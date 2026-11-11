@@ -1,0 +1,36 @@
+name: CI / Windows native
+run-name: >-
+  Windows native · ${{ github.event_name }} · ${{ github.ref_name }} · Rust core, bridge and CLI
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-windows-${{ github.ref }}${{ github.run_attempt > 1 && format('-rerun-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.run_attempt == 1 }}
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  windows-platform:
+    name: Windows Rust checks
+    uses: ./.github/workflows/ci-windows-native.yml
+    permissions:
+      contents: read
+      actions: read
+    with:
+      source_sha: ${{ github.sha }}
+
+  windows-gate:
+    name: Windows native gate
+    if: always()
+    needs: windows-platform
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require the native Windows checks
+        env:
+          RESULT: ${{ needs.windows-platform.result }}
+        run: |
+          test "$RESULT" = success

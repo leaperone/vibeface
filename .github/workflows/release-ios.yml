@@ -1,4 +1,4 @@
-name: Release iOS device archive
+name: Reusable / Build iOS device archive
 
 on:
   workflow_call:
@@ -23,6 +23,7 @@ permissions:
 
 jobs:
   build:
+    name: Build iOS device archive
     runs-on: macos-26
     timeout-minutes: 90
     outputs:

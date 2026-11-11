@@ -7,6 +7,7 @@ apps/www/dist/
 tests/e2e/.artifacts/
 /.worktrees/
 node_modules/
+__pycache__/
 /apps/app/generated/
 *.sqlite3
 *.sqlite3-shm
@@ -21,3 +22,5 @@ node_modules/
 .e2e/summary.md
 .e2e/logs/
 .e2e/videos/
+__pycache__/
+.DS_Store

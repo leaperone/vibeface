@@ -13,9 +13,6 @@ fn outgoing_model(tracked: &Value) -> Result<Option<String>> {
     let value = tracked
         .get("resolved")
         .context("the Node returned no frozen model selection")?;
-    value
-        .get("model")
-        .context("the frozen model selection has no model")?;
     let resolved_model = value
         .get("model")
         .context("the frozen model selection has no model")?;
@@ -346,6 +343,18 @@ async fn send_to_node(mut record: Value) {
     let Ok(url) = std::env::var("VIBEFACE_TRIAGE_URL") else {
         return;
     };
+    let credential = std::env::var_os("VIBEFACE_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .and_then(|dir| crate::LocalHttpCredential::read(&dir).ok());
+    let Some(credential) = credential else {
+        return;
+    };
+    let Ok(url) = reqwest::Url::parse(&url) else {
+        return;
+    };
+    if credential.require_origin(&url).is_err() {
+        return;
+    }
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .no_proxy()
@@ -355,7 +364,8 @@ async fn send_to_node(mut record: Value) {
         return;
     };
     let _ = client
-        .post(format!("{}/api/log", url.trim_end_matches('/')))
+        .post(format!("{}/api/log", credential.origin))
+        .bearer_auth(credential.capability)
         .json(&json!({"source":"agent","records":[record]}))
         .send()
         .await;

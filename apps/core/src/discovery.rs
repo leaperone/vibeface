@@ -1,7 +1,7 @@
 //! Finds the paths this computer's providers need and writes them into the Node's own
 //! configuration once, where Settings shows them and the owner can change them. Nothing is
 //! guessed while running: a value is filled only for an enabled use or explicit local connection.
-//! The paths stay in `config.json` and `provider-env.json`; they never reach shared records.
+//! The paths stay in the private `config.json` snapshot; they never reach shared records.
 use crate::{
     config::{Config, ManagerSettings},
     providers::{AppServer, AppServerMode, Local, Provider, ProviderEnv},
@@ -65,11 +65,31 @@ pub(crate) async fn complete_local(
         return Ok(false);
     }
     let mut next = local.clone();
-    let bin = local.bin(connect.provider);
+    if connect.provider == Provider::Cursor
+        && next
+            .bins
+            .get(&Provider::Cursor)
+            .is_none_or(|bin| vibeface_bridge::agent::is_cursor_sdk_bridge(bin))
+    {
+        next.bins.remove(&Provider::Cursor);
+        let provider_host = Host {
+            path: next
+                .env
+                .get(Provider::Cursor)
+                .get("PATH")
+                .map(OsString::from)
+                .or(host.path.clone()),
+            ..host.clone()
+        };
+        if let Some(bin) = provider_host.program(Provider::Cursor.default_bin()) {
+            next.bins.insert(Provider::Cursor, bin);
+        }
+    }
+    let bin = next.bin(connect.provider);
     let selected = bare(&bin)
         .and_then(|name| host.program(name))
         .unwrap_or_else(|| bin.clone());
-    let needs_program = !local.bins.contains_key(&connect.provider) && !host.installed(&bin);
+    let needs_program = !next.bins.contains_key(&connect.provider) && !host.installed(&bin);
     let needs_node = uses_path_node(&selected)
         && !runnable(Path::new("node"), host.path.as_ref())
         && host.program("node").is_none();
@@ -254,8 +274,6 @@ impl Host {
         versions.into_iter().map(|(_, path)| path).collect()
     }
 
-    /// `path` as the owner reads it in a question: under the home folder as `~/…`, elsewhere
-    /// only its last two parts, so the full path stays on this computer.
     /// The usual project folders in the home folder that exist, for a first folder to offer.
     pub fn project_folders(&self) -> Vec<PathBuf> {
         let Some(home) = &self.home else {
@@ -279,6 +297,8 @@ impl Host {
         found
     }
 
+    /// `path` as the owner reads it in a question: under the home folder as `~/…`, elsewhere
+    /// only its last two parts, so the full path stays on this computer.
     pub fn display(&self, path: &Path) -> String {
         self.tilde(path).unwrap_or_else(|| {
             let parts: Vec<_> = path.components().rev().take(2).collect();
@@ -358,18 +378,6 @@ pub fn runnable(program: &Path, path: Option<&OsString>) -> bool {
                 .any(|candidate| program::runnable(candidate))
         })
     })
-}
-
-/// Where Codex's running App Server listens: the desktop app and `codex app-server proxy` keep
-/// this link to the live socket.
-pub fn control_socket(codex_home: &Path) -> Option<PathBuf> {
-    let socket = codex_home.join("app-server-control/app-server-control.sock");
-    socket.symlink_metadata().is_ok().then_some(socket)
-}
-
-pub fn sessions_dir(codex_home: &Path) -> Option<PathBuf> {
-    let sessions = codex_home.join("sessions");
-    sessions.is_dir().then_some(sessions)
 }
 
 /// Provider paths for this device, each `None` when it stays as it is, and the providers to
@@ -566,8 +574,8 @@ pub fn complete(config: &mut Config, env: &mut ProviderEnv, host: &Host) -> Resu
 /// Before a Node starts: what its saved configuration misses is found and saved. When Codex
 /// cannot be found, nothing is written and loading the configuration says why.
 pub fn complete_saved(dir: &Path, host: &Host) -> Result<()> {
-    let mut config: Config = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
-    let mut env = ProviderEnv::load(dir)?;
+    let mut config = Config::load(dir)?;
+    let mut env = std::mem::take(&mut config.provider_env);
     let filled = match complete(&mut config, &mut env, host) {
         Ok(filled) => filled,
         Err(error) => {
@@ -578,10 +586,8 @@ pub fn complete_saved(dir: &Path, host: &Host) -> Result<()> {
     if filled.is_empty() {
         return Ok(());
     }
+    config.provider_env = env;
     config.save(dir)?;
-    if filled.codex_home.is_some() {
-        env.save(dir)?;
-    }
     tracing::info!(event = "providers.discovered", filled = ?filled.names(), "filled missing provider paths from this computer");
     Ok(())
 }
@@ -810,7 +816,10 @@ exec /bin/sh -c "$2"
         assert!(cursor.names(&local, None)?.is_empty());
         local.env.apply(
             Provider::Cursor,
-            BTreeMap::from([("CURSOR_API_KEY".into(), Some("synthetic-private".into()))]),
+            BTreeMap::from([(
+                "FIXTURE_CURSOR_KEY".into(),
+                Some("synthetic-private".into()),
+            )]),
         )?;
         assert!(cursor.names(&local, None)?.is_empty());
         local.switches.codex_app_server.mode = AppServerMode::System;
@@ -1045,7 +1054,8 @@ exec /bin/sh -c "$2"
         assert_eq!(saved.providers.codex_app_server.mode, AppServerMode::Spawn);
         assert_eq!(saved.triage.codex_sessions, None);
         assert!(
-            ProviderEnv::load(&dir)?
+            Config::load(&dir)?
+                .provider_env
                 .get(crate::providers::Provider::Codex)
                 .get(CODEX_HOME)
                 .is_none()
@@ -1061,8 +1071,8 @@ exec /bin/sh -c "$2"
         Ok(())
     }
 
-    #[test]
-    fn programs_named_only_are_found_where_a_service_path_does_not_look() -> Result<()> {
+    #[tokio::test]
+    async fn programs_named_only_are_found_where_a_service_path_does_not_look() -> Result<()> {
         let root = scratch("programs");
         let bridge = root.join(".local/bin/agent");
         program(&bridge);
@@ -1089,7 +1099,10 @@ exec /bin/sh -c "$2"
             None,
             &host,
         )?;
-        assert_eq!(found.bins, BTreeMap::from([(Provider::Cursor, bridge)]));
+        assert_eq!(
+            found.bins,
+            BTreeMap::from([(Provider::Cursor, bridge.clone())])
+        );
         local
             .bins
             .insert(Provider::Cursor, root.join("chosen/agent"));
@@ -1106,6 +1119,59 @@ exec /bin/sh -c "$2"
             .is_empty(),
             "a path the owner chose stays, even when it is gone"
         );
+        let sdk = root.join(".local/bin/cursor-sdk-bridge");
+        program(&sdk);
+        local.bins.insert(Provider::Cursor, sdk);
+        let connect = LocalConnect {
+            provider: Provider::Cursor,
+            explicit_env_names: BTreeSet::new(),
+        };
+        assert!(complete_local(&mut local, &connect, None, &host).await?);
+        assert_eq!(
+            local.bins.get(&Provider::Cursor),
+            Some(&bridge),
+            "the discovered official path replaces the unsupported SDK choice in saved settings"
+        );
+        assert!(local.switches.execution.is_empty());
+        let custom = root.join("chosen/custom-cursor");
+        program(&custom);
+        local.bins.insert(Provider::Cursor, custom.clone());
+        assert!(!complete_local(&mut local, &connect, None, &host).await?);
+        assert_eq!(
+            local.bin(Provider::Cursor),
+            custom,
+            "a custom CLI remains selected"
+        );
+        let saved = root.join("saved-path/agent");
+        let inherited = root.join("process-path/agent");
+        program(&saved);
+        program(&inherited);
+        let priority_host = Host {
+            path: Some(inherited.parent().unwrap().as_os_str().to_owned()),
+            ..host.clone()
+        };
+        assert_eq!(priority_host.program("agent"), Some(inherited));
+        for sdk_selected in [false, true] {
+            local.bins.remove(&Provider::Cursor);
+            if sdk_selected {
+                local
+                    .bins
+                    .insert(Provider::Cursor, root.join(".local/bin/cursor-sdk-bridge"));
+            }
+            local.env.apply(
+                Provider::Cursor,
+                BTreeMap::from([(
+                    "PATH".into(),
+                    Some(saved.parent().unwrap().to_string_lossy().into_owned()),
+                )]),
+            )?;
+            assert!(complete_local(&mut local, &connect, None, &priority_host).await?);
+            assert_eq!(
+                local.bins.get(&Provider::Cursor),
+                Some(&saved),
+                "the saved Cursor PATH wins with sdk_selected={sdk_selected}"
+            );
+        }
         assert_eq!(host.display(&root.join(".codex")), "~/.codex");
         assert_eq!(
             host.display(Path::new("/opt/tools/bin/codex")),

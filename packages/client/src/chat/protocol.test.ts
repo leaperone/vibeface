@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { awaitsDevice, botReach, botCanSend, canRetryJob, inputEventBody, inputTargetKey, inputTaskCommand, runtimeLabel, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, retryText, roleLabel, reachDevice } from './protocol.ts'
+import { awaitsDevice, botReach, botCanSend, canRetryJob, inputEventBody, inputTargetKey, inputTaskCommand, runtimeLabel, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, retryText, reachDevice } from './protocol.ts'
 import type { ManagerJob, TurnRuntime } from '../workspace/types.ts'
-import { parseInputReceipt, parseNodes, parsePendingMessage, parseTurnRuntime, parseWorkspaceCommand, parseWorkspaceCommandNotSaved } from '../workspace/model.ts'
+import { parseInputReceipt, parseMessageRequest, parseNodes, parsePendingMessage, parseTurnRuntime, parseWorkspaceCommand, parseWorkspaceCommandNotSaved, parseWorkspaceHistory, parseWorkspaceState, record } from '../workspace/model.ts'
 import { enqueue, type OutboxItem } from '../lib/outbox.ts'
 
 const prepareMainSend = (input: Omit<Parameters<typeof prepareSend>[0], 'target' | 'sequence'>) => prepareSend({ ...input, target: { kind: 'bot_main', bot_id: 'bot' }, sequence: 1 })
@@ -35,8 +35,6 @@ test('automatic Task commands meet the Node expected-result contract and retain 
   assert.deepEqual(sources, ['a'.repeat(64), 'b'.repeat(64)])
 })
 test('send waits for a loaded conversation', () => {
-  assert.equal(roleLabel('user'), '你')
-  assert.equal(roleLabel('assistant'), 'Bot')
   assert.equal(canSend({ ...ready, busy: false }), true)
   assert.equal(canSend({ ...ready, loaded: false, busy: false }), false)
   assert.equal(composerHint(ready), '')
@@ -215,4 +213,52 @@ test("a model the bot set itself is changed in its chat, not on the device", asy
   const { replyFailure } = await import("../lib/errors.ts")
   assert.equal(replyFailure("no_model", "model not found（这个 bot 设定的模型是 gpt-x）"), "这个 Bot 设定的模型 gpt-x 用不了。在聊天里让它换一个。")
   assert.match(replyFailure("no_model", "model not found"), /设备/)
+})
+
+
+test('new draft defaults become explicit signed booleans, and false survives durable retries', async () => {
+  for (const reportResults of [undefined, true, false]) {
+    const prepared = prepareMainSend({ conversationId: 'chat', text: '后台工作', reportResults })
+    assert.equal(prepared.ok, true)
+    if (!prepared.ok) continue
+    const expected = reportResults ?? true
+    assert.equal(prepared.pending.report_results, expected)
+    assert.equal(prepared.body.report_results, expected)
+    assert.equal(record(JSON.parse(JSON.stringify(inputEventBody(prepared.body)))).report_results, expected)
+    const item: OutboxItem = { key: prepared.pending.message_id, method: 'message', created_at_ms: 1, delivery: 'unknown', params: { ...prepared.body, attestation: { device_id: 'client', signature: 'original-signature' } } }
+    const entries = new Map<string, OutboxItem>()
+    const store = { all: async () => [...entries.values()], put: async (value: OutboxItem) => { entries.set(value.key, structuredClone(value)) }, delete: async (key: string) => { entries.delete(key) } }
+    await enqueue(store, item)
+    const restored = parsePendingMessage((await store.all())[0])
+    const retried = prepareMainSend({ conversationId: 'chat', text: restored.text, pending: restored, reportResults: !expected })
+    assert.equal(retried.ok, true)
+    if (!retried.ok) continue
+    assert.equal(retried.body.report_results, expected)
+    assert.deepEqual(retried.body, prepared.body)
+    assert.deepEqual((await store.all())[0], item)
+  }
+})
+
+test('untyped message, queued input and history boundaries require explicit report_results booleans', () => {
+  const body = { message_id: 'input', target: { kind: 'bot_main', bot_id: 'bot' }, intent: 'continue', sequence: 1, text: '原输入' }
+  const queue = (input: unknown) => ({ channels: [], tasks: [], assignments: [], inputs: [{ input, conversation_id: 'chat', source_event: 'source', control_event: 'control', effective_order: 1, deferred: false, cancelled: false }], coverage: { limit: 20, truncated: false } })
+  const history = (input: object) => ({ events: [{ event_hash: 'event', created_at_ms: 1, scope_id: 'chat', kind: 'input_posted', body: { type: 'input_posted', ...input }, speaker: { kind: 'human', device_id: 'client' } }], coverage: { limit: 20, truncated: false, scope: 'workspace' } })
+  for (const report_results of [undefined, null, 0, 1, 'true', 'false', {}, []]) {
+    const input = { ...body, ...(report_results === undefined ? {} : { report_results }) }
+    assert.throws(() => parseMessageRequest({ conversation_id: 'chat', ...input }), /report_results/)
+    assert.throws(() => parsePendingMessage({ key: 'input', method: 'message', params: { conversation_id: 'chat', ...input, attestation: { device_id: 'client', signature: 'original' } }, created_at_ms: 1, delivery: 'unknown' }), /report_results/)
+    assert.throws(() => parseWorkspaceState(queue(input)), /report_results/)
+    assert.throws(() => parseWorkspaceHistory(history(input)), /report_results/)
+  }
+  for (const report_results of [true, false]) {
+    const input = { ...body, report_results }
+    const parsed = parseMessageRequest({ conversation_id: 'chat', ...input })
+    assert.equal(parsed.report_results, report_results)
+    assert.deepEqual(inputEventBody(parsed), { type: 'input_posted', ...input })
+    assert.equal(parseWorkspaceState(queue(input)).inputs[0].input.report_results, report_results)
+    const event = parseWorkspaceHistory(history(input)).events[0]
+    assert.equal(event.body.type, 'input_posted')
+    if (event.body.type !== 'input_posted') assert.fail('input event changed kind')
+    assert.equal(event.body.report_results, report_results)
+  }
 })

@@ -75,7 +75,7 @@ export function Message({ message, conversationId, schedule, time: shown, retry,
     </span>
     <div title={full} className="min-w-0 max-w-[85%] rounded-2xl border bg-muted px-4 py-2 [overflow-wrap:anywhere] sm:max-w-[75%]">
       <span className="sr-only">{message.sender?.name ?? '另一个 Bot'}：</span>
-      <Markdown text={message.text} />
+      <Markdown text={message.text} streaming={message.state === 'streaming'} />
     </div>
     {time}
   </div>
@@ -88,7 +88,7 @@ export function Message({ message, conversationId, schedule, time: shown, retry,
     {/* Every streamed chunk redraws the reply inside the chat log, which would read it from the top each time; the finished reply lands as a new entry and is read once. */}
     <div title={full} aria-live={message.state === 'streaming' ? 'off' : undefined} className="w-full min-w-0">
       <span className="sr-only">Bot：</span>
-      <Markdown text={message.text} />
+      <Markdown text={message.text} streaming={message.state === 'streaming'} />
     </div>
     {message.state === 'streaming' ? <span role="img" aria-label="正在回复" className="flex h-6 items-center">{selectedBot ? <BotFace bot={selectedBot} mood={connectionOnline ? 'replying' : 'asleep'} size={24} /> : <LoaderCircle aria-hidden="true" className={`size-4 text-muted-foreground ${connectionOnline ? 'animate-spin' : ''}`} />}</span> : null}
     {failed ? <span className="flex flex-wrap items-center gap-x-3 gap-y-1 text-meta">

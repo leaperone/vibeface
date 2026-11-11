@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import urllib.request
+from unittest import TestCase
 
 
 ROOT = Path('/opt/vibeface')
@@ -93,6 +94,10 @@ def inspect():
     return response['result']
 
 
+def bounded(value, limit):
+    return type(value) is int and 0 < value <= limit
+
+
 def guard(info):
     expected = os.environ
     metadata = DATA.lstat()
@@ -118,12 +123,13 @@ def guard(info):
             'the official node must run outside personal networks')
     require(config['listen'] == expected['VIBEFACE_LISTEN'], 'existing HTTP listen address differs')
     # Any device may use the official node, so every service it offers them is bounded.
-    require(network['serve_discovery'] is True and network.get('relay_listen') is not None
+    mesh = network.get('mesh') or {}
+    require(mesh.get('enabled') is True and network.get('relay_listen') is not None and network.get('relay_url')
             and network.get('relay_open') is True and network.get('relay_operator_token') is None
-            and network.get('relay_rate') and network.get('relay_max_clients')
-            and network.get('relay_max_clients_per_ip') and forwarding['any'] is True and forwarding.get('rate')
-            and forwarding.get('per_ip'),
-            'the official node needs discovery, an open relay and browser forwarding, each within limits')
+            and bounded(network.get('relay_rate'), 16384) and bounded(network.get('relay_max_clients'), 128)
+            and bounded(network.get('relay_max_clients_per_ip'), 8) and forwarding['any'] is True
+            and forwarding.get('rate') and forwarding.get('per_ip'),
+            'the official node needs the mesh, an open relay and browser forwarding, each within limits')
     # Browsers connect straight to this Node, so every limit counts the real peer address.
     require(not forwarding.get('trusted_proxies'), 'the official node has no proxy in front to trust')
     anchor = json.loads(regular(ROOT / 'public-bootstrap.json', 4096))
@@ -140,7 +146,7 @@ def guard(info):
     return result
 
 
-def maintenance(command):
+def maintenance():
     endpoint = Path('/tmp') / ('vibeface-' + os.environ['VIBEFACE_EXPECTED_DEVICE'][:32]) / 'maintenance.sock'
     metadata = endpoint.lstat()
     parent = endpoint.parent.lstat()
@@ -151,7 +157,7 @@ def maintenance(command):
     stream = socket.socket(socket.AF_UNIX)
     stream.settimeout(15)
     stream.connect(str(endpoint))
-    stream.sendall((json.dumps({'protocol': 1, 'command': command}) + '\n').encode())
+    stream.sendall((json.dumps({'protocol': 1, 'command': 'acquire'}) + '\n').encode())
     response = bytearray()
     while not response.endswith(b'\n') and len(response) <= 4096:
         part = stream.recv(4096)
@@ -159,7 +165,7 @@ def maintenance(command):
         response.extend(part)
     value = json.loads(response)
     require(len(response) <= 4096 and value.get('protocol') == 1
-            and value.get('status') == ('ready' if command == 'acquire' else 'healthy')
+            and value.get('status') == 'ready'
             and value['health']['device_id'] == os.environ['VIBEFACE_EXPECTED_DEVICE'],
             'maintenance lease refused or identity differs')
     return stream
@@ -204,9 +210,11 @@ def self_test():
                   'web_enabled': True, 'tls': True, 'roots': [], 'manager': None,
                   'forwarding': {'any': True, 'sessions': 32, 'queue': 192, 'rate': 262144, 'per_ip': 8,
                                  'trusted_proxies': []},
-                  'network': {'serve_discovery': True, 'relay_listen': '0.0.0.0:3340', 'relay_open': True,
-                              'relay_operator_token': None, 'relay_rate': 65536, 'relay_max_clients': 512,
-                              'relay_max_clients_per_ip': 16}}
+                  'network': {'relay_listen': '0.0.0.0:3340', 'relay_url': 'http://203.0.113.7:3340',
+                              'relay_open': True, 'relay_operator_token': None, 'relay_rate': 16384,
+                              'relay_max_clients': 128, 'relay_max_clients_per_ip': 8,
+                              'mesh': {'enabled': True, 'network': 'vibeface', 'bootstrap': [],
+                                       'allow_private': False, 'advertise': ['203.0.113.7:4792']}}}
         (data / 'config.json').write_text(json.dumps(config))
         env = {'VIBEFACE_ROLE': 'node', 'VIBEFACE_LISTEN': config['listen'],
                'VIBEFACE_EXPECTED_DEVICE': 'b' * 64, 'VIBEFACE_EXPECTED_VERSION': '1.0.0',
@@ -222,52 +230,28 @@ def self_test():
             for unsafe in (patch.object(module, 'read_only', return_value=False),
                            patch.object(module, 'TLS_OWNER', os.geteuid() + 1)):
                 with unsafe:
-                    try:
+                    with TestCase().assertRaises(ValueError, msg='TLS files the Node could replace accepted'):
                         guard(info)
-                    except ValueError:
-                        pass
-                    else:
-                        raise AssertionError('TLS files the Node could replace accepted')
             (data / 'tls-key.pem').chmod(0o660)
-            try:
+            with TestCase().assertRaises(ValueError, msg='a group-writable TLS key accepted'):
                 guard(info)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError('a group-writable TLS key accepted')
             (data / 'tls-key.pem').chmod(0o640)
             (directory / 'public-bootstrap.json').write_text(json.dumps(dict(anchor, issuer='c' * 64)))
-            try:
+            with TestCase().assertRaises(ValueError, msg='a Node other than the pinned issuer accepted'):
                 guard(info)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError('a Node other than the pinned issuer accepted')
             (directory / 'public-bootstrap.json').write_text(json.dumps(anchor))
             (data / 'tls-cert.pem').unlink()
-            try:
+            with TestCase().assertRaises(ValueError, msg='missing TLS certificate accepted'):
                 guard(info)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError('missing TLS certificate accepted')
             (data / 'tls-cert.pem').write_text('fixture')
             for marker in ('{"data_epoch":2}', '{"data_epoch":true}'):
                 (data / 'data-epoch.json').write_text(marker)
-                try:
+                with TestCase().assertRaises(ValueError, msg='different epoch accepted'):
                     guard(info)
-                except ValueError:
-                    pass
-                else:
-                    raise AssertionError('different epoch accepted')
             (data / 'data-epoch.json').write_text('{"data_epoch":1}')
             (data / 'identity.json').unlink()
-            try:
+            with TestCase().assertRaises(ValueError, msg='missing identity accepted'):
                 guard(info)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError('missing identity accepted')
             assert not (data / 'identity.json').exists()
             (data / 'identity.json').write_text('fixture')
             network, forwarding = config['network'], config['forwarding']
@@ -276,18 +260,17 @@ def self_test():
                            {'web_enabled': False}, {'tls': False}, {'forwarding': dict(forwarding, any=False)},
                            {'forwarding': dict(forwarding, rate=None)}, {'forwarding': dict(forwarding, per_ip=None)},
                            {'forwarding': dict(forwarding, trusted_proxies=['203.0.113.1'])},
-                           {'network': dict(network, serve_discovery=False)}, {'network': dict(network, relay_listen=None)},
+                           {'network': dict(network, mesh=dict(network['mesh'], enabled=False))},
+                           {'network': dict(network, relay_listen=None)}, {'network': dict(network, relay_url=None)},
+                           {'network': dict(network, relay_rate=65536)}, {'network': dict(network, relay_max_clients=512)},
+                           {'network': dict(network, relay_max_clients_per_ip=16)},
                            {'network': dict(network, relay_open=False)},
                            {'network': dict(network, relay_rate=None)}, {'network': dict(network, relay_max_clients=None)},
                            {'network': dict(network, relay_max_clients_per_ip=None)},
                            {'network': dict(network, relay_operator_token='c' * 64)}):
                 (data / 'config.json').write_text(json.dumps(dict(config, **change)))
-                try:
+                with TestCase().assertRaises(ValueError, msg=f'unbounded or private official node accepted: {change}'):
                     guard(info)
-                except ValueError:
-                    pass
-                else:
-                    raise AssertionError(f'unbounded or private official node accepted: {change}')
             (data / 'config.json').write_text(json.dumps(config))
             assert guard(info)['device_id'] == 'b' * 64
     print('container runtime self-test passed')
@@ -314,7 +297,7 @@ def main():
             args = [str(ROOT / 'vibeface-core'), '--data-dir', str(DATA)]
             os.execv(args[0], args)
     else:
-        with maintenance('acquire'):
+        with maintenance():
             print(json.dumps({'status': 'ready'}), flush=True)
             sys.stdin.buffer.read(1)
 

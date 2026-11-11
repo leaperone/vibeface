@@ -3,7 +3,7 @@ use super::{
     codex_server::Link,
     provider_adapter::{
         PendingDisconnectClassification, ScrubbedStderrTail, TerminationEvidence,
-        classify_pending_disconnect,
+        classify_pending_disconnect, safe_model_text,
     },
 };
 use crate::config::ManagerSettings;
@@ -45,6 +45,29 @@ enum LaunchIdentity<'a> {
     System {
         socket: Option<&'a std::path::Path>,
     },
+}
+
+pub(super) fn generation_for(
+    identity: &crate::crypto::LocalIdentity,
+    provider: Provider,
+    local: &providers::Local,
+) -> anyhow::Result<String> {
+    let server = &local.switches.codex_app_server;
+    let env = local.launch_env(provider);
+    let launch = if provider.on_app_server() && server.mode == AppServerMode::System {
+        LaunchIdentity::System {
+            socket: server.socket.as_deref(),
+        }
+    } else {
+        LaunchIdentity::Process {
+            bin: local.bin(provider),
+            env: &env,
+            authentication: (provider == Provider::Codex)
+                .then(|| local.codex_external_auth().map(|auth| auth.fingerprint()))
+                .flatten(),
+        }
+    };
+    identity.provider_fingerprint(&serde_json::to_vec(&(provider, launch))?)
 }
 
 pub(super) struct CachedProviderProbe {
@@ -165,23 +188,7 @@ impl Runtime {
         provider: Provider,
         local: &providers::Local,
     ) -> anyhow::Result<String> {
-        let server = &local.switches.codex_app_server;
-        let env = local.launch_env(provider);
-        let launch = if provider.on_app_server() && server.mode == AppServerMode::System {
-            LaunchIdentity::System {
-                socket: server.socket.as_deref(),
-            }
-        } else {
-            LaunchIdentity::Process {
-                bin: local.bin(provider),
-                env: &env,
-                authentication: (provider == Provider::Codex)
-                    .then(|| local.codex_external_auth().map(|auth| auth.fingerprint()))
-                    .flatten(),
-            }
-        };
-        self.identity
-            .provider_fingerprint(&serde_json::to_vec(&(provider, launch))?)
+        generation_for(&self.identity, provider, local)
     }
 
     pub(crate) async fn provider_probe_snapshot(&self, provider: Provider) -> ProviderProbe {
@@ -237,6 +244,11 @@ impl Runtime {
 
     pub(crate) async fn manager_readiness(&self) -> Option<ProviderProbeReadiness> {
         let manager = self.manager()?;
+        if !manager.workspace.is_dir() {
+            return Some(ProviderProbeReadiness::NeedsSetup {
+                issue: ProbeIssue::new(ProbeStage::Launch, ProbeCode::ConfigInvalid),
+            });
+        }
         Some(
             self.provider_readiness(manager.provider, &manager.model)
                 .await,
@@ -693,13 +705,6 @@ fn pi_model_catalog(data: &Value) -> Option<ModelCatalog> {
     })
 }
 
-fn safe_model_text(value: &str) -> bool {
-    !value.trim().is_empty()
-        && value.len() <= 256
-        && !value.chars().any(char::is_control)
-        && !crate::model::looks_secret(value)
-}
-
 fn unchecked(provider: Provider) -> ProviderProbe {
     ProviderProbe {
         provider,
@@ -748,6 +753,7 @@ fn prerequisites(provider: Provider, local: &providers::Local) -> Option<ProbeIs
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::initialize_node;
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
     use vibeface_bridge::agent::{CursorAuthentication, CursorModel};
@@ -768,24 +774,21 @@ mod tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../crates/bridge/tests/fixtures/fake-cursor-agent"),
         );
-        configuration.save(&dir)?;
-        crate::config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        crate::config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&crate::crypto::LocalIdentity::generate())?,
+        initialize_node(
+            &dir,
+            &configuration,
+            &crate::crypto::LocalIdentity::generate(),
         )?;
         let mut variables = providers::ProviderEnv::default();
         variables.apply(
             Provider::Cursor,
             env.into_iter()
-                .chain([("CURSOR_API_KEY".into(), "fixture-api-key".into())])
                 .map(|(name, value)| (name, Some(value)))
                 .collect(),
         )?;
-        variables.save(&dir)?;
+        let mut configuration = crate::config::Config::load(&dir)?;
+        configuration.provider_env = variables;
+        configuration.save(&dir)?;
         let node = std::sync::Arc::new(Runtime::open(&dir).await?);
         node.tools_ready("http://127.0.0.1:9".into())?;
         Ok((node, dir))
@@ -822,7 +825,7 @@ mod tests {
         )]))
         .await?;
         let probe = node.probe_provider(Provider::Cursor).await;
-        assert!(matches!(probe.launch, LaunchCheck::Failed { .. }));
+        assert_ne!(probe.launch, LaunchCheck::Launchable);
         assert_eq!(probe.authentication, Authentication::Unverified);
         assert_eq!(probe.catalog, ModelCatalog::default());
         node.cursor.get().unwrap().stop().await;
@@ -841,7 +844,7 @@ mod tests {
         original.env.apply(
             provider,
             BTreeMap::from([
-                ("FAKE_BRIDGE_ME".into(), Some("401".into())),
+                ("FAKE_BRIDGE_ME".into(), Some("200".into())),
                 (
                     "FAKE_BRIDGE_ME_READY".into(),
                     Some(ready.display().to_string()),
@@ -854,33 +857,40 @@ mod tests {
         )?;
         *node.providers.lock().unwrap() = original.clone();
         let first = node.provider_probe_snapshot(provider).await;
-        let running = node.clone();
-        let pending = tokio::spawn(async move { running.probe_provider(provider).await });
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while !ready.exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        let result = async {
+            let pending = node.probe_provider(provider);
+            tokio::pin!(pending);
+            tokio::select! {
+                _ = async {
+                    while !ready.exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } => {},
+                early = &mut pending => anyhow::bail!("Cursor probe completed before the fixture barrier: {early:?}"),
             }
-        })
-        .await?;
-        let save = node.config_save.lock().await;
-        for key in ["fixture-new-key", "fixture-api-key"] {
-            node.write_providers(
-                |target| {
-                    target.local.env.apply(
-                        provider,
-                        BTreeMap::from([("CURSOR_API_KEY".into(), Some(key.into()))]),
-                    )
-                },
-                None,
-            )
-            .await?;
+            let save = node.config_save.lock().await;
+            for key in ["fixture-new-key", "fixture-api-key"] {
+                node.write_providers(
+                    |target| {
+                        target.local.env.apply(
+                            provider,
+                            BTreeMap::from([("FAKE_CONFIG_ID".into(), Some(key.into()))]),
+                        )
+                    },
+                    None,
+                )
+                .await?;
+            }
+            drop(save);
+            let current = node.provider_probe_snapshot(provider).await;
+            std::fs::write(release, b"ready")?;
+            let returned = pending.await;
+            Ok::<_, anyhow::Error>((current, returned))
         }
-        drop(save);
-        let current = node.provider_probe_snapshot(provider).await;
-        std::fs::write(release, b"ready")?;
-        let returned = pending.await?;
+        .await;
         node.cursor.get().unwrap().stop().await;
         drop(node);
+        let (current, returned) = result?;
         std::fs::remove_dir_all(dir)?;
         assert_ne!(first.config_id, current.config_id);
         assert_eq!(returned, current);

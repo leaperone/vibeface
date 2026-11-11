@@ -1,0 +1,69 @@
+diff --git a/cpp/includes/Bridging.h b/cpp/includes/Bridging.h
+--- a/cpp/includes/Bridging.h
++++ b/cpp/includes/Bridging.h
+@@ -4,6 +4,8 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/
+  */
+ #pragma once
++
++#include <memory>
+
+ namespace uniffi_jsi {
+
+@@ -29,6 +31,23 @@
+   size_t len;
+ };
+
++class OwnedMutableBuffer final : public jsi::MutableBuffer {
++public:
++  explicit OwnedMutableBuffer(size_t len)
++      : bytes(new uint8_t[len]), len(len) {}
++  ~OwnedMutableBuffer() override {
++    // Volatile stores keep erasure of secret-bearing copies from being optimized out.
++    volatile uint8_t *data = bytes.get();
++    for (size_t i = 0; i < len; ++i) data[i] = 0;
++  }
++  size_t size() const override { return len; }
++  uint8_t *data() override { return bytes.get(); }
++
++private:
++  std::unique_ptr<uint8_t[]> bytes;
++  size_t len;
++};
++
+ // Wrap an `ArrayBuffer` as a `Uint8Array` by invoking the JS-side
+ // `Uint8Array` constructor. Used wherever native code hands a buffer of
+ // bytes to JS — the wasm/napi runtimes expose `Uint8Array` directly, and
+diff --git a/cpp/includes/UniffiString.h b/cpp/includes/UniffiString.h
+--- a/cpp/includes/UniffiString.h
++++ b/cpp/includes/UniffiString.h
+@@ -48,12 +48,10 @@
+
+       // Make a copy of the bytes in the string.
+       auto len = string.size();
+-      auto bytes = new uint8_t[len];
+-      std::memcpy(bytes, reinterpret_cast<uint8_t *>(string.data()), len);
++      auto payload = std::make_shared<OwnedMutableBuffer>(len);
++      std::memcpy(payload->data(), string.data(), len);
+
+       // Construct an array buffer out of the new bytes.
+-      auto payload =
+-          std::make_shared<CMutableBuffer>(CMutableBuffer(bytes, len));
+       auto arrayBuffer = jsi::ArrayBuffer(rt, payload);
+
+       return uniffi_jsi::Bridging<jsi::ArrayBuffer>::arraybuffer_to_value(
+diff --git a/crates/ubrn_bindgen/src/bindings/gen_cpp/templates/RustCallStatusHelper.cpp b/crates/ubrn_bindgen/src/bindings/gen_cpp/templates/RustCallStatusHelper.cpp
+--- a/crates/ubrn_bindgen/src/bindings/gen_cpp/templates/RustCallStatusHelper.cpp
++++ b/crates/ubrn_bindgen/src/bindings/gen_cpp/templates/RustCallStatusHelper.cpp
+@@ -27,9 +27,8 @@
+       // immediately. The errorBuf is small (a serialized error variant) and
+       // only allocated on the cold error path, so the boundary copy is cheap.
+       auto len = static_cast<size_t>(status.error_buf.len);
+-      uint8_t *bytes = new uint8_t[len];
+-      std::memcpy(bytes, status.error_buf.data, len);
+-      auto payload = std::make_shared<uniffi_jsi::CMutableBuffer>(bytes, len);
++      auto payload = std::make_shared<uniffi_jsi::OwnedMutableBuffer>(len);
++      std::memcpy(payload->data(), status.error_buf.data, len);
+       auto view = uniffi_jsi::arraybufferToUint8Array(
+           rt, jsi::ArrayBuffer(rt, payload));
+       statusObject.setProperty(rt, "errorBuf", view);

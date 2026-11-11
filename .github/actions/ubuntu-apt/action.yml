@@ -1,0 +1,22 @@
+name: Check hosted Ubuntu package resolver
+description: Check existing Ubuntu package DNS and optionally repair an unavailable resolver on this disposable runner
+inputs:
+  apply:
+    description: Repair unavailable package DNS only on the disposable hosted runner
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Check the current runner's Ubuntu package DNS
+      if: runner.os == 'Linux'
+      shell: bash
+      env:
+        REPAIR_HOSTED_DNS: ${{ inputs.apply }}
+      run: |
+        options=()
+        case "$REPAIR_HOSTED_DNS" in
+          true) options+=(--repair) ;;
+          false) ;;
+          *) echo 'apply must be true or false' >&2; exit 1 ;;
+        esac
+        python3 -B scripts/ci-ubuntu-dns.py "${options[@]}"

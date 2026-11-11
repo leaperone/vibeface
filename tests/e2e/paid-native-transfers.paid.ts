@@ -33,7 +33,7 @@ test('accepts a paid file in the release Android app, disconnects, resumes and s
       await device.installApp(undefined, { reinstall: true });
       await app.open();
       await screen.getByRole('textbox', /^加入链接/).fill(secrets.get('paidAndroidInvitation'), { timeout: 30000 });
-      await screen.getByRole('textbox', /^这台手机叫什么/).fill('VDP paid native receiver');
+      await screen.getByRole('textbox', /^这台设备的名字(?:$|[\s,，])/).fill('VDP paid native receiver');
       await device.dismissKeyboard();
       await screen.getByRole('button', '加入', { exact: true }).click();
       await expect.poll(async () => (await pairing('android')) !== null, { timeout: 45000, message: 'The real Android member reveals its pairing nonce' }).toBe(true);
@@ -41,13 +41,13 @@ test('accepts a paid file in the release Android app, disconnects, resumes and s
       assert(joined);
       await expect(screen.getByLabel(`安全码 ${joined.code.split('').join(' ')}`, { exact: true })).toBeVisible();
       await request('/approve', { role: 'android', peer: joined.peer, code: joined.code });
-      await expect(screen.getByRole('link', '设置', { exact: true })).toBeVisible({ timeout: 30000 });
-      await screen.getByRole('link', '设置', { exact: true }).click();
-      await screen.scrollUntilVisible(screen.getByRole('switch', '实验功能', { exact: true }), { direction: 'down' });
+      await expect(screen.getByLabel('设置', { exact: true })).toBeVisible({ timeout: 30000 });
+      await screen.getByLabel('设置', { exact: true }).click();
+      await screen.scrollUntilVisible(screen.getByRole('link', '实验室', { exact: true }), { direction: 'down' });
+      await screen.getByRole('link', '实验室', { exact: true }).click();
       await screen.getByRole('switch', '实验功能', { exact: true }).click();
       await expect(screen.getByRole('switch', '实验功能', { exact: true })).toBeChecked();
-      await screen.scrollUntilVisible(screen.getByRole('link', '发送和接收文件', { exact: true }), { direction: 'up' });
-      await screen.getByRole('link', '发送和接收文件', { exact: true }).click();
+      await screen.getByRole('link', '文件传输', { exact: true }).click();
       await expect(screen.getByText('传输设置', { exact: true }).first()).toBeVisible();
       await event('observer-ready', { role: 'android' });
       for (const kind of ['receiver-key-before', 'receiver-key-after'] as const) {

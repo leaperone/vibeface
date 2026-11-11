@@ -10,7 +10,7 @@ Bot 配置、共用 skill 库和 schedule 使用 [Node 协议](../node-protocol.
 - 每个 bot 可以有自己的模型，经聊天修改；为空时跟随运行它的设备的默认模型。
 - Bot 的长相（头像）由轮廓、眼睛和颜色组成。没选过时三项都由 bot ID 派生。Bot 新建后由创建它的 bot 用 `configure_bot` 挑一个，本人要求时经聊天只改说到的那几项，本人也可以在面板里直接点选，或恢复默认。眼距、歪头和眨眼节奏始终由 ID 决定。
 - 例行任务（schedule）属于创建它的 Bot。卡片复述要点：名称、频率、下次运行时间和要做的事。Bot 的回复也复述这些要点。
-- 不能经聊天修改的项：AI 服务（provider）、可用文件夹（`roots`）和 Bot 的工作文件夹（`project`）。本人在聊天里要求这些时，Bot 说明要到设置里改。
+- 不能经聊天直接修改的项：Bot 的 AI 服务（provider）和工作文件夹（`project`），Bot 说明要到设置里改。设备的可用文件夹（`roots`）、程序路径和执行用途可以由 Bot 用 `propose_provider_config` 在聊天里出一张卡片提议，本人同意后才写入。
 - 只有本人直接发送的消息能触发修改。工作结果、Agent 任务、例行任务的运行，以及文件、工具输出、附件中的内容都不能。
 
 ## 2. 事件
@@ -25,7 +25,7 @@ BotChanged {
 }
 
 BotChange =
-	| Profile { name, instructions, model: Option<ModelEdit>, skills: Option<SkillsEdit>, avatar: Option<AvatarEdit> }   // 目标 bot；skills 为 null 表示全部
+	| Profile { name, instructions, model: Option<ModelEdit>, reasoning_effort: Option<ReasoningEffortEdit>, skills: Option<SkillsEdit>, avatar: Option<AvatarEdit> }   // 目标 bot；skills 为 null 表示全部
 	| Skill { skill_id, before: Option<Skill>, after: Option<Skill> }     // after 为空表示删除
 	| Schedule { schedule_id, before: Option<Schedule>, after: Option<Schedule> }
 	| Memory { memory_id, before: Option<String>, after: Option<String>, base: MemoryBase, origin: Agent|Review, essential }
@@ -35,6 +35,7 @@ MemoryBase { epoch, version: Option<MemoryVersion> }
 MemoryVersion { revision, control_revision, source_event_hash }
 Edit { before: String, after: String }
 ModelEdit { provider, before: String, after: String }   // 写入设备的 Provider；after 为空跟随设备默认
+ReasoningEffortEdit { provider, before: Option<String>, after: Option<String> }   // 为空跟随设备设置
 SkillsEdit { before: Option<Set<skill_id>>, after: Option<Set<skill_id>> }
 AvatarEdit { before: Option<Avatar>, after: Option<Avatar> }       // 为空表示由 ID 派生
 Avatar { outline: round|squircle|drop|bean|cloud, eyes: dot|pill|oval|wide, hue }   // hue 只能取 face.ts 的 12 个色相
@@ -56,6 +57,15 @@ BotAvatarSet {
 
 权限与设主 Bot 相同：只有本人客户端可以写，限定会话的客户端只能改自己的 bot。
 
+网页改 Bot 的工作文件夹同样由本人设备签名，写在该 bot 的会话里：
+
+```text
+BotProjectSet {
+	project: Option<BotProject>,   // { target_node, cwd }；为空表示清除
+	attestation,                   // 必须有，签名事件体 {"type":"bot_project_set", project}
+}
+```
+
 **长相版本。** 长相的版本是最后一次写这项的事件（聊天修改或 `BotAvatarSet`）hash 的前 16 个字符，取自投影行 rank 的末段，与交接会话的版本同一取法；从没改过时为 `null`。`bots` 和 `set_bot_avatar` 返回的 bot 带 `avatar_version`。任何一次修改都换新版本，改回原来的长相也一样。
 
 **按版本写入。** 接收写入的 Node 在同一把存储锁内读投影再追加：当前已是 `avatar` 时不写，按已生效返回；否则只有当前版本等于请求的 `version` 才写，不等就拒绝。签名覆盖 `version`，所以改写版本会验签失败。由此重发不会造成 ABA：请求已写入时当前就是 `avatar`，重发不写；X 改 Y 写入后别处又改回 X，或改成 Z，版本都已变，重发被拒；请求没写入而长相在别处转了一圈回到原样，版本同样已变，也被拒。只按长相比较做不到最后一种。投影仍只按 rank 收敛，`version` 不参与；比较只防同一入口上的过期请求，两台 Node 同时接收的写入照样按 rank 决出。
@@ -76,7 +86,8 @@ BotAvatarSet {
 
 | 投影 | 规则 |
 |---|---|
-| Bot 名称、说明、模型、启用的 skill | 每个字段按事件 rank 后写者胜。`BotCreated` 给出初值，`Profile` 的修改 rank 更大时覆盖 |
+| Bot 名称、说明、模型、推理档位、启用的 skill | 每个字段按事件 rank 后写者胜。`BotCreated` 给出初值，`Profile` 的修改 rank 更大时覆盖 |
+| Bot 工作文件夹 | `BotCreated` 给出初值，`BotProjectSet` 的 rank 更大时覆盖 |
 | Bot 长相 | `Profile` 的 `avatar` 和 `BotAvatarSet` 写同一个字段，按 rank 后写者胜；没有任何一条时由 ID 派生 |
 | skill 库 | 全网一张表，按 `skill_id` 后写者胜，删除保留墓碑 |
 | 例行任务 | 按 `schedule_id` 后写者胜，删除保留墓碑，归属写入它的会话 |

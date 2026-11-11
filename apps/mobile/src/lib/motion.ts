@@ -1,4 +1,4 @@
-import { cubicBezier, Easing, FadeIn, LinearTransition, ReduceMotion } from 'react-native-reanimated'
+import { cubicBezier, Easing, FadeIn, FadeOut, LinearTransition, ReduceMotion } from 'react-native-reanimated'
 
 // Two durations and one curve for every animation, the same as the theme's on the web: no bounce, no overshoot.
 /** Presses and colour changes. */
@@ -14,5 +14,7 @@ export const tap = { duration: quick, easing: easeOut, reduceMotion: ReduceMotio
 export const glide = { duration: settle, easing: easeOut, reduceMotion: ReduceMotion.System }
 /** `entering` for something that appears in place. */
 export const fadeIn = FadeIn.duration(settle).easing(easeOut).reduceMotion(ReduceMotion.System)
+/** `exiting` for something that leaves in place. */
+export const fadeOut = FadeOut.duration(settle).easing(easeOut).reduceMotion(ReduceMotion.System)
 /** `layout` for something that shifts as what is around it comes or goes. */
 export const move = LinearTransition.duration(settle).easing(easeOut).reduceMotion(ReduceMotion.System)

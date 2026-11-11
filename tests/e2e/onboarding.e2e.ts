@@ -1,12 +1,49 @@
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { stat } from 'node:fs/promises';
-import { test } from './fixtures';
+import { readFile, stat } from 'node:fs/promises';
+import { test, cursorTest } from './fixtures';
 import { expect, secrets } from 'e2e';
 
+cursorTest('automatically connects Cursor using only the official CLI subscription login', async ({ app, cursor, screen, browser }) => {
+  await app.open(cursor.node.entry);
+  await screen.getByRole('button', '新建我的网络').click();
+  await screen.getByLabel('这个节点叫什么？').fill('Cursor subscription fixture');
+  await screen.getByRole('button', '下一步').click();
+  await screen.getByLabel(/^恢复密码/).fill(secrets.get('recoveryPassword'));
+  await screen.getByRole('button', '下一步').click();
+  await browser.waitForDownload(() => screen.getByRole('button', '下载恢复文件').click());
+  await screen.getByRole('checkbox', '已把文件和密码分开保存').check();
+  await screen.getByRole('button', '完成创建').click();
+  await expect(screen.getByRole('heading', '让这台电脑运行 Bot')).toBeVisible();
+  const card = screen.getByRole('listitem').filter({ has: screen.getByText('Cursor', { exact: true }) });
+  await expect(card.getByText('Cursor 需要在运行设备上完成官方 CLI 订阅登录', { exact: true })).toBeVisible();
+  await expect(card.getByRole('textbox', 'Cursor 登录命令')).toHaveValue(/\/agent' login$/);
+  await expect(card.getByRole('textbox', /密钥|令牌/)).toHaveCount(0);
+  await expect(card.getByRole('link', /获取/)).toHaveCount(0);
+  await expect(card.getByRole('button', 'Cursor 运行 Bot')).toHaveAttribute('aria-pressed', 'false');
+  await expect(card.getByRole('button', 'Cursor 执行任务')).toHaveAttribute('aria-pressed', 'false');
+  assert.deepEqual(await cursor.inspect(), { selected_official: true, bot_enabled: false, execution: [], prompts: 0 });
+  await app.screenshot('cursor-cli-sign-in-required');
+  await cursor.login();
+  await browser.evaluate(() => window.dispatchEvent(new Event('focus')));
+  await expect(card.getByText('未验证，可尝试', { exact: true })).toBeVisible();
+  await expect(card.getByText('Cursor 尚未确认这个模型，可发送消息或先检查可用性', { exact: true })).toBeVisible();
+  await expect(card.getByText('Cursor 需要在运行设备上完成官方 CLI 订阅登录', { exact: true })).toHaveCount(0);
+  await expect(card.getByRole('textbox', 'Cursor 登录命令')).toHaveCount(0);
+  const requests = (await readFile(join(cursor.node.directory, '..', 'cursor-requests.jsonl'), 'utf8')).trim().split('\n').map((line): unknown => JSON.parse(line));
+  assert(requests.includes('initialize') && requests.includes('session/new'), 'the signed-in CLI returned its controlled model catalog');
+  assert(!requests.includes('session/prompt'), 'catalog observation sends no model prompt');
+  await expect(card.getByRole('button', 'Cursor 运行 Bot')).toHaveAttribute('aria-pressed', 'false');
+  await expect(card.getByRole('button', 'Cursor 执行任务')).toHaveAttribute('aria-pressed', 'false');
+  assert.deepEqual(await cursor.inspect(), { selected_official: true, bot_enabled: false, execution: [], prompts: 0 });
+  await app.screenshot('cursor-cli-authenticated-model-unverified');
+});
+
 test('creates a persistent Bot without a model and shows triage budget state', async ({ app, node, screen, browser }) => {
-  await app.open(node.url);
+  await app.open(node.entry);
+  await expect(screen.getByRole('button', '新建我的网络')).toBeVisible();
+  await expect(screen.getByRole('button', '加入已有网络')).toBeVisible();
   await screen.getByRole('button', '新建我的网络').click();
   await screen.getByLabel('这个节点叫什么？').fill('E2E Node');
   await screen.getByRole('button', '下一步').click();
@@ -136,6 +173,43 @@ test('creates a persistent Bot without a model and shows triage budget state', a
   await expect(triage).toContainText('待审阅 0 · 审阅中 0 · 待确认 0');
   await expect(triage).not.toContainText('分诊暂停');
 
+  const webhookSecret = screen.getByLabel(/^密钥/);
+  const saveWebhook = screen.getByRole('button', '保存', { exact: true });
+  await webhookSecret.fill(secrets.get('webhookSecret'));
+  await browser.evaluate(() => {
+    const send = WebSocket.prototype.send;
+    const pending: { socket: WebSocket; data: Parameters<WebSocket['send']>[0] }[] = [];
+    window.addEventListener('release-webhook-save', () => {
+      WebSocket.prototype.send = send;
+      for (const { socket, data } of pending) send.call(socket, data);
+      document.documentElement.removeAttribute('data-webhook-save-held');
+    }, { once: true });
+    WebSocket.prototype.send = function (this: WebSocket, data) {
+      const copy = typeof data === 'string' || data instanceof Blob ? data
+        : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice() : new Uint8Array(data).slice();
+      pending.push({ socket: this, data: copy });
+      document.documentElement.setAttribute('data-webhook-save-held', 'true');
+    };
+    return true;
+  });
+  try {
+    await saveWebhook.click();
+    await expect(saveWebhook).toBeDisabled();
+    await expect(browser.locator('html')).toHaveAttribute('data-webhook-save-held', 'true');
+    await webhookSecret.fill(secrets.get('nextWebhookSecret'));
+    await browser.evaluate(() => window.dispatchEvent(new Event('release-webhook-save')));
+    const clearWebhook = screen.getByRole('button', '清除密钥', { exact: true });
+    await expect(clearWebhook).toBeVisible();
+    await expect(clearWebhook).toBeEnabled();
+    await expect(saveWebhook).toBeEnabled();
+    await app.screenshot('webhook-newer-draft-preserved');
+    await saveWebhook.click();
+    await expect(clearWebhook).toBeEnabled();
+    await expect(saveWebhook).toBeDisabled();
+  } finally {
+    await browser.evaluate(() => window.dispatchEvent(new Event('release-webhook-save')));
+  }
+
   const database = new DatabaseSync(join(node.directory, 'node.sqlite3'));
   try {
     const network = database.prepare('SELECT network_id FROM networks').get();
@@ -172,6 +246,10 @@ test('creates a persistent Bot without a model and shows triage budget state', a
     };
     const three = ['导出 Markdown，保留可编辑内容', '导出 PDF，保留当前排版', '同时导出两种格式'];
     seed('q-decision-three', three);
+    decisionDb.prepare('INSERT INTO session_owners(network_id,node,session_id,conversation_id,rank,attribution,muted,created_at_ms) VALUES(?,?,?,?,?,?,0,?)')
+      .run(identity.network_id, node.peer, 'q-decision-three', identity.conversation_id, '0', JSON.stringify({ agent: 'codex', cwd: 'workspace', summary: '' }), Date.now());
+    decisionDb.prepare("UPDATE questions SET body=json_remove(body,'$.target') WHERE network_id=? AND question_id=?")
+      .run(identity.network_id, 'q-decision-three');
     await browser.goto(`${node.url}/inbox`);
     await expect(screen.getByRole('heading', '报告用哪种格式交付？')).toBeVisible();
     await expect(screen.getByRole('group', '选一个回答').getByRole('button')).toHaveCount(3);

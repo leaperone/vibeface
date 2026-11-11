@@ -1,10 +1,12 @@
+import { HistoryControls } from '@/features/chat/history-controls'
 import { Stack, useFocusEffect, useLocalSearchParams } from 'expo-router'
 import { Bot, CalendarClock, CircleHelp, Laptop, ListChecks, MessagesSquare, Send, type LucideIcon } from 'lucide-react-native'
 import { useCallback, useRef, useState, type ReactNode } from 'react'
-import { ScrollView, View } from 'react-native'
+import { View } from 'react-native'
+import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { messageOf, providerNames } from '@vibeface/client/lib/node.ts'
 import { formatWhen, scheduleFrequency } from '@vibeface/client/workspace/bot-settings.ts'
-import { contextCoverageLabels, contextIndexLabels, contextInvalidation, contextStages, externalSessionLabels, externalSessionStatus, nativeSessionObservation, nodeName, queueHoldLabels, schedulerStatus, shownState, staleTaskLabel, taskLabel, taskStale } from '@vibeface/client/workspace/labels.ts'
+import { contextCoverageLabels, contextIndexLabels, contextInvalidation, contextStages, memoryConflictLabel, externalSessionLabels, externalSessionStatus, nativeSessionObservation, nodeName, queueHoldLabels, schedulerStatus, shownState, staleTaskLabel, taskLabel, taskStale } from '@vibeface/client/workspace/labels.ts'
 import { awaitsAnswer } from '@vibeface/client/workspace/questions.ts'
 import type { BotRecord, ConversationPayload, ManagerJob } from '@vibeface/client/workspace/types.ts'
 import { Details, EmptyState, providerIcons, SettingsGroup, SettingsRow } from '@/components/kit'
@@ -43,13 +45,15 @@ export default function BotContext() {
   if (!shared || !bot || !data) return <><Stack.Screen options={{ title: '上下文和协作' }} /><EmptyState icon={MessagesSquare}
     title={readError ?? (!shared || !shared.connectionOnline ? '上下文状态未知，连接后再读取' : !shared.synced ? '正在读取上下文' : !bot ? '找不到这个 Bot' : '正在读取这个 Bot 的上下文')}
     action={shared?.connectionOnline && bot ? <Button variant="outline" onPress={() => setRetry((value) => value + 1)}><Text>重新读取</Text></Button> : undefined} className="flex-1 justify-center" /></>
-  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-5 p-4 pb-10">
+  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-5 p-4 pb-10">
     <Stack.Screen options={{ title: '上下文和协作' }} />
     <View className="gap-1"><Text role="heading" className="text-title font-semibold">{bot.name}</Text><Text className="text-meta text-muted-foreground">当前 Bot 的共享记录和持久记忆。</Text></View>
     {!shared.synced || !shared.connectionOnline ? <Text className="text-meta text-warning">{!shared.connectionOnline ? '连接已断开，显示最近记录；当前状态未知。' : '当前连接尚未完成首读，显示已知记录。'}</Text> : null}
     {readError ? <View className="gap-2"><Text className="text-danger">{readError}</Text><Button variant="outline" className="self-start" onPress={() => setRetry((value) => value + 1)}><Text>重新读取</Text></Button></View> : null}
+    <HistoryControls key={`${shared.generation}:${shared.conversationId}`} workspace={shared} />
+    {data.scheduler?.remote?.memory_conflicts?.length ? <Fold label={`负责设备的记忆冲突 · ${data.scheduler.remote.memory_conflicts.length}`}>{data.scheduler.remote.memory_conflicts.map((conflict) => <View key={conflict.history_id} className="gap-1"><Text>{memoryConflictLabel(conflict.reason)}</Text><Text selectable className="text-meta">记忆 {conflict.memory_id} · 预期 {conflict.expected_revision || '尚无版本'} · 当前 {conflict.actual_revision || '已移除'}</Text></View>)}</Fold> : null}
     <ContextRecords bot={bot} data={data} shared={shared} />
-  </ScrollView>
+  </KeyboardAwareScrollView>
 }
 
 function ContextRecords({ bot, data, shared }: { bot: BotRecord; data: ConversationPayload; shared: NonNullable<ReturnType<typeof useLive>> }) {

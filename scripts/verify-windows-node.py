@@ -18,6 +18,7 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -491,7 +492,7 @@ class Node:
             self.cli, "init", "--data-dir", self.directory,
             "--listen", f"127.0.0.1:{self.port}",
             "--local-listen", f"127.0.0.1:{self.local_port}",
-            "--bootstrap", "off",
+            "--no-mesh",
             "--root", str(workspace),
             "--bin", f"codex={provider.program}",
         ], timeout=120, env=self.environment())
@@ -502,6 +503,12 @@ class Node:
         ], env=self.environment()).stdout)
         require(access["device_id"], "local access pins the node identity")
         self.device_id = access["device_id"]
+        configuration = json.loads((self.directory / "config.json").read_text(encoding="utf-8"))
+        network = configuration["network"]
+        # A free TCP port may be excluded for UDP on Windows. Keep real QUIC on
+        # loopback and let its UDP bind allocate a port, independently of HTTP.
+        network["bind"] = "127.0.0.1:0"
+        self.configure(network=network)
 
     def environment(self):
         base = {
@@ -513,12 +520,25 @@ class Node:
         return self.provider.environment(base)
 
     def configure(self, **values):
+        require(self.process is None, "fixture configuration changes require a stopped Node")
         path = self.directory / "config.json"
-        configuration = json.loads(path.read_text(encoding="utf-8"))
-        configuration.update(values)
-        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}")
-        temporary.write_text(json.dumps(configuration, indent=2) + "\n", encoding="utf-8")
-        os.replace(temporary, path)
+        for candidate, expected in ((self.directory, stat.S_ISDIR), (path, stat.S_ISREG)):
+            metadata = candidate.lstat()
+            require(expected(metadata.st_mode)
+                    and not getattr(metadata, "st_file_attributes", 0) & 0x400,
+                    "fixture config and its directory are ordinary paths, never reparse points")
+        owner_only(self.directory)
+        owner_only(path)
+        # Both callers own a stopped fixture. Keep its file and protected DACL intact.
+        with path.open("r+", encoding="utf-8", newline="\n") as output:
+            configuration = json.load(output)
+            configuration.update(values)
+            output.seek(0)
+            output.write(json.dumps(configuration, indent=2) + "\n")
+            output.truncate()
+            output.flush()
+            os.fsync(output.fileno())
+        owner_only(path)
 
     def use_fake_provider(self):
         configuration = json.loads((self.directory / "config.json").read_text(encoding="utf-8"))

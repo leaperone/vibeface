@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,7 @@ import uuid
 
 import deploy
 import release
+from unittest import TestCase
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -93,10 +95,11 @@ def core_smoke(identity, info, output):
         # The official node's shape, offline; the runtime guard refuses anything less bounded.
         gateway = 'https://127.0.0.1:4793'
         options = {'data_dir': '/data', 'listen': '127.0.0.1:4793', 'public_url': gateway, 'tls': True,
-                   'allowed_origins': ['https://app.vibeface.dev'], 'serve_discovery': True, 'relay_listen': '127.0.0.1:4792',
-                   'relay_open': True, 'relay_rate': 65536, 'relay_max_clients': 512,
-                   'relay_max_clients_per_ip': 16, 'forward_any': True, 'forward_sessions': 32,
-                   'forward_queue': 192, 'forward_rate': 262144, 'forward_per_ip': 8, 'bootstrap': 'off'}
+                   'allowed_origins': ['https://app.vibeface.dev'], 'relay_listen': '127.0.0.1:4792',
+                   'relay_url': 'http://127.0.0.1:4792', 'relay_open': True, 'relay_rate': 16384,
+                   'relay_max_clients': 128, 'relay_max_clients_per_ip': 8, 'forward_any': True,
+                   'forward_sessions': 32, 'forward_queue': 192, 'forward_rate': 262144, 'forward_per_ip': 8,
+                   'mesh_network': 'deploy-fixture'}
         result = json.loads(docker('run', '--rm', '-i', *base, '--entrypoint',
                                   '/opt/vibeface/vibeface-core', identity, '--control',
                                   input=json.dumps({'command': 'init', 'options': options})))
@@ -255,25 +258,222 @@ def activate(service, output):
             'image': receipt['image'], 'prepared_image': identity}
 
 
+def rehearse(output):
+    """Start the previous published Core, stage the candidate config, then upgrade and repeat."""
+    release.require(os.geteuid() == 0 and sys.platform == 'linux',
+                    'the activation rehearsal requires root on a disposable Linux runner')
+    output = Path(output).resolve()
+    info = json.loads((output / 'deployment.json').read_text())
+    previous = deploy.previous(info['tag'])
+    if previous:
+        previous = build('node', previous['tag'], output / 'previous')
+    seed = previous or info
+    host = Path(tempfile.mkdtemp(dir=output, prefix='rehearsal-'))
+    data, tls = host / 'state', host / 'tls'
+    public_url = 'https://127.0.0.1:4792'
+    options = {'data_dir': '/data', 'listen': '0.0.0.0:4792', 'public_url': public_url, 'tls': True,
+               'allowed_origins': ['https://app.vibeface.dev'], 'relay_listen': '0.0.0.0:3340',
+               'relay_url': 'http://127.0.0.1:3340', 'relay_open': True, 'relay_rate': 16384,
+               'relay_max_clients': 128, 'relay_max_clients_per_ip': 8, 'forward_any': True,
+               'forward_sessions': 32, 'forward_queue': 192, 'forward_rate': 262144, 'forward_per_ip': 8,
+               'mesh_network': 'deploy-fixture'}
+    project = 'vibeface-rehearsal-' + uuid.uuid4().hex[:24]
+    fixtures, receipts = {}, []
+
+    def initialize(identity, directory):
+        directory.mkdir()
+        result = json.loads(subprocess.check_output(
+            ['docker', 'run', '--rm', '-i', '--network', 'none', '-v', f'{directory}:/data', '--entrypoint',
+             '/opt/vibeface/vibeface-core', identity, '--control'],
+            input=json.dumps({'command': 'init', 'options': options}), text=True))
+        release.require(result.get('ok') is True, 'fixture Node initialization failed')
+        return result['result']['device_id']
+
+    def state():
+        connection = sqlite3.connect((data / 'node.sqlite3').as_uri() + '?mode=ro', uri=True)
+        try:
+            bootstrap = connection.execute("SELECT value FROM identity_meta WHERE key='bootstrap_capability_hash'").fetchone()
+            release.require(bootstrap is not None, 'fixture bootstrap database record is missing')
+        finally:
+            connection.close()
+        return ([release.digest(data / name) for name in ('identity.json', 'bootstrap.json', 'data-epoch.json')], bootstrap)
+
+    def activate_fixture(released, expected):
+        identity = released['images']['core']
+        if identity not in fixtures:
+            container = subprocess.check_output(['docker', 'create', identity], text=True).strip()
+            try:
+                checked(['docker', 'cp', str(anchor), container + ':/opt/vibeface/public-bootstrap.json'])
+                fixtures[identity] = subprocess.check_output(['docker', 'commit', container], text=True).strip()
+            finally:
+                checked(['docker', 'rm', container], stdout=subprocess.DEVNULL)
+        fixture = fixtures[identity]
+        result = subprocess.run([sys.executable, '-B', str(ROOT / 'scripts/deploy-activate.py'), '--config', '-',
+                                 '--image', fixture, '--tag', released['tag'], '--source-sha', released['source_sha'],
+                                 '--version', released['version']],
+                                input=json.dumps(config), capture_output=True, text=True)
+        release.require(result.returncode == 0, 'rehearsal ' + (result.stderr.strip() or 'activation failed'))
+        receipt = json.loads(result.stdout)
+        release.require(receipt['status'] == expected and receipt['image'] == fixture
+                        and receipt['source_sha'] == released['source_sha'] and receipt['version'] == released['version'],
+                        'rehearsal receipt differs')
+        release.require(state() == preserved, 'rehearsal changed the existing Node identity or data')
+        receipts.append(receipt['status'])
+
+    try:
+        # Initialize with the old binary; only its fixture anchor differs from published bytes.
+        device = initialize(seed['images']['core'], data)
+        preserved = state()
+        (data / 'node.lock').touch()
+        checked(['chown', '-R', '1001:1001', str(data)])
+        os.chmod(data, 0o700)
+        checked(['install', '-d', '-o', 'root', '-g', '1001', '-m', '0750', str(tls)])
+        checked(['install', '-o', 'root', '-g', 'root', '-m', '0644', str(data / 'tls-cert.pem'), str(tls / 'tls-cert.pem')])
+        checked(['install', '-o', 'root', '-g', '1001', '-m', '0640', str(data / 'tls-key.pem'), str(tls / 'tls-key.pem')])
+        anchor = host / 'public-bootstrap.json'
+        anchor.write_text(json.dumps({'issuer': device, 'udp_host': '127.0.0.1', 'udp_port': 4792,
+                                      'gateway_url': public_url}))
+        config = {'project': project, 'role': 'node', 'deploy_dir': str(host / 'deploy'),
+                  'listen': '0.0.0.0:4792', 'data_dir': str(data), 'tls_dir': str(tls), 'device_id': device,
+                  'uid': 1001, 'gid': 1001, 'public_url': public_url}
+        activate_fixture(seed, 'activated')
+        if previous:
+            # Reproduce a host whose running old Core now sees the candidate's complete config format.
+            candidate = host / 'candidate-state'
+            initialize(info['images']['core'], candidate)
+            replacement = data / '.config.rehearsal.json'
+            shutil.copy2(candidate / 'config.json', replacement)
+            os.chown(replacement, 1001, 1001)
+            os.replace(replacement, data / 'config.json')
+            activate_fixture(info, 'activated')
+        activate_fixture(info, 'already_active')
+    finally:
+        checked(['docker', 'compose', '--project-name', project, '-f', str(ROOT / 'deploy/compose.yaml'), 'down'],
+                env=dict(os.environ, VIBEFACE_IMAGE=seed['images']['core']),
+                stdout=subprocess.DEVNULL)
+        if fixtures:
+            subprocess.run(['docker', 'image', 'rm', *fixtures.values()],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return {'service': 'node', 'tag': info['tag'], 'previous_tag': previous['tag'] if previous else None,
+            'mode': 'upgrade' if previous else 'first_release', 'rehearsal': receipts,
+            'identity_and_data_preserved': True}
+
+
 def self_test():
     base = {'DEPLOY_HOST': 'host.example', 'DEPLOY_USER': 'deploy', 'DEPLOY_SSH_KEY': 'fixture',
             'DEPLOY_KNOWN_HOSTS': 'fixture', 'DEPLOY_CONFIG': '{}'}
     assert transport(base) == ('host.example', 'deploy', '22')
     for key, value in (('DEPLOY_HOST', '-oProxyCommand=bad'), ('DEPLOY_USER', 'x;id'),
                        ('DEPLOY_PORT', '0'), ('DEPLOY_PORT', '65536'), ('DEPLOY_SSH_KEY', '')):
-        try:
+        with TestCase().assertRaises(ValueError, msg='accepted invalid transport'):
             transport(dict(base, **{key: value}))
-        except ValueError:
-            pass
-        else:
-            raise AssertionError('accepted invalid transport')
-    print('deployment transport self-test passed')
+    import runpy
+    from unittest.mock import patch
+    validate_config = runpy.run_path(str(ROOT / 'scripts/deploy-activate.py'))['validate_config']
+    for has_previous, failure in ((True, None), (False, None), (True, 'activation'), (True, 'data')):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary).resolve()
+            host = output / 'host'; host.mkdir()
+            current = {'tag': 'v0.0.1-nightly.20261108.1', 'version': '0.0.1-nightly.20261108.1',
+                       'source_sha': 'a' * 40, 'images': {'core': 'sha256:' + 'a' * 64}}
+            old = {'tag': 'v0.0.1-nightly.20261107.1', 'version': '0.0.1-nightly.20261107.1',
+                   'source_sha': 'b' * 40, 'images': {'core': 'sha256:' + 'b' * 64}}
+            (output / 'deployment.json').write_text(json.dumps(current))
+            initialized, activated, cleaned = [], [], []
+            images = {current['images']['core']: 'sha256:' + 'c' * 64,
+                      old['images']['core']: 'sha256:' + 'd' * 64}
+            containers = {}
+            def response(args, **kwargs):
+                if args[:2] == ['docker', 'run']:
+                    request = json.loads(kwargs['input'])
+                    assert request['command'] == 'init' and request['options']['mesh_network'] == 'deploy-fixture'
+                    assert args[args.index('--network') + 1] == 'none'
+                    identity = args[-2]
+                    initialized.append(identity)
+                    assert initialized[0] == (old if has_previous else current)['images']['core'], \
+                        'rehearsal initialized the candidate instead of the previous release'
+                    data = Path(args[args.index('-v') + 1].removesuffix(':/data'))
+                    for name in ('identity.json', 'bootstrap.json', 'data-epoch.json', 'tls-cert.pem', 'tls-key.pem'):
+                        (data / name).write_text(identity + ':' + name)
+                    (data / 'config.json').write_text(json.dumps({'format': identity}))
+                    connection = sqlite3.connect(data / 'node.sqlite3')
+                    connection.execute('CREATE TABLE identity_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+                    connection.execute("INSERT INTO identity_meta VALUES('bootstrap_capability_hash','preserved')")
+                    connection.commit(); connection.close()
+                    return json.dumps({'ok': True, 'result': {'device_id': 'e' * 64}})
+                if args[:2] == ['docker', 'create']:
+                    container = 'fixture-' + str(len(containers)); containers[container] = args[-1]
+                    return container
+                if args[:2] == ['docker', 'commit']:
+                    return images[containers[args[-1]]]
+                raise AssertionError('unexpected fixture command: ' + repr(args))
+            def command(args, **kwargs):
+                if args[0] == 'install':
+                    if '-d' in args:
+                        Path(args[-1]).mkdir()
+                    else:
+                        shutil.copyfile(args[-2], args[-1])
+                elif args[:2] == ['docker', 'compose']:
+                    assert '-f' in args and args[-1] == 'down'
+                    cleaned.append(args[args.index('--project-name') + 1])
+                elif args[0] != 'chown' and args[:2] not in (['docker', 'cp'], ['docker', 'rm']):
+                    raise AssertionError('unexpected fixture command: ' + repr(args))
+            def activation(args, **kwargs):
+                if args[:3] == ['docker', 'image', 'rm']:
+                    return subprocess.CompletedProcess(args, 0)
+                assert args[2] == str(ROOT / 'scripts/deploy-activate.py')
+                settings = json.loads(kwargs['input'])
+                validate_config(settings)
+                identity = args[args.index('--image') + 1]
+                expected = old if has_previous and not activated else current
+                assert identity == images[expected['images']['core']]
+                data = Path(settings['data_dir'])
+                assert json.loads((data / 'config.json').read_text())['format'] == expected['images']['core']
+                assert (data / 'identity.json').read_text() == (old if has_previous else current)['images']['core'] + ':identity.json'
+                if failure == 'activation' and activated:
+                    return subprocess.CompletedProcess(args, 1, '', 'fixture cross-version activation refused')
+                if failure == 'data' and activated:
+                    connection = sqlite3.connect(data / 'node.sqlite3')
+                    connection.execute("UPDATE identity_meta SET value='lost previous data'")
+                    connection.commit(); connection.close()
+                status = 'already_active' if activated and activated[-1] == identity else 'activated'
+                activated.append(identity)
+                return subprocess.CompletedProcess(args, 0, json.dumps({'status': status, 'image': identity,
+                    'source_sha': expected['source_sha'], 'version': expected['version']}), '')
+            with patch.object(os, 'geteuid', return_value=0), patch.object(sys, 'platform', 'linux'), \
+                    patch.object(os, 'chown'), patch.object(tempfile, 'mkdtemp', return_value=str(host)) as directory, \
+                    patch.object(deploy, 'previous', return_value={'tag': old['tag']} if has_previous else None), \
+                    patch(__name__ + '.build', return_value=old) as previous_build, \
+                    patch(__name__ + '.checked', side_effect=command), \
+                    patch('subprocess.check_output', side_effect=response), \
+                    patch('subprocess.run', side_effect=activation):
+                try:
+                    result = rehearse(output)
+                except ValueError as error:
+                    assert failure and ('cross-version activation refused' in str(error) or 'identity or data' in str(error))
+                else:
+                    assert failure is None, 'failed upgrade or lost data was accepted'
+                    assert result['mode'] == ('upgrade' if has_previous else 'first_release')
+                    assert result['previous_tag'] == (old['tag'] if has_previous else None)
+                    assert result['rehearsal'] == (['activated', 'activated', 'already_active'] if has_previous
+                                                   else ['activated', 'already_active'])
+                    assert result['identity_and_data_preserved'] is True
+                directory.assert_called_once_with(dir=output, prefix='rehearsal-')
+                if has_previous:
+                    previous_build.assert_called_once_with('node', old['tag'], output / 'previous')
+                    assert initialized == [old['images']['core'], current['images']['core']]
+                else:
+                    previous_build.assert_not_called()
+                    assert initialized == [current['images']['core']]
+                assert len(cleaned) == 1, 'fixture containers were not cleaned up'
+    print('deployment transport and rehearsal self-test passed')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='action', required=True)
     sub.add_parser('self-test')
+    sub.add_parser('rehearse').add_argument('--output', required=True)
     for action in ('build', 'activate'):
         command = sub.add_parser(action)
         command.add_argument('--service', choices=deploy.SERVICES, required=True)
@@ -283,6 +483,8 @@ def main():
     args = parser.parse_args()
     if args.action == 'self-test':
         self_test()
+    elif args.action == 'rehearse':
+        print(json.dumps(rehearse(args.output)))
     else:
         info = build(args.service, args.tag, args.output) if args.action == 'build' else activate(args.service, args.output)
         print(json.dumps(info))

@@ -219,7 +219,10 @@ pub struct Sink {
 
 impl Sink {
     pub fn open(dir: &Path, max_bytes: u64, keep: usize) -> Result<Self> {
-        ensure!(keep >= 1, "keep at least the current log file");
+        ensure!(
+            keep >= 2,
+            "keep the current log file and at least one rotation"
+        );
         let current = path(dir, 0);
         let file = open(&current)?;
         let len = file.metadata()?.len();
@@ -782,38 +785,6 @@ pub fn child_line(source: Source, event: &str, line: &str, thread_id: Option<&st
     } else {
         tracing::info!(source, event, thread_id, "{line}");
     }
-}
-
-/// From a separate process such as `vibeface codex call`: adds one record to this device's Node
-/// log through `/api/log` when the Node's local URL is in the environment, as it is in a
-/// coordination Agent's shell. Best effort; the command's own result never depends on it.
-pub async fn send_to_node(mut record: Value) {
-    if let Some(message) = record["message"].as_str() {
-        record["message"] = Value::String(message.chars().take(2_000).collect());
-    }
-    if let (true, Ok(conversation)) = (
-        record["conversation_id"].is_null(),
-        std::env::var("VIBEFACE_NODE_CONVERSATION"),
-    ) {
-        record["conversation_id"] = Value::String(conversation);
-    }
-    let Ok(url) = std::env::var(crate::runtime::TRIAGE_URL_ENV) else {
-        return;
-    };
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    else {
-        return;
-    };
-    let body = serde_json::json!({"source":"agent","records":[record]});
-    let _ = client
-        .post(format!("{}/api/log", url.trim_end_matches('/')))
-        .json(&body)
-        .send()
-        .await;
 }
 
 /// A Codex thread id mentioned in a line of App Server output, such as `thread_id=…`.

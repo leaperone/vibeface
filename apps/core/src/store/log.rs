@@ -11,11 +11,188 @@ use crate::{
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
+#[cfg(test)]
+pub(crate) mod test_metrics {
+    use std::cell::{Cell, RefCell};
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct Metrics {
+        pub recomputes: usize,
+        pub rebuilds: usize,
+        pub assistant_tail_skips: usize,
+        pub ingest_ns: Vec<u128>,
+        pub validation_ns: Vec<u128>,
+        pub recompute_ns: Vec<u128>,
+        pub rebuild_ns: Vec<u128>,
+    }
+    thread_local! {
+        pub(super) static METRICS: RefCell<Metrics> = RefCell::new(Metrics::default());
+        static LEGACY: Cell<bool> = const { Cell::new(false) };
+        static FULL_WORKSPACE_AUTHORIZATION: Cell<bool> = const { Cell::new(false) };
+    }
+    pub(crate) fn reset() {
+        METRICS.with(|metrics| *metrics.borrow_mut() = Metrics::default());
+    }
+    pub(crate) fn snapshot() -> Metrics {
+        METRICS.with(|metrics| metrics.borrow().clone())
+    }
+    pub(crate) fn legacy() -> bool {
+        LEGACY.with(Cell::get)
+    }
+    pub(crate) fn with_legacy<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LEGACY.with(|value| value.set(self.0));
+            }
+        }
+        let _restore = Restore(LEGACY.with(|value| value.replace(enabled)));
+        f()
+    }
+    pub(crate) fn full_workspace_authorization() -> bool {
+        FULL_WORKSPACE_AUTHORIZATION.with(Cell::get)
+    }
+    pub(crate) fn with_full_workspace_authorization<T>(f: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FULL_WORKSPACE_AUTHORIZATION.with(|value| value.set(self.0));
+            }
+        }
+        let _restore = Restore(FULL_WORKSPACE_AUTHORIZATION.with(|value| value.replace(true)));
+        f()
+    }
+    pub(super) struct IngestTimer(std::time::Instant);
+    impl IngestTimer {
+        pub(super) fn start() -> Self {
+            Self(std::time::Instant::now())
+        }
+    }
+    impl Drop for IngestTimer {
+        fn drop(&mut self) {
+            METRICS.with(|metrics| {
+                metrics
+                    .borrow_mut()
+                    .ingest_ns
+                    .push(self.0.elapsed().as_nanos())
+            });
+        }
+    }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(super) struct CausalClock(BTreeMap<String, CausalPoint>);
+
+#[derive(Serialize, Deserialize)]
+struct CausalPoint {
+    author: String,
+    seq: u64,
+}
+
+impl CausalClock {
+    fn merge(&mut self, other: Self) {
+        for (chain, point) in other.0 {
+            if self.0.get(&chain).is_none_or(|old| old.seq < point.seq) {
+                self.0.insert(chain, point);
+            }
+        }
+    }
+
+    pub(super) fn before(connection: &Connection, network: &str, event: &Event) -> Result<Self> {
+        let mut clock = Self::default();
+        for hash in event.prev.iter().chain(&event.deps) {
+            clock.include(connection, network, hash)?;
+        }
+        Ok(clock)
+    }
+
+    pub(super) fn stored(connection: &Connection, network: &str, hash: &str) -> Result<Self> {
+        let clock: String = connection.query_row(
+            "SELECT causal_clock FROM events WHERE network_id=? AND hash=?",
+            params![network, hash],
+            |row| row.get(0),
+        )?;
+        Ok(serde_json::from_str(&clock)?)
+    }
+
+    pub(super) fn include(
+        &mut self,
+        connection: &Connection,
+        network: &str,
+        hash: &str,
+    ) -> Result<()> {
+        let (chain, author, seq, clock): (String, String, u64, String) = connection
+            .query_row(
+                "SELECT causal_chain,author,seq,causal_clock FROM events WHERE network_id=? AND hash=?",
+                params![network, hash],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?
+            .context("workspace dependency is missing")?;
+        let mut parent: Self = serde_json::from_str(&clock)?;
+        parent.0.insert(chain, CausalPoint { author, seq });
+        self.merge(parent);
+        Ok(())
+    }
+
+    fn covers(&self, chain: &str, seq: u64) -> bool {
+        self.0.get(chain).is_some_and(|point| point.seq >= seq)
+    }
+
+    pub(super) fn contains(
+        &self,
+        connection: &Connection,
+        network: &str,
+        hash: &str,
+    ) -> Result<bool> {
+        let point: Option<(String, u64)> = connection
+            .query_row(
+                "SELECT causal_chain,seq FROM events WHERE network_id=? AND hash=?",
+                params![network, hash],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(point.is_some_and(|(chain, seq)| self.covers(&chain, seq)))
+    }
+
+    pub(super) fn event(
+        &self,
+        connection: &Connection,
+        network: &str,
+        hash: &str,
+    ) -> Result<Option<Event>> {
+        let row: Option<(String, u64, String)> = connection
+            .query_row(
+                "SELECT causal_chain,seq,envelope FROM events WHERE network_id=? AND hash=?",
+                params![network, hash],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((_, _, envelope)) = row.filter(|(chain, seq, _)| self.covers(chain, *seq)) else {
+            return Ok(None);
+        };
+        let envelope: SignedEvent = serde_json::from_str(&envelope)?;
+        Ok(Some(serde_json::from_str(&envelope.canonical_body)?))
+    }
+
+    pub(super) fn version_vector(&self) -> VersionVector {
+        self.0
+            .values()
+            .fold(VersionVector::new(), |mut vector, point| {
+                let seq = vector.entry(point.author.clone()).or_default();
+                *seq = (*seq).max(point.seq);
+                vector
+            })
+    }
+}
+
+/// Shared hard limit; only verified authors with a write bound receive a fair share.
 pub const MAX_PENDING_EVENTS: i64 = 10_000;
 
 pub(crate) fn blob_path(dir: &Path, hash: &str) -> PathBuf {
@@ -102,6 +279,23 @@ pub(crate) struct Placed {
     pub stored: Vec<HashedEvent>,
 }
 
+fn attestation_authorized(view: &AuthorizationView, event: &Event) -> bool {
+    event
+        .body
+        .attestation()
+        .is_none_or(|attestation| view.attester(&attestation.device_id))
+}
+
+fn input_rejection(checked: Result<()>) -> Result<Option<String>> {
+    match checked {
+        Ok(()) => Ok(None),
+        Err(error) if error.is::<rusqlite::Error>() || error.is::<serde_json::Error>() => {
+            Err(error)
+        }
+        Err(error) => Ok(Some(error.to_string())),
+    }
+}
+
 /// Verifies once, then places; events waiting on this one are placed without re-verifying.
 pub(crate) fn ingest_from(
     connection: &Connection,
@@ -110,6 +304,10 @@ pub(crate) fn ingest_from(
     seen_at_ms: i64,
     placed: &mut Placed,
 ) -> Result<IngestStatus> {
+    #[cfg(test)]
+    let _timer = test_metrics::IngestTimer::start();
+    #[cfg(test)]
+    let validation_started = std::time::Instant::now();
     let network = view.network_id.as_str();
     let event = match check_event(network, envelope) {
         Ok(event) => event,
@@ -124,9 +322,7 @@ pub(crate) fn ingest_from(
     if view.write_bound(&event.author).is_none() {
         return Ok(IngestStatus::Rejected("unknown author".into()));
     }
-    if let Some(attestation) = event.body.attestation()
-        && !view.attester(&attestation.device_id)
-    {
+    if !attestation_authorized(view, &event) {
         return Ok(IngestStatus::Rejected(
             "attestation is not signed by a client of this network".into(),
         ));
@@ -134,6 +330,13 @@ pub(crate) fn ingest_from(
     if let Err(error) = verify_event_signature(envelope, &event.author) {
         return Ok(IngestStatus::Rejected(error.to_string()));
     }
+    #[cfg(test)]
+    test_metrics::METRICS.with(|metrics| {
+        metrics
+            .borrow_mut()
+            .validation_ns
+            .push(validation_started.elapsed().as_nanos())
+    });
     let status = place(connection, view, envelope, &event, seen_at_ms, placed)?;
     if matches!(status, IngestStatus::Accepted | IngestStatus::Conflict) {
         cascade(connection, view, &envelope.hash, seen_at_ms, placed)?;
@@ -151,18 +354,20 @@ fn cascade(
     let mut ready = vec![hash.to_owned()];
     while let Some(hash) = ready.pop() {
         let waiting: Vec<String> = connection
-            .prepare(
-                "DELETE FROM pending_events WHERE network_id=? AND missing=? RETURNING envelope",
-            )?
+            .prepare("SELECT envelope FROM pending_events WHERE network_id=? AND missing=?")?
             .query_map(params![view.network_id, hash], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         for envelope in waiting {
             let envelope: SignedEvent = serde_json::from_str(&envelope)?;
             let event: Event = serde_json::from_str(&envelope.canonical_body)?;
-            if matches!(
-                place(connection, view, &envelope, &event, seen_at_ms, placed)?,
-                IngestStatus::Accepted | IngestStatus::Conflict
-            ) {
+            let status = place(connection, view, &envelope, &event, seen_at_ms, placed)?;
+            if status != IngestStatus::Pending {
+                connection.execute(
+                    "DELETE FROM pending_events WHERE network_id=? AND hash=?",
+                    params![view.network_id, envelope.hash],
+                )?;
+            }
+            if matches!(status, IngestStatus::Accepted | IngestStatus::Conflict) {
                 ready.push(envelope.hash);
             }
         }
@@ -172,24 +377,47 @@ fn cascade(
 
 fn pending(
     connection: &Connection,
-    network: &str,
+    view: &AuthorizationView,
     envelope: &SignedEvent,
+    author: &str,
     missing: &str,
 ) -> Result<IngestStatus> {
-    let count: i64 = connection.query_row(
-        "SELECT count(*) FROM pending_events WHERE network_id=?",
-        [network],
-        |r| r.get(0),
+    let network = view.network_id.as_str();
+    if connection.execute(
+        "UPDATE pending_events SET missing=? WHERE network_id=? AND hash=?",
+        params![missing, network, envelope.hash],
+    )? > 0
+    {
+        return Ok(IngestStatus::Pending);
+    }
+    let authors: BTreeSet<_> = view
+        .members
+        .iter()
+        .map(|member| member.device_id.as_str())
+        .chain(
+            view.revoked
+                .iter()
+                .map(|revoked| revoked.device_id.as_str()),
+        )
+        .filter(|author| view.write_bound(author).is_some())
+        .collect();
+    let share = MAX_PENDING_EVENTS / authors.len().max(1) as i64;
+    let (total, count): (i64, i64) = connection.query_row(
+        "SELECT count(*),count(*) FILTER (WHERE author=?2) FROM pending_events WHERE network_id=?1",
+        params![network, author],
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    if count >= MAX_PENDING_EVENTS {
+    // New members can shrink shares; keep existing waits intact even if they now fill the total.
+    if total >= MAX_PENDING_EVENTS || count >= share {
         return Ok(IngestStatus::Rejected("too many pending events".into()));
     }
     connection.execute(
-        "INSERT INTO pending_events(network_id,hash,envelope,missing) VALUES(?,?,?,?)",
+        "INSERT INTO pending_events(network_id,hash,envelope,author,missing) VALUES(?,?,?,?,?)",
         params![
             network,
             envelope.hash,
             serde_json::to_string(envelope)?,
+            author,
             missing
         ],
     )?;
@@ -218,7 +446,7 @@ fn place(
             None if event.seq <= max + 1
                 || exists(connection, "pending_events", network, prev)? =>
             {
-                return pending(connection, network, envelope, prev);
+                return pending(connection, view, envelope, &event.author, prev);
             }
             None => {
                 return Ok(IngestStatus::Rejected(format!(
@@ -237,26 +465,45 @@ fn place(
     }
     for dep in &event.deps {
         if !exists(connection, "events", network, dep)? {
-            return pending(connection, network, envelope, dep);
+            return pending(connection, view, envelope, &event.author, dep);
         }
-    }
-    if let Err(error) = super::workspace::authorize_event(connection, network, event) {
-        return Ok(IngestStatus::Rejected(error.to_string()));
-    }
-    if let Err(error) = authorize_memory(connection, network, event) {
-        return Ok(IngestStatus::Rejected(error.to_string()));
-    }
-    if let Err(error) = authorize_cause(connection, network, event) {
-        return Ok(IngestStatus::Rejected(error.to_string()));
-    }
-    if let Err(error) = authorize_owner(connection, network, event) {
-        tracing::warn!(event = "sync.event_rejected", author = event.author, seq = event.seq, scope = event.scope_id, %error, "rejected a write only the conversation's scheduling Node makes");
-        return Ok(IngestStatus::Rejected(error.to_string()));
     }
     let main = match &event.prev {
         Some(prev) => *prev == head_hash,
         None => max == 0,
     };
+    // Dependencies are present and signatures were checked at admission, including pending
+    // events. Keep authorization failures inside input_rejection so one bad row cannot abort
+    // an otherwise valid batch. SQL/decoding failures still propagate as storage failures.
+    let authorization = (|| {
+        let fresh_main_input = main
+            && event.seq == max + 1
+            && matches!(
+                &event.body,
+                EventBody::InputPosted {
+                    target: crate::workspace::InputTarget::BotMain { .. },
+                    ..
+                }
+            )
+            && matches!(view.write_bound(&event.author), Some(WriteBound::Unlimited))
+            && first_fork(connection, network, &event.author)?.is_none();
+        #[cfg(test)]
+        let fresh_main_input = fresh_main_input && !test_metrics::full_workspace_authorization();
+        if fresh_main_input
+            && super::workspace::authorize_fresh_bot_main(connection, network, event)?
+        {
+            Ok(())
+        } else {
+            super::workspace::authorize_event(connection, network, event)
+        }
+    })()
+    .and_then(|()| authorize_memory(connection, network, event))
+    .and_then(|()| authorize_cause(connection, view, event))
+    .and_then(|()| authorize_owner(connection, view, event));
+    if let Some(error) = input_rejection(authorization)? {
+        tracing::warn!(event = "sync.event_rejected", author = event.author, seq = event.seq, scope = event.scope_id, %error, "rejected an unauthorized write");
+        return Ok(IngestStatus::Rejected(error.to_string()));
+    }
     placed.stale |= !insert_event(connection, view, envelope, event, seen_at_ms, main)?;
     if !main {
         return Ok(IngestStatus::Conflict);
@@ -343,7 +590,8 @@ fn authorize_memory(connection: &Connection, network: &str, event: &Event) -> Re
 /// a bot change, or a bot it creates or deletes. One of the event's stored parents must be that
 /// signed user message. The one change without a cause is a new one-shot schedule: a reminder
 /// the bot sets itself.
-fn authorize_cause(connection: &Connection, network: &str, event: &Event) -> Result<()> {
+fn authorize_cause(connection: &Connection, view: &AuthorizationView, event: &Event) -> Result<()> {
+    let network = view.network_id.as_str();
     let cause = match &event.body {
         EventBody::BotDeleted {
             cause: Some(cause), ..
@@ -378,6 +626,9 @@ fn authorize_cause(connection: &Connection, network: &str, event: &Event) -> Res
         }
         | EventBody::ConversationOwner {
             cause: Some(cause), ..
+        }
+        | EventBody::WorkspaceCommanded {
+            cause: Some(cause), ..
         } => cause,
         _ => return Ok(()),
     };
@@ -397,13 +648,17 @@ fn authorize_cause(connection: &Connection, network: &str, event: &Event) -> Res
         let Some(parent) = event_from(connection, network, parent)? else {
             continue;
         };
-        if parent.scope_id == cause.conversation_id
-            && matches!(&parent.body, EventBody::MessagePosted {
-                message_id, role: Role::User, answers: None, attestation: Some(_), ..
-            } | EventBody::InputPosted {
+        let signed_request = matches!(&parent.body, EventBody::InputPosted {
                 message_id, target: crate::workspace::InputTarget::BotMain { .. },
                 attestation: Some(_), ..
             } if *message_id == cause.message_id)
+            || matches!(&event.body, EventBody::WorkspaceCommanded { .. })
+                && matches!(&parent.body, EventBody::InputPosted {
+                    message_id, attestation: Some(_), ..
+                } if *message_id == cause.message_id);
+        if parent.scope_id == cause.conversation_id
+            && signed_request
+            && attestation_authorized(view, &parent)
         {
             return Ok(());
         }
@@ -411,13 +666,18 @@ fn authorize_cause(connection: &Connection, network: &str, event: &Event) -> Res
     bail!("a bot's write for the user must follow the user's own signed message")
 }
 
-/// The conversation whose scheduling Node alone makes this write: a checkpoint, a reminder its
-/// bot set itself, a schedule time it takes, or its bot's message to another bot.
+/// The conversation whose scheduling Node makes this write. A work target may also report its
+/// own unknown result; `authorize_owner` checks that exception against its earlier dispatch.
 fn owner_scope(event: &Event) -> Option<&str> {
     match &event.body {
         EventBody::ContextCheckpoint { .. }
         | EventBody::BotChanged { cause: None, .. }
-        | EventBody::ScheduleRunClaimed { .. } => Some(&event.scope_id),
+        | EventBody::ScheduleRunClaimed { .. }
+        | EventBody::WorkFinished {
+            outcome: WorkOutcome::Unverified,
+            attestation: None,
+            ..
+        } => Some(&event.scope_id),
         EventBody::BotMessaged { from, .. } => Some(&from.conversation_id),
         _ => None,
     }
@@ -428,10 +688,24 @@ fn owner_scope(event: &Event) -> Option<&str> {
 /// to that dependency), those of the highest epoch must name the author. An owner change the
 /// author had not seen yet does not count against it. A schedule claim names that epoch. The
 /// parents are stored before an event is placed, so every replica reads the same records.
-fn authorize_owner(connection: &Connection, network: &str, event: &Event) -> Result<()> {
+fn authorize_owner(connection: &Connection, view: &AuthorizationView, event: &Event) -> Result<()> {
+    let network = view.network_id.as_str();
     let Some(scope) = owner_scope(event) else {
         return Ok(());
     };
+    if let EventBody::WorkFinished { work_id, .. } = &event.body
+        && connection
+            .query_row(
+                "SELECT 1 FROM events WHERE network_id=? AND scope_id=? AND kind='work_dispatched' AND subject=? AND author=? AND seq<? LIMIT 1",
+                params![network, scope, work_id, event.author, event.seq],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+    {
+        // The target's own earlier dispatch authorizes its unknown result regardless of owner changes.
+        return Ok(());
+    }
     let mut seen = BTreeMap::from([(event.author.clone(), event.seq - 1)]);
     for dep in &event.deps {
         let (author, seq): (String, u64) = connection.query_row(
@@ -453,11 +727,17 @@ fn authorize_owner(connection: &Connection, network: &str, event: &Event) -> Res
             continue;
         }
         let envelope: SignedEvent = serde_json::from_str(&row.get::<_, String>(2)?)?;
+        let owner: Event = serde_json::from_str(&envelope.canonical_body)?;
+        if !attestation_authorized(view, &owner)
+            || input_rejection(authorize_cause(connection, view, &owner))?.is_some()
+        {
+            continue;
+        }
         let EventBody::ConversationOwner {
             scheduler_node,
             epoch,
             ..
-        } = serde_json::from_str::<Event>(&envelope.canonical_body)?.body
+        } = owner.body
         else {
             continue;
         };
@@ -480,19 +760,16 @@ fn authorize_owner(connection: &Connection, network: &str, event: &Event) -> Res
     Ok(())
 }
 
-fn has_forks(connection: &Connection, network: &str, author: &str) -> Result<bool> {
-    Ok(connection
-        .query_row(
-            "SELECT 1 FROM events WHERE network_id=? AND author=? AND main=0 LIMIT 1",
-            params![network, author],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some())
+fn first_fork(connection: &Connection, network: &str, author: &str) -> Result<Option<u64>> {
+    Ok(connection.query_row(
+        "SELECT min(seq) FROM events WHERE network_id=? AND author=? AND main=0",
+        params![network, author],
+        |row| row.get(0),
+    )?)
 }
 
-/// Stores the event and applies it at once when it plainly counts. Returns false when only a
-/// recompute can tell: it forks its log, or its log has forked.
+/// Stores the event and applies it when it plainly counts. Returns false when its effect
+/// requires recomputation. A proven ineffective assistant tail needs no recomputation.
 fn insert_event(
     connection: &Connection,
     view: &AuthorizationView,
@@ -502,8 +779,28 @@ fn insert_event(
     main: bool,
 ) -> Result<bool> {
     let network = view.network_id.as_str();
-    let settled = main && !has_forks(connection, network, &event.author)?;
+    let fork = first_fork(connection, network, &event.author)?;
+    let settled = main && fork.is_none();
+    // An existing unlimited fork makes this exact tail ineffective. Assistant messages
+    // supply neither owner nor dispatch evidence, and cannot move the earliest fork.
+    let ineffective_assistant_tail =
+        matches!(view.write_bound(&event.author), Some(WriteBound::Unlimited))
+            && fork.is_some_and(|seq| event.seq >= seq)
+            && matches!(
+                &event.body,
+                EventBody::MessagePosted {
+                    role: Role::Assistant,
+                    ..
+                }
+            );
+    #[cfg(test)]
+    let ineffective_assistant_tail = ineffective_assistant_tail && !test_metrics::legacy();
+    #[cfg(test)]
+    if ineffective_assistant_tail {
+        test_metrics::METRICS.with(|metrics| metrics.borrow_mut().assistant_tail_skips += 1);
+    }
     let effective = settled
+        && attestation_authorized(view, event)
         && match view.write_bound(&event.author) {
             Some(WriteBound::Unlimited) => true,
             Some(WriteBound::Cutoff(revocation)) => event.seq <= revocation.cutoff_seq,
@@ -538,9 +835,20 @@ fn insert_event(
             "event writer clock differs from this Node's first-seen clock"
         );
     }
+    let clock = CausalClock::before(connection, network, event)?;
+    // A chain only extends at its tail; a late fork starts a separate exact prefix.
+    let chain = if let Some(prev) = &event.prev {
+        connection.query_row(
+            "SELECT causal_chain FROM events p WHERE network_id=?1 AND hash=?2 AND NOT EXISTS (SELECT 1 FROM events n WHERE n.network_id=p.network_id AND n.causal_chain=p.causal_chain AND n.seq>p.seq)",
+            params![network, prev],
+            |row| row.get::<_, String>(0),
+        ).optional()?.unwrap_or_else(|| envelope.hash.clone())
+    } else {
+        envelope.hash.clone()
+    };
     connection.execute(
-        "INSERT INTO events(network_id,author,seq,hash,scope_id,lamport,created_at_ms,seen_at_ms,envelope,main,effective,kind,subject) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        params![network, event.author, event.seq, envelope.hash, event.scope_id, lamport, event.created_at_ms, seen_at_ms, serde_json::to_string(envelope)?, main, effective, event.body.kind(), event.body.subject()],
+        "INSERT INTO events(network_id,author,seq,hash,scope_id,lamport,created_at_ms,seen_at_ms,envelope,main,effective,kind,subject,causal_chain,causal_clock) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        params![network, event.author, event.seq, envelope.hash, event.scope_id, lamport, event.created_at_ms, seen_at_ms, serde_json::to_string(envelope)?, main, effective, event.body.kind(), event.body.subject(), chain, serde_json::to_string(&clock)?],
     )?;
     for blob in &event.blobs {
         connection.execute(
@@ -565,7 +873,7 @@ fn insert_event(
             true,
         )?;
     }
-    Ok(settled)
+    Ok(settled || ineffective_assistant_tail)
 }
 
 /// The events that count for one author: a current member's log up to its first fork; a former
@@ -617,29 +925,45 @@ fn effective_set(
     Ok(wanted)
 }
 
-/// Brings every `effective` flag in line with `view` and the fork evidence. When one moves, the
-/// projections are rebuilt from the effective events in shared order; local ledgers are left
-/// alone. Returns whether the projections were rebuilt.
+/// Brings every `effective` flag in line with `view`, its attesters and the fork evidence. When
+/// one moves, projections are rebuilt in shared order; signed history and local ledgers remain.
+/// Returns whether the projections were rebuilt.
 pub(crate) fn recompute(connection: &Connection, view: &AuthorizationView) -> Result<bool> {
+    #[cfg(test)]
+    let recompute_started = std::time::Instant::now();
+    #[cfg(test)]
+    test_metrics::METRICS.with(|metrics| metrics.borrow_mut().recomputes += 1);
     let network = view.network_id.as_str();
     let mut logs: BTreeMap<String, Vec<(u64, String, bool, bool)>> = BTreeMap::new();
+    let mut unauthorized = BTreeSet::new();
     {
-        let mut statement = connection
-            .prepare("SELECT author,seq,hash,main,effective FROM events WHERE network_id=?")?;
+        let mut statement = connection.prepare(
+            "SELECT author,seq,hash,main,effective,envelope FROM events WHERE network_id=?",
+        )?;
         let rows = statement.query_map([network], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?),
+                r.get::<_, String>(5)?,
             ))
         })?;
         for row in rows {
-            let (author, row) = row?;
+            let (author, row, envelope) = row?;
+            let envelope: SignedEvent = serde_json::from_str(&envelope)?;
+            let event: Event = serde_json::from_str(&envelope.canonical_body)?;
+            if !attestation_authorized(view, &event)
+                || input_rejection(authorize_cause(connection, view, &event))?.is_some()
+                || input_rejection(authorize_owner(connection, view, &event))?.is_some()
+            {
+                unauthorized.insert(envelope.hash);
+            }
             logs.entry(author).or_default().push(row);
         }
     }
     let mut flips = Vec::new();
     for (author, rows) in &logs {
-        let wanted = effective_set(connection, view, author, rows)?;
+        let mut wanted = effective_set(connection, view, author, rows)?;
+        wanted.retain(|hash| !unauthorized.contains(hash));
         for (_, hash, _, effective) in rows {
             if *effective != wanted.contains(hash) {
                 flips.push((hash, !effective));
@@ -647,8 +971,17 @@ pub(crate) fn recompute(connection: &Connection, view: &AuthorizationView) -> Re
         }
     }
     if flips.is_empty() {
+        #[cfg(test)]
+        test_metrics::METRICS.with(|metrics| {
+            metrics
+                .borrow_mut()
+                .recompute_ns
+                .push(recompute_started.elapsed().as_nanos())
+        });
         return Ok(false);
     }
+    #[cfg(test)]
+    let rebuild_started = std::time::Instant::now();
     for (hash, effective) in flips {
         connection.execute(
             "UPDATE events SET effective=? WHERE network_id=? AND hash=?",
@@ -675,6 +1008,17 @@ pub(crate) fn recompute(connection: &Connection, view: &AuthorizationView) -> Re
             false,
         )?;
     }
+    #[cfg(test)]
+    test_metrics::METRICS.with(|metrics| {
+        let mut metrics = metrics.borrow_mut();
+        metrics.rebuilds += 1;
+        metrics
+            .rebuild_ns
+            .push(rebuild_started.elapsed().as_nanos());
+        metrics
+            .recompute_ns
+            .push(recompute_started.elapsed().as_nanos());
+    });
     Ok(true)
 }
 
@@ -785,10 +1129,27 @@ pub(crate) fn append_from(
         blobs,
     })?;
     let event = check_event(network, &envelope).context("appended event is invalid")?;
-    super::workspace::authorize_event(connection, network, &event)?;
+    // This branch is only for this transaction's freshly signed local head extension.
+    // Forked/cutoff authors retain causal authorization, as does full recomputation.
+    let fresh_main_input =
+        matches!(
+            &event.body,
+            EventBody::InputPosted {
+                target: crate::workspace::InputTarget::BotMain { .. },
+                ..
+            }
+        ) && matches!(view.write_bound(&event.author), Some(WriteBound::Unlimited))
+            && first_fork(connection, network, &event.author)?.is_none();
+    #[cfg(test)]
+    let fresh_main_input = fresh_main_input && !test_metrics::full_workspace_authorization();
+    let fresh_main_input = fresh_main_input
+        && super::workspace::authorize_fresh_bot_main(connection, network, &event)?;
+    if !fresh_main_input {
+        super::workspace::authorize_event(connection, network, &event)?;
+    }
     authorize_memory(connection, network, &event)?;
-    authorize_cause(connection, network, &event)?;
-    authorize_owner(connection, network, &event)?;
+    authorize_cause(connection, &view, &event)?;
+    authorize_owner(connection, &view, &event)?;
     ensure!(
         insert_event(connection, &view, &envelope, &event, created_at_ms, true)?,
         "this Node's log has forked and it no longer writes"

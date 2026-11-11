@@ -14,32 +14,7 @@ pub const WIRE_VERSION: u32 = 1;
 pub const MAX_EVENT_BYTES: usize = 1_048_576;
 pub const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(deny_unknown_fields)]
-pub struct BlobRef {
-    pub hash: String,
-    pub size: u64,
-}
-
 pub const MAX_ATTACHMENT_NAME_BYTES: usize = 255;
-
-/// A file the user attached to a message. The name belongs to the message, not the content.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(deny_unknown_fields)]
-pub struct Attachment {
-    pub hash: String,
-    pub size: u64,
-    pub name: String,
-}
-
-impl Attachment {
-    pub fn blob(&self) -> BlobRef {
-        BlobRef {
-            hash: self.hash.clone(),
-            size: self.size,
-        }
-    }
-}
 
 /// A file name as the web signs it: no path separators or control characters, at most
 /// `MAX_ATTACHMENT_NAME_BYTES`, never empty.
@@ -420,15 +395,6 @@ fn is_zero(value: &u8) -> bool {
     *value == 0
 }
 
-/// What the user's web client does to a schedule; it never creates or edits one.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ScheduleAction {
-    Pause,
-    Resume,
-    Delete,
-}
-
 /// The user's own signed message that started the turn a write stands on.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -446,29 +412,24 @@ pub struct Sender {
 }
 
 /// Where a memory came from. Agent writes are staged until the turn completes; user-controlled
-/// values cannot be replaced by an automatic review.
+/// values cannot be replaced by automatic writes.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryOrigin {
     #[default]
     Agent,
     User,
-    Review,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AutomaticMemoryOrigin {
     Agent,
-    Review,
 }
 
 impl From<AutomaticMemoryOrigin> for MemoryOrigin {
-    fn from(origin: AutomaticMemoryOrigin) -> Self {
-        match origin {
-            AutomaticMemoryOrigin::Agent => Self::Agent,
-            AutomaticMemoryOrigin::Review => Self::Review,
-        }
+    fn from(_: AutomaticMemoryOrigin) -> Self {
+        Self::Agent
     }
 }
 
@@ -503,10 +464,7 @@ impl MemoryBase {
         );
         if let Some(version) = &self.version {
             for hash in [&version.revision, &version.source_event_hash] {
-                anyhow::ensure!(
-                    hex::decode(hash).is_ok_and(|value| value.len() == 32),
-                    "invalid memory version"
-                );
+                vibeface_secure::membership::validate_hash(hash)?;
             }
         }
         Ok(())
@@ -805,10 +763,8 @@ pub fn looks_secret(text: &str) -> bool {
         "hf_",
         "npm_",
     ];
-    if MARKERS
-        .iter()
-        .any(|marker| text.to_lowercase().contains(marker))
-    {
+    let lower = text.to_lowercase();
+    if MARKERS.iter().any(|marker| lower.contains(marker)) {
         return true;
     }
     text.split(|c: char| c.is_whitespace() || "\"'`,;()[]{}<>".contains(c))
@@ -941,7 +897,7 @@ pub enum EventBody {
     ConversationCreated {
         title: String,
     },
-    /// The user's choice of scheduling Node; the highest epoch wins, ties pick the smaller hash.
+    /// The user's choice of scheduling Node; the highest epoch wins, ties pick the smaller request key.
     /// A bot another bot creates gets its first owner through the user's message `cause`.
     ConversationOwner {
         scheduler_node: DeviceId,
@@ -1045,8 +1001,8 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
     },
-    /// Written by the target. The user settles an `unverified` result through any entry Node,
-    /// signed; the owner records `unverified` after the target is removed.
+    /// Written by the target, including `unverified`. The user settles an unknown result through
+    /// any entry Node, signed; the causal owner may also record it as `unverified`.
     WorkFinished {
         work_id: String,
         outcome: WorkOutcome,
@@ -1522,3 +1478,5 @@ pub enum IngestStatus {
     Conflict,
     Rejected(String),
 }
+
+pub use vibeface_protocol::workspace::{Attachment, BlobRef, ScheduleAction};

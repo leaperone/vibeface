@@ -3,8 +3,8 @@ import { AlarmClock, ArrowRight, ArrowRightLeft, BookOpen, Bot, ChevronRight, Ci
 import { useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { failureText, taskError, workFailure, type FailureKind } from '@vibeface/client/lib/errors.ts'
-import { canRetryJob, runtimeLabel } from '@vibeface/client/chat/protocol.ts'
+import { failureText, outcomeUnknown, taskError, workFailure, type FailureKind } from '@vibeface/client/lib/errors.ts'
+import { runtimeLabel } from '@vibeface/client/chat/protocol.ts'
 import { providerNames, type ProviderId } from '@vibeface/client/lib/node.ts'
 import { changeTitle, firedAt, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { chatTaskState, interruptedCopy, nodeName, queueHoldLabels, staleTaskLabel, taskActive, taskAgent, taskCopy, taskLabel, taskProgress, taskStale } from '@vibeface/client/workspace/labels.ts'
@@ -28,7 +28,7 @@ export type Row = { key: string; node: ReactNode }
 const cause = (kind: FailureKind | undefined, raw: string | null | undefined) => failureText(kind) || (raw ? taskError(raw).split('\n').at(-1) ?? '' : '')
 
 /** Plain-language reason a work needs the person; the device's own words stay out of the card. */
-export function confirmText(check: Pick<WorkCheck, 'reason' | 'detail'>, device: string): string {
+function confirmText(check: Pick<WorkCheck, 'reason' | 'detail'>, device: string): string {
   if (check.reason === 'offline') return `${device} 离线了，报不回这个任务的结果。`
   if (check.reason === 'disconnected') return `${device} 上的 Codex 断开了，报不回这个任务的结果。`
   if (check.detail.startsWith('设备已移除')) return `${device} 已移除，报不回这个任务的结果。`
@@ -71,7 +71,7 @@ export function useChatExtras(conversationId: string, botId: string) {
     if (job.state === 'reconciling' || job.pending_check) cards.push(<ActionCard key={`reconcile:${job.trigger}`} icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => shared.refresh()}>再查一次</ActionButton>}><Text className="text-meta text-muted-foreground">设备正在查询上次回复，系统不会自动重发。</Text></ActionCard>)
     const message = data.messages.find((message) => message.message_id === job.message_id && message.role === 'user')
     if (job.state === 'queued' && message) add(job.message_id, { key: `queued:${job.trigger}`, node: <Text className="text-meta text-muted-foreground">{job.hold_reason ? queueHoldLabels[job.hold_reason] : '等待开始工作'}</Text> })
-    if ((job.state === 'failed' || job.state === 'rejected') && job.message_id && shown.has(job.message_id)) add(at, { key: `job:${job.trigger}`, node: <JobLine job={job} /> })
+    if ((job.state === 'failed' || job.state === 'rejected') && job.message_id && shown.has(job.message_id) && !shown.has(job.reply_message_id ?? '')) add(at, { key: `job:${job.trigger}`, node: <JobLine job={job} /> })
   }
   const changes = placeChanges(data.messages, data.changes)
   const schedules = data.bot_settings.schedules
@@ -141,11 +141,13 @@ function TaskCard({ work, state, stale, away, joined, botId, device, agent, prog
 function JobLine({ job }: { job: ManagerJob }) {
   const shared = useLive()
   const reason = job.failure ? cause(job.failure.kind, job.failure.detail) : ''
-  const message = shared?.data?.messages.find((message) => message.message_id === job.message_id && message.role === 'user')
+  const newest = shared?.data?.messages.at(-1)
+  const retry = shared && newest?.role === 'user' && newest.message_id === job.message_id && !outcomeUnknown(job.failure?.kind, job.failure?.detail)
+    ? () => shared.retryReply(newest.message_id) : undefined
   return <View className="flex-row flex-wrap items-center gap-x-2 gap-y-1">
     <View className="flex-row items-center gap-1"><Icon as={CircleX} className="size-4 text-danger" /><Text className="text-meta text-danger">Bot 没能回复</Text></View>
     {reason ? <Text className="shrink text-meta text-muted-foreground">{reason}</Text> : null}
-    {shared ? canRetryJob(job) && message && !message.attachments?.length ? <ActionButton variant="ghost" disabled={!shared.writable} action={() => shared.sendMessage(message.text)}>再发一次</ActionButton> : <ActionButton variant="ghost" action={() => shared.refresh()}>再查一次</ActionButton> : null}
+    {shared ? retry ? <ActionButton variant="ghost" disabled={!shared.writable} action={retry}>重试</ActionButton> : <ActionButton variant="ghost" action={() => shared.refresh()}>再查一次</ActionButton> : null}
   </View>
 }
 

@@ -168,7 +168,7 @@ impl Delivery {
                 ensure!(prior.completed.is_some(),"another receiving key operation is unresolved; reconcile its original intent first");
             }
             let current_label=current_key_label(&config)?;
-            let current=store.value(&current_label)?.map(|bytes|serde_json::from_slice::<ReceivingMaterial>(&bytes)).transpose()?;
+            let current=store.value(&current_label)?.map(Zeroizing::new).map(|bytes|serde_json::from_slice::<ReceivingMaterial>(&bytes)).transpose()?;
             if action == KeyAction::Rotate {
                 let confirmed_active = match &current {
                     Some(material) => material.binding.binding.action == BindingAction::Active
@@ -207,12 +207,14 @@ impl Delivery {
             Ok(operation)
         })
     }
-    pub async fn local_key_operation(
+    pub(crate) async fn local_key_operation(
         &self,
         action: KeyAction,
         intent: &str,
         gas_cap: &str,
+        diagnostics: Option<&proof::Diagnostics>,
     ) -> Result<Value> {
+        let mut preproof = proof::DiagnosticStage::new(diagnostics, "key_preproof", "key");
         ensure!(
             uuid::Uuid::parse_str(intent)?.to_string() == intent,
             "receiving key intent must be a canonical UUID"
@@ -267,9 +269,11 @@ impl Delivery {
                 true,
             );
             result["transaction_phase"] = json!(transaction.map(|tx| tx.phase));
+            preproof.ok();
             return Ok(result);
         }
         if let Some(completion) = operation.completed {
+            preproof.ok();
             return Ok(key_result(
                 &operation,
                 if matches!(completion, KeyCompletion::Confirmed) {
@@ -292,6 +296,8 @@ impl Delivery {
             store.put_value(&format!("local-spend:key-{intent}"), gas_cap.as_bytes())
         })?;
         let seal = if let Some(seal) = self.with_store(|store| store.value(&proof_id))? {
+            preproof.ok();
+            drop(preproof);
             seal
         } else {
             let input = ProofInput {
@@ -302,11 +308,24 @@ impl Delivery {
                 },
             };
             let path = self.with_store(|store| store.reserve_proof(&digest))?;
-            let seal = self.proofs.prove(&config, &input, &path).await?;
+            preproof.ok();
+            drop(preproof);
+            let seal = self
+                .proofs
+                .prove(
+                    &config,
+                    &input,
+                    &path,
+                    proof::ProofDiagnostics::Registration(diagnostics),
+                )
+                .await?;
+            let mut stored = proof::DiagnosticStage::new(diagnostics, "key_proof_store", "key");
             self.with_store(|store| store.put_value(&proof_id, &seal))?;
+            stored.ok();
             seal
         };
         let id = operation.transaction_id();
+        let mut transaction = proof::DiagnosticStage::new(diagnostics, "register_tx", "key");
         let observed = chain
             .execute(
                 self,
@@ -315,6 +334,9 @@ impl Delivery {
                 gas_cap,
             )
             .await?;
+        transaction.ok();
+        drop(transaction);
+        let mut registry_after = proof::DiagnosticStage::new(diagnostics, "registry_after", "key");
         self.finish_key_operation(&chain, &id, &observed.phase)
             .await?;
         let registry = chain.current_key(peer).await?;
@@ -330,6 +352,7 @@ impl Delivery {
             registered,
         );
         result["transaction_phase"] = json!(observed.phase);
+        registry_after.ok();
         Ok(result)
     }
     pub(super) async fn finish_key_operation(
@@ -506,6 +529,12 @@ mod tests {
     fn receiving_key_intents_keep_the_same_binding_across_retries_and_restarts() {
         let (node, identity, dir) = node();
         let original = node.key_binding(Mode::Paid).unwrap();
+        let missing = node
+            .receiver_secret([0x99; 32])
+            .err()
+            .expect("old key must stay unavailable");
+        assert!(missing.is::<ReceivingKeyUnavailable>());
+        assert_eq!(node.key_binding(Mode::Paid).unwrap(), original);
         let current = record(&original.binding);
         let intent = uuid::Uuid::new_v4().to_string();
         let operation = node
@@ -732,6 +761,7 @@ mod tests {
                 KeyAction::Rotate,
                 &uuid::Uuid::new_v4().to_string(),
                 "1000000000000000",
+                None,
             )
             .await
             .unwrap_err();

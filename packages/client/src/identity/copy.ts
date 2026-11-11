@@ -26,7 +26,7 @@ export const joinCopy = {
 
 /**
  * Why this computer's join ended and what to do next, from the `reason` the Node reports. The patterns and words follow
- * `join_failure_text` in apps/core/src/main.rs, which `vibeface join` prints; only the next step is the page's own.
+ * `join_failure_text` in apps/cli/src/main.rs, which `vibeface join` prints; only the next step is the page's own.
  */
 export const nodeJoinCopy = {
   used: '这条加入链接已经用过了。在管理设备上点“添加设备”重新生成，再粘贴新链接。',
@@ -112,7 +112,7 @@ export const eraseSoleManagerText = (self: string) => `${self}是唯一的管理
 /** A join link from another network, opened on a device already in one. */
 export const switchCopy = {
   title: '换到新的网络？',
-  erase: (self: string) => `${self}会离开当前网络，并清除本机数据`,
+  erase: (self: string) => `${self}会离开当前网络，并清除 Vibeface 应用内数据。已导出的副本和照片、文件原件仍由你保管。`,
   leave: (self: string) => `${self}会离开当前网络`,
   confirm: '换网络',
 }

@@ -38,7 +38,6 @@ pub enum Phase {
     Recoverable,
     Paid,
     Partial,
-    Refundable,
     Refunded,
     Reconciling,
     KeyUnavailable,
@@ -58,8 +57,6 @@ pub enum Evidence {
 pub enum PaymentState {
     Free,
     Prepared,
-    Submitted,
-    Included,
     Confirmed,
     Earned,
     Withdrawn,
@@ -95,6 +92,24 @@ pub struct Payment {
     pub withdrawn: String,
     pub refunded: String,
     pub tx_hash: Option<String>,
+    pub budget_id: Option<String>,
+    pub settlement: Option<BudgetSettlement>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetSettlement {
+    pub earned: String,
+    pub withdrawn: String,
+    pub refunded: String,
+    pub publication: Option<PublicationView>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicationView {
+    pub state: String,
+    pub total_amount: String,
+    pub economic_cutoff: u64,
+    pub availability_risk: Option<String>,
 }
 impl Payment {
     pub fn free() -> Self {
@@ -113,6 +128,8 @@ impl Payment {
             withdrawn: "0".into(),
             refunded: "0".into(),
             tx_hash: None,
+            budget_id: None,
+            settlement: None,
         }
     }
 }
@@ -185,6 +202,46 @@ pub struct StoredOrder {
     pub grants: Vec<ServiceGrant>,
     pub accepted: bool,
     pub notified: bool,
+    pub allocation_batch: Vec<String>,
+    #[serde(skip)]
+    pub chain_observed_at_ms: i64,
+    #[serde(skip)]
+    pub settlement_complete: bool,
+}
+impl StoredOrder {
+    pub(super) fn historical(&self) -> bool {
+        self.settlement_complete
+            && self
+                .view
+                .payment
+                .settlement
+                .as_ref()
+                .is_some_and(|budget| budget.earned == budget.withdrawn)
+            && self
+                .view
+                .windows
+                .iter()
+                .all(|window| matches!(window.state, WindowState::Earned | WindowState::Refunded))
+            && !self.resume_requested
+            && self.view.error.is_none()
+            && !matches!(
+                self.view.phase,
+                Phase::Reconciling | Phase::KeyUnavailable | Phase::Failed
+            )
+            && self.view.payment.state != PaymentState::Unknown
+            && (self.view.role != Role::Receiver
+                || self
+                    .view
+                    .windows
+                    .iter()
+                    .all(|window| window.state == WindowState::Refunded)
+                || self.view.name.is_some()
+                    && self.view.sha256.is_some()
+                    && matches!(
+                        self.view.evidence,
+                        Evidence::Recoverable | Evidence::DecryptionProven
+                    ))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -199,6 +256,7 @@ pub struct Prepare {
     pub content_base64: String,
     pub max_service_amount: String,
     pub max_gas_amount: String,
+    pub budget_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,6 +320,7 @@ pub enum ServiceRequest {
         binding: SignedKeyBinding,
         file_bytes: u64,
         intent_id: String,
+        budget_id: String,
     },
     Offer {
         mode: Mode,
@@ -269,6 +328,7 @@ pub enum ServiceRequest {
         file_bytes: u64,
         intent_id: String,
         wallet_signature: Vec<u8>,
+        budget_id: String,
     },
     Grant {
         order_id: String,

@@ -8,8 +8,9 @@ description: 构建 Vibeface iOS 设备归档和签名 IPA，先通过 TestFligh
 iOS 先通过 TestFlight 内测，验证后再上 App Store。当前工作流只构建和校验，
 不上传 App Store Connect，也不提交商店审核。
 
-`release-ios.yml` 是可复用工作流，由产品发布或 CI 的 `mobile_apps=ios`
-入口调用。它从同一份 React Native App 与 Rust secure-native XCFramework
+`release-ios.yml` 是可复用工作流，由产品 `release.yml` 或手动 `ci-mobile-device.yml` 的 `platforms=ios`、`both` 入口调用。
+手动设备构建默认不发布。`mobile.yml` 的 iOS 模拟器 UI 验收使用另一条路径。
+它从同一份 React Native App 与 Rust secure-native XCFramework
 构建 `arm64` iPhoneOS 设备归档，核对真正的设备架构、源码提交、bundle ID、
 发行版本、App 版本和构建号。模拟器 App 不能替代设备归档。
 
@@ -27,7 +28,7 @@ iOS 先通过 TestFlight 内测，验证后再上 App Store。当前工作流只
 请求的分发方式，再签名归档并导出 `vibeface-<releaseVersion>-ios.ipa`。
 输出包含经签名与描述文件校验的 SHA256 和来源收据。只配置部分 secrets 时构建失败。
 
-每日 Nightly 的版本准备会将 iOS `buildNumber` 递增一次，同日恢复沿用已经准备的值。
+每个四小时 Nightly 批次的版本准备会将 iOS `buildNumber` 递增一次，同批次恢复沿用已经准备的值。
 构建号按 Apple 的 CFBundleVersion 分段规则验证；末段超出上限时停止，不重置或自动进位。
 Mobile 的 marketing version 仍保持 `0.0.1`。
 

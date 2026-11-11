@@ -1,5 +1,5 @@
 import { array, boolean, record, text, type Member } from '../lib/node.ts'
-import type { Acceptance, DeliveryDeadlines, DeliveryDraft, DeliveryEvidence, DeliveryMode, DeliveryOrder, DeliveryPayment, DeliveryPhase, DeliveryStatus, PendingIntent, PaymentState, ReceivedFile } from './types.ts'
+import type { DeliveryBudget, DeliveryDeadlines, DeliveryDraft, DeliveryEvidence, DeliveryMode, DeliveryOrder, DeliveryPayment, DeliveryPhase, DeliveryProvider, DeliveryStatus, PendingIntent, PaymentState, ReceivedFile } from './types.ts'
 
 const maxAmount = (1n << 256n) - 1n
 const protocolMaxBytes = 16 * 65_536
@@ -48,11 +48,17 @@ export function parseStatus(value: unknown): DeliveryStatus {
 }
 function payment(value: unknown): DeliveryPayment {
   const v = record(value)
+  const settlement = v.settlement === null ? null : record(v.settlement)
+  const publication = settlement?.publication === null || settlement === null ? null : record(settlement.publication)
   const result: DeliveryPayment = {
-    state: member(v.state, ['free', 'prepared', 'submitted', 'included', 'confirmed', 'earned', 'withdrawn', 'refunded', 'unknown', 'failed']),
+    state: member(v.state, ['free', 'prepared', 'confirmed', 'earned', 'withdrawn', 'refunded', 'unknown', 'failed']),
     chain_id: nullable(v.chain_id, amount), asset: nullable(v.asset, address), payer: nullable(v.payer, address), provider_wallet: nullable(v.provider_wallet, address),
     delivery_fee: amount(v.delivery_fee), reservation_fee: amount(v.reservation_fee), priority_fee: amount(v.priority_fee), total: amount(v.total), gas_cap: amount(v.gas_cap),
     earned: amount(v.earned), withdrawn: amount(v.withdrawn), refunded: amount(v.refunded),
+    budget_id: nullable(v.budget_id, peer),
+    settlement: settlement ? { earned: amount(settlement.earned), withdrawn: amount(settlement.withdrawn), refunded: amount(settlement.refunded),
+      publication: publication ? { state: member(publication.state, ['private_ready', 'disclosed_outstanding', 'final_earned', 'final_settled', 'expired_unrevealed']), total_amount: amount(publication.total_amount),
+        economic_cutoff: integer(publication.economic_cutoff), availability_risk: nullable(publication.availability_risk, text) } : null } : null,
     tx_hash: nullable(v.tx_hash, value => {
       const hash = text(value)
       if (!/^0x[a-fA-F0-9]{64}$/.test(hash)) throw new Error('交易摘要无效。')
@@ -61,7 +67,25 @@ function payment(value: unknown): DeliveryPayment {
   }
   if (BigInt(result.delivery_fee) + BigInt(result.reservation_fee) + BigInt(result.priority_fee) !== BigInt(result.total)
     || BigInt(result.withdrawn) > BigInt(result.earned) || BigInt(result.earned) + BigInt(result.refunded) > BigInt(result.total)) throw new Error('订单金额对不上，已暂停付款。')
+  if (result.settlement && BigInt(result.settlement.withdrawn) > BigInt(result.settlement.earned)) throw new Error('预算提款超过已赚取金额。')
   return result
+}
+export function parseBudgets(value: unknown): DeliveryBudget[] {
+  const rows = array(record(value).budgets)
+  if (rows.length > 128) throw new Error('预算列表超过设备上限。')
+  const budgets = rows.map(item => {
+    const b = record(item)
+    const budget: DeliveryBudget = { budget_id: peer(b.budget_id), payer: address(b.payer), payee: address(b.payee), provider_peer: peer(b.provider_peer), asset: address(b.asset),
+      deposit: amount(b.deposit), free: amount(b.free), locked: amount(b.locked), earned: amount(b.earned), withdrawn: amount(b.withdrawn), refunded: amount(b.refunded),
+      state: member(b.state, ['open', 'closing', 'closed']), gas_cap: amount(b.gas_cap),
+      ready_windows: array(b.ready_windows).map(item => { const window = record(item); return { order_id: peer(window.order_id), index: integer(window.index, 1) } }) }
+    if (BigInt(budget.free) + BigInt(budget.locked) + BigInt(budget.earned) + BigInt(budget.refunded) !== BigInt(budget.deposit)
+      || BigInt(budget.withdrawn) > BigInt(budget.earned) || budget.payer.toLowerCase() === budget.payee.toLowerCase()) throw new Error('预算账目或固定收付款人对不上。')
+    if (budget.ready_windows.length > 256 || new Set(budget.ready_windows.map(window => `${window.order_id}:${window.index}`)).size !== budget.ready_windows.length) throw new Error('待结算文件片段重复或超过设备容量。')
+    return budget
+  })
+  if (new Set(budgets.map(b => b.budget_id)).size !== budgets.length) throw new Error('预算列表包含重复记录。')
+  return budgets
 }
 function deadlines(value: unknown): DeliveryDeadlines | null {
   if (value === null) return null
@@ -75,7 +99,7 @@ export function parseOrder(value: unknown): DeliveryOrder {
   const order: DeliveryOrder = {
     order_id: peer(v.order_id), intent_id: intentId(v.intent_id), role: member(v.role, ['sender', 'receiver', 'provider']), mode: member(v.mode, ['charity', 'paid']), acceptance: member(v.acceptance, ['recoverable', 'strict']),
     source_peer: peer(v.source_peer), receiver_peer: peer(v.receiver_peer), provider_peer: peer(v.provider_peer), name: nullable(v.name, fileName), bytes: integer(v.bytes, protocolMaxBytes), sha256: nullable(v.sha256, peer),
-    phase: member(v.phase, ['prepared', 'funding_pending', 'proving', 'funded', 'transferring', 'cipher_held', 'key_published', 'recoverable', 'paid', 'partial', 'refundable', 'refunded', 'reconciling', 'key_unavailable', 'failed']),
+    phase: member(v.phase, ['prepared', 'funding_pending', 'proving', 'funded', 'transferring', 'cipher_held', 'key_published', 'recoverable', 'paid', 'partial', 'refunded', 'reconciling', 'key_unavailable', 'failed']),
     evidence: member(v.evidence, ['none', 'charity_receipt', 'ciphertext_held', 'recoverable', 'decryption_proven']), payment: payment(v.payment), deadlines: deadlines(v.deadlines),
     windows: windows.map((item, index) => {
       const w = record(item), bytes = integer(w.bytes, 65_536)
@@ -87,13 +111,13 @@ export function parseOrder(value: unknown): DeliveryOrder {
   if (order.mode === 'charity') {
     const p = order.payment
     if (order.acceptance !== 'recoverable' || p.state !== 'free' || [p.delivery_fee, p.reservation_fee, p.priority_fee, p.total, p.gas_cap, p.earned, p.withdrawn, p.refunded].some(value => value !== '0')
-      || [p.chain_id, p.asset, p.payer, p.provider_wallet, p.tx_hash].some(value => value !== null)
+      || [p.chain_id, p.asset, p.payer, p.provider_wallet, p.tx_hash, p.budget_id, p.settlement].some(value => value !== null)
       || !['none', 'charity_receipt'].includes(order.evidence) || order.windows.some(window => window.decryption_proven)) throw new Error('免费订单不能带付款或付款条件。')
-  } else if (order.payment.state === 'free' || order.payment.chain_id === null || order.payment.asset === null || order.payment.payer === null || order.payment.provider_wallet === null) throw new Error('付费订单缺少固定付款信息。')
+  } else if (order.acceptance !== 'recoverable' || order.payment.state === 'free' || order.payment.chain_id === null || order.payment.asset === null || order.payment.payer === null || order.payment.provider_wallet === null || order.payment.budget_id === null) throw new Error('受保护订单需要固定预付预算，只支持可恢复验收。')
   if (order.mode === 'paid') {
     const d = order.deadlines
     if (!d || d.quote_expires_at === 0 || d.quote_expires_at > d.hold_deadline || d.hold_deadline >= d.key_deadline || d.key_deadline > d.open_deadline || d.open_deadline > d.retain_until
-      || d.priority_deadline <= d.quote_expires_at || d.priority_deadline > (order.acceptance === 'strict' ? d.open_deadline : d.key_deadline)) throw new Error('订单的报价、交付或时效截止对不上，已暂停付款。')
+      || d.priority_deadline <= d.quote_expires_at || d.priority_deadline > d.key_deadline) throw new Error('订单的报价、交付或时效截止对不上，已暂停付款。')
   }
   if (order.role === 'provider' && (order.name !== null || order.sha256 !== null)) throw new Error('服务商视图不能包含明文文件信息。')
   return order
@@ -157,17 +181,35 @@ export function walletNotice(wallet: DeliveryStatus['wallet']): string {
 }
 
 export const phaseLabels: Record<DeliveryPhase, string> = {
-  prepared: '待确认', funding_pending: '正在付款', proving: '正在确认付款条件', funded: '已付款', transferring: '传输中', cipher_held: '对方已收到，等待解锁', key_published: '正在解锁',
-  recoverable: '已送达', paid: '已完成', partial: '部分完成', refundable: '可以退款', refunded: '已退款', reconciling: '正在确认付款结果', key_unavailable: '暂时打不开', failed: '未完成',
+  prepared: '待确认', funding_pending: '正在分配预算', proving: '正在确认付款条件', funded: '预算已占用', transferring: '传输中', cipher_held: '文件已收到，等待批次解锁', key_published: '正在解锁',
+  recoverable: '已送达', paid: '已完成', partial: '部分完成', refunded: '已退款', reconciling: '正在确认付款结果', key_unavailable: '暂时打不开', failed: '未完成',
 }
 export const evidenceLabels: Record<DeliveryEvidence, string> = { none: '还没送达', charity_receipt: '对方已收到', ciphertext_held: '对方已收到，还没解锁', recoverable: '对方可以打开', decryption_proven: '对方已打开' }
 export const paymentLabels: Record<PaymentState, string> = {
-  free: '免费', prepared: '未付款', submitted: '付款已提交', included: '付款处理中', confirmed: '已付款', earned: '服务费已结算', withdrawn: '服务费已提取', refunded: '款已退回', unknown: '付款结果未知', failed: '付款失败',
+  free: '免费', prepared: '预算待分配', confirmed: '预算已分配', earned: '服务费已赚取', withdrawn: '预算费用已提取', refunded: '款已退回', unknown: '付款结果未知', failed: '付款失败',
 }
-export function settlementAmountsLabel(order: DeliveryOrder): string {
+function settlementUncertain(order: DeliveryOrder): boolean {
   return order.payment.state === 'unknown' || order.payment.state === 'failed' || order.phase === 'reconciling' || order.phase === 'failed'
-    ? '上次记录（赚取 / 提款 / 退款，到账待确认）'
-    : '已赚取 / 已提款 / 已退款'
+}
+export function settlementAmountsLabel(order: DeliveryOrder, scope: 'order' | 'budget'): string {
+  if (scope === 'order') return settlementUncertain(order) ? '本单上次记录（赚取 / 退款，当前待确认）' : '本单已赚取 / 已退款'
+  return settlementUncertain(order) ? '预算上次记录（赚取 / 提款 / 退款，到账待确认）' : '预算累计赚取 / 提款 / 退款'
+}
+export function publicationLabel(order: DeliveryOrder): string {
+  if (settlementUncertain(order)) return '批次状态待确认，请检查原交易'
+  const publication = order.payment.settlement?.publication
+  if (!publication) {
+    if (BigInt(order.payment.earned) > 0n) return '本单费用已赚取'
+    if (BigInt(order.payment.refunded) > 0n) return '本单费用已退款'
+    return '等待中转设备结算已就绪批次'
+  }
+  switch (publication.state) {
+    case 'private_ready': return '恢复材料仍私密'
+    case 'disclosed_outstanding': return '恢复材料可能已公开，正在确认收入'
+    case 'final_earned': return '本批约定费用已赚取'
+    case 'final_settled': return '本批款项已赚取或退款，恢复材料可能已公开'
+    case 'expired_unrevealed': return '已过期，尚未公开恢复材料'
+  }
 }
 export function canRead(order: DeliveryOrder): boolean {
   return order.mode === 'charity' && order.role === 'sender'
@@ -181,7 +223,7 @@ export function deadlineRows(order: DeliveryOrder): Array<[string, string]> {
   if (order.mode !== 'paid' || !d) return []
   const rows: Array<[string, number]> = [
     ['报价确认截止', d.quote_expires_at], ['时效优先费截止', d.priority_deadline],
-    ['交付结算硬截止', order.acceptance === 'strict' ? d.open_deadline : d.key_deadline],
+    ['交付结算硬截止', d.key_deadline],
     ['对方收到文件截止', d.hold_deadline], ['密钥包发布截止', d.key_deadline], ['保留义务截止', d.retain_until],
   ]
   return rows.map(([label, seconds]) => [label, new Date(seconds * 1000).toLocaleString(undefined, { timeZoneName: 'short' })])
@@ -189,9 +231,20 @@ export function deadlineRows(order: DeliveryOrder): Array<[string, string]> {
 
 /** Where a file can go without pasting an ID: my other computers, since a Node is what receives. */
 export const receiverChoices = (members: readonly Member[], self: string): Member[] => members.filter(item => item.kind === 'node' && item.device_id !== self)
+/** Devices that announce they relay deliveries; one whose record does not read right is left out, not the list. */
+export function parseProviders(value: unknown): DeliveryProvider[] {
+  return array(record(value).providers).flatMap((item): DeliveryProvider[] => {
+    try {
+      const v = record(item), offer = v.offer === null ? null : record(v.offer), settlement = offer && record(offer.settlement)
+      return [{ device_id: peer(v.device_id), paid: boolean(v.paid), last_seen_ms: integer(v.last_seen_ms),
+        offer: offer && settlement && { settlement: { chain_id: integer(settlement.chain_id), escrow: text(settlement.escrow), asset: text(settlement.asset) }, price: amount(offer.price) } }]
+    } catch { return [] }
+  })
+}
+/** Paid delivery offers only providers that quote a price; free delivery any of them. */
+export const providerChoices = (providers: readonly DeliveryProvider[], mode: DeliveryMode): DeliveryProvider[] => mode === 'paid' ? providers.filter(item => item.paid && item.offer) : [...providers]
 
 export const modeOptions: Array<{ value: DeliveryMode; label: string }> = [{ value: 'charity', label: '免费传输' }, { value: 'paid', label: '付费传输' }]
-export const acceptanceOptions: Array<{ value: Acceptance; label: string }> = [{ value: 'recoverable', label: '对方能取回后付款' }, { value: 'strict', label: '对方打开后付款' }]
 
 /** Sizes for people: bytes below 1 KB, then KB or MB. `floor` keeps a limit from rounding up past what fits. */
 export function sizeLabel(bytes: number, floor = false): string {
@@ -223,6 +276,17 @@ export function orderActions(order: DeliveryOrder) {
     save: canRead(order) && order.phase !== 'prepared',
   }
 }
+export function receivingBatches(orders: readonly DeliveryOrder[]): Array<[string, DeliveryOrder[]]> {
+  const batches = new Map<string, DeliveryOrder[]>()
+  for (const order of orders) {
+    const id = order.payment.budget_id
+    if (order.role !== 'receiver' || order.mode !== 'paid' || !id || !orderActions(order).accept) continue
+    const batch = batches.get(id) ?? []
+    batch.push(order)
+    batches.set(id, batch)
+  }
+  return [...batches].filter(([, batch]) => batch.length === 2 && batch.every(order => order.windows.length === 1))
+}
 export const transferCopy = {
   offline: '重新连接后可查看传输记录，不会重复付款。',
   loading: '正在读取传输设置。',
@@ -231,25 +295,26 @@ export const transferCopy = {
   free: '全程加密 · 免费',
   connectionId: '连接 ID · 收文件时发给对方',
   charity: '免费传输',
-  paid: '付费传输',
+  paid: '受保护付费传输',
   sendTo: '发给',
   pickDevice: '选一台设备',
   otherDevice: '发给别人的设备',
   receiver: '接收方的连接 ID',
   provider: '中转设备的连接 ID',
+  providers: '可选的中转设备',
   providerHint: '只经手加密后的文件，不会加入你的设备',
   noRecords: '还没有传输记录',
   serviceCap: '服务费上限',
-  gasCap: '链费上限',
+  gasCap: '预算累计链费上限',
   serviceTotal: '服务费合计',
   units: '金额按测试代币和测试链原生币的最小单位计。',
-  strict: '对方确认打开后才付款。对方离线或没确认时，中转设备可能收不到费用。',
+  protected: '文件全程加密。发送前会不可撤销地占用预算。接收设备完成文件完整性检查后，中转设备按批次解锁文件并赚取费用，发送设备无需再次确认。可恢复不表示真人已读。',
   walletFirst: '先在发送设备本机创建或解锁钱包，再刷新。',
   unknownPayment: '付款结果还没确定。点“检查进度”会查询原来那笔，不会重复付款。',
   walletDetails: '钱包的创建、解锁和备份通过本机命令行完成。个人恢复文件不包含钱包和订单解密密钥。',
   prepareDetails: '下一步会把文件交给当前连接的可信设备加密，还不付款。同一文件和条款不会重复发送。原订单完成后，选择相同文件和条款，点“作为新订单再次发送”才会另建一笔。',
   prepare: (mode: DeliveryMode) => mode === 'paid' ? '查看费用' : '下一步',
-  confirm: (mode: DeliveryMode) => mode === 'paid' ? '确认并付款' : '确认发送',
+  confirm: (mode: DeliveryMode) => mode === 'paid' ? '确认并分配预算' : '确认发送',
   maxSize: (bytes: number) => `最大 ${sizeLabel(bytes, true)}`,
   tooLarge: (bytes: number) => `文件超过 ${sizeLabel(bytes, true)}，换一个小点的`,
 } as const

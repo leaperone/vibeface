@@ -23,21 +23,22 @@ impl Runtime {
             .filter(|value| !value.is_null())
             .map(|value| serde_json::from_value(value.clone()))
             .transpose()?;
-        let existing = self
-            .store
-            .lock()
-            .await
-            .bots(&access.network_id)?
-            .iter()
-            .any(|bot| bot.bot_id == bot_id);
+        let existing = {
+            let network_id = access.network_id.to_owned();
+            self.store
+                .call("bots.bots", move |store| store.bots(&network_id))
+                .await
+        }?
+        .iter()
+        .any(|bot| bot.bot_id == bot_id);
         if !existing && let Some(project) = &project {
             self.validate_bot_project(&access.network_id, project)
                 .await?;
         }
-        let bot = self.store.lock().await.create_bot(
-            &self.identity,
-            &access.network_id,
-            &BotCreateSpec {
+        let bot = {
+            let identity = self.identity.to_owned();
+            let network_id = access.network_id.to_owned();
+            let spec = BotCreateSpec {
                 conversation_id: scope.clone(),
                 bot_id,
                 name: name.to_owned(),
@@ -45,9 +46,13 @@ impl Runtime {
                 project,
                 attestation: attestation(input)?,
                 owner: first_owner(input)?,
-            },
-            now_ms(),
-        )?;
+            };
+            self.store
+                .call("bots.create_bot", move |store| {
+                    store.create_bot(&identity, &network_id, &spec, now_ms())
+                })
+                .await
+        }?;
         self.publish_changed(&access.network_id, &scope, Changed::Event(&bot.event_hash));
         Ok(json!({"bot":bot}))
     }
@@ -62,20 +67,34 @@ impl Runtime {
             state.genesis.network_id == access.network_id,
             "wrong personal network"
         );
-        let store = self.store.lock().await;
-        store.authorize_node(&access.network_id, &self.identity.device_id()?)?;
-        let bots = store
-            .bots(&access.network_id)?
-            .into_iter()
-            .filter(|bot| {
-                access
-                    .conversation_id
-                    .as_ref()
-                    .is_none_or(|scope| scope == &bot.conversation_id)
-            })
-            .collect::<Vec<_>>();
-        let mut last = store.last_messages(&access.network_id)?;
-        let mut busy = store.busy_conversations()?;
+        let (bots, mut last, mut busy, primary, successor) = {
+            let (network, allowed_scope, local) = (
+                access.network_id.clone(),
+                access.conversation_id.clone(),
+                self.identity.device_id()?,
+            );
+            self.store
+                .call("bots.list", move |store| {
+                    store.authorize_node(&network, &local)?;
+                    let bots = store
+                        .bots(&network)?
+                        .into_iter()
+                        .filter(|bot| {
+                            allowed_scope
+                                .as_ref()
+                                .is_none_or(|scope| scope == &bot.conversation_id)
+                        })
+                        .collect::<Vec<_>>();
+                    Ok((
+                        bots,
+                        store.last_messages(&network)?,
+                        store.busy_conversations()?,
+                        store.primary_bot(&network)?,
+                        store.primary_successor(&network)?,
+                    ))
+                })
+                .await?
+        };
         let bots: Vec<_> = bots
             .into_iter()
             .map(|bot| {
@@ -87,8 +106,6 @@ impl Runtime {
                 value
             })
             .collect();
-        let primary = store.primary_bot(&access.network_id)?;
-        let successor = store.primary_successor(&access.network_id)?;
         Ok(json!({"bots":bots,"primary":primary,"successor":successor}))
     }
 
@@ -100,15 +117,26 @@ impl Runtime {
         let schedule_id = id(input, "schedule_id")?;
         let action: ScheduleAction = serde_json::from_value(input["action"].clone())
             .context("action is pause, resume or delete")?;
-        let written = self.store.lock().await.control_schedule(
-            &self.identity,
-            &access.network_id,
-            &scope,
-            &schedule_id,
-            action,
-            attestation(input)?,
-            now_ms(),
-        )?;
+        let written = {
+            let identity = self.identity.to_owned();
+            let network_id = access.network_id.to_owned();
+            let scope = scope.to_owned();
+            let schedule_id = schedule_id.to_owned();
+            let attestation_input = attestation(input)?;
+            self.store
+                .call("bots.control_schedule", move |store| {
+                    store.control_schedule(
+                        &identity,
+                        &network_id,
+                        &scope,
+                        &schedule_id,
+                        action,
+                        attestation_input,
+                        now_ms(),
+                    )
+                })
+                .await
+        }?;
         if let Some(hash) = &written {
             self.publish_changed(&access.network_id, &scope, Changed::Event(hash));
             self.schedule_wakeup.notify_one();
@@ -129,13 +157,16 @@ impl Runtime {
             attestation: attestation(input)?,
             operation_id: field(input, "operation_id")?.into(),
         };
-        let result = self.store.lock().await.control_memory(
-            &self.identity,
-            &access.network_id,
-            &scope,
-            command,
-            now_ms(),
-        )?;
+        let result = {
+            let identity = self.identity.to_owned();
+            let network_id = access.network_id.to_owned();
+            let scope = scope.to_owned();
+            self.store
+                .call("bots.control_memory", move |store| {
+                    store.control_memory(&identity, &network_id, &scope, command, now_ms())
+                })
+                .await
+        }?;
         if result.state == MemoryControlStatus::Applied {
             self.publish_changed(&access.network_id, &scope, Changed::Reload);
         }
@@ -151,16 +182,19 @@ impl Runtime {
             .get("operation_id")
             .map(|value| value.as_str().context("operation_id must be a string"))
             .transpose()?;
-        let store = self.store.lock().await;
-        store
-            .bot_for_conversation(&access.network_id, &scope)?
-            .context("no such bot")?;
-        Ok(json!(store.memory_state(
-            &access.network_id,
-            &scope,
-            &memory_id,
-            operation_id
-        )?))
+        let state = {
+            let (network, operation_id) =
+                (access.network_id.clone(), operation_id.map(str::to_owned));
+            self.store
+                .read("bots.memory_state", move |store| {
+                    store
+                        .bot_for_conversation(&network, &scope)?
+                        .context("no such bot")?;
+                    store.memory_state(&network, &scope, &memory_id, operation_id.as_deref())
+                })
+                .await?
+        };
+        Ok(json!(state))
     }
 
     /// The user deletes a bot from the web. Deleting one already gone writes nothing.
@@ -175,19 +209,24 @@ impl Runtime {
             ensure!(allowed == &scope, "outside this client's conversation");
         }
         let network = &access.network_id;
-        let written = self.store.lock().await.delete_bot(
-            &self.identity,
-            network,
-            &scope,
-            attestation(input)?,
-            now_ms(),
-        )?;
+        let written = {
+            let identity = self.identity.to_owned();
+            let network = network.to_owned();
+            let scope = scope.to_owned();
+            let attestation_input = attestation(input)?;
+            self.store
+                .call("bots.delete_bot", move |store| {
+                    store.delete_bot(&identity, &network, &scope, attestation_input, now_ms())
+                })
+                .await
+        }?;
         if let Some(event) = &written {
             self.bot_deleted(network, &scope, &event.hash);
         }
-        Ok(
-            json!({"written":written.is_some(),"primary":self.store.lock().await.primary_bot(network)?}),
-        )
+        Ok(json!({"written":written.is_some(),"primary":({
+                let network = network.to_owned();
+                self.store.call("bots.primary_bot", move |store| store.primary_bot(&network)).await
+            }?)}))
     }
 
     /// Stops what a deleted bot was doing here, apart from the caller, which may be another
@@ -212,28 +251,36 @@ impl Runtime {
     }
 
     async fn stop_bot_turns(self: &Arc<Self>, network: &str, scope: &str) -> Result<()> {
-        let running: Vec<String> = self
-            .store
-            .lock()
-            .await
-            .scheduler_jobs(scope)?
-            .into_iter()
-            .filter(|job| {
-                matches!(
-                    job.state,
-                    crate::scheduling::JobState::Claimed { .. }
-                        | crate::scheduling::JobState::Running { .. }
-                )
-            })
-            .map(|job| job.trigger)
-            .collect();
+        let running: Vec<String> = {
+            let scope = scope.to_owned();
+            self.store
+                .call("bots.scheduler_jobs", move |store| {
+                    store.scheduler_jobs(&scope)
+                })
+                .await
+        }?
+        .into_iter()
+        .filter(|job| {
+            matches!(
+                job.state,
+                crate::scheduling::JobState::Claimed { .. }
+                    | crate::scheduling::JobState::Running { .. }
+            )
+        })
+        .map(|job| job.trigger)
+        .collect();
         for trigger in running {
-            let job = self.store.lock().await.request_manager_cancel(
-                &self.identity,
-                network,
-                scope,
-                &trigger,
-            )?;
+            let job = {
+                let identity = self.identity.to_owned();
+                let network = network.to_owned();
+                let scope = scope.to_owned();
+                let trigger = trigger.to_owned();
+                self.store
+                    .call("bots.request_manager_cancel", move |store| {
+                        store.request_manager_cancel(&identity, &network, &scope, &trigger)
+                    })
+                    .await
+            }?;
             if let Some(crate::scheduling::JobState::Cancelling { attempt }) =
                 job.map(|job| job.state)
             {
@@ -242,17 +289,21 @@ impl Runtime {
             self.publish_changed(network, scope, Changed::Job(&trigger));
         }
         let works: Vec<String> = {
-            let store = self.store.lock().await;
-            let mut works = Vec::new();
-            for work in store.works(network, scope)? {
-                if store
-                    .work_record(&work.work_id)?
-                    .is_some_and(|record| super::work::live(&record))
-                {
-                    works.push(work.work_id);
-                }
-            }
-            works
+            let (network, scope) = (network.to_owned(), scope.to_owned());
+            self.store
+                .call("bots.live_works", move |store| {
+                    let mut works = Vec::new();
+                    for work in store.works(&network, &scope)? {
+                        if store
+                            .work_record(&work.work_id)?
+                            .is_some_and(|record| super::work::live(&record))
+                        {
+                            works.push(work.work_id);
+                        }
+                    }
+                    Ok(works)
+                })
+                .await?
         };
         for work_id in works {
             if let Err(error) = self.interrupt_work(network, &work_id).await {
@@ -270,11 +321,16 @@ impl Runtime {
             ensure!(allowed == &scope, "outside this client's conversation");
         }
         ensure!(
-            self.store
-                .lock()
-                .await
-                .bot_for_conversation(&access.network_id, &scope)?
-                .is_some(),
+            {
+                let network_id = access.network_id.to_owned();
+                let scope = scope.to_owned();
+                self.store
+                    .call("bots.bot_for_conversation", move |store| {
+                        store.bot_for_conversation(&network_id, &scope)
+                    })
+                    .await
+            }?
+            .is_some(),
             "no such bot"
         );
         let event = self
@@ -289,7 +345,10 @@ impl Runtime {
             .await?;
         tracing::info!(event = "bot.primary", "primary bot set");
         self.publish_changed(&access.network_id, BOTS_SCOPE, Changed::Event(&event.hash));
-        Ok(json!({"primary":self.store.lock().await.primary_bot(&access.network_id)?}))
+        Ok(json!({"primary":({
+            let network_id = access.network_id.to_owned();
+            self.store.call("bots.primary_bot", move |store| store.primary_bot(&network_id)).await
+        }?)}))
     }
 
     /// The user moves a bot's project folder, or clears it; asking for the current one writes nothing.
@@ -304,12 +363,16 @@ impl Runtime {
             .filter(|value| !value.is_null())
             .map(|value| serde_json::from_value(value.clone()))
             .transpose()?;
-        let bot = self
-            .store
-            .lock()
-            .await
-            .bot_for_conversation(&access.network_id, &scope)?
-            .context("no such bot")?;
+        let bot = {
+            let network_id = access.network_id.to_owned();
+            let scope = scope.to_owned();
+            self.store
+                .call("bots.bot_for_conversation", move |store| {
+                    store.bot_for_conversation(&network_id, &scope)
+                })
+                .await
+        }?
+        .context("no such bot")?;
         if bot.project == project {
             return Ok(json!({"bot":bot}));
         }
@@ -333,7 +396,11 @@ impl Runtime {
             "bot project set"
         );
         self.publish_changed(&access.network_id, &scope, Changed::Event(&event.hash));
-        Ok(json!({"bot":self.store.lock().await.bot_for_conversation(&access.network_id, &scope)?}))
+        Ok(json!({"bot":({
+            let network_id = access.network_id.to_owned();
+            let scope = scope.to_owned();
+            self.store.call("bots.bot_for_conversation", move |store| store.bot_for_conversation(&network_id, &scope)).await
+        }?)}))
     }
 
     /// The user picks a bot's face, or `null` for the one its ID gives, over the face's `version`
@@ -356,31 +423,44 @@ impl Runtime {
             membership.genesis.network_id == access.network_id,
             "wrong personal network"
         );
-        let mut store = self.store.lock().await;
-        let bot = store
-            .bot_for_conversation(&access.network_id, &scope)?
-            .context("no such bot")?;
-        if bot.avatar == avatar {
+        let (bot, event) = {
+            let (identity, network, scope) = (
+                self.identity.clone(),
+                access.network_id.clone(),
+                scope.clone(),
+            );
+            let signature_input = json!({"attestation":input["attestation"]});
+            self.store
+                .call("bots.set_avatar", move |store| {
+                    let bot = store
+                        .bot_for_conversation(&network, &scope)?
+                        .context("no such bot")?;
+                    if bot.avatar == avatar {
+                        return Ok((Some(bot), None));
+                    }
+                    ensure!(
+                        bot.avatar_version == version,
+                        "the bot's face changed since you saw it; nothing was written"
+                    );
+                    let event = store.append_event(
+                        &identity,
+                        &network,
+                        &scope,
+                        EventBody::BotAvatarSet {
+                            version,
+                            avatar,
+                            attestation: Some(attestation(&signature_input)?),
+                        },
+                        vec![],
+                        now_ms(),
+                    )?;
+                    Ok((store.bot_for_conversation(&network, &scope)?, Some(event)))
+                })
+                .await?
+        };
+        let Some(event) = event else {
             return Ok(json!({"bot":bot}));
-        }
-        ensure!(
-            bot.avatar_version == version,
-            "the bot's face changed since you saw it; nothing was written"
-        );
-        let event = store.append_event(
-            &self.identity,
-            &access.network_id,
-            &scope,
-            EventBody::BotAvatarSet {
-                version,
-                avatar,
-                attestation: Some(attestation(input)?),
-            },
-            vec![],
-            now_ms(),
-        )?;
-        let bot = store.bot_for_conversation(&access.network_id, &scope)?;
-        drop(store);
+        };
         tracing::info!(
             event = "bot.avatar",
             conversation_id = scope,
@@ -395,10 +475,15 @@ impl Runtime {
         network: &str,
         project: &BotProject,
     ) -> Result<()> {
-        self.store
-            .lock()
-            .await
-            .authorize_node(network, &project.target_node)?;
+        {
+            let network = network.to_owned();
+            let target_node = project.target_node.to_owned();
+            self.store
+                .call("bots.authorize_node", move |store| {
+                    store.authorize_node(&network, &target_node)
+                })
+                .await
+        }?;
         let cwd = Path::new(&project.cwd);
         ensure!(
             cwd.is_absolute()
@@ -446,6 +531,7 @@ impl Runtime {
 mod tests {
     use super::*;
     use crate::model::{Eyes, Hue, Outline};
+    use crate::runtime::test_support::access as test_access;
     use crate::runtime::triage::tests::{bot, node, start_reply};
 
     #[tokio::test]
@@ -465,12 +551,8 @@ mod tests {
             face(Outline::Cloud, Eyes::Wide, 285)?,
             face(Outline::Bean, Eyes::Dot, 155)?,
         );
-        let client = |scope: Option<&str>| Access {
-            network_id: network.clone(),
-            human: true,
-            conversation_id: scope.map(Into::into),
-            manager: None,
-        };
+        let client =
+            |scope: Option<&str>| test_access(network.clone(), true, scope.map(Into::into));
         let request =
             |scope: &str, version: Option<String>, avatar: Option<Avatar>| -> Result<Value> {
                 let signed = admin.attest(
@@ -492,23 +574,31 @@ mod tests {
             async move {
                 let local = node.identity.device_id()?;
                 anyhow::Ok(
-                    node.store
-                        .lock()
-                        .await
-                        .events_from(&network, &local, 1, 1000)?
-                        .len(),
+                    {
+                        let network = network.to_owned();
+                        let local = local.to_owned();
+                        node.store
+                            .call("bots.events_from", move |store| {
+                                store.events_from(&network, &local, 1, 1000)
+                            })
+                            .await
+                    }?
+                    .len(),
                 )
             }
         };
         let shown = |node: &Arc<Runtime>| {
             let (node, network) = (node.clone(), network.clone());
             async move {
-                let bot = node
-                    .store
-                    .lock()
-                    .await
-                    .bot_for_conversation(&network, "c")?
-                    .context("bot")?;
+                let bot = {
+                    let network = network.to_owned();
+                    node.store
+                        .call("bots.bot_for_conversation", move |store| {
+                            store.bot_for_conversation(&network, "c")
+                        })
+                        .await
+                }?
+                .context("bot")?;
                 anyhow::Ok((bot.avatar, bot.avatar_version))
             }
         };
@@ -550,12 +640,6 @@ mod tests {
                 .contains("version and avatar are required"),
             "{missing}"
         );
-        let mut forged = pick.clone();
-        forged["version"] = json!("0123456789abcdef");
-        assert!(
-            node.rpc(client(None), forged).await.is_err(),
-            "the signature covers the version"
-        );
         let in_bots = node
             .rpc(client(None), request("bots", None, Some(cloud))?)
             .await;
@@ -578,6 +662,14 @@ mod tests {
         );
 
         let count = events(&node).await?;
+        let mut forged = request("c", None, Some(bean))?;
+        forged["version"] = json!(picked);
+        let forged = node.rpc(client(None), forged).await.unwrap_err();
+        assert!(
+            format!("{forged:#}").contains("device signature does not match"),
+            "the signature covers the version: {forged:#}"
+        );
+        assert_eq!(events(&node).await?, count);
         let again = node.rpc(client(None), pick.clone()).await?;
         assert_eq!(again["bot"]["avatar_version"], json!(picked));
         assert_eq!(
@@ -634,27 +726,16 @@ mod tests {
         bot(&node, &admin, "c", "Ops", &[]).await?;
         let network = node.membership_state().await?.genesis.network_id;
         let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
-        let idle = Access {
-            network_id: network,
-            human: false,
-            conversation_id: Some("c".into()),
-            manager: None,
-        };
-        node.register_manager_attempt_fixture(
-            "token".into(),
-            idle.clone(),
-            &attempt,
-            &trigger,
-            crate::providers::Provider::Codex,
-        )
-        .await?;
+        let idle = test_access(network, false, Some("c".into()));
         let live = node
-            .agent_tokens
-            .lock()
-            .await
-            .get("token")
-            .cloned()
-            .context("registered tool token")?;
+            .manager_access_fixture(
+                "token",
+                idle.clone(),
+                &attempt,
+                &trigger,
+                crate::providers::Provider::Codex,
+            )
+            .await?;
         let created = node
             .tool(
                 live.clone(),

@@ -4,10 +4,10 @@
 //! sight of is read back from Claude Code's own transcript and never sent again. Hooks of the
 //! owner's own sessions hold permission requests and questions for the bot.
 use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
+use super::provider_adapter::bounded;
 use super::*;
 use crate::manager::{self, CodexTurn, ManagerConfig, ManagerError, ManagerFailure};
 use crate::scheduling::{SteerOutcome, SteerTarget};
-use crate::triage::RequestKind;
 use crate::work::{Probe, Signal, WorkRecord, WorkSpec};
 use futures_util::future::BoxFuture;
 use std::collections::HashSet;
@@ -16,10 +16,11 @@ use std::sync::{
     PoisonError, Weak,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use vibeface_bridge::failure::ProviderStage;
 use vibeface_bridge::platform::tree;
+use vibeface_bridge::transport;
 use vibeface_bridge::{
     agent::{self, AgentResult},
     failure::{ExecFailure, FailureKind},
@@ -49,6 +50,39 @@ pub struct Processes {
     pidfile: PathBuf,
     running: std::sync::Mutex<BTreeMap<String, PathBuf>>,
     inputs: std::sync::Mutex<HashMap<String, InputChannel>>,
+}
+
+pub(super) struct Guide {
+    pub(super) path: PathBuf,
+    tree: std::sync::Mutex<Option<String>>,
+}
+
+impl Guide {
+    pub(super) fn write(dir: &Path, instructions: &str) -> Result<Arc<Self>> {
+        config::private_dir(dir)?;
+        let path = dir.join(format!("{}.md", uuid::Uuid::new_v4()));
+        config::private_write(&path, instructions.as_bytes())?;
+        Ok(Arc::new(Self {
+            path,
+            tree: Default::default(),
+        }))
+    }
+
+    pub(super) fn started(&self, token: &str) {
+        *self.tree.lock().unwrap_or_else(PoisonError::into_inner) = Some(token.into());
+    }
+}
+
+impl Drop for Guide {
+    fn drop(&mut self) {
+        let token = self.tree.lock().unwrap_or_else(PoisonError::into_inner);
+        if token
+            .as_ref()
+            .is_none_or(|token| matches!(tree::Leftover::find(token), Ok(None)))
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -124,8 +158,14 @@ impl Processes {
     }
 
     /// Ends the processes an earlier Node run left in `pidfile` before tracking this run's.
-    pub(super) fn open(pidfile: PathBuf) -> Self {
-        vibeface_bridge::agent::kill_recorded_programs(&pidfile);
+    /// The ending blocks for up to a grace period per tree, so it runs off the async runtime,
+    /// which also lets a tree this process is the parent of be reaped and confirmed gone.
+    pub(super) async fn open(pidfile: PathBuf) -> Self {
+        let journal = pidfile.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            vibeface_bridge::agent::kill_recorded_programs(&journal)
+        })
+        .await;
         Self::new(pidfile)
     }
 
@@ -149,22 +189,54 @@ impl Processes {
     pub(super) fn track(&self, token: &str, bin: &Path) -> Result<()> {
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
         running.insert(token.to_owned(), bin.to_owned());
-        self.save(&running).context("record the agent process tree")
+        self.save(&running, None)
+            .context("record the agent process tree")
     }
 
+    /// Drops `token` from the journal once its tree is confirmed gone; a tree that may still
+    /// run stays recorded for the next check.
     pub(super) fn forget(&self, token: &str) {
         self.remove_input(token);
-        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
-        if running.remove(token).is_some() {
-            let _ = self.save(&running);
+        if !matches!(tree::Leftover::find(token), Ok(None)) {
+            return;
         }
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        running.remove(token);
+        let _ = self.save(&running, Some(token));
     }
 
     pub(super) fn tracked(&self, token: &str) -> bool {
-        self.running
+        let current = self
+            .running
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains_key(token)
+            .contains_key(token);
+        let recorded = match self.journal() {
+            Ok(lines) => match recorded_program(&lines, token) {
+                None if !current => return false,
+                recorded => recorded,
+            },
+            Err(_) => None,
+        };
+        match tree::Leftover::find(token) {
+            Ok(None) => {
+                self.forget(token);
+                false
+            }
+            Ok(Some(leftover)) if !current => {
+                if !leftover.matches_record() {
+                    return false;
+                }
+                let members = leftover.members();
+                members.is_empty()
+                    || recorded.is_none_or(|bin| {
+                        members
+                            .iter()
+                            .any(|member| tree::names_program(member, &bin))
+                    })
+            }
+            _ => true,
+        }
     }
 
     /// Ends a tree this Node run recorded, once the programs still in it are the ones it
@@ -354,19 +426,56 @@ impl Processes {
         )))
     }
 
-    fn save(&self, running: &BTreeMap<String, PathBuf>) -> Result<()> {
-        if running.is_empty() {
+    /// The journal's lines, `token executable` each, as its last writer left them.
+    fn journal(&self) -> std::io::Result<Vec<String>> {
+        match std::fs::read_to_string(&self.pidfile) {
+            Ok(recorded) => Ok(recorded.lines().map(str::to_owned).collect()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Writes this run's trees into the journal and drops `ended`. Every other record stays:
+    /// an earlier run's tree leaves only through the check that confirms it gone, never
+    /// through a rewrite that did not look. The file goes once nothing is recorded.
+    fn save(&self, running: &BTreeMap<String, PathBuf>, ended: Option<&str>) -> Result<()> {
+        let recorded = self.journal().context("read the process journal")?;
+        let mut lines: Vec<String> = recorded
+            .iter()
+            .filter(|line| {
+                let token = line
+                    .split_once(' ')
+                    .map_or(line.as_str(), |(token, _)| token);
+                Some(token) != ended && !running.contains_key(token)
+            })
+            .cloned()
+            .collect();
+        lines.extend(
+            running
+                .iter()
+                .map(|(token, bin)| format!("{token} {}", bin.display())),
+        );
+        if lines == recorded {
+            return Ok(());
+        }
+        if lines.is_empty() {
             return match std::fs::remove_file(&self.pidfile) {
                 Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
                 _ => Ok(()),
             };
         }
-        let lines: String = running
-            .iter()
-            .map(|(token, bin)| format!("{token} {}\n", bin.display()))
-            .collect();
-        config::private_write(&self.pidfile, lines.as_bytes())
+        let mut journal = lines.join("\n");
+        journal.push('\n');
+        config::private_write(&self.pidfile, journal.as_bytes())
     }
+}
+
+/// The program a journal line records for `token`.
+fn recorded_program(lines: &[String], token: &str) -> Option<PathBuf> {
+    lines.iter().find_map(|line| {
+        let (recorded, bin) = line.split_once(' ')?;
+        (recorded == token).then(|| PathBuf::from(bin))
+    })
 }
 
 /// One line of the `stream-json` output, as far as a turn needs it.
@@ -535,15 +644,8 @@ fn tool_kind(name: &str) -> &'static str {
     }
 }
 
-fn clip(text: &str, limit: usize) -> String {
-    text.chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
-        .take(limit)
-        .collect()
-}
-
 fn tool_progress(id: &str, name: &str, status: &str) -> Value {
-    json!({"type":"tool","item_id":clip(id, 128),"name":name,"status":status})
+    json!({"type":"tool","item_id":bounded(id, 128),"name":name,"status":status})
 }
 
 /// What the frames of one turn said so far.
@@ -564,7 +666,7 @@ impl Turn {
                 Some(json!({"type":"status","status":"running"}))
             }
             Frame::Text { id, text } => Some(
-                json!({"type":"text_snapshot","item_id":clip(&id, 128),"text":clip(&text, 8000)}),
+                json!({"type":"text_snapshot","item_id":bounded(&id, 128),"text":bounded(&text, 8000)}),
             ),
             Frame::ToolStarted { id, name } => {
                 let progress = tool_progress(&id, name, "running");
@@ -866,7 +968,7 @@ struct Launch<'a> {
     resume: bool,
     model: &'a str,
     effort: Option<&'a str>,
-    instructions: &'a str,
+    guide: Option<Arc<Guide>>,
     env: &'a BTreeMap<String, String>,
 }
 
@@ -874,10 +976,23 @@ struct Launch<'a> {
 struct Process {
     child: Child,
     tree: tree::Tree,
+    reaped: bool,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
-    lines: Lines<BufReader<ChildStdout>>,
+    lines: transport::Lines<BufReader<ChildStdout>>,
     /// The end of what it wrote to stderr, once it closed it.
     stderr: Option<tokio::task::JoinHandle<String>>,
+    _guide: Option<Arc<Guide>>,
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        if !self.reaped && (cfg!(windows) || self.child.id() == Some(self.tree.root())) {
+            self.tree.kill();
+        }
+        if let Some(stderr) = self.stderr.take() {
+            stderr.abort();
+        }
+    }
 }
 
 impl Launch<'_> {
@@ -904,8 +1019,8 @@ impl Launch<'_> {
         if let Some(effort) = self.effort {
             command.args(["--effort", effort]);
         }
-        if !self.instructions.is_empty() {
-            command.args(["--append-system-prompt", self.instructions]);
+        if let Some(guide) = &self.guide {
+            command.arg("--append-system-prompt-file").arg(&guide.path);
         }
         // The Node's own session variables would make the process a nested or interactive
         // session; each turn gets only its own.
@@ -933,6 +1048,9 @@ impl Launch<'_> {
             };
             ExecFailure::new(kind, format!("could not start Claude Code: {error:#}"))
         })?;
+        if let Some(guide) = &self.guide {
+            guide.started(tree.token());
+        }
         let (Some(stdin), Some(stdout), Some(stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {
@@ -942,30 +1060,24 @@ impl Launch<'_> {
             ));
         };
         let stderr = tokio::spawn(async move {
-            let mut tail = String::new();
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tail.push_str(&line);
-                tail.push('\n');
-                keep_end(&mut tail);
+            let mut stderr = stderr;
+            let (mut tail, mut buffer) = (Vec::new(), [0; 4096]);
+            while let Ok(read @ 1..) = stderr.read(&mut buffer).await {
+                tail.extend_from_slice(&buffer[..read]);
+                let over = tail.len().saturating_sub(2000);
+                tail.drain(..over);
             }
-            tail.trim().to_owned()
+            String::from_utf8_lossy(&tail).trim().to_owned()
         });
         Ok(Process {
             child,
             tree,
+            reaped: false,
             stdin: Arc::new(Mutex::new(Some(stdin))),
-            lines: BufReader::new(stdout).lines(),
+            lines: transport::Lines::new(BufReader::new(stdout), transport::FRAME_BYTES),
             stderr: Some(stderr),
+            _guide: self.guide.clone(),
         })
-    }
-}
-
-/// Keeps the last 2000 characters of `tail` once it grows past 4000.
-fn keep_end(tail: &mut String) {
-    let count = tail.chars().count();
-    if count > 4000 {
-        *tail = tail.chars().skip(count - 2000).collect();
     }
 }
 
@@ -974,7 +1086,9 @@ async fn send(stdin: &Mutex<Option<ChildStdin>>, frame: &Value) -> Result<()> {
     let pipe = stdin
         .as_mut()
         .context("Claude Code no longer takes input")?;
-    pipe.write_all(format!("{frame}\n").as_bytes()).await?;
+    let mut bytes = transport::json(frame, transport::FRAME_BYTES)?;
+    bytes.push(b'\n');
+    pipe.write_all(&bytes).await?;
     pipe.flush().await?;
     Ok(())
 }
@@ -996,15 +1110,20 @@ impl Process {
         })
         .await
         .unwrap_or(false);
-        agent::terminate_process_tree(&mut self.child, &mut self.tree).await || ended
+        self.reaped = agent::terminate_process_tree(&mut self.child, &mut self.tree).await;
+        self.reaped || ended
     }
 
     /// Closes its input, so it exits once its turn is done, and ends its tree.
     async fn end(&mut self, processes: &Processes) {
         processes.remove_input(self.tree.token());
         self.stdin.lock().await.take();
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
-        if agent::terminate_process_tree(&mut self.child, &mut self.tree).await {
+        let _ =
+            tokio::time::timeout(Duration::from_secs(5), tree::observe_exit(&mut self.child)).await;
+        if !self.reaped {
+            self.reaped = agent::terminate_process_tree(&mut self.child, &mut self.tree).await;
+        }
+        if self.reaped {
             processes.forget(self.tree.token());
         }
     }
@@ -1051,21 +1170,7 @@ where
     let secrets = manager::secret_values(config);
     let start = std::sync::Mutex::new(manager::StartEvidence::NotStarted);
     let stage = vibeface_bridge::failure::ProviderTrace::new("claude", ProviderStage::SessionStart);
-    let error = |outcome, session: Option<&str>, failure: ExecFailure| -> anyhow::Error {
-        ManagerError {
-            stage: stage.current(),
-            outcome,
-            start: *start
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            session_id: session.map(str::to_owned),
-            failure: ExecFailure {
-                detail: manager::redact_string(failure.detail, &secrets),
-                ..failure
-            },
-        }
-        .into()
-    };
+    let error = ManagerError::reporter(&stage, &start, &secrets);
     // Faults of this Node's own bookkeeping, not of Claude Code.
     let own = |detail: &str| ExecFailure::new(FailureKind::Unknown, detail);
     let stopped = |session: Option<&str>| {
@@ -1126,12 +1231,27 @@ where
     if let Some(token) = &config.tool_token {
         env.insert("VIBEFACE_TOOL_TOKEN".into(), token.clone());
     }
-    // Claude Code keeps no instructions with a session, so every turn brings them.
     let instructions = manager::bot_instructions(
         config.tool_cli.as_deref(),
         &config.custom_tools,
         &config.instructions,
     );
+    let guide = if instructions.is_empty() {
+        None
+    } else {
+        let dir = processes
+            .pidfile
+            .parent()
+            .context("Claude pidfile has no parent")?
+            .join("claude/guides");
+        Some(Guide::write(&dir, &instructions).map_err(|e| {
+            error(
+                ManagerFailure::Failed,
+                native,
+                own(&format!("write the Claude instructions: {e}")),
+            )
+        })?)
+    };
     let message = config.codex_turn.as_ref().map_or_else(
         || uuid::Uuid::new_v4().to_string(),
         |turn| derived(MESSAGE_SEED, &turn.client_id),
@@ -1146,7 +1266,7 @@ where
         resume: resumed.is_some(),
         model: &config.model,
         effort: config.reasoning_effort.as_deref(),
-        instructions: &instructions,
+        guide,
         env: &env,
     };
     stage.enter(ProviderStage::Launch);
@@ -1200,6 +1320,13 @@ where
             }
             line = process.lines.next_line() => line,
         };
+        if let Err(failure) = &line {
+            break Err(error(
+                ManagerFailure::Unknown,
+                native,
+                own(&format!("Claude Code output transport: {failure}")),
+            ));
+        }
         let Ok(Some(line)) = line else {
             if let Some(ending) = ending.take() {
                 break if processes.drained(process.tree.token(), results) {
@@ -1263,14 +1390,15 @@ where
                 reported_start = true;
             }
             if let Some(update) = turn.apply(frame)
-                && let Err(e) = progress(manager::redact(update, &secrets)).await
+                && let Err(e) = transport::deliver(
+                    progress(manager::redact(update, &secrets)),
+                    &mut cancel,
+                    deadline,
+                )
+                .await
             {
                 break 'turn Err(error(ManagerFailure::Unknown, native, own(&e.to_string())));
             }
-        }
-        if turn.session.is_some() {
-            stage.enter(ProviderStage::Run);
-            *start.lock().unwrap() = manager::StartEvidence::Started;
         }
         if let Some(next) = turn.ending.take() {
             processes.close_input(process.tree.token());
@@ -1393,9 +1521,9 @@ impl Claude {
     }
 
     /// Ends the processes an earlier Node run left, so their turns are read back as they are.
-    pub(super) fn open(dir: &Path, env: &BTreeMap<String, String>) -> Self {
+    pub(super) async fn open(dir: &Path, env: &BTreeMap<String, String>) -> Self {
         Self {
-            processes: Arc::new(Processes::open(dir.join(PIDFILE))),
+            processes: Arc::new(Processes::open(dir.join(PIDFILE)).await),
             live: Default::default(),
             starting: Default::default(),
             projects: std::sync::Mutex::new(projects_dir(env)),
@@ -1469,6 +1597,7 @@ async fn follow(
     node: Weak<Runtime>,
     network: String,
     work_id: String,
+    conversation: String,
     session: String,
     message: String,
     mut process: Process,
@@ -1493,8 +1622,12 @@ async fn follow(
             return;
         };
         let Ok(Some(line)) = line else {
-            missing_input_results =
-                ending.is_some() && !node.claude.processes.drained(process.tree.token(), results);
+            missing_input_results = line.is_err()
+                || (ending.is_some()
+                    && !node.claude.processes.drained(process.tree.token(), results));
+            if let Err(error) = &line {
+                tracing::warn!(%error, "Claude Code output transport stopped; reconcile native session");
+            }
             break;
         };
         for frame in frames(&line) {
@@ -1511,12 +1644,11 @@ async fn follow(
             };
             if let Some(progress) = turn.apply(frame)
                 && let Ok(target_node) = node.identity.device_id()
-                && let Ok(Some(record)) = node.store.lock().await.work_record(&work_id)
             {
                 let sequence = node.progress_sequence.fetch_add(1, Ordering::Relaxed) + 1;
                 node.publish_progress(
                     &network,
-                    json!({"type":"native_progress","conversation_id":record.conversation,
+                    json!({"type":"native_progress","conversation_id":conversation,
                         "work_id":work_id,"target_node":target_node,"sequence":sequence,
                         "progress":progress}),
                 );
@@ -1539,8 +1671,13 @@ async fn follow(
         node.claude.processes.remove_input(process.tree.token());
     }
     process.stdin.lock().await.take();
-    let _ = tokio::time::timeout(Duration::from_secs(5), process.child.wait()).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        tree::observe_exit(&mut process.child),
+    )
+    .await;
     let stopped = agent::terminate_process_tree(&mut process.child, &mut process.tree).await;
+    process.reaped = stopped;
     let Some(node) = node.upgrade() else {
         return;
     };
@@ -1682,7 +1819,7 @@ impl Executor for Claude {
                     "none" | "minimal" => "low",
                     effort => effort,
                 }),
-                instructions: "",
+                guide: None,
                 env: &env,
             };
             let mut process = match launch.spawn() {
@@ -1717,6 +1854,7 @@ impl Executor for Claude {
                 Arc::downgrade(node),
                 network.to_owned(),
                 work_id.to_owned(),
+                work.conversation.clone(),
                 session,
                 message,
                 process,
@@ -1800,7 +1938,12 @@ impl Executor for Claude {
                 Err(error) => return SteerAck::Refused(error.to_string()),
             };
             let frame = steer_frame(input, message_id, &into.thread_id);
-            let input_hash = crate::crypto::digest(frame.to_string().as_bytes());
+            let mut bytes = match transport::json(&frame, transport::FRAME_BYTES) {
+                Ok(bytes) => bytes,
+                Err(error) => return SteerAck::Refused(error.to_string()),
+            };
+            let input_hash = crate::crypto::digest(&bytes);
+            bytes.push(b'\n');
             let existing = match std::fs::read(&path) {
                 Ok(bytes) => Some(bytes),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -1884,7 +2027,7 @@ impl Executor for Claude {
                 ));
             }
             let result = async {
-                pipe.write_all(format!("{frame}\n").as_bytes()).await?;
+                pipe.write_all(&bytes).await?;
                 pipe.flush().await
             }
             .await;
@@ -1931,70 +2074,13 @@ impl Executor for Claude {
     }
 }
 
-/// What a `PermissionRequest` of the owner's own session asks, for the bot: the tool and what
-/// the model said it is for, never the command or the file contents, and how to answer.
-pub(crate) fn describe_request(input: &Value) -> String {
-    let tool = input["tool_name"].as_str().unwrap_or("a tool");
-    let tool_input = &input["tool_input"];
-    if request_kind(input) == RequestKind::Question {
-        let questions = crate::triage::question_lines(&tool_input["questions"]);
-        return format!(
-            "Claude Code asks: {}. Answer with {{\"answers\":{{\"QUESTION\":\"ANSWER\"}}}}.",
-            questions.join("; ")
-        );
-    }
-    let what = tool_input["description"]
-        .as_str()
-        .or_else(|| tool_input["file_path"].as_str())
-        .map(|what| format!(": {what}"))
-        .unwrap_or_default();
-    format!(
-        "{tool}{what}. Answer with {{\"behavior\":\"allow\"}} or {{\"behavior\":\"deny\",\"message\":\"WHY\"}}."
-    )
-}
-
-/// `AskUserQuestion` asks a question; every other tool asks permission.
-pub(crate) fn request_kind(input: &Value) -> RequestKind {
-    match input["tool_name"] == "AskUserQuestion" {
-        true => RequestKind::Question,
-        false => RequestKind::Permission,
-    }
-}
-
-/// What `vibeface hook claude` prints for the answer to its `PermissionRequest`: allow, with
-/// the question's answers filled in, or deny. An allow never changes the tool's input. `None`
-/// prints nothing, which leaves the decision to the session, as for `{"decision":null}`, an
-/// allow that carries `updatedInput`, or an answer that fits neither.
-pub fn hook_output(input: &Value, answer: &Value) -> Option<Value> {
-    if input["hook_event_name"] != "PermissionRequest" {
-        return None;
-    }
-    let decision = match (&answer["answers"], answer["behavior"].as_str()) {
-        (Value::Object(answers), _) if request_kind(input) == RequestKind::Question => {
-            if !answers.values().all(Value::is_string) {
-                return None;
-            }
-            let mut updated = input["tool_input"].clone();
-            updated.as_object_mut()?;
-            updated["answers"] = Value::Object(answers.clone());
-            json!({"behavior":"allow","updatedInput":updated})
-        }
-        // What was approved is what runs: an allow that rewrites the input is not this
-        // approval, so it prints nothing and the session asks again.
-        (_, Some("allow")) if answer.get("updatedInput").is_some() => return None,
-        (_, Some("allow")) => json!({"behavior":"allow"}),
-        (_, Some("deny")) => json!({"behavior":"deny",
-            "message":answer["message"].as_str().unwrap_or("The owner's bot declined this."),
-            "interrupt":answer["interrupt"] == true}),
-        _ => return None,
-    };
-    Some(json!({"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":decision}}))
-}
-
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::identity::{Genesis, Member, NetworkState};
+    use crate::runtime::test_support::{
+        assert_work_outcome, join_network, manager_settings, open_node, provider_work,
+    };
+    use crate::triage::{RequestKind, cli_hooks::hook_output};
     use crate::work::WorkState;
 
     fn fixture() -> PathBuf {
@@ -2003,17 +2089,6 @@ pub(super) mod tests {
         } else {
             "tests/fixtures/fake-claude"
         })
-    }
-
-    #[test]
-    fn a_stderr_tail_of_wide_characters_keeps_its_end() {
-        let mut tail = "错".repeat(1399) + "尾";
-        keep_end(&mut tail);
-        assert_eq!(tail.chars().count(), 1400);
-        let mut tail = "错".repeat(4000) + "尾";
-        keep_end(&mut tail);
-        assert_eq!(tail.chars().count(), 2000);
-        assert!(tail.ends_with('尾'));
     }
 
     /// A private directory with Claude Code's home and the fixture's log inside it.
@@ -2335,9 +2410,7 @@ pub(super) mod tests {
     }
 
     fn gated_config(place: &Place, client: &str) -> ManagerConfig {
-        let (record, _) = recorder();
-        let mut config = bot_config(place, record);
-        config.timeout_secs = 30;
+        let mut config = bot_config(place, Arc::new(|_, _| Box::pin(async { Ok(()) })));
         config.codex_turn = Some(CodexTurn {
             client_id: client.into(),
             started: None,
@@ -2394,28 +2467,83 @@ pub(super) mod tests {
         std::fs::File::create(place.dir.join("concurrent-release")).unwrap();
     }
 
-    fn concurrent_claude_turns(
-        place: &Place,
-        prompts: Vec<String>,
-    ) -> Vec<tokio::task::JoinHandle<Result<AgentResult>>> {
-        prompts
-            .into_iter()
-            .enumerate()
-            .map(|(index, prompt)| {
-                let config = gated_config(place, &format!("client-{index}"));
-                tokio::spawn(async move {
-                    manager::run_manager(
-                        &config,
-                        &prompt,
-                        None,
-                        |_| async { Ok(()) },
-                        tokio::sync::watch::channel(false).1,
-                        |_| async { Ok(()) },
-                    )
-                    .await
-                })
-            })
-            .collect()
+    async fn concurrent_claude_turns(place: &Place, first: Option<ManagerFailure>) -> Result<()> {
+        let mut tasks = Vec::with_capacity(16);
+        let mut stops = Vec::with_capacity(16);
+        for index in 0..16 {
+            let config = gated_config(place, &format!("client-{index}"));
+            let prompt = if index == 0 && first == Some(ManagerFailure::Failed) {
+                "fail marker-0".into()
+            } else {
+                format!("marker-{index}")
+            };
+            let (stop, cancel) = tokio::sync::watch::channel(false);
+            stops.push(stop);
+            tasks.push(tokio::spawn(async move {
+                crate::manager::run_manager(
+                    &config,
+                    &prompt,
+                    None,
+                    |_| async { Ok(()) },
+                    cancel,
+                    |_| async { Ok(()) },
+                )
+                .await
+            }));
+        }
+        let gated = async {
+            wait_for_gate(place).await?;
+            if first.is_none() {
+                assert_eq!(place.user_frames(), 16);
+            }
+            if first == Some(ManagerFailure::Cancelled) {
+                stops[0].send(true)?;
+                wait_for_interrupt(place).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        release(place);
+        let mut results = Vec::with_capacity(16);
+        for task in tasks {
+            results.push(task.await);
+        }
+        gated?;
+        let mut sessions = std::collections::HashSet::new();
+        for (index, result) in results.into_iter().enumerate() {
+            let result = result?;
+            if index == 0 && first.is_some() {
+                let error = result.err().context("first claude turn")?;
+                let error = error
+                    .downcast_ref::<ManagerError>()
+                    .context("manager error")?;
+                if first == Some(ManagerFailure::Cancelled) {
+                    assert!(error.cancelled());
+                } else {
+                    assert_eq!(error.outcome, ManagerFailure::Failed);
+                }
+            } else {
+                let result = result?;
+                if first.is_none() {
+                    sessions.insert(result.session_id.context("claude session")?);
+                }
+                assert_eq!(result.output, format!("done: marker-{index}"));
+            }
+        }
+        if first.is_none() {
+            assert_eq!(sessions.len(), 16);
+        }
+        if first == Some(ManagerFailure::Cancelled) {
+            assert_eq!(
+                place
+                    .log()
+                    .iter()
+                    .filter(|entry| entry["subtype"] == "interrupt")
+                    .count(),
+                1
+            );
+        }
+        Ok(())
     }
 
     /// One bot turn; returns its result, the session saved first, and the progress shown.
@@ -2454,7 +2582,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn bot_readback_requires_its_exact_message_and_explicit_ending() -> Result<()> {
         let place = Place::new()?;
-        let reader = Claude::open(&place.dir, &place.env());
+        let reader = Claude::open(&place.dir, &place.env()).await;
         let session = uuid::Uuid::new_v4().to_string();
         let project = projects_dir(&place.env())
             .context("projects")?
@@ -2533,7 +2661,7 @@ pub(super) mod tests {
                 error: None,
             }
         );
-        let recovered = Claude::open(&place.dir, &place.env());
+        let recovered = Claude::open(&place.dir, &place.env()).await;
         assert_eq!(
             recovered
                 .read_back(
@@ -2573,7 +2701,6 @@ pub(super) mod tests {
             Probe::Missing
         );
         let locator_path = reader.processes.reply_locator_path("attempt-a")?;
-        let locator = std::fs::read(&locator_path)?;
         std::fs::remove_file(&locator_path)?;
         assert_eq!(
             reader.probe_reply(&session, None, "attempt-a").await?,
@@ -2584,7 +2711,6 @@ pub(super) mod tests {
             reader.probe_reply(&session, None, "attempt-a").await?,
             Probe::Missing
         );
-        config::private_write(&locator_path, &locator)?;
         Ok(())
     }
 
@@ -2637,7 +2763,7 @@ pub(super) mod tests {
             assistant("initial-reply", "initial result", json!("end_turn")),
         ];
         write(&initial_rows)?;
-        let recovered = Claude::open(&place.dir, &place.env());
+        let recovered = Claude::open(&place.dir, &place.env()).await;
         assert_eq!(
             recovered
                 .probe_reply(&session, Some(&initial), "tree-attempt")
@@ -2738,7 +2864,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn bot_readback_keeps_the_transcript_root_used_before_config_changed() -> Result<()> {
         let place = Place::new()?;
-        let reader = Claude::open(&place.dir, &place.env());
+        let reader = Claude::open(&place.dir, &place.env()).await;
         let projects_a = reader.projects().context("initial transcript root")?;
         let (record, _) = recorder();
         let mut config = bot_config(&place, record);
@@ -2769,7 +2895,7 @@ pub(super) mod tests {
             reader.probe_reply(&session, None, "attempt-1").await?,
             expected
         );
-        let reopened = Claude::open(&place.dir, &place.env());
+        let reopened = Claude::open(&place.dir, &place.env()).await;
         assert_eq!(reopened.projects(), Some(projects_a));
         assert_eq!(
             reopened.native_directory(&session).await?.canonicalize()?,
@@ -2894,14 +3020,28 @@ pub(super) mod tests {
             ["--permission-mode", "bypassPermissions"],
             ["--model", "haiku"],
             ["--effort", "high"],
-            ["--append-system-prompt", "Answer briefly."],
         ] {
             assert!(argv.windows(2).any(|pair| pair == expected), "{argv:?}");
         }
+        let guide = Path::new(
+            argv[argv
+                .iter()
+                .position(|arg| *arg == "--append-system-prompt-file")
+                .context("guide argument")?
+                + 1],
+        );
+        assert!(!argv.contains(&"Answer briefly."));
+        assert_eq!(log[0]["guide"], "Answer briefly.");
+        #[cfg(unix)]
+        assert_eq!(log[0]["guide_private"], true);
+        assert!(
+            !guide.exists(),
+            "an ended process releases its instruction file"
+        );
         assert_eq!(
             log[0]["env"],
             json!({"VIBEFACE_TOOL_TOKEN":true,"VIBEFACE_NODE_URL":true,"CLAUDECODE":false,
-                "CLAUDE_CODE_ENTRYPOINT":false,"FAKE_MARK":false})
+                "CLAUDE_CODE_ENTRYPOINT":false})
         );
         assert_eq!(log[1]["uuid"], message.as_str());
         assert!(
@@ -2935,6 +3075,74 @@ pub(super) mod tests {
             "a lost session goes on in a new one"
         );
         assert_eq!(fresh.output, "done: fresh full context");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn cooperative_cli(directory: &Path) -> Result<PathBuf> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let bin = directory.join("cooperative-cli");
+        std::fs::write(
+            &bin,
+            r#"#!/usr/bin/env python3
+import os, pathlib, signal, sys, time
+home = pathlib.Path(os.environ['HOME'])
+if os.fork() == 0:
+    for fd in [0, 1, 2]:
+        os.close(fd)
+    def finish(*_):
+        time.sleep(0.05)
+        (home / 'member-completed').write_text('term-finished')
+        os._exit(0)
+    signal.signal(signal.SIGTERM, finish)
+    (home / 'member-ready').write_text('ready')
+    while True:
+        time.sleep(1)
+sys.stdin.read()
+time.sleep(0.05)
+(home / 'natural-close').write_text('persisted')
+"#,
+        )?;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700))?;
+        Ok(bin)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_normal_end_preserves_eof_and_grace_for_a_cooperative_child() -> Result<()> {
+        let place = Place::new()?;
+        let bin = cooperative_cli(&place.dir)?;
+        let env = BTreeMap::from([("HOME".into(), place.dir.display().to_string())]);
+        let mut process = Launch {
+            bin: &bin,
+            cwd: &place.dir.join("work"),
+            session: "fixture",
+            resume: false,
+            model: "fixture",
+            effort: None,
+            guide: None,
+            env: &env,
+        }
+        .spawn()?;
+        let processes = Processes::new(place.dir.join(PIDFILE));
+        processes.track(process.tree.token(), &bin)?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !place.dir.join("member-ready").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        process.end(&processes).await;
+        drop(process);
+        assert_eq!(
+            std::fs::read_to_string(place.dir.join("natural-close"))?,
+            "persisted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(place.dir.join("member-completed")).unwrap_or_default(),
+            "term-finished",
+            "a normal Claude end gives its live child TERM and time to finish"
+        );
         Ok(())
     }
 
@@ -3008,103 +3216,19 @@ pub(super) mod tests {
     #[tokio::test]
     async fn sixteen_claude_turns_overlap_and_keep_their_outputs() -> Result<()> {
         let place = Place::new()?;
-        let prompts: Vec<_> = (0..16).map(|i| format!("marker-{i}")).collect();
-        let tasks = concurrent_claude_turns(&place, prompts.clone());
-        wait_for_gate(&place).await?;
-        assert_eq!(place.user_frames(), 16);
-        release(&place);
-        let mut sessions = std::collections::HashSet::new();
-        for (index, task) in tasks.into_iter().enumerate() {
-            let result = task.await??;
-            sessions.insert(result.session_id.context("Claude session")?);
-            assert_eq!(result.output, format!("done: marker-{index}"));
-        }
-        assert_eq!(sessions.len(), 16);
-        Ok(())
+        concurrent_claude_turns(&place, None).await
     }
 
     #[tokio::test]
     async fn cancelling_one_of_sixteen_claude_turns_leaves_the_others_running() -> Result<()> {
         let place = Place::new()?;
-        let mut tasks = Vec::with_capacity(16);
-        let mut stops = Vec::with_capacity(16);
-        for index in 0..16 {
-            let config = gated_config(&place, &format!("client-{index}"));
-            let prompt = format!("marker-{index}");
-            let (stop, cancel) = tokio::sync::watch::channel(false);
-            stops.push(stop);
-            tasks.push(tokio::spawn(async move {
-                manager::run_manager(
-                    &config,
-                    &prompt,
-                    None,
-                    |_| async { Ok(()) },
-                    cancel,
-                    |_| async { Ok(()) },
-                )
-                .await
-            }));
-        }
-        wait_for_gate(&place).await?;
-        stops[0].send(true)?;
-        wait_for_interrupt(&place).await?;
-        release(&place);
-        for (index, task) in tasks.into_iter().enumerate() {
-            let result = task.await?;
-            if index == 0 {
-                let error = result.err().context("cancelled Claude turn")?;
-                assert!(
-                    error
-                        .downcast_ref::<manager::ManagerError>()
-                        .context("manager error")?
-                        .cancelled()
-                );
-            } else {
-                assert_eq!(result?.output, format!("done: marker-{index}"));
-            }
-        }
-        assert_eq!(
-            place
-                .log()
-                .iter()
-                .filter(|entry| entry["subtype"] == "interrupt")
-                .count(),
-            1
-        );
-        Ok(())
+        concurrent_claude_turns(&place, Some(ManagerFailure::Cancelled)).await
     }
 
     #[tokio::test]
     async fn one_failed_claude_turn_does_not_stop_the_other_fifteen() -> Result<()> {
         let place = Place::new()?;
-        let prompts: Vec<_> = (0..16)
-            .map(|i| {
-                if i == 0 {
-                    "fail marker-0".into()
-                } else {
-                    format!("marker-{i}")
-                }
-            })
-            .collect();
-        let tasks = concurrent_claude_turns(&place, prompts);
-        wait_for_gate(&place).await?;
-        release(&place);
-        for (index, task) in tasks.into_iter().enumerate() {
-            let result = task.await?;
-            if index == 0 {
-                let error = result.err().context("failed Claude turn")?;
-                assert_eq!(
-                    error
-                        .downcast_ref::<manager::ManagerError>()
-                        .context("manager error")?
-                        .outcome,
-                    ManagerFailure::Failed
-                );
-            } else {
-                assert_eq!(result?.output, format!("done: marker-{index}"));
-            }
-        }
-        Ok(())
+        concurrent_claude_turns(&place, Some(ManagerFailure::Failed)).await
     }
 
     #[tokio::test]
@@ -3151,7 +3275,6 @@ pub(super) mod tests {
 
     async fn node(place: &Place) -> Result<(Arc<Runtime>, LocalIdentity, String)> {
         let dir = place.dir.join("node");
-        config::private_dir(&dir)?;
         let mut configuration =
             Config::local("127.0.0.1:0".parse()?, vec![place.dir.join("work")], false);
         // Nothing listens there: the Node never reaches this computer's own App Server.
@@ -3168,10 +3291,6 @@ pub(super) mod tests {
         configuration.providers.codex_app_server.socket = Some(socket);
         configuration.providers.execution = [Provider::Claude].into();
         configuration.bins.insert(Provider::Claude, fixture());
-        configuration.save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
-        let identity = LocalIdentity::generate();
-        config::private_write(&dir.join("identity.json"), &serde_json::to_vec(&identity)?)?;
         let mut env = crate::providers::ProviderEnv::default();
         env.apply(
             Provider::Claude,
@@ -3181,16 +3300,9 @@ pub(super) mod tests {
                 .map(|(name, value)| (name, Some(value)))
                 .collect(),
         )?;
-        env.save(&dir)?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let admin = LocalIdentity::generate();
-        let state = NetworkState::new(Genesis::create(
-            &LocalIdentity::generate(),
-            Member::client(&admin, "admin", true)?,
-            Member::node(&node.identity, "node")?,
-        )?)?;
-        node.install_membership(state).await?;
-        let network = node.membership_state().await?.genesis.network_id;
+        configuration.provider_env = env;
+        let node = open_node(&dir, &configuration).await?;
+        let (admin, network) = join_network(&node).await?;
         conversation(&node, &admin, &network, "c", "m").await?;
         Ok((node, admin, network))
     }
@@ -3230,94 +3342,83 @@ pub(super) mod tests {
                 cause: None,
             },
         )?;
-        let mut store = node.store.lock().await;
-        store.create_conversation(
-            &node.identity,
-            network,
-            conversation_id,
-            "bot",
-            owner,
-            now_ms(),
-        )?;
-        store.append_event(
-            &node.identity,
-            network,
-            conversation_id,
-            bot,
-            vec![],
-            now_ms(),
-        )?;
-        let input = admin.attest(
-            network,
-            conversation_id,
-            EventBody::InputPosted {
-                message_id: message_id.into(),
-                target: crate::workspace::InputTarget::BotMain {
-                    bot_id: conversation_id.into(),
-                },
-                intent: crate::workspace::InputIntent::Continue,
-                sequence: 1,
-                expected_revision: None,
-                text: "Run the provider fixture work".into(),
-                attachments: vec![],
-                report_results: Some(true),
-                attestation: None,
-            },
-        )?;
-        store.append_event(
-            &node.identity,
-            network,
-            conversation_id,
-            input,
-            vec![],
-            now_ms(),
-        )?;
-        Ok(())
+        let (identity, admin, network, conversation_id, message_id) = (
+            node.identity.clone(),
+            admin.clone(),
+            network.to_owned(),
+            conversation_id.to_owned(),
+            message_id.to_owned(),
+        );
+        node.store
+            .call("claude.conversation_fixture", move |store| {
+                store.create_conversation(
+                    &identity,
+                    &network,
+                    &conversation_id,
+                    "bot",
+                    owner,
+                    now_ms(),
+                )?;
+                store.append_event(&identity, &network, &conversation_id, bot, vec![], now_ms())?;
+                let input = crate::runtime::test_support::signed_main_input(
+                    &admin,
+                    &network,
+                    &conversation_id,
+                    &message_id,
+                    "Run the provider fixture work",
+                    vec![],
+                    1,
+                )?;
+                store.append_event(
+                    &identity,
+                    &network,
+                    &conversation_id,
+                    input,
+                    vec![],
+                    now_ms(),
+                )?;
+                Ok(())
+            })
+            .await
     }
 
     fn spec(node: &Runtime, place: &Place, call_ref: &str, prompt: &str) -> Result<WorkSpec> {
         let local = node.identity.device_id()?;
         Ok(WorkSpec {
             work_id: WorkSpec::id("c", "message:m", call_ref),
-            conversation: "c".into(),
             trigger: "message:m".into(),
-            target: local.clone(),
-            dispatcher: local,
             call_ref: call_ref.into(),
-            kind: WorkKind::Agent(Provider::Claude),
-            model: None,
-            resolved: crate::model::ResolvedModel {
-                provider: Provider::Claude,
-                model: None,
-            },
-            cwd: place.dir.join("work").display().to_string(),
-            title: "t".into(),
-            prompt: prompt.into(),
-            continues: None,
-            parent: None,
-            thread: None,
+            ..provider_work(Provider::Claude, &local, &place.dir.join("work"), prompt)
         })
     }
 
     /// Registers the work and has Claude Code start it, as `track_work` does.
     async fn dispatch(node: &Arc<Runtime>, network: &str, spec: &WorkSpec) -> Result<bool> {
-        node.store.lock().await.accept_work_fixture(
-            &node.identity,
-            network,
-            spec.clone(),
-            now_ms(),
-        )?;
+        {
+            let identity = node.identity.to_owned();
+            let network = network.to_owned();
+            let spec = spec.clone();
+            node.store
+                .call("claude.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, now_ms())
+                })
+                .await
+        }?;
         let claude = node.executor(Provider::Claude)?;
         node.start_work(claude, network, spec, None, &json!({}))
             .await
     }
 
     async fn record(node: &Runtime, work_id: &str) -> Result<WorkRecord> {
-        node.store
-            .lock()
-            .await
-            .work_record(work_id)?
-            .context("the work is recorded")
+        {
+            let work_id = work_id.to_owned();
+            node.store
+                .call("claude.work_record", move |store| {
+                    store.work_record(&work_id)
+                })
+                .await
+        }?
+        .context("the work is recorded")
     }
 
     async fn until(
@@ -3350,12 +3451,7 @@ pub(super) mod tests {
             "the Node sends it, not the Agent"
         );
         let finished = until(&node, &spec.work_id, WorkState::finished).await?;
-        assert_eq!(
-            finished.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Completed
-            }
-        );
+        assert_work_outcome(&finished, WorkOutcome::Completed);
         assert_eq!(finished.text, "done: build it");
         let session = derived(SESSION_SEED, &spec.work_id);
         let unsure = WorkRecord {
@@ -3397,7 +3493,24 @@ pub(super) mod tests {
             text: "the work's late constraint".into(),
             files: vec![],
         };
-        let store = node.store.lock().await;
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let (held_node, held_work) = (node.clone(), work.work_id.clone());
+        let gate = tokio::spawn(async move {
+            held_node
+                .store
+                .call("claude.hold_fixture_completion", move |store| {
+                    let _ = entered.send(());
+                    held.recv().context("release fixture completion")?;
+                    Ok(!store
+                        .work_record(&held_work)?
+                        .context("work")?
+                        .state
+                        .finished())
+                })
+                .await
+        });
+        waiting.await?;
         assert!(!matches!(
             node.claude.send_turn(&target, "work-input", &input).await,
             SteerAck::Refused(_)
@@ -3411,26 +3524,15 @@ pub(super) mod tests {
             }
         })
         .await?;
-        assert!(
-            !store
-                .work_record(&work.work_id)?
-                .context("work")?
-                .state
-                .finished()
-        );
-        drop(store);
+        release.send(())?;
+        assert!(gate.await??);
         let finished = until(&node, &work.work_id, WorkState::finished).await?;
-        assert_eq!(
-            finished.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Completed
-            }
-        );
+        assert_work_outcome(&finished, WorkOutcome::Completed);
         assert_eq!(
             finished.text,
             format!("initial finished\n\ndone: {}", input.message("work-input"))
         );
-        let recovered = Claude::open(&place.dir.join("node"), &place.env());
+        let recovered = Claude::open(&place.dir.join("node"), &place.env()).await;
         let pending = WorkRecord {
             state: WorkState::Starting {
                 thread: Some(target.thread_id.clone()),
@@ -3514,12 +3616,7 @@ pub(super) mod tests {
         assert!(!pidfile.exists(), "the restart ended the process it left");
         node.probe_work(&network, &spec.work_id, true).await?;
         let finished = record(&node, &spec.work_id).await?;
-        assert_eq!(
-            finished.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Completed
-            }
-        );
+        assert_work_outcome(&finished, WorkOutcome::Completed);
         assert_eq!(finished.text, "finished while unwatched");
         assert_eq!(place.user_frames(), 1, "the prompt was sent once");
         Ok(())
@@ -3530,12 +3627,16 @@ pub(super) mod tests {
         let place = Place::new()?;
         let (node, _, network) = node(&place).await?;
         let spec = spec(&node, &place, "r1", "never sent")?;
-        node.store.lock().await.accept_work_fixture(
-            &node.identity,
-            &network,
-            spec.clone(),
-            now_ms(),
-        )?;
+        {
+            let identity = node.identity.to_owned();
+            let network = network.to_owned();
+            let spec = spec.clone();
+            node.store
+                .call("claude.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, now_ms())
+                })
+                .await
+        }?;
         let session = derived(SESSION_SEED, &spec.work_id);
         let journaled = node
             .signal_work(&network, &spec.work_id, Signal::ThreadCreated(session))
@@ -3558,12 +3659,7 @@ pub(super) mod tests {
         .await?;
         node.executor(Provider::Claude)?.interrupt(&running).await?;
         let finished = until(&node, &spec.work_id, WorkState::finished).await?;
-        assert_eq!(
-            finished.state,
-            WorkState::Finished {
-                outcome: WorkOutcome::Interrupted
-            }
-        );
+        assert_work_outcome(&finished, WorkOutcome::Interrupted);
         Ok(())
     }
 
@@ -3581,12 +3677,16 @@ pub(super) mod tests {
                 thread: Some(session.clone()),
                 ..spec(&node, &place, call_ref, "hang around")?
             };
-            node.store.lock().await.accept_work_fixture(
-                &node.identity,
-                &network,
-                spec.clone(),
-                now_ms(),
-            )?;
+            {
+                let identity = node.identity.to_owned();
+                let network = network.to_owned();
+                let spec = spec.clone();
+                node.store
+                    .call("claude.accept_work_fixture", move |store| {
+                        store.accept_work_fixture(&identity, &network, spec, now_ms())
+                    })
+                    .await
+            }?;
             specs.push(spec);
         }
         let (claude, args) = (node.executor(Provider::Claude)?, json!({}));
@@ -3680,12 +3780,16 @@ pub(super) mod tests {
         let place = Place::new()?;
         let (node, _, network) = node(&place).await?;
         let spec = spec(&node, &place, "r1", "never run")?;
-        node.store.lock().await.accept_work_fixture(
-            &node.identity,
-            &network,
-            spec.clone(),
-            now_ms(),
-        )?;
+        {
+            let identity = node.identity.to_owned();
+            let network = network.to_owned();
+            let spec = spec.clone();
+            node.store
+                .call("claude.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, now_ms())
+                })
+                .await
+        }?;
         let error = node
             .start_work(&Unstartable, &network, &spec, None, &json!({}))
             .await
@@ -3710,13 +3814,11 @@ pub(super) mod tests {
     async fn a_permission_request_waits_for_the_bot_and_gets_its_answer() -> Result<()> {
         let place = Place::new()?;
         let (node, _, _) = node(&place).await?;
-        node.settings.lock().unwrap().manager = Some(crate::config::ManagerSettings {
-            provider: Provider::Claude,
-            workspace: place.dir.join("work"),
-            model: String::new(),
-            reasoning_effort: None,
-            backup: Default::default(),
-        });
+        node.settings.lock().unwrap().manager = Some(manager_settings(
+            Provider::Claude,
+            place.dir.join("work"),
+            String::new(),
+        ));
         let input = asks(
             "Bash",
             json!({"command":"rm -rf build","description":"Clean the build"}),

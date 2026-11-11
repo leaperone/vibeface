@@ -11,6 +11,8 @@ description: 安装桌面 App，连接已有节点，或在自己的电脑上启
 
 从同一产品 Release 下载本平台的 Vibeface Desktop：macOS 使用 DMG，Windows 使用当前用户安装器，Linux 使用 AppImage。桌面包内已有对应平台的 Core、CLI 和客户端，无需先运行 CLI。
 
+当前源码的桌面界面使用 GPUI。公开安装包以对应 Release 的源码提交和来源收据为准；源码改动、开发预览和已发布版本分别核对，不能把本分支构建等同于已经更新安装。
+
 打开 App 后会检查当前用户已有的本机节点。只有一个可用节点时会自动选择；多个节点会列出位置与状态，选择后打开客户端。记住的节点每次启动都重新核对身份。节点停止时，点击“启动并连接”后才会启动它。首次注册设备仍需要确认身份、下载恢复文件并确认已保存。
 
 没有已有节点时，可以选择“仅作控制端”，用邀请链接访问个人网络；也可以选择在这台电脑启用节点。点击“安装后台节点”后，App 会安装自己的当前用户服务，退出 App 后仍继续运行。“移除后台运行”会卸载服务并保留节点数据。
@@ -21,7 +23,7 @@ description: 安装桌面 App，连接已有节点，或在自己的电脑上启
 
 本文对应拆分后的 CLI、Core 与 App。完整包需要同时含 `vibeface`、`vibeface-core` 和 `web/`，当前 main 的安装器会检查这个结构。
 
-安装器只接受当前协议和 data epoch 的完整包。旧开发版的数据目录、组件包和单独程序不能沿用；请创建全新数据目录。需要从源码运行时，按[从源码准备当前版本](quick-start.md#从源码准备当前版本)操作。下面的安装和更新步骤以匹配的完整包已经发布为前提。
+安装器只接受当前协议和 data epoch 的完整包。当前 data epoch 保持为 1；相同 epoch 且通过完整性检查的数据库继续使用，新增的派生性能索引由 Core 在验证后创建。Nightly 序号较旧本身不要求重建数据目录。数据格式或完整性不符合要求时，Core 会拒绝启动；先备份数据与身份并按诊断修复，不修改 epoch 或清空身份来绕过检查。组件包和单独程序不能替代完整包。需要从源码运行时，按[从源码准备当前版本](quick-start.md#从源码准备当前版本)操作。下面的安装和更新步骤以匹配的完整包已经发布为前提。
 
 ## 选择安装目录
 
@@ -46,7 +48,7 @@ vibeface --version
 vibeface
 ```
 
-一个 npm 包包含四个平台的 CLI、Core 和 `web/` 资源，按本机平台启动 Rust CLI。无需安装期脚本、二次下载、Rust 编译器或构建工具。npm 不创建身份、配置 Provider、启动服务或开启自动更新。产品 Nightly 的 GitHub Release 发布成功后自动通过 OIDC 发布同一份 npm 包，流程与权限要求见 [npm Nightly 制品与发布](releasing.md#npm-nightly-制品与发布)。也可从扩展 CI 的 `npm-package-<SHA>` artifact 下载 `.tgz`，使用 `npm install --global --prefix /absolute/isolated/prefix --ignore-scripts /absolute/path/leaperone-vibeface-<version>.tgz` 隔离安装。
+一个 npm 包包含四个平台的 CLI、Core 和 `web/` 资源，按本机平台启动 Rust CLI。无需安装期脚本、二次下载、Rust 编译器或构建工具。npm 不创建身份、配置 Provider、启动服务或开启自动更新。产品 Nightly 的 GitHub Release 发布成功后自动通过 OIDC 发布同一份 npm 包，流程与权限要求见 [npm Nightly 制品与发布](releasing.md#npm-nightly-制品与发布)。当前声明版本为 Nightly 时，也可从扩展 CI 的 `npm-package-<SHA>` artifact 下载 `.tgz`，使用 `npm install --global --prefix /absolute/isolated/prefix --ignore-scripts /absolute/path/leaperone-vibeface-<version>.tgz` 隔离安装。
 
 初始化后，下面的 `service` 命令也适用于全局 npm 安装。服务绑定 npm 包中固定的原生程序路径；不要把后台服务绑定到临时 `npx` 缓存，也不要在服务仍运行时移除或覆盖 npm 安装。迁移服务前先从原安装入口确认空闲并停止服务；npm 服务安装拒绝运行中的 updater、仍被运行中节点锁定或存在未完成更新记录的数据目录，通过后才移除同一目录绑定的旧受管更新定时器。安装期间持续持有同一更新锁，避免旧 updater 并发改写状态。存在 `update-pending.json` 时，先使用原受管安装的 `update apply` 恢复，再迁移服务。
 
@@ -144,7 +146,7 @@ vibeface init --relay-listen 127.0.0.1:3340 --relay-url https://relay.example   
 vibeface init --relay https://relay.example                                      # 其他 Node，可重复
 ```
 
-显式设置写入 `config.json` 的 `network` 字段，之后修改该字段并重启。默认还会使用官方公共节点在发现服务登记时提供的开放 Relay，也可以指定自己的 Relay。更多说明见 [Node 之间的连接](node.md#node-之间的连接)。
+显式设置写入 `config.json` 的 `network` 字段，之后修改该字段并重启。默认还会使用从全网表选出的开放 Relay（包括官方公共节点的 Relay），也可以指定自己的 Relay。更多说明见 [Node 之间的连接](node.md#node-之间的连接)。
 
 relay 默认只接纳运行它的 Node、个人网络的成员 Node 和它所发邀请的加入者，加 `--relay-open` 才对任何设备开放，且必须同时设上限。还要给熟人用时，运行 relay 的 Node 加令牌，个人网络以外的 Node 带上同一令牌：
 
@@ -208,9 +210,13 @@ Stable 不存在时不会切换 Nightly，更新器也不自动降级。每次 `
 
 ## 安装桌面应用
 
-从同一个产品 Release 下载适合本机的 `vibeface-desktop-<version>-<target>`。macOS Apple Silicon 使用 `.dmg`，Windows x64 使用 `.exe` 安装器，Linux x64 和 ARM64 使用对应架构的 `.AppImage`。两端也提供 `.zip`，以及校验摘要和来源收据。
+从同一个产品 Release 下载适合本机的 `vibeface-desktop-<version>-<target>`。macOS Apple Silicon 使用 `.dmg`，Windows x64 使用 `.exe` 安装器，Linux x64 和 ARM64 使用对应架构的 `.AppImage`。各平台也提供 `.zip`，以及校验摘要和来源收据。
 
-桌面应用内含同版本、同源码的 CLI、Core 和 Web 资源。关闭窗口后继续在托盘运行。选择退出时，应用停止自己启动的 Core；连接既有服务时，退出保留该服务。首次点击“在这台电脑开始使用”后，应用在自己的配置目录下保存数据。选择已有数据时，所选目录决定这台电脑的数据位置。
+桌面界面使用 GPUI，随包带有同版本、同源码的 CLI、Core 和独立 Web 资源。纯控制端打开窗口、扫描和选择节点不会初始化或启动 Node。只有明确启动本机节点或安装后台服务时，才创建 App 自有节点数据。退出只停止 App 自己启动的 Core；连接既有服务时保留该服务。
+
+原生客户端有自己的身份。旧桌面页面的浏览器私钥不可导出，需要通过本人管理设备邀请或显式恢复加入；不静默导出身份、删除旧 profile 或改签未确认写入。已有 Node 数据保留。
+
+Linux 需要 glibc、X11 或 Wayland 桌面会话与可用的 Vulkan 驱动。包内 `native-dependencies.json` 记录实际链接库和最低 glibc 符号要求；AppImage 不安装系统库或显卡驱动。`vibeface.desktop` 包含深链声明，实际注册由桌面集成或明确的用户安装完成。
 
 Windows 安装器只安装到当前账户，不需要管理员、WSL、Git Bash 或开发者模式。未配置签名证书的 Nightly 明确标记为未签名开发预览。正式版必须通过签名验证。已有独立 CLI 服务可以继续运行；桌面应用只连接它，不接管启停。
 

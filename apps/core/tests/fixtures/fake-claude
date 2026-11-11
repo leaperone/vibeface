@@ -10,9 +10,18 @@ the turn goes:
   die     records the prompt, then exits before the turn ends
   fail    ends the turn with an API error
   abort   ends the turn as aborted though nobody asked it to stop
+  steer   waits like hang, holds user frames until three arrived, replays them and answers
+          "Got all three inputs"
+  steer-late, steer-late-delayed
+          waits like hang; the next user frame ends the turn with "initial finished" and runs
+          as a turn of its own. The delayed one holds that turn's result: it creates
+          `$FAKE_CLAUDE_RESULT_GATE.waiting` and waits until `$FAKE_CLAUDE_RESULT_GATE` exists
   other   replies, runs one Bash tool, and answers "done: <prompt>"
 
 Every argument list and stdin frame is appended to `$FAKE_CLAUDE_LOG` as one JSON line.
+With `$FAKE_CLAUDE_GATE_DIR` and `$FAKE_CLAUDE_GATE_RELEASE` both set, every turn first creates
+`$FAKE_CLAUDE_GATE_DIR/<session>.started` and waits until the release file exists, taking
+steers meanwhile; an interrupt or EOF ends the turn there.
 """
 import json
 import os
@@ -102,11 +111,21 @@ def option(name):
     return args[args.index(name) + 1] if name in args else None
 
 
+guide = option("--append-system-prompt-file")
+guide_text = None
+guide_private = None
+if guide:
+    with open(guide) as file:
+        guide_text = file.read()
+    if os.name != "nt":
+        guide_private = os.stat(guide).st_mode & 0o077 == 0
 log({
     "argv": sys.argv[1:],
     "cwd": os.getcwd(),
+    "guide": guide_text,
+    "guide_private": guide_private,
     "env": {name: name in os.environ for name in
-            ("VIBEFACE_TOOL_TOKEN", "VIBEFACE_NODE_URL", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "FAKE_MARK")},
+            ("VIBEFACE_TOOL_TOKEN", "VIBEFACE_NODE_URL", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")},
 })
 resumed = option("--resume")
 session = resumed or option("--session-id")

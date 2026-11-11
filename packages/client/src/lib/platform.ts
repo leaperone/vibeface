@@ -1,11 +1,13 @@
 import type { SecureApi } from '../secure-api.ts'
-import type { ConnectionEntry, LocalSetup, PublicIdentity } from './node.ts'
+import type { ConnectionEntry, LocalSetup, PublicIdentity, ReadyConnection } from './node.ts'
 import type { OutboxStore } from './outbox.ts'
 import type { Transport } from './transport.ts'
+import type { NotificationRecord } from '../workspace/types.ts'
 import type { TransferFile } from '../delivery/types.ts'
 
 /** Synchronous string storage that survives restarts, like the browser's `localStorage`. */
 export type KeyValue = { getItem(key: string): string | null; setItem(key: string, value: string): void }
+export type NotificationDestination = { network_id: string; device_id: string; notification_id: string; conversation_id: string }
 export type Permission = 'granted' | 'denied' | 'default' | 'unsupported'
 /** Alerts shown by the system while the app is open. */
 export type Notifier = {
@@ -13,7 +15,10 @@ export type Notifier = {
   name: string
   permission(): Promise<Permission>
   request(): Promise<Permission>
-  show(alert: { title: string; body: string; tag: string }, open: () => void): void
+  show(alert: { title: string; body: string; tag: string; destination: NotificationDestination }, open: () => void): void
+  /** Retains an opening until the current workspace consumes it. False keeps it for a later connection. */
+  watchOpen?(listener: (destination: NotificationDestination) => Promise<boolean>): () => void
+  replayOpen?(): void
 }
 /** `rejoin`: a removed device asked to join again once the launch connects. */
 export type LocalLaunch = { token: string; deviceId: string; rejoin: boolean }
@@ -56,18 +61,37 @@ export type Platform = {
   /** Calls `listener` each time the app comes back to the foreground. */
   onForeground(listener: () => void): () => void
   foreground(): boolean
-  /** Hands a sealed recovery file to the person to keep, under `name`. */
+  /** Opens a sealed file's download or share; completion does not confirm an external saved copy. */
   saveRecovery(bytes: Uint8Array, name: string): void | Promise<void>
+  /** A sealed pending file and its index, stored together before recovery is committed. Web uses tab storage. */
+  recoveryStorage?: { read(): string | null; write(value: string | null): void }
   files?: {
     pick(): Promise<TransferFile | null>
     save(bytes: Uint8Array, name: string): Promise<'saved' | 'handed_off'>
   }
   /** How messages name this device: 这个浏览器, 这台手机. */
   self: string
-  /** Deletes this device's key and everything it stored, for a factory reset. */
+  /** Deletes this device's key and app-owned local data. External originals and exported copies stay with the person. */
   erase?(): Promise<void>
   page?: LocalPage
   joinTabs?: JoinTabs
+  /** Serializes local input persistence across tabs independently of network delivery. */
+  inputLock?<T>(name: string, save: () => Promise<T>): Promise<T>
   /** The app's: a browser cannot reach Nodes on its LAN directly. */
   lan?: Lan
+}
+
+/** A persisted OS target must be found again in the current authenticated network. */
+export async function notificationForOpening(args: {
+  destination: NotificationDestination
+  connection: ReadyConnection
+  current(): boolean
+  read(): Promise<NotificationRecord[]>
+}): Promise<{ kind: 'deferred' } | { kind: 'invalid' } | { kind: 'target'; notification: NotificationRecord }> {
+  const { destination, connection, current, read } = args
+  if (!current() || destination.network_id !== connection.principal.network_id || connection.info.network_id !== destination.network_id) return { kind: 'deferred' }
+  const items = await read()
+  if (!current()) return { kind: 'deferred' }
+  const notification = items.find(item => item.notification_id === destination.notification_id && item.conversation_id === destination.conversation_id)
+  return notification ? { kind: 'target', notification } : connection.catchingUp?.() ? { kind: 'deferred' } : { kind: 'invalid' }
 }

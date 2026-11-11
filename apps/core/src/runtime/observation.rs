@@ -1,5 +1,6 @@
 //! Temporary progress is read from its source; it never becomes a command or shared history.
 
+use super::provider_adapter::bounded as bounded_text;
 use super::{Access, Runtime, Update, field};
 use anyhow::{Context, Result, ensure};
 use futures_util::StreamExt;
@@ -172,13 +173,6 @@ fn valid_progress(event: &Value, scope: &str, source: &str) -> bool {
         && serde_json::to_vec(event).is_ok_and(|bytes| bytes.len() <= MAX_EVENT_BYTES)
 }
 
-fn bounded_text(text: &str, limit: usize) -> String {
-    text.chars()
-        .filter(|character| !character.is_control() || matches!(*character, '\n' | '\t'))
-        .take(limit)
-        .collect()
-}
-
 /// Provider tool arguments, raw outputs and reasoning never enter the live UI protocol.
 pub(crate) fn native_progress(event: &Value) -> Value {
     let method = event["method"].as_str().unwrap_or("");
@@ -288,10 +282,15 @@ impl Runtime {
             .collect::<BTreeSet<_>>();
         ensure!(targets.len() <= MAX_TARGETS, "too many progress sources");
         {
-            let store = self.store.lock().await;
-            for target in &targets {
-                store.authorize_node(&access.network_id, target)?;
-            }
+            let (network, targets) = (access.network_id.clone(), targets.clone());
+            self.store
+                .call("observation.authorize_targets", move |store| {
+                    for target in &targets {
+                        store.authorize_node(&network, target)?;
+                    }
+                    Ok(())
+                })
+                .await?;
         }
         let mut state = self
             .observation
@@ -345,7 +344,15 @@ impl Runtime {
             scope,
         )
         .await?;
-        self.store.lock().await.authorize_node(network, origin)?;
+        {
+            let network = network.to_owned();
+            let origin = origin.to_owned();
+            self.store
+                .call("observation.authorize_node", move |store| {
+                    store.authorize_node(&network, &origin)
+                })
+                .await
+        }?;
         let since = input
             .get("cursor")
             .filter(|cursor| !cursor.is_null())
@@ -411,10 +418,15 @@ impl Runtime {
         // Authorization is checked again before every poll, including after membership changes.
         let authorized = async {
             self.membership_state().await?;
-            self.store
-                .lock()
-                .await
-                .authorize_node(&stream.network, &stream.source)?;
+            {
+                let network = stream.network.to_owned();
+                let source = stream.source.to_owned();
+                self.store
+                    .call("observation.authorize_node", move |store| {
+                        store.authorize_node(&network, &source)
+                    })
+                    .await
+            }?;
             self.require_scope(
                 &Access {
                     network_id: stream.network.clone(),
@@ -494,9 +506,17 @@ impl Runtime {
             "invalid progress cursor"
         );
         {
-            let store = self.store.lock().await;
-            store.authorize_node(&stream.network, &stream.source)?;
-            store.authorize_node(&stream.network, &self.identity.device_id()?)?;
+            let (network, source, local) = (
+                stream.network.clone(),
+                stream.source.clone(),
+                self.identity.device_id()?,
+            );
+            self.store
+                .call("observation.authorize_stream", move |store| {
+                    store.authorize_node(&network, &source)?;
+                    store.authorize_node(&network, &local)
+                })
+                .await?;
         }
         {
             let mut state = self
@@ -567,6 +587,11 @@ mod tests {
             &json!({"method":"item/reasoning/textDelta","params":{"delta":"private-value"}}),
         );
         assert!(!reasoning.to_string().contains("private-value"));
+        let bounded = native_progress(&json!({"method":"item/agentMessage/delta",
+            "params":{"itemId":"界".repeat(129),"delta":format!("\0{}", "界".repeat(8001))}}));
+        assert_eq!(bounded["item_id"], "界".repeat(128));
+        assert_eq!(bounded["text"], "界".repeat(8000));
+        assert_eq!(bounded_text("\0界\n\t\r文", 4), "界\n\t文");
     }
 
     #[test]

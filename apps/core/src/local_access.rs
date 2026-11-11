@@ -48,13 +48,13 @@ pub struct LocalSession {
     expires_at_ms: i64,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Launcher {
-    pub origin: String,
-    pub node_id: String,
-    pub capability: String,
+impl LocalSession {
+    pub(crate) fn expires_at_ms(&self) -> i64 {
+        self.expires_at_ms
+    }
 }
+
+pub use vibeface_control::LocalHttpCredential as Launcher;
 
 impl LocalAccess {
     pub fn open(dir: &Path, enabled: bool) -> Result<Self> {
@@ -149,6 +149,13 @@ impl LocalAccess {
         Self::issue_pending(&mut state, node_id, network_id)
     }
 
+    pub fn is_owner(&self, capability: &str) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            capability.len() == 64 && crypto::digest(capability.as_bytes()) == state.launcher_hash
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn issue_from_local_setup(&self, node_id: &str, network_id: &str) -> Result<String> {
         let mut state = self
             .state
@@ -260,12 +267,14 @@ impl LocalAccess {
         if state.enabled == enabled {
             return Ok(());
         }
-        state.enabled = enabled;
         state.generation = state.generation.wrapping_add(1);
+        // Fence existing transport snapshots before changing cookie authority or persisting
+        // its removal. Socket pumps can observe this watch without taking the disk-held lock.
+        self.changes.send_replace(state.generation);
+        state.enabled = enabled;
         state.tokens.clear();
         state.sessions.clear();
         self.save_sessions(&state)?;
-        self.changes.send_replace(state.generation);
         Ok(())
     }
 

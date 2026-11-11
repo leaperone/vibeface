@@ -24,18 +24,20 @@ PLAYWRIGHT_BROWSERS_PATH="$PWD/.artifacts/e2e/browsers" pnpm exec e2e-web instal
 
 每项测试创建独立 Node 数据目录，使用随机本机端口，关闭 Codex 会话扫描。默认 fixture 关闭模型执行；`workspaceTest` 启用本次测试的受控 Codex 程序，不连接真实模型。测试结束后停止自己的进程，不连接已有 Node。测试控制口只监听 loopback，认证材料保存在 owner-only 文件。Node 数据和控制文件位于 `.artifacts/e2e/`，runner 日志、报告和下载文件位于 `tests/e2e/.artifacts/`，都不会提交。恢复密码每次随机生成，通过 e2e secrets 传入。
 
-示例检查建网页面。核心测试依次建网、下载恢复文件、跳过 AI 设置、创建 Bot，再刷新确认它仍存在。传输测试启动发送 Node、接收 Node 和运行 relay 的公共节点，经真实界面创建两个独立个人网络，从“设置 → 实验室”开启文件传输，再到 `/settings/lab/transfers` 确认零费用订单，接受订单并重启接收 Node。它还关闭实验并刷新，检查记录仍在、已收到文件仍可保存、重开不新增订单且不改变原传输方式。浏览器下载的原文件必须通过 SHA-256 核对，免费过程不创建钱包或调用链上 RPC。这些测试不需要模型或登录。CI 使用本次提交打包出的 Linux 程序运行。
+所有 Web fixture 显式选择受控 Cursor CLI，避免 AI 设置的自动探针启动 PATH 中的个人 CLI。`onboarding.e2e.ts` 的 Cursor 场景从旧 SDK 程序选择开始，在受控 PATH 中发现并保存官方入口，核对未登录提示、无密钥输入、受控 CLI 登录后返回页面的认证与模型状态，以及 Bot 和执行用途仍关闭。全过程不发送模型提示。
+
+核心测试依次建网、下载恢复文件、跳过 AI 设置、创建 Bot，再刷新确认它仍存在。传输测试启动发送 Node、接收 Node 和运行 relay 的公共节点，经真实界面创建两个独立个人网络，从“设置 → 实验室”开启文件传输，再到 `/settings/lab/transfers` 确认零费用订单，接受订单并重启接收 Node。它还关闭实验并刷新，检查记录仍在、已收到文件仍可保存、重开不新增订单且不改变原传输方式。浏览器下载的原文件必须通过 SHA-256 核对，免费过程不创建钱包或调用链上 RPC。这些测试不需要模型或登录。CI 使用本次提交打包出的 Linux 程序运行。
 
 headless 传输测试仅阻止临时文件输入打开原生系统选择框，再用真实 `setInputFiles` 选择任务内文件。文件输入的 change 事件、原文件内容、产品加密和 Node 请求均保留真实路径。下载结果仍需独立核对 SHA-256。
 
-测试使用 `tests/e2e/fixtures.ts` 导出的 `test`、`deliveryTest` 或 `workspaceTest`，每项测试均重建 Node。保持 `workers: 1` 和 `retries: 0`，避免重复执行有外部副作用的验收。
+测试使用 `tests/e2e/fixtures.ts` 导出的 `test`、`cursorTest`、`deliveryTest`、`workspaceTest` 或 `meshTest`，每项测试均重建 Node。保持 `workers: 1` 和 `retries: 0`，避免重复执行有外部副作用的验收。
 
 `workspace.e2e.ts` 从真实表单创建 Bot、独立 Task 和频道，检查连续补充、稍后队列控制、Context 来源、scope 隔离及窄屏输入和停止。控制器只释放固定的受控 Provider 门，并读取实际原生输入和回合记录，不直接写业务表。390px 网页通过不能替代原生手机制品验收。
 
-公共引导使用同一文件导出的 `bootstrapTest`。测试页面由一台公共节点提供，它运行发现服务、开放 relay 和面向任何设备的浏览器转发；成员 Node 只配置这台公共节点的发现服务，不配置 relay 或运营者令牌。浏览器粘贴加入链接，经公共节点按设备编号连到成员 Node，完成真实安全码配对后读取助手列表，刷新后仍能连上。普通夹具的 Node 关闭公共引导，本机页面不连接官方服务。
+公共入网使用同一文件导出的 `meshTest`。测试页面由一台公共节点提供，它在随机网络名的全网里当 bootstrap 节点，提供开放 relay 和面向任何设备的浏览器转发；成员 Node 只把这台公共节点配成 bootstrap 节点，不配置 relay 或运营者令牌。浏览器粘贴加入链接，经公共节点按设备编号连到成员 Node，完成真实安全码配对后读取 Bot 列表，刷新后仍能连上。普通夹具的 Node 不入全网（`--no-mesh`），本机页面不连接官方服务。
 
 ```sh
-pnpm exec e2e run --config tests/e2e/e2e.config.ts bootstrap.e2e.ts
+pnpm exec e2e run --config tests/e2e/e2e.config.ts mesh.e2e.ts
 ```
 
 只运行核心测试或显示浏览器：
@@ -46,6 +48,20 @@ pnpm exec e2e run --config tests/e2e/e2e.config.ts --headed
 ```
 
 排查失败时，读取终端指向的 `trace.md`。不要上传 Node 数据目录或恢复文件。
+
+## 验证会话历史分页
+
+使用同一源码构建的 CLI、Core 和 Web 加密模块运行隔离进程验收：
+
+```sh
+python3 scripts/verify-node.py --conversation-history \
+  --binary /absolute/path/to/vibeface \
+  --core-binary /absolute/path/to/vibeface-core \
+  --crypto-module /absolute/path/to/apps/app/dist/client/vibeface_secure.js \
+  --artifacts .artifacts/conversation-history
+```
+
+该模式通过真实加密连接写入 1024 条延后处理的签名消息，核对默认窗口、完整旧历史、3 MiB 响应预算、错误作用域拒绝、进程重启和新消息合并。Provider 执行与会话扫描关闭；若任何 Provider 程序被调用，验收失败。每次运行仅停止自己的 Node 和客户端进程，私有目录中的 `summary.json` 保存内容摘要、字节计量和清理结果，不输出凭证。此验收不证明网页或原生窗口的滚动表现。
 
 ## 验证公益传输进程和网络边界
 
@@ -63,88 +79,96 @@ python3 scripts/verify-node.py --delivery-charity \
   --delivery-probe .artifacts/delivery-probe/target/debug/vibeface-delivery-probe
 ```
 
-该模式运行四个全新 Node，验证免费签名目录、默认关闭、两窗公益传输、同 intent 幂等、明确接收同意和原文件恢复。probe 使用真实产品发现代码和受控身份，正例必须成功到达指定 PeerID 的服务，外部 Node 必须在真实私网权限检查处遭到拒绝。验收先上传 8192 字节真实密文，再强制停止公共节点，重启后检查持久前缀和旧 offset 拒绝，最后由产品继续完成订单。摘要保存在输出路径的 `summary.json`。
+该模式运行四个全新 Node，验证免费全网记录（另列一台不可达的 bootstrap 节点）、默认关闭、两窗公益传输、同 intent 幂等、明确接收同意和原文件恢复。probe 使用真实产品全网记录代码和受控身份，正例必须成功到达指定 PeerID 的服务，外部 Node 必须在真实私网权限检查处遭到拒绝。验收先上传 8192 字节真实密文，再强制停止公共节点，重启后检查持久前缀和旧 offset 拒绝，最后由产品继续完成订单。摘要保存在输出路径的 `summary.json`。
 
-构建与执行目录不同时，分别传入 `--crypto-module`、`--delivery-profile` 和 `--delivery-source-root` 的绝对路径。运行时会核对 probe 内嵌发现代码的 SHA-256，拒绝使用其他源码的旧 probe。
+构建与执行目录不同时，分别传入 `--crypto-module`、`--delivery-profile` 和 `--delivery-source-root` 的绝对路径。运行时会核对 probe 内嵌全网记录代码（`apps/core/src/net/mesh/record.rs`）的 SHA-256，拒绝使用其他源码的旧 probe。
 
-## 验证付费交付和实际结算
+## 验证受保护付费交付
 
-完整付费模式必须在 Linux cgroup v2 环境中运行，使用固定产品 profile、真实 prover 和本机 31337 测试链。先安装合约依赖。
+当前 Node 只提供 Recoverable 预算付款。旧 `verify-node.py --delivery`、Strict/十三证明 `run-delivery-live.py` 和旧 JSONL mutation 控制器已明确拒绝原启动方式；不能用其旧命令或旧截图当作当前产品验收。默认公益进程验收沿用上节，不产生链或钱包副作用。
+
+受保护真实场景使用正常当前时钟、固定产品 profile、Linux cgroup v2 和真正的 S/P/R 进程。R 先注册新的 genuine KeyBinding；S 开一个精确预付预算，分别 prepare 两笔新的 paid/recoverable 单窗口订单，再经管理成员 `confirm_batch` 明确授权同批。后台按原证明锁产生两个 genuine Source，一笔 reserveBatch 分配到不同订单 slot。R 经 `accept_batch` 明确同批接收并串行产生两个 genuine Hold；P 的正式预算状态 `ready_windows` 同时出现两窗后，操作者在既有实验室页或 `wallet budget flush` 明确同批核验/揭钥。正常恢复不再自动要求 Open。
+
+最小样本为每单 delivery=5、reservation=bonus=0、预算10：一份 KeyBinding 加两份 Source、两份 Hold，共五份不同真实证明。必须核对真实 reserve/hold/reveal 三种方法各自含2slot、逐单 earned5、预算 withdrawn10，以及固定 P 钱包实际净增10。S 在传输必要对象后停止，不提供任何事后签名；R 读取并校验原文件、名称、字节和 SHA-256。样本不能把旧17证明改成5，也不能把一份证明充作第二个订单。
+
+公开 schema2 bundle 只包含已披露 capsule、公开证明、交易哈希和固定条款。官方 host 对每份 binary receipt 独立验真并拒绝错 journal；`observe-settlement.mjs` 只读同一原链的真实 runtime、canonical 条款/预算/窗口、逐窗 Source/Hold、批次 calldata、事件、余额与 gas。固定源码、CLI/Core 制品摘要、真实进程重启、钱包 lock/off 门禁、披露恢复故障和实际渲染分别留证，任何一层未执行均标未验证。
+
+本轮 proof 构建和新genuine驱动不得放宽原7200秒证明硬界、现有 deadline、11GiB/zero-swap/64PIDs、image/profile 或时钟。界面验收按本文件 e2e 规则执行最小真实表面；源码、类型检查、HTTP200 或合约测试都不代替浏览器/设备证据。操作和安全模型见 [受保护预算](paid-delivery.md)；链上观察格式见 `contracts/delivery/README.md`。
+
+宿主和手动 CI 使用同一个正式入口。先运行纯自检，再提供当前 clean HEAD 的 Linux package 下载目录或已解包目录：
 
 ```sh
-node contracts/delivery/install.mjs
+python3 scripts/run-delivery-live.py --protected-selfcheck
+
+python3 scripts/run-delivery-live.py \
+  --protected-package "$PWD/.artifacts/exact-head-linux-package" \
+  --source-commit "$(git rev-parse HEAD)"
 ```
 
-在同一任务目录创建权限为 `0600` 的配置文件，使用以下字段。`deployment_file` 指向当前 worktree 的 `.artifacts/` 下尚不存在的新文件。runner 自行启动并清理该次独立部署，拒绝复用旧输出或旧链。`prover` 必须含绝对路径 `program`、`r0vm`、`cgroup` 和与 `crates/delivery/proof/profile.json` 完全相同的 `profile`。金额均为十进制字符串，gas 上限以 wei 表示。
+该入口复用 `check-delivery.py` 的 canonical sandbox 构建配方，固定 Linux amd64、11GiB、zero swap、64 PIDs 和两个 Tokio workers。源码与任务缓存仍在本 worktree 的 `.artifacts/`；linked worktree 的 common Git metadata 和 `.git` 只读挂载，显式设置 `GIT_DIR`、`GIT_WORK_TREE` 和 `GIT_OPTIONAL_LOCKS=0`，始终核对 clean exact HEAD。容器以宿主 UID/GID 运行，配置在容器内以 `0600` 创建；不会改变既有缓存权限或复制工具链。
+
+canonical 入口监督 native 与 tracked restart observer 两个同级子进程，observer 不属于 native 的后代清理树。native 只先创建 fresh native/public，再在原 start 的任何进程前等待匿名 ready FD；observer 安装同一 inotify FD 的 host inode/目录 watch，并实际完成 official info exit0、ELF 匹配及同 inode open 正控后才放行。原120秒准备门不进入 KeyBinding 或订单期限。observer 失败会阻止或中断本任务 native，原 native 中断状态如实保留。
+
+独立 E1 窗口始终是原 `settlement-observation.json` 到 cleanup 后 `native-result.json`。要求同 inode host opens=0、无 inotify 队列/身份缺口、累计 RPC ready→stopped、前后 raw 广播数均至少7且所有写方法增量0，以及窗口内至少两份已完成的锚定账户样本相等、nonce 已结清。只容忍精确 stats 文件的预窗口 ENOENT 且不推进 baseline，终态缺失或坏数据仍失败。native 被 reap 后关闭 done FD，observer 先排空原事件队列，再对缺窗作 INCONCLUSIVE 判定。PID1 等 observer 保存并真实退出后才结束，不延长业务窗口或 key gate 凑样本。
+
+本机入口按原生驱动既有阶段和业务期限等待，不再套用旧 Strict/UI 的 20700 秒整轮截止。KeyBinding 观察上限仍为 7400 秒，Source、Hold 各为 16000 秒；每次证明的 7200 秒硬界、原 UUID、报价/持有/密钥截止、费用与 W/I/F/S 均不变。每份完成的证明仍立即独立验真并保存。同一个运行容器可以跨宿主工具轮次继续等待；停止容器后不支持恢复原链/订单，不能把已保存分项称为已支持跨容器续跑。
+
+`prepare`、`confirm_batch`、`accept_batch` 只有在结构化响应明确返回提交前的固定错误 `another delivery operation is in progress` 时，才沿既有 120 秒阶段上限等待重试，原 UUID 和参数不变。超时、网络异常、未知结果及其他拒绝直接失败，不自动重发。
+
+GitHub Actions `delivery-live` 使用 `ubuntu-24.04` 原生 x86 runner，核对宿主 Linux/x86_64，消费同 run 同 SHA 的 Linux/crypto/web 制品。job 的物理上限仍为 360 分钟，这是独立的外部限制，可能先于原生阶段完成而终止 job，不代表具体 prove 耗尽或完整实验通过。不能凭容器目标架构证明没有 emulation，也不能把已停止 CI 的链称为可恢复。健康的同一运行只能在原容器、原链与原业务期限内继续等待；停止后若重新验收，必须创建完整新链、钱包、预算、订单和五份新 proof，保留旧 FAIL，不通过新 UUID 或期限掩盖原失败。
+
+容器核对 package checksum、`BUILD-INFO.json`、当前 JS/WASM 和 build-input receipts，先以真实 Web 资源进程检查实测 package 的 libc。仅当日志实际证明 GLIBC 不兼容时，按当前 clean HEAD 和现有 release flags 重建 CLI/Core，并再次检查真实资源进程。package 的检查状态、实际使用的 binary 来源及摘要分别写入 `artifact-provenance.json`，不能用 bare binary hash 自证源码来源。随后调用固定 guest 安装器和官方 `build.sh`，核对 image/profile/ELF，生成配置，再由 native 子进程经既有 `--protected-config` 调用 verify-node 的 `delivery_protected_acceptance` helper。Web 资源进程检查不代表渲染验收。
+
+输出位于 `.artifacts/vdp/protected-runs/<run-id>/`；可用 `--protected-run-dir` 指定另一个全新任务目录。只上传 launcher 输出或 `GITHUB_OUTPUT` 的 `public-directory` 所指安全目录，实际路径为本轮 run 的 `public-export-<opaque>/`。其中包括逐项认证且当前摘要匹配的 receipts/metadata、原链公开观察、制品来源、资源状态和最终摘要。导出的 `progress.json` 只保留受控状态与合格清单，完整原生终态结果由摘要认证的 `native-result.json` 保留。
+
+observer 只导出固定字段投影 `restart-observer-summary.json`，包含受控状态、计数、条件布尔、相对 run/配置内容绑定与 script/prover/native-result 摘要，以及 supervisor 实际 wait 得到的两个退出码。原 native 全通过、observer 完整窗口全通过、两者真实 exit0 才能整体 PASS。result 自称 PASS、observer 尚未退出、缺窗或 INCONCLUSIVE 均不够。账户原始快照、RPC payload、私有 observer result/诊断不能导出。原生 get 的 proof deadline 诊断保持中性，同一句 Core 错误也可能来自 info30秒或 verify120秒；`node_proof_timeout_seconds=7200` 是 prove 配置，不单独证明具体耗时。
+
+未登记、临时、私密或损坏材料不导出，也不妨碍其他已验真分项导出；整体仍为 FAIL，并写出安全摘要和 `public-directory`。任何 Node、证明、清理、资源或制品检查失败都不能标记整体 PASS。配置、钱包、原始文件和日志留在私有 run 内，不能上传整个 run 或 `native/public/`。
+
+已准备好受限 sandbox 和全部精确制品时，也可以使用不构建、不下载或启动 Docker 的低层 `--protected-config`。配置 schema 为 `scripts/verify-delivery-protected.py` 的 `validate_config`；在本任务 `.artifacts/` 写入 `0600` 配置，所有摘要必须填实际值，不能沿用其他源码或旧 receipt：
 
 ```json
 {
   "schema_version": 1,
-  "deployment_file": "/absolute/task/.artifacts/delivery/deployment.json",
-  "prover": {
-    "program": "/absolute/path/to/vibeface-delivery-prover",
-    "r0vm": "/absolute/path/to/r0vm",
-    "cgroup": "/sys/fs/cgroup/task-proof",
-    "profile": {}
+  "source_commit": "<final 40-character commit>",
+  "paths": {
+    "repository": "/absolute/current/task/worktree",
+    "binary": "/absolute/artifacts/vibeface",
+    "core_binary": "/absolute/artifacts/vibeface-core",
+    "crypto_module": "/absolute/artifacts/vibeface_secure.js",
+    "prover": "/absolute/artifacts/vibeface-delivery-prover",
+    "r0vm": "/absolute/artifacts/r0vm"
   },
-  "max_service_amount": "1000000",
-  "source_gas_cap_wei": "1000000000000000000",
-  "provider_gas_cap_wei": "1000000000000000000",
-  "register_key_gas_cap_wei": "1000000000000000000",
-  "settlement_observer": "/absolute/repo/contracts/delivery/observe-settlement.mjs"
+  "sha256": {
+    "binary": "<actual sha256>", "core_binary": "<actual sha256>",
+    "crypto_module": "<actual sha256>", "crypto_wasm": "<actual sha256>",
+    "prover": "<actual sha256>", "r0vm": "<actual sha256>", "profile": "<actual sha256>"
+  },
+  "elf_sha256": "<actual guest ELF sha256>",
+  "caps": {
+    "deposit": "10", "max_service_amount": "5",
+    "source_gas_cap_wei": "100000000000000000",
+    "provider_gas_cap_wei": "100000000000000000",
+    "register_key_gas_cap_wei": "100000000000000000",
+    "native_funding_wei_each": "10000000000000000000"
+  },
+  "publication_policy": {
+    "watchdog_seconds": 60, "inclusion_seconds": 60,
+    "finality_seconds": 10, "clock_skew_seconds": 5,
+    "max_fee_per_gas": "3000000000", "priority_fee_per_gas": "1000000000"
+  }
 }
 ```
 
-用实际产品 profile 替换示例中的空对象，再执行以下命令。
-
 ```sh
-python3 scripts/verify-node.py --delivery \
-  --binary /absolute/path/to/vibeface \
-  --core-binary /absolute/path/to/vibeface-core \
-  --artifacts .artifacts/delivery \
-  --delivery-probe .artifacts/delivery-probe/target/debug/vibeface-delivery-probe \
-  --delivery-config .artifacts/delivery/acceptance.json
+python3 scripts/run-delivery-live.py \
+  --protected-config "$PWD/.artifacts/protected/config.json" \
+  --protected-run-dir "$PWD/.artifacts/protected/run"
 ```
 
-该模式先验证公益路径，再创建独立测试钱包，通过受保护 FD 解锁。它只使用本机部署的公开测试资助账户，生成一份 key-binding 证明及两个窗口各自的 source、hold、open 证明，核对完整原文件和实际提现。独立观察器只读原链，复核七份证明、真实交易、余额和 gas。导出的 `settlement/` 只含公开证明、capsule 与交易哈希，不含 witness、私钥、密码或 raw transaction。
+每次要求全新输出目录，动态部署原链并创建全新钱包、注册和两笔订单；不复用原钱包、witness 或 proof。也可使用 `verify-node.py --delivery-protected`，显式传匹配的 `--binary`、`--core-binary`、`--crypto-module`、`--artifacts`、`--delivery-config` 和可选 `--delivery-run-dir`。低层驱动在其 run 的 `public/` 保留逐份验真的五份 receipt、schema2 bundle、原链观察和 `progress.json`，但它本身不核验 bare binary 构建来源，也不启动独立 observer 或认证 E1；完整验收使用 canonical `--protected-package`。`--protected-selfcheck` 检查真实 predicate、合成 observer 事件、FD 监督和安全投影，不产生实际 proof 或完整 E1 窗口证据。
 
-缺少配置、真实证明、部署或结算证据时，命令失败并报告 `UNVERIFIED` 或具体错误。公益模式通过不能代替付费验收。测试链的两次确认也不代表绝对最终性。
-
-## 验证完整付费分支与双端恢复
-
-`scripts/run-delivery-live.py` 监督同一临时链、sandbox 和宿主 UI。向 `verify-node.py --delivery` 追加 `--delivery-ui-control` 的专用路径后，runner 在原严格订单之后运行有限分支、真实密钥生命周期和普通单窗口订单。核心严格订单仍是 130816 字节、两窗和七份证明。
-
-扩展验收在实际付款前捕获 C0，并在两个 source 证明完成、原 Source 的 approve `eth_estimateGas` 返回前捕获 C0Prime。该请求保持阻断，停稳节点并备份完整私有目录后，以失败结束旧请求。后续操作复用原意图和已完成的证明。C1 对应真实 fund 已确认、接收方尚未接受的状态。链快照和完整 Node 数据快照必须配对恢复，不修改单表或删除签名交易。
-
-有限分支验证入金代币行为、退款、部分交付、截止、重组和固定收款地址。keeper 操作与真实 Source 自主退款分别记录。Source 自主退款恢复匹配的完整 C1 数据，只解锁 Source，完成后保存分支目录和实际交易，再停稳恢复。Node 专用 loopback RPC 转发器只计广播次数，不保存请求体或 raw。锁定观察期间广播必须为零。
-
-真实 Rotate、Revoke、Register 各新增一份 key-binding 证明。Rotate 在一个旧窗口已 Held、另一个尚未 Held 的分支执行。原签名交易恢复后保留同一 Rotate 和旧密钥，最后的新 Active key 接收普通订单。普通订单是 4096 字节的 `ordinary-paid-ui.bin`，新增 source、hold、open 各一份。全任务共十三份不同证明，普通公开 bundle 有四项，其中 key-binding 与最终 Register 共用。
-
-宿主通过 `tests/e2e/e2e.paid.config.ts` 运行两个平台过滤的测试，使用 `workers: 2` 和 `retries: 0`。测试扩展名是 `.paid.ts`，默认 e2e 测试不会发现这些需要控制器的用例。两个测试都通过真实邀请、安全码和管理权限入网。Web 选择实际文件、查看费用并确认原订单。Android release app 接受订单，实际后台、移除本任务的接收端口 reverse，并终止原 app 连接。只有前台实际出现离线状态才记录断线。后台 Node 完成结算后，恢复同一 reverse，手机回到原订单并保存文件。root AVD 仅读取该 app 的 transfers 文件核对大小与 SHA。
-
-宿主必须提供以下环境变量。APK、serial 和 controller 都由本轮 CI 明确指定。
-
-```sh
-VIBEFACE_DELIVERY_UI_CONTROL=/absolute/task/tests/e2e/.artifacts/vdp/live-ui/control.json
-VIBEFACE_DELIVERY_UI_TIMEOUT_MS=3600000
-VIBEFACE_E2E_ANDROID_APK=/absolute/task/.artifacts/native/app-release.apk
-VIBEFACE_E2E_ANDROID_SERIAL=emulator-5554
-```
-
-容器保持原 root 证明环境，通过 `VIBEFACE_DELIVERY_UI_UID` 和 `VIBEFACE_DELIVERY_UI_GID` 把专用控制目录、原文件和 `0600` 控制描述交给宿主用户。邀请码只经过认证 API，不落公开文件。Node 目录、钱包、密钥和 witness 不改变所有者或权限。
-
-严格和普通 observer 的当次公开 JSON 分别保存在各自 bundle 目录的 `settlement-observation.json`，不读取一个可被覆盖的 latest 报告。有限分支只接受 helper ready 事件给出的本次 `publicIndex`。密钥生命周期公开文件位于 `key-lifecycle/`，完整私有数据快照与分支 raw 永不上传。
-
-普通双端操作保留三个配对后的视频片段，内置整段录像保持关闭。CI 以 `--headed --video off` 在任务独立 Xvfb 的 1440×1000 显示中运行。Web 在费用报价可见后启动 ffmpeg，确认付款并刷新原意图后用 `q` 结束。Android 通过现有 adb screenrecord 分别录制接受至实际离线、恢复连接至实际保存，只向本次录像的匹配 PID 发 SIGINT。两端都检查录像实际开始、一直存活至片段结束，并用 ffprobe 核对真实 MP4 视频流与时长。提前自行结束，即使退出码为零，也失败。
-
-公开目录只增加 `web-confirm.mp4`、`android-accept-offline.mp4`、`android-resume-save.mp4`，以及各自独立写入的 `web-video.json` 和 `android-video.json`。收据包含原订单与意图、实际退出码和 signal、视频 SHA 与大小。宿主独立复核后合并视频清单。邀请码、钱包密码、恢复文件、完整 attempt 视频和 trace 均不上传。
-
-只检查控制器和阻断规则时运行以下纯自检。它不启动 Node、UI、链或证明，不能替代实际验收。
-
-```sh
-python3 scripts/verify-node.py --delivery-ui-selfcheck \
-  --binary /usr/bin/true --artifacts .artifacts/paid-ui-selfcheck
-```
+该运行只证明新的 4096 字节双单场景。它核对 S 离线后 nonce 不增、P 自动累计提款、R 实际读取，以及 S/R/P 真正重启、locked/off 后拒写与历史读取；不覆盖 UI 渲染、旧 fee5 同字节或最大容量、强制 reorg、nonce-consuming revert、临近截止和异常代币矩阵。这些仍需独立证据。
 
 ## 使用 Device Hub 验收本机 Apple 设备
 
@@ -179,7 +203,7 @@ cp -R .artifacts/native/ios-build/Build/Products/Release-iphonesimulator/Vibefac
 VIBEFACE_E2E_IOS_APP=/absolute/task/.artifacts/native/Vibeface.app \
 VIBEFACE_E2E_SIMULATOR="$TASK_SIMULATOR_UUID" \
 VIBEFACE_E2E_BINARY=/absolute/task/.artifacts/native/vibeface \
-VIBEFACE_E2E_CRYPTO_MODULE=/absolute/task/.artifacts/native/web/vibeface_secure.js \
+VIBEFACE_E2E_CRYPTO_MODULE=/absolute/task/apps/app/dist/client/vibeface_secure.js \
 AGENT_DEVICE_HOME="$PWD/.artifacts/native/agent-device" \
 AGENT_DEVICE_STATE_DIR="$PWD/.artifacts/native/agent-device" \
 pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^receives a charity file'
@@ -189,7 +213,7 @@ pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^receives a ch
 
 ## 验证原生工作台
 
-`workspace.native.ts` 使用同一任务构建的 iOS App 和受控 Node。先新建名称以 `vibeface-workspace-` 开头的专属模拟器并启动，把 UUID 写入 `.artifacts/native/workspace/simulator.txt`。不得复用其他任务的模拟器。邀请文件保持在同一目录，权限为 `0600`。
+`workspace.native.ts` 使用同一任务构建的 iOS App 和受控 Node。先核对 Apple 官方最新稳定、与本次 Xcode、SDK 和设备类型兼容的 runtime；缺少时先安装，不能只选本机已安装版本的最大值。用该 runtime 新建名称以 `vibeface-workspace-` 开头的专属模拟器并启动，把 UDID 写入 `.artifacts/native/workspace/simulator.txt`。验收前按该 UDID 核对 runtime，并记录版本、build、设备名称和 UDID。不得复用其他任务的模拟器。邀请文件保持在同一目录，权限为 `0600`。
 
 ```sh
 VIBEFACE_E2E_IOS_APP=/absolute/task/.artifacts/native/Vibeface.app \
@@ -197,10 +221,12 @@ VIBEFACE_E2E_SIMULATOR="$TASK_SIMULATOR_UUID" \
 VIBEFACE_E2E_SOURCE_COMMIT="$TASK_SOURCE_COMMIT" \
 VIBEFACE_E2E_BINARY=/absolute/task/target/debug/vibeface \
 VIBEFACE_E2E_CRYPTO_MODULE=/absolute/task/apps/app/dist/client/vibeface_secure.js \
-pnpm exec e2e run --config tests/e2e/e2e.workspace.native.config.ts workspace.native.ts:123 --retries 0 --video off
+pnpm exec e2e run --config tests/e2e/e2e.workspace.native.config.ts workspace.native.ts --retries 0 --video off
 ```
 
-用例核对已安装 App 与构建文件，通过邀请、安全码和管理授权加入，再从原生界面创建 Bot。主聊天检查历史阅读、回到底部、键盘、新回复保留阅读位置及聊天切换，随后创建 Task 和频道，检查补充、Context、队列编辑取消及停止后的草稿。`acceptance.json` 只在全部界面步骤通过后写入，`cleanup.json` 只在受控 fixture 正常退出后写入。运行结束后，操作者还需停止并删除本任务的模拟器。模拟器通过不代表真机、Android 或真实模型验收。
+`VIBEFACE_E2E_BINARY` 同目录下还必须有 `vibeface-core`，先运行 `cargo build -p vibeface -p vibeface-core --locked`。`VIBEFACE_E2E_CRYPTO_MODULE` 指向的 WASM 由 `scripts/build-web-crypto.sh` 和 `scripts/build-web.sh` 生成。
+
+用例核对已安装 App 与构建文件，以 `vibeface://join/` 链接打开邀请，经安全码和管理授权加入，确认加入页不留返回按钮，从深层页面再次打开同网络链接也只回到首页，再从原生界面创建 Bot。主聊天检查历史阅读、回到底部、键盘、新回复保留阅读位置及聊天切换，随后创建 Task 和频道，检查补充、Context、队列编辑取消、下滑关闭目标面板及停止后的草稿。`acceptance.json` 只在全部界面步骤通过后写入，`cleanup.json` 只在受控 fixture 正常退出后写入。运行结束后，操作者还需停止并删除本任务的模拟器。模拟器通过不代表真机、Android 或真实模型验收。
 
 ## 验证原生 Provider 设置和队列取消
 
@@ -208,7 +234,7 @@ pnpm exec e2e run --config tests/e2e/e2e.workspace.native.config.ts workspace.na
 
 宿主构建前还要求 HEAD 等于本次提交，且 `git status --porcelain --untracked-files=normal` 为空。DerivedData 和 Simulator zip 位于已忽略的 `.artifacts/native/`，不会干扰这个检查。Expo prebuild 改变源码时必须先解决，不能继续把脏源码产物记为当前提交。
 
-本地运行使用上节的四个明确产物与 simulator 环境变量，并补充当前源码身份。仅选择 Provider 用例，不运行公益文件用例。
+本地运行使用[验证原生接收和本地文件](#验证原生接收和本地文件)一节的四个明确产物与 simulator 环境变量，并补充当前源码身份。仅选择 Provider 用例，不运行公益文件用例。Node 端的 `native_provider_clipboard` 总是核对 CI 身份：要设置 `GITHUB_RUN_ID` 和 `GITHUB_RUN_ATTEMPT`，模拟器名为 `vibeface-provider-<run>-<attempt>`，并把它的 UUID 写入 `.artifacts/native/simulator.txt`，否则本地运行在这一步失败。
 
 ```sh
 umask 077
@@ -218,15 +244,15 @@ pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^provider ' \
   --trace off --video off --retries 0 > .artifacts/native/private/ui.log 2>&1
 ```
 
-该用例重新安装当前 App，逐项核对已安装 bundle 与构建 bundle 的文件摘要，包括实际可执行文件、打包 JavaScript 和原生库。它用 e2e Secret 从任务私有文件读取邀请，填写原生“加入链接”表单，再核对双方安全码并授予管理权限。邀请不会作为普通深链接参数传入 UI driver。iOS 的 TextInput 可把 placeholder 或值附在可访问名称后面，因此输入定位使用 textbox 角色和以字段名称开头、带分隔边界的正则，仍要求唯一匹配。已填写值、保存回读和私有命令剪贴板均作精确核对。
+该用例重新安装当前 App，逐项核对已安装 bundle 与构建 bundle 的文件摘要，包括实际可执行文件、打包 JavaScript 和原生库。fixture 把邀请经 `simctl pbcopy` 的标准输入写入专属模拟器剪贴板，用例点系统粘贴按钮填入原生“加入链接”表单，再核对双方安全码并授予管理权限。邀请不会作为普通深链接参数传入 UI driver。iOS 的 TextInput 可把 placeholder 或值附在可访问名称后面，因此输入定位使用 textbox 角色和以字段名称开头、带分隔边界的正则，仍要求唯一匹配。已填写值、保存回读和私有命令剪贴板均作精确核对。
 
-原生设备页的“Bot 与任务”进入真实 AI 设置页。fixture 只配置受控程序与连接模式，并关闭 Bot 和执行角色，真实返回 `manager=null`。用例先确认未启用的 Codex 尚未主动检查，再开启执行用途；依照 Node 的首次设置默认，这也开启 Bot，用例随后由原生界面关闭 Bot。启用和已有 manager 的 Node 启动都会主动检查，不能把这些结果称为未检查。用例在 execution-only 状态实际检查未登录提示，精确核对从界面复制的私有目录认证命令，由受限 fake CLI 完成一次合成登录，再主动检查并选择、手填和清空执行模型。之后开启 Bot，验证双角色草稿、独立保存、默认模型和 high。它还确认 Provider 控制强度时清除旧覆盖，包括带空白的手填已知模型，以及目录不可用时保留旧模型和强度。所有启用与保存均经已授权手机的正常接口执行。
+原生设备页的“Bot 与任务”进入真实 AI 设置页。fixture 只配置受控程序与连接模式，并关闭 Bot 和执行角色，真实返回 `manager=null`。用例先确认未启用的 Codex 尚未主动检查，再开启执行用途；依照 Node 的首次设置默认，这也开启 Bot，用例随后由原生界面关闭 Bot。启用和已有 manager 的 Node 启动都会主动检查，不能把这些结果称为未检查。用例在 execution-only 状态实际检查未登录提示，精确核对从界面复制的登录命令，由受限 fake CLI 完成一次合成登录，再主动检查并选择、手填和清空执行模型。之后开启 Bot，验证双角色草稿、独立保存、默认模型和 high。它还确认 Provider 控制强度时清除旧覆盖，包括带空白的手填已知模型，以及目录不可用时保留旧模型和强度。所有启用与保存均经已授权手机的正常接口执行。
 
 队列场景通过真实 Node API 准备一条运行中消息和一条排队消息。原生 UI 取消排队后，再通过原生“停止”结束运行中的消息并释放槽位。独立读取确认运行中的消息调用过一次，被取消的消息始终没有调用，离开再进入聊天后计数保持不变。受控 fixture 不调用真实模型，也不代替手机保存、取消或停止。
 
 native config 默认关闭 trace 和整段 video。原始日志、自动失败截图、e2e report、邀请、恢复文件、Node 数据与 driver 状态都属于私有材料，不能递归上传 `.artifacts/native/`。CI 只上传固定的 `provider.json`、`provider-probe.json`、`provider-initial.png`、`provider-selectable.png`、`provider-controlled.png`、`provider-typed.png` 和 `terminology-device-kinds.png`。`provider-probe.json` 只记录首轮检查的 `link`、`readiness`、`authentication`、`catalog` 和 `checked` 五个固定状态字段。
 
-`provider-initial.png` 是唯一的配对前诊断图。它只在本次 CI 新建的专属 simulator 上，重新安装、清除钥匙串并启动 App 后主动拍摄，且早于首次 `secrets.get` 和邀请输入。用例核对 simulator 文件、实际 UUID、Booted 状态以及包含当前 run ID 和 attempt 的专属名称。此时 App 尚未接收邀请、登录命令或凭证，也没有旧应用数据；初始图只用于查看路由、系统弹窗和空表单。`terminology-device-kinds.png` 在配对后的“添加设备”面板记录节点与客户端分类，其他三张图在配对后的设置页保存。诊断图不代表配对或表单验收通过。导航诊断仅记录固定阶段和已知界面的布尔状态，不输出界面文本、加入链接、命令或剪贴板内容。CI 按固定键与布尔类型校验后，将该诊断并入公开的 `provider.json`，不上传原始页面树或测试日志。最终收据只有在一个目标测试真实通过、fixture 退出、专属 simulator 删除和私有状态清理后才标为 `passed`。
+`provider-initial.png` 是唯一的配对前诊断图。它只在本次 CI 新建的专属 simulator 上，重新安装、清除钥匙串并启动 App 后主动拍摄，且早于剪贴板写入和邀请输入。用例核对 simulator 文件、实际 UUID、Booted 状态以及包含当前 run ID 和 attempt 的专属名称。此时 App 尚未接收邀请、登录命令或凭证，也没有旧应用数据；初始图只用于查看路由、系统弹窗和空表单。`terminology-device-kinds.png` 在配对后的“添加设备”面板记录节点与客户端分类，其他三张图在配对后的设置页保存。诊断图不代表配对或表单验收通过。导航诊断仅记录固定阶段和已知界面的布尔状态，不输出界面文本、加入链接、命令或剪贴板内容。CI 按固定键与布尔类型校验后，将该诊断并入公开的 `provider.json`，不上传原始页面树或测试日志。最终收据只有在一个目标测试真实通过、fixture 退出、专属 simulator 删除和私有状态清理后才标为 `passed`。
 
 失败收据与 stdout 保留固定阶段、报告是否可读，以及从实际 e2e report 提取的受限错误码、固定 `engine_reason` 和 `engine_timeout_kind`、已知 API 名和两个验收文件的行号。`completed_poll_samples` 只来自唯一合法的既有 expect 采样事件；零表示没有记录完成的采样，字段缺失不补零。错误 message、stack、locator label、值和原始报告不会导出。
 
@@ -248,3 +274,16 @@ native config 默认关闭 trace 和整段 video。原始日志、自动失败�
 项目已配置 Codex、Claude Code 和 Cursor 的 e2e MCP。安装依赖后重新打开可信项目会话。编写或运行测试前，读取 [e2e skill](../../.agents/skills/e2e/SKILL.md)。
 
 当前未选择 AI 模型。需要 `agent.act` 时，先选择订阅、API 或本地模型，再按 `pnpm exec e2e guide setup` 配置 provider。ChatGPT 订阅的登录命令为 `pnpm exec e2e login openai`，完成登录后再运行模型测试。不要把凭证写入仓库；CI 保持不调用真实模型。
+
+## 验证原生桌面窗口
+
+Desktop 使用 GPUI。浏览器和手机 e2e 保留各自的配置，不把网页通过当作 Desktop 验收。
+
+```sh
+cargo test -p vibeface-desktop --locked
+VIBEFACE_E2E_DESKTOP_APP=<absolute-packaged-executable-or-mac-app> \
+VIBEFACE_E2E_DESKTOP_RUNTIME=<absolute-sealed-runtime-directory> \
+pnpm exec e2e run --config tests/e2e/e2e.native-desktop.config.ts
+```
+
+Linux 在有图形驱动的 X11/Wayland 会话运行；hosted CI 使用 Xvfb 和 Mesa Vulkan。该配置使用现有 e2e runner 的 tools-only 原生目标，不设置浏览器引擎或 AI 模型；workers 为 1，retries 为 0。测试调用确定性的 OS 窗口驱动，只启动自己持有的程序，使用独立 profile 和受控夹具参数，按 PID 定位 OS 窗口，发送原生键盘输入与 Enter、保存窗口 PNG，并核对 GPUI 输入/焦点/动作回执、无自动 Node、进程树和正常退出。业务、网络未知结果、本机服务、IME、焦点和无障碍仍按 [GPUI 验收矩阵](design/gpui-desktop.md#功能与验收) 分别记录。不得以窗口回执代替完整功能验证。

@@ -64,7 +64,7 @@ export type WorkspaceCommandResult = Omit<WorkspaceDomainState, 'coverage'> & { 
 export type WorkspaceCommandNotSaved = { accepted: false; code: 'workspace_command_not_saved'; stored: false; command_id: string; reason: string }
 export type WorkspaceInputBody = {
   type: 'input_posted'; message_id: string; target: InputTarget; intent: InputIntent; sequence: number; expected_revision?: number
-  text: string; attachments?: Attachment[]; report_results?: boolean
+  text: string; attachments?: Attachment[]; report_results: boolean
 }
 export type WorkspaceHistoryBody =
   | WorkspaceInputBody
@@ -115,20 +115,8 @@ type WorkFields = {
   failure?: FailureKind
   /** A provider: a turn on it that its device watches; `task`: a task run by its device's coordination Agent. */
   kind?: ProviderId | "task"
-  /** The device that signed the dispatch; absent in snapshots from older Nodes. */
-  dispatcher?: string
-  /** The caller's idempotency key; absent in snapshots from older Nodes. */
-  call_ref?: string
   /** The dispatcher's optional model override. */
   model?: string
-  /** A follow-up work continues the prior work's provider session. */
-  continues?: string
-  /** The causal parent work, if this was dispatched as a child. */
-  parent?: string
-  /** The existing provider thread that received this dispatch, when applicable. */
-  thread?: string
-  /** The durable phase from the latest WorkProgress event. */
-  phase?: WorkPhase
   /** The Codex thread and turn running it; works steered into one turn share both. */
   thread_id?: string
   turn_id?: string
@@ -136,9 +124,17 @@ type WorkFields = {
   stop?: StopState
   coordination_job?: ScopeJob | null
 }
+type WorkRelations = {
+  dispatcher: string
+  call_ref: string
+  continues: string | null
+  parent: string | null
+  thread: string | null
+  phase: WorkPhase | null
+}
 export type WorkRecord = WorkFields & (
-  | { state: WorkState; resolved: ResolvedModel }
-  | { state: DispatchState; resolved?: never }
+  | (WorkRelations & { state: WorkState; resolved: ResolvedModel })
+  | (Partial<WorkRelations> & { state: DispatchState; resolved?: never })
 )
 /** The fields a task card can read from either full work or an overview summary. */
 export type WorkCard = Pick<WorkRecord, "work_id" | "target" | "target_node" | "cwd" | "title" | "state" | "summary" | "outcome" | "failure_reason" | "failure" | "kind" | "dispatcher" | "call_ref" | "continues" | "parent" | "thread" | "thread_id" | "turn_id" | "phase" | "stop">
@@ -150,6 +146,19 @@ export type TurnRuntime = {
   stage: ProviderStage; execution: 'not_started' | 'started' | 'unknown'; attempted_at_ms: number
   switched_from: { provider: ProviderId; model: string | null; reasoning_effort: string | null } | null; switch_reason: FailureKind | null
 }
+export const jobStates = {
+  queued: { rank: 10, phase: 'waiting' }, pending_delivery: { rank: 10, phase: 'waiting' },
+  claimed: { rank: 20, phase: 'active' }, running: { rank: 30, phase: 'active' }, steering: { rank: 35, phase: 'active' },
+  cancelling: { rank: 40, phase: 'active' }, publishing: { rank: 50, phase: 'active' }, reconciling: { rank: 80, phase: 'active' },
+  completed: { rank: 60, phase: 'ended' }, interrupted: { rank: 60, phase: 'ended' }, cancelled: { rank: 60, phase: 'ended' },
+  steered: { rank: 60, phase: 'steered' }, rejected: { rank: 65, phase: 'ended' }, failed: { rank: 65, phase: 'ended' },
+  unknown: { rank: 100, phase: 'unknown' }, unverified: { rank: 100, phase: 'unknown' },
+} as const
+export type JobState = keyof typeof jobStates
+export function isJobState(state: string): state is JobState { return Object.hasOwn(jobStates, state) }
+/** A steered input settles separately from the reply whose stream it joined. */
+export const isReplyEnded = (state: string) => isJobState(state) && jobStates[state].phase === 'ended'
+export const isTerminalJobState = (state: string) => isReplyEnded(state) || state === 'steered'
 export type ManagerJob = {
   trigger: string
   state: string
@@ -208,9 +217,11 @@ export type MemoryConflict = {
   call_ref: string; memory_id: string; expected_epoch: number; actual_epoch: number
   expected_revision: string; actual_revision: string; reason: string
 }
+export type ConversationMemoryConflict = MemoryConflict & { history_id: string }
 export type SteerOutcome = 'answered' | 'unfinished' | 'unknown'
 export type SchedulerSnapshot = {
   jobs: ManagerJob[]
+  local_jobs: ManagerJob[]
   scope_jobs: ScopeJob[]
   context?: ContextProjection | null
   /** Messages a former scheduling device left unanswered; only listed on the device that schedules now. */
@@ -219,7 +230,7 @@ export type SchedulerSnapshot = {
   model?: string
   capabilities?: { streaming: boolean; cancel: boolean; steer: boolean }
   /** Set when another device schedules this conversation; unreachable leaves its replies' state unknown. */
-  remote?: { owner: string; reachable: boolean }
+  remote?: { owner: string; reachable: boolean; jobs: ManagerJob[]; scope_jobs: ScopeJob[]; memory_conflicts: ConversationMemoryConflict[] | null }
 }
 /** A coordination process still alive after its turn ended; the Node closes it once the process exits. */
 export type CoordinationCheck = {
@@ -240,27 +251,10 @@ export type WorkDetail = { work: WorkDetailWork; coverage: { source: 'shared_his
 /** What one change touched, pushed by the Node so the page merges it without a reload. */
 export type ConversationRecords = {
   conversation_id: string
-  context?: ContextProjection | null
-  memory?: MemoryEntry[]
-  memory_staged_count?: number | null
-  memory_conflicts?: MemoryConflict[] | null
-  memory_sync_conflicts?: MemorySyncConflicts
+  history_authority: string
+  refresh_metadata: boolean
   messages: TranscriptMessage[]
   works: WorkRecord[]
-  last_message: LastMessage | null
-  busy: Busy
-  questions: Question[]
-  notifications: NotificationRecord[]
-  /** This device's dispatch and stop requests, as `conversation` returns them. */
-  deliveries: unknown[]
-  checks: CoordinationCheck[]
-  jobs: ManagerJob[]
-  scope_jobs: ScopeJob[]
-  unanswered: string[]
-  sent: SentBotMessage[]
-  sent_coverage: SentCoverage
-  /** The conversation's works that want the person, as the Node lists them now; replaces its share of `open_works`. */
-  open_works: OpenWork[]
 }
 /**
  * What only the person can settle; nothing is resent.
@@ -286,7 +280,7 @@ export type BotSchedule = { name: string; prompt: string; first_run_at_ms: numbe
 export type MemoryVersion = { revision: string; control_revision: number; source_event_hash: string }
 export type MemoryBase = { epoch: number; version: MemoryVersion | null }
 export type MemoryMetadata = MemoryVersion & {
-  epoch: number; origin: 'agent' | 'user' | 'review'; user_controlled: boolean; essential: boolean
+  epoch: number; origin: 'agent' | 'user'; user_controlled: boolean; essential: boolean
 }
 export type MemoryState = { memory_id: string; text: string | null; metadata: MemoryMetadata }
 export type MemoryEntry = MemoryState & { text: string }
@@ -325,12 +319,15 @@ export type Overwritten = { change_id: string; by: string } & (
   | { field: "reasoning_effort"; provider: ProviderId; value: string | null }
   | { field: "skills"; value: SkillSet }
   | { field: "avatar"; value: Avatar | null })
-type SkillSummary = { skill_id: string; name: string; description: string }
+export type SkillSummary = { skill_id: string; name: string; description: string }
 export type ScheduleView = BotSchedule & { schedule_id: string; next_run_at_ms: number | null }
 export type ScheduleAction = "pause" | "resume" | "delete"
 /** This bot's schedules still ahead, its notes, and the skill library every bot shares. */
-export type BotSettings = { skills: SkillSummary[]; schedules: ScheduleView[]; memory: MemoryEntry[]; memory_sync_conflicts: MemorySyncConflicts; memory_staged_count?: number | null; memory_conflicts?: MemoryConflict[] | null }
+export type BotSettings = { skills: SkillSummary[]; schedules: ScheduleView[]; memory: MemoryEntry[]; memory_sync_conflicts: MemorySyncConflicts; memory_staged_count?: number | null; memory_conflicts?: ConversationMemoryConflict[] | null }
 export type ConversationPayload = {
+  history_authority: string
+  history: ConversationHistory
+  deliveries: DeliveryRecord[]
   conversation: ConversationSummary | null
   messages: TranscriptMessage[]
   works: WorkRecord[]
@@ -375,7 +372,6 @@ export type OverviewNode = Pick<NodeInfo, "device_id" | "name" | "online" | "rev
 export type OverviewConsistency = "local_snapshot" | "mixed_remote" | "partial"
 export type OverviewTaskState = WorkState | DispatchState | StopState | "accepted_waiting_sync" | "unknown"
 export type OverviewDeliveryState = DispatchState | "dispatch_accepted" | StopState
-export type OverviewTaskKind = "work" | "check" | "dispatch"
 export type OverviewNavigation = { bot_id: string; conversation_id: string; work_id?: string }
 
 type OverviewTaskCommon = {
@@ -557,7 +553,7 @@ export type AnswerResult = { status: "answered" | "already_answered"; text: stri
 /** An answer this browser sent whose outcome it has not seen; trying again sends the same signed request. */
 export type PendingAnswer = { question_id: string; text: string }
 /** A session no bot started that this bot looks after; `muted`: the person stopped following it here. */
-export type SessionHandoff = { node: string; agent: ProviderId; session_id: string; cwd: string; summary: string; muted: boolean; created_at_ms: number }
+export type SessionHandoff = { rank?: string; node: string; agent: ProviderId; session_id: string; cwd: string; summary: string; muted: boolean; created_at_ms: number }
 /** Where questions go besides the web: "both" also sends them to Grok Bot. */
 export type Outlet = "record" | "both"
 export type TriageSettings = {
@@ -578,3 +574,17 @@ export type TriageSettings = {
     unknown_events: number
   }
 }
+
+export type DeliveryRecord = { work_id: string; target_node: string } & (
+  | { state: DispatchState; cwd: string; trigger?: string; title?: string; prompt?: string; reason?: string | null; failure?: FailureKind }
+  | { state: StopState }
+)
+export type HistoryItems = {
+  messages: TranscriptMessage; works: WorkRecord; changes: BotChangeRecord; questions: Question; sessions: SessionHandoff
+  jobs: ManagerJob; scope_jobs: ScopeJob; owner_jobs: ManagerJob; owner_scope_jobs: ScopeJob; owner_memory_conflicts: ConversationMemoryConflict; checks: CoordinationCheck; deliveries: DeliveryRecord; unanswered: string
+  skills: SkillSummary; schedules: ScheduleView; memory: MemoryEntry; memory_conflicts: ConversationMemoryConflict; memory_sync_conflicts: MemorySyncConflict; overwritten: Overwritten
+}
+export type HistorySection = keyof HistoryItems
+export type HistoryCoverage = { next_cursor: string | null; complete: boolean }
+export type ConversationHistory = { [S in HistorySection]: HistoryCoverage }
+export type HistoryPage = { [S in HistorySection]: { conversation_id: string; history_authority: string; section: S; items: HistoryItems[S][] } & HistoryCoverage }[HistorySection]

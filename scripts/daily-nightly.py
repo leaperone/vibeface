@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
-"""Land one mechanical version PR per four-hour UTC batch, then reconcile both Nightlies."""
+"""Tag one mechanical source per four-hour UTC batch, then reconcile both Nightlies."""
 import argparse
-from contextlib import contextmanager
-from dataclasses import dataclass
 import datetime
 import json
 import os
@@ -16,13 +14,16 @@ from urllib.parse import quote
 
 sys.dont_write_bytecode = True
 import release
+from nightly_source import (DailyPlan, BOT, PATHS, blob, checkout, generated, git, locked_package_version, metadata,
+                            abandoned_source,
+                            next_build_numbers, next_ios_build_number, nightly_order, recovered_plan,
+                            scratch, verify_tree, version_paths_at, versions_at)
 
 ROOT = Path(__file__).resolve().parent.parent
 REPO = 'leaperone/vibeface'
 CI = '.github/workflows/ci.yml'
+NIGHTLY = '.github/workflows/nightly.yml'
 RELEASE = '.github/workflows/release.yml'
-PATHS = ('apps/www/package.json', 'apps/app/package.json', 'apps/core/Cargo.toml',
-         'apps/cli/Cargo.toml', 'Cargo.lock', 'apps/mobile/app.json', 'apps/desktop/package.json')
 PRODUCT_APPS = release.PRODUCT_APPS
 RELEASES = release.RELEASES
 PRODUCER = 'collect'
@@ -37,31 +38,9 @@ PART_PUBLISHERS = (
     'publish-desktop-aarch64-unknown-linux-gnu',
     'publish-desktop-x86_64-pc-windows-msvc',
     'publish-android', 'publish-ios')
-PUBLISHERS = ('release-start', *PART_PUBLISHERS, 'publish-product', 'publish', 'npm')
-BOT = '41898282+github-actions[bot]@users.noreply.github.com'
+PUBLISHERS = ('release-start', *PART_PUBLISHERS, 'publish-product', 'release-failed', 'publish', 'npm')
+MAX_PUBLISHER_ATTEMPTS = 3
 require = release.require
-
-
-@dataclass(frozen=True)
-class DailyPlan:
-    batch: str
-    base: str
-    versions: dict
-    android_code: int
-    ios_build_number: str
-
-    def __post_init__(self):
-        slot = datetime.datetime.strptime(self.batch, '%Y%m%d%H')
-        require(slot.strftime('%Y%m%d%H') == self.batch and slot.hour % 4 == 0,
-                'Nightly batch must be a four-hour UTC slot')
-
-    @property
-    def day(self):
-        return self.batch[:8]
-
-    @property
-    def branch(self):
-        return 'bot/daily-nightly/' + self.batch
 
 
 def schedule_batch(created_at):
@@ -69,22 +48,9 @@ def schedule_batch(created_at):
     return created.replace(hour=created.hour // 4 * 4).strftime('%Y%m%d%H')
 
 
-def git(*args, root=None, data=None, env=None):
-    return subprocess.check_output(['git', *args], cwd=root or ROOT, input=data, env=env).decode().strip()
-
-
-def blob(commit, path):
-    return subprocess.check_output(['git', 'show', f'{commit}:{path}'], cwd=ROOT)
-
-
-def api(path, method='GET', data=None, pat=False, missing=False):
+def api(path, method='GET', data=None, missing=False):
     environment = dict(os.environ)
-    if pat:
-        require(environment.get('NIGHTLY_RELEASE_TOKEN'), 'NIGHTLY_RELEASE_TOKEN is required; daily Nightly is not configured')
-        environment['GH_TOKEN'] = environment['NIGHTLY_RELEASE_TOKEN']
     args = ['gh', 'api', '--method', method, 'repos/' + REPO + '/' + path]
-    if path == '/user':
-        args[-1] = 'user'
     if data is not None:
         args += ['--input', '-']
     result = subprocess.run(args, input=json.dumps(data) if data is not None else None,
@@ -122,41 +88,6 @@ def reconcile_write(write, read, accepted, description):
     raise ValueError(description + ' has an unknown or rejected outcome; no write was repeated')
 
 
-def json_value(text, path, value):
-    data = json.loads(text)
-    require(json.dumps(data, indent=2, ensure_ascii=False) + '\n' == text, 'version JSON formatting changed; refuse unrelated formatting edits')
-    parent = data
-    for key in path[:-1]:
-        parent = parent[key]
-    require(path[-1] in parent, 'missing JSON version field')
-    parent[path[-1]] = value
-    return json.dumps(data, indent=2, ensure_ascii=False) + '\n'
-
-
-def package_version(text, value):
-    match = re.search(r'(?ms)^\[package\]\s*\n(.*?)(?=^\[|\Z)', text)
-    require(match, 'missing Cargo package section')
-    section, count = re.subn(r'(?m)^(version\s*=\s*)"[^"]+"', lambda m: m[1] + json.dumps(value), match[1])
-    require(count == 1, 'Cargo package must own exactly one version')
-    return text[:match.start(1)] + section + text[match.end(1):]
-
-
-def versions_at(commit):
-    values = {}
-    for app in release.APPS:
-        path = f'apps/{app}/' + ('Cargo.toml' if app in ('core', 'cli') else 'app.json' if app == 'mobile' else 'package.json')
-        text = blob(commit, path).decode()
-        if app in ('core', 'cli'):
-            match = re.search(r'(?ms)^\[package\]\s*\n(.*?)(?=^\[|\Z)', text)
-            require(match, 'missing Cargo package')
-            values[app] = re.search(r'(?m)^version\s*=\s*"([^"]+)"', match[1])[1]
-        else:
-            info = json.loads(text)
-            values[app] = info['expo']['extra']['releaseVersion'] if app == 'mobile' else info['version']
-        release.version(values[app])
-    return values
-
-
 def declared_versions(tags):
     """Versions already claimed by real release tags, per release group."""
     values = {group: [] for group in RELEASES}
@@ -175,21 +106,7 @@ def next_sequence(prefix, claimed):
     return prefix + str(max(sequences, default=0) + 1)
 
 
-def next_ios_build_number(value):
-    """Increment the last valid CFBundleVersion component without rollover."""
-    require(isinstance(value, str), 'iOS build number must be a string')
-    parts = value.split('.')
-    require(1 <= len(parts) <= 3 and re.fullmatch(r'[0-9]{1,4}', parts[0])
-            and int(parts[0]) > 0 and all(re.fullmatch(r'[0-9]{1,2}', part) for part in parts[1:]),
-            'iOS build number must be a valid Apple CFBundleVersion')
-    maximum = 9999 if len(parts) == 1 else 99
-    last = int(parts[-1])
-    require(last < maximum, 'iOS build number component cannot be incremented without rollover')
-    parts[-1] = str(last + 1)
-    return '.'.join(parts)
-
-
-def plan_versions(batch, base, tags):
+def plan_versions(batch, base, tags, run_id, previous=''):
     day = batch[:8]
     values = versions_at(base)
     for app in ('cli', 'www'):
@@ -203,207 +120,8 @@ def plan_versions(batch, base, tags):
     values['www'] = next_sequence(www_prefix, claimed['www'] + [values['www']])
     for app in PRODUCT_APPS:
         values[app] = product_ver
-    expo = json.loads(blob(base, 'apps/mobile/app.json'))['expo']
-    code = expo['android']['versionCode']
-    require(type(code) is int and 0 < code < 2100000000, 'Android versionCode cannot be incremented')
-    ios_build_number = next_ios_build_number(expo['ios']['buildNumber'])
-    return DailyPlan(batch, base, values, code + 1, ios_build_number)
-
-
-def generated(plan):
-    old = versions_at(plan.base)
-    require(set(plan.versions) == set(release.APPS), 'daily plan must contain all release applications')
-    product_ver = plan.versions['cli']
-    for app in PRODUCT_APPS:
-        require(plan.versions[app] == product_ver, 'product apps must share one canonical version')
-    for app, value in plan.versions.items():
-        release.version(value)
-        prefix = old[app].split('-', 1)[0] + '-nightly.' + plan.day + '.'
-        require(value.startswith(prefix), 'daily version changed baseline or date')
-        if old[app].startswith(prefix):
-            require(int(value[len(prefix):]) > int(old[app][len(prefix):]), 'daily version did not advance')
-    result = {path: blob(plan.base, path).decode() for path in PATHS}
-    for app in ('www', 'app', 'desktop'):
-        path = f'apps/{app}/package.json'
-        result[path] = json_value(result[path], ('version',), plan.versions[app])
-    for app in ('core', 'cli'):
-        path = f'apps/{app}/Cargo.toml'
-        result[path] = package_version(result[path], plan.versions[app])
-    blocks = result['Cargo.lock'].split('[[package]]')
-    found = set()
-    for index, block in enumerate(blocks):
-        match = re.search(r'(?m)^name = "(vibeface|vibeface-core)"$', block)
-        if match:
-            app = 'cli' if match[1] == 'vibeface' else 'core'
-            require(app not in found and f'version = "{old[app]}"' in block, 'Cargo.lock local package mismatch')
-            blocks[index], count = re.subn(r'(?m)^version = "[^"]+"$', 'version = "' + plan.versions[app] + '"', block)
-            require(count == 1, 'ambiguous local lock version')
-            found.add(app)
-    require(found == {'core', 'cli'}, 'Cargo.lock is missing local packages')
-    result['Cargo.lock'] = '[[package]]'.join(blocks)
-    mobile_path = 'apps/mobile/app.json'
-    expo = json.loads(result[mobile_path])['expo']
-    require(expo['version'] == plan.versions['mobile'].split('-', 1)[0], 'mobile marketing version mismatch')
-    require(type(plan.android_code) is int and plan.android_code == expo['android']['versionCode'] + 1
-            and 0 < plan.android_code <= 2100000000, 'Android versionCode must advance exactly once')
-    require(plan.ios_build_number == next_ios_build_number(expo['ios']['buildNumber']),
-            'iOS build number must advance exactly once')
-    result[mobile_path] = json_value(result[mobile_path], ('expo', 'extra', 'releaseVersion'), plan.versions['mobile'])
-    result[mobile_path] = json_value(result[mobile_path], ('expo', 'android', 'versionCode'), plan.android_code)
-    result[mobile_path] = json_value(result[mobile_path], ('expo', 'ios', 'buildNumber'), plan.ios_build_number)
-    return {path: text.encode() for path, text in result.items()}
-
-
-def recovered_plan(batch, head):
-    parents = git('rev-list', '--parents', '-n', '1', head).split()
-    require(len(parents) == 2, 'daily version head must be one ordinary commit')
-    expo = json.loads(blob(head, 'apps/mobile/app.json'))['expo']
-    return DailyPlan(batch, parents[1], versions_at(head), expo['android']['versionCode'], expo['ios']['buildNumber'])
-
-
-def expected_tree(plan):
-    expected = generated(plan)
-    with tempfile.TemporaryDirectory(dir=scratch(), prefix='index-') as temporary:
-        environment = dict(os.environ, GIT_INDEX_FILE=str(Path(temporary) / 'index'))
-        git('read-tree', plan.base, env=environment)
-        for path, content in expected.items():
-            entry = git('ls-tree', plan.base, '--', path).split()
-            require(entry[:2] == ['100644', 'blob'], 'version source must be an ordinary tracked file')
-            oid = git('hash-object', '-w', '--stdin', data=content)
-            git('update-index', '--add', '--cacheinfo', '100644', oid, path, env=environment)
-        return git('write-tree', env=environment)
-
-
-def verify_tree(plan, head):
-    require(git('show', '-s', '--format=%ae%n%ce', head).splitlines() == [BOT, BOT], 'unexpected daily commit author')
-    require(git('rev-list', '--parents', '-n', '1', head).split() == [head, plan.base], 'daily version head changed its original base')
-    require(expected_tree(plan) == git('rev-parse', head + '^{tree}'),
-            'daily PR tree differs from exact mechanical version changes; refusing merge')
-
-
-def scratch():
-    directory = ROOT / '.artifacts/daily-nightly'
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory
-
-
-@contextmanager
-def checkout(commit):
-    with tempfile.TemporaryDirectory(dir=scratch(), prefix='checkout-') as temporary:
-        source = Path(temporary) / 'source'
-        git('worktree', 'add', '--detach', str(source), commit)
-        try:
-            yield source
-        finally:
-            git('worktree', 'remove', '--force', str(source))
-
-
-def metadata(source, plan):
-    before = (source / 'Cargo.lock').read_bytes()
-    result = subprocess.check_output(['cargo', 'metadata', '--locked', '--no-deps', '--format-version', '1'], cwd=source)
-    packages = {package['name']: package['version'] for package in json.loads(result)['packages']}
-    require(packages['vibeface'] == plan.versions['cli'] and packages['vibeface-core'] == plan.versions['core'],
-            'Cargo metadata does not match daily versions')
-    require((source / 'Cargo.lock').read_bytes() == before, 'cargo metadata changed dependency resolution')
-
-
-def daily_pr(branch):
-    matches = pages('pulls?state=all&head=' + quote('leaperone:' + branch, safe=''))
-    require(len(matches) <= 1, 'daily branch has multiple PRs; refusing a second daily PR')
-    return api(f'pulls/{matches[0]["number"]}') if matches else None
-
-
-def branch_sha(branch):
-    ref = api('git/ref/heads/' + branch, missing=True)
-    return ref['object']['sha'] if ref else None
-
-
-def validate_pr(pr, plan, head, login):
-    require(pr['user']['login'] == login and pr['head']['repo']['full_name'] == REPO
-            and pr['base']['repo']['full_name'] == REPO and pr['base']['ref'] == 'main'
-            and pr['head']['ref'] == plan.branch and pr['head']['sha'] == head
-            and pr['commits'] == 1 and not pr['draft'] and pr['title'] == 'chore(release): nightly ' + plan.batch,
-            'daily PR identity, author, base or head mismatch')
-    require(pr['state'] == 'open' or pr.get('merged'), 'daily PR was closed without merge; refusing a replacement')
-    verify_tree(plan, head)
-
-
-def create_pr(plan, head, login):
-    def read():
-        return daily_pr(plan.branch)
-    pr = reconcile_write(lambda: api('pulls', 'POST', dict(head=plan.branch, base='main',
-                         title='chore(release): nightly ' + plan.batch,
-                         body='Mechanical four-hour Nightly versions. Only the trusted Nightly coordinator may merge this PR.'), pat=True),
-                         read, lambda value: value is not None, 'daily PR creation')
-    validate_pr(pr, plan, head, login)
-    return pr
-
-
-def merge_pr(pr, plan, head, login):
-    validate_pr(pr, plan, head, login)
-    if not pr.get('merged'):
-        git('fetch', 'origin', 'main')
-        git('merge-base', '--is-ancestor', plan.base, 'origin/main')
-        with checkout(head) as source:
-            metadata(source, plan)
-        for attempt in range(18):
-            pr = api(f'pulls/{pr["number"]}')
-            validate_pr(pr, plan, head, login)
-            if pr['mergeable'] is not None:
-                break
-            if attempt < 17:
-                time.sleep(10)
-        require(pr['mergeable'] is True, 'daily PR is conflicted or mergeability is unknown; rerun after reconciliation')
-        number = pr['number']
-        pr = reconcile_write(lambda: api(f'pulls/{number}/merge', 'PUT', dict(sha=head, merge_method='squash'), pat=True),
-                             lambda: api(f'pulls/{number}'), lambda value: bool(value.get('merged')), 'daily squash merge')
-        validate_pr(pr, plan, head, login)
-    source = pr['merge_commit_sha']
-    require(re.fullmatch(r'[a-f0-9]{40}', source or ''), 'merged PR has no actual merge SHA')
-    git('fetch', 'origin', 'main')
-    git('merge-base', '--is-ancestor', source, 'origin/main')
-    parents = git('rev-list', '--parents', '-n', '1', source).split()
-    require(len(parents) == 2, 'daily squash merge must have one real main parent')
-    landed = DailyPlan(plan.batch, parents[1], plan.versions, plan.android_code, plan.ios_build_number)
-    require(git('rev-parse', source + '^{tree}') == expected_tree(landed),
-            'actual main merge differs from exact mechanical versions on its real parent; retain original PR and stop')
-    return source
-
-
-def ensure_landed(batch, login):
-    branch = 'bot/daily-nightly/' + batch
-    pr = daily_pr(branch)
-    remote = branch_sha(branch)
-    if pr:
-        head = pr['head']['sha']
-        require(remote is None and pr.get('merged') or remote == head, 'daily branch no longer matches original PR head')
-        git('fetch', 'origin', f'pull/{pr["number"]}/head')
-        plan = recovered_plan(batch, head)
-    elif remote:
-        git('fetch', 'origin', 'refs/heads/' + branch)
-        head = remote
-        plan = recovered_plan(batch, head)
-        verify_tree(plan, head)
-        pr = create_pr(plan, head, login)
-    else:
-        git('fetch', 'origin', 'main', '--tags')
-        base = git('rev-parse', 'origin/main')
-        tags = [line.split('\t')[1][10:] for line in git('ls-remote', '--tags', 'origin').splitlines()
-                if not line.endswith('^{}')]
-        plan = plan_versions(batch, base, tags)
-        with checkout(base) as source:
-            for path, content in generated(plan).items():
-                (source / path).write_bytes(content)
-            metadata(source, plan)
-            git('add', '--', *PATHS, root=source)
-            git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
-                'commit', '-m', 'chore(release): nightly ' + batch, root=source)
-            head = git('rev-parse', 'HEAD', root=source)
-            verify_tree(plan, head)
-            reconcile_write(lambda: git('push', 'origin', head + ':refs/heads/' + branch),
-                            lambda: branch_sha(branch), lambda value: value == head, 'daily branch push')
-        pr = create_pr(plan, head, login)
-    return plan, merge_pr(pr, plan, head, login), pr['number']
+    code, ios = next_build_numbers(base, previous)
+    return DailyPlan(batch, base, values, code, ios, str(run_id), previous)
 
 
 def matching_runs(workflow, sha, branch, events):
@@ -418,24 +136,6 @@ def rerun(run, failed_only):
     return reconcile_write(lambda: api(f'actions/runs/{run["id"]}/' + ('rerun-failed-jobs' if failed_only else 'rerun'), 'POST'),
                            lambda: api(f'actions/runs/{run["id"]}'),
                            lambda value: value['run_attempt'] > attempt or value['status'] != 'completed', 'original run recovery')
-
-
-def wait_main_ci(source, deadline):
-    restored = set()
-    while time.monotonic() < deadline:
-        runs = matching_runs(CI, source, 'main', {'push'})
-        require(len(runs) <= 1, 'multiple main push CI runs for daily merge; reconcile before releasing')
-        if runs:
-            run = runs[0]
-            if run['status'] == 'completed':
-                if run['conclusion'] == 'success':
-                    return run
-                require(run['conclusion'] == 'cancelled' and run['id'] not in restored,
-                        'exact daily merge main CI did not succeed; refusing tags')
-                restored.add(run['id'])
-                rerun(run, False)
-        time.sleep(15)
-    raise ValueError('exact daily merge main push CI is missing or pending; refusing tags')
 
 
 def tag_sha(tag):
@@ -454,7 +154,7 @@ def tag_sha(tag):
 def ensure_tag(tag, source):
     existing = tag_sha(tag)
     if existing is None:
-        existing = reconcile_write(lambda: api('git/refs', 'POST', dict(ref='refs/tags/' + tag, sha=source)),
+        existing = reconcile_write(lambda: git('push', 'origin', source + ':refs/tags/' + tag),
                                    lambda: tag_sha(tag), lambda value: value is not None, 'release tag creation')
     require(existing == source, 'existing immutable tag points to a different SHA')
 
@@ -470,18 +170,19 @@ def release_dispatch_tag(app):
 
 
 def start_release(app, source):
+    workflow, extra_inputs = release.release_workflow(source, app)
     tag = release_dispatch_tag(app)
     ensure_tag(tag, source)
     state = release_state(tag)
-    runs = matching_runs(RELEASE, source, tag, {'push', 'workflow_dispatch'})
+    runs = matching_runs(workflow, source, tag, {'push', 'workflow_dispatch'})
     if state and not state['draft']:
         return runs
     if not runs:
         require(state is None, 'draft release has no original run; original bytes cannot be recovered')
         # The release workflow only builds unless publish is requested explicitly.
-        inputs = dict(app=app, tag=tag, publish='true')
-        runs = reconcile_write(lambda: api('actions/workflows/release.yml/dispatches', 'POST', dict(ref=tag, inputs=inputs)),
-                               lambda: matching_runs(RELEASE, source, tag, {'push', 'workflow_dispatch'}), bool, 'release workflow dispatch')
+        inputs = dict(extra_inputs, tag=tag, publish='true')
+        runs = reconcile_write(lambda: api('actions/workflows/' + workflow.split('/')[-1] + '/dispatches', 'POST', dict(ref=tag, inputs=inputs)),
+                               lambda: matching_runs(workflow, source, tag, {'push', 'workflow_dispatch'}), bool, 'release workflow dispatch')
     return runs
 
 
@@ -518,6 +219,8 @@ def original_artifacts(app, run, source):
 
 def recover_publisher(app, run, source):
     require(app in RELEASES, 'only the product and www release groups can be recovered')
+    require(type(run['run_attempt']) is int and 0 < run['run_attempt'] < MAX_PUBLISHER_ATTEMPTS,
+            'publisher attempt limit reached; review the original failure and declare an explicit Nightly abandonment')
     jobs = pages(f'actions/runs/{run["id"]}/jobs?filter=latest', 'jobs')
     producers = [job for job in jobs if job_leaf(job) == PRODUCER]
     require(len(producers) == 1 and producers[0]['conclusion'] == 'success',
@@ -536,11 +239,12 @@ def recover_publisher(app, run, source):
 
 
 def finish_release(app, source, deadline):
+    workflow, _ = release.release_workflow(source, app)
     tag = release_dispatch_tag(app)
     restored = set()
     while time.monotonic() < deadline:
         require(tag_sha(tag) == source, 'release tag changed source')
-        runs = matching_runs(RELEASE, source, tag, {'push', 'workflow_dispatch'})
+        runs = matching_runs(workflow, source, tag, {'push', 'workflow_dispatch'})
         state = release_state(tag)
         active = [run for run in runs if run['status'] != 'completed']
         if not active:
@@ -549,6 +253,7 @@ def finish_release(app, source, deadline):
             run = runs[0]
             # A public Release with a failed npm job is not a success; it is a recoverable publisher failure.
             if state and not state['draft'] and run['conclusion'] == 'success':
+                require(app != 'product' or npm_complete(run), 'original Nightly npm publisher did not succeed')
                 with tempfile.TemporaryDirectory(dir=scratch(), prefix='public-') as temporary:
                     release.verify_public(app, Path(temporary) / 'assets')
                 return [dict(id=run['id'], url=run['html_url'], conclusion=run['conclusion'])]
@@ -559,9 +264,9 @@ def finish_release(app, source, deadline):
     raise ValueError('release workflow is still pending; rerun the original daily coordinator to reconcile')
 
 
-def publish_daily(source, deadline):
+def publish_daily(source, deadline, groups=RELEASES):
     receipt = {}; started = []; errors = []
-    for app in RELEASES:
+    for app in groups:
         started.append(app)
         try:
             start_release(app, source)
@@ -569,7 +274,7 @@ def publish_daily(source, deadline):
             errors.append(f'{app}: {error}')
             break
     if not errors:
-        for app in RELEASES:
+        for app in groups:
             if app not in started:
                 continue
             try:
@@ -577,11 +282,12 @@ def publish_daily(source, deadline):
             except Exception as error:
                 errors.append(f'{app}: {error}')
     for app in started:
+        workflow, _ = release.release_workflow(source, app)
         tag = release_dispatch_tag(app)
-        runs = matching_runs(RELEASE, source, tag, {'push', 'workflow_dispatch'})
+        runs = matching_runs(workflow, source, tag, {'push', 'workflow_dispatch'})
         while any(run['status'] != 'completed' for run in runs) and time.monotonic() < deadline:
             time.sleep(15)
-            runs = matching_runs(RELEASE, source, tag, {'push', 'workflow_dispatch'})
+            runs = matching_runs(workflow, source, tag, {'push', 'workflow_dispatch'})
         print(json.dumps(dict(app=app, runs=[dict(id=run['id'], url=run['html_url'], status=run['status'],
                                                 conclusion=run['conclusion']) for run in runs])))
         if any(run['status'] != 'completed' for run in runs):
@@ -590,49 +296,345 @@ def publish_daily(source, deadline):
     return receipt
 
 
+def trusted_nightlies(tags, batch):
+    """Either group may be the sole surviving tag of a partially published source."""
+    trusted = {}; candidates = []; values_by_source = {}
+    for tag in tags:
+        try:
+            app, value, channel = release.parse_tag(tag)
+        except ValueError:
+            continue
+        if channel != 'nightly':
+            continue
+        source = git('rev-parse', tag + '^{commit}')
+        subject = git('show', '-s', '--format=%s', source)
+        original_batch = subject == 'chore(release): nightly ' + batch
+        try:
+            paths = version_paths_at(source)
+            require(set(git('ls-tree', '-r', '--name-only', source, '--', *paths).splitlines()) == set(paths),
+                    'Nightly candidate is missing immutable version sources')
+            if source not in values_by_source:
+                values_by_source[source] = versions_at(source)
+            values = values_by_source[source]
+            require(values['cli' if app == 'product' else 'www'] == value, 'Nightly tag version mismatch')
+            candidates.append((nightly_order(values['cli']), tag, source, app, original_batch))
+        except ValueError:
+            require(not original_batch, 'existing Nightly batch tag has an invalid immutable source')
+            require(not re.fullmatch(r'chore\(release\): nightly [0-9]{10}', subject),
+                    'existing mechanical Nightly source is invalid or unresolved; reconcile it before allocating')
+    checked = 0
+    for order, tag, source, app, original_batch in sorted(candidates, reverse=True):
+        if trusted and not original_batch:
+            continue
+        checked += 1
+        require(checked <= 16, 'too many invalid Nightly candidates; reconcile immutable tags before continuing')
+        try:
+            context = release.validate_source(source, app)
+            if app == 'www' and not context['ci_run_id']:
+                continue
+        except ValueError:
+            require(not original_batch, 'existing Nightly batch tag has an invalid immutable source')
+            require(not re.fullmatch(r'chore\(release\): nightly [0-9]{10}',
+                                     git('show', '-s', '--format=%s', source)),
+                    'existing mechanical Nightly source is invalid or unresolved; reconcile it before allocating')
+            continue
+        trusted[source] = (order, tag, source, context)
+    return [(tag, source, context) for _, tag, source, context in sorted(trusted.values(), reverse=True)]
+
+
+def npm_complete(run):
+    jobs = pages(f'actions/runs/{run["id"]}/jobs?filter=latest', 'jobs')
+    npm = [job for job in jobs if job_leaf(job) == 'npm']
+    return len(npm) == 1 and npm[0]['status'] == 'completed' and npm[0]['conclusion'] == 'success'
+
+
+def completed_source(source):
+    """A complete product includes the original npm publisher, not merely a public Release."""
+    with checkout(source) as clean:
+        previous_root = release.ROOT
+        release.ROOT = clean
+        try:
+            groups = RELEASES if release.validate_source(source, 'product')['ci_run_id'] else ('product',)
+            for app in groups:
+                workflow, _ = release.release_workflow(source, app)
+                tag = release_dispatch_tag(app)
+                require(release.parse_tag(tag)[2] == 'nightly', 'recovery only accepts Nightly groups')
+                if tag_sha(tag) != source:
+                    return False
+                state = release_state(tag)
+                runs = matching_runs(workflow, source, tag, {'push', 'workflow_dispatch'})
+                if not (state and not state['draft'] and len(runs) == 1
+                        and runs[0]['status'] == 'completed' and runs[0]['conclusion'] == 'success'):
+                    return False
+                if app == 'product' and not npm_complete(runs[0]):
+                    return False
+                with tempfile.TemporaryDirectory(dir=scratch(), prefix='complete-') as temporary:
+                    release.verify_public(app, Path(temporary) / 'assets')
+            return True
+        finally:
+            release.ROOT = previous_root
+
+
+def ensure_source(batch, base, run_id):
+    git('fetch', 'origin', 'main', '--tags')
+    tags = [line.split('\t')[1][10:] for line in git('ls-remote', '--tags', 'origin').splitlines()
+            if not line.endswith('^{}')]
+    # Fetch before reading any immutable ref, including a batch stopped after only its WWW tag.
+    trusted = trusted_nightlies(tags, batch)
+    sources = {source for _, source, context in trusted if context['nightly_batch'] == batch}
+    require(len(sources) <= 1, 'Nightly batch has conflicting immutable sources')
+    if sources:
+        source = sources.pop()
+        plan = recovered_plan(source)
+        require(plan.base == base and plan.run_id == str(run_id), 'Nightly batch differs from its original schedule source')
+        require(not abandoned_source(source, plan, release.validate_source(source, 'product')),
+                'this Nightly batch was explicitly abandoned; wait for the next schedule batch')
+        return source, completed_source(source)
+    # A reviewed abandonment preserves the failed source and permits a later batch to advance.
+    previous = ''
+    if trusted:
+        _, previous, context = trusted[0]
+        complete = completed_source(previous)
+        if not complete and not abandoned_source(previous, recovered_plan(previous) if context['ci_run_id'] else None, context):
+            return previous, False
+        require(subprocess.run(['git', 'merge-base', '--is-ancestor', context['ci_source_commit'], base],
+                               cwd=release.ROOT, capture_output=True).returncode == 0,
+                'unstarted Nightly source predates the previous main source')
+        require(batch[:8] >= versions_at(previous)['cli'].split('-nightly.')[1].split('.')[0],
+                'unstarted Nightly batch predates the previous Nightly; refusing a downgrade')
+        if complete and context['ci_source_commit'] == base:
+            return previous, True
+    plan = plan_versions(batch, base, tags, run_id, previous)
+    with checkout(base) as clean:
+        for path, content in generated(plan).items():
+            (clean / path).write_bytes(content)
+        metadata(clean, plan)
+        git('add', '--', *PATHS, root=clean)
+        git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+            'commit', '-m', plan.message, root=clean)
+        source = git('rev-parse', 'HEAD', root=clean)
+        verify_tree(plan, source)
+    return source, False
+
+
 def run_daily(run_id):
-    require(os.environ.get('NIGHTLY_RELEASE_TOKEN'), 'NIGHTLY_RELEASE_TOKEN is missing; daily Nightly has not been enabled')
-    require(os.environ.get('GH_TOKEN'), 'GITHUB_TOKEN must be supplied as GH_TOKEN for branch/tag/dispatch writes')
+    require(os.environ.get('GH_TOKEN'), 'GITHUB_TOKEN must be supplied as GH_TOKEN for tag/dispatch writes')
     require(os.environ.get('GITHUB_REPOSITORY') == REPO and os.environ.get('GITHUB_EVENT_NAME') == 'schedule'
             and os.environ.get('GITHUB_REF') == 'refs/heads/main' and str(run_id) == os.environ.get('GITHUB_RUN_ID'),
             'daily coordinator only accepts its original main schedule run')
     original = api(f'actions/runs/{run_id}')
-    require(original['event'] == 'schedule' and original['head_branch'] == 'main' and original['path'] == CI
-            and original['head_sha'] == os.environ.get('GITHUB_SHA') and original['repository']['full_name'] == REPO,
+    source = os.environ.get('GITHUB_SHA')
+    require(original['event'] == 'schedule' and original['head_branch'] == 'main' and original['path'] == NIGHTLY
+            and original['head_sha'] == source and original['repository']['full_name'] == REPO
+            and original['head_repository']['full_name'] == REPO and str(original['id']) == str(run_id),
             'untrusted daily schedule source')
     batch = schedule_batch(original['created_at'])
-    login = api('/user', pat=True)['login']
+    ci = release.require_ci(dict(ci_source_commit=source, ci_run_id=str(run_id), nightly_batch=batch))
+    source, complete = ensure_source(batch, source, run_id)
+    if complete:
+        print(json.dumps(dict(batch=batch, source_commit=source, skipped='no new main commits; previous Nightly including npm is complete')))
+        return
+    context = release.validate_source(source, 'product')
+    ci = release.require_ci(context)
+    groups = RELEASES if context['ci_run_id'] else ('product',)
     deadline = time.monotonic() + 5 * 60 * 60
-    plan, source, number = ensure_landed(batch, login)
-    ci = wait_main_ci(source, deadline)
     with checkout(source) as clean:
-        previous = release.ROOT
+        previous_root = release.ROOT
         release.ROOT = clean
         try:
-            require(versions_at(source) == plan.versions, 'landed daily versions changed')
-            environment = {key: value for key, value in os.environ.items()
-                           if key not in ('GITHUB_EVENT_NAME', 'GITHUB_REF', 'NIGHTLY_RELEASE_TOKEN')}
-            environment['PYTHONDONTWRITEBYTECODE'] = '1'
-            for app in RELEASES:
-                tag = release.release_tag_for(app, plan.versions['cli' if app == 'product' else 'www'])
-                subprocess.run(['python3', str(clean / 'scripts/release.py'), 'plan', '--app', app, '--tag', tag, '--require-main'],
-                               cwd=clean, env=environment, check=True)
-            releases = publish_daily(source, deadline)
+            versions = versions_at(source)
+            for app in groups:
+                tag = release_dispatch_tag(app)
+                require(release.parse_tag(tag)[2] == 'nightly', 'coordinator only publishes Nightly groups')
+                release.plan(app, tag=tag, require_main=True)
+            releases = publish_daily(source, deadline, groups)
         finally:
-            release.ROOT = previous
-    print(json.dumps(dict(batch=batch, day=plan.day, pr=number, source_commit=source, versions=plan.versions,
-                          main_ci=ci['html_url'], releases=releases), indent=2))
+            release.ROOT = previous_root
+    print(json.dumps(dict(batch=batch, source_commit=source, versions=versions,
+                          schedule_ci=ci['html_url'], releases=releases), indent=2))
+
+
+def self_test_source_layouts():
+    """Historical and native source trees use their own exact version manifests."""
+    from unittest.mock import patch
+
+    old = '0.0.1-nightly.20261105.2'
+    new = '0.0.1-nightly.20261106.1'
+    for native in (False, True):
+        with tempfile.TemporaryDirectory(dir=scratch(), prefix='source-layout-') as temporary:
+            root = Path(temporary)
+            rust = {'core': 'vibeface-core', 'cli': 'vibeface'}
+            if native:
+                rust['desktop'] = 'vibeface-desktop'
+            initial = {}
+            for app in release.APPS:
+                directory = root / 'apps' / app
+                directory.mkdir(parents=True)
+                if app in rust:
+                    path = f'apps/{app}/Cargo.toml'
+                    text = f'[package]\nname = "{rust[app]}"\nversion = "{old}"\nedition = "2021"\n'
+                    (directory / 'src').mkdir()
+                    (directory / 'src/main.rs').write_text('fn main() {}\n')
+                else:
+                    path = f'apps/{app}/package.json'
+                    value = {'version': old, 'private': True}
+                    if app == 'mobile':
+                        path = 'apps/mobile/app.json'
+                        value = {'expo': {'version': '0.0.1', 'extra': {'releaseVersion': old},
+                                          'android': {'versionCode': 1}, 'ios': {'buildNumber': '1'}}}
+                    text = json.dumps(value, indent=2) + '\n'
+                initial[path] = text.encode()
+            initial['Cargo.lock'] = ('version = 3\n' + ''.join(
+                f'\n[[package]]\nname = "{name}"\nversion = "{old}"\n' for name in sorted(rust.values()))).encode()
+            for path, content in initial.items():
+                (root / path).write_bytes(content)
+            members = ', '.join(json.dumps(f'apps/{app}') for app in rust)
+            (root / 'Cargo.toml').write_text(f'[workspace]\nmembers = [{members}]\nresolver = "2"\n')
+            (root / 'business.txt').write_text('unchanged business source\n')
+            git('init', '--initial-branch=main', root=root)
+            git('add', '.', root=root)
+            git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+                'commit', '-qm', 'immutable source layout', root=root)
+            with patch('release.ROOT', root):
+                base = git('rev-parse', 'HEAD')
+                git('update-ref', 'refs/remotes/origin/main', base)
+                plan = DailyPlan('2026110600', base, dict.fromkeys(release.APPS, new), 2, '2', '42')
+                # Independent expected bytes, including unchanged manifest bodies and lock entries.
+                expected = {path: content.replace(old.encode(), new.encode()) for path, content in initial.items()}
+                expected['apps/mobile/app.json'] = expected['apps/mobile/app.json'].replace(
+                    b'"versionCode": 1', b'"versionCode": 2').replace(b'"buildNumber": "1"', b'"buildNumber": "2"')
+                assert generated(plan) == expected
+                desktop_path = 'apps/desktop/' + ('Cargo.toml' if native else 'package.json')
+                assert len(expected['Cargo.lock'].split(b'[[package]]')) - 1 == len(rust)
+                if native:
+                    assert set(expected) == set(PATHS) and len(rust) == 3
+                else:
+                    assert 'apps/desktop/Cargo.toml' not in expected and len(rust) == 2
+
+                def commit_candidate(changes):
+                    git('checkout', '--detach', '-q', base)
+                    for path, content in (expected | changes).items():
+                        (root / path).write_bytes(content)
+                    git('add', '--all')
+                    git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+                        'commit', '-qm', plan.message)
+                    return git('rev-parse', 'HEAD')
+
+                head = commit_candidate({})
+                assert versions_at(head) == plan.versions
+                assert recovered_plan(head) == plan
+                verify_tree(plan, head)
+                metadata(root, plan)
+                assert release.validate_source(head, 'product') == dict(
+                    ci_source_commit=base, ci_run_id='42', nightly_batch=plan.batch)
+                tampered_manifest = (expected[desktop_path] + b'\n[dependencies]\nserde = "1"\n'
+                                     if native else expected[desktop_path].replace(b'"private": true', b'"private": false'))
+                for path, content in (
+                    (desktop_path, tampered_manifest),
+                    (desktop_path, expected[desktop_path].replace(new.encode(), b'0.0.1-nightly.20261106.2')),
+                    ('Cargo.lock', expected['Cargo.lock'].replace(new.encode(), b'0.0.1-nightly.20261106.2', 1)),
+                    ('Cargo.lock', expected['Cargo.lock'] + b'\n[[package]]\nname = "unexpected"\nversion = "1.0.0"\n'),
+                    ('business.txt', b'modified non-version source\n'),
+                ):
+                    bad = commit_candidate({path: content})
+                    for check in (lambda: verify_tree(plan, bad), lambda: release.validate_source(bad, 'product')):
+                        try:
+                            check()
+                        except ValueError:
+                            pass
+                        else:
+                            raise AssertionError(f'tampered source accepted: {path}')
+                if not native:
+                    self_test_trusted_source_layouts(root, base, head, plan)
+
+
+def self_test_trusted_source_layouts(root, historical_base, historical_head, historical_plan):
+    """Discover mixed immutable layouts without accepting forged historical sources."""
+    historical_tag = 'v' + historical_plan.versions['cli']
+    git('tag', historical_tag, historical_head)
+    git('checkout', '--detach', '-q', historical_base)
+    desktop = root / 'apps/desktop'
+    (desktop / 'package.json').unlink()
+    (desktop / 'Cargo.toml').write_bytes(blob(historical_base, 'apps/core/Cargo.toml').replace(
+        b'vibeface-core', b'vibeface-desktop'))
+    (desktop / 'src').mkdir()
+    (desktop / 'src/main.rs').write_text('fn main() {}\n')
+    workspace = root / 'Cargo.toml'
+    workspace.write_text(workspace.read_text().replace('members = [', 'members = ["apps/desktop", '))
+    lock = root / 'Cargo.lock'
+    lock.write_text(lock.read_text() + '\n[[package]]\nname = "vibeface-desktop"\n'
+                    'version = "0.0.1-nightly.20261105.2"\n')
+    git('add', '--all')
+    git('-c', 'user.name=fixture-reviewer', '-c', 'user.email=reviewer@example.invalid',
+        'commit', '-qm', 'replace Desktop with the Native application')
+    native_base = git('rev-parse', 'HEAD')
+    git('update-ref', 'refs/remotes/origin/main', native_base)
+    native_plan = DailyPlan('2026110604', native_base,
+                           dict.fromkeys(release.APPS, '0.0.1-nightly.20261106.2'), 2, '2', '43')
+    native_contents = generated(native_plan)
+    assert set(native_contents) == set(PATHS) and native_contents['Cargo.lock'].count(b'[[package]]') == 3
+    for path, content in native_contents.items():
+        (root / path).write_bytes(content)
+    git('add', '--all')
+    git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+        'commit', '-qm', native_plan.message)
+    native_head = git('rev-parse', 'HEAD')
+    native_tag = 'v' + native_plan.versions['cli']
+    git('tag', native_tag, native_head)
+    for tags in ([historical_tag, native_tag], [native_tag, historical_tag]):
+        # The original historical batch forces both candidates through real source validation.
+        trusted = trusted_nightlies(tags, historical_plan.batch)
+        assert [source for _, source, _ in trusted] == [native_head, historical_head]
+        assert trusted[1][2] == dict(ci_source_commit=historical_base, ci_run_id='42',
+                                    nightly_batch=historical_plan.batch)
+        assert [source for _, source, _ in trusted_nightlies(tags, '2026110608')] == [native_head]
+
+    historical_contents = generated(historical_plan)
+    historical_manifest = 'apps/desktop/package.json'
+    forged = historical_contents[historical_manifest].replace(b'"private": true', b'"private": false')
+    for invalid in ('missing', 'dual', 'symlink', 'forged'):
+        git('checkout', '--detach', '-q', historical_head)
+        manifest = root / historical_manifest
+        if invalid == 'missing':
+            manifest.unlink()
+        elif invalid == 'dual':
+            (desktop / 'Cargo.toml').write_bytes(blob(native_base, 'apps/desktop/Cargo.toml'))
+        elif invalid == 'symlink':
+            manifest.unlink()
+            manifest.symlink_to('../app/package.json')
+        else:
+            manifest.write_bytes(forged)
+        git('add', '--all')
+        tree = git('write-tree')
+        bad = git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+                  'commit-tree', tree, '-p', historical_base, '-m', historical_plan.message)
+        git('tag', '-f', historical_tag, bad)
+        for tags, batch, message in (
+            ([historical_tag, native_tag], historical_plan.batch, 'invalid immutable source'),
+            ([native_tag, historical_tag], historical_plan.batch, 'invalid immutable source'),
+            ([historical_tag], '2026110608', 'invalid or unresolved'),
+        ):
+            try:
+                trusted_nightlies(tags, batch)
+            except ValueError as error:
+                assert message in str(error), str(error)
+            else:
+                raise AssertionError(f'invalid historical mechanical source accepted: {invalid}')
+        # Restore the ordinary tracked manifest before checking out another fixture.
+        git('reset', '--hard', '-q', historical_head)
 
 
 def self_test():
     from unittest.mock import patch
+    import nightly_source
+    real_anchor = nightly_source.complete_release_anchor
 
-    with patch.dict(os.environ, {'GH_TOKEN': 'fixture-actions-token', 'NIGHTLY_RELEASE_TOKEN': 'fixture-pr-token'}):
+    self_test_source_layouts()
+
+    with patch.dict(os.environ, {'GH_TOKEN': 'fixture-actions-token'}):
         with patch('subprocess.run', return_value=subprocess.CompletedProcess([], 0, '{}', '')) as transport:
             api('git/refs', 'POST', dict(ref='refs/tags/v0.0.1', sha='a' * 40))
             assert transport.call_args.kwargs['env']['GH_TOKEN'] == 'fixture-actions-token'
-            api('pulls', 'POST', {}, pat=True)
-            assert transport.call_args.kwargs['env']['GH_TOKEN'] == 'fixture-pr-token'
 
     def rejected(call, message=None):
         try:
@@ -642,21 +644,31 @@ def self_test():
         else:
             raise AssertionError('unsafe operation was accepted')
 
+    for package in ('vibeface', 'vibeface-core', 'vibeface-desktop'):
+        lock_block = f'\nname = "{package}"\nversion = "0.0.1"\ndependencies = [\n "vibeface-protocol",\n]\n'
+        updated = locked_package_version(lock_block, '0.0.1', '0.0.1-nightly.20261106.1')
+        assert updated == lock_block.replace('version = "0.0.1"', 'version = "0.0.1-nightly.20261106.1"')
+        for invalid in (lock_block.replace('version = "0.0.1"', '# version = "0.0.1"\nversion = "0.0.2"'),
+                        lock_block + 'version = "0.0.1"\n',
+                        lock_block + 'source = "registry+https://example.invalid/index"\n',
+                        lock_block + 'checksum = "unchanged-dependency-digest"\n'):
+            rejected(lambda invalid=invalid: locked_package_version(invalid, '0.0.1', '0.0.1-nightly.20261106.1'), 'Cargo.lock local package')
+
     for hour in range(24):
         assert schedule_batch(f'2026-11-06T{hour:02}:23:00Z') == f'20261106{hour // 4 * 4:02}'
         assert schedule_batch(f'2026-11-06T{hour:02}:59:59Z') == f'20261106{hour // 4 * 4:02}'
     assert schedule_batch('2026-11-07T00:23:00+08:00') == '2026110616'
     assert schedule_batch('2026-11-07T00:00:00Z') == '2026110700'
     for batch in ('20261106', '2026110601', '2026110624', '2026130600'):
-        rejected(lambda: DailyPlan(batch, '', {}, 1, '3'))
+        rejected(lambda: DailyPlan(batch, '', {}, 1, '3', '42'))
 
     with tempfile.TemporaryDirectory(dir=scratch(), prefix='self-test-') as temporary:
         root = Path(temporary) / 'repo'; root.mkdir()
         for app in release.APPS:
             directory = root / 'apps' / app; directory.mkdir(parents=True)
-            if app in ('core', 'cli'):
+            if app in ('core', 'cli', 'desktop'):
                 (directory / 'src').mkdir(); (directory / 'src/main.rs').write_text('fn main() {}\n')
-                (directory / 'Cargo.toml').write_text('[package]\nname = "' + ('vibeface' if app == 'cli' else 'vibeface-core')
+                (directory / 'Cargo.toml').write_text('[package]\nname = "' + {'cli': 'vibeface', 'core': 'vibeface-core', 'desktop': 'vibeface-desktop'}[app]
                                                      + '"\nversion = "0.0.1-nightly.20261105.2"\nedition = "2021"\n')
             else:
                 value = {'version': '0.0.1'} if app == 'www' else {'version': '0.0.1-nightly.20261105.2', 'private': True}
@@ -665,207 +677,342 @@ def self_test():
                         'android': {'package': 'one.leaper.vibeface', 'versionCode': 250001},
                         'extra': {'releaseVersion': '0.0.1-nightly.20261105.2'}}}
                 (directory / ('app.json' if app == 'mobile' else 'package.json')).write_text(json.dumps(value, indent=2) + '\n')
-        (root / 'Cargo.toml').write_text('[workspace]\nmembers = ["apps/core", "apps/cli"]\nresolver = "2"\n')
-        (root / 'Cargo.lock').write_text('version = 3\n\n[[package]]\nname = "vibeface"\nversion = "0.0.1-nightly.20261105.2"\n\n[[package]]\nname = "vibeface-core"\nversion = "0.0.1-nightly.20261105.2"\n')
+        (root / 'Cargo.toml').write_text('[workspace]\nmembers = ["apps/core", "apps/cli", "apps/desktop"]\nresolver = "2"\n')
+        (root / 'Cargo.lock').write_text('version = 3\n\n[[package]]\nname = "vibeface"\nversion = "0.0.1-nightly.20261105.2"\n\n[[package]]\nname = "vibeface-core"\nversion = "0.0.1-nightly.20261105.2"\n\n[[package]]\nname = "vibeface-desktop"\nversion = "0.0.1-nightly.20261105.2"\n')
+        (root / 'scripts').mkdir()
+        (root / nightly_source.ABANDONED).write_text('[]\n')
         git('init', '--initial-branch=main', root=root)
+        legacy_blob = git('hash-object', '-w', '--stdin', root=root, data=(root / 'Cargo.lock').read_bytes())
+        legacy_tree = git('mktree', root=root, data=f'100644 blob {legacy_blob}\tCargo.lock\n'.encode())
+        legacy = git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+                     'commit-tree', legacy_tree, '-m', 'old release layout fixture', root=root)
+        legacy_batch = git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+                           'commit-tree', legacy_tree, '-p', legacy, '-m', 'chore(release): nightly 2026110600', root=root)
+        git('update-ref', 'refs/heads/main', legacy_batch, root=root)
+        git('tag', 'v0.0.1-nightly.20261016.1', legacy, root=root)
+        git('tag', 'v0.0.1-nightly.20261016.2', legacy_batch, root=root)
+        (root / '.github/workflows').mkdir(parents=True)
+        # Commit the historical contracts themselves; HEAD may already use the split entries.
+        (root / CI).write_text("name: CI\non:\n  schedule:\n    - cron: '23 */4 * * *'\n"
+                              "jobs:\n  ci-gate:\n    runs-on: ubuntu-24.04\n"
+                              "    steps:\n      - run: 'true'\n")
+        (root / RELEASE).write_text("name: Release\non:\n  workflow_dispatch:\n    inputs:\n"
+                                   "      app:\n        type: choice\n        options: [product, www]\n"
+                                   "      tag:\n        type: string\n"
+                                   "      publish:\n        type: boolean\n        default: false\n"
+                                   "jobs:\n  identity:\n    runs-on: ubuntu-24.04\n"
+                                   "    steps:\n      - run: 'true'\n")
+        git('add', '.', root=root)
+        git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT, 'commit', '-qm', 'historical workflow fixture', root=root)
+        old_base = git('rev-parse', 'HEAD', root=root)
+        for path in (CI, RELEASE, NIGHTLY, '.github/workflows/release-www.yml'):
+            (root / path).write_bytes((ROOT / path).read_bytes())
         git('add', '.', root=root)
         git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT, 'commit', '-qm', 'fixture', root=root)
-        real_check_output = subprocess.check_output
-
-        def metadata_cargo_stub(cmd, cwd=None, **kwargs):
-            if isinstance(cmd, (list, tuple)) and len(cmd) >= 2 and cmd[0] == 'cargo' and cmd[1] == 'metadata':
-                work = Path(cwd)
-                cli = re.search(r'version = "([^"]+)"', (work / 'apps/cli/Cargo.toml').read_text())[1]
-                core = re.search(r'version = "([^"]+)"', (work / 'apps/core/Cargo.toml').read_text())[1]
-                return json.dumps({'packages': [{'name': 'vibeface', 'version': cli},
-                                                {'name': 'vibeface-core', 'version': core}]}).encode()
-            return real_check_output(cmd, cwd=cwd, **kwargs)
-
-        with patch(f'{__name__}.ROOT', root), patch('release.ROOT', root), patch(f'{__name__}.time.sleep'), \
-                patch('subprocess.check_output', side_effect=metadata_cargo_stub):
+        with patch('release.ROOT', root), patch(f'{__name__}.time.sleep'), \
+                patch('nightly_source.complete_release_anchor', return_value=False):
             assert RELEASES == ('product', 'www') and PRODUCT_APPS == ('app', 'core', 'cli', 'mobile', 'desktop')
             base = git('rev-parse', 'HEAD')
-            # Legacy component tags no longer claim a sequence; only real v/www-v tags and the current cohort do.
-            plan = plan_versions('2026110600', base, ['v0.0.1-nightly.20261106.7', 'core-v0.0.1-nightly.20261106.9',
-                                                    'mobile-v0.0.1-nightly.20261106.9', 'cli-v0.0.1-nightly.20261106.9'])
-            assert plan.versions['core'] == '0.0.1-nightly.20261106.8'
-            assert all(plan.versions[app] == plan.versions['cli'] for app in PRODUCT_APPS)
+            git('update-ref', 'refs/remotes/origin/main', base)
+            with tempfile.TemporaryDirectory(dir=scratch(), prefix='unreviewed-policy-') as temporary:
+                index = dict(os.environ, GIT_INDEX_FILE=str(Path(temporary) / 'index'))
+                git('read-tree', base, env=index)
+                git('update-index', '--force-remove', nightly_source.ABANDONED, env=index)
+                tree = git('write-tree', env=index)
+                without_policy = git('-c', 'user.name=fixture-reviewer', '-c', 'user.email=reviewer@example.invalid',
+                                     'commit-tree', tree, '-p', base, '-m', 'main without abandonment declarations')
+                policy = root / nightly_source.ABANDONED
+                original_policy = policy.read_bytes()
+                policy.write_text('unreviewed working-tree content is not a declaration\n')
+                git('update-ref', 'refs/remotes/origin/main', without_policy)
+                try:
+                    with patch('nightly_source.github') as no_remote:
+                        assert not abandoned_source(base, None, {})
+                        no_remote.assert_not_called()
+                finally:
+                    policy.write_bytes(original_policy)
+                    git('update-ref', 'refs/remotes/origin/main', base)
+            plan = plan_versions('2026110600', base, ['v0.0.1-nightly.20261106.7', 'core-v0.0.1-nightly.20261106.9'], '42')
+            assert plan.versions['cli'] == '0.0.1-nightly.20261106.8'
             assert plan.versions['www'] == '0.0.1-nightly.20261106.1'
-            assert plan.ios_build_number == '4'
+            assert plan.ios_build_number == '4' and plan.android_code == 250002
             assert next_ios_build_number('3.1.9') == '3.1.10'
             assert next_ios_build_number('3.01') == '3.2'
             for invalid in ('', '0', '10000', '9999', '3.99', '3.1.99', '3.100', '3.1.100', '3.1.2.3'):
                 rejected(lambda invalid=invalid: next_ios_build_number(invalid))
-            assert plan.day == '20261106' and plan.branch == 'bot/daily-nightly/2026110600'
-            assert plan_versions('2026110500', base, []).versions['core'].endswith('.3')
-            assert plan_versions('2026110600', base, ['v0.0.1-nightly.20261106.9']).versions['cli'].endswith('.10')
-            assert plan_versions('2026110600', base, ['www-v0.0.1-nightly.20261106.4']).versions['www'].endswith('.5')
-            assert plan_versions('2026110600', base, ['www-v0.0.1-nightly.20261106.4']).versions['cli'].endswith('.1')
             contents = generated(plan)
             mobile_generated = json.loads(contents['apps/mobile/app.json'])['expo']
             assert mobile_generated['ios']['buildNumber'] == '4'
             assert mobile_generated['ios']['supportsTablet'] is True
-            assert json.loads(contents['apps/desktop/package.json'])['version'] == plan.versions['cli']
-            assert contents['Cargo.lock'].count(b'[[package]]') == 2
+            assert re.search(rb'version = "([^"]+)"', contents['apps/desktop/Cargo.toml'])[1].decode() == plan.versions['cli']
+            assert contents['Cargo.lock'].count(b'[[package]]') == 3
+            assert 'apps/desktop/Cargo.toml' in PATHS and 'apps/desktop/package.json' not in PATHS
+            for package in ('vibeface', 'vibeface-core', 'vibeface-desktop'):
+                assert f'name = "{package}"\nversion = "{plan.versions["cli"]}"'.encode() in contents['Cargo.lock']
 
-            def commit_files(changes):
-                git('checkout', '--detach', '-q', base)
-                for path, content in contents.items():
+            def commit_files(changes, candidate=plan):
+                git('checkout', '--detach', '-q', candidate.base)
+                for path, content in generated(candidate).items():
                     (root / path).write_bytes(content)
                 for path, content in changes.items():
                     (root / path).write_bytes(content)
                 git('add', '--all')
-                git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT, 'commit', '-qm', 'daily fixture')
+                git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT, 'commit', '-qm', candidate.message)
                 return git('rev-parse', 'HEAD')
 
             head = commit_files({})
-            assert recovered_plan(plan.batch, head) == plan
+            assert recovered_plan(head) == plan
             verify_tree(plan, head)
             metadata(root, plan)
+            assert release.validate_source(head, 'product') == dict(ci_source_commit=base, ci_run_id='42', nightly_batch=plan.batch)
+            assert release.validate_source(head, 'www')['ci_source_commit'] == base
             for path, content in (
                 ('apps/app/package.json', contents['apps/app/package.json'].replace(b'"private": true', b'"private": false')),
-                ('apps/desktop/package.json', contents['apps/desktop/package.json'].replace(b'"private": true', b'"private": false')),
+                ('apps/desktop/Cargo.toml', contents['apps/desktop/Cargo.toml'] + b'\n[dependencies]\nserde = "1"\n'),
+                ('Cargo.lock', contents['Cargo.lock'].replace(
+                    f'name = "vibeface-desktop"\nversion = "{plan.versions["desktop"]}"'.encode(),
+                    b'name = "vibeface-desktop"\nversion = "0.0.1-nightly.20261106.9"')),
                 ('Cargo.lock', contents['Cargo.lock'] + b'\n[[package]]\nname = "unexpected"\nversion = "1.0.0"\n'),
                 ('apps/core/Cargo.toml', contents['apps/core/Cargo.toml'] + b'\n[dependencies]\nserde = "1"\n'),
-                ('apps/cli/Cargo.toml', contents['apps/cli/Cargo.toml'].replace(b'0.0.1-nightly.20261106.8', b'0.0.1-nightly.20261106.9')),
+                ('apps/cli/Cargo.toml', contents['apps/cli/Cargo.toml'].replace(b'20261106.8', b'20261106.9')),
                 ('apps/mobile/app.json', contents['apps/mobile/app.json'].replace(b'250002', b'1')),
-                ('apps/mobile/app.json', contents['apps/mobile/app.json'].replace(b'"buildNumber": "4"', b'"buildNumber": "3"')),
                 ('apps/mobile/app.json', contents['apps/mobile/app.json'].replace(b'"buildNumber": "4"', b'"buildNumber": "5"')),
                 ('apps/mobile/app.json', contents['apps/mobile/app.json'].replace(b'"supportsTablet": true', b'"supportsTablet": false')),
                 ('extra.txt', b'not a version file\n'),
             ):
                 bad = commit_files({path: content})
                 rejected(lambda: verify_tree(plan, bad), 'mechanical')
-                git('checkout', '--detach', '-q', base)
-            # An old per-app operation is refused outright instead of being reinterpreted as a new cohort.
-            stale = commit_files({'apps/mobile/app.json': contents['apps/mobile/app.json'].replace(
-                b'"releaseVersion": "0.0.1-nightly.20261106.8"', b'"releaseVersion": "0.0.1-nightly.20261106.9"')})
-            rejected(lambda: verify_tree(plan, stale), 'mechanical')
-            rejected(lambda: verify_tree(recovered_plan(plan.batch, stale), stale), 'canonical version')
-            git('checkout', '--detach', '-q', base)
-            head = commit_files({})
+                rejected(lambda: release.validate_source(bad, 'product'))
+            stale = commit_files({'apps/mobile/app.json': contents['apps/mobile/app.json'].replace(b'20261106.8', b'20261106.9')})
+            rejected(lambda: release.validate_source(stale, 'product'), 'canonical version')
             git('checkout', '--detach', '-q', base)
             (root / 'business.txt').write_text('main advanced independently\n')
             git('add', 'business.txt')
             git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT, 'commit', '-qm', 'independent main change')
             advanced = git('rev-parse', 'HEAD')
-            landed = DailyPlan(plan.batch, advanced, plan.versions, plan.android_code, plan.ios_build_number)
-            merged = git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
-                         'commit-tree', expected_tree(landed), '-p', advanced, '-m', 'actual squash fixture')
-            assert merged != head
-            assert blob(merged, 'business.txt') == b'main advanced independently\n'
             git('update-ref', 'refs/remotes/origin/main', advanced)
-            pr = dict(number=17, user=dict(login='nightly-owner'), head=dict(repo=dict(full_name=REPO), ref=plan.branch, sha=head),
-                      base=dict(repo=dict(full_name=REPO), ref='main'), commits=1, draft=False,
-                      title='chore(release): nightly ' + plan.batch, state='open', merged=False, mergeable=True)
-            state = {'pr': None, 'merge_checks': 0}; writes = []
+            assert recovered_plan(head).base == base and release.validate_source(head, 'product')['ci_source_commit'] == base
+            assert release.validate_source(advanced, 'product')['ci_source_commit'] == advanced
+            merge = git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+                        'commit-tree', git('rev-parse', head + '^{tree}'), '-p', base, '-p', advanced, '-m', plan.message)
+            rejected(lambda: release.validate_source(merge, 'product'), 'ordinary commit')
+            foreign = git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+                          'commit-tree', git('rev-parse', head + '^{tree}'), '-m', plan.message)
+            rejected(lambda: release.validate_source(foreign, 'product'), 'ordinary commit')
+            orphan_base = git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+                              'commit-tree', git('rev-parse', base + '^{tree}'), '-m', 'foreign root')
+            orphan = DailyPlan(plan.batch, orphan_base, plan.versions, plan.android_code, plan.ios_build_number, '42')
+            orphan_head = commit_files({}, orphan)
+            rejected(lambda: release.validate_source(orphan_head, 'product'), 'parent must be on main')
+            stable = commit_files({'apps/www/package.json': contents['apps/www/package.json'].replace(b'0.0.1-nightly.20261106.1', b'0.0.1')})
+            rejected(lambda: release.validate_source(stable, 'www'), 'only Nightly')
+            for value in (b'0.0.1', b'0.0.1-rc.1'):
+                ordinary_channel = commit_files({path: content.replace(plan.versions['cli'].encode(), value)
+                                                 for path, content in contents.items()})
+                rejected(lambda: release.validate_source(ordinary_channel, 'product'), 'only Nightly')
+            git('tag', 'v' + plan.versions['cli'], head)
+            # A new business parent still starts with main's old build values; the prior tag supplies the upper bounds.
+            next_plan = plan_versions('2026110604', advanced, ['v' + plan.versions['cli']], '43', head)
+            assert next_plan.android_code == 250003 and next_plan.ios_build_number == '5'
+            next_head = commit_files({}, next_plan)
+            assert release.validate_source(next_head, 'product')['ci_source_commit'] == advanced
+            assert recovered_plan(next_head).previous == head
+            legacy_tag = 'v0.0.1-nightly.20261016.1'
+            current_tag = 'v' + plan.versions['cli']
+            git('merge-base', '--is-ancestor', legacy, 'origin/main')
+            for tags in ([legacy_tag, current_tag], [current_tag, legacy_tag]):
+                assert [source for _, source, _ in trusted_nightlies(tags, plan.batch)] == [head]
+            rejected(lambda: trusted_nightlies(['v0.0.1-nightly.20261016.2'], plan.batch), 'invalid immutable source')
+            with patch('release.validate_source', side_effect=subprocess.CalledProcessError(1, ['cargo', 'metadata'])):
+                try:
+                    trusted_nightlies([current_tag], plan.batch)
+                except subprocess.CalledProcessError as error:
+                    assert error.cmd == ['cargo', 'metadata']
+                else:
+                    raise AssertionError('candidate filtering swallowed a metadata environment failure')
+            rollback_plan = plan_versions('2026110608', base, ['v' + next_plan.versions['cli']], '44', next_head)
+            rollback = commit_files({}, rollback_plan)
+            for _ in range(2):
+                rejected(lambda: release.validate_source(rollback, 'product'), 'previous Nightly main source must be an ancestor')
+            nested_plan = plan_versions('2026110612', advanced, ['v' + rollback_plan.versions['cli']], '45', rollback)
+            nested = commit_files({}, nested_plan)
+            rejected(lambda: release.validate_source(nested, 'product'), 'previous Nightly main source must be an ancestor')
+            future_main_plan = plan_versions('2026110608', base, [current_tag], '44', advanced)
+            future_main = commit_files({}, future_main_plan)
+            rejected(lambda: release.validate_source(future_main, 'product'), 'previous Nightly main source must be an ancestor')
+            # Numeric CFBundleVersion ordering must select 3.1.10 rather than 3.1.9.
+            with patch('nightly_source.blob', side_effect=lambda commit, path: json.dumps({'expo': {
+                    'android': {'versionCode': 9 if commit == base else 10},
+                    'ios': {'buildNumber': '3.1.9' if commit == base else '3.1.10'}}}).encode()):
+                assert next_build_numbers(base, head) == (11, '3.1.11')
+            with patch('nightly_source.blob', side_effect=lambda commit, path: json.dumps({'expo': {
+                    'android': {'versionCode': 10}, 'ios': {'buildNumber': '4' if commit == base else '3.99'}}}).encode()):
+                assert next_build_numbers(base, head) == (11, '5')
+            rejected(lambda: plan_versions('2026110400', base, [], '42'), 'current cli version')
+
+            # Recovery never allocates a new version or switches to the newly advanced main.
+            remote_tags = f'{head}\trefs/tags/v{plan.versions["cli"]}'
             real_git = git
-
             def fixture_git(*args, **kwargs):
-                return '' if args[0] == 'fetch' else real_git(*args, **kwargs)
-
-            def pr_api(path, method='GET', data=None, pat=False, missing=False):
-                if method == 'POST':
-                    assert path == 'pulls' and pat
-                    assert data['head'] == plan.branch and data['base'] == 'main' and data['title'] == pr['title']
-                    writes.append((path, method, data)); state['pr'] = dict(pr)
-                    raise ValueError('PR created but response lost')
-                if method == 'PUT':
-                    assert path == 'pulls/17/merge' and pat and data == dict(sha=head, merge_method='squash')
-                    assert state['merge_checks'] >= 2
-                    writes.append((path, method, data))
-                    state['pr'] = dict(pr, merged=True, state='closed', merge_commit_sha=merged)
-                    real_git('update-ref', 'refs/remotes/origin/main', merged)
-                    raise ValueError('merge completed but response lost')
-                assert path == 'pulls/17'
-                if not state['pr'].get('merged'):
-                    state['merge_checks'] += 1
-                    if state['merge_checks'] == 1:
-                        return dict(state['pr'], mergeable=None)
-                return state['pr']
-
-            with patch(f'{__name__}.api', side_effect=pr_api), patch(f'{__name__}.daily_pr', side_effect=lambda branch: state['pr']), \
-                    patch(f'{__name__}.git', side_effect=fixture_git):
-                created = create_pr(plan, head, 'nightly-owner')
-                assert merge_pr(created, plan, head, 'nightly-owner') == merged
-                assert len(writes) == 2
-                assert merge_pr(state['pr'], plan, head, 'nightly-owner') == merged and len(writes) == 2
-                with patch(f'{__name__}.branch_sha', return_value=head), patch(f'{__name__}.plan_versions', side_effect=AssertionError('same-batch reallocation')):
-                    assert ensure_landed(plan.batch, 'nightly-owner') == (plan, merged, 17)
-                rejected(lambda: validate_pr(dict(pr, user=dict(login='outsider')), plan, head, 'nightly-owner'), 'identity')
-            next_batch = plan_versions('2026110604', merged, [])
-            assert next_batch.day == plan.day and next_batch.branch != plan.branch
-            assert next_batch.versions['cli'] == '0.0.1-nightly.20261106.9'
-            assert next_batch.versions['www'] == '0.0.1-nightly.20261106.2'
-            assert next_batch.android_code == plan.android_code + 1
-            assert next_batch.ios_build_number == '5'
-            new_remote = {}
-            def next_batch_git(*args, **kwargs):
-                if args[0] in ('fetch', 'ls-remote'):
+                if args[0] == 'fetch':
                     return ''
-                if args[0] == 'push':
-                    pushed, ref = args[2].split(':')
-                    assert ref == 'refs/heads/' + next_batch.branch
-                    new_remote['head'] = pushed
-                    return ''
+                if args[0] == 'ls-remote':
+                    return remote_tags
                 return real_git(*args, **kwargs)
-            with patch(f'{__name__}.git', side_effect=next_batch_git), \
-                    patch(f'{__name__}.daily_pr', side_effect=lambda branch: state['pr'] if branch == plan.branch else None) as lookup, \
-                    patch(f'{__name__}.branch_sha', side_effect=lambda branch: new_remote.get('head')), \
-                    patch(f'{__name__}.create_pr', return_value=dict(number=18)) as new_pr, \
-                    patch(f'{__name__}.merge_pr', side_effect=lambda pr, plan, head, login: head):
-                allocated, next_head, number = ensure_landed(next_batch.batch, 'nightly-owner')
-                assert allocated == next_batch and number == 18
-                lookup.assert_called_once_with(next_batch.branch)
-                new_pr.assert_called_once_with(next_batch, next_head, 'nightly-owner')
-            assert recovered_plan(next_batch.batch, next_head) == next_batch
-            verify_tree(next_batch, next_head)
-            next_day = plan_versions('2026110700', next_head, [])
-            pv = next_day.versions['cli']
-            assert pv == '0.0.1-nightly.20261107.1' and all(next_day.versions[a] == pv for a in PRODUCT_APPS)
-            assert next_day.versions['www'] == '0.0.1-nightly.20261107.1'
-            assert next_day.android_code == next_batch.android_code + 1
-            assert next_day.ios_build_number == '6'
-            future_main = git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
-                              'commit-tree', expected_tree(next_day), '-p', next_head, '-m', 'next-day main fixture')
-            git('update-ref', 'refs/remotes/origin/main', future_main)
-            with patch(f'{__name__}.git', side_effect=next_batch_git), patch(f'{__name__}.daily_pr', return_value=None), \
-                    patch(f'{__name__}.branch_sha', return_value=None), patch(f'{__name__}.api') as no_write, \
-                    patch(f'{__name__}.checkout', side_effect=AssertionError('stale batch generated a branch')) as no_checkout:
-                rejected(lambda: ensure_landed('2026110620', 'nightly-owner'), 'current cli version')
-                no_checkout.assert_not_called()
-                no_write.assert_not_called()
-            newer_www = versions_at(next_head)
-            newer_www['www'] = next_day.versions['www']
-            with patch(f'{__name__}.versions_at', return_value=newer_www):
-                rejected(lambda: plan_versions('2026110620', next_head, []), 'current www version')
-            with patch(f'{__name__}.git', side_effect=fixture_git), patch(f'{__name__}.daily_pr', return_value=state['pr']), \
-                    patch(f'{__name__}.branch_sha', return_value=head), \
+            with patch(f'{__name__}.git', side_effect=fixture_git), patch(f'{__name__}.completed_source', return_value=False), \
+                    patch(f'{__name__}.plan_versions', side_effect=AssertionError('original source reallocated')):
+                assert ensure_source(plan.batch, base, 42) == (head, False)
+                assert ensure_source('2026110604', base, 43) == (head, False)
+                rejected(lambda: ensure_source(plan.batch, advanced, 42), 'original schedule source')
+            with patch(f'{__name__}.git', side_effect=fixture_git), patch(f'{__name__}.completed_source', return_value=True), \
+                    patch(f'{__name__}.plan_versions', side_effect=AssertionError('unchanged main reallocated')):
+                assert ensure_source('2026110604', base, 43) == (head, True)
+            git('tag', 'www-v' + plan.versions['www'], head)
+            saved_tags = remote_tags
+            remote_tags = f'{head}\trefs/tags/www-v{plan.versions["www"]}'
+            with patch(f'{__name__}.git', side_effect=fixture_git), patch(f'{__name__}.completed_source', return_value=False), \
+                    patch(f'{__name__}.plan_versions', side_effect=AssertionError('WWW-only source reallocated')):
+                assert ensure_source('2026110604', advanced, 43) == (head, False)
+            remote_tags = saved_tags
+            git('tag', 'v' + next_plan.versions['cli'], next_head)
+            remote_tags += f'\n{next_head}\trefs/tags/v{next_plan.versions["cli"]}'
+            with patch(f'{__name__}.git', side_effect=fixture_git), patch(f'{__name__}.completed_source', return_value=True), \
+                    patch(f'{__name__}.plan_versions', side_effect=AssertionError('stale batch allocated a new version')):
+                rejected(lambda: ensure_source('2026110504', advanced, 44), 'predates the previous Nightly')
+                rejected(lambda: ensure_source('2026110608', base, 44), 'predates the previous main source')
+            with patch(f'{__name__}.git', side_effect=fixture_git), patch(f'{__name__}.completed_source', return_value=False), \
                     patch(f'{__name__}.plan_versions', side_effect=AssertionError('old batch was reallocated')):
-                assert ensure_landed(plan.batch, 'nightly-owner') == (plan, merged, 17)
-            git('update-ref', 'refs/remotes/origin/main', merged)
-
-            good = dict(id=1, run_attempt=1, head_sha=merged, head_branch='main', event='push', path=CI,
+                assert ensure_source(plan.batch, base, 42) == (head, False)
+            remote_tags = saved_tags
+            # The same shared source rule runs at the real plan and publisher boundaries.
+            git('checkout', '--detach', '-q', head)
+            assert release.plan('product', tag='v' + plan.versions['cli'], require_main=True, publishing=True)['ci_source_commit'] == base
+            release.require_product_publishing()
+            bad = commit_files({'apps/app/package.json': contents['apps/app/package.json'].replace(b'"private": true', b'"private": false')})
+            git('update-ref', 'refs/tags/v' + plan.versions['cli'], bad)
+            remote_tags = f'{bad}\trefs/tags/v{plan.versions["cli"]}'
+            with patch(f'{__name__}.git', side_effect=fixture_git), \
+                    patch(f'{__name__}.plan_versions', side_effect=AssertionError('conflicting tag allocated a new version')):
+                rejected(lambda: ensure_source(plan.batch, base, 42), 'invalid immutable source')
+            remote_tags = saved_tags
+            rejected(lambda: release.plan('product', require_main=True), 'mechanical')
+            rejected(release.require_product_publishing, 'mechanical')
+            with patch('release.verify_release', return_value=release.identity('product')), patch('release.release_view', side_effect=AssertionError('untrusted publication wrote remotely')):
+                rejected(lambda: release.publish('product', root), 'mechanical')
+            git('update-ref', 'refs/tags/v' + plan.versions['cli'], head)
+            remote_tags = ''
+            with patch(f'{__name__}.git', side_effect=fixture_git):
+                pinned_source, complete = ensure_source('2026110600', base, 42)
+            assert not complete and recovered_plan(pinned_source).base == base
+            assert git('ls-tree', pinned_source, '--', 'business.txt') == ''
+            remote_tags = saved_tags
+            good = dict(id=1, run_attempt=1, head_sha=head, head_branch='main', event='push', path=CI,
                         repository=dict(full_name=REPO), head_repository=dict(full_name=REPO),
                         status='completed', conclusion='success', html_url='https://example.invalid/main-ci')
-            with patch(f'{__name__}.pages', return_value=[good]):
-                assert wait_main_ci(merged, time.monotonic() + 1)['id'] == 1
-            for change in ({'head_sha': 'b' * 40}, {'event': 'workflow_dispatch'}, {'head_branch': 'feature'}, {'path': RELEASE},
-                           {'status': 'in_progress', 'conclusion': None}, {'conclusion': 'failure'}):
-                with patch(f'{__name__}.pages', return_value=[dict(good, **change)]), \
-                        patch(f'{__name__}.time.monotonic', side_effect=[0, 1]), patch(f'{__name__}.api') as no_write:
-                    rejected(lambda: wait_main_ci(merged, 0.5))
-                    no_write.assert_not_called()
-            cancelled = {'run': dict(good, conclusion='cancelled')}; writes = []
-            def cancelled_api(path, method='GET', **kwargs):
-                if method == 'POST':
-                    writes.append(path); cancelled['run'] = dict(good, run_attempt=2)
-                    raise ValueError('CI recovery response lost')
-                return cancelled['run']
-            with patch(f'{__name__}.pages', side_effect=lambda *args: [cancelled['run']]), \
-                    patch(f'{__name__}.api', side_effect=cancelled_api):
-                assert wait_main_ci(merged, time.monotonic() + 1)['run_attempt'] == 2
-                assert writes == ['actions/runs/1/rerun']
+            schedule = dict(good, id=42, event='schedule', head_sha=base, created_at='2026-11-06T00:23:00Z',
+                            status='in_progress', conclusion=None, path=NIGHTLY)
+            ci_context = dict(ci_source_commit=base, ci_run_id='42', nightly_batch=plan.batch)
+            jobs = [dict(name='Nightly validation gate', status='completed', conclusion='success')]
+            original_run = release.run
+            def ci_api(*args, **kwargs):
+                if args[0] == 'git':
+                    return original_run(*args, **kwargs)
+                return json.dumps([dict(jobs=jobs)] if args[-1].endswith('per_page=100') else schedule)
+            with patch('release.run', side_effect=ci_api):
+                assert release.require_ci(ci_context)['id'] == 42
+                for change in ({'id': 43}, {'head_sha': advanced}, {'event': 'workflow_dispatch'}, {'head_branch': 'feature'},
+                               {'path': RELEASE}, {'repository': dict(full_name='other/repo')},
+                               {'head_repository': dict(full_name='other/repo')}, {'created_at': '2026-11-06T04:23:00Z'}):
+                    with patch.dict(schedule, change):
+                        rejected(lambda: release.require_ci(ci_context))
+                for job_list in ([], [dict(jobs[0], conclusion='failure')], [dict(jobs[0], conclusion='skipped')],
+                                 [dict(jobs[0], status='in_progress')], [dict(name=jobs[0]['name'])], jobs * 2,
+                                 [dict(jobs[0], name='checks / Nightly validation gate')]):
+                    with patch('release.run', side_effect=lambda *args, **kwargs: original_run(*args, **kwargs) if args[0] == 'git'
+                               else json.dumps([dict(jobs=job_list)] if args[-1].endswith('per_page=100') else schedule)):
+                        rejected(lambda: release.require_ci(ci_context), 'Nightly validation gate')
+                for pinned, path, gate in ((old_base, CI, 'ci-gate'), (base, NIGHTLY, 'Nightly validation gate')):
+                    pinned_context = dict(ci_context, ci_source_commit=pinned)
+                    pinned_run = dict(schedule, head_sha=pinned, path=path)
+                    for crossed_path in (CI, NIGHTLY):
+                        for crossed_gate in ('ci-gate', 'Nightly validation gate'):
+                            def pinned_api(*args, **kwargs):
+                                if args[0] == 'git':
+                                    return original_run(*args, **kwargs)
+                                return json.dumps([dict(jobs=[dict(jobs[0], name=crossed_gate)])]
+                                                  if args[-1].endswith('per_page=100') else dict(pinned_run, path=crossed_path))
+                            with patch('release.run', side_effect=pinned_api):
+                                if crossed_path == path and crossed_gate == gate:
+                                    assert release.require_ci(pinned_context)['head_sha'] == pinned
+                                else:
+                                    rejected(lambda: release.require_ci(pinned_context))
+            assert release.release_workflow(old_base, 'product') == (RELEASE, dict(app='product'))
+            assert release.release_workflow(old_base, 'www') == (RELEASE, dict(app='www'))
+            assert release.release_workflow(base, 'product') == (RELEASE, {})
+            assert release.release_workflow(base, 'www') == ('.github/workflows/release-www.yml', {})
+            for pinned in (old_base, base):
+                for app in RELEASES:
+                    workflow, extra = release.release_workflow(pinned, app)
+                    dispatch_tag = ('www-v' if app == 'www' else 'v') + '0.0.1-nightly.20261106.1'
+                    dispatched = []; discovered = []
+                    expected_run = dict(good, head_sha=pinned, path=workflow, head_branch=dispatch_tag,
+                                        event='workflow_dispatch')
+                    def dispatch_api(path, method='GET', data=None):
+                        assert path == 'actions/workflows/' + workflow.split('/')[-1] + '/dispatches'
+                        assert method == 'POST' and data == dict(ref=dispatch_tag, inputs=dict(extra, tag=dispatch_tag, publish='true'))
+                        dispatched.append(data)
+                        discovered.append(expected_run)
+                        raise ValueError('dispatch accepted but response lost')
+                    def dispatch_pages(path, key=None):
+                        assert path == ('actions/workflows/' + workflow.split('/')[-1] + '/runs?head_sha='
+                                        + pinned + '&branch=' + quote(dispatch_tag, safe=''))
+                        assert key == 'workflow_runs'
+                        return discovered
+                    with patch(f'{__name__}.api', side_effect=dispatch_api), patch(f'{__name__}.pages', side_effect=dispatch_pages), \
+                            patch(f'{__name__}.ensure_tag'), patch(f'{__name__}.release_state', return_value=None), \
+                            patch(f'{__name__}.release_dispatch_tag', return_value=dispatch_tag):
+                        assert start_release(app, pinned) == [expected_run]
+                        assert start_release(app, pinned) == [expected_run] and len(dispatched) == 1
+                        # Even a response from the selected endpoint must match its exact source-era path.
+                        for wrong in (dict(expected_run, path=CI), dict(expected_run, head_sha=advanced),
+                                      dict(expected_run, event='schedule'), dict(expected_run, head_branch='main')):
+                            discovered[:] = [wrong]
+                            assert matching_runs(workflow, pinned, dispatch_tag, {'push', 'workflow_dispatch'}) == []
+            rejected(lambda: release.nightly_ci_identity(legacy), 'missing Core CI')
+            rejected(lambda: release.nightly_ci_identity('HEAD'), 'invalid workflow source')
+            rejected(lambda: release.nightly_ci_identity(base[:12]), 'invalid workflow source')
+            workflow_blob = git('rev-parse', base + ':' + CI)
+            malformed_workflows = git('mktree', data=(f'100644 blob {workflow_blob}\tci.yml\n'
+                f'120000 blob {workflow_blob}\tnightly.yml\n100644 blob {workflow_blob}\trelease.yml\n').encode())
+            malformed_github = git('mktree', data=f'040000 tree {malformed_workflows}\tworkflows\n'.encode())
+            malformed_tree = git('mktree', data=f'040000 tree {malformed_github}\t.github\n'.encode())
+            malformed_source = git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
+                                   'commit-tree', malformed_tree, '-m', 'malformed workflow tree fixture')
+            rejected(lambda: release.nightly_ci_identity(malformed_source), 'malformed workflow source tree')
+            rejected(lambda: release.release_workflow(malformed_source, 'www'), 'malformed workflow source tree')
+            with patch('release.run', return_value=json.dumps([dict(workflow_runs=[dict(good, head_sha=base)])])):
+                assert release.require_ci(dict(ci_source_commit=base, ci_run_id='', nightly_batch=''))['id'] == 1
+                for change in ({'event': 'schedule'}, {'head_sha': advanced}, {'path': RELEASE}, {'path': NIGHTLY},
+                               {'status': 'in_progress'}, {'conclusion': 'failure'}):
+                    with patch('release.run', return_value=json.dumps([dict(workflow_runs=[dict(good, **({'head_sha': base} | change))])])):
+                        rejected(lambda: release.require_ci(dict(ci_source_commit=base, ci_run_id='', nightly_batch='')))
+            with patch(f'{__name__}.tag_sha', return_value=head), patch(f'{__name__}.release_state', return_value=dict(draft=False)), \
+                    patch(f'{__name__}.matching_runs', return_value=[good]), patch('release.verify_public') as verify_public:
+                for state in ('success', 'failure', 'skipped'):
+                    with patch(f'{__name__}.pages', return_value=[dict(name='npm / npm', status='completed', conclusion=state)]):
+                        assert completed_source(head) == (state == 'success')
+                assert verify_public.call_count == 2
+                with patch(f'{__name__}.pages', return_value=[]):
+                    assert not completed_source(head)
+                with patch(f'{__name__}.tag_sha', return_value=None):
+                    assert not completed_source(head)
+            with patch(f'{__name__}.tag_sha', return_value=base), patch(f'{__name__}.release_state', return_value=dict(draft=False)), \
+                    patch(f'{__name__}.matching_runs', return_value=[good]), patch(f'{__name__}.npm_complete', return_value=True), \
+                    patch('release.verify_public') as verified:
+                assert completed_source(base)
+                assert verified.call_count == 1 and verified.call_args.args[0] == 'product'
+            merged = head
+            git('checkout', '--detach', '-q', advanced)
 
             assert release_dispatch_tag('product') == 'v0.0.1-nightly.20261105.2'
             assert release_dispatch_tag('www') == 'www-v0.0.1'
@@ -881,11 +1028,9 @@ def self_test():
             def release_api(path, method='GET', data=None, **kwargs):
                 if method != 'GET':
                     writes.append((path, method, data))
-                    if path == 'git/refs':
-                        remote['tag'] = data['sha']
-                    elif path.endswith('/dispatches'):
+                    if path.endswith('/dispatches'):
                         # A real daily release must request publication, not a build-only dry run.
-                        assert data == dict(ref=tag, inputs=dict(app='product', tag=tag, publish='true'))
+                        assert data == dict(ref=tag, inputs=dict(tag=tag, publish='true'))
                         remote['runs'] = [dict(good, head_branch=tag, event='workflow_dispatch', path=RELEASE)]
                     else:
                         raise AssertionError('unexpected write')
@@ -895,7 +1040,12 @@ def self_test():
                 assert path.startswith('releases/tags/')
                 return dict(draft=False) if remote['public'] else None
 
-            with patch(f'{__name__}.api', side_effect=release_api), \
+            def tag_push(*args, **kwargs):
+                assert args == ('push', 'origin', merged + ':refs/tags/' + tag)
+                writes.append(('tag-push', 'git', args)); remote['tag'] = merged
+                raise subprocess.CalledProcessError(1, ['git', 'push'])
+
+            with patch(f'{__name__}.api', side_effect=release_api), patch(f'{__name__}.git', side_effect=tag_push), \
                     patch(f'{__name__}.matching_runs', side_effect=lambda *args: remote['runs']), \
                     patch(f'{__name__}.release_dispatch_tag', return_value=tag):
                 ensure_tag(tag, merged); ensure_tag(tag, merged)
@@ -942,6 +1092,9 @@ def self_test():
                 assert recovered_ids[f'product-release-{merged}-'] == 51 + product_prefixes.index(f'product-release-{merged}-')
                 assert recover_publisher('product', failing, merged)['run_attempt'] == 2
                 assert writes == ['actions/runs/1/rerun-failed-jobs']
+                with patch.dict(failing, {'run_attempt': MAX_PUBLISHER_ATTEMPTS}):
+                    rejected(lambda: recover_publisher('product', failing, merged), 'attempt limit')
+                assert writes == ['actions/runs/1/rerun-failed-jobs']
                 for artifacts in ([], good_artifacts[:-1],
                                   [dict(item, name=(item['name'][:-1] + '2') if item['name'].startswith(f'npm-package-{merged}-') else item['name']) for item in good_artifacts],
                                   [dict(item, expired=True) if item['name'].startswith(f'npm-package-{merged}-') else item for item in good_artifacts],
@@ -969,7 +1122,7 @@ def self_test():
                 rejected(lambda: recover_publisher('mobile', failing, merged), 'product and www')
                 assert len(writes) == 1 + len(product_publishers)
 
-            with patch(f'{__name__}.tag_sha', return_value=merged), patch(f'{__name__}.release_state', return_value=dict(draft=False)), \
+            with patch(f'{__name__}.npm_complete', return_value=True), patch(f'{__name__}.tag_sha', return_value=merged), patch(f'{__name__}.release_state', return_value=dict(draft=False)), \
                     patch('release.verify_public') as verified, patch(f'{__name__}.recover_publisher') as no_retry, \
                     patch(f'{__name__}.release_dispatch_tag', return_value='v' + plan.versions['cli']):
                 with patch(f'{__name__}.matching_runs', return_value=[]):
@@ -986,13 +1139,13 @@ def self_test():
                     assert finish_release('product', merged, time.monotonic() + 1)[0]['conclusion'] == 'success'
                 verified.assert_called_once()
 
-            with patch(f'{__name__}.tag_sha', return_value=merged), patch(f'{__name__}.release_state', return_value=dict(draft=False)), \
+            with patch(f'{__name__}.npm_complete', return_value=True), patch(f'{__name__}.tag_sha', return_value=merged), patch(f'{__name__}.release_state', return_value=dict(draft=False)), \
                     patch('release.verify_public', side_effect=ValueError('canonical completion manifest is missing')), \
                     patch(f'{__name__}.release_dispatch_tag', return_value='v' + plan.versions['cli']), \
                     patch(f'{__name__}.matching_runs', return_value=[good]):
                 rejected(lambda: finish_release('product', merged, time.monotonic() + 1), 'completion manifest is missing')
 
-            with patch(f'{__name__}.tag_sha', return_value=merged), patch(f'{__name__}.release_state', return_value=None), \
+            with patch(f'{__name__}.npm_complete', return_value=True), patch(f'{__name__}.tag_sha', return_value=merged), patch(f'{__name__}.release_state', return_value=None), \
                     patch('release.verify_public') as verified, patch(f'{__name__}.recover_publisher') as no_retry, \
                     patch(f'{__name__}.release_dispatch_tag', return_value='v' + plan.versions['cli']), \
                     patch(f'{__name__}.matching_runs', return_value=[failing]), patch(f'{__name__}.time.sleep'):
@@ -1034,34 +1187,199 @@ def self_test():
                 assert not any(t.startswith('mobile-v') or t.startswith('app-v') or t.startswith('core-v') for t in groups)
 
             environment = dict(GITHUB_REPOSITORY=REPO, GITHUB_EVENT_NAME='schedule', GITHUB_REF='refs/heads/main',
-                               GITHUB_RUN_ID='42', GITHUB_SHA=merged, NIGHTLY_RELEASE_TOKEN='fixture-only', GH_TOKEN='fixture-only')
-            original = dict(good, event='schedule', created_at='2026-11-06T00:23:00Z')
+                               GITHUB_RUN_ID='42', GITHUB_SHA=base, GH_TOKEN='fixture-only')
             observed_batches = []
-            def observe_batch(batch, login):
-                observed_batches.append(batch)
+            def observe_batch(batch, pinned, run_id):
+                observed_batches.append((batch, pinned, run_id))
                 raise ValueError('batch recovered from original run')
-            for now, attempt in ((datetime.datetime(2026, 11, 6, 23, tzinfo=datetime.timezone.utc), 1),
-                                 (datetime.datetime(2026, 11, 7, 12, tzinfo=datetime.timezone.utc), 2)):
-                original['run_attempt'] = attempt
-                with patch.dict(os.environ, environment), \
-                        patch(f'{__name__}.api', side_effect=lambda path, **kwargs: dict(login='owner') if path == '/user' else original), \
-                        patch(f'{__name__}.ensure_landed', side_effect=observe_batch), \
-                        patch(f'{__name__}.datetime.datetime', wraps=datetime.datetime) as clock:
-                    clock.now.return_value = now
+            for attempt in (1, 2):
+                schedule['run_attempt'] = attempt
+                with patch.dict(os.environ, environment), patch(f'{__name__}.api', return_value=schedule), \
+                        patch('release.require_ci', return_value=schedule), patch(f'{__name__}.ensure_source', side_effect=observe_batch):
                     rejected(lambda: run_daily(42), 'batch recovered')
-                    clock.now.assert_not_called()
-            assert observed_batches == ['2026110600', '2026110600']
-            for changes in ({'NIGHTLY_RELEASE_TOKEN': ''}, {'GITHUB_EVENT_NAME': 'workflow_dispatch'}):
+            assert observed_batches == [('2026110600', base, 42)] * 2
+            for changes in ({'GH_TOKEN': ''}, {'GITHUB_EVENT_NAME': 'workflow_dispatch'}):
                 with patch.dict(os.environ, dict(environment, **changes)), patch(f'{__name__}.api') as no_write:
                     rejected(lambda: run_daily(42))
                     no_write.assert_not_called()
 
-    workflow = (ROOT / CI).read_text()
+            # A complete public release is a bounded historical proof, not a self-reported manifest.
+            history = [head]
+            batch_time = datetime.datetime(2026, 11, 7, tzinfo=datetime.timezone.utc)
+            for index in range(nightly_source.MAX_HISTORY + 2):
+                candidate = plan_versions((batch_time + datetime.timedelta(hours=index * 4)).strftime('%Y%m%d%H'),
+                                          advanced, ['v' + versions_at(history[-1])['cli']], str(100 + index), history[-1])
+                history.append(commit_files({}, candidate))
+            anchor = history[-2]
+            anchor_plan = recovered_plan(anchor)
+            anchor_context = dict(ci_source_commit=advanced, ci_run_id=anchor_plan.run_id, nightly_batch=anchor_plan.batch)
+            anchor_tag = 'v' + anchor_plan.versions['cli']
+            anchor_run = dict(good, id=200, path=RELEASE, event='workflow_dispatch', head_branch=anchor_tag, head_sha=anchor)
+            manifest = dict(app='product', version=anchor_plan.versions['cli'], tag=anchor_tag,
+                            source_commit=anchor, channel='nightly', schema=release.SCHEMA_VERSION,
+                            assets=[dict(name=name, size=1, sha256='a' * 64)
+                                    for name in sorted(release.product_payload_names(anchor_plan.versions['cli']))])
+            public_state = dict(draft=False)
+            def refresh_assets():
+                import hashlib
+                data = (json.dumps(manifest) + '\n').encode()
+                public_state['assets'] = [dict(asset, digest='sha256:' + asset['sha256']) for asset in manifest['assets']]
+                public_state['assets'].append(dict(name='release.json', size=len(data),
+                                                   digest='sha256:' + hashlib.sha256(data).hexdigest()))
+                return data
+            manifest_bytes = refresh_assets()
+            anchor_jobs = [dict(name=name, status='completed', conclusion='success') for name in ('collect', 'publish-product')]
+            def anchor_api(path, missing=False):
+                if path.startswith('git/ref/tags/'):
+                    return dict(object=dict(type='commit', sha=anchor)) if path.endswith(anchor_tag) else None
+                if path.startswith('releases/tags/'):
+                    return public_state
+                if path.startswith('actions/workflows/'):
+                    return dict(total_count=1, workflow_runs=[anchor_run])
+                if path.startswith('actions/runs/'):
+                    return dict(total_count=len(anchor_jobs), jobs=anchor_jobs)
+                raise AssertionError(path)
+            real_subprocess_run = subprocess.run
+            downloads = []
+            def download_manifest(args, **kwargs):
+                if args[:3] == ['gh', 'release', 'download']:
+                    assert args[args.index('--pattern') + 1] == 'release.json'
+                    downloads.append(args[3])
+                    (Path(args[args.index('--dir') + 1]) / 'release.json').write_bytes(manifest_bytes)
+                    return subprocess.CompletedProcess(args, 0)
+                return real_subprocess_run(args, **kwargs)
+            with patch('nightly_source.github', side_effect=anchor_api), patch('release.require_ci', return_value=schedule), \
+                    patch('subprocess.run', side_effect=download_manifest):
+                assert real_anchor(anchor, anchor_plan, anchor_context)
+                for changes in ({'draft': True},):
+                    with patch.dict(public_state, changes):
+                        assert not real_anchor(anchor, anchor_plan, anchor_context)
+                for changes in ({'status': 'in_progress'}, {'conclusion': 'failure'}, {'head_sha': 'b' * 40},
+                                {'path': CI}, {'repository': dict(full_name='other/repo')}):
+                    with patch.dict(anchor_run, changes):
+                        assert not real_anchor(anchor, anchor_plan, anchor_context)
+                with patch('nightly_source.release_runs', return_value=[anchor_run, anchor_run]):
+                    assert not real_anchor(anchor, anchor_plan, anchor_context)
+                with patch.dict(anchor_jobs[0], {'conclusion': 'failure'}):
+                    rejected(lambda: real_anchor(anchor, anchor_plan, anchor_context), 'publisher')
+                with patch.dict(manifest, {'source_commit': 'b' * 40}):
+                    manifest_bytes = refresh_assets()
+                    rejected(lambda: real_anchor(anchor, anchor_plan, anchor_context), 'identity mismatch')
+                manifest_bytes = refresh_assets()
+                with patch.dict(public_state['assets'][0], {'digest': None}):
+                    rejected(lambda: real_anchor(anchor, anchor_plan, anchor_context), 'remote SHA-256')
+                nightly_source._verified_sources.clear()
+                with patch('nightly_source.complete_release_anchor', side_effect=real_anchor), \
+                        patch('nightly_source.metadata', wraps=metadata) as checks:
+                    assert release.validate_source(history[-1], 'product')['ci_source_commit'] == advanced
+                    assert checks.call_count == 2, 'history validation must stop at the directly previous complete release'
+                assert set(downloads) == {anchor_tag}, 'no historical payload was downloaded'
+            nightly_source._verified_sources.clear()
+            rejected(lambda: release.validate_source(history[-1], 'product'), 'fixed limit')
+
+            # Reviewed main declarations keep failures failed while several later batches advance.
+            reviewed_main = advanced
+            declarations = []; failed_sources = {}; associated_runs = {}
+            def review_abandonments(records):
+                nonlocal reviewed_main
+                git('checkout', '--detach', '-q', reviewed_main)
+                (root / nightly_source.ABANDONED).write_text(json.dumps(records, indent=2) + '\n')
+                git('add', nightly_source.ABANDONED)
+                git('-c', 'user.name=fixture-reviewer', '-c', 'user.email=reviewer@example.invalid',
+                    'commit', '-qm', 'record reviewed failed Nightly sources')
+                reviewed_main = git('rev-parse', 'HEAD')
+                git('update-ref', 'refs/remotes/origin/main', reviewed_main)
+            def failed_api(path, missing=False):
+                if path.startswith('git/ref/tags/'):
+                    tag = path.split('/')[-1]
+                    return dict(object=dict(type='commit', sha=failed_sources[tag])) if tag in failed_sources else None
+                if path.startswith('releases/tags/'):
+                    return None
+                if path.startswith('actions/workflows/'):
+                    tag = path.split('&branch=')[1].split('&')[0]
+                    runs = associated_runs.get(tag, [])
+                    return dict(total_count=len(runs), workflow_runs=runs)
+                if path.startswith('actions/runs/'):
+                    return dict(total_count=1, jobs=[dict(name='collect', status='completed', conclusion='failure')])
+                raise AssertionError(path)
+            failed_source = history[-1]
+            latest_batch = datetime.datetime.strptime(recovered_plan(failed_source).batch, '%Y%m%d%H')
+            with patch('nightly_source.github', side_effect=failed_api), patch('release.require_ci', return_value=schedule), \
+                    patch(f'{__name__}.completed_source', return_value=False), patch(f'{__name__}.git', side_effect=fixture_git):
+                for index in range(3):
+                    failed_plan = recovered_plan(failed_source)
+                    reason = ('original producer failed', 'duplicate original runs', 'original artifact expired')[index]
+                    record = dict(source_commit=failed_source, reason=reason + '; preserve its published evidence', releases={})
+                    for app in RELEASES:
+                        tag = release.release_tag_for(app, failed_plan.versions['cli' if app == 'product' else 'www'])
+                        run = dict(good, id=300 + index * 2 + len(record['releases']),
+                                   path=release.release_workflow(failed_source, app)[0],
+                                   event='workflow_dispatch', head_branch=tag, head_sha=failed_source, conclusion='failure')
+                        git('tag', tag, failed_source)
+                        failed_sources[tag] = failed_source
+                        associated_runs[tag] = [run]
+                        if index == 1 and app == 'product':
+                            associated_runs[tag].append(dict(run, id=run['id'] + 1000))
+                        record['releases'][app] = dict(tag=tag, run_ids=[item['id'] for item in associated_runs[tag]])
+                    declarations.append(record)
+                    review_abandonments(declarations)
+                    remote_tags = '\n'.join(source + '\trefs/tags/' + tag for tag, source in failed_sources.items())
+                    current_context = release.validate_source(failed_source, 'product')
+                    assert abandoned_source(failed_source, failed_plan, current_context)
+                    active_run = associated_runs[record['releases']['product']['tag']][0]
+                    with patch.dict(active_run, {'status': 'in_progress', 'conclusion': None}):
+                        rejected(lambda: abandoned_source(failed_source, failed_plan, current_context), 'active or unknown')
+                        with patch(f'{__name__}.plan_versions', side_effect=AssertionError('active source was skipped')):
+                            rejected(lambda: ensure_source((latest_batch + datetime.timedelta(hours=4)).strftime('%Y%m%d%H'),
+                                                           reviewed_main, 500 + index))
+                    with patch.dict(active_run, {'id': 999}):
+                        rejected(lambda: abandoned_source(failed_source, failed_plan, current_context), 'all associated')
+                    rejected(lambda: ensure_source(failed_plan.batch, failed_plan.base, failed_plan.run_id), 'explicitly abandoned')
+                    latest_batch += datetime.timedelta(hours=4)
+                    next_source, complete = ensure_source(latest_batch.strftime('%Y%m%d%H'), reviewed_main, 400 + index)
+                    next_plan = recovered_plan(next_source)
+                    assert not complete and next_plan.previous == failed_source
+                    assert nightly_order(next_plan.versions['cli']) > nightly_order(failed_plan.versions['cli'])
+                    assert next_plan.android_code > failed_plan.android_code
+                    assert nightly_source.ios_number(next_plan.ios_build_number) > nightly_source.ios_number(failed_plan.ios_build_number)
+                    failed_source = next_source
+                # Working-tree edits cannot authorize abandonment; a new main also invalidates cached declarations.
+                (root / nightly_source.ABANDONED).write_text('[]\n')
+                assert abandoned_source(declarations[-1]['source_commit'], recovered_plan(declarations[-1]['source_commit']),
+                                        release.validate_source(declarations[-1]['source_commit'], 'product'))
+                git('checkout', '--', nightly_source.ABANDONED)
+                review_abandonments([])
+                rejected(lambda: release.validate_source(failed_source, 'product'), 'fixed limit')
+            print('bounded Nightly history: two metadata checks and only the complete manifest downloaded; '
+                  'forged/partial/failed anchors refused; three reviewed producer/duplicate-run/artifact abandonments '
+                  'advanced versions and mobile builds; active/unknown runs and removed main declarations refused')
+
+    workflow = (ROOT / NIGHTLY).read_text()
     assert "cron: '23 */4 * * *'" in workflow and 'group: daily-nightly\n      cancel-in-progress: false' in workflow
     assert "if: ${{ !cancelled() && github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.ci-gate.result == 'success' }}" in workflow
     npm = (ROOT / '.github/workflows/npm-publish.yml').read_text()
     assert 'id-token: write' in npm and 'environment: npm-release' in npm and 'default: false' in npm
     assert 'NPM_TOKEN' not in npm and 'secrets.' not in npm
+    nightly_job = workflow.split('  daily-nightly:', 1)[1]
+    assert 'NIGHTLY_RELEASE_TOKEN' not in nightly_job and 'pull-requests:' not in nightly_job
+    assert 'name: Release / Nightly\n' in workflow and 'run-name:' in workflow
+    checks_job = workflow.split('  checks:', 1)[1].split('  ci-gate:', 1)[0]
+    assert 'secrets: inherit' in checks_job, 'Nightly Core checks require the existing platform signing identities'
+    assert 'uses: ./.github/workflows/ci.yml' in checks_job and 'package_policy:' not in checks_job
+    assert workflow.count('uses: ./.github/workflows/ci.yml') == 1
+    gate_job = workflow.split('  ci-gate:', 1)[1].split('  daily-nightly:', 1)[0]
+    assert 'name: Nightly validation gate\n' in gate_job and 'needs: [checks]' in gate_job
+    assert 'if: always()' in gate_job and 'checkout' not in gate_job
+    assert "set(checks) != {'checks'}" in gate_job and ".get('result') != 'success'" in gate_job
+    assert 'needs: [ci-gate]' in nightly_job and 'ref: ${{ github.sha }}' in nightly_job
+    import textwrap
+    gate_code = textwrap.dedent(gate_job.split("python3 - <<'PYTHON'\n", 1)[1].split('          PYTHON', 1)[0])
+    for result in ({'checks': {'result': 'success'}}, {'checks': {'result': 'failure'}},
+                   {'checks': {'result': 'cancelled'}}, {'checks': {'result': 'skipped'}},
+                   {'checks': {}}, {}, {'unexpected': {'result': 'success'}}):
+        tested = subprocess.run([sys.executable, '-c', gate_code], env=dict(os.environ, NIGHTLY_NEEDS=json.dumps(result)),
+                                capture_output=True, text=True)
+        assert (tested.returncode == 0) == (result == {'checks': {'result': 'success'}})
     print('four-hour Nightly real-Git, batch identity, reconciliation and original-artifact self-tests passed')
 
 

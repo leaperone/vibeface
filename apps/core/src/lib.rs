@@ -2,8 +2,11 @@
 use anyhow::Context as _;
 pub mod agent_context;
 pub mod api;
+#[cfg(test)]
+mod cli_round_trip;
 pub mod client;
 pub mod config;
+mod config_edit;
 pub mod control;
 pub mod control_discovery;
 pub mod crypto;

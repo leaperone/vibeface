@@ -388,10 +388,15 @@ impl Delivery {
         self.with_store(|store| {
             let previous = store
                 .value("charity-receiving-current")?
+                .map(Zeroizing::new)
                 .map(|bytes| serde_json::from_slice::<ReceivingMaterial>(&bytes))
                 .transpose()?;
             if let Some(material) = &previous {
                 material.key.verify()?;
+                ensure!(
+                    material.key.receiver_peer == self.identity.device_id()?,
+                    "charity receiving key belongs to another Node; restore the original Node identity and delivery backup"
+                );
                 ensure!(
                     receiving_public(&material.secret)? == parse_word(&material.key.public_key)?,
                     "stored charity receiving material is inconsistent"
@@ -485,6 +490,22 @@ impl Delivery {
 
     pub(super) fn charity_get(&self, network: &str, id: &str) -> Result<DeliveryOrder> {
         Ok(self.charity_scoped(network, id)?.view)
+    }
+
+    pub(super) fn charity_client_receipt(&self, network: &str, id: &str) -> Result<Value> {
+        let stored = self.charity_scoped(network, id)?;
+        Ok(json!({
+            "receipt": {
+                "network_id": network,
+                "node_id": self.identity.device_id()?,
+                "order_id": stored.view.order_id,
+                "intent_id": stored.view.intent_id,
+                "authorized_by": stored.authorized_by,
+                "confirmed": stored.confirmed,
+                "accepted": stored.accepted,
+            },
+            "order": stored.view,
+        }))
     }
 
     pub(super) fn charity_find_intent(
@@ -872,6 +893,10 @@ impl Delivery {
                         return Ok(());
                     }
                 }
+                ensure!(
+                    now() <= stored.order.terms.retain_until,
+                    "charity delivery expired without a receipt"
+                );
                 if !stored.notified {
                     self.charity_authorized(stored).await?;
                     charity_request(
@@ -1221,27 +1246,12 @@ impl Delivery {
                         save_record(store, &mut stored)?;
                         stored
                     };
-                    for spec in &stored.order.windows {
-                        store.reserve_object(
-                            &stored.view.order_id,
-                            spec.index,
-                            "ciphertext",
-                            &hex::encode(spec.ciphertext_hash),
-                            spec.ciphertext_bytes,
-                        )?;
-                        store.reserve_object(
-                            &stored.view.order_id,
-                            spec.index,
-                            "capsule",
-                            &hex::encode(spec.capsule_hash),
-                            80,
-                        )?;
-                    }
                     snapshot(&stored)
                 })
             }
             Request::Offer { order } => {
                 order.verify()?;
+                order.terms.active_offer(now())?;
                 ensure!(
                     order.terms.receiver_peer == self.identity.device_id()?
                         && order.terms.source_peer == remote,
@@ -1467,6 +1477,7 @@ fn save_record(store: &mut ServiceStore, stored: &mut StoredCharity) -> Result<(
         stored.network.as_deref(),
         &intent,
         &serde_json::to_string(stored)?,
+        &stored.order.windows,
     )
 }
 

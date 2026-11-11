@@ -30,7 +30,7 @@ Core 默认只接受配置允许的网页来源。独立 App 的 HTTPS origin �
 
 本地完整发行包把静态文件放在两个二进制文件旁边的 `web/`。Core 直接读取该目录；源码运行时可用 `VIBEFACE_APP_DIR` 指定同提交生成的 `apps/app/dist/client`。这只是选择文件位置，App 仍不包含或启动 Core。
 
-公共节点是不加入个人网络的 Core 配置，按配置提供发现服务、relay 和浏览器转发，不提供用户的执行环境，见[从外网访问](node.md#从外网访问)和[运行公共发现服务](node.md#运行公共发现服务)。`www.vibeface.dev` 的门户部署不等于独立 App 或公共节点已经部署。
+公共节点是不加入个人网络的 Core 配置，按配置提供 relay 和浏览器转发，并在全网里宣告这些角色，不提供用户的执行环境，见[从外网访问](node.md#从外网访问)和[全网](node.md#全网)。`www.vibeface.dev` 的门户部署不等于独立 App 或公共节点已经部署。
 
 ## 指定数据目录
 
@@ -64,14 +64,14 @@ vibeface join '<加入链接>' --name '<设备显示名称>'
 
 - 默认 App Server 模式是 `spawn`，Node 使用 `<data-dir>/providers/codex` 作为 `CODEX_HOME`，并在 `<data-dir>/providers/codex/sessions` 保存自己的会话。
 - Node 不扫描用户的会话或 control socket。只有明确选择 `system` 并填写绝对 socket 才连接外部 App Server。
-- 程序先查 PATH，再查用户安装、Homebrew、npm、Volta 和 NVM 目录。Cursor 使用官方 `agent` 或 `cursor-agent`。Codex 另查 `/Applications/Codex.app/Contents/Resources`。NVM 根取 `NVM_DIR`，默认 `~/.nvm`；Windows 使用 PATHEXT。
+- 程序先查 PATH，再查用户安装、Homebrew、npm、Bun、Volta 和 NVM 目录。Cursor 使用官方 `agent` 或 `cursor-agent`。Codex 另查 `/Applications/Codex.app/Contents/Resources`，Claude Code 另查 `~/.claude/local`，opencode 另查 `~/.opencode/bin`。NVM 根取 `NVM_DIR`，默认 `~/.nvm`；Windows 使用 PATHEXT。
 - npm wrapper 使用同一 `bin` 目录下的 Node。无保存程序或 PATH 且常见目录仍找不到时，仅查询登记登录 shell 的 PATH。
 
 已写下的程序路径、模型和用途不被替换。Node-owned Codex 运行目录由 Node 创建和维护，不从用户目录查找，也不在普通 Provider 环境变量中修改。
 
 启用 Node 独立 App Server 或自动接入 Codex，且私有 `config.toml` 尚不存在时，Node 从用户的 Codex 配置中初始化当前选中的模型、Provider 地址和认证环境变量名称。已有私有配置保持不变。配置投影不复制登录文件、密钥、固定认证请求头、会话、hooks、MCP 或项目信任设置。
 
-启动已启用服务、开启用途及自动接入时，Node 只补该服务实际需要的认证变量。已有私有值优先，其次是 Node 继承环境，最后按需读取操作系统登记的 `zsh`、`bash` 或 `sh` 交互登录环境。只查询缺少的名称，使用 Node 的 `HOME`；不继承 `ZDOTDIR`，不保存整个 shell 环境。补入的值只写当前 Node 的私有 `provider-env.json`，不会跟随来源自动更新。本次明确填写或删除的变量不被补回；删除仍表示移除私有覆盖，后续接入或重启可以再次补缺。
+启动已启用服务、开启用途及自动接入时，Node 只补该服务实际需要的认证变量。已有私有值优先，其次是 Node 继承环境，最后按需读取操作系统登记的 `zsh`、`bash` 或 `sh` 交互登录环境。只查询缺少的名称，使用 Node 的 `HOME`；不继承 `ZDOTDIR`，不保存整个 shell 环境。补入的值只写进当前 Node 私有 `config.json` 的 `provider_env`，与其余配置同一次原子保存，不会跟随来源自动更新。本次明确填写或删除的变量不被补回；删除仍表示移除私有覆盖，后续接入或重启可以再次补缺。
 
 登录 shell 有执行用户启动脚本的副作用，只在存在变量缺口时运行，并限制输出和时限、回收子进程。无可复用变量时显示缺失；读取异常时按钮报告失败，启动只记录固定告警并继续上线。新配置或变量等待活跃任务结束后切换并重新检查，不中断任务或重放历史。
 
@@ -104,7 +104,7 @@ Codex 命令设置 `<data-dir>/providers/codex` 的 `CODEX_HOME` 后执行 `code
 
 pi 的认证目录不变，只有 session 目录固定为 `<data-dir>/providers/pi/sessions`。OpenCode 的数据、配置、状态和缓存分别位于私有根的 `data`、`config`、`state` 和 `cache`，项目配置不会覆盖此运行配置。Codex system 模式共享明确指定的外部服务会话，使用该服务自身的登录入口。
 
-Cursor 使用官方 Agent CLI 的已有订阅登录，缺认证时提供 `agent login`，不要求 API key，也不自动打开浏览器。保存或继承的 API key/token 仍优先。检查先读官方 status JSON，再按需初始化私有空 ACP 会话取得模型目录，不发送模型提示。Node 设置私有 CURSOR_CONFIG_DIR 和 CURSOR_DATA_DIR，保持真实 HOME 供 CLI 读取认证。CLI 自身用户和项目资源仍按官方规则加载；Node 工具只取得当前 attempt 的作用域认证。
+Cursor 只使用官方 Agent CLI 的已有订阅登录，缺认证时提供所选 CLI 的 `login` 命令，不自动打开浏览器。网页进入 AI 设置或返回页面时自动接入并重新检查 Cursor，不开启用途。Node 忽略已有私有文件中的 Cursor API key/token 和 credential-store 覆盖，拒绝新设置，并在子进程边界清除这些覆盖。检查先读官方 status JSON，再按需初始化私有空 ACP 会话取得模型目录，不发送模型提示。Node 设置私有 CURSOR_CONFIG_DIR 和 CURSOR_DATA_DIR，保持真实 HOME 供 CLI 读取认证。CLI 自身用户和项目资源仍按官方规则加载；Node 工具只取得当前 attempt 的作用域认证。
 
 ## 配置会话扫描和 hooks
 
@@ -135,7 +135,7 @@ vibeface hooks status [--home '<同一个目录>']
 
 公网部署使用 HTTPS 反向代理，将网页和 WebSocket 请求转发到配置的回环监听地址。域名、证书、防火墙和 relay 地址都属于部署配置。具体角色配置见 [从外网访问](node.md#从外网访问)。
 
-官方拓扑只有两部分：`app.vibeface.dev` 是静态网页，不转发接口；公共节点 `node.vibeface.dev` 是指向 `8.217.72.118` 的 DNS-only A 记录，不经代理，提供 UDP 发现服务、开放 Relay 和浏览器接入 `https://node.vibeface.dev:4792`，网页的 `/api/client`、`/api/info` 和 `/api/decision` 直接连它，证书是宿主 acme.sh 续期的 Let's Encrypt 域名证书。自建节点可以不用域名，按纯 IP `https://<IP>:4792` 直连，配 Let's Encrypt 短期 IP 证书。公共节点的设备编号、地址和 `gateway_url` 只在 `config/public-bootstrap.json` 定义一次，Core 编入同一文件，网页和 App 构建时导入它：官方页面与手机、桌面 App 以 `gateway_url` 为默认接入地址，由 Node 提供的页面用该页面自己的 origin，用户可在设置里改。自建发现服务和公共节点使用各自明确配置的地址与身份。
+官方拓扑只有两部分：`app.vibeface.dev` 是静态网页，不转发接口；公共节点 `node.vibeface.dev` 是指向 `84.54.3.78` 的 DNS-only A 记录，不经代理，是全网的默认 bootstrap 节点（UDP 4792），提供开放 Relay 和浏览器接入 `https://node.vibeface.dev:4792`，网页的 `/api/client`、`/api/info` 和 `/api/decision` 直接连它，证书是宿主 acme.sh 续期的 Let's Encrypt 域名证书。自建节点可以不用域名，按纯 IP `https://<IP>:4792` 直连，配 Let's Encrypt 短期 IP 证书。公共节点的设备编号、UDP 地址、`relay_url` 和 `gateway_url` 写在 `config/public-bootstrap.json`：Core 编入这个文件，只用设备编号、UDP 地址和 `relay_url` 生成默认 bootstrap 节点；网页和 App 构建时经 `packages/client` 导入它，只用 `gateway_url`；部署 guard 用它核对公共节点的设备编号和 `public_url`。`deploy/README.md` 的初始化命令要写同样的地址。官方页面与手机、桌面 App 以 `gateway_url` 为默认接入地址，由 Node 提供的页面用该页面自己的 origin，用户可在设置里改。自建公共节点使用各自明确配置的地址与身份，个人 Node 可用 `--bootstrap` 经它入网。
 
 
 ## 安装程序和后台服务

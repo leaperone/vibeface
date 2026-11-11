@@ -12,12 +12,12 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    io::Read,
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     num::NonZeroUsize,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::Poll,
     time::Duration,
 };
@@ -29,6 +29,9 @@ const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// The scoped CLI posts tool calls to this private path.
 pub const TOOL_PATH: &str = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool";
 pub(crate) const MAX_CLIENT_SOCKETS: usize = 256;
+const MAX_DECISIONS: usize = 16;
+const DECISIONS_PER_MINUTE: u32 = 12;
+const MAX_DECISION_SOURCES: usize = 256;
 const HOOKS: &str = "/api/hooks";
 /// A hook whose event holds a request waits here for the answer.
 const HOOKS_WAIT: &str = "/api/hooks/wait";
@@ -43,9 +46,11 @@ struct App {
     node: Arc<Runtime>,
     sites: Vec<Site>,
     clients: Arc<tokio::sync::Semaphore>,
+    decisions: Arc<DecisionLimit>,
     /// The `/api/client` connections each browser address holds, counted on `listen` alone.
     addresses: Option<crate::net::Shares>,
     assets: Option<Arc<StaticAssets>>,
+    local: bool,
 }
 
 impl App {
@@ -54,9 +59,54 @@ impl App {
             node,
             sites,
             clients: Arc::new(tokio::sync::Semaphore::new(MAX_CLIENT_SOCKETS)),
+            decisions: Arc::new(DecisionLimit::default()),
             addresses: None,
             assets,
+            local: false,
         }
+    }
+}
+
+struct DecisionLimit {
+    active: Arc<tokio::sync::Semaphore>,
+    sources: Mutex<HashMap<IpAddr, (i64, u32)>>,
+}
+
+impl Default for DecisionLimit {
+    fn default() -> Self {
+        Self {
+            active: Arc::new(tokio::sync::Semaphore::new(MAX_DECISIONS)),
+            sources: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl DecisionLimit {
+    fn enter(&self, source: IpAddr, now_ms: i64) -> ApiResult<tokio::sync::OwnedSemaphorePermit> {
+        // Per client address as the relay and `listen` count them: an IPv6 /56, not each host.
+        let source = crate::net::client_address(source);
+        let denied = || {
+            ApiError(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many decision requests".into(),
+            )
+        };
+        let permit = self
+            .active
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| denied())?;
+        let mut sources = self.sources.lock().map_err(|_| denied())?;
+        sources.retain(|_, (start, _)| now_ms.saturating_sub(*start) < 60_000);
+        if !sources.contains_key(&source) && sources.len() >= MAX_DECISION_SOURCES {
+            return Err(denied());
+        }
+        let (_, used) = sources.entry(source).or_insert((now_ms, 0));
+        if *used >= DECISIONS_PER_MINUTE {
+            return Err(denied());
+        }
+        *used += 1;
+        Ok(permit)
     }
 }
 
@@ -166,10 +216,8 @@ pub async fn serve(node: Arc<Runtime>, app_dir: Option<PathBuf>) -> Result<()> {
         )
     })?;
     let local_url = format!("http://{local_listen}");
-    if node.config.web_enabled {
-        node.local_access
-            .publish_listener(local_url.clone(), node.identity.device_id()?)?;
-    }
+    node.local_access
+        .publish_listener(local_url.clone(), node.identity.device_id()?)?;
     let local = browser_router_with_assets(
         node.clone(),
         vec![Site::parse(&local_url)?],
@@ -235,16 +283,41 @@ struct TlsFiles {
     failed: Option<(Stamp, std::time::Instant)>,
 }
 
-/// Each file's modification time and length.
-type Stamp = [(std::time::SystemTime, u64); 2];
-/// An unchanged pair that failed is tried again this often: a new owner or mode, which a
-/// renewal may set after writing, changes neither field of its stamp.
+/// Content digests are internal cache identities, including the private key's digest.
+type Stamp = [[u8; 32]; 2];
+/// An unchanged pair that failed to parse is tried again this often.
 const TLS_RETRY: Duration = Duration::from_secs(5);
+
+struct TlsMaterial {
+    certificate: Vec<u8>,
+    key: zeroize::Zeroizing<Vec<u8>>,
+}
+
+impl TlsMaterial {
+    fn read(dir: &Path) -> Result<Self> {
+        Ok(Self {
+            certificate: std::fs::read(dir.join(crate::config::TLS_CERT))
+                .context("cannot read TLS certificate")?,
+            key: zeroize::Zeroizing::new(
+                std::fs::read(dir.join(crate::config::TLS_KEY)).context("cannot read TLS key")?,
+            ),
+        })
+    }
+
+    fn stamp(&self) -> Stamp {
+        use sha2::{Digest as _, Sha256};
+        [
+            Sha256::digest(&self.certificate).into(),
+            Sha256::digest(self.key.as_slice()).into(),
+        ]
+    }
+}
 
 impl TlsFiles {
     fn load(dir: &Path) -> Result<Self> {
-        let loaded = tls_stamp(dir)?;
-        let (acceptor, leaf) = tls_acceptor(dir)?;
+        let material = TlsMaterial::read(dir)?;
+        let loaded = material.stamp();
+        let (acceptor, leaf) = tls_acceptor(&material)?;
         Ok(Self {
             dir: dir.to_owned(),
             loaded,
@@ -257,14 +330,15 @@ impl TlsFiles {
     /// The acceptor for the files as they are now. A pair that does not load, such as one caught
     /// between its certificate and its key being replaced, leaves the last good one in place.
     fn current(&mut self) -> tokio_rustls::TlsAcceptor {
-        let Ok(now) = tls_stamp(&self.dir) else {
+        let Ok(material) = TlsMaterial::read(&self.dir) else {
             return self.acceptor.clone();
         };
+        let now = material.stamp();
         let due = self
             .failed
             .is_none_or(|(stamp, at)| stamp != now || at.elapsed() >= TLS_RETRY);
         if now != self.loaded && due {
-            match tls_acceptor(&self.dir) {
+            match tls_acceptor(&material) {
                 Ok((acceptor, leaf)) => {
                     tracing::info!(event = "tls.reloaded", sha256 = %leaf, "serving a new TLS certificate");
                     (self.acceptor, self.leaf, self.loaded, self.failed) =
@@ -282,29 +356,17 @@ impl TlsFiles {
     }
 }
 
-fn tls_stamp(dir: &Path) -> std::io::Result<Stamp> {
-    let stamp = |name| {
-        let file = std::fs::metadata(dir.join(name))?;
-        Ok::<_, std::io::Error>((file.modified()?, file.len()))
-    };
-    Ok([
-        stamp(crate::config::TLS_CERT)?,
-        stamp(crate::config::TLS_KEY)?,
-    ])
-}
-
-fn tls_acceptor(dir: &Path) -> Result<(tokio_rustls::TlsAcceptor, String)> {
+fn tls_acceptor(material: &TlsMaterial) -> Result<(tokio_rustls::TlsAcceptor, String)> {
     use sha2::{Digest as _, Sha256};
     use tokio_rustls::rustls::{
         self,
         pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _},
     };
-    let chain = CertificateDer::pem_file_iter(dir.join(crate::config::TLS_CERT))
-        .and_then(Iterator::collect::<std::result::Result<Vec<_>, _>>)
+    let chain = CertificateDer::pem_slice_iter(&material.certificate)
+        .collect::<std::result::Result<Vec<_>, _>>()
         .context("invalid TLS certificate")?;
     let leaf = hex::encode(Sha256::digest(chain.first().context("no TLS certificate")?));
-    let key = PrivateKeyDer::from_pem_file(dir.join(crate::config::TLS_KEY))
-        .context("invalid TLS key")?;
+    let key = PrivateKeyDer::from_pem_slice(&material.key).context("invalid TLS key")?;
     // Refuses a key that is not the leaf certificate's.
     let config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -361,7 +423,19 @@ async fn serve_public(
             continue;
         };
         let held = (place, share);
-        let acceptor = tls.as_mut().map(TlsFiles::current);
+        let acceptor = if let Some(mut files) = tls.take() {
+            // One refresh at a time, with file reads and certificate validation off the executor.
+            let (files, acceptor) = tokio::task::spawn_blocking(move || {
+                let acceptor = files.current();
+                (files, acceptor)
+            })
+            .await
+            .map_err(std::io::Error::other)?;
+            tls = Some(files);
+            Some(acceptor)
+        } else {
+            None
+        };
         let router = router.clone();
         // Handshakes run apart, so a slow client holds up no other.
         tokio::spawn(async move {
@@ -464,26 +538,6 @@ fn tool_router(node: Arc<Runtime>, site: Site) -> Router {
         .with_state(app)
 }
 
-pub fn router(node: Arc<Runtime>) -> Router {
-    let sites = node
-        .config
-        .browser_origins()
-        .ok()
-        .and_then(|origins| {
-            origins
-                .into_iter()
-                .map(|origin| Site::parse(&origin))
-                .collect::<Result<Vec<_>>>()
-                .ok()
-        })
-        .unwrap_or_default();
-    router_with_sites(node, sites)
-}
-
-fn router_with_sites(node: Arc<Runtime>, sites: Vec<Site>) -> Router {
-    browser_router_with_assets(node, sites, false, None)
-}
-
 #[cfg(test)]
 fn browser_router(node: Arc<Runtime>, sites: Vec<Site>, local: bool) -> Router {
     browser_router_with_assets(node, sites, local, None)
@@ -496,6 +550,7 @@ fn browser_router_with_assets(
     assets: Option<Arc<StaticAssets>>,
 ) -> Router {
     let mut app = App::new(node, sites, assets);
+    app.local = local;
     // Anyone may reach `listen`; every connection to the local listener is this computer's.
     if !local {
         app.addresses = Some(Default::default());
@@ -543,8 +598,24 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
         ip,
     )
     .await
-    {
-        Ok(()) => {
+    .and_then(|()| {
+        // Admission comes before maintenance or any discovery and dial work.
+        if request.uri().path() == "/api/decision" && *request.method() == Method::POST {
+            app.decisions
+                .enter(
+                    client_ip(
+                        ip,
+                        request.headers(),
+                        &app.node.config.forwarding.trusted_proxies,
+                    ),
+                    crate::runtime::now_ms(),
+                )
+                .map(Some)
+        } else {
+            Ok(None)
+        }
+    }) {
+        Ok(_decision) => {
             let work = if matches!(
                 *request.method(),
                 Method::GET | Method::HEAD | Method::OPTIONS
@@ -627,6 +698,10 @@ async fn check_boundary(
     }
     if path == HOOKS || path == HOOKS_WAIT || path == TRIAGE || path == LOG {
         check_hook(headers, ip)?;
+        if app.local && !bearer(headers).is_some_and(|token| app.node.local_access.is_owner(token))
+        {
+            return Err(ApiError::auth());
+        }
     }
     let unsafe_method = !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
     if unsafe_method {
@@ -857,6 +932,9 @@ struct LocalSetupRequest {}
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum LocalSetup {
+    OwnerRequired {
+        initialized: bool,
+    },
     Uninitialized {
         invitation: BootstrapInvitation,
     },
@@ -904,20 +982,27 @@ async fn local_setup(
     }
     let origin = one_header(&headers, header::ORIGIN.as_str()).ok_or_else(ApiError::forbidden)?;
     let device_id = app.node.identity.device_id().map_err(ApiError::bad)?;
-    if app.node.has_membership().await.map_err(ApiError::bad)? {
+    let initialized = app.node.has_membership().await.map_err(ApiError::bad)?;
+    let owner =
+        app.local && bearer(&headers).is_some_and(|token| app.node.local_access.is_owner(token));
+    if initialized {
         let state = app.node.membership_state().await.map_err(ApiError::bad)?;
         let removed = state
             .project()
             .map_err(ApiError::bad)?
             .revocation(&device_id)
             .is_some();
-        let local_launch = if app.node.local_access.enabled() {
+        let local_launch = if owner && app.node.local_access.enabled() {
             match app.node.local_access.origin() {
                 Ok(url) => {
                     let token = app
                         .node
                         .local_access
-                        .issue_from_local_setup(&device_id, &state.genesis.network_id)
+                        .issue(
+                            bearer(&headers).ok_or_else(ApiError::auth)?,
+                            &device_id,
+                            &state.genesis.network_id,
+                        )
                         .map_err(ApiError::bad)?;
                     Some(LocalLaunch {
                         url,
@@ -939,21 +1024,23 @@ async fn local_setup(
             local_launch,
         }));
     }
+    if !owner {
+        return Ok(Json(LocalSetup::OwnerRequired { initialized }));
+    }
     let capability = async {
-        let mut bytes = Vec::new();
-        std::fs::File::open(app.node.data_dir.join("bootstrap.json"))?
-            .take(4097)
-            .read_to_end(&mut bytes)?;
-        ensure!(
-            bytes.len() <= 4096,
-            "local bootstrap capability exceeds size limit"
-        );
+        let bytes = vibeface_bridge::platform::privatefs::read_private_bounded(
+            &app.node.data_dir.join("bootstrap.json"),
+            4096,
+            "the bootstrap capability",
+        )?;
         let capability: BootstrapCapability = serde_json::from_slice(&bytes)?;
+        let verified_capability = capability.capability.clone();
         app.node
             .store
-            .lock()
-            .await
-            .verify_bootstrap_capability(&capability.capability)?;
+            .call("local_bootstrap_capability", move |store| {
+                store.verify_bootstrap_capability(&verified_capability)
+            })
+            .await?;
         Ok::<_, anyhow::Error>(capability)
     }
     .await
@@ -1257,6 +1344,7 @@ fn static_response(file: static_assets::StaticFile, cache: &'static str) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::{access as test_access, initialize_node};
 
     #[test]
     fn a_renewed_certificate_is_served_without_a_restart() -> Result<()> {
@@ -1296,6 +1384,83 @@ mod tests {
         std::fs::write(dir.join(TLS_KEY), &next.1)?;
         files.current();
         assert_eq!(files.leaf, fingerprint(&next.0));
+        assert!(files.failed.is_none());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn tls_reloads_same_metadata_material_and_retries_unchanged_bad_pairs() -> Result<()> {
+        use crate::config::{TLS_CERT, TLS_KEY};
+        use std::fs::{File, FileTimes};
+        use tokio_rustls::rustls::pki_types::{CertificateDer, pem::PemObject as _};
+
+        let dir = std::env::temp_dir().join(format!("vibeface-tls-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir)?;
+        let mut pairs: [(String, String); 3] = std::array::from_fn(|_| {
+            let made = rcgen::generate_simple_self_signed(vec!["203.0.113.7".into()]).unwrap();
+            (made.cert.pem(), made.signing_key.serialize_pem())
+        });
+        // DER signatures can vary in length; trailing PEM whitespace fixes the fixture sizes.
+        let cert_len = pairs.iter().map(|pair| pair.0.len()).max().unwrap();
+        let key_len = pairs.iter().map(|pair| pair.1.len()).max().unwrap();
+        for (cert, key) in &mut pairs {
+            cert.push_str(&"\n".repeat(cert_len - cert.len()));
+            key.push_str(&"\n".repeat(key_len - key.len()));
+        }
+        let modified = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let write = |name: &str, bytes: &str| -> std::io::Result<()> {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes)?;
+            File::options()
+                .write(true)
+                .open(path)?
+                .set_times(FileTimes::new().set_modified(modified))
+        };
+        let metadata = || -> std::io::Result<[(std::time::SystemTime, u64); 2]> {
+            let stamp = |name| -> std::io::Result<_> {
+                let file = std::fs::metadata(dir.join(name))?;
+                Ok((file.modified()?, file.len()))
+            };
+            Ok([stamp(TLS_CERT)?, stamp(TLS_KEY)?])
+        };
+        let fingerprint = |pem: &str| {
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                CertificateDer::from_pem_slice(pem.as_bytes()).unwrap(),
+            ))
+        };
+        write(TLS_CERT, &pairs[0].0)?;
+        write(TLS_KEY, &pairs[0].1)?;
+        let initial_metadata = metadata()?;
+        let mut files = TlsFiles::load(&dir)?;
+        assert_eq!(files.leaf, fingerprint(&pairs[0].0));
+
+        write(TLS_CERT, &pairs[1].0)?;
+        write(TLS_KEY, &pairs[1].1)?;
+        assert_eq!(metadata()?, initial_metadata);
+        files.current();
+        assert_eq!(files.leaf, fingerprint(&pairs[1].0));
+
+        write(TLS_CERT, &pairs[2].0)?;
+        assert_eq!(metadata()?, initial_metadata);
+        files.current();
+        assert_eq!(files.leaf, fingerprint(&pairs[1].0));
+        let failed_at = files.failed.context("mismatched pair must be rejected")?.1;
+        files.current();
+        assert_eq!(
+            files.failed.context("bad pair remains rejected")?.1,
+            failed_at
+        );
+        // Advance only the retry bookkeeping, without sleeping or changing the material.
+        files.failed.as_mut().unwrap().1 = failed_at - TLS_RETRY;
+        files.current();
+        assert_eq!(files.leaf, fingerprint(&pairs[1].0));
+        assert!(files.failed.context("bad pair still fails on retry")?.1 > failed_at);
+
+        write(TLS_KEY, &pairs[2].1)?;
+        assert_eq!(metadata()?, initial_metadata);
+        files.current();
+        assert_eq!(files.leaf, fingerprint(&pairs[2].0));
         assert!(files.failed.is_none());
         std::fs::remove_dir_all(dir)?;
         Ok(())
@@ -1429,21 +1594,18 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_reuses_the_scoped_write_journal_and_revokes_access() -> Result<()> {
-        use crate::runtime::{
-            Access, test_bot as bot, test_node as node, test_start_reply as start_reply,
-        };
+        use crate::runtime::{test_bot as bot, test_node as node, test_start_reply as start_reply};
         let (node, admin, dir) = node().await?;
         bot(&node, &admin, "c", "Ops", &[]).await?;
-        let network = node.store.lock().await.network()?.context("network")?;
+        let network = node
+            .store
+            .call("fixture_network", |store| store.network())
+            .await?
+            .context("network")?;
         let (trigger, attempt) = start_reply(&node, &admin, "mcp-trigger").await?;
         node.register_manager_attempt_fixture(
             "mcp-current-attempt".into(),
-            Access {
-                network_id: network.clone(),
-                human: false,
-                conversation_id: Some("c".into()),
-                manager: None,
-            },
+            test_access(network.clone(), false, Some("c".into())),
             &attempt,
             &trigger,
             crate::providers::Provider::Cursor,
@@ -1468,13 +1630,13 @@ mod tests {
             let request=json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tool_call","arguments":{"tool":"create_bot","arguments":{"name":"Docs"},"call_ref":"one-intent"}}});
             let first:Value=call(request.clone()).await?.json().await?;
             assert_eq!(first["result"]["isError"],false);
-            let basis=node.store.lock().await.version_vector(&network)?;
+            let basis={ let network = network.clone(); node.store.call("fixture_version_vector", move |store| store.version_vector(&network)).await? };
             let replay:Value=call(request).await?.json().await?;
             assert_eq!(first,replay);
-            assert_eq!(basis,node.store.lock().await.version_vector(&network)?);
+            assert_eq!(basis,{ let network = network.clone(); node.store.call("fixture_version_vector", move |store| store.version_vector(&network)).await? });
             let missing_ref:Value=call(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_bot","arguments":{"name":"Duplicate"}}})).await?.json().await?;
             assert_eq!(missing_ref["result"]["isError"],true);
-            assert_eq!(basis,node.store.lock().await.version_vector(&network)?);
+            assert_eq!(basis,{ let network = network.clone(); node.store.call("fixture_version_vector", move |store| store.version_vector(&network)).await? });
             let mut wrong=node.agent_tokens.lock().await.get("mcp-current-attempt").cloned().context("token")?;
             wrong.network_id="another-personal-network".into();
             node.agent_tokens.lock().await.insert("wrong-network".into(),wrong);
@@ -1490,6 +1652,60 @@ mod tests {
         drop(node);
         std::fs::remove_dir_all(dir)?;
         result
+    }
+
+    #[test]
+    fn decision_admission_bounds_concurrency_sources_and_rate_without_leaking_slots() -> Result<()>
+    {
+        let limit = DecisionLimit::default();
+        let mut permits = Vec::new();
+        for source in 0..MAX_DECISIONS {
+            permits.push(
+                limit
+                    .enter(IpAddr::V4(Ipv4Addr::new(192, 0, 2, source as u8)), 0)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            limit.enter("198.51.100.1".parse()?, 0).unwrap_err().0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        drop(permits);
+        let source = "203.0.113.1".parse()?;
+        for _ in 0..DECISIONS_PER_MINUTE {
+            drop(limit.enter(source, 0).unwrap());
+        }
+        assert_eq!(
+            limit.enter(source, 0).unwrap_err().0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(limit.active.available_permits(), MAX_DECISIONS);
+        drop(limit.enter(source, 60_000).unwrap());
+        for source in 0..MAX_DECISION_SOURCES - 1 {
+            drop(
+                limit
+                    .enter(IpAddr::V4(Ipv4Addr::new(198, 51, source as u8, 1)), 60_000)
+                    .unwrap(),
+            );
+        }
+        assert!(limit.sources.lock().unwrap().len() <= MAX_DECISION_SOURCES);
+        assert_eq!(
+            limit.enter("203.0.113.2".parse()?, 60_000).unwrap_err().0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        drop(limit.enter("203.0.113.2".parse()?, 120_000).unwrap());
+        // IPv6 sources count per /56, as the relay and `listen` do.
+        let block = |host: u16| -> IpAddr { format!("2001:db8:0:{host:x}::1").parse().unwrap() };
+        for _ in 0..DECISIONS_PER_MINUTE {
+            drop(limit.enter(block(0), 180_000).unwrap());
+        }
+        assert_eq!(
+            limit.enter(block(0xff), 180_000).unwrap_err().0,
+            StatusCode::TOO_MANY_REQUESTS,
+            "another host of the same /56 shares its budget"
+        );
+        drop(limit.enter(block(0x100), 180_000).unwrap());
+        Ok(())
     }
 
     #[test]
@@ -1658,15 +1874,7 @@ mod tests {
             .join(format!("local-setup-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
         let config = Config::local(address, vec![], false);
-        config.save(&dir)?;
-        config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
         let store = crate::store::Store::open(dir.join("node.sqlite3"))?;
         let capability = store.bootstrap_capability()?;
         config::private_write(
@@ -1675,7 +1883,10 @@ mod tests {
         )?;
         drop(store);
         let node = Arc::new(Runtime::open(&dir).await?);
-        let app = router(node.clone());
+        node.local_access
+            .publish_listener(origin.clone(), node.identity.device_id()?)?;
+        let launcher = crate::local_access::Launcher::read(&dir)?;
+        let app = browser_router(node.clone(), vec![Site::parse(&origin)?], true);
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -1684,10 +1895,29 @@ mod tests {
             .await
             .unwrap();
         });
+        let public_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let public_origin = format!("http://{}", public_listener.local_addr()?);
+        let public_app = browser_router(node.clone(), vec![Site::parse(&public_origin)?], false);
+        let public_server = tokio::spawn(async move {
+            axum::serve(
+                public_listener,
+                public_app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
         let client = reqwest::Client::builder().no_proxy().build()?;
         let endpoint = format!("{origin}/api/local/setup");
         let result = async {
-            let request = || client.post(&endpoint).header(header::ORIGIN, &origin).json(&json!({}));
+            let request = || client.post(&endpoint).header(header::ORIGIN, &origin).bearer_auth(&launcher.capability).json(&json!({}));
+            let anonymous: Value = client.post(&endpoint).header(header::ORIGIN, &origin).json(&json!({})).send().await?.json().await?;
+            assert_eq!(anonymous, json!({"kind":"owner_required","initialized":false}));
+            for owner in [None, Some(&launcher.capability)] {
+                let mut proxy = client.post(format!("{public_origin}/api/local/setup")).header(header::ORIGIN, &public_origin).json(&json!({}));
+                if let Some(owner) = owner { proxy = proxy.bearer_auth(owner); }
+                assert_eq!(proxy.send().await?.json::<Value>().await?, anonymous,
+                    "a public listener never issues owner credentials, including hidden-source loopback proxies");
+            }
             let response = request().send().await?;
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
@@ -1702,8 +1932,6 @@ mod tests {
             assert_eq!(client.post(&endpoint).json(&json!({})).send().await?.status(), StatusCode::FORBIDDEN);
             assert_eq!(request().header("x-forwarded-for", "127.0.0.1").send().await?.status(), StatusCode::FORBIDDEN);
             assert_eq!(client.post(&endpoint).header(header::ORIGIN, "https://hostile.invalid").json(&json!({})).send().await?.status(), StatusCode::FORBIDDEN);
-            let removed = client.post(format!("{origin}/api/local/join/status")).header(header::ORIGIN, &origin).json(&json!({})).send().await?;
-            assert_eq!(removed.status(), StatusCode::NOT_FOUND);
             let public_info: Value = client.get(format!("{origin}/api/info")).send().await?.json().await?;
             assert!(!public_info.to_string().contains(&capability.capability));
             assert!(public_info.get("invitation").is_none());
@@ -1714,16 +1942,19 @@ mod tests {
                 Member::client(&admin, "browser", true)?,
                 Member::node(&node.identity, "node")?,
             )?)?;
-            node.store.lock().await.bootstrap_network(state, &capability.capability, &admin.device_id()?)?;
+            let bootstrap_capability = capability.capability.clone();
+            let admin_id = admin.device_id()?;
+            node.store.call("fixture_bootstrap", move |store| store.bootstrap_network(state, &bootstrap_capability, &admin_id)).await?;
+            node.local_access.set_enabled(false)?;
             let initialized: Value = request().send().await?.json().await?;
             assert_eq!(initialized, json!({"kind":"initialized","entry":{"address":origin,"device_id":node.identity.device_id()?},"removed":false}));
             assert!(!initialized.to_string().contains(&capability.capability));
-            assert!(node.store.lock().await.verify_bootstrap_capability(&capability.capability).is_err());
-            let local_origin = "http://127.0.0.1:4791";
-            node.local_access.publish_listener(local_origin.into(), node.identity.device_id()?)?;
+            assert!({ let capability = capability.capability.clone(); node.store.call("fixture_consumed_capability", move |store| store.verify_bootstrap_capability(&capability)).await.is_err() });
+            let local_origin = &origin;
+            node.local_access.set_enabled(true)?;
             let launched: Value = request().send().await?.json().await?;
             assert_eq!(launched["entry"], initialized["entry"]);
-            assert_eq!(launched["local_launch"]["url"], local_origin);
+            assert_eq!(launched["local_launch"]["url"], *local_origin);
             assert_eq!(launched["local_launch"]["device_id"], node.identity.device_id()?);
             let token = launched["local_launch"]["token"].as_str().context("local token missing")?;
             assert!(token.len() == 64 && hex::decode(token).is_ok());
@@ -1745,6 +1976,8 @@ mod tests {
         }.await;
         server.abort();
         let _ = server.await;
+        public_server.abort();
+        let _ = public_server.await;
         node.shutdown().await;
         drop(node);
         std::fs::remove_dir_all(dir)?;
@@ -1759,14 +1992,10 @@ mod tests {
                 .join("../../.artifacts")
                 .join(format!("hook-boundary-{}", uuid::Uuid::new_v4()));
             config::private_dir(&dir)?;
-            Config::local("127.0.0.1:0".parse()?, vec![], false).save(&dir)?;
-            config::private_write(
-                &dir.join("data-epoch.json"),
-                &crate::config::data_epoch_marker(),
-            )?;
-            config::private_write(
-                &dir.join("identity.json"),
-                &serde_json::to_vec(&crate::crypto::LocalIdentity::generate())?,
+            initialize_node(
+                &dir,
+                &Config::local("127.0.0.1:0".parse()?, vec![], false),
+                &crate::crypto::LocalIdentity::generate(),
             )?;
             let mut runtime = Runtime::open(&dir).await?;
             runtime.config.web_enabled = web_enabled;
@@ -1777,6 +2006,10 @@ mod tests {
             for local in [true, false] {
                 let listener = TcpListener::bind("127.0.0.1:0").await?;
                 let origin = format!("http://{}", listener.local_addr()?);
+                if local {
+                    node.local_access
+                        .publish_listener(origin.clone(), node.identity.device_id()?)?;
+                }
                 let app = browser_router(node.clone(), vec![Site::parse(&origin)?], local);
                 origins.push(origin);
                 servers.push(tokio::spawn(async move {
@@ -1789,6 +2022,14 @@ mod tests {
                 }));
             }
             let client = reqwest::Client::builder().no_proxy().build()?;
+            let launcher = crate::local_access::Launcher::read(&dir)?;
+            node.local_access.set_enabled(false)?;
+            assert!(node.local_access.is_owner(&launcher.capability));
+            assert!(
+                node.local_access
+                    .issue(&launcher.capability, &launcher.node_id, "network")
+                    .is_err()
+            );
             let result = async {
                 if !web_enabled {
                     for origin in &origins {
@@ -1823,6 +2064,20 @@ mod tests {
                     };
                     assert_eq!(
                         status(client.post(&url).json(&body)).await?,
+                        StatusCode::UNAUTHORIZED
+                    );
+                    assert_eq!(
+                        status(client.post(&url).bearer_auth("wrong-owner").json(&body)).await?,
+                        StatusCode::UNAUTHORIZED
+                    );
+                    assert_eq!(
+                        status(
+                            client
+                                .post(&url)
+                                .bearer_auth(&launcher.capability)
+                                .json(&body)
+                        )
+                        .await?,
                         StatusCode::BAD_REQUEST
                     );
                     assert_eq!(
@@ -1849,6 +2104,7 @@ mod tests {
                         status(
                             client
                                 .post(&url)
+                                .bearer_auth(&launcher.capability)
                                 .header(header::CONTENT_TYPE, "text/plain")
                                 .body(body.to_string())
                         )

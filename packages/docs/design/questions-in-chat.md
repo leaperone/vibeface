@@ -56,7 +56,7 @@ PrimaryBotSet {                 // 写在 BOTS_SCOPE，须本人签名
 
 Subject {                             // 问题所涉的设备、项目和 session
 	node: DeviceId,                   // 运行该 session 的设备
-	agent: String,                    // "codex" | "claude"
+	agent: Option<Provider>,          // codex | cursor | claude | pi | opencode；问的是该设备自身设置时为空
 	session_id: String,               // Codex thread ID 或 Claude session ID
 	cwd: String,                      // "workspace-N/…"：该设备第 N 个可用文件夹（roots，从 1 数）下的相对路径，不在任何文件夹下时为 "workspace"；网页和手机按该设备公开的 roots 还原成文件夹名
 	summary: String,                  // 一行，session 最近在说什么
@@ -90,7 +90,7 @@ MessagePosted {                       // 现有事件，新增一个字段
 
 SessionAttributed {                   // 写在接手 Bot 的会话 scope；rank 最大者为准
 	node: DeviceId,
-	agent: String,
+	agent: Provider,
 	session_id: String,
 	cwd: String,
 	summary: String,
@@ -100,6 +100,11 @@ SessionMuted {                        // 写在当前接手 Bot 的会话 scope�
 	node: DeviceId,
 	session_id: String,
 }
+
+QuestionClosed {                      // 提问设备写在问题所在会话：挂起的请求已消失、答案无处可送；已有回答仍以回答为准
+	question_id: String,
+	reason: CloseReason,              // request_lost
+}
 ```
 
 签名规则：网页回答须本人设备签名。Grok 经已验证的 decision token 回答，由入口 Node 保存同一答案及私有授权绑定。普通无签名消息不能进入本人控制通路。普通问题后续轮的触发类型为 `answer`，保持原目标且不提供改设置工具；live request 的答案不用 Answer job。
@@ -108,11 +113,11 @@ SessionMuted {                        // 写在当前接手 Bot 的会话 scope�
 
 | 表 | 主键 | 规则 |
 |---|---|---|
-| `questions` | `(network_id, question_id)` | 先到者胜；存会话 ID、事件体、作者、时间 |
+| `questions` | `(network_id, question_id)` | rank 最小者胜；存会话 ID、事件体、作者、时间和 `closed` |
 | `messages.answers` | 新列，索引 `(network_id, answers)` | 回答即消息；同 ID 先到者胜 |
 | `session_owners` | `(network_id, node, session_id)` | 来自 `WorkProgress.thread_id`（rank 最小者胜）与 `SessionAttributed`（rank 最大者胜，覆盖工作记录）；`muted` 由同一 Bot 会话里 rank 更大的 `SessionMuted` 置位，新的 `SessionAttributed` 清除 |
 
-未回答 = `questions` 左连接 `messages.answers` 为空。不另设“已回答”状态。
+未回答 = `questions` 左连接 `messages.answers` 为空且 `closed` 为空。不另设“已回答”状态；提问设备可用 `QuestionClosed` 关闭已无法送达的问题。
 
 主 Bot 不建表，也不改数据纪元。读取时取 `BOTS_SCOPE` 里 rank 最大的 `PrimaryBotSet`，所指 Bot 仍在则用它，否则用最早创建的 Bot。旧版本 Node 不认识这个事件，升级前会拒收。
 
@@ -124,7 +129,7 @@ Agent 侧（CLI → `/api/triage`）：
 
 - `vibeface triage raise --event-id ID --severity S --question TEXT [--choice LABEL]... [--request-id R] [--attention-kind question|approval|browser-takeover]`：写入拥有该 session 的 Bot 会话。同一 session 同一请求已有未答问题时返回原问题。需要本人在事件设备的浏览器继续操作时指定 `browser-takeover`；不传时根据挂起请求推断提问或审批。卡片类型不授予操作权限，也不能改变接管设备。带 `--request-id` 时请求挂起到回答为止，回答沿独立私有控制递交原请求；失效 transport 和未知发送结果不自动重放。
 - `vibeface triage dismiss --event-id ID`：不变。
-- `vibeface respond REQUEST_ID RESULT_JSON [--node DEVICE]`：带 `--node` 时经设备转发，应答仍只一次。本机 Node 地址参数为 `--node-url`。
+- `vibeface respond REQUEST_ID RESULT_JSON [--node DEVICE]`：不带 attempt 的回答（本机或经 `--node` 转发到持有请求的设备）只能回答仍在待处理队列、未被认领、且没有已提问 `question_id` 的请求，首个回答生效，之后只读回；带 `VIBEFACE_TRIAGE_ATTEMPT` 的回答只用于该 attempt 领取的私有回答控制。本机 Node 地址参数为 `--node-url`。
 - 协调工具 `hand_over_session { node, session_id, version, to? | stop_following? }`：Bot 把名下的会话转给 `to`（Bot 的会话 ID 或名称），或不再关注；`version` 是 `bot.sessions` 里的版本，即最后改动归属的事件 hash 前 16 位。返回 `{node, session_id, conversation_id, muted, version, changed}`，状态已成立时 `changed = false`、不写事件；版本已变时拒绝。
 
 用户侧 RPC：
@@ -138,6 +143,6 @@ Agent 侧（CLI → `/api/triage`）：
 Grok 侧：
 
 - webhook 事件 `{"type":"question", question_id, severity, text, choices[{index,label}], about, bot, answer:{url, device_id, question_id}}` 和 `{"type":"answered", question_id, text}`，`event_id` 分别为问题 ID 与 `answered-<问题 ID>-<回答事件哈希前 16 位>`。两端同时回答时 rank 小者胜，同步把输方本机的回答换成胜者；提问方 Node 按新的回答再发一次 `answered`，未送出的旧 `answered` 撤下。接收方以同一 `question_id` 最后收到的为准。
-- `POST /api/decision { device_id, question_id, choice | text }`：返回 `{question_id, answer_id, status: "answered" | "already_answered", text}`。重试同一请求只读回。
+- `POST /api/decision { device_id, question_id, choice | text }`：返回 `{question_id, answer_id, status: "answered" | "already_answered", text}`。重试同一请求只读回。`forwarding.any` 的公共节点不核对成员，把请求转给 `device_id`；成员 Node 处理自己的会话，其余只转给当前成员 Node，非成员目标拒绝，token 只由目标核验。每台 Node 同时最多处理 16 个 decision 请求，每分钟最多记 256 个来源、每来源 12 次（IPv6 按 /56 计），超出回 429。回答落成消息后的私有回答控制与其他分诊轮共用 `daily_decision_limit`，每次领取占一次额度。
 
 Bot 一轮的输入：`trigger.event` 是回答消息，另附 `trigger.question`（问题全文、选项和 Subject），说明它回答哪个问题。提示要求 Bot 用回答消息的 `message_id` 作为 `vibeface codex send --id`。这次发送是这一轮的工作，同一轮重试只读回；回合结束后结果作为 `work_result` 轮回到 Bot。

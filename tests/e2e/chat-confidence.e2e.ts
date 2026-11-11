@@ -6,7 +6,7 @@ import { expect, secrets } from 'e2e';
 
 test('chat keeps decisions and task records readable on desktop and phone', async ({ app, node, screen, browser }) => {
   await browser.setViewport({ width: 1280, height: 900 });
-  await app.open(node.url);
+  await app.open(node.entry);
   await screen.getByRole('button', '新建我的网络').click();
   await screen.getByLabel('这个节点叫什么？').fill('交互验收设备');
   await screen.getByRole('button', '下一步').click();
@@ -149,7 +149,8 @@ test('chat keeps decisions and task records readable on desktop and phone', asyn
     const after = await readingPosition();
     assert(Math.abs(after.top - before.top) < 3, `completion preserves the message being read: ${JSON.stringify({ before, after })}`);
 
-    await screen.getByRole('link', '我的设备', { exact: true }).click();
+    await screen.getByRole('link', '设置', { exact: true }).click();
+    await screen.getByRole('link', /^我的设备/).click();
     await expect(tasksButton()).toHaveCount(0);
     await screen.getByRole('link', /^运营助手(?:\s|$)/).click();
     await tasksButton().click();

@@ -10,9 +10,6 @@ const base = cn(
   })
 );
 
-// Headings tighten slightly, as the web's h1–h3.
-const heading = 'tracking-[-0.011em]';
-
 const TextClassContext = React.createContext<string | undefined>(undefined);
 
 function Text({
@@ -28,7 +25,7 @@ function Text({
   const Component = asChild ? Slot : RNText;
   return (
     <Component
-      className={cn(base, props.role === 'heading' && heading, textClass, className)}
+      className={cn(base, textClass, className)}
       maxFontSizeMultiplier={maxFontSizeMultiplier}
       {...props}
     />

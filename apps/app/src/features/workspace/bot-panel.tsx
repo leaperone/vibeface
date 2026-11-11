@@ -1,3 +1,4 @@
+import { HistoryControls } from '../chat/history-controls'
 "use client"
 
 import { useEffect, useRef, useState } from "react"
@@ -30,8 +31,8 @@ const GAP_MS = 4000
 // The one title button on screen; a schedule card in the chat opens its panel on that schedule.
 let showSchedule: ((id: string) => void) | null = null
 export const openSchedule = (id: string) => showSchedule?.(id)
-let showContext: (() => void) | null = null
-export const openBotContext = () => showContext?.()
+let showPanel: (() => void) | null = null
+export const openBotPanel = () => showPanel?.()
 
 /** The chat route's title: the bot's avatar and name as one button that opens a view of the bot where its face can be picked, schedules paused, resumed or deleted and the bot itself deleted (packages/docs/design/bot-config.md section 5). */
 export function BotPanelButton() {
@@ -47,7 +48,7 @@ export function BotPanelButton() {
   const [confirming, setConfirming] = useState<string | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [contextOpen, setContextOpen] = useState(false)
-  useEffect(() => { showContext = () => { setContextOpen(true); setOpen(true) }; return () => { showContext = null } }, [])
+  useEffect(() => { showPanel = () => { order.current = []; setOpen(true) }; return () => { showPanel = null } }, [])
   const [shownSchedule, setShownSchedule] = useState<string | null>(null)
   useEffect(() => { showSchedule = (id) => { order.current = []; setShownSchedule(id); setOpen(true) }; return () => { showSchedule = null } }, [])
   useEffect(() => { if (open && shownSchedule) requestAnimationFrame(() => document.getElementById(`schedule-${shownSchedule}`)?.scrollIntoView({ block: "center" })) }, [open, shownSchedule])
@@ -112,6 +113,7 @@ export function BotPanelButton() {
           </span>
         </SheetHeader>
         {view ? contextOpen && workspace.data ? <ContextPanel bot={bot} data={workspace.data} nodes={workspace.nodes} connected={workspace.connectionOnline} memory={workspace} onBack={() => { refocus.current = "context"; setContextOpen(false) }} /> : <div className="grid gap-6 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
+          <HistoryControls key={`${workspace.generation}:${workspace.conversationId}`} workspace={workspace} sections={['skills', 'schedules', 'memory', 'memory_conflicts', 'memory_sync_conflicts']} />
           <SettingsGroup>
             <AvatarPicker botId={bot.bot_id} avatar={look.avatar} face={look.face} disabled={!workspace.writable} busy={look.pending} pick={look.pick} />
           </SettingsGroup>

@@ -18,6 +18,7 @@ import tempfile
 import time
 import uuid
 import zipfile
+from unittest import TestCase
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -38,7 +39,7 @@ def hex_bytes(value, length=None):
     return bytes.fromhex(value)
 
 ITEMS = ("prepare", "relation-1", "relation-2", "relation-3", "relation-4", "accept")
-WORKFLOW_PATH = ".github/workflows/ci.yml"
+WORKFLOW_PATH = ".github/workflows/delivery-small.yml"
 DEADLINE_ENV = "VIBEFACE_DELIVERY_DEADLINE_UNIX_MS"
 ITEM_CEILING_SECONDS = 5 * 60 * 60 + 30 * 60
 PROOF_NAMES = {"manifest.json", *[f"relation-{relation}.{suffix}" for relation in range(1, 5) for suffix in ("json", "receipt")]}
@@ -569,7 +570,9 @@ def checked_transaction(value):
     integer(value["status"], 0, 1)
     for field in ("gasUsed", "effectiveGasPrice", "nativeCostWei"):
         decimal(value[field])
-    event_types = {"KeyUpdated": ("hash", "amount", "hash", "bool"), "Funded": ("hash", "address", "amount"), "WindowUpdated": ("hash", "amount", "amount"), "DecryptionProven": ("hash", "amount"), "Withdrawn": ("hash", "address", "amount"), "Refunded": ("hash", "address", "amount")}
+    event_types = {"KeyUpdated": ("hash", "amount", "hash", "bool"), "Funded": ("hash", "address", "amount"), "WindowUpdated": ("hash", "amount", "amount"), "DecryptionProven": ("hash", "amount"), "Refunded": ("hash", "address", "amount"),
+        "BudgetOpened": ("hash", "address", "address", "amount"), "BudgetReserved": ("hash", "hash", "amount"), "BudgetEarned": ("hash", "hash", "amount", "amount"),
+        "BudgetWithdrawn": ("hash", "address", "amount"), "BudgetClosed": ("hash",), "BudgetRefunded": ("hash", "address", "amount")}
     if not isinstance(value["events"], list) or len(value["events"]) > 8:
         raise ValueError("Unexpected public event list")
     for event in value["events"]:
@@ -600,7 +603,7 @@ def checked_node_summary(value, item, context, commit):
             raise ValueError("Node summary uses a different continuation context")
     elif value["file"] is not None or value["contextSha256"] is not None:
         raise ValueError("Node summary claims a missing context")
-    if value["limits"] != {"memoryBytes": 11 * 1024 ** 3, "swapBytes": 0, "pids": 64} or value["resourceScope"] != "CPU deltas cover each entire sandbox interval; memory.peak is cumulative sandbox lifetime, not per-process RSS" or value["coverage"] != "synthetic raw 4096-byte file, deterministic public test keys and controlled Ganache branches; no production confidentiality, product Node, UI, mobile, real asset, or public-chain finality":
+    if value["limits"] != {"memoryBytes": 11 * 1024 ** 3, "swapBytes": 0, "pids": 64} or value["resourceScope"] != "CPU deltas cover each entire sandbox interval; memory.peak is cumulative sandbox lifetime, not per-process RSS" or value["coverage"] != "synthetic raw 4096-byte file, deterministic public test keys and controlled Ganache branches; no product Node or durable-publication-policy coverage; raw late/reorg controls intentionally exceed its gate; no UI, mobile, real asset, or public-chain finality":
         raise ValueError("Unexpected experiment limits or coverage claim")
     if any(type(limit) is not int for limit in value["limits"].values()):
         raise ValueError("Invalid experiment limit type")
@@ -644,10 +647,11 @@ def checked_node_summary(value, item, context, commit):
         checked_transaction(record)
     if value["deployment"] is not None:
         deployment = value["deployment"]
-        object_keys(deployment, ("chainId", "escrow", "asset", "payer", "provider", "profileId", "adapter", "verifier", "tokenDecimals", "orderId", "fundTransaction", "runtimeCodeHashes"))
+        object_keys(deployment, ("chainId", "escrow", "asset", "payer", "provider", "profileId", "adapter", "verifier", "tokenDecimals", "orderId", "budgetId", "allocationTransaction", "runtimeCodeHashes"))
         if context is None or any(deployment[field] != context["deployment"][field] for field in ("chainId", "escrow", "asset", "payer", "provider", "adapter", "verifier", "tokenDecimals", "runtimeCodeHashes")) or deployment["profileId"] != "0x" + context["profileId"] or deployment["orderId"] != "0x" + context["orderId"]:
             raise ValueError("Final deployment differs from reconstructed context")
-        prefixed(deployment["fundTransaction"], 32)
+        for field in ("budgetId", "allocationTransaction"):
+            prefixed(deployment[field], 32)
     if value["failure"] is not None:
         object_keys(value["failure"], ("stage", "kind", "code"))
         for field in ("stage", "kind", "code"):
@@ -1291,12 +1295,8 @@ def self_test():
     for field, value in (("max_windows", 16), ("max_total_bytes", 1_048_576), ("crypto_suite", True), ("guest_image_id", [102] * 32), ("statement_schema_hash", [102] * 32), ("extra", 1)):
         changed = deepcopy(profile)
         changed[field] = value
-        try:
+        with TestCase().assertRaises(ValueError, msg='Unsupported product profiles must fail'):
             checked_profile_vectors(vectors, changed, compiled, profile_proofs)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("Unsupported product profiles must fail")
     changed = deepcopy(profile_proofs)
     for proof in changed:
         proof["profileId"] = "66" * 32
@@ -1304,22 +1304,14 @@ def self_test():
         journal[4 * 32:5 * 32] = b"\x66" * 32
         proof["journal"], proof["journalHash"] = journal.hex(), hashlib.sha256(journal).hexdigest()
     checked_metadata(manifest, changed, compiled)
-    try:
+    with TestCase().assertRaises(ValueError, msg='Self-consistent receipt profiles outside the product trust root must fail'):
         checked_profile_vectors(vectors, profile, compiled, changed)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("Self-consistent receipt profiles outside the product trust root must fail")
     verified = {"verified": True, "kind": "groth16", "seal": proofs[0]["seal"], "imageId": compiled["imageId"], "journalHash": proofs[0]["journalHash"]}
     checked_verification(verified, compiled, proofs[0])
     for field, value in (("kind", "succinct"), ("seal", "66" * 260), ("imageId", "66" * 32), ("journalHash", "66" * 32), ("verified", 1), ("extra", "unexpected")):
         changed = dict(verified, **{field: value})
-        try:
+        with TestCase().assertRaises(ValueError, msg='A mismatched receipt export must fail'):
             checked_verification(changed, compiled, proofs[0])
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("A mismatched receipt export must fail")
     build, container = sandbox_commands(Path("/context"))
     assert build[:5] == ["docker", "build", "--platform", "linux/amd64", "--file"]
     assert build[-1] == "/context" and build[5] == "/context/crates/delivery/proof/Sandbox.Dockerfile"
@@ -1348,12 +1340,8 @@ def self_test():
         assert optional_fixtures() is None
         loader.assert_not_called()
     with patch(f"{__name__}.FIXTURES", ROOT), patch(f"{__name__}.load_fixtures", side_effect=ValueError("missing fixture")), patch(f"{__name__}.run") as operation:
-        try:
+        with TestCase().assertRaises(ValueError, msg='A broken fixture must stop sandbox dispatch'):
             sandbox()
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("A broken fixture must stop sandbox dispatch")
         operation.assert_not_called()
     with patch(f"{__name__}.optional_fixtures", return_value=None), patch(f"{__name__}.subprocess.check_output", return_value=b" M uncommitted-source"), patch(f"{__name__}.run") as operation:
         try:
@@ -1456,7 +1444,7 @@ def continuation_self_test(manifest, compiled, profile, vectors, proofs):
     node_summary = {"schemaVersion": 1, "sourceCommit": commit, "workItem": "prepare", "status": "PREPARED", "stage": "complete", "guest": compiled, "file": context["file"], "contextSha256": context_hash,
         "executionControls": controls, "legacyImagePreTermsRejected": True, "wrongJournals": wrongs, "reused": False, "replayChecks": 2, "proofs": [], "branches": [], "transactions": [], "processes": [],
         "limits": {"memoryBytes": 11 * 1024 ** 3, "swapBytes": 0, "pids": 64}, "resourceScope": "CPU deltas cover each entire sandbox interval; memory.peak is cumulative sandbox lifetime, not per-process RSS",
-        "coverage": "synthetic raw 4096-byte file, deterministic public test keys and controlled Ganache branches; no production confidentiality, product Node, UI, mobile, real asset, or public-chain finality", "deployment": None, "corruptERejectedWithoutOutput": False, "failure": None}
+        "coverage": "synthetic raw 4096-byte file, deterministic public test keys and controlled Ganache branches; no product Node or durable-publication-policy coverage; raw late/reorg controls intentionally exceed its gate; no UI, mobile, real asset, or public-chain finality", "deployment": None, "corruptERejectedWithoutOutput": False, "failure": None}
 
     def must_reject(call):
         try:
@@ -1467,12 +1455,31 @@ def continuation_self_test(manifest, compiled, profile, vectors, proofs):
 
     checked_context(context_data, compiled, vectors["profileId"], commit)
     checked_node_summary(node_summary, "prepare", context, commit)
+    producer_coverage = re.search(r"^  coverage: '([^'\n]*)',$", (ROOT / "contracts/delivery/experiment-delivery.mjs").read_text(), re.M)[1]
+    checked_node_summary({**node_summary, "coverage": producer_coverage}, "prepare", context, commit)
     checked_resources(resources, require_pass=True)
     checked_counters({"cpu.stat": "usage_usec 1\ncore_sched.force_idle_usec 0"})
     must_reject(lambda: checked_counters({"cpu.stat": "usage_usec 1\n.core_sched.force_idle_usec 0"}))
     must_reject(lambda: checked_counters({"cpu.stat": "usage_usec 1\ncore_sched.force_idle_usec -1"}))
     checked_transaction({"label": "fund", "hash": "0x" + "1" * 64, "blockHash": "0x" + "2" * 64, "blockNumber": 5, "status": 1,
         "gasUsed": "1", "effectiveGasPrice": "2", "nativeCostWei": "2", "events": [{"name": "Funded", "args": ["0x" + "4" * 64, "0x" + "Ab" * 20, "17"]}]})
+    budget, order = "0x" + "5" * 64, "0x" + context["orderId"]
+    accepted_events = (("open-budget", [("BudgetOpened", [budget, addresses[0], addresses[1], "17"])]),
+        ("reserve-batch", [("Funded", [order, addresses[0], "17"]), ("BudgetReserved", [budget, order, "17"])]),
+        ("publish", [("WindowUpdated", [order, "0", "3"]), ("BudgetEarned", [budget, order, "0", "17"])]),
+        ("withdraw", [("BudgetWithdrawn", [budget, addresses[1], "17"])]),
+        ("close", [("BudgetClosed", [budget])]),
+        ("refund", [("Refunded", [order, addresses[0], "17"]), ("BudgetRefunded", [budget, addresses[0], "17"])]))
+    accepted = {**node_summary, "workItem": "accept", "status": "PASS-accept-candidate",
+        "transactions": [{"label": label, "hash": "0x" + "1" * 64, "blockHash": "0x" + "2" * 64, "blockNumber": 5, "status": 1, "gasUsed": "1", "effectiveGasPrice": "2", "nativeCostWei": "2",
+            "events": [{"name": name, "args": arguments} for name, arguments in events]} for label, events in accepted_events],
+        "deployment": {**{field: context["deployment"][field] for field in ("chainId", "escrow", "asset", "payer", "provider", "adapter", "verifier", "tokenDecimals", "runtimeCodeHashes")},
+            "profileId": "0x" + context["profileId"], "orderId": order, "budgetId": budget, "allocationTransaction": "0x" + "6" * 64}}
+    checked_node_summary(accepted, "accept", context, commit)
+    must_reject(lambda: checked_node_summary({**accepted, "deployment": {**{field: value for field, value in accepted["deployment"].items() if field not in ("budgetId", "allocationTransaction")}, "fundTransaction": "0x" + "6" * 64}}, "accept", context, commit))
+    must_reject(lambda: checked_node_summary({**accepted, "deployment": {**accepted["deployment"], "budgetId": "5" * 64}}, "accept", context, commit))
+    must_reject(lambda: checked_transaction({**accepted["transactions"][0], "events": [{"name": "Withdrawn", "args": [order, addresses[1], "17"]}]}))
+    must_reject(lambda: checked_transaction({**accepted["transactions"][0], "events": [{"name": "BudgetClosed", "args": [budget, "17"]}]}))
     for field, value in (("sourceCommit", "b" * 40), ("profileId", "f" * 64), ("profileSha256", "f" * 64), ("orderId", "0x" + "4" * 64), ("secret", "private")):
         changed = {**context, field: value}
         must_reject(lambda: checked_context(json_bytes(changed), compiled, vectors["profileId"], commit))
@@ -1490,16 +1497,23 @@ def continuation_self_test(manifest, compiled, profile, vectors, proofs):
     must_reject(lambda: checked_resources(oom, require_pass=True))
     oom["status"], oom["oomDelta"]["oom"] = "FAIL", 1
     checked_resources(oom)
-    for field, value in (("extra", "secret"), ("coverage", "raw witness"), ("processes", [{**process, "privateLog": "secret"}])):
+    for field, value in (("extra", "secret"),
+                         ("coverage", "synthetic raw 4096-byte file, deterministic public test keys and controlled Ganache branches; no production confidentiality, product Node, UI, mobile, real asset, or public-chain finality"),
+                         ("coverage", "raw witness"), ("coverage", producer_coverage + " "), ("coverage", None),
+                         ("processes", [{**process, "privateLog": "secret"}])):
         must_reject(lambda: checked_node_summary({**node_summary, field: value}, "prepare", context, commit))
 
     def origin_for(item, artifact_id, attempt=2):
         return {**producer, "runAttempt": attempt, "artifactId": artifact_id,
             "artifactName": f"delivery-small-{item}-{commit}-101-{attempt}", "artifactDigest": "sha256:" + "0" * 64}
 
+    assert WORKFLOW_PATH == ".github/workflows/delivery-small.yml"
+    checked_producer(producer)
+    for path in (".github/workflows/ci.yml", ".github/workflows/delivery-live.yml", ".github/workflows/delivery-small.yml/extra"):
+        must_reject(lambda: checked_producer({**producer, "workflowPath": path}))
     run_api = {"id": 101, "path": WORKFLOW_PATH, "event": "workflow_dispatch", "head_sha": commit, "repository": {"full_name": producer["repository"]}, "head_repository": {"full_name": producer["repository"]}, "run_attempt": 2, "run_started_at": "2026-10-30T00:00:00Z"}
     checked_run_api(run_api, producer, 101, 2)
-    for field, value in (("path", "other.yml"), ("event", "push"), ("head_sha", "b" * 40), ("run_attempt", 3)):
+    for field, value in (("path", "other.yml"), ("path", ".github/workflows/ci.yml"), ("path", ".github/workflows/delivery-live.yml"), ("event", "push"), ("head_sha", "b" * 40), ("run_attempt", 3)):
         must_reject(lambda: checked_run_api({**run_api, field: value}, producer, 101, 2))
     artifact_api = {"id": 1, "name": origin_for("prepare", 1)["artifactName"], "digest": "sha256:" + "0" * 64, "size_in_bytes": 100, "expired": False,
         "expires_at": "2999-01-01T00:00:00Z", "created_at": "2026-10-30T00:01:00Z", "workflow_run": {"id": 101, "head_sha": commit}}
@@ -1621,6 +1635,9 @@ def continuation_self_test(manifest, compiled, profile, vectors, proofs):
         with patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": producer["repository"], "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_RUN_ID": "101", "GITHUB_RUN_ATTEMPT": "2", "GITHUB_SHA": commit, "GITHUB_WORKFLOW_REF": producer["repository"] + "/" + WORKFLOW_PATH + "@refs/heads/test"}):
             assert current_producer(commit) == producer
             must_reject(lambda: current_producer("f" * 40))
+            for path in (".github/workflows/ci.yml", ".github/workflows/delivery-live.yml", ".github/workflows/delivery-small.yml/extra"):
+                with patch.dict(os.environ, {"GITHUB_WORKFLOW_REF": producer["repository"] + "/" + path + "@refs/heads/test"}):
+                    must_reject(lambda: current_producer(commit))
 
         incoming = base / "incoming"
         incoming.mkdir(mode=0o700)
@@ -1789,7 +1806,8 @@ def continuation_self_test(manifest, compiled, profile, vectors, proofs):
         assert "max-parallel: 1" in workflow and "fail-fast: false" in workflow
         assert "fromJSON(needs.delivery-small-prepare.outputs.matrix)" in workflow
         assert "needs: [delivery-small-prepare, delivery-small-proofs]" in workflow
-        assert "inputs.delivery_small && 'delivery-small'" in workflow
+        assert "group: ci-delivery-small" in workflow and "cancel-in-progress: false" in workflow
+        assert "inputs.prepare_only" in workflow and "inputs.resume_run" in workflow
         assert workflow.count("path: ${{ steps.run.outputs.public-directory }}") == 3
         assert ".artifacts/vdp/canonical/small/*/public" not in workflow
 

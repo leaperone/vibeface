@@ -14,6 +14,8 @@ processes and controlled provider protocol fixtures.
 --memory-sync checks signed user Memory controls, concurrent Agent changes, receipts,
 provenance and replay across two isolated Nodes with the same controlled fixtures.
 --web-only checks packaged Web resources through one isolated Node process.
+--npm-service checks native npm service management and published-to-candidate replacement
+only on fresh GitHub-hosted POSIX runners, never a developer's user services.
 --auto-route checks the entry: joins, origins, revocation, unknown writes, recovery and forwarding
 through another member Gateway.
 """
@@ -30,6 +32,7 @@ import io
 import ipaddress
 import json
 import os
+import plistlib
 import re
 import runpy
 from html.parser import HTMLParser
@@ -53,6 +56,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from unittest import TestCase
 
 
 def definitions_of(bots):
@@ -266,6 +270,13 @@ async function connect(input) {
         send(id, method, params);
       });
     },
+    // The server completed the request, but Python never receives its successful body.
+    async dropResponse(method, params) {
+      const response = await this.request(method, params);
+      if (Object.hasOwn(response, 'error')) throw new Error(`request rejected before reply discard: ${response.error}`);
+      close(new Error('application reply discarded'));
+      return { sent: true, application_reply_discarded: true };
+    },
     // The request leaves, then the connection drops before any answer: an unknown write.
     drop(method, params) { send(String(++sequence), method, params); close(new Error('dropped after send')); return { sent: true }; },
   };
@@ -332,7 +343,7 @@ for await (const line of createInterface({ input: process.stdin })) {
         const secret = invites.get(input.invite_hash);
         if (!secret) throw new Error('unknown invite');
         invites.delete(input.invite_hash);
-        result = ticketEncode(input.entry_id, hex(secret));
+        result = ticketEncode(input.entry, hex(secret));
         secret.fill(0);
         break;
       }
@@ -375,6 +386,7 @@ for await (const line of createInterface({ input: process.stdin })) {
         const connection = connections.get(input.connection || 'main');
         if (!connection) throw new Error('no connection');
         if (input.op === 'request') result = await connection.request(input.method, input.params || {});
+        else if (input.op === 'drop_response') result = await connection.dropResponse(input.method, input.params || {});
         else if (input.op === 'drop') result = connection.drop(input.method, input.params || {});
         else if (input.op === 'events') result = connection.events;
         else throw new Error('unknown client command');
@@ -386,6 +398,65 @@ for await (const line of createInterface({ input: process.stdin })) {
 for (const connection of connections.values()) connection.close();
 for (const key of roots.values()) key.free();
 """
+
+
+def client_response_drop_selfcheck():
+    start = CLIENT_SOURCE.index("  const send =")
+    end = CLIENT_SOURCE.index("\n}\nfor await", start)
+    factory = "const factory = new Function('pending', 'events', 'close', 'queued', 'channel', 'socket', 'encoder', " \
+              + json.dumps("let sequence = 0; let closed = false; let failure;\n" + CLIENT_SOURCE[start:end]) + ");\n"
+    check = r"""
+import assert from 'node:assert/strict';
+function fixture() {
+  const pending = new Map();
+  let sent;
+  let closes = 0;
+  const channel = { sealMessage: bytes => [bytes] };
+  const socket = { send: bytes => { sent = JSON.parse(new TextDecoder().decode(bytes)); } };
+  const connection = factory(pending, [], () => { closes++; }, [], channel, socket, new TextEncoder());
+  return { connection, pending, sent: () => sent, closes: () => closes,
+    deliver(response) {
+      const request = pending.get(response.id);
+      if (!request) return false;
+      pending.delete(response.id); clearTimeout(request.timer); request.resolve(response); return true;
+    },
+  };
+}
+const params = { method: 'create_bot', bot_id: 'fixed-bot', attestation: { signature: 'fixed-signed-fixture' } };
+const success = fixture();
+const outstanding = success.connection.dropResponse('rpc', params);
+let exposed = false;
+outstanding.then(() => { exposed = true; });
+await Promise.resolve();
+assert.equal(exposed, false); assert.equal(success.closes(), 0);
+assert.deepEqual(success.sent().params, params);
+assert.equal(success.deliver({ id: 'wrong-id', result: {} }), false);
+assert.equal(success.closes(), 0);
+assert.equal(success.deliver({ id: success.sent().id, result: { private: 'MUST-NOT-REACH-PYTHON' } }), true);
+const marker = await outstanding;
+assert.deepEqual(marker, { sent: true, application_reply_discarded: true });
+assert.equal(JSON.stringify(marker).includes('MUST-NOT-REACH-PYTHON'), false);
+assert.equal(success.closes(), 1); assert.equal(success.pending.size, 0);
+for (const error of ['authoritative fixture refusal', '', null]) {
+  const rejected = fixture();
+  const response = rejected.connection.dropResponse('rpc', params);
+  rejected.deliver({ id: rejected.sent().id, error, result: { private: 'MUST-NOT-REACH-PYTHON' } });
+  await assert.rejects(response, /request rejected before reply discard/);
+  assert.equal(rejected.closes(), 0); assert.equal(rejected.pending.size, 0);
+}
+const immediate = fixture();
+assert.deepEqual(immediate.connection.drop('rpc', params), { sent: true });
+assert.deepEqual(immediate.sent().params, params);
+assert.equal(immediate.closes(), 1); assert.equal(immediate.pending.size, 0);
+console.log(JSON.stringify({ status: 'PASS', matching_response_required: true, success_body_exposed: false,
+  rejected_responses: 3, immediate_drop_preserved: true, network_sockets: 0 }));
+"""
+    result = subprocess.run(["node", "--input-type=module"], input=factory + check, text=True, capture_output=True)
+    require(result.returncode == 0, "the response-drop helper selfcheck passes without a Node service or network")
+    value = json.loads(result.stdout)
+    require(value["status"] == "PASS" and value["success_body_exposed"] is False,
+            "successful replies stay private to the discard boundary")
+    print(result.stdout.strip())
 
 
 class Client:
@@ -405,8 +476,8 @@ class Client:
         require(0 < _wait_timeout <= 30, "client command wait stays within its original deadline")
         if self.process is None:
             self.process = subprocess.Popen(
-                ["node", str(self.helper), *([str(self.identity_file)] if self.identity_file else [])], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                ["node", "--v8-pool-size=1", str(self.helper), *([str(self.identity_file)] if self.identity_file else [])], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, bufsize=1, env={**os.environ, "UV_THREADPOOL_SIZE": "1"})
         self.process.stdin.write(json.dumps({"op": op, **arguments}) + "\n")
         self.process.stdin.flush()
         require(select.select([self.process.stdout], [], [], _wait_timeout)[0], "WASM client command completed before timeout")
@@ -559,8 +630,8 @@ class Client:
         tampered = copy.deepcopy(made["record"])
         tampered["expires_at_ms"] += 1
         self.call("invite", {"record": tampered}, status=400)
-        self.call("invite", {"record": made["record"]})
-        ticket = self.command("invite_ticket", invite_hash=made["record"]["invite_hash"], entry_id=self.device_id)
+        registered = self.call("invite", {"record": made["record"]})
+        ticket = self.command("invite_ticket", invite_hash=made["record"]["invite_hash"], entry=registered["entry"])
         return f"vibeface://join/{ticket}"
 
     def directory_state(self):
@@ -569,6 +640,18 @@ class Client:
     def pending_join(self, device_id):
         requests = self.call("join_status")["requests"]
         return next((item for item in requests if item["device_id"] == device_id), None)
+
+    def revealed_join(self, request):
+        if request and request["status"] == "pending":
+            self.start_approval(request["join_id"])
+            return None
+        return request if request and request.get("joiner_nonce") else None
+
+    def named_pairing(self, name):
+        request = next((item for item in self.call("join_status")["requests"]
+                        if item["name"] == name and item["kind"] == "client"
+                        and item["status"] in ("pending", "confirming")), None)
+        return self.revealed_join(request)
 
     def start_approval(self, join_id):
         request = self.call("approve", {"join_id": join_id, "admin_nonce": uuid.uuid4().hex + uuid.uuid4().hex})
@@ -630,7 +713,7 @@ class Client:
 
 
 class Node:
-    def __init__(self, run, name, binary, workspace, helper, *, init_args=None, port=None):
+    def __init__(self, run, name, binary, workspace, helper, *, init_args=None, port=None, local_port=None):
         self.name = name
         self.binary = binary
         self.directory = run / name
@@ -638,7 +721,8 @@ class Node:
         require(0 < self.port < 65536, "Node listener uses a valid port")
         _assigned_ports.add(self.port)
         self.quic_port = available_port() if port is not None else self.port
-        self.local_port = available_port()
+        self.local_port = local_port if local_port is not None else available_port()
+        _assigned_ports.add(self.local_port)
         self.url = f"http://127.0.0.1:{self.port}"
         self.client = Client(self.url, helper, identity_file=self.directory / "client-identity.json")
         self.process = None
@@ -647,8 +731,8 @@ class Node:
             arguments = [str(binary), "init", "--data-dir", str(self.directory),
                          "--listen", f"127.0.0.1:{self.port}", "--local-listen", f"127.0.0.1:{self.local_port}",
                          *(init_args if init_args is not None else ["--root", str(workspace)])]
-            if not any(arg == "--bootstrap" or arg.startswith("--bootstrap=") for arg in arguments):
-                arguments.extend(["--bootstrap", "off"])
+            if not any(arg.split("=")[0] in ("--no-mesh", "--bootstrap", "--mesh-network") for arg in arguments):
+                arguments.append("--no-mesh")
             result = subprocess.run(arguments, capture_output=True, timeout=45)
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"{name}: CLI initialization timed out") from None
@@ -657,12 +741,12 @@ class Node:
                 "new private Node data uses the current data epoch")
         self.configure(timeout_secs=60)
         self.configure_network(bind=f"127.0.0.1:{self.quic_port}")
-        result = subprocess.run([str(binary), "access", "--json", "--data-dir", str(self.directory)],
-                                capture_output=True, timeout=15)
-        require(result.returncode == 0, f"{name}: local access material is available")
-        self.access = json.loads(result.stdout)
-        require(self.access["device_id"], "local access pins the Node identity")
-        self.device_id = self.client.device_id = self.access["device_id"]
+        self.device_id = self.client.device_id = node_status(self)["device_id"]
+        require(self.device_id, "the initialized data directory pins the Node identity")
+        # The owner's access material exists only while the Node runs; `start` reads it once the listener publishes it.
+        self.access = None
+        # The owner's access link for a browser, read on the first web start while the Node is still uninitialized.
+        self.entry = None
 
     def configure(self, *, app_server=None, **values):
         path = self.directory / "config.json"
@@ -672,15 +756,22 @@ class Node:
             configuration["providers"]["codex_app_server"] = app_server
             configuration["providers"]["execution"] = ["codex"]
             if app_server["mode"] == "spawn":
-                env_path = self.directory / "provider-env.json"
-                providers = json.loads(env_path.read_text()) if env_path.exists() else {}
-                providers.setdefault("codex", {})["CODEX_HOME"] = str(self.directory / "home/.codex")
-                private_json(env_path, providers)
+                configuration.setdefault("provider_env", {}).setdefault("codex", {})["CODEX_HOME"] = str(self.directory / "home/.codex")
         private_json(path, configuration)
 
     def configure_network(self, **values):
         network = json.loads((self.directory / "config.json").read_text())["network"]
         self.configure(network={**network, **values})
+
+    @property
+    def mesh_address(self):
+        """This Node as a mesh bootstrap node."""
+        return f"vibeface://node/{self.device_id}?addr=127.0.0.1:{self.quic_port}"
+
+    def configure_mesh(self, network, bootstrap=()):
+        """Joins the loopback mesh `network` through `bootstrap`; loopback fixtures need private addresses."""
+        self.configure_network(mesh={"enabled": True, "network": network, "bootstrap": list(bootstrap),
+                                     "allow_private": True})
 
     def environment(self):
         """A private HOME, so session scans and hooks never see the operator's own ~/.codex or ~/.claude."""
@@ -702,14 +793,17 @@ class Node:
 
     def start(self, *, env=None, no_web=False, bare=False):
         require(self.process is None, f"{self.name}: process is stopped before start")
+        configuration = json.loads((self.directory / "config.json").read_text())
+        credential = self.directory / "local-access.json"
+        stale = credential.read_bytes() if credential.exists() else None
         self.log = (self.directory / "process.log").open("ab")
         self.process = subprocess.Popen(
             [str(self.binary), *([] if bare else ["serve"]), "--data-dir", str(self.directory),
              *(["--no-web"] if no_web else [])],
             stdin=subprocess.DEVNULL, stdout=self.log, stderr=self.log,
             start_new_session=True, env=env or self.environment())
-        configuration = json.loads((self.directory / "config.json").read_text())
-        if no_web or not configuration["web_enabled"]:
+        web = not no_web and configuration["web_enabled"]
+        if not web:
             health = wait_for(f"{self.name} headless maintenance socket", lambda: (
                 value if (value := node_status(self))["status"] == "running" and value["web_enabled"] is False else None))
             require(health["device_id"] == self.device_id, f"{self.name}: maintenance pins its identity")
@@ -720,6 +814,36 @@ class Node:
                 return pinned_info(self) if configuration.get("tls") else self.client.request("/api/info")
             info = wait_for(f"{self.name} HTTP listener", listener)
             require(info["device_id"] == self.device_id, f"{self.name}: serves its own device identity")
+        def published():
+            if self.process.poll() is not None:
+                raise RuntimeError(f"{self.name}: Node exited {self.process.returncode}; inspect {self.directory / 'process.log'}")
+            return local_owner(self) if credential.read_bytes() != stale else None
+        # Every start publishes a fresh owner credential for the local listener; the last run's file does not count.
+        launcher = wait_for(f"{self.name} publishes its local owner credential", published)
+        require(launcher["origin"] == f"http://127.0.0.1:{self.local_port}" and launcher["node_id"] == self.device_id
+                and credential.stat().st_mode & 0o077 == 0,
+                f"{self.name}: the owner credential is private and names this Node's exact local origin")
+        # A public node forwards browsers to any device and answers no local setup, so it has no owner link to check.
+        if web and self.access is None and not configuration["forwarding"]["any"]:
+            result = subprocess.run([str(self.binary), "access", "--json", "--data-dir", str(self.directory)],
+                                    capture_output=True, timeout=15)
+            require(result.returncode == 0, f"{self.name}: local access material is available: {result.stderr.decode(errors='replace')[-300:]}")
+            self.access = json.loads(result.stdout)
+            require(self.access["device_id"] == self.device_id, "local access pins the Node identity")
+            # A `--tls` listener answers no plain HTTP (`pinned_info` covers it); the owner link below uses the loopback listener.
+            if not configuration.get("tls"):
+                setup = self.client.request("/api/local/setup", {})
+                require(setup["kind"] == ("owner_required" if self.access.get("capability") else "initialized")
+                        and not {"invitation", "local_launch", "capability"} & set(setup),
+                        "an anonymous local setup on the public listener reports only the Node's state")
+            if self.access.get("capability"):
+                link = subprocess.run([str(self.binary), "access", "--data-dir", str(self.directory)],
+                                      capture_output=True, text=True, timeout=15)
+                require(self.access["url"] == launcher["origin"] and link.returncode == 0
+                        and bootstrap_entry(link.stdout.strip()) == {"url": launcher["origin"], "device_id": self.device_id,
+                                                                     "capability": self.access["capability"]},
+                        "the owner's access link carries the bootstrap entry a browser consumes")
+                self.entry = link.stdout.strip()
         require(self.process.poll() is None, f"{self.name}: independent process remains running")
 
     def stop(self, *, crash=False):
@@ -747,7 +871,7 @@ class Node:
         link = owner.invite()
         encoded = link.removeprefix("vibeface://join/vibeface1").upper()
         ticket = base64.b32decode(encoded + "=" * (-len(encoded) % 8))
-        require(len(ticket) == 65 and ticket[0] == 1, "CLI join ticket holds only the entry device ID and secret")
+        require(ticket[0] == 1 and len(ticket) > 65, "CLI join ticket carries the entry's node link and secret")
         log_path = self.directory / f"join-cli-{uuid.uuid4().hex[:8]}.log"
         log = os.fdopen(os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb")
         process = None
@@ -759,11 +883,7 @@ class Node:
             def revealed():
                 if process.poll() is not None:
                     raise RuntimeError(f"{self.name}: CLI join exited {process.returncode}; see {log_path}")
-                request = owner.pending_join(self.device_id)
-                if request and request["status"] == "pending":
-                    owner.start_approval(request["join_id"])
-                    return None
-                return request if request and request.get("joiner_nonce") else None
+                return owner.revealed_join(owner.pending_join(self.device_id))
             request = wait_for(f"{self.name} reveals its join nonce", revealed)
             code = owner.command("short_code", request=request)
             shown = wait_for("the CLI shows its short code", lambda: code.encode() in log_path.read_bytes())
@@ -813,12 +933,19 @@ def pinned_info(node, certificate=None):
     return json.loads(body)
 
 
-def local_discovery(run, binary, workspace, helper, cleanup, name="DISCOVERY"):
-    """A started Node serving discovery on loopback, with no relay. Invites carry only the entry's device ID,
-    so a CLI join finds its entry here; give `discovery_address` to the joiner and the entry before they start."""
-    node = Node(run, name, binary, workspace, helper, init_args=["--serve-discovery"])
+def mesh_network():
+    """A fresh mesh name, so a run never meets another run's or the public mesh's records."""
+    return "t-" + uuid.uuid4().hex[:12]
+
+
+def local_bootstrap(run, binary, workspace, helper, cleanup, name="BOOT"):
+    """A started Node that is the bootstrap node of a fresh loopback mesh, with no relay. Invites carry the
+    entry's NodeLink; the CLI can also look up the entry through this mesh: call
+    `configure_mesh(boot.mesh_network, [boot.mesh_address])` on the joiner and the entry before they start."""
+    node = Node(run, name, binary, workspace, helper)
     cleanup.append(node)
-    node.discovery_address = f"vibeface://{node.device_id}@localhost:{node.quic_port}"
+    node.mesh_network = mesh_network()
+    node.configure_mesh(node.mesh_network)
     node.start()
     return node
 
@@ -1095,13 +1222,9 @@ def native_clipboard_selfcheck(options):
         marker.unlink()
         marker.symlink_to(target)
         calls.clear()
-        try:
+        with TestCase().assertRaises(AssertionError, msg='native clipboard must reject a symlinked marker'):
             native_provider_clipboard(invitation, env=env, cwd=cwd, runner=runner,
                                       system="darwin", xcrun_path="/usr/bin/xcrun")
-        except AssertionError:
-            pass
-        else:
-            raise AssertionError("native clipboard must reject a symlinked marker")
         require(not calls, "a symlinked marker is refused before invoking xcrun")
         marker.unlink()
         marker.write_text(simulator + "\n")
@@ -1807,13 +1930,19 @@ def fixture_manager(run, initial, bot):
         completed = fixture_cli(initial, "tool", name, "--json", json.dumps(arguments),
                                 "--call-ref", arguments["call_ref"], check=False)
         accepted = completed.returncode == 0
+        result = json.loads(completed.stdout) if accepted else None
         fixture_record(run, "manager-tools.jsonl", {"conversation_id": context["conversation_id"], "trigger": trigger,
                        "name": name, "cli": True, "accepted": accepted, "expected": expected,
-                       "call_ref": arguments["call_ref"], "result": json.loads(completed.stdout) if accepted else None,
+                       "call_ref": arguments["call_ref"], "result": result,
                        "error": completed.stderr[-2048:]})
         require(accepted == expected and (accepted or rejection in completed.stderr),
                 name + " from the Shell has its expected outcome: " + completed.stderr[-300:])
-        return json.loads(completed.stdout) if accepted else None
+        if accepted:
+            record = result["call_record"]
+            require(record["tool"] == name and record["call_ref"] == arguments["call_ref"] and record["stage"] == "result"
+                    and (record["confirmation"] not in {"unknown", "pending"} or record["retry"] == "lookup_same_ref"),
+                    "the Shell preserves call identity and the Node's reconciliation requirement")
+        return result
 
     if directive.get("paid_delivery_security") is True:
         fixture_paid_principals(run, initial, bot, tool)
@@ -2196,6 +2325,74 @@ def verify_recovery_approval(node, other, network):
     return checkpoint
 
 
+CONVERSATION_HISTORY_PATHS = {
+    "messages": ("messages",), "works": ("works",), "changes": ("changes",),
+    "questions": ("questions",), "sessions": ("sessions",), "checks": ("checks",),
+    "deliveries": ("deliveries",), "overwritten": ("overwritten",),
+    "jobs": ("scheduler", "jobs"), "scope_jobs": ("scheduler", "scope_jobs"),
+    "unanswered": ("scheduler", "unanswered"),
+    "owner_jobs": ("scheduler", "remote", "jobs"),
+    "owner_scope_jobs": ("scheduler", "remote", "scope_jobs"),
+    "owner_memory_conflicts": ("scheduler", "remote", "memory_conflicts"),
+    "skills": ("bot_settings", "skills"), "schedules": ("bot_settings", "schedules"),
+    "memory": ("bot_settings", "memory"), "memory_conflicts": ("bot_settings", "memory_conflicts"),
+    "memory_sync_conflicts": ("bot_settings", "memory_sync_conflicts", "items"),
+}
+
+
+def conversation_snapshot(client, conversation_id, *, sections=("messages", "works", "jobs")):
+    """Read a bounded snapshot and complete only the sections this oracle needs."""
+    def bounded(value):
+        require(len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()) < 3 * 1024 * 1024,
+                "each conversation/history response stays below 3 MiB")
+        return value
+
+    def continuation(coverage):
+        require(isinstance(coverage, dict) and type(coverage.get("complete")) is bool,
+                "history coverage explicitly declares completeness")
+        cursor = coverage["next_cursor"]
+        require(cursor is None or isinstance(cursor, str) and 0 < len(cursor) <= 8192,
+                "history continuation is one bounded opaque cursor")
+        require(coverage["complete"] == (cursor is None), "history cursor and completeness agree")
+        return cursor
+
+    snapshot = bounded(client.rpc("conversation", conversation_id=conversation_id))
+    require(snapshot["conversation"]["conversation_id"] == conversation_id,
+            "conversation snapshot retains its requested scope")
+    authority = snapshot["history_authority"]
+    require(isinstance(authority, str) and authority, "conversation snapshot has a projection authority")
+    for section in sections:
+        require(section in CONVERSATION_HISTORY_PATHS, "oracle requests one current typed history section")
+        if section in ("owner_jobs", "owner_scope_jobs", "owner_memory_conflicts"):
+            require(snapshot["scheduler"]["remote"]["reachable"] is True,
+                    "offline owner history remains unknown until the owner is reachable")
+        path = CONVERSATION_HISTORY_PATHS[section]
+        parent = snapshot
+        for key in path[:-1]:
+            parent = parent[key]
+        items = parent[path[-1]]
+        require(isinstance(items, list), "history section retains its typed item array")
+        cursor = continuation(snapshot["history"][section])
+        seen = set()
+        while cursor is not None:
+            require(cursor not in seen, "history traversal advances without a cursor loop")
+            seen.add(cursor)
+            page = bounded(client.rpc("conversation_history", conversation_id=conversation_id,
+                                      section=section, cursor=cursor, limit=100))
+            require(page["conversation_id"] == conversation_id and page["section"] == section,
+                    "history page retains its requested conversation and section")
+            require(page["history_authority"] == authority,
+                    "one complete oracle read retains its original projection authority")
+            require(isinstance(page["items"], list) and len(page["items"]) <= 100,
+                    "history response contains at most the requested typed item count")
+            items[0:0] = page["items"]
+            cursor = continuation(page)
+        snapshot["history"][section] = {"next_cursor": None, "complete": True}
+        if section == "memory_sync_conflicts":
+            snapshot["bot_settings"]["memory_sync_conflicts"]["has_more"] = False
+    return snapshot
+
+
 def scheduler_records(node, network):
     with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
         connection.row_factory = sqlite3.Row
@@ -2258,7 +2455,7 @@ def bot_checks(run, workspace, a, network, passed, outsider):
     for definition, invocation in zip(definitions, first):
         require(invocation["bot_prompt_markers"] == [definition["instructions"]],
                 "each management prompt receives only its own Bot instructions")
-        snapshot = a.client.rpc("conversation", conversation_id=definition["conversation_id"])
+        snapshot = conversation_snapshot(a.client, definition["conversation_id"])
         require(snapshot["bot"] == next(bot for bot in stored if bot["bot_id"] == definition["bot_id"])
                 and [message["message_id"] for message in snapshot["messages"] if message["role"] == "user"]
                     == ["bot-message-" + definition["bot_id"]], "two Bots retain separate definitions and message histories")
@@ -2293,11 +2490,32 @@ def node_cli(node, *arguments, socket=None, check=True, timeout=60, stdin=None):
     return completed
 
 
-def local_post(node, path, body):
-    """A same-device caller on the Node's loopback-only listener, such as a hook."""
-    request = urllib.request.Request(f"http://127.0.0.1:{node.local_port}{path}", json.dumps(body).encode(),
-                                     {"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=10) as response:
+def local_owner(node):
+    """The credential the Node published for its local listener; only the owner's OS account can read it."""
+    return json.loads((node.directory / "local-access.json").read_text())
+
+
+def bootstrap_entry(url):
+    """What a browser reads from the owner's access link: the fragment, never a request of its own."""
+    fragment = urllib.parse.urlsplit(url).fragment
+    require(fragment.startswith("bootstrap="), "the access link carries its bootstrap entry in the fragment")
+    encoded = fragment[len("bootstrap="):]
+    return json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+
+
+def local_post(node, path, body, *, status=200, owner=True):
+    """A same-device owner process on the Node's local listener, such as a hook: the exact published origin and bearer."""
+    launcher = local_owner(node)
+    headers = {"Content-Type": "application/json"}
+    if owner:
+        headers["Authorization"] = "Bearer " + launcher["capability"]
+    request = urllib.request.Request(launcher["origin"] + path, json.dumps(body).encode(), headers)
+    try:
+        response = urllib.request.urlopen(request, timeout=10)
+    except urllib.error.HTTPError as error:
+        response = error
+    with response:
+        require(response.status == status, f"{path}: expected HTTP {status}, received {response.status}")
         return json.load(response)
 
 
@@ -2306,7 +2524,7 @@ def work_checks(run, workspace, a, network, passed):
         return [row for row in fixture_records(run, "codex-rpc.jsonl") if row["message"].get("method") == method and not row["bot"]]
 
     def snapshot(name):
-        return a.client.rpc("conversation", conversation_id=name)
+        return conversation_snapshot(a.client, name)
 
     def work(name, work_id):
         return next((row for row in snapshot(name)["works"] if row["work_id"] == work_id), None)
@@ -2395,8 +2613,16 @@ def work_checks(run, workspace, a, network, passed):
     name = "chat-work-steer"
     directory, receipt, work_id = start(name)
     running = wait_for("the steered work is running", lambda: in_state(name, work_id, "running"))
+    sends_before = len(rpc("turn/start")) + len(rpc("turn/steer"))
     shell = node_cli(a, "codex", "send", running["thread_id"], "x", "--id", "shell-1", socket=socket_path, check=False)
-    require(shell.returncode != 0 and "bot turn" in shell.stderr, "codex send outside a bot turn is refused")
+    rejected = json.loads(shell.stderr.splitlines()[0])
+    record = rejected["call_record"]
+    require(shell.returncode != 0 and not shell.stdout and rejected["code"] == "tool_not_authorized"
+            and record["tool"] == "dispatch_work" and record["call_ref"] == "shell-1"
+            and record["stage"] == "authorization" and record["execution"] == "not_started"
+            and record["confirmation"] == "confirmed" and record["retry"] == "none"
+            and len(rpc("turn/start")) + len(rpc("turn/steer")) == sends_before,
+            "codex send outside a bot turn is refused before any send")
     steer_label = name + "-send"
     steer_receipt = a.client.rpc("message", conversation_id=name, message_id=steer_label, report_results=True,
         text=json.dumps({"chat_agent": True, "label": steer_label, "send": {
@@ -2673,7 +2899,7 @@ def triage_checks(run, workspace, a, network, passed):
                 (row for row in fixture_records(run, "manager-native-work.jsonl")
                  if row["label"] == label and row["trigger"] == receipt["trigger"]), None))
             source = wait_for("the hook's source Work finishes with its real native turn", lambda: next(
-                (row for row in a.client.rpc("conversation", conversation_id=owner)["works"]
+                (row for row in conversation_snapshot(a.client, owner, sections=("works",))["works"]
                  if row["work_id"] == dispatch["work_id"] and row["state"] == "finished"
                  and row.get("thread_id") and row.get("turn_id")), None), timeout=60)
             require(source["trigger"] == receipt["trigger"] and source["target_node"] == a.device_id
@@ -2745,7 +2971,7 @@ def triage_checks(run, workspace, a, network, passed):
                 and answer_detail["work_id"] == answer_work and answer_detail["trigger"] == acted[0]["trigger"]
                 and answer_detail["target"] == question["target"] and answer_detail["thread_id"] == thread_id
                 and not any(row["work_id"] == answer_work
-                            for row in a.client.rpc("conversation", conversation_id=owner)["works"]),
+                            for row in conversation_snapshot(a.client, owner, sections=("works",))["works"]),
                 "the Answer manager and its native work keep the original Work scope and stay outside Main")
         told = wait_for("the webhook hears the answer", lambda: [row for row in receiver.deliveries
                         if row["event_id"].startswith("answered-" + question_id + "-") and row["status"] == 200] or None, timeout=60)
@@ -2895,8 +3121,9 @@ def no_agent_checks(run, a, passed):
     a.start()
     a.client.connect()
     a.client.authenticate()
-    dropped = local_post(a, "/api/hooks", {"source": "hook", "agent": "codex", "event": "turn_end",
-                                           "session_id": "no-agent", "turn_id": "t", "cwd": "/tmp"})
+    event = {"source": "hook", "agent": "codex", "event": "turn_end", "session_id": "no-agent", "turn_id": "t", "cwd": "/tmp"}
+    local_post(a, "/api/hooks", event, status=401, owner=False)
+    dropped = local_post(a, "/api/hooks", event)
     require(dropped["status"] == "dropped", "without an Agent an event is dropped, not queued")
     marker = run / "fixture-codex-global-request"
     marker.write_text(uuid.uuid4().hex[:8])
@@ -3008,7 +3235,7 @@ def bot_settings_checks(run, a, network, passed):
         return receipt
 
     def snapshot(conversation=name):
-        return a.client.rpc("conversation", conversation_id=conversation)
+        return conversation_snapshot(a.client, conversation)
 
     def results(trigger, tool_name):
         return [row for row in fixture_records(run, "manager-tools.jsonl")
@@ -3186,7 +3413,7 @@ def provider_runtime_checks(run, workspace, node, network, passed):
         disabled = node.client.rpc("message", conversation_id=scope, message_id="runtime-default-off",
                                    text=json.dumps({"chat_agent": True, "tools": []}))
         failed = wait_for("disabled backup records the original refusal", lambda:
-            next((job for job in node.client.rpc("conversation", conversation_id=scope)["scheduler"]["jobs"]
+            next((job for job in conversation_snapshot(node.client, scope, sections=("jobs",))["scheduler"]["jobs"]
                   if job["trigger"] == disabled["trigger"] and job["state"] == "failed"), None))
         require(failed["runtime"]["execution"] == "not_started" and failed["retryable"]
                 and failed["runtime"]["stage"] == "turn_start" and failed["runtime"]["switched_from"] is None,
@@ -3196,7 +3423,7 @@ def provider_runtime_checks(run, workspace, node, network, passed):
         sent = node.client.rpc("message", conversation_id=scope, message_id="runtime-explicit-backup",
                                text=json.dumps({"chat_agent": True, "tools": []}))
         completed = wait_for("explicit backup completes exactly one accepted turn", lambda:
-            next((job for job in node.client.rpc("conversation", conversation_id=scope)["scheduler"]["jobs"]
+            next((job for job in conversation_snapshot(node.client, scope, sections=("jobs",))["scheduler"]["jobs"]
                   if job["trigger"] == sent["trigger"] and job["state"] == "completed"), None))
         runtime = completed["runtime"]
         attempts = [row["message"]["params"] for row in fixture_records(run, "codex-rpc.jsonl")
@@ -3212,7 +3439,7 @@ def provider_runtime_checks(run, workspace, node, network, passed):
                  if row["accepted"] and row["name"] in WORK_TOOLS | WAKE_TOOLS | SETTINGS_TOOLS] == tools_before,
                 "neither the refused turn nor the backup repeats a tool effect")
         node.client.call("configure_node", original)
-        frozen = next(job for job in node.client.rpc("conversation", conversation_id=scope)["scheduler"]["jobs"]
+        frozen = next(job for job in conversation_snapshot(node.client, scope, sections=("jobs",))["scheduler"]["jobs"]
                       if job["trigger"] == sent["trigger"])
         require(frozen["runtime"] == runtime, "later settings never rewrite a historical turn runtime")
         passed("backup is off by default; an explicit unstarted quota fallback sends once with frozen model and effort",
@@ -3368,7 +3595,7 @@ def phase1_acceptance(options):
                 and (label is None or record["label"] == label)]
 
     def conversation(name):
-        return a.client.rpc("conversation", conversation_id=name)
+        return conversation_snapshot(a.client, name)
 
     def new_conversation(name):
         a.client.rpc("create_bot", bot_id="bot-" + name, conversation_id=name, name=name, instructions="",
@@ -3400,9 +3627,9 @@ def phase1_acceptance(options):
              if row["event"] == "turn_started" and row["thread_id"] == thread), None))
         return thread, turn
 
-    def native_inputs(labels):
+    def native_inputs(labels, *, event="input"):
         return [row for row in fixture_records(run, "codex-inputs.jsonl")
-                if row["event"] == "input" and row["message_id"] in labels]
+                if row["event"] == event and row["message_id"] in labels]
 
     def inputs_before_completion(thread, turn, labels, *, acknowledged=True):
         rows = native_inputs(labels)
@@ -3467,12 +3694,12 @@ def phase1_acceptance(options):
         wait_for("A receives its client grant", lambda: a.client.authenticate())
 
     try:
-        discovery = local_discovery(run, binary, workspace, helper, nodes).discovery_address
+        boot = local_bootstrap(run, binary, workspace, helper, nodes)
         a = Node(run, "A", binary, workspace, helper)
         nodes.append(a)
         a.configure(timeout_secs=600, manager=manager, bins={"codex": str(codex)}, app_server=SPAWN_APP_SERVER,
                     daily_decision_limit=100)
-        a.configure_network(discovery=[discovery])
+        a.configure_mesh(boot.mesh_network, [boot.mesh_address])
         a.start()
         network = a.bootstrap()
         a.client.call("subscribe")
@@ -3521,8 +3748,14 @@ def phase1_acceptance(options):
             [event["payload"] for event in a.client.command("events") if event.get("payload", {}).get("type") == "records"
              and event["payload"]["conversation_id"] == name
              and any(row["message_id"] == "queue-first" and row["rank"] for row in event["payload"]["messages"])])
-        require(all(isinstance(row["jobs"], list) and isinstance(row["works"], list) for row in pushed),
-                "pushed records carry the conversation's jobs and changed works")
+        refreshed = conversation(name)
+        require(all(isinstance(row["messages"], list) and isinstance(row["works"], list)
+                    and row["refresh_metadata"] is True
+                    and row["history_authority"] == refreshed["history_authority"] for row in pushed),
+                "exact pushed message/work records request metadata refresh under the same authority")
+        require({job["trigger"] for job in refreshed["scheduler"]["jobs"]}
+                == {first["trigger"], second["trigger"], cancelled_queued["trigger"]},
+                "the authenticated metadata refresh recovers every durable local job")
         active_before = state(first, "running")
         require(active_before, "original reply remains running before queued cancellation")
         cancelled_reply = a.client.rpc("cancel_manager", conversation_id=name, trigger=cancelled_queued["trigger"])
@@ -3576,8 +3809,7 @@ def phase1_acceptance(options):
         labels = ["steer-m1", "steer-m2", "steer-m3"]
         joined, texts = batch_inputs(name, labels)
         wait_for("three concurrent messages reach the current native turn", lambda: len(native_inputs(labels)) == 3)
-        wait_for("the native server acknowledges every input", lambda: sum(row["event"] == "input_ack"
-                 and row.get("message_id") in labels for row in fixture_records(run, "codex-inputs.jsonl")) == 3)
+        wait_for("the native server acknowledges every input", lambda: len(native_inputs(labels, event="input_ack")) == 3)
         inputs_before_completion(thread, turn, labels)
         target = {"kind": "bot_main", "bot_id": "bot-" + name}
         proofs = [wait_for("the owner reports actual provider acceptance", lambda label=label:
@@ -3611,9 +3843,7 @@ def phase1_acceptance(options):
         thread, turn = native_turn(name)
         (run / "fixture-codex-drop-steer-ack").write_text("ack-lost-input")
         joined, text = send(name, "ack-lost-input", report_results=True)
-        wait_for("the provider accepts the input before losing its ACK", lambda: any(
-            row["event"] == "ack_dropped" and row["message_id"] == "ack-lost-input"
-            for row in fixture_records(run, "codex-inputs.jsonl")))
+        wait_for("the provider accepts the input before losing its ACK", lambda: native_inputs(["ack-lost-input"], event="ack_dropped"))
         inputs_before_completion(thread, turn, ["ack-lost-input"], acknowledged=False)
         duplicate = a.client.rpc("message", conversation_id=name, message_id="ack-lost-input", text=text, report_results=True)
         require(duplicate["trigger"] == joined["trigger"], "client retry preserves the uncertain input's identity")
@@ -3641,9 +3871,7 @@ def phase1_acceptance(options):
         dropped_ack = run / "fixture-codex-drop-steer-ack"
         dropped_ack.write_text("slow-read-input")
         slow_joined, _ = send(slow, "slow-read-input", report_results=True)
-        wait_for("A's input is persisted before its ACK is lost", lambda: any(
-            row["event"] == "ack_dropped" and row["message_id"] == "slow-read-input"
-            for row in fixture_records(run, "codex-inputs.jsonl")))
+        wait_for("A's input is persisted before its ACK is lost", lambda: native_inputs(["slow-read-input"], event="ack_dropped"))
         wait_for("A's native read-back is held without completing its turn", lambda: any(
             row["event"] == "read_blocked" and row["thread_id"] == slow_thread
             for row in fixture_records(run, "codex-inputs.jsonl")))
@@ -3651,9 +3879,7 @@ def phase1_acceptance(options):
         dropped_ack.unlink()
         fast_joined, _ = send(fast, "independent-read-input", report_results=True)
         wait_for("B's input reaches its active turn while A's read is held", lambda: native_inputs(["independent-read-input"]))
-        wait_for("B gets its native input receipt independently", lambda: any(
-            row["event"] == "input_ack" and row["message_id"] == "independent-read-input"
-            for row in fixture_records(run, "codex-inputs.jsonl")))
+        wait_for("B gets its native input receipt independently", lambda: native_inputs(["independent-read-input"], event="input_ack"))
         inputs_before_completion(fast_thread, fast_turn, ["independent-read-input"])
         require(not read_gate.exists() and state(slow_first, "running") and state(fast_first, "running"),
                 "the blocked target remains live when the other target's provider accepts its input")
@@ -3686,9 +3912,7 @@ def phase1_acceptance(options):
         barrier = run / "fixture-codex-steer-barrier.json"
         private_json(barrier, {"message_id": "attachment-order-m1", "gate": str(native_gate)})
         with_image, _ = send(name, "attachment-order-m1", attachments=[attachment], report_results=True)
-        wait_for("the complete image waits at its controlled native input gate", lambda: any(
-            row["event"] == "input_blocked" and row["message_id"] == "attachment-order-m1"
-            for row in fixture_records(run, "codex-inputs.jsonl")))
+        wait_for("the complete image waits at its controlled native input gate", lambda: native_inputs(["attachment-order-m1"], event="input_blocked"))
         text_only, _ = send(name, "attachment-order-m2", report_results=True)
         labels = ["attachment-order-m1", "attachment-order-m2"]
         saved = conversation(name)["messages"]
@@ -3698,8 +3922,7 @@ def phase1_acceptance(options):
         native_gate.touch()
         barrier.unlink()
         wait_for("the complete image and following text reach the provider", lambda: len(native_inputs(labels)) == 2)
-        wait_for("both ordered inputs receive native ACKs", lambda: sum(row["event"] == "input_ack"
-                 and row.get("message_id") in labels for row in fixture_records(run, "codex-inputs.jsonl")) == 2)
+        wait_for("both ordered inputs receive native ACKs", lambda: len(native_inputs(labels, event="input_ack")) == 2)
         rows = inputs_before_completion(thread, turn, labels)
         expected_image = "data:image/png;base64," + base64.b64encode(image).decode()
         require([part["url"] for part in rows[0]["input"] if part["type"] == "image"] == [expected_image]
@@ -3758,9 +3981,7 @@ def phase1_acceptance(options):
             label = task_id + "-follow"
             joined, _ = send(name, label, target=target, expected_revision=1, report_results=True)
             wait_for("each follow-up reaches its own Task turn", lambda label=label: native_inputs([label]))
-            wait_for("each Task's provider ACK is visible", lambda label=label: any(
-                row["event"] == "input_ack" and row["message_id"] == label
-                for row in fixture_records(run, "codex-inputs.jsonl")))
+            wait_for("each Task's provider ACK is visible", lambda label=label: native_inputs([label], event="input_ack"))
             inputs_before_completion(thread, turn, [label])
             gate.touch()
             wait_for("the Task completes before the same workspace is used by its sibling", lambda: completed(first))
@@ -3808,7 +4029,7 @@ def phase1_acceptance(options):
         b.configure(timeout_secs=600, daily_decision_limit=100, manager=fixture_manager_settings(child_fixture, child_workspace),
                     bins={"codex": str(fixture_wrapper(child_fixture, "fixture-codex", "--fixture-codex"))},
                     app_server=SPAWN_APP_SERVER)
-        b.configure_network(discovery=[discovery])
+        b.configure_mesh(boot.mesh_network, [boot.mesh_address])
         b.pair(a)
         b.start()
         root_workspace = run / "delegate-root-workspace"
@@ -3822,7 +4043,7 @@ def phase1_acceptance(options):
                             manager=fixture_manager_settings(root_fixture, root_workspace),
                             bins={"codex": str(fixture_wrapper(root_fixture, "fixture-codex", "--fixture-codex"))},
                             app_server=SPAWN_APP_SERVER)
-        root_node.configure_network(discovery=[discovery])
+        root_node.configure_mesh(boot.mesh_network, [boot.mesh_address])
         root_node.pair(a)
         root_node.start()
         root_node.client = Client(root_node.url, helper, identity_file=a.client.identity_file)
@@ -3966,7 +4187,7 @@ def phase1_acceptance(options):
         for task_id, history, assignment_id, bot_id, expected in (
                 (root_task, root_conversation, root_assignment, root_bot, "delegate-root:complete"),
                 (child_task, child_conversation, child_assignment, child_bot, "delegate-child:complete")):
-            messages = a.client.rpc("conversation", conversation_id=history)["messages"]
+            messages = conversation_snapshot(a.client, history, sections=("messages",))["messages"]
             task_history = a.client.rpc("workspace_history", task_id=task_id, limit=100)
             replies = [row for row in task_history["events"] if row["kind"] == "message_posted"
                        and row["body"]["role"] == "assistant"]
@@ -4237,7 +4458,7 @@ def memory_sync_acceptance(options):
         return rows
 
     try:
-        discovery = local_discovery(run, binary, workspace, helper, nodes).discovery_address
+        boot = local_bootstrap(run, binary, workspace, helper, nodes)
         for name in ("A", "B"):
             node = Node(run, name, binary, workspace, helper)
             nodes.append(node)
@@ -4246,7 +4467,8 @@ def memory_sync_acceptance(options):
             node.configure(timeout_secs=600, daily_decision_limit=100, app_server=SPAWN_APP_SERVER,
                            manager=fixture_manager_settings(root, workspace),
                            bins={"codex": str(fixture_wrapper(root, "fixture-codex", "--fixture-codex"))})
-            node.configure_network(relays=[], n0_relays=False, discovery=[discovery])
+            node.configure_network(relays=[])
+            node.configure_mesh(boot.mesh_network, [boot.mesh_address])
         _, a, b = nodes
         a.start()
         network = a.bootstrap()
@@ -4469,6 +4691,469 @@ def memory_sync_acceptance(options):
             raise RuntimeError("Memory fixture cleanup failed; see " + str(run / "report.json"))
 
 
+def pin_npm_baseline(options):
+    import release
+
+    source = Path(__file__).resolve().parents[1]
+    output = options.artifacts.resolve()
+    require(output.is_relative_to(source / ".artifacts") and not output.exists(),
+            "npm baseline pinning requires a fresh checkout artifact directory")
+    candidate = release.run("git", "rev-parse", "HEAD", cwd=source)
+    require(os.environ.get("GITHUB_SHA", candidate) == candidate, "npm baseline pins this exact candidate source")
+    with urllib.request.urlopen("https://registry.npmjs.org/@leaperone%2fvibeface", timeout=30) as response:
+        encoded = response.read(4 * 1024 * 1024 + 1)
+    require(len(encoded) <= 4 * 1024 * 1024, "npm metadata is bounded")
+    registry = json.loads(encoded)
+    version = registry["dist-tags"]["nightly"]
+    require(release.version(version) == "nightly", "the public baseline is a real Nightly")
+    metadata = registry["versions"][version]
+    require(metadata["name"] == "@leaperone/vibeface" and metadata["version"] == version,
+            "the pinned registry version matches its package")
+    tarball = f"https://registry.npmjs.org/@leaperone/vibeface/-/vibeface-{version}.tgz"
+    integrity = metadata["dist"]["integrity"]
+    require(metadata["dist"]["tarball"] == tarball and re.fullmatch(r"sha512-[A-Za-z0-9+/]{86}==", integrity),
+            "the baseline has an immutable registry tarball and SHA-512 integrity")
+    tag = "v" + version
+    record = release.release_record(tag)
+    require(not record["draft"] and record["published_at"] and record["tag_name"] == tag
+            and not any(marker in (record.get("body") or "") for marker in (release.BUILDING_MARKER, release.FAILED_MARKER)),
+            "the baseline product release is public and complete")
+    remote = release.remote_assets_by_name(record["assets"])
+    require("release.json" in remote and all(release.remote_asset_sha256(asset) for asset in remote.values()),
+            "baseline product assets require immutable GitHub SHA-256 metadata")
+    baseline_source = json.loads(release.run("gh", "api", f"repos/{release.GITHUB_REPO}/commits/{tag}"))["sha"]
+    context = release.validate_source(baseline_source, "product", root=source)
+    require(baseline_source != candidate, "baseline and candidate must have different real source commits")
+    require(subprocess.run(["git", "merge-base", "--is-ancestor", context["ci_source_commit"], candidate],
+                           cwd=source, capture_output=True).returncode == 0,
+            "the baseline business source must be an ancestor of the candidate; future baselines are refused")
+    output.mkdir(parents=True, mode=0o700)
+    with tempfile.TemporaryDirectory(dir=output, prefix=".verify-") as scratch:
+        scratch = Path(scratch)
+
+        def download_asset(name):
+            for _ in range(3):
+                (scratch / name).unlink(missing_ok=True)
+                result = subprocess.run(["gh", "release", "download", tag, f"--repo={release.GITHUB_REPO}",
+                                         "--pattern", name, "--dir", str(scratch)], cwd=source, capture_output=True)
+                if result.returncode == 0:
+                    require(file_sha256(scratch / name) == release.remote_asset_sha256(remote[name]),
+                            "the pinned public product asset matches its immutable digest")
+                    return
+            raise AssertionError("cannot download pinned public product asset " + name)
+
+        expected = {"app": "product", "tag": tag, "version": version, "source_commit": baseline_source, "channel": "nightly"}
+        download_asset("release.json")
+        release.verify_remote_product_manifest(tag, release.GITHUB_REPO, expected, remote, scratch)
+        archive = output / "baseline.tgz"
+        for attempt in range(3):
+            digest = hashlib.sha512()
+            archive.unlink(missing_ok=True)
+            try:
+                with urllib.request.urlopen(tarball, timeout=90) as response, archive.open("xb") as stream:
+                    require(response.geturl() == tarball, "the pinned npm download does not redirect")
+                    size = 0
+                    for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                        size += len(chunk)
+                        require(size <= release.MAX_ARCHIVE, "the npm baseline archive is bounded")
+                        stream.write(chunk)
+                        digest.update(chunk)
+                break
+            except (OSError, http.client.HTTPException):
+                require(attempt < 2, "cannot download the pinned public npm baseline")
+        require("sha512-" + base64.b64encode(digest.digest()).decode() == integrity, "the baseline tarball matches registry integrity")
+        unpacked = release.unpack(archive, scratch / "npm")
+        npm = json.loads((unpacked / "package.json").read_text())
+        require(npm["name"] == "@leaperone/vibeface" and npm["version"] == version
+                and npm["bin"] == {"vibeface": "bin/vibeface.mjs"}
+                and not any(npm.get(key) for key in ("scripts", "dependencies", "optionalDependencies"))
+                and {path.name for path in (unpacked / "vendor").iterdir()} == set(release.TARGETS),
+                "the published npm baseline is a complete package without install hooks or downloaded dependencies")
+        builds = {}
+        for target in release.TARGETS:
+            vendor = unpacked / "vendor" / target
+            build = json.loads((vendor / "BUILD-INFO.json").read_text())
+            release.verify_build_info(build)
+            require(build["source_commit"] == baseline_source and build["version"] == version and build["target"] == target,
+                    "every baseline vendor belongs to the complete product source and current data epoch")
+            name = f"vibeface-{version}-{target}.tar.gz"
+            download_asset(name)
+            native = release.unpack(scratch / name, scratch / target)
+            require(release.files(native) == release.files(vendor), "npm vendor bytes equal the published native product bundle")
+            builds[target] = build
+        shutil.copyfile(scratch / "release.json", output / "release.json")
+        pin = {"version": version, "source_commit": baseline_source, "source_context": context,
+               "candidate_source": candidate, "published_at": registry["time"][version], "release_id": record["id"],
+               "integrity": integrity, "tarball": tarball, "sha256": file_sha256(archive),
+               "manifest_sha256": file_sha256(output / "release.json"), "builds": builds,
+               "business_source_relation": "same" if context["ci_source_commit"] == candidate else "ancestor"}
+        private_json(output / "pin.json", pin)
+    print("PASS pinned public npm baseline " + json.dumps({key: pin[key] for key in
+          ("version", "source_commit", "source_context", "candidate_source", "sha256", "manifest_sha256")}), flush=True)
+
+
+def npm_service_acceptance(options):
+    require(os.environ.get("GITHUB_ACTIONS") == "true"
+            and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted",
+            "npm service acceptance requires a disposable GitHub-hosted runner")
+    require(sys.platform in ("darwin", "linux"), "npm service acceptance requires launchd or systemd")
+    import fcntl
+    import tarfile
+
+    source = Path(__file__).resolve().parents[1]
+    artifacts = options.artifacts.resolve()
+    require(artifacts.is_relative_to(source / ".artifacts"), "npm service artifacts stay in the checkout")
+    binary, core = options.binary.resolve(strict=True), options.core_binary.resolve(strict=True)
+    root, vendor = binary.parent.parent, core.parent
+    require(binary.name == "vibeface.mjs" and root.name == "vibeface"
+            and root.parent.name == "@leaperone" and root.parents[1].name == "node_modules"
+            and root.parents[2].name == "lib" and root.is_relative_to(source / ".artifacts")
+            and vendor.parent == root / "vendor", "service acceptance uses an isolated scoped npm installation")
+    prefix = root.parents[3]
+    native = vendor / "vibeface"
+    module = options.crypto_module.resolve(strict=True)
+    require(module == vendor / "web/vibeface_secure.js", "the npm client uses its own packaged WASM")
+    require(options.npm_package is not None, "npm service acceptance requires the immutable CI npm artifact")
+    package = options.npm_package.resolve(strict=True)
+    require(package.is_relative_to(source / ".artifacts") and package.suffix == ".tgz",
+            "npm replacement uses the downloaded CI artifact")
+    metadata = json.loads((root / "package.json").read_text())
+    build = json.loads((vendor / "BUILD-INFO.json").read_text())
+    target = {("darwin", "arm64"): "aarch64-apple-darwin",
+              ("linux", "x86_64"): "x86_64-unknown-linux-gnu",
+              ("linux", "aarch64"): "aarch64-unknown-linux-gnu"}.get((sys.platform, os.uname().machine))
+    require(target is not None and build["target"] == target and metadata["name"] == "@leaperone/vibeface"
+            and metadata["version"] == build["version"] and build["data_epoch"] == DATA_EPOCH
+            and all(build[field] == os.environ.get("GITHUB_SHA")
+                    for field in ("source_commit", "core_source_commit", "app_source_commit")),
+            "the npm artifact pins this runner, source commit and current data format")
+    home = Path.home()
+    require(not list(home.glob(".vibeface*")), "the disposable runner has no existing Vibeface data")
+    manager_env = os.environ.copy()
+
+    def command(arguments, *, check=True):
+        result = subprocess.run([str(argument) for argument in arguments], capture_output=True, text=True,
+                                timeout=90, cwd=source, env=manager_env)
+        require(not check or result.returncode == 0,
+                f"{Path(arguments[0]).name} {arguments[1]} succeeds: {result.stderr[-400:]}")
+        return result
+
+    def manager_absent(unit):
+        if sys.platform == "darwin":
+            result = command(["/bin/launchctl", "print", f"{domain}/{unit}"], check=False)
+            return result.returncode != 0 and "Could not find service" in result.stderr
+        result = command(["/usr/bin/systemctl", "--user", "show", unit, "--property=LoadState", "--value"], check=False)
+        return result.stdout.strip() == "not-found"
+
+    if sys.platform == "darwin":
+        domain = f"gui/{os.getuid()}"
+        service_dir = home / "Library/LaunchAgents"
+        units = ("com.leaperone.vibeface.node", "com.leaperone.vibeface.update")
+        service_files = [service_dir / (unit + ".plist") for unit in units]
+        command(["/bin/launchctl", "print", domain])
+    else:
+        runtime = Path(f"/run/user/{os.getuid()}")
+        require(os.environ.get("XDG_CONFIG_HOME", str(home / ".config")) == str(home / ".config")
+                and os.environ.get("XDG_RUNTIME_DIR") == str(runtime)
+                and os.environ.get("DBUS_SESSION_BUS_ADDRESS") == f"unix:path={runtime}/bus"
+                and (runtime / "bus").is_socket(), "the real disposable user's D-Bus is available")
+        service_dir = home / ".config/systemd/user"
+        units = ("vibeface.service", "vibeface-update.service", "vibeface-update.timer")
+        service_files = [service_dir / unit for unit in units]
+        command(["/usr/bin/systemctl", "--user", "show-environment"])
+    require(all(manager_absent(unit) for unit in units), "the disposable manager has no existing default Vibeface service")
+    require(not any(path.exists() or path.is_symlink() for path in service_files),
+            "the disposable runner has no existing default service files")
+    require(options.npm_baseline is not None, "npm service acceptance requires a pinned public baseline")
+    baseline = options.npm_baseline.resolve(strict=True)
+    require(baseline.is_relative_to(source / ".artifacts"), "the pinned npm baseline stays in checkout artifacts")
+    pin = json.loads((baseline / "pin.json").read_text())
+    require(pin["candidate_source"] == build["source_commit"] and pin["source_commit"] != build["source_commit"]
+            and file_sha256(baseline / "baseline.tgz") == pin["sha256"]
+            and file_sha256(baseline / "release.json") == pin["manifest_sha256"]
+            and pin["builds"][target]["data_epoch"] == build["data_epoch"],
+            "the immutable baseline pins a different real source, this exact candidate and the same data epoch")
+
+    artifacts.mkdir(parents=True, exist_ok=True)
+    run = artifacts / ("npm-service-" + uuid.uuid4().hex[:10])
+    run.mkdir(mode=0o700)
+    workspace = run / "workspace"
+    workspace.mkdir(mode=0o700)
+    helper = run / "client.mjs"
+    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
+    cleanup_script = run / "cleanup-service.sh"
+    candidate_checksums = {name: file_sha256(vendor / name) for name in
+                           ("vibeface", "vibeface-core", "BUILD-INFO.json", "FILES.sha256", "scripts/install-node-service.sh")}
+    nightly_order = lambda value: tuple(map(int, re.fullmatch(r"(\d+)\.(\d+)\.(\d+)-nightly\.(\d{8})\.(\d+)", value).groups()))
+    baseline_version, candidate_version = nightly_order(pin["version"]), nightly_order(build["version"])
+    version_order = (candidate_version > baseline_version) - (candidate_version < baseline_version)
+    report = {"status": "running", "target": target,
+              "candidate": {"version": build["version"], "source_commit": build["source_commit"],
+                            "package_sha256": file_sha256(package), "binary_sha256": file_sha256(native), "core_sha256": file_sha256(core)},
+              "manager": "launchd" if sys.platform == "darwin" else "systemd --user", "cases": [],
+              "native_path": str(native.relative_to(root)), "native_pids": [],
+              "baseline": {key: pin[key] for key in ("version", "source_commit", "source_context", "sha256", "manifest_sha256")},
+              "baseline_artifact_id": os.environ.get("NPM_BASELINE_ARTIFACT_ID", ""),
+              "candidate_declared_version": {1: "higher", 0: "same", -1: "lower"}[version_order],
+              "business_source_relation": pin["business_source_relation"], "real_provider_calls": 0,
+              "replacement": "public same-epoch baseline to a different-source immutable CI candidate",
+              "not_checked": ["historical-format migration", "real AI Providers",
+                              "full lifecycle of the immutable public baseline; only the candidate lifecycle is required"]}
+    node, owned = None, False
+
+    def service(action, *, check=True):
+        entry = {"action": action, "source_commit": json.loads((vendor / "BUILD-INFO.json").read_text())["source_commit"]}
+        report.setdefault("service_actions", []).append(entry)
+        result = command([binary, "service", action, "--data-dir", node.directory], check=check)
+        entry["returncode"] = result.returncode
+        return result
+
+    def passed(name):
+        report["cases"].append(name)
+        print("PASS npm service " + name, flush=True)
+
+    def reinstall(destination, archive):
+        command(["npm", "install", "--global", "--prefix", destination, "--cache", run / "npm-cache",
+                 "--offline", "--ignore-scripts", "--no-audit", "--no-fund", "--force", archive])
+
+    def persistent():
+        files = {name: file_sha256(node.directory / name) for name in
+                 ("identity.json", "config.json", "data-epoch.json", "node.lock", "update.lock", "update.json", "update-pending.json")
+                 if (node.directory / name).exists()}
+        with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
+            events = dict(database.execute("SELECT hash,envelope FROM events"))
+        return files, events
+
+    def rejected(action, expected):
+        before = persistent()
+        service_before = [path.read_bytes() if path.exists() else None for path in service_files]
+        result = service(action, check=False)
+        require(result.returncode != 0 and expected in result.stderr, "npm service refuses " + expected)
+        require(persistent() == before and service_before == [path.read_bytes() if path.exists() else None
+                                                             for path in service_files],
+                "refused npm service operations preserve existing data and service files")
+
+    def idle_guards():
+        update = json.loads(command([binary, "update", "status", "--data-dir", node.directory]).stdout)
+        require(update["distribution"] == "npm" and update["automatic"] is False,
+                "npm owns updates and disables the built-in updater")
+        rejected("install-updater", "npm installations are updated with npm")
+        with (node.directory / "update.lock").open("r+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            rejected("install", "wait for the updater before installing the npm service")
+        private_json(node.directory / "update-pending.json", {"fixture": "pending"})
+        rejected("install", "recover the pending update")
+        (node.directory / "update-pending.json").unlink()
+        before = persistent()
+        command([binary, "update", "apply", "--automatic", "--data-dir", node.directory])
+        require(persistent() == before, "npm automatic update exits without changing persistent data")
+
+    def stopped():
+        wait_for("npm service stops its Node", lambda: node_status(node)["status"] == "stopped")
+        if sys.platform == "darwin":
+            wait_for("launchd unloads the stopped Node", lambda: manager_absent(units[0]))
+        else:
+            state = dict(line.split("=", 1) for line in command([
+                "/usr/bin/systemctl", "--user", "show", units[0], "--property=MainPID,LoadState"], check=False).stdout.splitlines())
+            require(state.get("LoadState") == "not-found" or state.get("MainPID") == "0",
+                    "systemd has no running Node PID")
+
+    def running():
+        wait_for("native npm service starts", lambda: node_status(node)["status"] == "running")
+        require(node.client.request("/api/info")["device_id"] == node.device_id, "the service retains the fixture identity")
+        if sys.platform == "darwin":
+            with service_files[0].open("rb") as stream:
+                require(plistlib.load(stream)["ProgramArguments"] == [str(native), "serve", "--data-dir", str(node.directory)],
+                        "launchd runs the scoped npm vendor CLI with the fixture data")
+            state = command(["/bin/launchctl", "print", f"{domain}/{units[0]}"]).stdout
+            pid = int(re.search(r"(?m)^\s*pid = (\d+)$", state)[1])
+        else:
+            state = dict(line.split("=", 1) for line in command([
+                "/usr/bin/systemctl", "--user", "show", units[0], "--property=MainPID,ExecStart,FragmentPath"]).stdout.splitlines())
+            require(state["FragmentPath"] == str(service_files[0]) and f"path={native} ;" in state["ExecStart"],
+                    "systemd runs the scoped npm vendor CLI from the fixture unit")
+            pid = int(state["MainPID"])
+            require(Path(f"/proc/{pid}/exe").resolve(strict=True) == core, "the running Core is the npm vendor executable")
+        process = command(["/bin/ps", "-ww", "-p", str(pid), "-o", "command="]).stdout.strip()
+        require(process == f"{core} --data-dir {node.directory}", "the manager PID executes the exact scoped npm Core")
+        require(not any(path.exists() for path in service_files[1:]) and all(manager_absent(unit) for unit in units[1:]),
+                "npm never installs or loads its built-in updater")
+        node.client.connect()
+        node.client.authenticate()
+        report["native_pids"].append(pid)
+        return pid
+
+    def create_history(name):
+        nonlocal node
+        previous_invocations = len(fixture_records(run))
+        node = Node(run, name, binary, workspace, helper)
+        node.configure(bins={"codex": str(fixture_wrapper(run, "fixture-codex", "--fixture-codex"))},
+                       manager=fixture_manager_settings(run, workspace), app_server=SPAWN_APP_SERVER)
+        node.start()
+        network = node.bootstrap()
+        conversation = "npm-service-history"
+        node.client.rpc("create_bot", bot_id="npm-service-bot", conversation_id=conversation, name="Npm fixture",
+                        instructions="", project={"target_node": node.device_id, "cwd": str(workspace)})
+        attachment = b"npm service attachment\x00\xff\n"
+        digest = hashlib.sha256(attachment).hexdigest()
+        uploaded = node.client.rpc("upload_attachment", conversation_id=conversation, hash=digest, size=len(attachment),
+                                   offset=0, data=base64.b64encode(attachment).decode())
+        require(uploaded == {"offset": len(attachment), "complete": True}, "the fixture persists the complete attachment")
+        receipt = node.client.rpc("message", conversation_id=conversation, message_id="npm-service-message",
+                                  text=json.dumps({"chat_agent": True, "label": "npm-service-message"}),
+                                  attachments=[{"hash": digest, "size": len(attachment), "name": "fixture.bin"}])
+        wait_for("the controlled fixture completes its actual message", lambda:
+                 (scheduler_record(node, network, receipt["trigger"]) or {}).get("state") == "completed")
+        messages = node.client.rpc("conversation", conversation_id=conversation)["messages"]
+        require(any(row["message_id"] == "npm-service-message" and row["attachments"] for row in messages)
+                and any(row["role"] == "assistant" for row in messages), "preservation starts with real nonempty message history")
+        invocation_count = len(fixture_records(run))
+        require(invocation_count == previous_invocations + 1, "one controlled fixture call creates this Node's history")
+        return conversation, attachment, digest, messages, invocation_count
+
+    try:
+        candidate = run / "candidate-prefix"
+        reinstall(candidate, package)
+        candidate_vendor = candidate / "lib/node_modules/@leaperone/vibeface/vendor" / target
+        require(candidate_checksums == {name: file_sha256(candidate_vendor / name) for name in candidate_checksums},
+                "the independent npm prefix contains the exact immutable CI candidate")
+        reinstall(prefix, baseline / "baseline.tgz")
+        require(json.loads((root / "package.json").read_text())["version"] == pin["version"]
+                and json.loads((vendor / "BUILD-INFO.json").read_text()) == pin["builds"][target],
+                "the first installed service package is the verified public baseline")
+        import release
+        with tarfile.open(baseline / "baseline.tgz", "r:gz") as reference:
+            checksums = reference.extractfile(f"package/vendor/{target}/FILES.sha256").read().decode().splitlines()
+        expected_files = {name: digest for digest, name in (line.split("  ", 1) for line in checksums)}
+        require(release.files(vendor, ("FILES.sha256",)) == expected_files,
+                "every installed baseline vendor byte matches the immutable published package")
+        shutil.copy2(vendor / "scripts/install-node-service.sh", cleanup_script)
+        conversation, attachment, digest, messages, invocation_count = create_history("NPM")
+        require(invocation_count == 1, "one controlled fixture call creates the message history")
+        update = json.loads(command([binary, "update", "status", "--data-dir", node.directory]).stdout)
+        require(update["distribution"] == "npm" and update["automatic"] is False,
+                "npm owns updates and disables the built-in updater")
+        rejected("install", "stop the node before installing its npm service")
+        passed("public baseline active Node refuses install without changing data or services")
+        node.client.close()
+        node.stop()
+        stopped()
+        idle_guards()
+        passed("public baseline updater lock, pending journal and second updater refuse without mutation")
+        saved_files, saved_events = persistent()
+
+        def preserved():
+            files, events = persistent()
+            require(files == saved_files and saved_events and all(events.get(key) == value for key, value in saved_events.items()),
+                    "npm lifecycle preserves identity, configuration and every original signed event")
+            require(node.client.rpc("conversation", conversation_id=conversation)["messages"] == messages,
+                    "npm lifecycle preserves the exact nonempty message history")
+            require(len(fixture_records(run)) == invocation_count, "service restarts never replay a completed fixture turn")
+            page = node.client.rpc("read_artifact", conversation_id=conversation, blob_hash=digest, binary=True)
+            require(page["size"] == len(attachment) and page["next_offset"] is None
+                    and base64.b64decode(page["data"]) == attachment, "npm lifecycle returns the original attachment bytes")
+
+        owned = True
+        service("install")
+        running()
+        service("status")
+        preserved()
+        service("stop")
+        stopped()
+        passed("immutable public baseline installs a real service and stops before candidate replacement")
+        node.client.close()
+        definition = service_files[0].read_bytes()
+        previous_inode = core.stat().st_ino
+        reinstall(prefix, package)
+        require(core.stat().st_ino != previous_inode and candidate_checksums == {name: file_sha256(vendor / name) for name in candidate_checksums},
+                "npm replaces the stopped public baseline with the exact different-source CI candidate")
+        require(file_sha256(package) == report["candidate"]["package_sha256"] and service_files[0].read_bytes() == definition,
+                "npm replacement preserves the immutable input and installed service definition")
+        stopped()
+        database_sha256 = file_sha256(node.directory / "node.sqlite3")
+        access = command([binary, "access", "--json", "--data-dir", node.directory], check=False)
+        if access.returncode != 0 and "data_schema_mismatch" in access.stderr:
+            schema_digests = []
+            for commit in (pin["source_context"]["ci_source_commit"], build["source_commit"]):
+                config = command(["git", "show", f"{commit}:apps/core/src/config.rs"]).stdout
+                fingerprint = re.search(r'DATA_EPOCH_SCHEMA_SHA256: &str\s*=\s*"([0-9a-f]{64})"', config)
+                require(fingerprint is not None, "both reviewed sources declare their data schema fingerprint")
+                schema_digests.append(fingerprint[1])
+            require(schema_digests[0] != schema_digests[1], "schema rejection corresponds to a declared format change")
+            refused = command([binary, "serve", "--data-dir", node.directory], check=False)
+            require(refused.returncode != 0 and "data_schema_mismatch" in refused.stderr,
+                    "the candidate refuses to start an incompatible baseline schema")
+            require(persistent() == (saved_files, saved_events)
+                    and file_sha256(node.directory / "node.sqlite3") == database_sha256
+                    and (node.directory / "blobs/sha256" / digest[:2] / digest).read_bytes() == attachment,
+                    "schema rejection leaves baseline identity, config, database and attachment bytes intact")
+            service("uninstall")
+            stopped()
+            report["schema_compatibility"] = {"status": "rejected", "baseline": schema_digests[0],
+                                               "candidate": schema_digests[1]}
+            passed("incompatible public baseline is refused without migration or data loss")
+            conversation, attachment, digest, messages, invocation_count = create_history("NPM-CANDIDATE")
+            node.client.close()
+            node.stop()
+            stopped()
+            idle_guards()
+            saved_files, saved_events = persistent()
+            service("install")
+            running()
+            passed("candidate starts a fresh data directory with nonempty history and attachment")
+        else:
+            service("start")
+            running()
+            report["schema_compatibility"] = {"status": "accepted"}
+            passed("published-to-candidate npm replacement starts with the original baseline data")
+        preserved()
+        passed("candidate service preserves identity, config, signed history and attachment bytes")
+        rejected("install", "stop the node before installing its npm service")
+        service("stop")
+        stopped()
+        idle_guards()
+        service("install")
+        running()
+        service("status")
+        service("stop")
+        stopped()
+        service("start")
+        previous = running()
+        service("restart")
+        require(running() != previous, "the candidate's native manager restart replaces its PID")
+        preserved()
+        passed("candidate install, stop, start, restart and concurrency guards preserve its original data")
+        service("uninstall")
+        stopped()
+        require(not any(path.exists() or path.is_symlink() for path in service_files) and all(manager_absent(unit) for unit in units),
+                "uninstall removes the fixture services from disk and the native manager")
+        files, events = persistent()
+        require(files == saved_files and all(events.get(key) == value for key, value in saved_events.items())
+                and (node.directory / "blobs/sha256" / digest[:2] / digest).read_bytes() == attachment,
+                "uninstall retains the fixture identity, configuration, history and attachment")
+        passed("uninstall removes the native service and retains data")
+        report["status"] = "passed"
+    except Exception as error:
+        report.update(status="failed", failure=f"{type(error).__name__}: {error}")
+        raise
+    finally:
+        cleanup = ([lambda: command([cleanup_script, "uninstall", "--data-dir", node.directory])] if owned else [])
+        cleanup += ([node.client.close, node.stop] if node else []) + [lambda: stop_fixture_processes(run)]
+        failures = []
+        for action in cleanup:
+            try:
+                action()
+            except Exception as error:
+                failures.append(f"{type(error).__name__}: {error}")
+        if failures:
+            report.update(status="failed", cleanup_failures=failures)
+        report["controlled_fixture_calls"] = len(fixture_records(run))
+        private_json(run / "report.json", report)
+        print("REPORT " + json.dumps(report, sort_keys=True), flush=True)
+        if failures and "failure" not in report:
+            raise RuntimeError("npm service cleanup failed")
+
+
 def web_acceptance(options):
     binary = options.binary.resolve(strict=True)
     module = options.crypto_module.resolve(strict=True)
@@ -4527,18 +5212,23 @@ def gateway_refusal(client, device_id):
     return refused["error"]
 
 
-def acceptance(options):
-    binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
-    require(module.with_name("vibeface_secure_bg.wasm").read_bytes().startswith(b"\x00asm"),
-            "packaged browser WASM is available")
-    options.artifacts.mkdir(parents=True, exist_ok=True)
-    run = options.artifacts.resolve() / ("node-acceptance-" + uuid.uuid4().hex[:10])
+def acceptance_workspace(artifacts, module, prefix):
+    artifacts.mkdir(parents=True, exist_ok=True)
+    run = artifacts.resolve() / (prefix + uuid.uuid4().hex[:10])
     run.mkdir(mode=0o700)
     workspace = run / "workspace"
     workspace.mkdir(mode=0o700)
     helper = run / "client.mjs"
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
     helper.chmod(0o600)
+    return run, workspace, helper
+
+
+def acceptance(options):
+    binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
+    require(module.with_name("vibeface_secure_bg.wasm").read_bytes().startswith(b"\x00asm"),
+            "packaged browser WASM is available")
+    run, workspace, helper = acceptance_workspace(options.artifacts, module, 'node-acceptance-')
     nodes, clients = [], []
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
               "coverage": "five real Node processes over iroh (four members and one outsider) with a member relay; WASM browser client; fixture SDK",
@@ -4570,11 +5260,11 @@ def acceptance(options):
         for name in ("A", "P", "B", "C", "OTHER-NETWORK"):
             nodes.append(Node(run, name, binary, workspace, helper))
         a, p, b, c, outsider = nodes
-        discovery = local_discovery(run, binary, workspace, helper, nodes).discovery_address
+        boot = local_bootstrap(run, binary, workspace, helper, nodes)
         # B cannot reach the IPv4-only Discovery, so its join hands the invite token to P's relay,
         # which admits only members and those P invited.
         for node in (a, p, c):
-            node.configure_network(discovery=[discovery])
+            node.configure_mesh(boot.mesh_network, [boot.mesh_address])
         a.configure(manager=fixture_manager_settings(run, workspace), bins={"codex": str(fixture_wrapper(run, "fixture-codex", "--fixture-codex"))},
                     app_server=SPAWN_APP_SERVER, daily_decision_limit=100)
         p.configure_network(relay_listen=f"127.0.0.1:{relay_port}")
@@ -4645,7 +5335,7 @@ def acceptance(options):
             require(opened["ok"], f"{gateway.name} forwards the browser to {target.name}: {opened.get('error')}")
             client.authenticate()
             require(client.call("info")["device_id"] == target.device_id, "Noise ends at the target, not the Gateway")
-            history = client.rpc("conversation", conversation_id=conversation)
+            history = conversation_snapshot(client, conversation)
             require(any(row["message_id"] == "m1" for row in history["messages"]), "the target shows the synced history")
             reached[f"{gateway.name}->{target.name}"] = True
             client.close()
@@ -4706,7 +5396,7 @@ def acceptance(options):
         require(failover.call("rpc", late)["trigger"] == first["trigger"], "resending through the new entrance is idempotent")
         c.start()
         final = wait_for("all four Nodes converge after the entrance switch", lambda: converged(members, network), timeout=60)
-        shown = [row["message_id"] for row in failover.rpc("conversation", conversation_id=conversation)["messages"]
+        shown = [row["message_id"] for row in conversation_snapshot(failover, conversation, sections=("messages",))["messages"]
                  if row["role"] == "user"]
         require(sorted(shown) == ["m1", "m2-delivered", "m3", "m4"], "each message appears once after failover")
         passed("entrance-switch", heads=final, messages=shown)
@@ -4719,12 +5409,14 @@ def acceptance(options):
         held = at_c.call("rpc", signed_message(at_c, conversation, "m5-stop", directive))
 
         def owner_job(state):
-            view = at_c.rpc("conversation", conversation_id=conversation)
-            job = next((row for row in view["scheduler"]["jobs"] if row["trigger"] == held["trigger"]), None)
+            view = conversation_snapshot(at_c, conversation,
+                sections=("jobs", "owner_jobs", "owner_scope_jobs", "owner_memory_conflicts"))
             remote = view["scheduler"]["remote"]
-            scope_jobs = remote.get("scope_jobs")
+            job = next((row for row in remote["jobs"] if row["trigger"] == held["trigger"]), None)
+            scope_jobs = remote["scope_jobs"]
             return view if job and job["state"] == state and job.get("source_node") == a.device_id \
-                and set(remote) == {"owner", "reachable", "context", "scope_jobs", "memory_staged_count", "memory_conflicts"} \
+                and set(remote) == {"owner", "reachable", "context", "jobs", "scope_jobs", "memory_staged_count", "memory_conflicts"} \
+                and not any(row.get("source_node") for row in view["scheduler"]["jobs"]) \
                 and isinstance(scope_jobs, list) \
                 and all(isinstance(row, dict) and row.get("conversation_id") == conversation
                         and row.get("source_node") == a.device_id and row.get("scope") == {"kind": "main"}
@@ -4739,9 +5431,10 @@ def acceptance(options):
                 and all(isinstance(conflict, dict) for conflict in remote["memory_conflicts"]),
                 "C receives the owner's typed context and Memory metadata")
         require(remote["context"] == view["scheduler"]["context"]
-                and remote["memory_staged_count"] == view["bot_settings"]["memory_staged_count"]
-                and remote["memory_conflicts"] == view["bot_settings"]["memory_conflicts"],
-                "C uses the owner's context and Memory from the same response")
+                and view["bot_settings"]["memory_staged_count"] == 0
+                and view["bot_settings"]["memory_conflicts"] == []
+                and scheduler_records(c, network) == [],
+                "C shows the owner's context while retaining its own empty local Memory and scheduler state")
         require(view["observation_targets"] == [a.device_id] and view["scheduler"]["capabilities"]["cancel"] is True,
                 "C follows A's progress and offers A's stop")
         wait_for("C receives the text A's reply streams", lambda: [
@@ -4751,7 +5444,7 @@ def acceptance(options):
         require(receipt.get("cancel_requested") is True and receipt.get("owner") == a.device_id, "C's stop is carried out by A")
         wait_for("A stops its reply", lambda: (scheduler_record(a, network, held["trigger"]) or {}).get("state") == "cancelled")
         stopped = wait_for("C shows the stopped reply", lambda: [
-            row for row in at_c.rpc("conversation", conversation_id=conversation)["messages"]
+            row for row in conversation_snapshot(at_c, conversation, sections=("messages",))["messages"]
             if row.get("in_reply_to") == "m5-stop" and row.get("status") == "stopped"])
         require(sum(row["label"] == "remote-stop" for row in fixture_records(run)) == 1 and scheduler_records(c, network) == [],
                 "the reply ran once on A and C stored none of its jobs")
@@ -4759,9 +5452,16 @@ def acceptance(options):
         unconfirmed = at_c.rpc("cancel_manager", conversation_id=conversation, trigger=held["trigger"])
         require(unconfirmed == {"cancel_requested": False, "unconfirmed": True, "owner": a.device_id},
                 "a stop A does not answer is unconfirmed")
-        away = at_c.rpc("conversation", conversation_id=conversation)["scheduler"]
-        require(away["remote"] == {"owner": a.device_id, "reachable": False}
-                and not any(row.get("source_node") for row in away["jobs"]), "C shows A's state as unknown, not stale")
+        away_view = conversation_snapshot(at_c, conversation)
+        away = away_view["scheduler"]
+        require(away["remote"] == {"owner": a.device_id, "reachable": False, "jobs": [], "scope_jobs": [],
+                                  "memory_conflicts": [], "memory_staged_count": None, "context": None, "manager": None}
+                and not any(row.get("source_node") for row in away["jobs"])
+                and all(away_view["history"][section]["complete"] is False
+                        and isinstance(away_view["history"][section]["next_cursor"], str)
+                        and away_view["history"][section]["next_cursor"]
+                        for section in ("owner_jobs", "owner_scope_jobs", "owner_memory_conflicts")),
+                "C keeps unavailable owner observations empty and incomplete without claiming local jobs as A's")
         a.start()
         a.client.connect()
         a.client.authenticate()
@@ -4816,14 +5516,7 @@ def phase4_acceptance(options):
     uses every entrance.
     """
     binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
-    options.artifacts.mkdir(parents=True, exist_ok=True)
-    run = options.artifacts.resolve() / ("phase4-" + uuid.uuid4().hex[:10])
-    run.mkdir(mode=0o700)
-    workspace = run / "workspace"
-    workspace.mkdir(mode=0o700)
-    helper = run / "client.mjs"
-    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
-    helper.chmod(0o600)
+    run, workspace, helper = acceptance_workspace(options.artifacts, module, 'phase4-')
     nodes, clients, roots = [], [], {}
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
               "coverage": "four real Node processes over iroh (A, B and C each with a fixture coordination Agent and "
@@ -4852,7 +5545,7 @@ def phase4_acceptance(options):
         return next(row for row in records(node) if row["trigger"] == trigger)
 
     def works(client):
-        return {row["work_id"]: row for row in client.rpc("conversation", conversation_id=conversation)["works"]}
+        return {row["work_id"]: row for row in conversation_snapshot(client, conversation, sections=("works",))["works"]}
 
     def delivery(client, work_id):
         rows = client.rpc("conversation", conversation_id=conversation)["deliveries"]
@@ -4895,7 +5588,7 @@ def phase4_acceptance(options):
         for name in ("A", "P", "B", "C"):
             nodes.append(Node(run, name, binary, workspace, helper))
         a, p, b, c = nodes
-        discovery = local_discovery(run, binary, workspace, helper, nodes).discovery_address
+        boot = local_bootstrap(run, binary, workspace, helper, nodes)
         for node in (a, b, c):
             root = roots[node.name] = run / ("fixture-" + node.name)
             root.mkdir(mode=0o700)
@@ -4903,8 +5596,10 @@ def phase4_acceptance(options):
                            bins={"codex": str(fixture_wrapper(root, "fixture-codex", "--fixture-codex"))},
                            app_server=SPAWN_APP_SERVER,
                            manager=fixture_manager_settings(root, workspace))
-            node.configure_network(relays=[{"url": relay_url}], discovery=[discovery])
-        p.configure_network(relay_listen=f"127.0.0.1:{relay_port}", discovery=[discovery])
+            node.configure_network(relays=[{"url": relay_url}])
+            node.configure_mesh(boot.mesh_network, [boot.mesh_address])
+        p.configure_network(relay_listen=f"127.0.0.1:{relay_port}")
+        p.configure_mesh(boot.mesh_network, [boot.mesh_address])
         a.start()
         network = a.bootstrap()
         p.pair(a)
@@ -4947,11 +5642,13 @@ def phase4_acceptance(options):
                    "owner_attestation": a.client.command("attest", network_id=network, scope_id=conversation, body={
                        "type": "conversation_owner", "scheduler_node": a.device_id, "epoch": 1}),
                    "attestation": a.client.attestation("create_bot", dict(definition))}
-        at_p.command("drop", method="rpc", params=request)
+        lost_reply = at_p.command("drop_response", method="rpc", params=request)
+        require(lost_reply == {"sent": True, "application_reply_discarded": True},
+                "P's successful creation reply is discarded before the application receives its body")
         at_p.connect(p.device_id)
         at_p.authenticate()
         at_b = browser(b)
-        wait_for("P's creation, whose answer was lost, reaches B", lambda: any(
+        wait_for("P's committed creation, whose application reply was discarded, reaches B", lambda: any(
             bot["bot_id"] == "p4-bot" for bot in at_b.rpc("bots")["bots"]), timeout=60)
         retried = at_b.call("rpc", request)["bot"]
         original = next(bot for bot in definitions_of(at_p.rpc("bots")["bots"]) if bot["bot_id"] == "p4-bot")
@@ -4959,7 +5656,8 @@ def phase4_acceptance(options):
         wait_for("the conversation reaches A", lambda: converged(members, network), timeout=60)
         owners = {client.rpc("conversation", conversation_id=conversation)["conversation"]["owner"] for client in (a.client, at_b, at_p)}
         require(owners == {a.device_id}, "every entrance records the owner the browser signed")
-        passed("bot-creation-retry-across-entrances", bot_event=original["event_hash"][:12], owner="A")
+        passed("bot-creation-retry-across-entrances", bot_event=original["event_hash"][:12], owner="A",
+               reply_boundary="discarded_before_application")
 
         first_dir = folder("p4-first", released=True)
         side_effect = workspace / "p4-side-effect.txt"
@@ -4991,7 +5689,7 @@ def phase4_acceptance(options):
         wait_for("all entrances converge", lambda: converged(members, network), timeout=60)
 
         def same_views():
-            seen = [[(row["message_id"], row["text"]) for row in client.rpc("conversation", conversation_id=conversation)["messages"]]
+            seen = [[(row["message_id"], row["text"]) for row in conversation_snapshot(client, conversation, sections=("messages",))["messages"]]
                     for client in (a.client, at_b, at_p)]
             return seen[0] if seen[0] == seen[1] == seen[2] else None
         shown = wait_for("every entrance shows the same conversation", same_views, timeout=30)
@@ -5124,7 +5822,7 @@ def phase4_acceptance(options):
                 and refused.get("code") == "input_not_saved" and refused.get("message_id") == "p4-unsigned",
                 "an unsigned input returns a typed refusal before persistence")
         require_quiet("the unsigned input creates no shared message or provider call on any execution Node", lambda:
-            not any(row["message_id"] == "p4-unsigned" for row in a.client.rpc("conversation", conversation_id=conversation)["messages"])
+            not any(row["message_id"] == "p4-unsigned" for row in conversation_snapshot(a.client, conversation, sections=("messages",))["messages"])
             and all(len(records(node)) == unsigned_calls[node.name] for node in (a, b, c))
             and all(not any(row.get("message_id") == "p4-unsigned" for row in records(node, "codex-inputs.jsonl"))
                     for node in (a, b, c)))
@@ -5282,7 +5980,7 @@ def phase4_acceptance(options):
         require(file_sha256(stored) == digest and 0 < kept < size, "B resumes the download and verifies its hash")
         at_b.connect(b.device_id)
         wait_for("the browser reconnects to the restarted B", lambda: at_b.authenticate())
-        shown = next(row for row in at_b.rpc("conversation", conversation_id=conversation)["messages"] if row["message_id"] == "p4-attachment")
+        shown = next(row for row in conversation_snapshot(at_b, conversation, sections=("messages",))["messages"] if row["message_id"] == "p4-attachment")
         require(shown["attachments"] == [{"hash": digest, "size": size, "name": "p4 附件.bin"}],
                 "the message carries its named attachment on every entrance")
         download, offset, pages = hashlib.sha256(), 0, 0
@@ -5320,25 +6018,18 @@ def phase4_acceptance(options):
 
 
 def public_node_acceptance(options):
-    """A public node P in no personal network: an ordinary Node that serves discovery, runs an open relay and
-    forwards browsers to any device, with one forwarding slot and one place in line. M is the only member Node
-    and configures nothing but P's discovery; a browser opens P's origin, joins M and chats with it. A private
+    """A public node P in no personal network: an ordinary Node that is the bootstrap node of a fresh mesh, runs
+    an open relay and forwards browsers to any device, with one forwarding slot and one place in line. M is the
+    only member Node and configures nothing but P as its bootstrap node; a browser opens P's origin, joins M and chats with it. A private
     relay R with an operator token then carries A's traffic to an IPv6-only X while X holds the token, and
     nothing once it holds a wrong one."""
     binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
-    options.artifacts.mkdir(parents=True, exist_ok=True)
-    run = options.artifacts.resolve() / ("public-node-" + uuid.uuid4().hex[:10])
-    run.mkdir(mode=0o700)
-    workspace = run / "workspace"
-    workspace.mkdir(mode=0o700)
-    helper = run / "client.mjs"
-    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
-    helper.chmod(0o600)
+    run, workspace, helper = acceptance_workspace(options.artifacts, module, 'public-node-')
     nodes, clients = [], []
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
-              "coverage": "public node P (not a member) serving discovery, an open relay limited per address and "
-                          "browser forwarding with one slot and one place in line; member M configured only with "
-                          "P's discovery; private relay R with an operator token between A and an IPv6-only X; "
+              "coverage": "public node P (not a member) as a mesh bootstrap node, an open relay limited per address "
+                          "and browser forwarding with one slot and one place in line; member M configured only with "
+                          "P as its bootstrap node; private relay R with an operator token between A and an IPv6-only X; "
                           "TLS-only T as a reverse proxy pinning its certificate sees it; WASM browser client on P's origin",
               "not_checked": ["real NAT and the nginx reverse proxy (loopback ports stand in for nginx paths)",
                               "rendered browser UI (see the browser screenshots)"]}
@@ -5371,19 +6062,22 @@ def public_node_acceptance(options):
     try:
         relay_port = available_port()
         relay_url = f"http://127.0.0.1:{relay_port}"
+        mesh = mesh_network()
         p = Node(run, "P", binary, workspace, helper, init_args=[
-            "--serve-discovery", "--forward-any", "--forward-sessions", "1", "--forward-queue", "1",
+            "--mesh-network", mesh, "--forward-any", "--forward-sessions", "1", "--forward-queue", "1",
             "--relay-listen", f"127.0.0.1:{relay_port}", "--relay-url", relay_url, *OPEN_RELAY])
         nodes.append(p)
-        discovery = f"vibeface://{p.device_id}@127.0.0.1:{p.quic_port}"
         fixture = run / "fixture-M"
         fixture.mkdir(mode=0o700)
-        m = Node(run, "M", binary, workspace, helper, init_args=["--root", str(workspace), "--bootstrap", discovery])
+        p.configure_mesh(mesh)
+        m = Node(run, "M", binary, workspace, helper, init_args=[
+            "--root", str(workspace), "--mesh-network", mesh, "--bootstrap", p.mesh_address])
         nodes.append(m)
         configured = json.loads((m.directory / "config.json").read_text())["network"]
-        require(configured["bootstrap"] == {"mode": "custom", "discovery": discovery}
-                and configured["relays"] == [] and configured["discovery"] == [],
-                "M configures nothing but P's discovery")
+        require(configured["mesh"] == {"enabled": True, "network": mesh, "bootstrap": [p.mesh_address],
+                                       "allow_private": False, "advertise": []} and configured["relays"] == [],
+                "M configures nothing but P as its bootstrap node")
+        m.configure_mesh(mesh, [p.mesh_address])
         m.configure(timeout_secs=600, daily_decision_limit=100, manager=fixture_manager_settings(fixture, workspace),
                     bins={"codex": str(fixture_wrapper(fixture, "fixture-codex", "--fixture-codex"))},
                     app_server=SPAWN_APP_SERVER)
@@ -5397,10 +6091,15 @@ def public_node_acceptance(options):
         phone = Client(p.url, helper, identity_file=run / "phone-identity.json")
         clients.append(phone)
         started = time.monotonic()
-        wait_for("M registers with P's discovery", lambda: phone.connect(m.device_id, check=False).get("ok"), timeout=60)
+        wait_for("P finds M through the mesh", lambda: phone.connect(m.device_id, check=False).get("ok"), timeout=60)
         phone.join(m.client, "phone", via=p.url)
         require(phone.url == p.url, "the phone joined through P's origin")
         passed("browser-joins-the-member-through-the-public-node", elapsed_ms=round((time.monotonic() - started) * 1000))
+        announced = wait_for("M learns P's volunteer relay from the mesh", lambda: [
+            role["url"].rstrip("/") for entry in mesh_records(m, "relay") if entry["record"]["device_id"] == p.device_id
+            for role in entry["record"]["roles"] if role["kind"] == "relay"], timeout=120)
+        require(announced == [relay_url], "P announces exactly its open relay")
+        passed("public-node-announces-its-open-relay-on-the-mesh", relay=relay_url)
 
         conversation = "public-node-chat"
         phone.rpc("create_bot", bot_id="public-node-bot", conversation_id=conversation, name="经公共节点",
@@ -5408,7 +6107,7 @@ def public_node_acceptance(options):
                   project={"target_node": m.device_id, "cwd": str(workspace)})
         phone.rpc("message", conversation_id=conversation, message_id="pe-1", text="你好")
         wait_for("M answers the phone", lambda: any(row["role"] == "assistant" for row in
-                 phone.rpc("conversation", conversation_id=conversation)["messages"]), timeout=60)
+                 conversation_snapshot(phone, conversation, sections=("messages",))["messages"]), timeout=60)
         passed("browser-chats-through-the-public-node")
 
         phone.close()
@@ -5418,7 +6117,7 @@ def public_node_acceptance(options):
         phone.authenticate(network)
         phone.rpc("message", conversation_id=conversation, message_id="pe-2", text="又来了")
         wait_for("M answers after the reconnect", lambda: sum(row["role"] == "assistant" for row in
-                 phone.rpc("conversation", conversation_id=conversation)["messages"]) >= 2, timeout=60)
+                 conversation_snapshot(phone, conversation, sections=("messages",))["messages"]) >= 2, timeout=60)
         passed("browser-reconnects-after-the-public-node-restarts")
 
         wait_for("M's Main scheduler settles before the hook producer", lambda:
@@ -5434,7 +6133,7 @@ def public_node_acceptance(options):
             (row for row in fixture_records(fixture, "manager-native-work.jsonl")
              if row["label"] == "pe-work" and row["trigger"] == "message:pe-3"), None), timeout=60)
         source = wait_for("M's exact Work records its Codex thread and turn", lambda: next(
-            (row for row in phone.rpc("conversation", conversation_id=conversation)["works"]
+            (row for row in conversation_snapshot(phone, conversation, sections=("works",))["works"]
              if row["work_id"] == dispatch["work_id"] and row["state"] == "finished"
              and row.get("thread_id") and row.get("turn_id")), None), timeout=60)
         require(source["trigger"] == "message:pe-3" and source["target_node"] == m.device_id
@@ -5509,11 +6208,13 @@ def public_node_acceptance(options):
             "--relay-operator-token", str(token_file)])
         nodes.append(r)
         # D offers no relay, so R is the only one A and X can use.
-        d = local_discovery(run, binary, workspace, helper, nodes, name="D")
+        d = local_bootstrap(run, binary, workspace, helper, nodes, name="D")
         a, x = (Node(run, name, binary, workspace, helper, init_args=[
-            "--root", str(workspace), "--discovery", d.discovery_address,
+            "--root", str(workspace),
             "--relay", private_url, "--relay-token", f"{private_url}={token_file}"]) for name in ("A", "X"))
         nodes += [a, x]
+        for node in (a, x):
+            node.configure_mesh(d.mesh_network, [d.mesh_address])
         r.start(no_web=True)
         a.start()
         private = a.bootstrap()
@@ -5554,12 +6255,8 @@ def public_node_acceptance(options):
         nodes += [t, t2]
         t.start()
         require(pinned_info(t)["device_id"] == t.device_id, "T answers over TLS pinned to its own certificate")
-        try:
+        with TestCase().assertRaises(ssl.SSLCertVerificationError, msg="another Node's certificate verifies T"):
             pinned_info(t, t2.directory / "tls-cert.pem")
-        except ssl.SSLCertVerificationError:
-            pass
-        else:
-            raise AssertionError("another Node's certificate verifies T")
         answer = b""
         with socket.create_connection(("127.0.0.1", t.port), timeout=5) as raw, contextlib.suppress(ConnectionResetError):
             raw.sendall(b"GET /api/info HTTP/1.1\r\nHost: app.example.invalid\r\n\r\n")
@@ -5586,37 +6283,52 @@ def public_node_acceptance(options):
         print("REPORT " + str(run / "report.json"), flush=True)
 
 
-def discovery_acceptance(options):
+def mesh_acceptance(options):
+    """Four Nodes on a fresh loopback mesh, driven by the CLI: A is the bootstrap node and volunteers a relay;
+    B and C join through A, learn every record, take A's relay as home and sync through it once their direct
+    path is gone; D joins through B alone, gets all four records, then rejoins from its old table with B gone
+    and no bootstrap node configured; A stops volunteering and B, C and D drop its relay."""
     binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
-    options.artifacts.mkdir(parents=True, exist_ok=True)
-    run = options.artifacts.resolve() / ("discovery-" + uuid.uuid4().hex[:10])
-    run.mkdir(mode=0o700)
-    workspace = run / "workspace"
-    workspace.mkdir(mode=0o700)
-    helper = run / "client.mjs"
-    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
-    helper.chmod(0o600)
+    run, workspace, helper = acceptance_workspace(options.artifacts, module, 'mesh-')
     nodes = []
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
-              "not_checked": ["public NAT types and UDP-blocked networks", "rendered browser UI", "live Agent tool execution"]}
+              "not_checked": ["public NAT types and UDP-blocked networks", "public HTTPS gateways",
+                              "rendered browser UI", "live Agent tool execution"]}
 
     def passed(name, **evidence):
         report["cases"][name] = evidence
         print("PASS " + name, flush=True)
 
-    def clear_addresses(*members):
-        for node in members:
-            require(node.process is None, "only stopped task-owned Nodes have their cached paths cleared")
-            with sqlite3.connect(node.directory / "node.sqlite3") as database:
-                database.execute("DELETE FROM addresses")
-
     def peer(node, target):
         return next((row for row in node_status(node).get("peers", []) if row["device_id"] == target.device_id), {})
 
-    def reconnect(node, network):
+    def online(node):
+        return {entry["record"]["device_id"] for entry in mesh_records(node) if entry["online"]}
+
+    def record_of(node, target):
+        return next((entry["record"] for entry in mesh_records(node) if entry["record"]["device_id"] == target.device_id), None)
+
+    def relay_roles(record):
+        return [role["url"].rstrip("/") for role in (record or {}).get("roles", []) if role["kind"] == "relay"]
+
+    def home(node):
+        return ((mesh_status(node).get("own") or {}).get("relay_url") or "").rstrip("/") or None
+
+    def member(name, *bootstrap):
+        node = Node(run, name, binary, workspace, helper, init_args=[
+            "--root", str(workspace), "--mesh-network", network, *[arg for url in bootstrap for arg in ("--bootstrap", url)]])
+        nodes.append(node)
+        node_cli(node, "config", "set", "mesh.allow_private", "true")
+        mesh = json.loads((node.directory / "config.json").read_text())["network"]["mesh"]
+        require(mesh == {"enabled": True, "network": network, "bootstrap": list(bootstrap), "allow_private": True,
+                         "advertise": []},
+                f"{name}: init joins the named mesh through exactly its bootstrap nodes")
+        return node
+
+    def reconnect(node, personal):
         node.client.close()
         node.client.connect(node.device_id)
-        node.client.authenticate(network)
+        node.client.authenticate(personal)
         wait_for("the management Node is aligned and writable", lambda: node_status(node).get("write_state") == "writable", timeout=60)
 
     def stopped_browser(node):
@@ -5638,110 +6350,102 @@ def discovery_acceptance(options):
         return node_status(node)
 
     try:
-        d = local_discovery(run, binary, workspace, helper, nodes, name="D")
-        served = json.loads((d.directory / "config.json").read_text())["network"]
-        require(served["serve_discovery"] and served["relay_listen"] is None,
-                "discovery is a capability of an ordinary Node and brings no relay")
-        require(b"<html" in d.client.request("/").lower(), "discovery serves its configured Web page")
-        passed("discovery-runs-on-an-ordinary-node-without-a-relay")
-        address = d.discovery_address
-        a, b = [Node(run, name, binary, workspace, helper) for name in ("A", "B")]
-        nodes += [a, b]
-        for node in (a, b):
-            node.configure_network(discovery=[address])
+        network = mesh_network()
+        a = member("A")
         a.start()
-        network = a.bootstrap()
-        b.pair(a)
+        b, c = member("B", a.mesh_address), member("C", a.mesh_address)
         b.start()
-        wait_for("discovery establishes A-to-B direct sync", lambda: peer(a, b).get("path") == "direct", timeout=60)
-        a.client.rpc("create_conversation", conversation_id="discovery-first", title="Discovery direct sync")
-        wait_for("discovery members sync their first event", lambda: converged((a, b), network), timeout=60)
-        passed("cli-join-with-only-target-id-and-invite-uses-discovery", path=peer(a, b)["path"])
+        c.start()
+        everyone = {a.device_id, b.device_id, c.device_id}
+        wait_for("B and C learn every record through A", lambda: all(online(node) >= everyone for node in (b, c)), timeout=90)
+        status = mesh_status(b)
+        require(status["enabled"] and status["network"] == network and status["neighbors"] >= 1
+                and status["own"]["network"] == network, "B reports the mesh it joined, its neighbors and its record")
+        require(node_status(a)["mesh"]["neighbors"] >= 1, "inspect reports the bootstrap node's mesh neighbors")
+        passed("bootstrap-node-introduces-members", records=status["records"], neighbors=status["neighbors"])
 
-        for node in (a, b):
-            node.client.close()
-            node.stop()
-        clear_addresses(a, b)
-        d.stop()
-        d.start(no_web=True)
-        a.start()
-        b.start()
-        wait_for("fresh caches recover through restarted discovery", lambda: peer(a, b).get("path") == "direct", timeout=60)
-        reconnect(a, network)
-        a.client.rpc("create_conversation", conversation_id="discovery-restart", title="Discovery restart")
-        wait_for("restarted discovery restores synchronization", lambda: converged((a, b), network), timeout=60)
-        passed("discovery-restart-restores-direct-sync-with-empty-address-caches", path=peer(a, b)["path"], web_enabled=node_status(d)["web_enabled"])
-
-        for node in (a, b):
-            node.client.close()
-            node.stop()
-        b.configure_network(bind=f"[::1]:{b.port}")
-        clear_addresses(a, b)
-        a.start()
-        b.start()
-        wait_for("disjoint IP families cannot complete business through discovery", lambda: peer(a, b).get("reachable") is False, timeout=45)
-        reconnect(a, network)
-        a.client.rpc("create_conversation", conversation_id="discovery-blocked", title="Direct path blocked")
-        require_quiet("discovery never forwards the blocked event", lambda: heads(b, network) != heads(a, network))
-        require(peer(a, b).get("path") is None, "no data path is hidden behind discovery")
-        passed("blocked-direct-path-does-not-fall-back-to-discovery")
-
-        b.stop()
-        b.configure_network(bind=f"127.0.0.1:{b.port}")
-        b.start()
-        wait_for("restored IP path catches up", lambda: converged((a, b), network), timeout=60)
         relay_port = available_port()
         relay_url = f"http://127.0.0.1:{relay_port}"
-        r = Node(run, "R", binary, workspace, helper, init_args=[
-            "--relay-listen", f"127.0.0.1:{relay_port}", "--relay-url", relay_url])
-        nodes.append(r)
-        r.configure_network(discovery=[address])
-        r.pair(a)
-        r.start()
-        for node in (a, b):
-            node.client.close()
-            node.stop()
-            node.configure_network(relays=[{"url": relay_url}])
-            node.start()
-        reconnect(a, network)
-        wait_for("members publish normal relay paths", lambda: all(
-            any("Relay" in item for item in json.loads(row["payload"])["endpoint"]["addrs"])
-            for row in a.client.call("entrances")["entrances"]), timeout=60)
-        wait_for("relay members align before isolating B", lambda: converged((a, b, r), network), timeout=60)
-        for node in (a, b):
-            node.client.close()
-            node.stop()
-        b.configure_network(bind=f"[::1]:{b.port}")
-        a.start()
-        b.start()
-        wait_for("ordinary relay recovers the disjoint direct paths automatically", lambda: peer(a, b).get("path") == "relay", timeout=60)
-        reconnect(a, network)
-        a.client.rpc("create_conversation", conversation_id="discovery-relay", title="Automatic relay fallback")
-        wait_for("business sync succeeds on the normal relay", lambda: converged((a, b, r), network), timeout=60)
-        passed("normal-relay-fallback-is-automatic", path=peer(a, b)["path"])
+        settings = json.loads(node_cli(a, "relay", "volunteer", "on", "--listen", f"127.0.0.1:{relay_port}", "--url", relay_url,
+                                       "--rate", "1048576", "--max-clients", "64", "--max-clients-per-ip", "64").stdout)
+        require(settings["volunteer"] and settings["url"].rstrip("/") == relay_url, "A volunteers its relay at the given URL")
+        wait_for("a neighbor checks A's relay from outside", lambda:
+                 json.loads(node_cli(a, "relay", "status").stdout)["status"] == "announced", timeout=120)
+        wait_for("B and C learn A's relay role", lambda: all(relay_roles(record_of(node, a)) == [relay_url] for node in (b, c)), timeout=90)
+        wait_for("B and C take A's relay as their home relay", lambda: home(b) == relay_url and home(c) == relay_url, timeout=150)
+        passed("volunteer-relay-is-announced-and-adopted", relay=relay_url)
 
+        personal = b.bootstrap()
+        c.stop()
+        c.pair(b)
+        c.start()
+        wait_for("B and C sync directly first", lambda: peer(b, c).get("path") == "direct", timeout=60)
+        b.client.rpc("create_conversation", conversation_id="mesh-direct", title="Mesh direct sync")
+        wait_for("B and C sync their first event", lambda: converged((b, c), personal), timeout=60)
+        b.client.close()
         b.stop()
-        b.start(no_web=True)
-        status = stopped_browser(b)
-        a.client.rpc("create_conversation", conversation_id="discovery-headless", title="Headless sync")
-        wait_for("headless B still synchronizes", lambda: converged((a, b, r), network), timeout=60)
-        wait_for("B withdraws its closed webpage", lambda: any(
-            json.loads(row["payload"])["device_id"] == b.device_id and json.loads(row["payload"])["gateway_url"] is None
-            for row in a.client.call("entrances")["entrances"]), timeout=60)
-        passed("serve-no-web-keeps-hooks-tool-auth-maintenance-and-sync", web_enabled=status["web_enabled"])
-        b.stop()
-        b.start(no_web=True, bare=True)
-        stopped_browser(b)
-        b.stop()
-        b.configure(web_enabled=False)
+        c.stop()
+        c.configure_network(bind=f"[::1]:{c.port}")
         b.start()
-        stopped_browser(b)
+        c.start()
+        wait_for("C, IPv6 only, reaches B through A's relay", lambda: peer(b, c).get("path") == "relay", timeout=120)
+        reconnect(b, personal)
+        b.client.rpc("create_conversation", conversation_id="mesh-relay", title="Through the volunteer relay")
+        wait_for("business sync succeeds on the adopted relay", lambda: converged((b, c), personal), timeout=60)
+        wait_for("C announces A's relay as home again after its restart", lambda: home(c) == relay_url, timeout=90)
+        passed("members-connect-through-the-adopted-relay", path=peer(b, c)["path"])
+
+        d = member("D", b.mesh_address)
+        d.start()
+        everyone.add(d.device_id)
+        wait_for("D, configured only with B, gets all four records", lambda: online(d) == everyone, timeout=90)
+        passed("records-spread-beyond-the-bootstrap-node", records=len(everyone))
+
+        d.stop()
+        listed = node_cli(d, "mesh", "bootstrap", "remove", b.device_id).stdout
+        require(b.mesh_address not in listed, "the stopped Node drops its only bootstrap node")
+        require(json.loads((d.directory / "config.json").read_text())["network"]["mesh"]["bootstrap"] == [],
+                "D has no bootstrap node configured")
+        b.client.close()
+        b.stop()
+        d.start()
+        wait_for("D rejoins from its old table without B", lambda: (mesh_status(d)["neighbors"] or 0) >= 1, timeout=150)
+        b.start()
+        reconnect(b, personal)
+        passed("old-table-rejoins-without-bootstrap-nodes", neighbors=mesh_status(d)["neighbors"])
+
+        # C reaches the others directly again, so it hears A withdraw its relay.
+        c.stop()
+        c.configure_network(bind=f"127.0.0.1:{c.port}")
+        c.start()
+        settings = json.loads(node_cli(a, "relay", "volunteer", "off").stdout)
+        require(not settings["volunteer"] and settings["status"] == "off", "A stops volunteering")
+        wait_for("D, rejoined, hears that A withdrew its relay", lambda: relay_roles(record_of(d, a)) == [], timeout=120)
+        wait_for("B, C and D drop A's relay", lambda: relay_url not in {home(b), home(c), home(d)}, timeout=180)
+        passed("withdrawn-relay-is-dropped", homes=[home(node) for node in (b, c, d)])
+
+        c.stop()
+        c.start(no_web=True)
+        status = stopped_browser(c)
+        b.client.rpc("create_conversation", conversation_id="mesh-headless", title="Headless sync")
+        wait_for("headless C still synchronizes", lambda: converged((b, c), personal), timeout=60)
+        wait_for("C withdraws its closed webpage", lambda: any(
+            json.loads(row["payload"])["device_id"] == c.device_id and json.loads(row["payload"])["gateway_url"] is None
+            for row in b.client.call("entrances")["entrances"]), timeout=60)
+        passed("serve-no-web-keeps-hooks-tool-auth-maintenance-and-sync", web_enabled=status["web_enabled"])
+        c.stop()
+        c.start(no_web=True, bare=True)
+        stopped_browser(c)
+        c.stop()
+        c.configure(web_enabled=False)
+        c.start()
+        stopped_browser(c)
         passed("bare-no-web-and-persisted-web-off")
-        with sqlite3.connect(f"file:{d.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
+        with sqlite3.connect(f"file:{a.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
             counts = {table: database.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
                       for table in ("networks", "events", "conversations", "log_heads")}
-        require(all(count == 0 for count in counts.values()), "discovery stores no personal network or business records")
-        passed("discovery-stores-no-business-records", **counts)
+        require(all(count == 0 for count in counts.values()), "the bootstrap node stores no personal network or business records")
+        passed("bootstrap-node-stores-no-business-records", **counts)
         report["status"] = "passed"
     except BaseException as error:
         report.update(status="failed", failure=f"{type(error).__name__}: {error}", traceback=traceback.format_exc())
@@ -5752,6 +6456,16 @@ def discovery_acceptance(options):
             node.stop()
         private_json(run / "report.json", report)
         print("REPORT " + str(run / "report.json"), flush=True)
+
+
+def mesh_status(node):
+    """`vibeface mesh status --json`: whether the mesh is on, its records and neighbors and this Node's record."""
+    return json.loads(node_cli(node, "mesh", "status", "--json").stdout)
+
+
+def mesh_records(node, role=None):
+    """`vibeface mesh records --json`, optionally only the Nodes offering `role`."""
+    return json.loads(node_cli(node, "mesh", "records", "--json", *(["--role", role] if role else [])).stdout)["records"]
 
 
 def node_status(node):
@@ -5767,14 +6481,7 @@ def phase5_acceptance(options):
     data directory is copied and run as A' while A is stopped. One browser identity opens A and B.
     """
     binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
-    options.artifacts.mkdir(parents=True, exist_ok=True)
-    run = options.artifacts.resolve() / ("phase5-" + uuid.uuid4().hex[:10])
-    run.mkdir(mode=0o700)
-    workspace = run / "workspace"
-    workspace.mkdir(mode=0o700)
-    helper = run / "client.mjs"
-    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
-    helper.chmod(0o600)
+    run, workspace, helper = acceptance_workspace(options.artifacts, module, 'phase5-')
     nodes, clients = [], []
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
               "coverage": "two real Node processes over iroh plus a copy of A's data directory; WASM browser client",
@@ -5813,9 +6520,11 @@ def phase5_acceptance(options):
         nodes += [a, b]
         for node in nodes:
             node.configure(app_server={"mode": "system", "socket": str(run / "unavailable.sock")})
-        discovery = local_discovery(run, binary, workspace, helper, nodes).discovery_address
-        b.configure_network(relay_listen=f"127.0.0.1:{relay_port}", discovery=[discovery])
-        a.configure_network(relays=[{"url": relay_url}], discovery=[discovery])
+        boot = local_bootstrap(run, binary, workspace, helper, nodes)
+        b.configure_network(relay_listen=f"127.0.0.1:{relay_port}")
+        b.configure_mesh(boot.mesh_network, [boot.mesh_address])
+        a.configure_network(relays=[{"url": relay_url}])
+        a.configure_mesh(boot.mesh_network, [boot.mesh_address])
         a.start()
         network = a.bootstrap()
         b.pair(a)
@@ -5912,7 +6621,7 @@ def phase5_acceptance(options):
         wait_for("removing A counts the branch B holds", lambda: original in listed() or None, timeout=30)
         passed("copied-data-directory-forks-and-removal-keeps-one-branch", conflicts=len(kept), refused=refused[:120])
 
-        secrets = [node.access["capability"] for node in (a, b)] + [a.backup_password]
+        secrets = [a.access["capability"], a.backup_password] + [local_owner(node)["capability"] for node in (a, b)]
         logs = [path for path in run.rglob("*.log*") if path.is_file()]
         require(all(path.stat().st_mode & 0o077 == 0 for path in logs if path.name.startswith("node.log")), "node.log is private")
         require(all(b"write state changed" in (node.directory / "node.log").read_bytes() for node in (a, b)),
@@ -5990,8 +6699,8 @@ def auto_route_acceptance(options):
         nodes.append(target)
         target.configure(manager=fixture_manager_settings(run, workspace), bins={"codex": str(fixture_wrapper(run, "fixture-codex", "--fixture-codex"))},
                          app_server=SPAWN_APP_SERVER, daily_decision_limit=100, allowed_origins=[allowed])
-        discovery = local_discovery(run, binary, workspace, helper, nodes).discovery_address
-        target.configure_network(discovery=[discovery])
+        boot = local_bootstrap(run, binary, workspace, helper, nodes)
+        target.configure_mesh(boot.mesh_network, [boot.mesh_address])
         target.start()
         network = target.bootstrap()
         passed("genesis", network=network, target=target.device_id)
@@ -6016,7 +6725,13 @@ def auto_route_acceptance(options):
         require(upgrade_status(target, "/api/client", "https://elsewhere.example") == 403,
                 "other origins cannot open /api/client")
         require(upgrade_status(target, "/api/local/ws", allowed) == 403, "other paths stay same-origin")
-        target.client.request("/api/info", headers={"Origin": allowed}, origin=False, status=403)
+        # /api/info is cross-origin for configured origins since the official App reaches its access Node from elsewhere.
+        public_info = target.client.request("/api/info", headers={"Origin": allowed}, origin=False, status=200)
+        require(set(public_info) == {"device_id", "version"} and public_info["device_id"] == target.device_id
+                and isinstance(public_info["version"], str) and public_info["version"].strip(),
+                "allowed origins read only the target device ID and nonempty version from /api/info")
+        target.client.request("/api/info", headers={"Origin": "https://elsewhere.example"}, origin=False, status=403)
+        target.client.request("/api/local/info", headers={"Origin": allowed}, origin=False, status=403)
         cross = fresh(target.url)
         cross.connect(target.device_id, origin=allowed)
         require(cross.call("info")["device_id"] == target.device_id, "a cross-origin page completes Noise to the target")
@@ -6090,7 +6805,7 @@ def auto_route_acceptance(options):
                         and refused.get("code") == "input_not_saved" and refused.get("message_id") == unsigned["message_id"],
                         f"{kind} input returns a typed refusal before persistence")
         require_quiet("invalid signatures create no shared input or provider execution", lambda:
-            not any(row["message_id"] == unsigned["message_id"] for row in target.client.rpc("conversation", conversation_id=conversation)["messages"])
+            not any(row["message_id"] == unsigned["message_id"] for row in conversation_snapshot(target.client, conversation, sections=("messages",))["messages"])
             and not fixture_records(run)
             and not any(row.get("message_id") == unsigned["message_id"] for row in fixture_records(run, "codex-inputs.jsonl")))
         passed("attestation-required", refused=["unsigned", "other-device", "changed-text"])
@@ -6101,13 +6816,15 @@ def auto_route_acceptance(options):
                     "report_results": False}
         target.client.message_arguments(original)
         signed = {**original, "attestation": target.client.attestation("message", dict(original))}
-        target.client.command("drop", method="rpc", params={"method": "message", **signed})
+        lost_reply = target.client.command("drop_response", method="rpc", params={"method": "message", **signed})
+        require(lost_reply == {"sent": True, "application_reply_discarded": True},
+                "the durable input reply is discarded before the application receives its body")
         marker = workspace / "auto-route-count.txt"
-        wait_for("exactly one Agent write starts after the dropped send", lambda:
+        wait_for("exactly one Agent write starts after the committed input's application reply is discarded", lambda:
                  marker.exists() and marker.read_text() == "once" and len(invocations(run, "auto-route")) == 1)
         target.client.connect()
         target.client.authenticate()
-        snapshot = target.client.rpc("conversation", conversation_id=conversation)
+        snapshot = conversation_snapshot(target.client, conversation)
         require(any(row["message_id"] == original["message_id"] for row in snapshot["messages"]),
                 "after reconnecting, the business ID shows the write was recorded")
         trigger = invocations(run, "auto-route")[0]["trigger"]
@@ -6115,11 +6832,12 @@ def auto_route_acceptance(options):
         require(duplicate["trigger"] == trigger, "resubmitting the unchanged signed request returns the original job")
         require_quiet("a same-ID resubmission never repeats the host write", lambda:
                       marker.read_text() == "once" and len(invocations(run, "auto-route")) == 1)
-        passed("unknown-write-not-replayed", message_id=original["message_id"], trigger=trigger, invocations=1)
+        passed("unknown-write-not-replayed", message_id=original["message_id"], trigger=trigger, invocations=1,
+               reply_boundary="discarded_before_application")
 
         joining = Node(run, "CLI", binary, workspace, helper)
         nodes.append(joining)
-        joining.configure_network(discovery=[discovery])
+        joining.configure_mesh(boot.mesh_network, [boot.mesh_address])
         code = joining.pair(target)
         listed = target.client.call("directory")["view"]["members"]
         require(any(row["device_id"] == joining.device_id and row["kind"] == "node" for row in listed),
@@ -6134,7 +6852,7 @@ def auto_route_acceptance(options):
         wait_for("the second Gateway forwards to the target", lambda: through.authenticate())
         require(through.call("info")["device_id"] == target.device_id, "Noise ends at the target behind the other Gateway")
         require(any(row["message_id"] == original["message_id"]
-                    for row in through.rpc("conversation", conversation_id=conversation)["messages"]),
+                    for row in conversation_snapshot(through, conversation, sections=("messages",))["messages"]),
                 "the forwarded channel reads the target's conversation")
         stranger = fresh(joining.url)
         refused = stranger.connect(stranger.own_id(), check=False)
@@ -6168,66 +6886,6 @@ def auto_route_acceptance(options):
                              "remaining_clients": sum(client.process is not None for client in clients)}
         private_json(run / "report.json", report)
         print("REPORT " + str(run / "report.json"), flush=True)
-
-
-class PkarrRelay:
-    def __init__(self, *, unavailable=False):
-        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-        self.packets = {}
-        self.reads = 0
-        self.writes = 0
-        self.lock = threading.Lock()
-        relay = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *_):
-                pass
-
-            def key(self):
-                match = re.fullmatch(r"/pkarr/([a-z0-9]{52})", self.path)
-                return match[1] if match else None
-
-            def do_PUT(self):
-                key = self.key()
-                length = int(self.headers.get("Content-Length", "0"))
-                if key is None or not 72 <= length <= 1072:
-                    self.send_error(400)
-                    return
-                packet = self.rfile.read(length)
-                with relay.lock:
-                    relay.writes += 1
-                    if not unavailable:
-                        relay.packets[key] = packet
-                self.send_response(503 if unavailable else 200)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-
-            def do_GET(self):
-                with relay.lock:
-                    relay.reads += 1
-                    packet = relay.packets.get(self.key())
-                if unavailable:
-                    self.send_error(503)
-                    return
-                if packet is None:
-                    self.send_error(404)
-                    return
-                self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Content-Length", str(len(packet)))
-                self.end_headers()
-                self.wfile.write(packet)
-
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.server.daemon_threads = True
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-        self.url = f"http://127.0.0.1:{self.server.server_port}/pkarr"
-
-    def close(self):
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=5)
 
 
 class DeliveryRpcSpy:
@@ -6299,8 +6957,34 @@ def delivery_free_state(nodes, spy):
     transactions = sum((delivery_rows(node, "SELECT count(*) FROM transactions") or [(0,)])[0][0]
                        for node in nodes)
     require(wallets == 0 and transactions == 0 and spy.calls == 0,
-            "free discovery and charity create no wallet, transactions or chain RPC calls")
+            "the free mesh and charity create no wallet, transactions or chain RPC calls")
     return {"wallet_files": wallets, "transaction_rows": transactions, "chain_rpc_calls": spy.calls}
+
+
+def require_disabled_delivery(node, state):
+    require(state["availability"] == {"state": "disabled"}
+            and state["enabled"] is False and state["paid_enabled"] is False,
+            "object delivery starts disabled with paid delivery inactive")
+    # Disabled delivery defers opening the independent keystore, so it cannot claim the
+    # loaded-wallet state `absent`. Other Unavailable reasons must still fail this check.
+    require(state["wallet"] == {
+        "state": "unavailable",
+        "reason": "delivery wallet is inactive until paid delivery is enabled",
+        "address": None,
+    } and state["receiver_key"] is None,
+            "disabled object delivery keeps its wallet and receiving key inactive")
+    require(not os.path.lexists(node.directory / "delivery-wallet.json")
+            and not os.path.lexists(node.directory / "delivery"),
+            "disabled object delivery creates no independent wallet or service store")
+
+
+def delivery_public_report(report):
+    public = {"status": report["status"], "mode": report["mode"],
+              "binary_sha256": report["binary_sha256"], "profile_sha256": report["profile_sha256"],
+              "passed_cases": sorted(report["cases"])}
+    if "failure" in report:
+        public["failure"] = {"type": report["failure"]["type"]}
+    return public
 
 
 def delivery_call(node, op, **params):
@@ -6339,8 +7023,8 @@ def delivery_probe(options, run, actor, targets, order_id, *, action=None):
     public = json.loads(result.stdout)
     require(public.get("passed") is True, "probe returned a positive bounded result")
     if action is None:
-        require(public["discovery"]["productSourceSha256"] == file_sha256(source / "apps/core/src/net/pkarr.rs"),
-                "probe resolves with the current product discovery implementation")
+        require(public["mesh"]["productSourceSha256"] == file_sha256(source / "apps/core/src/net/mesh/record.rs"),
+                "probe opens mesh records with the current product implementation")
     return public
 
 
@@ -6358,7 +7042,7 @@ def delivery_charity_acceptance(options):
     workspace.mkdir(mode=0o700)
     helper = run / "client.mjs"
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
-    relay, fault_directory, spy = PkarrRelay(), PkarrRelay(unavailable=True), DeliveryRpcSpy()
+    spy = DeliveryRpcSpy()
     nodes = []
     report = {"status": "running", "mode": "charity", "source_binary": str(binary),
               "binary_sha256": file_sha256(binary), "profile_sha256": file_sha256(profile),
@@ -6403,11 +7087,16 @@ def delivery_charity_acceptance(options):
             node = Node(run, name, binary, workspace, helper, init_args=args)
             nodes.append(node)
             isolate_delivery_node(node)
-            node.configure_network(pkarr={"publish": True, "resolve": True,
-                                             "urls": [fault_directory.url, relay.url], "publish_direct": True})
             private_json(node.directory / "delivery-settings.json", free_delivery_settings(spy, profile, enabled=False))
-            node.start()
         source, receiver, provider, outsider = nodes
+        # The public provider is the mesh's bootstrap node; the others list a Node that never starts before it.
+        gone = Node(run, "GONE", binary, workspace, helper)
+        mesh = mesh_network()
+        provider.configure_mesh(mesh)
+        for node in (source, receiver, outsider):
+            node.configure_mesh(mesh, [gone.mesh_address, provider.mesh_address])
+        for node in nodes:
+            node.start()
         source.bootstrap()
         receiver.bootstrap()
         require(source.client.network_id != receiver.client.network_id, "source and receiver use different personal networks")
@@ -6415,10 +7104,17 @@ def delivery_charity_acceptance(options):
                            for node in (source, receiver)}
         for node in (source, receiver):
             state = call(node, "status")
-            require(state["enabled"] is False and state["wallet"]["state"] == "absent",
-                    "object delivery starts disabled with no independent wallet")
-        wait_for("free peer publication", lambda: relay.writes >= 3)
-        passed("default-disabled-and-free-discovery", **delivery_free_state(nodes, spy), published=relay.writes)
+            require_disabled_delivery(node, state)
+        everyone = {node.device_id for node in nodes}
+        wait_for("every Node learns every record through the free mesh", lambda: all(
+            {entry["record"]["device_id"] for entry in mesh_records(node) if entry["online"]} == everyone for node in nodes),
+            timeout=90)
+        for node in (source, receiver):
+            require_disabled_delivery(node, call(node, "status"))
+        service_stores = sum(os.path.lexists(node.directory / "delivery") for node in nodes)
+        require(service_stores == 0, "the disabled mesh creates no delivery service stores on any Node")
+        passed("default-disabled-and-free-mesh", **delivery_free_state(nodes, spy), records=len(everyone),
+               service_store_directories=service_stores)
         for node in (source, receiver):
             state = call(node, "configure", enabled=True, charity_enabled=True, paid_enabled=False)
             require(state["enabled"] and not state["paid_enabled"], "manager explicitly enables charity")
@@ -6482,8 +7178,10 @@ def delivery_charity_acceptance(options):
 
         outsider.stop()
         security = delivery_probe(options, run, outsider, [source, receiver, provider], order_id)
-        require(security["discovery"]["fresh"] and len(security["targets"]) == 3,
-                "real signed discovery and service positive controls accompany all boundary rejections")
+        require(security["mesh"]["valid"] and all(security["mesh"][case] for case in (
+                    "expiredRejected", "aheadRejected", "badSignatureRejected", "oversizeRejected", "wrongNetworkRejected"))
+                and len(security["targets"]) == 3,
+                "real signed mesh records and service positive controls accompany all boundary rejections")
         passed("real-service-and-private-network-boundaries", **security)
         call(receiver, "accept", order_id=order_id)
         restart(receiver)
@@ -6503,20 +7201,18 @@ def delivery_charity_acceptance(options):
         wait_for("source reconciles the receiver receipt", lambda:
                  call(source, "get", order_id=order_id)["evidence"] == "charity_receipt", timeout=60)
         no_private_payload(provider, original_name, original)
-        require(relay.reads > 0 and relay.writes > 0, "delivery resolves PeerIDs through the free signed directory")
+        offered = wait_for("the source sees the provider's delivery service on the mesh", lambda: [
+            item for item in call(source, "providers")["providers"] if item["device_id"] == provider.device_id], timeout=60)
+        require(offered[0]["paid"] is False and offered[0]["offer"] is None, "the charity provider announces no price")
         for node in (source, receiver):
             orders = call(node, "list")["orders"]
             require(sum(order["order_id"] == order_id for order in orders) == 1, "retry and restart retain exactly one order")
         passed("receiver-restart-original-file-and-charity-receipt", bytes=len(original), sha256=digest,
                evidence=received["evidence"], provider_plaintext_absent=True, provider_private_events_absent=True)
-        passed("free-path-has-no-financial-side-effects", **delivery_free_state(nodes, spy),
-               pkarr_reads=relay.reads, pkarr_writes=relay.writes)
-        require(fault_directory.reads > 0 and fault_directory.writes > 0 and relay.reads > 0 and relay.writes > 0,
-                "actual discovery tries both the unavailable directory and the working signed directory")
+        passed("free-path-has-no-financial-side-effects", **delivery_free_state(nodes, spy))
         require(initial_members == {node.name: sorted(member["device_id"] for member in node.client.call("directory")["view"]["members"])
-                                   for node in (source, receiver)}, "directory failover does not add or merge personal network members")
-        passed("free-directory-failover-preserves-membership-and-no-finance", unavailable_reads=fault_directory.reads,
-               unavailable_writes=fault_directory.writes, available_reads=relay.reads, available_writes=relay.writes,
+                                   for node in (source, receiver)}, "the shared mesh does not add or merge personal network members")
+        passed("unreachable-bootstrap-node-preserves-membership-and-no-finance", unreachable=gone.device_id,
                member_counts={name: len(members) for name, members in initial_members.items()}, **delivery_free_state(nodes, spy))
         report["status"] = "passed"
     except BaseException as error:
@@ -6527,2220 +7223,31 @@ def delivery_charity_acceptance(options):
         for node in reversed(nodes):
             node.client.close()
             node.stop()
-        relay.close()
-        fault_directory.close()
         spy.close()
         private_json(run / "summary.json", report)
+        private_json(run / "report.json", delivery_public_report(report))
         print("Delivery report: " + str(run / "summary.json"), flush=True)
     return report
 
 
-class DeliveryRpcForwarder:
-    def __init__(self, target):
-        self.target, self.raw_broadcasts = target, 0
-        self.lock = threading.Lock()
-        self.approval_barrier = None
-        self.read_failure = None
-        recorder = self
 
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, *_):
-                pass
-
-            def do_POST(self):
-                self.connection.settimeout(35)
-                try:
-                    size = self.headers.get("Content-Length", "")
-                    require(self.client_address[0] == "127.0.0.1" and self.headers.get("Origin") is None
-                            and self.headers.get("Transfer-Encoding") is None and re.fullmatch(r"[0-9]{1,7}", size)
-                            and int(size) <= 1024 * 1024, "task Node RPC forwarding remains local and bounded")
-                    body = self.rfile.read(int(size))
-                    value = json.loads(body)
-                    require(isinstance(value, dict) and value.get("jsonrpc") == "2.0" and isinstance(value.get("method"), str),
-                            "task Node RPC forwarding preserves one actual JSON-RPC request")
-                    with recorder.lock:
-                        barrier = recorder.approval_barrier
-                        read_failure = recorder.read_failure
-                    candidate = value.get("params", [None])[0] if value.get("params") else None
-                    if (read_failure and time.monotonic() < read_failure["expires"] and value["method"] == "eth_call"
-                            and isinstance(candidate, dict) and candidate.get("to", "").lower() == read_failure["escrow"]):
-                        with recorder.lock:
-                            read_failure["blocked"] += 1
-                        raise AssertionError("the bounded Node transport failure returns no fabricated chain result")
-                    if (barrier and value["method"] == "eth_estimateGas" and isinstance(candidate, dict)
-                            and candidate.get("from", "").lower() == barrier["wallet"]
-                            and candidate.get("to", "").lower() == barrier["asset"]
-                            and re.fullmatch(r"0x095ea7b3[0-9a-fA-F]{128}", candidate.get("data", ""))):
-                        barrier["reached"].set()
-                        barrier["released"].wait(120)
-                        raise AssertionError("the controlled pre-approval checkpoint never forwards its abandoned request")
-                    if value["method"] == "eth_sendRawTransaction":
-                        with recorder.lock:
-                            recorder.raw_broadcasts += 1
-                    request = urllib.request.Request(recorder.target, body, {"Content-Type": "application/json"})
-                    with urllib.request.urlopen(request, timeout=30) as response:
-                        output = response.read(1024 * 1024 + 1)
-                    require(len(output) <= 1024 * 1024, "actual task chain RPC response remains bounded")
-                    status = 200
-                except (AssertionError, ValueError, TypeError, OSError):
-                    output, status = b'{"error":"task_rpc_forward_failed"}', 502
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(output)))
-                self.end_headers()
-                self.wfile.write(output)
-
-        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-        self.url = f"http://127.0.0.1:{self.server.server_port}"
-
-    def broadcasts(self):
-        with self.lock:
-            return self.raw_broadcasts
-
-    def arm_approval(self, wallet, asset):
-        require(re.fullmatch(r"0x[0-9a-fA-F]{40}", wallet) and re.fullmatch(r"0x[0-9a-fA-F]{40}", asset),
-                "approval barrier pins only its actual source wallet and fixed asset")
-        with self.lock:
-            require(self.approval_barrier is None, "one pre-approval checkpoint is armed at a time")
-            self.approval_barrier = {"wallet": wallet.lower(), "asset": asset.lower(),
-                                     "reached": threading.Event(), "released": threading.Event()}
-            return self.approval_barrier["reached"]
-
-    def release_approval(self):
-        with self.lock:
-            if self.approval_barrier:
-                self.approval_barrier["released"].set()
-                self.approval_barrier = None
-
-    def fail_reads(self, escrow, timeout=180):
-        require(re.fullmatch(r"0x[0-9a-fA-F]{40}", escrow) and 0 < timeout <= 180,
-                "one bounded transport failure names only the actual escrow")
-        with self.lock:
-            require(self.read_failure is None, "Node transport failures do not overlap")
-            self.read_failure = {"escrow": escrow.lower(), "expires": time.monotonic() + timeout, "blocked": 0}
-            return self.read_failure
-
-    def restore_reads(self):
-        with self.lock:
-            self.read_failure = None
-
-    def close(self):
-        self.release_approval()
-        self.restore_reads()
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=5)
-
-
-class DeliveryUiControl:
-    names = {"web": "VDP paid web sender", "android": "VDP paid native receiver"}
-    sequence = ("prepared", "confirmed", "accepted", "offline-visible", "settled-offline", "saved")
-    inspections = {"source-partial": ("web", "web-partial-refund.png"),
-                   "source-unknown": ("web", "web-unknown-transaction.png"),
-                   "receiver-key-before": ("android", "android-key-before.png"),
-                   "receiver-key-after": ("android", "android-key-rotated.png")}
-
-    @staticmethod
-    def inspection_verified(checks):
-        booleans = ("walletLocked", "proofJobsUnchanged", "transactionIntentsUnchanged", "canonicalRestored")
-        return (set(checks) == {*booleans, "rawBroadcastDelta"}
-                and type(checks["rawBroadcastDelta"]) is int and checks["rawBroadcastDelta"] == 0
-                and all(checks[name] is True for name in booleans))
-
-    def __init__(self, path, repository, source_file, nodes, configuration):
-        self.path, self.repository, self.source_file = path, repository, source_file
-        self.nodes, self.configuration = nodes, configuration
-        owner = {name: os.environ.get("VIBEFACE_DELIVERY_UI_" + name, str(value))
-                 for name, value in (("UID", os.getuid()), ("GID", os.getgid()))}
-        require(all(re.fullmatch(r"[0-9]{1,10}", value) and int(value) < 2 ** 32 for value in owner.values()),
-                "UI fixture owner IDs are explicit bounded decimal values")
-        self.uid, self.gid = int(owner["UID"]), int(owner["GID"])
-        self.token = os.urandom(32).hex()
-        self.pairings, self.events = {}, {}
-        self.stage, self.observers, self.inspection, self.inspection_ack = "bootstrap", set(), None, None
-        self.closed = False
-        self.inspection_finished = threading.Event()
-        self.lock = threading.RLock()
-        self.client_locks = {role: threading.RLock() for role in self.names}
-        self.failure = None
-        self.finished = threading.Event()
-        self.invitations = {role: nodes[role].client.invite() for role in self.names}
-        self.digest = file_sha256(source_file)
-        self.size = source_file.stat().st_size
-        require(self.size == 4096, "ordinary UI acceptance uses one bounded original window")
-        self.server = http.server.HTTPServer(("127.0.0.1", 0), self.handler())
-        self.url = f"http://127.0.0.1:{self.server.server_port}"
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-
-    def start(self):
-        require(not self.path.exists() and self.path.parent.resolve().is_relative_to(self.repository / ".artifacts"),
-                "UI control descriptor is fresh and remains in the task artifacts")
-        require(self.source_file.parent == self.path.parent and stat.S_ISREG(self.source_file.lstat().st_mode),
-                "UI exposes only its single synthetic source file in the dedicated control directory")
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        require(stat.S_ISDIR(self.path.parent.lstat().st_mode), "UI directory is an actual private task directory")
-        self.path.parent.chmod(0o700)
-        os.chown(self.path.parent, self.uid, self.gid)
-        self.host_file(self.source_file, self.source_file.read_bytes())
-        self.thread.start()
-        self.publish()
-
-    def host_file(self, path, contents):
-        require(path in (self.path, self.source_file) and path.parent == self.path.parent and len(contents) <= 8192,
-                "only the descriptor and bounded synthetic source file receive the host owner")
-        temporary = path.with_name("." + path.name + "." + uuid.uuid4().hex)
-        with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb") as output:
-            os.fchown(output.fileno(), self.uid, self.gid)
-            output.write(contents)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path)
-
-    def publish(self):
-        self.host_file(self.path, json.dumps({"schemaVersion": 1, "url": self.url, "token": self.token}).encode())
-
-    def close(self):
-        if self.closed:
-            return
-        self.closed = True
-        self.path.unlink(missing_ok=True)
-        if self.thread.is_alive():
-            self.server.shutdown()
-        self.server.server_close()
-        if self.thread.is_alive():
-            self.thread.join(timeout=5)
-        self.invitations.clear()
-
-    def order(self, node, identifier=None):
-        rows = delivery_rows(node, "SELECT body FROM orders" if identifier is None else
-                             "SELECT body FROM orders WHERE id=?", () if identifier is None else (identifier,))
-        orders = [json.loads(row[0]) for row in rows]
-        orders = [order for order in orders if identifier is not None or order["view"].get("name") == self.source_file.name]
-        require(len(orders) <= 1, "ordinary UI actions preserve one original order")
-        return orders[0] if orders else None
-
-    def snapshot(self):
-        if self.stage not in ("ordinary", "complete"):
-            return None, None, None
-        source = self.order(self.nodes["web"])
-        receiver, provider = None, None
-        if source:
-            view = source["view"]
-            require(view["role"] == "sender" and view["mode"] == "paid" and view["acceptance"] == "recoverable" and len(view["windows"]) == 1
-                    and view["bytes"] == self.size and view["sha256"] == self.digest
-                    and view["source_peer"] == self.nodes["web"].device_id
-                    and view["receiver_peer"] == self.nodes["android"].device_id
-                    and view["provider_peer"] == self.nodes["provider"].device_id and view["payment"]["total"] == "17",
-                    "actual ordinary order binds the selected original, peers, mode and exact fees")
-            receiver = self.order(self.nodes["android"], view["order_id"])
-            provider = self.order(self.nodes["provider"], view["order_id"])
-        return source, receiver, provider
-
-    def facts(self):
-        source, receiver, provider = self.snapshot()
-        complete = bool(receiver and provider and receiver["view"]["evidence"] == "decryption_proven"
-                        and all(window["decryption_proven"] for window in receiver["view"]["windows"])
-                        and all(provider["view"]["payment"][name] == "17" for name in ("earned", "withdrawn"))
-                        and provider["view"]["payment"]["refunded"] == "0")
-        return {"schemaVersion": 1, "nodes": {role: {"url": node.url, "peer": node.device_id}
-                for role, node in self.nodes.items()}, "sourceFile": str(self.source_file.relative_to(self.repository)),
-                "name": self.source_file.name, "bytes": self.size, "sha256": self.digest,
-                "serviceCap": self.configuration["max_service_amount"], "gasCap": self.configuration["source_gas_cap_wei"],
-                "source": source["view"] if source else None, "receiver": receiver["view"] if receiver else None,
-                "provider": provider["view"] if provider else None, "settled": complete,
-                "paired": {role: self.pairings.get(role, {}).get("approved", False) for role in self.names},
-                "stage": self.stage, "inspection": self.inspection,
-                "events": list(self.events), "failure": self.failure}
-
-    def set_stage(self, stage):
-        with self.lock:
-            require((self.stage, stage) in (("bootstrap", "inspections"), ("inspections", "ordinary")),
-                    "UI stages advance once from pairing through inspection to ordinary actions")
-            require(self.observers == set(self.names) and self.inspection is None and self.failure is None,
-                    "both real paired observers finish each bounded inspection before ordinary actions")
-            self.stage = stage
-
-    def begin_inspection(self, value):
-        with self.lock:
-            require(self.stage == "inspections" and self.inspection is None and value["kind"] in self.inspections,
-                    "one finite original-order inspection is active outside ordinary mutations")
-            role, screenshot = self.inspections[value["kind"]]
-            require(value["role"] == role and value["screenshot"] == screenshot
-                    and value["nodePeer"] == self.nodes[role].device_id and value["timeoutMs"] == 120000,
-                    "inspection binds its fixed real Node, role, file and bounded deadline")
-            self.inspection_finished.clear()
-            self.inspection_ack = None
-            self.inspection = value
-
-    def end_inspection(self):
-        with self.lock:
-            require(self.inspection_ack is not None and self.inspection_finished.is_set() and self.failure is None,
-                    "the actual UI acknowledges its current rendered inspection")
-            result = self.inspection_ack
-            self.inspection, self.inspection_ack = None, None
-            return result
-
-    def pairing(self, role):
-        require(role in self.names, "UI pairing names one of its two fixed clients")
-        with self.client_locks[role]:
-            if role in self.pairings:
-                return self.pairings[role]
-            client = self.nodes[role].client
-            requests = client.call("join_status")["requests"]
-            pending = [request for request in requests if request["name"] == self.names[role]
-                       and request["kind"] == "client" and request["status"] in ("pending", "confirming")]
-            require(len(pending) <= 1, "one actual browser or mobile client owns its UI pairing")
-            if not pending:
-                return None
-            request = pending[0]
-            if request["status"] == "pending":
-                client.start_approval(request["join_id"])
-                return None
-            if not request.get("joiner_nonce"):
-                return None
-            pairing = {"peer": request["device_id"], "code": client.command("short_code", request=request), "approved": False}
-            require(re.fullmatch(r"[0-9a-f]{64}", pairing["peer"]) and re.fullmatch(r"[0-9]{6}", pairing["code"]),
-                    "actual UI pairing returns one peer and a six digit safety code")
-            self.pairings[role] = pairing
-            return pairing
-
-    def approve(self, role, peer, code):
-        require(role in self.names, "approval names its fixed UI client")
-        with self.client_locks[role]:
-            pairing = self.pairings.get(role)
-            require(pairing and pairing["peer"] == peer and pairing["code"] == code,
-                    "UI and the manager compare the same actual safety code")
-            if not pairing["approved"]:
-                client = self.nodes[role].client
-                pending = client.pending_join(peer)
-                require(pending and pending["name"] == self.names[role] and pending.get("joiner_nonce")
-                        and client.command("short_code", request=pending) == code,
-                        "manage approval binds the revealed original pairing request")
-                client.grant(pending, manage=True)
-                pairing["approved"] = True
-            return {"approved": True, "peer": peer}
-
-    def event(self, request):
-        name = request.get("name")
-        if name == "observer-ready":
-            require(set(request) == {"name", "role"} and request["role"] in self.names,
-                    "bootstrap readiness names one fixed real observer")
-            with self.lock:
-                require(self.stage == "bootstrap" and self.pairings.get(request["role"], {}).get("approved"),
-                        "the observer is actually paired before any whole checkpoint")
-                self.observers.add(request["role"])
-                return {"recorded": name}
-        if name == "inspection-observed":
-            require(set(request) == {"name", "role", "id", "screenshot", "sha256", "bytes"},
-                    "inspection acknowledgements have one exact finite schema")
-            with self.lock:
-                current = self.inspection
-                require(self.stage == "inspections" and current and all(request[key] == current[key]
-                        for key in ("role", "id", "screenshot")), "stale or cross-role inspection acknowledgements are rejected")
-                require(re.fullmatch(r"[0-9a-f]{64}", request["sha256"]) and type(request["bytes"]) is int
-                        and 8 < request["bytes"] <= 10 * 1024 * 1024, "inspection names a bounded actual PNG")
-                screenshot = self.path.parent / "public" / current["screenshot"]
-                metadata = screenshot.lstat()
-                require(stat.S_ISREG(metadata.st_mode) and metadata.st_size == request["bytes"]
-                        and file_sha256(screenshot) == request["sha256"]
-                        and screenshot.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n",
-                        "inspection acknowledgement matches the actual allowlisted rendered screenshot")
-                require(self.inspection_ack is None or self.inspection_ack == request,
-                        "an idempotent inspection acknowledgement cannot change its screenshot")
-                self.inspection_ack = request
-                self.inspection_finished.set()
-                return {"recorded": name}
-        require(name in self.sequence and set(request) == ({"name", "sha256", "bytes"} if name == "saved" else {"name"}),
-                "UI events have a fixed bounded schema")
-        with self.lock:
-            if name == "saved":
-                require(request["sha256"] == self.digest and type(request["bytes"]) is int and request["bytes"] == self.size,
-                        "the actual Android saved file matches the original length and SHA-256")
-            require(self.stage == "ordinary" or self.stage == "complete" and name in self.events,
-                    "ordinary acceptance actions are forbidden during bootstrap and inspection")
-            if name in self.events:
-                return {"recorded": name}
-            require(name == self.sequence[len(self.events)], "ordinary UI events follow the actual acceptance sequence")
-            source, receiver, provider = self.snapshot()
-            require(source is not None and all(self.pairings.get(role, {}).get("approved") for role in self.names),
-                    "both real UI clients are paired before ordinary order acceptance")
-            identifier = source["view"]["order_id"]
-            funded = delivery_rows(self.nodes["web"], "SELECT id FROM transactions WHERE id=?", (identifier + "/fund",))
-            if name == "prepared":
-                require(source["view"]["phase"] == "prepared" and not source["confirmed"] and not funded,
-                        "actual UI quotation precedes any original order funding")
-            else:
-                require(source["confirmed"] and source["authorized_by"] == self.pairings["web"]["peer"],
-                        "ordinary payment was authorized by the actual Web member")
-            if self.sequence.index(name) >= self.sequence.index("accepted"):
-                require(receiver and receiver["accepted"] and receiver["authorized_by"] == self.pairings["android"]["peer"],
-                        "the real Android member accepts the exact receiver order")
-            if name in ("settled-offline", "saved"):
-                require(self.facts()["settled"], "actual ordinary proof and withdrawal complete before UI file acceptance")
-            self.events[name] = {"order_id": identifier, "intent_id": source["view"]["intent_id"],
-                                 "monotonic": time.monotonic()}
-            if name == "saved":
-                self.stage = "complete"
-                self.finished.set()
-            return {"recorded": name}
-
-    def handler(self):
-        control = self
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, *_):
-                pass
-
-            def handle_request(self):
-                try:
-                    self.connection.settimeout(5)
-                    require(self.client_address[0] == "127.0.0.1" and self.headers.get("Host") ==
-                            f"127.0.0.1:{control.server.server_port}" and self.headers.get("Origin") is None
-                            and self.headers.get("Transfer-Encoding") is None,
-                            "UI controller accepts only direct local non-browser requests")
-                    require(hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + control.token),
-                            "UI controller requires its single task bearer")
-                    require(self.path in ("/facts", "/invitation/web", "/invitation/android", "/pairing", "/approve", "/event", "/abort"),
-                            "UI controller exposes only its fixed test operations")
-                    length = self.headers.get("Content-Length", "0")
-                    require(re.fullmatch(r"[0-9]{1,4}", length) and int(length) <= 1024,
-                            "UI controller input remains bounded")
-                    if self.command == "GET":
-                        require(length == "0" and self.path in ("/facts", "/invitation/web", "/invitation/android"),
-                                "UI reads use one fixed bodyless GET")
-                        with control.lock:
-                            result = control.facts() if self.path == "/facts" else {"invitation": control.invitations[self.path.rsplit("/", 1)[1]]}
-                    else:
-                        require(self.command == "POST" and self.path in ("/pairing", "/approve", "/event", "/abort")
-                                and self.headers.get("Content-Type") == "application/json", "UI mutations have a fixed JSON entry")
-                        request = json.loads(self.rfile.read(int(length)))
-                        require(isinstance(request, dict), "UI input is one JSON record")
-                        with control.lock:
-                            if self.path == "/pairing":
-                                require(set(request) == {"role"}, "pairing input has one role")
-                                result = control.pairing(request["role"])
-                            elif self.path == "/approve":
-                                require(set(request) == {"role", "peer", "code"}, "approval input names one original peer and code")
-                                result = control.approve(**request)
-                            elif self.path == "/abort":
-                                require(set(request) == {"role"} and request["role"] in control.names, "abort names one UI client")
-                                control.failure = request["role"] + "_ui_failed"
-                                control.finished.set()
-                                control.inspection_finished.set()
-                                result = {"aborted": True}
-                            else:
-                                result = control.event(request)
-                    self.respond(200, {"ok": True, "result": result})
-                except (AssertionError, KeyError, ValueError, TypeError, OSError):
-                    self.respond(400, {"ok": False, "error": "invalid_ui_control_request"})
-
-            def respond(self, status, value):
-                body = json.dumps(value).encode()
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            do_GET = handle_request
-            do_POST = handle_request
-
-        return Handler
-
-
-def delivery_ui_selfcheck(options):
-    root = Path(__file__).resolve().parents[1]
-    require(options.artifacts.resolve().is_relative_to(root / ".artifacts"), "UI selfcheck stays in ignored task artifacts")
-    run = options.artifacts.resolve() / ("controller-selfcheck-" + uuid.uuid4().hex)
-    run.mkdir(mode=0o700, parents=True)
-    source_file = run / "ordinary-paid-ui.bin"
-    source_file.write_bytes(os.urandom(4096))
-
-    class Fixture:
-        def __init__(self, role, index):
-            self.directory = run / role
-            self.url = f"http://127.0.0.1:{10000 + index}"
-            self.device_id = format(index, "064x")
-            self.client = self
-
-        def invite(self):
-            return "controller-selfcheck-invitation"
-
-    nodes = {role: Fixture(role, index) for index, role in enumerate(("web", "android", "provider"), 1)}
-    control = DeliveryUiControl(run / "control.json", root, source_file, nodes,
-                                {"max_service_amount": "1000000", "source_gas_cap_wei": "1000000000000000000"})
-    verified = {"walletLocked": True, "rawBroadcastDelta": 0, "proofJobsUnchanged": True,
-                "transactionIntentsUnchanged": True, "canonicalRestored": True}
-    require(control.inspection_verified(verified), "zero broadcasts with all four actual invariants passes the inspection aggregate")
-    for name in ("walletLocked", "proofJobsUnchanged", "transactionIntentsUnchanged", "canonicalRestored"):
-        require(not control.inspection_verified({**verified, name: False}), "each failed inspection invariant rejects the aggregate")
-    for invalid in (1, False):
-        require(not control.inspection_verified({**verified, "rawBroadcastDelta": invalid}),
-                "a real broadcast or boolean cannot masquerade as a verified zero integer")
-    count = 0
-
-    def check(path, *, body=None, token=True, origin=None, expected=400):
-        nonlocal count
-        headers = {"Content-Type": "application/json"}
-        if token:
-            headers["Authorization"] = "Bearer " + control.token
-        if origin:
-            headers["Origin"] = origin
-        request = urllib.request.Request(control.url + path, None if body is None else json.dumps(body).encode(), headers)
-        try:
-            with urllib.request.urlopen(request, timeout=10) as response:
-                status, value = response.status, json.load(response)
-        except urllib.error.HTTPError as error:
-            status, value = error.code, json.load(error)
-        require(status == expected and value["ok"] == (expected == 200), "pure controller selfcheck observes its expected HTTP boundary")
-        count += 1
-        return value.get("result")
-
-    try:
-        control.start()
-        first_inode = control.path.stat().st_ino
-        control.publish()
-        require(control.path.stat().st_ino != first_inode and control.path.stat().st_uid == control.uid
-                and control.path.stat().st_gid == control.gid and (control.path.stat().st_mode & 0o077) == 0,
-                "atomic descriptor republication retains its explicit host owner and private mode")
-        require(source_file.stat().st_uid == control.uid and source_file.stat().st_gid == control.gid
-                and (source_file.stat().st_mode & 0o077) == 0 and control.path.parent.stat().st_uid == control.uid,
-                "only the dedicated UI directory and single synthetic fixture receive the host owner")
-        facts = check("/facts", expected=200)
-        require(facts["source"] is None and facts["bytes"] == 4096 and not facts["settled"]
-                and control.token not in json.dumps(facts), "facts contain public values and no task bearer")
-        check("/facts", token=False)
-        check("/facts", origin="http://127.0.0.1")
-        check("/facts?token=forbidden")
-        check("/wallet")
-        check("/facts", body={})
-        check("/invitation/web", expected=200)
-        check("/pairing", body={"role": "other"})
-        check("/pairing", body={"role": "web", "extra": True})
-        check("/approve", body={"role": "web", "peer": "0" * 64, "code": "000000"})
-        check("/event", body={"name": "saved", "bytes": 4096, "sha256": control.digest})
-        check("/event", body={"name": "prepared", "extra": True})
-        check("/event", body={"name": "confirm"})
-        check("/abort", body={"role": "other"})
-        check("/abort", body={"role": "android"}, expected=200)
-        require(control.finished.is_set() and control.failure == "android_ui_failed" and not control.events,
-                "abort completes no acceptance stage")
-        control.finished.clear()
-        control.failure = None
-        control.pairings = {role: {"peer": format(index, "064x"), "code": "123456", "approved": True}
-                            for index, role in enumerate(("web", "android"), 4)}
-        check("/event", body={"name": "observer-ready", "role": "other"})
-        check("/event", body={"name": "observer-ready", "role": "web", "extra": True})
-        check("/event", body={"name": "observer-ready", "role": "web"}, expected=200)
-        check("/event", body={"name": "observer-ready", "role": "android"}, expected=200)
-        check("/event", body={"name": "prepared"})
-        control.set_stage("inspections")
-        inspection = {"id": str(uuid.uuid4()), "kind": "receiver-key-before", "role": "android",
-                      "nodePeer": nodes["android"].device_id, "orderId": None, "intentId": None,
-                      "keyId": "c" * 64, "keySerial": 1, "expectedPhase": None, "expectedPaymentState": None,
-                      "earned": None, "withdrawn": None, "refunded": None, "evidence": None, "windows": [],
-                      "screenshot": "android-key-before.png", "timeoutMs": 120000}
-        control.begin_inspection(inspection)
-        screenshot = run / "public" / inspection["screenshot"]
-        screenshot.parent.mkdir(mode=0o700)
-        screenshot.write_bytes(b"\x89PNG\r\n\x1a\n" + b"pure-controller-boundary-fixture")
-        acknowledgement = {"name": "inspection-observed", "role": "android", "id": inspection["id"],
-                           "screenshot": inspection["screenshot"], "sha256": file_sha256(screenshot), "bytes": screenshot.stat().st_size}
-        check("/event", body={**acknowledgement, "id": str(uuid.uuid4())})
-        check("/event", body={**acknowledgement, "role": "web"})
-        check("/event", body={**acknowledgement, "screenshot": "../other.png"})
-        check("/event", body={**acknowledgement, "sha256": "f" * 64})
-        check("/event", body={**acknowledgement, "bytes": True})
-        check("/event", body={"name": "prepared"})
-        check("/event", body=acknowledgement, expected=200)
-        check("/event", body=acknowledgement, expected=200)
-        require(control.end_inspection() == acknowledgement and not control.events,
-                "pure inspection acknowledgement cannot authorize any ordinary order action")
-        check("/event", body=acknowledgement)
-        control.set_stage("ordinary")
-        identifier = "a" * 64
-        view = {"order_id": identifier, "intent_id": str(uuid.uuid4()), "role": "sender", "mode": "paid",
-                "acceptance": "recoverable", "windows": [{"decryption_proven": False}], "bytes": 4096,
-                "name": source_file.name, "sha256": control.digest, "phase": "prepared", "evidence": "none",
-                "source_peer": nodes["web"].device_id, "receiver_peer": nodes["android"].device_id,
-                "provider_peer": nodes["provider"].device_id,
-                "payment": {"total": "17", "earned": "0", "withdrawn": "0", "refunded": "0"}}
-        synthetic_source = {"view": view, "confirmed": False, "authorized_by": None}
-
-        def synthetic_order(role, value):
-            directory = nodes[role].directory / "delivery"
-            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-            with sqlite3.connect(directory / "service.sqlite3") as database:
-                database.execute("CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,body TEXT NOT NULL)")
-                database.execute("CREATE TABLE IF NOT EXISTS transactions(id TEXT PRIMARY KEY)")
-                database.execute("INSERT OR REPLACE INTO orders(id,body) VALUES(?,?)", (identifier, json.dumps(value)))
-
-        invalid = copy.deepcopy(synthetic_source)
-        invalid["view"]["acceptance"] = "strict"
-        synthetic_order("web", invalid)
-        check("/event", body={"name": "prepared"})
-        invalid["view"]["acceptance"] = "recoverable"
-        invalid["view"]["sha256"] = "b" * 64
-        synthetic_order("web", invalid)
-        check("/event", body={"name": "prepared"})
-        synthetic_order("web", synthetic_source)
-        check("/event", body={"name": "prepared"}, expected=200)
-        check("/event", body={"name": "prepared"}, expected=200)
-        check("/event", body={"name": "confirmed"})
-        synthetic_source.update(confirmed=True, authorized_by="f" * 64)
-        synthetic_order("web", synthetic_source)
-        check("/event", body={"name": "confirmed"})
-        synthetic_source["authorized_by"] = control.pairings["web"]["peer"]
-        synthetic_order("web", synthetic_source)
-        check("/event", body={"name": "confirmed"}, expected=200)
-        check("/event", body={"name": "accepted"})
-        synthetic_receiver = {"view": copy.deepcopy(view), "accepted": True, "authorized_by": "f" * 64}
-        synthetic_receiver["view"]["role"] = "receiver"
-        synthetic_order("android", synthetic_receiver)
-        check("/event", body={"name": "accepted"})
-        synthetic_receiver["authorized_by"] = control.pairings["android"]["peer"]
-        synthetic_order("android", synthetic_receiver)
-        check("/event", body={"name": "accepted"}, expected=200)
-        check("/event", body={"name": "settled-offline"})
-        check("/event", body={"name": "offline-visible"}, expected=200)
-        check("/event", body={"name": "settled-offline"})
-        synthetic_provider = {"view": copy.deepcopy(view)}
-        synthetic_provider["view"]["role"] = "provider"
-        synthetic_provider["view"]["payment"].update(earned="17", withdrawn="16")
-        synthetic_receiver["view"]["evidence"] = "decryption_proven"
-        synthetic_receiver["view"]["windows"][0]["decryption_proven"] = True
-        synthetic_order("android", synthetic_receiver)
-        synthetic_order("provider", synthetic_provider)
-        check("/event", body={"name": "settled-offline"})
-        synthetic_provider["view"]["payment"]["withdrawn"] = "17"
-        synthetic_order("provider", synthetic_provider)
-        check("/event", body={"name": "settled-offline"}, expected=200)
-        check("/event", body={"name": "saved", "sha256": control.digest, "bytes": True})
-        check("/event", body={"name": "saved", "sha256": "f" * 64, "bytes": 4096})
-        check("/event", body={"name": "saved", "sha256": control.digest, "bytes": 4096}, expected=200)
-        check("/event", body={"name": "saved", "sha256": "f" * 64, "bytes": 4096})
-        require(control.finished.is_set() and list(control.events) == list(control.sequence),
-                "synthetic state-machine selfchecks reach exactly the six expected event stages")
-    finally:
-        control.close()
-        source_file.unlink()
-    require(not control.path.exists(), "UI control teardown removes its bearer descriptor")
-    target_calls = []
-
-    class Stub(http.server.BaseHTTPRequestHandler):
-        def log_message(self, *_):
-            pass
-
-        def do_POST(self):
-            value = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            target_calls.append(value["method"])
-            output = json.dumps({"jsonrpc": "2.0", "id": value["id"], "result": "0x1"}).encode()
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(output)))
-            self.end_headers()
-            self.wfile.write(output)
-
-    target = http.server.HTTPServer(("127.0.0.1", 0), Stub)
-    target_thread = threading.Thread(target=target.serve_forever, daemon=True)
-    target_thread.start()
-    recorder = DeliveryRpcForwarder(f"http://127.0.0.1:{target.server_port}")
-    results = []
-
-    def synthetic_rpc(method, params):
-        request = urllib.request.Request(recorder.url, json.dumps({"jsonrpc": "2.0", "id": 1,
-            "method": method, "params": params}).encode(), {"Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(request, timeout=10) as response:
-                return response.status, json.load(response)
-        except urllib.error.HTTPError as error:
-            return error.code, json.load(error)
-
-    try:
-        require(synthetic_rpc("eth_chainId", [])[0] == 200 and recorder.broadcasts() == 0,
-                "pure forwarder selfcheck preserves an actual local read without labeling it a broadcast")
-        require(synthetic_rpc("eth_sendRawTransaction", ["0x00"])[0] == 200 and recorder.broadcasts() == 1,
-                "pure forwarder selfcheck counts its synthetic RPC method without storing its payload")
-        wallet, asset = "0x" + "11" * 20, "0x" + "22" * 20
-        reached = recorder.arm_approval(wallet, asset)
-        other = {"from": "0x" + "33" * 20, "to": asset, "data": "0x095ea7b3" + "00" * 64}
-        require(synthetic_rpc("eth_estimateGas", [other])[0] == 200 and not reached.is_set(),
-                "pre-approval barrier never intercepts a different wallet")
-        call_count = len(target_calls)
-        operation = threading.Thread(target=lambda: results.append(synthetic_rpc("eth_estimateGas", [{**other, "from": wallet}])), daemon=True)
-        operation.start()
-        require(reached.wait(5) and operation.is_alive() and len(target_calls) == call_count,
-                "pure pre-approval barrier really blocks only the fixed Source estimate before forwarding")
-        recorder.release_approval()
-        operation.join(timeout=5)
-        require(results and results[0][0] == 502 and len(target_calls) == call_count and recorder.broadcasts() == 1,
-                "abandoned pre-approval request is released as failure and never reaches the synthetic upstream")
-        require(synthetic_rpc("eth_estimateGas", [{**other, "from": wallet}])[0] == 200,
-                "a fresh request after checkpoint release uses the actual upstream again")
-        fault = recorder.fail_reads(asset)
-        call_count = len(target_calls)
-        require(synthetic_rpc("eth_call", [{"to": asset, "data": "0x00"}, "latest"])[0] == 502
-                and fault["blocked"] == 1 and len(target_calls) == call_count and recorder.broadcasts() == 1,
-                "the finite Node read fault returns a real transport failure without fabricating a receipt")
-        require(synthetic_rpc("eth_call", [{"to": wallet, "data": "0x00"}, "latest"])[0] == 200
-                and synthetic_rpc("eth_chainId", [])[0] == 200,
-                "the bounded fault leaves other targets and non-call methods untouched")
-        fault["expires"] = time.monotonic() - 1
-        require(synthetic_rpc("eth_call", [{"to": asset, "data": "0x00"}, "latest"])[0] == 200,
-                "an expired transport fault cannot leave a live Node read blocked")
-        recorder.restore_reads()
-    finally:
-        recorder.close()
-        target.shutdown()
-        target.server_close()
-        target_thread.join(timeout=5)
-    print(f"PASS pure delivery-ui selfcheck {count} HTTP cases plus forwarding/barrier/owner checks; no Node, UI, chain or proof started", flush=True)
+def delivery_ui_selfcheck(_options):
+    raise ValueError("the former Strict delivery UI controller selfcheck is retired; use --delivery-protected-selfcheck for the current driver without starting processes or proofs")
 
 
 def delivery_paid_acceptance(options):
-    require(options.delivery_config is not None,
-            "UNVERIFIED paid delivery requires --delivery-config; charity success is not full delivery acceptance")
-    configuration_path = options.delivery_config.resolve(strict=True)
-    metadata = options.delivery_config.lstat()
-    require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.getuid()
-            and metadata.st_mode & 0o077 == 0 and metadata.st_size <= 16384,
-            "paid acceptance configuration must be an owner-only bounded regular file")
-    configuration = json.loads(configuration_path.read_text())
-    expected = {"schema_version", "deployment_file", "prover", "max_service_amount", "source_gas_cap_wei",
-                "provider_gas_cap_wei", "register_key_gas_cap_wei", "settlement_observer"}
-    require(set(configuration) == expected and configuration["schema_version"] == 1,
-            "paid acceptance requires the exact schema_version 1 configuration")
-    require(sys.platform.startswith("linux"), "UNVERIFIED paid Node proving requires the real Linux cgroup environment")
-    repository = Path(__file__).resolve().parents[1]
-    deployment_path = Path(configuration["deployment_file"])
-    require(deployment_path.is_absolute() and not deployment_path.exists()
-            and deployment_path.resolve().is_relative_to(repository / ".artifacts"),
-            "paid acceptance requires a fresh deployment output inside this task's ignored artifacts")
-    deployment_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    log = deployment_path.with_suffix(".log").open("xb")
-    process = subprocess.Popen(["node", str(repository / "contracts/delivery/deploy-local.mjs"),
-                               "--listen", "127.0.0.1:0", "--output", str(deployment_path)],
-                              stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
-    try:
-        def deployed():
-            if process.poll() is not None:
-                raise RuntimeError("local paid deployment process exited; inspect its task-local log")
-            try:
-                value = json.loads(deployment_path.read_text())
-                return value if value.get("rpc_url") else None
-            except (FileNotFoundError, json.JSONDecodeError):
-                return None
-        deployment = wait_for("fresh local delivery contracts and automatic confirmation blocks", deployed, timeout=120)
-        return delivery_paid_run(options, configuration, deployment)
-    finally:
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=5)
-        log.close()
+    raise ValueError("the former Strict/13-proof delivery runner is retired; protected delivery uses prepaid budgets, confirm_batch and explicit provider budget flush with schema-2 evidence")
 
 
-def delivery_progress(options):
-    commit = os.environ.get("VIBEFACE_DELIVERY_PROGRESS_COMMIT", "")
-    if options.delivery_ui_control is None or not re.fullmatch(r"[0-9a-f]{40}", commit):
-        return lambda stage: None
-    runner = Path(__file__).resolve().parents[1] / "scripts/run-delivery-live.py"
-    return runpy.run_path(str(runner))["progress_writer"]("paid", commit)
+def delivery_protected_selfcheck():
+    driver = runpy.run_path(str(Path(__file__).resolve().with_name("verify-delivery-protected.py")))
+    driver["self_test"]()
 
 
-def delivery_paid_run(options, configuration, deployment):
-    enter = delivery_progress(options)
-    fields = ("rpc_url", "chain_id", "escrow", "asset", "profile", "confirmations")
-    chain = {name: deployment[name] for name in fields}
-    profile = json.loads(options.delivery_profile.resolve(strict=True).read_text())
-    require(chain["chain_id"] == 31337 and chain["confirmations"] == 2 and chain["profile"] == profile,
-            "paid acceptance uses the exact local deployment, product profile and two confirmations")
-    url = urllib.parse.urlsplit(chain["rpc_url"])
-    require(url.scheme == "http" and url.hostname and ipaddress.ip_address(url.hostname).is_loopback
-            and url.port and not url.username and not url.password and url.path in ("", "/")
-            and not url.query and not url.fragment, "paid acceptance RPC is a literal loopback HTTP origin")
-    for name in ("escrow", "asset"):
-        require(re.fullmatch(r"0x[0-9a-fA-F]{40}", chain[name]), "deployment contains a bounded contract address")
-    prover = configuration["prover"]
-    require(set(prover) == {"program", "r0vm", "cgroup", "profile"} and prover["profile"] == profile,
-            "paid acceptance prover uses the fixed product profile")
-    for name in ("program", "r0vm", "cgroup"):
-        require(Path(prover[name]).is_absolute(), "paid acceptance prover paths are explicit absolute paths")
-    for name in ("max_service_amount", "source_gas_cap_wei", "provider_gas_cap_wei", "register_key_gas_cap_wei"):
-        require(isinstance(configuration[name], str) and re.fullmatch(r"[1-9][0-9]{0,70}", configuration[name]),
-                "paid acceptance financial caps are explicit positive decimal strings")
-    enter("free-checks")
-    free = delivery_charity_acceptance(options)
-    require(free["status"] == "passed", "full paid acceptance also requires the free-network safety checks")
-    repository = Path(__file__).resolve().parents[1]
-    binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
-    artifacts = options.artifacts.resolve()
-    run = artifacts / ("delivery-paid-" + uuid.uuid4().hex[:10])
-    run.mkdir(mode=0o700)
-    export = run / "settlement"
-    export.mkdir(mode=0o700)
-    workspace = run / "workspace"
-    workspace.mkdir(mode=0o700)
-    principals = run / "paid-principals"
-    principals.mkdir(mode=0o700)
-    helper = run / "client.mjs"
-    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
-    relay, nodes, passwords = PkarrRelay(), [], {}
-    chain_recorder = DeliveryRpcForwarder(chain["rpc_url"]) if options.delivery_ui_control is not None else None
-    node_chain = {**chain, "rpc_url": chain_recorder.url} if chain_recorder else chain
-    inherited_proof = {}
-    registration_process = None
-    registration_log = None
-    key_processes = []
-    branch_process, branch_log = None, None
-    data_checkpoints, known_locked, lifecycle_actions, proof_catalog = {}, set(), [], {}
-    ui_control, inspection_records, process_recoveries = None, [], []
-    last_quiesced = None
-    report = {"status": "running", "mode": "paid", "binary_sha256": file_sha256(binary),
-              "free_checks": free["status"], "deployment": {name: chain[name] for name in fields if name != "profile"},
-              "cases": {}, "not_checked": ["public assets", "absolute chain finality", "rendered native mobile UI",
-                                             "public internet or long-term retention"]}
-
-    def passed(name, **evidence):
-        report["cases"][name] = evidence
-        print("PASS delivery-paid " + name, flush=True)
-
-    def rpc(method, params):
-        request = urllib.request.Request(chain["rpc_url"], json.dumps({"jsonrpc": "2.0", "id": 1,
-            "method": method, "params": params}).encode(), {"Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=30) as response:
-            body = response.read(1024 * 1024 + 1)
-        require(len(body) <= 1024 * 1024, "local chain RPC response is bounded")
-        value = json.loads(body)
-        require(value.get("id") == 1 and "error" not in value, "local chain RPC returns a matching successful response")
-        return value["result"]
-
-    def confirmed(hash_value):
-        receipt = rpc("eth_getTransactionReceipt", [hash_value])
-        if receipt is None:
-            return None
-        require(receipt["status"] == "0x1", "controlled local funding transaction succeeds")
-        height = int(rpc("eth_blockNumber", []), 16)
-        return receipt if height >= int(receipt["blockNumber"], 16) + chain["confirmations"] - 1 else None
-
-    def cli(node, arguments, *, password=None, timeout=30, success=True, error_contains=None):
-        descriptor, password_path = None, None
-        command = [str(binary), "wallet", "--data-dir", str(node.directory), *arguments]
-        try:
-            if password is not None:
-                password_path = run / ("passphrase-" + uuid.uuid4().hex)
-                descriptor = os.open(password_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
-                os.write(descriptor, password.encode() + b"\n")
-                os.lseek(descriptor, 0, os.SEEK_SET)
-                command += ["--passphrase-fd", str(descriptor)]
-            result = subprocess.run(command, capture_output=True, timeout=timeout,
-                                    pass_fds=(() if descriptor is None else (descriptor,)))
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
-                password_path.unlink(missing_ok=True)
-        require((result.returncode == 0) == success, "local wallet command has its expected outcome without exposing its passphrase")
-        if error_contains is not None:
-            require(not success and error_contains.encode() in result.stderr,
-                    "the rejected local wallet operation names the expected authority or proof-lock boundary")
-        if success and result.stdout.lstrip().startswith(b"{"):
-            return json.loads(result.stdout)
-        return None
-
-    def process_fact(pid):
-        try:
-            fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-            return {"pid": pid, "start": fields[19], "group": int(fields[2]),
-                    "exe": Path(f"/proc/{pid}/exe").resolve(strict=True)}
-        except FileNotFoundError:
-            return None
-
-    def controlled_descendants(parent):
-        pending, found = [parent], {}
-        while pending:
-            pid = pending.pop()
-            if pid in found:
-                continue
-            fact = process_fact(pid)
-            if fact is None:
-                continue
-            found[pid] = fact
-            for task in Path(f"/proc/{pid}/task").glob("*"):
-                try:
-                    pending.extend(int(child) for child in (task / "children").read_text().split())
-                except FileNotFoundError:
-                    pass
-        found.pop(parent, None)
-        return found
-
-    def same_process(fact):
-        current = process_fact(fact["pid"])
-        return current is not None and current["start"] == fact["start"]
-
-    def owns_proof_lock(fact, lock):
-        if not same_process(fact):
-            return False
-        for fd in Path(f"/proc/{fact['pid']}/fd").glob("*"):
-            try:
-                if fd.resolve(strict=True) == lock:
-                    return True
-            except FileNotFoundError:
-                pass
-        return False
-
-    def proof_busy(lock):
-        import fcntl
-        descriptor = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        try:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return True
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-            return False
-        finally:
-            os.close(descriptor)
-
-    def transaction(node, identifier):
-        def observed():
-            rows = delivery_rows(node, "SELECT hash,phase FROM transactions WHERE id=?", (identifier,))
-            require(len(rows) == 1 and re.fullmatch(r"0x[0-9a-f]{64}", rows[0][0]),
-                    "settlement bundle references a unique actual Node transaction")
-            if rows[0][1] in ("reverted", "conflicted", "failed"):
-                raise RuntimeError("actual Node settlement transaction reached a terminal failure")
-            return rows[0][0] if rows[0][1] == "confirmed" else None
-        return wait_for("Node durably observes its settlement transaction confirmed", observed)
-
-    def public_proof(journal, node, relation, index=None, *, destination=None, name=None):
-        destination = export if destination is None else destination
-        require(len(journal) == 1504 and int.from_bytes(journal[32:64], "big") == relation,
-                "exported journal is the canonical 47-word relation")
-        digest = hashlib.sha256(journal).hexdigest()
-        rows = delivery_rows(node, "SELECT path FROM proof_jobs WHERE digest=?", (digest,))
-        require(len(rows) == 1, "public proof has one durable Node receipt")
-        receipt = Path(rows[0][0])
-        require(receipt.resolve().is_relative_to(node.directory.resolve()) and stat.S_ISREG(receipt.lstat().st_mode)
-                and receipt.stat().st_size <= 16384, "receipt is a bounded regular file in its controlled Node")
-        verified = subprocess.run([prover["program"], "verify", journal.hex()], input=receipt.read_bytes(),
-                                  capture_output=True, timeout=120,
-                                  env={"PATH": "/usr/bin:/bin", "RISC0_SERVER_PATH": prover["r0vm"]})
-        require(verified.returncode == 0, "actual host verifies the binary Groth16 receipt against the public journal")
-        value = json.loads(verified.stdout)
-        image = bytes(profile["guest_image_id"]).hex()
-        require(value["verified"] is True and value["kind"] == "groth16" and value["imageId"] == image
-                and value["journalHash"] == digest, "verified receipt binds the product image and exact journal")
-        profile_bytes = hashlib.sha256(b"vibeface-delivery-profile-v1").digest() + bytes(profile["guest_image_id"]) + bytes(profile["statement_schema_hash"])
-        for field in ("crypto_suite", "max_windows", "max_window_bytes", "max_total_bytes", "max_guest_cycles", "max_prover_memory_bytes"):
-            profile_bytes += profile[field].to_bytes(32, "big")
-        basename = name if name is not None else "key-binding" if index is None else f"relation-{relation}-window-{index}"
-        require(re.fullmatch(r"[a-z0-9-]{1,64}", basename), "public receipt export uses a bounded local basename")
-        shutil.copyfile(receipt, destination / (basename + ".receipt"))
-        private_json(destination / (basename + ".json"), {"mode": "prove", "kind": "groth16", "relation": relation,
-                     "imageId": image, "profileId": hashlib.sha256(profile_bytes).hexdigest(),
-                     "journal": journal.hex(), "journalHash": digest, "seal": value["seal"]})
-        entry = {"relation": relation, "public": basename + ".json", "receipt": basename + ".receipt"}
-        if index is not None:
-            entry["windowIndex"] = index
-        return entry
-
-    def stopped_nodes(label, *, save=False):
-        nonlocal last_quiesced
-        require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}", label), "whole Node checkpoint has one opaque bounded label")
-        descendants = {}
-        for node in nodes:
-            if node.process is not None:
-                cli(node, ["lock"])
-                require(cli(node, ["status"])["state"] == "locked", "each task wallet is actually locked before its data checkpoint")
-                known_locked.add(node.name)
-                descendants.update(controlled_descendants(node.process.pid))
-            else:
-                require(node.name in known_locked, "an already stopped task Node was explicitly locked before stopping")
-            lock = node.directory / "delivery/private/prover.lock"
-            require(not lock.exists() or not proof_busy(lock), "a whole Node checkpoint cannot cross an inherited active prover lock")
-        for node in nodes:
-            node.client.close()
-            node.stop()
-        require(not any(same_process(fact) for fact in descendants.values()),
-                "every known task descendant has stopped before copying any Node data")
-        for node in nodes:
-            lock = node.directory / "delivery/private/prover.lock"
-            require(node.process is None and (not lock.exists() or not proof_busy(lock)),
-                    "task Node and inherited proof processes are quiescent at the checkpoint")
-            for proof_digest, proof_path in delivery_rows(node, "SELECT digest,path FROM proof_jobs"):
-                receipt = Path(proof_path)
-                require(re.fullmatch(r"[a-f0-9]{64}", proof_digest) and receipt.resolve().is_relative_to(node.directory.resolve())
-                        and stat.S_ISREG(receipt.lstat().st_mode) and 0 < receipt.stat().st_size <= 16384,
-                        "quiescent proof reservations all have actual bounded atomically completed receipts")
-                fact = (node.name, file_sha256(receipt))
-                require(proof_digest not in proof_catalog or proof_catalog[proof_digest] == fact,
-                        "whole data restoration never changes or regenerates an already catalogued genuine receipt")
-                proof_catalog[proof_digest] = fact
-        if save:
-            require(label not in data_checkpoints, "whole Node checkpoints are immutable once saved")
-            destination = run / "private-node-checkpoints" / label
-            destination.mkdir(mode=0o700, parents=True)
-
-            def runtime_entries(directory, names):
-                skipped = []
-                for name in names:
-                    mode = (Path(directory) / name).lstat().st_mode
-                    require(stat.S_ISDIR(mode) or stat.S_ISREG(mode) or stat.S_ISSOCK(mode),
-                            "task Node data checkpoint contains only regular state, directories and disposable sockets")
-                    if stat.S_ISSOCK(mode):
-                        skipped.append(name)
-                return skipped
-
-            for node in nodes:
-                require(node.directory.parent.resolve() == run.resolve() and node.directory.resolve().is_relative_to(repository / ".artifacts"),
-                        "whole data checkpoints apply only to this run's disposable Nodes")
-                shutil.copytree(node.directory, destination / node.name, ignore=runtime_entries)
-            data_checkpoints[label] = destination
-        last_quiesced = {"nodesStopped": True, "walletsLocked": True, "proversIdle": True, "nodeDataCheckpoint": label}
-        return last_quiesced
-
-    def restore_node_data(label):
-        require(label in data_checkpoints and all(node.process is None for node in nodes),
-                "restore requires one actual whole checkpoint and fully stopped task Nodes")
-        retired = run / "private-node-retired" / (label + "-" + uuid.uuid4().hex)
-        retired.mkdir(mode=0o700, parents=True)
-        for node in nodes:
-            node.client.close()
-            source_directory = data_checkpoints[label] / node.name
-            restored = run / (".node-restore-" + node.name + "-" + uuid.uuid4().hex)
-            shutil.copytree(source_directory, restored)
-            os.replace(node.directory, retired / node.name)
-            os.replace(restored, node.directory)
-            known_locked.add(node.name)
-
-    def start_task_nodes(*, unlock=False, names=("S", "R", "P")):
-        for node in nodes:
-            if node.name not in names:
-                continue
-            require(node.process is None, "task Node is stopped before its controlled checkpoint restart")
-            node.start()
-            require(cli(node, ["status"])["state"] == "locked", "whole checkpoint restart actually starts every wallet locked")
-            if node.client.network_id:
-                node.client.connect()
-                node.client.authenticate()
-            if unlock:
-                cli(node, ["unlock"], password=passwords[node.name])
-                known_locked.discard(node.name)
-
-    def compact_view(view):
-        return {"phase": view["phase"], "evidence": view["evidence"],
-                "payment": {name: view["payment"][name] for name in ("earned", "withdrawn", "refunded")},
-                "windows": [{name: window[name] for name in ("state", "decryption_proven")} for window in view["windows"]]}
-
-    def durable_intents():
-        return {node.name: {"transactions": delivery_rows(node, "SELECT id,hash,nonce FROM transactions ORDER BY id"),
-                            "proofs": delivery_rows(node, "SELECT digest,path FROM proof_jobs ORDER BY digest")}
-                for node in nodes}
-
-    def principal_state():
-        def digest(value):
-            return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-        result = {"nodes": {}, "events": {}, "work_counts": {}, "job_keys": {}, "chain": {},
-                  "broadcasts": chain_recorder.broadcasts()}
-        queries = {"orders": "SELECT id,network,intent,role FROM orders ORDER BY id",
-                   "charity_orders": "SELECT id,network,intent FROM charity_orders ORDER BY id",
-                   "transactions": "SELECT id,chain,wallet,nonce,intent,raw,hash FROM transactions ORDER BY id",
-                   "gas_budgets": "SELECT * FROM gas_budgets ORDER BY chain,wallet,budget_group",
-                   "proof_jobs": "SELECT * FROM proof_jobs ORDER BY digest",
-                   "private_values": "SELECT id,hex(body) FROM private_values ORDER BY id",
-                   "objects": "SELECT * FROM objects ORDER BY order_id,idx,kind"}
-        for node in nodes:
-            tables = {}
-            for name, query in queries.items():
-                rows = delivery_rows(node, query)
-                tables[name] = {"count": len(rows), "sha256": digest(rows)}
-            views = []
-            for body, in delivery_rows(node, "SELECT body FROM orders ORDER BY id"):
-                order = json.loads(body)
-                order["view"].pop("updated_at_ms", None)
-                views.append(order)
-            files = {}
-            for name in ("config.json", "delivery-settings.json", "delivery-wallet.json"):
-                path = node.directory / name
-                metadata = path.lstat()
-                require(stat.S_ISREG(metadata.st_mode), "principal snapshots read only actual regular task configuration and keystores")
-                files[name] = {"sha256": file_sha256(path), "mode": stat.S_IMODE(metadata.st_mode), "mtime_ns": metadata.st_mtime_ns}
-            objects = {}
-            for path in sorted((node.directory / "delivery/objects").rglob("*")):
-                metadata = path.lstat()
-                if stat.S_ISDIR(metadata.st_mode):
-                    continue
-                require(stat.S_ISREG(metadata.st_mode), "principal snapshots do not traverse nonregular task delivery objects")
-                objects[str(path.relative_to(node.directory))] = {"sha256": file_sha256(path), "bytes": metadata.st_size}
-            proof_material = {}
-            for proof_digest, proof_path, size in delivery_rows(node, "SELECT digest,path,size FROM proof_jobs ORDER BY digest"):
-                path = Path(proof_path)
-                require(path.resolve().is_relative_to(node.directory.resolve()) and stat.S_ISREG(path.lstat().st_mode),
-                        "principal snapshots read only actual immutable proof files of this task Node")
-                proof_material[proof_digest] = {"sha256": file_sha256(path), "bytes": path.stat().st_size, "reserved_bytes": size}
-            result["nodes"][node.name] = {"tables": tables, "views": digest(views), "files": files, "objects": objects,
-                                           "proof_material": proof_material, "wallet": cli(node, ["status"])}
-            with sqlite3.connect((node.directory / "node.sqlite3").as_uri() + "?mode=ro", uri=True) as database:
-                result["events"][node.name] = database.execute("SELECT network_id,author,seq,hash FROM events ORDER BY network_id,author,seq,hash").fetchall()
-                result["work_counts"][node.name] = {name: database.execute("SELECT count(*) FROM " + name).fetchone()[0]
-                    for name in ("works", "work_runs", "work_dispatches", "work_stops", "schedules", "questions")}
-                result["job_keys"][node.name] = database.execute("SELECT conversation_id,trigger FROM scheduler_jobs ORDER BY conversation_id,trigger").fetchall()
-            wallet = node.wallet_address
-            result["chain"][node.name] = {"latest_nonce": rpc("eth_getTransactionCount", [wallet, "latest"]),
-                "pending_nonce": rpc("eth_getTransactionCount", [wallet, "pending"]),
-                "native_balance": rpc("eth_getBalance", [wallet, "latest"]),
-                "token_balance": rpc("eth_call", [{"to": chain["asset"], "data": "0x70a08231" + wallet[2:].lower().zfill(64)}, "latest"])}
-        result["chain"]["escrow_token_balance"] = rpc("eth_call", [{"to": chain["asset"],
-            "data": "0x70a08231" + chain["escrow"][2:].lower().zfill(64)}, "latest"])
-        return result
-
-    def principal_digest(value):
-        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-    def principal_client_boundaries(request, prepared):
-        identifier, original_intent = prepared["order_id"], prepared["intent_id"]
-        clients, checks = [], []
-        nonmember = "this device is not a member of the personal network"
-        restricted = "delivery writes and spending require a managing member of your personal network"
-        settings = {name: delivery_call(source, "status")[name] for name in ("enabled", "charity_enabled", "paid_enabled")}
-        actor_directory = principals / "X"
-        actor_directory.mkdir(mode=0o700)
-        outsider = Client(source.url, helper, identity_file=actor_directory / "identity.json")
-        member = Client(source.url, helper, identity_file=principals / "member.json")
-        local = Client(f"http://127.0.0.1:{source.local_port}", helper, identity_file=principals / "local.json")
-        foreign = Client(source.url, helper, identity_file=receiver.client.identity_file)
-        clients.extend((outsider, member, local, foreign))
-        try:
-            outsider.connect(source.device_id)
-            require(outsider.call("info")["device_id"] == source.device_id
-                    and outsider.call("authenticate", {"network_id": source.client.network_id})["principal"] is None,
-                    "X reaches the actual encrypted Node without a personal membership principal")
-            member.join(source.client, "Restricted paid client", manage=False)
-            require(member.principal["source"] == "membership" and member.principal["can_manage"] is False,
-                    "the actual signed ordinary member has no paid management authority")
-            accessed = subprocess.run([str(binary), "access", "--json", "--enable", "--data-dir", str(source.directory)],
-                                      capture_output=True, timeout=20)
-            require(accessed.returncode == 0, "the owner issues a real local-session entry without exposing launch material")
-            entry = json.loads(accessed.stdout)
-            fragment = urllib.parse.parse_qs(urllib.parse.urlsplit(entry["url"]).fragment)
-            require(entry["device_id"] == source.device_id and entry.get("local") is True
-                    and set(fragment) == {"local", "node"} and fragment["node"] == [source.device_id],
-                    "the actual owner launch entry pins only this task Source")
-            local_peer = local.own_id()
-            exchange = urllib.request.Request(local.url + "/api/local/exchange", json.dumps({"token": fragment["local"][0],
-                "node_id": source.device_id, "device_id": local_peer}).encode(), {"Origin": local.url, "Content-Type": "application/json"})
-            with urllib.request.urlopen(exchange, timeout=15) as response:
-                cookie = response.headers["Set-Cookie"].split(";", 1)[0]
-                require(response.status == 200 and json.load(response)["network_id"] == source.client.network_id,
-                        "the real one-time local exchange returns this Source network")
-            local.connect(source.device_id, origin=local.url, local_cookie=cookie)
-            local.authenticate(source.client.network_id)
-            require(local.principal["source"] == "local_session" and local.principal["can_manage"] is False
-                    and local_peer not in {row["device_id"] for row in source.client.call("directory")["view"]["members"]},
-                    "the separate actual local session is not silently a managing member")
-            require(receiver.client.principal["source"] == "membership" and receiver.client.principal["can_manage"],
-                    "the foreign personal-network actor is an actual manager of R")
-            foreign.connect(source.device_id)
-            require(foreign.call("authenticate", {"network_id": source.client.network_id})["principal"] is None,
-                    "actual R management grants no principal at the independent Source")
-            require(delivery_call(source, "get", order_id=identifier)["order_id"] == identifier
-                    and delivery_call(source, "prepare", **request)["order_id"] == identifier,
-                    "the managing Source successfully reads and retries the complete original prepare request")
-            private_json(principals / "paid-principal-input.json", {"source_url": source.url, "source_peer": source.device_id,
-                "network": source.client.network_id, "order_id": identifier, "intent_id": original_intent, "configure": settings,
-                "helper": str(helper), "outsider_identity": str(outsider.identity_file), "outsider_peer": outsider.own_id()})
-            conversation = "paid-principal-security"
-            source.client.rpc("create_bot", bot_id="paid-principal-bot", conversation_id=conversation,
-                name="Paid principal fixture", instructions="", project={"target_node": source.device_id, "cwd": str(workspace)})
-            receipt = source.client.rpc("message", conversation_id=conversation, message_id="paid-security-" + uuid.uuid4().hex,
-                text=json.dumps({"label": "paid-principal-security", "paid_delivery_security": True}), report_results=False)
-            trigger = receipt["trigger"]
-            wait_for("the actual controlled Agent turn is live before its principal baseline", lambda:
-                (principals / "agent-ready.json").exists()
-                and (scheduler_record(source, source.client.network_id, trigger) or {}).get("state") == "running", timeout=90)
-            require(all(cli(node, ["status"])["state"] == "unlocked" for node in nodes),
-                    "the principal matrix uses the natural pre-confirm idle point with all wallets actually unlocked")
-            before = principal_state()
-            payloads = ({"op": "prepare", **request}, {"op": "confirm", "intent_id": original_intent}, {"op": "configure", **settings})
-            for role, client, expected in (("outsider", outsider, nonmember), ("member", member, restricted), ("local_session", local, restricted)):
-                for payload in payloads:
-                    error = client.call("delivery", payload, status=400).get("error")
-                    require(isinstance(error, str) and expected in error, "each real principal rejects the valid original paid write for its exact authority boundary")
-                    checks.append({"actor": role, "op": payload["op"], "rejection": expected})
-            for role, client in (("outsider", outsider), ("foreign_manager", foreign)):
-                reads = [{"op": "get", "order_id": identifier}]
-                if role == "foreign_manager":
-                    reads.append({"op": "confirm", "intent_id": original_intent})
-                for payload in reads:
-                    error = client.call("delivery", payload, status=400).get("error")
-                    require(isinstance(error, str) and nonmember in error, "an unjoined actual identity cannot read or authorize the original private order")
-                    checks.append({"actor": role, "op": payload["op"], "rejection": nonmember})
-                error = client.rpc("nodes", status=400).get("error")
-                require(isinstance(error, str) and nonmember in error, "unjoined identities receive no private Node directory")
-                checks.append({"actor": role, "op": "nodes", "rejection": nonmember})
-            for role, client in (("member", member), ("local_session", local)):
-                require(client.call("delivery", {"op": "status"})["node_peer"] == source.device_id
-                        and client.call("delivery", {"op": "get", "order_id": identifier})["intent_id"] == original_intent
-                        and client.rpc("nodes").get("nodes"), "same-network ordinary members and actual local sessions retain their allowed read access")
-                checks.append({"actor": role, "op": "status-get-nodes", "allowed": True})
-            private_json(principals / "agent-run.json", {"run": True})
-            agent_result = wait_for("the same valid live Agent finishes its finite authority checks", lambda:
-                json.loads((principals / "agent-checked.json").read_text()) if (principals / "agent-checked.json").exists() else None, timeout=90)
-            require(agent_result["passed"] and agent_result["valid_token_before_and_after"], "Agent authority includes actual valid token positive controls")
-            after = principal_state()
-            private_json(principals / "client-before.json", before)
-            private_json(principals / "client-after.json", after)
-            require(before == after, "all client and live Agent attacks leave finances, wallet files, objects, settings, DAG and work counts unchanged")
-            private_json(principals / "agent-finish.json", {"finish": True})
-            wait_for("the original controlled Agent reaches its normal terminal scheduler state", lambda:
-                (scheduler_record(source, source.client.network_id, trigger) or {}).get("state") == "completed", timeout=60)
-            completed = principal_state()
-            for name in ("nodes", "work_counts", "job_keys", "chain", "broadcasts"):
-                require(completed[name] == after[name], "normal Agent completion adds no delivery money, work, configuration or object effects")
-            prior_events = {tuple(row) for row in after["events"]["S"]}
-            added = [row for row in completed["events"]["S"] if tuple(row) not in prior_events]
-            job = scheduler_record(source, source.client.network_id, trigger)
-            with sqlite3.connect((source.directory / "node.sqlite3").as_uri() + "?mode=ro", uri=True) as database:
-                events = [json.loads(json.loads(row[0])["canonical_body"]) for item in added
-                          for row in database.execute("SELECT envelope FROM events WHERE network_id=? AND hash=?",
-                                                      (source.client.network_id, item[3])).fetchall()]
-            require(len(added) == len(events) == 1 and events[0]["author"] == source.device_id
-                    and events[0]["scope_id"] == conversation
-                    and events[0]["body"]["type"] == "message_posted" and events[0]["body"]["role"] == "assistant"
-                    and events[0]["body"]["message_id"] == job["message_id"]
-                    and events[0]["body"]["text"] == "paid-principal-security-complete"
-                    and all(completed["events"][name] == after["events"][name] for name in ("R", "P")),
-                    "only the original Agent's exact normal assistant completion event is added outside the attack window")
-            passed("paid-client-principal-boundaries", status="passed", order_id=identifier, intent_id=original_intent,
-                checks=checks, agent=agent_result, before_sha256=principal_digest(before), after_sha256=principal_digest(after),
-                wallets_unlocked=True, raw_broadcast_delta=0, new_orders=0, new_proofs=0, dag_unchanged_during_checks=True,
-                manager_positive_controls=True,
-                agent_completion={"state": "completed", "new_events": 1, "event_hash": added[0][3], "new_work": 0, "financial_state_unchanged": True})
-            return actor_directory, outsider.own_id()
-        finally:
-            private_json(principals / "agent-finish.json", {"finish": True})
-            for client in clients:
-                client.close()
-
-    def principal_service_boundaries(identifier, actor_directory, actor_peer):
-        for node in nodes:
-            cli(node, ["unlock"], password=passwords[node.name])
-            known_locked.discard(node.name)
-        require(all(cli(node, ["status"])["state"] == "unlocked" for node in nodes),
-                "completed-order service boundaries run with every wallet genuinely unlocked")
-        before = principal_state()
-        grant_path = receiver.directory / "paid-security-read-grant.json"
-        class Outsider:
-            directory, device_id = actor_directory, actor_peer
-        try:
-            for node in (source, receiver):
-                node.client.close()
-                node.stop()
-            received = delivery_probe(options, run, receiver, [provider], identifier,
-                action={"kind": "paid_security", "scenario": {"role": "receiver", "provider_identity_file": str(provider.directory / "identity.json")}})
-            require(stat.S_ISREG(grant_path.lstat().st_mode) and grant_path.stat().st_mode & 0o077 == 0
-                    and grant_path.stat().st_size <= 2048
-                    and file_sha256(grant_path) == received["details"]["receiver_grant_sha256"],
-                    "the private grant fixture is the actual provider response already verified by the real receiver")
-            encoded = base64.b64encode((provider.directory / "delivery/objects" / identifier / "0-ciphertext.bin").read_bytes()[:8192])
-            require(hashlib.sha256(encoded).hexdigest() == received["details"]["ciphertext_base64_sha256"]
-                    and received["details"]["expired_signature_verified"] is True,
-                    "the legal receiver read matches the actual complete ciphertext and the expired fixture has a valid provider signature")
-            sent = delivery_probe(options, run, source, [provider], identifier, action={"kind": "paid_security", "scenario": {"role": "source"}})
-            start_task_nodes(unlock=True, names=("S", "R"))
-            outside = delivery_probe(options, run, Outsider(), nodes, identifier,
-                action={"kind": "paid_security", "scenario": {"role": "outsider", "receiver_grant": json.loads(grant_path.read_text())}})
-            for observation in (received, sent, outside):
-                announcement = observation["announcement"]
-                require(announcement["paid_enabled"] is True and announcement["provider_wallet"].lower() == provider.wallet_address.lower()
-                        and announcement["asset"].lower() == chain["asset"].lower() and announcement["profile"] == profile,
-                        "every service boundary has a real enabled paid announcement bound to the same provider, asset and proof profile")
-            after = principal_state()
-            private_json(principals / "service-before.json", before)
-            private_json(principals / "service-after.json", after)
-            require(before == after, "wrong service roles, correctly signed expiry and private ALPN attempts change no financial or private state")
-            passed("paid-service-grant-and-private-alpn-boundaries", status="passed", order_id=identifier,
-                checks={"receiver": received["checks"], "source": sent["checks"], "outsider": outside["checks"]},
-                positive_paid_announcement=True, positive_source_and_receiver_order=True, positive_receiver_ciphertext_read=True,
-                expired_signature_verified=True, expiry_fixture="resigned-provider-host-unix-seconds",
-                private_alpn_targets=3, private_alpns=["rpc", "sync", "blob"], before_sha256=principal_digest(before),
-                after_sha256=principal_digest(after), wallets_unlocked=True, raw_broadcast_delta=0, new_orders=0, new_proofs=0,
-                financial_objects_settings_dag_work_unchanged=True)
-        finally:
-            grant_path.unlink(missing_ok=True)
-
-    def inspection_view(node, view):
-        key = delivery_call(node, "status")["receiver_key"] if node is receiver else None
-        return {"phase": view["phase"] if view else None, "paymentState": view["payment"]["state"] if view else None,
-                **{name: view["payment"][name] if view else None for name in ("earned", "withdrawn", "refunded")},
-                "evidence": view["evidence"] if view else None,
-                "windows": [{"state": window["state"], "decryptionProven": window["decryption_proven"]}
-                            for window in view["windows"]] if view else [],
-                "receiverKey": {"keyId": key["key_id"], "serial": key["serial"]} if key else None}
-
-    def inspect_rendered(kind, *, view=None):
-        require(ui_control is not None and kind in DeliveryUiControl.inspections, "rendered inspection uses the existing paired UI control")
-        role, screenshot = DeliveryUiControl.inspections[kind]
-        node = source if role == "web" else receiver
-        before, broadcasts = durable_intents(), chain_recorder.broadcasts()
-        require(all(cli(item, ["status"])["state"] == "locked" for item in nodes),
-                "every inspection leaves all independent wallets actually locked")
-        observed = inspection_view(node, view)
-        if kind in ("source-partial", "receiver-key-after"):
-            require(observed["phase"] == "partial" and observed["paymentState"] == "withdrawn"
-                    and [observed[name] for name in ("earned", "withdrawn", "refunded")] == ["12", "12", "17"]
-                    and observed["evidence"] == "none"
-                    and observed["windows"] == [{"state": "earned", "decryptionProven": True},
-                                               {"state": "refunded", "decryptionProven": False}],
-                    "partial screenshots require the actual earned first window and refunded second window")
-        if kind == "source-unknown":
-            require(observed["phase"] == "reconciling" and observed["paymentState"] == "unknown"
-                    and observed["evidence"] == "none"
-                    and [observed[name] for name in ("earned", "withdrawn", "refunded")] == ["12", "12", "17"]
-                    and observed["windows"] == [{"state": "pending", "decryptionProven": False}] * 2,
-                    "unknown screenshots require real retracted completion and proof claims with historical amounts")
-        if role == "android":
-            require(observed["receiverKey"] and observed["receiverKey"]["serial"] == (1 if kind == "receiver-key-before" else 2),
-                    "key screenshots show the actual first registration or sole second-serial rotation")
-        value = {"id": str(uuid.uuid4()), "kind": kind, "role": role, "nodePeer": node.device_id,
-                 "orderId": view["order_id"] if view else None, "intentId": view["intent_id"] if view else None,
-                 "keyId": observed["receiverKey"]["keyId"] if observed["receiverKey"] else None,
-                 "keySerial": observed["receiverKey"]["serial"] if observed["receiverKey"] else None,
-                 "expectedPhase": observed["phase"], "expectedPaymentState": observed["paymentState"],
-                 **{name: observed[name] for name in ("earned", "withdrawn", "refunded", "evidence", "windows")},
-                 "screenshot": screenshot, "timeoutMs": 120000}
-        ui_control.begin_inspection(value)
-        require(ui_control.inspection_finished.wait(120), "the fixed real UI renders and saves its bounded inspection")
-        acknowledgement = ui_control.end_inspection()
-        require(before == durable_intents() and chain_recorder.broadcasts() == broadcasts
-                and all(cli(item, ["status"])["state"] == "locked" for item in nodes),
-                "real UI inspection creates no transaction intent, proof reservation or signed broadcast")
-        actual = delivery_call(node, "get", order_id=view["order_id"]) if view else None
-        require(inspection_view(node, actual) == observed, "the screenshot interval retains the same actual Node projection")
-        record = {name: value[name] for name in ("id", "kind", "role", "nodePeer", "orderId", "intentId", "screenshot")}
-        record.update(sha256=acknowledgement["sha256"], bytes=acknowledgement["bytes"], observed=observed,
-                      checks={"walletLocked": True, "rawBroadcastDelta": 0, "proofJobsUnchanged": True,
-                              "transactionIntentsUnchanged": True, "canonicalRestored": kind != "source-unknown"})
-        inspection_records.append(record)
-        return record
-
-    def view_matches(view, expected):
-        phases = ("pending", "held", "key_published", "earned", "refunded")
-        return (all(view["payment"][name] == expected[name] for name in ("earned", "withdrawn", "refunded"))
-                and len(view["windows"]) == len(expected["windows"])
-                and all(local["state"] == phases[remote["phase"]]
-                        and local["decryption_proven"] == remote["decryptionProven"]
-                        for local, remote in zip(view["windows"], expected["windows"]))
-                and (all(window["phase"] == 3 for window in expected["windows"]) or view["phase"] != "paid"))
-
-    def checkpoint_ack(event):
-        require(event.get("schemaVersion") == 1 and event.get("noNodeDataCopyByHelper") is True,
-                "only the actual finite helper may request a task Node checkpoint")
-        checkpoint_id, data_label = event["checkpointId"], event["nodeDataCheckpoint"]
-        require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,159}", checkpoint_id) and data_label in data_checkpoints,
-                "helper checkpoint names one existing opaque whole Node data label")
-        restore_only = any(checkpoint_id.endswith("-" + name) for name in
-                           ("restore-data", "restore-main-data", "restore-rotation-data", "restore-C0-data", "case-reset"))
-        if restore_only:
-            stopped_nodes(data_label)
-            restore_node_data(data_label)
-            return {"op": "checkpoint-ack", "checkpointId": checkpoint_id, "quiesced": stopped_nodes(data_label),
-                    "nodeObservation": "not_observed", "rawBroadcastDelta": 0}
-        if checkpoint_id.endswith("-incoming-result"):
-            return {"op": "checkpoint-ack", "checkpointId": checkpoint_id, "quiesced": stopped_nodes(data_label),
-                    "nodeObservation": "not_observed", "rawBroadcastDelta": 0}
-        before = chain_recorder.broadcasts()
-        rebuild = checkpoint_id.endswith("-rebuild-C1-data")
-        if rebuild or event["nodeMode"] == "owner-native-refund":
-            stopped_nodes(data_label)
-            restore_node_data(data_label)
-        start_task_nodes()
-        if event["nodeMode"] == "owner-key-rotate":
-            require(not lifecycle_actions, "mixed-held checkpoint produces the sole actual Rotate")
-            key_directory = run / "key-lifecycle"
-            key_directory.mkdir(mode=0o700)
-            rotated = genuine_key_action("rotate", key_directory, order_id, digest)
-            lifecycle_actions.append(rotated)
-            quiesced = stopped_nodes("AfterRotateData", save=True)
-            return {"op": "checkpoint-ack", "checkpointId": checkpoint_id, "quiesced": quiesced,
-                    "nodeObservation": "not_observed", "rawBroadcastDelta": chain_recorder.broadcasts() - before,
-                    "nodeTransactions": [rotated["public"]["transactionHash"]]}
-        if event["nodeMode"] == "owner-native-refund":
-            fund_rows = delivery_rows(source, "SELECT hash,phase FROM transactions WHERE id=?", (order_id + "/fund",))
-            require(data_label != "C0PrimeData" and len(fund_rows) == 1 and fund_rows[0][1] == "confirmed"
-                    and not delivery_rows(provider, "SELECT id FROM transactions WHERE id LIKE ?", (order_id + "/%",)),
-                    "actual autonomous refund restores the whole post-fund pre-accept checkpoint with no later provider signed intents")
-            restore_expected = event.get("expected")
-            require(isinstance(restore_expected, dict), "actual Source refund checkpoint supplies its public expected ledger")
-            prior = {row[0] for row in delivery_rows(source, "SELECT id FROM transactions")}
-            cli(source, ["unlock"], password=passwords["S"])
-            known_locked.discard("S")
-            delivery_call(source, "reconcile", order_id=order_id)
-
-            def refunded_source():
-                view = delivery_call(source, "get", order_id=order_id)
-                return view if all(view["payment"][name] == restore_expected[name] for name in ("earned", "withdrawn", "refunded")) else None
-
-            actual = wait_for("the actual Source independently executes its authorized refund", refunded_source, timeout=120)
-            fresh = delivery_rows(source, "SELECT id,hash,phase FROM transactions ORDER BY nonce")
-            refunds = [(identifier, hash_value) for identifier, hash_value, phase in fresh
-                       if identifier not in prior and phase == "confirmed" and identifier.startswith(order_id + "/refund")]
-            require(refunds and len(refunds) <= 4 and len(refunds) == len([row for row in fresh if row[0] not in prior]),
-                    "actual Source refund adds only confirmed authorized refund transactions")
-            quiesced = stopped_nodes("NativeRefundData-" + uuid.uuid4().hex[:10], save=True)
-            return {"op": "checkpoint-ack", "checkpointId": checkpoint_id, "quiesced": quiesced,
-                    "nodeObservation": "observed", "rawBroadcastDelta": chain_recorder.broadcasts() - before,
-                    "views": {"S": compact_view(actual)}, "nodeTransactions": [hash_value for _, hash_value in refunds]}
-        require(event["nodeMode"] == "locked-observe", "ordinary branch observation never unlocks a task wallet")
-        expected = event["state"]["order"]
-        only_receiver = any(checkpoint_id.endswith("-" + point) for point in
-                            ("mixed-held-result", "revoke-observed", "register-observed", "rotate-observed"))
-        observed = {}
-        for node in ((source,) if rebuild else (receiver,) if only_receiver else (source, receiver)):
-            delivery_call(node, "reconcile", order_id=order_id)
-            view = wait_for("the real locked Node projection converges to its canonical branch", lambda:
-                            (value if view_matches(value, expected) else None)
-                            if (value := delivery_call(node, "get", order_id=order_id)) else None, timeout=60)
-            observed[node.name] = compact_view(view)
-        recovered_sha = None
-        if not rebuild:
-            recovered_file = delivery_call(receiver, "read", order_id=order_id)
-            recovered_bytes = base64.b64decode(recovered_file["content_base64"], validate=True)
-            recovered_sha = hashlib.sha256(recovered_bytes).hexdigest()
-            require(recovered_bytes == original and len(recovered_bytes) == max_file_bytes
-                    and recovered_file["sha256"] == recovered_sha == digest,
-                    "the actual warm receiver returns every original byte across branch observation")
-        crash_point = ("held" if event["case"] == "held-timeout" and checkpoint_id.endswith("-held") else
-                       "key-published" if event["case"] == "strict-late-open" and checkpoint_id.endswith("-key-published") else None)
-        if crash_point:
-            def provider_projection():
-                rows = delivery_rows(provider, "SELECT body FROM orders WHERE id=?", (order_id,))
-                value = json.loads(rows[0][0])["view"] if len(rows) == 1 else None
-                return value if value and view_matches(value, expected) else None
-
-            provider_before = wait_for("the live provider projects the actual pre-crash canonical stage", provider_projection, timeout=60)
-            immutable = durable_intents()
-            killed = []
-            for node in (receiver, provider):
-                require(node.process is not None and node.process.poll() is None and cli(node, ["status"])["state"] == "locked",
-                        "only the two live task Nodes are killed at the observed held or key-published stage")
-                pid = node.process.pid
-                outcome = node.stop(crash=True)
-                require(outcome == -signal.SIGKILL, "the real held-stage task process exits from SIGKILL")
-                killed.append({"role": node.name, "pid": pid, "signal": "SIGKILL", "exit_code": outcome, "wallet_locked": True})
-            start_task_nodes(names=("R", "P"))
-            delivery_call(receiver, "reconcile", order_id=order_id)
-            after_crash = wait_for("the actual killed receiver converges again to its canonical chain stage", lambda:
-                                   (view if view_matches(view, expected) else None)
-                                   if (view := delivery_call(receiver, "get", order_id=order_id)) else None, timeout=60)
-            provider_after = wait_for("the killed provider projects the same actual canonical stage after restart", provider_projection, timeout=60)
-            require(all(cli(node, ["status"])["state"] == "locked" for node in (receiver, provider))
-                    and immutable == durable_intents(), "real SIGKILL recovery preserves locked wallets, proof rows and signed transaction intents")
-            recovered_file = delivery_call(receiver, "read", order_id=order_id)
-            recovered_bytes = base64.b64decode(recovered_file["content_base64"], validate=True)
-            require(recovered_bytes == original and len(recovered_bytes) == max_file_bytes
-                    and hashlib.sha256(recovered_bytes).hexdigest() == recovered_file["sha256"] == digest
-                    and observed["R"]["payment"]["earned"] == after_crash["payment"]["earned"] == expected["earned"]
-                    and provider_before["payment"]["earned"] == provider_after["payment"]["earned"] == expected["earned"],
-                    "cached old-key original bytes and earned balance survive the actual receiver and provider kills")
-            observed["R"] = compact_view(after_crash)
-            process_recoveries.append({"point": crash_point, "order_id": order_id, "nodes": killed,
-                "earned_before": expected["earned"], "earned_after": after_crash["payment"]["earned"],
-                "proof_rows_unchanged": True, "transaction_rows_unchanged": True, "original_sha256": digest,
-                "original_bytes": max_file_bytes, "raw_broadcast_delta": 0, "warm_cached_material": True})
-            report["process_recoveries"] = process_recoveries
-        if event["case"] == "partial-refund" and checkpoint_id.endswith("-result"):
-            inspect_rendered("source-partial", view=delivery_call(source, "get", order_id=order_id))
-            fault = chain_recorder.fail_reads(chain["escrow"])
-            unknown_record = None
-            try:
-                delivery_call(source, "reconcile", order_id=order_id)
-
-                def source_unknown():
-                    view = delivery_call(source, "get", order_id=order_id)
-                    return view if view["phase"] == "reconciling" and view["payment"]["state"] == "unknown" else None
-
-                actual_unknown = wait_for("a real bounded Node RPC transport failure retracts the original Source claim", source_unknown, timeout=45)
-                require(fault["blocked"] > 0, "the real Node actually encounters the bounded escrow transport failure")
-                unknown_record = inspect_rendered("source-unknown", view=actual_unknown)
-            finally:
-                chain_recorder.restore_reads()
-                for node in (source, receiver):
-                    delivery_call(node, "reconcile", order_id=order_id)
-                    wait_for("removing the transport fault restores the actual canonical order", lambda:
-                             view_matches(delivery_call(node, "get", order_id=order_id), expected), timeout=60)
-            require(unknown_record is not None, "unknown UI inspection completed before canonical recovery")
-            unknown_record["checks"]["canonicalRestored"] = True
-        if checkpoint_id.endswith("-mixed-held-result"):
-            inspect_rendered("receiver-key-after", view=delivery_call(receiver, "get", order_id=order_id))
-        if not only_receiver and not rebuild:
-            for node in (source, receiver):
-                node.client.close()
-                node.stop()
-            remote = delivery_probe(options, run, source, [provider], order_id, action={"kind": "paid_order"})["order"]
-            require(view_matches(remote, expected), "actual authorized public provider view converges to its canonical branch")
-            observed["P"] = compact_view(remote)
-        label = "ObservedData-" + uuid.uuid4().hex[:10]
-        quiesced = stopped_nodes(label, save=True)
-        require(chain_recorder.broadcasts() == before, "locked actual Node branch observations broadcast no signed transaction")
-        return {"op": "checkpoint-ack", "checkpointId": checkpoint_id, "quiesced": quiesced,
-                "nodeObservation": "observed", "rawBroadcastDelta": 0, "views": observed,
-                **({"readSha256": recovered_sha} if recovered_sha is not None else {})}
-
-    def exercise_line(timeout=300):
-        require(branch_process is not None, "finite exercise process was explicitly started in this original deployment")
-        require(select.select([branch_process.stdout], [], [], timeout)[0], "finite genuine exercise responds within its bounded command deadline")
-        line = branch_process.stdout.readline(65537)
-        require(line and len(line) <= 65536, "finite genuine exercise returns one bounded public JSON event")
-        value = json.loads(line)
-        require(value.get("schemaVersion") == 1, "finite genuine exercise uses the exact public event schema")
-        if value.get("event") == "error":
-            raise RuntimeError("actual genuine branch helper failed: " + str(value.get("error", "inspect its private task log")))
-        return value
-
-    def exercise_command(operation, expected_event, **fields):
-        request_id = "vdp-" + operation + "-" + uuid.uuid4().hex[:10]
-        branch_process.stdin.write(json.dumps({"id": request_id, "op": operation, **fields}) + "\n")
-        branch_process.stdin.flush()
-        while True:
-            event = exercise_line(timeout=9000 if operation == "lifecycle-held" else 300)
-            if event["event"] == "checkpoint":
-                ack = checkpoint_ack(event)
-                branch_process.stdin.write(json.dumps(ack) + "\n")
-                branch_process.stdin.flush()
-            else:
-                require(event["event"] == expected_event and event.get("id") == request_id,
-                        "finite exercise response matches its actual original command")
-                return event
-
-    def genuine_key_action(action, destination, old_order_id, old_file_sha256):
-        require(action in ("rotate", "revoke", "register"), "key lifecycle uses only its three actual owner actions")
-        intent = str(uuid.uuid4())
-        arguments = [action + "-key", "--intent-id", intent, "--gas-cap", configuration["register_key_gas_cap_wei"]]
-        before_jobs = delivery_rows(receiver, "SELECT digest,path FROM proof_jobs ORDER BY digest")
-        before_transactions = delivery_rows(receiver, "SELECT id FROM transactions ORDER BY id")
-        cli(receiver, ["unlock"], password=passwords["R"])
-        active = {}
-
-        def launch():
-            attempt = uuid.uuid4().hex
-            stdout_path, stderr_path = run / f"key-{action}-{attempt}.stdout", run / f"key-{action}-{attempt}.stderr"
-            with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
-                process = subprocess.Popen([str(binary), "wallet", "--data-dir", str(receiver.directory), *arguments],
-                                           stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, start_new_session=True)
-            key_processes.append(process)
-            active.update(process=process, stdout=stdout_path, stderr=stderr_path)
-
-        def completed():
-            process = active["process"]
-            if process.poll() is None:
-                return None
-            stderr = active["stderr"].read_bytes()
-            require(len(stderr) <= 65536, "private owner key-operation error remains bounded")
-            if process.returncode != 0 and b"another delivery operation is in progress; retry this same key intent" in stderr:
-                launch()
-                return None
-            require(process.returncode == 0, "actual owner key operation succeeds; inspect its private task log on failure")
-            output = active["stdout"].read_bytes()
-            require(0 < len(output) <= 16384, "actual owner key-operation result remains bounded")
-            value = json.loads(output)
-            require(value["intent_id"] == intent and value["action"] == action, "actual key response retains its original intent and action")
-            return value
-
-        launch()
-        first = wait_for("the actual new key proof and owner transaction complete", completed, timeout=7400)
-
-        def confirmed_key():
-            value = cli(receiver, arguments, timeout=15)
-            if value["phase"] in ("reverted", "conflicted", "failed", "superseded"):
-                raise RuntimeError("actual key lifecycle operation failed or was superseded before confirmation")
-            require(value["serial"] == first["serial"] and value["binding_hash"] == first["binding_hash"],
-                    "same owner key intent retains its exact genuine certificate")
-            return value if value["phase"] == "confirmed" and value.get("registry_confirmed") is True else None
-
-        result = wait_for("the actual lifecycle certificate is confirmed in the registry", confirmed_key, timeout=120)
-        transaction_id = f"key-{intent}/register"
-        rows = delivery_rows(receiver, "SELECT intent FROM transactions WHERE id=?", (transaction_id,))
-        require(len(rows) == 1, "each real lifecycle intent has exactly one original registry transaction")
-        calldata = bytes.fromhex(json.loads(rows[0][0])["calldata"].removeprefix("0x"))
-        journal = calldata[4:1508]
-        after_jobs = delivery_rows(receiver, "SELECT digest,path FROM proof_jobs ORDER BY digest")
-        require(len(after_jobs) == len(before_jobs) + 1 and set(before_jobs).issubset(after_jobs)
-                and len(delivery_rows(receiver, "SELECT id FROM transactions ORDER BY id")) == len(before_transactions) + 1,
-                "each actual key lifecycle action adds exactly one genuine proof and one registry transaction")
-        entry = public_proof(journal, receiver, 1, destination=destination, name=action)
-        transaction_hash = transaction(receiver, transaction_id)
-        require(result["tx_hash"] == transaction_hash and type(result["serial"]) is int and result["serial"] > 0
-                and re.fullmatch(r"[a-f0-9]{64}", result["binding_hash"]),
-                "lifecycle public identifiers come from the actual confirmed result and ledger")
-        cli(receiver, ["lock"])
-        receiver.client.close()
-        receiver.stop(crash=True)
-        receiver.start()
-        receiver.client.connect()
-        receiver.client.authenticate()
-        require(cli(receiver, ["status"])["state"] == "locked", "actual lifecycle receiver restart keeps its independent wallet locked")
-        recovered = delivery_call(receiver, "read", order_id=old_order_id)
-        recovered_bytes = base64.b64decode(recovered["content_base64"], validate=True)
-        require(recovered_bytes == original and len(recovered_bytes) == max_file_bytes
-                and hashlib.sha256(recovered_bytes).hexdigest() == recovered["sha256"] == old_file_sha256,
-                "old held-order key material still recovers the original file after actual key lifecycle and process restart")
-        jobs_after_restart = delivery_rows(receiver, "SELECT digest,path FROM proof_jobs ORDER BY digest")
-        transactions_after_restart = delivery_rows(receiver, "SELECT id FROM transactions ORDER BY id")
-        cli(receiver, ["unlock"], password=passwords["R"])
-        repeated = cli(receiver, arguments, timeout=15)
-        require(repeated["phase"] == "confirmed" and repeated.get("registry_confirmed") is True
-                and repeated["serial"] == result["serial"] and repeated["binding_hash"] == result["binding_hash"]
-                and repeated["tx_hash"] == transaction_hash
-                and delivery_rows(receiver, "SELECT digest,path FROM proof_jobs ORDER BY digest") == jobs_after_restart
-                and delivery_rows(receiver, "SELECT id FROM transactions ORDER BY id") == transactions_after_restart,
-                "same lifecycle UUID after a real restart reuses its original certificate, proof and transaction")
-        if action == "revoke":
-            blocked = ["rotate-key", "--intent-id", str(uuid.uuid4()), "--gas-cap", configuration["register_key_gas_cap_wei"]]
-            cli(receiver, blocked, success=False,
-                error_contains="rotate-key requires a confirmed active receiving key; use register-key to enable receiving")
-            require(delivery_rows(receiver, "SELECT digest,path FROM proof_jobs ORDER BY digest") == jobs_after_restart
-                    and delivery_rows(receiver, "SELECT id FROM transactions ORDER BY id") == transactions_after_restart,
-                    "a fresh rotate intent cannot reactivate revoked receiving or reserve any proof or nonce")
-        metadata = json.loads((destination / entry["public"]).read_text())
-        public_result = {"action": action, "bindingAction": "revoked" if action == "revoke" else "active",
-                         "serial": result["serial"], "intentId": intent, "bindingHash": result["binding_hash"],
-                         "transactionId": transaction_id, "transactionHash": transaction_hash, "relation": 1,
-                         "public": entry["public"], "receipt": entry["receipt"],
-                         "journalHash": hashlib.sha256(journal).hexdigest(), "receiptSha256": file_sha256(destination / entry["receipt"]),
-                         "newProofs": 1, "registryConfirmed": True, "retryReusedIntent": True,
-                         "restartedWalletLocked": True, "oldOrderReadSha256": recovered["sha256"]}
-        return {"public": public_result, "journal": journal, "transaction_id": transaction_id,
-                "metadata": {name: metadata[name] for name in ("imageId", "profileId")}}
-
-    def ordinary_ui_acceptance(current_binding_journal, registration_id):
-        require(options.delivery_ui_control is not None and type(current_binding_journal) is bytes
-                and len(current_binding_journal) == 1504 and isinstance(registration_id, str),
-                "ordinary UI starts only with the explicitly supplied current active registration")
-        active_transaction = delivery_rows(receiver, "SELECT intent,phase FROM transactions WHERE id=?", (registration_id,))
-        require(len(active_transaction) == 1 and active_transaction[0][1] == "confirmed", "ordinary UI uses a confirmed actual key registration")
-        active_calldata = bytes.fromhex(json.loads(active_transaction[0][0])["calldata"].removeprefix("0x"))
-        require(active_calldata[4:1508] == current_binding_journal, "ordinary UI binding proof matches its exact registration transaction")
-        destination = run / "ordinary-settlement"
-        destination.mkdir(mode=0o700)
-        require(ui_control is not None and ui_control.stage == "inspections", "the ordinary UI reuses the actual members captured before C0")
-        original_path = ui_control.source_file
-        ordinary_bytes, ordinary_digest = original_path.read_bytes(), file_sha256(original_path)
-        before_jobs = {node.name: delivery_rows(node, "SELECT digest,path FROM proof_jobs ORDER BY digest") for node in nodes}
-        for node in nodes:
-            cli(node, ["unlock"], password=passwords[node.name])
-        control = ui_control
-        try:
-            control.set_stage("ordinary")
-            print("OBSERVE delivery-paid ordinary Web and Android UI controller ready", flush=True)
-            require(control.finished.wait(options.delivery_ui_timeout_ms / 1000), "ordinary UI completes within its explicit acceptance bound")
-            require(control.failure is None and list(control.events) == list(control.sequence),
-                    "both actual UI clients complete quotation, payment, disconnect, recovery and saved-file acceptance")
-            facts = control.facts()
-            ordinary_order = facts["source"]
-            require(facts["settled"] and ordinary_order is not None, "ordinary UI has actual original-chain settlement evidence")
-            ui_events = dict(control.events)
-        finally:
-            control.close()
-        ordinary_id = ordinary_order["order_id"]
-        recovered = delivery_call(receiver, "read", order_id=ordinary_id)
-        require(base64.b64decode(recovered["content_base64"], validate=True) == ordinary_bytes
-                and recovered["sha256"] == ordinary_digest and recovered["bytes"] == 4096,
-                "actual Node ordinary recovery matches the UI-selected original bytes")
-        ordinary_proofs = [public_proof(current_binding_journal, receiver, 1, destination=destination)]
-        source_input = delivery_rows(source, "SELECT body FROM private_values WHERE id=?", (f"source-input:{ordinary_id}:0",))
-        require(len(source_input) == 1, "ordinary source proof retains its own actual public statement")
-        journal = bytes(json.loads(source_input[0][0])["statement"])
-        ordinary_proofs.append(public_proof(journal, source, 2, 0, destination=destination))
-        for relation in (3, 4):
-            public = journal[:32] + relation.to_bytes(32, "big") + journal[64:]
-            ordinary_proofs.append(public_proof(public, receiver, relation, 0, destination=destination))
-        after_jobs = {node.name: delivery_rows(node, "SELECT digest,path FROM proof_jobs ORDER BY digest") for node in nodes}
-        require(sum(len(after_jobs[name]) - len(before_jobs[name]) for name in before_jobs) == 3
-                and all(set(before_jobs[name]).issubset(after_jobs[name]) for name in before_jobs),
-                "ordinary UI generates exactly three new proofs and retains all previous actual receipts")
-        ordinary_transactions = {"registerKey": transaction(receiver, registration_id),
-                                 "approve": transaction(source, f"{ordinary_id}/approve"),
-                                 "fund": transaction(source, f"{ordinary_id}/fund")}
-        for action in ("hold", "publish", "open", "withdraw"):
-            identifier = f"{ordinary_id}/{action}-0"
-            ordinary_transactions[action] = [transaction(provider, identifier)]
-        ordinary_capsule = provider.directory / "delivery/objects" / ordinary_id / "0-capsule.bin"
-        bundle = {"schemaVersion": 1, "escrow": chain["escrow"], "asset": chain["asset"], "orderId": "0x" + ordinary_id,
-                  "proofs": ordinary_proofs, "capsules": [{"windowIndex": 0, "capsule": ordinary_capsule.read_bytes().hex()}],
-                  "transactions": ordinary_transactions}
-        ordinary_bundle = destination / "settlement.json"
-        private_json(ordinary_bundle, bundle)
-        observer = Path(configuration["settlement_observer"]).resolve(strict=True)
-        observed = subprocess.run(["node", str(observer), "--settlement", str(ordinary_bundle), "--rpc-url", chain["rpc_url"],
-                                   "--case", "ordinary"], capture_output=True, timeout=180)
-        with (run / "ordinary-settlement-observer.log").open("wb") as output:
-            output.write(observed.stdout[:65536])
-            output.write(observed.stderr[:65536])
-        require(observed.returncode == 0, "independent ordinary observer verifies four public receipts and actual original-chain payment")
-        require(len(observed.stdout) <= 65536, "ordinary public observer receipt remains bounded")
-        ordinary_observation = json.loads(observed.stdout)
-        require(ordinary_observation.get("status") == "PASS", "ordinary public observer receipt records this actual success")
-        private_json(destination / "settlement-observation.json", ordinary_observation)
-        passed("ordinary-paid-real-web-android-offline-recovery-and-save", order_id=ordinary_id,
-               intent_id=ordinary_order["intent_id"], bytes=4096, sha256=ordinary_digest, windows=1,
-               acceptance="recoverable", new_proofs=3, public_proofs=4, current_registration=registration_id,
-               earned="17", withdrawn="17", refunded="0", bundle=str(ordinary_bundle), ui_events=ui_events,
-               actual_web_confirmation=True, actual_android_acceptance=True, actual_android_saved_file=True,
-               offline_visible=True, settled_while_app_background=True, read_only_observer=True)
-        report["not_checked"] = [item for item in report["not_checked"] if item != "rendered native mobile UI"]
-        return ordinary_bundle
-
-    try:
-        enter("wallet-bootstrap")
-        accounts = rpc("eth_accounts", [])
-        require(accounts and deployment.get("funder", accounts[0]).lower() == accounts[0].lower(),
-                "only the controlled fixture's unlocked local funder is used")
-        funder = accounts[0]
-        require(int(rpc("eth_chainId", []), 16) == 31337, "the running local chain has the pinned identity")
-        for name in ("S", "R", "P"):
-            args = public_node_args() if name == "P" else []
-            node = Node(run, name, binary, workspace, helper, init_args=args)
-            nodes.append(node)
-            isolate_delivery_node(node)
-            if name == "S" and chain_recorder:
-                node.configure(timeout_secs=600, manager=fixture_manager_settings(principals, workspace),
-                    bins={"codex": str(fixture_wrapper(principals, "fixture-codex", "--fixture-codex"))}, app_server=SPAWN_APP_SERVER)
-            node.configure_network(pkarr={"publish": True, "resolve": True, "urls": [relay.url], "publish_direct": True})
-            node.start()
-            if name != "P":
-                node.bootstrap()
-            settings = {"enabled": True, "charity_enabled": False, "paid_enabled": True, "chain": node_chain,
-                        "prover": prover, "provider_gas_cap": configuration["provider_gas_cap_wei"],
-                        "delivery_fee_per_window": "10", "reservation_fee_per_window": "2", "priority_fee": "5"}
-            settings_path = node.directory / "acceptance-delivery-settings.json"
-            private_json(settings_path, settings)
-            cli(node, ["configure", str(settings_path)])
-            password = base64.urlsafe_b64encode(os.urandom(32)).decode()
-            passwords[name] = password
-            created = cli(node, ["create"], password=password)
-            require(created["state"] == "locked", "a newly created wallet starts locked")
-            cli(node, ["unlock"], password="invalid-acceptance-passphrase", success=False)
-            require(cli(node, ["status"])["state"] == "locked", "wrong local passphrase cannot unlock the wallet")
-            unlocked = cli(node, ["unlock"], password=password)
-            require(unlocked["state"] == "unlocked" and unlocked["address"] == created["address"],
-                    "protected FD unlocks only this Node's independent wallet")
-            node.wallet_address = unlocked["address"]
-            funding = rpc("eth_sendTransaction", [{"from": funder, "to": node.wallet_address,
-                                                   "value": hex(10 ** 19)}])
-            wait_for("controlled Node native gas funding", lambda: confirmed(funding), timeout=60)
-        source, receiver, provider = nodes
-        require(source.client.network_id != receiver.client.network_id, "paid transfer does not merge personal networks")
-        transfer = "0xa9059cbb" + source.wallet_address[2:].lower().zfill(64) + format(1000000, "064x")
-        token_tx = rpc("eth_sendTransaction", [{"from": funder, "to": chain["asset"], "data": transfer}])
-        wait_for("controlled sender TestToken funding", lambda: confirmed(token_tx), timeout=60)
-        register_intent = str(uuid.uuid4())
-        registration_log = (run / "register-before-crash.log").open("wb")
-        enter("first-proof-starting")
-        registration_process = subprocess.Popen([str(binary), "wallet", "--data-dir", str(receiver.directory),
-            "register-key", "--intent-id", register_intent, "--gas-cap", configuration["register_key_gas_cap_wei"]],
-            stdin=subprocess.DEVNULL, stdout=registration_log, stderr=registration_log, start_new_session=True)
-        lock = (receiver.directory / "delivery/private/prover.lock").resolve()
-        actual_r0vm = Path(prover["r0vm"]).resolve(strict=True)
-
-        def genuine_prover_started():
-            if registration_process.poll() is not None:
-                raise RuntimeError("the first real receiving-key proof stopped before its crash checkpoint; inspect the private registration log")
-            facts = controlled_descendants(receiver.process.pid)
-            inherited = {pid: fact for pid, fact in facts.items() if owns_proof_lock(fact, lock)}
-            r0vm = [fact for fact in inherited.values() if fact["exe"] == actual_r0vm]
-            if r0vm and len(inherited) >= 2 and lock.exists() and proof_busy(lock):
-                require(all(fact["group"] not in (os.getpgrp(), receiver.process.pid) for fact in inherited.values()),
-                        "the trusted proof descendants use a separate process group owned by this task")
-                return inherited
-            return None
-
-        inherited_proof = wait_for("actual trusted host and r0vm inherit the exclusive Node proof lock", genuine_prover_started, timeout=120)
-        enter("first-proof-observed")
-        responsiveness = []
-        for sample in range(3):
-            require(proof_busy(lock) and any(same_process(fact) and owns_proof_lock(fact, lock) for fact in inherited_proof.values()),
-                    "the actual trusted prover retains its inherited proof lock before each responsiveness sample")
-            for method, read in (("encrypted delivery.status", lambda: delivery_call(receiver, "status")),
-                                 ("HTTP GET /api/info", lambda: receiver.client.request("/api/info")),
-                                 ("local wallet status", lambda: cli(receiver, ["status"]))):
-                started = time.monotonic_ns()
-                value = read()
-                elapsed = time.monotonic_ns() - started
-                require(isinstance(value, dict) and value, "the actual Node completes each sampled status or GET read while proving")
-                require((method == "encrypted delivery.status" and value.get("node_peer") == receiver.device_id)
-                        or (method == "HTTP GET /api/info" and value.get("device_id") == receiver.device_id)
-                        or (method == "local wallet status" and value.get("state") == "unlocked" and value.get("address") == receiver.wallet_address),
-                        "each sampled response has its actual pinned Node identity or independent wallet state")
-                responsiveness.append({"sample": sample, "method": method, "elapsed_ns": elapsed, "success": True})
-            require(proof_busy(lock) and any(same_process(fact) and owns_proof_lock(fact, lock) for fact in inherited_proof.values()),
-                    "the actual trusted prover retains its inherited proof lock after each responsiveness sample")
-        passed("node-status-and-get-respond-during-genuine-proof", samples=responsiveness, successful_reads=len(responsiveness),
-               actual_r0vm_observed_at_start=True, actual_trusted_proof_busy_before_and_after=True, actual_inherited_lock_busy=True,
-               clock="monotonic_ns", scope="three actual read methods during the first real key-binding proof; no throughput or baseline comparison")
-        jobs = delivery_rows(receiver, "SELECT digest,path FROM proof_jobs")
-        require(len(jobs) == 1, "the first receiving-key proof has one reserved stable receipt")
-        proof_digest, receipt_name = jobs[0]
-        receipt = Path(receipt_name)
-        require(receipt.resolve().is_relative_to(receiver.directory.resolve()) and not receipt.exists(),
-                "the genuine crash checkpoint precedes publication of its original receipt")
-        enter("receiver-crash")
-        receiver.stop(crash=True)
-        require(any(same_process(fact) and owns_proof_lock(fact, lock) for fact in inherited_proof.values()) and proof_busy(lock),
-                "the actual authorized proof retains the lock after its Node is killed")
-        try:
-            registration_process.wait(timeout=35)
-        except subprocess.TimeoutExpired:
-            registration_process.terminate()
-            registration_process.wait(timeout=5)
-        registration_log.close()
-        registration_log = None
-        receiver.start()
-        receiver.client.connect()
-        receiver.client.authenticate()
-        require(cli(receiver, ["status"])["state"] == "locked", "SIGKILL restores the actual receiving wallet locked")
-        registration_args = ["register-key", "--intent-id", register_intent,
-                             "--gas-cap", configuration["register_key_gas_cap_wei"]]
-        cli(receiver, registration_args, success=False, error_contains="unlock the independent delivery wallet locally first")
-        require(proof_busy(lock), "the original proof still occupies its inherited lock at the retry checkpoint")
-        cli(receiver, ["unlock"], password=passwords["R"])
-        cli(receiver, registration_args, success=False,
-            error_contains="a previously authorized proof is still running; waiting to reconcile its receipt")
-        cli(receiver, ["lock"])
-        spawned = controlled_descendants(receiver.process.pid)
-        require(not any(fact["exe"] == actual_r0vm or owns_proof_lock(fact, lock) for fact in spawned.values()),
-                "same-intent retries create no second host or r0vm while the inherited proof is active")
-        require(delivery_rows(receiver, "SELECT digest,path FROM proof_jobs") == jobs
-                and not delivery_rows(receiver, "SELECT id FROM transactions WHERE id=?", (f"key-{register_intent}/register",)),
-                "the crash and occupied-lock retries preserve one proof reservation and reserve no transaction nonce")
-        print("OBSERVE delivery-paid the original receiving-key proof continues after Node SIGKILL", flush=True)
-
-        def original_receipt_ready():
-            if receipt.exists() and not proof_busy(lock):
-                metadata = receipt.lstat()
-                require(stat.S_ISREG(metadata.st_mode) and 0 < metadata.st_size <= 16384,
-                        "the original trusted prover atomically publishes its bounded receipt")
-                return True
-            require(any(same_process(fact) for fact in inherited_proof.values()),
-                    "the authorized prover remains observable until it publishes its receipt")
-            return False
-
-        enter("original-receipt-wait")
-        wait_for("the original genuine receiving-key proof completes without a duplicate job", original_receipt_ready, timeout=7400)
-        enter("original-receipt-ready")
-        original_receipt_sha = file_sha256(receipt)
-        require(cli(receiver, ["status"])["state"] == "locked", "waiting for the authorized receipt does not unlock the receiving wallet")
-        cli(receiver, ["unlock"], password=passwords["R"])
-
-        def registration():
-            value = cli(receiver, registration_args, timeout=7300)
-            if value["phase"] in ("reverted", "conflicted", "failed"):
-                raise RuntimeError("receiving-key registration reached a terminal chain failure")
-            return value if value["phase"] == "confirmed" and value.get("registry_confirmed") is True else None
-        enter("registration-reconcile")
-        wait_for("actual receiving-key proof registration confirmation", registration, timeout=7400)
-        require(delivery_rows(receiver, "SELECT digest,path FROM proof_jobs") == jobs
-                and file_sha256(receipt) == original_receipt_sha
-                and len(delivery_rows(receiver, "SELECT id FROM transactions WHERE id=?", (f"key-{register_intent}/register",))) == 1,
-                "same registry intent reuses the original genuine receipt and has exactly one durable transaction")
-        enter("registration-confirmed")
-        passed("genuine-prover-survives-node-sigkill-without-a-duplicate-job", proof_digest=proof_digest,
-               original_receipt_sha256=original_receipt_sha, inherited_lock=True,
-               restarted_wallet_locked=True, same_intent=True, proof_reservations=1, registry_transactions=1)
-        passed("local-wallets-and-genuine-receiving-key-registration", wallets=3, chain_id=31337,
-               two_confirmations=True, protected_passphrase_fd=True)
-        if chain_recorder:
-            branch_log = (run / "genuine-branches-private.log").open("xb")
-            branch_process = subprocess.Popen(["node", str(repository / "contracts/delivery/exercise-settlement.mjs"),
-                "--settlement", str(export / "settlement.json"), "--rpc-url", chain["rpc_url"],
-                "--deployment", configuration["deployment_file"]], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=branch_log, text=True, bufsize=1, start_new_session=True)
-            ready = exercise_line(timeout=120)
-            require(ready["event"] == "ready" and ready["chainId"] == 31337 and ready["escrow"].lower() == chain["escrow"].lower()
-                    and re.fullmatch(r"[a-f0-9-]{36}", ready["sessionId"]),
-                    "finite genuine helper is attached to the same original local deployment")
-            branch_session = ready["sessionId"]
-            branch_public_index = ready["publicIndex"]
-            require(branch_public_index == f".artifacts/vdp/contracts/branch-observations/{branch_session}/index.json",
-                    "finite helper identifies this exact session's repository-relative public index")
-            wallets = {node.name: node.wallet_address for node in nodes}
-            original_path = options.delivery_ui_control.resolve().parent / "ordinary-paid-ui.bin"
-            require(original_path.parent.is_relative_to(repository / ".artifacts"), "early UI retains its single bounded synthetic source in task artifacts")
-            original_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            with os.fdopen(os.open(original_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb") as output:
-                output.write(os.urandom(4096))
-            for node in nodes:
-                cli(node, ["lock"])
-                known_locked.add(node.name)
-            enter("controller-start")
-            ui_control = DeliveryUiControl(options.delivery_ui_control.resolve(), repository, original_path,
-                                            {"web": source, "android": receiver, "provider": provider}, configuration)
-            ui_control.start()
-            enter("controller-published")
-
-            def observers_ready():
-                require(ui_control.failure is None, "both actual UI observers remain healthy during pre-C0 pairing")
-                return ui_control.observers == set(ui_control.names)
-
-            wait_for("both real UI members pair before the original whole Node checkpoints", observers_ready, timeout=120)
-            ui_control.set_stage("inspections")
-            inspect_rendered("receiver-key-before")
-            quiesced = stopped_nodes("C0Data", save=True)
-            exercise_command("capture-pre-prepare", "captured", quiesced=quiesced, wallets=wallets,
-                             receiverPeer="0x" + receiver.device_id)
-            exercise_command("resume-main", "main-miner-resumed")
-            start_task_nodes(unlock=True)
-        max_file_bytes = 130_816
-        require(delivery_call(source, "status")["max_file_bytes"] == max_file_bytes
-                and delivery_call(receiver, "status")["max_file_bytes"] == max_file_bytes,
-                "paid acceptance covers the exact advertised original-file capacity")
-        original = os.urandom(130_816)
-        digest, name, intent = hashlib.sha256(original).hexdigest(), "private-paid-" + uuid.uuid4().hex + ".bin", str(uuid.uuid4())
-        request = {"intent_id": intent, "receiver_peer": receiver.device_id, "provider_peer": provider.device_id,
-                   "mode": "paid", "acceptance": "strict", "name": name,
-                   "content_base64": base64.b64encode(original).decode(), "max_service_amount": configuration["max_service_amount"],
-                   "max_gas_amount": configuration["source_gas_cap_wei"]}
-        prepared = delivery_call(source, "prepare", **request)
-        order_id = prepared["order_id"]
-        require(prepared["bytes"] == max_file_bytes and len(prepared["windows"]) == 2
-                and prepared["payment"]["total"] == "29",
-                "maximum-capacity strict two-window quotation has the exact original length and fees")
-        require(delivery_call(source, "prepare", **request)["order_id"] == order_id,
-                "same paid intent returns the existing order before authorization")
-        changed = {**request, "content_base64": base64.b64encode(b"different").decode()}
-        source.client.call("delivery", {"op": "prepare", **changed}, status=400)
-        if chain_recorder:
-            outsider_directory, outsider_peer = principal_client_boundaries(request, prepared)
-            cli(provider, ["lock"])
-            require(cli(provider, ["status"])["state"] == "locked", "intentional paid provider outage starts with its actual wallet locked")
-            known_locked.add("P")
-            provider.client.close()
-            provider.stop()
-            approval_barrier = chain_recorder.arm_approval(source.wallet_address, chain["asset"])
-        delivery_call(source, "confirm", intent_id=intent)
-        duplicate = source.client.command("request", method="delivery",
-            params={"op": "confirm", "intent_id": intent}, _wait_timeout=5)
-        require(not duplicate.get("error") and duplicate["result"]["order_id"] == order_id,
-                "immediate duplicate authorization keeps the exact original paid intent")
-        if chain_recorder:
-            wait_for("both real source proofs finish before the original approval estimate is released", approval_barrier.is_set, timeout=16000)
-            require(len(delivery_rows(source, "SELECT digest,path FROM proof_jobs")) == 2
-                    and not delivery_rows(source, "SELECT id FROM transactions"),
-                    "real C0Prime barrier precedes every Source approval/funding reservation while both source proofs are durable")
-            quiesced = stopped_nodes("C0PrimeData", save=True)
-            chain_recorder.release_approval()
-            exercise_command("capture-source-ready", "captured", quiesced=quiesced, wallets=wallets,
-                             orderId="0x" + order_id, receiverPeer="0x" + receiver.device_id)
-            exercise_command("resume-main", "main-miner-resumed")
-            start_task_nodes(unlock=True, names=("S", "R"))
-            delivery_call(source, "reconcile", order_id=order_id)
-            actual_fund = transaction(source, order_id + "/fund")
-            quiesced = stopped_nodes("C1Data", save=True)
-            exercise_command("capture-post-fund", "captured", quiesced=quiesced, wallets=wallets,
-                             orderId="0x" + order_id, fundTxHash=actual_fund)
-            exercise_command("resume-main", "main-miner-resumed")
-            start_task_nodes(names=("P",))
-            stored_rows = delivery_rows(source, "SELECT body FROM orders WHERE id=?", (order_id,))
-            require(len(stored_rows) == 1, "funded original strict Source retains its actual signed order and grants")
-            stored = json.loads(stored_rows[0][0])
-            grants = {grant["body"]["operation"]: grant for grant in stored["grants"] if grant["body"]["window_index"] == 0}
-            ciphertext = (source.directory / "delivery/objects" / order_id / "0-ciphertext.bin").read_bytes()
-            capsule = bytearray((source.directory / "delivery/objects" / order_id / "0-capsule.bin").read_bytes())
-            require(len(ciphertext) > 8192 and len(capsule) == 80, "paid probe uses actual source-encrypted bytes and complete committed capsule")
-            capsule[0] ^= 1
-            action = {"kind": "paid_upload", "offer": {"op": "offer", "mode": "paid", "order": stored["order"],
-                      "file_bytes": max_file_bytes, "intent_id": intent, "wallet_signature": stored["wallet_signature"]},
-                      "ciphertext_grant": grants["put_ciphertext"], "capsule_grant": grants["put_capsule"],
-                      "prefix": base64.b64encode(ciphertext[:8192]).decode(), "tampered_capsule": base64.b64encode(capsule).decode()}
-            integrity = delivery_probe(options, run, source, [provider], order_id, action=action)
-            durable = delivery_rows(provider, "SELECT idx,kind,committed,complete FROM objects WHERE order_id=? ORDER BY idx,kind", (order_id,))
-            require(len(durable) == 4 and all(not complete for _, _, _, complete in durable)
-                    and {(index, kind): committed for index, kind, committed, _ in durable} ==
-                    {(0, "ciphertext"): 8192, (0, "capsule"): 0, (1, "ciphertext"): 0, (1, "capsule"): 0}
-                    and not delivery_rows(provider, "SELECT id FROM transactions"),
-                    "real rejected paid chunks never mark an incomplete object complete or create early payment")
-            passed("paid-real-service-duplicate-reorder-offset-and-capsule-integrity", **integrity,
-                   incomplete_objects=4, early_provider_transactions=0, original_order=True)
-            prefix_rows, prefix_broadcasts = durable_intents(), chain_recorder.broadcasts()
-            provider_exit = provider.stop(crash=True)
-            require(provider_exit == -signal.SIGKILL, "the real task provider is killed before its uncommitted tail fixture")
-            partial = provider.directory / "delivery/objects" / order_id / "0-ciphertext.part"
-            require(provider.process is None and stat.S_ISREG(partial.lstat().st_mode)
-                    and partial.read_bytes() == ciphertext[:8192], "only the actual incomplete durable provider prefix receives an uncommitted tail")
-            tail = b"uncommitted-delivery-tail" * 7
-            with os.fdopen(os.open(partial, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW), "wb") as output:
-                output.write(tail)
-                output.flush()
-                os.fsync(output.fileno())
-            require(delivery_rows(provider, "SELECT idx,kind,committed,complete FROM objects WHERE order_id=? ORDER BY idx,kind", (order_id,)) == durable
-                    and partial.read_bytes() == ciphertext[:8192] + tail,
-                    "the stopped provider fixture changes no committed database offset or complete object")
-            start_task_nodes(names=("P",))
-            require(cli(provider, ["status"])["state"] == "locked" and partial.stat().st_size == 8192 + len(tail)
-                    and delivery_rows(provider, "SELECT committed,complete FROM objects WHERE order_id=? AND idx=0 AND kind='ciphertext'", (order_id,)) == [(8192, 0)],
-                    "provider restart preserves its actual durable offset and does not claim startup truncation")
-            resumed = delivery_probe(options, run, source, [provider], order_id,
-                action={"kind": "paid_resume", "ciphertext_grant": grants["put_ciphertext"],
-                        "chunk": base64.b64encode(ciphertext[8192:16384]).decode()})
-            require(resumed["resumed_offset"] == 8192 and resumed["committed_offset"] == 16384
-                    and partial.read_bytes() == ciphertext[:16384] and partial.stat().st_size == 16384
-                    and delivery_rows(provider, "SELECT committed,complete FROM objects WHERE order_id=? AND idx=0 AND kind='ciphertext'", (order_id,)) == [(16384, 0)]
-                    and prefix_rows == durable_intents() and chain_recorder.broadcasts() == prefix_broadcasts
-                    and cli(provider, ["status"])["state"] == "locked",
-                    "the first original-grant valid append discards only the uncommitted tail without another proof or transaction")
-            passed("paid-provider-sigkill-resumes-committed-prefix-and-discards-uncommitted-tail", status="passed",
-                   order_id=order_id, signal="SIGKILL", exit_code=provider_exit, wallet_locked=True,
-                   committed_before=8192, committed_after=16384, uncommitted_tail_bytes=len(tail),
-                   truncate_on_first_valid_append=True, original_ciphertext_prefix_matches=True,
-                   transaction_rows_unchanged=True, proof_rows_unchanged=True, raw_broadcast_delta=0,
-                   new_proofs=0, original_order=True)
-            cli(provider, ["unlock"], password=passwords["P"])
-            known_locked.discard("P")
-            start_task_nodes(unlock=True, names=("S", "R"))
-            delivery_call(source, "reconcile", order_id=order_id)
-            wait_for("actual Source reconciles its original funded intent after the controlled provider outage", lambda:
-                     not delivery_call(source, "get", order_id=order_id)["error"], timeout=90)
-        latest = {}
-
-        def state(node):
-            value = delivery_call(node, "get", order_id=order_id)
-            if value["error"]:
-                raise RuntimeError("paid executor reported a failure while proving or settling: " + value["error"])
-            key = (value["phase"], value["evidence"], tuple(w["state"] for w in value["windows"]))
-            if latest.get(node.name) != key:
-                latest[node.name] = key
-                print(f"OBSERVE delivery-paid {node.name} phase={key[0]} evidence={key[1]}", flush=True)
-            return value
-
-        def offered():
-            state(source)
-            return next((order for order in delivery_call(receiver, "list")["orders"] if order["order_id"] == order_id), None)
-
-        wait_for("two genuine source proofs, escrow funding and receiver offer", offered, timeout=16000)
-        delivery_call(receiver, "accept", order_id=order_id)
-
-        def completely_opened():
-            value = state(receiver)
-            complete = (value["evidence"] == "decryption_proven"
-                        and all(w["decryption_proven"] for w in value["windows"])
-                        and value["payment"]["earned"] == "29" and value["payment"]["withdrawn"] == "29")
-            return value if complete else None
-
-        final = wait_for("both genuine hold and open proofs settle strict delivery", completely_opened, timeout=32000)
-        recovered = delivery_call(receiver, "read", order_id=order_id)
-        data = base64.b64decode(recovered["content_base64"], validate=True)
-        require(len(data) == max_file_bytes and recovered["bytes"] == max_file_bytes
-                and data == original and recovered["name"] == name and recovered["sha256"] == digest,
-                "strict paid delivery returns the maximum-size original file, private name and SHA-256")
-        require(final["payment"]["earned"] == "29" and final["payment"]["withdrawn"] == "29"
-                and final["payment"]["refunded"] == "0", "provider actually withdraws all exact earned service fees")
-        passed("two-window-source-hold-open-and-original-file", order_id=order_id, windows=2,
-               bytes=len(data), max_file_bytes=max_file_bytes, capacity_boundary=True, sha256=digest,
-               earned="29", withdrawn="29", evidence=final["evidence"])
-        register_rows = delivery_rows(receiver, "SELECT id,intent FROM transactions WHERE id=?",
-                                      (f"key-{register_intent}/register",))
-        require(len(register_rows) == 1, "receiving key has a unique registration transaction")
-        register_id, register_intent = register_rows[0]
-        calldata = bytes.fromhex(json.loads(register_intent)["calldata"].removeprefix("0x"))
-        proofs = [public_proof(calldata[4:1508], receiver, 1)]
-        for index in range(2):
-            source_input = delivery_rows(source, "SELECT body FROM private_values WHERE id=?", (f"source-input:{order_id}:{index}",))
-            require(len(source_input) == 1, "source proof input retains its exact public statement")
-            journal = bytes(json.loads(source_input[0][0])["statement"])
-            proofs.append(public_proof(journal, source, 2, index))
-            for relation in (3, 4):
-                public = journal[:32] + relation.to_bytes(32, "big") + journal[64:]
-                proofs.append(public_proof(public, receiver, relation, index))
-        transactions = {"registerKey": transaction(receiver, register_id), "approve": transaction(source, f"{order_id}/approve"),
-                        "fund": transaction(source, f"{order_id}/fund")}
-        for action in ("hold", "publish", "open", "withdraw"):
-            transactions[action] = [transaction(provider, f"{order_id}/{action}-{index}") for index in range(2)]
-        capsules = [{"windowIndex": index, "capsule": (provider.directory / "delivery/objects" / order_id / f"{index}-capsule.bin").read_bytes().hex()}
-                    for index in range(2)]
-        bundle = {"schemaVersion": 1, "escrow": chain["escrow"], "asset": chain["asset"], "orderId": "0x" + order_id,
-                  "proofs": proofs, "capsules": capsules, "transactions": transactions}
-        bundle_path = export / "settlement.json"
-        private_json(bundle_path, bundle)
-        observer = Path(configuration["settlement_observer"]).resolve(strict=True)
-        observed = subprocess.run(["node", str(observer), "--settlement", str(bundle_path), "--rpc-url", chain["rpc_url"]],
-                                  capture_output=True, timeout=180)
-        with (run / "settlement-observer.log").open("wb") as output:
-            output.write(observed.stdout[:65536])
-            output.write(observed.stderr[:65536])
-        require(observed.returncode == 0, "independent read-only observer verifies seven proofs, actual transactions, balances and gas on the original chain")
-        require(len(observed.stdout) <= 65536, "strict public observer receipt remains bounded")
-        strict_observation = json.loads(observed.stdout)
-        require(strict_observation.get("status") == "PASS", "strict public observer receipt records this actual success")
-        private_json(export / "settlement-observation.json", strict_observation)
-        passed("seven-real-receipts-and-independent-settlement-observer", bundle=str(bundle_path), proofs=7,
-               fund=transactions["fund"], withdrawals=transactions["withdraw"], read_only_observer=True)
-        counts = {node.name: len(delivery_rows(node, "SELECT id FROM transactions")) for node in nodes}
-        for node in (source, receiver):
-            node.stop(crash=True)
-            node.start()
-            node.client.connect()
-            node.client.authenticate()
-            require(cli(node, ["status"])["state"] == "locked", "a restarted Node restores its independent wallet locked")
-        recovered_again = delivery_call(receiver, "read", order_id=order_id)
-        require(base64.b64decode(recovered_again["content_base64"], validate=True) == original,
-                "paid file remains recoverable after a real receiver process restart")
-        require_quiet("restarting completed paid Nodes creates no second nonce or transaction intent", lambda:
-                      counts == {node.name: len(delivery_rows(node, "SELECT id FROM transactions")) for node in nodes})
-        passed("paid-process-restart-retains-file-wallet-lock-and-transaction-identity", transaction_counts=counts)
-        if chain_recorder:
-            principal_service_boundaries(order_id, outsider_directory, outsider_peer)
-            quiesced = stopped_nodes("MainSuccessData", save=True)
-            exercise_command("verify-core", "core-verified", quiesced=quiesced, fileSha256=digest)
-            incoming_cases = ("incoming-false", "incoming-frozen", "incoming-fee", "incoming-sender-tax",
-                              "incoming-precision", "incoming-reentrancy", "incoming-nonreturn")
-            settled_cases = ("offline-refund", "partial-refund", "held-timeout", "strict-late-open", "late-priority",
-                             "hold-reorg", "capsule-reorg", "keeper", "token-false", "token-frozen", "token-fee",
-                             "token-sender-tax", "token-precision", "token-nonreturn", "token-reentrancy", "node-refund-hook")
-            branch_results = []
-            for case in (*incoming_cases, *settled_cases):
-                result = exercise_command("exercise-case", "case-complete", quiesced=last_quiesced, case=case)
-                require(result["case"] == case and result["status"] == "EVM_PASS" and result["newProofs"] == 0,
-                        "each finite branch actually uses the original genuine proof set without generating a replacement")
-                branch_results.append(result)
-            require([value["point"] for value in process_recoveries] == ["held", "key-published"]
-                    and all(value["raw_broadcast_delta"] == 0 for value in process_recoveries),
-                    "both actual held and key-published SIGKILL recoveries are required")
-            passed("real-paid-held-and-key-published-sigkill-recovery", status="passed", points=process_recoveries,
-                   new_proofs=0, original_order=True)
-            exercise_command("restore-core", "core-restored", quiesced=last_quiesced)
-            mixed = exercise_command("lifecycle-held", "lifecycle-held-complete", quiesced=last_quiesced)
-            require(len(lifecycle_actions) == 1 and lifecycle_actions[0]["public"]["action"] == "rotate"
-                    and mixed["status"] == "EVM_PASS" and mixed["oldFileSha256"] == digest,
-                    "mixed held lifecycle performs one actual Rotate and recovers the old held-key original")
-            restored = exercise_command("restore-core", "core-restored", quiesced=last_quiesced)
-            require(restored["status"] == "PASS" and restored["restoredAuthorizedRotation"]["txHash"] == lifecycle_actions[0]["public"]["transactionHash"],
-                    "canonical restoration reuses the same original Rotate transaction and retains its new key material")
-            key_directory = run / "key-lifecycle"
-            for action in ("revoke", "register"):
-                exercise_command("resume-main", "main-miner-resumed")
-                start_task_nodes()
-                completed_key = genuine_key_action(action, key_directory, order_id, digest)
-                lifecycle_actions.append(completed_key)
-                label = "After" + action.capitalize() + "Data"
-                quiesced = stopped_nodes(label, save=True)
-                recorded = exercise_command("record-key", "key-recorded", quiesced=quiesced,
-                                            action=action, txHash=completed_key["public"]["transactionHash"])
-                require(recorded["status"] == "PASS" and recorded["serial"] == completed_key["public"]["serial"],
-                        "finite lifecycle observer independently confirms the actual owner certificate serial and transaction")
-            public_branches = run / "genuine-branches"
-            public_branches.mkdir(mode=0o700)
-            actual_exports = (repository / branch_public_index).parent
-            branch_files = ["index.json", "core-restored.json", "branch-mixed-held-rotate.json",
-                            *["branch-" + case + ".json" for case in (*incoming_cases, *settled_cases)],
-                            *["key-" + action + ".json" for action in ("rotate", "revoke", "register")]]
-            for name in branch_files:
-                source_file = actual_exports / name
-                require(stat.S_ISREG(source_file.lstat().st_mode) and source_file.stat().st_size <= 1024 * 1024,
-                        "only the current finite session's bounded public branch receipts are exported")
-                shutil.copyfile(source_file, public_branches / name)
-            shutil.copyfile(public_branches / "branch-mixed-held-rotate.json", key_directory / "mixed-held.json")
-            public_actions = [value["public"] for value in lifecycle_actions]
-            require([value["action"] for value in public_actions] == ["rotate", "revoke", "register"]
-                    and len({value["serial"] for value in public_actions}) == 3,
-                    "three actual lifecycle actions have distinct observed increasing registry serials")
-            key_summary = {"schemaVersion": 1, "kind": "genuine-key-lifecycle", "status": "PASS", "generatedProofs": 3,
-                           **lifecycle_actions[-1]["metadata"], "operations": public_actions,
-                           "oldOrderId": "0x" + order_id, "oldFileSha256": digest, "mixedHeldObservation": "mixed-held.json",
-                           "finalRegistrationId": lifecycle_actions[-1]["transaction_id"], "finalActiveSerial": public_actions[-1]["serial"],
-                           "finalBindingJournalHash": public_actions[-1]["journalHash"]}
-            private_json(key_directory / "summary.json", key_summary)
-            passed("genuine-key-lifecycle-preserves-old-key-and-enables-new-key", summary=str(key_directory / "summary.json"),
-                   new_proofs=3, actions=[value["action"] for value in public_actions],
-                   serials=[value["serial"] for value in public_actions], old_sha256=digest, mixed_held=True)
-            passed("genuine-branches-and-canonical-restoration", status="passed", public_index=branch_public_index,
-                   session_id=branch_session, helper_new_proofs=0, core_restored=True)
-            require([record["kind"] for record in inspection_records] ==
-                    ["receiver-key-before", "source-partial", "source-unknown", "receiver-key-after"]
-                    and all(DeliveryUiControl.inspection_verified(record["checks"]) for record in inspection_records)
-                    and inspection_records[0]["observed"]["receiverKey"]["keyId"] != inspection_records[3]["observed"]["receiverKey"]["keyId"],
-                    "four actual rendered inspections preserve their original order and the genuine changed key")
-            inspection_manifest = run / "ui-inspections.json"
-            private_json(inspection_manifest, {"schemaVersion": 1, "kind": "vdp-rendered-inspections", "status": "PASS",
-                         "strictOrderId": order_id, "strictIntentId": intent, "generatedProofs": 0, "inspections": inspection_records})
-            passed("rendered-original-order-inspections", status="passed", manifest=str(inspection_manifest), count=4,
-                   new_proofs=0, raw_broadcast_delta=0, strict_order_id=order_id)
-            exercise_command("resume-main", "main-miner-resumed")
-            start_task_nodes()
-            ordinary_bundle = ordinary_ui_acceptance(lifecycle_actions[-1]["journal"], lifecycle_actions[-1]["transaction_id"])
-            actual_proof_jobs = [(node.name, digest_value) for node in nodes
-                                 for digest_value, in delivery_rows(node, "SELECT digest FROM proof_jobs")]
-            require(len(actual_proof_jobs) == 13 and len({digest_value for _, digest_value in actual_proof_jobs}) == 13,
-                    "final task has exactly thirteen distinct actual genuine proof reservations")
-            stopped_nodes("FinalThirteenProofData", save=True)
-            require(len(proof_catalog) == 13 and set(proof_catalog) == {digest_value for _, digest_value in actual_proof_jobs},
-                    "all observed whole-checkpoint histories contain exactly the same thirteen final distinct genuine receipts")
-            report["genuine_proofs"] = 13
-            report["ordinary_bundle"] = str(ordinary_bundle)
-        report["status"] = "passed"
-        report["bundle"] = str(bundle_path)
-    except BaseException as error:
-        report["status"] = "failed"
-        report["failure"] = {"type": type(error).__name__, "message": str(error)}
-        raise
-    finally:
-        passwords.clear()
-        if ui_control is not None:
-            ui_control.close()
-        if registration_process is not None and registration_process.poll() is None:
-            registration_process.terminate()
-            try:
-                registration_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                registration_process.kill()
-                registration_process.wait(timeout=5)
-        if registration_log is not None:
-            registration_log.close()
-        for process in key_processes:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
-        if branch_process is not None:
-            branch_process.stdin.close()
-            try:
-                branch_process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                branch_process.terminate()
-                try:
-                    branch_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    branch_process.kill()
-                    branch_process.wait(timeout=5)
-            if report["status"] == "passed" and branch_process.returncode != 0:
-                report["status"] = "failed"
-                report["failure"] = {"type": "GenuineExerciseExit", "message": "finite genuine exercise did not complete with its successful original session"}
-        if branch_log is not None:
-            branch_log.close()
-        for group in {fact["group"] for fact in inherited_proof.values() if same_process(fact)}:
-            if any(fact["group"] == group and same_process(fact) for fact in inherited_proof.values()):
-                try:
-                    os.killpg(group, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-        for node in reversed(nodes):
-            node.client.close()
-            node.stop()
-        stop_fixture_processes(principals)
-        relay.close()
-        if chain_recorder:
-            chain_recorder.close()
-        private_json(run / "summary.json", report)
-        print("Paid delivery report: " + str(run / "summary.json"), flush=True)
-    require(report["status"] == "passed", "actual paid acceptance and its finite exercise both complete successfully")
-    return report
+def delivery_protected_acceptance(options):
+    driver = runpy.run_path(str(Path(__file__).resolve().with_name("verify-delivery-protected.py")))
+    require(driver["run_from_options"](options, globals()) == 0,
+            "fresh protected delivery reaches its five genuine receipts and actual budget settlement")
 
 
 def e2e_fixture(options):
@@ -8757,20 +7264,48 @@ def e2e_fixture(options):
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
     helper.chmod(0o600)
     nodes = {}
-    relay = PkarrRelay() if options.fixture_kind == "delivery" else None
-    rpc = DeliveryRpcSpy() if relay else None
+    delivery_kind = options.fixture_kind == "delivery"
+    rpc = DeliveryRpcSpy() if delivery_kind else None
+    mesh = mesh_network()
     native_ready = False
     native_invitation = None
     native_provider = None
     native_queue = None
     workspace_gates = {name: run / ("workspace-release-" + name) for name in ("taskA", "taskB", "main", "channel")} \
         if options.fixture_kind == "workspace" else None
-    bootstrap_invitation = None
-    bootstrap_kind = options.fixture_kind == "bootstrap"
+    mesh_invitation = None
+    mesh_kind = options.fixture_kind == "mesh"
+    cursor_bin = run / "cursor-cli"
+    cursor_bin.mkdir(mode=0o700)
+    cursor_program = cursor_bin / "agent"
+    cursor_login = run / "cursor-signed-in"
+    cursor_requests = run / "cursor-requests.jsonl"
+    cursor_prompts = run / "cursor-prompts.jsonl"
+    cursor_protocol = Path(__file__).resolve().parents[1] / "crates/bridge/tests/fixtures/fake-cursor-agent"
+    cursor_program.write_text(f'''#!{sys.executable}
+import os, pathlib, sys
+login = pathlib.Path({str(cursor_login)!r})
+if sys.argv[1:] == ['login']:
+    login.touch(mode=0o600)
+    sys.exit(0)
+if not login.exists():
+    os.environ['FAKE_STATUS_SIGNED_OUT'] = '1'
+os.environ['FAKE_BRIDGE_REQUEST_LOG'] = {str(cursor_requests)!r}
+os.environ['FAKE_BRIDGE_SEND_LOG'] = {str(cursor_prompts)!r}
+os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:]])
+''')
+    cursor_program.chmod(0o700)
+
+    def configure_cursor(node):
+        bins = json.loads((node.directory / "config.json").read_text()).get("bins", {})
+        bins["cursor"] = str(cursor_bin / "cursor-sdk-bridge" if options.fixture_kind == "cursor" else cursor_program)
+        node.configure(bins=bins)
 
     def details():
+        # A browser lives on the origin of the owner's access link; a Node without one names its listener.
         return {"run": str(run), "nodes": {
-            role: {"url": node.url, "peer": node.device_id, "directory": str(node.directory)}
+            role: {"url": node.access["url"] if node.entry else node.url, "entry": node.entry,
+                   "peer": node.device_id, "directory": str(node.directory)}
             for role, node in nodes.items()
         }, **({"gates": {name: str(path) for name, path in workspace_gates.items()}} if workspace_gates else {})}
 
@@ -8780,38 +7315,41 @@ def e2e_fixture(options):
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     try:
-        if bootstrap_kind:
-            # The page's own Node is a public node; the member configures nothing but its discovery.
-            relay_port = available_port()
-            relay_url = f"http://127.0.0.1:{relay_port}"
-            public = Node(run, "public", binary, workspace, helper, port=options.fixture_port, init_args=[
-                "--serve-discovery", "--forward-any",
-                "--relay-listen", f"127.0.0.1:{relay_port}", "--relay-url", relay_url, *OPEN_RELAY])
+        if mesh_kind:
+            # The page's own Node is the bootstrap node of a fresh mesh, volunteers a relay and forwards
+            # browsers to any device; the member configures nothing but it as its bootstrap node.
+            public = Node(run, "public", binary, workspace, helper, port=options.fixture_port,
+                          init_args=["--mesh-network", mesh, "--forward-any", *public_node_args()])
             nodes["public"] = public
+            public.configure_mesh(mesh)
             member = Node(run, "member", binary, workspace, helper, init_args=[
-                "--root", str(workspace), "--bootstrap", f"vibeface://{public.device_id}@127.0.0.1:{public.quic_port}"])
+                "--root", str(workspace), "--mesh-network", mesh, "--bootstrap", public.mesh_address])
             nodes["member"] = member
+            node_cli(member, "config", "set", "mesh.allow_private", "true")
+            configure_cursor(public)
+            configure_cursor(member)
             public.start()
             member.start()
             member.bootstrap()
             probe = Client(public.url, helper, identity_file=run / "probe-identity.json")
             try:
-                wait_for("the member registers with the page Node's discovery",
+                wait_for("the page Node finds the member through the mesh",
                          lambda: probe.connect(member.device_id, check=False).get("ok"), timeout=60)
             finally:
                 probe.close()
-            member.client.rpc("create_bot", bot_id="bootstrap-fixture-bot", conversation_id="bootstrap-fixture-chat",
-                              name="Bootstrap fixture assistant", instructions="Controlled fixture; no provider enabled")
-            bootstrap_invitation = member.client.invite().removeprefix("vibeface://join/")
-        for role in ([] if bootstrap_kind else ["source", "receiver", "provider"] if relay else ["source"]):
+            member.client.rpc("create_bot", bot_id="mesh-fixture-bot", conversation_id="mesh-fixture-chat",
+                              name="Mesh fixture assistant", instructions="Controlled fixture; no provider enabled")
+            mesh_invitation = member.client.invite().removeprefix("vibeface://join/")
+        for role in ([] if mesh_kind else ["source", "receiver", "provider"] if delivery_kind else ["source"]):
             args = public_node_args() if role == "provider" else []
+            # The e2e runner's port is the browser's origin: the source Node's local listener, where its owner link opens.
             node = Node(run, role, binary, workspace, helper, init_args=args,
-                        port=options.fixture_port if role == "source" else None)
+                        local_port=options.fixture_port if role == "source" else None)
             nodes[role] = node
             isolate_delivery_node(node)
-            if relay:
-                node.configure_network(pkarr={"publish": True, "resolve": True,
-                                                 "urls": [relay.url], "publish_direct": True})
+            if delivery_kind:
+                # The source is the mesh's bootstrap node; the others join through it.
+                node.configure_mesh(mesh, [] if role == "source" else [nodes["source"].mesh_address])
             if rpc:
                 private_json(node.directory / "delivery-settings.json",
                              free_delivery_settings(rpc, options.fixture_profile, enabled=role == "provider"))
@@ -8819,7 +7357,11 @@ def e2e_fixture(options):
                 node.configure(timeout_secs=600, daily_decision_limit=100, manager=fixture_manager_settings(run, workspace),
                                bins={"codex": str(fixture_wrapper(run, "workspace-codex", "--fixture-codex"))},
                                app_server=SPAWN_APP_SERVER)
-            node.start()
+            configure_cursor(node)
+            environment = node.environment()
+            if options.fixture_kind == "cursor":
+                environment["PATH"] = str(cursor_bin) + os.pathsep + os.defpath
+            node.start(env=environment)
         print(json.dumps({"ready": details()}), flush=True)
         for line in sys.stdin:
             request = json.loads(line)
@@ -8832,11 +7374,28 @@ def e2e_fixture(options):
                     node.stop(crash=bool(request.get("crash")))
                     node.start()
                     result = details()
+                elif op == "cursor_login":
+                    require(set(request) == {"op"} and options.fixture_kind == "cursor",
+                            "Cursor login belongs only to this controlled fixture")
+                    env = nodes["source"].environment()
+                    for name in ("CURSOR_API_KEY", "CURSOR_AUTH_TOKEN", "AGENT_CLI_CREDENTIAL_STORE"):
+                        env.pop(name, None)
+                    result = subprocess.run([str(cursor_program), "login"], env=env, capture_output=True, timeout=5)
+                    require(result.returncode == 0 and cursor_login.exists(), "the controlled CLI login completes")
+                    result = {"signed_in": True}
+                elif op == "cursor_inspect":
+                    require(set(request) == {"op"} and options.fixture_kind == "cursor",
+                            "Cursor inspection belongs only to this controlled fixture")
+                    configuration = json.loads((nodes["source"].directory / "config.json").read_text())
+                    result = {"selected_official": configuration["bins"].get("cursor") == str(cursor_program),
+                              "bot_enabled": configuration["manager"] is not None,
+                              "execution": configuration["providers"]["execution"],
+                              "prompts": len(cursor_prompts.read_text().splitlines()) if cursor_prompts.exists() else 0}
                 elif op == "inspect":
                     result = {"wallet_files": sum((node.directory / "delivery-wallet.json").exists()
                                                   for node in nodes.values()),
-                              "pkarr_reads": relay.reads if relay else 0,
-                              "pkarr_writes": relay.writes if relay else 0,
+                              "mesh_records": min((sum(entry["online"] for entry in mesh_records(node))
+                                                   for node in nodes.values()), default=0) if delivery_kind else 0,
                               "chain_rpc_calls": rpc.calls if rpc else 0}
                 elif op == "workspace_release":
                     require(set(request) == {"op", "gate"} and workspace_gates and request["gate"] in workspace_gates,
@@ -8883,35 +7442,31 @@ def e2e_fixture(options):
                         output.write(invitation)
                     native_ready = True
                     result = details()
-                elif op == "bootstrap_info":
-                    require(bootstrap_kind, "bootstrap info belongs to its controlled fixture")
+                elif op == "mesh_info":
+                    require(mesh_kind, "mesh info belongs to its controlled fixture")
                     network = json.loads((nodes["member"].directory / "config.json").read_text())["network"]
-                    result = {**details(), "invitation": bootstrap_invitation, "bootstrap": network["bootstrap"],
-                              "relays": network["relays"], "discovery": network["discovery"]}
-                elif op == "bootstrap_pairing":
-                    require(bootstrap_kind, "bootstrap pairing belongs to its controlled fixture")
+                    relays = wait_for("the member learns the page Node's volunteer relay", lambda: [
+                        role["url"] for entry in mesh_records(nodes["member"], "relay")
+                        if entry["online"] and entry["record"]["device_id"] == nodes["public"].device_id
+                        for role in entry["record"]["roles"] if role["kind"] == "relay"], timeout=75)
+                    result = {**details(), "invitation": mesh_invitation, "mesh": network["mesh"],
+                              "relays": network["relays"], "announced_relays": relays}
+                elif op == "mesh_pairing":
+                    require(mesh_kind, "mesh pairing belongs to its controlled fixture")
                     owner = nodes["member"].client
-                    def revealed_bootstrap():
-                        pending = next((item for item in owner.call("join_status")["requests"]
-                                        if item["name"] == "Bootstrap browser" and item["kind"] == "client"
-                                        and item["status"] in ("pending", "confirming")), None)
-                        if pending and pending["status"] == "pending":
-                            owner.start_approval(pending["join_id"])
-                            return None
-                        return pending if pending and pending.get("joiner_nonce") else None
-                    pending = wait_for("browser reveals its real bootstrap pairing nonce", revealed_bootstrap, timeout=20)
+                    pending = wait_for("browser reveals its real pairing nonce", lambda: owner.named_pairing("Mesh browser"), timeout=20)
                     result = {"peer": pending["device_id"], "code": owner.command("short_code", request=pending)}
-                elif op == "bootstrap_approve":
-                    require(bootstrap_kind, "bootstrap approval belongs to its controlled fixture")
+                elif op == "mesh_approve":
+                    require(mesh_kind, "mesh approval belongs to its controlled fixture")
                     owner = nodes["member"].client
                     pending = owner.pending_join(request["peer"])
-                    require(pending and pending["name"] == "Bootstrap browser" and pending.get("joiner_nonce")
+                    require(pending and pending["name"] == "Mesh browser" and pending.get("joiner_nonce")
                             and request["code"] == owner.command("short_code", request=pending),
                             "browser and manager display the same actual safety code")
                     owner.grant(pending)
                     result = {"approved": True}
                 elif op == "native_setup":
-                    require(relay is not None and not native_ready, "native setup initializes only its own fresh delivery fixture")
+                    require(delivery_kind and not native_ready, "native setup initializes only its own fresh delivery fixture")
                     for role in ("source", "receiver"):
                         node = nodes[role]
                         node.bootstrap()
@@ -8934,16 +7489,7 @@ def e2e_fixture(options):
                     require(native_ready, "native pairing requires the controlled initialized Node")
                     client = nodes["source" if workspace_gates else "receiver"].client
 
-                    def revealed():
-                        entries = client.call("join_status")["requests"]
-                        pending = next((item for item in entries if item["name"] == "VDP native receiver"
-                                        and item["kind"] == "client" and item["status"] in ("pending", "confirming")), None)
-                        if pending and pending["status"] == "pending":
-                            client.start_approval(pending["join_id"])
-                            return None
-                        return pending if pending and pending.get("joiner_nonce") else None
-
-                    pending = wait_for("native client reveals its actual pairing nonce", revealed)
+                    pending = wait_for("native client reveals its actual pairing nonce", lambda: client.named_pairing("VDP native receiver"))
                     result = {"peer": pending["device_id"], "code": client.command("short_code", request=pending)}
                 elif op == "native_approve":
                     require(native_ready, "native approval belongs to the controlled initialized Node")
@@ -9001,7 +7547,7 @@ def e2e_fixture(options):
                             "native running input preserves its accepted trigger")
                     wait_for("native running input reaches its actual job state", lambda:
                         any(job["trigger"] == running["trigger"] and job["state"] == "running"
-                            for job in client.rpc("conversation", conversation_id=native_queue["conversation_id"])["scheduler"]["jobs"]))
+                            for job in conversation_snapshot(client, native_queue["conversation_id"], sections=("jobs",))["scheduler"]["jobs"]))
                     wait_for("the native queue has one positive controlled invocation", lambda:
                         len([row for row in fixture_records(run) if row["conversation_id"] == native_queue["conversation_id"]
                              and row["trigger"] == native_queue["running_trigger"]]) == 1)
@@ -9020,7 +7566,7 @@ def e2e_fixture(options):
                     settings = client.call("node_settings")
                     provider = next(item for item in settings["providers"] if item["provider"] == "codex")
                     manager = settings["settings"]["manager"]
-                    jobs = client.rpc("conversation", conversation_id=native_queue["conversation_id"])["scheduler"]["jobs"] if native_queue else []
+                    jobs = conversation_snapshot(client, native_queue["conversation_id"], sections=("jobs",))["scheduler"]["jobs"] if native_queue else []
                     inputs = client.rpc("workspace_state")["inputs"] if native_queue else []
                     deferred_input = next((row for row in inputs
                         if row["input"]["message_id"] == native_queue["deferred_message_id"]), None) if native_queue else None
@@ -9065,7 +7611,7 @@ def e2e_fixture(options):
     finally:
         cleanup_failed = False
         actions = [action for node in reversed(list(nodes.values())) for action in (node.client.close, node.stop)]
-        actions += ([relay.close] if relay else []) + ([rpc.close] if rpc else []) + [lambda: stop_fixture_processes(run)]
+        actions += ([rpc.close] if rpc else []) + [lambda: stop_fixture_processes(run)]
         for action in actions:
             try:
                 action()
@@ -9080,7 +7626,7 @@ if __name__ == "__main__":
         fixture_codex(sys.argv[1:])
     else:
         parser = argparse.ArgumentParser(description=__doc__)
-        parser.add_argument("--binary", type=Path, required=True,
+        parser.add_argument("--binary", type=Path,
                             help="the vibeface CLI binary used to create and run the isolated Nodes")
         parser.add_argument("--core-binary", type=Path,
                             help="the sibling vibeface-core binary to verify; defaults to --binary's sibling")
@@ -9088,36 +7634,48 @@ if __name__ == "__main__":
                             help="development static output directory; packages discover sibling web/ automatically")
         parser.add_argument("--artifacts", type=Path, required=True)
         parser.add_argument("--crypto-module", type=Path, default=Path(__file__).resolve().parents[1] / "apps/app/dist/client/vibeface_secure.js")
+        parser.add_argument("--npm-package", type=Path, help="the immutable CI npm artifact for --npm-service replacement")
+        parser.add_argument("--npm-baseline", type=Path, help="the public baseline artifact pinned once for this candidate")
         modes = parser.add_mutually_exclusive_group()
         modes.add_argument("--web-only", action="store_true", help="check packaged Web resources without Node business or provider scenarios")
+        modes.add_argument("--conversation-history", action="store_true", help="check bounded conversation history through a real isolated Core process")
+        modes.add_argument("--npm-service", action="store_true", help="check real npm user services only on a fresh GitHub-hosted POSIX runner")
+        modes.add_argument("--npm-baseline-pin", action="store_true", help="pin one public same-epoch npm baseline and its complete product provenance")
         modes.add_argument("--phase1", action="store_true", help="run focused durable Manager queue/follow-up process checks with controlled fixtures")
         modes.add_argument("--chat-agent", action="store_true", help="run direct App Server work, triage, decisions, cancellation and native observation process checks")
         modes.add_argument("--memory-sync", action="store_true", help="check signed user Memory controls, cross-Node conflicts, provenance and replay")
         modes.add_argument("--auto-route", action="store_true", help="check entry joins, origins, forwarding, recovery and uncertain writes")
         modes.add_argument("--phase4", action="store_true", help="check cross-entrance coordination, agent tasks, owner moves, revocation, checks and attachments")
-        modes.add_argument("--discovery", action="store_true", help="check discovery connection assistance, automatic normal-relay fallback, and headless Nodes")
-        modes.add_argument("--public-node", action="store_true", help="check a public node that serves discovery, an open relay and queued browser forwarding to a member Node, and a private relay's token")
+        modes.add_argument("--mesh", action="store_true", help="check joining the mesh through a bootstrap node, rejoining from the old table, volunteer relay adoption, and headless Nodes")
+        modes.add_argument("--public-node", action="store_true", help="check a public node that is a mesh bootstrap node, an open relay and queued browser forwarding to a member Node, and a private relay's token")
         modes.add_argument("--phase5", action="store_true", help="check write protection after a restore, alone and as a copied data directory, status, logs and diagnostics")
         modes.add_argument("--e2e-fixture", action="store_true", help=argparse.SUPPRESS)
         modes.add_argument("--native-provider-selfcheck", action="store_true", help=argparse.SUPPRESS)
         modes.add_argument("--native-clipboard-selfcheck", action="store_true", help=argparse.SUPPRESS)
-        modes.add_argument("--delivery-charity", action="store_true", help="check free discovery, charity transfer, loopback service boundaries and durable restart")
-        modes.add_argument("--delivery", action="store_true", help="check the full paid delivery flow; requires a private local deployment configuration")
-        modes.add_argument("--delivery-ui-selfcheck", action="store_true", help="check only the local UI controller schema without starting Nodes, UI, chain or proofs")
+        modes.add_argument("--client-response-drop-selfcheck", action="store_true", help=argparse.SUPPRESS)
+        modes.add_argument("--delivery-charity", action="store_true", help="check the free mesh, charity transfer, loopback service boundaries and durable restart")
+        modes.add_argument("--delivery", action="store_true", help="retired Strict full-delivery runner; fails explicitly without starting paid work")
+        modes.add_argument("--delivery-protected", action="store_true", help="run fresh two-order protected budgets with five genuine receipts in the bounded Linux proof sandbox")
+        modes.add_argument("--delivery-protected-selfcheck", action="store_true", help="check the protected driver without starting a Node, chain, proof or socket")
+        modes.add_argument("--delivery-ui-selfcheck", action="store_true", help="retired Strict UI controller selfcheck; rejects before writing or starting work")
         parser.add_argument("--delivery-profile", type=Path, default=Path(__file__).resolve().parents[1] / "crates/delivery/proof/profile.json")
         parser.add_argument("--delivery-source-root", type=Path, default=Path(__file__).resolve().parents[1])
         parser.add_argument("--delivery-probe", type=Path)
         parser.add_argument("--delivery-config", type=Path)
+        parser.add_argument("--delivery-run-dir", type=Path, help="fresh protected evidence directory inside this worktree's .artifacts")
         parser.add_argument("--delivery-ui-control", type=Path)
         parser.add_argument("--delivery-ui-timeout-ms", type=int, default=43_200_000)
-        parser.add_argument("--fixture-kind", choices=("single", "delivery", "workspace", "bootstrap"), default="single", help=argparse.SUPPRESS)
+        parser.add_argument("--fixture-kind", choices=("single", "delivery", "workspace", "mesh", "cursor"), default="single", help=argparse.SUPPRESS)
         parser.add_argument("--fixture-port", type=int, help=argparse.SUPPRESS)
         parser.add_argument("--fixture-profile", type=Path, default=Path(__file__).resolve().parents[1] / "crates/delivery/proof/profile.json", help=argparse.SUPPRESS)
         arguments = parser.parse_args()
         try:
             needs_process = not (arguments.delivery_ui_selfcheck or arguments.native_provider_selfcheck
-                                 or arguments.native_clipboard_selfcheck)
+                                 or arguments.native_clipboard_selfcheck or arguments.npm_baseline_pin
+                                 or arguments.delivery or arguments.delivery_protected_selfcheck
+                                 or arguments.client_response_drop_selfcheck)
             if needs_process:
+                require(arguments.binary is not None, "--binary is required for Node process acceptance")
                 program = shutil.which(str(arguments.binary)) if len(arguments.binary.parts) == 1 else str(arguments.binary)
                 require(program is not None, "the Vibeface CLI binary exists on PATH or at its explicit path")
                 launcher = Path(program)
@@ -9138,12 +7696,20 @@ if __name__ == "__main__":
                 require(arguments.app_dir.is_dir(), "the explicit App output directory exists")
                 os.environ["VIBEFACE_APP_DIR"] = str(arguments.app_dir)
             require(30_000 <= arguments.delivery_ui_timeout_ms <= 86_400_000, "UI acceptance has a bounded explicit execution deadline")
-            if arguments.native_provider_selfcheck:
+            if arguments.npm_baseline_pin:
+                pin_npm_baseline(arguments)
+            elif arguments.native_provider_selfcheck:
                 native_provider_selfcheck(arguments)
             elif arguments.native_clipboard_selfcheck:
                 native_clipboard_selfcheck(arguments)
+            elif arguments.client_response_drop_selfcheck:
+                client_response_drop_selfcheck()
             elif arguments.delivery_ui_selfcheck:
                 delivery_ui_selfcheck(arguments)
+            elif arguments.delivery_protected_selfcheck:
+                delivery_protected_selfcheck()
+            elif arguments.delivery_protected:
+                delivery_protected_acceptance(arguments)
             elif arguments.e2e_fixture:
                 require(arguments.fixture_port is not None, "e2e fixture requires its allocated port")
                 e2e_fixture(arguments)
@@ -9151,8 +7717,8 @@ if __name__ == "__main__":
                 delivery_paid_acceptance(arguments)
             elif arguments.delivery_charity:
                 delivery_charity_acceptance(arguments)
-            elif arguments.discovery:
-                discovery_acceptance(arguments)
+            elif arguments.mesh:
+                mesh_acceptance(arguments)
             elif arguments.phase5:
                 phase5_acceptance(arguments)
             elif arguments.public_node:
@@ -9161,6 +7727,11 @@ if __name__ == "__main__":
                 phase4_acceptance(arguments)
             elif arguments.auto_route:
                 auto_route_acceptance(arguments)
+            elif arguments.conversation_history:
+                from conversation_history_probe import conversation_history_acceptance
+                conversation_history_acceptance(arguments, sys.modules[__name__])
+            elif arguments.npm_service:
+                npm_service_acceptance(arguments)
             elif arguments.web_only:
                 web_acceptance(arguments)
             elif arguments.chat_agent:

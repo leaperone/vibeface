@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
+import { registerHooks } from 'node:module'
 import test from 'node:test'
 import type { ReadyConnection } from '../lib/node.ts'
+import type { Platform } from '../lib/platform.ts'
 import { createDeliveryClient } from './client.ts'
-import { amount, canRead, canRestart, changeMode, checkedFile, draftFor, fromBase64, orderActions, orderSummary, orderTitle, parseOrder, parseReceived, parseStatus, receiverChoices, settlementAmountsLabel, sha256, sizeLabel, toBase64, walletNotice } from './model.ts'
+import { amount, canRead, canRestart, changeMode, checkedFile, draftFor, fromBase64, orderActions, orderSummary, orderTitle, parseBudgets, parseOrder, parseReceived, parseStatus, publicationLabel, providerChoices, receiverChoices, receivingBatches, settlementAmountsLabel, sha256, sizeLabel, toBase64, walletNotice } from './model.ts'
 import type { DeliveryDraft, DeliveryOrder, DeliveryStatus } from './types.ts'
 
 const source = '11'.repeat(32), receiver = '22'.repeat(32), provider = '33'.repeat(32)
@@ -13,13 +15,13 @@ function order(): DeliveryOrder {
   return {
     order_id: '44'.repeat(32), intent_id: uuid, role: 'sender', mode: 'charity', acceptance: 'recoverable', source_peer: source, receiver_peer: receiver, provider_peer: provider,
     name: 'example.txt', bytes: content.length, sha256: digest, phase: 'prepared', evidence: 'none',
-    payment: { state: 'free', chain_id: null, asset: null, payer: null, provider_wallet: null, delivery_fee: '0', reservation_fee: '0', priority_fee: '0', total: '0', gas_cap: '0', earned: '0', withdrawn: '0', refunded: '0', tx_hash: null },
+    payment: { state: 'free', chain_id: null, asset: null, payer: null, provider_wallet: null, delivery_fee: '0', reservation_fee: '0', priority_fee: '0', total: '0', gas_cap: '0', earned: '0', withdrawn: '0', refunded: '0', tx_hash: null, budget_id: null, settlement: null },
     deadlines: null, windows: [{ index: 0, bytes: content.length + 128, committed_bytes: 0, state: 'pending', decryption_proven: false }], created_at_ms: 1, updated_at_ms: 1, error: null,
   }
 }
 function paidOrder(): DeliveryOrder {
   const paid = order()
-  paid.mode = 'paid'; paid.payment.state = 'prepared'
+  paid.mode = 'paid'; paid.payment.state = 'prepared'; paid.payment.budget_id = '88'.repeat(32)
   paid.deadlines = { quote_expires_at: 10, hold_deadline: 20, key_deadline: 30, open_deadline: 40, retain_until: 50, priority_deadline: 25 }
   paid.payment.chain_id = '31337'; paid.payment.asset = `0x${'55'.repeat(20)}`; paid.payment.payer = `0x${'66'.repeat(20)}`; paid.payment.provider_wallet = `0x${'77'.repeat(20)}`
   paid.payment.delivery_fee = '9007199254740993'; paid.payment.total = '9007199254740993'
@@ -48,13 +50,20 @@ test('paid accounting remains exact above Number precision and rejects overspend
 
 test('uncertain chain results label retained settlement amounts as the last record rather than current receipts', () => {
   const paid = paidOrder()
-  const confirmed = parseOrder({ ...paid, phase: 'paid', payment: { ...paid.payment, state: 'withdrawn', earned: paid.payment.total, withdrawn: paid.payment.total } })
+  const confirmed = parseOrder({ ...paid, phase: 'paid', payment: { ...paid.payment, state: 'withdrawn', earned: paid.payment.total, withdrawn: paid.payment.total,
+    settlement: { earned: paid.payment.total, withdrawn: paid.payment.total, refunded: '0', publication: { state: 'final_earned', total_amount: paid.payment.total, economic_cutoff: 30, availability_risk: null } } } })
   const uncertain = parseOrder({ ...confirmed, phase: 'reconciling', evidence: 'none', payment: { ...confirmed.payment, state: 'unknown' } })
-  assert.equal(settlementAmountsLabel(confirmed), '已赚取 / 已提款 / 已退款')
-  assert.equal(settlementAmountsLabel(uncertain), '上次记录（赚取 / 提款 / 退款，到账待确认）')
+  assert.equal(settlementAmountsLabel(confirmed, 'order'), '本单已赚取 / 已退款')
+  assert.equal(settlementAmountsLabel(confirmed, 'budget'), '预算累计赚取 / 提款 / 退款')
+  assert.equal(settlementAmountsLabel(uncertain, 'order'), '本单上次记录（赚取 / 退款，当前待确认）')
+  assert.equal(settlementAmountsLabel(uncertain, 'budget'), '预算上次记录（赚取 / 提款 / 退款，到账待确认）')
   assert.equal(uncertain.payment.withdrawn, confirmed.payment.withdrawn)
-  assert.equal(settlementAmountsLabel({ ...confirmed, phase: 'failed' }), settlementAmountsLabel(uncertain))
-  assert.equal(settlementAmountsLabel({ ...confirmed, payment: { ...confirmed.payment, state: 'failed' } }), settlementAmountsLabel(uncertain))
+  assert.equal(settlementAmountsLabel({ ...confirmed, phase: 'failed' }, 'budget'), settlementAmountsLabel(uncertain, 'budget'))
+  assert.equal(settlementAmountsLabel({ ...confirmed, payment: { ...confirmed.payment, state: 'failed' } }, 'order'), settlementAmountsLabel(uncertain, 'order'))
+  assert.equal(publicationLabel(confirmed), '本批约定费用已赚取')
+  assert.equal(publicationLabel(uncertain), '批次状态待确认，请检查原交易')
+  assert.equal(publicationLabel({ ...confirmed, phase: 'failed' }), publicationLabel(uncertain))
+  assert.equal(publicationLabel({ ...confirmed, payment: { ...confirmed.payment, settlement: null } }), '本单费用已赚取')
 })
 
 test('a received file is saved only after exact content, length, name and digest agree', async () => {
@@ -66,6 +75,20 @@ test('a received file is saved only after exact content, length, name and digest
   assert.throws(() => parseReceived({ ...received, name: '../file' }, 131072))
   assert.throws(() => parseReceived({ ...received, content_base64: undefined }, 131072))
   assert.throws(() => fromBase64('Zh=='))
+})
+
+test('settled publication preserves partial earnings and refunds without claiming recovery material stayed private', () => {
+  for (const earned of ['0', '3']) {
+    const refunded = earned === '0' ? '10' : '7'
+    const settled = parseOrder({ ...paidOrder(), phase: 'refunded', payment: { ...paidOrder().payment,
+      state: 'refunded', delivery_fee: '10', total: '10', earned, refunded,
+      settlement: { earned, withdrawn: '0', refunded, publication: { state: 'final_settled', total_amount: '10', economic_cutoff: 30, availability_risk: null } } } })
+    assert.equal(settled.payment.earned, earned)
+    assert.equal(settled.payment.refunded, refunded)
+    assert.equal(publicationLabel(settled), '本批款项已赚取或退款，恢复材料可能已公开')
+    assert.throws(() => parseOrder({ ...settled, payment: { ...settled.payment, settlement: { ...settled.payment.settlement,
+      publication: { state: 'invented_terminal', total_amount: '10', economic_cutoff: 30, availability_risk: null } } } }))
+  }
 })
 
 test('file retrieval permits charity senders and accepted receivers but never paid senders or providers', () => {
@@ -81,11 +104,76 @@ test('file retrieval permits charity senders and accepted receivers but never pa
 })
 
 const status: DeliveryStatus = { enabled: true, charity_enabled: true, paid_enabled: false, node_peer: source, wallet: { state: 'absent', address: null }, max_file_bytes: 130816, receiver_key: null }
-const draft: DeliveryDraft = { receiver_peer: receiver, provider_peer: provider, mode: 'charity', acceptance: 'recoverable', max_service_amount: '0', max_gas_amount: '0' }
+const draft: DeliveryDraft = { receiver_peer: receiver, provider_peer: provider, mode: 'charity', acceptance: 'recoverable', max_service_amount: '0', max_gas_amount: '0', budget_id: null }
 const file = { name: 'example.txt', size: content.length, arrayBuffer: async () => new Uint8Array(content).buffer }
 function connection(request: ReadyConnection['request']): ReadyConnection {
   return { generation: 1, entry: { kind: 'gateway', address: 'http://127.0.0.1:4790', device_id: source }, principal: { source: 'membership', can_manage: true, network_id: 'network', device_id: 'client', epoch: 1 }, info: { device_id: source, name: 'own Node', version: 'test', initialized: true, network_id: 'network' }, request, rpc: async () => { throw new Error('delivery must not use private RPC') }, subscribe: () => () => {}, isCurrent: () => true }
 }
+
+test('delivery refresh keeps read-only history and file access without requesting manager budgets', async () => {
+  const identity = { network_id: 'network', device_id: 'client', epoch: 1 }
+  const principals: ReadyConnection['principal'][] = [
+    { ...identity, source: 'membership', can_manage: false },
+    { ...identity, source: 'local_session', can_manage: false },
+    { ...identity, source: 'membership', can_manage: true },
+  ]
+  const budget = { budget_id: '88'.repeat(32), payer: `0x${'66'.repeat(20)}`, payee: `0x${'77'.repeat(20)}`, provider_peer: provider,
+    asset: `0x${'55'.repeat(20)}`, deposit: '10', free: '10', locked: '0', earned: '0', withdrawn: '0', refunded: '0', state: 'open', gas_cap: '0', ready_windows: [] }
+  const react = `
+    export const effects = [], updates = [];
+    export const useMemo = create => create();
+    export const useRef = current => ({ current });
+    export const useState = initial => [initial, value => updates.push(value)];
+    export const useEffect = effect => effects.push(effect);
+  `
+  for (const principal of principals) for (const history of [false, true]) {
+    const managing = principal.source === 'membership' && principal.can_manage
+    const key = `${principal.source}-${managing}-${history}`
+    const subject = new URL('./client.ts', import.meta.url); subject.searchParams.set('refresh-permissions', key)
+    const reactUrl = `data:text/javascript,${encodeURIComponent(react)}#${key}`
+    const hooks: { effects: (() => void | (() => void))[]; updates: unknown[] } = await import(reactUrl)
+    const loader = registerHooks({ resolve(specifier, context, nextResolve) {
+      return specifier === 'react' && context.parentURL === subject.href ? { url: reactUrl, shortCircuit: true } : nextResolve(specifier, context)
+    } })
+    let loaded: typeof import('./client.ts')
+    try { loaded = await import(subject.href) }
+    finally { loader.deregister() }
+    const calls: Record<string, unknown>[] = []
+    const readable = { ...order(), order_id: 'aa'.repeat(32) }
+    const nextStatus = { ...status, paid_enabled: !history }, nextOrders = history ? [paidOrder(), readable] : [readable]
+    const transport = connection(async (method, params = {}) => {
+      assert.equal(method, 'delivery'); calls.push(params)
+      switch (params.op) {
+        case 'status': return nextStatus
+        case 'list': return { orders: nextOrders }
+        case 'providers': return { providers: [] }
+        case 'budgets': if (!managing) throw new Error('budget permission denied'); return { budgets: [budget] }
+        case 'get': assert.equal(params.order_id, readable.order_id); return readable
+        case 'read': assert.equal(params.order_id, readable.order_id); return { name: readable.name, bytes: content.length, content_base64: toBase64(content), sha256: digest }
+        default: throw new Error('unexpected delivery request')
+      }
+    })
+    transport.principal = principal
+    const platform: Platform = {
+      storage: { getItem: () => null, setItem: () => { throw new Error('a read must not write storage') } },
+      onForeground: () => () => {}, foreground: () => false, self: 'test', saveRecovery: () => { throw new Error('unexpected recovery') },
+      get secure(): never { throw new Error('unexpected secure API') }, get transport(): never { throw new Error('unexpected transport') },
+      get outbox(): never { throw new Error('unexpected outbox') }, get notifier(): never { throw new Error('unexpected notifier') },
+      files: { pick: async () => null, save: async (bytes, name) => { assert.deepEqual(bytes, content); assert.equal(name, readable.name); return 'saved' } },
+    }
+    assert.equal(loaded.useDelivery(transport, platform).canManage, managing)
+    const cleanups = hooks.effects.map(effect => effect())
+    try {
+      await new Promise(resolve => setImmediate(resolve))
+      assert.deepEqual(calls, [{ op: 'status' }, { op: 'list' }, { op: 'providers' }, ...(managing ? [{ op: 'budgets' }] : [])])
+      assert.deepEqual(hooks.updates.slice(-4), [nextStatus, nextOrders, managing ? [budget] : [], ''])
+      const client = createDeliveryClient(transport, platform.storage)
+      assert.deepEqual(await client.get(readable.order_id), readable)
+      assert.equal(await client.save(readable, platform), 'saved')
+      assert.deepEqual(calls.slice(-2), [{ op: 'get', order_id: readable.order_id }, { op: 'read', order_id: readable.order_id }])
+    } finally { for (const cleanup of cleanups) cleanup?.() }
+  }
+})
 
 test('a lost prepare response reuses its persisted intent and confirm submits only that original id', async () => {
   const records = new Map<string, string>(), calls: Record<string, unknown>[] = []
@@ -131,7 +219,7 @@ test('charity resets strict mode and rejects every financial or strong proof fie
 test('preparing B cannot erase the unknown A intent and returning to A after restart reuses its id', async () => {
   const records = new Map<string, string>(), stored = new Map<string, DeliveryOrder>(), calls: Record<string, unknown>[] = []
   const storage = { getItem: (key: string) => records.get(key) ?? null, setItem: (key: string, value: string) => { records.set(key, value) } }
-  const paidDraft: DeliveryDraft = { ...draft, mode: 'paid', max_service_amount: '9007199254740993' }
+  const paidDraft: DeliveryDraft = { ...draft, mode: 'paid', max_service_amount: '9007199254740993', budget_id: '88'.repeat(32) }
   const paidStatus: DeliveryStatus = { ...status, paid_enabled: true, wallet: { state: 'unlocked', address: `0x${'66'.repeat(20)}` } }
   const transport = connection(async (_method, params = {}) => {
     calls.push(params)
@@ -201,7 +289,8 @@ test('only completed delivery or a full refund permits an explicit new paid orde
   paid.windows = paid.windows.map(window => ({ ...window, state: 'earned' }))
   assert.equal(canRestart(parseOrder(paid)), true)
   assert.equal(canRestart({ ...paid, payment: { ...paid.payment, state: 'unknown' } }), false)
-  assert.equal(canRestart({ ...paid, payment: { ...paid.payment, state: 'included' } }), false)
+  for (const state of ['submitted', 'included']) assert.throws(() => parseOrder({ ...paid, payment: { ...paid.payment, state } }), /\u72b6\u6001/)
+  assert.throws(() => parseOrder({ ...paid, phase: 'refundable' }), /\u72b6\u6001/)
   for (const phase of ['failed', 'prepared', 'partial', 'reconciling'] satisfies DeliveryOrder['phase'][]) assert.equal(canRestart({ ...paid, phase }), false)
   const refunded: DeliveryOrder = { ...paidOrder(), phase: 'refunded', payment: { ...paidOrder().payment, state: 'refunded', refunded: paid.payment.total } }
   assert.equal(canRestart(parseOrder(refunded)), true)
@@ -236,7 +325,7 @@ test('a record reads as file name and one plain line, and offers only what this 
 })
 
 test('without 实验功能 a send is free whatever mode the draft last held', () => {
-  const paid: DeliveryDraft = { receiver_peer: receiver, provider_peer: provider, mode: 'paid', acceptance: 'strict', max_service_amount: '5', max_gas_amount: '7' }
+  const paid: DeliveryDraft = { receiver_peer: receiver, provider_peer: provider, mode: 'paid', acceptance: 'strict', max_service_amount: '5', max_gas_amount: '7', budget_id: '88'.repeat(32) }
   assert.deepEqual(draftFor(paid, false), { ...paid, mode: 'charity', acceptance: 'recoverable' })
   assert.equal(draftFor(paid, true), paid)
 })
@@ -248,4 +337,69 @@ test('a file goes to my other computers without pasting, never to this one or a 
     { device_id: provider, kind: 'client' as const, name: 'Mac 上的 Chrome', manage: true },
   ]
   assert.deepEqual(receiverChoices(members, source).map(item => item.device_id), [receiver])
+})
+
+test('protected budgets enforce exact conservation and fixed roles at the shared boundary', () => {
+  const budget = { budget_id: '88'.repeat(32), payer: `0x${'66'.repeat(20)}`, payee: `0x${'77'.repeat(20)}`, provider_peer: provider,
+    asset: `0x${'55'.repeat(20)}`, deposit: '100', free: '66', locked: '0', earned: '34', withdrawn: '17', refunded: '0', state: 'open', gas_cap: '9007199254740993', ready_windows: [] }
+  assert.equal(parseBudgets({ budgets: [budget] })[0].gas_cap, '9007199254740993')
+  assert.throws(() => parseBudgets({ budgets: [{ ...budget, free: '67' }] }))
+  assert.throws(() => parseBudgets({ budgets: [{ ...budget, withdrawn: '35' }] }))
+  assert.throws(() => parseBudgets({ budgets: [{ ...budget, payee: budget.payer }] }))
+  assert.throws(() => parseBudgets({ budgets: [budget, budget] }))
+  assert.throws(() => parseOrder({ ...paidOrder(), acceptance: 'strict' }))
+})
+
+test('protected preparation rejects missing budgets or Strict before any request; a two-order confirmation preserves both exact authorizations', async () => {
+  let requests = 0
+  const a = paidOrder(), b = { ...paidOrder(), order_id: '99'.repeat(32), intent_id: '00000000-0000-4000-8000-000000000002' }
+  const client = createDeliveryClient(connection(async (_method, params = {}) => { requests++; assert.equal(params.op, 'confirm_batch'); return { orders: [a, b].map(order => ({ ...order, phase: 'funding_pending' })) } }),
+    { getItem: () => null, setItem: () => {} })
+  const paidStatus: DeliveryStatus = { ...status, paid_enabled: true }
+  await assert.rejects(client.prepare({ ...draft, mode: 'paid' }, file, paidStatus), /预付预算/)
+  await assert.rejects(client.prepare({ ...draft, mode: 'paid', budget_id: a.payment.budget_id, acceptance: 'strict' }, file, paidStatus), /Strict/)
+  assert.equal(requests, 0)
+  const confirmed = await client.confirmBatch([a, b])
+  assert.equal(confirmed.length, 2); assert.equal(confirmed[0].payment.budget_id, a.payment.budget_id); assert.equal(requests, 1)
+  await assert.rejects(client.confirmBatch([a, { ...b, payment: { ...b.payment, budget_id: 'aa'.repeat(32) } }]), /同一预算/)
+  await assert.rejects(client.confirmBatch([a, a]), /同一预算/)
+  assert.equal(requests, 1)
+})
+
+test('the receiver authorizes both original orders together and groups only two live windows from one budget', async () => {
+  const a: DeliveryOrder = { ...paidOrder(), role: 'receiver', phase: 'funded' }
+  const b: DeliveryOrder = { ...a, order_id: '99'.repeat(32), intent_id: '00000000-0000-4000-8000-000000000002' }
+  let requests = 0
+  const client = createDeliveryClient(connection(async (_method, params = {}) => {
+    requests++
+    assert.equal(params.op, 'accept_batch')
+    assert.deepEqual(params.order_ids, [a.order_id, b.order_id])
+    return { orders: [a, b] }
+  }), { getItem: () => null, setItem: () => {} })
+  assert.deepEqual(receivingBatches([a, b, order()]), [[a.payment.budget_id, [a, b]]])
+  assert.deepEqual(receivingBatches([a, { ...b, payment: { ...b.payment, budget_id: 'aa'.repeat(32) } }]), [])
+  assert.deepEqual(receivingBatches([a, { ...b, phase: 'failed' }]), [])
+  assert.deepEqual(await client.acceptBatch([a, b]), [a, b])
+  await assert.rejects(client.acceptBatch([a, a]), /同时接收/)
+  await assert.rejects(client.acceptBatch([a, { ...b, phase: 'failed' }]), /同时接收/)
+  assert.equal(requests, 1)
+})
+
+test('the provider field offers announced devices: paid delivery those that quote a price, free delivery all', async () => {
+  const offer = { settlement: { chain_id: 31337, escrow: `0x${'66'.repeat(20)}`, asset: `0x${'55'.repeat(20)}` }, price: '9007199254740993' }
+  const asked: unknown[] = []
+  const client = createDeliveryClient(connection(async (method, params) => {
+    asked.push([method, params])
+    return { providers: [
+      { device_id: provider, paid: true, offer, last_seen_ms: 5 },
+      { device_id: receiver, paid: false, offer: null, last_seen_ms: 3 },
+      { device_id: 'not-a-device', paid: false, offer: null, last_seen_ms: 1 },
+      { device_id: source, paid: true, offer: { ...offer, price: '1.5' }, last_seen_ms: 2 },
+    ] }
+  }), { getItem: () => null, setItem: () => {} })
+  const providers = await client.providers()
+  assert.deepEqual(asked, [['delivery', { op: 'providers' }]])
+  assert.deepEqual(providers, [{ device_id: provider, paid: true, offer, last_seen_ms: 5 }, { device_id: receiver, paid: false, offer: null, last_seen_ms: 3 }], 'a malformed record drops only itself')
+  assert.deepEqual(providerChoices(providers, 'paid').map(item => item.device_id), [provider])
+  assert.deepEqual(providerChoices(providers, 'charity').map(item => item.device_id), [provider, receiver])
 })

@@ -1,3 +1,4 @@
+import { completeHistory } from './history-fixture.ts'
 import assert from "node:assert/strict"
 import test from "node:test"
 import { botModelRows, firedAt, formatIn, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleDetail, scheduleFrequency, scheduleName, scheduleTrigger, sortSchedules } from "./bot-settings.ts"
@@ -223,7 +224,7 @@ test('Memory state, result and metadata fail closed on malformed or mismatched r
   assert.throws(() => parseMemoryControlResult({ ...result, operation_id: 'f'.repeat(64) }, 'memory', operationId))
   assert.throws(() => parseMemoryControlResult({ ...result, current: memoryState() }, 'memory', operationId))
   assert.throws(() => parseMemoryControlResult({ ...result, current: { ...result.current, memory_id: 'other' } }, 'memory', operationId))
-  for (const invalid of [{ control_revision: undefined }, { control_revision: -1 }, { control_revision: 0x1_0000_0000 }, { source_event_hash: null }, { origin: 'import' }, { epoch: 0 }, { epoch: 2 }, { epoch: 12 }]) {
+  for (const invalid of [{ control_revision: undefined }, { control_revision: -1 }, { control_revision: 0x1_0000_0000 }, { source_event_hash: null }, { origin: 'import' }, { origin: 'review' }, { epoch: 0 }, { epoch: 2 }, { epoch: 12 }]) {
     assert.throws(() => parseMemoryControlResult({ ...result, current: { ...result.current, metadata: { ...result.current.metadata, ...invalid } } }, 'memory', operationId))
   }
   assert.throws(() => parseMemoryControlResult({ ...result, state: 'success' }, 'memory', operationId))
@@ -309,7 +310,8 @@ test("changes sit after the reply to their message, else after the message, else
 
 test("conversation snapshots parse bot changes strictly", () => {
   const base = {
-    conversation: { conversation_id: "chat", title: "t", owner: null, owner_epoch: 0 }, messages: [],
+    history_authority: "authority", history: completeHistory(),
+  conversation: { conversation_id: "chat", title: "t", owner: null, owner_epoch: 0 }, messages: [],
     works: [], deliveries: [], checks: [], local_node: "n", questions: [], sessions: [],
     sent: [], sent_coverage: { scope: 'main', omitted_unknown: 0 }, overwritten: [],
     bot_settings: {
@@ -358,7 +360,8 @@ test("conversation snapshots parse bot changes strictly", () => {
 
 test("a change another device replaced reads as one line and asks for it back the usual way", () => {
   const base = {
-    conversation: { conversation_id: "chat", title: "t", owner: null, owner_epoch: 0 }, messages: [], works: [], deliveries: [], checks: [], local_node: "n",
+    history_authority: "authority", history: completeHistory(),
+  conversation: { conversation_id: "chat", title: "t", owner: null, owner_epoch: 0 }, messages: [], works: [], deliveries: [], checks: [], local_node: "n",
     questions: [], sessions: [], sent: [], sent_coverage: { scope: 'main', omitted_unknown: 0 }, changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } },
   }
   assert.deepEqual(parseConversation(base, "chat").overwritten, [])

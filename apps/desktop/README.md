@@ -1,57 +1,23 @@
-# vibeface-desktop
+# Vibeface Desktop
 
-Electron 宿主：一个受信任的本机启动器，加上一个只加载 Core 自己提供界面的业务窗口。
+`vibeface-desktop` 是 GPUI 原生客户端。`src/views` 和 `src/widgets` 绘制业务界面，`crates/client` 负责个人网络身份、加密连接、订阅和耐久 outbox，`src/host` 管理平台集成和可选本机 Node。Web 与 Mobile 独立构建。
 
-## 两个窗口
+启动窗口、扫描和选择 Node 不初始化或启动 Node。只有明确启动或安装后台节点时才改变本机运行状态。退出只关闭 App 自己持有的 Core Child；连接已有服务不取得停止权。
 
-- **单窗口客户端**（`vibeface-app://app/`）：内置 React 业务界面；本机节点管理在 App 设置 `/settings/desktop-node`，经受限 client preload 调用主进程。
-  负责选择数据目录、初始化、启动与停止本机 Core、仅连接已有服务、打开业务窗口和桌面设置。
-- **业务窗口**：`sandbox`、`contextIsolation` 为真，`nodeIntegration` 为假，**没有 preload，也没有任何原生桥**。
-  它加载 Core 在 `local_listen`（默认 `http://127.0.0.1:4791`）提供的真实界面。
-  通知、文件选择和下载走 W3C API，由主进程的权限与下载钩子接住。
-
-## 业务地址如何确定
-
-`vibeface-core --control` 的 `access` 返回的 URL 建立在公开监听端口上（`http://localhost:4790`），
-但 `/api/local/exchange` 和本机会话 Cookie 只存在于 `local_listen` 监听器，并且它按字面 `Host` 匹配。
-`src/main/business-url.ts` 因此把 `access` 的路径与一次性 `#local=` / `#bootstrap=` 片段原样搬到
-`inspect.local_listen` 报告的私有 origin 上，并校验回环地址与 `node=` 对应的设备。
-片段不写入设置、不打日志。
-
-## 生命周期
-
-`OwnedChild` 与 `Attached` 是两种不同的类型，而不是 pid 加布尔值。
-
-- 自己启动的 Core 带 `--desktop-parent-stdin`，父进程持有它的 stdin。退出或崩溃产生 EOF，Core 正常关闭；
-  若 EOF 超时，会按 `SIGTERM -> SIGKILL` 分阶段等待确认退出；只有确认退出才释放 owned 状态。
-- 仅连接的服务永远不会被停止，退出 Vibeface 不影响它。
-- 启动前先 `inspect`；目录上已有运行中的 Core 时只提示改用仅连接，不接管、不清理任何已有数据。
-
-## 邀请激活时序
-
-`open-url`、`second-instance` 和初始 `argv` 只接受解析后的 `join` 邀请，先在内存队列里去重并限长缓存。
-队列在 `app.whenReady()` 与 `coreSession.restore()` 完成后统一消费；若当时还没连上本机 Core，邀请会保留并在会话变化后重试，不写入设置文件。
-
-## 命令
-
-```
-pnpm --dir apps/desktop typecheck   # tsconfig.json（主进程/preload/测试）
-pnpm --dir apps/desktop test        # vitest
-pnpm --dir apps/desktop build       # dist/main/index.cjs, dist/preload/client.cjs
-pnpm --dir apps/desktop package     # scripts/build-desktop.mjs（由交付侧拥有）
-node apps/desktop/scripts/make-icons.mjs   # 仅 macOS：从品牌矢量重新生成已提交的图标
+```sh
+cargo test -p vibeface-desktop --features native-ui-tests --locked
+cargo clippy -p vibeface-desktop --all-targets --locked -- -D warnings
+cargo run -p vibeface-desktop -- --controlled-fixture --profile-dir /absolute/task-profile --runtime-dir /absolute/sealed-runtime
+node scripts/build-desktop.mjs --target <target> --runtime-dir <runtime> --runtime-archive <archive> --output <fresh-output>
+node scripts/verify-desktop.mjs --target <target> --input <output>
 ```
 
-## 运行时与开关
+桌面构建固定使用已验证可编译的 Rust 1.98.1，独立 Core/CLI 的最低版本声明不变。图形依赖的工具链和 hosted runner 系统库由 [native-desktop action](../../.github/actions/native-desktop/action.yml) 固定。不要按 Core 的最低 Rust 版本推断 GPUI 已可编译。构建包保留 macOS ARM64 DMG/ZIP、Windows x64 当前用户安装器/ZIP、Linux x64 和 ARM64 AppImage/ZIP。封存 Core/CLI 的字节与摘要不能被桌面签名重写。
 
-打包后运行时固定为 `process.resourcesPath/runtime`，其中的 `vibeface-core[.exe]` 是唯一可执行的程序。
-下列变量**只在未打包时**生效，打包产物不会读取它们：
+真实窗口检查使用现有 e2e runner 的 `tests/e2e/e2e.native-desktop.config.ts`，其确定性 helper 调用 `scripts/e2e-desktop.mjs`。通过 `VIBEFACE_E2E_DESKTOP_APP` 和 `VIBEFACE_E2E_DESKTOP_RUNTIME` 指定打包后的程序及同源运行包。它使用独立 profile 和显式 `--controlled-fixture`，按 PID 定位 OS 窗口，发送原生键盘输入与 Enter、保存窗口 PNG，再核对 GPUI 输入/焦点/动作回执、正常退出和无自动启动的 Node。普通 Rust 单测不证明图形、IME、无障碍、通知送达或各平台完整功能验收通过。完整验收范围见 [GPUI 设计](../../packages/docs/design/gpui-desktop.md)。
 
-| 变量 | 作用 |
-|------|------|
-| `VIBEFACE_DESKTOP_RUNTIME` | 未打包时的运行时目录 |
-| `VIBEFACE_DESKTOP_FAKE_CONTROL` | 测试夹具替代 `vibeface-core --control` |
-| `VIBEFACE_DESKTOP_FAKE_CORE` | 测试夹具替代常驻 Core |
+旧页面私钥不能导出为原生身份。通过本人管理设备邀请或显式恢复加入，不自动删除旧 profile、撤销旧成员或改签未确认写入。
 
-命令行：`--profile-dir <绝对路径>` 把设置、Chromium 配置和自己启动的 Core 与真实用户目录隔离；
-`--attach` 让这次运行只连接，不启动也不停止任何 Core。
+`--runtime-dir` 只允许与 `--controlled-fixture` 一起使用；安装包默认按各平台固定的相对位置读取封存运行包。受控模式不带 `--acceptance-report` 时打开产品界面供人工查看；正式 OS 输入测试由 e2e helper 提供独立 profile 和两阶段回执路径。这个测试只证明窗口、输入动作、PNG 和退出行为，不代表完整聊天业务、IME 或性能验收。
+
+会话协议改为 19 分区的有界历史读取，不能把 `conversation` 的首个响应当作全部历史。`src/views/history.rs` 和 `tests/native_ui_history.rs` 定义覆盖状态、依据失效、旧页合并与晚到响应的边界；协议见[会话历史分页](../../packages/docs/node-protocol.md#会话历史分页)。原生页面接线、读取更多入口与滚动锚点仍须通过当前源码和真实窗口验收，模块单测存在不表示这部分界面已经完成。

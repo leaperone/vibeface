@@ -24,8 +24,9 @@ class LanBrowserModule : Module() {
    * Older Android resolves one service at a time, once.
    * ponytail: an address change shows up when the Node's hourly name change does; resolve on a beat if that is too slow.
    */
-  private val waiting = ArrayDeque<NsdServiceInfo>()
-  private var resolving = false
+  private val waiting = ArrayDeque<Pair<DiscoveryLifetime.Ticket, NsdServiceInfo>>()
+  private val lifetime = DiscoveryLifetime()
+  private var resolving: DiscoveryLifetime.Ticket? = null
   private val executor = Executors.newSingleThreadExecutor()
 
   override fun definition() = ModuleDefinition {
@@ -44,13 +45,14 @@ class LanBrowserModule : Module() {
       // Wi-Fi drops multicast, mDNS included, unless an app holds this.
       val wifi = context.getSystemService(Context.WIFI_SERVICE) as WifiManager
       multicast = wifi.createMulticastLock("vibeface-lan").apply { setReferenceCounted(false); acquire() }
+      val session = lifetime.start()
       val listener = object : NsdManager.DiscoveryListener {
         override fun onDiscoveryStarted(serviceType: String) {}
         override fun onDiscoveryStopped(serviceType: String) {}
         override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {}
         override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {}
-        override fun onServiceFound(info: NsdServiceInfo) = resolve(info)
-        override fun onServiceLost(info: NsdServiceInfo) = lost(info.serviceName)
+        override fun onServiceFound(info: NsdServiceInfo) = resolve(session, info)
+        override fun onServiceLost(info: NsdServiceInfo) = lost(session, info.serviceName)
       }
       discovery = listener
       nsd.discoverServices("_vibeface._udp", NsdManager.PROTOCOL_DNS_SD, listener)
@@ -61,6 +63,7 @@ class LanBrowserModule : Module() {
     synchronized(lock) {
       val listener = discovery ?: return
       discovery = null
+      lifetime.stop()
       runCatching { nsd.stopServiceDiscovery(listener) }
       if (Build.VERSION.SDK_INT >= 34) callbacks.values.forEach { runCatching { nsd.unregisterServiceInfoCallback(it) } }
       callbacks.clear()
@@ -71,59 +74,74 @@ class LanBrowserModule : Module() {
     }
   }
 
-  private fun resolve(info: NsdServiceInfo) {
+  private fun resolve(session: Long, info: NsdServiceInfo) {
     synchronized(lock) {
-      if (discovery == null) return
+      val ticket = lifetime.find(session, info.serviceName) ?: return
       if (Build.VERSION.SDK_INT < 34) {
-        waiting.addLast(info)
+        waiting.addLast(ticket to info)
         next()
         return
       }
       if (callbacks.containsKey(info.serviceName)) return
       val callback = object : NsdManager.ServiceInfoCallback {
-        override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) {}
-        override fun onServiceUpdated(service: NsdServiceInfo) = put(service.serviceName, service.attributes["t"], service.hostAddresses, service.port)
-        override fun onServiceLost() = lost(info.serviceName)
+        override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) {
+          synchronized(lock) { if (lifetime.current(ticket)) lost(session, ticket.name) }
+        }
+        override fun onServiceUpdated(service: NsdServiceInfo) = put(ticket, service.attributes["t"], service.hostAddresses, service.port)
+        override fun onServiceLost() {
+          synchronized(lock) { if (lifetime.current(ticket)) lost(session, ticket.name) }
+        }
         override fun onServiceInfoCallbackUnregistered() {}
       }
       callbacks[info.serviceName] = callback
-      nsd.registerServiceInfoCallback(info, executor, callback)
+      try { nsd.registerServiceInfoCallback(info, executor, callback) }
+      catch (failure: RuntimeException) { lost(session, info.serviceName) }
     }
   }
 
   /** Runs under `lock`. */
   @Suppress("DEPRECATION")
   private fun next() {
-    if (resolving || discovery == null) return
-    val info = waiting.removeFirstOrNull() ?: return
-    resolving = true
-    nsd.resolveService(info, object : NsdManager.ResolveListener {
-      override fun onResolveFailed(service: NsdServiceInfo, errorCode: Int) = done()
-      override fun onServiceResolved(service: NsdServiceInfo) {
-        put(service.serviceName, service.attributes["t"], listOfNotNull(service.host), service.port)
-        done()
+    if (resolving != null || discovery == null) return
+    val (ticket, info) = waiting.removeFirstOrNull() ?: return
+    if (!lifetime.current(ticket)) { next(); return }
+    resolving = ticket
+    try { nsd.resolveService(info, object : NsdManager.ResolveListener {
+      override fun onResolveFailed(service: NsdServiceInfo, errorCode: Int) {
+        synchronized(lock) { if (lifetime.current(ticket)) lifetime.lose(ticket.session, ticket.name) }
+        done(ticket)
       }
-    })
+      override fun onServiceResolved(service: NsdServiceInfo) {
+        put(ticket, service.attributes["t"], listOfNotNull(service.host), service.port)
+        done(ticket)
+      }
+    }) } catch (failure: RuntimeException) {
+      if (lifetime.current(ticket)) lifetime.lose(ticket.session, ticket.name)
+      done(ticket)
+    }
   }
 
-  private fun done() {
+  private fun done(ticket: DiscoveryLifetime.Ticket) {
     synchronized(lock) {
-      resolving = false
+      if (resolving != ticket) return
+      resolving = null
       next()
     }
   }
 
-  private fun put(name: String, tag: ByteArray?, hosts: List<InetAddress>, port: Int) {
+  private fun put(ticket: DiscoveryLifetime.Ticket, tag: ByteArray?, hosts: List<InetAddress>, port: Int) {
     synchronized(lock) {
       val addrs = hosts.filterIsInstance<Inet4Address>().mapNotNull { it.hostAddress }.map { "$it:$port" }
-      if (discovery == null || tag == null || addrs.isEmpty()) return
-      found[name] = mapOf("tag" to String(tag, Charsets.UTF_8), "addrs" to addrs)
+      if (!lifetime.current(ticket) || tag == null || addrs.isEmpty()) return
+      found[ticket.name] = mapOf("tag" to String(tag, Charsets.UTF_8), "addrs" to addrs)
       emit()
     }
   }
 
-  private fun lost(name: String) {
+  private fun lost(session: Long, name: String) {
     synchronized(lock) {
+      val ticket = lifetime.lose(session, name) ?: return
+      waiting.removeAll { it.first == ticket }
       if (Build.VERSION.SDK_INT >= 34) callbacks.remove(name)?.let { runCatching { nsd.unregisterServiceInfoCallback(it) } }
       if (found.remove(name) != null) emit()
     }

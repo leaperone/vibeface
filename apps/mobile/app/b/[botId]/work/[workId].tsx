@@ -10,7 +10,7 @@ import { agentLaneLabels, fixOnDevice, fixOnDeviceLabel, followUp, followUpCopy,
 import { messageOf, providerNames } from '@vibeface/client/lib/node.ts'
 import { projectName, workApproval } from '@vibeface/client/workspace/questions.ts'
 import { workChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
-import { ActionButton } from '@/components/action'
+import { ActionButton, ErrorText } from '@/components/action'
 import { CopyableId, Details, EmptyState, providerIcons, toneText, type Tone } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
@@ -24,7 +24,6 @@ import { useChatChrome } from '@/features/chat/chrome'
 import { InputOptions, InputStatus } from '@/features/workspace/workspace'
 import type { InputIntent, WorkDetail } from '@vibeface/client/workspace/types.ts'
 import type { Attachment } from '@/data/types'
-import { ErrorText } from '@/components/action'
 
 const tone = (state: string): Tone => state === 'failed' ? 'danger' : state === 'completed' ? 'success' : ['awaiting_confirmation', 'stop_timed_out'].includes(state) ? 'warning' : 'neutral'
 type ComposerDraft = { text: string; files: Attachment[]; intent: InputIntent; workId: string; conversationId: string }

@@ -161,13 +161,13 @@ impl Runtime {
                 Err(error) => error,
             },
             Err(error) => {
-                let store = self.store.lock().await;
-                let not_started = !store.work_native_submission_reserved(&work.work_id)?
-                    && store.work_record(&work.work_id)?.is_some_and(|record| {
+                let (work_id, original_thread) = (work.work_id.clone(), work.thread.clone());
+                let not_started = self.store.call("executor.not_started", move |store| Ok( !store.work_native_submission_reserved(&work_id)?
+                    && store.work_record(&work_id)?.is_some_and(|record| {
                         matches!(record.state, crate::work::WorkState::Accepted)
-                            || matches!(&record.state, crate::work::WorkState::Starting { thread: Some(thread) } if work.thread.as_ref() == Some(thread))
-                    });
-                drop(store);
+                            || matches!(&record.state, crate::work::WorkState::Starting { thread: Some(thread) } if original_thread.as_ref() == Some(thread))
+                    })
+                )).await?;
                 if !not_started {
                     return Err(error
                         .context("native submission is unconfirmed; query the original work ID"));

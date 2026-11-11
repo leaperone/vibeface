@@ -10,6 +10,7 @@ import { caret } from '@/components/ui/input'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import type { Attachment } from '@/data/types'
+import { privateFiles } from '@/platform/files'
 import { ChatMaterial, type ChatChrome } from './chrome'
 
 type Props = {
@@ -28,6 +29,7 @@ type Props = {
   children?: ReactNode
   /** The bot's accent for the live send button; the neutral fill without it. */
   tint?: { fill: string; ink: string }
+  /** A small control beside the send button, inside the box. */
   target?: ReactNode
   sendLabel?: string
   label?: string
@@ -53,20 +55,30 @@ export function Composer({ chrome, value, onChange, files, onFiles, attachmentSc
     const scope = latest.current.attachmentScope, request = ++latest.current.generation
     const current = () => latest.current.mounted && latest.current.enabled && latest.current.attachmentScope === scope && latest.current.generation === request
     try {
-      let added: Attachment[]
-      if (source === 'photos') {
-        const picked = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], allowsMultipleSelection: true, quality: 1, preferredAssetRepresentationMode: ImagePicker.UIImagePickerPreferredAssetRepresentationMode.Current })
-        if (picked.canceled) return
-        added = picked.assets.map((asset) => {
-          const file = new File(asset.uri)
-          return { uri: asset.uri, name: asset.fileName || file.name, size: asset.fileSize ?? file.size, mimeType: asset.mimeType || file.type || null }
-        })
-      } else {
-        const picked = await DocumentPicker.getDocumentAsync({ multiple: true, copyToCacheDirectory: true })
-        if (picked.canceled) return
-        added = picked.assets.map((asset) => ({ uri: asset.uri, name: asset.name, size: asset.size ?? null, mimeType: asset.mimeType ?? null }))
-      }
-      if (current()) latest.current.onFiles([...latest.current.files, ...added])
+      await privateFiles.run(async (fileCurrent) => {
+        const sources: string[] = [], added: Attachment[] = []
+        try {
+          if (source === 'photos') {
+            const picked = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], allowsMultipleSelection: true, quality: 1, preferredAssetRepresentationMode: ImagePicker.UIImagePickerPreferredAssetRepresentationMode.Current })
+            if (picked.canceled) return
+            sources.push(...picked.assets.map(asset => asset.uri))
+            if (!current() || !fileCurrent()) return
+            for (const asset of picked.assets) {
+              const file = new File(asset.uri)
+              added.push({ uri: privateFiles.retain(asset.uri).uri, name: asset.fileName || file.name, size: asset.fileSize ?? file.size, mimeType: asset.mimeType || file.type || null })
+            }
+          } else {
+            const picked = await DocumentPicker.getDocumentAsync({ multiple: true, copyToCacheDirectory: true })
+            if (picked.canceled) return
+            sources.push(...picked.assets.map(asset => asset.uri))
+            if (!current() || !fileCurrent()) return
+            for (const asset of picked.assets) added.push({ uri: privateFiles.retain(asset.uri).uri, name: asset.name, size: asset.size ?? null, mimeType: asset.mimeType ?? null })
+          }
+          if (current()) latest.current.onFiles([...latest.current.files, ...added])
+          else for (const file of added) privateFiles.release(file.uri)
+        } catch (cause) { for (const file of added) privateFiles.release(file.uri); throw cause }
+        finally { for (const uri of sources) privateFiles.releasePicker(uri) }
+      })
     } catch (error) {
       if (current()) Alert.alert('未能添加附件', error instanceof Error ? error.message : '请重试，或选择其他文件。')
     } finally {
@@ -104,20 +116,19 @@ export function Composer({ chrome, value, onChange, files, onFiles, attachmentSc
     {files.length ? <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerClassName="gap-2 px-3 pt-3">
       {files.map((file, index) => <View key={`${file.uri}:${index}`} className="max-w-48 flex-row items-center rounded-full bg-muted ps-3">
         <Text numberOfLines={1} className="shrink text-meta">{file.name}</Text>
-        <Pressable accessibilityRole="button" accessibilityLabel={`移除 ${file.name}`} hitSlop={6} className="size-8 items-center justify-center" onPress={() => onFiles(files.filter((_, at) => at !== index))}>
+        <Pressable accessibilityRole="button" accessibilityLabel={`移除 ${file.name}`} hitSlop={6} className="size-8 items-center justify-center" onPress={() => { try { privateFiles.release(file.uri); onFiles(files.filter((_, at) => at !== index)) } catch (cause) { Alert.alert('未能移除附件', cause instanceof Error ? cause.message : '请重试。') } }}>
           <Icon as={X} className="size-3.5" />
         </Pressable>
       </View>)}
     </ScrollView> : null}
     {ios ? <View className="min-h-13 flex-row items-end p-1">
-      {input}<View className="flex-row gap-1">{controls}</View>
+      {input}<View className="flex-row gap-1">{target}{controls}</View>
     </View> : <>
       {input}
-      <View className="flex-row items-center justify-between ps-0.5 pe-1.5 pb-1.5">{attach}{controls}</View>
+      <View className="flex-row items-center justify-between ps-0.5 pe-1.5 pb-1.5"><View className="flex-row items-center">{attach}{target}</View>{controls}</View>
     </>}
   </>
   return <View pointerEvents={ios ? 'box-none' : undefined} className={ios ? 'gap-2 px-4 pb-2' : 'gap-2 bg-background px-4 pb-3'}>
-    {target ? <View className="w-full max-w-3xl self-center">{target}</View> : null}
     {ios ? <View pointerEvents="box-none" className="w-full max-w-3xl flex-row items-end gap-2 self-center">
       <ChatMaterial chrome={chrome} className="size-13">{attach}</ChatMaterial>
       <ChatMaterial chrome={chrome} className="min-w-0 flex-1">{box}</ChatMaterial>

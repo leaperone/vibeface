@@ -396,8 +396,16 @@ impl CursorExecutor {
             );
             return Ok(owner);
         }
-        let projections = node.store.lock().await.works(network, &work.conversation)?;
-        let mut by_id: HashMap<_, _> = projections
+        let projections = {
+            let network = network.to_owned();
+            let conversation = work.conversation.to_owned();
+            node.store
+                .call("cursor.works", move |store| {
+                    store.works(&network, &conversation)
+                })
+                .await
+        }?;
+        let by_id: HashMap<_, _> = projections
             .into_iter()
             .map(|projection| (projection.work_id.clone(), projection))
             .collect();
@@ -410,10 +418,10 @@ impl CursorExecutor {
                 "Cursor continuation lineage contains a cycle"
             );
             let projection = by_id
-                .remove(&previous)
+                .get(&previous)
                 .context("continued Cursor work is not on this device")?;
             root = projection.work_id.clone();
-            next = projection.continues;
+            next = projection.continues.clone();
         }
         let workspace = self
             .owner_for_work(&root)
@@ -445,7 +453,15 @@ impl CursorExecutor {
         work_id: &str,
         result: std::result::Result<vibeface_bridge::agent::AgentResult, AgentRunError>,
     ) {
-        let record = match node.store.lock().await.work_record(work_id) {
+        let stored = {
+            let work_id = work_id.to_owned();
+            node.store
+                .call("cursor.work_record", move |store| {
+                    store.work_record(&work_id)
+                })
+                .await
+        };
+        let record = match stored {
             Ok(Some(record)) => record,
             Ok(None) => return,
             Err(error) => {
@@ -502,7 +518,10 @@ impl CursorExecutor {
         cancel: watch::Receiver<bool>,
     ) {
         let WorkSpec {
-            work_id, prompt, ..
+            work_id,
+            prompt,
+            conversation,
+            ..
         } = work;
         let bridge = match self.bridge() {
             Ok(bridge) => bridge,
@@ -535,9 +554,8 @@ impl CursorExecutor {
                     .context("Node closed while recording Cursor agent")?;
                 let stopped = node
                     .store
-                    .lock()
-                    .await
-                    .stop_requests()?
+                    .call("cursor.stop_requests", move |store| store.stop_requests())
+                    .await?
                     .into_iter()
                     .any(|request| request.work_id == persist_work);
                 ensure!(!stopped, "Cursor work was stopped before Send");
@@ -597,6 +615,7 @@ impl CursorExecutor {
             let node = progress_node.clone();
             let network = progress_network.clone();
             let work_id = progress_work.clone();
+            let conversation = conversation.clone();
             let text = progress_text.clone();
             async move {
                 let Some(node) = node.upgrade() else {
@@ -635,7 +654,7 @@ impl CursorExecutor {
                 let target_node = node.identity.device_id()?;
                 node.publish_progress(
                     &network,
-                    json!({"type":"native_progress","conversation_id":node.store.lock().await.work_record(&work_id)?.map(|r| r.conversation).unwrap_or_default(),"work_id":work_id,"target_node":target_node,"sequence":node.progress_sequence.fetch_add(1, Ordering::Relaxed)+1,"progress":update}),
+                    json!({"type":"native_progress","conversation_id":conversation,"work_id":work_id,"target_node":target_node,"sequence":node.progress_sequence.fetch_add(1, Ordering::Relaxed)+1,"progress":update}),
                 );
                 Ok(())
             }
@@ -872,20 +891,18 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::{
+        access as test_access, initialize_node, join_network, manager_settings, open_node,
+        provider_work, signed_main_input,
+    };
     use crate::{
         config::{self, Config},
         crypto::LocalIdentity,
-        identity::{Genesis, Member, NetworkState},
     };
     use std::time::Instant;
 
     fn access(conversation: &str) -> Access {
-        Access {
-            network_id: "network".into(),
-            human: false,
-            conversation_id: Some(conversation.into()),
-            manager: None,
-        }
+        test_access("network".into(), false, Some(conversation.into()))
     }
 
     #[tokio::test]
@@ -894,12 +911,7 @@ mod tests {
         config::private_dir(&dir)?;
         let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
         configuration.providers.codex_app_server.socket = Some(dir.join("unavailable.sock"));
-        configuration.save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &configuration, &LocalIdentity::generate())?;
         let node = Runtime::open(&dir).await?;
         for (token, conversation) in [
             ("attempt-a", "conversation-a"),
@@ -1033,13 +1045,11 @@ mod tests {
         );
         let new_workspace = dir.join("new-workspace");
         config::private_dir(&new_workspace)?;
-        node.settings.lock().unwrap().manager = Some(config::ManagerSettings {
-            provider: Provider::Cursor,
-            workspace: new_workspace,
-            model: "different-model".into(),
-            reasoning_effort: None,
-            backup: Default::default(),
-        });
+        node.settings.lock().unwrap().manager = Some(manager_settings(
+            Provider::Cursor,
+            new_workspace,
+            "different-model".into(),
+        ));
         assert_eq!(
             node.cursor_executor.native_directory(&agent).await?,
             workspace
@@ -1067,11 +1077,11 @@ mod tests {
         let locator_path = reply_locator_path(&node.data_dir.join("cursor"), "bot-attempt")?;
         let locator_bytes = std::fs::read(&locator_path)?;
         let saved = std::str::from_utf8(&locator_bytes)?;
-        assert!(!saved.contains("fixture-api-key") && !saved.contains("CURSOR_API_KEY"));
+        assert!(!saved.contains("fixture-api-key") && !saved.contains("FIXTURE_CURSOR_KEY"));
         let launches = std::fs::read_to_string(dir.join("bridge-starts.log"))?;
         node.providers.lock().unwrap().env.apply(
             Provider::Cursor,
-            BTreeMap::from([("CURSOR_API_KEY".into(), Some("rotated-key".into()))]),
+            BTreeMap::from([("FIXTURE_CURSOR_KEY".into(), Some("rotated-key".into()))]),
         )?;
         assert_eq!(
             probe_recorded_reply(&node, "bot-attempt", &agent, run).await?,
@@ -1084,7 +1094,7 @@ mod tests {
         );
         node.providers.lock().unwrap().env.apply(
             Provider::Cursor,
-            BTreeMap::from([("CURSOR_API_KEY".into(), Some("fixture-api-key".into()))]),
+            BTreeMap::from([("FIXTURE_CURSOR_KEY".into(), Some("fixture-api-key".into()))]),
         )?;
         config::private_write(&locator_path, b"not json")?;
         assert_eq!(
@@ -1094,7 +1104,7 @@ mod tests {
         config::private_write(&locator_path, &locator_bytes)?;
         node.providers.lock().unwrap().env.apply(
             Provider::Cursor,
-            BTreeMap::from([("CURSOR_API_KEY".into(), None)]),
+            BTreeMap::from([("FIXTURE_CURSOR_KEY".into(), None)]),
         )?;
         assert_eq!(
             probe_recorded_reply(&node, "bot-attempt", &agent, run).await?,
@@ -1106,7 +1116,7 @@ mod tests {
         );
         node.providers.lock().unwrap().env.apply(
             Provider::Cursor,
-            BTreeMap::from([("CURSOR_API_KEY".into(), Some("fixture-api-key".into()))]),
+            BTreeMap::from([("FIXTURE_CURSOR_KEY".into(), Some("fixture-api-key".into()))]),
         )?;
         let blocked = reply_locator_path(&node.data_dir.join("cursor"), "blocked-attempt")?;
         config::private_dir(&blocked)?;
@@ -1167,20 +1177,14 @@ mod tests {
         let mut configuration =
             Config::local("127.0.0.1:0".parse()?, vec![workspace.clone()], false);
         configuration.providers.execution = [Provider::Cursor].into();
-        configuration.save(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
-        let node = Arc::new(Runtime::open(&dir).await?);
+        let node = open_node(&dir, &configuration).await?;
         {
             let mut local = node.providers.lock().unwrap();
             local.bins.insert(Provider::Cursor, fake_bridge());
             local.env.apply(
                 Provider::Cursor,
                 BTreeMap::from([
-                    ("CURSOR_API_KEY".into(), Some("fixture-api-key".into())),
+                    ("FIXTURE_CURSOR_KEY".into(), Some("fixture-api-key".into())),
                     (
                         "FAKE_BRIDGE_SEND_LOG".into(),
                         Some(send_log.display().to_string()),
@@ -1189,14 +1193,7 @@ mod tests {
             )?;
         }
         node.tools_ready("http://127.0.0.1:1".into())?;
-        let admin = LocalIdentity::generate();
-        let state = NetworkState::new(Genesis::create(
-            &LocalIdentity::generate(),
-            Member::client(&admin, "admin", true)?,
-            Member::node(&node.identity, "node")?,
-        )?)?;
-        let network = state.genesis.network_id.clone();
-        node.install_membership(state).await?;
+        let (admin, network) = join_network(&node).await?;
         super::super::claude::tests::conversation(
             &node,
             &admin,
@@ -1214,33 +1211,28 @@ mod tests {
             work_id: WorkSpec::id("conversation", "message:prompt", call_ref),
             conversation: "conversation".into(),
             trigger: "message:prompt".into(),
-            target: device.clone(),
-            dispatcher: device,
             call_ref: call_ref.into(),
-            kind: WorkKind::Agent(Provider::Cursor),
-            model: None,
             resolved: crate::model::ResolvedModel {
                 provider: Provider::Cursor,
                 model: Some("fixture-model".into()),
             },
-            cwd: workspace.display().to_string(),
             title: "cursor work".into(),
-            prompt: prompt.into(),
-            continues: None,
-            parent: None,
-            thread: None,
+            ..provider_work(Provider::Cursor, &device, workspace, prompt)
         })
     }
 
     async fn until_finished(node: &Runtime, work_id: &str) -> Result<WorkRecord> {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            let record = node
-                .store
-                .lock()
-                .await
-                .work_record(work_id)?
-                .context("Cursor work record")?;
+            let record = {
+                let work_id = work_id.to_owned();
+                node.store
+                    .call("cursor.work_record", move |store| {
+                        store.work_record(&work_id)
+                    })
+                    .await
+            }?
+            .context("Cursor work record")?;
             if record.state.finished() || Instant::now() >= deadline {
                 return Ok(record);
             }
@@ -1264,118 +1256,121 @@ mod tests {
             crate::scheduling::SchedulerJob,
             Arc<std::sync::Mutex<Shown>>,
         )> {
-            let event = admin.attest(
-                network,
-                "start-state",
-                crate::model::EventBody::MessagePosted {
-                    message_id: id.into(),
-                    role: crate::model::Role::User,
-                    text: id.into(),
-                    attachments: vec![],
-                    report_results: Some(true),
-                    in_reply_to: None,
-                    status: None,
-                    answers: None,
-                    attestation: None,
-                    failure: None,
-                },
-            )?;
-            let mut store = node.store.lock().await;
-            store.accept_message(
-                &node.identity,
-                network,
-                "start-state",
-                id,
-                id,
-                vec![],
-                true,
-                event.attestation().cloned().context("signed message")?,
-                now_ms(),
-            )?;
-            let key = SessionKey {
-                conversation_id: "start-state".into(),
-                scope: SessionScope::Main,
-            };
-            let claimed = store
-                .claim_next_in_session(
-                    &node.identity,
-                    network,
-                    &key,
-                    crate::scheduler::boot_id(),
-                    configuration,
-                    &node.config.scheduling,
-                )?
-                .context("claimed Cursor turn")?;
-            let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
-            let job = store.record_turn_runtime(
-                "start-state",
-                &claimed.job.trigger,
-                &attempt,
-                &TurnRuntime {
-                    provider: Provider::Cursor,
-                    model: Some("fixture-model".into()),
-                    reasoning_effort: None,
-                    generation: node.provider_generation(Provider::Cursor, &node.providers())?,
-                    session_generation: claimed.session_generation,
-                    delivery_id: attempt.clone(),
-                    stage: vibeface_bridge::failure::ProviderStage::Validate,
-                    execution: TurnExecution::NotStarted,
-                    attempted_at_ms: now_ms(),
-                    switched_from: None,
-                    switch_reason: None,
-                },
-            )?;
-            let context = ContextProjection {
-                network_id: network.into(),
-                scope: SessionScope::Main,
-                attempt_id: attempt.clone(),
-                provider: Provider::Cursor,
-                stable_fingerprint: configuration.stable_fingerprint.clone(),
-                dynamic_fingerprint: format!("context-{id}"),
-                session_generation: claimed.session_generation,
-                coverage: Default::default(),
-                stable_bytes: 1,
-                dynamic_bytes: 1,
-                invalidation_reason: None,
-                stage: ContextStage::Compiled,
-                session_status: None,
-                sources: Vec::new(),
-                sources_omitted: 0,
-                inputs: Vec::new(),
-                inputs_omitted: 0,
-            };
-            store.record_compiled_context("start-state", &job.trigger, &attempt, &context)?;
-            store.mark_started("start-state", &job.trigger, &attempt)?;
-            Ok((
-                job,
-                Arc::new(std::sync::Mutex::new(Shown {
-                    session_generation: claimed.session_generation,
-                    dynamic: Some(format!("delivered-{id}")),
-                    context: Some(context),
-                    ..Shown::default()
-                })),
-            ))
+            let (identity, admin, network, id, configuration, scheduling, generation) = (
+                node.identity.clone(),
+                admin.clone(),
+                network.to_owned(),
+                id.to_owned(),
+                configuration.clone(),
+                node.config.scheduling,
+                node.provider_generation(Provider::Cursor, &node.providers())?,
+            );
+            node.store
+                .call("cursor.claim_fixture", move |store| {
+                    let sequence = match store.workspace_input(&network, &id)? {
+                        Some(existing) => existing.input.route.sequence,
+                        None => store.messages(&network, "start-state")?.len() as u64 + 1,
+                    };
+                    store.post_input_fixture(
+                        &identity,
+                        &network,
+                        signed_main_input(
+                            &admin,
+                            &network,
+                            "start-state",
+                            &id,
+                            &id,
+                            vec![],
+                            sequence,
+                        )?,
+                        now_ms(),
+                    )?;
+                    let key = SessionKey {
+                        conversation_id: "start-state".into(),
+                        scope: SessionScope::Main,
+                    };
+                    let claimed = store
+                        .claim_next_in_session(
+                            &identity,
+                            &network,
+                            &key,
+                            crate::scheduler::boot_id(),
+                            &configuration,
+                            &scheduling,
+                        )?
+                        .context("claimed Cursor turn")?;
+                    let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+                    let job = store.record_turn_runtime(
+                        "start-state",
+                        &claimed.job.trigger,
+                        &attempt,
+                        &TurnRuntime {
+                            provider: Provider::Cursor,
+                            model: Some("fixture-model".into()),
+                            reasoning_effort: None,
+                            generation,
+                            session_generation: claimed.session_generation,
+                            delivery_id: attempt.clone(),
+                            stage: vibeface_bridge::failure::ProviderStage::Validate,
+                            execution: TurnExecution::NotStarted,
+                            attempted_at_ms: now_ms(),
+                            switched_from: None,
+                            switch_reason: None,
+                        },
+                    )?;
+                    let context = ContextProjection {
+                        network_id: network.clone(),
+                        scope: SessionScope::Main,
+                        attempt_id: attempt.clone(),
+                        provider: Provider::Cursor,
+                        stable_fingerprint: configuration.stable_fingerprint.clone(),
+                        dynamic_fingerprint: format!("context-{id}"),
+                        session_generation: claimed.session_generation,
+                        coverage: Default::default(),
+                        stable_bytes: 1,
+                        dynamic_bytes: 1,
+                        invalidation_reason: None,
+                        stage: ContextStage::Compiled,
+                        session_status: None,
+                        sources: Vec::new(),
+                        sources_omitted: 0,
+                        inputs: Vec::new(),
+                        inputs_omitted: 0,
+                    };
+                    store.record_compiled_context(
+                        "start-state",
+                        &job.trigger,
+                        &attempt,
+                        &context,
+                    )?;
+                    store.mark_started("start-state", &job.trigger, &attempt)?;
+                    Ok((
+                        job,
+                        Arc::new(std::sync::Mutex::new(Shown {
+                            session_generation: claimed.session_generation,
+                            dynamic: Some(format!("delivered-{id}")),
+                            context: Some(context),
+                            ..Shown::default()
+                        })),
+                    ))
+                })
+                .await
         }
         async fn seen(node: &Runtime) -> Result<(crate::model::VersionVector, Shown)> {
-            let store = node.store.lock().await;
-            let (covers, shown) = store.connection.query_row(
-                "SELECT covers,shown FROM scheduler_sessions WHERE conversation_id='start-state' AND scope='main'", [],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )?;
-            Ok((
-                serde_json::from_str(&covers)?,
-                serde_json::from_str(&shown)?,
-            ))
+            node.store.call("cursor.seen_fixture", move |store| {
+                let (covers, shown) = store.connection.query_row(
+                    "SELECT covers,shown FROM scheduler_sessions WHERE conversation_id='start-state' AND scope='main'", [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )?;
+                Ok((
+                    serde_json::from_str(&covers)?,
+                    serde_json::from_str(&shown)?,
+                ))
+            }).await
         }
         let (node, dir, network, workspace, admin) = cursor_node_with_admin().await?;
         let result = async {
-            let settings = crate::config::ManagerSettings {
-                provider: Provider::Cursor,
-                workspace,
-                model: "fixture-model".into(),
-                reasoning_effort: None,
-                backup: Default::default(),
-            };
+            let settings = manager_settings(Provider::Cursor, workspace, "fixture-model".into());
             node.settings.lock().unwrap().manager = Some(settings.clone());
             crate::runtime::triage::tests::bot(&node, &admin, "start-state", "Bot", &[]).await?;
             let key = SessionKey {
@@ -1443,14 +1438,12 @@ mod tests {
                     move |session| {
                         *saved.lock().unwrap() = Some(session.clone());
                         async move {
-                            persist_node.store.lock().await.save_scheduler_native_id(
-                                "start-state",
-                                &persist_trigger,
-                                &persist_attempt,
-                                &session,
-                                "controlled-token",
-                                false,
-                            )
+                            {
+                                let persist_trigger = persist_trigger.to_owned();
+                                let persist_attempt = persist_attempt.to_owned();
+                                let session = session.to_owned();
+                                persist_node.store.call("cursor.save_scheduler_native_id", move |store| store.save_scheduler_native_id("start-state", &persist_trigger, &persist_attempt, &session, "controlled-token", false)).await
+                            }
                         }
                     },
                     receiver,
@@ -1490,11 +1483,10 @@ mod tests {
                 let fake_send_seen = std::fs::read_to_string(dir.join("sends.log"))
                     .is_ok_and(|log| log.lines().any(|line| line.contains("\"text\": \"hang\"")));
                 let session_saved = persisted.lock().unwrap().is_some();
-                let durable_run_recorded = node
-                    .store
-                    .lock()
-                    .await
-                    .manager_turn_record(&attempt)
+                let durable_run_recorded = {
+                    let attempt = attempt.to_owned();
+                    node.store.call("cursor.manager_turn_record", move |store| store.manager_turn_record(&attempt)).await
+                }
                     .ok()
                     .flatten()
                     .is_some_and(|record| record.turn.is_some());
@@ -1506,17 +1498,21 @@ mod tests {
                 );
             }
             let captured = async {
-                let store = node.store.lock().await;
-                let early = store
-                    .manager_turn_record(&attempt)?
-                    .context("early native locator")?;
-                let execution = store
-                    .scheduler_job("start-state", &job.trigger)?
-                    .context("job")?
-                    .runtime
-                    .context("runtime")?
-                    .execution;
-                drop(store);
+                let (early, execution) = {
+                let (attempt, trigger) = (attempt.clone(), job.trigger.clone());
+                node.store.call("cursor.captured_fixture", move |store| {
+                    let early = store
+                        .manager_turn_record(&attempt)?
+                        .context("early native locator")?;
+                    let execution = store
+                        .scheduler_job("start-state", &trigger)?
+                        .context("job")?
+                        .runtime
+                        .context("runtime")?
+                        .execution;
+                    Ok((early, execution))
+                }).await?
+                };
                 let (covers, shown) = seen(&node).await?;
                 Ok::<_, anyhow::Error>((early, execution, covers, shown))
             }
@@ -1552,16 +1548,14 @@ mod tests {
             );
             assert!(seen(&node).await?.0.is_empty());
             assert!(seen(&node).await?.1.dynamic.is_none());
-            node.store.lock().await.finish_job(
-                &node.identity,
-                &network,
-                "start-state",
-                &job.trigger,
-                &attempt,
-                JobOutcome::Cancelled("controlled stop".into()),
-                "",
-                now_ms(),
-            )?;
+            {
+                let identity = node.identity.to_owned();
+                let network = network.to_owned();
+                let trigger = job.trigger.to_owned();
+                let attempt = attempt.to_owned();
+                let into = JobOutcome::Cancelled("controlled stop".into());
+                node.store.call("cursor.finish_job", move |store| store.finish_job(&identity, &network, "start-state", &trigger, &attempt, into, "", now_ms())).await
+            }?;
 
             let (job, shown) = claim(&node, &admin, &network, "completed", &configuration).await?;
             let attempt = job.state.attempt().unwrap().id.clone();
@@ -1582,14 +1576,12 @@ mod tests {
                 "hello",
                 None,
                 move |session| async move {
-                    persist_node.store.lock().await.save_scheduler_native_id(
-                        "start-state",
-                        &persist_trigger,
-                        &persist_attempt,
-                        &session,
-                        "controlled-token",
-                        false,
-                    )
+                    {
+                        let persist_trigger = persist_trigger.to_owned();
+                        let persist_attempt = persist_attempt.to_owned();
+                        let session = session.to_owned();
+                        persist_node.store.call("cursor.save_scheduler_native_id", move |store| store.save_scheduler_native_id("start-state", &persist_trigger, &persist_attempt, &session, "controlled-token", false)).await
+                    }
                 },
                 tokio::sync::watch::channel(false).1,
                 |_| async { Ok(()) },
@@ -1634,12 +1626,16 @@ mod tests {
             ),
         ] {
             let spec = work(&node, &workspace, call_ref, "fixture prompt")?;
-            node.store.lock().await.accept_work_fixture(
-                &node.identity,
-                &network,
-                spec.clone(),
-                now_ms(),
-            )?;
+            {
+                let identity = node.identity.to_owned();
+                let network = network.to_owned();
+                let spec = spec.clone();
+                node.store
+                    .call("cursor.accept_work_fixture", move |store| {
+                        store.accept_work_fixture(&identity, &network, spec, now_ms())
+                    })
+                    .await
+            }?;
             node.signal_work(
                 &network,
                 &spec.work_id,
@@ -1663,12 +1659,15 @@ mod tests {
                     }),
                 )
                 .await;
-            let record = node
-                .store
-                .lock()
-                .await
-                .work_record(&spec.work_id)?
-                .context("finished Cursor classification")?;
+            let record = {
+                let work_id = spec.work_id.to_owned();
+                node.store
+                    .call("cursor.work_record", move |store| {
+                        store.work_record(&work_id)
+                    })
+                    .await
+            }?
+            .context("finished Cursor classification")?;
             if start == StartEvidence::NotStarted {
                 assert_eq!(
                     record.state,
@@ -1683,6 +1682,21 @@ mod tests {
                 );
             }
         }
+        let root = work(&node, &workspace, "not-started", "fixture prompt")?;
+        let follow = WorkSpec {
+            continues: Some(root.work_id.clone()),
+            cwd: dir.join("elsewhere").display().to_string(),
+            ..work(&node, &workspace, "follow", "more")?
+        };
+        let owner = node
+            .cursor_executor
+            .lineage(&node, &network, &follow)
+            .await?;
+        assert_eq!(
+            (owner.root_work, owner.workspace),
+            (root.work_id, workspace.clone()),
+            "a follow-up runs where its root work ran"
+        );
         node.shutdown().await;
         drop(node);
         std::fs::remove_dir_all(dir)?;
@@ -1693,12 +1707,16 @@ mod tests {
     async fn cursor_work_dispatches_once_and_returns_result() -> Result<()> {
         let (node, dir, network, workspace) = cursor_node().await?;
         let spec = work(&node, &workspace, "once", "build it")?;
-        node.store.lock().await.accept_work_fixture(
-            &node.identity,
-            &network,
-            spec.clone(),
-            now_ms(),
-        )?;
+        {
+            let identity = node.identity.to_owned();
+            let network = network.to_owned();
+            let spec = spec.clone();
+            node.store
+                .call("cursor.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, now_ms())
+                })
+                .await
+        }?;
         assert!(
             !node
                 .start_work(
@@ -1728,12 +1746,15 @@ mod tests {
             node.cursor_executor.native_directory(&agent).await?,
             workspace
         );
-        let (_, created) = node.store.lock().await.accept_work_fixture(
-            &node.identity,
-            &network,
-            spec,
-            now_ms(),
-        )?;
+        let (_, created) = {
+            let identity = node.identity.to_owned();
+            let network = network.to_owned();
+            node.store
+                .call("cursor.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, now_ms())
+                })
+                .await
+        }?;
         assert!(
             !created,
             "retrying the same call only reads the existing work"
@@ -1754,12 +1775,16 @@ mod tests {
     async fn cursor_interrupt_waits_for_provider_cancelled_terminal() -> Result<()> {
         let (node, dir, network, workspace) = cursor_node().await?;
         let spec = work(&node, &workspace, "cancel", "hang around")?;
-        node.store.lock().await.accept_work_fixture(
-            &node.identity,
-            &network,
-            spec.clone(),
-            now_ms(),
-        )?;
+        {
+            let identity = node.identity.to_owned();
+            let network = network.to_owned();
+            let spec = spec.clone();
+            node.store
+                .call("cursor.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, now_ms())
+                })
+                .await
+        }?;
         node.start_work(
             node.executor(Provider::Cursor)?,
             &network,
@@ -1770,12 +1795,15 @@ mod tests {
         .await?;
         let running = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let record = node
-                    .store
-                    .lock()
-                    .await
-                    .work_record(&spec.work_id)?
-                    .context("running Cursor work")?;
+                let record = {
+                    let work_id = spec.work_id.to_owned();
+                    node.store
+                        .call("cursor.work_record", move |store| {
+                            store.work_record(&work_id)
+                        })
+                        .await
+                }?
+                .context("running Cursor work")?;
                 if matches!(record.state, WorkState::Running { .. }) {
                     break Ok::<_, anyhow::Error>(record);
                 }

@@ -8,6 +8,13 @@ struct SourceDraft {
     binding_signature: vibeface_delivery::PeerSignature,
     randomness: Vec<WindowRandomness>,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+enum AllocationRecovery {
+    Unallocated,
+    Pending,
+    Allocated,
+}
 #[derive(Deserialize)]
 pub(super) struct Announcement {
     pub peer_id: String,
@@ -28,76 +35,24 @@ pub(super) struct Quotation {
     pub grants: Vec<ServiceGrant>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum RefundAction {
-    Window(u16),
-    Bonus,
-}
-
-fn next_refund(
-    terms: &Terms,
-    state: &chain::OrderState,
-    key: &chain::KeyRecord,
-    at: u64,
-) -> Option<RefundAction> {
-    for (index, window) in state.windows.iter().enumerate() {
-        let refundable = match window.phase {
-            0 => at > terms.hold_deadline || !key.active || key.serial != terms.binding.serial,
-            1 => at > terms.key_deadline,
-            2 => {
-                terms.acceptance == vibeface_delivery::Acceptance::Strict
-                    && at > terms.open_deadline
-            }
-            _ => false,
-        };
-        if refundable {
-            return Some(RefundAction::Window(index as u16));
-        }
-    }
-    (!state.bonus_earned
-        && !state.bonus_refunded
-        && (at > terms.priority_deadline || state.windows.iter().any(|window| window.phase == 4)))
-    .then_some(RefundAction::Bonus)
-}
-
 impl Delivery {
     pub(super) async fn reconcile(
         &self,
         node: &Runtime,
         mut stored: StoredOrder,
     ) -> Result<StoredOrder> {
-        self.ensure_mode(stored.view.mode)?;
+        self.ensure_mode(Mode::Paid)?;
+        ensure!(
+            stored.view.mode == Mode::Paid,
+            "charity uses its independent signed protocol"
+        );
+        if stored.view.role == Role::Receiver && stored.accepted {
+            self.receiver_secret(stored.order.unsigned.terms.binding.key_id)?;
+        }
         if stored.view.role == Role::Receiver && !stored.accepted {
             return Ok(stored);
         }
         if stored.view.mode == Mode::Paid {
-            if stored.view.role == Role::Sender
-                && matches!(
-                    stored.view.phase,
-                    Phase::Prepared | Phase::FundingPending | Phase::Reconciling
-                )
-            {
-                let fund_id = format!("{}/fund", stored.view.order_id);
-                let funded = self.with_store(|store| store.find_transaction(&fund_id))?;
-                let Some(tx) = funded else {
-                    return Ok(stored);
-                };
-                let observed = self.chain().await?.observe(&tx).await?;
-                self.with_store(|store| {
-                    store.observe_transaction(
-                        &fund_id,
-                        &observed.phase,
-                        observed.block_number,
-                        observed.block_hash.as_deref(),
-                        observed.error.as_deref(),
-                    )
-                })?;
-                if observed.phase != "confirmed" {
-                    stored.view.chain_unknown();
-                    self.save(&mut stored)?;
-                    return Ok(stored);
-                }
-            }
             if let Err(error) = self.update_paid_view(&mut stored).await {
                 stored.view.chain_unknown();
                 self.save(&mut stored)?;
@@ -108,9 +63,6 @@ impl Delivery {
         self.authorize_order_effect(&stored).await?;
         match stored.view.role {
             Role::Sender => {
-                if stored.view.mode == Mode::Charity && stored.view.phase == Phase::Prepared {
-                    return Ok(stored);
-                }
                 let refunding = self.refund_expired(&mut stored).await?;
                 self.save(&mut stored)?;
                 if refunding || matches!(stored.view.phase, Phase::Paid | Phase::Refunded) {
@@ -122,6 +74,12 @@ impl Delivery {
                     file_bytes: stored.view.bytes,
                     intent_id: stored.view.intent_id.clone(),
                     wallet_signature: stored.wallet_signature.clone(),
+                    budget_id: stored
+                        .view
+                        .payment
+                        .budget_id
+                        .clone()
+                        .context("protected budget missing")?,
                 };
                 service::request(node, &stored.view.provider_peer, &offer).await?;
                 for index in 0..stored.order.unsigned.windows.len() {
@@ -160,25 +118,14 @@ impl Delivery {
                     local.state = remote.state;
                     local.decryption_proven = remote.decryption_proven;
                 }
-                if stored.view.mode == Mode::Paid {
-                    self.update_paid_view(&mut stored).await?;
-                    self.refund_expired(&mut stored).await?;
-                } else if snapshot.evidence == Evidence::CharityReceipt {
-                    stored.view.evidence = Evidence::CharityReceipt;
-                    if stored.view.windows.iter().all(|w| {
-                        matches!(
-                            w.state,
-                            WindowState::Held | WindowState::KeyPublished | WindowState::Earned
-                        )
-                    }) {
-                        stored.view.phase = Phase::Recoverable;
-                    }
-                }
+                self.update_paid_view(&mut stored).await?;
+                self.refund_expired(&mut stored).await?;
             }
             Role::Receiver => {
                 if !stored.accepted {
                     return Ok(stored);
                 }
+                let recovered_locally = stored.view.name.is_some() && stored.view.sha256.is_some();
                 for index in 0..stored.order.unsigned.windows.len() {
                     let index = index as u16;
                     let state = self.paid_state(&stored.order).await?;
@@ -227,9 +174,7 @@ impl Delivery {
                         };
                         stored.view.phase = Phase::Proving;
                         self.save(&mut stored)?;
-                        let seal = self
-                            .prove_cached(&config, &stored, index, "hold", input)
-                            .await?;
+                        let seal = self.prove_cached(&config, &stored, index, input).await?;
                         self.authorize_order_effect(&stored).await?;
                         let value = service::request(
                             node,
@@ -255,6 +200,11 @@ impl Delivery {
                             .await?
                             .capsule;
                     }
+                    if capsule.is_empty() {
+                        stored.view.phase = Phase::CipherHeld;
+                        self.save(&mut stored)?;
+                        continue;
+                    }
                     ensure!(
                         capsule.len() == 80
                             && hash(&capsule)
@@ -267,19 +217,32 @@ impl Delivery {
                     let ciphertext = self.with_store(|store| {
                         store.object(&stored.view.order_id, index, "ciphertext")
                     })?;
-                    recover_window(
-                        &stored.order.unsigned,
-                        index,
-                        &self.receiver_secret(stored.order.unsigned.terms.binding.key_id)?,
-                        &ciphertext,
-                        &capsule,
-                    )?;
+                    if !recovered_locally {
+                        recover_window(
+                            &stored.order.unsigned,
+                            index,
+                            &self.receiver_secret(stored.order.unsigned.terms.binding.key_id)?,
+                            &ciphertext,
+                            &capsule,
+                        )?;
+                    }
                     stored.view.windows[index as usize].state = WindowState::KeyPublished;
                     if new_hold {
                         stored.view.phase = Phase::Partial;
                         self.save(&mut stored)?;
                         return Ok(stored);
                     }
+                }
+                let mut waiting = false;
+                for window in &stored.order.unsigned.windows {
+                    waiting |= !self.with_store(|store| {
+                        store.object_complete(&stored.view.order_id, window.index, "capsule")
+                    })?;
+                }
+                if waiting {
+                    self.update_paid_view(&mut stored).await?;
+                    self.save(&mut stored)?;
+                    return Ok(stored);
                 }
                 let recovered = self.read(&stored)?;
                 stored.view.name = Some(text(&recovered, "name")?.into());
@@ -288,65 +251,8 @@ impl Delivery {
                 stored.view.evidence = Evidence::Recoverable;
                 self.update_paid_view(&mut stored).await?;
                 self.save(&mut stored)?;
-                for index in 0..stored.order.unsigned.windows.len() {
-                    if stored.view.windows[index].decryption_proven
-                        || stored.view.windows[index].state == WindowState::Refunded
-                    {
-                        continue;
-                    }
-                    let index = index as u16;
-                    let (ciphertext, capsule) = self.with_store(|store| {
-                        Ok((
-                            store.object(&stored.view.order_id, index, "ciphertext")?,
-                            store.object(&stored.view.order_id, index, "capsule")?,
-                        ))
-                    })?;
-                    let config = self
-                        .config()
-                        .prover
-                        .context("receiving prover is not configured")?;
-                    let input = ProofInput {
-                        profile: config.profile.clone(),
-                        statement: Statement::window(
-                            &stored.order.unsigned,
-                            index,
-                            Relation::Open,
-                        )?,
-                        witness: Witness::Open {
-                            order: stored.order.unsigned.clone(),
-                            index,
-                            receiving_secret: self
-                                .receiver_secret(stored.order.unsigned.terms.binding.key_id)?,
-                            ciphertext,
-                            capsule,
-                        },
-                    };
-                    stored.view.phase = Phase::Proving;
-                    self.save(&mut stored)?;
-                    let seal = self
-                        .prove_cached(&config, &stored, index, "open", input)
-                        .await?;
-                    self.authorize_order_effect(&stored).await?;
-                    service::request(
-                        node,
-                        &stored.view.provider_peer,
-                        &ServiceRequest::Open {
-                            order_id: stored.view.order_id.clone(),
-                            index,
-                            seal,
-                        },
-                    )
-                    .await?;
-                    self.update_paid_view(&mut stored).await?;
-                    self.save(&mut stored)?;
-                    return Ok(stored);
-                }
             }
-            Role::Provider => {
-                if stored.view.mode == Mode::Paid {
-                    self.update_paid_view(&mut stored).await?;
-                }
-            }
+            Role::Provider => self.update_paid_view(&mut stored).await?,
         }
         self.save(&mut stored)?;
         Ok(stored)
@@ -518,7 +424,6 @@ impl Delivery {
         config: &proof::ProofConfig,
         stored: &StoredOrder,
         index: u16,
-        _relation: &str,
         input: ProofInput,
     ) -> Result<Vec<u8>> {
         let digest = hex::encode(input.statement.digest());
@@ -532,11 +437,20 @@ impl Delivery {
             "proof job differs from the authorized window"
         );
         let receipt = self.with_store(|store| store.reserve_proof(&digest))?;
-        let seal = self.proofs.prove(config, &input, &receipt).await?;
+        let diagnostics = proof::ProofDiagnostics::Order {
+            data_dir: &self.data_dir,
+            node_id: self.identity.device_id().ok(),
+            order_id: &stored.view.order_id,
+            window: index,
+        };
+        let seal = self
+            .proofs
+            .prove(config, &input, &receipt, diagnostics)
+            .await?;
         self.with_store(|store| store.put_value(&id, &seal))?;
         Ok(seal)
     }
-    async fn authorize_order_effect(&self, order: &StoredOrder) -> Result<()> {
+    pub(super) async fn authorize_order_effect(&self, order: &StoredOrder) -> Result<()> {
         self.ensure_mode(order.view.mode)?;
         if order.view.role == Role::Provider && order.network_id.is_none() {
             return Ok(());
@@ -595,40 +509,44 @@ impl Delivery {
         )
     }
     async fn refund_expired(&self, stored: &mut StoredOrder) -> Result<bool> {
-        let chain = self.chain().await?;
-        let state = self.paid_state(&stored.order).await?;
-        let terms = &stored.order.unsigned.terms;
-        let at = chain.confirmed_position().await?.timestamp;
-        let key = chain.current_key(terms.binding.receiver_peer).await?;
-        let action = next_refund(terms, &state, &key, at);
-        let refunding = action.is_some();
-        if let Some(action) = action {
-            let (suffix, call) = match action {
-                RefundAction::Window(index) => (
-                    format!("refund-{index}"),
-                    chain::Call::Refund {
-                        order_id: terms.order_id()?,
-                        index,
-                    },
-                ),
-                RefundAction::Bonus => (
-                    "refund-bonus".into(),
-                    chain::Call::RefundBonus {
-                        order_id: terms.order_id()?,
-                    },
-                ),
-            };
-            chain
-                .execute(
-                    self,
-                    &format!("{}/{suffix}", stored.view.order_id),
-                    call,
-                    &stored.view.payment.gas_cap,
-                )
-                .await?;
+        let id = stored
+            .view
+            .payment
+            .budget_id
+            .clone()
+            .context("protected budget missing")?;
+        let snapshot = self.budget_snapshot(&id).await?;
+        if snapshot.state != "closing" || snapshot.position.timestamp <= snapshot.max_claim_until {
+            return Ok(false);
         }
+        if snapshot.locked == "0" && snapshot.free == "0" {
+            return Ok(false);
+        }
+        let record = self.budget_record(&id)?;
+        let windows = stored
+            .order
+            .unsigned
+            .windows
+            .iter()
+            .map(|w| budget::WindowRef {
+                order_id: stored.view.order_id.clone(),
+                index: w.index,
+            })
+            .collect();
+        self.chain()
+            .await?
+            .execute(
+                self,
+                &format!("budget-{id}/refund-{}", stored.view.order_id),
+                chain::Call::Budget(Box::new(budget::BudgetAction::Refund {
+                    budget_id: parse_word(&id)?,
+                    windows,
+                })),
+                &record.payer_gas_cap,
+            )
+            .await?;
         self.update_paid_view(stored).await?;
-        Ok(refunding)
+        Ok(true)
     }
     pub(super) async fn prepare(
         &self,
@@ -641,6 +559,45 @@ impl Delivery {
             request.mode == Mode::Paid,
             "charity uses its independent signed protocol"
         );
+        ensure!(
+            request.acceptance == Acceptance::Recoverable,
+            "protected delivery supports Recoverable only; Strict is not silently downgraded"
+        );
+        let budget_id = request
+            .budget_id
+            .as_deref()
+            .context("select a prepaid protected budget before preparing delivery")?;
+        parse_word(budget_id)?;
+        let snapshot = self.budget_snapshot(budget_id).await?;
+        let mut budget_record = self.budget_record(budget_id)?;
+        ensure!(
+            snapshot.terms == budget_record.terms
+                && snapshot.state == "open"
+                && snapshot.terms.provider_peer == request.provider_peer
+                && snapshot.terms.payer
+                    == chain::address_hex(
+                        self.wallet
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("delivery wallet lock failed"))?
+                            .address()?
+                    )
+                && budget_record.payer_gas_cap == request.max_gas_amount,
+            "protected budget roles, open state or cumulative payer gas authorization do not match"
+        );
+        ensure!(
+            budget_record
+                .network_id
+                .as_deref()
+                .is_none_or(|id| id == network),
+            "protected budget belongs to another personal network"
+        );
+        budget_record.network_id = Some(network.into());
+        self.with_store(|store| {
+            store.put_value(
+                &format!("protected-budget:{budget_id}"),
+                &serde_json::to_vec(&budget_record)?,
+            )
+        })?;
         self.config()
             .prover
             .context("sending Node requires a trusted local prover")?
@@ -700,6 +657,12 @@ impl Delivery {
             ensure!(
                 announcement.paid_enabled,
                 "service does not support paid delivery"
+            );
+            ensure!(
+                chain::address(&announcement.provider_wallet)?
+                    == chain::address(&snapshot.terms.payee)?
+                    && announcement.asset == snapshot.terms.asset,
+                "protected budget fixes another provider wallet or asset"
             );
             let binding: SignedKeyBinding = serde_json::from_value(
                 service::request(
@@ -905,6 +868,10 @@ impl Delivery {
                     },
                     file_bytes: file.len() as u64,
                     intent_id: request.intent_id.clone(),
+                    budget_id: request
+                        .budget_id
+                        .clone()
+                        .context("protected budget missing")?,
                 },
             )
             .await?,
@@ -930,27 +897,21 @@ impl Delivery {
             confirmed: false,
             resume_requested: false,
             request_hash,
-            view: view(
-                &request.intent_id,
-                Role::Sender,
-                request.mode,
-                &order,
-                file.len() as u64,
-            )?,
+            view: view(&request.intent_id, Role::Sender, &order, file.len() as u64)?,
             order,
             wallet_signature: quotation.wallet_signature,
             source_seals: Vec::new(),
             grants: quotation.grants,
             accepted: false,
             notified: false,
+            allocation_batch: Vec::new(),
+            chain_observed_at_ms: 0,
+            settlement_complete: false,
         };
+        stored.view.payment.budget_id = request.budget_id;
         stored.view.name = Some(request.name);
         stored.view.sha256 = Some(hex::encode(hash(&file)));
-        stored.view.payment.gas_cap = if stored.view.mode == Mode::Paid {
-            request.max_gas_amount
-        } else {
-            "0".into()
-        };
+        stored.view.payment.gas_cap = request.max_gas_amount;
         self.with_store(|store| {
             for (index, randomness) in randomness.into_iter().enumerate() {
                 let statement =
@@ -981,6 +942,96 @@ impl Delivery {
         })?;
         Ok(stored)
     }
+    async fn recover_allocation(
+        &self,
+        chain: &chain::Chain,
+        order: &mut StoredOrder,
+    ) -> Result<AllocationRecovery> {
+        let budget_id = order
+            .view
+            .payment
+            .budget_id
+            .as_deref()
+            .context("protected budget missing")?;
+        let ids = if order.allocation_batch.is_empty() {
+            vec![order.view.order_id.clone()]
+        } else {
+            order.allocation_batch.clone()
+        };
+        let transaction_id = format!(
+            "budget-{budget_id}/reserve-{}",
+            hex::encode(hash(&serde_json::to_vec(&ids)?))
+        );
+        let transaction = self.with_store(|store| store.find_transaction(&transaction_id))?;
+        let position = chain.confirmed_position().await?;
+        let expected_budget = parse_word(budget_id)?;
+        let mut batch = Vec::new();
+        let mut allocated = 0;
+        for id in &ids {
+            let pending = self.with_store(|store| store.order(id))?;
+            ensure!(
+                pending.confirmed
+                    && pending.view.role == Role::Sender
+                    && pending.allocation_batch == order.allocation_batch
+                    && pending.view.payment.budget_id.as_deref() == Some(budget_id),
+                "confirmed source batch changed"
+            );
+            let actual = chain.order_budget_at(&position, parse_word(id)?).await?;
+            ensure!(
+                actual == [0; 32] || actual == expected_budget,
+                "order allocation belongs to another budget"
+            );
+            allocated += usize::from(actual == expected_budget);
+            batch.push(pending);
+        }
+        ensure!(
+            allocated == 0 || allocated == batch.len(),
+            "original allocation batch is only partially observed; reconcile before spending"
+        );
+        if allocated == batch.len() {
+            for pending in &mut batch {
+                let (state, budget) = self.paid_state_at(chain, &position, &pending.order).await?;
+                ensure!(
+                    budget.terms.budget_id == budget_id,
+                    "original allocation budget changed"
+                );
+                provider::apply_paid_snapshot(&mut pending.view, &state)?;
+                pending.view.payment.tx_hash = transaction
+                    .as_ref()
+                    .and_then(|tx| tx.tx_hash.clone())
+                    .or_else(|| pending.view.payment.tx_hash.clone());
+                pending.view.error = None;
+                pending.view.updated_at_ms = crate::runtime::now_ms();
+            }
+            chain.verify_position(&position).await?;
+            self.with_store(|store| store.save_authorized_batch(&batch))?;
+            *order = batch
+                .into_iter()
+                .find(|item| item.view.order_id == order.view.order_id)
+                .context("original order missing from allocation batch")?;
+            return Ok(AllocationRecovery::Allocated);
+        }
+        chain.verify_position(&position).await?;
+        if let Some(transaction) = transaction.filter(|tx| tx.raw_tx.is_some()) {
+            let observed = chain.observe(&transaction).await;
+            if !observed.as_ref().is_ok_and(|value| {
+                matches!(value.phase.as_str(), "reverted" | "conflicted" | "failed")
+            }) {
+                order.view.payment.tx_hash = transaction.tx_hash;
+                order.view.chain_unknown();
+                self.save(order)?;
+                return Ok(AllocationRecovery::Pending);
+            }
+        }
+        ensure!(
+            batch
+                .iter()
+                .all(|pending| position.timestamp <= pending.order.unsigned.terms.quote_expires_at),
+            "quotation expired; no new allocation will be submitted"
+        );
+        Ok(AllocationRecovery::Unallocated)
+    }
+
     pub(super) async fn confirm(
         &self,
         node: &Runtime,
@@ -999,39 +1050,12 @@ impl Delivery {
             return self.reconcile(node, order).await;
         }
         if order.view.mode == Mode::Paid {
-            let fund_id = format!("{}/fund", order.view.order_id);
-            if let Some(transaction) = self.with_store(|store| store.find_transaction(&fund_id))? {
-                let observed = self.chain().await?.observe(&transaction).await?;
-                self.with_store(|store| {
-                    store.observe_transaction(
-                        &fund_id,
-                        &observed.phase,
-                        observed.block_number,
-                        observed.block_hash.as_deref(),
-                        observed.error.as_deref(),
-                    )
-                })?;
-                if observed.phase == "confirmed" {
-                    order.view.phase = Phase::Funded;
-                    order.view.payment.state = PaymentState::Confirmed;
-                    order.view.payment.tx_hash = transaction.tx_hash;
-                    self.save(&mut order)?;
-                    return self.reconcile(node, order).await;
-                }
-                if observed.phase == "reverted" {
-                    order.view.chain_unknown();
-                    order.view.phase = Phase::Failed;
-                    order.view.payment.state = PaymentState::Failed;
-                    order.view.error = observed.error;
-                    self.save(&mut order)?;
-                    return Ok(order);
-                }
+            let chain = self.chain().await?;
+            match self.recover_allocation(&chain, &mut order).await? {
+                AllocationRecovery::Allocated => return self.reconcile(node, order).await,
+                AllocationRecovery::Pending => return Ok(order),
+                AllocationRecovery::Unallocated => {}
             }
-            ensure!(
-                self.chain().await?.confirmed_position().await?.timestamp
-                    <= order.order.unsigned.terms.quote_expires_at,
-                "quotation expired; this intent will not be paid"
-            );
             let config = self.config();
             let prover = config.prover.context("paid prover is not configured")?;
             if order.source_seals.len() < order.order.unsigned.windows.len() {
@@ -1046,7 +1070,7 @@ impl Delivery {
                 );
                 let input: ProofInput = serde_json::from_slice(&encoded)?;
                 let seal = self
-                    .prove_cached(&prover, &order, index as u16, "source", input)
+                    .prove_cached(&prover, &order, index as u16, input)
                     .await?;
                 order.source_seals.push(seal);
                 self.save(&mut order)?;
@@ -1054,43 +1078,48 @@ impl Delivery {
             }
             order.view.phase = Phase::FundingPending;
             self.save(&mut order)?;
-            let chain = self.chain().await?;
-            let approve = chain
-                .execute(
-                    self,
-                    &format!("{}/approve", order.view.order_id),
-                    chain::Call::Approve {
-                        amount: order.order.unsigned.terms.escrow_amount,
-                    },
-                    &order.view.payment.gas_cap,
-                )
-                .await?;
-            if approve.phase != "confirmed" {
+            let budget_id = order
+                .view
+                .payment
+                .budget_id
+                .clone()
+                .context("protected budget missing")?;
+            let ids = if order.allocation_batch.is_empty() {
+                vec![order.view.order_id.clone()]
+            } else {
+                order.allocation_batch.clone()
+            };
+            let mut batch = Vec::new();
+            for id in &ids {
+                let pending = self.with_store(|store| store.order(id))?;
+                ensure!(
+                    pending.confirmed
+                        && pending.allocation_batch == order.allocation_batch
+                        && pending.view.payment.budget_id.as_deref() == Some(&budget_id),
+                    "confirmed source batch changed"
+                );
+                if pending.source_seals.len() != pending.order.unsigned.windows.len() {
+                    return Ok(order);
+                }
+                batch.push(pending);
+            }
+            let intent = hex::encode(hash(&serde_json::to_vec(&ids)?));
+            let allocation = self.reserve_orders(&budget_id, &batch, &intent).await?;
+            order.view.payment.tx_hash = allocation.tx_hash.clone();
+            if allocation.phase != "confirmed" {
                 order.view.chain_unknown();
                 self.save(&mut order)?;
                 return Ok(order);
             }
-            let fund = chain
-                .execute(
-                    self,
-                    &format!("{}/fund", order.view.order_id),
-                    chain::Call::Fund {
-                        order: Box::new(order.order.clone()),
-                        source_seals: order.source_seals.clone(),
-                        wallet_signature: order.wallet_signature.clone(),
-                    },
-                    &order.view.payment.gas_cap,
-                )
-                .await?;
-            let tx = self
-                .with_store(|store| store.transaction(&format!("{}/fund", order.view.order_id)))?;
-            order.view.payment.tx_hash = tx.tx_hash;
-            if fund.phase != "confirmed" {
-                order.view.chain_unknown();
-                self.save(&mut order)?;
-                return Ok(order);
+            for mut allocated in batch {
+                allocated.view.payment.state = PaymentState::Confirmed;
+                allocated.view.payment.tx_hash = allocation.tx_hash.clone();
+                allocated.view.phase = Phase::Funded;
+                self.save(&mut allocated)?;
+                if allocated.view.order_id == order.view.order_id {
+                    order = allocated;
+                }
             }
-            order.view.payment.state = PaymentState::Confirmed;
         }
         order.view.phase = Phase::Funded;
         self.save(&mut order)?;
@@ -1111,20 +1140,18 @@ pub(super) fn address_bytes(value: &str) -> Result<[u8; 20]> {
 pub(super) fn view(
     intent: &str,
     role: Role,
-    mode: Mode,
     order: &Order,
     file_bytes: u64,
 ) -> Result<DeliveryOrder> {
     let terms = &order.unsigned.terms;
-    let mut payment = Payment::free();
-    if mode == Mode::Paid {
+    let payment = {
         let mut delivery = Amount::ZERO;
         let mut reservation = Amount::ZERO;
         for window in &order.unsigned.windows {
             delivery = delivery.checked_add(window.delivery_fee)?;
             reservation = reservation.checked_add(window.reservation_fee)?;
         }
-        payment = Payment {
+        Payment {
             state: PaymentState::Prepared,
             chain_id: Some(
                 u64::from_be_bytes(terms.binding.chain_id[24..].try_into().expect("chain"))
@@ -1142,13 +1169,15 @@ pub(super) fn view(
             withdrawn: "0".into(),
             refunded: "0".into(),
             tx_hash: None,
-        };
-    }
+            budget_id: None,
+            settlement: None,
+        }
+    };
     Ok(DeliveryOrder {
         order_id: hex::encode(terms.order_id()?),
         intent_id: intent.into(),
         role,
-        mode,
+        mode: Mode::Paid,
         acceptance: match terms.acceptance {
             vibeface_delivery::Acceptance::Recoverable => Acceptance::Recoverable,
             vibeface_delivery::Acceptance::Strict => Acceptance::Strict,
@@ -1191,90 +1220,393 @@ pub(super) fn view(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::{Address, B256, U256};
+    use alloy_sol_types::{SolCall, SolValue};
+    use std::collections::BTreeMap;
+
+    #[allow(dead_code)]
+    mod support {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/delivery/examples/support/mod.rs"
+        ));
+    }
 
     #[test]
-    fn window_refunds_precede_bonus_and_each_new_snapshot_selects_only_one_action() {
-        let profile = chain::tests::config().profile;
-        let peer = parse_word(&LocalIdentity::generate().device_id().unwrap()).unwrap();
-        let mut chain_id = [0; 32];
-        chain_id[24..].copy_from_slice(&31337u64.to_be_bytes());
-        let terms = Terms {
-            profile_id: profile.digest().unwrap(),
-            guest_image_id: profile.guest_image_id,
-            binding: KeyBinding {
-                chain_id,
-                escrow: [0x11; 20],
-                receiver_peer: peer,
-                receiver_public: receiving_public(&Secret32::new([7; 32]).unwrap()).unwrap(),
-                key_id: [0x22; 32],
-                serial: 1,
-                valid_from: 100,
-                valid_until: 700,
-                action: BindingAction::Active,
-            },
-            source_peer: peer,
-            provider_peer: peer,
-            payer: [0x33; 20],
-            provider_wallet: [0x44; 20],
-            asset: [0x55; 20],
-            acceptance: vibeface_delivery::Acceptance::Strict,
-            total_plaintext_bytes: 8,
-            window_count: 2,
-            whole_order_bonus: Amount::from_u64(5),
-            escrow_amount: Amount::from_u64(29),
-            quote_expires_at: 200,
-            hold_deadline: 300,
-            key_deadline: 400,
-            open_deadline: 500,
-            retain_until: 600,
-            priority_deadline: 350,
-            payer_order_nonce: [0x66; 32],
-        };
-        terms.validate().unwrap();
-        let key = chain::KeyRecord {
-            binding_hash: terms.binding.digest().unwrap(),
-            serial: 1,
-            valid_from: 100,
-            valid_until: 700,
-            active: true,
-        };
-        let mut state = chain::OrderState {
-            payer: format!("0x{}", "33".repeat(20)),
-            provider_wallet: format!("0x{}", "44".repeat(20)),
-            earned: "0".into(),
-            withdrawn: "0".into(),
-            refunded: "0".into(),
-            bonus_earned: false,
-            bonus_refunded: false,
-            windows: vec![
-                chain::WindowState {
-                    phase: 1,
-                    decryption_proven: false,
-                    capsule: Vec::new(),
-                    ciphertext_hash: [0x77; 32],
-                    capsule_hash: [0x88; 32],
-                };
-                2
+    fn recoverable_receiver_reads_original_bytes_without_open_or_chain_and_reports_a_missing_key()
+    -> Result<()> {
+        let content = b"original recovered bytes";
+        let wrapped = envelope("restored.bin", content)?;
+        let middle = wrapped.len() / 2;
+        let original = support::fixture_with_profile(
+            &[middle, wrapped.len() - middle],
+            chain::tests::config().profile,
+        );
+        let fixture = support::fixture_from_terms(
+            original.profile,
+            original.order.unsigned.terms,
+            vec![
+                SecretBytes::new(wrapped[..middle].to_vec()),
+                SecretBytes::new(wrapped[middle..].to_vec()),
             ],
+            Amount::from_u64(2),
+            Amount::from_u64(1),
+        );
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("receiver-recovery-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let delivery = Delivery::open(&dir, LocalIdentity::generate())?;
+        delivery.configure_local(DeliveryConfig {
+            enabled: true,
+            ..Default::default()
+        })?;
+        let mut stored = super::super::store::tests::paid_order(Role::Receiver);
+        stored.order = fixture.order;
+        stored.view = view(
+            &uuid::Uuid::new_v4().to_string(),
+            Role::Receiver,
+            &stored.order,
+            content.len() as u64,
+        )?;
+        stored.accepted = true;
+        delivery.with_store(|store| {
+            store.save_order(&stored)?;
+            for (index, encrypted) in fixture.encrypted.iter().enumerate() {
+                store.write_object(
+                    &stored.view.order_id,
+                    index as u16,
+                    "ciphertext",
+                    &encrypted.ciphertext,
+                )?;
+                store.write_object(
+                    &stored.view.order_id,
+                    index as u16,
+                    "capsule",
+                    &encrypted.capsule,
+                )?;
+            }
+            Ok(())
+        })?;
+        assert!(
+            delivery
+                .read(&stored)
+                .unwrap_err()
+                .is::<ReceivingKeyUnavailable>()
+        );
+        let key = format!(
+            "receiving-key:{}",
+            hex::encode(stored.order.unsigned.terms.binding.key_id)
+        );
+        let mut material = ReceivingMaterial {
+            binding: SignedKeyBinding {
+                binding: stored.order.unsigned.terms.binding.clone(),
+                signature: stored.order.binding_signature,
+            },
+            secret: Some(Secret32::new([7; 32])?),
         };
-        assert_eq!(next_refund(&terms, &state, &key, 350), None);
+        delivery.with_store(|store| store.put_value(&key, &serde_json::to_vec(&material)?))?;
+        let recovered = delivery.read(&stored)?;
+        assert_eq!(recovered["name"], "restored.bin");
+        assert_eq!(recovered["content_base64"], STANDARD.encode(content));
+        assert_eq!(recovered["sha256"], hex::encode(hash(content)));
+        stored.view.name = Some(text(&recovered, "name")?.into());
+        stored.view.sha256 = Some(text(&recovered, "sha256")?.into());
+        stored.view.evidence = Evidence::Recoverable;
+        stored.view.phase = Phase::Paid;
+        stored.view.payment.settlement = Some(BudgetSettlement {
+            earned: "7".into(),
+            withdrawn: "7".into(),
+            refunded: "0".into(),
+            publication: None,
+        });
+        stored.settlement_complete = true;
+        for window in &mut stored.view.windows {
+            window.state = WindowState::Earned;
+            assert!(!window.decryption_proven);
+        }
+        assert!(
+            stored.historical(),
+            "actual local recovery does not require automatic Open"
+        );
+        assert!(
+            delivery
+                .with_store(|store| store.recent_transactions())?
+                .is_empty()
+        );
+        assert!(
+            delivery
+                .with_store(|store| store.values_with_prefix("proof-seal:"))?
+                .is_empty()
+        );
+        material.secret = None;
+        delivery.with_store(|store| store.put_value(&key, &serde_json::to_vec(&material)?))?;
+        assert!(
+            delivery
+                .read(&stored)
+                .unwrap_err()
+                .is::<ReceivingKeyUnavailable>()
+        );
+        drop(delivery);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn canonical_reservation_recovers_both_original_orders_after_quote_expiry_without_new_payment()
+    -> Result<()> {
+        let mut config = chain::tests::config();
+        config.escrow = format!("0x{}", "44".repeat(20));
+        config.asset = format!("0x{}", "33".repeat(20));
+        let original = support::fixture_with_profile(&[4], config.profile.clone());
+        let mut orders = Vec::new();
+        for nonce in [1, 2, 3] {
+            let mut terms = original.order.unsigned.terms.clone();
+            terms.payer_order_nonce = [nonce; 32];
+            let fixture = support::fixture_from_terms(
+                config.profile.clone(),
+                terms,
+                vec![SecretBytes::new(vec![nonce; 4])],
+                Amount::from_u64(2),
+                Amount::from_u64(1),
+            );
+            let order = fixture.order;
+            let intent = uuid::Uuid::new_v4().to_string();
+            let mut view = view(&intent, Role::Sender, &order, 4)?;
+            view.payment.budget_id = Some("77".repeat(32));
+            view.chain_unknown();
+            let mut source_seal = vec![0x22; 260];
+            source_seal[..4].copy_from_slice(&[0x73, 0xc4, 0x57, 0xba]);
+            orders.push(StoredOrder {
+                network_id: Some("fixture-network".into()),
+                authorized_by: Some("fixture-member".into()),
+                confirmed: true,
+                resume_requested: true,
+                request_hash: "88".repeat(32),
+                view,
+                order,
+                wallet_signature: vec![0x11; 65],
+                source_seals: vec![source_seal],
+                grants: Vec::new(),
+                accepted: false,
+                notified: false,
+                allocation_batch: Vec::new(),
+                chain_observed_at_ms: 0,
+                settlement_complete: false,
+            });
+        }
+        let ids: Vec<_> = orders[..2]
+            .iter()
+            .map(|order| order.view.order_id.clone())
+            .collect();
+        for order in &mut orders[..2] {
+            order.allocation_batch = ids.clone();
+        }
+        let budget_id = B256::repeat_byte(0x77);
+        let mut responses = BTreeMap::<String, Value>::new();
+        let encoded = |value: Vec<u8>| json!(format!("0x{}", hex::encode(value)));
+        for (index, order) in orders.iter().enumerate() {
+            let id = B256::from(parse_word(&order.view.order_id)?);
+            responses.insert(
+                hex::encode(chain::abi::orderBudgetCall { id }.abi_encode()),
+                encoded(if index < 2 { budget_id } else { B256::ZERO }.abi_encode()),
+            );
+            if index >= 2 {
+                continue;
+            }
+            let statement = Statement::window(&order.order.unsigned, 0, Relation::Source)?;
+            let terms = chain::abi::DeliveryStatement::abi_decode(statement.abi_bytes())?;
+            let spec = &order.order.unsigned.windows[0];
+            let state = chain::abi::ChainOrder {
+                terms,
+                windows: vec![chain::abi::ChainWindow {
+                    spec: chain::abi::WindowSpec {
+                        index: 0,
+                        offset: 0,
+                        plaintextBytes: 4,
+                        ciphertextBytes: 72,
+                        ciphertextHash: spec.ciphertext_hash.into(),
+                        capsuleHash: spec.capsule_hash.into(),
+                        plaintextCommitment: spec.plaintext_commitment.into(),
+                        deliveryFee: U256::from(2),
+                        reservationFee: U256::from(1),
+                    },
+                    phase: 0,
+                    decryptionProven: false,
+                    capsule: Vec::new().into(),
+                }],
+                earned: U256::ZERO,
+                withdrawn: U256::ZERO,
+                refunded: U256::ZERO,
+                earnedWindows: 0,
+                refundedWindows: 0,
+                assetDecimals: 6,
+                bonusEarned: false,
+                bonusRefunded: false,
+            };
+            responses.insert(
+                hex::encode(chain::abi::getOrderCall { id }.abi_encode()),
+                encoded(chain::abi::getOrderCall::abi_encode_returns(&state)),
+            );
+            responses.insert(
+                hex::encode(
+                    chain::abi::publicValuesCall {
+                        id,
+                        index: 0,
+                        relation: 2,
+                    }
+                    .abi_encode(),
+                ),
+                encoded(chain::abi::publicValuesCall::abi_encode_returns(
+                    &chain::abi::DeliveryStatement::abi_decode(statement.abi_bytes())?,
+                )),
+            );
+        }
+        let budget = chain::abi::ChainBudget {
+            payer: Address::repeat_byte(0x11),
+            payee: Address::repeat_byte(0x22),
+            providerPeer: orders[0].order.unsigned.terms.provider_peer.into(),
+            asset: Address::repeat_byte(0x33),
+            deposit: U256::from(8),
+            locked: U256::from(8),
+            earned: U256::ZERO,
+            withdrawn: U256::ZERO,
+            refunded: U256::ZERO,
+            maxClaimUntil: 400,
+            assetDecimals: 6,
+            state: 1,
+        };
+        responses.insert(
+            hex::encode(chain::abi::getBudgetCall { id: budget_id }.abi_encode()),
+            encoded(chain::abi::getBudgetCall::abi_encode_returns(&budget)),
+        );
+        let rpc = chain::tests::rpc_fixture(config, move |request| match request["method"].as_str().unwrap() {
+            "eth_blockNumber" => json!("0xb"),
+            "eth_getBlockByNumber" => json!({"number":"0xa","hash":format!("0x{}","55".repeat(32)),"timestamp":"0xc9"}),
+            "eth_call" => responses.get(request["params"][0]["data"].as_str().unwrap().strip_prefix("0x").unwrap()).cloned().unwrap_or(Value::Null),
+            _ => Value::Null,
+        }).await?;
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("allocation-recovery-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let delivery = Delivery::open(&dir, LocalIdentity::generate())?;
+        delivery.configure_local(DeliveryConfig {
+            enabled: true,
+            paid_enabled: true,
+            chain: Some(rpc.chain.config().clone()),
+            ..Default::default()
+        })?;
+        for order in &orders {
+            delivery.with_store(|store| store.save_order(order))?;
+        }
+        let mut intent = chain::tests::approval_intent(Address::repeat_byte(0x11))?;
+        intent.id = format!(
+            "budget-{}/reserve-{}",
+            "77".repeat(32),
+            hex::encode(hash(&serde_json::to_vec(&ids)?))
+        );
+        let (target, calldata) = budget::BudgetAction::Reserve {
+            budget_id: budget_id.into(),
+            reservations: orders[..2]
+                .iter()
+                .map(|order| budget::Reservation {
+                    order: order.order.clone(),
+                    source_seals: order.source_seals.clone(),
+                    wallet_signature: order.wallet_signature.clone(),
+                })
+                .collect(),
+        }
+        .encode(rpc.chain.config(), Address::repeat_byte(0x11))?;
+        intent.to = chain::address_hex(target);
+        intent.calldata = format!("0x{}", hex::encode(calldata));
+        let transaction_id = intent.id.clone();
+        let position = rpc.chain.confirmed_position().await?;
+        let budget_snapshot = rpc.chain.budget_at(&position, budget_id).await?;
+        rpc.chain.verify_position(&position).await?;
+        delivery.with_store(|store| {
+            store.put_value(
+                &format!("protected-budget:{}", "77".repeat(32)),
+                &serde_json::to_vec(&budget::BudgetRecord {
+                    terms: budget_snapshot.terms,
+                    payer_gas_cap: intent.gas_cap.clone(),
+                    provider_gas_cap: "0".into(),
+                    network_id: orders[0].network_id.clone(),
+                    authorized_by: orders[0].authorized_by.clone(),
+                    role: Role::Sender,
+                })?,
+            )?;
+            store.reserve_budget_transaction(
+                &intent,
+                7,
+                &format!("budget-{}", "77".repeat(32)),
+                &intent.gas_cap,
+            )?;
+            store.sign_transaction(&transaction_id, "0x02", &format!("0x{}", "99".repeat(32)))?;
+            store.observe_transaction(
+                &transaction_id,
+                "unknown",
+                None,
+                None,
+                Some("synthetic lost allocation response"),
+            )
+        })?;
+        let before = delivery.with_store(|store| store.transaction(&transaction_id))?;
+        let mut recovering = orders[0].clone();
         assert_eq!(
-            next_refund(&terms, &state, &key, 351),
-            Some(RefundAction::Bonus)
+            delivery
+                .recover_allocation(&rpc.chain, &mut recovering)
+                .await?,
+            AllocationRecovery::Allocated
+        );
+        for id in &ids {
+            let restored = delivery.with_store(|store| store.order(id))?;
+            assert_eq!(restored.view.phase, Phase::Funded);
+            assert_eq!(restored.allocation_batch, ids);
+            assert_eq!(restored.view.payment.tx_hash, before.tx_hash);
+            assert_eq!(restored.source_seals, orders[0].source_seals);
+            assert_eq!(restored.order.unsigned.terms.quote_expires_at, 200);
+        }
+        assert_eq!(
+            delivery.with_store(|store| store.transaction(&transaction_id))?,
+            before,
+            "restoring canonical allocations must preserve the original nonce, raw, cap and transaction identity"
+        );
+        let mut expired = orders[2].clone();
+        assert!(
+            delivery
+                .recover_allocation(&rpc.chain, &mut expired)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("no new allocation")
         );
         assert_eq!(
-            next_refund(&terms, &state, &key, 401),
-            Some(RefundAction::Window(0))
+            delivery
+                .with_store(|store| store.order(&expired.view.order_id))?
+                .view
+                .phase,
+            Phase::Reconciling
         );
-        state.windows[0].phase = 4;
-        state.bonus_refunded = true;
-        state.refunded = "17".into();
+        assert!(rpc.requests.lock().unwrap().iter().all(|request| matches!(
+            request["method"].as_str(),
+            Some("eth_blockNumber" | "eth_getBlockByNumber" | "eth_call")
+        )));
+        let database = rusqlite::Connection::open_with_flags(
+            dir.join("delivery/service.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
         assert_eq!(
-            next_refund(&terms, &state, &key, 401),
-            Some(RefundAction::Window(1))
+            database.query_row("SELECT count(*) FROM transactions", [], |row| row
+                .get::<_, i64>(0))?,
+            1
         );
-        state.windows[1].phase = 4;
-        state.refunded = "29".into();
-        assert_eq!(next_refund(&terms, &state, &key, 401), None);
+        drop(database);
+        rpc.shutdown().await?;
+        delivery.shutdown().await;
+        drop(delivery);
+        std::fs::remove_dir_all(dir)
+            .context("remove allocation recovery test directory after RPC and delivery shutdown")?;
+        Ok(())
     }
 }

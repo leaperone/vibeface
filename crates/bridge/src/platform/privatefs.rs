@@ -194,26 +194,6 @@ pub fn create_new(path: &Path) -> io::Result<File> {
     }
 }
 
-/// Creates or replaces a private file, emptying one that already exists.
-pub fn create_or_truncate(path: &Path) -> io::Result<File> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-    }
-    #[cfg(windows)]
-    {
-        super::winsec::create_private_file(path, super::winsec::Disposition::Truncate)
-    }
-}
-
 /// Opens a private file for reading and writing, creating it when absent and keeping the
 /// content of one that exists. The exclusive data lock is taken on a file opened this way.
 pub fn open_or_create(path: &Path) -> io::Result<File> {

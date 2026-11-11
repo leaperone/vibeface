@@ -36,7 +36,7 @@ vibeface --version
 
 ### 从源码准备当前版本
 
-匹配的安装包尚未发布时，需要先从源码构建。准备 Git、Python 3、Rust 1.91+、Node.js 22.12+ 和 pnpm 11.9.0，再执行：
+匹配的安装包尚未发布时，需要先从源码构建。准备 Git、Python 3.12+、Core/CLI 对应的 Rust 工具链、Node.js 24 和 pnpm 11.9.0，再执行：
 
 ```sh
 git clone https://github.com/leaperone/vibeface.git
@@ -54,7 +54,7 @@ vibeface --version
 
 后续步骤使用这个终端。这里启动的是本地源码构建，不是受管安装；先保持前台运行，不执行安装包专用的服务或自动更新步骤。源码构建工具的安装方式和平台条件以各工具文档为准。
 
-首次初始化会配置[默认公共发现服务](node.md#使用公共发现服务)，Node 在后台向官方公共节点登记并取得它的 Relay，局域网直连仍优先。只使用自己的服务或局域网时，可在首次初始化使用 `--bootstrap off`。已有节点按配置说明修改，不要重新初始化；加入个人网络仍需邀请和批准。
+首次初始化会加入[全网](node.md#全网)，Node 在后台经官方公共节点入网，从全网表里取开放 Relay，局域网直连仍优先。只使用自己的服务或局域网时，可在首次初始化使用 `--no-mesh`。已有节点按配置说明修改，不要重新初始化；加入个人网络仍需邀请和批准。
 
 ## 2. 启动并打开本机页面
 
@@ -104,3 +104,5 @@ vibeface
 - [日常使用指南](user-guide.md)：管理 Bot、查看工作状态、取消任务和换设备继续。
 - [安装与管理节点](install.md#用-cli-管理后台服务)：把前台进程改成后台服务。
 - [排障](troubleshooting.md)：页面打不开、Agent 无法使用或任务结果待确认。
+
+Desktop 另外需要 GPUI 图形工具链与平台开发库，版本及 hosted runner 配置见 [原生 Desktop action](../../.github/actions/native-desktop/action.yml)。Core/CLI 的最低 Rust 版本不能作为 GPUI 已通过编译的证明。Windows 原生组包使用 `python3 -B scripts/package-node-windows.py`，不执行 POSIX shell 组包脚本。

@@ -67,9 +67,9 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 
 - 浏览器上报未捕获的错误、未处理的 Promise 拒绝、失败的请求和设置等操作，只发给当前连接的那台 Node，要求已加入的设备或本机会话；
 - 协调 Agent 和命令行用 `vibeface log <level> <message> [--conversation ID] [--work ID] [--thread ID]` 写一条；`vibeface codex call` 自动记下结果，`vibeface codex send` 与 `dispatch_work` 一样由 Node 记下工作事件；
-- Codex App Server 和 Codex SDK 的标准错误逐行记录，能看出 thread 时带上 `thread_id`。Cursor ACP 不记录原始标准错误，只返回受控的失败类别。
+- Codex App Server 的标准错误逐行记录，能看出 thread 时带上 `thread_id`。Cursor ACP 不记录原始标准错误，只返回受控的失败类别。
 
-每条外来记录不超过 8 KiB，一次最多 20 条，每个来源每分钟最多 120 条，超出整批拒绝。
+每条外来记录不超过 8 KiB，一次最多 20 条，每个发送方每分钟最多 120 条，超出整批拒绝。浏览器按设备身份分别计数，本机 Agent 和 CLI 各自共享额度。
 
 查看日志：
 
@@ -86,7 +86,6 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 | `sync.forked`（`another copy of this device wrote different events; writes stopped`） | 发现这台设备的数据被复制过，已停止写入 |
 | `sync.write_confirmed`（`write confirmed without a backup check`） | 有人在网页上确认了“不是从备份恢复的” |
 | `refused a connection from a non-member` | 非成员设备试图连接，debug 级别 |
-| `work changed a file outside its directory` | 工作改动了它目录之外的文件，只记录，不拦截 |
 | `relay.started`（`relay started`） | 本机 relay 已启动，`listen` 字段是它的地址 |
 | `app_server.start_failed`、`app_server.exited` | Node 启动的 Codex App Server 没能启动或已退出，`error`、`status` 是原因 |
 | `work.dispatched`、`work.dispatch_rejected` | 工作被接纳或派发被拒绝，带 `work_id` 和原因 |
@@ -94,8 +93,8 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 | `work.state` | 工作状态变化，结束时带 `outcome` |
 | `agent.turn.started`、`agent.turn.finished` | 协调 Agent 一轮开始和结束 |
 | `agent.tool`、`agent.tool_failed` | 协调 Agent 调用的工具 |
-| `codex.send`、`codex.call`、`codex.call_failed` | Agent 经命令行给 Codex 发的消息和请求 |
-| `codex.app_server.stderr`、`codex.sdk.stderr`、`cursor.stderr` | 子进程的标准错误 |
+| `codex.call`、`codex.call_failed` | Agent 经命令行向 Codex App Server 发的请求 |
+| `codex.app_server.stderr` | Codex App Server 的标准错误 |
 
 写入前每条记录统一脱敏：邀请链接片段替换为 `[invite]`，`Bearer` 后的令牌、relay 令牌、Cursor 回调令牌和环境变量中名字以 `_KEY`、`_TOKEN`、`_SECRET`、`_PASSWORD` 结尾的值，以及设置页填写的 Provider 变量值替换为 `[redacted]`。日志不记录加入 secret、本机启动 token 或模型密钥。
 
@@ -116,9 +115,9 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 | `Writes` | 网页显示 | 意思 | 怎么办 |
 |---|---|---|---|
 | `writable` | 无提示 | 正常 | 无 |
-| `aligning` | “这台设备正在和你的其他设备对齐” | 数据像是复制或从备份恢复的，正在确认自己没有落后于其他设备记下的内容 | 等它连上每一台其他 Node，通常几秒；某个 `Peer` 行一直 `unreachable` 时检查网络和 relay，那台 Node 不再使用就移除它 |
+| `aligning` | 连接状态显示“同步中” | 数据像是复制或从备份恢复的，正在确认自己没有落后于其他设备记下的内容 | 等它连上每一台其他 Node，通常几秒；某个 `Peer` 行一直 `unreachable` 时检查网络和 relay，那台 Node 不再使用就移除它 |
 | `read_only` | 待处理里出现“这个节点暂时只读” | 数据像是复制或从备份恢复的，还没确认过它的其他 Node 都连不上，无法确认这份数据是不是旧备份 | 见下文 |
-| `forked` | “这台设备的数据有两份副本” | 另一份同样身份的数据写了不同内容 | 见下文 |
+| `forked` | “某某 的数据被复制过” | 另一份同样身份的数据写了不同内容 | 见下文 |
 
 正常重启直接可写，其他设备离线也一样。只有数据库文件和上次写入时的不同（复制了数据目录或从备份恢复）才进入对齐。对齐和只读期间可以照常阅读，发消息会提示稍后再试，已排队的消息在可写后继续处理。
 
@@ -139,13 +138,13 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 3. 停掉这台设备两份副本上的 Node，用 `vibeface init --data-dir <新目录>` 初始化一个新的数据目录，再用新的加入链接执行 `vibeface join --data-dir <新目录> <链接>`。旧数据目录不要再启动。
 4. 把需要保留的内容重新发一次。
 
-其他设备上出现“某某 的数据有两份副本”时，说明是那台设备分叉了，按同样步骤处理那台设备。
+其他设备上出现“某某 的数据被复制过”时，说明是那台设备分叉了，按同样步骤处理那台设备。
 
 ## 常见问题
 
 **对端一直 `unreachable`。** 两台 Node 没有直连路径时要经 relay 转发。确认至少一台 Node 用 `--relay-listen` 运行 relay，其他 Node 的 `config.json` 里 `network.relays` 指向它，反向代理允许 WebSocket 升级。改了 `network` 字段要重启。见 [Node 之间的连接](node.md#node-之间的连接)。
 
-**手机打开官方页面或自建公共节点后连不上个人设备。** 公共节点按设备编号经发现服务找到个人设备上的 Node。检查这台 Node 正在运行，`vibeface status` 的 `Bootstrap` 不是 `off`，自建时 `--bootstrap` 指向的是这台公共节点；两边没有直连路径时还要有共同的 relay，公共节点的开放 relay 会在登记时提供给 Node。见 [从外网访问](node.md#从外网访问)。
+**手机打开官方页面或自建公共节点后连不上个人设备。** 公共节点按设备编号在全网表里找到个人设备上的 Node。检查这台 Node 正在运行，`vibeface status` 的 `Mesh` 不是 `off`，`vibeface mesh status` 有邻居，自建时两边在同一个网络名下；两边没有直连路径时还要有共同的 relay，Node 会从全网表里选用公共节点宣告的开放 relay。见 [从外网访问](node.md#从外网访问)。
 
 **任务停在“待核对”。** Node 无法确认一项工作是否执行过时不会自己重做，见 [待核对](node.md#待核对)。
 

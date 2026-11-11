@@ -14,6 +14,35 @@ const INBOUND: &str = "peer-inbound:";
 const OUTBOUND: &str = "peer-outbound:";
 const MAX_PENDING: usize = 1024;
 
+/// A definite business refusal; persistence and other unknown failures stay retryable.
+#[derive(Debug)]
+pub(crate) struct AdmissionRejected(String);
+
+impl AdmissionRejected {
+    pub(crate) fn new(detail: impl Into<String>) -> Self {
+        Self(detail.into())
+    }
+}
+
+impl std::fmt::Display for AdmissionRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AdmissionRejected {}
+
+pub(crate) fn authorize_peer_node_from(
+    connection: &Connection,
+    network: &str,
+    device: &str,
+) -> Result<()> {
+    super::membership_from(connection, network)?
+        .node(device)
+        .map(|_| ())
+        .map_err(|error| AdmissionRejected::new(error.to_string()).into())
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum PeerCommand {
@@ -298,6 +327,24 @@ pub(crate) fn held_answer_subject_from(
         "held question belongs to another conversation or request Node"
     );
     Ok(Some(subject))
+}
+
+fn held_delivery_subject_from(
+    connection: &Connection,
+    network: &str,
+    payload: &PeerCommand,
+) -> Result<Option<Subject>> {
+    let PeerCommand::Deliver {
+        conversation_id,
+        trigger,
+    } = payload
+    else {
+        return Ok(None);
+    };
+    let Some(("message", message_id)) = trigger.split_once(':') else {
+        return Ok(None);
+    };
+    held_answer_subject_from(connection, network, conversation_id, message_id)
 }
 
 fn held_answer_target(subject: &Subject) -> String {
@@ -613,21 +660,7 @@ impl Store {
         payload: PeerCommand,
         source: (Option<u64>, u64, Vec<String>),
     ) -> Result<PeerOutbound> {
-        let held = match &payload {
-            PeerCommand::Deliver {
-                conversation_id,
-                trigger,
-            } => match trigger.split_once(':') {
-                Some(("message", message_id)) => held_answer_subject_from(
-                    &self.connection,
-                    network,
-                    conversation_id,
-                    message_id,
-                )?,
-                _ => None,
-            },
-            _ => None,
-        };
+        let held = held_delivery_subject_from(&self.connection, network, &payload)?;
         let owner_epoch = if held.is_some() {
             0
         } else {
@@ -835,7 +868,7 @@ impl Store {
                 ensure!(
                     self.peer_delivery_target(network, conversation_id, trigger)?
                         == envelope.target,
-                    "delivery target does not match its signed input"
+                    AdmissionRejected::new("delivery target does not match its signed input")
                 );
                 Some(self.peer_source(network, conversation_id, trigger)?)
             }
@@ -848,14 +881,14 @@ impl Store {
                             && envelope.owner_epoch == assignment.bot_owner_epoch
                             && envelope.sequence == 0
                             && envelope.target == format!("work:{}", spec.work_id),
-                        "Work does not match its frozen assignment"
+                        AdmissionRejected::new("Work does not match its frozen assignment")
                     );
                     let revision = envelope
                         .revision
                         .context("assignment Work revision is missing")?;
                     ensure!(
                         revision >= assignment.started_revision,
-                        "Work revision predates its assignment"
+                        AdmissionRejected::new("Work revision predates its assignment")
                     );
                     if !super::workspace::assignment_work_source_matches_from(
                         &self.connection,
@@ -878,7 +911,7 @@ impl Store {
                 revision == envelope.revision
                     && sequence == envelope.sequence
                     && refs == envelope.causal_refs,
-                "command metadata does not match its signed source"
+                AdmissionRejected::new("command metadata does not match its signed source")
             );
         }
         Ok(true)
@@ -991,9 +1024,8 @@ impl Store {
                     return Ok(None);
                 }
                 let work = self
-                    .works(network, conversation_id)?
-                    .into_iter()
-                    .find(|work| work.work_id == *work_id)
+                    .work(network, work_id)?
+                    .filter(|work| work.conversation_id == *conversation_id)
                     .context("stopped work source not found")?;
                 ensure!(
                     work.target_node == local,
@@ -1044,34 +1076,23 @@ impl Store {
             let Some(effective) = effective else {
                 return Ok(false);
             };
-            ensure!(effective, "command source is no longer authorized");
+            ensure!(
+                effective,
+                AdmissionRejected::new("command source is no longer authorized")
+            );
         }
         let Some(conversation) = self.conversation(network, envelope.payload.conversation())?
         else {
             return Ok(false);
         };
-        let held = match &envelope.payload {
-            PeerCommand::Deliver {
-                conversation_id,
-                trigger,
-            } => match trigger.split_once(':') {
-                Some(("message", message_id)) => held_answer_subject_from(
-                    &self.connection,
-                    network,
-                    conversation_id,
-                    message_id,
-                )?,
-                _ => None,
-            },
-            _ => None,
-        };
+        let held = held_delivery_subject_from(&self.connection, network, &envelope.payload)?;
         ensure!(
             if held.is_some() {
                 envelope.owner_epoch == 0
             } else {
                 conversation.owner_epoch == envelope.owner_epoch
             },
-            "command belongs to another owner epoch"
+            AdmissionRejected::new("command belongs to another owner epoch")
         );
         if !self.peer_original_metadata(network, envelope)? {
             return Ok(false);
@@ -1093,7 +1114,7 @@ impl Store {
                         &spec.dispatcher,
                         &spec.conversation
                     )?,
-                "assignment no longer authorizes this Work revision"
+                AdmissionRejected::new("assignment no longer authorizes this Work revision")
             );
         }
         Ok(true)

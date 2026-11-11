@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 from typing import Any
+from unittest import TestCase
 
 
 UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -485,12 +486,8 @@ def self_test() -> None:
                          clock=lambda: next(ticks))
     budget.run(["fixture"], timeout=4)
     budget.run(["fixture"], timeout=4)
-    try:
+    with TestCase().assertRaises(subprocess.TimeoutExpired, msg='an exhausted probe budget started another process'):
         budget.run(["fixture"], timeout=4)
-    except subprocess.TimeoutExpired:
-        pass
-    else:
-        raise AssertionError("an exhausted probe budget started another process")
     assert probe_timeouts == [4, 0.5]
     from tempfile import TemporaryDirectory
 
@@ -511,12 +508,8 @@ def self_test() -> None:
     assert socket is not None
     socket_path, host_pid = socket
     assert socket_path.name == "snapshot.sock" and host_pid == 42
-    try:
+    with TestCase().assertRaises(ValueError, msg='accepted a socket namespace for another simulator'):
         snapshot_socket_path(socket_command, "87654321-4321-4321-4321-cba987654321")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("accepted a socket namespace for another simulator")
 
     secret = "unknown-raw-secret-path-token-uuid-args-must-drop"
     fixture = {
@@ -568,12 +561,8 @@ def self_test() -> None:
             return original_lstat(path)
         Path.lstat = reject_outside_lstat
         try:
-            try:
+            with TestCase().assertRaises(ValueError, msg='accepted a parent artifact symlink'):
                 inside_artifacts(root2, root2 / ".artifacts/native/private")
-            except ValueError:
-                pass
-            else:
-                raise AssertionError("accepted a parent artifact symlink")
         finally:
             Path.lstat = original_lstat
         assert not outside.exists()

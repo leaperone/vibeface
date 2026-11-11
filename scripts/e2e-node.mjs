@@ -6,6 +6,23 @@ import { mkdir, rename, unlink, writeFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { resolve } from 'node:path';
 
+function authorized(value, token) {
+  if (typeof value !== 'string') return false;
+  const received = Buffer.from(value);
+  const expected = Buffer.from(`Bearer ${token}`);
+  return received.length === expected.length && timingSafeEqual(received, expected);
+}
+
+if (process.argv[2] === '--self-test') {
+  const token = 'a'.repeat(64);
+  assert(authorized(`Bearer ${token}`, token));
+  for (const value of [undefined, '', [], `Bearer ${'b'.repeat(64)}`, `Bearer é${'a'.repeat(63)}`]) {
+    assert.equal(authorized(value, token), false);
+  }
+  console.log('e2e controller credential self-test passed');
+  process.exit(0);
+}
+
 const port = Number(process.argv[2]);
 assert(Number.isInteger(port) && port > 0 && port < 65536, 'Expected a TCP port');
 const repository = resolve(import.meta.dirname, '..');
@@ -39,7 +56,7 @@ async function stopFixture() {
   });
 }
 async function startFixture(kind) {
-  assert(['single', 'delivery', 'workspace', 'bootstrap'].includes(kind), 'Unknown fixture kind');
+  assert(['single', 'delivery', 'workspace', 'mesh', 'cursor'].includes(kind), 'Unknown fixture kind');
   await stopFixture();
   const args = [resolve(repository, 'scripts/verify-node.py'), '--e2e-fixture', '--binary', binary,
     '--artifacts', root, '--fixture-port', String(port), '--fixture-kind', kind];
@@ -80,10 +97,7 @@ function command(value) {
   return result;
 }
 const control = createServer(async (request, response) => {
-  const authorization = request.headers.authorization;
-  const expected = `Bearer ${token}`;
-  if (request.method !== 'POST' || request.url !== '/' || typeof authorization !== 'string'
-    || authorization.length !== expected.length || !timingSafeEqual(Buffer.from(authorization), Buffer.from(expected))) {
+  if (request.method !== 'POST' || request.url !== '/' || !authorized(request.headers.authorization, token)) {
     response.writeHead(403).end(); return;
   }
   if (changing || stopping) { response.writeHead(409).end(); return; }
@@ -96,7 +110,7 @@ const control = createServer(async (request, response) => {
     let result;
     if (value.op === 'reset') result = await startFixture(value.kind);
     else if (value.op === 'stop') { await stopFixture(); result = { stopped: true }; }
-    else if (['restart', 'inspect', 'workspace_release', 'workspace_inspect', 'workspace_native_setup', 'bootstrap_info', 'bootstrap_pairing', 'bootstrap_approve'].includes(value.op)) result = await command(value);
+    else if (['restart', 'inspect', 'cursor_login', 'cursor_inspect', 'workspace_release', 'workspace_inspect', 'mesh_info', 'mesh_pairing', 'mesh_approve'].includes(value.op)) result = await command(value);
     else throw new Error('Unknown fixture operation');
     response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(result));
   } catch (error) {

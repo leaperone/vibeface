@@ -373,6 +373,8 @@ async fn cursor_stream_and_journal_redact_fragmented_credentials() -> Result<()>
     let mut turn = turn(&root, "redaction");
     turn.env
         .insert("FIXTURE_SECRET".into(), "synthetic-sensitive-token".into());
+    turn.env
+        .insert("FIXTURE_SHORT_SECRET".into(), "synthetic-sensitive".into());
     turn.env.insert("FAKE_ACP_CHUNK_SIZE".into(), "1".into());
     let updates = Arc::new(Mutex::new(Vec::new()));
     let seen = updates.clone();
@@ -397,6 +399,7 @@ async fn cursor_stream_and_journal_redact_fragmented_credentials() -> Result<()>
         .filter_map(|r| r["text"].as_str())
         .collect::<String>();
     assert!(!joined.contains("synthetic-sensitive-token"));
+    assert!(!joined.contains("-token"));
     {
         let updates = updates.lock().unwrap();
         let snapshot = updates.last().context("final reply snapshot")?;
@@ -422,8 +425,7 @@ async fn cursor_stream_and_journal_redact_fragmented_credentials() -> Result<()>
 }
 
 #[tokio::test]
-async fn a_signed_out_or_partial_status_never_starts_acp_and_explicit_auth_stays_supported()
--> Result<()> {
+async fn a_signed_out_or_partial_status_never_starts_acp_even_with_explicit_auth() -> Result<()> {
     let root = root()?;
     let agent = agent(&root)?;
     for state in ["FAKE_STATUS_SIGNED_OUT", "FAKE_STATUS_PARTIAL"] {
@@ -444,7 +446,11 @@ async fn a_signed_out_or_partial_status_never_starts_acp_and_explicit_auth_stays
             "status exit 0 does not authorize starting ACP"
         );
     }
-    for name in ["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"] {
+    for name in [
+        "CURSOR_API_KEY",
+        "CURSOR_AUTH_TOKEN",
+        "AGENT_CLI_CREDENTIAL_STORE",
+    ] {
         let env = BTreeMap::from([
             (name.into(), "synthetic-explicit-auth".into()),
             ("FAKE_STATUS_SIGNED_OUT".into(), "1".into()),
@@ -452,8 +458,25 @@ async fn a_signed_out_or_partial_status_never_starts_acp_and_explicit_auth_stays
         let result = agent
             .provider_observation(&fixture(), &root, &root.join(name), &env)
             .await?;
-        assert_eq!(result.authentication, CursorAuthentication::Authenticated);
-        assert!(result.launchable);
+        assert_eq!(result.authentication, CursorAuthentication::SignInRequired);
+        assert!(!result.launchable);
+        assert!(!root.join("acp-starts").exists());
+        let mut turn = turn(&root, name);
+        turn.env = env;
+        assert!(
+            agent
+                .run(
+                    &turn,
+                    "must not run",
+                    None,
+                    |_| async { Ok(()) },
+                    watch::channel(false).1,
+                    |_| async { Ok(()) }
+                )
+                .await
+                .is_err()
+        );
+        assert!(!root.join("prompts.jsonl").exists());
     }
     agent.stop().await;
     std::fs::remove_dir_all(root)?;
@@ -610,6 +633,7 @@ async fn orphan_recovery_checks_the_recorded_process_before_ending_its_tree() ->
         wrong[0]["identity"]["value"] = serde_json::json!("another-process-start");
         vibeface_bridge::platform::privatefs::write_atomic(&file, &serde_json::to_vec(&wrong)?)?;
         CursorAgent::kill_orphan(&file);
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         assert!(
             !pending.is_finished(),
             "a stale identifier cannot end another CLI process"

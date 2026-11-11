@@ -16,14 +16,23 @@ use std::{
 };
 use vibeface_bridge::platform::privatefs;
 
+pub(crate) mod actor;
+pub use actor::StoreActor;
 pub(crate) mod admission;
+mod attachment_scope;
 pub(crate) mod bot_settings;
 pub(crate) mod bots;
+mod client_receipts;
+pub(crate) mod conversation_history;
+pub(crate) mod conversation_sections;
+pub(crate) mod conversation_settings_history;
+mod conversation_settings_projection;
 mod log;
 pub(crate) mod mailbox;
 pub(crate) mod questions;
 mod reduce;
 pub(crate) mod scheduler;
+pub(crate) mod scheduler_history;
 pub(crate) mod scope_projection;
 mod sync;
 pub(crate) mod triage;
@@ -83,6 +92,17 @@ pub(crate) struct HistoryFilter<'a> {
     pub keyword: Option<&'a str>,
 }
 
+pub(crate) fn network_from(connection: &Connection) -> Result<Option<NetworkId>> {
+    let mut statement = connection.prepare("SELECT network_id FROM networks LIMIT 2")?;
+    let mut rows = statement.query([])?;
+    let network = rows.next()?.map(|row| row.get(0)).transpose()?;
+    ensure!(
+        rows.next()?.is_none(),
+        "Node has more than one personal network"
+    );
+    Ok(network)
+}
+
 /// Merges `state` into the stored history. Returns whether the projections were rebuilt.
 ///
 /// A recovery takes effect with time alone, and a late veto can put the earlier directory back, so
@@ -97,6 +117,10 @@ pub(crate) fn install_trust_bundle_in(
     ensure!(
         state.genesis.network_id == network_id,
         "membership belongs to another personal network"
+    );
+    ensure!(
+        network_from(connection)?.is_none_or(|installed| installed == network_id),
+        "Node already belongs to another personal network"
     );
     state.project()?;
     let previous: Option<String> = connection
@@ -251,7 +275,7 @@ impl Store {
                 ))?;
             }
             SCHEMA_VERSION => {
-                schema_guard::validate_application_schema(&connection)?;
+                schema_guard::install_derived_objects(&connection)?;
             }
             _ => bail!(
                 "unsupported database schema version {version}; initialize a fresh Node data directory"
@@ -274,6 +298,7 @@ impl Store {
         )?;
         Ok(store)
     }
+    #[cfg(test)]
     pub fn install_trust_bundle(&mut self, network_id: &str, state: &NetworkState) -> Result<bool> {
         let tx = self
             .connection
@@ -299,7 +324,8 @@ impl Store {
             version == SCHEMA_VERSION,
             "unsupported database schema version {version}"
         );
-        schema_guard::validate_application_schema(&connection)?;
+        schema_guard::validate_readonly_schema(&connection)?;
+        network_from(&connection)?;
         Ok(Self {
             connection,
             blob_dir: blob_dir_for(path),
@@ -317,20 +343,11 @@ impl Store {
                 .optional()?,
         )
     }
-    /// Calls `written` whenever any log head is written, whichever path appended or ingested it.
-    pub(crate) fn on_log_head_written(&self, written: impl Fn() + Send + 'static) {
-        self.connection
-            .update_hook(Some(move |_, _: &str, table: &str, _| {
-                if table == "log_heads" {
-                    written();
-                }
-            }));
-    }
     /// The member record of a current, unrevoked Node.
     pub fn authorize_node(&self, network_id: &str, device_id: &str) -> Result<Member> {
         authorize_node_from(&self.connection, network_id, device_id)
     }
-    /// Stores each event or reports why not; one bad event never aborts the batch.
+    /// Stores each event or rejects invalid input; database and internal errors roll back the batch.
     /// Signatures are verified here, once; stored events are trusted afterwards.
     pub fn ingest_events(
         &mut self,
@@ -453,17 +470,6 @@ impl Store {
     /// `{author: max_seq}` of stored events: every stored event's dependencies are stored too.
     pub fn version_vector(&self, network_id: &str) -> Result<VersionVector> {
         log::version_vector_from(&self.connection, network_id)
-    }
-
-    /// The conversation's effective events covered by `basis` (default: all of them), in shared
-    /// order.
-    pub fn context(
-        &self,
-        network_id: &str,
-        scope_id: &str,
-        basis: Option<&VersionVector>,
-    ) -> Result<Context> {
-        context_from(&self.connection, network_id, scope_id, basis)
     }
 
     /// What a turn's prompt reads at the job's basis: the events after the newest checkpoint, or
@@ -755,27 +761,20 @@ impl Store {
         message_id: &str,
         attachment: &Attachment,
     ) -> Result<(PathBuf, Vec<u8>)> {
-        if let Some(input) = self.queued_workspace_input(network, message_id)? {
-            ensure!(
-                input.conversation_id == conversation
-                    && input.input.attachments.contains(attachment),
-                "attachment is outside the signed input"
-            );
-            if self
-                .referenced_size(network, conversation, &attachment.hash)
-                .is_err()
-            {
-                return self.verified_blob_path(
-                    network,
-                    crate::workspace::WORKSPACE_SCOPE,
-                    attachment,
-                );
-            }
-        }
+        let source = self
+            .input_attachment_source(network, message_id)?
+            .context("signed input missing")?;
+        ensure!(
+            source.input.conversation_id == conversation
+                && source.input.input.attachments.contains(attachment),
+            "attachment is outside the signed input"
+        );
         self.verified_blob_path(network, conversation, attachment)
     }
 
-    /// Attachments are files named by their SHA-256; writes are atomic and reads re-verify.
+    /// Test fixture that stores a whole attachment at once; production writes go through
+    /// `partial_blob_file` and `blob_file`.
+    #[cfg(test)]
     pub fn put_blob(&mut self, expected: &BlobRef, content: &[u8]) -> Result<()> {
         ensure!(
             content.len() <= MAX_BLOB_BYTES && content.len() as u64 == expected.size,
@@ -796,14 +795,7 @@ impl Store {
 
     /// Reads an attachment referenced by a stored event of this conversation.
     pub(crate) fn referenced_size(&self, network: &str, scope: &str, hash: &str) -> Result<u64> {
-        self.connection
-            .query_row(
-                "SELECT b.size FROM event_blobs b JOIN events e ON e.network_id=b.network_id AND e.hash=b.hash WHERE b.network_id=? AND b.blob=? AND e.scope_id=? LIMIT 1",
-                params![network, hash, scope],
-                |r| r.get(0),
-            )
-            .optional()?
-            .context("attachment is not referenced by this conversation")
+        self.attachment_reference_size(network, scope, hash)
     }
 
     /// Up to `len` bytes of an attachment from `offset`, and its size. The file was verified
@@ -981,40 +973,9 @@ impl Store {
             })
             .collect()
     }
-    /// Counts one more model run against today's UTC limit, or refuses it.
-    pub fn reserve_budget(&mut self, network_id: &str, units: u64, limit: u64) -> Result<()> {
-        ensure!(
-            units > 0 && limit <= i64::MAX as u64,
-            "invalid budget units/limit"
-        );
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (day, used): (String, u64) = tx.query_row(
-            "SELECT date('now'), COALESCE((SELECT used FROM budget_days WHERE network_id=?1 AND day=date('now')), 0)",
-            [network_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        let next = used.checked_add(units).context("budget overflow")?;
-        ensure!(next <= limit, "daily model budget exhausted");
-        tx.execute("INSERT INTO budget_days(network_id,day,used) VALUES(?,?,?) ON CONFLICT(network_id,day) DO UPDATE SET used=excluded.used",params![network_id,day,next])?;
-        tx.commit()?;
-        Ok(())
-    }
     /// A Node belongs to at most one network.
     pub fn network(&self) -> Result<Option<NetworkId>> {
-        Ok(self
-            .connection
-            .query_row("SELECT network_id FROM networks", [], |r| r.get(0))
-            .optional()?)
-    }
-    pub fn scopes(&self, network_id: &str) -> Result<Vec<ScopeId>> {
-        let mut statement = self.connection.prepare(
-            "SELECT conversation_id FROM conversations WHERE network_id=? ORDER BY conversation_id",
-        )?;
-        Ok(statement
-            .query_map([network_id], |r| r.get(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+        network_from(&self.connection)
     }
     /// A member Node's last `capabilities` answer, kept only here to show while it is offline.
     pub fn peer_capabilities(&self, peer: &str) -> Result<Option<Value>> {
@@ -1242,21 +1203,6 @@ fn optional_json<T: DeserializeOwned>(value: Option<String>) -> Result<Option<T>
     value.map(|v| Ok(serde_json::from_str(&v)?)).transpose()
 }
 
-pub(crate) fn context_from(
-    connection: &Connection,
-    network_id: &str,
-    scope_id: &str,
-    basis: Option<&VersionVector>,
-) -> Result<Context> {
-    context_after(
-        connection,
-        network_id,
-        scope_id,
-        basis,
-        &VersionVector::new(),
-    )
-}
-
 /// The newest effective checkpoint of the conversation within `basis` (default: all), and the
 /// vector it covers. Read through the kind index, so its cost does not grow with the history.
 pub(crate) fn latest_checkpoint_from(
@@ -1323,7 +1269,7 @@ pub(crate) fn event_about_from(
         .transpose()
 }
 
-fn context_after(
+pub(crate) fn context_after(
     connection: &Connection,
     network_id: &str,
     scope_id: &str,

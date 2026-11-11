@@ -1,4 +1,4 @@
-name: Release platform package
+name: Reusable / Compose platform package
 on:
   workflow_call:
     inputs:
@@ -14,6 +14,7 @@ permissions:
   contents: read
 jobs:
   compose:
+    name: Compose CLI + Core / ${{ inputs.target }}
     runs-on: ${{ inputs.runner }}
     defaults:
       run: {shell: bash}

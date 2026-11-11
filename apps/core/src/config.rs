@@ -2,20 +2,18 @@ use crate::crypto::LocalIdentity;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
-    ffi::OsString,
     net::{IpAddr, SocketAddr},
     num::{NonZeroU32, NonZeroUsize},
     path::{Path, PathBuf},
 };
 use vibeface_bridge::platform::privatefs;
+use zeroize::Zeroizing;
 
-/// Bumped whenever stored data stops being readable by the previous build.
+/// Fixed at 1 before the first stable release; schema changes update the fingerprint below.
 pub use vibeface_control::DATA_EPOCH;
 /// SHA-256 of the Core and delivery initial SQL schemas.
 pub const DATA_EPOCH_SCHEMA_SHA256: &str =
-    "a854af1e33092a6f80232b013cb3585b4959ad59b012e0cc11401bf1511569fe";
-/// Bumped whenever a release package stops being installable by the previous updater.
-pub use vibeface_control::UPDATE_PROTOCOL;
+    "6060f835c4ad94fa814daca98cbebd9a82b29fac24235ef479dfbc4003f04939";
 pub fn data_epoch_marker() -> Vec<u8> {
     format!(r#"{{"data_epoch":{DATA_EPOCH}}}"#).into_bytes()
 }
@@ -105,46 +103,6 @@ impl Forwarding {
     }
 }
 
-pub const NO_HOME: &str =
-    "no data directory: HOME is unset or not absolute; pass --data-dir or set VIBEFACE_DATA_DIR";
-
-/// `$HOME/.vibeface`, or empty when HOME is unset or relative so that `data_dir` reports it.
-pub fn default_data_dir() -> PathBuf {
-    home_data_dir(std::env::var_os("HOME"))
-}
-
-pub fn home_data_dir(home: Option<OsString>) -> PathBuf {
-    home.map(PathBuf::from)
-        .filter(|home| home.is_absolute())
-        .map(|home| home.join(".vibeface"))
-        .unwrap_or_default()
-}
-
-/// The chosen data directory, or `$HOME/.vibeface` when none was named.
-pub fn data_dir_or_home(dir: Option<PathBuf>, home: Option<OsString>) -> Result<PathBuf> {
-    let dir = dir.unwrap_or_else(|| home_data_dir(home));
-    ensure!(!dir.as_os_str().is_empty(), NO_HOME);
-    ensure!(dir.is_absolute(), "specify an absolute data directory");
-    Ok(dir)
-}
-
-pub fn data_dir(value: &str) -> std::result::Result<PathBuf, String> {
-    if value.is_empty() {
-        Err(NO_HOME.into())
-    } else {
-        absolute_path(value)
-    }
-}
-
-pub fn absolute_path(value: &str) -> std::result::Result<PathBuf, String> {
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        Ok(path)
-    } else {
-        Err("specify an absolute path".into())
-    }
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -174,9 +132,13 @@ pub struct Config {
     /// Where triaged local sessions go; the webhook secret is a separate private file.
     #[serde(default)]
     pub triage: crate::triage::TriageConfig,
-    /// Which local providers are on and the roles each serves; their keys are a separate file.
+    /// Which local providers are on and the roles each serves.
     #[serde(default)]
     pub providers: crate::providers::Providers,
+    /// Provider variables belong to this private snapshot and never to shared records.
+    pub(crate) provider_env: crate::providers::ProviderEnv,
+    /// An initial private Codex configuration, published from this snapshot when idle.
+    pub(crate) codex_config: Option<String>,
 }
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -209,10 +171,14 @@ impl Config {
             scheduling: Default::default(),
             triage: Default::default(),
             providers: Default::default(),
+            provider_env: Default::default(),
+            codex_config: None,
         }
     }
     pub fn load(dir: &Path) -> Result<Self> {
-        let config: Self = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
+        let bytes = Zeroizing::new(std::fs::read(dir.join("config.json"))?);
+        let mut config: Self = serde_json::from_slice(&bytes)?;
+        config.provider_env.remove_cursor_auth_overrides();
         config.register_private_paths(dir);
         config.validate()?;
         Ok(config)
@@ -271,10 +237,7 @@ impl Config {
             "invalid SDK timeout"
         );
         for root in &self.roots {
-            ensure!(
-                root.is_absolute() && root.is_dir(),
-                "project root must be an existing absolute directory"
-            );
+            ensure!(root.is_absolute(), "project root must be an absolute path");
         }
         self.triage.validate()?;
         self.providers.validate(
@@ -293,10 +256,18 @@ impl Config {
                 "{} does not run bots",
                 m.provider.name()
             );
-            ensure!(m.workspace.is_dir(), "manager workspace does not exist");
+            ensure!(
+                m.workspace.is_absolute(),
+                "manager workspace must be absolute"
+            );
             m.provider
                 .validate_reasoning_effort(m.reasoning_effort.as_deref())?;
             m.backup.validate()?;
+        }
+        self.provider_env.validate()?;
+        if let Some(source) = &self.codex_config {
+            toml::from_str::<toml::Value>(source)
+                .map_err(|_| anyhow::anyhow!("invalid private Codex configuration"))?;
         }
         Ok(())
     }
@@ -345,9 +316,24 @@ impl Config {
         Ok(origins)
     }
     pub fn save(&self, dir: &Path) -> Result<()> {
+        self.save_and_publish(dir, || {})
+    }
+
+    pub(crate) fn save_and_publish(&self, dir: &Path, publish: impl FnOnce()) -> Result<()> {
         self.register_private_paths(dir);
         self.validate()?;
-        private_write(&dir.join("config.json"), &serde_json::to_vec_pretty(self)?)
+        let bytes = Zeroizing::new(serde_json::to_vec_pretty(self)?);
+        let path = dir.join("config.json");
+        let saved = private_write(&path, &bytes);
+        // A rename may succeed before its directory flush fails; memory must follow the file.
+        if saved.is_ok()
+            || std::fs::read(&path)
+                .map(Zeroizing::new)
+                .is_ok_and(|stored| stored.as_slice() == bytes.as_slice())
+        {
+            publish();
+        }
+        saved
     }
 }
 
@@ -373,10 +359,10 @@ pub fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
     privatefs::write_atomic(path, bytes)
 }
 pub fn identity(dir: &Path) -> Result<LocalIdentity> {
-    serde_json::from_slice(
-        &std::fs::read(dir.join("identity.json")).context("run vibeface init first")?,
-    )
-    .context("invalid local identity")
+    let bytes = Zeroizing::new(
+        std::fs::read(dir.join("identity.json")).context("run vibeface init first")?,
+    );
+    serde_json::from_slice(&bytes).context("invalid local identity")
 }
 pub fn lock_data_dir(dir: &Path) -> Result<std::fs::File> {
     let lock = privatefs::open_or_create(&dir.join("node.lock"))?;
@@ -413,6 +399,74 @@ mod tests {
         ] {
             assert!(limits.validate().is_err());
         }
+    }
+
+    #[test]
+    fn private_configuration_keeps_unavailable_directories_and_one_provider_snapshot() -> Result<()>
+    {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("private-configuration-{}", uuid::Uuid::new_v4()));
+        private_dir(&dir)?;
+        let root = dir.join("unmounted-root");
+        let workspace = dir.join("unmounted-workspace");
+        let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![root.clone()], false);
+        configuration.providers.execution.clear();
+        configuration.manager = Some(ManagerSettings {
+            provider: crate::providers::Provider::Pi,
+            workspace: workspace.clone(),
+            model: "fixture-model".into(),
+            reasoning_effort: None,
+            backup: Default::default(),
+        });
+        configuration.provider_env.apply(
+            crate::providers::Provider::Pi,
+            [(
+                "FIXTURE_API_KEY".into(),
+                Some("synthetic-private-key".into()),
+            )]
+            .into(),
+        )?;
+        let published = std::cell::Cell::new(false);
+        std::fs::create_dir(dir.join("config.json"))?;
+        std::fs::write(dir.join("config.json/sentinel"), "preserved")?;
+        assert!(
+            configuration
+                .save_and_publish(&dir, || published.set(true))
+                .is_err()
+        );
+        assert!(!published.get());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.json/sentinel"))?,
+            "preserved"
+        );
+        std::fs::remove_dir_all(dir.join("config.json"))?;
+        configuration.save_and_publish(&dir, || published.set(true))?;
+        assert!(published.get());
+        let saved = Config::load(&dir)?;
+        assert_eq!(saved.roots, std::slice::from_ref(&root));
+        assert_eq!(
+            saved.manager.as_ref().context("manager")?.workspace,
+            workspace
+        );
+        assert!(saved.provider_env == configuration.provider_env);
+        assert!(!root.exists() && !workspace.exists());
+        assert!(!dir.join("provider-env.json").exists());
+        privatefs::ensure_private(&dir.join("config.json"), "private configuration")?;
+        let mut malformed = serde_json::to_value(&saved)?;
+        malformed.as_object_mut().unwrap().remove("provider_env");
+        assert!(serde_json::from_value::<Config>(malformed).is_err());
+        configuration.roots = vec!["relative-root".into()];
+        published.set(false);
+        assert!(
+            configuration
+                .save_and_publish(&dir, || published.set(true))
+                .is_err()
+        );
+        assert!(!published.get());
+        assert!(Config::load(&dir)?.provider_env == saved.provider_env);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]

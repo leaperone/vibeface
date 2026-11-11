@@ -33,6 +33,18 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const STOP_TIMEOUT: Duration = Duration::from_secs(6);
 static NEXT_PROCESS: AtomicU64 = AtomicU64::new(0);
 
+pub const CURSOR_AUTH_OVERRIDES: [&str; 3] = [
+    "CURSOR_API_KEY",
+    "CURSOR_AUTH_TOKEN",
+    "AGENT_CLI_CREDENTIAL_STORE",
+];
+
+pub fn is_cursor_sdk_bridge(executable: &Path) -> bool {
+    executable
+        .file_stem()
+        .is_some_and(|name| name == "cursor-sdk-bridge")
+}
+
 #[derive(Clone, Copy)]
 enum CursorCommand {
     Acp,
@@ -212,18 +224,13 @@ fn process_start(process: u32) -> Result<String> {
     Ok(value)
 }
 impl Processes {
+    /// Writes this run's processes plus any earlier record whose tree is not confirmed gone, so
+    /// a tree an earlier start could not end is still there to try again after the next start.
     fn save(&self, running: &BTreeMap<String, Tracked>) -> Result<()> {
         let Some(path) = &self.pidfile else {
             return Ok(());
         };
-        if running.is_empty() {
-            return match std::fs::remove_file(path) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e.into()),
-            };
-        }
-        let records: Vec<_> = running
+        let mut records: Vec<_> = running
             .iter()
             .map(|(token, tracked)| ProcessRecord {
                 token: token.clone(),
@@ -231,6 +238,21 @@ impl Processes {
                 identity: tracked.identity.clone(),
             })
             .collect();
+        if let Ok(bytes) = std::fs::read(path)
+            && let Ok(earlier) = serde_json::from_slice::<Vec<ProcessRecord>>(&bytes)
+        {
+            records.extend(earlier.into_iter().filter(|record| {
+                !running.contains_key(&record.token)
+                    && !matches!(platform::tree::Leftover::find(&record.token), Ok(None))
+            }));
+        }
+        if records.is_empty() {
+            return match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.into()),
+            };
+        }
         platform::privatefs::write_atomic(path, &serde_json::to_vec(&records)?)
     }
     fn track(&self, token: String, tracked: Tracked) -> Result<()> {
@@ -374,15 +396,16 @@ impl CursorAgent {
         let Ok(records) = serde_json::from_slice::<Vec<ProcessRecord>>(&bytes) else {
             return;
         };
+        let mut unconfirmed = Vec::new();
         for record in records {
-            let same = match record.identity {
+            let same = match &record.identity {
                 #[cfg(unix)]
                 ProcessIdentity::UnixStart(expected) => record
                     .token
                     .parse()
                     .ok()
                     .and_then(|pid| process_start(pid).ok())
-                    .is_some_and(|current| current == expected),
+                    .is_some_and(|current| current == *expected),
                 #[cfg(windows)]
                 ProcessIdentity::WindowsJob => true,
                 ProcessIdentity::Exited => false,
@@ -397,8 +420,18 @@ impl CursorAgent {
                 let accepted = |_: &str| true;
                 let _ = platform::tree::stop_recorded(&record.token, accepted);
             }
+            // A tree that cannot be confirmed gone stays on record for the next start.
+            if same && !matches!(platform::tree::Leftover::find(&record.token), Ok(None)) {
+                unconfirmed.push(record);
+            }
         }
-        let _ = std::fs::remove_file(pidfile);
+        if unconfirmed.is_empty() {
+            let _ = std::fs::remove_file(pidfile);
+        } else if let Ok(bytes) = serde_json::to_vec(&unconfirmed)
+            && let Err(error) = platform::privatefs::write_atomic(pidfile, &bytes)
+        {
+            tracing::warn!(%error, "could not preserve the unconfirmed process journal");
+        }
     }
     pub async fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
@@ -434,6 +467,10 @@ impl CursorAgent {
             "Cursor agent is stopped"
         );
         ensure!(
+            !is_cursor_sdk_bridge(executable),
+            "Cursor requires the official agent or cursor-agent CLI"
+        );
+        ensure!(
             workspace.is_absolute() && workspace.is_dir() && root.is_absolute(),
             "Cursor needs an existing absolute workspace and private store"
         );
@@ -461,8 +498,8 @@ impl CursorAgent {
             .envs(&self.env)
             .env("CURSOR_CONFIG_DIR", root.join("config"))
             .env("CURSOR_DATA_DIR", root.join("data"));
-        if env.contains_key("CURSOR_API_KEY") || env.contains_key("CURSOR_AUTH_TOKEN") {
-            command.env("AGENT_CLI_CREDENTIAL_STORE", "memory");
+        for name in CURSOR_AUTH_OVERRIDES {
+            command.env_remove(name);
         }
         if !model.is_empty() {
             command.args(["--model", model]);
@@ -487,7 +524,7 @@ impl CursorAgent {
         let identity = match process_start(group) {
             Ok(start) => ProcessIdentity::UnixStart(start),
             Err(error) => {
-                if child.try_wait()?.is_some() {
+                if platform::tree::try_observe_exit(&mut child)?.is_some() {
                     ProcessIdentity::Exited
                 } else {
                     tree.kill();
@@ -573,7 +610,7 @@ impl CursorAgent {
                     }
                 }
             }
-            let _ = terminate_process_tree(&mut child, &mut tree).await;
+            let cleared = terminate_process_tree(&mut child, &mut tree).await;
             stdout_task.abort();
             stderr_task.abort();
             if !stdout_joined {
@@ -583,7 +620,9 @@ impl CursorAgent {
             drop(stdin);
             drop(child);
             drop(tree);
-            processes.forget(&token);
+            if cleared {
+                processes.forget(&token);
+            }
             let _ = exit.send(true);
         });
         Ok(Rpc {
@@ -674,18 +713,15 @@ impl CursorAgent {
         root: &Path,
         env: &BTreeMap<String, String>,
     ) -> Result<CursorObservation> {
-        let mut authentication = CursorAuthentication::Unknown;
-        if !env.contains_key("CURSOR_API_KEY") && !env.contains_key("CURSOR_AUTH_TOKEN") {
-            authentication = self
-                .subscription_authentication(executable, workspace, root, env)
-                .await?;
-            if authentication != CursorAuthentication::Authenticated {
-                return Ok(CursorObservation {
-                    launchable: false,
-                    authentication,
-                    catalog: CursorCatalog::Unavailable,
-                });
-            }
+        let authentication = self
+            .subscription_authentication(executable, workspace, root, env)
+            .await?;
+        if authentication != CursorAuthentication::Authenticated {
+            return Ok(CursorObservation {
+                launchable: false,
+                authentication,
+                catalog: CursorCatalog::Unavailable,
+            });
         }
         let mut rpc = self
             .spawn(executable, workspace, root, env, "", CursorCommand::Acp)
@@ -745,9 +781,10 @@ impl CursorAgent {
         let mut observed = false;
         let secrets: Vec<&str> = turn
             .env
-            .values()
-            .chain(self.env.values())
-            .map(String::as_str)
+            .iter()
+            .chain(self.env.iter())
+            .filter(|(name, value)| credential_value(name, value))
+            .map(|(_, value)| value.as_str())
             .chain(turn.callback_token.as_deref())
             .collect();
         let operation = async {
@@ -791,22 +828,18 @@ impl CursorAgent {
             if *cancel.borrow() {
                 bail!("Cursor cancelled before prompt submission");
             }
-            if !turn.env.contains_key("CURSOR_API_KEY")
-                && !turn.env.contains_key("CURSOR_AUTH_TOKEN")
-            {
-                stage = ProviderStage::Authentication;
-                ensure!(
-                    self.subscription_authentication(
-                        &turn.executable,
-                        &turn.workspace,
-                        &turn.local_store_root,
-                        &turn.env
-                    )
-                    .await?
-                        == CursorAuthentication::Authenticated,
-                    "Cursor CLI login is missing or unverified; run agent login explicitly"
-                );
-            }
+            stage = ProviderStage::Authentication;
+            ensure!(
+                self.subscription_authentication(
+                    &turn.executable,
+                    &turn.workspace,
+                    &turn.local_store_root,
+                    &turn.env
+                )
+                .await?
+                    == CursorAuthentication::Authenticated,
+                "Cursor CLI login is missing or unverified; run agent login explicitly"
+            );
             stage = ProviderStage::Launch;
             let mut rpc = self
                 .spawn(
@@ -1076,9 +1109,9 @@ fn cursor_models(response: &Value, env: &BTreeMap<String, String>) -> CursorCata
             !value.is_empty()
                 && value.len() <= 256
                 && !value.chars().any(char::is_control)
-                && !env
-                    .values()
-                    .any(|secret| !secret.is_empty() && value.contains(secret))
+                && !env.iter().any(|(name, secret)| {
+                    credential_value(name, secret) && value.contains(secret.as_str())
+                })
         };
         let Some(id) = model["modelId"].as_str().filter(valid) else {
             return CursorCatalog::Unavailable;
@@ -1340,19 +1373,44 @@ fn validate_origin(origin: &str) -> Result<()> {
     Ok(())
 }
 
-/// Existing line-based journals used by the Claude process owner.
+/// Existing line-based journals used by the Claude and pi process owners. A record stays until
+/// its tree is confirmed gone, so an unanswerable or still-running tree is never forgotten.
 pub fn kill_recorded_programs(pidfile: &Path) {
     let Ok(recorded) = std::fs::read_to_string(pidfile) else {
         return;
     };
+    let mut unconfirmed = String::new();
     for line in recorded.lines() {
-        if let Some((token, executable)) = line.split_once(' ')
-            && !executable.is_empty()
-        {
-            let _ = platform::tree::stop_recorded(token, |member| member.contains(executable));
+        // A journal record never contains a space, so the rest of the line is the whole
+        // program path even when a directory in it has one.
+        let Some((token, executable)) = line.split_once(' ') else {
+            unconfirmed.push_str(&format!("{line}\n"));
+            continue;
+        };
+        if executable.is_empty() {
+            unconfirmed.push_str(&format!("{line}\n"));
+            continue;
+        }
+        // The Windows job token already binds the root's creation time and job key, and a
+        // program started through a script runs under its interpreter's image.
+        if let Err(error) = platform::tree::stop_recorded(token, |member| {
+            cfg!(windows) || member.contains(executable)
+        }) {
+            tracing::debug!(
+                event = "agent.leftover_left_alone",
+                %error,
+                "a recorded program was not ended"
+            );
+        }
+        if !matches!(platform::tree::Leftover::find(token), Ok(None)) {
+            unconfirmed.push_str(&format!("{line}\n"));
         }
     }
-    let _ = std::fs::remove_file(pidfile);
+    if unconfirmed.is_empty() {
+        let _ = std::fs::remove_file(pidfile);
+    } else if let Err(error) = platform::privatefs::write_atomic(pidfile, unconfirmed.as_bytes()) {
+        tracing::warn!(%error, "could not preserve the unconfirmed process journal");
+    }
 }
 
 pub async fn wait_for_cancel(cancel: &mut watch::Receiver<bool>) {
@@ -1368,20 +1426,28 @@ pub async fn wait_for_cancel(cancel: &mut watch::Receiver<bool>) {
 
 /// Reaps this bridge's own process tree only; already accepted external work is unaffected.
 ///
-/// `true` means nothing of the tree is left. A `false` answer keeps the tree recorded so a
-/// later attempt, or the next run of the Node, ends it rather than losing track of it.
+/// `true` means nothing of the tree is left. A `false` answer leaves cleanup unconfirmed.
+/// Callers retain the record for later reconciliation.
 pub async fn terminate_process_tree(child: &mut Child, tree: &mut platform::tree::Tree) -> bool {
     let token = tree.token().to_owned();
-    tree.stop();
-    let reaped = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
-    if !matches!(reaped, Ok(Ok(_))) {
-        tree.kill();
-        if !matches!(
-            tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
-            Ok(Ok(_))
-        ) {
-            return false;
+    if cfg!(windows) || child.id() == Some(tree.root()) {
+        tree.ask_to_stop();
+        let stopped = tokio::time::timeout(platform::tree::GRACE, async {
+            // Keep the Unix leader unreaped until the last possible group signal.
+            while tree.has_live_members().await.unwrap_or(true) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        if stopped.is_err() {
+            tree.kill();
         }
+    }
+    if !matches!(
+        tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
+        Ok(Ok(_))
+    ) {
+        return false;
     }
     for _ in 0..20 {
         // Windows Tree::kill drops its Job handle after terminating it. Query the recorded job
@@ -1393,20 +1459,123 @@ pub async fn terminate_process_tree(child: &mut Child, tree: &mut platform::tree
                 tracing::warn!(%error, "could not confirm Cursor process-tree exit");
             }
         }
+        #[cfg(windows)]
         tree.kill();
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     false
 }
 
-fn redact_text(mut text: String, secrets: &[&str]) -> String {
-    for secret in secrets.iter().copied().filter(|secret| !secret.is_empty()) {
-        text = text.replace(secret, "[redacted]");
+/// Whether an environment value is a credential worth hiding in shared records. Ordinary values
+/// such as `DEBUG=1` or a workspace path must not be replaced, or every "1" in a reply vanishes.
+fn credential_value(name: &str, value: &str) -> bool {
+    if value.len() < 8 {
+        return false;
     }
-    text
+    if ["_KEY", "_TOKEN", "_SECRET", "_PASSWORD"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+    {
+        return true;
+    }
+    let lower = value.to_ascii_lowercase();
+    if [
+        "-----begin",
+        "bearer ",
+        "password=",
+        "password:",
+        "passwd=",
+        "secret=",
+        "api_key=",
+        "apikey=",
+        "token=",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return true;
+    }
+    value
+        .split(|c: char| c.is_whitespace() || "\"'`,;()[]{}<>".contains(c))
+        .any(|word| {
+            let lower = word.to_ascii_lowercase();
+            url_with_password(word)
+                || (word.len() >= 20
+                    && [
+                        "sk-",
+                        "sk_",
+                        "ghp_",
+                        "gho_",
+                        "ghs_",
+                        "ghu_",
+                        "github_pat_",
+                        "xoxb-",
+                        "xoxp-",
+                        "xapp-",
+                        "akia",
+                        "aiza",
+                        "glpat-",
+                        "hf_",
+                        "npm_",
+                    ]
+                    .iter()
+                    .any(|prefix| lower.starts_with(prefix)))
+                || (word.len() >= 32
+                    && word
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "-_+/=".contains(c))
+                    && word.chars().any(|c| c.is_ascii_digit())
+                    && word.chars().any(|c| c.is_ascii_uppercase())
+                    && word.chars().any(|c| c.is_ascii_lowercase()))
+        })
 }
 
-fn redact_progress(value: Value, secrets: &[&str]) -> Value {
+/// A connection string such as `postgres://user:pass@host/db` carries its password in the
+/// authority, so the whole value is a credential whatever its variable is called.
+fn url_with_password(word: &str) -> bool {
+    let Some((_, rest)) = word.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    authority.rsplit_once('@').is_some_and(|(userinfo, _)| {
+        userinfo
+            .split_once(':')
+            .is_some_and(|(_, pass)| !pass.is_empty())
+    })
+}
+
+pub fn redact_text(text: String, secrets: &[impl AsRef<str>]) -> String {
+    redact_prefix(&text, secrets, text.len(), 0).0
+}
+
+fn redact_prefix(
+    text: &str,
+    secrets: &[impl AsRef<str>],
+    split: usize,
+    mut redacted_until: usize,
+) -> (String, usize) {
+    let mut clean = String::with_capacity(split);
+    for (index, ch) in text[..split].char_indices() {
+        let end = secrets
+            .iter()
+            .map(AsRef::as_ref)
+            .filter(|secret| !secret.is_empty() && text[index..].starts_with(secret))
+            .map(|secret| index + secret.len())
+            .max()
+            .unwrap_or(index);
+        if end > index {
+            if index >= redacted_until {
+                clean.push_str("[redacted]");
+            }
+            redacted_until = redacted_until.max(end);
+        } else if index >= redacted_until {
+            clean.push(ch);
+        }
+    }
+    (clean, redacted_until.saturating_sub(split))
+}
+
+pub fn redact_progress(value: Value, secrets: &[impl AsRef<str>]) -> Value {
     match value {
         Value::String(text) => Value::String(redact_text(text, secrets)),
         Value::Array(items) => Value::Array(
@@ -1425,10 +1594,16 @@ fn redact_progress(value: Value, secrets: &[&str]) -> Value {
     }
 }
 
+#[derive(Default)]
+struct PendingRedaction {
+    text: String,
+    redacted_until: usize,
+}
+
 fn redact_stream_progress(
     mut value: Value,
     secrets: &[&str],
-    pending: &mut BTreeMap<String, String>,
+    pending: &mut BTreeMap<String, PendingRedaction>,
 ) -> Value {
     if let Some(item) = value
         .get("item_id")
@@ -1442,27 +1617,31 @@ fn redact_stream_progress(
             && let Some(text) = value.get("text").and_then(Value::as_str)
         {
             let buffered = pending.entry(item).or_default();
-            buffered.push_str(text);
-            let Value::String(clean) = redact_progress(json!(buffered), secrets) else {
-                unreachable!()
-            };
+            buffered.text.push_str(text);
             let max_prefix = secrets
                 .iter()
                 .map(|secret| secret.len().saturating_sub(1))
                 .max()
                 .unwrap_or(0);
-            let split = clean
+            let split = buffered
+                .text
                 .char_indices()
                 .map(|(index, _)| index)
-                .filter(|index| clean.len() - index <= max_prefix)
+                .filter(|index| buffered.text.len() - index <= max_prefix)
                 .find(|index| {
                     secrets.iter().any(|secret| {
-                        secret.len() > clean.len() - index && secret.starts_with(&clean[*index..])
+                        secret.len() > buffered.text.len() - index
+                            && secret.starts_with(&buffered.text[*index..])
                     })
                 })
-                .unwrap_or(clean.len());
-            *buffered = clean[split..].to_owned();
-            value["text"] = json!(&clean[..split]);
+                .unwrap_or(buffered.text.len());
+            let (text, redacted_until) =
+                redact_prefix(&buffered.text, secrets, split, buffered.redacted_until);
+            buffered.text = buffered.text[split..].to_owned();
+            buffered.redacted_until = redacted_until;
+            value = redact_progress(value, secrets);
+            value["text"] = json!(text);
+            return value;
         }
     }
     redact_progress(value, secrets)
@@ -1482,4 +1661,178 @@ pub(crate) async fn bounded_line(
         "line exceeds the configured size limit"
     );
     Ok(line)
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::{
+        CursorCatalog, CursorModel, credential_value, cursor_models, redact_progress,
+        redact_stream_progress,
+    };
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn redaction_preserves_keys_and_masks_overlapping_secrets() {
+        let secrets = [
+            "synthetic-sensitive",
+            "synthetic-sensitive-token",
+            "token-suffix",
+            "",
+            "redacted",
+        ];
+        assert_eq!(
+            redact_progress(
+                json!({
+                    "synthetic-sensitive-token": [
+                        "prefix synthetic-sensitive-token-suffix ✓",
+                        {"nested": "synthetic-sensitive"},
+                    ],
+                    "literal": true,
+                    "number": 7,
+                    "null": null,
+                }),
+                &secrets,
+            ),
+            json!({
+                "synthetic-sensitive-token": [
+                    "prefix [redacted] ✓",
+                    {"nested": "[redacted]"},
+                ],
+                "literal": true,
+                "number": 7,
+                "null": null,
+            }),
+        );
+    }
+
+    #[test]
+    fn redaction_buffers_nested_and_overlapping_secrets_across_frames() {
+        let secrets = [
+            "synthetic-sensitive",
+            "synthetic-sensitive-token",
+            "aba",
+            "秘密🙂",
+        ];
+        for text in [
+            "before synthetic-sensitive-token after",
+            "before synthetic-sensitive after",
+            "before ababa after",
+            "before 秘密🙂 after",
+        ] {
+            let mut pending = BTreeMap::new();
+            let mut streamed = String::new();
+            for ch in text.chars() {
+                let update = redact_stream_progress(
+                    json!({"type": "text_delta", "item_id": "reply", "text": ch.to_string()}),
+                    &secrets,
+                    &mut pending,
+                );
+                streamed.push_str(update["text"].as_str().unwrap());
+            }
+            assert_eq!(streamed, "before [redacted] after");
+            let snapshot = redact_stream_progress(
+                json!({"type": "text_snapshot", "item_id": "reply", "text": text}),
+                &secrets,
+                &mut pending,
+            );
+            assert_eq!(snapshot["text"], "before [redacted] after");
+            assert!(pending.is_empty());
+        }
+    }
+
+    #[test]
+    fn redaction_keeps_periodic_overlap_streams_bounded() {
+        let secrets = ["aba"];
+        let mut pending = BTreeMap::new();
+        let mut streamed = String::new();
+        for ch in format!("{}a end", "ab".repeat(4096)).chars() {
+            let update = redact_stream_progress(
+                json!({"type": "text_delta", "item_id": "reply", "text": ch.to_string()}),
+                &secrets,
+                &mut pending,
+            );
+            let buffered = pending["reply"].text.len();
+            assert!(buffered <= 2, "pending grew to {buffered} bytes");
+            streamed.push_str(update["text"].as_str().unwrap());
+        }
+        assert_eq!(streamed, "[redacted] end");
+    }
+
+    #[test]
+    fn redaction_keeps_items_separate_and_does_not_reprocess_stream_markers() {
+        let secrets = ["aba", "秘密🙂", "redacted"];
+        let mut pending = BTreeMap::new();
+        let mut streamed = BTreeMap::<&str, String>::new();
+        for (item, chunk) in [
+            ("left", "ab"),
+            ("right", "秘"),
+            ("left", "aba"),
+            ("right", "密🙂 "),
+            ("left", " "),
+        ] {
+            let update = redact_stream_progress(
+                json!({"type": "text_delta", "item_id": item, "text": chunk}),
+                &secrets,
+                &mut pending,
+            );
+            streamed
+                .entry(item)
+                .or_default()
+                .push_str(update["text"].as_str().unwrap());
+        }
+        assert_eq!(streamed["left"], "[redacted] ");
+        assert_eq!(streamed["right"], "[redacted] ");
+        let snapshot = redact_stream_progress(
+            json!({"type": "text_snapshot", "item_id": "left", "text": "ababa"}),
+            &secrets,
+            &mut pending,
+        );
+        assert_eq!(snapshot["text"], "[redacted]");
+        assert!(!pending.contains_key("left"));
+        assert!(pending.contains_key("right"));
+    }
+
+    #[test]
+    fn credential_values_are_selected_by_name_or_shape_only() {
+        assert!(credential_value("CURSOR_API_KEY", "k!secret1"));
+        assert!(!credential_value("FOO_TOKEN", "1"));
+        assert!(credential_value(
+            "DATABASE_URL",
+            "postgres://app:s3cret@db.internal/app"
+        ));
+        assert!(credential_value(
+            "X",
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        ));
+        assert!(!credential_value("DEBUG", "1"));
+        assert!(!credential_value("NODE_ENV", "production"));
+        assert!(!credential_value("HOME", "/Users/me/project"));
+        assert!(!credential_value("API_BASE", "http://host:8080/path"));
+        assert!(!credential_value("ORIGIN", "user@example.com"));
+    }
+
+    #[test]
+    fn cursor_catalog_rejects_only_echoed_credentials() {
+        let env = BTreeMap::from([
+            ("DEBUG".to_owned(), "1".to_owned()),
+            ("CURSOR_API_KEY".to_owned(), "k!secret1".to_owned()),
+        ]);
+        let catalog = |name: &str| {
+            cursor_models(
+                &json!({"models": {"availableModels": [{"modelId": "gpt-5.1", "name": name}]}}),
+                &env,
+            )
+        };
+        assert_eq!(
+            catalog("GPT 5.1"),
+            CursorCatalog::Available {
+                models: vec![CursorModel {
+                    id: "gpt-5.1".into(),
+                    display_name: "GPT 5.1".into(),
+                }],
+            }
+        );
+        assert_eq!(catalog("GPT k!secret1"), CursorCatalog::Unavailable);
+    }
 }

@@ -1,6 +1,5 @@
 import { useId, useLayoutEffect, useRef, useState, type ChangeEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react'
 import { ArrowUpIcon, CircleAlertIcon, PaperclipIcon, SquareIcon, XIcon } from 'lucide-react'
-import { Spinner } from '@/components/ui/spinner'
 import { cn } from '@/lib/utils'
 import { isSubmitKey } from '@vibeface/client/chat/protocol.ts'
 import { attachmentLimit } from '@vibeface/client/workspace/model.ts'
@@ -18,7 +17,6 @@ export function PromptInput({
   hint,
   reason,
   disabled,
-  busy,
   onChange,
   onSubmit,
   onStop,
@@ -26,6 +24,7 @@ export function PromptInput({
   onFiles,
   above,
   target,
+  tools,
   sendLabel = '发送',
   label = '给 Bot 发消息',
   tint,
@@ -36,7 +35,6 @@ export function PromptInput({
   hint: string
   reason: string
   disabled: boolean
-  busy: boolean
   onChange: (value: string) => void
   onSubmit: () => void
   onStop?: () => void
@@ -45,6 +43,8 @@ export function PromptInput({
   /** Floats over the transcript, just above the box. */
   above?: ReactNode
   target?: ReactNode
+  /** Small controls beside the attachment button, inside the box. */
+  tools?: ReactNode
   sendLabel?: string
   label?: string
   /** The bot's tint, taken by the send button once there is something to send. */
@@ -63,7 +63,7 @@ export function PromptInput({
   // Caught on pick: the upload would only refuse it after the person pressed Send.
   const unfits = (file: File) => !file.size || file.size > attachmentLimit
   const unfit = files.find(unfits)
-  const sendable = !disabled && !busy && drafting && !unfit
+  const sendable = !disabled && drafting && !unfit
   const limit = `${attachmentLimit / 2 ** 20} MiB`
   const note = disabled && reason ? reason : hint
   // The box sizes itself to the text (field-sizing), already at its new height when this runs; CSS cannot ease
@@ -123,16 +123,17 @@ export function PromptInput({
           <InputGroupAddon align={open ? 'block-end' : 'inline-end'} className={open ? 'flex-wrap ps-1 pe-1.5 pt-1 pb-1.5' : 'py-0 pe-1.5'}>
             {onFiles ? <>
               <input ref={pickerRef} type="file" multiple hidden onChange={(event) => { onFiles([...files, ...event.target.files ?? []]); event.target.value = '' }} />
-              <InputGroupButton type="button" variant="ghost" size="icon-sm" className="relative size-9 rounded-full text-muted-foreground hover:text-foreground max-md:size-11" aria-label={files.length ? `添加附件，已选 ${files.length} 个` : '添加附件'} title="添加附件" disabled={disabled || busy} onMouseDown={keepFocus} onClick={() => pickerRef.current?.click()}>
+              <InputGroupButton type="button" variant="ghost" size="icon-sm" className="relative size-9 rounded-full text-muted-foreground hover:text-foreground max-md:size-11" aria-label={files.length ? `添加附件，已选 ${files.length} 个` : '添加附件'} title="添加附件" disabled={disabled} onMouseDown={keepFocus} onClick={() => pickerRef.current?.click()}>
                 <PaperclipIcon aria-hidden="true" />
                 {!open && files.length ? <span aria-hidden="true" className="absolute end-1 top-1 grid min-w-4 place-items-center rounded-full bg-primary px-1 text-[11px] leading-4 text-primary-foreground tabular-nums">{files.length}</span> : null}
               </InputGroupButton>
               {open && files.map((file, index) => <span key={`${file.name}:${index}`} title={file.name} className={cn('flex max-w-56 min-w-0 items-center gap-1 rounded-full ps-3 text-meta', unfits(file) ? 'border border-danger-border bg-danger-soft text-danger' : 'bg-muted')}>
                 {unfits(file) ? <CircleAlertIcon aria-label={file.size ? `超过 ${limit}` : '空文件'} className="-ms-1 size-3.5 shrink-0" /> : null}
                 <FileName name={file.name} />
-                <button type="button" onMouseDown={keepFocus} className="hit-area relative grid size-8 shrink-0 place-items-center rounded-full hover:bg-background" aria-label={`移除 ${file.name}`} disabled={busy} onClick={() => onFiles(files.filter((_, at) => at !== index))}><XIcon aria-hidden="true" className="size-3.5" /></button>
+                <button type="button" onMouseDown={keepFocus} className="hit-area relative grid size-8 shrink-0 place-items-center rounded-full hover:bg-background" aria-label={`移除 ${file.name}`} onClick={() => onFiles(files.filter((_, at) => at !== index))}><XIcon aria-hidden="true" className="size-3.5" /></button>
               </span>)}
             </> : null}
+            {tools}
             <span className="ms-auto flex shrink-0 gap-1">
               {onStop ? <InputGroupButton type="button" variant="outline" size="icon-sm" aria-label="停止" title="停止" className="size-9 rounded-full max-md:size-11" onMouseDown={keepFocus} onClick={onStop}>
                 <SquareIcon aria-hidden="true" className="fill-current" />
@@ -142,14 +143,13 @@ export function PromptInput({
                 variant="default"
                 size="icon-sm"
                 disabled={!sendable}
-                aria-busy={busy || undefined}
                 aria-label={sendLabel}
                 title={sendLabel}
                 style={sendable && tint ? { backgroundColor: tint.fill, color: tint.ink } : undefined}
                 className={cn('size-9 rounded-full max-md:size-11', sendable ? 'hover:opacity-88' : 'bg-muted text-muted-foreground disabled:opacity-100')}
                 onMouseDown={keepFocus}
               >
-                {busy ? <Spinner aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}
+                <ArrowUpIcon aria-hidden="true" />
               </InputGroupButton>
             </span>
           </InputGroupAddon>

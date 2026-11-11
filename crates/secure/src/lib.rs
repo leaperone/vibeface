@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 
 pub mod join;
 pub mod lan;
+pub mod link;
 pub mod membership;
 
 mod recovery;
@@ -65,7 +66,7 @@ const NOISE: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 const MAX_MESSAGE: usize = 65_535;
 const MAX_CONTEXT: usize = 4_096;
 pub const MAX_APPLICATION_MESSAGE: usize = 16 * 1024 * 1024;
-const RECORD_PLAINTEXT: usize = 60 * 1024;
+pub const RECORD_PLAINTEXT: usize = 60 * 1024;
 const NOISE_STATIC_DOMAIN: &[u8] = b"vibeface:noise-static:v1";
 
 /// A locally held Ed25519 key: a Node's device key or an unlocked recovery root.

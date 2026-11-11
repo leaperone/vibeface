@@ -127,10 +127,14 @@ pub(crate) enum TriageAdmission {
     Claimed(TriageAttempt),
 }
 
-fn queued(connection: &Connection) -> Result<Vec<StoredTriageEvent>> {
+fn queued(
+    connection: &Connection,
+    selection: &str,
+    parameters: impl rusqlite::Params,
+) -> Result<Vec<StoredTriageEvent>> {
     let mut statement =
-        connection.prepare("SELECT event FROM triage_queue ORDER BY ts_ms,event_id")?;
-    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        connection.prepare(&format!("SELECT event FROM triage_queue {selection}"))?;
+    let rows = statement.query_map(parameters, |row| row.get::<_, String>(0))?;
     rows.map(|row| StoredTriageEvent::decode(&row?)).collect()
 }
 
@@ -378,9 +382,11 @@ pub(crate) fn held_answer_receipt_from(
 
 impl Store {
     pub(crate) fn has_pending_answer_controls(&self) -> Result<bool> {
-        Ok(queued(&self.connection)?
-            .iter()
-            .any(|row| row.answer.is_some() && row.claim.is_none()))
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM triage_queue WHERE json_type(event,'$._triage') IS NULL AND json_type(event,'$._answer') IS NOT NULL)",
+            [],
+            |row| row.get(0),
+        )?)
     }
     pub(crate) fn held_answer_receipt(
         &self,
@@ -419,15 +425,11 @@ impl Store {
         boot: &str,
         attempt: &str,
     ) -> Result<Option<HeldAnswerControl>> {
-        Ok(queued(&self.connection)?
-            .into_iter()
-            .find(|row| {
-                row.claim
-                    .as_ref()
-                    .is_some_and(|claim| claim.boot == boot && claim.attempt == attempt)
-                    && row.answer.is_some()
-            })
-            .and_then(|row| row.answer))
+        Ok(queued(
+            &self.connection,
+            "WHERE json_extract(event,'$._triage.boot')=? AND json_extract(event,'$._triage.attempt')=? AND json_type(event,'$._answer') IS NOT NULL ORDER BY ts_ms,event_id LIMIT 1",
+            params![boot, attempt],
+        )?.into_iter().next().and_then(|row| row.answer))
     }
 
     pub(crate) fn validate_answer_control_claim(
@@ -437,7 +439,11 @@ impl Store {
         control: &HeldAnswerControl,
     ) -> Result<()> {
         ensure!(
-            queued(&self.connection)?.iter().any(|row| {
+            queued(
+                &self.connection,
+                "WHERE json_extract(event,'$._triage.boot')=? AND json_extract(event,'$._triage.attempt')=? AND json_extract(event,'$._triage.state')='in_flight' ORDER BY ts_ms,event_id",
+                params![boot, attempt],
+            )?.iter().any(|row| {
                 row.eligible(Some((boot, attempt)))
                     && row.answer.as_ref() == Some(control)
                     && row.event.request_id.as_deref() == Some(control.request.request_id.as_str())
@@ -478,9 +484,21 @@ impl Store {
     }
 
     pub(crate) fn triage_events(&self, context: Option<(&str, &str)>) -> Result<Vec<AgentEvent>> {
-        Ok(queued(&self.connection)?
+        let rows = match context {
+            None => queued(
+                &self.connection,
+                "WHERE json_type(event,'$._triage') IS NULL AND json_type(event,'$._answer') IS NULL ORDER BY ts_ms,event_id",
+                [],
+            )?,
+            Some((boot, attempt)) => queued(
+                &self.connection,
+                "WHERE json_extract(event,'$._triage.boot')=? AND json_extract(event,'$._triage.attempt')=? AND json_extract(event,'$._triage.state')='in_flight' AND json_type(event,'$._answer') IS NULL ORDER BY ts_ms,event_id",
+                params![boot, attempt],
+            )?,
+        };
+        Ok(rows
             .into_iter()
-            .filter(|row| row.answer.is_none() && row.eligible(context))
+            .filter(|row| row.eligible(context))
             .map(|row| row.event)
             .collect())
     }
@@ -489,18 +507,22 @@ impl Store {
         &self,
         active: Option<(&str, &str)>,
     ) -> Result<Vec<AgentEvent>> {
-        Ok(queued(&self.connection)?
-            .into_iter()
-            .filter(|row| row.claim.is_some() && !row.eligible(active))
-            .map(|row| row.event)
-            .collect())
+        Ok(queued(
+            &self.connection,
+            "WHERE json_type(event,'$._triage') IS NOT NULL ORDER BY ts_ms,event_id",
+            [],
+        )?
+        .into_iter()
+        .filter(|row| !row.eligible(active))
+        .map(|row| row.event)
+        .collect())
     }
 
     pub(crate) fn recover_triage(&mut self) -> Result<()> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for mut row in queued(&tx)? {
+        for mut row in queued(&tx, "ORDER BY ts_ms,event_id", [])? {
             if let Some(claim) = &mut row.claim {
                 claim.state = ClaimState::Unknown;
             } else if row.answer.is_some() {
@@ -522,10 +544,7 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for mut row in queued(&tx)?
-            .into_iter()
-            .filter(|row| row.event.request_id.as_deref() == Some(request))
-        {
+        for mut row in queued(&tx, "WHERE request_id=? ORDER BY ts_ms,event_id", [request])? {
             if reviewed && row.claim.is_none() {
                 tx.execute(
                     "DELETE FROM triage_queue WHERE ts_ms=? AND event_id=?",
@@ -545,10 +564,7 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let Some(mut row) = queued(&tx)?
-            .into_iter()
-            .find(|row| row.event.event_id == event)
-        else {
+        let Some(mut row) = queued(&tx, "WHERE event_id=?", [event])?.into_iter().next() else {
             return Ok(false);
         };
         if row.event.request_id.as_deref() == Some(request) {
@@ -575,24 +591,31 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let pending: Vec<_> = queued(&tx)?
-            .into_iter()
-            .filter(|row| row.claim.is_none())
-            .collect();
-        let mut rows: Vec<_> =
-            if let Some(index) = pending.iter().position(|row| row.answer.is_some()) {
-                pending.into_iter().skip(index).take(1).collect()
-            } else {
-                pending.into_iter().take(max).collect()
-            };
+        let mut rows = queued(
+            &tx,
+            "WHERE json_type(event,'$._triage') IS NULL AND json_type(event,'$._answer') IS NOT NULL ORDER BY ts_ms,event_id LIMIT 1",
+            [],
+        )?;
+        if rows.is_empty() {
+            rows = queued(
+                &tx,
+                "WHERE json_type(event,'$._triage') IS NULL AND json_type(event,'$._answer') IS NULL ORDER BY ts_ms,event_id LIMIT ?",
+                [i64::try_from(max).context("triage batch is too large")?],
+            )?;
+        }
         if rows.is_empty() {
             return Ok(TriageAdmission::Empty);
         }
         let key = format!("triage:{network}");
         let status = budget(&tx, &key, limit, now)?;
-        if status.paused_reason.is_some() {
+        if status.paused_reason.is_some() && rows[0].answer.is_none() {
             return Ok(TriageAdmission::Paused(status));
         }
+        let used = status
+            .used
+            .checked_add(1)
+            .context("triage budget overflow")?;
+        ensure!(used <= i64::MAX as u64, "triage budget overflow");
         let id = uuid::Uuid::new_v4().simple().to_string();
         for row in &mut rows {
             row.claim = Some(TriageClaim {
@@ -604,7 +627,7 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO budget_days(network_id,day,used) VALUES(?,?,?) ON CONFLICT(network_id,day) DO UPDATE SET used=excluded.used",
-            params![key, status.day, status.used + 1],
+            params![key, status.day, used],
         )?;
         tx.commit()?;
         let answer = rows
@@ -649,10 +672,15 @@ impl Store {
                 "triage reservation charge is missing"
             );
         }
-        for mut row in queued(&tx)? {
-            if !row.eligible(Some((&attempt.boot, &attempt.id))) {
-                continue;
-            }
+        for mut row in queued(
+            &tx,
+            "WHERE json_extract(event,'$._triage.boot')=? AND json_extract(event,'$._triage.attempt')=? AND json_extract(event,'$._triage.state')='in_flight' ORDER BY ts_ms,event_id",
+            params![attempt.boot, attempt.id],
+        )? {
+            ensure!(
+                row.eligible(Some((&attempt.boot, &attempt.id))),
+                "triage claim changed"
+            );
             if result.is_ok() {
                 tx.execute(
                     "DELETE FROM triage_queue WHERE ts_ms=? AND event_id=?",
@@ -679,21 +707,23 @@ impl Store {
         limit: u64,
         now: i64,
     ) -> Result<TriageStatus> {
-        let mut status = TriageStatus {
+        let total: usize =
+            self.connection
+                .query_row("SELECT count(*) FROM triage_queue", [], |row| row.get(0))?;
+        let pending_events: usize = self.connection.query_row(
+            "SELECT count(*) FROM triage_queue WHERE json_type(event,'$._triage') IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let inflight_events: usize = self.connection.query_row(
+            "SELECT count(*) FROM triage_queue WHERE json_extract(event,'$._triage.boot')=? AND json_extract(event,'$._triage.attempt')=? AND json_extract(event,'$._triage.state')='in_flight'",
+            params![boot, active], |row| row.get(0),
+        )?;
+        Ok(TriageStatus {
             budget: budget(&self.connection, &format!("triage:{network}"), limit, now)?,
-            pending_events: 0,
-            inflight_events: 0,
-            unknown_events: 0,
-        };
-        for row in queued(&self.connection)? {
-            if row.claim.is_none() {
-                status.pending_events += 1;
-            } else if row.eligible(active.map(|id| (boot, id))) {
-                status.inflight_events += 1;
-            } else {
-                status.unknown_events += 1;
-            }
-        }
-        Ok(status)
+            pending_events,
+            inflight_events,
+            unknown_events: total - pending_events - inflight_events,
+        })
     }
 }

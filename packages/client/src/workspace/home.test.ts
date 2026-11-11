@@ -26,11 +26,11 @@ test('the list puts the newest message first and silent bots last', () => {
   assert.deepEqual(byRecent(bots).map((item) => item.bot_id), ['b', 'a', 'c'])
 })
 
-test('on a phone every page leads back toward the list', () => {
-  assert.equal(backTo('/'), null)
-  for (const [from, to] of [['/b/bot', '/'], ['/b/bot/work/w1', '/b/bot'], ['/inbox', '/'], ['/devices', '/'], ['/devices/d1', '/devices'], ['/settings', '/'], ['/settings/logs', '/settings'], ['/settings/lab', '/settings'], ['/settings/lab/transfers', '/settings/lab']]) assert.equal(backTo(from), to, from)
+test('on a phone every page below a tab leads back toward it', () => {
+  for (const tab of ['/', '/tasks', '/inbox', '/settings']) assert.equal(backTo(tab), null, tab)
+  for (const [from, to] of [['/b/bot', '/'], ['/b/bot/work/w1', '/b/bot'], ['/channels', '/'], ['/tasks/t1', '/tasks'], ['/devices', '/settings'], ['/devices/d1', '/devices'], ['/settings/logs', '/settings'], ['/settings/lab', '/settings'], ['/settings/lab/transfers', '/settings/lab']]) assert.equal(backTo(from), to, from)
   assert.equal(backTo('/devices/d1', 'bot'), '/b/bot')
-  assert.equal(backTo('/settings', 'bot'), '/')
+  assert.equal(backTo('/settings', 'bot'), null)
 })
 
 test('an empty list tells a network it cannot reach apart from one still loading', () => {

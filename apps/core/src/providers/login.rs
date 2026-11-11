@@ -93,8 +93,7 @@ fn environment_authentication(provider: Provider, local: &Local) -> bool {
             "ANTHROPIC_AUTH_TOKEN",
             "CLAUDE_CODE_OAUTH_TOKEN",
         ],
-        Provider::Cursor => &["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"],
-        Provider::Pi | Provider::Opencode => &[],
+        Provider::Cursor | Provider::Pi | Provider::Opencode => &[],
     };
     names.iter().any(|name| {
         local.env.get(provider).contains_key(*name)

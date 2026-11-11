@@ -14,6 +14,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import release as rel  # noqa: E402
 from progressive_publication_fixtures import build_collected_tree  # noqa: E402
+from progressive_publication_fake_gh import FakeRelease, gh_handler  # noqa: E402
 
 
 def require(condition, message):
@@ -41,102 +42,6 @@ def rejects(label, action, expect=None):
             return
         raise
     raise AssertionError(f'accepted {label}')
-
-
-class FakeRelease:
-    def __init__(self, tag, source):
-        self.tag = tag
-        self.source = source
-        self.exists = False
-        self.draft = False
-        self.body = ''
-        self.immutable = False
-        self.assets = {}
-        self.uploads = []
-        self.edits = []
-
-    def asset_records(self):
-        return [{'name': name, 'size': len(data), 'digest': f'sha256:{digest_bytes(data)}'}
-                for name, data in sorted(self.assets.items())]
-
-    def view_json(self):
-        return json.dumps(dict(isDraft=self.draft, body=self.body,
-                               assets=[{'name': name} for name in sorted(self.assets)]))
-
-    def api_payload(self):
-        return json.dumps(dict(assets=self.asset_records(), immutable=self.immutable))
-
-
-def digest_bytes(data):
-    return hashlib.sha256(data).hexdigest()
-
-
-def gh_handler(state, calls):
-    def runner(args, **kwargs):
-        command = list(args)
-        calls.append(command)
-        if command[:2] == ['git', 'merge-base']:
-            return subprocess.CompletedProcess(command, 0)
-        if command[:2] == ['git', 'rev-parse']:
-            if command[-1].endswith('^{commit}'):
-                return subprocess.CompletedProcess(command, 0, state.source, '')
-            if command[2] == 'HEAD':
-                return subprocess.CompletedProcess(command, 0, state.source, '')
-            return subprocess.CompletedProcess(command, 0, 'clean', '')
-        if command[0] == 'git' and command[1] == 'status':
-            return subprocess.CompletedProcess(command, 0, '', '')
-        require(command[0] == 'gh', 'unexpected command')
-        if command[1] == 'api':
-            path = command[2]
-            if path.endswith(f'/commits/{state.tag}'):
-                return subprocess.CompletedProcess(command, 0, json.dumps(dict(sha=state.source)), '')
-            if path.endswith(f'/releases/tags/{state.tag}'):
-                require(state.exists, 'release missing')
-                return subprocess.CompletedProcess(command, 0, state.api_payload(), '')
-            raise AssertionError(path)
-        action = command[2]
-        if action == 'view':
-            if not state.exists:
-                return subprocess.CompletedProcess(command, 1, '', 'release not found')
-            return subprocess.CompletedProcess(command, 0, state.view_json(), '')
-        if action == 'create':
-            state.exists = True
-            state.draft = '--draft=false' not in command
-            state.body = command[command.index('--notes') + 1]
-            return subprocess.CompletedProcess(command, 0, '', '')
-        if action == 'upload':
-            for path in map(Path, command[5:]):
-                state.uploads.append(path.name)
-                state.assets[path.name] = path.read_bytes()
-            return subprocess.CompletedProcess(command, 0, '', '')
-        if action == 'download':
-            name = command[command.index('--pattern') + 1]
-            destination = Path(command[command.index('--dir') + 1])
-            (destination / name).write_bytes(state.assets[name])
-            return subprocess.CompletedProcess(command, 0, '', '')
-        if action == 'edit':
-            state.body = command[command.index('--notes') + 1]
-            state.edits.append(command)
-            return subprocess.CompletedProcess(command, 0, '', '')
-        raise AssertionError(command)
-
-    def runner_output(*args, **kwargs):
-        command = list(args)
-        calls.append(command)
-        if command[:2] == ['git', 'rev-parse'] and len(command) > 2 and command[2] == 'HEAD':
-            return state.source
-        if command[:2] == ['git', 'status'] and command[2] == '--porcelain':
-            return ''
-        if len(command) >= 3 and command[:2] == ['gh', 'api'] and command[2].endswith(f'/releases/tags/{state.tag}'):
-            require(state.exists, 'release missing')
-            return state.api_payload()
-        if len(command) >= 3 and command[:2] == ['gh', 'api'] and command[2].endswith(f'/commits/{state.tag}'):
-            return json.dumps(dict(sha=state.source))
-        if command[:2] == ['git', 'merge-base']:
-            return ''
-        raise AssertionError(command)
-
-    return runner, runner_output
 
 
 def build_minimal_app_part(tmp, version, source, channel, tag):
@@ -173,7 +78,6 @@ def test_real_validators():
         rel.verify_part_directory('native', collected / 'native' / target, target=target)
         rel.verify_part_directory('desktop', collected / 'desktop' / desktop, target=desktop)
         native_dir = collected / 'native' / target
-        core = native_dir / f'vibeface-core-{product["version"]}-{target}.tar.gz'
         bad = native_dir.parent / 'bad-native' / target
         bad.mkdir(parents=True)
         for name in native_dir.iterdir():
@@ -275,7 +179,6 @@ def main():
                 require(set(state.assets) == app_names, 'one part without manifest')
                 require('release.json' not in state.assets, 'no global manifest yet')
                 uploads = list(state.uploads)
-                same_calls = len(calls)
                 rel.publish_part('app', part)
                 require(state.uploads == uploads, 'equal remote bytes are a no-op')
                 require(isinstance(summary['names'], list), 'public summary uses list names')
@@ -293,6 +196,14 @@ def main():
                 desktop = rel.DESKTOP_TARGETS[0]
                 rel.publish_part('desktop', collected / 'desktop' / desktop, target=desktop)
                 require(any(name.startswith('vibeface-desktop-') for name in state.assets), 'desktop part uploaded')
+
+                rel.fail_product()
+                require(rel.FAILED_MARKER in state.body and rel.BUILDING_MARKER not in state.body, 'failed release')
+                edits = len(state.edits)
+                rel.fail_product()
+                require(len(state.edits) == edits, 'marking an already failed release is a no-op')
+                rel.begin_product()
+                require(rel.BUILDING_MARKER in state.body, 'a rerun reopens the failed release')
 
     staged = part.parent / 'finalize-product'
     staged.mkdir()
@@ -312,6 +223,10 @@ def main():
         with patch.object(rel, 'require_product_publishing', side_effect=publishing_patch):
             with patch.object(rel, 'identity', side_effect=identity_patch):
                 rejects('partial manifest on public release', rel.begin_product, 'immutable complete release')
+                edits = len(state.edits)
+                rel.fail_product()
+                require(len(state.edits) == edits and rel.BUILDING_MARKER in state.body,
+                        'a release with its manifest is never marked failed')
 
     state.immutable = True
     state.assets.pop('release.json')
@@ -319,6 +234,7 @@ def main():
         with patch.object(rel, 'require_product_publishing', side_effect=publishing_patch):
             with patch.object(rel, 'identity', side_effect=identity_patch):
                 rejects('immutable release', rel.begin_product, 'immutable')
+                rejects('immutable failed release', rel.fail_product, 'immutable')
 
     rejects('duplicate remote asset names', lambda: rel.remote_assets_by_name([
         dict(name='a.bin', size=1, digest='sha256:' + '0' * 64),

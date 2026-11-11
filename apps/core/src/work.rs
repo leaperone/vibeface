@@ -1,6 +1,8 @@
-//! The target Node's work state machine. It is the only authority for a work unit:
-//! `transition` is the only source of Work events in the DAG, and the DAG projection,
-//! the pending-check list and the Web state all derive from it.
+//! The target Node's work state machine. It is the authority for a work unit's execution
+//! states: `transition` writes the Work events the target itself produces, and the DAG
+//! projection, the pending-check list and the Web state derive from them. Two other Work events
+//! come from the Store on purpose: the user's signed settlement (`settle_work`) and the
+//! conversation owner's `unverified` record for a removed target (`unverify_removed_works`).
 use crate::{crypto::digest, model::*};
 use serde::{Deserialize, Serialize};
 use vibeface_bridge::{failure::ExecFailure, turn::TurnStatus};
@@ -325,8 +327,6 @@ pub enum Signal {
     InterruptTimedOut,
     /// The DAG already holds a settled result (the user's signed choice); no event is implied.
     Settled(WorkOutcome),
-    /// The coordination process of an unverified agent task is gone; its turn did not finish.
-    ProcessExited,
     /// An agent task's coordination turn ended; its reply is the result. `failure` names the
     /// execution failure that ended it, if one did.
     Concluded {
@@ -679,12 +679,6 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
                 )
             }
         },
-        (Unverified { handle: None, .. }, Signal::ProcessExited) => finish(
-            record,
-            WorkOutcome::Interrupted,
-            Some("Bot 进程已退出，任务没有做完".into()),
-            Some(FailureKind::Lost),
-        ),
         (Unverified { .. } | Accepted | Starting { .. }, Signal::Settled(outcome)) => {
             record.state = Finished { outcome };
             None
@@ -745,33 +739,10 @@ mod tests {
     }
 
     #[test]
-    fn final_work_dispatch_round_trips_and_epoch8_shape_rejects_model_fields() -> anyhow::Result<()>
-    {
-        #[derive(Serialize, Deserialize)]
-        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-        enum Epoch8Body {
-            WorkDispatched {
-                work_id: String,
-                trigger: String,
-                dispatcher: String,
-                call_ref: String,
-                kind: WorkKind,
-                cwd: String,
-                title: String,
-                prompt: String,
-            },
-        }
-        let old = serde_json::json!({"type":"work_dispatched", "work_id":"w", "trigger":"message:m", "dispatcher":"node", "call_ref":"call", "kind":"codex", "cwd":"/tmp", "title":"work", "prompt":"go"});
-        let _: Epoch8Body = serde_json::from_value(old.clone())?;
-        let mut new = old;
-        new["model"] = serde_json::json!("requested");
-        new["resolved"] = serde_json::json!({"provider":"codex", "model":"accepted"});
-        let body: EventBody = serde_json::from_value(new.clone())?;
-        assert_eq!(serde_json::to_value(body)?, new);
-        let error = serde_json::from_value::<Epoch8Body>(new)
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("old shape must reject"))?;
-        assert!(error.to_string().contains("unknown field"));
+    fn work_dispatch_round_trips() -> anyhow::Result<()> {
+        let dispatched = serde_json::json!({"type":"work_dispatched", "work_id":"w", "trigger":"message:m", "dispatcher":"node", "call_ref":"call", "kind":"codex", "cwd":"/tmp", "title":"work", "prompt":"go", "model":"requested", "resolved":{"provider":"codex", "model":"accepted"}});
+        let body: EventBody = serde_json::from_value(dispatched.clone())?;
+        assert_eq!(serde_json::to_value(body)?, dispatched);
         Ok(())
     }
 

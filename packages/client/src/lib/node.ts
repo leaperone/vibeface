@@ -62,6 +62,15 @@ export type AppServerMode = 'system' | 'spawn'
 export type ProviderChange = {
   provider: ProviderId; bot?: boolean; execution?: boolean; execution_model?: string; bin?: string
   env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null }; connect_local?: boolean
+  /** opencode only. `null` removes the endpoint and its token; `api_key` omitted keeps the stored token, `null` deletes it. */
+  opencode_endpoint?: { protocol: EndpointProtocol; base_url: string; models: string[]; api_key?: string | null } | null
+}
+export const endpointProtocols = ['openai_compatible', 'anthropic', 'openai'] as const
+export type EndpointProtocol = typeof endpointProtocols[number]
+/** opencode's custom model service; its models run as `custom/<model>`. The token never comes back, only whether one is stored. */
+export type ProviderEndpoint = { protocol: EndpointProtocol; base_url: string; models: string[]; has_api_key: boolean }
+export function canSetProviderEnvironment(provider: ProviderId, name: string): boolean {
+  return provider !== 'cursor' || !['CURSOR_API_KEY', 'CURSOR_AUTH_TOKEN', 'AGENT_CLI_CREDENTIAL_STORE'].includes(name)
 }
 /** `socket` is required when enabling a system App Server connection. */
 export type AppServer = { mode: AppServerMode; socket: string | null; link: AppServerLink }
@@ -91,6 +100,8 @@ export type ProviderStatus = {
   readiness: ProviderReadiness
   probe: { provider: ProviderId; config_id: string; checked_at_ms: number | null; launch: { state: 'unchecked' | 'starting' | 'launchable' } | { state: 'failed'; issue: ProbeIssue }; authentication: 'unverified' | 'authenticated' | 'not_required' | 'sign_in_required'; catalog: ModelCatalog; version: string | null }
   observed: ProviderObservations
+  /** opencode only; always `null` for the other providers. */
+  endpoint: ProviderEndpoint | null
 }
 export type NodeSettingsResponse = {
   settings: NodeSettings
@@ -107,15 +118,17 @@ export function record(value: unknown, label = '设备响应'): Record<string, u
   if (!isRecord(value)) throw new Error(`${label}格式无效。`)
   return value
 }
-function isRecord(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === 'object' && !Array.isArray(value) }
+export function isRecord(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === 'object' && !Array.isArray(value) }
+export function isText(value: unknown): value is string { return typeof value === 'string' }
+export function isSafeInteger(value: unknown): value is number { return typeof value === 'number' && Number.isSafeInteger(value) }
 export function text(value: unknown, label = '文本'): string {
-  if (typeof value !== 'string' || !value) throw new Error(`${label}缺失或格式无效。`)
+  if (!isText(value) || !value) throw new Error(`${label}缺失或格式无效。`)
   return value
 }
-export function boolean(value: unknown): boolean { if (typeof value !== 'boolean') throw new Error('设备返回的状态格式无效。'); return value }
-function integer(value: unknown): number { if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) throw new Error('设备返回的编号或版本无效。'); return value }
-function strings(value: unknown): string[] { if (!Array.isArray(value)) throw new Error('设备返回的列表格式无效。'); return value.map(item => text(item)) }
-export function array(value: unknown): unknown[] { if (!Array.isArray(value)) throw new Error('设备返回的列表格式无效。'); return value }
+export function boolean(value: unknown, error = '设备返回的状态格式无效。'): boolean { if (typeof value !== 'boolean') throw new Error(error); return value }
+function integer(value: unknown): number { if (!isSafeInteger(value) || value < 1) throw new Error('设备返回的编号或版本无效。'); return value }
+function strings(value: unknown): string[] { return array(value).map(item => text(item)) }
+export function array(value: unknown, error = '设备返回的列表格式无效。'): unknown[] { if (!Array.isArray(value)) throw new Error(error); return value }
 /** An entry as Nodes send it and this device stores it: `{address, device_id}`, plus `local: true` for a local page, or `{device_id, addrs}` on the LAN. */
 export function parseEntry(value: unknown): ConnectionEntry {
   const v = record(value, '访问地址')
@@ -262,6 +275,31 @@ export function parseNodeSettings(value: unknown): NodeSettingsResponse {
     suggested_roots: strings(v.suggested_roots),
   }
 }
+const relayStates = ['off', 'checking', 'announced', 'unreachable'] as const
+/** This Node's open relay for other people's devices; `announced` once a neighbour reached it from outside. */
+export type RelaySettings = {
+  volunteer: boolean; url: string | null; listen: string | null; rate: number; max_clients: number; max_clients_per_ip: number
+  status: typeof relayStates[number]; error: string | null
+}
+/** `share_link`: this Node's node link, `vibeface://node/<device-id>?addr=…&relay=…`, which another Node takes as its bootstrap. */
+export function parseShareLink(value: unknown): string {
+  const link = text(record(value, '节点链接').link)
+  if (!/^vibeface:\/\/node\/[0-9a-f]{64}(\?\S*)?$/.test(link)) throw new Error('节点链接格式无效。')
+  return link
+}
+/** The limits `configure_relay` applies when turned on without them: bytes per second per connection, connections, connections per IP. */
+export const relayDefaults = { rate: 16384, max_clients: 128, max_clients_per_ip: 8 } as const
+export function parseRelaySettings(value: unknown): RelaySettings {
+  const v = record(value, '转发设置'), status = relayStates.find(state => state === v.status)
+  const count = (input: unknown) => { if (typeof input !== 'number' || !Number.isSafeInteger(input) || input < 0) throw new Error('转发设置格式无效。'); return input }
+  const optional = (input: unknown) => input === null ? null : text(input)
+  if (!status) throw new Error('转发设置格式无效。')
+  return {
+    volunteer: boolean(v.volunteer), url: optional(v.url), listen: optional(v.listen),
+    rate: count(v.rate), max_clients: count(v.max_clients), max_clients_per_ip: count(v.max_clients_per_ip),
+    status, error: optional(v.error),
+  }
+}
 export const providerIds: readonly ProviderId[] = ['codex', 'cursor', 'claude', 'pi', 'opencode']
 /** A provider named by a peer's capabilities, or null when it names none this client knows. */
 export const asProvider = (value: unknown): ProviderId | null => providerIds.includes(value as ProviderId) ? value as ProviderId : null
@@ -336,7 +374,7 @@ export function probeIssueText(provider: ProviderId, issue: ProbeIssue): string 
   const messages: Record<ProbeCode, string> = {
     not_installed: `找不到 ${name} 程序，请在运行设备安装或检查路径`, config_invalid: `${name} 配置无法读取，请检查运行设备上的配置`,
     missing_credential: `${name} 缺少认证信息，请在运行设备设置`, launch_unverified: `${name} 尚未检查启动，请检查可用性`,
-    launch_failed: `${name} 没能启动，请在运行设备检查程序`, sign_in_required: `${name} 需要完成认证，请在运行设备登录或配置 API 密钥`,
+    launch_failed: `${name} 没能启动，请在运行设备检查程序`, sign_in_required: provider === 'cursor' ? 'Cursor 需要在运行设备上完成官方 CLI 订阅登录' : `${name} 需要完成认证，请在运行设备登录或配置 API 密钥`,
     authentication_unverified: `${name} 认证状态尚未确认，可发送消息或先检查可用性`, catalog_unavailable: `${name} 模型列表暂不可用，可继续手填模型`,
     model_unverified: `${name} 尚未确认这个模型，可发送消息或先检查可用性`, model_unavailable: `${name} 无法使用所选模型，请检查模型设置`,
   }
@@ -368,8 +406,11 @@ export function parseProvider(value: unknown): ProviderStatus {
   const launchState = launch.state === 'failed' ? { state: 'failed' as const, issue: parseProbeIssue(launch.issue) } : { state: oneOf(launch.state, ['unchecked', 'starting', 'launchable'] as const) }
   if (probe.checked_at_ms !== null && (typeof probe.checked_at_ms !== 'number' || !Number.isSafeInteger(probe.checked_at_ms) || probe.checked_at_ms < 0)) throw new Error('检查时间无效。')
   const observed = record(v.observed)
+  const endpoint = v.endpoint === null ? null : record(v.endpoint, '自定义模型服务')
+  if (endpoint && provider !== 'opencode') throw new Error('只有 opencode 可以使用自定义模型服务。')
   return {
     provider,
+    endpoint: endpoint === null ? null : { protocol: oneOf(endpoint.protocol, endpointProtocols), base_url: text(endpoint.base_url), models: strings(endpoint.models), has_api_key: boolean(endpoint.has_api_key) },
     authentication_source: oneOf(v.authentication_source, authenticationSources),
     setup: setup === null ? null : { directory: setup.directory === null ? null : text(setup.directory), command: text(setup.command) },
     roles: array(v.roles).map(role => oneOf(role, providerRoles)), supports: array(v.supports).map(role => oneOf(role, providerRoles)),

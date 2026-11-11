@@ -4,12 +4,12 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const EVENT_DOMAIN: &[u8] = b"vibeface:event:v1:";
 const PROVIDER_CONFIG_DOMAIN: &[u8] = b"vibeface:provider-runtime-key:v1";
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 pub struct LocalIdentity {
     pub secret_key_hex: String,
@@ -21,12 +21,20 @@ impl std::fmt::Debug for LocalIdentity {
 }
 impl LocalIdentity {
     pub fn generate() -> Self {
+        let mut seed = Zeroizing::new([0; 32]);
+        OsRng.fill_bytes(&mut seed[..]);
         Self {
-            secret_key_hex: hex::encode(SigningKey::generate(&mut OsRng).to_bytes()),
+            secret_key_hex: hex::encode(&seed[..]),
         }
     }
+    pub(crate) fn seed(&self) -> Result<Zeroizing<[u8; 32]>> {
+        let mut seed = Zeroizing::new([0; 32]);
+        hex::decode_to_slice(&self.secret_key_hex, &mut seed[..]).context("invalid device key")?;
+        Ok(seed)
+    }
     fn key(&self) -> Result<SigningKey> {
-        Ok(SigningKey::from_bytes(&decode32(&self.secret_key_hex)?))
+        let seed = self.seed()?;
+        Ok(SigningKey::from_bytes(&seed))
     }
     /// The device's Ed25519 public key, which is also its `DeviceId`.
     pub fn device_id(&self) -> Result<DeviceId> {
@@ -360,10 +368,7 @@ fn validate_attestation(event: &Event) -> Result<()> {
         EventBody::ConversationOwner { cause: Some(_), .. }
         | EventBody::BotCreated { cause: Some(_), .. }
         | EventBody::BotDeleted { cause: Some(_), .. } => UserSignature::Forbidden,
-        EventBody::MessagePosted {
-            role: Role::User, ..
-        }
-        | EventBody::ConversationOwner { .. }
+        EventBody::ConversationOwner { .. }
         | EventBody::BotCreated { .. }
         | EventBody::BotDeleted { .. }
         | EventBody::NotificationAcked { .. }
@@ -422,7 +427,7 @@ fn cause_id(scope: &str, cause: &Cause) -> Result<()> {
 }
 
 fn subject(node: &str, session: &str, cwd: &str, summary: &str) -> Result<()> {
-    decode32(node)?;
+    vibeface_secure::validate_device_id(node)?;
     ensure!(
         !session.is_empty() && session.len() <= 256 && cwd.len() <= 4096 && summary.len() <= 1024,
         "invalid session subject"
@@ -436,8 +441,8 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         !event.scope_id.is_empty() && event.scope_id.len() <= 512,
         "invalid scope"
     );
-    decode32(&event.network_id)?;
-    decode32(&event.author)?;
+    vibeface_secure::membership::validate_hash(&event.network_id)?;
+    vibeface_secure::validate_device_id(&event.author)?;
     ensure!(
         event.seq > 0 && event.seq <= i64::MAX as u64,
         "invalid sequence"
@@ -460,7 +465,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         "blobs must be sorted and unique"
     );
     for hash in event.deps.iter().chain(event.prev.iter()) {
-        decode32(hash)?;
+        vibeface_secure::membership::validate_hash(hash)?;
     }
     ensure!(
         event
@@ -470,8 +475,22 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         "prev is not a dependency on another author"
     );
     for blob in &event.blobs {
-        decode32(&blob.hash)?;
+        vibeface_secure::membership::validate_hash(&blob.hash)?;
         ensure!(blob.size <= MAX_BLOB_BYTES as u64, "blob too large");
+    }
+    if let Some(attestation) = event.body.attestation() {
+        vibeface_secure::validate_device_id(&attestation.device_id)?;
+    }
+    if let EventBody::BotCreated {
+        project: Some(project),
+        ..
+    }
+    | EventBody::BotProjectSet {
+        project: Some(project),
+        ..
+    } = &event.body
+    {
+        vibeface_secure::validate_device_id(&project.target_node)?;
     }
     let id = |value: &str| vibeface_protocol::validate_id(value).map_err(anyhow::Error::msg);
     match &event.body {
@@ -569,6 +588,14 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             id(message_id)?;
             match role {
                 Role::User => {
+                    let question = answers
+                        .as_ref()
+                        .context("ordinary user messages use InputPosted")?;
+                    question_id(question)?;
+                    ensure!(
+                        *message_id == format!("a-{question}"),
+                        "an answer's message ID is derived from its question"
+                    );
                     ensure!(
                         report_results.is_some()
                             && in_reply_to.is_none()
@@ -588,13 +615,6 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                                 .all(|attachment| valid_attachment_name(&attachment.name)),
                         "attachments are ordered by content, once each, with clean file names"
                     );
-                    if let Some(question) = answers {
-                        question_id(question)?;
-                        ensure!(
-                            *message_id == format!("a-{question}"),
-                            "an answer's message ID is derived from its question"
-                        );
-                    }
                 }
                 Role::Assistant => {
                     ensure!(
@@ -619,7 +639,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             cause,
             ..
         } => {
-            decode32(scheduler_node)?;
+            vibeface_secure::validate_device_id(scheduler_node)?;
             ensure!(*epoch > 0, "owner epoch starts at 1");
             if let Some(cause) = cause {
                 ensure!(
@@ -667,7 +687,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                 _ => anyhow::bail!("invalid work trigger"),
             }
             id(call_ref)?;
-            decode32(dispatcher)?;
+            vibeface_secure::validate_device_id(dispatcher)?;
             if let Some(model) = model {
                 crate::model::validate_model(model)?;
             }
@@ -710,10 +730,10 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                 "a bot's face is set in its own conversation"
             );
             ensure!(
-                version
-                    .as_ref()
-                    .is_none_or(|version| version.len() == 16
-                        && version.bytes().all(|b| b.is_ascii_hexdigit())),
+                version.as_ref().is_none_or(|version| version.len() == 16
+                    && version
+                        .bytes()
+                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))),
                 "a face version is the start of an event hash"
             );
         }
@@ -807,7 +827,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         }
         EventBody::ContextCheckpoint { covers, .. } => {
             for author in covers.keys() {
-                decode32(author)?;
+                vibeface_secure::validate_device_id(author)?;
             }
         }
         EventBody::BotChanged {
@@ -921,8 +941,21 @@ mod tests {
             tag,
             "19cdf6bf40dd7beddd0fcb28b93d1ce8450c62da516aa4d1147c971fcc47d714"
         );
-        let restored: LocalIdentity = serde_json::from_slice(&serde_json::to_vec(&identity)?)?;
+        let encoded = Zeroizing::new(serde_json::to_vec(&identity)?);
+        let restored: LocalIdentity = serde_json::from_slice(&encoded)?;
         assert_eq!(restored.provider_fingerprint(payload)?, tag);
+        let mut cleared = restored.clone();
+        cleared.zeroize();
+        assert!(cleared.secret_key_hex.is_empty());
+        assert_eq!(restored.provider_fingerprint(payload)?, tag);
+        let uppercase = LocalIdentity {
+            secret_key_hex: "AB".repeat(32),
+        };
+        let lowercase = LocalIdentity {
+            secret_key_hex: "ab".repeat(32),
+        };
+        assert_eq!(uppercase.device_id()?, lowercase.device_id()?);
+        assert_eq!(decode32(&uppercase.secret_key_hex)?, [0xab; 32]);
         assert_ne!(identity.provider_fingerprint(b"changed-config")?, tag);
         assert_ne!(
             LocalIdentity {
@@ -996,6 +1029,61 @@ mod tests {
         };
         let event = owner.sign_event(body)?;
         verify_signed_event(&view.network_id, &event)?;
+        let original: Event = serde_json::from_str(&event.canonical_body)?;
+        for field in ["author", "network_id", "deps", "blobs", "covers"] {
+            let mut bad = original.clone();
+            match field {
+                "author" => bad.author.make_ascii_uppercase(),
+                "network_id" => bad.network_id.make_ascii_uppercase(),
+                "deps" => bad.deps = vec![digest(b"dependency").to_uppercase()],
+                "blobs" => {
+                    bad.blobs = vec![BlobRef {
+                        hash: digest(b"blob").to_uppercase(),
+                        size: 0,
+                    }];
+                }
+                "covers" => {
+                    bad.body = EventBody::ContextCheckpoint {
+                        covers: VersionVector::from([(original.author.to_uppercase(), 1)]),
+                        summary: String::new(),
+                        recent_user_requests: vec![],
+                        open_work: vec![],
+                        decisions: vec![],
+                    };
+                }
+                _ => unreachable!(),
+            }
+            let canonical_body = serde_json::to_string(&bad)?;
+            let envelope = SignedEvent {
+                hash: digest(canonical_body.as_bytes()),
+                canonical_body,
+                signature: event.signature.clone(),
+            };
+            assert!(check_event(&view.network_id, &envelope).is_err(), "{field}");
+        }
+        let mut bad_prev = original.clone();
+        bad_prev.seq = 2;
+        bad_prev.prev = Some(digest(b"previous").to_uppercase());
+        assert!(validate_event_shape(&bad_prev).is_err());
+        let mut weak = original.clone();
+        weak.author = "00".repeat(32);
+        assert!(validate_event_shape(&weak).is_err());
+        let mut base = MemoryBase {
+            epoch: crate::config::DATA_EPOCH,
+            version: Some(MemoryVersion {
+                revision: digest(b"revision"),
+                control_revision: 0,
+                source_event_hash: digest(b"source"),
+            }),
+        };
+        base.validate()?;
+        base.version
+            .as_mut()
+            .unwrap()
+            .revision
+            .make_ascii_uppercase();
+        assert!(base.validate().is_err());
+        assert_eq!(serde_json::to_string(&original)?, event.canonical_body);
         let mut bad = event.clone();
         bad.canonical_body.push(' ');
         assert!(verify_signed_event(&view.network_id, &bad).is_err());
@@ -1022,17 +1110,18 @@ mod tests {
             let body = client.attest(
                 &network,
                 "conversation",
-                EventBody::MessagePosted {
+                EventBody::InputPosted {
                     message_id: "m-1".into(),
-                    role: Role::User,
+                    target: crate::workspace::InputTarget::BotMain {
+                        bot_id: "conversation".into(),
+                    },
+                    intent: crate::workspace::InputIntent::Continue,
+                    sequence: 1,
+                    expected_revision: None,
                     text: "see files".into(),
                     attachments,
                     report_results: Some(true),
-                    in_reply_to: None,
-                    status: None,
-                    answers: None,
                     attestation: None,
-                    failure: None,
                 },
             )?;
             identity.sign_event(Event {
@@ -1051,7 +1140,7 @@ mod tests {
         let blobs = |files: &[Attachment]| files.iter().map(Attachment::blob).collect::<Vec<_>>();
         let signed = sign(files.clone(), blobs(&files))?;
         match verify_signed_event(&network, &signed)?.body {
-            EventBody::MessagePosted { attachments, .. } => assert_eq!(attachments, files),
+            EventBody::InputPosted { attachments, .. } => assert_eq!(attachments, files),
             _ => unreachable!(),
         }
         assert!(
@@ -1091,11 +1180,20 @@ mod tests {
         };
         let network = identity.fixture_network_id()?;
         let client = identity.fixture_admin();
-        let signed_user = client.attest(
-            &network,
-            "conversation",
-            message(Role::User, Some(true), None),
-        )?;
+        let input = || EventBody::InputPosted {
+            message_id: "m-1".into(),
+            target: crate::workspace::InputTarget::BotMain {
+                bot_id: "conversation".into(),
+            },
+            intent: crate::workspace::InputIntent::Continue,
+            sequence: 1,
+            expected_revision: None,
+            text: "hi".into(),
+            attachments: vec![],
+            report_results: Some(true),
+            attestation: None,
+        };
+        let signed_user = client.attest(&network, "conversation", input())?;
         let mut event = Event {
             version: WIRE_VERSION,
             network_id: network.clone(),
@@ -1112,10 +1210,10 @@ mod tests {
         let verified = verify_signed_event(&event.network_id, &signed)?;
         assert_eq!(verified.deps.len(), 2);
         assert!(verified.deps.windows(2).all(|pair| pair[0] < pair[1]));
-        event.body = message(Role::User, Some(true), None);
+        event.body = input();
         assert!(identity.sign_event(event.clone()).is_err());
         event.body = signed_user.clone();
-        if let EventBody::MessagePosted { text, .. } = &mut event.body {
+        if let EventBody::InputPosted { text, .. } = &mut event.body {
             *text = "rm -rf".into();
         }
         assert!(identity.sign_event(event.clone()).is_err());
@@ -1139,6 +1237,12 @@ mod tests {
             "bot replies carry no device signature"
         );
         event.body = message(Role::User, None, None);
+        assert!(identity.sign_event(event.clone()).is_err());
+        event.body = client.attest(
+            &network,
+            "conversation",
+            message(Role::User, Some(true), None),
+        )?;
         assert!(identity.sign_event(event.clone()).is_err());
         let answer = |id: &str, role, report_results, status| {
             let mut body = message(role, report_results, status);
@@ -1211,6 +1315,11 @@ mod tests {
         identity
             .sign_event(event(Provider::Codex))
             .expect("matching frozen provider should be valid");
+        let mut bad_dispatcher = event(Provider::Codex);
+        if let EventBody::WorkDispatched { dispatcher, .. } = &mut bad_dispatcher.body {
+            dispatcher.make_ascii_uppercase();
+        }
+        assert!(identity.sign_event(bad_dispatcher).is_err());
         let mut assigned = event(Provider::Codex);
         if let EventBody::WorkDispatched { trigger, .. } = &mut assigned.body {
             *trigger = "assignment:assignment-1".into();

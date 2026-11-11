@@ -8,6 +8,14 @@ pub enum RpcId {
     String(String),
 }
 
+pub fn valid_business_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"-_.:".contains(&c))
+}
+
 pub fn validate_id(id: &str) -> Result<(), String> {
     if id.is_empty()
         || id.len() > 128
@@ -35,6 +43,17 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn business_ids_allow_colons_without_widening_protocol_ids() {
+        for id in ["Az09-_.:", ".", "..", ":", &"a".repeat(128)] {
+            assert!(valid_business_id(id), "{id:?}");
+        }
+        for id in ["", "bad/id", "bad id", "bad\nid", "é", &"a".repeat(129)] {
+            assert!(!valid_business_id(id), "{id:?}");
+        }
+        assert!(validate_id("scope:item").is_err());
+    }
+
+    #[test]
     fn ids_reject_path_components_and_rpc_ids_preserve_their_wire_type() {
         assert!(validate_id("thread-1.turn_2").is_ok());
         assert!(validate_id("").is_err());
@@ -47,3 +66,7 @@ mod tests {
         assert_eq!(serde_json::to_value(text).unwrap(), json!("7"));
     }
 }
+
+pub mod workspace;
+
+pub mod history;

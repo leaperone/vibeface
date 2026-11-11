@@ -5,6 +5,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
+use vibeface_protocol::valid_business_id;
 
 const PREVIEW_CHARS: usize = 120;
 
@@ -26,14 +27,6 @@ pub struct SentBotMessage {
     pub created_at_ms: i64,
 }
 
-fn valid_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "-_.:".contains(character))
-}
-
 fn validate_definition(
     bot_id: &str,
     conversation_id: &str,
@@ -41,8 +34,11 @@ fn validate_definition(
     instructions: &str,
     project: Option<&BotProject>,
 ) -> Result<()> {
-    ensure!(valid_id(bot_id), "invalid bot_id");
-    ensure!(valid_id(conversation_id), "invalid conversation_id");
+    ensure!(valid_business_id(bot_id), "invalid bot_id");
+    ensure!(
+        valid_business_id(conversation_id),
+        "invalid conversation_id"
+    );
     validate_bot_name(name)?;
     validate_instructions(instructions)?;
     ensure!(
@@ -51,7 +47,7 @@ fn validate_definition(
     );
     if let Some(project) = project {
         ensure!(
-            valid_id(&project.target_node),
+            valid_business_id(&project.target_node),
             "invalid project target_node"
         );
         let cwd = Path::new(&project.cwd);

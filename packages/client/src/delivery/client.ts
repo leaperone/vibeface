@@ -2,14 +2,14 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReadyConnection } from '../lib/node.ts'
 import { messageOf, record, same } from '../lib/node.ts'
 import type { KeyValue, Platform } from '../lib/platform.ts'
-import { amount, canRead, canRestart, checkedFile, fileName, intentId, needsRefresh, parseOrder, parseOrders, parsePending, parseReceived, parseStatus, peer, sha256, toBase64 } from './model.ts'
-import type { DeliveryDraft, DeliveryOrder, DeliverySettings, DeliveryStatus, PendingIntent, TransferFile } from './types.ts'
+import { amount, canRead, canRestart, checkedFile, fileName, intentId, needsRefresh, orderActions, parseBudgets, parseOrder, parseOrders, parsePending, parseProviders, parseReceived, parseStatus, peer, sha256, toBase64 } from './model.ts'
+import type { DeliveryBudget, DeliveryDraft, DeliveryOrder, DeliveryProvider, DeliverySettings, DeliveryStatus, PendingIntent, TransferFile } from './types.ts'
 
 function authorization(order: DeliveryOrder) {
   const p = order.payment
   return { order_id: order.order_id, intent_id: order.intent_id, mode: order.mode, acceptance: order.acceptance, source_peer: order.source_peer, receiver_peer: order.receiver_peer, provider_peer: order.provider_peer,
     name: order.name, bytes: order.bytes, sha256: order.sha256, deadlines: order.deadlines,
-    payment: { chain_id: p.chain_id, asset: p.asset, payer: p.payer, provider_wallet: p.provider_wallet, delivery_fee: p.delivery_fee, reservation_fee: p.reservation_fee, priority_fee: p.priority_fee, total: p.total, gas_cap: p.gas_cap } }
+    payment: { chain_id: p.chain_id, asset: p.asset, payer: p.payer, provider_wallet: p.provider_wallet, delivery_fee: p.delivery_fee, reservation_fee: p.reservation_fee, priority_fee: p.priority_fee, total: p.total, gas_cap: p.gas_cap, budget_id: p.budget_id } }
 }
 
 export function shouldPollDelivery(enabled: boolean, orders: readonly DeliveryOrder[]): boolean {
@@ -59,10 +59,15 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
       return status
     },
     list: async () => parseOrders(await request('list')),
+    budgets: async () => parseBudgets(await request('budgets')),
+    async flushBudget(budgetId: string) { manage(); const result = record(await request('flush_budget', { budget_id: peer(budgetId) })); if (result.queued !== true) throw new Error('批次尚未获确认，请刷新预算状态。') },
+    providers: async () => parseProviders(await request('providers')),
     async configure(settings: DeliverySettings) { manage(); return parseStatus(await request('configure', settings)) },
     async prepare(draft: DeliveryDraft, file: TransferFile, status: DeliveryStatus, restartIntentId?: string) {
       manage()
       if (draft.mode === 'charity' && draft.acceptance !== 'recoverable') throw new Error('免费传输不能选“对方打开后付款”。')
+      if (draft.mode === 'paid' && draft.acceptance !== 'recoverable') throw new Error('受保护付费仅支持可恢复验收，暂不支持 Strict。')
+      if (draft.mode === 'paid' && draft.budget_id === null) throw new Error('先选择已建立的预付预算。')
       if (!status.enabled || draft.mode === 'charity' && !status.charity_enabled || draft.mode === 'paid' && !status.paid_enabled) throw new Error('这台设备尚未启用所选传输方式。')
       if (!Number.isSafeInteger(file.size) || file.size < 0 || file.size > status.max_file_bytes) throw new Error(`文件须在 ${status.max_file_bytes} 字节以内。`)
       const bytes = new Uint8Array(await file.arrayBuffer())
@@ -71,6 +76,7 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
       const params = {
         receiver_peer: peer(draft.receiver_peer.trim()), provider_peer: peer(draft.provider_peer.trim()), mode: draft.mode, acceptance: draft.acceptance,
         name, max_service_amount: amount(draft.mode === 'charity' ? '0' : draft.max_service_amount.trim()), max_gas_amount: amount(draft.mode === 'charity' ? '0' : draft.max_gas_amount.trim()),
+        budget_id: draft.mode === 'paid' ? peer(draft.budget_id) : null,
       }
       const fingerprint = await sha256(new TextEncoder().encode(JSON.stringify({ ...params, sha256: digest, bytes: file.size })))
       const previous = pending(fingerprint)
@@ -92,7 +98,7 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
       const order = parseOrder(await request('prepare', { ...params, intent_id: intent.intent_id, content_base64: toBase64(bytes) }))
       if (order.intent_id !== intent.intent_id || order.role !== 'sender' || order.source_peer !== status.node_peer || order.receiver_peer !== params.receiver_peer || order.provider_peer !== params.provider_peer
         || order.mode !== draft.mode || order.acceptance !== draft.acceptance || order.name !== name || order.sha256 !== digest || order.bytes !== file.size
-        || BigInt(order.payment.total) > BigInt(params.max_service_amount) || BigInt(order.payment.gas_cap) > BigInt(params.max_gas_amount)) throw new Error('设备返回的订单与本次选择不一致，未确认付款。请先查看原订单。')
+        || order.payment.budget_id !== params.budget_id || BigInt(order.payment.total) > BigInt(params.max_service_amount) || BigInt(order.payment.gas_cap) > BigInt(params.max_gas_amount)) throw new Error('设备返回的订单与本次选择不一致，未确认付款。请先查看原订单。')
       return order
     },
     async confirm(order: DeliveryOrder) {
@@ -102,8 +108,26 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
       if (!same(authorization(confirmed), authorization(order))) throw new Error('确认结果与原订单的条款不一致。先点“检查进度”，不会自动再次付款。')
       return confirmed
     },
+    async confirmBatch(orders: DeliveryOrder[]) {
+      manage()
+      if (orders.length !== 2 || orders.some(order => order.role !== 'sender' || order.mode !== 'paid' || order.phase !== 'prepared')
+        || orders[0].order_id === orders[1].order_id || !orders[0].payment.budget_id
+        || orders[0].payment.budget_id !== orders[1].payment.budget_id || orders.reduce((total, order) => total + order.windows.length, 0) > 2) throw new Error('请选择同一预算内两笔待确认且各含一个文件片段的订单。')
+      const confirmed = parseOrders(await request('confirm_batch', { intent_ids: orders.map(order => order.intent_id) }))
+      if (confirmed.length !== orders.length || confirmed.some(order => !orders.some(original => same(authorization(order), authorization(original))))) throw new Error('批次返回的条款与原订单不同，请查询原订单。')
+      return confirmed
+    },
     async get(orderId: string) { return parseOrder(await request('get', { order_id: peer(orderId) })) },
     async accept(order: DeliveryOrder) { manage(); return parseOrder(await request('accept', { order_id: order.order_id })) },
+    async acceptBatch(orders: DeliveryOrder[]) {
+      manage()
+      if (orders.length !== 2 || orders.some(order => order.role !== 'receiver' || order.mode !== 'paid' || !orderActions(order).accept)
+        || orders[0].order_id === orders[1].order_id || !orders[0].payment.budget_id
+        || orders[0].payment.budget_id !== orders[1].payment.budget_id || orders.reduce((total, order) => total + order.windows.length, 0) > 2) throw new Error('同时接收需要同一预算内两笔各含一个文件片段的订单。')
+      const accepted = parseOrders(await request('accept_batch', { order_ids: orders.map(order => order.order_id) }))
+      if (accepted.length !== orders.length || accepted.some(order => !orders.some(original => same(authorization(order), authorization(original))))) throw new Error('接收批次与原订单不一致，请先刷新。')
+      return accepted
+    },
     async reconcile(order: DeliveryOrder) { manage(); return parseOrder(await request('reconcile', { order_id: order.order_id })) },
     async save(order: DeliveryOrder, platform: Platform) {
       if (!platform.files) throw new Error('此客户端尚不支持保存文件。')
@@ -119,8 +143,11 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
 
 export function useDelivery(connection: ReadyConnection, platform: Platform) {
   const client = useMemo(() => createDeliveryClient(connection, platform.storage), [connection, platform.storage])
+  const canManage = connection.principal.source === 'membership' && connection.principal.can_manage
   const [status, setStatus] = useState<DeliveryStatus | null>(null)
   const [orders, setOrders] = useState<DeliveryOrder[]>([])
+  const [budgets, setBudgets] = useState<DeliveryBudget[]>([])
+  const [providers, setProviders] = useState<DeliveryProvider[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState('')
@@ -145,8 +172,11 @@ export function useDelivery(connection: ReadyConnection, platform: Platform) {
       if (statusResult.status === 'rejected') throw statusResult.reason
       if (ordersResult.status === 'rejected') throw ordersResult.reason
       const nextStatus = statusResult.value, nextOrders = ordersResult.value
+      let nextBudgets: DeliveryBudget[] = [], budgetError = ''
+      try { if (canManage && (nextStatus.paid_enabled || nextOrders.some(order => order.mode === 'paid'))) nextBudgets = await client.budgets() }
+      catch (cause) { budgetError = messageOf(cause) }
       if (!current() || owner !== sequence.current) return
-      setStatus(nextStatus); setOrders(nextOrders); setReadError('')
+      setStatus(nextStatus); setOrders(nextOrders); setBudgets(nextBudgets); setReadError(budgetError)
       const recent = client.recent()
       if (recent) setSelectedId(previous => previous ?? nextOrders.find(order => order.intent_id === recent)?.order_id ?? null)
     } catch (cause) { if (current() && owner === sequence.current) setReadError(messageOf(cause)) }
@@ -154,10 +184,13 @@ export function useDelivery(connection: ReadyConnection, platform: Platform) {
   }
   useEffect(() => {
     alive.current = true; running.current = null
-    setStatus(null); setOrders([]); setSelectedId(null); setBusy(null); setError(''); setReadError(''); setNotice('')
+    setStatus(null); setOrders([]); setBudgets([]); setProviders([]); setSelectedId(null); setBusy(null); setError(''); setReadError(''); setNotice('')
     void refresh()
+    // Only a hint for the provider field, read once per connection; without it the ID is still typed in.
+    let live = true
+    void client.providers().then(list => { if (live && current()) setProviders(list) }, () => {})
     const foreground = platform.onForeground(() => { void refresh() })
-    return () => { alive.current = false; sequence.current += 1; foreground() }
+    return () => { live = false; alive.current = false; sequence.current += 1; foreground() }
   }, [client])
   const polling = shouldPollDelivery(status?.enabled === true, orders)
   useEffect(() => {
@@ -166,16 +199,16 @@ export function useDelivery(connection: ReadyConnection, platform: Platform) {
     return () => clearInterval(timer)
   }, [client, polling])
   async function run(key: string, action: () => Promise<void>) {
-    if (running.current !== null || !current()) return
+    if (running.current !== null || !current()) return false
     running.current = key; setBusy(key); setError(''); setNotice('')
-    try { await action() }
-    catch (cause) { if (current()) setError(messageOf(cause)) }
+    try { await action(); return true }
+    catch (cause) { if (current()) setError(messageOf(cause)); return false }
     finally { if (current()) { running.current = null; setBusy(null) } }
   }
   const selected = orders.find(order => order.order_id === selectedId) ?? null
   return {
-    status, orders, selected, busy, error: error || readError, notice,
-    canManage: connection.principal.source === 'membership' && connection.principal.can_manage,
+    status, orders, budgets, providers, selected, busy, error: error || readError, notice,
+    canManage,
     select: setSelectedId,
     refresh: () => run('refresh', refresh),
     configure: (settings: DeliverySettings) => run('configure', async () => { const result = await client.configure(settings); if (current()) { sequence.current += 1; setStatus(result) } }),
@@ -184,8 +217,11 @@ export function useDelivery(connection: ReadyConnection, platform: Platform) {
       remember(await client.prepare(draft, file, status, restartIntentId))
     }),
     confirm: (order: DeliveryOrder) => run('confirm', async () => { remember(await client.confirm(order)) }),
+    confirmBatch: (orders: DeliveryOrder[]) => run('confirm_batch', async () => { for (const order of await client.confirmBatch(orders)) remember(order) }),
     accept: (order: DeliveryOrder) => run('accept', async () => { remember(await client.accept(order)) }),
+    acceptBatch: (orders: DeliveryOrder[]) => run('accept_batch', async () => { for (const order of await client.acceptBatch(orders)) remember(order) }),
     reconcile: (order: DeliveryOrder) => run('reconcile', async () => { remember(await client.reconcile(order)) }),
+    flushBudget: (budgetId: string) => run('flush_budget', async () => { await client.flushBudget(budgetId); await refresh() }),
     save: (order: DeliveryOrder) => run('save', async () => {
       const saved = await client.save(order, platform)
       if (current()) setNotice(saved === 'saved' ? '文件校验通过，并已保存到此应用。分享面板可导出副本。' : '文件校验通过，已交给浏览器保存。请确认下载文件。')

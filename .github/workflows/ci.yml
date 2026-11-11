@@ -1,66 +1,48 @@
-name: ci
+name: CI / Core
+run-name: >-
+  Core · ${{ github.event_name }} · ${{ github.ref_name }} · ${{ inputs.package_policy || 'standard' }}
 
 on:
   push:
     branches: [main]
   merge_group:
     types: [checks_requested]
-  schedule:
-    - cron: '23 */4 * * *'
   workflow_dispatch:
+  workflow_call:
     inputs:
-      delivery_live:
-        description: 'Run genuine local paid delivery proofs and settlement in the bounded Linux sandbox'
-        type: boolean
-        default: false
-      delivery_small:
-        description: 'Run only the bounded 4 KiB proof, settlement and exposed-key experiments'
-        type: boolean
-        default: false
-      delivery_small_resume_run:
-        description: 'Optional explicit same-source small-experiment run ID to reuse verified public parts'
+      package_policy:
+        description: Internal package coverage policy, standard or linux-native
         type: string
-        default: ''
-      windows_only:
-        description: 'Run native Windows checks; optionally diagnose a prior Windows package when windows_package_run is set'
-        type: boolean
-        default: false
-      windows_package_run:
-        description: 'For windows_only diagnostics, reuse a prior completed ci.yml run whose Windows package producer succeeded'
-        type: string
-        default: ''
-      mobile_apps:
-        description: 'Build native mobile apps independently, without the desktop acceptance jobs'
-        type: choice
-        options: [none, ios, android, both]
-        default: none
-      desktop_only:
-        description: 'Run only independent Mac and Windows native builds, desktop windows and Windows platform checks'
-        type: boolean
-        default: false
-      desktop:
-        description: 'Also run the hosted Windows native checks and the real Mac and Windows desktop window tests'
-        type: boolean
-        default: false
+        default: standard
+    outputs:
+      source_sha:
+        value: ${{ jobs.plan.outputs.source_sha }}
+      version:
+        value: ${{ jobs.plan.outputs.version }}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.delivery_small && 'delivery-small' || format('{0}-{1}-{2}', github.event_name, github.ref, (github.event_name == 'workflow_dispatch' || github.run_attempt > 1) && github.run_id || '') }}
-  cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == 1 }}
+  group: ci-core-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ inputs.package_policy || 'standard' }}${{ inputs.package_policy == 'linux-native' && format('-proof-{0}', github.run_id) || (github.run_attempt > 1 && format('-rerun-{0}', github.run_id) || '') }}
+  cancel-in-progress: ${{ inputs.package_policy != 'linux-native' && github.run_attempt == 1 && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
 
 permissions:
   contents: read
 
 jobs:
   plan:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.delivery_small || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    name: Select frozen coverage
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       actions: read
     outputs:
       plan: ${{ steps.select.outputs.plan }}
+      source_sha: ${{ steps.select.outputs.source_sha }}
       web: ${{ steps.select.outputs.web }}
+      web_tests: ${{ steps.select.outputs.web_tests }}
+      crypto: ${{ steps.select.outputs.crypto }}
       www: ${{ steps.select.outputs.www }}
+      mobile: ${{ steps.select.outputs.mobile }}
+      desktop: ${{ steps.select.outputs.desktop }}
       rust: ${{ steps.select.outputs.rust }}
       slow: ${{ steps.select.outputs.slow }}
       delivery: ${{ steps.select.outputs.delivery }}
@@ -82,10 +64,11 @@ jobs:
         id: select
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/ci.py plan --github-output "$GITHUB_OUTPUT"
+          CI_PACKAGE_POLICY: ${{ inputs.package_policy || 'standard' }}
+        run: python3 scripts/ci.py plan --package-policy-env CI_PACKAGE_POLICY --github-output "$GITHUB_OUTPUT"
 
   quick-check:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.desktop_only) }}
+    name: Workflow and source checks
     needs: plan
     runs-on: ubuntu-24.04
     steps:
@@ -106,6 +89,8 @@ jobs:
         if: needs.plan.outputs.rust == 'true'
         run: atlas migrate validate --dir file://apps/core/migrations
       - name: Check workflow, selectors and shell scripts
+        env:
+          GOTOOLCHAIN: go1.26.3
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
           python3 scripts/ci.py --self-test
@@ -116,11 +101,10 @@ jobs:
           python3 scripts/release.py self-test
           python3 -B scripts/test_progressive_publication.py
           python3 scripts/package-node-windows.py --self-test
-          python3 scripts/windows-diagnostic-input.py --self-test
           python3 scripts/checksum.py --self-test
           python3 scripts/ios_device.py --self-test
           python3 scripts/verify-node.py --binary /usr/bin/true --artifacts .artifacts/native-clipboard-selfcheck --native-clipboard-selfcheck
-          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/release.py", "scripts/package-node-windows.py", "scripts/verify-windows-imports.py", "scripts/check-release-workflow.py", "scripts/daily-nightly.py")]'
+          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/verify-delivery-protected.py", "scripts/verify-delivery-restart-observer.py", "scripts/release.py", "scripts/package-node-windows.py", "scripts/verify-windows-imports.py", "scripts/check-release-workflow.py", "scripts/daily-nightly.py", "scripts/nightly_source.py")]'
           bash -n install.sh
           bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/import-mac-identity.sh
           shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/import-mac-identity.sh
@@ -133,16 +117,17 @@ jobs:
           node --check scripts/build-desktop.mjs
           node --check scripts/verify-desktop.mjs
           node --check scripts/e2e-desktop.mjs
-          node --check apps/desktop/electron-builder.cjs
           node scripts/package-npm.mjs --self-test
           node scripts/publish-npm.mjs --self-test
+          python3 -B scripts/offline-docs.py --self-test
           node scripts/build-desktop.mjs --self-test
           node scripts/verify-desktop.mjs --self-test
       - run: cargo fmt --all -- --check
 
   www:
+    name: Static portal
     needs: plan
-    if: ${{ (needs.plan.outputs.www == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    if: needs.plan.outputs.www == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -172,75 +157,97 @@ jobs:
           retention-days: 14
 
   crypto-web:
+    name: Browser cryptography
     needs: plan
-    if: needs.plan.outputs.web == 'true'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          key: crypto-web
-          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: '22'
-      - name: Build shared browser cryptography
-        run: |
-          cargo install wasm-bindgen-cli --version 0.2.129 --locked
-          npm install -g binaryen@132.0.0
-          bash scripts/build-web-crypto.sh
-          cargo build -p vibeface-secure --example secure-probe --locked
-          node scripts/crypto-client.mjs --self-test --native-probe target/debug/examples/secure-probe
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: crypto-web-${{ github.sha }}
-          path: |
-            apps/app/generated/vibeface_secure.js
-            apps/app/generated/vibeface_secure_bg.wasm
-            apps/app/generated/*.d.ts
-            apps/app/generated/.vibeface-build.json
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 14
+    if: needs.plan.outputs.crypto == 'true'
+    uses: ./.github/workflows/_ci-crypto.yml
+    with:
+      source_sha: ${{ github.sha }}
 
   web:
+    name: Web assets and checks
     needs: [plan, crypto-web]
     if: needs.plan.outputs.web == 'true'
+    uses: ./.github/workflows/_ci-web.yml
+    with:
+      source_sha: ${{ github.sha }}
+
+  web-tests:
+    name: Web and shared client unit tests
+    needs: [plan, crypto-web]
+    if: needs.plan.outputs.web_tests == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: crypto-web-${{ github.sha }}
           path: apps/app/generated
-      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
         with:
           version: 11.9.0
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '24'
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
-      - name: Build and typecheck the static web client
-        run: bash scripts/build-web.sh
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - name: Verify crypto inputs and run Web and shared client tests
+        run: |
+          python3 -B scripts/build-inputs.py check crypto
+          pnpm install --frozen-lockfile --filter 'vibeface-web...' --filter 'vibeface-mobile...'
+          pnpm --filter vibeface-web generate-routes
+          pnpm --filter vibeface-web test
+          pnpm --filter vibeface-web typecheck
+          pnpm --filter @vibeface/client test
+          pnpm --filter @vibeface/client typecheck
+
+  mobile-check:
+    name: Mobile types
+    needs: plan
+    if: needs.plan.outputs.mobile == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          name: web-${{ github.sha }}
-          path: apps/app/dist/client
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 14
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile --filter 'vibeface-mobile...'
+      - name: Check shared client and native mobile types
+        run: |
+          pnpm --filter @vibeface/client run typecheck
+          pnpm --filter @vibeface/secure-native run typecheck
+          pnpm --filter vibeface-mobile run typecheck
+
+  desktop-check:
+    name: Native desktop host checks
+    needs: plan
+    if: needs.plan.outputs.desktop == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {persist-credentials: false}
+      - uses: ./.github/actions/native-desktop
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with: {key: gpui-feature-check}
+      - name: Check and test the native desktop host
+        run: |
+          cargo fmt --all -- --check
+          cargo test -p vibeface-desktop --locked
+          cargo clippy -p vibeface-desktop --all-targets --locked -- -D warnings
 
   rust-check:
+    name: Rust lint and minimum version
     needs: [plan, quick-check]
-    if: ${{ (needs.plan.outputs.rust == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    if: needs.plan.outputs.rust == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -260,8 +267,9 @@ jobs:
         run: python3 scripts/ci.py check --plan-env CI_PLAN --msrv "$MSRV"
 
   rust-fast:
+    name: Rust fast tests
     needs: plan
-    if: ${{ (needs.plan.outputs.rust == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    if: needs.plan.outputs.rust == 'true'
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_TEST_OPT_LEVEL: '1'
@@ -280,11 +288,20 @@ jobs:
       - name: Run affected Rust tests except the exact heavy scenarios
         env:
           CI_PLAN: ${{ needs.plan.outputs.plan }}
-        run: /usr/bin/time -v python3 scripts/ci.py test --tier fast --plan-env CI_PLAN
+        run: /usr/bin/time -v python3 scripts/ci.py test --tier fast --plan-env CI_PLAN --timings-file .artifacts/ci-timings/rust-fast.json
+      - name: Keep Rust fast timing evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rust-fast-timing-${{ github.sha }}
+          path: .artifacts/ci-timings/rust-fast.json
+          if-no-files-found: warn
+          retention-days: 7
 
   rust-slow:
+    name: Rust heavy scenarios
     needs: plan
-    if: ${{ (needs.plan.outputs.slow == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    if: needs.plan.outputs.slow == 'true'
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_TEST_OPT_LEVEL: '1'
@@ -303,11 +320,20 @@ jobs:
       - name: Run the exact heavy Node scenarios
         env:
           CI_PLAN: ${{ needs.plan.outputs.plan }}
-        run: /usr/bin/time -v python3 scripts/ci.py test --tier slow --plan-env CI_PLAN
+        run: /usr/bin/time -v python3 scripts/ci.py test --tier slow --plan-env CI_PLAN --timings-file .artifacts/ci-timings/rust-slow.json
+      - name: Keep Rust slow timing evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rust-slow-timing-${{ github.sha }}
+          path: .artifacts/ci-timings/rust-slow.json
+          if-no-files-found: warn
+          retention-days: 7
 
   delivery:
+    name: Delivery fixture and contract checks
     needs: plan
-    if: ${{ (needs.plan.outputs.delivery == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    if: needs.plan.outputs.delivery == 'true'
     runs-on: ubuntu-24.04
     env:
       RISC0_HOME: /risc0
@@ -360,8 +386,8 @@ jobs:
 
   package:
     needs: [plan, crypto-web, web]
-    if: ${{ (needs.plan.outputs.package == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
-    name: package (${{ matrix.target }})
+    if: needs.plan.outputs.package == 'true'
+    name: Native package and acceptance (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -388,7 +414,10 @@ jobs:
           components: rustfmt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: package-${{ matrix.target }}${{ runner.os == 'Windows' && '-static-crt' || '' }}
+          key: package-with-probe-${{ matrix.target }}-${{ hashFiles('scripts/release-rustflags.py') }}${{ runner.os == 'Windows' && '-static-crt' || '' }}
+          workspaces: |
+            . -> target
+            tests/fixtures/delivery-probe -> ../../../.artifacts/delivery-probe/target
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
@@ -510,7 +539,7 @@ jobs:
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-web --web-only
-      - name: Verify packaged free discovery and charity delivery over real Node processes
+      - name: Verify packaged free mesh and charity delivery over real Node processes
         if: needs.plan.outputs.delivery == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
@@ -527,9 +556,10 @@ jobs:
           path: .artifacts/ci-delivery/delivery-charity-*/report.json
           if-no-files-found: warn
           retention-days: 7
-      - name: Use official Ubuntu package mirror
+      - uses: ./.github/actions/ubuntu-apt
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: printf 'https://archive.ubuntu.com/ubuntu/\n' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+        with:
+          apply: 'true'
       - name: Cache Chromium binaries
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
@@ -581,11 +611,11 @@ jobs:
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-public-node --public-node
-      - name: Verify discovery assistance and headless Nodes
+      - name: Verify the mesh, volunteer relay adoption and headless Nodes
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
-        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-discovery --discovery
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-mesh --mesh
       - name: Verify write protection, status and diagnostics
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'aarch64-apple-darwin'
         env:
@@ -618,8 +648,8 @@ jobs:
             .artifacts/ci-chat-agent/chat-agent-process-*/manager-tool-errors.jsonl
             .artifacts/ci-phase4/phase4-*/report.json
             .artifacts/ci-phase4/phase4-*/*/node.log
-            .artifacts/ci-discovery/discovery-*/report.json
-            .artifacts/ci-discovery/discovery-*/*/node.log
+            .artifacts/ci-mesh/mesh-*/report.json
+            .artifacts/ci-mesh/mesh-*/*/node.log
             .artifacts/ci-public-node/public-node-*/report.json
             .artifacts/ci-public-node/public-node-*/*/node.log
             .artifacts/ci-phase5/phase5-*/report.json
@@ -633,249 +663,17 @@ jobs:
           security delete-keychain "$RUNNER_TEMP/vibeface-signing.keychain-db" 2> /dev/null || true
           rm -f "$RUNNER_TEMP/vibeface-notary.p8" "$RUNNER_TEMP/vibeface-signing.p12"
 
-  delivery-small-prepare:
-    if: github.event_name == 'workflow_dispatch' && inputs.delivery_small
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
-    permissions:
-      contents: read
-      actions: read
-    outputs:
-      matrix: ${{ steps.run.outputs.matrix }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: Require a single explicit experiment mode
-        env:
-          DELIVERY_LIVE: ${{ inputs.delivery_live }}
-        run: test "$DELIVERY_LIVE" = false
-      - name: Rebuild the canonical profile and verify two actual fixture replays
-        id: run
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RESUME_RUN: ${{ inputs.delivery_small_resume_run }}
-        run: |
-          args=(--sandbox --prove-small prepare)
-          if [[ -n "$RESUME_RUN" ]]; then args+=(--resume-run "$RESUME_RUN"); fi
-          python3 scripts/check-delivery.py "${args[@]}"
-      - name: Preserve validated public preparation evidence
-        if: ${{ always() && steps.run.outputs.public-directory != '' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: delivery-small-prepare-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ steps.run.outputs.public-directory }}
-          if-no-files-found: error
-          retention-days: 14
-
-  delivery-small-proofs:
-    needs: delivery-small-prepare
-    if: github.event_name == 'workflow_dispatch' && inputs.delivery_small
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
-    permissions:
-      contents: read
-      actions: read
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix: ${{ fromJSON(needs.delivery-small-prepare.outputs.matrix) }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: Prove the selected relation or independently verify its saved part
-        id: run
-        env:
-          GH_TOKEN: ${{ github.token }}
-          WORK_ITEM: ${{ matrix.item }}
-          RESUME_RUN: ${{ inputs.delivery_small_resume_run }}
-        run: |
-          args=(--sandbox --prove-small "$WORK_ITEM")
-          if [[ -n "$RESUME_RUN" ]]; then args+=(--resume-run "$RESUME_RUN"); fi
-          python3 scripts/check-delivery.py "${args[@]}"
-      - name: Preserve independently verified public part or unqualified diagnostic
-        if: ${{ always() && steps.run.outputs.public-directory != '' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: delivery-small-${{ matrix.item }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ steps.run.outputs.public-directory }}
-          if-no-files-found: error
-          retention-days: 14
-
-  delivery-small-accept:
-    needs: [delivery-small-prepare, delivery-small-proofs]
-    if: ${{ always() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.delivery_small && needs.delivery-small-prepare.result == 'success' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: Require all four qualified parts before the original money and recovery checks
-        id: run
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RESUME_RUN: ${{ inputs.delivery_small_resume_run }}
-        run: |
-          args=(--sandbox --prove-small accept)
-          if [[ -n "$RESUME_RUN" ]]; then args+=(--resume-run "$RESUME_RUN"); fi
-          python3 scripts/check-delivery.py "${args[@]}"
-      - name: Preserve independently verified final public evidence
-        if: ${{ always() && steps.run.outputs.public-directory != '' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: delivery-small-accept-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ steps.run.outputs.public-directory }}
-          if-no-files-found: error
-          retention-days: 14
-
-  delivery-android:
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.delivery_live && !inputs.delivery_small) && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
-    uses: ./.github/workflows/mobile.yml
-    with:
-      android_only: true
-
-  delivery-live:
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.delivery_live && !inputs.delivery_small) && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
-    needs: [plan, package, crypto-web, web, delivery-android]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: node-package-x86_64-unknown-linux-gnu-${{ github.sha }}
-          path: .artifacts/vdp/live-package
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: crypto-web-${{ github.sha }}
-          path: apps/app/generated
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: web-${{ github.sha }}
-          path: apps/app/dist/client
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: vibeface-android-${{ github.sha }}
-          path: .artifacts/vdp/live-android
-      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
-        with:
-          version: 11.9.0
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: '24'
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
-      - name: Install recording and KVM access tools
-        run: |
-          printf 'https://archive.ubuntu.com/ubuntu\n' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg acl
-      - name: Prepare host Web and Android drivers without model calls
-        env:
-          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/tests/e2e/.artifacts/vdp/live-ui/browsers
-        run: |
-          pnpm install --frozen-lockfile --filter .
-          pnpm test:e2e:check
-          pnpm exec e2e-web install chromium --with-deps
-          command -v Xvfb
-          command -v xvfb-run
-          command -v xauth
-          command -v ffmpeg
-          command -v ffprobe
-          test -c /dev/kvm
-          sudo setfacl -m "u:$(id -u):rw" /dev/kvm
-      - name: Generate genuine local proofs and verify actual Web and Android delivery
-        env:
-          SOURCE_COMMIT: ${{ github.sha }}
-        run: python3 scripts/run-delivery-live.py --package .artifacts/vdp/live-package --android .artifacts/vdp/live-android --source-commit "$SOURCE_COMMIT"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: ${{ !cancelled() }}
-        with:
-          name: delivery-live-public-${{ github.sha }}
-          path: |
-            .artifacts/vdp/live-public/key-binding.receipt
-            .artifacts/vdp/live-public/key-binding.json
-            .artifacts/vdp/live-public/relation-*-window-*.receipt
-            .artifacts/vdp/live-public/relation-*-window-*.json
-            .artifacts/vdp/live-public/settlement.json
-            .artifacts/vdp/live-public/settlement-observation.json
-            .artifacts/vdp/live-public/key-lifecycle/rotate.receipt
-            .artifacts/vdp/live-public/key-lifecycle/rotate.json
-            .artifacts/vdp/live-public/key-lifecycle/revoke.receipt
-            .artifacts/vdp/live-public/key-lifecycle/revoke.json
-            .artifacts/vdp/live-public/key-lifecycle/register.receipt
-            .artifacts/vdp/live-public/key-lifecycle/register.json
-            .artifacts/vdp/live-public/key-lifecycle/summary.json
-            .artifacts/vdp/live-public/key-lifecycle/mixed-held.json
-            .artifacts/vdp/live-public/ordinary-settlement/key-binding.receipt
-            .artifacts/vdp/live-public/ordinary-settlement/key-binding.json
-            .artifacts/vdp/live-public/ordinary-settlement/relation-*-window-0.receipt
-            .artifacts/vdp/live-public/ordinary-settlement/relation-*-window-0.json
-            .artifacts/vdp/live-public/ordinary-settlement/settlement.json
-            .artifacts/vdp/live-public/ordinary-settlement/settlement-observation.json
-            .artifacts/vdp/live-public/branches/index.json
-            .artifacts/vdp/live-public/branches/core-restored.json
-            .artifacts/vdp/live-public/branches/key-rotate.json
-            .artifacts/vdp/live-public/branches/key-revoke.json
-            .artifacts/vdp/live-public/branches/key-register.json
-            .artifacts/vdp/live-public/branches/branch-offline-refund.json
-            .artifacts/vdp/live-public/branches/branch-partial-refund.json
-            .artifacts/vdp/live-public/branches/branch-held-timeout.json
-            .artifacts/vdp/live-public/branches/branch-strict-late-open.json
-            .artifacts/vdp/live-public/branches/branch-late-priority.json
-            .artifacts/vdp/live-public/branches/branch-hold-reorg.json
-            .artifacts/vdp/live-public/branches/branch-capsule-reorg.json
-            .artifacts/vdp/live-public/branches/branch-keeper.json
-            .artifacts/vdp/live-public/branches/branch-token-false.json
-            .artifacts/vdp/live-public/branches/branch-token-frozen.json
-            .artifacts/vdp/live-public/branches/branch-token-fee.json
-            .artifacts/vdp/live-public/branches/branch-token-sender-tax.json
-            .artifacts/vdp/live-public/branches/branch-token-precision.json
-            .artifacts/vdp/live-public/branches/branch-token-nonreturn.json
-            .artifacts/vdp/live-public/branches/branch-token-reentrancy.json
-            .artifacts/vdp/live-public/branches/branch-node-refund-hook.json
-            .artifacts/vdp/live-public/branches/branch-incoming-false.json
-            .artifacts/vdp/live-public/branches/branch-incoming-frozen.json
-            .artifacts/vdp/live-public/branches/branch-incoming-fee.json
-            .artifacts/vdp/live-public/branches/branch-incoming-sender-tax.json
-            .artifacts/vdp/live-public/branches/branch-incoming-precision.json
-            .artifacts/vdp/live-public/branches/branch-incoming-reentrancy.json
-            .artifacts/vdp/live-public/branches/branch-incoming-nonreturn.json
-            .artifacts/vdp/live-public/branches/branch-mixed-held-rotate.json
-            .artifacts/vdp/live-public/ui/web.json
-            .artifacts/vdp/live-public/ui/android.json
-            .artifacts/vdp/live-public/ui/web.png
-            .artifacts/vdp/live-public/ui/android-offline.png
-            .artifacts/vdp/live-public/ui/android.png
-            .artifacts/vdp/live-public/ui/ui-inspections.json
-            .artifacts/vdp/live-public/ui/web-partial-refund.png
-            .artifacts/vdp/live-public/ui/web-unknown-transaction.png
-            .artifacts/vdp/live-public/ui/android-key-before.png
-            .artifacts/vdp/live-public/ui/android-key-rotated.png
-            .artifacts/vdp/live-public/ui/web-settled.png
-            .artifacts/vdp/live-public/ui/video-metadata.json
-            .artifacts/vdp/live-public/ui/web-confirm.mp4
-            .artifacts/vdp/live-public/ui/android-accept-offline.mp4
-            .artifacts/vdp/live-public/ui/android-resume-save.mp4
-            .artifacts/vdp/live-public/summary.json
-            .artifacts/vdp/live-public/resources.json
-          if-no-files-found: warn
-          retention-days: 14
-
   npm-package:
+    name: npm package
     needs: [plan, package]
-    if: ${{ (needs.plan.outputs.npm == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    if: needs.plan.outputs.npm == 'true'
     runs-on: ubuntu-24.04
+    outputs:
+      baseline_artifact: ${{ steps.baseline.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -895,10 +693,26 @@ jobs:
           path: .artifacts/npm/leaperone-vibeface-*.tgz*
           if-no-files-found: error
           retention-days: 14
+      - name: Pin one complete public npm baseline for every service runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIBEFACE_RELEASE_SCRATCH: ${{ github.workspace }}/.artifacts/npm-baseline-source
+        run: python3 scripts/verify-node.py --npm-baseline-pin --artifacts .artifacts/npm-service-baseline
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        id: baseline
+        with:
+          name: npm-service-baseline-${{ github.sha }}
+          path: |
+            .artifacts/npm-service-baseline/baseline.tgz
+            .artifacts/npm-service-baseline/pin.json
+            .artifacts/npm-service-baseline/release.json
+          if-no-files-found: error
+          retention-days: 14
 
   npm-smoke:
+    name: npm installation and service acceptance
     needs: [plan, npm-package]
-    if: ${{ (needs.plan.outputs.npm == 'true') && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
+    if: needs.plan.outputs.npm == 'true'
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -909,6 +723,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -920,6 +735,12 @@ jobs:
         with:
           name: npm-package-${{ github.sha }}
           path: .artifacts/npm
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: matrix.target != 'x86_64-pc-windows-msvc'
+        with:
+          artifact-ids: ${{ needs.npm-package.outputs.baseline_artifact }}
+          path: .artifacts/npm-service-baseline
+          merge-multiple: true
       - name: Install npm artifact without lifecycle scripts
         id: install
         env:
@@ -949,204 +770,35 @@ jobs:
         run: |
           prefix="$PWD/.artifacts/npm-installed"
           python3 scripts/verify-node.py --binary "$prefix/bin/vibeface" --core-binary "$VENDOR/vibeface-core" --crypto-module "$VENDOR/web/vibeface_secure.js" --artifacts .artifacts/ci-npm --web-only
-
-  windows-native:
-    needs: [plan, package]
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.desktop && contains(needs.plan.outputs.package_matrix, 'x86_64-pc-windows-msvc') }}
-    uses: ./.github/workflows/ci-windows-native.yml
-    permissions:
-      contents: read
-      actions: read
-    with:
-      source_sha: ${{ github.sha }}
-      package_artifact: node-package-x86_64-pc-windows-msvc-${{ github.sha }}
-
-  desktop-macos:
-    needs: [plan, package]
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.desktop && contains(needs.plan.outputs.package_matrix, 'aarch64-apple-darwin') }}
-    uses: ./.github/workflows/ci-desktop.yml
-    with:
-      source_sha: ${{ github.sha }}
-      runner: macos-15
-      target: aarch64-apple-darwin
-      package_artifact: node-package-aarch64-apple-darwin-${{ github.sha }}
-
-  desktop-windows:
-    needs: [plan, package]
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.desktop && contains(needs.plan.outputs.package_matrix, 'x86_64-pc-windows-msvc') }}
-    uses: ./.github/workflows/ci-desktop.yml
-    with:
-      source_sha: ${{ github.sha }}
-      runner: windows-2025
-      target: x86_64-pc-windows-msvc
-      package_artifact: node-package-x86_64-pc-windows-msvc-${{ github.sha }}
-
-  desktop-only-macos:
-    needs: [plan, crypto-web, web]
-    if: github.event_name == 'workflow_dispatch' && inputs.desktop_only
-    uses: ./.github/workflows/ci-desktop.yml
-    with:
-      source_sha: ${{ github.sha }}
-      runner: macos-15
-      target: aarch64-apple-darwin
-
-  desktop-only-windows:
-    needs: [plan, crypto-web, web]
-    if: github.event_name == 'workflow_dispatch' && inputs.desktop_only
-    uses: ./.github/workflows/ci-desktop.yml
-    with:
-      source_sha: ${{ github.sha }}
-      runner: windows-2025
-      target: x86_64-pc-windows-msvc
-
-  desktop-only-linux-x64:
-    needs: [plan, crypto-web, web]
-    if: github.event_name == 'workflow_dispatch' && inputs.desktop_only
-    uses: ./.github/workflows/ci-desktop.yml
-    with:
-      source_sha: ${{ github.sha }}
-      runner: ubuntu-24.04
-      target: x86_64-unknown-linux-gnu
-
-  desktop-only-linux-arm64:
-    needs: [plan, crypto-web, web]
-    if: github.event_name == 'workflow_dispatch' && inputs.desktop_only
-    uses: ./.github/workflows/ci-desktop.yml
-    with:
-      source_sha: ${{ github.sha }}
-      runner: ubuntu-24.04-arm
-      target: aarch64-unknown-linux-gnu
-
-  mobile-plan:
-    if: github.event_name == 'workflow_dispatch' && inputs.mobile_apps != 'none'
-    runs-on: ubuntu-24.04
-    outputs:
-      version: ${{ steps.version.outputs.value }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with: {persist-credentials: false}
-      - id: version
-        name: Read the committed mobile release version
-        run: |
-          python3 - <<'PYTHON'
-          import json, os
-          version = json.load(open('apps/mobile/app.json'))['expo']['extra']['releaseVersion']
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write('value=' + version + '\n')
-          PYTHON
-
-  ios-device:
-    needs: [mobile-plan]
-    if: github.event_name == 'workflow_dispatch' && (inputs.mobile_apps == 'ios' || inputs.mobile_apps == 'both')
-    uses: ./.github/workflows/release-ios.yml
-    with:
-      source_sha: ${{ github.sha }}
-      version: ${{ needs.mobile-plan.outputs.version }}
-    secrets:
-      IOS_CERTIFICATE_P12_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
-      IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
-      IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
-
-  android-app:
-    needs: [mobile-plan]
-    if: github.event_name == 'workflow_dispatch' && (inputs.mobile_apps == 'android' || inputs.mobile_apps == 'both')
-    uses: ./.github/workflows/release-apps.yml
-    with:
-      source_sha: ${{ github.sha }}
-      version: ${{ needs.mobile-plan.outputs.version }}
-      tag: ''
-
-  mobile-gate:
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.mobile_apps != 'none' }}
-    needs: [mobile-plan, ios-device, android-app]
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Require exactly the selected native mobile applications
+      - name: Verify native npm service and package replacement
+        if: matrix.target != 'x86_64-pc-windows-msvc'
         env:
-          MOBILE_NEEDS: ${{ toJSON(needs) }}
-          SCOPE: ${{ inputs.mobile_apps }}
+          VENDOR: ${{ steps.install.outputs.vendor }}
+          PACKAGE_VERSION: ${{ needs.plan.outputs.version }}
+          NPM_BASELINE_ARTIFACT_ID: ${{ needs.npm-package.outputs.baseline_artifact }}
         run: |
-          python3 - <<'PYTHON'
-          import json, os
-          checks = json.loads(os.environ['MOBILE_NEEDS'])
-          required = ['mobile-plan']
-          if os.environ['SCOPE'] in ('ios', 'both'): required.append('ios-device')
-          if os.environ['SCOPE'] in ('android', 'both'): required.append('android-app')
-          failed = {name: checks[name]['result'] for name in required if checks[name]['result'] != 'success'}
-          if failed: raise SystemExit('Native mobile builds are incomplete: ' + json.dumps(failed))
-          print('Selected native mobile application builds passed')
-          PYTHON
-
-  windows-package-input:
-    if: github.event_name == 'workflow_dispatch' && inputs.windows_package_run != ''
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Restrict package diagnostics to windows_only
-        env:
-          WINDOWS_ONLY: ${{ inputs.windows_only }}
-          DESKTOP_ONLY: ${{ inputs.desktop_only }}
-          PACKAGE_RUN_ID: ${{ inputs.windows_package_run }}
-        run: |
-          [[ "$WINDOWS_ONLY" == true && "$DESKTOP_ONLY" != true ]] || {
-            echo '::error::windows_package_run is only allowed with windows_only=true and desktop_only=false.'
-            exit 1
-          }
-          [[ "$PACKAGE_RUN_ID" =~ ^[1-9][0-9]{0,18}$ ]] || {
-            echo '::error::windows_package_run must be a positive decimal workflow run ID.'
-            exit 1
-          }
-
-  windows-platform:
-    if: github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only)
-    uses: ./.github/workflows/ci-windows-native.yml
-    permissions:
-      contents: read
-      actions: read
-    with:
-      source_sha: ${{ github.sha }}
-      package_run_id: ${{ inputs.windows_only && !inputs.desktop_only && inputs.windows_package_run || '' }}
-      rust_checks: ${{ !inputs.windows_only || inputs.desktop_only || inputs.windows_package_run == '' }}
-
-  windows-gate:
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && (inputs.windows_only || inputs.windows_package_run != '') }}
-    needs: [windows-platform, windows-package-input]
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Require the native Windows checks
-        env:
-          RESULT: ${{ needs.windows-platform.result }}
-          INPUT_RESULT: ${{ needs.windows-package-input.result }}
-          WINDOWS_ONLY: ${{ inputs.windows_only }}
-          PACKAGE_RUN_ID: ${{ inputs.windows_package_run }}
-        run: |
-          test "$RESULT" = success
-          if [[ -n "$PACKAGE_RUN_ID" ]]; then
-            [[ "$WINDOWS_ONLY" == true && "$INPUT_RESULT" == success ]] || exit 1
-            echo 'The prior-package Windows diagnostic succeeded; it is not current-source acceptance.'
+          [[ "$GITHUB_ACTIONS" == true && "$RUNNER_ENVIRONMENT" == github-hosted ]]
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            if compgen -G "$HOME/.vibeface*" >/dev/null; then exit 1; fi
+            [[ "${XDG_CONFIG_HOME:-$HOME/.config}" == "$HOME/.config" ]]
+            for directory in "$HOME/.config/systemd/user" /etc/systemd/user /usr/lib/systemd/user /usr/local/lib/systemd/user; do
+              if compgen -G "$directory/vibeface*" >/dev/null || compgen -G "$directory/*/vibeface*" >/dev/null; then exit 1; fi
+            done
+            service_uid="$(id -u)"
+            sudo loginctl enable-linger "$(id -un)"
+            sudo systemctl start "user@$service_uid.service"
+            export XDG_RUNTIME_DIR="/run/user/$service_uid"
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+            [[ -S "$XDG_RUNTIME_DIR/bus" ]]
+            /usr/bin/systemctl --user show-environment >/dev/null
           fi
-
-  desktop-gate:
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.desktop_only }}
-    needs: [plan, crypto-web, web, desktop-only-macos, desktop-only-windows, desktop-only-linux-x64, desktop-only-linux-arm64, windows-platform]
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Require all native platforms and their real desktop windows
-        env:
-          DESKTOP_NEEDS: ${{ toJSON(needs) }}
-        run: |
-          python3 - <<'PYTHON'
-          import json, os
-          checks = json.loads(os.environ['DESKTOP_NEEDS'])
-          failed = {name: job['result'] for name, job in checks.items() if job['result'] != 'success'}
-          if failed:
-              raise SystemExit('Desktop acceptance is incomplete: ' + json.dumps(failed))
-          print('All native desktop applications and Windows platform checks passed')
-          PYTHON
+          prefix="$PWD/.artifacts/npm-installed"
+          python3 scripts/verify-node.py --binary "$prefix/bin/vibeface" --core-binary "$VENDOR/vibeface-core" --crypto-module "$VENDOR/web/vibeface_secure.js" --artifacts .artifacts/ci-npm-service --npm-service --npm-package ".artifacts/npm/leaperone-vibeface-$PACKAGE_VERSION.tgz" --npm-baseline .artifacts/npm-service-baseline
 
   ci-gate:
     name: ci-gate
-    if: ${{ (always() && !(github.event_name == 'workflow_dispatch' && inputs.delivery_small)) && !(github.event_name == 'workflow_dispatch' && (inputs.desktop_only || inputs.windows_only || inputs.mobile_apps != 'none')) }}
-    needs: [plan, quick-check, crypto-web, web, www, rust-check, rust-fast, rust-slow, delivery, delivery-live, package, npm-package, npm-smoke, windows-native, desktop-macos, desktop-windows]
+    if: always()
+    needs: [plan, quick-check, crypto-web, web, web-tests, mobile-check, desktop-check, www, rust-check, rust-fast, rust-slow, delivery, package, npm-package, npm-smoke]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -1156,31 +808,5 @@ jobs:
       - name: Require every check selected for this commit and scenario
         env:
           CI_NEEDS: ${{ toJSON(needs) }}
-        run: python3 scripts/ci.py gate --needs-env CI_NEEDS ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_live && '--delivery-live' || '' }} ${{ github.event_name == 'workflow_dispatch' && inputs.desktop && '--desktop' || '' }}
-
-  daily-nightly:
-    needs: ci-gate
-    if: ${{ !cancelled() && github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.ci-gate.result == 'success' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
-    concurrency:
-      group: daily-nightly
-      cancel-in-progress: false
-    permissions:
-      contents: write
-      actions: write
-      pull-requests: read
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: ${{ github.sha }}
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
-      - name: Reconcile four-hour version PR and immutable Nightly archives
-        env:
-          GH_TOKEN: ${{ github.token }}
-          NIGHTLY_RELEASE_TOKEN: ${{ secrets.NIGHTLY_RELEASE_TOKEN }}
-        run: |
-          gh auth setup-git
-          python3 scripts/daily-nightly.py --run-id "$GITHUB_RUN_ID"
+          CI_PACKAGE_POLICY: ${{ inputs.package_policy || 'standard' }}
+        run: python3 scripts/ci.py gate --needs-env CI_NEEDS --package-policy-env CI_PACKAGE_POLICY

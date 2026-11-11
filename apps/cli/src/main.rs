@@ -16,9 +16,11 @@ use vibeface_bridge::platform::privatefs;
 use vibeface_control::{
     ControlRequest,
     maintenance::{self, MaintenanceCommand, SecretString, WalletCommand},
+    observation,
 };
 
 mod desktop_node;
+mod manage;
 mod service;
 mod terminal;
 mod triage;
@@ -72,6 +74,24 @@ enum Action {
     Join(Join),
     /// Manage this Node's delivery wallet.
     Wallet(WalletOptions),
+    /// Inspect the public mesh or change the Nodes this one joins it through.
+    Mesh(MeshOptions),
+    /// Call a client method on this Node as its local operator.
+    Call(manage::Call),
+    /// Change one config.json value after init.
+    Config(manage::ConfigOptions),
+    /// Show or change this Node's project roots, bot and write state.
+    Node(manage::NodeOptions),
+    /// Configure and check the AI providers on this Node.
+    Provider(manage::ProviderOptions),
+    /// List, create and manage bots, their schedules and memories.
+    Bots(manage::BotsOptions),
+    /// Inspect delivery orders and the Nodes that offer delivery.
+    Delivery(manage::DeliveryOptions),
+    /// Volunteer this Node's relay to the public mesh.
+    Relay(manage::RelayOptions),
+    /// Manage the personal network as an approved management client.
+    Client(manage::ClientOptions),
     /// Manage the installed user service.
     Service(crate::service::Service),
     /// Check releases and manage the automatic update policy.
@@ -139,7 +159,7 @@ struct Init {
     #[arg(long, default_value_t = DEFAULT_LISTEN)]
     listen: SocketAddr,
     /// Address for the local control API.
-    #[arg(long, default_value_t = local_listen())]
+    #[arg(long, default_value_t = DEFAULT_LOCAL_LISTEN)]
     local_listen: SocketAddr,
     /// Public browser entry URL.
     #[arg(long)]
@@ -185,12 +205,6 @@ struct Init {
     /// File with the token a listed --relay asks of this Node. Repeat for each such relay.
     #[arg(long = "relay-token", value_name = "URL=FILE", value_parser = relay_token)]
     relay_tokens: Vec<(String, PathBuf)>,
-    /// Discovery URL. Repeat for multiple entries.
-    #[arg(long = "discovery", value_name = "URL")]
-    discovery: Vec<String>,
-    /// Answer other devices' discovery registrations and lookups on this Node's UDP port.
-    #[arg(long)]
-    serve_discovery: bool,
     /// Address for an embedded relay.
     #[arg(long, value_name = "ADDR")]
     relay_listen: Option<SocketAddr>,
@@ -231,10 +245,17 @@ struct Init {
     /// Reverse proxy whose X-Real-IP names the browser's address. Repeat for each proxy.
     #[arg(long = "trusted-proxy", value_name = "IP")]
     trusted_proxies: Vec<IpAddr>,
-    /// Public bootstrap: `public` (default for a fresh Node not serving discovery), `off`, or
-    /// a self-hosted `vibeface://` discovery URL.
-    #[arg(long, value_name = "MODE|URL")]
-    bootstrap: Option<String>,
+    /// Stay off the public mesh.
+    #[arg(long)]
+    no_mesh: bool,
+    /// Mesh to join instead of the public one; it starts without the default bootstrap node.
+    #[arg(long, value_name = "NAME")]
+    mesh_network: Option<String>,
+    /// The first Node you know, as its node link from `vibeface mesh share`:
+    /// vibeface://node/<device-id>?addr=<host>:<UDP-port>&relay=<URL>. Repeat for more; replaces
+    /// the default bootstrap node.
+    #[arg(long = "bootstrap", value_name = "LINK")]
+    bootstrap: Vec<String>,
 }
 
 #[derive(Args)]
@@ -302,6 +323,11 @@ struct WalletOptions {
 
 #[derive(Subcommand)]
 enum WalletAction {
+    /// Run the manually enabled local protected-budget experiment.
+    Budget {
+        #[command(subcommand)]
+        command: WalletBudgetAction,
+    },
     /// Show wallet and receiving-key status.
     Status,
     /// Create a wallet using a protected passphrase descriptor.
@@ -356,6 +382,126 @@ enum WalletAction {
     Backup {
         /// Destination backup file.
         output: PathBuf,
+    },
+}
+
+#[derive(Args)]
+struct MeshOptions {
+    /// Node data directory.
+    #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = data_dir, default_value_os_t = default_data_dir())]
+    data_dir: PathBuf,
+    #[command(subcommand)]
+    command: MeshAction,
+}
+
+#[derive(Subcommand)]
+enum MeshAction {
+    /// Show whether the mesh is on, its records and neighbors, and this Node's record.
+    Status {
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the records this Node holds, most recently seen first.
+    Records {
+        /// Only Nodes offering this role.
+        #[arg(long, value_enum)]
+        role: Option<MeshRole>,
+        /// Maximum number of records to show.
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change the Nodes this one joins the mesh through first.
+    Bootstrap {
+        #[command(subcommand)]
+        command: BootstrapAction,
+    },
+    /// Print this running Node's node link, for another Node's --bootstrap.
+    Share,
+}
+
+#[derive(Subcommand)]
+enum BootstrapAction {
+    /// Add bootstrap nodes, each a node link
+    /// vibeface://node/<device-id>?addr=<host>:<UDP-port>&relay=<URL>.
+    Add {
+        #[arg(required = true, value_name = "LINK")]
+        nodes: Vec<String>,
+    },
+    /// Remove bootstrap nodes by node link or device ID.
+    Remove {
+        #[arg(required = true, value_name = "LINK|DEVICE_ID")]
+        nodes: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MeshRole {
+    Relay,
+    Gateway,
+    Service,
+}
+
+#[derive(Subcommand)]
+enum WalletBudgetAction {
+    /// Lock one exact local test-token deposit for a fixed Provider; retry the same UUID.
+    Open {
+        #[arg(long)]
+        intent_id: String,
+        #[arg(long)]
+        payee: String,
+        #[arg(long)]
+        provider_peer: String,
+        #[arg(long)]
+        deposit: String,
+        #[arg(long)]
+        gas_cap: String,
+    },
+    /// Allocate up to two already confirmed/proved windows in one irreversible batch.
+    Reserve {
+        #[arg(long)]
+        budget_id: String,
+        #[arg(long, required = true, num_args = 1..=2)]
+        order_ids: Vec<String>,
+        #[arg(long)]
+        intent_id: String,
+    },
+    /// Authorize the fixed Provider to batch its ready Holds and durable reveals.
+    Flush {
+        #[arg(long)]
+        budget_id: String,
+    },
+    /// Withdraw cumulative earned funds to the immutable payee.
+    Withdraw {
+        #[arg(long)]
+        budget_id: String,
+        #[arg(long)]
+        intent_id: String,
+    },
+    /// Stop new allocations without reclaiming any live rights.
+    Close {
+        #[arg(long)]
+        budget_id: String,
+        #[arg(long)]
+        intent_id: String,
+    },
+    /// Refund free and expired allocations; each window is ORDER_ID:INDEX.
+    Refund {
+        #[arg(long)]
+        budget_id: String,
+        #[arg(long)]
+        intent_id: String,
+        #[arg(long, num_args = 0..=2)]
+        windows: Vec<String>,
+    },
+    /// Read confirmed accounting and redacted durable claim status, even while locked/off.
+    Status {
+        #[arg(long)]
+        budget_id: Option<String>,
     },
 }
 
@@ -499,6 +645,43 @@ enum TriageAction {
         #[arg(long)]
         event_id: String,
     },
+    /// Show the triage, webhook and decision token settings.
+    #[serde(skip)]
+    Settings,
+    /// Change triage settings with a JSON object; absent fields keep their value.
+    #[serde(skip)]
+    Configure { change: String },
+    /// Send a test message to the configured webhook.
+    #[serde(skip)]
+    TestWebhook,
+    /// Create a decision token; it is shown once.
+    #[serde(skip)]
+    CreateToken {
+        #[arg(long, default_value = "")]
+        label: String,
+    },
+    /// Revoke a decision token.
+    #[serde(skip)]
+    RevokeToken { token_id: String },
+}
+
+impl TriageAction {
+    /// The settings actions run as the local operator; the rest go to the local triage API.
+    fn operator(&self) -> Result<Option<(&'static str, Value)>> {
+        Ok(Some(match self {
+            Self::Settings => ("triage_settings", json!({})),
+            Self::Configure { change } => (
+                "configure_triage",
+                serde_json::from_str(change).context("the change must be JSON")?,
+            ),
+            Self::TestWebhook => ("test_webhook", json!({})),
+            Self::CreateToken { label } => ("create_decision_token", json!({"label":label})),
+            Self::RevokeToken { token_id } => {
+                ("revoke_decision_token", json!({"token_id":token_id}))
+            }
+            _ => return Ok(None),
+        }))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum, PartialEq, Eq, PartialOrd, Ord)]
@@ -511,14 +694,6 @@ enum LogLevel {
     Error,
 }
 
-impl std::str::FromStr for LogLevel {
-    type Err = anyhow::Error;
-    fn from_str(value: &str) -> Result<Self> {
-        serde_json::from_value(Value::String(value.to_ascii_lowercase()))
-            .context("level is one of trace, debug, info, warn, error")
-    }
-}
-
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum LogSource {
@@ -528,14 +703,6 @@ enum LogSource {
     Cli,
     Codex,
     Cursor,
-}
-
-impl std::str::FromStr for LogSource {
-    type Err = anyhow::Error;
-    fn from_str(value: &str) -> Result<Self> {
-        serde_json::from_value(Value::String(value.to_ascii_lowercase()))
-            .context("source is one of node, web, agent, cli, codex, cursor")
-    }
 }
 
 #[derive(Args)]
@@ -602,10 +769,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         None => {
-            let data_dir = data_dir_or_home(
-                cli.data_dir
-                    .or_else(|| std::env::var_os("VIBEFACE_DATA_DIR").map(PathBuf::from)),
-            )?;
+            let data_dir = data_dir_or_home(cli.data_dir)?;
             let mut args = vec![
                 "--data-dir".to_owned(),
                 data_dir.to_string_lossy().into_owned(),
@@ -632,27 +796,23 @@ async fn main() -> Result<()> {
             exec_core(&args.iter().map(String::as_str).collect::<Vec<_>>())
         }
         Some(Action::Init(options)) => {
-            let result = control(
-                &options.data_dir,
-                ControlRequest::Init {
-                    options: serde_json::to_value(&*options)?,
-                },
-            )
+            let result = control(ControlRequest::Init {
+                options: serde_json::to_value(&*options)?,
+            })
             .await?;
             println!("Vibeface 已就绪");
             if let Some(open) = result["open"].as_str() {
                 println!("打开 {open}");
             }
-            if options.serve_discovery
-                && let Some(device_id) = result["device_id"].as_str()
-            {
-                println!("Discovery device ID: {device_id}");
-            }
-            match result["bootstrap"].as_str() {
-                Some("public") => println!("公共接入: 启用（--bootstrap off 可关闭）"),
-                Some("custom") => println!("公共接入: 自建 Discovery"),
-                Some("off") if !options.serve_discovery => println!("公共接入: 关闭"),
-                _ => {}
+            let mesh = &result["mesh"];
+            if mesh["enabled"] == true {
+                println!(
+                    "全网: 开启（{}，bootstrap 节点 {} 个；--no-mesh 可关闭）",
+                    mesh["network"].as_str().unwrap_or_default(),
+                    mesh["bootstrap"].as_array().map_or(0, Vec::len)
+                );
+            } else {
+                println!("全网: 关闭");
             }
             Ok(())
         }
@@ -661,6 +821,15 @@ async fn main() -> Result<()> {
         Some(Action::Access(options)) => access(options).await,
         Some(Action::Join(options)) => join(options).await,
         Some(Action::Wallet(options)) => wallet(options).await,
+        Some(Action::Mesh(options)) => mesh(options).await,
+        Some(Action::Call(options)) => manage::call(options).await,
+        Some(Action::Config(options)) => manage::config(options).await,
+        Some(Action::Node(options)) => manage::node(options).await,
+        Some(Action::Provider(options)) => manage::provider(options).await,
+        Some(Action::Bots(options)) => manage::bots(options).await,
+        Some(Action::Delivery(options)) => manage::delivery(options).await,
+        Some(Action::Relay(options)) => manage::relay(options).await,
+        Some(Action::Client(options)) => manage::client(options).await,
         Some(Action::Tool {
             name,
             json,
@@ -674,10 +843,15 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Action::Hooks(options)) => hooks(options).await,
-        Some(Action::Triage(options)) => {
-            post_triage(&options.local, serde_json::to_value(options.action)?).await
-        }
-        Some(Action::Requests(local)) => post_triage(&local, json!({"action":"requests"})).await,
+        Some(Action::Triage(options)) => match options.action.operator()? {
+            Some((method, params)) => {
+                let result = manage::operator(&options.local.data_dir, method, params).await?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                Ok(())
+            }
+            None => triage_post(&options.local, serde_json::to_value(options.action)?).await,
+        },
+        Some(Action::Requests(local)) => triage_post(&local, json!({"action":"requests"})).await,
         Some(Action::Respond {
             request_id,
             result,
@@ -685,7 +859,7 @@ async fn main() -> Result<()> {
             local,
         }) => {
             let result: Value = serde_json::from_str(&result).context("result must be JSON")?;
-            post_triage(
+            triage_post(
                 &local,
                 json!({"action":"respond","request_id":request_id,"result":result,"node":node}),
             )
@@ -733,17 +907,14 @@ fn core_binary() -> Result<PathBuf> {
     vibeface_control::sibling_core(&std::env::current_exe()?)
 }
 
-async fn control(_data_dir: &Path, request: ControlRequest) -> Result<Value> {
+async fn control(request: ControlRequest) -> Result<Value> {
     vibeface_control::request(&core_binary()?, &request).await
 }
 
 async fn inspect_socket(data_dir: &Path) -> Result<PathBuf> {
-    let info = control(
-        data_dir,
-        ControlRequest::Inspect {
-            data_dir: data_dir.to_owned(),
-        },
-    )
+    let info = control(ControlRequest::Inspect {
+        data_dir: data_dir.to_owned(),
+    })
     .await?;
     info["maintenance_socket"]
         .as_str()
@@ -752,12 +923,9 @@ async fn inspect_socket(data_dir: &Path) -> Result<PathBuf> {
 }
 
 async fn status(options: Access) -> Result<()> {
-    let mut result = control(
-        &options.data_dir,
-        ControlRequest::Inspect {
-            data_dir: options.data_dir.clone(),
-        },
-    )
+    let mut result = control(ControlRequest::Inspect {
+        data_dir: options.data_dir.clone(),
+    })
     .await?;
     result["cli_version"] = json!(env!("CARGO_PKG_VERSION"));
     if options.json {
@@ -784,8 +952,8 @@ async fn status(options: Access) -> Result<()> {
         if let Some(write_state) = result["write_state"].as_str() {
             println!("Writes: {write_state}");
         }
-        if let Some(bootstrap) = result["bootstrap"].as_str() {
-            println!("Bootstrap: {bootstrap}");
+        if let Some(mesh) = terminal::mesh_summary(&result["mesh"]) {
+            println!("Mesh: {mesh}");
         }
         if let Some(peers) = result["peers"].as_array() {
             let now = now_ms();
@@ -818,15 +986,100 @@ async fn status(options: Access) -> Result<()> {
     Ok(())
 }
 
+async fn mesh(options: MeshOptions) -> Result<()> {
+    let operation = match &options.command {
+        MeshAction::Share => {
+            let shared = manage::operator(&options.data_dir, "share_link", json!({})).await?;
+            println!("{}", shared["link"].as_str().unwrap_or_default());
+            return Ok(());
+        }
+        MeshAction::Status { .. } => json!({"op":"status"}),
+        MeshAction::Records { role, limit, .. } => {
+            json!({"op":"records","role":role,"limit":limit})
+        }
+        MeshAction::Bootstrap {
+            command: BootstrapAction::Add { nodes },
+        } => json!({"op":"bootstrap","add":nodes}),
+        MeshAction::Bootstrap {
+            command: BootstrapAction::Remove { nodes },
+        } => json!({"op":"bootstrap","remove":nodes}),
+    };
+    let result = control(ControlRequest::Mesh {
+        data_dir: options.data_dir.clone(),
+        operation,
+    })
+    .await?;
+    match options.command {
+        MeshAction::Status { json: true } | MeshAction::Records { json: true, .. } => {
+            println!("{}", serde_json::to_string(&result)?);
+        }
+        MeshAction::Status { json: false } => {
+            println!(
+                "Mesh: {} ({})",
+                if result["enabled"] == true {
+                    "on"
+                } else {
+                    "off"
+                },
+                result["network"].as_str().unwrap_or_default()
+            );
+            println!("Records: {}", result["records"]);
+            match result["neighbors"].as_u64() {
+                Some(neighbors) => println!("Neighbors: {neighbors}"),
+                None => println!("Neighbors: - (Node not running)"),
+            }
+            for node in result["bootstrap"].as_array().into_iter().flatten() {
+                println!("Bootstrap: {}", node.as_str().unwrap_or_default());
+            }
+            match result["own"].as_object() {
+                Some(_) => println!("Own record: {}", terminal::mesh_record(&result["own"])),
+                None => println!("Own record: none yet"),
+            }
+        }
+        MeshAction::Records { json: false, .. } => {
+            let now = now_ms();
+            for entry in result["records"].as_array().into_iter().flatten() {
+                let seen = now.saturating_sub(entry["last_seen_ms"].as_i64().unwrap_or(now)) / 1000;
+                println!(
+                    "{} {} seen {seen}s ago",
+                    terminal::mesh_record(&entry["record"]),
+                    if entry["online"] == true {
+                        "online"
+                    } else {
+                        "expired"
+                    },
+                );
+            }
+            let shown = result["records"].as_array().map_or(0, Vec::len);
+            if result["total"]
+                .as_u64()
+                .is_some_and(|total| total > shown as u64)
+            {
+                println!(
+                    "{shown} of {} records shown; use --limit for more",
+                    result["total"]
+                );
+            }
+        }
+        MeshAction::Share => unreachable!("answered by the running Node above"),
+        MeshAction::Bootstrap { .. } => {
+            for node in result["bootstrap"].as_array().into_iter().flatten() {
+                println!("{}", node.as_str().unwrap_or_default());
+            }
+            if result["running"] != true {
+                println!("Saved; the Node joins through these when it starts.");
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn access(options: LocalEntry) -> Result<()> {
     if options.enable || options.disable {
-        let result = control(
-            &options.access.data_dir,
-            ControlRequest::SetLocalAccess {
-                data_dir: options.access.data_dir.clone(),
-                enabled: options.enable,
-            },
-        )
+        let result = control(ControlRequest::SetLocalAccess {
+            data_dir: options.access.data_dir.clone(),
+            enabled: options.enable,
+        })
         .await?;
         let running = result["running"].as_bool().unwrap_or(true);
         if options.disable || !running {
@@ -840,13 +1093,10 @@ async fn access(options: LocalEntry) -> Result<()> {
             return Ok(());
         }
     }
-    let result = control(
-        &options.access.data_dir,
-        ControlRequest::Access {
-            data_dir: options.access.data_dir.clone(),
-            json: options.access.json,
-        },
-    )
+    let result = control(ControlRequest::Access {
+        data_dir: options.access.data_dir.clone(),
+        json: options.access.json,
+    })
     .await?;
     if options.access.json {
         let mut output = json!({
@@ -874,25 +1124,19 @@ async fn access(options: LocalEntry) -> Result<()> {
 
 async fn join(options: Join) -> Result<()> {
     let data_dir = options.data_dir.clone();
-    let running = control(
-        &data_dir,
-        ControlRequest::Inspect {
-            data_dir: data_dir.clone(),
-        },
-    )
+    let running = control(ControlRequest::Inspect {
+        data_dir: data_dir.clone(),
+    })
     .await
     .ok()
     .and_then(|value| value["status"].as_str().map(|status| status == "running"))
     .unwrap_or(false);
     if !running {
-        let result = control(
-            &data_dir,
-            ControlRequest::Join {
-                data_dir: data_dir.clone(),
-                link: options.link.clone(),
-                name: options.name.clone(),
-            },
-        )
+        let result = control(ControlRequest::Join {
+            data_dir: data_dir.clone(),
+            link: options.link.clone(),
+            name: options.name.clone(),
+        })
         .await?;
         match result["status"].as_str() {
             Some("joined") => {
@@ -1027,6 +1271,7 @@ fn join_failure_text(reason: &str) -> String {
 async fn wallet(options: WalletOptions) -> Result<()> {
     let dir = options.data_dir.clone();
     match options.command {
+        WalletAction::Budget { command } => wallet_budget(&dir, command).await,
         WalletAction::Status => wallet_request(&dir, WalletCommand::Status).await,
         WalletAction::Create { passphrase_fd } => {
             wallet_request(
@@ -1071,13 +1316,10 @@ async fn wallet(options: WalletOptions) -> Result<()> {
             key_operation(&dir, "revoke", intent_id, gas_cap).await
         }
         WalletAction::Backup { output } => {
-            let result = control(
-                &dir,
-                ControlRequest::Wallet {
-                    data_dir: dir.clone(),
-                    operation: json!({"op":"backup","output":output}),
-                },
-            )
+            let result = control(ControlRequest::Wallet {
+                data_dir: dir.clone(),
+                operation: json!({"op":"backup","output":output}),
+            })
             .await?;
             if result.is_null() {
                 println!("Encrypted delivery wallet backup saved.");
@@ -1087,6 +1329,70 @@ async fn wallet(options: WalletOptions) -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn wallet_budget(dir: &Path, command: WalletBudgetAction) -> Result<()> {
+    let command = match command {
+        WalletBudgetAction::Open {
+            intent_id,
+            payee,
+            provider_peer,
+            deposit,
+            gas_cap,
+        } => {
+            json!({"op":"open","intent_id":intent_id,"payee":payee,"provider_peer":provider_peer,"deposit":deposit,"gas_cap":gas_cap})
+        }
+        WalletBudgetAction::Reserve {
+            budget_id,
+            order_ids,
+            intent_id,
+        } => {
+            json!({"op":"reserve","budget_id":budget_id,"order_ids":order_ids,"intent_id":intent_id})
+        }
+        WalletBudgetAction::Flush { budget_id } => json!({"op":"flush","budget_id":budget_id}),
+        WalletBudgetAction::Withdraw {
+            budget_id,
+            intent_id,
+        } => json!({"op":"withdraw","budget_id":budget_id,"intent_id":intent_id}),
+        WalletBudgetAction::Close {
+            budget_id,
+            intent_id,
+        } => json!({"op":"close","budget_id":budget_id,"intent_id":intent_id}),
+        WalletBudgetAction::Refund {
+            budget_id,
+            windows,
+            intent_id,
+        } => {
+            let windows = windows
+                .into_iter()
+                .map(|value| -> Result<Value> {
+                    let (order_id, index) = value
+                        .split_once(':')
+                        .context("window must be ORDER_ID:INDEX")?;
+                    ensure!(
+                        order_id.len() == 64
+                            && order_id
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                        "invalid window order id"
+                    );
+                    let index: u16 = index.parse()?;
+                    ensure!(index < 2, "window index must be 0 or 1");
+                    Ok(json!({"order_id":order_id,"index":index}))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            json!({"op":"refund","budget_id":budget_id,"windows":windows,"intent_id":intent_id})
+        }
+        WalletBudgetAction::Status { budget_id } => json!({"op":"status","budget_id":budget_id}),
+    };
+    let socket = inspect_socket(dir).await?;
+    let response =
+        maintenance::request(&socket, MaintenanceCommand::DeliveryBudget(command)).await?;
+    let value = response
+        .delivery
+        .context("Node returned no protected budget result")?;
+    println!("{}", serde_json::to_string(&value)?);
+    Ok(())
 }
 
 async fn wallet_request(dir: &Path, command: WalletCommand) -> Result<()> {
@@ -1185,12 +1491,37 @@ fn widely_readable_file(path: &Path) -> Result<PathBuf> {
 }
 
 fn read_wallet_passphrase(handed_over: Option<i64>) -> Result<SecretString> {
+    read_secret(
+        handed_over,
+        "Delivery wallet passphrase",
+        "wallet passphrase",
+        false,
+    )
+}
+
+/// A passphrase from a protected channel or the terminal; `confirm` asks twice for a new one.
+pub(crate) fn read_passphrase(
+    handed_over: Option<i64>,
+    label: &str,
+    confirm: bool,
+) -> Result<SecretString> {
+    let mut prompt = label.to_owned();
+    prompt[..1].make_ascii_uppercase();
+    read_secret(handed_over, &prompt, label, confirm)
+}
+
+fn read_secret(
+    handed_over: Option<i64>,
+    prompt: &str,
+    label: &str,
+    confirm: bool,
+) -> Result<SecretString> {
     use vibeface_bridge::platform::secret;
     use zeroize::Zeroizing;
     let mut bytes = Zeroizing::new(Vec::new());
     if let Some(reference) = handed_over {
         let channel = secret::handed_over(reference)
-            .context("read the wallet passphrase the caller handed over")?;
+            .with_context(|| format!("read the {label} the caller handed over"))?;
         channel.take(1026).read_to_end(&mut bytes)?;
         if bytes.last() == Some(&b'\n') {
             bytes.pop();
@@ -1200,27 +1531,36 @@ fn read_wallet_passphrase(handed_over: Option<i64>) -> Result<SecretString> {
         }
     } else {
         let mut console = secret::Console::open()
-            .context("wallet passphrase requires a terminal or --passphrase-fd")?;
-        console.prompt("Delivery wallet passphrase: ")?;
-        loop {
-            let byte = console
-                .read_byte()?
-                .context("the terminal closed before a passphrase was entered")?;
-            if matches!(byte, b'\n' | b'\r') {
-                break;
+            .with_context(|| format!("{label} requires a terminal or --passphrase-fd"))?;
+        let mut read = |prompt: &str, bytes: &mut Vec<u8>| -> Result<()> {
+            console.prompt(prompt)?;
+            loop {
+                let byte = console
+                    .read_byte()?
+                    .context("the terminal closed before a passphrase was entered")?;
+                if matches!(byte, b'\n' | b'\r') {
+                    break;
+                }
+                ensure!(bytes.len() < 1024, "{label} exceeds its limit");
+                bytes.push(byte);
             }
-            ensure!(bytes.len() < 1024, "wallet passphrase exceeds its limit");
-            bytes.push(byte);
+            console.prompt("\n")?;
+            Ok(())
+        };
+        read(&format!("{prompt}: "), &mut bytes)?;
+        if confirm {
+            let mut again = Zeroizing::new(Vec::new());
+            read(&format!("{prompt} again: "), &mut again)?;
+            ensure!(*again == *bytes, "the two entries differ");
         }
-        console.prompt("\n")?;
     }
     ensure!(
         (12..=1024).contains(&bytes.len())
             && !bytes.iter().any(|byte| matches!(byte, b'\n' | b'\r' | 0)),
-        "wallet passphrase must contain 12 to 1024 bytes on one line"
+        "{label} must contain 12 to 1024 bytes on one line"
     );
     Ok(SecretString::new(
-        String::from_utf8(bytes.to_vec()).context("wallet passphrase must be UTF-8")?,
+        String::from_utf8(bytes.to_vec()).with_context(|| format!("{label} must be UTF-8"))?,
     ))
 }
 
@@ -1250,12 +1590,11 @@ async fn codex(socket: Option<PathBuf>, command: CodexCommand) -> Result<()> {
             effort,
             image,
         } => {
-            ensure!(
-                std::env::var_os("VIBEFACE_TOOL_TOKEN").is_some(),
-                "codex send runs inside a bot turn (VIBEFACE_NODE_URL and VIBEFACE_TOOL_TOKEN); outside one, ask the bot in its chat"
-            );
             let args = json!({"thread":thread,"prompt":text,"call_ref":id,"agent":"codex","model":model,"effort":effort,"images":image});
-            let result = dispatch_work(&args, &id, socket.as_deref()).await?;
+            let tools = ToolContext::from_env().map_err(|error| {
+                report_tool_failure("dispatch_work", &args, "authorization", false, &error)
+            })?;
+            let result = dispatch_work(&tools, &args, &id, socket.as_deref()).await?;
             println!("{}", serde_json::to_string(&result)?);
             Ok(())
         }
@@ -1282,26 +1621,18 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
     if let Some(call_ref) = &call_ref {
         arguments["call_ref"] = json!(call_ref);
     }
+    let tools = ToolContext::from_env()
+        .map_err(|error| report_tool_failure(&name, &arguments, "authorization", false, &error))?;
     if name != "dispatch_work" {
         let result = post_tool(
+            &tools,
             &name,
             arguments.clone(),
             call_ref.as_deref().unwrap_or_default(),
         )
         .await
         .map_err(|error| {
-            let response = tool_failure(&name, &arguments, "execution", call_ref.is_some(), &error);
-            eprintln!(
-                "{}",
-                serde_json::to_string(&response)
-                    .unwrap_or_else(|_| "{\"error\":\"tool call failed\"}".into())
-            );
-            anyhow::anyhow!(
-                response["error"]
-                    .as_str()
-                    .unwrap_or("tool call failed")
-                    .to_owned()
-            )
+            report_tool_failure(&name, &arguments, "execution", call_ref.is_some(), &error)
         })?;
         // Core performs schema validation and annotation at the authenticated HTTP boundary.
         println!("{}", serde_json::to_string(&result)?);
@@ -1330,38 +1661,35 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
     );
     let result = {
         let socket = std::env::var_os("VIBEFACE_CODEX_SOCKET").map(PathBuf::from);
-        dispatch_work(&arguments, call_id, socket.as_deref()).await
+        dispatch_work(&tools, &arguments, call_id, socket.as_deref()).await
     };
-    let result = result.map_err(|error| {
-        let response = tool_failure(&name, &arguments, "execution", true, &error);
-        eprintln!(
-            "{}",
-            serde_json::to_string(&response)
-                .unwrap_or_else(|_| "{\"error\":\"tool call failed\"}".into())
-        );
-        anyhow::anyhow!(
-            response["error"]
-                .as_str()
-                .unwrap_or("tool call failed")
-                .to_owned()
-        )
-    })?;
-    println!(
-        "{}",
-        serde_json::to_string(&annotate_tool(&name, &arguments, result))?
-    );
+    let mut result = result
+        .map_err(|error| report_tool_failure(&name, &arguments, "execution", true, &error))?;
+    let record = result
+        .get_mut("call_record")
+        .and_then(Value::as_object_mut)
+        .context("dispatch response has no valid result record")
+        .map_err(|error| report_tool_failure(&name, &arguments, "execution", true, &error))?;
+    record.insert("tool".into(), json!(name));
+    record.insert("call_ref".into(), json!(call_id));
+    println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
 
-async fn dispatch_work(arguments: &Value, call_id: &str, socket: Option<&Path>) -> Result<Value> {
+async fn dispatch_work(
+    tools: &ToolContext,
+    arguments: &Value,
+    call_id: &str,
+    socket: Option<&Path>,
+) -> Result<Value> {
     vibeface_control::agent::dispatch(
         arguments,
-        |ref_id| post_tool("call_lookup", json!({"call_ref":ref_id}), call_id),
-        |args| post_tool("track_work", args, call_id),
-        |work_id, report| post_tool("bind_work", json!({"work_id":work_id,"report":report}), call_id),
+        |ref_id| post_tool(tools, "call_lookup", json!({"call_ref":ref_id}), call_id),
+        |args| post_tool(tools, "track_work", args, call_id),
+        |work_id, report| post_tool(tools, "bind_work", json!({"work_id":work_id,"report":report}), call_id),
         |args| async move {
             let asked = json!({"agent":args["agent"],"thread":args["thread"],"continues":args["continues"]});
-            let ready = post_tool("wait_work", asked, call_id).await?;
+            let ready = post_tool(tools, "wait_work", asked, call_id).await?;
             Ok(ready["agent"].as_str().map(str::to_owned))
         },
         socket,
@@ -1399,16 +1727,51 @@ fn is_loopback(url: &Url) -> bool {
     })
 }
 
-async fn post_tool(name: &str, arguments: Value, call_id: &str) -> Result<Value> {
-    let url =
-        origin(&std::env::var("VIBEFACE_NODE_URL").context("VIBEFACE_NODE_URL is required")?)?;
-    ensure!(
-        is_loopback(&url),
-        "SDK tools must connect to a loopback node URL"
-    );
-    let token = std::env::var("VIBEFACE_TOOL_TOKEN").context("VIBEFACE_TOOL_TOKEN is required")?;
-    ensure!(!token.is_empty(), "VIBEFACE_TOOL_TOKEN is empty");
-    let response = reqwest::Client::builder().timeout(Duration::from_secs(30)).no_proxy().redirect(reqwest::redirect::Policy::none()).build()?.post(url.join("sdk.v1.SdkCustomToolCallbackService/CallCustomTool")?).bearer_auth(token).json(&json!({"toolName":name,"args":arguments,"agentId":"cli"})).send().await.map_err(|error| anyhow::anyhow!("reach local node tool API; preserve call_ref {call_id} and query call_lookup before retrying: {error}"))?;
+struct ToolContext {
+    url: Url,
+    token: String,
+    client: reqwest::Client,
+}
+
+impl ToolContext {
+    fn from_env() -> Result<Self> {
+        Self::new(
+            std::env::var("VIBEFACE_NODE_URL").ok().as_deref(),
+            std::env::var("VIBEFACE_TOOL_TOKEN").ok().as_deref(),
+        )
+    }
+
+    fn new(node_url: Option<&str>, token: Option<&str>) -> Result<Self> {
+        let context = || {
+            let url = origin(node_url.context("VIBEFACE_NODE_URL is required")?)?;
+            ensure!(
+                is_loopback(&url),
+                "SDK tools must connect to a loopback node URL"
+            );
+            let token = token.context("VIBEFACE_TOOL_TOKEN is required")?;
+            ensure!(!token.is_empty(), "VIBEFACE_TOOL_TOKEN is empty");
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?;
+            Ok(Self {
+                url,
+                token: token.to_owned(),
+                client,
+            })
+        };
+        context().context("tool authorization requires a live Bot turn; open an authenticated browser enrolled in your personal network and send a new task in the Bot chat for the Bot to dispatch; do not copy tool tokens from other sessions")
+    }
+}
+
+async fn post_tool(
+    tools: &ToolContext,
+    name: &str,
+    arguments: Value,
+    call_id: &str,
+) -> Result<Value> {
+    let response = tools.client.post(tools.url.join("sdk.v1.SdkCustomToolCallbackService/CallCustomTool")?).bearer_auth(&tools.token).json(&json!({"toolName":name,"args":arguments,"agentId":"cli"})).send().await.map_err(|error| anyhow::anyhow!("reach local node tool API; preserve call_ref {call_id} and query call_lookup before retrying: {error}"))?;
     let status = response.status();
     let body = bounded_body(response).await?;
     if !status.is_success() {
@@ -1446,76 +1809,32 @@ fn tool_failure(
     unknown: bool,
     error: &anyhow::Error,
 ) -> Value {
-    json!({"error":format!("{error:#}"),"code":if stage == "validation" { "invalid_tool_arguments" } else { "tool_execution_failed" },"call_record":{"tool":name,"call_ref":args.get("call_ref"),"stage":stage,"execution":if unknown { "unknown" } else { "not_started" },"confirmation":if unknown { "unknown" } else { "confirmed" },"approval":"unknown","retry":if unknown { "lookup_same_ref" } else { "none" }}})
+    json!({"error":format!("{error:#}"),"code":match stage {
+        "validation" => "invalid_tool_arguments",
+        "authorization" => "tool_not_authorized",
+        _ => "tool_execution_failed",
+    },"call_record":{"tool":name,"call_ref":args.get("call_ref"),"stage":stage,"execution":if unknown { "unknown" } else { "not_started" },"confirmation":if unknown { "unknown" } else { "confirmed" },"approval":"unknown","retry":if unknown { "lookup_same_ref" } else { "none" }}})
 }
 
-fn annotate_tool(name: &str, args: &Value, mut value: Value) -> Value {
-    if !value.is_object() {
-        value = json!({"value": value});
-    }
-    let state = value["state"]
-        .as_str()
-        .or_else(|| value["state"]["state"].as_str());
-    let outcome = value["outcome"]
-        .as_str()
-        .or_else(|| value["state"]["outcome"].as_str());
-    let unverified = value["found"] == false
-        || state.is_some_and(|state| state.contains("unverified"))
-        || outcome == Some("unverified");
-    let read = matches!(
-        name,
-        "search"
-            | "tool_search"
-            | "tool_describe"
-            | "history_search"
-            | "history_read"
-            | "nodes"
-            | "context"
-            | "work_status"
-            | "call_lookup"
-            | "read_skill"
-            | "recall"
-            | "fetch_url"
-            | "list_bots"
-            | "read_bot"
-            | "list_sessions"
-            | "wait_work"
+fn report_tool_failure(
+    name: &str,
+    args: &Value,
+    stage: &str,
+    unknown: bool,
+    error: &anyhow::Error,
+) -> anyhow::Error {
+    let response = tool_failure(name, args, stage, unknown, error);
+    eprintln!(
+        "{}",
+        serde_json::to_string(&response)
+            .unwrap_or_else(|_| "{\"error\":\"tool call failed\"}".into())
     );
-    let (execution, confirmation) = if unverified {
-        ("unknown", "unknown")
-    } else if value.get("work_id").is_some() {
-        match (state, outcome) {
-            (Some("dispatch_rejected"), _) | (_, Some("rejected")) => ("not_started", "confirmed"),
-            (_, Some("completed" | "failed" | "interrupted")) => ("completed", "confirmed"),
-            (Some("running" | "interrupting"), _) => ("started", "confirmed"),
-            _ => ("unknown", "pending"),
-        }
-    } else if read && name != "call_lookup" {
-        ("read", "confirmed")
-    } else if value.get("event_hash").is_some()
-        || value.get("bot_id").is_some()
-        || value.get("message").is_some()
-        || value["deleted"] == true
-        || value["status"] == "applied"
-    {
-        ("applied", "confirmed")
-    } else if matches!(
-        value["status"].as_str(),
-        Some("asked" | "declined" | "unchanged")
-    ) {
-        ("not_started", "confirmed")
-    } else {
-        ("unknown", "unknown")
-    };
-    let approval = match value["status"].as_str() {
-        Some("asked") => "pending",
-        Some("applied") => "allowed",
-        Some("declined") => "denied",
-        _ if confirmation == "unknown" || value.get("work_id").is_some() => "unknown",
-        _ => "not_required",
-    };
-    value["call_record"] = json!({"tool":name,"call_ref":args.get("call_ref").or_else(|| value.get("call_ref")),"stage":if name == "call_lookup" { "lookup" } else { "result" },"execution":execution,"confirmation":confirmation,"approval":approval,"retry":if matches!(confirmation, "unknown" | "pending") { "lookup_same_ref" } else { "none"}});
-    value
+    anyhow::anyhow!(
+        response["error"]
+            .as_str()
+            .unwrap_or("tool call failed")
+            .to_owned()
+    )
 }
 
 fn hook_event(agent: triage::Provider, input: &Value) -> Option<triage::AgentEvent> {
@@ -1534,8 +1853,8 @@ fn hook_event(agent: triage::Provider, input: &Value) -> Option<triage::AgentEve
                     .map(|_| line)
                 })
                 .unwrap_or_default();
-            let meta = triage::rollout_meta(&first);
-            triage::interactive_codex(&meta["source"], meta["originator"].as_str())
+            let meta = observation::rollout_meta(&first);
+            observation::interactive_codex(&meta["source"], meta["originator"].as_str())
                 .then(|| triage::from_hook(agent, input, 0))
                 .flatten()
         }
@@ -1601,17 +1920,13 @@ async fn hook(options: Hook) -> Result<()> {
         body["_request"] = json!({"provider":event.agent,"session_id":event.session_id,
             "turn_id":event.turn_id,"kind":kind,"questions":questions});
     }
-    let sent = async {
-        let url = local_node_url(&options.local).await?;
-        post_local(&url, "/api/hooks", &body, Duration::from_secs(5)).await
-    }
-    .await;
+    let sent = post_local(&options.local, "/api/hooks", &body, Duration::from_secs(5)).await;
     match sent {
         Ok(result) if options.test => println!("{result}"),
         Ok(result) => {
             if let Some(request_id) = result["request_id"].as_str() {
                 let answer = post_local(
-                    &local_node_url(&options.local).await?,
+                    &options.local,
                     "/api/hooks/wait",
                     &json!({"request_id":request_id}),
                     Duration::from_secs(triage::HOOK_ANSWER_WITHIN_SECS + 10),
@@ -1647,7 +1962,7 @@ async fn hook(options: Hook) -> Result<()> {
 
 async fn hooks(options: Hooks) -> Result<()> {
     if matches!(options.action, HooksAction::Test) {
-        let result = post_local(&local_node_url(&options.local).await?, "/api/hooks", &json!({"source":"test","session_id":"test","turn_id":uuid::Uuid::new_v4().to_string(),"test":true}), Duration::from_secs(5)).await?;
+        let result = post_local(&options.local, "/api/hooks", &json!({"source":"test","session_id":"test","turn_id":uuid::Uuid::new_v4().to_string(),"test":true}), Duration::from_secs(5)).await?;
         ensure!(
             result["status"] == "accepted",
             "unexpected answer: {result}"
@@ -1851,13 +2166,7 @@ async fn log_record(options: LogRecord) -> Result<()> {
         "--source is agent or cli"
     );
     let body = json!({"source":source,"records":[{"level":options.level,"message":options.message,"event":options.event,"conversation_id":options.conversation,"work_id":options.work,"thread_id":options.thread}]});
-    post_local(
-        &local_node_url(&options.local).await?,
-        "/api/log",
-        &body,
-        Duration::from_secs(10),
-    )
-    .await?;
+    post_local(&options.local, "/api/log", &body, Duration::from_secs(10)).await?;
     Ok(())
 }
 
@@ -1926,7 +2235,7 @@ async fn logs(options: Logs) -> Result<()> {
         }
         Ok(())
     };
-    let mut records = Vec::new();
+    let mut records = std::collections::VecDeque::new();
     for path in log_files(&options.data_dir) {
         let file = fs::File::open(path)?;
         for line in std::io::BufReader::new(file).split(b'\n') {
@@ -1937,9 +2246,9 @@ async fn logs(options: Logs) -> Result<()> {
             if let Ok(record) = serde_json::from_slice::<LogValue>(&line)
                 && log_matches(&record, &options, since)
             {
-                records.push(record);
+                records.push_back(record);
                 if records.len() > options.limit.max(1) {
-                    records.remove(0);
+                    records.pop_front();
                 }
             }
         }
@@ -2061,53 +2370,15 @@ async fn triage_post(local: &LocalNode, mut body: Value) -> Result<()> {
     if let Ok(attempt) = std::env::var("VIBEFACE_TRIAGE_ATTEMPT") {
         body["_attempt"] = json!(attempt);
     }
-    let result = post_local(
-        &local_node_url(local).await?,
-        "/api/triage",
-        &body,
-        Duration::from_secs(30),
-    )
-    .await?;
+    let result = post_local(local, "/api/triage", &body, Duration::from_secs(30)).await?;
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
 
-async fn post_triage(local: &LocalNode, body: Value) -> Result<()> {
-    triage_post(local, body).await
-}
-
-async fn local_node_url(local: &LocalNode) -> Result<Url> {
-    let value = match local
-        .node_url
-        .clone()
-        .or_else(|| std::env::var("VIBEFACE_TRIAGE_URL").ok())
-    {
-        Some(value) => value,
-        None => {
-            let info = control(
-                &local.data_dir,
-                ControlRequest::Inspect {
-                    data_dir: local.data_dir.clone(),
-                },
-            )
-            .await?;
-            format!(
-                "http://{}",
-                info["local_listen"]
-                    .as_str()
-                    .context("core did not return a local listener")?
-            )
-        }
-    };
-    let url = origin(&value)?;
-    ensure!(
-        is_loopback(&url),
-        "the local Node URL must be a loopback address"
-    );
-    Ok(url)
-}
-
-async fn post_local(url: &Url, path: &str, body: &Value, total: Duration) -> Result<Value> {
+async fn post_local(local: &LocalNode, path: &str, body: &Value, total: Duration) -> Result<Value> {
+    let credential = vibeface_control::LocalHttpCredential::read(&local.data_dir)?;
+    let url = origin(local.node_url.as_deref().unwrap_or(&credential.origin))?;
+    credential.require_origin(&url)?;
     let response = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
         .timeout(total)
@@ -2115,6 +2386,7 @@ async fn post_local(url: &Url, path: &str, body: &Value, total: Duration) -> Res
         .redirect(reqwest::redirect::Policy::none())
         .build()?
         .post(url.join(path.trim_start_matches('/'))?)
+        .bearer_auth(credential.capability)
         .json(body)
         .send()
         .await
@@ -2161,10 +2433,7 @@ fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
             "private file path is not a regular file"
         );
     }
-    let mut file = privatefs::create_or_truncate(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
+    privatefs::write_atomic(path, bytes)
 }
 
 fn relay_token(value: &str) -> Result<(String, PathBuf), String> {
@@ -2212,9 +2481,6 @@ fn data_dir_or_home(dir: Option<PathBuf>) -> Result<PathBuf> {
     Ok(dir)
 }
 
-fn local_listen() -> SocketAddr {
-    DEFAULT_LOCAL_LISTEN
-}
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2224,6 +2490,18 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(crate) fn mark_runnable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Windows carries the right to run in the name, which the fixtures already use.
+        #[cfg(windows)]
+        let _ = path;
+        assert!(vibeface_bridge::platform::privatefs::is_executable(path));
+    }
 
     const TEST_PRIVATE_NODE: &str = if cfg!(windows) {
         r"C:\vibeface\private\node"
@@ -2488,6 +2766,31 @@ mod tests {
     }
 
     #[test]
+    fn mesh_share_and_bootstrap_take_node_links() {
+        let cli = Cli::try_parse_from(["vibeface", "mesh", "--data-dir", TEST_DATA_NODE, "share"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Action::Mesh(MeshOptions {
+                command: MeshAction::Share,
+                ..
+            }))
+        ));
+        assert!(Cli::try_parse_from(["vibeface", "mesh", "share", "extra"]).is_err());
+        let link = "vibeface://node/82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235?addr=203.0.113.5:4790";
+        let cli = Cli::try_parse_from(["vibeface", "mesh", "bootstrap", "add", link]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Action::Mesh(MeshOptions {
+                command: MeshAction::Bootstrap {
+                    command: BootstrapAction::Add { nodes }
+                },
+                ..
+            })) if nodes == [link]
+        ));
+    }
+
+    #[test]
     fn cli_requires_one_invite_link_and_supports_accountless_flags() {
         assert!(Cli::try_parse_from(["vibeface", "join"]).is_err());
         assert!(Cli::try_parse_from(["vibeface", "pair", "--invite", "abc"]).is_err());
@@ -2640,6 +2943,94 @@ mod tests {
         assert!(!is_loopback(&origin("http://192.168.1.5:4790").unwrap()));
     }
 
+    #[test]
+    fn tool_preflight_authorization_is_not_started_but_send_failures_remain_unknown() {
+        let args = json!({"call_ref":"dispatch-preflight"});
+        let error = anyhow::anyhow!("VIBEFACE_TOOL_TOKEN is required");
+        let rejected = tool_failure("dispatch_work", &args, "authorization", false, &error);
+        assert_eq!(rejected["code"], "tool_not_authorized");
+        assert_eq!(rejected["call_record"]["stage"], "authorization");
+        assert_eq!(rejected["call_record"]["execution"], "not_started");
+        assert_eq!(rejected["call_record"]["confirmation"], "confirmed");
+        assert_eq!(rejected["call_record"]["retry"], "none");
+
+        let unknown = tool_failure("dispatch_work", &args, "execution", true, &error);
+        assert_eq!(unknown["code"], "tool_execution_failed");
+        assert_eq!(unknown["call_record"]["execution"], "unknown");
+        assert_eq!(unknown["call_record"]["confirmation"], "unknown");
+        assert_eq!(unknown["call_record"]["retry"], "lookup_same_ref");
+    }
+
+    #[test]
+    fn tool_preflight_rejects_missing_or_invalid_context_without_exposing_credentials() {
+        let token = "fixture-tool-token-do-not-log";
+        for (url, token, reason) in [
+            (None, Some(token), "VIBEFACE_NODE_URL is required"),
+            (
+                Some("http://127.0.0.1:1"),
+                None,
+                "VIBEFACE_TOOL_TOKEN is required",
+            ),
+            (
+                Some("http://127.0.0.1:1"),
+                Some(""),
+                "VIBEFACE_TOOL_TOKEN is empty",
+            ),
+            (
+                Some("fixture-tool-token-do-not-log"),
+                Some(token),
+                "invalid node URL",
+            ),
+            (
+                Some("https://example.invalid"),
+                Some(token),
+                "SDK tools must connect to a loopback node URL",
+            ),
+            (
+                Some("http://user:fixture-tool-token-do-not-log@localhost"),
+                Some(token),
+                "node URL must not contain credentials",
+            ),
+            (
+                Some("http://localhost/?token=fixture-tool-token-do-not-log"),
+                Some(token),
+                "node URL must not contain query or fragment",
+            ),
+        ] {
+            let Err(error) = ToolContext::new(url, token) else {
+                panic!("invalid tool context was accepted")
+            };
+            let response = tool_failure(
+                "dispatch_work",
+                &json!({"call_ref":"dispatch-preflight"}),
+                "authorization",
+                false,
+                &error,
+            );
+            let message = response["error"].as_str().unwrap();
+            assert!(message.contains(reason));
+            assert!(message.contains("new task in the Bot chat"));
+            assert!(message.contains("do not copy tool tokens"));
+            assert!(!message.contains("fixture-tool-token-do-not-log"));
+            assert_eq!(response["call_record"]["execution"], "not_started");
+            assert_eq!(response["call_record"]["retry"], "none");
+        }
+    }
+
+    #[test]
+    fn tool_preflight_accepts_loopback_context_without_sending() {
+        for url in [
+            "http://127.0.0.1:1",
+            "http://[::1]:1",
+            "http://localhost:1",
+            "https://localhost:1",
+        ] {
+            let context = ToolContext::new(Some(url), Some("fixture-token")).unwrap();
+            assert_eq!(context.url.as_str().trim_end_matches('/'), url);
+            assert_eq!(context.token, "fixture-token");
+        }
+    }
+
     #[tokio::test]
     async fn hooks_install_writes_pi_extension_once_and_removes_only_its_own() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("vibeface-hooks-{}", uuid::Uuid::new_v4()));
@@ -2696,6 +3087,40 @@ mod tests {
         assert_eq!(fs::read_to_string(&path)?, code);
         run(HooksAction::Uninstall).await?;
         assert!(!path.exists());
+        let settings = home.join(".claude/settings.json");
+        fs::write(&settings, b"{invalid JSON")?;
+        assert!(run(HooksAction::Install).await.is_err());
+        assert_eq!(fs::read(&settings)?, b"{invalid JSON");
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn private_writes_replace_whole_files_and_preserve_failed_replacements() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("vibeface-write-{}", uuid::Uuid::new_v4()));
+        private_dir(&dir)?;
+        let path = dir.join("hook.json");
+        private_write(&path, b"old complete content")?;
+        private_write(&path, b"new complete content")?;
+        assert_eq!(fs::read(&path)?, b"new complete content");
+        privatefs::ensure_private(&path, "the hook fixture")?;
+        let linked = dir.join("linked");
+        privatefs::link_dir(&fs::canonicalize(&dir)?, &linked)?;
+        assert!(private_write(&linked, b"must not replace a link").is_err());
+        assert!(privatefs::is_dir_link(&linked)?);
+        privatefs::remove_dir_link(&linked)?;
+        #[cfg(unix)]
+        {
+            let linked = dir.join("linked-file");
+            std::os::unix::fs::symlink(&path, &linked)?;
+            assert!(private_write(&linked, b"must not touch the target").is_err());
+            assert_eq!(fs::read(&path)?, b"new complete content");
+            // The existing name fits NAME_MAX; the atomic temporary name cannot fit it.
+            let long = dir.join("a".repeat(240));
+            privatefs::create_durable(&long, b"old complete content")?;
+            assert!(private_write(&long, b"replacement must fail").is_err());
+            assert_eq!(fs::read(&long)?, b"old complete content");
+        }
         fs::remove_dir_all(dir)?;
         Ok(())
     }

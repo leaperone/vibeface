@@ -5,10 +5,12 @@ import base64
 import fnmatch
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from unittest import TestCase
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -184,7 +186,7 @@ def check(repo, component):
 
 
 def self_test():
-    scratch = ROOT / ".artifacts/build-inputs-test"
+    scratch = Path(os.environ.get("VIBEFACE_RELEASE_SCRATCH", ROOT / ".artifacts/build-inputs-test"))
     scratch.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="fixture-", dir=scratch) as directory:
         repo = Path(directory)
@@ -194,6 +196,10 @@ def self_test():
         defaults = repo / "config/public-bootstrap.json"
         defaults.parent.mkdir()
         defaults.write_text('{"issuer":"fixture-one"}')
+        desktop_main = repo / "apps/desktop/src/main.rs"
+        desktop_main.parent.mkdir(parents=True)
+        desktop_main.write_text("fn main() {}\n")
+        subprocess.run(["git", "add", "apps/desktop/src"], cwd=repo, check=True)
         for component in OUTPUTS:
             prepare(repo, component)
             output = repo / OUTPUTS[component]
@@ -228,59 +234,38 @@ def self_test():
         public = repo / "apps/app/public"
         public.mkdir(parents=True)
         (public / ".env").write_text("PRIVATE_DATA=must-not-ship")
-        try:
+        with TestCase().assertRaises(ValueError, msg='untracked public asset was accepted'):
             sources(repo, "web")
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("untracked public asset was accepted")
         (public / ".env").unlink()
         receipt = repo / OUTPUTS["crypto"] / RECEIPT
         saved_receipt = receipt.read_bytes()
         receipt.unlink()
-        try:
+        with TestCase().assertRaises(ValueError, msg='missing receipt was accepted'):
             check(repo, "crypto")
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("missing receipt was accepted")
         receipt.write_bytes(saved_receipt)
         output = repo / OUTPUTS["web"]
         (output / "private-note").write_text("must not ship")
-        try:
+        with TestCase().assertRaises(ValueError, msg='extra output was accepted'):
             check(repo, "web")
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("extra output was accepted")
         (output / "private-note").unlink()
         defaults.write_text('{"issuer":"fixture-two"}')
         check(repo, "crypto")
-        try:
+        with TestCase().assertRaises(ValueError, msg='changed public bootstrap defaults reused stale web output'):
             check(repo, "web")
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("changed public bootstrap defaults reused stale web output")
         defaults.write_text('{"issuer":"fixture-one"}')
+        check(repo, "web")
+        desktop_main.write_text("desktop main changed\n")
+        check(repo, "crypto")
         check(repo, "web")
         (repo / "Cargo.toml").write_text("changed source")
         for component in OUTPUTS:
-            try:
+            with TestCase().assertRaises(ValueError, msg='stale source was accepted'):
                 check(repo, component)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError("stale source was accepted")
         prepare(repo, "crypto")
         assert not (repo / OUTPUTS["crypto"] / "asset").exists()
         (repo / "Cargo.toml").write_text("changed while building")
-        try:
+        with TestCase().assertRaises(ValueError, msg='mid-build source change was accepted'):
             finish(repo, "crypto")
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("mid-build source change was accepted")
     print("Build input self-test passed")
 
 
@@ -288,7 +273,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("prepare", "finish", "check", "self-test"))
     parser.add_argument("component", choices=tuple(OUTPUTS), nargs="?")
-    parser.add_argument("--cargo", action="store_true")
     args = parser.parse_args()
     if args.action == "self-test":
         self_test()
@@ -296,16 +280,7 @@ def main():
     if not args.component:
         parser.error("component is required")
     if args.action == "check":
-        receipt = check(ROOT, args.component)
-        if args.cargo:
-            for component in dict.fromkeys(("crypto", args.component)):
-                component_receipt = check(ROOT, component)
-                for name in component_receipt["inputs"]["source"]:
-                    print(f"cargo:rerun-if-changed={ROOT / name}")
-                for name in INPUTS[component]:
-                    print(f"cargo:rerun-if-changed={ROOT / name}")
-                print(f"cargo:rerun-if-changed={ROOT / OUTPUTS[component]}")
-                print(f"cargo:rerun-if-changed={ROOT / OUTPUTS[component] / RECEIPT}")
+        check(ROOT, args.component)
     elif args.action == "prepare":
         prepare(ROOT, args.component)
     else:

@@ -21,7 +21,7 @@ const retired: Record<string, string> = {
 }
 const cjk = /[一-鿿]/
 
-export function violations(source: string, file = "x.tsx") {
+function violations(source: string, file = "x.tsx") {
   const found: string[] = []
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
   const inDetails = (node: ts.Node): boolean => {

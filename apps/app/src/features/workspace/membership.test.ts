@@ -1,11 +1,12 @@
+import { completeHistory } from '@vibeface/client/workspace/history-fixture.ts'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, extname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createContext, Script } from 'node:vm'
-import { JsxEmit, ModuleKind, transpileModule } from 'typescript'
+import { createContext } from 'node:vm'
+import { hookHarness, moduleLoader } from '../../lib/test-harness.ts'
 
 const network = 'b'.repeat(64), browser = 'c'.repeat(64), entry = 'a'.repeat(64)
 const conversationId = 'conversation-1'
@@ -16,6 +17,7 @@ const question = {
   about: { node: entry, agent: 'codex', session_id: 's', cwd: '/p', summary: '' }, author: entry, created_at_ms: 1, answer: null, closed: null,
 }
 const conversation = {
+  history_authority: "authority", history: completeHistory(),
   conversation: { conversation_id: conversationId, title: '', owner: entry, owner_epoch: 1 }, messages: [], works: [], deliveries: [], scheduler: null,
   checks: [], local_node: entry, changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } }, sent: [], sent_coverage: { scope: 'main', omitted_unknown: 0 }, questions: [question], sessions: [],
 }
@@ -28,52 +30,28 @@ const nodeRequire = createRequire(import.meta.url)
 /** Loads a TypeScript module the way the bundle sees it, with `stubs` for browser-only imports. */
 function loader(globals: Record<string, unknown>, stubs: (specifier: string) => unknown) {
   const sandbox = createContext({ ...globals, URL, URLSearchParams, TextEncoder, TextDecoder, Uint8Array, Error, JSON, Promise, crypto: globalThis.crypto })
-  const modules = new Map<string, { exports: Record<string, unknown> }>()
-  return function load(filename: string): Record<string, unknown> {
-    const cached = modules.get(filename)
-    if (cached) return cached.exports
-    const module = { exports: {} as Record<string, unknown> }; modules.set(filename, module)
-    const compiled = transpileModule(readFileSync(filename, 'utf8'), { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
-    const require = (specifier: string) => {
-      const stub = stubs(specifier)
-      if (stub) return stub
-      if (specifier.startsWith('@vibeface/client/')) return load(resolve(clientRoot, specifier.slice(17)))
-      if (!specifier.startsWith('.') && !specifier.startsWith('@/')) return nodeRequire(specifier)
-      const path = specifier.startsWith('@/') ? resolve(sourceRoot, specifier.slice(2)) : resolve(dirname(filename), specifier)
-      const file = extname(path) ? path : [`${path}.ts`, `${path}.tsx`].find(candidate => { try { readFileSync(candidate); return true } catch { return false } })!
-      return load(file)
-    }
-    new Script(`(function (exports, require, module) {\n${compiled}\n})`, { filename }).runInContext(sandbox)(module.exports, require, module)
-    return module.exports
-  }
+  const load = moduleLoader(sandbox, (specifier, filename) => {
+    const stub = stubs(specifier)
+    if (stub) return stub
+    if (specifier.startsWith('@vibeface/client/')) return load(resolve(clientRoot, specifier.slice(17)))
+    if (!specifier.startsWith('.') && !specifier.startsWith('@/')) return nodeRequire(specifier)
+    const path = specifier.startsWith('@/') ? resolve(sourceRoot, specifier.slice(2)) : resolve(dirname(filename), specifier)
+    const file = extname(path) ? path : [`${path}.ts`, `${path}.tsx`].find(candidate => { try { readFileSync(candidate); return true } catch { return false } })!
+    return load(file)
+  })
+  return load
 }
 
 /** The workspace state of one connected browser; React hooks are replayed by hand, one render per call. */
 function workspace(source: 'membership' | 'local_session', readBefore: string[] | null) {
-  const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
-  const afterRender: (() => void)[] = []
+  const hooks = hookHarness(), { effects, afterRender } = hooks
   const rpcs: string[] = [], stored = new Map<string, string>(), failing = new Set<string>(), ticks: (() => void)[] = []
   let notificationReads = [
     { notification_id: 'n-1', conversation_id: conversationId, target, kind: 'progress', text: '有新进展' },
     { notification_id: 'n-session', conversation_id: conversationId, target, kind: 'session_attributed', text: 'tests fail' },
   ]
   if (readBefore) stored.set(`vibeface.read-before.${browser}.${network}`, JSON.stringify(readBefore))
-  let cursor = 0
-  const react = {
-    createContext: () => ({ Provider: 'provider' }), useContext: () => null,
-    useState(initial: unknown) {
-      const index = cursor++
-      if (!(index in values)) values[index] = initial
-      return [values[index], (next: unknown) => { values[index] = typeof next === 'function' ? (next as (value: unknown) => unknown)(values[index]) : next }]
-    },
-    useRef(initial: unknown) { const index = cursor++; if (!(index in values)) values[index] = { current: initial }; return values[index] },
-    useEffect(run: () => (() => void) | void, dependencies: unknown[]) {
-      const index = cursor++, previous = effects.get(index)
-      if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) afterRender.push(() => {
-        previous?.cleanup?.(); effects.set(index, { dependencies, cleanup: run() ?? undefined })
-      })
-    },
-  }
+  const react = { ...hooks.react, createContext: () => ({ Provider: 'provider' }) }
   const writes = new Map<string, unknown>()
   const outbox = {
     all: async () => [...writes.values()], put: async (item: { key: string }) => { writes.set(item.key, structuredClone(item)) }, delete: async (key: string) => { writes.delete(key) },
@@ -85,7 +63,7 @@ function workspace(source: 'membership' | 'local_session', readBefore: string[] 
   }
   const connection = {
     generation: 1, entry: { address: 'https://node.example', device_id: entry },
-    principal: source === 'membership' ? { source, network_id: network, device_id: browser, epoch: 1, can_manage: false } : { source, network_id: network, device_id: browser, epoch: 1, can_manage: false },
+    principal: { source, network_id: network, device_id: browser, epoch: 1, can_manage: false },
     info: { device_id: entry, name: 'node', version: 'test', initialized: true, network_id: network },
     isCurrent: () => true, subscribe: () => () => {},
     async request(method: string) { if (method === 'write_state') return { state: 'writable', conflicts: [] }; return {} },
@@ -122,7 +100,7 @@ function workspace(source: 'membership' | 'local_session', readBefore: string[] 
   const Provider = load(resolve(clientRoot, 'workspace/context.tsx')).WorkspaceProvider as (props: Record<string, unknown>) => { value: Record<string, any> }
   const tabs = { leader: () => true, post() {}, listen: () => () => {} }
   const render = () => {
-    cursor = 0
+    hooks.reset()
     const { value } = Provider({ platform, connection, tabs, initialBot: bot.bot_id, openConversation() {}, children: null })
     afterRender.splice(0).forEach(run => run())
     return value

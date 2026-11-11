@@ -171,7 +171,7 @@ export function RotateHintCard() {
 export function SaveRecoveryFile({ code, saved, onSaved, download, busy = false }: {
   code: string; saved: boolean; onSaved(saved: boolean): void; download?: { done: boolean; run(): void }; busy?: boolean
 }) {
-  const downloaded = !download || download.done
+  const downloaded = saved || download?.done === true
   // The download button gives way to the file once it is down, and is disabled while it works; ticking the box is next.
   const box = useRef<HTMLInputElement>(null)
   const settled = downloaded && !busy
@@ -187,7 +187,7 @@ export function SaveRecoveryFile({ code, saved, onSaved, download, busy = false 
         <span className="truncate text-muted-foreground">{recoveryFileStem('')}</span><span className="font-medium tracking-wide">{code}</span>
       </span>
       {download ? <Button type="button" variant="ghost" disabled={busy} onClick={download.run}>重新下载</Button> : null}
-    </p> : <Button type="button" className="w-fit" disabled={busy} onClick={download.run}><Download aria-hidden="true" />下载恢复文件</Button>}
+    </p> : download ? <Button type="button" className="w-fit" disabled={busy} onClick={download.run}><Download aria-hidden="true" />下载恢复文件</Button> : <InlineError error="当前页面没有恢复副本。请用已另存的文件重新打开，或连接管理设备后更换恢复文件。" />}
     <label className={cn('flex min-h-11 items-center gap-2', !downloaded && 'text-muted-foreground')}><input ref={box} type="checkbox" className="size-4" disabled={!downloaded || busy} checked={saved} onChange={(event) => onSaved(event.target.checked)} />{recoveryCopy.keptApart}</label>
   </>
 }
@@ -197,12 +197,12 @@ export function SaveRecoveryFile({ code, saved, onSaved, download, busy = false 
  * person confirms it is kept apart from its password, which drops the copy.
  * `landing`: where the focus goes once confirming takes the file, and the box ticked, off the page.
  */
-export function UnsavedRecoveryFile({ landing }: { landing(): HTMLElement | null | undefined }) {
+function UnsavedRecoveryFile({ landing }: { landing(): HTMLElement | null | undefined }) {
   const { unsavedRecovery: file, downloadUnsavedRecovery, forgetUnsavedRecovery } = useDevice()
   const [error, setError] = useState('')
   if (!file) return null
   return <>
-    <SaveRecoveryFile code={file.code} saved={false} onSaved={(saved) => { if (saved) { landing()?.focus({ preventScroll: true }); forgetUnsavedRecovery() } }}
+    <SaveRecoveryFile code={file.code} saved={false} onSaved={(saved) => { if (saved) { try { forgetUnsavedRecovery(); landing()?.focus({ preventScroll: true }) } catch (cause) { setError(messageOf(cause)) } } }}
       download={{ done: file.attempted, run: () => { setError(''); downloadUnsavedRecovery().catch((cause) => setError(messageOf(cause))) } }} />
     <InlineError error={error || null} />
   </>
@@ -242,8 +242,9 @@ export function RecoveredStep() {
   // Ticking 已分开保存 drops the copy this page held for another download.
   return <Panel icon={FileKey} title={recoveryCopy.saveNew}>
     <p className="flex items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.recovered}</p>
-    <SaveRecoveryFile code={code ?? ''} saved={saved} onSaved={(value) => { setSaved(value); if (value) forgetUnsavedRecovery() }}
+    <SaveRecoveryFile code={file?.code ?? code ?? ''} saved={saved} onSaved={(value) => { try { if (value) forgetUnsavedRecovery(); setSaved(value) } catch (cause) { setError(messageOf(cause)) } }}
       download={file ? { done: file.attempted, run: () => { setError(''); downloadUnsavedRecovery().catch((cause) => setError(messageOf(cause))) } } : undefined} />
+    {!file && !saved ? <RecoveryControls only="passphrase" /> : null}
     <InlineError error={error || null} />
     <Button type="button" className="w-fit justify-self-end" disabled={!saved} onClick={() => { forgetUnsavedRecovery(); finishRecovered() }}>完成</Button>
   </Panel>

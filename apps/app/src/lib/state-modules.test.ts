@@ -3,8 +3,8 @@ import test from 'node:test'
 import { nextLink, type Link } from '@vibeface/client/lib/link.ts'
 import { enqueue, settle, type OutboxItem, type OutboxStore } from '@vibeface/client/lib/outbox.ts'
 import { joinTabs } from './tabs.ts'
-import { APP_ORIGIN, PUBLIC_GATEWAY, candidates, defaultGateway, isPublicUrl, markReached, mergeEntrances, storedEntrances, verifiedEntrances } from '@vibeface/client/lib/entrances.ts'
-import { entryAddress } from '@vibeface/client/lib/node.ts'
+import { APP_ORIGIN, PUBLIC_GATEWAY, candidates, defaultGateway, gatewaysOf, isPublicUrl, markReached, mergeEntrances, storedEntrances, verifiedEntrances } from '@vibeface/client/lib/entrances.ts'
+import { entryAddress, parseRelaySettings, parseShareLink } from '@vibeface/client/lib/node.ts'
 import { joinCopy } from '@vibeface/client/identity/copy.ts'
 import { passphrase, passwordStrength } from '@vibeface/client/lib/secure.ts'
 import { failureKinds, failureText, humanError, outcomeUnknown, rawError, spentInvite, spentInviteText, workFailure } from '@vibeface/client/lib/errors.ts'
@@ -143,6 +143,40 @@ test('the app dials only the Nodes it sees on its LAN, and an unseen one only wh
   assert.deepEqual(ways(lanOnly, lan, new Map([[b, ['192.168.1.5:7002']]])), ['lan 192.168.1.5:7002', 'lan 192.168.1.8:7002'])
 })
 
+test('public gateways reach the current Node after every web entrance and before the last LAN resort', () => {
+  const a = 'a'.repeat(64), b = 'b'.repeat(64), g = 'f'.repeat(64)
+  const gateways = gatewaysOf([{ device_id: g, url: 'https://gw.example.com/' }, { device_id: g, url: 'http://plain.example.com' }, { device_id: g, url: 'https://gw.example.com/path' },
+    { device_id: 'f', url: 'https://short.example.com' }, { device_id: b, url: 'https://node.example.com' }, 'junk'])
+  assert.deepEqual(gateways, [{ device_id: g, url: 'https://gw.example.com' }, { device_id: b, url: 'https://node.example.com' }])
+  assert.deepEqual(gatewaysOf(JSON.parse(JSON.stringify(gateways))), gateways, 'stored as returned')
+  assert.deepEqual(gatewaysOf({ gateways }), [], 'a stored value of another shape is dropped')
+  const list = [{ device_id: b, seq: 1, gateway_url: 'https://b.example.com', public: true, direct: [], last_ok_ms: 0 }, { device_id: a, seq: 1, gateway_url: null, public: false, direct: ['192.168.1.4:7001'], last_ok_ms: 0 }]
+  const ways = (...args: Parameters<typeof candidates>) => candidates(...args).map(entry => `${entry.kind} ${entryAddress(entry)} ${entry.device_id[0]}`)
+  const web = { kind: 'gateway' as const, address: 'https://node.example.com', device_id: a }
+  assert.deepEqual(ways(list, web, undefined, gateways), ['gateway https://node.example.com a', 'gateway https://b.example.com b', 'gateway https://gw.example.com a'], 'the address that dropped is not tried twice')
+  const lan = { kind: 'lan' as const, addrs: ['192.168.1.8:7001'], device_id: a }
+  assert.deepEqual(ways(list.slice(1), lan, new Map(), gateways), ['gateway https://gw.example.com a', 'gateway https://node.example.com a', 'lan 192.168.1.8:7001 a'])
+})
+
+test('relay settings read as the Node reports them and refuse an unknown state', () => {
+  const on = { volunteer: true, url: 'http://203.0.113.7:3340', listen: '0.0.0.0:3340', rate: 16384, max_clients: 128, max_clients_per_ip: 8, status: 'checking', error: null }
+  assert.deepEqual(parseRelaySettings(on), on)
+  const off = { volunteer: false, url: null, listen: null, rate: 0, max_clients: 0, max_clients_per_ip: 0, status: 'off', error: 'relay port 3340 is in use' }
+  assert.deepEqual(parseRelaySettings(off), off)
+  assert.throws(() => parseRelaySettings({ ...on, status: 'pending' }))
+  assert.throws(() => parseRelaySettings({ ...on, rate: -1 }))
+})
+
+test('a share link reads only as a node link', () => {
+  const link = `vibeface://node/${'ab'.repeat(32)}?addr=203.0.113.5:4790&relay=https://relay.example`
+  assert.equal(parseShareLink({ link }), link)
+  assert.equal(parseShareLink({ link: `vibeface://node/${'ab'.repeat(32)}` }), `vibeface://node/${'ab'.repeat(32)}`)
+  for (const bad of [`vibeface://join/vibeface1abc`, `vibeface://${'ab'.repeat(32)}@203.0.113.5:4790`, `vibeface://node/${'AB'.repeat(32)}`, `vibeface://node/${'ab'.repeat(32)}?addr=a b`, '']) {
+    assert.throws(() => parseShareLink({ link: bad }), bad)
+  }
+  assert.throws(() => parseShareLink(null))
+})
+
 test('backend English and gateway refusal codes reach the page as plain Chinese', () => {
   assert.equal(humanError('unknown member', 'target_not_member'), '那个节点不在我的设备里，访问地址不会转发给它。')
   assert.match(humanError('conversation not found'), /还没有这个对话/)
@@ -227,7 +261,7 @@ test('a provider catalog keeps model effort and distinguishes unavailable from a
 test('node settings keep a neutral unchecked provider and parse explicit probe evidence', async () => {
   const { parseNodeSettings, availability, summaryReadiness, parseProvider } = await import('@vibeface/client/lib/node.ts')
   const readiness = { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } }
-  const provider = { provider: 'claude', roles: ['agent'], supports: ['agent', 'execution'], bin: 'claude', app_server: null, setup: null, authentication_source: 'private_login', installed: true, home: null, sessions: null, env: [], state: 'unverified', issues: [], readiness, execution_model: '', execution_readiness: readiness, probe: { provider: 'claude', config_id: 'config', checked_at_ms: null, launch: { state: 'unchecked' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null }, observed: { installed: { status: 'confirmed', evidence: 'binary_discovery' }, launchable: { status: 'unknown', evidence: 'launch_prerequisites' }, authenticated: { status: 'unknown', evidence: 'authentication_not_observed' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } } }
+  const provider = { provider: 'claude', roles: ['agent'], supports: ['agent', 'execution'], bin: 'claude', app_server: null, setup: null, authentication_source: 'private_login', installed: true, home: null, sessions: null, env: [], state: 'unverified', issues: [], readiness, endpoint: null, execution_model: '', execution_readiness: readiness, probe: { provider: 'claude', config_id: 'config', checked_at_ms: null, launch: { state: 'unchecked' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null }, observed: { installed: { status: 'confirmed', evidence: 'binary_discovery' }, launchable: { status: 'unknown', evidence: 'launch_prerequisites' }, authenticated: { status: 'unknown', evidence: 'authentication_not_observed' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } } }
   const manager = { provider: 'claude', workspace: '/work', model: 'my-manual-model', reasoning_effort: null, backup: { automatic: false, candidates: [] } }
   const parsed = parseNodeSettings({ settings: { roots: [], manager }, defaults: { workspace: '/work' }, readiness: { manager: readiness }, providers: [provider], display_paths: {}, suggested_roots: [] })
   assert.equal(availability(parsed.providers[0]), 'unverified')
@@ -248,4 +282,12 @@ test('node settings keep a neutral unchecked provider and parse explicit probe e
   assert.equal(availability(split), 'unverified')
   assert.equal(availability(parseProvider({ ...provider, roles: ['execution'], execution_readiness: { state: 'ready' } })), 'ready')
   assert.equal(availability(parseProvider({ ...provider, roles: ['agent', 'execution'], readiness: { state: 'ready' }, execution_readiness: execution })), 'ready')
+  const opencode = { ...provider, provider: 'opencode', probe: { ...provider.probe, provider: 'opencode' } }
+  const endpoint = { protocol: 'openai_compatible', base_url: 'http://127.0.0.1:11434/v1', models: ['qwen3', 'llama3'], has_api_key: false }
+  assert.deepEqual(parseProvider({ ...opencode, endpoint }).endpoint, endpoint)
+  assert.throws(() => parseProvider({ ...opencode, endpoint: undefined }))
+  assert.throws(() => parseProvider({ ...opencode, endpoint: { ...endpoint, protocol: 'gemini' } }))
+  assert.throws(() => parseProvider({ ...opencode, endpoint: { ...endpoint, models: 'qwen3' } }))
+  assert.throws(() => parseProvider({ ...opencode, endpoint: { ...endpoint, has_api_key: undefined } }))
+  assert.throws(() => parseProvider({ ...provider, endpoint }))
 })

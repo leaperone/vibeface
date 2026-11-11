@@ -1,3 +1,4 @@
+import { completeHistory } from './history-fixture.ts'
 import assert from "node:assert/strict"
 import test from "node:test"
 import { parseAnswer, parseConversation, parseOpenWorks, parsePrimary, parseQuestions, parseTriageSettings } from "./model.ts"
@@ -10,6 +11,7 @@ const row = (question_id: string, created_at_ms: number, extra: Record<string, u
   choices: [{ label: "继续" }, { label: "看看" }], about, author: "gateway", created_at_ms, answer: null, ...extra,
 })
 const snapshot = (extra: Record<string, unknown>) => ({
+  history_authority: "authority", history: completeHistory(),
   conversation: { conversation_id: "chat", title: "Bot", owner: "gateway", owner_epoch: 1 }, messages: [], works: [], deliveries: [],
   checks: [], local_node: "gateway", changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [], memory_sync_conflicts: { items: [], has_more: false } }, sent: [], sent_coverage: { scope: 'main', omitted_unknown: 0 }, questions: [], sessions: [], ...extra,
 })
@@ -124,8 +126,16 @@ test("only an open question waits on the person: a closed one is no count and no
 
 test("an approval card names the task its request holds and leaves the device this screen goes through unnamed", () => {
   const works = parseOpenWorks({ works: [
-    { work_id: "w-done", conversation_id: "chat", thread_id: "s", trigger: "t", target_node: "worker", cwd: "/w", title: "旧的", prompt: "p", state: "finished", summary: "", outcome: "completed", result_text: "", failure_reason: null, kind: "codex", resolved: { provider: "codex", model: null } },
-    { work_id: "w1", conversation_id: "chat", thread_id: "s", trigger: "t", target_node: "worker", cwd: "/w", title: "", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, kind: "codex", resolved: { provider: "codex", model: null } },
+    {
+      dispatcher: 'gateway', call_ref: 'dispatch',
+      continues: null, parent: null,
+      thread: null, phase: null,
+      work_id: "w-done", conversation_id: "chat", thread_id: "s", trigger: "t", target_node: "worker", cwd: "/w", title: "旧的", prompt: "p", state: "finished", summary: "", outcome: "completed", result_text: "", failure_reason: null, kind: "codex", resolved: { provider: "codex", model: null } },
+    {
+      dispatcher: 'gateway', call_ref: 'dispatch',
+      continues: null, parent: null,
+      thread: null, phase: null,
+      work_id: "w1", conversation_id: "chat", thread_id: "s", trigger: "t", target_node: "worker", cwd: "/w", title: "", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, kind: "codex", resolved: { provider: "codex", model: null } },
   ] })
   const bots = [{ bot_id: "bot", conversation_id: "chat" }]
   const [approval, question] = parseQuestions({ questions: [row("s1", 1, { about: { ...about, request_id: "r" } }), row("q1", 2)] })
@@ -157,7 +167,11 @@ test('question details keep labels as readable text', () => {
 })
 
 test("work approval belongs to an unfinished work in the same Bot, target device and session", () => {
-  const [work] = parseOpenWorks({ works: [{ work_id: "new", conversation_id: "chat", trigger: "m", target_node: "worker", cwd: "/w", title: "新任务", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, thread_id: "s", resolved: { provider: "codex", model: null } }] })
+  const [work] = parseOpenWorks({ works: [{
+    dispatcher: 'gateway', call_ref: 'dispatch',
+    continues: null, parent: null,
+    thread: null, phase: null,
+    work_id: "new", conversation_id: "chat", trigger: "m", target_node: "worker", cwd: "/w", title: "新任务", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, thread_id: "s", resolved: { provider: "codex", model: null } }] })
   const [approval] = parseQuestions({ questions: [row("approval", 2, { about: { ...about, request_id: "request" } })] })
   const input = { work, conversationId: "chat", questions: [approval], answered: {} }
   assert.equal(workApproval(input), approval)
@@ -167,7 +181,7 @@ test("work approval belongs to an unfinished work in the same Bot, target device
   assert.equal(workApproval({ ...input, conversationId: "other-bot" }), undefined)
   assert.equal(workApproval({ ...input, work: { ...work, target_node: "other-device" } }), undefined)
   assert.equal(workApproval({ ...input, work: { ...work, thread_id: "other-session" } }), undefined)
-  assert.equal(workApproval({ ...input, questions: [{ ...approval, about: { ...about, agent: "codex" } }] }), undefined)
+  assert.equal(workApproval({ ...input, questions: parseQuestions({ questions: [row("approval", 2)] }) }), undefined, "a question without a held request is not an approval")
   assert.equal(workApproval({ ...input, questions: [{ ...approval, closed: "request_lost" }] }), undefined)
   assert.equal(workApproval({ ...input, questions: [{ ...approval, answer: { message_id: "a", text: "继续", author: "me", created_at_ms: 3 } }] }), undefined)
 })

@@ -44,6 +44,9 @@ pub enum ControlRequest {
         data_dir: PathBuf,
         json: bool,
     },
+    LocalSetup {
+        data_dir: PathBuf,
+    },
     SetLocalAccess {
         data_dir: PathBuf,
         enabled: bool,
@@ -57,6 +60,71 @@ pub enum ControlRequest {
         data_dir: PathBuf,
         operation: Value,
     },
+    Mesh {
+        data_dir: PathBuf,
+        operation: Value,
+    },
+    /// Set one config.json value in the running Node or, stopped, in the file.
+    ConfigSet {
+        data_dir: PathBuf,
+        key: String,
+        value: Value,
+    },
+}
+
+/// Read by owner processes only. A loopback connection does not prove an OS account.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalHttpCredential {
+    pub origin: String,
+    pub node_id: String,
+    pub capability: String,
+}
+
+impl LocalHttpCredential {
+    pub fn read(data_dir: &Path) -> Result<Self> {
+        use vibeface_bridge::platform::privatefs;
+        privatefs::ensure_private(data_dir, "the local Node directory")?;
+        let credential: Self = serde_json::from_slice(&privatefs::read_private_bounded(
+            &data_dir.join("local-access.json"),
+            4096,
+            "the local HTTP credential",
+        )?)?;
+        let token = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        };
+        let url = reqwest::Url::parse(&credential.origin)?;
+        ensure!(
+            url.scheme() == "http"
+                && url.host_str() == Some("127.0.0.1")
+                && url.port().is_some()
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && token(&credential.node_id)
+                && token(&credential.capability),
+            "invalid local HTTP credential"
+        );
+        Ok(credential)
+    }
+
+    pub fn require_origin(&self, url: &reqwest::Url) -> Result<()> {
+        ensure!(
+            url.origin().ascii_serialization() == self.origin
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && url.username().is_empty()
+                && url.password().is_none(),
+            "local HTTP credential belongs to another Node origin"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +304,7 @@ pub fn sibling_core(cli: &Path) -> Result<PathBuf> {
 
 pub mod agent;
 pub mod maintenance;
+pub mod observation;
 
 #[cfg(test)]
 mod tests {
@@ -255,6 +324,50 @@ mod tests {
                 "remembered_data_dirs":["/controlled/node"]
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn local_http_credentials_require_owner_protection_and_bind_the_origin() -> Result<()> {
+        use vibeface_bridge::platform::privatefs;
+        let dir =
+            std::env::temp_dir().join(format!("vibeface-local-http-{}", uuid::Uuid::new_v4()));
+        privatefs::create_dir(&dir)?;
+        let path = dir.join("local-access.json");
+        let credential = LocalHttpCredential {
+            origin: "http://127.0.0.1:4791".into(),
+            node_id: "a".repeat(64),
+            capability: "b".repeat(64),
+        };
+        privatefs::write_atomic(&path, &serde_json::to_vec(&credential)?)?;
+        let read = LocalHttpCredential::read(&dir)?;
+        read.require_origin(&reqwest::Url::parse(&credential.origin)?)?;
+        for origin in [
+            "http://127.0.0.1:4792",
+            "https://remote.example",
+            "http://secret@127.0.0.1:4791",
+            "http://127.0.0.1:4791/?redirect=remote",
+        ] {
+            assert!(read.require_origin(&reqwest::Url::parse(origin)?).is_err());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+            assert!(
+                LocalHttpCredential::read(&dir).is_err(),
+                "credentials readable by another account are rejected"
+            );
+            std::fs::remove_file(&path)?;
+            let target = dir.join("credential");
+            privatefs::write_atomic(&target, &serde_json::to_vec(&credential)?)?;
+            std::os::unix::fs::symlink(&target, &path)?;
+            assert!(
+                LocalHttpCredential::read(&dir).is_err(),
+                "a credential symlink is rejected"
+            );
+        }
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 

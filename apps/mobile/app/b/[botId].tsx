@@ -1,6 +1,8 @@
+import { historySections } from '@vibeface/client/workspace/model.ts'
+import { HistoryControls } from '@/features/chat/history-controls'
 import { Link, Stack, router, useFocusEffect, useLocalSearchParams } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
-import { ArrowDown, Bot, BrainCircuit, Crown, LoaderCircle, MessageSquareOff, Star } from 'lucide-react-native'
+import { ArrowDown, Bot, Crown, LoaderCircle, MessageSquareOff, Settings, Star } from 'lucide-react-native'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { FlatList, Platform, Pressable, StyleSheet, View, type NativeScrollEvent } from 'react-native'
 import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller'
@@ -17,7 +19,7 @@ import { InputOptions, type TargetOption } from '@/features/workspace/workspace'
 import type { InputIntent } from '@vibeface/client/workspace/types.ts'
 import { ErrorText } from '@/components/action'
 import { outcomeUnknown } from '@vibeface/client/lib/errors.ts'
-import { botCopy } from '@vibeface/client/workspace/bot-settings.ts'
+import { botCopy, scheduleName } from '@vibeface/client/workspace/bot-settings.ts'
 import { unreachable } from '@vibeface/client/workspace/home.ts'
 import { botMood, BotFace, ScreenFaces, type FaceBot } from '@/components/bot-face'
 import { OfflineBar } from '@/components/connection-pill'
@@ -146,6 +148,7 @@ export default function ChatScreen() {
   // Nothing pushes a device's bot readiness, so while a device that could reply is not ready and this chat is on screen, read it again every 10s, or every 2s while it starts.
   const latestLive = useRef(live)
   latestLive.current = live
+  useFocusEffect(useCallback(() => () => { for (const section of historySections) latestLive.current?.cancelHistory(section) }, [id, live?.generation]))
   const awaiting = live ? awaitsDevice(reach) : false, starting = reach === 'starting'
   useFocusEffect(useCallback(() => {
     if (!awaiting) return
@@ -179,8 +182,8 @@ export default function ChatScreen() {
   if (!bot || !id) return <EmptyState icon={Bot} title={botCopy.notFound} className="flex-1 justify-center" />
   const offline = unreachable(device.link)
   const blocked = chat?.blocked ?? (chat ? null : '尚未完成首读')
-  const targetOptions: TargetOption[] = [{ key: 'main', label: `${bot.name} · 主聊天`, target: { kind: 'bot_main', bot_id: bot.bot_id } }, ...(chat?.works ?? []).filter((work) => !work.outcome || selectedTarget === `work:${work.work_id}`).map((work) => ({ key: `work:${work.work_id}`, label: work.title || '工作', target: { kind: 'work' as const, work_id: work.work_id } })), ...(live?.data?.scopeJobs ?? []).filter((job) => job.lane === 'schedule_routine' && (['queued', 'steering', 'claimed', 'running'].includes(job.state) || selectedTarget === `routine:${job.trigger}`)).map((job) => ({ key: `routine:${job.trigger}`, label: `例行任务 · ${job.trigger}`, target: { kind: 'routine' as const, bot_id: bot.bot_id, trigger: job.trigger } }))]
-  if (selectedTarget.startsWith('routine:') && !targetOptions.some((option) => option.key === selectedTarget)) targetOptions.push({ key: selectedTarget, label: '例行任务 · 状态待查询', target: { kind: 'routine', bot_id: bot.bot_id, trigger: selectedTarget.slice(8) } })
+  const targetOptions: TargetOption[] = [{ key: 'main', label: `${bot.name} · 主聊天`, target: { kind: 'bot_main', bot_id: bot.bot_id } }, ...(chat?.works ?? []).filter((work) => !work.outcome || selectedTarget === `work:${work.work_id}`).map((work) => ({ key: `work:${work.work_id}`, label: work.title || '工作', target: { kind: 'work' as const, work_id: work.work_id } })), ...(live?.data?.scopeJobs ?? []).filter((job) => job.lane === 'schedule_routine' && (['queued', 'steering', 'claimed', 'running'].includes(job.state) || selectedTarget === `routine:${job.trigger}`)).map((job) => ({ key: `routine:${job.trigger}`, label: `例行任务 · ${scheduleName(job.trigger, live?.data?.bot_settings, live?.data?.changes)}`, target: { kind: 'routine' as const, bot_id: bot.bot_id, trigger: job.trigger } }))]
+  if (selectedTarget.startsWith('routine:') && !targetOptions.some((option) => option.key === selectedTarget)) targetOptions.push({ key: selectedTarget, label: `例行任务 · ${scheduleName(selectedTarget.slice(8), live?.data?.bot_settings, live?.data?.changes)}`, target: { kind: 'routine', bot_id: bot.bot_id, trigger: selectedTarget.slice(8) } })
   const targetOption = targetOptions.find((option) => option.key === selectedTarget) ?? targetOptions[0]
   const inputTarget = targetOption.target
   const targetWork = inputTarget.kind === 'work' ? chat?.works.find((work) => work.work_id === inputTarget.work_id) : undefined
@@ -207,6 +210,8 @@ export default function ChatScreen() {
       if (!routeActive.current || !live?.isCurrent() || latestLive.current?.conversationId !== id || draftRef.current !== submittedDraft) return; if (intent === "new_task" && (input.target.kind === "task" || input.target.kind === "channel_task")) router.push(`/task/${input.target.task_id}`) } }).catch((cause) => { setSendError(messageOf(cause)) }).finally(() => { savingDrafts.current.delete(submittedDraft) })
   }
   const rows = chat ? entries(chat, extras, bot, offline) : []
+  const history = live?.conversationId === id ? live.data?.history : undefined
+  if (history && live && historySections.some((section) => !history[section].complete)) rows.push({ key: 'history-controls', node: <HistoryControls key={`${live.generation}:${id}`} workspace={live} /> })
   const setupHint = !offline && rows.length && (reach === 'needs_setup' || reach === 'none' || reach === 'offline') ? composerHint({ hasConversation: true, loaded: Boolean(chat), bot: reach }) : ''
   // 重试 on the newest reply once it failed or was stopped, as on the web.
   const newest = chat?.messages.at(-1)
@@ -229,7 +234,7 @@ export default function ChatScreen() {
   return <View className="flex-1">
     <Stack.Screen options={{
       title: bot.name,
-      headerRight: () => <Link href={`/b/${bot.bot_id}/context`} asChild><Button variant="ghost" size="icon" accessibilityLabel="上下文和历史"><Icon as={BrainCircuit} /></Button></Link>,
+      headerRight: () => <Link href={`/b/${bot.bot_id}/about`} asChild><Button variant="ghost" size="icon" accessibilityLabel={`${bot.name} 设置`}><Icon as={Settings} className="size-5" /></Button></Link>,
       // iOS 26 measures the edge blur on the un-inverted list and covers every message once the chat outgrows the screen.
       scrollEdgeEffects: { top: 'hidden', bottom: 'hidden', left: 'hidden', right: 'hidden' },
       headerTransparent: ios,
@@ -246,7 +251,7 @@ export default function ChatScreen() {
       ref={list}
       data={rows}
       inverted
-      maintainVisibleContentPosition={scrollButton.id === id && scrollButton.visible ? { minIndexForVisible: 0 } : undefined}
+      maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
       keyExtractor={(row) => row.key}
       onScrollToIndexFailed={({ index, averageItemLength }) => {
         if (scrollInset.current.id !== id) return
@@ -308,7 +313,10 @@ export default function ChatScreen() {
               : <Text className="text-meta text-muted-foreground">{setUpOnManager(workspace.members.filter((member) => member.admin).map((member) => member.name))}</Text>}
           </View> : null}
           {sendError ? <ErrorText error={sendError} /> : null}
-          {inputTarget.kind !== "bot_main" ? <Text className="text-meta text-muted-foreground">上方是 Bot 主聊天记录，当前输入补充所选工作。</Text> : null}
+          {inputTarget.kind !== "bot_main" ? <View className="flex-row items-center gap-2 px-2">
+            <Text numberOfLines={1} className="min-w-0 flex-1 text-meta text-muted-foreground">{targetBusy ? '补充给' : '发送给'} · {targetOption.label}</Text>
+            <Button variant="ghost" size="sm" onPress={() => setSelectedTarget('main')}><Text>改回主聊天</Text></Button>
+          </View> : null}
           {stopSharing.length > 1 ? <Text className="text-meta text-warning">停止会影响这些工作 · {stopSharing.map((work) => work.title || "工作").join("、")}</Text> : null}
         </> : null}
         </Composer>

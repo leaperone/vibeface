@@ -91,6 +91,16 @@ struct Journal {
     resume_service: bool,
 }
 
+const BACKUP_RETENTION: usize = 2;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommittedBackup {
+    data_dir: PathBuf,
+    device_id: String,
+    sequence: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct InspectResult {
     status: String,
@@ -98,8 +108,8 @@ struct InspectResult {
     data_dir: PathBuf,
     maintenance_socket: PathBuf,
     listen: SocketAddr,
-    version: Option<String>,
-    core_version: Option<String>,
+    http_enabled: bool,
+    core_version: String,
     #[serde(default)]
     error: Option<String>,
 }
@@ -346,15 +356,7 @@ pub async fn run(options: Update) -> Result<()> {
                 !root.starts_with(&data),
                 "install-root must not be inside the node data directory"
             );
-            let backups = root.join("backups");
-            if !backups.exists() {
-                fs::create_dir(&backups)?;
-            }
-            ensure!(
-                fs::symlink_metadata(&backups)?.is_dir(),
-                "backup directory must not be a symlink"
-            );
-            private_dir(&backups)?;
+            let backups = backup_directory(&root)?;
             let mut journal = Journal {
                 phase: Phase::Prepared,
                 previous,
@@ -615,6 +617,7 @@ async fn handoff(
 
 /// Confirm and open admission only after the caller has proved the final state.
 async fn acknowledge(
+    policy: &Policy,
     data: &Path,
     service: &impl ServiceControl,
     journal: &mut Journal,
@@ -622,6 +625,7 @@ async fn acknowledge(
     journal.phase = Phase::Confirmed;
     persist(&data.join("update-pending.json"), journal)?;
     service.commit(data).await?;
+    retain_committed_artifacts(policy, data, journal);
     Ok(())
 }
 
@@ -632,7 +636,7 @@ async fn activate(
     journal: &mut Journal,
 ) -> Result<()> {
     handoff(policy, data, service, journal).await?;
-    acknowledge(data, service, journal).await?;
+    acknowledge(policy, data, service, journal).await?;
     Ok(())
 }
 
@@ -710,6 +714,9 @@ async fn recover_with_service(
         );
         fs::remove_file(&pending)?;
         privatefs::sync_dir(data)?;
+        if confirmed {
+            retain_committed_releases(policy, data, &journal);
+        }
         eprintln!(
             "Recovered {} program; business data was kept.",
             if confirmed { "confirmed" } else { "previous" }
@@ -724,6 +731,7 @@ async fn recover_with_service(
             .is_ok()
     {
         service.commit(data).await?;
+        retain_committed_artifacts(policy, data, &journal);
         return Ok(());
     }
     service.stop().await?;
@@ -736,6 +744,9 @@ async fn recover_with_service(
     journal.phase = Phase::Confirmed;
     persist(&pending, &journal)?;
     service.commit(data).await?;
+    if confirmed {
+        retain_committed_artifacts(policy, data, &journal);
+    }
     eprintln!(
         "Recovered {} program; business data was kept.",
         if confirmed { "confirmed" } else { "previous" }
@@ -882,6 +893,14 @@ pub(crate) fn complete_desktop_managed_release(data: &Path) -> Result<()> {
     );
     fs::remove_file(pending)?;
     privatefs::sync_dir(data)?;
+    if let Some(root) = journal.candidate.parent().and_then(Path::parent) {
+        let policy = Policy {
+            channel: Channel::Nightly,
+            automatic: false,
+            install_root: root.to_owned(),
+        };
+        retain_committed_releases(&policy, data, &journal);
+    }
     Ok(())
 }
 
@@ -985,7 +1004,7 @@ where
         if let Err(error) = prove(journal.candidate.clone()).await {
             return reconcile_running(&policy, data, &service, error).await;
         }
-        acknowledge(data, &service, &mut journal).await?;
+        acknowledge(&policy, data, &service, &mut journal).await?;
         drop(lease);
         return Ok(());
     }
@@ -1036,17 +1055,11 @@ async fn healthy(data: &Path, package: &Path, device_id: &str) -> Result<()> {
     for _ in 0..150 {
         match inspect(data, &package.join(PROGRAMS[1])).await {
             Ok(inspected) => {
-                let running_version = inspected
-                    .core_version
-                    .as_deref()
-                    .or(inspected.version.as_deref());
                 if inspected.status != "running" {
                     last = inspected
                         .error
                         .unwrap_or_else(|| "node is not running".into());
-                } else if inspected.device_id != device_id
-                    || running_version != Some(version.as_str())
-                {
+                } else if inspected.device_id != device_id || inspected.core_version != version {
                     bail!("started node has an unexpected version or identity");
                 } else {
                     let health = maintenance::request(
@@ -1074,6 +1087,9 @@ async fn healthy(data: &Path, package: &Path, device_id: &str) -> Result<()> {
                         Ok(health)
                             if health.device_id == device_id && health.version == version =>
                         {
+                            if !inspected.http_enabled {
+                                return Ok(());
+                            }
                             let mut listen = inspected.listen;
                             if listen.ip().is_unspecified() {
                                 listen.set_ip(if listen.is_ipv6() {
@@ -1130,6 +1146,141 @@ async fn healthy(data: &Path, package: &Path, device_id: &str) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     bail!("node failed its private health check: {last}")
+}
+
+fn owned_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_dir()
+            && !metadata.is_symlink()
+            && fs::canonicalize(path)? == path
+            && privatefs::owner_of(path)? == privatefs::current_account()?,
+        "{} is not a directory owned by this account without links",
+        path.display()
+    );
+    Ok(())
+}
+
+fn backup_directory(root: &Path) -> Result<PathBuf> {
+    owned_directory(root)?;
+    let backups = root.join("backups");
+    match fs::symlink_metadata(&backups) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            privatefs::create_dir_new(&backups)?;
+            privatefs::sync_dir(root)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    owned_directory(&backups)?;
+    privatefs::ensure_private(&backups, "the updater backup directory")?;
+    Ok(backups)
+}
+
+fn backup_receipt(backups: &Path, backup: &Path) -> Result<PathBuf> {
+    let name = backup
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("backup directory has no name")?;
+    ensure!(
+        backup.parent() == Some(backups) && uuid::Uuid::parse_str(name)?.to_string() == name,
+        "backup directory is outside the updater namespace"
+    );
+    Ok(backups.join(format!(".updater-{name}.json")))
+}
+
+fn retain_committed_artifacts(policy: &Policy, data: &Path, journal: &Journal) {
+    // Recovery pins candidate to previous before committing a rollback; that backup is evidence.
+    if journal.candidate == journal.previous {
+        return;
+    }
+    retain_committed_releases(policy, data, journal);
+    if let Err(error) = prune_committed_backups(policy, data, journal) {
+        eprintln!("Update committed; backup retention could not finish: {error:#}");
+    }
+}
+
+fn retain_committed_releases(policy: &Policy, data: &Path, journal: &Journal) {
+    if journal.candidate == journal.previous {
+        return;
+    }
+    if let Err(error) = release::retain_committed(
+        &policy.install_root,
+        data,
+        &journal.device_id,
+        &journal.previous,
+        &journal.candidate,
+    ) {
+        eprintln!("Update committed; release retention could not finish: {error:#}");
+    }
+}
+
+fn prune_committed_backups(policy: &Policy, data: &Path, journal: &Journal) -> Result<()> {
+    // A failed or interrupted activation keeps its whole snapshot and diagnostic journal.
+    match fs::symlink_metadata(data.join("update-pending.json")) {
+        Ok(_) => bail!("an activation journal still references this Node's backups"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let backups = backup_directory(&policy.install_root)?;
+    let receipt = backup_receipt(&backups, &journal.backup)?;
+    owned_directory(&journal.backup)?;
+    privatefs::ensure_private(&journal.backup, "the completed updater snapshot")?;
+    let mut completed = Vec::new();
+    for entry in fs::read_dir(&backups)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(".updater-"))
+            .and_then(|name| name.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        let snapshot = backups.join(id);
+        if backup_receipt(&backups, &snapshot).is_err()
+            || owned_directory(&snapshot).is_err()
+            || !privatefs::is_private(&snapshot)?
+        {
+            continue;
+        }
+        let Ok(bytes) = privatefs::read_private_bounded(&entry.path(), 4096, "backup receipt")
+        else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<CommittedBackup>(&bytes) else {
+            continue;
+        };
+        if record.data_dir == data && record.device_id == journal.device_id {
+            completed.push((snapshot, entry.path(), record.sequence));
+        }
+    }
+    if !completed.iter().any(|(path, _, _)| path == &journal.backup) {
+        let sequence = completed
+            .iter()
+            .map(|(_, _, sequence)| *sequence)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .context("updater backup sequence is exhausted")?;
+        let record = CommittedBackup {
+            data_dir: data.to_path_buf(),
+            device_id: journal.device_id.clone(),
+            sequence,
+        };
+        privatefs::create_durable(&receipt, &serde_json::to_vec(&record)?)?;
+        completed.push((journal.backup.clone(), receipt, sequence));
+    }
+    completed
+        .sort_by_key(|(path, _, sequence)| (path != &journal.backup, std::cmp::Reverse(*sequence)));
+    for (snapshot, receipt, _) in completed.into_iter().skip(BACKUP_RETENTION) {
+        owned_directory(&snapshot)?;
+        privatefs::ensure_private(&snapshot, "the old updater snapshot")?;
+        fs::remove_dir_all(snapshot)?;
+        fs::remove_file(receipt)?;
+        privatefs::sync_dir(&backups)?;
+    }
+    Ok(())
 }
 
 fn backup(source: &Path, destination: &Path) -> Result<()> {
@@ -1585,19 +1736,8 @@ async fn checked(command: &mut Command, action: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Marks `path` as a program this account can run, where that is something a file carries.
-    fn mark_runnable(path: &Path) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        // Windows carries the right to run in the name, which the fixtures already use.
-        #[cfg(windows)]
-        let _ = path;
-        assert!(privatefs::is_executable(path));
-    }
+    use crate::tests::mark_runnable;
+    use sha2::{Digest, Sha256};
 
     /// Writes a fixture service script that records the arguments it was handed.
     fn recording_service_script(package: &Path) -> PathBuf {
@@ -1684,6 +1824,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn update_health_inspects_the_candidate_core() -> Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use vibeface_bridge::platform::ipc::{Endpoint, Listener};
+
         let root = sandbox();
         let candidate = package(&root, "9.0.0");
         let data = root.join("data");
@@ -1691,8 +1834,12 @@ mod tests {
         let response = serde_json::json!({"ok":true,"result":{
             "status":"running","device_id":"unexpected","data_dir":data,
             "maintenance_socket":root.join("socket"),"listen":"127.0.0.1:4790",
+            "http_enabled":false,
             "version":"9.0.0","core_version":"9.0.0"
         }});
+        let mut old_inspect = response["result"].clone();
+        old_inspect.as_object_mut().unwrap().remove("core_version");
+        assert!(serde_json::from_value::<InspectResult>(old_inspect).is_err());
         let core = candidate.join(PROGRAMS[1]);
         fs::write(
             &core,
@@ -1706,6 +1853,82 @@ mod tests {
         let error = healthy(&data, &candidate, "expected").await.unwrap_err();
         assert!(marker.exists(), "health must execute the candidate Core");
         assert!(error.to_string().contains("unexpected version or identity"));
+        for (case, (web_enabled, http_enabled, http_device, succeeds)) in [
+            (false, false, "other", true),
+            (true, true, "expected", true),
+            (false, true, "expected", true),
+            (false, true, "other", false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let endpoint = Endpoint::in_private_dir(&root, &format!("health-{case}.sock"))?;
+            let mut listener = Listener::bind(&endpoint).await?;
+            let maintenance_server = tokio::spawn(async move {
+                let mut stream = listener.accept().await?;
+                while stream.read_u8().await? != b'\n' {}
+                let response = serde_json::json!({
+                    "protocol":maintenance::PROTOCOL,"status":"healthy",
+                    "health":{"device_id":"expected","version":"9.0.0"}
+                });
+                stream.write_all(&serde_json::to_vec(&response)?).await?;
+                stream.write_all(b"\n").await?;
+                Ok::<_, anyhow::Error>(())
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let listen = listener.local_addr()?;
+            let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let received = requests.clone();
+            let http_server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await?;
+                received.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut request = [0_u8; 4096];
+                let _request_bytes = stream.read(&mut request).await?;
+                let body = serde_json::json!({"device_id":http_device,"version":"9.0.0"});
+                let body = serde_json::to_vec(&body)?;
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                stream.write_all(&body).await?;
+                Ok::<_, anyhow::Error>(())
+            });
+            let response = serde_json::json!({"ok":true,"result":{
+                "status":"running","device_id":"expected","data_dir":data,
+                "maintenance_socket":endpoint.path(),"listen":listen,
+                "web_enabled":web_enabled,"http_enabled":http_enabled,
+                "version":"9.0.0","core_version":"9.0.0"
+            }});
+            fs::write(
+                &core,
+                format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{response}'\n"),
+            )?;
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                healthy(&data, &candidate, "expected"),
+            )
+            .await?;
+            maintenance_server.await??;
+            if http_enabled {
+                http_server.await??;
+            } else {
+                http_server.abort();
+            }
+            assert_eq!(
+                requests.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(http_enabled),
+                "web={web_enabled}, http={http_enabled}"
+            );
+            assert_eq!(result.is_ok(), succeeds);
+            if let Err(error) = result {
+                assert!(error.to_string().contains("HTTP listener belongs"));
+            }
+        }
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -1728,9 +1951,34 @@ mod tests {
         directory
     }
 
+    fn sealed_package(root: &Path, version: &str) -> PathBuf {
+        let directory = package(root, version);
+        let checksums = [
+            PROGRAMS[0],
+            PROGRAMS[1],
+            SERVICE_SCRIPT,
+            "web/index.html",
+            "BUILD-INFO.json",
+        ]
+        .into_iter()
+        .map(|name| {
+            let hash = Sha256::digest(fs::read(directory.join(name)).unwrap());
+            format!("{}  {name}\n", hex::encode(hash))
+        })
+        .collect::<String>();
+        fs::write(directory.join("FILES.sha256"), checksums).unwrap();
+        directory
+    }
+
     fn build_info(version: &str) -> serde_json::Value {
+        let suffix = match std::env::consts::OS {
+            "macos" => "apple-darwin",
+            "linux" => "unknown-linux-gnu",
+            "windows" => "pc-windows-msvc",
+            other => panic!("unsupported test platform: {other}"),
+        };
         serde_json::json!({
-            "version": version, "target": if cfg!(windows) { "x86_64-pc-windows-msvc" } else { "aarch64-apple-darwin" }, "source_commit": "a".repeat(40),
+            "version": version, "target": format!("{}-{suffix}", std::env::consts::ARCH), "source_commit": "a".repeat(40),
             "core_version": version, "core_source_commit": "a".repeat(40),
             "app_version": version, "app_source_commit": "a".repeat(40),
             "update_protocol": vibeface_control::UPDATE_PROTOCOL,
@@ -2100,7 +2348,7 @@ mod tests {
             previous,
             candidate,
             device_id: "device".into(),
-            backup: root.join("backups/fixture"),
+            backup: root.join("backups").join(uuid::Uuid::new_v4().to_string()),
             resume_service: true,
         };
         persist(&data.join("update-pending.json"), &journal).unwrap();
@@ -2151,6 +2399,12 @@ mod tests {
                 .unwrap();
             assert_eq!(installed(&policy.install_root).unwrap(), journal.previous);
             assert!(!data.join("update-pending.json").exists());
+            assert!(
+                !backup_receipt(&policy.install_root.join("backups"), &journal.backup)
+                    .unwrap()
+                    .exists(),
+                "a restored failure keeps its snapshot as diagnostics"
+            );
             for (name, bytes) in filenames.iter().zip(before) {
                 assert_eq!(fs::read(data.join(name)).unwrap(), bytes);
             }
@@ -2281,7 +2535,305 @@ mod tests {
             fs::read(data.join("node.sqlite3")).unwrap(),
             b"new-user-writes-must-survive"
         );
+        let backups = policy.install_root.join("backups");
+        let receipt = backup_receipt(&backups, &journal.backup).unwrap();
+        let record: CommittedBackup = serde_json::from_slice(&fs::read(receipt).unwrap()).unwrap();
+        assert_eq!(record.data_dir, data);
+        assert_eq!(record.device_id, journal.device_id);
+        let mut successful = vec![journal.backup.clone()];
+        let unknown = backups.join(uuid::Uuid::new_v4().to_string());
+        private_dir(&unknown).unwrap();
+        fs::write(unknown.join("keep"), b"unknown snapshot").unwrap();
+        let mut other_nodes = Vec::new();
+        for (data_dir, device_id) in [
+            (data.clone(), "other-device"),
+            (data.with_file_name("other-node-data"), "device"),
+        ] {
+            let snapshot = backups.join(uuid::Uuid::new_v4().to_string());
+            private_dir(&snapshot).unwrap();
+            persist(
+                &backup_receipt(&backups, &snapshot).unwrap(),
+                &CommittedBackup {
+                    data_dir,
+                    device_id: device_id.into(),
+                    sequence: 0,
+                },
+            )
+            .unwrap();
+            other_nodes.push(snapshot);
+        }
+        let outside = policy.install_root.join("outside-backups");
+        private_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"link target").unwrap();
+        let linked = backups.join(uuid::Uuid::new_v4().to_string());
+        privatefs::link_dir(&outside, &linked).unwrap();
+        persist(
+            &backup_receipt(&backups, &linked).unwrap(),
+            &CommittedBackup {
+                data_dir: data.clone(),
+                device_id: journal.device_id.clone(),
+                sequence: 0,
+            },
+        )
+        .unwrap();
+        journal.previous = journal.candidate.clone();
+        journal.candidate = package(&policy.install_root, "1.2.0");
+        journal.phase = Phase::Prepared;
+        journal.backup = backups.join(uuid::Uuid::new_v4().to_string());
+        persist(&data.join("update-pending.json"), &journal).unwrap();
+        let failing = FakeService {
+            candidate: journal.candidate.clone(),
+            failure: "health",
+            starts: std::sync::atomic::AtomicUsize::new(0),
+            stops: std::sync::atomic::AtomicUsize::new(0),
+        };
+        assert!(
+            activate(&policy, &data, &failing, &mut journal)
+                .await
+                .is_err()
+        );
+        recover_with_service(&policy, &data, &failing, RecoveryMode::ResumeJournal)
+            .await
+            .unwrap();
+        let failed = journal.backup.clone();
+        journal.candidate = journal.previous.clone();
+        journal.phase = Phase::Confirmed;
+        persist(&data.join("update-pending.json"), &journal).unwrap();
+        recover_with_service(&policy, &data, &service, RecoveryMode::ResumeJournal)
+            .await
+            .unwrap();
+        assert!(!backup_receipt(&backups, &failed).unwrap().exists());
+        fs::write(data.join("new-private-snapshot"), b"must be copied whole").unwrap();
+        for version in ["1.3.0", "1.4.0", "1.5.0"] {
+            journal.previous = installed(&policy.install_root).unwrap();
+            journal.candidate = package(&policy.install_root, version);
+            journal.phase = Phase::Prepared;
+            journal.backup = backups.join(uuid::Uuid::new_v4().to_string());
+            persist(&data.join("update-pending.json"), &journal).unwrap();
+            activate(&policy, &data, &service, &mut journal)
+                .await
+                .unwrap();
+            successful.push(journal.backup.clone());
+            assert_eq!(
+                fs::read(journal.backup.join("new-private-snapshot")).unwrap(),
+                b"must be copied whole"
+            );
+            assert_eq!(
+                successful.iter().filter(|path| path.exists()).count(),
+                BACKUP_RETENTION
+            );
+        }
+        let referenced = backups.join(uuid::Uuid::new_v4().to_string());
+        backup(&data, &referenced).unwrap();
+        persist(
+            &backup_receipt(&backups, &referenced).unwrap(),
+            &CommittedBackup {
+                data_dir: data.clone(),
+                device_id: journal.device_id.clone(),
+                sequence: 0,
+            },
+        )
+        .unwrap();
+        let pending = Journal {
+            phase: Phase::Prepared,
+            previous: journal.previous.clone(),
+            candidate: journal.candidate.clone(),
+            device_id: journal.device_id.clone(),
+            backup: referenced.clone(),
+            resume_service: true,
+        };
+        persist(&data.join("update-pending.json"), &pending).unwrap();
+        assert!(prune_committed_backups(&policy, &data, &journal).is_err());
+        assert!(
+            referenced.is_dir(),
+            "a live journal prevents all pruning for its Node"
+        );
+        fs::remove_file(data.join("update-pending.json")).unwrap();
+        prune_committed_backups(&policy, &data, &journal).unwrap();
+        assert!(!referenced.exists());
+        assert!(!backup_receipt(&backups, &referenced).unwrap().exists());
+        assert!(failed.is_dir() && unknown.is_dir());
+        assert!(other_nodes.iter().all(|path| path.is_dir()));
+        assert!(privatefs::is_dir_link(&linked).unwrap());
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"link target");
+        let root_alias = policy.install_root.join("root-alias");
+        privatefs::link_dir(&policy.install_root, &root_alias).unwrap();
+        let linked_policy = Policy {
+            install_root: root_alias.clone(),
+            channel: policy.channel,
+            automatic: policy.automatic,
+        };
+        assert!(prune_committed_backups(&linked_policy, &data, &journal).is_err());
+        privatefs::remove_dir_link(&root_alias).unwrap();
+        let moved_backups = policy.install_root.join("kept-backups");
+        fs::rename(&backups, &moved_backups).unwrap();
+        privatefs::link_dir(&moved_backups, &backups).unwrap();
+        assert!(prune_committed_backups(&policy, &data, &journal).is_err());
+        privatefs::remove_dir_link(&backups).unwrap();
+        fs::rename(&moved_backups, &backups).unwrap();
         fs::remove_dir_all(policy.install_root).unwrap();
+    }
+
+    #[test]
+    fn committed_release_retention_keeps_referenced_changed_and_unknown_packages() -> Result<()> {
+        let root = sandbox();
+        let data = root.join("data");
+        private_dir(&data)?;
+        let legacy = sealed_package(&root, "0.8.0");
+        let first = sealed_package(&root, "1.0.0");
+        privatefs::link_dir(&first, &root.join("current"))?;
+        release::retain_committed(&root, &data, "device", &legacy, &first)?;
+        assert!(root.join("releases/.updater-1.0.0.json").is_file());
+        assert!(!root.join("releases/.updater-0.8.0.json").exists());
+        let second = sealed_package(&root, "1.1.0");
+        switch(&root, &second)?;
+        release::retain_committed(&root, &data, "device", &first, &second)?;
+        let unknown = sealed_package(&root, "0.9.0");
+        let staging = root.join("releases/.staging-unclaimed");
+        fs::create_dir(&staging)?;
+        fs::write(staging.join("keep"), b"unclaimed partial download")?;
+        let third = sealed_package(&root, "1.2.0");
+        switch(&root, &third)?;
+        fs::write(
+            data.join("update-pending.json"),
+            b"a journal still pins the first package",
+        )?;
+        assert!(release::retain_committed(&root, &data, "device", &second, &third).is_err());
+        assert!(first.is_dir() && second.is_dir());
+        fs::remove_file(data.join("update-pending.json"))?;
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("missing-journal", data.join("update-pending.json"))?;
+            assert!(release::retain_committed(&root, &data, "device", &second, &third).is_err());
+            fs::remove_file(data.join("update-pending.json"))?;
+        }
+        release::retain_committed(&root, &data, "device", &second, &third)?;
+        assert!(!first.exists());
+        assert!(!root.join("releases/.updater-1.0.0.json").exists());
+        assert!(legacy.is_dir() && second.is_dir() && third.is_dir());
+        assert!(unknown.is_dir() && staging.is_dir());
+        fs::write(
+            second.join("user-file"),
+            b"not part of the committed package",
+        )?;
+        let outside = root.join("outside");
+        private_dir(&outside)?;
+        fs::write(outside.join("keep"), b"link target")?;
+        privatefs::link_dir(&outside, &first)?;
+        fs::copy(
+            root.join("releases/.updater-1.2.0.json"),
+            root.join("releases/.updater-1.0.0.json"),
+        )?;
+        let fourth = sealed_package(&root, "1.3.0");
+        switch(&root, &fourth)?;
+        release::retain_committed(&root, &data, "device", &third, &fourth)?;
+        assert_eq!(installed(&root)?, fourth);
+        assert_eq!(
+            fs::read(second.join("user-file"))?,
+            b"not part of the committed package"
+        );
+        assert!(legacy.is_dir() && third.is_dir());
+        assert!(unknown.is_dir() && staging.join("keep").is_file());
+        assert!(privatefs::is_dir_link(&first)?);
+        assert_eq!(fs::read(outside.join("keep"))?, b"link target");
+        let alias = root.join("root-alias");
+        privatefs::link_dir(&root, &alias)?;
+        assert!(release::retain_committed(&alias, &data, "device", &third, &fourth).is_err());
+        privatefs::remove_dir_link(&alias)?;
+        privatefs::remove_dir_link(&first)?;
+        let releases = root.join("releases");
+        let moved = root.join("kept-releases");
+        fs::rename(&releases, &moved)?;
+        privatefs::link_dir(&moved, &releases)?;
+        assert!(release::retain_committed(&root, &data, "device", &third, &fourth).is_err());
+        privatefs::remove_dir_link(&releases)?;
+        fs::rename(&moved, &releases)?;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn committed_release_retention_never_adopts_preexisting_user_files() -> Result<()> {
+        for contaminated in ["previous", "candidate"] {
+            let root = sandbox();
+            let data = root.join("data");
+            private_dir(&data)?;
+            let first = sealed_package(&root, "1.0.0");
+            let second = sealed_package(&root, "1.1.0");
+            let user_package = if contaminated == "previous" {
+                &first
+            } else {
+                &second
+            };
+            fs::write(
+                user_package.join("user-file"),
+                b"predates the first receipt",
+            )?;
+            privatefs::link_dir(&second, &root.join("current"))?;
+            let retained = release::retain_committed(&root, &data, "device", &first, &second);
+            assert_eq!(retained.is_ok(), contaminated == "previous");
+            assert!(!root.join("releases/.updater-1.0.0.json").exists());
+            assert_eq!(
+                root.join("releases/.updater-1.1.0.json").is_file(),
+                contaminated == "previous"
+            );
+            let third = sealed_package(&root, "1.2.0");
+            let fourth = sealed_package(&root, "1.3.0");
+            let fifth = sealed_package(&root, "1.4.0");
+            for (previous, candidate) in [(&second, &third), (&third, &fourth), (&fourth, &fifth)] {
+                switch(&root, candidate)?;
+                release::retain_committed(&root, &data, "device", previous, candidate)?;
+                assert_eq!(
+                    fs::read(user_package.join("user-file"))?,
+                    b"predates the first receipt"
+                );
+            }
+            assert!(!third.exists());
+            assert!(!root.join("releases/.updater-1.2.0.json").exists());
+            assert!(first.is_dir() && fourth.is_dir() && fifth.is_dir());
+            assert_eq!(second.is_dir(), contaminated == "candidate");
+            assert!(!root.join("releases/.updater-1.1.0.json").exists());
+            fs::remove_dir_all(root)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn committed_release_retention_never_records_an_unsealed_candidate() -> Result<()> {
+        for mutation in ["changed payload", "missing seal"] {
+            let root = sandbox();
+            let data = root.join("data");
+            private_dir(&data)?;
+            let first = sealed_package(&root, "1.0.0");
+            let second = sealed_package(&root, "1.1.0");
+            if mutation == "changed payload" {
+                fs::write(second.join("web/index.html"), b"user payload")?;
+            } else {
+                fs::remove_file(second.join("FILES.sha256"))?;
+            }
+            privatefs::link_dir(&second, &root.join("current"))?;
+            assert!(release::retain_committed(&root, &data, "device", &first, &second).is_err());
+            assert!(!root.join("releases/.updater-1.0.0.json").exists());
+            assert!(!root.join("releases/.updater-1.1.0.json").exists());
+            let third = sealed_package(&root, "1.2.0");
+            let fourth = sealed_package(&root, "1.3.0");
+            let fifth = sealed_package(&root, "1.4.0");
+            for (previous, candidate) in [(&second, &third), (&third, &fourth), (&fourth, &fifth)] {
+                switch(&root, candidate)?;
+                release::retain_committed(&root, &data, "device", previous, candidate)?;
+                assert!(second.is_dir());
+                assert!(!root.join("releases/.updater-1.1.0.json").exists());
+            }
+            if mutation == "changed payload" {
+                assert_eq!(fs::read(second.join("web/index.html"))?, b"user payload");
+            } else {
+                assert!(!second.join("FILES.sha256").exists());
+            }
+            assert!(!third.exists());
+            assert!(fourth.is_dir() && fifth.is_dir());
+            fs::remove_dir_all(root)?;
+        }
+        Ok(())
     }
 
     #[test]
@@ -2321,7 +2873,9 @@ mod tests {
         assert_eq!(stored.phase, Phase::Prepared);
         assert_eq!(service.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(service.stops.load(std::sync::atomic::Ordering::SeqCst), 1);
-        acknowledge(&data, &service, &mut journal).await.unwrap();
+        acknowledge(&policy, &data, &service, &mut journal)
+            .await
+            .unwrap();
         assert!(!data.join("update-pending.json").exists());
         assert_eq!(service.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(service.stops.load(std::sync::atomic::Ordering::SeqCst), 1);

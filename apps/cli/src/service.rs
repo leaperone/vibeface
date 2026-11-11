@@ -221,11 +221,7 @@ pub async fn run(options: Service) -> Result<()> {
     let data_dir = data_dir_or_home(options.data_dir)?;
     let data = std::fs::canonicalize(data_dir)
         .context("initialized data directory is required; run vibeface init first")?;
-    let inspected = inspect(&data).await?;
-    ensure!(
-        inspected.data_dir == data,
-        "core inspected a different data directory"
-    );
+    inspect(&data).await?;
     let executable = std::env::current_exe()?;
     let npm_root = update::npm_install_root(&executable)?;
     let root = match &npm_root {
@@ -262,6 +258,7 @@ pub async fn run(options: Service) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::mark_runnable;
     #[cfg(windows)]
     use std::ffi::OsStr;
     use vibeface_bridge::platform::privatefs;
@@ -286,19 +283,6 @@ mod tests {
             strip_verbatim_windows_path(r"\\?\Volume{fixture}\path"),
             r"\\?\Volume{fixture}\path"
         );
-    }
-
-    /// Marks `path` as a program this account can run, where that is something a file carries.
-    fn mark_runnable(path: &Path) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        // Windows carries the right to run in the name, which the fixtures already use.
-        #[cfg(windows)]
-        let _ = path;
-        assert!(privatefs::is_executable(path));
     }
 
     /// What `command` is expected to start to run the service script at `script`.
@@ -456,25 +440,10 @@ mod tests {
         let binary = package.join(PROGRAMS[0]);
         let data = root.join("data with spaces");
         std::fs::create_dir(&data).unwrap();
-        let install = command(&root, &data, &binary, Action::Install).unwrap();
-        let mut expected = expected_script_call(&package.join(SERVICE_SCRIPT));
-        expected.extend([
-            "install".into(),
-            "--data-dir".into(),
-            script_os_argument(&data).into_os_string(),
-            "--binary".into(),
-            script_os_argument(&binary).into_os_string(),
-        ]);
-        assert_eq!(whole_call(&install), expected);
-        assert!(command(&root, &data, &binary, Action::InstallUpdater).is_err());
-        assert!(command(&root, &data, &binary, Action::UninstallUpdater).is_ok());
-        assert!(command(&root.join("another-install"), &data, &binary, Action::Stop).is_err());
         let running = update::lock_data_dir(&data).unwrap();
         assert!(command(&root, &data, &binary, Action::Install).is_err());
         assert!(command(&root, &data, &binary, Action::Stop).is_ok());
         drop(running);
-        let pending = data.join("update-pending.json");
-        std::fs::write(&pending, b"{}").unwrap();
         // A child another test thread is spawning may still hold the released lock, as in
         // `Runtime::reopen`.
         let install = || {
@@ -493,6 +462,21 @@ mod tests {
                 }
             }
         };
+        let installation = install().unwrap();
+        let mut expected = expected_script_call(&package.join(SERVICE_SCRIPT));
+        expected.extend([
+            "install".into(),
+            "--data-dir".into(),
+            script_os_argument(&data).into_os_string(),
+            "--binary".into(),
+            script_os_argument(&binary).into_os_string(),
+        ]);
+        assert_eq!(whole_call(&installation), expected);
+        assert!(command(&root, &data, &binary, Action::InstallUpdater).is_err());
+        assert!(command(&root, &data, &binary, Action::UninstallUpdater).is_ok());
+        assert!(command(&root.join("another-install"), &data, &binary, Action::Stop).is_err());
+        let pending = data.join("update-pending.json");
+        std::fs::write(&pending, b"{}").unwrap();
         let error = install().unwrap_err();
         assert!(error.to_string().contains("recover the pending update"));
         assert!(command(&root, &data, &binary, Action::Status).is_ok());

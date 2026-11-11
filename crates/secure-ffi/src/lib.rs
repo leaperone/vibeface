@@ -156,8 +156,12 @@ impl Membership {
 }
 
 #[uniffi::export]
-pub fn verify_membership(state_json: String, expected_network: String) -> Result<Arc<Membership>> {
-    let membership = secure::membership::verify_membership(&state_json, &expected_network, None)?;
+pub fn verify_membership(
+    state_json: String,
+    expected_network: String,
+    now: Option<f64>,
+) -> Result<Arc<Membership>> {
+    let membership = secure::membership::verify_membership(&state_json, &expected_network, now)?;
     Ok(Arc::new(Membership(membership)))
 }
 
@@ -242,8 +246,8 @@ pub fn ticket_decode(text: String) -> Result<String> {
 }
 
 #[uniffi::export]
-pub fn ticket_encode(entry_id: String, secret_hex: String) -> Result<String> {
-    Ok(secure::join::ticket_encode(&entry_id, &secret_hex)?)
+pub fn ticket_encode(entry: String, secret_hex: String) -> Result<String> {
+    Ok(secure::join::ticket_encode(&entry, &secret_hex)?)
 }
 
 #[uniffi::export]
@@ -369,5 +373,45 @@ mod tests {
             signature,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn membership_uses_the_nodes_clock_across_recovery_activation() {
+        use secure::membership::{Genesis, Member, NetworkState, RootCheckpoint};
+        let root = secure::Identity::generate().unwrap();
+        let client = secure::Identity::generate().unwrap();
+        let node = secure::Identity::generate().unwrap();
+        let next = secure::Identity::generate().unwrap();
+        let members = vec![
+            Member::client(&client, "phone", true).unwrap(),
+            Member::node(&node, "node").unwrap(),
+        ];
+        let genesis = Genesis::create(&root, members[0].clone(), members[1].clone()).unwrap();
+        let mut state = NetworkState::new(genesis).unwrap();
+        let checkpoint =
+            RootCheckpoint::recovery(&state, &root, &next.device_id(), members, vec![], 1_000)
+                .unwrap();
+        let due = checkpoint.effective_at_ms();
+        state.recover_at(checkpoint, 1_000).unwrap();
+        let json = serde_json::to_string(&state).unwrap();
+        for now in [due - 1, due, due + 1] {
+            let native =
+                verify_membership(json.clone(), root.device_id(), Some(now as f64)).unwrap();
+            let core =
+                secure::membership::verify_membership(&json, &root.device_id(), Some(now as f64))
+                    .unwrap();
+            assert_eq!(native.view_json().unwrap(), core.view_json().unwrap());
+            let view: serde_json::Value =
+                serde_json::from_str(&native.view_json().unwrap()).unwrap();
+            assert_eq!(
+                view["recovery_key"],
+                if now < due {
+                    root.device_id()
+                } else {
+                    next.device_id()
+                }
+            );
+        }
+        assert!(verify_membership(json, root.device_id(), None).is_ok());
     }
 }

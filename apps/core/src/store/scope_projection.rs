@@ -1,7 +1,7 @@
 //! Read-model destinations follow signed inputs and verified execution bindings.
 use super::{Store, bots::bot_for_conversation_from, log, reduce, work, workspace};
 use crate::{
-    model::{EventBody, Role},
+    model::{Event, EventBody, Role, Subject},
     scheduling::{SessionScope, parse_schedule_trigger},
     workspace::InputTarget,
 };
@@ -48,6 +48,38 @@ fn main_target_from(
     Ok(Destination::Main(
         bot_for_conversation_from(connection, network, conversation)?.map(|bot| bot.bot_id),
     ))
+}
+
+fn attributed_session_target_from(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    about: &Subject,
+    before_rank: Option<&str>,
+) -> Result<Option<InputTarget>> {
+    let Some(agent) = about.agent else {
+        return Ok(None);
+    };
+    let attributed: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_owners s
+         WHERE s.network_id=?1 AND s.node=?2 AND s.session_id=?3 AND s.conversation_id=?4
+            AND s.attribution IS NOT NULL AND json_extract(s.attribution,'$.agent')=?5
+            AND s.muted=0 AND (?6 IS NULL OR s.rank<=?6)
+            AND NOT EXISTS(SELECT 1 FROM bot_deletions d
+                WHERE d.network_id=s.network_id AND d.conversation_id=s.conversation_id)
+            AND NOT EXISTS(SELECT 1 FROM works w
+                WHERE w.network_id=s.network_id AND w.target_node=s.node
+                    AND (w.thread_id=s.session_id OR json_extract(w.dispatch,'$.thread')=s.session_id)
+                    AND json_extract(w.dispatch,'$.resolved.provider')=?5
+                    AND (?6 IS NULL OR w.dispatch_rank<=?6)))",
+        params![network, about.node, about.session_id, conversation, agent.name(), before_rank],
+        |row| row.get(0),
+    )?;
+    if attributed {
+        Ok(main_target_from(connection, network, conversation)?.target())
+    } else {
+        Ok(None)
+    }
 }
 
 fn task_target_from(
@@ -146,12 +178,7 @@ fn target_from(
                         answers: Some(question),
                         ..
                     }) => Source::Question(question),
-                    Some(EventBody::MessagePosted {
-                        role: Role::User,
-                        attestation: Some(_),
-                        ..
-                    })
-                    | Some(EventBody::BotMessaged { .. }) => {
+                    Some(EventBody::BotMessaged { .. }) => {
                         return main_target_from(connection, network, &conversation);
                     }
                     Some(EventBody::MessagePosted {
@@ -180,21 +207,32 @@ fn target_from(
                 }
             }
             Source::Question(question_id) => {
-                let body: Option<String> = connection
+                let question: Option<(String, String)> = connection
                     .query_row(
-                        "SELECT body FROM questions WHERE network_id=? AND conversation_id=? AND question_id=?",
+                        "SELECT body,rank FROM questions WHERE network_id=? AND conversation_id=? AND question_id=?",
                         params![network, conversation, question_id],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()?;
-                return Ok(
-                    match body.map(|body| serde_json::from_str(&body)).transpose()? {
-                        Some(EventBody::QuestionAsked { target, .. }) => {
-                            target.map_or(Destination::Unknown, Destination::from_target)
-                        }
-                        _ => Destination::Unknown,
-                    },
-                );
+                let Some((body, rank)) = question else {
+                    return Ok(Destination::Unknown);
+                };
+                let EventBody::QuestionAsked { target, about, .. } = serde_json::from_str(&body)?
+                else {
+                    return Ok(Destination::Unknown);
+                };
+                let target = match target {
+                    Some(target) => Some(target),
+                    // A later answer may bind this thread to Work without changing the question's scope.
+                    None => attributed_session_target_from(
+                        connection,
+                        network,
+                        &conversation,
+                        &about,
+                        Some(&rank),
+                    )?,
+                };
+                return Ok(target.map_or(Destination::Unknown, Destination::from_target));
             }
             Source::Work(work_id) => {
                 if let Some(assignment) =
@@ -300,6 +338,51 @@ pub(crate) fn trigger_input_target_from(
     .target())
 }
 
+pub(crate) fn question_input_target_from(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    question_id: &str,
+) -> Result<Option<InputTarget>> {
+    Ok(target_from(
+        connection,
+        network,
+        conversation,
+        Source::Question(question_id.into()),
+    )?
+    .target())
+}
+
+pub(crate) fn question_event_input_target_from(
+    connection: &Connection,
+    network: &str,
+    event: &Event,
+) -> Result<Option<InputTarget>> {
+    let EventBody::QuestionAsked {
+        question_id,
+        target,
+        ..
+    } = &event.body
+    else {
+        return Ok(None);
+    };
+    if let Some(target) = target {
+        return Ok(Some(target.clone()));
+    }
+    if !super::event_about_from(
+        connection,
+        network,
+        &event.scope_id,
+        "question_asked",
+        question_id,
+    )?
+    .is_some_and(|question| question.event == *event)
+    {
+        return Ok(None);
+    }
+    question_input_target_from(connection, network, &event.scope_id, question_id)
+}
+
 pub(crate) fn trigger_is_main_from(
     connection: &Connection,
     network: &str,
@@ -355,7 +438,9 @@ pub(crate) fn notification_target_from(
         EventBody::WorkFinished { work_id, .. } => {
             Ok(target_from(connection, network, &event.scope_id, Source::Work(work_id))?.target())
         }
-        EventBody::QuestionAsked { target, .. } => Ok(target),
+        EventBody::QuestionAsked { .. } => {
+            question_event_input_target_from(connection, network, &event)
+        }
         EventBody::SessionAttributed { .. } => {
             Ok(main_target_from(connection, network, &event.scope_id)?.target())
         }
@@ -420,6 +505,15 @@ impl Store {
             target.get_or_insert(candidate);
         }
         Ok(target)
+    }
+
+    pub(crate) fn attributed_session_input_target(
+        &self,
+        network: &str,
+        conversation: &str,
+        about: &Subject,
+    ) -> Result<Option<InputTarget>> {
+        attributed_session_target_from(&self.connection, network, conversation, about, None)
     }
 
     pub(super) fn native_input_targets(

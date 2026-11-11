@@ -336,7 +336,7 @@ extern "C" {
         RustCallStatus *uniffi_out_err
     );
     RustBuffer uniffi_vibeface_secure_ffi_fn_func_ticket_encode(
-        RustBuffer entry_id, 
+        RustBuffer entry, 
         RustBuffer secret_hex, 
         RustCallStatus *uniffi_out_err
     );
@@ -350,6 +350,7 @@ extern "C" {
     /*handle*/ uint64_t uniffi_vibeface_secure_ffi_fn_func_verify_membership(
         RustBuffer state_json, 
         RustBuffer expected_network, 
+        RustBuffer now, 
         RustCallStatus *uniffi_out_err
     );
     /*handle*/ uint64_t uniffi_vibeface_secure_ffi_fn_func_lan_connect(
@@ -822,9 +823,8 @@ template <> struct Bridging<RustCallStatus> {
       // immediately. The errorBuf is small (a serialized error variant) and
       // only allocated on the cold error path, so the boundary copy is cheap.
       auto len = static_cast<size_t>(status.error_buf.len);
-      uint8_t *bytes = new uint8_t[len];
-      std::memcpy(bytes, status.error_buf.data, len);
-      auto payload = std::make_shared<uniffi_jsi::CMutableBuffer>(bytes, len);
+      auto payload = std::make_shared<uniffi_jsi::OwnedMutableBuffer>(len);
+      std::memcpy(payload->data(), status.error_buf.data, len);
       auto view = uniffi_jsi::arraybufferToUint8Array(
           rt, jsi::ArrayBuffer(rt, payload));
       statusObject.setProperty(rt, "errorBuf", view);
@@ -2513,7 +2513,7 @@ NativeVibefaceSecureFfi::NativeVibefaceSecureFfi(
     props["ubrn_uniffi_vibeface_secure_ffi_fn_func_verify_membership"] = jsi::Function::createFromHostFunction(
         rt,
         jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_fn_func_verify_membership"),
-        2,
+        3,
         [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
             return this->cpp_uniffi_vibeface_secure_ffi_fn_func_verify_membership(rt, thisVal, args, count);
         }
@@ -3953,7 +3953,7 @@ jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_func_verif
 }
 jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_func_verify_membership(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
-        auto value = uniffi_vibeface_secure_ffi_fn_func_verify_membership(uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[1]), 
+        auto value = uniffi_vibeface_secure_ffi_fn_func_verify_membership(uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[1]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[2]), 
             &status
         );
         uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);

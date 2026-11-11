@@ -20,7 +20,7 @@
 - [What you can do](#what-you-can-do)
 - [Get started](#get-started)
 - [Add another device](#add-another-device)
-- [Public discovery service](#public-discovery-service)
+- [Public mesh](#public-mesh)
 - [Privacy and permissions](#privacy-and-permissions)
 - [Documentation](#documentation)
 - [Build from source](#build-from-source)
@@ -31,7 +31,7 @@
 ## What you can do
 
 - **Ask in chat.** Give a bot a name and a job, then use its conversation to ask for work and review results.
-- **Choose a computer.** Run tasks on your own Mac or Linux computer using Codex, Claude Code, pi, opencode, or Cursor.
+- **Choose a computer.** Run tasks on your own Mac, Windows, or Linux computer using Codex, Claude Code, pi, opencode, or Cursor.
 - **Continue elsewhere.** Approved computers share conversations, task updates, and saved results. Open a synced conversation on another computer and choose to continue there.
 - **Check from your phone.** Connect through a browser or the native iOS and Android apps.
 
@@ -39,7 +39,7 @@ Vibeface coordinates the work. You provide the Agent, its login and model access
 
 ## Get started
 
-You need an Apple Silicon Mac, Linux x64, or Linux ARM64 with glibc, plus a supported Agent set up on that computer.
+You need an Apple Silicon Mac, Windows x64, Linux x64, or Linux ARM64 with glibc, plus a supported Agent set up on that computer.
 
 1. Install Nightly. The installer selects and verifies the complete package for your platform:
 
@@ -76,15 +76,15 @@ vibeface join '<join link>' --name '<device name>'
 
 Compare the six-digit code on both devices before approving. Join the existing network instead of creating a new one. Read [first-time setup](packages/docs/onboarding.md) for joining and recovery.
 
-## Public discovery service
+## Public mesh
 
-The official public node is an ordinary Node outside every personal network. It serves discovery, an open relay and browser access, each with small limits. Its device ID and UDP address are pinned in [`config/public-bootstrap.json`](config/public-bootstrap.json):
+Every Node joins one public mesh by default: it announces a signed record with its device ID, direct addresses, home relay and the roles it offers, and keeps every other Node's record. The official public node is an ordinary Node outside every personal network and the default bootstrap node. It also runs an open relay and browser access, each with small limits. Its device ID, UDP address and relay are pinned in [`config/public-bootstrap.json`](config/public-bootstrap.json):
 
 ```text
-vibeface://<issuer>@8.217.72.118:4792
+vibeface://node/<issuer>?addr=84.54.3.78:4792&relay=http://node.vibeface.dev:3340
 ```
 
-New personal Nodes register with it by default, and use its open relay when no direct path works. `https://app.vibeface.dev` connects straight to its browser access address, `gateway_url` (`https://node.vibeface.dev:4792`), and reaches your Node through it by device ID; you can switch to your own Gateway in the connection settings, and LAN connections remain preferred. It forwards only ciphertext. Use `--bootstrap off` during first initialization to disable public bootstrap, or point a Node at a self-hosted service. See [Use the public discovery service](packages/docs/node.md#使用公共发现服务) for configuration, visible metadata, and connection limits. Joining a personal network still requires an invitation and approval.
+New personal Nodes join the mesh through it, and pick verified open relays from the mesh when no direct path works. `https://app.vibeface.dev` connects straight to its browser access address, `gateway_url` (`https://node.vibeface.dev:4792`), and reaches your Node through it by device ID; you can switch to your own Gateway in the connection settings, and LAN connections remain preferred. It forwards ciphertext and sees addresses, device IDs and traffic volume, not content. Use `--no-mesh` during first initialization to stay off the mesh, or `--bootstrap <node link>` to join through the first Node you know (`vibeface mesh share` prints a running Node's link). See [The mesh](packages/docs/node.md#全网) for configuration, visible metadata, and connection limits. Joining a personal network still requires an invitation and approval.
 
 ## Privacy and permissions
 
@@ -117,15 +117,16 @@ Detailed guides are currently in Chinese.
 
 ## Build from source
 
-You need Rust 1.91+, Node.js 22.12+, pnpm 11.9.0, and `wasm-bindgen-cli` 0.2.129.
+Core/CLI builds need Python 3.12+, Rust 1.91+, Node.js 24, pnpm 11.9.0, and `wasm-bindgen-cli` 0.2.129.
 
 ```sh
 rustup target add wasm32-unknown-unknown
 bash scripts/build-web-crypto.sh
 bash scripts/build-web.sh
-cargo build --release -p vibeface -p vibeface-core --locked
 bash scripts/package-node.sh
 ```
+
+The native GPUI Desktop uses the separate pinned toolchain and platform libraries in `.github/actions/native-desktop/action.yml`. The repository contains six apps: Web, CLI, Core, Desktop, Mobile, and the independent website.
 
 The platform package is written to `.artifacts/packages/`. See [source setup](packages/docs/quick-start.md#从源码准备当前版本) for running it and [release instructions](packages/docs/releasing.md) for packaging details.
 
@@ -137,14 +138,18 @@ The platform package is written to `.artifacts/packages/`. See [source setup](pa
 │   ├── app/         # Web app
 │   ├── cli/         # Command line
 │   ├── core/        # Node service
+│   ├── desktop/     # Native GPUI desktop app
 │   ├── mobile/      # iOS and Android apps
 │   └── www/         # Public website
 ├── crates/          # Shared Rust libraries
 ├── packages/
 │   ├── client/      # Shared app client
 │   ├── docs/        # User and developer guides
+│   ├── secure-native/ # Rust crypto bindings for the mobile apps
 │   └── theme/       # Shared styles
+├── config/          # Official public node address
 ├── contracts/       # Experimental file delivery contracts
+├── deploy/          # Container deployment for the official services
 ├── scripts/         # Build, package, and verification tools
 ├── tests/           # Fixtures and end-to-end tests
 └── install.sh       # Package installer
@@ -158,4 +163,6 @@ For a pull request, start from `main`, use a separate branch, and run the checks
 
 ## License
 
-This repository does not include a `LICENSE` file yet. Until a license is published, all rights are reserved.
+Vibeface's original source does not include a `LICENSE` file yet. Until a license is published, all rights to that source are reserved.
+
+Third-party files retain their own licenses. In `contracts/delivery/vendor/`, the two Groth16 verifier implementations are licensed under GPL-3.0, the other RISC Zero files under Apache-2.0, and OpenZeppelin's `SafeCast.sol` under MIT. See each file's license header. The reservation above does not replace those licenses or waive obligations when using or distributing the vendored contracts.

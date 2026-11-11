@@ -1,7 +1,9 @@
-//! Drives the work state machine from what the providers report and read back. Every change goes
-//! through `Store::apply_work_signal`, so the journal, the DAG and the UI agree.
+//! Drives the work state machine from what the providers report and read back. Provider signals
+//! go through `Store::apply_work_signal`, so the journal, the DAG and the UI agree.
+use super::agent_tools::ExecutionProviderRequest;
 use super::*;
 use crate::scheduling::task_trigger;
+use crate::store::admission::{AdmissionRejected, authorize_peer_node_from};
 use crate::work::{
     Dispatch, DispatchState, Probe, RequestedWorkKind, Signal, StopRequest, WorkAdmission,
     WorkRecord, WorkRequest, WorkSpec, WorkState,
@@ -36,6 +38,13 @@ fn on_app_server(record: &WorkRecord) -> bool {
     matches!(record.kind, WorkKind::Agent(provider) if provider.on_app_server())
 }
 
+struct WorkDispatchSettings {
+    identity: LocalIdentity,
+    roots: Vec<PathBuf>,
+    manager: Option<config::ManagerSettings>,
+    providers: crate::providers::Providers,
+}
+
 impl Runtime {
     pub(super) async fn signal_work(
         self: &Arc<Self>,
@@ -44,19 +53,29 @@ impl Runtime {
         signal: Signal,
     ) -> Result<WorkRecord> {
         let quiet = matches!(signal, Signal::Text(_) | Signal::Progress { .. });
-        let (before, (record, receipt)) = {
-            let mut store = self.store.lock().await;
-            let before = if quiet {
-                None
-            } else {
-                store
-                    .work_record(work_id)?
-                    .map(|record| record.state.name())
-            };
-            let applied =
-                store.apply_work_signal(&self.identity, network, work_id, signal, now_ms())?;
-            (before, applied)
-        };
+        let identity = self.identity.clone();
+        let call_network = network.to_owned();
+        let call_work = work_id.to_owned();
+        let (before, (record, receipt)) = self
+            .store
+            .call("work.signal", move |store| {
+                let before = if quiet {
+                    None
+                } else {
+                    store
+                        .work_record(&call_work)?
+                        .map(|record| record.state.name())
+                };
+                let applied = store.apply_work_signal(
+                    &identity,
+                    &call_network,
+                    &call_work,
+                    signal,
+                    now_ms(),
+                )?;
+                Ok((before, applied))
+            })
+            .await?;
         // A probe that finds the turn where it was changes nothing; only a new state is logged.
         if !quiet && before != Some(record.state.name()) {
             let thread_id = record.state.thread();
@@ -132,9 +151,8 @@ impl Runtime {
     async fn observe_live_threads(&self) {
         let threads = self
             .store
-            .lock()
+            .call("work.observe_threads", |store| store.open_work_records())
             .await
-            .work_records()
             .unwrap_or_default()
             .into_iter()
             .filter(|record| live(record) && on_app_server(record))
@@ -147,14 +165,35 @@ impl Runtime {
     /// carries the user's signed message or their permission to continue, the directory is in
     /// this Node's roots, and an agent task has an Agent to run it.
     fn authorize_dispatch(
-        &self,
         store: &Store,
         network: &str,
         spec: &WorkRequest,
         kind: WorkKind,
+        settings: &WorkDispatchSettings,
     ) -> Result<()> {
         if spec.thread.is_none() || !spec.cwd.is_empty() {
-            self.allowed_path(&spec.cwd)?;
+            let path = std::fs::canonicalize(&spec.cwd).context("execution path does not exist")?;
+            let roots = settings
+                .roots
+                .iter()
+                .map(std::fs::canonicalize)
+                .collect::<Vec<_>>();
+            let allowed = roots
+                .iter()
+                .filter_map(|root| root.as_ref().ok())
+                .any(|root| path.starts_with(root));
+            if !allowed {
+                for root in roots {
+                    root.context("configured execution root cannot be resolved")?;
+                }
+            }
+            ensure!(
+                allowed,
+                AdmissionRejected::new(
+                    "execution path is outside configured roots; ask the user to allow its folder with propose_provider_config roots"
+                )
+            );
+            ensure!(path.is_dir(), "execution path must be a directory");
         }
         let conversation = store
             .conversation(network, &spec.conversation)?
@@ -164,20 +203,24 @@ impl Runtime {
             Some(("message", message_id)) => {
                 ensure!(
                     from_owner,
-                    "only the conversation's scheduling device dispatches its work"
+                    AdmissionRejected::new(
+                        "only the conversation's scheduling device dispatches its work"
+                    )
                 );
                 let message = store
                     .message(network, &spec.conversation, message_id)?
                     .context("the user's message has not reached this device")?;
                 ensure!(
                     message.role == Role::User,
-                    "work must follow the user's own message"
+                    AdmissionRejected::new("work must follow the user's own message")
                 );
             }
             Some(("work", previous)) => {
                 ensure!(
                     from_owner,
-                    "only the conversation's scheduling device dispatches its work"
+                    AdmissionRejected::new(
+                        "only the conversation's scheduling device dispatches its work"
+                    )
                 );
                 // A refused or unknown dispatch of this Node has no result in the DAG; only this
                 // Node, which holds it, can follow it up.
@@ -185,7 +228,7 @@ impl Runtime {
                     .works(network, &spec.conversation)?
                     .iter()
                     .any(|work| work.work_id == previous && work.outcome.is_some())
-                    || spec.dispatcher == self.identity.device_id()?
+                    || spec.dispatcher == settings.identity.device_id()?
                         && store.dispatch(previous)?.is_some_and(|dispatch| {
                             dispatch.spec.conversation == spec.conversation
                                 && dispatch.state.ended()
@@ -198,10 +241,12 @@ impl Runtime {
             Some(("schedule", _)) => {
                 ensure!(
                     from_owner,
-                    "only the conversation's scheduling device dispatches its work"
+                    AdmissionRejected::new(
+                        "only the conversation's scheduling device dispatches its work"
+                    )
                 );
                 let (schedule_id, _) = crate::scheduling::parse_schedule_trigger(&spec.trigger)
-                    .context("invalid work trigger")?;
+                    .context(AdmissionRejected::new("invalid work trigger"))?;
                 ensure!(
                     store.schedule(network, schedule_id)?.is_some_and(|entry| {
                         entry.conversation_id == spec.conversation && entry.schedule.enabled
@@ -212,14 +257,16 @@ impl Runtime {
             Some(("bot_message", message_id)) => {
                 ensure!(
                     from_owner,
-                    "only the conversation's scheduling device dispatches its work"
+                    AdmissionRejected::new(
+                        "only the conversation's scheduling device dispatches its work"
+                    )
                 );
                 let message = store
                     .message(network, &spec.conversation, message_id)?
                     .context("the bot's message has not reached this device")?;
                 ensure!(
                     message.role == Role::Bot,
-                    "work must follow a message in this conversation"
+                    AdmissionRejected::new("work must follow a message in this conversation")
                 );
             }
             Some(("task", task)) => {
@@ -233,7 +280,7 @@ impl Runtime {
                         && task.conversation == spec.conversation
                         && spec.parent.as_deref() == Some(task.work_id.as_str())
                         && !task.state.finished(),
-                    "an agent task only starts work on its own device"
+                    AdmissionRejected::new("an agent task only starts work on its own device")
                 );
             }
             Some(("assignment", assignment_id)) => {
@@ -245,10 +292,12 @@ impl Runtime {
                         &spec.dispatcher,
                         &spec.conversation
                     )?,
-                    "this assignment does not authorize work in this conversation"
+                    AdmissionRejected::new(
+                        "this assignment does not authorize work in this conversation"
+                    )
                 );
             }
-            _ => bail!("invalid work trigger"),
+            _ => bail!(AdmissionRejected::new("invalid work trigger")),
         }
         if let Some(original) = &spec.continues {
             let original = store
@@ -256,7 +305,7 @@ impl Runtime {
                 .context("the work to continue is not on this device")?;
             ensure!(
                 original.conversation == spec.conversation,
-                "a continuation keeps the original conversation"
+                AdmissionRejected::new("a continuation keeps the original conversation")
             );
             match original.kind {
                 _ if original.kind == kind => {}
@@ -266,19 +315,21 @@ impl Runtime {
                     ran.label(),
                     ran.name()
                 ),
-                WorkKind::Task => bail!("a continuation keeps the original kind"),
+                WorkKind::Task => bail!(AdmissionRejected::new(
+                    "a continuation keeps the original kind"
+                )),
             }
         }
         ensure!(
             kind == WorkKind::Task || spec.dispatcher == spec.target,
-            "another device takes work only as a task for its bot"
+            AdmissionRejected::new("another device takes work only as a task for its bot")
         );
         if kind == WorkKind::Task {
             ensure!(
                 spec.dispatcher != spec.target,
-                "an agent task goes to another device"
+                AdmissionRejected::new("an agent task goes to another device")
             );
-            if self.manager().is_none() {
+            if settings.manager.is_none() {
                 return Err(ExecFailure::new(
                     FailureKind::NoBot,
                     "this device has no bot to take the task",
@@ -306,51 +357,70 @@ impl Runtime {
             .map(str::to_owned);
         ensure!(
             request.target == self.identity.device_id()?,
-            "work targets another Node"
+            AdmissionRejected::new("work targets another Node")
         );
         ensure!(
             request.work_id
                 == WorkSpec::id(&request.conversation, &request.trigger, &request.call_ref),
-            "work ID does not match its call"
+            AdmissionRejected::new("work ID does not match its call")
         );
         let _settings = self.manager_controls.lock().await;
-        let admitted = {
-            let mut store = self.store.lock().await;
-            if let Some(existing) = store.accepted_work(network, &request)? {
-                existing
-            } else {
-                if let Some(envelope) = store.peer_dispatch_envelope(network, &request)? {
-                    store.authorize_node(network, &request.dispatcher)?;
-                    ensure!(
-                        store.peer_command_dependencies(network, &envelope)?,
-                        "dispatch dependencies are still missing"
-                    );
-                }
-                ensure!(
-                    !store.peer_cancelled(network, &request.conversation, &request.work_id)?,
-                    "work was cancelled before dispatch admission"
-                );
-                let first = (|| {
-                    let proposed = self.resolve_work_model(&store, network, &request)?;
-                    let kind = match request.kind {
-                        RequestedWorkKind::Agent(_) => {
-                            proposed.provider.check_work(args)?;
-                            WorkKind::Agent(proposed.provider)
-                        }
-                        RequestedWorkKind::Task => WorkKind::Task,
-                    };
-                    self.authorize_dispatch(&store, network, &request, kind)?;
-                    store.accept_work(&self.identity, network, request.clone(), proposed, now_ms())
-                })();
-                match first {
-                    Ok(admitted) => admitted,
-                    Err(error) => match store.accepted_work(network, &request)? {
-                        Some(existing) => existing,
-                        None => return Err(error),
-                    },
-                }
-            }
+        let settings = WorkDispatchSettings {
+            identity: self.identity.clone(),
+            roots: self.settings_snapshot().roots,
+            manager: self.manager(),
+            providers: self.providers().switches,
         };
+        let network = network.to_owned();
+        let call_network = network.clone();
+        let args = args.clone();
+        let admitted = self
+            .store
+            .call("work.accept_dispatch", move |store| {
+                let network = call_network.as_str();
+                if let Some(existing) = store.accepted_work(network, &request)? {
+                    Ok(existing)
+                } else {
+                    if let Some(envelope) = store.peer_dispatch_envelope(network, &request)? {
+                        authorize_peer_node_from(&store.connection, network, &request.dispatcher)?;
+                        ensure!(
+                            store.peer_command_dependencies(network, &envelope)?,
+                            "dispatch dependencies are still missing"
+                        );
+                    }
+                    ensure!(
+                        !store.peer_cancelled(network, &request.conversation, &request.work_id)?,
+                        AdmissionRejected::new("work was cancelled before dispatch admission")
+                    );
+                    let first = (|| {
+                        let proposed =
+                            Self::resolve_work_model(store, network, &request, &settings)?;
+                        let kind = match request.kind {
+                            RequestedWorkKind::Agent(_) => {
+                                proposed.provider.check_work(&args)?;
+                                WorkKind::Agent(proposed.provider)
+                            }
+                            RequestedWorkKind::Task => WorkKind::Task,
+                        };
+                        Self::authorize_dispatch(store, network, &request, kind, &settings)?;
+                        store.accept_work(
+                            &settings.identity,
+                            network,
+                            request.clone(),
+                            proposed,
+                            now_ms(),
+                        )
+                    })();
+                    match first {
+                        Ok(admitted) => Ok(admitted),
+                        Err(error) => match store.accepted_work(network, &request)? {
+                            Some(existing) => Ok(existing),
+                            None => Err(error),
+                        },
+                    }
+                }
+            })
+            .await?;
         let record = &admitted.record;
         tracing::info!(
             event = "work.dispatched",
@@ -361,7 +431,7 @@ impl Runtime {
             "work dispatched to this device"
         );
         self.publish_changed(
-            network,
+            &network,
             &record.conversation,
             Changed::Work(&record.work_id),
         );
@@ -372,22 +442,32 @@ impl Runtime {
     }
 
     fn resolve_work_model(
-        &self,
         store: &Store,
         network: &str,
         request: &WorkRequest,
+        settings: &WorkDispatchSettings,
     ) -> Result<ResolvedModel> {
         let (provider, model) = match request.kind {
             RequestedWorkKind::Agent(agent) => {
-                let provider = self.executing_from(
+                let provider = Self::execution_provider_from(
                     store,
                     network,
-                    agent,
-                    request.thread.as_deref(),
-                    request.continues.as_deref(),
+                    &settings.identity.device_id()?,
+                    &settings.providers.execution,
+                    settings.manager.as_ref().map(|manager| manager.provider),
+                    ExecutionProviderRequest {
+                        agent,
+                        thread: request.thread.as_deref(),
+                        continues: request.continues.as_deref(),
+                    },
                 )?;
                 if let Some(thread) = &request.thread {
-                    match self.ran_on_from(store, network, thread)? {
+                    match Self::ran_on_from(
+                        store,
+                        network,
+                        &settings.identity.device_id()?,
+                        thread,
+                    )? {
                         Some(ran) if ran != provider => bail!(
                             "this device's {} works ran in this session; set agent to {} or leave agent out",
                             ran.label(),
@@ -404,25 +484,24 @@ impl Runtime {
                         "this thread is a bot's own reply thread; message that bot with message_bot instead"
                     );
                 }
-                let model = self
-                    .providers()
-                    .switches
+                let model = settings
+                    .providers
                     .resolve_execution_model(provider, request.model.as_deref());
                 (provider, model)
             }
             RequestedWorkKind::Task => {
                 ensure!(
                     request.model.is_none(),
-                    "a remote task uses the target Bot's model; omit model"
+                    AdmissionRejected::new("a remote task uses the target Bot's model; omit model")
                 );
-                let manager = self.manager().ok_or_else(|| {
+                let manager = settings.manager.as_ref().ok_or_else(|| {
                     ExecFailure::new(
                         FailureKind::NoBot,
                         "this device has no bot to take the task",
                     )
                 })?;
                 let bot = store.bot_for_conversation(network, &request.conversation)?;
-                let model = crate::scheduler::bot_model(&manager, bot.as_ref())
+                let model = crate::scheduler::bot_model(manager, bot.as_ref())
                     .unwrap_or_else(|| manager.model.clone());
                 (manager.provider, manager.provider.model(model.trim()))
             }
@@ -476,10 +555,15 @@ impl Runtime {
         spec: WorkRequest,
         notify: bool,
     ) -> Result<Dispatch> {
-        let dispatch = self.store.lock().await.save_dispatch(&Dispatch {
-            spec,
-            state: DispatchState::Pending,
-        })?;
+        let dispatch = self
+            .store
+            .call("work.save_dispatch", move |store| {
+                store.save_dispatch(&Dispatch {
+                    spec,
+                    state: DispatchState::Pending,
+                })
+            })
+            .await?;
         if dispatch.state != DispatchState::Pending {
             return Ok(dispatch);
         }
@@ -502,11 +586,14 @@ impl Runtime {
     ) -> Result<Result<Dispatch>> {
         let lane = format!("dispatch:{network}:{}", dispatch.spec.work_id);
         let _peer_delivery = self.peer_delivery_locks.lock(&lane).await;
+        let call_network = network.to_owned();
+        let spec = dispatch.spec.clone();
         let command = self
             .store
-            .lock()
-            .await
-            .peer_dispatch_command(network, &dispatch.spec)?;
+            .call("work.dispatch_command", move |store| {
+                store.peer_dispatch_command(&call_network, &spec)
+            })
+            .await?;
         let command_id = command.envelope.command_id.clone();
         let request = json!({"type":"dispatch_work","command":command.envelope});
         let reply = match self
@@ -558,13 +645,15 @@ impl Runtime {
                 "another device accepted the work"
             ),
         }
-        let (dispatch, receipt) = self.store.lock().await.answer_dispatch(
-            network,
-            &self.identity.device_id()?,
-            &spec.work_id,
-            state,
-            notify,
-        )?;
+        let call_network = network.to_owned();
+        let local = self.identity.device_id()?;
+        let call_work = spec.work_id.clone();
+        let (dispatch, receipt) = self
+            .store
+            .call("work.answer_dispatch", move |store| {
+                store.answer_dispatch(&call_network, &local, &call_work, state, notify)
+            })
+            .await?;
         self.publish_changed(
             network,
             &dispatch.spec.conversation,
@@ -585,21 +674,26 @@ impl Runtime {
         work_id: &str,
         report: StartReport,
     ) -> Result<Value> {
-        let record = self
-            .store
-            .lock()
-            .await
-            .work_record(work_id)?
-            .context("work not found on this device")?;
+        let record = {
+            let call_work = work_id.to_owned();
+            self.store
+                .call("work.record", move |store| store.work_record(&call_work))
+                .await
+        }?
+        .context("work not found on this device")?;
         ensure!(
             record.conversation == scope && on_app_server(&record),
             "work belongs to another conversation"
         );
-        let execution = self
-            .store
-            .lock()
-            .await
-            .work_native_execution(network, work_id)?;
+        let execution = {
+            let call_network = network.to_owned();
+            let call_work = work_id.to_owned();
+            self.store
+                .call("work.native_execution", move |store| {
+                    store.work_native_execution(&call_network, &call_work)
+                })
+                .await
+        }?;
         if let Some(execution) = execution {
             let matches = match &report {
                 StartReport::Thread { thread_id } => thread_id == &execution.thread_id,
@@ -708,12 +802,13 @@ impl Runtime {
                 if let Err(error) = self.probe_work(network, work_id, true).await {
                     tracing::debug!(%error, work_id, "unknown start waits for the next probe");
                 }
-                record = self
-                    .store
-                    .lock()
-                    .await
-                    .work_record(work_id)?
-                    .context("work not found on this device")?;
+                record = {
+                    let call_work = work_id.to_owned();
+                    self.store
+                        .call("work.record", move |store| store.work_record(&call_work))
+                        .await
+                }?
+                .context("work not found on this device")?;
             }
         }
         Ok(json!({"work_id":work_id,"state":record.state}))
@@ -727,12 +822,13 @@ impl Runtime {
         work_id: &str,
         now: bool,
     ) -> Result<()> {
-        let record = self
-            .store
-            .lock()
-            .await
-            .work_record(work_id)?
-            .context("work not found")?;
+        let record = {
+            let call_work = work_id.to_owned();
+            self.store
+                .call("work.record", move |store| store.work_record(&call_work))
+                .await
+        }?
+        .context("work not found")?;
         if record.kind == WorkKind::Task {
             return Ok(());
         }
@@ -763,11 +859,15 @@ impl Runtime {
             state if state.thread().is_none() => return Ok(()),
             _ => self.work_executor(&record)?.probe(&record).await,
         };
-        let execution = self
-            .store
-            .lock()
-            .await
-            .work_native_execution(network, work_id)?;
+        let execution = {
+            let call_network = network.to_owned();
+            let call_work = work_id.to_owned();
+            self.store
+                .call("work.native_execution", move |store| {
+                    store.work_native_execution(&call_network, &call_work)
+                })
+                .await
+        }?;
         if let Some(execution) = execution {
             let turn = match &probe {
                 Ok(Probe::Running { turn_id, .. } | Probe::Terminal { turn_id, .. }) => {
@@ -804,7 +904,7 @@ impl Runtime {
 
     /// Settles works the Agent registered but did not finish starting within its window, reads
     /// the turns of running and unverified works about once a minute, and carries out the stops
-    /// this device holds for its own works. A probe only reads; it never starts or resends.
+    /// this device holds for its own works. A probe reads provider state and never starts or resends work.
     pub(super) async fn reconcile_works(self: &Arc<Self>, network: &str) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
         let at = now_ms();
@@ -814,23 +914,25 @@ impl Runtime {
                 .live_probe_at
                 .compare_exchange(last, at, Relaxed, Relaxed)
                 .is_ok();
-        let records = self.store.lock().await.work_records()?;
+        let records = self
+            .store
+            .call("work.reconcile_records", move |store| {
+                store.reconcile_work_records(at, read_live)
+            })
+            .await?;
         for record in records {
-            if record.kind == WorkKind::Task {
-                continue;
-            }
-            let due = match record.state {
-                WorkState::Accepted | WorkState::Starting { .. } => record.send_window_over(at),
-                WorkState::Running { .. } | WorkState::Unverified { probe: true, .. } => read_live,
-                _ => false,
-            };
-            if due && let Err(error) = self.probe_work(network, &record.work_id, false).await {
+            if let Err(error) = self.probe_work(network, &record.work_id, false).await {
                 tracing::debug!(%error, "work probe waits for its provider");
             }
         }
         let local = self.identity.device_id()?;
-        let stops = self.store.lock().await.stop_requests()?;
-        for request in stops.into_iter().filter(|request| request.target == local) {
+        let stops = self
+            .store
+            .call("work.local_stops", move |store| {
+                store.stop_requests_for_target(&local)
+            })
+            .await?;
+        for request in stops {
             let work_id = request.work_id.clone();
             if let Err(error) = self.reconcile_stop(network, request).await {
                 tracing::debug!(%error, work_id, "stop waits for its provider");
@@ -842,13 +944,14 @@ impl Runtime {
     /// Whether the user stopped this device's work and the work has not ended yet.
     async fn waiting_stop(&self, work_id: &str) -> Result<bool> {
         let local = self.identity.device_id()?;
-        Ok(self
-            .store
-            .lock()
+        let work_id = work_id.to_owned();
+        self.store
+            .call("work.waiting_stop", move |store| {
+                Ok(store
+                    .stop_request(&work_id)?
+                    .is_some_and(|request| request.target == local))
+            })
             .await
-            .stop_requests()?
-            .iter()
-            .any(|request| request.work_id == work_id && request.target == local))
     }
 
     /// Takes a turn at a held stop: true when one is due, and the next then waits 3 s, 6 s, …
@@ -872,20 +975,21 @@ impl Runtime {
             .await
             .write_owned()
             .await;
-        let mut store = self.store.lock().await;
-        if store
-            .stop_requests()?
-            .iter()
-            .any(|held| held.work_id == request.work_id)
-        {
-            return Ok(false);
-        }
-        store.save_stop_request(request)?;
-        Ok(true)
+        let request = request.clone();
+        self.store
+            .call("work.hold_stop", move |store| {
+                store.hold_stop_request(&request)
+            })
+            .await
     }
 
     async fn drop_stop(&self, work_id: &str) -> Result<()> {
-        self.store.lock().await.forget_stop_request(work_id)?;
+        let call_work = work_id.to_owned();
+        self.store
+            .call("work.forget_stop", move |store| {
+                store.forget_stop_request(&call_work)
+            })
+            .await?;
         self.stop_retries
             .lock()
             .expect("stop retries")
@@ -907,22 +1011,22 @@ impl Runtime {
             .lock()
             .expect("stop retries")
             .remove(work_id);
-        {
-            let mut store = self.store.lock().await;
-            // A turn that outlived an interrupt the provider took is still being stopped.
-            let again = store
-                .work_record(work_id)?
-                .is_some_and(|record| matches!(record.state, WorkState::Interrupting { .. }));
-            if let Some(mut request) = store
-                .stop_requests()?
-                .into_iter()
-                .find(|request| request.work_id == work_id)
-            {
-                request.deadline_ms = now_ms() + INTERRUPT_TIMEOUT.as_millis() as i64;
-                request.timed_out = again;
-                store.save_stop_request(&request)?;
-            }
-        }
+        let call_work = work_id.to_owned();
+        self.store
+            .call("work.interrupt_deadline", move |store| {
+                let work_id = call_work.as_str();
+                // A turn that outlived an interrupt the provider took is still being stopped.
+                let again = store
+                    .work_record(work_id)?
+                    .is_some_and(|record| matches!(record.state, WorkState::Interrupting { .. }));
+                if let Some(mut request) = store.stop_request(work_id)? {
+                    request.deadline_ms = now_ms() + INTERRUPT_TIMEOUT.as_millis() as i64;
+                    request.timed_out = again;
+                    store.save_stop_request(&request)?;
+                }
+                Ok(())
+            })
+            .await?;
         self.signal_work(network, work_id, Signal::InterruptRequested)
             .await
     }
@@ -937,7 +1041,12 @@ impl Runtime {
         mut request: StopRequest,
     ) -> Result<()> {
         let work_id = request.work_id.clone();
-        let record = self.store.lock().await.work_record(&work_id)?;
+        let record = {
+            let call_work = work_id.to_owned();
+            self.store
+                .call("work.record", move |store| store.work_record(&call_work))
+                .await
+        }?;
         let Some(record) = record.filter(live) else {
             self.drop_stop(&work_id).await?;
             self.publish_changed(network, &request.conversation, Changed::Work(&work_id));
@@ -959,7 +1068,12 @@ impl Runtime {
         let at = now_ms();
         if !request.timed_out && at >= request.deadline_ms {
             request.timed_out = true;
-            self.store.lock().await.save_stop_request(&request)?;
+            let held = request.clone();
+            self.store
+                .call("work.update_stop", move |store| {
+                    store.save_stop_request(&held)
+                })
+                .await?;
             self.publish_changed(network, &request.conversation, Changed::Work(&work_id));
         }
         let interrupting = matches!(record.state, WorkState::Interrupting { .. });
@@ -996,22 +1110,32 @@ impl Runtime {
         network: &str,
         work_id: &str,
     ) -> Result<Value> {
-        let record = self
-            .store
-            .lock()
-            .await
-            .work_record(work_id)?
-            .context("work not found")?;
+        let record = {
+            let call_work = work_id.to_owned();
+            self.store
+                .call("work.record", move |store| store.work_record(&call_work))
+                .await
+        }?
+        .context("work not found")?;
         let mut waiting_for_start = false;
         let mut retrying = false;
         match &record.state {
             WorkState::Accepted if record.kind == WorkKind::Task => {
-                let job = self.store.lock().await.request_manager_cancel(
-                    &self.identity,
-                    network,
-                    &record.conversation,
-                    &task_trigger(work_id),
-                )?;
+                let identity = self.identity.clone();
+                let call_network = network.to_owned();
+                let conversation = record.conversation.clone();
+                let trigger = task_trigger(work_id);
+                let job = self
+                    .store
+                    .call("work.cancel_task", move |store| {
+                        store.request_manager_cancel(
+                            &identity,
+                            &call_network,
+                            &conversation,
+                            &trigger,
+                        )
+                    })
+                    .await?;
                 if let Some(crate::scheduling::JobState::Cancelling { attempt }) =
                     job.map(|job| job.state)
                 {
@@ -1058,20 +1182,27 @@ impl Runtime {
             }
             _ => {}
         }
-        let children = {
-            let store = self.store.lock().await;
-            let mut children = Vec::new();
-            for work in store.works(network, &record.conversation)? {
-                if work.parent.as_deref() == Some(work_id)
-                    && store
-                        .work_record(&work.work_id)?
-                        .is_some_and(|child| live(&child))
-                {
-                    children.push(work.work_id);
+        let call_network = network.to_owned();
+        let conversation = record.conversation.clone();
+        let call_work = work_id.to_owned();
+        let children = self
+            .store
+            .call("work.children", move |store| {
+                let network = call_network.as_str();
+                let work_id = call_work.as_str();
+                let mut children = Vec::new();
+                for work in store.works(network, &conversation)? {
+                    if work.parent.as_deref() == Some(work_id)
+                        && store
+                            .work_record(&work.work_id)?
+                            .is_some_and(|child| live(&child))
+                    {
+                        children.push(work.work_id);
+                    }
                 }
-            }
-            children
-        };
+                Ok(children)
+            })
+            .await?;
         for child in children {
             Box::pin(self.interrupt_work(network, &child)).await?;
         }
@@ -1088,23 +1219,27 @@ impl Runtime {
         scope: &str,
         work_id: &str,
     ) -> Result<Value> {
-        let target = {
-            let store = self.store.lock().await;
-            let work_target = store
-                .works(network, scope)?
-                .into_iter()
-                .find(|work| work.work_id == work_id)
-                .map(|work| work.target_node);
-            work_target
-                .or(store
-                    .dispatch(work_id)?
-                    .filter(|dispatch| {
-                        dispatch.spec.conversation == scope
-                            && dispatch.state == DispatchState::Pending
-                    })
-                    .map(|dispatch| dispatch.spec.target))
-                .context("work not found in this conversation")?
-        };
+        let call_network = network.to_owned();
+        let call_scope = scope.to_owned();
+        let call_work = work_id.to_owned();
+        let target = self
+            .store
+            .call("work.stop_target", move |store| {
+                let work_target = store
+                    .work(&call_network, &call_work)?
+                    .filter(|work| work.conversation_id == call_scope)
+                    .map(|work| work.target_node);
+                work_target
+                    .or(store
+                        .dispatch(&call_work)?
+                        .filter(|dispatch| {
+                            dispatch.spec.conversation == call_scope
+                                && dispatch.state == DispatchState::Pending
+                        })
+                        .map(|dispatch| dispatch.spec.target))
+                    .context("work not found in this conversation")
+            })
+            .await?;
         if target == self.identity.device_id()? {
             return self.interrupt_work(network, work_id).await;
         }
@@ -1139,11 +1274,14 @@ impl Runtime {
     }
 
     async fn deliver_stop(&self, network: &str, request: &StopRequest) -> Result<Value> {
+        let call_network = network.to_owned();
+        let held = request.clone();
         let command = self
             .store
-            .lock()
-            .await
-            .peer_stop_command(network, request)?;
+            .call("work.stop_command", move |store| {
+                store.peer_stop_command(&call_network, &held)
+            })
+            .await?;
         let command_id = command.envelope.command_id.clone();
         let reply = self
             .peer_request(
@@ -1169,11 +1307,13 @@ impl Runtime {
 
     /// Retries waiting dispatches and the stops held for other devices' works.
     pub(super) async fn deliver_work_requests(self: &Arc<Self>, network: &str) -> Result<()> {
-        let dispatches = self.store.lock().await.dispatches()?;
-        for dispatch in dispatches
-            .into_iter()
-            .filter(|dispatch| dispatch.state == DispatchState::Pending)
-        {
+        let dispatches = self
+            .store
+            .call("work.pending_dispatches", |store| {
+                store.pending_dispatches()
+            })
+            .await?;
+        for dispatch in dispatches {
             let lane = format!("dispatch_worker:{network}:{}", dispatch.spec.work_id);
             let Some(guard) = self.peer_delivery_locks.try_lock(&lane) else {
                 continue;
@@ -1191,7 +1331,10 @@ impl Runtime {
             });
         }
         let local = self.identity.device_id()?;
-        let stops = self.store.lock().await.stop_requests()?;
+        let stops = self
+            .store
+            .call("work.remote_stops", |store| store.stop_requests())
+            .await?;
         for request in stops.into_iter().filter(|request| request.target != local) {
             let lane = format!("stop_worker:{network}:{}", request.work_id);
             let Some(guard) = self.peer_delivery_locks.try_lock(&lane) else {
@@ -1217,19 +1360,27 @@ impl Runtime {
         mut request: StopRequest,
     ) -> Result<()> {
         let work_id = request.work_id.clone();
-        let ended = {
-            let store = self.store.lock().await;
-            store
-                .works(network, &request.conversation)?
-                .iter()
-                .any(|work| work.work_id == work_id && work.outcome.is_some())
-                || store
-                    .dispatch(&work_id)?
-                    .is_some_and(|dispatch| dispatch.state.ended())
-        };
+        let call_network = network.to_owned();
+        let conversation = request.conversation.clone();
+        let call_work = work_id.clone();
+        let ended = self
+            .store
+            .call("work.stop_ended", move |store| {
+                Ok(store.work(&call_network, &call_work)?.is_some_and(|work| {
+                    work.conversation_id == conversation && work.outcome.is_some()
+                }) || store
+                    .dispatch(&call_work)?
+                    .is_some_and(|dispatch| dispatch.state.ended()))
+            })
+            .await?;
         if !ended && !request.timed_out && now_ms() >= request.deadline_ms {
             request.timed_out = true;
-            self.store.lock().await.save_stop_request(&request)?;
+            let held = request.clone();
+            self.store
+                .call("work.update_stop", move |store| {
+                    store.save_stop_request(&held)
+                })
+                .await?;
             self.publish_changed(network, &request.conversation, Changed::Work(&work_id));
         }
         if !ended {
@@ -1255,17 +1406,27 @@ impl Runtime {
     /// leaves the running works waiting for that read.
     async fn on_connection(self: &Arc<Self>, connected: bool) -> Result<()> {
         if connected {
-            let epoch = self.store.lock().await.next_codex_epoch();
+            let epoch = self
+                .store
+                .call("work.codex_epoch", |store| store.next_codex_epoch())
+                .await;
             self.codex
                 .connected(*epoch.as_ref().unwrap_or(&self.codex.epoch()));
             epoch?;
         } else {
             self.drop_codex_requests().await?;
         }
-        let Some(network) = self.store.lock().await.network()? else {
+        let Some(network) = self
+            .store
+            .call("work.network", |store| store.network())
+            .await?
+        else {
             return Ok(());
         };
-        let records = self.store.lock().await.work_records()?;
+        let records = self
+            .store
+            .call("work.records", |store| store.open_work_records())
+            .await?;
         for record in records
             .into_iter()
             .filter(|record| live(record) && on_app_server(record))
@@ -1288,7 +1449,13 @@ impl Runtime {
         let Some(thread) = turn.thread else {
             return Ok(());
         };
-        let records = self.store.lock().await.work_records_on_thread(thread)?;
+        let call_thread = thread.to_owned();
+        let records = self
+            .store
+            .call("work.records_on_thread", move |store| {
+                store.work_records_on_thread(&call_thread)
+            })
+            .await?;
         // A turn on the thread of a send not seen in time may be that send; reading the thread
         // tells, and settles the work if so.
         if turn.boundary {
@@ -1337,7 +1504,7 @@ impl Runtime {
         Ok(())
     }
 
-    pub(super) fn start_codex(self: &Arc<Self>, mut events: mpsc::UnboundedReceiver<ExecEvent>) {
+    pub(super) fn start_codex(self: &Arc<Self>, mut events: vibeface_bridge::codex::EventReceiver) {
         let node = self.clone();
         if let Err(error) = self.background_tasks.spawn(async move {
             // Known before the first connect, so requests on these threads come back to the Node
@@ -1355,7 +1522,7 @@ impl Runtime {
                     ExecEvent::Disconnected => node.on_connection(false).await,
                     ExecEvent::Message(message) => {
                         node.triage_app_server(&message);
-                        let network = node.store.lock().await.network();
+                        let network = node.store.call("work.network", |store| store.network()).await;
                         match network {
                             Ok(Some(network)) => node.route_turn_event(&network, message).await,
                             other => other.map(|_| ()),

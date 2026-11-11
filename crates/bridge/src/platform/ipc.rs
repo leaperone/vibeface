@@ -6,7 +6,7 @@
 //! account behind every client by impersonating it. Neither family listens on a network
 //! socket, so nothing here is reachable from another machine or another account.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use std::{
     path::{Path, PathBuf},
     pin::Pin,
@@ -123,7 +123,7 @@ impl Endpoint {
         match &self.address {
             WindowsAddress::Pipe(name) => Ok(name),
             WindowsAddress::CodexSocket => {
-                bail!("the Node's control listener requires a named pipe")
+                anyhow::bail!("the Node's control listener requires a named pipe")
             }
         }
     }
@@ -634,9 +634,5 @@ pub fn runtime_dir(key: &str) -> Result<PathBuf> {
     let base = PathBuf::from("/tmp");
     #[cfg(windows)]
     let base = std::env::temp_dir();
-    let directory = base.join(format!("vibeface-{key}"));
-    if directory.as_os_str().is_empty() {
-        bail!("this account has no usable temporary directory");
-    }
-    Ok(directory)
+    Ok(base.join(format!("vibeface-{key}")))
 }

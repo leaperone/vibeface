@@ -1,22 +1,21 @@
 //! The AI providers this Node runs locally, what a bot on each can do, and the variables each
-//! provider's processes get. The bot's provider and which providers execute work live in `config.json`;
-//! the variables are model keys, so they stay in one private file of the data directory and
+//! provider's processes get. Provider configuration and model keys live in one private `config.json`
+//! snapshot in the data directory and
 //! never reach events, logs or the web, which only learns which names are set.
 use crate::scheduling::TriggerKind;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
-use vibeface_bridge::agent::CustomToolConfig;
+use vibeface_bridge::agent::{CURSOR_AUTH_OVERRIDES, CustomToolConfig, is_cursor_sdk_bridge};
 
 mod login;
 pub use login::AuthenticationSource;
 pub use login::ExternalCodexLogin;
 
-pub const ENV_FILE: &str = "provider-env.json";
 const MAX_VARIABLES: usize = 64;
 
 /// A coding agent product: what a bot runs on, what dispatched work runs on, or whose session
@@ -560,91 +559,43 @@ pub struct ProviderDescriptor {
 
 impl ProviderDescriptor {
     pub fn for_provider(provider: Provider) -> Self {
-        let (
-            sessions,
-            prompt_mode,
-            stable_prompt,
-            skill_injection,
-            sandbox,
-            steer,
-            concurrency,
-            model_catalog,
-            text_stream_mode,
-            cancel_confirmation_evidence,
-        ) = match provider {
-            Provider::Codex => (
-                SessionPersistence::AppServer,
-                PromptMode::Thread,
-                StablePromptPlacement::ThreadInstructions,
-                SkillInjection::Folder,
-                SandboxMode::FullAccess,
-                true,
-                ConcurrencyMode::Parallel,
-                CapabilitySupport::Supported,
-                TextStreamMode::Snapshot,
-                CancelEvidence::AppServerTurnEnd,
-            ),
-            Provider::Cursor => (
-                SessionPersistence::Process,
-                PromptMode::Turn,
-                StablePromptPlacement::TurnInstructions,
-                SkillInjection::Folder,
-                SandboxMode::ProviderControlled,
-                false,
-                ConcurrencyMode::Serial,
-                CapabilitySupport::Supported,
-                TextStreamMode::DeltaAndSnapshot,
-                CancelEvidence::ProviderTerminal,
-            ),
-            Provider::Claude => (
-                SessionPersistence::Process,
-                PromptMode::Thread,
-                StablePromptPlacement::SessionInstructions,
-                SkillInjection::Plugin,
-                SandboxMode::ProviderControlled,
-                true,
-                ConcurrencyMode::Serial,
-                CapabilitySupport::Unsupported,
-                TextStreamMode::Snapshot,
-                CancelEvidence::ProviderTerminalOrManagedProcessExit,
-            ),
-            Provider::Pi => (
-                SessionPersistence::Process,
-                PromptMode::Thread,
-                StablePromptPlacement::SessionInstructions,
-                SkillInjection::Folder,
-                SandboxMode::ProviderControlled,
-                true,
-                ConcurrencyMode::Serial,
-                CapabilitySupport::Unsupported,
-                TextStreamMode::DeltaAndSnapshot,
-                CancelEvidence::ProviderTerminalOrManagedProcessExit,
-            ),
-            Provider::Opencode => (
-                SessionPersistence::ProviderStore,
-                PromptMode::Thread,
-                StablePromptPlacement::UserTurnPrefix,
-                SkillInjection::PromptIndex,
-                SandboxMode::ProviderControlled,
-                true,
-                ConcurrencyMode::Serial,
-                CapabilitySupport::Unsupported,
-                TextStreamMode::DeltaAndSnapshot,
-                CancelEvidence::ProviderTerminalOrManagedProcessExit,
-            ),
-        };
         Self {
             provider,
-            sessions,
-            prompt_mode,
-            stable_prompt,
+            sessions: match provider.sessions() {
+                Sessions::AppServer => SessionPersistence::AppServer,
+                Sessions::Store(_) => SessionPersistence::ProviderStore,
+                Sessions::Process => SessionPersistence::Process,
+            },
+            prompt_mode: if provider == Provider::Cursor {
+                PromptMode::Turn
+            } else {
+                PromptMode::Thread
+            },
+            stable_prompt: match provider {
+                Provider::Codex => StablePromptPlacement::ThreadInstructions,
+                Provider::Cursor => StablePromptPlacement::TurnInstructions,
+                Provider::Claude | Provider::Pi => StablePromptPlacement::SessionInstructions,
+                Provider::Opencode => StablePromptPlacement::UserTurnPrefix,
+            },
             dynamic_context: DynamicContextPlacement::UserTurn,
             tool_mode: ToolMode::DynamicCatalog,
-            skill_injection,
+            skill_injection: match provider {
+                Provider::Codex | Provider::Cursor | Provider::Pi => SkillInjection::Folder,
+                Provider::Claude => SkillInjection::Plugin,
+                Provider::Opencode => SkillInjection::PromptIndex,
+            },
             workspace_required: true,
-            sandbox,
-            steer,
-            concurrency,
+            sandbox: if provider == Provider::Codex {
+                SandboxMode::FullAccess
+            } else {
+                SandboxMode::ProviderControlled
+            },
+            steer: provider != Provider::Cursor,
+            concurrency: if provider == Provider::Codex {
+                ConcurrencyMode::Parallel
+            } else {
+                ConcurrencyMode::Serial
+            },
             compaction: CompactionMode::Handoff,
             usage: if provider == Provider::Cursor {
                 CapabilitySupport::Supported
@@ -652,12 +603,26 @@ impl ProviderDescriptor {
                 CapabilitySupport::Unsupported
             },
             approvals: CapabilitySupport::Unsupported,
-            model_catalog,
+            model_catalog: if matches!(provider, Provider::Codex | Provider::Cursor) {
+                CapabilitySupport::Supported
+            } else {
+                CapabilitySupport::Unsupported
+            },
             streaming: true,
             cancel: true,
             resume_local_session: true,
-            text_stream_mode,
-            cancel_confirmation_evidence,
+            text_stream_mode: if matches!(provider, Provider::Codex | Provider::Claude) {
+                TextStreamMode::Snapshot
+            } else {
+                TextStreamMode::DeltaAndSnapshot
+            },
+            cancel_confirmation_evidence: match provider {
+                Provider::Codex => CancelEvidence::AppServerTurnEnd,
+                Provider::Cursor => CancelEvidence::ProviderTerminal,
+                Provider::Claude | Provider::Pi | Provider::Opencode => {
+                    CancelEvidence::ProviderTerminalOrManagedProcessExit
+                }
+            },
         }
     }
 
@@ -714,11 +679,8 @@ impl Provider {
     /// The program the Node runs for this provider unless the owner or discovery chose one.
     pub fn default_bin(self) -> &'static str {
         match self {
-            Provider::Codex => "codex",
             Provider::Cursor => "agent",
-            Provider::Claude => "claude",
-            Provider::Pi => "pi",
-            Provider::Opencode => "opencode",
+            Provider::Codex | Provider::Claude | Provider::Pi | Provider::Opencode => self.name(),
         }
     }
 
@@ -786,32 +748,10 @@ impl Provider {
 
     /// What a work on the provider can ask for.
     pub fn work(self) -> WorkCapabilities {
-        match self {
-            Provider::Codex => WorkCapabilities {
-                images: true,
-                effort: true,
-                any_thread: true,
-            },
-            Provider::Claude => WorkCapabilities {
-                images: false,
-                effort: true,
-                any_thread: false,
-            },
-            Provider::Pi => WorkCapabilities {
-                images: true,
-                effort: true,
-                any_thread: false,
-            },
-            Provider::Opencode => WorkCapabilities {
-                images: true,
-                effort: false,
-                any_thread: false,
-            },
-            Provider::Cursor => WorkCapabilities {
-                images: false,
-                effort: false,
-                any_thread: false,
-            },
+        WorkCapabilities {
+            images: matches!(self, Provider::Codex | Provider::Pi | Provider::Opencode),
+            effort: matches!(self, Provider::Codex | Provider::Claude | Provider::Pi),
+            any_thread: self == Provider::Codex,
         }
     }
 
@@ -877,10 +817,6 @@ impl Provider {
 
     pub fn prompt_mode(self) -> PromptMode {
         self.descriptor().prompt_mode
-    }
-
-    pub fn native_compaction(self) -> bool {
-        matches!(self, Provider::Codex | Provider::Claude | Provider::Pi)
     }
 
     /// Name prefixes of the variables the Node sets itself for this provider's processes.
@@ -957,6 +893,93 @@ pub struct Providers {
     pub execution_models: BTreeMap<Provider, String>,
     #[serde(default)]
     pub codex_app_server: AppServer,
+    /// A model service the Node-owned opencode reaches instead of an opencode account. Its
+    /// token is the private opencode variable `OPENCODE_ENDPOINT_API_KEY`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_endpoint: Option<OpencodeEndpoint>,
+}
+
+/// The API an opencode custom endpoint speaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointProtocol {
+    OpenaiCompatible,
+    Anthropic,
+    Openai,
+}
+
+impl EndpointProtocol {
+    /// The AI SDK package opencode loads for the protocol.
+    fn npm(self) -> &'static str {
+        match self {
+            EndpointProtocol::OpenaiCompatible => "@ai-sdk/openai-compatible",
+            EndpointProtocol::Anthropic => "@ai-sdk/anthropic",
+            EndpointProtocol::Openai => "@ai-sdk/openai",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpencodeEndpoint {
+    pub protocol: EndpointProtocol,
+    pub base_url: String,
+    pub models: Vec<String>,
+}
+
+pub const OPENCODE_ENDPOINT_KEY: &str = "OPENCODE_ENDPOINT_API_KEY";
+const ENDPOINT_NO_TOKEN: &str = "no-token";
+
+impl OpencodeEndpoint {
+    // opencode expands `{env:..}` and `{file:..}` anywhere in its config, so braces are refused.
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.base_url.len() <= 2048
+                && !self.base_url.contains(['{', '}'])
+                && reqwest::Url::parse(&self.base_url).is_ok_and(|url| {
+                    matches!(url.scheme(), "http" | "https")
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                }),
+            "the endpoint base URL must be an http or https URL without credentials or braces"
+        );
+        ensure!(
+            (1..=64).contains(&self.models.len()),
+            "an endpoint lists 1 to 64 models"
+        );
+        let mut seen = BTreeSet::new();
+        for model in &self.models {
+            ensure!(!model.is_empty(), "an endpoint model needs a name");
+            ensure!(
+                !model.contains(['{', '}']),
+                "endpoint model {model} has braces"
+            );
+            crate::model::validate_model(model)?;
+            ensure!(seen.insert(model), "endpoint model {model} is listed twice");
+        }
+        Ok(())
+    }
+
+    /// opencode configuration declaring the endpoint as provider `custom`. The token stays in
+    /// its variable. Without one, apiKey is a fixed non-secret value: left out or empty, the
+    /// adapters fall back to the host's `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` and would send
+    /// that key to the endpoint.
+    fn config_content(&self, has_key: bool) -> String {
+        let api_key = if has_key {
+            format!("{{env:{OPENCODE_ENDPOINT_KEY}}}")
+        } else {
+            ENDPOINT_NO_TOKEN.to_owned()
+        };
+        let options = json!({"baseURL":self.base_url,"apiKey":api_key});
+        let models: serde_json::Map<String, Value> = self
+            .models
+            .iter()
+            .map(|model| (model.clone(), json!({})))
+            .collect();
+        json!({"provider":{"custom":{"npm":self.protocol.npm(),"name":"Custom endpoint",
+            "options":options,"models":models}}})
+        .to_string()
+    }
 }
 
 impl Providers {
@@ -998,6 +1021,9 @@ impl Providers {
                 "the App Server socket must be an absolute path"
             );
         }
+        if let Some(endpoint) = &self.opencode_endpoint {
+            endpoint.validate()?;
+        }
         Ok(())
     }
 
@@ -1027,25 +1053,20 @@ pub struct ProviderEnv(BTreeMap<Provider, BTreeMap<String, String>>);
 static NO_VARIABLES: BTreeMap<String, String> = BTreeMap::new();
 
 impl ProviderEnv {
-    pub fn load(dir: &Path) -> Result<Self> {
-        let env: Self = match std::fs::read(dir.join(ENV_FILE)) {
-            Ok(bytes) => serde_json::from_slice(&bytes).context("invalid provider environment")?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(error) => return Err(error.into()),
-        };
-        for (provider, variables) in &env.0 {
+    pub(crate) fn remove_cursor_auth_overrides(&mut self) {
+        if let Some(cursor) = self.0.get_mut(&Provider::Cursor) {
+            cursor.retain(|name, _| !CURSOR_AUTH_OVERRIDES.contains(&name.as_str()));
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        for (provider, variables) in &self.0 {
             for (name, value) in variables {
                 validate(*provider, name, value)?;
                 crate::logging::add_private_path(std::path::Path::new(value));
             }
         }
-        env.hide_values();
-        Ok(env)
-    }
-
-    pub fn save(&self, dir: &Path) -> Result<()> {
         self.hide_values();
-        crate::config::private_write(&dir.join(ENV_FILE), &serde_json::to_vec(self)?)?;
         Ok(())
     }
 
@@ -1107,6 +1128,10 @@ pub(crate) fn validate_env_name(name: &str) -> Result<()> {
 fn validate(provider: Provider, name: &str, value: &str) -> Result<()> {
     validate_env_name(name)?;
     ensure!(
+        provider != Provider::Cursor || !CURSOR_AUTH_OVERRIDES.contains(&name),
+        "Cursor uses the official CLI subscription login; authentication overrides are unsupported"
+    );
+    ensure!(
         !name.starts_with("VIBEFACE_")
             && !provider
                 .reserved_env()
@@ -1117,6 +1142,14 @@ fn validate(provider: Provider, name: &str, value: &str) -> Result<()> {
     ensure!(
         !value.is_empty() && value.len() <= 4096 && !value.contains('\0'),
         "a variable value must be 1 to 4096 characters"
+    );
+    // opencode substitutes the token into JSON text unescaped, then expands `{file:..}` in it.
+    ensure!(
+        name != OPENCODE_ENDPOINT_KEY
+            || !value.chars().any(|c| {
+                matches!(c, '"' | '\\' | '{' | '}') || c.is_whitespace() || c.is_control()
+            }),
+        "the endpoint token cannot contain quotes, backslashes, braces or whitespace"
     );
     Ok(())
 }
@@ -1313,6 +1346,7 @@ impl Local {
     pub fn bin(&self, provider: Provider) -> PathBuf {
         self.bins
             .get(&provider)
+            .filter(|bin| provider != Provider::Cursor || !is_cursor_sdk_bridge(bin))
             .cloned()
             .unwrap_or_else(|| provider.default_bin().into())
     }
@@ -1329,25 +1363,14 @@ impl Local {
         host: &crate::discovery::Host,
     ) -> BTreeMap<String, String> {
         let mut env = self.env.get(provider).clone();
-        if provider == Provider::Cursor && !cfg!(test) {
-            if !["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"]
-                .iter()
-                .any(|name| env.contains_key(*name))
-            {
-                for name in ["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"] {
-                    if let Ok(value) = std::env::var(name)
-                        && !value.is_empty()
-                    {
-                        env.insert(name.into(), value);
-                    }
-                }
-            }
-            if !env.contains_key("AGENT_CLI_CREDENTIAL_STORE")
-                && let Ok(value) = std::env::var("AGENT_CLI_CREDENTIAL_STORE")
-                && !value.is_empty()
-            {
-                env.insert("AGENT_CLI_CREDENTIAL_STORE".into(), value);
-            }
+        if provider == Provider::Cursor {
+            env.retain(|name, _| !CURSOR_AUTH_OVERRIDES.contains(&name.as_str()));
+        }
+        if provider == Provider::Opencode
+            && let Some(endpoint) = &self.switches.opencode_endpoint
+        {
+            let content = endpoint.config_content(env.contains_key(OPENCODE_ENDPOINT_KEY));
+            env.insert("OPENCODE_CONFIG_CONTENT".into(), content);
         }
         let path = env
             .get("PATH")
@@ -1435,6 +1458,7 @@ impl Local {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
 
     #[test]
     fn local_cli_logins_update_only_owned_access_snapshots_and_do_not_import_sessions() -> Result<()>
@@ -1697,19 +1721,25 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("vibeface-provider-env-{}", uuid::Uuid::new_v4()));
         crate::config::private_dir(&dir)?;
-        let mut env = ProviderEnv::load(&dir)?;
+        let mut env = ProviderEnv::default();
         env.apply(
             Provider::Codex,
             BTreeMap::from([("CPA_API_KEY".into(), Some("fixture-codex-value".into()))]),
         )?;
         env.apply(
             Provider::Cursor,
-            BTreeMap::from([("CURSOR_API_KEY".into(), Some("fixture-cursor-value".into()))]),
+            BTreeMap::from([(
+                "FIXTURE_CURSOR_KEY".into(),
+                Some("fixture-cursor-value".into()),
+            )]),
         )?;
         for (provider, name) in [
             (Provider::Codex, "VIBEFACE_DATA_DIR"),
             (Provider::Cursor, "CURSOR_CONFIG_DIR"),
             (Provider::Cursor, "CURSOR_DATA_DIR"),
+            (Provider::Cursor, "CURSOR_API_KEY"),
+            (Provider::Cursor, "CURSOR_AUTH_TOKEN"),
+            (Provider::Cursor, "AGENT_CLI_CREDENTIAL_STORE"),
             (Provider::Codex, "1KEY"),
             (Provider::Codex, "A-B"),
         ] {
@@ -1723,16 +1753,22 @@ mod tests {
                 "{name}"
             );
         }
-        env.save(&dir)?;
+        let mut configuration = crate::config::Config::local("127.0.0.1:0".parse()?, vec![], false);
+        configuration.provider_env = env;
+        configuration.save(&dir)?;
         vibeface_bridge::platform::privatefs::ensure_private(
-            &dir.join(ENV_FILE),
-            "the saved provider environment",
+            &dir.join("config.json"),
+            "the saved private configuration",
         )?;
-        let loaded = ProviderEnv::load(&dir)?;
+        let loaded = crate::config::Config::load(&dir)?.provider_env;
         assert!(!loaded.get(Provider::Cursor).contains_key("CPA_API_KEY"));
-        assert!(!loaded.get(Provider::Codex).contains_key("CURSOR_API_KEY"));
+        assert!(
+            !loaded
+                .get(Provider::Codex)
+                .contains_key("FIXTURE_CURSOR_KEY")
+        );
         assert_eq!(
-            loaded.get(Provider::Cursor)["CURSOR_API_KEY"],
+            loaded.get(Provider::Cursor)["FIXTURE_CURSOR_KEY"],
             "fixture-cursor-value"
         );
         let mut removed = loaded.clone();
@@ -1741,6 +1777,25 @@ mod tests {
             BTreeMap::from([("CPA_API_KEY".into(), None)]),
         )?;
         assert!(removed.get(Provider::Codex).is_empty());
+        let mut historical = serde_json::to_value(&configuration)?;
+        for name in CURSOR_AUTH_OVERRIDES {
+            historical["provider_env"]["cursor"][name] = json!("synthetic-unused-auth");
+        }
+        crate::config::private_write(&dir.join("config.json"), &serde_json::to_vec(&historical)?)?;
+        let loaded = crate::config::Config::load(&dir)?.provider_env;
+        let local = Local {
+            switches: Providers::default(),
+            bins: BTreeMap::new(),
+            env: loaded,
+        };
+        assert_eq!(
+            ProviderRoots::new(&dir).authentication_source(Provider::Cursor, &local),
+            AuthenticationSource::LocalCliLogin
+        );
+        for name in CURSOR_AUTH_OVERRIDES {
+            assert!(!local.env.get(Provider::Cursor).contains_key(name));
+            assert!(!local.launch_env(Provider::Cursor).contains_key(name));
+        }
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -2194,8 +2249,10 @@ requires_openai_auth = false
             BTreeMap::from([("ANTHROPIC_API_KEY".into(), Some("fixture-auth".into()))]),
         )?;
         roots.apply(&mut local)?;
-        local.env.save(&dir)?;
-        let loaded = ProviderEnv::load(&dir)?;
+        let mut configuration = crate::config::Config::local("127.0.0.1:0".parse()?, vec![], false);
+        configuration.provider_env = local.env;
+        configuration.save(&dir)?;
+        let loaded = crate::config::Config::load(&dir)?.provider_env;
         for provider in Provider::ALL {
             for (name, value) in roots.env(provider) {
                 assert_eq!(loaded.get(provider).get(&name), Some(&value));
@@ -2384,6 +2441,72 @@ requires_openai_auth = false
         assert_eq!(local.bin(Provider::Opencode), PathBuf::from("opencode"));
         assert_eq!(local.bin(Provider::Cursor), PathBuf::from("agent"));
         assert!(local.launches(Provider::Claude) && local.launches(Provider::Codex));
+        Ok(())
+    }
+
+    #[test]
+    fn opencode_endpoint_reaches_launch_as_a_custom_provider() -> Result<()> {
+        let mut local = Local {
+            switches: serde_json::from_value(json!({"execution":[],"opencode_endpoint":{
+                "protocol":"anthropic","base_url":"https://api.example.test/v1",
+                "models":["model-a","model-b"]}}))?,
+            bins: Default::default(),
+            env: Default::default(),
+        };
+        local.validate(false)?;
+        let content = |local: &Local| -> Result<Value> {
+            let env = local.launch_env(Provider::Opencode);
+            Ok(serde_json::from_str(
+                env.get("OPENCODE_CONFIG_CONTENT")
+                    .map(String::as_str)
+                    .unwrap_or("null"),
+            )?)
+        };
+        assert_eq!(
+            content(&local)?,
+            json!({"provider":{"custom":{"npm":"@ai-sdk/anthropic","name":"Custom endpoint",
+                "options":{"baseURL":"https://api.example.test/v1","apiKey":"no-token"},
+                "models":{"model-a":{},"model-b":{}}}}})
+        );
+        for token in ["has space", "quo\"te", "back\\slash", "{file:~/.ssh/id}"] {
+            assert!(
+                local
+                    .env
+                    .apply(
+                        Provider::Opencode,
+                        [(OPENCODE_ENDPOINT_KEY.into(), Some(token.into()))].into(),
+                    )
+                    .is_err()
+            );
+        }
+        local.env.apply(
+            Provider::Opencode,
+            [(OPENCODE_ENDPOINT_KEY.into(), Some("fixture-token".into()))].into(),
+        )?;
+        let with_key = content(&local)?;
+        assert_eq!(
+            with_key["provider"]["custom"]["options"]["apiKey"],
+            "{env:OPENCODE_ENDPOINT_API_KEY}"
+        );
+        assert!(!with_key.to_string().contains("fixture-token"));
+        assert!(
+            !local
+                .launch_env(Provider::Codex)
+                .contains_key("OPENCODE_CONFIG_CONTENT")
+        );
+        local.switches.opencode_endpoint = None;
+        assert_eq!(content(&local)?, Value::Null);
+        for invalid in [
+            json!({"protocol":"openai","base_url":"ftp://example.test","models":["m"]}),
+            json!({"protocol":"openai","base_url":"https://example.test","models":[]}),
+            json!({"protocol":"openai","base_url":"https://example.test","models":["m","m"]}),
+            json!({"protocol":"openai","base_url":"https://u:p@example.test","models":["m"]}),
+            json!({"protocol":"openai","base_url":"https://example.test/{file:~/.ssh/id}","models":["m"]}),
+            json!({"protocol":"openai","base_url":"https://example.test","models":["{env:HOME}"]}),
+        ] {
+            local.switches.opencode_endpoint = Some(serde_json::from_value(invalid)?);
+            assert!(local.validate(false).is_err());
+        }
         Ok(())
     }
 

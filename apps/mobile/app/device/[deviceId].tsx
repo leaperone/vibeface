@@ -24,7 +24,7 @@ export default function DeviceDetail() {
   const device = useDevice()
   const { members } = useWorkspace()
   const member = members.find((item) => item.device_id === deviceId)
-  const { busy, error, run } = useRun()
+  const { busy, error, run, clear } = useRun()
   const switching = useRun()
   const [removing, setRemoving] = useState(false)
   if (!member) return <EmptyState icon={MonitorSmartphone} title="找不到这个设备" className="flex-1 justify-center" />
@@ -75,12 +75,12 @@ export default function DeviceDetail() {
       <CopyableId value={member.device_id} label="设备编号" />
     </Details>
     {removable ? <SettingsGroup>
-      <SettingsRow icon={Trash2} tone="danger" label="移除设备" onPress={removing ? undefined : () => setRemoving(true)}>
+      <SettingsRow icon={Trash2} tone="danger" label="移除设备" onPress={removing ? undefined : () => { clear(); setRemoving(true) }}>
         {removing ? <View className="basis-full gap-3 ps-11">
           <Text>{deviceCopy.removeNotice(member.bot !== null)}</Text>
           <ErrorText error={error} />
           <View className="flex-row flex-wrap justify-end gap-2">
-            <Button variant="ghost" onPress={() => setRemoving(false)}><Text>取消</Text></Button>
+            <Button variant="ghost" onPress={() => { clear(); setRemoving(false) }}><Text>取消</Text></Button>
             <Button variant="destructive" disabled={busy !== null} onPress={() => void run('remove', async () => { await device.revoke(member.device_id); router.back() })}>
               <Icon as={Trash2} /><Text>{busy ? '移除中' : '移除'}</Text>
             </Button>

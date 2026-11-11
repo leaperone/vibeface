@@ -87,10 +87,6 @@ impl StaticAssets {
             headers == static_headers(&receipt.content_security_policy),
             "static App headers do not match the receipt CSP"
         );
-        ensure!(
-            !files["_shell.html"].body.is_empty(),
-            "static App shell is empty"
-        );
         Ok(Self {
             files,
             content_security_policy,

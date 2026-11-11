@@ -171,7 +171,6 @@ fn valid_date(date: &str) -> bool {
 fn host_target() -> Result<&'static str> {
     match (std::env::consts::ARCH, std::env::consts::OS) {
         ("aarch64", "macos") => Ok("aarch64-apple-darwin"),
-        ("x86_64", "macos") => Ok("x86_64-apple-darwin"),
         ("aarch64", "linux") => Ok("aarch64-unknown-linux-gnu"),
         ("x86_64", "linux") => Ok("x86_64-unknown-linux-gnu"),
         ("x86_64", "windows") => Ok("x86_64-pc-windows-msvc"),
@@ -882,46 +881,123 @@ pub(crate) fn same_package_bytes(left: &Path, right: &Path) -> Result<bool> {
     Ok(tree(left)? == tree(right)?)
 }
 
-fn verify_build(package: &Path, release: &Release) -> Result<BuildInfo> {
-    let metadata = fs::symlink_metadata(package.join("BUILD-INFO.json"))?;
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommittedRelease {
+    data_dir: PathBuf,
+    device_id: String,
+    package_digest: String,
+}
+
+/// Only a confirmed, sealed candidate grants permission to remove an unchanged package later.
+pub(super) fn retain_committed(
+    root: &Path,
+    data: &Path,
+    device_id: &str,
+    previous: &Path,
+    candidate: &Path,
+) -> Result<()> {
+    super::owned_directory(root)?;
+    super::owned_directory(data)?;
+    let releases = root.join("releases");
+    super::owned_directory(&releases)?;
+    let journal_exists = || -> std::io::Result<bool> {
+        match fs::symlink_metadata(data.join("update-pending.json")) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    };
     ensure!(
-        metadata.file_type().is_file() && metadata.len() <= 4096,
-        "BUILD-INFO exceeds limit"
+        !journal_exists()?,
+        "an activation journal still references this Node's releases"
     );
-    let entries = tree(package)?;
-    let checksums = fs::read_to_string(package.join("FILES.sha256"))?;
+    let current = super::installed(root)?;
     ensure!(
-        checksums.len() <= 1024 * 1024,
-        "file checksums exceed limit"
+        current == candidate,
+        "committed package is no longer current"
     );
-    let mut declared = BTreeMap::new();
-    for line in checksums.lines() {
-        let (hash, name) = line.split_once("  ").context("invalid file checksum")?;
-        ensure!(name != "FILES.sha256", "self-referencing checksum");
+    let receipt = |package: &Path| -> Result<PathBuf> {
+        let name = package
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("release directory has no version")?;
         ensure!(
-            declared
-                .insert(PathBuf::from(name), hash.to_owned())
-                .is_none(),
-            "duplicate file checksum"
+            package.parent() == Some(releases.as_path())
+                && Version::parse(name)?.to_string() == name,
+            "release is outside the updater namespace"
         );
+        Ok(releases.join(format!(".updater-{name}.json")))
+    };
+    let package_digest = |package: &Path| -> Result<String> {
+        super::owned_directory(package)?;
+        verify_sealed_contents(package, host_target()?)?;
+        let contents = tree(package)?;
+        ensure!(
+            package.file_name().and_then(|name| name.to_str())
+                == Some(super::manifest(package)?.version.to_string().as_str()),
+            "release directory does not match its package version"
+        );
+        Ok(hex::encode(Sha256::digest(serde_json::to_vec(&contents)?)))
+    };
+    let path = receipt(candidate)?;
+    let record = CommittedRelease {
+        data_dir: data.to_path_buf(),
+        device_id: device_id.to_owned(),
+        package_digest: package_digest(candidate)?,
+    };
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let saved: CommittedRelease = serde_json::from_slice(
+                &privatefs::read_private_bounded(&path, 4096, "committed release receipt")?,
+            )?;
+            ensure!(
+                saved.data_dir == record.data_dir
+                    && saved.device_id == record.device_id
+                    && saved.package_digest == record.package_digest,
+                "committed release receipt belongs to another package or Node"
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            privatefs::create_durable(&path, &serde_json::to_vec(&record)?)?;
+        }
+        Err(error) => return Err(error.into()),
     }
-    let actual: BTreeMap<_, _> = entries
-        .iter()
-        .filter_map(|(name, entry)| match entry {
-            TreeEntry::File { sha256, .. } if name != Path::new("FILES.sha256") => Some((
-                name.clone(),
-                sha256
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>(),
-            )),
-            _ => None,
-        })
-        .collect();
-    ensure!(declared == actual, "package file checksums differ");
-    let build: BuildInfo = serde_json::from_slice(&fs::read(package.join("BUILD-INFO.json"))?)
-        .context("package does not declare a supported update protocol and data epoch")?;
-    build.validate()?;
+    let executable = fs::canonicalize(std::env::current_exe()?)?;
+    for entry in fs::read_dir(&releases)? {
+        let package = entry?.path();
+        if package == current || package == previous || executable.starts_with(&package) {
+            continue;
+        }
+        let Ok(path) = receipt(&package) else {
+            continue;
+        };
+        let Ok(bytes) = privatefs::read_private_bounded(&path, 4096, "committed release receipt")
+        else {
+            continue;
+        };
+        let Ok(saved) = serde_json::from_slice::<CommittedRelease>(&bytes) else {
+            continue;
+        };
+        if saved.data_dir != data
+            || saved.device_id != device_id
+            || package_digest(&package).ok().as_ref() != Some(&saved.package_digest)
+        {
+            continue;
+        }
+        ensure!(
+            super::installed(root)? == current && !journal_exists()?,
+            "the active release changed during retention"
+        );
+        fs::remove_dir_all(&package)?;
+        fs::remove_file(path)?;
+        privatefs::sync_dir(&releases)?;
+    }
+    Ok(())
+}
+
+fn verify_build(package: &Path, release: &Release) -> Result<BuildInfo> {
+    let build = verify_sealed_contents(package, &release.target)?;
     ensure!(
         build.version == release.version.to_string()
             && build.target == release.target
@@ -1001,7 +1077,7 @@ async fn verify_binary(binary: &Path, version: &Version, name: &str) -> Result<(
     Ok(())
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Serialize)]
 enum TreeEntry {
     Directory,
     File {
@@ -1054,20 +1130,8 @@ fn tree(root: &Path) -> Result<BTreeMap<PathBuf, TreeEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::mark_runnable;
     use flate2::{Compression, write::GzEncoder};
-
-    /// Marks `path` as a program this account can run, where that is something a file carries.
-    fn mark_runnable(path: &Path) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        // Windows carries the right to run in the name, which the fixtures already use.
-        #[cfg(windows)]
-        let _ = path;
-        assert!(privatefs::is_executable(path));
-    }
 
     #[test]
     fn channels_accept_only_canonical_release_tags() {

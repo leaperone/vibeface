@@ -1,5 +1,5 @@
 //! Local scheduling state is never reconstructed by importing shared conversation history.
-//! A job is keyed by `(conversation, message_id | work_id)`, so retries and sync never add a second one.
+//! A job is keyed by `(conversation, trigger)`, so retries and sync never add a second one.
 use crate::{
     model::{Schedule, VersionVector, WorkOutcome},
     providers::Provider,
@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use vibeface_bridge::failure::{ExecFailure, FailureKind, ProviderStage};
+pub use vibeface_protocol::workspace::TurnExecution;
 
 pub const MAX_PENDING_JOBS: usize = 256;
 
@@ -131,24 +132,6 @@ pub struct SessionConfig {
     pub stable_fingerprint: String,
     pub runtime_fingerprint: String,
     pub provider: Provider,
-}
-
-#[cfg(test)]
-pub fn queue_hold_reason(
-    state: &JobState,
-    active: bool,
-    steering_unsettled: bool,
-) -> Option<QueueHoldReason> {
-    if !matches!(state, JobState::Queued) {
-        return None;
-    }
-    if active {
-        return Some(QueueHoldReason::ActiveTurn);
-    }
-    if steering_unsettled {
-        return Some(QueueHoldReason::SteeringSettlement);
-    }
-    None
 }
 
 pub fn message_trigger(message_id: &str) -> String {
@@ -416,14 +399,6 @@ pub struct RuntimeSelection {
     pub reasoning_effort: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnExecution {
-    NotStarted,
-    Started,
-    Unknown,
-}
-
 /// Safe submitted configuration and execution evidence. Native identifiers and credentials stay local.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TurnRuntime {
@@ -444,7 +419,7 @@ pub struct TurnRuntime {
 pub struct SchedulerJob {
     pub conversation_id: String,
     pub scope: SessionScope,
-    /// `message:<message_id>`, `work:<work_id>`, `task:<work_id>`,
+    /// `message:<message_id>`, `work:<work_id>`, `task:<work_id>`, `assignment:<assignment_id>`,
     /// `bot_message:<message_id>` or `schedule:<schedule_id>:<slot_ms>`.
     pub trigger: String,
     pub kind: TriggerKind,
@@ -838,28 +813,5 @@ mod lane_tests {
         assert_eq!(TriggerKind::AgentTask.lane(), AgentLane::Task);
         assert_eq!(TriggerKind::Schedule.lane(), AgentLane::ScheduleRoutine);
         assert_eq!(TriggerKind::BotMessage.lane(), AgentLane::BotMessage);
-    }
-
-    #[test]
-    fn queued_jobs_explain_their_wait_boundary() {
-        assert_eq!(
-            queue_hold_reason(&JobState::Queued, true, false),
-            Some(QueueHoldReason::ActiveTurn)
-        );
-        assert_eq!(
-            queue_hold_reason(&JobState::Queued, false, true),
-            Some(QueueHoldReason::SteeringSettlement)
-        );
-        assert_eq!(
-            queue_hold_reason(
-                &JobState::Cancelled {
-                    attempt: None,
-                    evidence: "stopped".into()
-                },
-                true,
-                false
-            ),
-            None
-        );
     }
 }

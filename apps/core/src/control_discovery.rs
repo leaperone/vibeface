@@ -514,22 +514,6 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn systemd_fixture_extracts_unicode_spaced_data_dir() {
-        let fixture = "[Service]\nExecStart=\"/opt/Vibeface/vibeface\" serve --data-dir \"/home/user/Node 数据 2\"\n";
-        assert_eq!(
-            parse_linux_service_unit(fixture).unwrap().unwrap(),
-            PathBuf::from("/home/user/Node 数据 2")
-        );
-        assert!(
-            parse_linux_service_unit(
-                "[Service]\nExecStart=/tmp/unrelated serve --data-dir /tmp/node\n"
-            )
-            .is_err()
-        );
-    }
-
     #[cfg(unix)]
     #[test]
     fn systemd_fixture_extracts_only_known_node_and_spaced_path() {

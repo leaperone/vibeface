@@ -27,7 +27,7 @@ export function parseMemoryBase(value: unknown): MemoryBase {
 }
 function metadata(value: unknown): MemoryMetadata {
   const data = record(value), origin = data.origin
-  if (origin !== 'agent' && origin !== 'user' && origin !== 'review') throw new Error('未知的记忆来源。')
+  if (origin !== 'agent' && origin !== 'user') throw new Error('未知的记忆来源。')
   return {
     epoch: epoch(data.epoch), revision: hash(data.revision), control_revision: counter(data.control_revision),
     source_event_hash: hash(data.source_event_hash), origin, user_controlled: boolean(data.user_controlled), essential: boolean(data.essential),
@@ -65,12 +65,14 @@ export function parseMemoryStateResult(value: unknown, memoryId: string, operati
 export function parseMemorySyncConflicts(value: unknown): MemorySyncConflicts {
   const data = record(value), items = array(data.items)
   if (items.length > 50) throw new Error('记忆同步冲突列表超出范围。')
-  return { has_more: boolean(data.has_more), items: items.map((value) => {
-    const item = record(value), reason = item.reason
-    if (reason !== 'user_protected' && reason !== 'concurrent_automatic' && reason !== 'concurrent_user') throw new Error('未知的记忆同步冲突。')
-    return { memory_id: text(item.memory_id), losing_revision: hash(item.losing_revision), winning_revision: hash(item.winning_revision), losing_event_hash: hash(item.losing_event_hash), winning_event_hash: hash(item.winning_event_hash), reason }
-  }) }
+  return { has_more: boolean(data.has_more), items: items.map(parseMemorySyncConflict) }
 }
+export function parseMemorySyncConflict(value: unknown): MemorySyncConflicts['items'][number] {
+  const item = record(value), reason = item.reason
+  if (reason !== 'user_protected' && reason !== 'concurrent_automatic' && reason !== 'concurrent_user') throw new Error('未知的记忆同步冲突。')
+  return { memory_id: text(item.memory_id), losing_revision: hash(item.losing_revision), winning_revision: hash(item.winning_revision), losing_event_hash: hash(item.losing_event_hash), winning_event_hash: hash(item.winning_event_hash), reason }
+}
+
 export const memorySyncConflictLabel = (reason: MemorySyncConflicts['items'][number]['reason']) => reason === 'user_protected' ? '用户维护的记忆受保护，自动修改未覆盖' : reason === 'concurrent_user' ? '人工并发修改发生冲突，当前版本按共享规则选定' : 'Bot 并发更新发生冲突，当前版本按共享规则选定'
 export const memorySaved = (result: MemoryControlResult) => result.state === 'applied' || result.state === 'already_recorded'
 export const memoryResultLabel = (result: MemoryControlResult) => memorySaved(result) ? result.current?.text === null ? '记忆已删除。' : '记忆已保存。' : result.state === 'superseded' ? '这次修改已记录，但已被其他修改替代。草稿已保留。' : '当前版本与草稿基准不同，草稿已保留。未确认的原操作需等待设备同步确认。'

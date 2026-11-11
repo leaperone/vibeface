@@ -22,7 +22,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { useWorkspace } from '@/data/context'
 import { Scanner } from '@/features/devices/scanner'
 import { RecoveredStep, RecoveryRestore, RecoveryReview, RecoveryWaiting } from '@/features/recovery/recovery'
-import { openedLink } from '@/lib/join-link'
+import { keepSwitchedLink, openedLink, switchedLink } from '@/lib/join-link'
 import { move } from '@/lib/motion'
 import { useRun } from '@/lib/use-run'
 import { defaultName, self } from '@/platform'
@@ -80,7 +80,7 @@ function Wordmark() {
 /** A first phone with no computer yet: Vibeface runs on a computer first, and its 添加设备 brings the phone in. */
 function NoComputer() {
   return <Pressable accessibilityRole="link" onPress={() => void openURL(joinCopy.installGuide).catch(() => {})}
-    className="-mx-3 min-h-14 flex-row items-center gap-2 rounded-lg px-4 py-2 active:bg-accent">
+    className="-mx-3 min-h-14 flex-row items-center gap-2 rounded-lg px-4 py-2 active:bg-muted">
     <Icon as={Laptop} />
     <View className="min-w-0 flex-1">
       <Text className="font-medium">{joinCopy.noComputer}</Text>
@@ -108,12 +108,16 @@ function JoinForm() {
   const workspace = useWorkspace()
   const device = useDevice()
   const url = useLinkingURL()
-  const [invitation, setInvitation] = useState('')
+  const [switched] = useState(switchedLink)
+  useEffect(() => { if (switched) keepSwitchedLink(null) }, [switched])
+  const [invitation, setInvitation] = useState(switched ?? '')
+  const [openingUrl] = useState(url)
   // An error belongs to the link it was about: a new one, typed, pasted, scanned or opened, starts clean.
   const [edited, setEdited] = useState(false)
   const edit = (text: string) => { setInvitation(text); setError(''); setEdited(true) }
   // Every new `vibeface://join/<ticket>` refills the field, also the one a network switch erased the phone for.
   useEffect(() => {
+    if (switched && url === openingUrl) return
     const link = openedLink(url)
     if (link && link !== spent) edit(link)
   }, [url])

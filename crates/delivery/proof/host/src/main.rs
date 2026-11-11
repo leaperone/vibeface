@@ -16,6 +16,193 @@ const MAX_PRIVATE_INPUT: u64 = 1024 * 1024;
 const MAX_RECEIPT_INPUT: u64 = 16 * 1024 * 1024;
 static RECEIPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+struct DiagnosticStage {
+    file: Option<std::fs::File>,
+    phase: &'static str,
+    command: &'static str,
+    success: bool,
+    errno: Option<i32>,
+    order: bool,
+}
+fn diagnostic_file(fd: i32) -> Option<std::fs::File> {
+    use std::os::{fd::BorrowedFd, unix::fs::MetadataExt};
+    if fd < 3 {
+        return None;
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0
+        || flags & libc::O_APPEND == 0
+        || flags & libc::O_ACCMODE == libc::O_RDONLY
+        || unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC != 0
+    {
+        return None;
+    }
+    let file = std::fs::File::from(
+        unsafe { BorrowedFd::borrow_raw(fd) }
+            .try_clone_to_owned()
+            .ok()?,
+    );
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.len() > 32768
+        || metadata.nlink() != 1
+    {
+        return None;
+    }
+    Some(file)
+}
+
+impl DiagnosticStage {
+    fn new(phase: &'static str, command: &str) -> Self {
+        let format = diagnostic_format(
+            std::env::var("VIBEFACE_DELIVERY_DIAGNOSTIC_FORMAT")
+                .ok()
+                .as_deref(),
+        );
+        let file = format.and_then(|_| {
+            std::env::var("VIBEFACE_DELIVERY_DIAGNOSTIC_FD")
+                .ok()
+                .and_then(|value| value.parse::<i32>().ok())
+                .and_then(diagnostic_file)
+        });
+        let stage = Self {
+            file,
+            phase,
+            command: if command == "verify" {
+                "verify"
+            } else {
+                "prove"
+            },
+            success: false,
+            errno: None,
+            order: format == Some(true),
+        };
+        stage.emit("begin");
+        stage
+    }
+    fn counters(&self) -> Option<serde_json::Value> {
+        if !matches!(self.phase, "host_succinct" | "host_groth16") {
+            return None;
+        }
+        let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        let relative = membership
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))?;
+        let root = Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+        Self::counters_at(&root)
+    }
+    fn counters_at(root: &Path) -> Option<serde_json::Value> {
+        let read = |name: &str| -> Option<std::collections::HashMap<String, u64>> {
+            let mut values = std::collections::HashMap::new();
+            for line in std::fs::read_to_string(root.join(name)).ok()?.lines() {
+                let (key, value) = line.split_once(' ')?;
+                let value = value.parse::<u64>().ok()?;
+                if value > i64::MAX as u64 || values.insert(key.to_owned(), value).is_some() {
+                    return None;
+                }
+            }
+            Some(values)
+        };
+        let memory = read("memory.events")?;
+        let pids = read("pids.events")?;
+        Some(
+            json!({"pids_max":pids.get("max")?,"memory_max":memory.get("max")?,"oom":memory.get("oom")?,
+            "oom_kill":memory.get("oom_kill")?,"oom_group_kill":memory.get("oom_group_kill")?}),
+        )
+    }
+    fn emit(&self, edge: &str) {
+        let Some(file) = &self.file else {
+            return;
+        };
+        let value = if self.order {
+            use std::os::unix::fs::MetadataExt;
+            let group = std::fs::read_to_string("/proc/self/cgroup")
+                .ok()
+                .and_then(|text| {
+                    text.lines().find_map(|line| {
+                        line.strip_prefix("0::").map(|relative| {
+                            Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'))
+                        })
+                    })
+                });
+            let identity = group
+                .as_ref()
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|info| [info.dev(), info.ino()]);
+            let mut clock = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let time = (unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut clock) } == 0)
+                .then(|| {
+                    u64::try_from(clock.tv_sec)
+                        .ok()?
+                        .checked_mul(1_000_000_000)?
+                        .checked_add(u64::try_from(clock.tv_nsec).ok()?)
+                })
+                .flatten()
+                .filter(|value| *value <= i64::MAX as u64);
+            let counters = group
+                .as_deref()
+                .filter(|_| matches!(self.phase, "host_succinct" | "host_groth16"))
+                .and_then(Self::counters_at)
+                .and_then(|value| {
+                    Some([
+                        value["pids_max"].as_u64()?,
+                        value["memory_max"].as_u64()?,
+                        value["oom"].as_u64()?,
+                        value["oom_kill"].as_u64()?,
+                        value["oom_group_kill"].as_u64()?,
+                    ])
+                });
+            json!({"v":2,"kind":"event","w":"host","c":self.command,"p":self.phase,"e":edge,
+                "t":time,"x":null,"s":null,"n":self.errno,"f":if edge == "error" {Some("stage_error")} else {None},
+                "r":null,"k":false,"g":identity,"q":counters,"i":null,"a":null})
+        } else {
+            json!({"v":1,"writer":"host","command":self.command,"phase":self.phase,"edge":edge,
+            "exit_code":null,"signal":null,"errno":self.errno,"failure_class":if edge == "error" {Some("stage_error")} else {None},
+            "worker":null,"cleanup_requested":false,"counters":self.counters()})
+        };
+        let Ok(mut bytes) = serde_json::to_vec(&value) else {
+            return;
+        };
+        bytes.push(b'\n');
+        let Ok(metadata) = file.metadata() else {
+            return;
+        };
+        if bytes.len() > 512 || metadata.len().saturating_add(bytes.len() as u64) > 32768 {
+            let _ = file.set_len(32769);
+            return;
+        }
+        let mut destination = file;
+        if destination.write(&bytes).ok() != Some(bytes.len()) {
+            let _ = file.set_len(32769);
+        }
+    }
+    fn ok(&mut self) {
+        self.success = true;
+    }
+    fn failure(&mut self, error: &anyhow::Error) {
+        self.errno = error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error);
+    }
+}
+fn diagnostic_format(value: Option<&str>) -> Option<bool> {
+    match value {
+        None => Some(false),
+        Some("order-job-v2") => Some(true),
+        _ => None,
+    }
+}
+impl Drop for DiagnosticStage {
+    fn drop(&mut self) {
+        self.emit(if self.success { "ok" } else { "error" });
+    }
+}
+
 fn read_stdin(limit: u64) -> Result<Zeroizing<Vec<u8>>> {
     let mut bytes = Zeroizing::new(Vec::new());
     std::io::stdin().take(limit + 1).read_to_end(&mut bytes)?;
@@ -188,6 +375,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if command == "verify" {
+        let mut diagnostic = DiagnosticStage::new("host_receipt_verify", "verify");
         ensure!(
             args.len() == 2,
             "verify requires the expected public journal hex"
@@ -196,6 +384,7 @@ fn main() -> Result<()> {
         let receipt = decode_receipt(&read_stdin(MAX_RECEIPT_INPUT)?)?;
         checked_receipt(&receipt, statement.abi_bytes())?;
         let seal = groth16_seal(&receipt)?;
+        diagnostic.ok();
         println!(
             "{}",
             json!({"verified":true,"kind":"groth16","seal":hex::encode(seal),"imageId":hex::encode(image_id()),"journalHash":hex::encode(statement.digest())})
@@ -239,6 +428,7 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    let mut input_diagnostic = DiagnosticStage::new("host_input", command);
     let input: ProofInput = serde_json::from_slice(&read_stdin(MAX_PRIVATE_INPUT)?)
         .map_err(|_| anyhow::anyhow!("invalid private proof input"))?;
     input.profile.validate()?;
@@ -248,11 +438,13 @@ fn main() -> Result<()> {
     );
     let mut builder = ExecutorEnv::builder();
     builder
-        .segment_limit_po2(20)
+        .segment_limit_po2(19)
         .session_limit(Some(input.profile.max_guest_cycles))
         .write(&input)?;
     let env = builder.build()?;
     let prover = local_prover()?;
+    input_diagnostic.ok();
+    drop(input_diagnostic);
     if command == "execute" {
         let session = prover.execute(env, VIBEFACE_DELIVERY_GUEST_ELF)?;
         ensure!(
@@ -276,9 +468,18 @@ fn main() -> Result<()> {
         );
     } else {
         let (output, succinct) = outputs.context("missing proof output paths")?;
-        let info =
-            prover.prove_with_opts(env, VIBEFACE_DELIVERY_GUEST_ELF, &ProverOpts::succinct())?;
+        let mut succinct_diagnostic = DiagnosticStage::new("host_succinct", command);
+        let info = prover
+            .prove_with_opts(env, VIBEFACE_DELIVERY_GUEST_ELF, &ProverOpts::succinct())
+            .inspect_err(|error| {
+                succinct_diagnostic.failure(error);
+            })?;
+        succinct_diagnostic.ok();
+        drop(succinct_diagnostic);
+        let mut succinct_verify = DiagnosticStage::new("host_succinct_verify", command);
         checked_succinct_receipt(&info.receipt, input.statement.abi_bytes())?;
+        succinct_verify.ok();
+        drop(succinct_verify);
         if let Some(path) = succinct {
             let bytes = bincode::serialize(&info.receipt)?;
             ensure!(
@@ -287,10 +488,23 @@ fn main() -> Result<()> {
             );
             publish_receipt(&path, &bytes)?;
         }
-        let receipt = prover.compress(&ProverOpts::groth16(), &info.receipt)?;
+        let mut groth16_diagnostic = DiagnosticStage::new("host_groth16", command);
+        let receipt = prover
+            .compress(&ProverOpts::groth16(), &info.receipt)
+            .inspect_err(|error| {
+                groth16_diagnostic.failure(error);
+            })?;
+        groth16_diagnostic.ok();
+        drop(groth16_diagnostic);
+        let mut receipt_diagnostic = DiagnosticStage::new("host_receipt_verify", command);
         checked_receipt(&receipt, input.statement.abi_bytes())?;
         let seal = groth16_seal(&receipt)?;
+        receipt_diagnostic.ok();
+        drop(receipt_diagnostic);
+        let mut publication = DiagnosticStage::new("host_receipt_publish", command);
         publish_receipt(&output, &bincode::serialize(&receipt)?)?;
+        publication.ok();
+        drop(publication);
         println!(
             "{}",
             json!({"mode":"prove","kind":"groth16","imageId":hex::encode(image_id()),
@@ -409,5 +623,78 @@ mod tests {
         assert!(new_receipt_path(&symlink).is_err());
         assert!(publish_receipt(&symlink, b"replacement").is_err());
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn diagnostic_descriptor_is_private_append_only_and_optional() {
+        use std::os::fd::AsRawFd;
+        let base =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../.artifacts/proof-host-tests");
+        std::fs::create_dir_all(&base).unwrap();
+        let directory = base.join(format!(
+            "diagnostic-{}-{}",
+            std::process::id(),
+            RECEIPT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("events.jsonl");
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let fd = file.as_raw_fd();
+        let original = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(diagnostic_file(fd).is_none());
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, original & !libc::FD_CLOEXEC) },
+            0
+        );
+        let mut stage = DiagnosticStage {
+            file: diagnostic_file(fd),
+            phase: "host_succinct",
+            command: "prove",
+            success: false,
+            errno: None,
+            order: false,
+        };
+        assert!(stage.file.is_some());
+        stage.emit("begin");
+        stage.ok();
+        drop(stage);
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["edge"], "begin");
+        assert_eq!(events[1]["edge"], "ok");
+        assert!(
+            events
+                .iter()
+                .all(|event| event["v"] == 1 && event.get("kind").is_none())
+        );
+        let linked = directory.join("linked");
+        std::fs::hard_link(&path, &linked).unwrap();
+        assert!(diagnostic_file(fd).is_none());
+        std::fs::remove_file(linked).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(diagnostic_file(fd).is_none());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        file.set_len(32769).unwrap();
+        assert!(diagnostic_file(fd).is_none());
+        drop(file);
+        assert!(diagnostic_file(fd).is_none());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn diagnostic_format_never_guesses_an_unknown_encoding() {
+        assert_eq!(diagnostic_format(None), Some(false));
+        assert_eq!(diagnostic_format(Some("order-job-v2")), Some(true));
+        assert_eq!(diagnostic_format(Some("")), None);
+        assert_eq!(diagnostic_format(Some("unknown")), None);
     }
 }

@@ -1,5 +1,5 @@
-//! Incremental projections. Each event updates its rows and their dependents; every rule is
-//! order-independent (first/last by rank, max epoch or version), so any arrival order converges.
+//! Incremental projections update rows by rank or epoch. Workspace history is rebuilt when
+//! earlier-ranked events arrive late, so different arrival orders converge.
 //! Bot settings, skills and schedules use rank. Memories permanently prefer signed user
 //! control and its stable counter; removals remain as tombstones.
 use crate::model::*;
@@ -34,7 +34,7 @@ fn text(value: impl serde::Serialize) -> Result<String> {
 }
 
 /// Every table `apply` writes. A rebuild clears exactly these; nothing else is derived from the log.
-pub(crate) const TABLES: [&str; 17] = [
+pub(crate) const TABLES: [&str; 22] = [
     "conversations",
     "messages",
     "bots",
@@ -52,6 +52,11 @@ pub(crate) const TABLES: [&str; 17] = [
     "questions",
     "session_owners",
     "workspace_projection",
+    "conversation_setting_writes",
+    "memory_history_operations",
+    "memory_winner_chain",
+    "workspace_tasks_lookup",
+    "workspace_assignments_lookup",
 ];
 
 /// Who owns a session, in any order the records arrive: the latest attribution or mute by
@@ -78,6 +83,7 @@ fn own_session(
 }
 
 pub(crate) fn clear(connection: &Connection, network: &str) -> Result<()> {
+    super::conversation_history::invalidate_all(connection, network)?;
     for table in TABLES {
         connection.execute(
             &format!("DELETE FROM {table} WHERE network_id=?"),
@@ -96,6 +102,7 @@ pub(crate) fn apply(
     rank: &str,
     notify_session: bool,
 ) -> Result<()> {
+    super::conversation_history::advance_revision(connection, network, event)?;
     let scope = event.scope_id.as_str();
     match &event.body {
         EventBody::ConversationCreated { title } => {
@@ -241,8 +248,8 @@ pub(crate) fn apply(
             attestation,
             ..
         } => {
-            // Besides the target, only the user's signed settlement or the owner's record that a
-            // removed device's result is unknown counts; any result of the target outranks the latter.
+            // Ingestion checks the causal owner for a non-target's unsigned Unverified record.
+            // The target's result or the user's signed settlement outranks that unknown result.
             let target: Option<String> = connection
                 .query_row(
                     "SELECT target_node FROM works WHERE network_id=? AND work_id=?",
@@ -506,6 +513,9 @@ pub(crate) fn apply(
         // Read from the log by rank; see `store::bots::primary_bot_from`.
         EventBody::ContextCheckpoint { .. } | EventBody::PrimaryBotSet { .. } => {}
     }
+    super::conversation_settings_projection::apply_projection(
+        connection, network, hash, event, rank,
+    )?;
     Ok(())
 }
 

@@ -5,7 +5,7 @@
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use futures_util::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
+    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr,
     address_lookup::memory::MemoryLookup,
     endpoint::{
         BindOpts, Connection, PortmapperConfig, ReadExactError, RecvStream, SendStream, presets,
@@ -21,12 +21,12 @@ use std::{
     time::Duration,
 };
 
-pub mod bootstrap;
-mod discovery;
-mod lan;
-pub mod pkarr;
+use vibeface_secure::link::{Host, NodeLink};
 
-pub const DISCOVERY: &[u8] = b"vibeface/discovery/1";
+mod lan;
+pub mod mesh;
+pub mod relay;
+
 pub const SYNC: &[u8] = b"vibeface/sync/1";
 pub const BLOB: &[u8] = b"vibeface/blob/1";
 pub const RPC: &[u8] = b"vibeface/rpc/1";
@@ -35,8 +35,7 @@ pub const JOIN: &[u8] = b"vibeface/join/1";
 /// A decision sent to a session through another device; the target checks its token.
 pub const DECISION: &[u8] = b"vibeface/decision/1";
 pub const SERVICE: &[u8] = b"vibeface/service/1";
-/// Every Node answers discovery probes; registrations and lookups only with `serve_discovery`.
-pub const ALPNS: [&[u8]; 8] = [SYNC, BLOB, RPC, CLIENT, JOIN, DECISION, SERVICE, DISCOVERY];
+pub const ALPNS: [&[u8]; 7] = [SYNC, BLOB, RPC, CLIENT, JOIN, DECISION, SERVICE];
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 const MAX_RELAYS: usize = 16;
@@ -68,23 +67,12 @@ impl std::error::Error for Unanswered {}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
-    #[serde(default)]
-    pub pkarr: pkarr::PkarrConfig,
     /// UDP address of the iroh endpoint; defaults to all interfaces on the `listen` port.
     #[serde(default)]
     pub bind: Option<SocketAddr>,
     /// Extra iroh relays besides the ones the personal network's Nodes run.
     #[serde(default)]
     pub relays: Vec<Relay>,
-    /// Also use n0's public relays.
-    #[serde(default)]
-    pub n0_relays: bool,
-    /// Infrastructure this Node uses for address discovery and simultaneous direct probes.
-    #[serde(default)]
-    pub discovery: Vec<String>,
-    /// Answer other devices' discovery registrations and lookups on this Node's UDP endpoint.
-    #[serde(default)]
-    pub serve_discovery: bool,
     /// Run an iroh relay on this address.
     #[serde(default)]
     pub relay_listen: Option<SocketAddr>,
@@ -110,10 +98,8 @@ pub struct NetworkConfig {
     /// Device IDs the relay refuses.
     #[serde(default)]
     pub relay_blocked: Vec<String>,
-    /// How this Node finds public infrastructure. Off in `default()`, so fixtures stay offline;
-    /// initialization turns the public service on for ordinary Nodes.
     #[serde(default)]
-    pub bootstrap: bootstrap::Bootstrap,
+    pub mesh: mesh::MeshConfig,
 }
 
 /// A relay this Node uses, with the token it requires of devices outside its personal network.
@@ -158,13 +144,8 @@ pub fn same_token(a: &str, b: &str) -> bool {
 }
 impl NetworkConfig {
     pub fn validate(&self) -> Result<()> {
-        self.pkarr.validate()?;
         ensure!(self.relays.len() <= MAX_RELAYS, "too many relays");
-        ensure!(self.discovery.len() <= 4, "too many discovery servers");
-        for server in &self.discovery {
-            discovery::validate_server(server)?;
-        }
-        self.bootstrap.validate()?;
+        self.mesh.validate()?;
         let mut urls = HashSet::new();
         for relay in &self.relays {
             ensure!(
@@ -219,18 +200,6 @@ impl NetworkConfig {
             (None, None) => Ok(None),
         }
     }
-
-    /// Every discovery service this Node registers with: the configured ones and the bootstrap
-    /// one, once each.
-    pub fn discovery_servers(&self) -> Result<Vec<String>> {
-        let mut servers = self.discovery.clone();
-        if let Some(discovery) = self.bootstrap.discovery()?
-            && !servers.contains(&discovery)
-        {
-            servers.push(discovery);
-        }
-        Ok(servers)
-    }
 }
 
 pub fn relay_url(value: &str) -> Result<RelayUrl> {
@@ -259,6 +228,7 @@ pub fn relay_token(invite_hash: &str) -> String {
 }
 
 pub fn endpoint_id(device_id: &str) -> Result<EndpointId> {
+    vibeface_secure::validate_device_id(device_id)?;
     let bytes: [u8; 32] = hex::decode(device_id)
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
@@ -268,6 +238,28 @@ pub fn endpoint_id(device_id: &str) -> Result<EndpointId> {
 
 pub fn device_id(id: &EndpointId) -> String {
     hex::encode(id.as_bytes())
+}
+
+/// Where `link` says its Node is, its DNS names resolved now; a name that does not resolve is
+/// left out.
+pub async fn link_addr(link: &NodeLink) -> Result<EndpointAddr> {
+    let mut addrs = Vec::new();
+    for addr in &link.addrs {
+        match &addr.host {
+            Host::Ip(ip) => addrs.push(TransportAddr::Ip(SocketAddr::new(*ip, addr.port))),
+            Host::Name(name) => match tokio::net::lookup_host((name.as_str(), addr.port)).await {
+                Ok(found) => addrs.extend(found.take(8).map(TransportAddr::Ip)),
+                Err(error) => tracing::debug!(event = "net.link_unresolved", %name, %error),
+            },
+        }
+    }
+    if let Some(relay) = &link.relay {
+        addrs.push(TransportAddr::Relay(relay_url(relay)?));
+    }
+    Ok(EndpointAddr::from_parts(
+        endpoint_id(&link.device_id())?,
+        addrs,
+    ))
 }
 
 /// A Node's signed statement of where it can be reached, exchanged only inside the network.
@@ -300,6 +292,7 @@ impl SignedAddress {
     pub fn open(&self, network_id: &str) -> Result<AddressRecord> {
         ensure!(self.payload.len() <= 8192, "address record too large");
         let record: AddressRecord = serde_json::from_str(&self.payload)?;
+        vibeface_secure::membership::validate_hash(&record.network_id)?;
         ensure!(
             record.version == 1 && record.network_id == network_id,
             "address record belongs to another network"
@@ -309,11 +302,7 @@ impl SignedAddress {
             "address record names another endpoint"
         );
         if let Some(url) = &record.gateway_url {
-            let url = reqwest::Url::parse(url)?;
-            ensure!(
-                matches!(url.scheme(), "http" | "https") && url.path() == "/",
-                "invalid gateway URL"
-            );
+            crate::config::http_origin(url)?;
         }
         vibeface_secure::verify(
             &record.device_id,
@@ -328,15 +317,33 @@ impl SignedAddress {
 pub struct Net {
     pub endpoint: Endpoint,
     lookup: MemoryLookup,
-    discovery: discovery::Discovery,
     lan: OnceLock<lan::Lan>,
+    mesh: OnceLock<Arc<mesh::Mesh>>,
+    /// Relays configured, run here or by member Nodes, which stay in the relay map.
     relays: Arc<tokio::sync::Mutex<HashSet<RelayUrl>>>,
+    /// The bootstrap nodes' relays, which stay in the relay map while they are bootstrap nodes.
+    bootstrap: tokio::sync::Mutex<HashSet<RelayUrl>>,
+    /// Open relays the mesh announces, adopted while they rank among the best.
+    adopted: tokio::sync::Mutex<HashSet<RelayUrl>>,
     connections: Mutex<HashMap<(EndpointId, &'static [u8]), Connection>>,
+    /// `network.mesh.advertise`, listed first in the node link.
+    advertise: Vec<SocketAddr>,
 }
 impl std::fmt::Debug for Net {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Net")
     }
+}
+
+/// `advertise`, then the `found` addresses not among them.
+fn advertised_first(advertise: &[SocketAddr], found: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut addrs = advertise.to_vec();
+    addrs.extend(
+        found
+            .into_iter()
+            .filter(|address| !advertise.contains(address)),
+    );
+    addrs
 }
 
 /// Relay configurations by URL. The first configuration of a URL stays unless it carried no
@@ -357,17 +364,18 @@ fn merge_relays(relays: Vec<(RelayUrl, Option<String>)>) -> Vec<(RelayUrl, Optio
 }
 
 impl Net {
-    /// Binds the endpoint. Addresses stay in tickets and the personal network unless the
-    /// operator configures a discovery service or public bootstrap is on.
+    /// Binds the endpoint. Addresses stay in tickets and the personal network until the mesh
+    /// starts.
     pub async fn bind(
         secret_key_hex: &str,
         config: &NetworkConfig,
         listen_port: u16,
         relays: Vec<(RelayUrl, Option<String>)>,
     ) -> Result<Self> {
-        let seed: [u8; 32] = hex::decode(secret_key_hex)?
-            .try_into()
-            .map_err(|_| anyhow!("invalid device key"))?;
+        let identity = crate::crypto::LocalIdentity {
+            secret_key_hex: secret_key_hex.to_owned(),
+        };
+        let seed = identity.seed()?;
         let map = RelayMap::empty();
         let mut urls: Vec<(RelayUrl, Option<String>)> = relays;
         for relay in &config.relays {
@@ -375,14 +383,6 @@ impl Net {
         }
         if let Some(own) = config.own_relay()? {
             urls.push((own, None));
-        }
-        if config.n0_relays {
-            urls.extend(
-                iroh::defaults::prod::default_relay_map()
-                    .urls::<Vec<_>>()
-                    .into_iter()
-                    .map(|url| (url, None)),
-            );
         }
         let mut known = HashSet::new();
         for (url, token) in merge_relays(urls) {
@@ -396,21 +396,6 @@ impl Net {
             .alpns(ALPNS.iter().map(|alpn| alpn.to_vec()).collect())
             .relay_mode(RelayMode::Custom(map))
             .address_lookup(lookup.clone());
-        for url in &config.pkarr.urls {
-            let url = reqwest::Url::parse(url)?;
-            if config.pkarr.publish {
-                let publisher = iroh::address_lookup::PkarrPublisher::builder(url.clone());
-                let publisher = if config.pkarr.publish_direct {
-                    publisher.addr_filter(iroh::address_lookup::AddrFilter::unfiltered())
-                } else {
-                    publisher
-                };
-                builder = builder.address_lookup(publisher);
-            }
-            if config.pkarr.resolve {
-                builder = builder.address_lookup(pkarr::FreshResolver::new(url)?);
-            }
-        }
         // iroh starts with wildcard sockets on random ports; replace them so a configured
         // address is the only one, and the default uses the listen port.
         builder = builder.clear_ip_transports();
@@ -434,34 +419,45 @@ impl Net {
             .bind()
             .await
             .context("QUIC endpoint failed to start")?;
-        // Registrants may make an open relay their home relay; any other is for those it admits.
-        let offered = if config.relay_open {
-            config.own_relay()?
-        } else {
-            None
-        };
-        // Registration runs in the background: the local API, maintenance and LAN start
-        // whether or not the public infrastructure answers.
-        let discovery = discovery::Discovery::new(
-            &endpoint,
-            &config.discovery_servers()?,
-            config.serve_discovery,
-            offered,
-            config.own_relay()?,
-            known.clone(),
-        )?;
         Ok(Self {
             endpoint,
             lookup,
-            discovery,
             lan: OnceLock::new(),
+            mesh: OnceLock::new(),
             relays: known,
+            bootstrap: Default::default(),
+            adopted: Default::default(),
             connections: Mutex::new(HashMap::new()),
+            advertise: config.mesh.advertise.clone(),
         })
     }
 
     pub fn addr(&self) -> EndpointAddr {
         self.endpoint.addr()
+    }
+
+    /// This Node's node link: advertised addresses first, then public, local and loopback ones,
+    /// at most four, and its home relay.
+    pub fn share_link(&self) -> Result<NodeLink> {
+        let addr = self.endpoint.addr();
+        let mut addrs: Vec<SocketAddr> = addr
+            .ip_addrs()
+            .copied()
+            .filter(|address| !matches!(address.ip(), IpAddr::V6(ip) if ip.is_unicast_link_local()))
+            .collect();
+        addrs.sort_by_key(|address| {
+            (
+                address.ip().is_loopback(),
+                !crate::fetch::public(address.ip()),
+            )
+        });
+        let mut addrs = advertised_first(&self.advertise, addrs);
+        addrs.truncate(vibeface_secure::link::MAX_ADDRS);
+        Ok(NodeLink::new(
+            &device_id(&self.endpoint.id()),
+            addrs.into_iter().map(Into::into).collect(),
+            addr.relay_urls().next().map(ToString::to_string),
+        )?)
     }
 
     /// Remembers where a peer is. Its relays are dialed as given, not added to the relay map:
@@ -479,6 +475,8 @@ impl Net {
             return;
         };
         let mut relays = self.relays.lock().await;
+        self.bootstrap.lock().await.remove(&url);
+        self.adopted.lock().await.remove(&url);
         if relays.insert(url.clone()) {
             self.endpoint
                 .insert_relay(url.clone(), Arc::new(relay_config(url, None)))
@@ -489,15 +487,80 @@ impl Net {
     #[cfg(test)]
     pub async fn knows_relay(&self, url: &RelayUrl) -> bool {
         self.relays.lock().await.contains(url)
+            || self.bootstrap.lock().await.contains(url)
+            || self.adopted.lock().await.contains(url)
     }
 
     /// Adds `url` with `token`. iroh reads a relay's credential when it first connects to the
     /// relay, so this comes before the first dial through it.
     pub async fn insert_relay(&self, url: RelayUrl, token: Option<String>) {
-        self.relays.lock().await.insert(url.clone());
+        let mut relays = self.relays.lock().await;
+        relays.insert(url.clone());
+        self.bootstrap.lock().await.remove(&url);
+        self.adopted.lock().await.remove(&url);
         self.endpoint
             .insert_relay(url.clone(), Arc::new(relay_config(url, token)))
             .await;
+    }
+
+    pub async fn remove_relay(&self, url: &RelayUrl) {
+        self.relays.lock().await.remove(url);
+        self.endpoint.remove_relay(url).await;
+    }
+
+    /// Makes `urls` the bootstrap nodes' relays: new ones join the relay map and stay there
+    /// whatever the ranking, and the rest leave it, apart from relays kept for another reason.
+    pub async fn set_bootstrap_relays(&self, urls: Vec<RelayUrl>) {
+        let pinned = self.relays.lock().await;
+        let mut bootstrap = self.bootstrap.lock().await;
+        let mut adopted = self.adopted.lock().await;
+        let next: HashSet<RelayUrl> = urls
+            .into_iter()
+            .filter(|url| !pinned.contains(url))
+            .collect();
+        for url in bootstrap.difference(&next) {
+            self.endpoint.remove_relay(url).await;
+        }
+        for url in next.difference(&bootstrap) {
+            if !adopted.remove(url) {
+                self.endpoint
+                    .insert_relay(url.clone(), Arc::new(relay_config(url.clone(), None)))
+                    .await;
+            }
+        }
+        *bootstrap = next;
+    }
+
+    /// Makes `urls` the adopted relays: new ones join the relay map and the rest leave it,
+    /// apart from relays kept for another reason.
+    pub async fn set_adopted(&self, urls: Vec<RelayUrl>) {
+        let pinned = self.relays.lock().await;
+        let bootstrap = self.bootstrap.lock().await;
+        let mut adopted = self.adopted.lock().await;
+        let next: HashSet<RelayUrl> = urls
+            .into_iter()
+            .filter(|url| !pinned.contains(url) && !bootstrap.contains(url))
+            .collect();
+        for url in adopted.difference(&next) {
+            self.endpoint.remove_relay(url).await;
+        }
+        for url in next.difference(&adopted) {
+            self.endpoint
+                .insert_relay(url.clone(), Arc::new(relay_config(url.clone(), None)))
+                .await;
+        }
+        *adopted = next;
+    }
+
+    /// Joins the mesh `config` names, keeping its records in `db`.
+    pub async fn start_mesh(&self, config: &mesh::MeshConfig, db: &std::path::Path) -> Result<()> {
+        let started = mesh::Mesh::start(self, config, db).await?;
+        ensure!(self.mesh.set(started).is_ok(), "the mesh already started");
+        Ok(())
+    }
+
+    pub fn mesh(&self) -> Option<Arc<mesh::Mesh>> {
+        self.mesh.get().cloned()
     }
 
     /// Advertises this Node on the LAN and finds the other member Nodes there; `wake` hears
@@ -551,6 +614,16 @@ impl Net {
         }
     }
 
+    /// Uses current admission on the next SYNC dial while active requests finish.
+    pub fn forget_sync_connection(&self, device_id: &str) {
+        if let Ok(id) = endpoint_id(device_id) {
+            self.connections
+                .lock()
+                .expect("connection cache")
+                .remove(&(id, SYNC));
+        }
+    }
+
     /// Drops connections to a peer that restarted. QUIC cannot tell they are dead until its
     /// idle timeout, so requests on them would hang that long.
     pub fn peer_restarted(&self, device_id: &str) {
@@ -570,17 +643,6 @@ impl Net {
         });
     }
 
-    pub fn connected(&self, device_id: &str) -> bool {
-        let Ok(id) = endpoint_id(device_id) else {
-            return false;
-        };
-        self.connections
-            .lock()
-            .expect("connection cache")
-            .iter()
-            .any(|((peer, _), connection)| *peer == id && connection.close_reason().is_none())
-    }
-
     /// Reuses an open connection; otherwise dials through the address book within `DIAL_TIMEOUT`.
     pub async fn connect(&self, device_id: &str, alpn: &'static [u8]) -> Result<Connection> {
         let id = endpoint_id(device_id)?;
@@ -595,18 +657,11 @@ impl Net {
             return Ok(connection.clone());
         }
         let connection = tokio::time::timeout(DIAL_TIMEOUT, async {
-            let hint = self.discovery.resolve(id, Duration::from_secs(1)).await;
             let mut addresses = self
                 .lookup
                 .get_endpoint_info(id)
                 .map(|info| info.addrs().cloned().collect::<Vec<_>>())
                 .unwrap_or_default();
-            // Dialed as given, not added to the relay map: a relay there could become this
-            // Node's home relay and refuse it.
-            if let Some(found) = hint {
-                addresses.push(iroh::TransportAddr::Ip(found.address));
-                addresses.extend(found.relays.into_iter().map(iroh::TransportAddr::Relay));
-            }
             let lan = self.lan.get().map(|lan| lan.hints(device_id));
             addresses.extend(lan.into_iter().flatten().map(iroh::TransportAddr::Ip));
             self.endpoint
@@ -621,27 +676,6 @@ impl Net {
             .expect("connection cache")
             .insert((id, alpn), connection.clone());
         Ok(connection)
-    }
-
-    /// The relays Discovery has registered for `device_id`, waiting up to `wait` for this
-    /// endpoint's registration sessions to come up.
-    pub async fn discovered_relays(
-        &self,
-        device_id: &str,
-        wait: Duration,
-    ) -> Result<Vec<RelayUrl>> {
-        let found = self.discovery.resolve(endpoint_id(device_id)?, wait).await;
-        Ok(found.map(|found| found.relays).unwrap_or_default())
-    }
-
-    pub(crate) fn discovery_router(self: &Arc<Self>) -> iroh::protocol::Router {
-        iroh::protocol::Router::builder(self.endpoint.clone())
-            .accept(DISCOVERY, discovery::Handler(Arc::downgrade(self)))
-            .spawn()
-    }
-
-    pub async fn serve_discovery(&self, connection: Connection) -> Result<()> {
-        self.discovery.serve(connection).await
     }
 
     pub fn path_kind(&self, device_id: &str) -> Option<PathKind> {
@@ -697,6 +731,9 @@ impl Net {
     }
 
     pub async fn close(&self) {
+        if let Some(mesh) = self.mesh.get() {
+            mesh.close().await;
+        }
         self.endpoint.close().await;
     }
 }
@@ -737,6 +774,14 @@ pub async fn write_frame(send: &mut SendStream, value: &Value) -> Result<()> {
 
 /// `None` when the peer finished the stream cleanly between frames.
 pub async fn read_frame(recv: &mut RecvStream) -> Result<Option<Value>> {
+    read_frame_within(recv, MAX_FRAME).await
+}
+
+/// A frame of at most `max` bytes, read straight into `T`.
+async fn read_frame_within<T: serde::de::DeserializeOwned>(
+    recv: &mut RecvStream,
+    max: usize,
+) -> Result<Option<T>> {
     let mut length = [0u8; 4];
     match recv.read_exact(&mut length).await {
         Ok(()) => {}
@@ -744,12 +789,14 @@ pub async fn read_frame(recv: &mut RecvStream) -> Result<Option<Value>> {
         Err(error) => bail!("peer stream failed: {error}"),
     }
     let length = u32::from_be_bytes(length) as usize;
-    ensure!(length <= MAX_FRAME, "frame too large");
+    ensure!(length <= max, "frame too large");
     let mut bytes = vec![0; length];
     recv.read_exact(&mut bytes)
         .await
         .map_err(|error| anyhow!("peer stream failed: {error}"))?;
-    Ok(Some(serde_json::from_slice(&bytes)?))
+    Ok(Some(
+        serde_json::from_slice(&bytes).map_err(|_| anyhow!("invalid request"))?,
+    ))
 }
 
 /// Answers each stream of `connection` with `handle`, one stream at a time per task.
@@ -758,14 +805,50 @@ where
     F: Fn(Value) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = Result<Value>> + Send,
 {
+    serve_streams_within(connection, None, MAX_FRAME, handle).await
+}
+
+/// Bounds a protocol anyone may call: at most the first semaphore's permits of streams are
+/// answered at once across every connection sharing it, the second's from the one remote, each
+/// within the duration; a stream past any is closed unanswered.
+pub type StreamLimit = (
+    Arc<tokio::sync::Semaphore>,
+    Arc<tokio::sync::Semaphore>,
+    Duration,
+);
+
+/// [`serve_streams`] under `limit`, for requests of at most `max_request` bytes, each read
+/// straight into `T`.
+pub async fn serve_streams_within<T, F, Fut>(
+    connection: Connection,
+    limit: Option<StreamLimit>,
+    max_request: usize,
+    handle: F,
+) where
+    T: serde::de::DeserializeOwned + Send + 'static,
+    F: Fn(T) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<Value>> + Send,
+{
     let mut replies = FuturesUnordered::new();
     loop {
         tokio::select! {
             stream = connection.accept_bi() => {
                 let Ok((mut send, mut recv)) = stream else { break };
+                let (permit, within) = match &limit {
+                    Some((open, remote, within)) => match (
+                        remote.clone().try_acquire_owned(),
+                        open.clone().try_acquire_owned(),
+                    ) {
+                        (Ok(remote), Ok(open)) => (Some((remote, open)), Some(*within)),
+                        _ => continue,
+                    },
+                    None => (None, None),
+                };
                 let handle = handle.clone();
                 replies.push(std::panic::AssertUnwindSafe(async move {
-                    let response = match read_frame(&mut recv).await {
+                    let _permit = permit;
+                    let reply = async move {
+                    let response = match read_frame_within::<T>(&mut recv, max_request).await {
                         Ok(Some(request)) => handle(request)
                             .await
                             .unwrap_or_else(|error| serde_json::json!({"error":format!("{error:#}")})),
@@ -775,6 +858,13 @@ where
                     if write_frame(&mut send, &response).await.is_ok() {
                         send.finish().ok();
                         let _ = send.stopped().await;
+                    }
+                    };
+                    match within {
+                        Some(within) => {
+                            let _ = tokio::time::timeout(within, reply).await;
+                        }
+                        None => reply.await,
                     }
                 }).catch_unwind());
             }
@@ -787,53 +877,64 @@ where
     }
 }
 
-/// A relay this Node runs, behind a front on `listen` when it limits connections per address.
+/// A relay this Node runs on loopback, behind a front on `listen` that limits connections per
+/// address and meters each endpoint's bytes.
 pub struct RelayServer {
     server: iroh_relay::server::Server,
     /// Where devices reach the relay.
     pub addr: SocketAddr,
-    front: Option<Front>,
+    front: Front,
 }
 
-struct Front(tokio::task::JoinHandle<()>);
+struct Front(Option<tokio::task::JoinHandle<()>>);
+impl Front {
+    async fn shutdown(&mut self) {
+        if let Some(task) = self.0.as_mut() {
+            // Keep ownership during the await so cancellation still reaches the Drop fallback.
+            task.abort();
+            if let Err(error) = task.await
+                && !error.is_cancelled()
+            {
+                tracing::error!(event = "relay.front_shutdown_failed", %error);
+            }
+            drop(self.0.take());
+        }
+    }
+}
 impl Drop for Front {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
     }
 }
 
 impl RelayServer {
-    pub async fn shutdown(self) {
-        drop(self.front);
+    pub async fn shutdown(mut self) {
+        self.front.shutdown().await;
         let _ = self.server.shutdown().await;
     }
 }
 
 /// The relay this Node runs; `access` decides who it admits, `rate` caps the bytes a second it
-/// reads from each connection and `per_ip` the connections one client address holds.
+/// reads from each connection and `per_ip` the connections one client address holds. `usage`
+/// learns from `access` which endpoint each front connection carries.
 pub async fn spawn_relay(
     listen: SocketAddr,
     access: Arc<dyn iroh_relay::server::DynAccessControl>,
     rate: Option<NonZeroU32>,
     per_ip: Option<NonZeroUsize>,
+    usage: Arc<relay::Usage>,
 ) -> Result<RelayServer> {
     let refused =
         |error: &dyn std::fmt::Display| anyhow!("relay failed to start on {listen}: {error}");
     // The relay never sees client addresses, so a front counts them and passes the bytes on to
     // the relay on loopback.
-    let front = match per_ip {
-        Some(per_ip) => Some((
-            tokio::net::TcpListener::bind(listen)
-                .await
-                .map_err(|error| refused(&error))?,
-            per_ip,
-        )),
-        None => None,
-    };
-    let mut relay = iroh_relay::server::RelayConfig::new(match front {
-        Some(_) => SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-        None => listen,
-    });
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .map_err(|error| refused(&error))?;
+    let mut relay =
+        iroh_relay::server::RelayConfig::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
     relay.access = access;
     relay.limits.client_rx = rate.map(iroh_relay::server::ClientRateLimit::new);
     let mut config = iroh_relay::server::ServerConfig::default();
@@ -842,56 +943,86 @@ pub async fn spawn_relay(
         .await
         .map_err(|error| refused(&error))?;
     let relay = server.http_addr().context("relay listener missing")?;
-    let (addr, front) = match front {
-        Some((listener, per_ip)) => (
-            listener.local_addr()?,
-            Some(Front(tokio::spawn(relay_front(listener, relay, per_ip)))),
-        ),
-        None => (relay, None),
-    };
     Ok(RelayServer {
         server,
-        addr,
-        front,
+        addr: listener.local_addr()?,
+        front: Front(Some(tokio::spawn(relay_front(
+            listener, relay, per_ip, usage,
+        )))),
     })
 }
 
-/// Passes each connection on to the relay unless its client address already holds `per_ip`.
-async fn relay_front(listener: tokio::net::TcpListener, relay: SocketAddr, per_ip: NonZeroUsize) {
+/// Passes each connection on to the relay unless its client address already holds `per_ip`,
+/// giving it a private binding in a header the relay's access check reads, and counts its bytes.
+async fn relay_front(
+    listener: tokio::net::TcpListener,
+    relay: SocketAddr,
+    per_ip: Option<NonZeroUsize>,
+    usage: Arc<relay::Usage>,
+) {
     let shares = Shares::default();
     let mut connections = tokio::task::JoinSet::new();
+    let mut flush = tokio::time::interval(Duration::from_secs(60));
     loop {
         tokio::select! {
             Some(_) = connections.join_next() => {}
+            _ = flush.tick() => usage.flush(),
             accepted = listener.accept() => match accepted {
-                Ok((mut client, peer)) => {
+                Ok((client, peer)) => {
                     // A refused connection closes as it drops.
-                    let Some(share) = shares.take(peer.ip(), per_ip) else { continue };
-                    connections.spawn(async move {
-                        let _share = share;
-                        // The relay sends small QUIC datagrams that must not wait to coalesce.
-                        let _ = client.set_nodelay(true);
-                        // A client gone without closing would otherwise keep its share.
-                        let keepalive = socket2::TcpKeepalive::new()
-                            .with_time(Duration::from_secs(60))
-                            .with_interval(Duration::from_secs(15));
-                        let _ = socket2::SockRef::from(&client).set_tcp_keepalive(&keepalive);
-                        if let Ok(mut relay) = tokio::net::TcpStream::connect(relay).await {
-                            let _ = relay.set_nodelay(true);
-                            let (mut from_client, mut to_client) = client.split();
-                            let (mut from_relay, mut to_relay) = relay.split();
-                            // Either side ending closes both, so a half-closed peer keeps no share.
-                            tokio::select! {
-                                _ = tokio::io::copy(&mut from_client, &mut to_relay) => {}
-                                _ = tokio::io::copy(&mut from_relay, &mut to_client) => {}
-                            }
-                        }
-                    });
+                    let share = match per_ip {
+                        Some(limit) => match shares.take(peer.ip(), limit) {
+                            Some(share) => Some(share),
+                            None => continue,
+                        },
+                        None => None,
+                    };
+                    connections.spawn(front_connection(client, relay, share, usage.clone()));
                 }
                 // Out of descriptors, say; retrying at once would spin.
                 Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
             },
         }
+    }
+}
+
+async fn front_connection(
+    mut client: tokio::net::TcpStream,
+    relay: SocketAddr,
+    _share: Option<Share>,
+    usage: Arc<relay::Usage>,
+) {
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncWriteExt as _;
+    let (front, counter, _guard) = usage.open_front();
+    // The relay sends small QUIC datagrams that must not wait to coalesce.
+    let _ = client.set_nodelay(true);
+    // A client gone without closing would otherwise keep its share.
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(15));
+    let _ = socket2::SockRef::from(&client).set_tcp_keepalive(&keepalive);
+    let head = tokio::time::timeout(
+        Duration::from_secs(10),
+        relay::read_head(&mut client, &front),
+    );
+    let Ok(Some((head, received))) = head.await else {
+        return;
+    };
+    counter.read.fetch_add(received as u64, Ordering::Relaxed);
+    let Ok(mut relay) = tokio::net::TcpStream::connect(relay).await else {
+        return;
+    };
+    let _ = relay.set_nodelay(true);
+    if relay.write_all(&head).await.is_err() {
+        return;
+    }
+    let (from_client, to_client) = client.split();
+    let (from_relay, to_relay) = relay.split();
+    // Either side ending closes both, so a half-closed peer keeps no share.
+    tokio::select! {
+        _ = relay::pump(from_client, to_relay, &counter.read) => {}
+        _ = relay::pump(from_relay, to_client, &counter.written) => {}
     }
 }
 
@@ -1047,6 +1178,7 @@ mod tests {
             Arc::new(iroh_relay::server::AllowAll),
             None,
             NonZeroUsize::new(1),
+            Default::default(),
         )
         .await?;
         let addr = relay.addr;
@@ -1093,31 +1225,28 @@ mod tests {
     }
 
     #[test]
+    fn advertised_addresses_come_first_once() {
+        let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
+        assert_eq!(
+            advertised_first(
+                &[addr("203.0.113.7:4792")],
+                vec![addr("172.17.0.2:4792"), addr("203.0.113.7:4792")]
+            ),
+            [addr("203.0.113.7:4792"), addr("172.17.0.2:4792")]
+        );
+    }
+
+    #[test]
     fn relay_tokens_depend_on_the_invite() {
         assert_ne!(relay_token(&"a".repeat(64)), relay_token(&"b".repeat(64)));
         assert_eq!(relay_token(&"a".repeat(64)).len(), 64);
     }
 
     #[test]
-    fn bootstrap_settings_are_validated() -> Result<()> {
-        let mut config = NetworkConfig {
-            bootstrap: bootstrap::Bootstrap::Public,
-            ..Default::default()
-        };
-        config.validate()?;
-        let servers = config.discovery_servers()?;
-        assert_eq!(servers.len(), 1);
-        assert!(servers[0].starts_with("vibeface://"));
-        config.discovery = servers.clone();
-        assert_eq!(
-            config.discovery_servers()?.len(),
-            1,
-            "the bootstrap Discovery is not registered twice"
-        );
-        assert!(NetworkConfig::default().discovery_servers()?.is_empty());
-        // The public node: Discovery and an open relay on one Node.
+    fn the_public_node_settings_are_valid() -> Result<()> {
+        // The default bootstrap node with an open relay.
         let public = NetworkConfig {
-            serve_discovery: true,
+            mesh: mesh::MeshConfig::public()?,
             relay_listen: Some("0.0.0.0:3340".parse()?),
             relay_url: Some("http://203.0.113.7:3340".into()),
             relay_open: true,
@@ -1145,6 +1274,45 @@ mod tests {
             merged,
             vec![(url, Some("grant".into())), (other, Some("token".into()))]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn signed_addresses_require_canonical_ids_and_gateway_origins() -> Result<()> {
+        let identity = crate::crypto::LocalIdentity::generate();
+        let device = identity.device_id()?;
+        let network = identity.fixture_network_id()?;
+        let record = AddressRecord {
+            version: 1,
+            network_id: network.clone(),
+            device_id: device.clone(),
+            seq: 1,
+            endpoint: EndpointAddr::new(endpoint_id(&device)?),
+            gateway_url: Some("https://node.example:8443".into()),
+            relay: None,
+        };
+        let sign = |record: &AddressRecord| -> Result<SignedAddress> {
+            let payload = serde_json::to_string(record)?;
+            Ok(SignedAddress {
+                signature: identity.sign_payload(ADDRESS_DOMAIN, payload.as_bytes())?,
+                payload,
+            })
+        };
+        let signed = sign(&record)?;
+        assert_eq!(signed.open(&network)?, record);
+        assert_eq!(signed.payload, serde_json::to_string(&record)?);
+        for url in [
+            "https://user:secret@node.example",
+            "https://node.example?query=1",
+            "https://node.example#fragment",
+            "https://node.example/path",
+        ] {
+            let mut bad = record.clone();
+            bad.gateway_url = Some(url.into());
+            assert!(sign(&bad)?.open(&network).is_err(), "{url}");
+        }
+        assert!(endpoint_id(&device.to_uppercase()).is_err());
+        assert!(endpoint_id(&"00".repeat(32)).is_err());
         Ok(())
     }
 
@@ -1185,7 +1353,14 @@ mod tests {
             token: token.clone(),
             attempts,
         };
-        let relay = spawn_relay("127.0.0.1:0".parse()?, Arc::new(policy), None, None).await?;
+        let relay = spawn_relay(
+            "127.0.0.1:0".parse()?,
+            Arc::new(policy),
+            None,
+            None,
+            Default::default(),
+        )
+        .await?;
         let url = format!("http://{}", relay.addr);
         let config = NetworkConfig {
             bind: Some("127.0.0.1:0".parse()?),

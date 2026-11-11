@@ -3,8 +3,9 @@
 //! Both ends prove their device key inside the Noise handshake. Membership is read again for
 //! every request, so a device that joins mid-session gains access and a revoked one loses it.
 
+#[cfg(test)]
+use crate::crypto::LocalIdentity;
 use crate::{
-    crypto::LocalIdentity,
     identity::{
         AuthorizationView, GovernanceAction, GovernanceEvent, IdentityKind, LAST_MANAGER, Member,
         NO_RECOVERY_WAITING, NetworkState, RECOVERY_SKEW_MS, RootCheckpoint,
@@ -23,7 +24,7 @@ use iroh::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     net::SocketAddr,
     num::NonZeroU32,
     path::Path,
@@ -31,14 +32,19 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time::Instant};
+#[cfg(test)]
 use tokio_tungstenite::tungstenite::Message as NativeMessage;
+use vibeface_protocol::valid_business_id;
 use vibeface_secure::{
     Channel,
     join::{InviteRecord, Ticket, invite_id, join_commit, short_code},
 };
+
+mod concurrency;
+use concurrency::{Authority, Calls, Pushes};
 
 pub const PROLOGUE: &[u8] = b"vibeface:client:v1";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -57,6 +63,7 @@ const QUEUED_FRAMES: usize = 4;
 static GUESTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
 const GUEST_LIFETIME: Duration = Duration::from_secs(15 * 60);
 
+#[cfg(test)]
 type NativeSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -64,6 +71,7 @@ type NativeSocket =
 /// over `vibeface/client/1`. Forwarded frames are `tag ‖ u32 length ‖ bytes`.
 pub enum ClientSocket {
     Server(Box<WebSocket>),
+    #[cfg(test)]
     Client(Box<NativeSocket>),
     Forwarded(Box<Forwarded>),
 }
@@ -110,6 +118,7 @@ impl ClientSocket {
     pub async fn next(&mut self) -> Option<Result<Message>> {
         match self {
             Self::Server(socket) => socket.next().await.map(|frame| frame.map_err(Into::into)),
+            #[cfg(test)]
             Self::Client(socket) => loop {
                 let frame = match socket.next().await? {
                     Ok(frame) => frame,
@@ -131,6 +140,7 @@ impl ClientSocket {
     pub async fn send(&mut self, message: Message) -> Result<()> {
         match self {
             Self::Server(socket) => socket.send(message).await.map_err(Into::into),
+            #[cfg(test)]
             Self::Client(socket) => socket
                 .send(match message {
                     Message::Text(text) => NativeMessage::Text(text.as_str().to_owned().into()),
@@ -220,9 +230,11 @@ struct Session {
     /// Set by `subscribe` to the management permission the device had then.
     subscribed: Option<bool>,
     observation: Option<crate::runtime::ObservationGuard>,
+    /// The owner at this computer over the owner-only maintenance socket; see `operator_call`.
+    operator: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct Principal {
     source: &'static str,
     network_id: String,
@@ -231,26 +243,13 @@ struct Principal {
     can_manage: bool,
 }
 
-pub struct Client {
+#[cfg(test)]
+struct FrameClient {
     socket: ClientSocket,
     channel: Channel,
 }
-impl Client {
-    /// Connects through the Gateway at `origin` and pins `target`'s device key.
-    pub async fn connect(origin: &str, identity: &LocalIdentity, target: &str) -> Result<Self> {
-        let (socket, _) = tokio::time::timeout(
-            HANDSHAKE_TIMEOUT,
-            tokio_tungstenite::connect_async(client_url(origin)?),
-        )
-        .await
-        .context("Gateway connection timed out")??;
-        let mut socket = ClientSocket::Client(Box::new(socket));
-        let connect = serde_json::to_string(&Connect::Connect {
-            target: target.to_owned(),
-        })?;
-        socket.send(Message::Text(connect.into())).await?;
-        Self::from_socket(socket, identity, target).await
-    }
+#[cfg(test)]
+impl FrameClient {
     async fn from_socket(
         mut socket: ClientSocket,
         identity: &LocalIdentity,
@@ -271,7 +270,7 @@ impl Client {
         .context("client handshake timed out")??;
         Ok(Self { socket, channel })
     }
-    pub async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+    async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = uuid::Uuid::new_v4().to_string();
         let request = Request {
             id: id.clone(),
@@ -295,6 +294,7 @@ impl Client {
         })
         .await
         .context("client response timed out; outcome may be unknown")?
+        .with_context(|| format!("client {method} request failed"))
     }
 }
 
@@ -354,7 +354,15 @@ pub async fn serve_gateway(node: Arc<Runtime>, mut socket: ClientSocket) -> Resu
     if !node.config.forwarding.any {
         let member = async {
             let network = node.membership_state().await?.genesis.network_id;
-            node.store.lock().await.authorize_node(&network, &target)
+            {
+                let network = network.clone();
+                let target = target.clone();
+                node.store
+                    .call("gateway_authorize", move |store| {
+                        store.authorize_node(&network, &target)
+                    })
+                    .await
+            }
         };
         if let Err(error) = member.await {
             return refuse(&mut socket, "target_not_member", error).await;
@@ -551,6 +559,7 @@ pub async fn serve_join(node: Arc<Runtime>, connection: Connection, remote: Stri
                 cookie: None,
                 subscribed: None,
                 observation: None,
+                operator: false,
             };
             let result = dispatch(&node, &mut session, method, request["params"].clone()).await?;
             Ok(json!({"result":result}))
@@ -566,8 +575,17 @@ pub async fn serve_local(node: Arc<Runtime>, socket: ClientSocket, cookie: Strin
 
 async fn serve_session(
     node: Arc<Runtime>,
+    socket: ClientSocket,
+    cookie: Option<String>,
+) -> Result<()> {
+    serve_session_with_heartbeat(node, socket, cookie, HEARTBEAT).await
+}
+
+async fn serve_session_with_heartbeat(
+    node: Arc<Runtime>,
     mut socket: ClientSocket,
     cookie: Option<String>,
+    heartbeat_period: Duration,
 ) -> Result<()> {
     let mut local_changes = node.local_access.subscribe();
     let (mut channel, device_id) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
@@ -586,26 +604,16 @@ async fn serve_session(
     })
     .await
     .context("client handshake timed out")??;
-    if let Some(cookie) = &cookie {
-        let view = node.membership_state().await?.project()?;
-        if view.client(&device_id).is_err() {
-            let local =
-                node.local_access
-                    .session(cookie, &node.identity.device_id()?, &view.network_id)?;
-            ensure!(
-                local.device_id == device_id,
-                "local browser cookie is bound to another device"
-            );
-        }
-    }
     let mut session = Session {
         device_id,
         cookie,
         subscribed: None,
         observation: None,
+        operator: false,
     };
+    let authority = Authority::initialize(&node, &session, local_changes.clone()).await?;
     let opened = Instant::now();
-    let mut guest = if session.cookie.is_none() && principal(&node, &session).await.is_err() {
+    let mut guest = if session.cookie.is_none() && authority.principal(&node, &session).is_err() {
         Some(
             GUESTS
                 .try_acquire()
@@ -616,11 +624,42 @@ async fn serve_session(
     };
     let mut membership = node.membership.subscribe();
     let mut events = node.events.subscribe();
-    let mut heartbeat = tokio::time::interval(HEARTBEAT);
+    let mut heartbeat = tokio::time::interval(heartbeat_period);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut received = Instant::now();
     let mut partial_started: Option<Instant> = None;
+    let mut calls = Calls::default();
+    let mut pushes = Pushes::default();
+    let mut resync_pending = false;
     loop {
+        calls.start_ordered(&node, &session, &authority);
+        let mut delivered = false;
+        if authority.ready(&node)? {
+            if resync_pending
+                && session.subscribed.is_some()
+                && pushes.is_empty()
+                && let Some(principal) = authority.current(&node, &session)?
+            {
+                pushes.start(&node, &session, principal, json!({"type":"resync"}));
+                resync_pending = false;
+            }
+            if let Some(completed) = calls.take_deferred()
+                && let Some(response) = calls.deliver(&node, &mut session, &authority, completed)?
+            {
+                send_value(&mut socket, &mut channel, &response).await?;
+                received = Instant::now();
+                delivered = true;
+            }
+            if let Some(prepared) = pushes.take_deferred()
+                && let Some(push) = pushes.deliver(&node, &session, &authority, prepared)?
+            {
+                send_value(&mut socket, &mut channel, &push).await?;
+                delivered = true;
+            }
+        }
+        if delivered {
+            continue;
+        }
         tokio::select! {
             frame = socket.next() => {
                 received = Instant::now();
@@ -630,28 +669,31 @@ async fn serve_session(
                             partial_started = None;
                             let request: Request = serde_json::from_slice(&plaintext).context("invalid client request")?;
                             validate_request(&request)?;
-                            let local = is_local_only(&node, &session).await?;
-                            let result = if local && request.method != "local_access" {
-                                tokio::select! {
-                                    result = dispatch(&node, &mut session, &request.method, request.params) => result,
-                                    _ = local_changes.changed() => bail!("local browser access was revoked"),
-                                }
-                            } else {
-                                dispatch(&node, &mut session, &request.method, request.params).await
-                            };
-                            let response = match result {
-                                Ok(result) => Response { id: request.id, result, error: None, code: None },
-                                Err(error) => Response { id: request.id, result: Value::Null, error: Some(crate::logging::scrub(&error.to_string())), code: error.downcast_ref::<crate::discovery::CodexMissing>().map(|_| crate::discovery::CodexMissing::CODE) },
-                            };
-                            send_value(&mut socket, &mut channel, &response).await?;
+                            if let Some(response) = calls.accept(&node, &session, &authority, request)? {
+                                send_value(&mut socket, &mut channel, &response).await?;
+                            }
                         } else { partial_started.get_or_insert_with(Instant::now); }
                     }
                     Message::Ping(_) | Message::Pong(_) => {},
                     _ => bail!("client channel accepts only encrypted binary frames"),
                 }
             }
-            event = events.recv(), if session.subscribed.is_some() => {
-                let principal = principal(&node, &session).await?;
+            completed = calls.next(), if calls.running() => {
+                if let Some(response) = calls.deliver(&node, &mut session, &authority, completed?)? {
+                    send_value(&mut socket, &mut channel, &response).await?;
+                    received = Instant::now();
+                }
+            }
+            prepared = pushes.next(), if pushes.running() => {
+                if let Some(push) = pushes.deliver(&node, &session, &authority, prepared?)? {
+                    send_value(&mut socket, &mut channel, &push).await?;
+                }
+            }
+            event = events.recv(), if session.subscribed.is_some() && pushes.is_empty() && authority.ready(&node)? => {
+                let Some(principal) = authority.current(&node, &session)? else {
+                    resync_pending = true;
+                    continue;
+                };
                 match event {
                     Ok(event) if event.network_id == principal.network_id => {
                         // A burst, such as a sync catching up, is cheaper as one full read than as records per event.
@@ -659,9 +701,9 @@ async fn serve_session(
                             while events.try_recv().is_ok() {}
                             json!({"type":"resync"})
                         } else {
-                            pushed(&node, &principal.network_id, &session.device_id, event.payload).await
+                            event.payload
                         };
-                        send_value(&mut socket, &mut channel, &json!({"type":"changed","payload":payload})).await?
+                        pushes.start(&node, &session, principal, payload);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => send_value(&mut socket, &mut channel, &json!({"type":"changed","payload":{"type":"resync"}})).await?,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
@@ -669,11 +711,13 @@ async fn serve_session(
                 }
             }
             _ = heartbeat.tick() => {
-                ensure!(received.elapsed() < IDLE_TIMEOUT, "client channel idle");
+                // A live call may legitimately outlast the idle interval. Completion starts a
+                // fresh interval, but a half-sent encrypted message still has its own deadline.
+                ensure!(!calls.is_empty() || received.elapsed() < IDLE_TIMEOUT, "client channel idle");
                 ensure!(partial_started.is_none_or(|at| at.elapsed() < IDLE_TIMEOUT), "client fragmented message timed out");
-                if session.subscribed.is_some() || session.observation.is_some() { principal(&node, &session).await?; }
+                if session.subscribed.is_some() || session.observation.is_some() { authority.current(&node, &session)?; }
                 if guest.is_some() {
-                    if principal(&node, &session).await.is_ok() { guest = None; }
+                    if authority.principal(&node, &session).is_ok() { guest = None; }
                     else { ensure!(opened.elapsed() < GUEST_LIFETIME, "a device that is not a member may stay connected for 15 minutes"); }
                 }
                 if let Some(observation) = &session.observation { observation.refresh(); }
@@ -681,16 +725,18 @@ async fn serve_session(
             }
             changed = membership.changed() => {
                 changed.context("membership state closed")?;
+                calls.check_authority(&node, &session, &authority)?;
                 // A removed device loses its subscription at once, not at the next heartbeat; one
                 // whose management permission changed reconnects to pick up the new principal.
                 if session.subscribed.is_some() || session.observation.is_some() {
-                    let now = principal(&node, &session).await?.can_manage;
+                    let Some(now) = authority.current(&node, &session)? else { continue; };
+                    let now = now.can_manage;
                     ensure!(session.subscribed.is_none_or(|was| was == now), "this device's management permission changed");
                 }
             }
             changed = local_changes.changed(), if session.cookie.is_some() => {
                 changed.context("local access state closed")?;
-                if is_local_only(&node, &session).await? {
+                if authority.current(&node, &session).is_err() {
                     bail!("local browser access was revoked");
                 }
             }
@@ -728,6 +774,34 @@ async fn dispatch(
     method: &str,
     params: Value,
 ) -> Result<Value> {
+    if snapshot_request(method, &params) {
+        let authority = Authority::initialize(node, session, node.local_access.subscribe()).await?;
+        let principal = authority.display_principal(node, session).await?;
+        let result = dispatch_inner(node, session, method, params, Some(principal.clone())).await;
+        authority.check(node, session, &principal)?;
+        result
+    } else {
+        dispatch_inner(node, session, method, params, None).await
+    }
+}
+
+fn snapshot_request(method: &str, params: &Value) -> bool {
+    method == "rpc"
+        && params["method"]
+            .as_str()
+            .is_some_and(crate::runtime::snapshot_rpc)
+}
+
+async fn dispatch_inner(
+    node: &Arc<Runtime>,
+    session: &mut Session,
+    method: &str,
+    params: Value,
+    display_principal: Option<Principal>,
+) -> Result<Value> {
+    // A supplied cached principal can only authorize the explicit display allowlist. Every
+    // mutation, control and receipt still enters the authoritative writer checks below.
+    let display_principal = display_principal.filter(|_| snapshot_request(method, &params));
     let _work = if matches!(
         method,
         "info"
@@ -746,7 +820,10 @@ async fn dispatch(
     } else {
         Some(node.maintenance.enter()?)
     };
-    if !GUEST_METHODS.contains(&method) {
+    if display_principal.is_none()
+        && !GUEST_METHODS.contains(&method)
+        && !local_owner_outside_a_network(node, session).await?
+    {
         principal(node, session).await?;
     }
     match method {
@@ -833,7 +910,7 @@ async fn dispatch(
             let principal = principal(node, session).await?;
             let read_only = matches!(
                 params["op"].as_str(),
-                Some("status" | "list" | "get" | "find_intent" | "read")
+                Some("receipt" | "status" | "list" | "get" | "find_intent" | "read" | "providers")
             );
             ensure!(
                 read_only || (principal.source == "membership" && principal.can_manage),
@@ -895,6 +972,18 @@ async fn dispatch(
             node_operator(node, session).await?;
             node.configure_triage(params).await
         }
+        "relay_settings" => {
+            node_operator(node, session).await?;
+            node.relay_settings()
+        }
+        "share_link" => {
+            node_operator(node, session).await?;
+            Ok(json!({"link":node.share_link()?.to_string()}))
+        }
+        "configure_relay" => {
+            node_operator(node, session).await?;
+            node.configure_relay(params).await
+        }
         "test_webhook" => {
             node_operator(node, session).await?;
             node.test_webhook().await
@@ -912,14 +1001,15 @@ async fn dispatch(
             // The browser sends the vector it has already shown; a lagging entry asks its peers now.
             let principal = principal(node, session).await?;
             session.subscribed = Some(principal.can_manage);
-            let vector: std::collections::BTreeMap<String, u64> = node
-                .store
-                .lock()
-                .await
-                .heads(&principal.network_id)?
-                .into_iter()
-                .map(|(author, (seq, _))| (author, seq))
-                .collect();
+            let vector: std::collections::BTreeMap<String, u64> = {
+                let network = principal.network_id.clone();
+                node.store
+                    .call("subscribe_heads", move |store| store.heads(&network))
+                    .await
+            }?
+            .into_iter()
+            .map(|(author, (seq, _))| (author, seq))
+            .collect();
             let behind = params["vector"].as_object().is_some_and(|seen| {
                 seen.iter().any(|(author, seq)| {
                     seq.as_u64()
@@ -932,7 +1022,10 @@ async fn dispatch(
             Ok(json!({"subscribed":true,"vector":vector,"behind":behind}))
         }
         "rpc" => {
-            let principal = principal(node, session).await?;
+            let principal = match display_principal {
+                Some(principal) => principal,
+                None => principal(node, session).await?,
+            };
             let mut params = params;
             bind_client_identity(&mut params, &principal.device_id)?;
             let watched_scope = (params["method"] == "conversation")
@@ -977,23 +1070,33 @@ async fn dispatch(
         "invite" => {
             manager_view(node, session).await?;
             let record: InviteRecord = from_field(&params, "record")?;
-            let join_id = node
-                .store
-                .lock()
-                .await
-                .register_invite(&record, &session.device_id)?;
-            Ok(json!({"join_id":join_id,"entry_id":node.identity.device_id()?}))
+            let join_id = {
+                let device = session.device_id.clone();
+                node.store
+                    .call("register_invite", move |store| {
+                        store.register_invite(&record, &device)
+                    })
+                    .await
+            }?;
+            Ok(json!({"join_id":join_id,"entry":node.share_link()?.to_string()}))
         }
         "entrances" => {
             let principal = principal(node, session).await?;
-            Ok(json!({"entrances":node.entrances(&principal.network_id).await?}))
+            Ok(
+                json!({"entrances":node.entrances(&principal.network_id).await?,
+                "gateways":node.mesh_gateways().await?}),
+            )
         }
         "join_check" => {
-            let state = node
-                .store
-                .lock()
-                .await
-                .invite_state(text(&params, "secret")?, &session.device_id)?;
+            let state = {
+                let secret = text(&params, "secret")?.to_owned();
+                let device = session.device_id.clone();
+                node.store
+                    .call("invite_state", move |store| {
+                        store.invite_state(&secret, &device)
+                    })
+                    .await
+            }?;
             Ok(json!({"invite":state}))
         }
         "join" => {
@@ -1002,16 +1105,24 @@ async fn dispatch(
                 join.public_key == session.device_id,
                 "join key differs from this channel's device"
             );
-            let request = node.store.lock().await.join(&join, &session.device_id)?;
+            let request = {
+                let device = session.device_id.clone();
+                node.store
+                    .call("join", move |store| store.join(&join, &device))
+                    .await
+            }?;
             node.join_changed(&request.network_id);
             Ok(serde_json::to_value(request)?)
         }
         "join_status" => {
             let Some(join_id) = params.get("join_id") else {
                 manager_view(node, session).await?;
-                let mut pending = serde_json::to_value(
-                    node.store.lock().await.pending_joins(&session.device_id)?,
-                )?;
+                let mut pending = serde_json::to_value({
+                    let device = session.device_id.clone();
+                    node.store
+                        .call("pending_joins", move |store| store.pending_joins(&device))
+                        .await
+                }?)?;
                 // A join waits on the Node whose invite it used; managers see it from any entry.
                 if let Some(local) = pending.as_array_mut() {
                     for remote in node.remote_joins(&session.device_id).await {
@@ -1027,11 +1138,16 @@ async fn dispatch(
             };
             let join_id = join_id.as_str().context("join_id must be a string")?;
             let reveal = params.get("reveal").and_then(Value::as_str);
-            let request =
+            let request = {
+                let join_id = join_id.to_owned();
+                let device = session.device_id.clone();
+                let reveal = reveal.map(str::to_owned);
                 node.store
-                    .lock()
+                    .call("join_status", move |store| {
+                        store.join_status(&join_id, &device, reveal.as_deref())
+                    })
                     .await
-                    .join_status(join_id, &session.device_id, reveal)?;
+            }?;
             if reveal.is_some() {
                 node.join_changed(&request.network_id);
             }
@@ -1045,31 +1161,44 @@ async fn dispatch(
             if request.status == JoinStatus::Joined {
                 let state = node.membership_state().await?;
                 state.project()?.member(&session.device_id)?;
-                result["addresses"] = json!(node.store.lock().await.address_book()?);
+                result["addresses"] = json!(
+                    node.store
+                        .call("address_book", |store| store.address_book())
+                        .await?
+                );
                 result["state"] = serde_json::to_value(state)?;
             }
             Ok(result)
         }
         "join_withdraw" => {
-            let request = node
-                .store
-                .lock()
-                .await
-                .withdraw_join(text(&params, "join_id")?, &session.device_id)?;
+            let request = {
+                let join_id = text(&params, "join_id")?.to_owned();
+                let device = session.device_id.clone();
+                node.store
+                    .call("withdraw_join", move |store| {
+                        store.withdraw_join(&join_id, &device)
+                    })
+                    .await
+            }?;
             node.join_changed(&request.network_id);
             Ok(serde_json::to_value(request)?)
         }
         "approve" => {
             manager_view(node, session).await?;
             let join_id = text(&params, "join_id")?;
-            if node.store.lock().await.holds_join(join_id)? {
+            if {
+                let join_id = join_id.to_owned();
+                node.store
+                    .call("holds_join", move |store| store.holds_join(&join_id))
+                    .await
+            }? {
                 approve_join(node, &session.device_id, &params).await
             } else {
                 node.forward_join_approval(&session.device_id, &params)
                     .await
             }
         }
-        // A manager revokes any device; any client may revoke itself, which the history checks.
+        // A manager revokes any device; any client may revoke itself.
         "revoke" => {
             let view = node.membership_state().await?.project()?;
             view.client(&session.device_id)?;
@@ -1080,6 +1209,7 @@ async fn dispatch(
                     && matches!(event.action, GovernanceAction::Revoke(_)),
                 "invalid revoke signer or action"
             );
+            view.authorize(&session.device_id, &event.action)?;
             let mut state = node.membership_state().await?;
             state.append(event)?;
             ensure!(
@@ -1106,6 +1236,7 @@ async fn dispatch(
                     .is_ok_and(|current| current.kind == member.kind),
                 "device is not a member of this personal network"
             );
+            view.authorize(&session.device_id, &event.action)?;
             let mut state = node.membership_state().await?;
             state.append(event)?;
             ensure!(
@@ -1233,7 +1364,12 @@ async fn dispatch(
                 })
                 .context("recovery key does not own this personal network")?;
             state.check_root(key, now as u64, false)?;
-            let heads = node.store.lock().await.heads(&state.genesis.network_id)?;
+            let heads = {
+                let network = state.genesis.network_id.clone();
+                node.store
+                    .call("heads", move |store| store.heads(&network))
+                    .await
+            }?;
             Ok(json!({"state":state,"heads":heads,"now_ms":now}))
         }
         "recover" => {
@@ -1254,9 +1390,8 @@ async fn dispatch(
     }
 }
 
-/// The history a recovery file carries, on top of `state`'s genesis. Anyone may send it, so of
-/// its events only the vetoes of its own checkpoints count: they let a recovery key sign again.
-/// Any other event, and with it any way to sign into an older epoch, is dropped.
+/// A recovery file carries its checkpoint vetoes and their complete signed dependencies.
+/// Dependencies establish history, and receive the same authorization projection as any sync.
 fn carried(params: &Value, state: &NetworkState) -> Result<NetworkState> {
     let checkpoints: Vec<RootCheckpoint> = optional(params, "checkpoints")?;
     let hashes = checkpoints
@@ -1264,15 +1399,35 @@ fn carried(params: &Value, state: &NetworkState) -> Result<NetworkState> {
         .map(RootCheckpoint::hash)
         .collect::<Result<Vec<_>>>()?;
     let events: Vec<GovernanceEvent> = optional(params, "events")?;
+    let mut available = BTreeMap::new();
+    for event in state.events.iter().chain(&events) {
+        available.insert(event.hash()?, event);
+    }
+    let mut pending = events.iter().filter(|event| {
+        matches!(&event.action, GovernanceAction::Veto { checkpoint, .. } if hashes.contains(checkpoint))
+    }).map(GovernanceEvent::hash).collect::<Result<Vec<_>>>()?;
+    let mut selected = BTreeSet::new();
+    while let Some(hash) = pending.pop() {
+        if !selected.insert(hash.clone()) {
+            continue;
+        }
+        let event = available
+            .get(&hash)
+            .context("missing carried governance dependency")?;
+        pending.extend(event.parents.iter().cloned());
+    }
+    let mut events: Vec<_> = selected
+        .into_iter()
+        .map(|hash| {
+            let event = available[&hash];
+            ((event.epoch, hash), event.clone())
+        })
+        .collect();
+    events.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(NetworkState {
         genesis: state.genesis.clone(),
         checkpoints,
-        events: events
-            .into_iter()
-            .filter(|event| {
-                matches!(&event.action, GovernanceAction::Veto { checkpoint, .. } if hashes.contains(checkpoint))
-            })
-            .collect(),
+        events: events.into_iter().map(|(_, event)| event).collect(),
     })
 }
 
@@ -1307,11 +1462,16 @@ async fn recover(node: &Runtime, session: &Session, params: &Value) -> Result<()
             incoming.recover_at(next, now)?;
         }
         stays(&incoming.project_at(now)?, &node_id)?;
-        node.store.lock().await.bootstrap_network(
-            incoming.clone(),
-            text(params, "capability")?,
-            &session.device_id,
-        )?;
+        {
+            let incoming = incoming.clone();
+            let capability = text(params, "capability")?.to_owned();
+            let device = session.device_id.clone();
+            node.store
+                .call("bootstrap_network", move |store| {
+                    store.bootstrap_network(incoming, &capability, &device)
+                })
+                .await
+        }?;
         node.install_membership(incoming).await?;
         return Ok(());
     }
@@ -1384,20 +1544,38 @@ pub(crate) async fn approve_join(
 ) -> Result<Value> {
     let join_id = text(params, "join_id")?;
     let request = if params["reject"] == true {
-        node.store.lock().await.reject_join(join_id, admin)?
+        {
+            let join_id = join_id.to_owned();
+            let admin = admin.to_owned();
+            node.store
+                .call("reject_join", move |store| {
+                    store.reject_join(&join_id, &admin)
+                })
+                .await
+        }?
     } else if let Some(nonce) = params.get("admin_nonce") {
         let nonce = nonce.as_str().context("admin_nonce must be a string")?;
-        node.store
-            .lock()
-            .await
-            .approve_nonce(join_id, admin, nonce)?
+        {
+            let join_id = join_id.to_owned();
+            let admin = admin.to_owned();
+            let nonce = nonce.to_owned();
+            node.store
+                .call("approve_nonce", move |store| {
+                    store.approve_nonce(&join_id, &admin, &nonce)
+                })
+                .await
+        }?
     } else {
         let event: GovernanceEvent = from_field(params, "event")?;
-        let (request, state) = node
-            .store
-            .lock()
-            .await
-            .approve_grant(join_id, admin, event)?;
+        let (request, state) = {
+            let join_id = join_id.to_owned();
+            let admin = admin.to_owned();
+            node.store
+                .call("approve_grant", move |store| {
+                    store.approve_grant(&join_id, &admin, event)
+                })
+                .await
+        }?;
         node.install_membership(state.clone()).await?;
         request
     };
@@ -1428,18 +1606,8 @@ async fn pushed(node: &Runtime, network: &str, client: &str, payload: Value) -> 
 async fn principal(node: &Runtime, session: &Session) -> Result<Principal> {
     let view = node.membership_state().await?.project()?;
     let node_id = node.identity.device_id()?;
-    ensure!(
-        view.revocation(&node_id).is_none(),
-        "this Node has been removed from the personal network"
-    );
-    if let Ok(member) = view.client(&session.device_id) {
-        return Ok(Principal {
-            source: "membership",
-            network_id: view.network_id,
-            device_id: member.device_id,
-            epoch: view.epoch,
-            can_manage: member.manage,
-        });
+    if let Some(principal) = member_principal(&view, &node_id, session)? {
+        return Ok(principal);
     }
     let cookie = session
         .cookie
@@ -1462,6 +1630,36 @@ async fn principal(node: &Runtime, session: &Session) -> Result<Principal> {
     })
 }
 
+fn member_principal(
+    view: &AuthorizationView,
+    node_id: &str,
+    session: &Session,
+) -> Result<Option<Principal>> {
+    ensure!(
+        view.revocation(node_id).is_none(),
+        "this Node has been removed from the personal network"
+    );
+    if session.operator {
+        return Ok(Some(Principal {
+            source: "local_operator",
+            network_id: view.network_id.clone(),
+            device_id: node_id.to_owned(),
+            epoch: view.epoch,
+            can_manage: false,
+        }));
+    }
+    if let Ok(member) = view.client(&session.device_id) {
+        return Ok(Some(Principal {
+            source: "membership",
+            network_id: view.network_id.clone(),
+            device_id: member.device_id,
+            epoch: view.epoch,
+            can_manage: member.manage,
+        }));
+    }
+    Ok(None)
+}
+
 /// Starting over is for the owner at this computer, once the signed removal is installed here.
 async fn removed_and_local(node: &Runtime, session: &Session) -> Result<()> {
     let view = node.membership_state().await?.project()?;
@@ -1470,6 +1668,9 @@ async fn removed_and_local(node: &Runtime, session: &Session) -> Result<()> {
         view.revocation(&node_id).is_some(),
         "this Node has not been removed from the personal network"
     );
+    if session.operator {
+        return Ok(());
+    }
     let cookie = session
         .cookie
         .as_deref()
@@ -1495,10 +1696,61 @@ async fn is_local_only(node: &Runtime, session: &Session) -> Result<bool> {
                 .is_err()))
 }
 
+/// Methods whose authority is a management client's signature, never the Node's own.
+const SIGNED_METHODS: [&str; 10] = [
+    "invite",
+    "approve",
+    "grant",
+    "revoke",
+    "veto",
+    "approve_recovery",
+    "recover",
+    "recovery_state",
+    "join",
+    "join_withdraw",
+];
+
+/// The owner at this computer, over the owner-only maintenance socket: what this Node's local
+/// page may do, without its cookie. Governance needs a management client's signature.
+pub(crate) async fn operator_call(
+    node: &Arc<Runtime>,
+    method: &str,
+    params: Value,
+) -> Result<Value> {
+    ensure!(
+        !SIGNED_METHODS.contains(&method)
+            && !(method == "join_status" && params.get("join_id").is_none()),
+        "{method} needs the signature of a management client; enroll one with `vibeface client enroll`"
+    );
+    ensure!(
+        !matches!(method, "subscribe" | "log" | "local_access" | "node_join"),
+        "{method} is not available from the maintenance socket"
+    );
+    ensure!(params.is_object(), "invalid client method or params");
+    let mut session = Session {
+        device_id: node.identity.device_id()?,
+        cookie: None,
+        subscribed: None,
+        observation: None,
+        operator: true,
+    };
+    dispatch(node, &mut session, method, params).await
+}
+
+async fn local_owner_outside_a_network(node: &Runtime, session: &Session) -> Result<bool> {
+    Ok(session.operator && !node.has_membership().await?)
+}
+
+/// A management client, the local page, or the owner at this computer; the owner runs the Node
+/// also before it belongs to a personal network, as a public or bootstrap Node does. Methods
+/// that act inside a network still ask for its principal.
 async fn node_operator(node: &Runtime, session: &Session) -> Result<()> {
+    if local_owner_outside_a_network(node, session).await? {
+        return Ok(());
+    }
     let principal = principal(node, session).await?;
     ensure!(
-        principal.can_manage || principal.source == "local_session",
+        principal.can_manage || matches!(principal.source, "local_session" | "local_operator"),
         "management permission or local browser access required"
     );
     Ok(())
@@ -1533,25 +1785,33 @@ async fn authentication(node: &Runtime, session: &Session) -> Result<Value> {
                 json!({"principal":null,"initialized":true,"network_id":view.network_id,"node_revoked":true,"state":state,"now_ms":now}),
             )
         }
-        Err(_) => Ok(
-            json!({"principal":null,"initialized":true,"revoked":view.cutoff(&session.device_id).is_some(),"recovery":recovery_status(&state, &view, &session.device_id)?,"now_ms":now}),
-        ),
+        Err(_) => {
+            let recovery = recovery_status(&state, &view, &session.device_id)?;
+            let owns_recovery = !recovery.is_null();
+            let mut result = json!({"principal":null,"initialized":true,"revoked":view.cutoff(&session.device_id).is_some(),"recovery":recovery,"now_ms":now});
+            if owns_recovery {
+                result["network_id"] = json!(view.network_id);
+            }
+            Ok(result)
+        }
     }
 }
 
 fn recovery_status(state: &NetworkState, view: &AuthorizationView, device: &str) -> Result<Value> {
     let manages = |members: &[Member]| members.iter().any(|m| m.device_id == device && m.manage);
     if let Some(pending) = view.pending.as_ref().filter(|p| manages(&p.members)) {
-        return Ok(json!({"status":"waiting","effective_at_ms":pending.effective_at_ms}));
+        return Ok(
+            json!({"status":"waiting","checkpoint_hash":pending.checkpoint,"effective_at_ms":pending.effective_at_ms}),
+        );
     }
-    for checkpoint in &state.checkpoints {
+    for checkpoint in state.checkpoints.iter().rev() {
         if checkpoint
             .directory
             .as_ref()
             .is_some_and(|d| manages(&d.members))
             && view.stopped.contains(&checkpoint.hash()?)
         {
-            return Ok(json!({"status":"stopped"}));
+            return Ok(json!({"status":"stopped","checkpoint_hash":checkpoint.hash()?}));
         }
     }
     Ok(Value::Null)
@@ -1577,7 +1837,14 @@ fn bind_client_identity(input: &mut Value, subject: &str) -> Result<()> {
     }
     if matches!(
         input["method"].as_str(),
-        Some("message" | "presence" | "notifications" | "ack")
+        Some(
+            "message"
+                | "presence"
+                | "notifications"
+                | "ack"
+                | "workspace_command_receipt"
+                | "signed_receipt"
+        )
     ) {
         input
             .as_object_mut()
@@ -1587,35 +1854,9 @@ fn bind_client_identity(input: &mut Value, subject: &str) -> Result<()> {
     Ok(())
 }
 
-/// `http(s)://host` → `ws(s)://host/api/client`.
-fn client_url(origin: &str) -> Result<String> {
-    let mut url = reqwest::Url::parse(origin)?;
-    let scheme = match url.scheme() {
-        "http" => "ws",
-        "https" => "wss",
-        _ => bail!("Gateway URL must be HTTP or HTTPS"),
-    };
-    ensure!(
-        url.host_str().is_some() && url.username().is_empty() && url.password().is_none(),
-        "Gateway URL must not contain credentials"
-    );
-    url.set_scheme(scheme)
-        .map_err(|_| anyhow::anyhow!("invalid Gateway URL"))?;
-    url.set_path("/api/client");
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url.into())
-}
-
 /// The ticket in an invite: `vibeface://join/vibeface1…` or `vibeface1…` alone.
 pub fn parse_join_link(link: &str) -> Result<Ticket> {
-    let link = link.trim();
-    let ticket = link.strip_prefix("vibeface://join/").unwrap_or(link);
-    ensure!(
-        ticket.starts_with("vibeface1"),
-        "invite link must look like vibeface://join/vibeface1…"
-    );
-    Ok(Ticket::decode(ticket)?)
+    Ok(Ticket::from_link(link)?)
 }
 
 /// Saved so an interrupted join, from the terminal or the local page, resumes with the same
@@ -1634,84 +1875,96 @@ struct PendingJoin {
 struct JoinLink {
     net: Arc<Net>,
     entry: String,
-    _router: iroh::protocol::Router,
 }
 impl JoinLink {
+    /// A link to the ticket's entry Node, dialed at the addresses and relay the ticket carries
+    /// and where the mesh or the configured relays find it.
     async fn open(node: &Runtime, ticket: &Ticket) -> Result<Self> {
         let entry = ticket.entry_id();
         let token = net::relay_token(&ticket.invite_hash());
+        let network = &node.config.network;
         let config = NetworkConfig {
-            discovery: node.config.network.discovery_servers()?,
-            bind: node
-                .config
-                .network
-                .bind
-                .map(|address| SocketAddr::new(address.ip(), 0)),
+            bind: network.bind.map(|address| SocketAddr::new(address.ip(), 0)),
             ..NetworkConfig::default()
         };
-        // A relay configured with a token keeps it. Without Discovery the entry Node may run
-        // any other configured relay; with it, only the relays the entry registered get the
-        // invite token, so the others never see it.
-        let discovery = !config.discovery.is_empty();
-        let mut relays = node
-            .config
-            .network
+        // iroh reads a relay's token only when it first connects, and it connects to a relay in
+        // its map on its own once bound, so the relays go in once their tokens are known.
+        let link = Arc::new(Net::bind(&node.identity.secret_key_hex, &config, 0, vec![]).await?);
+        let db = node.data_dir.join("mesh.sqlite3");
+        let hints = net::link_addr(&ticket.entry).await?;
+        // The entry's home relays: where the mesh says it is, and where the ticket says it was.
+        let homes = |record: &Option<net::mesh::record::MeshRecord>| -> Vec<iroh::RelayUrl> {
+            record
+                .as_ref()
+                .and_then(|record| record.relay_url.as_deref())
+                .and_then(|url| net::relay_url(url).ok())
+                .into_iter()
+                .chain(hints.relay_urls().cloned())
+                .collect()
+        };
+        let (record, open) = match node.net().ok().and_then(|net| net.mesh()) {
+            Some(mesh) => {
+                let record = mesh.find(&entry).await;
+                let open: Vec<_> = homes(&record)
+                    .into_iter()
+                    .filter(|url| net::mesh::open_relay(mesh.table().entries(), url))
+                    .collect();
+                (record, open)
+            }
+            None if network.mesh.enabled => {
+                let record = net::mesh::find_through(&link, &network.mesh, &db, &entry).await;
+                let entries =
+                    net::mesh::table::read(&db, &network.mesh.network).unwrap_or_default();
+                let open: Vec<_> = homes(&record)
+                    .into_iter()
+                    .filter(|url| net::mesh::open_relay(&entries, url))
+                    .collect();
+                (record, open)
+            }
+            None => (None, vec![]),
+        };
+        let entry_addr = record
+            .as_ref()
+            .map(|record| net::mesh::record_addr(record, network.mesh.allow_private))
+            .transpose()?;
+        // A relay configured with a token keeps it. The entry's home relays, found on the mesh or
+        // named by the ticket, get the invite token unless they admit anyone; not found on the
+        // mesh, the entry may run any configured relay.
+        let mut relays = network
             .relays
             .iter()
             .map(|relay| {
                 let credential = relay
                     .token
                     .clone()
-                    .or_else(|| (!discovery).then(|| token.clone()));
+                    .or_else(|| record.is_none().then(|| token.clone()));
                 Ok((net::relay_url(&relay.url)?, credential))
             })
             .collect::<Result<Vec<_>>>()?;
-        let n0 = if node.config.network.n0_relays {
-            iroh::defaults::prod::default_relay_map().urls::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        relays.extend(n0.iter().map(|url| (url.clone(), None)));
-        ensure!(
-            !relays.is_empty() || discovery,
-            "no relay or discovery server is configured to find the invite's entry Node"
-        );
-        // iroh reads a relay's token only when it first connects, and it connects to a relay
-        // in its map on its own once bound. With Discovery the endpoint binds without relays
-        // and they go in, with their tokens, once the entry's registered relays are known.
-        let initial = if discovery {
-            Vec::new()
-        } else {
-            relays.clone()
-        };
-        let link = Arc::new(Net::bind(&node.identity.secret_key_hex, &config, 0, initial).await?);
-        if discovery {
-            for url in link.discovered_relays(&entry, net::DIAL_TIMEOUT).await? {
-                if n0.contains(&url) {
-                    continue;
-                }
-                match relays.iter_mut().find(|(known, _)| *known == url) {
-                    Some((_, credential @ None)) => *credential = Some(token.clone()),
-                    Some(_) => {}
-                    None => relays.push((url, Some(token.clone()))),
-                }
-            }
-            for (url, credential) in &relays {
-                link.insert_relay(url.clone(), credential.clone()).await;
+        let mesh_home = entry_addr.iter().flat_map(|addr| addr.relay_urls()).take(1);
+        for home in mesh_home.chain(hints.relay_urls()) {
+            let credential = (!open.contains(home)).then(|| token.clone());
+            match relays.iter_mut().find(|(known, _)| known == home) {
+                Some((_, slot @ None)) => *slot = credential,
+                Some(_) => {}
+                None => relays.push((home.clone(), credential)),
             }
         }
-        let addrs: Vec<TransportAddr> = relays
-            .into_iter()
-            .map(|(url, _)| TransportAddr::Relay(url))
-            .collect();
-        let router = link.discovery_router();
+        ensure!(
+            record.is_some() || !relays.is_empty() || hints.ip_addrs().next().is_some(),
+            "the invite carries no address of its entry Node, which is not on the mesh, and no relay is configured to reach it"
+        );
+        for (url, credential) in &relays {
+            link.insert_relay(url.clone(), credential.clone()).await;
+        }
+        let mut addrs: Vec<TransportAddr> = entry_addr
+            .map(|addr| addr.addrs.into_iter().collect())
+            .unwrap_or_default();
+        addrs.extend(hints.ip_addrs().copied().map(TransportAddr::Ip));
+        addrs.extend(relays.into_iter().map(|(url, _)| TransportAddr::Relay(url)));
         link.learn(&EndpointAddr::from_parts(net::endpoint_id(&entry)?, addrs))
             .await;
-        Ok(Self {
-            net: link,
-            entry,
-            _router: router,
-        })
+        Ok(Self { net: link, entry })
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
@@ -1782,10 +2035,14 @@ async fn check_link_for_local_page(node: &Arc<Runtime>, params: &Value) -> Resul
         !node.has_membership().await?,
         "this Node already belongs to a personal network"
     );
-    node.store
-        .lock()
-        .await
-        .verify_bootstrap_capability(text(params, "capability")?)?;
+    {
+        let capability = text(params, "capability")?.to_owned();
+        node.store
+            .call("verify_bootstrap_capability", move |store| {
+                store.verify_bootstrap_capability(&capability)
+            })
+            .await
+    }?;
     let ticket = parse_join_link(text(params, "link")?)?;
     let link = JoinLink::open(node, &ticket).await?;
     let reply = link
@@ -1814,28 +2071,35 @@ pub(crate) async fn start_node_join(
     let link = parse_join_link(link)?.encode()?;
     let name = name.to_owned();
     ensure!(name.chars().count() <= 128, "device name is too long");
+    let existing_status = |slot: &mut Option<NodeJoinTask>| -> Result<Option<NodeJoin>> {
+        let Some(current) = slot.as_ref() else {
+            return Ok(None);
+        };
+        let ended = matches!(
+            current.status,
+            NodeJoin::Failed { .. } | NodeJoin::Cancelled
+        );
+        // An end without joining is reported once; asking again after that starts over.
+        if current.link == link && current.owner == owner {
+            let status = current.status.clone();
+            if ended {
+                *slot = None;
+            }
+            return Ok(Some(status));
+        }
+        ensure!(
+            ended || current.owner == owner,
+            "another join is already running on this computer"
+        );
+        Ok(None)
+    };
     {
         let mut slot = node
             .node_join
             .lock()
             .map_err(|_| anyhow!("join state unavailable"))?;
-        if let Some(current) = slot.as_ref() {
-            let ended = matches!(
-                current.status,
-                NodeJoin::Failed { .. } | NodeJoin::Cancelled
-            );
-            // An end without joining is reported once; asking again after that starts over.
-            if current.link == link && current.owner == owner {
-                let status = current.status.clone();
-                if ended {
-                    *slot = None;
-                }
-                return Ok(status);
-            }
-            ensure!(
-                ended || current.owner == owner,
-                "another join is already running on this computer"
-            );
+        if let Some(status) = existing_status(&mut slot)? {
+            return Ok(status);
         }
     }
     ensure!(
@@ -1843,15 +2107,22 @@ pub(crate) async fn start_node_join(
         "this Node already belongs to a personal network"
     );
     if let JoinOwner::Page(capability) = &owner {
-        node.store
-            .lock()
-            .await
-            .verify_bootstrap_capability(capability)?;
+        {
+            let capability = capability.clone();
+            node.store
+                .call("verify_bootstrap_capability", move |store| {
+                    store.verify_bootstrap_capability(&capability)
+                })
+                .await
+        }?;
     }
     let mut slot = node
         .node_join
         .lock()
         .map_err(|_| anyhow!("join state unavailable"))?;
+    if let Some(status) = existing_status(&mut slot)? {
+        return Ok(status);
+    }
     if let Some(previous) = slot.take() {
         previous.task.abort();
         let _ = std::fs::remove_file(node.data_dir.join("join.json"));
@@ -2106,15 +2377,7 @@ fn from_field<T: serde::de::DeserializeOwned>(value: &Value, key: &str) -> Resul
     .with_context(|| format!("invalid {key}"))
 }
 fn validate_request(request: &Request) -> Result<()> {
-    ensure!(
-        !request.id.is_empty()
-            && request.id.len() <= 128
-            && request
-                .id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b)),
-        "invalid request ID"
-    );
+    ensure!(valid_business_id(&request.id), "invalid request ID");
     ensure!(
         !request.method.is_empty() && request.method.len() <= 64 && request.params.is_object(),
         "invalid client method or params"
@@ -2157,6 +2420,7 @@ async fn send_value<T: Serialize>(
     }
     Ok(())
 }
+#[cfg(test)]
 async fn receive_value(socket: &mut ClientSocket, channel: &mut Channel) -> Result<Vec<u8>> {
     loop {
         if let Some(value) = channel.open_record(&next_binary(socket).await?)? {
@@ -2169,10 +2433,179 @@ async fn receive_value(socket: &mut ClientSocket, channel: &mut Channel) -> Resu
 mod tests {
     use super::*;
     use crate::identity::{Genesis, Member, Revocation};
+    use crate::runtime::test_support::{access as test_access, initialize_node, manager_settings};
+
+    fn test_session(device_id: String) -> Session {
+        Session {
+            device_id,
+            cookie: None,
+            subscribed: None,
+            observation: None,
+            operator: false,
+        }
+    }
+
+    /// A ticket entry known only by device ID, found on the mesh or through relays.
+    fn entry_only(device_id: &str) -> vibeface_secure::link::NodeLink {
+        vibeface_secure::link::NodeLink::new(device_id, vec![], None).unwrap()
+    }
+
+    #[tokio::test]
+    async fn slow_dispatch_resets_idle_but_idle_and_partial_messages_still_expire() -> Result<()> {
+        use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::protocol::Role};
+
+        async fn connect(
+            node: Arc<Runtime>,
+            admin: &LocalIdentity,
+        ) -> Result<(FrameClient, tokio::task::JoinHandle<Result<()>>)> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let (client, accepted) = tokio::join!(
+                tokio::net::TcpStream::connect(listener.local_addr()?),
+                listener.accept()
+            );
+            // Real clients get this from `connect_async`; with Nagle on, Linux holds a small
+            // request behind the client's unacknowledged pong for up to 40ms.
+            let client = client?;
+            client.set_nodelay(true)?;
+            let client =
+                WebSocketStream::from_raw_socket(MaybeTlsStream::Plain(client), Role::Client, None)
+                    .await;
+            let server = WebSocketStream::from_raw_socket(
+                MaybeTlsStream::Plain(accepted?.0),
+                Role::Server,
+                None,
+            )
+            .await;
+            let target = node.identity.device_id()?;
+            let serving = tokio::spawn(serve_session(
+                node,
+                ClientSocket::Client(Box::new(server)),
+                None,
+            ));
+            Ok((
+                FrameClient::from_socket(ClientSocket::Client(Box::new(client)), admin, &target)
+                    .await?,
+                serving,
+            ))
+        }
+
+        /// Sends a ping and then `frames` in one flush and waits for the pong. The server
+        /// writes the pong inside the read that hands it the next buffered frame, so once the
+        /// pong is back it has read every frame in order, even one whose dispatch then blocks.
+        /// Returns whether a heartbeat ping arrived first: tungstenite answers that with a pong
+        /// of its own, which is then still on the wire.
+        async fn ping(client: &mut FrameClient, frames: &[Vec<u8>]) -> Result<bool> {
+            let ClientSocket::Client(socket) = &mut client.socket else {
+                unreachable!()
+            };
+            socket.feed(NativeMessage::Ping(Vec::new().into())).await?;
+            for frame in frames {
+                socket
+                    .feed(NativeMessage::Binary(frame.clone().into()))
+                    .await?;
+            }
+            socket.flush().await?;
+            let mut heartbeat = false;
+            loop {
+                match client
+                    .socket
+                    .next()
+                    .await
+                    .context("client disconnected")??
+                {
+                    Message::Pong(_) => return Ok(heartbeat),
+                    Message::Ping(_) => heartbeat = true,
+                    other => bail!("unexpected {other:?} before the pong"),
+                }
+            }
+        }
+
+        /// Jumps the clock while nothing is on the wire and lets the heartbeat run, then returns
+        /// to real time: a paused runtime that waits on a socket auto-advances to the next timer.
+        async fn jump(duration: Duration) {
+            tokio::time::pause();
+            tokio::time::advance(duration).await;
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::resume();
+        }
+
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("client-idle-{}", uuid::Uuid::new_v4()));
+        crate::control::prepare_start(&dir)?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let admin = LocalIdentity::generate();
+        node.install_membership(NetworkState::new(Genesis::create(
+            &LocalIdentity::generate(),
+            Member::client(&admin, "admin", true)?,
+            Member::node(&node.identity, "node")?,
+        )?)?)
+        .await?;
+        let result = async {
+            let (mut client, serving) = connect(node.clone(), &admin).await?;
+            client.call("authenticate", json!({})).await?;
+            let save = node.config_save.lock().await;
+            let slow = client.channel.seal_message(&serde_json::to_vec(&Request {
+                id: "slow".into(),
+                method: "configure_node".into(),
+                params: json!({"roots":[],"manager":null}),
+            })?)?;
+            ping(&mut client, &slow).await?;
+            jump(IDLE_TIMEOUT + HEARTBEAT).await;
+            drop(save);
+            let reply: Value = serde_json::from_slice(
+                &receive_value(&mut client.socket, &mut client.channel).await?,
+            )?;
+            assert_eq!(reply["id"], "slow");
+            assert!(reply["error"].is_null(), "{reply}");
+            jump(HEARTBEAT).await;
+            assert!(
+                !serving.is_finished(),
+                "a completed slow dispatch starts a fresh idle interval"
+            );
+            client.call("authenticate", json!({})).await?;
+            // Nothing of the client's may still be on the wire when the clock jumps.
+            while ping(&mut client, &[]).await? {}
+            jump(IDLE_TIMEOUT + HEARTBEAT).await;
+            assert!(
+                serving
+                    .await?
+                    .unwrap_err()
+                    .to_string()
+                    .contains("client channel idle")
+            );
+
+            let (mut client, serving) = connect(node.clone(), &admin).await?;
+            client.call("authenticate", json!({})).await?;
+            let records = client.channel.seal_message(&vec![b'x'; 70_000])?;
+            assert!(records.len() > 1);
+            send_frame(&mut client.socket, records[0].clone()).await?;
+            ping(&mut client, &[]).await?;
+            for _ in 0..4 {
+                jump(HEARTBEAT).await;
+                ping(&mut client, &[]).await?;
+            }
+            jump(HEARTBEAT * 2).await;
+            let error = serving.await?.unwrap_err().to_string();
+            assert!(error.contains("fragmented message timed out"), "{error}");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        node.shutdown().await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
 
     #[test]
     fn join_links_from_the_app_or_a_bare_ticket_name_the_same_ticket() {
-        let ticket = Ticket::new(&LocalIdentity::generate().device_id().unwrap(), [7; 32]).unwrap();
+        let ticket = Ticket::new(
+            entry_only(&LocalIdentity::generate().device_id().unwrap()),
+            [7; 32],
+        )
+        .unwrap();
         let text = ticket.encode().unwrap();
         for link in [format!("vibeface://join/{text}"), format!(" {text} ")] {
             assert_eq!(parse_join_link(&link).unwrap(), ticket, "{link}");
@@ -2187,8 +2620,48 @@ mod tests {
         }
     }
 
+    /// A public or bootstrap Node never joins a personal network; its owner still runs its relay
+    /// and shares its link, while network methods say why they cannot answer.
     #[tokio::test(flavor = "multi_thread")]
-    async fn node_joins_reuse_the_configured_private_relay() -> Result<()> {
+    async fn the_owner_operates_a_node_outside_any_personal_network() -> Result<()> {
+        use crate::config::{self, Config};
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("operator-no-network-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
+        configuration.providers.codex_app_server.socket = Some(dir.join("unavailable.sock"));
+        initialize_node(&dir, &configuration, &LocalIdentity::generate())?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let result = async {
+            assert!(!node.has_membership().await?);
+            let settings = operator_call(&node, "relay_settings", json!({})).await?;
+            assert_eq!(settings["volunteer"], false);
+            let closed =
+                operator_call(&node, "configure_relay", json!({"volunteer":false})).await?;
+            assert_eq!(closed["volunteer"], false);
+            let shared = operator_call(&node, "share_link", json!({})).await?;
+            let link = vibeface_secure::link::NodeLink::parse(
+                shared["link"].as_str().context("share link")?,
+            )?;
+            assert_eq!(link.device_id(), node.identity.device_id()?);
+            let refused = operator_call(&node, "confirm_writable", json!({}))
+                .await
+                .expect_err("writes need a personal network");
+            assert!(
+                format!("{refused:#}").contains("personal network is not installed"),
+                "{refused:#}"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop(node);
+        std::fs::remove_dir_all(&dir)?;
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn node_joins_reach_the_entry_through_the_mesh_or_the_configured_relays() -> Result<()> {
         use crate::config::{self, Config};
         use iroh::protocol::{AcceptError, ProtocolHandler, Router};
         use iroh_relay::server::{Access, AccessControl, ClientRequest};
@@ -2250,12 +2723,7 @@ mod tests {
             let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
             configuration.network = network;
             configuration.providers.codex_app_server.socket = Some(dir.join("unavailable.sock"));
-            configuration.save(dir)?;
-            config::private_write(&dir.join("data-epoch.json"), &config::data_epoch_marker())?;
-            config::private_write(
-                &dir.join("identity.json"),
-                &serde_json::to_vec(&LocalIdentity::generate())?,
-            )?;
+            initialize_node(dir, &configuration, &LocalIdentity::generate())?;
             Ok(Arc::new(Runtime::open(dir).await?))
         }
 
@@ -2309,33 +2777,51 @@ mod tests {
             .join(format!("private-relay-join-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
         let access = Arc::new(PrivateRelay::default());
-        let relay = net::spawn_relay("127.0.0.1:0".parse()?, access.clone(), None, None).await?;
+        let relay = net::spawn_relay(
+            "127.0.0.1:0".parse()?,
+            access.clone(),
+            None,
+            None,
+            Default::default(),
+        )
+        .await?;
         let relay_url = format!("http://{}", relay.addr);
+        let mesh = |bootstrap: Vec<String>| net::mesh::MeshConfig {
+            enabled: true,
+            network: "join-test".into(),
+            bootstrap,
+            allow_private: true,
+            advertise: vec![],
+        };
+        // An ordinary Node the others join the mesh through.
         let service = Arc::new(
             Net::bind(
                 &LocalIdentity::generate().secret_key_hex,
-                &NetworkConfig {
-                    serve_discovery: true,
-                    ..Default::default()
-                },
+                &NetworkConfig::default(),
                 0,
                 vec![],
             )
             .await?,
         );
-        let service_router = service.discovery_router();
-        let discovery = |v4: bool| -> Result<String> {
+        service
+            .start_mesh(&mesh(vec![]), &dir.join("service-mesh.sqlite3"))
+            .await?;
+        let service_mesh = service.mesh().context("the service mesh")?;
+        let service_router = service_mesh
+            .accept(Router::builder(service.endpoint.clone()))
+            .spawn();
+        let bootstrap = |v4: bool| -> Result<String> {
             let port = service
                 .endpoint
                 .bound_sockets()
                 .into_iter()
                 .find(|address| address.is_ipv4() == v4)
-                .context("discovery socket missing")?
+                .context("mesh socket missing")?
                 .port();
             let host = if v4 { "127.0.0.1" } else { "[::1]" };
             Ok(format!(
-                "vibeface://{}@{host}:{port}",
-                service.endpoint.id()
+                "vibeface://node/{}?addr={host}:{port}",
+                net::device_id(&service.endpoint.id())
             ))
         };
         let listed = |url: &str, token: Option<&str>| net::Relay {
@@ -2366,7 +2852,7 @@ mod tests {
             )
             .await?;
         let admin = target.identity.fixture_admin();
-        let ticket = Ticket::new(&target_id, [7; 32])?;
+        let ticket = Ticket::new(entry_only(&target_id), [7; 32])?;
         let mut record = InviteRecord {
             network_id: target.identity.fixture_network_id()?,
             invite_hash: ticket.invite_hash(),
@@ -2377,23 +2863,32 @@ mod tests {
         record.signature = admin.sign_payload(INVITE_DOMAIN, &record.signing_payload()?)?;
         target
             .store
-            .lock()
-            .await
-            .register_invite(&record, &record.issuer)?;
+            .call("fixture_invite", move |store| {
+                store.register_invite(&record, &record.issuer)
+            })
+            .await?;
         let target_net = Arc::new(
             Net::bind(
                 &target.identity.secret_key_hex,
-                &NetworkConfig {
-                    discovery: vec![discovery(false)?],
-                    ..target.config.network.clone()
-                },
+                &target.config.network,
                 0,
                 vec![],
             )
             .await?,
         );
-        let router = Router::builder(target_net.endpoint.clone())
-            .accept(net::JOIN, JoinServer(target.clone()))
+        target_net
+            .start_mesh(
+                &mesh(vec![bootstrap(false)?]),
+                &dir.join("target-mesh.sqlite3"),
+            )
+            .await?;
+        let router = target_net
+            .mesh()
+            .context("the target mesh")?
+            .accept(
+                Router::builder(target_net.endpoint.clone())
+                    .accept(net::JOIN, JoinServer(target.clone())),
+            )
             .spawn();
         let result = async {
             tokio::time::timeout(Duration::from_secs(10), async {
@@ -2406,33 +2901,24 @@ mod tests {
             check(&joining, &ticket, &access, Some(OPERATOR_TOKEN)).await?;
             let stale_relay = "http://127.0.0.1:9";
             let invite_token = net::relay_token(&ticket.invite_hash());
-            let watcher = Net::bind(
-                &LocalIdentity::generate().secret_key_hex,
-                &NetworkConfig {
-                    bind: Some("127.0.0.1:0".parse()?),
-                    discovery: vec![discovery(true)?],
-                    ..Default::default()
-                },
-                0,
-                vec![],
-            )
-            .await?;
+            let home = net::relay_url(&relay_url)?;
             tokio::time::timeout(Duration::from_secs(15), async {
-                while watcher
-                    .discovered_relays(&target_id, Duration::from_secs(1))
-                    .await?
-                    != [net::relay_url(&relay_url)?]
-                {
+                while !service_mesh.records().iter().any(|entry| {
+                    entry.record.device_id == target_id
+                        && entry
+                            .record
+                            .relay_url
+                            .as_deref()
+                            .is_some_and(|url| net::relay_url(url).is_ok_and(|url| url == home))
+                }) {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                anyhow::Ok(())
             })
             .await
-            .context("Discovery did not learn the target's home relay")??;
-            watcher.close().await;
-            for (name, discovered, relays, expected_token) in [
+            .context("the mesh did not learn the target's home relay")?;
+            for (name, on_mesh, relays, expected_token) in [
                 (
-                    "discovered-relay",
+                    "home-relay-from-the-mesh",
                     true,
                     vec![
                         listed(stale_relay, Some(WRONG_TOKEN)),
@@ -2441,7 +2927,7 @@ mod tests {
                     Some(invite_token.as_str()),
                 ),
                 (
-                    "configured-token-over-discovered",
+                    "configured-token-over-the-mesh",
                     true,
                     vec![listed(&relay_url, Some(OPERATOR_TOKEN))],
                     Some(OPERATOR_TOKEN),
@@ -2456,10 +2942,10 @@ mod tests {
                 let configuration = NetworkConfig {
                     bind: Some("127.0.0.1:0".parse()?),
                     relays,
-                    discovery: if discovered {
-                        vec![discovery(true)?]
+                    mesh: if on_mesh {
+                        mesh(vec![bootstrap(true)?])
                     } else {
-                        vec![]
+                        Default::default()
                     },
                     ..Default::default()
                 };
@@ -2468,6 +2954,49 @@ mod tests {
                     .await
                     .with_context(|| format!("relay case {name}"))?;
             }
+            // Off the mesh and without a configured relay, the ticket's own hints reach the
+            // entry: its home relay, given the invite token, or its direct address.
+            let shared = target_net.share_link()?;
+            assert_eq!(
+                shared.relay.as_deref().map(net::relay_url).transpose()?,
+                Some(home.clone())
+            );
+            let off_mesh = |bind: &str| -> Result<NetworkConfig> {
+                Ok(NetworkConfig {
+                    bind: Some(bind.parse()?),
+                    ..Default::default()
+                })
+            };
+            let relay_hint = vibeface_secure::link::NodeLink {
+                addrs: vec![],
+                ..shared.clone()
+            };
+            let joining = node(&dir.join("ticket-relay"), off_mesh("127.0.0.1:0")?).await?;
+            check(
+                &joining,
+                &Ticket::new(relay_hint, [7; 32])?,
+                &access,
+                Some(invite_token.as_str()),
+            )
+            .await
+            .context("ticket relay hint")?;
+            let direct_hint = vibeface_secure::link::NodeLink {
+                relay: None,
+                ..shared
+            };
+            ensure!(
+                !direct_hint.addrs.is_empty(),
+                "the target shares no address"
+            );
+            let joining = node(&dir.join("ticket-addrs"), off_mesh("[::1]:0")?).await?;
+            let link = JoinLink::open(&joining, &Ticket::new(direct_hint, [7; 32])?).await?;
+            let reply = link
+                .call("join_check", json!({"secret":hex::encode([7; 32])}))
+                .await;
+            let path = link.net.path_kind(&target_id);
+            link.net.close().await;
+            assert_eq!(reply?, json!({"invite":"open"}));
+            assert_eq!(path, Some(net::PathKind::Direct));
             let denied = node(
                 &dir.join("wrong-operator-token"),
                 network("127.0.0.1:0".parse()?, WRONG_TOKEN),
@@ -2497,14 +3026,36 @@ mod tests {
         router.shutdown().await?;
         target_net.close().await;
         service_router.shutdown().await?;
+        service.close().await;
         relay.shutdown().await;
-        drop((target, joining));
+        // Windows refuses to delete a database that is still open, so every owner of the
+        // Nodes' stores and the mesh tables lets go first.
+        let meshes = [
+            Arc::downgrade(&service_mesh),
+            Arc::downgrade(&target_net.mesh().context("the target mesh")?),
+        ];
+        drop((
+            router,
+            service_router,
+            service_mesh,
+            service,
+            target_net,
+            target,
+            joining,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while meshes.iter().any(|mesh| mesh.strong_count() > 0) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .context("a closed mesh stayed open")?;
         std::fs::remove_dir_all(dir)?;
         result
     }
 
     /// The payload of the next push this client receives.
-    async fn next_push(client: &mut Client) -> Result<Value> {
+    async fn next_push(client: &mut FrameClient) -> Result<Value> {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let value: Value = serde_json::from_slice(
@@ -2529,15 +3080,7 @@ mod tests {
         config::private_dir(&dir)?;
         let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
-        config.save(&dir)?;
-        config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let (root, admin, member, local) = (
             LocalIdentity::generate(),
@@ -2557,15 +3100,7 @@ mod tests {
         )?)?;
         let network = state.genesis.network_id.clone();
         node.install_membership(state.clone()).await?;
-        let session = |identity: &LocalIdentity| -> Result<Session> {
-            Ok(Session {
-                device_id: identity.device_id()?,
-                cookie: None,
-                subscribed: None,
-                observation: None,
-            })
-        };
-        let mut browser = session(&member)?;
+        let mut browser = test_session(member.device_id()?);
         assert_eq!(
             dispatch(&node, &mut browser, "delivery", json!({"op":"status"})).await?["enabled"],
             false
@@ -2600,7 +3135,7 @@ mod tests {
             &network,
             &local.device_id()?,
         )?;
-        let mut local_session = session(&local)?;
+        let mut local_session = test_session(local.device_id()?);
         local_session.cookie = Some(cookie);
         assert_eq!(
             dispatch(&node, &mut local_session, "authenticate", json!({})).await?["principal"]["source"],
@@ -2611,7 +3146,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        let mut manager = session(&admin)?;
+        let mut manager = test_session(admin.device_id()?);
         assert_eq!(
             dispatch(&node, &mut manager, "delivery", change).await?["enabled"],
             true
@@ -2666,15 +3201,7 @@ mod tests {
         let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
         config.providers.execution = [crate::providers::Provider::Codex].into();
-        config.save(&dir)?;
-        config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let (root, admin, member) = (
             LocalIdentity::generate(),
@@ -2692,24 +3219,16 @@ mod tests {
             Member::client(&member, "browser", false)?,
         )?)?;
         node.install_membership(state).await?;
-        let session = |identity: &LocalIdentity| -> Result<Session> {
-            Ok(Session {
-                device_id: identity.device_id()?,
-                cookie: None,
-                subscribed: None,
-                observation: None,
-            })
-        };
         let record =
             json!({"level":"error","event":"web.uncaught","message":"TypeError: x is undefined"});
-        let mut stranger = session(&LocalIdentity::generate())?;
+        let mut stranger = test_session(LocalIdentity::generate().device_id()?);
         assert!(
             dispatch(&node, &mut stranger, "log", json!({"records":[record]}))
                 .await
                 .is_err(),
             "a browser outside the network cannot write"
         );
-        let mut browser = session(&member)?;
+        let mut browser = test_session(member.device_id()?);
         let oversized =
             json!({"level":"info","message":"x".repeat(crate::logging::MAX_RECORD_BYTES)});
         assert!(
@@ -2727,7 +3246,7 @@ mod tests {
                 .is_err(),
             "reading needs management"
         );
-        let mut manager = session(&admin)?;
+        let mut manager = test_session(admin.device_id()?);
         assert!(
             dispatch(&node, &mut manager, "logs", json!({"level":"warn"})).await?["records"]
                 .is_array()
@@ -2746,7 +3265,7 @@ mod tests {
     #[tokio::test]
     async fn node_settings_require_management_and_apply_without_restarting_or_losing_other_configuration()
     -> Result<()> {
-        use crate::config::{self, Config, ManagerSettings};
+        use crate::config::{self, Config};
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
             .join(format!("node-settings-{}", uuid::Uuid::new_v4()));
@@ -2754,15 +3273,7 @@ mod tests {
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
         config.providers.execution = [crate::providers::Provider::Codex].into();
-        config.save(&dir)?;
-        config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let root = LocalIdentity::generate();
         let admin = LocalIdentity::generate();
@@ -2779,16 +3290,8 @@ mod tests {
         )?)?;
         let network = state.genesis.network_id.clone();
         node.install_membership(state).await?;
-        let session = |identity: &LocalIdentity| -> Result<Session> {
-            Ok(Session {
-                device_id: identity.device_id()?,
-                cookie: None,
-                subscribed: None,
-                observation: None,
-            })
-        };
         for identity in [&client, &LocalIdentity::generate()] {
-            let mut unauthorized = session(identity)?;
+            let mut unauthorized = test_session(identity.device_id()?);
             assert!(
                 dispatch(&node, &mut unauthorized, "node_settings", json!({}))
                     .await
@@ -2805,7 +3308,7 @@ mod tests {
                 .is_err()
             );
         }
-        let mut manager_session = session(&admin)?;
+        let mut manager_session = test_session(admin.device_id()?);
         assert_eq!(
             dispatch(&node, &mut manager_session, "info", json!({})).await?["connection_entry"],
             json!({"address":"http://127.0.0.1:4790","device_id":node.identity.device_id()?})
@@ -2863,13 +3366,11 @@ mod tests {
         latest.save(&dir)?;
         let settings = crate::runtime::NodeSettings {
             roots: vec![project.clone(), project.join(".")],
-            manager: Some(ManagerSettings {
-                provider: crate::providers::Provider::Cursor,
-                workspace: workspace.clone(),
-                model: "auto".into(),
-                reasoning_effort: None,
-                backup: Default::default(),
-            }),
+            manager: Some(manager_settings(
+                crate::providers::Provider::Cursor,
+                workspace.clone(),
+                "auto".into(),
+            )),
         };
         let refused = dispatch(
             &node,
@@ -2948,15 +3449,7 @@ mod tests {
         );
         assert!(node.info().get("manager_available").is_none());
         let nodes = node
-            .rpc(
-                Access {
-                    network_id: network,
-                    human: true,
-                    conversation_id: None,
-                    manager: None,
-                },
-                json!({"method":"nodes"}),
-            )
+            .rpc(test_access(network, true, None), json!({"method":"nodes"}))
             .await?;
         assert_eq!(
             nodes["nodes"][0]["capabilities"]["roots"],
@@ -3047,15 +3540,7 @@ mod tests {
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
         config.providers.execution = [Provider::Codex].into();
-        config.save(&dir)?;
-        config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let root = LocalIdentity::generate();
         let admin = LocalIdentity::generate();
@@ -3072,14 +3557,6 @@ mod tests {
         )?)?;
         let network = state.genesis.network_id.clone();
         node.install_membership(state).await?;
-        let session = |identity: &LocalIdentity| -> Result<Session> {
-            Ok(Session {
-                device_id: identity.device_id()?,
-                cookie: None,
-                subscribed: None,
-                observation: None,
-            })
-        };
         let codex_key = "fixture-codex-secret-0123456789";
         let cursor_key = "fixture-cursor-secret-0123456789";
         let user_codex_home = dir.join("user-codex-home");
@@ -3091,16 +3568,15 @@ mod tests {
         )?;
         let set_codex = json!({"provider":"codex","connect_local":true,"bot":true,"bin":"/fixture/codex",
             "env":{"FIXTURE_CODEX_KEY":codex_key,"CODEX_HOME":user_codex_home}});
-        let mut member = session(&client)?;
+        let mut member = test_session(client.device_id()?);
         assert!(
             dispatch(&node, &mut member, "configure_provider", set_codex.clone())
                 .await
                 .is_err(),
             "only the owner changes providers"
         );
-        assert!(!dir.join(crate::providers::ENV_FILE).exists());
 
-        let mut owner = session(&admin)?;
+        let mut owner = test_session(admin.device_id()?);
         let set_node = json!({"roots":[user_codex_home.canonicalize()?],"manager":null});
         let before_config = std::fs::read(dir.join("config.json"))?;
         let before_settings = serde_json::to_value(node.settings_snapshot())?;
@@ -3113,11 +3589,9 @@ mod tests {
             let mut queued = Box::pin(dispatch(&node, &mut owner, method, params));
             assert!(futures_util::poll!(queued.as_mut()).is_pending());
             assert_eq!(std::fs::read(dir.join("config.json"))?, before_config);
-            assert!(!dir.join(crate::providers::ENV_FILE).exists());
             drop(queued);
             drop(active);
             assert_eq!(std::fs::read(dir.join("config.json"))?, before_config);
-            assert!(!dir.join(crate::providers::ENV_FILE).exists());
             assert_eq!(
                 serde_json::to_value(node.settings_snapshot())?,
                 before_settings
@@ -3144,18 +3618,17 @@ mod tests {
             Config::load(&dir)?.bins.get(&Provider::Codex),
             Some(&std::path::PathBuf::from("/fixture/codex"))
         );
-        assert!(crate::providers::ProviderEnv::load(&dir)? == node.providers().env);
+        assert!(Config::load(&dir)?.provider_env == node.providers().env);
         let cursor = dispatch(
             &node,
             &mut owner,
             "configure_provider",
-            json!({"provider":"cursor","connect_local":true,"env":{"CURSOR_API_KEY":cursor_key}}),
+            json!({"provider":"cursor","connect_local":true,"env":{"FIXTURE_CURSOR_KEY":cursor_key}}),
         )
         .await?;
         let read = dispatch(&node, &mut owner, "node_settings", json!({})).await?;
-        let private_env = std::fs::read(dir.join(crate::providers::ENV_FILE))?;
-        let private_env_modified =
-            std::fs::metadata(dir.join(crate::providers::ENV_FILE))?.modified()?;
+        let private_env = std::fs::read(dir.join("config.json"))?;
+        let private_env_modified = std::fs::metadata(dir.join("config.json"))?.modified()?;
         let repeated = dispatch(
             &node,
             &mut owner,
@@ -3164,9 +3637,9 @@ mod tests {
         )
         .await?;
         assert_eq!(repeated["providers"][1]["roles"], json!([]));
-        assert!(std::fs::read(dir.join(crate::providers::ENV_FILE))? == private_env);
+        assert!(std::fs::read(dir.join("config.json"))? == private_env);
         assert_eq!(
-            std::fs::metadata(dir.join(crate::providers::ENV_FILE))?.modified()?,
+            std::fs::metadata(dir.join("config.json"))?.modified()?,
             private_env_modified
         );
         for reply in [&saved, &cursor, &read] {
@@ -3231,8 +3704,8 @@ mod tests {
         let codex_env = node.provider_env(Provider::Codex);
         let cursor_env = node.provider_env(Provider::Cursor);
         assert_eq!(codex_env["FIXTURE_CODEX_KEY"], codex_key);
-        assert!(!codex_env.contains_key("CURSOR_API_KEY"));
-        assert_eq!(cursor_env["CURSOR_API_KEY"], cursor_key);
+        assert!(!codex_env.contains_key("FIXTURE_CURSOR_KEY"));
+        assert_eq!(cursor_env["FIXTURE_CURSOR_KEY"], cursor_key);
         assert!(!cursor_env.contains_key("FIXTURE_CODEX_KEY"));
 
         crate::logging::write(&crate::logging::Record {
@@ -3277,7 +3750,7 @@ mod tests {
                 }
                 continue;
             }
-            if path.file_name() == Some(std::ffi::OsStr::new(crate::providers::ENV_FILE)) {
+            if path.file_name() == Some(std::ffi::OsStr::new("config.json")) {
                 continue;
             }
             let bytes = std::fs::read(&path).with_context(|| {
@@ -3299,8 +3772,8 @@ mod tests {
         }
         assert!(checked >= 3 && logs.join("node.log").is_file());
         vibeface_bridge::platform::privatefs::ensure_private(
-            &dir.join(crate::providers::ENV_FILE),
-            "the saved provider environment",
+            &dir.join("config.json"),
+            "the saved private configuration",
         )?;
         let node = Arc::new(
             Runtime::reopen(&dir)
@@ -3313,6 +3786,10 @@ mod tests {
             json!({"provider":"codex","roles":["agent"]}),
             json!({"provider":"codex","enabled":false}),
             json!({"provider":"codex","env":{"VIBEFACE_DATA_DIR":"/elsewhere"}}),
+            json!({"provider":"cursor","env":{"CURSOR_API_KEY":"synthetic-rejected-key"}}),
+            json!({"provider":"cursor","env":{"CURSOR_AUTH_TOKEN":"synthetic-rejected-token"}}),
+            json!({"provider":"cursor","env":{"AGENT_CLI_CREDENTIAL_STORE":"memory"}}),
+            json!({"provider":"cursor","bin":"/fixture/cursor-sdk-bridge"}),
         ] {
             assert!(
                 dispatch(&node, &mut owner, "configure_provider", invalid)
@@ -3366,15 +3843,7 @@ mod tests {
                 .all(|row| row["name"] != "FIXTURE_CODEX_KEY")
         );
         let nodes = node
-            .rpc(
-                Access {
-                    network_id: network,
-                    human: true,
-                    conversation_id: None,
-                    manager: None,
-                },
-                json!({"method":"nodes"}),
-            )
+            .rpc(test_access(network, true, None), json!({"method":"nodes"}))
             .await?;
         assert_eq!(nodes["nodes"][0]["capabilities"]["codex"]["enabled"], false);
         let moved = dispatch(
@@ -3451,7 +3920,7 @@ mod tests {
             std::path::PathBuf::from("/fixture/codex")
         );
         assert_eq!(
-            reopened.provider_env(Provider::Cursor)["CURSOR_API_KEY"],
+            reopened.provider_env(Provider::Cursor)["FIXTURE_CURSOR_KEY"],
             cursor_key
         );
         reopened.shutdown().await;
@@ -3471,15 +3940,7 @@ mod tests {
         crate::config::private_dir(&dir)?;
         let mut config = crate::config::Config::local("127.0.0.1:4791".parse()?, vec![], false);
         config.local_listen = "127.0.0.1:4792".parse()?;
-        config.save(&dir)?;
-        crate::config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        crate::config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let result = async {
             let (root, admin, browser) = (
@@ -3503,18 +3964,9 @@ mod tests {
             let cookie =
                 node.local_access
                     .exchange(&token, &node_id, &network, &browser.device_id()?)?;
-            let mut local = Session {
-                device_id: browser.device_id()?,
-                cookie: Some(cookie),
-                subscribed: None,
-                observation: None,
-            };
-            let mut remote_manager = Session {
-                device_id: admin.device_id()?,
-                cookie: None,
-                subscribed: None,
-                observation: None,
-            };
+            let mut local = test_session(browser.device_id()?);
+            local.cookie = Some(cookie);
+            let mut remote_manager = test_session(admin.device_id()?);
             assert!(
                 dispatch(&node, &mut local, "rejoin", json!({}))
                     .await
@@ -3560,31 +4012,18 @@ mod tests {
             url: "http://127.0.0.1:9".into(),
             token: None,
         }];
-        configuration.save(&dir)?;
-        crate::config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        crate::config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &configuration, &LocalIdentity::generate())?;
         let capability =
             crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let result = async {
-            let ticket = Ticket::new(&LocalIdentity::generate().device_id()?, [7; 32])?;
+            let ticket = Ticket::new(entry_only(&LocalIdentity::generate().device_id()?), [7; 32])?;
             let params = json!({
                 "capability": capability.capability,
                 "link": format!("vibeface://join/{}", ticket.encode()?),
                 "name": "工作室 Mac",
             });
-            let mut page = Session {
-                device_id: LocalIdentity::generate().device_id()?,
-                cookie: None,
-                subscribed: None,
-                observation: None,
-            };
+            let mut page = test_session(LocalIdentity::generate().device_id()?);
             let status = |value: Value| value["status"].as_str().unwrap_or_default().to_owned();
             assert_eq!(
                 status(dispatch(&node, &mut page, "node_join", params.clone()).await?),
@@ -3670,19 +4109,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_node_joins_preserve_the_first_owner_and_request() -> Result<()> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("node-join-concurrent-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        initialize_node(
+            &dir,
+            &crate::config::Config::local("127.0.0.1:4795".parse()?, vec![], false),
+            &LocalIdentity::generate(),
+        )?;
+        let capability =
+            crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let result = async {
+            let link = Ticket::new(entry_only(&LocalIdentity::generate().device_id()?), [7; 32])?
+                .encode()?;
+            for owner in [JoinOwner::Terminal, JoinOwner::Page(capability.capability)] {
+                let (entered, running) = tokio::sync::oneshot::channel();
+                let (release, held) = std::sync::mpsc::channel();
+                let holding_node = node.clone();
+                let holder = tokio::spawn(async move {
+                    holding_node
+                        .store
+                        .call("hold_concurrent_node_join", move |_| {
+                            let _ = entered.send(());
+                            held.recv()?;
+                            Ok(())
+                        })
+                        .await
+                });
+                running.await?;
+                let mut first =
+                    std::pin::pin!(start_node_join(&node, &link, "first", JoinOwner::Terminal,));
+                let mut second =
+                    std::pin::pin!(start_node_join(&node, &link, "second", owner.clone(),));
+                assert!(futures_util::poll!(&mut first).is_pending());
+                assert!(futures_util::poll!(&mut second).is_pending());
+                release.send(())?;
+                assert_eq!(first.await?, NodeJoin::Waiting);
+                let task = node
+                    .node_join
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .context("join")?
+                    .task
+                    .clone();
+                let reply = second.await;
+                if owner == JoinOwner::Terminal {
+                    assert_eq!(reply?, NodeJoin::Waiting);
+                } else {
+                    assert!(reply.unwrap_err().to_string().contains("another join"));
+                }
+                assert!(
+                    !task.is_aborted(),
+                    "a concurrent request must preserve the first join"
+                );
+                let current = node.node_join.lock().unwrap().take().context("join")?;
+                assert!(current.owner == JoinOwner::Terminal);
+                current.task.abort();
+                holder.await??;
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        node.shutdown().await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
+
+    #[tokio::test]
     async fn a_failed_page_join_keeps_its_commitment_so_asking_again_resumes_it() -> Result<()> {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
             .join(format!("node-join-failed-{}", uuid::Uuid::new_v4()));
         crate::config::private_dir(&dir)?;
-        crate::config::Config::local("127.0.0.1:4795".parse()?, vec![], false).save(&dir)?;
-        crate::config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        crate::config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
+        initialize_node(
+            &dir,
+            &crate::config::Config::local("127.0.0.1:4795".parse()?, vec![], false),
+            &LocalIdentity::generate(),
         )?;
         let capability =
             crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
@@ -3690,16 +4197,11 @@ mod tests {
         let result = async {
             // No address and no discovery: the join fails after it committed, before reaching anyone.
             let link = |secret: u8| -> Result<String> {
-                let ticket = Ticket::new(&LocalIdentity::generate().device_id()?, [secret; 32])?;
+                let ticket = Ticket::new(entry_only(&LocalIdentity::generate().device_id()?), [secret; 32])?;
                 Ok(format!("vibeface://join/{}", ticket.encode()?))
             };
             let params = |link: &str| json!({"capability": capability.capability, "link": link, "name": "工作室 Mac"});
-            let mut page = Session {
-                device_id: LocalIdentity::generate().device_id()?,
-                cookie: None,
-                subscribed: None,
-                observation: None,
-            };
+            let mut page = test_session(LocalIdentity::generate().device_id()?);
             let nonce = || -> Result<String> {
                 let pending: Value = serde_json::from_slice(&std::fs::read(dir.join("join.json"))?)?;
                 Ok(pending["nonce"].as_str().unwrap_or_default().to_owned())
@@ -3747,12 +4249,12 @@ mod tests {
             target: &str,
             cookie: &str,
             identity: &LocalIdentity,
-        ) -> Result<Client> {
+        ) -> Result<FrameClient> {
             let endpoint = origin.replace("http://", "ws://") + "/api/local/ws";
             let mut request = endpoint.into_client_request()?;
             request.headers_mut().insert("cookie", cookie.parse()?);
             let (socket, _) = tokio_tungstenite::connect_async(request).await?;
-            Client::from_socket(ClientSocket::Client(Box::new(socket)), identity, target).await
+            FrameClient::from_socket(ClientSocket::Client(Box::new(socket)), identity, target).await
         }
 
         async fn browser_node(
@@ -3765,15 +4267,7 @@ mod tests {
             let mut config = crate::config::Config::local(reservation.local_addr()?, vec![], false);
             config.local_listen = local.local_addr()?;
             drop((reservation, local));
-            config.save(dir)?;
-            crate::config::private_write(
-                &dir.join("identity.json"),
-                &serde_json::to_vec(&LocalIdentity::generate())?,
-            )?;
-            crate::config::private_write(
-                &dir.join("data-epoch.json"),
-                &crate::config::data_epoch_marker(),
-            )?;
+            initialize_node(dir, &config, &LocalIdentity::generate())?;
             let node = Arc::new(Runtime::open(dir).await?);
             let root = LocalIdentity::generate();
             node.install_membership(NetworkState::new(Genesis::create(
@@ -3889,10 +4383,8 @@ mod tests {
             assert_eq!(auth["principal"]["can_manage"], true);
             let cookie = cookies[0].split_once('=').context("local cookie missing")?.1;
             let browser_id = browser.device_id()?;
-            let mut local_session = Session {
-                device_id: browser_id.clone(), cookie: Some(cookie.into()),
-                subscribed: None, observation: None,
-            };
+            let mut local_session = test_session(browser_id.clone());
+            local_session.cookie = Some(cookie.into());
             let save = node.config_save.lock().await;
             let mut queued_disable = Box::pin(dispatch(&node, &mut local_session, "local_access", json!({"enabled":false})));
             assert!(futures_util::poll!(queued_disable.as_mut()).is_pending());
@@ -3911,10 +4403,7 @@ mod tests {
             signed.call("local_access", json!({"enabled":true})).await?;
             assert_eq!(http.get(format!("{}/api/local/ws", launcher.origin)).header("Cookie", &cookies[0]).header("Connection", "Upgrade").header("Upgrade", "websocket").header("Sec-WebSocket-Version", "13").header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==").send().await?.status(), 401);
             node.local_access.set_enabled(false)?;
-            let mut manager_session = Session {
-                device_id: manager.device_id()?, cookie: None,
-                subscribed: None, observation: None,
-            };
+            let mut manager_session = test_session(manager.device_id()?);
             let save = node.config_save.lock().await;
             let mut queued_enable = Box::pin(dispatch(&node, &mut manager_session, "local_access", json!({"enabled":true})));
             assert!(futures_util::poll!(queued_enable.as_mut()).is_pending());
@@ -3962,6 +4451,54 @@ mod tests {
         result
     }
 
+    #[test]
+    fn recovery_status_returns_the_latest_stopped_checkpoint_for_this_client() -> Result<()> {
+        let (root, manager, node, recovering) = (
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+        );
+        let mut state = NetworkState::new(Genesis::create(
+            &root,
+            Member::client(&manager, "manager", true)?,
+            Member::node(&node, "node")?,
+        )?)?;
+        let now = crate::runtime::now_ms() as u64 - 100;
+        let mut latest = String::new();
+        for at_ms in [now, now + 1] {
+            let mut members = state.genesis.members();
+            members.push(Member::client(&recovering, "recovering", true)?);
+            let checkpoint = RootCheckpoint::recovery(
+                &state,
+                &root,
+                &LocalIdentity::generate().device_id()?,
+                members,
+                vec![],
+                at_ms,
+            )?;
+            latest = checkpoint.hash()?;
+            state.recover_at(checkpoint, at_ms)?;
+            let veto = GovernanceEvent::unsigned(
+                &state.project_at(at_ms)?,
+                &manager.device_id()?,
+                GovernanceAction::Veto {
+                    checkpoint: latest.clone(),
+                    at_ms,
+                },
+            )?
+            .sign(&manager)?;
+            state.append(veto)?;
+        }
+        let view = state.project_at(now + 2)?;
+        assert_eq!(view.stopped.len(), 2);
+        assert_eq!(
+            recovery_status(&state, &view, &recovering.device_id()?)?,
+            json!({"status":"stopped","checkpoint_hash":latest})
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn approve_recovery_accepts_a_near_due_checkpoint_and_is_idempotent() -> Result<()> {
         use crate::config::{self, Config};
@@ -3972,15 +4509,7 @@ mod tests {
         config::private_dir(&dir)?;
         let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
-        config.save(&dir)?;
-        config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
 
         let node = Arc::new(Runtime::open(&dir).await?);
         let (root, manager) = (LocalIdentity::generate(), LocalIdentity::generate());
@@ -4001,12 +4530,7 @@ mod tests {
         state.recover_at(checkpoint.clone(), now)?;
         node.install_membership(state.clone()).await?;
 
-        let mut session = Session {
-            device_id: manager.device_id()?,
-            cookie: None,
-            subscribed: None,
-            observation: None,
-        };
+        let mut session = test_session(manager.device_id()?);
         let view = state.project_at(now)?.clone();
         let event = GovernanceEvent::unsigned(
             &view,
@@ -4047,12 +4571,7 @@ mod tests {
             assert_eq!(node.membership_state().await?.events.len(), 0);
             assert_eq!(node.membership_state().await?.project()?.epoch, 1);
         }
-        let mut stranger = Session {
-            device_id: LocalIdentity::generate().device_id()?,
-            cookie: None,
-            subscribed: None,
-            observation: None,
-        };
+        let mut stranger = test_session(LocalIdentity::generate().device_id()?);
         assert!(
             dispatch(
                 &node,
@@ -4094,6 +4613,103 @@ mod tests {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         use vibeface_secure::join::{INVITE_DOMAIN, invite_hash};
 
+        // Keep request arguments and identity material out of diagnostics. Peer labels and
+        // committed authority are enough to locate an admission/dispatch/delivery stall.
+        struct IdentityPeer {
+            label: &'static str,
+            device_id: String,
+            target_id: String,
+            step: u32,
+            node: Arc<Runtime>,
+            client: FrameClient,
+        }
+        impl IdentityPeer {
+            fn authority(&self) -> String {
+                use crate::runtime::ClientAuthorityState;
+                let (generation, state) = self.node.client_membership();
+                let principal = match state {
+                    ClientAuthorityState::Initializing => "initializing".to_owned(),
+                    ClientAuthorityState::Updating => "updating".to_owned(),
+                    ClientAuthorityState::Unavailable => "unavailable".to_owned(),
+                    ClientAuthorityState::Ready(None) => "uninitialized".to_owned(),
+                    ClientAuthorityState::Ready(Some(state)) => {
+                        match state.project().and_then(|view| {
+                            member_principal(
+                                &view,
+                                &self.target_id,
+                                &test_session(self.device_id.clone()),
+                            )
+                        }) {
+                            Ok(Some(principal)) => format!(
+                                "ready:{}:epoch={}:manage={}",
+                                principal.source, principal.epoch, principal.can_manage
+                            ),
+                            Ok(None) => "ready:guest".to_owned(),
+                            Err(_) => "ready:principal-refused".to_owned(),
+                        }
+                    }
+                };
+                format!("generation={generation},{principal}")
+            }
+            async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+                self.step += 1;
+                let step = self.step;
+                let before = self.authority();
+                let started = Instant::now();
+                eprintln!(
+                    "identity-fixture peer={} step={step} wait=rpc method={method} stage=begin authority={before}",
+                    self.label
+                );
+                let result = self.client.call(method, params).await;
+                let after = self.authority();
+                let elapsed_ms = started.elapsed().as_millis();
+                eprintln!(
+                    "identity-fixture peer={} step={step} wait=rpc method={method} stage={} elapsed_ms={elapsed_ms} authority={after}",
+                    self.label,
+                    if result.is_ok() { "ok" } else { "error" }
+                );
+                if result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.is::<tokio::time::error::Elapsed>())
+                {
+                    let timings = self.node.store.take_timings();
+                    for timing in timings.iter().rev().take(12).rev() {
+                        eprintln!(
+                            "identity-fixture peer={} step={step} store={} admission_ms={} queue_ms={} execute_ms={}",
+                            self.label,
+                            timing.operation,
+                            timing.admission_wait.as_millis(),
+                            timing.queue_wait.as_millis(),
+                            timing.execute.as_millis()
+                        );
+                    }
+                }
+                result.with_context(|| format!("identity gateway peer={} step={step} rpc={method} elapsed_ms={elapsed_ms} authority_before=[{before}] authority_after=[{after}]", self.label))
+            }
+            async fn push(&mut self) -> Result<Value> {
+                self.step += 1;
+                let step = self.step;
+                let started = Instant::now();
+                eprintln!(
+                    "identity-fixture peer={} step={step} wait=push stage=begin authority={}",
+                    self.label,
+                    self.authority()
+                );
+                let result = next_push(&mut self.client).await;
+                eprintln!(
+                    "identity-fixture peer={} step={step} wait=push stage={} elapsed_ms={} authority={}",
+                    self.label,
+                    if result.is_ok() { "ok" } else { "error" },
+                    started.elapsed().as_millis(),
+                    self.authority()
+                );
+                result.with_context(|| {
+                    format!("identity gateway peer={} step={step} wait=push", self.label)
+                })
+            }
+        }
+
         let dir = std::env::temp_dir().join(format!("vibeface-identity-{}", uuid::Uuid::new_v4()));
         crate::config::private_dir(&dir)?;
         let public = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -4102,36 +4718,56 @@ mod tests {
         config.local_listen = local.local_addr()?;
         config.allowed_origins = vec!["https://app.example".into()];
         drop((public, local));
-        config.save(&dir)?;
-        crate::config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
-        crate::config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
         let capability =
             crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
-        let node = Arc::new(Runtime::open(&dir).await?);
+        let opened = Instant::now();
+        eprintln!("identity-fixture wait=open-node stage=begin");
+        let node = Arc::new(
+            Runtime::open(&dir)
+                .await
+                .context("identity gateway setup: open Node")?,
+        );
+        eprintln!(
+            "identity-fixture wait=open-node stage=ok elapsed_ms={}",
+            opened.elapsed().as_millis()
+        );
         let origin = node.config.public_url.clone();
         let node_id = node.identity.device_id()?;
         let server = tokio::spawn(crate::api::serve(node.clone(), None));
         let result: Result<()> = async {
-            let connect = |identity: LocalIdentity| {
-                let (origin, node_id) = (origin.clone(), node_id.clone());
+            let connect = |label: &'static str, identity: LocalIdentity| {
+                let (origin, node_id, node) = (origin.clone(), node_id.clone(), node.clone());
                 async move {
-                    for _ in 0..100 {
-                        match Client::connect(&origin, &identity, &node_id).await {
-                            Ok(client) => return Ok(client),
-                            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                    let started = Instant::now();
+                    let device_id = identity.device_id()?;
+                    eprintln!("identity-fixture peer={label} wait=connect stage=begin");
+                    let open = || async {
+                        let (socket, _) = tokio::time::timeout(HANDSHAKE_TIMEOUT,
+                            tokio_tungstenite::connect_async(format!("{}/api/client", origin.replace("http://", "ws://"))))
+                            .await.context("Gateway connection timed out")??;
+                        let mut socket = ClientSocket::Client(Box::new(socket));
+                        socket.send(Message::Text(json!({"type":"connect","target":node_id}).to_string().into())).await?;
+                        FrameClient::from_socket(socket, &identity, &node_id).await
+                    };
+                    for attempt in 0..100 {
+                        match open().await {
+                            Ok(client) => {
+                                eprintln!("identity-fixture peer={label} wait=connect stage=ok attempt={} elapsed_ms={}", attempt + 1, started.elapsed().as_millis());
+                                return Ok::<_, anyhow::Error>(IdentityPeer { label, device_id, target_id: node_id.clone(), step: 0, node: node.clone(), client });
+                            }
+                            Err(error) => {
+                                eprintln!("identity-fixture peer={label} wait=connect stage=attempt-error attempt={} elapsed_ms={} timed_out={}", attempt + 1, started.elapsed().as_millis(), error.is::<tokio::time::error::Elapsed>());
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
                         }
                     }
-                    Client::connect(&origin, &identity, &node_id).await
+                    let client = open().await.with_context(|| format!("identity gateway peer={label} wait=connect final_attempt=101"))?;
+                    Ok(IdentityPeer { label, device_id, target_id: node_id, step: 0, node, client })
                 }
             };
             let (root, admin) = (LocalIdentity::generate(), LocalIdentity::generate());
-            let mut manager = connect(admin.clone()).await?;
+            let mut manager = connect("admin-manager", admin.clone()).await?;
             let public_info = manager.call("info", json!({})).await?;
             assert_eq!(public_info["initialized"], false);
             assert_eq!(public_info["name"], "Node");
@@ -4167,7 +4803,7 @@ mod tests {
 
             let phone = LocalIdentity::generate();
             let join_id = manager.call("invite", invite([1; 32])?).await?["join_id"].clone();
-            let mut joiner = connect(phone.clone()).await?;
+            let mut joiner = connect("phone-joiner", phone.clone()).await?;
             let guest_auth = joiner.call("authenticate", json!({"network_id":network})).await?;
             assert_eq!(guest_auth["principal"], Value::Null);
             assert!(guest_auth.get("network_id").is_none());
@@ -4190,7 +4826,7 @@ mod tests {
             let listed = manager.call("join_status", json!({})).await?;
             let request = &listed["requests"][0];
             assert_eq!(code(request, request["joiner_nonce"].as_str().context("revealed nonce")?)?, phone_code);
-            let view = node.membership_state().await?.project()?;
+            let view = node.membership_state().await.context("identity gateway: read authoritative membership")?.project()?;
             let grant = GovernanceEvent::grant(&admin, &view, Member::client(&phone, "phone", true)?)?;
             assert_eq!(manager.call("approve", json!({"join_id":join_id,"event":grant})).await?["status"], "joined");
             let joined = joiner.call("join_status", json!({"join_id":join_id})).await?;
@@ -4203,7 +4839,7 @@ mod tests {
 
             let (liar, nonce) = (LocalIdentity::generate(), "33".repeat(32));
             let liar_id = manager.call("invite", invite([2; 32])?).await?["join_id"].clone();
-            let mut liar_client = connect(liar.clone()).await?;
+            let mut liar_client = connect("mismatched-commitment-guest", liar.clone()).await?;
             liar_client.call("join", join(&liar, [2; 32], &nonce)?).await?;
             manager.call("approve", json!({"join_id":liar_id,"admin_nonce":"44".repeat(32)})).await?;
             let voided = liar_client.call("join_status", json!({"join_id":liar_id,"reveal":"55".repeat(32)})).await?;
@@ -4211,23 +4847,23 @@ mod tests {
             assert!(liar_client.call("join_status", json!({"join_id":liar_id,"reveal":nonce})).await.is_err());
             let refused = LocalIdentity::generate();
             let refused_id = manager.call("invite", invite([3; 32])?).await?["join_id"].clone();
-            connect(refused.clone()).await?.call("join", join(&refused, [3; 32], &nonce)?).await?;
+            connect("rejected-guest", refused.clone()).await?.call("join", join(&refused, [3; 32], &nonce)?).await?;
             assert_eq!(manager.call("approve", json!({"join_id":refused_id,"reject":true})).await?["status"], "rejected");
             assert!(manager.call("approve", json!({"join_id":refused_id,"admin_nonce":"66".repeat(32)})).await.is_err());
 
             let set_manage = |issuer: &LocalIdentity, view: &AuthorizationView, device: &LocalIdentity, name: &str, manage: bool| -> Result<GovernanceEvent> {
                 GovernanceEvent::unsigned(view, &issuer.device_id()?, GovernanceAction::Grant { member: Member::client(device, name, manage)? })?.sign(issuer)
             };
-            let mut listening = connect(phone.clone()).await?;
+            let mut listening = connect("phone-demotion-subscriber", phone.clone()).await?;
             listening.call("subscribe", json!({})).await?;
-            let view = node.membership_state().await?.project()?;
+            let view = node.membership_state().await.context("identity gateway: read authoritative membership")?.project()?;
             let demote = set_manage(&admin, &view, &phone, "phone", false)?;
             assert!(joiner.call("grant", json!({"event":demote})).await.is_err(), "issuer must be the session");
             manager.call("grant", json!({"event":demote})).await?;
             manager.call("grant", json!({"event":demote})).await?;
             assert_eq!(joiner.call("authenticate", json!({})).await?["principal"]["can_manage"], false);
             assert!(listening.call("info", json!({})).await.is_err(), "a subscription reconnects to pick up the new permission");
-            let view = node.membership_state().await?.project()?;
+            let view = node.membership_state().await.context("identity gateway: read authoritative membership")?.project()?;
             let mut own = set_manage(&admin, &view, &phone, "phone", true)?;
             own.issuer = phone.device_id()?;
             assert!(joiner.call("grant", json!({"event":own.sign(&phone)?})).await.is_err(), "a demoted device cannot promote itself");
@@ -4239,15 +4875,15 @@ mod tests {
             assert!(format!("{error:#}").contains(LAST_MANAGER), "{error:#}");
             manager.call("grant", json!({"event":set_manage(&admin, &view, &phone, "phone", true)?})).await?;
             assert_eq!(joiner.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
-            let view = node.membership_state().await?.project()?;
+            let view = node.membership_state().await.context("identity gateway: read authoritative membership")?.project()?;
             let rename = GovernanceEvent::grant(&admin, &view, Member::node(&node.identity, "工作室 Mac")?)?;
             manager.call("grant", json!({"event":rename})).await?;
-            assert_eq!(node.membership_state().await?.project()?.node(&node_id)?.name, "工作室 Mac", "a manager renames a computer");
-            let view = node.membership_state().await?.project()?;
+            assert_eq!(node.membership_state().await.context("identity gateway: read authoritative membership")?.project()?.node(&node_id)?.name, "工作室 Mac", "a manager renames a computer");
+            let view = node.membership_state().await.context("identity gateway: read authoritative membership")?.project()?;
             let as_client = GovernanceEvent::grant(&admin, &view, Member::new(&node_id, IdentityKind::Client, "工作室 Mac", false)?)?;
             assert!(manager.call("grant", json!({"event":as_client})).await.is_err(), "a rename keeps the kind");
 
-            let view = node.membership_state().await?.project()?;
+            let view = node.membership_state().await.context("identity gateway: read authoritative membership")?.project()?;
             let revoke = GovernanceEvent::revoke(&admin, &view, Revocation::new(&phone.device_id()?, None)?)?;
             assert!(joiner.call("revoke", json!({"event":revoke})).await.is_err(), "issuer must be the session");
             let mut last = GovernanceEvent::unsigned(&view, &admin.device_id()?, GovernanceAction::Revoke(Revocation::new(&phone.device_id()?, None)?))?;
@@ -4255,12 +4891,12 @@ mod tests {
             manager.call("grant", json!({"event":set_manage(&admin, &view, &phone, "phone", false)?})).await?;
             let error = manager.call("revoke", json!({"event":last.sign(&admin)?})).await.unwrap_err();
             assert!(format!("{error:#}").contains(LAST_MANAGER), "{error:#}");
-            let view = node.membership_state().await?.project()?;
+            let view = node.membership_state().await.context("identity gateway: read authoritative membership")?.project()?;
             let mut forged = GovernanceEvent::unsigned(&view, &admin.device_id()?, GovernanceAction::Revoke(Revocation::new(&node_id, None)?))?;
             forged.issuer = phone.device_id()?;
             let error = joiner.call("revoke", json!({"event":forged.sign(&phone)?})).await.unwrap_err();
             assert!(format!("{error:#}").contains("management permission required"), "{error:#}");
-            let mut watching = connect(phone.clone()).await?;
+            let mut watching = connect("phone-revocation-subscriber", phone.clone()).await?;
             watching.call("subscribe", json!({})).await?;
             let leave = GovernanceEvent::revoke(&phone, &view, Revocation::new(&phone.device_id()?, None)?)?;
             let mut updates = node.events.subscribe();
@@ -4277,28 +4913,28 @@ mod tests {
             assert!(revoked_info.get("connection_entry").is_none());
             assert!(watching.call("info", json!({})).await.is_err(), "the revoked device's subscription is closed");
             let rejoin = manager.call("invite", invite([4; 32])?).await?["join_id"].clone();
-            let error = connect(phone.clone()).await?.call("join", join(&phone, [4; 32], &nonce)?).await.unwrap_err();
+            let error = connect("revoked-phone-rejoin", phone.clone()).await?.call("join", join(&phone, [4; 32], &nonce)?).await.unwrap_err();
             assert!(format!("{error:#}").contains("already a member or was revoked"), "{error:#}");
             let fresh = LocalIdentity::generate();
-            let mut rejoining = connect(fresh.clone()).await?;
+            let mut rejoining = connect("fresh-key-rejoiner", fresh.clone()).await?;
             assert_eq!(rejoining.call("join", join(&fresh, [4; 32], &nonce)?).await?["status"], "pending", "a new key joins with a new link");
             manager.call("approve", json!({"join_id":rejoin,"admin_nonce":admin_nonce})).await?;
             rejoining.call("join_status", json!({"join_id":rejoin,"reveal":nonce})).await?;
-            let grant = GovernanceEvent::grant(&admin, &node.membership_state().await?.project()?, Member::client(&fresh, "phone", false)?)?;
+            let grant = GovernanceEvent::grant(&admin, &node.membership_state().await.context("identity gateway: read authoritative membership")?.project()?, Member::client(&fresh, "phone", false)?)?;
             assert_eq!(manager.call("approve", json!({"join_id":rejoin,"event":grant})).await?["status"], "joined");
             assert_eq!(rejoining.call("authenticate", json!({})).await?["principal"]["can_manage"], false);
             rejoining.call("subscribe", json!({})).await?;
             manager.call("subscribe", json!({})).await?;
             let later = LocalIdentity::generate();
             manager.call("invite", invite([5; 32])?).await?;
-            connect(later.clone()).await?.call("join", join(&later, [5; 32], &nonce)?).await?;
+            connect("later-guest", later.clone()).await?.call("join", join(&later, [5; 32], &nonce)?).await?;
             for client in [&mut manager, &mut rejoining] {
-                assert_eq!(next_push(client).await?, json!({"type":"changed"}),
+                assert_eq!(client.push().await?, json!({"type":"changed"}),
                     "a new join tells every open page to reread, and tells nothing about the request");
             }
 
             let replacement = LocalIdentity::generate();
-            let before = node.membership_state().await?;
+            let before = node.membership_state().await.context("identity gateway: read authoritative membership")?;
             let next = LocalIdentity::generate();
             let members = vec![
                 Member::client(&admin, "admin", true)?,
@@ -4309,7 +4945,7 @@ mod tests {
             let checkpoint = RootCheckpoint::recovery(&before, &root, &next.device_id()?, members.clone(), vec![], now)?;
             let backdated = RootCheckpoint::recovery(&before, &root, &next.device_id()?, members.clone(), vec![], 0)?;
             let dropped = RootCheckpoint::recovery(&before, &root, &next.device_id()?, vec![Member::client(&replacement, "new laptop", true)?], vec![], now)?;
-            let mut recovering = connect(replacement.clone()).await?;
+            let mut recovering = connect("replacement-root-recovery", replacement.clone()).await?;
             let expires = crate::runtime::now_ms() + 60_000;
             let read_with = |signer: &LocalIdentity, checkpoints: &[&RootCheckpoint]| -> Result<Value> {
                 let payload = format!(r#"{{"device_id":"{}","expires_at_ms":{expires},"network_id":"{network}"}}"#, replacement.device_id()?);
@@ -4324,40 +4960,53 @@ mod tests {
             refused(recovering.call("recover", submit(vec![&backdated])).await.unwrap_err(), RECOVERY_TOO_OLD);
             let first_since = manager.call("authenticate", json!({})).await?["recovery_since_ms"].clone();
             let waiting = recovering.call("recover", submit(vec![&checkpoint])).await?;
-            assert_eq!(next_push(&mut manager).await?, json!({"type":"changed"}), "a waiting recovery reaches open manager pages at once");
+            assert_eq!(manager.push().await?, json!({"type":"changed"}), "a waiting recovery reaches open manager pages at once");
             assert_eq!((&waiting["principal"], &waiting["recovery"]["status"]), (&Value::Null, &json!("waiting")));
+            assert_eq!(waiting["network_id"], network);
+            assert_eq!(waiting["recovery"]["checkpoint_hash"], checkpoint.hash()?);
             assert_eq!(waiting["recovery"]["effective_at_ms"], checkpoint.effective_at_ms());
             assert_eq!(recovering.call("recover", submit(vec![&checkpoint])).await?["recovery"], waiting["recovery"], "a retry changes nothing");
+            assert_eq!(recovering.call("authenticate", json!({})).await?["recovery"], waiting["recovery"], "readback preserves the exact recovery checkpoint");
+            let mut unrelated = connect("unrelated-guest", LocalIdentity::generate()).await?;
+            let unrelated_auth = unrelated.call("authenticate", json!({})).await?;
+            assert!(unrelated_auth["recovery"].is_null(), "another device cannot read the waiting recovery summary");
+            assert!(unrelated_auth.get("network_id").is_none());
             assert!(recovering.call("directory", json!({})).await.is_err(), "a waiting device reads nothing");
             let seen = manager.call("authenticate", json!({})).await?;
             assert_eq!((&seen["view"]["pending"]["checkpoint"], &seen["recovery_since_ms"]), (&json!(checkpoint.hash()?), &first_since));
             refused(recovering.call("recovery_state", read(&root)?).await.unwrap_err(), vibeface_secure::membership::RECOVERY_WAITING);
-            let veto = GovernanceEvent::unsigned(&node.membership_state().await?.project()?, &admin.device_id()?, GovernanceAction::Veto { checkpoint: checkpoint.hash()?, at_ms: now })?.sign(&admin)?;
+            let veto = GovernanceEvent::unsigned(&node.membership_state().await.context("identity gateway: read authoritative membership")?.project()?, &admin.device_id()?, GovernanceAction::Veto { checkpoint: checkpoint.hash()?, at_ms: now })?.sign(&admin)?;
             assert!(recovering.call("veto", json!({"event":veto})).await.is_err(), "only a manager in effect stops it");
             let stopped = manager.call("veto", json!({"event":veto})).await?;
             assert_eq!(stopped["view"]["stopped"], json!([checkpoint.hash()?]));
             assert_eq!(manager.call("veto", json!({"event":veto})).await?["view"], stopped["view"], "a retry changes nothing");
-            assert_eq!(recovering.call("authenticate", json!({})).await?["recovery"]["status"], "stopped");
+            let stopped_summary = recovering.call("authenticate", json!({})).await?;
+            assert_eq!(stopped_summary["recovery"], json!({"status":"stopped","checkpoint_hash":checkpoint.hash()?}));
+            assert_eq!(stopped_summary["network_id"], network);
+            assert_eq!(recovering.call("authenticate", json!({})).await?["recovery"], stopped_summary["recovery"]);
+            let unrelated_auth = unrelated.call("authenticate", json!({})).await?;
+            assert!(unrelated_auth["recovery"].is_null(), "another device cannot read the stopped recovery summary");
+            assert!(unrelated_auth.get("network_id").is_none());
             refused(recovering.call("recovery_state", read_with(&next, &[&checkpoint])?).await.unwrap_err(), vibeface_secure::membership::RECOVERY_STOPPED);
             recovering.call("recovery_state", read(&root)?).await?;
             // A guest sends events only to carry its file's vetoes; anything else is dropped.
-            let before = node.membership_state().await?;
+            let before = node.membership_state().await.context("identity gateway: read authoritative membership")?;
             let stray = GovernanceEvent::grant(&admin, &before.project()?, Member::client(&LocalIdentity::generate(), "stray", true)?)?;
             recovering.call("recover", json!({"genesis":genesis,"checkpoints":[&checkpoint],"events":[stray]})).await?;
-            assert_eq!(node.membership_state().await?, before, "a retry with other events changes nothing");
+            assert_eq!(node.membership_state().await.context("identity gateway: read authoritative membership")?, before, "a retry with other events changes nothing");
 
-            let (next, stopped) = (LocalIdentity::generate(), node.membership_state().await?);
+            let (next, stopped) = (LocalIdentity::generate(), node.membership_state().await.context("identity gateway: read authoritative membership")?);
             let effective = RootCheckpoint::recovery(&stopped, &root, &next.device_id()?, members, vec![], 0)?;
             let started = crate::runtime::now_ms();
             let mut state = stopped.clone();
             state.recover(effective.clone())?;
-            node.install_membership(state).await?;
+            node.install_membership(state).await.context("identity gateway: install fixture effective recovery")?;
             let recovered = recovering.call("authenticate", json!({})).await?;
             assert_eq!((&recovered["principal"]["can_manage"], &recovered["principal"]["epoch"]), (&json!(true), &json!(3)));
             assert!(recovered["recovery_since_ms"].as_i64() >= Some(started), "a new recovery key restarts the date");
             let chain = [&checkpoint, &effective];
             refused(recovering.call("recovery_state", read_with(&root, &chain)?).await.unwrap_err(), vibeface_secure::membership::SUPERSEDED);
-            let after = node.membership_state().await?;
+            let after = node.membership_state().await.context("identity gateway: read authoritative membership")?;
             // The new file carries the veto, without which the root could not have signed again.
             let carrying = |checkpoints: Vec<&RootCheckpoint>| json!({"genesis":genesis,"checkpoints":checkpoints,"events":after.events});
             let stale = RootCheckpoint::rotation(&after, &root, &LocalIdentity::generate().device_id()?, now)?;
@@ -4371,10 +5020,10 @@ mod tests {
             recovering.call("recover", submit(vec![&checkpoint, &effective, &rotated])).await?;
             recovering.call("recover", carrying(vec![&checkpoint, &effective, &rotated])).await?;
             assert!(recovering.call("directory", json!({})).await?["recovery_since_ms"].as_i64() >= Some(started), "a rotation restarts the date");
-            assert_eq!(node.membership_state().await?.project()?.recovery_key, rotated.recovery_key);
+            assert_eq!(node.membership_state().await.context("identity gateway: read authoritative membership")?.project()?.recovery_key, rotated.recovery_key);
             assert!(recovering.call("recovery_state", read(&next)?).await.is_err(), "a rotation supersedes the file too");
 
-            assert!(Client::connect(&origin, &admin, &LocalIdentity::generate().device_id()?).await.is_err());
+            assert!(vibeface_client::Connection::open(&origin, &vibeface_secure::Identity::from_secret_hex(&admin.secret_key_hex)?, &LocalIdentity::generate().device_id()?).await.is_err());
 
             let ws = |page: &str| -> Result<_> {
                 let mut request = format!("{}/api/client", origin.replace("http://", "ws://")).into_client_request()?;
@@ -4384,7 +5033,8 @@ mod tests {
             let (socket, _) = tokio_tungstenite::connect_async(ws("https://app.example")?).await?;
             let mut socket = ClientSocket::Client(Box::new(socket));
             socket.send(Message::Text(json!({"type":"connect","target":node_id}).to_string().into())).await?;
-            let mut cross = Client::from_socket(socket, &admin, &node_id).await?;
+            let client = FrameClient::from_socket(socket, &admin, &node_id).await.context("identity gateway allowed-origin admin handshake")?;
+            let mut cross = IdentityPeer { label: "allowed-origin-admin", device_id: admin.device_id()?, target_id: node_id.clone(), step: 0, node: node.clone(), client };
             assert_eq!(cross.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
             assert!(tokio_tungstenite::connect_async(ws("https://evil.example")?).await.is_err());
             // A target outside the network is refused before it would wait for a slot.
@@ -4408,12 +5058,22 @@ mod tests {
             Ok(())
         }
         .await;
+        let server_finished = server.is_finished();
+        let cleanup_started = Instant::now();
+        eprintln!(
+            "identity-fixture wait=cleanup stage=begin scenario_ok={} gateway_finished={server_finished}",
+            result.is_ok()
+        );
         server.abort();
         let _ = server.await;
         node.shutdown().await;
+        eprintln!(
+            "identity-fixture wait=cleanup stage=ok elapsed_ms={}",
+            cleanup_started.elapsed().as_millis()
+        );
         drop(node);
         std::fs::remove_dir_all(&dir)?;
-        result
+        result.with_context(|| format!("identity gateway scenario failed; gateway_finished_before_cleanup={server_finished}"))
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4437,15 +5097,7 @@ mod tests {
         config.forwarding.per_ip = std::num::NonZeroUsize::new(1);
         config.forwarding.trusted_proxies = vec!["127.0.0.1".parse()?];
         drop((public, local));
-        config.save(&dir)?;
-        crate::config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
-        crate::config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let origin = node.config.public_url.clone();
         let server = tokio::spawn(crate::api::serve(node.clone(), None));
@@ -4454,7 +5106,8 @@ mod tests {
             let origin = &origin;
             // The trusted proxy on loopback names each browser's address.
             let request = |address: &'static str| -> Result<_> {
-                let mut request = client_url(origin)?.into_client_request()?;
+                let mut request = format!("{}/api/client", origin.replace("http://", "ws://"))
+                    .into_client_request()?;
                 request.headers_mut().insert("x-real-ip", address.parse()?);
                 Ok(request)
             };
@@ -4575,15 +5228,22 @@ mod tests {
     #[test]
     fn channel_requests_require_bounded_ids_and_object_params() {
         let mut request = Request {
-            id: "valid-request".into(),
+            id: "valid:request-._1".into(),
             method: "info".into(),
             params: json!({}),
         };
         assert!(validate_request(&request).is_ok());
+        request.id = "a".repeat(128);
+        assert!(validate_request(&request).is_ok());
         request.params = json!("untyped payload");
         assert!(validate_request(&request).is_err());
         request.params = json!({});
-        request.id = "\n".into();
-        assert!(validate_request(&request).is_err());
+        for id in ["", "\n", "bad/id", "bad id", "é", &"a".repeat(129)] {
+            request.id = id.into();
+            assert_eq!(
+                validate_request(&request).unwrap_err().to_string(),
+                "invalid request ID"
+            );
+        }
     }
 }

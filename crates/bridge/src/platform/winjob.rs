@@ -3,9 +3,8 @@
 //!
 //! A job created here is named for this account and keyed to one managed program, and is set to
 //! end its members when the last handle to it closes. A crash of the Node therefore ends the
-//! tree with it. The journal record carries the moment the root process started and the image it
-//! was started from, so a process id another program later reuses can never be mistaken for the
-//! recorded one.
+//! tree with it. The journal record stores the root process id, its start time and the job key,
+//! so a process id another program later reuses is not mistaken for the recorded one.
 
 use anyhow::{Context as _, Result, bail, ensure};
 use std::io;
@@ -243,9 +242,6 @@ impl Job {
 /// The start moment is what makes the record safe. Windows hands a process identifier to a new
 /// program as soon as the old one is gone, so an identifier on its own proves nothing; the pair
 /// of identifier and start moment names exactly one program for as long as it runs.
-///
-/// The fields are separated by a character no Windows path may contain, so a record never needs
-/// escaping and never runs into a program path.
 pub struct Record {
     process: u32,
     started: u64,
@@ -286,9 +282,14 @@ impl std::str::FromStr for Record {
 /// because the caller uses the answer to decide whether to refuse rather than to end anything.
 pub fn process_is_running(process: u32) -> bool {
     use windows_sys::Win32::{Foundation::STATUS_PENDING, System::Threading::GetExitCodeProcess};
-    let Ok(handle) = open_for_query(process) else {
-        return io::Error::last_os_error().raw_os_error()
-            != Some(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER as i32);
+    let handle = match open_for_query(process) {
+        Ok(handle) => handle,
+        Err(error) => {
+            return error
+                .downcast_ref::<io::Error>()
+                .and_then(io::Error::raw_os_error)
+                != Some(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER as i32);
+        }
     };
     let mut status = 0_u32;
     // SAFETY: the handle is open and the status is a live local.

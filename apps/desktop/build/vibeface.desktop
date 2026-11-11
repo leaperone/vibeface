@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Vibeface
+Exec=vibeface %u
+Icon=vibeface
+Type=Application
+Categories=Network;Development;
+MimeType=x-scheme-handler/vibeface;
+Terminal=false

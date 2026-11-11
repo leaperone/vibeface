@@ -1,0 +1,84 @@
+name: Delivery / Live native proof
+run-name: >-
+  Live native proof · ${{ github.event_name }} · ${{ github.ref_name }} · five fresh proofs and settlement
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: delivery-live-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  checks:
+    name: Core with Linux native packages
+    uses: ./.github/workflows/ci.yml
+    with:
+      package_policy: linux-native
+    secrets: inherit
+
+  delivery-live:
+    name: Five fresh native proofs and settlement
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && needs.checks.result == 'success' }}
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.checks.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: node-package-x86_64-unknown-linux-gnu-${{ needs.checks.outputs.source_sha }}
+          path: .artifacts/vdp/live-package
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: crypto-web-${{ needs.checks.outputs.source_sha }}
+          path: apps/app/generated
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: web-${{ needs.checks.outputs.source_sha }}
+          path: apps/app/dist/client
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - name: Require native Linux x86_64 runner
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+      - name: Run fresh protected native receipts, recovery and cumulative payment
+        id: protected
+        env:
+          SOURCE_COMMIT: ${{ needs.checks.outputs.source_sha }}
+        run: python3 scripts/run-delivery-live.py --protected-package .artifacts/vdp/live-package --source-commit "$SOURCE_COMMIT"
+      - name: Preserve only the reviewed public native evidence
+        if: ${{ always() && steps.protected.outputs.public-directory != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: delivery-protected-public-${{ needs.checks.outputs.source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.protected.outputs.public-directory }}
+          if-no-files-found: error
+          retention-days: 14
+
+  delivery-gate:
+    name: Live native proof gate
+    if: always()
+    needs: [checks, delivery-live]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require Core and fresh native proof acceptance
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os
+          checks = json.loads(os.environ['RESULTS'])
+          required = ['checks', 'delivery-live']
+          failed = {name: checks.get(name, {}).get('result', 'missing') for name in required if checks.get(name, {}).get('result') != 'success'}
+          if failed: raise SystemExit('Live native delivery is incomplete: ' + json.dumps(failed))
+          PYTHON

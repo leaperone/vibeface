@@ -19,6 +19,8 @@ import plistlib
 import zipfile
 
 sys.dont_write_bytecode = True
+if __name__ == '__main__':
+    sys.modules.setdefault('release', sys.modules[__name__])
 
 ROOT = Path(__file__).resolve().parent.parent
 APPS = ('www', 'app', 'core', 'cli', 'mobile', 'desktop')
@@ -31,7 +33,8 @@ WINDOWS_TARGETS = ('x86_64-pc-windows-msvc',)
 DESKTOP_TARGETS = TARGETS
 DESKTOP_INSTALLERS = {'aarch64-apple-darwin': 'dmg', 'x86_64-pc-windows-msvc': 'exe',
                       'x86_64-unknown-linux-gnu': 'AppImage', 'aarch64-unknown-linux-gnu': 'AppImage'}
-ELECTRON_VERSION = '45.2.3'
+NATIVE_UI = {'ui': 'gpui', 'gpui_kit': '0.9.1', 'gpui': '0.3.12'}
+DESKTOP_SCHEMA = 2
 SIGNING_STATES = ('developer-id-notarized', 'authenticode', 'unsigned-development-preview', 'platform-checksums')
 VERSION = r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(nightly)\.([0-9]{8})\.([1-9][0-9]*)|-(rc)\.([1-9][0-9]*))?'
 COMMIT = r'[a-f0-9]{40}'
@@ -88,7 +91,7 @@ def read_version(app, root=None):
     root = root or ROOT
     require(app in APPS, 'unknown app')
     directory = root / 'apps' / app
-    if app in ('core', 'cli'):
+    if app in ('core', 'cli', 'desktop'):
         text = (directory / 'Cargo.toml').read_text(encoding='utf-8')
         match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
         require(match, f'{app} must own its package version')
@@ -124,6 +127,94 @@ def identity(release_app, root=None):
         value = read_version('www', root)
     return {'app': release_app, 'version': value, 'tag': release_tag_for(release_app, value),
             'source_commit': run('git', 'rev-parse', 'HEAD', cwd=root), 'channel': version(value)}
+
+
+def validate_source(source, release_app, root=None):
+    """Return the main CI source after proving the entire detached Nightly tree."""
+    import nightly_source
+    global ROOT
+    previous = ROOT
+    ROOT = root or ROOT
+    try:
+        return nightly_source.source_context(source, release_app)
+    finally:
+        ROOT = previous
+
+
+def source_workflows(source):
+    """Read release entry paths from an exact immutable commit, never the checkout."""
+    require(isinstance(source, str) and re.fullmatch(COMMIT, source), 'invalid workflow source commit')
+    require(run('git', 'rev-parse', '--verify', source + '^{commit}') == source,
+            'workflow source must be an exact commit')
+    paths = {'.github/workflows/' + name for name in ('ci.yml', 'nightly.yml', 'release.yml', 'release-www.yml')}
+    entries = run('git', 'ls-tree', '-z', source, '--', *sorted(paths))
+    found = set()
+    for entry in entries.split('\0'):
+        if not entry:
+            continue
+        header, separator, path = entry.partition('\t')
+        fields = header.split()
+        require(separator and len(fields) == 3 and fields[0] in ('100644', '100755')
+                and fields[1] == 'blob' and re.fullmatch(COMMIT, fields[2])
+                and path in paths and path not in found, 'malformed workflow source tree')
+        found.add(path)
+    return found
+
+
+def nightly_ci_identity(source):
+    paths = source_workflows(source)
+    require('.github/workflows/ci.yml' in paths, 'workflow source is missing Core CI')
+    if '.github/workflows/nightly.yml' in paths:
+        return '.github/workflows/nightly.yml', 'Nightly validation gate'
+    return '.github/workflows/ci.yml', 'ci-gate'
+
+
+def release_workflow(source, app):
+    """Return the source-era release entry and its fixed dispatch input contract."""
+    require(app in RELEASES, 'release app must be product or www')
+    paths = source_workflows(source)
+    require('.github/workflows/release.yml' in paths, 'workflow source is missing Product release')
+    split = '.github/workflows/release-www.yml' in paths
+    path = '.github/workflows/release-www.yml' if app == 'www' and split else '.github/workflows/release.yml'
+    return path, ({} if split else dict(app=app))
+
+
+def require_ci(context):
+    """Main tags require push success; detached Nightlies require their original schedule gate."""
+    source, run_id = context['ci_source_commit'], context['ci_run_id']
+    require(isinstance(source, str) and re.fullmatch(COMMIT, source), 'invalid CI source commit')
+    def api(path):
+        return json.loads(run('gh', 'api', f'repos/{GITHUB_REPO}/' + path))
+    if run_id:
+        require(isinstance(run_id, str) and re.fullmatch(r'[1-9][0-9]*', run_id), 'invalid original Nightly run ID')
+        workflow, gate = nightly_ci_identity(source)
+        candidates = [api(f'actions/runs/{run_id}')]
+    else:
+        workflow = '.github/workflows/ci.yml'
+        batches = json.loads(run('gh', 'api', '--paginate', '--slurp',
+            f'repos/{GITHUB_REPO}/actions/workflows/ci.yml/runs?head_sha={source}&branch=main&event=push&per_page=100'))
+        candidates = [item for page in batches for item in page['workflow_runs']]
+    for candidate in candidates:
+        if not (candidate['head_sha'] == source and candidate['head_branch'] == 'main'
+                and candidate['path'] == workflow
+                and candidate['repository']['full_name'] == GITHUB_REPO
+                and candidate['head_repository']['full_name'] == GITHUB_REPO):
+            continue
+        if not run_id:
+            if candidate['event'] == 'push' and candidate['status'] == 'completed' and candidate['conclusion'] == 'success':
+                return candidate
+            continue
+        require(str(candidate['id']) == run_id and candidate['event'] == 'schedule', 'untrusted original Nightly CI run')
+        created = datetime.datetime.fromisoformat(candidate['created_at'].replace('Z', '+00:00')).astimezone(datetime.timezone.utc)
+        batch = created.replace(hour=created.hour // 4 * 4).strftime('%Y%m%d%H')
+        require(batch == context['nightly_batch'], 'Nightly CI run does not match its original batch')
+        pages = json.loads(run('gh', 'api', '--paginate', '--slurp',
+                              f'repos/{GITHUB_REPO}/actions/runs/{run_id}/jobs?filter=latest&per_page=100'))
+        gates = [job for page in pages for job in page['jobs'] if job['name'] == gate]
+        require(len(gates) == 1 and gates[0].get('status') == 'completed' and gates[0].get('conclusion') == 'success',
+                f'original Nightly schedule {gate} did not succeed')
+        return candidate
+    raise ValueError('release requires the exact trusted main push CI or original Nightly schedule gate')
 
 
 def expected_release_kind_for_component(app):
@@ -406,10 +497,11 @@ def compose_offline(target, native_dir, app_archive, output):
         installer = service_installer(target)
         require(installer.is_file(), f'missing user service installer for {target}: scripts/{installer.name}')
         shutil.copy2(installer, directory / 'scripts' / installer.name)
-        shutil.copy2(ROOT / 'README.md', directory / 'README.md')
-        (directory / 'docs').mkdir()
-        for name in ('node.md', 'releasing.md'):
-            shutil.copy2(ROOT / 'packages/docs' / name, directory / 'docs' / name)
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('offline_docs', ROOT / 'scripts/offline-docs.py')
+        offline_docs = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(offline_docs)
+        offline_docs.assemble(directory)
         (directory / 'RUNTIME-REQUIREMENTS.md').write_text('Requires separately configured Agent programs and credentials.\n')
         os.environ['PACKAGE_TARGET'] = target
         seal_bundle(directory)
@@ -470,13 +562,14 @@ def verify_desktop_receipt(directory, target, pins, runtime_digest=None):
     require(path.is_file(), 'missing desktop provenance receipt')
     info = json.loads(path.read_text(encoding='utf-8'))
     require(set(info) == {'schema', 'app', 'target', 'version', 'tag', 'channel', 'source_commit',
-                          'electron', 'signed', 'signing', 'runtime', 'artifacts'},
+                          'ui', 'gpui_kit', 'gpui', 'signed', 'signing', 'runtime', 'artifacts'},
             'unsupported desktop receipt fields')
-    require(type(info['schema']) is int and info['schema'] == SCHEMA_VERSION, 'invalid desktop receipt schema')
+    require(type(info['schema']) is int and info['schema'] == DESKTOP_SCHEMA, 'invalid desktop receipt schema')
     require(info['app'] == 'desktop' and info['target'] == target, 'desktop receipt is not this platform')
     require(all(info[key] == value for key, value in pins.items()), 'desktop receipt cohort mismatch')
     require(re.fullmatch(COMMIT, info['source_commit']), 'invalid desktop source commit')
-    require(info['electron'] == ELECTRON_VERSION, 'desktop receipt must name the pinned Electron version')
+    require(all(info.get(key) == value for key, value in NATIVE_UI.items()),
+            'desktop receipt must name the pinned native GPUI version')
     require(type(info['signed']) is bool and info['signing'] in SIGNING_STATES, 'invalid desktop signing status')
     require(info['signed'] == (info['signing'] in ('developer-id-notarized', 'authenticode')),
             'desktop signing status and signed flag disagree')
@@ -598,6 +691,7 @@ def expected_asset_names(release_app, version_value, ios_signed=False):
 
 PART_KINDS = ('app', 'native', 'desktop', 'android', 'ios')
 BUILDING_MARKER = 'BUILDING — incomplete'
+FAILED_MARKER = 'FAILED — incomplete'
 
 
 def product_payload_names(version_value, ios_signed=False):
@@ -647,6 +741,12 @@ def product_building_notes(info):
             f"product {info['version']}; source {info['source_commit']}.")
 
 
+def product_failed_notes(info):
+    return (f'{FAILED_MARKER}; the release run failed and rerunning its failed jobs resumes it; '
+            f'automated install or update waits for the global release manifest.\n\n'
+            f"product {info['version']}; source {info['source_commit']}.")
+
+
 def product_complete_notes(info):
     return f"product {info['version']}; source {info['source_commit']}."
 
@@ -657,7 +757,7 @@ def require_product_publishing():
     tag = expected['tag']
     require(run('git', 'rev-parse', tag + '^{commit}') == expected['source_commit'],
             'publishing requires the existing release tag at this source commit')
-    subprocess.run(['git', 'merge-base', '--is-ancestor', expected['source_commit'], 'origin/main'], check=True)
+    validate_source(expected['source_commit'], 'product')
     return expected
 
 
@@ -899,6 +999,21 @@ def begin_product(repo=GITHUB_REPO):
     return expected
 
 
+def fail_product(repo=GITHUB_REPO):
+    """Mark a BUILDING product Release whose run failed before its manifest; a rerun restores it."""
+    expected = require_product_publishing()
+    tag = expected['tag']
+    view = release_view(tag, repo)
+    if view is None or BUILDING_MARKER not in (view.get('body') or ''):
+        return expected
+    if 'release.json' in remote_assets_by_name(list_release_assets(tag, repo)):
+        return expected
+    require(not release_record(tag, repo).get('immutable'), 'release is immutable')
+    subprocess.run(['gh', 'release', 'edit', tag, f'--repo={repo}', '--notes', product_failed_notes(expected)],
+                   check=True)
+    return expected
+
+
 def publish_part(kind, directory, target=None, repo=GITHUB_REPO):
     """Validate and append one progressive product part without touching the final manifest."""
     part = verify_part_directory(kind, directory, target)
@@ -966,7 +1081,7 @@ def finalize_progressive_product(directory, expected, info, repo=GITHUB_REPO):
                 remote_by_name = remote_assets_by_name(list_release_assets(tag, repo))
                 require('release.json' in remote_by_name, 'uploaded manifest missing after write')
             confirm_remote_asset(tag, repo, remote_by_name['release.json'], manifest_sha, manifest_size, scratch)
-    if BUILDING_MARKER in (view.get('body') or ''):
+    if BUILDING_MARKER in (view.get('body') or '') or FAILED_MARKER in (view.get('body') or ''):
         require(not record.get('immutable'), 'release is immutable')
         subprocess.run(['gh', 'release', 'edit', tag, f'--repo={repo}', '--notes', product_complete_notes(info),
                         '--latest=false', f'--prerelease={str(info["channel"] != "stable").lower()}'], check=True)
@@ -1055,7 +1170,7 @@ def publish(release_app, directory, repo=GITHUB_REPO):
     info = verify_release(release_app, directory, expected)
     tag = info['tag']
     require(run('git', 'rev-parse', tag + '^{commit}') == info['source_commit'], 'release tag source mismatch')
-    subprocess.run(['git', 'merge-base', '--is-ancestor', info['source_commit'], 'origin/main'], check=True)
+    validate_source(info['source_commit'], release_app)
     if release_app == 'product':
         return finalize_progressive_product(directory, expected, info, repo)
     view = subprocess.run(['gh', 'release', 'view', tag, f'--repo={repo}', '--json', 'isDraft,assets'],
@@ -1152,7 +1267,7 @@ def plan(release_app, tag=None, require_main=False, publishing=False, github_out
                 'tag does not match the declared version')
     if require_main or publishing:
         require(not run('git', 'status', '--porcelain'), 'release source must be clean')
-        subprocess.run(['git', 'merge-base', '--is-ancestor', 'HEAD', 'origin/main'], check=True)
+        data.update(validate_source(data['source_commit'], release_app))
     if publishing:
         require(run('git', 'rev-parse', data['tag'] + '^{commit}') == data['source_commit'],
                 'publishing requires the existing release tag at this source commit')
@@ -1166,6 +1281,7 @@ def plan(release_app, tag=None, require_main=False, publishing=False, github_out
 
 def self_test():
     from unittest.mock import patch
+    from progressive_publication_fixtures import native_programs, stage_desktop as fixture_desktop
     real_run = run
     product_version = canonical_product_version()
     channel = version(product_version)
@@ -1253,7 +1369,7 @@ def self_test():
             return json.dumps(dict(sha=public_view['source']))
         return real_run(*args, **kwargs)
 
-    scratch = ROOT / '.artifacts/release-tests'
+    scratch = Path(os.environ.get('VIBEFACE_RELEASE_SCRATCH', ROOT / '.artifacts/release-tests'))
     scratch.mkdir(parents=True, exist_ok=True)
     # The per-platform user service installers are repository files; the real compose job proves they
     # exist, so the self-test composes against fixtures instead of the checkout's scripts directory.
@@ -1326,15 +1442,7 @@ def self_test():
                 'the App producer stages the product release')
 
         # Native staging: real executable fixtures reporting the cohort version, per platform basename.
-        def native_programs(directory, target, reported=product_version):
-            directory.mkdir(parents=True, exist_ok=True)
-            for name in program_names(target):
-                binary = directory / name
-                binary.write_text(f'#!/bin/sh\necho "{name.removesuffix(".exe")} {reported}"\n')
-                binary.chmod(0o755)
-            return directory
-
-        native_bin = {target: native_programs(tmp / f'native-bin-{target}', target) for target in TARGETS}
+        native_bin = {target: native_programs(tmp / f'native-bin-{target}', target, product_version) for target in TARGETS}
         wrong_bin = native_programs(tmp / 'wrong-bin', TARGETS[0], '9.9.9')
         for target in TARGETS:
             receipt = accepts(lambda target=target: stage_native(target, native_bin[target], tmp / f'stage-{target}'))
@@ -1374,24 +1482,8 @@ def self_test():
 
         # Desktop producers: installer and archive payloads bound to this platform's released runtime.
         def stage_desktop(destination, target, **changes):
-            destination.mkdir(parents=True, exist_ok=True)
             runtime = collected / 'native' / target / f'vibeface-{product_version}-{target}.tar.gz'
-            artifacts = {}
-            for name in desktop_payload_names(product_version, target):
-                payload = destination / name
-                payload.write_bytes(f'{name} fixture payload'.encode())
-                payload.with_name(name + '.sha256').write_text(f'{digest(payload)}  {name}\n')
-                artifacts[name] = digest(payload)
-            receipt = dict(schema=SCHEMA_VERSION, app='desktop', target=target, version=product_version,
-                           tag=product_tag, channel=channel, source_commit=source, electron=ELECTRON_VERSION,
-                           signed=target == 'aarch64-apple-darwin',
-                           signing='developer-id-notarized' if target == 'aarch64-apple-darwin'
-                           else 'platform-checksums' if target.endswith('-unknown-linux-gnu')
-                           else 'unsigned-development-preview',
-                           runtime={'archive': runtime.name, 'sha256': digest(runtime)}, artifacts=artifacts)
-            receipt.update(changes)
-            write_json(destination / f'{desktop_basename(product_version, target)}.provenance.json', receipt)
-            return destination
+            return fixture_desktop(sys.modules[__name__], destination, target, product, runtime, **changes)
 
         desktop_pins = dict(version=product_version, tag=product_tag, source_commit=source, channel=channel)
         for target in DESKTOP_TARGETS:
@@ -1399,7 +1491,7 @@ def self_test():
             runtime_digest = digest(collected / 'native' / target / f'vibeface-{product_version}-{target}.tar.gz')
             info = accepts(lambda produced=produced, target=target, runtime_digest=runtime_digest:
                            verify_desktop_receipt(produced, target, desktop_pins, runtime_digest))
-            require(info['electron'] == ELECTRON_VERSION and len(info['artifacts']) == 2, 'desktop receipt payloads')
+            require(all(info[key] == value for key, value in NATIVE_UI.items()) and len(info['artifacts']) == 2, 'desktop receipt payloads')
             accepts(lambda produced=produced: manifest('product', produced))
             require({p.name for p in produced.iterdir()}
                     == desktop_asset_names(product_version, target) | {'release.json'}, 'desktop producer output set')
@@ -1430,10 +1522,10 @@ def self_test():
                     desktop_variant('stable-unsigned', windows_target, channel='stable'), windows_target,
                     dict(desktop_pins, channel='stable')),
                 'stable desktop distribution requires a signed application')
-        rejects('a desktop receipt claiming another Electron version',
-                lambda: verify_desktop_receipt(desktop_variant('other-electron', mac_target, electron='34.5.8'),
+        rejects('a desktop receipt claiming another native GPUI version',
+                lambda: verify_desktop_receipt(desktop_variant('other-gpui', mac_target, gpui='0.2.2'),
                                                mac_target, desktop_pins),
-                'pinned Electron version')
+                'pinned native GPUI version')
         rejects('a signed flag without a signing kind',
                 lambda: verify_desktop_receipt(
                     desktop_variant('claimed-signed', windows_target, signed=True), windows_target, desktop_pins),
@@ -1906,6 +1998,7 @@ def main():
     p.add_argument('app', choices=RELEASES)
     p.add_argument('directory', type=Path)
     sub.add_parser('begin-product')
+    sub.add_parser('fail-product')
     p = sub.add_parser('publish-part')
     p.add_argument('--kind', choices=PART_KINDS, required=True)
     p.add_argument('--input', type=Path, required=True)
@@ -1942,6 +2035,8 @@ def main():
         publish(args.app, args.directory)
     elif args.command == 'begin-product':
         print(json.dumps(begin_product()))
+    elif args.command == 'fail-product':
+        print(json.dumps(fail_product()))
     elif args.command == 'publish-part':
         print(json.dumps(publish_part(args.kind, args.input, target=args.target), sort_keys=True))
     elif args.command == 'verify-public':

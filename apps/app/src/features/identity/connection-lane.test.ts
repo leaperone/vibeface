@@ -3,12 +3,13 @@ import test from 'node:test'
 import { readFileSync } from 'node:fs'
 import { dirname, extname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createContext, Script } from 'node:vm'
-import { JsxEmit, ModuleKind, transpileModule } from 'typescript'
+import { createContext } from 'node:vm'
 import type { ConnectionEntry, MembershipView } from '@vibeface/client/lib/node.ts'
+import type { Platform } from '@vibeface/client/lib/platform.ts'
 import { primaryLane, shouldAutoConnect } from '@vibeface/client/identity/connection-lane.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
 import { joinLink, joinTicket } from '@vibeface/client/lib/transport.ts'
+import { hookHarness, moduleLoader } from '../../lib/test-harness.ts'
 
 test('one saved entry connects itself, and several entries stay listed', () => {
   assert.equal(shouldAutoConnect({ hasInvitation: false, savedCount: 1 }), true)
@@ -52,9 +53,9 @@ const until = async (ready: () => boolean) => {
 }
 
 const remote = '6'.repeat(64), freshKey = '7'.repeat(64)
-function deviceHarness({ joining = '', bootstrap = false, saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>(), removed = false, now = Date.now, origin = '' } = {}) {
-  const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
-  const afterRender: (() => void)[] = [], timers = new Map<number, () => void>()
+function deviceHarness({ joining = '', saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>(), tabStorage = new Map<string, string>(), removed = false, origin = '', entryAddrs = [] as string[] } = {}) {
+  const hooks = hookHarness(true), { effects, afterRender } = hooks
+  const timers = new Map<number, () => void>()
   const stored = storage, calls: string[] = [], navigations: string[] = []
   const requests: { method: string; params: Record<string, unknown> }[] = []
   const setupRequests: { path: string; options: RequestInit }[] = []
@@ -79,34 +80,22 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   const location = { hash, pathname, href: `${pageOrigin}${pathname}${hash}`, origin: pageOrigin, assign(url: string) { navigations.push(url) } }
   const hashListeners = new Set<() => void>()
   const openHash = (path: string, next: string) => { Object.assign(location, { pathname: path, hash: next, href: `${pageOrigin}${path}${next}` }); hashListeners.forEach(listener => listener()) }
-  let cursor = 0, nextTimer = 0
+  let nextTimer = 0
   const react = {
-    createContext: () => ({}), useContext: () => null, useCallback: (fn: unknown) => fn,
-    useState(initial: unknown) {
-      const index = cursor++
-      if (!(index in values)) values[index] = typeof initial === 'function' ? initial() : initial
-      return [values[index], (next: unknown) => { values[index] = typeof next === 'function' ? next(values[index]) : next }]
-    },
-    useRef(initial: unknown) { const index = cursor++; if (!(index in values)) values[index] = { current: initial }; return values[index] },
-    useMemo(read: () => unknown) { cursor++; return read() },
-    useEffect(run: () => (() => void) | void, dependencies: unknown[]) {
-      const index = cursor++, previous = effects.get(index)
-      if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) afterRender.push(() => {
-        previous?.cleanup?.(); effects.set(index, { dependencies, cleanup: run() ?? undefined })
-      })
-    },
+    ...hooks.react, useCallback: (fn: unknown) => fn,
+    useMemo(read: () => unknown) { hooks.next(); return read() },
   }
   if (joining) stored.set('vibeface.pending-join', JSON.stringify({ entry, join_id: 'join', invite_id: inviteId, nonce: joinNonce, name: 'browser', pinned: { network_id: network, admin_id: target, admin_nonce: '2'.repeat(64) } }))
   if (saved) stored.set('vibeface.connections', JSON.stringify([entry]))
   // A cookie-bound local session only exists after a launch on this origin, which the browser remembers.
   if (localSession) stored.set('vibeface.local-origin', 'true')
   let key = subject
-  let initialized = !bootstrap && local !== 'fresh'
+  let initialized = local !== 'fresh'
   const transport = {
     validTarget: (value: string) => value, validEndpoint: (value: string) => value, joinTicket, joinLink,
     initClient: async () => ({ deviceId: key }), signClient: async (purpose: string) => { signatures.push(purpose); return 'signature' },
     replaceClient: async () => { calls.push('replace-key'); key = freshKey; return { deviceId: key } },
-    parseJoinLink: async () => ({ entryId: target, inviteId, inviteHash: 'h'.repeat(64), secret: 'one-time-secret' }),
+    parseJoinLink: async () => ({ entryId: target, entryAddrs, inviteId, inviteHash: 'h'.repeat(64), secret: 'one-time-secret' }),
     async connectDevice(candidate: ConnectionEntry, options: { onClose?(cause: Error): void; signal?: AbortSignal }) {
       calls.push(`open:${candidate.device_id}`)
       let closed = false
@@ -157,10 +146,11 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   }
   const timer = (run: () => void) => { const id = ++nextTimer; timers.set(id, run); return id }
   const sandbox = createContext({
-    Date: class extends Date { static now = now },
+    Date,
     localStorage: { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => stored.set(key, value) },
+    sessionStorage: { getItem: (key: string) => tabStorage.get(key) ?? null, setItem: (key: string, value: string) => tabStorage.set(key, value), removeItem: (key: string) => tabStorage.delete(key) },
     location, addEventListener: (type: string, listener: () => void) => { if (type === 'hashchange') hashListeners.add(listener) }, removeEventListener: (_type: string, listener: () => void) => hashListeners.delete(listener),
-    history: { replaceState(_state: unknown, _title: string, url: URL) { location.hash = url.hash } }, URL, URLSearchParams, AbortController, TextEncoder, TextDecoder, Uint8Array, Error, crypto: globalThis.crypto,
+    history: { replaceState(_state: unknown, _title: string, url: URL) { location.hash = url.hash } }, URL, URLSearchParams, AbortController, TextEncoder, TextDecoder, Uint8Array, Error, btoa, atob, crypto: globalThis.crypto,
     async fetch(path: string, options: RequestInit) {
       if (path === '/api/local/info') calls.push('local-info')
       if (path === '/api/local/info') return localSession
@@ -180,37 +170,31 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     },
     setTimeout: timer, clearTimeout: (id: number) => timers.delete(id), setInterval: timer, clearInterval: (id: number) => timers.delete(id),
   })
-  const modules = new Map<string, { exports: Record<string, unknown> }>(), sourceRoot = fileURLToPath(new URL('../../', import.meta.url))
+  const sourceRoot = fileURLToPath(new URL('../../', import.meta.url))
   const clientRoot = fileURLToPath(new URL('../../../../../packages/client/src/', import.meta.url))
-  function load(filename: string): Record<string, unknown> {
-    if (extname(filename) === '.json') return { __esModule: true, default: JSON.parse(readFileSync(filename, 'utf8')) }
-    const cached = modules.get(filename)
-    if (cached) return cached.exports
-    const module = { exports: {} }; modules.set(filename, module)
-    const compiled = transpileModule(readFileSync(filename, 'utf8'), { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
-    const require = (specifier: string) => {
-      if (specifier === 'react') return react
-      if (specifier === 'react/jsx-runtime') return { jsx: (_type: unknown, props: unknown) => props }
-      if (specifier.endsWith('/lib/transport.ts')) return transport
-      if (specifier.endsWith('/lib/secure.ts')) return { secureKit: () => secure, recoveryCode: async () => 'ABCDEF12', recoveryFileName: (code: string) => `vibeface-recovery-${code}.json` }
-      const path = specifier.startsWith('@/') ? resolve(sourceRoot, specifier.slice(2)) : specifier.startsWith('@vibeface/client/') ? resolve(clientRoot, specifier.slice(17)) : resolve(dirname(filename), specifier)
-      return load(extname(path) ? path : `${path}.ts`)
-    }
-    new Script(`(function (exports, require, module) {\n${compiled}\n})`, { filename }).runInContext(sandbox)(module.exports, require, module)
-    return module.exports
-  }
+  const load = moduleLoader(sandbox, (specifier, filename) => {
+    if (specifier === 'react') return react
+    if (specifier === 'react/jsx-runtime') return { jsx: (_type: unknown, props: unknown) => props }
+    if (specifier.endsWith('/lib/transport.ts')) return transport
+    if (specifier.endsWith('/lib/secure.ts')) return { secureKit: () => secure, recoveryCode: async () => 'ABCDEF12', recoveryFileName: (code: string) => `vibeface-recovery-${code}.json` }
+    const path = specifier.startsWith('@/') ? resolve(sourceRoot, specifier.slice(2)) : specifier.startsWith('@vibeface/client/') ? resolve(clientRoot, specifier.slice(17)) : resolve(dirname(filename), specifier)
+    return load(extname(path) ? path : `${path}.ts`)
+  })
   const Provider = load(resolve(clientRoot, 'identity/context.tsx')).DeviceProvider
-  const platform = { secure: {}, transport, storage: sandbox.localStorage, page: load(resolve(sourceRoot, 'lib/local-page.ts')).localPage, self: '这个浏览器', saveRecovery() {} }
+  const platform = { secure: {}, transport, storage: sandbox.localStorage, page: load(resolve(sourceRoot, 'lib/local-page.ts')).localPage, self: '这个浏览器', saveRecovery(_bytes: Uint8Array, _name: string) {}, recoveryStorage: undefined as Platform['recoveryStorage'], joinTabs: undefined as Platform['joinTabs'], erase: undefined as Platform['erase'] }
+  let tabReceive: ((serialized: string) => void) | undefined
+  const enableTabs = () => { platform.joinTabs = (_name, handlers) => { tabReceive = value => handlers.message(JSON.parse(value)); const stop = handlers.lead(); return { post() {}, close() { tabReceive = undefined; stop?.() } } } }
+  let restarts = 0
   assert.equal(typeof Provider, 'function')
   type Device = ReturnType<typeof import('@vibeface/client/identity/context.tsx').useDevice>
   const render = (): Device => {
-    cursor = 0
+    hooks.reset()
     assert.ok(typeof Provider === 'function')
-    const props = Provider({ platform, children: null })
+    const props = Provider({ platform, children: null, restart: () => { restarts++ } })
     afterRender.splice(0).forEach(run => run())
     return props.value
   }
-  return { render, secure, calls, requests, setupRequests, joinStatus, inviteState, managed, holds, directory, receipt, signatures, sockets, stored, timers, location, openHash, localState, navigations, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
+  return { render, platform, enableTabs, broadcast: (value: unknown) => tabReceive?.(JSON.stringify(value)), secure, calls, requests, setupRequests, joinStatus, inviteState, managed, holds, directory, receipt, signatures, sockets, stored, timers, location, openHash, localState, navigations, restarts: () => restarts, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
 }
 
 const notMember = { principal: null, initialized: true, network_id: network, revoked: false }
@@ -226,14 +210,19 @@ function approvedDirectory(app: ReturnType<typeof recoveryApprovalHarness>, chan
   app.directory.view = { ...app.directory.view, epoch: 3, pending: null, ...change }
   return app.receipt()
 }
+async function pendingRecoveryApproval(app: ReturnType<typeof recoveryApprovalHarness>) {
+  const reply = deferred()
+  app.holds.set('approve_recovery', reply)
+  const approval = app.render().approveRecovery(recoveryCheckpoint)
+  await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+  return { reply, approval }
+}
 
 for (const detached of [false, true]) test(`recovery approval verifies its signed receipt${detached ? ' even after this manager is removed' : ''}`, async () => {
   const app = recoveryApprovalHarness()
   try {
     app.render(); await settle(); app.render()
-    const reply = deferred(); app.holds.set('approve_recovery', reply)
-    const approval = app.render().approveRecovery(recoveryCheckpoint)
-    await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+    const { reply, approval } = await pendingRecoveryApproval(app)
     const answer = approvedDirectory(app, detached ? { members: [] } : {})
     if (detached) {
       const unavailable = deferred(); unavailable.promise.catch(() => {}); unavailable.reject(new Error('this manager was removed'))
@@ -255,9 +244,7 @@ for (const landed of [true, false]) test(`a lost recovery approval reply ${lande
   const app = recoveryApprovalHarness()
   try {
     app.render(); await settle(); app.render()
-    const reply = deferred(); app.holds.set('approve_recovery', reply)
-    const approval = app.render().approveRecovery(recoveryCheckpoint)
-    await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+    const { reply, approval } = await pendingRecoveryApproval(app)
     if (landed) approvedDirectory(app)
     const cause = new Error('approval reply lost')
     reply.reject(cause)
@@ -290,9 +277,7 @@ for (const principal of [null, { network_id: network }]) test(`a lost recovery a
   try {
     app.render(); await settle(); app.render()
     const authentications = app.calls.filter(call => call === 'authenticate').length
-    const reply = deferred(); app.holds.set('approve_recovery', reply)
-    const approval = app.render().approveRecovery(recoveryCheckpoint)
-    await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+    const { reply, approval } = await pendingRecoveryApproval(app)
     const read = deferred(), auth = deferred(); read.promise.catch(() => {}); read.reject(new Error('directory unavailable')); auth.resolve({ principal })
     app.holds.set('directory', read); app.holds.set('authenticate', auth)
     const cause = new Error('approval reply lost'); reply.reject(cause)
@@ -309,9 +294,7 @@ for (const lost of [false, true]) test(`a ${lost ? 'lost' : 'successful'} recove
     const before = app.directory.state, verify = app.secure.verifyState
     app.secure.verifyState = (state = app.directory.state) => { if (state !== before) throw new Error('invalid signed state'); return verify(state) }
     app.render(); await settle(); app.render()
-    const reply = deferred(); app.holds.set('approve_recovery', reply)
-    const approval = app.render().approveRecovery(recoveryCheckpoint)
-    await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+    const { reply, approval } = await pendingRecoveryApproval(app)
     const answer = approvedDirectory(app), cause = new Error('approval reply lost')
     if (lost) reply.reject(cause)
     else reply.resolve(answer)
@@ -337,9 +320,7 @@ for (const lost of [false, true]) for (const outcome of ['pending', 'vetoed', 'r
   const app = recoveryApprovalHarness()
   try {
     app.render(); await settle(); app.render()
-    const reply = deferred(); app.holds.set('approve_recovery', reply)
-    const approval = app.render().approveRecovery(recoveryCheckpoint)
-    await until(() => app.requests.some(request => request.method === 'approve_recovery'))
+    const { reply, approval } = await pendingRecoveryApproval(app)
     let answer: unknown = app.receipt()
     if (outcome === 'unsigned-state') answer = { principal: null, view: { ...app.directory.view, epoch: 3, pending: null } }
     else if (outcome === 'unsigned-view') answer = { ...app.receipt(), view: { ...app.directory.view, epoch: 3, pending: null } }
@@ -363,8 +344,10 @@ for (const lost of [false, true]) for (const outcome of ['pending', 'vetoed', 'r
   } finally { app.close() }
 })
 
-test('fresh localhost discovers its one-time capability and creates the network through recover', async () => {
-  const app = deviceHarness({ local: 'fresh', saved: true })
+test('an owner bootstrap link creates the network through recover without HTTP credential issuance', async () => {
+  const fragment = `#bootstrap=${Buffer.from(JSON.stringify(localInvitation)).toString('base64url')}`
+  const app = deviceHarness({ local: 'fresh', saved: true, fragment })
+  app.localState.setup = { kind: 'owner_required', initialized: false }
   try {
     app.render(); await settle()
     assert.equal(app.render().localSetup?.kind, 'uninitialized')
@@ -387,6 +370,21 @@ test('fresh localhost discovers its one-time capability and creates the network 
     assert.equal(recover[0].params.capability, localCapability)
     assert.deepEqual(plain(recover[0].params.genesis), genesis)
   } finally { app.close() }
+})
+
+test('anonymous localhost status cannot initialize a node or obtain a local launch', async () => {
+  for (const fragment of ['', '#bootstrap=not-json', `#bootstrap=${Buffer.from(JSON.stringify({ ...localInvitation, url: 'https://remote.example' })).toString('base64url')}`]) {
+    const app = deviceHarness({ local: 'fresh', fragment })
+    app.localState.setup = { kind: 'owner_required', initialized: false }
+    try {
+      app.render(); await settle()
+      assert.equal(app.render().localSetup, null)
+      assert.equal(app.render().ready, null)
+      assert.equal(app.calls.includes('local-exchange'), false)
+      assert.equal(app.calls.includes('recover'), false)
+      assert.equal(app.navigations.length, 0)
+    } finally { app.close() }
+  }
 })
 
 test('initialized localhost requires member authorization and cannot create a second network', async () => {
@@ -651,6 +649,21 @@ test('opening a used link says so before 加入, on its own channel, and sends n
     app.inviteState.value = 'open'
     await app.render().join('vibeface://join/vibeface1ticket', 'browser')
     assert.equal(app.render().joining?.status, 'pending', 'an open link still goes through the approval')
+  } finally { app.close() }
+})
+
+test('a link whose entry Node listens at addresses is checked and joined straight there first', async () => {
+  const app = deviceHarness({ entryAddrs: ['192.168.1.4:7001'] })
+  try {
+    app.render(); await settle()
+    const before = app.sockets.length
+    assert.equal(await app.render().checkInvite('vibeface://join/vibeface1ticket'), 'open')
+    await app.render().join('vibeface://join/vibeface1ticket', 'browser')
+    assert.deepEqual(plain(app.sockets.slice(before).map(socket => socket.entry)), [
+      { kind: 'lan', addrs: ['192.168.1.4:7001'], device_id: target },
+      { kind: 'lan', addrs: ['192.168.1.4:7001'], device_id: target },
+    ])
+    assert.equal(app.render().joining?.status, 'pending')
   } finally { app.close() }
 })
 
@@ -1179,8 +1192,7 @@ for (const flow of ['directory', 'recovery']) test(`cancelling after ${flow} res
     if (flow === 'directory') work = app.render().refreshDirectory()
     else work = app.render().beginRecovery({ file: new File(['test-fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry })
     const rejected = assert.rejects(work, /切换|取消/)
-    for (let tries = 0; tries < 100 && !app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_state'); tries++) await new Promise(resolve => setTimeout(resolve, 1))
-    assert.ok(app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_state'))
+    await until(() => app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_state'))
     hold.resolve({ state: { genesis }, view: { ...membership, members: [{ device_id: subject, kind: 'client', name: 'browser', manage: false }, { device_id: target, kind: 'node', name: 'node', manage: false }] } })
     queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => app.render().disconnect())))
     await rejected; await settle()
@@ -1221,6 +1233,24 @@ test('unexpected closure reconnects the same target with fresh authentication an
     assert.equal(app.verifications(), 2)
     assert.deepEqual(app.calls, [`open:${target}`, 'info', 'authenticate', 'info', 'subscribe', 'entrances', `open:${target}`, 'info', 'authenticate', 'info', 'subscribe', 'entrances'])
     assert.equal(app.timers.size, 0)
+  } finally { app.close() }
+})
+
+test('when its address stops answering, the Node is reached by its device ID through a public gateway it named', async () => {
+  const gateway = 'https://gateway.example'
+  const app = deviceHarness({ saved: true })
+  try {
+    const named = deferred(); named.resolve({ entrances: [], gateways: [{ device_id: remote, url: `${gateway}/` }, { device_id: remote, url: 'http://plain.example' }] })
+    app.holds.set('entrances', named)
+    app.render(); await settle(); app.render()
+    assert.deepEqual(JSON.parse(app.stored.get(`vibeface.gateways.${network}`) ?? 'null'), [{ device_id: remote, url: gateway }])
+    const down = deferred(); down.promise.catch(() => {}); down.reject(new Error('connection refused'))
+    app.holds.set(`open:${entry.address}`, down)
+    app.sockets[0].drop()
+    const [id, retry] = [...app.timers.entries()][0]
+    app.timers.delete(id); retry(); await settle()
+    assert.deepEqual(plain(app.sockets.slice(1).map(socket => socket.entry)), [entry, { kind: 'gateway', address: gateway, device_id: target }])
+    assert.deepEqual(plain(app.render().ready?.entry), { kind: 'gateway', address: gateway, device_id: target })
   } finally { app.close() }
 })
 
@@ -1434,5 +1464,133 @@ for (const stage of ['open', 'authenticate']) test(`switching devices during rec
     assert.equal(app.timers.size, 0)
     assert.equal(app.calls.filter(call => call === `open:${target}`).length, 2)
     assert.equal(app.calls.filter(call => ['recover', 'join', 'rpc'].includes(call)).length, 0)
+  } finally { app.close() }
+})
+
+for (const stage of ['open', 'info', 'authenticate']) for (const outcome of ['reject', 'success', 'disconnect', 'unmount', 'manual']) test(`a tab entrance during ${stage} ${outcome} only resumes the current connection`, async () => {
+  const app = deviceHarness({ saved: true })
+  app.enableTabs()
+  const next = { ...entry, address: 'https://new-entry.example' }
+  const manual = { ...entry, address: 'https://manual-entry.example' }
+  try {
+    app.render(); await settle()
+    app.sockets[0].drop()
+    const hold = deferred()
+    app.holds.set(stage, hold)
+    const [id, retry] = [...app.timers.entries()][0]
+    app.timers.delete(id); retry(); await settle()
+    const attempts = app.sockets.length
+    app.broadcast({ type: 'entrance', networkId: network, entry: next })
+    app.broadcast({ type: 'entrance', networkId: network, entry: next })
+    assert.equal(app.timers.size, 0, 'broadcasts wait for the active attempt')
+    if (outcome === 'disconnect') app.render().disconnect()
+    if (outcome === 'unmount') app.close()
+    app.holds.delete(stage)
+    if (outcome === 'manual') await app.render().connect(manual)
+    if (outcome === 'success') hold.resolve(stage === 'info' ? { device_id: target, name: 'Node', version: 'test', initialized: true, network_id: null } : stage === 'authenticate' ? { principal: { network_id: network } } : undefined)
+    else hold.reject(new Error('controlled old entrance failure'))
+    await settle()
+    if (outcome === 'reject') {
+      assert.equal(app.timers.size, 1)
+      const [nextId, reconnect] = [...app.timers.entries()][0]
+      app.timers.delete(nextId); reconnect(); await settle()
+      const active = app.render().ready?.entry
+      assert.equal(active?.kind !== 'lan' && active?.address, next.address)
+      assert.equal(app.sockets.length, attempts + 1)
+      assert.equal(app.timers.size, 0)
+    } else if (outcome === 'success') {
+      assert.equal(app.render().ready?.isCurrent(), true)
+      assert.equal(app.timers.size, 0)
+      assert.equal(app.sockets.length, attempts)
+    } else {
+      assert.equal(app.timers.size, 0)
+      assert.equal(app.sockets.length, attempts + (outcome === 'manual' ? 1 : 0))
+      if (outcome === 'manual') { const active = app.render().ready?.entry; assert.equal(active?.kind !== 'lan' && active?.address, manual.address) }
+    }
+    assert.equal(app.requests.some(({ method }) => !['info', 'authenticate', 'subscribe', 'entrances'].includes(method)), false, 'reconnect never replays business writes')
+  } finally { app.close() }
+})
+
+for (const flow of ['recovery', 'rotation']) test(`${flow} persists the same sealed copy before submission and can share it after remount`, async () => {
+  const app = deviceHarness({ saved: true }), kept = new Map<string, string>(), handed: Uint8Array[] = []
+  let fail = true
+  const storage = { read: () => kept.get('copy') ?? null, write(value: string | null) { if (fail) throw new Error('private disk full'); if (value === null) kept.delete('copy'); else kept.set('copy', value) } }
+  app.platform.recoveryStorage = storage
+  app.platform.saveRecovery = async (bytes) => { handed.push(bytes.slice()); throw new Error('share dismissed') }
+  try {
+    app.render(); await settle()
+    const input = () => ({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', oldPassword: 'test-only-passphrase', name: 'phone', entry })
+    if (flow === 'recovery') await app.render().beginRecovery(input())
+    const submit = () => { const review = app.render().review; return flow === 'rotation' ? app.render().replaceRecoveryFile(input()) : app.render().confirmRecovery(review?.kind === 'recovery' ? review.members : []) }
+    await assert.rejects(submit(), /private disk full/)
+    assert.equal(app.calls.includes('recover'), false)
+    assert.equal(handed.length, 0)
+    fail = false
+    await submit()
+    assert.equal(app.calls.filter(method => method === 'recover').length, 1)
+    assert.equal(handed.length, 1)
+    const value = storage.read()
+    assert.ok(value)
+    assert.equal(/test-only-passphrase|private-test-key/.test(value), false)
+    const reloaded = deviceHarness()
+    reloaded.platform.recoveryStorage = storage
+    reloaded.platform.saveRecovery = (bytes) => { handed.push(bytes.slice()) }
+    try {
+      reloaded.render(); await settle()
+      assert.equal(reloaded.render().unsavedRecovery?.attempted, false)
+      await reloaded.render().downloadUnsavedRecovery()
+      assert.deepEqual(handed[1], handed[0])
+      assert.equal(reloaded.render().unsavedRecovery?.attempted, true)
+      reloaded.render().forgetUnsavedRecovery()
+      assert.equal(storage.read(), null)
+    } finally { reloaded.close() }
+  } finally { app.close() }
+})
+
+test('a local erase failure stays retryable and a pending erase never reconnects after restart', async () => {
+  const app = deviceHarness({ saved: true })
+  let attempts = 0
+  app.platform.erase = async () => { if (++attempts === 1) throw new Error('controlled delete failure'); app.stored.clear() }
+  try {
+    app.render(); await settle()
+    await assert.rejects(app.render().factoryReset(), /controlled delete failure/)
+    assert.equal(app.render().phase, 'erase_failed')
+    assert.equal(app.restarts(), 0)
+    assert.equal(app.stored.get('vibeface.erase-pending'), 'true')
+    const reloaded = deviceHarness({ storage: app.stored })
+    try { reloaded.render(); await settle(); assert.equal(reloaded.render().phase, 'erase_failed'); assert.equal(reloaded.sockets.length, 0) } finally { reloaded.close() }
+    await app.render().factoryReset()
+    assert.equal(app.restarts(), 1)
+  } finally { app.close() }
+})
+
+test('web sealed recovery copies survive a tab reload and disappear with that tab', async () => {
+  const tabStorage = new Map<string, string>(), app = deviceHarness({ saved: true, tabStorage })
+  try {
+    app.render(); await settle()
+    await app.render().replaceRecoveryFile({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', oldPassword: 'test-only-passphrase' })
+    assert.equal(app.render().unsavedRecovery?.attempted, true)
+    const reload = deviceHarness({ tabStorage }), newTab = deviceHarness()
+    try {
+      assert.equal(reload.render().unsavedRecovery?.code, app.render().unsavedRecovery?.code)
+      assert.equal(newTab.render().unsavedRecovery, null)
+      reload.render().forgetUnsavedRecovery()
+      assert.equal(tabStorage.size, 0)
+    } finally { reload.close(); newTab.close() }
+  } finally { app.close() }
+})
+
+test('a failed remote leave still allows the authorized local erase', async () => {
+  const app = deviceHarness({ saved: true }), refusal = deferred()
+  let erased = false
+  app.platform.erase = async () => { erased = true; app.stored.clear() }
+  try {
+    app.render(); await settle()
+    app.holds.set('revoke', refusal)
+    refusal.promise.catch(() => {}); refusal.reject(new Error('controlled remote refusal'))
+    await app.render().factoryReset()
+    assert.equal(erased, true)
+    assert.equal(app.restarts(), 1)
+    assert.equal(app.requests.filter(request => request.method === 'revoke').length, 1)
   } finally { app.close() }
 })

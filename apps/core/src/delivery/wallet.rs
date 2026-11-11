@@ -14,40 +14,27 @@ use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use vibeface_bridge::platform::privatefs;
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use vibeface_control::maintenance::{SecretString, WalletCommand};
+use zeroize::Zeroizing;
 
 const KEYSTORE_DOMAIN: &[u8] = b"vibeface-delivery-wallet-v1";
 const ARGON_MEMORY_KIB: u32 = 65_536;
 const ARGON_PASSES: u32 = 3;
 const MAX_KEYSTORE_BYTES: u64 = 4096;
 
-#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
-#[serde(transparent)]
-pub struct SecretString(String);
-impl SecretString {
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-    fn validate(&self) -> Result<()> {
-        ensure!(
-            (12..=1024).contains(&self.0.len()),
-            "wallet passphrase must contain 12 to 1024 bytes"
-        );
-        ensure!(
-            !self.0.bytes().any(|byte| matches!(byte, b'\n' | b'\r' | 0)),
-            "wallet passphrase must occupy one line"
-        );
-        Ok(())
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-pub enum WalletCommand {
-    Status,
-    Create { passphrase: SecretString },
-    Unlock { passphrase: SecretString },
-    Lock,
+fn validate_passphrase(passphrase: &SecretString) -> Result<()> {
+    ensure!(
+        (12..=1024).contains(&passphrase.as_str().len()),
+        "wallet passphrase must contain 12 to 1024 bytes"
+    );
+    ensure!(
+        !passphrase
+            .as_str()
+            .bytes()
+            .any(|byte| matches!(byte, b'\n' | b'\r' | 0)),
+        "wallet passphrase must occupy one line"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,9 +61,23 @@ pub struct Wallet {
     address: Option<Address>,
     key: Option<SigningKey>,
     load_error: Option<String>,
+    deferred: bool,
 }
 
 impl Wallet {
+    pub(super) fn deferred(path: PathBuf) -> Self {
+        Self {
+            path,
+            address: None,
+            key: None,
+            load_error: Some("delivery wallet is inactive until paid delivery is enabled".into()),
+            deferred: true,
+        }
+    }
+    pub(super) fn is_deferred(&self) -> bool {
+        self.deferred
+    }
+
     pub fn open(path: PathBuf) -> Result<Self> {
         let loaded = match read_keystore(&path) {
             Ok(store) => Ok(Some(chain::address(&store.address)?)),
@@ -98,6 +99,7 @@ impl Wallet {
             address,
             key: None,
             load_error,
+            deferred: false,
         })
     }
 
@@ -125,7 +127,7 @@ impl Wallet {
 
     pub fn create(&mut self, passphrase: &SecretString) -> Result<WalletStatus> {
         self.require_loaded()?;
-        passphrase.validate()?;
+        validate_passphrase(passphrase)?;
         ensure!(
             self.address.is_none() && !self.path.try_exists()?,
             "delivery wallet already exists"
@@ -164,7 +166,7 @@ impl Wallet {
 
     pub fn unlock(&mut self, passphrase: &SecretString) -> Result<WalletStatus> {
         self.require_loaded()?;
-        passphrase.validate()?;
+        validate_passphrase(passphrase)?;
         let store = read_keystore(&self.path)?;
         let address = chain::address(&store.address)?;
         ensure!(
@@ -225,6 +227,24 @@ impl Wallet {
     ) -> Result<SignedBytes> {
         let wallet = self.address()?;
         let transaction = chain::checked_transaction(config, intent, wallet, nonce)?;
+        self.sign_checked_transaction(transaction)
+    }
+
+    pub(super) fn sign_publication_recovery(
+        &self,
+        config: &ChainConfig,
+        original: &super::store::SignedTransaction,
+        intent: &SpendIntent,
+    ) -> Result<SignedBytes> {
+        let transaction =
+            chain::checked_publication_recovery(config, original, intent, self.address()?)?;
+        self.sign_checked_transaction(transaction)
+    }
+
+    fn sign_checked_transaction(
+        &self,
+        transaction: alloy_consensus::TxEip1559,
+    ) -> Result<SignedBytes> {
         let signature = self.sign_hash(transaction.signature_hash())?;
         let envelope = TxEnvelope::from(transaction.into_signed(signature));
         let raw = envelope.encoded_2718();
@@ -266,7 +286,7 @@ fn derive_key(passphrase: &SecretString, salt: &[u8]) -> Result<Zeroizing<[u8; 3
         .map_err(|_| anyhow::anyhow!("invalid wallet password parameters"))?;
     let mut key = Zeroizing::new([0; 32]);
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into(passphrase.0.as_bytes(), salt, key.as_mut())
+        .hash_password_into(passphrase.as_str().as_bytes(), salt, key.as_mut())
         .map_err(|_| anyhow::anyhow!("wallet password derivation failed"))?;
     Ok(key)
 }
@@ -299,7 +319,12 @@ fn read_keystore(path: &Path) -> Result<Keystore> {
 
 fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let result = privatefs::create_durable(path, bytes);
-    if result.is_err() {
+    // A file that was already there is not this call's to remove.
+    if let Err(error) = &result
+        && !error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists)
+    {
         let _ = std::fs::remove_file(path);
     }
     result
@@ -318,7 +343,7 @@ impl super::Delivery {
             WalletCommand::Create { .. } | WalletCommand::Unlock { .. }
         ) {
             ensure!(
-                self.config().enabled,
+                self.availability() == super::DeliveryAvailability::Ready,
                 "enable the experimental delivery service before creating or unlocking its wallet"
             );
         }
@@ -326,6 +351,13 @@ impl super::Delivery {
             .wallet
             .lock()
             .map_err(|_| anyhow::anyhow!("delivery wallet lock failed"))?;
+        if matches!(
+            command,
+            WalletCommand::Create { .. } | WalletCommand::Unlock { .. }
+        ) && wallet.is_deferred()
+        {
+            *wallet = Wallet::open(self.data_dir.join("delivery-wallet.json"))?;
+        }
         match command {
             WalletCommand::Status => Ok(wallet.status()),
             WalletCommand::Create { passphrase } => wallet.create(&passphrase),
@@ -373,6 +405,7 @@ mod tests {
         backup(&dir, &output)?;
         assert_eq!(std::fs::read(&output)?, encrypted);
         assert!(backup(&dir, &output).is_err());
+        assert_eq!(std::fs::read(&output)?, encrypted);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -385,6 +418,7 @@ mod tests {
             address: Some(Address::from_public_key(key.verifying_key())),
             key: Some(key),
             load_error: None,
+            deferred: false,
         };
         let config = chain::tests::config();
         let digest = chain::quote_wallet_digest(&config, [2; 32], [3; 32])?;
@@ -409,11 +443,12 @@ mod tests {
         use alloy_consensus::{Transaction, transaction::SignerRecoverable};
         use alloy_eips::eip2718::Decodable2718;
         let key = SigningKey::from_slice(&[2; 32])?;
-        let wallet = Wallet {
+        let mut wallet = Wallet {
             path: PathBuf::new(),
             address: Some(Address::from_public_key(key.verifying_key())),
             key: Some(key),
             load_error: None,
+            deferred: false,
         };
         let intent = chain::tests::approval_intent(wallet.address()?)?;
         let config = chain::tests::config();
@@ -431,6 +466,139 @@ mod tests {
         assert_eq!(
             envelope.kind(),
             alloy_primitives::TxKind::Call(chain::address(&config.asset)?)
+        );
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts/wallet-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        crate::config::private_dir(&dir)?;
+        let mut store = crate::delivery::store::ServiceStore::open(&dir, 1_000_000, 8)?;
+        let mut original = intent.clone();
+        original.id = "provider/approve".into();
+        let signed = store.signed_budget_transaction(
+            &original,
+            7,
+            "provider",
+            &original.gas_cap,
+            |intent, nonce| {
+                let signed = wallet.sign_transaction(&config, intent, nonce)?;
+                Ok((signed.raw_tx, signed.tx_hash))
+            },
+        )?;
+        assert_eq!(signed.raw_tx.as_deref(), Some(first.raw_tx.as_str()));
+        assert_eq!(signed.tx_hash.as_deref(), Some(first.tx_hash.as_str()));
+        wallet.lock();
+        let mut next = original.clone();
+        next.id = "key-original/register".into();
+        assert!(
+            store
+                .signed_budget_transaction(
+                    &next,
+                    8,
+                    "key-original",
+                    &next.gas_cap,
+                    |intent, nonce| {
+                        let signed = wallet.sign_transaction(&config, intent, nonce)?;
+                        Ok((signed.raw_tx, signed.tx_hash))
+                    }
+                )
+                .is_err()
+        );
+        assert!(store.find_transaction(&next.id)?.is_none());
+        assert_eq!(store.transaction(&original.id)?, signed);
+        drop(store);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn nonce_recovery_signer_only_spends_the_original_reveal_nonce_on_the_pinned_getter()
+    -> Result<()> {
+        use alloy_consensus::Transaction;
+        use alloy_eips::eip2718::Decodable2718;
+        use alloy_sol_types::SolCall;
+        let key = SigningKey::from_slice(&[2; 32])?;
+        let wallet = Wallet {
+            path: PathBuf::new(),
+            address: Some(Address::from_public_key(key.verifying_key())),
+            key: Some(key),
+            load_error: None,
+            deferred: false,
+        };
+        let config = chain::tests::config();
+        let mut intent = chain::tests::approval_intent(wallet.address()?)?;
+        let (target, calldata) = super::super::budget::BudgetAction::Reveal {
+            budget_id: [3; 32],
+            items: vec![super::super::budget::Reveal {
+                window: super::super::budget::WindowRef {
+                    order_id: "04".repeat(32),
+                    index: 0,
+                },
+                capsule: vec![5; 80],
+            }],
+        }
+        .encode(&config, wallet.address()?)?;
+        intent.id = format!("budget-{}/reveal-{}-0", "03".repeat(32), "06".repeat(8));
+        intent.to = chain::address_hex(target);
+        intent.calldata = format!("0x{}", hex::encode(calldata));
+        intent.gas_limit = super::super::budget::REVEAL_GAS_LIMIT;
+        intent.gas_cap = "100000000000000000".into();
+        let signed = wallet.sign_transaction(&config, &intent, 7)?;
+        let original = super::super::store::SignedTransaction {
+            intent,
+            nonce: 7,
+            raw_tx: Some(signed.raw_tx),
+            tx_hash: Some(signed.tx_hash),
+            phase: "signed".into(),
+            block_number: None,
+            block_hash: None,
+            error: None,
+        };
+        let mut intent = original.intent.clone();
+        intent.id = format!("{}/nonce-0", original.intent.id);
+        intent.gas_limit = chain::NONCE_RECOVERY_GAS_LIMIT;
+        intent.calldata = format!(
+            "0x{}",
+            hex::encode(chain::abi::profileIdCall {}.abi_encode())
+        );
+        let signed = wallet.sign_publication_recovery(&config, &original, &intent)?;
+        assert!(
+            wallet.sign_transaction(&config, &intent, 7).is_err(),
+            "nonce recovery must not widen the ordinary action whitelist"
+        );
+        let raw = hex::decode(signed.raw_tx.trim_start_matches("0x"))?;
+        let transaction = TxEnvelope::decode_2718(&mut raw.as_slice())?;
+        assert_eq!(transaction.nonce(), 7);
+        assert_eq!(transaction.kind(), alloy_primitives::TxKind::Call(target));
+        assert_eq!(transaction.value(), alloy_primitives::U256::ZERO);
+        assert_eq!(
+            transaction.input().as_ref(),
+            chain::abi::profileIdCall {}.abi_encode()
+        );
+        for case in 0..8 {
+            let mut wrong = intent.clone();
+            match case {
+                0 => wrong.chain_id += 1,
+                1 => wrong.wallet = chain::address_hex(Address::repeat_byte(9)),
+                2 => wrong.to = wrong.wallet.clone(),
+                3 => wrong.value = "1".into(),
+                4 => wrong.calldata.push_str("00"),
+                5 => wrong.gas_limit += 1,
+                6 => wrong.gas_cap = "200000000000000000".into(),
+                7 => wrong.max_fee_per_gas = "1000000000000".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                wallet
+                    .sign_publication_recovery(&config, &original, &wrong)
+                    .is_err()
+            );
+        }
+        let mut wrong_original = original;
+        wrong_original.intent = chain::tests::approval_intent(wallet.address()?)?;
+        assert!(
+            wallet
+                .sign_publication_recovery(&config, &wrong_original, &intent)
+                .is_err()
         );
         Ok(())
     }

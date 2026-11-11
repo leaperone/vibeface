@@ -1,15 +1,15 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { availability, parseNodeSettings, summaryReadiness, type JoinRequest, type ProviderStatus } from '../lib/node.ts'
+import { availability, canSetProviderEnvironment, parseNodeSettings, probeIssueText, summaryReadiness, type JoinRequest, type ProviderStatus } from '../lib/node.ts'
 import { inboxItems, waitingItems, type InboxSource } from './inbox.ts'
 import { cardState, chatTaskState, deviceForm, deviceOnline, entryLabel, externalSessionLabels, externalSessionStatus, fixOnDevice, formName, parseSummarySteps, promptSummary, schedulerStatus, staleTaskLabel, taskGroup, taskLabel, taskStale } from './labels.ts'
-import { isMainNotification, type BotRecord, type NodeInfo, type NotificationRecord, type PendingMessage, type Question, type WorkCard, type WorkRecord } from './types.ts'
+import { isMainNotification, type BotRecord, type NodeInfo, type NotificationRecord, type PendingMessage, type Question, type ResolvedModel, type WorkCard, type WorkRecord } from './types.ts'
 import { parseNotifications } from './model.ts'
 
 const question = (id: string, closed = false): Question => ({
-  question_id: id, conversation_id: 'c', bot: { bot_id: 'b', name: '助手' }, severity: 'normal', text: id, choices: [], about: { kind: 'general' },
-  author: 'node', created_at_ms: 1, answer: null, closed: closed ? { reason: 'expired', at_ms: 2 } : null,
-} as unknown as Question)
+  question_id: id, conversation_id: 'c', bot: { bot_id: 'b', name: '助手' }, severity: 'attention', text: id, choices: [], about: { node: 'node', agent: 'codex', session_id: 's', cwd: '/w', summary: '' },
+  author: 'node', created_at_ms: 1, answer: null, closed: closed ? 'request_lost' : null,
+})
 const join = (status: JoinRequest['status']): JoinRequest => ({
   join_id: status, status, network_id: 'n', invite_id: 'i', device_id: 'phone', kind: 'client', name: '我的手机', commit: 'c',
   admin_id: null, admin_nonce: null, joiner_nonce: null, reason: null, expires_at_ms: 1,
@@ -27,7 +27,7 @@ const source = (manage: boolean, answered: Record<string, string> = {}): InboxSo
 
 test('unknown inputs keep separate Inbox IDs and their original Task and Channel targets', () => {
   const state = source(false)
-  const pending = (message_id: string, target: PendingMessage['target'], delivery: PendingMessage['delivery']): PendingMessage => ({ message_id, conversation_id: 'c', target, delivery, text: message_id, intent: 'continue', sequence: 1, created_at_ms: 1 })
+  const pending = (message_id: string, target: PendingMessage['target'], delivery: PendingMessage['delivery']): PendingMessage => ({ message_id, conversation_id: 'c', target, delivery, text: message_id, report_results: true, intent: 'continue', sequence: 1, created_at_ms: 1 })
   state.workspace.pendingMessages = [pending('task-input', { kind: 'task', task_id: 'task' }, 'unknown'), pending('saved-main', { kind: 'bot_main', bot_id: 'b' }, 'saved'), pending('channel-input', { kind: 'channel_task', channel_id: 'channel', task_id: 'other', bot_id: 'b' }, 'unknown')]
   const items = inboxItems(state).flatMap((item) => item.kind === 'undelivered' ? [item] : [])
   assert.deepEqual(items.map((item) => item.key), ['undelivered:task-input', 'undelivered:channel-input'])
@@ -82,8 +82,16 @@ test('a different pending recovery gets a fresh confirmation card', () => {
 
 test('a failed task waits in 待处理 under its bot until something follows it up, naming its device', () => {
   const failed = source(false)
-  const work = { work_id: 'w1', conversation_id: 'c', trigger: '', target_node: 'mac', cwd: '/w', title: '跑测试', prompt: '', state: 'finished', summary: '', outcome: 'failed', result_text: '', failure_reason: 'timed out' } as const
-  failed.workspace.openWorks = [{ ...work, resolved: { provider: 'codex', model: null } }, { ...work, work_id: 'w2', outcome: null, state: 'running', resolved: { provider: 'codex', model: null } }, { ...work, work_id: 'w3', title: '', outcome: null, state: 'dispatch_rejected' }]
+  const work = {
+    dispatcher: 'gateway', call_ref: 'dispatch',
+    continues: null, parent: null,
+    thread: null, phase: null,
+    work_id: 'w1', conversation_id: 'c', trigger: '', target_node: 'mac', cwd: '/w', title: '跑测试', prompt: '', state: 'finished', summary: '', outcome: 'failed', result_text: '', failure_reason: 'timed out' } as const
+  failed.workspace.openWorks = [
+    { ...work, resolved: { provider: 'codex', model: null } satisfies ResolvedModel },
+    { ...work, work_id: 'w2', outcome: null, state: 'running', resolved: { provider: 'codex', model: null } satisfies ResolvedModel },
+    { ...work, work_id: 'w3', title: '', outcome: null, state: 'dispatch_rejected' },
+  ]
   failed.workspace.bots = [botRecord]
   assert.deepEqual(inboxItems(failed).filter((item) => item.kind === 'failed').map((item) => [item.key, item.title, item.meta]), [['failed:w1', '跑测试', 'Mac'], ['failed:w3', '任务没有完成', 'Mac']], 'a refused dispatch waits like a failure')
 })
@@ -170,8 +178,8 @@ test('a provider shows whether it can be used before any use is picked', () => {
   const provider = (extra: Partial<Status>): Status => ({ app_server: null, state: 'off', installed: true, env: [], ...extra })
   assert.equal(availability(provider({})), 'unverified')
   assert.equal(availability(provider({ installed: false })), 'missing')
-  assert.equal(availability(provider({ env: [{ name: 'CURSOR_API_KEY', set: false, inherited: false, required: true }] })), 'needs_setup')
-  assert.equal(availability(provider({ env: [{ name: 'CURSOR_API_KEY', set: false, inherited: true, required: true }] })), 'unverified')
+  assert.equal(availability(provider({ env: [{ name: 'FIXTURE_KEY', set: false, inherited: false, required: true }] })), 'needs_setup')
+  assert.equal(availability(provider({ env: [{ name: 'FIXTURE_KEY', set: false, inherited: true, required: true }] })), 'unverified')
   assert.equal(availability(provider({ state: 'starting' })), 'starting')
   for (const installed of [false, true]) {
     const system = provider({ installed, app_server: { mode: 'system', socket: '/fixture/codex.sock', link: { state: 'off' } }, env: [{ name: 'FIXTURE_KEY', set: false, inherited: false, required: true }] })
@@ -180,13 +188,25 @@ test('a provider shows whether it can be used before any use is picked', () => {
   }
 })
 
+test('Cursor settings accept only the official CLI subscription authentication', () => {
+  for (const name of ['CURSOR_API_KEY', 'CURSOR_AUTH_TOKEN', 'AGENT_CLI_CREDENTIAL_STORE']) {
+    assert.equal(canSetProviderEnvironment('cursor', name), false)
+    assert.equal(canSetProviderEnvironment('codex', name), true, 'other providers keep their environment rules')
+  }
+  assert.equal(canSetProviderEnvironment('cursor', 'PATH'), true)
+  const issue = { stage: 'authentication', code: 'sign_in_required' } as const
+  assert.match(probeIssueText('cursor', issue), /CLI 订阅登录/)
+  assert.ok(!probeIssueText('cursor', issue).includes('API'))
+  assert.match(probeIssueText('codex', issue), /API 密钥/)
+})
+
 test('provider observations preserve unknown prerequisites and discard private fields', () => {
   const observed = {
     installed: { status: 'confirmed', evidence: 'binary_discovery' }, launchable: { status: 'confirmed', evidence: 'app_server_handshake' },
     authenticated: { status: 'unknown', evidence: 'authentication_not_observed' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' },
   }
   const readiness = { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } }
-  const provider = { provider: 'codex', authentication_source: 'private_login', roles: ['agent'], supports: ['agent', 'execution'], installed: true, bin: 'codex', app_server: null, setup: null, home: null, sessions: null, env: [], state: 'unverified', issues: [], readiness, execution_model: '', execution_readiness: readiness, probe: { provider: 'codex', config_id: 'config', checked_at_ms: null, launch: { state: 'unchecked' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null }, observed }
+  const provider = { provider: 'codex', authentication_source: 'private_login', roles: ['agent'], supports: ['agent', 'execution'], installed: true, bin: 'codex', app_server: null, setup: null, home: null, sessions: null, env: [], state: 'unverified', issues: [], readiness, endpoint: null, execution_model: '', execution_readiness: readiness, probe: { provider: 'codex', config_id: 'config', checked_at_ms: null, launch: { state: 'unchecked' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null }, observed }
   const response = { settings: { roots: [], manager: null }, defaults: { workspace: '/project' }, readiness: { manager: readiness, missing: [] }, display_paths: {}, suggested_roots: [], providers: [provider] }
   const parsed = parseNodeSettings({ ...response, providers: [{ ...provider, observed: { ...observed, authenticated: { ...observed.authenticated, native_token: 'private-token' } } }] })
   assert.equal(parsed.providers[0].state, 'unverified')
@@ -229,7 +249,11 @@ test('scheduler observations distinguish waiting, stopping, publishing, history 
 })
 
 test('losing the entry makes active tasks stale without claiming every target is offline', () => {
-  const work: WorkRecord = { work_id: 'w', trigger: '', target_node: 'mac', cwd: '', title: '', prompt: '', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null, resolved: { provider: 'codex', model: null } }
+  const work: WorkRecord = {
+    dispatcher: 'gateway', call_ref: 'dispatch',
+    continues: null, parent: null,
+    thread: null, phase: null,
+    work_id: 'w', trigger: '', target_node: 'mac', cwd: '', title: '', prompt: '', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null, resolved: { provider: 'codex', model: null } }
   const state = cardState(work, [unready], { state: 'running', outcome: null })
   assert.equal(state, 'running', 'the last target report is still online')
   assert.equal(taskStale(state, false), true)
@@ -243,9 +267,8 @@ test('losing the entry makes active tasks stale without claiming every target is
 
 test('manager attention keeps its notification identity and can be hidden locally', () => {
   const attention = source(true)
-  const bot = { bot_id: 'b', conversation_id: 'c', name: '助手' } as unknown as BotRecord
   const note = { notification_id: 'n1', kind: 'manager_attention', text: '看看进展', conversation_id: 'c' } satisfies NotificationRecord
-  attention.workspace.bots = [bot]
+  attention.workspace.bots = [botRecord]
   attention.workspace.notifications = [note]
   const item = inboxItems(attention).find((candidate) => candidate.kind === 'attention')
   assert.equal(item?.kind, 'attention')
