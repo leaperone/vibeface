@@ -4483,6 +4483,8 @@ mod tests {
             )?)?;
             a.install_membership(removed).await?;
             b.install_membership(state).await?;
+            // Only the explicit requests exercise this quota, without B's periodic sync racing them.
+            b.sync_peers.lock().unwrap().entry(ia.device_id()?).or_default().running = true;
             for node in [&a, &b] { node.start_network().await?; }
             let limits = a.removed_sync_limits.for_peer(&ib.device_id()?);
             let first = b.net()?.endpoint.connect(a.net()?.addr(), net::SYNC).await?;
