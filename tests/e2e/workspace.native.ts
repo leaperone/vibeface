@@ -97,7 +97,7 @@ test('native workspace routes preserve Task input, queue controls and directed C
   await webhookSecret.press('Enter');
   await expect(saveWebhook).toBeEnabled();
   await saveWebhook.click();
-  const invalidWebhook = screen.getByText(/invalid webhook URL/);
+  const invalidWebhook = screen.getByText('请求内容不完整或格式不对。刷新页面后重试。', { exact: true });
   await screen.scrollUntilVisible(invalidWebhook, { direction: 'down' });
   await expect(invalidWebhook).toBeVisible();
   await webhookUrl.clear();
