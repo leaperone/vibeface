@@ -1200,7 +1200,8 @@ mod prepaid_delivery {
     use super::{app, ui, views};
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
-        AnyWindowHandle, AppContext, Entity, ScrollDelta, TestAppContext, WindowOptions, point, px,
+        AnyWindowHandle, AppContext, Entity, Role, ScrollDelta, TestAppContext, WindowOptions,
+        point, px,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -1300,8 +1301,31 @@ mod prepaid_delivery {
                 window.render_frame(cx);
                 let target = window.find(id.clone());
                 if !target.visible() {
+                    assert!(
+                        target.path().contains(&"page-scroll".into()),
+                        "offscreen financial control is outside the page scroller: {id}"
+                    );
                     let delta = px(350.) - target.bounds().center().y;
-                    window.scroll("page-scroll", ScrollDelta::Pixels(point(px(0.), delta)), cx);
+                    let viewport = window.viewport_size();
+                    let mut page = window.within("page-scroll");
+                    let anchor = page
+                        .elements()
+                        .into_iter()
+                        .find(|element| {
+                            let center = element.bounds().center();
+                            element.visible()
+                                && element.role() == Some(Role::Button)
+                                && center.x > px(0.)
+                                && center.x < viewport.width
+                                && center.y > px(0.)
+                                && center.y < viewport.height
+                        })
+                        .expect("visible page control to receive the native wheel event");
+                    page.scroll(
+                        anchor.path().last().unwrap().clone(),
+                        ScrollDelta::Pixels(point(px(0.), delta)),
+                        cx,
+                    );
                     window.render_frame(cx);
                 }
                 window.click(id, cx);
