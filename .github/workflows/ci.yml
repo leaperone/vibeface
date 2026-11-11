@@ -9,6 +9,10 @@ on:
     - cron: '23 */4 * * *'
   workflow_dispatch:
     inputs:
+      installer_rebuild:
+        description: 'With installer_source_run, rebuild only the normal installer and run its full guarded acceptance'
+        type: boolean
+        default: false
       installer_source_run:
         description: 'Optional completed CI run for isolated Windows installer diagnostics'
         type: string
@@ -1248,6 +1252,7 @@ jobs:
       source_run: ${{ inputs.installer_source_run }}
       source_sha: ${{ inputs.installer_source_sha }}
       source_attempt: ${{ inputs.installer_source_attempt }}
+      rebuild_installer: ${{ inputs.installer_rebuild }}
 
   native-prepare:
     name: Prepare native lockfile, formatting and compiler evidence

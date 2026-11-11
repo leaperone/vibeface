@@ -163,7 +163,9 @@ function windowsInstallerManifest(application, includeFile, planFile = `${includ
   return { files, directories: folders, include: output, plan };
 }
 
-function buildWindowsInstallerFixture(portableDirectory, outputDirectory, diagnostic = false) {
+function buildWindowsInstallerFixture(portableDirectory, outputDirectory, mode = 'upgrade') {
+  assert(['upgrade', 'diagnostic', 'normal'].includes(mode), 'invalid installer fixture mode');
+  const diagnostic = mode === 'diagnostic';
   assert.equal(process.platform, 'win32', 'installer fixtures are built on the existing hosted Windows runner');
   assert(process.env.GITHUB_ACTIONS === 'true' && process.env.RUNNER_ENVIRONMENT === 'github-hosted', 'installer fixture builds are limited to disposable hosted accounts');
   const temporaryRoot = path.resolve(process.env.RUNNER_TEMP);
@@ -174,7 +176,7 @@ function buildWindowsInstallerFixture(portableDirectory, outputDirectory, diagno
   const payload = path.join(outputDirectory, 'payload');
   fs.cpSync(portableDirectory, payload, { recursive: true });
   fs.rmSync(path.join(payload, '.vibeface-installed-files.json'));
-  if (!diagnostic) {
+  if (mode === 'upgrade') {
     const collision = path.join(payload, 'resources', 'upgrade-new-file.txt');
     assert(!fs.existsSync(collision), 'upgrade fixture path must be new to the old payload');
     fs.writeFileSync(collision, 'new-package-payload');
@@ -185,8 +187,16 @@ function buildWindowsInstallerFixture(portableDirectory, outputDirectory, diagno
   const sourceInfo = JSON.parse(fs.readFileSync(path.join(payload, 'resources/runtime/BUILD-INFO.json'), 'utf8'));
   assert.equal(sourceInfo.target, 'x86_64-pc-windows-msvc', 'installer fixture requires the verified Windows runtime');
   assert(typeof sourceInfo.version === 'string' && /^[0-9]+\.[0-9]+\.[0-9]+(?:-(?:nightly\.[0-9]{8}\.[1-9][0-9]*|rc\.[1-9][0-9]*))?$/.test(sourceInfo.version), 'invalid source runtime version');
+  const installer = path.join(outputDirectory, { upgrade: 'upgrade-fixture.exe', diagnostic: 'diagnostic-fixture.exe', normal: 'normal-fixture.exe' }[mode]);
   run(process.env.MAKENSIS || path.join(process.env['ProgramFiles(x86)'] || 'C:/Program Files (x86)', 'NSIS', 'makensis.exe'),
-    [`/DAPP_DIR=${payload}`, `/DFILE_MANIFEST=${include}`, `/DPATH_PLAN=${plan}`, `/DOUTPUT=${path.join(outputDirectory, diagnostic ? 'diagnostic-fixture.exe' : 'upgrade-fixture.exe')}`, `/DVERSION=${sourceInfo.version}`, ...(diagnostic ? ['/DINSTALLER_DIAGNOSTICS'] : []), path.join(desktop, 'build/installer.nsi')], { stdio: 'inherit' });
+    [`/DAPP_DIR=${payload}`, `/DFILE_MANIFEST=${include}`, `/DPATH_PLAN=${plan}`, `/DOUTPUT=${installer}`, `/DVERSION=${sourceInfo.version}`, ...(diagnostic ? ['/DINSTALLER_DIAGNOSTICS'] : []), path.join(desktop, 'build/installer.nsi')], { stdio: 'inherit' });
+  writeJson(path.join(outputDirectory, 'installer-source.json'), {
+    mode, diagnostics_enabled: diagnostic, target: sourceInfo.target, version: sourceInfo.version,
+    source_payload_commit: sourceInfo.source_commit,
+    installer_script_commit: run('git', ['rev-parse', 'HEAD'], { cwd: repo }).trim(),
+    portable_ownership_sha256: hash(path.join(portableDirectory, '.vibeface-installed-files.json')),
+    installer_sha256: hash(installer), signing: 'unsigned-task-fixture',
+  });
 }
 
 async function build({ target, runtimeDir, output, runtimeArchive, sign }) {
@@ -438,7 +448,9 @@ function selfTest() {
     } else if (args.length === 3 && args[0] === '--windows-upgrade-fixture') {
       buildWindowsInstallerFixture(path.resolve(args[1]), path.resolve(args[2]));
     } else if (args.length === 3 && args[0] === '--windows-installer-diagnostic') {
-      buildWindowsInstallerFixture(path.resolve(args[1]), path.resolve(args[2]), true);
+      buildWindowsInstallerFixture(path.resolve(args[1]), path.resolve(args[2]), 'diagnostic');
+    } else if (args.length === 3 && args[0] === '--windows-installer-rebuild') {
+      buildWindowsInstallerFixture(path.resolve(args[1]), path.resolve(args[2]), 'normal');
     } else {
       const options = new Map();
       let sign = false;

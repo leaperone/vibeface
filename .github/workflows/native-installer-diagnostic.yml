@@ -10,6 +10,10 @@ on:
         description: Exact 40-character source SHA of that run
         type: string
         required: true
+      rebuild_installer:
+        description: Rebuild the normal installer from current NSIS and verified existing payload, then run the full guarded fixture
+        type: boolean
+        default: false
       source_attempt:
         description: Exact source run attempt
         type: string
@@ -20,6 +24,7 @@ on:
       source_run: {type: string, required: true}
       source_sha: {type: string, required: true}
       source_attempt: {type: string, default: '1'}
+      rebuild_installer: {type: boolean, default: false}
 permissions:
   contents: read
   actions: read
@@ -56,10 +61,22 @@ jobs:
       - name: Install the locked existing deterministic runner without lifecycle downloads
         shell: pwsh
         run: pnpm install --frozen-lockfile --ignore-scripts --filter vibeface-monorepo
+      - name: Rebuild only the current normal installer against verified existing payload
+        if: inputs.rebuild_installer
+        id: rebuild
+        shell: pwsh
+        env:
+          PORTABLE_APP: ${{ steps.inputs.outputs.portable_app }}
+        run: |
+          $fixture = Join-Path $env:RUNNER_TEMP ('Vibeface normal rebuilt ' + [guid]::NewGuid().ToString('N'))
+          node scripts/build-desktop.mjs --windows-installer-rebuild (Split-Path $env:PORTABLE_APP) $fixture
+          if ($LASTEXITCODE -ne 0) { throw 'Normal installer rebuild failed' }
+          Copy-Item (Join-Path $fixture 'installer-source.json') .artifacts/native-installer-diagnostic/rebuilt-installer-source.json
+          "installer=$(Join-Path $fixture 'normal-fixture.exe')" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
       - name: Execute the current guarded installer fixture against verified existing bytes
         shell: pwsh
         env:
-          INSTALLER: ${{ steps.inputs.outputs.installer }}
+          INSTALLER: ${{ inputs.rebuild_installer && steps.rebuild.outputs.installer || steps.inputs.outputs.installer }}
           RUNTIME: ${{ steps.inputs.outputs.runtime }}
           PORTABLE_APP: ${{ steps.inputs.outputs.portable_app }}
           E2E_TELEMETRY_DISABLED: '1'

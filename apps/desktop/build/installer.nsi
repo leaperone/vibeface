@@ -46,6 +46,12 @@ Var InstallerDiagnosticCheckStage
 !endif
 !macroend
 
+!macro NormalizePath PREFIX VALUE RESULT
+  Push "${VALUE}"
+  Call ${PREFIX}NormalizePath
+  Pop ${RESULT}
+!macroend
+
 !macro CheckPath PREFIX PATH KIND
   Push "${PATH}"
   Push "${KIND}"
@@ -74,6 +80,37 @@ diagnostic_record_done:
   Pop $0
 FunctionEnd
 !endif
+; NSIS GetFullPathName additionally probes file existence and clears a missing
+; destination. The Win32 API only normalizes; filesystem guards still run below.
+Function ${PREFIX}NormalizePath
+  Exch $0
+  Push $1
+  Push $2
+  Push $3
+  System::Call 'kernel32::GetFullPathNameW(w r0, i ${NSIS_MAX_STRLEN}, w .r1, p 0) i.r2 ?e'
+  Pop $3
+!ifdef INSTALLER_DIAGNOSTICS
+  Push "NORMALIZE|stage=$InstallerDiagnosticStage|incoming=$0|result=$1|length=$2|saved_error=$3$\r$\n"
+  Call ${PREFIX}DiagnosticRecord
+!endif
+  IntCmp $2 0 normalize_failed normalize_failed 0
+  IntCmp $2 ${NSIS_MAX_STRLEN} normalize_failed normalize_done normalize_failed
+normalize_failed:
+  Push "The installation path could not be normalized completely. No files will be changed."
+  Exch 4
+  Pop $0
+  Pop $3
+  Pop $2
+  Pop $1
+  Call ${PREFIX}Refuse
+normalize_done:
+  StrCpy $0 $1
+  Pop $3
+  Pop $2
+  Pop $1
+  Exch $0
+FunctionEnd
+
 Function ${PREFIX}Refuse
   Exch $0
 !ifdef INSTALLER_DIAGNOSTICS
@@ -186,7 +223,7 @@ FunctionEnd
 
 Function ValidateInstallRoot
   !insertmacro DiagnosticStage "validate-root.full-path"
-  GetFullPathName $INSTDIR "$INSTDIR"
+  !insertmacro NormalizePath "" "$INSTDIR" $INSTDIR
   StrCpy $0 $INSTDIR 2
   StrCmp $0 "\\" invalid_root
   ${GetParent} "$INSTDIR" $0
@@ -265,7 +302,7 @@ plan_path_invalid:
   Push "The proposed upgrade has an invalid relative package path. The installation was not changed."
   Call un.Refuse
 plan_path_done:
-  GetFullPathName $PlanPath "$INSTDIR\$PlanRelative"
+  !insertmacro NormalizePath "un." "$INSTDIR\$PlanRelative" $PlanPath
   StrCpy $0 "$INSTDIR\"
   StrLen $1 $0
   StrCpy $2 $PlanPath $1
@@ -332,7 +369,7 @@ FunctionEnd
 Function un.onInit
   SetShellVarContext current
   SetRegView 64
-  GetFullPathName $INSTDIR "$INSTDIR"
+  !insertmacro NormalizePath "un." "$INSTDIR" $INSTDIR
   Call un.RequireOwnedRoot
   !insertmacro ValidateOwnedPaths "un."
   StrCpy $Upgrade 0
