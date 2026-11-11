@@ -1159,8 +1159,9 @@ impl CheckedHistory<'_> {
         ensure!(stable, "governance effect projection did not converge");
         let mut removal = RemovalEvidence::default();
         if let Some(device) = removed {
+            let retired_at_root = sources.get(device).is_some_and(|source| source.retired);
             let revocation = variables.iter().enumerate()
-                .filter(|(index, (_, entry))| effects[*index] == Effect::Yes
+                .filter(|(index, (_, entry))| !retired_at_root && effects[*index] == Effect::Yes
                     && matches!(&entry.event.action, GovernanceAction::Revoke(revocation) if revocation.device_id == device))
                 .min_by_key(|(_, (hash, entry))| (entry.ancestors.len(), *hash))
                 .map(|(index, _)| index);
@@ -2546,6 +2547,56 @@ mod tests {
         assert!(proof.events.contains(&removal));
         assert!(known.merge(&proof)?.project_at(T)?.removed_node(&id(&node)));
         assert!(!serde_json::to_string(&proof)?.contains(&id(&later)));
+        Ok(())
+    }
+
+    #[test]
+    fn removal_evidence_keeps_recovery_retirement_before_later_repeated_revokes() -> Result<()> {
+        let (root, a, service, mut state) = setup()?;
+        let removed = identity();
+        state.append(GovernanceEvent::grant(
+            &a,
+            &state.project()?,
+            Member::node(&removed, "removed")?,
+        )?)?;
+        let known = state.clone();
+        let next = identity();
+        let checkpoint = RootCheckpoint::recovery(
+            &state,
+            &root,
+            &id(&next),
+            vec![
+                Member::client(&a, "a", true)?,
+                Member::node(&service, "service")?,
+            ],
+            vec![cut(&removed, 0)],
+            0,
+        )?;
+        state.recover_at(checkpoint, T)?;
+        let later = identity();
+        state.append(GovernanceEvent::grant(
+            &a,
+            &state.project_at(T)?,
+            Member::client(&later, "private-after-retirement", false)?,
+        )?)?;
+        state.append(GovernanceEvent::revoke(
+            &a,
+            &state.project_at(T)?,
+            cut(&removed, 0),
+        )?)?;
+        for held in [None, Some(&known)] {
+            let proof = state.removal_state_at(&id(&removed), held, T)?;
+            assert!(proof.project_at(T)?.removed_node(&id(&removed)));
+            assert!(
+                known
+                    .merge(&proof)?
+                    .project_at(T)?
+                    .removed_node(&id(&removed))
+            );
+            let encoded = serde_json::to_string(&proof)?;
+            assert!(!encoded.contains(&id(&later)));
+            assert!(!encoded.contains("private-after-retirement"));
+        }
         Ok(())
     }
 
