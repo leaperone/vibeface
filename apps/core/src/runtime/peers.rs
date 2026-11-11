@@ -4424,7 +4424,7 @@ mod tests {
             a.install_membership(removed.clone()).await?;
             let before = a.membership_state().await?;
             let attacker = LocalIdentity::generate();
-            let mut members = removed.project()?.members;
+            let mut members = state.project()?.members;
             members.push(crate::identity::Member::client(
                 &attacker, "attacker", true,
             )?);
@@ -4503,6 +4503,9 @@ mod tests {
             }).await.context("the stalled request kept its quota")?;
             let oversized = net::call(&second, &json!({"type":"membership","network_id":network,"padding":"x".repeat(REMOVED_SYNC_BYTES)})).await;
             assert!(oversized.unwrap_err().to_string().contains("frame too large"));
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while limits.1.available_permits() != 1 { tokio::task::yield_now().await; }
+            }).await.context("the oversized request kept its quota")?;
             let bounded = net::call(&second, &json!({"type":"hello","network_id":network})).await?;
             assert_eq!(bounded["type"], "revoked", "a small request still receives its signed denial");
             anyhow::Ok(())

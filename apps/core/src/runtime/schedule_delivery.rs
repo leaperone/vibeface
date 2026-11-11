@@ -1461,10 +1461,10 @@ mod tests {
                 assert_eq!(accepted["accepted"], true);
                 assert_eq!(accepted["state"], "pending_admission");
                 assert!(node.store.lock().await.scheduler_job("c", &trigger)?.is_none());
-                assert_eq!(node.store.lock().await.pending_workspace_input_admissions(&network)?, [message_id.clone()]);
+                assert_eq!(node.store.lock().await.pending_workspace_input_admissions(&network)?, std::slice::from_ref(&message_id));
                 node.schedule_tick().await?;
                 assert!(node.store.lock().await.scheduler_job("c", &trigger)?.is_none());
-                assert_eq!(node.store.lock().await.pending_workspace_input_admissions(&network)?, [message_id.clone()]);
+                assert_eq!(node.store.lock().await.pending_workspace_input_admissions(&network)?, std::slice::from_ref(&message_id));
                 assert_eq!(node.store.lock().await.scheduler_job("healthy", &healthy)?.context("recovered unrelated reply")?.state, JobState::Queued);
                 {
                     let store = node.store.lock().await;
