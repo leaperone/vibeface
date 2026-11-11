@@ -188,6 +188,7 @@ test("workspace preserves bot and message requests while routing native decision
     secure: { attestationPayload: (network: string, scope: string, body: string) => { const event = JSON.parse(body); assert.equal(typeof event.type, "string"); assert.equal(event.attestation, undefined); return `${network}|${scope}|${body}` } },
     transport: { signClient: async (domain: string, payload: string) => { signed.push(`${domain}|${payload}`); return "signature" } },
     storage: browser.localStorage, outbox: memoryOutbox, self: "这个浏览器",
+    inputLock: <T,>(name: string, save: () => Promise<T>) => globalThis.navigator.locks.request(name, save),
     notifier: { name: "浏览器提醒", permission: async () => "default", request: async () => "default", show() {} },
     onForeground: () => () => {}, foreground: () => true,
   }
@@ -605,6 +606,70 @@ test("workspace preserves bot and message requests while routing native decision
       conversationHold = null
       await render().refresh()
       assert.equal(render().pendingMessages.length, 0)
+    })
+
+    await t.test('two tabs preserve target order while the earlier input is still signing', async () => {
+      const otherHooks = hookHarness()
+      const loadOther = moduleLoader(sandbox, (specifier, filename) => {
+        if (specifier === 'react') return otherHooks.react
+        if (specifier.endsWith('/lib/node.ts')) return { ...nodeSettings, messageOf: (cause: unknown) => cause instanceof Error ? cause.message : String(cause) }
+        if (specifier === 'react/jsx-runtime') return { jsx: () => null }
+        return loadOther(resolve(dirname(filename), specifier))
+      }, (filename) => readFileSync(filename, 'utf8') + (filename.endsWith('/workspace/context.tsx') ? '\nexport { useWorkspaceState }\n' : ''))
+      const otherModule = loadOther(resolve(clientRoot, 'workspace/context.tsx'))
+      const otherHook = otherModule.useWorkspaceState
+      assert.ok(typeof otherHook === 'function')
+      const follower = { leader: () => false, post() {}, listen: () => () => {} }
+      const other = () => {
+        otherHooks.reset()
+        const state: Workspace = otherHook(platform, activeConnection, undefined, follower)
+        otherHooks.afterRender.splice(0).forEach((run) => run())
+        return state
+      }
+      const sign = platform.transport.signClient, gate = deferred()
+      let signing = false
+      platform.transport.signClient = async (domain, payload) => {
+        if (payload.includes('"text":"first tab input"')) { signing = true; await gate.promise }
+        return sign(domain, payload)
+      }
+      const previousBots = knownBots, previousTranscript = transcript, previousMessages = messages.length
+      const previousOutbox = new Map(outboxItems)
+      const independentBot = { ...bot, bot_id: 'other-tab-bot', conversation_id: 'other-tab-chat' }
+      let first: Promise<boolean> | undefined, second: Promise<boolean> | undefined, independent: Promise<boolean> | undefined
+      try {
+        knownBots = [bot, independentBot]
+        await render().refresh()
+        other(); other().setView('chat'); other()
+        await new Promise(setImmediate); other(); await new Promise(setImmediate)
+        assert.equal(other().writable, true)
+        const before = messages.length
+        first = other().sendMessage('first tab input')
+        await new Promise(setImmediate)
+        assert.equal(signing, true, 'the follower reserved its sequence and is waiting on signing')
+        independent = render().sendMessage('independent tab input', [], [], { target: { kind: 'bot_main', bot_id: independentBot.bot_id }, conversation_id: independentBot.conversation_id })
+        await new Promise(setImmediate)
+        assert.deepEqual(messages.slice(before).map((message) => message.text), ['independent tab input'], 'a different target must remain independent of the held signature')
+        second = render().sendMessage('second tab input')
+        await new Promise(setImmediate)
+        assert.deepEqual(messages.slice(before).map((message) => message.text), ['independent tab input'], 'a later tab cannot submit ahead of the input still being signed')
+        gate.resolve(null)
+        assert.deepEqual(await Promise.all([first, second, independent]), [true, true, true])
+        await render().refresh(); await new Promise(setImmediate)
+        assert.deepEqual(messages.slice(before).map((message) => message.text), ['independent tab input', 'first tab input', 'second tab input'])
+        assert.equal(Number(messages[before + 2].sequence), Number(messages[before + 1].sequence) + 1)
+      } finally {
+        gate.resolve(null)
+        await Promise.allSettled([first, second, independent])
+        platform.transport.signClient = sign
+        knownBots = previousBots
+        for (const effect of otherHooks.effects.values()) effect.cleanup?.()
+        await render().refresh(); await new Promise(setImmediate)
+        outboxItems.clear()
+        for (const [key, item] of previousOutbox) outboxItems.set(key, item)
+        transcript = previousTranscript
+        messages.splice(previousMessages)
+        await render().refresh()
+      }
     })
 
     await t.test('attachment upload holds target order while later drafts remain locally recoverable', async () => {
