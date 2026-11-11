@@ -37,6 +37,8 @@ fn provider_setup(
     let directory = match provider {
         Provider::Codex if local.launches(provider) => &roots.codex_home,
         Provider::Claude => &roots.claude_config,
+        // A custom endpoint authenticates with its own token; an opencode login adds nothing.
+        Provider::Opencode if local.switches.opencode_endpoint.is_some() => return None,
         Provider::Opencode => &roots.opencode,
         Provider::Codex | Provider::Cursor | Provider::Pi => return None,
     };
@@ -1657,18 +1659,24 @@ mod tests {
                 .await
             }
         };
-        let status = |settings: &Value| {
+        let field = |settings: &Value, name: &str| {
             settings["providers"]
                 .as_array()
                 .and_then(|all| all.iter().find(|status| status["provider"] == "opencode"))
-                .map(|status| status["endpoint"].clone())
+                .map(|status| status[name].clone())
                 .unwrap_or_default()
         };
+        let status = |settings: &Value| field(settings, "endpoint");
         let settings = configure(endpoint(Some(json!("synthetic-endpoint-token")))).await?;
         assert_eq!(
             status(&settings),
             json!({"protocol":"openai_compatible","base_url":"http://127.0.0.1:11434/v1",
                 "models":["model-a"],"has_api_key":true})
+        );
+        assert_eq!(
+            field(&settings, "setup"),
+            Value::Null,
+            "no opencode login is offered"
         );
         assert!(!settings.to_string().contains("synthetic-endpoint-token"));
         let saved = Config::load(&dir)?;
@@ -1684,7 +1692,12 @@ mod tests {
         let removed_key = endpoint(Some(Value::Null));
         assert_eq!(status(&configure(removed_key).await?)["has_api_key"], false);
         configure(endpoint(Some(json!("synthetic-endpoint-token")))).await?;
-        assert_eq!(status(&configure(Value::Null).await?), Value::Null);
+        let removed = configure(Value::Null).await?;
+        assert_eq!(status(&removed), Value::Null);
+        assert!(
+            field(&removed, "setup").is_object(),
+            "the login returns with the endpoint gone"
+        );
         let local = node.providers();
         assert!(local.switches.opencode_endpoint.is_none());
         assert!(
