@@ -16,7 +16,11 @@ def command(arguments, **kwargs):
 
 
 def resolves(host):
-    result = subprocess.run(["getent", "ahosts", host], capture_output=True, text=True, timeout=20)
+    try:
+        result = subprocess.run(["getent", "ahosts", host], capture_output=True, text=True, timeout=20)
+    except subprocess.TimeoutExpired:
+        print(f"ubuntu_dns_host={host} resolved=false lookup_timeout=true", flush=True)
+        return False
     print(f"ubuntu_dns_host={host} resolved={result.returncode == 0}", flush=True)
     return result.returncode == 0
 
@@ -36,7 +40,7 @@ def run(repair):
              "arm64": ("ports.ubuntu.com",)}.get(architecture)
     if hosts is None:
         raise ValueError("unsupported hosted Ubuntu architecture")
-    if any([resolves(host) for host in hosts]):
+    if any(resolves(host) for host in hosts):
         print("system_resolver_available=true configuration_unchanged=true", flush=True)
         return
     if not repair:
@@ -51,7 +55,7 @@ def run(repair):
     print("temporary_hosted_dns_repair=true servers=1.1.1.1,8.8.8.8", flush=True)
     try:
         command(["sudo", "resolvectl", "dns", interface, "1.1.1.1", "8.8.8.8"])
-        if not any([resolves(host) for host in hosts]):
+        if not any(resolves(host) for host in hosts):
             raise ValueError("public DNS did not resolve any configured Ubuntu package host")
     except (OSError, ValueError, subprocess.SubprocessError):
         if original:
