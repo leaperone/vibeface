@@ -3465,8 +3465,9 @@ pub(crate) fn refresh_reply_targets(
     )?;
     let mut changed = BTreeSet::from([message_id.to_owned()]);
     while let Some(message_id) = changed.pop_first() {
-        let replies: Vec<String> = connection.prepare(
-            "SELECT message_id FROM messages WHERE network_id=?1 AND conversation_id=?2 AND in_reply_to=?3 AND role='assistant' UNION SELECT message_id FROM messages WHERE network_id=?1 AND conversation_id=?2 AND message_id=?3 AND role='assistant' UNION SELECT steered_into FROM messages WHERE network_id=?1 AND conversation_id=?2 AND message_id=?3 AND steered_into IS NOT NULL",
+        // Deduplicate here so SQLite can use the reply index without sorting the union.
+        let replies: BTreeSet<String> = connection.prepare(
+            "SELECT message_id FROM messages WHERE network_id=?1 AND conversation_id=?2 AND in_reply_to=?3 AND role='assistant' UNION ALL SELECT message_id FROM messages WHERE network_id=?1 AND conversation_id=?2 AND message_id=?3 AND role='assistant' UNION ALL SELECT steered_into FROM messages WHERE network_id=?1 AND conversation_id=?2 AND message_id=?3 AND steered_into IS NOT NULL",
         )?.query_map(params![network, conversation, message_id], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
         for reply in replies {
             if refresh_reply_target(connection, network, conversation, &reply)? {

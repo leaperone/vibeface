@@ -7238,30 +7238,35 @@ fn reply_targets_follow_winning_rows_and_ranked_steers_in_any_order() -> Result<
         )?;
         let [early, late, direct] =
             ["early", "late", "direct"].map(|id| InputTarget::Task { task_id: id.into() });
-        let apply =
-            |scope: &str, body: EventBody, rank: u64, author: &LocalIdentity| -> Result<()> {
-                let hash = format!("{rank:064x}");
-                reduce::apply(
-                    &origin.connection,
-                    &net.network,
-                    &hash,
-                    &Event {
-                        version: WIRE_VERSION,
-                        network_id: net.network.clone(),
-                        author: author.device_id()?,
-                        seq: 1,
-                        prev: None,
-                        deps: vec![],
-                        scope_id: scope.into(),
-                        created_at_ms: rank as i64,
-                        body,
-                        blobs: vec![],
-                    },
-                    rank as i64,
-                    &super::rank(1000 + rank, rank as i64, &hash),
-                    false,
-                )
+        let apply = |scope: &str, body: EventBody, rank: u64, author: &LocalIdentity| {
+            let event = Event {
+                version: WIRE_VERSION,
+                network_id: net.network.clone(),
+                author: author.device_id()?,
+                seq: 1,
+                prev: None,
+                deps: vec![],
+                scope_id: scope.into(),
+                created_at_ms: rank as i64,
+                body,
+                blobs: vec![],
             };
+            let envelope = author.sign_event(event.clone())?;
+            // Reducer fixtures persist the event while controlling its projection rank.
+            origin.connection.execute(
+                "INSERT INTO events(network_id,author,seq,hash,scope_id,lamport,created_at_ms,seen_at_ms,envelope,main,effective,kind,subject,causal_chain,causal_clock) VALUES(?,?,?,?,?,?,?,?,?,0,1,?,?,?,'{}')",
+                params![net.network, event.author, event.seq, envelope.hash, scope, 1000 + rank, event.created_at_ms, rank as i64, serde_json::to_string(&envelope)?, event.body.kind(), event.body.subject(), envelope.hash],
+            )?;
+            reduce::apply(
+                &origin.connection,
+                &net.network,
+                &envelope.hash,
+                &event,
+                rank as i64,
+                &super::rank(1000 + rank, rank as i64, &envelope.hash),
+                false,
+            )
+        };
         let question_body = |id: &str, target: Option<InputTarget>| -> Result<EventBody> {
             let mut body = question(&origin, &net, "c", id, "session")?;
             if let EventBody::QuestionAsked {
