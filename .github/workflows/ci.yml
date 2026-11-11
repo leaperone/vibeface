@@ -556,6 +556,10 @@ jobs:
           path: .artifacts/ci-delivery/delivery-charity-*/report.json
           if-no-files-found: warn
           retention-days: 7
+      - uses: ./.github/actions/ubuntu-apt
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        with:
+          apply: 'true'
       - name: Cache Chromium binaries
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25

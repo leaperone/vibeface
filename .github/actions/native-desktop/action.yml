@@ -3,6 +3,10 @@ description: Set up native platform libraries and package tools on disposable ho
 runs:
   using: composite
   steps:
+    - uses: ./.github/actions/ubuntu-apt
+      if: runner.os == 'Linux'
+      with:
+        apply: 'true'
     - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
       with:
         toolchain: '1.98.1'

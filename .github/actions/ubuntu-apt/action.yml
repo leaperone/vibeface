@@ -1,0 +1,22 @@
+name: Probe existing Ubuntu package mirrors
+description: Verify signed release metadata on this disposable hosted runner before optionally changing mirror priorities
+inputs:
+  apply:
+    description: Prioritize verified existing official mirrors while retaining every candidate
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Probe the current runner's official Ubuntu mirrors
+      if: runner.os == 'Linux'
+      shell: bash
+      env:
+        APPLY_MIRROR_PRIORITIES: ${{ inputs.apply }}
+      run: |
+        options=()
+        case "$APPLY_MIRROR_PRIORITIES" in
+          true) options+=(--apply) ;;
+          false) ;;
+          *) echo 'apply must be true or false' >&2; exit 1 ;;
+        esac
+        python3 -B scripts/ci-ubuntu-mirrors.py "${options[@]}"
