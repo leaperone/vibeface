@@ -9,6 +9,7 @@ colors:
   primary-light: "oklch(0.24 0.016 270)"
   primary-foreground-light: "oklch(0.985 0.002 270)"
   primary-dark: "oklch(0.94 0.005 270)"
+  primary-foreground-dark: "oklch(0.2 0.01 270)"
   brand-light: "oklch(0.53 0.2 280)"
   brand-dark: "oklch(0.72 0.15 280)"
   muted-light: "oklch(0.965 0.004 270)"
@@ -16,6 +17,17 @@ colors:
   danger-light: "oklch(0.54 0.2 27)"
   danger-dark: "oklch(0.72 0.17 25)"
 typography:
+  title:
+    fontSize: "20px"
+    fontWeight: 600
+    lineHeight: "28px"
+  heading:
+    fontSize: "16px"
+    lineHeight: "24px"
+  task-metric:
+    fontSize: "28px"
+  badge:
+    fontSize: "11px"
   body:
     fontFamily: "Geist Variable, -apple-system, BlinkMacSystemFont, system-ui, sans-serif"
     fontSize: "15px"
@@ -27,6 +39,7 @@ typography:
 rounded:
   base: "0.625rem"
   control: "0.5rem"
+  inline-code: "4px"
   xl: "0.875rem"
 spacing:
   unit: "4px"
@@ -71,7 +84,7 @@ Depth is tonal first. Light mode uses subtle `elevation-xs`/`elevation-sm` on in
 
 ## Shapes
 
-The base radius is 10px, with 14px cards and 20px sheets where the component already establishes that language. Pills are reserved for compact status controls. Focus is an inset or 2px ring derived from `--ring`.
+The base radius is 10px, with 14px cards and 20px sheets where the component already establishes that language. Pills appear on compact status controls and the existing conversation starter suggestions. Focus is an inset or 2px ring derived from `--ring`.
 
 ## Components
 
@@ -80,6 +93,7 @@ The base radius is 10px, with 14px cards and 20px sheets where the component alr
 - **Cards and list groups:** `bg-card`, border, and small elevation; list groups use dividers rather than nested cards.
 - **Buttons and fields:** existing UI primitives provide variants, focus treatment, and mobile sizing.
 - **EmptyState:** icon, concise heading, optional explanation, and one recovery action.
+- **Task overview:** the existing masthead uses three metrics, a gradient, and soft blur. Review its populated and empty states before changing or extending it.
 - **BotFace and status marks:** identity and state are reinforced by text or icons; color is never the only signal.
 
 ## Do's and Don'ts
@@ -88,7 +102,7 @@ The base radius is 10px, with 14px cards and 20px sheets where the component alr
 - Do make recovery, waiting, and offline states explicit in words.
 - Do reuse `packages/theme/theme.css` and the existing UI primitives.
 - Do preserve keyboard order and 44px mobile hit areas.
-- Don't add dashboard-style metric cards to task surfaces.
-- Don't introduce gradients, decorative blur, or new color families without a product decision.
+- Do keep task metrics contextual to the task overview; the existing 28px metric masthead is not a conversation pattern.
+- Do retain the existing Bot identity halo and task overview gradient as incumbent patterns; additions require a surface-specific reason.
 - Don't use color alone for status.
 - Don't create one-off spacing or component variants when an existing primitive fits.

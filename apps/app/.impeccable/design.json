@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-11-11T18:49:03.408397+00:00",
+  "generatedAt": "2026-11-11T19:05:18.003160+00:00",
   "title": "Design System: Vibeface Web App",
   "extensions": {
     "colorMeta": {
@@ -198,6 +198,21 @@
           "oklch(0.860 0.1190 25)",
           "oklch(0.950 0.0425 25)"
         ]
+      },
+      "primary-foreground-dark": {
+        "role": "neutral",
+        "displayName": "Primary Foreground Dark",
+        "canonical": "oklch(0.2 0.01 270)",
+        "tonalRamp": [
+          "oklch(0.15 0.01 270)",
+          "oklch(0.26 0.01 270)",
+          "oklch(0.38 0.01 270)",
+          "oklch(0.5 0.01 270)",
+          "oklch(0.62 0.01 270)",
+          "oklch(0.74 0.01 270)",
+          "oklch(0.86 0.01 270)",
+          "oklch(0.95 0.01 270)"
+        ]
       }
     },
     "shadows": [
@@ -289,11 +304,11 @@
       "Do keep the primary task visible in the middle column.",
       "Do make recovery, waiting, and offline states explicit in words.",
       "Do reuse `packages/theme/theme.css` and the existing UI primitives.",
-      "Do preserve keyboard order and 44px mobile hit areas."
+      "Do preserve keyboard order and 44px mobile hit areas.",
+      "Do keep task metrics contextual to the task overview; the existing 28px metric masthead is not a conversation pattern.",
+      "Do retain the existing Bot identity halo and task overview gradient as incumbent patterns; additions require a surface-specific reason."
     ],
     "donts": [
-      "Don't add dashboard-style metric cards to task surfaces.",
-      "Don't introduce gradients, decorative blur, or new color families without a product decision.",
       "Don't use color alone for status.",
       "Don't create one-off spacing or component variants when an existing primitive fits."
     ]

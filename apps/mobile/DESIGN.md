@@ -9,6 +9,7 @@ colors:
   primary-light: "oklch(0.24 0.016 270)"
   primary-foreground-light: "oklch(0.985 0.002 270)"
   primary-dark: "oklch(0.94 0.005 270)"
+  primary-foreground-dark: "oklch(0.2 0.01 270)"
   brand-light: "oklch(0.53 0.2 280)"
   brand-dark: "oklch(0.72 0.15 280)"
   muted-light: "oklch(0.965 0.004 270)"
