@@ -4104,14 +4104,10 @@ mod tests {
             .join("../../.artifacts")
             .join(format!("node-join-failed-{}", uuid::Uuid::new_v4()));
         crate::config::private_dir(&dir)?;
-        crate::config::Config::local("127.0.0.1:4795".parse()?, vec![], false).save(&dir)?;
-        crate::config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        crate::config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
+        initialize_node(
+            &dir,
+            &crate::config::Config::local("127.0.0.1:4795".parse()?, vec![], false),
+            &LocalIdentity::generate(),
         )?;
         let capability =
             crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
@@ -4189,15 +4185,7 @@ mod tests {
             let mut config = crate::config::Config::local(reservation.local_addr()?, vec![], false);
             config.local_listen = local.local_addr()?;
             drop((reservation, local));
-            config.save(dir)?;
-            crate::config::private_write(
-                &dir.join("identity.json"),
-                &serde_json::to_vec(&LocalIdentity::generate())?,
-            )?;
-            crate::config::private_write(
-                &dir.join("data-epoch.json"),
-                &crate::config::data_epoch_marker(),
-            )?;
+            initialize_node(dir, &config, &LocalIdentity::generate())?;
             let node = Arc::new(Runtime::open(dir).await?);
             let root = LocalIdentity::generate();
             node.install_membership(NetworkState::new(Genesis::create(
@@ -4600,15 +4588,7 @@ mod tests {
         config.local_listen = local.local_addr()?;
         config.allowed_origins = vec!["https://app.example".into()];
         drop((public, local));
-        config.save(&dir)?;
-        crate::config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
-        crate::config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
         let capability =
             crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
         let opened = Instant::now();
@@ -4987,15 +4967,7 @@ mod tests {
         config.forwarding.per_ip = std::num::NonZeroUsize::new(1);
         config.forwarding.trusted_proxies = vec!["127.0.0.1".parse()?];
         drop((public, local));
-        config.save(&dir)?;
-        crate::config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
-        crate::config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
+        initialize_node(&dir, &config, &LocalIdentity::generate())?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let origin = node.config.public_url.clone();
         let server = tokio::spawn(crate::api::serve(node.clone(), None));

@@ -22,12 +22,12 @@ PACKAGES = ("vibeface-protocol", "vibeface-bridge", "vibeface-secure", "vibeface
 DEPENDENTS = {
     "protocol": ("bridge", "control", "client"),
     "bridge": ("control", "client"),
-    "secure": ("node", "secure-ffi", "client"),
+    "secure": ("control", "node", "secure-ffi", "client"),
     "node": (),
     "control": ("node", "cli"),
     "cli": (),
-    "secure-ffi": ("client",),
-    "client": ("cli",),
+    "secure-ffi": ("node", "client"),
+    "client": ("node", "cli"),
     "delivery": ("node",),
 }
 CRATES = {
@@ -568,7 +568,7 @@ def self_test():
         assert not mobile["rust_packages"] and not mobile["docs_only"]
     for path in ("packages/client/src/lib/transport.ts", "packages/client/src/avatar/face.ts", "packages/client/src/avatar/derived-faces.json", "packages/theme/theme.css", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"):
         assert make_plan([path])["mobile"], path
-    assert make_plan(["crates/secure-ffi/src/lib.rs"])["rust_packages"] == ["vibeface-client", "vibeface", "vibeface-secure-ffi"]
+    assert make_plan(["crates/secure-ffi/src/lib.rs"])["rust_packages"] == ["vibeface-client", "vibeface-core", "vibeface", "vibeface-secure-ffi"]
     docs = make_plan(["README.md", "packages/docs/node.md"])
     assert docs["docs_only"] and docs["www"] and docs["required_jobs"] == ["quick-check", "www"]
     for path in ("README.md", "README.zh-CN.md"):
@@ -605,8 +605,8 @@ def self_test():
         "node": ["vibeface-core"],
         "bridge": ["vibeface-bridge", "vibeface-client", "vibeface-core", "vibeface-control", "vibeface"],
         "protocol": ["vibeface-protocol", "vibeface-bridge", "vibeface-client", "vibeface-core", "vibeface-control", "vibeface"],
-        "secure": ["vibeface-secure", "vibeface-client", "vibeface-core", "vibeface", "vibeface-secure-ffi"],
-        "client": ["vibeface-client", "vibeface"],
+        "secure": ["vibeface-secure", "vibeface-client", "vibeface-core", "vibeface-control", "vibeface", "vibeface-secure-ffi"],
+        "client": ["vibeface-client", "vibeface-core", "vibeface"],
         "control": ["vibeface-core", "vibeface-control", "vibeface"],
         "cli": ["vibeface"],
         "delivery": ["vibeface-core", "vibeface-delivery"],

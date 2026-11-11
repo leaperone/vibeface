@@ -74,13 +74,6 @@ impl Runtime {
             .context("missing tool scope")?;
         self.require_scope(&access, &scope).await?;
         let name = tool.name();
-        if let Some(call_ref) = args["call_ref"].as_str()
-            && vibeface_protocol::validate_id(call_ref).is_err()
-        {
-            bail!(
-                "call_ref must contain 1-128 ASCII letters, digits, hyphens, dots or underscores, such as create-dokilove; it only keys retries of this call"
-            );
-        }
         ensure!(
             tool.effect() == Effect::Read || access.manager.is_some(),
             "work changes require a live agent invocation"
@@ -2155,14 +2148,15 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
-    async fn epoch8_directory_is_rejected_before_loading_any_provider_or_history() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("vibeface-old-epoch-{}", uuid::Uuid::new_v4()));
+    async fn a_directory_of_another_data_epoch_is_rejected_before_loading_anything() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("vibeface-other-epoch-{}", uuid::Uuid::new_v4()));
         crate::config::private_dir(&dir)?;
         std::fs::write(dir.join("data-epoch.json"), br#"{"data_epoch":8}"#)?;
         let error = Runtime::open(&dir)
             .await
             .err()
-            .context("old epoch must fail")?;
+            .context("another epoch must fail")?;
         assert!(error.to_string().contains(&format!(
             "requires an initialized data epoch {} directory",
             crate::config::DATA_EPOCH

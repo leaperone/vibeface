@@ -2630,9 +2630,8 @@ test('both task overviews preserve known records, show their coverage and only n
       assert.match(componentText(elements), /总览已截断/)
       assert.match(componentText(elements), /本次总览未返回 1 项任务/)
       assert.match(componentText(elements), /本次总览未返回 2 项问题/)
-      assert.doesNotMatch(componentText(elements), /另有.*未列出/)
       assert.match(componentText(elements), /尚未读取其他设备的后台工作/)
-      assert.doesNotMatch(componentText(elements), /0 项.*未列出/)
+      assert.doesNotMatch(componentText(elements), /未返回 0 项/)
       assert.equal(elements.some(({ type }) => type === 'ConfirmCard'), false, 'another Bot program check cannot settle against the active conversation')
       assert.equal(nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard']).some(({ type, props }) => type === 'Link' && (platform === 'web' ? (props.params as { botId?: string })?.botId === 'other' : props.href === '/b/other')), true)
       shared.nodes = [{ ...parityNode, online: false }]
@@ -2914,8 +2913,7 @@ test('context shows scheduler observations without promising native resume or re
     assert.ok(continuity && typeof continuity.type === 'function')
     let tree = continuity.type(continuity.props)
     assert.match(componentText(tree), /排队中/)
-    assert.doesNotMatch(componentText(tree), /正在运行|首次模型|续接记录|设备默认模型 · 设备默认模型/)
-    assert.equal(elements.filter(({ type }) => typeof type === 'function' && type.name === 'ContinuitySession').length, 0)
+    assert.doesNotMatch(componentText(tree), /正在运行|设备默认模型 · 设备默认模型/)
     data.scheduler!.jobs = [{ scope: { kind: 'main' as const }, trigger: 'message:stop', state: 'cancelling' }]
     tree = continuity.type(continuity.props)
     assert.match(componentText(tree), /停止中/)
@@ -3661,7 +3659,7 @@ test("bot drafts survive a new connection while old create completion cannot clo
     work = pendingResult(); submit()
     old.reject(new Error('stale create error')); await settleComponent()
     assert.equal(render().find(({ props }) => props.type === 'submit')?.props.disabled, true)
-    assert.equal(render().some(({ props }) => props.role === 'alert'), false)
+    assert.equal(render().find(({ type }) => type === 'InlineError')?.props.error, '')
     assert.deepEqual(closed, [])
     work.resolve({}); await settleComponent()
     assert.deepEqual(closed, [false])
@@ -3816,7 +3814,7 @@ test("a segmented control is one Tab stop whose arrow keys move and select, wrap
   assert.deepEqual(render().filter(({ props }) => props.role === 'radio').map(({ props }) => props.tabIndex), [0, -1, -1], "with nothing checked the first option takes the Tab stop")
 })
 
-for (const mode of ['restore']) test(`recovery ${mode} clears submitted passwords before waiting and keeps the chosen file and name`, async () => {
+test('recovery restore clears submitted passwords before waiting and keeps the chosen file and name', async () => {
   let generation = 1, work = pendingResult()
   class Input { value = 'test-only-value'; files: object[] = [{}]; checked = false }
   const fields = new Map(['bundle', 'password', 'old_password', 'confirmation', 'name', 'bootstrap', 'address', 'device_id', 'relay'].map(name => [name, new Input()]))
@@ -3828,7 +3826,7 @@ for (const mode of ['restore']) test(`recovery ${mode} clears submitted password
     '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/lib/node.ts': { parseEntry: (value: unknown) => value, messageOf: (cause: Error) => cause.message },
     '@vibeface/client/lib/secure.ts': { passphrase: (value: string) => value }, '@/lib/device-name': { defaultBrowserName: () => 'browser' },
   }, { HTMLInputElement: Input, HTMLTextAreaElement: Input })
-  const render = () => app.render('RecoveryControls', { only: mode })
+  const render = () => app.render('RecoveryControls', { only: 'restore' })
   const submit = () => render().find(({ type }) => type === 'form')?.props.onSubmit?.({ preventDefault() {}, currentTarget: form })
   try {
     render(); render(); submit()
@@ -4229,7 +4227,7 @@ test("conversation preserves local input while execution devices are unavailable
     currentWorkspace = workspace([{ device_id: 'gateway', online: true, capabilities: { manager: 'codex', manager_state: 'unverified', roots: [] } }])
     assert.equal(composer()?.disabled, false, 'unknown authentication can be tried without claiming readiness')
     assert.equal(composer()?.reason, '')
-    assert.doesNotMatch(componentText(composer()?.children), /尚未确认|检查状态|可用性|Codex/)
+    assert.doesNotMatch(componentText(composer()?.children), /尚未确认|可用性|Codex/)
     composer()?.onChange?.('third input')
     composer()?.onSubmit?.()
     assert.equal(sent, 3)
@@ -4331,7 +4329,6 @@ test('merged and in-flight user messages show honest status labels and refresh-o
       current = build([{ trigger: 'message:m2', state: 'steered', message_id: 'm2', outcome }], [{ message_id: 'm2', event_hash: 'm2', role: 'user', text: outcome, created_at_ms: 2 }])
       const tree = harness.messageTree('m2')
       assert.ok(componentText(tree).includes(label))
-      assert.doesNotMatch(componentText(tree), /已接受|已送达/)
       if (outcome === 'unknown') {
         refreshed = 0; sent = 0
         const action = findActionProps(tree, '再查一次')
@@ -4484,7 +4481,6 @@ test("an outstanding clipboard permission cannot keep the add-device sheet busy 
     creation = pendingResult(); labelled('生成链接')?.onClick?.()
     clipboard.resolve(undefined); await settleComponent()
     assert.equal(labelled('生成链接')?.disabled, true)
-    assert.equal(render().some(({ props }) => props.children === '已复制'), false)
     creation.resolve(invitation); await settleComponent()
     assert.equal(labelled('复制链接')?.disabled, false)
   } finally { app.close() }

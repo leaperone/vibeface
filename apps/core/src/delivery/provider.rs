@@ -287,9 +287,10 @@ impl Delivery {
                         "delivery offer belongs to another receiver"
                     );
                     let key_id = hex::encode(order.unsigned.terms.binding.key_id);
-                    let material = self
-                        .with_store(|store| store.value(&format!("receiving-key:{key_id}")))?
-                        .context("historical receiving key is unavailable")?;
+                    let material = Zeroizing::new(
+                        self.with_store(|store| store.value(&format!("receiving-key:{key_id}")))?
+                            .context("historical receiving key is unavailable")?,
+                    );
                     let key: ReceivingMaterial = serde_json::from_slice(&material)?;
                     ensure!(
                         key.binding.binding == order.unsigned.terms.binding && key.secret.is_some(),

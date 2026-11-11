@@ -739,33 +739,10 @@ mod tests {
     }
 
     #[test]
-    fn final_work_dispatch_round_trips_and_epoch8_shape_rejects_model_fields() -> anyhow::Result<()>
-    {
-        #[derive(Serialize, Deserialize)]
-        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-        enum Epoch8Body {
-            WorkDispatched {
-                work_id: String,
-                trigger: String,
-                dispatcher: String,
-                call_ref: String,
-                kind: WorkKind,
-                cwd: String,
-                title: String,
-                prompt: String,
-            },
-        }
-        let old = serde_json::json!({"type":"work_dispatched", "work_id":"w", "trigger":"message:m", "dispatcher":"node", "call_ref":"call", "kind":"codex", "cwd":"/tmp", "title":"work", "prompt":"go"});
-        let _: Epoch8Body = serde_json::from_value(old.clone())?;
-        let mut new = old;
-        new["model"] = serde_json::json!("requested");
-        new["resolved"] = serde_json::json!({"provider":"codex", "model":"accepted"});
-        let body: EventBody = serde_json::from_value(new.clone())?;
-        assert_eq!(serde_json::to_value(body)?, new);
-        let error = serde_json::from_value::<Epoch8Body>(new)
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("old shape must reject"))?;
-        assert!(error.to_string().contains("unknown field"));
+    fn work_dispatch_round_trips() -> anyhow::Result<()> {
+        let dispatched = serde_json::json!({"type":"work_dispatched", "work_id":"w", "trigger":"message:m", "dispatcher":"node", "call_ref":"call", "kind":"codex", "cwd":"/tmp", "title":"work", "prompt":"go", "model":"requested", "resolved":{"provider":"codex", "model":"accepted"}});
+        let body: EventBody = serde_json::from_value(dispatched.clone())?;
+        assert_eq!(serde_json::to_value(body)?, dispatched);
         Ok(())
     }
 

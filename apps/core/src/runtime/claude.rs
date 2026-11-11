@@ -4,6 +4,7 @@
 //! sight of is read back from Claude Code's own transcript and never sent again. Hooks of the
 //! owner's own sessions hold permission requests and questions for the bot.
 use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
+use super::provider_adapter::bounded;
 use super::*;
 use crate::manager::{self, CodexTurn, ManagerConfig, ManagerError, ManagerFailure};
 use crate::scheduling::{SteerOutcome, SteerTarget};
@@ -643,15 +644,8 @@ fn tool_kind(name: &str) -> &'static str {
     }
 }
 
-fn clip(text: &str, limit: usize) -> String {
-    text.chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
-        .take(limit)
-        .collect()
-}
-
 fn tool_progress(id: &str, name: &str, status: &str) -> Value {
-    json!({"type":"tool","item_id":clip(id, 128),"name":name,"status":status})
+    json!({"type":"tool","item_id":bounded(id, 128),"name":name,"status":status})
 }
 
 /// What the frames of one turn said so far.
@@ -672,7 +666,7 @@ impl Turn {
                 Some(json!({"type":"status","status":"running"}))
             }
             Frame::Text { id, text } => Some(
-                json!({"type":"text_snapshot","item_id":clip(&id, 128),"text":clip(&text, 8000)}),
+                json!({"type":"text_snapshot","item_id":bounded(&id, 128),"text":bounded(&text, 8000)}),
             ),
             Frame::ToolStarted { id, name } => {
                 let progress = tool_progress(&id, name, "running");
@@ -1406,10 +1400,6 @@ where
                 break 'turn Err(error(ManagerFailure::Unknown, native, own(&e.to_string())));
             }
         }
-        if turn.session.is_some() {
-            stage.enter(ProviderStage::Run);
-            *start.lock().unwrap() = manager::StartEvidence::Started;
-        }
         if let Some(next) = turn.ending.take() {
             processes.close_input(process.tree.token());
             Ending::append(&mut ending, next);
@@ -1607,6 +1597,7 @@ async fn follow(
     node: Weak<Runtime>,
     network: String,
     work_id: String,
+    conversation: String,
     session: String,
     message: String,
     mut process: Process,
@@ -1653,19 +1644,11 @@ async fn follow(
             };
             if let Some(progress) = turn.apply(frame)
                 && let Ok(target_node) = node.identity.device_id()
-                && let Ok(Some(record)) = {
-                    let work_id = work_id.to_owned();
-                    node.store
-                        .call("claude.work_record", move |store| {
-                            store.work_record(&work_id)
-                        })
-                        .await
-                }
             {
                 let sequence = node.progress_sequence.fetch_add(1, Ordering::Relaxed) + 1;
                 node.publish_progress(
                     &network,
-                    json!({"type":"native_progress","conversation_id":record.conversation,
+                    json!({"type":"native_progress","conversation_id":conversation,
                         "work_id":work_id,"target_node":target_node,"sequence":sequence,
                         "progress":progress}),
                 );
@@ -1871,6 +1854,7 @@ impl Executor for Claude {
                 Arc::downgrade(node),
                 network.to_owned(),
                 work_id.to_owned(),
+                work.conversation.clone(),
                 session,
                 message,
                 process,
@@ -2426,9 +2410,7 @@ pub(super) mod tests {
     }
 
     fn gated_config(place: &Place, client: &str) -> ManagerConfig {
-        let (record, _) = recorder();
-        let mut config = bot_config(place, record);
-        config.timeout_secs = 30;
+        let mut config = bot_config(place, Arc::new(|_, _| Box::pin(async { Ok(()) })));
         config.codex_turn = Some(CodexTurn {
             client_id: client.into(),
             started: None,
@@ -2719,7 +2701,6 @@ pub(super) mod tests {
             Probe::Missing
         );
         let locator_path = reader.processes.reply_locator_path("attempt-a")?;
-        let locator = std::fs::read(&locator_path)?;
         std::fs::remove_file(&locator_path)?;
         assert_eq!(
             reader.probe_reply(&session, None, "attempt-a").await?,
@@ -2730,7 +2711,6 @@ pub(super) mod tests {
             reader.probe_reply(&session, None, "attempt-a").await?,
             Probe::Missing
         );
-        config::private_write(&locator_path, &locator)?;
         Ok(())
     }
 
@@ -3061,7 +3041,7 @@ pub(super) mod tests {
         assert_eq!(
             log[0]["env"],
             json!({"VIBEFACE_TOOL_TOKEN":true,"VIBEFACE_NODE_URL":true,"CLAUDECODE":false,
-                "CLAUDE_CODE_ENTRYPOINT":false,"FAKE_MARK":false})
+                "CLAUDE_CODE_ENTRYPOINT":false})
         );
         assert_eq!(log[1]["uuid"], message.as_str());
         assert!(
@@ -3380,22 +3360,14 @@ time.sleep(0.05)
                     now_ms(),
                 )?;
                 store.append_event(&identity, &network, &conversation_id, bot, vec![], now_ms())?;
-                let input = admin.attest(
+                let input = crate::runtime::test_support::signed_main_input(
+                    &admin,
                     &network,
                     &conversation_id,
-                    EventBody::InputPosted {
-                        message_id: message_id.clone(),
-                        target: crate::workspace::InputTarget::BotMain {
-                            bot_id: conversation_id.clone(),
-                        },
-                        intent: crate::workspace::InputIntent::Continue,
-                        sequence: 1,
-                        expected_revision: None,
-                        text: "Run the provider fixture work".into(),
-                        attachments: vec![],
-                        report_results: Some(true),
-                        attestation: None,
-                    },
+                    &message_id,
+                    "Run the provider fixture work",
+                    vec![],
+                    1,
                 )?;
                 store.append_event(
                     &identity,

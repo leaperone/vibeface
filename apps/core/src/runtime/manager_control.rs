@@ -1009,7 +1009,7 @@ pub(super) mod tests {
                 let job = store.claim_next_fixture(&identity, &network, "c", &boot, "lease-fence")?.context("Task claim")?.job;
                 let attempt = job.state.attempt().context("attempt")?.id.clone();
                 store.mark_started("c", &job.trigger, &attempt)?;
-                store.started_workspace_assignment(&identity, &network, &job, now_ms())?;
+                store.settle_workspace_assignment(&identity, &network, &job, now_ms())?;
                 Ok((job, first, attempt))
                             }).await?
             };

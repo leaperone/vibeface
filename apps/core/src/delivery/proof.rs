@@ -1430,7 +1430,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_terminates_the_whole_process_group() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(".artifacts")
+            .join("../../.artifacts")
             .join("proof-supervisor-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("{}.pid", uuid::Uuid::new_v4()));

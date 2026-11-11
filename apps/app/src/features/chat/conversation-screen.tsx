@@ -311,7 +311,6 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
         hint={notice}
         reason={reason}
         disabled={sendDisabled}
-        busy={false}
         sendLabel={intent === 'defer' ? '保存为稍后处理' : intent === 'new_task' ? '发送为新任务' : targetBusy ? '补充当前工作' : '发送'}
         tools={<IntentMenu intent={intent} busy={targetBusy} onChange={setIntent} />}
         onStop={workspace.writable && (inputTarget.kind === 'bot_main' ? stopJob : targetBusy) ? () => { setSendError(null); workspace.stopInputTarget({ target: inputTarget }).catch(setSendError) } : undefined}

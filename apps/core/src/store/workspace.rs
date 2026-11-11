@@ -1610,7 +1610,13 @@ fn projection_basis(
     network: &str,
     event: &Event,
 ) -> Result<VersionVector> {
-    let needs_basis = matches!(&event.body, EventBody::WorkspaceCommanded { .. });
+    let needs_basis = matches!(
+        &event.body,
+        EventBody::WorkspaceCommanded {
+            command: WorkspaceCommand::AssignTask { .. },
+            ..
+        }
+    );
     #[cfg(test)]
     let needs_basis = needs_basis || log::test_metrics::legacy();
     if !needs_basis {
@@ -2742,6 +2748,19 @@ pub(crate) fn additional_dependencies(
     network: &str,
     body: &EventBody,
 ) -> Result<Vec<String>> {
+    if !matches!(
+        body,
+        EventBody::InputPosted { .. }
+            | EventBody::WorkspaceCommanded { .. }
+            | EventBody::MessagePosted {
+                in_reply_to: Some(_),
+                role: Role::Assistant,
+                ..
+            }
+            | EventBody::MessageSteered { .. }
+    ) {
+        return Ok(Vec::new());
+    }
     let graph = Graph::read(connection, network)?;
     let mut hashes = BTreeSet::new();
     let mut scopes = BTreeSet::new();
@@ -3874,15 +3893,6 @@ impl Store {
             at,
         )?;
         self.workspace_assignment(network, &assignment_id)
-    }
-    pub fn started_workspace_assignment(
-        &mut self,
-        identity: &LocalIdentity,
-        network: &str,
-        job: &crate::scheduling::SchedulerJob,
-        at: i64,
-    ) -> Result<()> {
-        self.settle_workspace_assignment(identity, network, job, at)
     }
     pub fn settle_workspace_assignment(
         &mut self,
@@ -5439,11 +5449,15 @@ pub(crate) fn bind_waiting_workspace_inputs_from(
     assignment: &Assignment,
 ) -> Result<()> {
     let mut statement =
-        connection.prepare("SELECT key,value FROM identity_meta WHERE key LIKE ?")?;
+        connection.prepare("SELECT key,value FROM identity_meta WHERE key>=?1 AND key<?2")?;
     let bindings = statement
-        .query_map([format!("workspace-input-assignment:{network}:%")], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
+        .query_map(
+            [
+                format!("workspace-input-assignment:{network}:"),
+                format!("workspace-input-assignment:{network};"),
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let graph = Graph::read(connection, network)?;
     for (key, value) in bindings {

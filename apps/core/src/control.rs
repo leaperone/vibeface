@@ -681,7 +681,6 @@ fn initialize(dir: &Path, configuration: Config) -> Result<()> {
         );
     }
     configuration.validate()?;
-    configuration.network.validate()?;
     let identity = LocalIdentity::generate();
     config::private_dir(dir)?;
     let identity_bytes = zeroize::Zeroizing::new(serde_json::to_vec_pretty(&identity)?);
@@ -768,9 +767,14 @@ fn start_over(dir: &Path) -> Result<PathBuf> {
         let _ = fs::remove_dir_all(&fresh);
         return Err(error);
     }
-    fs::rename(dir, &archive)?;
+    if let Err(error) = fs::rename(dir, &archive) {
+        let _ = fs::remove_dir_all(&fresh);
+        return Err(error.into());
+    }
     if let Err(error) = fs::rename(&fresh, dir) {
-        fs::rename(&archive, dir)?;
+        let restored = fs::rename(&archive, dir);
+        let _ = fs::remove_dir_all(&fresh);
+        restored?;
         return Err(error.into());
     }
     Ok(archive)

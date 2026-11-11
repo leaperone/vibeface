@@ -190,7 +190,9 @@ impl Runtime {
             .await?;
         let jobs = self
             .store
-            .call("scheduler_jobs_all", |store| store.scheduler_jobs_all())
+            .call("workspace_scheduler_jobs", |store| {
+                store.workspace_scheduler_jobs()
+            })
             .await?;
         for job in jobs {
             let crate::scheduling::SessionScope::WorkspaceTask { task_id } = &job.scope else {

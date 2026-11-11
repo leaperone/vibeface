@@ -163,27 +163,6 @@ pub async fn node(options: NodeOptions) -> Result<()> {
     print(&result)
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-pub enum Provider {
-    Codex,
-    Claude,
-    Opencode,
-    Cursor,
-    Pi,
-}
-
-impl Provider {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::Claude => "claude",
-            Self::Opencode => "opencode",
-            Self::Cursor => "cursor",
-            Self::Pi => "pi",
-        }
-    }
-}
-
 #[derive(Args)]
 pub struct ProviderOptions {
     #[command(flatten)]
@@ -197,7 +176,7 @@ pub enum ProviderAction {
     /// Change a provider: {"bot","execution","execution_model","bin","app_server","connect_local","env"}.
     Configure {
         #[arg(value_enum)]
-        provider: Provider,
+        provider: crate::triage::Provider,
         /// The change as a JSON object; absent fields keep their value. `-` reads it from
         /// standard input, for one holding API keys.
         change: String,
@@ -205,12 +184,12 @@ pub enum ProviderAction {
     /// Check whether a provider is ready.
     Probe {
         #[arg(value_enum)]
-        provider: Provider,
+        provider: crate::triage::Provider,
     },
     /// List a provider's models.
     Models {
         #[arg(value_enum)]
-        provider: Provider,
+        provider: crate::triage::Provider,
     },
     /// Test the Codex App Server connection.
     TestCodex,
@@ -364,14 +343,11 @@ fn config_value(text: &str) -> Value {
 pub async fn config(options: ConfigOptions) -> Result<()> {
     let ConfigAction::Set { key, value } = options.command;
     let dir = options.node.data_dir;
-    let result = crate::control(
-        &dir,
-        ControlRequest::ConfigSet {
-            data_dir: dir.clone(),
-            key: key.clone(),
-            value: config_value(&arg_or_stdin(value)?),
-        },
-    )
+    let result = crate::control(ControlRequest::ConfigSet {
+        data_dir: dir.clone(),
+        key: key.clone(),
+        value: config_value(&arg_or_stdin(value)?),
+    })
     .await?;
     if result["restart_required"] == true {
         println!("Saved {key}; restart the Node to apply it.");
@@ -426,14 +402,26 @@ impl ClientAccess {
         ClientKey::create(&self.client_dir, passphrase.as_str())
     }
 
+    /// `--url` with the remembered Node's ID; none without `--url`, for the remembered entry.
+    fn entry(&self, key: &ClientKey) -> Result<Option<Entry>> {
+        let Some(url) = &self.url else {
+            return Ok(None);
+        };
+        Ok(Some(Entry {
+            origin: url.clone(),
+            node_id: key
+                .entry()
+                .context("this client is not enrolled yet")?
+                .node_id
+                .clone(),
+        }))
+    }
+
     /// The local Node's Gateway and device ID, or `--url` with `node`.
     async fn local_entry(&self, node: Option<String>) -> Result<Entry> {
-        let info = crate::control(
-            &self.data_dir,
-            ControlRequest::Inspect {
-                data_dir: self.data_dir.clone(),
-            },
-        )
+        let info = crate::control(ControlRequest::Inspect {
+            data_dir: self.data_dir.clone(),
+        })
         .await;
         let origin = match (&self.url, &info) {
             (Some(url), _) => url.clone(),
@@ -675,17 +663,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
         }
         command => {
             let key = access.unlock()?;
-            let entry = match &access.url {
-                Some(url) => Some(Entry {
-                    origin: url.clone(),
-                    node_id: key
-                        .entry()
-                        .context("this client is not enrolled yet")?
-                        .node_id
-                        .clone(),
-                }),
-                None => None,
-            };
+            let entry = access.entry(&key)?;
             let mut session = key.connect(entry.as_ref()).await?;
             signed(&mut session, command).await
         }
@@ -876,7 +854,8 @@ pub async fn bots(options: BotsOptions) -> Result<()> {
         _ => {}
     }
     let key = access.unlock()?;
-    let mut session = key.connect(None).await?;
+    let entry = access.entry(&key)?;
+    let mut session = key.connect(entry.as_ref()).await?;
     let result = match options.command {
         BotsAction::Create {
             name,

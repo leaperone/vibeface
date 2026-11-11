@@ -101,7 +101,7 @@ function About({ bot, shared }: { bot: BotRecord; shared: NonNullable<ReturnType
             <ActionButton variant="outline" size="sm" icon={schedule.enabled ? Pause : Play} disabled={!shared.writable} action={() => shared.controlSchedule(schedule.schedule_id, schedule.enabled ? 'pause' : 'resume')}>{schedule.enabled ? '暂停' : '恢复'}</ActionButton>
             <Button variant="outline" size="sm" disabled={!shared.writable} onPress={() => Alert.alert(`删除「${schedule.name}」？`, undefined, [
               { text: '取消', style: 'cancel' },
-              { text: '删除', style: 'destructive', onPress: () => void shared.controlSchedule(schedule.schedule_id, 'delete').catch((error: unknown) => Alert.alert('删除失败', error instanceof Error ? error.message : String(error))) },
+              { text: '删除', style: 'destructive', onPress: () => void shared.controlSchedule(schedule.schedule_id, 'delete').catch((error: unknown) => Alert.alert('删除失败', messageOf(error))) },
             ])}>
               <Icon as={Trash2} /><Text>删除</Text>
             </Button>

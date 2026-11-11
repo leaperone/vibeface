@@ -168,7 +168,7 @@ impl Delivery {
                 ensure!(prior.completed.is_some(),"another receiving key operation is unresolved; reconcile its original intent first");
             }
             let current_label=current_key_label(&config)?;
-            let current=store.value(&current_label)?.map(|bytes|serde_json::from_slice::<ReceivingMaterial>(&bytes)).transpose()?;
+            let current=store.value(&current_label)?.map(Zeroizing::new).map(|bytes|serde_json::from_slice::<ReceivingMaterial>(&bytes)).transpose()?;
             if action == KeyAction::Rotate {
                 let confirmed_active = match &current {
                     Some(material) => material.binding.binding.action == BindingAction::Active

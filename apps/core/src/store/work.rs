@@ -530,6 +530,10 @@ impl Store {
     pub fn work_records(&self) -> Result<Vec<WorkRecord>> {
         query_runs(&self.connection, "1", [])
     }
+    pub fn open_work_records(&self) -> Result<Vec<WorkRecord>> {
+        query_runs(&self.connection, "state<>'finished'", [])
+    }
+
     /// Only runs whose next reconciliation can do work, excluding coordination tasks.
     pub fn reconcile_work_records(&self, at: i64, read_live: bool) -> Result<Vec<WorkRecord>> {
         let filter = if read_live {

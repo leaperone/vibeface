@@ -143,8 +143,11 @@ bash scripts/package-node.sh
 ├── packages/
 │   ├── client/      # 共享应用客户端
 │   ├── docs/        # 用户和开发者指南
+│   ├── secure-native/ # 移动应用使用的 Rust 加密绑定
 │   └── theme/       # 共享样式
+├── config/          # 官方公共节点地址
 ├── contracts/       # 实验性文件交付合约
+├── deploy/          # 官方服务的容器部署
 ├── scripts/         # 构建、打包和验证工具
 ├── tests/           # 测试夹具和端到端测试
 └── install.sh       # 安装脚本

@@ -53,7 +53,7 @@ const until = async (ready: () => boolean) => {
 }
 
 const remote = '6'.repeat(64), freshKey = '7'.repeat(64)
-function deviceHarness({ joining = '', bootstrap = false, saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>(), tabStorage = new Map<string, string>(), removed = false, now = Date.now, origin = '', entryAddrs = [] as string[] } = {}) {
+function deviceHarness({ joining = '', saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>(), tabStorage = new Map<string, string>(), removed = false, origin = '', entryAddrs = [] as string[] } = {}) {
   const hooks = hookHarness(true), { effects, afterRender } = hooks
   const timers = new Map<number, () => void>()
   const stored = storage, calls: string[] = [], navigations: string[] = []
@@ -90,7 +90,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   // A cookie-bound local session only exists after a launch on this origin, which the browser remembers.
   if (localSession) stored.set('vibeface.local-origin', 'true')
   let key = subject
-  let initialized = !bootstrap && local !== 'fresh'
+  let initialized = local !== 'fresh'
   const transport = {
     validTarget: (value: string) => value, validEndpoint: (value: string) => value, joinTicket, joinLink,
     initClient: async () => ({ deviceId: key }), signClient: async (purpose: string) => { signatures.push(purpose); return 'signature' },
@@ -146,7 +146,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   }
   const timer = (run: () => void) => { const id = ++nextTimer; timers.set(id, run); return id }
   const sandbox = createContext({
-    Date: class extends Date { static now = now },
+    Date,
     localStorage: { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => stored.set(key, value) },
     sessionStorage: { getItem: (key: string) => tabStorage.get(key) ?? null, setItem: (key: string, value: string) => tabStorage.set(key, value), removeItem: (key: string) => tabStorage.delete(key) },
     location, addEventListener: (type: string, listener: () => void) => { if (type === 'hashchange') hashListeners.add(listener) }, removeEventListener: (_type: string, listener: () => void) => hashListeners.delete(listener),
@@ -1192,8 +1192,7 @@ for (const flow of ['directory', 'recovery']) test(`cancelling after ${flow} res
     if (flow === 'directory') work = app.render().refreshDirectory()
     else work = app.render().beginRecovery({ file: new File(['test-fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry })
     const rejected = assert.rejects(work, /切换|取消/)
-    for (let tries = 0; tries < 100 && !app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_state'); tries++) await new Promise(resolve => setTimeout(resolve, 1))
-    assert.ok(app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_state'))
+    await until(() => app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_state'))
     hold.resolve({ state: { genesis }, view: { ...membership, members: [{ device_id: subject, kind: 'client', name: 'browser', manage: false }, { device_id: target, kind: 'node', name: 'node', manage: false }] } })
     queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => app.render().disconnect())))
     await rejected; await settle()

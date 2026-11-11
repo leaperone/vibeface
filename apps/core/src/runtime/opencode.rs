@@ -191,9 +191,6 @@ struct Live {
     /// Its first message, which steers name as the turn.
     turn: String,
     conn: Conn,
-    directory: String,
-    /// What every message of the turn carries besides its own: agent, system and model.
-    body: Value,
     /// Our messages in the order sent: the turn's, then the steered ones.
     sent: Vec<String>,
     last_post_ms: i64,
@@ -997,39 +994,6 @@ impl Opencode {
         Some(!self.inbox(&conn, session).await.ok()?.is_empty())
     }
 
-    /// Whether no run or queued input remains in a reply's session; a running turn is aborted. Runs
-    /// end with their serve, and the Node stops the serve of an earlier run when it opens.
-    #[cfg(all(test, unix))]
-    pub(crate) async fn run_ended(&self, session: &str) -> bool {
-        let ended = async {
-            let Some(conn) = self.running().await else {
-                return true;
-            };
-            match self.session(&conn, session).await {
-                Ok(Some(_)) => {}
-                Ok(None) => return true,
-                Err(_) => return false,
-            }
-            let pending = match self.inbox(&conn, session).await {
-                Ok(items) => !items.is_empty(),
-                Err(_) => return false,
-            };
-            match self.busy(&conn, session).await {
-                Ok(false) => !pending,
-                Ok(true) => {
-                    let _ = self.abort(&conn, session).await;
-                    false
-                }
-                Err(_) => false,
-            }
-        }
-        .await;
-        if ended {
-            self.release_manager(session);
-        }
-        ended
-    }
-
     pub(crate) async fn run_turn<F, P, PF>(
         &self,
         config: &ManagerConfig,
@@ -1102,7 +1066,7 @@ impl Opencode {
             })?,
             None => None,
         };
-        let (session, directory, prompt) = match (resumed, previous) {
+        let (session, prompt) = match (resumed, previous) {
             (Some(found), Some(id)) => {
                 let busy = self
                     .busy(&conn, id)
@@ -1121,7 +1085,6 @@ impl Opencode {
                         ),
                     ));
                 }
-                let directory = found["location"]["directory"].as_str().unwrap_or(workspace);
                 if let Some(model) = model.as_ref()
                     && found["model"] != *model
                 {
@@ -1132,7 +1095,7 @@ impl Opencode {
                         )
                     })?;
                 }
-                (id.to_owned(), directory.to_owned(), prompt)
+                (id.to_owned(), prompt)
             }
             _ => {
                 let id = (self.create(&conn, workspace, model.as_ref()).await)
@@ -1141,7 +1104,7 @@ impl Opencode {
                 let fresh = previous
                     .and(config.codex_turn.as_ref())
                     .and_then(|turn| turn.fresh_prompt.as_deref());
-                (id, workspace.to_owned(), fresh.unwrap_or(prompt))
+                (id, fresh.unwrap_or(prompt))
             }
         };
         let native = Some(session.as_str());
@@ -1196,17 +1159,14 @@ impl Opencode {
             &config.custom_tools,
             &config.instructions,
         );
-        let body = json!({"id":message,"text":if instructions.is_empty() {
+        let first = json!({"id":message,"text":if instructions.is_empty() {
             prompt.to_owned()
         } else {
             format!("{instructions}\n\n{prompt}")
         }});
-        let first = body.clone();
         let live = Live {
             turn: message.clone(),
             conn: conn.clone(),
-            directory: directory.clone(),
-            body,
             sent: vec![message.clone()],
             last_post_ms: now_ms(),
             open: true,
@@ -1393,9 +1353,9 @@ impl Opencode {
         }
         let reply = match &last.reply {
             None => {
-                let failure = seen.error.take().unwrap_or_else(|| {
-                    own("opencode ended the run without an answer; check that the model exists and its provider is signed in")
-                });
+                let failure = own(
+                    "opencode ended the run without an answer; check that the model exists and its provider is signed in",
+                );
                 return Err(failed(native, failure));
             }
             Some(reply) if reply["error"]["type"] == "aborted" => {
@@ -2044,15 +2004,13 @@ impl Executor for Opencode {
                     .map(|turn| {
                         turn.sent.push(id.clone());
                         turn.last_post_ms = now_ms();
-                        (turn.conn.clone(), turn.directory.clone(), turn.body.clone())
+                        turn.conn.clone()
                     })
             };
-            let Some((conn, _directory, mut body)) = joined else {
+            let Some(conn) = joined else {
                 return SteerAck::Refused("the reply already ended".into());
             };
-            body["id"] = json!(id);
-            body["text"] = json!(input.message(message_id));
-            body.as_object_mut().expect("prompt body").remove("files");
+            let mut body = json!({"id":id,"text":input.message(message_id)});
             if !input.files.is_empty() {
                 let mut files = Vec::new();
                 for file in &input.files {
@@ -2744,12 +2702,16 @@ mod tests {
 
     /// The session and message of the bot turn once opencode took it.
     async fn started(turns: &Turns) -> (String, String) {
-        loop {
-            if let Some((session, Some(turn))) = turns.lock().unwrap().last().cloned() {
-                return (session, turn);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some((session, Some(turn))) = turns.lock().unwrap().last().cloned() {
+                    return (session, turn);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        })
+        .await
+        .expect("the turn was recorded")
     }
 
     fn spec(target: &str, place: &Place, prompt: &str) -> WorkSpec {
@@ -2859,6 +2821,7 @@ mod tests {
                 "XDG_STATE_HOME",
                 "XDG_CACHE_HOME",
                 "OPENCODE_CONFIG",
+                "OPENCODE_CLI_CONFIG_CONTENT",
                 "OPENCODE_TEST_HOME",
             ] {
                 env.insert(key.into(), user.join(key).display().to_string());
@@ -2886,11 +2849,10 @@ mod tests {
                 .collect::<std::result::Result<_, _>>()?;
             let last = recorded.last().context("recorded launch")?;
             for (key, value) in &expected {
-                if last.get(key).is_some() {
-                    assert_eq!(last[key], json!(value));
-                }
+                assert_eq!(last[key], json!(value), "{key}");
             }
             assert_eq!(last["OPENCODE_CONFIG"], Value::Null);
+            assert_eq!(last["OPENCODE_CLI_CONFIG_CONTENT"], Value::Null);
             assert_eq!(last["OPENCODE_TEST_HOME"], Value::Null);
             assert_eq!(last["fake_auth_present"], true);
             assert!(Path::new(&expected["OPENCODE_DB"]).is_file());
@@ -3445,7 +3407,12 @@ mod tests {
         let config = bot(&place, &server, "attempt-1", &Turns::default());
         let (_, never) = watch::channel(false);
         let (result, _, _) = turn(&place, &config, "hello", None, never).await;
-        assert!(result.is_err());
+        let error = result.err().expect("the turn is refused");
+        assert!(
+            format!("{error:#}").contains("set the tool environment"),
+            "{error:#}"
+        );
+        assert_eq!(place.fake.lock().unwrap().sessions.len(), 1);
         assert!(place.prompts().is_empty());
         Ok(())
     }
@@ -4157,38 +4124,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unknown_turn_keeps_its_serve_until_read_back_confirms_it_ended() -> Result<()> {
-        let place = Place::new().await?;
-        let server = place.opencode()?;
-        let (conn, serving) = server.conn().await?;
-        let session = server
-            .create(&conn, place.dir.to_str().unwrap(), None)
-            .await
-            .expect("fixture session");
-        let start = std::sync::Mutex::new(manager::StartEvidence::Started);
-        drop(TurnGuard {
-            owner: &server,
-            session: session.clone(),
-            events: tokio::spawn(async {}),
-            serving: Some(serving),
-            start: &start,
-            terminal: false,
-        });
-        assert_eq!(server.users.load(std::sync::atomic::Ordering::SeqCst), 1);
-        let mut expected = server.launch.lock().expect("launch").current.clone();
-        expected
-            .env
-            .insert("VIBEFACE_FAKE_LAUNCH".into(), "after-unknown".into());
-        server.set_launch(expected.bin.clone(), expected.env.clone());
-        assert!(server.configuration_pending(&expected.bin, &expected.env));
-        assert!(server.run_ended(&session).await);
-        assert_eq!(server.users.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert!(!server.configuration_pending(&expected.bin, &expected.env));
-        server.stop().await;
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn serve_startup_is_serial_and_a_waiting_turn_can_be_cancelled() -> Result<()> {
         let place = Place::new().await?;
         let server = place.opencode()?;
@@ -4325,32 +4260,5 @@ mod tests {
             parse_model("flash").map_err(|failure| failure.kind),
             Err(FailureKind::NoModel)
         );
-    }
-
-    #[tokio::test]
-    async fn pending_input_does_not_prevent_reconciliation_from_stopping_a_running_session()
-    -> Result<()> {
-        let place = Place::new().await?;
-        let server = place.opencode()?;
-        let (conn, _serving) = server.conn().await?;
-        let session = server
-            .create(&conn, &place.dir.join("work").to_string_lossy(), None)
-            .await
-            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
-        server
-            .send(&conn, &session, &json!({"id":"msg_active","text":"HOLD"}))
-            .await;
-        server
-            .send(&conn, &session, &json!({"id":"msg_pending","text":"INBOX"}))
-            .await;
-        assert!(!server.run_ended(&session).await);
-        assert!(!place.fake.lock().unwrap().sessions[&session].busy);
-        assert!(
-            server
-                .inbox_contains(&conn, &session, "msg_pending")
-                .await?
-        );
-        assert_eq!(place.fake.lock().unwrap().aborts, 1);
-        Ok(())
     }
 }

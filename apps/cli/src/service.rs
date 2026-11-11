@@ -221,11 +221,7 @@ pub async fn run(options: Service) -> Result<()> {
     let data_dir = data_dir_or_home(options.data_dir)?;
     let data = std::fs::canonicalize(data_dir)
         .context("initialized data directory is required; run vibeface init first")?;
-    let inspected = inspect(&data).await?;
-    ensure!(
-        inspected.data_dir == data,
-        "core inspected a different data directory"
-    );
+    inspect(&data).await?;
     let executable = std::env::current_exe()?;
     let npm_root = update::npm_install_root(&executable)?;
     let root = match &npm_root {

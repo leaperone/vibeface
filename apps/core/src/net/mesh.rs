@@ -1358,6 +1358,7 @@ impl Mesh {
             Request::ProbeRelay { url } => {
                 {
                     let mut limits = self.limits.lock().expect("mesh limits");
+                    forget_idle(&mut limits);
                     let limit = limits.entry(remote).or_default();
                     ensure!(
                         limit.probe_at.is_none_or(|at| at.elapsed() >= PROBE_EVERY),
@@ -1379,14 +1380,7 @@ impl Mesh {
 
     fn admit(&self, remote: EndpointId, digest: bool) -> Result<()> {
         let mut limits = self.limits.lock().expect("mesh limits");
-        if limits.len() >= 4096 {
-            limits.retain(|_, limit| {
-                [limit.digest_at, limit.lookups.0, limit.probe_at]
-                    .into_iter()
-                    .flatten()
-                    .any(|at| at.elapsed() < Duration::from_secs(60))
-            });
-        }
+        forget_idle(&mut limits);
         let limit = limits.entry(remote).or_default();
         if digest {
             ensure!(
@@ -1433,6 +1427,18 @@ impl Mesh {
             records.push(entry.signed.clone());
         }
         Ok((records, false))
+    }
+}
+
+/// Drops the limits of devices idle for a minute once the table is full.
+fn forget_idle(limits: &mut HashMap<EndpointId, Limit>) {
+    if limits.len() >= 4096 {
+        limits.retain(|_, limit| {
+            [limit.digest_at, limit.lookups.0, limit.probe_at]
+                .into_iter()
+                .flatten()
+                .any(|at| at.elapsed() < Duration::from_secs(60))
+        });
     }
 }
 

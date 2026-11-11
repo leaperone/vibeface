@@ -3,11 +3,8 @@
   "private": true,
   "type": "module",
   "imports": {
-    "#/*": "./src/*",
     "#components/*": "./src/components/*",
-    "#hooks/*": "./src/lib/hooks/*",
-    "#lib/*": "./src/lib/*",
-    "#lib/utils": "./src/lib/utils.ts"
+    "#hooks/*": "./src/lib/hooks/*"
   },
   "scripts": {
     "dev": "vite dev --port 3000",

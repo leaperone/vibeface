@@ -2891,6 +2891,11 @@ impl Runtime {
                     })
                     .await?
             };
+            if let Some(mark) = mark
+                && std::fs::metadata(&path).is_ok_and(|meta| meta.len() == mark as u64)
+            {
+                continue;
+            }
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
@@ -3878,9 +3883,7 @@ pub(super) mod tests {
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
             let mut requests = answering_app_server(&node).await?;
-            while node.codex.status().await["connection"]["state"] != "connected" {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+            connected(&node).await;
             let network = node.network_id().await?;
             let local = node.identity.device_id()?;
             let spec = crate::work::WorkSpec {
@@ -4036,7 +4039,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn a_send_stuck_past_its_window_is_unverified_then_followed() -> Result<()> {
         use crate::model::{WorkOutcome, WorkStatus};
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::AtomicBool;
         with_node(async |node, admin, _| {
             bot(&node, &admin, "c", "前端", &[]).await?;
             let started = Arc::new(AtomicBool::new(false));
@@ -4198,7 +4201,7 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn a_held_stop_outlives_a_failed_interrupt_and_ends_with_its_work() -> Result<()> {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::AtomicBool;
         with_node(async |node, admin, _| {
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
@@ -5764,6 +5767,7 @@ pub(super) mod tests {
             assert_eq!(node.triage_status().await?["unknown_events"], 1);
             Ok::<_, anyhow::Error>((network, question.to_owned(), request_id.to_owned()))
         }.await;
+        node.shutdown().await;
         drop(node);
         let reopened = Arc::new(Runtime::reopen(&dir).await?);
         let result = async {
@@ -6902,7 +6906,6 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn a_work_runs_on_the_provider_it_names() -> Result<()> {
-        use crate::providers::Provider;
         with_node(async |node, admin, dir| {
             assert!(std::ptr::addr_eq(
                 node.executor(Provider::Codex)?,
@@ -7040,7 +7043,6 @@ pub(super) mod tests {
     #[tokio::test]
     async fn a_work_asking_what_its_agent_cannot_do_is_refused_before_it_is_registered()
     -> Result<()> {
-        use crate::providers::Provider;
         with_node(async |node, admin, dir| {
             with_agent(&node);
             node.settings.lock().unwrap().roots = vec![dir.clone()];
@@ -7133,13 +7135,11 @@ pub(super) mod tests {
     #[tokio::test]
     async fn a_work_without_agent_goes_on_where_its_thread_or_original_ran() -> Result<()> {
         use crate::model::WorkKind;
-        use crate::providers::Provider;
         with_node(async |node, admin, dir| {
             with_agent(&node);
             if let Some(manager) = node.settings.lock().unwrap().manager.as_mut() {
                 manager.provider = Provider::Claude;
             }
-            node.settings.lock().unwrap().roots = vec![dir.clone()];
             {
                 let mut providers = node.providers.lock().unwrap();
                 providers.switches.execution.insert(Provider::Claude);
@@ -8675,8 +8675,7 @@ pub(super) mod tests {
         }
         .await;
         server.abort();
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
+        cleanup(node, dir).await?;
         result
     }
 
@@ -9256,8 +9255,7 @@ pub(super) mod tests {
             bot(&node, &admin, "c", "Bot", &[]).await?;
             let network = node.network_id().await?;
             let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
-            node.register_manager_attempt_fixture("thread-retry-token".into(), test_access(network.clone(), false, Some("c".into())), &attempt, &trigger, Provider::Codex).await?;
-            let access = node.agent_tokens.lock().await.get("thread-retry-token").cloned().context("access")?;
+            let access = node.manager_access_fixture("thread-retry-token", test_access(network.clone(), false, Some("c".into())), &attempt, &trigger, Provider::Codex).await?;
             let mut original = Vec::new();
             for (call, explicit, model) in [("explicit", true, Some("frozen")), ("implicit", false, Some("frozen")), ("explicit-default", true, None), ("implicit-default", false, None)] {
                 {
@@ -9375,7 +9373,6 @@ pub(super) mod tests {
             Ok::<_, anyhow::Error>(())
         }.await;
         server.abort();
-        node.shutdown().await;
         cleanup(node, dir).await?;
         result
     }
@@ -9392,8 +9389,7 @@ pub(super) mod tests {
             bot(&node, &admin, "c", "Bot", &[]).await?;
             let network = node.network_id().await?;
             let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
-            node.register_manager_attempt_fixture("retry-token".into(), test_access(network.clone(), false, Some("c".into())), &attempt, &trigger, Provider::Codex).await?;
-            let access = node.agent_tokens.lock().await.get("retry-token").cloned().context("access")?;
+            let access = node.manager_access_fixture("retry-token", test_access(network.clone(), false, Some("c".into())), &attempt, &trigger, Provider::Codex).await?;
             let args = |call: &str, explicit: bool| -> Result<Value> {
                 let cwd = dir.join(call);
                 std::fs::create_dir(&cwd)?;
@@ -9448,7 +9444,6 @@ pub(super) mod tests {
             node.finish_manager_attempt(&attempt).await;
             Ok::<_, anyhow::Error>(())
         }.await;
-        node.shutdown().await;
         cleanup(node, dir).await?;
         result
     }
@@ -9643,7 +9638,6 @@ pub(super) mod tests {
                 Ok::<_, anyhow::Error>(())
             }
             .await;
-            node.shutdown().await;
             cleanup(node, dir).await?;
             result?;
         }
@@ -9750,7 +9744,6 @@ pub(super) mod tests {
             Ok::<_, anyhow::Error>(())
         }
         .await;
-        node.shutdown().await;
         cleanup(node, dir).await?;
         result
     }
@@ -9896,7 +9889,6 @@ pub(super) mod tests {
                 Ok::<_, anyhow::Error>(())
             }
             .await;
-            node.shutdown().await;
             cleanup(node, dir).await?;
             result?;
         }

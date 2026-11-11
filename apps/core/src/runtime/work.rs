@@ -150,7 +150,7 @@ impl Runtime {
     async fn observe_live_threads(&self) {
         let threads = self
             .store
-            .call("work.observe_threads", |store| store.work_records())
+            .call("work.observe_threads", |store| store.open_work_records())
             .await
             .unwrap_or_default()
             .into_iter()
@@ -1400,7 +1400,7 @@ impl Runtime {
         };
         let records = self
             .store
-            .call("work.records", |store| store.work_records())
+            .call("work.records", |store| store.open_work_records())
             .await?;
         for record in records
             .into_iter()

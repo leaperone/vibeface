@@ -7,9 +7,9 @@ import { isMainNotification, type BotRecord, type NodeInfo, type NotificationRec
 import { parseNotifications } from './model.ts'
 
 const question = (id: string, closed = false): Question => ({
-  question_id: id, conversation_id: 'c', bot: { bot_id: 'b', name: '助手' }, severity: 'normal', text: id, choices: [], about: { kind: 'general' },
-  author: 'node', created_at_ms: 1, answer: null, closed: closed ? { reason: 'expired', at_ms: 2 } : null,
-} as unknown as Question)
+  question_id: id, conversation_id: 'c', bot: { bot_id: 'b', name: '助手' }, severity: 'attention', text: id, choices: [], about: { node: 'node', agent: 'codex', session_id: 's', cwd: '/w', summary: '' },
+  author: 'node', created_at_ms: 1, answer: null, closed: closed ? 'request_lost' : null,
+})
 const join = (status: JoinRequest['status']): JoinRequest => ({
   join_id: status, status, network_id: 'n', invite_id: 'i', device_id: 'phone', kind: 'client', name: '我的手机', commit: 'c',
   admin_id: null, admin_nonce: null, joiner_nonce: null, reason: null, expires_at_ms: 1,
@@ -267,9 +267,8 @@ test('losing the entry makes active tasks stale without claiming every target is
 
 test('manager attention keeps its notification identity and can be hidden locally', () => {
   const attention = source(true)
-  const bot = { bot_id: 'b', conversation_id: 'c', name: '助手' } as unknown as BotRecord
   const note = { notification_id: 'n1', kind: 'manager_attention', text: '看看进展', conversation_id: 'c' } satisfies NotificationRecord
-  attention.workspace.bots = [bot]
+  attention.workspace.bots = [botRecord]
   attention.workspace.notifications = [note]
   const item = inboxItems(attention).find((candidate) => candidate.kind === 'attention')
   assert.equal(item?.kind, 'attention')

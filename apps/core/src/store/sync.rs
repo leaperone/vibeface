@@ -359,9 +359,8 @@ impl Store {
                 }
             }
             Some(("work", work_id)) => {
-                let outcome = super::reduce::works_from(&tx, network, conversation)?
-                    .into_iter()
-                    .find(|work| work.work_id == work_id)
+                let outcome = super::reduce::work_from(&tx, network, work_id)?
+                    .filter(|work| work.conversation_id == conversation)
                     .and_then(|work| work.outcome);
                 let Some(outcome) = outcome.filter(|o| *o != WorkOutcome::Unverified) else {
                     return Ok(None);

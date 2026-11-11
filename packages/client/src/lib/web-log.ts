@@ -41,7 +41,9 @@ export function pageIds(location: { pathname: string; search: string }): Pick<We
   const conversation = new URLSearchParams(location.search).get("conversation")
   const work = /\/work\/([^/]+)/.exec(location.pathname)?.[1]
   const valid = (id: string | null | undefined) => id && /^[A-Za-z0-9_.:-]{1,128}$/.test(id) ? id : undefined
-  return { conversation_id: valid(conversation), work_id: valid(work && decodeURIComponent(work)) }
+  // A hand-edited address can carry a broken escape; it names no task.
+  const decoded = (() => { try { return work && decodeURIComponent(work) } catch { return undefined } })()
+  return { conversation_id: valid(conversation), work_id: valid(decoded) }
 }
 
 /** Sends as soon as a device is connected; records that arrive during a send go in the next batch. */

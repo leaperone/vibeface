@@ -22,3 +22,5 @@ __pycache__/
 .e2e/summary.md
 .e2e/logs/
 .e2e/videos/
+__pycache__/
+.DS_Store

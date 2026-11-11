@@ -551,7 +551,7 @@ Node 从整张表里抽取开放 relay 并行验证，先按历史通过次数�
 
 普通查询可以直接回答，本机工作使用 SDK 的宿主工具，远端工作通过 Agent 任务消息委派。日常操作不需要创建任务单、打开执行会话或选择调度器。进展、补充输入和结果都回到原机器人的聊天。
 
-会话的调度设备由本人在建会话时签名指定，每次更换都写一条带本人签名、epoch 加一的负责人记录（`set_owner`）。调度设备离线而当前连接的设备能运行管理 Agent 时，聊天里出现“X 离线了，这个对话在等它”，点**交给这台设备处理**即可换过来，排队的消息在新设备上继续回复。新调度设备只按共享记录和上下文检查点重建上下文，不重放已经执行的工作。旧调度设备看到更换后会停下正在进行的回复，并拒绝它之后的工具调用。每个定时时刻由当时的调度设备在共享记录里领取，本机已有有效领取记录的时刻不再排队；错过太久而跳过的时刻也会领取。每个定时任务只看最新到期的时刻：同一时刻只领一次；上一次运行还在排队时不领新时刻，错过的中间时刻并入最新到期的那个；晚于 10 分钟的时刻只记领取并跳过；会话队列满 256 项时也不领。上一次运行已经开始则不等待，所以 Parallel 的 Provider 在 `machine_slots` 允许时，同一定时任务的不同时刻可以重叠运行；Serial 的 Provider 仍串行。新设备不领取早于或等于换负责人记录时间的时刻，并等待 5 分钟接管宽限期，让旧设备同步领取记录。schedule 定义、启停和接管时间使用事件首次在本机落库的 `seen_at_ms`，不受写入方时钟偏差影响。旧设备断网超过宽限期且尚未得知负责人变更时，新旧设备仍可能执行同一时刻。详见 [Schedule](design/agent-capabilities.md#1-schedule)。
+会话的调度设备由本人在建会话时签名指定，每次更换都写一条带本人签名、epoch 加一的负责人记录（`set_owner`）。调度设备离线而当前连接的设备能运行管理 Agent 时，聊天里出现“X 离线，对话在等它”，点**换到 Y**（Y 是当前设备的名称）即可换过来，排队的消息在新设备上继续回复。新调度设备只按共享记录和上下文检查点重建上下文，不重放已经执行的工作。旧调度设备看到更换后会停下正在进行的回复，并拒绝它之后的工具调用。每个定时时刻由当时的调度设备在共享记录里领取，本机已有有效领取记录的时刻不再排队；错过太久而跳过的时刻也会领取。每个定时任务只看最新到期的时刻：同一时刻只领一次；上一次运行还在排队时不领新时刻，错过的中间时刻并入最新到期的那个；晚于 10 分钟的时刻只记领取并跳过；会话队列满 256 项时也不领。上一次运行已经开始则不等待，所以 Parallel 的 Provider 在 `machine_slots` 允许时，同一定时任务的不同时刻可以重叠运行；Serial 的 Provider 仍串行。新设备不领取早于或等于换负责人记录时间的时刻，并等待 5 分钟接管宽限期，让旧设备同步领取记录。schedule 定义、启停和接管时间使用事件首次在本机落库的 `seen_at_ms`，不受写入方时钟偏差影响。旧设备断网超过宽限期且尚未得知负责人变更时，新旧设备仍可能执行同一时刻。详见 [Schedule](design/agent-capabilities.md#1-schedule)。
 
 发送后先看状态。`pending_delivery` 表示入口已保存消息，正在投递给原调度设备；只有目标持久入队后才是 `queued`。排队不表示模型已开始，`running` 才表示已跨过 SDK 启动边界。目标离线、能力不满足或回执丢失时，保留原目标与消息身份核对，不自动改派另一台设备。
 
@@ -572,7 +572,7 @@ Agent 通过 Node 的 `dispatch_work` 工具派发工作，例如 `vibeface tool
 
 协调 Agent 的 Shell 完全访问本机，可以改文件、跑 git 和 gh。它用 `vibeface codex call <method> [json]` 调用 App Server 的读取和线程管理方法，开始、引导或停止回合的方法（`turn/start`、`turn/steer`、`turn/interrupt`、`thread/start`、`thread/fork`、`thread/compact/start`、`thread/shellCommand`、`thread/revert`、`thread/inject_items`、`review/start`）一律拒绝，改用 `dispatch_work`、`codex send` 和 `interrupt_work`，让每个回合都是 Node 登记过的工作；`vibeface codex send <thread> <text> --id <id>` 给已有会话插话（回合进行中时 steer，否则开新回合）。这条消息是本轮的一项工作，与 `dispatch_work` 相同：发送前向 Node 登记，`--id` 即 `call_ref`，Node 观察它所在的回合，结束后结果作为 `work_result` 轮回到 Bot；同一轮同一 `--id` 再次执行只回读、绝不重发，换了内容或会话则拒绝。Node 发送前读取并规范化线程的真实目录，核对它位于本机 `roots` 内。给出 `cwd` 时还须与真实目录一致。它只能在 Bot 的一轮里运行，因为它要用这一轮的工具令牌；Cursor 的 Shell 没有这个令牌，Cursor 回合用带 `thread` 的 `dispatch_work` 工具做同样的事。`vibeface codex watch <thread>` 查看事件，`vibeface log <level> <message> --conversation <id>` 把它遇到的问题写进 Node 日志（经本机监听器的 `/api/log`，边界与 `/api/hooks`、`/api/triage` 相同：回环来源、无 `Origin`、无转发头，并带数据目录 `local-access.json` 里的所有者 bearer，命令按该文件记录的 origin 发请求；同一 OS 账户的完整 Shell 本就能读这个文件，所以这不是进程沙箱隔离）。Socket 路径在 `VIBEFACE_CODEX_SOCKET`。
 
-Codex 默认 bypass，正常不会发起请求。仍发起的请求（审批、提问、登录等）由 Node 挂起并立即唤醒协调 Agent：它用 `vibeface requests` 查看，`vibeface respond <request_id> '<result-json>'` 回答，同一请求只回答一次。需要本人拍板时，它用 `vibeface triage raise --event-id <ID> --request-id <请求> --question <问题> --choice 批准 --choice 拒绝` 在拥有该会话的 Bot 聊天里提问，按项目设置也经 webhook 转发 Grok Bot。提问挂住请求直到有回答。本人答案沿独立私有控制队列回到原执行设备，不等待被挂起 Task 的 scheduler 槽位。基础审批只按原请求动作递交，文字题由捕获配置的新协调会话按原题型整理。普通问题仍在原 Task 或 Main 排后续轮，未知结果只查询。没有协调 Agent，或它 120 秒内既没回答也没提问时，Node 按方法拒绝并记录。等待回答的 hook 挂起的请求同样经 `vibeface requests` 和 `vibeface respond` 处理，30 秒内没有回答时交回会话自己决定。没有协调 Agent 时分诊事件直接丢弃。协调 Agent 每次启动分诊都预占一次额度，上限同为 `daily_decision_limit`，但与 Bot 的自动轮次分开记账，不占它们的额度。额度用完时保留未审阅事件，挂起请求仍按原期限兜底；额度恢复后只重新审阅事件，不重放原工具或已执行的工作。只有当前进程确认模型未启动时才退还原日额度；启动后失败、结果未知或 Node 重启时不退款，也不自动重跑该批事件。设置和诊断包显示已用额度、上限、下次尝试时间，以及待审阅、处理中和结果未知的事件数。协调 Agent 能看到拥有该会话的 Bot 的说明开头和最新记忆，各有长度上限。hook 挂起的 `continue` 只在执行本人已要求的事时代发；下一步需要本人决定、难以撤销或需要本人未给的授权时，改为提问。不是 Bot 发起的交互会话由运行它的设备归给主 Bot；Bot 每轮能看到名下的会话，自己判断后用 `hand_over_session` 转给其他 Bot 或不再关注；`codex exec`、子代理等后台会话不处理，见 [聊天里的提问与回答](design/questions-in-chat.md)。
+Codex 默认 bypass，正常不会发起请求。仍发起的请求（审批、提问、登录等）由 Node 挂起并立即唤醒协调 Agent：它用 `vibeface requests` 查看，`vibeface respond <request_id> '<result-json>'` 回答，同一请求只回答一次。需要本人拍板时，它用 `vibeface triage raise --event-id <ID> --request-id <请求> --question <问题>` 在拥有该会话的 Bot 聊天里提问，按项目设置也经 webhook 转发 Grok Bot。挂起的审批只用 Node 给出的“允许本次”（原请求支持时）和“拒绝”，`--choice` 只用于普通提问。提问挂住请求直到有回答。本人答案沿独立私有控制队列回到原执行设备，不等待被挂起 Task 的 scheduler 槽位。基础审批只按原请求动作递交，文字题由捕获配置的新协调会话按原题型整理。普通问题仍在原 Task 或 Main 排后续轮，未知结果只查询。没有协调 Agent，或它 120 秒内既没回答也没提问时，Node 按方法拒绝并记录。等待回答的 hook 挂起的请求同样经 `vibeface requests` 和 `vibeface respond` 处理，30 秒内没有回答时交回会话自己决定。没有协调 Agent 时分诊事件直接丢弃。协调 Agent 每次启动分诊都预占一次额度，上限同为 `daily_decision_limit`，但与 Bot 的自动轮次分开记账，不占它们的额度。额度用完时保留未审阅事件，挂起请求仍按原期限兜底；额度恢复后只重新审阅事件，不重放原工具或已执行的工作。只有当前进程确认模型未启动时才退还原日额度；启动后失败、结果未知或 Node 重启时不退款，也不自动重跑该批事件。设置和诊断包显示已用额度、上限、下次尝试时间，以及待审阅、处理中和结果未知的事件数。协调 Agent 能看到拥有该会话的 Bot 的说明开头和最新记忆，各有长度上限。hook 挂起的 `continue` 只在执行本人已要求的事时代发；下一步需要本人决定、难以撤销或需要本人未给的授权时，改为提问。不是 Bot 发起的交互会话由运行它的设备归给主 Bot；Bot 每轮能看到名下的会话，自己判断后用 `hand_over_session` 转给其他 Bot 或不再关注；`codex exec`、子代理等后台会话不处理，见 [聊天里的提问与回答](design/questions-in-chat.md)。
 
 Node 默认不启用 Codex。启用 Codex Bot 或任务执行时，缺少的程序路径由 Node 从本机找出并写进配置，设备设置里显示并可修改；Bot 也能用 `propose_provider_config` 提议显式 App Server socket、会话扫描目录或添加可用文件夹（`roots`），经聊天里的「允许 / 不允许」卡片同意后由 Node 写入。首次设置时打开 Codex 运行 Bot 会同时打开执行任务，并可一键添加家目录下常见的项目文件夹（`node_settings.suggested_roots`）。整个 `providers.codex_app_server` 对象省略时默认 `spawn`，提供对象时 `mode` 必填。spawn 时 Node 托管自己的 `codex app-server`，使用 `<data-dir>/providers/codex` 和私有的 `/tmp/vibeface-<identity>/` socket；不会扫描用户 control socket、sessions 或 hooks。`system` 只连接明确配置的 socket，不启动或结束外部服务。App Server 运行在独立进程组，进程组号写入数据目录的 `codex-app-server.pid`。Node 启动时先结束上次遗留的进程组，正常退出时一并停止它，异常退出则退避重启。连接系统 App Server 时，同时设置 `providers.codex_app_server.mode` 为 `system` 和显式的绝对 `socket`；`init --codex-socket` 会同时保存两者。启动网页成功不等于程序已安装、已登录或模型可用，应查看聊天中工作的实际状态。
 
@@ -614,7 +614,7 @@ vibeface status
 vibeface service status
 ```
 
-服务管理命令需要完整的受管安装，启动路径始终为安装根目录下的 `current/vibeface`。通过 `$VIBEFACE_BIN_DIR/vibeface` 链接调用也保留该路径，升级后不会固定在旧 release。直接运行 `cargo build` 的程序不安装服务。先使用 `update configure --install-root "$VIBEFACE_INSTALL_ROOT"` 保存部署时选择的安装根。
+GitHub 受管安装通过安装根目录下固定的 `current/vibeface` 启动，npm 安装通过 npm 包中固定的原生程序路径启动。通过 `$VIBEFACE_BIN_DIR/vibeface` 链接调用也保留该路径，升级后不会固定在旧 release。直接运行 `cargo build` 的程序不安装服务。先使用 `update configure --install-root "$VIBEFACE_INSTALL_ROOT"` 保存部署时选择的安装根。
 
 每个系统用户管理一个 Node 服务。各服务命令核对 `--data-dir` 与已安装服务一致，再操作该服务。省略参数时使用 `VIBEFACE_DATA_DIR`，未设置时使用 `~/.vibeface`。管理其他数据目录时显式传入绝对路径。
 
@@ -627,7 +627,7 @@ vibeface service start
 vibeface service restart
 ```
 
-macOS 使用当前登录用户的 launchd agent，Linux 使用 `systemd --user`。Node 无论前台还是后台都把 info 级日志写到数据目录的 `node.log`（JSON lines，用 `vibeface logs` 查看）；后台运行时 macOS 的 `service.stderr.log` 和 Linux 的用户 journal 只剩崩溃输出。退出登录后仍需运行的 Linux 主机，由管理员按主机策略启用该用户的 lingering。
+macOS 使用当前登录用户的 launchd agent，Linux 使用 `systemd --user`，Windows 使用当前用户的计划任务。Node 无论前台还是后台都把 info 级日志写到数据目录的 `node.log`（JSON lines，用 `vibeface logs` 查看）；后台运行时 macOS 的 `service.stderr.log` 和 Linux 的用户 journal 只剩崩溃输出。退出登录后仍需运行的 Linux 主机，由管理员按主机策略启用该用户的 lingering。
 
 后台服务不保证继承终端的 PATH 或临时环境变量。在 `config.json` 使用 Provider 的绝对路径，并通过对应服务管理器配置模型凭证。安装脚本不保存或复制密钥。
 

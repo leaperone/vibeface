@@ -298,6 +298,7 @@ impl Store {
         )?;
         Ok(store)
     }
+    #[cfg(test)]
     pub fn install_trust_bundle(&mut self, network_id: &str, state: &NetworkState) -> Result<bool> {
         let tx = self
             .connection
@@ -771,7 +772,9 @@ impl Store {
         self.verified_blob_path(network, conversation, attachment)
     }
 
-    /// Attachments are files named by their SHA-256; writes are atomic and reads re-verify.
+    /// Test fixture that stores a whole attachment at once; production writes go through
+    /// `partial_blob_file` and `blob_file`.
+    #[cfg(test)]
     pub fn put_blob(&mut self, expected: &BlobRef, content: &[u8]) -> Result<()> {
         ensure!(
             content.len() <= MAX_BLOB_BYTES && content.len() as u64 == expected.size,

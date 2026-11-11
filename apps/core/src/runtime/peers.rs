@@ -616,14 +616,13 @@ impl Runtime {
                     json!({"records":self.store.call("peers.address_book", move |store| store.address_book()).await?}),
                 )
             }
-            "deliver" => self.accept_delivery(network, origin, input).await,
             "scheduler_jobs" => {
                 self.owner_jobs(network, field(input, "conversation_id")?)
                     .await
             }
             "scheduler_history" => self.owner_history(network, input).await,
             "progress_read" => self.read_progress(network, origin, input).await,
-            "dispatch_work" | "interrupt_work" => {
+            "deliver" | "dispatch_work" | "interrupt_work" => {
                 self.accept_peer_command(network, origin, input).await
             }
             "input_receipt" => self.read_input_receipt(network, input).await,
@@ -1399,7 +1398,6 @@ impl Runtime {
         true
     }
 
-    /// The write state, and the conflicts kept aside here, for the web.
     /// Each other member Node with whether the last sync reached it and when one last finished.
     pub(crate) async fn peer_health(&self) -> Vec<crate::maintenance::PeerHealth> {
         let Ok(view) = self
@@ -1492,6 +1490,7 @@ impl Runtime {
         }))
     }
 
+    /// The write state, and the conflicts kept aside here, for the web.
     pub(crate) async fn write_status(&self, network: &str) -> Result<Value> {
         let state = *self.write_state.borrow();
         let conflicts = {
@@ -2269,10 +2268,6 @@ impl Runtime {
                         })
                         .await
                 }?;
-                ensure!(
-                    matches!(state, "saved" | "waiting_dependencies"),
-                    "invalid owner admission state"
-                );
                 {
                     let arg0 = (network).to_owned();
                     let arg1 = (command_id).to_owned();
@@ -2300,15 +2295,6 @@ impl Runtime {
                 Err(error)
             }
         }
-    }
-
-    async fn accept_delivery(
-        self: &Arc<Self>,
-        network: &str,
-        origin: &str,
-        input: &Value,
-    ) -> Result<Value> {
-        self.accept_peer_command(network, origin, input).await
     }
 
     async fn accept_peer_command(
@@ -2696,14 +2682,6 @@ impl Runtime {
             let size = blob.size;
             tokio::task::spawn_blocking(move || staging_room(&dir, size)).await??;
         }
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&part)
-            .await?;
-        file.set_len(committed).await?;
-        file.seek(std::io::SeekFrom::Start(committed)).await?;
         let connection = self.net()?.connect(peer, net::BLOB).await?;
         let (mut send, mut recv) = connection
             .open_bi()
@@ -2721,6 +2699,14 @@ impl Runtime {
         if let Some(error) = header["error"].as_str() {
             bail!("{error}");
         }
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&part)
+            .await?;
+        file.set_len(committed).await?;
+        file.seek(std::io::SeekFrom::Start(committed)).await?;
         let mut offset = committed;
         let mut unsynced = 0;
         while let Some(chunk) = recv
@@ -5706,6 +5692,18 @@ mod tests {
                 }?,
                 std::slice::from_ref(&lacked.1)
             );
+            let partial = {
+                let hash = lacked.1.hash.clone();
+                b.store
+                    .call("peers.partial_blob_file", move |store| {
+                        store.partial_blob_file(&hash)
+                    })
+                    .await?
+            };
+            assert!(
+                !partial.exists(),
+                "an attachment the peer lacks stages nothing"
+            );
             {
                 let arg0 = (lacked.1).to_owned();
                 let arg1 = (lacked.0).to_owned();
@@ -5768,20 +5766,7 @@ mod tests {
                     .cloned()
                     .context("the peer is listed")
             };
-            a.wake_sync(&peer);
-            tokio::time::timeout(Duration::from_secs(30), async {
-                while !a
-                    .sync_peers
-                    .lock()
-                    .expect("sync peers")
-                    .get(&peer)
-                    .is_some_and(|state| state.synced_ms.is_some() && state.failures == 0)
-                {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            })
-            .await
-            .context("first sync")?;
+            first_sync(&a, &peer).await?;
             let online = listed(a.rpc(access.clone(), json!({"method":"nodes"})).await?)?;
             assert_eq!(online["online"], true);
             assert_eq!(online["capabilities"]["manager"], "cursor");
@@ -7028,14 +7013,18 @@ mod tests {
                     .collect())
             };
             let mut settled = Vec::new();
-            loop {
-                let now = vec![book(&l).await?, book(&c).await?];
-                if now.iter().all(|records| records.len() == 1) && now == settled {
-                    break;
+            tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    let now = vec![book(&l).await?, book(&c).await?];
+                    if now.iter().all(|records| records.len() == 1) && now == settled {
+                        break anyhow::Ok(());
+                    }
+                    settled = now;
+                    tokio::time::sleep(Duration::from_secs(6)).await;
                 }
-                settled = now;
-                tokio::time::sleep(Duration::from_secs(6)).await;
-            }
+            })
+            .await
+            .context("the address books settle")??;
             let records = l
                 .store
                 .call("peers.address_book", move |store| store.address_book())

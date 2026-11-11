@@ -19,7 +19,7 @@ export function ChannelsOverview() {
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-5">
     <div className="flex flex-wrap items-center justify-between gap-3"><div className="grid gap-1"><h2 className="text-heading font-semibold">与我的 Bot 协作</h2><p className="text-meta text-muted-foreground">让我的多个 Bot 围绕同一件事协作。</p></div><Button type="button" disabled={!workspace.writable || !workspace.bots.length} onClick={() => setCreating(true)}><Plus aria-hidden="true" />新频道</Button></div>
     {channels.length ? <ul className="grid gap-3">{channels.map((channel) => <li key={channel.channel_id}><Link to="/channels/$channelId" params={{ channelId: channel.channel_id }} className="grid gap-2 rounded-xl border bg-card p-4 transition-colors hover:bg-muted/50 focus-visible:ring-3 focus-visible:ring-ring/50"><span className="flex items-center gap-2 font-medium"><MessagesSquare aria-hidden="true" className="size-5 text-muted-foreground" />{channel.title}</span>{channel.purpose ? <span className="text-meta text-muted-foreground">{channel.purpose}</span> : null}<span className="text-meta text-muted-foreground">{channel.members.length} 个 Bot · 默认协调 {workspace.bots.find((bot) => bot.bot_id === channel.coordinator_bot)?.name ?? 'Bot 未加载'}</span></Link></li>)}</ul> : <EmptyState icon={MessagesSquare} title={workspace.workspaceState ? '还没有频道' : '正在读取频道'} action={workspace.workspaceState && workspace.bots.length ? <Button type="button" variant="outline" disabled={!workspace.writable} onClick={() => setCreating(true)}>新频道</Button> : undefined} />}
-    <ChannelForm open={creating} onOpenChange={setCreating} />
+    {creating ? <ChannelForm open onOpenChange={setCreating} /> : null}
   </div>
 }
 

@@ -13,7 +13,7 @@ import type { ConversationPayload, ManagerJob, SessionHandoff, SentBotMessage } 
 import { cn } from "@/lib/utils"
 
 /** A read-only view of this conversation's local scheduler and Bot-to-Bot records. */
-export type CollaborationPanelProps = { data: ConversationPayload; botId: string; className?: string }
+type CollaborationPanelProps = { data: ConversationPayload; botId: string; className?: string }
 
 function schedulerTone(state: string): Tone {
   if (state === "failed" || state === "interrupted") return "danger"

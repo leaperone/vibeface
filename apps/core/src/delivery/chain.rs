@@ -359,17 +359,6 @@ impl Chain {
         })
     }
 
-    pub async fn order(&self, order_id: Word) -> Result<OrderState> {
-        self.confirmed_order(order_id).await
-    }
-
-    pub async fn confirmed_order(&self, order_id: Word) -> Result<OrderState> {
-        let position = self.confirmed_position().await?;
-        let result = self.order_at(&position, order_id).await?;
-        self.verify_position(&position).await?;
-        Ok(result)
-    }
-
     pub async fn order_at(&self, position: &ChainPosition, order_id: Word) -> Result<OrderState> {
         let result = self
             .call_at(
@@ -1517,7 +1506,7 @@ pub(super) mod tests {
         Ok(RpcFixture {
             chain: Chain {
                 config,
-                client: reqwest::Client::new(),
+                client: reqwest::Client::builder().no_proxy().build()?,
                 request_id: AtomicU64::new(1),
             },
             requests,
@@ -1922,7 +1911,7 @@ pub(super) mod tests {
         config.rpc_url = format!("http://{}/", listener.local_addr()?);
         let chain = Chain {
             config,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder().no_proxy().build()?,
             request_id: AtomicU64::new(1),
         };
         let policy = super::super::budget::PublicationPolicy {

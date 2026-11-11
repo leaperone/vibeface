@@ -493,7 +493,6 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (item.method === "ack") return !parseNotifications(await connection.rpc("notifications")).some((note) => note.notification_id === item.params.notification_id)
     if (item.method === "create_bot") return parseBots(await connection.rpc("bots")).some((bot) => bot.bot_id === item.params.bot_id)
     if (item.method === "delete_bot") return !parseBots(await connection.rpc("bots")).some((bot) => bot.conversation_id === item.params.conversation_id)
-    // Every unanswered question is listed, so one missing from the list has its answer.
     if (item.method === "set_primary_bot") return parsePrimary(await connection.rpc("bots")) === item.params.conversation_id
     if (item.method === "set_bot_project") {
       const project = parseBots(await connection.rpc("bots")).find((bot) => bot.conversation_id === item.params.conversation_id)?.project ?? null
@@ -510,6 +509,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     }
     // Only what still wants the person is listed, so a missing one is closed or answered either way.
     if (item.method === "dismiss_work") return !parseOpenWorks(await connection.rpc("open_works")).some((work) => work.work_id === item.params.work_id)
+    // Every unanswered question is listed, so one missing from the list has its answer.
     if (item.method === "answer") return !parseQuestions(await connection.rpc("questions")).some((question) => question.question_id === item.params.question_id)
     const id = String(item.params.conversation_id)
     const context = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
@@ -645,7 +645,6 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (!notificationsRef.current.some((item) => item.notification_id === notification.notification_id)) return
     await signedWrite("ack", notification.notification_id, "ack", {
       notification_id: notification.notification_id,
-      client_id: clientId,
       attestation: await attest(notification.conversation_id, { type: "notification_acked", notification_id: notification.notification_id, client_id: clientId }),
     })
     requireCurrent()
