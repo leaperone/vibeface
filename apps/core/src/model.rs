@@ -933,7 +933,7 @@ pub enum EventBody {
     ConversationCreated {
         title: String,
     },
-    /// The user's choice of scheduling Node; the highest epoch wins, ties pick the smaller hash.
+    /// The user's choice of scheduling Node; the highest epoch wins, ties pick the smaller request key.
     /// A bot another bot creates gets its first owner through the user's message `cause`.
     ConversationOwner {
         scheduler_node: DeviceId,

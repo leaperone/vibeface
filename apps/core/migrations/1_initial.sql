@@ -1,10 +1,14 @@
 CREATE TABLE `networks` (`network_id` text NULL, `bundle` text NOT NULL, PRIMARY KEY (`network_id`));
-CREATE TABLE `events` (`network_id` text NOT NULL, `author` text NOT NULL, `seq` integer NOT NULL, `hash` text NOT NULL, `scope_id` text NOT NULL, `lamport` integer NOT NULL, `created_at_ms` integer NOT NULL, `seen_at_ms` integer NOT NULL, `envelope` text NOT NULL, `main` integer NOT NULL, `effective` integer NOT NULL, `kind` text NOT NULL, `subject` text NULL, PRIMARY KEY (`network_id`, `hash`), CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION);
+CREATE TABLE `events` (`network_id` text NOT NULL, `author` text NOT NULL, `seq` integer NOT NULL, `hash` text NOT NULL, `scope_id` text NOT NULL, `lamport` integer NOT NULL, `created_at_ms` integer NOT NULL, `seen_at_ms` integer NOT NULL, `envelope` text NOT NULL, `main` integer NOT NULL, `effective` integer NOT NULL, `kind` text NOT NULL, `subject` text NULL, `causal_chain` text NOT NULL, `causal_clock` text NOT NULL, PRIMARY KEY (`network_id`, `hash`), CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION);
 CREATE UNIQUE INDEX `events_main` ON `events` (`network_id`, `author`, `seq`) WHERE main = 1;
 CREATE INDEX `events_forks` ON `events` (`network_id`, `author`, `seq`) WHERE main = 0;
 CREATE INDEX `events_order` ON `events` (`network_id`, `scope_id`, `lamport`, `created_at_ms`, `hash`);
 CREATE INDEX `events_scope_author` ON `events` (`network_id`, `scope_id`, `author`, `seq`);
 CREATE INDEX `events_kind` ON `events` (`network_id`, `scope_id`, `kind`, `subject`);
+CREATE UNIQUE INDEX `events_causal_chain` ON `events` (`network_id`, `causal_chain`, `seq`);
+CREATE INDEX `events_workspace_causal` ON `events` (`network_id`, `causal_chain`, `seq`) WHERE effective = 1 AND kind IN ('workspace_commanded','input_posted');
+CREATE INDEX `events_workspace_order` ON `events` (`network_id`, `lamport`, `created_at_ms`, `hash`) WHERE effective = 1 AND kind IN ('workspace_commanded','input_posted');
+CREATE INDEX `events_owner_causal` ON `events` (`network_id`, `scope_id`, `causal_chain`, `seq`) WHERE kind = 'conversation_owner';
 CREATE TABLE `event_blobs` (`network_id` text NOT NULL, `hash` text NOT NULL, `blob` text NOT NULL, `size` integer NOT NULL, PRIMARY KEY (`network_id`, `hash`, `blob`));
 CREATE INDEX `event_blobs_blob` ON `event_blobs` (`network_id`, `blob`);
 CREATE TABLE `log_heads` (`network_id` text NOT NULL, `author` text NOT NULL, `max_seq` integer NOT NULL, `head_hash` text NOT NULL, PRIMARY KEY (`network_id`, `author`));

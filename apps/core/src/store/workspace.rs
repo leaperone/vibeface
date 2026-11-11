@@ -1437,55 +1437,37 @@ impl Graph {
     }
 }
 
-fn ancestors(
-    connection: &Connection,
-    network: &str,
-    event: &Event,
-) -> Result<BTreeMap<String, Event>> {
-    let mut pending: Vec<_> = event.prev.iter().chain(&event.deps).cloned().collect();
-    let mut result = BTreeMap::new();
-    while let Some(hash) = pending.pop() {
-        if result.contains_key(&hash) {
-            continue;
-        }
-        let ancestor = log::event_from(connection, network, &hash)?
-            .context("workspace dependency is missing")?;
-        pending.extend(ancestor.prev.iter().chain(&ancestor.deps).cloned());
-        result.insert(hash, ancestor);
-    }
-    Ok(result)
-}
+const WORKSPACE_CAUSAL_QUERY: &str = "SELECT e.hash,e.envelope,e.lamport,e.created_at_ms,e.causal_clock FROM json_each(?2) AS known CROSS JOIN events e WHERE e.network_id=?1 AND e.causal_chain=known.key AND e.seq<=json_extract(known.value,'$.seq') AND e.effective=1 AND e.kind IN ('workspace_commanded','input_posted') ORDER BY e.lamport,e.created_at_ms,e.hash";
+const WORKSPACE_ORDER_QUERY: &str = "SELECT hash,envelope,lamport,created_at_ms,causal_clock FROM events WHERE network_id=? AND effective=1 AND kind IN ('workspace_commanded','input_posted') ORDER BY lamport,created_at_ms,hash";
+const OWNER_CAUSAL_QUERY: &str = "SELECT e.envelope FROM json_each(?2) AS known CROSS JOIN events e WHERE e.network_id=?1 AND e.scope_id=?3 AND e.kind='conversation_owner' AND e.causal_chain=known.key AND e.seq<=json_extract(known.value,'$.seq')";
+
 fn graph_at(
     connection: &Connection,
     network: &str,
-    known: Option<&BTreeMap<String, Event>>,
+    known: Option<&log::CausalClock>,
 ) -> Result<Graph> {
     let mut graph = Graph::default();
-    let mut statement=connection.prepare("SELECT hash,envelope,lamport,created_at_ms FROM events WHERE network_id=? AND effective=1 AND kind IN ('workspace_commanded','input_posted') ORDER BY lamport,created_at_ms,hash")?;
-    let rows = statement.query_map([network], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, u64>(2)?,
-            row.get::<_, i64>(3)?,
-        ))
+    let mut statement = connection.prepare(if known.is_some() {
+        WORKSPACE_CAUSAL_QUERY
+    } else {
+        WORKSPACE_ORDER_QUERY
     })?;
-    for row in rows {
-        let (hash, envelope, lamport, created) = row?;
-        if known.is_some_and(|known| !known.contains_key(&hash)) {
-            continue;
-        }
-        let envelope: SignedEvent = serde_json::from_str(&envelope)?;
+    let clock = known.map(serde_json::to_string).transpose()?;
+    let mut rows = match &clock {
+        Some(clock) => statement.query(params![network, clock])?,
+        None => statement.query([network])?,
+    };
+    while let Some(row) = rows.next()? {
+        let hash: String = row.get(0)?;
+        let envelope: SignedEvent = serde_json::from_str(&row.get::<_, String>(1)?)?;
         let event: Event = serde_json::from_str(&envelope.canonical_body)?;
-        let basis = ancestors(connection, network, &event)?.values().fold(
-            VersionVector::new(),
-            |mut vector, event| {
-                let seq = vector.entry(event.author.clone()).or_default();
-                *seq = (*seq).max(event.seq);
-                vector
-            },
-        );
-        graph.record(&hash, &event, &super::rank(lamport, created, &hash), basis)?;
+        let basis: log::CausalClock = serde_json::from_str(&row.get::<_, String>(4)?)?;
+        graph.record(
+            &hash,
+            &event,
+            &super::rank(row.get(2)?, row.get(3)?, &hash),
+            basis.version_vector(),
+        )?;
     }
     Ok(graph)
 }
@@ -1500,14 +1482,7 @@ pub(crate) fn apply_projection(
     if rank < graph.last_rank.as_str() {
         graph = graph_at(connection, network, None)?;
     } else {
-        let basis = ancestors(connection, network, event)?.values().fold(
-            VersionVector::new(),
-            |mut vector, event| {
-                let seq = vector.entry(event.author.clone()).or_default();
-                *seq = (*seq).max(event.seq);
-                vector
-            },
-        );
+        let basis = log::CausalClock::stored(connection, network, hash)?.version_vector();
         graph.record(hash, event, rank, basis)?;
     }
     graph.save(connection, network)?;
@@ -1533,9 +1508,18 @@ fn bot_scope(connection: &Connection, network: &str, bot_id: &str) -> Result<Str
         .optional()?
         .context("Bot not found in this personal network")
 }
-fn owner_at(known: &BTreeMap<String, Event>, scope: &str) -> Result<(String, u64)> {
+fn owner_at(
+    connection: &Connection,
+    network: &str,
+    known: &log::CausalClock,
+    scope: &str,
+) -> Result<(String, u64)> {
     let mut owners = Vec::new();
-    for event in known.values().filter(|event| event.scope_id == scope) {
+    let mut statement = connection.prepare(OWNER_CAUSAL_QUERY)?;
+    let mut rows = statement.query(params![network, serde_json::to_string(known)?, scope])?;
+    while let Some(row) = rows.next()? {
+        let envelope: SignedEvent = serde_json::from_str(&row.get::<_, String>(0)?)?;
+        let event: Event = serde_json::from_str(&envelope.canonical_body)?;
         if let EventBody::ConversationOwner {
             scheduler_node,
             epoch,
@@ -1555,6 +1539,143 @@ fn owner_at(known: &BTreeMap<String, Event>, scope: &str) -> Result<(String, u64
         .map(|(epoch, _, node)| (node.clone(), *epoch))
         .context("Bot has no causally known owner")
 }
+#[cfg(test)]
+pub(super) fn assert_causal_reads_match_recursive_history(
+    connection: &Connection,
+    network: &str,
+    event: &Event,
+) -> Result<()> {
+    fn ancestors(
+        connection: &Connection,
+        network: &str,
+        event: &Event,
+    ) -> Result<BTreeMap<String, Event>> {
+        let mut pending: Vec<_> = event.prev.iter().chain(&event.deps).cloned().collect();
+        let mut result = BTreeMap::new();
+        while let Some(hash) = pending.pop() {
+            if result.contains_key(&hash) {
+                continue;
+            }
+            let parent =
+                log::event_from(connection, network, &hash)?.context("oracle parent missing")?;
+            pending.extend(parent.prev.iter().chain(&parent.deps).cloned());
+            result.insert(hash, parent);
+        }
+        Ok(result)
+    }
+    fn vector(events: &BTreeMap<String, Event>) -> VersionVector {
+        events
+            .values()
+            .fold(VersionVector::new(), |mut vector, event| {
+                let seq = vector.entry(event.author.clone()).or_default();
+                *seq = (*seq).max(event.seq);
+                vector
+            })
+    }
+    let known = ancestors(connection, network, event)?;
+    let clock = log::CausalClock::before(connection, network, event)?;
+    assert_eq!(clock.version_vector(), vector(&known));
+    for (query, index, causal) in [
+        (WORKSPACE_CAUSAL_QUERY, "events_workspace_causal", true),
+        (WORKSPACE_ORDER_QUERY, "events_workspace_order", false),
+        (OWNER_CAUSAL_QUERY, "events_owner_causal", true),
+    ] {
+        let mut statement = connection.prepare(&format!("EXPLAIN QUERY PLAN {query}"))?;
+        let clock = serde_json::to_string(&clock)?;
+        let mut rows = if query == OWNER_CAUSAL_QUERY {
+            statement.query(params![network, clock, event.scope_id])?
+        } else if causal {
+            statement.query(params![network, clock])?
+        } else {
+            statement.query([network])?
+        };
+        let mut plan = Vec::new();
+        while let Some(row) = rows.next()? {
+            plan.push(row.get::<_, String>(3)?);
+        }
+        assert!(plan.iter().any(|step| step.contains(index)), "{plan:?}");
+        if causal {
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("causal_chain=? AND seq<?")),
+                "{plan:?}"
+            );
+        }
+    }
+    let mut statement = connection.prepare("SELECT hash FROM events WHERE network_id=?")?;
+    for hash in statement.query_map([network], |row| row.get::<_, String>(0))? {
+        let hash = hash?;
+        assert_eq!(
+            clock.contains(connection, network, &hash)?,
+            known.contains_key(&hash),
+            "{hash}"
+        );
+        assert_eq!(
+            clock.event(connection, network, &hash)?,
+            known.get(&hash).cloned()
+        );
+    }
+    if let Some(hash) = known.keys().next() {
+        assert!(!clock.contains(connection, "other-network", hash)?);
+        assert!(clock.event(connection, "other-network", hash)?.is_none());
+    }
+    for causal_only in [false, true] {
+        let mut expected = Graph::default();
+        let mut statement = connection.prepare("SELECT hash,envelope,lamport,created_at_ms FROM events WHERE network_id=? AND effective=1 AND kind IN ('workspace_commanded','input_posted') ORDER BY lamport,created_at_ms,hash")?;
+        let mut rows = statement.query([network])?;
+        while let Some(row) = rows.next()? {
+            let hash: String = row.get(0)?;
+            if causal_only && !known.contains_key(&hash) {
+                continue;
+            }
+            let envelope: SignedEvent = serde_json::from_str(&row.get::<_, String>(1)?)?;
+            let event: Event = serde_json::from_str(&envelope.canonical_body)?;
+            let basis = vector(&ancestors(connection, network, &event)?);
+            expected.record(
+                &hash,
+                &event,
+                &super::rank(row.get(2)?, row.get(3)?, &hash),
+                basis,
+            )?;
+        }
+        assert_eq!(
+            serde_json::to_value(graph_at(
+                connection,
+                network,
+                causal_only.then_some(&clock)
+            )?)?,
+            serde_json::to_value(expected)?,
+        );
+    }
+    let scopes: BTreeSet<_> = known
+        .values()
+        .map(|event| event.scope_id.as_str())
+        .collect();
+    for scope in scopes {
+        let mut owners = Vec::new();
+        for event in known.values().filter(|event| event.scope_id == scope) {
+            if let EventBody::ConversationOwner {
+                scheduler_node,
+                epoch,
+                ..
+            } = &event.body
+            {
+                owners.push((
+                    *epoch,
+                    request_key(network, scope, &event.body, &event.author)?,
+                    scheduler_node.clone(),
+                ));
+            }
+        }
+        owners.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let expected = owners
+            .first()
+            .map(|(epoch, _, node)| (node.clone(), *epoch));
+        assert_eq!(owner_at(connection, network, &clock, scope).ok(), expected);
+    }
+    Ok(())
+}
+
 fn direct_parent(event: &Event, hash: &str) -> bool {
     event.prev.as_deref() == Some(hash) || event.deps.iter().any(|parent| parent == hash)
 }
@@ -1567,7 +1688,7 @@ fn assignment_reply_source_matches_from(
     input: &str,
     proof: &Event,
 ) -> Result<bool> {
-    let known = ancestors(connection, network, proof)?;
+    let known = log::CausalClock::before(connection, network, proof)?;
     let at_reply = graph_at(connection, network, Some(&known))?;
     let Some(task) = at_reply.tasks.get(&assignment.task_id) else {
         return Ok(false);
@@ -1597,15 +1718,17 @@ fn assignment_reply_source_matches_from(
         return Ok(source.conversation_id == proof.scope_id
             && target_task(&source.input.route.target) == Some(assignment.task_id.as_str())
             && (source.input.route.expected_revision == Some(revision) || submitted)
-            && known.get(&source.source_event).is_some_and(|event| {
-                matches!(
-                    &event.body,
-                    EventBody::InputPosted {
-                        attestation: Some(_),
-                        ..
-                    }
-                )
-            }));
+            && known
+                .event(connection, network, &source.source_event)?
+                .is_some_and(|event| {
+                    matches!(
+                        &event.body,
+                        EventBody::InputPosted {
+                            attestation: Some(_),
+                            ..
+                        }
+                    )
+                }));
     }
     let Some(answer) = super::message_from(connection, network, &proof.scope_id, input)?
         .filter(|answer| answer.role == Role::User)
@@ -1615,7 +1738,7 @@ fn assignment_reply_source_matches_from(
     let Some(question) = answer.answers.as_deref() else {
         return Ok(false);
     };
-    if !known.get(&answer.event_hash).is_some_and(|event| {
+    if !known.event(connection, network, &answer.event_hash)?.is_some_and(|event| {
         matches!(&event.body, EventBody::MessagePosted { role: Role::User, answers: Some(id), attestation: Some(_), .. } if id == question)
     }) {
         return Ok(false);
@@ -1638,14 +1761,14 @@ fn assignment_reply_source_matches_from(
     else {
         return Ok(false);
     };
-    if !known.contains_key(&asked.hash)
+    if !known.contains(connection, network, &asked.hash)?
         || asked.event.author != assignment.execution_node
         || about.node != assignment.execution_node
         || target_task(target) != Some(assignment.task_id.as_str())
     {
         return Ok(false);
     }
-    let question_known = ancestors(connection, network, &asked.event)?;
+    let question_known = log::CausalClock::before(connection, network, &asked.event)?;
     let at_question = graph_at(connection, network, Some(&question_known))?;
     let Some(question_task) = at_question.tasks.get(&assignment.task_id) else {
         return Ok(false);
@@ -1687,7 +1810,7 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
     ) {
         return Ok(());
     }
-    let known = ancestors(connection, network, event)?;
+    let known = log::CausalClock::before(connection, network, event)?;
     let mut graph = graph_at(connection, network, Some(&known))?;
     let projected = Graph::read(connection, network)?;
     match &event.body {
@@ -1804,7 +1927,7 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
                         "not-started evidence must name its original source"
                     );
                     let original = known
-                        .get(source)
+                        .event(connection, network, source)?
                         .context("original task input is missing")?;
                     ensure!(
                         matches!(&original.body, EventBody::InputPosted { message_id, target, expected_revision, .. } if assignment.trigger_message_id.as_ref() == Some(message_id) && target_task(target) == Some(assignment.task_id.as_str()) && *expected_revision == Some(assignment.started_revision)),
@@ -1812,7 +1935,9 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
                     );
                     let proof = evidence_event
                         .as_ref()
-                        .and_then(|hash| known.get(hash))
+                        .context("not-started evidence needs its failed reply")?;
+                    let proof = known
+                        .event(connection, network, proof)?
                         .context("not-started evidence needs its failed reply")?;
                     ensure!(
                         proof.author == assignment.execution_node
@@ -1829,7 +1954,9 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
                         direct_parent(event, input),
                         "adopted input must be a direct dependency"
                     );
-                    let input = known.get(input).context("adopted input is missing")?;
+                    let input = known
+                        .event(connection, network, input)?
+                        .context("adopted input is missing")?;
                     let valid = match &input.body {
                         EventBody::InputPosted {
                             target,
@@ -1859,7 +1986,9 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
                         direct_parent(event, proof),
                         "assignment evidence must be a direct dependency"
                     );
-                    let proof = known.get(proof).context("assignment evidence is missing")?;
+                    let proof = known
+                        .event(connection, network, proof)?
+                        .context("assignment evidence is missing")?;
                     ensure!(
                         proof.author == assignment.execution_node,
                         "assignment evidence comes from another Node"
@@ -1908,7 +2037,7 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
                             );
                             ensure!(
                                 assignment_reply_source_matches_from(
-                                    connection, network, assignment, *revision, input, proof,
+                                    connection, network, assignment, *revision, input, &proof,
                                 )?,
                                 "assignment reply is outside this task revision"
                             );
@@ -1934,27 +2063,20 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
                 let cause = cause
                     .as_ref()
                     .context("Bot commands need the user's signed request")?;
-                let source = known
-                    .iter()
-                    .find(|(hash, parent)| {
-                        direct_parent(event, hash)
-                            && parent.scope_id == cause.conversation_id
-                            && match &parent.body {
-                                EventBody::InputPosted {
-                                    message_id,
-                                    attestation: Some(_),
-                                    ..
-                                } => message_id == &cause.message_id,
-                                _ => false,
-                            }
-                    })
-                    .map(|(_, event)| event)
-                    .context("Bot command must directly follow the user's signed request")?;
-                let cause_hash = known
-                    .iter()
-                    .find(|(_, candidate)| std::ptr::eq(*candidate, source))
-                    .map(|(hash, _)| hash.as_str())
-                    .context("command cause is missing")?;
+                let mut source = None;
+                for hash in event.prev.iter().chain(&event.deps) {
+                    let parent = known
+                        .event(connection, network, hash)?
+                        .context("command dependency is missing")?;
+                    if parent.scope_id == cause.conversation_id
+                        && matches!(&parent.body, EventBody::InputPosted { message_id, attestation: Some(_), .. } if message_id == &cause.message_id)
+                        && source.as_ref().is_none_or(|(prior, _)| hash < *prior)
+                    {
+                        source = Some((hash, parent));
+                    }
+                }
+                let (cause_hash, source) =
+                    source.context("Bot command must directly follow the user's signed request")?;
                 let delegated = acting_assignment
                     .as_ref()
                     .map(|id| {
@@ -1969,7 +2091,7 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
                         ensure!(
                             direct_parent(event, &assignment.event_hash)
                                 && assignment.execution_node == event.author
-                                && assignment.source_event.as_deref() == Some(cause_hash),
+                                && assignment.source_event.as_deref() == Some(cause_hash.as_str()),
                             "acting assignment is outside the command source or Node"
                         );
                         ensure!(
@@ -1984,7 +2106,7 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
                             "acting assignment is no longer active"
                         );
                         let scope = bot_scope(connection, network, &assignment.bot_id)?;
-                        let (owner, epoch) = owner_at(&known, &scope)?;
+                        let (owner, epoch) = owner_at(connection, network, &known, &scope)?;
                         ensure!(
                             epoch == assignment.bot_owner_epoch
                                 && (assignment.work_id.is_some()
@@ -2011,7 +2133,8 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
                     .or(source_task);
                 ensure!(
                     delegated.is_some()
-                        || owner_at(&known, &cause.conversation_id)?.0 == event.author,
+                        || owner_at(connection, network, &known, &cause.conversation_id)?.0
+                            == event.author,
                     "only the request Bot's owner or its delegated assignment issues commands"
                 );
                 if let Some(task_id) = acting_task {
@@ -2044,7 +2167,7 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
                         "input control version changed"
                     );
                     let source = known
-                        .get(&input.source_event)
+                        .event(connection, network, &input.source_event)?
                         .context("input control source is missing")?;
                     let owner = match &input.target {
                         InputTarget::Work { work_id } => {
@@ -2052,7 +2175,7 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
                                 .context("controlled Work is missing")?
                                 .target_node
                         }
-                        _ => owner_at(&known, &source.scope_id)?.0,
+                        _ => owner_at(connection, network, &known, &source.scope_id)?.0,
                     };
                     ensure!(
                         owner == event.author,
@@ -2098,11 +2221,14 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
                     bot_scope(connection, network, owner_bot)?;
                     for hash in source_events {
                         ensure!(
-                            direct_parent(event, hash) && known.contains_key(hash),
+                            direct_parent(event, hash)
+                                && known.contains(connection, network, hash)?,
                             "task source must be a known direct dependency"
                         );
                         if attestation.is_none() {
-                            let source = &known[hash];
+                            let source = known
+                                .event(connection, network, hash)?
+                                .context("task source is missing")?;
                             let acting = cause.as_ref().expect("validated cause");
                             let cause_input =
                                 workspace_input_from(connection, network, &acting.message_id)?;
@@ -2148,7 +2274,7 @@ pub(crate) fn authorize_event(connection: &Connection, network: &str, event: &Ev
                 } => {
                     membership_from(connection, network)?.node(execution_node)?;
                     let scope = bot_scope(connection, network, bot_id)?;
-                    let (owner, epoch) = owner_at(&known, &scope)?;
+                    let (owner, epoch) = owner_at(connection, network, &known, &scope)?;
                     ensure!(epoch == *bot_owner_epoch, "Bot owner epoch changed");
                     if let Some(work_id) = work_id {
                         let work = super::reduce::work_from(connection, network, work_id)?
@@ -2886,6 +3012,7 @@ impl Store {
             stored.source_event == envelope.hash,
             "input ID is already used by another message"
         );
+        super::scheduler::queue_workspace_input_admission_from(&tx, network, &input.message_id)?;
         tx.commit()?;
         Ok(stored)
     }
@@ -4166,8 +4293,10 @@ fn history_speaker(
             role: Role::Assistant,
             ..
         } => {
-            let known = ancestors(connection, network, event)?;
-            if owner_at(&known, &event.scope_id).is_ok_and(|(owner, _)| owner == event.author) {
+            let known = log::CausalClock::before(connection, network, event)?;
+            if owner_at(connection, network, &known, &event.scope_id)
+                .is_ok_and(|(owner, _)| owner == event.author)
+            {
                 connection
                     .query_row(
                         "SELECT bot_id FROM bots WHERE network_id=? AND conversation_id=?",
@@ -4542,7 +4671,7 @@ pub(crate) fn assignment_work_source_matches_from(
     {
         return Ok(false);
     }
-    let mut known = BTreeMap::new();
+    let mut known = log::CausalClock::default();
     for hash in refs {
         if connection
             .query_row(
@@ -4555,11 +4684,7 @@ pub(crate) fn assignment_work_source_matches_from(
         {
             return Ok(false);
         }
-        let Some(event) = log::event_from(connection, network, hash)? else {
-            return Ok(false);
-        };
-        known.extend(ancestors(connection, network, &event)?);
-        known.insert(hash.clone(), event);
+        known.include(connection, network, hash)?;
     }
     let graph = graph_at(connection, network, Some(&known))?;
     let Some(assignment) = graph.assignments.get(assignment_id) else {
@@ -4580,7 +4705,7 @@ pub(crate) fn assignment_work_source_matches_from(
         return Ok(false);
     }
     let scope = bot_scope(connection, network, &assignment.bot_id)?;
-    let (owner, epoch) = owner_at(&known, &scope)?;
+    let (owner, epoch) = owner_at(connection, network, &known, &scope)?;
     if epoch != assignment.bot_owner_epoch
         || (assignment.work_id.is_none() && owner != assignment.execution_node)
     {
@@ -5066,7 +5191,7 @@ fn assignment_for_input_from(
     }
     let source = log::event_from(connection, network, &input.source_event)?
         .context("task input source is missing")?;
-    let known = ancestors(connection, network, &source)?;
+    let known = log::CausalClock::before(connection, network, &source)?;
     let at_input = graph_at(connection, network, Some(&known))?;
     if let Some(task) = at_input.tasks.get(task_id) {
         if input.input.route.expected_revision != Some(task.revision) {
@@ -5431,7 +5556,7 @@ pub(crate) fn workspace_assignment_for_job_from(
         {
             return Ok(None);
         }
-        let known = ancestors(connection, network, &asked.event)?;
+        let known = log::CausalClock::before(connection, network, &asked.event)?;
         let at_question = graph_at(connection, network, Some(&known))?;
         let Some(task) = at_question.tasks.get(&task_id) else {
             return Ok(None);
