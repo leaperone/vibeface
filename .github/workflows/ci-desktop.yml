@@ -94,7 +94,17 @@ jobs:
       - name: Test the native desktop features
         id: native_features
         continue-on-error: true
-        run: cargo test -p vibeface-desktop --features native-ui-tests --locked
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          if [[ "$TARGET" == aarch64-unknown-linux-gnu ]]; then
+            bash scripts/ci-runner-load.sh &
+            VIBEFACE_LOAD_PID=$!
+            trap 'kill "$VIBEFACE_LOAD_PID" 2>/dev/null || true; wait "$VIBEFACE_LOAD_PID" 2>/dev/null || true' EXIT
+            CARGO_BUILD_JOBS=1 /usr/bin/time -v cargo test -p vibeface-desktop --features native-ui-tests --locked
+          else
+            cargo test -p vibeface-desktop --features native-ui-tests --locked
+          fi
       - name: Build the desktop application around the verified runtime
         env:
           TARGET: ${{ inputs.target }}

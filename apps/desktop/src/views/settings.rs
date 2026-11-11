@@ -7,6 +7,7 @@ use crate::{
     },
 };
 use gpui_kit::{
+    base::TestTextExt as _,
     component::{Disableable, button::Button},
     *,
 };
@@ -1107,20 +1108,31 @@ impl Desktop {
 
 impl Desktop {
     fn transfer_order_review(&self, order: &TransferOrder) -> AnyElement {
+        let details: SharedString = format!(
+            "原订单 {}\n原意图 {}\n{} 字节 · 摘要 {}",
+            order.order_id,
+            order.intent_id,
+            order.bytes,
+            order.sha256.as_deref().unwrap_or("未提供")
+        )
+        .into();
+        let fee: SharedString = format!(
+            "原服务费 {} · {}个片段",
+            order.payment.total,
+            order.windows.len()
+        )
+        .into();
         let mut review = div()
             .flex()
             .flex_col()
             .gap_2()
-            .child(self.row(
-                order.name.clone().unwrap_or_else(|| "加密文件".into()),
-                format!(
-                    "原订单 {}\n原意图 {}\n{} 字节 · 摘要 {}",
-                    order.order_id,
-                    order.intent_id,
-                    order.bytes,
-                    order.sha256.as_deref().unwrap_or("未提供")
-                ),
-            ))
+            .child(
+                self.row(
+                    order.name.clone().unwrap_or_else(|| "加密文件".into()),
+                    details.clone(),
+                )
+                .test_text(details),
+            )
             .child(format!(
                 "来源 {} · 接收 {} · 中转 {}",
                 order.source_peer, order.receiver_peer, order.provider_peer
@@ -1133,11 +1145,7 @@ impl Desktop {
                 order.payment.chain_id.as_deref().unwrap_or("无"),
                 order.payment.asset.as_deref().unwrap_or("无")
             ))
-            .child(format!(
-                "原服务费 {} · {}个片段",
-                order.payment.total,
-                order.windows.len()
-            ))
+            .child(fee.clone().test_text(fee))
             .child(
                 div()
                     .id(SharedString::from(format!(
@@ -1146,11 +1154,12 @@ impl Desktop {
                     )))
                     .role(Role::Note)
                     .aria_label(order_fee_authorization_label(order))
-                    .child(order_fee_authorization_label(order)),
+                    .child(order_fee_authorization_label(order))
+                    .test_support(),
             )
             .child(transfer_publication_label(order));
         if let Some(deadline) = &order.deadlines {
-            review = review.child(format!(
+            let text: SharedString = format!(
                 "原截止时间（Unix秒）：报价 {} · 持有 {} · 密钥 {} · 打开 {} · 保留 {} · 时效 {}",
                 deadline.quote_expires_at,
                 deadline.hold_deadline,
@@ -1158,7 +1167,9 @@ impl Desktop {
                 deadline.open_deadline,
                 deadline.retain_until,
                 deadline.priority_deadline
-            ));
+            )
+            .into();
+            review = review.child(text.clone().test_text(text));
         }
         if let Some(risk) = order
             .payment
@@ -1235,14 +1246,16 @@ impl Desktop {
                             .id("delivery-payer-chain-fee-cap")
                             .role(Role::Note)
                             .aria_label(format!("本机记录的付款方累计链费上限 {}", budget.gas_cap))
-                            .child(format!("本机记录的付款方累计链费上限 {}", budget.gas_cap)),
+                            .child(format!("本机记录的付款方累计链费上限 {}", budget.gas_cap))
+                            .test_support(),
                     )
                     .child(
                         div()
                             .id("delivery-provider-spending-note")
                             .role(Role::Note)
                             .aria_label(RELAY_FEE_AUTHORIZATION_NOTE)
-                            .child(RELAY_FEE_AUTHORIZATION_NOTE),
+                            .child(RELAY_FEE_AUTHORIZATION_NOTE)
+                            .test_support(),
                     );
                 for window in &budget.ready_windows {
                     review = review.child(format!(
@@ -1257,6 +1270,6 @@ impl Desktop {
             }
             _ => return None,
         }
-        Some(review.child("确认只提交这次意图。设备接收不代表付款、收入或到账已完成；结果未知时先检查原订单、原预算和原批次，不自动再次提交。预算建立、充值和钱包解锁仍通过发送设备现有CLI本机维护。").into_any_element())
+        Some(review.child("确认只提交这次意图。设备接收不代表付款、收入或到账已完成；结果未知时先检查原订单、原预算和原批次，不自动再次提交。预算建立、充值和钱包解锁仍通过发送设备现有CLI本机维护。").test_support().into_any_element())
     }
 }

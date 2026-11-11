@@ -1346,6 +1346,42 @@ mod prepaid_delivery {
         }
     }
 
+    fn assert_original_order_texts(window: &gpui_kit::Window, sha256: &str) {
+        let review = window.find("delivery-financial-review");
+        assert_eq!(review.role(), Some(Role::Group));
+        assert!(review.visible());
+        let texts: Vec<_> = gpui_kit::base::test_support::texts(window)
+            .into_iter()
+            .filter(|text| text.path().starts_with(review.path()) && !text.is_alternative())
+            .map(|text| text.text().to_owned())
+            .collect();
+        for (digit, intent) in [('d', 1), ('e', 2)] {
+            assert!(texts.contains(&format!(
+                "原订单 {}\n原意图 00000000-0000-4000-8000-00000000000{intent}\n4 字节 · 摘要 {sha256}",
+                digit.to_string().repeat(64)
+            )));
+        }
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|text| text.starts_with("原服务费 "))
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["原服务费 10 · 1个片段"; 2]
+        );
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|text| text.starts_with("原截止时间"))
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec![
+                "原截止时间（Unix秒）：报价 2000000000 · 持有 2000000100 · 密钥 2000000200 · 打开 2000000300 · 保留 2000000400 · 时效 2000000150";
+                2
+            ]
+        );
+    }
+
     #[gpui_kit::test]
     fn two_original_orders_are_reviewed_before_batch_confirmation(cx: &mut TestAppContext) {
         let mut h = open(cx, snapshot("sender"));
@@ -1355,12 +1391,19 @@ mod prepaid_delivery {
             let mut next = (*view.snapshot).clone();
             next.delivery.orders[0].payment.delivery_fee = "94".into();
             next.delivery.orders[0].payment.total = "99".into();
+            next.delivery.orders[0].payment.gas_cap = "88".into();
+            next.delivery.orders[0]
+                .deadlines
+                .as_mut()
+                .unwrap()
+                .quote_expires_at = 2000000999;
             view.snapshot = Arc::new(next);
             cx.notify();
         });
         h.window
             .update(cx, |_, window, cx| {
                 window.render_frame(cx);
+                assert_original_order_texts(window, &"f".repeat(64));
                 assert_eq!(
                     window.find("delivery-financial-review").label(),
                     Some(
@@ -1392,6 +1435,11 @@ mod prepaid_delivery {
                 assert_eq!(orders[1].order_id, "e".repeat(64));
                 assert_eq!(orders[0].payment.total, "10");
                 assert_eq!(orders[1].payment.total, "10");
+                assert_eq!(orders[0].payment.gas_cap, "7");
+                assert_eq!(
+                    orders[0].deadlines.as_ref().unwrap().quote_expires_at,
+                    2000000000
+                );
             }
             _ => panic!("not the reviewed pair"),
         }
@@ -1403,6 +1451,12 @@ mod prepaid_delivery {
         let mut h = open(cx, snapshot("receiver"));
         click(&h, cx, &format!("accept-batch-{}", "2".repeat(64)));
         assert!(h.commands.try_recv().is_err());
+        h.window
+            .update(cx, |_, window, cx| {
+                window.render_frame(cx);
+                assert_original_order_texts(window, &"f".repeat(64));
+            })
+            .unwrap();
         click(&h, cx, "confirm-danger");
         assert!(matches!(command(&mut h), Command::DeliveryAcceptBatch(_)));
         let mut state = snapshot("provider");
@@ -1425,6 +1479,7 @@ mod prepaid_delivery {
         assert!(h.commands.try_recv().is_err());
         h.window.update(cx,|_,window,cx| {
             window.render_frame(cx);
+            assert_original_order_texts(window, "未提供");
             let review=window.within("delivery-financial-review");
             assert_eq!(review.find("delivery-payer-chain-fee-cap").label(),Some("本机记录的付款方累计链费上限 0"));
             assert_eq!(review.find("delivery-provider-spending-note").label(),Some("中转设备的链费支出沿用本机既有授权、限额和公开规则；付款方的金额不是中转设备的支出限额。"));
