@@ -1353,10 +1353,11 @@ impl CheckedHistory<'_> {
                 GovernanceAction::Approve {
                     checkpoint: target,
                     at_ms,
-                } if target == hash && *at_ms < checkpoint.effective_at_ms() => {
-                    if approval.as_ref().is_none_or(|(known, _)| *at_ms < *known) {
-                        approval = Some((*at_ms, event_hash.clone()));
-                    }
+                } if target == hash
+                    && *at_ms < checkpoint.effective_at_ms()
+                    && approval.as_ref().is_none_or(|(known, _)| *at_ms < *known) =>
+                {
+                    approval = Some((*at_ms, event_hash.clone()));
                 }
                 _ => {}
             }
