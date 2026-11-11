@@ -335,13 +335,17 @@ impl Store {
         )
     }
     /// Calls `written` whenever any log head is written, whichever path appended or ingested it.
-    pub(crate) fn on_log_head_written(&self, written: impl Fn() + Send + 'static) {
+    pub(crate) fn on_log_head_written(
+        &mut self,
+        written: impl Fn() + Send + 'static,
+    ) -> Result<()> {
         self.connection
             .update_hook(Some(move |_, _: &str, table: &str, _| {
                 if table == "log_heads" {
                     written();
                 }
-            }));
+            }))?;
+        Ok(())
     }
     /// The member record of a current, unrevoked Node.
     pub fn authorize_node(&self, network_id: &str, device_id: &str) -> Result<Member> {

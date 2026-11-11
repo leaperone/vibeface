@@ -1640,16 +1640,18 @@ async fn authentication(node: &Runtime, session: &Session) -> Result<Value> {
 fn recovery_status(state: &NetworkState, view: &AuthorizationView, device: &str) -> Result<Value> {
     let manages = |members: &[Member]| members.iter().any(|m| m.device_id == device && m.manage);
     if let Some(pending) = view.pending.as_ref().filter(|p| manages(&p.members)) {
-        return Ok(json!({"status":"waiting","effective_at_ms":pending.effective_at_ms}));
+        return Ok(
+            json!({"status":"waiting","checkpoint":pending.checkpoint,"effective_at_ms":pending.effective_at_ms}),
+        );
     }
-    for checkpoint in &state.checkpoints {
+    for checkpoint in state.checkpoints.iter().rev() {
         if checkpoint
             .directory
             .as_ref()
             .is_some_and(|d| manages(&d.members))
             && view.stopped.contains(&checkpoint.hash()?)
         {
-            return Ok(json!({"status":"stopped"}));
+            return Ok(json!({"status":"stopped","checkpoint":checkpoint.hash()?}));
         }
     }
     Ok(Value::Null)
@@ -4191,6 +4193,54 @@ mod tests {
         result
     }
 
+    #[test]
+    fn recovery_status_returns_the_latest_stopped_checkpoint_for_this_client() -> Result<()> {
+        let (root, manager, node, recovering) = (
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+        );
+        let mut state = NetworkState::new(Genesis::create(
+            &root,
+            Member::client(&manager, "manager", true)?,
+            Member::node(&node, "node")?,
+        )?)?;
+        let now = crate::runtime::now_ms() as u64 - 100;
+        let mut latest = String::new();
+        for at_ms in [now, now + 1] {
+            let mut members = state.genesis.members();
+            members.push(Member::client(&recovering, "recovering", true)?);
+            let checkpoint = RootCheckpoint::recovery(
+                &state,
+                &root,
+                &LocalIdentity::generate().device_id()?,
+                members,
+                vec![],
+                at_ms,
+            )?;
+            latest = checkpoint.hash()?;
+            state.recover_at(checkpoint, at_ms)?;
+            let veto = GovernanceEvent::unsigned(
+                &state.project_at(at_ms)?,
+                &manager.device_id()?,
+                GovernanceAction::Veto {
+                    checkpoint: latest.clone(),
+                    at_ms,
+                },
+            )?
+            .sign(&manager)?;
+            state.append(veto)?;
+        }
+        let view = state.project_at(now + 2)?;
+        assert_eq!(view.stopped.len(), 2);
+        assert_eq!(
+            recovery_status(&state, &view, &recovering.device_id()?)?,
+            json!({"status":"stopped","checkpoint":latest})
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn approve_recovery_accepts_a_near_due_checkpoint_and_is_idempotent() -> Result<()> {
         use crate::config::{self, Config};
@@ -4538,6 +4588,7 @@ mod tests {
             assert_eq!(next_push(&mut manager).await?, json!({"type":"changed"}), "a waiting recovery reaches open manager pages at once");
             assert_eq!((&waiting["principal"], &waiting["recovery"]["status"]), (&Value::Null, &json!("waiting")));
             assert_eq!(waiting["recovery"]["effective_at_ms"], checkpoint.effective_at_ms());
+            assert_eq!(waiting["recovery"]["checkpoint"], checkpoint.hash()?);
             assert_eq!(recovering.call("recover", submit(vec![&checkpoint])).await?["recovery"], waiting["recovery"], "a retry changes nothing");
             assert!(recovering.call("directory", json!({})).await.is_err(), "a waiting device reads nothing");
             let seen = manager.call("authenticate", json!({})).await?;
@@ -4548,7 +4599,9 @@ mod tests {
             let stopped = manager.call("veto", json!({"event":veto})).await?;
             assert_eq!(stopped["view"]["stopped"], json!([checkpoint.hash()?]));
             assert_eq!(manager.call("veto", json!({"event":veto})).await?["view"], stopped["view"], "a retry changes nothing");
-            assert_eq!(recovering.call("authenticate", json!({})).await?["recovery"]["status"], "stopped");
+            let stopped_recovery = recovering.call("authenticate", json!({})).await?;
+            assert_eq!(stopped_recovery["recovery"]["status"], "stopped");
+            assert_eq!(stopped_recovery["recovery"]["checkpoint"], checkpoint.hash()?);
             refused(recovering.call("recovery_state", read_with(&next, &[&checkpoint])?).await.unwrap_err(), vibeface_secure::membership::RECOVERY_STOPPED);
             recovering.call("recovery_state", read(&root)?).await?;
             // A guest sends events only to carry its file's vetoes; anything else is dropped.

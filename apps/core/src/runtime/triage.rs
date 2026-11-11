@@ -9,7 +9,10 @@ use crate::{
     model::{AttentionKind, AttentionRequest, Choice, EventBody, Subject},
     net,
     providers::Provider,
-    store::triage::{BudgetStatus, TriageAdmission},
+    store::{
+        admission::AdmissionRejected,
+        triage::{BudgetStatus, TriageAdmission},
+    },
     triage::{
         self, AgentEvent, AnswerAuthority, AnswerResponse, Delivery, HeldAnswerControl,
         HeldAnswerRequest, HookRequest, OutboxEntry, RequestKind, Severity, TriageConfig,
@@ -1272,7 +1275,7 @@ impl Runtime {
         };
         ensure!(
             question["about"]["node"] == node,
-            "this Node does not hold the answer's request"
+            AdmissionRejected::new("this Node does not hold the answer's request")
         );
         if let Some(receipt) = store.held_answer_receipt(network, conversation, message_id)? {
             return Ok(Some(receipt));
@@ -1280,10 +1283,12 @@ impl Runtime {
         let request = lock(&self.triage.requests)
             .get(request_id)
             .cloned()
-            .context("the original request is no longer waiting on this Node")?;
+            .context(AdmissionRejected::new(
+                "the original request is no longer waiting on this Node",
+            ))?;
         ensure!(
             request.question_id.as_deref() == Some(question_id),
-            "the held request belongs to another question"
+            AdmissionRejected::new("the held request belongs to another question")
         );
         store.queue_answer_control(
             network,
@@ -4736,6 +4741,56 @@ pub(super) mod tests {
             assert_eq!(
                 answered_once(&mut server).await["result"],
                 json!({"decision":"decline"})
+            );
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn explicit_approval_answers_bypass_exhausted_triage_budget_once() -> Result<()> {
+        with_node(async |node, admin, _| {
+            with_agent(&node);
+            bot(&node, &admin, "c", "Approval", &["t-1"]).await?;
+            let network = node.network_id().await?;
+            let (mut server, handed) = app_server(&node).await?;
+            node.on_codex_request(&handed).await;
+            let (question, request_id) = raise_for(&node).await?;
+            let limit = node.config.daily_decision_limit;
+            node.store.lock().await.connection.execute(
+                "INSERT INTO budget_days(network_id,day,used) VALUES(?1,date('now'),?2)",
+                rusqlite::params![format!("triage:{network}"), limit],
+            )?;
+            node.ingest_agent_event(turn("ordinary-pending", "ordinary-turn", "/tmp"))
+                .await?;
+            signed_answer_fact(&node, &admin, &question, "允许本次").await?;
+            node.expire_requests().await?;
+            assert!(
+                lock(&node.triage.requests)[&request_id]
+                    .answer_by_ms
+                    .is_some()
+            );
+            node.wake_agent().await?;
+            assert_eq!(
+                answered_once(&mut server).await["result"],
+                json!({"decision":"accept"})
+            );
+            assert!(!lock(&node.triage.requests).contains_key(&request_id));
+            assert_eq!(node.triage_status().await?["budget"]["used"], limit + 1);
+            node.wake_agent().await?;
+            assert_eq!(
+                node.triage_status().await?["budget"]["used"],
+                limit + 1,
+                "the explicit answer is charged once"
+            );
+            assert_eq!(
+                node.pending_events().await?.len(),
+                1,
+                "ordinary triage remains paused after the explicit answer"
+            );
+            assert_eq!(
+                node.triage_status().await?["budget"]["paused_reason"],
+                "budget_exhausted"
             );
             Ok::<_, anyhow::Error>(())
         })

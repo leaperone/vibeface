@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The header the relay front sets to its connection number; a client's own copy is removed.
+/// The header the relay front sets to its private binding; a client's own copy is removed.
 pub const FRONT_HEADER: &str = "x-vibeface-front";
 pub const GRANT_DOMAIN: &str = "relay-grant";
 /// Adopted relays kept in the relay map.
@@ -229,13 +229,12 @@ fn prefix(ip: IpAddr) -> Prefix {
     }
 }
 
-/// What each endpoint moves through this Node's relay. The front numbers its connections and
-/// counts their bytes; the relay names the endpoint behind a number once it admits it.
+/// What each endpoint moves through this Node's relay. The front gives each connection a
+/// private binding and counts its bytes; the relay binds the endpoint once it admits it.
 #[derive(Default)]
 pub struct Usage {
     db: Option<Arc<RelayDb>>,
-    next: AtomicU64,
-    live: Mutex<HashMap<u64, Live>>,
+    live: Mutex<HashMap<String, Live>>,
 }
 
 struct Live {
@@ -250,10 +249,10 @@ pub(super) struct Counter {
 }
 
 /// Flushes and forgets a front connection when it ends.
-pub(super) struct FrontGuard(Arc<Usage>, u64);
+pub(super) struct FrontGuard(Arc<Usage>, String);
 impl Drop for FrontGuard {
     fn drop(&mut self) {
-        self.0.close_front(self.1);
+        self.0.close_front(&self.1);
     }
 }
 
@@ -269,30 +268,30 @@ impl Usage {
         self.db.as_ref()
     }
 
-    pub(super) fn open_front(self: &Arc<Self>) -> (u64, Arc<Counter>, FrontGuard) {
-        let front = self.next.fetch_add(1, Ordering::Relaxed);
+    pub(super) fn open_front(self: &Arc<Self>) -> (String, Arc<Counter>, FrontGuard) {
+        let front = crate::crypto::random_hex(32);
         let counter = Arc::new(Counter::default());
         self.live.lock().expect("relay usage").insert(
-            front,
+            front.clone(),
             Live {
                 endpoint: None,
                 counter: counter.clone(),
             },
         );
-        (front, counter, FrontGuard(self.clone(), front))
+        (front.clone(), counter, FrontGuard(self.clone(), front))
     }
 
     /// The relay admitted `request`: its front connection carries this endpoint from now on.
-    pub fn bind(&self, request: &iroh_relay::server::ClientRequest) {
-        let Some(front) = request
-            .headers()
-            .get(FRONT_HEADER)
-            .and_then(|value| value.to_str().ok()?.parse::<u64>().ok())
-        else {
-            return;
+    pub fn bind(&self, request: &iroh_relay::server::ClientRequest) -> bool {
+        let mut headers = request.headers().get_all(FRONT_HEADER).iter();
+        let Some(front) = headers.next().and_then(|value| value.to_str().ok()) else {
+            return false;
         };
+        if headers.next().is_some() {
+            return false;
+        }
         let endpoint = super::device_id(&request.endpoint_id());
-        let bound = match self.live.lock().expect("relay usage").get_mut(&front) {
+        let bound = match self.live.lock().expect("relay usage").get_mut(front) {
             Some(live) if live.endpoint.is_none() => {
                 live.endpoint = Some(endpoint.clone());
                 true
@@ -302,6 +301,7 @@ impl Usage {
         if bound && let Some(db) = &self.db {
             db.add_usage(&endpoint, 0, 0, 1);
         }
+        bound
     }
 
     fn take(&self, live: &Live) -> Option<(String, u64, u64)> {
@@ -323,8 +323,8 @@ impl Usage {
         self.write(pending);
     }
 
-    fn close_front(&self, front: u64) {
-        let live = self.live.lock().expect("relay usage").remove(&front);
+    fn close_front(&self, front: &str) {
+        let live = self.live.lock().expect("relay usage").remove(front);
         self.write(live.iter().filter_map(|live| self.take(live)).collect());
     }
 
@@ -341,7 +341,7 @@ impl Usage {
 /// of any the client sent, followed by whatever came after the head.
 pub(super) async fn read_head(
     client: &mut tokio::net::TcpStream,
-    front: u64,
+    front: &str,
 ) -> Option<(Vec<u8>, usize)> {
     use tokio::io::AsyncReadExt as _;
     let mut buffer = Vec::with_capacity(1024);
@@ -362,7 +362,7 @@ pub(super) async fn read_head(
     }
 }
 
-fn rewrite_head(bytes: &[u8], end: usize, front: u64) -> Vec<u8> {
+fn rewrite_head(bytes: &[u8], end: usize, front: &str) -> Vec<u8> {
     let head = &bytes[..end - 4];
     let mut lines = head
         .split(|byte| *byte == b'\n')
@@ -748,9 +748,37 @@ mod tests {
             b"GET /relay HTTP/1.1\r\nHost: r\r\nX-Vibeface-Front : 9\r\nUpgrade: websocket\r\n\r\nrest";
         let end = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
         assert_eq!(
-            String::from_utf8(rewrite_head(request, end, 3)).unwrap(),
-            "GET /relay HTTP/1.1\r\nx-vibeface-front: 3\r\nHost: r\r\nUpgrade: websocket\r\n\r\nrest"
+            String::from_utf8(rewrite_head(request, end, "private-binding")).unwrap(),
+            "GET /relay HTTP/1.1\r\nx-vibeface-front: private-binding\r\nHost: r\r\nUpgrade: websocket\r\n\r\nrest"
         );
+    }
+
+    #[test]
+    fn a_front_binding_is_private_live_and_consumed_once() -> Result<()> {
+        let usage = Usage::new(None);
+        let request = |headers: &[&str]| -> Result<_> {
+            let mut request = axum::http::Request::builder();
+            for header in headers {
+                request = request.header(FRONT_HEADER, *header);
+            }
+            Ok(iroh_relay::server::ClientRequest::new(
+                iroh::SecretKey::generate().public(),
+                iroh_relay::http::ProtocolVersion::V1,
+                request.body(())?.into_parts().0,
+            ))
+        };
+        assert!(!usage.bind(&request(&[])?));
+        assert!(!usage.bind(&request(&["0"])?));
+        let (front, _, guard) = usage.open_front();
+        let (other, _, _other_guard) = usage.open_front();
+        assert_eq!(front.len(), 64);
+        assert_ne!(front, other);
+        assert!(!usage.bind(&request(&[&front, &other])?));
+        assert!(usage.bind(&request(&[&front])?));
+        assert!(!usage.bind(&request(&[&front])?));
+        drop(guard);
+        assert!(!usage.bind(&request(&[&front])?));
+        Ok(())
     }
 
     #[test]
@@ -807,8 +835,11 @@ mod tests {
             &self,
             request: &iroh_relay::server::ClientRequest,
         ) -> iroh_relay::server::Access {
-            self.0.bind(request);
-            iroh_relay::server::Access::Allow
+            if self.0.bind(request) {
+                iroh_relay::server::Access::Allow
+            } else {
+                iroh_relay::server::Access::Deny { reason: None }
+            }
         }
     }
 
@@ -829,6 +860,105 @@ mod tests {
         .await?;
         let url = format!("http://{}", relay.addr);
         Ok((relay, url))
+    }
+
+    /// A real relay client authenticates after the TCP fixture prepends an HTTP request or
+    /// injects a header. The fixture removes the probe response before returning relay frames.
+    async fn client_through_fixture(
+        target: SocketAddr,
+        probe: Option<bool>,
+        header: Option<String>,
+    ) -> Result<iroh_relay::client::Client> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        async fn head(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            while !bytes.ends_with(b"\r\n\r\n") {
+                ensure!(bytes.len() < 16 * 1024, "fixture HTTP head too large");
+                bytes.push(stream.read_u8().await?);
+            }
+            Ok(bytes)
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let proxy = tokio::spawn(async move {
+            let (mut client, _) = listener.accept().await?;
+            let mut request = head(&mut client).await?;
+            if let Some(header) = header {
+                request.truncate(request.len() - 2);
+                request.extend_from_slice(format!("{FRONT_HEADER}: {header}\r\n\r\n").as_bytes());
+            }
+            let mut server = tokio::net::TcpStream::connect(target).await?;
+            if let Some(pipelined) = probe {
+                let mut first = b"GET /generate_204 HTTP/1.1\r\nHost: relay\r\n\r\n".to_vec();
+                if pipelined {
+                    first.extend_from_slice(&request);
+                }
+                server.write_all(&first).await?;
+                ensure!(
+                    head(&mut server).await?.starts_with(b"HTTP/1.1 204"),
+                    "fixture probe failed"
+                );
+                if !pipelined {
+                    server.write_all(&request).await?;
+                }
+            } else {
+                server.write_all(&request).await?;
+            }
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+            anyhow::Ok(())
+        });
+        let tls = iroh_relay::tls::CaTlsConfig::default()
+            .client_config(iroh_relay::tls::default_provider())?;
+        let connected = tokio::time::timeout(
+            Duration::from_secs(10),
+            iroh_relay::client::ClientBuilder::new(
+                super::super::relay_url(&url)?,
+                iroh::SecretKey::generate(),
+                iroh::dns::DnsResolver::new(),
+            )
+            .tls_client_config(tls)
+            .connect(),
+        )
+        .await;
+        proxy.abort();
+        connected?.map_err(Into::into)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relay_upgrades_cannot_bypass_the_front_binding() -> Result<()> {
+        let usage = Usage::new(None);
+        let (relay, _) = metered_relay(usage.clone()).await?;
+        let backend = relay.server.http_addr().context("relay backend")?;
+        let result = async {
+            for pipelined in [false, true] {
+                for header in [None, Some("0".into()), Some(crate::crypto::random_hex(32))] {
+                    assert!(
+                        client_through_fixture(relay.addr, Some(pipelined), header)
+                            .await
+                            .is_err()
+                    );
+                }
+            }
+            assert!(client_through_fixture(backend, None, None).await.is_err());
+            assert!(
+                client_through_fixture(backend, None, Some(crate::crypto::random_hex(32)))
+                    .await
+                    .is_err()
+            );
+            let (front, _, _guard) = usage.open_front();
+            let connected = client_through_fixture(backend, None, Some(front.clone())).await?;
+            drop(connected);
+            assert!(
+                client_through_fixture(backend, None, Some(front))
+                    .await
+                    .is_err(),
+                "a consumed binding cannot be reused"
+            );
+            anyhow::Ok(())
+        }
+        .await;
+        relay.shutdown().await;
+        result
     }
 
     /// A relay handshake through the front is written to `relay_usage` under the endpoint's

@@ -5,7 +5,10 @@
 //! after a restart or from another Node replays no side effect.
 use super::*;
 use crate::net::{self, AddressRecord, Net, SignedAddress, relay::RelayGrant};
-use crate::store::admission::{PeerAdmission, PeerAdmissionState, PeerCommand, PeerEnvelope};
+use crate::store::admission::{
+    AdmissionRejected, PeerAdmission, PeerAdmissionState, PeerCommand, PeerEnvelope,
+    authorize_peer_node_from,
+};
 use iroh::{
     endpoint::{Connection, ConnectionError},
     protocol::{AcceptError, ProtocolHandler, Router},
@@ -24,6 +27,38 @@ const MAX_FORK_PAGES: usize = 4;
 /// How long a turn waits for the attachments it shows before it marks them pending.
 const ATTACHMENT_WAIT: Duration = Duration::from_secs(15);
 const JOIN_NOTICE_WAIT: Duration = Duration::from_secs(3);
+const REMOVED_SYNC_BYTES: usize = 256 * 1024;
+const REMOVED_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(super) struct RemovedSyncLimits {
+    open: Arc<tokio::sync::Semaphore>,
+    peers: std::sync::Mutex<HashMap<String, Weak<tokio::sync::Semaphore>>>,
+}
+
+impl Default for RemovedSyncLimits {
+    fn default() -> Self {
+        Self {
+            open: Arc::new(tokio::sync::Semaphore::new(4)),
+            peers: Default::default(),
+        }
+    }
+}
+
+impl RemovedSyncLimits {
+    fn for_peer(&self, remote: &str) -> net::StreamLimit {
+        let mut peers = self.peers.lock().expect("removed Node sync limits");
+        peers.retain(|_, limit| limit.strong_count() > 0);
+        let peer = peers
+            .get(remote)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| {
+                let limit = Arc::new(tokio::sync::Semaphore::new(1));
+                peers.insert(remote.into(), Arc::downgrade(&limit));
+                limit
+            });
+        (self.open.clone(), peer, REMOVED_SYNC_TIMEOUT)
+    }
+}
 
 #[derive(Default)]
 pub(super) struct PeerDeliveryLocks {
@@ -121,22 +156,17 @@ impl iroh_relay::server::AccessControl for RelayAccess {
         request: &iroh_relay::server::ClientRequest,
     ) -> iroh_relay::server::Access {
         let allowed = match self.node.upgrade() {
-            Some(node) => {
-                let allowed = match node.relay_admits(request).await {
-                    Some(true) => {
-                        let max = node.relay_config().relay_max_clients;
-                        let mut counted = self.counted.lock().expect("relay clients");
-                        max.is_none_or(|max| counted.len() < max.get())
-                            && counted.insert(request.connection_id())
-                    }
-                    Some(false) => true,
-                    None => false,
-                };
-                if allowed {
-                    node.volunteer.usage.bind(request);
+            Some(node) => match node.relay_admits(request).await {
+                Some(true) => {
+                    let max = node.relay_config().relay_max_clients;
+                    let mut counted = self.counted.lock().expect("relay clients");
+                    max.is_none_or(|max| counted.len() < max.get())
+                        && node.volunteer.usage.bind(request)
+                        && counted.insert(request.connection_id())
                 }
-                allowed
-            }
+                Some(false) => node.volunteer.usage.bind(request),
+                None => false,
+            },
             None => false,
         };
         if allowed {
@@ -412,35 +442,59 @@ impl Runtime {
                 // A removed Node learns why from the signed history; it checks every signature.
                 // One that holds a veto undoing that removal hands it here the same way.
                 let network = self.membership_state().await?.genesis.network_id;
+                let limit = self.removed_sync_limits.for_peer(&remote);
                 let node = Arc::downgrade(&self);
-                net::serve_streams(connection, move |request: Value| {
-                    let (node, network) = (node.clone(), network.clone());
-                    async move {
-                        ensure!(
-                            request["network_id"].as_str() == Some(network.as_str()),
-                            "wrong personal network"
-                        );
-                        let node = node.upgrade().context("Node stopped")?;
-                        if request["type"] == "membership" {
-                            let incoming: NetworkState =
-                                serde_json::from_value(request["state"].clone())
-                                    .context("invalid membership")?;
-                            // Only its governance events count: a removed Node cannot bring in a
-                            // recovery checkpoint, so a backdated one skips no wait or veto. Events
-                            // this history cannot check are left out.
-                            let local = node.membership_state().await?;
-                            let state = NetworkState {
-                                events: incoming.events,
-                                ..local
+                net::serve_streams_within(
+                    connection,
+                    Some(limit),
+                    REMOVED_SYNC_BYTES,
+                    move |request: Value| {
+                        let (node, network, remote) =
+                            (node.clone(), network.clone(), remote.clone());
+                        async move {
+                            ensure!(
+                                request["network_id"].as_str() == Some(network.as_str()),
+                                "wrong personal network"
+                            );
+                            let node = node.upgrade().context("Node stopped")?;
+                            ensure!(
+                                matches!(request["type"].as_str(), Some("hello" | "membership")),
+                                "removed Nodes only exchange membership"
+                            );
+                            let known = if request["type"] == "membership" {
+                                let incoming: NetworkState =
+                                    serde_json::from_value(request["state"].clone())
+                                        .context("invalid membership")?;
+                                let known = incoming.project().ok().map(|_| incoming.clone());
+                                // Only its governance events count: a removed Node cannot bring in a
+                                // recovery checkpoint, so a backdated one skips no wait or veto. Events
+                                // this history cannot check are left out.
+                                let local = node.membership_state().await?;
+                                let state = NetworkState {
+                                    events: incoming.events,
+                                    ..local
+                                };
+                                if let Err(error) = node.install_membership(state).await {
+                                    tracing::debug!(%error, "ignored a removed Node's history");
+                                }
+                                known
+                            } else {
+                                None
                             };
-                            if let Err(error) = node.install_membership(state).await {
-                                tracing::debug!(%error, "ignored a removed Node's history");
-                            }
+                            let state = node.membership_state().await?;
+                            let state = if state.project()?.node(&remote).is_ok() {
+                                state
+                            } else {
+                                state.removal_state(&remote, known.as_ref())?
+                            };
+                            ensure!(
+                                serde_json::to_vec(&state)?.len() <= REMOVED_SYNC_BYTES,
+                                "removal evidence exceeds the recovery sync limit"
+                            );
+                            Ok(json!({"type":"revoked","network_id":network,"state":state}))
                         }
-                        let state = node.membership_state().await?;
-                        Ok(json!({"type":"revoked","network_id":network,"state":state}))
-                    }
-                })
+                    },
+                )
                 .await;
                 return Ok(());
             }
@@ -650,6 +704,17 @@ impl Runtime {
         }
     }
 
+    async fn sync_membership(&self, network: &str, recipient: &str) -> Result<NetworkState> {
+        let state = self.membership_state().await?;
+        ensure!(
+            state.genesis.network_id == network,
+            "wrong personal network"
+        );
+        // A request may have started before revocation; check the snapshot being sent.
+        state.project()?.node(recipient)?;
+        Ok(state)
+    }
+
     async fn hello(&self, network: &str) -> Result<Value> {
         let state = self.membership_state().await?;
         let (heads, forks) = {
@@ -724,7 +789,7 @@ impl Runtime {
                     "wrong membership network"
                 );
                 self.install_membership(incoming).await?;
-                Ok(json!({"state":self.membership_state().await?}))
+                Ok(json!({"state":self.sync_membership(network, origin).await?}))
             }
             "forks" => {
                 let after: Option<(String, u64, String)> =
@@ -913,13 +978,45 @@ impl Runtime {
     pub(super) async fn sync_peer(self: &Arc<Self>, network: &str, peer: &str) -> Result<bool> {
         let net = self.net()?.clone();
         let ours = self.hello(network).await?;
-        let theirs = net.request(peer, net::SYNC, &ours, PEER_TIMEOUT).await?;
+        let theirs = match net.request(peer, net::SYNC, &ours, PEER_TIMEOUT).await {
+            Ok(reply) => reply,
+            Err(error) => {
+                if self
+                    .member_node(peer)
+                    .await
+                    .is_ok_and(|member| member == network)
+                {
+                    // A private removal proof may be unavailable. A currently authorized peer
+                    // can still receive our signed history and learn a late veto.
+                    let state = self.sync_membership(network, peer).await?;
+                    let reply = net
+                        .request(
+                            peer,
+                            net::SYNC,
+                            &json!({"type":"membership","network_id":network,"state":state}),
+                            PEER_TIMEOUT,
+                        )
+                        .await?;
+                    let incoming: NetworkState = serde_json::from_value(reply["state"].clone())
+                        .context("peer membership exchange had no valid state")?;
+                    ensure!(
+                        incoming.genesis.network_id == network,
+                        "wrong membership network"
+                    );
+                    self.install_membership(incoming).await?;
+                    if reply["type"] == "revoked" {
+                        net.forget_sync_connection(peer);
+                    }
+                }
+                return Err(error);
+            }
+        };
         if theirs["type"] == "revoked" {
             let removed = self.accept_removal(network, &theirs).await;
             if removed.is_err() {
                 // Still a member here: a late veto may have put back a directory the peer has
                 // not seen, so it gets this history to roll back too.
-                let state = self.membership_state().await?;
+                let state = self.sync_membership(network, peer).await?;
                 net.request(
                     peer,
                     net::SYNC,
@@ -929,7 +1026,7 @@ impl Runtime {
                 .await?;
                 // The peer decided how to serve this connection when it took it; the next
                 // round dials again.
-                net.peer_restarted(peer);
+                net.forget_sync_connection(peer);
             }
             return removed.map(|()| false);
         }
@@ -938,7 +1035,7 @@ impl Runtime {
             "peer answered for another personal network"
         );
         if theirs["membership"] != ours["membership"] {
-            let state = self.membership_state().await?;
+            let state = self.sync_membership(network, peer).await?;
             let reply = net
                 .request(
                     peer,
@@ -2139,11 +2236,11 @@ impl Runtime {
             {
                 let store = self.store.lock().await;
                 let local = self.identity.device_id()?;
-                store.authorize_node(network, &local)?;
+                authorize_peer_node_from(&store.connection, network, &local)?;
                 if let Some(proof) = store.peer_owner_proof(network, &local, envelope)? {
                     return Ok(Some(proof));
                 }
-                store.authorize_node(network, &command.origin)?;
+                authorize_peer_node_from(&store.connection, network, &command.origin)?;
                 if !store.peer_command_dependencies(network, envelope)? { return Ok(None); }
             }
             match &envelope.payload {
@@ -2154,7 +2251,7 @@ impl Runtime {
                         }
                     let receipt = {
                         let mut store = self.store.lock().await;
-                        store.authorize_node(network, &command.origin)?;
+                        authorize_peer_node_from(&store.connection, network, &command.origin)?;
                         if !store.peer_command_dependencies(network, envelope)? { return Ok(None); }
                         store.admit_delivery(&self.identity.device_id()?, network, conversation_id, trigger)?
                     };
@@ -2173,7 +2270,7 @@ impl Runtime {
                     let Some(record) = record else {
                         return Ok(Some(json!({"work_id":work_id,"interrupt_requested":true,"confirmed":false,"waiting_for_start":true})));
                     };
-                    ensure!(record.conversation == *conversation_id, "work belongs to another conversation");
+                    ensure!(record.conversation == *conversation_id, AdmissionRejected::new("work belongs to another conversation"));
                     self.interrupt_work(network, work_id).await.map(Some)
                 }
             }
@@ -2184,11 +2281,21 @@ impl Runtime {
                 self.wake_sync(&command.origin);
                 (PeerAdmissionState::WaitingDependencies, json!({}))
             }
-            Err(error) => (
-                PeerAdmissionState::Rejected,
-                json!({"rejected":error.to_string(),
+            Err(error)
+                if error.is::<AdmissionRejected>()
+                    || error
+                        .downcast_ref::<vibeface_bridge::failure::ExecFailure>()
+                        .is_some_and(|failure| {
+                            failure.kind == vibeface_bridge::failure::FailureKind::NoBot
+                        }) =>
+            {
+                (
+                    PeerAdmissionState::Rejected,
+                    json!({"rejected":error.to_string(),
                 "failure":error.downcast_ref::<vibeface_bridge::failure::ExecFailure>().map(|failure| failure.kind)}),
-            ),
+                )
+            }
+            Err(error) => return Err(error),
         };
         self.store.lock().await.finish_peer_command(
             network,
@@ -2467,6 +2574,255 @@ mod tests {
         configuration.providers.codex_app_server.socket = Some(dir.join("unavailable.sock"));
         initialize_node(&dir, &configuration, identity)?;
         Ok((Arc::new(Runtime::open(&dir).await?), dir))
+    }
+
+    #[tokio::test]
+    async fn member_relay_clients_also_need_a_front_binding() -> Result<()> {
+        use iroh_relay::server::AccessControl as _;
+        let identity = LocalIdentity::generate();
+        let (node, dir) = node(&identity).await?;
+        let result = async {
+            node.install_membership(identity.sign_network_fixture(1, vec![identity.device_id()?])?)
+                .await?;
+            let access = RelayAccess::new(Arc::downgrade(&node));
+            for header in [None, Some("0"), Some("unknown-binding")] {
+                let mut request = axum::http::Request::builder();
+                if let Some(header) = header {
+                    request = request.header(net::relay::FRONT_HEADER, header);
+                }
+                let request = iroh_relay::server::ClientRequest::new(
+                    net::endpoint_id(&identity.device_id()?)?,
+                    iroh_relay::http::ProtocolVersion::V1,
+                    request.body(())?.into_parts().0,
+                );
+                assert_eq!(node.relay_admits(&request).await, Some(false));
+                assert!(matches!(
+                    access.on_connect(&request).await,
+                    iroh_relay::server::Access::Deny { .. }
+                ));
+            }
+            assert!(access.counted.lock().unwrap().is_empty());
+            anyhow::Ok(())
+        }
+        .await;
+        finish_nodes(result, vec![(node, dir)]).await
+    }
+
+    #[tokio::test]
+    async fn a_failed_hello_does_not_send_membership_to_a_nonmember() -> Result<()> {
+        #[derive(Clone, Debug)]
+        struct Probe(Arc<std::sync::Mutex<Vec<Value>>>);
+        impl ProtocolHandler for Probe {
+            async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+                let seen = self.0.clone();
+                net::serve_streams(connection, move |request: Value| {
+                    seen.lock().unwrap().push(request);
+                    async { Ok(json!({"error":"fixture hello failure"})) }
+                })
+                .await;
+                Ok(())
+            }
+        }
+        let (identity, stranger) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let (node, dir) = node(&identity).await?;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let probe = Net::bind(
+            &stranger.secret_key_hex,
+            &net::NetworkConfig {
+                bind: Some("127.0.0.1:0".parse()?),
+                ..Default::default()
+            },
+            0,
+            vec![],
+        )
+        .await?;
+        let router = Router::builder(probe.endpoint.clone())
+            .accept(net::SYNC, Probe(seen.clone()))
+            .spawn();
+        let result = async {
+            let network = identity.fixture_network_id()?;
+            node.install_membership(identity.sign_network_fixture(1, vec![identity.device_id()?])?)
+                .await?;
+            node.start_network().await?;
+            node.net()?.learn(&probe.addr()).await;
+            assert!(
+                node.sync_peer(&network, &stranger.device_id()?)
+                    .await
+                    .is_err()
+            );
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0]["type"], "hello");
+            assert!(seen[0].get("state").is_none());
+            anyhow::Ok(())
+        }
+        .await;
+        let _ = router.shutdown().await;
+        probe.close().await;
+        finish_nodes(result, vec![(node, dir)]).await
+    }
+
+    #[tokio::test]
+    async fn a_full_membership_reply_checks_the_recipient_in_its_snapshot() -> Result<()> {
+        use crate::identity::{GovernanceEvent, Member, Revocation};
+        let (ia, ib, later) = (
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+        );
+        let mut state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir) = node(&ia).await?;
+        let result = async {
+            a.install_membership(state.clone()).await?;
+            assert_eq!(a.member_node(&ib.device_id()?).await?, network);
+            state.append(GovernanceEvent::revoke(
+                &ia.fixture_admin(),
+                &state.project()?,
+                Revocation::new(&ib.device_id()?, None)?,
+            )?)?;
+            state.append(GovernanceEvent::grant(
+                &ia.fixture_admin(),
+                &state.project()?,
+                Member::node(&later, "after-removal-private")?,
+            )?)?;
+            let request = json!({"type":"membership","state":state});
+            assert!(
+                a.handle_sync(&network, &ib.device_id()?, &request)
+                    .await
+                    .is_err(),
+                "a request admitted earlier must not receive private post-removal membership"
+            );
+            let reply = a
+                .handle_sync(&network, &later.device_id()?, &request)
+                .await?;
+            let returned: NetworkState = serde_json::from_value(reply["state"].clone())?;
+            assert_eq!(
+                returned.project()?.node(&later.device_id()?)?.name,
+                "after-removal-private"
+            );
+            anyhow::Ok(())
+        }
+        .await;
+        finish_nodes(result, vec![(a, dir)]).await
+    }
+
+    #[tokio::test]
+    async fn a_full_membership_exchange_checks_the_recipient_in_its_snapshot() -> Result<()> {
+        use crate::identity::{GovernanceEvent, Member, Revocation};
+
+        #[derive(Clone, Debug)]
+        struct SnapshotProbe {
+            node: Weak<Runtime>,
+            snapshot: NetworkState,
+            peer: String,
+            network: String,
+            address: iroh::EndpointAddr,
+            seen: Arc<std::sync::Mutex<Vec<Value>>>,
+        }
+        impl ProtocolHandler for SnapshotProbe {
+            async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+                let probe = self.clone();
+                net::serve_streams(connection, move |request: Value| {
+                    let probe = probe.clone();
+                    async move {
+                        probe.seen.lock().unwrap().push(request.clone());
+                        if request["type"] == "hello" {
+                            let node = probe.node.upgrade().context("fixture Node stopped")?;
+                            node.net()?.forget_sync_connection(&probe.peer);
+                            node.install_membership(probe.snapshot.clone()).await?;
+                            // A discovery address does not grant membership.
+                            node.net()?.learn(&probe.address).await;
+                            Ok(json!({"network_id":probe.network,"membership":"0".repeat(64)}))
+                        } else {
+                            Ok(json!({"error":"fixture recorded the membership request"}))
+                        }
+                    }
+                })
+                .await;
+                Ok(())
+            }
+        }
+
+        for revoke in [false, true] {
+            let (ia, ib, later) = (
+                LocalIdentity::generate(),
+                LocalIdentity::generate(),
+                LocalIdentity::generate(),
+            );
+            let mut snapshot =
+                ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+            let network = ia.fixture_network_id()?;
+            let (a, dir) = node(&ia).await?;
+            a.install_membership(snapshot.clone()).await?;
+            if revoke {
+                snapshot.append(GovernanceEvent::revoke(
+                    &ia.fixture_admin(),
+                    &snapshot.project()?,
+                    Revocation::new(&ib.device_id()?, None)?,
+                )?)?;
+            }
+            snapshot.append(GovernanceEvent::grant(
+                &ia.fixture_admin(),
+                &snapshot.project()?,
+                Member::node(&later, "after-removal-private")?,
+            )?)?;
+            let probe = Net::bind(
+                &ib.secret_key_hex,
+                &net::NetworkConfig {
+                    bind: Some("127.0.0.1:0".parse()?),
+                    ..Default::default()
+                },
+                0,
+                vec![],
+            )
+            .await?;
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let router = Router::builder(probe.endpoint.clone())
+                .accept(
+                    net::SYNC,
+                    SnapshotProbe {
+                        node: Arc::downgrade(&a),
+                        snapshot,
+                        peer: ib.device_id()?,
+                        network: network.clone(),
+                        address: probe.addr(),
+                        seen: seen.clone(),
+                    },
+                )
+                .spawn();
+            let result = async {
+                a.sync_peers
+                    .lock()
+                    .unwrap()
+                    .entry(ib.device_id()?)
+                    .or_default()
+                    .running = true;
+                a.start_network().await?;
+                a.net()?.learn(&probe.addr()).await;
+                assert!(a.sync_peer(&network, &ib.device_id()?).await.is_err());
+                let seen = seen.lock().unwrap();
+                assert!(seen.iter().any(|request| request["type"] == "hello"));
+                let full: Vec<_> = seen
+                    .iter()
+                    .filter(|request| request["type"] == "membership")
+                    .collect();
+                for request in &full {
+                    let state: NetworkState = serde_json::from_value(request["state"].clone())?;
+                    assert_eq!(
+                        state.project()?.node(&later.device_id()?)?.name,
+                        "after-removal-private"
+                    );
+                }
+                assert_eq!(full.len(), usize::from(!revoke));
+                anyhow::Ok(())
+            }
+            .await;
+            let _ = router.shutdown().await;
+            probe.close().await;
+            finish_nodes(result, vec![(a, dir)]).await?;
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -3026,6 +3382,22 @@ mod tests {
             assert!(command.envelope.target.starts_with("held_request:"));
             assert_eq!(command.envelope.owner_epoch, 0);
             assert_eq!(command.envelope.causal_refs.len(), 2);
+            let expired = r.accept_held_answer_delivery(&network, "c", "a-q-held").await
+                .expect_err("an expired request is a definite refusal");
+            assert!(expired.is::<AdmissionRejected>());
+            let saved = r.store.lock().await.save_peer_command(
+                &network, &sender_id, &command.envelope, now_ms(),
+            )?;
+            r.store.lock().await.connection.execute_batch("PRAGMA query_only=ON")?;
+            let unwritten = r.process_peer_command(&network, &saved).await;
+            r.store.lock().await.connection.execute_batch("PRAGMA query_only=OFF")?;
+            assert!(unwritten.unwrap_err().is::<rusqlite::Error>(),
+                "a failed refusal receipt write stays retryable");
+            let pending = r.store.lock().await.pending_peer_commands(&network)?;
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].state, PeerAdmissionState::Saved);
+            assert!(r.store.lock().await.scheduler_jobs("c")?.is_empty());
+            assert!(r.store.lock().await.held_answer_receipt(&network, "c", "a-q-held")?.is_none());
             for node in [&a, &r] { node.start_network().await?; }
             a.net()?.learn(&r.net()?.addr()).await;
             r.net()?.learn(&a.net()?.addr()).await;
@@ -3039,6 +3411,11 @@ mod tests {
                 }
                 anyhow::Ok(())
             }).await.context("an answer for a request without a live transport fails explicitly")??;
+            let rejected = r.store.lock().await.save_peer_command(
+                &network, &sender_id, &command.envelope, now_ms(),
+            )?;
+            assert_eq!(rejected.state, PeerAdmissionState::Rejected);
+            assert!(r.store.lock().await.pending_peer_commands(&network)?.is_empty());
             assert!(r.store.lock().await.scheduler_jobs("c")?.is_empty());
             assert!(r.store.lock().await.held_answer_receipt(&network, "c", "a-q-held")?.is_none());
             anyhow::Ok(())
@@ -3549,12 +3926,48 @@ mod tests {
                 .await
                 .peer_dispatch_command(&network, &allowed)?
                 .envelope;
+            let _inbound = node
+                .peer_delivery_locks
+                .lock(&format!("inbound:{}", allowed_command.lane(&network)))
+                .await;
             node.store.lock().await.save_peer_command(
                 &network,
                 &sender_id,
                 &allowed_command,
                 now_ms(),
             )?;
+            let pending = node
+                .store
+                .lock()
+                .await
+                .pending_peer_commands(&network)?
+                .into_iter()
+                .find(|pending| pending.envelope.command_id == allowed_command.command_id)
+                .context("saved dispatch")?;
+            node.store
+                .lock()
+                .await
+                .connection
+                .execute_batch("PRAGMA query_only=ON")?;
+            let failed = node.process_peer_command(&network, &pending).await;
+            node.store
+                .lock()
+                .await
+                .connection
+                .execute_batch("PRAGMA query_only=OFF")?;
+            assert!(
+                failed.unwrap_err().is::<rusqlite::Error>(),
+                "a storage failure stays retryable"
+            );
+            let pending = node
+                .store
+                .lock()
+                .await
+                .pending_peer_commands(&network)?
+                .into_iter()
+                .find(|pending| pending.envelope.command_id == allowed_command.command_id)
+                .context("dispatch remains pending after a write failure")?;
+            assert_eq!(pending.state, PeerAdmissionState::Saved);
             assert!(
                 node.accept_dispatch(&network, allowed.clone(), &Value::Null)
                     .await?
@@ -3612,6 +4025,21 @@ mod tests {
                     .into_iter()
                     .find(|pending| pending.envelope.command_id == *command_id)
                     .context("unwritten peer receipt")?;
+                node.store
+                    .lock()
+                    .await
+                    .connection
+                    .execute_batch("PRAGMA query_only=ON")?;
+                let unwritten = node.process_peer_command(&network, &pending).await;
+                node.store
+                    .lock()
+                    .await
+                    .connection
+                    .execute_batch("PRAGMA query_only=OFF")?;
+                assert!(
+                    unwritten.unwrap_err().is::<rusqlite::Error>(),
+                    "a failed receipt write does not reject or repeat the work"
+                );
                 assert!(node.process_peer_command(&network, &pending).await?);
                 let proof = node
                     .accept_peer_envelope(&network, &sender_id, pending.envelope)
@@ -3996,6 +4424,60 @@ mod tests {
         result
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sync_policy_redial_preserves_active_streams_and_other_protocols() -> Result<()> {
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir_a) = node(&ia).await?;
+        let (b, dir_b) = node(&ib).await?;
+        let result = async {
+            for (node, peer) in [(&a, &ib), (&b, &ia)] {
+                node.install_membership(state.clone()).await?;
+                node.sync_peers
+                    .lock()
+                    .unwrap()
+                    .entry(peer.device_id()?)
+                    .or_default()
+                    .running = true;
+                node.start_network().await?;
+            }
+            let peer = ia.device_id()?;
+            let net = b.net()?.clone();
+            net.learn(&a.net()?.addr()).await;
+            let sync = net.connect(&peer, net::SYNC).await?;
+            let rpc = net.connect(&peer, net::RPC).await?;
+            let (mut send, mut recv) = sync.open_bi().await?;
+            net.forget_sync_connection(&peer);
+            assert!(
+                sync.close_reason().is_none(),
+                "an active sync stream must finish"
+            );
+            assert!(
+                rpc.close_reason().is_none(),
+                "another protocol must stay connected"
+            );
+            net::write_frame(&mut send, &b.hello(&network).await?).await?;
+            send.finish()?;
+            let reply = tokio::time::timeout(PEER_TIMEOUT, net::read_frame(&mut recv))
+                .await??
+                .context("the active sync stream returned no reply")?;
+            assert_eq!(reply["network_id"].as_str(), Some(network.as_str()));
+            assert_ne!(
+                net.connect(&peer, net::SYNC).await?.stable_id(),
+                sync.stable_id()
+            );
+            assert_eq!(
+                net.connect(&peer, net::RPC).await?.stable_id(),
+                rpc.stable_id()
+            );
+            anyhow::Ok(())
+        }
+        .await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await?;
+        result
+    }
+
     /// A Node that put in effect a recovery leaving out a peer refuses that peer; the peer, which
     /// holds the veto, hands it over anyway, and both end on the old directory.
     #[tokio::test(flavor = "multi_thread")]
@@ -4039,6 +4521,119 @@ mod tests {
         result
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_undisclosable_removal_still_accepts_a_members_late_veto() -> Result<()> {
+        use crate::identity::{GovernanceEvent, Member, Revocation};
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let (manager_b, manager_c, manager_d) = (
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+        );
+        let admin = ia.fixture_admin();
+        let mut base = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+        for manager in [&manager_b, &manager_d] {
+            base.append(GovernanceEvent::grant(
+                &admin,
+                &base.project()?,
+                Member::client(manager, "manager", true)?,
+            )?)?;
+        }
+        let network = ia.fixture_network_id()?;
+        let (a, dir_a) = node(&ia).await?;
+        let (b, dir_b) = node(&ib).await?;
+        let result = async {
+            let issued = overdue();
+            let (waiting, checkpoint, _) =
+                recovery_on(&ia, &base, base.project()?.members, vec![], issued)?;
+            let mut removed = waiting.clone();
+            let view = removed.project()?;
+            let mut private = waiting.clone();
+            private.append(GovernanceEvent::grant(
+                &manager_d,
+                &view,
+                Member::client(&manager_c, "private-manager", true)?,
+            )?)?;
+            removed.append(GovernanceEvent::revoke(
+                &admin,
+                &view,
+                Revocation::new(&ib.device_id()?, None)?,
+            )?)?;
+            removed.append(GovernanceEvent::revoke(
+                &manager_b,
+                &view,
+                Revocation::new(&admin.device_id()?, None)?,
+            )?)?;
+            removed = removed.merge(&private)?;
+            assert!(removed.project()?.node(&ib.device_id()?).is_ok());
+            removed.append(GovernanceEvent::revoke(
+                &manager_c,
+                &private.project()?,
+                Revocation::new(&manager_b.device_id()?, None)?,
+            )?)?;
+            assert!(removed.project()?.removed_node(&ib.device_id()?));
+            assert!(removed.removal_state(&ib.device_id()?, None).is_err());
+            a.install_membership(removed).await?;
+            b.install_membership(vetoed(&ia, &waiting, &checkpoint, issued + 1)?)
+                .await?;
+            b.sync_peers
+                .lock()
+                .unwrap()
+                .entry(ia.device_id()?)
+                .or_default()
+                .running = true;
+            for node in [&a, &b] {
+                node.start_network().await?;
+            }
+            b.net()?.learn(&a.net()?.addr()).await;
+            assert!(
+                b.net()?
+                    .request(
+                        &ia.device_id()?,
+                        net::SYNC,
+                        &b.hello(&network).await?,
+                        PEER_TIMEOUT
+                    )
+                    .await
+                    .is_err(),
+                "the hello discloses no unproved later member"
+            );
+            assert!(
+                b.sync_peer(&network, &ia.device_id()?).await.is_err(),
+                "the repair does not claim a completed history sync"
+            );
+            assert!(
+                a.membership_state()
+                    .await?
+                    .project()?
+                    .node(&ib.device_id()?)
+                    .is_ok()
+            );
+            assert_eq!(a.membership_state().await?, b.membership_state().await?);
+            let owner = ia.owner_fixture(&network, "after-veto", &ia.device_id()?)?;
+            a.store.lock().await.create_conversation(
+                &ia,
+                &network,
+                "after-veto",
+                "restored",
+                owner,
+                now_ms(),
+            )?;
+            b.sync_peer(&network, &ia.device_id()?).await?;
+            assert!(
+                b.store
+                    .lock()
+                    .await
+                    .conversation(&network, "after-veto")?
+                    .is_some(),
+                "the next authenticated connection completes normal sync"
+            );
+            anyhow::Ok(())
+        }
+        .await;
+        finish_nodes(result, vec![(a, dir_a), (b, dir_b)]).await
+    }
+
     /// A stolen, removed Node with the recovery file signs a backdated recovery and pushes it:
     /// the checkpoint stays out, so nothing skips the wait or the veto.
     #[tokio::test(flavor = "multi_thread")]
@@ -4059,12 +4654,20 @@ mod tests {
             a.install_membership(removed.clone()).await?;
             let before = a.membership_state().await?;
             let attacker = LocalIdentity::generate();
-            let mut members = removed.project()?.members;
+            let mut members = state.project()?.members;
             members.push(crate::identity::Member::client(
                 &attacker, "attacker", true,
             )?);
-            let (forged, _, _) = recovery_on(&ia, &removed, members, vec![], overdue())?;
+            let (forged, checkpoint, _) = recovery_on(&ia, &removed, members, vec![], overdue())?;
             assert!(forged.project()?.client(&attacker.device_id()?).is_ok());
+            assert!(forged.project()?.node(&ib.device_id()?).is_ok());
+            assert!(before.removal_state(&ib.device_id()?, None).is_ok());
+            assert!(
+                before
+                    .removal_state(&ib.device_id()?, Some(&forged))
+                    .is_err(),
+                "the local denial cannot override the unaccepted recovery directory"
+            );
             for node in [&a, &b] {
                 node.start_network().await?;
             }
@@ -4077,9 +4680,15 @@ mod tests {
                     &json!({"type":"membership","network_id":network,"state":forged}),
                     PEER_TIMEOUT,
                 )
-                .await?;
-            assert_eq!(reply["type"], "revoked");
+                .await;
+            assert!(reply.is_err(), "an unprovable denial fails closed");
             assert_eq!(a.membership_state().await?, before);
+            assert!(
+                !a.membership_state()
+                    .await?
+                    .checkpoints
+                    .contains(&checkpoint)
+            );
             let view = a.membership_state().await?.project()?;
             assert!(view.client(&attacker.device_id()?).is_err());
             anyhow::Ok(())
@@ -4087,6 +4696,53 @@ mod tests {
         .await;
         stop_nodes(vec![(a, dir_a), (b, dir_b)]).await?;
         result
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removed_node_sync_bounds_frames_streams_and_stalled_requests() -> Result<()> {
+        use crate::identity::{GovernanceEvent, Revocation};
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir_a) = node(&ia).await?;
+        let (b, dir_b) = node(&ib).await?;
+        let result = async {
+            let mut removed = state.clone();
+            removed.append(GovernanceEvent::revoke(
+                &ia.fixture_admin(), &state.project()?, Revocation::new(&ib.device_id()?, None)?,
+            )?)?;
+            a.install_membership(removed).await?;
+            b.install_membership(state).await?;
+            // Only the explicit requests exercise this quota, without B's periodic sync racing them.
+            b.sync_peers.lock().unwrap().entry(ia.device_id()?).or_default().running = true;
+            for node in [&a, &b] { node.start_network().await?; }
+            let limits = a.removed_sync_limits.for_peer(&ib.device_id()?);
+            let first = b.net()?.endpoint.connect(a.net()?.addr(), net::SYNC).await?;
+            let (mut stalled, mut reply) = first.open_bi().await?;
+            stalled.write_all(&[0]).await?;
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while limits.1.available_permits() != 0 { tokio::task::yield_now().await; }
+            }).await.context("the incomplete request did not acquire its quota")?;
+            let second = b.net()?.endpoint.connect(a.net()?.addr(), net::SYNC).await?;
+            assert!(tokio::time::timeout(Duration::from_secs(3), net::call(&second,
+                &json!({"type":"hello","network_id":network})))
+                .await?.is_err(), "the same removed Node cannot bypass its quota with another connection");
+            assert!(!matches!(tokio::time::timeout(REMOVED_SYNC_TIMEOUT + Duration::from_secs(3),
+                net::read_frame(&mut reply)).await?, Ok(Some(_))), "a stalled request is closed within the deadline");
+            drop(stalled);
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while limits.1.available_permits() != 1 { tokio::task::yield_now().await; }
+            }).await.context("the stalled request kept its quota")?;
+            let oversized = net::call(&second, &json!({"type":"membership","network_id":network,"padding":"x".repeat(REMOVED_SYNC_BYTES)})).await;
+            assert!(oversized.unwrap_err().to_string().contains("frame too large"));
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while limits.1.available_permits() != 1 { tokio::task::yield_now().await; }
+            }).await.context("the oversized request kept its quota")?;
+            let bounded = net::call(&second, &json!({"type":"hello","network_id":network})).await?;
+            assert_eq!(bounded["type"], "revoked", "a small request still receives its signed denial");
+            anyhow::Ok(())
+        }.await;
+        finish_nodes(result, vec![(a, dir_a), (b, dir_b)]).await
     }
 
     /// The lost device was itself a Node and never comes back: the recovery that leaves it out
@@ -4411,6 +5067,13 @@ mod tests {
                 revocation.clone(),
             )?)?;
             a.install_membership(next).await?;
+            // Keep this round from racing B's background sync for the removed-node quota.
+            b.sync_peers
+                .lock()
+                .unwrap()
+                .entry(member.clone())
+                .or_default()
+                .running = true;
             for node in [&a, &b] {
                 node.start_network().await?;
             }

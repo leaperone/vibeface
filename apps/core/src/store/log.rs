@@ -11,10 +11,118 @@ use crate::{
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(super) struct CausalClock(BTreeMap<String, CausalPoint>);
+
+#[derive(Serialize, Deserialize)]
+struct CausalPoint {
+    author: String,
+    seq: u64,
+}
+
+impl CausalClock {
+    fn merge(&mut self, other: Self) {
+        for (chain, point) in other.0 {
+            if self.0.get(&chain).is_none_or(|old| old.seq < point.seq) {
+                self.0.insert(chain, point);
+            }
+        }
+    }
+
+    pub(super) fn before(connection: &Connection, network: &str, event: &Event) -> Result<Self> {
+        let mut clock = Self::default();
+        for hash in event.prev.iter().chain(&event.deps) {
+            clock.include(connection, network, hash)?;
+        }
+        Ok(clock)
+    }
+
+    pub(super) fn stored(connection: &Connection, network: &str, hash: &str) -> Result<Self> {
+        let clock: String = connection.query_row(
+            "SELECT causal_clock FROM events WHERE network_id=? AND hash=?",
+            params![network, hash],
+            |row| row.get(0),
+        )?;
+        Ok(serde_json::from_str(&clock)?)
+    }
+
+    pub(super) fn include(
+        &mut self,
+        connection: &Connection,
+        network: &str,
+        hash: &str,
+    ) -> Result<()> {
+        let (chain, author, seq, clock): (String, String, u64, String) = connection
+            .query_row(
+                "SELECT causal_chain,author,seq,causal_clock FROM events WHERE network_id=? AND hash=?",
+                params![network, hash],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?
+            .context("workspace dependency is missing")?;
+        let mut parent: Self = serde_json::from_str(&clock)?;
+        parent.0.insert(chain, CausalPoint { author, seq });
+        self.merge(parent);
+        Ok(())
+    }
+
+    fn covers(&self, chain: &str, seq: u64) -> bool {
+        self.0.get(chain).is_some_and(|point| point.seq >= seq)
+    }
+
+    pub(super) fn contains(
+        &self,
+        connection: &Connection,
+        network: &str,
+        hash: &str,
+    ) -> Result<bool> {
+        let point: Option<(String, u64)> = connection
+            .query_row(
+                "SELECT causal_chain,seq FROM events WHERE network_id=? AND hash=?",
+                params![network, hash],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(point.is_some_and(|(chain, seq)| self.covers(&chain, seq)))
+    }
+
+    pub(super) fn event(
+        &self,
+        connection: &Connection,
+        network: &str,
+        hash: &str,
+    ) -> Result<Option<Event>> {
+        let row: Option<(String, u64, String)> = connection
+            .query_row(
+                "SELECT causal_chain,seq,envelope FROM events WHERE network_id=? AND hash=?",
+                params![network, hash],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((_, _, envelope)) = row.filter(|(chain, seq, _)| self.covers(chain, *seq)) else {
+            return Ok(None);
+        };
+        let envelope: SignedEvent = serde_json::from_str(&envelope)?;
+        Ok(Some(serde_json::from_str(&envelope.canonical_body)?))
+    }
+
+    pub(super) fn version_vector(&self) -> VersionVector {
+        self.0
+            .values()
+            .fold(VersionVector::new(), |mut vector, point| {
+                let seq = vector.entry(point.author.clone()).or_default();
+                *seq = (*seq).max(point.seq);
+                vector
+            })
+    }
+}
 
 /// Shared hard limit; only verified authors with a write bound receive a fair share.
 pub const MAX_PENDING_EVENTS: i64 = 10_000;
@@ -608,9 +716,20 @@ fn insert_event(
             "event writer clock differs from this Node's first-seen clock"
         );
     }
+    let clock = CausalClock::before(connection, network, event)?;
+    // A chain only extends at its tail; a late fork starts a separate exact prefix.
+    let chain = if let Some(prev) = &event.prev {
+        connection.query_row(
+            "SELECT causal_chain FROM events p WHERE network_id=?1 AND hash=?2 AND NOT EXISTS (SELECT 1 FROM events n WHERE n.network_id=p.network_id AND n.causal_chain=p.causal_chain AND n.seq>p.seq)",
+            params![network, prev],
+            |row| row.get::<_, String>(0),
+        ).optional()?.unwrap_or_else(|| envelope.hash.clone())
+    } else {
+        envelope.hash.clone()
+    };
     connection.execute(
-        "INSERT INTO events(network_id,author,seq,hash,scope_id,lamport,created_at_ms,seen_at_ms,envelope,main,effective,kind,subject) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        params![network, event.author, event.seq, envelope.hash, event.scope_id, lamport, event.created_at_ms, seen_at_ms, serde_json::to_string(envelope)?, main, effective, event.body.kind(), event.body.subject()],
+        "INSERT INTO events(network_id,author,seq,hash,scope_id,lamport,created_at_ms,seen_at_ms,envelope,main,effective,kind,subject,causal_chain,causal_clock) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        params![network, event.author, event.seq, envelope.hash, event.scope_id, lamport, event.created_at_ms, seen_at_ms, serde_json::to_string(envelope)?, main, effective, event.body.kind(), event.body.subject(), chain, serde_json::to_string(&clock)?],
     )?;
     for blob in &event.blobs {
         connection.execute(

@@ -2,6 +2,7 @@
 //! through `Store::apply_work_signal`, so the journal, the DAG and the UI agree.
 use super::*;
 use crate::scheduling::task_trigger;
+use crate::store::admission::{AdmissionRejected, authorize_peer_node_from};
 use crate::work::{
     Dispatch, DispatchState, Probe, RequestedWorkKind, Signal, StopRequest, WorkAdmission,
     WorkRecord, WorkRequest, WorkSpec, WorkState,
@@ -164,20 +165,24 @@ impl Runtime {
             Some(("message", message_id)) => {
                 ensure!(
                     from_owner,
-                    "only the conversation's scheduling device dispatches its work"
+                    AdmissionRejected::new(
+                        "only the conversation's scheduling device dispatches its work"
+                    )
                 );
                 let message = store
                     .message(network, &spec.conversation, message_id)?
                     .context("the user's message has not reached this device")?;
                 ensure!(
                     message.role == Role::User,
-                    "work must follow the user's own message"
+                    AdmissionRejected::new("work must follow the user's own message")
                 );
             }
             Some(("work", previous)) => {
                 ensure!(
                     from_owner,
-                    "only the conversation's scheduling device dispatches its work"
+                    AdmissionRejected::new(
+                        "only the conversation's scheduling device dispatches its work"
+                    )
                 );
                 // A refused or unknown dispatch of this Node has no result in the DAG; only this
                 // Node, which holds it, can follow it up.
@@ -198,10 +203,12 @@ impl Runtime {
             Some(("schedule", _)) => {
                 ensure!(
                     from_owner,
-                    "only the conversation's scheduling device dispatches its work"
+                    AdmissionRejected::new(
+                        "only the conversation's scheduling device dispatches its work"
+                    )
                 );
                 let (schedule_id, _) = crate::scheduling::parse_schedule_trigger(&spec.trigger)
-                    .context("invalid work trigger")?;
+                    .context(AdmissionRejected::new("invalid work trigger"))?;
                 ensure!(
                     store.schedule(network, schedule_id)?.is_some_and(|entry| {
                         entry.conversation_id == spec.conversation && entry.schedule.enabled
@@ -212,14 +219,16 @@ impl Runtime {
             Some(("bot_message", message_id)) => {
                 ensure!(
                     from_owner,
-                    "only the conversation's scheduling device dispatches its work"
+                    AdmissionRejected::new(
+                        "only the conversation's scheduling device dispatches its work"
+                    )
                 );
                 let message = store
                     .message(network, &spec.conversation, message_id)?
                     .context("the bot's message has not reached this device")?;
                 ensure!(
                     message.role == Role::Bot,
-                    "work must follow a message in this conversation"
+                    AdmissionRejected::new("work must follow a message in this conversation")
                 );
             }
             Some(("task", task)) => {
@@ -233,7 +242,7 @@ impl Runtime {
                         && task.conversation == spec.conversation
                         && spec.parent.as_deref() == Some(task.work_id.as_str())
                         && !task.state.finished(),
-                    "an agent task only starts work on its own device"
+                    AdmissionRejected::new("an agent task only starts work on its own device")
                 );
             }
             Some(("assignment", assignment_id)) => {
@@ -245,10 +254,12 @@ impl Runtime {
                         &spec.dispatcher,
                         &spec.conversation
                     )?,
-                    "this assignment does not authorize work in this conversation"
+                    AdmissionRejected::new(
+                        "this assignment does not authorize work in this conversation"
+                    )
                 );
             }
-            _ => bail!("invalid work trigger"),
+            _ => bail!(AdmissionRejected::new("invalid work trigger")),
         }
         if let Some(original) = &spec.continues {
             let original = store
@@ -256,7 +267,7 @@ impl Runtime {
                 .context("the work to continue is not on this device")?;
             ensure!(
                 original.conversation == spec.conversation,
-                "a continuation keeps the original conversation"
+                AdmissionRejected::new("a continuation keeps the original conversation")
             );
             match original.kind {
                 _ if original.kind == kind => {}
@@ -266,17 +277,19 @@ impl Runtime {
                     ran.label(),
                     ran.name()
                 ),
-                WorkKind::Task => bail!("a continuation keeps the original kind"),
+                WorkKind::Task => bail!(AdmissionRejected::new(
+                    "a continuation keeps the original kind"
+                )),
             }
         }
         ensure!(
             kind == WorkKind::Task || spec.dispatcher == spec.target,
-            "another device takes work only as a task for its bot"
+            AdmissionRejected::new("another device takes work only as a task for its bot")
         );
         if kind == WorkKind::Task {
             ensure!(
                 spec.dispatcher != spec.target,
-                "an agent task goes to another device"
+                AdmissionRejected::new("an agent task goes to another device")
             );
             if self.manager().is_none() {
                 return Err(ExecFailure::new(
@@ -306,12 +319,12 @@ impl Runtime {
             .map(str::to_owned);
         ensure!(
             request.target == self.identity.device_id()?,
-            "work targets another Node"
+            AdmissionRejected::new("work targets another Node")
         );
         ensure!(
             request.work_id
                 == WorkSpec::id(&request.conversation, &request.trigger, &request.call_ref),
-            "work ID does not match its call"
+            AdmissionRejected::new("work ID does not match its call")
         );
         let _settings = self.manager_controls.lock().await;
         let admitted = {
@@ -320,7 +333,7 @@ impl Runtime {
                 existing
             } else {
                 if let Some(envelope) = store.peer_dispatch_envelope(network, &request)? {
-                    store.authorize_node(network, &request.dispatcher)?;
+                    authorize_peer_node_from(&store.connection, network, &request.dispatcher)?;
                     ensure!(
                         store.peer_command_dependencies(network, &envelope)?,
                         "dispatch dependencies are still missing"
@@ -328,7 +341,7 @@ impl Runtime {
                 }
                 ensure!(
                     !store.peer_cancelled(network, &request.conversation, &request.work_id)?,
-                    "work was cancelled before dispatch admission"
+                    AdmissionRejected::new("work was cancelled before dispatch admission")
                 );
                 let first = (|| {
                     let proposed = self.resolve_work_model(&store, network, &request)?;
@@ -413,7 +426,7 @@ impl Runtime {
             RequestedWorkKind::Task => {
                 ensure!(
                     request.model.is_none(),
-                    "a remote task uses the target Bot's model; omit model"
+                    AdmissionRejected::new("a remote task uses the target Bot's model; omit model")
                 );
                 let manager = self.manager().ok_or_else(|| {
                     ExecFailure::new(
@@ -804,7 +817,7 @@ impl Runtime {
 
     /// Settles works the Agent registered but did not finish starting within its window, reads
     /// the turns of running and unverified works about once a minute, and carries out the stops
-    /// this device holds for its own works. A probe only reads; it never starts or resends.
+    /// this device holds for its own works. A probe reads provider state and never starts or resends work.
     pub(super) async fn reconcile_works(self: &Arc<Self>, network: &str) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
         let at = now_ms();

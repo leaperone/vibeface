@@ -15,7 +15,7 @@ use iroh::{
 };
 use tokio::{
     runtime::Runtime,
-    sync::{Mutex, OnceCell, mpsc},
+    sync::{Mutex, OnceCell, OwnedSemaphorePermit, Semaphore, mpsc},
 };
 use vibeface_secure as secure;
 
@@ -24,6 +24,12 @@ use crate::{Result, SecureError};
 const ALPN: &[u8] = b"vibeface/client/1";
 /// What a Node accepts in one frame.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_MESSAGE_RECORDS: usize =
+    (secure::MAX_APPLICATION_MESSAGE + 4).div_ceil(secure::RECORD_PLAINTEXT);
+const MAX_QUEUED_FRAMES: usize = MAX_MESSAGE_RECORDS + 1;
+// One complete application message, including Noise tags and frame headers, plus one control frame.
+const MAX_QUEUED_BYTES: usize =
+    secure::MAX_APPLICATION_MESSAGE + 4 + MAX_MESSAGE_RECORDS * (16 + 5) + MAX_FRAME_BYTES + 5;
 const BINARY: u8 = 0;
 const TEXT: u8 = 1;
 const PING: u8 = 2;
@@ -98,17 +104,62 @@ pub struct LanFrame {
     pub data: Vec<u8>,
 }
 
+struct QueuedFrame {
+    tag: u8,
+    data: Vec<u8>,
+    _bytes: OwnedSemaphorePermit,
+}
+
+struct Outgoing {
+    queue: mpsc::Sender<QueuedFrame>,
+    bytes: Arc<Semaphore>,
+}
+
+impl Outgoing {
+    fn new() -> (Self, mpsc::Receiver<QueuedFrame>) {
+        let (queue, receiver) = mpsc::channel(MAX_QUEUED_FRAMES);
+        (
+            Self {
+                queue,
+                bytes: Arc::new(Semaphore::new(MAX_QUEUED_BYTES)),
+            },
+            receiver,
+        )
+    }
+
+    fn send(&self, tag: u8, data: Vec<u8>) -> Result<()> {
+        if data.len() > MAX_FRAME_BYTES {
+            return Err(failed("frame too large"));
+        }
+        let bytes = self
+            .bytes
+            .clone()
+            .try_acquire_many_owned((data.len() + 5) as u32)
+            .map_err(|_| failed("stream backpressure limit reached"))?;
+        self.queue
+            .try_send(QueuedFrame {
+                tag,
+                data,
+                _bytes: bytes,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => failed("stream backpressure limit reached"),
+                mpsc::error::TrySendError::Closed(_) => failed("stream closed"),
+            })
+    }
+}
+
 /// One client stream to a Node. Frames go out in call order; the Node's pings are answered here.
 #[derive(uniffi::Object)]
 pub struct LanStream {
     connection: Connection,
-    outgoing: mpsc::Sender<(u8, Vec<u8>)>,
+    outgoing: Outgoing,
     incoming: Mutex<RecvStream>,
 }
 
 impl LanStream {
     fn new(connection: Connection, mut send: SendStream, recv: RecvStream) -> Arc<Self> {
-        let (outgoing, mut queue) = mpsc::channel::<(u8, Vec<u8>)>(16);
+        let (outgoing, mut queue) = Outgoing::new();
         let writer = connection.clone();
         // Ends with the connection too: the app's handle, which holds the queue, lives until GC.
         tokio::spawn(async move {
@@ -117,8 +168,8 @@ impl LanStream {
                     next = queue.recv() => next,
                     _ = writer.closed() => return,
                 };
-                let Some((tag, data)) = next else { break };
-                if send.write_all(&frame(tag, &data)).await.is_err() {
+                let Some(next) = next else { break };
+                if send.write_all(&frame(next.tag, &next.data)).await.is_err() {
                     writer.close(1u32.into(), b"write failed");
                     return;
                 }
@@ -137,15 +188,7 @@ impl LanStream {
 impl LanStream {
     /// Queues one binary frame. A failed write closes the stream, which `recv` then reports.
     pub fn send(&self, data: Vec<u8>) -> Result<()> {
-        if data.len() > MAX_FRAME_BYTES {
-            return Err(failed("frame too large"));
-        }
-        self.outgoing
-            .try_send((BINARY, data))
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => failed("stream backpressure limit reached"),
-                mpsc::error::TrySendError::Closed(_) => failed("stream closed"),
-            })
+        self.outgoing.send(BINARY, data)
     }
 
     /// The next binary or text frame, `None` once the Node ended the stream.
@@ -164,7 +207,7 @@ impl LanStream {
                         }));
                     }
                     PING => {
-                        let _ = self.outgoing.try_send((PONG, data));
+                        let _ = self.outgoing.send(PONG, data);
                     }
                     PONG => {}
                     _ => return Err(failed("unknown frame")),
@@ -241,6 +284,61 @@ mod tests {
     fn frames_carry_tag_and_big_endian_length() {
         assert_eq!(frame(TEXT, b"no"), [1, 0, 0, 0, 2, b'n', b'o']);
         assert_eq!(frame(BINARY, &[]), [0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn outgoing_queue_holds_a_maximum_message_without_a_writer() {
+        let sender = secure::Identity::generate().unwrap();
+        let receiver = secure::Identity::generate().unwrap();
+        let mut a = secure::Handshake::signed(true, &sender, None, CONTEXT).unwrap();
+        let mut b = secure::Handshake::signed(false, &receiver, None, CONTEXT).unwrap();
+        b.read(&a.write(&[]).unwrap()).unwrap();
+        a.read(&b.write(&[]).unwrap()).unwrap();
+        b.read(&a.write(&[]).unwrap()).unwrap();
+        let mut a = a.finish().unwrap();
+        let mut b = b.finish().unwrap();
+        let payload = vec![0x3c; secure::MAX_APPLICATION_MESSAGE];
+        let records = a.seal_message(&payload).unwrap();
+        assert_eq!(records.len(), MAX_MESSAGE_RECORDS);
+        assert_eq!(
+            records.iter().map(|record| record.len() + 5).sum::<usize>() + MAX_FRAME_BYTES + 5,
+            MAX_QUEUED_BYTES
+        );
+        let (outgoing, mut queued) = Outgoing::new();
+        outgoing.send(PONG, vec![0; MAX_FRAME_BYTES]).unwrap();
+        for record in records {
+            outgoing.send(BINARY, record).unwrap();
+        }
+        assert_eq!(outgoing.bytes.available_permits(), 0);
+        assert!(outgoing.send(BINARY, vec![]).is_err());
+        assert_eq!(queued.try_recv().unwrap().tag, PONG);
+        let mut received = None;
+        while let Ok(next) = queued.try_recv() {
+            assert_eq!(next.tag, BINARY);
+            let message = b.open_record(&next.data).unwrap();
+            if message.is_some() {
+                assert!(received.is_none());
+                received = message;
+            }
+        }
+        assert_eq!(received.unwrap(), payload);
+        assert_eq!(outgoing.bytes.available_permits(), MAX_QUEUED_BYTES);
+    }
+
+    #[test]
+    fn outgoing_queue_bounds_bytes_and_releases_dropped_frames() {
+        let (outgoing, mut queued) = Outgoing::new();
+        assert!(outgoing.send(BINARY, vec![0; MAX_FRAME_BYTES + 1]).is_err());
+        for _ in 0..MAX_QUEUED_BYTES / (MAX_FRAME_BYTES + 5) {
+            outgoing.send(BINARY, vec![0; MAX_FRAME_BYTES]).unwrap();
+        }
+        assert!(outgoing.send(BINARY, vec![0; MAX_FRAME_BYTES]).is_err());
+        drop(queued.try_recv().unwrap());
+        outgoing.send(BINARY, vec![0; MAX_FRAME_BYTES]).unwrap();
+        drop(queued);
+        assert_eq!(outgoing.bytes.available_permits(), MAX_QUEUED_BYTES);
+        assert!(outgoing.send(BINARY, vec![0]).is_err());
+        assert_eq!(outgoing.bytes.available_permits(), MAX_QUEUED_BYTES);
     }
 
     /// A Node-like server on loopback: Noise as the responder, a ping the client must answer, then

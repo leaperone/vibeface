@@ -5,7 +5,7 @@ use crate::{
     maintenance::Gate,
     model::*,
     providers::{Provider, ProviderRoots},
-    store::{Store, WriteState},
+    store::{Store, WriteState, admission::AdmissionRejected},
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -592,6 +592,7 @@ pub struct Runtime {
     background_tasks: BackgroundTasks,
     sync_peers: std::sync::Mutex<HashMap<String, peers::PeerSync>>,
     peer_delivery_locks: peers::PeerDeliveryLocks,
+    removed_sync_limits: peers::RemovedSyncLimits,
     /// Two syncs downloading the same attachment would share one staging file.
     /// ponytail: one download at a time; per-attachment locks if parallel downloads matter.
     blob_fetch: Mutex<()>,
@@ -709,7 +710,7 @@ impl Runtime {
         store.on_log_head_written({
             let have_wakeup = have_wakeup.clone();
             move || have_wakeup.notify_one()
-        });
+        })?;
         let store = Arc::new(Mutex::new(store));
         let (events, _) = broadcast::channel(256);
         let (tx, rx) = mpsc::unbounded_channel();
@@ -873,6 +874,7 @@ impl Runtime {
             background_tasks: BackgroundTasks::new(),
             sync_peers: std::sync::Mutex::new(HashMap::new()),
             peer_delivery_locks: peers::PeerDeliveryLocks::default(),
+            removed_sync_limits: peers::RemovedSyncLimits::default(),
             blob_fetch: Mutex::new(()),
             boot: uuid::Uuid::new_v4().simple().to_string(),
             sync_wakeup: tokio::sync::Notify::new(),
@@ -1798,15 +1800,31 @@ impl Runtime {
     }
     fn allowed_path(&self, path: &str) -> Result<PathBuf> {
         let path = std::fs::canonicalize(path).context("execution path does not exist")?;
+        let roots = self
+            .settings_snapshot()
+            .roots
+            .iter()
+            .map(std::fs::canonicalize)
+            .collect::<Vec<_>>();
+        let allowed = roots
+            .iter()
+            .filter_map(|root| root.as_ref().ok())
+            .any(|root| path.starts_with(root));
+        if !allowed {
+            for root in roots {
+                root.context("configured execution root cannot be resolved")?;
+            }
+        }
         ensure!(
-            self.settings_snapshot()
-                .roots
-                .iter()
-                .filter_map(|r| std::fs::canonicalize(r).ok())
-                .any(|r| path.starts_with(r)),
-            "execution path is outside configured roots; ask the user to allow its folder with propose_provider_config roots"
+            allowed,
+            AdmissionRejected::new(
+                "execution path is outside configured roots; ask the user to allow its folder with propose_provider_config roots"
+            )
         );
-        ensure!(path.is_dir(), "execution path must be a directory");
+        ensure!(
+            std::fs::metadata(&path)?.is_dir(),
+            AdmissionRejected::new("execution path must be a directory")
+        );
         Ok(path)
     }
 }
