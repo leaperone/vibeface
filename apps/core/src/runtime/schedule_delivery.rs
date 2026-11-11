@@ -1433,6 +1433,7 @@ mod tests {
                 bot(&node, &admin, "c", "Pending admission", &[]).await?;
                 bot(&node, &admin, "healthy", "Healthy reply", &[]).await?;
                 let network = node.network_id().await?;
+                let (healthy, _) = claim_reply(&node, &admin, "healthy", "healthy-reply", crate::scheduler::boot_id()).await?;
                 let message_id = format!("pending-{case}");
                 let trigger = message_trigger(&message_id);
                 {
@@ -1461,7 +1462,6 @@ mod tests {
                 assert_eq!(accepted["state"], "pending_admission");
                 assert!(node.store.lock().await.scheduler_job("c", &trigger)?.is_none());
                 assert_eq!(node.store.lock().await.pending_workspace_input_admissions(&network)?, [message_id.clone()]);
-                let (healthy, _) = claim_reply(&node, &admin, "healthy", "healthy-reply", crate::scheduler::boot_id()).await?;
                 node.schedule_tick().await?;
                 assert!(node.store.lock().await.scheduler_job("c", &trigger)?.is_none());
                 assert_eq!(node.store.lock().await.pending_workspace_input_admissions(&network)?, [message_id.clone()]);
@@ -1511,6 +1511,7 @@ mod tests {
                 bot(&node, &admin, scope, scope, &[]).await?;
             }
             let network = node.network_id().await?;
+            let (healthy, _) = claim_reply(&node, &admin, "healthy", "healthy-reply", crate::scheduler::boot_id()).await?;
             let root = directory.join("workspace");
             std::fs::create_dir(&root)?;
             node.settings.lock().unwrap().roots = vec![directory.clone(), root.clone()];
@@ -1554,7 +1555,6 @@ mod tests {
             let accepted = node.accept_chat_message(&access, &input).await?;
             assert_eq!(accepted["accepted"], true);
             assert_eq!(accepted["state"], "pending_admission");
-            let (healthy, _) = claim_reply(&node, &admin, "healthy", "healthy-reply", crate::scheduler::boot_id()).await?;
             node.store.lock().await.connection.execute(
                 "DELETE FROM scheduler_jobs WHERE trigger LIKE 'message:capacity-%'", []
             )?;
