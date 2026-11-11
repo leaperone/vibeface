@@ -5027,9 +5027,11 @@ mod tests {
         let (ia, lost) = (LocalIdentity::generate(), LocalIdentity::generate());
         let state = ia.sign_network_fixture(1, vec![ia.device_id()?, lost.device_id()?])?;
         let network = ia.fixture_network_id()?;
-        let (a, dir) = node(&ia).await?;
+        let (a, dir) = node(&ia).await.context("open lost-Node recovery fixture")?;
         let result = async {
-            a.install_membership(state.clone()).await?;
+            a.install_membership(state.clone())
+                .await
+                .context("install initial lost-Node recovery membership")?;
             let view = state.project()?;
             let kept: Vec<_> = view
                 .members
@@ -5042,25 +5044,40 @@ mod tests {
                 a.store
                     .call("peers.heads", move |store| store.heads(&arg0))
                     .await
+                    .context("read lost-Node recovery retirement heads")
             }?)?;
             let issued = now_ms() as u64 + 1_000 - crate::identity::RECOVERY_DELAY_MS;
             let (waiting, _, next) = recovery_on(&ia, &state, kept, retired, issued)?;
-            assert_eq!(a.install_membership(waiting).await?.epoch, 2, "waiting");
+            assert_eq!(
+                a.install_membership(waiting)
+                    .await
+                    .context("install waiting lost-Node recovery")?
+                    .epoch,
+                2,
+                "waiting"
+            );
             a.start_recovery_timer();
             let deadline = Instant::now() + Duration::from_secs(10);
-            while a.recovery_since_ms(&next).await?.is_none() {
+            while a
+                .recovery_since_ms(&next)
+                .await
+                .context("read lost-Node recovery activation marker")?
+                .is_none()
+            {
                 ensure!(Instant::now() < deadline, "the recovery never took effect");
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            let view = a.membership_state().await?.project()?;
+            let view = a
+                .membership_state()
+                .await
+                .context("read activated lost-Node recovery membership")?
+                .project()?;
             assert_eq!(view.epoch, 3);
             assert!(view.revocation(&lost.device_id()?).is_some());
             anyhow::Ok(())
         }
         .await;
-        drop(a);
-        std::fs::remove_dir_all(dir)?;
-        result
+        finish_nodes(result, vec![(a, dir)]).await
     }
 
     /// A recovery leaving out a Node records nothing about its work: a late veto can put the
