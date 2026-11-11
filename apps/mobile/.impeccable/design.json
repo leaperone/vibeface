@@ -241,7 +241,7 @@
       "kind": "nav",
       "description": "Native list-row translation.",
       "html": "<nav><a class=\"ds-nav\" href=\"#\" aria-current=\"page\">消息</a></nav>",
-      "css": ".ds-nav{font-family:\"Geist\",system-ui,sans-serif;font-size:16px;line-height:24px;display:flex;align-items:center;min-height:44px;padding:0 12px;border-radius:10px;color:oklch(0.21 0.012 270);text-decoration:none}.ds-nav[aria-current=page],.ds-nav:hover,.ds-nav:active{background:oklch(0.965 0.004 270)}.ds-nav:focus-visible{outline:2px solid oklch(0.6 0.17 280)}"
+      "css": ".ds-nav{font-family:\"Geist\",system-ui,sans-serif;font-size:16px;line-height:24px;display:flex;align-items:center;min-height:64px;padding:0 12px;border-radius:14px;color:oklch(0.21 0.012 270);text-decoration:none}.ds-nav[aria-current=page],.ds-nav:hover,.ds-nav:active{background:oklch(0.965 0.004 270)}.ds-nav:focus-visible{outline:2px solid oklch(0.6 0.17 280)}"
     },
     {
       "name": "List group",

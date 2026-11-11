@@ -271,7 +271,7 @@
       "kind": "nav",
       "description": "Workspace navigation row.",
       "html": "<nav><a class=\"ds-nav\" href=\"#\" aria-current=\"page\">消息</a></nav>",
-      "css": ".ds-nav{font-family:\"Geist Variable\",system-ui,sans-serif;font-size:15px;line-height:24px;display:flex;align-items:center;min-height:44px;padding:0 12px;border-radius:10px;color:var(--foreground);text-decoration:none}.ds-nav[aria-current=page],.ds-nav:hover,.ds-nav:active{background:var(--muted)}.ds-nav:focus-visible{outline:2px solid var(--ring)}"
+      "css": ".ds-nav{font-family:\"Geist Variable\",system-ui,sans-serif;font-size:15px;line-height:24px;display:flex;align-items:center;min-height:44px;padding:0 12px;border-radius:8px;color:var(--foreground);text-decoration:none}.ds-nav[aria-current=page],.ds-nav:hover,.ds-nav:active{background:var(--muted)}.ds-nav:focus-visible{outline:2px solid var(--ring)}"
     },
     {
       "name": "List group",
