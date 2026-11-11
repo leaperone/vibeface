@@ -283,16 +283,41 @@ struct TlsFiles {
     failed: Option<(Stamp, std::time::Instant)>,
 }
 
-/// Each file's modification time and length.
-type Stamp = [(std::time::SystemTime, u64); 2];
-/// An unchanged pair that failed is tried again this often: a new owner or mode, which a
-/// renewal may set after writing, changes neither field of its stamp.
+/// Content digests are internal cache identities, including the private key's digest.
+type Stamp = [[u8; 32]; 2];
+/// An unchanged pair that failed to parse is tried again this often.
 const TLS_RETRY: Duration = Duration::from_secs(5);
+
+struct TlsMaterial {
+    certificate: Vec<u8>,
+    key: zeroize::Zeroizing<Vec<u8>>,
+}
+
+impl TlsMaterial {
+    fn read(dir: &Path) -> Result<Self> {
+        Ok(Self {
+            certificate: std::fs::read(dir.join(crate::config::TLS_CERT))
+                .context("cannot read TLS certificate")?,
+            key: zeroize::Zeroizing::new(
+                std::fs::read(dir.join(crate::config::TLS_KEY)).context("cannot read TLS key")?,
+            ),
+        })
+    }
+
+    fn stamp(&self) -> Stamp {
+        use sha2::{Digest as _, Sha256};
+        [
+            Sha256::digest(&self.certificate).into(),
+            Sha256::digest(self.key.as_slice()).into(),
+        ]
+    }
+}
 
 impl TlsFiles {
     fn load(dir: &Path) -> Result<Self> {
-        let loaded = tls_stamp(dir)?;
-        let (acceptor, leaf) = tls_acceptor(dir)?;
+        let material = TlsMaterial::read(dir)?;
+        let loaded = material.stamp();
+        let (acceptor, leaf) = tls_acceptor(&material)?;
         Ok(Self {
             dir: dir.to_owned(),
             loaded,
@@ -305,14 +330,15 @@ impl TlsFiles {
     /// The acceptor for the files as they are now. A pair that does not load, such as one caught
     /// between its certificate and its key being replaced, leaves the last good one in place.
     fn current(&mut self) -> tokio_rustls::TlsAcceptor {
-        let Ok(now) = tls_stamp(&self.dir) else {
+        let Ok(material) = TlsMaterial::read(&self.dir) else {
             return self.acceptor.clone();
         };
+        let now = material.stamp();
         let due = self
             .failed
             .is_none_or(|(stamp, at)| stamp != now || at.elapsed() >= TLS_RETRY);
         if now != self.loaded && due {
-            match tls_acceptor(&self.dir) {
+            match tls_acceptor(&material) {
                 Ok((acceptor, leaf)) => {
                     tracing::info!(event = "tls.reloaded", sha256 = %leaf, "serving a new TLS certificate");
                     (self.acceptor, self.leaf, self.loaded, self.failed) =
@@ -330,29 +356,17 @@ impl TlsFiles {
     }
 }
 
-fn tls_stamp(dir: &Path) -> std::io::Result<Stamp> {
-    let stamp = |name| {
-        let file = std::fs::metadata(dir.join(name))?;
-        Ok::<_, std::io::Error>((file.modified()?, file.len()))
-    };
-    Ok([
-        stamp(crate::config::TLS_CERT)?,
-        stamp(crate::config::TLS_KEY)?,
-    ])
-}
-
-fn tls_acceptor(dir: &Path) -> Result<(tokio_rustls::TlsAcceptor, String)> {
+fn tls_acceptor(material: &TlsMaterial) -> Result<(tokio_rustls::TlsAcceptor, String)> {
     use sha2::{Digest as _, Sha256};
     use tokio_rustls::rustls::{
         self,
         pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _},
     };
-    let chain = CertificateDer::pem_file_iter(dir.join(crate::config::TLS_CERT))
-        .and_then(Iterator::collect::<std::result::Result<Vec<_>, _>>)
+    let chain = CertificateDer::pem_slice_iter(&material.certificate)
+        .collect::<std::result::Result<Vec<_>, _>>()
         .context("invalid TLS certificate")?;
     let leaf = hex::encode(Sha256::digest(chain.first().context("no TLS certificate")?));
-    let key = PrivateKeyDer::from_pem_file(dir.join(crate::config::TLS_KEY))
-        .context("invalid TLS key")?;
+    let key = PrivateKeyDer::from_pem_slice(&material.key).context("invalid TLS key")?;
     // Refuses a key that is not the leaf certificate's.
     let config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -409,7 +423,19 @@ async fn serve_public(
             continue;
         };
         let held = (place, share);
-        let acceptor = tls.as_mut().map(TlsFiles::current);
+        let acceptor = if let Some(mut files) = tls.take() {
+            // One refresh at a time, with file reads and certificate validation off the executor.
+            let (files, acceptor) = tokio::task::spawn_blocking(move || {
+                let acceptor = files.current();
+                (files, acceptor)
+            })
+            .await
+            .map_err(std::io::Error::other)?;
+            tls = Some(files);
+            Some(acceptor)
+        } else {
+            None
+        };
         let router = router.clone();
         // Handshakes run apart, so a slow client holds up no other.
         tokio::spawn(async move {
@@ -1358,6 +1384,83 @@ mod tests {
         std::fs::write(dir.join(TLS_KEY), &next.1)?;
         files.current();
         assert_eq!(files.leaf, fingerprint(&next.0));
+        assert!(files.failed.is_none());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn tls_reloads_same_metadata_material_and_retries_unchanged_bad_pairs() -> Result<()> {
+        use crate::config::{TLS_CERT, TLS_KEY};
+        use std::fs::{File, FileTimes};
+        use tokio_rustls::rustls::pki_types::{CertificateDer, pem::PemObject as _};
+
+        let dir = std::env::temp_dir().join(format!("vibeface-tls-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir)?;
+        let mut pairs: [(String, String); 3] = std::array::from_fn(|_| {
+            let made = rcgen::generate_simple_self_signed(vec!["203.0.113.7".into()]).unwrap();
+            (made.cert.pem(), made.signing_key.serialize_pem())
+        });
+        // DER signatures can vary in length; trailing PEM whitespace fixes the fixture sizes.
+        let cert_len = pairs.iter().map(|pair| pair.0.len()).max().unwrap();
+        let key_len = pairs.iter().map(|pair| pair.1.len()).max().unwrap();
+        for (cert, key) in &mut pairs {
+            cert.push_str(&"\n".repeat(cert_len - cert.len()));
+            key.push_str(&"\n".repeat(key_len - key.len()));
+        }
+        let modified = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let write = |name: &str, bytes: &str| -> std::io::Result<()> {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes)?;
+            File::options()
+                .write(true)
+                .open(path)?
+                .set_times(FileTimes::new().set_modified(modified))
+        };
+        let metadata = || -> std::io::Result<[(std::time::SystemTime, u64); 2]> {
+            let stamp = |name| -> std::io::Result<_> {
+                let file = std::fs::metadata(dir.join(name))?;
+                Ok((file.modified()?, file.len()))
+            };
+            Ok([stamp(TLS_CERT)?, stamp(TLS_KEY)?])
+        };
+        let fingerprint = |pem: &str| {
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                CertificateDer::from_pem_slice(pem.as_bytes()).unwrap(),
+            ))
+        };
+        write(TLS_CERT, &pairs[0].0)?;
+        write(TLS_KEY, &pairs[0].1)?;
+        let initial_metadata = metadata()?;
+        let mut files = TlsFiles::load(&dir)?;
+        assert_eq!(files.leaf, fingerprint(&pairs[0].0));
+
+        write(TLS_CERT, &pairs[1].0)?;
+        write(TLS_KEY, &pairs[1].1)?;
+        assert_eq!(metadata()?, initial_metadata);
+        files.current();
+        assert_eq!(files.leaf, fingerprint(&pairs[1].0));
+
+        write(TLS_CERT, &pairs[2].0)?;
+        assert_eq!(metadata()?, initial_metadata);
+        files.current();
+        assert_eq!(files.leaf, fingerprint(&pairs[1].0));
+        let failed_at = files.failed.context("mismatched pair must be rejected")?.1;
+        files.current();
+        assert_eq!(
+            files.failed.context("bad pair remains rejected")?.1,
+            failed_at
+        );
+        // Advance only the retry bookkeeping, without sleeping or changing the material.
+        files.failed.as_mut().unwrap().1 = failed_at - TLS_RETRY;
+        files.current();
+        assert_eq!(files.leaf, fingerprint(&pairs[1].0));
+        assert!(files.failed.context("bad pair still fails on retry")?.1 > failed_at);
+
+        write(TLS_KEY, &pairs[2].1)?;
+        assert_eq!(metadata()?, initial_metadata);
+        files.current();
+        assert_eq!(files.leaf, fingerprint(&pairs[2].0));
         assert!(files.failed.is_none());
         std::fs::remove_dir_all(dir)?;
         Ok(())
