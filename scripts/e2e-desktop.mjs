@@ -2,11 +2,37 @@
 // Run the packaged native executable in an isolated, controlled-fixture profile.
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 const repo = fileURLToPath(new URL('../', import.meta.url));
+
+function freshProfilePath(directory) {
+  // The real application creates the profile with its protected current-account ACL.
+  // Precreating it in Node inherits a Windows DACL that prepare_profile must reject.
+  const profile = path.join(directory, `controlled-profile-${randomUUID()}`);
+  assert(!fs.existsSync(profile), 'the controlled application profile must be fresh');
+  return profile;
+}
+
+if (process.argv.length === 3 && process.argv[2] === '--self-test') {
+  const artifacts = path.join(repo, '.artifacts');
+  fs.mkdirSync(artifacts, { recursive: true });
+  const directory = fs.mkdtempSync(path.join(artifacts, 'profile-allocation-'));
+  try {
+    const first = freshProfilePath(directory);
+    const second = freshProfilePath(directory);
+    assert.notEqual(first, second);
+    assert.equal(path.dirname(first), directory);
+    assert.match(path.basename(first), /^controlled-profile-[a-f0-9-]{36}$/);
+    assert(!fs.existsSync(first) && !fs.existsSync(second));
+    assert.deepEqual(fs.readdirSync(directory), [], 'profile allocation must not create files or directories');
+    console.log('native desktop driver self-test passed: unique absent profile paths leave private directory creation to the app');
+  } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  process.exit(0);
+}
 
 const options = new Map();
 const args = process.argv.slice(2);
@@ -18,7 +44,7 @@ while (args.length) {
 for (const flag of ['--app', '--runtime', '--output']) assert(options.has(flag), `${flag} is required`);
 const output = options.get('--output');
 fs.mkdirSync(output, { recursive: true });
-const profile = fs.mkdtempSync(path.join(output, 'controlled-profile-'));
+const profile = freshProfilePath(output);
 const report = path.join(profile, 'window.json');
 const requested = options.get('--app');
 const executable = requested.endsWith('.app') ? path.join(requested, 'Contents/MacOS/Vibeface') : requested;
