@@ -928,14 +928,20 @@ pub struct OpencodeEndpoint {
 }
 
 pub const OPENCODE_ENDPOINT_KEY: &str = "OPENCODE_ENDPOINT_API_KEY";
+const ENDPOINT_NO_TOKEN: &str = "no-token";
 
 impl OpencodeEndpoint {
+    // opencode expands `{env:..}` and `{file:..}` anywhere in its config, so braces are refused.
     fn validate(&self) -> Result<()> {
         ensure!(
             self.base_url.len() <= 2048
-                && reqwest::Url::parse(&self.base_url)
-                    .is_ok_and(|url| matches!(url.scheme(), "http" | "https")),
-            "the endpoint base URL must be an http or https URL"
+                && !self.base_url.contains(['{', '}'])
+                && reqwest::Url::parse(&self.base_url).is_ok_and(|url| {
+                    matches!(url.scheme(), "http" | "https")
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                }),
+            "the endpoint base URL must be an http or https URL without credentials or braces"
         );
         ensure!(
             (1..=64).contains(&self.models.len()),
@@ -944,6 +950,10 @@ impl OpencodeEndpoint {
         let mut seen = BTreeSet::new();
         for model in &self.models {
             ensure!(!model.is_empty(), "an endpoint model needs a name");
+            ensure!(
+                !model.contains(['{', '}']),
+                "endpoint model {model} has braces"
+            );
             crate::model::validate_model(model)?;
             ensure!(seen.insert(model), "endpoint model {model} is listed twice");
         }
@@ -951,13 +961,16 @@ impl OpencodeEndpoint {
     }
 
     /// opencode configuration declaring the endpoint as provider `custom`. The token stays in
-    /// its variable; without one, apiKey is left out so no authentication header is sent and the
-    /// OpenAI adapter does not fall back to `OPENAI_API_KEY`.
+    /// its variable. Without one, apiKey is a fixed non-secret value: left out or empty, the
+    /// adapters fall back to the host's `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` and would send
+    /// that key to the endpoint.
     fn config_content(&self, has_key: bool) -> String {
-        let mut options = json!({"baseURL":self.base_url});
-        if has_key {
-            options["apiKey"] = json!(format!("{{env:{OPENCODE_ENDPOINT_KEY}}}"));
-        }
+        let api_key = if has_key {
+            format!("{{env:{OPENCODE_ENDPOINT_KEY}}}")
+        } else {
+            ENDPOINT_NO_TOKEN.to_owned()
+        };
+        let options = json!({"baseURL":self.base_url,"apiKey":api_key});
         let models: serde_json::Map<String, Value> = self
             .models
             .iter()
@@ -1129,6 +1142,14 @@ fn validate(provider: Provider, name: &str, value: &str) -> Result<()> {
     ensure!(
         !value.is_empty() && value.len() <= 4096 && !value.contains('\0'),
         "a variable value must be 1 to 4096 characters"
+    );
+    // opencode substitutes the token into JSON text unescaped.
+    ensure!(
+        name != OPENCODE_ENDPOINT_KEY
+            || !value
+                .chars()
+                .any(|c| c == '"' || c == '\\' || c.is_whitespace() || c.is_control()),
+        "the endpoint token cannot contain quotes, backslashes or whitespace"
     );
     Ok(())
 }
@@ -2444,9 +2465,20 @@ requires_openai_auth = false
         assert_eq!(
             content(&local)?,
             json!({"provider":{"custom":{"npm":"@ai-sdk/anthropic","name":"Custom endpoint",
-                "options":{"baseURL":"https://api.example.test/v1"},
+                "options":{"baseURL":"https://api.example.test/v1","apiKey":"no-token"},
                 "models":{"model-a":{},"model-b":{}}}}})
         );
+        for token in ["has space", "quo\"te", "back\\slash"] {
+            assert!(
+                local
+                    .env
+                    .apply(
+                        Provider::Opencode,
+                        [(OPENCODE_ENDPOINT_KEY.into(), Some(token.into()))].into(),
+                    )
+                    .is_err()
+            );
+        }
         local.env.apply(
             Provider::Opencode,
             [(OPENCODE_ENDPOINT_KEY.into(), Some("fixture-token".into()))].into(),
@@ -2468,6 +2500,9 @@ requires_openai_auth = false
             json!({"protocol":"openai","base_url":"ftp://example.test","models":["m"]}),
             json!({"protocol":"openai","base_url":"https://example.test","models":[]}),
             json!({"protocol":"openai","base_url":"https://example.test","models":["m","m"]}),
+            json!({"protocol":"openai","base_url":"https://u:p@example.test","models":["m"]}),
+            json!({"protocol":"openai","base_url":"https://example.test/{file:~/.ssh/id}","models":["m"]}),
+            json!({"protocol":"openai","base_url":"https://example.test","models":["{env:HOME}"]}),
         ] {
             local.switches.opencode_endpoint = Some(serde_json::from_value(invalid)?);
             assert!(local.validate(false).is_err());

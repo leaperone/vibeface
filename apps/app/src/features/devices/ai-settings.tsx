@@ -678,7 +678,7 @@ function ExecutionDetails({ model, models, working, busy, save }: { model: strin
 
 const protocolLabels: Record<EndpointProtocol, string> = { openai_compatible: "OpenAI 兼容", anthropic: "Anthropic", openai: "OpenAI" }
 
-/** opencode's custom model service. The token is write-only: left empty, the stored one stays. Keyed by the saved endpoint, so a save resets the draft. */
+/** opencode's custom model service. The token is write-only: left empty, the stored one stays. Keyed by the saved endpoint; a saved token clears its draft. */
 function EndpointDetails({ endpoint, working, busy, save }: { endpoint: ProviderEndpoint | null; working: boolean; busy: string; save(key: string, value: Omit<Change, "provider">): Promise<boolean> }) {
   const [protocol, setProtocol] = useState<EndpointProtocol>(endpoint?.protocol ?? "openai_compatible")
   const [baseUrl, setBaseUrl] = useState(endpoint?.base_url ?? "")
@@ -689,7 +689,7 @@ function EndpointDetails({ endpoint, working, busy, save }: { endpoint: Provider
   const dirty = Boolean(token) || protocol !== (endpoint?.protocol ?? "openai_compatible") || baseUrl.trim() !== (endpoint?.base_url ?? "") || models.join("\n") !== (endpoint?.models.join("\n") ?? "")
   return <form className="grid gap-2" onSubmit={(event) => {
     event.preventDefault()
-    void save("endpoint", { opencode_endpoint: { protocol, base_url: baseUrl.trim(), models, ...(token ? { api_key: token } : {}) } })
+    void save("endpoint", { opencode_endpoint: { protocol, base_url: baseUrl.trim(), models, ...(token ? { api_key: token.trim() } : {}) } }).then((saved) => { if (saved) setToken("") })
   }}>
     <label className="grid gap-1 text-meta">协议
       <NativeSelect className="w-full" value={protocol} disabled={working} onChange={(event) => setProtocol(event.target.value as EndpointProtocol)}>
