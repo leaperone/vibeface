@@ -1,0 +1,151 @@
+name: CI / Desktop
+run-name: >-
+  Desktop · ${{ github.event_name }} · ${{ github.ref_name }} · ${{ inputs.intent }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      intent:
+        description: Four-platform Desktop acceptance or full Core plus Mac and Windows acceptance
+        type: choice
+        options: [desktop-only, full-validation]
+        default: desktop-only
+
+concurrency:
+  group: ci-desktop-${{ github.ref }}-${{ inputs.intent }}${{ github.run_attempt > 1 && format('-rerun-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.run_attempt == 1 }}
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  checks:
+    name: Full Core validation
+    if: inputs.intent == 'full-validation'
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+
+  crypto-web:
+    name: Browser cryptography for Desktop
+    if: inputs.intent == 'desktop-only'
+    uses: ./.github/workflows/_ci-crypto.yml
+    with:
+      source_sha: ${{ github.sha }}
+
+  web:
+    name: Web assets for Desktop
+    needs: crypto-web
+    if: inputs.intent == 'desktop-only'
+    uses: ./.github/workflows/_ci-web.yml
+    with:
+      source_sha: ${{ github.sha }}
+
+  windows-native:
+    name: Windows Rust and packaged processes
+    needs: checks
+    if: inputs.intent == 'full-validation'
+    uses: ./.github/workflows/ci-windows-native.yml
+    permissions:
+      contents: read
+      actions: read
+    with:
+      source_sha: ${{ needs.checks.outputs.source_sha }}
+      package_artifact: node-package-x86_64-pc-windows-msvc-${{ needs.checks.outputs.source_sha }}
+
+  desktop-macos:
+    name: macOS Desktop acceptance
+    needs: checks
+    if: inputs.intent == 'full-validation'
+    uses: ./.github/workflows/ci-desktop.yml
+    with:
+      source_sha: ${{ needs.checks.outputs.source_sha }}
+      runner: macos-15
+      target: aarch64-apple-darwin
+      package_artifact: node-package-aarch64-apple-darwin-${{ needs.checks.outputs.source_sha }}
+
+  desktop-windows:
+    name: Windows Desktop acceptance
+    needs: checks
+    if: inputs.intent == 'full-validation'
+    uses: ./.github/workflows/ci-desktop.yml
+    with:
+      source_sha: ${{ needs.checks.outputs.source_sha }}
+      runner: windows-2025
+      target: x86_64-pc-windows-msvc
+      package_artifact: node-package-x86_64-pc-windows-msvc-${{ needs.checks.outputs.source_sha }}
+
+  desktop-only-macos:
+    name: macOS native Desktop and window
+    needs: [crypto-web, web]
+    if: inputs.intent == 'desktop-only'
+    uses: ./.github/workflows/ci-desktop.yml
+    with:
+      source_sha: ${{ github.sha }}
+      runner: macos-15
+      target: aarch64-apple-darwin
+
+  desktop-only-windows:
+    name: Windows native Desktop and window
+    needs: [crypto-web, web]
+    if: inputs.intent == 'desktop-only'
+    uses: ./.github/workflows/ci-desktop.yml
+    with:
+      source_sha: ${{ github.sha }}
+      runner: windows-2025
+      target: x86_64-pc-windows-msvc
+
+  desktop-only-linux-x64:
+    name: Linux x64 native Desktop and window
+    needs: [crypto-web, web]
+    if: inputs.intent == 'desktop-only'
+    uses: ./.github/workflows/ci-desktop.yml
+    with:
+      source_sha: ${{ github.sha }}
+      runner: ubuntu-24.04
+      target: x86_64-unknown-linux-gnu
+
+  desktop-only-linux-arm64:
+    name: Linux arm64 native Desktop and window
+    needs: [crypto-web, web]
+    if: inputs.intent == 'desktop-only'
+    uses: ./.github/workflows/ci-desktop.yml
+    with:
+      source_sha: ${{ github.sha }}
+      runner: ubuntu-24.04-arm
+      target: aarch64-unknown-linux-gnu
+
+  windows-platform:
+    name: Windows Rust checks
+    if: inputs.intent == 'desktop-only'
+    uses: ./.github/workflows/ci-windows-native.yml
+    permissions:
+      contents: read
+      actions: read
+    with:
+      source_sha: ${{ github.sha }}
+
+  desktop-gate:
+    name: Desktop acceptance gate
+    if: always()
+    needs: [checks, crypto-web, web, windows-native, desktop-macos, desktop-windows, desktop-only-macos, desktop-only-windows, desktop-only-linux-x64, desktop-only-linux-arm64, windows-platform]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require exactly the selected Desktop acceptance
+        env:
+          DESKTOP_NEEDS: ${{ toJSON(needs) }}
+          INTENT: ${{ inputs.intent }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os
+          checks = json.loads(os.environ['DESKTOP_NEEDS'])
+          modes = {
+              'desktop-only': ['crypto-web', 'web', 'desktop-only-macos', 'desktop-only-windows', 'desktop-only-linux-x64', 'desktop-only-linux-arm64', 'windows-platform'],
+              'full-validation': ['checks', 'windows-native', 'desktop-macos', 'desktop-windows'],
+          }
+          if os.environ['INTENT'] not in modes: raise SystemExit('Invalid Desktop validation intent')
+          required = modes[os.environ['INTENT']]
+          failed = {name: checks.get(name, {}).get('result', 'missing') for name in required if checks.get(name, {}).get('result') != 'success'}
+          failed.update({name: job['result'] for name, job in checks.items() if name not in required and job['result'] != 'skipped'})
+          if failed: raise SystemExit('Desktop acceptance is incomplete: ' + json.dumps(failed))
+          PYTHON

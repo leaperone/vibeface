@@ -1,4 +1,4 @@
-name: Release Apps
+name: Reusable / Build Android APK
 
 on:
   workflow_call:

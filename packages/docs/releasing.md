@@ -5,16 +5,16 @@ description: 了解 Vibeface 的 CI、制品和 Nightly 发布流程。
 
 # 构建与发布
 
-[CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 按改动范围选择 `main` push 的核心检查；开发分支 PR 不触发 Actions，Draft 与 Ready 都不例外。merge queue 执行全工作区核心检查，定时和手动执行扩展回归。`main` 的常规 CI 只上传 Actions 制品，不创建公开版本。制品发布不触发线上部署。官方服务使用独立的部署命令选择已发布产品 Tag，见[官方服务部署](service-deployments.md)。公开版本在 [Releases](https://github.com/leaperone/vibeface/releases) 下载。具体选择规则见 [按改动选择 CI](ci.md)。
+[CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 按改动范围选择 `main` push 的核心检查；开发分支 PR 不触发 Actions，Draft 与 Ready 都不例外。merge queue 执行全工作区核心检查，手动 Core 与独立 `nightly.yml` 执行扩展回归。`main` 的常规 CI 只上传 Actions 制品，不创建公开版本。制品发布不触发线上部署。官方服务使用独立的部署命令选择已发布产品 Tag，见[官方服务部署](service-deployments.md)。公开版本在 [Releases](https://github.com/leaperone/vibeface/releases) 下载。具体选择规则见 [按改动选择 CI](ci.md)。
 
 ## 按产品组合发布
 
 Core、CLI、Web App、Desktop 和 Mobile 共享一个版本、一个 `v<version>` Tag 与一个 GitHub Release。`www-v<version>` 只发布独立官网与文档。产品版本以 `apps/cli/Cargo.toml` 为准，各产品组件的发行版本必须与之相等。
 
-| 发布组 | Tag | 交付物 |
-| --- | --- | --- |
-| product | `v<version>` | 四个平台的完整 CLI/Core 包、macOS、Windows 与两个 Linux 架构的桌面安装包、Web App 归档、Android APK、iOS 设备归档及配置签名后的 IPA，以及各自校验信息 |
-| www | `www-v<version>` | 静态官网与文档归档 |
+| 发布组 | Tag | 工作流 | 交付物 |
+| --- | --- | --- | --- |
+| product | `v<version>` | `release.yml`（Release / Product） | 四个平台的完整 CLI/Core 包、macOS、Windows 与两个 Linux 架构的桌面安装包、Web App 归档、Android APK、iOS 设备归档及配置签名后的 IPA，以及各自校验信息 |
+| www | `www-v<version>` | `release-www.yml`（Release / Website） | 静态官网与文档归档 |
 
 首个正式版为 `0.0.1`。Nightly 使用 `0.0.1-nightly.YYYYMMDD.N`，日期取 UTC 准备日期，序号按发布组递增。Mobile 的 `expo.version` 保持 `0.0.1`，版本准备时 Android versionCode 与 iOS buildNumber 各递增一次。Android 交付 APK；iOS 先走 TestFlight 内测，再准备 App Store 发布。构建签名 IPA 不代表已经上传、可供测试者安装或通过商店审核。
 
@@ -26,21 +26,21 @@ Core、CLI、Web App、Desktop 和 Mobile 共享一个版本、一个 `v<version
 
 ## 每 4 小时 Nightly 的发布约束
 
-协调入口是 `ci.yml` 的 `daily-nightly`。配置保留 `23 */4 * * *`，UTC 槽位为 00:23、04:23、08:23、12:23、16:23、20:23。GitHub schedule 是 best effort，可能延迟或跳过，不保证每个槽位都发生。仅 main schedule 的 `ci-gate` 成功后启动自动 Nightly。手动 CI 和普通 main push 不触发它，手动扩展检查不能补发 Nightly。
+协调入口是 `nightly.yml`（Release / Nightly）的 `daily-nightly`。配置保留 `23 */4 * * *`，UTC 槽位为 00:23、04:23、08:23、12:23、16:23、20:23。GitHub schedule 是 best effort，可能延迟或跳过，不保证每个槽位都发生。它先调用一次完整标准 Core，再由根级 `ci-gate` 验证结果。仅 main schedule 的 gate 成功后启动自动 Nightly。手动 Core、手动 Nightly 和普通 main push 不启动发布协调器，手动验证不能补发 Nightly。
 
 协调器只使用 job 级 `GITHUB_TOKEN`，不需要 PAT，不创建版本分支或 PR，也不把版本提交合入 main。它以原 schedule run 的精确 main SHA 为唯一 parent，生成一个普通机械版本提交，只改产品与官网版本、Cargo.lock 两个本仓包版本及 Android、iOS 构建号。完整 tree 校验保留依赖、脚本、权限、Mobile marketing version 与其他内容；`cargo metadata --locked --no-deps` 另核对两个本仓包的清单版本，带 `--no-deps` 时不校验锁文件，`Cargo.lock` 的内容由完整 tree 比对覆盖。仅路径白名单不能放行发布。
 
 原 run 的 `created_at` 转为 UTC，向下取整到四小时批次，版本日期仍取原 run 的 `YYYYMMDD`。机械提交记录原 schedule run ID、批次及上一可信 Nightly 来源。Android versionCode 和 iOS buildNumber 从 main 与上一可信产品 Nightly 取数值上界后各递增一次。iOS 按数字分段比较，末段超出 Apple 上限就停止，不回绕或自动进位。恢复同批次沿用原提交、版本与构建号。上一来源已完整发布且 npm 成功、main 又没有新提交时跳过；部分 Tag、Release 或 npm 必须先恢复原来源，不分配新版本覆盖。既有 main 产品 Tag 独立恢复产品与 npm，不重发其旧官网版本。
 
-机械 Nightly 的发布门验证普通单 parent、parent 在 main、精确机械 tree，以及原 schedule run 的仓库、workflow path、main、SHA 与成功 `ci-gate`。不等待包含协调 job 的整个 schedule run 成功，避免循环。Stable、RC 及直接位于 main 的 Tag 仍要求原有 main push CI success。所有制品、Tag、`source_commit` 与 provenance 始终绑定实际版本提交，可信 parent 仅用于 CI 证明。
+机械 Nightly 的发布门验证普通单 parent、parent 在 main、精确机械 tree，以及原 schedule run 的仓库、workflow path、main、SHA 与成功 `ci-gate`。来源门根据原 CI SHA 的精确文件树选择 workflow 和根级 gate，新来源要求 `nightly.yml`，历史来源仍严格验证原 `ci.yml`，不使用宽泛路径白名单。不等待包含协调 job 的整个 schedule run 成功，避免循环。Stable、RC 及直接位于 main 的 Tag 仍要求原有 main push CI success。所有制品、Tag、`source_commit` 与 provenance 始终绑定实际版本提交，可信 parent 仅用于 CI 证明。
 
-Tag 只创建一次，随后用 `GITHUB_TOKEN` 精确 dispatch `release.yml` 并指定 `publish=true`。产品与官网可并行发布。响应未知时先查询远端 Tag 和原 run，对账后继续，不重复副作用；已有 Tag 指向其他 SHA 时停止。发布恢复复用原运行和完整不可变 artifact，不重建或覆盖公开字节。npm 失败保持失败；原制品缺失、过期或字节冲突时停止。
+Tag 只创建一次，随后用 `GITHUB_TOKEN` 按发布组精确 dispatch `release.yml` 或 `release-www.yml` 并指定 `publish=true`。历史来源由精确源码树选择原发布入口，恢复仍核对原运行身份。产品与官网可并行发布。响应未知时先查询远端 Tag 和原 run，对账后继续，不重复副作用；已有 Tag 指向其他 SHA 时停止。发布恢复复用原运行和完整不可变 artifact，不重建或覆盖公开字节。npm 失败保持失败；原制品缺失、过期或字节冲突时停止。
 
 ## 独立部署发布
 
 产品和官网发布只交付制品，不推送线上服务。公共节点与 App 使用[官方服务部署](service-deployments.md)中的独立命令，显式选择已经完成发布的产品 Tag。部署端校验最终 `release.json`、源码身份及所选制品字节后，包装和部署容器。它不重新编译产品，也不创建新产品版本。
 
-官网使用独立命令 `python3 scripts/deploy.py release --service www --tag www-v<version>`。所有部署都在本仓库的 `deploy-services.yml` 中执行，不派发其他仓库。命令成功不代表上线，必须跟踪运行到终态并验证线上版本。
+官网使用独立命令 `python3 scripts/deploy.py release --service www --tag www-v<version>`。CLI 按目标选择 `deploy-node.yml`、`deploy-app.yml`、`deploy-www.yml` 或 `deploy-product.yml`。入口固定目标，`apply=false` 默认构建验证与排练，统一调用本仓库的 `deploy-services.yml`，由它持有全局锁。`all` 仍将 Node 与 App 作为同一可观察批次。命令成功不代表上线，必须跟踪运行到终态并验证线上版本。
 
 ## 可下载的包
 
@@ -132,10 +132,11 @@ pnpm --filter vibeface-www run check:static
 手动验证默认只构建，既不创建 Tag，也不公开 Release：
 
 ```sh
-gh workflow run release.yml --ref <branch> -f app=product -F publish=false
+gh workflow run release.yml --ref <branch> -F publish=false
+gh workflow run release-www.yml --ref <branch> -F publish=false
 ```
 
-真实发布的手动入口只能引用现存精确 Tag，例如 `--ref v<version> -f app=product -f tag=v<version> -F publish=true`。网站使用 `app=www` 与 `www-v<version>`。先查询同一 Tag、SHA 的原 run，不为一次未知响应重复派发。失败的 publisher 只消费原完整 artifact，不能为同一 Tag 重建替换字节。
+两个手动入口均只有 `tag` 与 `publish` 参数，`tag` 默认为空，`publish` 默认为 false；入口固定发布组，不接受 `app`。真实发布只能引用现存精确 Tag。产品使用 `release.yml --ref v<version> -f tag=v<version> -F publish=true`，官网使用 `release-www.yml --ref www-v<version> -f tag=www-v<version> -F publish=true`。`scripts/release-entry.py` 统一验证入口身份。新增入口需合入默认分支后才可派发。先查询同一 Tag、SHA 的原 run，不为一次未知响应重复派发。失败的 publisher 只消费原完整 artifact，不能为同一 Tag 重建替换字节。
 
 ## 更新渠道
 
@@ -183,7 +184,7 @@ npm 包名为 `@leaperone/vibeface`，已公开首版 `0.0.1-nightly.20261106.1`
 
 `scripts/package-npm.mjs` 接收四个平台的完整 `.tar.gz` 与同名 SHA256，要求四个平台的 CLI 版本、CLI 源码、锁定组件身份及包协议一致，平台字段分别匹配各自 target。它拒绝危险路径、链接、特殊文件、校验错配和缺失资源，把完整包放入 `vendor/<target>`，再生成一个含全部平台的 `.tgz`。只有一个 npm 发布身份和一次发布操作，代价是下载包含其他平台的程序。没有 postinstall、运行期下载或新增 npm 依赖。
 
-定时和手动扩展 CI 生成 `npm-package-<SHA>` artifact。产品 Nightly 汇总生成 `npm-package-<SHA>-<producer_attempt>`，由 `collect` 输出不可变 artifact ID。npm job 使用该 id 下载，失败后单独重跑仍使用原 producer 的制品，不按当前 run attempt 拼接名称。两种 artifact 都包含 `.tgz` 和记录源码 SHA、SHA256、npm integrity 的 JSON。CI 在四个原生平台上以 `--ignore-scripts` 全局安装到隔离 prefix，然后验证版本；POSIX 平台另以 `--web-only` 验证启动和随包网页，不重复完整多节点验收。Stable 和 rc 延续现有 GitHub 发布流程，不生成 npm 包。
+Nightly 的标准 Core 与手动扩展 Core 生成 `npm-package-<SHA>` artifact。产品 Nightly 汇总生成 `npm-package-<SHA>-<producer_attempt>`，由 `collect` 输出不可变 artifact ID。npm job 使用该 id 下载，失败后单独重跑仍使用原 producer 的制品，不按当前 run attempt 拼接名称。两种 artifact 都包含 `.tgz` 和记录源码 SHA、SHA256、npm integrity 的 JSON。CI 在四个原生平台上以 `--ignore-scripts` 全局安装到隔离 prefix，然后验证版本；POSIX 平台另以 `--web-only` 验证启动和随包网页，不重复完整多节点验收。Stable 和 rc 延续现有 GitHub 发布流程，不生成 npm 包。
 
 本地检查与打包命令如下。输入目录只能包含对应版本的四个包与四个 checksum，默认输出 `.artifacts/npm`，已有同名制品会被保留并报错：
 

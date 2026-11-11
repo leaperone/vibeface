@@ -1,4 +1,4 @@
-name: Release native inputs
+name: Reusable / Build native programs
 on:
   workflow_call:
     inputs:
@@ -22,6 +22,7 @@ permissions:
   contents: read
 jobs:
   build:
+    name: Build CLI + Core / ${{ inputs.target }}
     runs-on: ${{ inputs.runner }}
     defaults:
       run: {shell: bash}
