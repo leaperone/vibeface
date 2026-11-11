@@ -129,7 +129,7 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 
 #### opencode 自定义模型服务
 
-不想登录 opencode 账户时，可以在 opencode 的**设置 → 自定义模型服务**里填一个兼容 API 的端点：协议（`openai_compatible`、`anthropic` 或 `openai`）、Base URL、API Token 和至少一个模型名。保存后 Node 在下一轮重启自己的 `opencode serve`，Bot 和执行任务的模型写成 `custom/<模型名>`。Token 只能写入、不回显，存在本机私有的 Provider 环境文件，变量名为 `OPENCODE_ENDPOINT_API_KEY`，不进 `config.json`、共享记录或工具载荷；不填 Token 时不发送认证头，适合本机 Ollama、LM Studio 一类服务。CLI 用同一个入口：
+不想登录 opencode 账户时，可以在 opencode 的**设置 → 自定义模型服务**里填一个兼容 API 的端点：协议（`openai_compatible`、`anthropic` 或 `openai`）、Base URL、API Token 和至少一个模型名。保存后 Node 在下一轮重启自己的 `opencode serve`，Bot 和执行任务的模型写成 `custom/<模型名>`。Token 只能写入、不回显，存在本机私有 `config.json` 的 opencode Provider 变量里，变量名为 `OPENCODE_ENDPOINT_API_KEY`，不进共享记录或工具载荷；不填 Token 时不发送认证头，适合本机 Ollama、LM Studio 一类服务。CLI 用同一个入口：
 
 ```bash
 printf '%s' '{"opencode_endpoint":{"protocol":"openai_compatible","base_url":"https://api.example.com/v1","models":["model-a"],"api_key":"<Token>"}}' \

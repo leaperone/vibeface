@@ -176,7 +176,7 @@ pub struct ProviderOptions {
 
 #[derive(Subcommand)]
 pub enum ProviderAction {
-    /// Change a provider: {"bot","execution","execution_model","bin","app_server","connect_local","env"}.
+    /// Change a provider: {"bot","execution","execution_model","bin","app_server","connect_local","env","opencode_endpoint"}.
     Configure {
         #[arg(value_enum)]
         provider: crate::triage::Provider,

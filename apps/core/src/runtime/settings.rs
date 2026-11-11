@@ -93,6 +93,29 @@ pub struct ProviderChange {
     connect_local: bool,
     #[serde(default)]
     env: BTreeMap<String, Option<String>>,
+    /// opencode's custom model service; `null` removes it and its token.
+    #[serde(default, deserialize_with = "present")]
+    opencode_endpoint: Option<Option<EndpointChange>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EndpointChange {
+    protocol: providers::EndpointProtocol,
+    base_url: String,
+    models: Vec<String>,
+    /// Absent keeps the stored token, `null` removes it.
+    #[serde(default, deserialize_with = "present")]
+    api_key: Option<Option<String>>,
+}
+
+/// Tells a field given as `null` (`Some(None)`) from an absent one (`None`).
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 impl ProviderChange {
@@ -195,7 +218,31 @@ impl ProviderChange {
             ensure!(provider.on_app_server(), "only Codex has an App Server");
             target.local.switches.codex_app_server = app_server;
         }
-        target.local.env.apply(provider, self.env)
+        let mut env = self.env;
+        if let Some(endpoint) = self.opencode_endpoint {
+            ensure!(
+                provider == Provider::Opencode,
+                "only opencode has a custom endpoint"
+            );
+            let key = providers::OPENCODE_ENDPOINT_KEY.to_owned();
+            target.local.switches.opencode_endpoint = match endpoint {
+                Some(endpoint) => {
+                    if let Some(api_key) = endpoint.api_key {
+                        env.insert(key, api_key);
+                    }
+                    Some(providers::OpencodeEndpoint {
+                        protocol: endpoint.protocol,
+                        base_url: endpoint.base_url.trim().to_owned(),
+                        models: endpoint.models,
+                    })
+                }
+                None => {
+                    env.insert(key, None);
+                    None
+                }
+            };
+        }
+        target.local.env.apply(provider, env)
     }
 }
 
@@ -521,6 +568,13 @@ impl Runtime {
             "execution_model":execution_model, "execution_readiness":execution_readiness,
             "authentication_source":roots.authentication_source(provider, local),
             "setup":setup,
+            "endpoint":(provider == Provider::Opencode).then(|| {
+                local.switches.opencode_endpoint.as_ref().map(|endpoint| {
+                    json!({"protocol":endpoint.protocol,"base_url":endpoint.base_url,
+                        "models":endpoint.models,
+                        "has_api_key":configured.contains_key(providers::OPENCODE_ENDPOINT_KEY)})
+                })
+            }),
         })
     }
 
@@ -1573,6 +1627,84 @@ mod tests {
         );
         assert_eq!(std::fs::read(dir.join("config.json"))?, bytes);
         drop(restarted);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn opencode_endpoint_token_is_private_and_write_only() -> Result<()> {
+        let (node, admin, dir) = super::super::triage::tests::node().await?;
+        let owner = admin.device_id()?;
+        let endpoint = |api_key: Option<Value>| {
+            let mut endpoint = json!({"protocol":"openai_compatible",
+                "base_url":"http://127.0.0.1:11434/v1","models":["model-a"]});
+            if let Some(api_key) = api_key {
+                endpoint["api_key"] = api_key;
+            }
+            endpoint
+        };
+        let configure = |endpoint: Value| {
+            let node = &node;
+            let owner = &owner;
+            async move {
+                node.configure_provider(
+                    serde_json::from_value(
+                        json!({"provider":"opencode","opencode_endpoint":endpoint}),
+                    )?,
+                    owner,
+                    None,
+                )
+                .await
+            }
+        };
+        let status = |settings: &Value| {
+            settings["providers"]
+                .as_array()
+                .and_then(|all| all.iter().find(|status| status["provider"] == "opencode"))
+                .map(|status| status["endpoint"].clone())
+                .unwrap_or_default()
+        };
+        let settings = configure(endpoint(Some(json!("synthetic-endpoint-token")))).await?;
+        assert_eq!(
+            status(&settings),
+            json!({"protocol":"openai_compatible","base_url":"http://127.0.0.1:11434/v1",
+                "models":["model-a"],"has_api_key":true})
+        );
+        assert!(!settings.to_string().contains("synthetic-endpoint-token"));
+        let saved = Config::load(&dir)?;
+        assert_eq!(
+            saved.provider_env.get(Provider::Opencode)[providers::OPENCODE_ENDPOINT_KEY],
+            "synthetic-endpoint-token"
+        );
+        assert!(!serde_json::to_string(&saved.providers)?.contains("synthetic-endpoint-token"));
+        assert_eq!(
+            status(&configure(endpoint(None)).await?)["has_api_key"],
+            true
+        );
+        let removed_key = endpoint(Some(Value::Null));
+        assert_eq!(status(&configure(removed_key).await?)["has_api_key"], false);
+        configure(endpoint(Some(json!("synthetic-endpoint-token")))).await?;
+        assert_eq!(status(&configure(Value::Null).await?), Value::Null);
+        let local = node.providers();
+        assert!(local.switches.opencode_endpoint.is_none());
+        assert!(
+            !local
+                .env
+                .get(Provider::Opencode)
+                .contains_key(providers::OPENCODE_ENDPOINT_KEY)
+        );
+        assert!(
+            node.configure_provider(
+                serde_json::from_value(
+                    json!({"provider":"pi","opencode_endpoint":endpoint(None)})
+                )?,
+                &owner,
+                None,
+            )
+            .await
+            .is_err()
+        );
+        drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
