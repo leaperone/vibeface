@@ -52,11 +52,11 @@ jobs:
         run: |
           python -B scripts/native-desktop/diagnostic-inputs.py --source-run $env:SOURCE_RUN --source-sha $env:SOURCE_SHA --source-attempt $env:SOURCE_ATTEMPT --output .artifacts/installer-diagnostic-inputs --evidence .artifacts/native-installer-diagnostic/verified-inputs.json
       - name: Check config security replacement using the verified CLI
-        shell: pwsh
+        shell: bash
         env:
           RUNTIME: ${{ steps.inputs.outputs.runtime }}
         run: |
-          @'
+          python -B - <<'PY'
           import importlib.util
           import json
           import os
@@ -91,8 +91,7 @@ jobs:
               fixture.require(before == after, 'a second protected replacement preserves all config fields')
               fixture.require(after['network']['bind'] == '127.0.0.1:0', 'the fixture retains ephemeral real UDP allocation')
           print('Verified CLI config security replacement and unchanged content passed; no Node daemon or Provider was started')
-          '@ | python -B -
-          if ($LASTEXITCODE -ne 0) { throw 'Verified CLI config security replacement failed' }
+          PY
       - name: Locate the existing hosted installer compiler
         shell: pwsh
         run: |
