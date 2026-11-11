@@ -469,14 +469,19 @@ async fn local_grant_reconnect_allows_profile_switch_before_http_response() -> R
 
     let network = &fixture.node.state.genesis.network_id;
     let outbox = fixture.a_dir.join("outbox").join(network).join(&fixture.a);
-    let old_profile = Client::open_offline(
+    let retired_profile = Client::open_offline(
         Arc::new(ClientKey::open(&fixture.a_dir, PASSWORD)?),
         Endpoint::Gateway(fixture.node.entry.clone()),
-        outbox,
+        outbox.clone(),
     )
-    .await
-    .context("cancelled HTTP reconnect must release A's exclusive storage lease")?;
-    drop(old_profile);
+    .await;
+    assert!(
+        retired_profile
+            .err()
+            .context("retired A must retain its exclusive storage lease for profile reuse")?
+            .to_string()
+            .contains("already open")
+    );
 
     fixture.node.launch_gate.send_replace(false);
     tokio::time::timeout(
@@ -502,6 +507,16 @@ async fn local_grant_reconnect_allows_profile_switch_before_http_response() -> R
     assert_eq!(fixture.node.business.load(Ordering::SeqCst), 0);
     stop.send_replace(true);
     task.await?;
+    let old_profile = Client::open_offline(
+        Arc::new(ClientKey::open(&fixture.a_dir, PASSWORD)?),
+        Endpoint::Gateway(fixture.node.entry.clone()),
+        outbox,
+    )
+    .await
+    .context("joined backend must release A's retired and cancelled reconnect storage leases")?;
+    assert_eq!(old_profile.client_id(), fixture.a);
+    assert!(old_profile.pending().await?.is_empty());
+    drop(old_profile);
     Ok(())
 }
 

@@ -2076,7 +2076,7 @@ impl Client {
                         let params = json!({"op":"confirm_batch","intent_ids":ids});
                         id = self.operation_id(
                             "delivery",
-                            &json!({"target_node":self.target,"request":params}),
+                            &json!({"type":"delivery_confirm_batch","target_node":self.target,"request":params}),
                         )?;
                         params
                     }
@@ -2090,7 +2090,7 @@ impl Client {
                         let params = json!({"op":"accept_batch","order_ids":ids});
                         id = self.operation_id(
                             "delivery",
-                            &json!({"target_node":self.target,"request":params}),
+                            &json!({"type":"delivery_accept_batch","target_node":self.target,"request":params}),
                         )?;
                         params
                     }
@@ -2100,7 +2100,7 @@ impl Client {
                     } => {
                         vibeface_secure::membership::validate_hash(&budget_id)?;
                         vibeface_secure::membership::validate_hash(&batch_id)?;
-                        id = self.operation_id("delivery", &json!({"target_node":self.target,"budget_id":budget_id,"batch_id":batch_id}))?;
+                        id = self.operation_id("delivery", &json!({"type":"delivery_flush_budget","target_node":self.target,"budget_id":budget_id,"batch_id":batch_id}))?;
                         reconciliation = Reconciliation::DeliveryFlush {
                             budget_id: budget_id.clone(),
                             batch_id,
@@ -4288,6 +4288,94 @@ mod prepaid_tests {
         prepare.budget_id = Some("d".repeat(64));
         assert!(validate_new_delivery_prepare(&prepare).is_err());
         assert!(canonical_delivery_pair(["a".repeat(64), "a".repeat(64)], false).is_err());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn protected_delivery_producers_use_typed_local_ids_without_changing_core_wire()
+    -> Result<()> {
+        let setup = setup_prepaid(false, true, false).await?;
+        let (intents, orders, budget): ([String; 2], [String; 2], DeliveryBudgetBatch) = {
+            let evidence = setup.evidence.lock().unwrap();
+            (
+                std::array::from_fn(|index| {
+                    evidence.orders[index]["intent_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                }),
+                std::array::from_fn(|index| {
+                    evidence.orders[index]["order_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                }),
+                evidence.budget.clone(),
+            )
+        };
+        let actions = [
+            (
+                DeliveryAction::ConfirmBatch {
+                    intent_ids: [intents[1].clone(), intents[0].clone()],
+                },
+                json!({"op":"confirm_batch","intent_ids":intents}),
+            ),
+            (
+                DeliveryAction::AcceptBatch {
+                    order_ids: [orders[1].clone(), orders[0].clone()],
+                },
+                json!({"op":"accept_batch","order_ids":orders}),
+            ),
+            (
+                DeliveryAction::FlushBudget {
+                    budget_id: budget.budget_id.clone(),
+                    batch_id: delivery_flush_batch_id(&budget)?,
+                },
+                json!({"op":"flush_budget","budget_id":budget.budget_id}),
+            ),
+        ];
+        let mut ids = std::collections::BTreeSet::new();
+        for (action, expected_params) in actions {
+            // Exercise the real producer and secure canonicalizer, not a hand-built request.
+            let original = setup.client.prepare(Action::Delivery(action.clone()))?;
+            let mut duplicate = action;
+            match &mut duplicate {
+                DeliveryAction::ConfirmBatch { intent_ids } => intent_ids.reverse(),
+                DeliveryAction::AcceptBatch { order_ids } => order_ids.reverse(),
+                DeliveryAction::FlushBudget { .. } => {}
+                _ => unreachable!(),
+            }
+            let repeated = setup.client.prepare(Action::Delivery(duplicate))?;
+            assert_eq!(original.snapshot.id, repeated.snapshot.id);
+            assert_eq!(original.bytes, repeated.bytes);
+            assert!(
+                ids.insert(original.snapshot.id.clone()),
+                "different operations need distinct stable identities"
+            );
+            let wire: Value = serde_json::from_slice(&original.bytes)?;
+            assert_eq!(
+                wire,
+                json!({"id":original.snapshot.id,"method":"delivery","params":expected_params})
+            );
+            vibeface_secure::membership::validate_hash(&original.snapshot.id)?;
+            assert!(
+                wire["params"].get("type").is_none(),
+                "the local ID domain must not become a Core event body"
+            );
+            assert!(
+                wire["params"].get("attestation").is_none(),
+                "delivery uses the existing authenticated management contract"
+            );
+            assert_eq!(original.snapshot.network_id, setup.client.network_id());
+            assert_eq!(original.snapshot.client_id, setup.client.client_id());
+            assert_eq!(original.snapshot.target_node, setup.client.target_node());
+            assert_eq!(original.snapshot.state, OperationState::Prepared);
+        }
+        assert_eq!(setup.evidence.lock().unwrap().mutation_count, 0);
+        setup.client.close();
+        setup.server.abort();
+        drop(setup.client);
+        drop(setup.key);
+        std::fs::remove_dir_all(setup.dir)?;
         Ok(())
     }
     #[tokio::test]

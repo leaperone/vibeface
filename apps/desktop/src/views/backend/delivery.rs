@@ -326,6 +326,11 @@ pub(super) fn can_restart_transfer(order: &TransferOrder) -> bool {
         )
         && !order.windows.is_empty()
         && order.windows.iter().all(|window| window.state == "earned")
+        && transfer_sum([
+            order.payment.earned.as_str(),
+            order.payment.refunded.as_str(),
+        ])
+        .is_ok_and(|settled| settled == order.payment.total)
         || order.phase == "refunded"
             && order.payment.state == "refunded"
             && order.payment.refunded == order.payment.total
@@ -921,6 +926,27 @@ mod restart_tests {
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
+    #[test]
+    fn paid_restart_waits_for_the_whole_order_bonus_to_settle() {
+        let mut pending = terminal("00000000-0000-4000-8000-000000000001");
+        pending.payment.earned = "7".into();
+        assert_eq!(pending.payment.priority_fee, "3");
+        assert_eq!(pending.payment.total, "10");
+        assert!(validate_transfer_order(&pending).is_ok());
+        assert!(
+            !can_restart_transfer(&pending),
+            "earned windows do not settle the pending whole-order bonus"
+        );
+
+        let mut earned = pending.clone();
+        earned.payment.earned = "10".into();
+        assert!(can_restart_transfer(&earned));
+
+        let mut refunded = pending;
+        refunded.payment.refunded = "3".into();
+        assert!(can_restart_transfer(&refunded));
+    }
+
     #[test]
     fn restart_requires_exact_terminal_evidence_and_recoverable_acceptance() {
         let order = terminal("00000000-0000-4000-8000-000000000001");
