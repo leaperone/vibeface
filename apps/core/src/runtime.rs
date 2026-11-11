@@ -709,7 +709,7 @@ impl Runtime {
         store.on_log_head_written({
             let have_wakeup = have_wakeup.clone();
             move || have_wakeup.notify_one()
-        });
+        })?;
         let store = Arc::new(Mutex::new(store));
         let (events, _) = broadcast::channel(256);
         let (tx, rx) = mpsc::unbounded_channel();

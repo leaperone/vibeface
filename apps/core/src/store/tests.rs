@@ -7173,7 +7173,7 @@ fn reply_target_refresh_visits_only_related_mixed_history() -> Result<()> {
         atomic::{AtomicUsize, Ordering},
     };
     let net = net()?;
-    let store = store(&net)?;
+    let mut store = store(&net)?;
     let target = serde_json::to_string(&crate::workspace::InputTarget::Task {
         task_id: "task".into(),
     })?;
@@ -7205,10 +7205,10 @@ fn reply_target_refresh_visits_only_related_mixed_history() -> Result<()> {
                 observed.fetch_add(1, Ordering::Relaxed);
                 false
             }),
-        );
+        )?;
         let result =
             workspace::refresh_reply_targets(&store.connection, &net.network, "c", "input");
-        store.connection.progress_handler(0, None::<fn() -> bool>);
+        store.connection.progress_handler(0, None::<fn() -> bool>)?;
         result?;
         steps.push(count.load(Ordering::Relaxed));
         assert_eq!(
