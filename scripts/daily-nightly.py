@@ -523,6 +523,24 @@ def self_test():
             assert RELEASES == ('product', 'www') and PRODUCT_APPS == ('app', 'core', 'cli', 'mobile', 'desktop')
             base = git('rev-parse', 'HEAD')
             git('update-ref', 'refs/remotes/origin/main', base)
+            with tempfile.TemporaryDirectory(dir=scratch(), prefix='unreviewed-policy-') as temporary:
+                index = dict(os.environ, GIT_INDEX_FILE=str(Path(temporary) / 'index'))
+                git('read-tree', base, env=index)
+                git('update-index', '--force-remove', nightly_source.ABANDONED, env=index)
+                tree = git('write-tree', env=index)
+                without_policy = git('-c', 'user.name=fixture-reviewer', '-c', 'user.email=reviewer@example.invalid',
+                                     'commit-tree', tree, '-p', base, '-m', 'main without abandonment declarations')
+                policy = root / nightly_source.ABANDONED
+                original_policy = policy.read_bytes()
+                policy.write_text('unreviewed working-tree content is not a declaration\n')
+                git('update-ref', 'refs/remotes/origin/main', without_policy)
+                try:
+                    with patch('nightly_source.github') as no_remote:
+                        assert not abandoned_source(base, None, {})
+                        no_remote.assert_not_called()
+                finally:
+                    policy.write_bytes(original_policy)
+                    git('update-ref', 'refs/remotes/origin/main', base)
             plan = plan_versions('2026110600', base, ['v0.0.1-nightly.20261106.7', 'core-v0.0.1-nightly.20261106.9'], '42')
             assert plan.versions['cli'] == '0.0.1-nightly.20261106.8'
             assert plan.versions['www'] == '0.0.1-nightly.20261106.1'

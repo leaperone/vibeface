@@ -272,7 +272,10 @@ def release_jobs(run):
 
 def abandoned_source(source, plan, context):
     # Only the reviewed default branch can authorize abandoning immutable failed evidence.
-    records = json.loads(blob('origin/main', ABANDONED))
+    reviewed = git('rev-parse', 'refs/remotes/origin/main^{commit}')
+    if not git('ls-tree', reviewed, '--', ABANDONED):
+        return False
+    records = json.loads(blob(reviewed, ABANDONED))
     require(isinstance(records, list), 'Nightly abandonment declarations must be a list')
     seen = set()
     selected = None
