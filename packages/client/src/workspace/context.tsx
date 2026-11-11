@@ -867,7 +867,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const saves = messageSaves.current
     const previous = saves.get(lane) ?? Promise.resolve()
     localMessageSaves.current += 1; setMessageBusy(true)
-    const save = previous.catch(() => {}).then(() => inputLock(outboxKey('input-save', lane), async () => {
+    const save = inputLock(outboxKey('input-save', lane), () => previous.catch(() => {}).then(async () => {
       const uploads = await Promise.all(files.map(prepareAttachment))
       if (renderedConnection.current !== connection || !alive.current) throw new Error('工作区已切换，输入仍留在编辑器。')
       let prerequisite: OutboxItem | undefined

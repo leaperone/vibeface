@@ -635,7 +635,7 @@ test("workspace preserves bot and message requests while routing native decision
       const previousBots = knownBots, previousTranscript = transcript, previousMessages = messages.length
       const previousOutbox = new Map(outboxItems)
       const independentBot = { ...bot, bot_id: 'other-tab-bot', conversation_id: 'other-tab-chat' }
-      let first: Promise<boolean> | undefined, second: Promise<boolean> | undefined, independent: Promise<boolean> | undefined
+      let first: Promise<boolean> | undefined, second: Promise<boolean> | undefined, sameTabSecond: Promise<boolean> | undefined, independent: Promise<boolean> | undefined
       try {
         knownBots = [bot, independentBot]
         await render().refresh()
@@ -649,17 +649,20 @@ test("workspace preserves bot and message requests while routing native decision
         independent = render().sendMessage('independent tab input', [], [], { target: { kind: 'bot_main', bot_id: independentBot.bot_id }, conversation_id: independentBot.conversation_id })
         await new Promise(setImmediate)
         assert.deepEqual(messages.slice(before).map((message) => message.text), ['independent tab input'], 'a different target must remain independent of the held signature')
+        sameTabSecond = other().sendMessage('earlier same tab second input')
+        await new Promise(setImmediate)
         second = render().sendMessage('second tab input')
         await new Promise(setImmediate)
         assert.deepEqual(messages.slice(before).map((message) => message.text), ['independent tab input'], 'a later tab cannot submit ahead of the input still being signed')
         gate.resolve(null)
-        assert.deepEqual(await Promise.all([first, second, independent]), [true, true, true])
+        assert.deepEqual(await Promise.all([first, sameTabSecond, second, independent]), [true, true, true, true])
         await render().refresh(); await new Promise(setImmediate)
-        assert.deepEqual(messages.slice(before).map((message) => message.text), ['independent tab input', 'first tab input', 'second tab input'])
+        assert.deepEqual(messages.slice(before).map((message) => message.text), ['independent tab input', 'first tab input', 'earlier same tab second input', 'second tab input'])
         assert.equal(Number(messages[before + 2].sequence), Number(messages[before + 1].sequence) + 1)
+        assert.equal(Number(messages[before + 3].sequence), Number(messages[before + 2].sequence) + 1)
       } finally {
         gate.resolve(null)
-        await Promise.allSettled([first, second, independent])
+        await Promise.allSettled([first, sameTabSecond, second, independent])
         platform.transport.signClient = sign
         knownBots = previousBots
         for (const effect of otherHooks.effects.values()) effect.cleanup?.()
