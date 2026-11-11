@@ -86,8 +86,21 @@ test('native workspace routes preserve Task input, queue controls and directed C
   await expect(screen.getByLabel('设置', { exact: true })).toBeVisible({ timeout: 30000 });
   await screen.getByLabel('设置', { exact: true }).click();
   const externalChat = screen.getByRole('link', '转发到外部聊天', { exact: true });
-  await screen.scrollUntilVisible(externalChat, { direction: 'down' });
+  const settingsScroll = device.locator('role=scroll-area').filter({ has: externalChat });
+  await settingsScroll.scrollUntilVisible(externalChat, { direction: 'down' });
+  await expect.poll(async () => {
+    const row = await externalChat.boundingBox(), area = await settingsScroll.boundingBox();
+    assert(row && area, 'The settings link and its content area expose bounds');
+    const reachable = row.y >= area.y && row.y + row.height <= area.y + area.height;
+    if (!reachable) {
+      const x = area.x + area.width / 2;
+      const high = { x, y: area.y + area.height * 0.25 }, low = { x, y: area.y + area.height * 0.75 };
+      await screen.swipe(row.y < area.y ? { from: high, to: low, duration: 600 } : { from: low, to: high, duration: 600 });
+    }
+    return reachable;
+  }, { timeout: 5000 }).toBe(true);
   await externalChat.click();
+  await expect(screen.getByTestId('外部聊天', { visible: true })).toBeVisible();
   const webhookUrl = screen.getByLabel('外部聊天地址', { exact: true });
   const webhookSecret = screen.getByLabel('外部聊天密钥', { exact: true });
   const saveWebhook = screen.getByRole('button', '保存', { exact: true });
