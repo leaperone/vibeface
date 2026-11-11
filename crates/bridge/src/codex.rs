@@ -1108,13 +1108,16 @@ async fn connection_loop(
     }
 }
 
-async fn run_session(
-    stream: WebSocketStream<LocalStream>,
+async fn run_session<S>(
+    stream: WebSocketStream<S>,
     commands: &mut transport::Receiver<Command>,
     observed: &watch::Receiver<BTreeSet<String>>,
     cache: &Arc<RwLock<Cache>>,
     events: &EventSender,
-) -> String {
+) -> String
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (mut sink, mut reader) = stream.split();
     let (writer, mut writes) = writer_channel();
     let writer_cache = cache.clone();
@@ -1761,6 +1764,11 @@ impl DirectSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        pin::Pin,
+        task::{Context as TaskContext, Poll, Waker},
+    };
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
     /// A local endpoint of this account that no other test shares.
     fn local_endpoint(name: &str) -> crate::platform::ipc::Endpoint {
@@ -1861,14 +1869,103 @@ mod tests {
         assert!(state.pending.is_empty());
     }
 
+    #[derive(Default)]
+    struct FlushState {
+        held: bool,
+        writer: Option<Waker>,
+    }
+
+    #[derive(Default)]
+    struct FlushGate {
+        state: std::sync::Mutex<FlushState>,
+        entered: tokio::sync::Notify,
+    }
+
+    impl FlushGate {
+        fn hold(&self) {
+            self.state.lock().unwrap().held = true;
+        }
+
+        fn ready(&self, context: &TaskContext<'_>) -> bool {
+            let mut state = self.state.lock().unwrap();
+            if !state.held {
+                return true;
+            }
+            state.writer = Some(context.waker().clone());
+            self.entered.notify_one();
+            false
+        }
+
+        fn open(&self) {
+            let writer = {
+                let mut state = self.state.lock().unwrap();
+                state.held = false;
+                state.writer.take()
+            };
+            if let Some(writer) = writer {
+                writer.wake();
+            }
+        }
+    }
+
+    struct ControlledStream {
+        stream: LocalStream,
+        flush_gate: Option<Arc<FlushGate>>,
+    }
+
+    impl AsyncRead for ControlledStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().stream).poll_read(context, buffer)
+        }
+    }
+
+    impl AsyncWrite for ControlledStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.get_mut().stream).poll_write(context, bytes)
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if let Some(gate) = &this.flush_gate
+                && !gate.ready(context)
+            {
+                return Poll::Pending;
+            }
+            Pin::new(&mut this.stream).poll_flush(context)
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().stream).poll_shutdown(context)
+        }
+    }
+
     async fn controlled_session(
         events: EventSender,
+        flush_gate: Option<Arc<FlushGate>>,
     ) -> (
         CodexClient,
         WebSocketStream<LocalStream>,
         tokio::task::JoinHandle<String>,
     ) {
         let (left, right) = crate::platform::ipc::pair().await.unwrap();
+        let left = ControlledStream {
+            stream: left,
+            flush_gate,
+        };
         let (client, server) = tokio::join!(
             client_async("ws://localhost/", left),
             tokio_tungstenite::accept_async(right)
@@ -1907,7 +2004,7 @@ mod tests {
     async fn progress_pressure_disconnects_pending_mutation_without_replaying_it() {
         timeout(Duration::from_secs(3), async {
             let (sender, mut events) = event_channel_with_limits(2, 4096);
-            let (client, mut server, session) = controlled_session(sender).await;
+            let (client, mut server, session) = controlled_session(sender, None).await;
             assert_eq!(events.recv().await, Some(ExecEvent::Connected));
             assert_eq!(events.recv().await, Some(ExecEvent::Observed));
             let querying = client.clone();
@@ -1934,7 +2031,7 @@ mod tests {
     async fn cancelling_session_aborts_writer_and_keeps_pending_mutation_unknown() {
         timeout(Duration::from_secs(3), async {
             let (sender, mut events) = event_channel();
-            let (client, mut server, session) = controlled_session(sender).await;
+            let (client, mut server, session) = controlled_session(sender, None).await;
             assert_eq!(events.recv().await, Some(ExecEvent::Connected));
             assert_eq!(events.recv().await, Some(ExecEvent::Observed));
             let pending =
@@ -1956,45 +2053,62 @@ mod tests {
 
     #[tokio::test]
     async fn an_unflushed_server_decision_is_unknown_when_the_session_is_cancelled() {
-        timeout(Duration::from_secs(5), async {
-            let (sender, mut events) = event_channel();
-            let (client, mut server, session) = controlled_session(sender).await;
-            assert_eq!(events.recv().await, Some(ExecEvent::Connected));
-            assert_eq!(events.recv().await, Some(ExecEvent::Observed));
-            server
-                .send(
-                    wire(
-                        &json!({"id":"decision","method":"item/tool/requestUserInput","params":{}}),
+        for cancel in [true, false] {
+            timeout(Duration::from_secs(5), async {
+                let (sender, mut events) = event_channel();
+                let flush = Arc::new(FlushGate::default());
+                let (client, mut server, session) =
+                    controlled_session(sender, Some(flush.clone())).await;
+                assert_eq!(events.recv().await, Some(ExecEvent::Connected));
+                assert_eq!(events.recv().await, Some(ExecEvent::Observed));
+                server
+                    .send(
+                        wire(
+                            &json!({"id":"decision","method":"item/tool/requestUserInput","params":{}}),
+                        )
+                        .unwrap(),
                     )
-                    .unwrap(),
+                    .await
+                    .unwrap();
+                assert!(matches!(events.recv().await, Some(ExecEvent::Request(_))));
+                assert!(matches!(events.recv().await, Some(ExecEvent::Message(_))));
+                flush.hold();
+                let responding = client.clone();
+                let response = tokio::spawn(async move {
+                    responding
+                        .respond(&json!("decision"), Ok(json!({"text":"answer"})), "answer")
+                        .await
+                });
+                flush.entered.notified().await;
+                let written: Value = serde_json::from_str(
+                    server.next().await.unwrap().unwrap().to_text().unwrap(),
                 )
-                .await
                 .unwrap();
-            assert!(matches!(events.recv().await, Some(ExecEvent::Request(_))));
-            assert!(matches!(events.recv().await, Some(ExecEvent::Message(_))));
-            let response = tokio::spawn(async move {
-                client
-                    .respond(
-                        &json!("decision"),
-                        Ok(json!({"text":"x".repeat(2 << 20)})),
-                        "answer",
-                    )
-                    .await
-            });
-            let mut response = response;
-            assert!(
-                timeout(Duration::from_millis(10), &mut response)
-                    .await
-                    .is_err(),
-                "queue admission cannot acknowledge an unflushed decision"
-            );
-            session.abort();
-            assert!(session.await.unwrap_err().is_cancelled());
-            let error = response.await.unwrap().unwrap_err();
-            assert!(error.uncertain && !error.answered);
-        })
-        .await
-        .unwrap();
+                assert_eq!(written, json!({"id":"decision","result":{"text":"answer"}}));
+                assert!(
+                    !response.is_finished(),
+                    "queue admission cannot acknowledge an unflushed decision"
+                );
+                assert!(client.cache.read().await.replies.is_empty());
+                if cancel {
+                    session.abort();
+                    assert!(session.await.unwrap_err().is_cancelled());
+                    let error = response.await.unwrap().unwrap_err();
+                    assert!(error.uncertain && !error.answered);
+                    assert!(client.cache.read().await.replies.is_empty());
+                } else {
+                    flush.open();
+                    response.await.unwrap().unwrap();
+                    let replies = client.cache.read().await.replies.clone();
+                    assert_eq!(replies.len(), 1);
+                    assert_eq!(replies[0]["decision"], "answer");
+                    session.abort();
+                    assert!(session.await.unwrap_err().is_cancelled());
+                }
+            })
+            .await
+            .unwrap();
+        }
     }
 
     #[tokio::test]
