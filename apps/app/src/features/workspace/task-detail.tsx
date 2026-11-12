@@ -156,7 +156,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const canContinue = Boolean(work && !work.outcome && !work.stop && ["accepted", "running"].includes(work.state))
   // A work whose result is unknown may still write; new input waits until the result is checked.
   const inputPaused = !canContinue && (!work?.outcome || unknown || work?.outcome === "unverified")
-  const inputIntent = canContinue ? promptIntent(input) : "new_task"
+  const inputIntent = canContinue || inputPaused ? promptIntent(input) : "new_task"
 
   return <div ref={layer} className="contents">
   {/* Clicking it must not move focus to the page behind, or React hands focus back there instead of to the task link. */}

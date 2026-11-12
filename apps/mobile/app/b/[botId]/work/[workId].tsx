@@ -109,7 +109,7 @@ function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
   const canContinue = !work.outcome && !work.stop && ["accepted", "running"].includes(work.state)
   // A work whose result is unknown may still write; new input waits until the result is checked.
   const inputPaused = !canContinue && (!work.outcome || unknown || work.outcome === "unverified")
-  const inputIntent = canContinue ? promptIntent(text) : "new_task"
+  const inputIntent = canContinue || inputPaused ? promptIntent(text) : "new_task"
   return <KeyboardAwareScrollView keyboardShouldPersistTaps="handled" bottomOffset={16} contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     <Stack.Screen options={{ title: work.title || '任务' }} />
     <Button variant="ghost" className="self-start" accessibilityLabel={`打开所属 Bot ${bot.name}`} onPress={() => router.push(`/b/${bot.bot_id}`)}><Icon as={Bot} /><Text>{bot.name}</Text></Button>
