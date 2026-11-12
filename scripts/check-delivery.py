@@ -2,6 +2,7 @@
 """Rebuild the delivery guest, verify its public receipts, and exercise the EVM adapter."""
 
 import argparse
+import fcntl
 import hashlib
 import io
 import json
@@ -25,6 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = ROOT / ".artifacts/vdp"
 FIXTURES = ROOT / "crates/delivery/proof/fixtures"
 PROFILE = ROOT / "crates/delivery/proof/profile.json"
+SANDBOX_FILES = ("crates/delivery/proof/Sandbox.Dockerfile", "crates/delivery/proof/confined-gnark.sh")
 STATEMENT_BYTES = 47 * 32
 PUBLIC_FIELDS = {"mode", "kind", "imageId", "profileId", "relation", "journal", "journalHash", "seal"}
 PROFILE_CAPS = {"crypto_suite": 1, "max_windows": 2, "max_window_bytes": 65_536, "max_total_bytes": 131_072,
@@ -179,11 +181,20 @@ def source_commit():
     return commit
 
 
-def sandbox_commands(context, small=None, resume_dir=None, work_id=None, producer=None):
-    image = "vibeface-vdp-proof:check-" + hashlib.sha256(str(ROOT).encode()).hexdigest()[:12]
+def shared_cache():
+    common = subprocess.check_output(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=ROOT, text=True).strip()
+    return Path(common).parent / ".artifacts/vdp-shared"
+
+
+def sandbox_commands(context, small=None, resume_dir=None, work_id=None, producer=None, cache=None):
+    image = "vibeface-vdp-proof:check-" + hashlib.sha256(b"".join((ROOT / file).read_bytes() for file in SANDBOX_FILES)).hexdigest()[:12]
     build = ["docker", "build", "--platform", "linux/amd64", "--file", str(context / "crates/delivery/proof/Sandbox.Dockerfile"), "--tag", image, str(context)]
     container = ["docker", "run", "--rm", "--platform", "linux/amd64", "--memory", "11g", "--memory-swap", "11g", "--pids-limit", "64", "--env", "HOME=/home/runner", "--env", "PYTHONDONTWRITEBYTECODE=1"]
-    for source, destination in ((ROOT, "/work"), (ARTIFACTS / "cargo", "/cargo"), (ARTIFACTS / "cargo", "/home/runner/.cargo"), (ARTIFACTS / "risc0", "/risc0"), (ARTIFACTS / "canonical", "/artifacts")):
+    cache = cache or ARTIFACTS
+    mounts = [(ROOT, "/work"), (cache / "cargo", "/cargo"), (cache / "cargo", "/home/runner/.cargo"), (cache / "risc0", "/risc0"), (ARTIFACTS / "canonical", "/artifacts")]
+    if cache != ARTIFACTS:
+        mounts += [(cache / "risc0", "/work/.artifacts/vdp/risc0"), (cache / "proof-target", "/artifacts/proof-target"), (cache / "domain-target", "/artifacts/domain-target")]
+    for source, destination in mounts:
         container.extend(["--mount", f"type=bind,source={source},target={destination}"])
     command = "python3 scripts/install-delivery-toolchain.py && python3 scripts/check-delivery.py"
     if small is not None:
@@ -221,7 +232,10 @@ def sandbox(small=None, resume_run=None):
         public = ARTIFACTS / "canonical/small" / work_id / "public"
     failure = None
     try:
-        for directory in ("cargo", "risc0", "canonical"):
+        cache = shared_cache()
+        for directory in ("cargo", "risc0", "proof-target", "domain-target"):
+            (cache / directory).mkdir(parents=True, exist_ok=True)
+        for directory in ("risc0", "canonical"):
             (ARTIFACTS / directory).mkdir(parents=True, exist_ok=True)
         if small is not None:
             (ARTIFACTS / "canonical/small").mkdir(mode=0o755, exist_ok=True)
@@ -233,14 +247,14 @@ def sandbox(small=None, resume_run=None):
                 resume_dir = download_inputs(producer, resume_run, small)
         with tempfile.TemporaryDirectory(prefix="sandbox-build-", dir=ARTIFACTS) as directory:
             context = Path(directory)
-            for file in ("crates/delivery/proof/Sandbox.Dockerfile", "crates/delivery/proof/confined-gnark.sh"):
+            for file in SANDBOX_FILES:
                 source = ROOT / file
                 if source.is_symlink() or not source.is_file():
                     raise ValueError(f"Sandbox build requires a regular source file: {file}")
                 destination = context / file
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source, destination)
-            build, container = sandbox_commands(context, small, resume_dir, work_id, producer)
+            build, container = sandbox_commands(context, small, resume_dir, work_id, producer, cache)
             run(build)
         task = "".join(character if character.isascii() and (character.isalnum() or character in "_.-") else "-" for character in ROOT.name)[:64]
         name = "vdp-" + task + "-" + uuid.uuid4().hex
@@ -253,7 +267,13 @@ def sandbox(small=None, resume_run=None):
 
         try:
             signal.signal(signal.SIGTERM, interrupted)
-            run(container)
+            with (cache / "sandbox.lock").open("a") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    print("Waiting for another delivery sandbox to release the shared cache", flush=True)
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                run(container)
             if small is not None and source_commit() != commit:
                 raise ValueError("Source changed while the work item was running")
         finally:
@@ -1322,6 +1342,11 @@ def self_test():
     assert mounts == [f"type=bind,source={source},target={destination}" for source, destination in (
         (ROOT, "/work"), (ARTIFACTS / "cargo", "/cargo"), (ARTIFACTS / "cargo", "/home/runner/.cargo"), (ARTIFACTS / "risc0", "/risc0"), (ARTIFACTS / "canonical", "/artifacts"))]
     assert build[-2] == container[-4]
+    _, shared = sandbox_commands(Path("/context"), cache=Path("/shared"))
+    assert [shared[index + 1] for index, value in enumerate(shared) if value == "--mount"][1:] == [f"type=bind,source=/shared/{source},target={destination}" for source, destination in (
+        ("cargo", "/cargo"), ("cargo", "/home/runner/.cargo"), ("risc0", "/risc0"))] + [f"type=bind,source={ARTIFACTS / 'canonical'},target=/artifacts"] + [
+        f"type=bind,source=/shared/{source},target={destination}" for source, destination in (
+        ("risc0", "/work/.artifacts/vdp/risc0"), ("proof-target", "/artifacts/proof-target"), ("domain-target", "/artifacts/domain-target"))]
     assert container[-3:] == ["bash", "-c", "python3 scripts/install-delivery-toolchain.py && python3 scripts/check-delivery.py"]
     env_pairs = [container[index + 1] for index, value in enumerate(container) if value == "--env"]
     assert env_pairs == ["HOME=/home/runner", "PYTHONDONTWRITEBYTECODE=1"]
@@ -1827,7 +1852,10 @@ if __name__ == "__main__":
     if args.resume_dir is not None and (args.sandbox or args.prove_small is None or args.resume_run is not None):
         parser.error("--resume-dir is internal to one canonical work item")
     if args.self_test:
-        self_test()
+        from unittest.mock import patch
+        ARTIFACTS.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="shared-cache-self-test-", dir=ARTIFACTS) as cache, patch(f"{__name__}.shared_cache", return_value=Path(cache)):
+            self_test()
     elif args.check_fixtures:
         if optional_fixtures():
             print("Public fixture structure and schema checked; proof verification has not run")

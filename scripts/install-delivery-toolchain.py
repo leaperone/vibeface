@@ -148,7 +148,7 @@ def install():
         if sha256(archive) != expected:
             raise ValueError("Guest compiler archive checksum mismatch")
         version.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix="guest-install-", dir=ARTIFACTS) as directory:
+        with tempfile.TemporaryDirectory(prefix="guest-install-", dir=version.parent) as directory:
             extracted = unpack(archive, Path(directory))
             os.rename(extracted, version)
         receipt.write_text(json.dumps({"release": RELEASE, "target": target, "archiveSha256": expected}) + "\n")

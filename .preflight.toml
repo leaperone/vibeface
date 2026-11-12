@@ -5,16 +5,25 @@ prefix = ""
 name = "CI policy and Python syntax"
 check = "python3 scripts/ci.py --self-test && python3 scripts/check-delivery.py --self-test && python3 scripts/install-delivery-toolchain.py --self-test && python3 scripts/run-delivery-live.py --self-test && python3 scripts/daily-nightly.py --self-test && python3 -B scripts/test_progressive_publication.py && actionlint"
 build = "python3 -c 'import ast,pathlib; [ast.parse(pathlib.Path(p).read_text()) for p in (\"scripts/ci.py\", \"scripts/verify-node.py\", \"scripts/build-inputs.py\", \"scripts/check-delivery.py\", \"scripts/install-delivery-toolchain.py\", \"scripts/run-delivery-live.py\", \"scripts/verify-delivery-protected.py\", \"scripts/verify-delivery-restart-observer.py\", \"scripts/release.py\", \"scripts/daily-nightly.py\", \"scripts/nightly_source.py\")]'"
+ci_check = "Workflow and source checks"
 
 [[domain_check]]
-name = "Rust workspace"
+name = "Rust lint"
 trigger_paths = ["crates/delivery/**", "apps/core/src/**", "apps/cli/src/**", "crates/control/src/**", "crates/client/src/**", "crates/bridge/src/**", "crates/protocol/src/**", "crates/secure/src/**", "crates/secure-ffi/**", "crates/*/tests/**", "apps/core/tests/**", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/core/build.rs", "apps/core/migrations/**", "apps/core/schema.hcl", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".cargo/**"]
-command = "cargo fmt --all -- --check && python3 scripts/ci.py test --tier fast --packages vibeface-protocol vibeface-bridge vibeface-secure vibeface-client vibeface-core vibeface-control vibeface vibeface-delivery vibeface-secure-ffi && cargo clippy --workspace --all-targets --locked -- -D warnings"
+command = "cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings"
+ci_check = "Rust lint and minimum version"
+
+[[domain_check]]
+name = "Rust fast tests"
+trigger_paths = ["crates/delivery/**", "apps/core/src/**", "apps/cli/src/**", "crates/control/src/**", "crates/client/src/**", "crates/bridge/src/**", "crates/protocol/src/**", "crates/secure/src/**", "crates/secure-ffi/**", "crates/*/tests/**", "apps/core/tests/**", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/core/build.rs", "apps/core/migrations/**", "apps/core/schema.hcl", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".cargo/**"]
+command = "python3 scripts/ci.py test --tier fast --packages vibeface-protocol vibeface-bridge vibeface-secure vibeface-client vibeface-core vibeface-control vibeface vibeface-delivery vibeface-secure-ffi"
+ci_check = "Rust fast tests"
 
 [[domain_check]]
 name = "Delivery proof and settlement"
 trigger_paths = ["crates/delivery/**", "crates/delivery/proof/**", "contracts/delivery/**", "apps/core/src/delivery/**", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py"]
 command = "python3 scripts/check-delivery.py --check-fixtures && python3 scripts/check-delivery.py --sandbox"
+ci_check = "Delivery fixture and contract checks"
 
 [[domain_check]]
 name = "Delivery service probe"
@@ -25,36 +34,58 @@ command = "cargo fmt --manifest-path tests/fixtures/delivery-probe/Cargo.toml --
 name = "Web build and packaged resources"
 trigger_paths = ["apps/app/**", "packages/client/**", "apps/mobile/**", "packages/secure-native/**", "packages/theme/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh"]
 command = "bash scripts/build-web-crypto.sh && bash scripts/build-web.sh && cargo build -p vibeface -p vibeface-core --locked && python3 scripts/verify-node.py --binary target/debug/vibeface --core-binary target/debug/vibeface-core --app-dir apps/app/dist/client --crypto-module apps/app/dist/client/vibeface_secure.js --artifacts .artifacts/preflight-web --web-only"
+ci_check = "Native package and acceptance (x86_64-unknown-linux-gnu)"
 
 [[domain_check]]
 name = "Mobile types"
 trigger_paths = ["apps/mobile/**", "packages/secure-native/**", "packages/client/**", "packages/theme/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
 command = "pnpm --filter @vibeface/client run typecheck && pnpm --filter @vibeface/secure-native run typecheck && pnpm --filter vibeface-mobile run typecheck"
+ci_check = "Mobile types"
 
 [[domain_check]]
 name = "Desktop source"
 trigger_paths = ["apps/desktop/**", "tests/e2e/e2e.native-desktop.config.ts", "tests/e2e/native-desktop*.ts", "scripts/e2e-desktop.mjs", "scripts/native-desktop/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
-command = "cargo test -p vibeface-desktop --locked && cargo clippy -p vibeface-desktop --all-targets --locked -- -D warnings && node scripts/build-desktop.mjs --self-test && node scripts/verify-desktop.mjs --self-test && python3 -B scripts/offline-docs.py --self-test && pnpm exec e2e list --config tests/e2e/e2e.native-desktop.config.ts"
+command = "cargo test -p vibeface-desktop --locked && cargo clippy -p vibeface-desktop --all-targets --locked -- -D warnings"
+ci_check = "Native desktop host checks"
+
+[[domain_check]]
+name = "Desktop scripts and e2e list"
+trigger_paths = ["apps/desktop/**", "tests/e2e/e2e.native-desktop.config.ts", "tests/e2e/native-desktop*.ts", "scripts/e2e-desktop.mjs", "scripts/native-desktop/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
+command = "node scripts/build-desktop.mjs --self-test && node scripts/verify-desktop.mjs --self-test && python3 -B scripts/offline-docs.py --self-test && pnpm exec e2e list --config tests/e2e/e2e.native-desktop.config.ts"
 
 [[domain_check]]
 name = "Static www portal"
 trigger_paths = ["apps/www/**", "packages/docs/**", "packages/theme/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
-command = "pnpm --filter vibeface-www run typecheck && pnpm --filter vibeface-www run test && pnpm --filter vibeface-www run build && pnpm --filter vibeface-www run check:static"
+command = "pnpm --filter vibeface-www run typecheck && pnpm --filter vibeface-www run build && pnpm --filter vibeface-www run check:static"
+ci_check = "Static portal"
+
+[[domain_check]]
+name = "Static www tests"
+trigger_paths = ["apps/www/**", "packages/docs/**", "packages/theme/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
+command = "pnpm --filter vibeface-www run test"
 
 [[domain_check]]
 name = "JavaScript syntax"
 trigger_paths = ["scripts/crypto-client.mjs", "apps/cli/npm/**", "scripts/package-npm.mjs", "scripts/publish-npm.mjs", ".github/workflows/npm-publish.yml", ".github/workflows/release.yml", ".github/workflows/release-www.yml"]
 command = "node --check scripts/crypto-client.mjs && node --check apps/cli/npm/bin/vibeface.mjs && node --check scripts/package-npm.mjs && node --check scripts/publish-npm.mjs && node scripts/package-npm.mjs --self-test && node scripts/publish-npm.mjs --self-test"
+ci_check = "Workflow and source checks"
 
 [[domain_check]]
 name = "Delivery scripts and workflow"
 trigger_paths = ["install.sh", "scripts/*.sh", "scripts/release.py", "scripts/daily-nightly.py", "scripts/nightly_source.py", ".github/workflows/**"]
-command = "bash -n install.sh && bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh && shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh && bash install.sh --self-test && python3 scripts/release.py self-test && bash -n scripts/sign-release.sh && actionlint"
+command = "bash -n install.sh && bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh && shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh && bash install.sh --self-test && python3 scripts/release.py self-test && actionlint"
+ci_check = "Workflow and source checks"
+
+[[domain_check]]
+name = "Release signing script syntax"
+trigger_paths = ["scripts/*.sh"]
+command = "bash -n scripts/sign-release.sh"
 
 [[domain_check]]
 name = "Migration integrity"
 trigger_paths = ["apps/core/migrations/**", "apps/core/schema.hcl"]
 command = "atlas migrate validate --dir file://apps/core/migrations"
+ci_check = "Workflow and source checks"
 
 [review]
 extra_checklist = "Check command deduplication, uncertain write results, device connection ownership, local socket permissions, and manager token budgets. A public Node may also schedule or execute; no permanent coordinator or task owner. Verify network and conversation scoping, complete DAG context and no side effects from replay. For paid delivery, require complete membership management authority, bound source/receiver/provider/wallet identities, canonical profile/image/schema, current key serial, independent service authorization, exact ERC20 balance accounting, nonce reservation before signing, durable signed bytes before broadcast, reconciliation of unknown transactions and reorgs, and distinct charity/recoverable/decrypted evidence."
