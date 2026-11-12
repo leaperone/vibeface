@@ -444,19 +444,20 @@ function JobLine({ job, retry, refresh }: { job: ManagerJob; retry?: () => Promi
 }
 
 const intents = [
-  { value: 'continue', label: '发送', icon: Send },
+  { value: 'continue', label: '普通消息', icon: Send },
   { value: 'new_task', label: '新任务', icon: ListPlus },
   { value: 'defer', label: '稍后处理', icon: Clock },
 ] as const
 
-/** How the next message goes, folded into one icon inside the box; the icon turns to the choice while it is not a plain send. */
+/** Keep the current sending mode visible beside its menu. */
 function IntentMenu({ intent, busy, onChange }: { intent: InputIntent; busy: boolean; onChange: (intent: InputIntent) => void }) {
   const current = intents.find((item) => item.value === intent) ?? intents[0]
   const label = (item: (typeof intents)[number]) => item.value === 'continue' && busy ? '补充当前工作' : item.label
   return <DropdownMenu.Root>
     <DropdownMenu.Trigger asChild>
-      <Button type="button" variant="ghost" size="icon-sm" className={cn('size-9 rounded-full max-md:size-11', intent === 'continue' ? 'text-muted-foreground hover:text-foreground' : 'bg-muted text-foreground')} aria-label={`发送方式：${label(current)}`} title="发送方式" onMouseDown={(event) => event.preventDefault()}>
+      <Button type="button" variant="ghost" size="sm" className={cn('h-9 rounded-lg max-md:h-11', intent === 'continue' ? 'text-muted-foreground hover:text-foreground' : 'bg-muted text-foreground')} aria-label={`发送方式：${label(current)}`} title="发送方式" onMouseDown={(event) => event.preventDefault()}>
         {intent === 'continue' ? <SlidersHorizontal aria-hidden="true" /> : <current.icon aria-hidden="true" />}
+        <span>{label(current)}</span>
       </Button>
     </DropdownMenu.Trigger>
     <DropdownMenu.Portal>

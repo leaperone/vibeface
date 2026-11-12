@@ -1,0 +1,286 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-11T19:54:07.568201+00:00",
+  "title": "Design System: Vibeface Mobile App",
+  "extensions": {
+    "colorMeta": {
+      "background-light": {
+        "role": "neutral",
+        "displayName": "Background Light",
+        "canonical": "oklch(1 0 0)",
+        "tonalRamp": [
+          "oklch(0.150 0.0000 0)",
+          "oklch(0.260 0.0000 0)",
+          "oklch(0.380 0.0000 0)",
+          "oklch(0.500 0.0000 0)",
+          "oklch(0.620 0.0000 0)",
+          "oklch(0.740 0.0000 0)",
+          "oklch(0.860 0.0000 0)",
+          "oklch(0.950 0.0000 0)"
+        ]
+      },
+      "background-dark": {
+        "role": "neutral",
+        "displayName": "Background Dark",
+        "canonical": "oklch(0.175 0.006 270)",
+        "tonalRamp": [
+          "oklch(0.150 0.0045 270)",
+          "oklch(0.260 0.0060 270)",
+          "oklch(0.380 0.0060 270)",
+          "oklch(0.500 0.0060 270)",
+          "oklch(0.620 0.0060 270)",
+          "oklch(0.740 0.0060 270)",
+          "oklch(0.860 0.0042 270)",
+          "oklch(0.950 0.0015 270)"
+        ]
+      },
+      "foreground-light": {
+        "role": "neutral",
+        "displayName": "Foreground Light",
+        "canonical": "oklch(0.21 0.012 270)",
+        "tonalRamp": [
+          "oklch(0.150 0.0090 270)",
+          "oklch(0.260 0.0120 270)",
+          "oklch(0.380 0.0120 270)",
+          "oklch(0.500 0.0120 270)",
+          "oklch(0.620 0.0120 270)",
+          "oklch(0.740 0.0120 270)",
+          "oklch(0.860 0.0084 270)",
+          "oklch(0.950 0.0030 270)"
+        ]
+      },
+      "foreground-dark": {
+        "role": "neutral",
+        "displayName": "Foreground Dark",
+        "canonical": "oklch(0.955 0.004 270)",
+        "tonalRamp": [
+          "oklch(0.150 0.0030 270)",
+          "oklch(0.260 0.0040 270)",
+          "oklch(0.380 0.0040 270)",
+          "oklch(0.500 0.0040 270)",
+          "oklch(0.620 0.0040 270)",
+          "oklch(0.740 0.0040 270)",
+          "oklch(0.860 0.0028 270)",
+          "oklch(0.950 0.0010 270)"
+        ]
+      },
+      "primary-light": {
+        "role": "primary",
+        "displayName": "Primary Light",
+        "canonical": "oklch(0.24 0.016 270)",
+        "tonalRamp": [
+          "oklch(0.150 0.0120 270)",
+          "oklch(0.260 0.0160 270)",
+          "oklch(0.380 0.0160 270)",
+          "oklch(0.500 0.0160 270)",
+          "oklch(0.620 0.0160 270)",
+          "oklch(0.740 0.0160 270)",
+          "oklch(0.860 0.0112 270)",
+          "oklch(0.950 0.0040 270)"
+        ]
+      },
+      "primary-foreground-light": {
+        "role": "primary",
+        "displayName": "Primary Foreground Light",
+        "canonical": "oklch(0.985 0.002 270)",
+        "tonalRamp": [
+          "oklch(0.150 0.0015 270)",
+          "oklch(0.260 0.0020 270)",
+          "oklch(0.380 0.0020 270)",
+          "oklch(0.500 0.0020 270)",
+          "oklch(0.620 0.0020 270)",
+          "oklch(0.740 0.0020 270)",
+          "oklch(0.860 0.0014 270)",
+          "oklch(0.950 0.0005 270)"
+        ]
+      },
+      "primary-dark": {
+        "role": "primary",
+        "displayName": "Primary Dark",
+        "canonical": "oklch(0.94 0.005 270)",
+        "tonalRamp": [
+          "oklch(0.150 0.0037 270)",
+          "oklch(0.260 0.0050 270)",
+          "oklch(0.380 0.0050 270)",
+          "oklch(0.500 0.0050 270)",
+          "oklch(0.620 0.0050 270)",
+          "oklch(0.740 0.0050 270)",
+          "oklch(0.860 0.0035 270)",
+          "oklch(0.950 0.0013 270)"
+        ]
+      },
+      "brand-light": {
+        "role": "accent",
+        "displayName": "Brand Light",
+        "canonical": "oklch(0.53 0.2 280)",
+        "tonalRamp": [
+          "oklch(0.150 0.1500 280)",
+          "oklch(0.260 0.2000 280)",
+          "oklch(0.380 0.2000 280)",
+          "oklch(0.500 0.2000 280)",
+          "oklch(0.620 0.2000 280)",
+          "oklch(0.740 0.2000 280)",
+          "oklch(0.860 0.1400 280)",
+          "oklch(0.950 0.0500 280)"
+        ]
+      },
+      "brand-dark": {
+        "role": "accent",
+        "displayName": "Brand Dark",
+        "canonical": "oklch(0.72 0.15 280)",
+        "tonalRamp": [
+          "oklch(0.150 0.1125 280)",
+          "oklch(0.260 0.1500 280)",
+          "oklch(0.380 0.1500 280)",
+          "oklch(0.500 0.1500 280)",
+          "oklch(0.620 0.1500 280)",
+          "oklch(0.740 0.1500 280)",
+          "oklch(0.860 0.1050 280)",
+          "oklch(0.950 0.0375 280)"
+        ]
+      },
+      "muted-light": {
+        "role": "neutral",
+        "displayName": "Muted Light",
+        "canonical": "oklch(0.965 0.004 270)",
+        "tonalRamp": [
+          "oklch(0.150 0.0030 270)",
+          "oklch(0.260 0.0040 270)",
+          "oklch(0.380 0.0040 270)",
+          "oklch(0.500 0.0040 270)",
+          "oklch(0.620 0.0040 270)",
+          "oklch(0.740 0.0040 270)",
+          "oklch(0.860 0.0028 270)",
+          "oklch(0.950 0.0010 270)"
+        ]
+      },
+      "muted-dark": {
+        "role": "neutral",
+        "displayName": "Muted Dark",
+        "canonical": "oklch(0.245 0.008 270)",
+        "tonalRamp": [
+          "oklch(0.150 0.0060 270)",
+          "oklch(0.260 0.0080 270)",
+          "oklch(0.380 0.0080 270)",
+          "oklch(0.500 0.0080 270)",
+          "oklch(0.620 0.0080 270)",
+          "oklch(0.740 0.0080 270)",
+          "oklch(0.860 0.0056 270)",
+          "oklch(0.950 0.0020 270)"
+        ]
+      },
+      "primary-foreground-dark": {
+        "role": "neutral",
+        "displayName": "Primary Foreground Dark",
+        "canonical": "oklch(0.2 0.01 270)",
+        "tonalRamp": [
+          "oklch(0.15 0.01 270)",
+          "oklch(0.26 0.01 270)",
+          "oklch(0.38 0.01 270)",
+          "oklch(0.5 0.01 270)",
+          "oklch(0.62 0.01 270)",
+          "oklch(0.74 0.01 270)",
+          "oklch(0.86 0.01 270)",
+          "oklch(0.95 0.01 270)"
+        ]
+      }
+    },
+    "shadows": [
+      {
+        "name": "elevation-xs",
+        "value": "var(--elevation-xs)",
+        "purpose": "Existing small surface elevation; resolves to no shadow in dark mode."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease-out",
+        "value": "cubic-bezier(0.23, 1, 0.32, 1)",
+        "purpose": "Existing shared easing."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "wide",
+        "value": "768px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Default button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Neutral primary action; CSS translation of the native primitive.",
+      "html": "<button class=\"ds-button\">保存</button>",
+      "css": ".ds-button{font-family:\"Geist\",system-ui,sans-serif;font-size:16px;line-height:24px;display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:0 12px;border:1px solid transparent;border-radius:10px;background:oklch(0.24 0.016 270);color:oklch(0.985 0.002 270);font-weight:500;transition:background-color 150ms cubic-bezier(.23,1,.32,1)}.ds-button:hover{background:color-mix(in oklch,oklch(0.24 0.016 270) 88%,transparent)}.ds-button:focus-visible{outline:2px solid oklch(0.6 0.17 280);outline-offset:2px}.ds-button:active{transform:scale(.97)}.ds-button:disabled{opacity:.5}"
+    },
+    {
+      "name": "Outline button",
+      "kind": "button",
+      "description": "Secondary action using existing semantic tokens.",
+      "html": "<button class=\"ds-button ds-outline\">取消</button>",
+      "css": ".ds-button{font-family:\"Geist\",system-ui,sans-serif;font-size:16px;line-height:24px;display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:0 12px;border:1px solid transparent;border-radius:10px;background:oklch(0.24 0.016 270);color:oklch(0.985 0.002 270);font-weight:500;transition:background-color 150ms cubic-bezier(.23,1,.32,1)}.ds-button:hover{background:color-mix(in oklch,oklch(0.24 0.016 270) 88%,transparent)}.ds-button:focus-visible{outline:2px solid oklch(0.6 0.17 280);outline-offset:2px}.ds-button:active{transform:scale(.97)}.ds-button:disabled{opacity:.5}.ds-outline{background:oklch(1 0 0);color:oklch(0.21 0.012 270);border-color:oklch(0.915 0.006 270)}.ds-outline:hover{background:oklch(0.965 0.004 270)}"
+    },
+    {
+      "name": "Ghost button",
+      "kind": "button",
+      "description": "Secondary action using existing semantic tokens.",
+      "html": "<button class=\"ds-button ds-ghost\">取消</button>",
+      "css": ".ds-button{font-family:\"Geist\",system-ui,sans-serif;font-size:16px;line-height:24px;display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:0 12px;border:1px solid transparent;border-radius:10px;background:oklch(0.24 0.016 270);color:oklch(0.985 0.002 270);font-weight:500;transition:background-color 150ms cubic-bezier(.23,1,.32,1)}.ds-button:hover{background:color-mix(in oklch,oklch(0.24 0.016 270) 88%,transparent)}.ds-button:focus-visible{outline:2px solid oklch(0.6 0.17 280);outline-offset:2px}.ds-button:active{transform:scale(.97)}.ds-button:disabled{opacity:.5}.ds-ghost{background:transparent;color:oklch(0.21 0.012 270);border-color:transparent}.ds-ghost:hover{background:oklch(0.965 0.004 270)}"
+    },
+    {
+      "name": "Input",
+      "kind": "input",
+      "description": "Editable field; native TextInput translated for the design panel.",
+      "html": "<input class=\"ds-input\" aria-label=\"任务名称\" placeholder=\"任务名称\">",
+      "css": ".ds-input{font-family:\"Geist\",system-ui,sans-serif;font-size:16px;line-height:24px;min-height:44px;padding:4px 12px;border:1px solid oklch(0.895 0.007 270);border-radius:10px;background:transparent;color:oklch(0.21 0.012 270)}.ds-input::placeholder{color:oklch(0.51 0.014 270)}.ds-input:focus-visible{outline:2px solid oklch(0.6 0.17 280);outline-offset:2px}.ds-input:disabled{opacity:.5}"
+    },
+    {
+      "name": "Navigation row",
+      "kind": "nav",
+      "description": "Native list-row translation.",
+      "html": "<nav><a class=\"ds-nav\" href=\"#\" aria-current=\"page\">消息</a></nav>",
+      "css": ".ds-nav{font-family:\"Geist\",system-ui,sans-serif;font-size:16px;line-height:24px;display:flex;align-items:center;min-height:64px;padding:0 12px;border-radius:14px;color:oklch(0.21 0.012 270);text-decoration:none}.ds-nav[aria-current=page],.ds-nav:hover,.ds-nav:active{background:oklch(0.965 0.004 270)}.ds-nav:focus-visible{outline:2px solid oklch(0.6 0.17 280)}"
+    },
+    {
+      "name": "List group",
+      "kind": "card",
+      "refersTo": "card",
+      "description": "Grouped settings rows; avoid nested cards.",
+      "html": "<section class=\"ds-card\">设备设置</section>",
+      "css": ".ds-card{font-family:\"Geist\",system-ui,sans-serif;font-size:16px;line-height:24px;border:1px solid oklch(0.915 0.006 270);border-radius:14px;padding:16px;background:oklch(1 0 0);color:oklch(0.21 0.012 270)}"
+    },
+    {
+      "name": "Status chip",
+      "kind": "chip",
+      "description": "Labeled status; color supplements the words.",
+      "html": "<span class=\"ds-chip\">等待确认</span>",
+      "css": ".ds-chip{display:inline-flex;padding:2px 8px;border-radius:8px;background:oklch(0.985 0.025 85);color:oklch(0.52 0.125 65);font-size:13px;line-height:20px}"
+    }
+  ],
+  "narrative": {
+    "northStar": "Quiet personal workspace",
+    "overview": "**Creative North Star: \"Quiet personal workspace\"**\n\nThis description records the incumbent interface; the source tokens below define the system.\n\nThe mobile app is an Operate surface designed around one-handed progress: choose a Bot, read the current work, and act without losing context. Shared cool neutrals and violet brand accents keep the native shell calm; platform materials appear only where the OS supports them and are disabled when reduced transparency is enabled.\n\n**Key Characteristics:** native, calm, task-first, accessible, interruption-aware.",
+    "keyCharacteristics": [
+      "native",
+      "calm",
+      "task-first",
+      "accessible",
+      "interruption-aware"
+    ],
+    "rules": [],
+    "dos": [
+      "Do honor safe areas, dynamic type constraints, reduced motion, and reduced transparency.",
+      "Do keep destructive or uncertain operations explicit and recoverable.",
+      "Do use the shared semantic theme instead of literal per-screen colors.",
+      "Do keep touch targets at least 44px even when the icon is smaller."
+    ],
+    "donts": [
+      "Don't replace native navigation or sheets with web-style scaffolding.",
+      "Don't use blur, gradients, or animation as decoration.",
+      "Don't rely on color alone for connection, delivery, or recovery state.",
+      "Don't add a second mobile design language beside the existing UI primitives."
+    ]
+  }
+}

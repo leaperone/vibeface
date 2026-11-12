@@ -165,6 +165,7 @@ export default function ChatScreen() {
   const [scrollButton, setScrollButton] = useState({ id, visible: false })
   const toLatest = () => {
     if (scrollInset.current.id !== id) return
+    setScrollButton({ id, visible: false })
     list.current?.scrollToOffset({ offset: ios ? -scrollInset.current.top : 0, animated: true })
   }
   // Opening a chat with 新消息 brings it to the top of the screen, the unread under it.
@@ -251,7 +252,7 @@ export default function ChatScreen() {
       ref={list}
       data={rows}
       inverted
-      maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
+      maintainVisibleContentPosition={scrollButton.id === id && scrollButton.visible ? { minIndexForVisible: 0 } : undefined}
       keyExtractor={(row) => row.key}
       onScrollToIndexFailed={({ index, averageItemLength }) => {
         if (scrollInset.current.id !== id) return
@@ -309,13 +310,13 @@ export default function ChatScreen() {
         >{offline || setupHint || sendError || inputTarget.kind !== 'bot_main' || stopSharing.length > 1 ? <>
           {offline ? <OfflineBar chat className="self-center" /> : setupHint ? <View role="status" className="flex-row flex-wrap items-center gap-x-2 px-2">
             <Text className="text-meta text-muted-foreground">{setupHint}</Text>
-            {reach === 'offline' || canSetUp ? <Link href={setupHref} asChild><Button variant="ghost" size="sm"><Text>{reach === 'offline' ? '查看设备' : '去设置'}</Text></Button></Link>
+            {reach === 'offline' || canSetUp ? <Link href={setupHref} asChild><Button variant="ghost" size="sm" className="min-h-12"><Text>{reach === 'offline' ? '查看设备' : '去设置'}</Text></Button></Link>
               : <Text className="text-meta text-muted-foreground">{setUpOnManager(workspace.members.filter((member) => member.admin).map((member) => member.name))}</Text>}
           </View> : null}
           {sendError ? <ErrorText error={sendError} /> : null}
           {inputTarget.kind !== "bot_main" ? <View className="flex-row items-center gap-2 px-2">
             <Text numberOfLines={1} className="min-w-0 flex-1 text-meta text-muted-foreground">{targetBusy ? '补充给' : '发送给'} · {targetOption.label}</Text>
-            <Button variant="ghost" size="sm" onPress={() => setSelectedTarget('main')}><Text>改回主聊天</Text></Button>
+            <Button variant="ghost" size="sm" className="min-h-12" onPress={() => setSelectedTarget('main')}><Text>改回主聊天</Text></Button>
           </View> : null}
           {stopSharing.length > 1 ? <Text className="text-meta text-warning">停止会影响这些工作 · {stopSharing.map((work) => work.title || "工作").join("、")}</Text> : null}
         </> : null}

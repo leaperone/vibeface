@@ -22,7 +22,7 @@ import {
   SidebarInset, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider, SidebarTrigger, useSidebar,
 } from "@/components/ui/sidebar"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
-import { BotPanelButton, openBotPanel } from "./bot-panel"
+import { BotPanelButton } from "./bot-panel"
 import { BotForm } from "./bot-form"
 import { useInbox } from "./inbox"
 import { waitingItems } from "@vibeface/client/workspace/inbox.ts"
@@ -141,7 +141,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
           <SidebarGroup>
             <SidebarGroupLabel>频道</SidebarGroupLabel>
             <SidebarGroupAction title="管理频道" aria-label="管理频道" onClick={() => void navigate({ to: "/channels" })}><Plus aria-hidden="true" /></SidebarGroupAction>
-            <SidebarGroupContent><SidebarMenu>{(workspace.workspaceState?.channels ?? []).map((channel) => <SidebarMenuItem key={channel.channel_id}><SidebarMenuButton asChild isActive={pathname === `/channels/${channel.channel_id}`} className="h-10 max-md:h-11"><Link to="/channels/$channelId" params={{ channelId: channel.channel_id }}><MessagesSquare aria-hidden="true" /><span className="truncate">{channel.title}</span></Link></SidebarMenuButton></SidebarMenuItem>)}{!workspace.workspaceState?.channels.length ? <SidebarMenuItem><SidebarMenuButton asChild><Link to="/channels"><MessagesSquare aria-hidden="true" /><span>查看频道</span></Link></SidebarMenuButton></SidebarMenuItem> : null}</SidebarMenu></SidebarGroupContent>
+            <SidebarGroupContent><SidebarMenu>{(workspace.workspaceState?.channels ?? []).map((channel) => <SidebarMenuItem key={channel.channel_id}><SidebarMenuButton asChild isActive={pathname === `/channels/${channel.channel_id}`} className="h-10 max-md:h-11"><Link to="/channels/$channelId" params={{ channelId: channel.channel_id }}><MessagesSquare aria-hidden="true" /><span className="truncate">{channel.title}</span></Link></SidebarMenuButton></SidebarMenuItem>)}{!workspace.workspaceState?.channels.length ? <SidebarMenuItem><SidebarMenuButton asChild className="h-10 max-md:h-11"><Link to="/channels"><MessagesSquare aria-hidden="true" /><span>查看频道</span></Link></SidebarMenuButton></SidebarMenuItem> : null}</SidebarMenu></SidebarGroupContent>
           </SidebarGroup>
           <SidebarGroup>
             <SidebarGroupLabel>Bot</SidebarGroupLabel>
@@ -197,7 +197,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
           </div>
           <div className="col-start-3 flex items-center justify-end ps-2 empty:hidden">
           {isMobile && pathname === "/" ? <Button type="button" variant="ghost" size="icon" className="-me-3" aria-label="新 Bot" title="新 Bot" disabled={!workspace.writable && !workspace.pendingBot} onClick={openCreator}><Plus aria-hidden="true" /></Button>
-          : botTitle ? <Button type="button" variant="ghost" size="icon" className="-me-3" aria-label={`${workspace.selectedBot?.name ?? "Bot"} 设置`} title={terms.settings.label} disabled={!workspace.data?.bot_settings} onClick={openBotPanel}><terms.settings.icon aria-hidden="true" /></Button>
+          : botTitle ? null
           : inboxInHeader ? <Button asChild variant="ghost" size="icon" className="relative -me-3">
             <Link to="/inbox" aria-label={recovering ? `${terms.inbox.label}，有人在找回` : waiting ? `${terms.inbox.label} ${waiting}` : terms.inbox.label} title={terms.inbox.label}>
               <Bell aria-hidden="true" />

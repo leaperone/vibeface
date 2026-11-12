@@ -173,6 +173,18 @@ test('native workspace routes preserve Task input, queue controls and directed C
     await backButton.click();
     await expect(screen.getByLabel('设置', { exact: true })).toBeVisible();
   }
+  const originalTextSize = (await execute('xcrun', ['simctl', 'ui', simulator, 'content_size'])).stdout.trim();
+  try {
+    await execute('xcrun', ['simctl', 'ui', simulator, 'content_size', 'accessibility-extra-large']);
+    await expect.poll(async () => {
+      const message = await screen.getByText('会话等你时提醒你', { exact: true }).first().boundingBox();
+      const action = await screen.getByRole('button', '打开通知', { exact: true }).boundingBox();
+      return Boolean(message && action && action.y >= message.y + message.height);
+    }).toBe(true);
+    await app.screenshot('workspace-native-home-large-type');
+  } finally {
+    await execute('xcrun', ['simctl', 'ui', simulator, 'content_size', originalTextSize]);
+  }
   await screen.getByRole('link', /^Native Builder，/, { visible: true }).click();
   const mainComposer = textbox('给 Bot 发消息');
   const mainTarget = screen.getByRole('button', /^输入目标 Native Builder · 主聊天，/, { visible: true });
@@ -211,10 +223,15 @@ test('native workspace routes preserve Task input, queue controls and directed C
     return stable;
   }).toBe(true);
   for (const phase of ['closed', 'keyboard', 'reply']) {
+    await expect(toLatest).toHaveCount(0);
     if (await keyboard.count() !== 0) await screen.getByText(/^原生滚动记录 8\s/, { visible: true }).click();
     await expect(keyboard).toHaveCount(0);
     await expect(latestReply).toBeVisible();
     await expect(toLatest).toHaveCount(0);
+    await expect.poll(async () => {
+      const reply = await latestReply.boundingBox(), target = await mainTarget.boundingBox();
+      return Boolean(reply && target && reply.y + reply.height <= target.y);
+    }).toBe(true);
     let previousHistoryBounds = '', positioningAttempt = 0;
     await expect.poll(async () => {
       const pane = await mainHistory.boundingBox(), target = await mainTarget.boundingBox(), back = await backButton.boundingBox();

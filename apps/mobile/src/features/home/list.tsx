@@ -25,6 +25,7 @@ import { listTime } from '@/lib/time'
 import { useRun } from '@/lib/use-run'
 import { cn } from '@/lib/utils'
 import { mobilePlatform } from '@/platform'
+import { useWide } from '@/lib/layout'
 
 // A bot lifted to the top by a new message, or rows closing over the 待处理 card, glide instead of jumping.
 const Item = withUniwind(Animated.View)
@@ -34,6 +35,7 @@ const Item = withUniwind(Animated.View)
  * own title, new-bot and settings buttons in place of the native header, and keeps the open screen's row lit.
  */
 export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?: number }) {
+  const wide = useWide()
   const workspace = useWorkspace()
   const device = useDevice()
   const dark = useUniwind().theme === 'dark'
@@ -80,7 +82,7 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
     {bots.length ? bots.map((bot, index) => {
       const last = bot.last_message, mood = botMood(bot, workspace, shared), primary = workspace.primary === bot.conversation_id
       return <Item key={bot.bot_id} layout={move}>
-        <Row href={`/b/${bot.bot_id}`} replace={replace} active={active(`/b/${bot.bot_id}`)} avatar={<BotFace bot={bot} mood={mood} size={44} />} name={bot.name} tint={botTint(faceOf(bot.bot_id, bot.avatar).hue, dark)}
+        <Row href={`/b/${bot.bot_id}`} replace={replace} active={active(`/b/${bot.bot_id}`)} avatar={<BotFace bot={bot} mood={mood} size={44} still={sidebar === true && !wide} />} name={bot.name} tint={botTint(faceOf(bot.bot_id, bot.avatar).hue, dark)}
           mark={primary ? <Icon as={Star} className="size-3.5 fill-muted-foreground text-muted-foreground" /> : null}
           label={[bot.name, primary ? '主 Bot' : '', moodLabel[mood]].filter(Boolean).join('，')}
           unread={workspace.unread[bot.conversation_id] ?? 0} time={last ? listTime(last.created_at_ms, now) : undefined}
@@ -118,11 +120,15 @@ function NotifyTip() {
   const { busy, error, run } = useRun()
   if (closed || !shared?.synced || shared.notificationButton.state !== 'off' || shared.notificationButton.disabled) return null
   return <Item key="notify" layout={move} entering={fadeIn} exiting={fadeOut} className="mb-2 mt-1 gap-1">
-    <View className="min-h-16 flex-row items-center gap-3 rounded-xl border border-border bg-card py-2.5 ps-3 pe-1">
-      <View className="size-11 items-center justify-center rounded-full bg-brand/10"><Icon as={BellRing} className="text-brand" /></View>
-      <Text className="min-w-0 flex-1 font-medium">{waitingCopy.notifyTip}</Text>
-      <Button size="sm" disabled={busy !== null} onPress={() => void run('notify', shared.enableNotifications)}><Text>{waitingCopy.notifyOn}</Text></Button>
-      <Button variant="ghost" size="icon" accessibilityLabel="关闭" onPress={() => { writeStorage(tipClosed, true); setClosed(true) }}><Icon as={X} className="text-muted-foreground" /></Button>
+    <View className="min-h-16 flex-row flex-wrap items-center gap-3 rounded-xl border border-border bg-card py-2.5 ps-3 pe-1">
+      <View className="min-w-48 flex-1 flex-row items-center gap-3">
+        <View className="size-11 items-center justify-center rounded-full bg-brand/10"><Icon as={BellRing} className="text-brand" /></View>
+        <Text className="min-w-0 flex-1 font-medium" >{waitingCopy.notifyTip}</Text>
+      </View>
+      <View className="basis-full flex-row items-center justify-end">
+        <Button size="sm" className="min-h-12" disabled={busy !== null} onPress={() => void run('notify', shared.enableNotifications)}><Text>{waitingCopy.notifyOn}</Text></Button>
+        <Button variant="ghost" size="icon" accessibilityLabel="关闭" onPress={() => { writeStorage(tipClosed, true); setClosed(true) }}><Icon as={X} className="text-muted-foreground" /></Button>
+      </View>
     </View>
     {error ? <View className="px-3"><ErrorText error={error} /></View> : null}
   </Item>
