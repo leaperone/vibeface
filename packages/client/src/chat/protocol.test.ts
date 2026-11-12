@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { awaitsDevice, botReach, botCanSend, canRetryJob, inputEventBody, inputTargetKey, inputTaskCommand, runtimeLabel, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, retryText, reachDevice } from './protocol.ts'
+import { awaitsDevice, botReach, botCanSend, canRetryJob, inputEventBody, inputTargetKey, inputTaskCommand, runtimeLabel, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, promptIntent, replyStatusLabel, retryText, reachDevice } from './protocol.ts'
 import type { ManagerJob, TurnRuntime } from '../workspace/types.ts'
 import { parseInputReceipt, parseMessageRequest, parseNodes, parsePendingMessage, parseTurnRuntime, parseWorkspaceCommand, parseWorkspaceCommandNotSaved, parseWorkspaceHistory, parseWorkspaceState, record } from '../workspace/model.ts'
 import { enqueue, type OutboxItem } from '../lib/outbox.ts'
@@ -261,4 +261,8 @@ test('untyped message, queued input and history boundaries require explicit repo
     if (event.body.type !== 'input_posted') assert.fail('input event changed kind')
     assert.equal(event.body.report_results, report_results)
   }
+})
+test('chat input steers by default and starts a task only when the prompt asks', () => {
+  for (const text of ['新任务：整理发布说明', ' New task: fix login', 'new  task', '新任务帮我修登录', '新任务']) assert.equal(promptIntent(text), 'new_task', text)
+  for (const text of ['顺便看看新任务的进度', 'new tasks list', 'renew task', '']) assert.equal(promptIntent(text), 'continue', text)
 })

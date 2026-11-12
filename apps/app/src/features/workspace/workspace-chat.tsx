@@ -3,17 +3,15 @@ import { Link, useNavigate } from '@tanstack/react-router'
 import { BrainCircuit, ChevronLeft, CircleQuestionMark, ListChecks, MessagesSquare, Reply, Settings, X } from 'lucide-react'
 import { Details, EmptyState, InlineError, StatusPill, useAction } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
-import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { Textarea } from '@/components/ui/textarea'
 import { Input } from '@/components/ui/input'
-import { Sheet, SheetContent, SheetHeader, SheetDescription, SheetTitle } from '@/components/ui/sheet'
 import { Chat, type ChatEntry } from '@/features/chat/elements/chat'
 import { PromptInput } from '@/features/chat/elements/prompt-input'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { inputTargetKey } from '@vibeface/client/chat/protocol.ts'
 import { networkKey, storageOf } from '@vibeface/client/workspace/storage.ts'
-import type { ContextProjection, InputControlAction, InputIntent, InputReceipt, InputTarget, PendingMessage, QueuedInput, ScopeContext, WorkspaceHistory, WorkspaceTask } from '@vibeface/client/workspace/types.ts'
+import type { ContextProjection, InputControlAction, InputReceipt, InputTarget, PendingMessage, QueuedInput, ScopeContext, WorkspaceHistory, WorkspaceTask } from '@vibeface/client/workspace/types.ts'
 import { webPlatform } from '@/lib/platform'
 import { ChannelForm } from './channels'
 import { WorkspaceTaskLink, WorkspaceTaskPill } from './workspace-tasks'
@@ -28,7 +26,7 @@ const receiptLabels: Record<InputReceipt['stage'], string> = {
   entry_accepted: '连接的设备已接收', owner_accepted: '执行设备已接纳', submitting: '提交已登记，等待执行服务确认',
   provider_accepted: '执行服务已接受输入', associated: '已确认回合归属', refused: '已拒绝', unknown: '补充是否进入当前工作尚未确认',
 }
-type ComposerDraft = { text: string; files: File[]; intent: InputIntent; target: string; conversationId: string }
+type ComposerDraft = { text: string; files: File[]; target: string; conversationId: string }
 
 function sameTarget(left: InputTarget, right: InputTarget) {
   if ((left.kind === 'task' || left.kind === 'channel_task') && (right.kind === 'task' || right.kind === 'channel_task')) return left.task_id === right.task_id
@@ -42,15 +40,6 @@ export function InputTargetLink({ target, conversationId }: { target: InputTarge
   if (target.kind === 'channel_member') return <Link to="/channels/$channelId" params={{ channelId: target.channel_id }} className="inline-flex min-h-11 items-center text-meta underline underline-offset-4">打开所属频道</Link>
   if (target.kind === 'work' && bot) return <Link to="/b/$botId/work/$workId" params={{ botId: bot.bot_id, workId: target.work_id }} search={{ from: 'inbox' }} className="inline-flex min-h-11 items-center text-meta underline underline-offset-4">打开所属工作</Link>
   return bot ? <Link to="/b/$botId" params={{ botId: bot.bot_id }} search={target.kind === 'routine' ? { routine: target.trigger } : {}} className="inline-flex min-h-11 items-center text-meta underline underline-offset-4">打开 {bot.name}{target.kind === 'routine' ? ' 的例行任务' : ''}</Link> : null
-}
-
-export function TargetContextButton({ target, conversationId }: { target: InputTarget; conversationId?: string }) {
-  const workspace = useWorkspace()
-  const [open, setOpen] = useState(false)
-  const [context, setContext] = useState<ScopeContext | null>(null)
-  const action = useAction()
-  const title = target.kind === 'routine' ? '例行任务上下文' : target.kind === 'work' ? '工作上下文' : '输入目标上下文'
-  return <><Button type="button" size="sm" variant="ghost" onClick={() => { setOpen(true); setContext(null); void action.run('scope-context', async () => setContext(await workspace.readScopeContext({ target, conversation_id: conversationId }))) }}><BrainCircuit aria-hidden="true" />查看目标上下文</Button><Sheet open={open} onOpenChange={setOpen}><SheetContent className="overflow-y-auto"><SheetHeader><SheetTitle>{title}</SheetTitle><SheetDescription>查看这个输入目标的来源、省略内容和补充归属。</SheetDescription></SheetHeader><div className="grid gap-3 px-4 pb-6"><InlineError error={action.error} />{context?.available ? <ScopeContextDetails context={context.context} /> : <p className="text-meta text-muted-foreground">{context ? context.reason || '这个目标尚无已编译的上下文。' : action.error ? '本次未读到目标上下文。' : '正在查询目标上下文。'}</p>}</div></SheetContent></Sheet></>
 }
 
 export function InputQueue({ target, channelId }: { target: InputTarget; channelId?: string }) {
@@ -147,7 +136,7 @@ export function ChannelWorkspace({ channelId }: { channelId: string }) {
   return <div className="flex min-h-0 min-w-0 flex-1">
     <div className="flex min-h-0 min-w-0 flex-1 flex-col"><header className="grid shrink-0 gap-2 border-b px-4 py-3 sm:px-6"><div className="flex min-w-0 items-start gap-3"><div className="min-w-0 flex-1"><h2 className="[overflow-wrap:anywhere] text-heading font-semibold">{channel.title}</h2>{channel.purpose ? <p className="mt-1 text-meta text-muted-foreground">{channel.purpose}</p> : null}</div><Button type="button" variant="ghost" size="icon" aria-label="频道设置" onClick={() => setSettings(true)}><Settings aria-hidden="true" /></Button></div><p className="text-meta text-muted-foreground">{channel.members.map((id) => workspace.bots.find((item) => item.bot_id === id)?.name ?? id).join('、')} · 默认协调 {workspace.bots.find((item) => item.bot_id === channel.coordinator_bot)?.name ?? 'Bot 未加载'}</p>
       <Details label={`频道任务 · ${tasks.length}`} className="lg:hidden"><div className="grid gap-2">{tasks.map((task) => <WorkspaceTaskLink key={task.task_id} task={task} />)}</div></Details></header>
-      <ScopedConversation key={channelId} target={target} conversationId={(workspace.bots.find((item) => item.bot_id === selectedTask?.owner_bot) ?? bot).conversation_id} task={selectedTask} expectedRevision={selectedTask?.revision ?? pending?.expected_revision} channelId={channelId} onSaved={(input) => { if (savedSelection !== selectionRevision.current || !workspace.isCurrent()) return; if (input.target.kind !== "channel_task" || input.target.channel_id !== channelId) return; setSavedInput(input); setRecipient(input.target.bot_id); setReplyTask(input.target.task_id); storage.writeStorage(selectionKey, { bot_id: input.target.bot_id, task_id: input.target.task_id }) }} label={`${workspace.bots.find((item) => item.bot_id === selectedTask?.owner_bot)?.name ?? bot.name}${selectedTask ? ` · ${selectedTask.title}` : replyTask ? ' · 已保存的频道任务' : ' · 新频道任务'}`} onReply={(taskId, recipientBot) => { selectionRevision.current++; setSavedInput(null); setReplyTask(taskId); setRecipient(recipientBot); storage.writeStorage(selectionKey, { bot_id: recipientBot, task_id: taskId }) }} targetControl={<><label className="flex min-w-0 max-w-full items-center gap-2"><span className="shrink-0">交给</span><NativeSelect className="min-w-0 flex-1" size="sm" aria-label="频道消息目标" value={botId} onChange={(event) => { selectionRevision.current++; setRecipient(event.currentTarget.value); setReplyTask(null); setSavedInput(null); storage.writeStorage(selectionKey, { bot_id: event.currentTarget.value }) }}>{channel.members.map((id) => <NativeSelectOption key={id} value={id}>{workspace.bots.find((item) => item.bot_id === id)?.name ?? id}{id === channel.coordinator_bot ? ' · 默认协调' : ''}</NativeSelectOption>)}</NativeSelect></label>{replyTask ? <Button type="button" variant="ghost" size="sm" onClick={() => { selectionRevision.current++; setReplyTask(null); setSavedInput(null); storage.writeStorage(selectionKey, { bot_id: recipient }) }}><X aria-hidden="true" />结束回复选择</Button> : null}</>} />
+      <ScopedConversation key={channelId} target={target} conversationId={(workspace.bots.find((item) => item.bot_id === selectedTask?.owner_bot) ?? bot).conversation_id} task={selectedTask} expectedRevision={selectedTask?.revision ?? pending?.expected_revision} channelId={channelId} onSaved={(input) => { if (savedSelection !== selectionRevision.current || !workspace.isCurrent()) return; if (input.target.kind !== "channel_task" || input.target.channel_id !== channelId) return; setSavedInput(input); setRecipient(input.target.bot_id); setReplyTask(input.target.task_id); storage.writeStorage(selectionKey, { bot_id: input.target.bot_id, task_id: input.target.task_id }) }} label={`${workspace.bots.find((item) => item.bot_id === selectedTask?.owner_bot)?.name ?? bot.name}${selectedTask ? ` · ${selectedTask.title}` : replyTask ? ' · 已保存的频道任务' : ' · 新频道任务'}`} onReply={(taskId, recipientBot) => { selectionRevision.current++; setSavedInput(null); setReplyTask(taskId); setRecipient(recipientBot); storage.writeStorage(selectionKey, { bot_id: recipientBot, task_id: taskId }) }} targetControl={<>{replyTask ? <Button type="button" variant="ghost" size="sm" onClick={() => { selectionRevision.current++; setReplyTask(null); setSavedInput(null); setRecipient(''); storage.writeStorage(selectionKey, null) }}><X aria-hidden="true" />结束回复选择</Button> : null}</>} />
     </div>
     <aside className="hidden w-[22rem] shrink-0 overflow-y-auto border-s p-4 lg:block" aria-label="频道任务"><h3 className="mb-3 font-medium">频道任务</h3><div className="grid gap-3">{tasks.map((task) => <WorkspaceTaskLink key={task.task_id} task={task} />)}{!tasks.length ? <p className="text-meta text-muted-foreground">发送第一条交代，创建频道任务。</p> : null}</div></aside>
     {settings ? <ChannelForm key={channel.event_hash} open={settings} onOpenChange={setSettings} channel={channel} /> : null}
@@ -163,15 +152,14 @@ function ScopedConversation({ target, conversationId, label, task, channelId, ex
   const [history, setHistory] = useState<WorkspaceHistory | null>(null)
   const [query, setQuery] = useState('')
   const [error, setError] = useState<unknown>(null)
-  const [intent, setIntent] = useState<InputIntent>('continue')
   const [files, setFiles] = useState<File[]>([])
   const scopeTaskId = task?.task_id ?? (target.kind === 'task' || target.kind === 'channel_task' ? target.task_id : undefined)
   const storage = storageOf(webPlatform.storage)
   const draftKey = networkKey(`draft:${channelId ? `channel:${channelId}` : `task:${scopeTaskId}`}`, ready?.principal.network_id ?? '')
   const [text, setText] = useState(() => { const saved = storage.readStorage<unknown>(draftKey, ''); return typeof saved === 'string' ? saved : '' })
   const targetKey = inputTargetKey(target)
-  const draftRef = useRef<ComposerDraft>({ text, files, intent, target: targetKey, conversationId })
-  if (draftRef.current.text !== text || draftRef.current.files !== files || draftRef.current.intent !== intent || draftRef.current.target !== targetKey || draftRef.current.conversationId !== conversationId) draftRef.current = { text, files, intent, target: targetKey, conversationId }
+  const draftRef = useRef<ComposerDraft>({ text, files, target: targetKey, conversationId })
+  if (draftRef.current.text !== text || draftRef.current.files !== files || draftRef.current.target !== targetKey || draftRef.current.conversationId !== conversationId) draftRef.current = { text, files, target: targetKey, conversationId }
   const draft = draftRef.current
   const savingDrafts = useRef(new Set<ComposerDraft>())
   const latest = useRef(workspace)
@@ -214,15 +202,13 @@ function ScopedConversation({ target, conversationId, label, task, channelId, ex
   for (const item of pending) if (!postedIds.has(item.message_id)) entries.push({ key: item.message_id, conversationId: item.conversation_id, anchor: true, message: { message_id: item.message_id, event_hash: item.message_id, role: 'user', text: item.text, created_at_ms: item.created_at_ms, state: 'sending' } })
   for (const item of pending) entries.push({ key: `delivery:${item.message_id}`, node: <WorkspaceInputStatus pending={item} refresh={refresh} /> })
   const busy = task && ['running', 'update_pending'].includes(task.state)
-  const sendLabel = intent === 'defer' ? '保存为稍后处理' : intent === 'new_task' ? '发送为新任务' : busy ? '补充当前工作' : '发送'
   return <section className="conversation-screen" aria-label={channelId ? '频道对话' : '任务对话'}>
     <label className="mx-auto grid w-full max-w-(--page-width) shrink-0 gap-1 px-4 pt-3 text-meta text-muted-foreground sm:px-6">{channelId ? '搜索当前频道已加载的记录' : '搜索当前任务已加载的记录'}<Input type="search" value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder="输入关键词" /></label>
     <Chat key={channelId ?? scopeTaskId} entries={entries} empty={<EmptyState icon={MessagesSquare} title={history ? '发送一条交代开始对话' : '正在读取任务历史'} />} />
-    <PromptInput value={text} onChange={setDraft} files={files} onFiles={setFiles} hint="" reason={workspace.readOnlyNotice || workspace.writeNotice} disabled={!workspace.canSaveMessages} label={`发给 ${label}`} sendLabel={sendLabel} target={<div className="grid w-full min-w-0 gap-2">
+    <PromptInput value={text} onChange={setDraft} files={files} onFiles={setFiles} hint="" reason={workspace.readOnlyNotice || workspace.writeNotice} disabled={!workspace.canSaveMessages} label={`发给 ${label}`} sendLabel={busy ? '补充当前工作' : '发送'} target={<div className="grid w-full min-w-0 gap-2">
       <span className="truncate" title={label}>{busy ? '补充给' : '发送给'} · {label}</span>
       <div className="flex min-w-0 flex-wrap items-center gap-2">
         {targetControl}
-        <NativeSelect className="max-w-full" size="sm" aria-label="发送方式" value={intent} onChange={(event) => { const value = event.currentTarget.value; if (value === 'continue' || value === 'new_task' || value === 'defer') setIntent(value) }}><NativeSelectOption value="continue">{busy ? '补充当前工作' : '发送'}</NativeSelectOption><NativeSelectOption value="new_task">新任务</NativeSelectOption><NativeSelectOption value="defer">稍后处理</NativeSelectOption></NativeSelect>
         <InputQueue target={target} channelId={channelId} />
       </div>
     </div>} onStop={workspace.writable && task && !['completed', 'cancelled', 'deferred'].includes(task.state) ? () => { void (onStop ? onStop() : workspace.stopInputTarget({ target, expected_revision: task.revision })).catch(setError) } : undefined} onSubmit={() => {
@@ -233,8 +219,8 @@ function ScopedConversation({ target, conversationId, label, task, channelId, ex
       const submitted = text
       const selectedFiles = files
       setError(null)
-      void workspace.sendMessage(submitted, selectedFiles, undefined, { target, intent, conversation_id: conversationId, ...((expectedRevision ?? task?.revision) !== undefined ? { expected_revision: expectedRevision ?? task?.revision } : {}), onSaved: (input) => { if (!routeActive.current || !workspace.isCurrent()) return; onSaved?.(input); if (draftRef.current === submittedDraft && !channelId && (input.target.kind === 'task' || input.target.kind === 'channel_task') && input.target.task_id !== scopeTaskId) void navigate({ to: '/tasks/$taskId', params: { taskId: input.target.task_id } }) } }).then((saved) => {
-        if (saved && latest.current.isCurrent()) { if (draftRef.current === submittedDraft) { setText((current) => { if (current !== submitted) return current; storage.writeStorage(draftKey, ''); return '' }); setFiles((current) => current === selectedFiles ? [] : current); setIntent('continue') } void refresh().catch(setError) }
+      void workspace.sendMessage(submitted, selectedFiles, undefined, { target, conversation_id: conversationId, ...((expectedRevision ?? task?.revision) !== undefined ? { expected_revision: expectedRevision ?? task?.revision } : {}), onSaved: (input) => { if (!routeActive.current || !workspace.isCurrent()) return; onSaved?.(input); if (draftRef.current === submittedDraft && !channelId && (input.target.kind === 'task' || input.target.kind === 'channel_task') && input.target.task_id !== scopeTaskId) void navigate({ to: '/tasks/$taskId', params: { taskId: input.target.task_id } }) } }).then((saved) => {
+        if (saved && latest.current.isCurrent()) { if (draftRef.current === submittedDraft) { setText((current) => { if (current !== submitted) return current; storage.writeStorage(draftKey, ''); return '' }); setFiles((current) => current === selectedFiles ? [] : current) } void refresh().catch(setError) }
       }).catch(setError).finally(() => { savingDrafts.current.delete(submittedDraft) })
     }}><InlineError error={error} action={{ label: '重新读取', onClick: () => void refresh().catch(setError) }} /><p className="text-meta text-muted-foreground">{history ? `已加载最近 ${history.events.length} 条${history.coverage.truncated ? '，更早的记录未加载' : ''}。` : '尚未读取历史。'}执行服务是否接收、输入归入哪个回合，请查看每条输入的状态。</p></PromptInput>
   </section>

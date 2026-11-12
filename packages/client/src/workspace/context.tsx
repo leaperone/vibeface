@@ -7,7 +7,7 @@ import { requestKey } from "../lib/secure.ts"
 import { notificationForOpening, type Platform } from "../lib/platform.ts"
 import type { Tabs } from "../identity/context.tsx"
 import { mergeProgress, type LiveProgress } from "../lib/progress.ts"
-import { inputEventBody, inputTargetKey, inputTaskCommand, isQueuedReceipt, prepareSend, retryText } from "../chat/protocol.ts"
+import { inputEventBody, inputTargetKey, inputTaskCommand, isQueuedReceipt, prepareSend, promptIntent, retryText } from "../chat/protocol.ts"
 import { taskActive } from "./labels.ts"
 import { outcomeUnknown } from "../lib/errors.ts"
 import { byRank, unreadReply } from "../chat/timeline.ts"
@@ -922,12 +922,13 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const id = targetConversation(target, options?.conversation_id)
     let revision = options?.expected_revision
     let localTask: LocalTask | undefined
-    if (options?.intent === 'new_task' || target.kind === 'channel_member') {
+    const intent = options?.intent ?? promptIntent(text)
+    if (intent === 'new_task' || target.kind === 'channel_member') {
       if (!files.length && !sent.length) inputText(text, '消息内容', 65536)
       const bot = botsRef.current.find((bot) => bot.conversation_id === id)
       if (!bot) throw new Error('输入目标没有可用的 Bot。')
       const channelKey = target.kind === 'channel_member' ? inputTargetKey(target) : undefined
-      localTask = channelKey && options?.intent !== 'new_task' ? channelTasks.current.get(channelKey) : undefined
+      localTask = channelKey && intent !== 'new_task' ? channelTasks.current.get(channelKey) : undefined
       if (!localTask) {
         const taskId = newId(), channelId = 'channel_id' in target ? target.channel_id : undefined
         const sources = target.kind === 'work' ? knownWorks.current.get(JSON.stringify([id, target.work_id]))?.source_events ?? [] : []
@@ -967,7 +968,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
         const sequences = record(readStorage<unknown>(sequenceKey, {}, true)), prior = sequences[lane]
         if (prior !== undefined && (typeof prior !== 'number' || !Number.isSafeInteger(prior) || prior < 0)) throw new Error('本地输入顺序损坏，已暂停发送。')
         const sequence = (typeof prior === 'number' ? prior : 0) + 1
-        const prepared = prepareSend({ conversationId: id, text, target, sequence, intent: options?.intent ?? 'continue', expected_revision: revision, reportResults: true, files: files.length + sent.length > 0 })
+        const prepared = prepareSend({ conversationId: id, text, target, sequence, intent, expected_revision: revision, reportResults: true, files: files.length + sent.length > 0 })
         if (!prepared.ok) throw new Error(prepared.error)
         writeStorage(sequenceKey, { ...sequences, [lane]: sequence }, true)
         return prepared

@@ -2,7 +2,7 @@ import { historySections } from '@vibeface/client/workspace/model.ts'
 import { HistoryControls } from './history-controls'
 import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
-import { ArrowDown, ArrowRightLeft, Bot, Check, ChevronRight, CircleCheck, Clock, CircleQuestionMark, CircleStop, CircleX, Crown, Hourglass, Laptop, Link2, ListChecks, ListPlus, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, RotateCcw, RotateCw, Send, SlidersHorizontal, Unplug, WifiOff } from 'lucide-react'
+import { ArrowDown, ArrowRightLeft, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Crown, Hourglass, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, RotateCcw, RotateCw, Send, Unplug, WifiOff } from 'lucide-react'
 import { ActionCard, Details, EmptyState, InlineError, PageActions, PrimaryMark } from '@/components/app/kit'
 import { BotFace, botMood, botTint, useDark } from '@/components/app/bot-face'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
@@ -12,7 +12,6 @@ import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { failureText, outcomeUnknown, taskError, workFailure } from '@vibeface/client/lib/errors.ts'
 import { terms } from '@/lib/glossary'
-import { cn } from '@/lib/utils'
 import { ActionButton } from '@/features/workspace/present'
 import { ChatSkeleton, useCreateBot } from '@/features/workspace/workspace-shell'
 import { ConfirmCard } from '@/features/workspace/task-activity'
@@ -28,9 +27,8 @@ import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
 import type { ChatMessage } from './elements/message'
 import { PromptInput } from './elements/prompt-input'
-import { DropdownMenu } from 'radix-ui'
 import { InputQueue, WorkspaceInputStatus } from '@/features/workspace/workspace-chat'
-import type { InputIntent, InputTarget } from '@vibeface/client/workspace/types.ts'
+import type { InputTarget } from '@vibeface/client/workspace/types.ts'
 import { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
 import { chatTimeline, firstUnread, taskMessage } from '@vibeface/client/chat/timeline.ts'
@@ -43,7 +41,7 @@ const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'runnin
 const failureReason = (raw: string) => taskError(raw).split('\n').at(-1) ?? ''
 // The owner wrote the reply but it has not synced here yet; its streamed text stands in until it lands.
 const streamingStates = [...busyStates, 'publishing']
-type ComposerDraft = { text: string; files: File[]; intent: InputIntent; target: string; conversationId: string }
+type ComposerDraft = { text: string; files: File[]; target: string; conversationId: string }
 
 function NoBot() {
   const { bots } = useWorkspace()
@@ -64,7 +62,6 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const [drafts, setDrafts] = useState<Map<string, string>>(() => { const stored = draftStorage.readStorage<unknown>(draftKey, {}); return stored && typeof stored === 'object' && !Array.isArray(stored) ? new Map(Object.entries(stored).filter((entry): entry is [string, string] => typeof entry[1] === 'string')) : new Map() })
   const [sendError, setSendError] = useState<unknown>(null)
   const [files, setFiles] = useState<File[]>([])
-  const [intent, setIntent] = useState<InputIntent>('continue')
   const [selectedTarget, setSelectedTarget] = useState(routeRoutine ? `routine:${routeRoutine}` : 'main')
   const { conversationId, data, chatSlot } = workspace
   const pendingMessages = workspace.pendingMessages.filter((item) => item.conversation_id === conversationId && item.target.kind === 'bot_main')
@@ -72,8 +69,8 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const dark = useDark()
   const tint = bot ? botTint(faceOf(bot.bot_id, bot.avatar).hue, dark) : undefined
   const text = drafts.get(conversationId) ?? ''
-  const draftRef = useRef<ComposerDraft>({ text, files, intent, target: selectedTarget, conversationId })
-  if (draftRef.current.text !== text || draftRef.current.files !== files || draftRef.current.intent !== intent || draftRef.current.target !== selectedTarget || draftRef.current.conversationId !== conversationId) draftRef.current = { text, files, intent, target: selectedTarget, conversationId }
+  const draftRef = useRef<ComposerDraft>({ text, files, target: selectedTarget, conversationId })
+  if (draftRef.current.text !== text || draftRef.current.files !== files || draftRef.current.target !== selectedTarget || draftRef.current.conversationId !== conversationId) draftRef.current = { text, files, target: selectedTarget, conversationId }
   const draft = draftRef.current
   const savingDrafts = useRef(new Set<ComposerDraft>())
   const jobs = data?.scheduler?.jobs ?? []
@@ -239,7 +236,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const canSetUp = ready?.principal.can_manage === true || ready?.principal.source === 'local_session'
 
   // Picked files belong to the bot they were picked for.
-  useEffect(() => { setSendError(null); setFiles([]); setSelectedTarget(routeRoutine ? `routine:${routeRoutine}` : 'main'); setIntent('continue') }, [conversationId, routeRoutine])
+  useEffect(() => { setSendError(null); setFiles([]); setSelectedTarget(routeRoutine ? `routine:${routeRoutine}` : 'main') }, [conversationId, routeRoutine])
   // Nothing pushes a device's bot readiness, so while a device that could reply to an open bot is not ready, read it again every 10s, or every 2s while it starts.
   const latest = useRef(workspace)
   latest.current = workspace
@@ -311,8 +308,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
         hint={notice}
         reason={reason}
         disabled={sendDisabled}
-        sendLabel={intent === 'defer' ? '保存为稍后处理' : intent === 'new_task' ? '发送为新任务' : targetBusy ? '补充当前工作' : '发送'}
-        tools={<IntentMenu intent={intent} busy={targetBusy} onChange={setIntent} />}
+        sendLabel={targetBusy ? '补充当前工作' : '发送'}
         onStop={workspace.writable && (inputTarget.kind === 'bot_main' ? stopJob : targetBusy) ? () => { setSendError(null); workspace.stopInputTarget({ target: inputTarget }).catch(setSendError) } : undefined}
         onChange={setText}
         files={files}
@@ -324,7 +320,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
           savingDrafts.current.add(submittedDraft)
           setSendError(null)
           const submittedFiles = files
-          workspace.sendMessage(text, submittedFiles, undefined, { target: inputTarget, intent, onSaved: (input) => { if (!workspace.isCurrent() || latest.current.conversationId !== conversationId || latest.current.view !== "chat" || draftRef.current !== submittedDraft) return; if (intent === "new_task" && (input.target.kind === "task" || input.target.kind === "channel_task")) void navigate({ to: "/tasks/$taskId", params: { taskId: input.target.task_id } }) } }).then((sent) => { if (sent && workspace.isCurrent()) { if (latest.current.conversationId !== conversationId || draftRef.current === submittedDraft) clearSentDraft(conversationId, text); if (draftRef.current === submittedDraft) setFiles((current) => current === submittedFiles ? [] : current) } }).catch(setSendError).finally(() => { savingDrafts.current.delete(submittedDraft) })
+          workspace.sendMessage(text, submittedFiles, undefined, { target: inputTarget, onSaved: (input) => { if (!workspace.isCurrent() || latest.current.conversationId !== conversationId || latest.current.view !== "chat" || draftRef.current !== submittedDraft) return; if (input.target.kind === "task" || input.target.kind === "channel_task") void navigate({ to: "/tasks/$taskId", params: { taskId: input.target.task_id } }) } }).then((sent) => { if (sent && workspace.isCurrent()) { if (latest.current.conversationId !== conversationId || draftRef.current === submittedDraft) clearSentDraft(conversationId, text); if (draftRef.current === submittedDraft) setFiles((current) => current === submittedFiles ? [] : current) } }).catch(setSendError).finally(() => { savingDrafts.current.delete(submittedDraft) })
         }}
       >
         <InlineError error={sendError} className="basis-full" />
@@ -441,35 +437,4 @@ function JobLine({ job, retry, refresh }: { job: ManagerJob; retry?: () => Promi
     {job.failure ? <span className="min-w-0 truncate text-muted-foreground" title={job.failure.detail}>{failureText(job.failure.kind) || failureReason(job.failure.detail)}</span> : null}
     {retry ? <ActionButton variant="ghost" className="-ms-1 h-8 px-2 text-meta max-md:h-11" action={retry}><RotateCcw aria-hidden="true" />重试</ActionButton> : <ActionButton variant="ghost" action={refresh}>再查一次</ActionButton>}
   </div>
-}
-
-const intents = [
-  { value: 'continue', label: '普通消息', icon: Send },
-  { value: 'new_task', label: '新任务', icon: ListPlus },
-  { value: 'defer', label: '稍后处理', icon: Clock },
-] as const
-
-/** Keep the current sending mode visible beside its menu. */
-function IntentMenu({ intent, busy, onChange }: { intent: InputIntent; busy: boolean; onChange: (intent: InputIntent) => void }) {
-  const current = intents.find((item) => item.value === intent) ?? intents[0]
-  const label = (item: (typeof intents)[number]) => item.value === 'continue' && busy ? '补充当前工作' : item.label
-  return <DropdownMenu.Root>
-    <DropdownMenu.Trigger asChild>
-      <Button type="button" variant="ghost" size="sm" className={cn('h-9 rounded-lg max-md:h-11', intent === 'continue' ? 'text-muted-foreground hover:text-foreground' : 'bg-muted text-foreground')} aria-label={`发送方式：${label(current)}`} title="发送方式" onMouseDown={(event) => event.preventDefault()}>
-        {intent === 'continue' ? <SlidersHorizontal aria-hidden="true" /> : <current.icon aria-hidden="true" />}
-        <span>{label(current)}</span>
-      </Button>
-    </DropdownMenu.Trigger>
-    <DropdownMenu.Portal>
-      <DropdownMenu.Content side="top" align="start" sideOffset={6} className="z-50 grid min-w-40 gap-0.5 rounded-xl border bg-popover p-1 text-popover-foreground shadow-lg">
-        <DropdownMenu.RadioGroup value={intent} onValueChange={(value) => { if (value === 'continue' || value === 'new_task' || value === 'defer') onChange(value) }}>
-          {intents.map((item) => <DropdownMenu.RadioItem key={item.value} value={item.value} className="flex min-h-9 cursor-default items-center gap-2 rounded-lg px-2.5 text-sm outline-none select-none data-highlighted:bg-muted max-md:min-h-11">
-            <item.icon aria-hidden="true" className="size-4 text-muted-foreground" />
-            <span className="flex-1">{label(item)}</span>
-            <DropdownMenu.ItemIndicator><Check aria-hidden="true" className="size-4" /></DropdownMenu.ItemIndicator>
-          </DropdownMenu.RadioItem>)}
-        </DropdownMenu.RadioGroup>
-      </DropdownMenu.Content>
-    </DropdownMenu.Portal>
-  </DropdownMenu.Root>
 }

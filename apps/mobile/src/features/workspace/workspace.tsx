@@ -1,15 +1,14 @@
 import { File } from 'expo-file-system'
 import { Link, Stack, router, useFocusEffect } from 'expo-router'
-import { BrainCircuit, ChevronRight, CircleQuestionMark, Clock, ListChecks, ListPlus, MessagesSquare, Plus, Reply, Settings, SlidersHorizontal, X } from 'lucide-react-native'
+import { BrainCircuit, ChevronRight, CircleQuestionMark, ListChecks, MessagesSquare, Plus, Reply, Settings, X } from 'lucide-react-native'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useReducedMotion } from 'react-native-reanimated'
-import { Modal, Platform, Pressable, ScrollView, View } from 'react-native'
-import { KeyboardAwareScrollView, KeyboardController, KeyboardStickyView } from 'react-native-keyboard-controller'
+import { Pressable, ScrollView, View } from 'react-native'
+import { KeyboardAwareScrollView, KeyboardStickyView } from 'react-native-keyboard-controller'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { messageOf } from '@vibeface/client/lib/node.ts'
 import { inputTargetKey } from '@vibeface/client/chat/protocol.ts'
 import { networkKey, newId, storageOf } from '@vibeface/client/workspace/storage.ts'
-import type { ContextProjection, InputControlAction, InputIntent, InputReceipt, InputTarget, PendingMessage, QueuedInput, ScopeContext, WorkspaceCommand, WorkspaceHistory, WorkspaceTask } from '@vibeface/client/workspace/types.ts'
+import type { ContextProjection, InputReceipt, InputTarget, PendingMessage, ScopeContext, WorkspaceCommand, WorkspaceHistory, WorkspaceTask } from '@vibeface/client/workspace/types.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { Details, EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
@@ -36,7 +35,7 @@ const receiptLabels: Record<InputReceipt['stage'], string> = {
   associated: '已确认回合归属', refused: '已拒绝', unknown: '补充是否进入当前工作尚未确认',
 }
 const deliveryLabels: Record<PendingMessage['delivery'], string> = { saved: '本地已保存', uploading: '本地已保存，附件准备中', submitting: '正在发送给连接的设备', accepted: '连接的设备已接收', unknown: '是否送达尚未确认' }
-type ComposerDraft = { text: string; files: Attachment[]; intent: InputIntent; target: string; conversationId: string }
+type ComposerDraft = { text: string; files: Attachment[]; target: string; conversationId: string }
 
 export function ScopeSources({ context }: { context: ContextProjection }) {
   const kinds: Record<ContextProjection['sources'][number]['kind'], string> = { trigger: '本轮交代', message: '共享消息', work: '工作结果', dispatch: '工作指派', checkpoint: '历史摘要', handoff: '任务交接', memory: '持久记忆', question: '已知问题', attachment: '附件' }
@@ -137,8 +136,6 @@ export function ChannelSettingsScreen({ channelId }: { channelId?: string }) {
   </KeyboardAwareScrollView>
 }
 
-export type TargetOption = { key: string; label: string; target: InputTarget; revision?: number }
-
 function sameTarget(left: InputTarget, right: InputTarget) {
   if ((left.kind === 'task' || left.kind === 'channel_task') && (right.kind === 'task' || right.kind === 'channel_task')) return left.task_id === right.task_id
   return JSON.stringify(left) === JSON.stringify(right)
@@ -149,58 +146,6 @@ export function InputLocation({ target, conversationId }: { target: InputTarget;
   const bot = shared?.bots.find((item) => item.conversation_id === conversationId)
   const href = target.kind === 'task' || target.kind === 'channel_task' ? `/task/${target.task_id}` : target.kind === 'channel_member' ? `/channel/${target.channel_id}` : target.kind === 'work' && bot ? `/b/${bot.bot_id}/work/${target.work_id}` : bot ? `/b/${bot.bot_id}${target.kind === 'routine' ? `?routine=${encodeURIComponent(target.trigger)}` : ''}` : null
   return href ? <Link href={href} asChild><Button variant="ghost" className="self-start"><Text>{target.kind === 'task' || target.kind === 'channel_task' ? '打开所属任务' : target.kind === 'work' ? '打开所属工作' : target.kind === 'channel_member' ? '打开所属频道' : '打开所属 Bot'}</Text></Button></Link> : null
-}
-
-function InputQueue({ targets, editing, setEditing }: { targets: InputTarget[]; editing: string | null; setEditing: (id: string | null) => void }) {
-  const shared = useLive()
-  const { busy, error, run } = useRun()
-  const [text, setText] = useState('')
-  const [attachments, setAttachments] = useState<NonNullable<PendingMessage['attachments']>>([])
-  const queued = (shared?.workspaceState?.inputs ?? []).filter((item) => item.deferred && !item.cancelled && targets.some((target) => sameTarget(item.input.target, target))).sort((left, right) => left.effective_order - right.effective_order)
-  const control = (item: QueuedInput, action: InputControlAction) => run(item.input.message_id, async () => {
-    if (!shared) throw new Error('尚未连接工作区。')
-    const receipt = await shared.queryInput({ message_id: item.input.message_id, target: item.input.target, conversation_id: item.conversation_id })
-    if (!['entry_accepted', 'owner_accepted', 'refused'].includes(receipt.stage)) throw new Error('这条输入可能已提交，只能查询当前结果。')
-    await shared.controlInput({ message_id: item.input.message_id, expected_event: item.control_event, action })
-    await shared.readWorkspaceState()
-    if (action.kind === 'edit') { await KeyboardController.dismiss(); setEditing(null) }
-  })
-  if (!queued.length) return null
-  return <View className="gap-3"><Text role="heading" className="font-medium">稍后处理 {queued.length} 条</Text>{queued.map((item) => {
-    const lane = queued.filter((other) => sameTarget(other.input.target, item.input.target))
-    const index = lane.findIndex((other) => other.input.message_id === item.input.message_id)
-    const pending = shared?.pendingMessages.find((value) => value.message_id === item.input.message_id)
-    const locked = Boolean(busy) || !shared?.writable || pending?.receipt && ['submitting', 'provider_accepted', 'associated', 'unknown'].includes(pending.receipt.stage)
-    return <View key={item.input.message_id} className="gap-2 rounded-xl border border-border bg-card p-3">{editing === item.input.message_id ? <View className="gap-2"><Text nativeID="queue-edit-label" className="text-meta font-medium">编辑稍后输入</Text><Input accessibilityLabel="编辑稍后输入" accessibilityLabelledBy="queue-edit-label" multiline value={text} onChangeText={setText} maxLength={100000} className="min-h-24 py-3" />{(item.input.attachments ?? []).map((attachment) => <Pressable key={attachment.hash} accessibilityRole="checkbox" accessibilityState={{ checked: attachments.some((value) => value.hash === attachment.hash) }} accessibilityLabel={`保留附件 ${attachment.name}`} className="min-h-11 justify-center" onPress={() => setAttachments((current) => current.some((value) => value.hash === attachment.hash) ? current.filter((value) => value.hash !== attachment.hash) : [...current, attachment])}><Text className="text-meta">{attachments.some((value) => value.hash === attachment.hash) ? '保留' : '移除'}附件 · {attachment.name}</Text></Pressable>)}<View className="flex-row flex-wrap gap-2"><Button disabled={Boolean(locked)} onPress={() => void control(item, { kind: 'edit', text, attachments })}><Text>保存输入修改</Text></Button><Button variant="ghost" onPress={() => setEditing(null)}><Text>放弃编辑</Text></Button></View></View> : <><Text selectable>{item.input.text || `${item.input.attachments?.length ?? 0} 个附件`}</Text><View className="flex-row flex-wrap gap-2"><Button variant="outline" disabled={Boolean(locked)} onPress={() => void control(item, { kind: 'release' })}><Text>现在处理</Text></Button><Button variant="ghost" disabled={Boolean(locked)} onPress={() => { setEditing(item.input.message_id); setText(item.input.text); setAttachments(item.input.attachments ?? []) }}><Text>编辑输入</Text></Button><Button variant="ghost" disabled={Boolean(locked)} onPress={() => void control(item, { kind: 'cancel' })}><Text>取消稍后输入</Text></Button><Button variant="ghost" disabled={Boolean(locked) || index === 0} onPress={() => void control(item, { kind: 'move', before_message_id: lane[index - 1]?.input.message_id })}><Text>上移</Text></Button><Button variant="ghost" disabled={Boolean(locked) || index === lane.length - 1} onPress={() => void control(item, { kind: 'move', ...(lane[index + 2] ? { before_message_id: lane[index + 2].input.message_id } : {}) })}><Text>下移</Text></Button></View></>}{locked ? <Text className="text-meta text-muted-foreground">输入状态变化或正在提交时，先查询结果再管理。</Text> : null}</View>
-  })}{error ? <ErrorText error={error} /> : null}<Text className="text-meta text-muted-foreground">操作由执行设备确认。已开始处理或结果未知的输入，只能查询状态。</Text></View>
-}
-
-export function InputOptions({ label, options, selected, onSelect, intent, onIntent, pending }: { label: string; options: TargetOption[]; selected: string; onSelect: (option: TargetOption) => void; intent: InputIntent; onIntent: (intent: InputIntent) => void; pending: PendingMessage[] }) {
-  const [open, setOpen] = useState(false)
-  // Lifted from the queue so a swipe cannot close the sheet over an unsaved edit.
-  const [editing, setEditing] = useState<string | null>(null)
-  const shared = useLive()
-  const [scopeContext, setScopeContext] = useState<ScopeContext | null>(null)
-  const [contextError, setContextError] = useState('')
-  const [contextBusy, setContextBusy] = useState(false)
-  const contextRead = useRef(0)
-  useEffect(() => { contextRead.current += 1; setScopeContext(null); setContextError(''); setContextBusy(false) }, [selected])
-  const insets = useSafeAreaInsets()
-  const reducedMotion = useReducedMotion()
-  const intents: { value: InputIntent; label: string }[] = [{ value: 'continue', label: '补充当前工作' }, { value: 'new_task', label: '新任务' }, { value: 'defer', label: '稍后处理' }]
-  const shown = intent === 'new_task' ? ListPlus : intent === 'defer' ? Clock : SlidersHorizontal
-  return <><Button variant="ghost" size="icon" className={cn('rounded-full', intent !== 'continue' && 'bg-muted')} accessibilityLabel={`输入目标 ${label}，${intents.find((item) => item.value === intent)?.label}${pending.length ? `，${pending.length} 条待确认` : ''}，打开目标和队列`} onPress={() => setOpen(true)}>
-    <Icon as={shown} className={intent === 'continue' ? 'text-muted-foreground' : 'text-foreground'} />
-    {pending.length ? <View className="absolute end-1 top-1 size-2 rounded-full bg-warning" /> : null}
-  </Button>
-    <Modal visible={open} presentationStyle="pageSheet" allowSwipeDismissal={!editing} animationType={reducedMotion ? 'none' : 'slide'} onRequestClose={() => { if (!editing) setOpen(false) }}>{/* Android ignores pageSheet and draws this full screen under the status bar. */}<View testID="input-options-sheet" accessibilityViewIsModal className="flex-1 bg-background px-4" style={{ paddingTop: (Platform.OS === 'android' ? insets.top : 0) + 16, paddingBottom: insets.bottom + 16 }}><View className="mb-3 flex-row items-center"><Text role="heading" className="flex-1 text-heading font-semibold">目标和队列</Text><Button variant="ghost" size="icon" accessibilityLabel="关闭目标和队列" onPress={() => setOpen(false)}><Icon as={X} /></Button></View><ScrollView automaticallyAdjustKeyboardInsets keyboardDismissMode="interactive" keyboardShouldPersistTaps="handled" contentContainerClassName="gap-4 pb-4"><View className="gap-2"><Text className="text-meta font-medium">发送给</Text>{options.map((option) => <Button key={option.key} variant={selected === option.key ? 'default' : 'outline'} accessibilityState={{ selected: selected === option.key }} onPress={() => onSelect(option)}><Text className="shrink">{option.label}</Text></Button>)}</View><View className="gap-2"><Text className="text-meta font-medium">发送方式</Text>{intents.map((item) => <Button key={item.value} variant={intent === item.value ? 'default' : 'outline'} accessibilityState={{ selected: intent === item.value }} onPress={() => { onIntent(item.value); setOpen(false) }}><Text>{item.label}</Text></Button>)}</View><Button variant="outline" disabled={!shared || contextBusy} onPress={() => {
-      const option = options.find((item) => item.key === selected)
-      if (!option || !shared) return
-      const ticket = ++contextRead.current
-      setContextBusy(true); setScopeContext(null); setContextError('')
-      void shared.readScopeContext({ target: option.target }).then((value) => { if (ticket === contextRead.current) setScopeContext(value) }, (cause) => { if (ticket === contextRead.current) setContextError(messageOf(cause)) }).finally(() => { if (ticket === contextRead.current) setContextBusy(false) })
-    }}><Icon as={BrainCircuit} /><Text>{contextBusy ? '正在查询目标上下文' : '查看目标上下文'}</Text></Button>{contextError ? <ErrorText error={contextError} /> : null}{scopeContext?.available ? <ScopeSources context={scopeContext.context} /> : scopeContext ? <Text className="text-meta text-muted-foreground">{scopeContext.reason || '这个目标尚无已编译的上下文。'}</Text> : null}<InputQueue targets={options.map((option) => option.target)} editing={editing} setEditing={setEditing} /><View className="gap-2"><Text role="heading" className="text-meta font-medium">已保存输入</Text>{pending.length ? pending.map((item) => <View key={item.message_id} className="gap-2"><Text numberOfLines={3} className="text-meta">{item.text}</Text><InputStatus pending={item} /></View>) : <Text className="text-meta text-muted-foreground">没有待确认的本地输入。</Text>}</View></ScrollView></View></Modal>
-  </>
 }
 
 export function InputStatus({ pending }: { pending: PendingMessage }) {
@@ -234,7 +179,6 @@ export function ScopedWorkspaceScreen({ taskId, channelId }: { taskId?: string; 
   const [savedInput, setSavedInput] = useState<PendingMessage | null>(null)
   const selectionRevision = useRef(0)
   const savedSelection = selectionRevision.current
-  const [intent, setIntent] = useState<InputIntent>('continue')
   const [files, setFiles] = useState<Attachment[]>([])
   const [error, setError] = useState('')
   const { error: actionError, busy: actionBusy, run } = useRun()
@@ -265,12 +209,11 @@ export function ScopedWorkspaceScreen({ taskId, channelId }: { taskId?: string; 
   if (!shared || !bot || taskId && !task && !pendingTask || channelId && !channel) return <View className="flex-1"><EmptyState icon={ListChecks} title={error || (shared?.workspaceState ? '尚未读到这个任务、频道或 Bot' : '正在读取')} className="flex-1 justify-center" action={<Button variant="outline" onPress={() => void read().catch((cause) => setError(messageOf(cause)))}><Text>重新读取</Text></Button>} /></View>
   const target: InputTarget = task ? task.channel_id ? { kind: 'channel_task', channel_id: task.channel_id, task_id: task.task_id, bot_id: task.owner_bot } : { kind: 'task', task_id: task.task_id } : taskId && pendingTask ? pendingTask.target : selectedTaskId && channelId ? { kind: 'channel_task', channel_id: channelId, task_id: selectedTaskId, bot_id: bot.bot_id } : { kind: 'channel_member', channel_id: channelId ?? '', bot_id: bot.bot_id }
   const targetKey = inputTargetKey(target), conversationId = bot.conversation_id
-  if (!draftRef.current || draftRef.current.text !== text || draftRef.current.files !== files || draftRef.current.intent !== intent || draftRef.current.target !== targetKey || draftRef.current.conversationId !== conversationId) draftRef.current = { text, files, intent, target: targetKey, conversationId }
+  if (!draftRef.current || draftRef.current.text !== text || draftRef.current.files !== files || draftRef.current.target !== targetKey || draftRef.current.conversationId !== conversationId) draftRef.current = { text, files, target: targetKey, conversationId }
   const draft = draftRef.current
   const expectedRevision = task?.revision ?? pendingTask?.expected_revision
   const label = `${bot.name} · ${task?.title ?? (selectedTaskId ? '已保存的任务' : '新频道任务')}`
   const pending = shared.pendingMessages.filter((item) => channelId ? (item.target.kind === 'channel_task' || item.target.kind === 'channel_member') && item.target.channel_id === channelId : item.target.kind === 'task' && item.target.task_id === taskId || item.target.kind === 'channel_task' && item.target.task_id === taskId)
-  const options: TargetOption[] = channel ? [...channel.members.map((id) => ({ key: `member:${id}`, label: shared.bots.find((item) => item.bot_id === id)?.name ?? id, target: { kind: 'channel_member' as const, channel_id: channel.channel_id, bot_id: id } })), ...tasks.map((item) => ({ key: `task:${item.task_id}`, label: `${shared.bots.find((value) => value.bot_id === item.owner_bot)?.name ?? 'Bot'} · ${item.title}`, target: { kind: 'channel_task' as const, channel_id: channel.channel_id, task_id: item.task_id, bot_id: item.owner_bot }, revision: item.revision })), ...(!task && selectedTaskId ? [{ key: `task:${selectedTaskId}`, label, target, revision: expectedRevision }] : [])] : [{ key: `task:${taskId ?? ''}`, label, target, revision: expectedRevision }]
   const posted = new Set(history?.events.flatMap((event) => event.body.type === 'input_posted' ? [event.body.message_id] : []) ?? [])
   const active = task && ['running', 'update_pending'].includes(task.state)
   const control = (action: 'continue' | 'defer' | 'cancel') => run(action, async () => { if (task) await shared.workspaceCommand({ kind: 'control_task', task_id: task.task_id, expected_revision: task.revision, action }); await read() })
@@ -299,13 +242,13 @@ export function ScopedWorkspaceScreen({ taskId, channelId }: { taskId?: string; 
       {history && !history.events.length ? <Text className="text-center text-meta text-muted-foreground">发送一条交代开始对话。</Text> : null}<Text className="text-meta text-muted-foreground">{history ? `已加载最近 ${history.events.length} 条${history.coverage.truncated ? '，更早的记录未加载' : ''}。` : '尚未读取历史。'}执行服务是否接收、输入归入哪个回合，请查看每条输入的状态。</Text>
       {error || actionError ? <ErrorText error={error || actionError} /> : null}
     </KeyboardAwareScrollView>
-    <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}><View style={{ paddingBottom: insets.bottom }}><Composer chrome={chrome} value={text} onChange={changeText} files={files} onFiles={setFiles} attachmentScope={JSON.stringify([ready?.principal.network_id ?? '', conversationId, targetKey, intent])} blocked={shared.canSaveMessages ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读'} sending={false} label={`发给 ${label}`} sendLabel={intent === 'defer' ? '保存为稍后处理' : intent === 'new_task' ? '发送为新任务' : active ? '补充当前工作' : '发送'} target={<InputOptions label={label} options={options} selected={selected || (task ? `task:${task.task_id}` : taskId ? `task:${taskId}` : `member:${bot.bot_id}`)} onSelect={(option) => { selectionRevision.current++; setSelected(option.key); setSavedInput(null); if (option.target.kind === 'channel_task' || option.target.kind === 'channel_member') { setRecipient(option.target.bot_id); storage.writeStorage(selectionKey, { bot_id: option.target.bot_id, ...(option.target.kind === 'channel_task' ? { task_id: option.target.task_id } : {}) }); if (option.target.kind === 'channel_task') void shared.readWorkspaceState({ task_id: option.target.task_id }).catch((cause) => setError(messageOf(cause))) } }} intent={intent} onIntent={setIntent} pending={pending} />} onStop={task && !['completed', 'cancelled', 'deferred'].includes(task.state) ? () => void shared.stopInputTarget({ target, expected_revision: task.revision }).catch((cause) => setError(messageOf(cause))) : undefined} onSend={() => {
+    <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}><View style={{ paddingBottom: insets.bottom }}><Composer chrome={chrome} value={text} onChange={changeText} files={files} onFiles={setFiles} attachmentScope={JSON.stringify([ready?.principal.network_id ?? '', conversationId, targetKey])} blocked={shared.canSaveMessages ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读'} sending={false} label={`发给 ${label}`} sendLabel={active ? '补充当前工作' : '发送'} target={channelId && selectedTaskId ? <Button variant="ghost" size="icon" className="rounded-full" accessibilityLabel="结束回复这个任务" onPress={() => { selectionRevision.current++; setSelected(''); setRecipient(''); setSavedInput(null); storage.writeStorage(selectionKey, null) }}><Icon as={X} className="text-muted-foreground" /></Button> : undefined} onStop={task && !['completed', 'cancelled', 'deferred'].includes(task.state) ? () => void shared.stopInputTarget({ target, expected_revision: task.revision }).catch((cause) => setError(messageOf(cause))) : undefined} onSend={() => {
       const submittedDraft = draft
       if (savingDrafts.current.has(submittedDraft)) return
       savingDrafts.current.add(submittedDraft)
       const submitted = text, selectedFiles = files
       setError('')
-      void shared.sendMessage(submitted, selectedFiles.map((file) => ({ name: file.name, arrayBuffer: () => new File(file.uri).arrayBuffer() })), undefined, { target, intent, conversation_id: bot.conversation_id, ...(expectedRevision !== undefined ? { expected_revision: expectedRevision } : {}), onSaved: (input) => { if (savedSelection !== selectionRevision.current || !shared.isCurrent()) return; if (channelId && input.target.kind === 'channel_task' && input.target.channel_id === channelId) { setSavedInput(input); setSelected(`task:${input.target.task_id}`); setRecipient(input.target.bot_id); storage.writeStorage(selectionKey, { bot_id: input.target.bot_id, task_id: input.target.task_id }) } else if (draftRef.current === submittedDraft && routeActive.current && !channelId && (input.target.kind === 'task' || input.target.kind === 'channel_task') && input.target.task_id !== taskId) router.push(`/task/${input.target.task_id}`) } }).then((saved) => { if (saved && shared.isCurrent()) { if (draftRef.current === submittedDraft) { setText((current) => { if (current !== submitted) return current; storage.writeStorage(draftKey, ''); return '' }); setFiles((current) => current === selectedFiles ? [] : current); setIntent('continue') } void read().catch((cause) => setError(messageOf(cause))) } }).catch((cause) => setError(messageOf(cause))).finally(() => { savingDrafts.current.delete(submittedDraft) })
+      void shared.sendMessage(submitted, selectedFiles.map((file) => ({ name: file.name, arrayBuffer: () => new File(file.uri).arrayBuffer() })), undefined, { target, conversation_id: bot.conversation_id, ...(expectedRevision !== undefined ? { expected_revision: expectedRevision } : {}), onSaved: (input) => { if (savedSelection !== selectionRevision.current || !shared.isCurrent()) return; if (channelId && input.target.kind === 'channel_task' && input.target.channel_id === channelId) { setSavedInput(input); setSelected(`task:${input.target.task_id}`); setRecipient(input.target.bot_id); storage.writeStorage(selectionKey, { bot_id: input.target.bot_id, task_id: input.target.task_id }) } else if (draftRef.current === submittedDraft && routeActive.current && !channelId && (input.target.kind === 'task' || input.target.kind === 'channel_task') && input.target.task_id !== taskId) router.push(`/task/${input.target.task_id}`) } }).then((saved) => { if (saved && shared.isCurrent()) { if (draftRef.current === submittedDraft) { setText((current) => { if (current !== submitted) return current; storage.writeStorage(draftKey, ''); return '' }); setFiles((current) => current === selectedFiles ? [] : current) } void read().catch((cause) => setError(messageOf(cause))) } }).catch((cause) => setError(messageOf(cause))).finally(() => { savingDrafts.current.delete(submittedDraft) })
     }}>{error ? <ErrorText error={error} /> : null}</Composer></View></KeyboardStickyView>
   </View>
 }
