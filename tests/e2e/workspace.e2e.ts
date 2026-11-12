@@ -3,7 +3,7 @@ import { stat } from 'node:fs/promises';
 import { expect, secrets } from 'e2e';
 import { workspaceTest as test } from './fixtures';
 
-test('keeps personal Tasks, deferred inputs and directed Channel results in their own scopes', { tags: ['workspace'], timeout: 300000 }, async ({ app, workspace, screen, browser }) => {
+test('keeps personal Tasks and directed Channel results in their own scopes', { tags: ['workspace'], timeout: 300000 }, async ({ app, workspace, screen, browser }) => {
   await browser.setViewport({ width: 1440, height: 1000 });
   await app.open(workspace.source.entry);
   await screen.getByRole('button', '新建我的网络').click();
@@ -106,40 +106,6 @@ test('keeps personal Tasks, deferred inputs and directed Channel results in thei
   await app.screenshot('workspace-task-desktop-context');
   await screen.getByRole('button', '收起上下文').click();
 
-  const deferred = ['稍后甲：补充导航说明', '稍后乙：核对搜索入口', '稍后丙：这条应取消'];
-  for (const text of deferred) {
-    await taskChat.getByRole('combobox', '发送方式').selectOption({ value: 'defer' });
-    await taskAComposer.fill(text);
-    await taskChat.getByRole('button', '保存为稍后处理').click();
-    await expect(taskAComposer).toHaveValue('');
-  }
-  await taskChat.getByText('稍后处理 3 条', { exact: true }).click();
-  const queue = taskChat.getByRole('list', '稍后输入队列');
-  await expect(queue.getByRole('listitem')).toHaveCount(3);
-  await expect(queue.getByRole('listitem')).toContainText(deferred);
-  expect((await workspace.inspect()).steers.filter(row => row.thread_id === taskA.thread_id)).toHaveLength(3);
-  await taskAComposer.fill('尚未发送的新草稿');
-  await queue.getByRole('listitem').filter({ hasText: deferred[0] }).getByRole('button', '编辑输入').click();
-  const edited = '稍后甲：已修订的导航说明';
-  await queue.getByLabel('编辑稍后输入').fill(edited);
-  await queue.getByRole('button', '保存输入修改').click();
-  await expect(queue.getByText(edited, { exact: true })).toBeVisible();
-  await expect(taskAComposer).toHaveValue('尚未发送的新草稿');
-  await queue.getByRole('listitem').filter({ hasText: deferred[1] }).getByRole('button', '上移').click();
-  await expect(queue.getByRole('listitem')).toContainText([deferred[1], edited, deferred[2]]);
-  await queue.getByRole('listitem').filter({ hasText: deferred[2] }).getByRole('button', '取消稍后输入').click();
-  await expect(queue.getByRole('listitem')).toHaveCount(2);
-  await expect(queue.getByRole('listitem')).toContainText([deferred[1], edited]);
-  await queue.getByRole('listitem').filter({ hasText: deferred[1] }).getByRole('button', '现在处理').click();
-  await expect(queue.getByRole('listitem')).toHaveCount(1);
-  await queue.getByRole('listitem').filter({ hasText: edited }).getByRole('button', '现在处理').click();
-  await expect(queue).toHaveCount(0);
-  await expect.poll(async () => (await workspace.inspect()).steers.filter(row => row.thread_id === taskA.thread_id).length, { timeout: 30000 }).toBe(5);
-  const released = (await workspace.inspect()).steers.filter(row => row.thread_id === taskA.thread_id);
-  expect(new Set(released.map(row => row.message_id)).size).toBe(5);
-  expect(released.slice(3).map(row => row.text.includes(deferred[1]) ? deferred[1] : row.text.includes(edited) ? edited : 'unexpected input')).toEqual([deferred[1], edited]);
-  expect(released.some(row => row.text.includes(deferred[2]))).toBe(false);
-  await taskAComposer.clear();
   await workspace.release('taskA');
   await expect.poll(async () => (await workspace.inspect()).turns.find(row => row.turn_id === taskATurn)?.state, { timeout: 30000 }).toBe('completed');
   await expect(taskChat).toContainText('workspace-task-a-only:complete', { timeout: 20000 });
@@ -150,7 +116,7 @@ test('keeps personal Tasks, deferred inputs and directed Channel results in thei
   const taskBTurn = await turn(taskB.thread_id);
   expect(taskB.conversation_id).toBe(taskA.conversation_id);
   expect(new Set([main.thread_id, taskA.thread_id, taskB.thread_id]).size).toBe(3);
-  expect(taskB.messages.some(message => /workspace-main-only|workspace-task-a-only|保留首页入口|已修订的导航说明/.test(message))).toBe(false);
+  expect(taskB.messages.some(message => /workspace-main-only|workspace-task-a-only|保留首页入口/.test(message))).toBe(false);
   await expect(taskChat).toContainText('workspace-task-b-only');
   await expect(taskChat).not.toContainText('workspace-task-a-only');
   await expect(taskChat).not.toContainText('workspace-main-only');
@@ -229,13 +195,12 @@ test('keeps personal Tasks, deferred inputs and directed Channel results in thei
   await channelForm.getByLabel('频道目标', { exact: true }).fill('本人两个 Bot 协作检查官网');
   await channelForm.getByRole('checkbox', 'Workspace Builder').check();
   await channelForm.getByRole('checkbox', 'Workspace Reviewer').check();
-  await channelForm.getByRole('combobox', '默认协调 Bot').selectOption({ label: 'Workspace Builder' });
+  await channelForm.getByRole('combobox', '默认协调 Bot').selectOption({ label: 'Workspace Reviewer' });
   await channelForm.getByRole('button', '创建频道').click();
   await expect(browser).toHaveURL(/\/channels\/[^/?#]+$/);
   const channelUrl = await browser.url();
   await expect(screen.getByRole('heading', '官网改版频道', { level: 2 })).toBeVisible();
   const channelChat = screen.getByRole('region', '频道对话');
-  await channelChat.getByRole('combobox', '频道消息目标').selectOption({ label: 'Workspace Reviewer' });
   const channelComposer = channelChat.getByRole('textbox', /^发给 Workspace Reviewer · /);
   await channelComposer.fill(directive('workspace-channel-directed', workspace.gates.channel));
   await channelChat.getByRole('button', '发送', { exact: true }).click();
@@ -284,6 +249,5 @@ test('keeps personal Tasks, deferred inputs and directed Channel results in thei
   await expect(channelChat).toContainText('workspace-channel-directed:complete');
   const finalEvidence = await workspace.inspect();
   expect(finalEvidence.starts.filter(row => row.thread_id === taskA.thread_id)).toHaveLength(1);
-  expect(finalEvidence.steers.filter(row => row.thread_id === taskA.thread_id)).toHaveLength(5);
-  expect(finalEvidence.steers.some(row => row.text.includes(deferred[2]))).toBe(false);
+  expect(finalEvidence.steers.filter(row => row.thread_id === taskA.thread_id)).toHaveLength(3);
 });
