@@ -11,7 +11,6 @@ ci_check = "Workflow and source checks"
 name = "Rust lint"
 trigger_paths = ["crates/delivery/**", "apps/core/src/**", "apps/cli/src/**", "crates/control/src/**", "crates/client/src/**", "crates/bridge/src/**", "crates/protocol/src/**", "crates/secure/src/**", "crates/secure-ffi/**", "crates/*/tests/**", "apps/core/tests/**", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/core/build.rs", "apps/core/migrations/**", "apps/core/schema.hcl", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".cargo/**"]
 command = "cargo clippy --workspace --all-targets --locked -- -D warnings"
-ci_check = "Rust lint and minimum version"
 
 [[domain_check]]
 name = "Rust format"
@@ -91,7 +90,6 @@ command = "bash -n scripts/sign-release.sh"
 name = "Migration integrity"
 trigger_paths = ["apps/core/migrations/**", "apps/core/schema.hcl"]
 command = "atlas migrate validate --dir file://apps/core/migrations"
-ci_check = "Workflow and source checks"
 
 [review]
 extra_checklist = "Check command deduplication, uncertain write results, device connection ownership, local socket permissions, and manager token budgets. A public Node may also schedule or execute; no permanent coordinator or task owner. Verify network and conversation scoping, complete DAG context and no side effects from replay. For paid delivery, require complete membership management authority, bound source/receiver/provider/wallet identities, canonical profile/image/schema, current key serial, independent service authorization, exact ERC20 balance accounting, nonce reservation before signing, durable signed bytes before broadcast, reconciliation of unknown transactions and reorgs, and distinct charity/recoverable/decrypted evidence."

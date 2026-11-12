@@ -21,7 +21,7 @@ The official Linux x86_64 Rust archive is `https://github.com/risc0/rust/release
 
 Install verified archives only inside the task's ignored artifact directory. Do not change the user's default rustup toolchain or Docker VM settings. The CI installer owns download and archive validation. The layout consumed by risc0-build is exact.
 
-The repository installer entry is `scripts/install-delivery-toolchain.py`. Its default RISC0_HOME is `.artifacts/vdp/risc0`. The full verification entry is `scripts/check-delivery.py`. Its `--check-fixtures` mode is structural preflight only and does not satisfy the proof gate.
+The repository installer entry is `scripts/install-delivery-toolchain.py`. Its default RISC0_HOME is `.artifacts/vdp/risc0`. Local `--sandbox` runs bind the main checkout's `.artifacts/vdp-shared/cargo` and `.artifacts/vdp-shared/risc0` over the container's cargo and risc0 homes, so worktrees share one registry cache and one guest compiler; these shared directories are writable by sandbox containers. Each worktree keeps its own `proof-target` and `domain-target`, seeded from the shared snapshot with every mtime reset to the Unix epoch so path crates and the guest rebuild from the current branch. The full verification entry is `scripts/check-delivery.py`. Its `--check-fixtures` mode is structural preflight only and does not satisfy the proof gate.
 
 ```text
 $RISC0_HOME/settings.toml

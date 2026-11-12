@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Install the checksum-pinned guest compiler inside this checkout's artifacts."""
+"""Install the checksum-pinned guest compiler under .artifacts/vdp/risc0.
+
+Local sandbox runs mount a risc0 home shared by all worktrees there, so the
+install lands with one atomic rename and a concurrent loser reuses the winner."""
 
 import argparse
 import errno
@@ -117,6 +120,13 @@ def unpack(archive, destination):
     return compiler_root(destination)
 
 
+def write_atomic(path, text):
+    with tempfile.NamedTemporaryFile("w", prefix=path.name + ".", dir=path.parent, delete=False) as output:
+        output.write(text)
+    os.chmod(output.name, 0o644)
+    os.replace(output.name, path)
+
+
 def install():
     target, expected = ASSETS.get((platform.system(), platform.machine()), (None, None))
     if target is None:
@@ -125,15 +135,8 @@ def install():
     home = ARTIFACTS / "risc0"
     version = home / f"toolchains/v1.97.0-rust-{target}"
     receipt = version / "installed.json"
-    if version.exists():
-        if version.is_symlink() or not receipt.is_file():
-            raise ValueError("Existing compiler directory has no installation receipt")
-        recorded = json.loads(receipt.read_text())
-        if recorded != {"release": RELEASE, "target": target, "archiveSha256": expected}:
-            raise ValueError("Existing compiler installation differs from the fixed release")
-        if not (version / "bin/rustc").is_file():
-            raise ValueError("Existing compiler installation is incomplete")
-    else:
+    fixed = {"release": RELEASE, "target": target, "archiveSha256": expected}
+    if not version.exists():
         name = f"rust-toolchain-{target}.tar.gz"
         archive = ARTIFACTS / name
         if not archive.is_file():
@@ -150,9 +153,19 @@ def install():
         version.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="guest-install-", dir=version.parent) as directory:
             extracted = unpack(archive, Path(directory))
-            os.rename(extracted, version)
-        receipt.write_text(json.dumps({"release": RELEASE, "target": target, "archiveSha256": expected}) + "\n")
-    (home / "settings.toml").write_text('[default_versions]\nrust = "1.97.0"\n')
+            (extracted / receipt.name).write_text(json.dumps(fixed) + "\n")
+            try:
+                os.rename(extracted, version)
+            except OSError as error:
+                if error.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                    raise
+    if version.is_symlink() or not receipt.is_file():
+        raise ValueError("Existing compiler directory has no installation receipt")
+    if json.loads(receipt.read_text()) != fixed:
+        raise ValueError("Existing compiler installation differs from the fixed release")
+    if not (version / "bin/rustc").is_file():
+        raise ValueError("Existing compiler installation is incomplete")
+    write_atomic(home / "settings.toml", '[default_versions]\nrust = "1.97.0"\n')
     result = subprocess.check_output([str(version / "bin/rustc"), "--version"], text=True).strip()
     if not result.startswith("rustc 1.97.0"):
         raise ValueError("Installed guest compiler reports the wrong version")

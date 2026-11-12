@@ -2,6 +2,7 @@
 """Rebuild the delivery guest, verify its public receipts, and exercise the EVM adapter."""
 
 import argparse
+import errno
 import hashlib
 import io
 import json
@@ -183,8 +184,10 @@ def source_commit():
 
 
 def shared_cache():
-    common = subprocess.check_output(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=ROOT, text=True).strip()
-    return Path(common).parent / ".artifacts/vdp-shared"
+    common = Path(subprocess.check_output(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=ROOT, text=True).strip())
+    if common.name != ".git" or not common.is_dir():
+        return ARTIFACTS
+    return common.parent / ".artifacts/vdp-shared"
 
 
 def clone_tree(source, destination):
@@ -192,14 +195,30 @@ def clone_tree(source, destination):
     subprocess.check_call(["cp", *flags, str(source), str(destination)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def share_failed(error):
+    return isinstance(error, (FileNotFoundError, FileExistsError)) or (type(error) is OSError and error.errno in (errno.ENOTEMPTY, errno.EEXIST, errno.EXDEV))
+
+
 def seed_target(target, shared):
-    if target.exists() or not shared.is_dir():
+    if target.exists():
         return
     staging = target.with_name(f"{target.name}.seed-{uuid.uuid4().hex}")
     try:
+        before = os.stat(shared)
         clone_tree(shared, staging)
+        after = os.stat(shared)
+        if (before.st_ino, before.st_dev) != (after.st_ino, after.st_dev):
+            return
+        # Cargo judges path crates and the guest by mtime, so another branch's outputs must look older than every source.
+        for directory, directories, files in os.walk(staging, topdown=False):
+            for name in directories + files:
+                os.utime(os.path.join(directory, name), (0, 0), follow_symlinks=False)
+        os.utime(staging, (0, 0), follow_symlinks=False)
         os.rename(staging, target)
-    except (OSError, subprocess.CalledProcessError):
+    except OSError as error:
+        if not share_failed(error):
+            raise
+    except subprocess.CalledProcessError:
         pass
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -217,7 +236,10 @@ def publish_target(target, shared):
         except FileNotFoundError:
             pass
         os.rename(staging, shared)
-    except (OSError, subprocess.CalledProcessError):
+    except OSError as error:
+        if not share_failed(error):
+            raise
+    except subprocess.CalledProcessError:
         pass
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -298,8 +320,7 @@ def sandbox(small=None, resume_run=None):
         name = "vdp-" + task + "-" + uuid.uuid4().hex
         container[2:2] = ["--name", name, "--label", "vibeface.task-root=" + str(ROOT)]
         print("Delivery sandbox owned by this task: " + name, flush=True)
-        for target in SHARED_TARGETS:
-            seed_target(ARTIFACTS / "canonical" / target, cache / target)
+        share = small is None and os.environ.get("GITHUB_ACTIONS") != "true" and cache != ARTIFACTS
         previous_term = signal.getsignal(signal.SIGTERM)
 
         def interrupted(*_):
@@ -307,10 +328,12 @@ def sandbox(small=None, resume_run=None):
 
         try:
             signal.signal(signal.SIGTERM, interrupted)
+            for target in SHARED_TARGETS if share else ():
+                seed_target(ARTIFACTS / "canonical" / target, cache / target)
             run(container)
             if small is not None and source_commit() != commit:
                 raise ValueError("Source changed while the work item was running")
-            for target in SHARED_TARGETS:
+            for target in SHARED_TARGETS if share else ():
                 publish_target(ARTIFACTS / "canonical" / target, cache / target)
         finally:
             try:
@@ -1390,7 +1413,9 @@ def self_test():
         os.utime(built / "release/prover", (1_000_000, 1_000_000))
         publish_target(built, shared_target)
         seed_target(worktree, shared_target)
-        assert (worktree / "release/prover").read_text() == "first" and (worktree / "release/prover").stat().st_mtime == 1_000_000
+        assert (worktree / "release/prover").read_text() == "first"
+        assert all(path.stat().st_mtime == 0 for path in (worktree, worktree / "release", worktree / "release/prover"))
+        assert (shared_target / "release/prover").stat().st_mtime == 1_000_000
         (built / "release/prover").write_text("second")
         publish_target(built, shared_target)
         seed_target(worktree, shared_target)
@@ -1399,6 +1424,20 @@ def self_test():
             publish_target(worktree, shared_target)
             seed_target(base / "cold", shared_target)
         assert (shared_target / "release/prover").read_text() == "second" and not (base / "cold").exists()
+        real_clone = clone_tree
+
+        def clone_during_publish(source, destination):
+            real_clone(source, destination)
+            if source == shared_target:
+                publish_target(built, shared_target)
+
+        with patch(f"{__name__}.clone_tree", side_effect=clone_during_publish):
+            seed_target(base / "raced", shared_target)
+        assert not (base / "raced").exists()
+        with patch(f"{__name__}.clone_tree", side_effect=InterruptedError("Delivery sandbox interrupted")):
+            for share in (publish_target, lambda target, shared: seed_target(base / "cold", shared)):
+                with TestCase().assertRaises(InterruptedError, msg="Sharing must not swallow a SIGTERM interruption"):
+                    share(worktree, shared_target)
         assert sorted(path.name for path in base.iterdir()) == ["built", "shared", "worktree"]
     assert container[-3:] == ["bash", "-c", "python3 scripts/install-delivery-toolchain.py && python3 scripts/check-delivery.py"]
     env_pairs = [container[index + 1] for index, value in enumerate(container) if value == "--env"]
@@ -1461,7 +1500,7 @@ def self_test():
                         raise failure
 
             result = lookup if isinstance(lookup, BaseException) else subprocess.CompletedProcess([], 0, stdout=lookup + "\n")
-            with patch(f"{__name__}.optional_fixtures", return_value=None), patch(f"{__name__}.run", side_effect=execute) as operation, \
+            with patch.dict(os.environ, {"GITHUB_ACTIONS": "false"}), patch(f"{__name__}.optional_fixtures", return_value=None), patch(f"{__name__}.run", side_effect=execute) as operation, \
                     patch(f"{__name__}.seed_target") as seeded, patch(f"{__name__}.publish_target") as published, \
                     patch("subprocess.run", side_effect=[result, stop_error or subprocess.CompletedProcess([], 0)]) as cleanup:
                 caught = None
@@ -1490,6 +1529,11 @@ def self_test():
                     assert cleanup.call_args_list[1].kwargs == {"capture_output": True, "check": True, "timeout": 30}
                 else:
                     assert cleanup.call_count == 1
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), patch(f"{__name__}.optional_fixtures", return_value=None), patch(f"{__name__}.run"), \
+                patch(f"{__name__}.seed_target") as seeded, patch(f"{__name__}.publish_target") as published, \
+                patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, stdout="")):
+            sandbox()
+        assert seeded.call_count == published.call_count == 0, "CI runners have no sibling worktree to share targets with"
     finally:
         signal.signal(signal.SIGTERM, previous_term)
     continuation_self_test(manifest, compiled, profile, vectors, profile_proofs)
