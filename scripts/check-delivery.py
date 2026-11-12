@@ -2,6 +2,7 @@
 """Rebuild the delivery guest, verify its public receipts, and exercise the EVM adapter."""
 
 import argparse
+import contextlib
 import errno
 import hashlib
 import io
@@ -199,6 +200,16 @@ def share_failed(error):
     return isinstance(error, (FileNotFoundError, FileExistsError)) or (type(error) is OSError and error.errno in (errno.ENOTEMPTY, errno.EEXIST, errno.EXDEV))
 
 
+@contextlib.contextmanager
+def deferred_sigterm():
+    # os.walk and rmtree(ignore_errors=True) swallow the handler's InterruptedError; hold SIGTERM until they finish.
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+
+
 def seed_target(target, shared):
     if target.exists():
         return
@@ -207,21 +218,23 @@ def seed_target(target, shared):
         before = os.stat(shared)
         clone_tree(shared, staging)
         after = os.stat(shared)
-        if (before.st_ino, before.st_dev) != (after.st_ino, after.st_dev):
+        if (before.st_ino, before.st_dev, before.st_ctime_ns) != (after.st_ino, after.st_dev, after.st_ctime_ns):
             return
-        # Cargo judges path crates and the guest by mtime, so another branch's outputs must look older than every source.
-        for directory, directories, files in os.walk(staging, topdown=False):
-            for name in directories + files:
-                os.utime(os.path.join(directory, name), (0, 0), follow_symlinks=False)
-        os.utime(staging, (0, 0), follow_symlinks=False)
-        os.rename(staging, target)
+        with deferred_sigterm():
+            # Cargo judges path crates and the guest by mtime, so another branch's outputs must look older than every source.
+            for directory, directories, files in os.walk(staging, topdown=False):
+                for name in directories + files:
+                    os.utime(os.path.join(directory, name), (0, 0), follow_symlinks=False)
+            os.utime(staging, (0, 0), follow_symlinks=False)
+            os.rename(staging, target)
     except OSError as error:
         if not share_failed(error):
             raise
     except subprocess.CalledProcessError:
         pass
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        with deferred_sigterm():
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 def publish_target(target, shared):
@@ -242,8 +255,9 @@ def publish_target(target, shared):
     except subprocess.CalledProcessError:
         pass
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
-        shutil.rmtree(old, ignore_errors=True)
+        with deferred_sigterm():
+            shutil.rmtree(staging, ignore_errors=True)
+            shutil.rmtree(old, ignore_errors=True)
 
 
 def sandbox_commands(context, small=None, resume_dir=None, work_id=None, producer=None, cache=None):
