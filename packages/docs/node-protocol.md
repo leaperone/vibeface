@@ -282,6 +282,8 @@ Memory 的 metadata 为 `{epoch, revision, control_revision, source_event_hash, 
 
 ## 可靠调度回执
 
+客户端在首次提交输入前持久保存入口 Node 的身份。结果未知时，保留原消息 ID、目标、正文和签名，回原入口对账；其他入口查无记录不能授权重发。尚无原入口证据的输入继续保留，不根据当前连接补写发送历史。
+
 本人普通输入使用 `InputPosted`。`message` 请求必需携带 `target`、`intent`、目标内 `sequence`，Task 修改还核验 `expected_revision`。实际提交目标为 Bot Main、稳定业务 Task、已登记 Work、Routine 或频道 Task。界面的频道成员目标先由客户端创建并绑定稳定 Task，再以 channel_task 提交；message 不直接接受 channel_member。签名覆盖目标、意图、顺序、revision、正文、完整附件和汇报选项。审批回答仍使用绑定原 `question_id` 的签名 `MessagePosted`，不能由普通输入冒充。
 
 连接身份绑定或会话权限检查失败仍返回 RPC 错误。进入 `message` 处理后的未保存拒绝返回 `{accepted:false, code:"input_not_saved", stored:false, message_id, reason}`。同一消息 ID 已有内容冲突时返回 `code:"input_conflict"` 和 `stored:true`，保留原记录。`accepted:true` 表示输入已保存，执行阶段仍以 `receipt` 为准。
