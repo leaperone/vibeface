@@ -29,7 +29,7 @@ ci_check = "Rust fast tests"
 name = "Delivery proof and settlement"
 trigger_paths = ["crates/delivery/**", "crates/delivery/proof/**", "contracts/delivery/**", "apps/core/src/delivery/**", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py"]
 command = "python3 scripts/check-delivery.py --check-fixtures && python3 scripts/check-delivery.py --sandbox"
-ci_check = "Delivery fixture and contract checks"
+heavy = true # CI runs the host checks, not the Docker sandbox, so this stays local
 
 [[domain_check]]
 name = "Delivery service probe"
