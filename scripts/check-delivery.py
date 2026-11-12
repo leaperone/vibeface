@@ -2,7 +2,6 @@
 """Rebuild the delivery guest, verify its public receipts, and exercise the EVM adapter."""
 
 import argparse
-import fcntl
 import hashlib
 import io
 import json
@@ -15,6 +14,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = ROOT / ".artifacts/vdp"
 FIXTURES = ROOT / "crates/delivery/proof/fixtures"
 PROFILE = ROOT / "crates/delivery/proof/profile.json"
+SHARED_TARGETS = ("proof-target", "domain-target")
 SANDBOX_FILES = ("crates/delivery/proof/Sandbox.Dockerfile", "crates/delivery/proof/confined-gnark.sh")
 STATEMENT_BYTES = 47 * 32
 PUBLIC_FIELDS = {"mode", "kind", "imageId", "profileId", "relation", "journal", "journalHash", "seal"}
@@ -186,6 +187,43 @@ def shared_cache():
     return Path(common).parent / ".artifacts/vdp-shared"
 
 
+def clone_tree(source, destination):
+    flags = ["-cpR"] if sys.platform == "darwin" else ["-a", "--reflink=auto"]
+    subprocess.check_call(["cp", *flags, str(source), str(destination)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def seed_target(target, shared):
+    if target.exists() or not shared.is_dir():
+        return
+    staging = target.with_name(f"{target.name}.seed-{uuid.uuid4().hex}")
+    try:
+        clone_tree(shared, staging)
+        os.rename(staging, target)
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def publish_target(target, shared):
+    if not target.is_dir():
+        return
+    token = uuid.uuid4().hex
+    staging, old = shared.with_name(f"{shared.name}.tmp-{token}"), shared.with_name(f"{shared.name}.old-{token}")
+    try:
+        clone_tree(target, staging)
+        try:
+            os.rename(shared, old)
+        except FileNotFoundError:
+            pass
+        os.rename(staging, shared)
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(old, ignore_errors=True)
+
+
 def sandbox_commands(context, small=None, resume_dir=None, work_id=None, producer=None, cache=None):
     image = "vibeface-vdp-proof:check-" + hashlib.sha256(b"".join((ROOT / file).read_bytes() for file in SANDBOX_FILES)).hexdigest()[:12]
     build = ["docker", "build", "--platform", "linux/amd64", "--file", str(context / "crates/delivery/proof/Sandbox.Dockerfile"), "--tag", image, str(context)]
@@ -193,7 +231,7 @@ def sandbox_commands(context, small=None, resume_dir=None, work_id=None, produce
     cache = cache or ARTIFACTS
     mounts = [(ROOT, "/work"), (cache / "cargo", "/cargo"), (cache / "cargo", "/home/runner/.cargo"), (cache / "risc0", "/risc0"), (ARTIFACTS / "canonical", "/artifacts")]
     if cache != ARTIFACTS:
-        mounts += [(cache / "risc0", "/work/.artifacts/vdp/risc0"), (cache / "proof-target", "/artifacts/proof-target"), (cache / "domain-target", "/artifacts/domain-target")]
+        mounts.append((cache / "risc0", "/work/.artifacts/vdp/risc0"))
     for source, destination in mounts:
         container.extend(["--mount", f"type=bind,source={source},target={destination}"])
     command = "python3 scripts/install-delivery-toolchain.py && python3 scripts/check-delivery.py"
@@ -233,7 +271,7 @@ def sandbox(small=None, resume_run=None):
     failure = None
     try:
         cache = shared_cache()
-        for directory in ("cargo", "risc0", "proof-target", "domain-target"):
+        for directory in ("cargo", "risc0"):
             (cache / directory).mkdir(parents=True, exist_ok=True)
         for directory in ("risc0", "canonical"):
             (ARTIFACTS / directory).mkdir(parents=True, exist_ok=True)
@@ -260,6 +298,8 @@ def sandbox(small=None, resume_run=None):
         name = "vdp-" + task + "-" + uuid.uuid4().hex
         container[2:2] = ["--name", name, "--label", "vibeface.task-root=" + str(ROOT)]
         print("Delivery sandbox owned by this task: " + name, flush=True)
+        for target in SHARED_TARGETS:
+            seed_target(ARTIFACTS / "canonical" / target, cache / target)
         previous_term = signal.getsignal(signal.SIGTERM)
 
         def interrupted(*_):
@@ -267,15 +307,11 @@ def sandbox(small=None, resume_run=None):
 
         try:
             signal.signal(signal.SIGTERM, interrupted)
-            with (cache / "sandbox.lock").open("a") as lock:
-                try:
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    print("Waiting for another delivery sandbox to release the shared cache", flush=True)
-                    fcntl.flock(lock, fcntl.LOCK_EX)
-                run(container)
+            run(container)
             if small is not None and source_commit() != commit:
                 raise ValueError("Source changed while the work item was running")
+            for target in SHARED_TARGETS:
+                publish_target(ARTIFACTS / "canonical" / target, cache / target)
         finally:
             try:
                 result = subprocess.run(["docker", "ps", "--all", "--no-trunc", "--filter", "name=^/" + re.escape(name) + "$",
@@ -1344,9 +1380,26 @@ def self_test():
     assert build[-2] == container[-4]
     _, shared = sandbox_commands(Path("/context"), cache=Path("/shared"))
     assert [shared[index + 1] for index, value in enumerate(shared) if value == "--mount"][1:] == [f"type=bind,source=/shared/{source},target={destination}" for source, destination in (
-        ("cargo", "/cargo"), ("cargo", "/home/runner/.cargo"), ("risc0", "/risc0"))] + [f"type=bind,source={ARTIFACTS / 'canonical'},target=/artifacts"] + [
-        f"type=bind,source=/shared/{source},target={destination}" for source, destination in (
-        ("risc0", "/work/.artifacts/vdp/risc0"), ("proof-target", "/artifacts/proof-target"), ("domain-target", "/artifacts/domain-target"))]
+        ("cargo", "/cargo"), ("cargo", "/home/runner/.cargo"), ("risc0", "/risc0"))] + [f"type=bind,source={ARTIFACTS / 'canonical'},target=/artifacts",
+        "type=bind,source=/shared/risc0,target=/work/.artifacts/vdp/risc0"]
+    with tempfile.TemporaryDirectory(prefix="target-share-", dir=ARTIFACTS) as directory:
+        base = Path(directory)
+        built, shared_target, worktree = base / "built", base / "shared", base / "worktree"
+        (built / "release").mkdir(parents=True)
+        (built / "release/prover").write_text("first")
+        os.utime(built / "release/prover", (1_000_000, 1_000_000))
+        publish_target(built, shared_target)
+        seed_target(worktree, shared_target)
+        assert (worktree / "release/prover").read_text() == "first" and (worktree / "release/prover").stat().st_mtime == 1_000_000
+        (built / "release/prover").write_text("second")
+        publish_target(built, shared_target)
+        seed_target(worktree, shared_target)
+        assert (shared_target / "release/prover").read_text() == "second" and (worktree / "release/prover").read_text() == "first"
+        with patch(f"{__name__}.clone_tree", side_effect=subprocess.CalledProcessError(1, ["cp"])):
+            publish_target(worktree, shared_target)
+            seed_target(base / "cold", shared_target)
+        assert (shared_target / "release/prover").read_text() == "second" and not (base / "cold").exists()
+        assert sorted(path.name for path in base.iterdir()) == ["built", "shared", "worktree"]
     assert container[-3:] == ["bash", "-c", "python3 scripts/install-delivery-toolchain.py && python3 scripts/check-delivery.py"]
     env_pairs = [container[index + 1] for index, value in enumerate(container) if value == "--env"]
     assert env_pairs == ["HOME=/home/runner", "PYTHONDONTWRITEBYTECODE=1"]
@@ -1409,6 +1462,7 @@ def self_test():
 
             result = lookup if isinstance(lookup, BaseException) else subprocess.CompletedProcess([], 0, stdout=lookup + "\n")
             with patch(f"{__name__}.optional_fixtures", return_value=None), patch(f"{__name__}.run", side_effect=execute) as operation, \
+                    patch(f"{__name__}.seed_target") as seeded, patch(f"{__name__}.publish_target") as published, \
                     patch("subprocess.run", side_effect=[result, stop_error or subprocess.CompletedProcess([], 0)]) as cleanup:
                 caught = None
                 try:
@@ -1419,6 +1473,7 @@ def self_test():
                     assert isinstance(caught, expected), "Sandbox interruption or cleanup must propagate the expected failure"
                 else:
                     assert caught is expected
+                assert seeded.call_count == 2 and published.call_count == (2 if failure is None else 0)
                 assert signal.getsignal(signal.SIGTERM) is prior_term
                 assert operation.call_count == 2
                 owned = operation.call_args.args[0]
