@@ -24,7 +24,6 @@ export function PromptInput({
   onFiles,
   above,
   target,
-  tools,
   sendLabel = '发送',
   label = '给 Bot 发消息',
   tint,
@@ -44,7 +43,6 @@ export function PromptInput({
   above?: ReactNode
   target?: ReactNode
   /** Small controls beside the attachment button, inside the box. */
-  tools?: ReactNode
   sendLabel?: string
   label?: string
   /** The bot's tint, taken by the send button once there is something to send. */
@@ -133,7 +131,6 @@ export function PromptInput({
                 <button type="button" onMouseDown={keepFocus} className="hit-area relative grid size-8 shrink-0 place-items-center rounded-full hover:bg-background" aria-label={`移除 ${file.name}`} onClick={() => onFiles(files.filter((_, at) => at !== index))}><XIcon aria-hidden="true" className="size-3.5" /></button>
               </span>)}
             </> : null}
-            {tools}
             <span className="ms-auto flex shrink-0 gap-1">
               {onStop ? <InputGroupButton type="button" variant="outline" size="icon-sm" aria-label="停止" title="停止" className="size-9 rounded-full max-md:size-11" onMouseDown={keepFocus} onClick={onStop}>
                 <SquareIcon aria-hidden="true" className="fill-current" />

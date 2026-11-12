@@ -263,6 +263,6 @@ test('untyped message, queued input and history boundaries require explicit repo
   }
 })
 test('chat input steers by default and starts a task only when the prompt asks', () => {
-  for (const text of ['新任务：整理发布说明', ' New task: fix login', 'new  task', '新任务帮我修登录', '新任务']) assert.equal(promptIntent(text), 'new_task', text)
-  for (const text of ['顺便看看新任务的进度', 'new tasks list', 'renew task', '']) assert.equal(promptIntent(text), 'continue', text)
+  for (const text of ['新任务：整理发布说明', ' New task: fix login', 'new  task', '新任务 帮我修登录', '新任务，修登录', 'NEW TASK, fix it', '新任务']) assert.equal(promptIntent(text), 'new_task', text)
+  for (const text of ['新任务的进度怎么样？', '新任务呢', 'New task assignments look wrong', '新任务帮我修登录', '顺便看看新任务的进度', 'new tasks list', 'renew task', '']) assert.equal(promptIntent(text), 'continue', text)
 })

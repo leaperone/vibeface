@@ -23,6 +23,7 @@ import { Composer } from '@/features/chat/composer'
 import { useChatChrome } from '@/features/chat/chrome'
 import { InputStatus } from '@/features/workspace/workspace'
 import type { WorkDetail } from '@vibeface/client/workspace/types.ts'
+import { promptIntent } from '@vibeface/client/chat/protocol.ts'
 import type { Attachment } from '@/data/types'
 
 const tone = (state: string): Tone => state === 'failed' ? 'danger' : state === 'completed' ? 'success' : ['awaiting_confirmation', 'stop_timed_out'].includes(state) ? 'warning' : 'neutral'
@@ -173,13 +174,13 @@ function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
       </View>
     </Details>
     {shared.pendingMessages.filter((item) => item.target.kind === 'work' && item.target.work_id === workId).map((item) => <InputStatus key={item.message_id} pending={item} />)}
-    <Composer chrome={chrome} value={text} onChange={setText} files={files} onFiles={setFiles} attachmentScope={JSON.stringify([ready?.principal.network_id ?? '', conversationId, ['work', workId]])} blocked={shared.canSaveMessages ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读'} sending={false} label={canContinue ? `补充给 ${work.title || '这个工作'}` : '发送为新任务'} sendLabel={canContinue ? '补充这个工作' : '发送为新任务'} onSend={() => {
+    <Composer chrome={chrome} value={text} onChange={setText} files={files} onFiles={setFiles} attachmentScope={JSON.stringify([ready?.principal.network_id ?? '', conversationId, ['work', workId]])} blocked={!canContinue && !work.outcome ? '这个工作当前不能接收补充。' : shared.canSaveMessages ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读'} sending={false} label={canContinue ? `补充给 ${work.title || '这个工作'}` : '发送为新任务'} sendLabel={canContinue ? '补充这个工作' : '发送为新任务'} onSend={() => {
       const submittedDraft = draft
       if (savingDrafts.current.has(submittedDraft)) return
       savingDrafts.current.add(submittedDraft)
       const submitted = text, selectedFiles = files
       setSendError('')
-      void shared.sendMessage(submitted, selectedFiles.map((file) => ({ name: file.name, arrayBuffer: () => new File(file.uri).arrayBuffer() })), undefined, { target: { kind: 'work', work_id: workId }, ...(canContinue ? {} : { intent: 'new_task' as const }), conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !shared.isCurrent() || draftRef.current !== submittedDraft) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') router.push(`/task/${saved.target.task_id}`) } }).then((saved) => { if (saved && draftRef.current === submittedDraft) { setText((current) => current === submitted ? '' : current); setFiles((current) => current === selectedFiles ? [] : current) } }).catch((cause) => setSendError(messageOf(cause))).finally(() => { savingDrafts.current.delete(submittedDraft) })
+      void shared.sendMessage(submitted, selectedFiles.map((file) => ({ name: file.name, arrayBuffer: () => new File(file.uri).arrayBuffer() })), undefined, { target: { kind: 'work', work_id: workId }, intent: canContinue ? promptIntent(submitted) : 'new_task', conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !shared.isCurrent() || draftRef.current !== submittedDraft) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') router.push(`/task/${saved.target.task_id}`) } }).then((saved) => { if (saved && draftRef.current === submittedDraft) { setText((current) => current === submitted ? '' : current); setFiles((current) => current === selectedFiles ? [] : current) } }).catch((cause) => setSendError(messageOf(cause))).finally(() => { savingDrafts.current.delete(submittedDraft) })
     }}>{sendError ? <ErrorText error={sendError} /> : null}</Composer>
   </KeyboardAwareScrollView>
 }

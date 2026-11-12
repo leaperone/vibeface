@@ -9,7 +9,7 @@ import { Chat, type ChatEntry } from '@/features/chat/elements/chat'
 import { PromptInput } from '@/features/chat/elements/prompt-input'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
-import { inputTargetKey } from '@vibeface/client/chat/protocol.ts'
+import { inputTargetKey, promptIntent } from '@vibeface/client/chat/protocol.ts'
 import { networkKey, storageOf } from '@vibeface/client/workspace/storage.ts'
 import type { ContextProjection, InputControlAction, InputReceipt, InputTarget, PendingMessage, QueuedInput, ScopeContext, WorkspaceHistory, WorkspaceTask } from '@vibeface/client/workspace/types.ts'
 import { webPlatform } from '@/lib/platform'
@@ -117,7 +117,7 @@ export function ChannelWorkspace({ channelId }: { channelId: string }) {
   const selectionRevision = useRef(0)
   const savedSelection = selectionRevision.current
   const [settings, setSettings] = useState(false)
-  const [recipient, setRecipient] = useState(cachedBot)
+  const [recipient, setRecipient] = useState(cachedTask ? cachedBot : '')
   const [replyTask, setReplyTask] = useState<string | null>(cachedTask)
   const [savedInput, setSavedInput] = useState<PendingMessage | null>(null)
   const [readError, setReadError] = useState<unknown>(null)
@@ -219,7 +219,7 @@ function ScopedConversation({ target, conversationId, label, task, channelId, ex
       const submitted = text
       const selectedFiles = files
       setError(null)
-      void workspace.sendMessage(submitted, selectedFiles, undefined, { target, conversation_id: conversationId, ...((expectedRevision ?? task?.revision) !== undefined ? { expected_revision: expectedRevision ?? task?.revision } : {}), onSaved: (input) => { if (!routeActive.current || !workspace.isCurrent()) return; onSaved?.(input); if (draftRef.current === submittedDraft && !channelId && (input.target.kind === 'task' || input.target.kind === 'channel_task') && input.target.task_id !== scopeTaskId) void navigate({ to: '/tasks/$taskId', params: { taskId: input.target.task_id } }) } }).then((saved) => {
+      void workspace.sendMessage(submitted, selectedFiles, undefined, { target, intent: promptIntent(submitted), conversation_id: conversationId, ...((expectedRevision ?? task?.revision) !== undefined ? { expected_revision: expectedRevision ?? task?.revision } : {}), onSaved: (input) => { if (!routeActive.current || !workspace.isCurrent()) return; onSaved?.(input); if (draftRef.current === submittedDraft && !channelId && (input.target.kind === 'task' || input.target.kind === 'channel_task') && input.target.task_id !== scopeTaskId) void navigate({ to: '/tasks/$taskId', params: { taskId: input.target.task_id } }) } }).then((saved) => {
         if (saved && latest.current.isCurrent()) { if (draftRef.current === submittedDraft) { setText((current) => { if (current !== submitted) return current; storage.writeStorage(draftKey, ''); return '' }); setFiles((current) => current === selectedFiles ? [] : current) } void refresh().catch(setError) }
       }).catch(setError).finally(() => { savingDrafts.current.delete(submittedDraft) })
     }}><InlineError error={error} action={{ label: '重新读取', onClick: () => void refresh().catch(setError) }} /><p className="text-meta text-muted-foreground">{history ? `已加载最近 ${history.events.length} 条${history.coverage.truncated ? '，更早的记录未加载' : ''}。` : '尚未读取历史。'}执行服务是否接收、输入归入哪个回合，请查看每条输入的状态。</p></PromptInput>

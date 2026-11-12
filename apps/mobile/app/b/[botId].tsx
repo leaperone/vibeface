@@ -10,7 +10,7 @@ import Animated, { useAnimatedStyle, useSharedValue } from 'react-native-reanima
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useCSSVariable, useUniwind, withUniwind } from 'uniwind'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
-import { awaitsDevice, botReach, botCanSend, composerHint, inputTargetKey, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice, botReach, botCanSend, composerHint, inputTargetKey, promptIntent, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
 import { messageTimes } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
@@ -191,7 +191,7 @@ export default function ChatScreen() {
     const { text, files } = submittedDraft.value
     setSendError('')
     toLatest()
-    workspace.actions.send(id, text.trim(), files, { target: targetOption.target, conversation_id: id, onSaved: (input) => {
+    workspace.actions.send(id, text.trim(), files, { target: targetOption.target, intent: promptIntent(text), conversation_id: id, onSaved: (input) => {
       if (!live?.isCurrent()) return
       setDrafts((current) => {
         const present = current[id]

@@ -6,7 +6,7 @@ import { Pressable, ScrollView, View } from 'react-native'
 import { KeyboardAwareScrollView, KeyboardStickyView } from 'react-native-keyboard-controller'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { messageOf } from '@vibeface/client/lib/node.ts'
-import { inputTargetKey } from '@vibeface/client/chat/protocol.ts'
+import { inputTargetKey, promptIntent } from '@vibeface/client/chat/protocol.ts'
 import { networkKey, newId, storageOf } from '@vibeface/client/workspace/storage.ts'
 import type { ContextProjection, InputReceipt, InputTarget, PendingMessage, ScopeContext, WorkspaceCommand, WorkspaceHistory, WorkspaceTask } from '@vibeface/client/workspace/types.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -174,8 +174,8 @@ export function ScopedWorkspaceScreen({ taskId, channelId }: { taskId?: string; 
   const cached = channelId ? storage.readStorage<unknown>(selectionKey, null) : null
   const cachedBot = cached && typeof cached === 'object' && 'bot_id' in cached && typeof cached.bot_id === 'string' ? cached.bot_id : ''
   const cachedTask = cached && typeof cached === 'object' && 'task_id' in cached && typeof cached.task_id === 'string' ? cached.task_id : ''
-  const [selected, setSelected] = useState(cachedTask ? `task:${cachedTask}` : cachedBot ? `member:${cachedBot}` : '')
-  const [recipient, setRecipient] = useState(cachedBot)
+  const [selected, setSelected] = useState(cachedTask ? `task:${cachedTask}` : '')
+  const [recipient, setRecipient] = useState(cachedTask ? cachedBot : '')
   const [savedInput, setSavedInput] = useState<PendingMessage | null>(null)
   const selectionRevision = useRef(0)
   const savedSelection = selectionRevision.current
@@ -248,7 +248,7 @@ export function ScopedWorkspaceScreen({ taskId, channelId }: { taskId?: string; 
       savingDrafts.current.add(submittedDraft)
       const submitted = text, selectedFiles = files
       setError('')
-      void shared.sendMessage(submitted, selectedFiles.map((file) => ({ name: file.name, arrayBuffer: () => new File(file.uri).arrayBuffer() })), undefined, { target, conversation_id: bot.conversation_id, ...(expectedRevision !== undefined ? { expected_revision: expectedRevision } : {}), onSaved: (input) => { if (savedSelection !== selectionRevision.current || !shared.isCurrent()) return; if (channelId && input.target.kind === 'channel_task' && input.target.channel_id === channelId) { setSavedInput(input); setSelected(`task:${input.target.task_id}`); setRecipient(input.target.bot_id); storage.writeStorage(selectionKey, { bot_id: input.target.bot_id, task_id: input.target.task_id }) } else if (draftRef.current === submittedDraft && routeActive.current && !channelId && (input.target.kind === 'task' || input.target.kind === 'channel_task') && input.target.task_id !== taskId) router.push(`/task/${input.target.task_id}`) } }).then((saved) => { if (saved && shared.isCurrent()) { if (draftRef.current === submittedDraft) { setText((current) => { if (current !== submitted) return current; storage.writeStorage(draftKey, ''); return '' }); setFiles((current) => current === selectedFiles ? [] : current) } void read().catch((cause) => setError(messageOf(cause))) } }).catch((cause) => setError(messageOf(cause))).finally(() => { savingDrafts.current.delete(submittedDraft) })
+      void shared.sendMessage(submitted, selectedFiles.map((file) => ({ name: file.name, arrayBuffer: () => new File(file.uri).arrayBuffer() })), undefined, { target, intent: promptIntent(submitted), conversation_id: bot.conversation_id, ...(expectedRevision !== undefined ? { expected_revision: expectedRevision } : {}), onSaved: (input) => { if (savedSelection !== selectionRevision.current || !shared.isCurrent()) return; if (channelId && input.target.kind === 'channel_task' && input.target.channel_id === channelId) { setSavedInput(input); setSelected(`task:${input.target.task_id}`); setRecipient(input.target.bot_id); storage.writeStorage(selectionKey, { bot_id: input.target.bot_id, task_id: input.target.task_id }) } else if (draftRef.current === submittedDraft && routeActive.current && !channelId && (input.target.kind === 'task' || input.target.kind === 'channel_task') && input.target.task_id !== taskId) router.push(`/task/${input.target.task_id}`) } }).then((saved) => { if (saved && shared.isCurrent()) { if (draftRef.current === submittedDraft) { setText((current) => { if (current !== submitted) return current; storage.writeStorage(draftKey, ''); return '' }); setFiles((current) => current === selectedFiles ? [] : current) } void read().catch((cause) => setError(messageOf(cause))) } }).catch((cause) => setError(messageOf(cause))).finally(() => { savingDrafts.current.delete(submittedDraft) })
     }}>{error ? <ErrorText error={error} /> : null}</Composer></View></KeyboardStickyView>
   </View>
 }

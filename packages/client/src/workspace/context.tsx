@@ -7,7 +7,7 @@ import { requestKey } from "../lib/secure.ts"
 import { notificationForOpening, type Platform } from "../lib/platform.ts"
 import type { Tabs } from "../identity/context.tsx"
 import { mergeProgress, type LiveProgress } from "../lib/progress.ts"
-import { inputEventBody, inputTargetKey, inputTaskCommand, isQueuedReceipt, prepareSend, promptIntent, retryText } from "../chat/protocol.ts"
+import { inputEventBody, inputTargetKey, inputTaskCommand, isQueuedReceipt, prepareSend, retryText } from "../chat/protocol.ts"
 import { taskActive } from "./labels.ts"
 import { outcomeUnknown } from "../lib/errors.ts"
 import { byRank, unreadReply } from "../chat/timeline.ts"
@@ -922,7 +922,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const id = targetConversation(target, options?.conversation_id)
     let revision = options?.expected_revision
     let localTask: LocalTask | undefined
-    const intent = options?.intent ?? promptIntent(text)
+    const intent = options?.intent ?? 'continue'
     if (intent === 'new_task' || target.kind === 'channel_member') {
       if (!files.length && !sent.length) inputText(text, '消息内容', 65536)
       const bot = botsRef.current.find((bot) => bot.conversation_id === id)

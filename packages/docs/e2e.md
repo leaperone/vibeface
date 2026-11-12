@@ -32,7 +32,7 @@ headless 传输测试仅阻止临时文件输入打开原生系统选择框，�
 
 测试使用 `tests/e2e/fixtures.ts` 导出的 `test`、`cursorTest`、`deliveryTest`、`workspaceTest` 或 `meshTest`，每项测试均重建 Node。保持 `workers: 1` 和 `retries: 0`，避免重复执行有外部副作用的验收。
 
-`workspace.e2e.ts` 从真实表单创建 Bot、独立 Task 和频道，检查连续补充、稍后队列控制、Context 来源、scope 隔离及窄屏输入和停止。控制器只释放固定的受控 Provider 门，并读取实际原生输入和回合记录，不直接写业务表。390px 网页通过不能替代原生手机制品验收。
+`workspace.e2e.ts` 从真实表单创建 Bot、独立 Task 和频道，检查连续补充、Context 来源、scope 隔离及窄屏输入和停止。控制器只释放固定的受控 Provider 门，并读取实际原生输入和回合记录，不直接写业务表。390px 网页通过不能替代原生手机制品验收。
 
 公共入网使用同一文件导出的 `meshTest`。测试页面由一台公共节点提供，它在随机网络名的全网里当 bootstrap 节点，提供开放 relay 和面向任何设备的浏览器转发；成员 Node 只把这台公共节点配成 bootstrap 节点，不配置 relay 或运营者令牌。浏览器粘贴加入链接，经公共节点按设备编号连到成员 Node，完成真实安全码配对后读取 Bot 列表，刷新后仍能连上。普通夹具的 Node 不入全网（`--no-mesh`），本机页面不连接官方服务。
 

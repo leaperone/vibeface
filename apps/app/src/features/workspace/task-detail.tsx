@@ -21,6 +21,7 @@ import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
 import type { WorkDetail } from '@vibeface/client/workspace/types.ts'
 import { PromptInput } from "@/features/chat/elements/prompt-input"
 import { InputQueue, WorkspaceInputStatus } from "./workspace-chat"
+import { promptIntent } from "@vibeface/client/chat/protocol.ts"
 
 const tone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["waiting", "awaiting_confirmation"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
 type ComposerDraft = { text: string; files: File[]; workId: string; conversationId: string }
@@ -239,13 +240,13 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       </Details>
       {workspace.pendingMessages.filter((item) => item.target.kind === 'work' && item.target.work_id === workId).map((item) => <WorkspaceInputStatus key={item.message_id} pending={item} />)}
     </div>}
-    {work ? <div className="shrink-0 border-t p-3"><PromptInput value={input} onChange={setInput} files={files} onFiles={setFiles} hint="" reason={workspace.readOnlyNotice || workspace.writeNotice} disabled={!workspace.canSaveMessages} label={canContinue ? `补充给 ${work.title || '这个工作'}` : '发送为新任务'} sendLabel={canContinue ? "补充这个工作" : "发送为新任务"} target={<><span className="text-meta text-muted-foreground">{canContinue ? '补充给' : '新任务 · 接着'} · {work.title || '这个工作'}</span><InputQueue target={{ kind: "work", work_id: workId }} /></>} onSubmit={() => {
+    {work ? <div className="shrink-0 border-t p-3"><PromptInput value={input} onChange={setInput} files={files} onFiles={setFiles} hint="" reason={!canContinue && !work.outcome ? "这个工作当前不能接收补充。" : workspace.readOnlyNotice || workspace.writeNotice} disabled={!workspace.canSaveMessages || !canContinue && !work.outcome} label={canContinue ? `补充给 ${work.title || '这个工作'}` : '发送为新任务'} sendLabel={canContinue ? "补充这个工作" : "发送为新任务"} target={<><span className="text-meta text-muted-foreground">{canContinue ? '补充给' : '新任务 · 接着'} · {work.title || '这个工作'}</span><InputQueue target={{ kind: "work", work_id: workId }} /></>} onSubmit={() => {
       const submittedDraft = draft
       if (savingDrafts.current.has(submittedDraft)) return
       savingDrafts.current.add(submittedDraft)
       const text = input, selectedFiles = files
       setSendError(null)
-      void workspace.sendMessage(text, selectedFiles, undefined, { target: { kind: 'work', work_id: workId }, ...(canContinue ? {} : { intent: 'new_task' as const }), conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !workspace.isCurrent() || draftRef.current !== submittedDraft) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') void navigate({ to: '/tasks/$taskId', params: { taskId: saved.target.task_id } }) } }).then((saved) => { if (saved && draftRef.current === submittedDraft) { setInput((current) => current === text ? '' : current); setFiles((current) => current === selectedFiles ? [] : current) } }).catch(setSendError).finally(() => { savingDrafts.current.delete(submittedDraft) })
+      void workspace.sendMessage(text, selectedFiles, undefined, { target: { kind: 'work', work_id: workId }, intent: canContinue ? promptIntent(text) : 'new_task', conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !workspace.isCurrent() || draftRef.current !== submittedDraft) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') void navigate({ to: '/tasks/$taskId', params: { taskId: saved.target.task_id } }) } }).then((saved) => { if (saved && draftRef.current === submittedDraft) { setInput((current) => current === text ? '' : current); setFiles((current) => current === selectedFiles ? [] : current) } }).catch(setSendError).finally(() => { savingDrafts.current.delete(submittedDraft) })
     }}><InlineError error={sendError} /></PromptInput></div> : null}
   </aside>
   </div>
