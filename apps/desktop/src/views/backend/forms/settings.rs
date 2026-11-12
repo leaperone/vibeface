@@ -192,6 +192,7 @@ impl Backend {
                     } else {
                         Some(get("bin").into())
                     },
+                    opencode_endpoint: vibeface_client::OpencodeEndpointChange::Keep,
                     connect_local: get("connect_local") == "true",
                     app_server: if get("app_server_mode").is_empty() {
                         None

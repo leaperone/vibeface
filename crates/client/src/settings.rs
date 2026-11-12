@@ -159,6 +159,32 @@ pub(crate) fn review(operation: &Operation, dependent_ids: Vec<String>) -> Resul
             });
         }
     }
+    if let Some(endpoint) = wanted.get("opencode_endpoint") {
+        has_secret_changes |= endpoint.is_null();
+        fields.push(SettingsField {
+            name: "opencode_endpoint".into(),
+            value: if endpoint.is_null() {
+                "remove"
+            } else {
+                "configure; endpoint and credentials hidden"
+            }
+            .into(),
+            secret: true,
+        });
+        if let Some(secret) = endpoint.get("api_key") {
+            has_secret_changes = true;
+            fields.push(SettingsField {
+                name: "opencode_endpoint.api_key".into(),
+                value: if secret.is_null() {
+                    "clear"
+                } else {
+                    "set; value hidden"
+                }
+                .into(),
+                secret: true,
+            });
+        }
+    }
     if wanted["connect_local"] == true
         || kind == SettingsKind::Provider && (wanted["bot"] == true || wanted["execution"] == true)
     {
@@ -234,5 +260,56 @@ mod tests {
             kind(&json!({"method":"configure_node"})),
             Some(SettingsKind::Node)
         );
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+    use crate::outbox::Reconciliation;
+    use serde_json::json;
+
+    #[test]
+    fn endpoint_review_hides_urls_and_keys_and_reports_explicit_clear() -> Result<()> {
+        for endpoint in [
+            Value::Null,
+            json!({"protocol":"openai","base_url":"https://synthetic-token@fixture.invalid","models":["fixture"],"api_key":"synthetic-secret"}),
+            json!({"protocol":"openai","base_url":"https://fixture.invalid","models":[],"api_key":null}),
+        ] {
+            let operation = Operation {
+                snapshot: crate::OperationSnapshot {
+                    id: "original".into(),
+                    network_id: "network".into(),
+                    client_id: "client".into(),
+                    target_node: "node".into(),
+                    state: OperationState::Unknown,
+                    sequence: None,
+                    result: None,
+                },
+                lane: "provider-settings".into(),
+                expected_revision: None,
+                bytes: serde_json::to_vec(
+                    &json!({"id":"original","method":"configure_provider","params":{"provider":"opencode","opencode_endpoint":endpoint}}),
+                )?,
+                reconciliation: Reconciliation::Manual,
+                attachments: vec![],
+                upload_scope: None,
+                prerequisites: vec![],
+            };
+            let result = review(&operation, vec![])?;
+            assert!(result.has_secret_changes);
+            assert_eq!(result.operation_id, "original");
+            let display = format!("{result:?}");
+            assert!(!display.contains("synthetic-secret"));
+            assert!(!display.contains("synthetic-token"));
+            assert!(!display.contains("fixture.invalid"));
+            assert!(
+                result
+                    .fields
+                    .iter()
+                    .any(|field| field.name == "opencode_endpoint" && field.secret)
+            );
+        }
+        Ok(())
     }
 }

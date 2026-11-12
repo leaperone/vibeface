@@ -94,6 +94,8 @@ jobs:
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
           python3 scripts/ci.py --self-test
+          python3 scripts/check-cli-parity.py --self-test
+          python3 scripts/check-cli-parity.py
           python3 scripts/check-delivery.py --self-test
           python3 scripts/install-delivery-toolchain.py --self-test
           python3 scripts/run-delivery-live.py --self-test
@@ -606,6 +608,23 @@ jobs:
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-phase4 --phase4
+      - name: Verify the complete CLI client against controlled Node processes
+        if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+        run: |
+          python3 scripts/check-cli-parity.py --binary "$PACKAGE/vibeface" --output .artifacts/ci-cli-parity.json
+          python3 scripts/verify-cli-client.py --binary "$PACKAGE/vibeface" --core-binary "$PACKAGE/vibeface-core" --artifacts .artifacts/ci-cli-client
+      - name: Upload CLI coverage and process evidence
+        if: ${{ !cancelled() && needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cli-client-${{ github.sha }}
+          path: |
+            .artifacts/ci-cli-parity.json
+            .artifacts/ci-cli-client/cli-process-*/summary.json
+          if-no-files-found: warn
+          retention-days: 7
       - name: Verify the public node, its queue and a private relay's token
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:

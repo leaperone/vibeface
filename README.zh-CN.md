@@ -105,6 +105,7 @@ vibeface://node/<issuer>?addr=84.54.3.78:4792&relay=http://node.vibeface.dev:334
 | --- | --- |
 | [快速上手](packages/docs/quick-start.md) | 安装并完成第一次对话。 |
 | [日常使用](packages/docs/user-guide.md) | 管理 Bot、任务、通知和电脑。 |
+| [终端客户端](packages/docs/cli.md) | 在 CLI 聊天、传附件、控制任务，并供脚本调用。 |
 | [产品概览](packages/docs/overview.md) | 了解用途和功能边界。 |
 | [Bot 与任务执行](packages/docs/bot-and-execution.md) | 配置协调和执行任务的 Agent。 |
 | [历史同步](packages/docs/history-sync.md) | 查看同步范围，以及如何换电脑继续。 |
