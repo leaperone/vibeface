@@ -348,6 +348,74 @@ test("workspace preserves bot and message requests while routing native decision
         await render().refresh()
       }
     })
+    await t.test('a lost first submission reconciles only at its bound entry and retries the original signed input by choice', async () => {
+      const previousOutbox = new Map(outboxItems), previousTranscript = transcript
+      const originalRpc = connection.rpc, entry = connection.entry.device_id, node = connection.info.device_id
+      const firstMessage = messages.length, firstSignature = signed.length
+      const queries: Record<string, unknown>[] = []
+      let missing = false
+      connection.rpc = async (method, body = {}) => {
+        if (method !== 'input_receipt') return originalRpc(method, body)
+        queries.push(structuredClone(body))
+        if (missing && body.original_input !== undefined) return { accepted: false, code: 'input_not_saved', stored: false, entry_device_id: entry, network_id: 'network', client_id: 'client', conversation_id: body.conversation_id, message_id: body.message_id, target: body.target, reason: '原入口未保存这条输入。' }
+        return { message_id: body.message_id, target: body.target, stage: 'unknown', actual_turn_id: null, reason: '原输入待确认', retry_safe: false, control_event: null }
+      }
+      try {
+        failMessage = true
+        assert.equal(await render().sendMessage('首次输入未落库'), true)
+        await new Promise(setImmediate)
+        const head = render().pendingMessages.find((item) => item.text === '首次输入未落库')
+        assert.ok(head)
+        const original = messages[firstMessage]
+        assert.ok(original)
+        const item = [...outboxItems.values()].find((item) => item.params.message_id === head.message_id)
+        assert.ok(item)
+        assert.equal(item.entry_device_id, entry, 'the first call must already have a durable original entry binding')
+        assert.equal(item.delivery, 'unknown')
+        assert.equal(await render().sendMessage('同目标后续输入'), true)
+        await new Promise(setImmediate)
+        assert.equal(messages.length, firstMessage + 1, 'the unknown first write holds later input')
+
+        missing = true
+        connection.entry.device_id = connection.info.device_id = 'another-entry'
+        await render().queryInput(head)
+        assert.equal(queries.at(-1)?.original_input, undefined, 'another Node only provides positive reconciliation')
+        assert.equal(render().pendingMessages.find((item) => item.message_id === head.message_id)?.delivery, 'unknown')
+        connection.entry.device_id = entry; connection.info.device_id = node
+        await memoryOutbox.put({ ...item, entry_device_id: undefined })
+        await render().queryInput(head)
+        assert.equal(queries.at(-1)?.original_input, undefined, 'an older unbound unknown cannot infer its entry from this connection')
+        assert.equal(render().pendingMessages.find((item) => item.message_id === head.message_id)?.delivery, 'unknown')
+
+        await memoryOutbox.put(item)
+        await render().queryInput(head)
+        assert.deepEqual(queries.at(-1)?.original_input, original, 'the full original ID, target, sequence and signature are reconciled unchanged')
+        assert.equal(queries.at(-1)?.entry_device_id, entry)
+        const recovered = render().pendingMessages.find((item) => item.message_id === head.message_id)
+        assert.equal(recovered?.delivery, 'saved')
+        assert.equal(recovered?.rejection_code, 'input_not_saved')
+        assert.equal(messages.length, firstMessage + 1, 'a negative receipt never automatically replays input')
+        failMessage = false
+        connection.entry.device_id = connection.info.device_id = 'another-entry'
+        await assert.rejects(render().retryPendingMessage(head.message_id), /原入口/)
+        assert.equal(messages.length, firstMessage + 1)
+        connection.entry.device_id = entry; connection.info.device_id = node
+        await render().retryPendingMessage(head.message_id)
+        await new Promise(setImmediate)
+        assert.deepEqual(messages[firstMessage + 1], original, 'retry sends the exact original signed request')
+        assert.equal(messages.length, firstMessage + 3, 'the later saved input advances after the original retry is accepted')
+        assert.equal(signed.length, firstSignature + 2, 'reconciliation and retry do not sign another input')
+      } finally {
+        failMessage = false
+        connection.entry.device_id = entry; connection.info.device_id = node
+        connection.rpc = originalRpc
+        messages.splice(firstMessage); signed.splice(firstSignature)
+        transcript = previousTranscript
+        outboxItems.clear()
+        for (const [key, item] of previousOutbox) outboxItems.set(key, item)
+        await reload(); await render().refresh()
+      }
+    })
     await t.test('shared public history API fences late results, preserves pushed rows and restarts after authority changes', async () => {
       const originalRpc = connection.rpc
       const row = (message_id: string, at: number, text = message_id) => ({ message_id, event_hash: message_id, rank: String(at).padStart(20, '0'), role: 'user', text, created_at_ms: at })
