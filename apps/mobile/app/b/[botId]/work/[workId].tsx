@@ -177,7 +177,7 @@ function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
       </View>
     </Details>
     {shared.pendingMessages.filter((item) => item.target.kind === 'work' && item.target.work_id === workId).map((item) => <InputStatus key={item.message_id} pending={item} />)}
-    <Composer chrome={chrome} value={text} onChange={setText} files={files} onFiles={setFiles} attachmentScope={JSON.stringify([ready?.principal.network_id ?? '', conversationId, ['work', workId]])} blocked={inputPaused ? (unknown || work.outcome === 'unverified' ? '先核对这个工作的结果，再继续。' : '这个工作当前不能接收补充。') : shared.canSaveMessages ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读'} sending={false} label={inputIntent === 'continue' ? `补充给 ${work.title || '这个工作'}` : '发送为新任务'} sendLabel={inputIntent === 'continue' ? '补充这个工作' : '发送为新任务'} onSend={() => {
+    <Composer chrome={chrome} value={text} onChange={setText} files={files} onFiles={setFiles} attachmentScope={JSON.stringify([ready?.principal.network_id ?? '', conversationId, ['work', workId]])} blocked={inputPaused ? (unknown || work.outcome === 'unverified' ? '先让 Bot 查结果，再继续。' : '这个工作当前不能接收补充。') : shared.canSaveMessages ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读'} sending={false} label={inputIntent === 'continue' ? `补充给 ${work.title || '这个工作'}` : '发送为新任务'} sendLabel={inputIntent === 'continue' ? '补充这个工作' : '发送为新任务'} onSend={() => {
       const submittedDraft = draft
       if (savingDrafts.current.has(submittedDraft)) return
       savingDrafts.current.add(submittedDraft)
