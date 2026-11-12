@@ -1629,6 +1629,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       return { ...workspaceModel, ...(typeof override === 'object' && override !== null ? override : {}) }
     }
     if (specifier === '@vibeface/client/workspace/history.ts') return workspaceHistory
+    if (specifier === '@vibeface/client/chat/protocol.ts') return { promptIntent, ...dependencies[specifier] as object }
     if (specifier === '@/features/chat/memory-summary') {
       const filename = fileURLToPath(new URL('../../../../../apps/mobile/src/features/chat/memory-summary.tsx', import.meta.url))
       const compiled = transpileModule(readFileSync(filename, 'utf8'), { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText

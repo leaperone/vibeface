@@ -154,6 +154,9 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const asked = promptSummary(work?.prompt ?? "", work?.title ?? "")
   const coordination = work?.coordination_job
   const canContinue = Boolean(work && !work.outcome && !work.stop && ["accepted", "running"].includes(work.state))
+  // A work whose result is unknown may still write; new input waits until the result is checked.
+  const inputPaused = !canContinue && (!work?.outcome || unknown || work?.outcome === "unverified")
+  const inputIntent = canContinue ? promptIntent(input) : "new_task"
 
   return <div ref={layer} className="contents">
   {/* Clicking it must not move focus to the page behind, or React hands focus back there instead of to the task link. */}
@@ -240,13 +243,13 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       </Details>
       {workspace.pendingMessages.filter((item) => item.target.kind === 'work' && item.target.work_id === workId).map((item) => <WorkspaceInputStatus key={item.message_id} pending={item} />)}
     </div>}
-    {work ? <div className="shrink-0 border-t p-3"><PromptInput value={input} onChange={setInput} files={files} onFiles={setFiles} hint="" reason={!canContinue && !work.outcome ? "这个工作当前不能接收补充。" : workspace.readOnlyNotice || workspace.writeNotice} disabled={!workspace.canSaveMessages || !canContinue && !work.outcome} label={canContinue ? `补充给 ${work.title || '这个工作'}` : '发送为新任务'} sendLabel={canContinue ? "补充这个工作" : "发送为新任务"} target={<><span className="text-meta text-muted-foreground">{canContinue ? '补充给' : '新任务 · 接着'} · {work.title || '这个工作'}</span><InputQueue target={{ kind: "work", work_id: workId }} /></>} onSubmit={() => {
+    {work ? <div className="shrink-0 border-t p-3"><PromptInput value={input} onChange={setInput} files={files} onFiles={setFiles} hint="" reason={inputPaused ? (unknown || work.outcome === "unverified" ? "先核对这个工作的结果，再继续。" : "这个工作当前不能接收补充。") : workspace.readOnlyNotice || workspace.writeNotice} disabled={!workspace.canSaveMessages || inputPaused} label={inputIntent === "continue" ? `补充给 ${work.title || '这个工作'}` : '发送为新任务'} sendLabel={inputIntent === "continue" ? "补充这个工作" : "发送为新任务"} target={<><span className="text-meta text-muted-foreground">{canContinue ? '补充给' : '新任务 · 接着'} · {work.title || '这个工作'}</span><InputQueue target={{ kind: "work", work_id: workId }} /></>} onSubmit={() => {
       const submittedDraft = draft
       if (savingDrafts.current.has(submittedDraft)) return
       savingDrafts.current.add(submittedDraft)
       const text = input, selectedFiles = files
       setSendError(null)
-      void workspace.sendMessage(text, selectedFiles, undefined, { target: { kind: 'work', work_id: workId }, intent: canContinue ? promptIntent(text) : 'new_task', conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !workspace.isCurrent() || draftRef.current !== submittedDraft) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') void navigate({ to: '/tasks/$taskId', params: { taskId: saved.target.task_id } }) } }).then((saved) => { if (saved && draftRef.current === submittedDraft) { setInput((current) => current === text ? '' : current); setFiles((current) => current === selectedFiles ? [] : current) } }).catch(setSendError).finally(() => { savingDrafts.current.delete(submittedDraft) })
+      void workspace.sendMessage(text, selectedFiles, undefined, { target: { kind: 'work', work_id: workId }, intent: inputIntent, conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !workspace.isCurrent() || draftRef.current !== submittedDraft) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') void navigate({ to: '/tasks/$taskId', params: { taskId: saved.target.task_id } }) } }).then((saved) => { if (saved && draftRef.current === submittedDraft) { setInput((current) => current === text ? '' : current); setFiles((current) => current === selectedFiles ? [] : current) } }).catch(setSendError).finally(() => { savingDrafts.current.delete(submittedDraft) })
     }}><InlineError error={sendError} /></PromptInput></div> : null}
   </aside>
   </div>

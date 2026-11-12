@@ -107,6 +107,9 @@ function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
   const plan = parseSummarySteps(work.summary)
   const coordination = work.coordination_job
   const canContinue = !work.outcome && !work.stop && ["accepted", "running"].includes(work.state)
+  // A work whose result is unknown may still write; new input waits until the result is checked.
+  const inputPaused = !canContinue && (!work.outcome || unknown || work.outcome === "unverified")
+  const inputIntent = canContinue ? promptIntent(text) : "new_task"
   return <KeyboardAwareScrollView keyboardShouldPersistTaps="handled" bottomOffset={16} contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     <Stack.Screen options={{ title: work.title || '任务' }} />
     <Button variant="ghost" className="self-start" accessibilityLabel={`打开所属 Bot ${bot.name}`} onPress={() => router.push(`/b/${bot.bot_id}`)}><Icon as={Bot} /><Text>{bot.name}</Text></Button>
@@ -174,13 +177,13 @@ function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
       </View>
     </Details>
     {shared.pendingMessages.filter((item) => item.target.kind === 'work' && item.target.work_id === workId).map((item) => <InputStatus key={item.message_id} pending={item} />)}
-    <Composer chrome={chrome} value={text} onChange={setText} files={files} onFiles={setFiles} attachmentScope={JSON.stringify([ready?.principal.network_id ?? '', conversationId, ['work', workId]])} blocked={!canContinue && !work.outcome ? '这个工作当前不能接收补充。' : shared.canSaveMessages ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读'} sending={false} label={canContinue ? `补充给 ${work.title || '这个工作'}` : '发送为新任务'} sendLabel={canContinue ? '补充这个工作' : '发送为新任务'} onSend={() => {
+    <Composer chrome={chrome} value={text} onChange={setText} files={files} onFiles={setFiles} attachmentScope={JSON.stringify([ready?.principal.network_id ?? '', conversationId, ['work', workId]])} blocked={inputPaused ? (unknown || work.outcome === 'unverified' ? '先核对这个工作的结果，再继续。' : '这个工作当前不能接收补充。') : shared.canSaveMessages ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读'} sending={false} label={inputIntent === 'continue' ? `补充给 ${work.title || '这个工作'}` : '发送为新任务'} sendLabel={inputIntent === 'continue' ? '补充这个工作' : '发送为新任务'} onSend={() => {
       const submittedDraft = draft
       if (savingDrafts.current.has(submittedDraft)) return
       savingDrafts.current.add(submittedDraft)
       const submitted = text, selectedFiles = files
       setSendError('')
-      void shared.sendMessage(submitted, selectedFiles.map((file) => ({ name: file.name, arrayBuffer: () => new File(file.uri).arrayBuffer() })), undefined, { target: { kind: 'work', work_id: workId }, intent: canContinue ? promptIntent(submitted) : 'new_task', conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !shared.isCurrent() || draftRef.current !== submittedDraft) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') router.push(`/task/${saved.target.task_id}`) } }).then((saved) => { if (saved && draftRef.current === submittedDraft) { setText((current) => current === submitted ? '' : current); setFiles((current) => current === selectedFiles ? [] : current) } }).catch((cause) => setSendError(messageOf(cause))).finally(() => { savingDrafts.current.delete(submittedDraft) })
+      void shared.sendMessage(submitted, selectedFiles.map((file) => ({ name: file.name, arrayBuffer: () => new File(file.uri).arrayBuffer() })), undefined, { target: { kind: 'work', work_id: workId }, intent: inputIntent, conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !shared.isCurrent() || draftRef.current !== submittedDraft) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') router.push(`/task/${saved.target.task_id}`) } }).then((saved) => { if (saved && draftRef.current === submittedDraft) { setText((current) => current === submitted ? '' : current); setFiles((current) => current === selectedFiles ? [] : current) } }).catch((cause) => setSendError(messageOf(cause))).finally(() => { savingDrafts.current.delete(submittedDraft) })
     }}>{sendError ? <ErrorText error={sendError} /> : null}</Composer>
   </KeyboardAwareScrollView>
 }
