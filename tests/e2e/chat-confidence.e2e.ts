@@ -216,7 +216,7 @@ test('chat keeps decisions and task records readable on desktop and phone', asyn
     await expect(task.getByRole('button', '没做完', { exact: true })).toBeVisible();
     const geometry = await browser.evaluate(() => ({ width: document.documentElement.clientWidth, content: document.documentElement.scrollWidth }));
     assert(geometry.content <= geometry.width, 'phone layout must not scroll horizontally');
-    const blockedReason = '这个工作当前不能接收补充。选择「新任务」继续。';
+    const blockedReason = '这个工作当前不能接收补充。';
     const blockedHint = task.getByText(blockedReason, { exact: true });
     await expect(blockedHint).toBeVisible();
     const hintBounds = await blockedHint.boundingBox();
