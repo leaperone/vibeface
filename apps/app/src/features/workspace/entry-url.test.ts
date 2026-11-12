@@ -451,7 +451,7 @@ test("workspace preserves bot and message requests while routing native decision
       const previousOutbox = new Map(outboxItems), previousTranscript = transcript
       const originalRpc = connection.rpc, originalOutbox = platform.outbox, originalLock = platform.inputLock
       const submissions = messages.length, signatures = signed.length
-      platform.inputLock = (_name, save) => save()
+      platform.inputLock = (_name, save) => Promise.resolve(save())
       try {
         for (const result of ['entry_accepted', 'unknown', 'history', 'workspace_history'] as const) await race.test(result, async () => {
           outboxItems.clear(); transcript = []
@@ -2507,6 +2507,9 @@ test('both pending input controls retry only a matching safe refusal and keep al
       assert.equal(button('关闭提醒'), undefined); assert.equal(button('不再发送'), undefined)
       assert.ok(button('确认原设备并查询'))
       assert.match(componentText(render()), /本人电脑 · original/)
+      const namedDevice = shared.info.name
+      shared.info.name = ''; assert.match(componentText(render()), /当前连接的设备/)
+      shared.info.name = namedDevice
       await press('确认原设备并查询')
       assert.deepEqual(confirmed, [['original', 'original-entry']])
       assert.equal(button('确认原设备并查询'), undefined, 'a confirmed entry cannot be replaced')
@@ -2546,6 +2549,7 @@ test('both pending input controls retry only a matching safe refusal and keep al
       pending = { ...accepted, entry_device_id: undefined, delivery: 'saved', receipt: undefined, rejected: '原输入未保存', rejection_code: 'input_not_saved' }
       shared.workspaceState.inputs = []
       assert.equal(button('重试原输入'), undefined, 'an old absence result cannot authorize retry without confirming its original device')
+      assert.match(componentText(render()), /尚未确认原设备是否保存这条输入/)
       assert.ok(button('确认原设备并查询'))
       assert.ok(button('不再发送'))
       shared.connectionOnline = false; assert.equal(button('确认原设备并查询'), undefined); shared.connectionOnline = true
