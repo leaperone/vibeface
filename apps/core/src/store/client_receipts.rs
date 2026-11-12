@@ -57,14 +57,14 @@ impl Store {
             return Ok(Some(
                 json!({"message_id":input.message_id,"target":input.route.target,
                 "stage":"unknown","actual_turn_id":null,"control_event":null,
-                "reason":"原输入仍有历史或待处理记录，暂不能确认未保存。","retry_safe":false}),
+                "reason":"这条输入仍有记录，暂时无法确认是否保存。","retry_safe":false}),
             ));
         }
         Ok(Some(
             json!({"accepted":false,"code":"input_not_saved","stored":false,
             "entry_device_id":entry_device_id,"network_id":network,"client_id":client_id,
             "conversation_id":conversation,"message_id":input.message_id,"target":input.route.target,
-            "reason":"原入口未保存这条输入，可选择重试原输入或不再发送。"}),
+            "reason":"原设备未保存这条输入，可选择重试原输入或不再发送。"}),
         ))
     }
 

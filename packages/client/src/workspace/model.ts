@@ -143,7 +143,7 @@ export function parseInputReceipt(value: unknown): InputReceipt {
 export function parseInputNotSaved(value: unknown): InputNotSaved | null {
   const data = record(value)
   if (data.code !== 'input_not_saved') return null
-  if (data.accepted !== false || data.stored !== false) throw new Error('输入未保存的证据不完整。')
+  if (data.accepted !== false || data.stored !== false) throw new Error('设备返回的输入状态不完整。')
   return { accepted: false, code: 'input_not_saved', stored: false, entry_device_id: text(data.entry_device_id), network_id: text(data.network_id), client_id: text(data.client_id), conversation_id: text(data.conversation_id), message_id: text(data.message_id), target: parseInputTarget(data.target), reason: text(data.reason) }
 }
 function inputStage(stage: unknown): InputReceipt['stage'] {
