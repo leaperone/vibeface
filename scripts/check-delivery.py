@@ -2,6 +2,8 @@
 """Rebuild the delivery guest, verify its public receipts, and exercise the EVM adapter."""
 
 import argparse
+import contextlib
+import errno
 import hashlib
 import io
 import json
@@ -14,6 +16,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -25,6 +28,8 @@ ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = ROOT / ".artifacts/vdp"
 FIXTURES = ROOT / "crates/delivery/proof/fixtures"
 PROFILE = ROOT / "crates/delivery/proof/profile.json"
+SHARED_TARGETS = ("proof-target", "domain-target")
+SANDBOX_FILES = ("crates/delivery/proof/Sandbox.Dockerfile", "crates/delivery/proof/confined-gnark.sh")
 STATEMENT_BYTES = 47 * 32
 PUBLIC_FIELDS = {"mode", "kind", "imageId", "profileId", "relation", "journal", "journalHash", "seal"}
 PROFILE_CAPS = {"crypto_suite": 1, "max_windows": 2, "max_window_bytes": 65_536, "max_total_bytes": 131_072,
@@ -179,11 +184,91 @@ def source_commit():
     return commit
 
 
-def sandbox_commands(context, small=None, resume_dir=None, work_id=None, producer=None):
-    image = "vibeface-vdp-proof:check-" + hashlib.sha256(str(ROOT).encode()).hexdigest()[:12]
+def shared_cache():
+    common = Path(subprocess.check_output(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=ROOT, text=True).strip())
+    if common.name != ".git" or not common.is_dir():
+        return ARTIFACTS
+    return common.parent / ".artifacts/vdp-shared"
+
+
+def clone_tree(source, destination):
+    flags = ["-cpR"] if sys.platform == "darwin" else ["-a", "--reflink=auto"]
+    subprocess.check_call(["cp", *flags, str(source), str(destination)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def share_failed(error):
+    return isinstance(error, (FileNotFoundError, FileExistsError)) or (type(error) is OSError and error.errno in (errno.ENOTEMPTY, errno.EEXIST, errno.EXDEV))
+
+
+@contextlib.contextmanager
+def deferred_sigterm():
+    # os.walk and rmtree(ignore_errors=True) swallow the handler's InterruptedError; hold SIGTERM until they finish.
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def seed_target(target, shared):
+    if target.exists():
+        return
+    staging = target.with_name(f"{target.name}.seed-{uuid.uuid4().hex}")
+    try:
+        before = os.stat(shared)
+        clone_tree(shared, staging)
+        after = os.stat(shared)
+        if (before.st_ino, before.st_dev, before.st_ctime_ns) != (after.st_ino, after.st_dev, after.st_ctime_ns):
+            return
+        with deferred_sigterm():
+            # Cargo judges path crates and the guest by mtime, so another branch's outputs must look older than every source.
+            for directory, directories, files in os.walk(staging, topdown=False):
+                for name in directories + files:
+                    os.utime(os.path.join(directory, name), (0, 0), follow_symlinks=False)
+            os.utime(staging, (0, 0), follow_symlinks=False)
+            os.rename(staging, target)
+    except OSError as error:
+        if not share_failed(error):
+            raise
+    except subprocess.CalledProcessError:
+        pass
+    finally:
+        with deferred_sigterm():
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def publish_target(target, shared):
+    if not target.is_dir():
+        return
+    token = uuid.uuid4().hex
+    staging, old = shared.with_name(f"{shared.name}.tmp-{token}"), shared.with_name(f"{shared.name}.old-{token}")
+    try:
+        clone_tree(target, staging)
+        try:
+            os.rename(shared, old)
+        except FileNotFoundError:
+            pass
+        os.rename(staging, shared)
+    except OSError as error:
+        if not share_failed(error):
+            raise
+    except subprocess.CalledProcessError:
+        pass
+    finally:
+        with deferred_sigterm():
+            shutil.rmtree(staging, ignore_errors=True)
+            shutil.rmtree(old, ignore_errors=True)
+
+
+def sandbox_commands(context, small=None, resume_dir=None, work_id=None, producer=None, cache=None):
+    image = "vibeface-vdp-proof:check-" + hashlib.sha256(b"".join((ROOT / file).read_bytes() for file in SANDBOX_FILES)).hexdigest()[:12]
     build = ["docker", "build", "--platform", "linux/amd64", "--file", str(context / "crates/delivery/proof/Sandbox.Dockerfile"), "--tag", image, str(context)]
     container = ["docker", "run", "--rm", "--platform", "linux/amd64", "--memory", "11g", "--memory-swap", "11g", "--pids-limit", "64", "--env", "HOME=/home/runner", "--env", "PYTHONDONTWRITEBYTECODE=1"]
-    for source, destination in ((ROOT, "/work"), (ARTIFACTS / "cargo", "/cargo"), (ARTIFACTS / "cargo", "/home/runner/.cargo"), (ARTIFACTS / "risc0", "/risc0"), (ARTIFACTS / "canonical", "/artifacts")):
+    cache = cache or ARTIFACTS
+    mounts = [(ROOT, "/work"), (cache / "cargo", "/cargo"), (cache / "cargo", "/home/runner/.cargo"), (cache / "risc0", "/risc0"), (ARTIFACTS / "canonical", "/artifacts")]
+    if cache != ARTIFACTS:
+        mounts.append((cache / "risc0", "/work/.artifacts/vdp/risc0"))
+    for source, destination in mounts:
         container.extend(["--mount", f"type=bind,source={source},target={destination}"])
     command = "python3 scripts/install-delivery-toolchain.py && python3 scripts/check-delivery.py"
     if small is not None:
@@ -221,7 +306,10 @@ def sandbox(small=None, resume_run=None):
         public = ARTIFACTS / "canonical/small" / work_id / "public"
     failure = None
     try:
-        for directory in ("cargo", "risc0", "canonical"):
+        cache = shared_cache()
+        for directory in ("cargo", "risc0"):
+            (cache / directory).mkdir(parents=True, exist_ok=True)
+        for directory in ("risc0", "canonical"):
             (ARTIFACTS / directory).mkdir(parents=True, exist_ok=True)
         if small is not None:
             (ARTIFACTS / "canonical/small").mkdir(mode=0o755, exist_ok=True)
@@ -233,19 +321,20 @@ def sandbox(small=None, resume_run=None):
                 resume_dir = download_inputs(producer, resume_run, small)
         with tempfile.TemporaryDirectory(prefix="sandbox-build-", dir=ARTIFACTS) as directory:
             context = Path(directory)
-            for file in ("crates/delivery/proof/Sandbox.Dockerfile", "crates/delivery/proof/confined-gnark.sh"):
+            for file in SANDBOX_FILES:
                 source = ROOT / file
                 if source.is_symlink() or not source.is_file():
                     raise ValueError(f"Sandbox build requires a regular source file: {file}")
                 destination = context / file
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source, destination)
-            build, container = sandbox_commands(context, small, resume_dir, work_id, producer)
+            build, container = sandbox_commands(context, small, resume_dir, work_id, producer, cache)
             run(build)
         task = "".join(character if character.isascii() and (character.isalnum() or character in "_.-") else "-" for character in ROOT.name)[:64]
         name = "vdp-" + task + "-" + uuid.uuid4().hex
         container[2:2] = ["--name", name, "--label", "vibeface.task-root=" + str(ROOT)]
         print("Delivery sandbox owned by this task: " + name, flush=True)
+        share = small is None and os.environ.get("GITHUB_ACTIONS") != "true" and cache != ARTIFACTS
         previous_term = signal.getsignal(signal.SIGTERM)
 
         def interrupted(*_):
@@ -253,9 +342,13 @@ def sandbox(small=None, resume_run=None):
 
         try:
             signal.signal(signal.SIGTERM, interrupted)
+            for target in SHARED_TARGETS if share else ():
+                seed_target(ARTIFACTS / "canonical" / target, cache / target)
             run(container)
             if small is not None and source_commit() != commit:
                 raise ValueError("Source changed while the work item was running")
+            for target in SHARED_TARGETS if share else ():
+                publish_target(ARTIFACTS / "canonical" / target, cache / target)
         finally:
             try:
                 result = subprocess.run(["docker", "ps", "--all", "--no-trunc", "--filter", "name=^/" + re.escape(name) + "$",
@@ -1322,6 +1415,44 @@ def self_test():
     assert mounts == [f"type=bind,source={source},target={destination}" for source, destination in (
         (ROOT, "/work"), (ARTIFACTS / "cargo", "/cargo"), (ARTIFACTS / "cargo", "/home/runner/.cargo"), (ARTIFACTS / "risc0", "/risc0"), (ARTIFACTS / "canonical", "/artifacts"))]
     assert build[-2] == container[-4]
+    _, shared = sandbox_commands(Path("/context"), cache=Path("/shared"))
+    assert [shared[index + 1] for index, value in enumerate(shared) if value == "--mount"][1:] == [f"type=bind,source=/shared/{source},target={destination}" for source, destination in (
+        ("cargo", "/cargo"), ("cargo", "/home/runner/.cargo"), ("risc0", "/risc0"))] + [f"type=bind,source={ARTIFACTS / 'canonical'},target=/artifacts",
+        "type=bind,source=/shared/risc0,target=/work/.artifacts/vdp/risc0"]
+    with tempfile.TemporaryDirectory(prefix="target-share-", dir=ARTIFACTS) as directory:
+        base = Path(directory)
+        built, shared_target, worktree = base / "built", base / "shared", base / "worktree"
+        (built / "release").mkdir(parents=True)
+        (built / "release/prover").write_text("first")
+        os.utime(built / "release/prover", (1_000_000, 1_000_000))
+        publish_target(built, shared_target)
+        seed_target(worktree, shared_target)
+        assert (worktree / "release/prover").read_text() == "first"
+        assert all(path.stat().st_mtime == 0 for path in (worktree, worktree / "release", worktree / "release/prover"))
+        assert (shared_target / "release/prover").stat().st_mtime == 1_000_000
+        (built / "release/prover").write_text("second")
+        publish_target(built, shared_target)
+        seed_target(worktree, shared_target)
+        assert (shared_target / "release/prover").read_text() == "second" and (worktree / "release/prover").read_text() == "first"
+        with patch(f"{__name__}.clone_tree", side_effect=subprocess.CalledProcessError(1, ["cp"])):
+            publish_target(worktree, shared_target)
+            seed_target(base / "cold", shared_target)
+        assert (shared_target / "release/prover").read_text() == "second" and not (base / "cold").exists()
+        real_clone = clone_tree
+
+        def clone_during_publish(source, destination):
+            real_clone(source, destination)
+            if source == shared_target:
+                publish_target(built, shared_target)
+
+        with patch(f"{__name__}.clone_tree", side_effect=clone_during_publish):
+            seed_target(base / "raced", shared_target)
+        assert not (base / "raced").exists()
+        with patch(f"{__name__}.clone_tree", side_effect=InterruptedError("Delivery sandbox interrupted")):
+            for share in (publish_target, lambda target, shared: seed_target(base / "cold", shared)):
+                with TestCase().assertRaises(InterruptedError, msg="Sharing must not swallow a SIGTERM interruption"):
+                    share(worktree, shared_target)
+        assert sorted(path.name for path in base.iterdir()) == ["built", "shared", "worktree"]
     assert container[-3:] == ["bash", "-c", "python3 scripts/install-delivery-toolchain.py && python3 scripts/check-delivery.py"]
     env_pairs = [container[index + 1] for index, value in enumerate(container) if value == "--env"]
     assert env_pairs == ["HOME=/home/runner", "PYTHONDONTWRITEBYTECODE=1"]
@@ -1383,7 +1514,8 @@ def self_test():
                         raise failure
 
             result = lookup if isinstance(lookup, BaseException) else subprocess.CompletedProcess([], 0, stdout=lookup + "\n")
-            with patch(f"{__name__}.optional_fixtures", return_value=None), patch(f"{__name__}.run", side_effect=execute) as operation, \
+            with patch.dict(os.environ, {"GITHUB_ACTIONS": "false"}), patch(f"{__name__}.optional_fixtures", return_value=None), patch(f"{__name__}.run", side_effect=execute) as operation, \
+                    patch(f"{__name__}.seed_target") as seeded, patch(f"{__name__}.publish_target") as published, \
                     patch("subprocess.run", side_effect=[result, stop_error or subprocess.CompletedProcess([], 0)]) as cleanup:
                 caught = None
                 try:
@@ -1394,6 +1526,7 @@ def self_test():
                     assert isinstance(caught, expected), "Sandbox interruption or cleanup must propagate the expected failure"
                 else:
                     assert caught is expected
+                assert seeded.call_count == 2 and published.call_count == (2 if failure is None else 0)
                 assert signal.getsignal(signal.SIGTERM) is prior_term
                 assert operation.call_count == 2
                 owned = operation.call_args.args[0]
@@ -1410,6 +1543,11 @@ def self_test():
                     assert cleanup.call_args_list[1].kwargs == {"capture_output": True, "check": True, "timeout": 30}
                 else:
                     assert cleanup.call_count == 1
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), patch(f"{__name__}.optional_fixtures", return_value=None), patch(f"{__name__}.run"), \
+                patch(f"{__name__}.seed_target") as seeded, patch(f"{__name__}.publish_target") as published, \
+                patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, stdout="")):
+            sandbox()
+        assert seeded.call_count == published.call_count == 0, "CI runners have no sibling worktree to share targets with"
     finally:
         signal.signal(signal.SIGTERM, previous_term)
     continuation_self_test(manifest, compiled, profile, vectors, profile_proofs)
@@ -1827,7 +1965,10 @@ if __name__ == "__main__":
     if args.resume_dir is not None and (args.sandbox or args.prove_small is None or args.resume_run is not None):
         parser.error("--resume-dir is internal to one canonical work item")
     if args.self_test:
-        self_test()
+        from unittest.mock import patch
+        ARTIFACTS.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="shared-cache-self-test-", dir=ARTIFACTS) as cache, patch(f"{__name__}.shared_cache", return_value=Path(cache)):
+            self_test()
     elif args.check_fixtures:
         if optional_fixtures():
             print("Public fixture structure and schema checked; proof verification has not run")

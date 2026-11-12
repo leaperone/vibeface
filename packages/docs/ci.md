@@ -120,7 +120,7 @@ python3 scripts/check-delivery.py --check-fixtures
 python3 scripts/check-delivery.py --sandbox
 ```
 
-`--sandbox` 先检查 fixture，再用固定的 `crates/delivery/proof/Sandbox.Dockerfile` 构建本地镜像。构建上下文仅含 Dockerfile 和 gnark 启动脚本。容器只挂四个宿主目录（Cargo 目录同时挂到 `/cargo` 和 `/home/runner/.cargo`），复用 `.artifacts/vdp/cargo`、`.artifacts/vdp/risc0` 和 `.artifacts/vdp/canonical`，不挂 Docker socket，不把 host 凭证或 dev mode 作为参数或挂载传入容器。内存上限为 11 GiB，内存与交换合计也限 11 GiB，最多 64 个进程。容器先在内部安装固定 guest 编译器，再执行默认完整检查。Preflight proof 域使用此入口，Mac 不安装原生 guest 编译器。
+`--sandbox` 先检查 fixture，再用固定的 `crates/delivery/proof/Sandbox.Dockerfile` 构建本地镜像。构建上下文仅含 Dockerfile 和 gnark 启动脚本。本地 worktree 的 Cargo 目录（同时挂到 `/cargo` 和 `/home/runner/.cargo`）与 risc0 目录挂主 checkout 的共享 `.artifacts/vdp-shared/cargo`、`.artifacts/vdp-shared/risc0`，`.artifacts/vdp/canonical` 仍按 worktree 独立；非标准 checkout 退回本 worktree 的 `.artifacts/vdp`。完整检查开始前，若本 worktree 尚无 `proof-target`、`domain-target`，先从共享快照复制一份并把其中所有 mtime 置为 Unix epoch，迫使 path crate 和 guest 按本分支源码重建，registry 依赖保持热缓存；检查通过后再以整目录替换方式发布新快照，复制期间快照被替换则放弃并冷启动。CI 和 `--prove-small` 不做复制和发布。共享目录对 sandbox 容器可写，与宿主 cargo 本就运行分支代码的信任边界相同。guest 编译器在临时目录解压并写好收据后原子改名就位，并发安装时后到者校验并沿用已存在的安装。容器不挂 Docker socket，不把 host 凭证或 dev mode 作为参数或挂载传入容器。内存上限为 11 GiB，内存与交换合计也限 11 GiB，最多 64 个进程。容器先在内部安装固定 guest 编译器，再执行默认完整检查。Preflight proof 域使用此入口，Mac 不安装原生 guest 编译器。
 
 `--check-fixtures` 只核对公开文件结构和 schema，不验证证明。两个脚本的 `--self-test` 也只验证工具自身的正反例。整个 fixture 目录不存在时按上文跳过 receipt 验证；fixture 不全、缺编译器、依赖或 verifier 时退出失败，不能把未验证结果记为通过。
 

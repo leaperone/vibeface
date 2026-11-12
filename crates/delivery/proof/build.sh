@@ -6,7 +6,7 @@ if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 || "$(pwd -P)" != /work 
   exit 2
 fi
 if [[ "${CARGO_HOME:-}" != /cargo || "${RISC0_HOME:-}" != /risc0 ]]; then
-  echo 'set CARGO_HOME=/cargo and RISC0_HOME=/risc0 to isolated task mounts' >&2
+  echo 'set CARGO_HOME=/cargo and RISC0_HOME=/risc0 to the sandbox cache mounts' >&2
   exit 2
 fi
 if [[ -n "${RISC0_DEV_MODE+x}" || -n "${RISC0_SKIP_BUILD+x}" ]]; then
