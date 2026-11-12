@@ -23,20 +23,27 @@ struct Plan {
     checkpoint: Option<RootCheckpoint>,
     state: IdentityOperationState,
 }
+struct IdentityLock(std::fs::File);
+impl Drop for IdentityLock {
+    fn drop(&mut self) {
+        // Closing alone leaves forked duplicates holding the lock.
+        let _ = self.0.unlock();
+    }
+}
 /// An encrypted pending identity operation plus an already durable, verified recovery backup.
 /// No governance request is sent until `submit` is explicitly called after the user confirms the file.
 pub struct IdentityPlan {
     dir: PathBuf,
     plan: Plan,
     password: Zeroizing<String>,
-    _lock: std::fs::File,
+    _lock: IdentityLock,
 }
 impl IdentityPlan {
-    fn lock(key: &ClientKey) -> Result<std::fs::File> {
+    fn lock(key: &ClientKey) -> Result<IdentityLock> {
         let lock = privatefs::open_or_create(&key.dir.join("identity-operation.lock"))?;
         lock.try_lock()
             .context("identity operation is open in another process or window")?;
-        Ok(lock)
+        Ok(IdentityLock(lock))
     }
     pub fn exists(key: &ClientKey) -> bool {
         key.dir.join(PLAN_FILE).exists()
@@ -401,7 +408,7 @@ mod tests {
             .is_err()
         );
         std::fs::remove_file(&path)?;
-        let inherited_lock = plan._lock.try_clone()?;
+        let inherited_lock = plan._lock.0.try_clone()?;
         drop(plan);
         assert!(IdentityPlan::load(&key, "wrong password").is_err());
         let mut reopened = IdentityPlan::load(&key, "recovery password")
