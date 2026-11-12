@@ -203,11 +203,11 @@ def share_failed(error):
 @contextlib.contextmanager
 def deferred_sigterm():
     # os.walk and rmtree(ignore_errors=True) swallow the handler's InterruptedError; hold SIGTERM until they finish.
-    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
     try:
         yield
     finally:
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 def seed_target(target, shared):
