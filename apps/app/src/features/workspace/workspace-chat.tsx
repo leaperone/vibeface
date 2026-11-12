@@ -62,7 +62,7 @@ export function InputQueue({ target, channelId }: { target: InputTarget; channel
   const queued = (workspace.workspaceState?.inputs ?? []).filter((item) => item.deferred && !item.cancelled && (channelId ? (item.input.target.kind === 'channel_task' || item.input.target.kind === 'channel_member') && item.input.target.channel_id === channelId : sameTarget(item.input.target, target))).sort((left, right) => left.effective_order - right.effective_order)
   const control = (item: QueuedInput, command: InputControlAction) => action.run(item.input.message_id, async () => {
     const receipt = await workspace.queryInput({ message_id: item.input.message_id, target: item.input.target, conversation_id: item.conversation_id })
-    if (!['entry_accepted', 'owner_accepted', 'refused'].includes(receipt.stage)) throw new Error('这条输入可能已提交，只能查询当前结果。')
+    if (!('stage' in receipt) || !['entry_accepted', 'owner_accepted', 'refused'].includes(receipt.stage)) throw new Error('这条输入可能已提交，只能查询当前结果。')
     await workspace.controlInput({ message_id: item.input.message_id, expected_event: item.control_event, action: command })
     await workspace.readWorkspaceState()
     if (command.kind === 'edit') setEditing(null)
@@ -248,14 +248,17 @@ export function WorkspaceInputStatus({ pending, refresh }: { pending: PendingMes
   const releasePending = pending.release_expected_event !== undefined || pending.release_command_id !== undefined
   const canClose = pending.delivery === 'accepted' && receipt?.stage === 'refused' && pending.rejection_code !== 'input_conflict' && !releasePending
     && receipt.message_id === pending.message_id && inputTargetKey(receipt.target) === inputTargetKey(pending.target)
-  const canDiscard = Boolean(pending.rejected) && pending.delivery === 'saved' && pending.rejection_code !== 'input_conflict' && !releasePending
-  const canRetry = workspace.writable && pending.delivery === 'accepted' && receipt?.stage === 'refused' && receipt.retry_safe === true && Boolean(receipt.control_event?.trim()) && pending.rejection_code !== 'input_conflict' && !releasePending
-    && receipt.message_id === pending.message_id && inputTargetKey(receipt.target) === inputTargetKey(pending.target) && !queued?.cancelled && !queued?.deferred
+  const canDiscard = pending.delivery === 'saved' && receipt === undefined && pending.rejection_code !== 'input_conflict' && !releasePending
+  const canRetry = workspace.writable && !releasePending && !queued?.cancelled && !queued?.deferred && (pending.delivery === 'saved' && pending.rejection_code === 'input_not_saved' || pending.delivery === 'accepted' && receipt?.stage === 'refused' && receipt.retry_safe === true && Boolean(receipt.control_event?.trim()) && pending.rejection_code !== 'input_conflict'
+    && receipt.message_id === pending.message_id && inputTargetKey(receipt.target) === inputTargetKey(pending.target))
+  const confirmEntry = pending.entry_device_id === undefined && (pending.delivery === 'unknown' || pending.delivery === 'submitting') && !releasePending && workspace.connectionOnline ? workspace.info : null
   return <div role="status" className="grid gap-2 rounded-lg bg-muted/60 px-3 py-2 text-meta">
     <p className={pending.rejected || pending.delivery === 'unknown' || receipt?.stage === 'unknown' ? 'text-warning' : 'text-muted-foreground'}>{pending.rejected ? `已拒绝 · ${pending.rejected}` : pending.delivery === 'unknown' && receipt?.stage === 'refused' && receipt.retry_safe ? '重试请求待确认' : receipt ? receiptLabels[receipt.stage] : deliveryLabels[pending.delivery]}</p>
     {receipt?.actual_turn_id ? <p className="break-all text-muted-foreground">实际回合 · {receipt.actual_turn_id}</p> : null}
     {receipt?.reason ? <p className="text-muted-foreground">{receipt.reason}</p> : null}
+    {confirmEntry ? <p className="text-muted-foreground">这条输入没有记录原设备。只有最初发给「{confirmEntry.name || '当前设备'} · {confirmEntry.device_id.slice(0, 8)}」时，才确认原设备并查询。查询不会重新发送。</p> : null}
     <div className="flex flex-wrap gap-2"><Button type="button" variant="ghost" size="sm" disabled={Boolean(action.busy)} onClick={() => void action.run('query', async () => { await workspace.queryInput({ message_id: pending.message_id, target: pending.target, conversation_id: pending.conversation_id }); await refresh?.() })}><CircleQuestionMark aria-hidden="true" />查询结果</Button>{canRetry ? <Button type="button" variant="outline" size="sm" disabled={Boolean(action.busy)} onClick={() => { if (canRetry) void action.run('retry-input', () => workspace.retryPendingMessage(pending.message_id)) }}>重试原输入</Button> : null}{canClose || canDiscard ? <Button type="button" variant="ghost" size="sm" disabled={Boolean(action.busy)} onClick={() => void action.run('release', () => workspace.releaseMessagePending(pending.message_id))}>{canClose ? '关闭提醒' : '不再发送'}</Button> : null}</div>
+    {confirmEntry ? <Button type="button" variant="outline" size="sm" className="justify-self-start" disabled={Boolean(action.busy)} onClick={() => void action.run('confirm-input-entry', async () => { await workspace.confirmInputEntry(pending.message_id, confirmEntry.device_id); await refresh?.() })}>确认原设备并查询</Button> : null}
     <InlineError error={action.error} />
   </div>
 }

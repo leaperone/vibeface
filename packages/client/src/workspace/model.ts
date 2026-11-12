@@ -9,7 +9,7 @@ import type {
   BotChange, BotChangeRecord, Overwritten, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, OpenWorkCard, WorkCard, SkillSet, SteerOutcome, Busy,
   WorkPhase, WorkDetail, OverviewBot, OverviewNode, OverviewConsistency, OverviewTaskState, OverviewTask, OverviewQuestion, OverviewJob, OverviewCoverage, WorkspaceOverview, OverviewDeliveryState, OverviewRelation, OverviewConversation, OverviewSession,
   AgentLane, QueueHoldReason, ContextProjection, ManagerJob, ScopeJob, SentCoverage, MemoryConflict,
-  InputTarget, InputIntent, InputReceipt, InputControlAction, QueuedInput, ScopeContext, SessionScope, WorkspaceChannel, WorkspaceTask, WorkspaceAssignment, WorkspaceCommand, WorkspaceCommandResult, WorkspaceCommandNotSaved, WorkspaceDomainState, WorkspaceHistory, WorkspaceHistoryBody, WorkspaceInputBody, WorkspaceSpeaker,
+  InputTarget, InputIntent, InputReceipt, InputNotSaved, InputControlAction, QueuedInput, ScopeContext, SessionScope, WorkspaceChannel, WorkspaceTask, WorkspaceAssignment, WorkspaceCommand, WorkspaceCommandResult, WorkspaceCommandNotSaved, WorkspaceDomainState, WorkspaceHistory, WorkspaceHistoryBody, WorkspaceInputBody, WorkspaceSpeaker,
 } from "./types.ts"
 import { parseMemoryEntry, parseMemorySyncConflict, parseMemorySyncConflicts } from "./memory.ts"
 import { answerId, questionOpen } from "./questions.ts"
@@ -140,6 +140,12 @@ export function parseInputReceipt(value: unknown): InputReceipt {
   if (retrySafe && (stage === 'unknown' || stage === 'submitting' || stage === 'provider_accepted' || stage === 'associated')) throw new Error('输入回执不能将已提交或未知结果标记为可重发。')
   return { message_id: text(data.message_id), target: parseInputTarget(data.target), stage, actual_turn_id: data.actual_turn_id == null ? null : text(data.actual_turn_id), reason: data.reason == null ? null : text(data.reason), retry_safe: retrySafe, control_event: controlEvent }
 }
+export function parseInputNotSaved(value: unknown): InputNotSaved | null {
+  const data = record(value)
+  if (data.code !== 'input_not_saved') return null
+  if (data.accepted !== false || data.stored !== false) throw new Error('输入未保存的证据不完整。')
+  return { accepted: false, code: 'input_not_saved', stored: false, entry_device_id: text(data.entry_device_id), network_id: text(data.network_id), client_id: text(data.client_id), conversation_id: text(data.conversation_id), message_id: text(data.message_id), target: parseInputTarget(data.target), reason: text(data.reason) }
+}
 function inputStage(stage: unknown): InputReceipt['stage'] {
   if (stage !== 'entry_accepted' && stage !== 'owner_accepted' && stage !== 'submitting' && stage !== 'provider_accepted' && stage !== 'associated' && stage !== 'refused' && stage !== 'unknown') throw new Error('输入回执无法识别。')
   return stage
@@ -161,7 +167,7 @@ export function parsePendingMessage(item: OutboxItem): PendingMessage {
   const request = parseMessageRequest(item.params), delivery = item.delivery ?? 'unknown'
   if (!['saved', 'uploading', 'submitting', 'accepted', 'unknown'].includes(delivery)) throw new Error('本地输入状态无法识别。')
   if (item.rejection_code !== undefined && item.rejection_code !== 'input_not_saved' && item.rejection_code !== 'input_conflict') throw new Error('本地输入拒绝原因无法识别。')
-  return { ...request, created_at_ms: number(item.created_at_ms), delivery, ...(item.rejected === undefined ? {} : { rejected: item.rejected }), ...(item.rejection_code === undefined ? {} : { rejection_code: item.rejection_code }), ...(item.receipt === undefined ? {} : { receipt: parseInputReceipt(item.receipt) }), ...(item.release_expected_event === undefined ? {} : { release_expected_event: text(item.release_expected_event) }), ...(item.release_command_id === undefined ? {} : { release_command_id: text(item.release_command_id) }) }
+  return { ...request, created_at_ms: number(item.created_at_ms), delivery, ...(item.entry_device_id === undefined ? {} : { entry_device_id: text(item.entry_device_id) }), ...(item.rejected === undefined ? {} : { rejected: item.rejected }), ...(item.rejection_code === undefined ? {} : { rejection_code: item.rejection_code }), ...(item.receipt === undefined ? {} : { receipt: parseInputReceipt(item.receipt) }), ...(item.release_expected_event === undefined ? {} : { release_expected_event: text(item.release_expected_event) }), ...(item.release_command_id === undefined ? {} : { release_command_id: text(item.release_command_id) }) }
 }
 export function parseMessageRequest(value: unknown): MessageRequest {
   const data = record(value)

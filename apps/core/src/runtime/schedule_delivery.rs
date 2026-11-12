@@ -1192,13 +1192,12 @@ impl Runtime {
                 let message_id = id(input, "message_id")?;
                 let stored = self
                     .store
-                    .call("workspace_input", {
+                    .call("workspace_input_evidence", {
                         let network_id = access.network_id.to_owned();
                         let message_id = message_id.to_owned();
-                        move |store| store.workspace_input(&network_id, &message_id)
+                        move |store| store.input_evidence(&network_id, &conversation, &message_id)
                     })
-                    .await?
-                    .is_some();
+                    .await?;
                 Ok(
                     json!({"accepted":false,"code":if stored { "input_conflict" } else { "input_not_saved" },
                     "stored":stored,"message_id":message_id,"reason":crate::logging::scrub(&error.to_string())}),

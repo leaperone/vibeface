@@ -2718,6 +2718,40 @@ fn input_from_event(hash: &str, event: Event) -> Result<Option<WorkspaceInput>> 
         _ => None,
     })
 }
+fn input_evidence_from(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    message_id: &str,
+) -> Result<bool> {
+    let retained: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE network_id=?1 AND kind='input_posted' AND subject=?2)
+         OR EXISTS(SELECT 1 FROM scheduler_jobs WHERE conversation_id=?3 AND (message_id=?2 OR trigger=?4))
+         OR EXISTS(SELECT 1 FROM identity_meta WHERE key=?5)",
+        params![network, message_id, conversation, crate::scheduling::message_trigger(message_id), format!("workspace-input-admission:{network}:{message_id}")],
+        |row| row.get(0),
+    )?;
+    if retained
+        || super::admission::input_delivery_evidence_from(
+            connection,
+            network,
+            conversation,
+            message_id,
+        )?
+    {
+        return Ok(true);
+    }
+    let mut query = connection.prepare("SELECT envelope FROM pending_events WHERE network_id=?")?;
+    for row in query.query_map([network], |row| row.get::<_, String>(0))? {
+        let signed: SignedEvent = serde_json::from_str(&row?)?;
+        let event: Event = serde_json::from_str(&signed.canonical_body)?;
+        if matches!(event.body, EventBody::InputPosted { message_id: id, .. } if id == message_id) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn workspace_input_from(
     connection: &Connection,
     network: &str,
@@ -3142,6 +3176,14 @@ impl Store {
     ) -> Result<Option<WorkspaceInput>> {
         workspace_input_from(&self.connection, network, message_id)
     }
+    pub(crate) fn input_evidence(
+        &self,
+        network: &str,
+        conversation: &str,
+        message_id: &str,
+    ) -> Result<bool> {
+        input_evidence_from(&self.connection, network, conversation, message_id)
+    }
     pub fn workspace_task(&self, network: &str, task_id: &str) -> Result<Option<WorkspaceTask>> {
         workspace_task_from(&self.connection, network, task_id)
     }
@@ -3224,6 +3266,10 @@ impl Store {
             tx.commit()?;
             return Ok(existing);
         }
+        ensure!(
+            !input_evidence_from(&tx, network, &resolved.conversation_id, &input.message_id)?,
+            "input has retained history or delivery evidence; reconcile it before retrying"
+        );
         ensure!(
             resolved.task_revision == input.route.expected_revision,
             "input task revision changed"

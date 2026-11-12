@@ -14,6 +14,8 @@ export type OutboxItem = {
   /** Local message bytes stay here until the Node has the signed input. */
   uploads?: { hash: string; size: number; name: string; data: string }[]
   delivery?: 'saved' | 'uploading' | 'submitting' | 'accepted' | 'unknown'
+  /** Bound before the first message call; an uncertain request never changes entry. */
+  entry_device_id?: string
   receipt?: InputReceipt
   release_expected_event?: string
   release_command_id?: string
