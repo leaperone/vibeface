@@ -401,9 +401,16 @@ mod tests {
             .is_err()
         );
         std::fs::remove_file(&path)?;
+        let inherited_lock = plan._lock.try_clone()?;
         drop(plan);
         assert!(IdentityPlan::load(&key, "wrong password").is_err());
-        let mut reopened = IdentityPlan::load(&key, "recovery password")?;
+        let mut reopened = IdentityPlan::load(&key, "recovery password")
+            .context("a dropped plan must release its lock while a duplicate stays open")?;
+        drop(inherited_lock);
+        assert!(
+            IdentityPlan::load(&key, "recovery password").is_err(),
+            "closing a stale duplicate must not unlock the current plan"
+        );
         assert_eq!(
             std::fs::read(&path)?,
             bytes,
