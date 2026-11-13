@@ -79,6 +79,7 @@ jobs:
         with:
           key: gpui-native-prepare
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Resolve workspace additions while preserving locked third-party packages
         id: lockfile
         run: |

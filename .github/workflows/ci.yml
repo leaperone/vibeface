@@ -239,7 +239,9 @@ jobs:
         with: {persist-credentials: false}
       - uses: ./.github/actions/native-desktop
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
-        with: {key: gpui-feature-check}
+        with:
+          key: gpui-feature-check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check and test the native desktop host
         run: |
           cargo fmt --all -- --check
@@ -261,7 +263,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: check
-          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check affected crates with Clippy and optional minimum Rust version
         env:
           CI_PLAN: ${{ needs.plan.outputs.plan }}
@@ -286,7 +288,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: test-opt1
-          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run affected Rust tests except the exact heavy scenarios
         env:
           CI_PLAN: ${{ needs.plan.outputs.plan }}
@@ -318,7 +320,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: test-opt1
-          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run the exact heavy Node scenarios
         env:
           CI_PLAN: ${{ needs.plan.outputs.plan }}
@@ -353,7 +355,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: delivery
-          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: |
             . -> .artifacts/vdp/domain-target
             crates/delivery/proof -> ../../../.artifacts/vdp/proof-target
@@ -420,7 +422,7 @@ jobs:
           workspaces: |
             . -> target
             tests/fixtures/delivery-probe -> ../../../.artifacts/delivery-probe/target
-          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
@@ -562,9 +564,10 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         with:
           apply: 'true'
-      - name: Cache Chromium binaries
+      - name: Restore Chromium binaries
+        id: chromium
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
         with:
           path: .artifacts/e2e/browsers
           key: ${{ matrix.runner }}-${{ runner.arch }}-chromium-${{ hashFiles('pnpm-lock.yaml') }}
@@ -579,6 +582,12 @@ jobs:
           pnpm test:e2e:check
           pnpm exec e2e-web install chromium --with-deps
           pnpm test:e2e
+      - name: Save Chromium binaries from main
+        if: matrix.target == 'x86_64-unknown-linux-gnu' && github.ref == 'refs/heads/main' && steps.chromium.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: .artifacts/e2e/browsers
+          key: ${{ steps.chromium.outputs.cache-primary-key }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: ${{ !cancelled() && matrix.target == 'x86_64-unknown-linux-gnu' }}
         with:

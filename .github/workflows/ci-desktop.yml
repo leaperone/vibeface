@@ -46,7 +46,7 @@ jobs:
         with:
           key: gpui-native-${{ inputs.target }}
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/msvc-environment
         if: runner.os == 'Windows'
       - name: Select this platform's Python
