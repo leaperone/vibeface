@@ -280,7 +280,7 @@ native config 默认关闭 trace 和整段 video。原始日志、自动失败�
 Desktop 使用 GPUI。浏览器和手机 e2e 保留各自的配置，不把网页通过当作 Desktop 验收。
 
 ```sh
-cargo test -p vibeface-desktop --locked
+cargo test -p vibeface-desktop --features native-ui-tests --locked
 VIBEFACE_E2E_DESKTOP_APP=<absolute-packaged-executable-or-mac-app> \
 VIBEFACE_E2E_DESKTOP_RUNTIME=<absolute-sealed-runtime-directory> \
 pnpm exec e2e run --config tests/e2e/e2e.native-desktop.config.ts
