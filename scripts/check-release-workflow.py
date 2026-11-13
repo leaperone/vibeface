@@ -75,9 +75,11 @@ PARTS = {
 
 def check(source, helpers):
     workflow = jobs(source)
+    allowed_auto = {'deploy-published-product'}
     require(not any('deploy' in name or 'dispatches' in block or 'scripts/deploy.py' in block or 'scripts/deploy-run.py' in block
                     or './.github/workflows/deploy-' in block
-                    for name, block in workflow.items()), 'artifact publication must not deploy services')
+                    for name, block in workflow.items() if name not in allowed_auto),
+            'artifact publication must not deploy services before its complete-release gate')
     require('release-${{ inputs.tag || github.ref_name }}-' in source,
             'tag pushes and manual publication must share the same concurrency group')
     identity = workflow['identity']
@@ -206,6 +208,7 @@ def check(source, helpers):
     require(needs(npm) == {'identity', 'collect', 'publish-product'}
             and "needs.publish-product.result == 'success'" in guard(npm),
             'npm publication must wait for the completed product release')
+    check_auto_dispatch(workflow['deploy-published-product'], 'product')
     return workflow
 
 
@@ -225,12 +228,18 @@ def check_identity_helper(source):
 
 def check_website(source):
     workflow = jobs(source)
-    require(set(workflow) == {'identity', 'static', 'collect', 'publish'},
-            'website publication must have its own four-job DAG')
+    require(set(workflow) == {'identity', 'static', 'collect', 'publish', 'deploy-published-www'},
+            'website publication must have its own publication and deployment DAG')
     require("tags: ['www-v*']" in source and 'inputs.app' not in source
             and 'scripts/release-entry.py --app www' in workflow['identity'],
             'website entry must select only the independent website identity')
-    require('deploy' not in source and 'contents: write' not in workflow['static']
+    auto = workflow['deploy-published-www']
+    publication = source.replace('  deploy-published-www:\n' + auto, '')
+    require('deploy' not in publication and 'dispatches' not in publication
+            and 'scripts/deploy.py' not in publication and 'scripts/deploy-run.py' not in publication
+            and './.github/workflows/deploy-' not in publication,
+            'website publication must not deploy services before its complete-release gate')
+    require('contents: write' not in workflow['static']
             and 'contents: write' not in workflow['collect'],
             'website production must not deploy or write a public release')
     require(needs(workflow['static']) == {'identity'}
@@ -264,6 +273,38 @@ def check_website(source):
         if step.startswith('uses: actions/download-artifact@'):
             require('artifact-ids:' in step and 'pattern:' not in step and 'run-id:' not in step,
                     'website must consume its same-run immutable artifacts')
+    check_auto_dispatch(workflow['deploy-published-www'], 'www')
+
+
+def check_auto_dispatch(block, kind):
+    publisher = 'publish-product' if kind == 'product' else 'publish'
+    workflow = 'deploy-product.yml' if kind == 'product' else 'deploy-www.yml'
+    require(needs(block) == {'identity', publisher},
+            kind + ' deployment must wait for its identity and complete publisher')
+    expression = guard(block)
+    require("needs.identity.outputs.publish == 'true'" in expression
+            and f"needs.{publisher}.result == 'success'" in expression,
+            kind + ' deployment must require a successful real publication')
+    good = {publisher: 'success'}
+    require(evaluate(expression, good), kind + ' deployment cannot run after a complete publication')
+    for result in ('failure', 'cancelled', 'skipped'):
+        require(not evaluate(expression, {publisher: result}),
+                kind + ' deployment accepts an incomplete publication')
+    require('runs-on: ubuntu-24.04' in block
+            and 'actions: write' in block and 'contents: read' in block
+            and 'contents: write' not in block,
+            kind + ' deployment must use only Actions dispatch permission')
+    require('GH_TOKEN: ${{ github.token }}' in block
+            and 'RELEASE_TAG: ${{ needs.identity.outputs.tag }}' in block,
+            kind + ' deployment must pass the exact release tag through the token boundary')
+    require(f'gh workflow run {workflow}' in block
+            and '--repo "$GITHUB_REPOSITORY"' in block
+            and '--ref main' in block
+            and '--raw-field "tag=$RELEASE_TAG" --raw-field apply=true' in block,
+            kind + ' deployment must dispatch the fixed entry from main with apply=true')
+    require(block.count('gh workflow run ') == 1
+            and 'scripts/deploy.py' not in block and 'scripts/deploy-run.py' not in block,
+            kind + ' deployment must have one fixed dispatch command')
 
 
 def self_test(source, helpers, website, entry):
@@ -291,6 +332,10 @@ def self_test(source, helpers, website, entry):
         source.replace('scripts/release.py publish product .artifacts/release', 'scripts/release.py publish www .artifacts/release'),
         source.replace('scripts/release.py fail-product', 'scripts/release.py publish product .artifacts/release'),
         source.replace("if: failure() && needs.release-start.result == 'success'", 'if: always()'),
+        source.replace("needs.publish-product.result == 'success'", 'true'),
+        source.replace('gh workflow run deploy-product.yml', 'gh workflow run deploy-www.yml'),
+        source.replace('--ref main', '--ref github.ref_name'),
+        source.replace('actions: write', 'contents: read', 1),
     ]
     broken_helpers = [helper.replace('artifact-ids: ${{ inputs.artifact_id }}', 'pattern: release-*'),
                       helper.replace('actions: read', 'contents: read'),
@@ -319,6 +364,12 @@ def self_test(source, helpers, website, entry):
         website.replace('artifact-ids: ${{ needs.static.outputs.artifact_id }}', 'pattern: static-*'),
         website.replace('scripts/release.py publish www .artifacts/release',
                         'scripts/release.py publish product .artifacts/release'),
+        website.replace('      - name: Collect website assets without rebuilding',
+                        '      - name: Inject deployment\n        run: gh workflow run deploy-product.yml\n      - name: Collect website assets without rebuilding'),
+        website.replace("needs.publish.result == 'success'", 'true'),
+        website.replace('gh workflow run deploy-www.yml', 'gh workflow run deploy-product.yml'),
+        website.replace('--ref main', '--ref github.ref_name'),
+        website.replace('actions: write', 'contents: read', 1),
     ):
         require(candidate != website, 'website mutation did not reach the workflow')
         with TestCase().assertRaises((ValueError, KeyError), msg='Unsafe website gate was accepted'):
@@ -409,7 +460,7 @@ def main():
                 with TestCase().assertRaises(ValueError, msg='unsafe fixed deployment entry was accepted'):
                     check_deployment(deployment, {**entries, service: candidate})
     print('Release DAG passed: parallel native, desktop, Web and Android producers, per-platform composition, '
-          'exact artifacts, progressive uploads and complete-only automatic consumption')
+          'exact artifacts, progressive uploads and complete-only publication with automatic deployment dispatch')
 
 
 if __name__ == '__main__':

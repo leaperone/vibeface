@@ -7,7 +7,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 `.github/workflows/ci.yml` 使用 `scripts/ci.py` 选择检查范围、Rust 测试分组和必需任务。常规 CI 运行生成计划，`ci-gate` 要求选中的任务全部成功。没有顶层 `paths` 筛选。
 
-开发分支的 PR 不触发 GitHub Actions，也不要求 CI 状态；需要远端验证时手动运行 `CI / Core`。Actions 只保留核心 CI、发布和部署入口：桌面四平台、Windows native、移动端构建与验收、原生诊断和付费交付实验入口已移除，iOS 模拟器等界面验收不在 CI 中运行。`CI / Core` 由 `main` push、手动运行或 merge queue 触发，不含定时入口。产品 tag 交给 `release.yml` 构建完整产品，官网 tag 交给 `release-www.yml`。合并、CI 通过、发布和部署各有自己的验收结果。
+开发分支的 PR 不触发 GitHub Actions，也不要求 CI 状态；需要远端验证时手动运行 `CI / Core`。Actions 只保留核心 CI、发布和部署入口：桌面四平台、Windows native、移动端构建与验收、原生诊断和付费交付实验入口已移除，iOS 模拟器等界面验收不在 CI 中运行。`CI / Core` 由 `main` push、手动运行或 merge queue 触发，不含定时入口。产品 tag 交给 `release.yml` 构建完整产品，官网 tag 交给 `release-www.yml`；完整 Release 发布后由对应发布工作流自动派发部署。合并、CI 通过、发布和部署各有自己的验收结果。
 
 ## 按用途选择 Actions 入口
 
@@ -17,10 +17,10 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | --- | --- | --- | --- |
 | `ci.yml` | CI / Core | main push、merge queue、手动、复用调用 | 自动按累计差异选核心检查；手动与复用调用执行扩展检查 |
 | `hourly.yml` | Release / Hourly | 每小时、手动 | 为最新 CI 通过的 main 提交创建当小时 Hourly Tag 并派发产品发布；不运行 Core 检查 |
-| `release.yml` | Release / Product | `v*` push、手动 | 固定产品组；手动默认只构建 |
-| `release-www.yml` | Release / Website | `www-v*` push、手动 | 固定官网组；手动默认只构建 |
+| `release.yml` | Release / Product | `v*` push、手动 | 固定产品组；完整发布后自动派发 Node + App，手动默认只构建 |
+| `release-www.yml` | Release / Website | `www-v*` push、手动 | 固定官网组；完整发布后自动派发官网，手动默认只构建 |
 | `npm-publish.yml` | Release / npm Hourly | 产品发布调用、手动 | 验证完整产品发布的原始 npm 制品；手动默认只验证 |
-| `deploy-node.yml`、`deploy-app.yml`、`deploy-www.yml`、`deploy-product.yml` | Deploy / Node、Web App、Website、Product services | 手动 | 固定目标部署，`tag` 必填，`apply=false` 默认构建验证与排练 |
+| `deploy-node.yml`、`deploy-app.yml`、`deploy-www.yml`、`deploy-product.yml` | Deploy / Node、Web App、Website、Product services | 自动派发或手动 | 固定目标部署，`tag` 必填；手动运行 `apply=false` 默认构建验证与排练 |
 
 `_ci-crypto.yml` 与 `_ci-web.yml` 仅供复用，不是手动入口。部署入口统一调用 `deploy-services.yml`，由它持有全局部署锁。`ci.yml` 的 `package_policy` 仅供复用调用，允许 `standard` 或 `linux-native`；公开手动 Core 入口没有模式参数。
 
@@ -30,8 +30,8 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | 本地相关检查 | `ci.py plan`、选中包的检查与进程专项 | 核对本次改动涉及的行为 |
 | PR 验收 | 独立工作树和同一个 PR，创建后及最终 HEAD 执行 `preflight --no-merge` | 检查固定 base、HEAD、范围及必要证据，不自动合并 |
 | 合并后检查 | 经明确授权合并，再核对 `main` 的 `ci-gate` | 证明该运行选中的检查成功，不发布应用 |
-| 制品发布 | 显式产品或官网 Tag 与各自发布入口 | 校验产品制品和发布记录，不更新线上服务 |
-| 服务部署 | 独立 deploy 命令与对应部署 workflow | 消费已发布版本，核对实际运行版本和服务行为 |
+| 制品发布 | 显式产品或官网 Tag 与各自发布入口 | 校验产品制品和发布记录；完整 Release 发布后自动派发部署 |
+| 服务部署 | 自动派发或独立 deploy 命令与对应部署 workflow | 消费已发布版本，核对实际运行版本和服务行为 |
 
 ## main 与 merge queue 的核心检查
 
@@ -165,7 +165,7 @@ Linux 组包 cache 另外覆盖独立 probe workspace 的 `.artifacts/delivery-p
 
 CI 不使用真实 AI Provider 或模型密钥。各模式都使用受控 SDK 和 App Server 夹具，`--phase5` 不启动 App Server。模拟协议通过不能证明真实模型理解需求或正确选择工具。
 
-产品 `v<version>` 与官网 `www-v<version>` 分别进入发布路径，必须匹配声明版本，并通过同一共享来源门验证 main 源码或受信机械 Hourly 提交。产品并行构建 Web、四个原生目标、Android 和 iOS，各平台再按自身输入组包并构建桌面 App。每组校验后立即向同一个公开 Release 追加附件，完整审计完成后才追加全局 `release.json`。`publish=false` 手动入口只验证并生成制品。产品与官网制品发布不触发部署；独立部署命令可显式选择已发布的 Stable、RC 或 Hourly Tag；派发成功不代表部署成功。详见 [构建与发布](releasing.md)。
+产品 `v<version>` 与官网 `www-v<version>` 分别进入发布路径，必须匹配声明版本，并通过同一共享来源门验证 main 源码或受信机械 Hourly 提交。产品并行构建 Web、四个原生目标、Android 和 iOS，各平台再按自身输入组包并构建桌面 App。每组校验后立即向同一个公开 Release 追加附件，完整审计完成后才追加全局 `release.json`。`publish=false` 手动入口只验证并生成制品。完整 Release 发布后，对应发布工作流按 Tag 自动派发产品或官网部署；独立部署命令仍可显式选择已发布的 Stable、RC 或 Hourly Tag；派发成功不代表部署成功。详见 [构建与发布](releasing.md)。
 
 ## 本地按改动补充验收
 

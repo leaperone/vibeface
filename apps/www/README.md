@@ -25,6 +25,6 @@ pnpm --filter vibeface-www run test:e2e
 
 The deployable files are in `apps/www/dist/client`. Serve that directory with a static server to review deep links such as `/docs/install/`. The portal reuses the logo from `apps/app/public/icon.svg` in `public/logo.svg`, including the document navigation and favicon.
 
-`python3 scripts/deploy.py release --service www --tag www-v<version>` deploys an existing website release through this repository’s `deploy-services.yml`. Publishing a tag does not deploy. The deployment packages verified website bytes in a static container; no other repository is involved. `apps/www/Dockerfile` remains the source-build container for local development.
+Publishing a complete `www-v<version>` release automatically dispatches the website deployment through this repository’s `deploy-services.yml`. For a retry or explicit rollout, `python3 scripts/deploy.py release --service www --tag www-v<version>` dispatches the same fixed entry. The deployment packages verified website bytes in a static container; no other repository is involved. `apps/www/Dockerfile` remains the source-build container for local development.
 
 The portal does not include the user app, Node runtime, public node, credentials, or private workspace data. The public repository currently exposes hourly product Releases, so the download page links to the GitHub Releases page instead of claiming a stable package.

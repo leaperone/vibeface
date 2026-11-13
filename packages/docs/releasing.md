@@ -5,7 +5,7 @@ description: 了解 Vibeface 的 CI、制品和 Hourly 发布流程。
 
 # 构建与发布
 
-[CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 按改动范围选择 `main` push 的核心检查；开发分支 PR 不触发 Actions，Draft 与 Ready 都不例外。merge queue 执行全工作区核心检查，手动 Core 执行扩展回归。`main` 的常规 CI 只上传 Actions 制品，不创建公开版本。制品发布不触发线上部署。官方服务使用独立的部署命令选择已发布产品 Tag，见[官方服务部署](service-deployments.md)。公开版本在 [Releases](https://github.com/leaperone/vibeface/releases) 下载。具体选择规则见 [按改动选择 CI](ci.md)。
+[CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 按改动范围选择 `main` push 的核心检查；开发分支 PR 不触发 Actions，Draft 与 Ready 都不例外。merge queue 执行全工作区核心检查，手动 Core 执行扩展回归。`main` 的常规 CI 只上传 Actions 制品，不创建公开版本。完整制品 Release 发布后，对应发布工作流自动派发线上部署；官方服务仍使用独立的部署命令选择已发布产品 Tag，见[官方服务部署](service-deployments.md)。公开版本在 [Releases](https://github.com/leaperone/vibeface/releases) 下载。具体选择规则见 [按改动选择 CI](ci.md)。
 
 ## 按产品组合发布
 
@@ -28,15 +28,15 @@ Core、CLI、Web App、Desktop 和 Mobile 共享一个版本、一个 `v<version
 
 `hourly.yml`（Release / Hourly）的 job `hourly` 每小时由 cron 触发，运行协调器 `scripts/hourly.py`。main 固定携带开发版本 `0.0.1-hourly.2026111300`；协调器选择 `ci.yml` push 运行已成功完成的最新 main 提交。该提交不包含最新 Hourly Tag 的 parent 时跳过；等于该 parent 且那次发布正在运行或已成功时也跳过。那次发布失败时用同一提交重建一次当小时新版本；同一提交第二次失败时协调器报错停止，等待修复或 main 的新提交。本 UTC 小时的 Tag 已存在时只核对来源，缺少发布运行时补派发。否则创建一个脱离 main 的 BOT 提交，只改版本字段：全部产品版本文件、`Cargo.lock` 中三个本仓包、Android versionCode（`YYMMDDHH`）与 iOS buildNumber（`YYMM.DD.HH`）。随后创建 `vX.Y.Z-hourly.YYYYMMDDHH` Tag 并派发 `release.yml`。
 
-协调器不等待发布结果，也不补发更早的小时。每小时链路只依赖 main push CI，不运行扩展 Core 的 npm 公开基线升级验收；需要该验收时手动派发扩展 Core。某小时失败时，该 Release 保持缺少 `release.json` 的未完成状态，下一小时发布新版本。Hourly 发布 npm（dist-tag `hourly`），不部署服务，不上传 TestFlight。官网不参与 Hourly，只发布 stable 与 rc。
+协调器不等待发布结果，也不补发更早的小时。每小时链路只依赖 main push CI，不运行扩展 Core 的 npm 公开基线升级验收；需要该验收时手动派发扩展 Core。某小时失败时，该 Release 保持缺少 `release.json` 的未完成状态，下一小时发布新版本。Hourly 发布 npm（dist-tag `hourly`）；产品 Release 完成后自动派发 Node 和 App 部署，不上传 TestFlight。官网不参与 Hourly，只发布 stable 与 rc；官网 Release 完成后自动派发官网部署。
 
 发布来源门：位于 main 的 Tag 要求该提交的 main push CI success；脱离 main 的 Hourly 来源必须恰好是机械版本提交，其唯一 parent 位于 main，且 parent 有 main push CI success。制品、Tag、`source_commit` 与 provenance 绑定实际版本提交，parent 只用于 CI 证明。
 
-## 独立部署发布
+## 自动与手动部署发布
 
-产品和官网发布只交付制品，不推送线上服务。公共节点与 App 使用[官方服务部署](service-deployments.md)中的独立命令，显式选择已经完成发布的产品 Tag。部署端校验最终 `release.json`、源码身份及所选制品字节后，包装和部署容器。它不重新编译产品，也不创建新产品版本。
+产品和官网完整发布后，对应发布工作流中的 `deploy-published-product` 或 `deploy-published-www` job 使用精确 Tag 从 `main` 派发对应部署：产品 Release 部署公共节点和 App，官网 Release 部署官网。公共节点与 App 也可使用[官方服务部署](service-deployments.md)中的独立命令，显式选择已经完成发布的产品 Tag。部署端校验最终 `release.json`、源码身份及所选制品字节后，包装和部署容器。它不重新编译产品，也不创建新产品版本。
 
-官网使用独立命令 `python3 scripts/deploy.py release --service www --tag www-v<version>`。CLI 按目标选择 `deploy-node.yml`、`deploy-app.yml`、`deploy-www.yml` 或 `deploy-product.yml`。入口固定目标，`apply=false` 默认构建验证与排练，统一调用本仓库的 `deploy-services.yml`，由它持有全局锁。`all` 仍将 Node 与 App 作为同一可观察批次。命令成功不代表上线，必须跟踪运行到终态并验证线上版本。
+官网使用独立命令 `python3 scripts/deploy.py release --service www --tag www-v<version>` 进行补发或手动控制。CLI 按目标选择 `deploy-node.yml`、`deploy-app.yml`、`deploy-www.yml` 或 `deploy-product.yml`。入口固定目标，`apply=false` 默认构建验证与排练，统一调用本仓库的 `deploy-services.yml`，由它持有全局锁。`all` 仍将 Node 与 App 作为同一可观察批次。自动或手动派发成功不代表上线，必须跟踪运行到终态并验证线上版本。
 
 ## 可下载的包
 
@@ -110,7 +110,7 @@ pnpm --filter vibeface-www run build
 pnpm --filter vibeface-www run check:static
 ```
 
-产物在 `apps/www/dist/client`。CI 的 `www-<SHA>` artifact 包含相同目录，可用于审核或后续静态部署；官网制品发布后，独立 deploy 命令在本仓库部署所选版本。命令成功不代表站点已经上线，仍需检查该运行的部署结果和线上页面。门户配置与验收命令见 [`apps/www/README.md`](../../apps/www/README.md)。
+产物在 `apps/www/dist/client`。CI 的 `www-<SHA>` artifact 包含相同目录，可用于审核或后续静态部署；官网完整制品发布后，`deploy-published-www` job 自动派发本仓库的官网部署，独立 deploy 命令可用于补发或手动控制。命令成功不代表站点已经上线，仍需检查该运行的部署结果和线上页面。门户配置与验收命令见 [`apps/www/README.md`](../../apps/www/README.md)。
 
 ## 显式发布版本
 
