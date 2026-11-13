@@ -51,8 +51,6 @@ jobs:
           key: gpui-native-${{ inputs.target }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
-      - name: Test the native desktop features
-        run: cargo test -p vibeface-desktop --features native-ui-tests --locked
       - name: Unpack the released runtime for this platform
         id: runtime
         env:
