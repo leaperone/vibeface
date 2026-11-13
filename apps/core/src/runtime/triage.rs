@@ -9743,6 +9743,11 @@ pub(super) mod tests {
             // was found, so a chat message steered into its turn and the reads go there too.
             node.codex.set_user_socket(None);
             assert_eq!(node.codex.user_thread("t-user"), Some(user_socket.clone()));
+            // A new send follows the cleared setting and is refused.
+            assert!(matches!(
+                node.codex.locate("t-user").await,
+                vibeface_control::agent::ThreadAt::Missing { .. }
+            ));
             use super::super::executor::{Executor as _, SteerAck, SteerInput, SteerTrace};
             let into = crate::scheduling::SteerTarget {
                 provider: Provider::Codex,

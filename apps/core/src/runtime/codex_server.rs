@@ -199,6 +199,15 @@ impl CodexServer {
             let reply = user_request(&socket, "thread/read", params).await?;
             return Ok((reply, Some(socket)));
         }
+        self.look_up(thread, params).await
+    }
+
+    /// Reads `thread` on the Node's App Server, else on the user's own Codex as now set.
+    async fn look_up(
+        &self,
+        thread: &str,
+        params: Value,
+    ) -> Result<(Value, Option<PathBuf>), CodexError> {
         let user = self.user.lock().expect("user codex").socket.clone();
         match (
             self.client.request("thread/read", params.clone()).await,
@@ -218,8 +227,21 @@ impl CodexServer {
     }
 
     /// Which App Server has `thread`, for a send into it.
+    /// A new send follows the settings as they are now: a thread remembered on another socket
+    /// than the one set is looked up again, while its running work stays where it was found.
     pub(crate) async fn locate(&self, thread: &str) -> ThreadAt {
-        match self.read(thread, json!({"threadId":thread})).await {
+        let params = json!({"threadId":thread});
+        let current = {
+            let user = self.user.lock().expect("user codex");
+            user.threads
+                .get(thread)
+                .is_none_or(|socket| user.socket.as_ref() == Some(socket))
+        };
+        let read = match current {
+            true => self.read(thread, params).await,
+            false => self.look_up(thread, params).await,
+        };
+        match read {
             Ok((_, None)) => ThreadAt::Node,
             Ok((_, Some(socket))) => ThreadAt::User { socket },
             Err(error) if error.missing_thread() => ThreadAt::Missing {
