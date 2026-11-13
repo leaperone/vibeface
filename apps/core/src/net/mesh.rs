@@ -313,7 +313,7 @@ fn recent<'a>(table: &'a Table, own: &str, allow_private: bool) -> Vec<&'a Entry
     prioritize_online(known, now_ms())
 }
 
-fn prioritize_online<'a>(mut entries: Vec<&'a Entry>, now_ms: u64) -> Vec<&'a Entry> {
+fn prioritize_online(mut entries: Vec<&Entry>, now_ms: u64) -> Vec<&Entry> {
     entries.sort_by_key(|entry| (!entry.online(now_ms), Reverse(entry.last_seen_ms)));
     entries.truncate(CANDIDATES);
     entries
