@@ -255,6 +255,40 @@ pub async fn run(options: Update) -> Result<()> {
             ),
         }
     }
+    let action = match &options.action {
+        Action::Check(_) => Some("check"),
+        Action::Apply { .. } => Some("apply"),
+        Action::Configure { .. } | Action::Status(_) => None,
+    };
+    let result = act(options, data.clone()).await;
+    if let (Some(action), Err(error)) = (action, &result) {
+        let error: String = format!("{error:#}").chars().take(2_000).collect();
+        report(
+            &data,
+            "error",
+            "update.failed",
+            "update failed",
+            serde_json::json!({"action":action,"error":error}),
+        )
+        .await;
+    }
+    result
+}
+
+/// Puts an update's outcome in `node.log` the way `vibeface log` does, through the running Node,
+/// which redacts it. With no Node answering, the outcome stays in the updater's own output.
+async fn report(data: &Path, level: &str, event: &str, message: &str, fields: serde_json::Value) {
+    let local = crate::LocalNode {
+        data_dir: data.to_owned(),
+        node_url: None,
+    };
+    let body = serde_json::json!({"source":"cli","records":[
+        {"level":level,"event":event,"message":message,"fields":fields}
+    ]});
+    let _ = crate::post_local(&local, "/api/log", &body, Duration::from_secs(5)).await;
+}
+
+async fn act(options: Update, data: PathBuf) -> Result<()> {
     match options.action {
         Action::Status(_) => {
             let policy = policy(&data)?;
@@ -301,6 +335,15 @@ pub async fn run(options: Update) -> Result<()> {
             let current = manifest(&installed(&policy.install_root)?)?.version;
             let latest = release::check(policy.channel).await?;
             let newer = latest.as_ref().filter(|r| r.version > current);
+            report(
+                &data,
+                "info",
+                "update.checked",
+                "update checked",
+                serde_json::json!({"channel":policy.channel,"current_version":current,
+                    "available_version":newer.map(|r|&r.version)}),
+            )
+            .await;
             println!(
                 "{}",
                 serde_json::json!({"channel":policy.channel,"current_version":current,
@@ -322,6 +365,15 @@ pub async fn run(options: Update) -> Result<()> {
                 .await?
                 .filter(|r| r.version > current)
             else {
+                report(
+                    &data,
+                    "info",
+                    "update.checked",
+                    "update checked",
+                    serde_json::json!({"channel":policy.channel,"current_version":current,
+                        "available_version":null}),
+                )
+                .await;
                 println!("No newer release is available in the selected channel.");
                 return Ok(());
             };
@@ -336,6 +388,15 @@ pub async fn run(options: Update) -> Result<()> {
             let lease = match maintenance::acquire(&inspected.maintenance_socket).await {
                 Ok(lease) => lease,
                 Err(error) if error.downcast_ref::<maintenance::Busy>().is_some() => {
+                    report(
+                        &data,
+                        "info",
+                        "update.deferred",
+                        "update deferred until the Node is idle",
+                        serde_json::json!({"current_version":current,
+                            "available_version":latest.version,"reason":format!("{error:#}")}),
+                    )
+                    .await;
                     println!("Update deferred; the node could not become idle: {error:#}");
                     return Ok(());
                 }
@@ -385,6 +446,14 @@ pub async fn run(options: Update) -> Result<()> {
                     ),
                 }
             }
+            report(
+                &data,
+                "info",
+                "update.applied",
+                "update applied",
+                serde_json::json!({"previous_version":current,"version":latest.version}),
+            )
+            .await;
             println!(
                 "Updated to {}. Backup: {}",
                 latest.version,
