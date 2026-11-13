@@ -44,6 +44,12 @@ struct Plan {
     checkpoint: Option<RootCheckpoint>,
     state: IdentityOperationState,
 }
+struct IdentityLock(std::fs::File);
+impl Drop for IdentityLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
 impl Plan {
     fn backup_sha256(&self) -> String {
         hex::encode(Sha256::digest(&self.backup_bytes))
@@ -86,14 +92,14 @@ pub struct IdentityPlan {
     dir: PathBuf,
     plan: Plan,
     password: Zeroizing<String>,
-    _lock: std::fs::File,
+    _lock: IdentityLock,
 }
 impl IdentityPlan {
-    fn lock(key: &ClientKey) -> Result<std::fs::File> {
+    fn lock(key: &ClientKey) -> Result<IdentityLock> {
         let lock = privatefs::open_or_create(&key.dir.join("identity-operation.lock"))?;
         lock.try_lock()
             .context("identity operation is open in another process or window")?;
-        Ok(lock)
+        Ok(IdentityLock(lock))
     }
     pub fn exists(key: &ClientKey) -> bool {
         key.dir.join(PLAN_FILE).exists()
@@ -577,9 +583,16 @@ mod tests {
             .is_err()
         );
         std::fs::remove_file(&path)?;
+        let inherited_lock = plan._lock.0.try_clone()?;
         drop(plan);
         assert!(IdentityPlan::load(&key, "wrong password").is_err());
-        let mut reopened = IdentityPlan::load(&key, "recovery password")?;
+        let mut reopened = IdentityPlan::load(&key, "recovery password")
+            .context("a dropped plan must release its lock while a duplicate stays open")?;
+        drop(inherited_lock);
+        assert!(
+            IdentityPlan::load(&key, "recovery password").is_err(),
+            "closing a stale duplicate must not unlock the current plan"
+        );
         assert_eq!(
             std::fs::read(&path)?,
             bytes,
