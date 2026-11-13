@@ -61,9 +61,9 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 | `conversation_id`、`work_id`、`thread_id` | 知道时才有 |
 | `fields` | 其余字段 |
 
-默认级别是 Vibeface 的 info 和依赖库的 warn；启动 Node 和 `update` 之外的命令不显示依赖库日志。iroh 的连接握手（`iroh::protocol`）和 gossip 拨号（`iroh_gossip::net`）只记 error：陌生设备握手失败、对端不在线都属常态，对端和邻居的上下线看 `peer.*` 与 `mesh.*`，Vibeface 自己处理连入连接时出的错记为 `net.accept_failed`。可用 `RUST_LOG` 环境变量调整，例如 `RUST_LOG=warn,vibeface=debug`；要看回这两类握手告警，用 `RUST_LOG=warn,vibeface=info,vibeface_bridge=info`。前台在终端运行时日志同时以文本打印到终端。`node.log` 写到 8 MiB 时改名为 `node.log.1`，旧文件依次后移，共保留 5 个。
+默认级别是 Vibeface 的 info 和依赖库的 warn；启动 Node 和 `update` 之外的命令不显示依赖库日志。iroh 的连接处理（`iroh::protocol`）和 gossip 网络层（`iroh_gossip::net`，含拨号、发送队列满和解码失败，`iroh_gossip::net::util` 除外）只记 error：陌生设备握手失败、对端不在线都属常态，对端和邻居的上下线看 `peer.*` 与 `mesh.*`，Vibeface 自己处理连入连接时出的错记为 `net.accept_failed`。可用 `RUST_LOG` 环境变量调整，例如 `RUST_LOG=warn,vibeface=debug`；要看回这两类握手告警，用 `RUST_LOG=warn,vibeface=info,vibeface_bridge=info`。前台在终端运行时日志同时以文本打印到终端。`node.log` 写到 8 MiB 时改名为 `node.log.1`，旧文件依次后移，共保留 5 个。
 
-重复的记录会合并。同一来源、事件和三个 ID 下，与上一条级别、说明和 `fields` 都相同的记录，60 秒内再次出现时不再逐条写入；同一事件说了不同的内容（例如对端从离线回到在线）时，先补写前一条的计数再写新记录，状态切换按发生顺序出现。窗口结束时补一条同样的记录，`fields` 多出三项：
+重复的记录会合并。来源、级别、事件、说明、三个 ID 和 `fields` 都相同的记录，60 秒内再次出现时不再逐条写入；只在状态变化时记的 `peer.online`、`peer.offline`、`mesh.neighbor_up`、`mesh.neighbor_down`、`sync.write_state` 和 `work.state` 不合并，每次变化都立即写入。窗口结束时补一条同样的记录，`fields` 多出三项：
 
 | 字段 | 含义 |
 |---|---|

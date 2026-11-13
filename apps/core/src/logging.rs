@@ -28,6 +28,16 @@ pub const MAX_READ: usize = 20_000;
 pub const REPEAT_WINDOW_MS: i64 = 60_000;
 /// Records whose repeats are counted at once; the oldest gives way to a new one.
 pub const MAX_REPEATS: usize = 256;
+/// Events logged only when a state changes, so a copy means the state flipped back: held as a
+/// repeat, the latest state would read wrong until its window ended.
+const STATE_EVENTS: &[&str] = &[
+    "peer.online",
+    "peer.offline",
+    "mesh.neighbor_up",
+    "mesh.neighbor_down",
+    "sync.write_state",
+    "work.state",
+];
 static PRIVATE_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
 pub fn add_private_path(path: &Path) {
@@ -124,24 +134,6 @@ pub struct Record {
 }
 
 impl Record {
-    /// Whether `other` is about the same thing: the same event from the same source for the
-    /// same conversation, work and thread, whatever it says.
-    fn same_subject(&self, other: &Record) -> bool {
-        (
-            self.source,
-            &self.event,
-            &self.conversation_id,
-            &self.work_id,
-            &self.thread_id,
-        ) == (
-            other.source,
-            &other.event,
-            &other.conversation_id,
-            &other.work_id,
-            &other.thread_id,
-        )
-    }
-
     /// Whether `other` says the same thing, whenever it was said.
     fn repeats(&self, other: &Record) -> bool {
         let Record {
@@ -325,20 +317,18 @@ impl Sink {
         Ok(())
     }
 
-    /// Writes `record`, unless the last record about the same subject, written within the last
-    /// [`REPEAT_WINDOW_MS`], said the same: that copy is counted, and one line with the count
-    /// follows when the window ends. A record that says something else about the subject ends
-    /// its window first, so a state that flips back is written in order, not held.
+    /// Writes `record`, unless one written within the last [`REPEAT_WINDOW_MS`] said the same:
+    /// that copy is counted, and one line with the count follows when the window ends. A
+    /// [`STATE_EVENTS`] record is always written when it comes.
     pub fn write(&self, record: &Record) {
         let mut repeats = self.repeats.lock().expect("log repeats");
         self.end_windows(&mut repeats, record.ts_ms, false);
-        repeats.retain(|repeat| {
-            if repeat.record.same_subject(record) && !repeat.record.repeats(record) {
-                self.write_count(repeat, record.ts_ms);
-                return false;
+        if STATE_EVENTS.contains(&record.event.as_str()) {
+            if let Some(line) = self.line(record) {
+                self.append(&line);
             }
-            true
-        });
+            return;
+        }
         if let Some(repeat) = repeats
             .iter_mut()
             .find(|repeat| repeat.record.repeats(record))
@@ -1223,41 +1213,44 @@ mod tests {
     }
 
     #[test]
-    fn a_subject_that_flips_back_is_written_in_order() {
+    fn a_state_that_flips_back_is_written_when_it_comes() {
         let dir = scratch("log-flip");
         let sink = Sink::open(&dir, MAX_FILE_BYTES, 2).unwrap();
-        let peer = |ts_ms, message: &str| {
-            let mut record = record(ts_ms, Level::Info, Source::Node, message);
-            record.event = "peer".into();
+        let peer = |ts_ms, event: &str| {
+            let mut record = record(ts_ms, Level::Info, Source::Node, event);
+            record.event = event.into();
+            record.fields.insert("peer".into(), json!("x"));
             record
         };
-        for written in [
-            peer(1_000, "online"),
-            peer(2_000, "online"),
-            peer(3_000, "offline"),
-            peer(4_000, "online"),
+        for (ts_ms, event) in [
+            (1_000, "peer.offline"),
+            (2_000, "peer.online"),
+            (3_000, "peer.offline"),
+            (4_000, "peer.online"),
         ] {
-            sink.write(&written);
+            sink.write(&peer(ts_ms, event));
         }
+        sink.settle(100_000, true);
         let lines: Vec<_> = read(&dir, &Filter::default())
             .unwrap()
             .into_iter()
-            .map(|record| (record.ts_ms, record.message, record.fields))
+            .map(|record| {
+                (
+                    record.ts_ms,
+                    record.event,
+                    record.fields.contains_key("repeated"),
+                )
+            })
             .collect();
-        let count = json!({"repeated":1,"first_ms":2_000,"last_ms":2_000});
         assert_eq!(
             lines,
             [
-                (1_000, "online".to_owned(), Map::new()),
-                (
-                    3_000,
-                    "online".to_owned(),
-                    count.as_object().unwrap().clone()
-                ),
-                (3_000, "offline".to_owned(), Map::new()),
-                (4_000, "online".to_owned(), Map::new()),
+                (1_000, "peer.offline".to_owned(), false),
+                (2_000, "peer.online".to_owned(), false),
+                (3_000, "peer.offline".to_owned(), false),
+                (4_000, "peer.online".to_owned(), false),
             ],
-            "the latest state is written when it comes, after the count of the one before"
+            "every change is written when it comes and none is counted"
         );
         fs::remove_dir_all(dir).unwrap();
     }
