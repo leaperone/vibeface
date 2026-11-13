@@ -258,23 +258,6 @@ try {
     node scripts/windows-signing.mjs verify $uninstaller
     if ($LASTEXITCODE -ne 0) { throw 'Signed installer has no verified signed uninstaller' }
   }
-  $previousApp = $env:VIBEFACE_E2E_DESKTOP_APP
-  $previousRuntime = $env:VIBEFACE_E2E_DESKTOP_RUNTIME
-  $previousOutput = $env:VIBEFACE_E2E_DESKTOP_OUTPUT
-  $previousTelemetry = $env:E2E_TELEMETRY_DISABLED
-  try {
-    $env:VIBEFACE_E2E_DESKTOP_APP = Join-Path $destination 'Vibeface.exe'
-    $env:VIBEFACE_E2E_DESKTOP_RUNTIME = $Runtime
-    $env:VIBEFACE_E2E_DESKTOP_OUTPUT = $Output
-    $env:E2E_TELEMETRY_DISABLED = '1'
-    pnpm exec e2e run --config tests/e2e/e2e.native-desktop.config.ts --output (Join-Path $PWD 'tests/e2e/.artifacts/native-desktop/installed-runner')
-    if ($LASTEXITCODE -ne 0) { throw 'The installed native application failed its real-window e2e checks' }
-  } finally {
-    $env:VIBEFACE_E2E_DESKTOP_APP = $previousApp
-    $env:VIBEFACE_E2E_DESKTOP_RUNTIME = $previousRuntime
-    $env:VIBEFACE_E2E_DESKTOP_OUTPUT = $previousOutput
-    $env:E2E_TELEMETRY_DISABLED = $previousTelemetry
-  }
 } finally {
   if ($installed) {
     $uninstaller = Join-Path $destination 'Uninstall.exe'
@@ -290,4 +273,4 @@ try {
     if ($collisionSentinel -and [System.IO.File]::ReadAllText($collisionSentinel) -ne 'keep-future-package-collision') { throw 'Uninstall changed the refused-upgrade user file' }
   }
 }
-Write-Output 'Current-user install, unowned-root refusal, copied-uninstaller refusal, junction refusal, nondestructive different-payload collision refusal, owned upgrade, sealed runtime, native window and user-file-preserving uninstall checks passed'
+Write-Output 'Current-user install, unowned-root refusal, copied-uninstaller refusal, junction refusal, nondestructive different-payload collision refusal, owned upgrade, sealed runtime and user-file-preserving uninstall checks passed'

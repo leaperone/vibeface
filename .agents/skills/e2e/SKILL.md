@@ -1,11 +1,11 @@
 ---
 name: e2e
-description: Write, run and debug Vibeface browser and native end-to-end tests with the installed e2e runner, or inspect its live UI through the project e2e MCP server.
+description: Write, run and debug Vibeface browser and native end-to-end tests with the installed e2e runner, or inspect its live UI through the project e2e MCP server. Use only when the user explicitly asks for e2e tests, screenshots or UI acceptance; never as a default verification step.
 ---
 
 # Vibeface e2e
 
-Use the existing e2e runner and fixtures. Read `packages/docs/e2e.md` for the project commands, isolated Node setup, artifact paths and platform boundaries.
+Run or write e2e only on the user's explicit request. CI and preflight do not run it. Use the existing e2e runner and fixtures. Read `packages/docs/e2e.md` for the project commands, isolated Node setup, artifact paths and platform boundaries.
 
 ## Read the installed guide
 

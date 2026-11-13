@@ -16,11 +16,7 @@ VIBEFACE_E2E_APP_DIR=/absolute/path/to/apps/app/dist/client \
 pnpm test:e2e
 ```
 
-程序的构建步骤见[源码构建](releasing.md#ci-验证范围)。本地默认把 Chromium 下载到 `tests/e2e/.artifacts/browsers/`。Linux CI 先执行以下命令：
-
-```sh
-PLAYWRIGHT_BROWSERS_PATH="$PWD/.artifacts/e2e/browsers" pnpm exec e2e-web install chromium --with-deps
-```
+程序的构建步骤见[源码构建](releasing.md#ci-验证范围)。本地默认把 Chromium 下载到 `tests/e2e/.artifacts/browsers/`。e2e 只在本地运行，CI 不执行。
 
 每项测试创建独立 Node 数据目录，使用随机本机端口，关闭 Codex 会话扫描。默认 fixture 关闭模型执行；`workspaceTest` 启用本次测试的受控 Codex 程序，不连接真实模型。测试结束后停止自己的进程，不连接已有 Node。测试控制口只监听 loopback，认证材料保存在 owner-only 文件。Node 数据和控制文件位于 `.artifacts/e2e/`，runner 日志、报告和下载文件位于 `tests/e2e/.artifacts/`，都不会提交。恢复密码每次随机生成，通过 e2e secrets 传入。
 
@@ -93,7 +89,7 @@ python3 scripts/verify-node.py --delivery-charity \
 
 公开 schema2 bundle 只包含已披露 capsule、公开证明、交易哈希和固定条款。官方 host 对每份 binary receipt 独立验真并拒绝错 journal；`observe-settlement.mjs` 只读同一原链的真实 runtime、canonical 条款/预算/窗口、逐窗 Source/Hold、批次 calldata、事件、余额与 gas。固定源码、CLI/Core 制品摘要、真实进程重启、钱包 lock/off 门禁、披露恢复故障和实际渲染分别留证，任何一层未执行均标未验证。
 
-本轮 proof 构建和新genuine驱动不得放宽原7200秒证明硬界、现有 deadline、11GiB/zero-swap/64PIDs、image/profile 或时钟。界面验收按本文件 e2e 规则执行最小真实表面；源码、类型检查、HTTP200 或合约测试都不代替浏览器/设备证据。操作和安全模型见 [受保护预算](paid-delivery.md)；链上观察格式见 `contracts/delivery/README.md`。
+本轮 proof 构建和新genuine驱动不得放宽原7200秒证明硬界、现有 deadline、11GiB/zero-swap/64PIDs、image/profile 或时钟。需要界面验收时按本文件 e2e 规则执行最小真实表面；源码、类型检查、HTTP200 或合约测试都不代替浏览器/设备证据。操作和安全模型见 [受保护预算](paid-delivery.md)；链上观察格式见 `contracts/delivery/README.md`。
 
 宿主和手动 CI 使用同一个正式入口。先运行纯自检，再提供当前 clean HEAD 的 Linux package 下载目录或已解包目录：
 
@@ -179,7 +175,7 @@ Device Hub 是 Xcode 自带的 Apple 设备管理应用，位于 Xcode 应用包
 3. 真机验收使用明确指定的设备，并先检查配对、开发者模式和签名条件。真机需要签名有效的 `iphoneos` 构建，Simulator `.app` 不能安装到 iPhone。覆盖安装时保留原有身份和数据，不卸载、重置或清除钥匙串。
 4. 安装后实际启动 App，按本次改动验证界面和操作。在任务 planning 的证据目录记录源码提交、构建来源、目标设备和验收结果。设备可用、安装成功和 App 启动成功不能代替功能验收通过。
 
-本地 iPhone 真机、专属模拟器和 CI 创建的模拟器分别记录验收结果。Device Hub 不上传 TestFlight、不发布 App Store，也不替代签名或发布流程。CI 的模拟器创建与 e2e 仍按 workflow 执行，不依赖打开本机 Device Hub。
+本地 iPhone 真机和专属模拟器分别记录验收结果。Device Hub 不上传 TestFlight、不发布 App Store，也不替代签名或发布流程。
 
 ## 验证原生接收和本地文件
 
@@ -250,7 +246,7 @@ pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^provider ' \
 
 队列场景通过真实 Node API 准备一条运行中消息和一条排队消息。原生 UI 取消排队后，再通过原生“停止”结束运行中的消息并释放槽位。独立读取确认运行中的消息调用过一次，被取消的消息始终没有调用，离开再进入聊天后计数保持不变。受控 fixture 不调用真实模型，也不代替手机保存、取消或停止。
 
-native config 默认关闭 trace 和整段 video。原始日志、自动失败截图、e2e report、邀请、恢复文件、Node 数据与 driver 状态都属于私有材料，不能递归上传 `.artifacts/native/`。CI 只上传固定的 `provider.json`、`provider-probe.json`、`provider-initial.png`、`provider-selectable.png`、`provider-controlled.png`、`provider-typed.png` 和 `terminology-device-kinds.png`。`provider-probe.json` 只记录首轮检查的 `link`、`readiness`、`authentication`、`catalog` 和 `checked` 五个固定状态字段。
+native config 默认关闭 trace 和整段 video。原始日志、自动失败截图、e2e report、邀请、恢复文件、Node 数据与 driver 状态都属于私有材料，不能递归上传 `.artifacts/native/`。需要共享时只取固定的 `provider.json`、`provider-probe.json`、`provider-initial.png`、`provider-selectable.png`、`provider-controlled.png`、`provider-typed.png` 和 `terminology-device-kinds.png`。`provider-probe.json` 只记录首轮检查的 `link`、`readiness`、`authentication`、`catalog` 和 `checked` 五个固定状态字段。
 
 `provider-initial.png` 是唯一的配对前诊断图。它只在本次 CI 新建的专属 simulator 上，重新安装、清除钥匙串并启动 App 后主动拍摄，且早于剪贴板写入和邀请输入。用例核对 simulator 文件、实际 UUID、Booted 状态以及包含当前 run ID 和 attempt 的专属名称。此时 App 尚未接收邀请、登录命令或凭证，也没有旧应用数据；初始图只用于查看路由、系统弹窗和空表单。`terminology-device-kinds.png` 在配对后的“添加设备”面板记录节点与客户端分类，其他三张图在配对后的设置页保存。诊断图不代表配对或表单验收通过。导航诊断仅记录固定阶段和已知界面的布尔状态，不输出界面文本、加入链接、命令或剪贴板内容。CI 按固定键与布尔类型校验后，将该诊断并入公开的 `provider.json`，不上传原始页面树或测试日志。最终收据只有在一个目标测试真实通过、fixture 退出、专属 simulator 删除和私有状态清理后才标为 `passed`。
 
@@ -286,4 +282,4 @@ VIBEFACE_E2E_DESKTOP_RUNTIME=<absolute-sealed-runtime-directory> \
 pnpm exec e2e run --config tests/e2e/e2e.native-desktop.config.ts
 ```
 
-Linux 在有图形驱动的 X11/Wayland 会话运行；hosted CI 使用 Xvfb 和 Mesa Vulkan。该配置使用现有 e2e runner 的 tools-only 原生目标，不设置浏览器引擎或 AI 模型；workers 为 1，retries 为 0。测试调用确定性的 OS 窗口驱动，只启动自己持有的程序，使用独立 profile 和受控夹具参数，按 PID 定位 OS 窗口，发送原生键盘输入与 Enter、保存窗口 PNG，并核对 GPUI 输入/焦点/动作回执、无自动 Node、进程树和正常退出。业务、网络未知结果、本机服务、IME、焦点和无障碍仍按 [GPUI 验收矩阵](design/gpui-desktop.md#功能与验收) 分别记录。不得以窗口回执代替完整功能验证。
+Linux 在有图形驱动的 X11/Wayland 会话运行；无图形会话时可用 Xvfb 和 Mesa Vulkan。该配置使用现有 e2e runner 的 tools-only 原生目标，不设置浏览器引擎或 AI 模型；workers 为 1，retries 为 0。测试调用确定性的 OS 窗口驱动，只启动自己持有的程序，使用独立 profile 和受控夹具参数，按 PID 定位 OS 窗口，发送原生键盘输入与 Enter、保存窗口 PNG，并核对 GPUI 输入/焦点/动作回执、无自动 Node、进程树和正常退出。业务、网络未知结果、本机服务、IME、焦点和无障碍仍按 [GPUI 验收矩阵](design/gpui-desktop.md#功能与验收) 分别记录。不得以窗口回执代替完整功能验证。

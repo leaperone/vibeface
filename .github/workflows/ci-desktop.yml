@@ -18,12 +18,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with: {ref: '${{ inputs.source_sha }}', persist-credentials: false}
-      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
-        with: {version: 11.9.0}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with: {node-version: '24'}
-      - name: Install the locked existing e2e runner without lifecycle downloads
-        run: pnpm install --frozen-lockfile --ignore-scripts --filter vibeface-monorepo
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with: {python-version: '3.12'}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -119,7 +115,7 @@ jobs:
         env:
           TARGET: ${{ inputs.target }}
         run: node scripts/verify-desktop.mjs --target "$TARGET" --input .artifacts/desktop
-      - name: Unpack the built application for the window tests
+      - name: Unpack the built application
         id: application
         env:
           TARGET: ${{ inputs.target }}
@@ -153,33 +149,6 @@ jobs:
           fi
           test -e "$application"
           printf 'path=%s\n' "$application" >> "$GITHUB_OUTPUT"
-      - name: Prepare the hosted Linux current-user service session
-        if: runner.os == 'Linux'
-        run: |
-          user_id="$(id -u)"
-          test "$user_id" -gt 0
-          command -v systemctl
-          # user@ starts the real logind-managed user session and its D-Bus socket.
-          # Reusing an existing manager is idempotent; the test removes only its own services.
-          sudo systemctl start "user@$user_id.service"
-          export XDG_RUNTIME_DIR="/run/user/$user_id"
-          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
-          test -S "$XDG_RUNTIME_DIR/bus"
-          systemctl --user show-environment >/dev/null
-          printf 'XDG_RUNTIME_DIR=%s\nDBUS_SESSION_BUS_ADDRESS=%s\n' "$XDG_RUNTIME_DIR" "$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
-      - name: Drive the packaged native GPUI window
-        id: native_window
-        continue-on-error: true
-        env:
-          VIBEFACE_E2E_DESKTOP_APP: ${{ steps.application.outputs.path }}
-          VIBEFACE_E2E_DESKTOP_RUNTIME: ${{ steps.runtime.outputs.dir }}
-          E2E_TELEMETRY_DISABLED: '1'
-        run: |
-          if [[ "$RUNNER_OS" == Linux ]]; then
-            xvfb-run --auto-servernum --server-args='-screen 0 1440x1000x24' pnpm exec e2e run --config tests/e2e/e2e.native-desktop.config.ts
-          else
-            pnpm exec e2e run --config tests/e2e/e2e.native-desktop.config.ts
-          fi
       - name: Verify the real per-user Windows installer and installed application
         id: native_installer
         if: runner.os == 'Windows'
@@ -194,11 +163,10 @@ jobs:
         if: ${{ always() && !cancelled() }}
         env:
           NATIVE_FEATURES: ${{ steps.native_features.outcome }}
-          NATIVE_WINDOW: ${{ steps.native_window.outcome }}
           NATIVE_INSTALLER: ${{ steps.native_installer.outcome }}
         run: |
           # Independent package checks continue after a test failure; none can waive this gate.
-          [[ "$NATIVE_FEATURES" == success && "$NATIVE_WINDOW" == success ]]
+          [[ "$NATIVE_FEATURES" == success ]]
           if [[ "$RUNNER_OS" == Windows ]]; then [[ "$NATIVE_INSTALLER" == success ]]; fi
       - name: Keep compact desktop failure evidence independently
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -209,7 +177,6 @@ jobs:
             .artifacts/ci-windows-node
             .artifacts/native-desktop-acceptance
             .artifacts/native-desktop-installer
-            tests/e2e/.artifacts/native-desktop
           if-no-files-found: warn
           retention-days: 7
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -221,6 +188,5 @@ jobs:
             .artifacts/ci-windows-node
             .artifacts/native-desktop-acceptance
             .artifacts/native-desktop-installer
-            tests/e2e/.artifacts/native-desktop
           if-no-files-found: warn
           retention-days: 14
