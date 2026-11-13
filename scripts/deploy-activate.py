@@ -22,7 +22,7 @@ from unittest import TestCase
 CORE_ROLES = ('node',)
 ROLES = (*CORE_ROLES, 'app', 'www')
 IMAGE = r'sha256:[0-9a-f]{64}'
-VERSION = r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-rc\.[1-9][0-9]*|-nightly\.[0-9]{8}\.[1-9][0-9]*)?'
+VERSION = r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-rc\.[1-9][0-9]*|-hourly\.[0-9]{10})?'
 DOCKER = ['docker', '--host', 'unix:///var/run/docker.sock']
 HEADER_NAMES = {'content-security-policy', 'x-content-type-options', 'x-frame-options',
                 'referrer-policy', 'cache-control', 'x-vibeface-source', 'x-vibeface-version'}

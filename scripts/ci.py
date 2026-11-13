@@ -102,7 +102,7 @@ def local_process_modes(paths, full):
     return [mode for mode, _ in LOCAL_PROCESS_RULES if mode in selected]
 
 
-def make_plan(paths, event="pull_request", ref_type="branch", channel="nightly", *, package_policy="standard"):
+def make_plan(paths, event="pull_request", ref_type="branch", channel="hourly", *, package_policy="standard"):
     scopes = set()
     for path in paths:
         if WEB_UNIT_TEST.fullmatch(path):
@@ -126,7 +126,7 @@ def scope_plan(scopes, event, ref_type, channel, *, package_policy="standard"):
         scopes - {"full", "docs", "web", "web-tests", "www", "mobile", "desktop", *DEPENDENTS}
         or event not in {"pull_request", "push", "schedule", "workflow_dispatch", "merge_group"}
         or ref_type not in {"branch", "tag"}
-        or channel not in {"stable", "rc", "nightly"}
+        or channel not in {"stable", "rc", "hourly"}
         or not isinstance(package_policy, str) or package_policy not in {"standard", "linux-native"}
         or package_policy == "linux-native" and event != "workflow_dispatch"
     ):
@@ -174,7 +174,7 @@ def scope_plan(scopes, event, ref_type, channel, *, package_policy="standard"):
         "test_tiers": (["fast"] if packages else []) + (["slow"] if slow else []),
         "package_mode": "node" if "node" in affected and extended else "web",
         "package_matrix": {"include": list(platforms) if web else []},
-        "npm": channel == "nightly" and "node" in affected and extended and package_policy == "standard",
+        "npm": channel == "hourly" and "node" in affected and extended and package_policy == "standard",
     }
     required = {"quick-check"}
     if crypto:
@@ -302,13 +302,13 @@ def release_metadata(ref_type, ref_name):
     package = next(package for package in metadata["packages"] if package["name"] == "vibeface")
     version = package["version"]
     number = r"(?:0|[1-9][0-9]*)"
-    match = re.fullmatch(rf"{number}\.{number}\.{number}(?:-(nightly)\.([0-9]{{8}})\.([1-9][0-9]*)|-(rc)\.([1-9][0-9]*))?", version)
+    match = re.fullmatch(rf"{number}\.{number}\.{number}(?:-(hourly)\.([0-9]{{10}})|-(rc)\.([1-9][0-9]*))?", version)
     if not match:
-        raise ValueError("Expected X.Y.Z, X.Y.Z-nightly.YYYYMMDD.N or X.Y.Z-rc.N")
-    channel = "nightly" if match[1] else "rc" if match[4] else "stable"
-    if channel == "nightly":
-        date = match[2]
-        datetime.date(int(date[:4]), int(date[4:6]), int(date[6:]))
+        raise ValueError("Expected X.Y.Z, X.Y.Z-hourly.YYYYMMDDHH or X.Y.Z-rc.N")
+    channel = "hourly" if match[1] else "rc" if match[3] else "stable"
+    if channel == "hourly":
+        stamp = match[2]
+        datetime.datetime(int(stamp[:4]), int(stamp[4:6]), int(stamp[6:8]), int(stamp[8:]))
     if ref_type == "tag":
         if ref_name != f"v{version}":
             raise ValueError("Release tag must exactly match the Cargo version")
@@ -549,7 +549,7 @@ def self_test():
     for path in ("README.md", "README.zh-CN.md"):
         assert make_plan([path])["required_jobs"] == ["quick-check"]
     assert make_plan(["README.zh-CN.md", "apps/core/src/api.rs"])["rust_packages"] == ["vibeface-core"]
-    for path in ("README.zh-CN.md.rs", ".agents/skills/release/SKILL.md", "scripts/release.py", "scripts/daily-nightly.py", "scripts/nightly_source.py",
+    for path in ("README.zh-CN.md.rs", ".agents/skills/release/SKILL.md", "scripts/release.py", "scripts/hourly.py",
                  "apps/desktop/build/installer.nsi", "scripts/build-desktop.mjs"):
         assert make_plan([path])["full"]
     assert docs["local_process_modes"] == [] and www["local_process_modes"] == []
@@ -751,7 +751,7 @@ def self_test():
         arguments = argparse.Namespace(event=None, base=new_base, head=pr_head)
         environment = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_REF_TYPE": "branch", "GITHUB_EVENT_PATH": str(event_file)}
         fixture_git = git
-        with patch.dict(os.environ, environment), patch(f"{__name__}.git", side_effect=lambda *args, **kwargs: fixture_git(*args, cwd=directory)), patch(f"{__name__}.changed_paths", return_value=paths) as diff, patch(f"{__name__}.release_metadata", return_value={"channel": "nightly"}):
+        with patch.dict(os.environ, environment), patch(f"{__name__}.git", side_effect=lambda *args, **kwargs: fixture_git(*args, cwd=directory)), patch(f"{__name__}.changed_paths", return_value=paths) as diff, patch(f"{__name__}.release_metadata", return_value={"channel": "hourly"}):
             for draft in (True, False):
                 event_file.write_text(json.dumps({"pull_request": {"base": {"sha": new_base}, "head": {"sha": pr_head}, "draft": draft}}))
                 arguments.base = None
@@ -760,14 +760,14 @@ def self_test():
                 assert selected == dict(make_plan(paths), coverage_base=new_base, coverage_head=pr_head, coverage_reason="event-range", baseline_run_id=None)
                 assert selected["test_tiers"] == ["fast"]
         coverage_self_test(directory, base, new_base)
-        for version, channel in (("1.2.3", "stable"), ("1.2.3-rc.2", "rc"), ("1.2.3-nightly.20261019.1", "nightly")):
+        for version, channel in (("1.2.3", "stable"), ("1.2.3-rc.2", "rc"), ("1.2.3-hourly.2026101923", "hourly")):
             cargo_metadata = {"packages": [{"name": "vibeface", "version": version, "rust_version": "1.89"}]}
             with patch("subprocess.check_output", return_value=json.dumps(cargo_metadata)), patch(f"{__name__}.git", return_value=b"a" * 40), patch("release.validate_source") as ancestor:
                 assert release_metadata("branch", "")["channel"] == channel
                 assert release_metadata("tag", f"v{version}")["prerelease"] == (channel != "stable")
                 ancestor.assert_called_once_with("a" * 40, "product")
                 expect_failure(lambda: release_metadata("tag", "v0.0.0"))
-        for version in ("01.2.3", "1.2.3-nightly.20260229.1", "1.2.3-nightly.20261019.0", "1.2.3+build"):
+        for version in ("01.2.3", "1.2.3-nightly.20261019.1", "1.2.3-hourly.2026022912", "1.2.3-hourly.2026101924", "1.2.3-hourly.20261019", "1.2.3-hourly.2026101900.1", "1.2.3+build"):
             cargo_metadata = {"packages": [{"name": "vibeface", "version": version, "rust_version": "1.89"}]}
             with patch("subprocess.check_output", return_value=json.dumps(cargo_metadata)):
                 expect_failure(lambda: release_metadata("branch", ""))
@@ -928,7 +928,7 @@ def workflow_contract_self_test():
         assert set(actual) == set(jobs), (filename, actual, jobs)
         assert "run-name:" in selected
     concurrency_self_test(workflows)
-    assert "  schedule:" not in core and "daily-nightly:" not in core
+    assert "  schedule:" not in core and "  hourly:" not in core
     manual = core.split("  workflow_dispatch:\n", 1)[1].split("  workflow_call:", 1)[0]
     assert not manual.strip(), "Core manual dispatch has no cross-purpose switches"
     for retired in ("delivery_live", "delivery_small", "windows_only", "desktop_only", "mobile_apps", "inputs.desktop"):
@@ -1154,7 +1154,7 @@ def native_delivery_self_test(scratch):
         environment = {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF_TYPE": "branch",
                        "GITHUB_EVENT_PATH": str(event_file), "GITHUB_SHA": head}
         arguments = argparse.Namespace(event=None, base=None, head=None, package_policy="standard")
-        metadata = {"channel": "nightly", "version": "1.2.3-nightly.20261109.1", "msrv": "1.91", "prerelease": True}
+        metadata = {"channel": "hourly", "version": "1.2.3-hourly.2026110907", "msrv": "1.91", "prerelease": True}
         def needs_for(selected):
             needs = {job: {"result": "success" if job in selected["required_jobs"] else "skipped"} for job in JOBS}
             needs["plan"] = {"result": "success", "outputs": {"plan": json.dumps(selected)}}
@@ -1218,7 +1218,7 @@ def coverage_self_test(directory, base, nonancestor):
     args = argparse.Namespace(event=None, base=None, head=None)
     successful = {"id": 7, "repository": {"full_name": "fixture/vibeface"}, "path": ".github/workflows/ci.yml", "head_branch": "main", "head_sha": base, "event": "push", "status": "completed", "conclusion": "success"}
     fixture_git = git
-    with patch.dict(os.environ, environment), patch(f"{__name__}.git", side_effect=lambda *args, **kwargs: fixture_git(*args, cwd=directory)), patch(f"{__name__}.release_metadata", return_value={"channel": "nightly"}):
+    with patch.dict(os.environ, environment), patch(f"{__name__}.git", side_effect=lambda *args, **kwargs: fixture_git(*args, cwd=directory)), patch(f"{__name__}.release_metadata", return_value={"channel": "hourly"}):
         runs = [dict(successful, id=8, head_sha=rust_head, conclusion="cancelled"), dict(successful, id=9, head_sha=rust_head, conclusion="skipped"), successful]
         with patch("urllib.request.urlopen", return_value=io.BytesIO(json.dumps({"workflow_runs": runs}).encode())) as query:
             cumulative = event_plan(args)

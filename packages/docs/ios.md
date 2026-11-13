@@ -28,7 +28,7 @@ iOS 先通过 TestFlight 内测，验证后再上 App Store。当前工作流只
 请求的分发方式，再签名归档并导出 `vibeface-<releaseVersion>-ios.ipa`。
 输出包含经签名与描述文件校验的 SHA256 和来源收据。只配置部分 secrets 时构建失败。
 
-每个四小时 Nightly 批次的版本准备会将 iOS `buildNumber` 递增一次，同批次恢复沿用已经准备的值。
+Hourly 协调器在 Tag 提交中把 iOS `buildNumber` 设为 `YYMM.DD.HH`（UTC），main 上的值不变。
 构建号按 Apple 的 CFBundleVersion 分段规则验证；末段超出上限时停止，不重置或自动进位。
 Mobile 的 marketing version 仍保持 `0.0.1`。
 

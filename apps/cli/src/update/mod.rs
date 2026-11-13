@@ -251,7 +251,7 @@ pub async fn run(options: Update) -> Result<()> {
                 automatic: true, ..
             } => return Ok(()),
             _ => bail!(
-                "npm owns this installation; wait for idle, stop any node service, then run npm install -g @leaperone/vibeface@nightly and restart the service"
+                "npm owns this installation; wait for idle, stop any node service, then run npm install -g @leaperone/vibeface@hourly and restart the service"
             ),
         }
     }
@@ -521,7 +521,7 @@ pub(crate) fn bind_desktop_install_root(data: &Path, root: &Path) -> Result<()> 
             persist(
                 &policy_path,
                 &Policy {
-                    channel: Channel::Nightly,
+                    channel: Channel::Hourly,
                     automatic: false,
                     install_root: root,
                 },
@@ -756,7 +756,7 @@ async fn recover_with_service(
 
 fn desktop_managed_policy(managed_root: &Path) -> Result<Policy> {
     Ok(Policy {
-        channel: Channel::Nightly,
+        channel: Channel::Hourly,
         automatic: false,
         install_root: fs::canonicalize(managed_root)?,
     })
@@ -895,7 +895,7 @@ pub(crate) fn complete_desktop_managed_release(data: &Path) -> Result<()> {
     privatefs::sync_dir(data)?;
     if let Some(root) = journal.candidate.parent().and_then(Path::parent) {
         let policy = Policy {
-            channel: Channel::Nightly,
+            channel: Channel::Hourly,
             automatic: false,
             install_root: root.to_owned(),
         };
@@ -1774,7 +1774,7 @@ mod tests {
         let package = package(&root, "1.0.0");
         privatefs::link_dir(&package, &root.join("current")).unwrap();
         let policy = Policy {
-            channel: Channel::Nightly,
+            channel: Channel::Hourly,
             automatic: true,
             install_root: root.clone(),
         };
@@ -2007,7 +2007,7 @@ mod tests {
         );
         run(Update {
             action: Action::Configure {
-                channel: Channel::Nightly,
+                channel: Channel::Hourly,
                 automatic: false,
                 install_root: root.clone(),
                 data: Data {
@@ -2020,7 +2020,7 @@ mod tests {
             serde_json::from_slice(&fs::read(data.join("update.json"))?)?;
         assert_eq!(
             saved,
-            serde_json::json!({"channel":"nightly","automatic":false,"install_root":root})
+            serde_json::json!({"channel":"hourly","automatic":false,"install_root":root})
         );
         assert_eq!(
             recorded_arguments(&installer),
@@ -2028,7 +2028,7 @@ mod tests {
         );
         run(Update {
             action: Action::Configure {
-                channel: Channel::Nightly,
+                channel: Channel::Hourly,
                 automatic: true,
                 install_root: root.clone(),
                 data: Data {
@@ -2056,7 +2056,7 @@ mod tests {
     #[test]
     fn npm_installation_requires_matching_package_metadata() {
         let root = sandbox();
-        let original = package(&root, "1.2.3-nightly.20261019.1");
+        let original = package(&root, "1.2.3-hourly.2026101909");
         assert_eq!(npm_install_root(&original.join(PROGRAMS[0])).unwrap(), None);
         fs::create_dir_all(root.join("vendor")).unwrap();
         let target = if cfg!(windows) {
@@ -2070,7 +2070,7 @@ mod tests {
         fs::write(root.join("bin/vibeface.mjs"), b"launcher").unwrap();
         fs::write(
             root.join("package.json"),
-            r#"{"name":"@leaperone/vibeface","version":"1.2.3-nightly.20261019.1"}"#,
+            r#"{"name":"@leaperone/vibeface","version":"1.2.3-hourly.2026101909"}"#,
         )
         .unwrap();
         assert_eq!(
@@ -2078,8 +2078,8 @@ mod tests {
             Some(root.clone())
         );
         for metadata in [
-            r#"{"name":"another-package","version":"1.2.3-nightly.20261019.1"}"#,
-            r#"{"name":"vibeface","version":"1.2.3-nightly.20261019.1"}"#,
+            r#"{"name":"another-package","version":"1.2.3-hourly.2026101909"}"#,
+            r#"{"name":"vibeface","version":"1.2.3-hourly.2026101909"}"#,
             r#"{"name":"@leaperone/vibeface","version":"2.0.0"}"#,
             r#"{"name":"@leaperone/vibeface"}"#,
         ] {
@@ -2459,7 +2459,7 @@ mod tests {
             .iter()
             .map(|path| fs::read(path).unwrap())
             .collect();
-        let policy_bytes = br#"{"channel":"nightly","automatic":false}"#.to_vec();
+        let policy_bytes = br#"{"channel":"hourly","automatic":false}"#.to_vec();
         fs::write(data.join("update.json"), &policy_bytes).unwrap();
         fs::write(data.join("providers.json"), b"provider-material").unwrap();
         let release = super::DesktopManagedRelease {

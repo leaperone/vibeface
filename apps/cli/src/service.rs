@@ -117,7 +117,7 @@ fn command(root: &Path, data: &Path, executable: &Path, action: Action) -> Resul
         );
         ensure!(
             !matches!(action, Action::InstallUpdater),
-            "npm installations are updated with npm install -g @leaperone/vibeface@nightly"
+            "npm installations are updated with npm install -g @leaperone/vibeface@hourly"
         );
         if matches!(action, Action::Install) {
             let _idle = update::lock_data_dir(data)
@@ -412,7 +412,7 @@ mod tests {
         std::fs::write(root.join("bin/vibeface.mjs"), b"launcher").unwrap();
         std::fs::write(
             root.join("package.json"),
-            r#"{"name":"@leaperone/vibeface","version":"1.2.3-nightly.20261019.1"}"#,
+            r#"{"name":"@leaperone/vibeface","version":"1.2.3-hourly.2026101909"}"#,
         )
         .unwrap();
         std::fs::write(package.join(PROGRAMS[0]), b"binary").unwrap();
@@ -425,9 +425,9 @@ mod tests {
         std::fs::write(
             package.join("BUILD-INFO.json"),
             serde_json::to_vec(&serde_json::json!({
-                "version": "1.2.3-nightly.20261019.1", "target": target,
-                "source_commit": "a".repeat(40), "core_version": "1.2.3-nightly.20261019.1",
-                "core_source_commit": "a".repeat(40), "app_version": "1.2.3-nightly.20261019.1",
+                "version": "1.2.3-hourly.2026101909", "target": target,
+                "source_commit": "a".repeat(40), "core_version": "1.2.3-hourly.2026101909",
+                "core_source_commit": "a".repeat(40), "app_version": "1.2.3-hourly.2026101909",
                 "app_source_commit": "a".repeat(40),
                 "update_protocol": vibeface_control::UPDATE_PROTOCOL,
                 "data_epoch": vibeface_control::DATA_EPOCH,

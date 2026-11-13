@@ -111,7 +111,7 @@ function HomePage() {
             <li><a className="text-link" href="/docs/onboarding">Set up a device <ArrowUpRight size={16} aria-hidden="true" /></a></li>
             <li><a className="text-link" href="/docs/user-guide">Read the user guide <ArrowUpRight size={16} aria-hidden="true" /></a></li>
           </ul>
-          <p className="nightly-note">Vibeface ships as Nightly builds. Updates can break compatibility before the first stable release. <a href="https://github.com/leaperone/vibeface/releases">View Nightly releases</a></p>
+          <p className="hourly-note">Vibeface ships as hourly builds. Updates can break compatibility before the first stable release. <a href="https://github.com/leaperone/vibeface/releases">View hourly releases</a></p>
         </section>
       </div>
     </SiteLayout>

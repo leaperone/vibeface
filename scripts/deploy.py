@@ -199,17 +199,17 @@ def prepare(service, tag, output):
 
 def self_test():
     import copy
-    tag = 'v0.0.1-nightly.20261108.1'
+    tag = 'v0.0.1-hourly.2026110812'
     sha = 'a' * 40
     names = release.expected_asset_names('product', tag[1:], False) - {'release.json'}
     manifest = {'schema': release.SCHEMA_VERSION, 'app': 'product', 'tag': tag,
-                'version': tag[1:], 'channel': 'nightly', 'source_commit': sha,
+                'version': tag[1:], 'channel': 'hourly', 'source_commit': sha,
                 'assets': [{'name': n, 'size': 1, 'sha256': 'b' * 64} for n in sorted(names)]}
     published = {'tag_name': tag, 'draft': False, 'prerelease': True,
                  'assets': [{'name': n, 'size': 1, 'digest': 'sha256:' + 'b' * 64}
                             for n in sorted(names | {'release.json'})]}
     assert verify(tag, manifest, published, sha)['source_sha'] == sha
-    for value in ('0.0.1', '0.0.1-rc.1', '0.0.1-nightly.20261107.1'):
+    for value in ('0.0.1', '0.0.1-rc.1', '0.0.1-hourly.2026110712'):
         m = copy.deepcopy(manifest); p = copy.deepcopy(published)
         m.update(tag='v' + value, version=value, channel=release.version(value))
         p.update(tag_name=m['tag'], prerelease=m['channel'] != 'stable')
@@ -261,15 +261,15 @@ def self_test():
             names.add('release.json')
         return {'tag_name': name, 'draft': draft, 'published_at': date,
                 'assets': [{'name': value} for value in sorted(names)]}
-    baseline = 'v0.0.1-nightly.20261107.1'
+    baseline = 'v0.0.1-hourly.2026110712'
     candidate = listed(tag, '2026-11-08T12:00:00Z')
-    pages = [[listed('v0.0.1-nightly.20261110.1', '2026-11-10T12:00:00Z'), candidate,
-              listed('v0.0.1-nightly.20261108.2', '2026-11-08T11:00:00Z', draft=True),
-              listed('v0.0.1-nightly.20261108.3', '2026-11-08T10:00:00Z', complete=False),
+    pages = [[listed('v0.0.1-hourly.2026111012', '2026-11-10T12:00:00Z'), candidate,
+              listed('v0.0.1-hourly.2026110811', '2026-11-08T11:00:00Z', draft=True),
+              listed('v0.0.1-hourly.2026110810', '2026-11-08T10:00:00Z', complete=False),
               listed('www-v0.0.1', '2026-11-08T11:00:00Z')],
-             [listed('v0.0.1-nightly.20261106.1', '2026-11-06T12:00:00Z'),
+             [listed('v0.0.1-hourly.2026110612', '2026-11-06T12:00:00Z'),
               listed(baseline, '2026-11-07T12:00:00Z')]]
-    missing_component = listed('v0.0.1-nightly.20261108.4', '2026-11-08T11:30:00Z')
+    missing_component = listed('v0.0.1-hourly.2026110813', '2026-11-08T11:30:00Z')
     missing_component['assets'].pop(0)
     pages[0].append(missing_component)
     for response, expected in ((pages, baseline), ([pages[0]], None)):
@@ -354,7 +354,7 @@ def self_test():
         directory = root / 'vibeface-app'; (directory / 'web').mkdir(parents=True)
         (directory / 'web/_shell.html').write_text('released fixture')
         component = {'app': 'app', 'schema': 1, 'tag': tag, 'version': tag[1:],
-                     'source_commit': sha, 'channel': 'nightly', 'target': None,
+                     'source_commit': sha, 'channel': 'hourly', 'target': None,
                      'files': release.files(directory)}
         def fixture(source=sha, corrupt=False, bad_checksum=False):
             component['source_commit'] = source
@@ -385,7 +385,7 @@ def self_test():
         for index, values in enumerate(({}, {'corrupt': True}, {'bad_checksum': True}, {'source': 'f' * 40})):
             remote, payload = fixture(**values)
             with patch(__name__ + '.execute', return_value={'tag': tag, 'source_sha': sha, 'version': tag[1:],
-                       'channel': 'nightly', 'targets': ['app']}), \
+                       'channel': 'hourly', 'targets': ['app']}), \
                     patch(__name__ + '.gh', side_effect=[remote, payload]), \
                     patch('subprocess.run', side_effect=download):
                 try:

@@ -1,11 +1,11 @@
-# Vibeface Nightly
+# Vibeface
 
 The Node stores its data in `~/.vibeface` by default; pass `--data-dir` or set `VIBEFACE_DATA_DIR` to use another absolute path. Configure external tools explicitly as described in [deployment configuration](https://github.com/leaperone/vibeface/blob/main/packages/docs/deployment.md).
 
-Install Node.js 22 or newer, then install the Nightly CLI:
+Install Node.js 22 or newer, then install the CLI from the hourly channel:
 
 ```sh
-npm install -g @leaperone/vibeface@nightly
+npm install -g @leaperone/vibeface@hourly
 vibeface --version
 vibeface
 ```
@@ -20,7 +20,7 @@ npm owns updates for this installation. The Rust self-updater is disabled. Befor
 
 ```sh
 vibeface service stop
-npm install -g @leaperone/vibeface@nightly
+npm install -g @leaperone/vibeface@hourly
 ```
 
 Then start the service and check its status:
