@@ -181,7 +181,7 @@ Device Hub 是 Xcode 自带的 Apple 设备管理应用，位于 Xcode 应用包
 
 原生验收使用已有 e2e mobile 引擎，必须指定当前任务构建的 `.app`、Node、匹配 WASM，以及专用模拟器的 UUID。该入口会重新安装本任务应用并清除该专用模拟器的钥匙串。不要指定其他任务正在使用的模拟器。
 
-先在任务 worktree 根目录构建模拟器 `.app`，命令与 `.github/workflows/mobile.yml` 一致，只把产物放进 `.artifacts/native/`：
+先在任务 worktree 根目录构建模拟器 `.app`，产物只放进 `.artifacts/native/`：
 
 ```sh
 scripts/build-mobile-secure.sh ios
@@ -226,7 +226,7 @@ pnpm exec e2e run --config tests/e2e/e2e.workspace.native.config.ts workspace.na
 
 ## 验证原生 Provider 设置和队列取消
 
-手动运行 `.github/workflows/mobile.yml` 时，现有 iOS job 在当前 checkout 构建 Simulator App、宿主 Node、Web 和 WASM，然后运行一个 Provider 原生用例。Android job 仍只构建 APK。iOS job 核对实际 arm64 宿主与 App，选择可用 iOS runtime，创建专属 iPhone 17 simulator 并等待它启动。缺少 runtime、启动失败或 driver 不可用都会使验收失败，构建成功不能代替 UI 结果。
+CI 不再构建模拟器 App 或运行这个 Provider 原生用例；需要时按上文在本机构建当前 checkout 的 Simulator App、宿主 Node、Web 和 WASM，再在专属模拟器上运行。缺少 runtime、模拟器启动失败或 driver 不可用都会使验收失败，构建成功不能代替 UI 结果。
 
 宿主构建前还要求 HEAD 等于本次提交，且 `git status --porcelain --untracked-files=normal` 为空。DerivedData 和 Simulator zip 位于已忽略的 `.artifacts/native/`，不会干扰这个检查。Expo prebuild 改变源码时必须先解决，不能继续把脏源码产物记为当前提交。
 
