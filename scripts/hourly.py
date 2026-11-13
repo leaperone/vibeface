@@ -223,13 +223,21 @@ def run_hourly(now):
         if hourly:
             require(hourly[-1][0] < batch, 'a later Hourly tag already exists; refusing to go back in time')
             previous = tag_commit(hourly[-1][1])
+            require(previous, 'the latest Hourly tag is listed but unreadable; reconcile before tagging')
             parent = git('rev-parse', previous + '^')
-            if subprocess.run(['git', 'merge-base', '--is-ancestor', parent, base], cwd=release.ROOT).returncode:
-                print(json.dumps(dict(batch=batch, skipped='newest green main commit precedes the latest Hourly')))
+            ancestry = subprocess.run(['git', 'merge-base', '--is-ancestor', parent, base], cwd=release.ROOT).returncode
+            require(ancestry in (0, 1), 'cannot compare the latest Hourly parent with main')
+            if ancestry == 1:
+                print(json.dumps(dict(batch=batch, skipped='newest green main commit does not contain the latest Hourly')))
                 return
-            if parent == base and release_settled(hourly[-1][1], previous):
-                print(json.dumps(dict(batch=batch, skipped='no new green main commit', latest=hourly[-1][1])))
-                return
+            if parent == base:
+                if release_settled(hourly[-1][1], previous):
+                    print(json.dumps(dict(batch=batch, skipped='no new green main commit', latest=hourly[-1][1])))
+                    return
+                earlier = tag_commit(hourly[-2][1]) if len(hourly) > 1 else None
+                # ponytail: one rebuild per commit; a second failure needs a human or a new main commit.
+                require(not earlier or git('rev-parse', earlier + '^') != base,
+                        'two Hourly releases of this main commit failed; fix the release before rebuilding')
         source = create_source(base, batch)
         with tempfile.TemporaryDirectory(dir=scratch()) as temporary:
             clean = Path(temporary) / 'plan'

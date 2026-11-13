@@ -34,7 +34,7 @@ description: 使用统一产品 Tag 或独立官网 Tag 发布 Vibeface，构建
 
 用户已授权每小时自动发布产品 Hourly。`hourly.yml`（Release / Hourly）使用 `17 * * * *`，也可从 main 手动派发。GitHub schedule 是 best effort，可能延迟或跳过。协调器 `scripts/hourly.py` 只用 `GITHUB_TOKEN`，全局串行，不创建分支或 PR，不改 main。
 
-批次取运行时的 UTC 小时 `YYYYMMDDHH`。协调器选 main first-parent 上最新一个 `ci.yml` push run 成功的提交作为 parent。该 parent 已是最新 Hourly tag 的 parent 时跳过；本小时 tag 已存在时只核对来源并补派发缺失的 release run；更晚的 Hourly tag 已存在时停止。否则生成一个 bot 机械提交，只改产品版本文件、Cargo.lock 三个本仓包版本、Android versionCode（`YYMMDDHH`）和 iOS buildNumber（`YYMM.DD.HH`），打 `v<X.Y.Z>-hourly.<YYYYMMDDHH>` 并派发 `release.yml`。main 的版本文件固定为 Hourly 开发版本，只有 tag 提交带真实小时。
+批次取运行时的 UTC 小时 `YYYYMMDDHH`。协调器选 main first-parent 上最新一个 `ci.yml` push run 成功的提交作为 parent。该提交不包含最新 Hourly tag 的 parent 时跳过；等于该 parent 且那次发布正在运行或已成功时跳过，失败时同一提交只重建一次，再失败则协调器报错停止；本小时 tag 已存在时只核对来源并补派发缺失的 release run；更晚的 Hourly tag 已存在时停止。否则生成一个 bot 机械提交，只改产品版本文件、Cargo.lock 三个本仓包版本、Android versionCode（`YYMMDDHH`）和 iOS buildNumber（`YYMM.DD.HH`），打 `v<X.Y.Z>-hourly.<YYYYMMDDHH>` 并派发 `release.yml`。main 的版本文件固定为 Hourly 开发版本，只有 tag 提交带真实小时。
 
 协调器不等待构建，也不追溯或恢复以前的小时。某小时构建失败时，该 Release 保持未完成、不写 `release.json`，下一小时照常发布新版本。所有发布入口共用来源门：main 上的来源要求同一 SHA 的 main push CI success；detached 来源必须是 parent 在 main 上的精确 Hourly 机械提交，且 parent 有 main push CI success。Hourly 自动发布 npm（dist-tag `hourly`），不部署、不上传 TestFlight 或 App Store，官网不参与。不要在人工会话中无授权派发 `hourly.yml`。
 
