@@ -516,7 +516,8 @@ enum CodexCommand {
     Call {
         /// App Server method name.
         method: String,
-        /// Method parameters as JSON.
+        /// Method parameters as JSON, in the App Server's own camelCase names, as in
+        /// '{"threadId":"<thread>"}'.
         params: Option<String>,
     },
     /// Send a turn through the coordinator.
