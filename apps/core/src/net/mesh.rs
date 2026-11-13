@@ -310,12 +310,18 @@ fn recent<'a>(table: &'a Table, own: &str, allow_private: bool) -> Vec<&'a Entry
                     || (allow_private && !entry.record.addrs.is_empty()))
         })
         .collect();
-    known.sort_by_key(|entry| Reverse(entry.last_seen_ms));
+    known.sort_by_key(|entry| (!entry.online(now_ms()), Reverse(entry.last_seen_ms)));
     known.truncate(CANDIDATES);
     known
 }
 
-fn prefer_online<'a>(entries: Vec<&'a Entry>, now_ms: u64) -> Vec<&'a Entry> {
+fn prioritize_online<'a>(mut entries: Vec<&'a Entry>, now_ms: u64) -> Vec<&'a Entry> {
+    entries.sort_by_key(|entry| (!entry.online(now_ms), Reverse(entry.last_seen_ms)));
+    entries.truncate(CANDIDATES);
+    entries
+}
+
+fn prefer_online(entries: Vec<&Entry>, now_ms: u64) -> Vec<&Entry> {
     let online: Vec<_> = entries
         .iter()
         .copied()
@@ -984,10 +990,7 @@ impl Mesh {
     async fn candidates(&self) -> Vec<EndpointId> {
         let mut peers: Vec<EndpointId> = {
             let table = self.table.lock().expect("mesh table");
-            prefer_online(
-                recent(&table, &self.device_id, self.allow_private),
-                now_ms(),
-            )
+            prefer_online(recent(&table, &self.device_id, self.allow_private), now_ms())
             .into_iter()
             .filter_map(|entry| endpoint_id(&entry.record.device_id).ok())
             .collect()
