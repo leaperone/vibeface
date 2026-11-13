@@ -28,7 +28,7 @@
           "_vibeface._udp"
         ]
       },
-      "buildNumber": "17"
+      "buildNumber": "2611.13.18"
     },
     "android": {
       "package": "one.leaper.vibeface",
@@ -47,7 +47,7 @@
         "android.permission.READ_EXTERNAL_STORAGE",
         "android.permission.WRITE_EXTERNAL_STORAGE"
       ],
-      "versionCode": 250019
+      "versionCode": 26111318
     },
     "plugins": [
       "expo-router",
@@ -129,7 +129,7 @@
       ]
     ],
     "extra": {
-      "releaseVersion": "0.0.1-hourly.2026111300"
+      "releaseVersion": "0.0.1-hourly.2026111318"
     }
   }
 }
