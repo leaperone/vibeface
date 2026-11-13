@@ -70,11 +70,11 @@ App Server 由部署配置显式选择。执行默认关闭；整个 `codex_app_
 
 | 命令 | 作用 |
 |---|---|
-| `vibeface codex call <method> [json]` | 调用名单里的任意方法，原样打印结果；写方法结果不明时报错并提示先回读 |
+| `vibeface codex call <method> [json]` | 调用名单里的任意方法，原样打印结果；`json` 用 App Server 自己的 camelCase 字段名，例如 `thread/read '{"threadId":"…"}'`，不是 Node 工具里的 `thread_id`；写方法结果不明时报错并提示先回读 |
 | `vibeface codex send <thread> <text> --id ID [--model M] [--effort E] [--image PATH]...` | 带 `thread` 的 `dispatch_work`：登记工作后 `thread/resume`，回合进行中时 `turn/steer`，否则 `turn/start`；输出与 `dispatch_work` 相同 |
 | `vibeface codex watch <thread>` | `thread/resume` 后逐行打印通知 |
 
-`send` 是一项工作，`--id` 即 `call_ref`。同一轮同一 `--id` 再次执行只拿回原工作，不会发第二次；结果不明时由 Node 按 `clientUserMessageId` 对账。Bot 转达本人的回答时以回答消息的 `message_id` 作 `--id`。
+`send` 是一项工作，`--id` 即 `call_ref`。登记前先 `thread/read`；App Server 没有这个线程时不登记也不发送，见 [Node 协议参考](../node-protocol.md)。同一轮同一 `--id` 再次执行只拿回原工作，不会发第二次；结果不明时由 Node 按 `clientUserMessageId` 对账。Bot 转达本人的回答时以回答消息的 `message_id` 作 `--id`。
 
 ### 2.3 派发流程
 

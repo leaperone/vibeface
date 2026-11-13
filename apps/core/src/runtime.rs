@@ -1101,7 +1101,17 @@ impl Runtime {
                 }
             })?;
         }
-        self.start_network().await
+        self.start_network().await?;
+        tracing::info!(
+            event = "node.started",
+            version = env!("CARGO_PKG_VERSION"),
+            data_epoch = crate::config::DATA_EPOCH,
+            os = std::env::consts::OS,
+            arch = std::env::consts::ARCH,
+            web = self.config.web_enabled,
+            "Node started"
+        );
+        Ok(())
     }
     /// Time can change the projected directory before the writer is free to rebuild its rows.
     /// Wake observers from committed history without delaying that permission check on SQLite.
@@ -1243,6 +1253,9 @@ impl Runtime {
         if let Err(error) = self.store.shutdown().await {
             tracing::error!(%error, "database shutdown failed");
         }
+        // The counts still held go out first, so the stop is the last line of this run.
+        crate::logging::flush();
+        tracing::info!(event = "node.stopped", "Node stopped");
     }
     pub(crate) fn writable(&self) -> bool {
         *self.write_state.borrow() == WriteState::Writable

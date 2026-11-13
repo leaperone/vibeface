@@ -36,6 +36,16 @@ export function fit(record: WebRecord): WebRecord {
   return fitted
 }
 
+/**
+ * What a failed request said before the page worded it for the reader: the device's error code and its own
+ * text, or the transport's. `shown` is the worded message; the same text is not kept twice.
+ */
+export function failureFields(cause: unknown, shown: string): { code?: string; cause?: string } {
+  const code = (cause as { code?: unknown } | null)?.code
+  const raw = (cause instanceof Error ? cause.message : String(cause)).slice(0, 500)
+  return { ...(typeof code === "string" ? { code } : {}), ...(raw && raw !== shown ? { cause: raw } : {}) }
+}
+
 /** The conversation and task the page shows, from `?conversation=` and `/work/<id>`. */
 export function pageIds(location: { pathname: string; search: string }): Pick<WebRecord, "conversation_id" | "work_id"> {
   const conversation = new URLSearchParams(location.search).get("conversation")

@@ -252,6 +252,14 @@ impl Runtime {
                 .await;
             match admission {
                 Ok(receipt) => {
+                    tracing::info!(
+                        event = "input.admitted",
+                        conversation_id = receipt.conversation_id,
+                        message_id,
+                        trigger = receipt.trigger,
+                        state = receipt.state,
+                        "saved input admitted on retry"
+                    );
                     self.publish_changed(
                         network,
                         &receipt.conversation_id,
@@ -609,6 +617,12 @@ impl Runtime {
             })
             .await?;
         for (scope, trigger) in admitted {
+            tracing::info!(
+                event = "schedule.fired",
+                conversation_id = scope,
+                trigger,
+                "a schedule came due and its run is queued"
+            );
             self.publish_changed(&network, &scope, Changed::Job(&trigger));
             self.schedule_wakeup.notify_one();
         }
@@ -1194,14 +1208,26 @@ impl Runtime {
                     .store
                     .call("workspace_input_evidence", {
                         let network_id = access.network_id.to_owned();
+                        let conversation = conversation.clone();
                         let message_id = message_id.to_owned();
                         move |store| store.input_evidence(&network_id, &conversation, &message_id)
                     })
                     .await?;
-                Ok(
-                    json!({"accepted":false,"code":if stored { "input_conflict" } else { "input_not_saved" },
-                    "stored":stored,"message_id":message_id,"reason":crate::logging::scrub(&error.to_string())}),
-                )
+                let code = if stored {
+                    "input_conflict"
+                } else {
+                    "input_not_saved"
+                };
+                tracing::warn!(
+                    event = "input.rejected",
+                    conversation_id = conversation,
+                    message_id,
+                    code,
+                    %error,
+                    "input message was not accepted"
+                );
+                Ok(json!({"accepted":false,"code":code,
+                    "stored":stored,"message_id":message_id,"reason":crate::logging::scrub(&error.to_string())}))
             }
         }
     }
@@ -1279,6 +1305,14 @@ impl Runtime {
             Ok((message, receipt))
             }).await?
         };
+        tracing::info!(
+            event = "input.accepted",
+            conversation_id = scope,
+            message_id,
+            trigger = receipt.trigger,
+            state = receipt.state,
+            "input message accepted"
+        );
         self.publish_changed(network, &scope, Changed::Event(&message.source_event));
         if let Err(error) = self.wake_scheduler() {
             tracing::debug!(%error,"saved input waits for scheduler recovery");

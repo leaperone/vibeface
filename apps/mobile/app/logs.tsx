@@ -21,12 +21,32 @@ const eventTitles: Record<string, string> = {
   'agent.turn.fenced': '对话交给了其他设备',
   'app_server.start_failed': 'Codex 没能启动',
   'app_server.exited': 'Codex 已退出',
+  'input.accepted': '收到一条消息',
+  'input.admitted': '消息已排队',
+  'input.delivered': '另一个节点转来消息或任务结果',
+  'input.rejected': '消息没有收下',
   'join.local_failed': '设备没能加入',
+  'mesh.neighbor_down': '一个全网邻居断开了',
+  'mesh.neighbor_up': '连上一个全网邻居',
+  'net.accept_failed': '一个连进来的连接出错断开',
   'network.removed': '设备已被移出网络',
+  'node.started': '节点已启动',
+  'node.start_failed': '节点没能启动',
+  'node.stopping': '节点正在停止',
+  'node.stopped': '节点已停止',
+  'peer.online': '和另一个节点同步上了',
+  'peer.offline': '和另一个节点同步不上',
   'question.asked': '向你提了一个问题',
   'question.answered': '问题已回答',
+  'schedule.fired': '定时任务到点，已排队',
   'sync.write_state': '写入状态已变化',
   'sync.forked': '设备副本发生冲突',
+  'triage.concluded': 'Bot 看过会话动态',
+  'triage.queued': '收到一条会话动态',
+  'update.applied': '已更新',
+  'update.checked': '检查了更新',
+  'update.deferred': '节点正忙，更新推迟',
+  'update.failed': '更新失败',
   'web.action_failed': '操作失败',
   'web.rpc_failed': '网页请求失败',
   'work.start_failed': '任务没能开始',
@@ -98,6 +118,7 @@ function LogRow({ record, bot, work, computer }: { record: LogRecord; bot?: stri
         <View className="flex-row flex-wrap gap-x-2 gap-y-0.5">
           <Text className="text-meta text-muted-foreground">{timeOf(record.ts_ms)}</Text>
           <Text className="text-meta text-muted-foreground">{sourceLabels[record.source]}</Text>
+          {typeof record.fields?.repeated === 'number' ? <Text className="text-meta text-muted-foreground">又出现 {record.fields.repeated} 次</Text> : null}
           {bot ? <Text numberOfLines={1} className="max-w-[40%] text-meta text-muted-foreground">Bot · {bot}</Text> : null}
           {work ? <Text numberOfLines={1} className="max-w-[40%] text-meta text-muted-foreground">任务 · {work}</Text> : null}
           {computer ? <Text numberOfLines={1} className="max-w-[40%] text-meta text-muted-foreground">设备 · {computer}</Text> : null}

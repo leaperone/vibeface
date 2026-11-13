@@ -74,6 +74,14 @@ async fn main() -> Result<()> {
     // Opening the log first would leave `node.log` in an empty directory and skip initialization.
     vibeface_core::control::prepare_start(&data_dir)?;
     vibeface_core::logging::init(Some(&data_dir), false);
+    vibeface_core::logging::add_private_path(&data_dir);
+    let start_failed = |error: &anyhow::Error| {
+        tracing::error!(
+            event = "node.start_failed",
+            error = %format!("{error:#}"),
+            "Node could not start"
+        )
+    };
     let app_dir = match args.app_dir {
         Some(path) => {
             anyhow::ensure!(
@@ -90,7 +98,7 @@ async fn main() -> Result<()> {
             sibling.filter(|path| path.is_dir())
         }
     };
-    let mut runtime = Runtime::open(&data_dir).await?;
+    let mut runtime = Runtime::open(&data_dir).await.inspect_err(start_failed)?;
     runtime.config.web_enabled &= !args.no_web;
     let runtime = Arc::new(runtime);
     let startup = tokio::select! {
@@ -101,20 +109,31 @@ async fn main() -> Result<()> {
         }
     };
     if let Err(error) = startup {
+        start_failed(&error);
         runtime.shutdown().await;
         return Err(error);
     }
-    let mut rejoin = false;
-    let result = tokio::select! {
-        result = vibeface_core::api::serve(runtime.clone(), app_dir) => result,
-        result = vibeface_core::maintenance::serve(runtime.clone(), data_dir.clone()) => result,
-        _ = runtime.rejoin_requested() => { rejoin = true; Ok(()) }
-        result = desktop_parent.closed() => result,
-        stop = vibeface_bridge::platform::stop::requested() => stop.map(drop).map_err(Into::into),
+    let (reason, result) = tokio::select! {
+        result = vibeface_core::api::serve(runtime.clone(), app_dir) => ("api", result),
+        result = vibeface_core::maintenance::serve(runtime.clone(), data_dir.clone()) => ("maintenance", result),
+        _ = runtime.rejoin_requested() => ("rejoin", Ok(())),
+        result = desktop_parent.closed() => ("parent_closed", result),
+        stop = vibeface_bridge::platform::stop::requested() => ("stop_requested", stop.map(drop).map_err(Into::into)),
     };
+    match &result {
+        Ok(()) => tracing::info!(event = "node.stopping", reason, "Node is stopping"),
+        Err(error) => tracing::error!(
+            event = "node.stopping",
+            reason,
+            error = %format!("{error:#}"),
+            "Node is stopping after an error"
+        ),
+    }
+    // A shutdown step that hangs until the service manager kills the Node keeps what came before.
+    vibeface_core::logging::flush();
     runtime.shutdown().await;
     drop(runtime);
-    if rejoin {
+    if reason == "rejoin" {
         return vibeface_core::control::restart_fresh(&data_dir);
     }
     result
