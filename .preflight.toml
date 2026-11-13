@@ -51,7 +51,7 @@ ci_check = "Mobile types"
 [[domain_check]]
 name = "Desktop source"
 trigger_paths = ["apps/desktop/**", "tests/e2e/e2e.native-desktop.config.ts", "tests/e2e/native-desktop*.ts", "scripts/e2e-desktop.mjs", "scripts/native-desktop/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
-command = "cargo test -p vibeface-desktop --locked && cargo clippy -p vibeface-desktop --all-targets --locked -- -D warnings"
+command = "cargo test -p vibeface-desktop --features native-ui-tests --locked && cargo clippy -p vibeface-desktop --all-targets --locked -- -D warnings"
 ci_check = "Native desktop host checks"
 
 [[domain_check]]
