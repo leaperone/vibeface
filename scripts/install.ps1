@@ -22,8 +22,9 @@ $Target = 'x86_64-pc-windows-msvc'
 $Api = 'https://api.github.com/repos/leaperone/vibeface'
 $Downloads = 'https://github.com/leaperone/vibeface/releases/download'
 $MaxJson = 4MB
-$MaxArchive = 128MB
-$MaxUnpacked = 512MB
+# Far above real packages: a release past these bounds could never be installed here.
+$MaxArchive = 1GB
+$MaxUnpacked = 2GB
 $MaxEntries = 4096
 
 function Fail {

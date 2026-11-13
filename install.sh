@@ -187,8 +187,9 @@ sha256() {
 check_archive() {
   local archive="$1" package="$2" scratch="$3" length
   # Bound decompression before tar reads any member, then reject links and special files.
-  length=$(gzip -dc "$archive" | head -c 536870913 | wc -c) || fail 'invalid or oversized compressed archive'
-  ((length <= 536870912)) || fail 'expanded archive exceeds size limit'
+  # The bounds stay far above real packages: a release past them could never be installed here.
+  length=$(gzip -dc "$archive" | head -c 2147483649 | wc -c) || fail 'invalid or oversized compressed archive'
+  ((length <= 2147483648)) || fail 'expanded archive exceeds size limit'
   tar -tzf "$archive" > "$scratch/entries" || fail 'invalid tar archive'
   awk -v root="$package" '
     {
@@ -322,7 +323,7 @@ install_release() (
   [[ $commit =~ ^[0-9a-f]{40}$ ]] || fail 'release tag has no valid source commit'
   [[ $(awk -F '\t' '{print $1}' <<< "$manifest_fields") == "$commit" ]] || fail 'completion manifest source does not match release tag'
   printf 'Downloading %s (%s)...\n' "$tag" "$target"
-  fetch "https://github.com/leaperone/vibeface/releases/download/$tag/$archive" "$scratch/$archive" 134217728
+  fetch "https://github.com/leaperone/vibeface/releases/download/$tag/$archive" "$scratch/$archive" 1073741824
   fetch "https://github.com/leaperone/vibeface/releases/download/$tag/$archive.sha256" "$scratch/checksum" 4096
   [[ $(wc -c < "$scratch/$archive" | tr -d ' ') == $(awk -F '\t' '{print $4}' <<< "$manifest_fields") &&
      $(wc -c < "$scratch/checksum" | tr -d ' ') == $(awk -F '\t' '{print $5}' <<< "$manifest_fields") ]] || fail 'release completion manifest target sizes mismatch'

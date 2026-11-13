@@ -21,8 +21,11 @@ const API: &str = "https://api.github.com/repos/leaperone/vibeface";
 /// Releases fetched one by one, newest first, before discovery gives up on finding a complete one.
 const MAX_CANDIDATES: usize = 16;
 const MAX_JSON: u64 = 4 * 1024 * 1024;
-const MAX_ARCHIVE: u64 = 128 * 1024 * 1024;
-const MAX_UNPACKED: u64 = 512 * 1024 * 1024;
+// Bounds against a corrupt or hostile download, kept far above real packages (about 45 MiB packed
+// and 130 MiB unpacked in November 2026). An updater can never install a release past its own
+// bounds, so they must stay ahead of package growth rather than track it.
+const MAX_ARCHIVE: u64 = 1024 * 1024 * 1024;
+const MAX_UNPACKED: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
 
 /// The programs a package carries, named the way this platform names a program.
