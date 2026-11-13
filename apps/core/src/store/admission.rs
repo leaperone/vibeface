@@ -236,6 +236,27 @@ fn key(prefix: &str, network: &str, command_id: &str) -> String {
     )
 }
 
+pub(super) fn input_delivery_evidence_from(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    message_id: &str,
+) -> Result<bool> {
+    let command_id = PeerCommand::Deliver {
+        conversation_id: conversation.into(),
+        trigger: crate::scheduling::message_trigger(message_id),
+    }
+    .id(network);
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM identity_meta WHERE key IN (?1,?2))",
+        params![
+            key(INBOUND, network, &command_id),
+            key(OUTBOUND, network, &command_id)
+        ],
+        |row| row.get(0),
+    )?)
+}
+
 fn load<T: serde::de::DeserializeOwned>(connection: &Connection, key: &str) -> Result<Option<T>> {
     let value: Option<String> = connection
         .query_row(

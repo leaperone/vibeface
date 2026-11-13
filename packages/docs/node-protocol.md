@@ -284,6 +284,12 @@ Memory 的 metadata 为 `{epoch, revision, control_revision, source_event_hash, 
 
 ## 可靠调度回执
 
+客户端在首次 `message` 调用前将入口 Node 的 `entry_device_id` 与 `submitting` 状态一并持久保存。结果未知时，保留原消息 ID、目标、正文和签名，回原入口对账；其他入口查无记录不能授权重发。尚无原入口记录的输入继续保留，不根据当前连接补写发送历史。本人可在输入状态中明确确认显示的当前设备就是原入口，再查询；确认只绑定该设备并读取原签名结果，不发送输入，连接已切换时拒绝绑定。旧版 `saved + input_not_saved` 且未绑定入口的记录也走这个确认流程；确认时先转为 `unknown` 并清除旧拒绝，只有新查询确认未保存才提供重试。绑定后不能改为其他入口。
+
+未知输入的 `input_receipt` 可带 `entry_device_id` 和完整原请求 `original_input`。仅这个入口 Node 能检查负证据；它核验当前通道客户端、网络、会话、目标、消息 ID 与原签名。已有原输入继续返回原逐阶段回执；任意同 ID 的原始事件（包括不生效的历史）、待导入事件、调度或对端投递记录都会阻止“未保存”结论。确无保留证据时返回 `{accepted:false, code:"input_not_saved", stored:false, entry_device_id, network_id, client_id, conversation_id, message_id, target, reason}`。客户端逐项绑定身份后恢复为本机 saved 拒绝状态，提供独立的“重试原输入”与“不再发送”，不自动重发。同目标后项仍为本机 saved 且没有回执时，可先选择“不再发送”；相同正文不会自动去重。重试只经同一入口提交完全相同的 ID 与签名；迟到原请求与重试在入口的 Immediate transaction 及稳定 job trigger 下去重。普通缺失错误和 `signed_receipt` 的 `not_seen_here` 仍不授予重发权限。
+
+同目标的回执查询、发送结果、恢复操作和历史接纳清理共用串行锁，锁内重新读取待发送记录。匹配原输入的回执（包括保留历史时的 `unknown`）清除旧的未保存拒绝，之后的未保存结果不能覆盖这份已有记录；历史已清理的待发送项也不会被迟到结果重新创建。
+
 本人普通输入使用 `InputPosted`。`message` 请求必需携带 `target`、`intent`、目标内 `sequence`，Task 修改还核验 `expected_revision`。实际提交目标为 Bot Main、稳定业务 Task、已登记 Work、Routine 或频道 Task。界面的频道成员目标先由客户端创建并绑定稳定 Task，再以 channel_task 提交；message 不直接接受 channel_member。签名覆盖目标、意图、顺序、revision、正文、完整附件和汇报选项。审批回答仍使用绑定原 `question_id` 的签名 `MessagePosted`，不能由普通输入冒充。
 
 连接身份绑定或会话权限检查失败仍返回 RPC 错误。进入 `message` 处理后的未保存拒绝返回 `{accepted:false, code:"input_not_saved", stored:false, message_id, reason}`。同一消息 ID 已有内容冲突时返回 `code:"input_conflict"` 和 `stored:true`，保留原记录。`accepted:true` 表示输入已保存，执行阶段仍以 `receipt` 为准。

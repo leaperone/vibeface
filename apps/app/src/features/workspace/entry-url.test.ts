@@ -348,6 +348,229 @@ test("workspace preserves bot and message requests while routing native decision
         await render().refresh()
       }
     })
+    await t.test('a lost first submission reconciles only at its bound entry and retries the original signed input by choice', async () => {
+      const previousOutbox = new Map(outboxItems), previousTranscript = transcript
+      const originalRpc = connection.rpc, entry = connection.entry.device_id, node = connection.info.device_id
+      const firstMessage = messages.length, firstSignature = signed.length
+      const queries: Record<string, unknown>[] = []
+      let missing = false, negativeOverride: Record<string, unknown> = {}
+      connection.rpc = async (method, body = {}) => {
+        if (method !== 'input_receipt') return originalRpc(method, body)
+        queries.push(structuredClone(body))
+        if (missing && body.original_input !== undefined) return { accepted: false, code: 'input_not_saved', stored: false, entry_device_id: entry, network_id: 'network', client_id: 'client', conversation_id: body.conversation_id, message_id: body.message_id, target: body.target, reason: '原入口未保存这条输入。', ...negativeOverride }
+        throw new Error(missing ? 'input not found' : 'receipt query unavailable')
+      }
+      try {
+        failMessage = true
+        assert.equal(await render().sendMessage('首次输入未落库'), true)
+        await new Promise(setImmediate)
+        const head = render().pendingMessages.find((item) => item.text === '首次输入未落库')
+        assert.ok(head)
+        const original = messages[firstMessage]
+        assert.ok(original)
+        const item = [...outboxItems.values()].find((item) => item.params.message_id === head.message_id)
+        assert.ok(item)
+        assert.equal(item.entry_device_id, entry, 'the first call must already have a durable original entry binding')
+        assert.equal(item.delivery, 'unknown')
+        assert.equal(await render().sendMessage('同目标后续输入'), true)
+        assert.equal(await render().sendMessage('首次输入未落库'), true)
+        await new Promise(setImmediate)
+        assert.equal(messages.length, firstMessage + 1, 'the unknown first write holds later input')
+        const duplicate = render().pendingMessages.find((item) => item.message_id !== head.message_id && item.text === head.text)
+        assert.ok(duplicate)
+        assert.equal(duplicate.delivery, 'saved')
+        await render().releaseMessagePending(duplicate.message_id)
+        assert.equal(messages.length, firstMessage + 1, 'discarding a later unsent duplicate never sends the first or later input')
+        assert.equal(render().pendingMessages.find((item) => item.message_id === head.message_id)?.delivery, 'unknown')
+
+        missing = true
+        connection.entry.device_id = connection.info.device_id = 'another-entry'
+        await assert.rejects(render().queryInput(head), /input not found/)
+        assert.equal(queries.at(-1)?.original_input, undefined, 'another Node only provides positive reconciliation')
+        assert.equal(render().pendingMessages.find((item) => item.message_id === head.message_id)?.delivery, 'unknown')
+        connection.entry.device_id = entry; connection.info.device_id = node
+        for (const changed of [{ client_id: 'another-client' }, { target: { kind: 'bot_main', bot_id: 'another-bot' } }]) {
+          negativeOverride = changed
+          await assert.rejects(render().queryInput(head), /不一致/)
+          assert.equal(render().pendingMessages.find((item) => item.message_id === head.message_id)?.delivery, 'unknown')
+        }
+        negativeOverride = {}
+        await memoryOutbox.put({ ...item, entry_device_id: undefined })
+        await assert.rejects(render().queryInput(head), /input not found/)
+        assert.equal(queries.at(-1)?.original_input, undefined, 'an older unbound unknown cannot infer its entry from this connection')
+        assert.equal(render().pendingMessages.find((item) => item.message_id === head.message_id)?.delivery, 'unknown')
+
+        connection.entry.device_id = connection.info.device_id = 'another-entry'
+        await assert.rejects(render().confirmInputEntry(head.message_id, entry), /原设备/)
+        assert.equal([...outboxItems.values()].find((item) => item.params.message_id === head.message_id)?.entry_device_id, undefined, 'a displayed entry cannot be confirmed after the connection changes')
+        connection.entry.device_id = entry; connection.info.device_id = node
+        await render().confirmInputEntry(head.message_id, entry)
+        assert.deepEqual(queries.at(-1)?.original_input, original, 'the full original ID, target, sequence and signature are reconciled unchanged')
+        assert.equal(queries.at(-1)?.entry_device_id, entry)
+        const recovered = render().pendingMessages.find((item) => item.message_id === head.message_id)
+        assert.equal(recovered?.delivery, 'saved')
+        assert.equal(recovered?.rejection_code, 'input_not_saved')
+        assert.equal(messages.length, firstMessage + 1, 'a negative receipt never automatically replays input')
+        await assert.rejects(render().confirmInputEntry(head.message_id, entry), /不能重新指定/)
+        failMessage = false
+        connection.entry.device_id = connection.info.device_id = 'another-entry'
+        await assert.rejects(render().retryPendingMessage(head.message_id), /原设备/)
+        assert.equal(messages.length, firstMessage + 1)
+        connection.entry.device_id = entry; connection.info.device_id = node
+        await render().retryPendingMessage(head.message_id)
+        await new Promise(setImmediate)
+        assert.deepEqual(messages[firstMessage + 1], original, 'retry sends the exact original signed request')
+        assert.equal(messages.length, firstMessage + 3, 'the later saved input advances after the original retry is accepted')
+        assert.equal(signed.length, firstSignature + 3, 'reconciliation, discard and retry do not sign another input')
+
+        failMessage = true
+        await render().sendMessage('稍后才落库的原输入'); await new Promise(setImmediate)
+        const late = render().pendingMessages.find((item) => item.text === '稍后才落库的原输入')
+        assert.ok(late)
+        await render().queryInput(late)
+        assert.equal(render().pendingMessages.find((item) => item.message_id === late.message_id)?.rejection_code, 'input_not_saved')
+        const writes = messages.length
+        transcript = [...transcript, posted(late.message_id)]
+        connection.rpc = originalRpc
+        await render().queryInput(late)
+        const received = render().pendingMessages.find((item) => item.message_id === late.message_id)
+        assert.ok(!received || received.delivery === 'accepted' && received.rejected === undefined, 'a late positive receipt supersedes the earlier absence proof')
+        assert.equal(messages.length, writes, 'reconciling a late positive receipt performs no message write')
+      } finally {
+        failMessage = false
+        connection.entry.device_id = entry; connection.info.device_id = node
+        connection.rpc = originalRpc
+        messages.splice(firstMessage); signed.splice(firstSignature)
+        transcript = previousTranscript
+        outboxItems.clear()
+        for (const [key, item] of previousOutbox) outboxItems.set(key, item)
+        await reload(); await render().refresh()
+      }
+    })
+    await t.test('an old absence write cannot replace positive receipts or restore a history-admitted input', async (race) => {
+      const previousOutbox = new Map(outboxItems), previousTranscript = transcript
+      const originalRpc = connection.rpc, originalOutbox = platform.outbox, originalLock = platform.inputLock
+      const submissions = messages.length, signatures = signed.length
+      platform.inputLock = (_name, save) => Promise.resolve(save())
+      try {
+        for (const result of ['entry_accepted', 'unknown', 'history', 'workspace_history'] as const) await race.test(result, async () => {
+          outboxItems.clear(); transcript = []
+          const item: OutboxItem = { key: `network.client:message:race-${result}`, method: 'message', created_at_ms: 1, delivery: 'unknown', entry_device_id: 'gateway', rejected: '等待查询',
+            params: { conversation_id: 'chat', message_id: `race-${result}`, target: { kind: 'bot_main', bot_id: 'bot' }, intent: 'continue', sequence: 1, text: '原输入', report_results: true, attestation: { device_id: 'client', signature: 'original-signature' } } }
+          await memoryOutbox.put(item)
+          await reload(); await render().refresh()
+          const input = workspaceModel.parsePendingMessage(item), writing = deferred(), resume = deferred()
+          const absence = { accepted: false, code: 'input_not_saved', stored: false, entry_device_id: 'gateway', network_id: 'network', client_id: 'client', conversation_id: 'chat', message_id: input.message_id, target: input.target, reason: '原设备未保存这条输入。' }
+          const receipt: InputReceipt = { message_id: input.message_id, target: input.target, stage: result === 'unknown' ? 'unknown' : 'entry_accepted', actual_turn_id: null, reason: '原输入已有记录', retry_safe: false, control_event: null }
+          let firstQuery = true, holdWrite = true
+          connection.rpc = async (method, body = {}) => {
+            if (method === 'workspace_history') return { events: [{ event_hash: 'input-event', created_at_ms: 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { ...item.params, type: 'input_posted' } }], coverage: { limit: 128, truncated: false, scope: 'workspace' } }
+            if (method !== 'input_receipt') return originalRpc(method, body)
+            if (firstQuery) { firstQuery = false; return absence }
+            return receipt
+          }
+          platform.outbox = { ...originalOutbox, put: async (next) => {
+            if (holdWrite && next.key === item.key && next.rejection_code === 'input_not_saved') {
+              holdWrite = false; writing.resolve(undefined); await resume.promise
+            }
+            await originalOutbox.put(next)
+          } }
+          const negative = render().queryInput(input)
+          let positive = Promise.resolve<unknown>(undefined)
+          try {
+            await writing.promise
+            if (result === 'history') { transcript = [posted(input.message_id)]; positive = render().refresh() }
+            else if (result === 'workspace_history') positive = render().readWorkspaceHistory()
+            else positive = render().queryInput(input)
+            await new Promise(setImmediate)
+            resume.resolve(undefined)
+            await Promise.all([negative, positive])
+            const latest = (await memoryOutbox.all()).find((entry) => entry.key === item.key)
+            if (result === 'history' || result === 'workspace_history') assert.equal(latest, undefined, 'history admission cannot be undone by an earlier absence write')
+            else {
+              assert.ok(latest)
+              assert.equal(latest.delivery, result === 'unknown' ? 'unknown' : 'accepted')
+              assert.equal(latest.receipt?.stage, result)
+              assert.equal(latest.rejection_code, undefined)
+              assert.equal(latest.rejected, undefined)
+              assert.deepEqual(latest.params, item.params)
+              if (result === 'unknown') {
+                firstQuery = true
+                assert.deepEqual(await render().queryInput(input), receipt, 'retained input knowledge outranks a later absence response')
+                assert.equal((await memoryOutbox.all()).find((entry) => entry.key === item.key)?.receipt?.stage, 'unknown')
+              }
+            }
+          } finally { resume.resolve(undefined); await Promise.allSettled([negative, positive]); platform.outbox = originalOutbox }
+        })
+        assert.equal(messages.length, submissions)
+        assert.equal(signed.length, signatures)
+      } finally {
+        platform.outbox = originalOutbox; platform.inputLock = originalLock; connection.rpc = originalRpc
+        transcript = previousTranscript; outboxItems.clear()
+        for (const [key, item] of previousOutbox) outboxItems.set(key, item)
+        await reload(); await render().refresh()
+      }
+    })
+    await t.test('legacy unsaved refusals require explicit original-device confirmation and a fresh signed-input query', async () => {
+      const previousOutbox = new Map(outboxItems), previousTranscript = transcript
+      const originalRpc = connection.rpc, submissions = messages.length, signatures = signed.length
+      const item: OutboxItem = { key: 'network.client:message:legacy-absence', method: 'message', created_at_ms: 1, delivery: 'saved', rejected: '原设备未保存', rejection_code: 'input_not_saved',
+        params: { conversation_id: 'chat', message_id: 'legacy-absence', target: { kind: 'bot_main', bot_id: 'bot' }, intent: 'continue', sequence: 1, text: '升级前的原输入', report_results: true, attestation: { device_id: 'client', signature: 'legacy-original-signature' } } }
+      const input = workspaceModel.parsePendingMessage(item), queries: Record<string, unknown>[] = []
+      try {
+        for (const outcome of ['unavailable', 'retained', 'missing'] as const) {
+          outboxItems.clear(); transcript = []
+          await memoryOutbox.put(item)
+          connection.rpc = async (method, body = {}) => {
+            if (method !== 'input_receipt') return originalRpc(method, body)
+            queries.push(structuredClone(body))
+            if (body.original_input === undefined) throw new Error('input not found')
+            const saved = (await memoryOutbox.all()).find((entry) => entry.key === item.key)
+            assert.ok(saved)
+            assert.equal(saved.delivery, 'unknown', 'the old absence permission is suspended before the new read')
+            assert.equal(saved.rejection_code, undefined)
+            assert.equal(saved.rejected, undefined)
+            if (outcome === 'unavailable') throw new Error('receipt query unavailable')
+            if (outcome === 'retained') return { message_id: input.message_id, target: input.target, stage: 'unknown', actual_turn_id: null, reason: '原输入仍有记录', retry_safe: false, control_event: null }
+            return { accepted: false, code: 'input_not_saved', stored: false, entry_device_id: 'gateway', network_id: 'network', client_id: 'client', conversation_id: 'chat', message_id: input.message_id, target: input.target, reason: '原设备未保存这条输入。' }
+          }
+          await reload(); await render().refresh()
+          await new Promise(setImmediate)
+          await assert.rejects(render().queryInput(input), /input not found/)
+          assert.equal((await memoryOutbox.all())[0]?.entry_device_id, undefined, 'ordinary reads cannot choose the missing original device')
+          await assert.rejects(render().retryPendingMessage(input.message_id), /缺少/)
+          if (outcome === 'unavailable') await assert.rejects(render().confirmInputEntry(input.message_id, 'gateway'), /receipt query unavailable/)
+          else await render().confirmInputEntry(input.message_id, 'gateway')
+          assert.deepEqual(queries.at(-1)?.original_input, item.params)
+          assert.equal(queries.at(-1)?.entry_device_id, 'gateway')
+          assert.equal(messages.length, submissions, 'confirmation and its fresh query never replay input')
+          const checked = (await memoryOutbox.all()).find((entry) => entry.key === item.key)
+          assert.ok(checked); assert.deepEqual(checked.params, item.params)
+          assert.equal(checked.entry_device_id, 'gateway')
+          assert.equal(checked.delivery, outcome === 'missing' ? 'saved' : 'unknown')
+          assert.equal(checked.rejection_code, outcome === 'missing' ? 'input_not_saved' : undefined)
+          if (outcome !== 'missing') {
+            if (outcome === 'unavailable') await assert.rejects(render().retryPendingMessage(input.message_id), /receipt query unavailable/)
+            else await render().retryPendingMessage(input.message_id)
+            assert.equal(messages.length, submissions)
+          } else {
+            const later = { ...item, key: 'network.client:message:legacy-later', rejected: undefined, rejection_code: undefined, params: { ...item.params, message_id: 'legacy-later', sequence: 2 } }
+            await memoryOutbox.put(later)
+            await render().releaseMessagePending('legacy-later')
+            await new Promise(setImmediate)
+            assert.equal(messages.length, submissions, 'plain later saved input remains discardable without replaying the head')
+            await render().retryPendingMessage(input.message_id); await new Promise(setImmediate)
+            assert.deepEqual(messages[submissions], item.params, 'only the separate retry sends the original request')
+            assert.equal(messages.length, submissions + 1)
+          }
+          assert.equal(signed.length, signatures)
+        }
+      } finally {
+        connection.rpc = originalRpc; transcript = previousTranscript; messages.splice(submissions); outboxItems.clear()
+        for (const [key, item] of previousOutbox) outboxItems.set(key, item)
+        await reload(); await render().refresh()
+      }
+    })
     await t.test('shared public history API fences late results, preserves pushed rows and restarts after authority changes', async () => {
       const originalRpc = connection.rpc
       const row = (message_id: string, at: number, text = message_id) => ({ message_id, event_hash: message_id, rank: String(at).padStart(20, '0'), role: 'user', text, created_at_ms: at })
@@ -2275,8 +2498,9 @@ test('both pending input controls retry only a matching safe refusal and keep al
   const targets: InputTarget[] = [{ kind: 'bot_main', bot_id: 'bot' }, { kind: 'task', task_id: 'task' }, { kind: 'channel_task', channel_id: 'channel', task_id: 'task', bot_id: 'bot' }, { kind: 'work', work_id: 'work' }, { kind: 'routine', bot_id: 'bot', trigger: 'schedule:one' }, { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' }]
   for (const platform of ['web', 'native']) for (const target of targets) {
     let pending: PendingMessage = { report_results: true, message_id: 'original', conversation_id: 'chat', target, intent: 'continue', text: '保留原交代', sequence: 1, created_at_ms: 1, delivery: 'unknown', attachments: [{ hash: 'a'.repeat(64), size: 3, name: 'notes.txt' }] }
-    const retries: string[] = [], closed: string[] = []
-    const shared = { ...parityShared(), workspaceState: { channels: [], tasks: [], assignments: [], inputs: [] as WorkspaceDomainState['inputs'], coverage: { limit: 128, truncated: false } },
+    const retries: string[] = [], closed: string[] = [], confirmed: [string, string][] = []
+    const shared = { ...parityShared(), info: { device_id: 'original-entry', name: '本人电脑' }, workspaceState: { channels: [], tasks: [], assignments: [], inputs: [] as WorkspaceDomainState['inputs'], coverage: { limit: 128, truncated: false } },
+      confirmInputEntry: async (messageId: string, entry: string) => { confirmed.push([messageId, entry]); pending = { ...pending, entry_device_id: entry } },
       queryInput: async () => { pending = { ...pending, delivery: 'accepted', receipt: { message_id: pending.message_id, target, stage: 'refused', retry_safe: true, control_event: 'c'.repeat(64), actual_turn_id: null, reason: '可以重试原输入' } } },
       retryPendingMessage: async (id: string) => { retries.push(id) },
       releaseMessagePending: async (id: string) => { closed.push(id) },
@@ -2293,6 +2517,15 @@ test('both pending input controls retry only a matching safe refusal and keep al
     try {
       assert.equal(button('重试原输入'), undefined, 'unknown delivery alone never authorizes replay')
       assert.equal(button('关闭提醒'), undefined); assert.equal(button('不再发送'), undefined)
+      assert.ok(button('确认原设备并查询'))
+      assert.match(componentText(render()), /本人电脑 · original/)
+      const namedDevice = shared.info.name
+      shared.info.name = ''; assert.match(componentText(render()), /当前连接的设备/)
+      shared.info.name = namedDevice
+      await press('确认原设备并查询')
+      assert.deepEqual(confirmed, [['original', 'original-entry']])
+      assert.equal(button('确认原设备并查询'), undefined, 'a confirmed entry cannot be replaced')
+      assert.deepEqual(retries, [], 'confirming the original device never invokes retry')
       await press('查询结果')
       const accepted = pending
       assert.ok(accepted.receipt)
@@ -2325,9 +2558,29 @@ test('both pending input controls retry only a matching safe refusal and keep al
       shared.workspaceState.inputs = [queued]; assert.equal(button('重试原输入'), undefined)
       assert.ok(button('关闭提醒'), 'the matched refused receipt determines closure, not a queue flag')
       shared.workspaceState.inputs = [{ ...queued, deferred: false, cancelled: true }]; assert.equal(button('重试原输入'), undefined); assert.ok(button('关闭提醒'))
+      pending = { ...accepted, entry_device_id: undefined, delivery: 'saved', receipt: undefined, rejected: '原输入未保存', rejection_code: 'input_not_saved' }
+      shared.workspaceState.inputs = []
+      assert.equal(button('重试原输入'), undefined, 'an old absence result cannot authorize retry without confirming its original device')
+      assert.match(componentText(render()), /尚未确认原设备是否保存这条输入/)
+      assert.ok(button('确认原设备并查询'))
+      assert.ok(button('不再发送'))
+      shared.connectionOnline = false; assert.equal(button('确认原设备并查询'), undefined); shared.connectionOnline = true
+      for (const marker of [{ release_expected_event: 'c'.repeat(64) }, { release_command_id: 'a'.repeat(64) }]) {
+        const legacy = pending
+        pending = { ...legacy, ...marker }; assert.equal(button('确认原设备并查询'), undefined)
+        pending = legacy
+      }
+      await press('确认原设备并查询')
+      assert.deepEqual(confirmed, [['original', 'original-entry'], ['original', 'original-entry']])
+      assert.deepEqual(retries, ['original'], 'confirming an older refusal also stays separate from retry')
       pending = { ...accepted, delivery: 'saved', receipt: undefined, rejected: '原输入未保存', rejection_code: 'input_not_saved' }
       assert.equal(button('关闭提醒'), undefined); assert.ok(button('不再发送'))
+      shared.workspaceState.inputs = []
+      assert.ok(button('重试原输入'), 'authoritative not-saved evidence exposes the existing separate retry action')
+      await press('重试原输入'); assert.deepEqual(retries, ['original', 'original'])
       await press('不再发送'); assert.deepEqual(closed, ['original', 'original', 'original'])
+      pending = { ...accepted, delivery: 'saved', receipt: undefined, rejected: undefined, rejection_code: undefined }
+      assert.ok(button('不再发送'), 'a later saved input can be discarded before an unknown earlier input is retried')
     } finally { app.close() }
   }
 })

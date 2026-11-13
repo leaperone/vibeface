@@ -15,7 +15,7 @@ import {
   inputText, parseConversation, parseNodes, parseNotifications,
   parseBot, parseBots, parseCreateBot, parsePrimary, parsePendingBot, record,
   parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseAnswer, parseOpenWorks, parseRecords, parseWorkspaceOverview, attachmentName, signedOrder, attachmentLimit,
-  parseInputReceipt, parsePendingMessage, parseScopeContext, parseWorkDetail, parseWorkspaceCommand, parseWorkspaceCommandResult, parseWorkspaceCommandNotSaved, parseWorkspaceHistory, parseWorkspaceState,
+  parseInputReceipt, parseInputNotSaved, parsePendingMessage, parseScopeContext, parseWorkDetail, parseWorkspaceCommand, parseWorkspaceCommandResult, parseWorkspaceCommandNotSaved, parseWorkspaceHistory, parseWorkspaceState,
 } from "./model.ts"
 import type { Attachment } from "../chat/types.ts"
 import type { Avatar } from "../avatar/face.ts"
@@ -28,7 +28,7 @@ import { networkKey, newId, storageOf } from "./storage.ts"
 import type {
   HistorySection, AnswerResult, ConversationPayload, MemoryBase, MemoryControlResult, NodeInfo, NotificationRecord, PendingAnswer, Question,
   PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, WriteState, WriteStatus, OpenWork, ScheduleAction, WorkspaceOverview,
-  InputControlAction, InputOptions, InputReceipt, InputTarget, WorkDetailWork, WorkspaceCommand, WorkspaceCommandResult, WorkspaceCommandNotSaved, WorkspaceDomainState, WorkspaceFilter,
+  InputControlAction, InputOptions, InputReceipt, InputNotSaved, InputTarget, WorkDetailWork, WorkspaceCommand, WorkspaceCommandResult, WorkspaceCommandNotSaved, WorkspaceDomainState, WorkspaceFilter,
 } from "./types.ts"
 import { isMainNotification, isReplyEnded, isSessionNotification, isTerminalJobState } from "./types.ts"
 
@@ -68,6 +68,14 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     delete: (key) => platform.outbox.delete(key),
   }
   const outboxKey = (kind: string, id: string) => `${prefix}${kind}:${id}`
+  const inputDeliveries = useRef(new Map<string, Promise<unknown>>())
+  const withInputDelivery = async <T,>(lane: string, deliver: () => Promise<T>): Promise<T> => {
+    const key = outboxKey('input-delivery', lane)
+    const pending = (inputDeliveries.current.get(key) ?? Promise.resolve()).catch(() => {}).then(() => inputLock(key, deliver))
+    inputDeliveries.current.set(key, pending)
+    try { return await pending }
+    finally { if (inputDeliveries.current.get(key) === pending) inputDeliveries.current.delete(key) }
+  }
   /** This device's signature over the exact event body the Node will write for it. */
   const attest = async (scope: string, body: Record<string, unknown>) =>
     ({ device_id: clientId, signature: await platform.transport.signClient("attestation", platform.secure.attestationPayload(networkId, scope, JSON.stringify(body))) })
@@ -318,7 +326,11 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const admitted = (item: PendingMessage) => item.rejection_code !== 'input_conflict' && item.receipt?.stage !== 'refused' && item.receipt?.stage !== 'unknown' && item.conversation_id === id && next.messages.some((message) => message.message_id === item.message_id)
     const landed = answersRef.current.filter((item) => next.messages.some((message) => message.message_id === answerId(item.question_id)))
     if (current() && (messagesRef.current.some(admitted) || landed.length)) {
-      for (const item of messagesRef.current.filter(admitted)) await outbox.delete(outboxKey("message", item.message_id))
+      for (const item of messagesRef.current.filter(admitted)) await withInputDelivery(messageLane(item), async () => {
+        if (!current()) return
+        const latest = (await outbox.all()).find((entry) => entry.key === outboxKey('message', item.message_id))
+        if (current() && latest && admitted(parsePendingMessage(latest))) await outbox.delete(latest.key)
+      })
       for (const item of landed) await outbox.delete(outboxKey("answer", item.question_id))
       await outboxChanged()
     }
@@ -698,13 +710,19 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     requireCurrent()
     const next = parseWorkspaceHistory(await connection.rpc('workspace_history', filter))
     requireCurrent()
-    const admitted = next.events.flatMap((event) => event.body.type === 'input_posted' ? [{ ...event.body, conversation_id: event.scope_id }] : [])
+    const admitted = (pending: PendingMessage) => next.events.some((event) => event.body.type === 'input_posted' && event.body.message_id === pending.message_id && event.scope_id === pending.conversation_id && inputTargetKey(event.body.target) === inputTargetKey(pending.target))
     let cleared = false
     for (const item of (await outbox.all()).filter((item) => item.method === 'message')) {
       const pending = parsePendingMessage(item)
-      if (pending.rejection_code === 'input_conflict' || pending.receipt?.stage === 'refused' || pending.receipt?.stage === 'unknown' || item.release_expected_event !== undefined) continue
-      if (!admitted.some((input) => input.message_id === pending.message_id && input.conversation_id === pending.conversation_id && inputTargetKey(input.target) === inputTargetKey(pending.target))) continue
-      await outbox.delete(item.key); cleared = true
+      if (!admitted(pending)) continue
+      await withInputDelivery(messageLane(pending), async () => {
+        const latest = (await outbox.all()).find((entry) => entry.key === item.key)
+        requireCurrent()
+        if (!latest) return
+        const checked = parsePendingMessage(latest)
+        if (checked.rejection_code === 'input_conflict' || checked.receipt?.stage === 'refused' || checked.receipt?.stage === 'unknown' || latest.release_expected_event !== undefined || !admitted(checked)) return
+        await outbox.delete(latest.key); cleared = true
+      })
     }
     if (cleared) await outboxChanged()
     return next
@@ -815,11 +833,45 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const scope = target.kind === 'task' || target.kind === 'channel_task' ? JSON.stringify(['workspace_task', target.task_id]) : inputTargetKey(target)
     return `${message.conversation_id}:${scope}`
   }
-  const queryInput = async (input: { message_id: string; target: InputTarget; conversation_id?: string }): Promise<InputReceipt> => {
+  const requireInputEntry = (entry: string) => {
+    requireCurrent()
+    if (connection.info.device_id !== entry || connection.entry.device_id !== entry) throw new Error('请连接这条输入的原设备后再操作。')
+  }
+  const withPendingInput = async <T,>(messageId: string, action: (item: OutboxItem) => Promise<T>): Promise<T> => {
+    requireCurrent()
+    const read = async () => {
+      const item = (await outbox.all()).find((item) => item.key === outboxKey('message', messageId))
+      if (!item) throw new Error('这条输入已不在本地待发送队列。')
+      return item
+    }
+    const lane = messageLane(parsePendingMessage(await read()))
+    if (messageTargets.current.has(lane)) throw new Error('正在处理这个目标的输入，请稍后查询。')
+    return withInputDelivery(lane, async () => { requireCurrent(); return action(await read()) })
+  }
+  // The caller holds this target's delivery lock throughout the read and reconciliation.
+  const readInputReceipt = async (input: { message_id: string; target: InputTarget; conversation_id?: string }): Promise<InputReceipt | InputNotSaved> => {
     requireCurrent()
     const id = targetConversation(input.target, input.conversation_id)
-    const receipt = parseInputReceipt(await connection.rpc('input_receipt', { message_id: input.message_id, conversation_id: id, target: input.target }))
+    const original = (await outbox.all()).find((item) => item.key === outboxKey('message', input.message_id))
+    const pending = original ? parsePendingMessage(original) : null
+    const reconcile = original && pending?.conversation_id === id && inputTargetKey(pending.target) === inputTargetKey(input.target) && original.entry_device_id === connection.info.device_id && original.entry_device_id === connection.entry.device_id && (pending.delivery === 'unknown' || pending.delivery === 'submitting') && original.release_expected_event === undefined && original.release_command_id === undefined
     requireCurrent()
+    if (reconcile && original.entry_device_id !== undefined) requireInputEntry(original.entry_device_id)
+    const value = await connection.rpc('input_receipt', { message_id: input.message_id, conversation_id: id, target: input.target, ...(reconcile ? { entry_device_id: original.entry_device_id, original_input: original.params } : {}) })
+    requireCurrent()
+    const notSaved = parseInputNotSaved(value)
+    if (notSaved) {
+      if (!reconcile || notSaved.entry_device_id !== original.entry_device_id || notSaved.network_id !== networkId || notSaved.client_id !== clientId || notSaved.conversation_id !== id || notSaved.message_id !== input.message_id || inputTargetKey(notSaved.target) !== inputTargetKey(input.target)) throw new Error('设备返回的输入状态与原内容不一致，原输入已保留。')
+      requireInputEntry(notSaved.entry_device_id)
+      const latest = (await outbox.all()).find((item) => item.key === original.key)
+      if (latest?.receipt !== undefined) return latest.receipt
+      if (latest && latest.entry_device_id === notSaved.entry_device_id && (latest.delivery === 'unknown' || latest.delivery === 'submitting') && latest.release_expected_event === undefined && latest.release_command_id === undefined) {
+        await outbox.put({ ...latest, delivery: 'saved', receipt: undefined, rejected: notSaved.reason, rejection_code: 'input_not_saved' })
+        await outboxChanged()
+      }
+      return notSaved
+    }
+    const receipt = parseInputReceipt(value)
     if (receipt.message_id !== input.message_id || inputTargetKey(receipt.target) !== inputTargetKey(input.target)) throw new Error('输入回执和查询目标不匹配，已保留原输入。')
     const items = await outbox.all(), item = items.find((item) => item.key === outboxKey('message', input.message_id))
     if (item) {
@@ -830,12 +882,32 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       })
       const releaseUnconfirmed = item.release_expected_event !== undefined && !releaseRejected && (!receipt.control_event?.trim() || receipt.control_event === item.release_expected_event)
       const uncertain = receipt.stage === 'unknown' || releaseUnconfirmed
-      await outbox.put({ ...item, receipt: releaseUnconfirmed ? item.receipt ?? receipt : receipt, delivery: uncertain ? 'unknown' : 'accepted', ...(!releaseUnconfirmed ? { release_expected_event: undefined, release_command_id: undefined } : {}) })
+      await outbox.put({ ...item, receipt: releaseUnconfirmed ? item.receipt ?? receipt : receipt, delivery: uncertain ? 'unknown' : 'accepted', ...(item.rejection_code === 'input_not_saved' ? { rejected: undefined, rejection_code: undefined } : {}), ...(!releaseUnconfirmed ? { release_expected_event: undefined, release_command_id: undefined } : {}) })
       await outboxChanged()
       if (!uncertain) flushMessagesRef.current()
     }
     return receipt
   }
+  const queryInput = async (input: Parameters<typeof readInputReceipt>[0]) => {
+    requireCurrent()
+    const id = targetConversation(input.target, input.conversation_id)
+    return withInputDelivery(messageLane({ target: input.target, conversation_id: id }), () => readInputReceipt({ ...input, conversation_id: id }))
+  }
+  const confirmInputEntry = (messageId: string, expectedEntry: string) => withPendingInput(messageId, async (item) => {
+    requireInputEntry(expectedEntry)
+    const pending = parsePendingMessage(item), lane = messageLane(pending)
+    const legacyAbsence = pending.delivery === 'saved' && pending.rejection_code === 'input_not_saved' && pending.receipt === undefined
+    if (item.entry_device_id !== undefined || pending.delivery !== 'unknown' && pending.delivery !== 'submitting' && !legacyAbsence || item.release_expected_event !== undefined || item.release_command_id !== undefined) throw new Error('这条输入不能重新指定原设备。')
+    if (messageTargets.current.has(lane)) throw new Error('正在查询这个目标的输入，请稍后再试。')
+    messageTargets.current.add(lane)
+    try {
+      requireInputEntry(expectedEntry)
+      await outbox.put({ ...item, entry_device_id: expectedEntry, ...(legacyAbsence ? { delivery: 'unknown', rejected: undefined, rejection_code: undefined } : {}) })
+      await outboxChanged()
+      requireInputEntry(expectedEntry)
+      return await readInputReceipt(pending)
+    } finally { messageTargets.current.delete(lane) }
+  })
   const readScopeContext = async (input: { target: InputTarget; conversation_id?: string }) => {
     requireCurrent()
     const id = targetConversation(input.target, input.conversation_id)
@@ -848,20 +920,21 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const targets = messageTargets.current
     if (targets.has(lane) || !current() || !tabs.leader()) return
     targets.add(lane)
-    try {
+    const deliver = async () => {
       for (;;) {
         if (!current()) return
         const item = (await outbox.all()).filter((item) => item.method === 'message' && item.delivery !== 'accepted' && messageLane(parsePendingMessage(item)) === lane).sort((a, b) => Number(a.params.sequence) - Number(b.params.sequence) || a.created_at_ms - b.created_at_ms)[0]
         if (!item || item.rejected !== undefined) return
         const pending = parsePendingMessage(item)
         if (item.delivery === 'unknown' || item.delivery === 'submitting' || item.delivery === undefined) {
-          await queryInput(pending)
+          await readInputReceipt(pending)
           const checked = (await outbox.all()).find((entry) => entry.key === item.key)
           if (checked?.delivery !== 'accepted') return
           continue
         }
         let sending = item
         try {
+          if (item.entry_device_id !== undefined) requireInputEntry(item.entry_device_id)
           if (item.prerequisite) {
             const command = parseWorkspaceCommand(item.prerequisite.params.command)
             const known = command.kind === 'create_task' && workspaceStateRef.current?.tasks.some((task) => task.task_id === command.task_id && task.owner_bot === command.owner_bot && task.channel_id === command.channel_id)
@@ -875,8 +948,11 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
           }
           requireCurrent()
           if (!(await outbox.all()).some((entry) => entry.key === item.key)) continue
-          sending = { ...sending, delivery: 'submitting' }
+          const entry = item.entry_device_id ?? connection.info.device_id
+          requireInputEntry(entry)
+          sending = { ...sending, delivery: 'submitting', entry_device_id: entry }
           await outbox.put(sending); await outboxChanged()
+          requireInputEntry(entry)
           const receipt = await connection.rpc('message', item.params)
           requireCurrent()
           const result = record(receipt)
@@ -903,7 +979,9 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
           return
         }
       }
-    } catch (caught) { showError(caught, '查询已保存的输入') }
+    }
+    try { await withInputDelivery(lane, deliver) }
+    catch (caught) { showError(caught, '查询已保存的输入') }
     finally { targets.delete(lane) }
   }
   const flushMessages = () => {
@@ -991,10 +1069,8 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       if (renderedConnection.current === connection && alive.current) setMessageBusy(localMessageSaves.current > 0)
     }
   }
-  const retryPendingMessage = async (messageId: string) => {
+  const retryPendingMessage = (messageId: string) => withPendingInput(messageId, async (item) => {
     if (renderedConnection.current !== connection || !alive.current) throw new Error('工作区已切换，先读取当前输入。')
-    const item = (await outbox.all()).find((item) => item.key === outboxKey('message', messageId))
-    if (!item) throw new Error('这条输入已不在本地待发送队列。')
     const pending = parsePendingMessage(item)
     const lane = messageLane(pending), targets = messageTargets.current
     if (targets.has(lane)) throw new Error('正在处理这个目标的输入，请稍后查询。')
@@ -1004,18 +1080,20 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       if (pending.rejection_code === 'input_conflict') throw new Error('设备保存的原输入和本地内容不同，已保留两边内容。请先查看原输入。')
       const queued = workspaceStateRef.current?.inputs.find((input) => input.input.message_id === messageId && input.conversation_id === pending.conversation_id && inputTargetKey(input.input.target) === inputTargetKey(pending.target))
       if (queued?.cancelled || queued?.deferred) throw new Error('这条输入已保存到设备。请查看状态，再使用对应操作。')
-      if (pending.delivery === 'saved' && (pending.rejection_code === 'input_not_saved' || pending.receipt === undefined)) {
+      if (pending.delivery === 'saved' && pending.receipt === undefined) {
         requireWritable()
+        if (pending.rejection_code === 'input_not_saved' && item.entry_device_id === undefined) throw new Error('这条输入缺少原设备记录，已保留原内容。')
+        if (item.entry_device_id !== undefined) requireInputEntry(item.entry_device_id)
         await outbox.put({ ...item, rejected: undefined, rejection_code: undefined, receipt: undefined, delivery: 'saved' })
         await outboxChanged()
         resume = true
         return
       }
-      const receipt = await queryInput(pending)
+      const receipt = await readInputReceipt(pending)
       const latest = (await outbox.all()).find((entry) => entry.key === item.key)
       if (!latest) { resume = true; return }
       resume = latest.delivery === 'accepted'
-      if (pending.delivery !== 'accepted' || item.release_expected_event !== undefined || receipt.stage !== 'refused' || !receipt.retry_safe || !receipt.control_event?.trim()) {
+      if (pending.delivery !== 'accepted' || item.release_expected_event !== undefined || !('stage' in receipt) || receipt.stage !== 'refused' || !receipt.retry_safe || !receipt.control_event?.trim()) {
         setNoticeText(receipt.reason ?? '已保留原输入，未重复提交。')
         return
       }
@@ -1031,7 +1109,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       let failure: unknown
       try { await submitWorkspaceCommand(control); scheduleRefresh() }
       catch (caught) { failure = caught }
-      try { await queryInput(pending) }
+      try { await readInputReceipt(pending) }
       catch (caught) { throw failure ?? caught }
       const confirmed = (await outbox.all()).find((entry) => entry.key === item.key)
       resume = confirmed?.delivery === 'accepted'
@@ -1044,22 +1122,20 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       targets.delete(lane)
       if (resume) flushMessages()
     }
-  }
-  const releaseMessagePending = async (messageId: string) => {
+  })
+  const releaseMessagePending = (messageId: string) => withPendingInput(messageId, async (item) => {
     if (renderedConnection.current !== connection || !alive.current) throw new Error('工作区已切换，先读取当前输入。')
-    const item = (await outbox.all()).find((item) => item.key === outboxKey('message', messageId))
-    if (!item) throw new Error('这条输入已不在本地待发送队列。')
     const pending = parsePendingMessage(item)
     if (messageTargets.current.has(messageLane(pending))) throw new Error('这个目标仍在提交输入，先查询原输入的结果。')
     if (pending.rejection_code === 'input_conflict') throw new Error('设备保存的原输入和本地内容不同，已保留两边内容。请先查看原输入。')
-    let notice = '已放弃这条未发送的输入。'
+    let notice = '已从本机待发送队列移除。'
     if (pending.delivery === 'unknown' || pending.delivery === 'submitting' || pending.delivery === 'accepted' || pending.receipt !== undefined || pending.release_expected_event !== undefined || pending.release_command_id !== undefined) {
-      const receipt = await queryInput(pending)
+      const receipt = await readInputReceipt(pending)
       const latest = (await outbox.all()).find((entry) => entry.key === item.key)
       if (!latest) return
       const checked = parsePendingMessage(latest)
       if (checked.message_id !== pending.message_id || checked.conversation_id !== pending.conversation_id || inputTargetKey(checked.target) !== inputTargetKey(pending.target)) throw new Error('本地输入已变化，内容仍保留。请再查询。')
-      if (checked.rejection_code === 'input_conflict' || checked.delivery !== 'accepted' || receipt.stage !== 'refused' || checked.receipt?.stage !== 'refused' || checked.release_expected_event !== undefined || checked.release_command_id !== undefined) throw new Error('这条输入还不能关闭提醒，原内容已保留。请继续查询结果。')
+      if (checked.rejection_code === 'input_conflict' || !('stage' in receipt) || checked.delivery !== 'accepted' || receipt.stage !== 'refused' || checked.receipt?.stage !== 'refused' || checked.release_expected_event !== undefined || checked.release_command_id !== undefined) throw new Error('这条输入还不能关闭提醒，原内容已保留。请继续查询结果。')
       notice = '已关闭这条输入的提醒。'
     }
     requireCurrent()
@@ -1067,7 +1143,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     await outboxChanged()
     flushMessages()
     setNoticeText(notice)
-  }
+  })
   const interruptRegisteredWork = async (id: string, workId: string) => {
     requireCurrent()
     const work = (dataRef.current?.conversation?.conversation_id === id ? dataRef.current.works.find((item) => item.work_id === workId) : undefined)
@@ -1161,7 +1237,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       else { onScreen.current = null; setFresh(new Set<string>()) }
     }, nodes, conversationId, data, fresh, notifications, ignoredNotifications, questions, openWorks, overview, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
     historyLoading, loadHistory, cancelHistory, refreshing, incomplete, chatSlot, pendingMessages, messageBusy, canSaveMessages, liveProgress, interrupted,
-    workspaceState, readWorkspaceState, readWorkspaceHistory, workspaceCommand, queryInput, readScopeContext, readWork, stopInputTarget, retryPendingMessage, releaseMessagePending,
+    workspaceState, readWorkspaceState, readWorkspaceHistory, workspaceCommand, queryInput, confirmInputEntry, readScopeContext, readWork, stopInputTarget, retryPendingMessage, releaseMessagePending,
     controlInput: (input: { message_id: string; expected_event: string; action: InputControlAction }) => workspaceCommand({ kind: 'control_input', ...input }),
     joined, synced,
     writable: joined && booted && current() && sameRead() && writeState.state === "writable",

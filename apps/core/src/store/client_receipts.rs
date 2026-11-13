@@ -1,9 +1,73 @@
-//! Positive evidence for a native client's exact signed command. Absence never permits replay.
+//! Exact signed request receipts; only original-entry input reconciliation can prove absence.
 use super::*;
 use crate::workspace::{WORKSPACE_SCOPE, WorkspaceCommand};
 use serde_json::json;
 
 impl Store {
+    pub(crate) fn client_input_receipt(
+        &self,
+        network: &str,
+        client_id: &str,
+        entry_device_id: &str,
+        original: &Value,
+    ) -> Result<Option<Value>> {
+        let conversation = original["conversation_id"]
+            .as_str()
+            .context("original conversation is missing")?;
+        let input: crate::workspace::InputRequest = serde_json::from_value(original.clone())?;
+        let attestation: Attestation = serde_json::from_value(original["attestation"].clone())?;
+        vibeface_protocol::validate_id(&input.message_id).map_err(anyhow::Error::msg)?;
+        ensure!(input.route.sequence > 0, "invalid input sequence");
+        ensure!(
+            attestation.device_id == client_id,
+            "receipt belongs to another client"
+        );
+        membership_from(&self.connection, network)?.client(client_id)?;
+        let body = EventBody::InputPosted {
+            message_id: input.message_id.clone(),
+            target: input.route.target.clone(),
+            intent: input.route.intent,
+            sequence: input.route.sequence,
+            expected_revision: input.route.expected_revision,
+            text: input.text.clone(),
+            attachments: input.attachments.clone(),
+            report_results: Some(input.report_results),
+            attestation: Some(attestation.clone()),
+        };
+        crate::crypto::verify_attestation(network, conversation, &body)?;
+        let resolved = self.resolve_input_target(network, &input.route.target)?;
+        ensure!(
+            resolved.conversation_id == conversation,
+            "input target belongs to another conversation"
+        );
+        if let Some(saved) = self.workspace_input(network, &input.message_id)? {
+            ensure!(
+                saved.conversation_id == conversation && saved.input == input,
+                "input ID already has another signed intent"
+            );
+            let source = log::event_from(&self.connection, network, &saved.source_event)?
+                .context("input event is missing")?;
+            ensure!(
+                source.body.attestation() == Some(&attestation),
+                "input ID belongs to another signer"
+            );
+            return Ok(None);
+        }
+        if self.input_evidence(network, conversation, &input.message_id)? {
+            return Ok(Some(
+                json!({"message_id":input.message_id,"target":input.route.target,
+                "stage":"unknown","actual_turn_id":null,"control_event":null,
+                "reason":"这条输入仍有记录，暂时无法确认是否保存。","retry_safe":false}),
+            ));
+        }
+        Ok(Some(
+            json!({"accepted":false,"code":"input_not_saved","stored":false,
+            "entry_device_id":entry_device_id,"network_id":network,"client_id":client_id,
+            "conversation_id":conversation,"message_id":input.message_id,"target":input.route.target,
+            "reason":"原设备未保存这条输入，可选择重试原输入或不再发送。"}),
+        ))
+    }
+
     pub fn client_workspace_receipt(
         &self,
         network: &str,

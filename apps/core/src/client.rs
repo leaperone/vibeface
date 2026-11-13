@@ -1833,6 +1833,14 @@ async fn connection_entry(node: &Runtime) -> Result<Value> {
 }
 
 fn bind_client_identity(input: &mut Value, subject: &str) -> Result<()> {
+    if input["method"] == "input_receipt"
+        && let Some(signer) = input.pointer("/original_input/attestation/device_id")
+    {
+        ensure!(
+            signer.as_str() == Some(subject),
+            "the original input is signed by another device"
+        );
+    }
     if let Some(signer) = input.pointer("/attestation/device_id") {
         ensure!(
             signer.as_str() == Some(subject),
@@ -1854,6 +1862,7 @@ fn bind_client_identity(input: &mut Value, subject: &str) -> Result<()> {
                 | "ack"
                 | "workspace_command_receipt"
                 | "signed_receipt"
+                | "input_receipt"
         )
     ) {
         input
@@ -5339,6 +5348,10 @@ mod tests {
         let mut input = json!({"method":"notifications"});
         bind_client_identity(&mut input, "actual-client").unwrap();
         assert_eq!(input["client_id"], "actual-client");
+        let mut receipt = json!({"method":"input_receipt","original_input":{"attestation":{"device_id":"actual-client"}}});
+        bind_client_identity(&mut receipt, "actual-client").unwrap();
+        assert_eq!(receipt["client_id"], "actual-client");
+        assert!(bind_client_identity(&mut json!({"method":"input_receipt","original_input":{"attestation":{"device_id":"another-client"}}}), "actual-client").is_err());
         assert!(
             bind_client_identity(
                 &mut json!({"method":"ack","client_id":"another-client"}),

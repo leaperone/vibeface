@@ -19,6 +19,11 @@ export type InputReceipt = {
   stage: 'entry_accepted' | 'owner_accepted' | 'submitting' | 'provider_accepted' | 'associated' | 'refused' | 'unknown'
   actual_turn_id: string | null; reason: string | null; retry_safe: boolean; control_event: string | null
 }
+export type InputNotSaved = {
+  accepted: false; code: 'input_not_saved'; stored: false
+  entry_device_id: string; network_id: string; client_id: string; conversation_id: string
+  message_id: string; target: InputTarget; reason: string
+}
 export type ScopeContext = { conversation_id: string; target: InputTarget } & (
   | { available: true; context: ContextProjection; reason: null }
   | { available: false; context: null; reason: string | null }
