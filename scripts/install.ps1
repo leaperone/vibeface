@@ -32,16 +32,14 @@ function Fail {
     exit 1
 }
 
-# The release tags of one channel, newest last. A tag of another product, a draft, or a tag
-# whose shape is not exactly this project's is left out rather than guessed at.
+# The release tags of one channel, newest last. A tag of another product, or a tag whose shape
+# is not exactly this project's, is left out rather than guessed at. Whether a tag's release is
+# published, a draft or a prerelease is checked when that release is looked up.
 function Select-Release {
-    param([object[]] $Releases, [string] $Channel)
+    param([string[]] $Tags, [string] $Channel)
     $wanted = $Channel -eq 'nightly'
     $ordered = @()
-    foreach ($release in $Releases) {
-        if ($release.draft -ne $false) { continue }
-        if ($release.prerelease -ne $wanted) { continue }
-        $tag = [string] $release.tag_name
+    foreach ($tag in $Tags) {
         $shape = if ($wanted) {
             '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-nightly\.([0-9]{8})\.([1-9][0-9]*)$'
         } else {
@@ -73,19 +71,32 @@ function Select-Release {
     return ($ordered | Sort-Object Major, Minor, Patch, Day, Build)
 }
 
+# Returns $false only for HTTP 404; any other failure stops the installation.
 function Get-OptionalDownload {
-    param([string] $Url, [string] $Path, [int64] $Limit)
+    param([string] $Url, [string] $Path, [int64] $Limit, [string] $Label = 'completion manifest',
+          [string] $Accept = '*/*')
     try {
         Invoke-WebRequest -Uri $Url -OutFile $Path -UseBasicParsing -MaximumRedirection 5 `
-            -UserAgent 'vibeface-installer' -TimeoutSec 180
+            -Headers @{ Accept = $Accept } -UserAgent 'vibeface-installer' -TimeoutSec 180
     } catch {
         $status = 0
         if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
         if ($status -eq 404) { return $false }
-        Fail 'completion manifest download failed (network or GitHub API limit)'
+        Fail "$Label download failed (network or GitHub API limit)"
     }
-    if ((Get-Item -LiteralPath $Path).Length -gt $Limit) { Fail 'release completion manifest exceeds limit' }
+    if ((Get-Item -LiteralPath $Path).Length -gt $Limit) { Fail "$Label exceeds its size limit" }
     return $true
+}
+
+function Get-OptionalJson {
+    param([string] $Url, [string] $Label)
+    $file = Join-Path $script:Scratch ('json-' + [guid]::NewGuid().ToString('N'))
+    if (-not (Get-OptionalDownload -Url $Url -Path $file -Limit $MaxJson -Label $Label `
+            -Accept 'application/vnd.github+json')) {
+        return $null
+    }
+    try { return (Get-Content -LiteralPath $file -Raw | ConvertFrom-Json -ErrorAction Stop) }
+    catch { Fail 'invalid GitHub release response' }
 }
 
 function Confirm-Completion {
@@ -283,15 +294,14 @@ function Install-Release {
         Fail 'vibeface already exists in the bin directory; use update apply for a managed installation'
     }
 
-    $releases = @()
-    $complete = $false
-    for ($page = 1; $page -le 20; $page++) {
-        $batch = @(Get-Json -Url "$Api/releases?per_page=100&page=$page")
-        $releases += $batch
-        if ($batch.Count -lt 100) { $complete = $true; break }
-    }
-    if (-not $complete) { Fail 'release list exceeds 20 pages; cannot select the latest version safely' }
-    $selected = @(Select-Release -Releases $releases -Channel $Channel)
+    # The full release listing grows by every release's assets; tag refs stay small. Order the
+    # channel's tags by version, then look up only those releases, newest first.
+    $tags = @(@(Get-Json -Url "$Api/git/matching-refs/tags/v") | ForEach-Object {
+        $name = [string] $_.ref
+        if (-not $name.StartsWith('refs/tags/', [StringComparison]::Ordinal)) { Fail 'invalid GitHub tag response' }
+        $name.Substring(10)
+    })
+    $selected = @(Select-Release -Tags $tags -Channel $Channel)
     if ($selected.Count -eq 0) {
         if ($Channel -eq 'stable') {
             Fail 'no published Stable release; pass -Channel nightly explicitly to install a preview'
@@ -299,11 +309,21 @@ function Install-Release {
         Fail 'no published Nightly release'
     }
     $chosen = $null
+    $probed = 0
     for ($index = $selected.Count - 1; $index -ge 0; $index--) {
+        if ($probed -eq 16) {
+            Fail 'none of the 16 newest candidate releases is complete; cannot select the latest version safely'
+        }
+        $probed++
         $candidateTag = $selected[$index].Tag
+        # Drafts and tags whose release has not been created yet answer 404.
+        $release = Get-OptionalJson -Url "$Api/releases/tags/$candidateTag" -Label 'release lookup'
+        if ($null -eq $release) { continue }
+        if ([string] $release.tag_name -cne $candidateTag) { Fail 'release lookup returned a different tag' }
+        if ($release.draft -ne $false -or $release.prerelease -ne ($Channel -eq 'nightly')) { continue }
         $candidateVersion = $candidateTag.Substring(1)
         $candidatePackage = "vibeface-$candidateVersion-$Target"
-        $candidateManifest = Confirm-Completion -Release ($releases | Where-Object tag_name -CEQ $candidateTag | Select-Object -First 1) `
+        $candidateManifest = Confirm-Completion -Release $release `
             -Tag $candidateTag -Version $candidateVersion -Archive "$candidatePackage.tar.gz" -Target $Target
         if ($candidateManifest) {
             $tag = $candidateTag; $version = $candidateVersion; $package = $candidatePackage
@@ -396,21 +416,11 @@ function Install-Release {
 
 # Checks the parts that need no network: tag selection, archive refusal, and the shim.
 function Invoke-SelfTest {
-    $stable = @(
-        [pscustomobject]@{ tag_name = 'v1.9.0'; draft = $false; prerelease = $false },
-        [pscustomobject]@{ tag_name = 'v1.10.0'; draft = $false; prerelease = $false },
-        [pscustomobject]@{ tag_name = 'v999.0.0'; draft = $true; prerelease = $false },
-        [pscustomobject]@{ tag_name = 'cli-v999.0.0'; draft = $false; prerelease = $false },
-        [pscustomobject]@{ tag_name = 'v01.2.3'; draft = $false; prerelease = $false },
-        [pscustomobject]@{ tag_name = 'v999.0.0-rc.1'; draft = $false; prerelease = $true },
-        [pscustomobject]@{ tag_name = 'v0.0.1-nightly.20261017.2'; draft = $false; prerelease = $true },
-        [pscustomobject]@{ tag_name = 'v0.0.1-nightly.20261017.10'; draft = $false; prerelease = $true },
-        [pscustomobject]@{ tag_name = 'v0.0.1-nightly.20260229.1'; draft = $false; prerelease = $true },
-        [pscustomobject]@{ tag_name = 'www-v999.0.0-nightly.20261017.99'; draft = $false; prerelease = $true }
-    )
-    $picked = @(Select-Release -Releases $stable -Channel 'stable')
+    $candidates = @('v1.9.0', 'v1.10.0', 'cli-v999.0.0', 'v01.2.3', 'v999.0.0-rc.1', 'v0.0.1-nightly.20261017.2',
+        'v0.0.1-nightly.20261017.10', 'v0.0.1-nightly.20260229.1', 'www-v999.0.0-nightly.20261017.99')
+    $picked = @(Select-Release -Tags $candidates -Channel 'stable')
     if ($picked[-1].Tag -ne 'v1.10.0') { Fail "self-test: stable selection picked $($picked[-1].Tag)" }
-    $picked = @(Select-Release -Releases $stable -Channel 'nightly')
+    $picked = @(Select-Release -Tags $candidates -Channel 'nightly')
     if ($picked[-1].Tag -ne 'v0.0.1-nightly.20261017.10') {
         Fail "self-test: nightly selection picked $($picked[-1].Tag)"
     }
@@ -488,9 +498,20 @@ public class VibefaceInstallerTestResponse : System.Net.WebResponse {
             -Archive "vibeface-0.0.1-nightly.20261108.99-$Target.tar.gz" -Target $Target) {
         throw 'self-test: HTTP 404 marker was treated as complete'
     }
-    $responses["$Api/releases?per_page=100&page=1"] = @{
-        Code = 200; Body = (@($building, $complete) | ConvertTo-Json -Depth 10 -Compress)
+    # Tag refs list every release; a tag listed under Missing has no release yet.
+    function Set-Releases {
+        param([object[]] $Published, [string[]] $Missing = @())
+        $names = @(@($Published | ForEach-Object { [string] $_.tag_name }) + $Missing)
+        $refs = @($names | ForEach-Object { [pscustomobject]@{ ref = "refs/tags/$_" } })
+        $responses["$Api/git/matching-refs/tags/v"] = @{ Code = 200; Body = (ConvertTo-Json -InputObject $refs -Compress) }
+        foreach ($release in $Published) {
+            $responses["$Api/releases/tags/$($release.tag_name)"] = @{
+                Code = 200; Body = ($release | ConvertTo-Json -Depth 10 -Compress)
+            }
+        }
+        foreach ($name in $Missing) { $responses["$Api/releases/tags/$name"] = @{ Code = 404; Body = '' } }
     }
+    Set-Releases -Published @($building, $complete)
     $responses["$Api/commits/$tag"] = @{ Code = 200; Body = '{"sha":"7845e46d9c5b04b66eb7a66bcda31572e1ef7f4a"}' }
     $install = Join-Path $script:Scratch 'install'
     $bin = Join-Path $script:Scratch 'bin'
@@ -500,6 +521,34 @@ public class VibefaceInstallerTestResponse : System.Net.WebResponse {
     if ($requests[$requests.Count - 1] -cne "$Downloads/$tag/$archive") {
         throw 'self-test: newest Building did not select the older complete archive'
     }
+    # A newer tag whose release is missing, a draft or not a prerelease is passed over without
+    # reading its completion manifest.
+    $draft = $building.PSObject.Copy(); $draft.draft = $true
+    $final = $building.PSObject.Copy(); $final.prerelease = $false
+    foreach ($case in @(@{ Published = @($complete); Missing = @($building.tag_name) },
+                        @{ Published = @($draft, $complete); Missing = @() },
+                        @{ Published = @($final, $complete); Missing = @() })) {
+        Set-Releases -Published $case.Published -Missing $case.Missing
+        $requests.Clear()
+        Assert-InstallerError { Install-Release -Channel nightly -InstallRoot $install -BinDir $bin } 'download failed'
+        if ($requests.Contains($buildingUrl) -or $requests[$requests.Count - 1] -cne "$Downloads/$tag/$archive") {
+            throw 'self-test: an unpublished newer release was not skipped'
+        }
+    }
+    Set-Releases -Published @($building, $complete)
+    $responses["$Api/releases/tags/$($building.tag_name)"] = $responses["$Api/releases/tags/$tag"]
+    Assert-InstallerError { Install-Release -Channel nightly -InstallRoot $install -BinDir $bin } 'release lookup returned a different tag'
+    # Sixteen releases are looked up at most; the complete one after them is not reached.
+    $missing = @(1..16 | ForEach-Object { "v0.0.1-nightly.20261109.$_" })
+    Set-Releases -Published @($complete) -Missing ($missing | Select-Object -Skip 1)
+    $requests.Clear()
+    Assert-InstallerError { Install-Release -Channel nightly -InstallRoot $install -BinDir $bin } 'download failed'
+    if ($requests[$requests.Count - 1] -cne "$Downloads/$tag/$archive") {
+        throw 'self-test: the sixteenth candidate release was not looked up'
+    }
+    Set-Releases -Published @($complete) -Missing $missing
+    Assert-InstallerError { Install-Release -Channel nightly -InstallRoot $install -BinDir $bin } 'none of the 16 newest candidate releases is complete'
+    Set-Releases -Published @($building, $complete)
     foreach ($code in @(403, 503)) {
         $responses[$buildingUrl] = @{ Code = $code; Body = '' }
         $requests.Clear()

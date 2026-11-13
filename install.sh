@@ -26,6 +26,11 @@ json_fields() {
       if (mode=="completion" && depth==1 && k !~ /^(app|version|tag|source_commit|channel|schema|assets)$/) error()
       if (mode=="completion" && depth==3 && k !~ /^(name|size|sha256)$/) error()
       if (mode=="completion" && k=="assets") { seen[0 SUBSEP k]++; return }
+      if (mode=="refs") {
+        if (k!="ref") return
+        if (value !~ /^"refs\/tags\//) error()
+        value="\"" substr(value,12); k="tag_name"
+      }
       if (!(k ~ /^(tag_name|draft|prerelease|sha|app|version|tag|channel|schema|name|size|sha256|target|source_commit|update_protocol|data_epoch|core_version|core_source_commit|app_version|app_source_commit)$/)) return
       record_key=(mode=="completion" && depth==1 ? 0 : record)
       if (seen[record_key SUBSEP k]++) error()
@@ -38,7 +43,7 @@ json_fields() {
       }
       print page "." record_key "\t" k "\t" value
     }
-    BEGIN { depth=0; record=0; expected=(mode=="releases" ? "[" : "{") }
+    BEGIN { depth=0; record=0; expected=(mode=="refs" ? "[" : "{") }
     {
       json=$0
       position=1; size=length(json)
@@ -65,14 +70,14 @@ json_fields() {
         if (token !~ /^"/ && token !~ /^(-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?|true|false|null|[][{}:,])$/) error()
         if (closed) error()
         if (!started++) { if (token!=expected) error() }
-        at=(mode=="releases" ? 2 : 1)
+        at=(mode=="refs" ? 2 : 1)
         if (key!="" && token!=":" && (depth==at || (mode=="completion" && depth==3))) {
           if (mode!="completion" || depth==1 || key ~ /^(name|size|sha256)$/) field(token)
         }
         if (token=="{" || token=="[") {
           if (depth==0 && closed) error()
           depth++; stack[depth]=token
-          if ((mode=="releases" && depth==2) || (mode=="completion" && depth==3)) { if (token!="{") error(); record++ }
+          if ((mode=="refs" && depth==2) || (mode=="completion" && depth==3)) { if (token!="{") error(); record++ }
           if (depth>64) error()
         } else if (token=="}" || token=="]") {
           if (depth<1 || (token=="}" ? stack[depth]!="{" : stack[depth]!="[")) error()
@@ -86,7 +91,6 @@ json_fields() {
     }
     END {
       if (invalid || !started || depth || !closed || (mode=="completion" && !seen[0 SUBSEP "assets"])) exit 1
-      if (mode=="releases") print record "\tcount\t" record
     }
   ' "$1"
 }
@@ -103,11 +107,9 @@ select_release() {
       return y>0 && m>=1 && m<=12 && d>=1 && d<=days
     }
     $2=="tag_name" { tags[$1]=$3 }
-    $2=="draft" { draft[$1]=$3 }
-    $2=="prerelease" { pre[$1]=$3 }
     END {
       for (i in tags) {
-        tag=tags[i]; if (draft[i]!="false" || pre[i]!=(channel=="nightly" ? "true" : "false")) continue
+        tag=tags[i]
         if (substr(tag,1,1)!="v") continue
         n=split(substr(tag,2),part,"-"); if (n!=(channel=="nightly" ? 2 : 1)) continue
         if (split(part[1],base,".")!=3 || !number(base[1]) || !number(base[2]) || !number(base[3])) continue
@@ -128,15 +130,16 @@ select_releases() {
   select_release "$1" "$2" all | awk '{line[NR]=$0} END {for(i=NR;i>0;i--) print line[i]}'
 }
 
-fetch_optional_marker() {
-  local url="$1" destination="$2" code
+# Returns 1 only for HTTP 404; any other failure stops the installation.
+fetch_optional() {
+  local url="$1" destination="$2" limit="$3" label="$4" code
   code=$(curl --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
-    --connect-timeout 15 --max-time 180 --max-filesize 1048576 -o "$destination" -w '%{http_code}' \
-    --header 'Accept: application/vnd.github+json' --user-agent 'vibeface-installer' "$url") || fail "completion manifest transport failed: $url"
+    --connect-timeout 15 --max-time 180 --max-filesize "$limit" -o "$destination" -w '%{http_code}' \
+    --header 'Accept: application/vnd.github+json' --user-agent 'vibeface-installer' "$url") || fail "$label transport failed: $url"
   case "$code" in
-    200) [[ $(wc -c < "$destination") -le 1048576 ]] || fail 'completion manifest exceeds size limit'; return 0 ;;
+    200) [[ $(wc -c < "$destination") -le $limit ]] || fail "$label exceeds size limit"; return 0 ;;
     404) return 1 ;;
-    *) fail "completion manifest request failed with HTTP $code" ;;
+    *) fail "$label request failed with HTTP $code" ;;
   esac
 }
 
@@ -276,30 +279,34 @@ install_release() (
     rm -rf "$scratch"
   ' EXIT
   trap 'exit 130' INT TERM
-  local page count found=false
-  : > "$scratch/releases"
-  for ((page=1; page<=20; page++)); do
-    fetch "https://api.github.com/repos/leaperone/vibeface/releases?per_page=100&page=$page" "$scratch/page.json" 4194304
-    json_fields "$scratch/page.json" releases "$page" > "$scratch/page-fields" || fail 'invalid GitHub release response'
-    cat "$scratch/page-fields" >> "$scratch/releases"
-    count=$(awk -F '\t' '$2=="count" {print $3}' "$scratch/page-fields")
-    if ((count < 100)); then found=true; break; fi
-  done
-  "$found" || fail 'release list exceeds 20 pages; cannot select the latest version safely'
-  local candidate manifest_fields selected=false
+  # The full release listing grows by every release's assets; tag refs stay small. Order the
+  # channel's tags by version, then look up only those releases, newest first.
+  fetch "https://api.github.com/repos/leaperone/vibeface/git/matching-refs/tags/v" "$scratch/refs.json" 4194304
+  json_fields "$scratch/refs.json" refs > "$scratch/refs" || fail 'invalid GitHub tag response'
+  local candidate manifest_fields selected=false probed=0 prerelease=false
+  [[ $channel == stable ]] || prerelease=true
   while IFS= read -r candidate; do
     [[ -n $candidate ]] || continue
+    ((probed < 16)) || fail 'none of the 16 newest candidate releases is complete; cannot select the latest version safely'
+    probed=$((probed + 1))
+    # Drafts and tags whose release has not been created yet answer 404.
+    fetch_optional "https://api.github.com/repos/leaperone/vibeface/releases/tags/$candidate" "$scratch/release-object.json" 4194304 'release lookup' || continue
+    json_fields "$scratch/release-object.json" object > "$scratch/release-fields" || fail 'invalid GitHub release response'
+    awk -F '\t' -v tag="$candidate" '$2=="tag_name" {name=$3} END {exit name!=tag}' "$scratch/release-fields" ||
+      fail 'release lookup returned a different tag'
+    awk -F '\t' -v pre="$prerelease" '$2=="draft" {draft=$3} $2=="prerelease" {p=$3} END {exit !(draft=="false" && p==pre)}' \
+      "$scratch/release-fields" || continue
     version=${candidate#v}
     package="vibeface-$version-$target"
     archive="$package.tar.gz"
-    if ! fetch_optional_marker "https://github.com/leaperone/vibeface/releases/download/$candidate/release.json" "$scratch/release.json"; then
+    if ! fetch_optional "https://github.com/leaperone/vibeface/releases/download/$candidate/release.json" "$scratch/release.json" 1048576 'completion manifest'; then
       continue
     fi
     manifest_fields=$(verify_completion "$scratch/release.json" "$candidate" "$version" "$target" "$archive") || fail 'release completion manifest validation failed'
     tag=$candidate
     selected=true
     break
-  done < <(select_releases "$scratch/releases" "$channel")
+  done < <(select_releases "$scratch/refs" "$channel")
   "$selected" || tag=''
   if [[ -z $tag ]]; then
     if [[ $channel == stable ]]; then fail 'no published Stable release; use --channel nightly explicitly to install a preview'; fi
@@ -513,8 +520,18 @@ while (($#)); do
   esac
  done
 case "$url" in
-  *'/releases?per_page=100&page=1') cp "$VIBEFACE_INSTALL_FIXTURE/releases.json" "$output" ;;
-  *'/releases?per_page=100&page=2') cp "$VIBEFACE_INSTALL_FIXTURE/page2.json" "$output" ;;
+  *'/git/matching-refs/tags/v') cp "$VIBEFACE_INSTALL_FIXTURE/refs.json" "$output" ;;
+  */releases/tags/*)
+    tag=${url##*/releases/tags/}
+    rcode=404
+    if [[ -f "$VIBEFACE_INSTALL_FIXTURE/release/$tag.json" ]]; then
+      rcode=200
+      cp "$VIBEFACE_INSTALL_FIXTURE/release/$tag.json" "$output"
+    else
+      : > "$output"
+    fi
+    [[ ${writeout:-} != '%{http_code}' ]] || printf '%s' "$rcode"
+    exit 0 ;;
   *'/commits/'*) printf '{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","nested":{"sha":"ignored"}}' > "$output" ;;
   */releases/download/*/release.json)
     tag=${url#*://github.com/leaperone/vibeface/releases/download/}
@@ -549,26 +566,51 @@ MOCK
   printf 'Linux\n' > "$fixture/os"
   printf 'x86_64\n' > "$fixture/arch"
   export PATH="$fixture/bin:$PATH"
-  cat > "$fixture/releases.json" <<'JSON'
+  # Each argument is TAG:DRAFT:PRERELEASE and publishes that release; a bare TAG has no release yet.
+  write_releases() {
+    local spec tag draft prerelease separator=''
+    rm -rf "$fixture/release"
+    mkdir -p "$fixture/release"
+    printf '[' > "$fixture/refs.json"
+    for spec in "$@"; do
+      IFS=: read -r tag draft prerelease <<< "$spec"
+      printf '%s{"ref":"refs/tags/%s","object":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"commit"}}' "$separator" "$tag" >> "$fixture/refs.json"
+      separator=,
+      [[ -z $draft ]] || printf '{"tag_name":"%s","name":"%s","draft":%s,"prerelease":%s,"body":"quoted \\"tag_name\\": \\"v999.0.0\\"","assets":[{"name":"ignored","size":1}]}\n' \
+        "$tag" "$tag" "$draft" "$prerelease" > "$fixture/release/$tag.json"
+    done
+    printf ']\n' >> "$fixture/refs.json"
+  }
+  cat > "$fixture/refs.json" <<'JSON'
 [
- {"tag_name":"v0.0.1-nightly.20261017.2","draft":false,"prerelease":true,"body":"quoted \"tag_name\": \"v999.0.0\""},
- {"tag_name":"cli-v999.0.0","draft":false,"prerelease":false},
- {"tag_name":"www-v999.0.0-nightly.20261017.99","draft":false,"prerelease":true},
- {"tag_name":"mobile-v999.0.0-nightly.20261017.99","draft":false,"prerelease":true},
- {"tag_name":"v1.9.0","draft":false,"prerelease":false},
- {"tag_name":"v0.0.1-nightly.20261017.10","draft":false,"prerelease":true},
- {"tag_name":"v1.10.0","draft":false,"prerelease":false},
- {"tag_name":"v999.0.0-rc.1","draft":false,"prerelease":true},
- {"tag_name":"v999.0.0","draft":true,"prerelease":false},
- {"tag_name":"v0.0.1-nightly.20260229.1","draft":false,"prerelease":true},
- {"tag_name":"v01.2.3","draft":false,"prerelease":false},
- {"tag_name":"v18446744073709551616.0.0","draft":false,"prerelease":false},
- {"tag_name":"v0.0.1-nightly.20261017.18446744073709551616","draft":false,"prerelease":true}
+ {"ref":"refs/tags/v0.0.1-nightly.20261017.2","url":"quoted \"ref\": \"refs/tags/v999.9.9\""},
+ {"ref":"refs/tags/cli-v999.0.0"},
+ {"ref":"refs/tags/www-v999.0.0-nightly.20261017.99"},
+ {"ref":"refs/tags/mobile-v999.0.0-nightly.20261017.99"},
+ {"ref":"refs/tags/v1.9.0"},
+ {"ref":"refs/tags/v0.0.1-nightly.20261017.10","object":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"tag"}},
+ {"ref":"refs/tags/v1.10.0"},
+ {"ref":"refs/tags/v999.0.0-rc.1"},
+ {"ref":"refs/tags/v0.0.1-nightly.20260229.1"},
+ {"ref":"refs/tags/v01.2.3"},
+ {"ref":"refs/tags/v18446744073709551616.0.0"},
+ {"ref":"refs/tags/v0.0.1-nightly.20261017.18446744073709551616"}
 ]
 JSON
-  json_fields "$fixture/releases.json" releases > "$fixture/fields"
+  json_fields "$fixture/refs.json" refs > "$fixture/fields" || fail 'self-test: tag refs did not parse'
   [[ $(select_release "$fixture/fields" stable) == v1.10.0 ]] || fail 'self-test: Stable numeric sorting or channel isolation'
   [[ $(select_release "$fixture/fields" nightly) == v0.0.1-nightly.20261017.10 ]] || fail 'self-test: Nightly numeric sorting or channel isolation'
+  local bad_ref
+  for bad_ref in refs/heads/v1.0.0 refs/abcdev1.0.0 'refs/tags/v1.0.0$(id)' refs/tags/../v1.0.0 refs/tags/v1.0.0/x; do
+    printf '[{"ref":"%s"}]\n' "$bad_ref" > "$fixture/bad-refs.json"
+    if json_fields "$fixture/bad-refs.json" refs > /dev/null; then fail "self-test: accepted tag ref $bad_ref"; fi
+  done
+  printf '[{"ref":"refs/tags/v0.0.1-nightly.20261017.2"}]\n' > "$fixture/compact.json"
+  json_fields "$fixture/compact.json" refs > "$fixture/compact-fields"
+  awk 'BEGIN { print "["; print "{"; print "\"ref\":"; print "\"refs/tags/v0.0.1-nightly.20261017.2\","; printf "\"url\":\""; for (i=0;i<10000;i++) printf "ignored "; print "\""; print "}"; print "]" }' > "$fixture/pretty.json"
+  json_fields "$fixture/pretty.json" refs > "$fixture/pretty-fields"
+  cmp "$fixture/compact-fields" "$fixture/pretty-fields" || fail 'self-test: pretty JSON changed tag fields'
+  write_releases v0.0.1-nightly.20261017.2:false:true v0.0.1-nightly.20261017.10:false:true v1.9.0:false:false v999.0.0:true:false
   version=0.0.1-nightly.20261017.10
   target=x86_64-unknown-linux-gnu
   package="vibeface-$version-$target"
@@ -716,18 +758,9 @@ JSON
   [[ $(cat "$case_dir/bin/vibeface") == 'preserve me' ]] || fail 'self-test: bin conflict changed'
   case_dir="$test_dir/no-stable"
   mkdir "$case_dir"
-  printf '[{"tag_name":"v%s","draft":false,"prerelease":true}]\n' "$version" > "$fixture/releases.json"
+  write_releases "v$version:false:true"
   expect_failure stable 'no published Stable release'
   [[ ! -e "$case_dir/root" ]] || fail 'self-test: no Stable release created installation directories'
-  # Page-local indexes must not overwrite earlier candidates.
-  json_fields "$fixture/releases.json" releases 1 > "$fixture/fields"
-  printf '[{"tag_name":"v0.0.1-nightly.20261017.2","draft":false,"prerelease":true}]\n' > "$fixture/page2.json"
-  json_fields "$fixture/page2.json" releases 2 >> "$fixture/fields"
-  [[ $(select_release "$fixture/fields" nightly) == "v$version" ]] || fail 'self-test: pagination changed version selection'
-  json_fields "$fixture/page2.json" releases 2 > "$fixture/compact-fields"
-  awk 'BEGIN { print "["; print "{"; print "\"tag_name\":\"v0.0.1-nightly.20261017.2\","; print "\"draft\":false,"; print "\"prerelease\":true,"; printf "\"body\":\""; for (i=0;i<10000;i++) printf "ignored "; print "\""; print "}"; print "]" }' > "$fixture/pretty.json"
-  json_fields "$fixture/pretty.json" releases 2 > "$fixture/pretty-fields"
-  cmp "$fixture/compact-fields" "$fixture/pretty-fields" || fail 'self-test: pretty JSON changed release fields'
   case_dir="$test_dir/http-failure"
   mkdir "$case_dir"
   : > "$fixture/http-failure"
@@ -739,13 +772,7 @@ JSON
     printf '%s' "$2" > "$fixture/marker-code/$1"
   }
   progressive_releases() {
-    cat > "$fixture/releases.json" <<'JSON'
-[
- {"tag_name":"v0.0.1-nightly.20261017.99","draft":false,"prerelease":true},
- {"tag_name":"v0.0.1-nightly.20261017.10","draft":false,"prerelease":true},
- {"tag_name":"v1.9.0","draft":false,"prerelease":false}
-]
-JSON
+    write_releases v0.0.1-nightly.20261017.99:false:true v0.0.1-nightly.20261017.10:false:true v1.9.0:false:false
   }
   cp "$fixture/supported-build" "$fixture/source/$package/BUILD-INFO.json"
   repack_fixture
@@ -788,7 +815,7 @@ JSON
   mkdir "$case_dir"
   expect_failure nightly 'release completion manifest identity or target binding is invalid'
   reset_progressive_markers
-  printf '[{"tag_name":"v%s","draft":false,"prerelease":true}]\n' "$version" > "$fixture/releases.json"
+  write_releases "v$version:false:true"
   marker_code "v$version" 503
   case_dir="$test_dir/marker-transport"
   mkdir "$case_dir"
@@ -813,8 +840,35 @@ JSON
   mkdir "$case_dir"
   expect_failure nightly 'no published Nightly release'
   reset_progressive_markers
+  # A newer tag whose release is a draft, carries the wrong prerelease flag or does not exist yet
+  # is skipped; if it were chosen, its completion manifest would not match it and the run fails.
+  local skipped
+  for skipped in v0.0.1-nightly.20261017.99:true:true v0.0.1-nightly.20261017.99:false:false v0.0.1-nightly.20261017.99; do
+    write_releases "$skipped" "v$version:false:true"
+    case_dir="$test_dir/skip-${skipped//:/-}"
+    mkdir "$case_dir"
+    bash "$script" --channel nightly --install-root "$case_dir/root" --bin-dir "$case_dir/bin" > "$case_dir/output"
+    [[ $("$case_dir/bin/vibeface" --version) == "vibeface $version" ]] || fail "self-test: $skipped was not skipped"
+  done
+  write_releases v0.0.1-nightly.20261017.99:false:true "v$version:false:true"
+  cp "$fixture/release/v$version.json" "$fixture/release/v0.0.1-nightly.20261017.99.json"
+  case_dir="$test_dir/release-tag-mismatch"
+  mkdir "$case_dir"
+  expect_failure nightly 'release lookup returned a different tag'
+  # Sixteen releases are looked up at most; the complete one after them is not reached.
+  local n missing=()
+  for ((n=1; n<=16; n++)); do missing+=("v0.0.1-nightly.20261018.$n"); done
+  write_releases "${missing[@]:1}" "v$version:false:true"
+  case_dir="$test_dir/probe-limit-reached"
+  mkdir "$case_dir"
+  bash "$script" --channel nightly --install-root "$case_dir/root" --bin-dir "$case_dir/bin" > "$case_dir/output"
+  [[ $("$case_dir/bin/vibeface" --version) == "vibeface $version" ]] || fail 'self-test: sixteenth candidate was not looked up'
+  write_releases "${missing[@]}" "v$version:false:true"
+  case_dir="$test_dir/probe-limit-exceeded"
+  mkdir "$case_dir"
+  expect_failure nightly 'none of the 16 newest candidate releases is complete'
   service_self_test "$(dirname "$script")/scripts/install-node-service.sh" "$test_dir/service"
-  printf 'Public installer self-test passed: channels, numeric sorting, layout, SHA256, manifest, links, paths, progressive completion, and existing-install protection.\n'
+  printf 'Public installer self-test passed: tag discovery, channels, numeric sorting, layout, SHA256, manifest, links, paths, progressive completion, and existing-install protection.\n'
 )
 
 if [[ ${1:-} == --self-test ]]; then
