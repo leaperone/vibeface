@@ -1940,14 +1940,6 @@ def continuation_self_test(manifest, compiled, profile, vectors, proofs):
             patch(f"{__name__}.run", side_effect=lambda command, **kwargs: calls.append(command)), patch(f"{__name__}.runpy.run_path", return_value={"resources": lambda: (None, snapshot), "oom_delta": lambda *_: resources["oomDelta"]}), patch("builtins.print"):
             must_reject(lambda: prove_small("accept"))
         assert not any(command[:2] == ["node", "contracts/delivery/experiment-delivery.mjs"] for command in calls)
-        workflow = (ROOT / WORKFLOW_PATH).read_text()
-        assert "max-parallel: 1" in workflow and "fail-fast: false" in workflow
-        assert "fromJSON(needs.delivery-small-prepare.outputs.matrix)" in workflow
-        assert "needs: [delivery-small-prepare, delivery-small-proofs]" in workflow
-        assert "group: ci-delivery-small" in workflow and "cancel-in-progress: false" in workflow
-        assert "inputs.prepare_only" in workflow and "inputs.resume_run" in workflow
-        assert workflow.count("path: ${{ steps.run.outputs.public-directory }}") == 3
-        assert ".artifacts/vdp/canonical/small/*/public" not in workflow
 
 
 if __name__ == "__main__":

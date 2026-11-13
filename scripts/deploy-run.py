@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import shlex
 import shutil
 import sqlite3
@@ -77,6 +78,8 @@ def build(service, tag, output):
             shutil.copyfileobj(process.stdout, compressed)
             process.stdout.close()
             release.require(process.wait() == 0, 'cannot export container image')
+        # The host proves the archive the same way before `docker load`; fail here, not on the host.
+        runpy.run_path(str(ROOT / 'scripts/deploy-activate.py'))['archive_images'](archive, identity)
     info['images'] = images
     (output / 'deployment.json').write_text(json.dumps(info, indent=2) + '\n')
     return info
@@ -367,7 +370,6 @@ def self_test():
                        ('DEPLOY_PORT', '0'), ('DEPLOY_PORT', '65536'), ('DEPLOY_SSH_KEY', '')):
         with TestCase().assertRaises(ValueError, msg='accepted invalid transport'):
             transport(dict(base, **{key: value}))
-    import runpy
     from unittest.mock import patch
     validate_config = runpy.run_path(str(ROOT / 'scripts/deploy-activate.py'))['validate_config']
     for has_previous, failure in ((True, None), (False, None), (True, 'activation'), (True, 'data')):
