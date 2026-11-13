@@ -1,6 +1,6 @@
-name: Release / npm Nightly
+name: Release / npm Hourly
 run-name: >-
-  Release / npm Nightly / ${{ inputs.tag }} / ${{ inputs.publish && 'publish' || 'validate only' }}
+  Release / npm Hourly / ${{ inputs.tag }} / ${{ inputs.publish && 'publish' || 'validate only' }}
 
 on:
   workflow_call:
@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing product Nightly tag whose release npm artifact will be used
+        description: Existing product Hourly tag whose release npm artifact will be used
         type: string
         required: true
       publish:
@@ -31,12 +31,12 @@ permissions:
   actions: read
 
 concurrency:
-  group: npm-nightly-publication
+  group: npm-hourly-publication
   cancel-in-progress: false
 
 jobs:
   npm:
-    name: Publish npm Nightly / npm
+    name: Publish npm Hourly / npm
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     environment: npm-release
@@ -45,11 +45,11 @@ jobs:
       actions: read
       id-token: write
     steps:
-      - name: Validate matching Nightly tag and workflow ref
+      - name: Validate matching Hourly tag and workflow ref
         env:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-nightly\.[0-9]{8}\.[1-9][0-9]*$ ]]
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-hourly\.[0-9]{10}$ ]]
           [[ "$GITHUB_REF" == "refs/tags/$RELEASE_TAG" ]]
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -86,7 +86,7 @@ jobs:
         if: ${{ !inputs.publish }}
         env:
           RELEASE_TAG: ${{ inputs.tag }}
-        run: npm publish ".artifacts/npm/leaperone-vibeface-${RELEASE_TAG#v}.tgz" --tag nightly --access public --dry-run --ignore-scripts --registry=https://registry.npmjs.org/
+        run: npm publish ".artifacts/npm/leaperone-vibeface-${RELEASE_TAG#v}.tgz" --tag hourly --access public --dry-run --ignore-scripts --registry=https://registry.npmjs.org/
       - name: Publish once using OIDC and reconcile the registry
         if: ${{ inputs.publish }}
         env:

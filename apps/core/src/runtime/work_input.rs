@@ -41,14 +41,13 @@ impl Runtime {
             match provider {
                 Provider::Codex => {
                     let reply = tokio::time::timeout(
-                        Duration::from_secs(5),
-                        self.codex.client().request(
-                            "thread/read",
-                            json!({"threadId":thread,"includeTurns":false}),
-                        ),
+                        codex_server::READ_WAIT,
+                        self.codex
+                            .read(thread, json!({"threadId":thread,"includeTurns":false})),
                     )
                     .await
-                    .context("native session directory query timed out")??;
+                    .context("native session directory query timed out")??
+                    .0;
                     Ok(PathBuf::from(
                         reply["thread"]["cwd"]
                             .as_str()
@@ -87,14 +86,13 @@ impl Runtime {
         actual_cwd: &Path,
     ) -> Result<Option<crate::work::NativeExecution>> {
         let reply = tokio::time::timeout(
-            Duration::from_secs(5),
-            self.codex.client().request(
-                "thread/read",
-                json!({"threadId":thread,"includeTurns":true}),
-            ),
+            codex_server::READ_WAIT,
+            self.codex
+                .read(thread, json!({"threadId":thread,"includeTurns":true})),
         )
         .await
-        .context("native execution query timed out")??;
+        .context("native execution query timed out")??
+        .0;
         let native = &reply["thread"];
         let Some(turns) = native["turns"].as_array() else {
             return Ok(None);

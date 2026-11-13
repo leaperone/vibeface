@@ -170,6 +170,17 @@ pub(crate) fn no_rollout(detail: &str) -> bool {
     detail.contains(NO_ROLLOUT)
 }
 
+/// How Codex answers `thread/read` for a thread it does not have. Codex 0.167 says "thread not
+/// loaded: <id>" when neither its Codex folder nor its memory holds it; a saved thread that is
+/// not loaded reads normally.
+const NO_THREAD: [&str; 2] = ["thread not loaded", "thread not found"];
+
+/// Whether this `thread/read` refusal is Codex's own message for a thread it does not have.
+pub(crate) fn no_thread(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    NO_THREAD.iter().any(|wording| message.starts_with(wording))
+}
+
 impl ExecFailure {
     pub fn new(kind: FailureKind, detail: impl Into<String>) -> Self {
         Self {

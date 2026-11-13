@@ -47,7 +47,7 @@ def component_info(directory=ROOT, content_root=None, verify=True, ignored=()):
             'invalid component fields')
     require(type(info['schema']) is int and info['schema'] == 1
             and re.fullmatch(r'[0-9a-f]{40}', info['source_commit'])
-            and re.fullmatch(r'\d+\.\d+\.\d+(?:-rc\.\d+|-nightly\.\d{8}\.\d+)?', info['version']),
+            and re.fullmatch(r'\d+\.\d+\.\d+(?:-rc\.\d+|-hourly\.\d{10})?', info['version']),
             'invalid component identity')
     require(info['tag'] == ('www-v' if app == 'www' else 'v') + info['version'], 'component tag mismatch')
     if app == 'core':

@@ -1,13 +1,56 @@
 //! The coordination Agent's own path to the App Server. It talks to the socket directly; the
 //! Node only registers dispatched work before the send and settles it afterwards.
 use anyhow::{Context as _, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{future::Future, path::Path};
+use std::{
+    future::Future,
+    path::{Path, PathBuf},
+};
 use vibeface_bridge::{
     codex::{DirectSession, Outgoing, StartReport},
     failure::{ExecFailure, FailureKind},
 };
 use vibeface_protocol::now_ms;
+
+/// Which Codex App Server has a thread, as the Node finds it for `wait_work`: the Node's own
+/// first, then the user's own Codex while the Node runs its own.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "server", rename_all = "snake_case")]
+pub enum ThreadAt {
+    /// The App Server the bots use: the Node's own, or the system one it shares.
+    Node,
+    /// The user's own Codex App Server. A send there keeps the session's own approval, sandbox
+    /// and model, since Codex keeps a turn's settings for the turns after it.
+    User { socket: PathBuf },
+    /// Neither has it; `user` says whether the user's own Codex was asked.
+    Missing { user: bool },
+    /// An App Server could not be read, so where the thread is stays unknown.
+    Unknown { error: String },
+}
+
+/// The `wait_work` answer: the agent that runs the work and, for a Codex thread, where it is.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct Ready {
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_at: Option<ThreadAt>,
+}
+
+/// The stop-loss for a thread no App Server the Node can reach has.
+fn not_delivered(thread: &str, user_asked: bool) -> anyhow::Error {
+    let (whose, hint) = if user_asked {
+        ("this device's Codex App Server or the user's own Codex", "")
+    } else {
+        (
+            "this device's Codex App Server",
+            " If it is a session of the user's own Codex app or terminal, ask the user to approve its App Server socket with propose_provider_config app_server_socket (Codex listens on $CODEX_HOME/app-server-control/app-server-control.sock, ~/.codex by default), then send again.",
+        )
+    };
+    anyhow::anyhow!(
+        "thread {thread} is not on {whose}, so nothing was registered or sent. It is a session of another Codex folder or no longer exists; thread/resume and retrying cannot load it, and its files must not be copied, linked or resumed into an App Server.{hint} Tell the user the message was not delivered and give them the exact text to send in that session; dispatch it as a new work without thread only when the user asks for that."
+    )
+}
 
 fn outgoing_model(tracked: &Value) -> Result<Option<String>> {
     let value = tracked
@@ -90,7 +133,10 @@ where
 /// provider the Node runs the work on, after waiting for the Node's own App Server
 /// connection when that is Codex, so a send right after the Node starts is not refused while
 /// the App Server comes up. A first send into a thread fails, with nothing registered, when `ready`
-/// cannot be asked: without the answer it would skip reading the thread.
+/// cannot be asked: without the answer it would skip reading the thread. For a Codex thread
+/// `ready` also says which App Server has it: `socket`, the Node's, or the user's own Codex,
+/// where the send keeps the session's own approval, sandbox and model. A new thread is always
+/// started on `socket`.
 pub async fn dispatch<L, LF, T, TF, B, BF, R, RF>(
     args: &Value,
     lookup: L,
@@ -107,7 +153,7 @@ where
     B: Fn(String, StartReport) -> BF,
     BF: Future<Output = Result<Value>>,
     R: Fn(Value) -> RF,
-    RF: Future<Output = Result<Option<String>>>,
+    RF: Future<Output = Result<Ready>>,
 {
     let original = args;
     let mut args = args.clone();
@@ -120,28 +166,46 @@ where
     // A Codex send reads its thread before registering, so a missing thread leaves nothing
     // behind. The Node checks the session another provider would take the work in.
     let prepared = async {
-        let readied = match &existing {
+        let (readied, thread_at) = match &existing {
             Some(thread) => {
-                let agent = ready(args.clone()).await.with_context(|| {
+                let ready = ready(args.clone()).await.with_context(|| {
                     format!("cannot ask the Node which agent has thread {thread}; this attempt registered or sent nothing, so the send can be retried")
                 })?;
-                Some(agent.with_context(|| {
+                let agent = ready.agent.with_context(|| {
                     format!("no execution agent is ready for thread {thread}; this attempt registered or sent nothing, so the send can be retried")
-                })?)
+                })?;
+                (Some(agent), ready.thread_at)
             }
-            None => None,
+            None => (None, None),
         };
+        let mut user = None;
         if let (Some(thread), Some("codex")) = (&existing, readied.as_deref()) {
-            let socket = socket.context("--socket or VIBEFACE_CODEX_SOCKET is required")?;
-            let mut session = DirectSession::connect(socket)
+            let at = match thread_at {
+                Some(ThreadAt::User { socket }) => user.insert(socket).clone(),
+                Some(ThreadAt::Missing { user: asked }) => return Err(not_delivered(thread, asked)),
+                Some(ThreadAt::Unknown { error }) => bail!(
+                    "cannot tell which Codex App Server has thread {thread}: {error}; nothing was registered or sent"
+                ),
+                Some(ThreadAt::Node) | None => socket
+                    .context("--socket or VIBEFACE_CODEX_SOCKET is required")?
+                    .to_owned(),
+            };
+            let mut session = DirectSession::connect(&at)
                 .await
                 .map_err(|error| anyhow::anyhow!(error.message))?;
             let read = session
                 .request("thread/read", json!({"threadId":thread}))
                 .await;
             session.close().await;
-            let read = read
-                .map_err(|error| anyhow::anyhow!("cannot read thread {thread}: {}", error.message))?;
+            let read = read.map_err(|error| {
+                // A saved thread reads even when it is not loaded, so this App Server does not
+                // have it.
+                if error.missing_thread() {
+                    not_delivered(thread, user.is_some())
+                } else {
+                    anyhow::anyhow!("cannot read thread {thread}: {}", error.message)
+                }
+            })?;
             ensure!(
                 read["thread"]["id"].as_str() == Some(thread.as_str()),
                 "thread {thread} was not returned by the App Server"
@@ -161,10 +225,10 @@ where
             }
             args = thread_arguments(&args, read["thread"]["cwd"].as_str().unwrap_or_default());
         }
-        Ok::<_, anyhow::Error>(readied)
+        Ok::<_, anyhow::Error>((readied, user))
     }.await;
-    let readied = match prepared {
-        Ok(readied) => readied,
+    let (readied, user) = match prepared {
+        Ok(prepared) => prepared,
         Err(error) => {
             return match readback(original, &lookup, &track).await? {
                 Some(tracked) => Ok(tracked),
@@ -194,7 +258,8 @@ where
     if readied.is_none() {
         let _ = ready(args.clone()).await;
     }
-    let Some(socket) = socket else {
+    // Only a thread found on the user's own Codex is sent there; a new one starts on the Node's.
+    let Some(socket) = user.as_deref().or(socket) else {
         return fail(ExecFailure::new(
             FailureKind::Transport,
             "--socket or VIBEFACE_CODEX_SOCKET is required",
@@ -241,11 +306,15 @@ where
         text: args["prompt"].as_str().unwrap_or_default().into(),
         client_id: work_id.clone(),
         expected_turn_id: tracked["expected_turn_id"].as_str().map(str::to_owned),
-        model,
+        // The user's session keeps its own model unless the send names one.
+        model: match user {
+            Some(_) => args["model"].as_str().map(str::to_owned),
+            None => model,
+        },
         effort: args["effort"].as_str().map(str::to_owned),
         images: serde_json::from_value(args["images"].clone()).unwrap_or_default(),
         start_only: existing.is_none(),
-        full_access: true,
+        full_access: user.is_none(),
     };
     let sent = session.send(&outgoing).await;
     session.close().await;
@@ -433,8 +502,14 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn a_codex_sub_agent_thread_is_refused_before_anything_is_registered() -> Result<()> {
+    /// An App Server that answers `thread/read` with `read`, a result or a JSON-RPC error, and
+    /// records every method it is asked.
+    async fn app_server(
+        read: Result<Value, Value>,
+    ) -> Result<(
+        vibeface_bridge::platform::ipc::Endpoint,
+        Arc<Mutex<Vec<Value>>>,
+    )> {
         let dir = vibeface_bridge::platform::ipc::runtime_dir(
             &uuid::Uuid::new_v4().simple().to_string(),
         )?;
@@ -453,20 +528,45 @@ mod tests {
                         continue;
                     };
                     seen.lock().unwrap().push(request["method"].clone());
-                    let result = match request["method"].as_str() {
-                        Some("initialize") => json!({"userAgent":"codex/fixture"}),
-                        Some("thread/read") => json!({"thread":{"id":"sub","cwd":"/w",
-                            "parentThreadId":"lead","source":{"subAgent":{"thread_spawn":
-                            {"depth":1,"parent_thread_id":"lead"}}}}}),
-                        _ => json!({}),
+                    let reply = match request["method"].as_str() {
+                        Some("initialize") => Ok(json!({"userAgent":"codex/fixture"})),
+                        Some("thread/read") => read.clone(),
+                        _ => Ok(json!({})),
                     };
                     if request.get("id").is_some() {
-                        let reply = json!({"id":request["id"],"result":result});
+                        let reply = match reply {
+                            Ok(result) => json!({"id":request["id"],"result":result}),
+                            Err(error) => json!({"id":request["id"],"error":error}),
+                        };
                         let _ = server.send(reply.to_string().into()).await;
                     }
                 }
             }
         });
+        Ok((socket, methods))
+    }
+
+    fn agent(name: &str) -> Ready {
+        Ready {
+            agent: Some(name.into()),
+            thread_at: None,
+        }
+    }
+
+    fn sent_into_a_thread(methods: &Mutex<Vec<Value>>) -> bool {
+        methods.lock().unwrap().iter().any(|method| {
+            method
+                .as_str()
+                .is_some_and(|method| method.starts_with("turn/") || method == "thread/resume")
+        })
+    }
+
+    #[tokio::test]
+    async fn a_codex_sub_agent_thread_is_refused_before_anything_is_registered() -> Result<()> {
+        let (socket, methods) = app_server(Ok(json!({"thread":{"id":"sub","cwd":"/w",
+            "parentThreadId":"lead","source":{"subAgent":{"thread_spawn":
+            {"depth":1,"parent_thread_id":"lead"}}}}})))
+        .await?;
         let tracked = Arc::new(Mutex::new(false));
         let track = |_| {
             *tracked.lock().unwrap() = true;
@@ -478,7 +578,7 @@ mod tests {
             |_| async { Ok(json!({"found":false})) },
             track,
             |_, _| async { Ok(json!({})) },
-            |_| async { Ok(Some("codex".to_owned())) },
+            |_| async { Ok(agent("codex")) },
             Some(socket.path()),
         )
         .await;
@@ -489,11 +589,108 @@ mod tests {
         );
         assert!(!*tracked.lock().unwrap(), "no work was registered");
         assert!(
-            !methods.lock().unwrap().iter().any(|method| method
-                .as_str()
-                .is_some_and(|method| method.starts_with("turn/") || method == "thread/resume")),
+            !sent_into_a_thread(&methods),
             "nothing was sent into the thread"
         );
+        Ok(())
+    }
+
+    /// The user's own Codex keeps its sessions in its own folder, so an App Server the Node
+    /// starts answers for one of them as Codex 0.167 does here.
+    #[tokio::test]
+    async fn a_thread_the_app_server_does_not_have_is_refused_and_left_to_the_user() -> Result<()> {
+        let thread = "01a1ffff-0000-7000-8000-000000000001";
+        let (socket, methods) = app_server(Err(
+            json!({"code":-32600,"message":format!("thread not loaded: {thread}")}),
+        ))
+        .await?;
+        let tracked = Arc::new(Mutex::new(false));
+        let track = |_| {
+            *tracked.lock().unwrap() = true;
+            async { Ok(json!({"may_send":true,"work_id":"w"})) }
+        };
+        let args = json!({"thread":thread,"prompt":"p","call_ref":"a-q-1"});
+        let refused = dispatch(
+            &args,
+            |_| async { Ok(json!({"found":false})) },
+            track,
+            |_, _| async { Ok(json!({})) },
+            |_| async { Ok(agent("codex")) },
+            Some(socket.path()),
+        )
+        .await;
+        let refused = refused
+            .expect_err("the App Server has no such thread")
+            .to_string();
+        for said in [
+            "is not on this device's Codex App Server",
+            "nothing was registered or sent",
+            "retrying cannot load it",
+            "must not be copied, linked or resumed",
+            "give them the exact text to send in that session",
+            "only when the user asks",
+        ] {
+            assert!(refused.contains(said), "{refused}");
+        }
+        assert!(
+            !refused.contains("thread not loaded"),
+            "Codex's wording reads as a thread that only needs loading: {refused}"
+        );
+        assert!(!*tracked.lock().unwrap(), "no work was registered");
+        assert!(
+            !sent_into_a_thread(&methods),
+            "nothing was sent into the thread"
+        );
+        Ok(())
+    }
+
+    /// The Node's answer alone refuses a thread neither App Server has, or one it cannot
+    /// place, before anything is registered or any App Server is asked.
+    #[tokio::test]
+    async fn a_thread_the_node_cannot_place_is_refused_before_registering() -> Result<()> {
+        let tracked = Arc::new(Mutex::new(false));
+        let track = |_| {
+            *tracked.lock().unwrap() = true;
+            async { Ok(json!({"may_send":true,"work_id":"w"})) }
+        };
+        let args = json!({"thread":"t-1","prompt":"p","call_ref":"r","agent":"codex"});
+        for (at, said) in [
+            (
+                ThreadAt::Missing { user: false },
+                "propose_provider_config app_server_socket",
+            ),
+            (
+                ThreadAt::Missing { user: true },
+                "or the user's own Codex, so nothing was registered or sent",
+            ),
+            (
+                ThreadAt::Unknown {
+                    error: "the user's own Codex App Server did not answer".into(),
+                },
+                "cannot tell which Codex App Server has thread t-1: the user's own Codex App Server did not answer; nothing was registered or sent",
+            ),
+        ] {
+            let ready = Ready {
+                agent: Some("codex".into()),
+                thread_at: Some(at),
+            };
+            let refused = dispatch(
+                &args,
+                |_| async { Ok(json!({"found":false})) },
+                track,
+                |_, _| async { bail!("must not bind") },
+                |_| {
+                    let ready = ready.clone();
+                    async move { Ok(ready) }
+                },
+                Some(Path::new("/nonexistent/app.sock")),
+            )
+            .await
+            .expect_err("nothing to send into")
+            .to_string();
+            assert!(refused.contains(said), "{refused}");
+            assert!(!*tracked.lock().unwrap(), "no work was registered");
+        }
         Ok(())
     }
 
@@ -522,7 +719,7 @@ mod tests {
             |_| async { Ok(json!({"found":false})) },
             track,
             |_, _| async { Ok(json!({})) },
-            |_| async { Ok(None) },
+            |_| async { Ok(Ready::default()) },
             None,
         )
         .await
@@ -569,7 +766,7 @@ mod tests {
                 async { bail!("track response lost") }
             },
             |_, _| async { bail!("must not bind") },
-            |_| async { Ok(Some("pi".into())) },
+            |_| async { Ok(agent("pi")) },
             None,
         )
         .await

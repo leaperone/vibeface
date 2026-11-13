@@ -99,7 +99,7 @@ vibeface status --data-dir /absolute/path/to/data
 
 GitHub 受管安装使用 `vibeface update`，npm 安装使用 npm 更新。不要在运行中的安装目录直接覆盖一个二进制文件；CLI、Core 和网页资源需要来自同一发行包。
 
-Nightly 不保证协议或数据格式向后兼容。同一网络使用一致版本。更新前核对[发布与更新说明](releasing.md)，保留备份，不把旧数据目录直接交给不同 data epoch 的版本。
+Hourly 不保证协议或数据格式向后兼容。同一网络使用一致版本。更新前核对[发布与更新说明](releasing.md)，保留备份，不把旧数据目录直接交给不同 data epoch 的版本。
 
 恢复文件用于找回管理身份，完整 Node 数据目录备份用于保存本机历史与状态，项目文件还要单独备份。备份 Node 数据前停止该 Node。不要把同一个 Node 数据目录复制到两台机器同时运行；新电脑通过加入流程获得独立身份。
 

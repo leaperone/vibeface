@@ -791,7 +791,7 @@ mod tests {
     #[test]
     fn authoritative_core_version_prefers_running_health_over_inspector_binary() {
         use maintenance::Health;
-        let running = "0.0.1-nightly.20261107.1";
+        let running = "0.0.1-hourly.2026110712";
         let health = Health {
             device_id: "device-fixture".into(),
             version: running.into(),

@@ -782,13 +782,21 @@ impl Runtime {
         } else {
             false
         };
+        // In spawn mode the socket is the user's own Codex, which no launch uses.
+        let launched = |local: &providers::Local| {
+            let mut switches = local.switches.clone();
+            if switches.codex_app_server.mode == AppServerMode::Spawn {
+                switches.codex_app_server.socket = None;
+            }
+            switches
+        };
         let launches_changed = codex_config.is_some()
             || login_created
             || manager_changed
-            || next.switches != previous.switches
+            || launched(&next) != launched(&previous)
             || next.bins != previous.bins
             || next.env != previous.env;
-        if !launches_changed && triage == previous_triage {
+        if !launches_changed && triage == previous_triage && next.switches == previous.switches {
             return Ok(filled);
         }
         let mut configuration = Config::load(&self.data_dir)?;
@@ -808,6 +816,7 @@ impl Runtime {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .manager = manager;
+            self.codex.set_user_socket(next.user_codex_socket());
             *self.providers.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = next;
             if triage != previous_triage {
                 self.triage.set_config(triage);
@@ -842,24 +851,35 @@ impl Runtime {
         let busy = self
             .store
             .call("settings.busy_provider_work", move |store| {
-                let busy_work = store.work_records()?.iter().any(|work| {
-                    matches!(
-                        work.kind,
-                        crate::model::WorkKind::Agent(Provider::Codex | Provider::Opencode)
-                    ) && !work.state.finished()
-                });
+                let busy_work: Vec<Option<String>> = store
+                    .work_records()?
+                    .into_iter()
+                    .filter(|work| {
+                        matches!(
+                            work.kind,
+                            crate::model::WorkKind::Agent(Provider::Codex | Provider::Opencode)
+                        ) && !work.state.finished()
+                    })
+                    .map(|work| work.state.thread().map(str::to_owned))
+                    .collect();
                 let busy_job = store.scheduler_jobs_all()?.iter().any(|job| {
                     matches!(
                         job.state.name(),
                         "claimed" | "running" | "cancelling" | "reconciling" | "steering"
                     )
                 });
-                Ok(busy_work || busy_job)
+                Ok((busy_work, busy_job))
             })
             .await;
         match busy {
-            Ok(false) => {}
-            Ok(true) => return Ok(false),
+            // Work on the user's own Codex does not run on the Node's App Server.
+            Ok((works, false))
+                if works.iter().all(|thread| {
+                    thread
+                        .as_deref()
+                        .is_some_and(|thread| self.codex.user_thread(thread).is_some())
+                }) => {}
+            Ok(_) => return Ok(false),
             Err(error) => return Err(error),
         }
         if let Some(projected) = Config::load(&self.data_dir)?.codex_config
@@ -1082,13 +1102,9 @@ impl ProposalInput {
         }
         Ok(Paths {
             execution: self.execution,
-            app_server: existing(self.app_server_socket, "app_server_socket", |path| {
+            app_server_socket: existing(self.app_server_socket, "app_server_socket", |path| {
                 path.symlink_metadata().is_ok()
-            })?
-            .map(|socket| AppServer {
-                mode: AppServerMode::System,
-                socket: Some(socket),
-            }),
+            })?,
             codex_home: None,
             bins: self
                 .bins
@@ -1134,7 +1150,7 @@ impl Runtime {
                 .execution
                 .iter()
                 .any(|provider| provider.on_app_server())
-            || given.app_server.is_some()
+            || given.app_server_socket.is_some()
             || given.codex_sessions.is_some();
         let (mut local, mut manager, mut triage) = (
             self.providers(),
@@ -1264,12 +1280,10 @@ impl Runtime {
         } else {
             "要改这个节点的这些 AI 设置吗？".to_owned()
         }];
-        if let Some(server) = &paths.app_server {
-            lines.push(match (&server.mode, &server.socket) {
-                (AppServerMode::System, Some(socket)) => {
-                    format!("连接已在运行的 Codex：{}", shown(socket))
-                }
-                _ => "由 Vibeface 启动 Codex".into(),
+        if let Some(socket) = &paths.app_server_socket {
+            lines.push(match self.providers().switches.codex_app_server.mode {
+                AppServerMode::System => format!("连接已在运行的 Codex：{}", shown(socket)),
+                AppServerMode::Spawn => format!("回复送进你自己的 Codex 会话：{}", shown(socket)),
             });
         }
         let named = [
@@ -1570,6 +1584,50 @@ mod tests {
                 .await
                 .config_id
         );
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// While the Node starts its own App Server the socket is the user's own Codex, which no
+    /// launch uses: changing it is saved and leaves no launch change waiting for work to end.
+    #[tokio::test]
+    async fn the_users_own_codex_socket_is_no_launch_change() -> Result<()> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("user-codex-socket-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
+        config.providers.execution.clear();
+        initialize_node(&dir, &config, &crate::crypto::LocalIdentity::generate())?;
+        let node = Runtime::open(&dir).await?;
+        assert_eq!(
+            node.providers().switches.codex_app_server.mode,
+            AppServerMode::Spawn
+        );
+        for socket in [Some(PathBuf::from("/fixture/user.sock")), None] {
+            {
+                let _save = node.config_save.lock().await;
+                node.write_providers(
+                    |target| {
+                        target.local.switches.codex_app_server.socket = socket.clone();
+                        Ok(())
+                    },
+                    None,
+                )
+                .await?;
+            }
+            assert_eq!(
+                Config::load(&dir)?.providers.codex_app_server.socket,
+                socket
+            );
+            assert_eq!(node.providers().user_codex_socket(), socket);
+            assert!(
+                !node
+                    .pending_provider_launches
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            );
+        }
         drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())

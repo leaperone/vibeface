@@ -21,7 +21,7 @@ test('every relative source-file type resolves to the exact source revision', ()
 })
 
 test('website routes, page anchors and external URLs stay unchanged', () => {
-  for (const href of ['/download?channel=nightly#mac', '/docs/node#配置管理-agent', '/icon.svg', '#本页', '?mode=full#本页', 'https://example.com/doc?a=1#part', 'http://localhost:4790', 'mailto:support@example.com', '//example.com/path']) {
+  for (const href of ['/download?channel=hourly#mac', '/docs/node#配置管理-agent', '/icon.svg', '#本页', '?mode=full#本页', 'https://example.com/doc?a=1#part', 'http://localhost:4790', 'mailto:support@example.com', '//example.com/path']) {
     assert.equal(documentationLink(href, source, options), href)
   }
 })

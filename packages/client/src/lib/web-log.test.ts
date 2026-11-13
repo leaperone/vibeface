@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { MAX_BATCH, MAX_RECORD_BYTES, createReporter, fit, pageIds, type WebRecord } from './web-log.ts'
+import { MAX_BATCH, MAX_RECORD_BYTES, createReporter, failureFields, fit, pageIds, type WebRecord } from './web-log.ts'
 
 const size = (record: WebRecord) => new TextEncoder().encode(JSON.stringify(record)).length
 
@@ -33,6 +33,14 @@ test('a failing device drops the batch instead of throwing', async () => {
   reporter.report({ level: 'error', event: 'web.uncaught', message: 'boom' })
   await reporter.flush()
   assert.equal(reporter.pending(), 0)
+})
+
+test('a failed request keeps the device code and its own words beside the worded message', () => {
+  const refused = Object.assign(new Error('work not found'), { responded: true, code: 'codex_missing' })
+  assert.deepEqual(failureFields(refused, '找不到这个任务，可能还在同步。'), { code: 'codex_missing', cause: 'work not found' })
+  assert.deepEqual(failureFields(new Error('连接已断开。'), '连接已断开。'), {}, 'words already shown are not kept twice')
+  assert.deepEqual(failureFields(Object.assign(new Error('x'.repeat(900)), { code: 7 }), '这次操作没有成功。再试一次。'), { cause: 'x'.repeat(500) })
+  assert.deepEqual(failureFields('offline', '这次操作没有成功。再试一次。'), { cause: 'offline' })
 })
 
 test('page ids come from the conversation query and the task path', () => {

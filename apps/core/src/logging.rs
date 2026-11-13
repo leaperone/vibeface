@@ -1,6 +1,6 @@
 //! One structured log per Node: JSON lines in `node.log`, rotated by size while the Node runs.
 //! Every record, whether from `tracing`, a browser, the CLI or a subprocess's stderr, is written
-//! by [`Sink::write`], the one place that redacts.
+//! by [`Sink::write`], the one place that redacts and that counts repeats instead of writing them.
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -24,6 +24,20 @@ pub const MAX_BATCH: usize = 20;
 /// Submitted records per sender per minute.
 pub const RATE_PER_MINUTE: u32 = 120;
 pub const MAX_READ: usize = 20_000;
+/// A record that says what one written this recently said is counted, not written again.
+pub const REPEAT_WINDOW_MS: i64 = 60_000;
+/// Records whose repeats are counted at once; the oldest gives way to a new one.
+pub const MAX_REPEATS: usize = 256;
+/// Events logged only when a state changes, so a copy means the state flipped back: held as a
+/// repeat, the latest state would read wrong until its window ended.
+const STATE_EVENTS: &[&str] = &[
+    "peer.online",
+    "peer.offline",
+    "mesh.neighbor_up",
+    "mesh.neighbor_down",
+    "sync.write_state",
+    "work.state",
+];
 static PRIVATE_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
 pub fn add_private_path(path: &Path) {
@@ -119,6 +133,42 @@ pub struct Record {
     pub fields: Map<String, Value>,
 }
 
+impl Record {
+    /// Whether `other` says the same thing, whenever it was said.
+    fn repeats(&self, other: &Record) -> bool {
+        let Record {
+            ts_ms: _,
+            level,
+            source,
+            event,
+            message,
+            conversation_id,
+            work_id,
+            thread_id,
+            fields,
+        } = self;
+        (
+            level,
+            source,
+            event,
+            message,
+            conversation_id,
+            work_id,
+            thread_id,
+            fields,
+        ) == (
+            &other.level,
+            &other.source,
+            &other.event,
+            &other.message,
+            &other.conversation_id,
+            &other.work_id,
+            &other.thread_id,
+            &other.fields,
+        )
+    }
+}
+
 /// Blanks known secrets, invite tickets and bearer credentials. Every log line passes here.
 pub fn redact(text: &str, secrets: &[String]) -> String {
     let mut text = text.to_owned();
@@ -211,10 +261,20 @@ impl Rotating {
     }
 }
 
+/// A record written within the last [`REPEAT_WINDOW_MS`] and the copies of it that came since.
+struct Repeat {
+    /// As first written; `ts_ms` is when its window opened.
+    record: Record,
+    count: u64,
+    first_ms: i64,
+    last_ms: i64,
+}
+
 /// The Node's log file and the secrets it must never contain.
 pub struct Sink {
     file: Mutex<Rotating>,
     secrets: Mutex<Vec<String>>,
+    repeats: Mutex<Vec<Repeat>>,
 }
 
 impl Sink {
@@ -235,6 +295,7 @@ impl Sink {
                 keep,
             }),
             secrets: Mutex::new(environment_secrets()),
+            repeats: Mutex::default(),
         })
     }
 
@@ -256,12 +317,104 @@ impl Sink {
         Ok(())
     }
 
+    /// Writes `record`, unless one written within the last [`REPEAT_WINDOW_MS`] said the same:
+    /// that copy is counted, and one line with the count follows when the window ends. The Node's
+    /// own [`STATE_EVENTS`] records are always written when they come.
     pub fn write(&self, record: &Record) {
-        let Ok(line) = serde_json::to_string(record) else {
+        let mut repeats = self.repeats.lock().expect("log repeats");
+        self.end_windows(&mut repeats, record.ts_ms, false);
+        if record.source == Source::Node && STATE_EVENTS.contains(&record.event.as_str()) {
+            if let Some(line) = self.line(record) {
+                self.append(&line);
+            }
+            return;
+        }
+        if let Some(repeat) = repeats
+            .iter_mut()
+            .find(|repeat| repeat.record.repeats(record))
+        {
+            if repeat.count == 0 {
+                repeat.first_ms = record.ts_ms;
+            }
+            repeat.count += 1;
+            repeat.last_ms = record.ts_ms;
+            return;
+        }
+        let Some(line) = self.line(record) else {
             return;
         };
+        // A record too large to keep is written every time it comes.
+        if line.len() <= MAX_RECORD_BYTES {
+            if repeats.len() >= MAX_REPEATS
+                && let Some(oldest) =
+                    (0..repeats.len()).min_by_key(|&index| repeats[index].record.ts_ms)
+            {
+                let oldest = repeats.swap_remove(oldest);
+                self.write_count(&oldest, record.ts_ms);
+            }
+            repeats.push(Repeat {
+                record: record.clone(),
+                count: 0,
+                first_ms: 0,
+                last_ms: 0,
+            });
+        }
+        self.append(&line);
+    }
+
+    /// Writes the repeat counts of the windows that ended by `now_ms`, or with `all` of every
+    /// window, as when the Node stops.
+    pub fn settle(&self, now_ms: i64, all: bool) {
+        self.end_windows(&mut self.repeats.lock().expect("log repeats"), now_ms, all);
+    }
+
+    /// A window that ends with copies writes their count and opens again, so a record that
+    /// keeps coming is one line a window; one that ends without is forgotten. A clock set far
+    /// back ends a window too, so it cannot hold its count until the clock catches up.
+    fn end_windows(&self, repeats: &mut Vec<Repeat>, now_ms: i64, all: bool) {
+        repeats.retain_mut(|repeat| {
+            let age = now_ms.saturating_sub(repeat.record.ts_ms);
+            let open = age.saturating_abs() < REPEAT_WINDOW_MS;
+            if open && !all {
+                return true;
+            }
+            if repeat.count == 0 {
+                return false;
+            }
+            self.write_count(repeat, now_ms);
+            repeat.record.ts_ms = now_ms;
+            repeat.count = 0;
+            !all
+        });
+    }
+
+    /// The record again, with how many copies came and when the first and last did.
+    fn write_count(&self, repeat: &Repeat, now_ms: i64) {
+        if repeat.count == 0 {
+            return;
+        }
+        let mut summary = repeat.record.clone();
+        summary.ts_ms = now_ms;
+        for (name, value) in [
+            ("repeated", Value::from(repeat.count)),
+            ("first_ms", Value::from(repeat.first_ms)),
+            ("last_ms", Value::from(repeat.last_ms)),
+        ] {
+            summary.fields.insert(name.to_owned(), value);
+        }
+        if let Some(line) = self.line(&summary) {
+            self.append(&line);
+        }
+    }
+
+    fn line(&self, record: &Record) -> Option<String> {
+        let line = serde_json::to_string(record).ok()?;
         let mut line = redact(&line, &self.secrets.lock().expect("log secrets"));
         line.push('\n');
+        Some(line)
+    }
+
+    fn append(&self, line: &str) {
         let _ = self.file.lock().expect("log file").write(line.as_bytes());
     }
 }
@@ -357,11 +510,30 @@ pub fn write(record: &Record) {
     }
 }
 
-/// Info for vibeface and warn for libraries unless `RUST_LOG` says otherwise. `quiet_libraries`
-/// turns library logs off for commands that report their own outcome, such as `join`, whose
-/// transient iroh warnings and errors read as failures. A serving Node writes structured records
-/// to `node.log` and copies text to stderr only on a terminal, so a service's own stderr file
-/// keeps just crashes.
+/// Writes every repeat count still held; the Node calls this as it stops, so none is lost.
+pub fn flush() {
+    if let Some(sink) = SINK.get() {
+        sink.settle(crate::runtime::now_ms(), true);
+    }
+}
+
+/// What shows when `RUST_LOG` is unset: info for vibeface and warn for libraries. iroh's
+/// connection handling and gossip dialing warn about every stranger's failed handshake and every
+/// peer that is away, which the Node's own `mesh.*` and `peer.*` events cover, so those two show
+/// errors only. `quiet_libraries` turns library logs off for commands that report their own
+/// outcome, such as `join`, whose transient iroh warnings and errors read as failures.
+fn default_filter(quiet_libraries: bool) -> String {
+    let libraries = if quiet_libraries {
+        "off"
+    } else {
+        "warn,iroh::protocol=error,iroh_gossip::net=error,iroh_gossip::net::util=warn"
+    };
+    format!("{libraries},vibeface=info,vibeface_bridge=info")
+}
+
+/// Filters by [`default_filter`] unless `RUST_LOG` says otherwise. A serving Node writes
+/// structured records to `node.log` and copies text to stderr only on a terminal, so a service's
+/// own stderr file keeps just crashes.
 pub fn init(data_dir: Option<&Path>, quiet_libraries: bool) {
     use std::io::IsTerminal as _;
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -370,12 +542,23 @@ pub fn init(data_dir: Option<&Path>, quiet_libraries: bool) {
         SINK.set(sink.clone()).ok()?;
         Some(sink)
     });
-    let libraries = if quiet_libraries { "off" } else { "warn" };
+    if let Some(sink) = sink.clone() {
+        // A window ends on time even while nothing else is logged, so a crash loses one at most.
+        let _ = std::thread::Builder::new()
+            .name("log-repeats".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    sink.settle(crate::runtime::now_ms(), false);
+                }
+            });
+    }
     let terminal = sink.is_none() || std::io::stderr().is_terminal();
     tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new(format!("{libraries},vibeface=info,vibeface_bridge=info"))
-        }))
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(default_filter(quiet_libraries))),
+        )
         .with(sink.map(|sink| Layer { sink }))
         .with(terminal.then(|| fmt::layer().with_writer(std::io::stderr)))
         .init();
@@ -676,6 +859,10 @@ fn submitted(source: Source, sender: &str, value: &Value, now_ms: i64) -> Result
     }
     let source_name = serde_json::to_value(source)?;
     let mut fields = input.fields;
+    // Only the Node counts repeats; a sender cannot claim one.
+    for reserved in ["repeated", "first_ms", "last_ms"] {
+        fields.remove(reserved);
+    }
     // A browser's records name the device that authenticated the channel, not one the page claims.
     if source == Source::Web {
         fields.insert("device_id".to_owned(), Value::String(sender.to_owned()));
@@ -893,6 +1080,237 @@ mod tests {
         assert!(
             stamps.windows(2).all(|pair| pair[1] == pair[0] + 1),
             "read oldest first, without gaps"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repeats_within_a_window_become_one_counted_line() {
+        let dir = scratch("log-repeat");
+        let sink = Sink::open(&dir, MAX_FILE_BYTES, 2).unwrap();
+        let wake = |ts_ms| record(ts_ms, Level::Warn, Source::Node, "wake failed");
+        let mut tagged = wake(3_000);
+        tagged.conversation_id = Some("c1".into());
+        let mut browser = wake(4_000);
+        browser.source = Source::Web;
+        let mut detailed = wake(5_000);
+        detailed.event = "wake.detail".into();
+        detailed.fields.insert("error".into(), json!("offline"));
+        let other = |ts_ms, event: &str, message| {
+            let mut record = record(ts_ms, Level::Warn, Source::Node, message);
+            record.event = event.into();
+            record
+        };
+        for written in [
+            wake(1_000),
+            other(2_000, "reconcile", "reconcile pending"),
+            wake(2_500),
+            tagged,
+            browser,
+            detailed,
+            wake(6_000),
+            wake(59_000),
+        ] {
+            sink.write(&written);
+        }
+        let lines = || -> Vec<(i64, String, Value)> {
+            read(&dir, &Filter::default())
+                .unwrap()
+                .into_iter()
+                .map(|record| {
+                    let rest = json!([record.source, record.conversation_id, record.fields]);
+                    (record.ts_ms, record.message, rest)
+                })
+                .collect()
+        };
+        let line = |ts_ms: i64, message: &str, fields: Value| {
+            (ts_ms, message.to_owned(), json!(["node", null, fields]))
+        };
+        let first = vec![
+            line(1_000, "wake failed", json!({})),
+            line(2_000, "reconcile pending", json!({})),
+            (3_000, "wake failed".to_owned(), json!(["node", "c1", {}])),
+            (4_000, "wake failed".to_owned(), json!(["web", null, {}])),
+            line(5_000, "wake failed", json!({"error":"offline"})),
+        ];
+        assert_eq!(
+            lines(),
+            first,
+            "copies are held; a record that differs in any part is written"
+        );
+
+        // The window ends 60 s after the first line: its three copies are counted in one line.
+        sink.write(&other(61_500, "turn", "turn started"));
+        assert_eq!(
+            lines()[first.len()..],
+            [
+                line(
+                    61_500,
+                    "wake failed",
+                    json!({"repeated":3,"first_ms":2_500,"last_ms":59_000})
+                ),
+                line(61_500, "turn started", json!({})),
+            ]
+        );
+        // The count line opens the next window, so a record that keeps coming is one line each.
+        sink.write(&wake(62_000));
+        sink.write(&wake(70_000));
+        assert_eq!(lines().len(), first.len() + 2);
+
+        // Stopping writes what is still held, once.
+        sink.settle(80_000, true);
+        sink.settle(80_000, true);
+        assert_eq!(
+            lines()[first.len() + 2..],
+            [line(
+                80_000,
+                "wake failed",
+                json!({"repeated":2,"first_ms":62_000,"last_ms":70_000})
+            )]
+        );
+        sink.write(&wake(81_000));
+        assert_eq!(lines().last().unwrap().0, 81_000, "written anew after it");
+
+        // A window without copies is forgotten, and no more than MAX_REPEATS are open at once.
+        sink.settle(200_000, false);
+        assert!(sink.repeats.lock().unwrap().is_empty());
+        for index in 0..MAX_REPEATS as i64 + 10 {
+            let mut distinct = record(
+                300_000 + index,
+                Level::Info,
+                Source::Node,
+                &format!("distinct {index}"),
+            );
+            distinct.event = format!("distinct.{index}");
+            sink.write(&distinct);
+            sink.write(&distinct);
+        }
+        assert_eq!(sink.repeats.lock().unwrap().len(), MAX_REPEATS);
+        let gave_way: Vec<_> = lines()
+            .into_iter()
+            .filter(|(_, _, rest)| rest[2]["repeated"] == 1)
+            .map(|(_, message, _)| message)
+            .collect();
+        assert_eq!(
+            gave_way.len(),
+            10,
+            "the oldest gives way and keeps its count"
+        );
+        assert_eq!(gave_way[0], "distinct 0");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_sender_cannot_claim_a_repeat_count() {
+        let value = json!({"level":"warn","message":"m","fields":{"repeated":9,"first_ms":1,"last_ms":2,"kept":true}});
+        let record = submitted(Source::Web, "device", &value, 5).unwrap();
+        assert_eq!(
+            record.fields,
+            *json!({"kept":true,"device_id":"device"})
+                .as_object()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_state_that_flips_back_is_written_when_it_comes() {
+        let dir = scratch("log-flip");
+        let sink = Sink::open(&dir, MAX_FILE_BYTES, 2).unwrap();
+        let peer = |ts_ms, event: &str| {
+            let mut record = record(ts_ms, Level::Info, Source::Node, event);
+            record.event = event.into();
+            record.fields.insert("peer".into(), json!("x"));
+            record
+        };
+        for (ts_ms, event) in [
+            (1_000, "peer.offline"),
+            (2_000, "peer.online"),
+            (3_000, "peer.offline"),
+            (4_000, "peer.online"),
+        ] {
+            sink.write(&peer(ts_ms, event));
+        }
+        sink.settle(100_000, true);
+        let lines: Vec<_> = read(&dir, &Filter::default())
+            .unwrap()
+            .into_iter()
+            .map(|record| {
+                (
+                    record.ts_ms,
+                    record.event,
+                    record.fields.contains_key("repeated"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (1_000, "peer.offline".to_owned(), false),
+                (2_000, "peer.online".to_owned(), false),
+                (3_000, "peer.offline".to_owned(), false),
+                (4_000, "peer.online".to_owned(), false),
+            ],
+            "every change is written when it comes and none is counted"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn records_from_browsers_agents_and_the_cli_are_merged_too() {
+        let dir = scratch("log-repeat-sources");
+        let sink = Sink::open(&dir, MAX_FILE_BYTES, 2).unwrap();
+        let sources = [Source::Web, Source::Agent, Source::Cli];
+        for ts_ms in [1_000, 2_000, 3_000] {
+            for source in sources {
+                sink.write(&record(ts_ms, Level::Warn, source, "rpc failed"));
+            }
+        }
+        sink.settle(4_000, true);
+        let written: Vec<_> = read(&dir, &Filter::default())
+            .unwrap()
+            .into_iter()
+            .map(|record| (record.source, record.fields.get("repeated").cloned()))
+            .collect();
+        let counted = sources.map(|source| (source, Some(json!(2))));
+        assert_eq!(
+            written,
+            [sources.map(|source| (source, None)), counted].concat()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_default_filter_hides_iroh_handshake_warnings_and_keeps_the_rest() {
+        use tracing_subscriber::prelude::*;
+        let dir = scratch("log-default-filter");
+        let sink = Arc::new(Sink::open(&dir, MAX_FILE_BYTES, 2).unwrap());
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new(default_filter(false)))
+            .with(Layer { sink });
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "iroh::protocol", "Ignoring connection: accepting failed");
+            tracing::warn!(target: "iroh_gossip::net", "dial failed: timed out");
+            tracing::warn!(target: "iroh_gossip::net::util", "message too large, dropped");
+            tracing::error!(target: "iroh::protocol", "an error stays");
+            tracing::warn!(target: "iroh::socket", "another library's warning stays");
+            tracing::info!(target: "iroh::socket", "library info was never shown");
+            tracing::warn!(target: "vibeface_core::runtime::triage", event = "triage.wake_failed", "ours stays");
+            tracing::info!(target: "vibeface_core::runtime", event = "node.started", "ours stays");
+        });
+        let events: Vec<_> = read(&dir, &Filter::default())
+            .unwrap()
+            .into_iter()
+            .map(|record| record.event)
+            .collect();
+        assert_eq!(
+            events,
+            [
+                "iroh_gossip::net::util",
+                "iroh::protocol",
+                "iroh::socket",
+                "triage.wake_failed",
+                "node.started"
+            ]
         );
         fs::remove_dir_all(dir).unwrap();
     }

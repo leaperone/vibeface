@@ -60,7 +60,26 @@ impl CodexError {
         };
         ExecFailure::upstream(self.message.clone(), otherwise)
     }
+
+    /// The App Server itself answered `thread/read` that it has no such thread: neither its
+    /// Codex folder nor its memory holds one with this ID, as for a session of another Codex
+    /// folder. Resuming or retrying cannot load it; a lost connection or another refusal says
+    /// nothing about it. Read only a `thread/read` answer this way: turn methods say "thread not
+    /// found" for a thread that is saved but not loaded.
+    pub fn missing_thread(&self) -> bool {
+        if !self.answered {
+            return false;
+        }
+        match self.message.strip_prefix(REJECTED) {
+            Some(body) => serde_json::from_str::<Value>(body)
+                .is_ok_and(|body| body["message"].as_str().is_some_and(failure::no_thread)),
+            None => failure::no_thread(&self.message),
+        }
+    }
 }
+
+/// Leads the JSON-RPC error object the App Server answered a request with.
+const REJECTED: &str = "Codex rejected request: ";
 
 /// Whether Codex refused because another process is writing the thread (Codex keeps one
 /// writer per thread across processes). Nothing was sent, and retrying does not help until that
@@ -78,7 +97,7 @@ fn server_error(error: &Value) -> String {
             "another Codex process is writing this thread ({detail}); nothing was sent, close it there or wait"
         )
     } else {
-        format!("Codex rejected request: {error}")
+        format!("{REJECTED}{error}")
     }
 }
 
@@ -2437,6 +2456,44 @@ mod tests {
         assert!(!cache.requests.contains_key(&RpcId::Number(7)));
         assert!(cache.requests.contains_key(&RpcId::String("7".into())));
         assert!(request_id(&json!({"id":7,"result":{}})).is_none());
+    }
+
+    #[test]
+    fn only_the_app_servers_own_answer_names_a_missing_thread() {
+        let error = |message: &str, answered| CodexError {
+            uncertain: false,
+            answered,
+            message: message.into(),
+        };
+        // `thread/read` and `thread/resume` as Codex 0.167 answers them for a session that is
+        // in another Codex folder.
+        let read = answered(server_error(
+            &json!({"code":-32600,"message":"thread not loaded: 01a1ffff-0000-7000-8000-000000000001"}),
+        ));
+        assert!(read.missing_thread());
+        let resume = answered(server_error(
+            &json!({"code":-32600,"message":"no rollout found for thread id 01a1ffff-0000-7000-8000-000000000001"}),
+        ));
+        assert!(
+            !resume.missing_thread(),
+            "a thread before its first turn has no rollout either"
+        );
+        assert!(error("thread not found: fixture", true).missing_thread());
+        assert!(!error("authentication required", true).missing_thread());
+        assert!(!error("server request rejected", true).missing_thread());
+        assert!(!error("thread not found", false).missing_thread());
+        let wrapped =
+            r#"Codex rejected request: {"code":-32602,"message":"thread not found: fixture"}"#;
+        assert!(error(wrapped, true).missing_thread());
+        assert!(!error(wrapped, false).missing_thread());
+        assert!(
+            !error(
+                r#"Codex rejected request: {"message":"authentication failed while reading thread not found"}"#,
+                true
+            )
+            .missing_thread()
+        );
+        assert!(!error("Codex rejected request: not-json", true).missing_thread());
     }
 
     #[tokio::test]

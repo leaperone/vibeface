@@ -36,7 +36,7 @@ DESKTOP_INSTALLERS = {'aarch64-apple-darwin': 'dmg', 'x86_64-pc-windows-msvc': '
 NATIVE_UI = {'ui': 'gpui', 'gpui_kit': '0.9.1', 'gpui': '0.3.12'}
 DESKTOP_SCHEMA = 2
 SIGNING_STATES = ('developer-id-notarized', 'authenticode', 'unsigned-development-preview', 'platform-checksums')
-VERSION = r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(nightly)\.([0-9]{8})\.([1-9][0-9]*)|-(rc)\.([1-9][0-9]*))?'
+VERSION = r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(hourly)\.([0-9]{10})|-(rc)\.([1-9][0-9]*))?'
 COMMIT = r'[a-f0-9]{40}'
 MAX_ARCHIVE = 384 * 1024 * 1024
 MAX_UNPACKED = 512 * 1024 * 1024
@@ -71,8 +71,8 @@ def version(value):
     match = re.fullmatch(VERSION, value)
     require(match, 'invalid release version')
     if match[4]:
-        datetime.datetime.strptime(match[5], '%Y%m%d')
-    return 'nightly' if match[4] else 'rc' if match[7] else 'stable'
+        datetime.datetime.strptime(match[5], '%Y%m%d%H')
+    return 'hourly' if match[4] else 'rc' if match[6] else 'stable'
 
 
 def parse_tag(tag):
@@ -130,13 +130,13 @@ def identity(release_app, root=None):
 
 
 def validate_source(source, release_app, root=None):
-    """Return the main CI source after proving the entire detached Nightly tree."""
-    import nightly_source
+    """Return the main CI source, proving a detached Hourly tree when the source is not on main."""
+    import hourly
     global ROOT
     previous = ROOT
     ROOT = root or ROOT
     try:
-        return nightly_source.source_context(source, release_app)
+        return hourly.source_context(source, release_app)
     finally:
         ROOT = previous
 
@@ -146,7 +146,7 @@ def source_workflows(source):
     require(isinstance(source, str) and re.fullmatch(COMMIT, source), 'invalid workflow source commit')
     require(run('git', 'rev-parse', '--verify', source + '^{commit}') == source,
             'workflow source must be an exact commit')
-    paths = {'.github/workflows/' + name for name in ('ci.yml', 'nightly.yml', 'release.yml', 'release-www.yml')}
+    paths = {'.github/workflows/' + name for name in ('ci.yml', 'release.yml', 'release-www.yml')}
     entries = run('git', 'ls-tree', '-z', source, '--', *sorted(paths))
     found = set()
     for entry in entries.split('\0'):
@@ -161,14 +161,6 @@ def source_workflows(source):
     return found
 
 
-def nightly_ci_identity(source):
-    paths = source_workflows(source)
-    require('.github/workflows/ci.yml' in paths, 'workflow source is missing Core CI')
-    if '.github/workflows/nightly.yml' in paths:
-        return '.github/workflows/nightly.yml', 'Nightly validation gate'
-    return '.github/workflows/ci.yml', 'ci-gate'
-
-
 def release_workflow(source, app):
     """Return the source-era release entry and its fixed dispatch input contract."""
     require(app in RELEASES, 'release app must be product or www')
@@ -180,41 +172,19 @@ def release_workflow(source, app):
 
 
 def require_ci(context):
-    """Main tags require push success; detached Nightlies require their original schedule gate."""
-    source, run_id = context['ci_source_commit'], context['ci_run_id']
+    """Every release source, including a detached Hourly parent, needs its exact main push CI success."""
+    source = context['ci_source_commit']
     require(isinstance(source, str) and re.fullmatch(COMMIT, source), 'invalid CI source commit')
-    def api(path):
-        return json.loads(run('gh', 'api', f'repos/{GITHUB_REPO}/' + path))
-    if run_id:
-        require(isinstance(run_id, str) and re.fullmatch(r'[1-9][0-9]*', run_id), 'invalid original Nightly run ID')
-        workflow, gate = nightly_ci_identity(source)
-        candidates = [api(f'actions/runs/{run_id}')]
-    else:
-        workflow = '.github/workflows/ci.yml'
-        batches = json.loads(run('gh', 'api', '--paginate', '--slurp',
-            f'repos/{GITHUB_REPO}/actions/workflows/ci.yml/runs?head_sha={source}&branch=main&event=push&per_page=100'))
-        candidates = [item for page in batches for item in page['workflow_runs']]
-    for candidate in candidates:
-        if not (candidate['head_sha'] == source and candidate['head_branch'] == 'main'
-                and candidate['path'] == workflow
+    batches = json.loads(run('gh', 'api', '--paginate', '--slurp',
+        f'repos/{GITHUB_REPO}/actions/workflows/ci.yml/runs?head_sha={source}&branch=main&event=push&per_page=100'))
+    for candidate in (item for page in batches for item in page['workflow_runs']):
+        if (candidate['head_sha'] == source and candidate['head_branch'] == 'main'
+                and candidate['path'] == '.github/workflows/ci.yml' and candidate['event'] == 'push'
                 and candidate['repository']['full_name'] == GITHUB_REPO
-                and candidate['head_repository']['full_name'] == GITHUB_REPO):
-            continue
-        if not run_id:
-            if candidate['event'] == 'push' and candidate['status'] == 'completed' and candidate['conclusion'] == 'success':
-                return candidate
-            continue
-        require(str(candidate['id']) == run_id and candidate['event'] == 'schedule', 'untrusted original Nightly CI run')
-        created = datetime.datetime.fromisoformat(candidate['created_at'].replace('Z', '+00:00')).astimezone(datetime.timezone.utc)
-        batch = created.replace(hour=created.hour // 4 * 4).strftime('%Y%m%d%H')
-        require(batch == context['nightly_batch'], 'Nightly CI run does not match its original batch')
-        pages = json.loads(run('gh', 'api', '--paginate', '--slurp',
-                              f'repos/{GITHUB_REPO}/actions/runs/{run_id}/jobs?filter=latest&per_page=100'))
-        gates = [job for page in pages for job in page['jobs'] if job['name'] == gate]
-        require(len(gates) == 1 and gates[0].get('status') == 'completed' and gates[0].get('conclusion') == 'success',
-                f'original Nightly schedule {gate} did not succeed')
-        return candidate
-    raise ValueError('release requires the exact trusted main push CI or original Nightly schedule gate')
+                and candidate['head_repository']['full_name'] == GITHUB_REPO
+                and candidate['status'] == 'completed' and candidate['conclusion'] == 'success'):
+            return candidate
+    raise ValueError('release requires the exact successful main push CI of its source')
 
 
 def expected_release_kind_for_component(app):
@@ -1311,7 +1281,7 @@ def self_test():
         mobile = root / 'apps/mobile'
         mobile.mkdir(parents=True)
         (mobile / 'app.json').write_bytes(json.dumps({
-            'expo': {'name': '浏览', 'extra': {'releaseVersion': '1.2.3-nightly.20261107.1'}},
+            'expo': {'name': '浏览', 'extra': {'releaseVersion': '1.2.3-hourly.2026110713'}},
         }, ensure_ascii=False).encode('utf-8'))
         original_read_text = Path.read_text
 
@@ -1321,7 +1291,7 @@ def self_test():
             return original_read_text(path, *args, **kwargs)
 
         with patch.object(Path, 'read_text', windows_default_read):
-            accepts(lambda: require(read_version('mobile', root) == '1.2.3-nightly.20261107.1',
+            accepts(lambda: require(read_version('mobile', root) == '1.2.3-hourly.2026110713',
                                     'UTF-8 mobile configuration must ignore the host default codepage'))
 
     with tempfile.TemporaryDirectory(prefix='vibeface-release-order-') as temporary:
@@ -1337,7 +1307,7 @@ def self_test():
     accepts(lambda: require(parse_tag(product_tag) == ('product', product_version, channel), 'product tag'))
     accepts(lambda: require(parse_tag(www_tag) == ('www', www_version, version(www_version)), 'www tag'))
     for bad in ('v01.0.1', 'v1', 'www-v', 'app-v0.0.1', 'cli-v0.0.1', 'mobile-v0.0.1',
-                'v0.0.1-nightly.20260229.1', 'v1.0.0+extra'):
+                'v0.0.1-hourly.2026022913', 'v1.0.0+extra'):
         rejects(f'invalid tag {bad}', lambda bad=bad: parse_tag(bad))
 
     expo = json.loads((ROOT / 'apps/mobile/app.json').read_text(encoding='utf-8'))['expo']

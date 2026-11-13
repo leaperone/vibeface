@@ -123,7 +123,8 @@ enum Action {
     },
     /// Read from a Codex App Server or send a coordinated turn.
     Codex {
-        /// Codex App Server socket path.
+        /// Codex App Server socket path: the Node's own App Server. Give the user's own Codex
+        /// App Server socket to read their sessions; `send` finds that one through the Node.
         #[arg(long, env = "VIBEFACE_CODEX_SOCKET")]
         socket: Option<PathBuf>,
         #[command(subcommand)]
@@ -516,10 +517,14 @@ enum CodexCommand {
     Call {
         /// App Server method name.
         method: String,
-        /// Method parameters as JSON.
+        /// Method parameters as JSON, in the App Server's own camelCase names, as in
+        /// '{"threadId":"<thread>"}'.
         params: Option<String>,
     },
-    /// Send a turn through the coordinator.
+    /// Send a turn through the coordinator into an existing thread. The Node says which App
+    /// Server has it: its own, or the user's own Codex set as the App Server socket, where the
+    /// session keeps its own approval, sandbox and model. A thread neither has is refused with
+    /// nothing registered or sent.
     Send {
         /// Thread ID.
         thread: String,
@@ -1696,7 +1701,7 @@ async fn dispatch_work(
         |args| async move {
             let asked = json!({"agent":args["agent"],"thread":args["thread"],"continues":args["continues"]});
             let ready = post_tool(tools, "wait_work", asked, call_id).await?;
-            Ok(ready["agent"].as_str().map(str::to_owned))
+            serde_json::from_value(ready).context("the Node's wait_work answer is malformed")
         },
         socket,
     ).await

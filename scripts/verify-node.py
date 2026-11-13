@@ -4705,8 +4705,8 @@ def pin_npm_baseline(options):
         encoded = response.read(4 * 1024 * 1024 + 1)
     require(len(encoded) <= 4 * 1024 * 1024, "npm metadata is bounded")
     registry = json.loads(encoded)
-    version = registry["dist-tags"]["nightly"]
-    require(release.version(version) == "nightly", "the public baseline is a real Nightly")
+    version = registry["dist-tags"]["hourly"]
+    require(release.version(version) == "hourly", "the public baseline is a real hourly release")
     metadata = registry["versions"][version]
     require(metadata["name"] == "@leaperone/vibeface" and metadata["version"] == version,
             "the pinned registry version matches its package")
@@ -4743,7 +4743,7 @@ def pin_npm_baseline(options):
                     return
             raise AssertionError("cannot download pinned public product asset " + name)
 
-        expected = {"app": "product", "tag": tag, "version": version, "source_commit": baseline_source, "channel": "nightly"}
+        expected = {"app": "product", "tag": tag, "version": version, "source_commit": baseline_source, "channel": "hourly"}
         download_asset("release.json")
         release.verify_remote_product_manifest(tag, release.GITHUB_REPO, expected, remote, scratch)
         archive = output / "baseline.tgz"
@@ -4885,8 +4885,8 @@ def npm_service_acceptance(options):
     cleanup_script = run / "cleanup-service.sh"
     candidate_checksums = {name: file_sha256(vendor / name) for name in
                            ("vibeface", "vibeface-core", "BUILD-INFO.json", "FILES.sha256", "scripts/install-node-service.sh")}
-    nightly_order = lambda value: tuple(map(int, re.fullmatch(r"(\d+)\.(\d+)\.(\d+)-nightly\.(\d{8})\.(\d+)", value).groups()))
-    baseline_version, candidate_version = nightly_order(pin["version"]), nightly_order(build["version"])
+    hourly_order = lambda value: tuple(map(int, re.fullmatch(r"(\d+)\.(\d+)\.(\d+)-hourly\.(\d{10})", value).groups()))
+    baseline_version, candidate_version = hourly_order(pin["version"]), hourly_order(build["version"])
     version_order = (candidate_version > baseline_version) - (candidate_version < baseline_version)
     report = {"status": "running", "target": target,
               "candidate": {"version": build["version"], "source_commit": build["source_commit"],

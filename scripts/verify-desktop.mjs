@@ -236,7 +236,7 @@ function selfTest() {
     const entitlementSource = fs.readFileSync(path.join(repo, 'apps/desktop/build/entitlements.mac.plist'), 'utf8');
     const configuredPermissions = Object.fromEntries([...entitlementSource.matchAll(/<key>([^<]+)<\/key>\s*<(true|false)\s*\/>/g)].map(match => [match[1], match[2] === 'true']));
     verifyMacEntitlements(configuredPermissions);
-    const version = '9.9.9-nightly.20261107.1';
+    const version = '9.9.9-hourly.2026110712';
     const commit = 'a'.repeat(40);
     const write = (file, content) => {
       fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -285,7 +285,7 @@ function selfTest() {
       fs.writeFileSync(path.join(runtime, 'FILES.sha256'), relativeFiles(runtime)
         .filter(name => name !== 'FILES.sha256').map(name => `${hash(path.join(runtime, name))}  ${name}\n`).join(''));
       const receipt = {
-        schema: SCHEMA_VERSION, app: 'desktop', target, version, tag: `v${version}`, channel: 'nightly',
+        schema: SCHEMA_VERSION, app: 'desktop', target, version, tag: `v${version}`, channel: 'hourly',
         source_commit: commit, ...NATIVE_UI, signed: false,
         signing: target.endsWith('-unknown-linux-gnu') ? 'platform-checksums' : 'unsigned-development-preview',
         runtime: { archive: `vibeface-${version}-${target}.tar.gz`, sha256: 'b'.repeat(64) },

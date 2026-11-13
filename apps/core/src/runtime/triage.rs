@@ -880,7 +880,19 @@ impl Runtime {
                     }
                 }
                 let event_id = event.event_id.clone();
+                let (provider, kind, origin) = (event.agent.name(), event.event, event.source);
+                let session = event.session_id.clone();
                 let status = if store.queue_triage_event(event, now_ms())? {
+                    tracing::info!(
+                        event = "triage.queued",
+                        conversation_id = scope,
+                        thread_id = session,
+                        event_id,
+                        provider,
+                        kind = ?kind,
+                        origin = ?origin,
+                        "session event queued for triage"
+                    );
                     "accepted"
                 } else {
                     "duplicate"
@@ -2517,7 +2529,10 @@ impl Runtime {
             }
             _ => bail!("unknown triage action"),
         };
-        self.store
+        let (provider, session) = (event.agent.name(), event.session_id.clone());
+        let handled = event_id.clone();
+        let result = self
+            .store
             .call("triage.handle_event", move |store| {
                 store.connection.execute(
                     "INSERT INTO triage_handled(event_id,ts_ms,result) VALUES(?,?,?)
@@ -2527,7 +2542,19 @@ impl Runtime {
                 dequeue(&store.connection, &event)?;
                 Ok(result)
             })
-            .await
+            .await?;
+        // What was concluded, never the question or the session's words.
+        tracing::info!(
+            event = "triage.concluded",
+            conversation_id = result["conversation_id"].as_str(),
+            thread_id = session,
+            event_id = handled,
+            provider,
+            conclusion = action,
+            severity = input["severity"].as_str(),
+            "triage concluded"
+        );
+        Ok(result)
     }
 
     /// Asks in the chat of the bot that owns the event's session, the primary bot's when its
@@ -9522,6 +9549,406 @@ pub(super) mod tests {
         }.await;
         server.abort();
         cleanup(node, dir).await?;
+        result
+    }
+
+    /// A Codex App Server fixture for every connection: `threads` (ID to directory) read and
+    /// resume, others are "thread not loaded" as Codex 0.167 says; turn/start runs a turn,
+    /// thread/start makes a thread. Returns its task, every request and the turns by thread.
+    async fn codex_fixture(
+        socket: &Path,
+        threads: &[(&str, &str)],
+    ) -> Result<(
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::Mutex<Vec<Value>>>,
+        Arc<std::sync::Mutex<BTreeMap<String, Value>>>,
+    )> {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let mut listener = vibeface_bridge::platform::ipc::Listener::bind(
+            &vibeface_bridge::platform::ipc::Endpoint::from_path(socket)?,
+        )
+        .await?;
+        let dirs: Arc<std::sync::Mutex<BTreeMap<String, String>>> =
+            Arc::new(std::sync::Mutex::new(
+                threads
+                    .iter()
+                    .map(|(id, cwd)| ((*id).into(), (*cwd).into()))
+                    .collect(),
+            ));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let turns = Arc::new(std::sync::Mutex::new(BTreeMap::<String, Value>::new()));
+        let (seen, served) = (requests.clone(), turns.clone());
+        let task = tokio::spawn(async move {
+            let mut sessions = tokio::task::JoinSet::new();
+            while let Ok(stream) = listener.accept().await {
+                let (seen, turns, dirs) = (seen.clone(), served.clone(), dirs.clone());
+                sessions.spawn(async move {
+                    let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else { return; };
+                    while let Some(Ok(message)) = server.next().await {
+                        let Ok(request) = serde_json::from_slice::<Value>(&message.into_data()) else { continue; };
+                        seen.lock().unwrap().push(request.clone());
+                        let thread = request["params"]["threadId"].as_str().unwrap_or_default().to_owned();
+                        let reply = {
+                            let mut turns = turns.lock().unwrap();
+                            let mut dirs = dirs.lock().unwrap();
+                            let known = dirs.get(&thread).cloned();
+                            match (request["method"].as_str(), known) {
+                                (Some("initialize"), _) => json!({"result":{"userAgent":"codex/fixture"}}),
+                                (Some("thread/read" | "thread/resume"), Some(cwd)) => {
+                                    let turn = turns.get(&thread).cloned();
+                                    let active = turn.as_ref().is_some_and(|turn| turn["status"] == "inProgress");
+                                    json!({"result":{"thread":{"id":thread,"cwd":cwd,"source":"cli",
+                                        "status":{"type":if active {"active"} else {"idle"}},
+                                        "turns":turn.into_iter().collect::<Vec<_>>()}}})
+                                }
+                                (Some("thread/read" | "thread/resume"), None) => {
+                                    json!({"error":{"code":-32600,"message":format!("thread not loaded: {thread}")}})
+                                }
+                                (Some("turn/start"), Some(_)) => {
+                                    let turn = json!({"id":format!("turn-{thread}"),"status":"inProgress",
+                                        "items":[{"type":"userMessage","clientId":request["params"]["clientUserMessageId"]}]});
+                                    turns.insert(thread, turn.clone());
+                                    json!({"result":{"turn":turn}})
+                                }
+                                (Some("thread/start"), _) => {
+                                    let id = format!("new-{}", dirs.len());
+                                    dirs.insert(id.clone(), request["params"]["cwd"].as_str().unwrap_or_default().into());
+                                    json!({"result":{"thread":{"id":id}}})
+                                }
+                                _ => json!({"result":{}}),
+                            }
+                        };
+                        if request.get("id").is_some() {
+                            let mut reply = reply;
+                            reply["id"] = request["id"].clone();
+                            let _ = server.send(reply.to_string().into()).await;
+                        }
+                    }
+                });
+            }
+        });
+        Ok((task, requests, turns))
+    }
+
+    /// The user's own Codex sessions live on their own App Server, which the Node only reaches
+    /// when its socket is set. Only threads found there are sent there, keeping the session's
+    /// settings, and the Node settles them by reading them there; its own threads and new
+    /// threads stay on its own App Server. A changed socket only serves later lookups, and work
+    /// there never holds a launch change. The test Node's named App Server stands in for the
+    /// one it starts.
+    #[tokio::test]
+    async fn sends_reach_the_users_own_codex_only_for_threads_found_there() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let cwd = dir.canonicalize()?.display().to_string();
+        let (own, own_seen, _) = codex_fixture(&named_socket(&node), &[("t-own", &cwd)]).await?;
+        let user_dir = vibeface_bridge::platform::ipc::runtime_dir(
+            &uuid::Uuid::new_v4().simple().to_string(),
+        )?;
+        vibeface_bridge::platform::privatefs::create_dir(&user_dir)?;
+        let user_socket = user_dir.join("user.sock");
+        let (user, user_seen, user_turns) =
+            codex_fixture(&user_socket, &[("t-user", &cwd)]).await?;
+        let result = async {
+            with_agent(&node);
+            node.settings.lock().unwrap().roots = vec![dir.canonicalize()?];
+            bot(&node, &admin, "c", "Bot", &[]).await?;
+            let network = node.network_id().await?;
+            let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
+            let access = node
+                .manager_access_fixture(
+                    "user-codex-token",
+                    test_access(network.clone(), false, Some("c".into())),
+                    &attempt,
+                    &trigger,
+                    Provider::Codex,
+                )
+                .await?;
+            connected(&node).await;
+            let dispatch = |thread: Option<&str>, call: &str| {
+                let mut args = json!({"prompt":"p","call_ref":call,"agent":"codex"});
+                match thread {
+                    Some(thread) => args["thread"] = json!(thread),
+                    None => {
+                        args["cwd"] = json!(cwd);
+                        args["title"] = json!("t");
+                    }
+                }
+                node.tool(access.clone(), "dispatch_work", args)
+            };
+            let works = async || -> Result<Vec<crate::work::WorkRecord>> {
+                node.store
+                    .call("triage.test.work_records", |store| store.work_records())
+                    .await
+            };
+            let wrote = |seen: &std::sync::Mutex<Vec<Value>>, thread: &str| {
+                seen.lock().unwrap().iter().any(|request| {
+                    request["params"]["threadId"] == thread
+                        && request["method"].as_str().is_some_and(|method| {
+                            method.starts_with("turn/") || method == "thread/resume"
+                        })
+                })
+            };
+
+            let refused = dispatch(Some("t-user"), "unset")
+                .await
+                .expect_err("no user socket yet");
+            assert!(
+                refused
+                    .to_string()
+                    .contains("is not on this device's Codex App Server"),
+                "{refused:#}"
+            );
+            assert!(works().await?.is_empty(), "nothing was registered");
+
+            node.codex.set_user_socket(Some(user_socket.clone()));
+            let sent = dispatch(Some("t-user"), "user").await?;
+            let work_id = sent["work_id"].as_str().context("user work")?.to_owned();
+            assert!(
+                !wrote(&own_seen, "t-user"),
+                "nothing went to the Node's own App Server"
+            );
+            let start = user_seen
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|request| request["method"] == "turn/start")
+                .cloned()
+                .context("sent on the user's App Server")?;
+            assert_eq!(start["params"]["threadId"], "t-user");
+            for kept in ["approvalPolicy", "sandboxPolicy", "model"] {
+                assert!(
+                    start["params"].get(kept).is_none(),
+                    "the session keeps its own {kept}: {start}"
+                );
+            }
+            let record = async |id: &str| -> Result<crate::work::WorkRecord> {
+                let id = id.to_owned();
+                node.store
+                    .call("triage.test.work_record", move |store| {
+                        store.work_record(&id)
+                    })
+                    .await?
+                    .context("work")
+            };
+            let running = record(&work_id).await?;
+            assert_eq!(
+                running
+                    .state
+                    .handle()
+                    .context("running on the user's turn")?
+                    .turn_id,
+                "turn-t-user"
+            );
+            // A changed or cleared socket only serves later lookups: the thread stays where it
+            // was found, so a chat message steered into its turn and the reads go there too.
+            node.codex.set_user_socket(None);
+            assert_eq!(node.codex.user_thread("t-user"), Some(user_socket.clone()));
+            // A new send follows the cleared setting and is refused.
+            assert!(matches!(
+                node.codex.locate("t-user").await,
+                vibeface_control::agent::ThreadAt::Missing { .. }
+            ));
+            use super::super::executor::{Executor as _, SteerAck, SteerInput, SteerTrace};
+            let into = crate::scheduling::SteerTarget {
+                provider: Provider::Codex,
+                attempt_id: format!("work:{work_id}"),
+                thread_id: "t-user".into(),
+                turn_id: "turn-t-user".into(),
+            };
+            let input = SteerInput {
+                text: "more".into(),
+                files: Vec::new(),
+            };
+            assert_eq!(
+                node.codex.send_turn(&into, "steer-1", &input).await,
+                SteerAck::Accepted { turn_id: None }
+            );
+            assert!(
+                user_seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request["method"] == "turn/steer"
+                        && request["params"]["threadId"] == "t-user"),
+                "steered on the user's App Server"
+            );
+            assert!(!wrote(&own_seen, "t-user"));
+            assert_eq!(
+                node.codex.read_back(&into, "steer-1").await,
+                Some(SteerTrace::Pending)
+            );
+            user_turns
+                .lock()
+                .unwrap()
+                .get_mut("t-user")
+                .context("user turn")?["status"] = json!("completed");
+            node.probe_work(&network, &work_id, true).await?;
+            assert!(
+                matches!(
+                    record(&work_id).await?.state,
+                    crate::work::WorkState::Finished { .. }
+                ),
+                "the Node read the user's turn and settled it"
+            );
+            node.codex.set_user_socket(Some(user_socket.clone()));
+
+            let own_work = dispatch(Some("t-own"), "own").await?;
+            assert!(own_work["state"]["state"] == "running", "{own_work}");
+            let own_start = own_seen
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|request| request["method"] == "turn/start")
+                .cloned()
+                .context("sent on the Node's App Server")?;
+            assert_eq!(own_start["params"]["threadId"], "t-own");
+            assert_eq!(own_start["params"]["approvalPolicy"], "never");
+            assert!(
+                !user_seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request["params"]["threadId"] == "t-own"),
+                "the user's App Server is not asked about the Node's thread"
+            );
+
+            // One work at a time holds the folder.
+            let own_id = own_work["work_id"].as_str().context("own work")?;
+            node.signal_work(
+                &network,
+                own_id,
+                crate::work::Signal::TurnCompleted {
+                    turn_id: "turn-t-own".into(),
+                    status: vibeface_bridge::turn::TurnStatus::Completed,
+                    text: "done".into(),
+                    error: None,
+                },
+            )
+            .await?;
+            let fresh = dispatch(None, "new").await?;
+            assert!(fresh["state"]["state"] == "running", "{fresh}");
+            assert!(
+                own_seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request["method"] == "thread/start"),
+                "a new thread starts on the Node's App Server"
+            );
+            assert!(
+                !user_seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request["method"] == "thread/start"),
+                "never on the user's"
+            );
+            let fresh_id = fresh["work_id"].as_str().context("new work")?;
+            let fresh_turn = record(fresh_id)
+                .await?
+                .state
+                .handle()
+                .context("new turn")?
+                .turn_id
+                .clone();
+            node.signal_work(
+                &network,
+                fresh_id,
+                crate::work::Signal::TurnCompleted {
+                    turn_id: fresh_turn,
+                    status: vibeface_bridge::turn::TurnStatus::Completed,
+                    text: "done".into(),
+                    error: None,
+                },
+            )
+            .await?;
+            let again = dispatch(Some("t-user"), "user-again").await?;
+            assert!(again["state"]["state"] == "running", "{again}");
+
+            let registered = works().await?.len();
+            let refused = dispatch(Some("t-gone"), "gone")
+                .await
+                .expect_err("neither App Server has it");
+            for said in [
+                "is not on this device's Codex App Server or the user's own Codex",
+                "nothing was registered or sent",
+                "must not be copied, linked or resumed",
+            ] {
+                assert!(refused.to_string().contains(said), "{refused:#}");
+            }
+            assert!(!wrote(&own_seen, "t-gone") && !wrote(&user_seen, "t-gone"));
+
+            user.abort();
+            let _ = std::fs::remove_file(&user_socket);
+            let refused = dispatch(Some("t-elsewhere"), "unreachable")
+                .await
+                .expect_err("the user's App Server is gone");
+            for said in [
+                "cannot tell which Codex App Server has thread t-elsewhere",
+                "the user's own Codex App Server did not answer",
+                "nothing was registered or sent",
+            ] {
+                assert!(refused.to_string().contains(said), "{refused:#}");
+            }
+            assert_eq!(
+                works().await?.len(),
+                registered,
+                "neither refusal registered a work"
+            );
+            assert!(
+                !refused
+                    .to_string()
+                    .contains(&*user_socket.to_string_lossy()),
+                "the chat never sees the socket: {refused:#}"
+            );
+            node.finish_manager_attempt(&attempt).await;
+
+            // A launch change waits only for work on the Node's own App Server, and the user's
+            // turn still running does not hold that launch.
+            {
+                let (identity, network, trigger, attempt) = (
+                    node.identity.clone(),
+                    network.clone(),
+                    trigger.clone(),
+                    attempt.clone(),
+                );
+                node.store
+                    .call("triage.test.finish_user_codex_reply", move |store| {
+                        store
+                            .finish_job(
+                                &identity,
+                                &network,
+                                "c",
+                                &trigger,
+                                &attempt,
+                                crate::scheduling::JobOutcome::Completed,
+                                "done",
+                                now_ms(),
+                            )
+                            .map(|_| ())
+                    })
+                    .await?;
+            }
+            node.pending_provider_launches.store(true, Ordering::SeqCst);
+            node.codex.configuration_changed();
+            assert!(
+                node.apply_provider_launches().await?,
+                "the user's running turn does not hold a launch change"
+            );
+            assert!(!node.pending_provider_launches.load(Ordering::SeqCst));
+            assert!(
+                !node
+                    .codex
+                    .configuration_pending(&node.providers().codex_target(true)),
+                "nor the Node's App Server launch"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        own.abort();
+        user.abort();
+        cleanup(node, dir).await?;
+        let _ = std::fs::remove_dir_all(user_dir);
         result
     }
 

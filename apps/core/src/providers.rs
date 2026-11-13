@@ -875,8 +875,9 @@ pub enum AppServerMode {
 #[serde(deny_unknown_fields)]
 pub struct AppServer {
     pub mode: AppServerMode,
-    /// The explicitly selected system App Server socket. Kept while the
-    /// Node starts its own, so switching back restores it.
+    /// The user's own Codex App Server socket, set explicitly. In system mode the Node uses
+    /// it; while the Node starts its own, it only sends into and follows the user's existing
+    /// threads there and never starts one.
     pub socket: Option<PathBuf>,
 }
 
@@ -1437,6 +1438,14 @@ impl Local {
         self.switches.validate(codex_agent)?;
         Ok(())
     }
+    /// The user's own Codex App Server while the Node starts its own; see `AppServer::socket`.
+    pub fn user_codex_socket(&self) -> Option<PathBuf> {
+        let app_server = &self.switches.codex_app_server;
+        (app_server.mode == AppServerMode::Spawn)
+            .then(|| app_server.socket.clone())
+            .flatten()
+    }
+
     /// The variables reach only an App Server the Node starts; the system one keeps its own.
     pub fn codex_target(&self, codex_agent: bool) -> CodexTarget {
         let app_server = &self.switches.codex_app_server;

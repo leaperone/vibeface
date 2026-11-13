@@ -5,9 +5,9 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 # 按改动选择 CI
 
-`.github/workflows/ci.yml` 使用 `scripts/ci.py` 选择检查范围、Rust 测试分组和必需任务。常规 CI 运行生成计划，`ci-gate` 要求选中的任务全部成功。付费交付的独立实验流程见下文。没有顶层 `paths` 筛选。
+`.github/workflows/ci.yml` 使用 `scripts/ci.py` 选择检查范围、Rust 测试分组和必需任务。常规 CI 运行生成计划，`ci-gate` 要求选中的任务全部成功。没有顶层 `paths` 筛选。
 
-开发分支的 PR 不触发 GitHub Actions，也不要求 CI 状态。需要验证移动端或 macOS 时，从 Actions 手动运行对应 workflow。`CI / Core` 由 `main` push、手动运行、merge queue 或其他 workflow 调用，不含定时入口。产品 tag 交给 `release.yml` 构建完整产品，官网 tag 交给 `release-www.yml`。合并、CI 通过、发布和部署各有自己的验收结果。
+开发分支的 PR 不触发 GitHub Actions，也不要求 CI 状态；需要远端验证时手动运行 `CI / Core`。Actions 只保留核心 CI、发布和部署入口：桌面四平台、Windows native、移动端构建与验收、原生诊断和付费交付实验入口已移除，iOS 模拟器等界面验收不在 CI 中运行。`CI / Core` 由 `main` push、手动运行或 merge queue 触发，不含定时入口。产品 tag 交给 `release.yml` 构建完整产品，官网 tag 交给 `release-www.yml`。合并、CI 通过、发布和部署各有自己的验收结果。
 
 ## 按用途选择 Actions 入口
 
@@ -16,17 +16,10 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | 文件 | Actions 名称 | 触发方式 | 用途 |
 | --- | --- | --- | --- |
 | `ci.yml` | CI / Core | main push、merge queue、手动、复用调用 | 自动按累计差异选核心检查；手动与复用调用执行扩展检查 |
-| `ci-desktop-acceptance.yml` | CI / Desktop | 手动 | `desktop-only` 默认运行四平台真实窗口与 Windows Rust；`full-validation` 运行完整 Core，再验收同 SHA 包的 Mac、Windows 窗口与 Windows 进程 |
-| `ci-windows.yml` | CI / Windows native | 手动 | 只检查当前源码的 Windows Rust |
-| `ci-native-diagnostics.yml` | CI / Native diagnostics | 手动 | compiler 四包编译、可选受控回归/frame/bench 或明确来源的安装器诊断，不发布 |
-| `ci-mobile-device.yml` | CI / Mobile device builds | 手动 | `platforms=ios\|android\|both` 构建设备归档或 APK，不发布 |
-| `mobile.yml` | CI / Mobile acceptance | 手动、复用调用 | Android 原生构建与 iOS 模拟器 UI；不含 Android 模拟器 UI 验收 |
-| `delivery-small.yml` | Delivery / Small proof | 手动 | 四关系真实证明、公开分项续用与结算实验 |
-| `delivery-live.yml` | Delivery / Live native proof | 手动 | Linux native Core 检查后，生成五份 fresh proof 并验收真实交付 |
-| `nightly.yml` | Release / Nightly | 每四小时、手动 | 完整标准 Core 检查后进入 Nightly 门；仅 main schedule 可启动发布协调器 |
+| `hourly.yml` | Release / Hourly | 每小时、手动 | 为最新 CI 通过的 main 提交创建当小时 Hourly Tag 并派发产品发布；不运行 Core 检查 |
 | `release.yml` | Release / Product | `v*` push、手动 | 固定产品组；手动默认只构建 |
 | `release-www.yml` | Release / Website | `www-v*` push、手动 | 固定官网组；手动默认只构建 |
-| `npm-publish.yml` | Release / npm Nightly | 产品发布调用、手动 | 验证完整产品发布的原始 npm 制品；手动默认只验证 |
+| `npm-publish.yml` | Release / npm Hourly | 产品发布调用、手动 | 验证完整产品发布的原始 npm 制品；手动默认只验证 |
 | `deploy-node.yml`、`deploy-app.yml`、`deploy-www.yml`、`deploy-product.yml` | Deploy / Node、Web App、Website、Product services | 手动 | 固定目标部署，`tag` 必填，`apply=false` 默认构建验证与排练 |
 
 `_ci-crypto.yml` 与 `_ci-web.yml` 仅供复用，不是手动入口。部署入口统一调用 `deploy-services.yml`，由它持有全局部署锁。`ci.yml` 的 `package_policy` 仅供复用调用，允许 `standard` 或 `linux-native`；公开手动 Core 入口没有模式参数。
@@ -54,7 +47,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | `apps/www/`、`packages/docs/` | 门户类型检查、静态构建和产物检查，不运行 Rust 测试 |
 | `apps/app/`、Web 构建脚本 | 浏览器密码学互通、Web 测试与类型检查、静态构建、Linux x64 完整包及网页进程验收 |
 | `apps/app/src/lib/*.test.ts`、`apps/app/src/features/*/*.test.ts`，限定单层目录 | 浏览器密码学互通和独立 `web-tests`，不组包或构建静态页面 |
-| 五个默认浏览器 E2E：chat-confidence、mesh、onboarding、transfers、workspace | Web 构建与真实 Linux 包 E2E，不额外选无关的 Rust workspace 测试或 proof |
+| `tests/e2e/` | 不选任何构建或测试；e2e 不在 CI 中运行，只在本地按 [e2e](e2e.md) 执行 |
 | `apps/desktop/src/`、`apps/desktop/tests/` | Linux 上的原生 GPUI Rust 测试与 Clippy；真实窗口留在显式平台验收 |
 | `apps/mobile/`、`packages/secure-native/` | 独立的 Mobile 与 secure-native 类型检查，同时保留 Web 套件中的手机行为测试 |
 | `packages/client/`、共享主题 | Web 和 Mobile 检查；主题另运行门户检查 |
@@ -71,13 +64,13 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 `desktop-check` 在 Linux 上运行原生 Desktop 的 Cargo 测试与 Clippy，使用 Rust 1.98.1 和 hosted runner 系统库，不替代手动平台窗口验收。桌面安装配置、打包脚本及尚未分类的路径继续选择全工作区检查。
 
-`web-tests` 执行与 Web 构建相同的 Web、共享 Client 行为测试及类型检查，下载并核对本提交的密码学产物。仍安装 Mobile 测试依赖。只有变更全部落在现有单测命令覆盖的路径时，才省去静态构建和组包；同时修改生产源码时由完整 Web job 承担这些检查，不重复运行测试 job。更深层测试、TSX 测试、原生或付费 E2E、公共 fixture 和 E2E 配置保持保守回退。原生 workspace 的手动验收要求保持不变，不把类型检查算作原生行为验收。
+`web-tests` 执行与 Web 构建相同的 Web、共享 Client 行为测试及类型检查，下载并核对本提交的密码学产物。仍安装 Mobile 测试依赖。只有变更全部落在现有单测命令覆盖的路径时，才省去静态构建和组包；同时修改生产源码时由完整 Web job 承担这些检查，不重复运行测试 job。更深层测试、TSX 测试和公共 fixture 保持保守回退。原生 workspace 的手动验收要求保持不变，不把类型检查算作原生行为验收。
 
 `mobile-check` 独立运行共享 Client、secure-native 和 Mobile 类型检查，`ci-gate` 要求它与选中的其他任务都成功。Web 构建脚本不再执行这两项原生类型检查；Web 套件仍包含手机行为测试，并读取手机依赖中的实现，所以暂时保留 Mobile 安装过滤器。移动这些行为测试前，不移除这部分依赖或手机变更对应的 Web 检查。全量事件和未知范围回退同时包含 Mobile、桌面源码检查。
 
 `www` 使用 Node.js 24 和冻结的 pnpm 依赖，依次运行 `typecheck`、`build`、`check:static`，上传 `apps/www/dist/client` 为 `www-<SHA>` 制品。门户与独立 App 分别构建；根 `packages/docs/` 是门户文档正文的唯一来源，修改文档也会触发 `www`。
 
-首个正式版前按 `AGENTS.md` 保持 `DATA_EPOCH=1`，不随功能或 Nightly 递增。改 `apps/core/migrations/` 或 `apps/core/src/delivery/schema.sql` 时直接维护最终 schema，并更新 `apps/core/src/config.rs` 的 `DATA_EPOCH_SCHEMA_SHA256`。当前检查比较 schema digest，不证明 epoch 增加。确需调整 epoch 时须单独说明理由，并同步 `crates/control/src/lib.rs`、`install.sh` 与 `ci.py --self-test`；不以新增迁移或兼容回退代替最终数据形状。
+首个正式版前按 `AGENTS.md` 保持 `DATA_EPOCH=1`，不随功能或 Hourly 版本递增。改 `apps/core/migrations/` 或 `apps/core/src/delivery/schema.sql` 时直接维护最终 schema，并更新 `apps/core/src/config.rs` 的 `DATA_EPOCH_SCHEMA_SHA256`。当前检查比较 schema digest，不证明 epoch 增加。确需调整 epoch 时须单独说明理由，并同步 `crates/control/src/lib.rs`、`install.sh` 与 `ci.py --self-test`；不以新增迁移或兼容回退代替最终数据形状。
 
 Web 路径优先于 Node 路径，只有 `packages/client/src/avatar/face.ts` 与 `derived-faces.json` 例外：它们按 Node 路径选取，因为这组向量也是 Node Rust 测试的输入，核对 Node 由 bot ID 派生的长相与客户端一致；Node 受影响时 Web 检查照常运行。Node 对 Protocol、Bridge、Secure 的依赖用于向上扩展检查范围。PR 按 `merge-base(base, head)..head` 的完整差异选取，删除与重命名包括旧、新路径。无法识别的输入选择整个工作区核心检查。
 
@@ -85,7 +78,7 @@ Web 路径优先于 Node 路径，只有 `packages/client/src/avatar/face.ts` �
 
 Linux 制品核对 checksum、源码提交、版本、target、WASM 和存储 epoch，再以 `verify-node.py --web-only` 启动真实进程，检查网页资源、SPA 路由、CSP、缓存与 404。它不执行多 Node 业务验收，也不验证浏览器渲染。
 
-Linux 制品还使用 [e2e](e2e.md) 启动隔离 Node，在 Chromium 中验证建网页面以及建网、下载恢复文件、跳过 AI 设置、创建 Bot 和刷新后保留的流程。它不调用真实模型。CI 上传浏览器测试报告，排除下载的恢复文件和 Node 数据。
+CI 不运行浏览器、桌面窗口或 iOS 模拟器 e2e，也不做截图类视觉验收。需要界面证据时按 [e2e](e2e.md) 在本地运行。
 
 ## 可验证交付的核心检查
 
@@ -124,7 +117,7 @@ python3 scripts/check-delivery.py --sandbox
 
 `--check-fixtures` 只核对公开文件结构和 schema，不验证证明。两个脚本的 `--self-test` 也只验证工具自身的正反例。整个 fixture 目录不存在时按上文跳过 receipt 验证；fixture 不全、缺编译器、依赖或 verifier 时退出失败，不能把未验证结果记为通过。
 
-普通 PR 和扩展 CI 不生成新的昂贵证明，也不为新容量或资源上限背书。旧 Strict/十三证明启动协议明确拒绝，不能用历史成功状态为新预算背书；当前受保护真实 Node/证明验收由显式运行的 `delivery-live.yml` 或同一宿主命令执行。修改密码关系或 guest 后，先验收新 image 的真实证明，再更新公开 fixture。生产 adapter 的 seal 验真只能证明该公开关系，不能单独证明托管合约已经收付款或用户已读。
+普通 PR 和扩展 CI 不生成新的昂贵证明，也不为新容量或资源上限背书。旧 Strict/十三证明启动协议明确拒绝，不能用历史成功状态为新预算背书；当前受保护真实 Node/证明验收只由显式运行的宿主命令 `scripts/run-delivery-live.py` 执行，Actions 不再提供入口。修改密码关系或 guest 后，先验收新 image 的真实证明，再更新公开 fixture。生产 adapter 的 seal 验真只能证明该公开关系，不能单独证明托管合约已经收付款或用户已读。
 
 当计划选中 `delivery` 时，Linux x64 package 任务还以本次打包的 Node 和 JS/WASM 执行 `verify-node.py --delivery-charity`。它先以 `--locked` 构建独立的 `tests/fixtures/delivery-probe`，产物放在 `.artifacts/delivery-probe/target`。probe 编译时包含当前产品的发现实现，进程验收重新核对该源码摘要。公网角色、不同个人网络的 Node、真实 loopback QUIC/Noise、免费发现、公益文件恢复、私人协议拒绝、每条服务连接只处理一个请求后关闭，以及停滞握手在限期内释放，都使用真实进程验证。CI 仅上传该模式的公开 `report.json`。
 
@@ -132,65 +125,15 @@ python3 scripts/check-delivery.py --sandbox
 
 ## 手动生成真实付费交付证据
 
-`delivery-small.yml` 是独立手动小实验。默认运行 `delivery-small-prepare`、四关系证明 matrix 和 `delivery-small-accept`，不调用常规 Core、Android 或 full live。`prepare_only` 默认 false；设为 true 后只运行 prepare 并上传公开准备证据，proofs 和 accept 均跳过。`resume_run` 指定同源旧运行。该次手动运行的成功不替代普通 PR 的最终 HEAD 检查。
-
-```sh
-gh workflow run delivery-small.yml --ref <实验分支>
-# 只运行四关系准备和执行控制，不启动证明或 accept 的资金与恢复分支。
-gh workflow run delivery-small.yml --ref <实验分支> -F prepare_only=true
-# 从明确的同源运行续用已合格的公开分项。
-gh workflow run delivery-small.yml --ref <同一提交的分支> -f resume_run=<run-id>
-# 本机只运行准备控制，不生成证明或可复用分项证书。
-python3 scripts/check-delivery.py --sandbox --prove-small prepare
-```
-
-`--prove-small` 必须指定 `prepare`、`relation-1` 至 `relation-4` 或 `accept`，不保留旧的无参数四证明入口。证明与续跑项要求真实 Actions 来源。`--resume-run` 仅供宿主选择一个明确的旧 run，不猜测分支最新运行。内部 `--resume-dir` 指向宿主已按 API、精确文件树和摘要检查的私有候选集合；容器中的 Python 用当前重编 host 验真全部合格候选后，才生成 Node 可读取的规范化目录。GH token 留在宿主，不进入容器环境、envfile 或新增挂载。
-
-小实验保持原来的 native Ubuntu x86_64 sandbox、11 GiB 内存、零 swap、64 PIDs、segment po2=19 和产品 profile。整个 small workflow 使用跨 ref 的串行 concurrency group `ci-delivery-small`，matrix `max-parallel: 1` 且 `fail-fast: false`。每项在 Docker build 前设置唯一绝对截止，所有子命令共用它，截止早于 hosted job 的六小时硬限，留出终止、清理和上传余量。该限制不保证任一证明能完成，也不续用证明中间的私密 checkpoint。
-
-`prepare` 使用封闭的公开测试部署配方，真实重建两个全新链与同一 4096 字节订单，逐字比较部署公开状态及四份 journal。它还完成四次 execute、八次空 stdin receipt decoder 控制和旧 image 的 PreTerms 反例。这些是非证明控制。四个证明项各自重建材料，只生成所选关系的一份真实 Groth16 receipt，或独立验真该关系已保存的合格分项。`accept` 不生成证明，先要求四份合格分项，再重放同一实际部署，完成正常 adapter 和原三条资金、恢复分支。缺项显式失败，不启动资金操作。
-
-prepare-only 仍执行上述构建、受控 Ganache 重建、四关系 execute 和 decoder 控制。公开摘要的 `executionControls` 记录各关系的 `cycles` 和 `segments`，其中 cycles 是 `user_cycles`，不包含全部 STARK padding 与 paging 工作。这些控制不生成证明，`PREPARED/NO_PROOF` 不能定位原 Source7200 的全部内部阶段，也不证明原两订单 fresh5 验收通过。guest、profile、11 GiB、64 PIDs 和外层 Tokio2 均保持原设置；Node 的单次证明 7200 秒上限未改动，但 small 实验的证明不经 Node，只受工作项绝对截止约束。
-
-公开 context 绑定当前干净 HEAD、实际 guest ELF/image/schema、原 profile 字节摘要、部署交易与区块、基线余额、订单和四份 journal。源码改变后不能自动续用旧分项。宿主通过当前仓库 Actions API 核对 workflow path、`workflow_dispatch`、head SHA、expiry、精确 artifact 名称、不可变 artifact ID 与 digest。允许同源 failed-job 重跑组合不同 producer attempt 的分项，不要求所有分项来自最新 attempt。相同关系的竞争候选全部独立验真后按固定来源顺序选择；冲突或声称合格但损坏的候选导致失败。只保留原 producer 与原证明资源，当前验证资源和导入 artifact ID 单独记录，不累计前驱图。
-
-同一 Held 快照分别验证正常 revealBatch、可选 Open 与 withdrawBudget 的 17 atoms、pending E 后超期失败并退款、成功 publish 后受控回滚并退款。每条分支记录实际 Token 余额、事件、交易回执和原生 gas，并由独立恢复程序只接收 Hold 与交易中实际观察到的 E，核对原文件字节和 SHA-256。公开固定的测试种子不为生产保密背书。恢复程序没有链参数，这不等于操作系统网络或文件访问隔离。快照分支不能相加为最终链上收入，Ganache 回滚不代表公网共识攻击。
-
-结果在 `.artifacts/vdp/canonical/small/<work-id>/public/`，每个阶段单独上传精确白名单。`context.json`、`summary.json` 和 `resources.json` 之外，合格关系项只有 `partials/relation-N/part.json` 及实际 `.json`、`.receipt` 两个证明文件。`VERIFIED_PARTIAL` 要求当前 host 的二进制正验、Node 单一构造的 intended wrong-journal 拒绝、全部控制、Node 清理和最终 cgroup 无 OOM 观察通过。Node 后续失败或资源 UNKNOWN/OOM 时，只能保留当前 host 已按实际 profile/context 独立验真的证明对，标为 `UNQUALIFIED`，不写可复用证书，也不满足缺项。未验真的字节永不上传。prepare 的 `PREPARED` 和本机 `local-control` 均不代表证明成功。
-
-完整验收候选通过独立二进制检查后，`proofs/` 恰好保留原四关系的九个文件，manifest 和核心 loader 不放宽。最终资源检查失败仍判整轮实验失败，但保留此前已独立验真的完整 bundle，摘要将 `VERIFIED_BUNDLE` 与整体 `FAIL` 分开。公开目录和文件分别为 `0755/0644`，私有目录和文件保持 `0700/0600`。原文、恢复文件、E、witness、接收秘密、私钥、vectors、Succinct checkpoint、calldata 与原始日志均不上传。CPU 是整个 sandbox 区间增量，`memory.peak` 是容器生命周期累计峰值，复用验证耗用不替代原证明耗用。任何证明、结算、恢复、清理或资源检查失败都不能报告完整实验通过。
-
-旧 Strict/十三证明、逐单 fund/publish 和 UI 控制器协议已退休。`verify-node.py --delivery`、`--delivery-ui-selfcheck` 和旧 run-live 的 package/Android 参数组合都在写入或启动工作前明确拒绝；历史 artifact 工具纯自检只用于识别旧证据，不代表当前产品验收。
-
-`delivery-live.yml` 仅在显式手动 workflow_dispatch 时执行，没有额外开关。该 job 使用 `ubuntu-24.04` 原生 x86 runner，先核对宿主 Linux/x86_64，再使用 `run-delivery-live.py --protected-package <same-run-linux-package> --source-commit <HEAD>`。容器内生成 `0600` 最终配置，由入口监督两个同级子进程：native 经既有 `--protected-config` 调用 verify-node 的 `delivery_protected_acceptance` helper，另一个运行 tracked restart observer。它依赖同 run、同 SHA 的 package/crypto/web 检查，不启动旧专属 Android、KVM 或录像前置。独立 Live gate 要求 Core 和真实证明 job 均成功；任何失败都不能忽略。容器的 amd64 目标不能独自证明宿主没有使用 emulation。
-
-Live 通过复用 Core 的内部 `package_policy=linux-native` 选择 native-only 实验：package matrix 只含 Linux x86_64，保留该平台上 `package_mode=node` 的制品、真实进程与 Chromium 验收（只在 macOS ARM64 包上运行的 `--chat-agent` 和 `--phase5` 不执行），以及 Rust 快慢组、MSRV、delivery、crypto 和 Web 检查。Linux Mobile/Desktop 源码检查照常执行。非 Linux 包、npm、托管的 Mac/Windows 桌面窗口及 Windows native 验收未选，其跳过不代表这些平台已验收。普通 Core、Nightly 的完整标准 Core 与产品 Tag 继续使用各自的完整检查范围。计划摘要列出实际 target 和未选范围。
-
-Live 等待同一次运行的 Core 成功，再从其输出的精确 SHA 下载 Linux package、crypto 和 Web 制品。失败、取消或缺少 Linux 包不能启动证明，整体取消后也不启动新证明。各用途使用独立入口。
-
-```sh
-gh workflow run delivery-live.yml --ref <实验分支>
-```
-
-protected 宿主入口不继承旧 Strict/UI 的 20700 秒整轮截止，而由既有原生阶段和业务期限决定退出；单项证明仍限 7200 秒，11GiB/zero swap/64 PIDs、原订单期限和 W/I/F/S 均不变。`prepare`、`confirm_batch`、`accept_batch` 仅对结构化响应中的固定提交前 busy 错误沿既有 120 秒阶段上限重试原请求；网络异常、未知结果及其他拒绝不重发。Actions 的 `timeout-minutes: 360` 是独立外部限制，可能截断尚在合法阶段内的运行，不能据此宣称完整实验通过。分项保存保留已验真的公开材料，但当前驱动不支持停止容器后的原链/订单续跑。
-
-native 创建 fresh 目录后，在原 start 的任何子进程或业务前等待 observer 的真实 official info/inotify 正控。匿名 ready FD 的 120 秒门只用于准备，不进入 KeyBinding、订单或 proof 期限。observer 与 native 同 UID/GID、cgroup 和 Tokio2；native 的后代清理不能杀它。观察严格覆盖原 `settlement-observation.json` 到业务 cleanup 后 `native-result.json`，要求同 inode host opens=0、累计 RPC ready→stopped、两端 raw 广播数至少7且所有写方法增量0、窗口内两份锚定账户样本相等。只有精确预窗口 stats ENOENT 可丢样且不得推进 baseline，终态缺失仍失败。native 退出后，observer 先排空 inotify 再处理 done EOF；PID1 等两者真实退出后才结束。不能延长业务窗口凑样本，也不能将 result 中的 PASS 代替实际 exit0。
-
-入口核对 clean HEAD、package 来源、GLIBC 实测、实际使用的 CLI/Core/crypto/host/r0vm/profile/ELF 摘要与原资源硬界，新建五份 genuine receipt、两笔订单和三种真正2slot批次，并核对自动提款与真实重启。宿主可复用同一命令，linked worktree Git metadata 只读挂载；低层 `--protected-config` 只执行 native，本身不证明独立 E1 或制品来源。只上传 launcher 输出或 `GITHUB_OUTPUT` 的 `public-directory` 所指 `public-export-<opaque>/` 安全目录。导出逐项核对认证及当前摘要，未登记或损坏一项会令整体 FAIL，但保留其他合格分项、安全摘要与输出路径。`progress.json` 只含受控状态及合格清单，原生终态见摘要认证的 `native-result.json`。observer 仅导出固定 schema 的 `restart-observer-summary.json`，绑定 source、相对 run 身份与配置内容、tracked script/prover/native-result 摘要和监督进程取得的真实退出码。整体 PASS 要求原 native 与完整 observer 均通过且实际 exit0；中断、缺窗或 INCONCLUSIVE 不能关闭 E1。账户原始快照、RPC payload、observer raw result、原始日志、配置、钱包、`native/public/` 和整个 run 都不上传。详细配置与边界见 [受保护交付验收](e2e.md#验证受保护付费交付)。`--protected-selfcheck` 和常规 run-live self-test 接入 driver、observer 合成行为、监督及导出投影检查，不启动链、Node、套接字或证明；它们不代表实际窗口通过。此 native job 不代表 Web/Android 渲染验收，普通核心 CI 不自动生成新证明。
-
-当前受保护验收通过正式产品入口完成：两个 paid/recoverable 单窗口订单、同一预付预算、`confirm_batch`、P 的 `ready_windows` 与显式 `budget flush`。实际 reserveBatch、holdBatch、revealBatch 均须至少一笔含两个不同 slot；S 上传完必要对象并离线后，P 独立 earned/withdraw，R 实际恢复原文件。新的最小五份真实证明驱动、真实重启、同 HEAD 制品及界面渲染需分别验收，不能用合约探针、旧17 fixture 或 parser 自检替代。正式公开 bundle 使用 schema2，`observe-settlement.mjs` 只读原链，核对 pinned runtime、逐窗 genuine Source/Hold、同 canonical anchor 的预算与订单、实际方法/事件/金额/余额和 gas。binary receipt 还必须由官方 host 独立验真。
-
-首次 E 外发门、签名私密状态、DisclosedOutstanding 近截止恢复、nonce-consuming revert 后原 cap 新 attempt、锁钱包/关实验室的只读对账都属于原生安全验收。固定本地 policy、两次确认或 cached genuine17 不构成公网活性、真实稳定币或绝对公平证明。见 [受保护预算说明](paid-delivery.md)。
+付费交付的真实证明实验（原 `delivery-small.yml` 与 `delivery-live.yml`）已从 Actions 移除，CI 不生成新证明，也不为证明容量或资源上限背书。本机仍可运行 `python3 scripts/check-delivery.py --sandbox --prove-small prepare` 生成不含证明的准备控制，以及 `scripts/run-delivery-live.py` 的宿主命令。要求真实 Actions 来源的证明分项与续用（`relation-1` 至 `relation-4`、`accept` 和 `--resume-run`）在恢复对应入口前不可用。受保护验收的配置与边界见 [受保护交付验收](e2e.md#验证受保护付费交付) 和 [受保护预算说明](paid-delivery.md)。
 
 ## 定期、手动和发布检查
 
-`nightly.yml` 保留每 4 小时的 `23 */4 * * *`，UTC 槽位为 00:23、04:23、08:23、12:23、16:23、20:23。GitHub schedule 是 best effort，可能延迟或跳过。Nightly 调用一次完整标准 Core，根级 `ci-gate` 确认成功后，才允许 main schedule 运行 `daily-nightly`。手动 Nightly 只验证，不发布。协调器全局串行，只使用 `GITHUB_TOKEN` 创建不可变 Tag 和精确 dispatch，不需要 PAT、版本分支、PR 或 main merge。
+`hourly.yml`（Release / Hourly）的 job `hourly` 每小时由 cron 触发，运行协调器 `scripts/hourly.py`。main 固定携带开发版本 `0.0.1-hourly.2026111300`；协调器选择 `ci.yml` push 运行已成功完成的最新 main 提交。该提交不包含最新 Hourly Tag 的 parent 时跳过；等于该 parent 且那次发布正在运行或已成功时也跳过。那次发布失败时用同一提交重建一次当小时新版本；同一提交第二次失败时协调器报错停止，等待修复或 main 的新提交。本 UTC 小时的 Tag 已存在时只核对来源，缺少发布运行时补派发。否则创建一个脱离 main 的 BOT 提交，只改版本字段：全部产品版本文件、`Cargo.lock` 中三个本仓包、Android versionCode（`YYMMDDHH`）与 iOS buildNumber（`YYMM.DD.HH`）。随后创建 `vX.Y.Z-hourly.YYYYMMDDHH` Tag 并派发 `release.yml`。协调器不等待发布结果，也不补发更早的小时；某小时失败时，下一小时发布新版本。详情见 [Hourly 发布](releasing.md#每小时-hourly-发布)。
 
 手动 `CI / Core` 同样执行完整扩展检查，不受路径影响，只验证和生成制品。merge queue 执行整个工作区核心检查，不启用慢测试、MSRV 或四平台打包。开发分支 PR 不触发 Core。产品 `v` Tag 由 `release.yml` 构建全部产品目标，`www-v` Tag 由 `release-www.yml` 构建官网。
 
-版本提交只使用原 schedule 的精确 main SHA 作 parent。共享来源门核对普通单 parent、完整机械 tree、版本 cohort、两个移动构建号及 `cargo metadata --locked --no-deps`。发布 workflow 根据原 CI SHA 的精确文件树选择来源工作流，验证原 run 的仓库、workflow path、main、SHA 与根级 `ci-gate` success。新来源要求 `nightly.yml`，历史来源仍严格验证原 `ci.yml`，不使用宽泛路径白名单。不等待包含协调 job 的整体 run success。真正的 artifact source 与 provenance 仍是 Tag 的版本提交。main 上的普通 Tag 继续要求同一 SHA 的 main push CI success，Stable/RC 不允许 detached 来源。
-
-原 run 的 UTC `created_at` 决定四小时批次；延迟和跨日恢复沿用原版本、构建号、SHA、运行与留存 artifact。构建号从 main 和上一可信产品 Nightly 取数值上界加一，iOS 分段溢出时停止。上一来源完整发布且 npm 成功、main 无新提交时跳过；部分 Tag、Release、npm 先恢复原来源，不新建版本覆盖。quick-check 与 preflight 执行现有 Nightly 自测，覆盖真实临时 Git、机械 tree 篡改、原 schedule CI 门、固定 parent、构建号数值比较、同批次及部分发布恢复、Tag 冲突和未知写入对账。详情见 [Nightly 发布约束](releasing.md#每-4-小时-nightly-的发布约束)。
+发布来源门：位于 main 的 Tag 要求同一 SHA 的 main push CI success；脱离 main 的 Hourly 来源必须恰好是机械版本提交，其唯一 parent 位于 main 且有 main push CI success。Stable/RC 不允许脱离 main 的来源。真正的 artifact source 与 provenance 仍是 Tag 的版本提交。quick-check 与 preflight 执行 `scripts/hourly.py --self-test`。
 
 | 扩展检查 | 执行范围 |
 | --- | --- |
@@ -204,11 +147,11 @@ native 创建 fresh 目录后，在原 start 的任何子进程或业务前等�
 | 公共节点、排队与私有 relay 令牌验收 | Linux x64 一次，使用 `--public-node` |
 | 全网入网、志愿 relay、relay 选择与无网页 Node 验收 | Linux x64 一次，使用 `--mesh` |
 | 写入保护、状态与诊断包验收 | macOS ARM64 一次，使用 `--phase5` |
-| Nightly npm 包（当前声明版本为 Nightly 时） | 组装四个原生包，四个平台分别安装并检查版本；macOS ARM64、Linux x64/ARM64 另执行 `--web-only` 和 `--npm-service` 原生服务验收 |
+| Hourly npm 包（扩展运行且声明版本为 Hourly 时） | 组装四个原生包，四个平台分别安装并检查版本；macOS ARM64、Linux x64/ARM64 另执行 `--web-only` 和 `--npm-service` 原生服务验收 |
 
 `--npm-service` 仅允许无既有 Vibeface 数据或默认服务的 GitHub hosted runner，使用真实 launchd 或 systemd user manager，不能在开发者机器运行。Linux job 显式准备 user manager 和 D-Bus；不可用即失败。验收通过公开 npm CLI 执行安装、启动、停止、重启和卸载，核对服务使用 scoped npm vendor 中的原生程序。
 
-`npm-package` 每次只读取一次公开 `nightly`，固定版本、registry integrity、完整产品 manifest 及全部 vendor 字节，使用共享发布来源门证明基线业务来源是候选源码的祖先。基线单独上传，三个平台按不可变 artifact ID 下载同一份，不混入候选发布 artifact。基线与候选是同一个源码提交、基线业务来源不是候选的祖先，或 data epoch 不兼容均失败；基线业务来源等于候选提交是允许的，记为 `business_source_relation=same`。
+`npm-package` 每次只读取一次公开 `hourly` dist-tag，固定版本、registry integrity、完整产品 manifest 及全部 vendor 字节，使用共享发布来源门证明基线业务来源是候选源码的祖先。基线单独上传，三个平台按不可变 artifact ID 下载同一份，不混入候选发布 artifact。基线与候选是同一个源码提交、基线业务来源不是候选的祖先，或 data epoch 不兼容均失败；基线业务来源等于候选提交是允许的，记为 `business_source_relation=same`。
 
 受控 Node 和 App Server 夹具从不可变的公开基线包创建真实非空消息及附件，安装真实服务并核对运行状态与数据，再停服，以独立 prefix 核验的本 CI 候选包替换原 prefix。首个正式版前 `DATA_EPOCH` 固定为 1，同 epoch 不代表 schema 兼容。若候选明确返回 `data_schema_mismatch`，必须核对两个已审源码的 schema 指纹不同、实际启动同样被拒绝，并证明基线身份、配置、数据库及附件字节未变；保留旧目录，再为候选初始化新目录及非空消息和附件。其余错误仍由正常启动验收判定，不回退为新目录。
 
@@ -218,25 +161,11 @@ native 创建 fresh 目录后，在原 start 的任何子进程或业务前等�
 
 Rust 测试额外记录 `compile`、`enumerate` 和 `execute` 三阶段。先以同一包和测试配置运行 `cargo test --no-run`，再枚举并验证慢测试分组，最后执行原有快、慢测试命令。执行阶段仍包含 Cargo 校验和文档测试准备，不能当作精确的纯测试 CPU 时间。`--timings-file` 将阶段时长和退出码写为 JSON；CI 上传该文件并写入 job summary。编译失败或测试失败继续使 job 失败。
 
-iOS Rust cache 同时覆盖默认 `target/` 和 Host Node 的 `.artifacts/native/target`；Linux 组包 cache 另外覆盖独立 probe workspace 的 `.artifacts/delivery-probe/target`，保留各自 Cargo.lock 的失效规则。Rust/App 缓存键包含实际使用的 `release-rustflags.py`。缓存命中只复用编译输入与依赖，不跳过类型、签名、真实进程或 UI 验收。
+Linux 组包 cache 另外覆盖独立 probe workspace 的 `.artifacts/delivery-probe/target`，保留各自 Cargo.lock 的失效规则。Rust/App 缓存键包含实际使用的 `release-rustflags.py`。缓存命中只复用编译输入与依赖，不跳过类型、签名、真实进程或 UI 验收。
 
 CI 不使用真实 AI Provider 或模型密钥。各模式都使用受控 SDK 和 App Server 夹具，`--phase5` 不启动 App Server。模拟协议通过不能证明真实模型理解需求或正确选择工具。
 
-产品 `v<version>` 与官网 `www-v<version>` 分别进入发布路径，必须匹配声明版本，并通过同一共享来源门验证 main 源码或受信机械 Nightly 提交。产品并行构建 Web、四个原生目标、Android 和 iOS，各平台再按自身输入组包并构建桌面 App。每组校验后立即向同一个公开 Release 追加附件，完整审计完成后才追加全局 `release.json`。`publish=false` 手动入口只验证并生成制品。产品与官网制品发布不触发部署；独立部署命令可显式选择已发布的 Stable、RC 或 Nightly Tag；派发成功不代表部署成功。详见 [构建与发布](releasing.md)。
-
-Windows 专项使用当前源码，不接受历史运行包。只检查原生 Rust 时运行：
-
-```sh
-gh workflow run ci-windows.yml --ref <branch>
-```
-
-需要运行当前 Windows 包的真实进程、IPC、服务、更新和 Provider 夹具时，使用扩展平台入口：
-
-```sh
-gh workflow run ci-desktop-acceptance.yml --ref <branch> -f intent=full-validation
-```
-
-该入口先构建当前源码的 Windows package，再从同一次运行下载按源码 SHA 命名的不可变制品，校验摘要后执行真实进程检查。
+产品 `v<version>` 与官网 `www-v<version>` 分别进入发布路径，必须匹配声明版本，并通过同一共享来源门验证 main 源码或受信机械 Hourly 提交。产品并行构建 Web、四个原生目标、Android 和 iOS，各平台再按自身输入组包并构建桌面 App。每组校验后立即向同一个公开 Release 追加附件，完整审计完成后才追加全局 `release.json`。`publish=false` 手动入口只验证并生成制品。产品与官网制品发布不触发部署；独立部署命令可显式选择已发布的 Stable、RC 或 Hourly Tag；派发成功不代表部署成功。详见 [构建与发布](releasing.md)。
 
 ## 本地按改动补充验收
 
@@ -327,17 +256,17 @@ Node 之间的传输、同步、地址簿、跨入口转发和投递改动跑默
 
 写入闸门、对齐、分叉、日志、`status` 与诊断导出改动跑 `--phase5`。A、B 两台 Node：A 从备份恢复后对齐前拒绝写入、对齐后无分叉；B 离线时 A 只读，用户确认后才写；复制的数据目录在 B 处分叉后只有副本停写并列出冲突，原 A 与 B 继续写；同时检查 `status` 的对端连通与上次同步、`node.log` 权限与内容、诊断包和日志里没有能力、口令或邀请。
 
-CI 固定的 Chromium 用例覆盖指定 Web 流程；任务特定的页面验收、其他浏览器渲染、真正模型调用、实体设备授权、实际公网 NAT 与用户后台服务安装需单独按任务验收，不属于 CI 的通过声明。
+CI 不运行界面用例；页面验收、其他浏览器渲染、真正模型调用、实体设备授权、实际公网 NAT 与用户后台服务安装需单独按任务验收，不属于 CI 的通过声明。
 
 Rust 快、慢组在计划生成后直接开始，Clippy 另等待静态快检。它们不等待或下载 Web 构建产物。制品任务继续等待 Web 和密码学资源，并执行原有的源码身份、真实进程和浏览器验收。
 
 ## 缓存与并发
 
-Core 的 concurrency group 包含调用方 workflow、事件、Git ref 和 package policy。标准 Core 的首次 main push 或手动验证会取消同组旧运行，main 累计覆盖选择仍保留未验证的改动。Desktop、Windows 与 Mobile 等纯验证入口的首次手动运行也按同分支、同模式去重。这些验证仅在 `run_attempt > 1` 时追加 `run_id`，并且不取消新提交的运行；普通手动验证不按 `run_id` 隔离。Core 的 schedule 和 merge queue 不取消同组正在执行的检查。
+Core 的 concurrency group 包含调用方 workflow、事件、Git ref 和 package policy。标准 Core 的首次 main push 或手动验证会取消同组旧运行，main 累计覆盖选择仍保留未验证的改动；重跑仅在 `run_attempt > 1` 时追加 `run_id`，不取消新提交的运行。Core 的 schedule 和 merge queue 不取消同组正在执行的检查。
 
-Small 使用跨 ref 的 `ci-delivery-small` 串行组，不取消正在执行的实验。Live 及其调用的 `linux-native` Core 均按 `run_id` 隔离且不自动取消，保留昂贵实验的显式独立运行。Nightly 协调器、产品发布与部署分别遵守自己的并发规则；Nightly 协调器使用全局 `daily-nightly` 串行组。
+Hourly 协调器、产品发布与部署分别遵守自己的并发规则；Hourly 协调器使用全局 `hourly-release` 串行组。
 
-Linux x64 制品任务使用 pnpm 缓存，并按 runner、架构和 `pnpm-lock.yaml` 缓存 Chromium 二进制。浏览器的系统依赖从 Ubuntu 官方镜像下载，沿用签名仓库配置。每次仍执行冻结依赖安装、浏览器与系统依赖安装以及完整浏览器用例。缓存只包含浏览器文件，不包含测试结果、Node 数据或下载的恢复文件。
+Linux x64 制品任务使用 pnpm 缓存。
 
 `ci` 工作流中的 Rust 缓存仅在 `refs/heads/main` 或显式 `workflow_dispatch` 时保存。手动运行可为相同 ref 的后续运行预热。新增 profile 或缓存 key 在首次保存前需要冷构建。产品或官网 Tag 使用独立发布工作流，不属于本节缓存保存规则。
 
@@ -351,7 +280,7 @@ Android 使用官方 Gradle 缓存动作和 Gradle build cache，保留 `arm64-v
 
 `ci-gate` 要求选中的任务成功，选中任务失败、取消、缺失或跳过均拒绝通过。未选中的任务允许跳过或缺失；若它们实际报告失败或取消，仍拒绝通过。gate 核对冻结提交范围并重新计算计划，拒绝缩小 `scopes`、必需任务或其他选取结果。它服务于 main、merge queue、手动运行与复用调用，不是开发分支 PR 的必需检查。
 
-Core 的 plan 与 gate 都从同一个内部 `package_policy` 重新计算覆盖范围，拒绝将标准四平台计划缩成 Linux-only 或关闭 npm。Live 的 `linux-native` 策略只允许手动来源的复用调用。独立 Live gate 另要求真实证明 job 成功。未选的 npm、托管 Mac/Windows 窗口与 Windows native 验收，以及非 Linux 包不计为已验证。
+Core 的 plan 与 gate 都从同一个内部 `package_policy` 重新计算覆盖范围，拒绝将标准四平台计划缩成 Linux-only 或关闭 npm。未选的 npm 与非 Linux 包不计为已验证。
 
 GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate` 列为必需状态。仓库开发流程仍要求相关本地验证、最终 HEAD 的 preflight 和明确合并授权。合并后的 CI 与产品或官网 Tag 的制品、发布和部署检查分别记录。
 
@@ -360,58 +289,12 @@ GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate`
 
 ## 桌面专项验收
 
-在开发分支手动运行 `ci-desktop-acceptance.yml`，选择默认的 `intent=desktop-only`。共享密码学与 Web 输入构建后，Mac ARM64、Windows x64、Linux x64 和 Linux ARM64 各自编译、组包并驱动真实 GPUI 窗口，一端不等待另一端的原生构建或测试。独立的 `windows-platform` 按 Core、Bridge 和 CLI 并行执行 MSVC Clippy 和 Windows Rust 测试，一组失败不会中止其他组。Linux 用例在 Xvfb 中启动实际 AppImage 解包后的 App。最终 `desktop-gate` 要求所有这些任务成功。
+桌面四平台窗口与 Windows native 检查不在 Actions 中运行；Linux 上的原生 GPUI 测试与 Clippy 由 `CI / Core` 的 `desktop-check` 执行。
 
-```sh
-	gh workflow run ci-desktop-acceptance.yml --repo leaperone/vibeface --ref <branch> -f intent=desktop-only
-```
-
-需要完整 Core 与 Mac、Windows 包验收时，选择 `intent=full-validation`。它只运行一次完整标准 Core，再消费同一次运行、同 SHA 的 Mac 与 Windows 包，运行真实窗口与 Windows 进程验收。该模式不额外运行 Linux 桌面窗口。
-
-只定位 Windows Rust 问题时，运行 `ci-windows.yml`。这条路径不启动桌面构建，其 `windows-gate` 只表示原生 Windows Rust 检查通过，不代表完整桌面验收。 Windows bridge 组包含 Protocol、Bridge、Secure、Rust Client 和 Control 的实际 Clippy 与测试；共享 SDK 不因已有窗口结果而跳过。
-
-桌面测试通过现有 e2e runner 的 `tests/e2e/e2e.native-desktop.config.ts` 注册为 tools-only 原生目标，helper 调用 `scripts/e2e-desktop.mjs` 启动打包后的原生程序。独立 profile 与显式受控夹具模式隔离真实数据，按 PID 定位真实 OS 窗口，发送原生键盘输入与 Enter，保存窗口 PNG，再核对 GPUI 输入、焦点与动作回执、正常退出和没有自动启动 Node。Cargo 原生功能测试覆盖业务状态与本机生命周期；窗口驱动不宣称完成 IME、无障碍或完整业务矩阵验收。Windows 另核对真实 SID/DACL、维护通道、Unicode 路径、Provider 子进程和当前用户服务。所有 Provider 均为受控夹具，不调用真实模型。
+本地桌面窗口测试通过现有 e2e runner 的 `tests/e2e/e2e.native-desktop.config.ts` 注册为 tools-only 原生目标，helper 调用 `scripts/e2e-desktop.mjs` 启动打包后的原生程序。独立 profile 与显式受控夹具模式隔离真实数据，按 PID 定位真实 OS 窗口，发送原生键盘输入与 Enter，保存窗口 PNG，再核对 GPUI 输入、焦点与动作回执、正常退出和没有自动启动 Node。Cargo 原生功能测试覆盖业务状态与本机生命周期；窗口驱动不宣称完成 IME、无障碍或完整业务矩阵验收。Windows 另核对真实 SID/DACL、维护通道、Unicode 路径、Provider 子进程和当前用户服务。所有 Provider 均为受控夹具，不调用真实模型。
 
 离线文档使用 `scripts/offline-docs.json` 作为唯一清单；`offline-docs.py` 由 compose、POSIX 和 Windows 组包入口共同调用，复制所有已跟踪公开文档并改写相对链接。测试检查最终组装目录中的本地链接闭包，源码引用固定到本次完整提交。
-
-## 原生编译与安装诊断
-
-原生准备与安装器诊断使用独立的 `ci-native-diagnostics.yml`，不放回快速 `ci.yml`。该入口只生成诊断证据，不发布、部署或代表普通 CI 门禁通过；新增入口合入默认分支前不能派发，也不提供临时旧参数桥接。
-
-`installer_source_run` 默认为空，此时运行 compiler 准备任务。固定 Rust 1.98.1 的受控 Linux hosted runner 执行 `cargo update --workspace`、`cargo fmt --all` 和 Client、Desktop、CLI、Core 四包 all-targets 编译，尽量保留已有第三方锁。`native_tests` 默认 false；开启时执行受控 Rust 回归与原生 frame probe。`native_test_scope=all|desktop` 默认 all，只缩小测试范围，不缩小四包编译。
-
-```sh
-	gh workflow run ci-native-diagnostics.yml --ref <branch> -F native_tests=true -f native_test_scope=all
-	gh workflow run ci-native-diagnostics.yml --ref <branch> -F native_tests=true -f native_test_scope=desktop
-```
-
-`native_frames=true` 额外执行 frame 和受控冷启动 debugger 诊断；`native_benchmarks=none|small|ingest|full` 默认 none，选择既有签名追加、同步或完整规模矩阵探针。它们不是四平台窗口、用户消息延迟或整机性能验收。
-
-```sh
-	gh workflow run ci-native-diagnostics.yml --ref <branch> -F native_frames=true -f native_benchmarks=small
-```
-
-只有这个显式准备入口允许解析锁变更。无论编译成功或失败，都上传完整源码 SHA、步骤 outcome、Cargo.lock、格式与锁补丁、工具链和日志。上传成功不表示编译成功。维护者核对原 SHA、审核补丁并提交最终源码后，仍须执行普通 CI 的 `--locked` 与真实平台验收。准备任务不提交、推送、创建 Tag、发布或读取真实 Provider 认证。
-
-`installer_source_run` 非空时切换安装器诊断，必须同时给出其精确 40 位 `installer_source_sha`；`installer_source_attempt` 默认 1。来源只接受经核验的历史 `ci.yml` 或当前 `ci-desktop-acceptance.yml`，不放宽制品、SHA、权限或实际测试校验。`installer_rebuild=true` 重建正常 NSIS 安装器并执行完整 guarded 验收；默认 false 保留原 primary 与 diagnostic clone 路径。
-
-```sh
-	gh workflow run ci-native-diagnostics.yml --ref <branch> -f installer_source_run=<run-id> -f installer_source_sha=<40-character-SHA> -f installer_source_attempt=1 -F installer_rebuild=true
-```
-
-旧 payload 的诊断结果保留原 payload 与当前脚本的不同来源，不能记成最终匹配 App cohort 通过。诊断也不替代 `ci-windows.yml`、桌面平台组或发布验收。
 
 ## 会话分页的交付检查
 
 修改会话分页时，至少核对 `crates/protocol/src/history.rs` 的 19 分区与所有客户端解析器一致，并执行 Core 的 `conversation_history`、`conversation_sections`、`conversation_settings`、`scheduler_history` 专项，原生 `native_ui_history` 和共享 Client 的 history 测试。需要覆盖空页继续游标、字节预算、稳定身份去重、同一连接刷新时保留已加载旧页、重连或连接代次变化后清空旧投影、完整替换后的删除、治理/分叉/owner 失效，以及网络或会话切换后的晚到响应。源码有测试不等于该 HEAD 已执行通过。
-
-最终已提交 HEAD 再运行 `ci-desktop-acceptance.yml` 的 `intent=desktop-only`，核对四个目标实际源码 SHA、原生二进制架构、DMG/AppImage/ZIP 一致性、Windows 当前用户安装与卸载、OS 窗口输入及 PNG。正式签名、公证、IME、无障碍、通知送达、全部业务操作和同数据性能比较分别记录。该手动 CI 只生成 Actions 制品；不要为验收创建 Tag、公开 Release、部署或安装到用户的日常环境。
-
-## 移动端专项验收
-
-```sh
-gh workflow run ci-mobile-device.yml --ref <branch> -f platforms=both
-gh workflow run mobile.yml --ref <branch> -f platforms=ios
-```
-
-原生移动端构建使用 `ci-mobile-device.yml` 的 `platforms=ios|android|both`。`both` 让两个系统并行构建，`mobile-gate` 只验收选中的系统。iOS 设备归档验证不等同于模拟器界面或真机安装验收；`mobile.yml` 的 `platforms=all|android|ios` 选择 Android 原生构建或 iOS 模拟器界面测试，不包含 Android 模拟器 UI 验收。同 ref、同平台的首次手动运行会取消旧运行，重跑按前文规则隔离。缺少 iOS 分发身份时，未签名设备归档的收据必须保留不可安装状态。 iOS 模拟器 app 按输入缓存：键包含 runner 镜像版本、rustc 版本和 `apps/mobile`、`packages`、`crates`、`config`、根 `package.json`、`pnpm-workspace.yaml`、lock 文件及 `build-mobile-secure.sh`、`release-rustflags.py` 和 `.github/workflows/mobile.yml` 的摘要（不含 `packages/docs`），以及 Node 版本；构建后工作树必须干净才写缓存，命中时跳过安全库和 Xcode 构建，仍核对 entitlements。专用模拟器在主机构建前由 simslim v0.14.0 开机并精简：关闭小组件、Spotlight、Siri、健康、家庭、新闻地图、遥测、邮件日历和信息类后台服务，保留相册、推送、钥匙串、链接、互联和资源服务，让首启负载与主机构建重叠；runner 的 Spotlight 索引同时关闭。从安装 simslim 前起，`scripts/ci-runner-load.sh` 每 10 秒记录负载、空闲与压缩内存、swap 和最忙的进程名，结束时打印到日志，用于区分模拟器慢和宿主资源不足。
