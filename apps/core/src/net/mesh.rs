@@ -315,6 +315,15 @@ fn recent<'a>(table: &'a Table, own: &str, allow_private: bool) -> Vec<&'a Entry
     known
 }
 
+fn prefer_online<'a>(entries: Vec<&'a Entry>, now_ms: u64) -> Vec<&'a Entry> {
+    let online: Vec<_> = entries
+        .iter()
+        .copied()
+        .filter(|entry| entry.online(now_ms))
+        .collect();
+    if online.is_empty() { entries } else { online }
+}
+
 /// The `peers` that are not `neighbors`.
 fn absent(peers: Vec<EndpointId>, neighbors: &HashSet<EndpointId>) -> Vec<EndpointId> {
     peers
@@ -975,10 +984,13 @@ impl Mesh {
     async fn candidates(&self) -> Vec<EndpointId> {
         let mut peers: Vec<EndpointId> = {
             let table = self.table.lock().expect("mesh table");
-            recent(&table, &self.device_id, self.allow_private)
-                .into_iter()
-                .filter_map(|entry| endpoint_id(&entry.record.device_id).ok())
-                .collect()
+            prefer_online(
+                recent(&table, &self.device_id, self.allow_private),
+                now_ms(),
+            )
+            .into_iter()
+            .filter_map(|entry| endpoint_id(&entry.record.device_id).ok())
+            .collect()
         };
         for peer in self.bootstrap_peers().await {
             if !peers.contains(&peer) {

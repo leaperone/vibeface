@@ -364,6 +364,9 @@ pub struct CodexServer {
 const READY_WAIT: Duration = Duration::from_secs(20);
 /// How long a started App Server may stay unconnected before the settings page asks the user.
 const START_LIMIT: Duration = Duration::from_secs(60);
+/// A provider configuration change wakes the supervisor immediately, so a missing executable
+/// can back off without delaying an explicit repair.
+const APP_SERVER_RETRY_MAX_SECS: u64 = 300;
 /// Names the managed App Server's process tree in this account's job object namespace.
 const TREE_KEY: &str = "codex-app-server";
 
@@ -921,7 +924,7 @@ impl Inner {
             if self.wait(backoff).await {
                 backoff = 1;
             } else {
-                backoff = (backoff * 2).min(30);
+                backoff = (backoff * 2).min(APP_SERVER_RETRY_MAX_SECS);
             }
         }
     }
