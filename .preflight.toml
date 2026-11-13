@@ -14,13 +14,6 @@ command = "cargo clippy --workspace --all-targets --locked -- -D warnings"
 ci_check = "Rust lint and minimum version"
 
 [[domain_check]]
-name = "Rust Windows lint"
-trigger_paths = ["crates/delivery/**", "apps/core/src/**", "apps/cli/src/**", "crates/control/src/**", "crates/client/src/**", "crates/bridge/src/**", "crates/protocol/src/**", "crates/secure/src/**", "crates/secure-ffi/**", "crates/*/tests/**", "apps/core/tests/**", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/core/build.rs", "apps/core/migrations/**", "apps/core/schema.hcl", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".cargo/**"]
-# Lints cfg(windows) code that a Linux or macOS checkout never compiles, with the native Windows job's packages.
-command = "python3 scripts/ci.py check --windows-cross --packages vibeface-core vibeface vibeface-protocol vibeface-bridge vibeface-secure vibeface-client vibeface-control"
-ci_check = "Windows native gate"
-
-[[domain_check]]
 name = "Rust format"
 trigger_paths = ["crates/delivery/**", "apps/core/src/**", "apps/cli/src/**", "crates/control/src/**", "crates/client/src/**", "crates/bridge/src/**", "crates/protocol/src/**", "crates/secure/src/**", "crates/secure-ffi/**", "crates/*/tests/**", "apps/core/tests/**", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/core/build.rs", "apps/core/migrations/**", "apps/core/schema.hcl", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".cargo/**"]
 command = "cargo fmt --all -- --check"
