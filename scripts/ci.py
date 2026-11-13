@@ -977,7 +977,7 @@ def workflow_contract_self_test():
     assert "scripts/verify-windows-node.py --package" in workflows["ci-desktop.yml"]
     assert "pnpm exec e2e run --config tests/e2e/e2e.native-desktop.config.ts" in workflows["ci-desktop.yml"]
     assert "cargo test -p vibeface-desktop --features native-ui-tests --locked" in block("ci.yml", "desktop-check")
-    assert "cargo clippy -p vibeface-desktop --all-targets --locked -- -D warnings" in block("ci.yml", "desktop-check")
+    assert "cargo clippy -p vibeface-desktop --all-targets --features native-ui-tests --locked -- -D warnings" in block("ci.yml", "desktop-check")
     for setting in ("CARGO_PROFILE_TEST_OPT_LEVEL: '1'", "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'", "CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'"):
         assert setting in windows
     mobile = workflows["ci-mobile-device.yml"]

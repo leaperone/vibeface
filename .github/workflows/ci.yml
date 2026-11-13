@@ -244,7 +244,7 @@ jobs:
         run: |
           cargo fmt --all -- --check
           cargo test -p vibeface-desktop --features native-ui-tests --locked
-          cargo clippy -p vibeface-desktop --all-targets --locked -- -D warnings
+          cargo clippy -p vibeface-desktop --all-targets --features native-ui-tests --locked -- -D warnings
 
   rust-check:
     name: Rust lint and minimum version
