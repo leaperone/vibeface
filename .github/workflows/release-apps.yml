@@ -36,6 +36,8 @@ jobs:
         with:
           targets: aarch64-linux-android,x86_64-linux-android
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
         with: {version: 11.9.0}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020

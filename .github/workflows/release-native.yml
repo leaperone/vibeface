@@ -35,6 +35,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           key: ${{ runner.os == 'Windows' && 'windows-static-crt' || '' }}
+          # Tag runs restore main's caches but never save: a tag's cache serves only that tag.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Select this platform's Python
         run: printf 'PY=%s\n' "$(command -v python3 || command -v python)" >> "$GITHUB_ENV"
       - uses: ./.github/actions/msvc-environment

@@ -50,7 +50,7 @@ jobs:
         with:
           key: gpui-native-${{ inputs.target }}
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Unpack the released runtime for this platform
         id: runtime
         env:
