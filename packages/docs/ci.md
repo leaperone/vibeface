@@ -85,7 +85,7 @@ Web 路径优先于 Node 路径，只有 `packages/client/src/avatar/face.ts` �
 
 Linux 制品核对 checksum、源码提交、版本、target、WASM 和存储 epoch，再以 `verify-node.py --web-only` 启动真实进程，检查网页资源、SPA 路由、CSP、缓存与 404。它不执行多 Node 业务验收，也不验证浏览器渲染。
 
-CI 不运行浏览器、桌面窗口或 iOS 模拟器 e2e，也不做截图类视觉验收；手动触发的 `delivery-live.yml` 付费实测仍由 e2e 驱动界面。需要界面证据时按 [e2e](e2e.md) 在本地运行。
+CI 不运行浏览器、桌面窗口或 iOS 模拟器 e2e，也不做截图类视觉验收。需要界面证据时按 [e2e](e2e.md) 在本地运行。
 
 ## 可验证交付的核心检查
 
@@ -403,7 +403,7 @@ GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate`
 
 修改会话分页时，至少核对 `crates/protocol/src/history.rs` 的 19 分区与所有客户端解析器一致，并执行 Core 的 `conversation_history`、`conversation_sections`、`conversation_settings`、`scheduler_history` 专项，原生 `native_ui_history` 和共享 Client 的 history 测试。需要覆盖空页继续游标、字节预算、稳定身份去重、同一连接刷新时保留已加载旧页、重连或连接代次变化后清空旧投影、完整替换后的删除、治理/分叉/owner 失效，以及网络或会话切换后的晚到响应。源码有测试不等于该 HEAD 已执行通过。
 
-最终已提交 HEAD 再运行 `ci-desktop-acceptance.yml` 的 `intent=desktop-only`，核对四个目标实际源码 SHA、原生二进制架构、DMG/AppImage/ZIP 一致性、Windows 当前用户安装与卸载、OS 窗口输入及 PNG。正式签名、公证、IME、无障碍、通知送达、全部业务操作和同数据性能比较分别记录。该手动 CI 只生成 Actions 制品；不要为验收创建 Tag、公开 Release、部署或安装到用户的日常环境。
+最终已提交 HEAD 再运行 `ci-desktop-acceptance.yml` 的 `intent=desktop-only`，核对四个目标实际源码 SHA、原生二进制架构、DMG/AppImage/ZIP 一致性和 Windows 当前用户安装与卸载。正式签名、公证、IME、无障碍、通知送达、全部业务操作和同数据性能比较分别记录。该手动 CI 只生成 Actions 制品；不要为验收创建 Tag、公开 Release、部署或安装到用户的日常环境。
 
 ## 移动端专项验收
 

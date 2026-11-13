@@ -66,4 +66,4 @@ cargo test -p vibeface-core --lib the_local_page_cancels_a_waiting_join_but_not_
 node --experimental-strip-types --test --test-name-pattern='webhook secret saves' apps/app/src/features/workspace/entry-url.test.ts
 ```
 
-组件检查不验证浏览器或原生设备渲染。修改连接或执行路径时，还须选择对应的真实进程与界面验收。
+组件检查不验证浏览器或原生设备渲染。修改连接或执行路径时，还须选择对应的真实进程验收；界面验收只在明确要求时执行。

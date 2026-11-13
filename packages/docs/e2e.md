@@ -89,7 +89,7 @@ python3 scripts/verify-node.py --delivery-charity \
 
 公开 schema2 bundle 只包含已披露 capsule、公开证明、交易哈希和固定条款。官方 host 对每份 binary receipt 独立验真并拒绝错 journal；`observe-settlement.mjs` 只读同一原链的真实 runtime、canonical 条款/预算/窗口、逐窗 Source/Hold、批次 calldata、事件、余额与 gas。固定源码、CLI/Core 制品摘要、真实进程重启、钱包 lock/off 门禁、披露恢复故障和实际渲染分别留证，任何一层未执行均标未验证。
 
-本轮 proof 构建和新genuine驱动不得放宽原7200秒证明硬界、现有 deadline、11GiB/zero-swap/64PIDs、image/profile 或时钟。界面验收按本文件 e2e 规则执行最小真实表面；源码、类型检查、HTTP200 或合约测试都不代替浏览器/设备证据。操作和安全模型见 [受保护预算](paid-delivery.md)；链上观察格式见 `contracts/delivery/README.md`。
+本轮 proof 构建和新genuine驱动不得放宽原7200秒证明硬界、现有 deadline、11GiB/zero-swap/64PIDs、image/profile 或时钟。需要界面验收时按本文件 e2e 规则执行最小真实表面；源码、类型检查、HTTP200 或合约测试都不代替浏览器/设备证据。操作和安全模型见 [受保护预算](paid-delivery.md)；链上观察格式见 `contracts/delivery/README.md`。
 
 宿主和手动 CI 使用同一个正式入口。先运行纯自检，再提供当前 clean HEAD 的 Linux package 下载目录或已解包目录：
 
