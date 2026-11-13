@@ -21,12 +21,13 @@ import { ConfirmCard } from '@/features/chat/work'
 import { cn } from '@/lib/utils'
 import { Composer } from '@/features/chat/composer'
 import { useChatChrome } from '@/features/chat/chrome'
-import { InputOptions, InputStatus } from '@/features/workspace/workspace'
-import type { InputIntent, WorkDetail } from '@vibeface/client/workspace/types.ts'
+import { InputStatus } from '@/features/workspace/workspace'
+import type { WorkDetail } from '@vibeface/client/workspace/types.ts'
+import { promptIntent } from '@vibeface/client/chat/protocol.ts'
 import type { Attachment } from '@/data/types'
 
 const tone = (state: string): Tone => state === 'failed' ? 'danger' : state === 'completed' ? 'success' : ['awaiting_confirmation', 'stop_timed_out'].includes(state) ? 'warning' : 'neutral'
-type ComposerDraft = { text: string; files: Attachment[]; intent: InputIntent; workId: string; conversationId: string }
+type ComposerDraft = { text: string; files: Attachment[]; workId: string; conversationId: string }
 
 /** One task of a bot's chat, as the web's task panel: progress, result, stop and the details behind it. */
 export default function TaskDetailRoute() {
@@ -44,12 +45,11 @@ function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
   const [detail, setDetail] = useState<{ generation: number; value: WorkDetail } | null>(null)
   const [retry, setRetry] = useState(0)
   const [text, setText] = useState('')
-  const [intent, setIntent] = useState<InputIntent>('continue')
   const [files, setFiles] = useState<Attachment[]>([])
   const [sendError, setSendError] = useState('')
   const conversationId = bot?.conversation_id ?? ''
-  const draftRef = useRef<ComposerDraft>({ text, files, intent, workId, conversationId })
-  if (draftRef.current.text !== text || draftRef.current.files !== files || draftRef.current.intent !== intent || draftRef.current.workId !== workId || draftRef.current.conversationId !== conversationId) draftRef.current = { text, files, intent, workId, conversationId }
+  const draftRef = useRef<ComposerDraft>({ text, files, workId, conversationId })
+  if (draftRef.current.text !== text || draftRef.current.files !== files || draftRef.current.workId !== workId || draftRef.current.conversationId !== conversationId) draftRef.current = { text, files, workId, conversationId }
   const draft = draftRef.current
   const savingDrafts = useRef(new Set<ComposerDraft>())
   const routeActive = useRef(false)
@@ -107,7 +107,9 @@ function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
   const plan = parseSummarySteps(work.summary)
   const coordination = work.coordination_job
   const canContinue = !work.outcome && !work.stop && ["accepted", "running"].includes(work.state)
-  const inputBlocked = !canContinue && intent !== "new_task"
+  // A work whose result is unknown may still write; new input waits until the result is checked.
+  const inputPaused = !canContinue && (!work.outcome || unknown || work.outcome === "unverified")
+  const inputIntent = canContinue || inputPaused ? promptIntent(text) : "new_task"
   return <KeyboardAwareScrollView keyboardShouldPersistTaps="handled" bottomOffset={16} contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     <Stack.Screen options={{ title: work.title || '任务' }} />
     <Button variant="ghost" className="self-start" accessibilityLabel={`打开所属 Bot ${bot.name}`} onPress={() => router.push(`/b/${bot.bot_id}`)}><Icon as={Bot} /><Text>{bot.name}</Text></Button>
@@ -175,13 +177,13 @@ function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
       </View>
     </Details>
     {shared.pendingMessages.filter((item) => item.target.kind === 'work' && item.target.work_id === workId).map((item) => <InputStatus key={item.message_id} pending={item} />)}
-    <Composer chrome={chrome} value={text} onChange={setText} files={files} onFiles={setFiles} attachmentScope={JSON.stringify([ready?.principal.network_id ?? '', conversationId, ['work', workId], intent])} blocked={inputBlocked ? '这个工作当前不能接收补充。选择「新任务」继续。' : shared.canSaveMessages ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读'} sending={false} label={`补充给 ${work.title || '这个工作'}`} sendLabel={intent === "defer" ? "保存为稍后处理" : intent === "new_task" ? "发送为新任务" : "补充这个工作"} target={<InputOptions label={`补充给 · ${work.title || "这个工作"}`} options={[{ key: workId, label: work.title || "这个工作", target: { kind: "work", work_id: workId } }]} selected={workId} onSelect={() => {}} intent={intent} onIntent={setIntent} pending={shared.pendingMessages.filter((item) => item.target.kind === "work" && item.target.work_id === workId)} />} onSend={() => {
+    <Composer chrome={chrome} value={text} onChange={setText} files={files} onFiles={setFiles} attachmentScope={JSON.stringify([ready?.principal.network_id ?? '', conversationId, ['work', workId]])} blocked={inputPaused ? (unknown || work.outcome === 'unverified' ? '先让 Bot 查结果，再继续。' : '这个工作当前不能接收补充。') : shared.canSaveMessages ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读'} sending={false} label={inputIntent === 'continue' ? `补充给 ${work.title || '这个工作'}` : '发送为新任务'} sendLabel={inputIntent === 'continue' ? '补充这个工作' : '发送为新任务'} onSend={() => {
       const submittedDraft = draft
       if (savingDrafts.current.has(submittedDraft)) return
       savingDrafts.current.add(submittedDraft)
       const submitted = text, selectedFiles = files
       setSendError('')
-      void shared.sendMessage(submitted, selectedFiles.map((file) => ({ name: file.name, arrayBuffer: () => new File(file.uri).arrayBuffer() })), undefined, { target: { kind: 'work', work_id: workId }, intent, conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !shared.isCurrent() || draftRef.current !== submittedDraft) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') router.push(`/task/${saved.target.task_id}`) } }).then((saved) => { if (saved && draftRef.current === submittedDraft) { setText((current) => current === submitted ? '' : current); setFiles((current) => current === selectedFiles ? [] : current) } }).catch((cause) => setSendError(messageOf(cause))).finally(() => { savingDrafts.current.delete(submittedDraft) })
+      void shared.sendMessage(submitted, selectedFiles.map((file) => ({ name: file.name, arrayBuffer: () => new File(file.uri).arrayBuffer() })), undefined, { target: { kind: 'work', work_id: workId }, intent: inputIntent, conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !shared.isCurrent() || draftRef.current !== submittedDraft) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') router.push(`/task/${saved.target.task_id}`) } }).then((saved) => { if (saved && draftRef.current === submittedDraft) { setText((current) => current === submitted ? '' : current); setFiles((current) => current === selectedFiles ? [] : current) } }).catch((cause) => setSendError(messageOf(cause))).finally(() => { savingDrafts.current.delete(submittedDraft) })
     }}>{sendError ? <ErrorText error={sendError} /> : null}</Composer>
   </KeyboardAwareScrollView>
 }

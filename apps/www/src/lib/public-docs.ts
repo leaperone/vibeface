@@ -3,6 +3,7 @@ export const PUBLIC_DOCS = [
   { file: 'quick-start.md', slug: 'quick-start' },
   { file: 'onboarding.md', slug: 'onboarding' },
   { file: 'user-guide.md', slug: 'user-guide' },
+  { file: 'cli.md', slug: 'cli' },
   { file: 'comparison.md', slug: 'comparison' },
   { file: 'install.md', slug: 'install' },
   { file: 'ios.md', slug: 'ios' },

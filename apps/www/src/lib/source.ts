@@ -10,6 +10,7 @@ export const docs = defineDocs({
       'quick-start.md',
       'onboarding.md',
       'user-guide.md',
+      'cli.md',
       'comparison.md',
       'install.md',
       'ios.md',

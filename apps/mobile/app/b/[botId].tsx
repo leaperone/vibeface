@@ -10,13 +10,11 @@ import Animated, { useAnimatedStyle, useSharedValue } from 'react-native-reanima
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useCSSVariable, useUniwind, withUniwind } from 'uniwind'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
-import { awaitsDevice, botReach, botCanSend, composerHint, inputTargetKey, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice, botReach, botCanSend, composerHint, inputTargetKey, promptIntent, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
 import { messageTimes } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
 import { messageOf } from '@vibeface/client/lib/node.ts'
-import { InputOptions, type TargetOption } from '@/features/workspace/workspace'
-import type { InputIntent } from '@vibeface/client/workspace/types.ts'
 import { ErrorText } from '@/components/action'
 import { outcomeUnknown } from '@vibeface/client/lib/errors.ts'
 import { botCopy, scheduleName } from '@vibeface/client/workspace/bot-settings.ts'
@@ -120,13 +118,12 @@ export default function ChatScreen() {
   const draftStorage = storageOf(mobilePlatform.storage)
   const draftKey = networkKey('bot-drafts', device.ready?.principal.network_id ?? '')
   const [drafts, setDrafts] = useState<Record<string, { text: string; files: Attachment[] }>>(() => { const stored = draftStorage.readStorage<unknown>(draftKey, {}); return stored && typeof stored === 'object' && !Array.isArray(stored) ? Object.fromEntries(Object.entries(stored).filter((entry): entry is [string, string] => typeof entry[1] === 'string').map(([id, text]) => [id, { text, files: [] }])) : {} })
-  const [intent, setIntent] = useState<InputIntent>('continue')
   const [selectedTarget, setSelectedTarget] = useState(routine ? `routine:${routine}` : 'main')
   const [sendError, setSendError] = useState('')
-  useEffect(() => { setSelectedTarget(routine ? `routine:${routine}` : 'main'); setIntent('continue') }, [id, routine])
+  useEffect(() => { setSelectedTarget(routine ? `routine:${routine}` : 'main') }, [id, routine])
   const draft = (id && drafts[id]) || { text: '', files: [] }
-  const draftRef = useRef({ value: draft, intent, target: selectedTarget, conversationId: id })
-  if (draftRef.current.value !== draft || draftRef.current.intent !== intent || draftRef.current.target !== selectedTarget || draftRef.current.conversationId !== id) draftRef.current = { value: draft, intent, target: selectedTarget, conversationId: id }
+  const draftRef = useRef({ value: draft, target: selectedTarget, conversationId: id })
+  if (draftRef.current.value !== draft || draftRef.current.target !== selectedTarget || draftRef.current.conversationId !== id) draftRef.current = { value: draft, target: selectedTarget, conversationId: id }
   const savingDrafts = useRef(new Set<typeof draftRef.current>())
   const setDraft = (next: Partial<typeof draft>) => { if (id) setDrafts((current) => {
     const present = current[id] ?? { text: '', files: [] }, changed = { ...present, ...next }
@@ -183,14 +180,10 @@ export default function ChatScreen() {
   if (!bot || !id) return <EmptyState icon={Bot} title={botCopy.notFound} className="flex-1 justify-center" />
   const offline = unreachable(device.link)
   const blocked = chat?.blocked ?? (chat ? null : '尚未完成首读')
-  const targetOptions: TargetOption[] = [{ key: 'main', label: `${bot.name} · 主聊天`, target: { kind: 'bot_main', bot_id: bot.bot_id } }, ...(chat?.works ?? []).filter((work) => !work.outcome || selectedTarget === `work:${work.work_id}`).map((work) => ({ key: `work:${work.work_id}`, label: work.title || '工作', target: { kind: 'work' as const, work_id: work.work_id } })), ...(live?.data?.scopeJobs ?? []).filter((job) => job.lane === 'schedule_routine' && (['queued', 'steering', 'claimed', 'running'].includes(job.state) || selectedTarget === `routine:${job.trigger}`)).map((job) => ({ key: `routine:${job.trigger}`, label: `例行任务 · ${scheduleName(job.trigger, live?.data?.bot_settings, live?.data?.changes)}`, target: { kind: 'routine' as const, bot_id: bot.bot_id, trigger: job.trigger } }))]
-  if (selectedTarget.startsWith('routine:') && !targetOptions.some((option) => option.key === selectedTarget)) targetOptions.push({ key: selectedTarget, label: `例行任务 · ${scheduleName(selectedTarget.slice(8), live?.data?.bot_settings, live?.data?.changes)}`, target: { kind: 'routine', bot_id: bot.bot_id, trigger: selectedTarget.slice(8) } })
-  const targetOption = targetOptions.find((option) => option.key === selectedTarget) ?? targetOptions[0]
+  const routineTrigger = selectedTarget.startsWith('routine:') ? selectedTarget.slice(8) : null
+  const targetOption = routineTrigger ? { label: `例行任务 · ${scheduleName(routineTrigger, live?.data?.bot_settings, live?.data?.changes)}`, target: { kind: 'routine' as const, bot_id: bot.bot_id, trigger: routineTrigger } } : { label: `${bot.name} · 主聊天`, target: { kind: 'bot_main' as const, bot_id: bot.bot_id } }
   const inputTarget = targetOption.target
-  const targetWork = inputTarget.kind === 'work' ? chat?.works.find((work) => work.work_id === inputTarget.work_id) : undefined
-  const targetBusy = inputTarget.kind === 'work' ? Boolean(targetWork && !targetWork.outcome) : inputTarget.kind === 'routine' ? Boolean(live?.data?.scopeJobs.some((job) => job.trigger === inputTarget.trigger && ['queued', 'steering', 'claimed', 'running'].includes(job.state))) : chat?.replying
-  const stopSharing = targetWork?.turn_id ? (chat?.works ?? []).filter((work) => !work.outcome && work.thread_id === targetWork.thread_id && work.turn_id === targetWork.turn_id) : []
-  const pending = live?.pendingMessages.filter((item) => item.conversation_id === id && ['bot_main', 'work', 'routine'].includes(item.target.kind)) ?? []
+  const targetBusy = inputTarget.kind === 'routine' ? Boolean(live?.data?.scopeJobs.some((job) => job.trigger === inputTarget.trigger && ['queued', 'steering', 'claimed', 'running'].includes(job.state))) : chat?.replying
   const send = () => {
     const submittedDraft = draftRef.current
     if (savingDrafts.current.has(submittedDraft)) return
@@ -198,7 +191,7 @@ export default function ChatScreen() {
     const { text, files } = submittedDraft.value
     setSendError('')
     toLatest()
-    workspace.actions.send(id, text.trim(), files, { target: targetOption.target, intent, conversation_id: id, onSaved: (input) => {
+    workspace.actions.send(id, text.trim(), files, { target: targetOption.target, intent: promptIntent(text), conversation_id: id, onSaved: (input) => {
       if (!live?.isCurrent()) return
       setDrafts((current) => {
         const present = current[id]
@@ -207,8 +200,7 @@ export default function ChatScreen() {
         draftStorage.writeStorage(draftKey, Object.fromEntries(Object.entries(updated).map(([key, value]) => [key, value.text])))
         return updated
       })
-      if (draftRef.current === submittedDraft) setIntent((current) => current === intent ? 'continue' : current)
-      if (!routeActive.current || !live?.isCurrent() || latestLive.current?.conversationId !== id || draftRef.current !== submittedDraft) return; if (intent === "new_task" && (input.target.kind === "task" || input.target.kind === "channel_task")) router.push(`/task/${input.target.task_id}`) } }).catch((cause) => { setSendError(messageOf(cause)) }).finally(() => { savingDrafts.current.delete(submittedDraft) })
+      if (!routeActive.current || !live?.isCurrent() || latestLive.current?.conversationId !== id || draftRef.current !== submittedDraft) return; if (input.target.kind === "task" || input.target.kind === "channel_task") router.push(`/task/${input.target.task_id}`) } }).catch((cause) => { setSendError(messageOf(cause)) }).finally(() => { savingDrafts.current.delete(submittedDraft) })
   }
   const rows = chat ? entries(chat, extras, bot, offline) : []
   const history = live?.conversationId === id ? live.data?.history : undefined
@@ -303,11 +295,10 @@ export default function ChatScreen() {
         {scrollButton.id === id && scrollButton.visible ? <View pointerEvents="box-none" className={ios ? 'absolute -top-13 w-full max-w-3xl self-center items-end px-4' : 'absolute -top-14 w-full max-w-3xl self-center items-end px-4'}>
           <Button variant="outline" size="icon" className="rounded-full bg-card shadow-sm" accessibilityLabel="回到底部" onPress={toLatest}><Icon as={ArrowDown} /></Button>
         </View> : null}
-        <Composer chrome={chrome} value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })} attachmentScope={JSON.stringify([device.ready?.principal.network_id ?? '', id, inputTargetKey(inputTarget), intent])}
+        <Composer chrome={chrome} value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })} attachmentScope={JSON.stringify([device.ready?.principal.network_id ?? '', id, inputTargetKey(inputTarget)])}
           blocked={blocked} sending={false} onSend={send} onStop={(inputTarget.kind === 'bot_main' ? chat?.stoppable : targetBusy) ? () => void live?.stopInputTarget({ target: targetOption.target }).catch((cause) => setSendError(messageOf(cause))) : undefined} tint={tint}
-          sendLabel={intent === 'defer' ? '保存为稍后处理' : intent === 'new_task' ? '发送为新任务' : targetBusy ? '补充当前工作' : '发送'}
-          target={<InputOptions label={targetOption.label} options={targetOptions} selected={targetOption.key} onSelect={(option) => setSelectedTarget(option.key)} intent={intent} onIntent={setIntent} pending={pending} />}
-        >{offline || setupHint || sendError || inputTarget.kind !== 'bot_main' || stopSharing.length > 1 ? <>
+          sendLabel={targetBusy ? '补充当前工作' : '发送'}
+        >{offline || setupHint || sendError || inputTarget.kind !== 'bot_main' ? <>
           {offline ? <OfflineBar chat className="self-center" /> : setupHint ? <View role="status" className="flex-row flex-wrap items-center gap-x-2 px-2">
             <Text className="text-meta text-muted-foreground">{setupHint}</Text>
             {reach === 'offline' || canSetUp ? <Link href={setupHref} asChild><Button variant="ghost" size="sm" className="min-h-12"><Text>{reach === 'offline' ? '查看设备' : '去设置'}</Text></Button></Link>
@@ -318,7 +309,6 @@ export default function ChatScreen() {
             <Text numberOfLines={1} className="min-w-0 flex-1 text-meta text-muted-foreground">{targetBusy ? '补充给' : '发送给'} · {targetOption.label}</Text>
             <Button variant="ghost" size="sm" className="min-h-12" onPress={() => setSelectedTarget('main')}><Text>改回主聊天</Text></Button>
           </View> : null}
-          {stopSharing.length > 1 ? <Text className="text-meta text-warning">停止会影响这些工作 · {stopSharing.map((work) => work.title || "工作").join("、")}</Text> : null}
         </> : null}
         </Composer>
       </View>

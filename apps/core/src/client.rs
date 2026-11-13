@@ -813,6 +813,7 @@ async fn dispatch_inner(
             | "subscribe"
             | "join_check"
             | "join_status"
+            | "node_join_status"
             | "recovery_state"
             | "entrances"
     ) {
@@ -1376,11 +1377,20 @@ async fn dispatch_inner(
             recover(node, session, &params).await?;
             authentication(node, session).await
         }
-        "node_join_check" => check_link_for_local_page(node, &params).await,
+        "node_join_status" => {
+            ensure!(
+                session.operator,
+                "Node join status requires the local operator"
+            );
+            Ok(serde_json::to_value(terminal_node_join_status(node)?)?)
+        }
+        "node_join_check" => check_link_for_local_owner(node, session, &params).await,
         "node_join" => Ok(serde_json::to_value(
             join_from_local_page(node, &params).await?,
         )?),
-        "node_join_cancel" => Ok(serde_json::to_value(cancel_node_join(node, &params)?)?),
+        "node_join_cancel" => Ok(serde_json::to_value(cancel_node_join(
+            node, session, &params,
+        )?)?),
         "rejoin" => {
             removed_and_local(node, session).await?;
             node.request_rejoin();
@@ -2038,20 +2048,25 @@ pub(crate) struct NodeJoinTask {
 }
 
 /// Asks the invite's Node whether it would still take this link, before this Node commits to it
-/// and before the page asks for a name. Only the page holding the setup capability may ask.
-async fn check_link_for_local_page(node: &Arc<Runtime>, params: &Value) -> Result<Value> {
+/// and before the page asks for a name. The local operator or the page holding the setup
+/// capability may ask.
+async fn check_link_for_local_owner(
+    node: &Arc<Runtime>,
+    session: &Session,
+    params: &Value,
+) -> Result<Value> {
     ensure!(
         !node.has_membership().await?,
         "this Node already belongs to a personal network"
     );
-    {
+    if !session.operator {
         let capability = text(params, "capability")?.to_owned();
         node.store
             .call("verify_bootstrap_capability", move |store| {
                 store.verify_bootstrap_capability(&capability)
             })
-            .await
-    }?;
+            .await?;
+    }
     let ticket = parse_join_link(text(params, "link")?)?;
     let link = JoinLink::open(node, &ticket).await?;
     let reply = link
@@ -2194,18 +2209,35 @@ fn forget_join_for_another_link(dir: &std::path::Path, link: &str) -> Result<()>
     Ok(())
 }
 
-/// Withdraws this Node's join for the page holding its local setup capability. Only waiting is
-/// cut short: once the manager approved, the join installs and the reply says so.
-fn cancel_node_join(node: &Runtime, params: &Value) -> Result<NodeJoin> {
-    let capability = text(params, "capability")?;
+/// Reads a terminal-owned join without starting, resuming or clearing it.
+fn terminal_node_join_status(node: &Runtime) -> Result<NodeJoin> {
     let slot = node
         .node_join
         .lock()
         .map_err(|_| anyhow!("join state unavailable"))?;
     let current = slot
         .as_ref()
-        .filter(|current| current.owner == JoinOwner::Page(capability.to_owned()))
-        .context("no join from this page is running")?;
+        .filter(|current| current.owner == JoinOwner::Terminal)
+        .context("no terminal join is running")?;
+    Ok(current.status.clone())
+}
+
+/// Withdraws the join belonging to the terminal or the page holding its setup capability.
+/// Only waiting is cut short: once the manager approved, the join installs and the reply says so.
+fn cancel_node_join(node: &Runtime, session: &Session, params: &Value) -> Result<NodeJoin> {
+    let owner = if session.operator {
+        JoinOwner::Terminal
+    } else {
+        JoinOwner::Page(text(params, "capability")?.to_owned())
+    };
+    let slot = node
+        .node_join
+        .lock()
+        .map_err(|_| anyhow!("join state unavailable"))?;
+    let current = slot
+        .as_ref()
+        .filter(|current| current.owner == owner)
+        .context("no join owned by this caller is running")?;
     current.cancel.notify_one();
     Ok(current.status.clone())
 }
@@ -3999,6 +4031,112 @@ mod tests {
                 json!({"restarting":true})
             );
             tokio::time::timeout(Duration::from_secs(5), node.rejoin_requested()).await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        node.shutdown().await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
+
+    #[tokio::test]
+    async fn terminal_join_lifecycle_keeps_ownership_and_never_starts_a_join() -> Result<()> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("terminal-join-lifecycle-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        initialize_node(
+            &dir,
+            &crate::config::Config::local("127.0.0.1:0".parse()?, vec![], false),
+            &LocalIdentity::generate(),
+        )?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let result = async {
+            for method in ["node_join_status", "node_join_cancel"] {
+                assert!(operator_call(&node, method, json!({})).await.is_err());
+            }
+            assert!(node.node_join.lock().unwrap().is_none());
+            let invalid_link = json!({"link":"invalid fixture ticket"});
+            let operator_error = operator_call(&node, "node_join_check", invalid_link.clone())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                operator_error.to_string(),
+                "an invite link is vibeface://join/vibeface1…"
+            );
+            let mut page = test_session(LocalIdentity::generate().device_id()?);
+            let page_error = dispatch(&node, &mut page, "node_join_check", invalid_link)
+                .await
+                .unwrap_err();
+            assert_eq!(page_error.to_string(), "capability is required");
+
+            let cancel = Arc::new(tokio::sync::Notify::new());
+            let (task, _registration) = futures_util::future::AbortHandle::new_pair();
+            *node.node_join.lock().unwrap() = Some(NodeJoinTask {
+                link: "fixture".into(),
+                owner: JoinOwner::Terminal,
+                status: NodeJoin::Waiting,
+                task,
+                cancel: cancel.clone(),
+            });
+            assert_eq!(
+                operator_call(&node, "node_join_status", json!({})).await?,
+                json!({"status":"waiting"})
+            );
+            assert!(
+                dispatch(&node, &mut page, "node_join_status", json!({}))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                dispatch(
+                    &node,
+                    &mut page,
+                    "node_join_cancel",
+                    json!({"capability":"page"})
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                operator_call(&node, "node_join_cancel", json!({})).await?,
+                json!({"status":"waiting"}),
+                "cancellation reports the current state until the join task confirms it"
+            );
+            tokio::time::timeout(Duration::from_secs(1), cancel.notified()).await?;
+            node.node_join.lock().unwrap().as_mut().unwrap().status = NodeJoin::Joined;
+            assert_eq!(
+                operator_call(&node, "node_join_cancel", json!({})).await?,
+                json!({"status":"joined"})
+            );
+            node.node_join.lock().unwrap().as_mut().unwrap().status = NodeJoin::Failed {
+                reason: "fixture failure".into(),
+            };
+            for _ in 0..2 {
+                assert_eq!(
+                    operator_call(&node, "node_join_status", json!({})).await?,
+                    json!({"status":"failed","reason":"fixture failure"})
+                );
+            }
+            node.node_join.lock().unwrap().as_mut().unwrap().owner = JoinOwner::Page("page".into());
+            for method in ["node_join_status", "node_join_cancel"] {
+                assert!(operator_call(&node, method, json!({})).await.is_err());
+            }
+            assert!(
+                dispatch(
+                    &node,
+                    &mut page,
+                    "node_join_cancel",
+                    json!({"capability":"page"})
+                )
+                .await
+                .is_ok()
+            );
+            assert!(
+                !dir.join("join.json").exists(),
+                "status and cancel never submit a join"
+            );
             Ok::<_, anyhow::Error>(())
         }
         .await;

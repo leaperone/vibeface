@@ -71,6 +71,11 @@ pub(crate) enum Reconciliation {
         batch_id: String,
         binding: Option<crate::DeliveryBudgetBatch>,
     },
+    Unanswered {
+        conversation_id: String,
+        message_ids: Vec<String>,
+        action: crate::UnansweredAction,
+    },
     StopReply {
         conversation_id: String,
         trigger: String,

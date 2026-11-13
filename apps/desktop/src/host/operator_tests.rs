@@ -24,6 +24,7 @@ fn provider_change() -> NodeOperatorChange {
         execution_model: None,
         bin: None,
         app_server: None,
+        opencode_endpoint: vibeface_client::OpencodeEndpointChange::Keep,
         connect_local: false,
         env: BTreeMap::new(),
     })

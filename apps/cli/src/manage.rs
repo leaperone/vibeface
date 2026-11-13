@@ -361,18 +361,30 @@ pub async fn config(options: ConfigOptions) -> Result<()> {
 #[derive(Args)]
 pub struct ClientAccess {
     /// Directory holding this client's sealed key.
-    #[arg(long, env = "VIBEFACE_CLIENT_DIR", value_parser = data_dir, default_value_os_t = default_client_dir())]
+    #[arg(long, global = true, env = "VIBEFACE_CLIENT_DIR", value_parser = data_dir, default_value_os_t = default_client_dir())]
     pub client_dir: PathBuf,
     /// Protected channel holding the client key passphrase: a file descriptor on Unix, a
     /// handle value on Windows.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub passphrase_fd: Option<i64>,
     /// Gateway the client connects through; the local Node's by default.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub url: Option<String>,
+    /// Target Node for an existing client or recovery. Defaults to the remembered/local Node.
+    #[arg(long, global = true)]
+    pub node: Option<String>,
     /// Node data directory, for the local Gateway and an empty Node's capability.
-    #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = data_dir, default_value_os_t = default_data_dir())]
+    #[arg(long, global = true, env = "VIBEFACE_DATA_DIR", value_parser = data_dir, default_value_os_t = default_data_dir())]
     pub data_dir: PathBuf,
+    /// Named identity profile beneath the client directory.
+    #[arg(long, global = true)]
+    pub profile: Option<String>,
+    /// Print compact machine-readable JSON.
+    #[arg(long, global = true)]
+    pub json: bool,
+    /// Private output file for an explicitly requested one-time decision token.
+    #[arg(long, global = true)]
+    pub secret_output: Option<PathBuf>,
 }
 
 fn default_client_dir() -> PathBuf {
@@ -384,41 +396,74 @@ fn default_client_dir() -> PathBuf {
 }
 
 impl ClientAccess {
-    fn unlock(&self) -> Result<ClientKey> {
+    pub(crate) fn resolved_client_dir(&self) -> Result<PathBuf> {
+        match self.profile.as_deref() {
+            None => Ok(self.client_dir.clone()),
+            Some(name) => {
+                ensure!(
+                    !name.is_empty()
+                        && name.len() <= 64
+                        && name
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')),
+                    "profile must contain 1 to 64 letters, numbers, dashes or underscores"
+                );
+                Ok(self.client_dir.join("profiles").join(name))
+            }
+        }
+    }
+
+    pub(crate) fn unlock(&self) -> Result<ClientKey> {
+        let dir = self.resolved_client_dir()?;
         ensure!(
-            ClientKey::exists(&self.client_dir),
+            ClientKey::exists(&dir),
             "no client key yet; run vibeface client enroll or vibeface client create-network"
         );
         let passphrase = read_passphrase(self.passphrase_fd, "client key passphrase", false)?;
-        ClientKey::open(&self.client_dir, passphrase.as_str())
+        ClientKey::open(&dir, passphrase.as_str())
     }
 
     /// The existing key, or a new one sealed with a passphrase entered now.
     fn unlock_or_create(&self) -> Result<ClientKey> {
-        if ClientKey::exists(&self.client_dir) {
+        let dir = self.resolved_client_dir()?;
+        if ClientKey::exists(&dir) {
             return self.unlock();
         }
         let passphrase = read_passphrase(self.passphrase_fd, "new client key passphrase", true)?;
-        ClientKey::create(&self.client_dir, passphrase.as_str())
+        ClientKey::create(&dir, passphrase.as_str())
     }
 
-    /// `--url` with the remembered Node's ID; none without `--url`, for the remembered entry.
-    fn entry(&self, key: &ClientKey) -> Result<Option<Entry>> {
-        let Some(url) = &self.url else {
+    /// Explicit routing overrides retain the enrolled identity and network.
+    pub(crate) fn entry(&self, key: &ClientKey) -> Result<Option<Entry>> {
+        if self.url.is_none() && self.node.is_none() {
             return Ok(None);
-        };
+        }
+        let remembered = key.entry();
         Ok(Some(Entry {
-            origin: url.clone(),
-            node_id: key
-                .entry()
-                .context("this client is not enrolled yet")?
-                .node_id
-                .clone(),
+            origin: self
+                .url
+                .clone()
+                .or_else(|| remembered.map(|entry| entry.origin.clone()))
+                .context("this target needs --url or a remembered Gateway")?,
+            node_id: self
+                .node
+                .clone()
+                .or_else(|| remembered.map(|entry| entry.node_id.clone()))
+                .context("this target needs --node or an enrolled entry")?,
         }))
     }
 
     /// The local Node's Gateway and device ID, or `--url` with `node`.
     async fn local_entry(&self, node: Option<String>) -> Result<Entry> {
+        let node = node.or_else(|| self.node.clone());
+        if let (Some(origin), Some(node_id)) = (&self.url, &node) {
+            let entry = Entry {
+                origin: origin.clone(),
+                node_id: node_id.clone(),
+            };
+            client::Endpoint::Gateway(entry.clone()).validate()?;
+            return Ok(entry);
+        }
         let info = crate::control(ControlRequest::Inspect {
             data_dir: self.data_dir.clone(),
         })
@@ -452,6 +497,18 @@ impl ClientAccess {
             .context("bootstrap.json is damaged")?
             .to_owned())
     }
+
+    async fn capability_for(&self, entry: &Entry) -> Result<String> {
+        let info = crate::control(ControlRequest::Inspect {
+            data_dir: self.data_dir.clone(),
+        })
+        .await?;
+        ensure!(
+            info["device_id"].as_str() == Some(entry.node_id.as_str()),
+            "setup capability belongs to the local Node; select it or recover an initialized remote Node"
+        );
+        self.capability()
+    }
 }
 
 #[derive(Args)]
@@ -470,6 +527,12 @@ pub enum Settle {
 
 #[derive(Subcommand)]
 pub enum ClientAction {
+    #[command(flatten)]
+    Lifecycle(crate::client_lifecycle::LifecycleCommand),
+    #[command(flatten)]
+    Business(crate::client_commands::BusinessCommand),
+    #[command(flatten)]
+    Access(crate::cli_client::ClientCommand),
     /// Create a personal network on this empty Node, with this client as its first manager.
     CreateNetwork {
         /// Where to save the new recovery file; it must not exist yet.
@@ -532,10 +595,17 @@ pub enum ClientAction {
         #[arg(long, value_parser = crate::absolute_path)]
         recovery_file: PathBuf,
         /// Where to save the recovery file that replaces it; it must not exist yet.
-        #[arg(long, value_parser = crate::absolute_path)]
-        new_recovery_file: PathBuf,
+        #[arg(long, value_parser = crate::absolute_path, required_unless_present = "review")]
+        new_recovery_file: Option<PathBuf>,
         #[arg(long, default_value = "CLI")]
         name: String,
+        /// Retained Member[] as JSON, @FILE, or - for stdin. Keep the connected Node;
+        /// omit this new client, which joins as a manager. Omit to retain all current members.
+        #[arg(long, value_name = "JSON|@FILE|-")]
+        members: Option<String>,
+        /// Print verified candidate members without creating a recovery file or submitting recovery.
+        #[arg(long, conflicts_with = "members")]
+        review: bool,
         /// Protected channel holding the recovery password.
         #[arg(long)]
         recovery_password_fd: Option<i64>,
@@ -550,6 +620,9 @@ pub enum ClientAction {
 pub async fn client(options: ClientOptions) -> Result<()> {
     let access = options.access;
     match options.command {
+        ClientAction::Lifecycle(command) => crate::client_lifecycle::run(&access, command).await,
+        ClientAction::Business(command) => crate::cli_client::business(&access, command).await,
+        ClientAction::Access(command) => crate::cli_client::run(&access, command).await,
         ClientAction::CreateNetwork {
             recovery_file,
             name,
@@ -557,10 +630,19 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             recovery_password_fd,
         } => {
             let entry = access.local_entry(None).await?;
-            let capability = zeroize::Zeroizing::new(access.capability()?);
+            let capability = zeroize::Zeroizing::new(access.capability_for(&entry).await?);
             let mut key = access.unlock_or_create()?;
             let password = read_passphrase(recovery_password_fd, "recovery password", true)?;
+            client::IdentityPlan::discard_applied(&key, password.as_str())?;
             let mut pending = if client::IdentityPlan::exists(&key) {
+                let info = client::IdentityPlan::inspect(&key, password.as_str())?
+                    .context("pending identity operation missing")?;
+                ensure!(
+                    info.kind == client::IdentityPlanKind::Creation
+                        && info.target == entry
+                        && info.backup_path == recovery_file,
+                    "another identity operation is pending; inspect it with client identity-plan status"
+                );
                 client::IdentityPlan::load(&key, password.as_str())?
             } else {
                 client::prepare_create(
@@ -580,6 +662,15 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                 pending.backup_sha256()
             );
             let created = pending.submit(&mut key).await?;
+            if pending.state() == client::IdentityOperationState::Applied {
+                pending.discard()?;
+            }
+            if access.json {
+                return crate::cli_client::session::print_value(
+                    &json!({"network_id":created["network_id"],"principal":created["principal"],"recovery_file":recovery_file,"state":"applied"}),
+                    true,
+                );
+            }
             println!(
                 "Personal network {} created; this client manages it.",
                 created["network_id"].as_str().unwrap_or_default()
@@ -591,6 +682,10 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             Ok(())
         }
         ClientAction::Enroll { link, name } => {
+            ensure!(
+                access.node.is_none(),
+                "an invitation already selects its Node; omit --node when enrolling"
+            );
             ensure!(
                 link != "-" || access.passphrase_fd != Some(0),
                 "the invite link and the passphrase cannot both come from standard input"
@@ -609,7 +704,7 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                         Progress::Waiting => {}
                         Progress::Code(code) => {
                             if shown.as_ref() != Some(&code) {
-                                println!(
+                                eprintln!(
                                     "Short code {code}: check that the approving device shows the same."
                                 );
                                 shown = Some(code);
@@ -622,6 +717,12 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                 enrollment.finish()?
             };
             key.remember(&network, entry)?;
+            if access.json {
+                return crate::cli_client::session::print_value(
+                    &json!({"network_id":network,"client_id":key.device_id(),"joined":true}),
+                    true,
+                );
+            }
             println!("Joined personal network {network}.");
             Ok(())
         }
@@ -629,14 +730,72 @@ pub async fn client(options: ClientOptions) -> Result<()> {
             recovery_file,
             new_recovery_file,
             name,
+            members,
+            review,
             recovery_password_fd,
         } => {
+            ensure!(
+                members.as_deref() != Some("-")
+                    || (access.passphrase_fd != Some(0) && recovery_password_fd != Some(0)),
+                "--members and passwords cannot both come from standard input"
+            );
+            let members: Option<Vec<_>> = members
+                .as_deref()
+                .map(|source| {
+                    serde_json::from_value(crate::client_commands::json_document(source)?)
+                        .context("--members must be a JSON array of Member objects")
+                })
+                .transpose()?;
             let entry = access.local_entry(None).await?;
-            let capability = access.capability().ok().map(zeroize::Zeroizing::new);
             let mut key = access.unlock_or_create()?;
             let password = read_passphrase(recovery_password_fd, "recovery password", false)?;
+            if review {
+                let saved = client::IdentityPlan::inspect(&key, password.as_str())?;
+                let (source, review) = if saved
+                    .is_some_and(|info| info.state != client::IdentityOperationState::Applied)
+                {
+                    (
+                        "saved_plan",
+                        client::IdentityPlan::recovery_review(&key, password.as_str(), &entry)?,
+                    )
+                } else {
+                    (
+                        "current_state",
+                        client::review_recovery(
+                            &key,
+                            entry,
+                            &recovery_file,
+                            password.as_str(),
+                            client::RecoveryOptions {
+                                name: &name,
+                                capability: None,
+                                members: None,
+                            },
+                        )
+                        .await?,
+                    )
+                };
+                let mut result = serde_json::to_value(review)?;
+                result["source"] = json!(source);
+                return crate::cli_client::session::print_value(&result, access.json);
+            }
+            let new_recovery_file =
+                new_recovery_file.context("--new-recovery-file is required to submit recovery")?;
+            client::IdentityPlan::discard_applied(&key, password.as_str())?;
+            let capability = access
+                .capability_for(&entry)
+                .await
+                .ok()
+                .map(zeroize::Zeroizing::new);
             let mut pending = if client::IdentityPlan::exists(&key) {
-                client::IdentityPlan::load(&key, password.as_str())?
+                let pending = client::IdentityPlan::load(&key, password.as_str())?;
+                pending.validate_recovery_intent(
+                    &entry,
+                    &new_recovery_file,
+                    &name,
+                    members.as_deref(),
+                )?;
+                pending
             } else {
                 client::prepare_recovery(
                     &key,
@@ -644,33 +803,57 @@ pub async fn client(options: ClientOptions) -> Result<()> {
                     &recovery_file,
                     password.as_str(),
                     &new_recovery_file,
-                    &name,
-                    capability.as_deref().map(String::as_str),
+                    client::RecoveryOptions {
+                        name: &name,
+                        capability: capability.as_deref().map(String::as_str),
+                        members: members.as_deref(),
+                    },
                 )
                 .await?
             };
+            eprintln!(
+                "Recovery members: {}",
+                serde_json::to_string(
+                    pending
+                        .recovery_members()
+                        .context("recovery members missing")?
+                )?
+            );
             eprintln!(
                 "Recovery backup saved and verified: {} (SHA-256 {})",
                 pending.backup_path().display(),
                 pending.backup_sha256()
             );
             let result = pending.submit(&mut key).await?;
-            println!(
-                "Recovery sent; {} now holds the recovery key.",
-                new_recovery_file.display()
-            );
-            print(&json!({"principal":result["principal"],"recovery":result["recovery"]}))
+            let state = pending.state();
+            if state == client::IdentityOperationState::Applied {
+                pending.discard()?;
+            }
+            if !access.json {
+                eprintln!(
+                    "Recovery state: {state:?}; recovery file: {}",
+                    new_recovery_file.display()
+                );
+            }
+            crate::cli_client::session::print_value(
+                &json!({"principal":result["principal"],"recovery":result["recovery"],"state":state,"recovery_file":new_recovery_file}),
+                access.json,
+            )
         }
         command => {
             let key = access.unlock()?;
             let entry = access.entry(&key)?;
             let mut session = key.connect(entry.as_ref()).await?;
-            signed(&mut session, command).await
+            signed(&mut session, command, access.json).await
         }
     }
 }
 
-async fn signed(session: &mut client::Session<'_>, command: ClientAction) -> Result<()> {
+async fn signed(
+    session: &mut client::Session<'_>,
+    command: ClientAction,
+    compact: bool,
+) -> Result<()> {
     let result = match command {
         ClientAction::Status => {
             let mut authenticated = session.call("authenticate", json!({})).await?;
@@ -678,6 +861,12 @@ async fn signed(session: &mut client::Session<'_>, command: ClientAction) -> Res
         }
         ClientAction::Invite => {
             let link = session.invite().await?;
+            if compact {
+                return crate::cli_client::session::print_value(
+                    &json!({"link":link,"single_use":true,"expires_in_seconds":600}),
+                    true,
+                );
+            }
             println!("{link}");
             println!("The link works once, for ten minutes.");
             return Ok(());
@@ -716,9 +905,12 @@ async fn signed(session: &mut client::Session<'_>, command: ClientAction) -> Res
         }
         ClientAction::CreateNetwork { .. }
         | ClientAction::Enroll { .. }
-        | ClientAction::Recover { .. } => unreachable!("handled before connecting"),
+        | ClientAction::Recover { .. }
+        | ClientAction::Business(_)
+        | ClientAction::Lifecycle(_)
+        | ClientAction::Access(_) => unreachable!("handled before connecting"),
     };
-    print(&result)
+    crate::cli_client::session::print_value(&result, compact)
 }
 
 /// Both approval steps: confirm, compare the short codes, then sign the grant.
@@ -750,7 +942,7 @@ async fn approve(
                 std::io::stdin().is_terminal(),
                 "short code {code}: pass --code with the code the joining device shows"
             );
-            println!("Short code {code}. Does the joining device show the same? [y/N]");
+            eprintln!("Short code {code}. Does the joining device show the same? [y/N]");
             let mut answer = String::new();
             std::io::stdin().read_line(&mut answer)?;
             ensure!(
@@ -842,151 +1034,106 @@ fn project(node: Option<String>, cwd: Option<String>) -> Value {
 pub async fn bots(options: BotsOptions) -> Result<()> {
     let access = options.access;
     let dir = &access.data_dir;
-    match options.command {
+    match &options.command {
         BotsAction::List => return print(&operator(dir, "rpc", json!({"method":"bots"})).await?),
         BotsAction::Memory {
             conversation_id,
             memory_id,
         } => {
-            let params = json!({"method":"memory_state","conversation_id":conversation_id,"memory_id":memory_id});
-            return print(&operator(dir, "rpc", params).await?);
+            return print(&operator(dir, "rpc", json!({"method":"memory_state","conversation_id":conversation_id,"memory_id":memory_id})).await?);
         }
         _ => {}
     }
-    let key = access.unlock()?;
-    let entry = access.entry(&key)?;
-    let mut session = key.connect(entry.as_ref()).await?;
-    let result = match options.command {
+    let profile = crate::cli_client::session::Profile::open(&access)?;
+    let mut identifiers = json!({});
+    let action = match options.command {
         BotsAction::Create {
             name,
             instructions,
             project_node,
             cwd,
         } => {
-            let new_id = || uuid::Uuid::new_v4().simple().to_string();
-            let (bot_id, conversation_id) = (new_id(), new_id());
-            let scheduler = session.entry.node_id().to_owned();
-            let project = project(project_node, cwd);
-            let mut body = json!({"type":"bot_created","bot_id":bot_id,"name":name,"instructions":instructions});
-            if !project.is_null() {
-                body["project"] = project.clone();
+            let bot_id = uuid::Uuid::new_v4().simple().to_string();
+            let conversation_id = uuid::Uuid::new_v4().simple().to_string();
+            identifiers = json!({"bot_id":bot_id,"conversation_id":conversation_id});
+            client::Action::CreateBot {
+                bot_id,
+                conversation_id,
+                name,
+                instructions,
+                scheduler_node: profile.endpoint.node_id().to_owned(),
+                project: serde_json::from_value(project(project_node, cwd))?,
             }
-            let attestation = session.attest(&conversation_id, &body)?;
-            let owner = session.attest(
-                &conversation_id,
-                &json!({"type":"conversation_owner","scheduler_node":scheduler,"epoch":1}),
-            )?;
-            let mut params = json!({"bot_id":bot_id,"conversation_id":conversation_id,"name":name,
-                "instructions":instructions,"scheduler_node":scheduler,
-                "owner_attestation":owner,"attestation":attestation});
-            if !project.is_null() {
-                params["project"] = project;
-            }
-            session.rpc("create_bot", params).await?
         }
-        BotsAction::Delete { conversation_id } => {
-            let attestation = session.attest(&conversation_id, &json!({"type":"bot_deleted"}))?;
-            session
-                .rpc(
-                    "delete_bot",
-                    json!({"conversation_id":conversation_id,"attestation":attestation}),
-                )
-                .await?
-        }
+        BotsAction::Delete { conversation_id } => client::Action::DeleteBot { conversation_id },
         BotsAction::SetPrimary { conversation_id } => {
-            let attestation = session.attest(
-                "bots",
-                &json!({"type":"primary_bot_set","conversation_id":conversation_id}),
-            )?;
-            session
-                .rpc(
-                    "set_primary_bot",
-                    json!({"conversation_id":conversation_id,"attestation":attestation}),
-                )
-                .await?
+            client::Action::SetPrimaryBot { conversation_id }
         }
         BotsAction::SetProject {
             conversation_id,
             project_node,
             cwd,
             clear: _,
-        } => {
-            let project = project(project_node, cwd);
-            let attestation = session.attest(
-                &conversation_id,
-                &json!({"type":"bot_project_set","project":project}),
-            )?;
-            session
-                .rpc(
-                    "set_bot_project",
-                    json!({"conversation_id":conversation_id,"project":project,"attestation":attestation}),
-                )
-                .await?
-        }
+        } => client::Action::SetBotProject {
+            conversation_id,
+            project: serde_json::from_value(project(project_node, cwd))?,
+        },
         BotsAction::Schedule {
             conversation_id,
             schedule_id,
             action,
-        } => {
-            let action = match action {
-                ScheduleAction::Pause => "pause",
-                ScheduleAction::Resume => "resume",
-                ScheduleAction::Delete => "delete",
-            };
-            let attestation = session.attest(
-                &conversation_id,
-                &json!({"type":"schedule_controlled","schedule_id":schedule_id,"action":action}),
-            )?;
-            session
-                .rpc(
-                    "control_schedule",
-                    json!({"conversation_id":conversation_id,"schedule_id":schedule_id,
-                        "action":action,"attestation":attestation}),
-                )
-                .await?
-        }
+        } => client::Action::Schedule {
+            conversation_id,
+            schedule_id,
+            action: match action {
+                ScheduleAction::Pause => client::wire::ScheduleAction::Pause,
+                ScheduleAction::Resume => client::wire::ScheduleAction::Resume,
+                ScheduleAction::Delete => client::wire::ScheduleAction::Delete,
+            },
+        },
         BotsAction::Remember {
             conversation_id,
             memory_id,
             text,
-        } => control_memory(&mut session, &conversation_id, &memory_id, json!(text)).await?,
+        } => memory_action(&profile, conversation_id, memory_id, Some(text)).await?,
         BotsAction::Forget {
             conversation_id,
             memory_id,
-        } => control_memory(&mut session, &conversation_id, &memory_id, Value::Null).await?,
-        BotsAction::List | BotsAction::Memory { .. } => unreachable!("read as the operator"),
+        } => memory_action(&profile, conversation_id, memory_id, None).await?,
+        BotsAction::List | BotsAction::Memory { .. } => unreachable!("read as the local operator"),
     };
-    print(&result)
+    let operation = profile.submit(action).await?;
+    identifiers["operation"] = serde_json::to_value(&operation)?;
+    if let Some(result) = &operation.result {
+        identifiers["result"] = result.clone();
+    }
+    profile.print(&identifiers)?;
+    crate::cli_client::session::require_accepted(&operation)
 }
 
-/// A memory change on top of the version the Node holds now, signed like the browser's.
-async fn control_memory(
-    session: &mut client::Session<'_>,
-    conversation_id: &str,
-    memory_id: &str,
-    after: Value,
-) -> Result<Value> {
-    let state = session
-        .rpc(
-            "memory_state",
-            json!({"conversation_id":conversation_id,"memory_id":memory_id}),
-        )
+async fn memory_action(
+    profile: &crate::cli_client::session::Profile,
+    conversation_id: String,
+    memory_id: String,
+    after: Option<String>,
+) -> Result<client::Action> {
+    let state = profile
+        .read(client::ReadRequest::Memory {
+            conversation_id: conversation_id.clone(),
+            memory_id: memory_id.clone(),
+        })
         .await?;
-    let base = memory_base(&state["current"])?;
+    let base: client::MemoryBase = serde_json::from_value(memory_base(&state["current"])?)?;
     ensure!(
-        !(after.is_null() && base["version"].is_null()),
+        after.is_some() || base.version.is_some(),
         "there is no such memory to delete"
     );
-    let body = json!({"type":"memory_controlled","memory_id":memory_id,"base":base,"after":after});
-    let attestation = session.attest(conversation_id, &body)?;
-    let operation_id = session.operation_id(conversation_id, &body)?;
-    session
-        .rpc(
-            "control_memory",
-            json!({"conversation_id":conversation_id,"memory_id":memory_id,"base":base,
-                "after":after,"attestation":attestation,"operation_id":operation_id}),
-        )
-        .await
+    Ok(client::Action::Memory {
+        conversation_id,
+        memory_id,
+        base,
+        after,
+    })
 }
 
 /// The version a change stands on: none for a new memory.
@@ -1025,6 +1172,105 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Command> {
         Ok(Cli::try_parse_from(std::iter::once("vibeface").chain(args.iter().copied()))?.command)
+    }
+
+    #[test]
+    fn recovery_review_needs_no_replacement_file_and_keeps_selection_explicit() -> Result<()> {
+        let Command::Client(options) = parse(&[
+            "client",
+            "recover",
+            "--review",
+            "--recovery-file",
+            "/tmp/original.json",
+        ])?
+        else {
+            anyhow::bail!("expected client recovery")
+        };
+        let ClientAction::Recover {
+            review,
+            new_recovery_file,
+            members,
+            ..
+        } = options.command
+        else {
+            anyhow::bail!("expected recovery options")
+        };
+        assert!(review);
+        assert_eq!(new_recovery_file, None);
+        assert_eq!(members, None);
+        assert!(parse(&["client", "recover", "--recovery-file", "/tmp/original.json"]).is_err());
+        assert!(
+            parse(&[
+                "client",
+                "recover",
+                "--review",
+                "--recovery-file",
+                "/tmp/original.json",
+                "--members",
+                "[]"
+            ])
+            .is_err()
+        );
+        let Command::Client(options) = parse(&[
+            "client",
+            "recover",
+            "--recovery-file",
+            "/tmp/original.json",
+            "--new-recovery-file",
+            "/tmp/replacement.json",
+            "--members",
+            "[]",
+        ])?
+        else {
+            anyhow::bail!("expected client recovery")
+        };
+        let ClientAction::Recover {
+            review, members, ..
+        } = options.command
+        else {
+            anyhow::bail!("expected recovery options")
+        };
+        assert!(!review);
+        assert_eq!(members.as_deref(), Some("[]"));
+        Ok(())
+    }
+
+    #[test]
+    fn client_routing_overrides_pin_the_requested_node_and_keep_the_identity() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("cli-routing-{}", uuid::Uuid::new_v4()));
+        let mut key = ClientKey::create(&root, "synthetic routing password")?;
+        let network = "a".repeat(64);
+        key.remember(
+            &network,
+            Entry {
+                origin: "http://127.0.0.1:4790".into(),
+                node_id: "b".repeat(64),
+            },
+        )?;
+        let target = "c".repeat(64);
+        let Command::Client(options) = parse(&[
+            "client",
+            "read",
+            "nodes",
+            "--url",
+            "http://127.0.0.1:4795",
+            "--node",
+            &target,
+        ])?
+        else {
+            anyhow::bail!("expected client")
+        };
+        assert_eq!(
+            options.access.entry(&key)?,
+            Some(Entry {
+                origin: "http://127.0.0.1:4795".into(),
+                node_id: target
+            })
+        );
+        assert_eq!(key.network_id(), Some(network.as_str()));
+        assert_eq!(key.entry().unwrap().node_id, "b".repeat(64));
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]

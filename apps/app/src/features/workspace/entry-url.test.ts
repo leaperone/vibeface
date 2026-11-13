@@ -21,7 +21,7 @@ import * as errors from "@vibeface/client/lib/errors.ts"
 import { joinDestination } from '@vibeface/client/identity/switch-network.ts'
 import { joinTicket } from '@vibeface/client/lib/transport.ts'
 import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
-import { messageKey, replyStatusLabel, inputTargetKey, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from "@vibeface/client/chat/protocol.ts"
+import { messageKey, replyStatusLabel, inputTargetKey, promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from "@vibeface/client/chat/protocol.ts"
 import { deviceCopy, offlineCopy, setUpOnManager, waitingCopy } from "@vibeface/client/identity/copy.ts"
 import { chatTimeline, firstUnread, messageTimes, taskMessage, unreadCounts } from "@vibeface/client/chat/timeline.ts"
 import { accessOf } from "@vibeface/client/identity/access.ts"
@@ -718,7 +718,7 @@ test("workspace preserves bot and message requests while routing native decision
     const inputUiErrors: string[] = []
     let inputWork = Promise.resolve()
     const inputUi = componentHarness('./workspace-chat.tsx', {
-      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => render() }, '@vibeface/client/chat/protocol.ts': { inputTargetKey },
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => render() }, '@vibeface/client/chat/protocol.ts': { promptIntent, inputTargetKey },
       '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, action: () => Promise<void>) => { inputWork = action().catch((cause) => { inputUiErrors.push(String(cause)) }); return inputWork } }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
     })
     const inputButton = (label: string) => {
@@ -1119,10 +1119,10 @@ test("workspace preserves bot and message requests while routing native decision
       } finally { current.rpc = originalRpc }
     })
 
-    await t.test('Main and Work explicit NewTask use a real valid expected result and preserve Work sources', async () => {
+    await t.test('Main and Work NewTask, explicit or from the prompt, use a real valid expected result and preserve Work sources', async () => {
       const current = activeConnection, originalRpc = current.rpc
       const sourceEvents = ['a'.repeat(64)]
-      for (const kind of ['main', 'work']) {
+      for (const kind of ['main', 'work', 'prompt']) {
         const before = messages.length, commands: Extract<import('@vibeface/client/workspace/types.ts').WorkspaceCommand, { kind: 'create_task' }>[] = []
         let domain: WorkspaceDomainState = { channels: [], tasks: [], assignments: [], inputs: [], coverage: { limit: 128, truncated: false } }
         current.rpc = async (method, body = {}) => {
@@ -1147,16 +1147,33 @@ test("workspace preserves bot and message requests while routing native decision
           if (kind === 'work') await render().readWork({ conversation_id: 'chat', work_id: work.work_id })
           let saved: PendingMessage | undefined
           const target: InputTarget = kind === 'work' ? { kind: 'work', work_id: work.work_id } : { kind: 'bot_main', bot_id: bot.bot_id }
-          assert.equal(await render().sendMessage(`${kind} new task original request`, [], undefined, { target, intent: 'new_task', onSaved: (input) => { saved = input } }), true)
+          const text = kind === 'prompt' ? '新任务：prompt original request' : `${kind} new task original request`
+          assert.equal(await render().sendMessage(text, [], undefined, { target, intent: kind === 'prompt' ? promptIntent(text) : 'new_task', onSaved: (input) => { saved = input } }), true)
           await settleComponent()
           assert.ok(saved && saved.target.kind === 'task')
           assert.equal(commands.length, 1)
           assert.equal(commands[0].task_id, saved.target.task_id)
           assert.equal(messages.length, before + 1)
           assert.equal((messages.at(-1)?.target as { task_id: string }).task_id, saved.target.task_id)
+          assert.equal(messages.at(-1)?.intent, 'new_task', `${kind} input opens a new task`)
           await render().readWorkspaceHistory({ task_id: saved.target.task_id })
         } finally { current.rpc = originalRpc }
       }
+      const before = messages.length, commands: unknown[] = []
+      current.rpc = async (method, body = {}) => {
+        if (method === 'workspace_command') commands.push(body.command)
+        return originalRpc(method, body)
+      }
+      try {
+        let saved: PendingMessage | undefined
+        const target: InputTarget = { kind: 'bot_main', bot_id: bot.bot_id }
+        assert.equal(await render().sendMessage('新任务：程序化交代仍是普通输入', [], undefined, { target, onSaved: (input) => { saved = input } }), true)
+        await settleComponent()
+        assert.deepEqual(commands, [], 'a programmatic send without an intent never creates a task')
+        assert.deepEqual(JSON.parse(JSON.stringify(saved?.target)), target)
+        assert.equal(messages.length, before + 1)
+        assert.equal(messages.at(-1)?.intent, 'continue', 'only composers read the prompt prefix')
+      } finally { current.rpc = originalRpc }
     })
 
     await t.test('Task and Channel attachment reads follow the signed event scope while Main stays on another Bot', async () => {
@@ -1182,11 +1199,11 @@ test("workspace preserves bot and message requests while routing native decision
       try {
         for (const channel of [false, true]) {
           target = channel ? { kind: 'channel_task', channel_id: 'attachment-channel', task_id: 'attachment-task', bot_id: otherBot.bot_id } : { kind: 'task', task_id: 'attachment-task' }
-          const shared = { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => render() }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: activeConnection, directory: null }) }, '@vibeface/client/chat/protocol.ts': { inputTargetKey } }
+          const shared = { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => render() }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: activeConnection, directory: null }) }, '@vibeface/client/chat/protocol.ts': { promptIntent, inputTargetKey } }
           const scope = componentHarness('./workspace-chat.tsx', shared, { setInterval: () => 1, clearInterval() {} }, 'ScopedConversation')
           const props = { target, conversationId: otherBot.conversation_id, label: '附件任务', ...(channel ? { channelId: 'attachment-channel' } : {}) }
           const chat = componentHarness('../chat/elements/chat.tsx', { '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') } })
-          const message = componentHarness('../chat/elements/message.tsx', { ...shared, '@vibeface/client/chat/protocol.ts': { messageKey, replyStatusLabel }, '@vibeface/client/lib/errors.ts': errors })
+          const message = componentHarness('../chat/elements/message.tsx', { ...shared, '@vibeface/client/chat/protocol.ts': { promptIntent, messageKey, replyStatusLabel }, '@vibeface/client/lib/errors.ts': errors })
           let downloads = 0
           const artifact = componentHarness('../chat/elements/artifact.tsx', { ...shared, '@vibeface/client/workspace/model.ts': { formatSize } }, { crypto, Blob, URL: { createObjectURL: () => 'blob:fixture', revokeObjectURL() {} }, document: { createElement: () => ({ click() { downloads++ } }) }, window: { setTimeout: () => 1 } })
           try {
@@ -1234,7 +1251,7 @@ test("workspace preserves bot and message requests while routing native decision
         'expo-file-system': { File: SelectedFile },
         '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/identity/access.ts': { accessOf },
         '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/lib/node.ts': { entryAddress },
-        '@vibeface/client/chat/protocol.ts': { botReach, composerHint }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, messageTimes, taskMessage, unreadCounts },
+        '@vibeface/client/chat/protocol.ts': { promptIntent, botReach, composerHint }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, messageTimes, taskMessage, unreadCounts },
         '@vibeface/client/workspace/bot-settings.ts': { botCopy }, '@vibeface/client/workspace/inbox.ts': { inboxItems }, '@vibeface/client/workspace/labels.ts': taskLabels,
         '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers }, '@vibeface/client/workspace/storage.ts': { storageOf }, '@vibeface/client/workspace/types.ts': { isSessionNotification: () => false },
         '@/platform': { mobilePlatform: { storage: browser.localStorage } }, './context': { WorkspaceProvider: 'NativeWorkspace' },
@@ -1268,7 +1285,7 @@ test("workspace preserves bot and message requests while routing native decision
         'uniwind': { withUniwind: (component: unknown) => component, useUniwind: () => ({ theme }), useCSSVariable: () => theme === 'dark' ? 'black' : 'white' },
         '@/data/context': { useWorkspace: () => native }, '@/data/live': { useLive: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
         '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/bot-settings.ts': { botCopy, scheduleName }, '@vibeface/client/workspace/home.ts': { unreachable },
-        '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
+        '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
         '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' }, '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' },
         '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/lib/layout': { useWide: () => false },
         '@/features/chat/chrome': { ChatMaterial: 'ChatMaterial', useChatChrome: () => glass ? { kind: 'glass', colorScheme: theme } : { kind: 'solid' } },
@@ -1360,8 +1377,6 @@ test("workspace preserves bot and message requests while routing native decision
         try {
           routine = 'schedule:not-loaded'
           chat.render('default')
-          const target = chat.render('default').find(({ type }) => type === 'InputOptions')?.props
-          assert.equal(target?.selected, `routine:${routine}`, 'an explicit routine route survives a bounded scheduler snapshot')
           const composer = chat.render('default').find(({ type }) => type === 'Composer')?.props
           composer?.onChange?.('补充这个例行任务')
           const send = chat.render('default').find(({ type }) => type === 'Composer')?.props.onSend
@@ -1427,58 +1442,54 @@ test("workspace preserves bot and message requests while routing native decision
         assert.equal(messages.slice(sentBefore).filter((message) => message.text === '附件失败后可重发').length, 1)
         const changingOptions = deferred(); fileReads.set('file:///options.txt', changingOptions)
         const optionStart = mainSaves.length, optionMessages = messages.length
-        composer()?.onChange?.('切换目标和发送方式仍是独立输入')
+        composer()?.onChange?.('切换目标仍是独立输入')
         const optionFiles = attach('file:///options.txt')
-        sendDraft(); await settleComponent()
-        const changeIntent = chat.render('default').find(({ type }) => type === 'InputOptions')?.props.onIntent
-        assert.ok(typeof changeIntent === 'function')
-        changeIntent('defer'); sendDraft(); sendDraft(); await settleComponent()
-        assert.equal(mainSaves.length, optionStart + 2, 'changing only intent saves a distinct input while unchanged repeated taps remain deduplicated')
-        routine = 'schedule:pending-draft'
+        sendDraft(); sendDraft(); await settleComponent()
+        assert.equal(mainSaves.length, optionStart + 1, 'unchanged repeated taps remain deduplicated')
+        const pendingRoutine = 'schedule:pending-draft'
+        routine = pendingRoutine
         chat.render('default'); chat.render('default')
         sendDraft(); sendDraft(); await settleComponent()
-        assert.equal(mainSaves.length, optionStart + 3, 'changing only target saves a distinct input with the same text and attachment')
-        const selectTarget = chat.render('default').find(({ type }) => type === 'InputOptions')?.props.onSelect
-        assert.ok(typeof selectTarget === 'function')
-        selectTarget({ key: 'main', label: '主聊天', target: { kind: 'bot_main', bot_id: botA.bot_id } })
+        assert.equal(mainSaves.length, optionStart + 2, 'changing only target saves a distinct input with the same text and attachment')
+        routine = undefined
+        chat.render('default'); chat.render('default')
         sendDraft(); sendDraft(); await settleComponent()
-        assert.equal(mainSaves.length, optionStart + 4, 'changing only target with an unchanged intent preserves a separate input identity')
-        changeIntent('defer'); chat.render('default')
+        assert.equal(mainSaves.length, optionStart + 3, 'returning to Main preserves a separate input identity')
+        routine = pendingRoutine
+        chat.render('default'); chat.render('default')
         changingOptions.resolve(new Uint8Array([13, 14, 15]).buffer)
         await Promise.all(mainSaves.slice(optionStart)); await settleComponent(); mobile()
-        assert.equal(composer()?.value, '切换目标和发送方式仍是独立输入')
-        assert.equal(composer()?.files, optionFiles, 'an earlier target or intent cannot clear the current attachment')
-        assert.equal(storedDraft(), '切换目标和发送方式仍是独立输入')
-        assert.equal(chat.render('default').find(({ type }) => type === 'InputOptions')?.props.intent, 'defer', 'earlier completion cannot reset the current send intent')
-        const optionMainTarget = { kind: 'bot_main', bot_id: botA.bot_id }, optionRoutineTarget = { kind: 'routine', bot_id: botA.bot_id, trigger: routine }
-        assert.deepEqual(messages.slice(optionMessages).map(message => JSON.stringify([message.target, message.intent])).sort(), [[optionMainTarget, 'continue'], [optionMainTarget, 'defer'], [optionRoutineTarget, 'continue'], [optionMainTarget, 'continue']].map(value => JSON.stringify(value)).sort())
+        assert.equal(composer()?.value, '切换目标仍是独立输入')
+        assert.equal(composer()?.files, optionFiles, 'an earlier target cannot clear the current attachment')
+        assert.equal(storedDraft(), '切换目标仍是独立输入')
+        const optionMainTarget = { kind: 'bot_main', bot_id: botA.bot_id }, optionRoutineTarget = { kind: 'routine', bot_id: botA.bot_id, trigger: pendingRoutine }
+        assert.deepEqual(messages.slice(optionMessages).map(message => JSON.stringify([message.target, message.intent])).sort(), [[optionMainTarget, 'continue'], [optionRoutineTarget, 'continue'], [optionMainTarget, 'continue']].map(value => JSON.stringify(value)).sort(), 'chat input steers by default')
         sendDraft(); await mainSaves.at(-1); await settleComponent(); mobile()
-        assert.equal(mainSaves.length, optionStart + 5)
+        assert.equal(mainSaves.length, optionStart + 4)
         assert.equal(composer()?.value, '')
-        assert.equal(storedDraft(), '', 'the matching target and intent still clear after durable acceptance')
-        assert.deepEqual(messages.slice(optionMessages).map(message => JSON.stringify([message.target, message.intent])).sort(), [[optionMainTarget, 'continue'], [optionMainTarget, 'defer'], [optionRoutineTarget, 'continue'], [optionMainTarget, 'continue'], [optionMainTarget, 'defer']].map(value => JSON.stringify(value)).sort())
-        assert.equal(new Set(messages.slice(optionMessages).map(message => message.message_id)).size, 5)
+        assert.equal(storedDraft(), '', 'the matching target still clears after durable acceptance')
+        assert.deepEqual(messages.slice(optionMessages).map(message => JSON.stringify([message.target, message.intent])).sort(), [[optionMainTarget, 'continue'], [optionRoutineTarget, 'continue'], [optionMainTarget, 'continue'], [optionRoutineTarget, 'continue']].map(value => JSON.stringify(value)).sort())
+        assert.equal(new Set(messages.slice(optionMessages).map(message => message.message_id)).size, 4)
         routine = undefined
         chat.render('default'); chat.render('default')
         mainActions.send = originalMainSend
-        for (const change of ['text', 'intent', 'unchanged']) {
+        for (const change of ['text', 'unchanged']) {
           const actions = mobile().actions, original = actions.send, accepted = deferred(), before = nativeNavigations.length
           let saving = Promise.resolve()
           actions.send = (_id, text, _files, options) => {
             assert.ok(options)
+            assert.equal(options.intent, promptIntent(text), 'native Main sends the prompt intent')
+            assert.equal(options.intent, 'new_task')
             saving = accepted.promise.then(() => { options.onSaved?.({ report_results: true, message_id: 'native-saved', conversation_id: 'chat', target: { kind: 'task', task_id: 'native-created-task' }, intent: 'continue', expected_revision: 1, sequence: 1, text, attachments: [], created_at_ms: 1, delivery: 'saved' }) })
             return saving
           }
           try {
-            const onIntent = chat.render('default').find(({ type }) => type === 'InputOptions')?.props.onIntent
-            assert.ok(typeof onIntent === 'function'); onIntent('new_task')
-            composer()?.onChange?.(`手机新任务 ${change}`); sendDraft()
+            composer()?.onChange?.(`新任务 手机 ${change}`); sendDraft()
             if (change === 'text') composer()?.onChange?.('手机仍在编辑')
-            if (change === 'intent') onIntent('continue')
             chat.render('default')
             accepted.resolve(undefined); await saving; await settleComponent()
             assert.equal(nativeNavigations.length, before + (change === 'unchanged' ? 1 : 0), 'native Main only navigates for its unchanged submitted draft')
-            assert.equal(composer()?.value, change === 'unchanged' ? '' : change === 'text' ? '手机仍在编辑' : `手机新任务 ${change}`)
+            assert.equal(composer()?.value, change === 'unchanged' ? '' : '手机仍在编辑')
             if (change === 'unchanged') assert.equal(nativeNavigations.at(-1), '/task/native-created-task')
           } finally { actions.send = original }
         }
@@ -1652,7 +1663,7 @@ test("workspace preserves bot and message requests while routing native decision
         rpcConnection.rpc = async (method, body = {}) => { closeCalls.push(method); return method === 'workspace_history' ? history : originalRpc(method, body) }
         let closeWork = Promise.resolve()
         const status = componentHarness('./workspace-chat.tsx', {
-          '@vibeface/client/workspace/context.tsx': { useWorkspace: () => render() }, '@vibeface/client/chat/protocol.ts': { inputTargetKey },
+          '@vibeface/client/workspace/context.tsx': { useWorkspace: () => render() }, '@vibeface/client/chat/protocol.ts': { promptIntent, inputTargetKey },
           '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, action: () => Promise<void>) => { closeWork = action(); return closeWork } }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
         })
         try {
@@ -1841,6 +1852,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       return { ...workspaceModel, ...(typeof override === 'object' && override !== null ? override : {}) }
     }
     if (specifier === '@vibeface/client/workspace/history.ts') return workspaceHistory
+    if (specifier === '@vibeface/client/chat/protocol.ts') return { promptIntent, ...dependencies[specifier] as object }
     if (specifier === '@/features/chat/memory-summary') {
       const filename = fileURLToPath(new URL('../../../../../apps/mobile/src/features/chat/memory-summary.tsx', import.meta.url))
       const compiled = transpileModule(readFileSync(filename, 'utf8'), { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
@@ -2434,7 +2446,7 @@ function conversationHarness(workspace: () => Record<string, unknown>, device: R
     '@vibeface/client/workspace/labels.ts': taskLabels,
     '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { can_manage: false, source: 'membership' } }, retryNow: () => {}, ...device }) },
     '@vibeface/client/identity/copy.ts': { setUpOnManager },
-    '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters },
+    '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters },
     '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage },
     '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger },
     '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks },
@@ -2443,7 +2455,7 @@ function conversationHarness(workspace: () => Record<string, unknown>, device: R
   }, chatGlobals)
   const messages = componentHarness('../chat/elements/message.tsx', {
     '@vibeface/client/workspace/context.tsx': { useWorkspace: workspace },
-    '@vibeface/client/chat/protocol.ts': { messageKey, replyStatusLabel },
+    '@vibeface/client/chat/protocol.ts': { promptIntent, messageKey, replyStatusLabel },
     '@vibeface/client/lib/errors.ts': errors,
   })
   const render = (props: object = {}) => app.render('ConversationScreen', props)
@@ -2495,7 +2507,7 @@ test('both pending input controls retry only a matching safe refusal and keep al
       sendMessage: async () => { throw new Error('must not create another input') },
     }
     const app = componentHarness(platform === 'web' ? './workspace-chat.tsx' : '../../../../../apps/mobile/src/features/workspace/workspace.tsx', {
-      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared }, '@vibeface/client/chat/protocol.ts': { inputTargetKey },
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared }, '@vibeface/client/chat/protocol.ts': { promptIntent, inputTargetKey },
       '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: async (_key: string, action: () => Promise<void>) => action() }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
       '@/lib/use-run': { useRun: () => ({ busy: null, error: '', run: async (_key: string, action: () => Promise<void>) => action() }) }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
     })
@@ -2674,7 +2686,7 @@ test('composers save each pending draft once and let edited drafts save independ
       '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/lib/node.ts': { providerNames, messageOf }, '@vibeface/client/lib/errors.ts': errors,
       '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
       '@vibeface/client/workspace/bot-settings.ts': { botCopy, folderLabels, placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage },
-      '@vibeface/client/chat/protocol.ts': { inputTargetKey, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters },
+      '@vibeface/client/chat/protocol.ts': { promptIntent, inputTargetKey, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters },
       '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) },
       '@/components/kit': { providerIcons: { codex: 'CodexIcon' }, toneText: {} }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
       '@tanstack/react-router': { useNavigate: () => (target: unknown) => { navigations.push(target) } },
@@ -2705,47 +2717,39 @@ test('composers save each pending draft once and let edited drafts save independ
       first.resolve(new Uint8Array([1, 2, 3]).buffer); await saves[0]; await settleComponent()
       assert.equal(composer().value, '第二份草稿')
       assert.equal(composer().files, laterFiles, 'the earlier save cannot remove the new attachments')
-      // Native and the web's main chat pick the intent by value; the web's scoped composers keep a native select.
-      const byValue = example.native || example.name === 'web Main'
-      const intent = render().find(({ type, props }) => example.native ? typeof type === 'function' && type.name === 'InputOptions' || type === 'InputOptions' : byValue ? typeof type === 'function' && type.name === 'IntentMenu' : type === 'NativeSelect' && props['aria-label'] === '发送方式')?.props
-      const changeIntent = intent?.[example.native ? 'onIntent' : 'onChange']; assert.ok(typeof changeIntent === 'function')
-      changeIntent(byValue ? 'defer' : { currentTarget: { value: 'defer' } }); submit(); submit(); await settleComponent()
-      assert.equal(attempts.length, 3, 'a changed send intent is a separate draft without blocking it globally')
       later.resolve(new Uint8Array([4, 5, 6]).buffer); await Promise.all(saves); await settleComponent()
       assert.equal(composer().value, '')
       assert.deepEqual(JSON.parse(JSON.stringify(composer().files)), [])
       assert.deepEqual(JSON.parse(JSON.stringify(attempts.map(({ text, files, intent }) => ({ text, files, intent })))), [
-        { text: '第一份草稿', files: ['first.txt'], intent: 'continue' }, { text: '第二份草稿', files: ['later.txt'], intent: 'continue' }, { text: '第二份草稿', files: ['later.txt'], intent: 'defer' },
-      ])
+        { text: '第一份草稿', files: ['first.txt'], intent: 'continue' }, { text: '第二份草稿', files: ['later.txt'], intent: 'continue' },
+      ], 'the composer sends the prompt intent')
       assert.deepEqual(saved, [
-        { text: '第一份草稿', attachments: [{ name: 'first.txt', bytes: [1, 2, 3] }] }, { text: '第二份草稿', attachments: [{ name: 'later.txt', bytes: [4, 5, 6] }] }, { text: '第二份草稿', attachments: [{ name: 'later.txt', bytes: [4, 5, 6] }] },
+        { text: '第一份草稿', attachments: [{ name: 'first.txt', bytes: [1, 2, 3] }] }, { text: '第二份草稿', attachments: [{ name: 'later.txt', bytes: [4, 5, 6] }] },
       ])
       const target: InputTarget = example.name.endsWith('Task') ? { kind: 'task', task_id: 'task' } : example.name === 'web Main' ? { kind: 'bot_main', bot_id: 'bot' } : example.component.includes('Scoped') ? { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' } : { kind: 'work', work_id: 'work' }
-      if (example.native) assert.equal(composer().attachmentScope, JSON.stringify(['network', 'chat', target.kind === 'work' ? ['work', target.work_id] : inputTargetKey(target), example.component.includes('Scoped') ? 'continue' : 'defer']))
-      assert.deepEqual(JSON.parse(JSON.stringify(attempts.map((item) => item.target))), [target, target, target])
+      if (example.native) assert.equal(composer().attachmentScope, JSON.stringify(['network', 'chat', target.kind === 'work' ? ['work', target.work_id] : inputTargetKey(target)]))
+      assert.deepEqual(JSON.parse(JSON.stringify(attempts.map((item) => item.target))), [target, target])
       const failed = pendingResult(); reads.set('retry.txt', failed)
       composer().onChange?.('原样重试'); const retryFiles = attach('retry.txt'); submit()
-      failed.reject(new Error('file unavailable')); await assert.rejects(saves[3], /file unavailable/); await settleComponent()
+      failed.reject(new Error('file unavailable')); await assert.rejects(saves[2], /file unavailable/); await settleComponent()
       assert.equal(composer().value, '原样重试'); assert.equal(composer().files, retryFiles)
       const retry = pendingResult(); reads.set('retry.txt', retry); submit(); submit(); await settleComponent()
-      assert.equal(attempts.length, 5, 'a failed save releases the draft guard for exactly one retry')
-      retry.resolve(new Uint8Array([7, 8, 9]).buffer); await saves[4]; await settleComponent()
+      assert.equal(attempts.length, 4, 'a failed save releases the draft guard for exactly one retry')
+      retry.resolve(new Uint8Array([7, 8, 9]).buffer); await saves[3]; await settleComponent()
       assert.equal(composer().value, '')
       assert.deepEqual(saved.at(-1), { text: '原样重试', attachments: [{ name: 'retry.txt', bytes: [7, 8, 9] }] })
-      if (!example.name.endsWith('Scoped')) for (const change of ['text', 'intent', 'unchanged']) {
+      if (!example.name.endsWith('Scoped')) for (const change of ['text', 'unchanged']) {
         const before = navigations.length, taskId: string = `created-task-${attempts.length + 1}`, name = `navigate-${change}.txt`
         const held = pendingResult(); reads.set(name, held)
-        changeIntent(byValue ? 'new_task' : { currentTarget: { value: 'new_task' } })
         composer().onChange?.(`新任务 ${change}`); attach(name); submit()
         if (change === 'text') composer().onChange?.('当前正在编辑的正文')
-        if (change === 'intent') changeIntent(byValue ? 'continue' : { currentTarget: { value: 'continue' } })
         render()
         held.resolve(new Uint8Array([10, 11, 12]).buffer); await saves.at(-1); await settleComponent()
         assert.equal(navigations.length, before + (change === 'unchanged' ? 1 : 0), 'only the unchanged submitted draft can navigate after local acceptance')
         if (change === 'unchanged') {
           assert.deepEqual(JSON.parse(JSON.stringify(navigations.at(-1))), example.native ? `/task/${taskId}` : { to: '/tasks/$taskId', params: { taskId } })
           assert.equal(composer().value, '')
-        } else assert.equal(composer().value, change === 'text' ? '当前正在编辑的正文' : `新任务 ${change}`, 'late navigation cannot discard the active draft')
+        } else assert.equal(composer().value, '当前正在编辑的正文', 'late navigation cannot discard the active draft')
       }
     } finally {
       for (const held of reads.values()) held.resolve(new ArrayBuffer(0))
@@ -2770,11 +2774,12 @@ test('both channel composers retain the durable task target before the domain sn
       sendMessage: async (_text: string, _files: unknown[], _sent: unknown, options?: InputOptions) => { assert.ok(options); sends.push(options); const saved: PendingMessage = options.target.kind === 'channel_member' && options.target.bot_id === 'other' ? { ...durable, conversation_id: 'other-chat', target: { kind: 'channel_task', channel_id: 'channel', task_id: 'other-task', bot_id: 'other' } } : durable; shared.pendingMessages = [saved]; options.onSaved?.(saved); return true },
     }
     shared.bots.push({ ...parityBot, bot_id: 'other', conversation_id: 'other-chat', name: '另一个 Bot' })
-    const saved = new Map<string, string>()
+    // A cached recipient without its task is ignored: the Channel opens on its coordinator.
+    const saved = new Map<string, string>([[`vibeface.${networkKey('channel-target:channel', 'network')}`, JSON.stringify({ bot_id: 'other' })]])
     const storage = { getItem: (key: string) => saved.get(key) ?? null, setItem: (key: string, value: string) => { saved.set(key, value) } }
     const dependencies = {
       '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared },
-      '@vibeface/client/chat/protocol.ts': { inputTargetKey },
+      '@vibeface/client/chat/protocol.ts': { promptIntent, inputTargetKey },
       '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: { principal: { network_id: 'network' } } }) },
       '@/lib/platform': { webPlatform: { storage } }, '@/platform': { mobilePlatform: { storage } },
       'expo-router': { Stack: { Screen: 'Screen' }, router: { push() {} } }, 'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 0 }) },
@@ -2799,11 +2804,11 @@ test('both channel composers retain the durable task target before the domain sn
         assert.deepEqual(JSON.parse(JSON.stringify(scoped()?.target)), durable.target, 'a reload restores the selected task from durable input evidence')
         assert.equal(scoped()?.expectedRevision, 1)
         const previousSaved = scoped()?.onSaved
-        const selector = app.render('ChannelWorkspace', { channelId: 'channel' }).find(({ props }) => props['aria-label'] === '频道消息目标')?.props
-        assert.ok(typeof selector?.onChange === 'function'); selector.onChange({ currentTarget: { value: 'other' } })
+        const endReply = app.render('ChannelWorkspace', { channelId: 'channel' }).find(({ type, props }) => type === 'Button' && componentText(props.children) === '结束回复选择')?.props
+        assert.ok(typeof endReply?.onClick === 'function'); endReply.onClick()
         scoped()
         assert.ok(typeof previousSaved === 'function'); previousSaved(durable)
-        assert.deepEqual(JSON.parse(JSON.stringify(scoped()?.target)), { kind: 'channel_member', channel_id: 'channel', bot_id: 'other' }, 'a late save cannot undo a later explicit Bot selection')
+        assert.deepEqual(JSON.parse(JSON.stringify(scoped()?.target)), { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' }, 'a late save cannot undo a later end of the reply selection')
       } else {
         const composer = () => app.render('ScopedWorkspaceScreen', { channelId: 'channel' }).find(({ type }) => type === 'Composer')?.props
         composer()?.onChange?.('first')
@@ -2820,15 +2825,14 @@ test('both channel composers retain the durable task target before the domain sn
         assert.ok(typeof afterReload === 'function'); afterReload(); await settleComponent()
         assert.deepEqual(JSON.parse(JSON.stringify(sends[2].target)), durable.target)
         assert.equal(sends[2].expected_revision, 1)
-        const controls = app.render('ScopedWorkspaceScreen', { channelId: 'channel' }).find(({ type }) => typeof type === 'function' && type.name === 'InputOptions')?.props
-        const other = (controls?.options as { key: string }[]).find((option) => option.key === 'member:other')
-        assert.ok(other && typeof controls?.onSelect === 'function'); controls.onSelect(other)
+        const endReply = app.render('ScopedWorkspaceScreen', { channelId: 'channel' }).find(({ props }) => props.accessibilityLabel === '结束回复这个任务')?.props
+        assert.ok(typeof endReply?.onPress === 'function'); endReply.onPress()
         composer()
         sends[2].onSaved?.(durable)
-        composer()?.onChange?.('交给另一个 Bot')
-        const sendOther = composer()?.onSend
-        assert.ok(typeof sendOther === 'function'); sendOther(); await settleComponent()
-        assert.deepEqual(JSON.parse(JSON.stringify(sends[3].target)), { kind: 'channel_member', channel_id: 'channel', bot_id: 'other' }, 'a late save cannot redirect the next native input back to the old Bot')
+        composer()?.onChange?.('交给协调 Bot')
+        const sendCoordinator = composer()?.onSend
+        assert.ok(typeof sendCoordinator === 'function'); sendCoordinator(); await settleComponent()
+        assert.deepEqual(JSON.parse(JSON.stringify(sends[3].target)), { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' }, 'a late save cannot redirect the next native input back to the old task')
       }
     } finally { app.close() }
   }
@@ -3196,9 +3200,9 @@ test('both work details read terminal shared records outside Main and discard la
 })
 
 test('terminal work followups retain their Task identity or explicitly create a task from the original request', async () => {
-  for (const platform of ['web', 'native']) for (const kind of ['task', 'channel_task', 'raw']) {
+  for (const platform of ['web', 'native']) for (const kind of ['task', 'channel_task', 'raw', 'unverified']) {
     const target: InputTarget | null = kind === 'task' ? { kind: 'task', task_id: 'stable-task' } : kind === 'channel_task' ? { kind: 'channel_task', task_id: 'stable-task', channel_id: 'channel', bot_id: 'bot' } : null
-    const work = parityWork({ state: 'finished', outcome: 'failed', prompt: '原始完整交代', result_text: '上次已经产生的输出' })
+    const work = kind === 'unverified' ? parityWork({ state: 'unverified' }) : parityWork({ state: 'finished', outcome: 'failed', prompt: '原始完整交代', result_text: '上次已经产生的输出' })
     const sends: { text: string; options: InputOptions }[] = [], reads: unknown[] = []
     const shared = { ...parityShared(), data: parseConversation(context), openWorks: [],
       readWork: async () => ({ work: { ...work, target, source_events: ['a'.repeat(64)], conversation_id: 'chat' }, coverage: { source: 'shared_history', complete: false } }),
@@ -3212,13 +3216,22 @@ test('terminal work followups retain their Task identity or explicitly create a 
       '@vibeface/client/workspace/questions.ts': workspaceQuestions, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/lib/node.ts': { providerNames, messageOf }, '@vibeface/client/lib/errors.ts': errors,
       '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: async (_key: string, action: () => Promise<void>) => action() }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
       '@/components/kit': { providerIcons: { codex: 'CodexIcon' }, toneText: {} }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
+      './task-activity': { confirmText: () => '设备无法报告结果', BackOnline: 'BackOnline' },
     }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } }, platform === 'native' ? 'TaskDetail' : '')
     const render = () => app.render('TaskDetail', { botId: 'bot', workId: 'work' })
     try {
       render(); await settleComponent()
       const elements = render()
       const composer = elements.find(({ type }) => type === (platform === 'web' ? 'PromptInput' : 'Composer'))
-      assert.ok(platform === 'web' ? composer?.props.disabled : composer?.props.blocked, 'a terminal Work cannot accept the default Continue')
+      assert.ok(composer)
+      if (kind === 'unverified') {
+        assert.equal(platform === 'web' ? composer.props.disabled : Boolean(composer.props.blocked), true, 'an unfinished Work that cannot take a supplement blocks its input')
+        assert.equal(platform === 'web' ? composer.props.reason : composer.props.blocked, '这个工作当前不能接收补充。')
+        continue
+      }
+      assert.ok(!(platform === 'web' ? composer.props.disabled : composer.props.blocked), 'a terminal Work still accepts a followup')
+      assert.equal(composer.props.label, '发送为新任务')
+      assert.equal(composer.props.sendLabel, '发送为新任务')
       const follow = elements.find(({ type, props }) => type === (platform === 'web' ? 'Button' : 'ActionButton') && componentText(props.children) === (target ? '继续所属任务' : '新任务重做'))
       assert.ok(follow)
       if (platform === 'web') { assert.ok(follow.props.onClick); follow.props.onClick(); await settleComponent() }
@@ -3230,6 +3243,14 @@ test('terminal work followups retain their Task identity or explicitly create a 
       assert.match(sends[0].text, /原始完整交代/)
       assert.match(sends[0].text, /上次已经产生的输出/)
       assert.deepEqual(JSON.parse(JSON.stringify(reads)), target ? [{ task_id: 'stable-task' }] : [])
+      const prompt = render().find(({ type }) => type === (platform === 'web' ? 'PromptInput' : 'Composer'))?.props
+      prompt?.onChange?.('接着改')
+      const submit = render().find(({ type }) => type === (platform === 'web' ? 'PromptInput' : 'Composer'))?.props[platform === 'web' ? 'onSubmit' : 'onSend']
+      assert.ok(typeof submit === 'function'); submit(); await settleComponent()
+      assert.equal(sends.length, 2)
+      assert.equal(sends[1].text, '接着改')
+      assert.deepEqual(JSON.parse(JSON.stringify(sends[1].options.target)), { kind: 'work', work_id: 'work' })
+      assert.equal(sends[1].options.intent, 'new_task', 'a terminal Work followup is sent as a new task')
     } finally { app.close() }
   }
 })
@@ -3280,7 +3301,7 @@ test('both task details bind approval to current unfinished work and keep stops 
 test('context shows scheduler observations without promising native resume or repeating external sessions', () => {
   const shared = parityShared()
   const data = parseConversation({ ...context, scheduler: { scope_jobs: [], jobs: [{ scope: { kind: 'main' as const }, trigger: 'message:queued', state: 'queued' }], unanswered: [] } })
-  const dependencies = { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/chat/protocol.ts': { runtimeLabel }, '@vibeface/client/workspace/bot-settings.ts': { scheduleFrequency: () => '一次', formatWhen: () => '刚才' }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') } }
+  const dependencies = { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/chat/protocol.ts': { promptIntent, runtimeLabel }, '@vibeface/client/workspace/bot-settings.ts': { scheduleFrequency: () => '一次', formatWhen: () => '刚才' }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') } }
   const app = componentHarness('./context-panel.tsx', dependencies)
   try {
     const elements = app.render('ContextPanel', { bot: parityBot, data, nodes: shared.nodes, connected: true, onBack() {} })
@@ -4050,7 +4071,7 @@ test("conversation keeps unknown and newly edited drafts across connection chang
     info: { device_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
   let currentWorkspace = workspace()
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('keep original draft'); composer()?.onSubmit?.()
@@ -4260,7 +4281,7 @@ test('native chat folds runtime diagnostics and retains result checks without pr
   shared.data = parseConversation({ ...context, messages: [{ message_id: 'reply', event_hash: 'reply', role: 'assistant', text: '完成', created_at_ms: 2 }], scheduler: { scope_jobs: [], jobs: [job], unanswered: [] } })
   const extras = componentHarness('../../../../../apps/mobile/src/features/chat/work.tsx', {
     '@/data/live': { useLive: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
-    '@vibeface/client/chat/protocol.ts': { canRetryJob, runtimeLabel }, '@vibeface/client/workspace/model.ts': workspaceModel,
+    '@vibeface/client/chat/protocol.ts': { promptIntent, canRetryJob, runtimeLabel }, '@vibeface/client/workspace/model.ts': workspaceModel,
     '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleTrigger }, '@vibeface/client/workspace/labels.ts': taskLabels,
     '@vibeface/client/workspace/questions.ts': { questionOpen }, '@vibeface/client/lib/errors.ts': errors,
   })
@@ -4310,7 +4331,7 @@ function nativeChatHarness(os: string, dependencies: Record<string, unknown>) {
     'react-native-reanimated': { default: { View: 'AnimatedView' }, useAnimatedStyle: (read: () => unknown) => read(), useSharedValue: (value: number) => ({ value }) },
     'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 34 }), useSafeAreaFrame: () => ({ width: 390 }) },
     'uniwind': { withUniwind: (value: unknown) => value, useUniwind: () => ({ theme: 'light' }), useCSSVariable: () => 'white' },
-    '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
+    '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
     '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/home.ts': { unreachable }, '@vibeface/client/workspace/bot-settings.ts': { botCopy },
     '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' }, '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' },
     '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/lib/layout': { useWide: () => false },
@@ -4432,7 +4453,7 @@ test('native composer adds photos and files without replacing current attachment
 
 test('native attachment results cannot cross a draft scope or survive its disabled or unmounted lifetime', async (t) => {
   type NativeButton = { text: string; onPress?: () => void }
-  for (const os of ['ios', 'android']) for (const source of ['photos', 'files']) for (const change of ['bot', 'bot-roundtrip', 'network', 'work', 'work-roundtrip', 'intent', 'blocked', 'blocked-roundtrip', 'sending', 'unmounted', 'stale-menu', 'blocked-before-menu', 'sending-before-menu']) await t.test(`${os} ${source} ${change}`, async () => {
+  for (const os of ['ios', 'android']) for (const source of ['photos', 'files']) for (const change of ['bot', 'bot-roundtrip', 'network', 'blocked', 'blocked-roundtrip', 'sending', 'unmounted', 'stale-menu', 'blocked-before-menu', 'sending-before-menu']) await t.test(`${os} ${source} ${change}`, async () => {
     const live = parityShared()
     const conversation: import('../../../../../apps/mobile/src/data/types.ts').Conversation = {
       messages: [], before: new Map(), rest: [], answers: new Map(), hidden: new Set(), unread: null,
@@ -4463,11 +4484,6 @@ test('native attachment results cannot cross a draft scope or survive its disabl
       return current
     }
     const render = () => composer.render('Composer', { ...props(), sending })
-    const selectTarget = (key: 'main' | 'work:work') => {
-      const select = screen.render('default').find(({ type }) => type === 'InputOptions')?.props.onSelect
-      assert.ok(typeof select === 'function'); select({ key })
-      render()
-    }
     try {
       props().onChange?.('A 草稿')
       const original = [{ uri: 'file:///a.txt', name: 'a.txt', size: 1, mimeType: 'text/plain' }]
@@ -4488,14 +4504,9 @@ test('native attachment results cannot cross a draft scope or survive its disabl
         if (change === 'bot-roundtrip') { botId = 'bot'; render(); assert.equal(props().attachmentScope, scope) }
       }
       if (change === 'network') { device.ready.principal.network_id = 'other-network'; render() }
-      if (change === 'work' || change === 'work-roundtrip') { selectTarget('work:work'); if (change === 'work-roundtrip') { selectTarget('main'); assert.equal(props().attachmentScope, scope) } }
-      if (change === 'intent') {
-        const intent = screen.render('default').find(({ type }) => type === 'InputOptions')?.props.onIntent
-        assert.ok(typeof intent === 'function'); intent('defer'); render()
-      }
       if (change === 'blocked' || change === 'blocked-roundtrip') { conversation.blocked = '当前设备仅可查看'; render(); if (change === 'blocked-roundtrip') { conversation.blocked = null; render() } }
       if (change === 'sending') { sending = true; render() }
-      if (['bot', 'network', 'work', 'intent', 'stale-menu'].includes(change)) assert.notEqual(props().attachmentScope, scope)
+      if (['bot', 'network', 'stale-menu'].includes(change)) assert.notEqual(props().attachmentScope, scope)
       if (change === 'unmounted') composer.close()
       if (change === 'stale-menu') { assert.ok(selected); selected(); assert.equal(calls, 0, 'a menu opened in A cannot start a picker in B') }
       if (change === 'blocked' || change === 'sending') {
@@ -4583,7 +4594,7 @@ test("conversation preserves local input while execution devices are unavailable
     info: { device_id: 'gateway' }, sendMessage: async () => { sent++; return true }, run: async (action: () => Promise<void>) => { await action() },
   })
   let currentWorkspace = workspace([{ device_id: 'gateway', online: false, capabilities: { manager: 'codex', manager_state: 'ready', roots: [] } }])
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/labels.ts': taskLabels, '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/labels.ts': taskLabels, '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('hello'); composer()?.onSubmit?.()
@@ -4624,7 +4635,7 @@ test("an owner's reply on its way keeps its streamed text until the reply lands"
     ...historyActions, generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), data: { ...parseConversation(context, "chat"), messages, scheduler: { scope_jobs: [], jobs: [job], unanswered: [] } }, pendingMessages: [], canSaveMessages: true, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [], liveProgress: [progress], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     refresh: async () => {},
-  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
+  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const streamed = () => (app.render('ConversationScreen').find(({ type }) => type === 'Chat')?.props.entries as { message?: { state?: string; text: string } }[]).filter((entry) => entry.message?.state === 'streaming').map((entry) => entry.message?.text).join()
   try {
     assert.equal(streamed(), "partial answer")
@@ -4643,7 +4654,7 @@ test("a closed question neither waits on the person nor hides 思考中", () => 
     ...historyActions, generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), data: { ...parseConversation(context, "chat"), messages: [ask], questions, scheduler: { scope_jobs: [], jobs: [job], unanswered: [] } }, pendingMessages: [], canSaveMessages: true, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [], liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true, answered: {},
     refresh: async () => {},
-  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
+  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const thinking = () => (app.render('ConversationScreen').find(({ type }) => type === 'Chat')?.props.entries as { key: string }[]).some((entry) => entry.key === 'activity')
   try {
     assert.equal(thinking(), true, "a question its device closed is not the bot's status")

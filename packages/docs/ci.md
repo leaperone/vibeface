@@ -240,6 +240,15 @@ gh workflow run ci-desktop-acceptance.yml --ref <branch> -f intent=full-validati
 
 ## 本地按改动补充验收
 
+CLI 客户端改动先运行 `python3 scripts/check-cli-parity.py --self-test` 和 `python3 scripts/check-cli-parity.py`。覆盖检查对比 Web 实际业务调用、原生客户端类型与具名命令目录，不替代实际行为验收。当前提交的 CLI/Core 构建后，执行：
+
+```sh
+python3 scripts/check-cli-parity.py --binary /absolute/path/vibeface --output .artifacts/cli-parity.json
+python3 scripts/verify-cli-client.py --binary /absolute/path/vibeface --core-binary /absolute/path/vibeface-core --artifacts .artifacts/cli-client
+```
+
+CLI 进程验收仅使用所属 Node、合成身份与受控 Provider，验证签名聊天、稳定请求 ID、附件、并行订阅、设置、问题、停止及丢失回执核对。它不调用真实模型，不启动用户后台服务。Core CI 的 Linux 制品验收也运行这两个检查。
+
 开发者修改同步、恢复、调度或工具执行时，除 PR 核心检查外，必须执行对应专项并记录命令及结果；不能只依赖下次定期运行。每次只跑相关模式。安装器或平台交付改动应额外手动触发完整 Core 或对应平台入口，确认目标平台制品。
 
 Web 开发使用 `pnpm --filter vibeface-web dev` 或 `pnpm --filter vibeface-www dev`，Vite HMR 只更新开发页面。Rust 可按需复用 Cargo 增量缓存，依赖与编译结果仍以 Cargo 为准，不引入另一套构建调度或 Core 热重载。最终验收使用当前提交的真实制品并重启进程，核对 Node、scheduler、Provider、DAG 和持久化状态的恢复、去重与未知结果对账。

@@ -6,8 +6,9 @@ pub mod outbox;
 pub use api::*;
 pub use connection::{Connection, Endpoint, Refused};
 pub use identity::{
-    ClientKey, Directory, Enrollment, Entry, IdentityOperationState, IdentityPlan, Progress,
-    Session, prepare_create, prepare_recovery,
+    ClientKey, Directory, Enrollment, Entry, IdentityOperationState, IdentityPlan,
+    IdentityPlanInfo, IdentityPlanKind, Progress, RecoveryOptions, RecoveryReview, Session,
+    prepare_create, prepare_key_rotation, prepare_recovery, review_recovery,
 };
 pub use vibeface_protocol::workspace as wire;
 

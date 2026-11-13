@@ -70,6 +70,24 @@ impl Journal {
     fn save(&self, key: &ClientKey) -> Result<()> {
         privatefs::write_atomic(&key.dir.join(FILE), &self.bytes(key)?)
     }
+
+    fn withdrawal_receipt(&self, key: &ClientKey, reply: &Value) -> Result<Value> {
+        ensure!(
+            reply["join_id"] == self.join_id
+                && reply["invite_id"] == self.join_id
+                && reply["device_id"] == key.device_id()
+                && reply["commit"] == join_commit(key.device_id(), &self.nonce)?,
+            "withdrawal reply belongs to another enrollment; original request retained"
+        );
+        let status = text(reply, "status")?;
+        ensure!(
+            matches!(status, "withdrawn" | "expired" | "rejected" | "joined"),
+            "withdrawal is not confirmed; original request retained"
+        );
+        // A joined response reports the approval race. It does not install membership or
+        // expose the request's nonces; normal enrollment still verifies the signed state.
+        Ok(json!({"join_id":self.join_id,"status":status}))
+    }
 }
 
 /// Joining preserves the original nonce and confirming manager across process restarts.
@@ -86,6 +104,31 @@ pub enum Progress {
 impl<'a> Enrollment<'a> {
     pub fn pending(key: &ClientKey) -> bool {
         key.dir.join(FILE).exists()
+    }
+    /// Withdraws only the saved original request, proving this client's own identity.
+    /// A lost reply retains the journal so the same withdrawal can be read back by retrying.
+    /// If approval won the race, reports `joined` without accepting unverified membership.
+    pub async fn withdraw_pending(key: &ClientKey) -> Result<Value> {
+        ensure!(
+            Self::pending(key),
+            "no saved enrollment; there is no original join ID to withdraw"
+        );
+        let mut journal = Journal::load(key)?;
+        ensure!(
+            journal.sent,
+            "the saved enrollment was never submitted; there is no remote join to withdraw"
+        );
+        let mut session = key.connect_endpoint(&journal.endpoint()?).await?;
+        let reply = session
+            .call("join_withdraw", json!({"join_id":journal.join_id}))
+            .await;
+        session.connection.close();
+        let receipt = journal.withdrawal_receipt(key, &reply?)?;
+        if receipt["status"] != "joined" {
+            journal.terminal = true;
+            journal.save(key)?;
+        }
+        Ok(receipt)
     }
     pub async fn start(key: &'a ClientKey, origin: &str, link: &str, name: &str) -> Result<Self> {
         if Self::pending(key) {
@@ -296,4 +339,206 @@ pub(super) fn clear_joined(key: &ClientKey, network: &str) -> Result<()> {
         privatefs::sync_dir(&key.dir)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn journal(key: &ClientKey, entry: Entry) -> Result<Journal> {
+        let ticket = Ticket::new(NodeLink::new(&entry.node_id, vec![], None)?, [7; 32])?;
+        Ok(Journal {
+            device_id: key.device_id().into(),
+            entry,
+            link: Zeroizing::new(ticket.encode()?),
+            name: "fixture client".into(),
+            join_id: invite_id(&ticket.invite_hash())?,
+            nonce: Zeroizing::new("12".repeat(32)),
+            admin: None,
+            request: vec![],
+            sent: true,
+            joined: None,
+            terminal: false,
+        })
+    }
+
+    fn reply(key: &ClientKey, journal: &Journal, status: &str) -> Result<Value> {
+        Ok(json!({
+            "join_id":journal.join_id,
+            "invite_id":journal.join_id,
+            "device_id":key.device_id(),
+            "commit":join_commit(key.device_id(), &journal.nonce)?,
+            "status":status,
+            "admin_nonce":"fixture manager nonce",
+            "joiner_nonce":journal.nonce.as_str(),
+        }))
+    }
+
+    #[test]
+    fn withdrawal_receipts_bind_the_original_request_and_omit_nonces() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("withdraw-receipt-{}", uuid::Uuid::new_v4()));
+        let key = ClientKey::create(&dir, "fixture client passphrase")?;
+        let journal = journal(
+            &key,
+            Entry {
+                origin: "http://127.0.0.1:9".into(),
+                node_id: Identity::generate()?.device_id(),
+            },
+        )?;
+        for status in ["withdrawn", "expired", "rejected", "joined"] {
+            assert_eq!(
+                journal.withdrawal_receipt(&key, &reply(&key, &journal, status)?)?,
+                json!({"join_id":journal.join_id,"status":status})
+            );
+        }
+        for field in ["join_id", "invite_id", "device_id", "commit"] {
+            let mut wrong = reply(&key, &journal, "withdrawn")?;
+            wrong[field] = "another request".into();
+            assert!(journal.withdrawal_receipt(&key, &wrong).is_err());
+        }
+        for status in ["pending", "confirming", "unknown"] {
+            assert!(
+                journal
+                    .withdrawal_receipt(&key, &reply(&key, &journal, status)?)
+                    .is_err()
+            );
+        }
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn withdrawal_requires_a_saved_submitted_request_without_creating_one() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("withdraw-unsent-{}", uuid::Uuid::new_v4()));
+        let key = ClientKey::create(&dir, "fixture client passphrase")?;
+        assert!(
+            Enrollment::withdraw_pending(&key)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("no saved enrollment")
+        );
+        assert!(!Enrollment::pending(&key));
+        let mut journal = journal(
+            &key,
+            Entry {
+                origin: "http://127.0.0.1:9".into(),
+                node_id: Identity::generate()?.device_id(),
+            },
+        )?;
+        journal.sent = false;
+        journal.save(&key)?;
+        let original = std::fs::read(dir.join(FILE))?;
+        assert!(
+            Enrollment::withdraw_pending(&key)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("never submitted")
+        );
+        assert_eq!(std::fs::read(dir.join(FILE))?, original);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lost_withdrawal_reply_retains_the_original_id_and_reports_an_approval_race()
+    -> Result<()> {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        use vibeface_secure::Handshake;
+
+        for status in ["withdrawn", "joined"] {
+            let dir = std::env::temp_dir().join(format!("withdraw-retry-{}", uuid::Uuid::new_v4()));
+            let key = ClientKey::create(&dir, "fixture client passphrase")?;
+            let node = Identity::generate()?;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let journal = journal(
+                &key,
+                Entry {
+                    origin: format!("http://{}", listener.local_addr()?),
+                    node_id: node.device_id(),
+                },
+            )?;
+            journal.save(&key)?;
+            let original = std::fs::read(dir.join(FILE))?;
+            let original_id = journal.join_id.clone();
+            let expected_device = key.device_id().to_owned();
+            let expected_params = json!({"join_id":original_id});
+            let result = reply(&key, &journal, status)?;
+            let serving = tokio::spawn(async move {
+                for attempt in 0..2 {
+                    let (stream, _) = listener.accept().await?;
+                    let mut socket = tokio_tungstenite::accept_async(stream).await?;
+                    assert!(matches!(
+                        socket.next().await.context("missing preface")??,
+                        Message::Text(_)
+                    ));
+                    let mut handshake = Handshake::signed(false, &node, None, PROLOGUE)?;
+                    handshake.read(
+                        &socket
+                            .next()
+                            .await
+                            .context("missing handshake")??
+                            .into_data(),
+                    )?;
+                    socket
+                        .send(Message::Binary(handshake.write(&[])?.into()))
+                        .await?;
+                    handshake.read(
+                        &socket
+                            .next()
+                            .await
+                            .context("missing client proof")??
+                            .into_data(),
+                    )?;
+                    assert_eq!(
+                        handshake.remote_id().as_deref(),
+                        Some(expected_device.as_str())
+                    );
+                    let mut channel = handshake.finish()?;
+                    loop {
+                        let frame = socket.next().await.context("missing withdrawal")??;
+                        let Some(plain) = channel.open_record(&frame.into_data())? else {
+                            continue;
+                        };
+                        let request: Value = serde_json::from_slice(&plain)?;
+                        assert_eq!(request["method"], "join_withdraw", "never resubmit join");
+                        assert_eq!(request["params"], expected_params);
+                        if attempt != 0 {
+                            let response = json!({"id":request["id"],"result":result});
+                            for record in channel.seal_message(&serde_json::to_vec(&response)?)? {
+                                socket.send(Message::Binary(record.into())).await?;
+                            }
+                        }
+                        break;
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            });
+            assert!(Enrollment::withdraw_pending(&key).await.is_err());
+            assert_eq!(
+                std::fs::read(dir.join(FILE))?,
+                original,
+                "unknown preserves the journal byte for byte"
+            );
+            assert_eq!(
+                Enrollment::withdraw_pending(&key).await?,
+                json!({"join_id":original_id,"status":status})
+            );
+            serving.await??;
+            let saved = Journal::load(&key)?;
+            assert_eq!(saved.join_id, original_id);
+            assert_eq!(saved.terminal, status == "withdrawn");
+            assert!(
+                saved.joined.is_none() && key.network_id().is_none(),
+                "a race never installs unverified membership"
+            );
+            if status == "joined" {
+                assert_eq!(std::fs::read(dir.join(FILE))?, original);
+            }
+            std::fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
 }

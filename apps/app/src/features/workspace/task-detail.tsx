@@ -18,13 +18,13 @@ import { providerIcons } from "@/features/devices/ai-settings"
 import { CopyDiagnostics } from "@/features/identity/device-controls"
 import { projectName, workApproval } from "@vibeface/client/workspace/questions.ts"
 import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
-import type { InputIntent, WorkDetail } from '@vibeface/client/workspace/types.ts'
-import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
+import type { WorkDetail } from '@vibeface/client/workspace/types.ts'
 import { PromptInput } from "@/features/chat/elements/prompt-input"
-import { InputQueue, TargetContextButton, WorkspaceInputStatus } from "./workspace-chat"
+import { InputQueue, WorkspaceInputStatus } from "./workspace-chat"
+import { promptIntent } from "@vibeface/client/chat/protocol.ts"
 
 const tone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["waiting", "awaiting_confirmation"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
-type ComposerDraft = { text: string; files: File[]; intent: InputIntent; workId: string; conversationId: string }
+type ComposerDraft = { text: string; files: File[]; workId: string; conversationId: string }
 
 // The route change unmounts the panel, so focus would otherwise drop to <body>. Module scope keeps the ref stable across renders.
 function holdFocus(node: HTMLElement | null) {
@@ -97,11 +97,10 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const state = shown === "running" && asking ? "waiting" : shown
   const [confirming, setConfirming] = useState(false)
   const [input, setInput] = useState('')
-  const [intent, setIntent] = useState<InputIntent>('continue')
   const [files, setFiles] = useState<File[]>([])
   const [sendError, setSendError] = useState<unknown>(null)
-  const draftRef = useRef<ComposerDraft>({ text: input, files, intent, workId, conversationId: conversationId ?? '' })
-  if (draftRef.current.text !== input || draftRef.current.files !== files || draftRef.current.intent !== intent || draftRef.current.workId !== workId || draftRef.current.conversationId !== (conversationId ?? '')) draftRef.current = { text: input, files, intent, workId, conversationId: conversationId ?? '' }
+  const draftRef = useRef<ComposerDraft>({ text: input, files, workId, conversationId: conversationId ?? '' })
+  if (draftRef.current.text !== input || draftRef.current.files !== files || draftRef.current.workId !== workId || draftRef.current.conversationId !== (conversationId ?? '')) draftRef.current = { text: input, files, workId, conversationId: conversationId ?? '' }
   const draft = draftRef.current
   const savingDrafts = useRef(new Set<ComposerDraft>())
   // Its device cannot say whether it finished, so the person settles it here; nothing is re-run.
@@ -155,7 +154,9 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const asked = promptSummary(work?.prompt ?? "", work?.title ?? "")
   const coordination = work?.coordination_job
   const canContinue = Boolean(work && !work.outcome && !work.stop && ["accepted", "running"].includes(work.state))
-  const inputBlocked = !canContinue && intent !== "new_task"
+  // A work whose result is unknown may still write; new input waits until the result is checked.
+  const inputPaused = !canContinue && (!work?.outcome || unknown || work?.outcome === "unverified")
+  const inputIntent = canContinue || inputPaused ? promptIntent(input) : "new_task"
 
   return <div ref={layer} className="contents">
   {/* Clicking it must not move focus to the page behind, or React hands focus back there instead of to the task link. */}
@@ -242,13 +243,13 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       </Details>
       {workspace.pendingMessages.filter((item) => item.target.kind === 'work' && item.target.work_id === workId).map((item) => <WorkspaceInputStatus key={item.message_id} pending={item} />)}
     </div>}
-    {work ? <div className="shrink-0 border-t p-3"><PromptInput value={input} onChange={setInput} files={files} onFiles={setFiles} hint="" reason={inputBlocked ? "这个工作当前不能接收补充。选择「新任务」继续。" : workspace.readOnlyNotice || workspace.writeNotice} disabled={!workspace.canSaveMessages || inputBlocked} label={`补充给 ${work.title || '这个工作'}`} sendLabel={intent === "defer" ? "保存为稍后处理" : intent === "new_task" ? "发送为新任务" : "补充这个工作"} target={<><span className="text-meta text-muted-foreground">补充给 · {work.title || '这个工作'}</span><NativeSelect size="sm" aria-label="发送方式" value={intent} onChange={(event) => { const value = event.currentTarget.value; if (value === "continue" || value === "new_task" || value === "defer") setIntent(value) }}><NativeSelectOption value="continue" disabled={!canContinue}>补充这个工作</NativeSelectOption><NativeSelectOption value="new_task">新任务</NativeSelectOption><NativeSelectOption value="defer" disabled={!canContinue}>稍后处理</NativeSelectOption></NativeSelect><TargetContextButton target={{ kind: "work", work_id: workId }} conversationId={work.conversation_id} /><InputQueue target={{ kind: "work", work_id: workId }} /></>} onSubmit={() => {
+    {work ? <div className="shrink-0 border-t p-3"><PromptInput value={input} onChange={setInput} files={files} onFiles={setFiles} hint="" reason={inputPaused ? (unknown || work.outcome === "unverified" ? "先让 Bot 查结果，再继续。" : "这个工作当前不能接收补充。") : workspace.readOnlyNotice || workspace.writeNotice} disabled={!workspace.canSaveMessages || inputPaused} label={inputIntent === "continue" ? `补充给 ${work.title || '这个工作'}` : '发送为新任务'} sendLabel={inputIntent === "continue" ? "补充这个工作" : "发送为新任务"} target={<><span className="text-meta text-muted-foreground">{inputIntent === "continue" ? '补充给' : '新任务 · 接着'} · {work.title || '这个工作'}</span><InputQueue target={{ kind: "work", work_id: workId }} /></>} onSubmit={() => {
       const submittedDraft = draft
       if (savingDrafts.current.has(submittedDraft)) return
       savingDrafts.current.add(submittedDraft)
       const text = input, selectedFiles = files
       setSendError(null)
-      void workspace.sendMessage(text, selectedFiles, undefined, { target: { kind: 'work', work_id: workId }, intent, conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !workspace.isCurrent() || draftRef.current !== submittedDraft) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') void navigate({ to: '/tasks/$taskId', params: { taskId: saved.target.task_id } }) } }).then((saved) => { if (saved && draftRef.current === submittedDraft) { setInput((current) => current === text ? '' : current); setFiles((current) => current === selectedFiles ? [] : current) } }).catch(setSendError).finally(() => { savingDrafts.current.delete(submittedDraft) })
+      void workspace.sendMessage(text, selectedFiles, undefined, { target: { kind: 'work', work_id: workId }, intent: inputIntent, conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !workspace.isCurrent() || draftRef.current !== submittedDraft) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') void navigate({ to: '/tasks/$taskId', params: { taskId: saved.target.task_id } }) } }).then((saved) => { if (saved && draftRef.current === submittedDraft) { setInput((current) => current === text ? '' : current); setFiles((current) => current === selectedFiles ? [] : current) } }).catch(setSendError).finally(() => { savingDrafts.current.delete(submittedDraft) })
     }}><InlineError error={sendError} /></PromptInput></div> : null}
   </aside>
   </div>
