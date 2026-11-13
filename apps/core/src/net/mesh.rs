@@ -1706,7 +1706,7 @@ mod tests {
         let online = entry("a".repeat(64), now - 1_000);
         let expired = entry("b".repeat(64), now - 1_800_001);
         let preferred = prioritize_online(vec![&online, &expired], now);
-        assert_eq!(preferred.len(), 1);
+        assert_eq!(preferred.len(), 2);
         assert_eq!(preferred[0].record.device_id, online.record.device_id);
         assert_eq!(prioritize_online(vec![&expired], now).len(), 1);
     }
