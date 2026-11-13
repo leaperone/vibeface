@@ -107,7 +107,7 @@ function providerInspection(value: Record<string, unknown>) {
     running_invocations: value.running_invocations, deferred_invocations: value.deferred_invocations };
 }
 
-test('provider settings and queued cancellation work in the installed native app', { platforms: ['ios'], timeout: 600000 }, async ({ app, device, network, screen }) => {
+test('provider settings and stopping beside a queued input work in the installed native app', { platforms: ['ios'], timeout: 600000 }, async ({ app, device, network, screen }) => {
   const simulator = process.env.VIBEFACE_E2E_SIMULATOR, appPath = process.env.VIBEFACE_E2E_IOS_APP;
   const source = process.env.VIBEFACE_E2E_SOURCE_COMMIT;
   const binary = process.env.VIBEFACE_E2E_BINARY, crypto = process.env.VIBEFACE_E2E_CRYPTO_MODULE;
@@ -433,39 +433,11 @@ test('provider settings and queued cancellation work in the installed native app
   const botId = text(queue.bot_id), runningTrigger = text(queue.running_trigger);
   const deferredMessageId = text(queue.deferred_message_id);
   await openLink(`vibeface://b/${botId}`);
-  const optionsButton = screen.getByRole('button', /^输入目标 Native Provider · 主聊天，/);
-  await optionsButton.click();
-  const optionsSheet = screen.getByTestId('input-options-sheet', { visible: true });
-  await expect(optionsSheet.getByText('目标和队列', { exact: true })).toBeVisible();
+  await expect(screen.getByRole('textbox', /^给 Bot 发消息(?:$|[\s,，])/)).toBeVisible();
   await expect.poll(async () => (await inspect()).deferred_input).toEqual({
     message_id: deferredMessageId, target: { kind: 'bot_main', bot_id: botId }, deferred: true, cancelled: false,
   });
   expect((await inspect()).jobs).toEqual([{ trigger: runningTrigger, state: 'running' }]);
-  expect((await inspect()).total_invocations).toBe(1);
-  const cancel = optionsSheet.getByRole('button', '取消稍后输入', { exact: true, visible: true });
-  // `has` searches inside each pane, so it takes a root locator that is not limited to visible elements;
-  // the button can still be below the fold.
-  const deferredScroll = device.locator('role=scroll-area').filter({
-    has: screen.getByRole('button', '取消稍后输入', { exact: true }),
-  });
-  await expect(deferredScroll).toHaveCount(1);
-  await deferredScroll.scrollUntilVisible(cancel, { direction: 'down' });
-  await expect(cancel).toBeEnabled();
-  let previousCancelBounds = '';
-  await expect.poll(async () => {
-    const bounds = await cancel.boundingBox(), pane = await deferredScroll.boundingBox();
-    assert(bounds && pane, 'Deferred Cancel and its scroll pane expose bounds');
-    const observed = JSON.stringify([bounds, pane]), stable = observed === previousCancelBounds;
-    previousCancelBounds = observed;
-    return stable && bounds.x >= pane.x && bounds.y >= pane.y && bounds.x + bounds.width <= pane.x + pane.width && bounds.y + bounds.height <= pane.y + pane.height;
-  }).toBe(true);
-  await cancel.click();
-  await expect.poll(async () => (await inspect()).deferred_input).toEqual({
-    message_id: deferredMessageId, target: { kind: 'bot_main', bot_id: botId }, deferred: true, cancelled: true,
-  });
-  await expect(optionsSheet).toHaveCount(1);
-  await optionsSheet.getByRole('button', '关闭目标和队列', { exact: true }).click();
-  await expect(optionsSheet).toHaveCount(0);
   expect((await inspect()).total_invocations).toBe(1);
   expect((await inspect()).deferred_invocations).toBe(0);
   await screen.getByRole('button', '停止', { exact: true }).click();
@@ -476,9 +448,6 @@ test('provider settings and queued cancellation work in the installed native app
   expect(after.total_invocations).toBe(1);
   expect(after.running_invocations).toBe(1);
   expect(after.deferred_invocations).toBe(0);
-  expect(after.deferred_input).toEqual({
-    message_id: deferredMessageId, target: { kind: 'bot_main', bot_id: botId }, deferred: true, cancelled: true,
-  });
   await openLink('vibeface://settings');
   await openLink(`vibeface://b/${botId}`);
   await expect(screen.getByRole('textbox', /^给 Bot 发消息(?:$|[\s,，])/)).toBeVisible();

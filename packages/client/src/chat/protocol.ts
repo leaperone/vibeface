@@ -61,6 +61,10 @@ export function composerHint(input: Omit<SendGate, 'busy'> & { bot: BotReach }):
   if (!input.loaded) return '稍等'
   return ''
 }
+/** Chat composers steer the current work unless the message opens with 新任务 or new task followed by a separator or nothing. */
+export function promptIntent(text: string): InputIntent {
+  return /^\s*(新任务(?:$|[\s：:，,])|new\s+task(?:$|[:：,，]))/i.test(text) ? 'new_task' : 'continue'
+}
 export function prepareSend(input: {
   conversationId: string
   text: string
