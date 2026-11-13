@@ -243,8 +243,11 @@ async fn the_cli_client_governs_a_node_that_checks_every_signature() -> Result<(
             &recovery,
             PASSWORD,
             &dir.join("recovery-2.json"),
-            "rescuer",
-            None,
+            client::RecoveryOptions {
+                name: "rescuer",
+                capability: None,
+                members: None,
+            },
         )
         .await?;
         assert!(view().await?.pending.is_none(),"saving the new backup does not rotate the root");
@@ -269,8 +272,11 @@ async fn the_cli_client_governs_a_node_that_checks_every_signature() -> Result<(
             &recovery,
             PASSWORD,
             &dir.join("recovery-3.json"),
-            "rescuer",
-            None,
+            client::RecoveryOptions {
+                name: "rescuer",
+                capability: None,
+                members: None,
+            },
         )
         .await?;
         second_recovery.submit(&mut rescuer).await?;

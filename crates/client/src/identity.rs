@@ -9,9 +9,13 @@ use crate::connection::{Connection, Endpoint};
 mod durable;
 mod enrollment;
 mod plan;
+#[cfg(test)]
+mod recovery_tests;
+#[cfg(test)]
+mod rotation_tests;
 use anyhow::{Context, Result, bail, ensure};
 pub use enrollment::{Enrollment, Progress};
-pub use plan::{IdentityOperationState, IdentityPlan};
+pub use plan::{IdentityOperationState, IdentityPlan, IdentityPlanInfo, IdentityPlanKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -96,7 +100,7 @@ impl RememberedEndpoint {
 }
 
 /// `client.json`: the sealed key and, once it is a member, which network and Node it uses.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KeyFile {
     version: u32,
@@ -210,12 +214,11 @@ impl ClientKey {
     pub fn remember_endpoint(&mut self, network_id: &str, endpoint: Endpoint) -> Result<()> {
         vibeface_secure::membership::validate_hash(network_id)?;
         let endpoint = RememberedEndpoint::from_endpoint(endpoint)?;
-        self.file.network_id = Some(network_id.to_owned());
-        self.file.endpoint = Some(endpoint);
-        privatefs::write_atomic(
-            &self.dir.join(KEY_FILE),
-            &serde_json::to_vec_pretty(&self.file)?,
-        )?;
+        let mut file = self.file.clone();
+        file.network_id = Some(network_id.to_owned());
+        file.endpoint = Some(endpoint);
+        privatefs::write_atomic(&self.dir.join(KEY_FILE), &serde_json::to_vec_pretty(&file)?)?;
+        self.file = file;
         enrollment::clear_joined(self, network_id)
     }
 
@@ -665,27 +668,131 @@ pub async fn prepare_create(
     )
 }
 
-/// Starts a recovery with `recovery_file`: every current member stays, this client joins as a
+pub struct RecoveryOptions<'a> {
+    pub name: &'a str,
+    pub capability: Option<&'a str>,
+    /// Retained members without the new manager. None keeps every current member.
+    pub members: Option<&'a [Member]>,
+}
+
+#[derive(Serialize)]
+pub struct RecoveryReview {
+    pub network_id: String,
+    pub members: Vec<Member>,
+    pub required_node: String,
+    pub new_manager: Member,
+}
+
+struct RecoverySource {
+    root: Identity,
+    state: NetworkState,
+    view: AuthorizationView,
+    heads: BTreeMap<String, (u64, String)>,
+    now: u64,
+    fresh: bool,
+    review: RecoveryReview,
+}
+
+/// Verify the current recovery candidates without preparing a checkpoint, backup, or plan.
+pub async fn review_recovery(
+    key: &ClientKey,
+    entry: Entry,
+    recovery_file: &Path,
+    password: &str,
+    options: RecoveryOptions<'_>,
+) -> Result<RecoveryReview> {
+    ensure!(
+        IdentityPlan::inspect(key, password)?
+            .is_none_or(|plan| plan.state == IdentityOperationState::Applied),
+        "an identity operation is pending; review its saved selection instead"
+    );
+    ensure!(
+        options.members.is_none(),
+        "review lists candidates before selecting members"
+    );
+    Ok(
+        recovery_source(key, &entry, recovery_file, password, options.name)
+            .await?
+            .review,
+    )
+}
+
+/// Starts a recovery with `recovery_file`: selected current members stay, this client joins as a
 /// manager, and `new_file` (written before the Node hears of it) takes over the recovery key.
 /// It takes effect after the recovery wait unless a manager stops it. An empty Node needs its
-/// one-time `capability`.
+/// one-time `capability`. With no selection, every current member stays. A selection excludes
+/// this new manager, keeps the connected Node, and may change existing clients' management rights.
 pub async fn prepare_recovery(
     key: &ClientKey,
     entry: Entry,
     recovery_file: &Path,
     password: &str,
     new_file: &Path,
-    name: &str,
-    capability: Option<&str>,
+    options: RecoveryOptions<'_>,
 ) -> Result<IdentityPlan> {
+    let RecoveryOptions {
+        name,
+        capability,
+        members: selected_members,
+    } = options;
     ensure!(
         !IdentityPlan::exists(key),
         "an identity operation is pending; reopen it instead of generating another root"
     );
+    let RecoverySource {
+        root,
+        state,
+        view,
+        heads,
+        now,
+        fresh,
+        review,
+    } = recovery_source(key, &entry, recovery_file, password, name).await?;
+    let members = recovery_members(
+        &review.members,
+        selected_members,
+        &entry.node_id,
+        review.new_manager,
+    )?;
+    let capability = if fresh {
+        Some(capability.context("an empty Node needs its capability")?)
+    } else {
+        None
+    };
+    let next = Identity::generate()?;
+    let retired = view.retire(&members, &heads)?;
+    let checkpoint =
+        RootCheckpoint::recovery(&state, &root, &next.device_id(), members, retired, now)?;
+    state.clone().recover_at(checkpoint.clone(), now)?;
+    let mut checkpoints = state.checkpoints.clone();
+    checkpoints.push(checkpoint);
+    let backup = RecoveryMaterial {
+        version: 1,
+        network_id: review.network_id,
+        root_secret_key: Zeroizing::new(next.secret_hex()),
+        genesis: state.genesis.clone(),
+        checkpoints: checkpoints.clone(),
+        events: state.events.clone(),
+    };
+    let mut params =
+        json!({"genesis":state.genesis,"checkpoints":checkpoints,"events":state.events});
+    if let Some(capability) = capability {
+        params["capability"] = json!(capability);
+    }
+    IdentityPlan::prepare(key, entry, new_file, &backup, password, params)
+}
+
+async fn recovery_source(
+    key: &ClientKey,
+    entry: &Entry,
+    recovery_file: &Path,
+    password: &str,
+    name: &str,
+) -> Result<RecoverySource> {
     let material = read_recovery_file(recovery_file, password)?;
     let root = Identity::from_secret_hex(&material.root_secret_key)?;
     let me = key.device_id().to_owned();
-    let mut session = key.connect(Some(&entry)).await?;
+    let mut session = key.connect(Some(entry)).await?;
     let info = session.call("info", json!({})).await?;
     let fresh = info["initialized"] == false;
     let mut state = NetworkState {
@@ -740,30 +847,112 @@ pub async fn prepare_recovery(
             false,
         )?);
     }
-    members.push(Member::client(&session.key.identity, name, true)?);
+    ensure!(
+        members
+            .iter()
+            .any(|member| member.device_id == entry.node_id && member.kind == IdentityKind::Node),
+        "recovery must retain the connected Node"
+    );
     state.check_root(&root.device_id(), now, false)?;
+    Ok(RecoverySource {
+        root,
+        state,
+        view,
+        heads,
+        now,
+        fresh,
+        review: RecoveryReview {
+            network_id: material.network_id,
+            members,
+            required_node: entry.node_id.clone(),
+            new_manager: Member::client(&session.key.identity, name, true)?,
+        },
+    })
+}
+
+fn recovery_members(
+    allowed: &[Member],
+    selected: Option<&[Member]>,
+    required_node: &str,
+    manager: Member,
+) -> Result<Vec<Member>> {
+    let mut members = selected.unwrap_or(allowed).to_vec();
+    let mut seen = std::collections::BTreeSet::new();
+    for member in &members {
+        let original = allowed
+            .iter()
+            .find(|original| original.device_id == member.device_id)
+            .context("selected recovery member is not a current member")?;
+        ensure!(
+            original.kind == member.kind && original.name == member.name,
+            "recovery selection cannot change a device's kind or name"
+        );
+        member.validate()?;
+        ensure!(
+            member.device_id != manager.device_id && seen.insert(&member.device_id),
+            "recovery selection contains a duplicate device or the new manager"
+        );
+    }
+    ensure!(
+        members
+            .iter()
+            .any(|member| member.device_id == required_node && member.kind == IdentityKind::Node),
+        "recovery must retain the connected Node"
+    );
+    members.push(manager);
+    Ok(members)
+}
+
+/// Rotates the recovery key without changing members. The replacement backup is durable
+/// before explicit plan submission, and the original request survives unknown outcomes.
+pub async fn prepare_key_rotation(
+    key: &ClientKey,
+    entry: Entry,
+    recovery_file: &Path,
+    password: &str,
+    new_file: &Path,
+    new_password: &str,
+) -> Result<IdentityPlan> {
+    ensure!(
+        !IdentityPlan::exists(key),
+        "an identity operation is pending; reopen it instead of generating another root"
+    );
+    let material = read_recovery_file(recovery_file, password)?;
+    ensure!(
+        key.network_id() == Some(material.network_id.as_str()),
+        "recovery file belongs to another personal network"
+    );
+    let root = Identity::from_secret_hex(&material.root_secret_key)?;
+    let mut session = key.connect(Some(&entry)).await?;
+    let directory = session.directory().await?;
+    ensure!(
+        directory.view.recovery_key == root.device_id(),
+        "a newer recovery file replaced this one"
+    );
+    directory
+        .state
+        .check_root(&root.device_id(), directory.now_ms, true)?;
     let next = Identity::generate()?;
-    let retired = view.retire(&members, &heads)?;
     let checkpoint =
-        RootCheckpoint::recovery(&state, &root, &next.device_id(), members, retired, now)?;
-    state.clone().recover_at(checkpoint.clone(), now)?;
-    let mut checkpoints = state.checkpoints.clone();
+        RootCheckpoint::rotation(&directory.state, &root, &next.device_id(), directory.now_ms)?;
+    directory
+        .state
+        .clone()
+        .recover_at(checkpoint.clone(), directory.now_ms)?;
+    let mut checkpoints = directory.state.checkpoints;
     checkpoints.push(checkpoint);
     let backup = RecoveryMaterial {
         version: 1,
-        network_id: material.network_id.clone(),
+        network_id: material.network_id,
         root_secret_key: Zeroizing::new(next.secret_hex()),
-        genesis: state.genesis.clone(),
-        checkpoints: checkpoints.clone(),
-        events: state.events.clone(),
+        genesis: directory.state.genesis,
+        checkpoints,
+        events: directory.state.events,
     };
-    let mut params =
-        json!({"genesis":state.genesis,"checkpoints":checkpoints,"events":state.events});
-    if fresh {
-        params["capability"] = json!(capability.context("an empty Node needs its capability")?);
-    }
+    let params =
+        json!({"genesis":backup.genesis,"checkpoints":backup.checkpoints,"events":backup.events});
     drop(session);
-    IdentityPlan::prepare(key, entry, new_file, &backup, password, params)
+    IdentityPlan::prepare(key, entry, new_file, &backup, new_password, params)
 }
 
 fn text<'v>(value: &'v Value, key: &str) -> Result<&'v str> {
@@ -1028,8 +1217,11 @@ mod tests {
                 &recovery_file,
                 "recovery passphrase",
                 &dir.join("next-recovery.json"),
-                "recovered client",
-                Some("fixture-capability"),
+                RecoveryOptions {
+                    name: "recovered client",
+                    capability: Some("fixture-capability"),
+                    members: None,
+                },
             )
             .await?;
             assert_eq!(plan.state(), IdentityOperationState::Prepared);

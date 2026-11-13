@@ -132,8 +132,11 @@ impl Backend {
                         &PathBuf::from(get("old_file")),
                         &get("password"),
                         &PathBuf::from(get("new_file")),
-                        &get("name"),
-                        None,
+                        vibeface_client::RecoveryOptions {
+                            name: &get("name"),
+                            capability: None,
+                            members: None,
+                        },
                     )
                     .await?
                 };

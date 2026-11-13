@@ -105,6 +105,7 @@ Detailed guides are currently in Chinese.
 | --- | --- |
 | [Quick start](packages/docs/quick-start.md) | Install Vibeface and finish the first conversation. |
 | [User guide](packages/docs/user-guide.md) | Manage bots, tasks, notifications, and computers. |
+| [Terminal client](packages/docs/cli.md) | Chat, attach files, control work, and call business operations from scripts. |
 | [Product overview](packages/docs/overview.md) | Understand what Vibeface does and its limits. |
 | [Agent support](packages/docs/bot-and-execution.md) | Set up coordination and task execution. |
 | [History sync](packages/docs/history-sync.md) | See what syncs and how to continue on another computer. |

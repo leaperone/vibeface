@@ -15,29 +15,62 @@ use std::sync::{
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tokio::sync::{Semaphore, broadcast, watch};
 
-#[derive(Clone, Debug)]
+// Serde's internally tagged unit decoder ignores map entries even with deny_unknown_fields.
+fn empty_operation<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<(), D::Error> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Empty {}
+    Empty::deserialize(deserializer).map(|_| ())
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReadRequest {
     ConversationHistory(vibeface_protocol::history::HistoryRequest),
+    #[serde(deserialize_with = "empty_operation")]
     WriteState,
+    #[serde(deserialize_with = "empty_operation")]
     Home,
     Conversation {
         conversation_id: String,
     },
+    #[serde(deserialize_with = "empty_operation")]
     Workspace,
+    #[serde(deserialize_with = "empty_operation")]
     WorkspaceOverview,
     WorkspaceHistory {
         channel_id: Option<String>,
         task_id: Option<String>,
         limit: usize,
     },
+    #[serde(deserialize_with = "empty_operation")]
     Nodes,
+    #[serde(deserialize_with = "empty_operation")]
     NodeSettings,
+    #[serde(deserialize_with = "empty_operation")]
     Logs,
     LogsFiltered(LogFilter),
+    #[serde(deserialize_with = "empty_operation")]
     Diagnostics,
+    DiagnosticsFiltered {
+        since_ms: Option<i64>,
+        until_ms: Option<i64>,
+    },
+    #[serde(deserialize_with = "empty_operation")]
+    OpenWorks,
+    #[serde(deserialize_with = "empty_operation")]
+    ShareLink,
+    #[serde(deserialize_with = "empty_operation")]
+    TestCodexAppServer,
+    #[serde(deserialize_with = "empty_operation")]
     Questions,
+    #[serde(deserialize_with = "empty_operation")]
     Notifications,
+    #[serde(deserialize_with = "empty_operation")]
     RelaySettings,
+    #[serde(deserialize_with = "empty_operation")]
     TriageSettings,
     ProviderModels {
         provider: Provider,
@@ -90,6 +123,7 @@ pub enum LogSource {
     Cursor,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogFilter {
     pub since_ms: Option<i64>,
     pub until_ms: Option<i64>,
@@ -114,15 +148,26 @@ pub enum OfflineBlockReason {
     NotMember,
     NodeRemoved,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DeliveryRead {
+    #[serde(deserialize_with = "empty_operation")]
     Status,
+    #[serde(deserialize_with = "empty_operation")]
     List,
+    #[serde(deserialize_with = "empty_operation")]
     Providers,
+    #[serde(deserialize_with = "empty_operation")]
     Budgets,
-    Get { order_id: String },
-    FindIntent { intent_id: String },
-    Read { order_id: String },
+    Get {
+        order_id: String,
+    },
+    FindIntent {
+        intent_id: String,
+    },
+    Read {
+        order_id: String,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -134,22 +179,26 @@ pub enum Provider {
     Pi,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryVersion {
     pub revision: String,
     pub control_revision: u32,
     pub source_event_hash: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryBase {
     pub epoch: u32,
     pub version: Option<MemoryVersion>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BotProject {
     pub target_node: String,
     pub cwd: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManagerSettings {
     pub provider: Provider,
     pub workspace: PathBuf,
@@ -159,11 +208,13 @@ pub struct ManagerSettings {
     pub backup: BackupPolicy,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupPolicy {
     pub automatic: bool,
     pub candidates: Vec<BackupModel>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupModel {
     pub provider: Provider,
     pub model: String,
@@ -176,6 +227,7 @@ pub enum AppServerMode {
     System,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppServer {
     pub mode: AppServerMode,
     pub socket: Option<PathBuf>,
@@ -187,23 +239,114 @@ pub enum Outlet {
     Both,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectOutlet {
     pub prefix: String,
     pub outlet: Outlet,
 }
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum SecretChange {
+    #[default]
     Keep,
     Set(String),
     Clear,
 }
-#[derive(Clone)]
+impl SecretChange {
+    fn is_keep(&self) -> bool {
+        matches!(self, Self::Keep)
+    }
+}
+impl Serialize for SecretChange {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Set(value) => serializer.serialize_str(value),
+            Self::Clear => serializer.serialize_none(),
+            Self::Keep => Err(serde::ser::Error::custom("omit a kept secret field")),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for SecretChange {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Ok(match Option::<String>::deserialize(deserializer)? {
+            Some(value) => Self::Set(value),
+            None => Self::Clear,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpencodeProtocol {
+    OpenaiCompatible,
+    Anthropic,
+    Openai,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpencodeEndpoint {
+    pub protocol: OpencodeProtocol,
+    pub base_url: String,
+    pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "SecretChange::is_keep")]
+    pub api_key: SecretChange,
+}
+#[derive(Clone, Default)]
+pub enum OpencodeEndpointChange {
+    #[default]
+    Keep,
+    Clear,
+    Set(OpencodeEndpoint),
+}
+impl OpencodeEndpointChange {
+    fn is_keep(&self) -> bool {
+        matches!(self, Self::Keep)
+    }
+}
+impl Serialize for OpencodeEndpointChange {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Set(value) => value.serialize(serializer),
+            Self::Clear => serializer.serialize_none(),
+            Self::Keep => Err(serde::ser::Error::custom("omit a kept endpoint field")),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for OpencodeEndpointChange {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Ok(
+            match Option::<OpencodeEndpoint>::deserialize(deserializer)? {
+                Some(value) => Self::Set(value),
+                None => Self::Clear,
+            },
+        )
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnansweredAction {
+    Reply,
+    Dismiss,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TriageSettings {
     pub default_outlet: Outlet,
     pub projects: Vec<ProjectOutlet>,
     pub webhook_url: Option<String>,
     pub scan_codex_sessions: bool,
     pub codex_sessions: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "SecretChange::is_keep")]
     pub webhook_secret: SecretChange,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -224,6 +367,7 @@ pub enum Eyes {
     Wide,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Avatar {
     pub outline: Outline,
     pub eyes: Eyes,
@@ -240,11 +384,13 @@ impl DecisionToken {
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeSettings {
     pub roots: Vec<PathBuf>,
     pub manager: Option<ManagerSettings>,
 }
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderSettings {
     pub provider: Provider,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -257,6 +403,8 @@ pub struct ProviderSettings {
     pub bin: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_server: Option<AppServer>,
+    #[serde(default, skip_serializing_if = "OpencodeEndpointChange::is_keep")]
+    pub opencode_endpoint: OpencodeEndpointChange,
     pub connect_local: bool,
     pub env: BTreeMap<String, Option<String>>,
 }
@@ -273,6 +421,7 @@ pub enum DeliveryAcceptance {
     Strict,
 }
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeliveryPrepare {
     pub intent_id: String,
     pub receiver_peer: String,
@@ -286,11 +435,13 @@ pub struct DeliveryPrepare {
     pub budget_id: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
 pub struct DeliveryReadyWindow {
     pub order_id: String,
     pub index: u16,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DeliveryBudgetBatch {
     pub budget_id: String,
     pub payer: String,
@@ -311,7 +462,8 @@ pub fn delivery_flush_batch_id(batch: &DeliveryBudgetBatch) -> Result<String> {
         batch,
     ))?)))
 }
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DeliveryAction {
     Configure {
         enabled: bool,
@@ -345,7 +497,8 @@ pub enum ResolveOutcome {
     Completed,
     Interrupted,
 }
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
     Input {
         conversation_id: String,
@@ -364,6 +517,23 @@ pub enum Action {
         conversation_id: String,
         schedule_id: String,
         action: ScheduleAction,
+    },
+    SetOwner {
+        conversation_id: String,
+        scheduler_node: String,
+        epoch: u64,
+    },
+    DismissWork {
+        conversation_id: String,
+        work_id: String,
+    },
+    Unanswered {
+        conversation_id: String,
+        message_ids: Vec<String>,
+        action: UnansweredAction,
+    },
+    LocalAccess {
+        enabled: bool,
     },
     StopReply {
         conversation_id: String,
@@ -418,7 +588,9 @@ pub enum Action {
     RevokeDecisionToken {
         token_id: String,
     },
+    #[serde(deserialize_with = "empty_operation")]
     TestWebhook,
+    #[serde(deserialize_with = "empty_operation")]
     ConfirmWritable,
     AckNotification {
         conversation_id: String,
@@ -438,6 +610,60 @@ pub struct ClientEvent {
     pub generation: String,
     pub network_id: String,
     pub payload: Value,
+}
+
+mod reader;
+pub use reader::ClientReader;
+#[cfg(test)]
+mod typed_tests;
+
+async fn read_connection(connection: &Connection, request: ReadRequest) -> Result<Value> {
+    let (rpc, method, mut params) = request.wire();
+    if rpc {
+        params["method"] = json!(method);
+        connection.call("rpc", params).await
+    } else {
+        connection.call(method, params).await
+    }
+}
+
+async fn subscribe_connection(
+    connection: &Connection,
+    network: &str,
+) -> Result<(broadcast::Sender<ClientEvent>, String)> {
+    let (events, _) = broadcast::channel(128);
+    let generation = uuid::Uuid::new_v4().to_string();
+    let mut pushes = connection.subscribe();
+    let updates = events.clone();
+    let token = generation.clone();
+    let event_network = network.to_owned();
+    tokio::spawn(async move {
+        loop {
+            let payload = match pushes.recv().await {
+                Ok(value) => value,
+                Err(broadcast::error::RecvError::Lagged(_)) => json!({"type":"resync_required"}),
+                Err(broadcast::error::RecvError::Closed) => {
+                    let _ = updates.send(ClientEvent {
+                        generation: token.clone(),
+                        network_id: event_network.clone(),
+                        payload: json!({"type":"disconnected"}),
+                    });
+                    break;
+                }
+            };
+            let disconnected = payload["type"] == "disconnected";
+            let _ = updates.send(ClientEvent {
+                generation: token.clone(),
+                network_id: event_network.clone(),
+                payload,
+            });
+            if disconnected {
+                break;
+            }
+        }
+    });
+    connection.call("subscribe", json!({})).await?;
+    Ok((events, generation))
 }
 
 #[derive(Debug)]
@@ -795,40 +1021,7 @@ impl Client {
             mut proof,
         } = session;
         let network = proof.network_id.clone();
-        let event_network = network.clone();
-        let (events, _) = broadcast::channel(128);
-        let generation = uuid::Uuid::new_v4().to_string();
-        let mut pushes = connection.subscribe();
-        let updates = events.clone();
-        let token = generation.clone();
-        tokio::spawn(async move {
-            loop {
-                let payload = match pushes.recv().await {
-                    Ok(value) => value,
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        json!({"type":"resync_required"})
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        let _ = updates.send(ClientEvent {
-                            generation: token.clone(),
-                            network_id: event_network.clone(),
-                            payload: json!({"type":"disconnected"}),
-                        });
-                        break;
-                    }
-                };
-                let disconnected = payload["type"] == "disconnected";
-                let _ = updates.send(ClientEvent {
-                    generation: token.clone(),
-                    network_id: event_network.clone(),
-                    payload,
-                });
-                if disconnected {
-                    break;
-                }
-            }
-        });
-        connection.call("subscribe", json!({})).await?;
+        let (events, generation) = subscribe_connection(&connection, &network).await?;
         let write_state = connection.call("write_state", json!({})).await?;
         let gate = write_gate_value(&write_state)?;
         proof.write_gate = gate;
@@ -1104,13 +1297,7 @@ impl Client {
         if update_gate && self.write_gate.load(Ordering::Acquire) != 2 {
             self.write_gate.store(0, Ordering::Release);
         }
-        let (rpc, method, mut params) = request.wire();
-        let value = if rpc {
-            params["method"] = json!(method);
-            self.connection.call("rpc", params).await?
-        } else {
-            self.connection.call(method, params).await?
-        };
+        let value = read_connection(&self.connection, request).await?;
         if update_gate {
             let mut gate = write_gate_value(&value)?;
             if self.write_gate.load(Ordering::Acquire) == 2 {
@@ -1150,6 +1337,7 @@ impl Client {
                 | Action::RevokeDecisionToken { .. }
                 | Action::ConfirmWritable
                 | Action::TestWebhook
+                | Action::LocalAccess { .. }
         ) {
             ensure!(
                 matches!(
@@ -1181,6 +1369,7 @@ impl Client {
                 | Action::RevokeDecisionToken { .. }
                 | Action::ConfirmWritable
                 | Action::TestWebhook
+                | Action::LocalAccess { .. }
         );
         ensure!(
             !self.revoked.load(Ordering::Acquire)
@@ -1193,6 +1382,8 @@ impl Client {
             Action::Input {input,..}=>Some(input.message_id.clone()),
             Action::Workspace {command}=>Some(self.operation_id("workspace",&json!({"type":"workspace_commanded","command":command}))?),
             Action::Memory {conversation_id,memory_id,base,after}=>Some(self.operation_id(conversation_id,&json!({"type":"memory_controlled","memory_id":memory_id,"base":base,"after":after}))?),
+            Action::SetOwner {conversation_id,scheduler_node,epoch}=>Some(self.operation_id(conversation_id,&json!({"type":"conversation_owner","scheduler_node":scheduler_node,"epoch":epoch}))?),
+            Action::DismissWork {conversation_id,work_id}=>Some(self.operation_id(conversation_id,&json!({"type":"notification_acked","notification_id":work_id,"client_id":"inbox"}))?),
             _=>None,
         };
         if let Some(id) = known
@@ -1245,6 +1436,12 @@ impl Client {
     }
     /// Local staging survives transport loss; only an admitted writer changes Prepared to Unknown.
     pub async fn submit(&self, action: Action) -> Result<OperationSnapshot> {
+        if matches!(self.authority, ClientAuthority::LocalSession) {
+            ensure!(
+                !matches!(&action, Action::LocalAccess { enabled: true }),
+                "only a managing member can enable local access"
+            );
+        }
         let node_operator = matches!(
             &action,
             Action::NodeSettings(_)
@@ -1252,6 +1449,7 @@ impl Client {
                 | Action::Triage(_)
                 | Action::Relay { .. }
                 | Action::TestWebhook
+                | Action::LocalAccess { .. }
                 | Action::CreateDecisionToken { .. }
                 | Action::RevokeDecisionToken { .. }
                 | Action::ConfirmWritable
@@ -1440,6 +1638,7 @@ impl Client {
                 if let Some(id)=order_id {self.connection.call("delivery",json!({"op":"receipt","order_id":id})).await?} else {Value::Null}
             }
             Reconciliation::Settings {kind}=>self.connection.call(crate::settings::read_method(*kind),json!({})).await?,
+            Reconciliation::Unanswered {conversation_id,..}=>self.connection.call("rpc",json!({"method":"conversation","conversation_id":conversation_id})).await?,
             Reconciliation::StopReply {conversation_id,..}=>self.connection.call("rpc",json!({"method":"conversation","conversation_id":conversation_id})).await?,
             Reconciliation::StopWork {conversation_id,work_id}=>self.connection.call("rpc",json!({"method":"work_detail","conversation_id":conversation_id,"work_id":work_id})).await?,
             Reconciliation::DeliveryBatch { .. } | Reconciliation::DeliveryFlush { .. } | Reconciliation::Manual => return Ok(op.snapshot),
@@ -1608,6 +1807,29 @@ impl Client {
                 let request: Value = serde_json::from_slice(&op.bytes)?;
                 crate::settings::goal_matches(*kind, &request["params"], &result)
                     .then_some(OperationState::Accepted)
+            }
+            Reconciliation::Unanswered {
+                conversation_id,
+                message_ids,
+                action,
+            } => {
+                ensure!(
+                    result["conversation"]["conversation_id"] == *conversation_id,
+                    "unanswered readback belongs to another conversation"
+                );
+                let local_owner = result["conversation"]["owner"] == op.snapshot.target_node;
+                // Bounded pages may omit jobs. Missing records are never evidence of success.
+                let jobs = result["scheduler"]["jobs"].as_array();
+                (local_owner
+                    && jobs.is_some_and(|jobs| {
+                        message_ids.iter().all(|message_id| {
+                            jobs.iter().any(|job| {
+                                job["trigger"] == format!("message:{message_id}")
+                                    && unanswered_state_matches(action, &job["state"]["state"])
+                            })
+                        })
+                    }))
+                .then_some(OperationState::Accepted)
             }
             Reconciliation::StopReply {
                 conversation_id,
@@ -1810,6 +2032,73 @@ impl Client {
                     Some((conversation_id, body)),
                 )
             }
+            Action::SetOwner {
+                conversation_id,
+                scheduler_node,
+                epoch,
+            } => {
+                ensure!(epoch > 0, "owner epoch must be positive");
+                vibeface_secure::validate_device_id(&scheduler_node)?;
+                let body = json!({"type":"conversation_owner","scheduler_node":scheduler_node,"epoch":epoch});
+                id = self.operation_id(&conversation_id, &body)?;
+                (
+                    true,
+                    "set_owner",
+                    json!({"conversation_id":conversation_id,"scheduler_node":scheduler_node,"epoch":epoch}),
+                    format!("owner:{conversation_id}"),
+                    Some((conversation_id, body)),
+                )
+            }
+            Action::DismissWork {
+                conversation_id,
+                work_id,
+            } => {
+                let body = json!({"type":"notification_acked","notification_id":work_id,"client_id":"inbox"});
+                id = self.operation_id(&conversation_id, &body)?;
+                (
+                    true,
+                    "dismiss_work",
+                    json!({"conversation_id":conversation_id,"work_id":work_id}),
+                    format!("work:{conversation_id}:{work_id}"),
+                    Some((conversation_id, body)),
+                )
+            }
+            Action::Unanswered {
+                conversation_id,
+                message_ids,
+                action,
+            } => {
+                ensure!(
+                    !message_ids.is_empty(),
+                    "select at least one unanswered message"
+                );
+                for message_id in &message_ids {
+                    vibeface_protocol::validate_id(message_id).map_err(anyhow::Error::msg)?;
+                }
+                reconciliation = Reconciliation::Unanswered {
+                    conversation_id: conversation_id.clone(),
+                    message_ids: message_ids.clone(),
+                    action: action.clone(),
+                };
+                let method = match action {
+                    UnansweredAction::Reply => "reply_unanswered",
+                    UnansweredAction::Dismiss => "dismiss_unanswered",
+                };
+                (
+                    true,
+                    method,
+                    json!({"conversation_id":conversation_id,"message_ids":message_ids}),
+                    format!("unanswered:{conversation_id}"),
+                    None,
+                )
+            }
+            Action::LocalAccess { enabled } => (
+                false,
+                "local_access",
+                json!({"enabled":enabled}),
+                "local-access".into(),
+                None,
+            ),
             Action::StopReply {
                 conversation_id,
                 trigger,
@@ -2169,6 +2458,74 @@ impl Client {
     }
 }
 
+fn unanswered_state_matches(action: &UnansweredAction, state: &Value) -> bool {
+    match action {
+        UnansweredAction::Dismiss => state == "cancelled",
+        UnansweredAction::Reply => matches!(
+            state.as_str(),
+            Some(
+                "queued"
+                    | "steering"
+                    | "steered"
+                    | "claimed"
+                    | "running"
+                    | "cancelling"
+                    | "reconciling"
+                    | "completed"
+                    | "failed"
+                    | "interrupted"
+            )
+        ),
+    }
+}
+
+fn validate_unanswered_result(op: &Operation, result: &Value) -> Result<Option<OperationState>> {
+    let Reconciliation::Unanswered {
+        conversation_id,
+        message_ids,
+        action,
+    } = &op.reconciliation
+    else {
+        anyhow::bail!("unanswered operation is missing its original selection");
+    };
+    let expected: std::collections::BTreeSet<_> = message_ids
+        .iter()
+        .map(|id| format!("message:{id}"))
+        .collect();
+    let receipts = result["receipts"]
+        .as_array()
+        .context("unanswered acknowledgement omitted receipts")?;
+    let mut observed = std::collections::BTreeSet::new();
+    let mut states_match = true;
+    for receipt in receipts {
+        ensure!(
+            receipt["network_id"] == op.snapshot.network_id
+                && receipt["conversation_id"] == *conversation_id,
+            "unanswered receipt belongs to another network or conversation"
+        );
+        let trigger = receipt["trigger"]
+            .as_str()
+            .context("unanswered receipt trigger missing")?;
+        ensure!(
+            expected.contains(trigger),
+            "unanswered receipt identifies an unselected message"
+        );
+        ensure!(
+            observed.insert(trigger.to_owned()),
+            "duplicate unanswered receipt"
+        );
+        ensure!(
+            receipt["state"].is_string(),
+            "unanswered receipt state missing"
+        );
+        states_match &= unanswered_state_matches(action, &receipt["state"]);
+    }
+    Ok(
+        (!expected.is_empty() && observed == expected && states_match)
+            .then_some(OperationState::Accepted),
+    )
+}
+
 fn validate_result(op: &Operation, result: &Value) -> Result<Option<OperationState>> {
     let request: Value = serde_json::from_slice(&op.bytes)?;
     if request["method"] == "delivery" {
@@ -2215,6 +2572,7 @@ fn validate_result(op: &Operation, result: &Value) -> Result<Option<OperationSta
     }
     let method = request["params"]["method"].as_str().unwrap_or_default();
     match method {
+        "reply_unanswered" | "dismiss_unanswered" => validate_unanswered_result(op, result),
         "cancel_manager" => {
             if result["unconfirmed"] == true {
                 return Ok(None);
@@ -2343,6 +2701,14 @@ impl ReadRequest {
                 serde_json::to_value(filter).expect("log filter contains only serializable fields"),
             ),
             Self::Diagnostics => (false, "diagnostics", json!({})),
+            Self::DiagnosticsFiltered { since_ms, until_ms } => (
+                false,
+                "diagnostics",
+                json!({"since_ms":since_ms,"until_ms":until_ms}),
+            ),
+            Self::OpenWorks => (true, "open_works", json!({})),
+            Self::ShareLink => (false, "share_link", json!({})),
+            Self::TestCodexAppServer => (false, "test_codex_app_server", json!({})),
             Self::Questions => (true, "questions", json!({})),
             Self::Notifications => (true, "notifications", json!({})),
             Self::RelaySettings => (false, "relay_settings", json!({})),
@@ -3521,6 +3887,7 @@ mod offline_tests {
             execution_model: None,
             bin: None,
             app_server: None,
+            opencode_endpoint: OpencodeEndpointChange::Keep,
             connect_local: false,
             env: BTreeMap::from([(
                 "SYNTHETIC_KEY".into(),

@@ -19,6 +19,9 @@ use vibeface_control::{
     observation,
 };
 
+mod cli_client;
+mod client_commands;
+mod client_lifecycle;
 mod desktop_node;
 mod manage;
 mod service;
@@ -92,6 +95,8 @@ enum Action {
     Relay(manage::RelayOptions),
     /// Manage the personal network as an approved management client.
     Client(manage::ClientOptions),
+    /// Talk to a Bot in its shared conversation.
+    Chat(cli_client::chat::ChatOptions),
     /// Manage the installed user service.
     Service(crate::service::Service),
     /// Check releases and manage the automatic update policy.
@@ -830,6 +835,7 @@ async fn main() -> Result<()> {
         Some(Action::Delivery(options)) => manage::delivery(options).await,
         Some(Action::Relay(options)) => manage::relay(options).await,
         Some(Action::Client(options)) => manage::client(options).await,
+        Some(Action::Chat(options)) => cli_client::chat::run(options).await,
         Some(Action::Tool {
             name,
             json,

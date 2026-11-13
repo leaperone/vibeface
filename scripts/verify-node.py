@@ -2281,7 +2281,8 @@ def verify_recovery(node, other, network):
     require(stopped["view"]["pending"] is None and stopped["view"]["stopped"] == [pending["checkpoint"]],
             "an existing manager stops the recovery")
     require(node.client.call("veto", {"event": veto})["view"] == stopped["view"], "retrying the veto changes nothing")
-    require(other.call("authenticate")["recovery"] == {"status": "stopped"}, "the recovering browser learns it was stopped")
+    require(other.call("authenticate")["recovery"] == {"status": "stopped", "checkpoint_hash": pending["checkpoint"]},
+            "the recovering browser learns the exact recovery checkpoint that was stopped")
     read_with([], [])
     other.command("recover_material", backup=renewed, password=node.backup_password)
     refused = read_with(chain, events, status=400)

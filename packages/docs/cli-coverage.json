@@ -1,0 +1,420 @@
+{
+  "schema_version": 1,
+  "purpose": "Additional named CLI identity, lifecycle and client-state adapters. Native operation and nested enum names are derived from live capabilities or catalog source, never pinned here. Evidence confirms implementation symbols only; behavior is verified separately.",
+  "additional_coverage": [
+    {
+      "command": "client status",
+      "core_methods": [
+        "directory",
+        "authenticate"
+      ],
+      "reason": "Authenticated membership and directory; the shared SDK also reads directory before governance mutations.",
+      "evidence": [
+        {
+          "path": "apps/cli/src/manage.rs",
+          "contains": "ClientAction::Status =>"
+        },
+        {
+          "path": "crates/client/src/identity.rs",
+          "contains": "self.call(\"directory\", json!({})).await?"
+        }
+      ]
+    },
+    {
+      "command": "client invite",
+      "core_methods": [
+        "invite"
+      ],
+      "reason": "Create a signed enrollment invitation.",
+      "evidence": [
+        {
+          "path": "apps/cli/src/manage.rs",
+          "contains": "session.invite().await?"
+        },
+        {
+          "path": "crates/client/src/identity.rs",
+          "contains": "self.call(\"invite\","
+        }
+      ]
+    },
+    {
+      "command": "client requests",
+      "core_methods": [
+        "join_status"
+      ],
+      "reason": "Read waiting enrollment requests, including enrollment polling in client enroll.",
+      "evidence": [
+        {
+          "path": "apps/cli/src/manage.rs",
+          "contains": "session.requests().await?"
+        },
+        {
+          "path": "crates/client/src/identity.rs",
+          "contains": "self.call(\"join_status\","
+        }
+      ]
+    },
+    {
+      "command": "client approve",
+      "core_methods": [
+        "approve"
+      ],
+      "reason": "Confirm the short code, sign grant, or reject.",
+      "evidence": [
+        {
+          "path": "apps/cli/src/manage.rs",
+          "contains": "session.reject_join(&join_id).await?"
+        },
+        {
+          "path": "apps/cli/src/manage.rs",
+          "contains": "approve(session, &join_id, manage, code).await?"
+        },
+        {
+          "path": "crates/client/src/identity.rs",
+          "contains": "self.call(\"approve\","
+        }
+      ]
+    },
+    {
+      "command": "client grant",
+      "core_methods": [
+        "grant"
+      ],
+      "reason": "Rename a member or update manager permission through SDK governance.",
+      "evidence": [
+        {
+          "path": "apps/cli/src/manage.rs",
+          "contains": "session.grant(&device_id, name.as_deref(), manage)"
+        },
+        {
+          "path": "crates/client/src/identity.rs",
+          "contains": "self.govern(\"grant\","
+        }
+      ]
+    },
+    {
+      "command": "client revoke",
+      "core_methods": [
+        "revoke"
+      ],
+      "reason": "Remove a member, including the caller leaving its own network.",
+      "evidence": [
+        {
+          "path": "apps/cli/src/manage.rs",
+          "contains": "session.revoke(&device_id)"
+        },
+        {
+          "path": "crates/client/src/identity.rs",
+          "contains": "self.govern(\"revoke\","
+        }
+      ]
+    },
+    {
+      "command": "client recovery",
+      "core_methods": [
+        "approve_recovery",
+        "veto"
+      ],
+      "reason": "Settle a waiting recovery through SDK signed governance.",
+      "evidence": [
+        {
+          "path": "apps/cli/src/manage.rs",
+          "contains": ".settle_recovery("
+        },
+        {
+          "path": "crates/client/src/identity.rs",
+          "contains": "\"approve_recovery\""
+        },
+        {
+          "path": "crates/client/src/identity.rs",
+          "contains": "self.govern(\"veto\","
+        }
+      ]
+    },
+    {
+      "command": "client enroll",
+      "core_methods": [
+        "join",
+        "join_check"
+      ],
+      "reason": "Resumable enrollment, with invitation check and original join polling.",
+      "evidence": [
+        {
+          "path": "apps/cli/src/manage.rs",
+          "contains": "Enrollment::start"
+        },
+        {
+          "path": "crates/client/src/identity/enrollment.rs",
+          "contains": "\"join_check\""
+        },
+        {
+          "path": "crates/client/src/identity/enrollment.rs",
+          "contains": "\"join\""
+        }
+      ]
+    },
+    {
+      "command": "client create-network / client recover",
+      "core_methods": [
+        "recover",
+        "recovery_state"
+      ],
+      "reason": "Durable identity plans create/recover with saved replacement file, then reconcile the original recover request.",
+      "evidence": [
+        {
+          "path": "apps/cli/src/manage.rs",
+          "contains": "client::prepare_create("
+        },
+        {
+          "path": "apps/cli/src/manage.rs",
+          "contains": "client::prepare_recovery("
+        },
+        {
+          "path": "crates/client/src/identity/plan.rs",
+          "contains": "\"method\":\"recover\""
+        },
+        {
+          "path": "crates/client/src/identity.rs",
+          "contains": "\"recovery_state\""
+        }
+      ]
+    },
+    {
+      "command": "client rotate-recovery",
+      "core_methods": [
+        "recover"
+      ],
+      "reason": "A key-rotation plan preserves members and saves its replacement recovery file.",
+      "evidence": [
+        {
+          "path": "apps/cli/src/cli_client/mod.rs",
+          "contains": "vibeface_client::prepare_key_rotation("
+        },
+        {
+          "path": "crates/client/src/identity.rs",
+          "contains": "pub async fn prepare_key_rotation("
+        }
+      ]
+    },
+    {
+      "command": "join",
+      "core_methods": [
+        "node_join"
+      ],
+      "reason": "Local Node lifecycle uses MaintenanceCommand::Join and reports waiting/confirming/failed outcomes.",
+      "evidence": [
+        {
+          "path": "apps/cli/src/main.rs",
+          "contains": "MaintenanceCommand::Join {"
+        }
+      ]
+    },
+    {
+      "command": "node rejoin",
+      "core_methods": [
+        "rejoin"
+      ],
+      "reason": "Local maintenance authority restarts removed Node lifecycle; no unrestricted signed-network Action.",
+      "evidence": [
+        {
+          "path": "apps/cli/src/manage.rs",
+          "contains": "\"rejoin\""
+        },
+        {
+          "path": "apps/cli/src/client_commands.rs",
+          "contains": "\"command\": \"node rejoin\""
+        }
+      ]
+    },
+    {
+      "command": "client write input / client reconcile",
+      "core_methods": [
+        "upload_attachment",
+        "input_receipt"
+      ],
+      "reason": "Native SDK owns automatic retained-attachment upload and original-message receipt reconciliation; do not expose duplicate manual retries.",
+      "evidence": [
+        {
+          "path": "apps/cli/src/cli_client/mod.rs",
+          "contains": "ClientCommand::Reconcile"
+        },
+        {
+          "path": "crates/client/src/api.rs",
+          "contains": "\"method\":\"input_receipt\""
+        },
+        {
+          "path": "crates/client/src/api.rs",
+          "contains": "\"method\":\"upload_attachment\""
+        }
+      ]
+    },
+    {
+      "command": "client files get",
+      "core_methods": [
+        "read_artifact"
+      ],
+      "reason": "Page binary attachments and verify the complete hash before publishing the file.",
+      "evidence": [
+        {
+          "path": "apps/cli/src/cli_client/files.rs",
+          "contains": "ReadRequest::ArtifactBytes"
+        },
+        {
+          "path": "apps/cli/src/cli_client/files.rs",
+          "contains": "\"attachment SHA-256 verification failed\""
+        }
+      ]
+    },
+    {
+      "command": "client watch",
+      "core_methods": [],
+      "reason": "Authenticated outbox-free event reader; terminal equivalent to live event subscriptions.",
+      "evidence": [
+        {
+          "path": "apps/cli/src/cli_client/mod.rs",
+          "contains": "ClientCommand::Watch"
+        },
+        {
+          "path": "apps/cli/src/cli_client/mod.rs",
+          "contains": "reader.subscribe()"
+        }
+      ]
+    },
+    {
+      "command": "client pending / client settings-review / client settings-close",
+      "core_methods": [],
+      "reason": "Durable local client state inspection and explicit unknown-settings review; no Core transport method.",
+      "evidence": [
+        {
+          "path": "apps/cli/src/cli_client/mod.rs",
+          "contains": "ClientCommand::Pending"
+        },
+        {
+          "path": "apps/cli/src/cli_client/mod.rs",
+          "contains": "ClientCommand::SettingsReview"
+        },
+        {
+          "path": "apps/cli/src/cli_client/mod.rs",
+          "contains": "ClientCommand::SettingsClose"
+        }
+      ]
+    },
+    {
+      "command": "client remember-entry",
+      "core_methods": [],
+      "reason": "Authenticate the selected entry before persisting its network-specific Gateway and target Node.",
+      "evidence": [
+        {
+          "path": "apps/cli/src/cli_client/mod.rs",
+          "contains": "key.remember(&network, entry.clone())?"
+        }
+      ]
+    },
+    {
+      "command": "client node-join-status",
+      "core_methods": [
+        "node_join_status"
+      ],
+      "reason": "Read only the local terminal-owned Node join without starting or resuming it.",
+      "evidence": [
+        {
+          "path": "apps/cli/src/client_lifecycle.rs",
+          "contains": "LifecycleCommand::NodeJoinStatus =>"
+        },
+        {
+          "path": "apps/core/src/client.rs",
+          "contains": "terminal_node_join_status(node)"
+        }
+      ]
+    },
+    {
+      "command": "client node-join-check",
+      "core_methods": [
+        "node_join_check"
+      ],
+      "reason": "Check a link using the existing local operator authority. Web callers still need their setup capability.",
+      "evidence": [
+        {
+          "path": "apps/cli/src/client_lifecycle.rs",
+          "contains": "operator(&access.data_dir, \"node_join_check\""
+        },
+        {
+          "path": "apps/core/src/client.rs",
+          "contains": "check_link_for_local_owner"
+        }
+      ]
+    },
+    {
+      "command": "client node-join-cancel",
+      "core_methods": [
+        "node_join_cancel"
+      ],
+      "reason": "Cancel the existing terminal-owned Node join; a webpage-owned join keeps its own capability.",
+      "evidence": [
+        {
+          "path": "apps/cli/src/client_lifecycle.rs",
+          "contains": "operator(&access.data_dir, \"node_join_cancel\""
+        },
+        {
+          "path": "apps/core/src/client.rs",
+          "contains": "JoinOwner::Terminal"
+        }
+      ]
+    },
+    {
+      "command": "client withdraw-enrollment",
+      "core_methods": [
+        "join_withdraw"
+      ],
+      "reason": "Withdraw the original saved enrollment with its own authenticated key and join ID; retain an unknown outcome.",
+      "evidence": [
+        {
+          "path": "apps/cli/src/client_lifecycle.rs",
+          "contains": "Enrollment::withdraw_pending(&key)"
+        },
+        {
+          "path": "crates/client/src/identity/enrollment.rs",
+          "contains": "pub async fn withdraw_pending"
+        }
+      ]
+    }
+  ],
+  "transport_only": {
+    "info": {
+      "sources": [
+        "packages/client/src/identity/context.tsx"
+      ],
+      "reason": "Authenticated transport identity/initialization metadata; native ClientKey connection and reader verify the selected Node."
+    },
+    "subscribe": {
+      "sources": [
+        "packages/client/src/identity/context.tsx"
+      ],
+      "reason": "Transport subscription and synchronization vector; client watch uses the SDK authenticated subscription."
+    },
+    "rpc": {
+      "sources": [
+        "packages/client/src/identity/context.tsx"
+      ],
+      "reason": "Wire envelope; concrete RPC producers are scanned independently and raw envelopes do not count as business parity."
+    },
+    "entrances": {
+      "sources": [
+        "packages/client/src/identity/context.tsx"
+      ],
+      "reason": "Background transport ingress discovery. CLI chooses and remembers an explicit authenticated Gateway; no business mutation."
+    },
+    "log": {
+      "sources": [
+        "packages/client/src/identity/context.tsx"
+      ],
+      "reason": "Browser diagnostic sink, not a user-requested business operation. CLI logs are emitted by the native client."
+    },
+    "delivery": {
+      "sources": [
+        "packages/client/src/delivery/client.ts"
+      ],
+      "reason": "Delivery transport wrapper; every concrete op call is scanned against native nested catalogs."
+    }
+  }
+}

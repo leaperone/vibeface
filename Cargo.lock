@@ -11786,6 +11786,7 @@ name = "vibeface"
 version = "0.0.1-nightly.20261112.3"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "crossterm",
  "flate2",
