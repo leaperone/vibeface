@@ -1012,12 +1012,14 @@ impl Mesh {
         while let Some(event) = receiver.next().await {
             match event {
                 Ok(Event::NeighborUp(peer)) => {
-                    let first = {
+                    let (new, first) = {
                         let mut neighbors = self.neighbors.lock().expect("mesh neighbors");
-                        neighbors.insert(peer);
-                        neighbors.len() == 1
+                        let new = neighbors.insert(peer);
+                        (new, neighbors.len() == 1)
                     };
-                    tracing::info!(event = "mesh.neighbor_up", peer = %peer.fmt_short(), "a mesh neighbor connected");
+                    if new {
+                        tracing::info!(event = "mesh.neighbor_up", peer = %peer.fmt_short(), "a mesh neighbor connected");
+                    }
                     // What was announced with no neighbor reached nobody.
                     if first {
                         let own = self

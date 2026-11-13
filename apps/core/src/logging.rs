@@ -318,12 +318,12 @@ impl Sink {
     }
 
     /// Writes `record`, unless one written within the last [`REPEAT_WINDOW_MS`] said the same:
-    /// that copy is counted, and one line with the count follows when the window ends. A
-    /// [`STATE_EVENTS`] record is always written when it comes.
+    /// that copy is counted, and one line with the count follows when the window ends. The Node's
+    /// own [`STATE_EVENTS`] records are always written when they come.
     pub fn write(&self, record: &Record) {
         let mut repeats = self.repeats.lock().expect("log repeats");
         self.end_windows(&mut repeats, record.ts_ms, false);
-        if STATE_EVENTS.contains(&record.event.as_str()) {
+        if record.source == Source::Node && STATE_EVENTS.contains(&record.event.as_str()) {
             if let Some(line) = self.line(record) {
                 self.append(&line);
             }
