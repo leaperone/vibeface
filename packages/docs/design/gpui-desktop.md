@@ -1,13 +1,13 @@
 # 原生 GPUI 桌面迁移
 
-本设计将 macOS、Windows 和 Linux 桌面改为 GPUI 原生界面，移除 Electron、preload、Chromium 和桌面 WebView。Web 与 Mobile 继续作为独立客户端存在。本文规定目标与验收范围，不代表这些步骤已经完成。
+本设计是当前 macOS、Windows 和 Linux 桌面的归属说明：原生 GPUI 界面，没有 Electron、preload、Chromium 或桌面 WebView。Web 与 Mobile 继续作为独立客户端存在。下文的功能表是验收范围，不是未完成的迁移步骤。
 
 ## 模块归属
 
 桌面进程内运行 GPUI 界面和独立 Rust 个人网络客户端。客户端连接本人网络中的 Node，也能管理可选的本机 Core。纯控制端启动、扫描和选择节点都不初始化或启动 Node。
 
 - `apps/desktop` 拥有原生窗口、输入、时间线、业务页面、通知、激活和本机进程管理。
-- `crates/client` 复用并接替 `crates/control/src/client.rs` 的密钥封存、目录验证、加入、恢复和签名规则，增加有界连接调度、订阅、业务读取和耐久 outbox。CLI 的对应调用者同时迁移，不保留旧实现或别名。
+- `crates/client` 拥有密钥封存、目录验证、加入、恢复、签名、有界连接调度、订阅、业务读取和耐久 outbox。CLI 的对应调用者同时使用这一套，不保留旧实现或别名。
 - `crates/protocol` 只承接 Core 已有的纯 wire 类型。存储、调度和 Provider 保留在 Core，不能为了复用 DTO 链入整个 Core。
 - `crates/control` 继续负责验证过的本机维护控制；服务与受管更新复用 CLI 的现有能力。
 - `crates/secure` 继续拥有签名、Noise、成员治理和恢复规则。原生客户端直接使用 Rust 实现。

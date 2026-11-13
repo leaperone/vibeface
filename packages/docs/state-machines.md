@@ -26,7 +26,7 @@ description: 定位执行、输入、连接和恢复的状态模型与安全边�
 | 原生密码学适配 | `packages/secure-native`、`crates/secure-ffi` | 握手失败关闭，完成时消费原握手。接收、关闭与运行时重建需核对句柄归属。 |
 | 系统服务 | `scripts/install-node-service.sh`、`scripts/install-node-service.ps1` | 服务管理器已加载或受理启动不等于 Core 健康。停止须确认进程与数据锁均已释放。 |
 | 官网主题 | `apps/www/src/components/theme-toggle.tsx` | hydration、偏好与解析后的颜色分别处理。持久化由主题 provider 管理。 |
-| 桌面进程 | `apps/desktop/src/main/lifecycle.ts`、`session.ts` | 已连接的外部服务不归当前窗口所有。退出未确认时保留所有权屏障。 |
+| 桌面进程 | `apps/desktop/src/host/lifecycle.rs`、`apps/desktop/src/host/mod.rs` | 已连接的外部服务不归当前窗口所有。退出未确认时保留所有权屏障。 |
 | 本机更新 | `apps/cli/src/update`、`apps/core/src/maintenance.rs` | 未确认更新保留日志和执行屏障。恢复运行程序不回滚业务数据。 |
 
 ## 加入任务的所有权
