@@ -63,14 +63,14 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 
 默认级别是 Vibeface 的 info 和依赖库的 warn；启动 Node 和 `update` 之外的命令不显示依赖库日志。iroh 的连接握手（`iroh::protocol`）和 gossip 拨号（`iroh_gossip::net`）只记 error：陌生设备握手失败、对端不在线都属常态，对端和邻居的上下线看 `peer.*` 与 `mesh.*`，Vibeface 自己处理连入连接时出的错记为 `net.accept_failed`。可用 `RUST_LOG` 环境变量调整，例如 `RUST_LOG=warn,vibeface=debug`；要看回这两类握手告警，用 `RUST_LOG=warn,vibeface=info,vibeface_bridge=info`。前台在终端运行时日志同时以文本打印到终端。`node.log` 写到 8 MiB 时改名为 `node.log.1`，旧文件依次后移，共保留 5 个。
 
-重复的记录会合并。来源、级别、事件、说明、三个 ID 和 `fields` 都相同的记录，60 秒内再次出现时不再逐条写入；窗口结束时补一条同样的记录，`fields` 多出三项：
+重复的记录会合并。同一来源、事件和三个 ID 下，与上一条级别、说明和 `fields` 都相同的记录，60 秒内再次出现时不再逐条写入；同一事件说了不同的内容（例如对端从离线回到在线）时，先补写前一条的计数再写新记录，状态切换按发生顺序出现。窗口结束时补一条同样的记录，`fields` 多出三项：
 
 | 字段 | 含义 |
 |---|---|
 | `repeated` | 这个窗口里合并掉的条数 |
 | `first_ms`、`last_ms` | 其中第一条和最后一条的时间 |
 
-持续重复的记录每 60 秒一条，出现总数是首条加上各条 `repeated` 之和。Node 正常停止时把尚未写出的计数全部写入；被强制结束时最多丢最后一个窗口的计数。同时合并的不同记录最多 256 种，超出时最早的一种先结算；超过 8 KiB 的记录不合并。终端上的文本输出不合并。
+持续重复的记录每 60 秒一条，出现总数是首条加上各条 `repeated` 之和。Node 开始停止时（`node.stopping` 之后）和停止结束时都把尚未写出的计数写入；被强制结束时最多丢最后一个窗口的计数。浏览器、Agent 和命令行提交的记录不能自带这三项，Node 会去掉它们。同时合并的不同记录最多 256 种，超出时最早的一种先结算；超过 8 KiB 的记录不合并。终端上的文本输出不合并。
 
 同一个日志还收这些来源的记录：
 
@@ -93,7 +93,7 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 | 日志 | 含义 |
 |---|---|
 | `node.started` | Node 启动完成，带 `version`、`data_epoch`、`os`、`arch` 和是否开启网页 |
-| `node.start_failed` | Node 没能启动，`error` 是原因 |
+| `node.start_failed` | Node 打开数据或启动服务时失败，`error` 是原因 |
 | `node.stopping`、`node.stopped` | Node 开始停止和停止完成。`reason` 是 `stop_requested`（收到停止信号）、`parent_closed`（桌面 App 退出）、`rejoin`、`api` 或 `maintenance`，出错停止时为 error 级并带 `error`。有 `node.started` 却没有 `node.stopped`，说明进程被强制结束或崩溃 |
 | `input.accepted`、`input.rejected` | 收下或拒收一条发来的消息，带 `conversation_id`、`message_id`；收下时 `state` 是排队结果，拒收时 `code` 和 `error` 是原因 |
 | `input.admitted` | 当时没排上队的消息重试后排上了 |
@@ -101,11 +101,11 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 | `schedule.fired` | 定时任务到点，已排队 |
 | `triage.queued` | 收到一条会话动态，等协调 Agent 分诊，带 `provider`、`kind`、`origin` 和 `thread_id` |
 | `triage.concluded` | 分诊结论：`conclusion` 是 `dismiss`（不用处理）或 `raise`（向你提问，带 `severity`）。不记问题和会话内容 |
-| `peer.online`、`peer.offline` | 与成员 Node（`peer`）启动后首次同步成功、恢复同步，或开始同步不上（`error` 是原因）。只在状态变化时记 |
+| `peer.online`、`peer.offline` | 与成员 Node（`peer`）启动后首次同步成功、恢复同步，或同步失败（`error` 是原因，含本机错误，不一定是网络不通）。只在状态变化时记，启动后第一次同步就失败也记一条 `peer.offline` |
 | `mesh.neighbor_up`、`mesh.neighbor_down` | 全网邻居连上或断开 |
 | `net.accept_failed` | 别的设备连进来后，Vibeface 处理这个连接时出错，带 `alpn`、`peer` 和 `error` |
 | `update.checked` | 更新器检查了通道，`available_version` 为空表示已是最新 |
-| `update.deferred`、`update.applied`、`update.failed` | 更新因 Node 正忙推迟、已应用（`previous_version`、`version`），或检查、应用失败（`action`、`error`） |
+| `update.deferred`、`update.applied`、`update.failed` | 更新因 Node 正忙推迟、已应用（`previous_version`、`version`），或检查、应用失败（`action`、`error`）。拿更新锁之前的失败只在命令输出和 `update.stderr.log` 里 |
 | `sync.write_state`（`write state changed`） | 写入状态变化，`state` 是新状态 |
 | `sync.forked`（`another copy of this device wrote different events; writes stopped`） | 发现这台设备的数据被复制过，已停止写入 |
 | `sync.write_confirmed`（`write confirmed without a backup check`） | 有人在网页上确认了“不是从备份恢复的” |

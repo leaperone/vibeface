@@ -129,6 +129,8 @@ async fn main() -> Result<()> {
             "Node is stopping after an error"
         ),
     }
+    // A shutdown step that hangs until the service manager kills the Node keeps what came before.
+    vibeface_core::logging::flush();
     runtime.shutdown().await;
     drop(runtime);
     if reason == "rejoin" {

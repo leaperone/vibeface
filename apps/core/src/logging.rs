@@ -124,6 +124,24 @@ pub struct Record {
 }
 
 impl Record {
+    /// Whether `other` is about the same thing: the same event from the same source for the
+    /// same conversation, work and thread, whatever it says.
+    fn same_subject(&self, other: &Record) -> bool {
+        (
+            self.source,
+            &self.event,
+            &self.conversation_id,
+            &self.work_id,
+            &self.thread_id,
+        ) == (
+            other.source,
+            &other.event,
+            &other.conversation_id,
+            &other.work_id,
+            &other.thread_id,
+        )
+    }
+
     /// Whether `other` says the same thing, whenever it was said.
     fn repeats(&self, other: &Record) -> bool {
         let Record {
@@ -307,11 +325,20 @@ impl Sink {
         Ok(())
     }
 
-    /// Writes `record`, unless one written within the last [`REPEAT_WINDOW_MS`] said the same:
-    /// that copy is counted, and one line with the count follows when the window ends.
+    /// Writes `record`, unless the last record about the same subject, written within the last
+    /// [`REPEAT_WINDOW_MS`], said the same: that copy is counted, and one line with the count
+    /// follows when the window ends. A record that says something else about the subject ends
+    /// its window first, so a state that flips back is written in order, not held.
     pub fn write(&self, record: &Record) {
         let mut repeats = self.repeats.lock().expect("log repeats");
         self.end_windows(&mut repeats, record.ts_ms, false);
+        repeats.retain(|repeat| {
+            if repeat.record.same_subject(record) && !repeat.record.repeats(record) {
+                self.write_count(repeat, record.ts_ms);
+                return false;
+            }
+            true
+        });
         if let Some(repeat) = repeats
             .iter_mut()
             .find(|repeat| repeat.record.repeats(record))
@@ -509,7 +536,7 @@ fn default_filter(quiet_libraries: bool) -> String {
     let libraries = if quiet_libraries {
         "off"
     } else {
-        "warn,iroh::protocol=error,iroh_gossip::net=error"
+        "warn,iroh::protocol=error,iroh_gossip::net=error,iroh_gossip::net::util=warn"
     };
     format!("{libraries},vibeface=info,vibeface_bridge=info")
 }
@@ -842,6 +869,10 @@ fn submitted(source: Source, sender: &str, value: &Value, now_ms: i64) -> Result
     }
     let source_name = serde_json::to_value(source)?;
     let mut fields = input.fields;
+    // Only the Node counts repeats; a sender cannot claim one.
+    for reserved in ["repeated", "first_ms", "last_ms"] {
+        fields.remove(reserved);
+    }
     // A browser's records name the device that authenticated the channel, not one the page claims.
     if source == Source::Web {
         fields.insert("device_id".to_owned(), Value::String(sender.to_owned()));
@@ -1073,10 +1104,16 @@ mod tests {
         let mut browser = wake(4_000);
         browser.source = Source::Web;
         let mut detailed = wake(5_000);
+        detailed.event = "wake.detail".into();
         detailed.fields.insert("error".into(), json!("offline"));
+        let other = |ts_ms, event: &str, message| {
+            let mut record = record(ts_ms, Level::Warn, Source::Node, message);
+            record.event = event.into();
+            record
+        };
         for written in [
             wake(1_000),
-            record(2_000, Level::Warn, Source::Node, "reconcile pending"),
+            other(2_000, "reconcile", "reconcile pending"),
             wake(2_500),
             tagged,
             browser,
@@ -1113,7 +1150,7 @@ mod tests {
         );
 
         // The window ends 60 s after the first line: its three copies are counted in one line.
-        sink.write(&record(61_500, Level::Info, Source::Node, "turn started"));
+        sink.write(&other(61_500, "turn", "turn started"));
         assert_eq!(
             lines()[first.len()..],
             [
@@ -1148,12 +1185,13 @@ mod tests {
         sink.settle(200_000, false);
         assert!(sink.repeats.lock().unwrap().is_empty());
         for index in 0..MAX_REPEATS as i64 + 10 {
-            let distinct = record(
+            let mut distinct = record(
                 300_000 + index,
                 Level::Info,
                 Source::Node,
                 &format!("distinct {index}"),
             );
+            distinct.event = format!("distinct.{index}");
             sink.write(&distinct);
             sink.write(&distinct);
         }
@@ -1169,6 +1207,58 @@ mod tests {
             "the oldest gives way and keeps its count"
         );
         assert_eq!(gave_way[0], "distinct 0");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_sender_cannot_claim_a_repeat_count() {
+        let value = json!({"level":"warn","message":"m","fields":{"repeated":9,"first_ms":1,"last_ms":2,"kept":true}});
+        let record = submitted(Source::Web, "device", &value, 5).unwrap();
+        assert_eq!(
+            record.fields,
+            *json!({"kept":true,"device_id":"device"})
+                .as_object()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_subject_that_flips_back_is_written_in_order() {
+        let dir = scratch("log-flip");
+        let sink = Sink::open(&dir, MAX_FILE_BYTES, 2).unwrap();
+        let peer = |ts_ms, message: &str| {
+            let mut record = record(ts_ms, Level::Info, Source::Node, message);
+            record.event = "peer".into();
+            record
+        };
+        for written in [
+            peer(1_000, "online"),
+            peer(2_000, "online"),
+            peer(3_000, "offline"),
+            peer(4_000, "online"),
+        ] {
+            sink.write(&written);
+        }
+        let lines: Vec<_> = read(&dir, &Filter::default())
+            .unwrap()
+            .into_iter()
+            .map(|record| (record.ts_ms, record.message, record.fields))
+            .collect();
+        let count = json!({"repeated":1,"first_ms":2_000,"last_ms":2_000});
+        assert_eq!(
+            lines,
+            [
+                (1_000, "online".to_owned(), Map::new()),
+                (
+                    3_000,
+                    "online".to_owned(),
+                    count.as_object().unwrap().clone()
+                ),
+                (3_000, "offline".to_owned(), Map::new()),
+                (4_000, "online".to_owned(), Map::new()),
+            ],
+            "the latest state is written when it comes, after the count of the one before"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1207,6 +1297,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             tracing::warn!(target: "iroh::protocol", "Ignoring connection: accepting failed");
             tracing::warn!(target: "iroh_gossip::net", "dial failed: timed out");
+            tracing::warn!(target: "iroh_gossip::net::util", "message too large, dropped");
             tracing::error!(target: "iroh::protocol", "an error stays");
             tracing::warn!(target: "iroh::socket", "another library's warning stays");
             tracing::info!(target: "iroh::socket", "library info was never shown");
@@ -1221,6 +1312,7 @@ mod tests {
         assert_eq!(
             events,
             [
+                "iroh_gossip::net::util",
                 "iroh::protocol",
                 "iroh::socket",
                 "triage.wake_failed",
