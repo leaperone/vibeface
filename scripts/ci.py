@@ -42,7 +42,6 @@ CRATES = {
     "delivery": "vibeface-delivery",
 }
 WEB_UNIT_TEST = re.compile(r"apps/app/src/(?:lib/[^/]+|features/[^/]+/[^/]+)\.test\.ts")
-WEB_E2E_TESTS = tuple(f"tests/e2e/{name}.e2e.ts" for name in ("chat-confidence", "mesh", "onboarding", "transfers", "workspace"))
 PATH_RULES = (
     ("delivery", ("crates/delivery/*", "crates/delivery/proof/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "apps/core/src/delivery/*", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/net/mesh/record.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/verify-delivery-protected.py", "scripts/verify-delivery-restart-observer.py")),
     ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "crates/control/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
@@ -51,7 +50,7 @@ PATH_RULES = (
     ("node", ("config/public-bootstrap.json", "packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts")),
     ("desktop", ("apps/desktop/src/*", "apps/desktop/tests/*")),
     ("mobile", ("apps/mobile/*", "packages/secure-native/*")),
-    ("web", WEB_E2E_TESTS),
+    ("docs", ("tests/e2e/*",)),
     ("web", ("apps/app/*", "packages/client/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
     ("protocol", ("crates/protocol/*",)),
     ("bridge", ("crates/bridge/*",)),
@@ -892,12 +891,12 @@ def concurrency_self_test(workflows):
             assert evaluate(core_group, "delivery-live.yml", {"package_policy": "standard"}, run_id=run_id, attempt=attempt) != proof_first
         assert evaluate(core_group, "delivery-live.yml", proof_policy, run_id=run_id) != evaluate(core_group, "delivery-live.yml", proof_policy, run_id=run_id + 1)
     mobile = workflows["mobile.yml"]
-    assert mobile.startswith("name: CI / Mobile acceptance\n")
+    assert mobile.startswith("name: CI / Mobile builds\n")
     run_name = " ".join(line.strip() for line in mobile.split("run-name: >-\n", 1)[1].split("\n\n", 1)[0].splitlines())
-    for inputs, label in (({"platforms": "android"}, "Android native build"), ({"platforms": "ios"}, "iOS simulator UI"), ({"platforms": "all"}, "Android native build + iOS simulator UI"), ({"android_only": True}, "Android native build")):
-        assert evaluate(run_name, "mobile.yml", inputs) == "Mobile acceptance · workflow_dispatch · main · " + label
-    assert evaluate(run_name, "mobile.yml", {}, event="schedule") == "Mobile acceptance · schedule · main · no platform selected"
-    assert evaluate(run_name, "mobile.yml", {"android_only": True}, event="schedule") == "Mobile acceptance · schedule · main · Android native build"
+    for inputs, label in (({"platforms": "android"}, "Android native build"), ({"platforms": "ios"}, "iOS simulator build"), ({"platforms": "all"}, "Android native build + iOS simulator build"), ({"android_only": True}, "Android native build")):
+        assert evaluate(run_name, "mobile.yml", inputs) == "Mobile builds · workflow_dispatch · main · " + label
+    assert evaluate(run_name, "mobile.yml", {}, event="schedule") == "Mobile builds · schedule · main · no platform selected"
+    assert evaluate(run_name, "mobile.yml", {"android_only": True}, event="schedule") == "Mobile builds · schedule · main · Android native build"
     print("Concurrency controls passed: first-attempt deduplication, isolated old reruns, independent modes, protected Live/Core proof runs and non-cancelling Core schedules/merge groups")
 
 
@@ -966,7 +965,7 @@ def workflow_contract_self_test():
     for command in ("atlas migrate validate", "scripts/check-delivery.py --self-test", "scripts/check-delivery.py --check-fixtures", "scripts/check-delivery.py", "cargo fmt --all", "pnpm --filter vibeface-web test", "pnpm --filter @vibeface/client test"):
         assert command in core, command
     package = block("ci.yml", "package")
-    for command in ("--web-only", "--delivery-charity", "pnpm test:e2e", "--phase1", "--artifacts .artifacts/ci-multi-node", "--chat-agent", "--phase4", "--public-node", "--mesh", "--phase5", "Verify Developer ID signature", "Verify checksum and unpacked source identity"):
+    for command in ("--web-only", "--delivery-charity", "--phase1", "--artifacts .artifacts/ci-multi-node", "--chat-agent", "--phase4", "--public-node", "--mesh", "--phase5", "Verify Developer ID signature", "Verify checksum and unpacked source identity"):
         assert command in package, command
     for job in ("npm-package", "npm-smoke"):
         assert "needs.plan.outputs.npm == 'true'" in block("ci.yml", job)
@@ -975,7 +974,7 @@ def workflow_contract_self_test():
     assert "scripts/ci.py check --packages" in windows and "scripts/ci.py test --tier fast --packages" in windows
     assert "scripts/verify-windows-node.py --package" in windows and "if: inputs.package_artifact != ''" in windows
     assert "scripts/verify-windows-node.py --package" in workflows["ci-desktop.yml"]
-    assert "pnpm exec e2e run --config tests/e2e/e2e.native-desktop.config.ts" in workflows["ci-desktop.yml"]
+    assert "e2e" not in workflows["ci-desktop.yml"] and "e2e" not in block("ci.yml", "package")
     assert "cargo test -p vibeface-desktop --features native-ui-tests --locked" in block("ci.yml", "desktop-check")
     assert "cargo clippy -p vibeface-desktop --all-targets --features native-ui-tests --locked -- -D warnings" in block("ci.yml", "desktop-check")
     for setting in ("CARGO_PROFILE_TEST_OPT_LEVEL: '1'", "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'", "CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'"):
@@ -1064,9 +1063,9 @@ def focused_self_test():
     for path in [*root.glob("apps/app/src/lib/*.test.ts"), *root.glob("apps/app/src/features/*/*.test.ts")]:
         plan = make_plan([path.relative_to(root).as_posix()])
         assert plan["required_jobs"] == unit_jobs and not plan["docs_only"]
-    for path in WEB_E2E_TESTS:
-        assert make_plan([path])["required_jobs"] == ["quick-check", "crypto-web", "web", "package"]
-    for path in ("tests/e2e/workspace.native.ts", "tests/e2e/fixtures.ts", "tests/e2e/e2e.config.ts", "tests/e2e/paid-native-transfers.paid.ts", "apps/app/src/lib/nested/new.test.ts", "apps/app/src/lib/new.test.tsx"):
+    for path in ("tests/e2e/onboarding.e2e.ts", "tests/e2e/fixtures.ts", "tests/e2e/e2e.native.config.ts"):
+        assert make_plan([path])["docs_only"], path
+    for path in ("apps/app/src/lib/nested/new.test.ts", "apps/app/src/lib/new.test.tsx"):
         assert make_plan([path])["full"], path
     assert make_plan(["apps/app/src/lib/markdown.test.ts", "apps/core/src/api.rs"])["rust_packages"] == ["vibeface-core"]
     assert "web-tests" not in make_plan(["apps/app/src/lib/markdown.test.ts", "apps/app/src/lib/markdown.ts"])["required_jobs"]

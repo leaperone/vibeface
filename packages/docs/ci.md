@@ -20,7 +20,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | `ci-windows.yml` | CI / Windows native | 手动 | 只检查当前源码的 Windows Rust |
 | `ci-native-diagnostics.yml` | CI / Native diagnostics | 手动 | compiler 四包编译、可选受控回归/frame/bench 或明确来源的安装器诊断，不发布 |
 | `ci-mobile-device.yml` | CI / Mobile device builds | 手动 | `platforms=ios\|android\|both` 构建设备归档或 APK，不发布 |
-| `mobile.yml` | CI / Mobile acceptance | 手动、复用调用 | Android 原生构建与 iOS 模拟器 UI；不含 Android 模拟器 UI 验收 |
+| `mobile.yml` | CI / Mobile builds | 手动、复用调用 | Android 原生构建与 iOS 模拟器 app 构建；不运行界面测试 |
 | `delivery-small.yml` | Delivery / Small proof | 手动 | 四关系真实证明、公开分项续用与结算实验 |
 | `delivery-live.yml` | Delivery / Live native proof | 手动 | Linux native Core 检查后，生成五份 fresh proof 并验收真实交付 |
 | `hourly.yml` | Release / Hourly | 每小时、手动 | 为最新 CI 通过的 main 提交创建当小时 Hourly Tag 并派发产品发布；不运行 Core 检查 |
@@ -54,7 +54,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | `apps/www/`、`packages/docs/` | 门户类型检查、静态构建和产物检查，不运行 Rust 测试 |
 | `apps/app/`、Web 构建脚本 | 浏览器密码学互通、Web 测试与类型检查、静态构建、Linux x64 完整包及网页进程验收 |
 | `apps/app/src/lib/*.test.ts`、`apps/app/src/features/*/*.test.ts`，限定单层目录 | 浏览器密码学互通和独立 `web-tests`，不组包或构建静态页面 |
-| 五个默认浏览器 E2E：chat-confidence、mesh、onboarding、transfers、workspace | Web 构建与真实 Linux 包 E2E，不额外选无关的 Rust workspace 测试或 proof |
+| `tests/e2e/` | 不选任何构建或测试；e2e 不在 CI 中运行，只在本地按 [e2e](e2e.md) 执行 |
 | `apps/desktop/src/`、`apps/desktop/tests/` | Linux 上的原生 GPUI Rust 测试与 Clippy；真实窗口留在显式平台验收 |
 | `apps/mobile/`、`packages/secure-native/` | 独立的 Mobile 与 secure-native 类型检查，同时保留 Web 套件中的手机行为测试 |
 | `packages/client/`、共享主题 | Web 和 Mobile 检查；主题另运行门户检查 |
@@ -71,7 +71,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 `desktop-check` 在 Linux 上运行原生 Desktop 的 Cargo 测试与 Clippy，使用 Rust 1.98.1 和 hosted runner 系统库，不替代手动平台窗口验收。桌面安装配置、打包脚本及尚未分类的路径继续选择全工作区检查。
 
-`web-tests` 执行与 Web 构建相同的 Web、共享 Client 行为测试及类型检查，下载并核对本提交的密码学产物。仍安装 Mobile 测试依赖。只有变更全部落在现有单测命令覆盖的路径时，才省去静态构建和组包；同时修改生产源码时由完整 Web job 承担这些检查，不重复运行测试 job。更深层测试、TSX 测试、原生或付费 E2E、公共 fixture 和 E2E 配置保持保守回退。原生 workspace 的手动验收要求保持不变，不把类型检查算作原生行为验收。
+`web-tests` 执行与 Web 构建相同的 Web、共享 Client 行为测试及类型检查，下载并核对本提交的密码学产物。仍安装 Mobile 测试依赖。只有变更全部落在现有单测命令覆盖的路径时，才省去静态构建和组包；同时修改生产源码时由完整 Web job 承担这些检查，不重复运行测试 job。更深层测试、TSX 测试和公共 fixture 保持保守回退。原生 workspace 的手动验收要求保持不变，不把类型检查算作原生行为验收。
 
 `mobile-check` 独立运行共享 Client、secure-native 和 Mobile 类型检查，`ci-gate` 要求它与选中的其他任务都成功。Web 构建脚本不再执行这两项原生类型检查；Web 套件仍包含手机行为测试，并读取手机依赖中的实现，所以暂时保留 Mobile 安装过滤器。移动这些行为测试前，不移除这部分依赖或手机变更对应的 Web 检查。全量事件和未知范围回退同时包含 Mobile、桌面源码检查。
 
@@ -85,7 +85,7 @@ Web 路径优先于 Node 路径，只有 `packages/client/src/avatar/face.ts` �
 
 Linux 制品核对 checksum、源码提交、版本、target、WASM 和存储 epoch，再以 `verify-node.py --web-only` 启动真实进程，检查网页资源、SPA 路由、CSP、缓存与 404。它不执行多 Node 业务验收，也不验证浏览器渲染。
 
-Linux 制品还使用 [e2e](e2e.md) 启动隔离 Node，在 Chromium 中验证建网页面以及建网、下载恢复文件、跳过 AI 设置、创建 Bot 和刷新后保留的流程。它不调用真实模型。CI 上传浏览器测试报告，排除下载的恢复文件和 Node 数据。
+CI 不运行浏览器、桌面窗口或 iOS 模拟器 e2e，也不做截图类视觉验收。需要界面证据时按 [e2e](e2e.md) 在本地运行。
 
 ## 可验证交付的核心检查
 
@@ -164,7 +164,7 @@ prepare-only 仍执行上述构建、受控 Ganache 重建、四关系 execute �
 
 `delivery-live.yml` 仅在显式手动 workflow_dispatch 时执行，没有额外开关。该 job 使用 `ubuntu-24.04` 原生 x86 runner，先核对宿主 Linux/x86_64，再使用 `run-delivery-live.py --protected-package <same-run-linux-package> --source-commit <HEAD>`。容器内生成 `0600` 最终配置，由入口监督两个同级子进程：native 经既有 `--protected-config` 调用 verify-node 的 `delivery_protected_acceptance` helper，另一个运行 tracked restart observer。它依赖同 run、同 SHA 的 package/crypto/web 检查，不启动旧专属 Android、KVM 或录像前置。独立 Live gate 要求 Core 和真实证明 job 均成功；任何失败都不能忽略。容器的 amd64 目标不能独自证明宿主没有使用 emulation。
 
-Live 通过复用 Core 的内部 `package_policy=linux-native` 选择 native-only 实验：package matrix 只含 Linux x86_64，保留该平台上 `package_mode=node` 的制品、真实进程与 Chromium 验收（只在 macOS ARM64 包上运行的 `--chat-agent` 和 `--phase5` 不执行），以及 Rust 快慢组、MSRV、delivery、crypto 和 Web 检查。Linux Mobile/Desktop 源码检查照常执行。非 Linux 包、npm、托管的 Mac/Windows 桌面窗口及 Windows native 验收未选，其跳过不代表这些平台已验收。普通 Core 与产品 Tag 继续使用各自的完整检查范围。计划摘要列出实际 target 和未选范围。
+Live 通过复用 Core 的内部 `package_policy=linux-native` 选择 native-only 实验：package matrix 只含 Linux x86_64，保留该平台上 `package_mode=node` 的制品、真实进程验收（只在 macOS ARM64 包上运行的 `--chat-agent` 和 `--phase5` 不执行），以及 Rust 快慢组、MSRV、delivery、crypto 和 Web 检查。Linux Mobile/Desktop 源码检查照常执行。非 Linux 包、npm、托管的 Mac/Windows 桌面窗口及 Windows native 验收未选，其跳过不代表这些平台已验收。普通 Core 与产品 Tag 继续使用各自的完整检查范围。计划摘要列出实际 target 和未选范围。
 
 Live 等待同一次运行的 Core 成功，再从其输出的精确 SHA 下载 Linux package、crypto 和 Web 制品。失败、取消或缺少 Linux 包不能启动证明，整体取消后也不启动新证明。各用途使用独立入口。
 
@@ -325,7 +325,7 @@ Node 之间的传输、同步、地址簿、跨入口转发和投递改动跑默
 
 写入闸门、对齐、分叉、日志、`status` 与诊断导出改动跑 `--phase5`。A、B 两台 Node：A 从备份恢复后对齐前拒绝写入、对齐后无分叉；B 离线时 A 只读，用户确认后才写；复制的数据目录在 B 处分叉后只有副本停写并列出冲突，原 A 与 B 继续写；同时检查 `status` 的对端连通与上次同步、`node.log` 权限与内容、诊断包和日志里没有能力、口令或邀请。
 
-CI 固定的 Chromium 用例覆盖指定 Web 流程；任务特定的页面验收、其他浏览器渲染、真正模型调用、实体设备授权、实际公网 NAT 与用户后台服务安装需单独按任务验收，不属于 CI 的通过声明。
+CI 不运行界面用例；页面验收、其他浏览器渲染、真正模型调用、实体设备授权、实际公网 NAT 与用户后台服务安装需单独按任务验收，不属于 CI 的通过声明。
 
 Rust 快、慢组在计划生成后直接开始，Clippy 另等待静态快检。它们不等待或下载 Web 构建产物。制品任务继续等待 Web 和密码学资源，并执行原有的源码身份、真实进程和浏览器验收。
 
@@ -335,7 +335,7 @@ Core 的 concurrency group 包含调用方 workflow、事件、Git ref 和 packa
 
 Small 使用跨 ref 的 `ci-delivery-small` 串行组，不取消正在执行的实验。Live 及其调用的 `linux-native` Core 均按 `run_id` 隔离且不自动取消，保留昂贵实验的显式独立运行。Hourly 协调器、产品发布与部署分别遵守自己的并发规则；Hourly 协调器使用全局 `hourly-release` 串行组。
 
-Linux x64 制品任务使用 pnpm 缓存，并按 runner、架构和 `pnpm-lock.yaml` 缓存 Chromium 二进制。浏览器的系统依赖从 Ubuntu 官方镜像下载，沿用签名仓库配置。每次仍执行冻结依赖安装、浏览器与系统依赖安装以及完整浏览器用例。缓存只包含浏览器文件，不包含测试结果、Node 数据或下载的恢复文件。
+Linux x64 制品任务使用 pnpm 缓存。
 
 `ci` 工作流中的 Rust 缓存仅在 `refs/heads/main` 或显式 `workflow_dispatch` 时保存。手动运行可为相同 ref 的后续运行预热。新增 profile 或缓存 key 在首次保存前需要冷构建。产品或官网 Tag 使用独立发布工作流，不属于本节缓存保存规则。
 
@@ -358,7 +358,7 @@ GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate`
 
 ## 桌面专项验收
 
-在开发分支手动运行 `ci-desktop-acceptance.yml`，选择默认的 `intent=desktop-only`。共享密码学与 Web 输入构建后，Mac ARM64、Windows x64、Linux x64 和 Linux ARM64 各自编译、组包并驱动真实 GPUI 窗口，一端不等待另一端的原生构建或测试。独立的 `windows-platform` 按 Core、Bridge 和 CLI 并行执行 MSVC Clippy 和 Windows Rust 测试，一组失败不会中止其他组。Linux 用例在 Xvfb 中启动实际 AppImage 解包后的 App。最终 `desktop-gate` 要求所有这些任务成功。
+在开发分支手动运行 `ci-desktop-acceptance.yml`，选择默认的 `intent=desktop-only`。共享密码学与 Web 输入构建后，Mac ARM64、Windows x64、Linux x64 和 Linux ARM64 各自编译、组包并运行原生功能测试，一端不等待另一端的原生构建或测试。独立的 `windows-platform` 按 Core、Bridge 和 CLI 并行执行 MSVC Clippy 和 Windows Rust 测试，一组失败不会中止其他组。最终 `desktop-gate` 要求所有这些任务成功。
 
 ```sh
 	gh workflow run ci-desktop-acceptance.yml --repo leaperone/vibeface --ref <branch> -f intent=desktop-only
@@ -368,7 +368,7 @@ GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate`
 
 只定位 Windows Rust 问题时，运行 `ci-windows.yml`。这条路径不启动桌面构建，其 `windows-gate` 只表示原生 Windows Rust 检查通过，不代表完整桌面验收。 Windows bridge 组包含 Protocol、Bridge、Secure、Rust Client 和 Control 的实际 Clippy 与测试；共享 SDK 不因已有窗口结果而跳过。
 
-桌面测试通过现有 e2e runner 的 `tests/e2e/e2e.native-desktop.config.ts` 注册为 tools-only 原生目标，helper 调用 `scripts/e2e-desktop.mjs` 启动打包后的原生程序。独立 profile 与显式受控夹具模式隔离真实数据，按 PID 定位真实 OS 窗口，发送原生键盘输入与 Enter，保存窗口 PNG，再核对 GPUI 输入、焦点与动作回执、正常退出和没有自动启动 Node。Cargo 原生功能测试覆盖业务状态与本机生命周期；窗口驱动不宣称完成 IME、无障碍或完整业务矩阵验收。Windows 另核对真实 SID/DACL、维护通道、Unicode 路径、Provider 子进程和当前用户服务。所有 Provider 均为受控夹具，不调用真实模型。
+本地桌面窗口测试通过现有 e2e runner 的 `tests/e2e/e2e.native-desktop.config.ts` 注册为 tools-only 原生目标，helper 调用 `scripts/e2e-desktop.mjs` 启动打包后的原生程序。独立 profile 与显式受控夹具模式隔离真实数据，按 PID 定位真实 OS 窗口，发送原生键盘输入与 Enter，保存窗口 PNG，再核对 GPUI 输入、焦点与动作回执、正常退出和没有自动启动 Node。Cargo 原生功能测试覆盖业务状态与本机生命周期；窗口驱动不宣称完成 IME、无障碍或完整业务矩阵验收。Windows 另核对真实 SID/DACL、维护通道、Unicode 路径、Provider 子进程和当前用户服务。所有 Provider 均为受控夹具，不调用真实模型。
 
 离线文档使用 `scripts/offline-docs.json` 作为唯一清单；`offline-docs.py` 由 compose、POSIX 和 Windows 组包入口共同调用，复制所有已跟踪公开文档并改写相对链接。测试检查最终组装目录中的本地链接闭包，源码引用固定到本次完整提交。
 
@@ -403,7 +403,7 @@ GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate`
 
 修改会话分页时，至少核对 `crates/protocol/src/history.rs` 的 19 分区与所有客户端解析器一致，并执行 Core 的 `conversation_history`、`conversation_sections`、`conversation_settings`、`scheduler_history` 专项，原生 `native_ui_history` 和共享 Client 的 history 测试。需要覆盖空页继续游标、字节预算、稳定身份去重、同一连接刷新时保留已加载旧页、重连或连接代次变化后清空旧投影、完整替换后的删除、治理/分叉/owner 失效，以及网络或会话切换后的晚到响应。源码有测试不等于该 HEAD 已执行通过。
 
-最终已提交 HEAD 再运行 `ci-desktop-acceptance.yml` 的 `intent=desktop-only`，核对四个目标实际源码 SHA、原生二进制架构、DMG/AppImage/ZIP 一致性、Windows 当前用户安装与卸载、OS 窗口输入及 PNG。正式签名、公证、IME、无障碍、通知送达、全部业务操作和同数据性能比较分别记录。该手动 CI 只生成 Actions 制品；不要为验收创建 Tag、公开 Release、部署或安装到用户的日常环境。
+最终已提交 HEAD 再运行 `ci-desktop-acceptance.yml` 的 `intent=desktop-only`，核对四个目标实际源码 SHA、原生二进制架构、DMG/AppImage/ZIP 一致性和 Windows 当前用户安装与卸载。正式签名、公证、IME、无障碍、通知送达、全部业务操作和同数据性能比较分别记录。该手动 CI 只生成 Actions 制品；不要为验收创建 Tag、公开 Release、部署或安装到用户的日常环境。
 
 ## 移动端专项验收
 
@@ -412,4 +412,4 @@ gh workflow run ci-mobile-device.yml --ref <branch> -f platforms=both
 gh workflow run mobile.yml --ref <branch> -f platforms=ios
 ```
 
-原生移动端构建使用 `ci-mobile-device.yml` 的 `platforms=ios|android|both`。`both` 让两个系统并行构建，`mobile-gate` 只验收选中的系统。iOS 设备归档验证不等同于模拟器界面或真机安装验收；`mobile.yml` 的 `platforms=all|android|ios` 选择 Android 原生构建或 iOS 模拟器界面测试，不包含 Android 模拟器 UI 验收。同 ref、同平台的首次手动运行会取消旧运行，重跑按前文规则隔离。缺少 iOS 分发身份时，未签名设备归档的收据必须保留不可安装状态。 iOS 模拟器 app 按输入缓存：键包含 runner 镜像版本、rustc 版本和 `apps/mobile`、`packages`、`crates`、`config`、根 `package.json`、`pnpm-workspace.yaml`、lock 文件及 `build-mobile-secure.sh`、`release-rustflags.py` 和 `.github/workflows/mobile.yml` 的摘要（不含 `packages/docs`），以及 Node 版本；构建后工作树必须干净才写缓存，命中时跳过安全库和 Xcode 构建，仍核对 entitlements。专用模拟器在主机构建前由 simslim v0.14.0 开机并精简：关闭小组件、Spotlight、Siri、健康、家庭、新闻地图、遥测、邮件日历和信息类后台服务，保留相册、推送、钥匙串、链接、互联和资源服务，让首启负载与主机构建重叠；runner 的 Spotlight 索引同时关闭。从安装 simslim 前起，`scripts/ci-runner-load.sh` 每 10 秒记录负载、空闲与压缩内存、swap 和最忙的进程名，结束时打印到日志，用于区分模拟器慢和宿主资源不足。
+原生移动端构建使用 `ci-mobile-device.yml` 的 `platforms=ios|android|both`。`both` 让两个系统并行构建，`mobile-gate` 只验收选中的系统。iOS 设备归档验证不等同于模拟器界面或真机安装验收；`mobile.yml` 的 `platforms=all|android|ios` 选择 Android 原生构建或 iOS 模拟器 app 构建，不运行界面测试。同 ref、同平台的首次手动运行会取消旧运行，重跑按前文规则隔离。缺少 iOS 分发身份时，未签名设备归档的收据必须保留不可安装状态。 iOS 模拟器 app 按输入缓存：键包含 runner 镜像版本、rustc 版本和 `apps/mobile`、`packages`、`crates`、`config`、根 `package.json`、`pnpm-workspace.yaml`、lock 文件及 `build-mobile-secure.sh`、`release-rustflags.py` 和 `.github/workflows/mobile.yml` 的摘要（不含 `packages/docs`），以及 Node 版本；构建后工作树必须干净才写缓存，命中时跳过安全库和 Xcode 构建，仍核对 entitlements。专用模拟器在主机构建前由 simslim v0.14.0 开机并精简：关闭小组件、Spotlight、Siri、健康、家庭、新闻地图、遥测、邮件日历和信息类后台服务，保留相册、推送、钥匙串、链接、互联和资源服务，让首启负载与主机构建重叠；runner 的 Spotlight 索引同时关闭。从安装 simslim 前起，`scripts/ci-runner-load.sh` 每 10 秒记录负载、空闲与压缩内存、swap 和最忙的进程名，结束时打印到日志，用于区分模拟器慢和宿主资源不足。
