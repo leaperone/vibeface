@@ -601,7 +601,7 @@ JSON
   [[ $(select_release "$fixture/fields" stable) == v1.10.0 ]] || fail 'self-test: Stable numeric sorting or channel isolation'
   [[ $(select_release "$fixture/fields" nightly) == v0.0.1-nightly.20261017.10 ]] || fail 'self-test: Nightly numeric sorting or channel isolation'
   local bad_ref
-  for bad_ref in refs/heads/v1.0.0 refs/abcdev1.0.0 'refs/tags/v1.0.0$(id)' refs/tags/../v1.0.0 refs/tags/v1.0.0/x; do
+  for bad_ref in refs/heads/v1.0.0 refs/abcdev1.0.0 'refs/tags/v1.0.0;id' refs/tags/../v1.0.0 refs/tags/v1.0.0/x; do
     printf '[{"ref":"%s"}]\n' "$bad_ref" > "$fixture/bad-refs.json"
     if json_fields "$fixture/bad-refs.json" refs > /dev/null; then fail "self-test: accepted tag ref $bad_ref"; fi
   done
