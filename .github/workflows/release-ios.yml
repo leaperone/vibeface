@@ -110,4 +110,3 @@ jobs:
             .artifacts/ios/*.ipa.provenance.json
             .artifacts/ios/release.json
           if-no-files-found: error
-          retention-days: 14
