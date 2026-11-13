@@ -650,8 +650,11 @@ impl Inner {
 
     /// Sleeps `seconds` unless the target changes first; `true` means it changed.
     async fn wait(&self, seconds: u64) -> bool {
+        if self.stopping() {
+            return true;
+        }
         tokio::select! {
-            () = tokio::time::sleep(Duration::from_secs(seconds)) => false,
+            () = tokio::time::sleep(Duration::from_secs(seconds)) => self.stopping(),
             () = self.changed.notified() => true,
         }
     }
