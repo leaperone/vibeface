@@ -48,7 +48,6 @@ vibeface-protocol.workspace = true
 vibeface-bridge.workspace = true
 vibeface-control.workspace = true
 vibeface-secure = { path = "../../crates/secure" }
-vibeface-secure-ffi = { path = "../../crates/secure-ffi" }
 vibeface-delivery = { path = "../../crates/delivery" }
 zeroize = { version = "1", features = ["derive"] }
 

@@ -1,5 +1,5 @@
 //! App-private durable Node provisioning. This command is intentionally hidden from the public
-//! CLI surface; the Electron main process is its only caller.
+//! CLI surface; the native desktop host is its only caller.
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Subcommand};
 use semver::Version;
@@ -52,7 +52,7 @@ fn public_failure(error: anyhow::Error) -> anyhow::Error {
 
 #[derive(Args)]
 pub struct DesktopNode {
-    /// Absolute Electron profile directory trusted by the App.
+    /// Absolute desktop profile directory trusted by the App.
     #[arg(long, value_parser = absolute_path)]
     profile_dir: PathBuf,
     /// Existing Node identity to preserve. Required for every mutation.
@@ -173,26 +173,6 @@ fn canonical_profile(path: &Path) -> Result<PathBuf> {
         "Desktop profile directory must be a private directory owned by this account"
     );
     Ok(profile)
-}
-
-/// Runs before Chromium and preferences use the App-owned directory, without creating a Node.
-pub(crate) fn prepare_profile(path: &Path) -> Result<()> {
-    ensure!(path.is_absolute(), "Desktop profile path must be absolute");
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => ensure!(
-            metadata.is_dir() && !metadata.file_type().is_symlink(),
-            "Desktop profile must be a real directory"
-        ),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir_all(path)?,
-        Err(error) => return Err(error.into()),
-    }
-    ensure!(
-        privatefs::owner_of(path)? == privatefs::current_account()?,
-        "Desktop profile belongs to another account"
-    );
-    privatefs::restrict_dir(path)?;
-    canonical_profile(path)?;
-    Ok(())
 }
 
 fn data_dir(profile: &Path) -> Result<PathBuf> {
@@ -1312,38 +1292,21 @@ mod tests {
     }
 
     #[test]
-    fn profile_preparation_is_private_idempotent_and_creates_no_node() {
+    fn canonical_profile_rejects_a_non_private_directory() {
         let root = temp("profile-permissions");
         let profile = root.join("Desktop 数据");
         fs::create_dir(&profile).unwrap();
-        fs::write(
-            profile.join("preferences.json"),
-            b"keep existing preferences",
-        )
-        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             fs::set_permissions(&profile, fs::Permissions::from_mode(0o755)).unwrap();
             assert!(canonical_profile(&profile).is_err());
         }
-        for _ in 0..2 {
-            prepare_profile(&profile).unwrap();
-            assert!(privatefs::is_private(&profile).unwrap());
-            assert_eq!(
-                fs::read(profile.join("preferences.json")).unwrap(),
-                b"keep existing preferences"
-            );
-            assert!(!profile.join("node").exists());
-        }
-        let fresh = root.join("fresh");
-        prepare_profile(&fresh).unwrap();
-        assert!(privatefs::is_private(&fresh).unwrap());
-        assert!(fs::read_dir(&fresh).unwrap().next().is_none());
-        let file = root.join("not-a-profile");
-        fs::write(&file, b"preserve").unwrap();
-        assert!(prepare_profile(&file).is_err());
-        assert_eq!(fs::read(file).unwrap(), b"preserve");
+        privatefs::restrict_dir(&profile).unwrap();
+        assert_eq!(
+            canonical_profile(&profile).unwrap(),
+            fs::canonicalize(&profile).unwrap()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
