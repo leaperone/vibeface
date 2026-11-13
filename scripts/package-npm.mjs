@@ -28,8 +28,15 @@ const updateProtocol = Number(/pub const UPDATE_PROTOCOL: u32 = (\d+);/.exec(con
 const dataEpoch = Number(/pub const DATA_EPOCH: u32 = (\d+);/.exec(control)?.[1]);
 assert(Number.isSafeInteger(updateProtocol) && Number.isSafeInteger(dataEpoch), 'missing release protocol constants');
 
+// The npm package carries all four platform bundles, so it grows four times as fast as one of
+// them. These bounds only stop a corrupt archive; collect fails on them and blocks the whole
+// product release, so they stay far above the real package (175 MB packed and 492 MB unpacked in
+// November 2026).
+const MAX_PACKED = 1024 * 1024 * 1024;
+const MAX_UNPACKED = 2 * 1024 * 1024 * 1024;
+
 function verifyTarMetadata(compressed) {
-  const bytes = gunzipSync(compressed, { maxOutputLength: 512 * 1024 * 1024 });
+  const bytes = gunzipSync(compressed, { maxOutputLength: MAX_UNPACKED });
   const text = (header, start, length) => header.subarray(start, start + length).toString('utf8').replace(/\0.*$/s, '').trim();
   for (let offset = 0; offset + 512 <= bytes.length;) {
     const header = bytes.subarray(offset, offset + 512);
@@ -61,8 +68,8 @@ function nightly(version) {
 }
 
 function unpack(archive, destination, root) {
-  assert(fs.statSync(archive).size <= 384 * 1024 * 1024, 'compressed package is too large');
-  gunzipSync(fs.readFileSync(archive), { maxOutputLength: 512 * 1024 * 1024 });
+  assert(fs.statSync(archive).size <= MAX_PACKED, 'compressed package is too large');
+  gunzipSync(fs.readFileSync(archive), { maxOutputLength: MAX_UNPACKED });
   const entries = run('tar', ['-tzf', archive]).trimEnd().split('\n').map(entry => entry.replace(/\/$/, ''));
   assert(entries.length > 0 && entries.length <= 4096, 'invalid archive entry count');
   assert.equal(new Set(entries).size, entries.length, 'duplicate archive paths');

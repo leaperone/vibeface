@@ -156,7 +156,7 @@ gh workflow run release-www.yml --ref <branch> -F publish=false
 
 npm Nightly 的制品与发布流程见下面的 npm 章节。npm 安装由 npm 更新，不使用本节的 Rust 自更新器。
 
-Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，不使用 Actions 的临时制品。Stable 只选择 `vX.Y.Z` 正式版，Nightly 只选择 `vX.Y.Z-nightly.YYYYMMDD.N` 预发布；两者都不选择 rc。新版更新器跳过缺少完整 `release.json` 的构建中 Release，再比较数值版本，不按 Release 创建时间或字符串排序，不自动降级。已安装旧客户端可能先消费自己平台已经齐备的完整包与校验文件；目标不齐时失败并保留现版。尚无正式版时，Stable 报告没有匹配版本，不回退到 Nightly。
+Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，不使用 Actions 的临时制品。Stable 只选择 `vX.Y.Z` 正式版，Nightly 只选择 `vX.Y.Z-nightly.YYYYMMDD.N` 预发布；两者都不选择 rc。新版更新器跳过缺少完整 `release.json` 的构建中 Release，再比较数值版本，不按 Release 创建时间或字符串排序，不自动降级。完整 Release 列表随每个版本的数十个附件增长，更新器不下载它：先用一次请求读取全部 `v` tag 引用，按数值版本排出本渠道中比当前版本新的 tag，再从新到旧逐个查询这些 Release，草稿或尚未创建 Release 的 tag 返回 404 并跳过。最多查询 16 个候选，都不完整时报错，不当作没有更新。已安装旧客户端可能先消费自己平台已经齐备的完整包与校验文件；目标不齐时失败并保留现版。尚无正式版时，Stable 报告没有匹配版本，不回退到 Nightly。
 
 更新确认提交后，安装目录保留当前包与最近一次 journal 的 previous。清理只处理同一 Node 曾确认提交、内容摘要未改变且不再引用的旧包，并保护正在执行的 CLI 包。未知目录、未提交候选、残留 staging、其他 Node 的记录和含链接的包均保留；失败或中断且 journal 尚在时不清理。
 
@@ -172,7 +172,7 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 
 ## 首次安装
 
-公开安装入口为仓库根 `install.sh`。默认选择最新 Stable，显式 `--channel nightly` 选择最新 Nightly；按数值版本比较，忽略 rc、draft 和缺少完整清单的构建中版本，不使用 `/releases/latest` 获取 Nightly。如果尚无正式版，Stable 安装会明确失败。命令和后续 CLI 管理见 [安装说明](install.md)。
+公开安装入口为仓库根 `install.sh`。默认选择最新 Stable，显式 `--channel nightly` 选择最新 Nightly；按数值版本比较，忽略 rc、draft 和缺少完整清单的构建中版本，不使用 `/releases/latest` 获取 Nightly。候选来源与更新器相同：读取 tag 引用后从新到旧逐个查询 Release，最多 16 个，不下载完整 Release 列表。如果尚无正式版，Stable 安装会明确失败。命令和后续 CLI 管理见 [安装说明](install.md)。
 
 安装器只依赖 Bash、curl、tar、gzip、系统文本工具及 `sha256sum` 或 `shasum`，不需要 jq、Python、Node.js 或 Rust。它解析公开 Releases 和 tag 对应的源码提交，下载完整包与准确同名的 SHA256，校验版本、target、源码身份、协议和 data epoch，并拒绝危险包路径、符号链接和特殊文件。校验通过后建立 `releases/<version>`、`current` 与用户 bin 链接，不覆盖已有安装、身份或服务。
 

@@ -1176,12 +1176,21 @@ mod tests {
 
     #[test]
     fn recovery_review_needs_no_replacement_file_and_keeps_selection_explicit() -> Result<()> {
+        // Recovery files must be absolute; `/tmp/...` is not absolute on Windows.
+        let original = std::env::temp_dir()
+            .join("original.json")
+            .display()
+            .to_string();
+        let replacement = std::env::temp_dir()
+            .join("replacement.json")
+            .display()
+            .to_string();
         let Command::Client(options) = parse(&[
             "client",
             "recover",
             "--review",
             "--recovery-file",
-            "/tmp/original.json",
+            &original,
         ])?
         else {
             anyhow::bail!("expected client recovery")
@@ -1198,14 +1207,14 @@ mod tests {
         assert!(review);
         assert_eq!(new_recovery_file, None);
         assert_eq!(members, None);
-        assert!(parse(&["client", "recover", "--recovery-file", "/tmp/original.json"]).is_err());
+        assert!(parse(&["client", "recover", "--recovery-file", &original]).is_err());
         assert!(
             parse(&[
                 "client",
                 "recover",
                 "--review",
                 "--recovery-file",
-                "/tmp/original.json",
+                &original,
                 "--members",
                 "[]"
             ])
@@ -1215,9 +1224,9 @@ mod tests {
             "client",
             "recover",
             "--recovery-file",
-            "/tmp/original.json",
+            &original,
             "--new-recovery-file",
-            "/tmp/replacement.json",
+            &replacement,
             "--members",
             "[]",
         ])?
