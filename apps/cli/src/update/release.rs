@@ -18,7 +18,8 @@ use vibeface_bridge::platform::privatefs;
 use vibeface_control::{DATA_EPOCH, UPDATE_PROTOCOL};
 
 const API: &str = "https://api.github.com/repos/leaperone/vibeface";
-const MAX_PAGES: usize = 20;
+/// Releases fetched one by one, newest first, before discovery gives up on finding a complete one.
+const MAX_CANDIDATES: usize = 16;
 const MAX_JSON: u64 = 4 * 1024 * 1024;
 const MAX_ARCHIVE: u64 = 128 * 1024 * 1024;
 const MAX_UNPACKED: u64 = 512 * 1024 * 1024;
@@ -83,39 +84,59 @@ struct ObjectResponse {
     object: GitObject,
 }
 
+#[derive(Deserialize)]
+struct TagRef {
+    #[serde(rename = "ref")]
+    name: String,
+}
+
 /// Find a newer official release in the selected channel without running providers.
+///
+/// Every product release attaches dozens of assets, so the full release listing outgrows any
+/// response limit. Tag refs stay small: list them, order the channel's tags by version and fetch
+/// only the newer releases, newest first, until one is complete.
 pub async fn check(channel: Channel) -> Result<Option<Release>> {
     let client = client()?;
     let current = Version::parse(env!("CARGO_PKG_VERSION"))?;
-    let mut candidates: Vec<(Version, GithubRelease)> = Vec::new();
-    for page in 1..=MAX_PAGES {
-        let releases: Vec<GithubRelease> =
-            get_json(&client, &format!("{API}/releases?per_page=100&page={page}")).await?;
-        let complete = releases.len() < 100;
-        for release in releases {
-            let Some(version) = channel_version(&release.tag_name, channel) else {
-                continue;
-            };
-            if release.draft
-                || release.prerelease != (channel == Channel::Nightly)
-                || version <= current
-            {
-                continue;
-            }
-            candidates.push((version, release));
+    let refs: Vec<TagRef> = get_json(&client, &format!("{API}/git/matching-refs/tags/v")).await?;
+    let candidates = candidate_tags(&refs, channel, &current);
+    let bounded = candidates.len() > MAX_CANDIDATES;
+    for (version, tag) in candidates.into_iter().take(MAX_CANDIDATES) {
+        // Drafts and tags whose release has not been created yet answer 404.
+        let Some(release) =
+            get_optional_json::<GithubRelease>(&client, &format!("{API}/releases/tags/{tag}"))
+                .await?
+        else {
+            continue;
+        };
+        ensure!(
+            release.tag_name == tag,
+            "release lookup returned a different tag"
+        );
+        if release.draft || release.prerelease != (channel == Channel::Nightly) {
+            continue;
         }
-        if complete {
-            candidates.sort_by(|a, b| b.0.cmp(&a.0));
-            for (version, release) in candidates {
-                match resolve_release(&client, release, version).await? {
-                    Some(release) => return Ok(Some(release)),
-                    None => continue,
-                }
-            }
-            return Ok(None);
+        if let Some(release) = resolve_release(&client, release, version).await? {
+            return Ok(Some(release));
         }
     }
-    bail!("release listing reached {MAX_PAGES} pages; cannot confirm a complete listing")
+    ensure!(
+        !bounded,
+        "none of the {MAX_CANDIDATES} newest candidate releases is complete; cannot confirm the latest release"
+    );
+    Ok(None)
+}
+
+/// The channel's tags newer than `current`, newest first. Other refs are ignored.
+fn candidate_tags(refs: &[TagRef], channel: Channel, current: &Version) -> Vec<(Version, String)> {
+    let mut candidates: Vec<_> = refs
+        .iter()
+        .filter_map(|item| item.name.strip_prefix("refs/tags/"))
+        .filter_map(|tag| Some((channel_version(tag, channel)?, tag.to_owned())))
+        .filter(|(version, _)| version > current)
+        .collect();
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates
 }
 
 fn channel_version(tag: &str, channel: Channel) -> Option<Version> {
@@ -197,7 +218,10 @@ async fn resolve_release(
         marker_asset.browser_download_url == manifest_url,
         "unexpected completion manifest URL"
     );
-    let Some(body) = get_optional_bytes(client, &manifest_url, 1024 * 1024).await? else {
+    let Some(body) = get_optional_bytes(client, &manifest_url, 1024 * 1024)
+        .await
+        .context("fetch release completion manifest")?
+    else {
         return Ok(None);
     };
     let manifest = parse_completion_manifest(&body, &release.tag_name, &version)?;
@@ -417,6 +441,17 @@ async fn get_json<T: serde::de::DeserializeOwned>(client: &Client, url: &str) ->
         .context("decode GitHub release response")
 }
 
+/// Like [`get_json`], but a 404 is `None` instead of an error.
+async fn get_optional_json<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    url: &str,
+) -> Result<Option<T>> {
+    get_optional_bytes(client, url, MAX_JSON)
+        .await?
+        .map(|body| serde_json::from_slice(&body).context("decode GitHub release response"))
+        .transpose()
+}
+
 async fn response(client: &Client, url: &str) -> Result<reqwest::Response> {
     let url = Url::parse(url)?;
     ensure!(trusted_url(&url), "update URL is not approved");
@@ -464,13 +499,13 @@ async fn get_optional_bytes(client: &Client, url: &str, limit: u64) -> Result<Op
         .send()
         .await
         .map_err(reqwest::Error::without_url)
-        .context("fetch release completion manifest")?;
+        .context("fetch official release")?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
     let mut response = response
         .error_for_status()
-        .context("fetch release completion manifest")?;
+        .context("fetch official release")?;
     ensure!(
         response.content_length().is_none_or(|size| size <= limit),
         "release response exceeds limit"
@@ -1170,6 +1205,46 @@ mod tests {
         assert!(
             Version::parse("1.2.3").unwrap() > Version::parse("1.2.3-nightly.20260102.1").unwrap()
         );
+    }
+
+    #[test]
+    fn candidate_tags_keep_newer_channel_tags_in_version_order() {
+        let refs: Vec<TagRef> = serde_json::from_value(serde_json::json!([
+            {"ref": "refs/tags/v0.0.1-nightly.20261112.3", "object": {"sha": "a", "type": "commit"}},
+            {"ref": "refs/tags/v0.0.1-nightly.20261112.10"},
+            {"ref": "refs/tags/v0.0.1-nightly.20261113.1"},
+            {"ref": "refs/tags/v0.0.1-nightly.20261101.1"},
+            {"ref": "refs/tags/v0.0.1"},
+            {"ref": "refs/tags/v0.0.2"},
+            {"ref": "refs/tags/v0.0.2-rc.1"},
+            {"ref": "refs/tags/www-v0.0.1-nightly.20261113.1"},
+            {"ref": "refs/tags/cli-v0.0.9"},
+            {"ref": "refs/heads/v0.0.3"},
+            {"ref": "v0.0.4"}
+        ]))
+        .unwrap();
+        let current = Version::parse("0.0.1-nightly.20261110.4").unwrap();
+        let tags = |channel| {
+            candidate_tags(&refs, channel, &current)
+                .into_iter()
+                .map(|(version, tag)| {
+                    assert_eq!(format!("v{version}"), tag);
+                    tag
+                })
+                .collect::<Vec<_>>()
+        };
+        // Numeric order, so .10 comes before .3, and only tags newer than the running version.
+        assert_eq!(
+            tags(Channel::Nightly),
+            [
+                "v0.0.1-nightly.20261113.1",
+                "v0.0.1-nightly.20261112.10",
+                "v0.0.1-nightly.20261112.3"
+            ]
+        );
+        assert_eq!(tags(Channel::Stable), ["v0.0.2", "v0.0.1"]);
+        let latest = Version::parse("0.0.2").unwrap();
+        assert!(candidate_tags(&refs, Channel::Stable, &latest).is_empty());
     }
 
     #[test]
