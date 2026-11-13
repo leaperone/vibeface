@@ -123,13 +123,15 @@ function AppServerSettings({ server, home, sessions, display, working, blocked, 
           <BusyIcon busy={testing} icon={PlugZap} />测试连接
         </Button>
       </div>
-      {draft.mode === "system" ? <div className="grid gap-1">
-        <label htmlFor="codex-socket" className="text-meta font-medium text-muted-foreground">连接路径</label>
-        <Input id="codex-socket" name="socket" className="min-w-0 font-mono" placeholder={placeholders.socket} required pattern="/.*" maxLength={4096} spellCheck={false}
+      <div className="grid gap-1">
+        <label htmlFor="codex-socket" className="text-meta font-medium text-muted-foreground">{draft.mode === "system" ? "连接路径" : "你的 Codex 连接路径"}</label>
+        <Input id="codex-socket" name="socket" className="min-w-0 font-mono" placeholder={placeholders.socket} required={draft.mode === "system"} pattern="/.*" maxLength={4096} spellCheck={false}
           value={draft.socket} disabled={working} onChange={(event) => setDraft({ ...draft, socket: event.target.value })} />
-        <p className="text-meta text-muted-foreground">填写运行 Codex 的电脑上的绝对路径。</p>
-        <p className="text-meta text-muted-foreground">共享所选外部 App Server 的会话，不隔离该服务的数据。</p>
-      </div> : null}
+        {draft.mode === "system" ? <>
+          <p className="text-meta text-muted-foreground">填写运行 Codex 的电脑上的绝对路径。</p>
+          <p className="text-meta text-muted-foreground">共享所选外部 App Server 的会话，不隔离该服务的数据。</p>
+        </> : <p className="text-meta text-muted-foreground">只用来把回复送进你自己的 Codex 会话。</p>}
+      </div>
       {dirty ? <p role="status" className="text-meta text-muted-foreground">保存后可测试连接</p>
         : blocked ? null : <LinkLine link={shown} prefix={tested ? "测试：" : ""} />}
       {!dirty && (shown.state === "handshake_failed" || shown.state === "launch_failed") ? <Details label="原因"><code className="font-mono break-all">{shown.reason}</code></Details> : null}
