@@ -22,6 +22,9 @@ from unittest import TestCase
 CORE_ROLES = ('node',)
 ROLES = (*CORE_ROLES, 'app', 'www')
 IMAGE = r'sha256:[0-9a-f]{64}'
+IMAGE_MANIFEST_TYPES = ('application/vnd.oci.image.manifest.v1+json',
+                        'application/vnd.docker.distribution.manifest.v2+json')
+ARCHIVE_METADATA_LIMIT = 4 * 1024 * 1024
 VERSION = r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-rc\.[1-9][0-9]*|-hourly\.[0-9]{10})?'
 DOCKER = ['docker', '--host', 'unix:///var/run/docker.sock']
 HEADER_NAMES = {'content-security-policy', 'x-content-type-options', 'x-frame-options',
@@ -135,7 +138,46 @@ def docker(*args, **kwargs):
     return command(*DOCKER, *args, **kwargs).stdout.strip()
 
 
-def import_image(archive, digest):
+def archive_images(archive, image):
+    """Prove a `docker save` archive holds only the pinned image; return the IDs a Docker store may load it as.
+
+    The pinned ID is the image configuration digest from the build runner's classic store. A host on the
+    containerd image store names the same image by its manifest digest, so that ID is accepted only after the
+    manifest is read back from the archive, hashed, and found to reference the pinned configuration.
+    """
+    require(re.fullmatch(IMAGE, image), 'invalid pinned image ID')
+    with tarfile.open(archive, 'r:gz') as bundle:
+        def entry(name):
+            try:
+                member = bundle.getmember(name)
+            except KeyError:
+                raise ValueError('image archive entry is missing') from None
+            require(member.isfile() and member.size <= ARCHIVE_METADATA_LIMIT, 'image archive entry is not a bounded file')
+            return bundle.extractfile(member).read()
+
+        def blob(digest):
+            require(type(digest) is str and re.fullmatch(IMAGE, digest), 'invalid image archive blob digest')
+            content = entry('blobs/sha256/' + digest.removeprefix('sha256:'))
+            require('sha256:' + hashlib.sha256(content).hexdigest() == digest, 'image archive blob differs from its digest')
+            return content
+
+        saved = json.loads(entry('manifest.json'))
+        require(type(saved) is list and len(saved) == 1 and type(saved[0]) is dict
+                and saved[0].get('Config') == 'blobs/sha256/' + image.removeprefix('sha256:'),
+                'image archive differs from the pinned image ID')
+        blob(image)
+        index = json.loads(entry('index.json'))
+        manifests = index.get('manifests') if type(index) is dict else None
+        require(type(manifests) is list and len(manifests) == 1 and type(manifests[0]) is dict
+                and manifests[0].get('mediaType') in IMAGE_MANIFEST_TYPES, 'image archive must index exactly one image manifest')
+        manifest = json.loads(blob(manifests[0].get('digest')))
+        require(type(manifest) is dict and type(manifest.get('config')) is dict
+                and manifest['config'].get('digest') == image, 'image archive manifest differs from the pinned image ID')
+        return image, manifests[0]['digest']
+
+
+def import_image(archive, digest, image):
+    """Load the verified archive and return the ID this host's Docker store gives the pinned image."""
     require(re.fullmatch(r'[0-9a-f]{64}', digest), 'invalid image archive digest')
     archive = checked_path(canonical_path(archive))
     require(archive.is_file(), 'image archive is not a regular file')
@@ -144,9 +186,11 @@ def import_image(archive, digest):
         while block := source.read(1024 * 1024):
             checksum.update(block)
     require(checksum.hexdigest() == digest, 'transferred image archive digest differs')
+    accepted = archive_images(archive, image)
     result = docker('load', '--input', str(archive), timeout=300)
     match = re.fullmatch(r'Loaded image ID: (' + IMAGE + r')', result)
     require(match is not None, 'Docker did not return one immutable imported image ID')
+    require(match[1] in accepted, 'imported image differs from the pinned image')
     return match[1]
 
 
@@ -610,24 +654,57 @@ def prune(directory, release, previous, image):
 
 def self_test():
     import copy
+    import io
     import tempfile
     from unittest.mock import patch
+
+    def saved_archive(path, images=1, tamper=False):
+        """Write the OCI layout `docker save` exports; return its config ID, manifest ID and archive digest."""
+        config = b'{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}'
+        config_id = 'sha256:' + hashlib.sha256(config).hexdigest()
+        manifest = json.dumps({'schemaVersion': 2, 'mediaType': IMAGE_MANIFEST_TYPES[0],
+                               'config': {'mediaType': 'application/vnd.oci.image.config.v1+json',
+                                          'digest': config_id, 'size': len(config)}, 'layers': []}).encode()
+        manifest_id = 'sha256:' + hashlib.sha256(manifest).hexdigest()
+        entries = {'oci-layout': b'{"imageLayoutVersion":"1.0.0"}',
+                   'index.json': json.dumps({'schemaVersion': 2, 'manifests': [
+                       {'mediaType': IMAGE_MANIFEST_TYPES[0], 'digest': manifest_id, 'size': len(manifest)}]}).encode(),
+                   'manifest.json': json.dumps([{'Config': 'blobs/sha256/' + config_id[7:], 'RepoTags': None,
+                                                 'Layers': []}] * images).encode(),
+                   'blobs/sha256/' + config_id[7:]: config,
+                   'blobs/sha256/' + manifest_id[7:]: manifest + (b' ' if tamper else b'')}
+        with tarfile.open(path, 'w:gz') as bundle:
+            for name, data in entries.items():
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                bundle.addfile(member, io.BytesIO(data))
+        return config_id, manifest_id, hashlib.sha256(path.read_bytes()).hexdigest()
+
     with tempfile.TemporaryDirectory() as temporary:
         archive = Path(temporary).resolve() / 'image.tar.gz'
-        archive.write_bytes(b'verified archive')
-        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-        imported = 'sha256:' + 'c' * 64
-        with patch(__name__ + '.docker', return_value='Loaded image ID: ' + imported) as load:
-            assert import_image(str(archive), digest) == imported
-            load.assert_called_once_with('load', '--input', str(archive), timeout=300)
+        imported, manifest_id, digest = saved_archive(archive)
+        # The classic store reports the configuration digest, the containerd store the manifest digest.
+        for loaded in (imported, manifest_id):
+            with patch(__name__ + '.docker', return_value='Loaded image ID: ' + loaded) as load:
+                assert import_image(str(archive), digest, imported) == loaded
+                load.assert_called_once_with('load', '--input', str(archive), timeout=300)
+        with patch(__name__ + '.docker', return_value='Loaded image ID: sha256:' + 'c' * 64):
+            with TestCase().assertRaises(ValueError, msg='accepted an image the archive does not prove'):
+                import_image(str(archive), digest, imported)
         with patch(__name__ + '.docker') as load:
-            with TestCase().assertRaises(ValueError, msg='imported an unverified archive'):
-                import_image(str(archive), '0' * 64)
+            for checksum, pin in (('0' * 64, imported), (digest, 'sha256:' + 'b' * 64), (digest, manifest_id)):
+                with TestCase().assertRaises(ValueError, msg='imported an unverified archive'):
+                    import_image(str(archive), checksum, pin)
+            for options in ({'tamper': True}, {'images': 2}):
+                other = Path(temporary).resolve() / 'other.tar.gz'
+                pin, _, checksum = saved_archive(other, **options)
+                with TestCase().assertRaises(ValueError, msg='accepted an archive that does not prove one image'):
+                    import_image(str(other), checksum, pin)
             load.assert_not_called()
         for result in ('Loaded image: moving:tag', 'Loaded image ID: ' + imported + '\nLoaded image ID: ' + imported):
             with patch(__name__ + '.docker', return_value=result):
                 with TestCase().assertRaises(ValueError, msg='accepted an ambiguous imported image'):
-                    import_image(str(archive), digest)
+                    import_image(str(archive), digest, imported)
         settings = Path(temporary).resolve() / 'config.json'
         settings.write_text(json.dumps({'project': 'official-app', 'role': 'app',
                                        'deploy_dir': '/srv/service-control/app', 'listen': '127.0.0.1:8088',
@@ -636,11 +713,13 @@ def self_test():
         arguments = ['deploy-activate.py', '--config', str(settings), '--tag', 'v0.0.1',
                      '--version', '0.0.1', '--source-sha', 'a' * 40, '--archive', str(archive)]
         for pin, checksum, loaded, accepted in (
-                (imported, digest, 'Loaded image ID: ' + imported, True),
-                ('sha256:' + 'b' * 64, digest, 'Loaded image ID: ' + imported, False),
-                (imported, '0' * 64, 'Loaded image ID: ' + imported, False),
-                (imported, digest, 'Loaded image: moving:tag', False),
-                (imported, digest, 'Loaded image ID: ' + imported + '\nLoaded image ID: ' + imported, False)):
+                (imported, digest, 'Loaded image ID: ' + imported, imported),
+                (imported, digest, 'Loaded image ID: ' + manifest_id, manifest_id),
+                ('sha256:' + 'b' * 64, digest, 'Loaded image ID: ' + imported, None),
+                (imported, digest, 'Loaded image ID: sha256:' + 'c' * 64, None),
+                (imported, '0' * 64, 'Loaded image ID: ' + imported, None),
+                (imported, digest, 'Loaded image: moving:tag', None),
+                (imported, digest, 'Loaded image ID: ' + imported + '\nLoaded image ID: ' + imported, None)):
             with patch.object(sys, 'argv', arguments + ['--image', pin, '--archive-sha256', checksum]), \
                     patch(__name__ + '.docker', return_value=loaded) as load, \
                     patch(__name__ + '.activate', return_value={}) as activation, \
@@ -652,7 +731,8 @@ def self_test():
                 else:
                     assert accepted, 'CLI activated an archive that differs from its pins'
                 if accepted:
-                    activation.assert_called_once_with(json.loads(settings.read_text()), pin,
+                    # Activation runs under the ID this host's store gave the pinned image.
+                    activation.assert_called_once_with(json.loads(settings.read_text()), accepted,
                                                        'v0.0.1', 'a' * 40, '0.0.1')
                 else:
                     activation.assert_not_called()
@@ -857,10 +937,11 @@ def main():
     config = validate_config(json.loads(raw))
     require(args.tag == ('www-v' if config['role'] == 'www' else 'v') + args.version, 'tag and version differ')
     require(bool(args.archive) == bool(args.archive_sha256), 'archive and its digest must be supplied together')
+    image = args.image
     if args.archive:
-        require(import_image(args.archive, args.archive_sha256) == args.image,
-                'imported image differs from the pinned image ID')
-    print(json.dumps(activate(config, args.image, args.tag, args.source_sha, args.version)))
+        # A containerd-store host names the pinned image by its manifest digest; activate it under that local ID.
+        image = import_image(args.archive, args.archive_sha256, args.image)
+    print(json.dumps(activate(config, image, args.tag, args.source_sha, args.version)))
 
 
 if __name__ == '__main__':
