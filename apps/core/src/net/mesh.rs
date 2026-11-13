@@ -300,9 +300,9 @@ pub fn record_addr(record: &MeshRecord, allow_private: bool) -> Result<EndpointA
 }
 
 /// The remembered Nodes worth joining again: publicly reachable ones, or any with an address on
-/// a private mesh, most recently seen first.
+/// a private mesh, online first and then most recently seen.
 fn recent<'a>(table: &'a Table, own: &str, allow_private: bool) -> Vec<&'a Entry> {
-    let mut known: Vec<&Entry> = table
+    let known: Vec<&Entry> = table
         .entries()
         .filter(|entry| {
             entry.record.device_id != own
@@ -310,9 +310,13 @@ fn recent<'a>(table: &'a Table, own: &str, allow_private: bool) -> Vec<&'a Entry
                     || (allow_private && !entry.record.addrs.is_empty()))
         })
         .collect();
-    known.sort_by_key(|entry| Reverse(entry.last_seen_ms));
-    known.truncate(CANDIDATES);
-    known
+    prioritize_online(known, now_ms())
+}
+
+fn prioritize_online(mut entries: Vec<&Entry>, now_ms: u64) -> Vec<&Entry> {
+    entries.sort_by_key(|entry| (!entry.online(now_ms), Reverse(entry.last_seen_ms)));
+    entries.truncate(CANDIDATES);
+    entries
 }
 
 /// The `peers` that are not `neighbors`.
@@ -1697,6 +1701,56 @@ mod tests {
         let neighbors = HashSet::from([ids[1]]);
         assert_eq!(absent(ids.clone(), &neighbors), [ids[0], ids[2]]);
         assert!(absent(ids.clone(), &ids.iter().copied().collect()).is_empty());
+    }
+
+    #[test]
+    fn rejoining_prefers_online_records_but_keeps_expired_fallback() {
+        let now = 10_000_000;
+        let online = entry("a".repeat(64), now - 1_000);
+        let expired = entry("b".repeat(64), now - 1_800_001);
+        let preferred = prioritize_online(vec![&online, &expired], now);
+        assert_eq!(preferred.len(), 2);
+        assert_eq!(preferred[0].record.device_id, online.record.device_id);
+        assert_eq!(prioritize_online(vec![&expired], now).len(), 1);
+    }
+
+    #[test]
+    fn rejoining_prioritizes_online_records_before_candidate_cap() {
+        let now = 10_000_000;
+        let mut entries: Vec<_> = (0..CANDIDATES)
+            .map(|index| entry(format!("{index:064x}"), now - 1_800_001))
+            .collect();
+        let online = entry("f".repeat(64), now - 1_000);
+        entries.push(online);
+        let selected = prioritize_online(entries.iter().collect(), now);
+        assert_eq!(selected.len(), CANDIDATES);
+        assert!(
+            selected
+                .iter()
+                .any(|entry| entry.record.device_id == "f".repeat(64))
+        );
+    }
+
+    fn entry(device_id: String, seq: u64) -> table::Entry {
+        table::Entry {
+            signed: SignedMeshRecord {
+                payload: String::new(),
+                signature: String::new(),
+            },
+            record: MeshRecord {
+                v: 1,
+                network: "vibeface".into(),
+                device_id,
+                seq,
+                ttl_s: record::DEFAULT_TTL_S,
+                addrs: vec![],
+                relay_url: None,
+                reachable: Reachable::Public,
+                roles: vec![],
+            },
+            first_seen_ms: seq,
+            last_seen_ms: seq,
+        }
     }
 
     struct Node {

@@ -482,6 +482,9 @@ async fn user_request(socket: &Path, method: &str, params: Value) -> Result<Valu
 const READY_WAIT: Duration = Duration::from_secs(20);
 /// How long a started App Server may stay unconnected before the settings page asks the user.
 const START_LIMIT: Duration = Duration::from_secs(60);
+/// A provider configuration change wakes the supervisor immediately, so a missing executable
+/// can back off without delaying an explicit repair.
+const APP_SERVER_RETRY_MAX_SECS: u64 = 300;
 /// Names the managed App Server's process tree in this account's job object namespace.
 const TREE_KEY: &str = "codex-app-server";
 
@@ -765,8 +768,11 @@ impl Inner {
 
     /// Sleeps `seconds` unless the target changes first; `true` means it changed.
     async fn wait(&self, seconds: u64) -> bool {
+        if self.stopping() {
+            return true;
+        }
         tokio::select! {
-            () = tokio::time::sleep(Duration::from_secs(seconds)) => false,
+            () = tokio::time::sleep(Duration::from_secs(seconds)) => self.stopping(),
             () = self.changed.notified() => true,
         }
     }
@@ -1039,7 +1045,7 @@ impl Inner {
             if self.wait(backoff).await {
                 backoff = 1;
             } else {
-                backoff = (backoff * 2).min(30);
+                backoff = (backoff * 2).min(APP_SERVER_RETRY_MAX_SECS);
             }
         }
     }
@@ -1299,6 +1305,7 @@ impl CodexServer {
         self.inner
             .stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.changed.notify_waiters();
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || {
             let mut owned = inner.tree.blocking_lock();
