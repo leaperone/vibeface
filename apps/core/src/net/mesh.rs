@@ -319,15 +319,6 @@ fn prioritize_online(mut entries: Vec<&Entry>, now_ms: u64) -> Vec<&Entry> {
     entries
 }
 
-fn prefer_online(entries: Vec<&Entry>, now_ms: u64) -> Vec<&Entry> {
-    let online: Vec<_> = entries
-        .iter()
-        .copied()
-        .filter(|entry| entry.online(now_ms))
-        .collect();
-    if online.is_empty() { entries } else { online }
-}
-
 /// The `peers` that are not `neighbors`.
 fn absent(peers: Vec<EndpointId>, neighbors: &HashSet<EndpointId>) -> Vec<EndpointId> {
     peers
@@ -988,13 +979,10 @@ impl Mesh {
     async fn candidates(&self) -> Vec<EndpointId> {
         let mut peers: Vec<EndpointId> = {
             let table = self.table.lock().expect("mesh table");
-            prefer_online(
-                recent(&table, &self.device_id, self.allow_private),
-                now_ms(),
-            )
-            .into_iter()
-            .filter_map(|entry| endpoint_id(&entry.record.device_id).ok())
-            .collect()
+            recent(&table, &self.device_id, self.allow_private)
+                .into_iter()
+                .filter_map(|entry| endpoint_id(&entry.record.device_id).ok())
+                .collect()
         };
         for peer in self.bootstrap_peers().await {
             if !peers.contains(&peer) {
@@ -1717,10 +1705,10 @@ mod tests {
         let now = 10_000_000;
         let online = entry("a".repeat(64), now - 1_000);
         let expired = entry("b".repeat(64), now - 1_800_001);
-        let preferred = prefer_online(vec![&online, &expired], now);
+        let preferred = prioritize_online(vec![&online, &expired], now);
         assert_eq!(preferred.len(), 1);
         assert_eq!(preferred[0].record.device_id, online.record.device_id);
-        assert_eq!(prefer_online(vec![&expired], now).len(), 1);
+        assert_eq!(prioritize_online(vec![&expired], now).len(), 1);
     }
 
     #[test]
