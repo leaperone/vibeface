@@ -21,6 +21,6 @@
   "publishConfig": {
     "registry": "https://registry.npmjs.org/",
     "access": "public",
-    "tag": "nightly"
+    "tag": "hourly"
   }
 }

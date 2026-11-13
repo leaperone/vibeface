@@ -173,7 +173,7 @@ const CONSTRAINTS: &[&str] = &[
     "Operate only inside this personal network and conversation.",
     "Your Shell has full access to this device. Hand longer coding work to a coding agent through dispatch_work; it registers the work with the Node, runs one turn with full access on a provider this device executes work on (agent names which), the Node watches it, and its result comes back to you as a new turn.",
     "Your turn ends after you dispatch. Do not wait or poll for work to finish; tell the user what was started.",
-    "dispatch_work runs on this device unless target_node names another of the user's devices; then that device's bot gets the task. continues names an earlier work to follow up on; it goes on from that work's session. dispatch_work with thread adds the prompt to an existing session on this device as a work, whose result comes back to you as a work_result turn: a Codex thread other than a sub-agent's, steering its running turn or starting one, or another agent's session one of this device's works ran in. The session's actual directory must be verified inside the current allowed roots. Reusing call_ref in the same turn only reads back. For Codex, `vibeface codex send <thread> <text> --id <call_ref>` is its Shell form; where it says it runs only inside a bot turn, use dispatch_work. `vibeface codex call <method> [json]` calls Codex App Server methods that read or manage threads; it refuses methods that start, steer or stop a turn (turn/start, turn/steer, turn/interrupt, thread/start, thread/fork, thread/compact/start, thread/shellCommand, thread/revert, thread/inject_items, review/start): start or steer through dispatch_work and stop through interrupt_work, so the Node tracks every turn. `vibeface codex watch <thread>` streams a Codex thread's events.",
+    "dispatch_work runs on this device unless target_node names another of the user's devices; then that device's bot gets the task. continues names an earlier work to follow up on; it goes on from that work's session. dispatch_work with thread adds the prompt to an existing session on this device as a work, whose result comes back to you as a work_result turn: a Codex thread other than a sub-agent's, steering its running turn or starting one, or another agent's session one of this device's works ran in. The session's actual directory must be verified inside the current allowed roots. Reusing call_ref in the same turn only reads back. For Codex, `vibeface codex send <thread> <text> --id <call_ref>` is its Shell form; where it says it runs only inside a bot turn, use dispatch_work. `vibeface codex call <method> [json]` calls Codex App Server methods that read or manage threads; json holds the App Server's own camelCase parameters, never the Node's snake_case names, as in `vibeface codex call thread/read '{\"threadId\":\"<thread>\",\"includeTurns\":true}'`. It refuses methods that start, steer or stop a turn (turn/start, turn/steer, turn/interrupt, thread/start, thread/fork, thread/compact/start, thread/shellCommand, thread/revert, thread/inject_items, review/start): start or steer through dispatch_work and stop through interrupt_work, so the Node tracks every turn. `vibeface codex watch <thread>` streams a Codex thread's events.",
     "Write what you send to a coding agent (a dispatch_work prompt, `vibeface codex send` text) as the task itself: the goal, where, limits and what done means. Do not relay the chat (no \"the user says ...\"); quote the user only when exact wording matters. When you need the result in a set shape, give the format and a short example.",
     "When something fails or behaves unexpectedly, record it with `vibeface log <warn|error|info> <message> --conversation <id> [--work <id>] [--thread <id>]` so it can be debugged later; never put secrets in it.",
     "Reuse call_ref only to retry the same dispatch; a retry never starts a second turn. An unknown outcome is settled by the Node, never by dispatching again.",
@@ -2969,6 +2969,17 @@ mod tests {
             Some(&json!("decision 9")),
             "decisions go last, newest kept"
         );
+    }
+
+    /// The Node's own tools and records say `thread_id`; the App Server refuses that name with
+    /// "missing field `threadId`".
+    #[test]
+    fn the_standing_rules_show_app_server_parameters_in_camel_case() {
+        let rules = thread_instructions();
+        assert!(rules.contains(
+            r#"`vibeface codex call thread/read '{"threadId":"<thread>","includeTurns":true}'`"#
+        ));
+        assert!(rules.contains("camelCase parameters, never the Node's snake_case names"));
     }
 
     #[test]

@@ -251,10 +251,44 @@ pub async fn run(options: Update) -> Result<()> {
                 automatic: true, ..
             } => return Ok(()),
             _ => bail!(
-                "npm owns this installation; wait for idle, stop any node service, then run npm install -g @leaperone/vibeface@nightly and restart the service"
+                "npm owns this installation; wait for idle, stop any node service, then run npm install -g @leaperone/vibeface@hourly and restart the service"
             ),
         }
     }
+    let action = match &options.action {
+        Action::Check(_) => Some("check"),
+        Action::Apply { .. } => Some("apply"),
+        Action::Configure { .. } | Action::Status(_) => None,
+    };
+    let result = act(options, data.clone()).await;
+    if let (Some(action), Err(error)) = (action, &result) {
+        let error: String = format!("{error:#}").chars().take(2_000).collect();
+        report(
+            &data,
+            "error",
+            "update.failed",
+            "update failed",
+            serde_json::json!({"action":action,"error":error}),
+        )
+        .await;
+    }
+    result
+}
+
+/// Puts an update's outcome in `node.log` the way `vibeface log` does, through the running Node,
+/// which redacts it. With no Node answering, the outcome stays in the updater's own output.
+async fn report(data: &Path, level: &str, event: &str, message: &str, fields: serde_json::Value) {
+    let local = crate::LocalNode {
+        data_dir: data.to_owned(),
+        node_url: None,
+    };
+    let body = serde_json::json!({"source":"cli","records":[
+        {"level":level,"event":event,"message":message,"fields":fields}
+    ]});
+    let _ = crate::post_local(&local, "/api/log", &body, Duration::from_secs(5)).await;
+}
+
+async fn act(options: Update, data: PathBuf) -> Result<()> {
     match options.action {
         Action::Status(_) => {
             let policy = policy(&data)?;
@@ -301,6 +335,15 @@ pub async fn run(options: Update) -> Result<()> {
             let current = manifest(&installed(&policy.install_root)?)?.version;
             let latest = release::check(policy.channel).await?;
             let newer = latest.as_ref().filter(|r| r.version > current);
+            report(
+                &data,
+                "info",
+                "update.checked",
+                "update checked",
+                serde_json::json!({"channel":policy.channel,"current_version":current,
+                    "available_version":newer.map(|r|&r.version)}),
+            )
+            .await;
             println!(
                 "{}",
                 serde_json::json!({"channel":policy.channel,"current_version":current,
@@ -322,6 +365,15 @@ pub async fn run(options: Update) -> Result<()> {
                 .await?
                 .filter(|r| r.version > current)
             else {
+                report(
+                    &data,
+                    "info",
+                    "update.checked",
+                    "update checked",
+                    serde_json::json!({"channel":policy.channel,"current_version":current,
+                        "available_version":null}),
+                )
+                .await;
                 println!("No newer release is available in the selected channel.");
                 return Ok(());
             };
@@ -336,6 +388,15 @@ pub async fn run(options: Update) -> Result<()> {
             let lease = match maintenance::acquire(&inspected.maintenance_socket).await {
                 Ok(lease) => lease,
                 Err(error) if error.downcast_ref::<maintenance::Busy>().is_some() => {
+                    report(
+                        &data,
+                        "info",
+                        "update.deferred",
+                        "update deferred until the Node is idle",
+                        serde_json::json!({"current_version":current,
+                            "available_version":latest.version,"reason":format!("{error:#}")}),
+                    )
+                    .await;
                     println!("Update deferred; the node could not become idle: {error:#}");
                     return Ok(());
                 }
@@ -385,6 +446,14 @@ pub async fn run(options: Update) -> Result<()> {
                     ),
                 }
             }
+            report(
+                &data,
+                "info",
+                "update.applied",
+                "update applied",
+                serde_json::json!({"previous_version":current,"version":latest.version}),
+            )
+            .await;
             println!(
                 "Updated to {}. Backup: {}",
                 latest.version,
@@ -521,7 +590,7 @@ pub(crate) fn bind_desktop_install_root(data: &Path, root: &Path) -> Result<()> 
             persist(
                 &policy_path,
                 &Policy {
-                    channel: Channel::Nightly,
+                    channel: Channel::Hourly,
                     automatic: false,
                     install_root: root,
                 },
@@ -756,7 +825,7 @@ async fn recover_with_service(
 
 fn desktop_managed_policy(managed_root: &Path) -> Result<Policy> {
     Ok(Policy {
-        channel: Channel::Nightly,
+        channel: Channel::Hourly,
         automatic: false,
         install_root: fs::canonicalize(managed_root)?,
     })
@@ -895,7 +964,7 @@ pub(crate) fn complete_desktop_managed_release(data: &Path) -> Result<()> {
     privatefs::sync_dir(data)?;
     if let Some(root) = journal.candidate.parent().and_then(Path::parent) {
         let policy = Policy {
-            channel: Channel::Nightly,
+            channel: Channel::Hourly,
             automatic: false,
             install_root: root.to_owned(),
         };
@@ -1774,7 +1843,7 @@ mod tests {
         let package = package(&root, "1.0.0");
         privatefs::link_dir(&package, &root.join("current")).unwrap();
         let policy = Policy {
-            channel: Channel::Nightly,
+            channel: Channel::Hourly,
             automatic: true,
             install_root: root.clone(),
         };
@@ -2007,7 +2076,7 @@ mod tests {
         );
         run(Update {
             action: Action::Configure {
-                channel: Channel::Nightly,
+                channel: Channel::Hourly,
                 automatic: false,
                 install_root: root.clone(),
                 data: Data {
@@ -2020,7 +2089,7 @@ mod tests {
             serde_json::from_slice(&fs::read(data.join("update.json"))?)?;
         assert_eq!(
             saved,
-            serde_json::json!({"channel":"nightly","automatic":false,"install_root":root})
+            serde_json::json!({"channel":"hourly","automatic":false,"install_root":root})
         );
         assert_eq!(
             recorded_arguments(&installer),
@@ -2028,7 +2097,7 @@ mod tests {
         );
         run(Update {
             action: Action::Configure {
-                channel: Channel::Nightly,
+                channel: Channel::Hourly,
                 automatic: true,
                 install_root: root.clone(),
                 data: Data {
@@ -2056,7 +2125,7 @@ mod tests {
     #[test]
     fn npm_installation_requires_matching_package_metadata() {
         let root = sandbox();
-        let original = package(&root, "1.2.3-nightly.20261019.1");
+        let original = package(&root, "1.2.3-hourly.2026101909");
         assert_eq!(npm_install_root(&original.join(PROGRAMS[0])).unwrap(), None);
         fs::create_dir_all(root.join("vendor")).unwrap();
         let target = if cfg!(windows) {
@@ -2070,7 +2139,7 @@ mod tests {
         fs::write(root.join("bin/vibeface.mjs"), b"launcher").unwrap();
         fs::write(
             root.join("package.json"),
-            r#"{"name":"@leaperone/vibeface","version":"1.2.3-nightly.20261019.1"}"#,
+            r#"{"name":"@leaperone/vibeface","version":"1.2.3-hourly.2026101909"}"#,
         )
         .unwrap();
         assert_eq!(
@@ -2078,8 +2147,8 @@ mod tests {
             Some(root.clone())
         );
         for metadata in [
-            r#"{"name":"another-package","version":"1.2.3-nightly.20261019.1"}"#,
-            r#"{"name":"vibeface","version":"1.2.3-nightly.20261019.1"}"#,
+            r#"{"name":"another-package","version":"1.2.3-hourly.2026101909"}"#,
+            r#"{"name":"vibeface","version":"1.2.3-hourly.2026101909"}"#,
             r#"{"name":"@leaperone/vibeface","version":"2.0.0"}"#,
             r#"{"name":"@leaperone/vibeface"}"#,
         ] {
@@ -2459,7 +2528,7 @@ mod tests {
             .iter()
             .map(|path| fs::read(path).unwrap())
             .collect();
-        let policy_bytes = br#"{"channel":"nightly","automatic":false}"#.to_vec();
+        let policy_bytes = br#"{"channel":"hourly","automatic":false}"#.to_vec();
         fs::write(data.join("update.json"), &policy_bytes).unwrap();
         fs::write(data.join("providers.json"), b"provider-material").unwrap();
         let release = super::DesktopManagedRelease {

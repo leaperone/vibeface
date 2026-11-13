@@ -35,7 +35,7 @@ function controlConstant(name) {
 
 function productVersion() {
   const version = /^version = "([^"]+)"$/m.exec(fs.readFileSync(path.join(repo, 'apps/cli/Cargo.toml'), 'utf8'))?.[1];
-  assert(version && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-(nightly\.\d{8}\.[1-9]\d*|rc\.[1-9]\d*))?$/.test(version),
+  assert(version && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-(hourly\.\d{10}|rc\.[1-9]\d*))?$/.test(version),
     'the canonical product version comes from the CLI package');
   return version;
 }
@@ -186,7 +186,7 @@ function buildWindowsInstallerFixture(portableDirectory, outputDirectory, mode =
   windowsInstallerManifest(payload, include, plan);
   const sourceInfo = JSON.parse(fs.readFileSync(path.join(payload, 'resources/runtime/BUILD-INFO.json'), 'utf8'));
   assert.equal(sourceInfo.target, 'x86_64-pc-windows-msvc', 'installer fixture requires the verified Windows runtime');
-  assert(typeof sourceInfo.version === 'string' && /^[0-9]+\.[0-9]+\.[0-9]+(?:-(?:nightly\.[0-9]{8}\.[1-9][0-9]*|rc\.[1-9][0-9]*))?$/.test(sourceInfo.version), 'invalid source runtime version');
+  assert(typeof sourceInfo.version === 'string' && /^[0-9]+\.[0-9]+\.[0-9]+(?:-(?:hourly\.[0-9]{10}|rc\.[1-9][0-9]*))?$/.test(sourceInfo.version), 'invalid source runtime version');
   const installer = path.join(outputDirectory, { upgrade: 'upgrade-fixture.exe', diagnostic: 'diagnostic-fixture.exe', normal: 'normal-fixture.exe' }[mode]);
   run(process.env.MAKENSIS || path.join(process.env['ProgramFiles(x86)'] || 'C:/Program Files (x86)', 'NSIS', 'makensis.exe'),
     [`/DAPP_DIR=${payload}`, `/DFILE_MANIFEST=${include}`, `/DPATH_PLAN=${plan}`, `/DOUTPUT=${installer}`, `/DVERSION=${sourceInfo.version}`, ...(diagnostic ? ['/DINSTALLER_DIAGNOSTICS'] : []), path.join(desktop, 'build/installer.nsi')], { stdio: 'inherit' });
@@ -214,7 +214,7 @@ async function build({ target, runtimeDir, output, runtimeArchive, sign }) {
   const archive = runtimeArchive ?? path.join(path.dirname(runtimeDir), `vibeface-${version}-${target}.tar.gz`);
   assert(fs.statSync(archive).isFile(), `the released runtime archive is required beside --runtime-dir or named with --runtime-archive`);
   const { signed, signing } = signingState(target, sign);
-  const channel = version.includes('-nightly.') ? 'nightly' : version.includes('-rc.') ? 'rc' : 'stable';
+  const channel = version.includes('-hourly.') ? 'hourly' : version.includes('-rc.') ? 'rc' : 'stable';
   assert(signed || channel !== 'stable' || target.endsWith('-unknown-linux-gnu'),
     'a stable desktop distribution requires a configured signer except on Linux, which uses checksums and provenance');
   if (signed && target === 'x86_64-pc-windows-msvc') {
@@ -312,7 +312,7 @@ function selfTest() {
   fs.mkdirSync(artifacts, { recursive: true });
   const scratch = fs.mkdtempSync(path.join(artifacts, 'desktop-build-'));
   try {
-    const version = '9.9.9-nightly.20261107.1';
+    const version = '9.9.9-hourly.2026110712';
     const commit = 'a'.repeat(40);
     const target = 'aarch64-apple-darwin';
     const bundle = path.join(scratch, `vibeface-${version}-${target}`);

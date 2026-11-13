@@ -880,7 +880,19 @@ impl Runtime {
                     }
                 }
                 let event_id = event.event_id.clone();
+                let (provider, kind, origin) = (event.agent.name(), event.event, event.source);
+                let session = event.session_id.clone();
                 let status = if store.queue_triage_event(event, now_ms())? {
+                    tracing::info!(
+                        event = "triage.queued",
+                        conversation_id = scope,
+                        thread_id = session,
+                        event_id,
+                        provider,
+                        kind = ?kind,
+                        origin = ?origin,
+                        "session event queued for triage"
+                    );
                     "accepted"
                 } else {
                     "duplicate"
@@ -2517,7 +2529,10 @@ impl Runtime {
             }
             _ => bail!("unknown triage action"),
         };
-        self.store
+        let (provider, session) = (event.agent.name(), event.session_id.clone());
+        let handled = event_id.clone();
+        let result = self
+            .store
             .call("triage.handle_event", move |store| {
                 store.connection.execute(
                     "INSERT INTO triage_handled(event_id,ts_ms,result) VALUES(?,?,?)
@@ -2527,7 +2542,19 @@ impl Runtime {
                 dequeue(&store.connection, &event)?;
                 Ok(result)
             })
-            .await
+            .await?;
+        // What was concluded, never the question or the session's words.
+        tracing::info!(
+            event = "triage.concluded",
+            conversation_id = result["conversation_id"].as_str(),
+            thread_id = session,
+            event_id = handled,
+            provider,
+            conclusion = action,
+            severity = input["severity"].as_str(),
+            "triage concluded"
+        );
+        Ok(result)
     }
 
     /// Asks in the chat of the bot that owns the event's session, the primary bot's when its

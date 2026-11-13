@@ -4,7 +4,7 @@ import { SiteLayout } from '@/components/site-layout'
 
 export const Route = createFileRoute('/download')({
   head: () => ({
-    meta: [{ title: '下载 Vibeface Nightly' }],
+    meta: [{ title: '下载 Vibeface Hourly' }],
     links: [{ rel: 'canonical', href: 'https://www.vibeface.dev/download' }],
   }),
   component: DownloadPage,
@@ -14,11 +14,11 @@ function DownloadPage() {
   return (
     <SiteLayout variant="page">
       <PageHero
-        eyebrow="Nightly"
+        eyebrow="Hourly"
         title="从公开 Releases 获取安装包。"
         lede={
           <p>
-            当前公开渠道是 Nightly。同一个产品 Release 提供电脑版完整包和 Android APK；电脑版包含同版本的 CLI、Core 与网页 App。
+            当前公开渠道是 Hourly，每小时自动发布。同一个产品 Release 提供电脑版完整包和 Android APK；电脑版包含同版本的 CLI、Core 与网页 App。
           </p>
         }
         actions={

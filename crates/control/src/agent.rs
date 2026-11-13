@@ -140,8 +140,18 @@ where
                 .request("thread/read", json!({"threadId":thread}))
                 .await;
             session.close().await;
-            let read = read
-                .map_err(|error| anyhow::anyhow!("cannot read thread {thread}: {}", error.message))?;
+            let read = read.map_err(|error| {
+                // A saved thread reads even when it is not loaded, so this App Server does not
+                // have it: usually a session of another Codex folder, as the user's own Codex app
+                // or terminal keeps while the Node runs its own App Server.
+                if error.missing_thread() {
+                    anyhow::anyhow!(
+                        "thread {thread} is not on this device's Codex App Server, so nothing was registered or sent. It is a session of another Codex folder (the user's own Codex app or terminal, while the Node runs its own App Server) or no longer exists; thread/resume and retrying cannot load it, and its files must not be copied, linked or resumed into this App Server. Tell the user the message was not delivered and give them the exact text to send in that session; dispatch it as a new work without thread only when the user asks for that."
+                    )
+                } else {
+                    anyhow::anyhow!("cannot read thread {thread}: {}", error.message)
+                }
+            })?;
             ensure!(
                 read["thread"]["id"].as_str() == Some(thread.as_str()),
                 "thread {thread} was not returned by the App Server"
@@ -433,8 +443,14 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn a_codex_sub_agent_thread_is_refused_before_anything_is_registered() -> Result<()> {
+    /// An App Server that answers `thread/read` with `read`, a result or a JSON-RPC error, and
+    /// records every method it is asked.
+    async fn app_server(
+        read: Result<Value, Value>,
+    ) -> Result<(
+        vibeface_bridge::platform::ipc::Endpoint,
+        Arc<Mutex<Vec<Value>>>,
+    )> {
         let dir = vibeface_bridge::platform::ipc::runtime_dir(
             &uuid::Uuid::new_v4().simple().to_string(),
         )?;
@@ -453,20 +469,38 @@ mod tests {
                         continue;
                     };
                     seen.lock().unwrap().push(request["method"].clone());
-                    let result = match request["method"].as_str() {
-                        Some("initialize") => json!({"userAgent":"codex/fixture"}),
-                        Some("thread/read") => json!({"thread":{"id":"sub","cwd":"/w",
-                            "parentThreadId":"lead","source":{"subAgent":{"thread_spawn":
-                            {"depth":1,"parent_thread_id":"lead"}}}}}),
-                        _ => json!({}),
+                    let reply = match request["method"].as_str() {
+                        Some("initialize") => Ok(json!({"userAgent":"codex/fixture"})),
+                        Some("thread/read") => read.clone(),
+                        _ => Ok(json!({})),
                     };
                     if request.get("id").is_some() {
-                        let reply = json!({"id":request["id"],"result":result});
+                        let reply = match reply {
+                            Ok(result) => json!({"id":request["id"],"result":result}),
+                            Err(error) => json!({"id":request["id"],"error":error}),
+                        };
                         let _ = server.send(reply.to_string().into()).await;
                     }
                 }
             }
         });
+        Ok((socket, methods))
+    }
+
+    fn sent_into_a_thread(methods: &Mutex<Vec<Value>>) -> bool {
+        methods.lock().unwrap().iter().any(|method| {
+            method
+                .as_str()
+                .is_some_and(|method| method.starts_with("turn/") || method == "thread/resume")
+        })
+    }
+
+    #[tokio::test]
+    async fn a_codex_sub_agent_thread_is_refused_before_anything_is_registered() -> Result<()> {
+        let (socket, methods) = app_server(Ok(json!({"thread":{"id":"sub","cwd":"/w",
+            "parentThreadId":"lead","source":{"subAgent":{"thread_spawn":
+            {"depth":1,"parent_thread_id":"lead"}}}}})))
+        .await?;
         let tracked = Arc::new(Mutex::new(false));
         let track = |_| {
             *tracked.lock().unwrap() = true;
@@ -489,9 +523,56 @@ mod tests {
         );
         assert!(!*tracked.lock().unwrap(), "no work was registered");
         assert!(
-            !methods.lock().unwrap().iter().any(|method| method
-                .as_str()
-                .is_some_and(|method| method.starts_with("turn/") || method == "thread/resume")),
+            !sent_into_a_thread(&methods),
+            "nothing was sent into the thread"
+        );
+        Ok(())
+    }
+
+    /// The user's own Codex keeps its sessions in its own folder, so an App Server the Node
+    /// starts answers for one of them as Codex 0.167 does here.
+    #[tokio::test]
+    async fn a_thread_the_app_server_does_not_have_is_refused_and_left_to_the_user() -> Result<()> {
+        let thread = "01a1ffff-0000-7000-8000-000000000001";
+        let (socket, methods) = app_server(Err(
+            json!({"code":-32600,"message":format!("thread not loaded: {thread}")}),
+        ))
+        .await?;
+        let tracked = Arc::new(Mutex::new(false));
+        let track = |_| {
+            *tracked.lock().unwrap() = true;
+            async { Ok(json!({"may_send":true,"work_id":"w"})) }
+        };
+        let args = json!({"thread":thread,"prompt":"p","call_ref":"a-q-1"});
+        let refused = dispatch(
+            &args,
+            |_| async { Ok(json!({"found":false})) },
+            track,
+            |_, _| async { Ok(json!({})) },
+            |_| async { Ok(Some("codex".to_owned())) },
+            Some(socket.path()),
+        )
+        .await;
+        let refused = refused
+            .expect_err("the App Server has no such thread")
+            .to_string();
+        for said in [
+            "is not on this device's Codex App Server",
+            "nothing was registered or sent",
+            "retrying cannot load it",
+            "must not be copied, linked or resumed",
+            "give them the exact text to send in that session",
+            "only when the user asks",
+        ] {
+            assert!(refused.contains(said), "{refused}");
+        }
+        assert!(
+            !refused.contains("thread not loaded"),
+            "Codex's wording reads as a thread that only needs loading: {refused}"
+        );
+        assert!(!*tracked.lock().unwrap(), "no work was registered");
+        assert!(
+            !sent_into_a_thread(&methods),
             "nothing was sent into the thread"
         );
         Ok(())

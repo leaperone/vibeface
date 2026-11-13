@@ -18,7 +18,7 @@ import type { Link, LinkEvent } from '../lib/link.ts'
 import { candidates, defaultGateway, gatewaysOf, markReached, mergeEntrances, openEntrances, storedEntrances, storedGateway, verifiedEntrances } from '../lib/entrances.ts'
 import type { Entrance, Gateway, OpenEntrance } from '../lib/entrances.ts'
 import type { KeyValue, LanSighting, LocalLaunch, Platform } from '../lib/platform.ts'
-import { connectLogSink, reportLog } from '../lib/web-log.ts'
+import { connectLogSink, failureFields, reportLog } from '../lib/web-log.ts'
 import { storageOf } from '../workspace/storage.ts'
 
 type Phase = 'initializing' | 'blocked' | 'key_lost' | 'disconnected' | 'connecting' | 'reconnecting' | 'unpaired' | 'removed' | 'restarting' | 'erasing' | 'erase_failed' | 'ready'
@@ -336,7 +336,8 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     try { result = await active.channel.request(method, params) } catch (cause) {
       // Codex not installed yet is a setup step for the owner, not a failed request.
       const missing = (cause as { code?: unknown } | null)?.code === 'codex_missing'
-      if (method !== 'log') reportLog({ level: missing ? 'info' : 'warn', event: missing ? 'web.codex_missing' : 'web.rpc_failed', message: messageOf(cause), fields: { method: method === 'rpc' ? `rpc.${String(params.method)}` : method, origin: page?.origin ?? self } })
+      const message = messageOf(cause)
+      if (method !== 'log') reportLog({ level: missing ? 'info' : 'warn', event: missing ? 'web.codex_missing' : 'web.rpc_failed', message, fields: { method: method === 'rpc' ? `rpc.${String(params.method)}` : method, origin: page?.origin ?? self, ...failureFields(cause, message) } })
       throw cause
     }
     if (session.current !== active || active.generation !== generation.current) throw changed()

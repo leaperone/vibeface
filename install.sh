@@ -5,7 +5,7 @@ export LC_ALL=C
 
 usage() {
   cat <<'USAGE'
-Usage: install.sh [--channel stable|nightly] --install-root DIRECTORY --bin-dir DIRECTORY
+Usage: install.sh [--channel stable|hourly] --install-root DIRECTORY --bin-dir DIRECTORY
        install.sh --self-test
 
 Install the latest published Vibeface release for this platform (default: stable).
@@ -107,19 +107,20 @@ select_release() {
     $2=="prerelease" { pre[$1]=$3 }
     END {
       for (i in tags) {
-        tag=tags[i]; if (draft[i]!="false" || pre[i]!=(channel=="nightly" ? "true" : "false")) continue
+        tag=tags[i]; if (draft[i]!="false" || pre[i]!=(channel=="hourly" ? "true" : "false")) continue
         if (substr(tag,1,1)!="v") continue
-        n=split(substr(tag,2),part,"-"); if (n!=(channel=="nightly" ? 2 : 1)) continue
+        n=split(substr(tag,2),part,"-"); if (n!=(channel=="hourly" ? 2 : 1)) continue
         if (split(part[1],base,".")!=3 || !number(base[1]) || !number(base[2]) || !number(base[3])) continue
-        day=0; build=0
-        if (channel=="nightly") {
-          if (split(part[2],night,".")!=3 || night[1]!="nightly" || !date(night[2]) || !number(night[3]) || night[3]=="0") continue
-          day=night[2]; build=night[3]
+        stamp=0
+        if (channel=="hourly") {
+          if (split(part[2],hour,".")!=2 || hour[1]!="hourly" || length(hour[2])!=10 || !date(substr(hour[2],1,8))) continue
+          if (substr(hour[2],9,2) !~ /^([01][0-9]|2[0-3])$/) continue
+          stamp=hour[2]
         }
-        print base[1],base[2],base[3],day,build,tag
+        print base[1],base[2],base[3],stamp,tag
       }
     }
-  ' "$1" | sort -k1,1n -k2,2n -k3,3n -k4,4n -k5,5n | awk '{print $6}' | {
+  ' "$1" | sort -k1,1n -k2,2n -k3,3n -k4,4n | awk '{print $5}' | {
     if [[ ${3:-} == all ]]; then cat; else tail -n 1; fi
   }
 }
@@ -149,7 +150,7 @@ verify_completion() {
     $2=="schema" {schema=$3}
     $2=="name" {an[$1]=$3} $2=="size" {as[$1]=$3} $2=="sha256" {ah[$1]=$3}
     END {
-      wanted=(tag ~ /-nightly\./ ? "nightly" : "stable")
+      wanted=(tag ~ /-hourly\./ ? "hourly" : "stable")
       if (app!="product" || schema!="1" || v!=version || t!=tag || ch!=wanted || length(source)!=40 || source ~ /[^a-f0-9]/) exit 1
       foundA=foundC=0
       for (i in an) {
@@ -249,7 +250,7 @@ install_release() (
       *) fail "unknown argument: $1" ;;
     esac
   done
-  [[ $channel == stable || $channel == nightly ]] || fail 'channel must be stable or nightly'
+  [[ $channel == stable || $channel == hourly ]] || fail 'channel must be stable or hourly'
   [[ -n "$install_root" && -n "$bin_dir" ]] || fail 'Specify --install-root and --bin-dir explicitly.'
   [[ $install_root == /* && $bin_dir == /* && $install_root != *$'\n'* && $bin_dir != *$'\n'* ]] || fail 'installation directories must be absolute paths without newlines'
   [[ ! -e "$install_root/current" && ! -L "$install_root/current" ]] || fail 'current already exists; use vibeface update apply'
@@ -302,8 +303,8 @@ install_release() (
   done < <(select_releases "$scratch/releases" "$channel")
   "$selected" || tag=''
   if [[ -z $tag ]]; then
-    if [[ $channel == stable ]]; then fail 'no published Stable release; use --channel nightly explicitly to install a preview'; fi
-    fail 'no published Nightly release'
+    if [[ $channel == stable ]]; then fail 'no published Stable release; use --channel hourly explicitly to install a preview'; fi
+    fail 'no published hourly release'
   fi
   version=${tag#v}
   package="vibeface-$version-$target"
@@ -551,25 +552,27 @@ MOCK
   export PATH="$fixture/bin:$PATH"
   cat > "$fixture/releases.json" <<'JSON'
 [
- {"tag_name":"v0.0.1-nightly.20261017.2","draft":false,"prerelease":true,"body":"quoted \"tag_name\": \"v999.0.0\""},
+ {"tag_name":"v0.0.1-hourly.2026101702","draft":false,"prerelease":true,"body":"quoted \"tag_name\": \"v999.0.0\""},
  {"tag_name":"cli-v999.0.0","draft":false,"prerelease":false},
- {"tag_name":"www-v999.0.0-nightly.20261017.99","draft":false,"prerelease":true},
- {"tag_name":"mobile-v999.0.0-nightly.20261017.99","draft":false,"prerelease":true},
+ {"tag_name":"www-v999.0.0-hourly.2026101722","draft":false,"prerelease":true},
+ {"tag_name":"mobile-v999.0.0-hourly.2026101722","draft":false,"prerelease":true},
  {"tag_name":"v1.9.0","draft":false,"prerelease":false},
- {"tag_name":"v0.0.1-nightly.20261017.10","draft":false,"prerelease":true},
+ {"tag_name":"v0.0.1-hourly.2026101710","draft":false,"prerelease":true},
  {"tag_name":"v1.10.0","draft":false,"prerelease":false},
  {"tag_name":"v999.0.0-rc.1","draft":false,"prerelease":true},
  {"tag_name":"v999.0.0","draft":true,"prerelease":false},
- {"tag_name":"v0.0.1-nightly.20260229.1","draft":false,"prerelease":true},
+ {"tag_name":"v0.0.1-hourly.2026022901","draft":false,"prerelease":true},
  {"tag_name":"v01.2.3","draft":false,"prerelease":false},
  {"tag_name":"v18446744073709551616.0.0","draft":false,"prerelease":false},
- {"tag_name":"v0.0.1-nightly.20261017.18446744073709551616","draft":false,"prerelease":true}
+ {"tag_name":"v0.0.1-hourly.2026101724","draft":false,"prerelease":true},
+ {"tag_name":"v0.0.1-hourly.20261017","draft":false,"prerelease":true},
+ {"tag_name":"v0.0.1-nightly.20261018.1","draft":false,"prerelease":true}
 ]
 JSON
   json_fields "$fixture/releases.json" releases > "$fixture/fields"
   [[ $(select_release "$fixture/fields" stable) == v1.10.0 ]] || fail 'self-test: Stable numeric sorting or channel isolation'
-  [[ $(select_release "$fixture/fields" nightly) == v0.0.1-nightly.20261017.10 ]] || fail 'self-test: Nightly numeric sorting or channel isolation'
-  version=0.0.1-nightly.20261017.10
+  [[ $(select_release "$fixture/fields" hourly) == v0.0.1-hourly.2026101710 ]] || fail 'self-test: hourly numeric sorting or channel isolation'
+  version=0.0.1-hourly.2026101710
   target=x86_64-unknown-linux-gnu
   package="vibeface-$version-$target"
   mkdir -p "$fixture/source/$package"
@@ -597,7 +600,7 @@ JSON
     archive_hash=$(sha256 "$fixture/package.tar.gz")
     archive_size=$(wc -c < "$fixture/package.tar.gz" | tr -d ' ')
     checksum_size=$(wc -c < "$fixture/checksum" | tr -d ' ')
-    printf '{"app":"product","version":"%s","tag":"v%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","channel":"nightly","schema":1,"assets":[{"name":"%s.tar.gz","size":%s,"sha256":"%s"},{"name":"%s.tar.gz.sha256","size":%s,"sha256":"%s"}]}\n' \
+    printf '{"app":"product","version":"%s","tag":"v%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","channel":"hourly","schema":1,"assets":[{"name":"%s.tar.gz","size":%s,"sha256":"%s"},{"name":"%s.tar.gz.sha256","size":%s,"sha256":"%s"}]}\n' \
       "$version" "$version" "$package" "$archive_size" "$archive_hash" "$package" "$checksum_size" "$checksum_hash" > "$fixture/release.json"
   }
   expect_failure() {
@@ -609,12 +612,12 @@ JSON
   repack_fixture
   case_dir="$test_dir/success"
   mkdir "$case_dir"
-  bash "$script" --channel nightly --install-root "$case_dir/root" --bin-dir "$case_dir/bin" > "$case_dir/output"
+  bash "$script" --channel hourly --install-root "$case_dir/root" --bin-dir "$case_dir/bin" > "$case_dir/output"
   [[ $("$case_dir/bin/vibeface" --version) == "vibeface $version" ]] || fail 'self-test: installed CLI'
   [[ $(readlink "$case_dir/root/current") == "releases/$version" ]] || fail 'self-test: current layout'
   [[ $(readlink "$case_dir/bin/vibeface") == "$case_dir/root/current/vibeface" ]] || fail 'self-test: bin layout'
   [[ -f "$case_dir/root/releases/$version/scripts/install-node-service.sh" ]] || fail 'self-test: incomplete package'
-  expect_failure nightly 'current already exists'
+  expect_failure hourly 'current already exists'
   [[ $(readlink "$case_dir/root/current") == "releases/$version" ]] || fail 'self-test: existing installation changed'
   local platform old_package
   for platform in aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-unknown-linux-gnu; do
@@ -632,45 +635,45 @@ JSON
     repack_fixture
     case_dir="$test_dir/$target"
     mkdir "$case_dir"
-    bash "$script" --channel nightly --install-root "$case_dir/root" --bin-dir "$case_dir/bin" > "$case_dir/output"
+    bash "$script" --channel hourly --install-root "$case_dir/root" --bin-dir "$case_dir/bin" > "$case_dir/output"
     [[ -f "$case_dir/root/releases/$version/BUILD-INFO.json" ]] || fail "self-test: platform selection $target"
   done
   case_dir="$test_dir/link-failure"
   mkdir "$case_dir"
   : > "$fixture/fail-link"
-  expect_failure nightly 'cannot create the CLI link'
+  expect_failure hourly 'cannot create the CLI link'
   [[ ! -e "$case_dir/root/current" && ! -L "$case_dir/root/current" && ! -e "$case_dir/root/releases/$version" ]] || fail 'self-test: activation failure left a selected or partial release'
   rm "$fixture/fail-link"
   case_dir="$test_dir/checksum"
   mkdir "$case_dir"
   printf '%064d  %s.tar.gz\n' 0 "$package" > "$fixture/checksum"
-  expect_failure nightly 'completion manifest digest'
+  expect_failure hourly 'completion manifest digest'
   [[ ! -e "$case_dir/root/current" && ! -L "$case_dir/root/current" ]] || fail 'self-test: failed checksum activated a release'
   repack_fixture
   case_dir="$test_dir/checksum-name"
   mkdir "$case_dir"
   printf '%s  ../%s.tar.gz\n' "$(sha256 "$fixture/package.tar.gz")" "$package" > "$fixture/checksum"
-  expect_failure nightly 'completion manifest target sizes mismatch'
+  expect_failure hourly 'completion manifest target sizes mismatch'
   repack_fixture
   case_dir="$test_dir/symlink"
   mkdir "$case_dir"
   ln -s /tmp/vibeface-outside "$fixture/source/$package/link"
   repack_fixture
-  expect_failure nightly 'archive contains links or special files'
+  expect_failure hourly 'archive contains links or special files'
   rm "$fixture/source/$package/link"
   case_dir="$test_dir/absolute-path"
   mkdir "$case_dir"
   tar -czPf "$fixture/package.tar.gz" "$fixture/source/$package" 2>/dev/null
   printf '%s  %s.tar.gz\n' "$(sha256 "$fixture/package.tar.gz")" "$package" > "$fixture/checksum"
   write_marker
-  expect_failure nightly 'archive contains unsafe or duplicate paths'
+  expect_failure hourly 'archive contains unsafe or duplicate paths'
   repack_fixture
   case_dir="$test_dir/package-protocol"
   mkdir "$case_dir"
   sed 's/"update_protocol":1/"update_protocol":2/' "$fixture/source/$package/BUILD-INFO.json" > "$fixture/unsupported-build"
   cp "$fixture/unsupported-build" "$fixture/source/$package/BUILD-INFO.json"
   repack_fixture
-  expect_failure nightly 'BUILD-INFO does not match'
+  expect_failure hourly 'BUILD-INFO does not match'
   sed 's/"update_protocol":2/"update_protocol":1/' "$fixture/source/$package/BUILD-INFO.json" > "$fixture/supported-build"
   cp "$fixture/supported-build" "$fixture/source/$package/BUILD-INFO.json"
   repack_fixture
@@ -681,7 +684,7 @@ JSON
     sed "s/\"data_epoch\":1/\"data_epoch\":$unsupported_epoch/" "$fixture/supported-build" > "$fixture/unsupported-build"
     cp "$fixture/unsupported-build" "$fixture/source/$package/BUILD-INFO.json"
     repack_fixture
-    expect_failure nightly 'BUILD-INFO does not match'
+    expect_failure hourly 'BUILD-INFO does not match'
   done
   cp "$fixture/supported-build" "$fixture/source/$package/BUILD-INFO.json"
   repack_fixture
@@ -689,30 +692,30 @@ JSON
   mkdir "$case_dir"
   sed 's/"app_version":"[^"]*"/"app_version":"0.0.1"/' "$fixture/supported-build" > "$fixture/source/$package/BUILD-INFO.json"
   repack_fixture
-  expect_failure nightly 'BUILD-INFO does not match'
+  expect_failure hourly 'BUILD-INFO does not match'
   for identity_field in core_source_commit app_source_commit; do
     case_dir="$test_dir/foreign-$identity_field"
     mkdir "$case_dir"
     sed "s/\"$identity_field\":\"[^\"]*\"/\"$identity_field\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"/" "$fixture/supported-build" > "$fixture/source/$package/BUILD-INFO.json"
     repack_fixture
-    expect_failure nightly 'BUILD-INFO does not match'
+    expect_failure hourly 'BUILD-INFO does not match'
   done
   cp "$fixture/supported-build" "$fixture/source/$package/BUILD-INFO.json"
   case_dir="$test_dir/unknown-build-field"
   mkdir "$case_dir"
   sed 's/}$/,"legacy":true}/' "$fixture/supported-build" > "$fixture/source/$package/BUILD-INFO.json"
   repack_fixture
-  expect_failure nightly 'invalid BUILD-INFO.json'
+  expect_failure hourly 'invalid BUILD-INFO.json'
   cp "$fixture/supported-build" "$fixture/source/$package/BUILD-INFO.json"
   case_dir="$test_dir/manifest"
   mkdir "$case_dir"
   printf '{"version":"wrong","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":1,"core_version":"%s","core_source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","app_version":"%s","app_source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\n' "$target" "$version" "$version" > "$fixture/source/$package/BUILD-INFO.json"
   repack_fixture
-  expect_failure nightly 'BUILD-INFO does not match'
+  expect_failure hourly 'BUILD-INFO does not match'
   case_dir="$test_dir/bin-conflict"
   mkdir -p "$case_dir/bin"
   printf 'preserve me\n' > "$case_dir/bin/vibeface"
-  expect_failure nightly 'already exists in the bin directory'
+  expect_failure hourly 'already exists in the bin directory'
   [[ $(cat "$case_dir/bin/vibeface") == 'preserve me' ]] || fail 'self-test: bin conflict changed'
   case_dir="$test_dir/no-stable"
   mkdir "$case_dir"
@@ -721,11 +724,11 @@ JSON
   [[ ! -e "$case_dir/root" ]] || fail 'self-test: no Stable release created installation directories'
   # Page-local indexes must not overwrite earlier candidates.
   json_fields "$fixture/releases.json" releases 1 > "$fixture/fields"
-  printf '[{"tag_name":"v0.0.1-nightly.20261017.2","draft":false,"prerelease":true}]\n' > "$fixture/page2.json"
+  printf '[{"tag_name":"v0.0.1-hourly.2026101702","draft":false,"prerelease":true}]\n' > "$fixture/page2.json"
   json_fields "$fixture/page2.json" releases 2 >> "$fixture/fields"
-  [[ $(select_release "$fixture/fields" nightly) == "v$version" ]] || fail 'self-test: pagination changed version selection'
+  [[ $(select_release "$fixture/fields" hourly) == "v$version" ]] || fail 'self-test: pagination changed version selection'
   json_fields "$fixture/page2.json" releases 2 > "$fixture/compact-fields"
-  awk 'BEGIN { print "["; print "{"; print "\"tag_name\":\"v0.0.1-nightly.20261017.2\","; print "\"draft\":false,"; print "\"prerelease\":true,"; printf "\"body\":\""; for (i=0;i<10000;i++) printf "ignored "; print "\""; print "}"; print "]" }' > "$fixture/pretty.json"
+  awk 'BEGIN { print "["; print "{"; print "\"tag_name\":\"v0.0.1-hourly.2026101702\","; print "\"draft\":false,"; print "\"prerelease\":true,"; printf "\"body\":\""; for (i=0;i<10000;i++) printf "ignored "; print "\""; print "}"; print "]" }' > "$fixture/pretty.json"
   json_fields "$fixture/pretty.json" releases 2 > "$fixture/pretty-fields"
   cmp "$fixture/compact-fields" "$fixture/pretty-fields" || fail 'self-test: pretty JSON changed release fields'
   case_dir="$test_dir/http-failure"
@@ -741,8 +744,8 @@ JSON
   progressive_releases() {
     cat > "$fixture/releases.json" <<'JSON'
 [
- {"tag_name":"v0.0.1-nightly.20261017.99","draft":false,"prerelease":true},
- {"tag_name":"v0.0.1-nightly.20261017.10","draft":false,"prerelease":true},
+ {"tag_name":"v0.0.1-hourly.2026101722","draft":false,"prerelease":true},
+ {"tag_name":"v0.0.1-hourly.2026101710","draft":false,"prerelease":true},
  {"tag_name":"v1.9.0","draft":false,"prerelease":false}
 ]
 JSON
@@ -762,37 +765,37 @@ JSON
   fi
   progressive_releases
   reset_progressive_markers
-  marker_code v0.0.1-nightly.20261017.99 404
+  marker_code v0.0.1-hourly.2026101722 404
   case_dir="$test_dir/progressive-fallback"
   mkdir -p "$case_dir/root" "$case_dir/bin"
-  bash "$script" --channel nightly --install-root "$case_dir/root" --bin-dir "$case_dir/bin" > "$case_dir/output"
+  bash "$script" --channel hourly --install-root "$case_dir/root" --bin-dir "$case_dir/bin" > "$case_dir/output"
   [[ $("$case_dir/bin/vibeface" --version) == "vibeface $version" ]] || fail 'self-test: progressive fallback installed older complete release'
   reset_progressive_markers
-  marker_code v0.0.1-nightly.20261017.99 200
+  marker_code v0.0.1-hourly.2026101722 200
   mkdir -p "$fixture/marker-body"
-  printf '{not-json' > "$fixture/marker-body/v0.0.1-nightly.20261017.99.json"
+  printf '{not-json' > "$fixture/marker-body/v0.0.1-hourly.2026101722.json"
   case_dir="$test_dir/corrupt-marker"
   mkdir "$case_dir"
-  expect_failure nightly 'invalid release completion manifest JSON'
+  expect_failure hourly 'invalid release completion manifest JSON'
   [[ ! -e "$case_dir/root/current" && ! -L "$case_dir/root/current" ]] || fail 'self-test: corrupt marker left a partial installation'
   reset_progressive_markers
   progressive_releases
-  marker_code v0.0.1-nightly.20261017.99 200
+  marker_code v0.0.1-hourly.2026101722 200
   write_marker
   mkdir -p "$fixture/marker-body"
-  cp "$fixture/release.json" "$fixture/marker-body/v0.0.1-nightly.20261017.99.json"
-  sed 's/"tag":"v'"$version"'"/"tag":"v0.0.1-nightly.20261017.99"/' \
-    "$fixture/marker-body/v0.0.1-nightly.20261017.99.json" > "$fixture/marker-body/v0.0.1-nightly.20261017.99.json.tmp"
-  mv "$fixture/marker-body/v0.0.1-nightly.20261017.99.json.tmp" "$fixture/marker-body/v0.0.1-nightly.20261017.99.json"
+  cp "$fixture/release.json" "$fixture/marker-body/v0.0.1-hourly.2026101722.json"
+  sed 's/"tag":"v'"$version"'"/"tag":"v0.0.1-hourly.2026101722"/' \
+    "$fixture/marker-body/v0.0.1-hourly.2026101722.json" > "$fixture/marker-body/v0.0.1-hourly.2026101722.json.tmp"
+  mv "$fixture/marker-body/v0.0.1-hourly.2026101722.json.tmp" "$fixture/marker-body/v0.0.1-hourly.2026101722.json"
   case_dir="$test_dir/marker-identity"
   mkdir "$case_dir"
-  expect_failure nightly 'release completion manifest identity or target binding is invalid'
+  expect_failure hourly 'release completion manifest identity or target binding is invalid'
   reset_progressive_markers
   printf '[{"tag_name":"v%s","draft":false,"prerelease":true}]\n' "$version" > "$fixture/releases.json"
   marker_code "v$version" 503
   case_dir="$test_dir/marker-transport"
   mkdir "$case_dir"
-  expect_failure nightly 'completion manifest request failed with HTTP 503'
+  expect_failure hourly 'completion manifest request failed with HTTP 503'
   reset_progressive_markers
   repack_fixture
   marker_code "v$version" 200
@@ -804,14 +807,14 @@ JSON
   mv "$fixture/marker-body/v$version.json.tmp" "$fixture/marker-body/v$version.json"
   case_dir="$test_dir/manifest-source"
   mkdir "$case_dir"
-  expect_failure nightly 'completion manifest source does not match release tag'
+  expect_failure hourly 'completion manifest source does not match release tag'
   reset_progressive_markers
   progressive_releases
-  marker_code v0.0.1-nightly.20261017.99 404
-  marker_code v0.0.1-nightly.20261017.10 404
+  marker_code v0.0.1-hourly.2026101722 404
+  marker_code v0.0.1-hourly.2026101710 404
   case_dir="$test_dir/no-complete-channel"
   mkdir "$case_dir"
-  expect_failure nightly 'no published Nightly release'
+  expect_failure hourly 'no published hourly release'
   reset_progressive_markers
   service_self_test "$(dirname "$script")/scripts/install-node-service.sh" "$test_dir/service"
   printf 'Public installer self-test passed: channels, numeric sorting, layout, SHA256, manifest, links, paths, progressive completion, and existing-install protection.\n'

@@ -57,6 +57,7 @@ const eventTitles: Record<string, string | ((fields: Fields, name: (device?: str
   'question.answered': '问题已回答',
   'question.closed': '问题已关闭',
   'schedule.skipped_late': '错过了定时，已跳过',
+  'schedule.fired': '定时任务到点，已排队',
   'session.attributed': '新会话归给主 Bot',
   'sync.event_rejected': '拒收了一条不合规的记录',
   'work.dispatched': (f, name) => f.target ? `任务已交给「${name(str(f.target))}」` : '收到任务',
@@ -92,6 +93,8 @@ const eventTitles: Record<string, string | ((fields: Fields, name: (device?: str
   'request.question_lookup_failed': '没找到请求对应的问题',
   'request.expire_failed': '过期的请求没能回复',
   'triage.test_received': '收到测试提醒',
+  'triage.queued': '收到一条会话动态',
+  'triage.concluded': (f) => f.conclusion === 'raise' ? 'Bot 看过会话动态，向你提问' : 'Bot 看过会话动态，不用处理',
   'triage.wake_failed': '没能把会话动态交给 Bot',
   'webhook.failed': '外部聊天发送失败',
   'webhook.dead': '外部聊天多次发送失败，已放弃',
@@ -104,6 +107,23 @@ const eventTitles: Record<string, string | ((fields: Fields, name: (device?: str
   'relay.started': '转发已开启',
   'join.local_failed': '这台电脑没能加入',
   'network.removed': '这台电脑已被移出网络',
+  'node.started': (f) => str(f.version) ? `节点已启动（${str(f.version)}）` : '节点已启动',
+  'node.start_failed': '节点没能启动',
+  'node.stopping': (f) => f.error ? '节点出错，正在停止' : '节点正在停止',
+  'node.stopped': '节点已停止',
+  'input.accepted': '收到一条消息',
+  'input.admitted': '消息已排队',
+  'input.rejected': '消息没有收下',
+  'input.delivered': (f, name) => `「${name(str(f.origin))}」转来一条消息或任务结果`,
+  'peer.online': (f, name) => `和「${name(str(f.peer))}」同步上了`,
+  'peer.offline': (f, name) => `和「${name(str(f.peer))}」同步不上`,
+  'mesh.neighbor_up': '连上一个全网邻居',
+  'mesh.neighbor_down': '一个全网邻居断开了',
+  'net.accept_failed': '一个连进来的连接出错断开',
+  'update.checked': (f) => str(f.available_version) ? `发现新版本 ${str(f.available_version)}` : '已是最新版本',
+  'update.deferred': '节点正忙，更新推迟',
+  'update.applied': (f) => str(f.version) ? `已更新到 ${str(f.version)}` : '已更新',
+  'update.failed': '更新失败',
   'node.data_set_aside': '旧数据已改名保留',
   'node.data_set_aside_failed': '旧数据没能改名保留',
   'recovery.install_pending': '找回结果稍后生效',
@@ -233,6 +253,7 @@ function LogRow({ record, name, chat, task, open, onToggle, onCopyAll }: { recor
         <span className="flex min-w-0 items-center gap-2 text-meta text-muted-foreground">
           <time className="shrink-0 tabular-nums" dateTime={new Date(record.ts_ms).toISOString()}>{time(record.ts_ms)}</time>
           {record.source === 'node' ? null : <span className="shrink-0">{sourceLabel[record.source]}</span>}
+          {typeof record.fields?.repeated === 'number' ? <span className="shrink-0">又出现 {record.fields.repeated} 次</span> : null}
         </span>
       </span>
       <ChevronDown aria-hidden="true" className={cn('mt-0.5 size-4 shrink-0 text-muted-foreground transition-transform duration-200', open && 'rotate-180')} />

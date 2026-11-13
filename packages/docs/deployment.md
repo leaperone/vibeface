@@ -145,13 +145,13 @@ vibeface hooks status [--home '<同一个目录>']
 ```sh
 export VIBEFACE_INSTALL_ROOT='<程序安装目录的绝对路径>'
 export VIBEFACE_BIN_DIR='<命令目录的绝对路径>'
-bash install.sh --channel nightly --install-root "$VIBEFACE_INSTALL_ROOT" --bin-dir "$VIBEFACE_BIN_DIR"
+bash install.sh --channel hourly --install-root "$VIBEFACE_INSTALL_ROOT" --bin-dir "$VIBEFACE_BIN_DIR"
 ```
 
 使用受管更新或原生后台服务前，登记安装目录：
 
 ```sh
-vibeface update configure --channel nightly --automatic false --install-root "$VIBEFACE_INSTALL_ROOT"
+vibeface update configure --channel hourly --automatic false --install-root "$VIBEFACE_INSTALL_ROOT"
 vibeface service install
 ```
 

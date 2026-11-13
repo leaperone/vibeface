@@ -661,7 +661,7 @@ vibeface service uninstall
     --automatic true
 ```
 
-将 `stable` 改为 `nightly` 可跟随开发预发布。Stable 不会安装 Nightly；尚无正式版时不会自动更换版本。切换渠道不触发降级。更新渠道和安装目录必须先配置；已有 Nightly 安装应显式选择 `nightly`。
+将 `stable` 改为 `hourly` 可跟随开发预发布。Stable 不会安装 Hourly；尚无正式版时不会自动更换版本。切换渠道不触发降级。更新渠道和安装目录必须先配置；已有 Hourly 安装应显式选择 `hourly`。
 
 查看策略和最近结果、主动检查或立即尝试升级：
 

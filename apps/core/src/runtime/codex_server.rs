@@ -33,21 +33,6 @@ fn last_answer(turn: &Value) -> String {
         .into()
 }
 
-fn missing_thread(error: &CodexError) -> bool {
-    if !error.answered {
-        return false;
-    }
-    let missing = |message: &str| message.to_ascii_lowercase().starts_with("thread not found");
-    if let Some(body) = error.message.strip_prefix("Codex rejected request: ") {
-        let Ok(body) = serde_json::from_str::<Value>(body) else {
-            return false;
-        };
-        body["message"].as_str().is_some_and(missing)
-    } else {
-        missing(&error.message)
-    }
-}
-
 /// Whether a turn carries the user message the caller sent with this `clientUserMessageId`.
 pub(crate) fn sent_by(turn: &Value, client_id: &str) -> bool {
     turn["items"]
@@ -207,7 +192,7 @@ impl CodexServer {
         {
             Ok(reply) => reply,
             // Only the App Server saying it has no such thread makes the turn missing.
-            Err(error) if missing_thread(&error) => {
+            Err(error) if error.missing_thread() => {
                 self.inner.release(&format!("manager:{client_id}"));
                 return Ok(Probe::Missing);
             }
@@ -1279,31 +1264,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_provider_refusal_does_not_prove_an_unknown_turn_ended() {
-        let error = |message: &str, answered| CodexError {
-            uncertain: false,
-            answered,
-            message: message.into(),
-        };
-        assert!(missing_thread(&error("thread not found: fixture", true)));
-        assert!(!missing_thread(&error("authentication required", true)));
-        assert!(!missing_thread(&error("server request rejected", true)));
-        assert!(!missing_thread(&error("thread not found", false)));
-        let wrapped =
-            r#"Codex rejected request: {"code":-32602,"message":"thread not found: fixture"}"#;
-        assert!(missing_thread(&error(wrapped, true)));
-        assert!(!missing_thread(&error(wrapped, false)));
-        assert!(!missing_thread(&error(
-            r#"Codex rejected request: {"message":"authentication failed while reading thread not found"}"#,
-            true
-        )));
-        assert!(!missing_thread(&error(
-            "Codex rejected request: not-json",
-            true
-        )));
-    }
-
-    #[test]
     fn model_choices_take_the_name_thread_start_uses_and_skip_hidden_ones() {
         let page = json!({"data":[
             {"id":"a","model":"gpt-a","displayName":"GPT A","isDefault":true},
@@ -1540,6 +1500,9 @@ mod tests {
                         let turn = turn.lock().unwrap().clone();
                         let reply = if turn.is_null() {
                             json!({"id":request["id"],"error":{"code":-32000,"message":"fixture unavailable"}})
+                        } else if let Some(refusal) = turn.as_str() {
+                            // The App Server's own refusal, in its wording.
+                            json!({"id":request["id"],"error":{"code":-32600,"message":refusal}})
                         } else {
                             json!({"id":request["id"],"result":{"thread":{"turns":[turn]}}})
                         };
@@ -2268,6 +2231,51 @@ raise SystemExit(7)
         assert!(!ran.exists(), "the Node never started an App Server");
         assert!(!dir.join("codex-app-server.pid").exists());
         restarted.abort();
+        std::fs::remove_dir_all(sockets)?;
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// Codex 0.167 answers `thread/read` with "thread not loaded" for a thread in neither its
+    /// Codex folder nor its memory, as after the Node moved to another App Server.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_thread_the_app_server_does_not_have_is_probed_as_missing() -> Result<()> {
+        let dir = artifacts("codex-missing-thread")?;
+        let sockets = sockets()?;
+        let socket = sockets.join("app.sock");
+        let refusal = Arc::new(std::sync::Mutex::new(json!("thread not loaded: gone")));
+        let fixture = system_app_server(&socket, "codex/fixture", Some(refusal.clone()));
+        let local = Local {
+            switches: crate::providers::Providers {
+                execution: [Provider::Codex].into(),
+                execution_models: BTreeMap::new(),
+                codex_app_server: crate::providers::AppServer {
+                    mode: AppServerMode::System,
+                    socket: Some(socket),
+                },
+                opencode_endpoint: None,
+            },
+            bins: BTreeMap::new(),
+            env: ProviderEnv::default(),
+        };
+        let identity = LocalIdentity::generate();
+        let (events, _events) = vibeface_bridge::codex::event_channel();
+        let server = CodexServer::open(local.codex_target(false), &identity, &dir, events)?;
+        server.start();
+        link_becomes(&server, |link| matches!(link, Link::Connected { .. })).await;
+        assert_eq!(
+            server.probe("gone", Some("turn"), "work").await?,
+            Probe::Missing
+        );
+        *refusal.lock().unwrap() = json!("authentication required");
+        assert!(
+            server.probe("gone", Some("turn"), "work").await.is_err(),
+            "another refusal leaves the turn unknown"
+        );
+        server.stop().await;
+        fixture.abort();
+        std::fs::remove_dir_all(server.socket().parent().unwrap())?;
         std::fs::remove_dir_all(sockets)?;
         std::fs::remove_dir_all(dir)?;
         Ok(())

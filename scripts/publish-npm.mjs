@@ -11,17 +11,18 @@ const publisherJob = 'publish-product';
 const registry = 'https://registry.npmjs.org/';
 const packageName = '@leaperone/vibeface';
 
-function nightly(version) {
-  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-nightly\.(\d{8})\.([1-9]\d*)$/.exec(version);
-  assert(match, 'invalid canonical Nightly version');
-  const day = `${match[4].slice(0, 4)}-${match[4].slice(4, 6)}-${match[4].slice(6, 8)}`;
-  assert(Number(match[4].slice(0, 4)) > 0 && new Date(`${day}T00:00:00Z`).toISOString().startsWith(day), 'invalid Nightly date');
+function hourly(version) {
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-hourly\.(\d{10})$/.exec(version);
+  assert(match, 'invalid canonical Hourly version');
+  const [year, month, day, hour] = [match[4].slice(0, 4), match[4].slice(4, 6), match[4].slice(6, 8), match[4].slice(8)];
+  const stamp = `${year}-${month}-${day}T${hour}:00:00Z`;
+  assert(Number(year) > 0 && Number(hour) < 24 && new Date(stamp).toISOString().startsWith(stamp.slice(0, 13)), 'invalid Hourly date');
   return match.slice(1).map(BigInt);
 }
 
 function compare(left, right) {
-  const before = nightly(right);
-  return nightly(left).map((part, index) => part - before[index]).find(part => part !== 0n) ?? 0n;
+  const before = hourly(right);
+  return hourly(left).map((part, index) => part - before[index]).find(part => part !== 0n) ?? 0n;
 }
 
 function github(endpoint, key) {
@@ -41,7 +42,7 @@ function completedJob(api, runId, leaf, message) {
 
 function resolveArtifact({ tag, sha, runId, artifactId, workflowRef }, api = github, now = Date.now()) {
   assert(/^v(0|[1-9][0-9]*)\./.test(tag), 'product v tag is required');
-  nightly(tag.slice(1));
+  hourly(tag.slice(1));
   assert(/^[a-f0-9]{40}$/.test(sha), 'full source SHA is required');
   assert(/^[1-9]\d*$/.test(runId), 'current workflow run id is required');
   assert.equal(workflowRef, `${repository}/.github/workflows/${artifactId ? 'release.yml' : 'npm-publish.yml'}@refs/tags/${tag}`,
@@ -106,30 +107,30 @@ function registryState(packument, version, integrity) {
   const object = value => value && typeof value === 'object' && !Array.isArray(value);
   assert(object(packument) && object(packument.versions) && object(packument['dist-tags']), 'invalid npm packument');
   const current = packument.versions[version];
-  const latest = packument['dist-tags'].nightly;
+  const latest = packument['dist-tags'].hourly;
   if (latest !== undefined) {
-    nightly(latest);
-    assert(typeof packument.versions[latest]?.dist?.integrity === 'string', 'nightly points to a missing registry version');
+    hourly(latest);
+    assert(typeof packument.versions[latest]?.dist?.integrity === 'string', 'hourly points to a missing registry version');
   }
   if (current !== undefined) {
     assert.equal(current?.dist?.integrity, integrity, 'published version integrity mismatch');
     return latest !== undefined && compare(latest, version) >= 0n ? 'complete' : 'unreconciled';
   }
-  assert(latest !== undefined && compare(version, latest) > 0n, 'Nightly must advance; reconcile the registry before publishing');
-  return 'absent';
+  // Hourly releases finish out of order; an older hour must not move the dist-tag back.
+  return latest === undefined || compare(version, latest) > 0n ? 'absent' : 'superseded';
 }
 
 async function publishOnce(version, integrity, { read = readRegistry, publish, pause = sleep, attempts = 40 }) {
   const state = registryState(await read(), version, integrity);
-  if (state === 'complete') return;
-  assert.equal(state, 'absent', 'existing version has a missing or older nightly tag; reconcile without republishing');
+  if (state === 'complete' || state === 'superseded') return state;
+  assert.equal(state, 'absent', 'existing version has a missing or older hourly tag; reconcile without republishing');
   let result;
   try { result = await publish(); } catch (error) { result = error.message; }
-  let lastError = 'version or nightly tag is not visible yet';
+  let lastError = 'version or hourly tag is not visible yet';
   for (let attempt = 0; attempt < attempts; attempt++) {
     if (attempt) await pause(15000);
     try {
-      if (registryState(await read(), version, integrity) === 'complete') return;
+      if (registryState(await read(), version, integrity) === 'complete') return 'complete';
     } catch (error) {
       if (error.message.includes('integrity mismatch')) throw error;
       lastError = error.message;
@@ -139,7 +140,7 @@ async function publishOnce(version, integrity, { read = readRegistry, publish, p
 }
 
 async function selfTest() {
-  const sha = 'a'.repeat(40), version = '0.0.1-nightly.20261106.1', newer = '0.0.1-nightly.20261106.2';
+  const sha = 'a'.repeat(40), version = '0.0.1-hourly.2026110610', newer = '0.0.1-hourly.2026110611';
   const tag = `v${version}`, integrity = 'sha512-fixture';
   const run = { id: 7, head_sha: sha, head_branch: tag, path: workflow, run_attempt: 2, event: 'push',
     repository: { full_name: repository }, head_repository: { full_name: repository }, status: 'in_progress', conclusion: null };
@@ -187,15 +188,19 @@ async function selfTest() {
   const packument = (latest = version, published = true) => ({
     versions: { ...(published ? { [version]: { dist: { integrity } } } : {}),
       ...(latest && latest !== version ? { [latest]: { dist: { integrity: 'sha512-other' } } } : {}) },
-    'dist-tags': latest ? { nightly: latest } : {},
+    'dist-tags': latest ? { hourly: latest } : {},
   });
   assert.equal(registryState(packument(), version, integrity), 'complete');
   assert.equal(registryState(packument(newer), version, integrity), 'complete');
   assert.equal(registryState(null, version, integrity), 'absent');
-  assert.equal(registryState(packument('0.0.1-nightly.20261105.1', false), version, integrity), 'absent');
+  assert.equal(registryState(packument('0.0.1-hourly.2026110523', false), version, integrity), 'absent');
   assert.throws(() => registryState(packument(), version, 'sha512-different'), /integrity mismatch/);
-  assert.throws(() => registryState(packument(newer, false), version, integrity), /must advance/);
-  for (const value of [{}, [], { versions: [], 'dist-tags': {} }, { versions: {}, 'dist-tags': { nightly: 'latest' } }]) {
+  assert.equal(registryState(packument(newer, false), version, integrity), 'superseded');
+  assert.equal(registryState({ versions: {}, 'dist-tags': {} }, version, integrity), 'absent');
+  assert.equal(await publishOnce(version, integrity, { read: async () => packument(newer, false), publish: () => assert.fail('superseded must not publish') }), 'superseded');
+  assert.throws(() => hourly('0.0.1-nightly.20261106.1'), /invalid canonical Hourly version/);
+  assert.throws(() => hourly('0.0.1-hourly.2026110624'), /invalid Hourly date/);
+  for (const value of [{}, [], { versions: [], 'dist-tags': {} }, { versions: {}, 'dist-tags': { hourly: 'latest' } }]) {
     assert.throws(() => registryState(value, version, integrity));
   }
   assert.equal(await readRegistry(async () => ({ status: 404 })), null);
@@ -209,13 +214,13 @@ async function selfTest() {
     await publishOnce(version, integrity, { read: async () => value, publish });
     assert.equal(writes, 0);
   }
-  for (const latest of [null, '0.0.1-nightly.20261105.1']) {
+  for (const latest of [null, '0.0.1-hourly.2026110523']) {
     await assert.rejects(publishOnce(version, integrity, { read: async () => packument(latest), publish }), /reconcile without republishing/);
     assert.equal(writes, 0);
   }
   await assert.rejects(publishOnce(version, 'sha512-different', { read: async () => packument(), publish }), /integrity mismatch/);
   assert.equal(writes, 0);
-  const reads = [packument('0.0.1-nightly.20261105.1', false), null, new Error('transient read failed'), packument(null), packument(newer)];
+  const reads = [packument('0.0.1-hourly.2026110523', false), null, new Error('transient read failed'), packument(null), packument(newer)];
   await publishOnce(version, integrity, { read: async () => {
     const value = reads.shift();
     if (value instanceof Error) throw value;
@@ -228,7 +233,7 @@ async function selfTest() {
     await assert.rejects(publishOnce(version, integrity, { read, publish }));
     assert.equal(writes, 2);
   }
-  console.log('npm publication self-test passed: successful collect producer and published product, exact source and artifact, original producer attempt reuse, honest npm failure recovery, registry integrity, monotonic Nightly, and publish-once reconciliation.');
+  console.log('npm publication self-test passed: successful collect producer and published product, exact source and artifact, original producer attempt reuse, honest npm failure recovery, registry integrity, monotonic Hourly with out-of-order skips, and publish-once reconciliation.');
 }
 
 try {
@@ -242,7 +247,7 @@ try {
     assert.equal(process.env.GITHUB_REF, `refs/tags/${tag}`, 'workflow ref must match the release tag');
     assert(/^v(0|[1-9][0-9]*)\./.test(tag), 'product v tag is required');
     const version = tag.slice(1);
-    nightly(version);
+    hourly(version);
     if (command === 'artifact') {
       const result = resolveArtifact({ tag, sha: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID,
         artifactId: process.env.NPM_ARTIFACT_ID, workflowRef: process.env.GITHUB_WORKFLOW_REF });
@@ -255,12 +260,14 @@ try {
       assert.equal(receipt.version, version);
       assert.equal(receipt.source_commit, process.env.GITHUB_SHA);
       assert(/^sha512-[A-Za-z0-9+/]+={0,2}$/.test(receipt.integrity), 'invalid package integrity');
-      await publishOnce(version, receipt.integrity, { publish: () => {
-        const result = spawnSync('npm', ['publish', archive, '--tag', 'nightly', '--access', 'public', '--provenance',
+      const state = await publishOnce(version, receipt.integrity, { publish: () => {
+        const result = spawnSync('npm', ['publish', archive, '--tag', 'hourly', '--access', 'public', '--provenance',
           '--ignore-scripts', `--registry=${registry}`], { stdio: 'inherit' });
         return result.error?.message ?? `npm exit ${result.status}`;
       } });
-      console.log(`Verified ${packageName}@${version} integrity with nightly at this version or newer.`);
+      console.log(state === 'superseded'
+        ? `Skipped ${packageName}@${version}; hourly already points to a newer version.`
+        : `Verified ${packageName}@${version} integrity with hourly at this version or newer.`);
     }
   }
 } catch (error) {

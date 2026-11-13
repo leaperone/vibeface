@@ -15,7 +15,7 @@ description: 准备匹配当前源码的程序，创建个人网络，让第一�
 
 Vibeface 不提供模型账号，也不安装 Agent。自动接入可复用 Codex、Claude Code 和 Cursor 的本机 CLI 登录，Node 会话保持私有；缺认证时设备设置提供登录命令。访问镜像到期需要原 CLI 提供新访问令牌或为 Node 独立登录。Pi 沿用本机认证，OpenCode 使用私有目录；显式环境认证继续优先。
 
-## 1. 安装 Nightly
+## 1. 安装 Hourly
 
 本指南对应 CLI、Core 与 App 的完整包。先检查 [Releases](https://github.com/leaperone/vibeface/releases) 中的包同时包含 `vibeface`、`vibeface-core` 和 `web/`。首次正式版使用 data epoch 1，旧开发版数据和包不受支持。首次运行使用全新数据目录。
 
@@ -25,7 +25,7 @@ Vibeface 不提供模型账号，也不安装 Agent。自动接入可复用 Code
 export VIBEFACE_INSTALL_ROOT="$HOME/.local/share/vibeface"
 export VIBEFACE_BIN_DIR="$HOME/.local/bin"
 curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh -o /tmp/vibeface-install.sh
-bash /tmp/vibeface-install.sh --channel nightly \
+bash /tmp/vibeface-install.sh --channel hourly \
 	--install-root "$VIBEFACE_INSTALL_ROOT" \
 	--bin-dir "$VIBEFACE_BIN_DIR"
 export PATH="$VIBEFACE_BIN_DIR:$PATH"

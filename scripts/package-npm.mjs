@@ -53,11 +53,13 @@ function verifyTarMetadata(compressed) {
   }
 }
 
-function nightly(version) {
-  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-nightly\.(\d{8})\.([1-9]\d*)$/.exec(version);
-  assert(match, 'npm packaging only accepts canonical Nightly versions');
-  const day = `${match[4].slice(0, 4)}-${match[4].slice(4, 6)}-${match[4].slice(6, 8)}`;
-  assert(Number(match[4].slice(0, 4)) > 0 && new Date(`${day}T00:00:00Z`).toISOString().startsWith(day), 'invalid Nightly date');
+function hourly(version) {
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-hourly\.(\d{10})$/.exec(version ?? '');
+  assert(match, 'npm packaging only accepts canonical hourly versions');
+  const hour = `${match[4].slice(0, 4)}-${match[4].slice(4, 6)}-${match[4].slice(6, 8)}T${match[4].slice(8, 10)}`;
+  const parsed = new Date(`${hour}:00:00Z`);
+  assert(Number(match[4].slice(0, 4)) > 0 && !Number.isNaN(parsed.getTime()) && parsed.toISOString().startsWith(hour),
+    'invalid hourly date');
 }
 
 function unpack(archive, destination, root) {
@@ -89,7 +91,7 @@ function nativePackage(directory, version, target, sourceCommit) {
   assert.deepEqual([info.version, info.target, info.source_commit, info.update_protocol, info.data_epoch],
     [version, target, sourceCommit, updateProtocol, dataEpoch], 'native package identity mismatch');
   for (const field of ['core_version', 'app_version']) {
-    nightly(info[field]);
+    hourly(info[field]);
     assert.equal(info[field], version, 'component versions must equal the bundled product version');
   }
   for (const field of ['core_source_commit', 'app_source_commit']) {
@@ -139,7 +141,7 @@ function verify(archive, version, sourceCommit, scratch) {
 }
 
 function pack(input, output, version, sourceCommit) {
-  nightly(version);
+  hourly(version);
   assert(/^[0-9a-f]{40}$/.test(sourceCommit), 'a full source commit is required');
   const names = targets.map(target => `vibeface-${version}-${target}.tar.gz`);
   assert.deepEqual(fs.readdirSync(input).sort(), names.flatMap(name => [name, `${name}.sha256`]).sort(),
@@ -182,7 +184,7 @@ async function selfTest() {
   const artifacts = path.join(repo, '.artifacts');
   fs.mkdirSync(artifacts, { recursive: true });
   const scratch = fs.mkdtempSync(path.join(artifacts, 'npm-self-test-'));
-  const version = '1.2.3-nightly.20261019.1';
+  const version = '1.2.3-hourly.2026101909';
   const commit = 'a'.repeat(40);
   try {
     const input = path.join(scratch, 'input');
@@ -257,11 +259,11 @@ async function selfTest() {
     repack(target);
     assert.throws(() => pack(input, path.join(scratch, 'unknown-field'), version, commit), /unsupported build info fields/);
     for (const field of ['core_version', 'app_version']) {
-      fs.writeFileSync(manifest, JSON.stringify({ ...build, [field]: '0.0.1' }));
+      fs.writeFileSync(manifest, JSON.stringify({ ...build, [field]: '1.2.3-nightly.20261019.1' }));
       repack(target);
-      assert.throws(() => pack(input, path.join(scratch, `mixed-${field}`), version, commit), /Nightly versions/);
-      // A same-channel Nightly from another cohort is still a foreign component.
-      fs.writeFileSync(manifest, JSON.stringify({ ...build, [field]: '1.2.3-nightly.20261019.2' }));
+      assert.throws(() => pack(input, path.join(scratch, `mixed-${field}`), version, commit), /canonical hourly versions/);
+      // A same-channel hourly release from another cohort is still a foreign component.
+      fs.writeFileSync(manifest, JSON.stringify({ ...build, [field]: '1.2.3-hourly.2026101910' }));
       repack(target);
       assert.throws(() => pack(input, path.join(scratch, `cohort-${field}`), version, commit), /must equal the bundled product version/);
     }
@@ -308,8 +310,13 @@ async function selfTest() {
     fs.symlinkSync('/tmp/vibeface-outside-package', path.join(sources.get(target), 'link'));
     repack(target);
     assert.throws(() => pack(input, path.join(scratch, 'unsafe-archive'), version, commit), /links or special files/);
-    assert.throws(() => nightly('1.2.3'), /Nightly versions/);
-    assert.throws(() => nightly('1.2.3-nightly.20260229.1'), /invalid Nightly date/);
+    hourly('1.2.3-hourly.2026101923');
+    for (const invalid of ['1.2.3', '1.2.3-rc.1', '1.2.3-nightly.20261019.1', '1.2.3-hourly.20261019', '1.2.3-hourly.2026101900.1']) {
+      assert.throws(() => hourly(invalid), /canonical hourly versions/);
+    }
+    for (const invalid of ['1.2.3-hourly.2026022912', '1.2.3-hourly.2026101924', '1.2.3-hourly.0000101900']) {
+      assert.throws(() => hourly(invalid), /invalid hourly date/);
+    }
     console.log(`npm self-test passed: complete epoch-1 packages, one cohort version and source across all ${targets.length} targets including Windows .exe vendors, old-epoch rejection, global install without scripts, arguments, exit status, signals, checksums, source identity, protocol and unsafe archive rejection.`);
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
@@ -328,7 +335,7 @@ try {
       options.set(flag, args.shift());
     }
     const version = /^version = "([^"]+)"$/m.exec(fs.readFileSync(path.join(repo, 'apps/cli/Cargo.toml'), 'utf8'))?.[1];
-    nightly(version);
+    hourly(version);
     const commit = options.get('--source-commit') ?? run('git', ['rev-parse', 'HEAD'], { cwd: repo }).trim();
     assert(/^[0-9a-f]{40}$/.test(commit), 'a full source commit is required');
     const output = path.resolve(options.get('--output') ?? path.join(repo, '.artifacts/npm'));
