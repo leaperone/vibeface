@@ -808,6 +808,7 @@ impl Runtime {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .manager = manager;
+            self.codex.set_user_socket(next.user_codex_socket());
             *self.providers.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = next;
             if triage != previous_triage {
                 self.triage.set_config(triage);
@@ -1082,13 +1083,9 @@ impl ProposalInput {
         }
         Ok(Paths {
             execution: self.execution,
-            app_server: existing(self.app_server_socket, "app_server_socket", |path| {
+            app_server_socket: existing(self.app_server_socket, "app_server_socket", |path| {
                 path.symlink_metadata().is_ok()
-            })?
-            .map(|socket| AppServer {
-                mode: AppServerMode::System,
-                socket: Some(socket),
-            }),
+            })?,
             codex_home: None,
             bins: self
                 .bins
@@ -1134,7 +1131,7 @@ impl Runtime {
                 .execution
                 .iter()
                 .any(|provider| provider.on_app_server())
-            || given.app_server.is_some()
+            || given.app_server_socket.is_some()
             || given.codex_sessions.is_some();
         let (mut local, mut manager, mut triage) = (
             self.providers(),
@@ -1264,12 +1261,10 @@ impl Runtime {
         } else {
             "要改这个节点的这些 AI 设置吗？".to_owned()
         }];
-        if let Some(server) = &paths.app_server {
-            lines.push(match (&server.mode, &server.socket) {
-                (AppServerMode::System, Some(socket)) => {
-                    format!("连接已在运行的 Codex：{}", shown(socket))
-                }
-                _ => "由 Vibeface 启动 Codex".into(),
+        if let Some(socket) = &paths.app_server_socket {
+            lines.push(match self.providers().switches.codex_app_server.mode {
+                AppServerMode::System => format!("连接已在运行的 Codex：{}", shown(socket)),
+                AppServerMode::Spawn => format!("回复送进你自己的 Codex 会话：{}", shown(socket)),
             });
         }
         let named = [

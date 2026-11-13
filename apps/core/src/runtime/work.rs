@@ -147,7 +147,8 @@ impl Runtime {
         Ok(record)
     }
 
-    /// Threads of live work stay subscribed across App Server reconnects.
+    /// Threads of live work stay subscribed across App Server reconnects. Threads on the user's
+    /// own Codex are only probed: the Node keeps no connection there.
     async fn observe_live_threads(&self) {
         let threads = self
             .store
@@ -157,6 +158,7 @@ impl Runtime {
             .into_iter()
             .filter(|record| live(record) && on_app_server(record))
             .filter_map(|record| record.state.thread().map(str::to_owned))
+            .filter(|thread| self.codex.user_thread(thread).is_none())
             .collect();
         let _ = self.codex.observe(threads);
     }
@@ -1435,10 +1437,19 @@ impl Runtime {
                 if let Err(error) = self.probe_work(&network, &record.work_id, false).await {
                     tracing::debug!(%error, "work probe after reconnect failed");
                 }
-            } else if record.state.handle().is_some() {
+            } else if record.state.handle().is_some()
+                && record
+                    .state
+                    .thread()
+                    .is_none_or(|thread| self.codex.user_thread(thread).is_none())
+            {
                 self.signal_work(&network, &record.work_id, Signal::Disconnected)
                     .await?;
             }
+        }
+        // The probes found which threads are on the user's own Codex.
+        if connected {
+            self.observe_live_threads().await;
         }
         Ok(())
     }
