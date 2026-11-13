@@ -300,7 +300,7 @@ pub fn record_addr(record: &MeshRecord, allow_private: bool) -> Result<EndpointA
 }
 
 /// The remembered Nodes worth joining again: publicly reachable ones, or any with an address on
-/// a private mesh, most recently seen first.
+/// a private mesh, online first and then most recently seen.
 fn recent<'a>(table: &'a Table, own: &str, allow_private: bool) -> Vec<&'a Entry> {
     let known: Vec<&Entry> = table
         .entries()
