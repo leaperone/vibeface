@@ -104,6 +104,8 @@ bash install.sh --channel hourly --install-root "$VIBEFACE_INSTALL_ROOT" --bin-d
 
 已有 `current` 或同名 bin 文件时，安装器保留原文件并拒绝安装。 旧版 CLI 只识别 `cli-v`，首次切换统一产品 Tag 需要手动安装新版完整包。先确认旧任务与更新已结束，关闭旧自动更新并停止旧服务，再安装到新的安装目录与命令目录，由新入口注册服务。保留原数据目录；这次 Tag 调整不改变数据 epoch。新版本之后的更新器只跟踪 `v`，不会回退旧应用前缀。受管安装通过 `update apply` 升级，不能绕过正在运行节点的维护检查。更新和服务管理需要完整包。
 
+从 Nightly 切换到 Hourly 不会自动完成：按 semver 规则 `hourly` 低于 `nightly`，更新器和桌面 App 会把新版本当作降级拒绝，新版本也不认识旧的 `nightly` 更新策略。停止旧服务后，删除数据目录中的 `update.json`，再用 `--channel hourly` 安装到新的安装目录与命令目录。数据目录保留，data epoch 不变。
+
 自定义位置需使用绝对路径，并保持安装根目录和 bin 目录为普通目录：
 
 ```sh

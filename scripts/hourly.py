@@ -196,24 +196,16 @@ def release_runs(tag, source):
 
 
 def create_source(base, batch):
-    with tempfile.TemporaryDirectory(dir=scratch()) as temporary:
-        clean = Path(temporary) / 'source'
-        git('worktree', 'add', '--detach', str(clean), base)
-        try:
-            _, files = generated(base, batch)
-            for path, content in files.items():
-                (clean / path).write_bytes(content)
-            subprocess.check_call(['cargo', 'metadata', '--locked', '--no-deps', '--format-version', '1'],
-                                  cwd=clean, stdout=subprocess.DEVNULL)
-            require((clean / 'Cargo.lock').read_bytes() == files['Cargo.lock']
-                    and set(git('diff', '--name-only', root=clean).splitlines()) == set(PATHS), 'unexpected Hourly diff')
-            git('-c', 'user.name=github-actions[bot]', '-c', 'user.email=' + BOT,
-                'commit', '-am', message(batch), root=clean)
-            source = git('rev-parse', 'HEAD', root=clean)
-        finally:
-            git('worktree', 'remove', '--force', str(clean))
+    identity = dict(os.environ, GIT_AUTHOR_NAME='github-actions[bot]', GIT_AUTHOR_EMAIL=BOT,
+                    GIT_COMMITTER_NAME='github-actions[bot]', GIT_COMMITTER_EMAIL=BOT)
+    source = git('commit-tree', expected_tree(base, batch), '-p', base, '-m', message(batch), env=identity)
     require(verify(source) == (base, batch), 'created Hourly source failed its own gate')
     return source
+
+
+def release_settled(tag, source):
+    """A previous hour counts only while its release is running or succeeded; failed hours are rebuilt."""
+    return any(run['status'] != 'completed' or run['conclusion'] == 'success' for run in release_runs(tag, source))
 
 
 def run_hourly(now):
@@ -231,7 +223,11 @@ def run_hourly(now):
         if hourly:
             require(hourly[-1][0] < batch, 'a later Hourly tag already exists; refusing to go back in time')
             previous = tag_commit(hourly[-1][1])
-            if git('rev-parse', previous + '^') == base:
+            parent = git('rev-parse', previous + '^')
+            if subprocess.run(['git', 'merge-base', '--is-ancestor', parent, base], cwd=release.ROOT).returncode:
+                print(json.dumps(dict(batch=batch, skipped='newest green main commit precedes the latest Hourly')))
+                return
+            if parent == base and release_settled(hourly[-1][1], previous):
                 print(json.dumps(dict(batch=batch, skipped='no new green main commit', latest=hourly[-1][1])))
                 return
         source = create_source(base, batch)

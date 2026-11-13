@@ -715,7 +715,6 @@ jobs:
       - name: Pin one complete public npm baseline for every service runner
         env:
           GH_TOKEN: ${{ github.token }}
-          VIBEFACE_RELEASE_SCRATCH: ${{ github.workspace }}/.artifacts/npm-baseline-source
         run: python3 scripts/verify-node.py --npm-baseline-pin --artifacts .artifacts/npm-service-baseline
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         id: baseline

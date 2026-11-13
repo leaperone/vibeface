@@ -26,7 +26,6 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - name: Tag the newest green main commit for this UTC hour
         env:
           GH_TOKEN: ${{ github.token }}

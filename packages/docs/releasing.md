@@ -26,9 +26,9 @@ Core、CLI、Web App、Desktop 和 Mobile 共享一个版本、一个 `v<version
 
 ## 每小时 Hourly 发布
 
-`hourly.yml`（Release / Hourly）的 job `hourly` 每小时由 cron 触发，运行协调器 `scripts/hourly.py`。main 固定携带开发版本 `0.0.1-hourly.2026111300`；协调器选择 `ci.yml` push 运行已成功完成的最新 main 提交。该提交已是最新 Hourly Tag 的 parent，或本 UTC 小时的 Tag 已存在时跳过。否则创建一个脱离 main 的 BOT 提交，只改版本字段：全部产品版本文件、`Cargo.lock` 中三个本仓包、Android versionCode（`YYMMDDHH`）与 iOS buildNumber（`YYMM.DD.HH`）。随后创建 `vX.Y.Z-hourly.YYYYMMDDHH` Tag 并派发 `release.yml`。
+`hourly.yml`（Release / Hourly）的 job `hourly` 每小时由 cron 触发，运行协调器 `scripts/hourly.py`。main 固定携带开发版本 `0.0.1-hourly.2026111300`；协调器选择 `ci.yml` push 运行已成功完成的最新 main 提交。该提交早于最新 Hourly Tag 的 parent 时跳过；等于该 parent 且那次发布正在运行或已成功时也跳过，那次发布失败时用同一提交发布当小时新版本。本 UTC 小时的 Tag 已存在时只核对来源，缺少发布运行时补派发。否则创建一个脱离 main 的 BOT 提交，只改版本字段：全部产品版本文件、`Cargo.lock` 中三个本仓包、Android versionCode（`YYMMDDHH`）与 iOS buildNumber（`YYMM.DD.HH`）。随后创建 `vX.Y.Z-hourly.YYYYMMDDHH` Tag 并派发 `release.yml`。
 
-协调器不等待发布结果，也不补发更早的小时。某小时失败时，该 Release 保持缺少 `release.json` 的未完成状态，下一小时发布新版本。Hourly 发布 npm（dist-tag `hourly`），不部署服务，不上传 TestFlight。官网不参与 Hourly，只发布 stable 与 rc。
+协调器不等待发布结果，也不补发更早的小时。每小时链路只依赖 main push CI，不运行扩展 Core 的 npm 公开基线升级验收；需要该验收时手动派发扩展 Core。某小时失败时，该 Release 保持缺少 `release.json` 的未完成状态，下一小时发布新版本。Hourly 发布 npm（dist-tag `hourly`），不部署服务，不上传 TestFlight。官网不参与 Hourly，只发布 stable 与 rc。
 
 发布来源门：位于 main 的 Tag 要求该提交的 main push CI success；脱离 main 的 Hourly 来源必须恰好是机械版本提交，其唯一 parent 位于 main，且 parent 有 main push CI success。制品、Tag、`source_commit` 与 provenance 绑定实际版本提交，parent 只用于 CI 证明。
 
@@ -216,7 +216,7 @@ gh workflow run npm-publish.yml --repo leaperone/vibeface --ref v<version> \
 
 需要手动公开发布时，把 `publish` 设为 true。原发布 run 的 npm job 失败时，先对账后使用 `gh run rerun <run-id> --failed`，复用原 artifact id，不重建归档。
 
-发布器先读取公开 registry，只把 HTTP 404 当作包不存在，传输失败、其他 HTTP 错误和无效响应都停止发布。已有目标版本的 integrity 必须相同，且 `hourly` 等于目标或更高时直接成功，不降级。已有版本但 `hourly` 缺失或较旧时停止并要求对账，不自动修改 dist-tag。仅目标版本不存在且比当前 Hourly 更新时执行一次 `npm publish --provenance`。随后最多进行 40 次只读查询，等待 registry 确认 integrity 和渠道；包括发布响应丢失的情况，也不自动重发。未核实公开结果始终失败。公开版本不能覆盖，不能通过复用 tag 更换内容。
+发布器先读取公开 registry，只把 HTTP 404 当作包不存在，传输失败、其他 HTTP 错误和无效响应都停止发布。已有目标版本的 integrity 必须相同，且 `hourly` 等于目标或更高时直接成功，不降级。已有版本但 `hourly` 缺失或较旧时停止并要求对账，不自动修改 dist-tag。目标版本不存在且 `hourly` 缺失或更旧时执行一次 `npm publish --provenance`；`hourly` 已指向更新的小时时跳过，不回拨 dist-tag。随后最多进行 40 次只读查询，等待 registry 确认 integrity 和渠道；包括发布响应丢失的情况，也不自动重发。未核实公开结果始终失败。公开版本不能覆盖，不能通过复用 tag 更换内容。
 
 
 ## 桌面与 Windows 签名
