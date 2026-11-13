@@ -310,9 +310,7 @@ fn recent<'a>(table: &'a Table, own: &str, allow_private: bool) -> Vec<&'a Entry
                     || (allow_private && !entry.record.addrs.is_empty()))
         })
         .collect();
-    known.sort_by_key(|entry| (!entry.online(now_ms()), Reverse(entry.last_seen_ms)));
-    known.truncate(CANDIDATES);
-    known
+    prioritize_online(known, now_ms())
 }
 
 fn prioritize_online<'a>(mut entries: Vec<&'a Entry>, now_ms: u64) -> Vec<&'a Entry> {
@@ -990,7 +988,10 @@ impl Mesh {
     async fn candidates(&self) -> Vec<EndpointId> {
         let mut peers: Vec<EndpointId> = {
             let table = self.table.lock().expect("mesh table");
-            prefer_online(recent(&table, &self.device_id, self.allow_private), now_ms())
+            prefer_online(
+                recent(&table, &self.device_id, self.allow_private),
+                now_ms(),
+            )
             .into_iter()
             .filter_map(|entry| endpoint_id(&entry.record.device_id).ok())
             .collect()
@@ -1720,6 +1721,23 @@ mod tests {
         assert_eq!(preferred.len(), 1);
         assert_eq!(preferred[0].record.device_id, online.record.device_id);
         assert_eq!(prefer_online(vec![&expired], now).len(), 1);
+    }
+
+    #[test]
+    fn rejoining_prioritizes_online_records_before_candidate_cap() {
+        let now = 10_000_000;
+        let mut entries: Vec<_> = (0..CANDIDATES)
+            .map(|index| entry(format!("{index:064x}"), now - 1_800_001))
+            .collect();
+        let online = entry("f".repeat(64), now - 1_000);
+        entries.push(online);
+        let selected = prioritize_online(entries.iter().collect(), now);
+        assert_eq!(selected.len(), CANDIDATES);
+        assert!(
+            selected
+                .iter()
+                .any(|entry| entry.record.device_id == "f".repeat(64))
+        );
     }
 
     fn entry(device_id: String, seq: u64) -> table::Entry {

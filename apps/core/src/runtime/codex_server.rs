@@ -1183,6 +1183,7 @@ impl CodexServer {
         self.inner
             .stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.changed.notify_waiters();
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || {
             let mut owned = inner.tree.blocking_lock();
