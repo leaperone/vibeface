@@ -42,7 +42,7 @@ pub(crate) const SERVICE_SCRIPT: &str = if cfg!(windows) {
 #[serde(rename_all = "snake_case")]
 pub enum Channel {
     Stable,
-    Nightly,
+    Hourly,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,7 +97,7 @@ pub async fn check(channel: Channel) -> Result<Option<Release>> {
                 continue;
             };
             if release.draft
-                || release.prerelease != (channel == Channel::Nightly)
+                || release.prerelease != (channel == Channel::Hourly)
                 || version <= current
             {
                 continue;
@@ -125,12 +125,12 @@ fn channel_version(tag: &str, channel: Channel) -> Option<Version> {
     }
     match channel {
         Channel::Stable if version.pre.is_empty() => Some(version),
-        Channel::Nightly => {
-            let parts: Vec<_> = version.pre.as_str().split('.').collect();
-            if parts.len() != 3
-                || parts[0] != "nightly"
-                || !valid_date(parts[1])
-                || parts[2].parse::<u64>().ok()? == 0
+        Channel::Hourly => {
+            let (label, stamp) = version.pre.as_str().split_once('.')?;
+            if label != "hourly"
+                || stamp.len() != 10
+                || !valid_date(&stamp[..8])
+                || stamp[8..].parse::<u8>().ok()? > 23
             {
                 return None;
             }
@@ -318,7 +318,7 @@ fn parse_completion_manifest(
     let expected_channel = if version.pre.is_empty() {
         "stable"
     } else {
-        "nightly"
+        "hourly"
     };
     ensure!(
         manifest.app == "product"
@@ -545,7 +545,7 @@ fn validate_release(release: &Release) -> Result<()> {
     let channel = if release.version.pre.is_empty() {
         Channel::Stable
     } else {
-        Channel::Nightly
+        Channel::Hourly
     };
     ensure!(
         channel_version(&release.tag, channel).as_ref() == Some(&release.version),
@@ -1139,8 +1139,8 @@ mod tests {
             channel_version("v1.2.3", Channel::Stable),
             Some(Version::new(1, 2, 3))
         );
-        assert!(channel_version("v1.2.3-nightly.20260228.1", Channel::Nightly).is_some());
-        assert!(channel_version("v1.2.3-nightly.20240229.10", Channel::Nightly).is_some());
+        assert!(channel_version("v1.2.3-hourly.2026022800", Channel::Hourly).is_some());
+        assert!(channel_version("v1.2.3-hourly.2024022923", Channel::Hourly).is_some());
         for tag in [
             "1.2.3",
             "cli-v1.2.3",
@@ -1151,24 +1151,27 @@ mod tests {
             "v01.2.3",
             "v1.2.3+build",
             "v1.2.3-rc.1",
-            "v1.2.3-nightly.20260229.1",
-            "v1.2.3-nightly.20261301.1",
-            "v1.2.3-nightly.20260100.1",
-            "v1.2.3-nightly.20260101.0",
-            "v1.2.3-nightly.20260101.01",
-            "v1.2.3-nightly.20260101.1.extra",
+            "v1.2.3-nightly.20260101.1",
+            "v1.2.3-hourly.2026022900",
+            "v1.2.3-hourly.2026130100",
+            "v1.2.3-hourly.2026010000",
+            "v1.2.3-hourly.2026010124",
+            "v1.2.3-hourly.20260101",
+            "v1.2.3-hourly.202601010",
+            "v1.2.3-hourly.2026010100.1",
+            "v1.2.3-hourly.2026010100.extra",
         ] {
             assert!(channel_version(tag, Channel::Stable).is_none(), "{tag}");
-            assert!(channel_version(tag, Channel::Nightly).is_none(), "{tag}");
+            assert!(channel_version(tag, Channel::Hourly).is_none(), "{tag}");
         }
-        assert!(channel_version("v1.2.3", Channel::Nightly).is_none());
-        assert!(channel_version("v1.2.3-nightly.20260101.1", Channel::Stable).is_none());
+        assert!(channel_version("v1.2.3", Channel::Hourly).is_none());
+        assert!(channel_version("v1.2.3-hourly.2026010100", Channel::Stable).is_none());
         assert!(
-            Version::parse("1.2.3-nightly.20260102.1").unwrap()
-                > Version::parse("1.2.3-nightly.20260101.10").unwrap()
+            Version::parse("1.2.3-hourly.2026010200").unwrap()
+                > Version::parse("1.2.3-hourly.2026010123").unwrap()
         );
         assert!(
-            Version::parse("1.2.3").unwrap() > Version::parse("1.2.3-nightly.20260102.1").unwrap()
+            Version::parse("1.2.3").unwrap() > Version::parse("1.2.3-hourly.2026010223").unwrap()
         );
     }
 
@@ -1244,10 +1247,10 @@ mod tests {
     #[test]
     fn canonical_manifest_binds_target_archive_and_checksum() {
         let body = include_bytes!("../../../../scripts/fixtures/product-release-completion.json");
-        let version = Version::parse("0.0.1-nightly.20261108.1").unwrap();
+        let version = Version::parse("0.0.1-hourly.2026110812").unwrap();
         let manifest =
-            parse_completion_manifest(body, "v0.0.1-nightly.20261108.1", &version).unwrap();
-        let name = "vibeface-0.0.1-nightly.20261108.1-x86_64-unknown-linux-gnu.tar.gz";
+            parse_completion_manifest(body, "v0.0.1-hourly.2026110812", &version).unwrap();
+        let name = "vibeface-0.0.1-hourly.2026110812-x86_64-unknown-linux-gnu.tar.gz";
         let (archive, checksum) = manifest_target_pair(&manifest, name).unwrap();
         assert_eq!(archive.size, 29_685_481);
         assert_eq!(checksum.size, 132);
@@ -1473,7 +1476,7 @@ mod tests {
             .unwrap();
         for field in ["core_version", "app_version"] {
             let mut mixed = build.clone();
-            mixed[field] = serde_json::json!("0.0.1-nightly.20261101.1");
+            mixed[field] = serde_json::json!("0.0.1-hourly.2026110100");
             assert!(
                 serde_json::from_value::<BuildInfo>(mixed)
                     .unwrap()

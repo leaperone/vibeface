@@ -6,7 +6,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('stable', 'nightly')]
+    [ValidateSet('stable', 'hourly')]
     [string] $Channel = 'stable',
     [string] $InstallRoot,
     [string] $BinDir,
@@ -36,41 +36,38 @@ function Fail {
 # whose shape is not exactly this project's is left out rather than guessed at.
 function Select-Release {
     param([object[]] $Releases, [string] $Channel)
-    $wanted = $Channel -eq 'nightly'
+    $wanted = $Channel -eq 'hourly'
     $ordered = @()
     foreach ($release in $Releases) {
         if ($release.draft -ne $false) { continue }
         if ($release.prerelease -ne $wanted) { continue }
         $tag = [string] $release.tag_name
         $shape = if ($wanted) {
-            '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-nightly\.([0-9]{8})\.([1-9][0-9]*)$'
+            '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-hourly\.([0-9]{10})$'
         } else {
             '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
         }
         $found = [regex]::Match($tag, $shape)
         if (-not $found.Success) { continue }
-        $day = 0
-        $build = 0
+        $hour = 0
         if ($wanted) {
             $stamp = $found.Groups[4].Value
             $parsed = [datetime]::MinValue
-            if (-not [datetime]::TryParseExact($stamp, 'yyyyMMdd', [cultureinfo]::InvariantCulture,
+            if (-not [datetime]::TryParseExact($stamp, 'yyyyMMddHH', [cultureinfo]::InvariantCulture,
                     [System.Globalization.DateTimeStyles]::None, [ref] $parsed)) {
                 continue
             }
-            $day = [int64] $stamp
-            $build = [int64] $found.Groups[5].Value
+            $hour = [int64] $stamp
         }
         $ordered += [pscustomobject]@{
             Tag = $tag
             Major = [int64] $found.Groups[1].Value
             Minor = [int64] $found.Groups[2].Value
             Patch = [int64] $found.Groups[3].Value
-            Day = $day
-            Build = $build
+            Hour = $hour
         }
     }
-    return ($ordered | Sort-Object Major, Minor, Patch, Day, Build)
+    return ($ordered | Sort-Object Major, Minor, Patch, Hour)
 }
 
 function Get-OptionalDownload {
@@ -103,7 +100,7 @@ function Confirm-Completion {
     catch { Fail 'invalid release completion manifest JSON' }
     $props = @($manifest.PSObject.Properties.Name | Sort-Object)
     if (($props -join ',') -ne 'app,assets,channel,schema,source_commit,tag,version') { Fail 'invalid release completion manifest fields' }
-    $channel = if ($Tag -match '-nightly\.') { 'nightly' } else { 'stable' }
+    $channel = if ($Tag -match '-hourly\.') { 'hourly' } else { 'stable' }
     if ($manifest.app -ne 'product' -or
         ($manifest.schema -isnot [int] -and $manifest.schema -isnot [long]) -or $manifest.schema -ne 1 -or
         $manifest.tag -cne $Tag -or $manifest.version -cne $Version -or $manifest.channel -cne $channel -or
@@ -294,9 +291,9 @@ function Install-Release {
     $selected = @(Select-Release -Releases $releases -Channel $Channel)
     if ($selected.Count -eq 0) {
         if ($Channel -eq 'stable') {
-            Fail 'no published Stable release; pass -Channel nightly explicitly to install a preview'
+            Fail 'no published Stable release; pass -Channel hourly explicitly to install a preview'
         }
-        Fail 'no published Nightly release'
+        Fail 'no published hourly release'
     }
     $chosen = $null
     for ($index = $selected.Count - 1; $index -ge 0; $index--) {
@@ -403,19 +400,21 @@ function Invoke-SelfTest {
         [pscustomobject]@{ tag_name = 'cli-v999.0.0'; draft = $false; prerelease = $false },
         [pscustomobject]@{ tag_name = 'v01.2.3'; draft = $false; prerelease = $false },
         [pscustomobject]@{ tag_name = 'v999.0.0-rc.1'; draft = $false; prerelease = $true },
-        [pscustomobject]@{ tag_name = 'v0.0.1-nightly.20261017.2'; draft = $false; prerelease = $true },
-        [pscustomobject]@{ tag_name = 'v0.0.1-nightly.20261017.10'; draft = $false; prerelease = $true },
-        [pscustomobject]@{ tag_name = 'v0.0.1-nightly.20260229.1'; draft = $false; prerelease = $true },
-        [pscustomobject]@{ tag_name = 'www-v999.0.0-nightly.20261017.99'; draft = $false; prerelease = $true }
+        [pscustomobject]@{ tag_name = 'v0.0.1-hourly.2026101702'; draft = $false; prerelease = $true },
+        [pscustomobject]@{ tag_name = 'v0.0.1-hourly.2026101710'; draft = $false; prerelease = $true },
+        [pscustomobject]@{ tag_name = 'v0.0.1-hourly.2026022901'; draft = $false; prerelease = $true },
+        [pscustomobject]@{ tag_name = 'v0.0.1-hourly.2026101724'; draft = $false; prerelease = $true },
+        [pscustomobject]@{ tag_name = 'v0.0.1-nightly.20261018.1'; draft = $false; prerelease = $true },
+        [pscustomobject]@{ tag_name = 'www-v999.0.0-hourly.2026101723'; draft = $false; prerelease = $true }
     )
     $picked = @(Select-Release -Releases $stable -Channel 'stable')
     if ($picked[-1].Tag -ne 'v1.10.0') { Fail "self-test: stable selection picked $($picked[-1].Tag)" }
-    $picked = @(Select-Release -Releases $stable -Channel 'nightly')
-    if ($picked[-1].Tag -ne 'v0.0.1-nightly.20261017.10') {
-        Fail "self-test: nightly selection picked $($picked[-1].Tag)"
+    $picked = @(Select-Release -Releases $stable -Channel 'hourly')
+    if ($picked[-1].Tag -ne 'v0.0.1-hourly.2026101710') {
+        Fail "self-test: hourly selection picked $($picked[-1].Tag)"
     }
     foreach ($entry in $picked) {
-        if ($entry.Tag -eq 'v0.0.1-nightly.20260229.1') { Fail 'self-test: accepted a date that does not exist' }
+        if ($entry.Tag -in @('v0.0.1-hourly.2026022901', 'v0.0.1-hourly.2026101724')) { Fail 'self-test: accepted an hour that does not exist' }
     }
     $directory = Join-Path ([System.IO.Path]::GetTempPath()) ('vibeface-installer-test-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $directory | Out-Null
@@ -473,7 +472,7 @@ public class VibefaceInstallerTestResponse : System.Net.WebResponse {
         assets = @($manifest.assets) + @([pscustomobject]@{ name = 'release.json'; size = 10000 })
     }
     $building = [pscustomobject]@{
-        tag_name = 'v0.0.1-nightly.20261108.99'; draft = $false; prerelease = $true
+        tag_name = 'v0.0.1-hourly.2026110822'; draft = $false; prerelease = $true
         assets = @([pscustomobject]@{ name = 'release.json'; size = 10000 })
     }
     $markerUrl = "$Downloads/$tag/release.json"
@@ -484,8 +483,8 @@ public class VibefaceInstallerTestResponse : System.Net.WebResponse {
         throw 'self-test: canonical manifest source mismatch'
     }
     $responses[$buildingUrl] = @{ Code = 404; Body = '' }
-    if (Confirm-Completion -Release $building -Tag $building.tag_name -Version '0.0.1-nightly.20261108.99' `
-            -Archive "vibeface-0.0.1-nightly.20261108.99-$Target.tar.gz" -Target $Target) {
+    if (Confirm-Completion -Release $building -Tag $building.tag_name -Version '0.0.1-hourly.2026110822' `
+            -Archive "vibeface-0.0.1-hourly.2026110822-$Target.tar.gz" -Target $Target) {
         throw 'self-test: HTTP 404 marker was treated as complete'
     }
     $responses["$Api/releases?per_page=100&page=1"] = @{
@@ -496,31 +495,31 @@ public class VibefaceInstallerTestResponse : System.Net.WebResponse {
     $bin = Join-Path $script:Scratch 'bin'
     $requests.Clear()
     # Stop at the chosen archive's mocked transport boundary, before any installation.
-    Assert-InstallerError { Install-Release -Channel nightly -InstallRoot $install -BinDir $bin } 'download failed'
+    Assert-InstallerError { Install-Release -Channel hourly -InstallRoot $install -BinDir $bin } 'download failed'
     if ($requests[$requests.Count - 1] -cne "$Downloads/$tag/$archive") {
         throw 'self-test: newest Building did not select the older complete archive'
     }
     foreach ($code in @(403, 503)) {
         $responses[$buildingUrl] = @{ Code = $code; Body = '' }
         $requests.Clear()
-        Assert-InstallerError { Install-Release -Channel nightly -InstallRoot $install -BinDir $bin } 'completion manifest download failed'
+        Assert-InstallerError { Install-Release -Channel hourly -InstallRoot $install -BinDir $bin } 'completion manifest download failed'
         if ($requests.Contains($markerUrl)) { throw 'self-test: HTTP failure silently selected an older release' }
     }
     $responses.Remove($buildingUrl)
-    Assert-InstallerError { Install-Release -Channel nightly -InstallRoot $install -BinDir $bin } 'completion manifest download failed'
+    Assert-InstallerError { Install-Release -Channel hourly -InstallRoot $install -BinDir $bin } 'completion manifest download failed'
     $responses[$buildingUrl] = @{ Code = 200; Body = '{bad-json' }
-    Assert-InstallerError { Install-Release -Channel nightly -InstallRoot $install -BinDir $bin } 'invalid release completion manifest JSON'
+    Assert-InstallerError { Install-Release -Channel hourly -InstallRoot $install -BinDir $bin } 'invalid release completion manifest JSON'
     $responses[$buildingUrl] = @{ Code = 200; Body = ($manifest | ConvertTo-Json -Depth 10 -Compress) }
-    Assert-InstallerError { Install-Release -Channel nightly -InstallRoot $install -BinDir $bin } 'release completion manifest identity mismatch'
+    Assert-InstallerError { Install-Release -Channel hourly -InstallRoot $install -BinDir $bin } 'release completion manifest identity mismatch'
     $responses[$buildingUrl] = @{ Code = 404; Body = '' }
     $responses["$Api/commits/$tag"] = @{ Code = 200; Body = '{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' }
-    Assert-InstallerError { Install-Release -Channel nightly -InstallRoot $install -BinDir $bin } 'release completion manifest source does not match the tag'
+    Assert-InstallerError { Install-Release -Channel hourly -InstallRoot $install -BinDir $bin } 'release completion manifest source does not match the tag'
     if (Test-Path -LiteralPath (Join-Path $install 'current')) { throw 'self-test: failed validation installed a release' }
     New-Item -ItemType Directory -Path (Join-Path $install 'current') -Force | Out-Null
     $sentinel = Join-Path $install 'current/retained.txt'
     Set-Content -LiteralPath $sentinel -Value 'retained'
     $requests.Clear()
-    Assert-InstallerError { Install-Release -Channel nightly -InstallRoot $install -BinDir $bin } 'current already exists'
+    Assert-InstallerError { Install-Release -Channel hourly -InstallRoot $install -BinDir $bin } 'current already exists'
     if ($requests.Count -ne 0 -or (Get-Content -LiteralPath $sentinel) -cne 'retained') {
         throw 'self-test: an existing installation was changed'
     }

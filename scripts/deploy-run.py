@@ -374,9 +374,9 @@ def self_test():
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary).resolve()
             host = output / 'host'; host.mkdir()
-            current = {'tag': 'v0.0.1-nightly.20261108.1', 'version': '0.0.1-nightly.20261108.1',
+            current = {'tag': 'v0.0.1-hourly.2026110812', 'version': '0.0.1-hourly.2026110812',
                        'source_sha': 'a' * 40, 'images': {'core': 'sha256:' + 'a' * 64}}
-            old = {'tag': 'v0.0.1-nightly.20261107.1', 'version': '0.0.1-nightly.20261107.1',
+            old = {'tag': 'v0.0.1-hourly.2026110712', 'version': '0.0.1-hourly.2026110712',
                    'source_sha': 'b' * 40, 'images': {'core': 'sha256:' + 'b' * 64}}
             (output / 'deployment.json').write_text(json.dumps(current))
             initialized, activated, cleaned = [], [], []

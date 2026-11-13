@@ -23,10 +23,10 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | `mobile.yml` | CI / Mobile acceptance | 手动、复用调用 | Android 原生构建与 iOS 模拟器 UI；不含 Android 模拟器 UI 验收 |
 | `delivery-small.yml` | Delivery / Small proof | 手动 | 四关系真实证明、公开分项续用与结算实验 |
 | `delivery-live.yml` | Delivery / Live native proof | 手动 | Linux native Core 检查后，生成五份 fresh proof 并验收真实交付 |
-| `nightly.yml` | Release / Nightly | 每四小时、手动 | 完整标准 Core 检查后进入 Nightly 门；仅 main schedule 可启动发布协调器 |
+| `hourly.yml` | Release / Hourly | 每小时、手动 | 为最新 CI 通过的 main 提交创建当小时 Hourly Tag 并派发产品发布；不运行 Core 检查 |
 | `release.yml` | Release / Product | `v*` push、手动 | 固定产品组；手动默认只构建 |
 | `release-www.yml` | Release / Website | `www-v*` push、手动 | 固定官网组；手动默认只构建 |
-| `npm-publish.yml` | Release / npm Nightly | 产品发布调用、手动 | 验证完整产品发布的原始 npm 制品；手动默认只验证 |
+| `npm-publish.yml` | Release / npm Hourly | 产品发布调用、手动 | 验证完整产品发布的原始 npm 制品；手动默认只验证 |
 | `deploy-node.yml`、`deploy-app.yml`、`deploy-www.yml`、`deploy-product.yml` | Deploy / Node、Web App、Website、Product services | 手动 | 固定目标部署，`tag` 必填，`apply=false` 默认构建验证与排练 |
 
 `_ci-crypto.yml` 与 `_ci-web.yml` 仅供复用，不是手动入口。部署入口统一调用 `deploy-services.yml`，由它持有全局部署锁。`ci.yml` 的 `package_policy` 仅供复用调用，允许 `standard` 或 `linux-native`；公开手动 Core 入口没有模式参数。
@@ -77,7 +77,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 `www` 使用 Node.js 24 和冻结的 pnpm 依赖，依次运行 `typecheck`、`build`、`check:static`，上传 `apps/www/dist/client` 为 `www-<SHA>` 制品。门户与独立 App 分别构建；根 `packages/docs/` 是门户文档正文的唯一来源，修改文档也会触发 `www`。
 
-首个正式版前按 `AGENTS.md` 保持 `DATA_EPOCH=1`，不随功能或 Nightly 递增。改 `apps/core/migrations/` 或 `apps/core/src/delivery/schema.sql` 时直接维护最终 schema，并更新 `apps/core/src/config.rs` 的 `DATA_EPOCH_SCHEMA_SHA256`。当前检查比较 schema digest，不证明 epoch 增加。确需调整 epoch 时须单独说明理由，并同步 `crates/control/src/lib.rs`、`install.sh` 与 `ci.py --self-test`；不以新增迁移或兼容回退代替最终数据形状。
+首个正式版前按 `AGENTS.md` 保持 `DATA_EPOCH=1`，不随功能或 Hourly 版本递增。改 `apps/core/migrations/` 或 `apps/core/src/delivery/schema.sql` 时直接维护最终 schema，并更新 `apps/core/src/config.rs` 的 `DATA_EPOCH_SCHEMA_SHA256`。当前检查比较 schema digest，不证明 epoch 增加。确需调整 epoch 时须单独说明理由，并同步 `crates/control/src/lib.rs`、`install.sh` 与 `ci.py --self-test`；不以新增迁移或兼容回退代替最终数据形状。
 
 Web 路径优先于 Node 路径，只有 `packages/client/src/avatar/face.ts` 与 `derived-faces.json` 例外：它们按 Node 路径选取，因为这组向量也是 Node Rust 测试的输入，核对 Node 由 bot ID 派生的长相与客户端一致；Node 受影响时 Web 检查照常运行。Node 对 Protocol、Bridge、Secure 的依赖用于向上扩展检查范围。PR 按 `merge-base(base, head)..head` 的完整差异选取，删除与重命名包括旧、新路径。无法识别的输入选择整个工作区核心检查。
 
@@ -164,7 +164,7 @@ prepare-only 仍执行上述构建、受控 Ganache 重建、四关系 execute �
 
 `delivery-live.yml` 仅在显式手动 workflow_dispatch 时执行，没有额外开关。该 job 使用 `ubuntu-24.04` 原生 x86 runner，先核对宿主 Linux/x86_64，再使用 `run-delivery-live.py --protected-package <same-run-linux-package> --source-commit <HEAD>`。容器内生成 `0600` 最终配置，由入口监督两个同级子进程：native 经既有 `--protected-config` 调用 verify-node 的 `delivery_protected_acceptance` helper，另一个运行 tracked restart observer。它依赖同 run、同 SHA 的 package/crypto/web 检查，不启动旧专属 Android、KVM 或录像前置。独立 Live gate 要求 Core 和真实证明 job 均成功；任何失败都不能忽略。容器的 amd64 目标不能独自证明宿主没有使用 emulation。
 
-Live 通过复用 Core 的内部 `package_policy=linux-native` 选择 native-only 实验：package matrix 只含 Linux x86_64，保留该平台上 `package_mode=node` 的制品、真实进程与 Chromium 验收（只在 macOS ARM64 包上运行的 `--chat-agent` 和 `--phase5` 不执行），以及 Rust 快慢组、MSRV、delivery、crypto 和 Web 检查。Linux Mobile/Desktop 源码检查照常执行。非 Linux 包、npm、托管的 Mac/Windows 桌面窗口及 Windows native 验收未选，其跳过不代表这些平台已验收。普通 Core、Nightly 的完整标准 Core 与产品 Tag 继续使用各自的完整检查范围。计划摘要列出实际 target 和未选范围。
+Live 通过复用 Core 的内部 `package_policy=linux-native` 选择 native-only 实验：package matrix 只含 Linux x86_64，保留该平台上 `package_mode=node` 的制品、真实进程与 Chromium 验收（只在 macOS ARM64 包上运行的 `--chat-agent` 和 `--phase5` 不执行），以及 Rust 快慢组、MSRV、delivery、crypto 和 Web 检查。Linux Mobile/Desktop 源码检查照常执行。非 Linux 包、npm、托管的 Mac/Windows 桌面窗口及 Windows native 验收未选，其跳过不代表这些平台已验收。普通 Core 与产品 Tag 继续使用各自的完整检查范围。计划摘要列出实际 target 和未选范围。
 
 Live 等待同一次运行的 Core 成功，再从其输出的精确 SHA 下载 Linux package、crypto 和 Web 制品。失败、取消或缺少 Linux 包不能启动证明，整体取消后也不启动新证明。各用途使用独立入口。
 
@@ -184,13 +184,11 @@ native 创建 fresh 目录后，在原 start 的任何子进程或业务前等�
 
 ## 定期、手动和发布检查
 
-`nightly.yml` 保留每 4 小时的 `23 */4 * * *`，UTC 槽位为 00:23、04:23、08:23、12:23、16:23、20:23。GitHub schedule 是 best effort，可能延迟或跳过。Nightly 调用一次完整标准 Core，根级 `ci-gate` 确认成功后，才允许 main schedule 运行 `daily-nightly`。手动 Nightly 只验证，不发布。协调器全局串行，只使用 `GITHUB_TOKEN` 创建不可变 Tag 和精确 dispatch，不需要 PAT、版本分支、PR 或 main merge。
+`hourly.yml`（Release / Hourly）的 job `hourly` 每小时由 cron 触发，运行协调器 `scripts/hourly.py`。main 固定携带开发版本 `0.0.1-hourly.2026111300`；协调器选择 `ci.yml` push 运行已成功完成的最新 main 提交。该提交已是最新 Hourly Tag 的 parent，或本 UTC 小时的 Tag 已存在时跳过。否则创建一个脱离 main 的 BOT 提交，只改版本字段：全部产品版本文件、`Cargo.lock` 中三个本仓包、Android versionCode（`YYMMDDHH`）与 iOS buildNumber（`YYMM.DD.HH`）。随后创建 `vX.Y.Z-hourly.YYYYMMDDHH` Tag 并派发 `release.yml`。协调器不等待发布结果，也不补发更早的小时；某小时失败时，下一小时发布新版本。详情见 [Hourly 发布](releasing.md#每小时-hourly-发布)。
 
 手动 `CI / Core` 同样执行完整扩展检查，不受路径影响，只验证和生成制品。merge queue 执行整个工作区核心检查，不启用慢测试、MSRV 或四平台打包。开发分支 PR 不触发 Core。产品 `v` Tag 由 `release.yml` 构建全部产品目标，`www-v` Tag 由 `release-www.yml` 构建官网。
 
-版本提交只使用原 schedule 的精确 main SHA 作 parent。共享来源门核对普通单 parent、完整机械 tree、版本 cohort、两个移动构建号及 `cargo metadata --locked --no-deps`。发布 workflow 根据原 CI SHA 的精确文件树选择来源工作流，验证原 run 的仓库、workflow path、main、SHA 与根级 `ci-gate` success。新来源要求 `nightly.yml`，历史来源仍严格验证原 `ci.yml`，不使用宽泛路径白名单。不等待包含协调 job 的整体 run success。真正的 artifact source 与 provenance 仍是 Tag 的版本提交。main 上的普通 Tag 继续要求同一 SHA 的 main push CI success，Stable/RC 不允许 detached 来源。
-
-原 run 的 UTC `created_at` 决定四小时批次；延迟和跨日恢复沿用原版本、构建号、SHA、运行与留存 artifact。构建号从 main 和上一可信产品 Nightly 取数值上界加一，iOS 分段溢出时停止。上一来源完整发布且 npm 成功、main 无新提交时跳过；部分 Tag、Release、npm 先恢复原来源，不新建版本覆盖。quick-check 与 preflight 执行现有 Nightly 自测，覆盖真实临时 Git、机械 tree 篡改、原 schedule CI 门、固定 parent、构建号数值比较、同批次及部分发布恢复、Tag 冲突和未知写入对账。详情见 [Nightly 发布约束](releasing.md#每-4-小时-nightly-的发布约束)。
+发布来源门：位于 main 的 Tag 要求同一 SHA 的 main push CI success；脱离 main 的 Hourly 来源必须恰好是机械版本提交，其唯一 parent 位于 main 且有 main push CI success。Stable/RC 不允许脱离 main 的来源。真正的 artifact source 与 provenance 仍是 Tag 的版本提交。quick-check 与 preflight 执行 `scripts/hourly.py --self-test`。
 
 | 扩展检查 | 执行范围 |
 | --- | --- |
@@ -204,11 +202,11 @@ native 创建 fresh 目录后，在原 start 的任何子进程或业务前等�
 | 公共节点、排队与私有 relay 令牌验收 | Linux x64 一次，使用 `--public-node` |
 | 全网入网、志愿 relay、relay 选择与无网页 Node 验收 | Linux x64 一次，使用 `--mesh` |
 | 写入保护、状态与诊断包验收 | macOS ARM64 一次，使用 `--phase5` |
-| Nightly npm 包（当前声明版本为 Nightly 时） | 组装四个原生包，四个平台分别安装并检查版本；macOS ARM64、Linux x64/ARM64 另执行 `--web-only` 和 `--npm-service` 原生服务验收 |
+| Hourly npm 包（当前声明版本为 Hourly 时） | 组装四个原生包，四个平台分别安装并检查版本；macOS ARM64、Linux x64/ARM64 另执行 `--web-only` 和 `--npm-service` 原生服务验收 |
 
 `--npm-service` 仅允许无既有 Vibeface 数据或默认服务的 GitHub hosted runner，使用真实 launchd 或 systemd user manager，不能在开发者机器运行。Linux job 显式准备 user manager 和 D-Bus；不可用即失败。验收通过公开 npm CLI 执行安装、启动、停止、重启和卸载，核对服务使用 scoped npm vendor 中的原生程序。
 
-`npm-package` 每次只读取一次公开 `nightly`，固定版本、registry integrity、完整产品 manifest 及全部 vendor 字节，使用共享发布来源门证明基线业务来源是候选源码的祖先。基线单独上传，三个平台按不可变 artifact ID 下载同一份，不混入候选发布 artifact。基线与候选是同一个源码提交、基线业务来源不是候选的祖先，或 data epoch 不兼容均失败；基线业务来源等于候选提交是允许的，记为 `business_source_relation=same`。
+`npm-package` 每次只读取一次公开 `hourly` dist-tag，固定版本、registry integrity、完整产品 manifest 及全部 vendor 字节，使用共享发布来源门证明基线业务来源是候选源码的祖先。基线单独上传，三个平台按不可变 artifact ID 下载同一份，不混入候选发布 artifact。基线与候选是同一个源码提交、基线业务来源不是候选的祖先，或 data epoch 不兼容均失败；基线业务来源等于候选提交是允许的，记为 `business_source_relation=same`。
 
 受控 Node 和 App Server 夹具从不可变的公开基线包创建真实非空消息及附件，安装真实服务并核对运行状态与数据，再停服，以独立 prefix 核验的本 CI 候选包替换原 prefix。首个正式版前 `DATA_EPOCH` 固定为 1，同 epoch 不代表 schema 兼容。若候选明确返回 `data_schema_mismatch`，必须核对两个已审源码的 schema 指纹不同、实际启动同样被拒绝，并证明基线身份、配置、数据库及附件字节未变；保留旧目录，再为候选初始化新目录及非空消息和附件。其余错误仍由正常启动验收判定，不回退为新目录。
 
@@ -222,7 +220,7 @@ iOS Rust cache 同时覆盖默认 `target/` 和 Host Node 的 `.artifacts/native
 
 CI 不使用真实 AI Provider 或模型密钥。各模式都使用受控 SDK 和 App Server 夹具，`--phase5` 不启动 App Server。模拟协议通过不能证明真实模型理解需求或正确选择工具。
 
-产品 `v<version>` 与官网 `www-v<version>` 分别进入发布路径，必须匹配声明版本，并通过同一共享来源门验证 main 源码或受信机械 Nightly 提交。产品并行构建 Web、四个原生目标、Android 和 iOS，各平台再按自身输入组包并构建桌面 App。每组校验后立即向同一个公开 Release 追加附件，完整审计完成后才追加全局 `release.json`。`publish=false` 手动入口只验证并生成制品。产品与官网制品发布不触发部署；独立部署命令可显式选择已发布的 Stable、RC 或 Nightly Tag；派发成功不代表部署成功。详见 [构建与发布](releasing.md)。
+产品 `v<version>` 与官网 `www-v<version>` 分别进入发布路径，必须匹配声明版本，并通过同一共享来源门验证 main 源码或受信机械 Hourly 提交。产品并行构建 Web、四个原生目标、Android 和 iOS，各平台再按自身输入组包并构建桌面 App。每组校验后立即向同一个公开 Release 追加附件，完整审计完成后才追加全局 `release.json`。`publish=false` 手动入口只验证并生成制品。产品与官网制品发布不触发部署；独立部署命令可显式选择已发布的 Stable、RC 或 Hourly Tag；派发成功不代表部署成功。详见 [构建与发布](releasing.md)。
 
 Windows 专项使用当前源码，不接受历史运行包。只检查原生 Rust 时运行：
 
@@ -335,7 +333,7 @@ Rust 快、慢组在计划生成后直接开始，Clippy 另等待静态快检�
 
 Core 的 concurrency group 包含调用方 workflow、事件、Git ref 和 package policy。标准 Core 的首次 main push 或手动验证会取消同组旧运行，main 累计覆盖选择仍保留未验证的改动。Desktop、Windows 与 Mobile 等纯验证入口的首次手动运行也按同分支、同模式去重。这些验证仅在 `run_attempt > 1` 时追加 `run_id`，并且不取消新提交的运行；普通手动验证不按 `run_id` 隔离。Core 的 schedule 和 merge queue 不取消同组正在执行的检查。
 
-Small 使用跨 ref 的 `ci-delivery-small` 串行组，不取消正在执行的实验。Live 及其调用的 `linux-native` Core 均按 `run_id` 隔离且不自动取消，保留昂贵实验的显式独立运行。Nightly 协调器、产品发布与部署分别遵守自己的并发规则；Nightly 协调器使用全局 `daily-nightly` 串行组。
+Small 使用跨 ref 的 `ci-delivery-small` 串行组，不取消正在执行的实验。Live 及其调用的 `linux-native` Core 均按 `run_id` 隔离且不自动取消，保留昂贵实验的显式独立运行。Hourly 协调器、产品发布与部署分别遵守自己的并发规则；Hourly 协调器使用全局 `hourly-release` 串行组。
 
 Linux x64 制品任务使用 pnpm 缓存，并按 runner、架构和 `pnpm-lock.yaml` 缓存 Chromium 二进制。浏览器的系统依赖从 Ubuntu 官方镜像下载，沿用签名仓库配置。每次仍执行冻结依赖安装、浏览器与系统依赖安装以及完整浏览器用例。缓存只包含浏览器文件，不包含测试结果、Node 数据或下载的恢复文件。
 

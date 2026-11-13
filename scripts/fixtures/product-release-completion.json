@@ -2,229 +2,229 @@
   "app": "product",
   "assets": [
     {
-      "name": "vibeface-0.0.1-nightly.20261108.1-aarch64-apple-darwin.tar.gz",
+      "name": "vibeface-0.0.1-hourly.2026110812-aarch64-apple-darwin.tar.gz",
       "sha256": "5e771725ba1002769bdce30580b8bade776b8066a4ce444357a190295757528a",
       "size": 26178768
     },
     {
-      "name": "vibeface-0.0.1-nightly.20261108.1-aarch64-apple-darwin.tar.gz.sha256",
+      "name": "vibeface-0.0.1-hourly.2026110812-aarch64-apple-darwin.tar.gz.sha256",
       "sha256": "8860f8d95012c007211882c9c5d375c9e437538ce2699f08e494812f7680f3a3",
       "size": 128
     },
     {
-      "name": "vibeface-0.0.1-nightly.20261108.1-aarch64-unknown-linux-gnu.tar.gz",
+      "name": "vibeface-0.0.1-hourly.2026110812-aarch64-unknown-linux-gnu.tar.gz",
       "sha256": "0c91befdef330929d6e5bb214d560b88445cc5c924dea586cfbd5871fb3bf919",
       "size": 29718944
     },
     {
-      "name": "vibeface-0.0.1-nightly.20261108.1-aarch64-unknown-linux-gnu.tar.gz.sha256",
+      "name": "vibeface-0.0.1-hourly.2026110812-aarch64-unknown-linux-gnu.tar.gz.sha256",
       "sha256": "670fb4f31aa90f7e1c7f27c6bcf7bf67be1338995deec06faedb0e2ab6ee0399",
       "size": 133
     },
     {
-      "name": "vibeface-0.0.1-nightly.20261108.1-android.apk",
+      "name": "vibeface-0.0.1-hourly.2026110812-android.apk",
       "sha256": "9c3735d2cd3b6a79e7c12460c563e8d76186a2d2a96e9aed3c21a24b6aa4556e",
       "size": 115867614
     },
     {
-      "name": "vibeface-0.0.1-nightly.20261108.1-android.apk.provenance.json",
+      "name": "vibeface-0.0.1-hourly.2026110812-android.apk.provenance.json",
       "sha256": "a6045c64d86a1afbb01797652b34d9800c93c614de4b5408490406eda2945bd8",
       "size": 279
     },
     {
-      "name": "vibeface-0.0.1-nightly.20261108.1-android.apk.sha256",
+      "name": "vibeface-0.0.1-hourly.2026110812-android.apk.sha256",
       "sha256": "fc0e8eab9f1751649740b2ab0d0f9fd2e5cea48c271274acbaba2dfb8e96d4fc",
       "size": 112
     },
     {
-      "name": "vibeface-0.0.1-nightly.20261108.1-ios-device-unsigned.xcarchive.zip",
+      "name": "vibeface-0.0.1-hourly.2026110812-ios-device-unsigned.xcarchive.zip",
       "sha256": "e71b77f060ecb7c8b93cc933a32e683addee4d24f85fa0a63f0d9ff0bcd68dd8",
       "size": 69323291
     },
     {
-      "name": "vibeface-0.0.1-nightly.20261108.1-ios-device-unsigned.xcarchive.zip.provenance.json",
+      "name": "vibeface-0.0.1-hourly.2026110812-ios-device-unsigned.xcarchive.zip.provenance.json",
       "sha256": "62a336eb1b2abd730173194a4f36c713dd30994c00cf96a316630cd2e496662f",
       "size": 515
     },
     {
-      "name": "vibeface-0.0.1-nightly.20261108.1-ios-device-unsigned.xcarchive.zip.sha256",
+      "name": "vibeface-0.0.1-hourly.2026110812-ios-device-unsigned.xcarchive.zip.sha256",
       "sha256": "dc123bdf10e81fbefcf382d50933ee21a1147230dca2911620d89fedaa19deb2",
       "size": 134
     },
     {
-      "name": "vibeface-0.0.1-nightly.20261108.1-x86_64-pc-windows-msvc.tar.gz",
+      "name": "vibeface-0.0.1-hourly.2026110812-x86_64-pc-windows-msvc.tar.gz",
       "sha256": "fc8123546973deef00ad12e4933df520a0d8ae966bcc5d7791ef5e0a61f724c8",
       "size": 25883684
     },
     {
-      "name": "vibeface-0.0.1-nightly.20261108.1-x86_64-pc-windows-msvc.tar.gz.sha256",
+      "name": "vibeface-0.0.1-hourly.2026110812-x86_64-pc-windows-msvc.tar.gz.sha256",
       "sha256": "f57d1eb382b40fa16bf7c73cb29638c3949557e238b2d48c8ea8c4bfaf70ab15",
       "size": 130
     },
     {
-      "name": "vibeface-0.0.1-nightly.20261108.1-x86_64-unknown-linux-gnu.tar.gz",
+      "name": "vibeface-0.0.1-hourly.2026110812-x86_64-unknown-linux-gnu.tar.gz",
       "sha256": "b9bc64ce56273a9a987fb8394decfaeab8c282b81e5ee29b8cb13e46422b0b0e",
       "size": 29685481
     },
     {
-      "name": "vibeface-0.0.1-nightly.20261108.1-x86_64-unknown-linux-gnu.tar.gz.sha256",
+      "name": "vibeface-0.0.1-hourly.2026110812-x86_64-unknown-linux-gnu.tar.gz.sha256",
       "sha256": "4184a5a2dd498d77b6ac00bbb6162fa28f41b17e818f171264e605520e57c7cf",
       "size": 132
     },
     {
-      "name": "vibeface-app-0.0.1-nightly.20261108.1.tar.gz",
+      "name": "vibeface-app-0.0.1-hourly.2026110812.tar.gz",
       "sha256": "86cb63fa0d8b69f9925c157f7ea38ecc8f7901e60b72a8e8657b618d7d8ec9b7",
       "size": 981690
     },
     {
-      "name": "vibeface-app-0.0.1-nightly.20261108.1.tar.gz.sha256",
+      "name": "vibeface-app-0.0.1-hourly.2026110812.tar.gz.sha256",
       "sha256": "7e8cb37740fb8a6731b93f83f5f10376873233209c028643b2e5da1a845362a5",
       "size": 111
     },
     {
-      "name": "vibeface-core-0.0.1-nightly.20261108.1-aarch64-apple-darwin.tar.gz",
+      "name": "vibeface-core-0.0.1-hourly.2026110812-aarch64-apple-darwin.tar.gz",
       "sha256": "0ed2a4f170c2c238736015bbda70caa22184e06c7d60a210dc48823c8ab6d4b4",
       "size": 21570897
     },
     {
-      "name": "vibeface-core-0.0.1-nightly.20261108.1-aarch64-apple-darwin.tar.gz.sha256",
+      "name": "vibeface-core-0.0.1-hourly.2026110812-aarch64-apple-darwin.tar.gz.sha256",
       "sha256": "392c80f352184121a18cbb6ceeeb6297db1202b0329e53d0e0756922d4165378",
       "size": 133
     },
     {
-      "name": "vibeface-core-0.0.1-nightly.20261108.1-aarch64-unknown-linux-gnu.tar.gz",
+      "name": "vibeface-core-0.0.1-hourly.2026110812-aarch64-unknown-linux-gnu.tar.gz",
       "sha256": "4404ae4af6e27e78ac76205701eec0852e36570f23ac4e80c968a9aa7972d493",
       "size": 24786447
     },
     {
-      "name": "vibeface-core-0.0.1-nightly.20261108.1-aarch64-unknown-linux-gnu.tar.gz.sha256",
+      "name": "vibeface-core-0.0.1-hourly.2026110812-aarch64-unknown-linux-gnu.tar.gz.sha256",
       "sha256": "4b5e3c62a8f6fca7e884459df78ae57e606dbb307ebd7ec8eea0e1a22b8dff0b",
       "size": 138
     },
     {
-      "name": "vibeface-core-0.0.1-nightly.20261108.1-x86_64-pc-windows-msvc.tar.gz",
+      "name": "vibeface-core-0.0.1-hourly.2026110812-x86_64-pc-windows-msvc.tar.gz",
       "sha256": "cfe914cb36cdb4322180d2b29319048aaadc2885056212979fe0e5213f406000",
       "size": 21373594
     },
     {
-      "name": "vibeface-core-0.0.1-nightly.20261108.1-x86_64-pc-windows-msvc.tar.gz.sha256",
+      "name": "vibeface-core-0.0.1-hourly.2026110812-x86_64-pc-windows-msvc.tar.gz.sha256",
       "sha256": "05656c34b2c405784f68621609be9b01a28834ab2d50cca9c4110a28ce8cdd97",
       "size": 135
     },
     {
-      "name": "vibeface-core-0.0.1-nightly.20261108.1-x86_64-unknown-linux-gnu.tar.gz",
+      "name": "vibeface-core-0.0.1-hourly.2026110812-x86_64-unknown-linux-gnu.tar.gz",
       "sha256": "683cd81e8976771144389a5d5dcf6ef15d02608c79a5d1bf66bdd6d1a443ea41",
       "size": 24745089
     },
     {
-      "name": "vibeface-core-0.0.1-nightly.20261108.1-x86_64-unknown-linux-gnu.tar.gz.sha256",
+      "name": "vibeface-core-0.0.1-hourly.2026110812-x86_64-unknown-linux-gnu.tar.gz.sha256",
       "sha256": "c1df143d927d004c5bdf8751cccb4dd5dbf7d0e83b37fea5efeff52cb44d4f92",
       "size": 137
     },
     {
-      "name": "vibeface-desktop-0.0.1-nightly.20261108.1-aarch64-apple-darwin.dmg",
+      "name": "vibeface-desktop-0.0.1-hourly.2026110812-aarch64-apple-darwin.dmg",
       "sha256": "2420c6730d94f1353bfcc4b05b2327d534f4e3309ccf5bfcf808961abb7a30db",
       "size": 147765845
     },
     {
-      "name": "vibeface-desktop-0.0.1-nightly.20261108.1-aarch64-apple-darwin.dmg.sha256",
+      "name": "vibeface-desktop-0.0.1-hourly.2026110812-aarch64-apple-darwin.dmg.sha256",
       "sha256": "c42447ff6b2b4aac225894f3883cc9cb8d30fb64b25375622da59df3395c5b47",
       "size": 133
     },
     {
-      "name": "vibeface-desktop-0.0.1-nightly.20261108.1-aarch64-apple-darwin.provenance.json",
+      "name": "vibeface-desktop-0.0.1-hourly.2026110812-aarch64-apple-darwin.provenance.json",
       "sha256": "dccf5b238e9e4380cffd91f63f2f26dc3f780f12f57da5059d6001e13f329475",
       "size": 807
     },
     {
-      "name": "vibeface-desktop-0.0.1-nightly.20261108.1-aarch64-apple-darwin.zip",
+      "name": "vibeface-desktop-0.0.1-hourly.2026110812-aarch64-apple-darwin.zip",
       "sha256": "57b9ae4a434f70e5a22e9c482a9e34290c729567c079eb00bdd2c96a28398f81",
       "size": 143035484
     },
     {
-      "name": "vibeface-desktop-0.0.1-nightly.20261108.1-aarch64-apple-darwin.zip.sha256",
+      "name": "vibeface-desktop-0.0.1-hourly.2026110812-aarch64-apple-darwin.zip.sha256",
       "sha256": "f74e8743c89ea2f87fbdba43355177e16eacbd38c1e390f91dafc4a0b7c716be",
       "size": 133
     },
     {
-      "name": "vibeface-desktop-0.0.1-nightly.20261108.1-aarch64-unknown-linux-gnu.AppImage",
+      "name": "vibeface-desktop-0.0.1-hourly.2026110812-aarch64-unknown-linux-gnu.AppImage",
       "sha256": "8cf8d2a52bb82e101a997898db3743e63265496ff232a34c8d27d5fe24ec2737",
       "size": 158059863
     },
     {
-      "name": "vibeface-desktop-0.0.1-nightly.20261108.1-aarch64-unknown-linux-gnu.AppImage.sha256",
+      "name": "vibeface-desktop-0.0.1-hourly.2026110812-aarch64-unknown-linux-gnu.AppImage.sha256",
       "sha256": "4cf1931001c8afa0dff4eebefaa6861db10de1bd0ae1970adf73cb46c459fcad",
       "size": 143
     },
     {
-      "name": "vibeface-desktop-0.0.1-nightly.20261108.1-aarch64-unknown-linux-gnu.provenance.json",
+      "name": "vibeface-desktop-0.0.1-hourly.2026110812-aarch64-unknown-linux-gnu.provenance.json",
       "sha256": "a5a700ce8ec7118917ccf15a2741eaec21c479df6947dfd3e89bd48491df1a38",
       "size": 829
     },
     {
-      "name": "vibeface-desktop-0.0.1-nightly.20261108.1-aarch64-unknown-linux-gnu.zip",
+      "name": "vibeface-desktop-0.0.1-hourly.2026110812-aarch64-unknown-linux-gnu.zip",
       "sha256": "7028c65b6c7f1e6aab4b1d359cc9e856bc2330e05cb38cb8e76e06f68bb20688",
       "size": 150262174
     },
     {
-      "name": "vibeface-desktop-0.0.1-nightly.20261108.1-aarch64-unknown-linux-gnu.zip.sha256",
+      "name": "vibeface-desktop-0.0.1-hourly.2026110812-aarch64-unknown-linux-gnu.zip.sha256",
       "sha256": "f1524a8c314aa143daca05347fb743af9ac5031dcd82904b1901eb53f381d996",
       "size": 138
     },
     {
-      "name": "vibeface-desktop-0.0.1-nightly.20261108.1-x86_64-pc-windows-msvc.exe",
+      "name": "vibeface-desktop-0.0.1-hourly.2026110812-x86_64-pc-windows-msvc.exe",
       "sha256": "70b7eb3ac878f14c397f442a2c3ae07622e769d0a4f6ad7a4b7502a8a9446330",
       "size": 124937900
     },
     {
-      "name": "vibeface-desktop-0.0.1-nightly.20261108.1-x86_64-pc-windows-msvc.exe.sha256",
+      "name": "vibeface-desktop-0.0.1-hourly.2026110812-x86_64-pc-windows-msvc.exe.sha256",
       "sha256": "71cbc1c83cc04c4dd81ff9320e9495b247aff22a668c760209acc8fe3c29830d",
       "size": 135
     },
     {
-      "name": "vibeface-desktop-0.0.1-nightly.20261108.1-x86_64-pc-windows-msvc.provenance.json",
+      "name": "vibeface-desktop-0.0.1-hourly.2026110812-x86_64-pc-windows-msvc.provenance.json",
       "sha256": "4097a158474c6ef7d2acb34ce9f28ee119513317b7ca1bd5456a0b026a8d8afd",
       "size": 822
     },
     {
-      "name": "vibeface-desktop-0.0.1-nightly.20261108.1-x86_64-pc-windows-msvc.zip",
+      "name": "vibeface-desktop-0.0.1-hourly.2026110812-x86_64-pc-windows-msvc.zip",
       "sha256": "7d659d24e45ead3d59992b9c2b70566290f13e672c7b1c27daecfcdb573cf9e8",
       "size": 178397113
     },
     {
-      "name": "vibeface-desktop-0.0.1-nightly.20261108.1-x86_64-pc-windows-msvc.zip.sha256",
+      "name": "vibeface-desktop-0.0.1-hourly.2026110812-x86_64-pc-windows-msvc.zip.sha256",
       "sha256": "aa9d55b55eda469771185d2c4377eac5cbee9d6a644a2f9ef7e841b24cdeabaa",
       "size": 135
     },
     {
-      "name": "vibeface-desktop-0.0.1-nightly.20261108.1-x86_64-unknown-linux-gnu.AppImage",
+      "name": "vibeface-desktop-0.0.1-hourly.2026110812-x86_64-unknown-linux-gnu.AppImage",
       "sha256": "b3c7e6a951d1e01e7a8515b8d3d12a383a3ad74fbaf17beafee1f43a22913964",
       "size": 156780225
     },
     {
-      "name": "vibeface-desktop-0.0.1-nightly.20261108.1-x86_64-unknown-linux-gnu.AppImage.sha256",
+      "name": "vibeface-desktop-0.0.1-hourly.2026110812-x86_64-unknown-linux-gnu.AppImage.sha256",
       "sha256": "c5255802d0c5cb33653ed5377aaea15468d97caab992680c2ea99c463f661247",
       "size": 142
     },
     {
-      "name": "vibeface-desktop-0.0.1-nightly.20261108.1-x86_64-unknown-linux-gnu.provenance.json",
+      "name": "vibeface-desktop-0.0.1-hourly.2026110812-x86_64-unknown-linux-gnu.provenance.json",
       "sha256": "ef644e1807e8b79dd58615644bcf188982cebb9bbcb45873a8edec19a15e5f65",
       "size": 825
     },
     {
-      "name": "vibeface-desktop-0.0.1-nightly.20261108.1-x86_64-unknown-linux-gnu.zip",
+      "name": "vibeface-desktop-0.0.1-hourly.2026110812-x86_64-unknown-linux-gnu.zip",
       "sha256": "43efd6c7bd70e895b10d0771f7f0a273e7db05ea5d0d125c8b627c4c51d0131f",
       "size": 149325085
     },
     {
-      "name": "vibeface-desktop-0.0.1-nightly.20261108.1-x86_64-unknown-linux-gnu.zip.sha256",
+      "name": "vibeface-desktop-0.0.1-hourly.2026110812-x86_64-unknown-linux-gnu.zip.sha256",
       "sha256": "bef5e9f374ad4bb4015c5138baabd710026f437f88e3f23aaa0b5ebbc7bff154",
       "size": 137
     }
   ],
-  "channel": "nightly",
+  "channel": "hourly",
   "schema": 1,
   "source_commit": "7845e46d9c5b04b66eb7a66bcda31572e1ef7f4a",
-  "tag": "v0.0.1-nightly.20261108.1",
-  "version": "0.0.1-nightly.20261108.1"
+  "tag": "v0.0.1-hourly.2026110812",
+  "version": "0.0.1-hourly.2026110812"
 }

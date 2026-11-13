@@ -13,7 +13,7 @@
 </div>
 
 > [!NOTE]
-> Vibeface is in Nightly. Before the first stable release, protocol, data, and API changes do not preserve backward compatibility. Use the same version on all computers in your network.
+> Vibeface ships hourly preview builds. Before the first stable release, protocol, data, and API changes do not preserve backward compatibility. Use the same version on all computers in your network.
 
 ## Contents
 
@@ -41,10 +41,10 @@ Vibeface coordinates the work. You provide the Agent, its login and model access
 
 You need an Apple Silicon Mac, Windows x64, Linux x64, or Linux ARM64 with glibc, plus a supported Agent set up on that computer.
 
-1. Install Nightly. The installer selects and verifies the complete package for your platform:
+1. Install the hourly build. The installer selects and verifies the complete package for your platform:
 
    ```sh
-   curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh | bash -s -- --channel nightly --install-root "$HOME/.local/share/vibeface" --bin-dir "$HOME/.local/bin"
+   curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh | bash -s -- --channel hourly --install-root "$HOME/.local/share/vibeface" --bin-dir "$HOME/.local/bin"
    export PATH="$HOME/.local/bin:$PATH"
    vibeface --version
    ```
@@ -64,7 +64,7 @@ The default data directory is `~/.vibeface`. The first run initializes only a mi
 
 Add `~/.local/bin` to your shell configuration to use `vibeface` in new terminals. For an existing installation, use `vibeface update` for updates and `vibeface service` to manage the background service. Do not run the installer again. See [installation and updates](packages/docs/install.md) for update configuration and other installation options.
 
-With Node.js 22 or newer, you can also install the CLI from npm with `npm install -g @leaperone/vibeface@nightly`. npm manages updates for that installation.
+With Node.js 22 or newer, you can also install the CLI from npm with `npm install -g @leaperone/vibeface@hourly`. npm manages updates for that installation.
 
 ## Add another device
 

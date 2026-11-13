@@ -52,8 +52,8 @@ def self_test():
     from unittest.mock import patch
 
     source = 'a' * 40
-    context = dict(app='product', version='0.0.1-nightly.20261111.1',
-                   tag='v0.0.1-nightly.20261111.1', source_commit=source, channel='nightly')
+    context = dict(app='product', version='0.0.1-hourly.2026111109',
+                   tag='v0.0.1-hourly.2026111109', source_commit=source, channel='hourly')
     environment = dict(RELEASE_TAG=context['tag'], PUBLISH='true',
                        GITHUB_REPOSITORY=release.GITHUB_REPO,
                        GITHUB_REF='refs/tags/' + context['tag'], GITHUB_SHA=source,
@@ -102,10 +102,10 @@ def self_test():
             accepted += 1
 
     exercise()
-    website_tag = 'www-v0.0.1-nightly.20261111.1'
+    website_tag = 'www-v0.0.1-rc.1'
     exercise('www', env=dict(RELEASE_TAG=website_tag, GITHUB_REF='refs/tags/' + website_tag,
                              WINDOWS_SIGNING_CONFIGURED='false', IOS_SIGNING_CONFIGURED='false'),
-             identity=dict(tag=website_tag))
+             identity=dict(tag=website_tag, version='0.0.1-rc.1', channel='rc'))
     exercise(env=dict(RELEASE_TAG='', PUBLISH='false', GITHUB_REPOSITORY='fork/repo',
                       GITHUB_REF='refs/heads/topic'))
     for env, error in (
@@ -114,8 +114,8 @@ def self_test():
         (dict(GITHUB_REF='refs/heads/main'), 'exact existing tag'),
         (dict(GITHUB_REF='refs/tags/v0.0.1'), 'exact existing tag'),
         (dict(RELEASE_TAG=website_tag, GITHUB_REF='refs/tags/' + website_tag), 'tag kind must match'),
-        (dict(RELEASE_TAG='v0.0.1-nightly.20261111.2',
-              GITHUB_REF='refs/tags/v0.0.1-nightly.20261111.2'), 'declared version'),
+        (dict(RELEASE_TAG='v0.0.1-hourly.2026111110',
+              GITHUB_REF='refs/tags/v0.0.1-hourly.2026111110'), 'declared version'),
         (dict(GITHUB_SHA='c' * 40), 'workflow commit'),
         (dict(PUBLISH='yes'), 'true or false'),
     ):

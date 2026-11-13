@@ -1507,8 +1507,8 @@ mod tests {
             "data_dir": "/fixture/node",
             "device_id": "a".repeat(64),
             "status": "running",
-            "core_version": "0.0.1-nightly.20261108.1",
-            "version": "0.0.1-nightly.20261108.1",
+            "core_version": "0.0.1-hourly.2026110812",
+            "version": "0.0.1-hourly.2026110812",
             "maintenance_socket": "/fixture/node/maintenance.sock",
             "listen": "127.0.0.1:4790",
             "local_listen": "127.0.0.1:4791",
@@ -1525,7 +1525,7 @@ mod tests {
         assert_eq!(inspected.status, "running");
         assert_eq!(
             running_core_version(&inspected).unwrap(),
-            "0.0.1-nightly.20261108.1"
+            "0.0.1-hourly.2026110812"
         );
         let mut missing_identity = report;
         missing_identity
@@ -1539,24 +1539,24 @@ mod tests {
     fn runtime_update_availability_covers_current_newer_conflict_and_downgrade() {
         let root = temp("runtime-compare");
         let bundled = sealed_fixture_version(&root.join("bundled"), env!("CARGO_PKG_VERSION"));
-        let installed = sealed_fixture_version(&root.join("installed"), "0.0.1-nightly.20261107.1");
+        let installed = sealed_fixture_version(&root.join("installed"), "0.0.1-hourly.2026110712");
         let newer = runtime_update_for_packages(&bundled, Some(&installed), None).unwrap();
         assert_eq!(newer.availability, "newer_available");
         let matching = sealed_fixture_version(&root.join("matching"), env!("CARGO_PKG_VERSION"));
         let current = runtime_update_for_packages(&matching, Some(&matching), None).unwrap();
         assert_eq!(current.availability, "current");
         let downgraded =
-            sealed_fixture_version(&root.join("downgraded"), "0.0.1-nightly.20261106.1");
+            sealed_fixture_version(&root.join("downgraded"), "0.0.1-hourly.2026110612");
         let downgrade = runtime_update_for_packages(&downgraded, Some(&installed), None).unwrap();
         assert_eq!(downgrade.availability, "downgrade_refused");
-        let same_version = sealed_fixture_version(&root.join("same"), "0.0.1-nightly.20261107.1");
+        let same_version = sealed_fixture_version(&root.join("same"), "0.0.1-hourly.2026110712");
         fs::write(installed.join("web/index.html"), b"changed-bytes").unwrap();
         let conflict = runtime_update_for_packages(&same_version, Some(&installed), None).unwrap();
         assert_eq!(conflict.availability, "immutable_conflict");
         let mismatch = runtime_update_for_packages(
             &matching,
             Some(&matching),
-            Some("0.0.1-nightly.20261106.1"),
+            Some("0.0.1-hourly.2026110612"),
         )
         .unwrap();
         assert_eq!(mismatch.availability, "newer_available");
@@ -1569,7 +1569,7 @@ mod tests {
         let managed = root.join("managed");
         fs::create_dir(&managed).unwrap();
         privatefs::restrict_dir(&managed).unwrap();
-        let first = sealed_fixture_version(&root.join("first"), "0.0.1-nightly.20261107.1");
+        let first = sealed_fixture_version(&root.join("first"), "0.0.1-hourly.2026110712");
         let first_release = stage_runtime_release(&managed, &first).unwrap();
         crate::update::switch_managed_current(&managed, &first_release).unwrap();
         let current_before = managed_package_version(&managed_current(&managed).unwrap()).unwrap();
@@ -1577,7 +1577,7 @@ mod tests {
         stage_runtime_release(&managed, &second).unwrap();
         let current_after = managed_package_version(&managed_current(&managed).unwrap()).unwrap();
         assert_eq!(current_before, current_after);
-        assert_eq!(current_before, "0.0.1-nightly.20261107.1");
+        assert_eq!(current_before, "0.0.1-hourly.2026110712");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1676,7 +1676,7 @@ mod tests {
         fs::create_dir(&managed_root).unwrap();
         privatefs::restrict_dir(&managed_root).unwrap();
         let policy = serde_json::json!({
-            "channel": "nightly", "automatic": false, "install_root": managed_root
+            "channel": "hourly", "automatic": false, "install_root": managed_root
         });
         privatefs::write_atomic(
             &data.join("update.json"),
@@ -1848,7 +1848,7 @@ mod tests {
         }
         reseal(&package);
         let policy = serde_json::json!({
-            "channel": "nightly", "automatic": false, "install_root": &managed_root
+            "channel": "hourly", "automatic": false, "install_root": &managed_root
         });
         privatefs::write_atomic(
             &data.join("update.json"),
