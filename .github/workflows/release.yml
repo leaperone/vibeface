@@ -405,7 +405,7 @@ jobs:
           python3 -B scripts/check-android-manifest-tool.py
           python3 -B scripts/release.py assemble-product --input-root .artifacts/input --output .artifacts/release
       - name: Prepare npm distribution from the complete product
-        if: contains(needs.identity.outputs.version, '-nightly.')
+        if: contains(needs.identity.outputs.version, '-hourly.')
         env:
           VERSION: ${{ needs.identity.outputs.version }}
           SOURCE_SHA: ${{ needs.identity.outputs.source_sha }}
@@ -417,7 +417,7 @@ jobs:
           node scripts/package-npm.mjs --input .artifacts/npm-input --source-commit "$SOURCE_SHA"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         id: npm-artifact
-        if: contains(needs.identity.outputs.version, '-nightly.')
+        if: contains(needs.identity.outputs.version, '-hourly.')
         with:
           name: npm-package-${{ needs.identity.outputs.source_sha }}-${{ github.run_attempt }}
           path: .artifacts/npm/*
@@ -474,9 +474,9 @@ jobs:
           python3 -B scripts/release.py plan --app product --tag "$RELEASE_TAG" --require-main --publish
           python3 -B scripts/release.py fail-product
   npm:
-    name: Publish npm Nightly
+    name: Publish npm Hourly
     needs: [identity, collect, publish-product]
-    if: needs.publish-product.result == 'success' && contains(needs.identity.outputs.version, '-nightly.')
+    if: needs.publish-product.result == 'success' && contains(needs.identity.outputs.version, '-hourly.')
     uses: ./.github/workflows/npm-publish.yml
     with:
       tag: ${{ needs.identity.outputs.tag }}
