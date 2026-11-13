@@ -1696,6 +1696,39 @@ mod tests {
         assert!(absent(ids.clone(), &ids.iter().copied().collect()).is_empty());
     }
 
+    #[test]
+    fn rejoining_prefers_online_records_but_keeps_expired_fallback() {
+        let now = 10_000_000;
+        let online = entry("a".repeat(64), now - 1_000);
+        let expired = entry("b".repeat(64), now - 1_800_001);
+        let preferred = prefer_online(vec![&online, &expired], now);
+        assert_eq!(preferred.len(), 1);
+        assert_eq!(preferred[0].record.device_id, online.record.device_id);
+        assert_eq!(prefer_online(vec![&expired], now).len(), 1);
+    }
+
+    fn entry(device_id: String, seq: u64) -> table::Entry {
+        table::Entry {
+            signed: SignedMeshRecord {
+                payload: String::new(),
+                signature: String::new(),
+            },
+            record: MeshRecord {
+                v: 1,
+                network: "vibeface".into(),
+                device_id,
+                seq,
+                ttl_s: record::DEFAULT_TTL_S,
+                addrs: vec![],
+                relay_url: None,
+                reachable: Reachable::Public,
+                roles: vec![],
+            },
+            first_seen_ms: seq,
+            last_seen_ms: seq,
+        }
+    }
+
     struct Node {
         net: Arc<Net>,
         mesh: Arc<Mesh>,
