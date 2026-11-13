@@ -9633,7 +9633,8 @@ pub(super) mod tests {
     /// The user's own Codex sessions live on their own App Server, which the Node only reaches
     /// when its socket is set. Only threads found there are sent there, keeping the session's
     /// settings, and the Node settles them by reading them there; its own threads and new
-    /// threads stay on its own App Server. The test Node's named App Server stands in for the
+    /// threads stay on its own App Server. A changed socket only serves later lookups, and work
+    /// there never holds a launch change. The test Node's named App Server stands in for the
     /// one it starts.
     #[tokio::test]
     async fn sends_reach_the_users_own_codex_only_for_threads_found_there() -> Result<()> {
@@ -9738,6 +9739,39 @@ pub(super) mod tests {
                     .turn_id,
                 "turn-t-user"
             );
+            // A changed or cleared socket only serves later lookups: the thread stays where it
+            // was found, so a chat message steered into its turn and the reads go there too.
+            node.codex.set_user_socket(None);
+            assert_eq!(node.codex.user_thread("t-user"), Some(user_socket.clone()));
+            use super::super::executor::{Executor as _, SteerAck, SteerInput, SteerTrace};
+            let into = crate::scheduling::SteerTarget {
+                provider: Provider::Codex,
+                attempt_id: format!("work:{work_id}"),
+                thread_id: "t-user".into(),
+                turn_id: "turn-t-user".into(),
+            };
+            let input = SteerInput {
+                text: "more".into(),
+                files: Vec::new(),
+            };
+            assert_eq!(
+                node.codex.send_turn(&into, "steer-1", &input).await,
+                SteerAck::Accepted { turn_id: None }
+            );
+            assert!(
+                user_seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request["method"] == "turn/steer"
+                        && request["params"]["threadId"] == "t-user"),
+                "steered on the user's App Server"
+            );
+            assert!(!wrote(&own_seen, "t-user"));
+            assert_eq!(
+                node.codex.read_back(&into, "steer-1").await,
+                Some(SteerTrace::Pending)
+            );
             user_turns
                 .lock()
                 .unwrap()
@@ -9751,6 +9785,7 @@ pub(super) mod tests {
                 ),
                 "the Node read the user's turn and settled it"
             );
+            node.codex.set_user_socket(Some(user_socket.clone()));
 
             let own_work = dispatch(Some("t-own"), "own").await?;
             assert!(own_work["state"]["state"] == "running", "{own_work}");
@@ -9803,6 +9838,27 @@ pub(super) mod tests {
                     .any(|request| request["method"] == "thread/start"),
                 "never on the user's"
             );
+            let fresh_id = fresh["work_id"].as_str().context("new work")?;
+            let fresh_turn = record(fresh_id)
+                .await?
+                .state
+                .handle()
+                .context("new turn")?
+                .turn_id
+                .clone();
+            node.signal_work(
+                &network,
+                fresh_id,
+                crate::work::Signal::TurnCompleted {
+                    turn_id: fresh_turn,
+                    status: vibeface_bridge::turn::TurnStatus::Completed,
+                    text: "done".into(),
+                    error: None,
+                },
+            )
+            .await?;
+            let again = dispatch(Some("t-user"), "user-again").await?;
+            assert!(again["state"]["state"] == "running", "{again}");
 
             let registered = works().await?.len();
             let refused = dispatch(Some("t-gone"), "gone")
@@ -9824,7 +9880,7 @@ pub(super) mod tests {
                 .expect_err("the user's App Server is gone");
             for said in [
                 "cannot tell which Codex App Server has thread t-elsewhere",
-                "the user's Codex App Server at",
+                "the user's own Codex App Server did not answer",
                 "nothing was registered or sent",
             ] {
                 assert!(refused.to_string().contains(said), "{refused:#}");
@@ -9834,7 +9890,53 @@ pub(super) mod tests {
                 registered,
                 "neither refusal registered a work"
             );
+            assert!(
+                !refused
+                    .to_string()
+                    .contains(&*user_socket.to_string_lossy()),
+                "the chat never sees the socket: {refused:#}"
+            );
             node.finish_manager_attempt(&attempt).await;
+
+            // A launch change waits only for work on the Node's own App Server, and the user's
+            // turn still running does not hold that launch.
+            {
+                let (identity, network, trigger, attempt) = (
+                    node.identity.clone(),
+                    network.clone(),
+                    trigger.clone(),
+                    attempt.clone(),
+                );
+                node.store
+                    .call("triage.test.finish_user_codex_reply", move |store| {
+                        store
+                            .finish_job(
+                                &identity,
+                                &network,
+                                "c",
+                                &trigger,
+                                &attempt,
+                                crate::scheduling::JobOutcome::Completed,
+                                "done",
+                                now_ms(),
+                            )
+                            .map(|_| ())
+                    })
+                    .await?;
+            }
+            node.pending_provider_launches.store(true, Ordering::SeqCst);
+            node.codex.configuration_changed();
+            assert!(
+                node.apply_provider_launches().await?,
+                "the user's running turn does not hold a launch change"
+            );
+            assert!(!node.pending_provider_launches.load(Ordering::SeqCst));
+            assert!(
+                !node
+                    .codex
+                    .configuration_pending(&node.providers().codex_target(true)),
+                "nor the Node's App Server launch"
+            );
             Ok::<_, anyhow::Error>(())
         }
         .await;

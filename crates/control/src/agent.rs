@@ -665,9 +665,9 @@ mod tests {
             ),
             (
                 ThreadAt::Unknown {
-                    error: "the user's Codex App Server at /u.sock did not answer".into(),
+                    error: "the user's own Codex App Server did not answer".into(),
                 },
-                "cannot tell which Codex App Server has thread t-1: the user's Codex App Server at /u.sock did not answer; nothing was registered or sent",
+                "cannot tell which Codex App Server has thread t-1: the user's own Codex App Server did not answer; nothing was registered or sent",
             ),
         ] {
             let ready = Ready {

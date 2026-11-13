@@ -41,7 +41,7 @@ impl Runtime {
             match provider {
                 Provider::Codex => {
                     let reply = tokio::time::timeout(
-                        Duration::from_secs(5),
+                        codex_server::READ_WAIT,
                         self.codex
                             .read(thread, json!({"threadId":thread,"includeTurns":false})),
                     )
@@ -86,7 +86,7 @@ impl Runtime {
         actual_cwd: &Path,
     ) -> Result<Option<crate::work::NativeExecution>> {
         let reply = tokio::time::timeout(
-            Duration::from_secs(5),
+            codex_server::READ_WAIT,
             self.codex
                 .read(thread, json!({"threadId":thread,"includeTurns":true})),
         )

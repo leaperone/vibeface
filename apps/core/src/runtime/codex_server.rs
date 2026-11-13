@@ -173,24 +173,19 @@ impl CodexServer {
     }
 
     /// The user's own Codex App Server while the Node runs its own: `codex_app_server.socket`
-    /// in spawn mode. Threads found on an earlier socket are looked for again.
+    /// in spawn mode. Only later lookups use it; a thread already found stays on its socket.
     pub(crate) fn set_user_socket(&self, socket: Option<PathBuf>) {
-        let mut user = self.user.lock().expect("user codex");
-        if user.socket != socket {
-            *user = UserCodex {
-                socket,
-                threads: BTreeSet::new(),
-            };
-        }
+        self.user.lock().expect("user codex").socket = socket;
     }
 
-    /// The user's own Codex App Server socket, when `thread` was found there.
+    /// The user's own Codex App Server socket `thread` was found on.
     pub(crate) fn user_thread(&self, thread: &str) -> Option<PathBuf> {
-        let user = self.user.lock().expect("user codex");
-        user.threads
-            .contains(thread)
-            .then(|| user.socket.clone())
-            .flatten()
+        self.user
+            .lock()
+            .expect("user codex")
+            .threads
+            .get(thread)
+            .cloned()
     }
 
     /// Reads `thread` on the App Server that has it: the Node's, else the user's own Codex,
@@ -211,10 +206,11 @@ impl CodexServer {
         ) {
             (Err(error), Some(socket)) if error.missing_thread() => {
                 let reply = user_request(&socket, "thread/read", params).await?;
-                let mut user = self.user.lock().expect("user codex");
-                if user.socket.as_ref() == Some(&socket) {
-                    user.threads.insert(thread.to_owned());
-                }
+                self.user
+                    .lock()
+                    .expect("user codex")
+                    .threads
+                    .insert(thread.to_owned(), socket.clone());
                 Ok((reply, Some(socket)))
             }
             (read, _) => read.map(|reply| (reply, None)),
@@ -311,17 +307,22 @@ impl CodexServer {
 }
 
 /// A Codex work is sent by the coordination Agent on its own App Server connection; the Node's
-/// client reads, stops and steers turns.
+/// client reads, stops and steers turns, on the user's own Codex for a thread found there.
 impl Executor for CodexServer {
     fn start_or_resume<'a>(
         &'a self,
         node: &'a Arc<Runtime>,
         _: &'a str,
         work: &'a WorkSpec,
-        _: Option<&'a str>,
+        thread: Option<&'a str>,
         _: &'a Value,
     ) -> BoxFuture<'a, Result<bool>> {
         Box::pin(async move {
+            // A turn on the user's own Codex does not run on the Node's App Server, so it does
+            // not hold that launch.
+            if thread.is_some_and(|thread| self.user_thread(thread).is_some()) {
+                return Ok(true);
+            }
             let expected = node.providers().codex_target(
                 node.manager()
                     .is_some_and(|manager| manager.provider.on_app_server()),
@@ -370,7 +371,11 @@ impl Executor for CodexServer {
             "clientUserMessageId":message_id,
             "input":blocks});
         Box::pin(async move {
-            match self.client.request("turn/steer", params).await {
+            let sent = match self.user_thread(&into.thread_id) {
+                Some(socket) => user_request(&socket, "turn/steer", params).await,
+                None => self.client.request("turn/steer", params).await,
+            };
+            match sent {
                 Ok(reply) => SteerAck::Accepted {
                     turn_id: reply["turnId"].as_str().map(str::to_owned),
                 },
@@ -386,10 +391,9 @@ impl Executor for CodexServer {
         message_id: &'a str,
     ) -> BoxFuture<'a, Option<SteerTrace>> {
         Box::pin(async move {
-            let reply = self
-                .client
-                .request(
-                    "thread/read",
+            let (reply, _) = self
+                .read(
+                    &into.thread_id,
                     json!({"threadId":into.thread_id,"includeTurns":true}),
                 )
                 .await
@@ -413,19 +417,23 @@ pub struct CodexServer {
     user: std::sync::Mutex<UserCodex>,
 }
 
-/// The user's own Codex App Server while the Node runs its own, and the threads found on it.
-/// The Node sends into and reads those threads there and never starts one there.
+/// The user's own Codex App Server while the Node runs its own, and the threads found on it,
+/// each with the socket it was found on. The Node sends into and reads those threads there and
+/// never starts one there.
 #[derive(Default)]
 struct UserCodex {
     socket: Option<PathBuf>,
-    threads: BTreeSet<String>,
+    threads: BTreeMap<String, PathBuf>,
 }
 
 /// How long the user's own Codex App Server gets to answer one request.
 const USER_WAIT: Duration = Duration::from_secs(10);
+/// How long the Node waits for a thread read that may ask its own App Server and then the
+/// user's own Codex.
+pub(crate) const READ_WAIT: Duration = Duration::from_secs(5 + USER_WAIT.as_secs());
 
 /// One request on its own connection to the user's own Codex App Server; the Node keeps no
-/// connection there.
+/// connection there. Its errors never name the socket: they reach the bot and the chat.
 async fn user_request(socket: &Path, method: &str, params: Value) -> Result<Value, CodexError> {
     let request = async {
         let mut session = DirectSession::connect(socket).await?;
@@ -433,22 +441,19 @@ async fn user_request(socket: &Path, method: &str, params: Value) -> Result<Valu
         session.close().await;
         reply
     };
-    let unanswered = |message: String| CodexError {
+    let unanswered = |message: &str| CodexError {
         uncertain: true,
         answered: false,
-        message,
+        message: format!("the user's own Codex App Server did not answer{message}"),
     };
-    tokio::time::timeout(USER_WAIT, request)
-        .await
-        .unwrap_or_else(|_| Err(unanswered("no answer in time".into())))
-        .map_err(|error| match error.answered {
-            true => error,
-            false => unanswered(format!(
-                "the user's Codex App Server at {} did not answer: {}",
-                socket.display(),
-                error.message
-            )),
-        })
+    match tokio::time::timeout(USER_WAIT, request).await {
+        Err(_) => Err(unanswered(" in time")),
+        Ok(Err(error)) if !error.answered => {
+            tracing::debug!(method, error = error.message, "user Codex request failed");
+            Err(unanswered(""))
+        }
+        Ok(reply) => reply,
+    }
 }
 
 /// How long a send waits for the App Server, as right after the Node starts, before it is refused.
