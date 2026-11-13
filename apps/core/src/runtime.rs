@@ -851,6 +851,7 @@ impl Runtime {
             dir,
             tx,
         )?);
+        codex.set_user_socket(local.user_codex_socket());
         let opencode = Arc::new(opencode::Opencode::open(
             dir,
             local.bin(Provider::Opencode),

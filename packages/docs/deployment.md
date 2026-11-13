@@ -63,7 +63,7 @@ vibeface join '<加入链接>' --name '<设备显示名称>'
 用到 Codex、Claude Code 或 Cursor 而程序路径缺失时，Node 在 `init`、启动和网页打开用途开关时从本机找出并写进配置。设备页的**自动接入**也能为尚未启用的服务准备设置，不开启 Bot 或任务执行。之后照写下的路径使用。Codex 的运行数据由 Node 隔离管理：
 
 - 默认 App Server 模式是 `spawn`，Node 使用 `<data-dir>/providers/codex` 作为 `CODEX_HOME`，并在 `<data-dir>/providers/codex/sessions` 保存自己的会话。
-- Node 不扫描用户的会话或 control socket。只有明确选择 `system` 并填写绝对 socket 才连接外部 App Server。
+- Node 不扫描用户的会话或 control socket。只有明确选择 `system` 并填写绝对 socket 才连接外部 App Server。`spawn` 时填写的 socket 是本人自己的 Codex App Server，只用来把消息送进本人已有的会话，见下文。
 - 程序先查 PATH，再查用户安装、Homebrew、npm、Bun、Volta 和 NVM 目录。Cursor 使用官方 `agent` 或 `cursor-agent`。Codex 另查 `/Applications/Codex.app/Contents/Resources`，Claude Code 另查 `~/.claude/local`，opencode 另查 `~/.opencode/bin`。NVM 根取 `NVM_DIR`，默认 `~/.nvm`；Windows 使用 PATHEXT。
 - npm wrapper 使用同一 `bin` 目录下的 Node。无保存程序或 PATH 且常见目录仍找不到时，仅查询登记登录 shell 的 PATH。
 
@@ -94,7 +94,9 @@ vibeface join '<加入链接>' --name '<设备显示名称>'
 
 Node 只连接这个 socket，不搜索其他正在运行的会话，也不启动或停止其所属进程。
 
-由 Node 启动自己的 App Server 时只需保持 `spawn`。Node 会在启动边界注入 Node-owned `CODEX_HOME`，覆盖普通 Provider 环境里的同名值。Provider 的其他认证环境通过设备设置或服务配置填写。不要把密钥写入源码、URL、共享记录或命令历史。Cursor 的 CLI 程序和协调 Agent 工作目录也由本机配置指定。
+由 Node 启动自己的 App Server 时只需保持 `spawn`。本人自己的 Codex（桌面 App 或终端）把会话存在另一个 Codex 目录，Node 自己的 App Server 读不到。要让 Bot 把回答送回这些会话，在 `spawn` 下同样填写 `socket`，指向本人 Codex 的 App Server（默认 `~/.codex/app-server-control/app-server-control.sock`）：Node 和 `vibeface codex send` 先问自己的 App Server，没有这个线程时再问它，只在那里有的线程才送过去，并沿用会话自己的审批、沙箱和模型；新线程永远开在 Node 自己的 App Server。不填时这些会话照旧拒绝送达。Bot 也可以用 `propose_provider_config app_server_socket` 提议，本人同意后写入，`mode` 不变。
+
+Node 会在启动边界注入 Node-owned `CODEX_HOME`，覆盖普通 Provider 环境里的同名值。Provider 的其他认证环境通过设备设置或服务配置填写。不要把密钥写入源码、URL、共享记录或命令历史。Cursor 的 CLI 程序和协调 Agent 工作目录也由本机配置指定。
 
 ## 为 Node 私有目录登录
 

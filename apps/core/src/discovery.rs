@@ -4,7 +4,7 @@
 //! The paths stay in the private `config.json` snapshot; they never reach shared records.
 use crate::{
     config::{Config, ManagerSettings},
-    providers::{AppServer, AppServerMode, Local, Provider, ProviderEnv},
+    providers::{AppServerMode, Local, Provider, ProviderEnv},
     triage::TriageConfig,
 };
 use anyhow::{Result, bail};
@@ -386,8 +386,9 @@ pub fn runnable(program: &Path, path: Option<&OsString>) -> bool {
 pub struct Paths {
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
     pub execution: BTreeSet<Provider>,
+    /// The user's own Codex App Server socket; the mode stays as it is.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub app_server: Option<AppServer>,
+    pub app_server_socket: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codex_home: Option<PathBuf>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -412,7 +413,7 @@ impl Paths {
     pub fn names(&self) -> Vec<String> {
         [
             ("execution", !self.execution.is_empty()),
-            ("app_server", self.app_server.is_some()),
+            ("app_server_socket", self.app_server_socket.is_some()),
             ("codex_home", self.codex_home.is_some()),
             ("codex_sessions", self.codex_sessions.is_some()),
         ]
@@ -435,7 +436,7 @@ impl Paths {
         execution.extend(self.execution);
         Paths {
             execution,
-            app_server: self.app_server.or(other.app_server),
+            app_server_socket: self.app_server_socket.or(other.app_server_socket),
             codex_home: self.codex_home.or(other.codex_home),
             bins,
             codex_sessions: self.codex_sessions.or(other.codex_sessions),
@@ -453,9 +454,10 @@ impl Paths {
                 .difference(&target.local.switches.execution)
                 .copied()
                 .collect(),
-            app_server: self
-                .app_server
-                .filter(|server| *server != target.local.switches.codex_app_server),
+            app_server_socket: differs(
+                self.app_server_socket,
+                target.local.switches.codex_app_server.socket.as_ref(),
+            ),
             codex_home: self.codex_home.filter(|home| {
                 target.local.env.get(Provider::Codex).get(CODEX_HOME)
                     != Some(&home.to_string_lossy().into_owned())
@@ -475,8 +477,8 @@ impl Paths {
             .switches
             .execution
             .extend(self.execution.iter().copied());
-        if let Some(server) = &self.app_server {
-            target.local.switches.codex_app_server = server.clone();
+        if let Some(socket) = &self.app_server_socket {
+            target.local.switches.codex_app_server.socket = Some(socket.clone());
         }
         if let Some(home) = &self.codex_home {
             target.local.env.apply(
@@ -1009,7 +1011,7 @@ exec /bin/sh -c "$2"
             Some(Provider::Codex),
             &host,
         )?;
-        assert_eq!(found.app_server, None);
+        assert_eq!(found.app_server_socket, None);
         assert_eq!(found.codex_home, None);
         assert_eq!(found.codex_sessions, None);
 
@@ -1025,9 +1027,31 @@ exec /bin/sh -c "$2"
             Some(Provider::Codex),
             &host,
         )?;
-        assert_eq!(found.app_server, None);
+        assert_eq!(found.app_server_socket, None);
         assert_eq!(found.codex_home, None);
         std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A proposed socket is the user's own Codex; it never moves the bots off the Node's own
+    /// App Server.
+    #[test]
+    fn a_proposed_app_server_socket_keeps_the_mode() -> Result<()> {
+        let (mut local, mut manager, mut triage) = (local(), None, TriageConfig::default());
+        let socket = PathBuf::from("/u/.codex/app-server-control/app-server-control.sock");
+        let paths = Paths {
+            app_server_socket: Some(socket.clone()),
+            ..Paths::default()
+        };
+        paths.apply(Target {
+            local: &mut local,
+            manager: &mut manager,
+            triage: &mut triage,
+        })?;
+        assert_eq!(local.switches.codex_app_server.mode, AppServerMode::Spawn);
+        assert_eq!(local.user_codex_socket(), Some(socket));
+        local.switches.codex_app_server.mode = AppServerMode::System;
+        assert_eq!(local.user_codex_socket(), None, "system mode shares it");
         Ok(())
     }
 

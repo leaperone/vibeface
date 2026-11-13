@@ -101,7 +101,10 @@ function AppServerSettings({ server, home, sessions, display, working, blocked, 
   const [testing, setTesting] = useState(false)
   useEffect(() => setDraft({ mode: server.mode, socket: server.socket ?? "" }), [server.mode, server.socket])
   useEffect(() => setTested(null), [server.mode, server.socket])
-  const dirty = draft.mode !== server.mode || draft.socket.trim() !== (server.socket ?? "")
+  const socketDirty = draft.socket.trim() !== (server.socket ?? "")
+  const dirty = draft.mode !== server.mode || socketDirty
+  // In spawn mode the socket is the user's own Codex; 测试连接 tests the Node's own App Server.
+  const testDirty = draft.mode !== server.mode || (draft.mode === "system" && socketDirty)
   const link = server.link
   const shown = tested ?? link
   // Opens by itself when a path needs attention and stays open after it is fixed, so a saved field does not fold away under the cursor.
@@ -119,20 +122,22 @@ function AppServerSettings({ server, home, sessions, display, working, blocked, 
       <div className="flex min-w-0 flex-wrap items-center gap-2">
         <Segmented label="连接方式" labels fill value={draft.mode} options={modes} disabled={working} onChange={(mode) => setDraft({ ...draft, mode })} />
         {dirty ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy.endsWith(":app_server")} />保存</Button> : null}
-        <Button type="button" variant="ghost" disabled={working || testing || dirty || blocked || link.state === "off"} onClick={() => void runTest()}>
+        <Button type="button" variant="ghost" disabled={working || testing || testDirty || blocked || link.state === "off"} onClick={() => void runTest()}>
           <BusyIcon busy={testing} icon={PlugZap} />测试连接
         </Button>
       </div>
-      {draft.mode === "system" ? <div className="grid gap-1">
-        <label htmlFor="codex-socket" className="text-meta font-medium text-muted-foreground">连接路径</label>
-        <Input id="codex-socket" name="socket" className="min-w-0 font-mono" placeholder={placeholders.socket} required pattern="/.*" maxLength={4096} spellCheck={false}
+      <div className="grid gap-1">
+        <label htmlFor="codex-socket" className="text-meta font-medium text-muted-foreground">{draft.mode === "system" ? "连接路径" : "你的 Codex 连接路径"}</label>
+        <Input id="codex-socket" name="socket" className="min-w-0 font-mono" placeholder={placeholders.socket} required={draft.mode === "system"} pattern="/.*" maxLength={1024} spellCheck={false}
           value={draft.socket} disabled={working} onChange={(event) => setDraft({ ...draft, socket: event.target.value })} />
-        <p className="text-meta text-muted-foreground">填写运行 Codex 的电脑上的绝对路径。</p>
-        <p className="text-meta text-muted-foreground">共享所选外部 App Server 的会话，不隔离该服务的数据。</p>
-      </div> : null}
-      {dirty ? <p role="status" className="text-meta text-muted-foreground">保存后可测试连接</p>
+        {draft.mode === "system" ? <>
+          <p className="text-meta text-muted-foreground">填写运行 Codex 的电脑上的绝对路径。</p>
+          <p className="text-meta text-muted-foreground">共享所选外部 App Server 的会话，不隔离该服务的数据。</p>
+        </> : <p className="text-meta text-muted-foreground">只用来把回复送进你自己的 Codex 会话。</p>}
+      </div>
+      {testDirty ? <p role="status" className="text-meta text-muted-foreground">保存后可测试连接</p>
         : blocked ? null : <LinkLine link={shown} prefix={tested ? "测试：" : ""} />}
-      {!dirty && (shown.state === "handshake_failed" || shown.state === "launch_failed") ? <Details label="原因"><code className="font-mono break-all">{shown.reason}</code></Details> : null}
+      {!testDirty && (shown.state === "handshake_failed" || shown.state === "launch_failed") ? <Details label="原因"><code className="font-mono break-all">{shown.reason}</code></Details> : null}
     </form>
     <Details label="路径" open={pathsOpen || needsPaths || undefined}>
       {draft.mode === "spawn" ? <p className="grid gap-1"><span className="font-medium">Node-owned Codex 目录</span><FolderPath path={home ?? ""} shown={home ? display[home] : "由 Node 创建"} /></p> : null}

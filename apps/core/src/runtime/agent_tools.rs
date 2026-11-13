@@ -619,7 +619,7 @@ impl Runtime {
             }
             Tool::WaitWork => {
                 drop((_lease, _work));
-                Ok(json!({"agent": self.ready_for(network, &args).await}))
+                Ok(serde_json::to_value(self.ready(network, &args).await)?)
             }
             // Cursor MCP calls the same dispatch flow as the scoped CLI.
             Tool::DispatchWork => {
@@ -632,10 +632,7 @@ impl Runtime {
                     |work_id, report| async move {
                         self.bind_work(network, scope, &work_id, report).await
                     },
-                    |args| async move {
-                        Ok((self.ready_for(network, &args).await)
-                            .map(|agent| agent.name().to_owned()))
-                    },
+                    |args| async move { Ok(self.ready(network, &args).await) },
                     Some(&socket),
                 )
                 .await
@@ -1339,6 +1336,21 @@ impl Runtime {
             "may_send":may_send,"send_by_ms":record.send_by_ms,"cwd":spec.cwd,"thread_id":thread,
             "model":spec.model,"resolved":spec.resolved}),
         )
+    }
+
+    /// The `wait_work` answer: the agent, and for a Codex thread the App Server that has it.
+    async fn ready(&self, network: &str, args: &Value) -> vibeface_control::agent::Ready {
+        let agent = self.ready_for(network, args).await;
+        let thread_at = match (agent, args["thread"].as_str()) {
+            (Some(agent), Some(thread)) if agent.on_app_server() => {
+                Some(self.codex.locate(thread).await)
+            }
+            _ => None,
+        };
+        vibeface_control::agent::Ready {
+            agent: agent.map(|agent| agent.name().to_owned()),
+            thread_at,
+        }
     }
 
     /// The provider a dispatch with these `args` would run on here, once the Node's App Server
