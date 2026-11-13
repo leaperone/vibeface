@@ -222,6 +222,8 @@ CI 不使用真实 AI Provider 或模型密钥。各模式都使用受控 SDK �
 
 产品 `v<version>` 与官网 `www-v<version>` 分别进入发布路径，必须匹配声明版本，并通过同一共享来源门验证 main 源码或受信机械 Hourly 提交。产品并行构建 Web、四个原生目标、Android 和 iOS，各平台再按自身输入组包并构建桌面 App。每组校验后立即向同一个公开 Release 追加附件，完整审计完成后才追加全局 `release.json`。`publish=false` 手动入口只验证并生成制品。产品与官网制品发布不触发部署；独立部署命令可显式选择已发布的 Stable、RC 或 Hourly Tag；派发成功不代表部署成功。详见 [构建与发布](releasing.md)。
 
+main push 的 Core 不运行 Windows Clippy，因此 preflight 的 `Rust Windows lint` 在本机执行 `python3 scripts/ci.py check --windows-cross --packages ...`，以 `x86_64-pc-windows-gnu` 检查只在 Windows 编译的 `cfg(windows)` 代码。包范围与 Windows Rust 任务相同，且仓库没有区分 GNU 与 MSVC 的条件编译。ring、libsqlite3-sys 和 blake3 仍为目标编译 C 代码，需要先安装 MinGW-w64（Debian/Ubuntu 为 `gcc-mingw-w64-x86-64`，Homebrew 为 `mingw-w64`）；缺少时检查直接失败，不会跳过。它只覆盖编译与 Clippy，Windows 测试和真实进程仍需下面的原生入口。
+
 Windows 专项使用当前源码，不接受历史运行包。只检查原生 Rust 时运行：
 
 ```sh

@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -495,9 +496,23 @@ def run_test(packages, tier, timings_file=None):
                 print("Could not write Rust timing report; preserving the test failure", file=sys.stderr)
 
 
-def run_check(packages, msrv=None):
+WINDOWS_CROSS_TARGET = "x86_64-pc-windows-gnu"
+WINDOWS_CROSS_CC = "x86_64-w64-mingw32-gcc"
+
+
+def run_check(packages, msrv=None, windows_cross=False):
     selected = package_args(packages)
-    subprocess.run(["cargo", "clippy", "--all-targets", "--locked", *selected, "--", "-D", "warnings"], check=True)
+    target = []
+    if windows_cross:
+        # Lints the cfg(windows) code a Linux or macOS checkout never compiles. No crate distinguishes the GNU
+        # and MSVC environments, so this matches the native Windows job's Clippy; ring, libsqlite3-sys and
+        # blake3 still build C for the target, which needs MinGW-w64.
+        if shutil.which(WINDOWS_CROSS_CC) is None:
+            raise SystemExit(f"Windows cross lint needs {WINDOWS_CROSS_CC}: install gcc-mingw-w64-x86-64 "
+                             "(Debian/Ubuntu) or mingw-w64 (Homebrew)")
+        subprocess.run(["rustup", "target", "add", WINDOWS_CROSS_TARGET], check=True)
+        target = ["--target", WINDOWS_CROSS_TARGET]
+    subprocess.run(["cargo", "clippy", *target, "--all-targets", "--locked", *selected, "--", "-D", "warnings"], check=True)
     if msrv:
         subprocess.run(["rustup", "toolchain", "install", msrv, "--profile", "minimal"], check=True)
         subprocess.run(["cargo", f"+{msrv}", "check", "--locked", *selected], check=True)
@@ -780,6 +795,22 @@ def self_test():
                 ["rustup", "toolchain", "install", "1.89", "--profile", "minimal"],
                 ["cargo", "+1.89", "check", "--locked", "-p", "vibeface", "-p", "vibeface-core", "-p", "vibeface-control"],
             ] if check_msrv else [])
+    with patch("shutil.which", return_value="/usr/bin/" + WINDOWS_CROSS_CC), patch("subprocess.run") as run:
+        run_check(["vibeface-bridge"], windows_cross=True)
+        assert [call.args[0] for call in run.call_args_list] == [
+            ["rustup", "target", "add", WINDOWS_CROSS_TARGET],
+            ["cargo", "clippy", "--target", WINDOWS_CROSS_TARGET, "--all-targets", "--locked", "-p", "vibeface-bridge", "--", "-D", "warnings"],
+        ]
+    with patch("shutil.which", return_value=None), patch("subprocess.run") as run:
+        try:
+            run_check(["vibeface-bridge"], windows_cross=True)
+        except SystemExit as error:
+            assert WINDOWS_CROSS_CC in str(error)
+        else:
+            raise AssertionError("Windows cross lint ran without its C compiler")
+        run.assert_not_called()
+    preflight = (Path(__file__).resolve().parent.parent / ".preflight.toml").read_text()
+    assert "scripts/ci.py check --windows-cross --packages" in preflight and 'ci_check = "Windows native gate"' in preflight
     root = Path(__file__).resolve().parent.parent
     workflow = (root / ".github/workflows/ci.yml").read_text()
     ci_gate = workflow.split("\n  ci-gate:\n", 1)[1]
@@ -1465,6 +1496,8 @@ def main():
             command.add_argument("--timings-file", type=Path, help="write compile, enumeration and execution durations")
         else:
             command.add_argument("--msrv", help="also check the declared minimum Rust version")
+            command.add_argument("--windows-cross", action="store_true",
+                                 help=f"lint for {WINDOWS_CROSS_TARGET} from a non-Windows host")
     args = parser.parse_args()
     if args.self_test:
         from unittest.mock import patch
@@ -1485,7 +1518,7 @@ def main():
             plan = json.loads(os.environ[args.plan_env]) if args.plan_env else None
             if plan and plan["check_msrv"] and not args.msrv:
                 parser.error("The selected CI plan requires --msrv")
-            run_check(packages, args.msrv if plan is None or plan["check_msrv"] else None)
+            run_check(packages, args.msrv if plan is None or plan["check_msrv"] else None, args.windows_cross)
     else:
         parser.error("Select a command or --self-test")
 
