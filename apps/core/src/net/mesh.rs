@@ -1017,7 +1017,7 @@ impl Mesh {
                         neighbors.insert(peer);
                         neighbors.len() == 1
                     };
-                    tracing::debug!(event = "mesh.neighbor_up", peer = %peer.fmt_short());
+                    tracing::info!(event = "mesh.neighbor_up", peer = %peer.fmt_short(), "a mesh neighbor connected");
                     // What was announced with no neighbor reached nobody.
                     if first {
                         let own = self
@@ -1034,6 +1034,7 @@ impl Mesh {
                 }
                 Ok(Event::NeighborDown(peer)) => {
                     self.neighbors.lock().expect("mesh neighbors").remove(&peer);
+                    tracing::info!(event = "mesh.neighbor_down", peer = %peer.fmt_short(), "a mesh neighbor disconnected");
                 }
                 Ok(Event::Received(message)) => {
                     if let Ok(signed) = serde_json::from_slice(&message.content) {

@@ -123,9 +123,15 @@ impl ProtocolHandler for Inbound {
         let Some(node) = self.node.upgrade() else {
             return Ok(());
         };
+        let peer = net::device_id(&connection.remote_id());
         node.accept_connection(self.alpn, connection)
             .await
-            .map_err(|error| AcceptError::from_err(std::io::Error::other(format!("{error:#}"))))
+            .map_err(|error| {
+                let error = format!("{error:#}");
+                // iroh repeats this under `iroh::protocol`, which the default filter keeps quiet.
+                tracing::warn!(event = "net.accept_failed", alpn = %String::from_utf8_lossy(self.alpn), peer, error, "an incoming connection ended with an error");
+                AcceptError::from_err(std::io::Error::other(error))
+            })
     }
 }
 
@@ -990,6 +996,16 @@ impl Runtime {
                         let entry = states.entry(peer.clone()).or_default();
                         entry.running = false;
                         let was_failing = entry.failures > 0;
+                        // The first sync since start and every change after it, not every round.
+                        match &result {
+                            Ok(_) if was_failing || entry.synced_ms.is_none() => {
+                                tracing::info!(event = "peer.online", %peer, "a member Node is reachable")
+                            }
+                            Err(error) if !was_failing => {
+                                tracing::info!(event = "peer.offline", %peer, %error, "a member Node is unreachable")
+                            }
+                            _ => {}
+                        }
                         match &result {
                             Ok(more) => {
                                 entry.failures = 0;
@@ -2541,6 +2557,7 @@ impl Runtime {
                         }).await?
                     };
                     if let Some(receipt) = receipt {
+                        tracing::info!(event = "input.delivered", conversation_id, trigger, origin = command.origin, state = receipt.state, "another Node delivered an input");
                         self.schedule_wakeup.notify_one();
                         self.publish_changed(network, conversation_id, Changed::Job(trigger));
                         Ok(Some(json!({"receipt":receipt})))
