@@ -11879,7 +11879,7 @@ dependencies = [
 
 [[package]]
 name = "vibeface-core"
-version = "0.0.1-hourly.2026111300"
+version = "0.0.1-hourly.2026111409"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
