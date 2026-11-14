@@ -312,7 +312,9 @@ def check_core(source):
             and '--raw-field "tag=$CORE_TAG" --raw-field apply=true' in dispatch,
             'Core release must dispatch the Node deployment from main')
     require('gh run list' in dispatch and 'DISPATCHED_AT' in dispatch and 'deployment_run' in dispatch
-            and 'gh run watch "$deployment_run" --repo "$GITHUB_REPOSITORY" --exit-status' in dispatch,
+            and 'gh run view "$deployment_run"' in dispatch
+            and 'deployment_status' in dispatch and 'deployment_conclusion' in dispatch
+            and 'Node deployment did not reach a terminal result in time' in dispatch,
             'Core release must wait for the Node deployment result')
 
 
