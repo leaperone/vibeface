@@ -443,6 +443,10 @@ jobs:
         run: printf 'PY=%s\n' "$(command -v python3 || command -v python)" >> "$GITHUB_ENV"
       - uses: ./.github/actions/msvc-environment
         if: runner.os == 'Windows'
+      - name: Verify the Windows installer contract
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/install.ps1 -SelfTest
       - name: Build native release package
         run: |
           [[ "$(rustc -vV | sed -n 's/^host: //p')" == "$PACKAGE_TARGET" ]]

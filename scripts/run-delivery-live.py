@@ -93,7 +93,7 @@ def source_commit(expected):
 def checked_package(package, expected):
     info = json.loads(regular(package / "BUILD-INFO.json"))
     verify_build_info(info)
-    if info["source_commit"] != expected or info["target"] != "x86_64-unknown-linux-gnu":
+    if any(info[field] != expected for field in ("source_commit", "core_source_commit", "app_source_commit")) or info["target"] != "x86_64-unknown-linux-gnu":
         raise ValueError("Package provenance differs from this Linux source commit")
     for binary in (package / "vibeface", package / "vibeface-core"):
         if not binary.is_file() or binary.is_symlink():
@@ -2175,6 +2175,8 @@ def self_test():
                     "update_protocol": 1, "data_epoch": 1, "core_version": "0.0.1", "core_source_commit": "1" * 40,
                     "app_version": "0.0.1", "app_source_commit": "1" * 40}
             (sample / "BUILD-INFO.json").write_text(json.dumps(info))
+            checked_package(sample, "1" * 40)
+            (sample / "BUILD-INFO.json").write_text(json.dumps({**info, "core_version": "2.3.4", "app_version": "3.4.5-rc.2"}))
             checked_package(sample, "1" * 40)
             for malformed in ({**info, "source_commit": "2" * 40}, {**info, "target": "another-target"},
                               {**info, "core_source_commit": "2" * 40}, {**info, "app_source_commit": "3" * 40}):

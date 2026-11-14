@@ -54,8 +54,8 @@ pub struct Release {
     pub archive_url: String,
     pub checksum_url: String,
     pub archive_size: u64,
-    pub core_pin: Option<Pin>,
-    pub app_pin: Option<Pin>,
+    pub core_pin: Pin,
+    pub app_pin: Pin,
 }
 
 #[derive(Deserialize)]
@@ -250,8 +250,8 @@ async fn resolve_release(
         archive_url: asset.browser_download_url.clone(),
         checksum_url: checksum.browser_download_url.clone(),
         archive_size: asset.size,
-        core_pin: Some(manifest.dependencies.core),
-        app_pin: Some(manifest.dependencies.app),
+        core_pin: manifest.dependencies.core,
+        app_pin: manifest.dependencies.app,
     }))
 }
 
@@ -300,12 +300,27 @@ struct CompletionAsset {
     sha256: String,
 }
 
-fn valid_pin(pin: &Pin) -> bool {
+fn valid_pin(pin: &Pin, component: &str) -> bool {
+    let Ok(version) = Version::parse(&pin.version) else {
+        return false;
+    };
+    let prerelease = version.pre.as_str();
+    let valid_prerelease = prerelease.is_empty()
+        || prerelease
+            .strip_prefix("rc.")
+            .is_some_and(|number| number.parse::<u64>().is_ok_and(|number| number > 0))
+        || prerelease.strip_prefix("hourly.").is_some_and(|stamp| {
+            stamp.len() == 10
+                && stamp.bytes().all(|byte| byte.is_ascii_digit())
+                && valid_date(&stamp[..8])
+                && stamp[8..].parse::<u8>().is_ok_and(|hour| hour <= 23)
+        });
     valid_commit(&pin.source_commit)
-        && Version::parse(&pin.version).is_ok()
+        && version.build.is_empty()
+        && version.to_string() == pin.version
+        && valid_prerelease
         && valid_digest(&pin.manifest_sha256)
-        && (pin.tag == format!("core-v{}", pin.version)
-            || pin.tag == format!("app-v{}", pin.version))
+        && pin.tag == format!("{component}-v{}", pin.version)
 }
 
 fn valid_digest(value: &str) -> bool {
@@ -366,8 +381,8 @@ fn parse_completion_manifest(
             && valid_commit(&manifest.source_commit)
             && manifest.contracts.data_epoch == DATA_EPOCH
             && manifest.contracts.update_protocol == UPDATE_PROTOCOL
-            && valid_pin(&manifest.dependencies.core)
-            && valid_pin(&manifest.dependencies.app),
+            && valid_pin(&manifest.dependencies.core, "core")
+            && valid_pin(&manifest.dependencies.app, "app"),
         "release completion manifest identity mismatch"
     );
     Ok(manifest)
@@ -583,6 +598,10 @@ pub async fn stage(release: &Release, install_root: &Path) -> Result<PathBuf> {
 }
 
 fn validate_release(release: &Release) -> Result<()> {
+    ensure!(
+        valid_pin(&release.core_pin, "core") && valid_pin(&release.app_pin, "app"),
+        "invalid release dependency pins"
+    );
     let channel = if release.version.pre.is_empty() {
         Channel::Stable
     } else {
@@ -1045,7 +1064,9 @@ fn verify_build(package: &Path, release: &Release) -> Result<BuildInfo> {
         valid_commit(&build.core_source_commit) && valid_commit(&build.app_source_commit),
         "invalid component identity"
     );
-    if let (Some(core), Some(app)) = (&release.core_pin, &release.app_pin) {
+    {
+        let core = &release.core_pin;
+        let app = &release.app_pin;
         ensure!(
             build.core_version == core.version && build.core_source_commit == core.source_commit,
             "Core BuildInfo does not match manifest pin"
@@ -1341,6 +1362,37 @@ mod tests {
             parse_completion_manifest(good.as_bytes(), "cli-v1.2.3", &Version::new(1, 2, 3))
                 .is_ok()
         );
+        for component in ["core", "app"] {
+            let mut manifest: serde_json::Value = serde_json::from_str(&good).unwrap();
+            let other = if component == "core" { "app" } else { "core" };
+            manifest["dependencies"][component]["tag"] = format!("{other}-v1.0.0").into();
+            assert!(
+                parse_completion_manifest(
+                    &serde_json::to_vec(&manifest).unwrap(),
+                    "cli-v1.2.3",
+                    &Version::new(1, 2, 3)
+                )
+                .is_err()
+            );
+        }
+        for value in [
+            "1.0.0+build",
+            "1.0.0-nightly.1",
+            "1.0.0-rc.0",
+            "1.0.0-hourly.2026111424",
+        ] {
+            let mut manifest: serde_json::Value = serde_json::from_str(&good).unwrap();
+            manifest["dependencies"]["core"]["version"] = value.into();
+            manifest["dependencies"]["core"]["tag"] = format!("core-v{value}").into();
+            assert!(
+                parse_completion_manifest(
+                    &serde_json::to_vec(&manifest).unwrap(),
+                    "cli-v1.2.3",
+                    &Version::new(1, 2, 3)
+                )
+                .is_err()
+            );
+        }
         assert!(
             parse_completion_manifest(good.as_bytes(), "cli-v1.2.4", &Version::new(1, 2, 3))
                 .is_err()
@@ -1534,8 +1586,18 @@ mod tests {
             archive_url: String::new(),
             checksum_url: String::new(),
             archive_size: 1,
-            core_pin: None,
-            app_pin: None,
+            core_pin: Pin {
+                tag: "core-v0.0.2".into(),
+                version: "0.0.2".into(),
+                source_commit: "a".repeat(40),
+                manifest_sha256: "a".repeat(64),
+            },
+            app_pin: Pin {
+                tag: "app-v0.0.2".into(),
+                version: "0.0.2".into(),
+                source_commit: "a".repeat(40),
+                manifest_sha256: "a".repeat(64),
+            },
         };
         let build = serde_json::json!({"version": release.version.to_string(), "target": release.target, "source_commit": release.source_commit, "update_protocol": UPDATE_PROTOCOL, "data_epoch": DATA_EPOCH, "core_version": "0.0.2", "core_source_commit": "a".repeat(40), "app_version": "0.0.2", "app_source_commit": "a".repeat(40)});
         serde_json::from_value::<BuildInfo>(build.clone())
