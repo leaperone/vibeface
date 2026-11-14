@@ -193,14 +193,32 @@ def self_test():
                 patch('release.download_assets', side_effect=copy_corrupt), \
                 TestCase().assertRaises(ValueError, msg='accepted a changed component archive'):
             prepare('app', tag, root / 'corrupt')
-    print('deployment plan and service-boundary self-test passed')
+    import contextlib
+    import io
+    for service, app in (('node', 'core'), ('app', 'app'), ('www', 'www')):
+        selected_tag = app + '-v0.0.1'
+        published = {'app': app, 'tag': selected_tag, 'version': '0.0.1',
+                     'source_commit': 'a' * 40, 'channel': 'stable'}
+        output = io.StringIO()
+        with patch('release.published', return_value=(published, {}, 'b' * 64)), contextlib.redirect_stdout(output):
+            main(['plan', '--service', service, '--tag', selected_tag])
+        value = json.loads(output.getvalue())
+        assert value['service'] == service and value['targets'] == [service] and value['tag'] == selected_tag
+    with patch('release.published') as request, TestCase().assertRaisesRegex(ValueError, 'selected service'):
+        main(['plan', '--service', 'app', '--tag', 'core-v0.0.1'])
+    request.assert_not_called()
+    with contextlib.redirect_stderr(io.StringIO()), TestCase().assertRaises(SystemExit) as missing:
+        main(['plan', '--tag', 'core-v0.0.1'])
+    assert missing.exception.code == 2
+    print('deployment plan and CLI service-boundary self-test passed')
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='action', required=True)
     sub.add_parser('self-test')
     command = sub.add_parser('plan')
+    command.add_argument('--service', choices=SERVICES, required=True)
     command.add_argument('--tag', required=True)
     command = sub.add_parser('release')
     command.add_argument('--service', choices=SERVICES, required=True)
@@ -209,11 +227,11 @@ def main():
     command.add_argument('--service', choices=SERVICES, required=True)
     command.add_argument('--tag', required=True)
     command.add_argument('--output', required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.action == 'self-test':
         self_test()
     elif args.action == 'plan':
-        print(json.dumps(plan(args.tag)))
+        print(json.dumps(execute('plan', args.service, args.tag)))
     elif args.action == 'release':
         print(json.dumps(execute('release', args.service, args.tag)))
     else:
