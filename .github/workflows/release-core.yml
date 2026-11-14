@@ -28,6 +28,9 @@ jobs:
   identity:
     name: Validate Core release identity
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
     outputs:
       tag: ${{ steps.plan.outputs.tag }}
       version: ${{ steps.plan.outputs.version }}
@@ -41,6 +44,7 @@ jobs:
         env:
           CORE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name || '') }}
           PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           args=(--tag "$CORE_TAG")
           if [[ "$PUBLISH" == true ]]; then args+=(--require-main --publish); fi
@@ -86,6 +90,7 @@ jobs:
       - name: Publish immutable Core release
         env:
           CORE_TAG: ${{ needs.identity.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           python3 -B scripts/core_release.py plan --tag "$CORE_TAG" --require-main --publish
           python3 -B scripts/core_release.py publish --directory .artifacts/core
@@ -103,6 +108,7 @@ jobs:
       - name: Mark the incomplete Core release
         env:
           CORE_TAG: ${{ needs.identity.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           python3 -B scripts/core_release.py plan --tag "$CORE_TAG" --require-main --publish
           python3 - <<'PY'

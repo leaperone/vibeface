@@ -284,6 +284,12 @@ def check_core(source):
             'Core release must have identity, build, publish, failure and deploy jobs')
     require("tags: ['core-v*']" in source and 'scripts/core_release.py' in source,
             'Core release must use its fixed tag and verifier')
+    require('actions: read' in workflow['identity']
+            and 'GH_TOKEN: ${{ github.token }}' in workflow['identity'],
+            'Core identity must authenticate its CI provenance query')
+    for name in ('publish', 'failed'):
+        require('GH_TOKEN: ${{ github.token }}' in workflow[name],
+                f'Core {name} job must authenticate GitHub release writes')
     require(needs(workflow['build']) == {'identity'}
             and needs(workflow['publish']) == {'identity', 'build'}
             and needs(workflow['failed']) == {'identity', 'publish'}
@@ -384,6 +390,14 @@ def self_test(source, helpers, website, entry, core):
                 'self-test mutation did not reach the workflow')
         with TestCase().assertRaises((ValueError, SyntaxError, KeyError), msg='Unsafe release dependency or gate was accepted'):
             check(candidate, candidate_helper)
+    for candidate in (
+        core.replace('actions: read', 'contents: read', 1),
+        core.replace('GH_TOKEN: ${{ github.token }}', 'GH_TOKEN:', 1),
+        core.replace('GH_TOKEN: ${{ github.token }}', 'GH_TOKEN:', 1).replace(
+            'GH_TOKEN: ${{ github.token }}', 'GH_TOKEN:', 1),
+    ):
+        with TestCase().assertRaises(ValueError, msg='Core GitHub token boundary was removed'):
+            check_core(candidate)
     for fragment in ('release.require_ci(result)', 'require_main=publish, publishing=publish',
                      "environ['GITHUB_REPOSITORY'] == release.GITHUB_REPO",
                      "environ['GITHUB_REF'] == 'refs/tags/' + tag",
