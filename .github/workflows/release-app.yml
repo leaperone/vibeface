@@ -65,7 +65,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         id: upload
         with:
-          name: app-release-${{ needs.identity.outputs.source_sha }}-${{ github.run_attempt }}
+          name: app-static-${{ needs.identity.outputs.source_sha }}-${{ github.run_attempt }}
           path: .artifacts/static/*
           if-no-files-found: error
   collect:
