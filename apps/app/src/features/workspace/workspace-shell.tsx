@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
-import { ArrowRightLeft, Bell, ChevronLeft, CircleAlert, Hand, LoaderCircle, MessageSquare, MessagesSquare, Plus, RefreshCw, RotateCw, ShieldAlert, Wifi, WifiOff, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, ChevronLeft, CircleAlert, Hand, LoaderCircle, MessageSquare, MessagesSquare, Plus, RefreshCw, RotateCw, ShieldAlert, Wifi, WifiOff, type LucideIcon } from "lucide-react"
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "@/lib/utils"
@@ -60,13 +60,13 @@ export function MoodTag({ mood }: { mood: Mood }) {
 }
 
 const JOINS_SEEN = "vibeface.joins-seen"
-const titles: Record<string, string> = { "/": "消息", "/inbox": terms.inbox.label, "/tasks": terms.task.label, "/channels": "频道", "/devices": terms.myDevices.label, "/settings": terms.settings.label, "/settings/logs": "日志", "/settings/lab": "实验室", "/settings/lab/transfers": "文件传输实验" }
+const titles: Record<string, string> = { "/": "消息", "/tasks": terms.task.label, "/channels": "频道", "/devices": terms.myDevices.label, "/settings": terms.settings.label, "/settings/logs": "日志", "/settings/lab": "实验室", "/settings/lab/transfers": "文件传输实验" }
 
 function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: boolean }) {
   const workspace = useWorkspace()
   // A question answered here stays on screen, collapsed, until the next read; it no longer counts.
   const waiting = waitingItems(useInbox()).length + (workspace.workspaceState?.tasks ?? []).filter((task) => ['waiting_user', 'needs_reconciliation', 'update_pending', 'stop_pending'].includes(task.state)).length
-  // A recovery about to take over outranks every other waiting item, so 待处理 shows a red shield instead of a count.
+  // A recovery about to take over outranks every other waiting item, so 任务 shows a red shield instead of a count.
   const device = useDevice()
   const recovering = Boolean(device.pendingRecovery)
   // A browser joins on this computer's lasting page, never the temporary origin this session opened on, or it would hold a second identity.
@@ -93,9 +93,9 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   const navigate = useNavigate()
   const joins = useOpenJoins()
   const [actionsSlot, setActionsSlot] = useState<HTMLElement | null>(null)
-  // On a phone the tabs carry 待处理 and 设置, so a tab's header keeps only its own actions; a chat's header opens the bot's settings.
+  // On a phone the tabs carry 任务 and 设置, so a tab's header keeps only its own actions; a chat's header opens the bot's settings.
   const phoneTab = isMobile && tabs.includes(pathname)
-  const inboxInHeader = !phoneTab && !botTitle && pathname !== "/inbox"
+  const tasksInHeader = !phoneTab && !botTitle && pathname !== "/tasks"
   const devicesAttention = joins.length > 0 || workspace.nodes.some((node) => !node.revoked && !node.online)
   const latest = useRef(workspace)
   latest.current = workspace
@@ -111,7 +111,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
     const fresh = joins.filter((join) => !seen.includes(join.join_id))
     if (!fresh.length) return
     try { sessionStorage.setItem(JOINS_SEEN, JSON.stringify([...seen, ...fresh.map((join) => join.join_id)].slice(-50))) } catch {}
-    if (pathname === "/devices" || pathname === "/inbox") return
+    if (pathname === "/devices" || pathname === "/tasks") return
     for (const join of fresh) toast(`${join.name || "新设备"} 想加入`, { icon: terms.myDevices.icon, action: { label: "查看", onClick: () => { void navigate({ to: "/devices" }) } } })
   }, [joinIds, pathname])
   useEffect(() => { if (workspace.noticeText) toast(workspace.noticeText) }, [workspace.noticeText])
@@ -134,8 +134,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
         <SidebarContent className="gap-1 pb-3">
           <SidebarGroup className="pb-0">
             <SidebarMenu>
-              <NavItem to="/tasks" icon={terms.task.icon} label={terms.task.label} active={pathname === "/tasks"} />
-              <NavItem to="/inbox" icon={terms.inbox.icon} label={terms.inbox.label} active={pathname === "/inbox"} badge={waiting || undefined} alert={recovering} />
+              <NavItem to="/tasks" icon={terms.task.icon} label={terms.task.label} active={pathname === "/tasks"} badge={waiting || undefined} alert={recovering} />
             </SidebarMenu>
           </SidebarGroup>
           <SidebarGroup>
@@ -198,16 +197,16 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
           <div className="col-start-3 flex items-center justify-end ps-2 empty:hidden">
           {isMobile && pathname === "/" ? <Button type="button" variant="ghost" size="icon" className="-me-3" aria-label="新 Bot" title="新 Bot" disabled={!workspace.writable && !workspace.pendingBot} onClick={openCreator}><Plus aria-hidden="true" /></Button>
           : botTitle ? null
-          : inboxInHeader ? <Button asChild variant="ghost" size="icon" className="relative -me-3">
-            <Link to="/inbox" aria-label={recovering ? `${terms.inbox.label}，有人在找回` : waiting ? `${terms.inbox.label} ${waiting}` : terms.inbox.label} title={terms.inbox.label}>
-              <Bell aria-hidden="true" />
+          : tasksInHeader ? <Button asChild variant="ghost" size="icon" className="relative -me-3">
+            <Link to="/tasks" aria-label={recovering ? `${terms.task.label}，有人在找回` : waiting ? `${terms.task.label} ${waiting}` : terms.task.label} title={terms.task.label}>
+              <terms.task.icon aria-hidden="true" />
               {recovering ? <ShieldAlert aria-hidden="true" className="absolute top-0.5 right-0.5 size-4! rounded-full bg-background text-danger md:-top-0.5 md:-right-0.5" /> : waiting ? <CountBadge key={waiting} count={waiting} className="absolute top-0.5 right-0.5 h-4 min-w-4 px-1 ring-2 ring-background animate-in zoom-in-50 duration-200 ease-out md:-top-0.5 md:-right-0.5" /> : null}
             </Link>
           </Button> : null}
           </div>
         </header>
         {workspace.joined ? null : <LocalSession onJoin={() => { if (home && home !== window.location.origin) window.location.assign(`${home}/join`); else void navigate({ to: "/join" }) }} />}
-        {pathname === "/inbox" ? null : <RecoveryAlert />}
+        {pathname === "/tasks" ? null : <RecoveryAlert />}
         {workspace.data && workspace.incomplete ? <div role="progressbar" aria-label="同步中" className="h-0.5 shrink-0 overflow-hidden bg-info-soft"><div className="h-full w-1/3 animate-pulse bg-info" /></div> : null}
         {/* Kept laid out while hidden so the chat keeps its scroll position across pages. */}
         <div className={cn("flex min-h-0 min-w-0 flex-1", !chatRoute && "invisible absolute inset-x-0 top-14 bottom-0")} inert={!chatRoute} aria-hidden={!chatRoute || undefined}>
@@ -229,18 +228,17 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
 const tabItems = [
   { to: "/", icon: MessageSquare, label: "消息" },
   { to: "/tasks", icon: terms.task.icon, label: terms.task.label },
-  { to: "/inbox", icon: terms.inbox.icon, label: terms.inbox.label },
   { to: "/settings", icon: terms.settings.icon, label: terms.settings.label },
 ] as const
 
-/** The phone's bottom tabs; the count on 待处理 and the mark on 设置 stand in for what a wide screen shows in the sidebar. */
+/** The phone's bottom tabs; the count on 任务 and the mark on 设置 stand in for what a wide screen shows in the sidebar. */
 function TabBar({ pathname, waiting, recovering, attention }: { pathname: string; waiting: number; recovering: boolean; attention: boolean }) {
   return <nav aria-label="标签栏" className="flex shrink-0 border-t bg-background ps-[env(safe-area-inset-left)] pe-[env(safe-area-inset-right)] pb-[env(safe-area-inset-bottom)]">
     {tabItems.map(({ to, icon: Icon, label }) => {
       const active = pathname === to
-      const mark = to === "/inbox" ? recovering ? <ShieldAlert aria-hidden="true" className="absolute -top-1 -right-2 size-4 rounded-full bg-background text-danger" /> : waiting ? <CountBadge count={waiting} className="absolute -top-1.5 -right-3 h-4 min-w-4 px-1 ring-2 ring-background" /> : null
+      const mark = to === "/tasks" ? recovering ? <ShieldAlert aria-hidden="true" className="absolute -top-1 -right-2 size-4 rounded-full bg-background text-danger" /> : waiting ? <CountBadge count={waiting} className="absolute -top-1.5 -right-3 h-4 min-w-4 px-1 ring-2 ring-background" /> : null
         : to === "/settings" && attention ? <CircleAlert aria-hidden="true" className="absolute -top-1 -right-1.5 size-3 rounded-full bg-background text-warning" /> : null
-      const name = to === "/inbox" && recovering ? `${label}，有人在找回` : to === "/inbox" && waiting ? `${label} ${waiting}` : to === "/settings" && attention ? `${label}，需要留意` : label
+      const name = to === "/tasks" && recovering ? `${label}，有人在找回` : to === "/tasks" && waiting ? `${label} ${waiting}` : to === "/settings" && attention ? `${label}，需要留意` : label
       return <Link key={to} to={to} replace aria-label={name} aria-current={active ? "page" : undefined} className={cn("flex min-h-14 flex-1 flex-col items-center justify-center gap-1 text-meta outline-none transition-colors focus-visible:bg-muted active:bg-muted", active ? "text-foreground" : "text-muted-foreground")}>
         <span className="relative"><Icon aria-hidden="true" className="size-5" />{mark}</span>
         <span className={cn(active && "font-medium")}>{label}</span>

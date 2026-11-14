@@ -39,7 +39,7 @@ export function BackOnline({ device }: { device: string }) {
  * "待确认": the person says whether a work its device cannot report finished, or that a leftover process stopped. Nothing is re-run.
  * `inbox`: also names the bot and links to its chat.
  */
-export function ConfirmCard({ check, inbox = false, from }: { check: PendingCheck; inbox?: boolean; from?: "inbox" | "tasks" }) {
+export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inbox?: boolean }) {
   const workspace = useWorkspace()
   const { directory } = useDevice()
   const id = useId()
@@ -64,7 +64,7 @@ export function ConfirmCard({ check, inbox = false, from }: { check: PendingChec
   const chatBot = inbox ? undefined : workspace.selectedBot
   const taskLink = (work: WorkCheck, title: ReactNode, className = "") => {
     const bot = botOf(work) ?? chatBot
-    return bot ? <Link to="/b/$botId/work/$workId" params={{ botId: bot.bot_id, workId: work.work_id }} search={from === "tasks" ? { from: "tasks" } : from === "inbox" || inbox ? { from: "inbox" } : {}} className={`rounded-sm underline-offset-4 hover:underline ${className}`}>{title}</Link> : title
+    return bot ? <Link to="/b/$botId/work/$workId" params={{ botId: bot.bot_id, workId: work.work_id }} search={inbox ? { from: "tasks" } : {}} className={`rounded-sm underline-offset-4 hover:underline ${className}`}>{title}</Link> : title
   }
   const viewTask = (work: WorkCheck) => botOf(work) || chatBot ? <Button asChild variant="outline">{taskLink(work, "查看任务")}</Button> : null
   const settleActions = (work: WorkCheck, text = "") => <Details label="我已自行核对">

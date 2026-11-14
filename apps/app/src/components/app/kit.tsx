@@ -240,7 +240,7 @@ export function StatusPill({ tone = "neutral", icon: Icon, children, className }
 }
 
 /**
- * Shared by approvals, join requests and confirmations, in chat and in /inbox.
+ * Shared by approvals, join requests and confirmations, in chat and in 待处理 on /tasks.
  * `trailing`: a card with a single action keeps it on the title row instead of a footer of its own.
  */
 export function ActionCard({ icon: Icon, tone = "warning", title, meta, trailing, children, actions, className }: {

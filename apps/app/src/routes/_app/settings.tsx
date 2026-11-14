@@ -134,7 +134,7 @@ function SecurityStatus({ children }: { children: ReactNode }) {
         <ChevronRight aria-hidden="true" className="size-4" />
       </SettingsRow>
     </Link>
-    {pending ? <Link to="/inbox" className={link}>
+    {pending ? <Link to="/tasks" className={link}>
       <SettingsRow icon={ShieldAlert} tone="danger" label={securityCopy.recovery}>
         <span className="text-danger tabular-nums">{securityCopy.recoveryIn(pending.effective_at_ms - nodeClockOffset)}</span>
         <ChevronRight aria-hidden="true" className="size-4" />

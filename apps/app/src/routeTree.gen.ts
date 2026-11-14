@@ -13,7 +13,6 @@ import { Route as AppRouteImport } from './routes/_app'
 import { Route as ConnectRouteImport } from './routes/connect'
 import { Route as JoinRouteImport } from './routes/join'
 import { Route as AppIndexRouteImport } from './routes/_app/index'
-import { Route as AppInboxRouteImport } from './routes/_app/inbox'
 import { Route as AppSettingsRouteImport } from './routes/_app/settings'
 import { Route as AppTasksRouteImport } from './routes/_app/tasks'
 import { Route as AppBBotIdRouteImport } from './routes/_app/b.$botId'
@@ -44,11 +43,6 @@ const JoinRoute = JoinRouteImport.update({
 const AppIndexRoute = AppIndexRouteImport.update({
   id: '/',
   path: '/',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppInboxRoute = AppInboxRouteImport.update({
-  id: '/inbox',
-  path: '/inbox',
   getParentRoute: () => AppRoute,
 } as any)
 const AppSettingsRoute = AppSettingsRouteImport.update({
@@ -116,7 +110,6 @@ export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
   '/connect': typeof ConnectRoute
   '/join': typeof JoinRoute
-  '/inbox': typeof AppInboxRoute
   '/settings': typeof AppSettingsRoute
   '/tasks': typeof AppTasksRoute
   '/b/$botId': typeof AppBBotIdRouteWithChildren
@@ -133,7 +126,6 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/connect': typeof ConnectRoute
   '/join': typeof JoinRoute
-  '/inbox': typeof AppInboxRoute
   '/settings': typeof AppSettingsRoute
   '/tasks': typeof AppTasksRoute
   '/': typeof AppIndexRoute
@@ -153,7 +145,6 @@ export interface FileRoutesById {
   '/_app': typeof AppRouteWithChildren
   '/connect': typeof ConnectRoute
   '/join': typeof JoinRoute
-  '/_app/inbox': typeof AppInboxRoute
   '/_app/settings': typeof AppSettingsRoute
   '/_app/tasks': typeof AppTasksRoute
   '/_app/': typeof AppIndexRoute
@@ -174,7 +165,6 @@ export interface FileRouteTypes {
     | '/'
     | '/connect'
     | '/join'
-    | '/inbox'
     | '/settings'
     | '/tasks'
     | '/b/$botId'
@@ -191,7 +181,6 @@ export interface FileRouteTypes {
   to:
     | '/connect'
     | '/join'
-    | '/inbox'
     | '/settings'
     | '/tasks'
     | '/'
@@ -210,7 +199,6 @@ export interface FileRouteTypes {
     | '/_app'
     | '/connect'
     | '/join'
-    | '/_app/inbox'
     | '/_app/settings'
     | '/_app/tasks'
     | '/_app/'
@@ -260,13 +248,6 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof AppIndexRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/_app/inbox': {
-      id: '/_app/inbox'
-      path: '/inbox'
-      fullPath: '/inbox'
-      preLoaderRoute: typeof AppInboxRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/settings': {
@@ -369,7 +350,6 @@ const AppBBotIdRouteWithChildren = AppBBotIdRoute._addFileChildren(
 )
 
 interface AppRouteChildren {
-  AppInboxRoute: typeof AppInboxRoute
   AppSettingsRoute: typeof AppSettingsRoute
   AppTasksRoute: typeof AppTasksRoute
   AppIndexRoute: typeof AppIndexRoute
@@ -385,7 +365,6 @@ interface AppRouteChildren {
 }
 
 const AppRouteChildren: AppRouteChildren = {
-  AppInboxRoute: AppInboxRoute,
   AppSettingsRoute: AppSettingsRoute,
   AppTasksRoute: AppTasksRoute,
   AppIndexRoute: AppIndexRoute,
@@ -410,12 +389,3 @@ const rootRouteChildren: RootRouteChildren = {
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
   ._addFileTypes<FileRouteTypes>()
-
-import type { getRouter } from './router.tsx'
-import type { createStart } from '@tanstack/react-start'
-declare module '@tanstack/react-start' {
-  interface Register {
-    ssr: true
-    router: Awaited<ReturnType<typeof getRouter>>
-  }
-}

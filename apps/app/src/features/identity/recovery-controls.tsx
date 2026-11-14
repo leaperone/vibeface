@@ -140,13 +140,13 @@ export function RecoveryPendingCard() {
   </ActionCard>
 }
 
-/** Atop every page while a recovery waits: a manager sees it without opening 待处理, and one tap leads there. */
+/** Atop every page while a recovery waits: a manager sees it without opening 任务, and one tap leads to 待处理 there. */
 export function RecoveryAlert() {
   const device = useDevice()
   const pending = device.pendingRecovery
   if (!pending) return null
   return <div className="mx-auto w-full max-w-(--page-width) shrink-0 px-4 pt-3 sm:px-6">
-    <Link to="/inbox" className="flex min-h-11 min-w-0 items-center gap-2.5 rounded-xl border border-danger-border bg-card py-1.5 ps-1.5 pe-3 shadow-xs transition-colors hover:bg-danger-soft">
+    <Link to="/tasks" className="flex min-h-11 min-w-0 items-center gap-2.5 rounded-xl border border-danger-border bg-card py-1.5 ps-1.5 pe-3 shadow-xs transition-colors hover:bg-danger-soft">
       <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-danger-soft text-danger ring-1 ring-danger-border"><ShieldAlert aria-hidden="true" className="size-4" /></span>
       <span className="min-w-0 flex-1 truncate font-medium">{recoveryCopy.pending}</span>
       <span className="shrink-0 text-meta text-danger tabular-nums">{recoveryCopy.effectiveIn(pending.effective_at_ms - device.nodeClockOffset)}</span>

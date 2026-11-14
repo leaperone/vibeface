@@ -1,7 +1,8 @@
 import { Link } from 'expo-router'
-import { ArrowUpRight, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Inbox, Laptop, LoaderCircle, ListChecks, type LucideIcon } from 'lucide-react-native'
+import { ArrowUpRight, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Laptop, LoaderCircle, ListChecks, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useState } from 'react'
 import { Pressable, ScrollView, View } from 'react-native'
+import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { providerNames } from '@vibeface/client/lib/node.ts'
 import { workFailure } from '@vibeface/client/lib/errors.ts'
@@ -17,14 +18,17 @@ import { useWorkspace } from '@/data/context'
 import { useInbox, useLive } from '@/data/live'
 import { cn } from '@/lib/utils'
 import { WorkspaceTasks } from '@/features/workspace/workspace'
+import { PendingSection } from './pending'
 
-/** The personal task projection; only open and unsettled work is available without loading every Bot conversation. */
+/**
+ * 待处理 on top, then the personal task projection; only open and unsettled work is available without loading every Bot
+ * conversation. Questions and checks act only in 待处理; a task held on one shows it as waiting.
+ */
 export function TasksScreen() {
   const shared = useLive()
   const [filter, setFilter] = useState<TaskGroup | 'all'>('all')
   const [botFilter, setBotFilter] = useState('all')
   const inbox = useInbox()
-  const pending = inbox.filter((item) => !(item.kind === 'question' && item.done)).length + (shared?.workspaceState?.tasks ?? []).filter((task) => ['waiting_user', 'needs_reconciliation', 'update_pending', 'stop_pending'].includes(task.state)).length
   const workspace = useWorkspace()
   const { directory } = useDevice()
   useEffect(() => { if (!shared) return; shared.setView('tasks'); return () => shared.setView('other') }, [shared?.generation])
@@ -44,8 +48,9 @@ export function TasksScreen() {
   const chosenConversation = shared?.bots.find((bot) => bot.bot_id === botFilter)?.conversation_id
   const known = activityView.activities.filter((activity) => {
     if (activity.kind === 'work' && activity.work && assignedWorkIds.has(activity.work.work_id)) return false
-    if (botFilter === 'all' || activity.conversation_id === chosenConversation) return true
-    return activity.kind === 'attention' && 'kind' in activity.attention && activity.attention.kind === 'device' && activity.attention.works.some((work) => work.conversation_id === chosenConversation)
+    // A live question or check is acted on in 待处理 above; only the overview's own stay here.
+    if (activity.kind === 'attention' && !('kind' in activity.attention && (activity.attention.kind === 'question' || activity.attention.kind === 'check'))) return false
+    return botFilter === 'all' || activity.conversation_id === chosenConversation
   })
   const visible = known.filter((activity) => filter === 'all' || activity.group === filter)
   const workActivities = visible.filter((activity): activity is Extract<WorkspaceActivity, { kind: 'work' }> => activity.kind === 'work')
@@ -64,12 +69,12 @@ export function TasksScreen() {
   })
 
   const count = (group: TaskGroup) => read ? known.filter((item) => item.group === group).length + taskCounts[group] : null
-  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-4 p-4 pb-10">
+  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-4 p-4 pb-10">
+    <PendingSection />
     <MobileMasthead attention={count('attention')} working={count('working')} waiting={count('waiting')} filter={filter} onFilter={setFilter} />
     <Text className="text-meta text-muted-foreground">{[...(overview ? overviewScope(overview.coverage) : ['尚未读取任务记录']), ...(!read ? ['当前连接尚未完成首读'] : !shared?.connectionOnline ? ['连接已断开，显示最近记录'] : [])].join(' · ')}</Text>
     <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerClassName="gap-2"><Button size="sm" hitSlop={4} variant={botFilter === 'all' ? 'secondary' : 'ghost'} accessibilityState={{ selected: botFilter === 'all' }} onPress={() => setBotFilter('all')}><Text>所有 Bot</Text></Button>{(read ? shared?.bots ?? [] : []).map((bot) => <Button key={bot.bot_id} size="sm" hitSlop={4} variant={botFilter === bot.bot_id ? 'secondary' : 'ghost'} accessibilityState={{ selected: botFilter === bot.bot_id }} onPress={() => setBotFilter(bot.bot_id)}><Text>{bot.name}</Text></Button>)}</ScrollView>
     <WorkspaceTasks botFilter={botFilter} filter={filter} />
-    <Link href="/inbox" asChild><Pressable accessibilityRole="link" accessibilityLabel={pending ? `${pending} 件事等你决定` : '查看待处理'} className={`min-h-11 flex-row items-center gap-3 rounded-xl border px-4 py-3 active:bg-muted ${pending ? 'border-warning-border bg-warning-soft' : 'border-border bg-card'}`}><Icon as={pending ? CircleQuestionMark : Inbox} className={`size-5 ${pending ? 'text-warning' : 'text-muted-foreground'}`} /><Text className="min-w-0 flex-1">{pending ? `${pending} 件事等你决定` : '查看待处理'}</Text><Icon as={ChevronRight} className="size-4 text-muted-foreground" /></Pressable></Link>
     {otherChecks.map((check) => <View key={`${check.conversation_id}:${check.item_id}`} className="gap-2 rounded-xl border border-border bg-card p-4"><Text className="font-medium">{check.work_id ? '任务状态待确认' : '程序状态待确认'} · {check.bot?.name ?? (read ? '未找到所属 Bot' : 'Bot 身份未加载')}</Text>{check.bot ? <Link href={`/b/${check.bot.bot_id}`} asChild><Pressable accessibilityRole="link" className="min-h-11 justify-center"><Text>打开 {check.bot.name}</Text></Pressable></Link> : null}</View>)}
     {questionActivities.map((activity) => <MobileQuestionAttention key={activity.id} activity={activity} bots={shared?.bots ?? []} read={read} />)}
     {turns.map((activity) => <MobileTurn key={activity.id} activity={activity} />)}
@@ -81,8 +86,8 @@ export function TasksScreen() {
     </View> : workActivities.length ? taskGroups.map(({ group, title }) => groups[group].length ? <View key={group} className="gap-2">
       <Text role="heading" className="px-1 text-heading font-semibold">{title} <Text className="text-muted-foreground">{groups[group].length}</Text></Text>
       {groups[group].map((activity) => <TaskRow key={activity.id} work={activity.work!} projected={activity.projection} waiting={activity.facts.questions.length > 0} bot={shared?.bots.find((item) => item.conversation_id === activity.conversation_id)} lookup={lookup} connected={Boolean(shared?.connectionOnline && read)} progress={taskProgress(activity.work!, shared?.liveProgress ?? [])} />)}
-    </View> : null) : visible.some((item) => item.group === 'attention') || otherChecks.length || turns.length || businessTasks.some((task) => filter === 'all' || taskStates[filter].includes(task.state)) ? null : filter !== 'all' || botFilter !== 'all' ? <Text className="text-meta text-muted-foreground">没有符合筛选的执行工作。</Text> : <MobileEmpty bot={bot} read={read} />}
-  </ScrollView>
+    </View> : null) : visible.some((item) => item.group === 'attention') || otherChecks.length || turns.length || inbox.length || businessTasks.some((task) => filter === 'all' || taskStates[filter].includes(task.state)) ? null : filter !== 'all' || botFilter !== 'all' ? <Text className="text-meta text-muted-foreground">没有符合筛选的执行工作。</Text> : <MobileEmpty bot={bot} read={read} />}
+  </KeyboardAwareScrollView>
 }
 
 function MobileQuestionAttention({ activity, bots, read }: { activity: Extract<WorkspaceActivity, { kind: 'attention' }>; bots: BotRecord[]; read: boolean }) {

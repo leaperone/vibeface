@@ -3,7 +3,7 @@ import '../global.css'
 
 import { useLinkingURL } from 'expo-linking'
 import { Link, Stack, router, usePathname } from 'expo-router'
-import { Inbox, ListChecks, MessageSquare, Settings, X } from 'lucide-react-native'
+import { ListChecks, MessageSquare, Settings, X } from 'lucide-react-native'
 import * as SystemUI from 'expo-system-ui'
 import { StatusBar } from 'expo-status-bar'
 import { useEffect } from 'react'
@@ -27,7 +27,7 @@ import { useWide } from '@/lib/layout'
 // The join address last answered here, so a remount or a return to the app does not ask again.
 let answered: string | null = null
 
-const tabs = [['/', '消息', MessageSquare], ['/tasks', '任务', ListChecks], ['/inbox', '待处理', Inbox], ['/settings', '设置', Settings]] as const
+const tabs = [['/', '消息', MessageSquare], ['/tasks', '任务', ListChecks], ['/settings', '设置', Settings]] as const
 // A tab bar press swaps its screen in at once; only a push from inside a screen slides.
 const viaTab = ({ route }: { route: { params?: object } }) => route.params && 'tab' in route.params ? { animation: 'none' as const } : {}
 
@@ -109,7 +109,6 @@ function Screens() {
             <Stack.Screen name="new-bot" options={{ title: '新 Bot', presentation: 'modal', headerLeft: Close }} />
             {/* Opened from the new bot sheet it is a sheet too, with no back button of its own. */}
             <Stack.Screen name="ai" options={({ route }) => ({ title: 'Bot 与任务', headerLeft: (route.params as { sheet?: string } | undefined)?.sheet ? Close : undefined })} />
-            <Stack.Screen name="inbox" options={(props) => ({ title: '待处理', ...root, ...viaTab(props) })} />
             <Stack.Screen name="settings" options={(props) => ({ title: '设置', ...root, ...viaTab(props) })} />
             <Stack.Screen name="lab" options={{ title: '实验室' }} />
             <Stack.Screen name="logs" options={{ title: '日志' }} />
@@ -128,10 +127,10 @@ function Screens() {
             // iOS reads buttons inside a tabbar as tabs ("tab, 1 of 4"); RN's role="tab" maps to no trait. `role` because only it
             // overrides the role="link" the Link hands its child.
             return <Link key={href} href={{ pathname: href, params: { tab: '1' } }} replace asChild>
-              <Pressable role="button" accessibilityState={{ selected }} accessibilityLabel={href === '/inbox' && waiting ? `${label}，${waiting} 件事等你决定` : label} className="min-h-14 flex-1 items-center justify-center gap-1">
+              <Pressable role="button" accessibilityState={{ selected }} accessibilityLabel={href === '/tasks' && waiting ? `${label}，${waiting} 件事等你决定` : label} className="min-h-14 flex-1 items-center justify-center gap-1">
                 <View>
                   <Icon as={icon} className={`size-5 ${tint}`} />
-                  {href === '/inbox' ? <View className="absolute start-3 -top-1.5"><Badge count={waiting} /></View> : null}
+                  {href === '/tasks' ? <View className="absolute start-3 -top-1.5"><Badge count={waiting} /></View> : null}
                 </View>
                 <Text className={`text-meta font-medium ${tint}`}>{label}</Text>
               </Pressable>
