@@ -100,7 +100,7 @@ jobs:
           python3 scripts/install-delivery-toolchain.py --self-test
           python3 scripts/run-delivery-live.py --self-test
           python3 scripts/hourly.py --self-test
-          python3 scripts/core_release.py --self-test
+          python3 scripts/core_release.py self-test
           python3 scripts/core_hourly.py --self-test
           python3 scripts/release.py self-test
           python3 -B scripts/test_progressive_publication.py
