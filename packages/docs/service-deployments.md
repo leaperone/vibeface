@@ -5,11 +5,11 @@ description: 使用已发布制品，在本仓库部署官方容器服务。
 
 # 发布官方服务部署
 
-制品发布和服务部署是两个独立操作。`release product` 和 `release www` 只发布不可变制品，不改变线上服务。部署命令显式选择已经完成发布的精确 Tag，不使用分支、`latest` 或未完成 Release。
+完整制品发布和服务部署通过精确 Tag 连接。`release product` 或 `release www` 完成公开 Release 后，对应发布工作流会自动派发服务部署；部署仍只消费已经完成发布的精确 Tag，不使用分支、`latest` 或未完成 Release。
 
 所有部署命令、Dockerfile、Compose 与 GitHub Actions 都在本仓库维护。部署不依赖另一个发布仓库，不重新编译产品，不发布新的产品版本。
 
-## 执行独立部署
+## 手动或补发部署
 
 先只读核对，再执行部署发布：
 
@@ -27,7 +27,7 @@ python3 scripts/deploy.py release --service all --tag '<PRODUCT_TAG>'
 | `app` | Deploy / Web App（`deploy-app.yml`） | 独立网页静态容器，只提供静态文件；网页直接连公共节点的 `gateway_url` |
 | `www` | Deploy / Website（`deploy-www.yml`） | 独立官网静态容器，使用精确 `www-v<version>` Tag |
 
-产品目标接受精确 Stable、RC、Hourly `v<version>`，官网只接受对应 `www-v<version>`。不自动跟随渠道。每个入口固定部署目标，只接收 Tag 和 `apply`；`deploy-services.yml` 是共用的可复用实现，不接受手动派发。所有入口共用该实现中的全局部署并发锁，正在运行的部署不会被后续请求取消。部署命令从 main 以 `apply=true` 启动对应入口；UI 手动运行默认 `apply=false`，只验证制品、构建容器并冒烟，不接触服务器。运行名称包含目标、Tag、执行意图和分支，便于核对运行记录。
+产品目标接受精确 Stable、RC、Hourly `v<version>`，官网只接受对应 `www-v<version>`；完整发布完成后按对应 Tag 派发部署，不自动跟随其他渠道。每个入口固定部署目标，只接收 Tag 和 `apply`；`deploy-services.yml` 是共用的可复用实现，不接受手动派发。所有入口共用该实现中的全局部署并发锁，正在运行的部署不会被后续请求取消。自动派发和部署命令都从 main 以 `apply=true` 启动对应入口；UI 手动运行默认 `apply=false`，只验证制品、构建容器并冒烟，不接触服务器。运行名称包含目标、Tag、执行意图和分支，便于核对运行记录。
 
 ```sh
 python3 scripts/deploy.py release --service www --tag '<WEBSITE_TAG>'

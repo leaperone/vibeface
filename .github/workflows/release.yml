@@ -475,6 +475,22 @@ jobs:
         run: |
           python3 -B scripts/release.py plan --app product --tag "$RELEASE_TAG" --require-main --publish
           python3 -B scripts/release.py fail-product
+  deploy-published-product:
+    name: Deploy complete product / deploy-published-product
+    needs: [identity, publish-product]
+    if: needs.identity.outputs.publish == 'true' && needs.publish-product.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Dispatch product deployment from main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.identity.outputs.tag }}
+        run: |
+          gh workflow run deploy-product.yml --repo "$GITHUB_REPOSITORY" --ref main \
+            --raw-field "tag=$RELEASE_TAG" --raw-field apply=true
   npm:
     name: Publish npm Hourly
     needs: [identity, collect, publish-product]
