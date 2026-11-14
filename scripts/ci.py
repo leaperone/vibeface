@@ -908,7 +908,7 @@ def workflow_contract_self_test():
         assert f"uses: ./.github/workflows/{filename}" in block("ci.yml", job)
         assert "${{ inputs.source_sha }}" in workflows[filename]
     assert "node scripts/crypto-client.mjs --self-test --native-probe" in workflows["_ci-crypto.yml"]
-    assert "run: bash scripts/build-web.sh" in workflows["_ci-web.yml"]
+    assert "bash scripts/build-web.sh\n          git diff --exit-code" in workflows["_ci-web.yml"]
     for command in ("atlas migrate validate", "scripts/check-delivery.py --self-test", "scripts/check-delivery.py --check-fixtures", "scripts/check-delivery.py", "cargo fmt --all", "pnpm --filter vibeface-web test", "pnpm --filter @vibeface/client test"):
         assert command in core, command
     package = block("ci.yml", "package")
