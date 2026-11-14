@@ -350,6 +350,7 @@ def check_auto_dispatch(block, kind):
     require('gh run list' in block and 'DISPATCHED_AT' in block and 'deployment_run' in block
             and 'gh run view "$deployment_run"' in block
             and 'deployment_status' in block and 'deployment_conclusion' in block
+            and 'run_list=' in block and "|| printf '[]'" in block
             and 'deployment did not reach a terminal result in time' in block.lower(),
             kind + ' deployment must wait for the dispatched run to reach a terminal result')
 

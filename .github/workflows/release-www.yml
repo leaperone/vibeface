@@ -137,10 +137,10 @@ jobs:
             --raw-field "tag=$RELEASE_TAG" --raw-field apply=true
           deployment_run=''
           for _ in $(seq 1 60); do
+            run_list="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow deploy-www.yml --branch main \
+              --event workflow_dispatch --limit 20 --json databaseId,displayTitle,createdAt 2>/dev/null || printf '[]')"
             deployment_run="$(DISPATCHED_AT="$dispatched_at" RELEASE_TAG="$RELEASE_TAG" \
-              gh run list --repo "$GITHUB_REPOSITORY" --workflow deploy-www.yml --branch main \
-                --event workflow_dispatch --limit 20 --json databaseId,displayTitle,createdAt \
-              | python3 -c 'import json, os, sys; start=os.environ["DISPATCHED_AT"]; tag=os.environ["RELEASE_TAG"]; runs=[r for r in json.load(sys.stdin) if r["createdAt"] >= start and tag in r["displayTitle"]]; print(max(runs, key=lambda r: r["createdAt"])["databaseId"] if runs else "")')"
+              python3 -c 'import json, os, sys; start=os.environ["DISPATCHED_AT"]; tag=os.environ["RELEASE_TAG"]; runs=[r for r in json.loads(sys.stdin.read()) if r["createdAt"] >= start and tag in r["displayTitle"]]; print(max(runs, key=lambda r: r["createdAt"])["databaseId"] if runs else "")' <<<"$run_list")"
             [[ -n "$deployment_run" ]] && break
             sleep 5
           done
