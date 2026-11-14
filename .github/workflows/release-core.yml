@@ -1,0 +1,142 @@
+name: Release / Core
+run-name: >-
+  Release / Core / ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || github.ref_name }} /
+  ${{ (github.event_name == 'push' || inputs.publish) && 'publish' || 'build only' }}
+
+on:
+  push:
+    tags: ['core-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact Core tag; leave empty for a build-only run
+        type: string
+        default: ''
+      publish:
+        description: Publish an existing Core tag after verification
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: core-release-${{ inputs.tag || github.ref_name }}-${{ github.event_name == 'workflow_dispatch' && !inputs.publish && github.run_id || 'publish' }}
+  cancel-in-progress: false
+
+jobs:
+  identity:
+    name: Validate Core release identity
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+      source_sha: ${{ steps.plan.outputs.source_commit }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {fetch-depth: 0, persist-credentials: false}
+      - id: plan
+        name: Validate exact Core tag, source and CI
+        env:
+          CORE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name || '') }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+        run: |
+          args=(--tag "$CORE_TAG")
+          if [[ "$PUBLISH" == true ]]; then args+=(--require-main --publish); fi
+          python3 -B scripts/core_release.py plan "${args[@]}" --github-output "$GITHUB_OUTPUT"
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build Core / x86_64 Linux
+    needs: [identity]
+    runs-on: ubuntu-24.04
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: '${{ needs.identity.outputs.source_sha }}', persist-credentials: false}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - name: Build Core
+        run: cargo build --release --locked -p vibeface-core --target x86_64-unknown-linux-gnu
+      - name: Package and verify Core release
+        run: python3 -B scripts/core_release.py package --binary target/x86_64-unknown-linux-gnu/release/vibeface-core --output .artifacts/core
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        id: upload
+        with:
+          name: core-release-${{ needs.identity.outputs.source_sha }}-${{ github.run_attempt }}
+          path: .artifacts/core/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish verified Core / publish
+    needs: [identity, build]
+    if: needs.identity.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: '${{ needs.identity.outputs.tag }}', fetch-depth: 0, persist-credentials: false}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          merge-multiple: true
+          path: .artifacts/core
+      - name: Publish immutable Core release
+        env:
+          CORE_TAG: ${{ needs.identity.outputs.tag }}
+        run: |
+          python3 -B scripts/core_release.py plan --tag "$CORE_TAG" --require-main --publish
+          python3 -B scripts/core_release.py publish --directory .artifacts/core
+
+  failed:
+    name: Mark unfinished Core release / failed
+    needs: [identity, publish]
+    if: always() && needs.identity.outputs.publish == 'true' && needs.publish.result != 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: '${{ needs.identity.outputs.tag }}', fetch-depth: 0, persist-credentials: false}
+      - name: Mark the incomplete Core release
+        env:
+          CORE_TAG: ${{ needs.identity.outputs.tag }}
+        run: |
+          python3 -B scripts/core_release.py plan --tag "$CORE_TAG" --require-main --publish
+          python3 - <<'PY'
+          import subprocess
+          tag = '${{ needs.identity.outputs.tag }}'
+          subprocess.run(['gh', 'release', 'edit', tag, '--repo', '${{ github.repository }}', '--notes',
+                          'FAILED — incomplete; rerun the Core release after reconciling its assets.'], check=True)
+          PY
+
+  deploy:
+    name: Deploy published Core / Node
+    needs: [identity, publish]
+    if: needs.identity.outputs.publish == 'true' && needs.publish.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Dispatch Node deployment from main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CORE_TAG: ${{ needs.identity.outputs.tag }}
+        run: |
+          dispatched_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          gh workflow run deploy-node.yml --repo "$GITHUB_REPOSITORY" --ref main \
+            --raw-field "tag=$CORE_TAG" --raw-field apply=true
+          deployment_run=''
+          for attempt in $(seq 1 60); do
+            deployment_run="$(DISPATCHED_AT="$dispatched_at" CORE_TAG="$CORE_TAG" \
+              gh run list --repo "$GITHUB_REPOSITORY" --workflow deploy-node.yml --branch main \
+                --event workflow_dispatch --limit 20 --json databaseId,displayTitle,createdAt \
+              | python3 -c 'import json, os, sys; start=os.environ["DISPATCHED_AT"]; tag=os.environ["CORE_TAG"]; runs=[r for r in json.load(sys.stdin) if r["createdAt"] >= start and tag in r["displayTitle"]]; print(max(runs, key=lambda r: r["createdAt"])["databaseId"] if runs else "")')"
+            [[ -n "$deployment_run" ]] && break
+            sleep 5
+          done
+          test -n "$deployment_run"
+          gh run watch "$deployment_run" --repo "$GITHUB_REPOSITORY" --exit-status

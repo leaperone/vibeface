@@ -507,6 +507,8 @@ def self_test():
     focused_self_test()
     subprocess.run(["python3", str(Path(__file__).resolve().parent / "check-release-workflow.py"), "--self-test"], check=True)
     subprocess.run(["python3", str(Path(__file__).resolve().parent / "deploy.py"), "self-test"], check=True)
+    subprocess.run(["python3", str(Path(__file__).resolve().parent / "core_release.py"), "self-test"], check=True)
+    subprocess.run(["python3", str(Path(__file__).resolve().parent / "core_hourly.py"), "--self-test"], check=True)
     subprocess.run(["python3", str(Path(__file__).resolve().parent / "deploy-run.py"), "self-test"], check=True)
     subprocess.run(["python3", str(Path(__file__).resolve().parent / "deploy-activate.py"), "--self-test"], check=True)
     subprocess.run(["python3", str(Path(__file__).resolve().parent.parent / "deploy/runtime.py"), "self-test"], check=True)

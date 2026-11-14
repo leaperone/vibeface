@@ -278,6 +278,38 @@ def check_website(source):
     check_auto_dispatch(workflow['deploy-published-www'], 'www')
 
 
+def check_core(source):
+    workflow = jobs(source)
+    require(set(workflow) == {'identity', 'build', 'publish', 'failed', 'deploy'},
+            'Core release must have identity, build, publish, failure and deploy jobs')
+    require("tags: ['core-v*']" in source and 'scripts/core_release.py' in source,
+            'Core release must use its fixed tag and verifier')
+    require(needs(workflow['build']) == {'identity'}
+            and needs(workflow['publish']) == {'identity', 'build'}
+            and needs(workflow['failed']) == {'identity', 'publish'}
+            and needs(workflow['deploy']) == {'identity', 'publish'},
+            'Core release dependency graph must be linear after identity')
+    require("needs.identity.outputs.publish == 'true'" in guard(workflow['publish'])
+            and "needs.identity.outputs.publish == 'true'" in guard(workflow['deploy'])
+            and "needs.publish.result == 'success'" in guard(workflow['deploy']),
+            'Core publication and deployment require explicit publish intent and success')
+    require('always()' in guard(workflow['failed'])
+            and "needs.publish.result != 'success'" in guard(workflow['failed'])
+            and "'gh', 'release', 'edit'" in workflow['failed'],
+            'Core failure job must mark an incomplete public release')
+    require('cargo build --release --locked -p vibeface-core --target x86_64-unknown-linux-gnu' in workflow['build']
+            and 'scripts/core_release.py package' in workflow['build']
+            and 'artifact-ids: ${{ needs.build.outputs.artifact_id }}' in workflow['publish'],
+            'Core release must build and publish the pinned x86_64 artifact')
+    dispatch = workflow['deploy']
+    require('gh workflow run deploy-node.yml' in dispatch and '--ref main' in dispatch
+            and '--raw-field "tag=$CORE_TAG" --raw-field apply=true' in dispatch,
+            'Core release must dispatch the Node deployment from main')
+    require('gh run list' in dispatch and 'DISPATCHED_AT' in dispatch and 'deployment_run' in dispatch
+            and 'gh run watch "$deployment_run" --repo "$GITHUB_REPOSITORY" --exit-status' in dispatch,
+            'Core release must wait for the Node deployment result')
+
+
 def check_auto_dispatch(block, kind):
     publisher = 'publish-product' if kind == 'product' else 'publish'
     workflow = 'deploy-product.yml' if kind == 'product' else 'deploy-www.yml'
@@ -312,9 +344,10 @@ def check_auto_dispatch(block, kind):
             kind + ' deployment must wait for the dispatched run to reach a terminal result')
 
 
-def self_test(source, helpers, website, entry):
+def self_test(source, helpers, website, entry, core):
     check(source, helpers)
     check_website(website)
+    check_core(core)
     check_identity_helper(entry)
     helper = helpers['release-publish-part.yml']
     broken = [
@@ -436,14 +469,16 @@ def main():
                for name in ('release-native.yml', 'release-compose.yml', 'release-desktop.yml', 'release-publish-part.yml',
                             'release-apps.yml', 'release-ios.yml', 'npm-publish.yml', 'deploy-services.yml')}
     website = (directory / 'release-www.yml').read_text()
+    core = (directory / 'release-core.yml').read_text()
     entry = (ROOT / 'scripts/release-entry.py').read_text()
     if args.self_test:
-        self_test(source, helpers, website, entry)
+        self_test(source, helpers, website, entry, core)
         import runpy
         runpy.run_path(str(ROOT / 'scripts/release-entry.py'))['self_test']()
     else:
         check(source, helpers)
         check_website(website)
+        check_core(core)
         check_identity_helper(entry)
     deployment = helpers['deploy-services.yml']
     entries = {service: (directory / f'deploy-{filename}.yml').read_text()

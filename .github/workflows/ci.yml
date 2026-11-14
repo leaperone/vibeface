@@ -100,13 +100,15 @@ jobs:
           python3 scripts/install-delivery-toolchain.py --self-test
           python3 scripts/run-delivery-live.py --self-test
           python3 scripts/hourly.py --self-test
+          python3 scripts/core_release.py --self-test
+          python3 scripts/core_hourly.py --self-test
           python3 scripts/release.py self-test
           python3 -B scripts/test_progressive_publication.py
           python3 scripts/package-node-windows.py --self-test
           python3 scripts/checksum.py --self-test
           python3 scripts/ios_device.py --self-test
           python3 scripts/verify-node.py --binary /usr/bin/true --artifacts .artifacts/native-clipboard-selfcheck --native-clipboard-selfcheck
-          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/verify-delivery-protected.py", "scripts/verify-delivery-restart-observer.py", "scripts/release.py", "scripts/package-node-windows.py", "scripts/verify-windows-imports.py", "scripts/check-release-workflow.py", "scripts/hourly.py")]'
+          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/verify-delivery-protected.py", "scripts/verify-delivery-restart-observer.py", "scripts/release.py", "scripts/core_release.py", "scripts/core_hourly.py", "scripts/package-node-windows.py", "scripts/verify-windows-imports.py", "scripts/check-release-workflow.py", "scripts/hourly.py")]'
           bash -n install.sh
           bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/import-mac-identity.sh
           shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/import-mac-identity.sh

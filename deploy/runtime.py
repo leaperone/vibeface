@@ -49,7 +49,9 @@ def component_info(directory=ROOT, content_root=None, verify=True, ignored=()):
             and re.fullmatch(r'[0-9a-f]{40}', info['source_commit'])
             and re.fullmatch(r'\d+\.\d+\.\d+(?:-rc\.\d+|-hourly\.\d{10})?', info['version']),
             'invalid component identity')
-    require(info['tag'] == ('www-v' if app == 'www' else 'v') + info['version'], 'component tag mismatch')
+    expected_tags = (('www-v' if app == 'www' else 'v') + info['version'],
+                     'core-v' + info['version'] if app == 'core' else '')
+    require(info['tag'] in expected_tags, 'component tag mismatch')
     if app == 'core':
         require(info['target'] == 'x86_64-unknown-linux-gnu' and type(info['data_epoch']) is int,
                 'unsupported Core component')

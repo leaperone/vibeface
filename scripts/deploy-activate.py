@@ -935,7 +935,9 @@ def main():
     raw = sys.stdin.buffer.read(65537) if args.config == '-' else checked_path(Path(args.config)).read_bytes()
     require(len(raw) <= 65536, 'deployment configuration is too large')
     config = validate_config(json.loads(raw))
-    require(args.tag == ('www-v' if config['role'] == 'www' else 'v') + args.version, 'tag and version differ')
+    expected_tags = (('www-v' if config['role'] == 'www' else 'v') + args.version,
+                     'core-v' + args.version if config['role'] in CORE_ROLES else '')
+    require(args.tag in expected_tags, 'tag and version differ')
     require(bool(args.archive) == bool(args.archive_sha256), 'archive and its digest must be supplied together')
     image = args.image
     if args.archive:
