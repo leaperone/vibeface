@@ -6,9 +6,6 @@ on:
       version:
         required: true
         type: string
-      tag:
-        required: true
-        type: string
       source_sha:
         required: true
         type: string
@@ -52,11 +49,12 @@ jobs:
       - run: scripts/build-mobile-secure.sh android
       - name: Validate committed mobile version
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          python3 -B scripts/release.py plan --app product --tag "$RELEASE_TAG"
+          mobile_version="$(python3 -c 'import json; print(json.load(open("apps/mobile/app.json"))["expo"]["extra"]["releaseVersion"])')"
+          test "$mobile_version" = "$VERSION"
+          echo "VERSION=$mobile_version" >> "$GITHUB_ENV"
           python3 -B scripts/run-delivery-live.py --verify-source-commit "$SOURCE_SHA"
       - name: Build release APK
         working-directory: apps/mobile
@@ -71,7 +69,7 @@ jobs:
           cp apps/mobile/android/app/build/outputs/apk/release/app-release.apk ".artifacts/android/vibeface-${VERSION#v}-android.apk"
           (cd .artifacts/android && shasum -a 256 "vibeface-${VERSION#v}-android.apk" > "vibeface-${VERSION#v}-android.apk.sha256")
           python3 -B scripts/release.py mobile-provenance ".artifacts/android/vibeface-${VERSION#v}-android.apk"
-          python3 -B scripts/release.py manifest product .artifacts/android
+          python3 -B scripts/release.py manifest mobile .artifacts/android
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         id: upload
         with:

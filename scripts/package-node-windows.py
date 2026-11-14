@@ -67,7 +67,7 @@ def stage(package, binaries, web):
 
 
 def package_windows(output):
-    version = release.require_version_cohort(('core', 'app'))
+    version = release.read_version('cli')
     web = ROOT / 'apps/app/dist/client'
     for name in WEB_FILES:
         release.require((web / name).is_file() and (web / name).stat().st_size > 0,
@@ -90,7 +90,7 @@ def self_test():
     from unittest.mock import patch
     scratch = ROOT / '.artifacts/windows-package-tests'
     scratch.mkdir(parents=True, exist_ok=True)
-    version = release.canonical_product_version()
+    version = release.read_version('cli')
     source = 'a' * 40
     installers = scratch / 'service-installers'
     installers.mkdir(exist_ok=True)

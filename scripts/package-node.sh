@@ -64,7 +64,11 @@ web="$repo/apps/app/dist/client"
 release_rustflags="$(python3 "$repo/scripts/release-rustflags.py")"
 CARGO_ENCODED_RUSTFLAGS="$release_rustflags" cargo "${build_args[@]}"
 [[ -x "$cli_binary" && -x "$core_binary" ]] || { printf 'Release binaries are missing: %s and %s\n' "$cli_binary" "$core_binary" >&2; exit 1; }
-version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$repo/apps/cli/Cargo.toml" | head -n 1)"
+version="$(PYTHONPATH="$repo/scripts" python3 - <<'PY2'
+import release
+print(release.read_version('cli'))
+PY2
+)"
 [[ -n "$version" && -n "$target" ]] || { echo 'Could not determine package version or target.' >&2; exit 1; }
 case "$version$target" in *[!a-zA-Z0-9._-]*) echo 'Invalid package version or target.' >&2; exit 1 ;; esac
 
