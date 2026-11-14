@@ -1,0 +1,104 @@
+name: Release / Web App
+run-name: Release / Web App / ${{ inputs.tag || github.ref_name }} / ${{ (github.event_name == 'push' || inputs.publish) && 'publish' || 'build only' }}
+on:
+  push:
+    tags: ['app-v*']
+  workflow_dispatch:
+    inputs:
+      tag: {description: Exact application tag, type: string, default: ''}
+      publish: {description: Publish this exact tag, type: boolean, default: false}
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: release-app-${{ inputs.tag || github.ref_name }}-${{ github.event_name == 'workflow_dispatch' && !inputs.publish && github.run_id || 'publish' }}
+  cancel-in-progress: false
+jobs:
+  identity:
+    name: Validate app release identity
+    runs-on: ubuntu-24.04
+    permissions: {contents: read, actions: read}
+    outputs:
+      app: ${{ steps.plan.outputs.app }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      source_sha: ${{ steps.plan.outputs.source_commit }}
+      publish: ${{ steps.plan.outputs.publish }}
+      runtime_tag: ${{ steps.plan.outputs.runtime_tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {fetch-depth: 0, persist-credentials: false}
+      - name: Validate exact tag and source
+        id: plan
+        env:
+          RELEASE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name || '') }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+          GH_TOKEN: ${{ github.token }}
+          WINDOWS_SIGNING_CONFIGURED: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 != '' }}
+          IOS_SIGNING_CONFIGURED: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 != '' && secrets.IOS_CERTIFICATE_PASSWORD != '' && secrets.IOS_PROVISIONING_PROFILE_BASE64 != '' }}
+        run: python3 -B scripts/release-entry.py --app app
+  static:
+    name: Build and verify App web assets
+    needs: [identity]
+    runs-on: ubuntu-24.04
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: '${{ needs.identity.outputs.source_sha }}', persist-credentials: false}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with: {targets: wasm32-unknown-unknown}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with: {save-if: false}
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with: {version: 11.9.0}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with: {node-version: '24', cache: pnpm, cache-dependency-path: pnpm-lock.yaml}
+      - run: pnpm install --frozen-lockfile
+      - name: Build and verify the static application
+        run: |
+          cargo install wasm-bindgen-cli --version 0.2.129 --locked
+          npm install --global binaryen@132.0.0
+          scripts/build-web-crypto.sh
+          scripts/build-web.sh
+          python3 -B scripts/release.py component app --input apps/app/dist/client --output .artifacts/static
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        id: upload
+        with:
+          name: app-release-${{ needs.identity.outputs.source_sha }}-${{ github.run_attempt }}
+          path: .artifacts/static/*
+          if-no-files-found: error
+  collect:
+    needs: [identity, static]
+    uses: ./.github/workflows/release-collect.yml
+    with:
+      app: app
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      artifact_ids: ${{ needs.static.outputs.artifact_id }}
+  publish-app:
+    name: publish-app
+    needs: [identity, collect]
+    if: needs.identity.outputs.publish == 'true'
+    uses: ./.github/workflows/release-publish.yml
+    with:
+      app: app
+      tag: ${{ needs.identity.outputs.tag }}
+      artifact_id: ${{ needs.collect.outputs.artifact_id }}
+    permissions: {contents: write, actions: read}
+  wake-consumers:
+    needs: [publish-app]
+    runs-on: ubuntu-24.04
+    permissions: {actions: write, contents: read}
+    steps:
+      - name: Reconcile independent release consumers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run hourly.yml --repo "$GITHUB_REPOSITORY" --ref main
+  deploy:
+    needs: [identity, publish-app]
+    uses: ./.github/workflows/release-deploy.yml
+    with:
+      app: app
+      tag: ${{ needs.identity.outputs.tag }}
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+    permissions: {actions: write, contents: read}

@@ -33,24 +33,29 @@ function controlConstant(name) {
   return value;
 }
 
-function productVersion() {
-  const version = /^version = "([^"]+)"$/m.exec(fs.readFileSync(path.join(repo, 'apps/cli/Cargo.toml'), 'utf8'))?.[1];
-  assert(version && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-(hourly\.\d{10}|rc\.[1-9]\d*))?$/.test(version),
-    'the canonical product version comes from the CLI package');
+function releaseVersion(version) {
+  assert(typeof version === 'string' && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-(hourly\.\d{10}|rc\.[1-9]\d*))?$/.test(version),
+    'invalid component release version');
   return version;
+}
+
+function desktopVersion() {
+  return releaseVersion(/^version = "([^"]+)"$/m.exec(fs.readFileSync(path.join(desktop, 'Cargo.toml'), 'utf8'))?.[1]);
 }
 
 /** Read a sealed runtime bundle and prove every byte still matches its own FILES.sha256. */
 function readRuntime(directory, target, version, sourceCommit) {
   const { exe } = PLATFORMS[target];
-  assert.equal(path.basename(directory), `vibeface-${version}-${target}`, 'the runtime directory must be the released CLI bundle for this platform');
   const info = JSON.parse(fs.readFileSync(path.join(directory, 'BUILD-INFO.json'), 'utf8'));
   assert.deepEqual(Object.keys(info).sort(), [...BUILD_FIELDS].sort(), 'unsupported build info fields');
+  assert.equal(path.basename(directory), `vibeface-${version ?? info.version}-${target}`, 'the runtime directory must be the released CLI bundle for this platform');
   assert.deepEqual([info.version, info.target, info.source_commit, info.update_protocol, info.data_epoch],
-    [version, target, sourceCommit, controlConstant('UPDATE_PROTOCOL'), controlConstant('DATA_EPOCH')],
+    [version ?? info.version, target, sourceCommit ?? info.source_commit, controlConstant('UPDATE_PROTOCOL'), controlConstant('DATA_EPOCH')],
     'the bundled runtime is not this platform, version and source');
-  for (const field of ['core_version', 'app_version']) assert.equal(info[field], version, 'mixed component versions in the runtime');
-  for (const field of ['core_source_commit', 'app_source_commit']) assert.equal(info[field], sourceCommit, 'mixed component sources in the runtime');
+  for (const field of ['version', 'core_version', 'app_version']) releaseVersion(info[field]);
+  for (const field of ['source_commit', 'core_source_commit', 'app_source_commit']) {
+    assert(typeof info[field] === 'string' && /^[a-f0-9]{40}$/.test(info[field]), 'invalid component source commit');
+  }
   const sealed = readSealedRuntime(directory);
   for (const name of [`vibeface${exe}`, `vibeface-core${exe}`, 'web/index.html', 'web/vibeface_secure.js',
     'web/vibeface_secure_bg.wasm', 'README.md', 'RUNTIME-REQUIREMENTS.md']) {
@@ -61,7 +66,7 @@ function readRuntime(directory, target, version, sourceCommit) {
 
 function readDesktopPackage(version) {
   const manifest = fs.readFileSync(path.join(desktop, 'Cargo.toml'), 'utf8');
-  assert(manifest.includes(`version = "${version}"`), 'desktop must join the canonical product version');
+  assert(manifest.includes(`version = "${version}"`), 'desktop package version does not match its release');
   assert(manifest.includes('gpui-kit = "=0.9.1"'), 'desktop must pin the verified GPUI kit');
 }
 
@@ -184,14 +189,16 @@ function buildWindowsInstallerFixture(portableDirectory, outputDirectory, mode =
   const include = path.join(outputDirectory, 'installer-files.nsh');
   const plan = path.join(outputDirectory, 'installer-paths.txt');
   windowsInstallerManifest(payload, include, plan);
-  const sourceInfo = JSON.parse(fs.readFileSync(path.join(payload, 'resources/runtime/BUILD-INFO.json'), 'utf8'));
-  assert.equal(sourceInfo.target, 'x86_64-pc-windows-msvc', 'installer fixture requires the verified Windows runtime');
-  assert(typeof sourceInfo.version === 'string' && /^[0-9]+\.[0-9]+\.[0-9]+(?:-(?:hourly\.[0-9]{10}|rc\.[1-9][0-9]*))?$/.test(sourceInfo.version), 'invalid source runtime version');
+  const runtime = JSON.parse(fs.readFileSync(path.join(payload, 'resources/runtime/BUILD-INFO.json'), 'utf8'));
+  assert.equal(runtime.target, 'x86_64-pc-windows-msvc', 'installer fixture requires the verified Windows runtime');
+  const sourceInfo = JSON.parse(fs.readFileSync(path.join(payload, 'resources/desktop-build.json'), 'utf8'));
+  releaseVersion(sourceInfo.version);
+  assert(/^[a-f0-9]{40}$/.test(sourceInfo.source_commit), 'invalid desktop payload source');
   const installer = path.join(outputDirectory, { upgrade: 'upgrade-fixture.exe', diagnostic: 'diagnostic-fixture.exe', normal: 'normal-fixture.exe' }[mode]);
   run(process.env.MAKENSIS || path.join(process.env['ProgramFiles(x86)'] || 'C:/Program Files (x86)', 'NSIS', 'makensis.exe'),
     [`/DAPP_DIR=${payload}`, `/DFILE_MANIFEST=${include}`, `/DPATH_PLAN=${plan}`, `/DOUTPUT=${installer}`, `/DVERSION=${sourceInfo.version}`, ...(diagnostic ? ['/DINSTALLER_DIAGNOSTICS'] : []), path.join(desktop, 'build/installer.nsi')], { stdio: 'inherit' });
   writeJson(path.join(outputDirectory, 'installer-source.json'), {
-    mode, diagnostics_enabled: diagnostic, target: sourceInfo.target, version: sourceInfo.version,
+    mode, diagnostics_enabled: diagnostic, target: runtime.target, version: sourceInfo.version,
     source_payload_commit: sourceInfo.source_commit,
     installer_script_commit: run('git', ['rev-parse', 'HEAD'], { cwd: repo }).trim(),
     portable_ownership_sha256: hash(path.join(portableDirectory, '.vibeface-installed-files.json')),
@@ -204,14 +211,15 @@ async function build({ target, runtimeDir, output, runtimeArchive, sign }) {
   assert(platform, `--target must be one of ${Object.keys(PLATFORMS).join(', ')}`);
   assert.equal(process.platform, platform.platform, `${target} desktop applications are built on their own platform`);
   if (platform.platform === 'linux') assert.equal(process.arch, platform.arch, `${target} desktop applications are built on their matching native architecture`);
-  const version = productVersion();
+  const version = desktopVersion();
   assert.equal(run('git', ['status', '--porcelain'], { cwd: repo }).trim(), '', 'desktop packaging source must be clean');
   const sourceCommit = run('git', ['rev-parse', 'HEAD'], { cwd: repo }).trim();
   assert(/^[0-9a-f]{40}$/.test(sourceCommit), 'a full source commit is required');
 
-  const { sealed } = readRuntime(runtimeDir, target, version, sourceCommit);
+  const { info: runtime, sealed } = readRuntime(runtimeDir, target);
   readDesktopPackage(version);
-  const archive = runtimeArchive ?? path.join(path.dirname(runtimeDir), `vibeface-${version}-${target}.tar.gz`);
+  const archive = runtimeArchive ?? path.join(path.dirname(runtimeDir), `vibeface-${runtime.version}-${target}.tar.gz`);
+  assert.equal(path.basename(archive), `vibeface-${runtime.version}-${target}.tar.gz`, 'runtime archive does not match the sealed CLI bundle');
   assert(fs.statSync(archive).isFile(), `the released runtime archive is required beside --runtime-dir or named with --runtime-archive`);
   const { signed, signing } = signingState(target, sign);
   const channel = version.includes('-hourly.') ? 'hourly' : version.includes('-rc.') ? 'rc' : 'stable';
@@ -237,6 +245,7 @@ async function build({ target, runtimeDir, output, runtimeArchive, sign }) {
   fs.copyFileSync(path.join(targetDirectory, target, 'release', `vibeface-desktop${platform.exe}`), executable);
   fs.chmodSync(executable, 0o755);
   copyRuntime(runtimeDir, path.join(resources, 'runtime'));
+  writeJson(path.join(resources, 'desktop-build.json'), { version, source_commit: sourceCommit });
   fs.copyFileSync(path.join(desktop, 'RUNTIME-REQUIREMENTS.md'), path.join(resources, 'NATIVE-REQUIREMENTS.md'));
   const base = `vibeface-desktop-${version}-${target}`;
   const produced = path.join(stage, 'out');
@@ -295,9 +304,9 @@ async function build({ target, runtimeDir, output, runtimeArchive, sign }) {
     fs.writeFileSync(`${destination}.sha256`, `${artifacts[name]}  ${name}\n`);
   }
   const receipt = {
-    schema: SCHEMA_VERSION, app: 'desktop', target, version, tag: `v${version}`, channel,
+    schema: SCHEMA_VERSION, app: 'desktop', target, version, tag: `desktop-v${version}`, channel,
     source_commit: sourceCommit, ...NATIVE_UI, signed, signing,
-    runtime: { archive: path.basename(archive), sha256: hash(archive) }, artifacts,
+    runtime: { version: runtime.version, source_commit: runtime.source_commit, archive: path.basename(archive), sha256: hash(archive) }, artifacts,
   };
   writeJson(path.join(output, `${base}.provenance.json`), receipt);
   run('python3', ['-B', path.join(repo, 'scripts/release.py'), 'verify-desktop', '--target', target,
@@ -331,8 +340,8 @@ function selfTest() {
     }
     writeJson(path.join(bundle, 'BUILD-INFO.json'), {
       version, target, source_commit: commit, update_protocol: controlConstant('UPDATE_PROTOCOL'),
-      data_epoch: controlConstant('DATA_EPOCH'), core_version: version, core_source_commit: commit,
-      app_version: version, app_source_commit: commit,
+      data_epoch: controlConstant('DATA_EPOCH'), core_version: '2.3.4', core_source_commit: 'b'.repeat(40),
+      app_version: '3.4.5-rc.2', app_source_commit: 'c'.repeat(40),
     });
     const seal = () => fs.writeFileSync(path.join(bundle, 'FILES.sha256'),
       relativeFiles(bundle).filter(name => name !== 'FILES.sha256')
@@ -340,6 +349,11 @@ function selfTest() {
     seal();
     const sealed = readRuntime(bundle, target, version, commit).sealed;
     assert.equal(sealed.size, Object.keys(entries).length + 1, 'the sealed set covers every runtime file');
+    const independent = readRuntime(bundle, target).info;
+    assert.deepEqual([independent.version, independent.core_version, independent.app_version],
+      ['9.9.9-hourly.2026110712', '2.3.4', '3.4.5-rc.2']);
+    assert.deepEqual([independent.source_commit, independent.core_source_commit, independent.app_source_commit],
+      ['a'.repeat(40), 'b'.repeat(40), 'c'.repeat(40)]);
 
     const packaged = path.join(scratch, 'packaged');
     copyRuntime(bundle, packaged);
@@ -360,8 +374,8 @@ function selfTest() {
     const info = JSON.parse(fs.readFileSync(path.join(bundle, 'BUILD-INFO.json'), 'utf8'));
     for (const [label, change, expected] of [
       ['an extra build info field', { legacy: true }, /unsupported build info fields/],
-      ['a mixed component version', { core_version: '1.2.3' }, /mixed component versions/],
-      ['a mixed component source', { app_source_commit: 'c'.repeat(40) }, /mixed component sources/],
+      ['an invalid component version', { core_version: 'invalid' }, /invalid component release version/],
+      ['an invalid component source', { app_source_commit: 'short' }, /invalid component source commit/],
       ['another data epoch', { data_epoch: 2 }, /platform, version and source/],
     ]) {
       writeJson(path.join(bundle, 'BUILD-INFO.json'), { ...info, ...change });
@@ -434,7 +448,7 @@ function selfTest() {
     fs.mkdirSync(linkedPayload);
     fs.symlinkSync(path.join(windowsPayload, 'Vibeface.exe'), path.join(linkedPayload, 'Vibeface.exe'));
     assert.throws(() => windowsInstallerManifest(linkedPayload, includeFile), /must not contain links/);
-    console.log('desktop build self-test passed: sealed runtime verification, cohort identity, packaging immutability, exact installer ownership and honest signing status.');
+    console.log('desktop build self-test passed: independent runtime versions and sources, sealed packaging, exact installer ownership and honest signing status.');
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
   }

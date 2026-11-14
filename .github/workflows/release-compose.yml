@@ -6,15 +6,15 @@ on:
       runner: {type: string, required: true}
       target: {type: string, required: true}
       native_artifact_id: {type: string, required: true}
-      app_artifact_id: {type: string, required: true}
     outputs:
       artifact_id:
         value: ${{ jobs.compose.outputs.artifact_id }}
 permissions:
   contents: read
+  actions: read
 jobs:
   compose:
-    name: Compose CLI + Core / ${{ inputs.target }}
+    name: Compose CLI package / ${{ inputs.target }}
     runs-on: ${{ inputs.runner }}
     defaults:
       run: {shell: bash}
@@ -28,32 +28,37 @@ jobs:
           artifact-ids: ${{ inputs.native_artifact_id }}
           merge-multiple: true
           path: .artifacts/native-input
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          artifact-ids: ${{ inputs.app_artifact_id }}
-          merge-multiple: true
-          path: .artifacts/app-input
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with: {node-version: '24'}
       - name: Select this platform's Python
         run: printf 'PY=%s\n' "$(command -v python3 || command -v python)" >> "$GITHUB_ENV"
-      - name: Compose from this run's exact inputs
+      - name: Resolve pinned Core and App dependencies
         id: package
         env:
+          GH_TOKEN: ${{ github.token }}
           TARGET: ${{ inputs.target }}
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           exe=''
           if [[ "$TARGET" == *-windows-* ]]; then exe='.exe'; fi
-          chmod +x ".artifacts/native-input/vibeface$exe" ".artifacts/native-input/vibeface-core$exe"
-          version=$("$PY" -B scripts/release.py plan --app product | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["version"])')
-          "$PY" -B scripts/release.py compose --target "$TARGET" --native-dir .artifacts/native-input --app-archive ".artifacts/app-input/vibeface-app-$version.tar.gz" --output .artifacts/release
+          chmod +x ".artifacts/native-input/vibeface$exe"
+          mkdir -p .artifacts/deps/core .artifacts/deps/app
+          "$PY" -B scripts/release.py dependency --app cli --dependency core --target "$TARGET" --output .artifacts/deps/core
+          "$PY" -B scripts/release.py dependency --app cli --dependency app --target "$TARGET" --output .artifacts/deps/app
+          core_archive=$(find .artifacts/deps/core -maxdepth 1 -type f -name '*.tar.gz' -print -quit)
+          app_archive=$(find .artifacts/deps/app -maxdepth 1 -type f -name '*.tar.gz' -print -quit)
+          [[ -n "$core_archive" && -n "$app_archive" ]] || { echo 'Pinned Core/App dependency archive is missing' >&2; exit 1; }
+          "$PY" -B scripts/release.py compose --target "$TARGET" --native-dir .artifacts/native-input --app-archive "$app_archive" --core-archive "$core_archive" --output .artifacts/release
+          archive=$(find .artifacts/release -maxdepth 1 -type f -name 'vibeface-*.tar.gz' ! -name 'vibeface-core-*' -print -quit)
+          [[ -n "$archive" ]] || { echo 'Composed CLI archive is missing' >&2; exit 1; }
+          package_name=$(tar -tzf "$archive" | sed -n '1s#/.*##p')
+          [[ -n "$package_name" ]] || { echo 'Composed CLI archive has no root' >&2; exit 1; }
           mkdir .artifacts/smoke
-          tar -xzf ".artifacts/release/vibeface-$version-$TARGET.tar.gz" -C .artifacts/smoke
+          tar -xzf "$archive" -C .artifacts/smoke
           {
-            printf 'package=%s\n' "$PWD/.artifacts/smoke/vibeface-$version-$TARGET"
-            printf 'archive=%s\n' "$PWD/.artifacts/release/vibeface-$version-$TARGET.tar.gz"
+            printf 'package=%s\n' "$PWD/.artifacts/smoke/$package_name"
+            printf 'archive=%s\n' "$PWD/$archive"
             printf 'exe=%s\n' "$exe"
           } >> "$GITHUB_OUTPUT"
       - name: Verify the composed programs and Web resources

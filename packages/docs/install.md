@@ -9,7 +9,7 @@ description: 安装桌面 App，连接已有节点，或在自己的电脑上启
 
 ## 使用桌面 App
 
-从同一产品 Release 下载本平台的 Vibeface Desktop：macOS 使用 DMG，Windows 使用当前用户安装器，Linux 使用 AppImage。桌面包内已有对应平台的 Core、CLI 和客户端，无需先运行 CLI。
+从 `desktop-v<version>` Release 下载本平台的 Vibeface Desktop：macOS 使用 DMG，Windows 使用当前用户安装器，Linux 使用 AppImage。桌面包内已有对应平台的 Core、CLI 和客户端，无需先运行 CLI。
 
 当前源码的桌面界面使用 GPUI。公开安装包以对应 Release 的源码提交和来源收据为准；源码改动、开发预览和已发布版本分别核对，不能把本分支构建等同于已经更新安装。
 
@@ -38,9 +38,9 @@ export VIBEFACE_BIN_DIR="$HOME/.local/bin"
 
 Vibeface 的完整 Rust 包包含 CLI `vibeface`、后台 Core `vibeface-core` 和 `web/` 静态 App。支持 macOS Apple Silicon、Windows x64、Linux x64 和 Linux ARM64；Linux 包需要 glibc。macOS 发布包的两个程序使用 Developer ID 签名并通过 Apple notarization。系统设置保持默认的“自动允许下载的已签名软件接收传入连接”且未阻止所有传入连接时，应用防火墙直接放行，安装和更新后不再询问。
 
-## npm Hourly
+## npm 安装
 
-Node.js 22+ 可通过已公开的 npm 包安装 Hourly：
+Node.js 22+ 可通过 `latest`、`rc` 或 `hourly` 选择已公开的 CLI npm 渠道。例如安装 Hourly：
 
 ```sh
 npm install -g @leaperone/vibeface@hourly
@@ -48,7 +48,7 @@ vibeface --version
 vibeface
 ```
 
-一个 npm 包包含四个平台的 CLI、Core 和 `web/` 资源，按本机平台启动 Rust CLI。无需安装期脚本、二次下载、Rust 编译器或构建工具。npm 不创建身份、配置 Provider、启动服务或开启自动更新。产品 Hourly 的 GitHub Release 发布成功后自动通过 OIDC 发布同一份 npm 包，流程与权限要求见 [npm Hourly 制品与发布](releasing.md#npm-hourly-制品与发布)。当前声明版本为 Hourly 时，也可从扩展 CI 的 `npm-package-<SHA>` artifact 下载 `.tgz`，使用 `npm install --global --prefix /absolute/isolated/prefix --ignore-scripts /absolute/path/leaperone-vibeface-<version>.tgz` 隔离安装。
+一个 npm 包包含四个平台的 CLI、Core 和 `web/` 资源，按本机平台启动 Rust CLI。无需安装期脚本、二次下载、Rust 编译器或构建工具。npm 不创建身份、配置 Provider、启动服务或开启自动更新。CLI 的 GitHub Release 发布成功后自动通过 OIDC 发布同一份 npm 包，流程与权限要求见 [CLI/npm 发布流程](releasing.md#安装与更新)。当前声明版本为 Hourly 时，也可从扩展 CI 的 `npm-package-<SHA>` artifact 下载 `.tgz`，使用 `npm install --global --prefix /absolute/isolated/prefix --ignore-scripts /absolute/path/leaperone-vibeface-<version>.tgz` 隔离安装。
 
 初始化后，下面的 `service` 命令也适用于全局 npm 安装。服务绑定 npm 包中固定的原生程序路径；不要把后台服务绑定到临时 `npx` 缓存，也不要在服务仍运行时移除或覆盖 npm 安装。迁移服务前先从原安装入口确认空闲并停止服务；npm 服务安装拒绝运行中的 updater、仍被运行中节点锁定或存在未完成更新记录的数据目录，通过后才移除同一目录绑定的旧受管更新定时器。安装期间持续持有同一更新锁，避免旧 updater 并发改写状态。存在 `update-pending.json` 时，先使用原受管安装的 `update apply` 恢复，再迁移服务。
 
@@ -207,7 +207,7 @@ vibeface update configure --channel hourly --automatic true --install-root "$VIB
 vibeface update configure --channel stable --automatic true --install-root "$VIBEFACE_INSTALL_ROOT"
 ```
 
-Stable 不存在时不会切换 Hourly，更新器也不自动降级。每次 `update configure` 都必须传入实际安装根目录的绝对路径。更新行为、维护检查和备份边界见 [构建与发布](releasing.md#更新渠道)。
+Stable 不存在时不会切换 Hourly，更新器也不自动降级。每次 `update configure` 都必须传入实际安装根目录的绝对路径。更新行为、维护检查和备份边界见 [构建与发布](releasing.md#安装与更新)。
 
 
 ## 安装桌面应用

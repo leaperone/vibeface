@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Exact published website tag
+        description: Exact published WWW tag (www-v...)
         type: string
         required: true
       apply:
@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   deploy:

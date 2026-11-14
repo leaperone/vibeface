@@ -1,7 +1,15 @@
-# Artifact publication and service deployment
+# Official service deployments
 
-Product and website tags publish immutable artifacts. When a complete Release is published, the corresponding release workflow dispatches the matching service deployment from `main` and waits for its terminal result; the deployment consumes that exact published release and does not rebuild or republish product artifacts.
+Core, App, and Website releases deploy independently after their complete `release.json` is published. The release workflow dispatches a purpose-specific deployment from `main` and waits for its actual terminal result. It does not rebuild dependencies or treat a successful dispatch as a successful deployment.
 
-All commands, container definitions and workflows live in this repository. Each deployment target uses a GitHub Environment with scoped SSH credentials and runtime configuration. No cross-repository dispatch token or shared release repository is used. Starting a workflow is not proof that deployment succeeded.
+| Service | Exact tag | Entry |
+| --- | --- | --- |
+| Node | `core-v<version>` | `deploy-node.yml` |
+| App | `app-v<version>` | `deploy-app.yml` |
+| WWW | `www-v<version>` | `deploy-www.yml` |
 
-Automatic dispatch covers product Releases with `deploy-product.yml` (Node and App), Core train Releases with `deploy-node.yml` (Node only), and website Releases with `deploy-www.yml`. Manual entries remain fixed by target: `deploy-node.yml`, `deploy-app.yml`, `deploy-www.yml`, and `deploy-product.yml`. They require an exact published `tag` and default to `apply=false` for read-only validation. All entries call `deploy-services.yml`, which owns the single global deployment lock. New entries become dispatchable after they reach the default branch.
+Each entry defaults to `apply=false`, has a fixed target, and calls `deploy-services.yml`. Only `main` may apply. The common implementation retains the global host activation lock; independent release jobs do not cancel an activation already in progress. There is no Product/`all` deployment or shared service version.
+
+The deployment planner verifies the final manifest, immutable tag source and green-main provenance, contracts, and GitHub asset digests. It downloads only the selected component, validates its internal receipt, then builds its container. Node activation first rehearses the previous complete Core release to candidate upgrade, preserves identity/data, and uses the existing maintenance, backup, journal, health, and recovery rules.
+
+Host addresses and credentials stay in deployment environment secrets. Follow [service deployments](../packages/docs/service-deployments.md) for commands and verification. Manual dispatch responses with unknown outcomes must be reconciled against exact tag/intent runs before another write.

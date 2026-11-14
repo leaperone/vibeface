@@ -23,6 +23,28 @@ const PLATFORMS = {
 const run = (program, args, options = {}) =>
   execFileSync(program, args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, ...options });
 
+function releaseVersion(version) {
+  assert(typeof version === 'string' && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-(hourly\.\d{10}|rc\.[1-9]\d*))?$/.test(version),
+    'invalid component release version');
+  return version;
+}
+
+function readRuntimeInfo(runtime) {
+  const info = JSON.parse(fs.readFileSync(path.join(runtime, 'BUILD-INFO.json'), 'utf8'));
+  assert.deepEqual(Object.keys(info).sort(), ['version', 'target', 'source_commit', 'update_protocol', 'data_epoch',
+    'core_version', 'core_source_commit', 'app_version', 'app_source_commit'].sort(), 'unsupported build info fields');
+  for (const field of ['version', 'core_version', 'app_version']) releaseVersion(info[field]);
+  for (const field of ['source_commit', 'core_source_commit', 'app_source_commit']) {
+    assert(typeof info[field] === 'string' && /^[a-f0-9]{40}$/.test(info[field]), 'invalid component source commit');
+  }
+  const control = fs.readFileSync(path.join(repo, 'crates/control/src/lib.rs'), 'utf8');
+  for (const [field, constant] of [['data_epoch', 'DATA_EPOCH'], ['update_protocol', 'UPDATE_PROTOCOL']]) {
+    const expected = Number(new RegExp(`pub const ${constant}: u32 = (\\d+);`).exec(control)?.[1]);
+    assert(Number.isSafeInteger(expected) && info[field] === expected, 'unsupported runtime protocol or data epoch');
+  }
+  return info;
+}
+
 function readReceipt(input, target, version) {
   const platform = PLATFORMS[target];
   const base = `vibeface-desktop-${version}-${target}`;
@@ -37,7 +59,9 @@ function readReceipt(input, target, version) {
   assert.equal(receipt.app, 'desktop');
   assert.equal(receipt.target, target);
   assert.equal(receipt.version, version);
-  assert.equal(receipt.tag, `v${version}`);
+  releaseVersion(version);
+  assert.equal(receipt.tag, `desktop-v${version}`);
+  assert.equal(receipt.channel, version.includes('-hourly.') ? 'hourly' : version.includes('-rc.') ? 'rc' : 'stable');
   for (const [key, value] of Object.entries(NATIVE_UI)) assert.equal(receipt[key], value, 'the desktop application must ship the pinned native GPUI version');
   assert(/^[a-f0-9]{40}$/.test(receipt.source_commit), 'invalid desktop source commit');
   assert(SIGNING_STATES.includes(receipt.signing) && typeof receipt.signed === 'boolean', 'invalid desktop signing status');
@@ -45,7 +69,10 @@ function readReceipt(input, target, version) {
   assert(!receipt.signed || receipt.signing === platform.signing, 'desktop signing kind does not match its platform');
   assert(target.endsWith('-unknown-linux-gnu') ? receipt.signing === 'platform-checksums' : receipt.signing !== 'platform-checksums',
     'desktop signing status does not match its platform');
-  assert.equal(receipt.runtime.archive, `vibeface-${version}-${target}.tar.gz`, 'the runtime must be this platform CLI bundle');
+  assert.deepEqual(Object.keys(receipt.runtime).sort(), ['version', 'source_commit', 'archive', 'sha256'].sort(), 'unsupported desktop runtime fields');
+  releaseVersion(receipt.runtime.version);
+  assert(typeof receipt.runtime.source_commit === 'string' && /^[a-f0-9]{40}$/.test(receipt.runtime.source_commit), 'invalid runtime source commit');
+  assert.equal(receipt.runtime.archive, `vibeface-${receipt.runtime.version}-${target}.tar.gz`, 'the runtime must be this platform CLI bundle');
   assert(/^[a-f0-9]{64}$/.test(receipt.runtime.sha256), 'invalid runtime digest');
   assert.deepEqual(Object.keys(receipt.artifacts).sort(), [...payloads].sort(), 'the receipt must cover exactly its two payloads');
   for (const name of payloads) {
@@ -92,7 +119,7 @@ function verifyApplication(root, target, receipt) {
   if (mac) {
     const info = fs.readFileSync(path.join(application, 'Contents/Info.plist'), 'utf8');
     assert(info.includes('<string>one.leaper.vibeface.desktop</string>'), 'unexpected macOS bundle identifier');
-    assert(info.includes(`<string>${receipt.version}</string>`), 'the macOS bundle does not carry the product version');
+    assert(info.includes(`<string>${receipt.version}</string>`), 'the macOS bundle does not carry the desktop version');
     assert(/CFBundleURLSchemes[\s\S]*?<string>vibeface<\/string>/.test(info), 'the macOS bundle does not declare the native deep-link scheme');
 
   }
@@ -103,15 +130,17 @@ function verifyApplication(root, target, receipt) {
     assert.equal(dependencies.target, target);
     assert(Array.isArray(dependencies.libraries) && dependencies.libraries.length > 0 && dependencies.minimum_glibc, 'Linux package has no actual native dependency report');
   }
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(resources, 'desktop-build.json'), 'utf8')),
+    { version: receipt.version, source_commit: receipt.source_commit }, 'the packaged desktop payload identity differs from its receipt');
   const runtime = path.join(resources, 'runtime');
   const sealed = readSealedRuntime(runtime);
   for (const name of [`vibeface${platform.exe}`, `vibeface-core${platform.exe}`, 'web/index.html',
     'web/vibeface_secure.js', 'web/vibeface_secure_bg.wasm']) {
     assert(sealed.has(name), `the bundled runtime is missing ${name}`);
   }
-  const info = JSON.parse(fs.readFileSync(path.join(runtime, 'BUILD-INFO.json'), 'utf8'));
+  const info = readRuntimeInfo(runtime);
   assert.deepEqual([info.version, info.target, info.source_commit],
-    [receipt.version, target, receipt.source_commit], 'the bundled runtime is from another cohort than the receipt');
+    [receipt.runtime.version, target, receipt.runtime.source_commit], 'the bundled runtime differs from the CLI identity in the receipt');
   return { application, resources, runtime, sealed };
 }
 
@@ -184,9 +213,9 @@ function extract(archive, destination) {
 
 function verify({ target, input, distribution, scratch }) {
   assert(PLATFORMS[target], `--target must be one of ${Object.keys(PLATFORMS).join(', ')}`);
-  const version = /^version = "([^"]+)"$/m.exec(fs.readFileSync(path.join(repo, 'apps/cli/Cargo.toml'), 'utf8'))?.[1];
-  assert(version, 'the canonical product version comes from the CLI package');
+  const version = releaseVersion(/^version = "([^"]+)"$/m.exec(fs.readFileSync(path.join(repo, 'apps/desktop/Cargo.toml'), 'utf8'))?.[1]);
   const { receipt } = readReceipt(input, target, version);
+  assert.equal(receipt.source_commit, run('git', ['rev-parse', 'HEAD'], { cwd: repo }).trim(), 'desktop receipt source does not match this checkout');
   const checksumProtectedLinux = target.endsWith('-unknown-linux-gnu') && receipt.signing === 'platform-checksums';
   assert(!distribution || receipt.signed || checksumProtectedLinux, 'a stable distribution requires a signed application or Linux checksums and provenance');
   assert(receipt.signed || checksumProtectedLinux || receipt.channel !== 'stable', 'a stable channel desktop build must be signed');
@@ -238,6 +267,8 @@ function selfTest() {
     verifyMacEntitlements(configuredPermissions);
     const version = '9.9.9-hourly.2026110712';
     const commit = 'a'.repeat(40);
+    const runtimeVersion = '2.3.4';
+    const runtimeCommit = 'b'.repeat(40);
     const write = (file, content) => {
       fs.mkdirSync(path.dirname(file), { recursive: true });
       fs.writeFileSync(file, content);
@@ -271,6 +302,7 @@ function selfTest() {
         write(path.join(application, 'vibeface.desktop'), 'Exec=vibeface %u\nMimeType=x-scheme-handler/vibeface;\n');
         write(path.join(application, 'native-dependencies.json'), JSON.stringify({ target, libraries: ['libc.so.6'], minimum_glibc: '2.17' }));
       }
+      write(path.join(resources, 'desktop-build.json'), JSON.stringify({ version, source_commit: commit }));
       const runtime = path.join(resources, 'runtime');
       const entries = {
         [`vibeface${platform.exe}`]: 'cli\n',
@@ -281,14 +313,15 @@ function selfTest() {
       };
       for (const [name, content] of Object.entries(entries)) write(path.join(runtime, name), content);
       write(path.join(runtime, 'BUILD-INFO.json'),
-        `${JSON.stringify({ version, target, source_commit: commit }, null, 2)}\n`);
+        `${JSON.stringify({ version: runtimeVersion, target, source_commit: runtimeCommit, data_epoch: 1, update_protocol: 1,
+          core_version: '3.4.5-rc.1', core_source_commit: 'c'.repeat(40), app_version: '4.5.6', app_source_commit: 'd'.repeat(40) }, null, 2)}\n`);
       fs.writeFileSync(path.join(runtime, 'FILES.sha256'), relativeFiles(runtime)
         .filter(name => name !== 'FILES.sha256').map(name => `${hash(path.join(runtime, name))}  ${name}\n`).join(''));
       const receipt = {
-        schema: SCHEMA_VERSION, app: 'desktop', target, version, tag: `v${version}`, channel: 'hourly',
+        schema: SCHEMA_VERSION, app: 'desktop', target, version, tag: `desktop-v${version}`, channel: 'hourly',
         source_commit: commit, ...NATIVE_UI, signed: false,
         signing: target.endsWith('-unknown-linux-gnu') ? 'platform-checksums' : 'unsigned-development-preview',
-        runtime: { archive: `vibeface-${version}-${target}.tar.gz`, sha256: 'b'.repeat(64) },
+        runtime: { version: runtimeVersion, source_commit: runtimeCommit, archive: `vibeface-${runtimeVersion}-${target}.tar.gz`, sha256: 'b'.repeat(64) },
         artifacts: {}, ...changes,
       };
       return { root, receipt, runtime };
@@ -297,6 +330,8 @@ function selfTest() {
     for (const target of Object.keys(PLATFORMS)) {
       const { root, receipt, runtime } = buildFixture(target);
       const verified = verifyApplication(root, target, receipt);
+      assert.deepEqual(readRuntimeInfo(runtime), { version: '2.3.4', target, source_commit: 'b'.repeat(40), data_epoch: 1, update_protocol: 1,
+        core_version: '3.4.5-rc.1', core_source_commit: 'c'.repeat(40), app_version: '4.5.6', app_source_commit: 'd'.repeat(40) });
       assert(verified.sealed.size >= 6, `${target} fixture seals its runtime`);
       const host = target.endsWith('-apple-darwin') ? path.join(verified.application, 'Contents/MacOS/Vibeface') : path.join(root, target.includes('-windows-') ? 'Vibeface.exe' : 'vibeface');
       const native = fs.readFileSync(host);
@@ -311,11 +346,16 @@ function selfTest() {
     fs.writeFileSync(path.join(runtime, 'extra.txt'), 'x');
     assert.throws(() => verifyApplication(root, 'aarch64-apple-darwin', receipt), /changed the set of runtime files/);
     fs.rmSync(path.join(runtime, 'extra.txt'));
+    const originalInfo = readRuntimeInfo(runtime);
     fs.writeFileSync(path.join(runtime, 'BUILD-INFO.json'),
-      `${JSON.stringify({ version, target: 'aarch64-apple-darwin', source_commit: 'c'.repeat(40) }, null, 2)}\n`);
+      `${JSON.stringify({ ...originalInfo, source_commit: 'c'.repeat(40) }, null, 2)}\n`);
     fs.writeFileSync(path.join(runtime, 'FILES.sha256'), relativeFiles(runtime)
       .filter(name => name !== 'FILES.sha256').map(name => `${hash(path.join(runtime, name))}  ${name}\n`).join(''));
-    assert.throws(() => verifyApplication(root, 'aarch64-apple-darwin', receipt), /another cohort than the receipt/);
+    assert.throws(() => verifyApplication(root, 'aarch64-apple-darwin', receipt), /differs from the CLI identity/);
+    const foreignPayload = buildFixture('aarch64-apple-darwin');
+    write(path.join(foreignPayload.root, 'Vibeface.app/Contents/Resources/desktop-build.json'),
+      JSON.stringify({ version, source_commit: runtimeCommit }));
+    assert.throws(() => verifyApplication(foreignPayload.root, 'aarch64-apple-darwin', foreignPayload.receipt), /desktop payload identity/);
 
     const missing = buildFixture('aarch64-apple-darwin');
     fs.rmSync(path.join(missing.runtime, 'web/vibeface_secure.js'));
@@ -353,8 +393,9 @@ function selfTest() {
       ['Authenticode claimed on macOS', { signed: true, signing: 'authenticode' }, /signing kind does not match/],
       ['another native GPUI version', { gpui: '0.2.2' }, /pinned native GPUI version/],
       ['an unknown signing state', { signed: true, signing: 'self-signed' }, /invalid desktop signing status/],
-      ['a foreign runtime archive', { runtime: { archive: 'vibeface-1.2.3-aarch64-apple-darwin.tar.gz', sha256: 'b'.repeat(64) } },
+      ['a foreign runtime archive', { runtime: { version: runtimeVersion, source_commit: runtimeCommit, archive: 'vibeface-1.2.3-aarch64-apple-darwin.tar.gz', sha256: 'b'.repeat(64) } },
         /this platform CLI bundle/],
+      ['an invalid runtime source', { runtime: { version: runtimeVersion, source_commit: 'bad', archive: `vibeface-${runtimeVersion}-aarch64-apple-darwin.tar.gz`, sha256: 'b'.repeat(64) } }, /invalid runtime source/],
       ['an extra receipt field', { legacy: true }, /unsupported desktop receipt fields/],
     ]) {
       assert.throws(() => readReceipt(assetSet('aarch64-apple-darwin', changes), 'aarch64-apple-darwin', version), expected, label);

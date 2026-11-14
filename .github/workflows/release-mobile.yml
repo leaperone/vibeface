@@ -1,0 +1,81 @@
+name: Release / Mobile
+run-name: Release / Mobile / ${{ inputs.tag || github.ref_name }} / ${{ (github.event_name == 'push' || inputs.publish) && 'publish' || 'build only' }}
+on:
+  push:
+    tags: ['mobile-v*']
+  workflow_dispatch:
+    inputs:
+      tag: {description: Exact application tag, type: string, default: ''}
+      publish: {description: Publish this exact tag, type: boolean, default: false}
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: release-mobile-${{ inputs.tag || github.ref_name }}-${{ github.event_name == 'workflow_dispatch' && !inputs.publish && github.run_id || 'publish' }}
+  cancel-in-progress: false
+jobs:
+  identity:
+    name: Validate mobile release identity
+    runs-on: ubuntu-24.04
+    permissions: {contents: read, actions: read}
+    outputs:
+      app: ${{ steps.plan.outputs.app }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      source_sha: ${{ steps.plan.outputs.source_commit }}
+      publish: ${{ steps.plan.outputs.publish }}
+      runtime_tag: ${{ steps.plan.outputs.runtime_tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {fetch-depth: 0, persist-credentials: false}
+      - name: Validate exact tag and source
+        id: plan
+        env:
+          RELEASE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name || '') }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+          GH_TOKEN: ${{ github.token }}
+          WINDOWS_SIGNING_CONFIGURED: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 != '' }}
+          IOS_SIGNING_CONFIGURED: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 != '' && secrets.IOS_CERTIFICATE_PASSWORD != '' && secrets.IOS_PROVISIONING_PROFILE_BASE64 != '' }}
+        run: python3 -B scripts/release-entry.py --app mobile
+  android:
+    name: Build Mobile / android
+    needs: [identity]
+    uses: ./.github/workflows/release-apps.yml
+    with:
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      version: ${{ needs.identity.outputs.version }}
+    secrets: inherit
+  ios:
+    name: Build Mobile / ios
+    needs: [identity]
+    uses: ./.github/workflows/release-ios.yml
+    with:
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      version: ${{ needs.identity.outputs.version }}
+    secrets: inherit
+  collect:
+    needs: [identity, android, ios]
+    uses: ./.github/workflows/release-collect.yml
+    with:
+      app: mobile
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      artifact_ids: ${{ needs.android.outputs.artifact_id }},${{ needs.ios.outputs.artifact_id }}
+  publish-mobile:
+    name: publish-mobile
+    needs: [identity, collect]
+    if: needs.identity.outputs.publish == 'true'
+    uses: ./.github/workflows/release-publish.yml
+    with:
+      app: mobile
+      tag: ${{ needs.identity.outputs.tag }}
+      artifact_id: ${{ needs.collect.outputs.artifact_id }}
+    permissions: {contents: write, actions: read}
+  wake-consumers:
+    needs: [publish-mobile]
+    runs-on: ubuntu-24.04
+    permissions: {actions: write, contents: read}
+    steps:
+      - name: Reconcile independent release consumers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run hourly.yml --repo "$GITHUB_REPOSITORY" --ref main

@@ -1,6 +1,6 @@
-name: Release / npm Hourly
+name: Release / npm
 run-name: >-
-  Release / npm Hourly / ${{ inputs.tag }} / ${{ inputs.publish && 'publish' || 'validate only' }}
+  Release / npm / ${{ inputs.tag }} / ${{ inputs.publish && 'publish' || 'validate only' }}
 
 on:
   workflow_call:
@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing product Hourly tag whose release npm artifact will be used
+        description: Existing CLI tag whose release npm artifact will be used
         type: string
         required: true
       publish:
@@ -31,12 +31,12 @@ permissions:
   actions: read
 
 concurrency:
-  group: npm-hourly-publication
+  group: npm-publication
   cancel-in-progress: false
 
 jobs:
   npm:
-    name: Publish npm Hourly / npm
+    name: Publish npm / npm
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: npm-release
@@ -45,11 +45,11 @@ jobs:
       actions: read
       id-token: write
     steps:
-      - name: Validate matching Hourly tag and workflow ref
+      - name: Validate matching CLI tag and workflow ref
         env:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-hourly\.[0-9]{10}$ ]]
+          [[ "$RELEASE_TAG" =~ ^cli-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-hourly\.[0-9]{10}|-rc\.[1-9][0-9]*)?$ ]]
           [[ "$GITHUB_REF" == "refs/tags/$RELEASE_TAG" ]]
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -69,7 +69,7 @@ jobs:
           NPM_ARTIFACT_ID: ${{ inputs.artifact_id }}
         run: |
           [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
-          python3 -B scripts/release.py plan --app product --tag "$RELEASE_TAG" --require-main --publish
+          python3 -B scripts/release.py plan --app cli --tag "$RELEASE_TAG" --require-main --publish
           node scripts/publish-npm.mjs artifact
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -81,12 +81,16 @@ jobs:
       - name: Verify the package against its source
         env:
           RELEASE_TAG: ${{ inputs.tag }}
-        run: node scripts/package-npm.mjs --verify ".artifacts/npm/leaperone-vibeface-${RELEASE_TAG#v}.tgz" --source-commit "$GITHUB_SHA"
+        run: node scripts/package-npm.mjs --verify ".artifacts/npm/leaperone-vibeface-${RELEASE_TAG#cli-v}.tgz" --source-commit "$GITHUB_SHA"
       - name: Validate npm publication without registry writes
         if: ${{ !inputs.publish }}
         env:
           RELEASE_TAG: ${{ inputs.tag }}
-        run: npm publish ".artifacts/npm/leaperone-vibeface-${RELEASE_TAG#v}.tgz" --tag hourly --access public --dry-run --ignore-scripts --registry=https://registry.npmjs.org/
+        run: |
+          version="${RELEASE_TAG#cli-v}"
+          channel=latest
+          if [[ "$version" == *-hourly.* ]]; then channel=hourly; elif [[ "$version" == *-rc.* ]]; then channel=rc; fi
+          npm publish ".artifacts/npm/leaperone-vibeface-$version.tgz" --tag "$channel" --access public --dry-run --ignore-scripts --registry=https://registry.npmjs.org/
       - name: Publish once using OIDC and reconcile the registry
         if: ${{ inputs.publish }}
         env:

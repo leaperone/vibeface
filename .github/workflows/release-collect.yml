@@ -1,0 +1,58 @@
+name: Reusable / Collect application release
+on:
+  workflow_call:
+    inputs:
+      app: {type: string, required: true}
+      source_sha: {type: string, required: true}
+      artifact_ids: {type: string, required: true}
+    outputs:
+      artifact_id: {value: '${{ jobs.collect.outputs.artifact_id }}'}
+      npm_artifact_id: {value: '${{ jobs.collect.outputs.npm_artifact_id }}'}
+permissions:
+  contents: read
+  actions: read
+jobs:
+  collect:
+    name: collect
+    runs-on: ubuntu-24.04
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      npm_artifact_id: ${{ steps.npm.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: '${{ inputs.source_sha }}', persist-credentials: false}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.artifact_ids }}
+          path: .artifacts/input
+      - name: Verify and collect this application's complete assets
+        env:
+          RELEASE_APP: ${{ inputs.app }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          python3 -B scripts/release.py collect --app "$RELEASE_APP" --input-root .artifacts/input --output .artifacts/release
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        id: upload
+        with:
+          name: ${{ inputs.app }}-release-${{ inputs.source_sha }}-${{ github.run_attempt }}
+          path: .artifacts/release/*
+          if-no-files-found: error
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        if: inputs.app == 'cli'
+        with: {node-version: '24'}
+      - name: Package the same verified CLI runtime for npm
+        if: inputs.app == 'cli'
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          mkdir .artifacts/npm-input
+          cp .artifacts/release/vibeface-*.tar.gz .artifacts/release/vibeface-*.tar.gz.sha256 .artifacts/npm-input/
+          node scripts/package-npm.mjs --input .artifacts/npm-input --source-commit "$SOURCE_SHA"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: inputs.app == 'cli'
+        id: npm
+        with:
+          name: npm-package-${{ inputs.source_sha }}-${{ github.run_attempt }}
+          path: .artifacts/npm/*
+          if-no-files-found: error

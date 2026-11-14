@@ -1,0 +1,30 @@
+name: Reusable / Publish application release
+on:
+  workflow_call:
+    inputs:
+      app: {type: string, required: true}
+      tag: {type: string, required: true}
+      artifact_id: {type: string, required: true}
+permissions:
+  contents: read
+jobs:
+  publish:
+    name: publish-${{ inputs.app }}
+    runs-on: ubuntu-24.04
+    permissions: {contents: write, actions: read}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: '${{ inputs.tag }}', fetch-depth: 0, persist-credentials: false}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.artifact_id }}
+          merge-multiple: true
+          path: .artifacts/release
+      - name: Publish verified immutable bytes and final manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_APP: ${{ inputs.app }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          python3 -B scripts/release.py plan --app "$RELEASE_APP" --tag "$RELEASE_TAG" --require-main --publish
+          python3 -B scripts/release.py publish "$RELEASE_APP" .artifacts/release

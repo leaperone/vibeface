@@ -16,7 +16,7 @@ VIBEFACE_E2E_APP_DIR=/absolute/path/to/apps/app/dist/client \
 pnpm test:e2e
 ```
 
-程序的构建步骤见[源码构建](releasing.md#ci-验证范围)。本地默认把 Chromium 下载到 `tests/e2e/.artifacts/browsers/`。e2e 只在本地运行，CI 不执行。
+程序的构建步骤见[源码构建](releasing.md#源码构建)。本地默认把 Chromium 下载到 `tests/e2e/.artifacts/browsers/`。e2e 只在本地运行，CI 不执行。
 
 每项测试创建独立 Node 数据目录，使用随机本机端口，关闭 Codex 会话扫描。默认 fixture 关闭模型执行；`workspaceTest` 启用本次测试的受控 Codex 程序，不连接真实模型。测试结束后停止自己的进程，不连接已有 Node。测试控制口只监听 loopback，认证材料保存在 owner-only 文件。Node 数据和控制文件位于 `.artifacts/e2e/`，runner 日志、报告和下载文件位于 `tests/e2e/.artifacts/`，都不会提交。恢复密码每次随机生成，通过 e2e secrets 传入。
 

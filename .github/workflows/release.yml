@@ -1,536 +1,150 @@
-name: Release / Product
-run-name: >-
-  Release / Product / ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || github.ref_name }} /
-  ${{ (github.event_name == 'push' || inputs.publish) && 'publish' || 'build only' }}
+name: Release / CLI
+run-name: Release / CLI / ${{ inputs.tag || github.ref_name }} / ${{ (github.event_name == 'push' || inputs.publish) && 'publish' || 'build only' }}
 on:
   push:
-    tags: ['v*']
+    tags: ['cli-v*']
   workflow_dispatch:
     inputs:
-      tag:
-        description: Exact declared tag; leave empty for a build-only run
-        type: string
-        default: ''
-      publish:
-        description: Publish an existing tag after verification
-        type: boolean
-        default: false
+      tag: {description: Exact application tag, type: string, default: ''}
+      publish: {description: Publish this exact tag, type: boolean, default: false}
 permissions:
   contents: read
+  actions: read
 concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}-${{ github.event_name == 'workflow_dispatch' && !inputs.publish && github.run_id || 'publish' }}
+  group: release-cli-${{ inputs.tag || github.ref_name }}-${{ github.event_name == 'workflow_dispatch' && !inputs.publish && github.run_id || 'publish' }}
   cancel-in-progress: false
 jobs:
   identity:
-    name: Validate product release identity
+    name: Validate cli release identity
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      actions: read
+    permissions: {contents: read, actions: read}
     outputs:
       app: ${{ steps.plan.outputs.app }}
       version: ${{ steps.plan.outputs.version }}
       tag: ${{ steps.plan.outputs.tag }}
       source_sha: ${{ steps.plan.outputs.source_commit }}
       publish: ${{ steps.plan.outputs.publish }}
+      runtime_tag: ${{ steps.plan.outputs.runtime_tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with: {fetch-depth: 0, persist-credentials: false}
-      - id: plan
-        name: Validate build and publication identity
+      - name: Validate exact tag and source
+        id: plan
         env:
           RELEASE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name || '') }}
           PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+          GH_TOKEN: ${{ github.token }}
           WINDOWS_SIGNING_CONFIGURED: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 != '' }}
           IOS_SIGNING_CONFIGURED: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 != '' && secrets.IOS_CERTIFICATE_PASSWORD != '' && secrets.IOS_PROVISIONING_PROFILE_BASE64 != '' }}
-          GH_TOKEN: ${{ github.token }}
-        run: python3 -B scripts/release-entry.py --app product
-  static:
-    name: Build and verify product web assets
-    needs: [identity]
-    runs-on: ubuntu-24.04
-    outputs:
-      artifact_id: ${{ steps.upload.outputs.artifact-id }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with: {ref: '${{ needs.identity.outputs.source_sha }}', persist-credentials: false}
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
-        with: {targets: wasm32-unknown-unknown}
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
-        with: {version: 11.9.0}
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with: {node-version: '24', cache: pnpm, cache-dependency-path: pnpm-lock.yaml}
-      - run: pnpm install --frozen-lockfile
-      - name: Build and verify static application
-        run: |
-          cargo install wasm-bindgen-cli --version 0.2.129 --locked
-          npm install --global binaryen@132.0.0
-          scripts/build-web-crypto.sh
-          scripts/build-web.sh
-          pnpm --filter @vibeface/secure-native run typecheck
-          pnpm --filter vibeface-mobile run typecheck
-          python3 -B scripts/release.py component app --input apps/app/dist/client --output .artifacts/static
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        id: upload
-        with:
-          name: static-release-${{ needs.identity.outputs.source_sha }}-${{ github.run_attempt }}
-          path: .artifacts/static/*
-          if-no-files-found: error
+        run: python3 -B scripts/release-entry.py --app cli
   native-macos:
-    name: Build and sign CLI + Core / macOS arm64
+    name: Build cli / macos
     needs: [identity]
     uses: ./.github/workflows/release-native.yml
     with:
+      app: cli
       source_sha: ${{ needs.identity.outputs.source_sha }}
       runner: macos-15
       target: aarch64-apple-darwin
-    secrets:
-      MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
-      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-      APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
-      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
-  native-linux-x64:
-    name: Build CLI + Core / Linux x64
-    needs: [identity]
-    uses: ./.github/workflows/release-native.yml
-    with:
-      source_sha: ${{ needs.identity.outputs.source_sha }}
-      runner: ubuntu-24.04
-      target: x86_64-unknown-linux-gnu
-  native-linux-arm64:
-    name: Build CLI + Core / Linux arm64
-    needs: [identity]
-    uses: ./.github/workflows/release-native.yml
-    with:
-      source_sha: ${{ needs.identity.outputs.source_sha }}
-      runner: ubuntu-24.04-arm
-      target: aarch64-unknown-linux-gnu
-  native-windows:
-    name: Build and sign CLI + Core / Windows x64
-    needs: [identity]
-    uses: ./.github/workflows/release-native.yml
-    with:
-      source_sha: ${{ needs.identity.outputs.source_sha }}
-      runner: windows-2025
-      target: x86_64-pc-windows-msvc
-    secrets:
-      WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
-      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-      WINDOWS_CERTIFICATE_SUBJECT: ${{ secrets.WINDOWS_CERTIFICATE_SUBJECT }}
-      WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
-  android:
-    name: Build Android APK
-    needs: [identity]
-    uses: ./.github/workflows/release-apps.yml
-    with:
-      source_sha: ${{ needs.identity.outputs.source_sha }}
-      version: ${{ needs.identity.outputs.version }}
-      tag: ${{ needs.identity.outputs.tag }}
-  ios:
-    name: Build iOS device archive
-    needs: [identity]
-    uses: ./.github/workflows/release-ios.yml
-    with:
-      source_sha: ${{ needs.identity.outputs.source_sha }}
-      version: ${{ needs.identity.outputs.version }}
-    secrets:
-      IOS_CERTIFICATE_P12_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
-      IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
-      IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
-  release-start:
-    name: Begin product publication / release-start
-    needs: [identity]
-    if: needs.identity.outputs.publish == 'true'
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with: {ref: '${{ needs.identity.outputs.tag }}', fetch-depth: 0, persist-credentials: false}
-      - name: Create or reconcile the single public BUILDING release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.identity.outputs.tag }}
-        run: |
-          python3 -B scripts/release.py plan --app product --tag "$RELEASE_TAG" --require-main --publish
-          python3 -B scripts/release.py begin-product
-  publish-app:
-    name: Publish verified app
-    needs: [identity, release-start, static]
-    if: needs.identity.outputs.publish == 'true'
-    uses: ./.github/workflows/release-publish-part.yml
-    with: {label: publish-app, kind: app, artifact_id: '${{ needs.static.outputs.artifact_id }}'}
-    permissions: {contents: write, actions: read}
-  publish-native-macos:
-    name: Publish verified CLI + Core / macOS arm64
-    needs: [identity, release-start, compose-macos]
-    if: needs.identity.outputs.publish == 'true'
-    uses: ./.github/workflows/release-publish-part.yml
-    with: {label: publish-native-aarch64-apple-darwin, kind: native, target: aarch64-apple-darwin, artifact_id: '${{ needs.compose-macos.outputs.artifact_id }}'}
-    permissions: {contents: write, actions: read}
-  publish-native-linux-x64:
-    name: Publish verified CLI + Core / Linux x64
-    needs: [identity, release-start, compose-linux-x64]
-    if: needs.identity.outputs.publish == 'true'
-    uses: ./.github/workflows/release-publish-part.yml
-    with: {label: publish-native-x86_64-unknown-linux-gnu, kind: native, target: x86_64-unknown-linux-gnu, artifact_id: '${{ needs.compose-linux-x64.outputs.artifact_id }}'}
-    permissions: {contents: write, actions: read}
-  publish-native-linux-arm64:
-    name: Publish verified CLI + Core / Linux arm64
-    needs: [identity, release-start, compose-linux-arm64]
-    if: needs.identity.outputs.publish == 'true'
-    uses: ./.github/workflows/release-publish-part.yml
-    with: {label: publish-native-aarch64-unknown-linux-gnu, kind: native, target: aarch64-unknown-linux-gnu, artifact_id: '${{ needs.compose-linux-arm64.outputs.artifact_id }}'}
-    permissions: {contents: write, actions: read}
-  publish-native-windows:
-    name: Publish verified CLI + Core / Windows x64
-    needs: [identity, release-start, compose-windows]
-    if: needs.identity.outputs.publish == 'true'
-    uses: ./.github/workflows/release-publish-part.yml
-    with: {label: publish-native-x86_64-pc-windows-msvc, kind: native, target: x86_64-pc-windows-msvc, artifact_id: '${{ needs.compose-windows.outputs.artifact_id }}'}
-    permissions: {contents: write, actions: read}
-  publish-desktop-macos:
-    name: Publish verified desktop / macOS arm64
-    needs: [identity, release-start, desktop-macos]
-    if: needs.identity.outputs.publish == 'true'
-    uses: ./.github/workflows/release-publish-part.yml
-    with: {label: publish-desktop-aarch64-apple-darwin, kind: desktop, target: aarch64-apple-darwin, artifact_id: '${{ needs.desktop-macos.outputs.artifact_id }}'}
-    permissions: {contents: write, actions: read}
-  publish-desktop-linux-x64:
-    name: Publish verified desktop / Linux x64
-    needs: [identity, release-start, desktop-linux-x64]
-    if: needs.identity.outputs.publish == 'true'
-    uses: ./.github/workflows/release-publish-part.yml
-    with: {label: publish-desktop-x86_64-unknown-linux-gnu, kind: desktop, target: x86_64-unknown-linux-gnu, artifact_id: '${{ needs.desktop-linux-x64.outputs.artifact_id }}'}
-    permissions: {contents: write, actions: read}
-  publish-desktop-linux-arm64:
-    name: Publish verified desktop / Linux arm64
-    needs: [identity, release-start, desktop-linux-arm64]
-    if: needs.identity.outputs.publish == 'true'
-    uses: ./.github/workflows/release-publish-part.yml
-    with: {label: publish-desktop-aarch64-unknown-linux-gnu, kind: desktop, target: aarch64-unknown-linux-gnu, artifact_id: '${{ needs.desktop-linux-arm64.outputs.artifact_id }}'}
-    permissions: {contents: write, actions: read}
-  publish-desktop-windows:
-    name: Publish verified desktop / Windows x64
-    needs: [identity, release-start, desktop-windows]
-    if: needs.identity.outputs.publish == 'true'
-    uses: ./.github/workflows/release-publish-part.yml
-    with: {label: publish-desktop-x86_64-pc-windows-msvc, kind: desktop, target: x86_64-pc-windows-msvc, artifact_id: '${{ needs.desktop-windows.outputs.artifact_id }}'}
-    permissions: {contents: write, actions: read}
-  publish-android:
-    name: Publish verified Android APK
-    needs: [identity, release-start, android]
-    if: needs.identity.outputs.publish == 'true'
-    uses: ./.github/workflows/release-publish-part.yml
-    with: {label: publish-android, kind: android, artifact_id: '${{ needs.android.outputs.artifact_id }}'}
-    permissions: {contents: write, actions: read}
-  publish-ios:
-    name: Publish verified iOS archive
-    needs: [identity, release-start, ios]
-    if: needs.identity.outputs.publish == 'true'
-    uses: ./.github/workflows/release-publish-part.yml
-    with: {label: publish-ios, kind: ios, artifact_id: '${{ needs.ios.outputs.artifact_id }}'}
-    permissions: {contents: write, actions: read}
+    secrets: inherit
   compose-macos:
-    name: Compose CLI + Core package / macOS arm64
-    needs: [identity, static, native-macos]
+    name: Compose CLI / macos
+    needs: [identity, native-macos]
     uses: ./.github/workflows/release-compose.yml
     with:
       source_sha: ${{ needs.identity.outputs.source_sha }}
       runner: macos-15
       target: aarch64-apple-darwin
       native_artifact_id: ${{ needs.native-macos.outputs.artifact_id }}
-      app_artifact_id: ${{ needs.static.outputs.artifact_id }}
+  native-linux-x64:
+    name: Build cli / linux-x64
+    needs: [identity]
+    uses: ./.github/workflows/release-native.yml
+    with:
+      app: cli
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runner: ubuntu-24.04
+      target: x86_64-unknown-linux-gnu
+    secrets: inherit
   compose-linux-x64:
-    name: Compose CLI + Core package / Linux x64
-    needs: [identity, static, native-linux-x64]
+    name: Compose CLI / linux-x64
+    needs: [identity, native-linux-x64]
     uses: ./.github/workflows/release-compose.yml
     with:
       source_sha: ${{ needs.identity.outputs.source_sha }}
       runner: ubuntu-24.04
       target: x86_64-unknown-linux-gnu
       native_artifact_id: ${{ needs.native-linux-x64.outputs.artifact_id }}
-      app_artifact_id: ${{ needs.static.outputs.artifact_id }}
+  native-linux-arm64:
+    name: Build cli / linux-arm64
+    needs: [identity]
+    uses: ./.github/workflows/release-native.yml
+    with:
+      app: cli
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runner: ubuntu-24.04-arm
+      target: aarch64-unknown-linux-gnu
+    secrets: inherit
   compose-linux-arm64:
-    name: Compose CLI + Core package / Linux arm64
-    needs: [identity, static, native-linux-arm64]
+    name: Compose CLI / linux-arm64
+    needs: [identity, native-linux-arm64]
     uses: ./.github/workflows/release-compose.yml
     with:
       source_sha: ${{ needs.identity.outputs.source_sha }}
       runner: ubuntu-24.04-arm
       target: aarch64-unknown-linux-gnu
       native_artifact_id: ${{ needs.native-linux-arm64.outputs.artifact_id }}
-      app_artifact_id: ${{ needs.static.outputs.artifact_id }}
+  native-windows:
+    name: Build cli / windows
+    needs: [identity]
+    uses: ./.github/workflows/release-native.yml
+    with:
+      app: cli
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runner: windows-2025
+      target: x86_64-pc-windows-msvc
+    secrets: inherit
   compose-windows:
-    name: Compose CLI + Core package / Windows x64
-    needs: [identity, static, native-windows]
+    name: Compose CLI / windows
+    needs: [identity, native-windows]
     uses: ./.github/workflows/release-compose.yml
     with:
       source_sha: ${{ needs.identity.outputs.source_sha }}
       runner: windows-2025
       target: x86_64-pc-windows-msvc
       native_artifact_id: ${{ needs.native-windows.outputs.artifact_id }}
-      app_artifact_id: ${{ needs.static.outputs.artifact_id }}
-  desktop-macos:
-    name: Build desktop package / macOS arm64
-    needs: [identity, compose-macos]
-    uses: ./.github/workflows/release-desktop.yml
-    with:
-      source_sha: ${{ needs.identity.outputs.source_sha }}
-      runner: macos-15
-      target: aarch64-apple-darwin
-      native_artifact_id: ${{ needs.compose-macos.outputs.artifact_id }}
-      sign: true
-    secrets:
-      MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
-      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-      APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
-      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
-  desktop-windows:
-    name: Build desktop package / Windows x64
-    needs: [identity, compose-windows]
-    uses: ./.github/workflows/release-desktop.yml
-    with:
-      source_sha: ${{ needs.identity.outputs.source_sha }}
-      runner: windows-2025
-      target: x86_64-pc-windows-msvc
-      native_artifact_id: ${{ needs.compose-windows.outputs.artifact_id }}
-      sign: true
-    secrets:
-      WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
-      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-      WINDOWS_CERTIFICATE_SUBJECT: ${{ secrets.WINDOWS_CERTIFICATE_SUBJECT }}
-      WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
-  desktop-linux-x64:
-    name: Build desktop package / Linux x64
-    needs: [identity, compose-linux-x64]
-    uses: ./.github/workflows/release-desktop.yml
-    with:
-      source_sha: ${{ needs.identity.outputs.source_sha }}
-      runner: ubuntu-24.04
-      target: x86_64-unknown-linux-gnu
-      native_artifact_id: ${{ needs.compose-linux-x64.outputs.artifact_id }}
-  desktop-linux-arm64:
-    name: Build desktop package / Linux arm64
-    needs: [identity, compose-linux-arm64]
-    uses: ./.github/workflows/release-desktop.yml
-    with:
-      source_sha: ${{ needs.identity.outputs.source_sha }}
-      runner: ubuntu-24.04-arm
-      target: aarch64-unknown-linux-gnu
-      native_artifact_id: ${{ needs.compose-linux-arm64.outputs.artifact_id }}
   collect:
-    name: Collect complete product / collect
-    needs: [identity, static, compose-macos, compose-linux-x64, compose-linux-arm64, compose-windows, desktop-macos, desktop-windows, desktop-linux-x64, desktop-linux-arm64, android, ios]
-    if: >-
-      always() && !cancelled() && needs.identity.result == 'success' && needs.static.result == 'success' &&
-      needs.compose-macos.result == 'success' && needs.compose-linux-x64.result == 'success' &&
-      needs.compose-linux-arm64.result == 'success' && needs.compose-windows.result == 'success' &&
-      needs.desktop-macos.result == 'success' && needs.desktop-windows.result == 'success' &&
-      needs.desktop-linux-x64.result == 'success' && needs.desktop-linux-arm64.result == 'success' &&
-      needs.ios.result == 'success' && needs.android.result == 'success'
+    needs: [identity, compose-macos, compose-linux-x64, compose-linux-arm64, compose-windows]
+    uses: ./.github/workflows/release-collect.yml
+    with:
+      app: cli
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      artifact_ids: ${{ needs.compose-macos.outputs.artifact_id }},${{ needs.compose-linux-x64.outputs.artifact_id }},${{ needs.compose-linux-arm64.outputs.artifact_id }},${{ needs.compose-windows.outputs.artifact_id }}
+  publish-cli:
+    name: publish-cli
+    needs: [identity, collect]
+    if: needs.identity.outputs.publish == 'true'
+    uses: ./.github/workflows/release-publish.yml
+    with:
+      app: cli
+      tag: ${{ needs.identity.outputs.tag }}
+      artifact_id: ${{ needs.collect.outputs.artifact_id }}
+    permissions: {contents: write, actions: read}
+  wake-consumers:
+    needs: [publish-cli]
     runs-on: ubuntu-24.04
-    outputs:
-      release_artifact_id: ${{ steps.release-artifact.outputs.artifact-id }}
-      npm_artifact_id: ${{ steps.npm-artifact.outputs.artifact-id }}
+    permissions: {actions: write, contents: read}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with: {ref: '${{ needs.identity.outputs.source_sha }}', persist-credentials: false}
-      - name: Assert the collection source
-        env:
-          SOURCE_SHA: ${{ needs.identity.outputs.source_sha }}
-        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          artifact-ids: ${{ needs.static.outputs.artifact_id }}
-          merge-multiple: true
-          path: .artifacts/input/app
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          artifact-ids: ${{ needs.compose-macos.outputs.artifact_id }}
-          merge-multiple: true
-          path: .artifacts/input/native/aarch64-apple-darwin
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          artifact-ids: ${{ needs.compose-linux-x64.outputs.artifact_id }}
-          merge-multiple: true
-          path: .artifacts/input/native/x86_64-unknown-linux-gnu
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          artifact-ids: ${{ needs.compose-linux-arm64.outputs.artifact_id }}
-          merge-multiple: true
-          path: .artifacts/input/native/aarch64-unknown-linux-gnu
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          artifact-ids: ${{ needs.compose-windows.outputs.artifact_id }}
-          merge-multiple: true
-          path: .artifacts/input/native/x86_64-pc-windows-msvc
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          artifact-ids: ${{ needs.desktop-macos.outputs.artifact_id }}
-          merge-multiple: true
-          path: .artifacts/input/desktop/aarch64-apple-darwin
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          artifact-ids: ${{ needs.desktop-windows.outputs.artifact_id }}
-          merge-multiple: true
-          path: .artifacts/input/desktop/x86_64-pc-windows-msvc
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          artifact-ids: ${{ needs.desktop-linux-x64.outputs.artifact_id }}
-          merge-multiple: true
-          path: .artifacts/input/desktop/x86_64-unknown-linux-gnu
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          artifact-ids: ${{ needs.desktop-linux-arm64.outputs.artifact_id }}
-          merge-multiple: true
-          path: .artifacts/input/desktop/aarch64-unknown-linux-gnu
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          artifact-ids: ${{ needs.android.outputs.artifact_id }}
-          merge-multiple: true
-          path: .artifacts/input/mobile
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          artifact-ids: ${{ needs.ios.outputs.artifact_id }}
-          merge-multiple: true
-          path: .artifacts/input/ios
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with: {node-version: '24'}
-      - name: Assemble the complete release without rebuilding
-        run: |
-          python3 -B scripts/check-android-manifest-tool.py
-          python3 -B scripts/release.py assemble-product --input-root .artifacts/input --output .artifacts/release
-      - name: Prepare npm distribution from the complete product
-        if: contains(needs.identity.outputs.version, '-hourly.')
-        env:
-          VERSION: ${{ needs.identity.outputs.version }}
-          SOURCE_SHA: ${{ needs.identity.outputs.source_sha }}
-        run: |
-          mkdir .artifacts/npm-input
-          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc; do
-            cp ".artifacts/release/vibeface-$VERSION-$target.tar.gz" ".artifacts/release/vibeface-$VERSION-$target.tar.gz.sha256" .artifacts/npm-input/
-          done
-          node scripts/package-npm.mjs --input .artifacts/npm-input --source-commit "$SOURCE_SHA"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        id: npm-artifact
-        if: contains(needs.identity.outputs.version, '-hourly.')
-        with:
-          name: npm-package-${{ needs.identity.outputs.source_sha }}-${{ github.run_attempt }}
-          path: .artifacts/npm/*
-          if-no-files-found: error
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        id: release-artifact
-        with:
-          name: product-release-${{ needs.identity.outputs.source_sha }}-${{ github.run_attempt }}
-          path: .artifacts/release/*
-          if-no-files-found: error
-  publish-product:
-    name: Finalize complete product / publish-product
-    needs: [identity, collect, publish-app, publish-native-macos, publish-native-linux-x64, publish-native-linux-arm64, publish-native-windows, publish-desktop-macos, publish-desktop-linux-x64, publish-desktop-linux-arm64, publish-desktop-windows, publish-android, publish-ios]
-    if: >-
-      always() && !cancelled() &&
-      needs.identity.outputs.publish == 'true' && needs.collect.result == 'success' &&
-      needs.publish-app.result == 'success' && needs.publish-native-macos.result == 'success' &&
-      needs.publish-native-linux-x64.result == 'success' && needs.publish-native-linux-arm64.result == 'success' &&
-      needs.publish-native-windows.result == 'success' && needs.publish-desktop-macos.result == 'success' &&
-      needs.publish-desktop-linux-x64.result == 'success' && needs.publish-desktop-linux-arm64.result == 'success' &&
-      needs.publish-desktop-windows.result == 'success' && needs.publish-android.result == 'success' &&
-      needs.publish-ios.result == 'success'
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with: {ref: '${{ needs.identity.outputs.tag }}', fetch-depth: 0, persist-credentials: false}
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with: {artifact-ids: '${{ needs.collect.outputs.release_artifact_id }}', merge-multiple: true, path: .artifacts/release}
-      - name: Audit every original artifact and complete the Release
+      - name: Reconcile independent release consumers
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.identity.outputs.tag }}
-        run: |
-          python3 -B scripts/release.py plan --app product --tag "$RELEASE_TAG" --require-main --publish
-          python3 -B scripts/check-android-manifest-tool.py
-          python3 -B scripts/release.py publish product .artifacts/release
-  release-failed:
-    name: Mark unfinished product / release-failed
-    needs: [identity, release-start, publish-product]
-    if: >-
-      always() && needs.identity.result == 'success' && needs.identity.outputs.publish == 'true' &&
-      needs.publish-product.result != 'success'
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with: {ref: '${{ needs.identity.outputs.tag }}', fetch-depth: 0, persist-credentials: false}
-      - name: Mark the unfinished Release as failed
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.identity.outputs.tag }}
-        run: |
-          python3 -B scripts/release.py plan --app product --tag "$RELEASE_TAG" --require-main --publish
-          python3 -B scripts/release.py fail-product
-  deploy-published-product:
-    name: Deploy complete product / deploy-published-product
-    needs: [identity, publish-product]
-    if: needs.identity.outputs.publish == 'true' && needs.publish-product.result == 'success'
-    runs-on: ubuntu-24.04
-    permissions:
-      actions: write
-      contents: read
-    steps:
-      - name: Dispatch product deployment from main
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.identity.outputs.tag }}
-        run: |
-          dispatched_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          gh workflow run deploy-product.yml --repo "$GITHUB_REPOSITORY" --ref main \
-            --raw-field "tag=$RELEASE_TAG" --raw-field apply=true
-          deployment_run=''
-          for _ in $(seq 1 60); do
-            run_list="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow deploy-product.yml --branch main \
-              --event workflow_dispatch --limit 20 --json databaseId,displayTitle,createdAt 2>/dev/null || printf '[]')"
-            deployment_run="$(DISPATCHED_AT="$dispatched_at" RELEASE_TAG="$RELEASE_TAG" \
-              python3 -c 'import json, os, sys; start=os.environ["DISPATCHED_AT"]; tag=os.environ["RELEASE_TAG"]; runs=[r for r in json.loads(sys.stdin.read()) if r["createdAt"] >= start and tag in r["displayTitle"]]; print(max(runs, key=lambda r: r["createdAt"])["databaseId"] if runs else "")' <<<"$run_list")"
-            [[ -n "$deployment_run" ]] && break
-            sleep 5
-          done
-          test -n "$deployment_run"
-          for _ in $(seq 1 120); do
-            deployment_state="$(gh run view "$deployment_run" --repo "$GITHUB_REPOSITORY" \
-              --json status,conclusion 2>/dev/null || true)"
-            if [[ -n "$deployment_state" ]]; then
-              read -r deployment_status deployment_conclusion < <(
-                python3 -c 'import json, sys; value=json.load(sys.stdin); print(value.get("status", ""), value.get("conclusion", ""))' \
-                  <<<"$deployment_state"
-              )
-              if [[ "$deployment_status" == completed ]]; then
-                [[ "$deployment_conclusion" == success ]]
-                exit $?
-              fi
-            fi
-            sleep 5
-          done
-          echo "Product deployment did not reach a terminal result in time" >&2
-          exit 1
+        run: gh workflow run hourly.yml --repo "$GITHUB_REPOSITORY" --ref main
   npm:
-    name: Publish npm Hourly
-    needs: [identity, collect, publish-product]
-    if: needs.publish-product.result == 'success' && contains(needs.identity.outputs.version, '-hourly.')
+    needs: [identity, collect, publish-cli]
+    if: needs.identity.outputs.publish == 'true' && needs.publish-cli.result == 'success'
     uses: ./.github/workflows/npm-publish.yml
     with:
       tag: ${{ needs.identity.outputs.tag }}
       artifact_id: ${{ needs.collect.outputs.npm_artifact_id }}
       publish: true
-    permissions:
-      contents: read
-      actions: read
-      id-token: write
+    permissions: {contents: read, actions: read, id-token: write}

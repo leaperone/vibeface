@@ -309,9 +309,9 @@ def release_metadata(ref_type, ref_name):
         stamp = match[2]
         datetime.datetime(int(stamp[:4]), int(stamp[4:6]), int(stamp[6:8]), int(stamp[8:]))
     if ref_type == "tag":
-        if ref_name != f"v{version}":
+        if ref_name != f"cli-v{version}":
             raise ValueError("Release tag must exactly match the Cargo version")
-        release.validate_source(git("rev-parse", "HEAD").decode().strip(), "product")
+        release.validate_source(git("rev-parse", "HEAD").decode().strip(), "cli")
     return {"version": version, "msrv": package["rust_version"], "channel": channel, "prerelease": channel != "stable"}
 
 
@@ -507,8 +507,10 @@ def self_test():
     focused_self_test()
     subprocess.run(["python3", str(Path(__file__).resolve().parent / "check-release-workflow.py"), "--self-test"], check=True)
     subprocess.run(["python3", str(Path(__file__).resolve().parent / "deploy.py"), "self-test"], check=True)
-    subprocess.run(["python3", str(Path(__file__).resolve().parent / "core_release.py"), "self-test"], check=True)
-    subprocess.run(["python3", str(Path(__file__).resolve().parent / "core_hourly.py"), "--self-test"], check=True)
+    subprocess.run(["python3", str(Path(__file__).resolve().parent / "release.py"), "self-test"], check=True)
+    subprocess.run(["python3", str(Path(__file__).resolve().parent / "hourly.py"), "--self-test"], check=True)
+    subprocess.run(["python3", str(Path(__file__).resolve().parent / "release-dispatch.py"), "--self-test"], check=True)
+    subprocess.run(["python3", "-B", str(Path(__file__).resolve().parent / "test_release_trains.py")], check=True)
     subprocess.run(["python3", str(Path(__file__).resolve().parent / "deploy-run.py"), "self-test"], check=True)
     subprocess.run(["python3", str(Path(__file__).resolve().parent / "deploy-activate.py"), "--self-test"], check=True)
     subprocess.run(["python3", str(Path(__file__).resolve().parent.parent / "deploy/runtime.py"), "self-test"], check=True)
@@ -765,9 +767,11 @@ def self_test():
             cargo_metadata = {"packages": [{"name": "vibeface", "version": version, "rust_version": "1.89"}]}
             with patch("subprocess.check_output", return_value=json.dumps(cargo_metadata)), patch(f"{__name__}.git", return_value=b"a" * 40), patch("release.validate_source") as ancestor:
                 assert release_metadata("branch", "")["channel"] == channel
-                assert release_metadata("tag", f"v{version}")["prerelease"] == (channel != "stable")
-                ancestor.assert_called_once_with("a" * 40, "product")
-                expect_failure(lambda: release_metadata("tag", "v0.0.0"))
+                assert release_metadata("tag", f"cli-v{version}")["prerelease"] == (channel != "stable")
+                ancestor.assert_called_once_with("a" * 40, "cli")
+                expect_failure(lambda: release_metadata("tag", "cli-v0.0.0"))
+                for other in ("core", "app", "desktop", "mobile", "www"):
+                    expect_failure(lambda: release_metadata("tag", f"{other}-v{version}"))
         for version in ("01.2.3", "1.2.3-nightly.20261019.1", "1.2.3-hourly.2026022912", "1.2.3-hourly.2026101924", "1.2.3-hourly.20261019", "1.2.3-hourly.2026101900.1", "1.2.3+build"):
             cargo_metadata = {"packages": [{"name": "vibeface", "version": version, "rust_version": "1.89"}]}
             with patch("subprocess.check_output", return_value=json.dumps(cargo_metadata)):
@@ -793,9 +797,6 @@ def self_test():
     assert '--filter "vibeface-mobile..."' in web_build, "Web behavior tests read Mobile package helpers"
     assert "pnpm --filter @vibeface/secure-native run typecheck" not in web_build
     assert "pnpm --filter vibeface-mobile run typecheck" not in web_build
-    standalone = (root / ".github/workflows/release.yml").read_text()
-    assert "pnpm --filter @vibeface/secure-native run typecheck" in standalone
-    assert "pnpm --filter vibeface-mobile run typecheck" in standalone
     concurrency = workflow.split("concurrency:\n", 1)[1].split("\npermissions:", 1)[0]
     assert "ci-core-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}" in concurrency
     assert "cancel-in-progress: ${{ inputs.package_policy != 'linux-native' && github.run_attempt == 1 && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}" in concurrency
@@ -1222,7 +1223,7 @@ def release_privacy_test(root, scratch):
         source.write_text('#[cfg(not(privacy_flag))] compile_error!("caller flag lost"); fn main() { println!("{}", file!()); }')
         binary = repo / "target/x86_64-unknown-linux-gnu/release/vibeface"
         binary.parent.mkdir(parents=True)
-        environment = {**os.environ, "CARGO_TARGET_DIR": str(repo / "target"), "RUSTFLAGS": "--cfg privacy_flag"}
+        environment = {**os.environ, "CARGO_TARGET_DIR": str(repo / "target"), "RUSTFLAGS": "--cfg privacy_flag", "PYTHONDONTWRITEBYTECODE": "1"}
         environment.pop("CARGO_ENCODED_RUSTFLAGS", None)
         for encoded in (None, "--cfg\x1fprivacy_flag", ""):
             if encoded is not None:
@@ -1238,6 +1239,11 @@ def release_privacy_test(root, scratch):
             assert subprocess.check_output([str(binary)], text=True).strip() == "/vibeface/private build.rs"
         (repo / "packages/docs").mkdir(parents=True)
         (repo / "packages/docs/guide.md").write_text("public guide")
+        for app, value in (("cli", "1.2.3-hourly.2026111400"), ("core", "2.3.4")):
+            manifest = repo / f"apps/{app}/Cargo.toml"
+            manifest.write_text(re.sub(r'^version = "[^"]+"$', f'version = "{value}"', manifest.read_text(), count=1, flags=re.M))
+        app_manifest = repo / "apps/app/package.json"
+        app_manifest.write_text(json.dumps(json.loads(app_manifest.read_text()) | {"version": "3.4.5-rc.2"}) + "\n")
         (repo / ".gitignore").write_text(".artifacts/\ntarget/\nbin/\nprivate build.rs\napps/app/generated/\napps/app/dist/\n.env\npackages/docs/untracked-note.md\ncargo-called\n")
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
         subprocess.run(["git", "add", "."], cwd=repo, check=True)
@@ -1264,7 +1270,7 @@ def release_privacy_test(root, scratch):
         environment.update({name: "" for name in ("VIBEFACE_CODESIGN_IDENTITY", "VIBEFACE_NOTARY_KEY", "VIBEFACE_NOTARY_KEY_ID", "VIBEFACE_NOTARY_ISSUER")})
         fake_cargo = repo / "bin/cargo"
         fake_cargo.parent.mkdir()
-        fake_cargo.write_text('#!/bin/sh\nset -eu\ntouch "$CARGO_MARKER"\nmkdir -p "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release"\nprintf "#!/bin/sh\\nprintf \\\"vibeface 0.0.1\\\\n\\\"\\n" > "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/vibeface"\nprintf "#!/bin/sh\\nprintf \\\"vibeface-core 0.0.1\\\\n\\\"\\n" > "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/vibeface-core"\nchmod +x "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/vibeface" "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/vibeface-core"\n')
+        fake_cargo.write_text('#!/bin/sh\nset -eu\ntouch "$CARGO_MARKER"\nmkdir -p "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release"\nprintf "#!/bin/sh\\nprintf \\\"vibeface 1.2.3-hourly.2026111400\\\\n\\\"\\n" > "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/vibeface"\nprintf "#!/bin/sh\\nprintf \\\"vibeface-core 2.3.4\\\\n\\\"\\n" > "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/vibeface-core"\nchmod +x "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/vibeface" "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/vibeface-core"\n')
         fake_cargo.chmod(0o755)
         marker = repo / "cargo-called"
         environment.update(PATH=f"{fake_cargo.parent}{os.pathsep}{environment['PATH']}", CARGO_MARKER=str(marker))
@@ -1281,12 +1287,27 @@ def release_privacy_test(root, scratch):
             assert not any(entry.name.endswith(("/.env", "/untracked-note.md")) for entry in archive.getmembers())
             assert archive.getmember(f"{package}/vibeface").mode & 0o111
             assert archive.getmember(f"{package}/vibeface-core").mode & 0o111
+            info = json.load(archive.extractfile(f"{package}/BUILD-INFO.json"))
+            assert [info[key] for key in ("version", "core_version", "app_version")] == ["1.2.3-hourly.2026111400", "2.3.4", "3.4.5-rc.2"]
+            unpacked = repo / ".artifacts/sealed-fixture"
+            archive.extractall(unpacked, filter="data")
+        from unittest.mock import patch
+        with patch.object(release, "ROOT", repo), patch.dict(os.environ, {"PACKAGE_TARGET": "x86_64-unknown-linux-gnu"}):
+            sealed = release.seal_bundle(unpacked / package,
+                                         {"version": "2.3.4", "source_commit": "b" * 40},
+                                         {"version": "3.4.5-rc.2", "source_commit": "c" * 40})
+        assert json.loads((unpacked / package / "BUILD-INFO.json").read_text()) == {
+            "version": "1.2.3-hourly.2026111400", "target": "x86_64-unknown-linux-gnu", "source_commit": info["source_commit"],
+            "update_protocol": 1, "data_epoch": 1, "core_version": "2.3.4", "core_source_commit": "b" * 40,
+            "app_version": "3.4.5-rc.2", "app_source_commit": "c" * 40,
+        }
+        release.verify_build_info(sealed)
         (repo / "scripts/release-rustflags.py").write_text('raise RuntimeError("fixture failure")')
         generated()
         marker.unlink()
         assert subprocess.run(["bash", str(repo / "scripts/package-node.sh"), "--target", "x86_64-unknown-linux-gnu"], env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode != 0
         assert not marker.exists(), "a failed privacy setup must stop the build"
-    print("Release privacy self-test passed: caller flags, source paths, archive owners and extended attributes")
+    print("Release privacy self-test passed: independent nine-field bundle identities, caller flags, source paths, archive owners and extended attributes")
 
 
 def expect_failure(check):

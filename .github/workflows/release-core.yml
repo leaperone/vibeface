@@ -1,164 +1,113 @@
 name: Release / Core
-run-name: >-
-  Release / Core / ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || github.ref_name }} /
-  ${{ (github.event_name == 'push' || inputs.publish) && 'publish' || 'build only' }}
-
+run-name: Release / Core / ${{ inputs.tag || github.ref_name }} / ${{ (github.event_name == 'push' || inputs.publish) && 'publish' || 'build only' }}
 on:
   push:
     tags: ['core-v*']
   workflow_dispatch:
     inputs:
-      tag:
-        description: Exact Core tag; leave empty for a build-only run
-        type: string
-        default: ''
-      publish:
-        description: Publish an existing Core tag after verification
-        type: boolean
-        default: false
-
+      tag: {description: Exact application tag, type: string, default: ''}
+      publish: {description: Publish this exact tag, type: boolean, default: false}
 permissions:
   contents: read
-
+  actions: read
 concurrency:
-  group: core-release-${{ inputs.tag || github.ref_name }}-${{ github.event_name == 'workflow_dispatch' && !inputs.publish && github.run_id || 'publish' }}
+  group: release-core-${{ inputs.tag || github.ref_name }}-${{ github.event_name == 'workflow_dispatch' && !inputs.publish && github.run_id || 'publish' }}
   cancel-in-progress: false
-
 jobs:
   identity:
-    name: Validate Core release identity
+    name: Validate core release identity
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      actions: read
+    permissions: {contents: read, actions: read}
     outputs:
-      tag: ${{ steps.plan.outputs.tag }}
+      app: ${{ steps.plan.outputs.app }}
       version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
       source_sha: ${{ steps.plan.outputs.source_commit }}
       publish: ${{ steps.plan.outputs.publish }}
+      runtime_tag: ${{ steps.plan.outputs.runtime_tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with: {fetch-depth: 0, persist-credentials: false}
-      - id: plan
-        name: Validate exact Core tag, source and CI
+      - name: Validate exact tag and source
+        id: plan
         env:
-          CORE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name || '') }}
+          RELEASE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name || '') }}
           PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
           GH_TOKEN: ${{ github.token }}
-        run: |
-          args=(--tag "$CORE_TAG")
-          if [[ "$PUBLISH" == true ]]; then args+=(--require-main --publish); fi
-          python3 -B scripts/core_release.py plan "${args[@]}" --github-output "$GITHUB_OUTPUT"
-          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
-
-  build:
-    name: Build Core / x86_64 Linux
+          WINDOWS_SIGNING_CONFIGURED: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 != '' }}
+          IOS_SIGNING_CONFIGURED: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 != '' && secrets.IOS_CERTIFICATE_PASSWORD != '' && secrets.IOS_PROVISIONING_PROFILE_BASE64 != '' }}
+        run: python3 -B scripts/release-entry.py --app core
+  native-macos:
+    name: Build core / macos
     needs: [identity]
-    runs-on: ubuntu-24.04
-    outputs:
-      artifact_id: ${{ steps.upload.outputs.artifact-id }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with: {ref: '${{ needs.identity.outputs.source_sha }}', persist-credentials: false}
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
-      - name: Build Core
-        run: cargo build --release --locked -p vibeface-core --target x86_64-unknown-linux-gnu
-      - name: Package and verify Core release
-        run: python3 -B scripts/core_release.py package --binary target/x86_64-unknown-linux-gnu/release/vibeface-core --output .artifacts/core
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        id: upload
-        with:
-          name: core-release-${{ needs.identity.outputs.source_sha }}-${{ github.run_attempt }}
-          path: .artifacts/core/*
-          if-no-files-found: error
-
-  publish:
-    name: Publish verified Core / publish
-    needs: [identity, build]
+    uses: ./.github/workflows/release-native.yml
+    with:
+      app: core
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runner: macos-15
+      target: aarch64-apple-darwin
+    secrets: inherit
+  native-linux-x64:
+    name: Build core / linux-x64
+    needs: [identity]
+    uses: ./.github/workflows/release-native.yml
+    with:
+      app: core
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runner: ubuntu-24.04
+      target: x86_64-unknown-linux-gnu
+    secrets: inherit
+  native-linux-arm64:
+    name: Build core / linux-arm64
+    needs: [identity]
+    uses: ./.github/workflows/release-native.yml
+    with:
+      app: core
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runner: ubuntu-24.04-arm
+      target: aarch64-unknown-linux-gnu
+    secrets: inherit
+  native-windows:
+    name: Build core / windows
+    needs: [identity]
+    uses: ./.github/workflows/release-native.yml
+    with:
+      app: core
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runner: windows-2025
+      target: x86_64-pc-windows-msvc
+    secrets: inherit
+  collect:
+    needs: [identity, native-macos, native-linux-x64, native-linux-arm64, native-windows]
+    uses: ./.github/workflows/release-collect.yml
+    with:
+      app: core
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      artifact_ids: ${{ needs.native-macos.outputs.artifact_id }},${{ needs.native-linux-x64.outputs.artifact_id }},${{ needs.native-linux-arm64.outputs.artifact_id }},${{ needs.native-windows.outputs.artifact_id }}
+  publish-core:
+    name: publish-core
+    needs: [identity, collect]
     if: needs.identity.outputs.publish == 'true'
+    uses: ./.github/workflows/release-publish.yml
+    with:
+      app: core
+      tag: ${{ needs.identity.outputs.tag }}
+      artifact_id: ${{ needs.collect.outputs.artifact_id }}
+    permissions: {contents: write, actions: read}
+  wake-consumers:
+    needs: [publish-core]
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
+    permissions: {actions: write, contents: read}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with: {ref: '${{ needs.identity.outputs.tag }}', fetch-depth: 0, persist-credentials: false}
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          artifact-ids: ${{ needs.build.outputs.artifact_id }}
-          merge-multiple: true
-          path: .artifacts/core
-      - name: Publish immutable Core release
+      - name: Reconcile independent release consumers
         env:
-          CORE_TAG: ${{ needs.identity.outputs.tag }}
           GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 -B scripts/core_release.py plan --tag "$CORE_TAG" --require-main --publish
-          python3 -B scripts/core_release.py publish --directory .artifacts/core
-
-  failed:
-    name: Mark unfinished Core release / failed
-    needs: [identity, publish]
-    if: always() && needs.identity.outputs.publish == 'true' && needs.publish.result != 'success'
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with: {ref: '${{ needs.identity.outputs.tag }}', fetch-depth: 0, persist-credentials: false}
-      - name: Mark the incomplete Core release
-        env:
-          CORE_TAG: ${{ needs.identity.outputs.tag }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 -B scripts/core_release.py plan --tag "$CORE_TAG" --require-main --publish
-          python3 - <<'PY'
-          import subprocess
-          tag = '${{ needs.identity.outputs.tag }}'
-          subprocess.run(['gh', 'release', 'edit', tag, '--repo', '${{ github.repository }}', '--notes',
-                          'FAILED — incomplete; rerun the Core release after reconciling its assets.'], check=True)
-          PY
-
+        run: gh workflow run hourly.yml --repo "$GITHUB_REPOSITORY" --ref main
   deploy:
-    name: Deploy published Core / Node
-    needs: [identity, publish]
-    if: needs.identity.outputs.publish == 'true' && needs.publish.result == 'success'
-    runs-on: ubuntu-24.04
-    permissions:
-      actions: write
-      contents: read
-    steps:
-      - name: Dispatch Node deployment from main
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CORE_TAG: ${{ needs.identity.outputs.tag }}
-        run: |
-          dispatched_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          gh workflow run deploy-node.yml --repo "$GITHUB_REPOSITORY" --ref main \
-            --raw-field "tag=$CORE_TAG" --raw-field apply=true
-          deployment_run=''
-          for _ in $(seq 1 60); do
-            run_list="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow deploy-node.yml --branch main \
-              --event workflow_dispatch --limit 20 --json databaseId,displayTitle,createdAt 2>/dev/null || printf '[]')"
-            deployment_run="$(DISPATCHED_AT="$dispatched_at" CORE_TAG="$CORE_TAG" \
-              python3 -c 'import json, os, sys; start=os.environ["DISPATCHED_AT"]; tag=os.environ["CORE_TAG"]; runs=[r for r in json.loads(sys.stdin.read()) if r["createdAt"] >= start and tag in r["displayTitle"]]; print(max(runs, key=lambda r: r["createdAt"])["databaseId"] if runs else "")' <<<"$run_list")"
-            [[ -n "$deployment_run" ]] && break
-            sleep 5
-          done
-          test -n "$deployment_run"
-          for _ in $(seq 1 120); do
-            deployment_state="$(gh run view "$deployment_run" --repo "$GITHUB_REPOSITORY" \
-              --json status,conclusion 2>/dev/null || true)"
-            if [[ -n "$deployment_state" ]]; then
-              read -r deployment_status deployment_conclusion < <(
-                python3 -c 'import json, sys; value=json.load(sys.stdin); print(value.get("status", ""), value.get("conclusion", ""))' \
-                  <<<"$deployment_state"
-              )
-              if [[ "$deployment_status" == completed ]]; then
-                [[ "$deployment_conclusion" == success ]]
-                exit $?
-              fi
-            fi
-            sleep 5
-          done
-          echo "Node deployment did not reach a terminal result in time" >&2
-          exit 1
+    needs: [identity, publish-core]
+    uses: ./.github/workflows/release-deploy.yml
+    with:
+      app: core
+      tag: ${{ needs.identity.outputs.tag }}
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+    permissions: {actions: write, contents: read}
