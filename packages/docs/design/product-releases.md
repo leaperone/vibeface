@@ -1,6 +1,6 @@
 # 产品组合发布
 
-Core、CLI、Web App、Desktop 和 Mobile 使用同一个产品版本和 `v<version>` Tag，在一个 GitHub Release 交付。`www-v<version>` 继续独立发布官网与文档。
+旧的完整产品线中，Core、CLI、Web App、Desktop 和 Mobile 使用同一个产品版本和 `v<version>` Tag，在一个 GitHub Release 交付。新的 Core train 使用 `core-v<version>` 独立交付公共 Node 的 Core。`www-v<version>` 继续独立发布官网与文档。
 
 产品版本以 CLI 的 Cargo 版本为准，Core、Web App、Desktop 和 Mobile 的发行版本必须与之相等。首个正式版前保持 `0.0.1` 基准及数据 epoch 1。各应用仍是独立构建目标，不再分别公开发布组件依赖。
 

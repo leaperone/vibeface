@@ -14,6 +14,7 @@ import shutil
 from unittest.mock import patch
 
 import release
+import core_release
 from unittest import TestCase
 
 SERVICES = ('all', 'node', 'app', 'www')
@@ -63,7 +64,47 @@ def verify(tag, manifest, published, source_sha):
     return {'tag': tag, 'source_sha': source_sha, 'version': version, 'channel': channel}
 
 
+def verify_core_manifest(tag, manifest, published, source_sha):
+    value, channel = core_release.parse_tag(tag)
+    release.require(manifest['app'] == 'core' and manifest['tag'] == tag
+                    and manifest['source_commit'] == source_sha
+                    and manifest['version'] == value and manifest['channel'] == channel,
+                    'Core release source does not match the selected tag')
+    release.require(manifest['data_epoch'] == release.control_constant('DATA_EPOCH')
+                    and manifest['update_protocol'] == release.control_constant('UPDATE_PROTOCOL'),
+                    'Core release protocol or data epoch mismatch')
+    assets = {asset['name']: asset for asset in manifest['assets']}
+    expected = {core_release.CORE_ASSET.format(version=value), core_release.CORE_CHECKSUM.format(version=value)}
+    release.require(set(assets) == {core_release.CORE_ASSET.format(version=value)}, 'Core release asset set mismatch')
+    actual = {asset['name']: asset for asset in published['assets']}
+    release.require(set(actual) == set(assets) | {core_release.MANIFEST}, 'Core release has unexpected assets')
+    return {'tag': tag, 'source_sha': source_sha, 'version': value, 'channel': channel,
+            'app': 'core', 'data_epoch': manifest['data_epoch'], 'update_protocol': manifest['update_protocol']}
+
+
 def plan(tag):
+    if tag.startswith('core-v'):
+        value, channel = core_release.parse_tag(tag)
+        published = json.loads(gh('api', f'repos/{REPOSITORY}/releases/tags/{tag}'))
+        assets = {asset['name']: asset for asset in published['assets']}
+        manifest_asset = assets.get(core_release.MANIFEST)
+        release.require(manifest_asset and manifest_asset.get('id'), 'published Core manifest is required')
+        content = gh('api', '-H', 'Accept: application/octet-stream',
+                     f"repos/{REPOSITORY}/releases/assets/{manifest_asset['id']}")
+        release.require('sha256:' + hashlib.sha256(content.encode()).hexdigest() == manifest_asset.get('digest'),
+                        'Core manifest digest mismatch')
+        manifest = json.loads(content)
+        obj = json.loads(gh('api', f'repos/{REPOSITORY}/git/ref/tags/{tag}'))['object']
+        for _ in range(16):
+            if obj['type'] == 'commit': break
+            release.require(obj['type'] == 'tag', 'Core tag must resolve to a commit')
+            obj = json.loads(gh('api', f"repos/{REPOSITORY}/git/tags/{obj['sha']}"))['object']
+        source = obj['sha']
+        subprocess.run(['git', 'fetch', '--tags', 'origin', 'main', 'refs/tags/' + tag], cwd=release.ROOT, check=True)
+        release.require(release.run('git', 'rev-parse', tag + '^{commit}') == source, 'Core tag source mismatch')
+        release.require(core_release.source_context(source) is not None, 'Core source provenance failed')
+        release.require(release.require_ci(core_release.source_context(source)) is not None, 'Core CI provenance failed')
+        return verify_core_manifest(tag, manifest, published, source) | {'service': 'node', 'targets': ['node']}
     kind, _, _ = release.parse_tag(tag)
     release.require(kind in ('product', 'www'), 'invalid deployment tag')
     published = json.loads(gh('api', f'repos/{REPOSITORY}/releases/tags/{tag}'))
@@ -98,6 +139,21 @@ def plan(tag):
 
 def previous(tag):
     """Select the last complete product release published no later than the candidate."""
+    if tag.startswith('core-v'):
+        selected = json.loads(gh('api', f'repos/{REPOSITORY}/releases/tags/{tag}'))
+        cutoff = datetime.datetime.fromisoformat(selected['published_at'].replace('Z', '+00:00'))
+        pages = json.loads(gh('api', '--paginate', '--slurp', f'repos/{REPOSITORY}/releases?per_page=100'))
+        candidates = []
+        for published in [item for page in pages for item in page]:
+            name = published['tag_name']
+            if published['draft'] or name == tag or not re.fullmatch('core-v' + release.VERSION, name):
+                continue
+            date = datetime.datetime.fromisoformat(published['published_at'].replace('Z', '+00:00'))
+            if date <= cutoff and core_release.MANIFEST in {a['name'] for a in published['assets']}:
+                candidates.append((date, name))
+        if not candidates:
+            return None
+        return plan(max(candidates)[1])
     kind, _, _ = release.parse_tag(tag)
     release.require(kind == 'product', 'Core rehearsal requires a product release')
     selected = json.loads(gh('api', f'repos/{REPOSITORY}/releases/tags/{tag}'))
@@ -132,6 +188,9 @@ def previous(tag):
 
 def selection(service, tag):
     release.require(service in SERVICES, 'invalid deployment service')
+    if tag.startswith('core-v'):
+        release.require(service == 'node', 'Core releases can only deploy the public Node')
+        return ['node']
     kind, _, _ = release.parse_tag(tag)
     release.require((service == 'www') == (kind == 'www'), 'website deployments require a www tag; other services require a product tag')
     return ['node', 'app'] if service == 'all' else [service]
@@ -153,6 +212,22 @@ def prepare(service, tag, output):
     output = Path(output)
     release.require(not output.exists(), 'deployment output already exists')
     output.mkdir(parents=True)
+    if tag.startswith('core-v'):
+        download = output / 'downloads'; download.mkdir(exist_ok=True)
+        for name in (core_release.MANIFEST,
+                     core_release.CORE_ASSET.format(version=info['version']),
+                     core_release.CORE_CHECKSUM.format(version=info['version'])):
+            result = subprocess.run(['gh', 'release', 'download', tag, '--repo', REPOSITORY,
+                                     '--pattern', name, '--dir', str(download)], capture_output=True, text=True)
+            release.require(result.returncode == 0, 'published Core component download failed')
+        manifest = core_release.verify_manifest(download)
+        context = output / 'core'; context.mkdir()
+        archive = download / core_release.CORE_ASSET.format(version=info['version'])
+        unpacked = release.unpack(archive, context / 'unpacked')
+        shutil.move(str(unpacked), str(context / 'component'))
+        (context / 'unpacked').rmdir()
+        (output / 'deployment.json').write_text(json.dumps(info, indent=2) + '\n')
+        return info
     raw = gh('api', f'repos/{REPOSITORY}/releases/tags/{tag}')
     published = json.loads(raw)
     manifests = [a for a in published['assets'] if a['name'] == 'release.json']
@@ -340,6 +415,11 @@ def self_test():
         assert dispatch.call_count == 1, 'retried a deployment with an unknown result'
     assert selection('all', tag) == ['node', 'app']
     assert selection('www', 'www-v0.0.1') == ['www']
+    core_tag = 'core-v0.0.1-hourly.2026111300'
+    assert selection('node', core_tag) == ['node']
+    for service in ('all', 'app', 'www'):
+        with TestCase().assertRaises(ValueError, msg='accepted Core tag for an incompatible service'):
+            selection(service, core_tag)
     for service, wrong_tag in (('www', tag), ('node', 'www-v0.0.1'), ('app', 'www-v0.0.1'),
                                ('all', 'www-v0.0.1'), ('invalid', tag)):
         with patch(__name__ + '.plan') as verify_plan, patch(__name__ + '.gh') as command:

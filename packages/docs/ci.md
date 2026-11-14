@@ -17,7 +17,9 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | --- | --- | --- | --- |
 | `ci.yml` | CI / Core | main push、merge queue、手动、复用调用 | 自动按累计差异选核心检查；手动与复用调用执行扩展检查 |
 | `hourly.yml` | Release / Hourly | 每小时、手动 | 为最新 CI 通过的 main 提交创建当小时 Hourly Tag 并派发产品发布；不运行 Core 检查 |
+| `core-hourly.yml` | Release / Core Hourly | 每小时、手动 | 为最新 CI 通过的 main 提交创建 Core Tag 并派发 Core 发布；只面向公共 Node |
 | `release.yml` | Release / Product | `v*` push、手动 | 固定产品组；完整发布后自动派发 Node + App，手动默认只构建 |
+| `release-core.yml` | Release / Core | `core-v*` push、手动 | 只发布公共 Node 的 x86_64 Core；完整发布后自动派发 Node |
 | `release-www.yml` | Release / Website | `www-v*` push、手动 | 固定官网组；完整发布后自动派发官网，手动默认只构建 |
 | `npm-publish.yml` | Release / npm Hourly | 产品发布调用、手动 | 验证完整产品发布的原始 npm 制品；手动默认只验证 |
 | `deploy-node.yml`、`deploy-app.yml`、`deploy-www.yml`、`deploy-product.yml` | Deploy / Node、Web App、Website、Product services | 自动派发或手动 | 固定目标部署，`tag` 必填；手动运行 `apply=false` 默认构建验证与排练 |

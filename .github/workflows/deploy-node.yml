@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Exact published product tag
+        description: Exact published product or Core train tag
         type: string
         required: true
       apply:

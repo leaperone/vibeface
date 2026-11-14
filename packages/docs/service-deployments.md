@@ -5,7 +5,7 @@ description: 使用已发布制品，在本仓库部署官方容器服务。
 
 # 发布官方服务部署
 
-完整制品发布和服务部署通过精确 Tag 连接。`release product` 或 `release www` 完成公开 Release 后，对应发布工作流会自动派发服务部署；部署仍只消费已经完成发布的精确 Tag，不使用分支、`latest` 或未完成 Release。
+完整制品发布和服务部署通过精确 Tag 连接。`release product`、`release core` 或 `release www` 完成公开 Release 后，对应发布工作流会自动派发服务部署；部署仍只消费已经完成发布的精确 Tag，不使用分支、`latest` 或未完成 Release。
 
 所有部署命令、Dockerfile、Compose 与 GitHub Actions 都在本仓库维护。部署不依赖另一个发布仓库，不重新编译产品，不发布新的产品版本。
 
@@ -23,7 +23,7 @@ python3 scripts/deploy.py release --service all --tag '<PRODUCT_TAG>'
 | 目标 | GitHub Actions 入口 | 交付内容 |
 | --- | --- | --- |
 | `all` | Deploy / Product services（`deploy-product.yml`） | 在同一次运行中串行部署官方公共节点和 App，不含官网 |
-| `node` | Deploy / Node（`deploy-node.yml`） | 香港官方公共节点的 Core 容器：全网 bootstrap 节点、开放 relay 和浏览器接入，各有限额，不含前端文件 |
+| `node` | Deploy / Node（`deploy-node.yml`） | 香港官方公共节点的 Core 容器；接受旧产品 Tag 或 `core-v<version>` Core train Tag |
 | `app` | Deploy / Web App（`deploy-app.yml`） | 独立网页静态容器，只提供静态文件；网页直接连公共节点的 `gateway_url` |
 | `www` | Deploy / Website（`deploy-www.yml`） | 独立官网静态容器，使用精确 `www-v<version>` Tag |
 
