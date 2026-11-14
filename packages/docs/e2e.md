@@ -111,11 +111,11 @@ canonical 入口监督 native 与 tracked restart observer 两个同级子进程
 
 `prepare`、`confirm_batch`、`accept_batch` 只有在结构化响应明确返回提交前的固定错误 `another delivery operation is in progress` 时，才沿既有 120 秒阶段上限等待重试，原 UUID 和参数不变。超时、网络异常、未知结果及其他拒绝直接失败，不自动重发。
 
-GitHub Actions `delivery-live` 使用 `ubuntu-24.04` 原生 x86 runner，核对宿主 Linux/x86_64，消费同 run 同 SHA 的 Linux/crypto/web 制品。job 的物理上限仍为 360 分钟，这是独立的外部限制，可能先于原生阶段完成而终止 job，不代表具体 prove 耗尽或完整实验通过。不能凭容器目标架构证明没有 emulation，也不能把已停止 CI 的链称为可恢复。健康的同一运行只能在原容器、原链与原业务期限内继续等待；停止后若重新验收，必须创建完整新链、钱包、预算、订单和五份新 proof，保留旧 FAIL，不通过新 UUID 或期限掩盖原失败。
+付费交付真实证明实验已从 Actions 移除，不再提供 `delivery-live` job。宿主命令 `scripts/run-delivery-live.py` 仍可在本机执行；它核对宿主 Linux/x86_64，消费当前 HEAD 的 Linux/crypto/web 制品。不能凭容器目标架构证明没有 emulation，也不能把已停止的链称为可恢复。健康的同一运行只能在原容器、原链与原业务期限内继续等待；停止后若重新验收，必须创建完整新链、钱包、预算、订单和五份新 proof，保留旧 FAIL，不通过新 UUID 或期限掩盖原失败。
 
 容器核对 package checksum、`BUILD-INFO.json`、当前 JS/WASM 和 build-input receipts，先以真实 Web 资源进程检查实测 package 的 libc。仅当日志实际证明 GLIBC 不兼容时，按当前 clean HEAD 和现有 release flags 重建 CLI/Core，并再次检查真实资源进程。package 的检查状态、实际使用的 binary 来源及摘要分别写入 `artifact-provenance.json`，不能用 bare binary hash 自证源码来源。随后调用固定 guest 安装器和官方 `build.sh`，核对 image/profile/ELF，生成配置，再由 native 子进程经既有 `--protected-config` 调用 verify-node 的 `delivery_protected_acceptance` helper。Web 资源进程检查不代表渲染验收。
 
-输出位于 `.artifacts/vdp/protected-runs/<run-id>/`；可用 `--protected-run-dir` 指定另一个全新任务目录。只上传 launcher 输出或 `GITHUB_OUTPUT` 的 `public-directory` 所指安全目录，实际路径为本轮 run 的 `public-export-<opaque>/`。其中包括逐项认证且当前摘要匹配的 receipts/metadata、原链公开观察、制品来源、资源状态和最终摘要。导出的 `progress.json` 只保留受控状态与合格清单，完整原生终态结果由摘要认证的 `native-result.json` 保留。
+输出位于 `.artifacts/vdp/protected-runs/<run-id>/`；可用 `--protected-run-dir` 指定另一个全新任务目录。公开导出目录是本轮 run 的 `public-export-<opaque>/`。其中包括逐项认证且当前摘要匹配的 receipts/metadata、原链公开观察、制品来源、资源状态和最终摘要。导出的 `progress.json` 只保留受控状态与合格清单，完整原生终态结果由摘要认证的 `native-result.json` 保留。
 
 observer 只导出固定字段投影 `restart-observer-summary.json`，包含受控状态、计数、条件布尔、相对 run/配置内容绑定与 script/prover/native-result 摘要，以及 supervisor 实际 wait 得到的两个退出码。原 native 全通过、observer 完整窗口全通过、两者真实 exit0 才能整体 PASS。result 自称 PASS、observer 尚未退出、缺窗或 INCONCLUSIVE 均不够。账户原始快照、RPC payload、私有 observer result/诊断不能导出。原生 get 的 proof deadline 诊断保持中性，同一句 Core 错误也可能来自 info30秒或 verify120秒；`node_proof_timeout_seconds=7200` 是 prove 配置，不单独证明具体耗时。
 

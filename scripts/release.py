@@ -138,18 +138,6 @@ def validate_source(source, app, root=None):
     return hourly.source_context(source, app, root=root or ROOT)
 
 
-def source_workflows(source):
-    require(re.fullmatch(COMMIT, source), 'invalid workflow source')
-    return set(run('git', 'ls-tree', '-r', '--name-only', source, '--', '.github/workflows').splitlines())
-
-
-def release_workflow(source, app):
-    require(app in APPS, 'unknown release application')
-    name = '.github/workflows/' + WORKFLOWS[app]
-    require(name in source_workflows(source), 'release source lacks its application workflow')
-    return name, {}
-
-
 def require_ci(context):
     source = context['ci_source_commit']
     require(isinstance(source, str) and re.fullmatch(COMMIT, source), 'invalid CI source commit')
