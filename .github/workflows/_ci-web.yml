@@ -29,7 +29,9 @@ jobs:
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
       - name: Build and typecheck the static web client
-        run: bash scripts/build-web.sh
+        run: |
+          bash scripts/build-web.sh
+          git diff --exit-code
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: web-${{ inputs.source_sha }}
