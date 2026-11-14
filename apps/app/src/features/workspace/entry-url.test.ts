@@ -396,13 +396,13 @@ test("workspace preserves bot and message requests while routing native decision
         }
         negativeOverride = {}
         await memoryOutbox.put({ ...item, entry_device_id: undefined })
-        await assert.rejects(render().queryInput(head), /当前设备没有这条未确认输入记录/)
+        await assert.rejects(render().queryInput(head), /当前连接的执行设备未找到这条输入/)
         assert.equal(queries.at(-1)?.original_input, undefined, 'an older unbound unknown cannot infer its entry from this connection')
         const missingInput = render().pendingMessages.find((item) => item.message_id === head.message_id)
         assert.equal(missingInput?.delivery, 'saved')
         assert.equal(missingInput?.rejection_code, 'input_missing')
         const missingQueries = queries.length
-        await assert.rejects(render().queryInput(head), /当前设备没有这条未确认输入记录/)
+        await assert.rejects(render().queryInput(head), /当前连接的执行设备未找到这条输入/)
         assert.equal(queries.length, missingQueries, 'a local missing-input marker stops repeated receipt RPCs')
 
         connection.entry.device_id = connection.info.device_id = 'another-entry'
@@ -2569,12 +2569,15 @@ test('both pending input controls retry only a matching safe refusal and keep al
       assert.match(componentText(render()), /尚未确认原设备是否保存这条输入/)
       assert.ok(button('确认原设备并查询'))
       assert.ok(button('不再发送'))
-      pending = { ...accepted, entry_device_id: undefined, delivery: 'saved', receipt: undefined, rejected: '当前设备没有这条未确认输入记录，原内容已保留，未重新发送。', rejection_code: 'input_missing' }
+      pending = { ...accepted, entry_device_id: undefined, delivery: 'saved', receipt: undefined, rejected: '当前连接的执行设备未找到这条输入，内容仍保存在此浏览器的本地待发送队列，未重新发送。', rejection_code: 'input_missing' }
       assert.equal(button('重试原输入'), undefined)
-      assert.match(componentText(render()), /当前设备没有这条输入记录，未重新发送/)
+      assert.equal(button('查询结果'), undefined)
+      assert.match(componentText(render()), /当前连接的执行设备未找到这条输入/)
       assert.ok(button('确认原设备并查询'))
       assert.ok(button('移除本地残留'))
       await press('移除本地残留')
+      assert.ok(button('确认移除'))
+      await press('确认移除')
       shared.connectionOnline = false; assert.equal(button('确认原设备并查询'), undefined); shared.connectionOnline = true
       for (const marker of [{ release_expected_event: 'c'.repeat(64) }, { release_command_id: 'a'.repeat(64) }]) {
         const legacy = pending

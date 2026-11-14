@@ -47,7 +47,7 @@ type AttachmentFile = { name: string; arrayBuffer(): Promise<ArrayBuffer> }
 type NotificationButton = { label: string; disabled: boolean; state: "off" | "on" | "unsupported" | "denied" }
 const soleTab: Tabs = { leader: () => true, post() {}, listen: () => () => {} }
 const faceSuperseded = "Bot 的长相刚在别处改过，之前没确认的那次修改没有再发送。"
-const inputMissingReason = '当前设备没有这条未确认输入记录，原内容已保留，未重新发送。'
+const inputMissingReason = '当前连接的执行设备未找到这条输入，内容仍保存在此浏览器的本地待发送队列，未重新发送。'
 const responded = (caught: unknown) => caught instanceof Error && "responded" in caught && caught.responded === true
 const inputNotFound = (caught: unknown) => caught instanceof Error && /\binput not found\b/i.test(caught.message)
 class WorkspaceCommandNotSavedError extends Error {
