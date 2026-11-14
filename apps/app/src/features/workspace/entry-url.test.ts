@@ -358,7 +358,7 @@ test("workspace preserves bot and message requests while routing native decision
         if (method !== 'input_receipt') return originalRpc(method, body)
         queries.push(structuredClone(body))
         if (missing && body.original_input !== undefined) return { accepted: false, code: 'input_not_saved', stored: false, entry_device_id: entry, network_id: 'network', client_id: 'client', conversation_id: body.conversation_id, message_id: body.message_id, target: body.target, reason: '原入口未保存这条输入。', ...negativeOverride }
-        throw new Error(missing ? 'input not found' : 'receipt query unavailable')
+        throw Object.assign(new Error(missing ? 'input not found' : 'receipt query unavailable'), { responded: missing })
       }
       try {
         failMessage = true
@@ -396,14 +396,23 @@ test("workspace preserves bot and message requests while routing native decision
         }
         negativeOverride = {}
         await memoryOutbox.put({ ...item, entry_device_id: undefined })
-        await assert.rejects(render().queryInput(head), /当前连接的执行设备未找到这条输入/)
+        await assert.rejects(render().queryInput(head), /未/)
         assert.equal(queries.at(-1)?.original_input, undefined, 'an older unbound unknown cannot infer its entry from this connection')
         const missingInput = render().pendingMessages.find((item) => item.message_id === head.message_id)
-        assert.equal(missingInput?.delivery, 'saved')
+        assert.equal(missingInput?.delivery, 'unknown', 'absence on the connected Node does not prove the original write was never executed')
         assert.equal(missingInput?.rejection_code, 'input_missing')
         const missingQueries = queries.length
-        await assert.rejects(render().queryInput(head), /当前连接的执行设备未找到这条输入/)
+        await assert.rejects(render().queryInput(head), /结果仍未确认/)
+        await assert.rejects(render().retryPendingMessage(head.message_id), /结果仍未确认/)
+        await assert.rejects(render().releaseMessagePending(head.message_id), /结果仍未确认/)
         assert.equal(queries.length, missingQueries, 'a local missing-input marker stops repeated receipt RPCs')
+        const preserved = (await memoryOutbox.all()).find((entry) => entry.key === item.key)
+        assert.deepEqual(preserved?.params, item.params, 'the signed input remains available for original-device reconciliation')
+        assert.deepEqual(preserved?.uploads, item.uploads, 'attachment bytes survive the missing-input result')
+        assert.equal(messages.length, firstMessage + 1, 'neither retry nor removal can replay an uncertain input or advance its lane')
+        await reload(); await render().refresh(); await new Promise(setImmediate)
+        assert.equal(queries.length, missingQueries, 'the pause survives remount and background refresh')
+        assert.equal(render().pendingMessages.find((item) => item.message_id === head.message_id)?.delivery, 'unknown')
 
         connection.entry.device_id = connection.info.device_id = 'another-entry'
         await assert.rejects(render().confirmInputEntry(head.message_id, entry), /原设备/)
@@ -449,6 +458,53 @@ test("workspace preserves bot and message requests while routing native decision
         transcript = previousTranscript
         outboxItems.clear()
         for (const [key, item] of previousOutbox) outboxItems.set(key, item)
+        await reload(); await render().refresh()
+      }
+    })
+    await t.test('a missing receipt pauses only a current authenticated read and retains uncertainty after original-device confirmation', async () => {
+      const previousOutbox = new Map(outboxItems), originalRpc = connection.rpc
+      const submissions = messages.length, signatures = signed.length
+      const item: OutboxItem = { key: 'network.client:message:missing-receipt', method: 'message', created_at_ms: 1, rejected: '等待查询',
+        params: { conversation_id: 'chat', message_id: 'missing-receipt', target: { kind: 'bot_main', bot_id: 'bot' }, intent: 'continue', sequence: 1, text: '原输入', report_results: true, attestation: { device_id: 'client', signature: 'original-signature' } } }
+      const input = workspaceModel.parsePendingMessage(item)
+      try {
+        outboxItems.clear(); await memoryOutbox.put(item)
+        await reload(); await render().refresh()
+        for (const failure of [new Error('input not found'), Object.assign(new Error('receipt query unavailable'), { responded: true })]) {
+          connection.rpc = async (method, body = {}) => { if (method !== 'input_receipt') return originalRpc(method, body); throw failure }
+          await assert.rejects(render().queryInput(input), (cause) => cause === failure)
+          assert.deepEqual(await memoryOutbox.all(), [item], 'a local error or a different Node refusal cannot classify a missing input')
+        }
+        connection.rpc = async (method, body = {}) => {
+          if (method !== 'input_receipt') return originalRpc(method, body)
+          baseGeneration += 1
+          throw Object.assign(new Error('input not found'), { responded: true })
+        }
+        await assert.rejects(render().queryInput(input), /连接换了/)
+        assert.deepEqual(await memoryOutbox.all(), [item], 'an old connection cannot pause a current input')
+        await reload(); await render().refresh()
+        connection.rpc = async (method, body = {}) => {
+          if (method !== 'input_receipt') return originalRpc(method, body)
+          if (body.original_input === undefined) throw Object.assign(new Error('input not found'), { responded: true })
+          assert.deepEqual(body.original_input, item.params)
+          return { message_id: input.message_id, target: input.target, stage: 'unknown', actual_turn_id: null, reason: '原设备仍有输入记录', retry_safe: false, control_event: null }
+        }
+        await assert.rejects(render().queryInput(input), /结果仍未确认/)
+        assert.equal((await memoryOutbox.all())[0]?.delivery, 'unknown', 'a legacy entry without a delivery field also remains uncertain')
+        await render().confirmInputEntry(input.message_id, connection.entry.device_id)
+        const retained = (await memoryOutbox.all())[0]
+        assert.deepEqual(retained?.params, item.params)
+        assert.equal(retained?.delivery, 'unknown')
+        assert.equal(retained?.rejection_code, undefined, 'positive receipt evidence clears the local missing marker')
+        assert.equal(retained?.rejected, undefined)
+        await render().retryPendingMessage(input.message_id)
+        await assert.rejects(render().releaseMessagePending(input.message_id), /还不能关闭/)
+        assert.equal((await memoryOutbox.all())[0]?.receipt?.stage, 'unknown')
+        assert.deepEqual([messages.length, signed.length], [submissions, signatures], 'confirming retained input cannot sign, replay or delete it')
+      } finally {
+        connection.rpc = originalRpc
+        outboxItems.clear()
+        for (const [key, value] of previousOutbox) outboxItems.set(key, value)
         await reload(); await render().refresh()
       }
     })
@@ -2569,15 +2625,14 @@ test('both pending input controls retry only a matching safe refusal and keep al
       assert.match(componentText(render()), /尚未确认原设备是否保存这条输入/)
       assert.ok(button('确认原设备并查询'))
       assert.ok(button('不再发送'))
-      pending = { ...accepted, entry_device_id: undefined, delivery: 'saved', receipt: undefined, rejected: '当前连接的执行设备未找到这条输入，内容仍保存在此浏览器的本地待发送队列，未重新发送。', rejection_code: 'input_missing' }
+      pending = { ...accepted, entry_device_id: undefined, delivery: 'unknown', receipt: undefined, rejected: '这条输入的送达结果仍未确认，原内容已保留。', rejection_code: 'input_missing' }
       assert.equal(button('重试原输入'), undefined)
       assert.equal(button('查询结果'), undefined)
-      assert.match(componentText(render()), /当前连接的执行设备未找到这条输入/)
+      assert.equal(button('不再发送'), undefined)
+      assert.equal(button('关闭提醒'), undefined)
+      assert.match(componentText(render()), /送达结果仍未确认/)
+      assert.match(componentText(render()), platform === 'web' ? /此浏览器/ : /此应用/)
       assert.ok(button('确认原设备并查询'))
-      assert.ok(button('移除本地残留'))
-      await press('移除本地残留')
-      assert.ok(button('确认移除'))
-      await press('确认移除')
       shared.connectionOnline = false; assert.equal(button('确认原设备并查询'), undefined); shared.connectionOnline = true
       for (const marker of [{ release_expected_event: 'c'.repeat(64) }, { release_command_id: 'a'.repeat(64) }]) {
         const legacy = pending
@@ -2592,7 +2647,7 @@ test('both pending input controls retry only a matching safe refusal and keep al
       shared.workspaceState.inputs = []
       assert.ok(button('重试原输入'), 'authoritative not-saved evidence exposes the existing separate retry action')
       await press('重试原输入'); assert.deepEqual(retries, ['original', 'original'])
-      await press('不再发送'); assert.deepEqual(closed, ['original', 'original', 'original', 'original'])
+      await press('不再发送'); assert.deepEqual(closed, ['original', 'original', 'original'])
       pending = { ...accepted, delivery: 'saved', receipt: undefined, rejected: undefined, rejection_code: undefined }
       assert.ok(button('不再发送'), 'a later saved input can be discarded before an unknown earlier input is retried')
     } finally { app.close() }
