@@ -4,7 +4,7 @@ from pathlib import Path
 import sys
 import zipfile
 source, output = map(Path, sys.argv[1:])
-with zipfile.ZipFile(output, 'x', compression=zipfile.ZIP_DEFLATED) as archive:
+with zipfile.ZipFile(output, 'x', compression=zipfile.ZIP_DEFLATED, strict_timestamps=False) as archive:
     for file in sorted(source.rglob('*')):
         if file.is_file():
             archive.write(file, file.relative_to(source).as_posix())
