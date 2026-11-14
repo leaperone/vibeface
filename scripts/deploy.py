@@ -111,10 +111,12 @@ def prepare(service, tag, output):
     output.mkdir(parents=True)
     downloads = output / 'downloads'
     downloads.mkdir()
-    published_info, remote, manifest_sha256 = release.published(tag)
-    release.require(published_info['app'] == info['app'], 'published app changed during preparation')
+    published_info, _, manifest_sha256 = release.published(tag)
+    release.require(published_info['app'] == info['app'] and published_info['tag'] == info['tag']
+                    and published_info['source_commit'] == info['source_sha']
+                    and manifest_sha256 == info['manifest_sha256'], 'published release changed during preparation')
     names = _selected_assets(info)
-    assets = {asset['name']: asset for asset in remote['assets']}
+    assets = {asset['name']: asset for asset in published_info['assets']}
     selected = [assets[name] for name in names if name in assets]
     release.require(len(selected) == len(names), 'published release is missing the selected component')
     release.download_assets(tag, selected, downloads)
@@ -125,7 +127,9 @@ def prepare(service, tag, output):
                 'source_commit': info['source_sha'], 'channel': info['channel'],
                 'target': CORE_TARGET if info['app'] == 'core' else None}
     component = release.verify_component(unpacked, info['app'], expected)
-    destination = output / info['app']
+    context = output / info['app']
+    context.mkdir()
+    destination = context / 'component'
     unpacked.rename(destination)
     (output / 'unpacked').rmdir()
     info = dict(info, manifest_sha256=manifest_sha256, component=component)
@@ -168,39 +172,72 @@ def self_test():
         checksum = archive.with_name(archive.name + '.sha256')
         checksum.write_text(f'{release.digest(archive)}  {archive.name}\n')
         info = {'tag': tag, 'source_sha': source, 'version': component_info['version'],
-                'channel': 'hourly', 'app': 'app', 'service': 'app', 'targets': ['app']}
+                'channel': 'hourly', 'app': 'app', 'service': 'app', 'targets': ['app'],
+                'manifest_sha256': 'd' * 64}
         remote = {'assets': [{'name': name, 'size': path.stat().st_size,
                               'digest': 'sha256:' + release.digest(path)}
                              for name, path in ((archive.name, archive), (checksum.name, checksum))]}
 
-        def copy_assets(_tag, _selected, destination):
-            shutil.copy2(archive, destination / archive.name)
-            shutil.copy2(checksum, destination / checksum.name)
+        published_info = {'app': 'app', 'tag': tag, 'version': info['version'], 'source_commit': source,
+                          'channel': 'hourly', 'assets': [
+                              {'name': path.name, 'size': path.stat().st_size, 'sha256': release.digest(path)}
+                              for path in (archive, checksum)]}
+
+        def download(args, **kwargs):
+            assert args[:3] == ['gh', 'release', 'download']
+            name = args[args.index('--pattern') + 1]
+            destination = Path(args[args.index('--dir') + 1])
+            shutil.copy2(root / name, destination / name)
+            return subprocess.CompletedProcess(args, 0)
 
         with patch(__name__ + '.execute', return_value=info), \
-                patch('release.published', return_value=(dict(info, app='app'), remote, 'd' * 64)), \
-                patch('release.download_assets', side_effect=copy_assets):
+                patch('release.published', return_value=(published_info, remote, 'd' * 64)), \
+                patch('subprocess.run', side_effect=download):
             prepared = prepare('app', tag, root / 'prepared')
         assert prepared['manifest_sha256'] == 'd' * 64
-        assert (root / 'prepared/app/web/_shell.html').read_text() == 'fixture'
+        assert (root / 'prepared/app/component/web/_shell.html').read_text() == 'fixture'
 
-        def copy_corrupt(_tag, _selected, destination):
-            (destination / archive.name).write_bytes(b'corrupt')
-            shutil.copy2(checksum, destination / checksum.name)
+        def download_corrupt(args, **kwargs):
+            name = args[args.index('--pattern') + 1]
+            destination = Path(args[args.index('--dir') + 1])
+            (destination / name).write_bytes(b'corrupt')
+            return subprocess.CompletedProcess(args, 0)
 
         with patch(__name__ + '.execute', return_value=info), \
-                patch('release.published', return_value=(dict(info, app='app'), remote, 'd' * 64)), \
-                patch('release.download_assets', side_effect=copy_corrupt), \
+                patch('release.published', return_value=(published_info, remote, 'd' * 64)), \
+                patch('subprocess.run', side_effect=download_corrupt), \
                 TestCase().assertRaises(ValueError, msg='accepted a changed component archive'):
             prepare('app', tag, root / 'corrupt')
-    print('deployment plan and service-boundary self-test passed')
+        with patch(__name__ + '.execute', return_value=info), \
+                patch('release.published', return_value=(published_info, remote, 'e' * 64)), \
+                TestCase().assertRaisesRegex(ValueError, 'changed during preparation'):
+            prepare('app', tag, root / 'changed-manifest')
+    import contextlib
+    import io
+    for service, app in (('node', 'core'), ('app', 'app'), ('www', 'www')):
+        selected_tag = app + '-v0.0.1'
+        published = {'app': app, 'tag': selected_tag, 'version': '0.0.1',
+                     'source_commit': 'a' * 40, 'channel': 'stable'}
+        output = io.StringIO()
+        with patch('release.published', return_value=(published, {}, 'b' * 64)), contextlib.redirect_stdout(output):
+            main(['plan', '--service', service, '--tag', selected_tag])
+        value = json.loads(output.getvalue())
+        assert value['service'] == service and value['targets'] == [service] and value['tag'] == selected_tag
+    with patch('release.published') as request, TestCase().assertRaisesRegex(ValueError, 'selected service'):
+        main(['plan', '--service', 'app', '--tag', 'core-v0.0.1'])
+    request.assert_not_called()
+    with contextlib.redirect_stderr(io.StringIO()), TestCase().assertRaises(SystemExit) as missing:
+        main(['plan', '--tag', 'core-v0.0.1'])
+    assert missing.exception.code == 2
+    print('deployment plan and CLI service-boundary self-test passed')
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='action', required=True)
     sub.add_parser('self-test')
     command = sub.add_parser('plan')
+    command.add_argument('--service', choices=SERVICES, required=True)
     command.add_argument('--tag', required=True)
     command = sub.add_parser('release')
     command.add_argument('--service', choices=SERVICES, required=True)
@@ -209,11 +246,11 @@ def main():
     command.add_argument('--service', choices=SERVICES, required=True)
     command.add_argument('--tag', required=True)
     command.add_argument('--output', required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.action == 'self-test':
         self_test()
     elif args.action == 'plan':
-        print(json.dumps(plan(args.tag)))
+        print(json.dumps(execute('plan', args.service, args.tag)))
     elif args.action == 'release':
         print(json.dumps(execute('release', args.service, args.tag)))
     else:
