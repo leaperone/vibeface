@@ -10,7 +10,7 @@ export type OutboxItem = {
   params: Record<string, unknown>
   created_at_ms: number
   rejected?: string
-  rejection_code?: 'input_not_saved' | 'input_conflict'
+  rejection_code?: 'input_not_saved' | 'input_conflict' | 'input_missing'
   /** Local message bytes stay here until the Node has the signed input. */
   uploads?: { hash: string; size: number; name: string; data: string }[]
   delivery?: 'saved' | 'uploading' | 'submitting' | 'accepted' | 'unknown'

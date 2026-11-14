@@ -132,7 +132,7 @@ test('a persisted unknown input retains the original signature, attachment bytes
   assert.equal(parseInputReceipt({ ...safe, control_event: 'A'.repeat(64) }).control_event, 'A'.repeat(64))
   for (const control_event of [undefined, null, 1, '', 'a'.repeat(63), 'g'.repeat(64)]) assert.throws(() => parseInputReceipt({ ...safe, control_event }))
   assert.throws(() => parseInputReceipt({ ...receipt, control_event: undefined }))
-  for (const rejection_code of ['input_not_saved', 'input_conflict'] satisfies NonNullable<OutboxItem['rejection_code']>[]) assert.equal(parsePendingMessage({ ...item, rejection_code }).rejection_code, rejection_code)
+  for (const rejection_code of ['input_not_saved', 'input_conflict', 'input_missing'] satisfies NonNullable<OutboxItem['rejection_code']>[]) assert.equal(parsePendingMessage({ ...item, rejection_code }).rejection_code, rejection_code)
   assert.throws(() => parseInputReceipt({ ...receipt, stage: 'read' }))
   for (const stage of ['unknown', 'submitting', 'provider_accepted', 'associated']) assert.throws(() => parseInputReceipt({ ...safe, stage }))
 })

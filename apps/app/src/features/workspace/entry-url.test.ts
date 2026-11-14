@@ -396,9 +396,14 @@ test("workspace preserves bot and message requests while routing native decision
         }
         negativeOverride = {}
         await memoryOutbox.put({ ...item, entry_device_id: undefined })
-        await assert.rejects(render().queryInput(head), /input not found/)
+        await assert.rejects(render().queryInput(head), /当前设备没有这条未确认输入记录/)
         assert.equal(queries.at(-1)?.original_input, undefined, 'an older unbound unknown cannot infer its entry from this connection')
-        assert.equal(render().pendingMessages.find((item) => item.message_id === head.message_id)?.delivery, 'unknown')
+        const missingInput = render().pendingMessages.find((item) => item.message_id === head.message_id)
+        assert.equal(missingInput?.delivery, 'saved')
+        assert.equal(missingInput?.rejection_code, 'input_missing')
+        const missingQueries = queries.length
+        await assert.rejects(render().queryInput(head), /当前设备没有这条未确认输入记录/)
+        assert.equal(queries.length, missingQueries, 'a local missing-input marker stops repeated receipt RPCs')
 
         connection.entry.device_id = connection.info.device_id = 'another-entry'
         await assert.rejects(render().confirmInputEntry(head.message_id, entry), /原设备/)
@@ -2564,6 +2569,12 @@ test('both pending input controls retry only a matching safe refusal and keep al
       assert.match(componentText(render()), /尚未确认原设备是否保存这条输入/)
       assert.ok(button('确认原设备并查询'))
       assert.ok(button('不再发送'))
+      pending = { ...accepted, entry_device_id: undefined, delivery: 'saved', receipt: undefined, rejected: '当前设备没有这条未确认输入记录，原内容已保留，未重新发送。', rejection_code: 'input_missing' }
+      assert.equal(button('重试原输入'), undefined)
+      assert.match(componentText(render()), /当前设备没有这条输入记录，未重新发送/)
+      assert.ok(button('确认原设备并查询'))
+      assert.ok(button('移除本地残留'))
+      await press('移除本地残留')
       shared.connectionOnline = false; assert.equal(button('确认原设备并查询'), undefined); shared.connectionOnline = true
       for (const marker of [{ release_expected_event: 'c'.repeat(64) }, { release_command_id: 'a'.repeat(64) }]) {
         const legacy = pending
@@ -2578,7 +2589,7 @@ test('both pending input controls retry only a matching safe refusal and keep al
       shared.workspaceState.inputs = []
       assert.ok(button('重试原输入'), 'authoritative not-saved evidence exposes the existing separate retry action')
       await press('重试原输入'); assert.deepEqual(retries, ['original', 'original'])
-      await press('不再发送'); assert.deepEqual(closed, ['original', 'original', 'original'])
+      await press('不再发送'); assert.deepEqual(closed, ['original', 'original', 'original', 'original'])
       pending = { ...accepted, delivery: 'saved', receipt: undefined, rejected: undefined, rejection_code: undefined }
       assert.ok(button('不再发送'), 'a later saved input can be discarded before an unknown earlier input is retried')
     } finally { app.close() }
