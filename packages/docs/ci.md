@@ -165,7 +165,7 @@ Linux 组包 cache 另外覆盖独立 probe workspace 的 `.artifacts/delivery-p
 
 CI 不使用真实 AI Provider 或模型密钥。各模式都使用受控 SDK 和 App Server 夹具，`--phase5` 不启动 App Server。模拟协议通过不能证明真实模型理解需求或正确选择工具。
 
-产品 `v<version>` 与官网 `www-v<version>` 分别进入发布路径，必须匹配声明版本，并通过同一共享来源门验证 main 源码或受信机械 Hourly 提交。产品并行构建 Web、四个原生目标、Android 和 iOS，各平台再按自身输入组包并构建桌面 App。每组校验后立即向同一个公开 Release 追加附件，完整审计完成后才追加全局 `release.json`。`publish=false` 手动入口只验证并生成制品。完整 Release 发布后，对应发布工作流按 Tag 自动派发产品或官网部署；独立部署命令仍可显式选择已发布的 Stable、RC 或 Hourly Tag；派发成功不代表部署成功。详见 [构建与发布](releasing.md)。
+产品 `v<version>` 与官网 `www-v<version>` 分别进入发布路径，必须匹配声明版本，并通过同一共享来源门验证 main 源码或受信机械 Hourly 提交。产品并行构建 Web、四个原生目标、Android 和 iOS，各平台再按自身输入组包并构建桌面 App。每组校验后立即向同一个公开 Release 追加附件，完整审计完成后才追加全局 `release.json`。`publish=false` 手动入口只验证并生成制品。完整 Release 发布后，对应发布工作流按 Tag 自动派发产品或官网部署，并等待部署工作流终态；独立部署命令仍可显式选择已发布的 Stable、RC 或 Hourly Tag，手动派发仍需继续核对运行结果。详见 [构建与发布](releasing.md)。
 
 ## 本地按改动补充验收
 

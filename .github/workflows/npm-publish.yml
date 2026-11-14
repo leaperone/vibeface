@@ -38,7 +38,7 @@ jobs:
   npm:
     name: Publish npm Hourly / npm
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     environment: npm-release
     permissions:
       contents: read

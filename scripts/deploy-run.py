@@ -233,7 +233,7 @@ def activate(service, output):
         ssh = ['ssh', *options, '-p', port, remote]
         stage = subprocess.check_output([*ssh, 'umask 077; mktemp -d /tmp/vibeface-deploy.XXXXXXXX'], text=True).strip()
         release.require(re.fullmatch(r'/tmp/vibeface-deploy\.[a-zA-Z0-9]+', stage), 'invalid remote staging directory')
-        succeeded = False
+        cleanup_stage = True
         try:
             checked(['scp', *options, '-P', port, str(settings), str(ROOT / 'scripts/deploy-activate.py'),
                      str(output / f'{component}.image.tar.gz'), f'{remote}:{stage}/'], stdout=subprocess.DEVNULL)
@@ -252,9 +252,13 @@ def activate(service, output):
                             and re.fullmatch(r'sha256:[0-9a-f]{64}', receipt.get('image', ''))
                             and receipt.get('source_sha') == info['source_sha']
                             and receipt.get('version') == info['version'], 'invalid remote activation receipt')
-            succeeded = True
+        except subprocess.CalledProcessError as error:
+            # SSH status 255 means the remote outcome is unknown; retain the stage for
+            # reconciliation. Known command failures have completed and can be cleaned.
+            cleanup_stage = error.returncode != 255
+            raise
         finally:
-            if succeeded:
+            if cleanup_stage:
                 subprocess.run([*ssh, 'rm -rf -- ' + shlex.quote(stage)],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return {'service': service, 'tag': info['tag'], 'source_sha': info['source_sha'],

@@ -36,7 +36,7 @@ Core、CLI、Web App、Desktop 和 Mobile 共享一个版本、一个 `v<version
 
 产品和官网完整发布后，对应发布工作流中的 `deploy-published-product` 或 `deploy-published-www` job 使用精确 Tag 从 `main` 派发对应部署：产品 Release 部署公共节点和 App，官网 Release 部署官网。公共节点与 App 也可使用[官方服务部署](service-deployments.md)中的独立命令，显式选择已经完成发布的产品 Tag。部署端校验最终 `release.json`、源码身份及所选制品字节后，包装和部署容器。它不重新编译产品，也不创建新产品版本。
 
-官网使用独立命令 `python3 scripts/deploy.py release --service www --tag www-v<version>` 进行补发或手动控制。CLI 按目标选择 `deploy-node.yml`、`deploy-app.yml`、`deploy-www.yml` 或 `deploy-product.yml`。入口固定目标，`apply=false` 默认构建验证与排练，统一调用本仓库的 `deploy-services.yml`，由它持有全局锁。`all` 仍将 Node 与 App 作为同一可观察批次。自动或手动派发成功不代表上线，必须跟踪运行到终态并验证线上版本。
+官网使用独立命令 `python3 scripts/deploy.py release --service www --tag www-v<version>` 进行补发或手动控制。CLI 按目标选择 `deploy-node.yml`、`deploy-app.yml`、`deploy-www.yml` 或 `deploy-product.yml`。入口固定目标，`apply=false` 默认构建验证与排练，统一调用本仓库的 `deploy-services.yml`，由它持有全局锁。`all` 仍将 Node 与 App 作为同一可观察批次。自动发布会等待部署工作流终态；手动派发仍需跟踪运行并验证线上版本。
 
 ## 可下载的包
 
@@ -216,7 +216,7 @@ gh workflow run npm-publish.yml --repo leaperone/vibeface --ref v<version> \
 
 需要手动公开发布时，把 `publish` 设为 true。原发布 run 的 npm job 失败时，先对账后使用 `gh run rerun <run-id> --failed`，复用原 artifact id，不重建归档。
 
-发布器先读取公开 registry，只把 HTTP 404 当作包不存在，传输失败、其他 HTTP 错误和无效响应都停止发布。已有目标版本的 integrity 必须相同，且 `hourly` 等于目标或更高时直接成功，不降级。已有版本但 `hourly` 缺失或较旧时停止并要求对账，不自动修改 dist-tag。目标版本不存在且 `hourly` 缺失或更旧时执行一次 `npm publish --provenance`；`hourly` 已指向更新的小时时跳过，不回拨 dist-tag。随后最多进行 40 次只读查询，等待 registry 确认 integrity 和渠道；包括发布响应丢失的情况，也不自动重发。未核实公开结果始终失败。公开版本不能覆盖，不能通过复用 tag 更换内容。
+发布器先读取公开 registry，只把 HTTP 404 当作包不存在，传输失败、其他 HTTP 错误和无效响应都停止发布。已有目标版本的 integrity 必须相同，且 `hourly` 等于目标或更高时直接成功，不降级。已有版本但 `hourly` 缺失或较旧时停止并要求对账，不自动修改 dist-tag。目标版本不存在且 `hourly` 缺失或更旧时执行一次 `npm publish --provenance`；`hourly` 已指向更新的小时时跳过，不回拨 dist-tag。随后最多进行 60 次只读查询，等待 registry 确认 integrity 和渠道；包括发布响应丢失的情况，也不自动重发。未核实公开结果始终失败。公开版本不能覆盖，不能通过复用 tag 更换内容。
 
 
 ## 桌面与 Windows 签名

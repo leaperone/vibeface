@@ -236,11 +236,15 @@ def public_archive(directory, output):
         require(info.isfile() or info.isdir(), 'links and special archive files are forbidden')
         info.uid = info.gid = 0
         info.uname = info.gname = ''
+        info.mtime = 0
+        info.mode = 0o755 if info.isdir() or info.mode & 0o111 else 0o644
         info.pax_headers = {}
         return info
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(output, 'w:gz') as archive:
-        archive.add(directory, arcname=directory.name, filter=clean)
+    with output.open('wb') as raw:
+        with gzip.GzipFile(filename='', fileobj=raw, mode='wb', mtime=0) as compressed:
+            with tarfile.open(fileobj=compressed, mode='w') as archive:
+                archive.add(directory, arcname=directory.name, filter=clean)
     output.with_name(output.name + '.sha256').write_text(f'{digest(output)}  {output.name}\n', encoding='utf-8', newline='\n')
 
 
@@ -1303,6 +1307,18 @@ def self_test():
                           lambda left, right: PureWindowsPath(str(left)) < PureWindowsPath(str(right))):
             accepts(lambda: require(list(files(root)) == ['README.md', 'docs/node.md'],
                                     'sealed file order must ignore host path comparison rules'))
+
+    with tempfile.TemporaryDirectory(prefix='vibeface-release-archive-') as temporary:
+        root = Path(temporary) / 'payload'
+        root.mkdir()
+        (root / 'file.txt').write_text('same bytes\n', encoding='utf-8')
+        os.utime(root / 'file.txt', (1_700_000_000, 1_700_000_000))
+        os.utime(root, (1_700_000_000, 1_700_000_000))
+        first, second = Path(temporary) / 'first.tar.gz', Path(temporary) / 'second.tar.gz'
+        public_archive(root, first)
+        public_archive(root, second)
+        accepts(lambda: require(first.read_bytes() == second.read_bytes(),
+                                'identical release trees must produce identical archives'))
 
     accepts(lambda: require(parse_tag(product_tag) == ('product', product_version, channel), 'product tag'))
     accepts(lambda: require(parse_tag(www_tag) == ('www', www_version, version(www_version)), 'www tag'))
