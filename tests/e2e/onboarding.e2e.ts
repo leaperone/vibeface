@@ -250,7 +250,7 @@ test('creates a persistent Bot without a model and shows triage budget state', a
       .run(identity.network_id, node.peer, 'q-decision-three', identity.conversation_id, '0', JSON.stringify({ agent: 'codex', cwd: 'workspace', summary: '' }), Date.now());
     decisionDb.prepare("UPDATE questions SET body=json_remove(body,'$.target') WHERE network_id=? AND question_id=?")
       .run(identity.network_id, 'q-decision-three');
-    await browser.goto(`${node.url}/inbox`);
+    await browser.goto(`${node.url}/tasks`);
     await expect(screen.getByRole('heading', '报告用哪种格式交付？')).toBeVisible();
     await expect(screen.getByRole('group', '选一个回答').getByRole('button')).toHaveCount(3);
     await expect(screen.getByRole('textbox', '你的回答')).toBeVisible();
@@ -265,7 +265,7 @@ test('creates a persistent Bot without a model and shows triage budget state', a
 
     seed('q-decision-four', [...three, '先发送摘要，正文保留可编辑版本']);
     await browser.goto(`${node.url}/tasks`);
-    await expect(screen.getByRole('main').getByRole('link', '待处理 2', { exact: true })).toBeVisible();
+    await expect(screen.getByRole('main').getByRole('heading', '待处理', { exact: true })).toBeVisible();
     await expect(screen.getByRole('radiogroup', '任务状态').getByRole('radio')).toHaveCount(4);
     await expect(screen.getByRole('heading', '报告用哪种格式交付？')).toHaveCount(1);
     await expect(screen.getByRole('button', '发送回答', { exact: true })).toHaveCount(1);
@@ -273,7 +273,7 @@ test('creates a persistent Bot without a model and shows triage budget state', a
     await expect(screen.getByText('2 项任务', { exact: true })).toBeVisible();
     await expect(screen.getByRole('textbox', '你的回答')).toHaveCount(1);
     await app.screenshot('task-overview-single-question-and-turn');
-    await browser.goto(`${node.url}/inbox`);
+    await browser.goto(`${node.url}/tasks`);
     await browser.setViewport({ width: 375, height: 812 });
     await expect(screen.getByRole('group', '选一个回答').getByRole('button')).toHaveCount(4);
     await screen.getByRole('textbox', '你的回答').fill('1');

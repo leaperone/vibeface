@@ -39,7 +39,7 @@ export function listTime(at: number, now: number): string {
 }
 
 /** The phone's bottom tabs; each is a root with no way back. */
-export const tabs = ["/", "/tasks", "/inbox", "/settings"]
+export const tabs = ["/", "/tasks", "/settings"]
 
 /** On a phone every page below a tab goes back one level; null on a tab. */
 export function backTo(pathname: string, bot?: string): string | null {

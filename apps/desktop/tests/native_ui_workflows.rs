@@ -245,7 +245,7 @@ fn local_read_only_session_cannot_stage_chat(cx: &mut TestAppContext) {
     );
 }
 #[gpui_kit::test]
-fn inbox_choice_keeps_the_question_conversation(cx: &mut TestAppContext) {
+fn pending_choice_keeps_the_question_conversation(cx: &mut TestAppContext) {
     let mut snapshot = fixture();
     snapshot.questions = vec![ui::Question {
         question_id: "question-b".into(),
@@ -256,7 +256,7 @@ fn inbox_choice_keeps_the_question_conversation(cx: &mut TestAppContext) {
         }],
         ..Default::default()
     }];
-    let mut h = open(cx, Route::Inbox, snapshot);
+    let mut h = open(cx, Route::Tasks, snapshot);
     click(&h, cx, "q-question-b-仅允许一次");
     let (generation, command) = scoped(h.commands.try_recv().expect("answer command"));
     assert_eq!(generation, 7);

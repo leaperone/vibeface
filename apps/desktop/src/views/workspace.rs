@@ -100,7 +100,11 @@ impl Desktop {
             .on_click(cx.listener(move |this, _, _, cx| this.navigate(Route::Chat(id.clone()), cx)))
     }
     pub(crate) fn tasks(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut page = self.page().child(
+        let mut page = self.page();
+        if let Some(pending) = self.pending(cx) {
+            page = page.child(pending);
+        }
+        page = page.child(
             self.open_editor(
                 "create-task",
                 "新建任务",
@@ -442,8 +446,29 @@ impl Desktop {
         }
         page.into_any_element()
     }
-    pub(crate) fn inbox(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut page = self.page();
+    /// 待处理 atop the task page; nothing waiting, nothing shown.
+    fn pending(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let questions: Vec<_> = self
+            .snapshot
+            .questions
+            .iter()
+            .filter(|q| q.answer.is_none() && q.closed.is_none())
+            .collect();
+        if self.snapshot.conversation.checks.is_empty()
+            && self.snapshot.notifications.is_empty()
+            && questions.is_empty()
+            && self.snapshot.drafts.is_empty()
+            && self.snapshot.pending.is_empty()
+            && self.snapshot.settings_review.is_none()
+        {
+            return None;
+        }
+        let mut page = div().flex().flex_col().gap_4().child(
+            div()
+                .text_lg()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child("待处理"),
+        );
         for check in &self.snapshot.conversation.checks {
             page = page.child(
                 self.row("进程状态待确认", check.detail.clone())
@@ -479,12 +504,7 @@ impl Desktop {
                     ),
             );
         }
-        for question in self
-            .snapshot
-            .questions
-            .iter()
-            .filter(|q| q.answer.is_none() && q.closed.is_none())
-        {
+        for question in questions {
             let mut row = self.row(
                 question.text.clone(),
                 "等待你的回复。重复确认使用同一问题标识。",
@@ -558,8 +578,7 @@ impl Desktop {
             }
             page = page.child(row);
         }
-        page = page.child(self.unknown_settings_review(cx));
-        page.into_any_element()
+        Some(page.child(self.unknown_settings_review(cx)))
     }
     pub(crate) fn bot_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(bot) = self.selected_bot() else {

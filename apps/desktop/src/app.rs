@@ -801,8 +801,8 @@ impl Desktop {
             .find(|note| note.notification_id == id)
             .cloned()
         else {
-            self.notice = Some("通知已更新，请查看待处理列表。".into());
-            self.navigate(Route::Inbox, cx);
+            self.notice = Some("通知已更新，请查看任务页的待处理。".into());
+            self.navigate(Route::Tasks, cx);
             return;
         };
         self.navigate(Route::Chat(note.conversation_id.clone()), cx);
@@ -1202,7 +1202,6 @@ impl Desktop {
             );
         for (id, title, route) in [
             ("home", "Bot", Route::Home),
-            ("inbox", "待处理", Route::Inbox),
             ("tasks", "任务", Route::Tasks),
             ("channels", "频道", Route::Channels),
             ("memory", "记忆", Route::Memory),
@@ -1542,7 +1541,6 @@ impl Render for Desktop {
                 Route::Channels => self.channels(cx),
                 Route::Memory => self.memory(cx),
                 Route::Schedules => self.schedules(cx),
-                Route::Inbox => self.inbox(cx),
                 Route::Devices => self.devices(cx),
                 Route::Bot => self.bot_settings(cx),
                 Route::Settings => self.settings(cx),

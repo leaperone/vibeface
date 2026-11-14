@@ -245,13 +245,13 @@ export function RecoveryPendingCard() {
   </ActionCard>
 }
 
-/** Above the chat while a recovery waits, as on the web: a managing phone sees it without opening 待处理, and one tap leads there. */
+/** Above the chat while a recovery waits, as on the web: a managing phone sees it without opening 任务, and one tap leads to 待处理 there. */
 export function RecoveryAlert({ top }: { top: number }) {
   const device = useDevice()
   const pending = device.pendingRecovery
   if (!pending) return null
   return <View pointerEvents="box-none" className="absolute inset-x-0 w-full max-w-3xl self-center px-4" style={{ top: top + 8 }}>
-    <Link href="/inbox" asChild>
+    <Link href="/tasks" asChild>
       <Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-2.5 rounded-xl border border-danger-border bg-card py-1.5 ps-1.5 pe-3 shadow-xs active:bg-muted">
         <View className="size-8 items-center justify-center rounded-lg bg-danger-soft"><Icon as={ShieldAlert} className="size-4 text-danger" /></View>
         <Text numberOfLines={1} className="min-w-0 flex-1 font-medium">{recoveryCopy.pending}</Text>

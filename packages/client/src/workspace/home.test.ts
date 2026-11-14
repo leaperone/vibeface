@@ -27,7 +27,7 @@ test('the list puts the newest message first and silent bots last', () => {
 })
 
 test('on a phone every page below a tab leads back toward it', () => {
-  for (const tab of ['/', '/tasks', '/inbox', '/settings']) assert.equal(backTo(tab), null, tab)
+  for (const tab of ['/', '/tasks', '/settings']) assert.equal(backTo(tab), null, tab)
   for (const [from, to] of [['/b/bot', '/'], ['/b/bot/work/w1', '/b/bot'], ['/channels', '/'], ['/tasks/t1', '/tasks'], ['/devices', '/settings'], ['/devices/d1', '/devices'], ['/settings/logs', '/settings'], ['/settings/lab', '/settings'], ['/settings/lab/transfers', '/settings/lab']]) assert.equal(backTo(from), to, from)
   assert.equal(backTo('/devices/d1', 'bot'), '/b/bot')
   assert.equal(backTo('/settings', 'bot'), null)

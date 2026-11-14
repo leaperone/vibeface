@@ -65,9 +65,9 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
       <Link href="/settings" replace={replace} asChild><Button variant="ghost" size="icon" className={cn('-me-1 size-11 rounded-full', active('/settings') && 'bg-muted')} accessibilityLabel="设置" accessibilityState={{ selected: active('/settings') }}><Icon as={Settings} className="size-5" /></Button></Link>
     </View> : null}
     {empty === 'unreachable' && !bots.length ? null : <OfflineBar className="mx-1 mb-2 mt-1" />}
-    {waiting ? <Item key="inbox" layout={move} entering={fadeIn} exiting={fadeOut} className="mb-2 mt-1">
-      <Link href="/inbox" replace={replace} asChild>
-        <Pressable accessibilityState={{ selected: active('/inbox') }} className={cn('min-h-16 flex-row items-center gap-3 rounded-xl border px-3 py-2.5 active:bg-muted', device.pendingRecovery ? 'border-danger-border bg-danger-soft' : 'border-warning-border bg-warning-soft', active('/inbox') && (device.pendingRecovery ? 'border-danger' : 'border-warning'))}>
+    {waiting ? <Item key="pending" layout={move} entering={fadeIn} exiting={fadeOut} className="mb-2 mt-1">
+      <Link href="/tasks" replace={replace} asChild>
+        <Pressable accessibilityState={{ selected: active('/tasks') }} className={cn('min-h-16 flex-row items-center gap-3 rounded-xl border px-3 py-2.5 active:bg-muted', device.pendingRecovery ? 'border-danger-border bg-danger-soft' : 'border-warning-border bg-warning-soft', active('/tasks') && (device.pendingRecovery ? 'border-danger' : 'border-warning'))}>
           <View className={cn('size-11 items-center justify-center rounded-full', device.pendingRecovery ? 'bg-danger/15' : 'bg-warning/15')}><Icon as={device.pendingRecovery ? ShieldAlert : Inbox} className={device.pendingRecovery ? 'text-danger' : 'text-warning'} /></View>
           <Text numberOfLines={1} className="min-w-0 flex-1 font-semibold">{device.pendingRecovery ? recoveryCopy.pending : `${waiting} 件事等你决定`}</Text>
           <Icon as={ChevronRight} className="text-muted-foreground" />

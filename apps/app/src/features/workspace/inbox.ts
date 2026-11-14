@@ -4,14 +4,14 @@ import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { inboxItems, type InboxItem } from "@vibeface/client/workspace/inbox.ts"
 
-/** The icon each item shows and where its row leads; cards act on the rest in place, in 待处理. */
+/** The icon each item shows and where its row leads; cards act on the rest in place, in 待处理 on the task page. */
 function presented(item: InboxItem, chat: string): { icon: LucideIcon; to: string } {
   switch (item.kind) {
-    case "recovery": return { icon: ShieldAlert, to: "/inbox" }
-    case "rotate": return { icon: KeyRound, to: "/inbox" }
-    case "write": return { icon: item.write === "read_only" ? terms.readOnly.icon : Copy, to: "/inbox" }
-    case "question": return { icon: MessageCircleQuestionMark, to: item.question.bot ? `/b/${item.question.bot.bot_id}` : "/inbox" }
-    case "confirm": return { icon: terms.confirm.icon, to: "/inbox" }
+    case "recovery": return { icon: ShieldAlert, to: "/tasks" }
+    case "rotate": return { icon: KeyRound, to: "/tasks" }
+    case "write": return { icon: item.write === "read_only" ? terms.readOnly.icon : Copy, to: "/tasks" }
+    case "question": return { icon: MessageCircleQuestionMark, to: item.question.bot ? `/b/${item.question.bot.bot_id}` : "/tasks" }
+    case "confirm": return { icon: terms.confirm.icon, to: "/tasks" }
     case "undelivered": return { icon: terms.undelivered.icon, to: chat }
     case "join": return { icon: MonitorSmartphone, to: "/devices" }
     case "attention": return { icon: MessageSquareWarning, to: `/b/${item.bot.bot_id}` }

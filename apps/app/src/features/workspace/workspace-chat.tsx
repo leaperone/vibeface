@@ -38,7 +38,7 @@ export function InputTargetLink({ target, conversationId }: { target: InputTarge
   const bot = workspace.bots.find((item) => item.conversation_id === conversationId)
   if (target.kind === 'task' || target.kind === 'channel_task') return <Link to="/tasks/$taskId" params={{ taskId: target.task_id }} className="inline-flex min-h-11 items-center text-meta underline underline-offset-4">打开所属任务</Link>
   if (target.kind === 'channel_member') return <Link to="/channels/$channelId" params={{ channelId: target.channel_id }} className="inline-flex min-h-11 items-center text-meta underline underline-offset-4">打开所属频道</Link>
-  if (target.kind === 'work' && bot) return <Link to="/b/$botId/work/$workId" params={{ botId: bot.bot_id, workId: target.work_id }} search={{ from: 'inbox' }} className="inline-flex min-h-11 items-center text-meta underline underline-offset-4">打开所属工作</Link>
+  if (target.kind === 'work' && bot) return <Link to="/b/$botId/work/$workId" params={{ botId: bot.bot_id, workId: target.work_id }} search={{ from: 'tasks' }} className="inline-flex min-h-11 items-center text-meta underline underline-offset-4">打开所属工作</Link>
   return bot ? <Link to="/b/$botId" params={{ botId: bot.bot_id }} search={target.kind === 'routine' ? { routine: target.trigger } : {}} className="inline-flex min-h-11 items-center text-meta underline underline-offset-4">打开 {bot.name}{target.kind === 'routine' ? ' 的例行任务' : ''}</Link> : null
 }
 

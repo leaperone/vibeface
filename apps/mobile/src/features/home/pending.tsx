@@ -1,14 +1,11 @@
 import { Link, type Href } from 'expo-router'
-import { useHeaderHeight } from 'expo-router/react-navigation'
-import { Bot, CheckCheck, ChevronRight, CircleAlert, CircleX, Copy, EyeOff, LoaderCircle, MessageCircle, Settings, X, Inbox as InboxIcon, Lock, MessageSquareWarning, Sparkles, type LucideIcon } from 'lucide-react-native'
+import { Bot, CheckCheck, ChevronRight, CircleAlert, CircleX, Copy, EyeOff, LoaderCircle, Settings, X, Lock, MessageSquareWarning, Sparkles, type LucideIcon } from 'lucide-react-native'
 import { useRef } from 'react'
 import { Pressable, View } from 'react-native'
-import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
-import Animated, { LayoutAnimationConfig } from 'react-native-reanimated'
+import Animated from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
-import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { ErrorText, useAction } from '@/components/action'
-import { ActionCard, EmptyState } from '@/components/kit'
+import { ActionCard } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
@@ -25,7 +22,7 @@ import { QuestionCard } from '@/features/chat/question-card'
 import { ConfirmCard } from '@/features/chat/work'
 import { JoinRequests } from '@/features/devices/join-requests'
 import { RecoveryPendingCard, RotateHintCard } from '@/features/recovery/recovery'
-import { InputLocation, InputStatus, WorkspaceTaskRow } from '@/features/workspace/workspace'
+import { InputLocation, InputStatus } from '@/features/workspace/workspace'
 
 // An answered card leaves at once and what was below glides up into its space, so nothing passes over anything.
 const Group = withUniwind(Animated.View)
@@ -34,21 +31,17 @@ type Row = Extract<InboxItem, { kind: 'write' | 'undelivered' | 'attention' | 's
 const rowIcons: Record<Row['kind'], LucideIcon> = { write: Copy, undelivered: CircleAlert, attention: MessageSquareWarning, setup: Sparkles }
 
 /**
- * The items the web lists: a recovery to stop first, cards to act on here, rows leading to where the rest is settled, join
- * requests, then questions nobody answered, grouped by bot; each group names its bot once and leads to its chat.
+ * 待处理 atop the task screen, as the web lists it: a recovery to stop first, cards to act on here, rows leading to where the
+ * rest is settled, join requests, then questions nobody answered, grouped by bot; each group names its bot once and leads to
+ * its chat. Waiting task conversations stay in the task list below; nothing waiting, nothing shown.
  */
-export default function Inbox() {
+export function PendingSection() {
   const items = useInbox()
   const device = useDevice()
   const shared = useLive()
-  const decisions = (shared?.workspaceState?.tasks ?? []).filter((task) => task.state === 'waiting_user' || task.state === 'update_pending')
-  const confirmations = (shared?.workspaceState?.tasks ?? []).filter((task) => task.state === 'needs_reconciliation' || task.state === 'stop_pending')
   const inputs = items.flatMap((item) => item.kind === 'undelivered' ? [item.message] : [])
   const { busy, error, status, run } = useRun()
   const wide = useWide()
-  const bar = useHeaderHeight()
-  const insets = useSafeAreaInsets()
-  const frame = useSafeAreaFrame()
   // Groups order by the newest question each bot has shown here. Answered questions leave the list, so the time is kept
   // and only rises: answering never reshuffles the groups, and only a new question lifts its bot to the top.
   const latest = useRef(new Map<string, number>()).current
@@ -59,17 +52,13 @@ export default function Inbox() {
     groups.set(key, [...groups.get(key) ?? [], question])
   }
   const open = [...groups].sort(([a], [b]) => latest.get(b)! - latest.get(a)!).map(([, questions]) => questions)
-  // The scroll view stays when empty: iOS tints the glass back button from it, and swapping it out flashes the button light.
-  // The empty state fills what shows below the bar, known from the first frame so it never starts at the top.
-  // Its extra 24 on top evens out the container's 16 top and 40 bottom padding, so it centres in that area.
-  const below = Math.max(0, frame.height - bar - insets.bottom - 56)
   const attention = items.filter((item): item is Extract<InboxItem, { kind: 'attention' }> => item.kind === 'attention')
-  // Entering animations skip the first render: an inbox opened empty just shows it, one emptied by an answer fades it in.
-  return <LayoutAnimationConfig skipEntering><KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-3 p-4 pb-10">
+  if (!items.length) return null
+  return <View className="gap-3">
+    <Text role="heading" className="px-1 text-heading font-semibold">待处理</Text>
     {items.map((item) => item.kind === 'recovery' ? <RecoveryPendingCard key={item.key} /> : null)}
-    {decisions.length ? <View className="gap-3"><Text role="heading" className="text-heading font-semibold">需要决定</Text>{decisions.map((task) => <WorkspaceTaskRow key={task.task_id} task={task} />)}</View> : null}
-    {confirmations.length || inputs.length ? <View className="gap-3"><Text role="heading" className="text-heading font-semibold">待确认</Text>{confirmations.map((task) => <WorkspaceTaskRow key={task.task_id} task={task} />)}{inputs.map((input) => <View key={input.message_id} className="gap-2"><Text numberOfLines={2} className="text-meta">{input.text}</Text><InputLocation target={input.target} conversationId={input.conversation_id} /><InputStatus pending={input} /></View>)}</View> : null}
-    {attention.length ? <Text role="heading" className="mt-3 text-heading font-semibold">更新</Text> : null}
+    {inputs.length ? <View className="gap-3"><Text role="heading" className="px-1 text-meta font-medium text-muted-foreground">待确认</Text>{inputs.map((input) => <View key={input.message_id} className="gap-2"><Text numberOfLines={2} className="text-meta">{input.text}</Text><InputLocation target={input.target} conversationId={input.conversation_id} /><InputStatus pending={input} /></View>)}</View> : null}
+    {attention.length ? <Text role="heading" className="mt-3 px-1 text-meta font-medium text-muted-foreground">更新</Text> : null}
     {attention.length && shared ? <View className="flex-row flex-wrap justify-end gap-2">
       <Button variant="ghost" disabled={busy !== null} accessibilityLabel="忽略提醒" onPress={() => void run('ignore', async () => { shared.ignoreNotifications(attention.map((item) => item.notification.notification_id)) }, '已忽略提醒，仅此设备隐藏。')}><Icon as={EyeOff} /><Text>忽略提醒</Text></Button>
       <Button variant="outline" disabled={busy !== null} accessibilityLabel="全部已读" onPress={() => void run('read', async () => { await shared.markNotificationsRead(attention.map((item) => item.notification.notification_id)) }, '提醒已标记为已读。')}><Icon as={CheckCheck} /><Text>全部已读</Text></Button>
@@ -89,10 +78,8 @@ export default function Inbox() {
         </Pressable>
       </Link> : null}
       {questions.map((question) => <Animated.View key={question.question_id} layout={move}><QuestionCard question={question} /></Animated.View>)}
-    </Group>) : items.length || decisions.length || confirmations.length || inputs.length ? null : <View style={{ minHeight: below, paddingTop: 24, justifyContent: 'center' }}>
-      <EmptyState icon={InboxIcon} title="没有待处理" action={<Link href="/" dismissTo asChild><Button variant="outline" className="self-center"><Icon as={MessageCircle} /><Text>回到消息</Text></Button></Link>} />
-    </View>}
-  </KeyboardAwareScrollView></LayoutAnimationConfig>
+    </Group>) : null}
+  </View>
 }
 
 /** Where a row leads on the phone; the phone cannot settle a copied or read-only computer, so that row only says it. */

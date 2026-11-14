@@ -126,7 +126,7 @@ function SecurityStatus({ toDevices }: { toDevices(): void }) {
         <Icon as={ChevronUp} className="text-muted-foreground" />
       </View>
     </SettingsRow>
-    {pending ? <SettingsRow href="/inbox" icon={ShieldAlert} tone="danger" label={securityCopy.recovery}>
+    {pending ? <SettingsRow href="/tasks" icon={ShieldAlert} tone="danger" label={securityCopy.recovery}>
       <Text className="text-meta text-danger" style={tabular}>{securityCopy.recoveryIn(pending.effective_at_ms - nodeClockOffset)}</Text>
     </SettingsRow> : <SettingsRow icon={ShieldCheck} label={securityCopy.recovery}><Text className="text-meta text-muted-foreground">{securityCopy.noRecovery}</Text></SettingsRow>}</> : null}
     <CurrentRecoveryFile />

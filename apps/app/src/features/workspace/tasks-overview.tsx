@@ -18,8 +18,7 @@ import { projectName } from "@vibeface/client/workspace/questions.ts"
 import { workFailure } from "@vibeface/client/lib/errors.ts"
 import type { NodeInfo, OpenWorkCard, OverviewTask, WorkspaceActivity } from "@vibeface/client/workspace/types.ts"
 import { useInbox } from "./inbox"
-import { ConfirmCard } from "./task-activity"
-import { QuestionCard } from "./question-card"
+import { PendingSection } from "./pending-section"
 import { useCreateBot } from "./workspace-shell"
 import { WorkspaceTasks } from "./workspace-tasks"
 
@@ -27,7 +26,7 @@ type ProjectedWork = Extract<OverviewTask, { kind: "work" | "dispatch" }>
 
 const stateTone = (state: string): Tone => state === "failed" || state === "dispatch_rejected" ? "danger" : state === "completed" ? "success" : ["waiting", "awaiting_confirmation", "unverified", "unknown", "accepted_waiting_sync", "dispatch_unverified"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
 
-/** The personal task surface. It only derives display rows from the already parsed workspace context. */
+/** The personal task surface: 待处理 on top, then tasks. Questions and checks act only in 待处理; a task held on one shows it as waiting. */
 export function TasksOverview() {
   const workspace = useWorkspace()
   const createBot = useCreateBot()
@@ -35,6 +34,7 @@ export function TasksOverview() {
   const [filter, setFilter] = useState<TaskGroup | "all">("all")
   const [botFilter, setBotFilter] = useState("all")
   const inbox = useInbox()
+  const failedIds = new Set(inbox.flatMap((item) => item.kind === "failed" ? [item.work.work_id] : []))
   type InboxItem = (typeof inbox)[number]
   const lookup = { nodes: workspace.nodes, directory }
   const localOverview = overviewFromWorkspace({ openWorks: workspace.openWorks, bots: workspace.bots, questions: workspace.questions, nodes: workspace.nodes })
@@ -69,30 +69,21 @@ export function TasksOverview() {
   const taskCounts = { attention: businessTasks.filter((task) => taskStates.attention.includes(task.state)).length, working: businessTasks.filter((task) => taskStates.working.includes(task.state)).length, waiting: businessTasks.filter((task) => taskStates.waiting.includes(task.state)).length }
   const assignedWorkIds = new Set((workspace.workspaceState?.assignments ?? []).flatMap((assignment) => assignment.work_id && workspace.workspaceState?.tasks.some((task) => task.task_id === assignment.task_id) ? [assignment.work_id] : []))
   const visibleGroups: Record<TaskGroup, WorkspaceActivity[]> = { attention: [], working: [], waiting: [] }
+  const heldGroups: Record<TaskGroup, number> = { attention: 0, working: 0, waiting: 0 }
   for (const group of taskGroups.map(({ group }) => group)) for (const activity of groups[group]) {
     if (activity.kind === 'work' && activity.work && assignedWorkIds.has(activity.work.work_id)) continue
-    const bot = activityBot(activity)
-    const deviceWorks = activity.kind === "attention" && "kind" in activity.attention && activity.attention.kind === "device" ? activity.attention.works.filter((work) => matchesBot(work.conversation_id)) : undefined
-    if (!matchesBot(activity.conversation_id ?? "", bot?.bot_id) && !deviceWorks?.length) continue
-    if (activity.kind === "attention" && "kind" in activity.attention && activity.attention.kind === "device" && deviceWorks) visibleGroups[group].push({ ...activity, attention: { ...activity.attention, works: deviceWorks } })
+    const deviceMatch = activity.kind === "attention" && "kind" in activity.attention && activity.attention.kind === "device" && activity.attention.works.some((work) => matchesBot(work.conversation_id))
+    if (!matchesBot(activity.conversation_id ?? "", activityBot(activity)?.bot_id) && !deviceMatch) continue
+    // A failed work, live question or check is acted on in 待处理 above: counted here, shown only there.
+    if (activity.kind === "work" && activity.work && failedIds.has(activity.work.work_id) || activity.kind === "attention" && !("kind" in activity.attention && (activity.attention.kind === "question" || activity.attention.kind === "check"))) heldGroups[group]++
     else visibleGroups[group].push(activity)
   }
   const visible = (group: TaskGroup) => filter === "all" || filter === group
-  const noticed = visible("attention") ? visibleGroups.attention.length + taskCounts.attention : 0
-  const visibleCount = (visible("attention") ? visibleGroups.attention.length : 0) + (visible("working") ? visibleGroups.working.length : 0) + (visible("waiting") ? visibleGroups.waiting.length : 0) + businessTasks.filter((task) => filter === "all" || taskStates[filter].includes(task.state)).length
+  const visibleCount = (visible("attention") ? visibleGroups.attention.length + heldGroups.attention : 0) + (visible("working") ? visibleGroups.working.length + heldGroups.working : 0) + (visible("waiting") ? visibleGroups.waiting.length + heldGroups.waiting : 0) + businessTasks.filter((task) => filter === "all" || taskStates[filter].includes(task.state)).length
   const hasContent = visibleCount > 0
   const emptyLabel = !read ? workspace.connectionOnline ? "正在读取当前连接的任务" : "尚未读取任务，连接后再确认" : filter === "all" && botFilter === "all" ? "当前记录没有未完成的任务" : "没有符合筛选的任务"
-  const renderedDeviceChecks = new Set<string>()
   const card = (activity: WorkspaceActivity) => {
-    if (activity.kind === "work" && activity.work) {
-      const checks = activity.facts.checks.filter((check) => {
-        if (check.kind !== "device") return true
-        if (!check.works.some((item) => item.work_id === activity.work_id) || renderedDeviceChecks.has(check.check_id)) return false
-        renderedDeviceChecks.add(check.check_id)
-        return true
-      }).map((check) => check.kind === "device" ? { ...check, works: check.works.filter((item) => matchesBot(item.conversation_id)) } : check)
-      return <div key={activity.id} className="grid gap-2"><TaskOverviewCard work={activity.work} projected={activity.projection} bot={activityBot(activity)} waiting={activity.facts.questions.length > 0} lookup={lookup} connected={workspace.connectionOnline && read} progress={taskProgress(activity.work, workspace.liveProgress)} />{activity.facts.questions.map((question) => <QuestionCard key={`question:${question.question_id}`} question={question} inbox from="tasks" />)}{checks.map((check) => <ConfirmCard key={`check:${check.check_id}`} check={check} inbox from="tasks" />)}{activity.facts.overviewChecks.map((check) => <OverviewCheckCard key={`overview-check:${check.check_id}`} check={check} />)}</div>
-    }
+    if (activity.kind === "work" && activity.work) return <div key={activity.id} className="grid gap-2"><TaskOverviewCard work={activity.work} projected={activity.projection} bot={activityBot(activity)} waiting={activity.facts.questions.length > 0} lookup={lookup} connected={workspace.connectionOnline && read} progress={taskProgress(activity.work, workspace.liveProgress)} />{activity.facts.overviewChecks.map((check) => <OverviewCheckCard key={`overview-check:${check.check_id}`} check={check} />)}</div>
     if (activity.kind === "turn" && activity.job) return <TurnActivity key={activity.id} activity={activity} />
     if (activity.kind === "attention" && activity.attention) return <AttentionActivity key={activity.id} activity={activity} bot={activityBot(activity)} read={read} />
     return null
@@ -100,12 +91,12 @@ export function TasksOverview() {
   const bot = workspace.bots.find((item) => item.bot_id === botFilter) ?? workspace.selectedBot ?? workspace.bots[0]
 
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
+    <PendingSection />
     <p className="sr-only" role="status" aria-live="polite">{hasContent ? `${visibleCount} 项任务` : emptyLabel}</p>
-    <WorkspaceMasthead attention={read ? visibleGroups.attention.length + taskCounts.attention : null} working={read ? visibleGroups.working.length + taskCounts.working : null} waiting={read ? visibleGroups.waiting.length + taskCounts.waiting : null} online={workspace.connectionOnline} />
+    <WorkspaceMasthead attention={read ? visibleGroups.attention.length + heldGroups.attention + taskCounts.attention : null} working={read ? visibleGroups.working.length + heldGroups.working + taskCounts.working : null} waiting={read ? visibleGroups.waiting.length + heldGroups.waiting + taskCounts.waiting : null} online={workspace.connectionOnline} />
     <p className="text-meta text-muted-foreground">{[...overviewScope(overview.coverage), ...(!read ? ["当前连接尚未完成首读"] : !workspace.connectionOnline ? ["连接已断开，显示最近记录"] : [])].join(" · ")}</p>
     <TaskFilters filter={filter} botFilter={botFilter} bots={workspace.bots} onFilter={setFilter} onBotFilter={setBotFilter} />
     <WorkspaceTasks botFilter={botFilter} filter={filter} />
-    {noticed ? <Link to="/inbox" className="flex min-h-12 items-center gap-2 rounded-lg border px-3 py-2 font-medium hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50"><CircleQuestionMark aria-hidden="true" className="size-4 shrink-0" /><span>待处理 {noticed} 项</span><ChevronRight aria-hidden="true" className="ms-auto size-4 shrink-0 text-muted-foreground" /></Link> : null}
     {taskGroups.map(({ group, title }) => {
       if (!visible(group)) return null
       const count = visibleGroups[group].length
@@ -144,9 +135,7 @@ function TurnActivity({ activity }: { activity: Extract<WorkspaceActivity, { kin
 function AttentionActivity({ activity, bot, read }: { activity: Extract<WorkspaceActivity, { kind: "attention" }>; bot?: { bot_id: string; name: string }; read: boolean }) {
   const attention = activity.attention
   if (!attention) return null
-  if ("answer" in attention && "about" in attention) return <QuestionCard question={attention} inbox from="tasks" />
   if ("kind" in attention && attention.kind === "check") return <OverviewCheckCard check={attention} read={read} />
-  if ("kind" in attention && (attention.kind === "work" || attention.kind === "device" || attention.kind === "process")) return <ConfirmCard check={attention} inbox from="tasks" />
   if ("question_id" in attention) return <Card><CardContent className="grid gap-2"><p className="font-medium">问题待确认</p><p className="text-meta text-muted-foreground">{attention.text}</p>{bot ? <Button asChild variant="outline"><Link to="/b/$botId" params={{ botId: bot.bot_id }}>打开 {bot.name}</Link></Button> : <p className="text-meta text-muted-foreground">{read ? "未找到所属 Bot" : "Bot 身份未加载"}</p>}</CardContent></Card>
   return null
 }

@@ -37,9 +37,9 @@ import type { NotificationDestination } from '@vibeface/client/lib/platform.ts'
 import { hookHarness, moduleLoader } from '../../lib/test-harness.ts'
 
 test("bulk inbox actions re-arm focus after an intervening list update", () => {
-  const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "../../routes/_app/inbox.tsx"), "utf8")
+  const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "pending-section.tsx"), "utf8")
   const start = source.indexOf("const action = async (kind")
-  const action = source.slice(start, source.indexOf("\n  return <div", start))
+  const action = source.slice(start, source.indexOf("\n  return <section", start))
   assert.ok(action.indexOf("held.current = { key: bulkFocusKey") >= 0)
   assert.ok(action.indexOf("held.current = { key: bulkFocusKey") < action.indexOf("setBusy(kind)"), "the action re-arms the sentinel before the list can change")
 })
@@ -3039,10 +3039,7 @@ test('both task overviews preserve known records, show their coverage and only n
       const empty = elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'WorkspaceEmpty' : 'MobileEmpty'))
       assert.ok(empty && typeof empty.type === 'function')
       assert.match(platform === 'web' ? String(empty.props.title) : componentText(empty.type(empty.props)), /当前记录没有未完成的任务/)
-      if (platform === 'native') {
-        assert.equal(elements.some(({ type, props }) => type === 'Link' && props.href === '/inbox'), true, 'the incoming mobile inbox entry remains available with no pending items')
-        assert.equal(elements.some(({ props }) => props.accessibilityLabel === '查看待处理'), true)
-      }
+      assert.equal(elements.some(({ type }) => type === 'PendingSection'), true, `${platform} keeps 待处理 atop the task page`)
     } finally { app.close() }
   }
 })
@@ -3150,7 +3147,7 @@ test('both task overviews reconcile raw confirmations and only fold task process
         const elements = render()
         assert.equal(count(elements), ['same', 'outside-bound', 'missing'].includes(variant) ? 1 : variant === 'running' ? 1 : 2, `${platform} ${variant} preserves exactly the represented checks`)
         if (variant === 'same' || variant === 'outside-bound') {
-          if (platform === 'web') assert.equal(elements.filter(({ type }) => type === 'ConfirmCard').length, 1, 'the real unknown work keeps its confirmation action')
+          assert.equal(elements.some(({ type }) => type === 'ConfirmCard'), false, `${platform} confirms the real unknown work in 待处理, not again in the list`)
           assert.doesNotMatch(componentText(elements), /程序状态待确认|任务状态待确认/)
         }
         if (variant === 'missing') {
@@ -3546,7 +3543,7 @@ test('native Stack focus restores non-chat views while the chat route owns its a
   } finally { app.close() }
 })
 
-test("task filters keep the counts, device confirmations and empty state within the selected Bot", () => {
+test("task filters leave live confirmations and questions to 待处理 and keep the empty state within the selected Bot", () => {
   const bots = [{ bot_id: "a", conversation_id: "chat-a", name: "Bot A" }, { bot_id: "b", conversation_id: "chat-b", name: "Bot B" }]
   const work = (conversation_id: string) => ({ kind: "work", work_id: conversation_id, check_id: conversation_id, conversation_id, target_node: "offline", title: conversation_id, detail: "", reason: "offline" })
   let inbox = [
@@ -3568,24 +3565,22 @@ test("task filters keep the counts, device confirmations and empty state within 
   const named = (elements: ReturnType<typeof app.render>, name: string) => elements.find(({ type }) => typeof type === "function" && type.name === name)
   try {
     let elements = app.render("TasksOverview")
-    assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 2)
+    assert.equal(elements.some(({ type }) => type === "PendingSection"), true)
+    assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 2, "live checks and questions act in 待处理 and still count")
     const selectBot = named(elements, "TaskFilters")?.props.onBotFilter
     assert.ok(typeof selectBot === "function")
     selectBot("a")
     elements = app.render("TasksOverview")
     assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 1)
-    const checks = nestedElements(elements, ["AttentionActivity"]).filter(({ type }) => type === "ConfirmCard").map(({ props }) => props.check)
-    assert.deepEqual(JSON.parse(JSON.stringify(checks)), [{ kind: "device", works: [work("chat-a")] }])
-    assert.equal(elements.some(({ type }) => type === "QuestionCard"), false)
-    assert.equal(elements.find(({ props }) => props.role === "status")?.props.children, "1 项任务")
-    inbox = inbox.filter((item) => item.kind === "question")
+    assert.equal(nestedElements(elements, ["AttentionActivity"]).some(({ type }) => type === "ConfirmCard" || type === "QuestionCard"), false)
+    assert.equal(named(elements, "WorkspaceEmpty"), undefined, "the task list does not claim emptiness under waiting items")
+    inbox = []
     elements = app.render("TasksOverview")
-    assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 0)
     assert.equal(named(elements, "WorkspaceEmpty")?.props.title, "没有符合筛选的任务")
   } finally { app.close() }
 })
 
-test("a device confirmation stays visible when Bot filtering removes the first Work", () => {
+test("Bot filtering keeps the remaining Work and leaves its device confirmation to 待处理", () => {
   const bots = [{ bot_id: "a", conversation_id: "chat-a", name: "Bot A" }, { bot_id: "b", conversation_id: "chat-b", name: "Bot B" }]
   const openWork = (conversation_id: string) => ({ work_id: `work-${conversation_id}`, conversation_id, trigger: "message:one", target_node: "offline", cwd: "/project", title: conversation_id, prompt: "检查", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, kind: "codex", thread_id: `thread-${conversation_id}` })
   const works = [openWork("chat-a"), openWork("chat-b")]
@@ -3607,12 +3602,12 @@ test("a device confirmation stays visible when Bot filtering removes the first W
     assert.ok(typeof selectBot === "function")
     selectBot("b")
     elements = app.render("TasksOverview")
-    const checks = nestedElements(elements, ["TaskOverviewCard"]).filter(({ type }) => type === "ConfirmCard").map(({ props }) => props.check)
-    assert.deepEqual(JSON.parse(JSON.stringify(checks)).map((check: { works: { conversation_id: string }[] }) => check.works.map((work) => work.conversation_id)), [["chat-b"]])
+    assert.deepEqual(elements.filter(({ type }) => typeof type === "function" && type.name === "TaskOverviewCard").map(({ props }) => (props.work as { conversation_id: string }).conversation_id), ["chat-b"])
+    assert.equal(elements.some(({ type }) => type === "ConfirmCard"), false)
   } finally { app.close() }
 })
 
-test("mobile task attention counts unanswered questions and program checks and opens their inbox", () => {
+test("mobile task screen holds 待处理 and claims no emptiness while something waits", () => {
   let inbox: unknown[] = [{ kind: "question", done: false }, { kind: "confirm", check: { kind: "process" } }, { kind: "question", done: true }]
   const app = componentHarness("../../../../../apps/mobile/src/features/home/tasks.tsx", {
     "@/data/live": { useLive: () => null, useInbox: () => inbox },
@@ -3625,7 +3620,7 @@ test("mobile task attention counts unanswered questions and program checks and o
     const attention = () => elements.find(({ type }) => typeof type === "function" && type.name === "MobileMasthead")?.props.attention
     const empty = () => elements.some(({ type }) => typeof type === "function" && type.name === "MobileEmpty")
     assert.equal(attention(), null, "counts remain unknown without the live connection first read")
-    assert.equal(elements.some(({ type, props }) => type === "Link" && props.href === "/inbox"), true)
+    assert.equal(elements.some(({ type }) => type === "PendingSection"), true)
     assert.equal(empty(), false)
     inbox = []
     elements = app.render("TasksScreen")
@@ -3937,8 +3932,7 @@ test("task overview keeps pending decisions with their task and every real task 
     const elements = app.render('TasksOverview')
     assert.deepEqual(elements.filter(({ props }) => props.work).map(({ props }) => (props.work as { work_id: string }).work_id), ['held', 'running'], 'a task waiting for confirmation remains visible before active tasks')
     assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === 'WorkspaceMasthead')?.props.attention, 1, 'the same task, question and confirmation are counted once')
-    assert.equal(elements.filter(({ type }) => type === 'QuestionCard').length, 1)
-    assert.equal(elements.filter(({ type }) => type === 'ConfirmCard').length, 1)
+    assert.equal(elements.some(({ type }) => type === 'QuestionCard' || type === 'ConfirmCard'), false, 'the question and confirmation act only in 待处理')
     assert.equal(elements.some(({ props }) => typeof props.children === 'string' && props.children === '2 项任务'), true)
   } finally { app.close() }
 })
