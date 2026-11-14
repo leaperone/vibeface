@@ -34,6 +34,6 @@ Desktop 的窗口、输入、时间线和业务设置由原生视图实现。客
 
 Windows 保留当前 SID 权限、私有命名管道、Unicode 路径、数据锁、进程和用户级服务检查。Codex App Server 的 `unix://PATH` 使用 Windows AF_UNIX，与维护命名管道分开。安装和运行不依赖 WSL、Git Bash、管理员或开发者模式。
 
-每个平台独立构建和校验。打包器复制同源、同版本运行包并在签名后复核其 `FILES.sha256`。来源收据记录 GPUI 版本和运行包归档摘要。macOS Developer ID/公证与 Windows Authenticode 状态分别核实；未签名开发预览不能视为正式签名发行。
+每个平台独立构建和校验。打包器复制精确锁定的 CLI 运行包并在签名后复核其 `FILES.sha256`，Desktop 与运行包的版本和源码可以不同。来源收据记录 GPUI 版本和运行包归档摘要。macOS Developer ID/公证与 Windows Authenticode 状态分别核实；未签名开发预览不能视为正式签名发行。
 
 真实窗口验收使用原生程序、独立 profile 和受控 Provider。图形启动、功能矩阵、IME、无障碍、系统通知、服务更新和性能分别提供运行证据。CI 成功、跨目标编译或依赖接口存在不能代替这些验收。

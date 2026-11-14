@@ -49,9 +49,8 @@ def component_info(directory=ROOT, content_root=None, verify=True, ignored=()):
             and re.fullmatch(r'[0-9a-f]{40}', info['source_commit'])
             and re.fullmatch(r'\d+\.\d+\.\d+(?:-rc\.\d+|-hourly\.\d{10})?', info['version']),
             'invalid component identity')
-    expected_tags = (('www-v' if app == 'www' else 'v') + info['version'],
-                     'core-v' + info['version'] if app == 'core' else '')
-    require(info['tag'] in expected_tags, 'component tag mismatch')
+    expected_tag = {'core': 'core-v', 'app': 'app-v', 'www': 'www-v'}[app] + info['version']
+    require(info['tag'] == expected_tag, 'component tag mismatch')
     if app == 'core':
         require(info['target'] == 'x86_64-unknown-linux-gnu' and type(info['data_epoch']) is int,
                 'unsupported Core component')
@@ -196,7 +195,7 @@ def self_test():
     with tempfile.TemporaryDirectory(dir=artifact_root, prefix='runtime-check-') as temporary:
         directory = Path(temporary)
         (directory / 'vibeface-core').write_bytes(b'fixture')
-        info = {'app': 'core', 'schema': 1, 'version': '1.0.0', 'tag': 'v1.0.0', 'channel': 'stable',
+        info = {'app': 'core', 'schema': 1, 'version': '1.0.0', 'tag': 'core-v1.0.0', 'channel': 'stable',
                 'target': 'x86_64-unknown-linux-gnu', 'source_commit': 'a' * 40, 'data_epoch': 1,
                 'files': {'vibeface-core': hashlib.sha256(b'fixture').hexdigest()}}
         (directory / 'COMPONENT-INFO.json').write_text(json.dumps(info))

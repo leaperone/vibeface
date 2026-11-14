@@ -5,7 +5,7 @@ on:
       source_sha: {type: string, required: true}
       runner: {type: string, required: true}
       target: {type: string, required: true}
-      native_artifact_id: {type: string, required: true}
+      runtime_tag: {type: string, required: true}
       sign: {type: boolean, default: false}
     secrets:
       MACOS_CERTIFICATE_P12_BASE64: {required: false}
@@ -22,6 +22,7 @@ on:
         value: ${{ jobs.desktop.outputs.artifact_id }}
 permissions:
   contents: read
+  actions: read
 jobs:
   desktop:
     name: Build desktop / ${{ inputs.target }}
@@ -33,12 +34,7 @@ jobs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with: {ref: '${{ inputs.source_sha }}', persist-credentials: false}
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          artifact-ids: ${{ inputs.native_artifact_id }}
-          merge-multiple: true
-          path: .artifacts/native-release
+        with: {ref: '${{ inputs.source_sha }}', fetch-depth: 0, persist-credentials: false}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with: {node-version: '24'}
       - name: Select this platform's Python
@@ -55,8 +51,12 @@ jobs:
         id: runtime
         env:
           TARGET: ${{ inputs.target }}
+          RUNTIME_TAG: ${{ inputs.runtime_tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          version=$("$PY" -B scripts/release.py plan --app product | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["version"])')
+          "$PY" -c 'import json, os; assert json.load(open("releases/desktop.json"))["cli"]["tag"] == os.environ["RUNTIME_TAG"], "runtime tag must match the desktop dependency lock"'
+          "$PY" -B scripts/release.py dependency --app desktop --dependency cli --target "$TARGET" --output .artifacts/native-release
+          version="${RUNTIME_TAG#cli-v}"
           archive=".artifacts/native-release/vibeface-$version-$TARGET.tar.gz"
           "$PY" -B scripts/checksum.py ".artifacts/native-release/vibeface-$version-$TARGET.tar.gz.sha256"
           mkdir -p .artifacts/runtime
@@ -93,7 +93,7 @@ jobs:
           TARGET: ${{ inputs.target }}
         run: |
           node scripts/verify-desktop.mjs --target "$TARGET" --input .artifacts/desktop
-          "$PY" -B scripts/release.py manifest product .artifacts/desktop
+          "$PY" -B scripts/release.py manifest desktop .artifacts/desktop
       - name: Remove the signing keychain and notary key
         if: always() && inputs.sign && runner.os == 'macOS'
         run: |

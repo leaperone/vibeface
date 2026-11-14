@@ -137,7 +137,7 @@ def self_test():
             (web / name).write_text('published fixture')
         (web / '.vibeface-build.json').write_text(json.dumps({'version': 1, 'component': 'web',
                                                             'content_security_policy': "default-src 'self'"}))
-        info = {'app': 'app', 'schema': 1, 'version': '1.0.0', 'tag': 'v1.0.0', 'channel': 'stable',
+        info = {'app': 'app', 'schema': 1, 'version': '1.0.0', 'tag': 'app-v1.0.0', 'channel': 'stable',
                 'source_commit': 'a' * 40, 'target': None,
                 'files': {str(path.relative_to(component)): hashlib.sha256(path.read_bytes()).hexdigest()
                           for path in web.iterdir()}}

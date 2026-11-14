@@ -1,111 +1,58 @@
 ---
 name: release
-description: 使用统一产品 Tag 或独立官网 Tag 发布 Vibeface，构建并签名本机 iOS 真机版本，核对制品与 npm 发布结果。
+description: 独立发布 Vibeface Core、App、CLI/npm、Desktop、Mobile 或 WWW，构建并签名本机 iOS 版本，核对不可变制品和分发结果。
 ---
 
 # Vibeface release
 
-本 skill 及引用文档只保留通用流程和占位变量。个人账号、设备名称或 UDID、证书身份或指纹、本机绝对路径、凭据和内部会话信息仅在运行时读取并按需留在私有本地证据中，不写入 skill 或公开 PR，凭据不写入日志。
+只执行会话已授权的发布范围。合并、构建通过或修改本 skill 不构成新的发布授权；已有自动 Hourly 与服务自动上线授权继续适用。人工发布确定应用、渠道和精确版本，Stable 的 patch/minor/major 不自行猜测。Hourly 交给自动协调器，不手工改时间造版本。
 
-## 本机 iOS 构建
+先读[发布说明](../../../packages/docs/releasing.md)、[发布工具](../../../scripts/release.py)和对应版本文件。首个正式版前基准保持 0.0.1，main 的开发版本固定；不保留旧 Product updater 的兼容路径。
 
-`release ios <SOURCE_SHA>` 构建指定源码的本机开发签名 App。执行前核对该源码声明的版本；它不创建独立 iOS Tag，也不发布整套产品。先读 [iOS 命令行构建](references/ios-local-build.md)。默认由独立 Aqua LaunchAgent 执行 Expo、CocoaPods 和 `xcodebuild`，复用本机已有开发签名身份，不依赖操作 Xcode 窗口。当前 Codex 后台 daemon 保持原样。
-
-本机开发签名构建、真机安装、公开产品发布和 TestFlight 分发分别核验、分别授权。只要求本机构建时，不因此创建产品 Tag 或发布 npm。安装已有制品使用 [Deploy skill](../deploy/SKILL.md) 的 `deploy ios <制品路径>`；缺少可安装制品时先完成单独授权的构建。CI 的分发签名仍使用现有 `scripts/build-ios.sh` 流程。
-
-## 确认发布范围
-
-只执行用户明确授权的发布。已有会话中的授权仍适用时继续执行，不重复确认。开发完成、合并 PR、preflight 通过、版本文件变化，以及修改本 skill，都不构成发布授权。语境中的 `ship` 若指合并 PR，只完成 Shipping。
-
-发布范围必须确定发布组、渠道与目标版本。产品组包含 Core、CLI、Web App、Desktop 和 Mobile，官网组独立。精确版本可以推出渠道；Stable 的 `patch`、`minor`、`major` 必须由用户选择，不默认 patch。按该应用最新正式 tag 计算递增；尚无正式版时使用用户指定的初始版本。Hourly 只由自动协调器生成，人工发布只用 Stable 或 RC。缺少影响范围的信息时询问，不自动扩大为其他发布组。
-
-示例：`release product stable 0.0.1`、`release product rc`、`release www stable patch`。这些是 skill 参数，不是 shell 命令。
-
-先读 [发布说明](../../../packages/docs/releasing.md)、[发布工具](../../../scripts/release.py) 和目标应用的版本文件。人工版本准备遵守 [AGENTS.md](../../../AGENTS.md) 的独立 worktree、单 PR 与合并规则。
-
-| 发布组 | Tag | 版本来源 | 交付结果 |
+| 应用 | Tag | 入口 | 依赖与结果 |
 | --- | --- | --- | --- |
-| product | `v<version>` | CLI Cargo 版本；各产品组件的发行版本必须与之完全一致 | 一个 Release 包含四个原生目标的电脑完整包、macOS/Windows/Linux 桌面 App、Web App、Android APK、iOS 设备归档及配置签名后的 IPA |
-| www | `www-v<version>` | `apps/www/package.json` | 独立官网归档，不触发部署 |
+| core | `core-v<version>` | `release-core.yml` | 四个 Core 原生归档；自动更新公共 Node |
+| app | `app-v<version>` | `release-app.yml` | 静态 App；自动更新 App 服务 |
+| cli | `cli-v<version>` | `release.yml` | 四个完整运行包与 npm；锁定 Core/App |
+| desktop | `desktop-v<version>` | `release-desktop-app.yml` | 四个平台桌面制品；锁定 CLI 运行包 |
+| mobile | `mobile-v<version>` | `release-mobile.yml` | Android 与 iOS 独立生产者；不内置 App/Core |
+| www | `www-v<version>` | `release-www.yml` | 静态官网；自动更新 WWW |
 
-版本只使用 `X.Y.Z`、`X.Y.Z-rc.N` 或 `X.Y.Z-hourly.YYYYMMDDHH`。Hourly 时间取 UTC 小时，只用于产品组。产品只使用 `v`，官网只使用 `www-v`；不新增旧应用前缀别名，不使用可变 Tag、build metadata 或重复版本。
+CLI/npm 共用版本。版本语法为 `X.Y.Z`、`X.Y.Z-rc.N`、`X.Y.Z-hourly.YYYYMMDDHH`。没有全局 `v<version>` 标签，不创建可变标签、别名、build metadata 或重复版本。
 
-## 每小时自动 Hourly
+## 自动 Hourly
 
-用户已授权每小时自动发布产品 Hourly。`hourly.yml`（Release / Hourly）使用 `17 * * * *`，也可从 main 手动派发。GitHub schedule 是 best effort，可能延迟或跳过。协调器 `scripts/hourly.py` 只用 `GITHUB_TOKEN`，全局串行，不创建分支或 PR，不改 main。
+用户已授权自动 Hourly 和官方服务上线。`hourly.yml` 在 main push CI 成功后、每小时 cron 与上游发布唤醒时运行。协调器选已通过同 SHA main push CI 的源码，仅为构建输入或依赖 pin 变化的应用生成 Tag。Core/App/Mobile/WWW 独立；CLI 等 Core/App，Desktop 等 CLI。一个应用失败只阻止自己的消费者。
 
-批次取运行时的 UTC 小时 `YYYYMMDDHH`。协调器选 main first-parent 上最新一个 `ci.yml` push run 成功的提交作为 parent。该提交不包含最新 Hourly tag 的 parent 时跳过；等于该 parent 且那次发布正在运行或已成功时跳过，失败时同一提交只重建一次，再失败则协调器报错停止；本小时 tag 已存在时只核对来源并补派发缺失的 release run；更晚的 Hourly tag 已存在时停止。否则生成一个 bot 机械提交，只改产品版本文件、Cargo.lock 三个本仓包版本、Android versionCode（`YYMMDDHH`）和 iOS buildNumber（`YYMM.DD.HH`），打 `v<X.Y.Z>-hourly.<YYYYMMDDHH>` 并派发 `release.yml`。main 的版本文件固定为 Hourly 开发版本，只有 tag 提交带真实小时。
+生成提交只有一个 main parent，只改所选版本、必要的 Cargo.lock 本地包或 Mobile build number，以及 `releases/cli.json`/`releases/desktop.json` 的精确依赖 pin。`scripts/hourly.py` 会重建 Git tree 校验来源，不改变 main。每个应用每 UTC 小时最多一个 Tag；已有 Tag 只能对账和补派发，不覆盖。
 
-协调器不等待构建，也不追溯或恢复以前的小时。某小时构建失败时，该 Release 保持未完成、不写 `release.json`，下一小时照常发布新版本。所有发布入口共用来源门：main 上的来源要求同一 SHA 的 main push CI success；detached 来源必须是 parent 在 main 上的精确 Hourly 机械提交，且 parent 有 main push CI success。Hourly 自动发布 npm（dist-tag `hourly`），不部署、不上传 TestFlight 或 App Store，官网不参与。不要在人工会话中无授权派发 `hourly.yml`。
+## 人工版本与发布
 
-## 准备并验证版本
+在一个独立分支/PR 准备所选应用版本、锁文件条目与精确依赖 pin。其他应用不用一起递增。依赖 pin 含 tag、version、source_commit、manifest_sha256；Stable 只消费 Stable 依赖。人工 Stable/RC 来源必须已在 main，且同 SHA main push CI 通过。具体命令如下，变量取已授权的实际值。
 
-1. 在任务 worktree 中同步各产品组件版本及 `Cargo.lock` 的本仓包版本，或只修改独立官网版本。Mobile marketing version 和原生 build number 按目标分发规则处理。准备好的精确版本可直接发布，不为打 tag 再自动递增一次。
-2. Web、macOS、Windows、Linux x64、Linux ARM64 原生程序、Android 和 iOS 在同一运行并行构建。桌面 App 只等待本平台完整运行包。每个平台组包只等自己的原生输入和 Web，以不可变 artifact ID 验证同一源码、版本与目标。不得等待或拉取独立公开组件 Release。每组校验通过即可追加并供手动下载；完整产品集通过才追加全局 `release.json`，标记整套发布完成。
-3. 在同一 PR 完成相关检查和独立审查，再按已有授权合并。不得直接在 main 上修改、commit 或 push 版本。
-4. 固定包含版本修改的完整 `SOURCE_SHA`。在指向该提交的干净 worktree 中验证；保留主 checkout 的无关修改。人工准备的提交必须已进入远端 main，版本必须与 tag 完全一致；自动 Hourly 使用前述共享来源门。
-5. 核对该 SHA 的必要检查与 main CI 均已通过。`pending`、缺少检查或只有其他 SHA 的成功记录均不能放行。失败先修复，不用打 tag 探测构建是否能过。
-
-打 tag 前使用现有只读校验入口，`APP` 取 `product` 或 `www`，`VERSION` 取已确认的版本：
-
-```bash
-set -euo pipefail
-git fetch origin main --tags
-SOURCE_SHA=$(git rev-parse HEAD)
-if [[ "$APP" == product ]]; then
-  TAG="v$VERSION"
-  WORKFLOW=release.yml
-else
-  TAG="www-v$VERSION"
-  WORKFLOW=release-www.yml
-fi
-python3 scripts/release.py plan --app "$APP" --tag "$TAG" --require-main
-gh run list --repo leaperone/vibeface --workflow ci.yml --commit "$SOURCE_SHA" \
-  --json databaseId,event,headBranch,headSha,status,conclusion,url
+```sh
+python3 -B scripts/release.py plan --app "$APP" --tag "$TAG" --require-main
 git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}"
 ```
 
-要求工作树干净、`plan` 成功，且 main CI 的 `headSha` 等于 `SOURCE_SHA`、`event=push`、`headBranch=main`、状态为 `completed/success`。同时核对本地与远端同名 tag；已有 tag 按下一节处理。只有本地、远端均无该 tag 且检查通过时，才创建并仅推送这一个 tag：
+核对干净源码、版本、main CI 与远端同名 Tag。只在本地和远端都不存在该 Tag 时创建精确不可变 Tag，再只推送这一 Tag。已有同名 Tag 先解析到完整 SHA，不同源码立即停止，禁止移动、删除重建、强推或更改保护规则。
 
-```bash
-set -euo pipefail
-test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-python3 scripts/release.py plan --app "$APP" --tag "$TAG" --require-main
-REMOTE_TAGS=$(git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}")
-test -z "$REMOTE_TAGS"
-git tag -a "$TAG" "$SOURCE_SHA" -m "$TAG"
-git push origin "refs/tags/${TAG}:refs/tags/${TAG}"
-```
+真实发布从精确 Tag ref 派发所选入口，`tag` 相同、`publish=true`。`publish=false` 只构建；CLI/Desktop 构建源码仍须携带完整依赖 pin。入口的身份检查、签名门和 source/CI 门不能跳过。
 
-GitHub 的不可变发布 Tag 规则保护产品 `v*`、官网与历史应用 Tag，禁止更新和删除，没有绕过者。创建时的完整格式由预检和 CI 验证，CI 还核对版本文件与共享来源规则。规则保护不代替打 tag 前的检查。
+## 对账与验收
 
-## 处理现存 tag 与失败
+每个应用有自己的九字段 `release.json`，只有本应用全部资产验证成功才最后发布。组件的 `COMPONENT-INFO.json`、CLI 的九字段 `BUILD-INFO.json`、Desktop/Mobile 来源收据和全部文件摘要必须匹配。CLI/Core/App 版本和源码允许不同，但必须与所选精确 pin 相同。
 
-- 同名本地或远端 tag 已存在：解析 annotated tag 的最终 commit 并核对 SHA。不同提交立即停止，禁止覆盖、强推、删除重建或改保护规则。同一提交的本地 tag 可直接推送；远端已存在则检查已有 Release 和关联 runs，已成功就报告已有结果。
-- 相同 tag、相同源码的构建因基础设施失败时，先对账并保留已有制品，再重跑失败任务。Hourly 失败通常直接由下一小时取代；确需补救时只用 `gh run rerun <原-run-id> --repo leaperone/vibeface --failed` 重跑原运行。其他 Tag 确需重新派发时使用 `gh workflow run "$WORKFLOW" --repo leaperone/vibeface --ref "$TAG" -f tag="$TAG" -F publish=true`。不重新打 tag，不覆盖已上传字节；若重建结果与已上传制品不同，停止重试并使用新版本。
-- 修复源码必须走新 PR 和新版本、新 tag。构建中的同一 Release 允许追加其他已校验平台的附件；已公开字节和 tag 不覆盖、不删除。回滚也通过新版本交付修正。
-- 推送或发布返回结果未知时，先查询远端 tag、Release 和 Actions 对账，再决定下一步。不要直接重发。
+已公开字节不覆盖。失败优先重跑原 run 的失败任务，复用原 artifact ID；新源码使用新版本。写入响应未知时查询 Tag、Release、资产摘要、Actions 或 npm registry 后再决定，不能直接重复写入。公开附件不等于完成，缺少清单时任何自动消费者都必须拒绝。
 
-## 跟踪实际发布结果
+跟踪本次 Tag/source 对应的全部运行到终态，不能用“最新一条”猜测，不把 pending 当成功。分别报告构建、公开 Release、npm、服务部署和移动端分发。Node 需读回版本、身份和健康；App/WWW 需读回页面/版本头。发布父 workflow 使用 `release-dispatch.py` 等待真实子部署结果。
 
-每次推送 tag 后立即按完整 `SOURCE_SHA`、`TAG` 和事件核对对应的 [产品](../../../.github/workflows/release.yml) 或 [官网](../../../.github/workflows/release-www.yml) workflow 的 runs。使用 `gh-run-watch` 持续跟踪所有本次关联 runs 到终态。不要用“最新一条”猜 run，也不要把 API 观察超时当作构建失败后重复发布。
+npm 通过 OIDC 发布原不可变 tgz，Stable/RC/Hourly 分别使用 latest/rc/hourly。自动调用方仍为 `release.yml`，手动入口 `npm-publish.yml`；两者使用 npm-release environment。先核对真实 trust、provenance、integrity 与 dist-tag，不把代码配置视为权限已生效，不索取或记录长期 token。
 
-公开附件不代表整套发布已完成。缺少全局 `release.json` 时，报告为构建中，用户可手动下载已校验平台；新版安装器和自动更新器跳过它。产品 run 失败且尚无 `release.json` 时，`release-failed` 把正文标为 FAILED；重跑失败 job 完成后写回完成说明，完整重跑先恢复为构建中。已安装旧客户端无法追溯修改，可能更新已具备完整电脑包和校验文件的平台，缺少目标时失败并保留现版。完整发布成功后，核对唯一 `release.json` 的发布组、Tag、版本、完整源码 SHA、精确文件集合和 SHA-256。产品文件集合必须与 `scripts/release.py` 定义的完整集合一致，包含所有桌面安装包、移动端包、校验和与来源收据；Core、App 与官网核对 `COMPONENT-INFO.json`，完整电脑包核对九字段 `BUILD-INFO.json` 和内部文件摘要，APK 核对 `.provenance.json`。所有产品载荷必须来自同一源码和版本。上传成功不等于制品通过运行验收。
+## 本机 iOS 与平台分发
 
-产品发布不更新 App 或公共节点。用户要求部署这些服务时，使用相邻的 [deploy skill](../deploy/SKILL.md)，显式选择已经完整发布的产品 Tag。不得由 `release product` 自动派发部署。
+`release ios <SOURCE_SHA>` 只构建指定源码的本机开发签名 App。执行前读 [iOS 命令行构建](references/ios-local-build.md)，核对该源码自己的 Mobile 版本，复用现有开发签名。默认使用现有 Aqua LaunchAgent 执行 Expo、CocoaPods 和 xcodebuild，不操作 Xcode 窗口或后台 daemon。
 
-官网发布同样不自动部署。部署官方站点时，在本仓库执行 `deploy www <精确官网 Tag>`，与产品服务使用相同的独立部署流水线。核对实际运行版本、镜像和线上页面，不能把 workflow 启动当作上线。
+本机构建、真机安装、公开 Mobile Release、TestFlight 和商店发布分别核验、按各自授权执行。安装已有 App 使用相邻 [deploy skill](../deploy/SKILL.md)。CI unsigned device archive 不可安装；App Store Connect IPA 构建不代表 Apple 已接收或测试者可用。TestFlight 上传、处理、分组、App Store 提交另行核对。
 
-npm 使用 [npm-publish.yml](../../../.github/workflows/npm-publish.yml)，当前仅支持 CLI Hourly，dist-tag 为 `hourly`；较旧的小时晚于新版本完成时跳过，不回拨 dist-tag。`release.yml` 在产品 `publish-product` 成功后自动调用它，以 `collect` 产生的原不可变 npm artifact ID 验证源码与包，再通过 OIDC 公开发布。npm trust 须分别允许调用方 `release.yml` 与手动入口 `npm-publish.yml`，均绑定 `npm-release` environment。手动入口允许同 Tag、同 SHA 的唯一已完成 release run，只要 `collect` 和 `publish-product` 成功，即使总 run 因 npm 标红。手动入口默认 dry run，实际发布须显式 `publish=true`，不得配置长期 npm token 或索取聊天凭证。配置命令和 registry 对账规则见 [发布说明](../../../packages/docs/releasing.md#npm-hourly-制品与发布)；仓库改动不代表远端 trust 已生效或真实 OIDC 发布已验收。
-
-iOS 默认使用 `app-store-connect` 分发方式，先通过 TestFlight 内测，再准备 App Store 发布。签名 IPA 的 `testflight_eligible=true` 只代表导出方式和描述文件通过校验，不代表 Apple 已接收或内测已可安装。TestFlight 上传、Apple 处理、内部测试组分配、App Store 提交和真机验收另行完成；不能把未签名设备归档或 CI 成功报告成可安装的 iOS App。
-
-最终逐发布组报告 Tag、完整源码 SHA、Actions URL 与结论、Release 与每类载荷的下载校验结果。部署、npm、移动端分发和实际运行验收分别说明；未发生或未验证的步骤明确标注。
-
-## 构建验证与切换
-
-产品使用 `release.yml`，官网使用 `release-www.yml`，入口固定发布组，不接受 `app`。两个手动入口均默认 `tag=''`、`publish=false`，可从开发分支完整构建，不要求真实 Tag。该结果只证明构建与验收，不代表公开发布、部署、npm registry 写入或升级已发生。按 `APP` 设置上文的 `WORKFLOW` 后，使用 `gh workflow run "$WORKFLOW" --ref <branch> -F publish=false` 验证实际并行与最终完整 artifact。新增入口需合入默认分支后才可派发。`scripts/release-entry.py` 统一检查入口身份；产品入口保持 `release.yml`，npm trust 的调用方文件名不变。
-
-真正发布必须使用现存精确 Tag 作为 workflow ref，显式 `publish=true`；身份检查对 main 来源要求同一 SHA 的 main push CI success，对 Hourly 机械提交要求其 main parent 的 main push CI success。`release-start` 只负责创建或确认一个公开 Release，各平台发布任务仅写自己独占的附件名称，最终 `publish-product` 最后写入全局 `release.json` 和完成状态；生产者与 `collect` 仍只上传 Actions 制品。
-
-旧 CLI 只识别旧 `cli-v` 格式，首次切换按安装说明手动安装新版完整包，之后由新版跟踪产品 `v`。不创建兼容 Tag、不自动覆盖已有安装或迁移数据。
+macOS 保留 Developer ID/notarization；Windows Stable 要求签名，预览制品明确记录 unsigned 状态。平台签名不能被 SHA256 清单替代。个人账号、设备标识、主机路径、凭据与证书私有信息只在运行时按需读取，不写入 skill、制品或公开 PR。

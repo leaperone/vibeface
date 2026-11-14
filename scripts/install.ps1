@@ -43,9 +43,9 @@ function Select-Release {
         if ($release.prerelease -ne $wanted) { continue }
         $tag = [string] $release.tag_name
         $shape = if ($wanted) {
-            '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-hourly\.([0-9]{10})$'
+            '^cli-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-hourly\.([0-9]{10})$'
         } else {
-            '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+            '^cli-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
         }
         $found = [regex]::Match($tag, $shape)
         if (-not $found.Success) { continue }
@@ -85,6 +85,31 @@ function Get-OptionalDownload {
     return $true
 }
 
+function Confirm-DependencyPin {
+    param([object] $Pin, [string] $Component)
+    if ($Pin -isnot [pscustomobject] -or
+        (@($Pin.PSObject.Properties.Name | Sort-Object) -join ',') -cne 'manifest_sha256,source_commit,tag,version') {
+        Fail 'invalid release dependency pin fields'
+    }
+    $match = [regex]::Match([string]$Pin.version,
+        '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-hourly\.([0-9]{10})|-rc\.([1-9][0-9]*))?$')
+    if ($Pin.version -isnot [string] -or -not $match.Success -or
+        $Pin.tag -cne "$Component-v$($Pin.version)" -or
+        $Pin.source_commit -isnot [string] -or $Pin.source_commit -cnotmatch '^[0-9a-f]{40}$' -or
+        $Pin.manifest_sha256 -isnot [string] -or $Pin.manifest_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        Fail 'invalid release dependency pin identity'
+    }
+    foreach ($part in 1..3) {
+        $number = [uint64] 0
+        if (-not [uint64]::TryParse($match.Groups[$part].Value, [ref]$number)) { Fail 'invalid release dependency version' }
+    }
+    if ($match.Groups[4].Success) {
+        $parsed = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact($match.Groups[4].Value, 'yyyyMMddHH', [cultureinfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) { Fail 'invalid release dependency hour' }
+    }
+}
+
 function Confirm-Completion {
     param([object] $Release, [string] $Tag, [string] $Version, [string] $Archive, [string] $Target)
     $marker = @($Release.assets | Where-Object { $_.name -eq 'release.json' })
@@ -99,12 +124,38 @@ function Confirm-Completion {
     try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -ErrorAction Stop }
     catch { Fail 'invalid release completion manifest JSON' }
     $props = @($manifest.PSObject.Properties.Name | Sort-Object)
-    if (($props -join ',') -ne 'app,assets,channel,schema,source_commit,tag,version') { Fail 'invalid release completion manifest fields' }
+    if (($props -join ',') -cne 'app,assets,channel,contracts,dependencies,schema,source_commit,tag,version') { Fail 'invalid release completion manifest fields' }
     $channel = if ($Tag -match '-hourly\.') { 'hourly' } else { 'stable' }
-    if ($manifest.app -ne 'product' -or
+    if ($manifest.app -cne 'cli' -or
         ($manifest.schema -isnot [int] -and $manifest.schema -isnot [long]) -or $manifest.schema -ne 1 -or
         $manifest.tag -cne $Tag -or $manifest.version -cne $Version -or $manifest.channel -cne $channel -or
-        $manifest.source_commit -notmatch '^[0-9a-f]{40}$') { Fail 'release completion manifest identity mismatch' }
+        $manifest.source_commit -isnot [string] -or $manifest.source_commit -cnotmatch '^[0-9a-f]{40}$' -or
+        $Tag -cne "cli-v$Version") { Fail 'release completion manifest identity mismatch' }
+    if ($manifest.contracts -isnot [pscustomobject] -or
+        (@($manifest.contracts.PSObject.Properties.Name | Sort-Object) -join ',') -cne 'data_epoch,update_protocol') {
+        Fail 'invalid release contracts fields'
+    }
+    foreach ($contract in @('data_epoch', 'update_protocol')) {
+        $value = $manifest.contracts.$contract
+        if (($value -isnot [int] -and $value -isnot [long]) -or $value -ne 1) { Fail 'unsupported release contracts' }
+    }
+    if ($manifest.dependencies -isnot [pscustomobject] -or
+        (@($manifest.dependencies.PSObject.Properties.Name | Sort-Object) -join ',') -cne 'app,core') {
+        Fail 'invalid release dependencies fields'
+    }
+    Confirm-DependencyPin -Pin $manifest.dependencies.core -Component core
+    Confirm-DependencyPin -Pin $manifest.dependencies.app -Component app
+    if ($manifest.assets -isnot [array]) { Fail 'invalid completion manifest assets' }
+    $names = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($entry in $manifest.assets) {
+        if ($entry -isnot [pscustomobject] -or
+            (@($entry.PSObject.Properties.Name | Sort-Object) -join ',') -cne 'name,sha256,size' -or
+            $entry.name -isnot [string] -or $entry.name -cnotmatch '^[a-zA-Z0-9._-]+$' -or $entry.name -in @('.', '..') -or
+            -not $names.Add($entry.name) -or $entry.sha256 -isnot [string] -or $entry.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            ($entry.size -isnot [long] -and $entry.size -isnot [int]) -or $entry.size -le 0) {
+            Fail 'invalid completion manifest asset metadata'
+        }
+    }
     $targetItems = @($manifest.assets | Where-Object { $_.name -eq $Archive -or $_.name -eq "$Archive.sha256" })
     if ($targetItems.Count -ne 2 -or @($targetItems | Where-Object { $_.name -eq $Archive }).Count -ne 1 -or
         @($targetItems | Where-Object { $_.name -eq "$Archive.sha256" }).Count -ne 1) { Fail 'completion manifest target assets are missing or duplicated' }
@@ -191,8 +242,30 @@ function Confirm-Archive {
 }
 
 # Refuses a package that is not exactly the release it claims to be.
+function Confirm-BuildIdentity {
+    param([object] $Build, [string] $Version, [string] $Commit, [object] $Completion)
+    if ($Build -isnot [pscustomobject]) { Fail 'invalid BUILD-INFO object' }
+    $fields = @($Build.PSObject.Properties.Name | Sort-Object)
+    if (($fields -join ',') -cne 'app_source_commit,app_version,core_source_commit,core_version,data_epoch,source_commit,target,update_protocol,version') {
+        Fail 'BUILD-INFO does not declare exactly this release format'
+    }
+    foreach ($field in @('version', 'target', 'source_commit', 'core_version', 'core_source_commit', 'app_version', 'app_source_commit')) {
+        if ($Build.$field -isnot [string]) { Fail 'invalid BUILD-INFO identity field type' }
+    }
+    if ($Build.version -cne $Version -or $Build.target -cne $Target -or $Build.source_commit -cne $Commit -or
+        ($Build.update_protocol -isnot [int] -and $Build.update_protocol -isnot [long]) -or $Build.update_protocol -ne 1 -or
+        ($Build.data_epoch -isnot [int] -and $Build.data_epoch -isnot [long]) -or $Build.data_epoch -ne 1 -or
+        $Build.core_version -cne $Completion.dependencies.core.version -or
+        $Build.core_source_commit -cne $Completion.dependencies.core.source_commit -or
+        $Build.app_version -cne $Completion.dependencies.app.version -or
+        $Build.app_source_commit -cne $Completion.dependencies.app.source_commit) {
+        Fail 'BUILD-INFO does not match the release, platform, source commit, contracts or dependency pins'
+    }
+    return $Build
+}
+
 function Confirm-Package {
-    param([string] $Package, [string] $Version, [string] $Commit)
+    param([string] $Package, [string] $Version, [string] $Commit, [object] $Completion)
     $required = @(
         'vibeface.exe', 'vibeface-core.exe', 'BUILD-INFO.json', 'README.md',
         'RUNTIME-REQUIREMENTS.md', 'scripts\install-node-service.ps1', 'docs\node.md',
@@ -232,20 +305,7 @@ function Confirm-Package {
         Where-Object { $_.Name -ne 'FILES.sha256' })
     if ($present.Count -ne $declared.Count) { Fail 'file checksum coverage mismatch' }
     $build = Get-Content -LiteralPath (Join-Path $Package 'BUILD-INFO.json') -Raw | ConvertFrom-Json
-    $fields = @($build.PSObject.Properties.Name)
-    $expected = @('version', 'target', 'source_commit', 'update_protocol', 'data_epoch',
-        'core_version', 'core_source_commit', 'app_version', 'app_source_commit')
-    if ($fields.Count -ne $expected.Count) { Fail 'BUILD-INFO does not declare exactly this release format' }
-    foreach ($name in $expected) {
-        if ($fields -notcontains $name) { Fail "BUILD-INFO is missing $name" }
-    }
-    if ($build.version -ne $Version -or $build.target -ne $Target -or
-        $build.source_commit -ne $Commit -or $build.update_protocol -ne 1 -or
-        $build.data_epoch -ne 1 -or $build.core_version -ne $Version -or
-        $build.app_version -ne $Version -or $build.core_source_commit -ne $Commit -or
-        $build.app_source_commit -ne $Commit) {
-        Fail 'BUILD-INFO does not match the release, platform, source commit, or data epoch'
-    }
+    $build = Confirm-BuildIdentity -Build $build -Version $Version -Commit $Commit -Completion $Completion
     $reported = & (Join-Path $Package 'vibeface.exe') '--version'
     if ($LASTEXITCODE -ne 0 -or "$reported".Trim() -ne "vibeface $Version") {
         Fail 'packaged CLI version does not match the release'
@@ -298,7 +358,7 @@ function Install-Release {
     $chosen = $null
     for ($index = $selected.Count - 1; $index -ge 0; $index--) {
         $candidateTag = $selected[$index].Tag
-        $candidateVersion = $candidateTag.Substring(1)
+        $candidateVersion = $candidateTag.Substring(5)
         $candidatePackage = "vibeface-$candidateVersion-$Target"
         $candidateManifest = Confirm-Completion -Release ($releases | Where-Object tag_name -CEQ $candidateTag | Select-Object -First 1) `
             -Tag $candidateTag -Version $candidateVersion -Archive "$candidatePackage.tar.gz" -Target $Target
@@ -340,7 +400,7 @@ function Install-Release {
     & (Get-Tar) '-xzf' $archivePath '-C' $unpack
     if ($LASTEXITCODE -ne 0) { Fail 'cannot unpack release' }
     $unpacked = Join-Path $unpack $package
-    Confirm-Package -Package $unpacked -Version $version -Commit $commit
+    Confirm-Package -Package $unpacked -Version $version -Commit $commit -Completion $manifest
 
     $releasesDir = Join-Path $InstallRoot 'releases'
     New-Item -ItemType Directory -Path $releasesDir -Force | Out-Null
@@ -394,27 +454,27 @@ function Install-Release {
 # Checks the parts that need no network: tag selection, archive refusal, and the shim.
 function Invoke-SelfTest {
     $stable = @(
-        [pscustomobject]@{ tag_name = 'v1.9.0'; draft = $false; prerelease = $false },
-        [pscustomobject]@{ tag_name = 'v1.10.0'; draft = $false; prerelease = $false },
-        [pscustomobject]@{ tag_name = 'v999.0.0'; draft = $true; prerelease = $false },
-        [pscustomobject]@{ tag_name = 'cli-v999.0.0'; draft = $false; prerelease = $false },
-        [pscustomobject]@{ tag_name = 'v01.2.3'; draft = $false; prerelease = $false },
-        [pscustomobject]@{ tag_name = 'v999.0.0-rc.1'; draft = $false; prerelease = $true },
-        [pscustomobject]@{ tag_name = 'v0.0.1-hourly.2026101702'; draft = $false; prerelease = $true },
-        [pscustomobject]@{ tag_name = 'v0.0.1-hourly.2026101710'; draft = $false; prerelease = $true },
-        [pscustomobject]@{ tag_name = 'v0.0.1-hourly.2026022901'; draft = $false; prerelease = $true },
-        [pscustomobject]@{ tag_name = 'v0.0.1-hourly.2026101724'; draft = $false; prerelease = $true },
-        [pscustomobject]@{ tag_name = 'v0.0.1-nightly.20261018.1'; draft = $false; prerelease = $true },
+        [pscustomobject]@{ tag_name = 'cli-v1.9.0'; draft = $false; prerelease = $false },
+        [pscustomobject]@{ tag_name = 'cli-v1.10.0'; draft = $false; prerelease = $false },
+        [pscustomobject]@{ tag_name = 'cli-v999.0.0'; draft = $true; prerelease = $false },
+        [pscustomobject]@{ tag_name = 'core-v999.0.0'; draft = $false; prerelease = $false },
+        [pscustomobject]@{ tag_name = 'cli-v01.2.3'; draft = $false; prerelease = $false },
+        [pscustomobject]@{ tag_name = 'cli-v999.0.0-rc.1'; draft = $false; prerelease = $true },
+        [pscustomobject]@{ tag_name = 'cli-v0.0.1-hourly.2026101702'; draft = $false; prerelease = $true },
+        [pscustomobject]@{ tag_name = 'cli-v0.0.1-hourly.2026101710'; draft = $false; prerelease = $true },
+        [pscustomobject]@{ tag_name = 'cli-v0.0.1-hourly.2026022901'; draft = $false; prerelease = $true },
+        [pscustomobject]@{ tag_name = 'cli-v0.0.1-hourly.2026101724'; draft = $false; prerelease = $true },
+        [pscustomobject]@{ tag_name = 'cli-v0.0.1-nightly.20261018.1'; draft = $false; prerelease = $true },
         [pscustomobject]@{ tag_name = 'www-v999.0.0-hourly.2026101723'; draft = $false; prerelease = $true }
     )
     $picked = @(Select-Release -Releases $stable -Channel 'stable')
-    if ($picked[-1].Tag -ne 'v1.10.0') { Fail "self-test: stable selection picked $($picked[-1].Tag)" }
+    if ($picked[-1].Tag -ne 'cli-v1.10.0') { Fail "self-test: stable selection picked $($picked[-1].Tag)" }
     $picked = @(Select-Release -Releases $stable -Channel 'hourly')
-    if ($picked[-1].Tag -ne 'v0.0.1-hourly.2026101710') {
+    if ($picked[-1].Tag -ne 'cli-v0.0.1-hourly.2026101710') {
         Fail "self-test: hourly selection picked $($picked[-1].Tag)"
     }
     foreach ($entry in $picked) {
-        if ($entry.Tag -in @('v0.0.1-hourly.2026022901', 'v0.0.1-hourly.2026101724')) { Fail 'self-test: accepted an hour that does not exist' }
+        if ($entry.Tag -in @('cli-v0.0.1-hourly.2026022901', 'cli-v0.0.1-hourly.2026101724')) { Fail 'self-test: accepted an hour that does not exist' }
     }
     $directory = Join-Path ([System.IO.Path]::GetTempPath()) ('vibeface-installer-test-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $directory | Out-Null
@@ -464,7 +524,7 @@ public class VibefaceInstallerTestResponse : System.Net.WebResponse {
             throw "self-test: expected '$Message', observed '$observed'"
         }
     }
-    $manifest = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures/product-release-completion.json') -Raw | ConvertFrom-Json
+    $manifest = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures/cli-release-completion.json') -Raw | ConvertFrom-Json
     $tag = $manifest.tag
     $archive = "vibeface-$($manifest.version)-$Target.tar.gz"
     $complete = [pscustomobject]@{
@@ -472,7 +532,7 @@ public class VibefaceInstallerTestResponse : System.Net.WebResponse {
         assets = @($manifest.assets) + @([pscustomobject]@{ name = 'release.json'; size = 10000 })
     }
     $building = [pscustomobject]@{
-        tag_name = 'v0.0.1-hourly.2026110822'; draft = $false; prerelease = $true
+        tag_name = 'cli-v0.0.1-hourly.2026110822'; draft = $false; prerelease = $true
         assets = @([pscustomobject]@{ name = 'release.json'; size = 10000 })
     }
     $markerUrl = "$Downloads/$tag/release.json"
@@ -482,6 +542,46 @@ public class VibefaceInstallerTestResponse : System.Net.WebResponse {
     if ($accepted.source_commit -cne '7845e46d9c5b04b66eb7a66bcda31572e1ef7f4a') {
         throw 'self-test: canonical manifest source mismatch'
     }
+    if ($accepted.dependencies.core.version -cne '2.3.4' -or $accepted.dependencies.app.version -cne '3.4.5-rc.2') {
+        throw 'self-test: independent dependency versions were not preserved'
+    }
+    $build = [pscustomobject]@{
+        version = $manifest.version; target = $Target; source_commit = $manifest.source_commit
+        data_epoch = 1; update_protocol = 1
+        core_version = '2.3.4'; core_source_commit = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+        app_version = '3.4.5-rc.2'; app_source_commit = 'cccccccccccccccccccccccccccccccccccccccc'
+    }
+    $validated = Confirm-BuildIdentity -Build $build -Version $manifest.version -Commit $manifest.source_commit -Completion $accepted
+    if ($validated.core_version -cne '2.3.4' -or $validated.app_source_commit -cne 'cccccccccccccccccccccccccccccccccccccccc') {
+        throw 'self-test: independent BUILD-INFO identities changed'
+    }
+    foreach ($field in @('core_version', 'app_version', 'core_source_commit', 'app_source_commit')) {
+        $changed = $build | ConvertTo-Json | ConvertFrom-Json
+        $changed.$field = if ($field.EndsWith('_version')) { '9.9.9' } else { 'ffffffffffffffffffffffffffffffffffffffff' }
+        Assert-InstallerError {
+            Confirm-BuildIdentity -Build $changed -Version $manifest.version -Commit $manifest.source_commit -Completion $accepted
+        } 'contracts or dependency pins'
+    }
+    $manifestJson = $manifest | ConvertTo-Json -Depth 10 -Compress
+    $invalidManifests = @(
+        @{ Edit = { param($m) $m.contracts.data_epoch = '1' }; Error = 'unsupported release contracts' },
+        @{ Edit = { param($m) $m.contracts.update_protocol = 2 }; Error = 'unsupported release contracts' },
+        @{ Edit = { param($m) $m.contracts | Add-Member -NotePropertyName unexpected -NotePropertyValue 1 }; Error = 'invalid release contracts fields' },
+        @{ Edit = { param($m) $m.dependencies.core.tag = 'app-v2.3.4' }; Error = 'invalid release dependency pin identity' },
+        @{ Edit = { param($m) $m.dependencies.core.version = '9.9.9' }; Error = 'invalid release dependency pin identity' },
+        @{ Edit = { param($m) $m.dependencies.app.manifest_sha256 = 'bad' }; Error = 'invalid release dependency pin identity' },
+        @{ Edit = { param($m) $m.dependencies.core.PSObject.Properties.Remove('manifest_sha256') }; Error = 'invalid release dependency pin fields' },
+        @{ Edit = { param($m) $m.dependencies.app | Add-Member -NotePropertyName unexpected -NotePropertyValue 1 }; Error = 'invalid release dependency pin fields' }
+    )
+    foreach ($invalid in $invalidManifests) {
+        $changed = $manifestJson | ConvertFrom-Json
+        & $invalid.Edit $changed
+        $responses[$markerUrl] = @{ Code = 200; Body = ($changed | ConvertTo-Json -Depth 10 -Compress) }
+        Assert-InstallerError {
+            Confirm-Completion -Release $complete -Tag $tag -Version $manifest.version -Archive $archive -Target $Target
+        } $invalid.Error
+    }
+    $responses[$markerUrl] = @{ Code = 200; Body = $manifestJson }
     $responses[$buildingUrl] = @{ Code = 404; Body = '' }
     if (Confirm-Completion -Release $building -Tag $building.tag_name -Version '0.0.1-hourly.2026110822' `
             -Archive "vibeface-0.0.1-hourly.2026110822-$Target.tar.gz" -Target $Target) {

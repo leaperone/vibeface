@@ -1,47 +1,41 @@
 name: Release / Website
-run-name: >-
-  Release / Website / ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || github.ref_name }} /
-  ${{ (github.event_name == 'push' || inputs.publish) && 'publish' || 'build only' }}
+run-name: Release / Website / ${{ inputs.tag || github.ref_name }} / ${{ (github.event_name == 'push' || inputs.publish) && 'publish' || 'build only' }}
 on:
   push:
     tags: ['www-v*']
   workflow_dispatch:
     inputs:
-      tag:
-        description: Exact declared tag; leave empty for a build-only run
-        type: string
-        default: ''
-      publish:
-        description: Publish an existing tag after verification
-        type: boolean
-        default: false
+      tag: {description: Exact application tag, type: string, default: ''}
+      publish: {description: Publish this exact tag, type: boolean, default: false}
 permissions:
   contents: read
+  actions: read
 concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}-${{ github.event_name == 'workflow_dispatch' && !inputs.publish && github.run_id || 'publish' }}
+  group: release-www-${{ inputs.tag || github.ref_name }}-${{ github.event_name == 'workflow_dispatch' && !inputs.publish && github.run_id || 'publish' }}
   cancel-in-progress: false
 jobs:
   identity:
-    name: Validate website release identity
+    name: Validate www release identity
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      actions: read
+    permissions: {contents: read, actions: read}
     outputs:
       app: ${{ steps.plan.outputs.app }}
       version: ${{ steps.plan.outputs.version }}
       tag: ${{ steps.plan.outputs.tag }}
       source_sha: ${{ steps.plan.outputs.source_commit }}
       publish: ${{ steps.plan.outputs.publish }}
+      runtime_tag: ${{ steps.plan.outputs.runtime_tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with: {fetch-depth: 0, persist-credentials: false}
-      - id: plan
-        name: Validate build and publication identity
+      - name: Validate exact tag and source
+        id: plan
         env:
           RELEASE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name || '') }}
           PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
           GH_TOKEN: ${{ github.token }}
+          WINDOWS_SIGNING_CONFIGURED: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 != '' }}
+          IOS_SIGNING_CONFIGURED: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 != '' && secrets.IOS_CERTIFICATE_PASSWORD != '' && secrets.IOS_PROVISIONING_PROFILE_BASE64 != '' }}
         run: python3 -B scripts/release-entry.py --app www
   static:
     name: Build and verify website
@@ -70,95 +64,36 @@ jobs:
           path: .artifacts/static/*
           if-no-files-found: error
   collect:
-    name: Collect complete website / collect
     needs: [identity, static]
-    if: always() && !cancelled() && needs.identity.result == 'success' && needs.static.result == 'success'
-    runs-on: ubuntu-24.04
-    outputs:
-      release_artifact_id: ${{ steps.release-artifact.outputs.artifact-id }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with: {ref: '${{ needs.identity.outputs.source_sha }}', persist-credentials: false}
-      - name: Assert the collection source
-        env:
-          SOURCE_SHA: ${{ needs.identity.outputs.source_sha }}
-        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          artifact-ids: ${{ needs.static.outputs.artifact_id }}
-          merge-multiple: true
-          path: .artifacts/input/app
-      - name: Collect website assets without rebuilding
-        run: mv .artifacts/input/app .artifacts/release
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        id: release-artifact
-        with:
-          name: www-release-${{ needs.identity.outputs.source_sha }}-${{ github.run_attempt }}
-          path: .artifacts/release/*
-          if-no-files-found: error
-  publish:
-    name: Publish verified website / publish
+    uses: ./.github/workflows/release-collect.yml
+    with:
+      app: www
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      artifact_ids: ${{ needs.static.outputs.artifact_id }}
+  publish-www:
+    name: publish-www
     needs: [identity, collect]
-    if: always() && !cancelled() && needs.identity.result == 'success' && needs.identity.outputs.publish == 'true' && needs.collect.result == 'success'
+    if: needs.identity.outputs.publish == 'true'
+    uses: ./.github/workflows/release-publish.yml
+    with:
+      app: www
+      tag: ${{ needs.identity.outputs.tag }}
+      artifact_id: ${{ needs.collect.outputs.artifact_id }}
+    permissions: {contents: write, actions: read}
+  wake-consumers:
+    needs: [publish-www]
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
+    permissions: {actions: write, contents: read}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with: {ref: '${{ needs.identity.outputs.tag }}', fetch-depth: 0, persist-credentials: false}
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          artifact-ids: ${{ needs.collect.outputs.release_artifact_id }}
-          merge-multiple: true
-          path: .artifacts/release
-      - name: Publish the verified complete release
+      - name: Reconcile independent release consumers
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.identity.outputs.tag }}
-        run: |
-          python3 -B scripts/release.py plan --app www --tag "$RELEASE_TAG" --require-main --publish
-          python3 -B scripts/release.py publish www .artifacts/release
-  deploy-published-www:
-    name: Deploy complete website / deploy-published-www
-    needs: [identity, publish]
-    if: needs.identity.outputs.publish == 'true' && needs.publish.result == 'success'
-    runs-on: ubuntu-24.04
-    permissions:
-      actions: write
-      contents: read
-    steps:
-      - name: Dispatch website deployment from main
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.identity.outputs.tag }}
-        run: |
-          dispatched_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          gh workflow run deploy-www.yml --repo "$GITHUB_REPOSITORY" --ref main \
-            --raw-field "tag=$RELEASE_TAG" --raw-field apply=true
-          deployment_run=''
-          for _ in $(seq 1 60); do
-            run_list="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow deploy-www.yml --branch main \
-              --event workflow_dispatch --limit 20 --json databaseId,displayTitle,createdAt 2>/dev/null || printf '[]')"
-            deployment_run="$(DISPATCHED_AT="$dispatched_at" RELEASE_TAG="$RELEASE_TAG" \
-              python3 -c 'import json, os, sys; start=os.environ["DISPATCHED_AT"]; tag=os.environ["RELEASE_TAG"]; runs=[r for r in json.loads(sys.stdin.read()) if r["createdAt"] >= start and tag in r["displayTitle"]]; print(max(runs, key=lambda r: r["createdAt"])["databaseId"] if runs else "")' <<<"$run_list")"
-            [[ -n "$deployment_run" ]] && break
-            sleep 5
-          done
-          test -n "$deployment_run"
-          for _ in $(seq 1 120); do
-            deployment_state="$(gh run view "$deployment_run" --repo "$GITHUB_REPOSITORY" \
-              --json status,conclusion 2>/dev/null || true)"
-            if [[ -n "$deployment_state" ]]; then
-              read -r deployment_status deployment_conclusion < <(
-                python3 -c 'import json, sys; value=json.load(sys.stdin); print(value.get("status", ""), value.get("conclusion", ""))' \
-                  <<<"$deployment_state"
-              )
-              if [[ "$deployment_status" == completed ]]; then
-                [[ "$deployment_conclusion" == success ]]
-                exit $?
-              fi
-            fi
-            sleep 5
-          done
-          echo "Website deployment did not reach a terminal result in time" >&2
-          exit 1
+        run: gh workflow run hourly.yml --repo "$GITHUB_REPOSITORY" --ref main
+  deploy:
+    needs: [identity, publish-www]
+    uses: ./.github/workflows/release-deploy.yml
+    with:
+      app: www
+      tag: ${{ needs.identity.outputs.tag }}
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+    permissions: {actions: write, contents: read}

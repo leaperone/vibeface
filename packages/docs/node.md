@@ -650,7 +650,7 @@ vibeface service uninstall
 
 ## 选择更新渠道
 
-自动更新需要完整发布包与受管安装目录。固定的 `current` 符号链接指向当前包，Node 用户服务也通过该路径启动。首次安装方式见 [构建与发布](releasing.md#首次安装)。
+自动更新需要完整发布包与受管安装目录。固定的 `current` 符号链接指向当前包，Node 用户服务也通过该路径启动。首次安装方式见 [构建与发布](install.md#github-完整包安装)。
 
 选择 Stable 并开启自动更新：
 

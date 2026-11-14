@@ -1,0 +1,68 @@
+{
+  "app": "cli",
+  "assets": [
+    {
+      "name": "vibeface-0.0.1-hourly.2026110812-aarch64-apple-darwin.tar.gz",
+      "sha256": "5e771725ba1002769bdce30580b8bade776b8066a4ce444357a190295757528a",
+      "size": 26178768
+    },
+    {
+      "name": "vibeface-0.0.1-hourly.2026110812-aarch64-apple-darwin.tar.gz.sha256",
+      "sha256": "8860f8d95012c007211882c9c5d375c9e437538ce2699f08e494812f7680f3a3",
+      "size": 128
+    },
+    {
+      "name": "vibeface-0.0.1-hourly.2026110812-aarch64-unknown-linux-gnu.tar.gz",
+      "sha256": "0c91befdef330929d6e5bb214d560b88445cc5c924dea586cfbd5871fb3bf919",
+      "size": 29718944
+    },
+    {
+      "name": "vibeface-0.0.1-hourly.2026110812-aarch64-unknown-linux-gnu.tar.gz.sha256",
+      "sha256": "670fb4f31aa90f7e1c7f27c6bcf7bf67be1338995deec06faedb0e2ab6ee0399",
+      "size": 133
+    },
+    {
+      "name": "vibeface-0.0.1-hourly.2026110812-x86_64-pc-windows-msvc.tar.gz",
+      "sha256": "fc8123546973deef00ad12e4933df520a0d8ae966bcc5d7791ef5e0a61f724c8",
+      "size": 25883684
+    },
+    {
+      "name": "vibeface-0.0.1-hourly.2026110812-x86_64-pc-windows-msvc.tar.gz.sha256",
+      "sha256": "f57d1eb382b40fa16bf7c73cb29638c3949557e238b2d48c8ea8c4bfaf70ab15",
+      "size": 130
+    },
+    {
+      "name": "vibeface-0.0.1-hourly.2026110812-x86_64-unknown-linux-gnu.tar.gz",
+      "sha256": "b9bc64ce56273a9a987fb8394decfaeab8c282b81e5ee29b8cb13e46422b0b0e",
+      "size": 29685481
+    },
+    {
+      "name": "vibeface-0.0.1-hourly.2026110812-x86_64-unknown-linux-gnu.tar.gz.sha256",
+      "sha256": "4184a5a2dd498d77b6ac00bbb6162fa28f41b17e818f171264e605520e57c7cf",
+      "size": 132
+    }
+  ],
+  "channel": "hourly",
+  "contracts": {
+    "data_epoch": 1,
+    "update_protocol": 1
+  },
+  "dependencies": {
+    "app": {
+      "manifest_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "source_commit": "cccccccccccccccccccccccccccccccccccccccc",
+      "tag": "app-v3.4.5-rc.2",
+      "version": "3.4.5-rc.2"
+    },
+    "core": {
+      "manifest_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "tag": "core-v2.3.4",
+      "version": "2.3.4"
+    }
+  },
+  "schema": 1,
+  "source_commit": "7845e46d9c5b04b66eb7a66bcda31572e1ef7f4a",
+  "tag": "cli-v0.0.1-hourly.2026110812",
+  "version": "0.0.1-hourly.2026110812"
+}

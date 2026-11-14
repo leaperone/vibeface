@@ -1,0 +1,109 @@
+name: Release / Desktop
+run-name: Release / Desktop / ${{ inputs.tag || github.ref_name }} / ${{ (github.event_name == 'push' || inputs.publish) && 'publish' || 'build only' }}
+on:
+  push:
+    tags: ['desktop-v*']
+  workflow_dispatch:
+    inputs:
+      tag: {description: Exact application tag, type: string, default: ''}
+      publish: {description: Publish this exact tag, type: boolean, default: false}
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: release-desktop-${{ inputs.tag || github.ref_name }}-${{ github.event_name == 'workflow_dispatch' && !inputs.publish && github.run_id || 'publish' }}
+  cancel-in-progress: false
+jobs:
+  identity:
+    name: Validate desktop release identity
+    runs-on: ubuntu-24.04
+    permissions: {contents: read, actions: read}
+    outputs:
+      app: ${{ steps.plan.outputs.app }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      source_sha: ${{ steps.plan.outputs.source_commit }}
+      publish: ${{ steps.plan.outputs.publish }}
+      runtime_tag: ${{ steps.plan.outputs.runtime_tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {fetch-depth: 0, persist-credentials: false}
+      - name: Validate exact tag and source
+        id: plan
+        env:
+          RELEASE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name || '') }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+          GH_TOKEN: ${{ github.token }}
+          WINDOWS_SIGNING_CONFIGURED: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 != '' }}
+          IOS_SIGNING_CONFIGURED: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 != '' && secrets.IOS_CERTIFICATE_PASSWORD != '' && secrets.IOS_PROVISIONING_PROFILE_BASE64 != '' }}
+        run: python3 -B scripts/release-entry.py --app desktop
+  desktop-macos:
+    name: Build desktop / macos
+    needs: [identity]
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runtime_tag: ${{ needs.identity.outputs.runtime_tag }}
+      runner: macos-15
+      target: aarch64-apple-darwin
+      sign: true
+    secrets: inherit
+  desktop-linux-x64:
+    name: Build desktop / linux-x64
+    needs: [identity]
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runtime_tag: ${{ needs.identity.outputs.runtime_tag }}
+      runner: ubuntu-24.04
+      target: x86_64-unknown-linux-gnu
+      sign: false
+    secrets: inherit
+  desktop-linux-arm64:
+    name: Build desktop / linux-arm64
+    needs: [identity]
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runtime_tag: ${{ needs.identity.outputs.runtime_tag }}
+      runner: ubuntu-24.04-arm
+      target: aarch64-unknown-linux-gnu
+      sign: false
+    secrets: inherit
+  desktop-windows:
+    name: Build desktop / windows
+    needs: [identity]
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      runtime_tag: ${{ needs.identity.outputs.runtime_tag }}
+      runner: windows-2025
+      target: x86_64-pc-windows-msvc
+      sign: true
+    secrets: inherit
+  collect:
+    needs: [identity, desktop-macos, desktop-linux-x64, desktop-linux-arm64, desktop-windows]
+    uses: ./.github/workflows/release-collect.yml
+    with:
+      app: desktop
+      source_sha: ${{ needs.identity.outputs.source_sha }}
+      artifact_ids: ${{ needs.desktop-macos.outputs.artifact_id }},${{ needs.desktop-linux-x64.outputs.artifact_id }},${{ needs.desktop-linux-arm64.outputs.artifact_id }},${{ needs.desktop-windows.outputs.artifact_id }}
+  publish-desktop:
+    name: publish-desktop
+    needs: [identity, collect]
+    if: needs.identity.outputs.publish == 'true'
+    uses: ./.github/workflows/release-publish.yml
+    with:
+      app: desktop
+      tag: ${{ needs.identity.outputs.tag }}
+      artifact_id: ${{ needs.collect.outputs.artifact_id }}
+    permissions: {contents: write, actions: read}
+  wake-consumers:
+    needs: [publish-desktop]
+    runs-on: ubuntu-24.04
+    permissions: {actions: write, contents: read}
+    steps:
+      - name: Reconcile independent release consumers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run hourly.yml --repo "$GITHUB_REPOSITORY" --ref main

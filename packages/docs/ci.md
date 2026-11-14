@@ -7,7 +7,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 `.github/workflows/ci.yml` 使用 `scripts/ci.py` 选择检查范围、Rust 测试分组和必需任务。常规 CI 运行生成计划，`ci-gate` 要求选中的任务全部成功。没有顶层 `paths` 筛选。
 
-开发分支的 PR 不触发 GitHub Actions，也不要求 CI 状态；需要远端验证时手动运行 `CI / Core`。Actions 只保留核心 CI、发布和部署入口：桌面四平台、Windows native、移动端构建与验收、原生诊断和付费交付实验入口已移除，iOS 模拟器等界面验收不在 CI 中运行。`CI / Core` 由 `main` push、手动运行或 merge queue 触发，不含定时入口。产品 tag 交给 `release.yml` 构建完整产品，官网 tag 交给 `release-www.yml`；完整 Release 发布后由对应发布工作流自动派发部署。合并、CI 通过、发布和部署各有自己的验收结果。
+开发分支的 PR 不触发 GitHub Actions，也不要求 CI 状态；需要远端验证时手动运行 `CI / Core`。Actions 只保留核心 CI、发布和部署入口：桌面四平台、Windows native、移动端构建与验收、原生诊断和付费交付实验入口已移除，iOS 模拟器等界面验收不在 CI 中运行。`CI / Core` 由 `main` push、手动运行或 merge queue 触发，不含定时入口。Core、App、CLI、Desktop、Mobile 和 www 各自使用 `<app>-v<version>` Tag 与独立发布入口。Core、App、www 完整发布后自动派发各自服务部署。合并、CI 通过、发布和部署各有自己的验收结果。
 
 ## 按用途选择 Actions 入口
 
@@ -16,15 +16,17 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | 文件 | Actions 名称 | 触发方式 | 用途 |
 | --- | --- | --- | --- |
 | `ci.yml` | CI / Core | main push、merge queue、手动、复用调用 | 自动按累计差异选核心检查；手动与复用调用执行扩展检查 |
-| `hourly.yml` | Release / Hourly | 每小时、手动 | 为最新 CI 通过的 main 提交创建当小时 Hourly Tag 并派发产品发布；不运行 Core 检查 |
-| `core-hourly.yml` | Release / Core Hourly | 每小时、手动 | 为最新 CI 通过的 main 提交创建 Core Tag 并派发 Core 发布；只面向公共 Node |
-| `release.yml` | Release / Product | `v*` push、手动 | 固定产品组；完整发布后自动派发 Node + App，手动默认只构建 |
-| `release-core.yml` | Release / Core | `core-v*` push、手动 | 只发布公共 Node 的 x86_64 Core；完整发布后自动派发 Node |
-| `release-www.yml` | Release / Website | `www-v*` push、手动 | 固定官网组；完整发布后自动派发官网，手动默认只构建 |
-| `npm-publish.yml` | Release / npm Hourly | 产品发布调用、手动 | 验证完整产品发布的原始 npm 制品；手动默认只验证 |
-| `deploy-node.yml`、`deploy-app.yml`、`deploy-www.yml`、`deploy-product.yml` | Deploy / Node、Web App、Website、Product services | 自动派发或手动 | 固定目标部署，`tag` 必填；手动运行 `apply=false` 默认构建验证与排练 |
+| `hourly.yml` | Release / Hourly | 每小时、成功的 main push CI 完成后、发布完成后唤醒、手动 | 按应用输入变化分配 Hourly Tag，记录精确依赖 pin，分别派发六条发布流程 |
+| `release-core.yml` | Release / Core | `core-v*` push、手动 | 四平台 Core；完整发布后自动部署公共 Node |
+| `release-app.yml` | Release / Web App | `app-v*` push、手动 | 静态 Web App；完整发布后自动部署 App |
+| `release.yml` | Release / CLI | `cli-v*` push、手动 | 四平台 CLI 运行包，消费精确 Core、App 依赖；完整发布后分发同版本 npm 包 |
+| `release-desktop-app.yml` | Release / Desktop | `desktop-v*` push、手动 | 四平台 Desktop 安装包，内置精确 CLI 运行包 |
+| `release-mobile.yml` | Release / Mobile | `mobile-v*` push、手动 | Android 与 iOS 制品 |
+| `release-www.yml` | Release / Website | `www-v*` push、手动 | 官网与文档；完整发布后自动部署官网 |
+| `npm-publish.yml` | Release / npm | CLI 发布调用、手动 | 核对原始 CLI npm artifact；stable、rc、hourly 分别使用 latest、rc、hourly；手动默认只验证 |
+| `deploy-node.yml`、`deploy-app.yml`、`deploy-www.yml` | Deploy / Node、Web App、Website | 自动派发或手动 | 分别消费 Core、App、www 的精确已发布 Tag；手动 `apply=false` 默认构建验证与排练 |
 
-`_ci-crypto.yml` 与 `_ci-web.yml` 仅供复用，不是手动入口。部署入口统一调用 `deploy-services.yml`，由它持有全局部署锁。`ci.yml` 的 `package_policy` 仅供复用调用，允许 `standard` 或 `linux-native`；公开手动 Core 入口没有模式参数。
+`_ci-crypto.yml` 与 `_ci-web.yml` 仅供复用，不是手动入口。发布入口复用 `release-collect.yml`、`release-publish.yml` 和 `release-deploy.yml`，制品按不可变 artifact ID 传递。手动发布默认只构建，真正发布要求现存精确 Tag 和显式 `publish=true`。部署入口统一调用 `deploy-services.yml`，由它持有全局部署锁。`ci.yml` 的 `package_policy` 仅供复用调用，允许 `standard` 或 `linux-native`；公开手动 Core 入口没有模式参数。
 
 | 反馈层 | 入口 | 结果含义 |
 | --- | --- | --- |
@@ -32,7 +34,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | 本地相关检查 | `ci.py plan`、选中包的检查与进程专项 | 核对本次改动涉及的行为 |
 | PR 验收 | 独立工作树和同一个 PR，创建后及最终 HEAD 执行 `preflight --no-merge` | 检查固定 base、HEAD、范围及必要证据，不自动合并 |
 | 合并后检查 | 经明确授权合并，再核对 `main` 的 `ci-gate` | 证明该运行选中的检查成功，不发布应用 |
-| 制品发布 | 显式产品或官网 Tag 与各自发布入口 | 校验产品制品和发布记录；完整 Release 发布后自动派发部署 |
+| 制品发布 | 各应用的精确 Tag 与发布入口 | 核对该应用的完整制品与最终清单；服务应用随后部署，CLI 随后分发 npm |
 | 服务部署 | 自动派发或独立 deploy 命令与对应部署 workflow | 消费已发布版本，核对实际运行版本和服务行为 |
 
 ## main 与 merge queue 的核心检查
@@ -131,11 +133,15 @@ python3 scripts/check-delivery.py --sandbox
 
 ## 定期、手动和发布检查
 
-`hourly.yml`（Release / Hourly）的 job `hourly` 每小时由 cron 触发，运行协调器 `scripts/hourly.py`。main 固定携带开发版本 `0.0.1-hourly.2026111300`；协调器选择 `ci.yml` push 运行已成功完成的最新 main 提交。该提交不包含最新 Hourly Tag 的 parent 时跳过；等于该 parent 且那次发布正在运行或已成功时也跳过。那次发布失败时用同一提交重建一次当小时新版本；同一提交第二次失败时协调器报错停止，等待修复或 main 的新提交。本 UTC 小时的 Tag 已存在时只核对来源，缺少发布运行时补派发。否则创建一个脱离 main 的 BOT 提交，只改版本字段：全部产品版本文件、`Cargo.lock` 中三个本仓包、Android versionCode（`YYMMDDHH`）与 iOS buildNumber（`YYMM.DD.HH`）。随后创建 `vX.Y.Z-hourly.YYYYMMDDHH` Tag 并派发 `release.yml`。协调器不等待发布结果，也不补发更早的小时；某小时失败时，下一小时发布新版本。详情见 [Hourly 发布](releasing.md#每小时-hourly-发布)。
+`hourly.yml` 运行统一协调器 `scripts/hourly.py`。定时或手动运行会核对最新成功的 main push CI；`workflow_run` 触发还要求来源事件为 main push 且结果为 success。已完成发布也会唤醒协调器，让等待依赖的消费者继续发布。
 
-手动 `CI / Core` 同样执行完整扩展检查，不受路径影响，只验证和生成制品。merge queue 执行整个工作区核心检查，不启用慢测试、MSRV 或四平台打包。开发分支 PR 不触发 Core。产品 `v` Tag 由 `release.yml` 构建全部产品目标，`www-v` Tag 由 `release-www.yml` 构建官网。
+协调器分别比较 Core、App、CLI、Desktop、Mobile、www 的输入摘要与依赖 pin。应用输入及依赖未变时跳过。CLI 等待完整 Core、App 发布，Desktop 等待完整 CLI 发布，其他应用独立构建。每次生成只改所选应用的版本、对应 Cargo.lock 包、依赖清单及必要的 Mobile 构建号；Tag 为 `<app>-vX.Y.Z-hourly.YYYYMMDDHH`。同一小时的 Tag 不移动，缺少发布运行时先对账再派发。协调器不等待构建结果，不将已派发视为已完成。详情见[构建与发布](releasing.md)。
 
-发布来源门：位于 main 的 Tag 要求同一 SHA 的 main push CI success；脱离 main 的 Hourly 来源必须恰好是机械版本提交，其唯一 parent 位于 main 且有 main push CI success。Stable/RC 不允许脱离 main 的来源。真正的 artifact source 与 provenance 仍是 Tag 的版本提交。quick-check 与 preflight 执行 `scripts/hourly.py --self-test`。
+手动 `CI / Core` 执行完整扩展检查，不受路径影响，只验证和生成制品。merge queue 执行整个工作区核心检查，不启用慢测试、MSRV 或四平台打包。开发分支 PR 不触发 Core。六条应用发布流程只等待本应用的生产者。本应用的平台失败会阻止完整发布，其他应用失败不会阻塞本应用。
+
+发布来源门要求精确 Tag、源码和成功 main push CI 对齐。脱离 main 的 Hourly 提交必须只有一个 main parent，且只能包含所选应用的机械版本与依赖变更。Stable、RC 的源码必须位于 main。每个应用的 `release.json` 最后写入，包含 contracts 和精确依赖 pin；CLI 包内九字段 `BUILD-INFO.json` 允许 CLI、Core、App 使用不同版本与源码。Core、App、www 的部署等待对应完整发布，`release-dispatch.py` 核对派发的运行并等待真实终态。
+
+quick-check 与 preflight 运行 `release.py self-test`、`hourly.py --self-test`、`release-dispatch.py --self-test` 和 `check-release-workflow.py --self-test`。检查器验证实际依赖图、artifact ID、权限传递和发布条件，并拒绝绕过完整收集或来源校验的负例。
 
 | 扩展检查 | 执行范围 |
 | --- | --- |
@@ -217,7 +223,7 @@ python3 scripts/ci.py check --packages vibeface-core vibeface-control vibeface
 python3 scripts/ci.py check --packages vibeface-core vibeface-control vibeface --msrv 1.91
 ```
 
-MSRV 参数应使用当前 `Cargo.toml` 的 `rust-version`。进程专项需要 Python 3、Node.js、当前提交构建的 CLI/Core 程序和真实 JS/WASM 密码学资源。先按 [源码构建步骤](releasing.md#ci-验证范围) 生成资源和制品，然后设置以下路径：
+MSRV 参数应使用当前 `Cargo.toml` 的 `rust-version`。进程专项需要 Python 3、Node.js、当前提交构建的 CLI/Core 程序和真实 JS/WASM 密码学资源。先按 [源码构建步骤](releasing.md#源码构建) 生成资源和制品，然后设置以下路径：
 
 ```sh
 binary=/absolute/path/to/package/vibeface
@@ -266,11 +272,11 @@ Rust 快、慢组在计划生成后直接开始，Clippy 另等待静态快检�
 
 Core 的 concurrency group 包含调用方 workflow、事件、Git ref 和 package policy。标准 Core 的首次 main push 或手动验证会取消同组旧运行，main 累计覆盖选择仍保留未验证的改动；重跑仅在 `run_attempt > 1` 时追加 `run_id`，不取消新提交的运行。Core 的 schedule 和 merge queue 不取消同组正在执行的检查。
 
-Hourly 协调器、产品发布与部署分别遵守自己的并发规则；Hourly 协调器使用全局 `hourly-release` 串行组。
+Hourly 协调器、各应用发布与部署分别遵守自己的并发规则。协调器使用 `independent-hourly-releases` 串行组；每个应用的同一 Tag 发布单独串行，构建验证与真实发布分组。
 
 Linux x64 制品任务使用 pnpm 缓存。
 
-`ci` 工作流中的 Rust 缓存仅在 `refs/heads/main` 或显式 `workflow_dispatch` 时保存。手动运行可为相同 ref 的后续运行预热。新增 profile 或缓存 key 在首次保存前需要冷构建。产品或官网 Tag 使用独立发布工作流，不属于本节缓存保存规则。
+`ci` 工作流中的 Rust 缓存仅在 `refs/heads/main` 或显式 `workflow_dispatch` 时保存。手动运行可为相同 ref 的后续运行预热。新增 profile 或缓存 key 在首次保存前需要冷构建。各应用 Tag 使用独立发布工作流，不属于本节缓存保存规则。
 
 Rust 缓存命中不表示当前 workspace 无需编译。每次仍由 Cargo 核对源码和构建参数；评估缓存时同时记录编译、保存与还原的耗时。
 
@@ -284,9 +290,9 @@ Android 使用官方 Gradle 缓存动作和 Gradle build cache，保留 `arm64-v
 
 Core 的 plan 与 gate 都从同一个内部 `package_policy` 重新计算覆盖范围，拒绝将标准四平台计划缩成 Linux-only 或关闭 npm。未选的 npm 与非 Linux 包不计为已验证。
 
-GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate` 列为必需状态。仓库开发流程仍要求相关本地验证、最终 HEAD 的 preflight 和明确合并授权。合并后的 CI 与产品或官网 Tag 的制品、发布和部署检查分别记录。
+GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate` 列为必需状态。仓库开发流程仍要求相关本地验证、最终 HEAD 的 preflight 和明确合并授权。合并后的 CI 与各应用 Tag 的制品、发布和部署检查分别记录。
 
-产品与官网 Tag 分别由 `release.yml` 和 `release-www.yml` 校验和发布；main 的普通 CI 不公开产品。参见 [按产品组合发布](releasing.md#按产品组合发布)。
+六类应用 Tag 由各自入口校验和发布，main 的普通 CI 只验证源码与制品。参见[构建与发布](releasing.md)。
 
 
 ## 桌面专项验收

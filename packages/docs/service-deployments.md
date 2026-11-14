@@ -1,66 +1,31 @@
 ---
-title: 发布官方服务部署
-description: 使用已发布制品，在本仓库部署官方容器服务。
+title: 官方服务部署
+description: 用已完成的独立 Core、App 或 WWW Release 更新对应官方服务。
 ---
 
-# 发布官方服务部署
+# 官方服务部署
 
-完整制品发布和服务部署通过精确 Tag 连接。`release product`、`release core` 或 `release www` 完成公开 Release 后，对应发布工作流会自动派发服务部署；部署仍只消费已经完成发布的精确 Tag，不使用分支、`latest` 或未完成 Release。
+Core、Web App 和 WWW 完整发布后，各自的 Release workflow 自动从 main 派发对应部署并等待终态。部署只使用精确 Tag、最终 `release.json` 和校验过的资产，不重新编译产品，不选择未完成版本或可变 `latest`。
 
-所有部署命令、Dockerfile、Compose 与 GitHub Actions 都在本仓库维护。部署不依赖另一个发布仓库，不重新编译产品，不发布新的产品版本。
-
-## 手动或补发部署
-
-先只读核对，再执行部署发布：
-
-```sh
-python3 scripts/deploy.py plan --service all --tag '<PRODUCT_TAG>'
-python3 scripts/deploy.py release --service all --tag '<PRODUCT_TAG>'
-```
-
-`--service` 支持以下目标：
-
-| 目标 | GitHub Actions 入口 | 交付内容 |
+| 目标 | Tag | 部署入口 |
 | --- | --- | --- |
-| `all` | Deploy / Product services（`deploy-product.yml`） | 在同一次运行中串行部署官方公共节点和 App，不含官网 |
-| `node` | Deploy / Node（`deploy-node.yml`） | 香港官方公共节点的 Core 容器；接受旧产品 Tag 或 `core-v<version>` Core train Tag |
-| `app` | Deploy / Web App（`deploy-app.yml`） | 独立网页静态容器，只提供静态文件；网页直接连公共节点的 `gateway_url` |
-| `www` | Deploy / Website（`deploy-www.yml`） | 独立官网静态容器，使用精确 `www-v<version>` Tag |
+| `node` | `core-v<version>` | `deploy-node.yml`，只更新官方公共 Node |
+| `app` | `app-v<version>` | `deploy-app.yml`，只更新静态 Web App |
+| `www` | `www-v<version>` | `deploy-www.yml`，只更新官网 |
 
-产品目标接受精确 Stable、RC、Hourly `v<version>`，官网只接受对应 `www-v<version>`；完整发布完成后按对应 Tag 派发部署，不自动跟随其他渠道。每个入口固定部署目标，只接收 Tag 和 `apply`；`deploy-services.yml` 是共用的可复用实现，不接受手动派发。产品批次按 Node → App 串行运行，Node 失败会停止后续 App 部署，避免只更新一半。所有入口共用该实现中的全局部署并发锁，正在运行的部署不会被后续请求取消。自动派发和部署命令都从 main 以 `apply=true` 启动对应入口，并等待下游运行到终态；UI 手动运行默认 `apply=false`，只验证制品、构建容器并冒烟，不接触服务器。运行名称包含目标、Tag、执行意图和分支，便于核对运行记录。
+各服务版本独立，不再提供 `all` 或 Product 批次。手动补部署时先检查计划：
 
 ```sh
-python3 scripts/deploy.py release --service www --tag '<WEBSITE_TAG>'
-gh workflow run deploy-node.yml --ref '<BRANCH>' -f tag='<PRODUCT_TAG>' -F apply=false
+python3 scripts/deploy.py plan --service node --tag 'core-v<version>'
+python3 scripts/deploy.py release --service node --tag 'core-v<version>'
 ```
 
-真实激活仅允许从 main 执行。自动发布会等待对应入口终态；手动派发成功只表示 GitHub 接收请求，仍须跟踪运行并核对结果。派发响应未知时先查询相同 Tag 的运行记录，不能直接重发。每次运行重新核对最终 `release.json` 的 Tag、源码 SHA、共享发布来源规则（main 或受信机械 Hourly）、附件集合和摘要，再下载需要的组件并核对实际字节与包内来源。容器只包装这些已发布字节，通过 SSH 传输并按 image ID 激活，无需共享镜像仓库。
+将目标与 Tag 前缀一起改为 `app` 或 `www` 可部署对应服务。CLI 的 `release` 派发 `apply=true`；UI 手动运行默认 `apply=false`，会验证、构建容器并演练，不触碰主机。只有 main 能执行生产激活。每个入口固定目标，共用 `deploy-services.yml` 的全局激活锁，后续请求不会取消已在进行的激活。
 
-激活前同时核对传输归档的 SHA256 和镜像身份。`--image` 是构建 runner 经典存储中的镜像配置摘要；`docker load` 之前先从归档读回 `manifest.json`、`index.json` 及其 blob 并逐一核对摘要，证明归档只含这一个镜像，构建步骤导出归档后也执行同一核对。主机使用 containerd 镜像存储时，导入后的 image ID 是 manifest 摘要，只有它正是归档中引用该配置的 manifest 时才接受；随后按主机自己的 image ID 激活，并在回执中返回。摘要正确不能替代镜像身份校验。
+Node 使用 Core 的 x86_64 Linux 归档。部署前先在 runner 练习上一份完整 Core 到候选版的升级，确认原身份和数据保留，再请求线上 Node 的维护租约、备份与激活。失败遵守原有 journal/回滚流程，不以程序回退代替业务数据恢复。
 
-`node` 无论是否 `apply` 都先在 runner 演练。脚本选择候选发布时间之前最近的完整产品 Release，排除候选本身、Draft 和缺少最终 manifest 或必要组件的发布，并核对其 `release.json`、来源和附件摘要。旧 Core 初始化并启动隔离 fixture 后，脚本原子换入候选 Core 生成的完整配置，再激活候选镜像并验证重复激活、原身份和初始化数据保留。fixture 对外公布的地址（`public_url`、`relay_url`、bootstrap anchor）都是回环，Core 仍按公共节点配置以 host network 监听 runner 的 `0.0.0.0:4792` 和 `0.0.0.0:3340`，使用独立 mesh 和生成的数据，不带 Provider 或部署凭证。没有历史完整产品 Release 时明确输出 `first_release`，只演练首次安装和重复激活；查询、校验或升级失败都停止，不退到更老版本或略过升级。
+App/WWW 消费各自静态 component，校验文件摘要与 CSP 后包装为静态容器。App 浏览器直接连接官方 Node 网关，不由 App 容器转发 Node API。线上配置、SSH 身份和地址保存在部署 environments，不写入发布制品。
 
-## 配置部署目标
+核对对应 Actions 的最终结果、容器镜像摘要、实际版本和健康状态。Node 还需确认设备身份与浏览器接入/relay 行为，App/WWW 需读回 HTTPS 状态、静态页面和版本头。派发成功或上传完成不等于上线成功。请求结果未知时先按精确 Tag 与执行意图对账，再决定是否重跑。
 
-为每个目标创建 GitHub Environment `vibeface-node`、`vibeface-app`、`vibeface-www`。按需设置 Environment 的 main 分支限制和人工审核。仅验证使用不含生产凭证的 `vibeface-validation`。
-
-每个目标配置以下 Secrets：
-
-| Secret | 用途 |
-| --- | --- |
-| `DEPLOY_HOST` | SSH 主机名 |
-| `DEPLOY_PORT` | SSH 端口，未设置时为 22 |
-| `DEPLOY_USER` | 有 Docker、Nginx 与服务管理权限的账号；非 root 账号需对应免密 sudo |
-| `DEPLOY_SSH_KEY` | 该目标的 SSH 私钥 |
-| `DEPLOY_KNOWN_HOSTS` | 预先核验的完整 SSH host key，不在运行中接受未知主机 |
-| `DEPLOY_CONFIG` | 目标运行配置 JSON，格式见 [`deploy/README.md`](../../deploy/README.md) |
-
-真实主机、用户、身份、数据路径及证据不写入公共仓库。服务器需要 Docker Compose v2、Python 3 和既有 Nginx。Core 镜像使用 Ubuntu 24.04 运行时，静态镜像使用 Nginx；它们都不安装 AI Provider 或带入模型凭证。
-
-## 保留身份并核对上线
-
-公共节点挂载自己的既有数据目录，使用原 UID/GID。空目录、身份不符、epoch 不匹配或仍被旧节点占用时停止；不初始化新身份、不自动迁移数据。从宿主 systemd 服务迁入前，须由维护者先停旧服务、完成数据交接，并移除或改写所有引用该数据目录的 systemd unit 文件和 drop-in；脚本按文本检查这些文件，仍有引用就拒绝激活，不自动迁移或停止宿主进程。全新安装没有旧服务，校验已初始化的数据目录并备份后直接启动容器，失败时只停新容器。公共节点的初始化参数和官方限额见 [`deploy/README.md`](../../deploy/README.md)。
-
-公共节点不提供网页文件。`node.vibeface.dev` 是指向 `84.54.3.78` 的 DNS-only A 记录，浏览器直接连接 `https://node.vibeface.dev:4792`，证书由宿主 acme.sh 申请并续期 Let's Encrypt 的域名证书，安装到数据目录后 Core 不重启即换用。部署前必须确认目标主机与提供商防火墙对公网开放 TCP 4792、UDP 4792 和 TCP 3340（TCP 80 供 acme.sh 签证书），脚本不做这一步，见 [`deploy/README.md`](../../deploy/README.md)。客户端直接连接公共节点主机上的网页接入、relay 和全网的 UDP 端口，都不经过 App 主机。
-
-部署成功必须核对实际容器 image ID、源码和版本、原身份、网页资源以及对应角色的网络行为。容器存活或 HTTP 200 不代表全网公网 UDP 入网、relay 连接、浏览器排队接入、配对和真实任务均已验收。失败或 SSH 响应未知时先检查远端 journal 和运行状态，不直接重发部署。
+容器、TLS、主机目录权限和维护流程见[部署配置](deployment.md)与仓库 `deploy/README.md`。

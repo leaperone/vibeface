@@ -11,6 +11,7 @@ on:
         value: ${{ jobs.compose.outputs.artifact_id }}
 permissions:
   contents: read
+  actions: read
 jobs:
   compose:
     name: Compose CLI package / ${{ inputs.target }}

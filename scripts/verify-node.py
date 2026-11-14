@@ -4692,7 +4692,49 @@ def memory_sync_acceptance(options):
             raise RuntimeError("Memory fixture cleanup failed; see " + str(run / "report.json"))
 
 
+def _npm_cli_candidate(registry, pages):
+    """Return the newest complete cli-v tag that also has a registry version."""
+    import release
+
+    versions = registry.get("versions")
+    require(isinstance(versions, dict), "npm registry has no bounded version map")
+    registry_versions = {value for value in versions if release.version(value) == "hourly"}
+    complete = []
+    matching = []
+    for item in (entry for page in pages for entry in page):
+        if not isinstance(item, dict) or not isinstance(item.get("tag_name"), str):
+            continue
+        tag = item["tag_name"]
+        if not tag.startswith("cli-v"):
+            continue
+        app, value, channel = release.parse_tag(tag)
+        require(app == "cli", "independent CLI tag parsed as another application")
+        names = {asset.get("name") for asset in item.get("assets", []) if isinstance(asset, dict)}
+        if item.get("draft") or item.get("prerelease") != (channel != "stable"):
+            if value in registry_versions:
+                raise AssertionError("a registry version points at a pending or draft CLI release")
+            continue
+        require("release.json" in names, "complete CLI release is missing release.json")
+        complete.append((value, tag))
+        if value in registry_versions:
+            matching.append((value, tag))
+    if not matching:
+        require(not complete, "a complete independent CLI release has no npm registry package")
+        return None
+    def key(value):
+        match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)-hourly\.(\d{10})", value)
+        require(match is not None, "registry hourly version has an invalid shape")
+        return tuple(map(int, match.groups()))
+    return max(matching, key=lambda pair: key(pair[0]))
+
+
 def pin_npm_baseline(options):
+    """Pin the newest independent CLI release behind the registry's hourly package.
+
+    A registry package may predate the independent CLI train.  In that case the
+    immutable pin records an explicit first-release baseline and the service
+    acceptance runs only the candidate lifecycle checks.
+    """
     import release
 
     source = Path(__file__).resolve().parents[1]
@@ -4705,8 +4747,23 @@ def pin_npm_baseline(options):
         encoded = response.read(4 * 1024 * 1024 + 1)
     require(len(encoded) <= 4 * 1024 * 1024, "npm metadata is bounded")
     registry = json.loads(encoded)
-    version = registry["dist-tags"]["hourly"]
-    require(release.version(version) == "hourly", "the public baseline is a real hourly release")
+
+    # Product-era v<version> releases are deliberately ignored.  Discover the
+    # independent CLI tag first; a malformed matching release is an error.
+    pages = json.loads(release.run("gh", "api", "--paginate", "--slurp",
+                                  f"repos/{release.GITHUB_REPO}/releases?per_page=100", cwd=source))
+    require(isinstance(pages, list) and all(isinstance(page, list) for page in pages),
+            "invalid GitHub release listing")
+    selected = _npm_cli_candidate(registry, pages)
+    output.mkdir(parents=True, mode=0o700)
+    if selected is None:
+        pin = {"first_release": True, "registry_hourly": registry.get("dist-tags", {}).get("hourly"),
+               "candidate_source": candidate,
+               "reason": "no_complete_independent_cli_release_with_registry_package"}
+        private_json(output / "pin.json", pin)
+        print("PASS pinned npm first-release baseline " + json.dumps(pin), flush=True)
+        return
+    version, cli_tag = selected
     metadata = registry["versions"][version]
     require(metadata["name"] == "@leaperone/vibeface" and metadata["version"] == version,
             "the pinned registry version matches its package")
@@ -4714,38 +4771,27 @@ def pin_npm_baseline(options):
     integrity = metadata["dist"]["integrity"]
     require(metadata["dist"]["tarball"] == tarball and re.fullmatch(r"sha512-[A-Za-z0-9+/]{86}==", integrity),
             "the baseline has an immutable registry tarball and SHA-512 integrity")
-    tag = "v" + version
-    record = release.release_record(tag)
-    require(not record["draft"] and record["published_at"] and record["tag_name"] == tag
-            and not any(marker in (record.get("body") or "") for marker in (release.BUILDING_MARKER, release.FAILED_MARKER)),
-            "the baseline product release is public and complete")
-    remote = release.remote_assets_by_name(record["assets"])
-    require("release.json" in remote and all(release.remote_asset_sha256(asset) for asset in remote.values()),
-            "baseline product assets require immutable GitHub SHA-256 metadata")
-    baseline_source = json.loads(release.run("gh", "api", f"repos/{release.GITHUB_REPO}/commits/{tag}"))["sha"]
-    context = release.validate_source(baseline_source, "product", root=source)
+    matches = [item for page in pages for item in page if item.get("tag_name") == cli_tag]
+    require(len(matches) == 1, "multiple independent CLI releases have the same tag")
+    baseline_source_info, remote, manifest_sha256 = release.published(cli_tag)
+    baseline_source = baseline_source_info["source_commit"]
     require(baseline_source != candidate, "baseline and candidate must have different real source commits")
+    context = release.validate_source(baseline_source, "cli", root=source)
     require(subprocess.run(["git", "merge-base", "--is-ancestor", context["ci_source_commit"], candidate],
                            cwd=source, capture_output=True).returncode == 0,
             "the baseline business source must be an ancestor of the candidate; future baselines are refused")
-    output.mkdir(parents=True, mode=0o700)
     with tempfile.TemporaryDirectory(dir=output, prefix=".verify-") as scratch:
         scratch = Path(scratch)
-
-        def download_asset(name):
-            for _ in range(3):
-                (scratch / name).unlink(missing_ok=True)
-                result = subprocess.run(["gh", "release", "download", tag, f"--repo={release.GITHUB_REPO}",
-                                         "--pattern", name, "--dir", str(scratch)], cwd=source, capture_output=True)
-                if result.returncode == 0:
-                    require(file_sha256(scratch / name) == release.remote_asset_sha256(remote[name]),
-                            "the pinned public product asset matches its immutable digest")
-                    return
-            raise AssertionError("cannot download pinned public product asset " + name)
-
-        expected = {"app": "product", "tag": tag, "version": version, "source_commit": baseline_source, "channel": "hourly"}
-        download_asset("release.json")
-        release.verify_remote_product_manifest(tag, release.GITHUB_REPO, expected, remote, scratch)
+        marker = next((asset for asset in remote["assets"] if asset.get("name") == "release.json"), None)
+        require(marker and marker.get("digest") == "sha256:" + manifest_sha256,
+                "CLI completion manifest digest metadata is missing")
+        selected_assets = list(baseline_source_info["assets"])
+        selected_assets.append({"name": "release.json", "size": marker["size"], "sha256": manifest_sha256})
+        release.download_assets(cli_tag, selected_assets, scratch)
+        release.verify_release("cli", scratch,
+                               {"app": "cli", "tag": cli_tag, "version": version,
+                                "source_commit": baseline_source, "channel": baseline_source_info["channel"]})
+        shutil.copyfile(scratch / "release.json", output / "release.json")
         archive = output / "baseline.tgz"
         for attempt in range(3):
             digest = hashlib.sha512()
@@ -4762,7 +4808,8 @@ def pin_npm_baseline(options):
                 break
             except (OSError, http.client.HTTPException):
                 require(attempt < 2, "cannot download the pinned public npm baseline")
-        require("sha512-" + base64.b64encode(digest.digest()).decode() == integrity, "the baseline tarball matches registry integrity")
+        require("sha512-" + base64.b64encode(digest.digest()).decode() == integrity,
+                "the baseline tarball matches registry integrity")
         unpacked = release.unpack(archive, scratch / "npm")
         npm = json.loads((unpacked / "package.json").read_text())
         require(npm["name"] == "@leaperone/vibeface" and npm["version"] == version
@@ -4776,21 +4823,21 @@ def pin_npm_baseline(options):
             build = json.loads((vendor / "BUILD-INFO.json").read_text())
             release.verify_build_info(build)
             require(build["source_commit"] == baseline_source and build["version"] == version and build["target"] == target,
-                    "every baseline vendor belongs to the complete product source and current data epoch")
+                    "every baseline vendor belongs to the complete CLI source and current data epoch")
             name = f"vibeface-{version}-{target}.tar.gz"
-            download_asset(name)
             native = release.unpack(scratch / name, scratch / target)
-            require(release.files(native) == release.files(vendor), "npm vendor bytes equal the published native product bundle")
+            require(release.files(native) == release.files(vendor),
+                    "npm vendor bytes equal the published native CLI bundle")
             builds[target] = build
-        shutil.copyfile(scratch / "release.json", output / "release.json")
-        pin = {"version": version, "source_commit": baseline_source, "source_context": context,
-               "candidate_source": candidate, "published_at": registry["time"][version], "release_id": record["id"],
+        pin = {"first_release": False, "version": version, "source_commit": baseline_source,
+               "source_context": context, "candidate_source": candidate,
+               "published_at": matches[0].get("published_at"), "release_id": matches[0].get("id"),
                "integrity": integrity, "tarball": tarball, "sha256": file_sha256(archive),
-               "manifest_sha256": file_sha256(output / "release.json"), "builds": builds,
-               "business_source_relation": "same" if context["ci_source_commit"] == candidate else "ancestor"}
+               "manifest_sha256": manifest_sha256, "builds": builds,
+               "tag": cli_tag, "business_source_relation": "same" if context["ci_source_commit"] == candidate else "ancestor"}
         private_json(output / "pin.json", pin)
     print("PASS pinned public npm baseline " + json.dumps({key: pin[key] for key in
-          ("version", "source_commit", "source_context", "candidate_source", "sha256", "manifest_sha256")}), flush=True)
+          ("tag", "version", "source_commit", "candidate_source", "sha256", "manifest_sha256")}), flush=True)
 
 
 def npm_service_acceptance(options):
@@ -4869,11 +4916,16 @@ def npm_service_acceptance(options):
     baseline = options.npm_baseline.resolve(strict=True)
     require(baseline.is_relative_to(source / ".artifacts"), "the pinned npm baseline stays in checkout artifacts")
     pin = json.loads((baseline / "pin.json").read_text())
-    require(pin["candidate_source"] == build["source_commit"] and pin["source_commit"] != build["source_commit"]
-            and file_sha256(baseline / "baseline.tgz") == pin["sha256"]
-            and file_sha256(baseline / "release.json") == pin["manifest_sha256"]
-            and pin["builds"][target]["data_epoch"] == build["data_epoch"],
-            "the immutable baseline pins a different real source, this exact candidate and the same data epoch")
+    first_release = bool(pin.get("first_release"))
+    if first_release:
+        require(not (baseline / "baseline.tgz").exists() and not (baseline / "release.json").exists(),
+                "first-release baseline must not claim a historical package")
+    else:
+        require(pin["candidate_source"] == build["source_commit"] and pin["source_commit"] != build["source_commit"]
+                and file_sha256(baseline / "baseline.tgz") == pin["sha256"]
+                and file_sha256(baseline / "release.json") == pin["manifest_sha256"]
+                and pin["builds"][target]["data_epoch"] == build["data_epoch"],
+                "the immutable baseline pins a different real source, this exact candidate and the same data epoch")
 
     artifacts.mkdir(parents=True, exist_ok=True)
     run = artifacts / ("npm-service-" + uuid.uuid4().hex[:10])
@@ -4886,20 +4938,22 @@ def npm_service_acceptance(options):
     candidate_checksums = {name: file_sha256(vendor / name) for name in
                            ("vibeface", "vibeface-core", "BUILD-INFO.json", "FILES.sha256", "scripts/install-node-service.sh")}
     hourly_order = lambda value: tuple(map(int, re.fullmatch(r"(\d+)\.(\d+)\.(\d+)-hourly\.(\d{10})", value).groups()))
-    baseline_version, candidate_version = hourly_order(pin["version"]), hourly_order(build["version"])
-    version_order = (candidate_version > baseline_version) - (candidate_version < baseline_version)
+    version_order = None
+    if not first_release:
+        baseline_version, candidate_version = hourly_order(pin["version"]), hourly_order(build["version"])
+        version_order = (candidate_version > baseline_version) - (candidate_version < baseline_version)
     report = {"status": "running", "target": target,
               "candidate": {"version": build["version"], "source_commit": build["source_commit"],
                             "package_sha256": file_sha256(package), "binary_sha256": file_sha256(native), "core_sha256": file_sha256(core)},
               "manager": "launchd" if sys.platform == "darwin" else "systemd --user", "cases": [],
               "native_path": str(native.relative_to(root)), "native_pids": [],
-              "baseline": {key: pin[key] for key in ("version", "source_commit", "source_context", "sha256", "manifest_sha256")},
+              "baseline": None if first_release else {key: pin[key] for key in ("version", "source_commit", "source_context", "sha256", "manifest_sha256")},
               "baseline_artifact_id": os.environ.get("NPM_BASELINE_ARTIFACT_ID", ""),
-              "candidate_declared_version": {1: "higher", 0: "same", -1: "lower"}[version_order],
-              "business_source_relation": pin["business_source_relation"], "real_provider_calls": 0,
-              "replacement": "public same-epoch baseline to a different-source immutable CI candidate",
+              "candidate_declared_version": "first_release" if first_release else ({1: "higher", 0: "same", -1: "lower"}[version_order]),
+              "business_source_relation": None if first_release else pin["business_source_relation"], "real_provider_calls": 0,
+              "replacement": None if first_release else "public same-epoch baseline to a different-source immutable CI candidate",
               "not_checked": ["historical-format migration", "real AI Providers",
-                              "full lifecycle of the immutable public baseline; only the candidate lifecycle is required"]}
+                              "historical baseline upgrade" if first_release else "full lifecycle of the immutable public baseline"]}
     node, owned = None, False
 
     def service(action, *, check=True):
@@ -5013,127 +5067,163 @@ def npm_service_acceptance(options):
         return conversation, attachment, digest, messages, invocation_count
 
     try:
-        candidate = run / "candidate-prefix"
-        reinstall(candidate, package)
-        candidate_vendor = candidate / "lib/node_modules/@leaperone/vibeface/vendor" / target
-        require(candidate_checksums == {name: file_sha256(candidate_vendor / name) for name in candidate_checksums},
-                "the independent npm prefix contains the exact immutable CI candidate")
-        reinstall(prefix, baseline / "baseline.tgz")
-        require(json.loads((root / "package.json").read_text())["version"] == pin["version"]
-                and json.loads((vendor / "BUILD-INFO.json").read_text()) == pin["builds"][target],
-                "the first installed service package is the verified public baseline")
-        import release
-        with tarfile.open(baseline / "baseline.tgz", "r:gz") as reference:
-            checksums = reference.extractfile(f"package/vendor/{target}/FILES.sha256").read().decode().splitlines()
-        expected_files = {name: digest for digest, name in (line.split("  ", 1) for line in checksums)}
-        require(release.files(vendor, ("FILES.sha256",)) == expected_files,
-                "every installed baseline vendor byte matches the immutable published package")
-        shutil.copy2(vendor / "scripts/install-node-service.sh", cleanup_script)
-        conversation, attachment, digest, messages, invocation_count = create_history("NPM")
-        require(invocation_count == 1, "one controlled fixture call creates the message history")
-        update = json.loads(command([binary, "update", "status", "--data-dir", node.directory]).stdout)
-        require(update["distribution"] == "npm" and update["automatic"] is False,
-                "npm owns updates and disables the built-in updater")
-        rejected("install", "stop the node before installing its npm service")
-        passed("public baseline active Node refuses install without changing data or services")
-        node.client.close()
-        node.stop()
-        stopped()
-        idle_guards()
-        passed("public baseline updater lock, pending journal and second updater refuse without mutation")
-        saved_files, saved_events = persistent()
-
-        def preserved():
+        if first_release:
+            candidate = run / "candidate-prefix"
+            reinstall(candidate, package)
+            candidate_vendor = candidate / "lib/node_modules/@leaperone/vibeface/vendor" / target
+            require(candidate_checksums == {name: file_sha256(candidate_vendor / name) for name in candidate_checksums},
+                    "the independent npm prefix contains the exact immutable CI candidate")
+            shutil.copy2(vendor / "scripts/install-node-service.sh", cleanup_script)
+            conversation, attachment, digest, messages, invocation_count = create_history("NPM-FIRST")
+            require(invocation_count == 1, "one controlled fixture call creates this Node's history")
+            update = json.loads(command([binary, "update", "status", "--data-dir", node.directory]).stdout)
+            require(update["distribution"] == "npm" and update["automatic"] is False,
+                    "npm owns updates and disables the built-in updater")
+            rejected("install", "stop the node before installing the npm service")
+            node.client.close(); node.stop(); stopped(); idle_guards()
+            saved_files, saved_events = persistent()
+            owned = True
+            service("install"); running(); service("status")
             files, events = persistent()
             require(files == saved_files and saved_events and all(events.get(key) == value for key, value in saved_events.items()),
-                    "npm lifecycle preserves identity, configuration and every original signed event")
-            require(node.client.rpc("conversation", conversation_id=conversation)["messages"] == messages,
-                    "npm lifecycle preserves the exact nonempty message history")
-            require(len(fixture_records(run)) == invocation_count, "service restarts never replay a completed fixture turn")
-            page = node.client.rpc("read_artifact", conversation_id=conversation, blob_hash=digest, binary=True)
-            require(page["size"] == len(attachment) and page["next_offset"] is None
-                    and base64.b64decode(page["data"]) == attachment, "npm lifecycle returns the original attachment bytes")
-
-        owned = True
-        service("install")
-        running()
-        service("status")
-        preserved()
-        service("stop")
-        stopped()
-        passed("immutable public baseline installs a real service and stops before candidate replacement")
-        node.client.close()
-        definition = service_files[0].read_bytes()
-        previous_inode = core.stat().st_ino
-        reinstall(prefix, package)
-        require(core.stat().st_ino != previous_inode and candidate_checksums == {name: file_sha256(vendor / name) for name in candidate_checksums},
-                "npm replaces the stopped public baseline with the exact different-source CI candidate")
-        require(file_sha256(package) == report["candidate"]["package_sha256"] and service_files[0].read_bytes() == definition,
-                "npm replacement preserves the immutable input and installed service definition")
-        stopped()
-        database_sha256 = file_sha256(node.directory / "node.sqlite3")
-        access = command([binary, "access", "--json", "--data-dir", node.directory], check=False)
-        if access.returncode != 0 and "data_schema_mismatch" in access.stderr:
-            schema_digests = []
-            for commit in (pin["source_context"]["ci_source_commit"], build["source_commit"]):
-                config = command(["git", "show", f"{commit}:apps/core/src/config.rs"]).stdout
-                fingerprint = re.search(r'DATA_EPOCH_SCHEMA_SHA256: &str\s*=\s*"([0-9a-f]{64})"', config)
-                require(fingerprint is not None, "both reviewed sources declare their data schema fingerprint")
-                schema_digests.append(fingerprint[1])
-            require(schema_digests[0] != schema_digests[1], "schema rejection corresponds to a declared format change")
-            refused = command([binary, "serve", "--data-dir", node.directory], check=False)
-            require(refused.returncode != 0 and "data_schema_mismatch" in refused.stderr,
-                    "the candidate refuses to start an incompatible baseline schema")
-            require(persistent() == (saved_files, saved_events)
-                    and file_sha256(node.directory / "node.sqlite3") == database_sha256
-                    and (node.directory / "blobs/sha256" / digest[:2] / digest).read_bytes() == attachment,
-                    "schema rejection leaves baseline identity, config, database and attachment bytes intact")
-            service("uninstall")
-            stopped()
-            report["schema_compatibility"] = {"status": "rejected", "baseline": schema_digests[0],
-                                               "candidate": schema_digests[1]}
-            passed("incompatible public baseline is refused without migration or data loss")
-            conversation, attachment, digest, messages, invocation_count = create_history("NPM-CANDIDATE")
+                    "first-release lifecycle preserves identity and signed history")
+            service("stop"); stopped(); service("start"); first_pid = running()
+            service("restart"); require(running() != first_pid, "first-release restart replaces the manager PID")
+            files, events = persistent()
+            require(files == saved_files and all(events.get(key) == value for key, value in saved_events.items())
+                    and node.client.rpc("conversation", conversation_id=conversation)["messages"] == messages
+                    and base64.b64decode(node.client.rpc("read_artifact", conversation_id=conversation,
+                                                        blob_hash=digest, binary=True)["data"]) == attachment,
+                    "first-release restart preserves history and attachment bytes")
+            service("uninstall"); stopped()
+            require(not any(path.exists() or path.is_symlink() for path in service_files)
+                    and all(manager_absent(unit) for unit in units),
+                    "first-release uninstall removes all fixture services")
+            report["status"] = "passed"
+            passed("first-release candidate service lifecycle and updater guards")
+            return
+        else:
+            candidate = run / "candidate-prefix"
+            reinstall(candidate, package)
+            candidate_vendor = candidate / "lib/node_modules/@leaperone/vibeface/vendor" / target
+            require(candidate_checksums == {name: file_sha256(candidate_vendor / name) for name in candidate_checksums},
+                    "the independent npm prefix contains the exact immutable CI candidate")
+            reinstall(prefix, baseline / "baseline.tgz")
+            require(json.loads((root / "package.json").read_text())["version"] == pin["version"]
+                    and json.loads((vendor / "BUILD-INFO.json").read_text()) == pin["builds"][target],
+                    "the first installed service package is the verified public baseline")
+            import release
+            with tarfile.open(baseline / "baseline.tgz", "r:gz") as reference:
+                checksums = reference.extractfile(f"package/vendor/{target}/FILES.sha256").read().decode().splitlines()
+            expected_files = {name: digest for digest, name in (line.split("  ", 1) for line in checksums)}
+            require(release.files(vendor, ("FILES.sha256",)) == expected_files,
+                    "every installed baseline vendor byte matches the immutable published package")
+            shutil.copy2(vendor / "scripts/install-node-service.sh", cleanup_script)
+            conversation, attachment, digest, messages, invocation_count = create_history("NPM")
+            require(invocation_count == 1, "one controlled fixture call creates the message history")
+            update = json.loads(command([binary, "update", "status", "--data-dir", node.directory]).stdout)
+            require(update["distribution"] == "npm" and update["automatic"] is False,
+                    "npm owns updates and disables the built-in updater")
+            rejected("install", "stop the node before installing its npm service")
+            passed("public baseline active Node refuses install without changing data or services")
             node.client.close()
             node.stop()
             stopped()
             idle_guards()
+            passed("public baseline updater lock, pending journal and second updater refuse without mutation")
             saved_files, saved_events = persistent()
+
+            def preserved():
+                files, events = persistent()
+                require(files == saved_files and saved_events and all(events.get(key) == value for key, value in saved_events.items()),
+                        "npm lifecycle preserves identity, configuration and every original signed event")
+                require(node.client.rpc("conversation", conversation_id=conversation)["messages"] == messages,
+                        "npm lifecycle preserves the exact nonempty message history")
+                require(len(fixture_records(run)) == invocation_count, "service restarts never replay a completed fixture turn")
+                page = node.client.rpc("read_artifact", conversation_id=conversation, blob_hash=digest, binary=True)
+                require(page["size"] == len(attachment) and page["next_offset"] is None
+                        and base64.b64decode(page["data"]) == attachment, "npm lifecycle returns the original attachment bytes")
+
+            owned = True
             service("install")
             running()
-            passed("candidate starts a fresh data directory with nonempty history and attachment")
-        else:
-            service("start")
+            service("status")
+            preserved()
+            service("stop")
+            stopped()
+            passed("immutable public baseline installs a real service and stops before candidate replacement")
+            node.client.close()
+            definition = service_files[0].read_bytes()
+            previous_inode = core.stat().st_ino
+            reinstall(prefix, package)
+            require(core.stat().st_ino != previous_inode and candidate_checksums == {name: file_sha256(vendor / name) for name in candidate_checksums},
+                    "npm replaces the stopped public baseline with the exact different-source CI candidate")
+            require(file_sha256(package) == report["candidate"]["package_sha256"] and service_files[0].read_bytes() == definition,
+                    "npm replacement preserves the immutable input and installed service definition")
+            stopped()
+            database_sha256 = file_sha256(node.directory / "node.sqlite3")
+            access = command([binary, "access", "--json", "--data-dir", node.directory], check=False)
+            if access.returncode != 0 and "data_schema_mismatch" in access.stderr:
+                schema_digests = []
+                for commit in (pin["source_context"]["ci_source_commit"], build["source_commit"]):
+                    config = command(["git", "show", f"{commit}:apps/core/src/config.rs"]).stdout
+                    fingerprint = re.search(r'DATA_EPOCH_SCHEMA_SHA256: &str\s*=\s*"([0-9a-f]{64})"', config)
+                    require(fingerprint is not None, "both reviewed sources declare their data schema fingerprint")
+                    schema_digests.append(fingerprint[1])
+                require(schema_digests[0] != schema_digests[1], "schema rejection corresponds to a declared format change")
+                refused = command([binary, "serve", "--data-dir", node.directory], check=False)
+                require(refused.returncode != 0 and "data_schema_mismatch" in refused.stderr,
+                        "the candidate refuses to start an incompatible baseline schema")
+                require(persistent() == (saved_files, saved_events)
+                        and file_sha256(node.directory / "node.sqlite3") == database_sha256
+                        and (node.directory / "blobs/sha256" / digest[:2] / digest).read_bytes() == attachment,
+                        "schema rejection leaves baseline identity, config, database and attachment bytes intact")
+                service("uninstall")
+                stopped()
+                report["schema_compatibility"] = {"status": "rejected", "baseline": schema_digests[0],
+                                                   "candidate": schema_digests[1]}
+                passed("incompatible public baseline is refused without migration or data loss")
+                conversation, attachment, digest, messages, invocation_count = create_history("NPM-CANDIDATE")
+                node.client.close()
+                node.stop()
+                stopped()
+                idle_guards()
+                saved_files, saved_events = persistent()
+                service("install")
+                running()
+                passed("candidate starts a fresh data directory with nonempty history and attachment")
+            else:
+                service("start")
+                running()
+                report["schema_compatibility"] = {"status": "accepted"}
+                passed("published-to-candidate npm replacement starts with the original baseline data")
+            preserved()
+            passed("candidate service preserves identity, config, signed history and attachment bytes")
+            rejected("install", "stop the node before installing its npm service")
+            service("stop")
+            stopped()
+            idle_guards()
+            service("install")
             running()
-            report["schema_compatibility"] = {"status": "accepted"}
-            passed("published-to-candidate npm replacement starts with the original baseline data")
-        preserved()
-        passed("candidate service preserves identity, config, signed history and attachment bytes")
-        rejected("install", "stop the node before installing its npm service")
-        service("stop")
-        stopped()
-        idle_guards()
-        service("install")
-        running()
-        service("status")
-        service("stop")
-        stopped()
-        service("start")
-        previous = running()
-        service("restart")
-        require(running() != previous, "the candidate's native manager restart replaces its PID")
-        preserved()
-        passed("candidate install, stop, start, restart and concurrency guards preserve its original data")
-        service("uninstall")
-        stopped()
-        require(not any(path.exists() or path.is_symlink() for path in service_files) and all(manager_absent(unit) for unit in units),
-                "uninstall removes the fixture services from disk and the native manager")
-        files, events = persistent()
-        require(files == saved_files and all(events.get(key) == value for key, value in saved_events.items())
-                and (node.directory / "blobs/sha256" / digest[:2] / digest).read_bytes() == attachment,
-                "uninstall retains the fixture identity, configuration, history and attachment")
-        passed("uninstall removes the native service and retains data")
-        report["status"] = "passed"
+            service("status")
+            service("stop")
+            stopped()
+            service("start")
+            previous = running()
+            service("restart")
+            require(running() != previous, "the candidate's native manager restart replaces its PID")
+            preserved()
+            passed("candidate install, stop, start, restart and concurrency guards preserve its original data")
+            service("uninstall")
+            stopped()
+            require(not any(path.exists() or path.is_symlink() for path in service_files) and all(manager_absent(unit) for unit in units),
+                    "uninstall removes the fixture services from disk and the native manager")
+            files, events = persistent()
+            require(files == saved_files and all(events.get(key) == value for key, value in saved_events.items())
+                    and (node.directory / "blobs/sha256" / digest[:2] / digest).read_bytes() == attachment,
+                    "uninstall retains the fixture identity, configuration, history and attachment")
+            passed("uninstall removes the native service and retains data")
+            report["status"] = "passed"
     except Exception as error:
         report.update(status="failed", failure=f"{type(error).__name__}: {error}")
         raise

@@ -7,6 +7,7 @@ app="$1"
 directory="$2"
 [[ "$app" == core || "$app" == cli ]] || { echo 'Expected core or cli.' >&2; exit 1; }
 [[ -d "$directory" ]] || { echo "Native output directory does not exist: $directory" >&2; exit 1; }
+# shellcheck source=scripts/import-mac-identity.sh
 GITHUB_ENV="${GITHUB_ENV:-/dev/null}" source "$(dirname "${BASH_SOURCE[0]}")/import-mac-identity.sh"
 if [[ "$app" == core ]]; then
   binaries=("$directory/vibeface-core")

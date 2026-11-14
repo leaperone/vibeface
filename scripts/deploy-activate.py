@@ -710,7 +710,7 @@ def self_test():
                                        'deploy_dir': '/srv/service-control/app', 'listen': '127.0.0.1:8088',
                                        'nginx_config': '/etc/nginx/conf.d/app.conf',
                                        'server_name': 'app.example.invalid'}))
-        arguments = ['deploy-activate.py', '--config', str(settings), '--tag', 'v0.0.1',
+        arguments = ['deploy-activate.py', '--config', str(settings), '--tag', 'app-v0.0.1',
                      '--version', '0.0.1', '--source-sha', 'a' * 40, '--archive', str(archive)]
         for pin, checksum, loaded, accepted in (
                 (imported, digest, 'Loaded image ID: ' + imported, imported),
@@ -733,7 +733,7 @@ def self_test():
                 if accepted:
                     # Activation runs under the ID this host's store gave the pinned image.
                     activation.assert_called_once_with(json.loads(settings.read_text()), accepted,
-                                                       'v0.0.1', 'a' * 40, '0.0.1')
+                                       'app-v0.0.1', 'a' * 40, '0.0.1')
                 else:
                     activation.assert_not_called()
                 if checksum != digest:
@@ -935,9 +935,8 @@ def main():
     raw = sys.stdin.buffer.read(65537) if args.config == '-' else checked_path(Path(args.config)).read_bytes()
     require(len(raw) <= 65536, 'deployment configuration is too large')
     config = validate_config(json.loads(raw))
-    expected_tags = (('www-v' if config['role'] == 'www' else 'v') + args.version,
-                     'core-v' + args.version if config['role'] in CORE_ROLES else '')
-    require(args.tag in expected_tags, 'tag and version differ')
+    expected_tag = {'node': 'core-v', 'app': 'app-v', 'www': 'www-v'}[config['role']] + args.version
+    require(args.tag == expected_tag, 'tag and version differ')
     require(bool(args.archive) == bool(args.archive_sha256), 'archive and its digest must be supplied together')
     image = args.image
     if args.archive:

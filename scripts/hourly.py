@@ -1,312 +1,360 @@
 #!/usr/bin/env python3
-"""Tag the newest green main commit once per UTC hour as a product Hourly release."""
+"""Release changed applications and wake exact dependency consumers independently."""
 import argparse
 import datetime
+import fnmatch
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
-import sys
 import tempfile
 import time
 
-sys.dont_write_bytecode = True
 import release
 
+COORDINATOR_SCHEMA = 2
 REPO = release.GITHUB_REPO
-PATHS = ('apps/app/package.json', 'apps/core/Cargo.toml', 'apps/cli/Cargo.toml', 'apps/desktop/Cargo.toml',
-         'apps/mobile/app.json', 'Cargo.lock')
-RUST = {'core': 'vibeface-core', 'cli': 'vibeface', 'desktop': 'vibeface-desktop'}
 BOT = '41898282+github-actions[bot]@users.noreply.github.com'
-HOURLY_TAG = re.compile(r'v[0-9]+\.[0-9]+\.[0-9]+-hourly\.([0-9]{10})')
-require = release.require
+RUST = {'core': 'vibeface-core', 'cli': 'vibeface', 'desktop': 'vibeface-desktop'}
+INPUTS = {
+    'core': ('apps/core/*', 'crates/protocol/*', 'crates/control/*', 'crates/bridge/*', 'crates/secure/*', 'crates/client/*', 'crates/delivery/*', 'Cargo.toml', 'Cargo.lock', '.cargo/*', 'config/*', 'rust-toolchain*', 'scripts/sign-release.sh', 'scripts/release-rustflags.py', '.github/workflows/release-native.yml'),
+    'app': ('apps/app/*', 'packages/client/*', 'packages/theme/*', 'crates/secure/*', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain*', 'pnpm*', 'package.json', 'scripts/build-web*', 'scripts/build-inputs.py'),
+    'cli': ('apps/cli/*', 'crates/control/*', 'crates/client/*', 'crates/bridge/*', 'crates/secure/*', 'crates/protocol/*', 'Cargo.toml', 'Cargo.lock', '.cargo/*', 'rust-toolchain*', 'install.sh', 'scripts/install*', 'scripts/package-*', 'scripts/offline-docs*', 'packages/docs/*'),
+    'desktop': ('apps/desktop/*', 'crates/client/*', 'crates/secure/*', 'crates/bridge/*', 'crates/control/*', 'crates/protocol/*', 'Cargo.toml', 'Cargo.lock', '.cargo/*', 'scripts/build-desktop.mjs', 'scripts/verify-desktop.mjs', 'scripts/windows-signing.mjs', 'scripts/import-mac-identity.sh', '.github/actions/native-desktop/*'),
+    'mobile': ('apps/mobile/*', 'packages/client/*', 'packages/theme/*', 'packages/secure-native/*', 'crates/secure/*', 'crates/secure-ffi/*', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain*', 'pnpm*', 'package.json', 'scripts/build-mobile*', 'scripts/build-ios*', 'scripts/verify-ios*', '.github/workflows/release-apps.yml', '.github/workflows/release-ios.yml'),
+    'www': ('apps/www/*', 'packages/docs/*', 'packages/theme/*', 'pnpm*', 'package.json'),
+}
+COMMON = ('scripts/release.py', 'scripts/hourly.py', 'scripts/release-entry.py', '.github/workflows/release-collect.yml', '.github/workflows/release-publish.yml')
 
 
 def git(*args, root=None, data=None, env=None):
     return subprocess.check_output(['git', *args], cwd=root or release.ROOT, input=data, env=env).decode().strip()
 
 
-def blob(commit, path):
-    return subprocess.check_output(['git', 'show', f'{commit}:{path}'], cwd=release.ROOT).decode()
+def blob(commit, path, root=None):
+    return subprocess.check_output(['git', 'show', f'{commit}:{path}'], cwd=root or release.ROOT)
 
 
 def hour_of(batch):
-    require(isinstance(batch, str) and re.fullmatch(r'[0-9]{10}', batch), 'Hourly batch must be YYYYMMDDHH')
+    release.require(isinstance(batch, str) and re.fullmatch(r'[0-9]{10}', batch), 'Hourly batch must be YYYYMMDDHH')
     datetime.datetime.strptime(batch, '%Y%m%d%H')
     return batch
 
 
 def build_numbers(batch):
-    """Android versionCode YYMMDDHH and iOS CFBundleVersion YYMM.DD.HH both rise with every hour."""
     hour_of(batch)
     return int(batch[2:]), f'{int(batch[2:6])}.{int(batch[6:8])}.{int(batch[8:])}'
 
 
-def hourly_version(base, batch):
-    value = blob(base, 'apps/cli/Cargo.toml')
-    current = re.search(r'(?m)^version\s*=\s*"([^"]+)"', value)[1]
+def version_path(app):
+    return f'apps/{app}/' + ('Cargo.toml' if app in RUST else 'app.json' if app == 'mobile' else 'package.json')
+
+
+def hourly_version(app, base, batch, root=None):
+    text = blob(base, version_path(app), root).decode()
+    if app in RUST:
+        current = re.search(r'(?m)^version\s*=\s*"([^"]+)"', text)[1]
+    else:
+        data = json.loads(text)
+        current = data['expo']['extra']['releaseVersion'] if app == 'mobile' else data['version']
     result = current.split('-', 1)[0] + '-hourly.' + hour_of(batch)
-    require(release.version(result) == 'hourly', 'invalid Hourly version')
+    release.version(result)
     return result
 
 
-def json_value(text, keys, value):
-    data = json.loads(text)
-    require(json.dumps(data, indent=2, ensure_ascii=False) + '\n' == text, 'version JSON formatting changed')
-    parent = data
-    for key in keys[:-1]:
-        parent = parent[key]
-    require(keys[-1] in parent, 'missing version field')
-    parent[keys[-1]] = value
-    return json.dumps(data, indent=2, ensure_ascii=False) + '\n'
+def generated(app, base, batch, pins=None, root=None):
+    release.require(app in release.APPS, 'unknown Hourly application')
+    pins = pins or {}
+    release.require(set(pins) == set(release.DEPENDENCIES[app]), 'Hourly dependency set differs')
+    for dependency, pin in pins.items():
+        release.validate_pin(dependency, pin)
+    value = hourly_version(app, base, batch, root)
+    path = version_path(app)
+    text = blob(base, path, root).decode()
+    result = {}
+    if app in RUST:
+        text, count = re.subn(r'(?m)^(version\s*=\s*)"[^"]+"', lambda m: m[1] + json.dumps(value), text, count=1)
+        release.require(count == 1, 'missing application version')
+        blocks = blob(base, 'Cargo.lock', root).split(b'[[package]]')
+        count = 0
+        for index, block in enumerate(blocks):
+            if re.search(rb'(?m)^name = "' + RUST[app].encode() + rb'"$', block):
+                release.require(not re.search(rb'(?m)^(source|checksum)\s*=', block), 'local package cannot be a registry package')
+                blocks[index] = re.sub(rb'(?m)^version = "[^"]+"$', b'version = ' + json.dumps(value).encode(), block, count=1)
+                count += 1
+        release.require(count == 1, 'Cargo.lock must contain selected local package once')
+        result['Cargo.lock'] = b'[[package]]'.join(blocks)
+    else:
+        data = json.loads(text)
+        if app == 'mobile':
+            data['expo']['extra']['releaseVersion'] = value
+            code, ios = build_numbers(batch)
+            data['expo']['android']['versionCode'] = code
+            data['expo']['ios']['buildNumber'] = ios
+        else:
+            data['version'] = value
+        text = json.dumps(data, indent=2, ensure_ascii=False) + '\n'
+    result[path] = text.encode()
+    if pins:
+        result[f'releases/{app}.json'] = (json.dumps(pins, sort_keys=True, indent=2) + '\n').encode()
+    return value, result
 
 
-def cargo_version(text, value):
-    result, count = re.subn(r'(?ms)(^\[package\]\s*\n(?:(?!^\[).)*?^version\s*=\s*)"[^"]+"',
-                            lambda match: match[1] + json.dumps(value), text, count=1)
-    require(count == 1, 'missing Cargo package version')
-    return result
-
-
-def generated(base, batch):
-    """The only bytes an Hourly source may change relative to its green main parent."""
-    value = hourly_version(base, batch)
-    code, ios = build_numbers(batch)
-    result = {path: blob(base, path) for path in PATHS}
-    result['apps/app/package.json'] = json_value(result['apps/app/package.json'], ('version',), value)
-    for app in RUST:
-        path = f'apps/{app}/Cargo.toml'
-        result[path] = cargo_version(result[path], value)
-    blocks = result['Cargo.lock'].split('[[package]]')
-    found = []
-    for index, block in enumerate(blocks):
-        name = re.search(r'(?m)^name = "([^"]+)"$', block)
-        if name and name[1] in RUST.values():
-            require(not re.search(r'(?m)^(source|checksum)\s*=', block), 'Cargo.lock local package has a registry source')
-            blocks[index] = re.sub(r'(?m)^version = "[^"]+"$', 'version = ' + json.dumps(value), block, count=1)
-            found.append(name[1])
-    require(sorted(found) == sorted(RUST.values()), 'Cargo.lock must hold each local package once')
-    result['Cargo.lock'] = '[[package]]'.join(blocks)
-    mobile = 'apps/mobile/app.json'
-    for keys, item in ((('expo', 'extra', 'releaseVersion'), value), (('expo', 'android', 'versionCode'), code),
-                       (('expo', 'ios', 'buildNumber'), ios)):
-        result[mobile] = json_value(result[mobile], keys, item)
-    return value, {path: text.encode() for path, text in result.items()}
-
-
-def expected_tree(base, batch):
-    _, files = generated(base, batch)
+def expected_tree(app, base, batch, pins=None, root=None):
+    _, content = generated(app, base, batch, pins, root)
     with tempfile.TemporaryDirectory() as temporary:
-        environment = dict(os.environ, GIT_INDEX_FILE=str(Path(temporary) / 'index'))
-        git('read-tree', base, env=environment)
-        for path, content in files.items():
-            require(git('ls-tree', base, '--', path).split()[:2] == ['100644', 'blob'], 'version source must be a tracked file')
-            oid = git('hash-object', '-w', '--stdin', data=content)
-            git('update-index', '--add', '--cacheinfo', '100644', oid, path, env=environment)
-        return git('write-tree', env=environment)
+        env = dict(os.environ, GIT_INDEX_FILE=str(Path(temporary) / 'index'))
+        git('read-tree', base, env=env, root=root)
+        for path, data in content.items():
+            oid = git('hash-object', '-w', '--stdin', data=data, root=root)
+            git('update-index', '--add', '--cacheinfo', '100644', oid, path, env=env, root=root)
+        return git('write-tree', env=env, root=root)
 
 
-def message(batch):
-    return f'chore(release): hourly {batch}'
-
-
-def verify(source):
-    """Return (base, batch) only for the exact bot commit that changes nothing but Hourly version fields."""
-    commits = git('rev-list', '--parents', '-n', '1', source).split()
-    require(len(commits) == 2 and commits[0] == source, 'Hourly source must be one ordinary commit')
-    base = commits[1]
-    match = re.fullmatch(r'chore\(release\): hourly ([0-9]{10})', git('show', '-s', '--format=%B', source))
-    require(match, 'Hourly source is missing its batch')
-    require(git('show', '-s', '--format=%ae%n%ce', source).splitlines() == [BOT, BOT], 'unexpected Hourly commit author')
-    require(expected_tree(base, match[1]) == git('rev-parse', source + '^{tree}'),
-            'Hourly tree differs from the exact mechanical version changes')
+def verify(source, app, root=None):
+    parts = git('rev-list', '--parents', '-n', '1', source, root=root).split()
+    release.require(len(parts) == 2 and parts[0] == source, 'Hourly source must be one ordinary commit')
+    base = parts[1]
+    match = re.fullmatch(r'chore\(release\): ' + app + r' hourly ([0-9]{10})', git('show', '-s', '--format=%B', source, root=root))
+    release.require(match, 'Hourly application/message mismatch')
+    release.require(git('show', '-s', '--format=%ae%n%ce', source, root=root).splitlines() == [BOT, BOT], 'unexpected Hourly author')
+    pins = json.loads(blob(source, f'releases/{app}.json', root)) if release.DEPENDENCIES[app] else {}
+    release.require(expected_tree(app, base, match[1], pins, root) == git('rev-parse', source + '^{tree}', root=root), 'Hourly source differs from exact selected version and pins')
     return base, match[1]
 
 
-def source_context(source, release_app):
-    """Main sources prove themselves; a detached source must be the Hourly commit on a main parent."""
-    require(release_app in release.RELEASES and re.fullmatch(release.COMMIT, source), 'invalid release source')
-    if subprocess.run(['git', 'merge-base', '--is-ancestor', source, 'origin/main'], cwd=release.ROOT).returncode == 0:
-        return dict(ci_source_commit=source)
-    require(release_app == 'product', 'only product Hourly sources may be outside main')
-    base, _ = verify(source)
-    require(subprocess.run(['git', 'merge-base', '--is-ancestor', base, 'origin/main'], cwd=release.ROOT).returncode == 0,
-            'Hourly parent must be on main')
-    return dict(ci_source_commit=base)
+def source_context(source, app, root=None):
+    root = root or release.ROOT
+    release.require(app in release.APPS and isinstance(source, str) and re.fullmatch(release.COMMIT, source), 'invalid release source')
+    if subprocess.run(['git', 'merge-base', '--is-ancestor', source, 'origin/main'], cwd=root).returncode == 0:
+        return {'ci_source_commit': source}
+    base, _ = verify(source, app, root)
+    release.require(subprocess.run(['git', 'merge-base', '--is-ancestor', base, 'origin/main'], cwd=root).returncode == 0, 'Hourly parent must be on main')
+    return {'ci_source_commit': base}
 
 
-def scratch():
-    directory = release.ROOT / '.artifacts' / 'hourly'
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory
+def input_digest(app, source, root=None):
+    patterns = (*INPUTS[app], *COMMON, '.github/workflows/' + release.WORKFLOWS[app])
+    if app in ('core', 'app', 'www'):
+        patterns += ('scripts/release-dispatch.py', '.github/workflows/release-deploy.yml')
+    if app == 'cli':
+        patterns += ('.github/workflows/release-native.yml', '.github/workflows/release-compose.yml', '.github/workflows/npm-publish.yml', 'scripts/publish-npm.mjs')
+    if app == 'desktop':
+        patterns += ('.github/workflows/release-desktop.yml',)
+    entries = git('ls-tree', '-r', source, root=root).splitlines()
+    selected = []
+    for line in entries:
+        header, path = line.split('\t', 1)
+        if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns):
+            selected.append(header + '\t' + path)
+    release.require(selected, 'application has no tracked build inputs')
+    return hashlib.sha256('\n'.join(selected).encode()).hexdigest()
 
 
 def api(path, method='GET', data=None, missing=False):
-    args = ['gh', 'api', '--method', method, f'repos/{REPO}/{path}'] + (['--input', '-'] if data is not None else [])
+    args = ['gh', 'api', '--method', method, f'repos/{REPO}/{path}']
+    if data is not None:
+        args += ['--input', '-']
     result = subprocess.run(args, input=json.dumps(data) if data is not None else None, capture_output=True, text=True)
     if missing and result.returncode and '(HTTP 404)' in result.stderr:
         return None
-    require(result.returncode == 0, f'GitHub {method} {path} failed')
+    release.require(result.returncode == 0, f'GitHub {method} request failed: {path}')
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 
-def confirm(write, read, description):
-    # A failed response can follow a successful write; only the remote state decides, never a second write.
-    try:
-        write()
-    except (ValueError, subprocess.SubprocessError):
-        pass
-    for _ in range(18):
-        value = read()
-        if value:
-            return value
-        time.sleep(10)
-    raise ValueError(description + ' has an unknown outcome; reconcile before the next hour')
-
-
 def green_main():
-    """Newest first-parent main commit whose push Core CI succeeded."""
     runs = api('actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=100')['workflow_runs']
-    green = {run['head_sha'] for run in runs if run['head_branch'] == 'main' and run['path'] == '.github/workflows/ci.yml'
-             and run['repository']['full_name'] == REPO and run['head_repository']['full_name'] == REPO}
-    for commit in git('rev-list', '--first-parent', '-n', '200', 'origin/main').splitlines():
-        if commit in green:
-            return commit
-    raise ValueError('no main commit with successful push CI among the latest 200')
+    green = {r['head_sha'] for r in runs if r['head_branch'] == 'main' and r['path'] == '.github/workflows/ci.yml'
+             and r['repository']['full_name'] == REPO and r['head_repository']['full_name'] == REPO}
+    required = {'.github/workflows/' + path for path in release.WORKFLOWS.values()}
+    for source in git('rev-list', '--first-parent', '-n', '200', 'origin/main').splitlines():
+        if source not in green:
+            continue
+        paths = set(git('ls-tree', '-r', '--name-only', source, '--', '.github/workflows').splitlines())
+        if required <= paths and b'COORDINATOR_SCHEMA = 2' in blob(source, 'scripts/hourly.py'):
+            return source
+    raise ValueError('no successful main push CI source contains the independent release workflows')
 
 
 def tag_commit(tag):
     ref = api('git/ref/tags/' + tag, missing=True)
-    if not ref:
+    if ref is None:
         return None
     item = ref['object']
     for _ in range(8):
         if item['type'] == 'commit':
             return item['sha']
-        require(item['type'] == 'tag', 'release ref is not a commit or annotated tag')
+        release.require(item['type'] == 'tag', 'release tag is not a commit')
         item = api('git/tags/' + item['sha'])['object']
-    raise ValueError('too many nested tag objects')
+    raise ValueError('tag nesting is too deep')
 
 
-def release_runs(tag, source):
-    runs = api(f'actions/workflows/release.yml/runs?branch={tag}&head_sha={source}&per_page=100')['workflow_runs']
-    return [run for run in runs if run['head_sha'] == source and run['head_branch'] == tag
-            and run['repository']['full_name'] == REPO]
+def release_runs(app, tag, source):
+    runs = api(f'actions/workflows/{release.WORKFLOWS[app]}/runs?branch={tag}&head_sha={source}&per_page=100')['workflow_runs']
+    return [r for r in runs if r['head_sha'] == source and r['head_branch'] == tag and r['repository']['full_name'] == REPO
+            and r.get('display_title', '').endswith('/ publish')]
 
 
-def create_source(base, batch):
-    identity = dict(os.environ, GIT_AUTHOR_NAME='github-actions[bot]', GIT_AUTHOR_EMAIL=BOT,
-                    GIT_COMMITTER_NAME='github-actions[bot]', GIT_COMMITTER_EMAIL=BOT)
-    source = git('commit-tree', expected_tree(base, batch), '-p', base, '-m', message(batch), env=identity)
-    require(verify(source) == (base, batch), 'created Hourly source failed its own gate')
-    return source
+def ensure_release_run(app, tag, source):
+    runs = release_runs(app, tag, source)
+    if not runs:
+        runs = reconcile(lambda: api(f'actions/workflows/{release.WORKFLOWS[app]}/dispatches', 'POST',
+                                    {'ref': tag, 'inputs': {'tag': tag, 'publish': 'true'}}),
+                         lambda: release_runs(app, tag, source), 'release dispatch')
+    return runs
 
 
-def release_settled(tag, source):
-    """A previous hour counts only while its release is running or succeeded; failed hours are rebuilt."""
-    return any(run['status'] != 'completed' or run['conclusion'] == 'success' for run in release_runs(tag, source))
+def reconcile(write, read, description):
+    try:
+        write()
+    except (ValueError, subprocess.SubprocessError):
+        pass
+    for _ in range(18):
+        result = read()
+        if result:
+            return result
+        time.sleep(5)
+    raise ValueError(description + ' result is unknown; reconcile before retrying')
+
+
+def version_key(value):
+    channel = release.version(value)
+    base, _, pre = value.partition('-')
+    return (*map(int, base.split('.')), {'hourly': 0, 'rc': 1, 'stable': 2}[channel], int(pre.split('.')[-1]) if pre else 0)
+
+
+def pending_attempt(app, base, pins):
+    """Do not overlap unchanged builds or rebuild a repeatedly failing source every hour."""
+    tags = sorted(git('tag', '--list', app + '-v*-hourly.*').splitlines(),
+                  key=lambda tag: version_key(release.parse_tag(tag)[1]), reverse=True)
+    failures = 0
+    for tag in tags:
+        source = git('rev-parse', tag + '^{commit}')
+        try:
+            parent, _ = verify(source, app)
+        except ValueError:
+            continue
+        if input_digest(app, parent) != input_digest(app, base):
+            break
+        previous_pins = json.loads(blob(source, f'releases/{app}.json')) if release.DEPENDENCIES[app] else {}
+        if previous_pins != pins:
+            break
+        runs = release_runs(app, tag, source)
+        if not runs:
+            ensure_release_run(app, tag, source)
+            return {'status': 'dispatched_existing_tag', 'tag': tag}
+        if any(run['status'] != 'completed' for run in runs):
+            return {'status': 'in_progress', 'tag': tag}
+        if any(run['conclusion'] == 'success' for run in runs):
+            return {'status': 'waiting_for_manifest', 'tag': tag}
+        failures += 1
+        if failures >= 2:
+            return {'status': 'failed_source_requires_fix', 'tag': tag}
+    return None
 
 
 def run_hourly(now):
-    require(os.environ.get('GH_TOKEN') and os.environ.get('GITHUB_REPOSITORY') == REPO
-            and os.environ.get('GITHUB_REF') == 'refs/heads/main', 'Hourly coordinator runs only from main in Actions')
+    release.require(os.environ.get('GH_TOKEN') and os.environ.get('GITHUB_REPOSITORY') == REPO
+                    and os.environ.get('GITHUB_REF') == 'refs/heads/main', 'coordinator runs only from main in Actions')
     batch = now.astimezone(datetime.timezone.utc).strftime('%Y%m%d%H')
     git('fetch', '--quiet', 'origin', 'main', '--tags')
     base = green_main()
-    tags = [line.split('\t')[1][len('refs/tags/'):] for line in git('ls-remote', '--tags', 'origin', 'v*-hourly.*').splitlines()
-            if not line.endswith('^{}')]
-    hourly = sorted((match[1], tag) for tag in tags if (match := HOURLY_TAG.fullmatch(tag)))
-    tag = 'v' + hourly_version(base, batch)
-    source = tag_commit(tag)
-    if source is None:
-        if hourly:
-            require(hourly[-1][0] < batch, 'a later Hourly tag already exists; refusing to go back in time')
-            previous = tag_commit(hourly[-1][1])
-            require(previous, 'the latest Hourly tag is listed but unreadable; reconcile before tagging')
-            parent = git('rev-parse', previous + '^')
-            ancestry = subprocess.run(['git', 'merge-base', '--is-ancestor', parent, base], cwd=release.ROOT).returncode
-            require(ancestry in (0, 1), 'cannot compare the latest Hourly parent with main')
-            if ancestry == 1:
-                print(json.dumps(dict(batch=batch, skipped='newest green main commit does not contain the latest Hourly')))
-                return
-            if parent == base:
-                if release_settled(hourly[-1][1], previous):
-                    print(json.dumps(dict(batch=batch, skipped='no new green main commit', latest=hourly[-1][1])))
-                    return
-                earlier = tag_commit(hourly[-2][1]) if len(hourly) > 1 else None
-                # ponytail: one rebuild per commit; a second failure needs a human or a new main commit.
-                require(not earlier or git('rev-parse', earlier + '^') != base,
-                        'two Hourly releases of this main commit failed; fix the release before rebuilding')
-        source = create_source(base, batch)
-        with tempfile.TemporaryDirectory(dir=scratch()) as temporary:
-            clean = Path(temporary) / 'plan'
-            git('worktree', 'add', '--detach', str(clean), source)
-            previous_root = release.ROOT
-            release.ROOT = clean
+    pages = json.loads(gitless_gh('api', '--paginate', '--slurp', f'repos/{REPO}/releases?per_page=100'))
+    records = [r for page in pages for r in page if not r['draft'] and 'release.json' in {a['name'] for a in r['assets']}]
+    completed = {}
+    for app in release.APPS:
+        candidates = []
+        for record in records:
             try:
-                release.plan('product', tag=tag, require_main=True)
-                release.require_ci(release.validate_source(source, 'product'))
-            finally:
-                release.ROOT = previous_root
-                git('worktree', 'remove', '--force', str(clean))
-        confirm(lambda: git('push', 'origin', f'{source}:refs/tags/{tag}'), lambda: tag_commit(tag), 'Hourly tag creation')
-        require(tag_commit(tag) == source, 'Hourly tag points to another commit')
-    else:
-        verify(source)
-    runs = release_runs(tag, source)
-    if not runs:
-        runs = confirm(lambda: api('actions/workflows/release.yml/dispatches', 'POST',
-                                   dict(ref=tag, inputs=dict(tag=tag, publish='true'))),
-                       lambda: release_runs(tag, source), 'Hourly release dispatch')
-    print(json.dumps(dict(batch=batch, tag=tag, source_commit=source, main_commit=base,
-                          release_runs=[run['html_url'] for run in runs]), indent=2))
+                kind, value, channel = release.parse_tag(record['tag_name'])
+            except ValueError:
+                continue
+            if kind == app and channel == 'hourly':
+                candidates.append((version_key(value), record['tag_name']))
+        if candidates:
+            info, _, sha = release.published(max(candidates)[1])
+            completed[app] = (info, sha)
+    outcomes, ready = {}, {}
+    for app in release.APPS:
+        if any(name not in ready for name in release.DEPENDENCIES[app]):
+            outcomes[app] = {'status': 'waiting_for_dependencies'}
+            continue
+        pins = {name: {key: ready[name][0][key] for key in ('tag', 'version', 'source_commit')} | {'manifest_sha256': ready[name][1]}
+                for name in release.DEPENDENCIES[app]}
+        previous = completed.get(app)
+        if previous:
+            old_base = source_context(previous[0]['source_commit'], app)['ci_source_commit']
+            release.require(subprocess.run(['git', 'merge-base', '--is-ancestor', old_base, base], cwd=release.ROOT).returncode == 0,
+                            'coordinator will not publish an older main source')
+            if input_digest(app, old_base) == input_digest(app, base) and previous[0]['dependencies'] == pins:
+                ready[app] = previous
+                outcomes[app] = {'status': 'unchanged', 'tag': previous[0]['tag']}
+                continue
+        value = hourly_version(app, base, batch)
+        tag = release.release_tag_for(app, value)
+        source = tag_commit(tag)
+        if source is None:
+            pending = pending_attempt(app, base, pins)
+            if pending:
+                outcomes[app] = pending
+                continue
+            tree = expected_tree(app, base, batch, pins)
+            env = dict(os.environ, GIT_AUTHOR_NAME='github-actions[bot]', GIT_AUTHOR_EMAIL=BOT,
+                       GIT_COMMITTER_NAME='github-actions[bot]', GIT_COMMITTER_EMAIL=BOT)
+            source = git('commit-tree', tree, '-p', base, '-m', f'chore(release): {app} hourly {batch}', env=env)
+            release.require(verify(source, app) == (base, batch), 'generated source failed verification')
+            reconcile(lambda: git('push', 'origin', source + ':refs/tags/' + tag), lambda: tag_commit(tag), 'tag creation')
+            release.require(tag_commit(tag) == source, 'tag points to another source')
+        else:
+            try:
+                existing_base, _ = verify(source, app)
+            except ValueError:
+                outcomes[app] = {'status': 'hour_occupied', 'tag': tag}
+                continue
+            if existing_base != base:
+                outcomes[app] = {'status': 'hour_occupied', 'tag': tag}
+                continue
+        runs = ensure_release_run(app, tag, source)
+        outcomes[app] = {'status': 'dispatched', 'tag': tag, 'runs': [r['html_url'] for r in runs]}
+    print(json.dumps({'batch': batch, 'main_commit': base, 'applications': outcomes}, indent=2))
+    return outcomes
+
+
+def gitless_gh(*args):
+    return subprocess.check_output(['gh', *args], text=True)
 
 
 def self_test():
-    head = git('rev-parse', 'HEAD')
-    batch = '2026111309'
-    assert build_numbers(batch) == (26111309, '2611.13.9')
-    assert build_numbers('2026123123')[0] > build_numbers('2026111309')[0]
-    for bad in ('2026111324', '20261113', '2026021309x'):
-        try:
-            hour_of(bad)
-        except ValueError:
-            continue
-        raise AssertionError(f'accepted invalid batch {bad}')
-    assert release.version('0.0.1-hourly.2026111309') == 'hourly'
-    for bad in ('0.0.1-nightly.20261113.1', '0.0.1-hourly.2026111324', '0.0.1-hourly.202611130'):
-        try:
-            release.version(bad)
-        except ValueError:
-            continue
-        raise AssertionError(f'accepted invalid version {bad}')
-    value, files = generated(head, batch)
-    assert value.endswith('-hourly.' + batch) and set(files) == set(PATHS)
-    mobile = json.loads(files['apps/mobile/app.json'])['expo']
-    assert (mobile['extra']['releaseVersion'], mobile['android']['versionCode'], mobile['ios']['buildNumber']) == (
-        value, 26111309, '2611.13.9')
-    assert files['Cargo.lock'].decode().count(f'version = "{value}"') == 3
-    tree = expected_tree(head, batch)
-    bot = dict(os.environ, GIT_AUTHOR_NAME='bot', GIT_AUTHOR_EMAIL=BOT, GIT_COMMITTER_NAME='bot', GIT_COMMITTER_EMAIL=BOT,
-               GIT_AUTHOR_DATE='2026-11-13T09:00:00Z', GIT_COMMITTER_DATE='2026-11-13T09:00:00Z')
-    good = git('commit-tree', tree, '-p', head, '-m', message(batch), env=bot)
-    assert verify(good) == (head, batch)
-    tampered = git('commit-tree', git('rev-parse', head + '^{tree}'), '-p', head, '-m', message(batch), env=bot)
-    human = git('commit-tree', tree, '-p', head, '-m', message(batch),
-                env=dict(bot, GIT_AUTHOR_EMAIL='someone@example.com'))
-    wrong_hour = git('commit-tree', tree, '-p', head, '-m', message('2026111310'), env=bot)
-    for commit in (tampered, human, wrong_hour):
-        try:
-            verify(commit)
-        except ValueError:
-            continue
-        raise AssertionError('accepted a non-mechanical Hourly source')
-    print('Hourly version, build number and exact mechanical source self-tests passed')
+    import unittest.mock as mock
+    app = 'cli'
+    pin = lambda name: {'tag': name + '-v0.0.1', 'version': '0.0.1', 'source_commit': 'a' * 40, 'manifest_sha256': 'b' * 64}
+    pins = {'core': pin('core'), 'app': pin('app')}
+    source = git('rev-parse', 'HEAD')
+    for app in release.APPS:
+        selected = pins if app == 'cli' else {'cli': pin('cli')} if app == 'desktop' else {}
+        value, changes = generated(app, source, '2026111409', selected)
+        assert value == '0.0.1-hourly.2026111409'
+        assert version_path(app) in changes
+        for other in release.APPS:
+            if other != app:
+                assert version_path(other) not in changes
+        if app in RUST:
+            before = blob(source, 'Cargo.lock').decode().split('[[package]]')
+            after = changes['Cargo.lock'].decode().split('[[package]]')
+            modified = [a for a, b in zip(before, after) if a != b]
+            assert len(modified) == 1 and f'name = "{RUST[app]}"' in modified[0]
+        if app == 'mobile':
+            mobile = json.loads(changes[version_path(app)])['expo']
+            assert mobile['android']['versionCode'] == 26111409 and mobile['ios']['buildNumber'] == '2611.14.9'
+    assert input_digest('core', source) == input_digest('core', source)
+    assert release.DEPENDENCIES == {'core': (), 'app': (), 'cli': ('core', 'app'), 'desktop': ('cli',), 'mobile': (), 'www': ()}
+    print('Independent Hourly self-test passed: selected version only, exact pins and per-train build numbers')
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser()
     parser.add_argument('--self-test', action='store_true')
     args = parser.parse_args()
     if args.self_test:

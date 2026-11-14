@@ -16,18 +16,115 @@ USAGE
 
 fail() { printf 'Vibeface installer: %s\n' "$*" >&2; exit 1; }
 
+# Completion manifests have a closed shape, including their nested dependency pins.
+completion_fields() {
+  LC_ALL=C awk -v page="${2:-0}" '
+    function error() { invalid=1; exit 1 }
+    function allowed(context, name) {
+      if (context=="root") return name ~ /^(app|version|tag|source_commit|channel|schema|assets|contracts|dependencies)$/
+      if (context=="contracts") return name ~ /^(data_epoch|update_protocol)$/
+      if (context=="dependencies") return name ~ /^(core|app)$/
+      if (context=="core" || context=="app") return name ~ /^(tag|version|source_commit|manifest_sha256)$/
+      if (context=="asset") return name ~ /^(name|size|sha256)$/
+      return 0
+    }
+    function close_container(token, context, count) {
+      if (!depth || (token=="}" ? kind[depth]!="{" : kind[depth]!="[")) error()
+      if (state[depth]!="after" && state[depth]!="first") error()
+      context=scope[depth]; count=fields[id[depth]]
+      if ((context=="root" && count!=9) || (context=="contracts" && count!=2) ||
+          (context=="dependencies" && count!=2) || ((context=="core" || context=="app") && count!=4) ||
+          (context=="asset" && count!=3) || (context=="assets" && !record)) error()
+      depth--; if (!depth) closed=1
+    }
+    function consume(token, context, name, row, child, string_value, numeric) {
+      if (closed) error()
+      if (!depth) {
+        if (started++ || token!="{") error()
+        depth=1; kind[depth]="{"; scope[depth]="root"; id[depth]=page ".0"; state[depth]="first"
+        return
+      }
+      context=scope[depth]; row=id[depth]
+      if (token=="}" || token=="]") { close_container(token); return }
+      if (token==",") {
+        if (state[depth]!="after") error()
+        state[depth]=(kind[depth]=="{" ? "key" : "value"); return
+      }
+      if (token==":") {
+        if (state[depth]!="colon") error()
+        state[depth]="value"; return
+      }
+      if (kind[depth]=="{" && (state[depth]=="first" || state[depth]=="key")) {
+        if (token !~ /^"[a-z_][a-z0-9_]*"$/) error()
+        name=substr(token,2,length(token)-2)
+        if (!allowed(context,name) || seen[row SUBSEP name]++) error()
+        key[depth]=name; fields[row]++; state[depth]="colon"; return
+      }
+      if (state[depth]!="value" && !(kind[depth]=="[" && state[depth]=="first")) error()
+      name=key[depth]
+      child=""
+      if (context=="root" && name ~ /^(contracts|dependencies|assets)$/) {
+        if (token!=(name=="assets" ? "[" : "{")) error()
+        child=name
+      } else if (context=="dependencies") {
+        if (token!="{") error()
+        child=name
+      } else if (context=="assets") {
+        if (token!="{") error()
+        child="asset"
+      } else {
+        numeric=(name ~ /^(schema|data_epoch|update_protocol|size)$/)
+        if (numeric) {
+          if (token !~ /^(0|[1-9][0-9]*)$/) error()
+          string_value=token
+        } else {
+          if (token !~ /^"[a-zA-Z0-9._-]+"$/) error()
+          string_value=substr(token,2,length(token)-2)
+        }
+        print row "\t" name "\t" string_value
+      }
+      state[depth]="after"
+      if (child!="") {
+        depth++; if (depth>4) error()
+        kind[depth]=token; scope[depth]=child; state[depth]="first"
+        id[depth]=page "." (child=="asset" ? ++record : child)
+      }
+    }
+    {
+      json=$0; position=1; size=length(json)
+      while (position<=size) {
+        char=substr(json,position,1)
+        if (char ~ /[ \t\r]/) { position++; continue }
+        start=position
+        if (char=="\"") {
+          escaped=0; position++
+          while (position<=size) {
+            char=substr(json,position,1)
+            if (!escaped && char=="\"") break
+            if (!escaped && char=="\\") escaped=1; else escaped=0
+            position++
+          }
+          if (position>size) error()
+          position++
+        } else if (char ~ /[][{}:,]/) position++
+        else while (position<=size && substr(json,position,1) !~ /[ \t\r]|[][{}:,]/) position++
+        consume(substr(json,start,position-start))
+      }
+    }
+    END { if (invalid || !started || depth || !closed) exit 1 }
+  ' "$1"
+}
+
 # Parse only named fields; remote JSON is never evaluated as shell code.
 json_fields() {
+  if [[ $2 == completion ]]; then completion_fields "$1" "${3:-0}"; return; fi
   LC_ALL=C awk -v mode="$2" -v page="${3:-0}" '
     function error() { invalid=1; exit 1 }
     function field(value, k) {
       k=key; key=""
       if (mode=="build" && k !~ /^(version|target|source_commit|update_protocol|data_epoch|core_version|core_source_commit|app_version|app_source_commit)$/) error()
-      if (mode=="completion" && depth==1 && k !~ /^(app|version|tag|source_commit|channel|schema|assets)$/) error()
-      if (mode=="completion" && depth==3 && k !~ /^(name|size|sha256)$/) error()
-      if (mode=="completion" && k=="assets") { seen[0 SUBSEP k]++; return }
       if (!(k ~ /^(tag_name|draft|prerelease|sha|app|version|tag|channel|schema|name|size|sha256|target|source_commit|update_protocol|data_epoch|core_version|core_source_commit|app_version|app_source_commit)$/)) return
-      record_key=(mode=="completion" && depth==1 ? 0 : record)
+      record_key=record
       if (seen[record_key SUBSEP k]++) error()
       if (k ~ /^(draft|prerelease)$/ && value !~ /^(true|false)$/) error()
       if (k ~ /^(update_protocol|data_epoch|schema|size)$/ && value !~ /^(0|[1-9][0-9]*)$/) error()
@@ -66,18 +163,16 @@ json_fields() {
         if (closed) error()
         if (!started++) { if (token!=expected) error() }
         at=(mode=="releases" ? 2 : 1)
-        if (key!="" && token!=":" && (depth==at || (mode=="completion" && depth==3))) {
-          if (mode!="completion" || depth==1 || key ~ /^(name|size|sha256)$/) field(token)
-        }
+        if (key!="" && token!=":" && depth==at) field(token)
         if (token=="{" || token=="[") {
           if (depth==0 && closed) error()
           depth++; stack[depth]=token
-          if ((mode=="releases" && depth==2) || (mode=="completion" && depth==3)) { if (token!="{") error(); record++ }
+          if (mode=="releases" && depth==2) { if (token!="{") error(); record++ }
           if (depth>64) error()
         } else if (token=="}" || token=="]") {
           if (depth<1 || (token=="}" ? stack[depth]!="{" : stack[depth]!="[")) error()
           depth--; if (!depth) closed=1
-        } else if (token==":" && (depth==at || (mode=="completion" && depth==3))) {
+        } else if (token==":" && depth==at) {
           if (previous !~ /^"/) error()
           key=substr(previous,2,length(previous)-2)
         }
@@ -85,7 +180,7 @@ json_fields() {
       }
     }
     END {
-      if (invalid || !started || depth || !closed || (mode=="completion" && !seen[0 SUBSEP "assets"])) exit 1
+      if (invalid || !started || depth || !closed) exit 1
       if (mode=="releases") print record "\tcount\t" record
     }
   ' "$1"
@@ -108,8 +203,8 @@ select_release() {
     END {
       for (i in tags) {
         tag=tags[i]; if (draft[i]!="false" || pre[i]!=(channel=="hourly" ? "true" : "false")) continue
-        if (substr(tag,1,1)!="v") continue
-        n=split(substr(tag,2),part,"-"); if (n!=(channel=="hourly" ? 2 : 1)) continue
+        if (substr(tag,1,5)!="cli-v") continue
+        n=split(substr(tag,6),part,"-"); if (n!=(channel=="hourly" ? 2 : 1)) continue
         if (split(part[1],base,".")!=3 || !number(base[1]) || !number(base[2]) || !number(base[3])) continue
         stamp=0
         if (channel=="hourly") {
@@ -145,22 +240,45 @@ verify_completion() {
   local file="$1" tag="$2" version="$3" target="$4" archive="$5"
   json_fields "$file" completion > "$file.fields" || fail 'invalid release completion manifest JSON'
   awk -F '\t' -v tag="$tag" -v version="$version" -v target="$target" -v archive="$archive" '
-    $2=="app" {app=$3} $2=="version" {v=$3} $2=="tag" {t=$3} $2=="channel" {ch=$3}
+    function hex(s,n) { return length(s)==n && s !~ /[^a-f0-9]/ }
+    function number(s) { return s ~ /^(0|[1-9][0-9]*)$/ && (length(s)<20 || (length(s)==20 && "x" s <= "x18446744073709551615")) }
+    function release_version(s, parts, base, count, stamp, y,m,d,days) {
+      count=split(s,parts,"-")
+      if (count>2 || split(parts[1],base,".")!=3 || !number(base[1]) || !number(base[2]) || !number(base[3])) return 0
+      if (count==1) return 1
+      if (parts[2] ~ /^rc\.[1-9][0-9]*$/) return number(substr(parts[2],4))
+      if (parts[2] !~ /^hourly\.[0-9]+$/) return 0
+      stamp=substr(parts[2],8); if (length(stamp)!=10) return 0
+      y=substr(stamp,1,4)+0; m=substr(stamp,5,2)+0; d=substr(stamp,7,2)+0
+      days=31; if (m==4 || m==6 || m==9 || m==11) days=30
+      if (m==2) days=28+(y%4==0 && (y%100!=0 || y%400==0))
+      return y>0 && m>=1 && m<=12 && d>=1 && d<=days && substr(stamp,9,2)+0<24
+    }
+    $1 ~ /\.0$/ { root[$2]=$3 }
+    $1 ~ /\.contracts$/ { contracts[$2]=$3 }
+    $1 ~ /\.core$/ { core[$2]=$3 }
+    $1 ~ /\.app$/ { web[$2]=$3 }
     $2=="source_commit" && $1 ~ /\.0$/ {source=$3}
-    $2=="schema" {schema=$3}
     $2=="name" {an[$1]=$3} $2=="size" {as[$1]=$3} $2=="sha256" {ah[$1]=$3}
     END {
       wanted=(tag ~ /-hourly\./ ? "hourly" : "stable")
-      if (app!="product" || schema!="1" || v!=version || t!=tag || ch!=wanted || length(source)!=40 || source ~ /[^a-f0-9]/) exit 1
+      if (root["app"]!="cli" || root["schema"]!="1" || root["version"]!=version || root["tag"]!=tag ||
+          tag!="cli-v" version || root["channel"]!=wanted || !hex(source,40) || !release_version(version)) exit 1
+      if (contracts["data_epoch"]!="1" || contracts["update_protocol"]!="1") exit 1
+      if (!release_version(core["version"]) || core["tag"]!="core-v" core["version"] ||
+          !hex(core["source_commit"],40) || !hex(core["manifest_sha256"],64) ||
+          !release_version(web["version"]) || web["tag"]!="app-v" web["version"] ||
+          !hex(web["source_commit"],40) || !hex(web["manifest_sha256"],64)) exit 1
       foundA=foundC=0
       for (i in an) {
         name=an[i]
+        if (names[name]++ || !hex(ah[i],64) || as[i] !~ /^(0|[1-9][0-9]*)$/) exit 1
         if (name==archive) {foundA++; ahash=ah[i]; size=as[i]}
         if (name==archive ".sha256") {foundC++; chash=ah[i]; csize=as[i]}
       }
       if (foundA!=1 || foundC!=1 || ahash !~ /^[a-f0-9]{64}$/ || chash !~ /^[a-f0-9]{64}$/ ||
           size !~ /^(0|[1-9][0-9]*)$/ || csize !~ /^(0|[1-9][0-9]*)$/) exit 1
-      print source "\t" ahash "\t" chash "\t" size "\t" csize
+      print source "\t" ahash "\t" chash "\t" size "\t" csize "\t" core["version"] "\t" core["source_commit"] "\t" web["version"] "\t" web["source_commit"]
     }
   ' "$file.fields" || fail 'release completion manifest identity or target binding is invalid'
 }
@@ -203,7 +321,7 @@ check_archive() {
 }
 
 verify_package() {
-  local package="$1" version="$2" target="$3" commit="$4" scratch="$5" entry
+  local package="$1" version="$2" target="$3" commit="$4" scratch="$5" pins="$6" entry
   for entry in vibeface vibeface-core BUILD-INFO.json README.md RUNTIME-REQUIREMENTS.md \
     scripts/install-node-service.sh docs/node.md docs/releasing.md \
     web/_shell.html web/index.html web/_redirects web/_headers web/.vibeface-build.json \
@@ -221,9 +339,10 @@ verify_package() {
   done < "$package/FILES.sha256"
   [[ $count -gt 0 && $count -eq $(find "$package" -type f ! -name FILES.sha256 | wc -l) ]] || fail 'file checksum coverage mismatch'
   json_fields "$package/BUILD-INFO.json" build > "$scratch/build-fields" || fail 'invalid BUILD-INFO.json'
-  awk -F '\t' -v version="$version" -v target="$target" -v commit="$commit" '
+  awk -F '\t' -v version="$version" -v target="$target" -v commit="$commit" -v pins="$pins" '
+    BEGIN { split(pins, dependency, "\t") }
     { info[$2]=$3 }
-    END { exit !(NR==9 && info["version"]==version && info["target"]==target && info["source_commit"]==commit && info["update_protocol"]=="1" && info["data_epoch"]=="1" && info["core_version"]==version && info["app_version"]==version && info["core_source_commit"]==commit && info["app_source_commit"]==commit) }
+    END { exit !(NR==9 && info["version"]==version && info["target"]==target && info["source_commit"]==commit && info["update_protocol"]=="1" && info["data_epoch"]=="1" && info["core_version"]==dependency[6] && info["core_source_commit"]==dependency[7] && info["app_version"]==dependency[8] && info["app_source_commit"]==dependency[9]) }
   ' "$scratch/build-fields" || fail 'BUILD-INFO does not match the release, platform, source commit, or data epoch'
   [[ -x "$package/vibeface" && -x "$package/vibeface-core" ]] || fail 'packaged CLI and Core binaries must be executable'
   [[ $("$package/vibeface" --version) == "vibeface $version" ]] || fail 'packaged CLI version does not match the release'
@@ -290,7 +409,7 @@ install_release() (
   local candidate manifest_fields selected=false
   while IFS= read -r candidate; do
     [[ -n $candidate ]] || continue
-    version=${candidate#v}
+    version=${candidate#cli-v}
     package="vibeface-$version-$target"
     archive="$package.tar.gz"
     if ! fetch_optional_marker "https://github.com/leaperone/vibeface/releases/download/$candidate/release.json" "$scratch/release.json"; then
@@ -306,7 +425,7 @@ install_release() (
     if [[ $channel == stable ]]; then fail 'no published Stable release; use --channel hourly explicitly to install a preview'; fi
     fail 'no published hourly release'
   fi
-  version=${tag#v}
+  version=${tag#cli-v}
   package="vibeface-$version-$target"
   archive="$package.tar.gz"
   fetch "https://api.github.com/repos/leaperone/vibeface/commits/$tag" "$scratch/commit.json" 4194304
@@ -333,7 +452,7 @@ install_release() (
   check_archive "$scratch/$archive" "$package" "$scratch"
   mkdir "$scratch/unpack"
   COPYFILE_DISABLE=1 tar -xzf "$scratch/$archive" --no-same-owner --no-same-permissions -C "$scratch/unpack" || fail 'cannot unpack release'
-  verify_package "$scratch/unpack/$package" "$version" "$target" "$commit" "$scratch"
+  verify_package "$scratch/unpack/$package" "$version" "$target" "$commit" "$scratch" "$manifest_fields"
   [[ ! -L "$install_root" && ! -L "$install_root/releases" && ! -L "$bin_dir" ]] || fail 'installation directories must not be symbolic links'
   mkdir -p "$install_root/releases" "$bin_dir"
   install_root=$(cd "$install_root" && pwd -P)
@@ -489,7 +608,7 @@ service_self_test() (
 )
 
 self_test() (
-  local test_dir script fixture version target package case_dir
+  local test_dir script fixture version target package case_dir core_version app_version core_commit app_commit
   script=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
   test_dir=$(mktemp -d "${TMPDIR:-/tmp}/vibeface-installer-test.XXXXXX")
   trap 'rm -rf "$test_dir"' EXIT
@@ -552,30 +671,37 @@ MOCK
   export PATH="$fixture/bin:$PATH"
   cat > "$fixture/releases.json" <<'JSON'
 [
- {"tag_name":"v0.0.1-hourly.2026101702","draft":false,"prerelease":true,"body":"quoted \"tag_name\": \"v999.0.0\""},
- {"tag_name":"cli-v999.0.0","draft":false,"prerelease":false},
+ {"tag_name":"cli-v0.0.1-hourly.2026101702","draft":false,"prerelease":true,"body":"quoted \"tag_name\": \"cli-v999.0.0\""},
+ {"tag_name":"core-v999.0.0","draft":false,"prerelease":false},
  {"tag_name":"www-v999.0.0-hourly.2026101722","draft":false,"prerelease":true},
  {"tag_name":"mobile-v999.0.0-hourly.2026101722","draft":false,"prerelease":true},
- {"tag_name":"v1.9.0","draft":false,"prerelease":false},
- {"tag_name":"v0.0.1-hourly.2026101710","draft":false,"prerelease":true},
- {"tag_name":"v1.10.0","draft":false,"prerelease":false},
- {"tag_name":"v999.0.0-rc.1","draft":false,"prerelease":true},
- {"tag_name":"v999.0.0","draft":true,"prerelease":false},
- {"tag_name":"v0.0.1-hourly.2026022901","draft":false,"prerelease":true},
- {"tag_name":"v01.2.3","draft":false,"prerelease":false},
- {"tag_name":"v18446744073709551616.0.0","draft":false,"prerelease":false},
- {"tag_name":"v0.0.1-hourly.2026101724","draft":false,"prerelease":true},
- {"tag_name":"v0.0.1-hourly.20261017","draft":false,"prerelease":true},
- {"tag_name":"v0.0.1-nightly.20261018.1","draft":false,"prerelease":true}
+ {"tag_name":"cli-v1.9.0","draft":false,"prerelease":false},
+ {"tag_name":"cli-v0.0.1-hourly.2026101710","draft":false,"prerelease":true},
+ {"tag_name":"cli-v1.10.0","draft":false,"prerelease":false},
+ {"tag_name":"cli-v999.0.0-rc.1","draft":false,"prerelease":true},
+ {"tag_name":"cli-v999.0.0","draft":true,"prerelease":false},
+ {"tag_name":"cli-v0.0.1-hourly.2026022901","draft":false,"prerelease":true},
+ {"tag_name":"cli-v01.2.3","draft":false,"prerelease":false},
+ {"tag_name":"cli-v18446744073709551616.0.0","draft":false,"prerelease":false},
+ {"tag_name":"cli-v0.0.1-hourly.2026101724","draft":false,"prerelease":true},
+ {"tag_name":"cli-v0.0.1-hourly.20261017","draft":false,"prerelease":true},
+ {"tag_name":"cli-v0.0.1-nightly.20261018.1","draft":false,"prerelease":true}
 ]
 JSON
   json_fields "$fixture/releases.json" releases > "$fixture/fields"
-  [[ $(select_release "$fixture/fields" stable) == v1.10.0 ]] || fail 'self-test: Stable numeric sorting or channel isolation'
-  [[ $(select_release "$fixture/fields" hourly) == v0.0.1-hourly.2026101710 ]] || fail 'self-test: hourly numeric sorting or channel isolation'
+  [[ $(select_release "$fixture/fields" stable) == cli-v1.10.0 ]] || fail 'self-test: Stable numeric sorting or channel isolation'
+  [[ $(select_release "$fixture/fields" hourly) == cli-v0.0.1-hourly.2026101710 ]] || fail 'self-test: hourly numeric sorting or channel isolation'
   version=0.0.1-hourly.2026101710
+  core_version=2.3.4; app_version=3.4.5-rc.2
+  core_commit=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  app_commit=cccccccccccccccccccccccccccccccccccccccc
   target=x86_64-unknown-linux-gnu
   package="vibeface-$version-$target"
   mkdir -p "$fixture/source/$package"
+  write_build_fixture() {
+    printf '{"version":"%s","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":1,"core_version":"%s","core_source_commit":"%s","app_version":"%s","app_source_commit":"%s"}\n' \
+      "$version" "$target" "$core_version" "$core_commit" "$app_version" "$app_commit" > "$fixture/source/$package/BUILD-INFO.json"
+  }
   local entry
   for entry in README.md RUNTIME-REQUIREMENTS.md scripts/install-node-service.sh docs/node.md docs/releasing.md \
     web/_shell.html web/index.html web/_redirects web/_headers web/.vibeface-build.json \
@@ -583,10 +709,9 @@ JSON
     mkdir -p "$fixture/source/$package/$(dirname "$entry")"
     printf 'test fixture\n' > "$fixture/source/$package/$entry"
   done
-  printf '{"version":"%s","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":1,"core_version":"%s","core_source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","app_version":"%s","app_source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\n' \
-    "$version" "$target" "$version" "$version" > "$fixture/source/$package/BUILD-INFO.json"
+  write_build_fixture
   printf '#!/bin/sh\nprintf "vibeface %s\\n"\n' "$version" > "$fixture/source/$package/vibeface"
-  printf '#!/bin/sh\nprintf "vibeface-core %s\\n"\n' "$version" > "$fixture/source/$package/vibeface-core"
+  printf '#!/bin/sh\nprintf "vibeface-core %s\\n"\n' "$core_version" > "$fixture/source/$package/vibeface-core"
   chmod +x "$fixture/source/$package/vibeface" "$fixture/source/$package/vibeface-core"
   repack_fixture() {
     (cd "$fixture/source/$package" && find . -type f ! -name FILES.sha256 | LC_ALL=C sort | while IFS= read -r file; do printf '%s  %s\n' "$(sha256 "$file")" "${file#./}"; done) > "$fixture/source/$package/FILES.sha256"
@@ -600,8 +725,8 @@ JSON
     archive_hash=$(sha256 "$fixture/package.tar.gz")
     archive_size=$(wc -c < "$fixture/package.tar.gz" | tr -d ' ')
     checksum_size=$(wc -c < "$fixture/checksum" | tr -d ' ')
-    printf '{"app":"product","version":"%s","tag":"v%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","channel":"hourly","schema":1,"assets":[{"name":"%s.tar.gz","size":%s,"sha256":"%s"},{"name":"%s.tar.gz.sha256","size":%s,"sha256":"%s"}]}\n' \
-      "$version" "$version" "$package" "$archive_size" "$archive_hash" "$package" "$checksum_size" "$checksum_hash" > "$fixture/release.json"
+    printf '{"app":"cli","version":"%s","tag":"cli-v%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","channel":"hourly","schema":1,"contracts":{"data_epoch":1,"update_protocol":1},"dependencies":{"core":{"tag":"core-v%s","version":"%s","source_commit":"%s","manifest_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},"app":{"tag":"app-v%s","version":"%s","source_commit":"%s","manifest_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}},"assets":[{"name":"%s.tar.gz","size":%s,"sha256":"%s"},{"name":"%s.tar.gz.sha256","size":%s,"sha256":"%s"}]}\n' \
+      "$version" "$version" "$core_version" "$core_version" "$core_commit" "$app_version" "$app_version" "$app_commit" "$package" "$archive_size" "$archive_hash" "$package" "$checksum_size" "$checksum_hash" > "$fixture/release.json"
   }
   expect_failure() {
     if bash "$script" --channel "$1" --install-root "$case_dir/root" --bin-dir "$case_dir/bin" > "$case_dir/output" 2>&1; then
@@ -617,6 +742,12 @@ JSON
   [[ $(readlink "$case_dir/root/current") == "releases/$version" ]] || fail 'self-test: current layout'
   [[ $(readlink "$case_dir/bin/vibeface") == "$case_dir/root/current/vibeface" ]] || fail 'self-test: bin layout'
   [[ -f "$case_dir/root/releases/$version/scripts/install-node-service.sh" ]] || fail 'self-test: incomplete package'
+  [[ $("$case_dir/root/current/vibeface-core" --version) == 'vibeface-core 2.3.4' ]] || fail 'self-test: independently versioned Core binary'
+  awk -F '\t' '
+    $2=="core_version" && $3=="2.3.4" {core=1}
+    $2=="app_version" && $3=="3.4.5-rc.2" {web=1}
+    END {exit !(core && web)}
+  ' <(json_fields "$case_dir/root/current/BUILD-INFO.json" build) || fail 'self-test: independent component versions changed during installation'
   expect_failure hourly 'current already exists'
   [[ $(readlink "$case_dir/root/current") == "releases/$version" ]] || fail 'self-test: existing installation changed'
   local platform old_package
@@ -625,8 +756,7 @@ JSON
     target="$platform"
     package="vibeface-$version-$target"
     if [[ $old_package != "$package" ]]; then mv "$fixture/source/$old_package" "$fixture/source/$package"; fi
-    printf '{"version":"%s","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":1,"core_version":"%s","core_source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","app_version":"%s","app_source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\n' \
-      "$version" "$target" "$version" "$version" > "$fixture/source/$package/BUILD-INFO.json"
+    write_build_fixture
     case "$target" in
       aarch64-apple-darwin) printf 'Darwin\n' > "$fixture/os"; printf 'arm64\n' > "$fixture/arch" ;;
       aarch64-unknown-linux-gnu) printf 'Linux\n' > "$fixture/os"; printf 'aarch64\n' > "$fixture/arch" ;;
@@ -688,19 +818,44 @@ JSON
   done
   cp "$fixture/supported-build" "$fixture/source/$package/BUILD-INFO.json"
   repack_fixture
-  case_dir="$test_dir/mixed-channel"
-  mkdir "$case_dir"
-  sed 's/"app_version":"[^"]*"/"app_version":"0.0.1"/' "$fixture/supported-build" > "$fixture/source/$package/BUILD-INFO.json"
-  repack_fixture
-  expect_failure hourly 'BUILD-INFO does not match'
+  local identity_field
+  for identity_field in core_version app_version; do
+    case_dir="$test_dir/unpinned-$identity_field"
+    mkdir "$case_dir"
+    sed "s/\"$identity_field\":\"[^\"]*\"/\"$identity_field\":\"0.0.1\"/" "$fixture/supported-build" > "$fixture/source/$package/BUILD-INFO.json"
+    repack_fixture
+    expect_failure hourly 'BUILD-INFO does not match'
+  done
   for identity_field in core_source_commit app_source_commit; do
     case_dir="$test_dir/foreign-$identity_field"
     mkdir "$case_dir"
-    sed "s/\"$identity_field\":\"[^\"]*\"/\"$identity_field\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"/" "$fixture/supported-build" > "$fixture/source/$package/BUILD-INFO.json"
+    sed "s/\"$identity_field\":\"[^\"]*\"/\"$identity_field\":\"ffffffffffffffffffffffffffffffffffffffff\"/" "$fixture/supported-build" > "$fixture/source/$package/BUILD-INFO.json"
     repack_fixture
     expect_failure hourly 'BUILD-INFO does not match'
   done
   cp "$fixture/supported-build" "$fixture/source/$package/BUILD-INFO.json"
+  repack_fixture
+  cp "$fixture/release.json" "$fixture/valid-marker"
+  local invalid_marker label expected_error
+  while IFS='|' read -r label invalid_marker expected_error; do
+    case_dir="$test_dir/manifest-$label"
+    mkdir "$case_dir"
+    sed "$invalid_marker" "$fixture/valid-marker" > "$fixture/release.json"
+    expect_failure hourly "$expected_error"
+    [[ ! -e "$case_dir/root" ]] || fail 'self-test: an invalid dependency manifest created installation directories'
+  done <<'CASES'
+contract-type|s/"data_epoch":1/"data_epoch":"1"/|invalid release completion manifest JSON
+contract-extra|s/"contracts":{/"contracts":{"unexpected":1,/|invalid release completion manifest JSON
+contract-duplicate|s/"data_epoch":1/"data_epoch":1,"data_epoch":1/|invalid release completion manifest JSON
+contract-unsupported|s/"data_epoch":1/"data_epoch":2/|release completion manifest identity or target binding is invalid
+dependency-extra|s/"tag":"core-v/"unexpected":1,"tag":"core-v/|invalid release completion manifest JSON
+dependency-kind|s/"tag":"core-v/"tag":"app-v/|release completion manifest identity or target binding is invalid
+dependency-version|s/"tag":"core-v2.3.4"/"tag":"core-v9.0.0"/|release completion manifest identity or target binding is invalid
+dependency-digest|s/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd/bad/|release completion manifest identity or target binding is invalid
+dependency-missing|s/,"manifest_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"//|invalid release completion manifest JSON
+double-comma|s/"data_epoch":1,/"data_epoch":1,,/|invalid release completion manifest JSON
+CASES
+  cp "$fixture/valid-marker" "$fixture/release.json"
   case_dir="$test_dir/unknown-build-field"
   mkdir "$case_dir"
   sed 's/}$/,"legacy":true}/' "$fixture/supported-build" > "$fixture/source/$package/BUILD-INFO.json"
@@ -719,16 +874,16 @@ JSON
   [[ $(cat "$case_dir/bin/vibeface") == 'preserve me' ]] || fail 'self-test: bin conflict changed'
   case_dir="$test_dir/no-stable"
   mkdir "$case_dir"
-  printf '[{"tag_name":"v%s","draft":false,"prerelease":true}]\n' "$version" > "$fixture/releases.json"
+  printf '[{"tag_name":"cli-v%s","draft":false,"prerelease":true}]\n' "$version" > "$fixture/releases.json"
   expect_failure stable 'no published Stable release'
   [[ ! -e "$case_dir/root" ]] || fail 'self-test: no Stable release created installation directories'
   # Page-local indexes must not overwrite earlier candidates.
   json_fields "$fixture/releases.json" releases 1 > "$fixture/fields"
-  printf '[{"tag_name":"v0.0.1-hourly.2026101702","draft":false,"prerelease":true}]\n' > "$fixture/page2.json"
+  printf '[{"tag_name":"cli-v0.0.1-hourly.2026101702","draft":false,"prerelease":true}]\n' > "$fixture/page2.json"
   json_fields "$fixture/page2.json" releases 2 >> "$fixture/fields"
-  [[ $(select_release "$fixture/fields" hourly) == "v$version" ]] || fail 'self-test: pagination changed version selection'
+  [[ $(select_release "$fixture/fields" hourly) == "cli-v$version" ]] || fail 'self-test: pagination changed version selection'
   json_fields "$fixture/page2.json" releases 2 > "$fixture/compact-fields"
-  awk 'BEGIN { print "["; print "{"; print "\"tag_name\":\"v0.0.1-hourly.2026101702\","; print "\"draft\":false,"; print "\"prerelease\":true,"; printf "\"body\":\""; for (i=0;i<10000;i++) printf "ignored "; print "\""; print "}"; print "]" }' > "$fixture/pretty.json"
+  awk 'BEGIN { print "["; print "{"; print "\"tag_name\":\"cli-v0.0.1-hourly.2026101702\","; print "\"draft\":false,"; print "\"prerelease\":true,"; printf "\"body\":\""; for (i=0;i<10000;i++) printf "ignored "; print "\""; print "}"; print "]" }' > "$fixture/pretty.json"
   json_fields "$fixture/pretty.json" releases 2 > "$fixture/pretty-fields"
   cmp "$fixture/compact-fields" "$fixture/pretty-fields" || fail 'self-test: pretty JSON changed release fields'
   case_dir="$test_dir/http-failure"
@@ -744,15 +899,15 @@ JSON
   progressive_releases() {
     cat > "$fixture/releases.json" <<'JSON'
 [
- {"tag_name":"v0.0.1-hourly.2026101722","draft":false,"prerelease":true},
- {"tag_name":"v0.0.1-hourly.2026101710","draft":false,"prerelease":true},
- {"tag_name":"v1.9.0","draft":false,"prerelease":false}
+ {"tag_name":"cli-v0.0.1-hourly.2026101722","draft":false,"prerelease":true},
+ {"tag_name":"cli-v0.0.1-hourly.2026101710","draft":false,"prerelease":true},
+ {"tag_name":"cli-v1.9.0","draft":false,"prerelease":false}
 ]
 JSON
   }
   cp "$fixture/supported-build" "$fixture/source/$package/BUILD-INFO.json"
   repack_fixture
-  production_manifest="$(dirname "$script")/scripts/fixtures/product-release-completion.json"
+  production_manifest="$(dirname "$script")/scripts/fixtures/cli-release-completion.json"
   if [[ -f $production_manifest ]]; then
     json_fields "$production_manifest" completion > "$test_dir/production.fields" ||
       fail 'self-test: production release.json failed completion parse'
@@ -765,59 +920,59 @@ JSON
   fi
   progressive_releases
   reset_progressive_markers
-  marker_code v0.0.1-hourly.2026101722 404
+  marker_code cli-v0.0.1-hourly.2026101722 404
   case_dir="$test_dir/progressive-fallback"
   mkdir -p "$case_dir/root" "$case_dir/bin"
   bash "$script" --channel hourly --install-root "$case_dir/root" --bin-dir "$case_dir/bin" > "$case_dir/output"
   [[ $("$case_dir/bin/vibeface" --version) == "vibeface $version" ]] || fail 'self-test: progressive fallback installed older complete release'
   reset_progressive_markers
-  marker_code v0.0.1-hourly.2026101722 200
+  marker_code cli-v0.0.1-hourly.2026101722 200
   mkdir -p "$fixture/marker-body"
-  printf '{not-json' > "$fixture/marker-body/v0.0.1-hourly.2026101722.json"
+  printf '{not-json' > "$fixture/marker-body/cli-v0.0.1-hourly.2026101722.json"
   case_dir="$test_dir/corrupt-marker"
   mkdir "$case_dir"
   expect_failure hourly 'invalid release completion manifest JSON'
   [[ ! -e "$case_dir/root/current" && ! -L "$case_dir/root/current" ]] || fail 'self-test: corrupt marker left a partial installation'
   reset_progressive_markers
   progressive_releases
-  marker_code v0.0.1-hourly.2026101722 200
+  marker_code cli-v0.0.1-hourly.2026101722 200
   write_marker
   mkdir -p "$fixture/marker-body"
-  cp "$fixture/release.json" "$fixture/marker-body/v0.0.1-hourly.2026101722.json"
-  sed 's/"tag":"v'"$version"'"/"tag":"v0.0.1-hourly.2026101722"/' \
-    "$fixture/marker-body/v0.0.1-hourly.2026101722.json" > "$fixture/marker-body/v0.0.1-hourly.2026101722.json.tmp"
-  mv "$fixture/marker-body/v0.0.1-hourly.2026101722.json.tmp" "$fixture/marker-body/v0.0.1-hourly.2026101722.json"
+  cp "$fixture/release.json" "$fixture/marker-body/cli-v0.0.1-hourly.2026101722.json"
+  sed 's/"tag":"v'"$version"'"/"tag":"cli-v0.0.1-hourly.2026101722"/' \
+    "$fixture/marker-body/cli-v0.0.1-hourly.2026101722.json" > "$fixture/marker-body/cli-v0.0.1-hourly.2026101722.json.tmp"
+  mv "$fixture/marker-body/cli-v0.0.1-hourly.2026101722.json.tmp" "$fixture/marker-body/cli-v0.0.1-hourly.2026101722.json"
   case_dir="$test_dir/marker-identity"
   mkdir "$case_dir"
   expect_failure hourly 'release completion manifest identity or target binding is invalid'
   reset_progressive_markers
-  printf '[{"tag_name":"v%s","draft":false,"prerelease":true}]\n' "$version" > "$fixture/releases.json"
-  marker_code "v$version" 503
+  printf '[{"tag_name":"cli-v%s","draft":false,"prerelease":true}]\n' "$version" > "$fixture/releases.json"
+  marker_code "cli-v$version" 503
   case_dir="$test_dir/marker-transport"
   mkdir "$case_dir"
   expect_failure hourly 'completion manifest request failed with HTTP 503'
   reset_progressive_markers
   repack_fixture
-  marker_code "v$version" 200
+  marker_code "cli-v$version" 200
   mkdir -p "$fixture/marker-body"
   write_marker
-  cp "$fixture/release.json" "$fixture/marker-body/v$version.json"
+  cp "$fixture/release.json" "$fixture/marker-body/cli-v$version.json"
   sed 's/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/' \
-    "$fixture/marker-body/v$version.json" > "$fixture/marker-body/v$version.json.tmp"
-  mv "$fixture/marker-body/v$version.json.tmp" "$fixture/marker-body/v$version.json"
+    "$fixture/marker-body/cli-v$version.json" > "$fixture/marker-body/cli-v$version.json.tmp"
+  mv "$fixture/marker-body/cli-v$version.json.tmp" "$fixture/marker-body/cli-v$version.json"
   case_dir="$test_dir/manifest-source"
   mkdir "$case_dir"
   expect_failure hourly 'completion manifest source does not match release tag'
   reset_progressive_markers
   progressive_releases
-  marker_code v0.0.1-hourly.2026101722 404
-  marker_code v0.0.1-hourly.2026101710 404
+  marker_code cli-v0.0.1-hourly.2026101722 404
+  marker_code cli-v0.0.1-hourly.2026101710 404
   case_dir="$test_dir/no-complete-channel"
   mkdir "$case_dir"
   expect_failure hourly 'no published hourly release'
   reset_progressive_markers
   service_self_test "$(dirname "$script")/scripts/install-node-service.sh" "$test_dir/service"
-  printf 'Public installer self-test passed: channels, numeric sorting, layout, SHA256, manifest, links, paths, progressive completion, and existing-install protection.\n'
+  printf 'Public installer self-test passed: independent CLI/Core/App pins, closed manifests, contracts, channels, SHA256, layout, paths, progressive completion and existing-install protection.\n'
 )
 
 if [[ ${1:-} == --self-test ]]; then

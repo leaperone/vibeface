@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Exact published product or Core train tag
+        description: Exact published Core tag (core-v...)
         type: string
         required: true
       apply:
@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   deploy:

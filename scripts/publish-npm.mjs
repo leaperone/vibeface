@@ -7,7 +7,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 const repository = 'leaperone/vibeface';
 const workflow = '.github/workflows/release.yml';
 const producerJob = 'collect';
-const publisherJob = 'publish-product';
+const publisherJob = 'publish-cli';
 const registry = 'https://registry.npmjs.org/';
 const packageName = '@leaperone/vibeface';
 
@@ -20,9 +20,18 @@ function hourly(version) {
   return match.slice(1).map(BigInt);
 }
 
+function releaseVersion(version) {
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(hourly)\.(\d{10})|-(rc)\.([1-9]\d*))?$/.exec(version);
+  assert(match, 'invalid canonical CLI version');
+  const channel = match[4] ? 'hourly' : match[6] ? 'rc' : 'latest';
+  if (channel === 'hourly') hourly(version);
+  return { channel, parts: [match[1], match[2], match[3], ...(match[5] || match[7] ? [match[5] ?? match[7]] : [])].map(BigInt) };
+}
+
 function compare(left, right) {
-  const before = hourly(right);
-  return hourly(left).map((part, index) => part - before[index]).find(part => part !== 0n) ?? 0n;
+  const before = releaseVersion(right), after = releaseVersion(left);
+  assert.equal(after.channel, before.channel, 'npm dist-tag must point to its own CLI channel');
+  return after.parts.map((part, index) => part - before.parts[index]).find(part => part !== 0n) ?? 0n;
 }
 
 function github(endpoint, key) {
@@ -41,8 +50,8 @@ function completedJob(api, runId, leaf, message) {
 }
 
 function resolveArtifact({ tag, sha, runId, artifactId, workflowRef }, api = github, now = Date.now()) {
-  assert(/^v(0|[1-9][0-9]*)\./.test(tag), 'product v tag is required');
-  hourly(tag.slice(1));
+  assert(/^cli-v(0|[1-9][0-9]*)\./.test(tag), 'CLI cli-v tag is required');
+  releaseVersion(tag.slice(5));
   assert(/^[a-f0-9]{40}$/.test(sha), 'full source SHA is required');
   assert(/^[1-9]\d*$/.test(runId), 'current workflow run id is required');
   assert.equal(workflowRef, `${repository}/.github/workflows/${artifactId ? 'release.yml' : 'npm-publish.yml'}@refs/tags/${tag}`,
@@ -53,7 +62,7 @@ function resolveArtifact({ tag, sha, runId, artifactId, workflowRef }, api = git
     run = api(`actions/runs/${runId}`);
     assert.equal(String(run.id), runId, 'artifact must belong to the calling run');
   } else {
-    // A manual recovery follows a published product whose npm job failed, so the run itself is red.
+    // A manual recovery may follow a published CLI whose npm job failed.
     const runs = api(`actions/workflows/release.yml/runs?head_sha=${sha}&per_page=100`, 'workflow_runs')
       .filter(item => item.head_sha === sha && item.head_branch === tag && item.path === workflow
         && item.status === 'completed');
@@ -69,7 +78,7 @@ function resolveArtifact({ tag, sha, runId, artifactId, workflowRef }, api = git
   assert(['push', 'workflow_dispatch'].includes(run.event), 'untrusted release event');
   assert(Number.isSafeInteger(run.run_attempt) && run.run_attempt > 0, 'invalid release run attempt');
   completedJob(api, run.id, producerJob, 'the complete release artifact producer did not succeed');
-  completedJob(api, run.id, publisherJob, 'the product release must be published before npm');
+  completedJob(api, run.id, publisherJob, 'the CLI release must be published before npm');
   let artifact;
   if (artifactId) {
     artifact = api(`actions/artifacts/${artifactId}`);
@@ -103,30 +112,31 @@ async function readRegistry(request = fetch) {
 }
 
 function registryState(packument, version, integrity) {
+  const { channel } = releaseVersion(version);
   if (packument === null) return 'absent';
   const object = value => value && typeof value === 'object' && !Array.isArray(value);
   assert(object(packument) && object(packument.versions) && object(packument['dist-tags']), 'invalid npm packument');
   const current = packument.versions[version];
-  const latest = packument['dist-tags'].hourly;
+  const latest = packument['dist-tags'][channel];
   if (latest !== undefined) {
-    hourly(latest);
-    assert(typeof packument.versions[latest]?.dist?.integrity === 'string', 'hourly points to a missing registry version');
+    assert.equal(releaseVersion(latest).channel, channel, 'npm dist-tag must point to its own CLI channel');
+    assert(typeof packument.versions[latest]?.dist?.integrity === 'string', `${channel} points to a missing registry version`);
   }
   if (current !== undefined) {
     assert.equal(current?.dist?.integrity, integrity, 'published version integrity mismatch');
     return latest !== undefined && compare(latest, version) >= 0n ? 'complete' : 'unreconciled';
   }
-  // Hourly releases finish out of order; an older hour must not move the dist-tag back.
+  // Releases can finish out of order; an older version must not move its dist-tag back.
   return latest === undefined || compare(version, latest) > 0n ? 'absent' : 'superseded';
 }
 
 async function publishOnce(version, integrity, { read = readRegistry, publish, pause = sleep, attempts = 60 }) {
   const state = registryState(await read(), version, integrity);
   if (state === 'complete' || state === 'superseded') return state;
-  assert.equal(state, 'absent', 'existing version has a missing or older hourly tag; reconcile without republishing');
+  assert.equal(state, 'absent', 'existing version has a missing or older channel tag; reconcile without republishing');
   let result;
   try { result = await publish(); } catch (error) { result = error.message; }
-  let lastError = 'version or hourly tag is not visible yet';
+  let lastError = 'version or channel tag is not visible yet';
   for (let attempt = 0; attempt < attempts; attempt++) {
     if (attempt) await pause(15000);
     try {
@@ -141,7 +151,7 @@ async function publishOnce(version, integrity, { read = readRegistry, publish, p
 
 async function selfTest() {
   const sha = 'a'.repeat(40), version = '0.0.1-hourly.2026110610', newer = '0.0.1-hourly.2026110611';
-  const tag = `v${version}`, integrity = 'sha512-fixture';
+  const tag = `cli-v${version}`, integrity = 'sha512-fixture';
   const run = { id: 7, head_sha: sha, head_branch: tag, path: workflow, run_attempt: 2, event: 'push',
     repository: { full_name: repository }, head_repository: { full_name: repository }, status: 'in_progress', conclusion: null };
   const artifact = { id: 11, name: `npm-package-${sha}-1`, expired: false, expires_at: '2099-01-01T00:00:00Z',
@@ -149,13 +159,22 @@ async function selfTest() {
   const context = { tag, sha, runId: '7', artifactId: '11', workflowRef: `${repository}/${workflow}@refs/tags/${tag}` };
   const manual = { ...context, artifactId: '', workflowRef: `${repository}/.github/workflows/npm-publish.yml@refs/tags/${tag}` };
   const jobs = [{ name: 'collect', status: 'completed', conclusion: 'success' },
-    { name: 'publish-product', status: 'completed', conclusion: 'success' },
+    { name: 'publish-cli', status: 'completed', conclusion: 'success' },
     { name: 'publish', status: 'completed', conclusion: 'skipped' },
     { name: 'npm / npm', status: 'completed', conclusion: 'failure' }];
   const api = (endpoint, key) => key === 'workflow_runs' ? [{ ...run, status: 'completed', conclusion: 'failure' }]
     : key === 'jobs' ? jobs : key === 'artifacts' ? [artifact] : endpoint.includes('/artifacts/') ? artifact : run;
   assert.deepEqual(resolveArtifact(context, api), { artifact_id: '11', run_id: '7' });
-  // A published product whose npm job failed is still recoverable by hand; it is never reported as green.
+  for (const candidate of ['1.2.3', '1.2.3-rc.2']) {
+    const cliTag = `cli-v${candidate}`;
+    const candidateContext = { ...context, tag: cliTag, workflowRef: `${repository}/${workflow}@refs/tags/${cliTag}` };
+    assert.deepEqual(resolveArtifact(candidateContext, (endpoint, key) => {
+      const value = api(endpoint, key);
+      return key || endpoint.includes('/artifacts/') ? value : { ...value, head_branch: cliTag };
+    }), { artifact_id: '11', run_id: '7' });
+  }
+  assert.throws(() => resolveArtifact({ ...context, tag: `v${version}` }, api), /CLI cli-v tag/);
+  // A published CLI whose npm job failed is still recoverable by hand.
   assert.deepEqual(resolveArtifact(manual, api), { artifact_id: '11', run_id: '7' });
   assert.throws(() => resolveArtifact({ ...context, artifactId: '' }, api), /calling workflow mismatch/);
   for (const change of [{ workflow_run: { id: 8, head_sha: sha } }, { workflow_run: { id: 7, head_sha: 'b'.repeat(40) } },
@@ -172,9 +191,9 @@ async function selfTest() {
   assert.throws(() => resolveArtifact(context, withJobs([jobs[1]])), /exactly one collect job/);
   assert.throws(() => resolveArtifact(context, withJobs([jobs[0], jobs[0], jobs[1]])), /exactly one collect job/);
   for (const request of [context, manual]) {
-    assert.throws(() => resolveArtifact(request, withJobs([jobs[0]])), /exactly one publish-product job/);
-    assert.throws(() => resolveArtifact(request, withJobs([jobs[0], jobs[1], jobs[1]])), /exactly one publish-product job/);
-    assert.throws(() => resolveArtifact(request, withJobs([jobs[0], { name: 'publish', status: 'completed', conclusion: 'success' }])), /exactly one publish-product job/);
+    assert.throws(() => resolveArtifact(request, withJobs([jobs[0]])), /exactly one publish-cli job/);
+    assert.throws(() => resolveArtifact(request, withJobs([jobs[0], jobs[1], jobs[1]])), /exactly one publish-cli job/);
+    assert.throws(() => resolveArtifact(request, withJobs([jobs[0], { name: 'publish', status: 'completed', conclusion: 'success' }])), /exactly one publish-cli job/);
     for (const conclusion of ['failure', 'skipped']) {
       assert.throws(() => resolveArtifact(request, withJobs([jobs[0], { ...jobs[1], conclusion }])), /published before npm/);
     }
@@ -190,6 +209,30 @@ async function selfTest() {
       ...(latest && latest !== version ? { [latest]: { dist: { integrity: 'sha512-other' } } } : {}) },
     'dist-tags': latest ? { hourly: latest } : {},
   });
+  for (const [candidate, previous, next, channel] of [
+    ['1.10.0', '1.9.9', '1.11.0', 'latest'],
+    ['1.2.3-rc.10', '1.2.3-rc.9', '1.2.3-rc.11', 'rc'],
+  ]) {
+    const registry = (latest, published = false) => ({
+      versions: { ...(published ? { [candidate]: { dist: { integrity } } } : {}),
+        [latest]: { dist: { integrity: latest === candidate ? integrity : 'sha512-other' } } },
+      'dist-tags': { [channel]: latest, hourly: newer },
+    });
+    assert.equal(registryState(registry(previous), candidate, integrity), 'absent');
+    assert.equal(registryState(registry(next), candidate, integrity), 'superseded');
+    assert.equal(registryState(registry(next, true), candidate, integrity), 'complete');
+    assert.throws(() => registryState(registry(candidate, true), candidate, 'sha512-mismatch'), /integrity mismatch/);
+    let writes = 0;
+    const reads = [registry(previous), registry(candidate, true)];
+    assert.equal(await publishOnce(candidate, integrity, { read: async () => reads.shift(),
+      publish: () => { writes++; throw new Error('publish response lost'); }, pause: async () => {}, attempts: 1 }), 'complete');
+    assert.equal(writes, 1);
+    assert.equal(await publishOnce(candidate, integrity, { read: async () => registry(next),
+      publish: () => { writes++; } }), 'superseded');
+    assert.equal(writes, 1);
+    assert.throws(() => registryState({ versions: { [version]: { dist: { integrity } } },
+      'dist-tags': { [channel]: version } }, candidate, integrity), /own CLI channel/);
+  }
   assert.equal(registryState(packument(), version, integrity), 'complete');
   assert.equal(registryState(packument(newer), version, integrity), 'complete');
   assert.equal(registryState(null, version, integrity), 'absent');
@@ -233,7 +276,7 @@ async function selfTest() {
     await assert.rejects(publishOnce(version, integrity, { read, publish }));
     assert.equal(writes, 2);
   }
-  console.log('npm publication self-test passed: successful collect producer and published product, exact source and artifact, original producer attempt reuse, honest npm failure recovery, registry integrity, monotonic Hourly with out-of-order skips, and publish-once reconciliation.');
+  console.log('npm publication self-test passed: CLI tag/source/artifact trust, successful collect and publish-cli jobs, stable/rc/hourly channel ordering, registry integrity, failure recovery and publish-once reconciliation.');
 }
 
 try {
@@ -245,9 +288,9 @@ try {
     assert.equal(process.env.GITHUB_REPOSITORY, repository, 'publication only accepts the upstream repository');
     const tag = process.env.RELEASE_TAG ?? '';
     assert.equal(process.env.GITHUB_REF, `refs/tags/${tag}`, 'workflow ref must match the release tag');
-    assert(/^v(0|[1-9][0-9]*)\./.test(tag), 'product v tag is required');
-    const version = tag.slice(1);
-    hourly(version);
+    assert(/^cli-v(0|[1-9][0-9]*)\./.test(tag), 'CLI cli-v tag is required');
+    const version = tag.slice(5);
+    const { channel } = releaseVersion(version);
     if (command === 'artifact') {
       const result = resolveArtifact({ tag, sha: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID,
         artifactId: process.env.NPM_ARTIFACT_ID, workflowRef: process.env.GITHUB_WORKFLOW_REF });
@@ -261,13 +304,13 @@ try {
       assert.equal(receipt.source_commit, process.env.GITHUB_SHA);
       assert(/^sha512-[A-Za-z0-9+/]+={0,2}$/.test(receipt.integrity), 'invalid package integrity');
       const state = await publishOnce(version, receipt.integrity, { publish: () => {
-        const result = spawnSync('npm', ['publish', archive, '--tag', 'hourly', '--access', 'public', '--provenance',
+        const result = spawnSync('npm', ['publish', archive, '--tag', channel, '--access', 'public', '--provenance',
           '--ignore-scripts', `--registry=${registry}`], { stdio: 'inherit' });
         return result.error?.message ?? `npm exit ${result.status}`;
       } });
       console.log(state === 'superseded'
-        ? `Skipped ${packageName}@${version}; hourly already points to a newer version.`
-        : `Verified ${packageName}@${version} integrity with hourly at this version or newer.`);
+        ? `Skipped ${packageName}@${version}; ${channel} already points to a newer version.`
+        : `Verified ${packageName}@${version} integrity with ${channel} at this version or newer.`);
     }
   }
 } catch (error) {

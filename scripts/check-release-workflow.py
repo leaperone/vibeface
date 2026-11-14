@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Check the release DAG and evaluate its real collection/publication guards."""
+"""Validate independent release DAGs and exercise their publication guards."""
 import argparse
 import ast
 from pathlib import Path
 import re
-from unittest import TestCase
 
 ROOT = Path(__file__).resolve().parent.parent
-TARGETS = ('macos', 'linux-x64', 'linux-arm64', 'windows')
-DESKTOP_TARGETS = TARGETS
+ENTRIES = {'core': 'release-core.yml', 'app': 'release-app.yml', 'cli': 'release.yml',
+           'desktop': 'release-desktop-app.yml', 'mobile': 'release-mobile.yml', 'www': 'release-www.yml'}
+TARGETS = {'macos': 'aarch64-apple-darwin', 'linux-x64': 'x86_64-unknown-linux-gnu',
+           'linux-arm64': 'aarch64-unknown-linux-gnu', 'windows': 'x86_64-pc-windows-msvc'}
+HELPERS = ('release-native.yml', 'release-compose.yml', 'release-desktop.yml', 'release-apps.yml',
+           'release-ios.yml', 'release-collect.yml', 'release-publish.yml', 'release-deploy.yml', 'npm-publish.yml')
 
 
 def require(condition, message):
@@ -20,417 +23,269 @@ def jobs(source):
     require('\njobs:\n' in source, 'workflow has no jobs')
     body = source.split('\njobs:\n', 1)[1]
     matches = list(re.finditer(r'^  ([a-z][a-z0-9-]*):\n', body, re.M))
+    require(len({match[1] for match in matches}) == len(matches), 'duplicate release job')
     return {match[1]: body[match.end():matches[index + 1].start() if index + 1 < len(matches) else len(body)]
             for index, match in enumerate(matches)}
 
 
 def needs(block):
-    match = re.search(r'^    needs: \[([^\]\n]+)\]$', block, re.M)
-    require(match is not None, 'use explicit needs lists for the release DAG')
-    return set(value.strip() for value in match[1].split(','))
+    match = re.search(r'^    needs: (.+)$', block, re.M)
+    if not match:
+        return set()
+    value = match[1]
+    return set(item.strip() for item in value.strip('[]').split(','))
+
+
+def scalar(block, name, indent=6):
+    match = re.search(r'^' + ' ' * indent + re.escape(name) + r': (.+)$', block, re.M)
+    require(match is not None, 'missing release input/output ' + name)
+    return match[1].strip("'\"")
 
 
 def guard(block):
     match = re.search(r'^    if: (.*)$', block, re.M)
-    require(match is not None, 'release gate has no condition')
-    if match[1] != '>-':
-        return match[1]
-    continuation = block[match.end() + 1:]
+    if not match:
+        return ''
+    if match[1] not in ('>-', '|'):
+        return match[1].strip()
     lines = []
-    for line in continuation.splitlines():
+    for line in block[match.end() + 1:].splitlines():
         if line and not line.startswith('      '):
             break
-        if line.strip():
-            lines.append(line.strip())
+        lines.append(line.strip())
     return ' '.join(lines)
 
 
-def evaluate(expression, results, scope='product', publishing=True, cancelled=False):
+def evaluate(expression, results=None, publishing=True, cancelled=False, context=None):
+    results = results or {}
+    expression = expression.removeprefix('${{').removesuffix('}}').strip()
+    explicit_status = re.search(r'\b(?:always|cancelled|success|failure)\s*\(', expression)
+    success = not cancelled and all(value == 'success' for value in results.values())
+    if not expression:
+        return success
     expression = expression.replace('always()', 'True').replace('cancelled()', repr(cancelled))
-    expression = expression.replace('needs.identity.outputs.app', repr(scope))
-    expression = expression.replace('needs.identity.outputs.publish', repr(str(publishing).lower()))
-    expression = re.sub(r'needs\.([a-z][a-z0-9-]*)\.result', lambda match: repr(results[match[1]]), expression)
-    expression = expression.replace('&&', ' and ').replace('||', ' or ').replace('!', ' not ').strip()
+    expression = expression.replace('success()', repr(success)).replace('failure()', repr('failure' in results.values()))
+    values = {'needs.identity.outputs.publish': str(publishing).lower(), **(context or {})}
+    for name, value in sorted(values.items(), key=lambda pair: -len(pair[0])):
+        expression = expression.replace(name, repr(value))
+    expression = re.sub(r'needs\.([a-z][a-z0-9-]*)\.result', lambda m: repr(results.get(m[1], 'missing')), expression)
+    expression = expression.replace('&&', ' and ').replace('||', ' or ')
+    expression = re.sub(r'!(?!=)', ' not ', expression).strip()
+    expression = re.sub(r'\btrue\b', 'True', expression)
+    expression = re.sub(r'\bfalse\b', 'False', expression)
     tree = ast.parse(expression, mode='eval')
     allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.UnaryOp, ast.Not,
-               ast.Compare, ast.Eq, ast.Constant, ast.Load)
+               ast.Compare, ast.Eq, ast.NotEq, ast.Constant, ast.Load)
     require(all(isinstance(node, allowed) for node in ast.walk(tree)), 'unsupported release guard expression')
-    return eval(compile(tree, '<release guard>', 'eval'), {'__builtins__': {}}, {})
+    result = bool(eval(compile(tree, '<release guard>', 'eval'), {'__builtins__': {}}, {}))
+    return result and (bool(explicit_status) or success)
 
 
-PARTS = {
-    'publish-app': 'static',
-    'publish-native-macos': 'compose-macos',
-    'publish-native-linux-x64': 'compose-linux-x64',
-    'publish-native-linux-arm64': 'compose-linux-arm64',
-    'publish-native-windows': 'compose-windows',
-    'publish-desktop-macos': 'desktop-macos',
-    'publish-desktop-linux-x64': 'desktop-linux-x64',
-    'publish-desktop-linux-arm64': 'desktop-linux-arm64',
-    'publish-desktop-windows': 'desktop-windows',
-    'publish-android': 'android',
-    'publish-ios': 'ios',
-}
+def permission(block, name, value):
+    return re.search(r'\b' + re.escape(name) + r':\s*' + re.escape(value) + r'\b', block) is not None
 
 
-def check(source, helpers):
+def inherited_permission(block, header, name, value):
+    return permission(block if re.search(r'^    permissions:', block, re.M) else header, name, value)
+
+
+def checked_source(block):
+    require(scalar(block, 'source_sha') == '${{ needs.identity.outputs.source_sha }}', 'producer must use the validated source SHA')
+
+
+def check_entry(app, source):
+    header = source.split('\njobs:\n', 1)[0]
+    require(f"tags: ['{app}-v*']" in header and 'workflow_dispatch:' in header
+            and 'workflow_call:' not in header and 'default: false' in header,
+            app + ' must expose only its own tags and explicit publication intent')
+    require(f'release-{app}-${{{{ inputs.tag || github.ref_name }}}}-' in header
+            and 'cancel-in-progress: false' in header and not permission(header, 'contents', 'write'),
+            app + ' publication retries must serialize without global write permission')
     workflow = jobs(source)
-    allowed_auto = {'deploy-published-product'}
-    require(not any('deploy' in name or 'dispatches' in block or 'scripts/deploy.py' in block or 'scripts/deploy-run.py' in block
-                    or './.github/workflows/deploy-' in block
-                    for name, block in workflow.items() if name not in allowed_auto),
-            'artifact publication must not deploy services before its complete-release gate')
-    require('release-${{ inputs.tag || github.ref_name }}-' in source,
-            'tag pushes and manual publication must share the same concurrency group')
+    publisher = 'publish-' + app
+    producers = ({'static'} if app in ('app', 'www') else {'android', 'ios'} if app == 'mobile'
+                 else {('desktop-' if app == 'desktop' else 'native-') + target for target in TARGETS})
+    composed = {'compose-' + target for target in TARGETS} if app == 'cli' else set()
+    optional = ({'deploy'} if app in ('core', 'app', 'www') else set()) | ({'npm'} if app == 'cli' else set())
+    require(set(workflow) == {'identity', 'collect', publisher, 'wake-consumers'} | producers | composed | optional,
+            app + ' release has foreign or missing producers/consumers')
     identity = workflow['identity']
-    require('scripts/release-entry.py --app product' in identity
-            and "tags: ['v*']" in source and 'inputs.app' not in source
-            and 'www-v' not in source and 'publish' not in workflow,
-            'the product entry must have a fixed identity and no website selector or publisher')
-    require('scripts/release.py plan --app product --tag "$RELEASE_TAG" --require-main --publish' in helpers['npm-publish.yml'],
-            'npm publication must enforce the same release source rule')
-    producers = ['static', 'android', 'ios', *('native-' + target for target in TARGETS)]
-    for producer in producers:
-        require(needs(workflow[producer]) == {'identity'}, producer + ' waits on an unrelated build')
-    for target in TARGETS:
-        require(needs(workflow['compose-' + target]) == {'identity', 'static', 'native-' + target},
-                target + ' packaging waits on another platform')
-    for target in DESKTOP_TARGETS:
-        require(needs(workflow['desktop-' + target]) == {'identity', 'compose-' + target},
-                target + ' desktop packaging waits on another platform')
-    collection_needs = {'identity', 'static', 'android', 'ios', *('compose-' + target for target in TARGETS),
-                        *('desktop-' + target for target in DESKTOP_TARGETS)}
-    require(needs(workflow['collect']) == collection_needs, 'collection is missing a required producer')
-    require(needs(workflow['release-start']) == {'identity'}, 'Release creator must only wait for identity')
-    creator = workflow['release-start']
-    require("needs.identity.outputs.publish == 'true'" in guard(creator),
-            'Release creator must be limited to publishing product runs')
-    require('contents: write' in creator and 'scripts/release.py begin-product' in creator,
-            'Release creator must create the product Release with write permission')
-    require("ref: '${{ needs.identity.outputs.tag }}'" in creator and 'fetch-depth: 0' in creator,
-            'Release creator must check out the exact fully fetched release tag')
-
-    require(set(name for name in workflow if name.startswith('publish-') and name != 'publish-product') == set(PARTS),
-            'workflow must define exactly the eleven product part publishers')
-    for name, producer in PARTS.items():
-        block = workflow[name]
-        require(needs(block) == {'identity', 'release-start', producer},
-                name + ' must wait only for identity, the single creator and its own producer')
-        expression = guard(block)
-        require("needs.identity.outputs.publish == 'true'" in expression,
-                name + ' must be product-publish only')
-        require('contents: write' in block and 'release-publish-part.yml' in block,
-                name + ' must call the isolated part publisher with write permission')
-        require('scripts/release.py publish ' not in block,
-                name + ' must not run the complete-release publisher')
-
-    final_parts = set(PARTS)
-    require(needs(workflow['publish-product']) == {'identity', 'collect', *final_parts},
-            'final product publisher must wait for collect and every product part')
-    final = workflow['publish-product']
-    final_guard = guard(final)
-    require('always()' in final_guard and '!cancelled()' in final_guard
-            and "needs.identity.outputs.publish == 'true'" in final_guard
-            and "needs.collect.result == 'success'" in final_guard,
-            'final product marker must be publish-only and require the complete audit')
-    for publisher in PARTS:
-        require(f'needs.{publisher}.result == \'success\'' in final_guard,
-                'final product marker is missing successful ' + publisher)
-    require('contents: write' in final and 'scripts/release.py publish product .artifacts/release' in final,
-            'final product marker must use the complete collected artifact')
-    require("ref: '${{ needs.identity.outputs.tag }}'" in final and 'fetch-depth: 0' in final,
-            'final product publisher must check out the exact fully fetched release tag')
-    require('scripts/release.py begin-product' not in final and 'scripts/release.py publish-part' not in final,
-            'final product job must only finalize the complete Release')
-
-    marker = workflow.get('release-failed', '')
-    require(needs(marker) == {'identity', 'release-start', 'publish-product'}
-            and 'always()' in guard(marker)
-            and "needs.identity.outputs.publish == 'true'" in guard(marker)
-            and "needs.publish-product.result != 'success'" in guard(marker)
-            and 'scripts/release.py fail-product' in marker and 'scripts/release.py publish' not in marker
-            and 'scripts/release.py begin-product' not in marker,
-            'failed product run must only mark its unfinished Release')
-
-    for name, block in workflow.items():
-        if name not in {'release-start', 'publish-product', 'release-failed', *PARTS}:
-            require('contents: write' not in block and 'scripts/release.py publish' not in block
-                    and 'scripts/release.py begin-product' not in block,
-                    name + ' must not mutate a public Release')
-    require(source.count('scripts/release.py publish ') == 1,
-            'only the complete product finalizer may publish the complete product')
-
-    part_helper = helpers['release-publish-part.yml']
-    part_jobs = jobs(part_helper)
-    require(set(part_jobs) == {'publish-part'} and 'contents: write' in part_helper
-            and 'actions: read' in part_helper,
-            'part helper must be the sole write-enabled upload-only workflow')
-    require("ref: '${{ github.sha }}'" in part_helper and 'fetch-depth: 0' in part_helper,
-            'part helper must check out the exact source with tags and origin/main available')
-    require('artifact-ids: ${{ inputs.artifact_id }}' in part_helper
-            and 'pattern:' not in part_helper and 'run-id:' not in part_helper,
-            'part helper must download only its same-run immutable artifact ID')
-    require('publish-part' in part_helper and 'begin-product' not in part_helper
-            and 'scripts/release.py publish ' not in part_helper,
-            'part helper may only append its verified release part')
-    for name, helper in helpers.items():
-        if name != 'release-publish-part.yml':
-            require('contents: write' not in helper and 'scripts/release.py publish ' not in helper
-                    and 'scripts/release.py publish-part' not in helper,
-                    name + ' must only produce artifacts or consume a completed release')
-    for name, content in [('release.yml', source), *helpers.items()]:
-        for step in re.split(r'(?m)^      - ', content):
-            if step.startswith('uses: actions/download-artifact@'):
-                require('artifact-ids:' in step and 'pattern:' not in step,
-                        name + ' downloads an unpinned artifact')
-    good = {name: 'success' for name in collection_needs}
-    collect = guard(workflow['collect'])
-    require(evaluate(collect, good), 'complete product cannot be collected')
-    for producer in collection_needs:
-        for failure in ('failure', 'cancelled', 'skipped'):
-            require(not evaluate(collect, {**good, producer: failure}),
-                    producer + ' failure exposes an incomplete product')
-    require(not evaluate(collect, good, cancelled=True), 'cancelled product must not be collected')
-    require(not evaluate(guard(creator), {}, publishing=False),
-            'Release creator must be disabled for build-only runs')
-    for name, block in ((name, workflow[name]) for name in PARTS):
-        require(evaluate(guard(block), {}, scope='product', publishing=True)
-                and not evaluate(guard(block), {}, scope='product', publishing=False),
-                name + ' must be disabled outside product publishing runs')
-    final_success = {name: 'success' for name in needs(final)}
-    require(evaluate(final_guard, final_success), 'complete product cannot be finalized')
-    for failed_job in needs(final) - {'identity'}:
-        for failure in ('failure', 'cancelled', 'skipped'):
-            require(not evaluate(final_guard, {**final_success, failed_job: failure}),
-                    failed_job + ' failure must block the final completion marker')
-    require(not evaluate(final_guard, final_success, cancelled=True),
-            'cancelled product must not receive a completion marker')
-
-    npm = workflow['npm']
-    require(needs(npm) == {'identity', 'collect', 'publish-product'}
-            and "needs.publish-product.result == 'success'" in guard(npm),
-            'npm publication must wait for the completed product release')
-    check_auto_dispatch(workflow['deploy-published-product'], 'product')
-    return workflow
-
-
-def check_identity_helper(source):
-    required = (
-        "environ['GITHUB_REPOSITORY'] == release.GITHUB_REPO",
-        "environ['GITHUB_REF'] == 'refs/tags/' + tag",
-        'require_main=publish, publishing=publish',
-        "result['source_commit'] == environ['GITHUB_SHA']",
-        'release.require_ci(result)',
-        "environ.get('WINDOWS_SIGNING_CONFIGURED') == 'true'",
-        "environ.get('IOS_SIGNING_CONFIGURED') == 'true'",
-    )
-    require(all(fragment in source for fragment in required),
-            'release entries must retain source, CI, exact tag and stable signing boundaries')
-
-
-def check_website(source):
-    workflow = jobs(source)
-    require(set(workflow) == {'identity', 'static', 'collect', 'publish', 'deploy-published-www'},
-            'website publication must have its own publication and deployment DAG')
-    require("tags: ['www-v*']" in source and 'inputs.app' not in source
-            and 'scripts/release-entry.py --app www' in workflow['identity'],
-            'website entry must select only the independent website identity')
-    auto = workflow['deploy-published-www']
-    publication = source.replace('  deploy-published-www:\n' + auto, '')
-    require('deploy' not in publication and 'dispatches' not in publication
-            and 'scripts/deploy.py' not in publication and 'scripts/deploy-run.py' not in publication
-            and './.github/workflows/deploy-' not in publication,
-            'website publication must not deploy services before its complete-release gate')
-    require('contents: write' not in workflow['static']
-            and 'contents: write' not in workflow['collect'],
-            'website production must not deploy or write a public release')
-    require(needs(workflow['static']) == {'identity'}
-            and needs(workflow['collect']) == {'identity', 'static'}
-            and needs(workflow['publish']) == {'identity', 'collect'},
-            'website publication must not wait for product producers')
-    collect = guard(workflow['collect'])
-    good = {'identity': 'success', 'static': 'success'}
-    require(evaluate(collect, good), 'complete website cannot be collected')
-    for producer in good:
-        for failure in ('failure', 'cancelled', 'skipped'):
-            require(not evaluate(collect, {**good, producer: failure}),
-                    'website collection accepts a missing producer')
-    require(not evaluate(collect, good, cancelled=True), 'cancelled website cannot be collected')
-    publish = workflow['publish']
-    expression = guard(publish)
+    require(not needs(identity) and f'scripts/release-entry.py --app {app}' in identity
+            and 'fetch-depth: 0' in identity and permission(identity, 'actions', 'read')
+            and 'GH_TOKEN: ${{ github.token }}' in identity,
+            app + ' identity must verify exact tag/source and CI with read access')
+    for name, output in (('app', 'app'), ('tag', 'tag'), ('publish', 'publish'), ('source_sha', 'source_commit')):
+        require(scalar(identity, name) == '${{ steps.plan.outputs.' + output + ' }}', 'release identity output differs')
+    require('RELEASE_TAG: ${{ inputs.tag || (github.ref_type' in identity
+            and 'PUBLISH: ${{ github.event_name == \'push\' || inputs.publish }}' in identity,
+            'tag push and manual publication intent must reach the identity validator')
+    for producer in producers | composed:
+        block = workflow[producer]
+        expected = {'identity', producer.replace('compose-', 'native-')} if producer in composed else {'identity'}
+        require(needs(block) == expected and not guard(block), producer + ' must depend only on its own source/inputs')
+        if producer != 'static':
+            checked_source(block)
+        if producer.startswith('native-'):
+            require('uses: ./.github/workflows/release-native.yml' in block and scalar(block, 'app') == app,
+                    'native producer must build its own application')
+            require(scalar(block, 'target') == TARGETS[producer.removeprefix('native-')], 'native target differs')
+        elif producer.startswith('compose-'):
+            native = producer.replace('compose-', 'native-')
+            require('uses: ./.github/workflows/release-compose.yml' in block
+                    and scalar(block, 'native_artifact_id') == '${{ needs.' + native + '.outputs.artifact_id }}',
+                    'CLI composition must consume its exact native artifact ID')
+            require(inherited_permission(block, header, 'actions', 'read'), 'CLI caller must pass dependency CI read access')
+        elif producer.startswith('desktop-'):
+            require('uses: ./.github/workflows/release-desktop.yml' in block
+                    and scalar(block, 'runtime_tag') == '${{ needs.identity.outputs.runtime_tag }}',
+                    'Desktop must consume its pinned CLI runtime tag')
+            require(inherited_permission(block, header, 'actions', 'read'), 'Desktop caller must pass dependency CI read access')
+        elif producer in ('android', 'ios'):
+            helper = 'release-apps.yml' if producer == 'android' else 'release-ios.yml'
+            require('uses: ./.github/workflows/' + helper in block
+                    and scalar(block, 'version') == '${{ needs.identity.outputs.version }}', 'Mobile producer identity differs')
+        else:
+            require(f'scripts/release.py component {app}' in block
+                    and "ref: '${{ needs.identity.outputs.source_sha }}'" in block,
+                    'static producer must build only its own validated source')
+    inventory = composed or producers
+    collect = workflow['collect']
+    require(needs(collect) == {'identity', *inventory} and not guard(collect)
+            and 'uses: ./.github/workflows/release-collect.yml' in collect and scalar(collect, 'app') == app,
+            'collection must wait for every producer in its application only')
+    checked_source(collect)
+    require(inherited_permission(collect, header, 'actions', 'read'), 'collector caller must pass artifact read access')
+    ids = scalar(collect, 'artifact_ids').split(',')
+    require(len(ids) == len(inventory) and set(ids) == {'${{ needs.' + name + '.outputs.artifact_id }}' for name in inventory},
+            'collection must pass every exact immutable producer artifact ID once')
+    publish = workflow[publisher]
+    require(needs(publish) == {'identity', 'collect'} and 'uses: ./.github/workflows/release-publish.yml' in publish
+            and scalar(publish, 'app') == app and scalar(publish, 'tag') == '${{ needs.identity.outputs.tag }}'
+            and scalar(publish, 'artifact_id') == '${{ needs.collect.outputs.artifact_id }}'
+            and permission(publish, 'contents', 'write') and permission(publish, 'actions', 'read'),
+            'publisher must consume the collected immutable artifact for this exact tag')
     good = {'identity': 'success', 'collect': 'success'}
-    require(evaluate(expression, good) and not evaluate(expression, good, publishing=False)
-            and not evaluate(expression, good, cancelled=True),
-            'website publication requires explicit intent and a successful complete collection')
-    for producer in good:
-        for failure in ('failure', 'cancelled', 'skipped'):
-            require(not evaluate(expression, {**good, producer: failure}),
-                    'website publication accepts an incomplete source or collection')
-    require("ref: '${{ needs.identity.outputs.tag }}'" in publish and 'fetch-depth: 0' in publish
-            and 'contents: write' in publish
-            and 'scripts/release.py plan --app www --tag "$RELEASE_TAG" --require-main --publish' in publish
-            and 'scripts/release.py publish www .artifacts/release' in publish,
-            'website publisher must revalidate and publish the exact tag and verified bytes')
-    for step in re.split(r'(?m)^      - ', source):
-        if step.startswith('uses: actions/download-artifact@'):
-            require('artifact-ids:' in step and 'pattern:' not in step and 'run-id:' not in step,
-                    'website must consume its same-run immutable artifacts')
-    check_auto_dispatch(workflow['deploy-published-www'], 'www')
+    require(evaluate(guard(publish), good) and not evaluate(guard(publish), good, publishing=False)
+            and not evaluate(guard(publish), good, cancelled=True), 'publication must require explicit intent and successful collection')
+    for state in ('failure', 'cancelled', 'skipped', 'missing'):
+        for name in good:
+            require(not evaluate(guard(publish), good | {name: state}), 'incomplete release can be published')
+    for name, block in workflow.items():
+        if name != publisher:
+            require(not permission(block, 'contents', 'write'), 'only the complete publisher may write release assets')
+        if name not in {'deploy', 'wake-consumers'}:
+            require(not permission(block, 'actions', 'write') and 'gh workflow run' not in block
+                    and 'release-dispatch.py' not in block and 'scripts/deploy' not in block,
+                    'producer/collector must not deploy or wake another release')
+    wake = workflow['wake-consumers']
+    require(needs(wake) == {publisher} and not guard(wake) and permission(wake, 'actions', 'write')
+            and 'GH_TOKEN: ${{ github.token }}' in wake and 'gh workflow run hourly.yml' in wake,
+            'consumer reconciliation must follow this application publication')
+    for consumer in optional:
+        block = workflow[consumer]
+        required = {'identity', publisher} | ({'collect'} if consumer == 'npm' else set())
+        require(needs(block) == required, 'consumer must wait for its own complete publication')
+        good = {name: 'success' for name in required}
+        require(evaluate(guard(block), good), 'completed publication cannot run its consumer')
+        for dependency in required:
+            for state in ('failure', 'cancelled', 'skipped'):
+                require(not evaluate(guard(block), good | {dependency: state}),
+                        'build-only or failed publication must not run consumers')
+        if consumer == 'deploy':
+            require('uses: ./.github/workflows/release-deploy.yml' in block and scalar(block, 'app') == app
+                    and scalar(block, 'tag') == '${{ needs.identity.outputs.tag }}' and permission(block, 'actions', 'write'),
+                    'only a published Core/App/www release may deploy its matching service')
+            checked_source(block)
+        else:
+            require('uses: ./.github/workflows/npm-publish.yml' in block
+                    and scalar(block, 'artifact_id') == '${{ needs.collect.outputs.npm_artifact_id }}'
+                    and scalar(block, 'tag') == '${{ needs.identity.outputs.tag }}'
+                    and scalar(block, 'publish') == 'true' and permission(block, 'id-token', 'write'),
+                    'npm must use the CLI collector artifact and retain OIDC')
 
 
-def check_core(source):
+def check_helpers(helpers):
+    for name, source in helpers.items():
+        require('workflow_call:' in source, name + ' must remain reusable')
+        if name != 'npm-publish.yml':
+            require('workflow_dispatch:' not in source and '  push:' not in source, 'release helpers must not become entrypoints')
+        if name != 'release-publish.yml':
+            require(not permission(source, 'contents', 'write'), 'only the publisher may write releases')
+        require('continue-on-error:' not in source, 'a failed release producer must fail its caller')
+        if name in ('release-native.yml', 'release-compose.yml', 'release-desktop.yml', 'release-apps.yml', 'release-ios.yml', 'release-collect.yml'):
+            outputs = re.findall(r'jobs\.([a-z][a-z0-9-]*)\.outputs\.artifact_id', source.split('\njobs:\n', 1)[0])
+            require(len(outputs) == 1 and outputs[0] in jobs(source), 'reusable artifact output must name its real producer job')
+            producer = jobs(source)[outputs[0]]
+            require(scalar(producer, 'artifact_id') == '${{ steps.upload.outputs.artifact-id }}'
+                    and 'id: upload\n' in producer and 'if-no-files-found: error' in producer,
+                    'caller artifact ID must come from the successful upload step')
+        for block in source.split('actions/download-artifact@')[1:]:
+            step = block.split('      - ', 1)[0]
+            require('artifact-ids:' in step and not re.search(r'^          (?:pattern|name):', step, re.M),
+                    name + ' must download artifacts by immutable ID')
+    collect = helpers['release-collect.yml']
+    require('artifact-ids: ${{ inputs.artifact_ids }}' in collect
+            and 'ref: \'${{ inputs.source_sha }}\'' in collect
+            and 'scripts/release.py collect --app "$RELEASE_APP"' in collect
+            and 'test "$(git rev-parse HEAD)" = "$SOURCE_SHA"' in collect,
+            'collection must audit exact source/artifacts without rebuilding')
+    require(permission(collect.split('\njobs:\n', 1)[0], 'actions', 'read'), 'collector helper must retain artifact read permission')
+    require(scalar(jobs(collect)['collect'], 'npm_artifact_id') == '${{ steps.npm.outputs.artifact-id }}',
+            'npm artifact output must name its real immutable upload')
+    require("if: inputs.app == 'cli'" in collect and 'npm-package-${{ inputs.source_sha }}-${{ github.run_attempt }}' in collect,
+            'npm artifacts must belong to the original CLI collector attempt')
+    publish = helpers['release-publish.yml']
+    require('artifact-ids: ${{ inputs.artifact_id }}' in publish and 'fetch-depth: 0' in publish
+            and "ref: '${{ inputs.tag }}'" in publish and permission(publish, 'actions', 'read')
+            and 'GH_TOKEN: ${{ github.token }}' in publish
+            and 'scripts/release.py plan --app "$RELEASE_APP" --tag "$RELEASE_TAG" --require-main --publish' in publish
+            and 'scripts/release.py publish "$RELEASE_APP" .artifacts/release' in publish,
+            'publisher must recheck exact tag/CI and publish only audited bytes')
+    compose = helpers['release-compose.yml']
+    for app in ('core', 'app'):
+        require(f'dependency --app cli --dependency {app} --target "$TARGET"' in compose,
+                'CLI composition must resolve exact Core and App release pins')
+    for name in ('release-compose.yml', 'release-desktop.yml'):
+        require(permission(helpers[name], 'actions', 'read') and 'GH_TOKEN: ${{ github.token }}' in helpers[name],
+                'dependency resolution requires its exact source CI read access')
+    desktop = helpers['release-desktop.yml']
+    require('dependency --app desktop --dependency cli --target "$TARGET"' in desktop
+            and 'releases/desktop.json' in desktop and 'RUNTIME_TAG: ${{ inputs.runtime_tag }}' in desktop,
+            'Desktop must verify the pinned CLI release before packaging')
+    deploy = helpers['release-deploy.yml']
+    require('scripts/release-dispatch.py --app "$RELEASE_APP" --tag "$RELEASE_TAG"' in deploy
+            and permission(deploy, 'actions', 'write') and 'GH_TOKEN: ${{ github.token }}' in deploy,
+            'automatic deployment must reconcile and wait for the exact dispatch')
+    npm = helpers['npm-publish.yml']
+    require(permission(npm, 'id-token', 'write') and permission(npm, 'actions', 'read')
+            and 'artifact-ids: ${{ steps.artifact.outputs.artifact_id }}' in npm
+            and 'run-id: ${{ steps.artifact.outputs.run_id }}' in npm
+            and 'scripts/release.py plan --app cli --tag "$RELEASE_TAG" --require-main --publish' in npm
+            and 'node scripts/publish-npm.mjs artifact' in npm and 'node scripts/publish-npm.mjs publish' in npm,
+            'npm must preserve CLI provenance, original artifacts, OIDC and reconciliation')
+
+
+def check_hourly(source):
+    require('workflow_run:' in source and "workflows: ['CI / Core']" in source
+            and 'types: [completed]' in source and 'branches: [main]' in source,
+            'coordinator must observe completed main CI')
     workflow = jobs(source)
-    require(set(workflow) == {'identity', 'build', 'publish', 'failed', 'deploy'},
-            'Core release must have identity, build, publish, failure and deploy jobs')
-    require("tags: ['core-v*']" in source and 'scripts/core_release.py' in source,
-            'Core release must use its fixed tag and verifier')
-    require('actions: read' in workflow['identity']
-            and 'GH_TOKEN: ${{ github.token }}' in workflow['identity'],
-            'Core identity must authenticate its CI provenance query')
-    for name in ('publish', 'failed'):
-        require('GH_TOKEN: ${{ github.token }}' in workflow[name],
-                f'Core {name} job must authenticate GitHub release writes')
-    require(needs(workflow['build']) == {'identity'}
-            and needs(workflow['publish']) == {'identity', 'build'}
-            and needs(workflow['failed']) == {'identity', 'publish'}
-            and needs(workflow['deploy']) == {'identity', 'publish'},
-            'Core release dependency graph must be linear after identity')
-    require("needs.identity.outputs.publish == 'true'" in guard(workflow['publish'])
-            and "needs.identity.outputs.publish == 'true'" in guard(workflow['deploy'])
-            and "needs.publish.result == 'success'" in guard(workflow['deploy']),
-            'Core publication and deployment require explicit publish intent and success')
-    require('always()' in guard(workflow['failed'])
-            and "needs.publish.result != 'success'" in guard(workflow['failed'])
-            and "'gh', 'release', 'edit'" in workflow['failed'],
-            'Core failure job must mark an incomplete public release')
-    require('cargo build --release --locked -p vibeface-core --target x86_64-unknown-linux-gnu' in workflow['build']
-            and 'scripts/core_release.py package' in workflow['build']
-            and 'artifact-ids: ${{ needs.build.outputs.artifact_id }}' in workflow['publish'],
-            'Core release must build and publish the pinned x86_64 artifact')
-    dispatch = workflow['deploy']
-    require('gh workflow run deploy-node.yml' in dispatch and '--ref main' in dispatch
-            and '--raw-field "tag=$CORE_TAG" --raw-field apply=true' in dispatch,
-            'Core release must dispatch the Node deployment from main')
-    require('gh run list' in dispatch and 'DISPATCHED_AT' in dispatch and 'deployment_run' in dispatch
-            and 'gh run view "$deployment_run"' in dispatch
-            and 'deployment_status' in dispatch and 'deployment_conclusion' in dispatch
-            and 'Node deployment did not reach a terminal result in time' in dispatch,
-            'Core release must wait for the Node deployment result')
-
-
-def check_auto_dispatch(block, kind):
-    publisher = 'publish-product' if kind == 'product' else 'publish'
-    workflow = 'deploy-product.yml' if kind == 'product' else 'deploy-www.yml'
-    require(needs(block) == {'identity', publisher},
-            kind + ' deployment must wait for its identity and complete publisher')
-    expression = guard(block)
-    require("needs.identity.outputs.publish == 'true'" in expression
-            and f"needs.{publisher}.result == 'success'" in expression,
-            kind + ' deployment must require a successful real publication')
-    good = {publisher: 'success'}
-    require(evaluate(expression, good), kind + ' deployment cannot run after a complete publication')
-    for result in ('failure', 'cancelled', 'skipped'):
-        require(not evaluate(expression, {publisher: result}),
-                kind + ' deployment accepts an incomplete publication')
-    require('runs-on: ubuntu-24.04' in block
-            and 'actions: write' in block and 'contents: read' in block
-            and 'contents: write' not in block,
-            kind + ' deployment must use only Actions dispatch permission')
-    require('GH_TOKEN: ${{ github.token }}' in block
-            and 'RELEASE_TAG: ${{ needs.identity.outputs.tag }}' in block,
-            kind + ' deployment must pass the exact release tag through the token boundary')
-    require(f'gh workflow run {workflow}' in block
-            and '--repo "$GITHUB_REPOSITORY"' in block
-            and '--ref main' in block
-            and '--raw-field "tag=$RELEASE_TAG" --raw-field apply=true' in block,
-            kind + ' deployment must dispatch the fixed entry from main with apply=true')
-    require(block.count('gh workflow run ') == 1
-            and 'scripts/deploy.py' not in block and 'scripts/deploy-run.py' not in block,
-            kind + ' deployment must have one fixed dispatch command')
-    require('gh run list' in block and 'DISPATCHED_AT' in block and 'deployment_run' in block
-            and 'gh run view "$deployment_run"' in block
-            and 'deployment_status' in block and 'deployment_conclusion' in block
-            and 'run_list=' in block and "|| printf '[]'" in block
-            and 'deployment did not reach a terminal result in time' in block.lower(),
-            kind + ' deployment must wait for the dispatched run to reach a terminal result')
-
-
-def self_test(source, helpers, website, entry, core):
-    check(source, helpers)
-    check_website(website)
-    check_core(core)
-    check_identity_helper(entry)
-    helper = helpers['release-publish-part.yml']
-    broken = [
-        source.replace('scripts/release-entry.py --app product', 'scripts/release-entry.py --app www'),
-        source + '\n  deploy-app:\n    uses: ./.github/workflows/deploy-services.yml\n',
-        source.replace('needs: [identity, static, native-macos]', 'needs: [identity, static, native-macos, native-linux-x64]'),
-        source.replace('needs: [identity, compose-macos]', 'needs: [identity, compose-macos, compose-windows]'),
-        source.replace('needs: [identity, release-start, compose-macos]',
-                       'needs: [identity, release-start, compose-macos, collect]'),
-        source.replace('needs: [identity, release-start, compose-macos]',
-                       'needs: [identity, release-start, compose-linux-x64]'),
-        source.replace('needs: [identity, release-start, static]', 'needs: [identity, static]'),
-        source.replace("needs.identity.outputs.publish == 'true'", 'true', 1),
-        source.replace("if: needs.identity.outputs.publish == 'true'\n    uses: ./.github/workflows/release-publish-part.yml",
-                       'if: always()\n    uses: ./.github/workflows/release-publish-part.yml', 1),
-        source.replace("needs.collect.result == 'success' &&\n      needs.publish-app.result == 'success'", "needs.publish-app.result == 'success'", 1),
-        source.replace("needs.publish-ios.result == 'success'", 'true', 1),
-        source.replace('needs: [identity, collect, publish-app, publish-native-macos, publish-native-linux-x64, publish-native-linux-arm64, publish-native-windows, publish-desktop-macos, publish-desktop-linux-x64, publish-desktop-linux-arm64, publish-desktop-windows, publish-android, publish-ios]',
-                       'needs: [identity, collect, publish-app, publish-native-macos, publish-native-linux-x64, publish-native-linux-arm64, publish-native-windows, publish-desktop-macos, publish-desktop-linux-x64, publish-desktop-linux-arm64, publish-desktop-windows, publish-android]'),
-        source.replace('scripts/release.py publish product .artifacts/release', 'scripts/release.py publish www .artifacts/release'),
-        source.replace('scripts/release.py fail-product', 'scripts/release.py publish product .artifacts/release'),
-        source.replace("always() && needs.identity.result == 'success' && needs.identity.outputs.publish == 'true' &&\n      needs.publish-product.result != 'success'", 'if: failure()'),
-        source.replace("needs.publish-product.result == 'success'", 'true'),
-        source.replace('gh workflow run deploy-product.yml', 'gh workflow run deploy-www.yml'),
-        source.replace('--ref main', '--ref github.ref_name'),
-        source.replace('actions: write', 'contents: read', 1),
-    ]
-    broken_helpers = [helper.replace('artifact-ids: ${{ inputs.artifact_id }}', 'pattern: release-*'),
-                      helper.replace('actions: read', 'contents: read'),
-                      helper.replace("fetch-depth: 0, persist-credentials: false", 'persist-credentials: false')]
-    for candidate, candidate_helper in [*((item, helpers) for item in broken),
-                                        *((source, {**helpers, 'release-publish-part.yml': item}) for item in broken_helpers)]:
-        require(candidate != source or candidate_helper != helpers,
-                'self-test mutation did not reach the workflow')
-        with TestCase().assertRaises((ValueError, SyntaxError, KeyError), msg='Unsafe release dependency or gate was accepted'):
-            check(candidate, candidate_helper)
-    for candidate in (
-        core.replace('actions: read', 'contents: read', 1),
-        core.replace('GH_TOKEN: ${{ github.token }}', 'GH_TOKEN:', 1),
-        core.replace('GH_TOKEN: ${{ github.token }}', 'GH_TOKEN:', 1).replace(
-            'GH_TOKEN: ${{ github.token }}', 'GH_TOKEN:', 1),
-    ):
-        with TestCase().assertRaises(ValueError, msg='Core GitHub token boundary was removed'):
-            check_core(candidate)
-    for fragment in ('release.require_ci(result)', 'require_main=publish, publishing=publish',
-                     "environ['GITHUB_REPOSITORY'] == release.GITHUB_REPO",
-                     "environ['GITHUB_REF'] == 'refs/tags/' + tag",
-                     "result['source_commit'] == environ['GITHUB_SHA']",
-                     "environ.get('WINDOWS_SIGNING_CONFIGURED') == 'true'",
-                     "environ.get('IOS_SIGNING_CONFIGURED') == 'true'"):
-        require(fragment in entry, 'identity mutation did not reach the helper')
-        with TestCase().assertRaises(ValueError, msg='Unsafe release identity was accepted'):
-            check_identity_helper(entry.replace(fragment, 'True'))
-    for candidate in (
-        website.replace('--app www', '--app product'),
-        website.replace('needs: [identity, static]', 'needs: [identity]'),
-        website.replace("needs.static.result == 'success'", 'true'),
-        website.replace("needs.collect.result == 'success'", 'true'),
-        website.replace("needs.identity.outputs.publish == 'true'", 'true'),
-        website.replace('artifact-ids: ${{ needs.static.outputs.artifact_id }}', 'pattern: static-*'),
-        website.replace('scripts/release.py publish www .artifacts/release',
-                        'scripts/release.py publish product .artifacts/release'),
-        website.replace('      - name: Collect website assets without rebuilding',
-                        '      - name: Inject deployment\n        run: gh workflow run deploy-product.yml\n      - name: Collect website assets without rebuilding'),
-        website.replace("needs.publish.result == 'success'", 'true'),
-        website.replace('gh workflow run deploy-www.yml', 'gh workflow run deploy-product.yml'),
-        website.replace('--ref main', '--ref github.ref_name'),
-        website.replace('actions: write', 'contents: read', 1),
-    ):
-        require(candidate != website, 'website mutation did not reach the workflow')
-        with TestCase().assertRaises((ValueError, KeyError), msg='Unsafe website gate was accepted'):
-            check_website(candidate)
+    require(set(workflow) == {'hourly'} and 'cancel-in-progress: false' in source
+            and 'group: independent-hourly-releases' in source,
+            'independent coordinator must keep one serial non-cancelling writer')
+    block = workflow['hourly']
+    require(permission(block, 'contents', 'write') and permission(block, 'actions', 'write')
+            and 'GH_TOKEN: ${{ github.token }}' in block and 'fetch-depth: 0' in block
+            and 'ref: main' in block and 'scripts/hourly.py' in block, 'coordinator source or permissions differ')
+    for ref in ('refs/heads/main', 'refs/heads/other'):
+        for event in ('schedule', 'workflow_dispatch', 'workflow_run'):
+            for origin in ('push', 'pull_request'):
+                for conclusion in ('success', 'failure', 'cancelled', 'skipped'):
+                    context = {'github.ref': ref, 'github.event_name': event,
+                               'github.event.workflow_run.event': origin, 'github.event.workflow_run.conclusion': conclusion}
+                    expected = ref == 'refs/heads/main' and (event != 'workflow_run' or (origin == 'push' and conclusion == 'success'))
+                    require(evaluate(guard(block), context=context) == expected,
+                            'coordinator must reject failed/fork CI and non-main execution')
 
 
 def check_deployment(source, entries):
@@ -442,7 +297,7 @@ def check_deployment(source, entries):
     require('group: vibeface-official-deployments' in source and 'cancel-in-progress: false' in source
             and 'fail-fast: true' in source and 'max-parallel: 1' in source,
             'shared deployment state must retain its single global lock and fail-closed serial service matrix')
-    require(set(entries) == {'node', 'app', 'www', 'all'}, 'missing a fixed deployment entry')
+    require(set(entries) == {'node', 'app', 'www'}, 'missing a fixed deployment entry')
     for service, entry in entries.items():
         require('  workflow_dispatch:' in entry and '  workflow_call:' not in entry
                 and '  push:' not in entry and 'schedule:' not in entry,
@@ -461,7 +316,7 @@ def check_deployment(source, entries):
                 and 'contents: write' not in entry,
                 'deployment entry must not select targets, default to apply or deadlock its callee')
     gate = guard(workflow['plan'])
-    for branch in ('refs/heads/main', 'refs/heads/feature', 'refs/tags/v0.0.1'):
+    for branch in ('refs/heads/main', 'refs/heads/feature', 'refs/tags/cli-v0.0.1'):
         for apply in (True, False):
             expression = gate.replace('github.ref', repr(branch)).replace('inputs.apply', repr(apply))
             require(evaluate(expression, {}) == (branch == 'refs/heads/main' or not apply),
@@ -478,49 +333,113 @@ def check_deployment(source, entries):
             and 'continue-on-error' not in step, 'every Core deployment must pass the rehearsal')
 
 
+def check_all(entries, helpers, hourly, deployment, deployment_entries):
+    require(set(entries) == set(ENTRIES), 'missing independent release entry')
+    for app, source in entries.items():
+        check_entry(app, source)
+    check_helpers(helpers)
+    check_hourly(hourly)
+    check_deployment(deployment, deployment_entries)
+
+
+def self_test(entries, helpers, hourly, deployment, deployment_entries):
+    checked = 0
+
+    def rejects(action):
+        nonlocal checked
+        try:
+            action()
+        except (ValueError, KeyError, SyntaxError):
+            checked += 1
+        else:
+            raise AssertionError('unsafe release workflow was accepted')
+
+    for app, source in entries.items():
+        first = ('compose-macos' if app == 'cli' else 'native-macos' if app == 'core'
+                 else 'desktop-macos' if app == 'desktop' else 'android' if app == 'mobile' else 'static')
+        for before, after in (
+            (f"tags: ['{app}-v*']", "tags: ['foreign-v*']"),
+            (f'--app {app}', '--app unknown'),
+            ('fetch-depth: 0', 'fetch-depth: 1'),
+            ('if: needs.identity.outputs.publish == \'true\'', 'if: always()'),
+            ('needs: [identity, collect]', 'needs: [identity]'),
+            ('artifact_ids: ${{ needs.' + first + '.outputs.artifact_id }}', 'artifact_ids: arbitrary-name'),
+            ('artifact_id: ${{ needs.collect.outputs.artifact_id }}', 'artifact_id: 123'),
+            ('permissions: {contents: write, actions: read}', 'permissions: {contents: read, actions: read}'),
+            ('  actions: read\n', '  actions: none\n'),
+            ('scripts/release-entry.py --app', 'scripts/release.py publish'),
+        ):
+            candidate = source.replace(before, after, 1)
+            require(candidate != source, 'mutation did not reach ' + app + ': ' + before)
+            rejects(lambda: check_entry(app, candidate))
+        if app == 'cli':
+            candidate = source.replace('needs: [identity, collect, publish-cli]', 'needs: [identity, collect]')
+            rejects(lambda: check_entry(app, candidate))
+        if app in ('core', 'app', 'www'):
+            candidate = source.replace('needs: [identity, publish-' + app + ']', 'needs: [identity]')
+            rejects(lambda: check_entry(app, candidate))
+    for filename, before, after in (
+        ('release-collect.yml', 'artifact-ids: ${{ inputs.artifact_ids }}', 'pattern: *'),
+        ('release-collect.yml', 'scripts/release.py collect', 'scripts/release.py manifest'),
+        ('release-collect.yml', 'actions: read', 'actions: none'),
+        ('release-collect.yml', 'jobs.collect.outputs.artifact_id', 'jobs.missing.outputs.artifact_id'),
+        ('release-collect.yml', 'steps.npm.outputs.artifact-id', 'steps.upload.outputs.artifact-id'),
+        ('release-publish.yml', 'artifact-ids: ${{ inputs.artifact_id }}', 'name: mutable-name'),
+        ('release-publish.yml', '--require-main --publish', '--publish'),
+        ('release-publish.yml', 'GH_TOKEN: ${{ github.token }}', 'GH_TOKEN: empty'),
+        ('release-compose.yml', '--dependency core', '--dependency app'),
+        ('release-desktop.yml', '--dependency cli', '--dependency core'),
+        ('release-desktop.yml', 'actions: read', 'actions: none'),
+        ('release-deploy.yml', 'scripts/release-dispatch.py', 'scripts/dispatch-without-wait.py'),
+        ('npm-publish.yml', '--app cli', '--app app'),
+        ('npm-publish.yml', 'id-token: write', 'id-token: none'),
+        ('npm-publish.yml', 'run-id: ${{ steps.artifact.outputs.run_id }}', 'run-id: 123'),
+    ):
+        candidate = helpers[filename].replace(before, after, 1)
+        require(candidate != helpers[filename], 'helper mutation did not reach ' + filename)
+        rejects(lambda: check_helpers(helpers | {filename: candidate}))
+    for before, after in (
+        ("github.event.workflow_run.conclusion == 'success'", "github.event.workflow_run.conclusion != 'failure'"),
+        ("github.event.workflow_run.event == 'push'", "github.event.workflow_run.event == 'pull_request'"),
+        ("github.ref == 'refs/heads/main'", 'true'),
+        ('cancel-in-progress: false', 'cancel-in-progress: true'),
+        ('GH_TOKEN: ${{ github.token }}', 'GH_TOKEN: empty'),
+    ):
+        candidate = hourly.replace(before, after, 1)
+        require(candidate != hourly, 'coordinator mutation did not reach its guard')
+        rejects(lambda: check_hourly(candidate))
+    for candidate in (
+        deployment.replace("github.ref == 'refs/heads/main' || !inputs.apply", 'true'),
+        deployment.replace('fail-fast: true', 'fail-fast: false'),
+        deployment.replace('if: inputs.apply', 'if: always()'),
+        deployment.replace('deploy-run.py rehearse', 'deploy-run.py self-test'),
+        deployment.replace("if: matrix.service == 'node'", "if: matrix.service == 'node' && inputs.apply"),
+    ):
+        rejects(lambda: check_deployment(candidate, deployment_entries))
+    for service, entry in deployment_entries.items():
+        for candidate in (entry.replace('default: false', 'default: true'),
+                          entry.replace('service: ' + service, 'service: invalid'),
+                          entry + '\nconcurrency:\n  group: vibeface-official-deployments\n'):
+            rejects(lambda: check_deployment(deployment, deployment_entries | {service: candidate}))
+    print(f'Release workflow negative cases passed: {checked} invalid scopes, guards, pins, artifacts, permissions and deployment gates rejected')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--self-test', action='store_true')
     args = parser.parse_args()
     directory = ROOT / '.github/workflows'
-    source = (directory / 'release.yml').read_text()
-    helpers = {name: (directory / name).read_text()
-               for name in ('release-native.yml', 'release-compose.yml', 'release-desktop.yml', 'release-publish-part.yml',
-                            'release-apps.yml', 'release-ios.yml', 'npm-publish.yml', 'deploy-services.yml')}
-    website = (directory / 'release-www.yml').read_text()
-    core = (directory / 'release-core.yml').read_text()
-    entry = (ROOT / 'scripts/release-entry.py').read_text()
+    entries = {app: (directory / filename).read_text() for app, filename in ENTRIES.items()}
+    helpers = {filename: (directory / filename).read_text() for filename in HELPERS}
+    hourly = (directory / 'hourly.yml').read_text()
+    deployment = (directory / 'deploy-services.yml').read_text()
+    deployment_entries = {service: (directory / f'deploy-{service}.yml').read_text() for service in ('node', 'app', 'www')}
+    check_all(entries, helpers, hourly, deployment, deployment_entries)
     if args.self_test:
-        self_test(source, helpers, website, entry, core)
+        self_test(entries, helpers, hourly, deployment, deployment_entries)
         import runpy
         runpy.run_path(str(ROOT / 'scripts/release-entry.py'))['self_test']()
-    else:
-        check(source, helpers)
-        check_website(website)
-        check_core(core)
-        check_identity_helper(entry)
-    deployment = helpers['deploy-services.yml']
-    entries = {service: (directory / f'deploy-{filename}.yml').read_text()
-               for service, filename in (('node', 'node'), ('app', 'app'), ('www', 'www'), ('all', 'product'))}
-    check_deployment(deployment, entries)
-    if args.self_test:
-        for candidate in (deployment.replace("github.ref == 'refs/heads/main' || !inputs.apply", 'true'),
-                          deployment.replace('fail-fast: true', 'fail-fast: false'),
-                          deployment.replace('if: inputs.apply', 'if: always()'),
-                          deployment.replace('deploy-run.py rehearse', 'deploy-run.py self-test'),
-                          deployment.replace("if: matrix.service == 'node'", "if: matrix.service == 'node' && inputs.apply"),
-                          deployment.replace("if: matrix.service == 'node'",
-                                             "if: matrix.service == 'node'\n        continue-on-error: true")):
-            with TestCase().assertRaises(ValueError, msg='unsafe deployment gate was accepted'):
-                check_deployment(candidate, entries)
-        for service, source in entries.items():
-            for candidate in (source.replace('default: false', 'default: true'),
-                              source.replace(f'service: {service}', 'service: invalid'),
-                              source + '\nconcurrency:\n  group: vibeface-official-deployments\n'):
-                with TestCase().assertRaises(ValueError, msg='unsafe fixed deployment entry was accepted'):
-                    check_deployment(deployment, {**entries, service: candidate})
-    print('Release DAG passed: parallel native, desktop, Web and Android producers, per-platform composition, '
-          'exact artifacts, progressive uploads and complete-only publication with automatic deployment dispatch')
+    print('Independent release DAG passed: six scopes, complete application manifests, exact artifact IDs, pinned dependencies and complete-only consumers')
 
 
 if __name__ == '__main__':

@@ -18,7 +18,7 @@ description: 部署已验证制品。通过 CI/CD 部署官方公共节点、App
 
 ## 部署官方服务
 
-命令形式为 `deploy <all|node|app|www> <精确已发布 Tag>`。缺少目标或 Tag 时先查询已发布版本，不能默认选择最新版本、创建新 Tag 或重新编译产品。
+命令形式为 `deploy <node|app|www> <精确已发布 Tag>`。缺少目标或 Tag 时先查询已发布版本，不能默认选择最新版本、创建新 Tag 或重新编译产品。
 
 先阅读[服务部署说明](../../../packages/docs/service-deployments.md)，再执行：
 
@@ -32,7 +32,7 @@ python3 scripts/deploy.py plan --service '<service>' --tag '<tag>'
 python3 scripts/deploy.py release --service '<service>' --tag '<tag>'
 ```
 
-该命令按目标请求独立的 CI/CD 入口：`node` 对应 `deploy-node.yml`（Deploy / Node），`app` 对应 `deploy-app.yml`（Deploy / Web App），`www` 对应 `deploy-www.yml`（Deploy / Website），`all` 对应 `deploy-product.yml`（Deploy / Product services），后者在同一次运行中串行部署 Node 和 App。各入口固定目标，只接收 Tag 和 `apply`，默认 `apply=false`；CLI 的 `release` 命令从 main 请求 `apply=true`。`deploy-services.yml` 只作为可复用实现，不接受手动派发。
+该命令按目标请求独立的 CI/CD 入口：`node` 对应 `deploy-node.yml`，只接受 `core-v<version>`；`app` 对应 `deploy-app.yml`，只接受 `app-v<version>`；`www` 对应 `deploy-www.yml`，只接受 `www-v<version>`。服务版本互不绑定，不提供全局 Product 或 all 批次。各入口固定目标，只接收 Tag 和 `apply`，默认 `apply=false`；CLI 的 `release` 命令从 main 请求 `apply=true`。`deploy-services.yml` 只作为可复用实现，不接受手动派发。
 
 跟踪对应入口的 Tag、源码 SHA 和目标的运行到终态。使用 `gh-run-watch` 持续监控。派发成功不代表部署成功；派发响应未知时先查询运行记录，不能直接重发。
 
