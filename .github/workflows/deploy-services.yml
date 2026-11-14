@@ -51,7 +51,7 @@ jobs:
     needs: plan
     runs-on: ubuntu-24.04
     strategy:
-      fail-fast: false
+      fail-fast: true
       max-parallel: 1
       matrix:
         service: ${{ fromJSON(needs.plan.outputs.targets) }}

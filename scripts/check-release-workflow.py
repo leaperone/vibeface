@@ -145,7 +145,9 @@ def check(source, helpers):
 
     marker = workflow.get('release-failed', '')
     require(needs(marker) == {'identity', 'release-start', 'publish-product'}
-            and "if: failure() && needs.release-start.result == 'success'" in marker
+            and 'always()' in guard(marker)
+            and "needs.identity.outputs.publish == 'true'" in guard(marker)
+            and "needs.publish-product.result != 'success'" in guard(marker)
             and 'scripts/release.py fail-product' in marker and 'scripts/release.py publish' not in marker
             and 'scripts/release.py begin-product' not in marker,
             'failed product run must only mark its unfinished Release')
@@ -305,6 +307,9 @@ def check_auto_dispatch(block, kind):
     require(block.count('gh workflow run ') == 1
             and 'scripts/deploy.py' not in block and 'scripts/deploy-run.py' not in block,
             kind + ' deployment must have one fixed dispatch command')
+    require('gh run list' in block and 'DISPATCHED_AT' in block and 'deployment_run' in block
+            and 'gh run watch "$deployment_run" --repo "$GITHUB_REPOSITORY" --exit-status' in block,
+            kind + ' deployment must wait for the dispatched run to reach a terminal result')
 
 
 def self_test(source, helpers, website, entry):
@@ -331,7 +336,7 @@ def self_test(source, helpers, website, entry):
                        'needs: [identity, collect, publish-app, publish-native-macos, publish-native-linux-x64, publish-native-linux-arm64, publish-native-windows, publish-desktop-macos, publish-desktop-linux-x64, publish-desktop-linux-arm64, publish-desktop-windows, publish-android]'),
         source.replace('scripts/release.py publish product .artifacts/release', 'scripts/release.py publish www .artifacts/release'),
         source.replace('scripts/release.py fail-product', 'scripts/release.py publish product .artifacts/release'),
-        source.replace("if: failure() && needs.release-start.result == 'success'", 'if: always()'),
+        source.replace("always() && needs.identity.result == 'success' && needs.identity.outputs.publish == 'true' &&\n      needs.publish-product.result != 'success'", 'if: failure()'),
         source.replace("needs.publish-product.result == 'success'", 'true'),
         source.replace('gh workflow run deploy-product.yml', 'gh workflow run deploy-www.yml'),
         source.replace('--ref main', '--ref github.ref_name'),
@@ -383,8 +388,8 @@ def check_deployment(source, entries):
     require('contents: write' not in source and 'repository_dispatch' not in source,
             'deployment must not publish or dispatch another repository')
     require('group: vibeface-official-deployments' in source and 'cancel-in-progress: false' in source
-            and 'max-parallel: 1' in source,
-            'shared deployment state must retain its single global lock and serial service matrix')
+            and 'fail-fast: true' in source and 'max-parallel: 1' in source,
+            'shared deployment state must retain its single global lock and fail-closed serial service matrix')
     require(set(entries) == {'node', 'app', 'www', 'all'}, 'missing a fixed deployment entry')
     for service, entry in entries.items():
         require('  workflow_dispatch:' in entry and '  workflow_call:' not in entry
@@ -446,6 +451,7 @@ def main():
     check_deployment(deployment, entries)
     if args.self_test:
         for candidate in (deployment.replace("github.ref == 'refs/heads/main' || !inputs.apply", 'true'),
+                          deployment.replace('fail-fast: true', 'fail-fast: false'),
                           deployment.replace('if: inputs.apply', 'if: always()'),
                           deployment.replace('deploy-run.py rehearse', 'deploy-run.py self-test'),
                           deployment.replace("if: matrix.service == 'node'", "if: matrix.service == 'node' && inputs.apply"),

@@ -120,7 +120,7 @@ function registryState(packument, version, integrity) {
   return latest === undefined || compare(version, latest) > 0n ? 'absent' : 'superseded';
 }
 
-async function publishOnce(version, integrity, { read = readRegistry, publish, pause = sleep, attempts = 40 }) {
+async function publishOnce(version, integrity, { read = readRegistry, publish, pause = sleep, attempts = 60 }) {
   const state = registryState(await read(), version, integrity);
   if (state === 'complete' || state === 'superseded') return state;
   assert.equal(state, 'absent', 'existing version has a missing or older hourly tag; reconcile without republishing');

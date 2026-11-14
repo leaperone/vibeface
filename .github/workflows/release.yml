@@ -461,7 +461,9 @@ jobs:
   release-failed:
     name: Mark unfinished product / release-failed
     needs: [identity, release-start, publish-product]
-    if: failure() && needs.release-start.result == 'success'
+    if: >-
+      always() && needs.identity.result == 'success' && needs.identity.outputs.publish == 'true' &&
+      needs.publish-product.result != 'success'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -489,8 +491,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.identity.outputs.tag }}
         run: |
+          dispatched_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           gh workflow run deploy-product.yml --repo "$GITHUB_REPOSITORY" --ref main \
             --raw-field "tag=$RELEASE_TAG" --raw-field apply=true
+          deployment_run=''
+          for attempt in $(seq 1 60); do
+            deployment_run="$(DISPATCHED_AT="$dispatched_at" RELEASE_TAG="$RELEASE_TAG" \
+              gh run list --repo "$GITHUB_REPOSITORY" --workflow deploy-product.yml --branch main \
+                --event workflow_dispatch --limit 20 --json databaseId,displayTitle,createdAt \
+              | python3 -c 'import json, os, sys; start=os.environ["DISPATCHED_AT"]; tag=os.environ["RELEASE_TAG"]; runs=[r for r in json.load(sys.stdin) if r["createdAt"] >= start and tag in r["displayTitle"]]; print(max(runs, key=lambda r: r["createdAt"])["databaseId"] if runs else "")')"
+            [[ -n "$deployment_run" ]] && break
+            sleep 5
+          done
+          test -n "$deployment_run"
+          gh run watch "$deployment_run" --repo "$GITHUB_REPOSITORY" --exit-status
   npm:
     name: Publish npm Hourly
     needs: [identity, collect, publish-product]
