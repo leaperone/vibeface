@@ -348,7 +348,9 @@ def check_auto_dispatch(block, kind):
             and 'scripts/deploy.py' not in block and 'scripts/deploy-run.py' not in block,
             kind + ' deployment must have one fixed dispatch command')
     require('gh run list' in block and 'DISPATCHED_AT' in block and 'deployment_run' in block
-            and 'gh run watch "$deployment_run" --repo "$GITHUB_REPOSITORY" --exit-status' in block,
+            and 'gh run view "$deployment_run"' in block
+            and 'deployment_status' in block and 'deployment_conclusion' in block
+            and 'deployment did not reach a terminal result in time' in block.lower(),
             kind + ' deployment must wait for the dispatched run to reach a terminal result')
 
 
