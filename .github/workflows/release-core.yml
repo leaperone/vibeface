@@ -130,7 +130,7 @@ jobs:
           gh workflow run deploy-node.yml --repo "$GITHUB_REPOSITORY" --ref main \
             --raw-field "tag=$CORE_TAG" --raw-field apply=true
           deployment_run=''
-          for attempt in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             deployment_run="$(DISPATCHED_AT="$dispatched_at" CORE_TAG="$CORE_TAG" \
               gh run list --repo "$GITHUB_REPOSITORY" --workflow deploy-node.yml --branch main \
                 --event workflow_dispatch --limit 20 --json databaseId,displayTitle,createdAt \
