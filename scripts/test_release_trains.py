@@ -4,6 +4,7 @@ import copy
 import json
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import tempfile
 import unittest
@@ -14,6 +15,25 @@ import release
 
 
 class ReleaseTrains(unittest.TestCase):
+    def test_npm_bootstrap_ignores_unrelated_release_channels(self):
+        choose = runpy.run_path(str(release.ROOT / 'scripts/verify-node.py'))['_npm_cli_candidate']
+        registry = {'versions': {'0.0.1-nightly.20261112.1': {}, '0.0.1-rc.1': {}}}
+        records = [[{'tag_name': 'cli-v0.0.1-nightly.20261112.1', 'draft': False, 'assets': []},
+                    {'tag_name': 'cli-v0.0.1', 'draft': False, 'prerelease': False, 'assets': [{'name': 'release.json'}]},
+                    {'tag_name': 'cli-v0.0.1-hourly.2026111409', 'draft': False, 'prerelease': True, 'assets': []}]]
+        self.assertIsNone(choose(registry, records))
+
+    def test_npm_baseline_selects_completed_registry_intersection(self):
+        choose = runpy.run_path(str(release.ROOT / 'scripts/verify-node.py'))['_npm_cli_candidate']
+        old, new = '0.0.1-hourly.2026111408', '0.0.1-hourly.2026111409'
+        registry = {'versions': {old: {}, '0.0.1-nightly.20261112.1': {}}}
+        completed = lambda value: {'tag_name': 'cli-v' + value, 'draft': False, 'prerelease': True,
+                                   'assets': [{'name': 'release.json'}]}
+        self.assertEqual(choose(registry, [[completed(new), completed(old)]]), (old, 'cli-v' + old))
+        incomplete = completed(old) | {'assets': []}
+        with self.assertRaisesRegex(AssertionError, 'pending or draft'):
+            choose(registry, [[incomplete]])
+
     def test_running_release_is_not_rebuilt_on_the_next_hour(self):
         def git(*args, **kwargs):
             return 'core-v0.0.1-hourly.2026111408' if args[:2] == ('tag', '--list') else 'a' * 40

@@ -4698,7 +4698,14 @@ def _npm_cli_candidate(registry, pages):
 
     versions = registry.get("versions")
     require(isinstance(versions, dict), "npm registry has no bounded version map")
-    registry_versions = {value for value in versions if release.version(value) == "hourly"}
+    registry_versions = set()
+    for value in versions:
+        try:
+            channel = release.version(value)
+        except ValueError:
+            continue
+        if channel == "hourly":
+            registry_versions.add(value)
     complete = []
     matching = []
     for item in (entry for page in pages for entry in page):
@@ -4707,14 +4714,18 @@ def _npm_cli_candidate(registry, pages):
         tag = item["tag_name"]
         if not tag.startswith("cli-v"):
             continue
-        app, value, channel = release.parse_tag(tag)
+        try:
+            app, value, channel = release.parse_tag(tag)
+        except ValueError:
+            continue
         require(app == "cli", "independent CLI tag parsed as another application")
+        if channel != "hourly":
+            continue
         names = {asset.get("name") for asset in item.get("assets", []) if isinstance(asset, dict)}
-        if item.get("draft") or item.get("prerelease") != (channel != "stable"):
+        if item.get("draft") or item.get("prerelease") is not True or "release.json" not in names:
             if value in registry_versions:
                 raise AssertionError("a registry version points at a pending or draft CLI release")
             continue
-        require("release.json" in names, "complete CLI release is missing release.json")
         complete.append((value, tag))
         if value in registry_versions:
             matching.append((value, tag))
