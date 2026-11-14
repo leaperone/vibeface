@@ -100,7 +100,10 @@ def plan(tag):
             release.require(obj['type'] == 'tag', 'Core tag must resolve to a commit')
             obj = json.loads(gh('api', f"repos/{REPOSITORY}/git/tags/{obj['sha']}"))['object']
         source = obj['sha']
-        subprocess.run(['git', 'fetch', '--tags', 'origin', 'main', 'refs/tags/' + tag], cwd=release.ROOT, check=True)
+        fetch = ['git', 'fetch', '--tags']
+        if release.run('git', 'rev-parse', '--is-shallow-repository') == 'true':
+            fetch.append('--unshallow')
+        subprocess.run([*fetch, 'origin', 'main', 'refs/tags/' + tag], cwd=release.ROOT, check=True)
         release.require(release.run('git', 'rev-parse', tag + '^{commit}') == source, 'Core tag source mismatch')
         release.require(core_release.source_context(source) is not None, 'Core source provenance failed')
         release.require(release.require_ci(core_release.source_context(source)) is not None, 'Core CI provenance failed')
