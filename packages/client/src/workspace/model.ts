@@ -166,7 +166,7 @@ export function parseScopeContext(value: unknown): ScopeContext {
 export function parsePendingMessage(item: OutboxItem): PendingMessage {
   const request = parseMessageRequest(item.params), delivery = item.delivery ?? 'unknown'
   if (!['saved', 'uploading', 'submitting', 'accepted', 'unknown'].includes(delivery)) throw new Error('本地输入状态无法识别。')
-  if (item.rejection_code !== undefined && item.rejection_code !== 'input_not_saved' && item.rejection_code !== 'input_conflict') throw new Error('本地输入拒绝原因无法识别。')
+  if (item.rejection_code !== undefined && item.rejection_code !== 'input_not_saved' && item.rejection_code !== 'input_conflict' && item.rejection_code !== 'input_missing') throw new Error('本地输入拒绝原因无法识别。')
   return { ...request, created_at_ms: number(item.created_at_ms), delivery, ...(item.entry_device_id === undefined ? {} : { entry_device_id: text(item.entry_device_id) }), ...(item.rejected === undefined ? {} : { rejected: item.rejected }), ...(item.rejection_code === undefined ? {} : { rejection_code: item.rejection_code }), ...(item.receipt === undefined ? {} : { receipt: parseInputReceipt(item.receipt) }), ...(item.release_expected_event === undefined ? {} : { release_expected_event: text(item.release_expected_event) }), ...(item.release_command_id === undefined ? {} : { release_command_id: text(item.release_command_id) }) }
 }
 export function parseMessageRequest(value: unknown): MessageRequest {

@@ -47,6 +47,7 @@ type AttachmentFile = { name: string; arrayBuffer(): Promise<ArrayBuffer> }
 type NotificationButton = { label: string; disabled: boolean; state: "off" | "on" | "unsupported" | "denied" }
 const soleTab: Tabs = { leader: () => true, post() {}, listen: () => () => {} }
 const faceSuperseded = "Bot 的长相刚在别处改过，之前没确认的那次修改没有再发送。"
+const inputMissingReason = '这条输入的送达结果仍未确认，原内容已保留。请连接原设备，再确认原设备并查询。'
 const responded = (caught: unknown) => caught instanceof Error && "responded" in caught && caught.responded === true
 class WorkspaceCommandNotSavedError extends Error {
   constructor(receipt: WorkspaceCommandNotSaved) { super(receipt.reason || '这次操作未保存。请读取最新状态后再操作。') }
@@ -854,10 +855,33 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const id = targetConversation(input.target, input.conversation_id)
     const original = (await outbox.all()).find((item) => item.key === outboxKey('message', input.message_id))
     const pending = original ? parsePendingMessage(original) : null
+    if (original?.rejection_code === 'input_missing' && original.entry_device_id === undefined && pending?.receipt === undefined) throw new Error(inputMissingReason)
     const reconcile = original && pending?.conversation_id === id && inputTargetKey(pending.target) === inputTargetKey(input.target) && original.entry_device_id === connection.info.device_id && original.entry_device_id === connection.entry.device_id && (pending.delivery === 'unknown' || pending.delivery === 'submitting') && original.release_expected_event === undefined && original.release_command_id === undefined
     requireCurrent()
     if (reconcile && original.entry_device_id !== undefined) requireInputEntry(original.entry_device_id)
-    const value = await connection.rpc('input_receipt', { message_id: input.message_id, conversation_id: id, target: input.target, ...(reconcile ? { entry_device_id: original.entry_device_id, original_input: original.params } : {}) })
+    let value: unknown
+    try {
+      value = await connection.rpc('input_receipt', { message_id: input.message_id, conversation_id: id, target: input.target, ...(reconcile ? { entry_device_id: original.entry_device_id, original_input: original.params } : {}) })
+    } catch (caught) {
+      requireCurrent()
+      if (!(caught instanceof Error) || !responded(caught) || caught.message !== 'input not found') throw caught
+      if (!original || !pending || original.entry_device_id !== undefined
+        || pending.conversation_id !== id || inputTargetKey(pending.target) !== inputTargetKey(input.target)
+        || pending.receipt !== undefined || pending.rejection_code === 'input_conflict'
+        || (pending.delivery !== 'unknown' && pending.delivery !== 'submitting')
+        || original.release_expected_event !== undefined || original.release_command_id !== undefined) throw caught
+      const latest = (await outbox.all()).find((item) => item.key === original.key)
+      requireCurrent()
+      if (latest?.receipt !== undefined) return parseInputReceipt(latest.receipt)
+      if (latest && latest.entry_device_id === undefined
+        && (latest.delivery === undefined || latest.delivery === 'unknown' || latest.delivery === 'submitting')
+        && latest.rejection_code !== 'input_conflict' && latest.release_expected_event === undefined && latest.release_command_id === undefined
+        && JSON.stringify(latest.params) === JSON.stringify(original.params)) {
+        await outbox.put({ ...latest, delivery: 'unknown', rejected: inputMissingReason, rejection_code: 'input_missing' })
+        await outboxChanged()
+      }
+      throw new Error(inputMissingReason)
+    }
     requireCurrent()
     const notSaved = parseInputNotSaved(value)
     if (notSaved) {
@@ -882,7 +906,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       })
       const releaseUnconfirmed = item.release_expected_event !== undefined && !releaseRejected && (!receipt.control_event?.trim() || receipt.control_event === item.release_expected_event)
       const uncertain = receipt.stage === 'unknown' || releaseUnconfirmed
-      await outbox.put({ ...item, receipt: releaseUnconfirmed ? item.receipt ?? receipt : receipt, delivery: uncertain ? 'unknown' : 'accepted', ...(item.rejection_code === 'input_not_saved' ? { rejected: undefined, rejection_code: undefined } : {}), ...(!releaseUnconfirmed ? { release_expected_event: undefined, release_command_id: undefined } : {}) })
+      await outbox.put({ ...item, receipt: releaseUnconfirmed ? item.receipt ?? receipt : receipt, delivery: uncertain ? 'unknown' : 'accepted', ...(item.rejection_code === 'input_not_saved' || item.rejection_code === 'input_missing' ? { rejected: undefined, rejection_code: undefined } : {}), ...(!releaseUnconfirmed ? { release_expected_event: undefined, release_command_id: undefined } : {}) })
       await outboxChanged()
       if (!uncertain) flushMessagesRef.current()
     }
@@ -902,7 +926,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     messageTargets.current.add(lane)
     try {
       requireInputEntry(expectedEntry)
-      await outbox.put({ ...item, entry_device_id: expectedEntry, ...(legacyAbsence ? { delivery: 'unknown', rejected: undefined, rejection_code: undefined } : {}) })
+      await outbox.put({ ...item, entry_device_id: expectedEntry, ...(legacyAbsence || pending.rejection_code === 'input_missing' ? { delivery: 'unknown', rejected: undefined, rejection_code: undefined } : {}) })
       await outboxChanged()
       requireInputEntry(expectedEntry)
       return await readInputReceipt(pending)
@@ -1077,6 +1101,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     targets.add(lane)
     let resume = false
     try {
+      if (pending.rejection_code === 'input_missing') throw new Error(inputMissingReason)
       if (pending.rejection_code === 'input_conflict') throw new Error('设备保存的原输入和本地内容不同，已保留两边内容。请先查看原输入。')
       const queued = workspaceStateRef.current?.inputs.find((input) => input.input.message_id === messageId && input.conversation_id === pending.conversation_id && inputTargetKey(input.input.target) === inputTargetKey(pending.target))
       if (queued?.cancelled || queued?.deferred) throw new Error('这条输入已保存到设备。请查看状态，再使用对应操作。')
@@ -1127,6 +1152,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (renderedConnection.current !== connection || !alive.current) throw new Error('工作区已切换，先读取当前输入。')
     const pending = parsePendingMessage(item)
     if (messageTargets.current.has(messageLane(pending))) throw new Error('这个目标仍在提交输入，先查询原输入的结果。')
+    if (pending.rejection_code === 'input_missing') throw new Error(inputMissingReason)
     if (pending.rejection_code === 'input_conflict') throw new Error('设备保存的原输入和本地内容不同，已保留两边内容。请先查看原输入。')
     let notice = '已从本机待发送队列移除。'
     if (pending.delivery === 'unknown' || pending.delivery === 'submitting' || pending.delivery === 'accepted' || pending.receipt !== undefined || pending.release_expected_event !== undefined || pending.release_command_id !== undefined) {
