@@ -77,7 +77,7 @@ def verify_core_manifest(tag, manifest, published, source_sha):
     expected = {core_release.CORE_ASSET.format(version=value), core_release.CORE_CHECKSUM.format(version=value)}
     release.require(set(assets) == {core_release.CORE_ASSET.format(version=value)}, 'Core release asset set mismatch')
     actual = {asset['name']: asset for asset in published['assets']}
-    release.require(set(actual) == set(assets) | {core_release.MANIFEST}, 'Core release has unexpected assets')
+    release.require(set(actual) == expected | {core_release.MANIFEST}, 'Core release has unexpected assets')
     return {'tag': tag, 'source_sha': source_sha, 'version': value, 'channel': channel,
             'app': 'core', 'data_epoch': manifest['data_epoch'], 'update_protocol': manifest['update_protocol']}
 
@@ -284,6 +284,20 @@ def self_test():
                  'assets': [{'name': n, 'size': 1, 'digest': 'sha256:' + 'b' * 64}
                             for n in sorted(names | {'release.json'})]}
     assert verify(tag, manifest, published, sha)['source_sha'] == sha
+    core_tag = 'core-v0.0.1-hourly.2026111300'
+    core_asset = core_release.CORE_ASSET.format(version=core_tag[len('core-v'):])
+    core_checksum = core_release.CORE_CHECKSUM.format(version=core_tag[len('core-v'):])
+    core_manifest = {
+        'app': 'core', 'tag': core_tag, 'version': core_tag[len('core-v'):],
+        'channel': 'hourly', 'source_commit': sha,
+        'data_epoch': release.control_constant('DATA_EPOCH'),
+        'update_protocol': release.control_constant('UPDATE_PROTOCOL'),
+        'assets': [{'name': core_asset, 'size': 1, 'sha256': 'b' * 64}],
+    }
+    core_published = {'assets': [{'name': name} for name in (core_asset, core_checksum, core_release.MANIFEST)]}
+    assert verify_core_manifest(core_tag, core_manifest, core_published, sha)['source_sha'] == sha
+    with TestCase().assertRaises(ValueError, msg='Core release without its checksum was accepted'):
+        verify_core_manifest(core_tag, core_manifest, {'assets': [{'name': core_asset}, {'name': core_release.MANIFEST}]}, sha)
     for value in ('0.0.1', '0.0.1-rc.1', '0.0.1-hourly.2026110712'):
         m = copy.deepcopy(manifest); p = copy.deepcopy(published)
         m.update(tag='v' + value, version=value, channel=release.version(value))
