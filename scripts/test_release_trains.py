@@ -6,8 +6,10 @@ import os
 from pathlib import Path
 import runpy
 import subprocess
+import sys
 import tempfile
 import unittest
+import zipfile
 from unittest.mock import patch
 
 import hourly
@@ -15,6 +17,48 @@ import release
 
 
 class ReleaseTrains(unittest.TestCase):
+    def test_portable_desktop_zip_accepts_epoch_runtime_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'application'
+            binary = source / 'runtime/vibeface-core'
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b'signed runtime bytes')
+            binary.chmod(0o755)
+            os.utime(binary, (0, 0))
+            output = root / 'desktop.zip'
+            result = subprocess.run([sys.executable, str(release.ROOT / 'scripts/zip-directory.py'),
+                                     str(source), str(output)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with zipfile.ZipFile(output) as archive:
+                self.assertEqual(archive.namelist(), ['runtime/vibeface-core'])
+                self.assertEqual(archive.read('runtime/vibeface-core'), b'signed runtime bytes')
+                info = archive.getinfo('runtime/vibeface-core')
+                self.assertEqual(info.date_time, (1980, 1, 1, 0, 0, 0))
+                self.assertEqual((info.external_attr >> 16) & 0o777, 0o755)
+            self.assertEqual(binary.stat().st_mtime, 0)
+            self.assertEqual(binary.read_bytes(), b'signed runtime bytes')
+
+    def test_desktop_zip_helper_is_a_desktop_build_input(self):
+        self.assert_changed_inputs('scripts/zip-directory.py', {'desktop'})
+
+    def test_coordinator_changes_do_not_rebuild_applications(self):
+        self.assert_changed_inputs('scripts/hourly.py', set())
+
+    def assert_changed_inputs(self, path, affected):
+        base = hourly.git('rev-parse', 'HEAD')
+        with tempfile.TemporaryDirectory() as temporary:
+            env = dict(os.environ, GIT_INDEX_FILE=str(Path(temporary) / 'index'))
+            hourly.git('read-tree', base, env=env)
+            oid = hourly.git('hash-object', '-w', '--stdin', data=hourly.blob(base, path) + b'\n# input fixture\n')
+            hourly.git('update-index', '--cacheinfo', '100644', oid, path, env=env)
+            tree = hourly.git('write-tree', env=env)
+            author = dict(os.environ, GIT_AUTHOR_NAME='release-fixture', GIT_COMMITTER_NAME='release-fixture',
+                          GIT_AUTHOR_EMAIL=hourly.BOT, GIT_COMMITTER_EMAIL=hourly.BOT)
+            changed = hourly.git('commit-tree', tree, '-p', base, '-m', 'Release input fixture', env=author)
+            for app in release.APPS:
+                self.assertEqual(hourly.input_digest(app, base) != hourly.input_digest(app, changed), app in affected, app)
+
     def test_npm_bootstrap_ignores_unrelated_release_channels(self):
         choose = runpy.run_path(str(release.ROOT / 'scripts/verify-node.py'))['_npm_cli_candidate']
         registry = {'versions': {'0.0.1-nightly.20261112.1': {}, '0.0.1-rc.1': {}}}
