@@ -1,0 +1,20 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "overused-font",
+        "value": "geist",
+        "createdAt": "2026-11-14T15:51:40.585Z",
+        "reason": "Agent: the existing website body font is unchanged from base 963e27b3; this layout refinement preserves the established typography."
+      },
+      {
+        "rule": "overused-font",
+        "value": "geist mono",
+        "createdAt": "2026-11-14T15:51:40.610Z",
+        "reason": "Agent: existing step-number and inner-page label typography is unchanged from base 963e27b3; this layout refinement preserves the established font stack."
+      }
+    ]
+  }
+}
