@@ -15,6 +15,8 @@ import core_release
 REPO = core_release.REPOSITORY
 BOT = core_release.BOT_EMAIL
 TAG_PATTERN = re.compile(r'core-v[0-9]+\.[0-9]+\.[0-9]+-hourly\.([0-9]{10})')
+REQUIRED_PATHS = ('.github/workflows/core-hourly.yml', '.github/workflows/release-core.yml',
+                  'scripts/core_hourly.py', 'scripts/core_release.py')
 
 
 def git(*args, root=None, env=None):
@@ -38,9 +40,10 @@ def green_main():
     green = {run['head_sha'] for run in runs if run['head_branch'] == 'main' and run['path'] == '.github/workflows/ci.yml'
              and run['repository']['full_name'] == REPO and run['head_repository']['full_name'] == REPO}
     for commit in git('rev-list', '--first-parent', '-n', '200', 'origin/main').splitlines():
-        if commit in green:
+        paths = set(git('ls-tree', '-r', '--name-only', commit, '--', *REQUIRED_PATHS).splitlines())
+        if commit in green and set(REQUIRED_PATHS) <= paths:
             return commit
-    raise ValueError('no main commit with successful push CI among the latest 200')
+    raise ValueError('no main commit with successful push CI and the Core train workflow among the latest 200')
 
 
 def tag_commit(tag):
@@ -108,6 +111,8 @@ def run_hourly(now):
 
 
 def self_test():
+    assert REQUIRED_PATHS == ('.github/workflows/core-hourly.yml', '.github/workflows/release-core.yml',
+                              'scripts/core_hourly.py', 'scripts/core_release.py')
     core_release.self_test()
     print('Core Hourly self-test passed')
 
