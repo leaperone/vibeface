@@ -5090,7 +5090,7 @@ def npm_service_acceptance(options):
             update = json.loads(command([binary, "update", "status", "--data-dir", node.directory]).stdout)
             require(update["distribution"] == "npm" and update["automatic"] is False,
                     "npm owns updates and disables the built-in updater")
-            rejected("install", "stop the node before installing the npm service")
+            rejected("install", "stop the node before installing its npm service")
             node.client.close(); node.stop(); stopped(); idle_guards()
             saved_files, saved_events = persistent()
             owned = True
@@ -5110,6 +5110,10 @@ def npm_service_acceptance(options):
             require(not any(path.exists() or path.is_symlink() for path in service_files)
                     and all(manager_absent(unit) for unit in units),
                     "first-release uninstall removes all fixture services")
+            files, events = persistent()
+            require(files == saved_files and all(events.get(key) == value for key, value in saved_events.items())
+                    and (node.directory / "blobs/sha256" / digest[:2] / digest).read_bytes() == attachment,
+                    "first-release uninstall retains identity, configuration, history and attachment")
             report["status"] = "passed"
             passed("first-release candidate service lifecycle and updater guards")
             return
