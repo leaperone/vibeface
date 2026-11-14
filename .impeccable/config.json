@@ -1,0 +1,26 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "overused-font",
+        "value": "geist",
+        "files": [
+          "apps/www/src/styles/app.css"
+        ],
+        "createdAt": "2026-11-14T15:57:16.778Z",
+        "reason": "Agent: the unchanged website body font is part of the established typography at base 963e27b3; preserve it during layout refinement."
+      },
+      {
+        "rule": "overused-font",
+        "value": "geist mono",
+        "files": [
+          "apps/www/src/styles/app.css"
+        ],
+        "createdAt": "2026-11-14T15:57:16.806Z",
+        "reason": "Agent: unchanged website step-number and inner-page label typography at base 963e27b3 is intentional; this exception is limited to the website stylesheet."
+      }
+    ]
+  }
+}
