@@ -19,6 +19,8 @@ pnpm run typecheck
 pnpm --filter @vibeface/client run test
 pnpm --filter @vibeface/client run typecheck
 pnpm run build
+# TanStack Start appends build-only types; keep the tracked tree in tsr format.
+pnpm run generate-routes
 [[ -s dist/client/_shell.html ]] || { echo 'SPA shell was not written to dist/client/_shell.html' >&2; exit 1; }
 cp generated/vibeface_secure.js generated/vibeface_secure_bg.wasm dist/client/
 [[ -s dist/client/vibeface_secure.js && -s dist/client/vibeface_secure_bg.wasm ]] || {
