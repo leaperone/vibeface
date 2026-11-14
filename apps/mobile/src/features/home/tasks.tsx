@@ -29,6 +29,7 @@ export function TasksScreen() {
   const [filter, setFilter] = useState<TaskGroup | 'all'>('all')
   const [botFilter, setBotFilter] = useState('all')
   const inbox = useInbox()
+  const failedIds = new Set(inbox.flatMap((item) => item.kind === 'failed' ? [item.work.work_id] : []))
   const workspace = useWorkspace()
   const { directory } = useDevice()
   useEffect(() => { if (!shared) return; shared.setView('tasks'); return () => shared.setView('other') }, [shared?.generation])
@@ -46,12 +47,13 @@ export function TasksScreen() {
   const taskCounts = { attention: businessTasks.filter((task) => taskStates.attention.includes(task.state)).length, working: businessTasks.filter((task) => taskStates.working.includes(task.state)).length, waiting: businessTasks.filter((task) => taskStates.waiting.includes(task.state)).length }
   const assignedWorkIds = new Set((shared?.workspaceState?.assignments ?? []).flatMap((assignment) => assignment.work_id && shared?.workspaceState?.tasks.some((task) => task.task_id === assignment.task_id) ? [assignment.work_id] : []))
   const chosenConversation = shared?.bots.find((bot) => bot.bot_id === botFilter)?.conversation_id
-  const known = activityView.activities.filter((activity) => {
+  const counted = activityView.activities.filter((activity) => {
     if (activity.kind === 'work' && activity.work && assignedWorkIds.has(activity.work.work_id)) return false
-    // A live question or check is acted on in 待处理 above; only the overview's own stay here.
-    if (activity.kind === 'attention' && !('kind' in activity.attention && (activity.attention.kind === 'question' || activity.attention.kind === 'check'))) return false
-    return botFilter === 'all' || activity.conversation_id === chosenConversation
+    if (botFilter === 'all' || activity.conversation_id === chosenConversation) return true
+    return activity.kind === 'attention' && 'kind' in activity.attention && activity.attention.kind === 'device' && activity.attention.works.some((work) => work.conversation_id === chosenConversation)
   })
+  // A failed work, live question or check is acted on in 待处理 above: counted here, shown only there.
+  const known = counted.filter((activity) => !(activity.kind === 'work' && activity.work && failedIds.has(activity.work.work_id) || activity.kind === 'attention' && !('kind' in activity.attention && (activity.attention.kind === 'question' || activity.attention.kind === 'check'))))
   const visible = known.filter((activity) => filter === 'all' || activity.group === filter)
   const workActivities = visible.filter((activity): activity is Extract<WorkspaceActivity, { kind: 'work' }> => activity.kind === 'work')
   const turns = visible.filter((activity): activity is Extract<WorkspaceActivity, { kind: 'turn' }> => activity.kind === 'turn')
@@ -68,7 +70,7 @@ export function TasksScreen() {
     return [activity.attention]
   })
 
-  const count = (group: TaskGroup) => read ? known.filter((item) => item.group === group).length + taskCounts[group] : null
+  const count = (group: TaskGroup) => read ? counted.filter((item) => item.group === group).length + taskCounts[group] : null
   return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-4 p-4 pb-10">
     <PendingSection />
     <MobileMasthead attention={count('attention')} working={count('working')} waiting={count('waiting')} filter={filter} onFilter={setFilter} />
@@ -86,7 +88,7 @@ export function TasksScreen() {
     </View> : workActivities.length ? taskGroups.map(({ group, title }) => groups[group].length ? <View key={group} className="gap-2">
       <Text role="heading" className="px-1 text-heading font-semibold">{title} <Text className="text-muted-foreground">{groups[group].length}</Text></Text>
       {groups[group].map((activity) => <TaskRow key={activity.id} work={activity.work!} projected={activity.projection} waiting={activity.facts.questions.length > 0} bot={shared?.bots.find((item) => item.conversation_id === activity.conversation_id)} lookup={lookup} connected={Boolean(shared?.connectionOnline && read)} progress={taskProgress(activity.work!, shared?.liveProgress ?? [])} />)}
-    </View> : null) : visible.some((item) => item.group === 'attention') || otherChecks.length || turns.length || inbox.length || businessTasks.some((task) => filter === 'all' || taskStates[filter].includes(task.state)) ? null : filter !== 'all' || botFilter !== 'all' ? <Text className="text-meta text-muted-foreground">没有符合筛选的执行工作。</Text> : <MobileEmpty bot={bot} read={read} />}
+    </View> : null) : counted.some((item) => item.group === 'attention' && (filter === 'all' || filter === 'attention')) || otherChecks.length || turns.length || businessTasks.some((task) => filter === 'all' || taskStates[filter].includes(task.state)) ? null : filter !== 'all' || botFilter !== 'all' ? <Text className="text-meta text-muted-foreground">没有符合筛选的执行工作。</Text> : <MobileEmpty bot={bot} read={read} />}
   </KeyboardAwareScrollView>
 }
 

@@ -3566,12 +3566,12 @@ test("task filters leave live confirmations and questions to 待处理 and keep 
   try {
     let elements = app.render("TasksOverview")
     assert.equal(elements.some(({ type }) => type === "PendingSection"), true)
-    assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 0, "live checks and questions count in 待处理, not again in the list")
+    assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 2, "live checks and questions act in 待处理 and still count")
     const selectBot = named(elements, "TaskFilters")?.props.onBotFilter
     assert.ok(typeof selectBot === "function")
     selectBot("a")
     elements = app.render("TasksOverview")
-    assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 0)
+    assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 1)
     assert.equal(nestedElements(elements, ["AttentionActivity"]).some(({ type }) => type === "ConfirmCard" || type === "QuestionCard"), false)
     assert.equal(named(elements, "WorkspaceEmpty"), undefined, "the task list does not claim emptiness under waiting items")
     inbox = []

@@ -270,7 +270,7 @@ test('creates a persistent Bot without a model and shows triage budget state', a
     await expect(screen.getByRole('heading', '报告用哪种格式交付？')).toHaveCount(1);
     await expect(screen.getByRole('button', '发送回答', { exact: true })).toHaveCount(1);
     await expect(screen.getByText('问题待确认', { exact: true })).toHaveCount(0);
-    await expect(screen.getByText('1 项任务', { exact: true })).toBeVisible();
+    await expect(screen.getByText('2 项任务', { exact: true })).toBeVisible();
     await expect(screen.getByRole('textbox', '你的回答')).toHaveCount(1);
     await app.screenshot('task-overview-single-question-and-turn');
     await browser.goto(`${node.url}/tasks`);
