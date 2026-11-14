@@ -333,11 +333,35 @@ def check_deployment(source, entries):
             and 'continue-on-error' not in step, 'every Core deployment must pass the rehearsal')
 
 
+def upload_names(source, app):
+    result = []
+    for block in source.split('actions/upload-artifact@')[1:]:
+        name = scalar(block.split('      - ', 1)[0], 'name', indent=10)
+        for expression in ('${{ inputs.app }}', '${{ needs.identity.outputs.app }}'):
+            name = name.replace(expression, app)
+        for expression in ('${{ inputs.source_sha }}', '${{ needs.identity.outputs.source_sha }}'):
+            name = name.replace(expression, '<source>')
+        result.append(name)
+    return result
+
+
+def check_artifact_names(entries, helpers):
+    for app, source in entries.items():
+        collected = set(upload_names(helpers['release-collect.yml'], app))
+        producers = upload_names(source, app)
+        for name, helper in helpers.items():
+            if name != 'release-collect.yml':
+                producers.extend(upload_names(helper, app))
+        require(not collected.intersection(producers),
+                app + ' producer and collector artifact names must be distinct')
+
+
 def check_all(entries, helpers, hourly, deployment, deployment_entries):
     require(set(entries) == set(ENTRIES), 'missing independent release entry')
     for app, source in entries.items():
         check_entry(app, source)
     check_helpers(helpers)
+    check_artifact_names(entries, helpers)
     check_hourly(hourly)
     check_deployment(deployment, deployment_entries)
 
@@ -353,6 +377,13 @@ def self_test(entries, helpers, hourly, deployment, deployment_entries):
             checked += 1
         else:
             raise AssertionError('unsafe release workflow was accepted')
+
+    colliding = entries['app'].replace('name: app-static-', 'name: app-release-', 1)
+    require(colliding != entries['app'], 'App artifact collision mutation did not reach its producer')
+    rejects(lambda: check_all(entries | {'app': colliding}, helpers, hourly, deployment, deployment_entries))
+    colliding = helpers['release-collect.yml'].replace('name: ${{ inputs.app }}-release-', 'name: app-static-', 1)
+    require(colliding != helpers['release-collect.yml'], 'artifact collision mutation did not reach the collector')
+    rejects(lambda: check_all(entries, helpers | {'release-collect.yml': colliding}, hourly, deployment, deployment_entries))
 
     for app, source in entries.items():
         first = ('compose-macos' if app == 'cli' else 'native-macos' if app == 'core'
