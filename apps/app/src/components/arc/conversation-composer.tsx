@@ -12,7 +12,7 @@ export function PromptInput({ id, value, hint, reason, disabled, onChange, onSub
   id?: string; value: string; hint: string; reason: string; disabled: boolean
   onChange(value: string): void; onSubmit(): void; onStop?: () => void
   files?: File[]; onFiles?: (files: File[]) => void; above?: ReactNode; target?: ReactNode
-  sendLabel?: string; label?: string; tint?: { fill: string; ink: string }; children?: ReactNode
+  sendLabel?: string; label?: string; children?: ReactNode
 }) {
   const form = useRef<HTMLFormElement>(null)
   const picker = useRef<HTMLInputElement>(null)

@@ -54,8 +54,8 @@ const transformOf = (frame: Frame) => `translate(${50 + frame.dx} ${50 + frame.d
 /** Who a face belongs to: its id gives what `avatar` leaves out. */
 type FaceBot = Pick<BotRecord, "bot_id" | "avatar">
 
-/** A bot's face, picked by its id and avatar and moving with its mood. Hidden from screen readers: the name next to it says who, and lists say the mood. `halo`: a still glow in the bot's tint behind the face, 1.8 times its size. `still` draws one frame and leaves the clock, for previews. */
-export function BotFace({ bot, mood, size, halo, still, className }: { bot: FaceBot; mood: Mood; size: number; halo?: string; still?: boolean; className?: string }) {
+/** A bot's identity artwork follows its mood. `still` draws one frame for previews. */
+export function BotFace({ bot, mood, size, still, className }: { bot: FaceBot; mood: Mood; size: number; still?: boolean; className?: string }) {
   const dark = useDark()
   const reduced = useSyncExternalStore(followReduced, () => reducedQuery?.matches ?? false, () => false)
   const { bot_id: botId, avatar } = bot
@@ -92,12 +92,7 @@ export function BotFace({ bot, mood, size, halo, still, className }: { bot: Face
         <stop offset={0.55} stopColor={palette[key].base} />
         <stop offset={1} stopColor={palette[key].bottom} />
       </radialGradient>)}
-      {halo ? <radialGradient id={`${gradient}halo`}>
-        <stop offset={0.5} stopColor={halo} stopOpacity={dark ? 0.18 : 0.14} />
-        <stop offset={1} stopColor={halo} stopOpacity={0} />
-      </radialGradient> : null}
     </defs>
-    {halo ? <rect x={-40} y={-40} width={180} height={180} fill={`url(#${gradient}halo)`} /> : null}
     <g transform={transformOf(first)}>
       <path data-ring="" d={first.ring} opacity={first.ringOpacity} fill="none" stroke={palette.awake.ring} strokeWidth={HALO.width} />
       <path data-body="" d={first.body} fill={`url(#${gradient}awake)`} />

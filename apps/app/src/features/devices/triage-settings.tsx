@@ -80,11 +80,11 @@ export function TriageSettings() {
       <p className="text-sm text-secondary">{waitingCopy.forwardHint}</p>
     </div>
 
-    <Input label={["地址","·",waitingCopy.urlHint].join(" ")} id="webhook-url" type="url" className="font-mono" placeholder="https://" value={url} onChange={(event) => setUrl(event.target.value)} />
+    <Input label={`地址 · ${waitingCopy.urlHint}`} id="webhook-url" type="url" className="font-mono" placeholder="https://" value={url} onChange={(event) => setUrl(event.target.value)} />
 
     {confirming === "secret" ? <p className="text-sm text-foreground">清除后提醒发不出去</p> : null}
     <div className="flex min-w-0 gap-2">
-      <Input label={["密钥","·",waitingCopy.secretHint].join(" ")} id="webhook-secret" type="password" autoComplete="new-password" minLength={16} maxLength={512} className="min-w-0" placeholder={settings.webhook_secret_set ? "已设置" : "至少 16 个字符"} value={secret} onChange={(event) => setSecret(event.target.value)} />
+      <Input label={`密钥 · ${waitingCopy.secretHint}`} id="webhook-secret" type="password" autoComplete="new-password" minLength={16} maxLength={512} className="min-w-0" placeholder={settings.webhook_secret_set ? "已设置" : "至少 16 个字符"} value={secret} onChange={(event) => setSecret(event.target.value)} />
       {!settings.webhook_secret_set ? null : confirming === "secret" ? <>
         <Button type="button" size="sm" variant="ghost" autoFocus onClick={() => setConfirming("")}>取消</Button>
         <Button type="button" size="sm" variant="danger" disabled={Boolean(busy)} onClick={() => { setConfirming(""); void save("webhook", {}, { webhook_secret: null }) }}>清除</Button>
@@ -123,11 +123,11 @@ export function TriageSettings() {
     <SettingsDisclosure icon={FolderTree} label="按文件夹另设" value={config.projects.length || undefined} open={config.projects.length > 0}>
       {config.projects.length ? <ul className="grid gap-1">{config.projects.map((project) => <li key={project.prefix} className="flex min-h-9 min-w-0 items-center gap-2 rounded-control bg-surface-muted/60 ps-3">
         <span className="min-w-0 flex-1 truncate font-mono text-sm" title={project.prefix}>{project.prefix.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || project.prefix}</span>
-        <Select label={`${project.prefix} 的去向`} disabled={Boolean(busy)} value={"arc:" + String(project.outlet)} onValueChange={selected => { const value = selected.slice(4);  void save("projects", { projects: config.projects.map((item) => item.prefix === project.prefix ? { ...item, outlet: value as Outlet } : item) })  }} options={[outlets.map(([value, text]) => ({ value: "arc:" + String(value), label: [text].join("") }))].flat().filter(option => option !== null && option !== undefined)} />
+        <Select label={`${project.prefix} 的去向`} disabled={Boolean(busy)} value={"arc:" + project.outlet} onValueChange={selected => { const value = selected.slice(4);  void save("projects", { projects: config.projects.map((item) => item.prefix === project.prefix ? { ...item, outlet: value as Outlet } : item) })  }} options={outlets.map(([value, text]) => ({ value: "arc:" + value, label: text }))} />
         <Button type="button" variant="ghost" size="md" aria-label={`移除 ${project.prefix}`} title="移除" disabled={Boolean(busy)} onClick={() => void save("projects", { projects: config.projects.filter((item) => item.prefix !== project.prefix) })}><X aria-hidden="true" /></Button>
       </li>)}</ul> : null}
       <div className="flex min-w-0 gap-2">
-        <Input label={"文件夹路径"} aria-label="文件夹路径" className="min-w-0 font-mono" placeholder="~/projects" value={prefix} disabled={Boolean(busy)} onChange={(event) => setPrefix(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addProject() } }} />
+        <Input label="文件夹路径" aria-label="文件夹路径" className="min-w-0 font-mono" placeholder="~/projects" value={prefix} disabled={Boolean(busy)} onChange={(event) => setPrefix(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addProject() } }} />
         <Button type="button" variant="secondary" disabled={Boolean(busy) || !prefix.trim()} onClick={addProject}><Plus aria-hidden="true" />添加</Button>
       </div>
     </SettingsDisclosure>
@@ -159,7 +159,7 @@ export function TriageSettings() {
           </> : <Button type="button" variant="ghost" size="md" aria-label={`撤销 ${item.label || "授权码"}`} title="撤销" disabled={Boolean(busy)} onClick={() => setConfirming(item.token_id)}><Trash2 aria-hidden="true" /></Button>}
         </li>)}</ul> : null}
         <div className="flex min-w-0 gap-2">
-          <Input label={"授权码名称"} aria-label="授权码名称" className="min-w-0" placeholder={chat} maxLength={64} value={label} disabled={Boolean(busy)} onChange={(event) => setLabel(event.target.value)} />
+          <Input label="授权码名称" aria-label="授权码名称" className="min-w-0" placeholder={chat} maxLength={64} value={label} disabled={Boolean(busy)} onChange={(event) => setLabel(event.target.value)} />
           <Button type="button" variant="secondary" disabled={Boolean(busy)} onClick={() => void call("token", "create_decision_token", { label: label.trim() || chat }).then((result) => {
             const value = (result as { token?: unknown } | null)?.token
             if (typeof value === "string") { setToken(value); setLabel("") }

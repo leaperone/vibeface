@@ -53,7 +53,7 @@ export function Onboarding() {
       </div>
     </Panel> : <Panel key="bot" icon={MessageSquarePlus} title="创建第一个 Bot">
       <form className="grid gap-4" noValidate onSubmit={(event) => { event.preventDefault(); if (name.trim()) void create(); else setError(new Error("还没填名称")) }}>
-        <div className="grid gap-1.5 text-sm font-medium"><Input label={"名称"} required maxLength={512} value={name} disabled={busy} onChange={(event) => setName(event.target.value)} /></div>
+        <div className="grid gap-1.5 text-sm font-medium"><Input label="名称" required maxLength={512} value={name} disabled={busy} onChange={(event) => setName(event.target.value)} /></div>
         {project && shown ? <p className="flex min-w-0 items-center gap-1.5 text-sm text-secondary"><FolderOpen aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{folderLabels.project}</span><FolderPath path={project.cwd} shown={shown[project.cwd]} /></p> : null}
         <InlineError error={error} />
         <div className="flex justify-between gap-2 border-t pt-4">

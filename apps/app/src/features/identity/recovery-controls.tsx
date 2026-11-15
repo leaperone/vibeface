@@ -323,13 +323,13 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         })
       }}><fieldset disabled={busy || !!device.review} className="grid gap-4">
         <div className="grid gap-1.5 text-sm font-medium">恢复文件<FilePicker name="bundle" accept="application/json,.json" required /></div>
-        <div ><PasswordInput label={"恢复密码"} name="password" autoComplete="off" required /></div>
-        <div ><Input label={"这个浏览器叫什么？"} name="name" required maxLength={128} defaultValue={defaultBrowserName()} /></div>
+        <div ><PasswordInput label="恢复密码" name="password" autoComplete="off" required /></div>
+        <div ><Input label="这个浏览器叫什么？" name="name" required maxLength={128} defaultValue={defaultBrowserName()} /></div>
         {/* With no address yet, opening this computer's own page fills it in; typing it is the fallback. */}
         {target ? null : <p className="flex items-center gap-2 text-sm text-secondary"><Laptop aria-hidden="true" className="size-4 shrink-0" />打开要连的节点的本机页面再找回</p>}
         <Details label={target ? recoveryCopy.connectTo : recoveryCopy.manual}>
-          <div ><Input label={"访问地址"} type="url" name="address" required defaultValue={target ? entryAddress(target) : ''} /></div>
-          <div ><Input label={"设备编号"} className="font-mono" name="device_id" required pattern="[a-f0-9]{64}" defaultValue={target?.device_id || ''} autoComplete="off" spellCheck={false} /></div>
+          <div ><Input label="访问地址" type="url" name="address" required defaultValue={target ? entryAddress(target) : ''} /></div>
+          <div ><Input label="设备编号" className="font-mono" name="device_id" required pattern="[a-f0-9]{64}" defaultValue={target?.device_id || ''} autoComplete="off" spellCheck={false} /></div>
         </Details>
         <InlineError error={error || null} />
         <div className="flex flex-wrap justify-end gap-2"><Button type="submit" aria-busy={busy || undefined}><BusyIcon busy={busy} />下一步</Button></div>
@@ -350,9 +350,9 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         }, recoveryCopy.replaced)
       }}><fieldset disabled={busy || !!device.review} className="grid gap-4">
         <div className="grid gap-1.5 text-sm font-medium">恢复文件<FilePicker name="bundle" accept="application/json,.json" required /></div>
-        <div ><PasswordInput label={"旧密码"} name="old_password" autoComplete="off" required /></div>
+        <div ><PasswordInput label="旧密码" name="old_password" autoComplete="off" required /></div>
         <div className="grid gap-1.5">
-          <div ><PasswordInput label={"新密码"} name="password" autoComplete="new-password" required aria-describedby="new-password-strength" onChange={(event) => setPassword(event.target.value)} /></div>
+          <div ><PasswordInput label="新密码" name="password" autoComplete="new-password" required aria-describedby="new-password-strength" onChange={(event) => setPassword(event.target.value)} /></div>
           <PasswordStrength id="new-password-strength" password={password} tried={tried} />
         </div>
         <InlineError error={error || null} />

@@ -69,7 +69,7 @@ function OverwrittenNote({ item, change, conversationId }: { item: Overwritten; 
       <TriangleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
       {overwriteCopy.line(item, bot?.name ?? '这个 Bot', nodeName(item.by, { nodes: workspace.nodes, directory }))}
     </p>
-    {bot && request ? <ActionButton variant="ghost" className="" action={restore}><Undo2 aria-hidden="true" />{overwriteCopy.restore}</ActionButton> : null}
+    {bot && request ? <ActionButton variant="ghost" action={restore}><Undo2 aria-hidden="true" />{overwriteCopy.restore}</ActionButton> : null}
   </div>
 }
 

@@ -94,7 +94,7 @@ export function ContextPanel({ bot, data, nodes, connected, onBack, memory }: Co
     </SettingsGroup>
 
     <SettingsGroup title="共享上下文">
-      <div className="grid gap-2 px-4 pt-3 text-sm"><Input label={["搜索这个 Bot 已加载的历史","范围为",bot.name,"当前已加载的",data.messages.length,"条主聊天消息。"].join(" ")} type="search" value={historyQuery} onChange={(event) => setHistoryQuery(event.currentTarget.value)} placeholder="输入关键词" /><span className="text-secondary">范围为 {bot.name} 当前已加载的 {data.messages.length} 条主聊天消息。</span></div>
+      <div className="grid gap-2 px-4 pt-3 text-sm"><Input label={`搜索这个 Bot 已加载的历史 范围为 ${bot.name} 当前已加载的 ${data.messages.length} 条主聊天消息。`} type="search" value={historyQuery} onChange={(event) => setHistoryQuery(event.currentTarget.value)} placeholder="输入关键词" /><span className="text-secondary">范围为 {bot.name} 当前已加载的 {data.messages.length} 条主聊天消息。</span></div>
       <SettingsRow icon={MessageCircle} label="消息摘要" description="共享聊天事实" children={<span>{data.messages.length} 条</span>} />
       {messages.length ? <Details label="查看最近消息">
         <ul className="grid gap-3">
@@ -261,7 +261,7 @@ export function MemorySummary({ settings, context, memory }: { settings: BotSett
     <p className="text-sm text-secondary">待提交和提交冲突来自负责设备最近的观察。Bot 待提交记忆只在本轮成功后保存。由你维护的记忆始终受保护。省略的记忆仍可按需读取。</p>
     <Button type="button" variant="secondary" className="justify-self-start" disabled={!memory?.writable || busy !== null || draft !== null} onClick={() => start()}>新增记忆</Button>
     {draft ? <div className="grid gap-3 rounded-panel border p-3">
-      <div className="grid gap-2"><Textarea label={"记忆内容"} aria-label="记忆内容" rows={3} value={draft.text} disabled={busy !== null} onChange={(event) => setDraft({ ...draft, text: event.target.value })} /></div>
+      <div className="grid gap-2"><Textarea label="记忆内容" aria-label="记忆内容" rows={3} value={draft.text} disabled={busy !== null} onChange={(event) => setDraft({ ...draft, text: event.target.value })} /></div>
       <p className="text-sm text-secondary">最多 500 个字符。保存后由你维护，Bot 不会自动覆盖或恢复已删除的记忆。</p>
       {draft.result && !memorySaved(draft.result) ? <div className="grid gap-2 text-sm" role="status"><p>{draft.result.current?.text ?? '当前记忆已删除或这台设备尚无记录。'}</p><Button type="button" variant="secondary" className="justify-self-start" disabled={busy !== null} onClick={() => { setDraft({ ...draft, base: memoryBase(draft.result?.current?.metadata ?? null), result: null }); setConfirmDelete(false); clear(); setNotice("") }}>按当前版本继续编辑</Button></div> : null}
       <div className="flex flex-wrap gap-2">

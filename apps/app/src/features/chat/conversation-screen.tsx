@@ -283,7 +283,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
               : <p className="flex items-center gap-1.5 text-sm text-secondary"><Crown aria-hidden="true" className="size-4 shrink-0" />{setUpOnManager((directory?.members ?? []).filter((member) => member.manage).map((member) => member.name))}</p>}
           </>
             : <div className="flex flex-wrap justify-center gap-2">
-              {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} type="button" variant="secondary" className="" onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
+              {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} type="button" variant="secondary" onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
             </div>}
         </div> : workspace.synced ? <NoBot /> : null}
       />
@@ -319,7 +319,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
         }}
       >
         <InlineError error={sendError} className="basis-full" />
-        {inputTarget.kind === 'routine' ? <p className="flex basis-full items-center gap-2"><span className="min-w-0 flex-1 truncate">{targetBusy ? '补充给' : '发送给'} · 例行任务 · {scheduleName(inputTarget.trigger, data?.bot_settings, changes)}</span><Button type="button" variant="ghost" size="sm" className="" onClick={() => setSelectedTarget('main')}>改回主聊天</Button></p> : null}
+        {inputTarget.kind === 'routine' ? <p className="flex basis-full items-center gap-2"><span className="min-w-0 flex-1 truncate">{targetBusy ? '补充给' : '发送给'} · 例行任务 · {scheduleName(inputTarget.trigger, data?.bot_settings, changes)}</span><Button type="button" variant="ghost" size="sm" onClick={() => setSelectedTarget('main')}>改回主聊天</Button></p> : null}
         <InputQueue target={inputTarget} />
         {needsSetup && !starting && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot?.bot_id }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
       </PromptInput> : null}
@@ -380,8 +380,7 @@ function TaskHistory({ tasks, botId, name }: { tasks: TaskRow[]; botId: string; 
   return <>
     <PageActions><Button type="button" variant="ghost" size="sm" aria-label={`任务${count ? ` · ${count}` : ''}`} onClick={() => { leaving.current = false; setOpen(true) }}><ListChecks aria-hidden="true" /><span>任务</span>{count ? <span className="text-sm text-secondary max-sm:sr-only">{count}</span> : null}{count ? <span className="text-sm sm:hidden">{working + attention}</span> : null}</Button></PageActions>
     <Drawer open={open} onOpenChange={setOpen}>
-      <DrawerContent title={"任务记录"} description={[name,"的任务"].join("")} className="!w-full min-w-0 gap-0 sm:!max-w-md" onCloseAutoFocus={(event) => { if (leaving.current) event.preventDefault() }}>
-        <div className="shrink-0 pe-14"></div>
+      <DrawerContent title="任务记录" description={`${name}的任务`} className="!w-full min-w-0 gap-0 sm:!max-w-md" onCloseAutoFocus={(event) => { if (leaving.current) event.preventDefault() }}>
         <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-6">
           {!workspace.connectionOnline || workspace.incomplete ? <p role="status" className="pb-3 text-sm text-secondary">{!workspace.connectionOnline ? '暂时收不到最新任务状态，显示最近记录。' : '任务记录正在同步，显示已读取的部分。'}</p> : null}
           {!workspace.data ? <p role="status" className="py-6 text-sm text-secondary">正在读取任务记录</p> : tasks.length ? <ul className="divide-y">{tasks.map((task) => {

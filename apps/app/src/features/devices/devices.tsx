@@ -91,7 +91,7 @@ export function DevicesPage({ joins = true }: { joins?: boolean }) {
           <h2 className="text-lg font-medium [overflow-wrap:anywhere]">{connected.name}</h2>
           <div className="flex flex-wrap items-center gap-2"><Tag>{entryLabel}</Tag>{connected.online !== undefined ? <Online online={connected.online} /> : null}</div>
         </div>
-        <RoutedAction variant="ghost" className="" to="/devices/$deviceId" params={{ deviceId: connected.id }} title="详细设置"><span className="max-sm:sr-only">详细设置</span><ChevronRight aria-hidden="true" /></RoutedAction>
+        <RoutedAction variant="ghost" to="/devices/$deviceId" params={{ deviceId: connected.id }} title="详细设置"><span className="max-sm:sr-only">详细设置</span><ChevronRight aria-hidden="true" /></RoutedAction>
       </header>
       {canEdit ? <AiSettings key={connected.id} compact targetName={local ? undefined : connected.name} /> : <p className="px-1 text-sm text-secondary">{editOnManager(rows.filter((row) => row.admin).map((row) => row.name))}</p>}
     </section> : null}
@@ -170,7 +170,7 @@ function DeviceTitle({ row, editable }: { row: DeviceRow; editable: boolean }) {
   }
   return <form className="grid gap-1" onSubmit={(event) => { event.preventDefault(); save() }}>
     <div className="flex min-w-0 items-center gap-1">
-      <Input label={"设备名称"} aria-label="设备名称" autoFocus required maxLength={128} className="min-w-0" value={draft} disabled={action.busy !== null}
+      <Input label="设备名称" aria-label="设备名称" autoFocus required maxLength={128} className="min-w-0" value={draft} disabled={action.busy !== null}
         onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Escape") close() }} />
       <Button type="submit" variant="ghost" size="md" aria-label="保存" title="保存" disabled={action.busy !== null || !draft.trim()}><BusyIcon busy={action.busy === "rename"} icon={Check} /></Button>
       <Button type="button" variant="ghost" size="md" aria-label="取消" title="取消" disabled={action.busy !== null} onClick={close}><X aria-hidden="true" /></Button>

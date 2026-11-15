@@ -63,7 +63,7 @@ PATH_RULES = (
     ("control", ("crates/control/*",)),
     ("cli", ("apps/cli/*",)),
 )
-WWW_PATHS = ("apps/www/*", "packages/docs/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
+WWW_PATHS = ("apps/www/*", "packages/docs/*", "packages/theme/*", "packages/uiarc/src/foundation.css", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
 MOBILE_PATHS = ("packages/client/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
 DESKTOP_PATHS = ("package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
 SLOW_TESTS = (

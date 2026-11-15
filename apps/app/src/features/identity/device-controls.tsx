@@ -37,7 +37,7 @@ export function GatewayForm() {
       event.preventDefault()
       choose((event.currentTarget.elements.namedItem('gateway') as HTMLInputElement).value.trim())
     }}>
-      <Input label={"接入地址"} type="url" name="gateway" aria-label="接入地址" defaultValue={device.gateway} onChange={() => setSaved(false)} autoComplete="off" spellCheck={false} />
+      <Input label="接入地址" type="url" name="gateway" aria-label="接入地址" defaultValue={device.gateway} onChange={() => setSaved(false)} autoComplete="off" spellCheck={false} />
       <div className="flex flex-wrap gap-2">
         <Button type="submit" variant="secondary" className="w-fit">{saved ? <Check aria-hidden="true" className="text-success" /> : null}<span role={saved ? 'status' : undefined}>{saved ? '已保存' : '保存'}</span></Button>
         {device.gateway !== device.defaultGateway ? <Button type="button" variant="ghost" className="w-fit" onClick={() => choose(null)}><RotateCcw aria-hidden="true" />恢复默认</Button> : null}
@@ -75,8 +75,8 @@ export function ConnectionSettings() {
         const field = (name: string) => (form.elements.namedItem(name) as HTMLInputElement).value.trim()
         try { device.saveEntry(parseEntry({ address: field('address'), device_id: field('device_id') })); form.reset(); setError(null) } catch (cause) { setError(cause) }
       }}>
-        <Input label={"访问地址"} type="url" name="address" aria-label="访问地址" placeholder="https://" />
-        <Input label={"设备编号"} className="font-mono" name="device_id" aria-label="设备编号" placeholder="设备编号" autoComplete="off" autoCapitalize="none" spellCheck={false} />
+        <Input label="访问地址" type="url" name="address" aria-label="访问地址" placeholder="https://" />
+        <Input label="设备编号" className="font-mono" name="device_id" aria-label="设备编号" placeholder="设备编号" autoComplete="off" autoCapitalize="none" spellCheck={false} />
         <Button type="submit" variant="secondary" className="w-fit">保存</Button>
       </form>
     </Details>

@@ -325,7 +325,7 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
           <h3 className="text-lg font-medium">AI 服务</h3>
           <p className="text-sm text-secondary [overflow-wrap:anywhere]">{targetName ? `在「${targetName}」上检测 Codex、Claude Code 和 Cursor` : "检测这台电脑的 Codex、Claude Code 和 Cursor"}</p>
         </div>
-        <Button type="button" variant={compact ? "primary" : "secondary"} className="" disabled={busy !== "" || needsRead} aria-busy={busy === "connect_local" || undefined} onClick={() => void connectLocal()}><BusyIcon busy={busy === "connect_local"} icon={PlugZap} />自动接入</Button>
+        <Button type="button" variant={compact ? "primary" : "secondary"} disabled={busy !== "" || needsRead} aria-busy={busy === "connect_local" || undefined} onClick={() => void connectLocal()}><BusyIcon busy={busy === "connect_local"} icon={PlugZap} />自动接入</Button>
       </div>
       <p role="status" aria-live="polite" aria-atomic="true" className="text-sm text-secondary">{busy === "connect_local" ? "正在检测并补齐设置" : localResult || "保留已保存的设置和用途"}</p>
       {error?.at === null ? <InlineError error={error.cause} action={needsRead ? { label: "重新读取", onClick: () => void load() } : undefined} /> : null}
@@ -404,7 +404,7 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
   const binForm = <form className="grid gap-1" onSubmit={(event) => { event.preventDefault(); void change("bin", { bin: bin.trim() }) }}>
 
       <div className="flex min-w-0 gap-2">
-        <PathInput label={"程序"} id={`${item.provider}-bin`} saved={item.bin} display={display} placeholder={item.bin.split(/[\\/]/).pop()} value={bin} disabled={working}
+        <PathInput label="程序" id={`${item.provider}-bin`} saved={item.bin} display={display} placeholder={item.bin.split(/[\\/]/).pop()} value={bin} disabled={working}
           data-fix={issue?.code === "bin_missing" ? "" : undefined} onChange={(event) => setBin(event.target.value)} />
         {bin.trim() !== item.bin ? <Button type="submit" variant="secondary" disabled={working}><BusyIcon busy={busy === `${item.provider}:bin`} />保存</Button> : null}
       </div>
@@ -424,7 +424,7 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
     {manager && item.probe.catalog.state === "available" && item.probe.catalog.coverage === "partial" ? <p>模型列表可能不完整，可手填其他模型。</p> : null}
     {manager && item.probe.catalog.state === "unavailable" ? <p>模型列表暂不可用，可继续手填。已保存的模型保持不变。</p> : null}
   </Details>
-  const checkButton = <Button type="button" variant="ghost" size="sm" className="" aria-label={compact ? `${name} 检查可用性` : undefined} disabled={busy !== ""} onClick={() => void probe()}>
+  const checkButton = <Button type="button" variant="ghost" size="sm" aria-label={compact ? `${name} 检查可用性` : undefined} disabled={busy !== ""} onClick={() => void probe()}>
     <BusyIcon busy={busy === `${item.provider}:probe`} icon={RotateCw} />{compact ? "检查" : "检查可用性"}
   </Button>
 
@@ -550,9 +550,9 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
             event.preventDefault()
             void setVariable("add", addName, newValue).then((ok) => { if (ok) { setNewName(""); setNewValue("") } })
           }}>
-            <Input label={"变量名"} aria-label="变量名" className="min-w-0 font-mono" placeholder="变量名" autoCapitalize="characters" spellCheck={false} maxLength={256} value={newName} disabled={working} onChange={(event) => setNewName(event.target.value)} />
+            <Input label="变量名" aria-label="变量名" className="min-w-0 font-mono" placeholder="变量名" autoCapitalize="characters" spellCheck={false} maxLength={256} value={newName} disabled={working} onChange={(event) => setNewName(event.target.value)} />
             <div className="flex min-w-0 gap-2 sm:contents">
-              <Input label={"值"} type="password" autoComplete="off" aria-label="值" className="min-w-0" placeholder="值" maxLength={4096} value={newValue} disabled={working} onChange={(event) => setNewValue(event.target.value)} />
+              <Input label="值" type="password" autoComplete="off" aria-label="值" className="min-w-0" placeholder="值" maxLength={4096} value={newValue} disabled={working} onChange={(event) => setNewValue(event.target.value)} />
               <Button type="submit" variant="secondary" disabled={working || !addName || !newValue || !canSetProviderEnvironment(item.provider, addName)}><BusyIcon busy={busy === `${item.provider}:add`} icon={Plus} />添加</Button>
             </div>
           </form>
@@ -582,7 +582,7 @@ function KeyField({ name, working, busy, more, save }: { name: string; working: 
   }}>
 
     <div className="flex min-w-0 gap-2">
-      <Input label={["缺少",label,more > 0 ? `，还有 ${more} 项` : ""].join(" ")} id={`key-${name}`} type="password" autoComplete="new-password" data-1p-ignore="" spellCheck={false} className="min-w-0" placeholder={`粘贴 ${label}`} maxLength={4096}
+      <Input label={`缺少 ${label} ${more > 0 ? `，还有 ${more} 项` : ""}`} id={`key-${name}`} type="password" autoComplete="new-password" data-1p-ignore="" spellCheck={false} className="min-w-0" placeholder={`粘贴 ${label}`} maxLength={4096}
         value={value} disabled={working} onChange={(event) => setValue(event.target.value)} />
       <Button type="submit" variant="secondary" disabled={working || !value}><BusyIcon busy={busy} />保存</Button>
     </div>
@@ -623,12 +623,12 @@ function BotDetails({ fields, manager, models = null, display, working, busy, sa
     void save({ ...manager, ...Object.fromEntries(fields.map((key) => [key, draft[key].trim()])),
       ...(fields.includes("model") ? { reasoning_effort: reasoningEffort, backup: { ...draft.backup, candidates: draft.backup.candidates.map((candidate) => ({ ...candidate, model: candidate.model.trim() })) } } : {}) })
   }}>
-    {fields.includes("model") ? models && !typing ? <div className="grid gap-1 text-sm"><Select label={copy.label} className="w-full" name="model" disabled={working} value={"arc:" + String(draft.model)} onValueChange={selected => { const value = selected.slice(4);  const model = value; if (model === other) { setTyping(true); setDraft({ ...draft, model: "" }) } else setDraft({ ...draft, model })  }} options={[({ value: "arc:" + String(""), label: [copy.default].join("") }),models.map((model) => ({ value: "arc:" + String(model.id), label: [model.name].join("") })),({ value: "arc:" + String(other), label: [copy.other].join("") })].flat().filter(option => option !== null && option !== undefined)} /></div> : <div className="flex min-w-0 items-end gap-2">
+    {fields.includes("model") ? models && !typing ? <div className="grid gap-1 text-sm"><Select label={copy.label} className="w-full" name="model" disabled={working} value={"arc:" + draft.model} onValueChange={selected => { const value = selected.slice(4);  const model = value; if (model === other) { setTyping(true); setDraft({ ...draft, model: "" }) } else setDraft({ ...draft, model })  }} options={[{ value: "arc:", label: copy.default }, ...models.map((model) => ({ value: "arc:" + model.id, label: model.name })), { value: "arc:" + other, label: copy.other }]} /></div> : <div className="flex min-w-0 items-end gap-2">
       <div className="min-w-0 flex-1">{field("model", copy.label, { placeholder: cursor ? "auto" : copy.default, required: cursor, plain: true })}</div>
       {models ? <Button type="button" variant="ghost" size="md" aria-label={copy.pick} title={copy.pick} disabled={working}
         onClick={() => { setTyping(false); setDraft({ ...draft, model: models.some((model) => model.id === draft.model) ? draft.model : "" }) }}><List aria-hidden="true" /></Button> : null}
     </div> : null}
-    {fields.includes("model") ? efforts.length ? <div className="grid gap-1 text-sm"><Select label={["推理强度","用于下一回合，模型是否支持以 AI 服务的检查结果为准。"].join(" ")} disabled={working} value={"arc:" + String(reasoningEffort ?? "")} onValueChange={selected => { const value = selected.slice(4);  setDraft({ ...draft, reasoning_effort: value || null })  }} options={[({ value: "arc:" + String(""), label: ["由 AI 服务决定"].join("") }),reasoningEffort && !efforts.includes(reasoningEffort) ? ({ value: "arc:" + String(reasoningEffort), label: [reasoningEffort].join("") }) : null,efforts.map((effort) => ({ value: "arc:" + String(effort), label: [effort].join("") }))].flat().filter(option => option !== null && option !== undefined)} /><span className="text-secondary">用于下一回合，模型是否支持以 AI 服务的检查结果为准。</span></div> : <p className="text-sm text-secondary">推理强度由 AI 服务决定</p> : null}
+    {fields.includes("model") ? efforts.length ? <div className="grid gap-1 text-sm"><Select label="推理强度" description="用于下一回合，模型是否支持以 AI 服务的检查结果为准。" disabled={working} value={"arc:" + (reasoningEffort ?? "")} onValueChange={selected => { const value = selected.slice(4);  setDraft({ ...draft, reasoning_effort: value || null })  }} options={[{ value: "arc:", label: "由 AI 服务决定" }, ...(reasoningEffort && !efforts.includes(reasoningEffort) ? [{ value: "arc:" + reasoningEffort, label: reasoningEffort }] : []), ...efforts.map((effort) => ({ value: "arc:" + effort, label: effort }))]} /></div> : <p className="text-sm text-secondary">推理强度由 AI 服务决定</p> : null}
     {fields.includes("model") ? <Details label="备用策略"><BackupPolicyEditor policy={draft.backup} disabled={working} change={(backup) => setDraft({ ...draft, backup })} /></Details> : null}
     {fields.includes("workspace") ? field("workspace", folderLabels.botRun) : null}
     {dirty ? <Button type="submit" variant="secondary" className="w-fit" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
@@ -642,7 +642,7 @@ function ExecutionDetails({ model, models, working, busy, save }: { model: strin
   const typing = chosen ?? modelTyped(model, models)
   const dirty = draft.trim() !== model
   return <form className="grid gap-2" onSubmit={(event) => { event.preventDefault(); void save(draft.trim()) }}>
-    {models && !typing ? <div className="grid gap-1 text-sm"><Select label={deviceCopy.executionModel.label} className="w-full" name="execution_model" disabled={working} value={"arc:" + String(draft)} onValueChange={selected => { const value = selected.slice(4);  if (value === other) { setTyping(true); setDraft("") } else setDraft(value)  }} options={[({ value: "arc:" + String(""), label: [deviceCopy.executionModel.default].join("") }),models.map((choice) => ({ value: "arc:" + String(choice.id), label: [choice.name].join("") })),({ value: "arc:" + String(other), label: [deviceCopy.executionModel.other].join("") })].flat().filter(option => option !== null && option !== undefined)} /></div> : <div className="flex min-w-0 items-end gap-2">
+    {models && !typing ? <div className="grid gap-1 text-sm"><Select label={deviceCopy.executionModel.label} className="w-full" name="execution_model" disabled={working} value={"arc:" + draft} onValueChange={selected => { const value = selected.slice(4);  if (value === other) { setTyping(true); setDraft("") } else setDraft(value)  }} options={[{ value: "arc:", label: deviceCopy.executionModel.default }, ...models.map((choice) => ({ value: "arc:" + choice.id, label: choice.name })), { value: "arc:" + other, label: deviceCopy.executionModel.other }]} /></div> : <div className="flex min-w-0 items-end gap-2">
       <div className="grid min-w-0 flex-1 gap-1 text-sm"><Input label={deviceCopy.executionModel.label} name="execution_model" value={draft} disabled={working} placeholder={deviceCopy.executionModel.default} onChange={(event) => setDraft(event.target.value)} /></div>
       {models ? <Button type="button" variant="ghost" size="md" aria-label={deviceCopy.executionModel.pick} title={deviceCopy.executionModel.pick} disabled={working}
         onClick={() => { setTyping(false); setDraft(models.some((choice) => choice.id === draft) ? draft : "") }}><List aria-hidden="true" /></Button> : null}
@@ -666,11 +666,11 @@ function EndpointDetails({ endpoint, working, busy, save }: { endpoint: Provider
     event.preventDefault()
     void save("endpoint", { opencode_endpoint: { protocol, base_url: baseUrl.trim(), models, ...(token.trim() ? { api_key: token.trim() } : {}) } }).then((saved) => { if (saved) setToken("") })
   }}>
-    <div className="grid gap-1 text-sm"><Select label={"协议"} className="w-full" disabled={working} value={"arc:" + String(protocol)} onValueChange={selected => { const value = selected.slice(4);  setProtocol(value as EndpointProtocol)  }} options={[Object.entries(protocolLabels).map(([value, label]) => ({ value: "arc:" + String(value), label: [label].join("") }))].flat().filter(option => option !== null && option !== undefined)} /></div>
-    <div className="grid gap-1 text-sm"><Input label={"Base URL"} type="url" required spellCheck={false} maxLength={2048} value={baseUrl} disabled={working} onChange={(event) => setBaseUrl(event.target.value)} /></div>
-    <div className="grid gap-1 text-sm"><Input label={"API Token"} type="password" autoComplete="new-password" data-1p-ignore="" spellCheck={false} maxLength={4096} placeholder={endpoint?.has_api_key ? "已保存，留空不改" : "可留空"}
+    <div className="grid gap-1 text-sm"><Select label="协议" className="w-full" disabled={working} value={"arc:" + protocol} onValueChange={selected => { const value = selected.slice(4);  setProtocol(value as EndpointProtocol)  }} options={Object.entries(protocolLabels).map(([value, label]) => ({ value: "arc:" + value, label: label }))} /></div>
+    <div className="grid gap-1 text-sm"><Input label="Base URL" type="url" required spellCheck={false} maxLength={2048} value={baseUrl} disabled={working} onChange={(event) => setBaseUrl(event.target.value)} /></div>
+    <div className="grid gap-1 text-sm"><Input label="API Token" type="password" autoComplete="new-password" data-1p-ignore="" spellCheck={false} maxLength={4096} placeholder={endpoint?.has_api_key ? "已保存，留空不改" : "可留空"}
         value={token} disabled={working} onChange={(event) => setToken(event.target.value)} /></div>
-    <div className="grid gap-1 text-sm"><Textarea label={"模型"} required spellCheck={false} value={modelText} disabled={working} onChange={(event) => setModelText(event.target.value)} /></div>
+    <div className="grid gap-1 text-sm"><Textarea label="模型" required spellCheck={false} value={modelText} disabled={working} onChange={(event) => setModelText(event.target.value)} /></div>
     <p className="text-sm text-secondary">模型写成 custom/{models[0] ?? "<模型名>"}</p>
     {dirty || endpoint ? <div className="flex flex-wrap gap-2">
       {dirty ? <Button type="submit" variant="secondary" disabled={working || !baseUrl.trim() || !models.length}><BusyIcon busy={busy === "opencode:endpoint"} />保存</Button> : null}
@@ -703,7 +703,7 @@ function Folders({ later, roots, suggested, display, busy, save }: { later: bool
       <Plus aria-hidden="true" />{label}
     </Button>)}</div> : null}
     <div className="flex min-w-0 gap-2">
-      <Input label={"文件夹路径"} aria-label="文件夹路径" className="min-w-0 font-mono" placeholder={roots.length || suggested.length ? "其他文件夹" : "~/projects"} value={folder} disabled={busy} onChange={(event) => setFolder(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); add() } }} />
+      <Input label="文件夹路径" aria-label="文件夹路径" className="min-w-0 font-mono" placeholder={roots.length || suggested.length ? "其他文件夹" : "~/projects"} value={folder} disabled={busy} onChange={(event) => setFolder(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); add() } }} />
       <Button type="button" variant="secondary" disabled={busy || !folder.trim()} onClick={add}><Plus aria-hidden="true" />添加</Button>
     </div>
     </div>
@@ -716,9 +716,9 @@ function BackupPolicyEditor({ policy, disabled, change }: { policy: BackupPolicy
     <label className="flex min-h-11 items-center gap-2 text-sm"><Checkbox aria-label="自动尝试备用模型" disabled={disabled || !policy.candidates.length} checked={policy.automatic} onCheckedChange={next => { const checked = next === true;  change({ ...policy, automatic: checked })  }} />自动尝试备用模型</label>
     <p className="text-sm text-secondary">仅在原回合明确未执行时按顺序尝试一次。使用运行设备对应 AI 服务的登录账户，可能产生该账户的费用。</p>
     {policy.candidates.map((candidate, index) => <div key={index} className="grid gap-2 rounded-control border p-2">
-      <div className="grid gap-1 text-sm"><Select label={["备用 AI 服务",index + 1].join(" ")} disabled={disabled} value={"arc:" + String(candidate.provider)} onValueChange={selected => { const value = selected.slice(4);  const provider = providerIds.find((provider) => provider === value); if (provider) update(index, { provider, model: '', reasoning_effort: null })  }} options={[providerIds.map((provider) => ({ value: "arc:" + String(provider), label: [providerNames[provider]].join("") }))].flat().filter(option => option !== null && option !== undefined)} /></div>
+      <div className="grid gap-1 text-sm"><Select label={`备用 AI 服务 ${index + 1}`} disabled={disabled} value={"arc:" + candidate.provider} onValueChange={selected => { const value = selected.slice(4);  const provider = providerIds.find((provider) => provider === value); if (provider) update(index, { provider, model: '', reasoning_effort: null })  }} options={providerIds.map((provider) => ({ value: "arc:" + provider, label: providerNames[provider] }))} /></div>
       <Input label={`备用模型 ${index + 1}`} aria-label={`备用模型 ${index + 1}`} placeholder="模型名称" required value={candidate.model} disabled={disabled} onChange={(event) => update(index, { ...candidate, model: event.target.value })} />
-      {effortOptions(candidate.provider).length ? <div className="grid gap-1 text-sm"><Select label={"备用推理强度"} disabled={disabled} value={"arc:" + String(candidate.reasoning_effort ?? '')} onValueChange={selected => { const value = selected.slice(4);  update(index, { ...candidate, reasoning_effort: value || null })  }} options={[({ value: "arc:" + String(""), label: ["由 AI 服务决定"].join("") }),effortOptions(candidate.provider).map((effort) => ({ value: "arc:" + String(effort), label: [effort].join("") }))].flat().filter(option => option !== null && option !== undefined)} /></div> : <p className="text-sm text-secondary">推理强度由 AI 服务决定</p>}
+      {effortOptions(candidate.provider).length ? <div className="grid gap-1 text-sm"><Select label="备用推理强度" disabled={disabled} value={"arc:" + (candidate.reasoning_effort ?? '')} onValueChange={selected => { const value = selected.slice(4);  update(index, { ...candidate, reasoning_effort: value || null })  }} options={[{ value: "arc:", label: "由 AI 服务决定" }, ...effortOptions(candidate.provider).map((effort) => ({ value: "arc:" + effort, label: effort }))]} /></div> : <p className="text-sm text-secondary">推理强度由 AI 服务决定</p>}
       <Button type="button" variant="ghost" disabled={disabled} onClick={() => { const candidates = policy.candidates.filter((_, at) => at !== index); change({ automatic: policy.automatic && candidates.length > 0, candidates }) }}>移除备用模型</Button>
     </div>)}
     <Button type="button" variant="secondary" disabled={disabled || policy.candidates.length >= 5} onClick={() => change({ ...policy, candidates: [...policy.candidates, { provider: 'codex', model: '', reasoning_effort: null }] })}>添加备用模型</Button>

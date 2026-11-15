@@ -62,9 +62,10 @@ function CreateWorkspaceTask({ open, onOpenChange, botId }: { open: boolean; onO
   useEffect(() => { if (!submission.current) setSelected(botId ?? '') }, [botId])
   const selectedId = workspace.bots.find((bot) => bot.bot_id === selected)?.bot_id
     ?? workspace.bots.find((bot) => bot.bot_id === (botId ?? workspace.selectedBot?.bot_id))?.bot_id ?? workspace.bots[0]?.bot_id ?? ''
-  return <Drawer open={open} onOpenChange={onOpenChange}><DrawerContent title={"新任务"} description={"选择 Bot，任务后续的补充留在同一个对话里。"} className="overflow-y-auto">
+  const ownerBotId = submission.current?.owner_bot ?? selectedId
+  return <Drawer open={open} onOpenChange={onOpenChange}><DrawerContent title="新任务" description="选择 Bot，任务后续的补充留在同一个对话里。" className="overflow-y-auto">
     <form className="grid gap-4" onSubmit={(event) => { event.preventDefault(); void action.run('create-task', async () => {
-      const owner = workspace.bots.find((bot) => bot.bot_id === (submission.current?.owner_bot ?? selectedId))
+      const owner = workspace.bots.find((bot) => bot.bot_id === ownerBotId)
       if (!owner) throw new Error('请选择一个 Bot。')
       const command: Extract<WorkspaceCommand, { kind: 'create_task' }> = submission.current ?? { kind: 'create_task', task_id: taskId.current, owner_bot: owner.bot_id, title: title.trim(), request: request.trim(), expected_result: title.trim(), source_events: [], dependencies: [], reply_only: false }
       submission.current = command
@@ -77,9 +78,9 @@ function CreateWorkspaceTask({ open, onOpenChange, botId }: { open: boolean; onO
       await navigate({ to: '/tasks/$taskId', params: { taskId: task.task_id } })
       submission.current = null; taskId.current = newId(); setTitle(''); setRequest('')
     }) }}>
-      <div className="grid gap-2 text-sm font-medium"><Select required label={"交给哪个 Bot"} disabled={Boolean(submission.current)} value={"arc:" + String(submission.current?.owner_bot ?? selectedId)} onValueChange={selected => { const value = selected.slice(4);  setSelected(value)  }} options={[workspace.bots.map((bot) => ({ value: "arc:" + String(bot.bot_id), label: [bot.name].join("") }))].flat().filter(option => option !== null && option !== undefined)} /></div>
-      <div className="grid gap-2 text-sm font-medium"><Input label={"任务名称"} required readOnly={Boolean(submission.current)} maxLength={512} value={title} onChange={(event) => setTitle(event.currentTarget.value)} placeholder="例如：检查官网导航" /></div>
-      <div className="grid gap-2 text-sm font-medium"><Textarea label={"交代内容"} required readOnly={Boolean(submission.current)} maxLength={100000} className="" value={request} onChange={(event) => setRequest(event.currentTarget.value)} placeholder="描述要完成的事情和需要保留的约束" /></div>
+      <div className="grid gap-2 text-sm font-medium"><Select required label="交给哪个 Bot" placeholder="请选择一个 Bot" disabled={Boolean(submission.current)} value={ownerBotId ? "arc:" + ownerBotId : ""} onValueChange={selected => { const value = selected.slice(4);  setSelected(value)  }} options={workspace.bots.map((bot) => ({ value: "arc:" + bot.bot_id, label: bot.name }))} /></div>
+      <div className="grid gap-2 text-sm font-medium"><Input label="任务名称" required readOnly={Boolean(submission.current)} maxLength={512} value={title} onChange={(event) => setTitle(event.currentTarget.value)} placeholder="例如：检查官网导航" /></div>
+      <div className="grid gap-2 text-sm font-medium"><Textarea label="交代内容" required readOnly={Boolean(submission.current)} maxLength={100000} value={request} onChange={(event) => setRequest(event.currentTarget.value)} placeholder="描述要完成的事情和需要保留的约束" /></div>
       <InlineError error={action.error} />{submission.current ? <p role="status" className="text-sm text-secondary">原交代已保留，重试会继续确认同一个任务。</p> : null}
       <Button type="submit" disabled={Boolean(action.busy) || !workspace.writable || !selectedId}>{action.busy ? '正在保存任务' : '创建并发送'}</Button>
     </form>

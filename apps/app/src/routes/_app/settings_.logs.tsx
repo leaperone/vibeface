@@ -203,7 +203,7 @@ function LogsPage() {
     <div className="flex items-center gap-2">
       <div className="relative min-w-0 flex-1">
         <Search aria-hidden="true" className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-secondary" />
-        <Input label={"搜索日志"} type="search" aria-label="搜索日志" placeholder="搜索日志" className="" value={query} onChange={(event) => setQuery(event.target.value)} />
+        <Input label="搜索日志" type="search" aria-label="搜索日志" placeholder="搜索日志" value={query} onChange={(event) => setQuery(event.target.value)} />
       </div>
       <Button type="button" variant="ghost" size="md" className="-me-2.5 max-md:-me-3.5" aria-label="刷新" title="刷新" disabled={busy} onClick={() => { void load() }}>
         <RefreshCw aria-hidden="true" className={cn(busy && 'animate-spin')} />
@@ -211,7 +211,7 @@ function LogsPage() {
     </div>
     <div className="flex flex-wrap items-center gap-2">
       <Segmented label="级别" labels fill value={level ?? 'all'} options={levelChoices} onChange={(value) => setLevel(value === 'all' ? undefined : value)} />
-      <Select label={"来源"} className="ms-auto max-sm:w-full" value={"arc:" + String(source ?? '')} onValueChange={selected => { const value = selected.slice(4);  setSource((value || undefined) as LogSource | undefined)  }} options={[({ value: "arc:" + String(""), label: ["全部来源"].join("") }),sourceChoices.map(([value, label]) => ({ value: "arc:" + String(value), label: [label].join("") }))].flat().filter(option => option !== null && option !== undefined)} />
+      <Select label="来源" className="ms-auto max-sm:w-full" value={"arc:" + (source ?? '')} onValueChange={selected => { const value = selected.slice(4);  setSource((value || undefined) as LogSource | undefined)  }} options={[{ value: "arc:", label: "全部来源" }, ...sourceChoices.map(([value, label]) => ({ value: "arc:" + value, label: label }))]} />
     </div>
     <InlineError error={error} />
     {records === null ? error ? null : <div className="grid gap-2" aria-busy="true"><Skeleton className="h-12" /><Skeleton className="h-12" /><Skeleton className="h-12" /></div> : records.length === 0

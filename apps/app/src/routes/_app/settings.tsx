@@ -78,7 +78,7 @@ function SettingsPage() {
       </Link>
       <SettingsRow icon={Download} label="诊断包">
         <span className="flex">
-          <Select label={"诊断包的时间范围"} className="focus-within:z-10" value={"arc:" + String(String(range))} onValueChange={selected => { const value = selected.slice(4);  setRange(Number(value))  }} options={[ranges.map(([value, label]) => ({ value: "arc:" + String(String(value)), label: [label].join("") }))].flat().filter(option => option !== null && option !== undefined)} />
+          <Select label="诊断包的时间范围" className="focus-within:z-10" value={"arc:" + String(range)} onValueChange={selected => { const value = selected.slice(4);  setRange(Number(value))  }} options={ranges.map(([value, label]) => ({ value: "arc:" + String(value), label: label }))} />
           <Button type="button" size="sm" variant="secondary" className="relative -ms-px focus-visible:z-10" disabled={exported === 'busy'} onClick={() => {
             setExported('busy')
             void workspace.run(async () => { saveDiagnostics(await workspace.diagnostics(Date.now() - range)); setExported('done') }, "导出诊断包")

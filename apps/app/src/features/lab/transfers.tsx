@@ -86,7 +86,7 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
         <h2 className="text-lg font-medium">发送文件</h2>
         {mine.length ? <>
           <FormField>
-            <Select label={transferCopy.sendTo} id="transfer-to" className="w-full" disabled={working} value={"arc:" + String(picked ? draft.receiver_peer : '')} onValueChange={selected => { const value = selected.slice(4);  setDraft({ ...draft, receiver_peer: value })  }} options={[({ value: "arc:" + String(""), label: [transferCopy.pickDevice].join(""), disabled: true }),mine.map(item => ({ value: "arc:" + String(item.device_id), label: [item.name].join("") }))].flat().filter(option => option !== null && option !== undefined)} />
+            <Select label={transferCopy.sendTo} id="transfer-to" className="w-full" disabled={working} value={"arc:" + (picked ? draft.receiver_peer : '')} onValueChange={selected => { const value = selected.slice(4);  setDraft({ ...draft, receiver_peer: value })  }} options={[{ value: "arc:", label: transferCopy.pickDevice, disabled: true }, ...mine.map(item => ({ value: "arc:" + item.device_id, label: item.name }))]} />
           </FormField>
           <Details label={transferCopy.otherDevice} open={other.current || undefined}>{receiverId}</Details>
         </> : receiverId}
@@ -102,10 +102,10 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
         {draft.mode === 'paid' ? <>
           <p className="text-sm text-secondary">{transferCopy.protected}</p>
           <FormField>
-            <Select required label={"预付预算"} id="transfer-budget" className="w-full" disabled={working} value={"arc:" + String(draft.budget_id ?? '')} onValueChange={selected => { const value = selected.slice(4);
+            <Select required label="预付预算" placeholder="选择发送前已建立的预算" id="transfer-budget" className="w-full" disabled={working} value={draft.budget_id ? "arc:" + draft.budget_id : ""} onValueChange={selected => { const value = selected.slice(4);
               const budget = availableBudgets.find(item => item.budget_id === value)
               if (budget) setDraft({ ...draft, budget_id: budget.budget_id, provider_peer: budget.provider_peer, max_gas_amount: budget.gas_cap })
-             }} options={[({ value: "arc:" + String(""), label: ["选择发送前已建立的预算"].join(""), disabled: true }),availableBudgets.map(budget => ({ value: "arc:" + String(budget.budget_id), label: [budget.budget_id.slice(0, 12)," · 可分配 ",budget.free].join("") }))].flat().filter(option => option !== null && option !== undefined)} />
+             }} options={availableBudgets.map(budget => ({ value: "arc:" + budget.budget_id, label: `${budget.budget_id.slice(0, 12)} · 可分配 ${budget.free}` }))} />
             <FieldNote>预算固定收款钱包和中转设备。先在发送设备本机建立预付预算，再刷新此页。</FieldNote>
           </FormField>
           <FormField><Input label={transferCopy.serviceCap} id="transfer-service-cap" inputMode="numeric" pattern="[0-9]+" value={draft.max_service_amount} required disabled={working} onChange={event => setDraft({ ...draft, max_service_amount: event.target.value })} /></FormField>

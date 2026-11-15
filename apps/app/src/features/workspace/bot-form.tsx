@@ -80,21 +80,17 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
   return (
     <Drawer open={open} onOpenChange={onOpenChange}>
       <DrawerContent title={pending ? "再试一次" : "新 Bot"} description={pending ? "上次没确认是否建好，内容保持不变。" : "起个名字，就能开始聊。"} className="!w-full max-sm:!border-l-0 overflow-y-auto sm:!max-w-lg" onCloseAutoFocus={(event) => { event.preventDefault(); restoreFocus() }}>
-        <div className="pr-14">
-
-
-        </div>
         <form className="space-y-6 pb-[env(safe-area-inset-bottom)]" noValidate onSubmit={(event) => { void submit(event) }}>
           {pending && rejected && !busy ? <p role="status" className="rounded-control bg-surface-muted p-3 text-sm">上次没建成，确认后可以修改。</p> : null}
           <FormField>
-            <Input label={"名称"} id="bot-name" name="bot-name" className="" autoComplete="off" required maxLength={512} value={name} readOnly={Boolean(pending)} disabled={busy} onChange={(event) => setName(event.target.value)} placeholder="例如：项目 Bot" />
+            <Input label="名称" id="bot-name" name="bot-name" autoComplete="off" required maxLength={512} value={name} readOnly={Boolean(pending)} disabled={busy} onChange={(event) => setName(event.target.value)} placeholder="例如：项目 Bot" />
           </FormField>
           <FormField>
-            <Textarea label="它负责什么" description="可选" id="bot-instructions" name="bot-instructions" className="" maxLength={8192} value={instructions} readOnly={Boolean(pending)} disabled={busy} onChange={(event) => setInstructions(event.target.value)} placeholder="例如：帮我维护项目，回答问题并检查修改。" />
+            <Textarea label="它负责什么" description="可选" id="bot-instructions" name="bot-instructions" maxLength={8192} value={instructions} readOnly={Boolean(pending)} disabled={busy} onChange={(event) => setInstructions(event.target.value)} placeholder="例如：帮我维护项目，回答问题并检查修改。" />
           </FormField>
           <FormField>
-            {pending ? <Input label={folderLabels.project} description="可选" id="bot-project" className="" readOnly value={savedProjectLabel} aria-describedby={pending.project ? undefined : "bot-project-help"} /> : (
-              <Select label={folderLabels.project} description="可选" id="bot-project" name="bot-project" className="w-full" disabled={busy} value={"arc:" + String(selectedProject)} onValueChange={selected => { const value = selected.slice(4);  setSelectedProject(value)  }} options={[({ value: "arc:" + String(""), label: ["不选"].join("") }),selectedProject && !projects.some((item) => item.key === selectedProject) ? ({ value: "arc:" + String(selectedProject), label: ["原来的文件夹用不了"].join(""), disabled: true }) : null,projects.map((item) => ({ value: "arc:" + String(item.key), label: [item.label].join("") }))].flat().filter(option => option !== null && option !== undefined)} />
+            {pending ? <Input label={folderLabels.project} description="可选" id="bot-project" readOnly value={savedProjectLabel} aria-describedby={pending.project ? undefined : "bot-project-help"} /> : (
+              <Select label={folderLabels.project} description="可选" id="bot-project" name="bot-project" className="w-full" disabled={busy} value={"arc:" + selectedProject} onValueChange={selected => { const value = selected.slice(4);  setSelectedProject(value)  }} options={[{ value: "arc:", label: "不选" }, ...(selectedProject && !projects.some((item) => item.key === selectedProject) ? [{ value: "arc:" + selectedProject, label: "原来的文件夹用不了", disabled: true }] : []), ...projects.map((item) => ({ value: "arc:" + item.key, label: item.label }))]} />
             )}
             {projects.length || pending?.project ? null : <FieldNote id="bot-project-help" className="flex flex-wrap items-center gap-x-2">
               {botDevice ? "还没有可用的文件夹" : "设备能运行 Bot 后就能选"}

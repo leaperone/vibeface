@@ -1,3 +1,5 @@
+import * as deliveryModel from '@vibeface/client/delivery/model.ts'
+import { transferSelection, type DeliveryBudget } from '@vibeface/client/delivery/types.ts'
 import { parseChanged } from '@vibeface/client/lib/progress.ts'
 import * as workspaceHistory from '@vibeface/client/workspace/history.ts'
 import { completeHistory } from '@vibeface/client/workspace/history-fixture.ts'
@@ -2637,7 +2639,14 @@ test('new task creation uses the displayed default Bot after the catalog loads a
     const render = () => app.render('CreateWorkspaceTask', { open: true, onOpenChange() {}, botId })
     const owner = () => String(render().find(({ type }) => type === 'Select')?.props.value).slice(4)
     try {
-      if (mode === 'cold') { assert.equal(owner(), ''); shared.bots = [parityBot] }
+      if (mode === 'cold') {
+        assert.equal(owner(), '')
+        const empty = render().find(({ type }) => type === 'Select')
+        assert.equal(empty?.props.value, '', 'required selection stays empty until a Bot is available')
+        assert.equal(empty?.props.required, true)
+        assert.deepEqual(JSON.parse(JSON.stringify(empty?.props.options)), [])
+        shared.bots = [parityBot]
+      }
       else { assert.equal(owner(), parityBot.bot_id); botId = other.bot_id; render() }
       const expected = mode === 'cold' ? parityBot.bot_id : other.bot_id
       assert.equal(owner(), expected, 'the visible default is also the command owner without changing the select')
@@ -2650,6 +2659,32 @@ test('new task creation uses the displayed default Bot after the catalog loads a
       assert.equal((commands[0] as { owner_bot: string }).owner_bot, expected)
     } finally { app.close() }
   }
+})
+
+test('the required paid transfer budget stays empty until a real budget is selected', () => {
+  const budget = { budget_id: 'budget-1', payer: 'wallet', payee: 'payee', provider_peer: 'provider', asset: 'asset', deposit: '10', free: '10', locked: '0', earned: '0', withdrawn: '0', refunded: '0', state: 'open', gas_cap: '1', ready_windows: [] } satisfies DeliveryBudget
+  const delivery = { status: { enabled: true, charity_enabled: true, paid_enabled: true, node_peer: 'sender', wallet: { state: 'unlocked', address: 'wallet' }, max_file_bytes: 1024, receiver_key: null }, budgets: [budget], orders: [], providers: [], selected: null, busy: null, canManage: true }
+  const app = componentHarness('../lab/transfers.tsx', {
+    '@vibeface/client/delivery/client.ts': { useDelivery: () => delivery },
+    '@vibeface/client/delivery/model.ts': deliveryModel,
+    '@vibeface/client/delivery/types.ts': { transferSelection },
+    '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
+    '@/lib/glossary': { terms: new Proxy({}, { get: (_target, name) => ({ label: String(name), icon: String(name) }) }) },
+    '@/components/arc/product-kit': { Segmented: 'Segmented', useAction: () => ({ busy: null }) },
+  }, {}, 'TransferPage')
+  const render = () => app.render('TransferPage', { connection: {} })
+  try {
+    const mode = render().find(({ type }) => type === 'Segmented')
+    assert.ok(mode)
+    ;(mode.props.onChange as (value: string) => void)('paid')
+    const empty = render().find(({ type, props }) => type === 'Select' && props.id === 'transfer-budget')
+    assert.ok(empty)
+    assert.equal(empty.props.required, true)
+    assert.equal(empty.props.value, '', 'the native required field has no artificial selected value')
+    assert.deepEqual(JSON.parse(JSON.stringify(empty.props.options)), [{ value: 'arc:budget-1', label: 'budget-1 · 可分配 10' }])
+    ;(empty.props.onValueChange as (value: string) => void)('arc:budget-1')
+    assert.equal(render().find(({ type, props }) => type === 'Select' && props.id === 'transfer-budget')?.props.value, 'arc:budget-1')
+  } finally { app.close() }
 })
 
 test('routine input links preserve their exact trigger', () => {

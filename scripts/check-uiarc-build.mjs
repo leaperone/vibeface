@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const appRequire = createRequire(resolve(root, 'apps/app/package.json'))
 const arcRequire = createRequire(resolve(root, 'packages/uiarc/package.json'))
+const clientRequire = createRequire(resolve(root, 'packages/client/package.json'))
 const { compile } = appRequire('tailwindcss')
 const variables = await readFile(resolve(dirname(appRequire.resolve('tailwindcss/package.json')), 'theme.css'), 'utf8')
 const candidates = ['text-secondary', 'text-muted', 'border-strong', 'border-subtle', 'bg-surface', 'rounded-control', 'text-sm', 'text-base']
@@ -37,4 +38,5 @@ for (const platform of ['web', 'native']) {
 for (const dependency of ['react', 'react-dom']) {
   assert.equal(arcRequire.resolve(dependency), appRequire.resolve(dependency), `Web and Arc must execute the same ${dependency} instance`)
 }
+assert.equal(clientRequire.resolve('react'), appRequire.resolve('react'), 'Web client providers must execute the same React instance as their controls')
 console.log('Arc compiled utilities, native line heights and Web React identity verified')

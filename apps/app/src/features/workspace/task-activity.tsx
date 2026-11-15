@@ -110,7 +110,7 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
     {check.reason === "offline" ? <BackOnline device={device} /> : null}
     {bot ? <Link to="/b/$botId" params={{ botId: bot.bot_id }} className="inline-flex w-fit max-w-full min-w-0 items-center gap-1.5 rounded-control text-sm font-medium underline-offset-4 hover:underline max-md:min-h-11">
       <BotFace bot={bot} mood="idle" size={16} /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-secondary" /></Link> : null}
-    <Details label="补充说明（可选）"><Textarea label={"补充说明"} id={`${id}-note`} aria-label="补充说明" rows={2} maxLength={2000} value={note} disabled={disabled} onChange={(event) => setNote(event.target.value)} /></Details>
+    <Details label="补充说明（可选）"><Textarea label="补充说明" id={`${id}-note`} aria-label="补充说明" rows={2} maxLength={2000} value={note} disabled={disabled} onChange={(event) => setNote(event.target.value)} /></Details>
     {settleActions(check, note)}
     {check.detail ? <Details><span>{check.detail}</span></Details> : null}
   </ActionCard>

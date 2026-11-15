@@ -119,8 +119,7 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
     </PageActions>
     <Drawer open={open} onOpenChange={(next) => { setOpen(next); if (!next) { setAdded(null); setAsManager(false) } }}>
       {/* A waiting request leads the sheet; its first control is 设为管理设备, which should not take focus on its own. */}
-      <DrawerContent title={"添加设备"} description={"在新设备上打开链接，安全码一致后允许"} className="!w-full max-sm:!border-l-0 overflow-y-auto sm:!max-w-md" onOpenAutoFocus={(event) => { if (requests) { event.preventDefault(); if (event.target instanceof HTMLElement) event.target.focus() } }}>
-        <div className="pr-14"></div>
+      <DrawerContent title="添加设备" description="在新设备上打开链接，安全码一致后允许" className="!w-full max-sm:!border-l-0 overflow-y-auto sm:!max-w-md" onOpenAutoFocus={(event) => { if (requests) { event.preventDefault(); if (event.target instanceof HTMLElement) event.target.focus() } }}>
         <div className="grid gap-6 pb-[env(safe-area-inset-bottom)]">
           {/* A device already asking is the next thing to act on, so it comes before a new link. */}
           <JoinRequests issuing={result !== null} manage={asManager} onAllowed={(device) => { setAdded(device); setAsManager(false); setResult(null); setError(""); setCopyFailed(false) }} />
@@ -158,7 +157,7 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
             </ul>
             {copyFailed ? <p role="alert" className="flex items-center gap-2 text-sm text-danger"><CircleAlert aria-hidden="true" className="size-4 shrink-0" />{addDeviceCopy.copyFailed}</p> : null}
             <Details key={copyFailed ? "open" : "folded"} label="链接原文" open={copyFailed || undefined}>
-              <Textarea label={"链接原文"} ref={raw} readOnly aria-label="链接原文" className="font-mono" value={shown === "command" ? addDeviceCopy.command(result.link) : result.link} onFocus={(event) => event.target.select()} />
+              <Textarea label="链接原文" ref={raw} readOnly aria-label="链接原文" className="font-mono" value={shown === "command" ? addDeviceCopy.command(result.link) : result.link} onFocus={(event) => event.target.select()} />
             </Details>
           </div> : null}
           {status ? <p role="status" className="text-sm text-success">{status}</p> : null}

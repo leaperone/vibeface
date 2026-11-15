@@ -65,7 +65,7 @@ export function Message({ message, conversationId, schedule, time: shown, retry,
       : message.state === 'merging' ? <span role="status" className="flex items-center gap-1 px-1 text-sm text-secondary"><Merge aria-hidden="true" className="size-3.5" />已登记为回合补充</span>
       : message.state === 'merged' && (!message.merged || message.merged === 'unknown') ? <div className="flex max-w-[85%] flex-wrap items-center justify-end gap-x-2 gap-y-1 text-sm sm:max-w-[75%]">
         <span role="status" className="flex items-center gap-1 text-warning"><CircleQuestionMark aria-hidden="true" className="size-3.5 shrink-0" />{mergedLabels.unknown}</span>
-        <ActionButton variant="ghost" className="" disabled={!connectionOnline} action={refresh}>再查一次</ActionButton>
+        <ActionButton variant="ghost" disabled={!connectionOnline} action={refresh}>再查一次</ActionButton>
       </div>
       : message.state === 'merged' ? <span role="status" className="flex items-center gap-1 px-1 text-sm text-secondary"><Merge aria-hidden="true" className="size-3.5" />{mergedLabels[message.merged ?? 'unknown']}</span> : time}
   </div>

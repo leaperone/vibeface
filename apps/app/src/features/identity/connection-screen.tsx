@@ -303,7 +303,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
         <fieldset disabled={linking || !usable} className="grid gap-4">
           {purpose !== 'link' && scanFirst ? <Button type="button" className="w-fit" onClick={() => setScanning(true)}><Camera aria-hidden="true" />{joinCopy.scan}</Button> : null}
           {purpose === 'empty' || purpose === 'invalid' ? <>
-            <Textarea label={"加入链接"} ref={scanFirst ? undefined : claimFocus} className="resize-none field-sizing-fixed font-mono" name="invitation" required value={invitation} aria-label="加入链接" aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} placeholder={scanFirst ? joinCopy.paste : joinCopy.pasteFirst} onChange={(event) => setInvitation(event.target.value)} />
+            <Textarea label="加入链接" ref={scanFirst ? undefined : claimFocus} className="resize-none field-sizing-fixed font-mono" name="invitation" required value={invitation} aria-label="加入链接" aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} placeholder={scanFirst ? joinCopy.paste : joinCopy.pasteFirst} onChange={(event) => setInvitation(event.target.value)} />
             {purpose === 'invalid' ? <InlineError error={joinCopy.notLink} /> : null}
             {scannable && !scanFirst ? <Button type="button" variant="ghost" className="-ms-3 w-fit" onClick={() => setScanning(true)}><Camera aria-hidden="true" />{joinCopy.scan}</Button> : null}
           </> : <p className="flex min-h-11 items-center gap-2 rounded-control bg-surface-muted/60 ps-3">
@@ -312,8 +312,8 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
             <Button ref={claimFocus} type="button" variant="ghost" onClick={() => setInvitation('')}>换一个</Button>
           </p>}
           {thisComputer
-            ? <div ><Input label={"这个节点叫什么？"} name="name" required maxLength={128} autoComplete="off" defaultValue={defaultComputerName()} /></div>
-            : <div ><Input label={"这个浏览器叫什么？"} name="name" required maxLength={128} autoComplete="off" defaultValue={lastBrowserName() || defaultBrowserName()} /></div>}
+            ? <div ><Input label="这个节点叫什么？" name="name" required maxLength={128} autoComplete="off" defaultValue={defaultComputerName()} /></div>
+            : <div ><Input label="这个浏览器叫什么？" name="name" required maxLength={128} autoComplete="off" defaultValue={lastBrowserName() || defaultBrowserName()} /></div>}
           {purpose === 'link' ? <Button type="submit" className="w-fit justify-self-end" aria-busy={linking || undefined}>{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}{linking ? joinCopy.joining : joinCopy.join}</Button> : null}
         </fieldset>
       </form>}
@@ -339,8 +339,8 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
           void run(() => device.connect(parseEntry({ address, device_id: deviceId })))
         }}>
           <fieldset disabled={linking} className="grid gap-3">
-            <div ><Input label={"访问地址"} key={device.gateway} type="url" name="address" defaultValue={device.gateway} /></div>
-            <div ><Input label={"设备编号"} className="font-mono" name="device_id" placeholder={gatewayNode ? manualCopy.optional : undefined} autoComplete="off" autoCapitalize="none" spellCheck={false} /></div>
+            <div ><Input label="访问地址" key={device.gateway} type="url" name="address" defaultValue={device.gateway} /></div>
+            <div ><Input label="设备编号" className="font-mono" name="device_id" placeholder={gatewayNode ? manualCopy.optional : undefined} autoComplete="off" autoCapitalize="none" spellCheck={false} /></div>
             <p className="-mt-1 text-secondary">{manualCopy.where}</p>
             <Button type="submit" variant="secondary" className="w-fit">连接</Button>
           </fieldset>
@@ -369,9 +369,9 @@ function StartChoice({ onCreate, onJoin }: { onCreate(): void; onJoin(): void })
 function NamesStep({ initial, onNext, onBack }: { initial: Names | null; onNext(names: Names): void; onBack(): void }) {
   return <Panel icon={Laptop} title="给这个节点起名">
     <form className="grid gap-4" onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; onNext({ computer: value(form, 'computer').trim(), browser: value(form, 'browser').trim() || defaultBrowserName() }) }}>
-      <Input label={"这个节点叫什么？"} name="computer" aria-label="这个节点叫什么？" required maxLength={128} autoComplete="off" defaultValue={initial?.computer || defaultComputerName()} />
+      <Input label="这个节点叫什么？" name="computer" aria-label="这个节点叫什么？" required maxLength={128} autoComplete="off" defaultValue={initial?.computer || defaultComputerName()} />
       <Details label="这个浏览器的名字">
-        <Input label={"这个浏览器叫什么？"} name="browser" aria-label="这个浏览器叫什么？" maxLength={128} autoComplete="off" className="" defaultValue={initial?.browser ?? defaultBrowserName()} />
+        <Input label="这个浏览器叫什么？" name="browser" aria-label="这个浏览器叫什么？" maxLength={128} autoComplete="off" defaultValue={initial?.browser ?? defaultBrowserName()} />
       </Details>
       <div className="flex justify-between gap-2">
         <Button type="button" variant="ghost" className="-ms-3" onClick={onBack}>上一步</Button>
@@ -403,7 +403,7 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
     }}>
       <fieldset disabled={busy || disabled} className="grid gap-4">
         <div className="grid gap-1.5">
-          <div ><PasswordInput label={"恢复密码"} name="password" autoComplete="new-password" aria-invalid={tried && weak || undefined} aria-describedby="password-hint" onChange={(event) => { setPassword(event.target.value); setTried(false) }} /></div>
+          <div ><PasswordInput label="恢复密码" name="password" autoComplete="new-password" aria-invalid={tried && weak || undefined} aria-describedby="password-hint" onChange={(event) => { setPassword(event.target.value); setTried(false) }} /></div>
           <PasswordStrength id="password-hint" password={password} tried={tried} />
         </div>
         <div className="flex justify-between gap-2">

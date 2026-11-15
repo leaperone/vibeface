@@ -133,7 +133,7 @@ function TaskFilters({ filter, botFilter, bots, onFilter, onBotFilter }: { filte
   const options = [{ value: "all" as const, label: "全部" }, ...taskGroups.map(({ group, title }) => ({ value: group, label: title }))]
   return <section className={taskStyles.filters} aria-label="任务筛选">
     <Segmented label="任务状态" value={filter} options={options} onChange={onFilter} />
-    <Select label={"按 Bot 筛选"}  value={"arc:" + String(botFilter)} onValueChange={selected => { const value = selected.slice(4);  onBotFilter(value)  }} options={[({ value: "arc:" + String("all"), label: ["所有 Bot"].join("") }),bots.map((bot) => ({ value: "arc:" + String(bot.bot_id), label: [bot.name].join("") }))].flat().filter(option => option !== null && option !== undefined)} />
+    <Select label="按 Bot 筛选"  value={"arc:" + botFilter} onValueChange={selected => { const value = selected.slice(4);  onBotFilter(value)  }} options={[{ value: "arc:all", label: "所有 Bot" }, ...bots.map((bot) => ({ value: "arc:" + bot.bot_id, label: bot.name }))]} />
   </section>
 }
 

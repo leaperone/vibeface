@@ -105,7 +105,7 @@ export function RelaySettings() {
     {settings.volunteer ? <SettingsDisclosure icon={SlidersHorizontal} label="地址和限额">
       <form className="grid gap-3" onSubmit={(event) => { event.preventDefault(); save() }}>
 
-        <Input label={"地址"} id="relay-url" type="url" className="font-mono" placeholder="http://" value={draft.url} disabled={Boolean(busy)} onChange={(event) => setDraft({ ...draft, url: event.target.value })} />
+        <Input label="地址" id="relay-url" type="url" className="font-mono" placeholder="http://" value={draft.url} disabled={Boolean(busy)} onChange={(event) => setDraft({ ...draft, url: event.target.value })} />
         <div className="grid gap-3 sm:grid-cols-3">
           {limits.map(([key, text]) => <div key={key} className="grid gap-2">
 

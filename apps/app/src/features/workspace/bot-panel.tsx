@@ -98,7 +98,7 @@ export function BotPanelButton() {
       <ChevronDown aria-hidden="true" className="size-4 shrink-0 text-secondary" />
     </Button>
     <Drawer open={open && Boolean(view)} onOpenChange={(next) => { setOpen(next); setShownSchedule(null); setConfirming(null); setDeleting(false); setContextOpen(false) }}>
-      <DrawerContent title={bot.name} description={"在聊天里说一声就能改"} className="!w-full max-sm:!border-l-0 gap-0 overflow-y-auto bg-surface-muted sm:!max-w-md" onCloseAutoFocus={(event) => {
+      <DrawerContent title={bot.name} description="在聊天里说一声就能改" className="!w-full max-sm:!border-l-0 gap-0 overflow-y-auto bg-surface-muted sm:!max-w-md" onCloseAutoFocus={(event) => {
         if (!toComposer.current) return
         toComposer.current = false
         const composer = document.getElementById("message-text")
@@ -122,7 +122,7 @@ export function BotPanelButton() {
               <span className="max-w-48 truncate" title={deviceName}>{deviceName}</span>
             </SettingsRow> : null}
             {bot.project || choices.length ? <SettingsRow icon={FolderOpen} label={folderLabels.project}>
-              {workspace.writable && choices.length ? <Select label={folderLabels.project} className="max-w-48" value={"arc:" + String(projectNow)} onValueChange={selected => { const value = selected.slice(4);  moveProject(value)  }} options={[({ value: "arc:" + String(""), label: ["不选"].join("") }),bot.project && !choices.some((item) => item.key === projectNow) ? ({ value: "arc:" + String(projectNow), label: [projectLabel].join("") }) : null,choices.map((item) => ({ value: "arc:" + String(item.key), label: [item.label].join("") }))].flat().filter(option => option !== null && option !== undefined)} /> : <span className="max-w-48 truncate" title={bot.project?.cwd}>{projectLabel}</span>}
+              {workspace.writable && choices.length ? <Select label={folderLabels.project} className="max-w-48" value={"arc:" + projectNow} onValueChange={selected => { const value = selected.slice(4);  moveProject(value)  }} options={[{ value: "arc:", label: "不选" }, ...(bot.project && !choices.some((item) => item.key === projectNow) ? [{ value: "arc:" + projectNow, label: projectLabel }] : []), ...choices.map((item) => ({ value: "arc:" + item.key, label: item.label }))]} /> : <span className="max-w-48 truncate" title={bot.project?.cwd}>{projectLabel}</span>}
             </SettingsRow> : null}
             {models.length ? models.map(([provider, model]) => <SettingsRow key={provider} icon={providerIcons[provider]} label={`${providerNames[provider]} 模型偏好`}>
               {model ? <span className="max-w-48 truncate font-mono" title={model}>{model}</span> : <span>设备默认</span>}
