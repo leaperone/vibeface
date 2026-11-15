@@ -359,8 +359,13 @@ test("workspace activities merge same-source job observations without hiding new
   const remoteUnknown = parseWorkspaceOverview({ jobs: [{ job_id: "remote-unknown", conversation_id: "chat-1", trigger: "message:ordinary", state: "unknown", source_node: "remote" }] })
   const localCompleted = { ...local, job: { ...local.job, state: "completed", outcome: "answered" as const } } satisfies WorkspaceActivityJob
   assert.deepEqual(workspaceActivities({ ...input, overview: remoteUnknown, jobs: [localCompleted] }).activities.map((entry) => entry.state), ["unknown"], "local completed history cannot hide another source's unknown observation")
-  const futureOverview = parseWorkspaceOverview({ jobs: [{ job_id: "future-job", conversation_id: "chat-1", trigger: "message:ordinary", state: "future_state", source_node: "entry" }] })
+  const futureOverview = parseWorkspaceOverview({ jobs: [
+    { job_id: "queued-job", conversation_id: "chat-1", trigger: "message:ordinary", state: "queued", source_node: "entry" },
+    { job_id: "future-job", conversation_id: "chat-1", trigger: "message:ordinary", state: "future_state", source_node: "entry", runtime },
+  ] })
   const arbitrary = workspaceActivities({ ...input, overview: futureOverview, jobs: [] }).activities
+  assert.equal(arbitrary.length, 1)
+  assert.equal(arbitrary[0]?.facts.jobs.length, 2, "same-source observations still merge before choosing a conservative state")
   assert.equal(arbitrary[0]?.kind === "turn" && arbitrary[0].state, "unknown", "an unrecognized scheduler state stays conservative")
   assert.equal(workspaceActivities({ ...input, overview: overviewRunning, jobs: [{ ...local, job: { ...local.job, state: "queued" } }] }).activities[0]?.state, "running", "the overview observation can be newer without preferring the local source")
   assert.equal(workspaceActivities({ ...input, nodes: [] }).activities.length, 2, "an unknown local identity cannot prove a duplicate")

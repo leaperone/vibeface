@@ -372,7 +372,7 @@ function sentCoverage(value: unknown): SentCoverage {
 }
 function jobState(value: unknown) {
   const state = text(value)
-  if (!isJobState(state)) throw new Error('调度状态无法识别。')
+  if (!isJobState(state)) throw new Error('任务状态无法识别。')
   return state
 }
 function steerOutcome(value: unknown): SteerOutcome | undefined {
