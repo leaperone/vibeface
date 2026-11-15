@@ -214,7 +214,7 @@ test('sync watermarks follow their network across entry changes and reconnects',
     await app.render().connect(candidate)
     return app.render()
   }
-  const subscribedVector = () => plain(app.requests.findLast(request => request.method === 'subscribe')?.params.vector)
+  const subscribedVector = () => plain(app.requests.filter(request => request.method === 'subscribe').at(-1)?.params.vector)
   try {
     app.render(); await settle(); app.render()
     let device = await connect(entry, network, { [firstAuthor]: 10 })
