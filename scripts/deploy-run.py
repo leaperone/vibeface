@@ -213,6 +213,8 @@ def activate(service, output):
     component = 'www' if service == 'www' else 'app' if service == 'app' else 'core'
     identity = info['images'][component]
     release.require(re.fullmatch(r'sha256:[0-9a-f]{64}', identity), 'invalid prepared image ID')
+    archive = output / f'{component}.image.tar.gz'
+    accepted_images = runpy.run_path(str(ROOT / 'scripts/deploy-activate.py'))['archive_images'](archive, identity)
     host, user, port = transport(os.environ)
     config = json.loads(os.environ['DEPLOY_CONFIG'])
     release.require(config['role'] == service, 'environment role does not match selected service')
@@ -239,7 +241,7 @@ def activate(service, output):
                      str(output / f'{component}.image.tar.gz'), f'{remote}:{stage}/'], stdout=subprocess.DEVNULL)
             checked(['scp', *options, '-P', port, '-r', str(ROOT / 'deploy'), f'{remote}:{stage}/'],
                     stdout=subprocess.DEVNULL)
-            archive_digest = release.digest(output / f'{component}.image.tar.gz')
+            archive_digest = release.digest(archive)
             command = ['python3', stage + '/deploy-activate.py', '--config', stage + '/config.json',
                        '--image', identity, '--tag', info['tag'], '--source-sha', info['source_sha'],
                        '--version', info['version'], '--archive', stage + f'/{component}.image.tar.gz',
@@ -249,7 +251,7 @@ def activate(service, output):
                      ('exec ' if user == 'root' else 'exec sudo -n ') + shlex.join(command))
             receipt = json.loads(subprocess.check_output([*ssh, shell], text=True))
             release.require(receipt.get('status') in ('activated', 'already_active')
-                            and re.fullmatch(r'sha256:[0-9a-f]{64}', receipt.get('image', ''))
+                            and receipt.get('image') in accepted_images
                             and receipt.get('source_sha') == info['source_sha']
                             and receipt.get('version') == info['version'], 'invalid remote activation receipt')
         except subprocess.CalledProcessError as error:
@@ -375,6 +377,73 @@ def self_test():
         with TestCase().assertRaises(ValueError, msg='accepted invalid transport'):
             transport(dict(base, **{key: value}))
     from unittest.mock import patch
+    import hashlib
+    import io
+    import tarfile
+    config_blob = json.dumps({'architecture': 'amd64', 'os': 'linux', 'rootfs': {'type': 'layers', 'diff_ids': []}}).encode()
+    prepared_image = 'sha256:' + hashlib.sha256(config_blob).hexdigest()
+    manifest_type = 'application/vnd.oci.image.manifest.v1+json'
+    manifest_blob = json.dumps({'schemaVersion': 2, 'mediaType': manifest_type,
+                               'config': {'digest': prepared_image}, 'layers': []}).encode()
+    manifest_image = 'sha256:' + hashlib.sha256(manifest_blob).hexdigest()
+    for service, component in (('node', 'core'), ('app', 'app'), ('www', 'www')):
+        for status, returned_image, dropped in (
+                ('activated', prepared_image, False), ('already_active', prepared_image, False),
+                ('activated', manifest_image, False), ('already_active', manifest_image, False),
+                ('activated', 'sha256:' + 'b' * 64, False), ('already_active', 'sha256:' + 'b' * 64, False),
+                ('activated', prepared_image, True)):
+            with tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary)
+                info = {'targets': [service], 'tag': f'{component}-v0.0.1', 'version': '0.0.1',
+                        'source_sha': 'c' * 40, 'images': {component: prepared_image}}
+                (output / 'deployment.json').write_text(json.dumps(info))
+                entries = {'manifest.json': json.dumps([{'Config': 'blobs/sha256/' + prepared_image[7:], 'RepoTags': None, 'Layers': []}]).encode(),
+                           'index.json': json.dumps({'schemaVersion': 2, 'manifests': [
+                               {'mediaType': manifest_type, 'digest': manifest_image, 'size': len(manifest_blob)}]}).encode(),
+                           'blobs/sha256/' + prepared_image[7:]: config_blob,
+                           'blobs/sha256/' + manifest_image[7:]: manifest_blob}
+                with tarfile.open(output / f'{component}.image.tar.gz', 'w:gz') as bundle:
+                    for name, content in entries.items():
+                        member = tarfile.TarInfo(name); member.size = len(content)
+                        bundle.addfile(member, io.BytesIO(content))
+                stage = '/tmp/vibeface-deploy.Fixture'
+                calls = []
+                def transfer(args, **kwargs):
+                    assert args[0] in ('ssh-keygen', 'scp'), args
+                    if args[0] == 'scp':
+                        assert args[-1] == f'root@host.example:{stage}/'
+                    calls.append(args)
+                def response(args, **kwargs):
+                    assert args[0] == 'ssh', args
+                    calls.append(args)
+                    if args[-1] == 'umask 077; mktemp -d /tmp/vibeface-deploy.XXXXXXXX':
+                        return stage + '\n'
+                    assert f'{stage}/deploy-activate.py' in args[-1], args
+                    assert f'--image {prepared_image}' in args[-1]
+                    if dropped:
+                        raise subprocess.CalledProcessError(255, args)
+                    return json.dumps({'status': status, 'image': returned_image,
+                                       'source_sha': info['source_sha'], 'version': info['version']})
+                def cleanup(args, **kwargs):
+                    assert args[0] == 'ssh' and args[-1] == f'rm -rf -- {stage}', args
+                    calls.append(args)
+                    return subprocess.CompletedProcess(args, 0)
+                environment = dict(base, DEPLOY_USER='root', DEPLOY_CONFIG=json.dumps({'role': service}))
+                with patch.dict(os.environ, environment), patch(__name__ + '.checked', side_effect=transfer), \
+                     patch('subprocess.check_output', side_effect=response), patch('subprocess.run', side_effect=cleanup):
+                    if dropped:
+                        with TestCase().assertRaises(subprocess.CalledProcessError) as caught:
+                            activate(service, output)
+                        assert caught.exception.returncode == 255
+                    elif returned_image == 'sha256:' + 'b' * 64:
+                        with TestCase().assertRaisesRegex(ValueError, 'invalid remote activation receipt'):
+                            activate(service, output)
+                    else:
+                        assert activate(service, output) == {'service': service, 'tag': info['tag'],
+                            'source_sha': 'c' * 40, 'image': returned_image, 'prepared_image': prepared_image}
+                assert sum(args[0] == 'scp' for args in calls) == 2
+                assert sum('deploy-activate.py' in args[-1] for args in calls if args[0] == 'ssh') == 1
+                assert sum(args[-1] == f'rm -rf -- {stage}' for args in calls) == (0 if dropped else 1)
     validate_config = runpy.run_path(str(ROOT / 'scripts/deploy-activate.py'))['validate_config']
     for has_previous, failure in ((True, None), (False, None), (True, 'activation'), (True, 'data')):
         with tempfile.TemporaryDirectory() as temporary:
@@ -472,7 +541,7 @@ def self_test():
                     previous_build.assert_not_called()
                     assert initialized == [current['images']['core']]
                 assert len(cleaned) == 1, 'fixture containers were not cleaned up'
-    print('deployment transport and rehearsal self-test passed')
+    print('deployment transport, activation receipts and rehearsal self-test passed')
 
 
 def main():
