@@ -105,7 +105,8 @@ export default function ChatScreen() {
   // already ends where the bar's buttons begin.
   const frame = useSafeAreaFrame().width
   const wide = useWide()
-  const titleWidth = ios ? (wide ? frame - 320 : frame) - 120 : undefined
+  // Compact iPad windows also need leading room for the system window controls.
+  const titleWidth = Platform.OS === 'ios' ? (wide ? frame - 320 : frame) - (Platform.isPad && !wide ? 200 : 120) : undefined
   const { theme } = useUniwind()
   const chrome = useChatChrome()
   const background = useCSSVariable('--background')
