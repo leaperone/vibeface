@@ -249,7 +249,7 @@ def activate(service, output):
                      ('exec ' if user == 'root' else 'exec sudo -n ') + shlex.join(command))
             receipt = json.loads(subprocess.check_output([*ssh, shell], text=True))
             release.require(receipt.get('status') in ('activated', 'already_active')
-                            and re.fullmatch(r'sha256:[0-9a-f]{64}', receipt.get('image', ''))
+                            and receipt.get('image') == identity
                             and receipt.get('source_sha') == info['source_sha']
                             and receipt.get('version') == info['version'], 'invalid remote activation receipt')
         except subprocess.CalledProcessError as error:
@@ -375,6 +375,55 @@ def self_test():
         with TestCase().assertRaises(ValueError, msg='accepted invalid transport'):
             transport(dict(base, **{key: value}))
     from unittest.mock import patch
+    prepared_image = 'sha256:' + 'a' * 64
+    for service, component in (('node', 'core'), ('app', 'app'), ('www', 'www')):
+        for status, different, dropped in (('activated', False, False), ('already_active', False, False),
+                                            ('activated', True, False), ('already_active', True, False),
+                                            ('activated', False, True)):
+            with tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary)
+                info = {'targets': [service], 'tag': f'{component}-v0.0.1', 'version': '0.0.1',
+                        'source_sha': 'c' * 40, 'images': {component: prepared_image}}
+                (output / 'deployment.json').write_text(json.dumps(info))
+                (output / f'{component}.image.tar.gz').write_bytes(b'fixture image archive')
+                stage = '/tmp/vibeface-deploy.Fixture'
+                calls = []
+                def transfer(args, **kwargs):
+                    assert args[0] in ('ssh-keygen', 'scp'), args
+                    if args[0] == 'scp':
+                        assert args[-1] == f'root@host.example:{stage}/'
+                    calls.append(args)
+                def response(args, **kwargs):
+                    assert args[0] == 'ssh', args
+                    calls.append(args)
+                    if args[-1] == 'umask 077; mktemp -d /tmp/vibeface-deploy.XXXXXXXX':
+                        return stage + '\n'
+                    assert f'{stage}/deploy-activate.py' in args[-1], args
+                    assert f'--image {prepared_image}' in args[-1]
+                    if dropped:
+                        raise subprocess.CalledProcessError(255, args)
+                    return json.dumps({'status': status, 'image': 'sha256:' + 'b' * 64 if different else prepared_image,
+                                       'source_sha': info['source_sha'], 'version': info['version']})
+                def cleanup(args, **kwargs):
+                    assert args[0] == 'ssh' and args[-1] == f'rm -rf -- {stage}', args
+                    calls.append(args)
+                    return subprocess.CompletedProcess(args, 0)
+                environment = dict(base, DEPLOY_USER='root', DEPLOY_CONFIG=json.dumps({'role': service}))
+                with patch.dict(os.environ, environment), patch(__name__ + '.checked', side_effect=transfer), \
+                     patch('subprocess.check_output', side_effect=response), patch('subprocess.run', side_effect=cleanup):
+                    if dropped:
+                        with TestCase().assertRaises(subprocess.CalledProcessError) as caught:
+                            activate(service, output)
+                        assert caught.exception.returncode == 255
+                    elif different:
+                        with TestCase().assertRaisesRegex(ValueError, 'invalid remote activation receipt'):
+                            activate(service, output)
+                    else:
+                        assert activate(service, output) == {'service': service, 'tag': info['tag'],
+                            'source_sha': 'c' * 40, 'image': prepared_image, 'prepared_image': prepared_image}
+                assert sum(args[0] == 'scp' for args in calls) == 2
+                assert sum('deploy-activate.py' in args[-1] for args in calls if args[0] == 'ssh') == 1
+                assert sum(args[-1] == f'rm -rf -- {stage}' for args in calls) == (0 if dropped else 1)
     validate_config = runpy.run_path(str(ROOT / 'scripts/deploy-activate.py'))['validate_config']
     for has_previous, failure in ((True, None), (False, None), (True, 'activation'), (True, 'data')):
         with tempfile.TemporaryDirectory() as temporary:
@@ -472,7 +521,7 @@ def self_test():
                     previous_build.assert_not_called()
                     assert initialized == [current['images']['core']]
                 assert len(cleaned) == 1, 'fixture containers were not cleaned up'
-    print('deployment transport and rehearsal self-test passed')
+    print('deployment transport, activation receipts and rehearsal self-test passed')
 
 
 def main():
