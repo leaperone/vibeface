@@ -53,3 +53,5 @@ The Web and Mobile implementation workstreams own separate app directories. The 
 Project instructions reserve e2e tests, screenshots and UI acceptance runs for an explicit request. This migration uses existing behavior tests, targeted component checks, source audits and production builds. Do not claim visual or native-device verification from compilation alone.
 
 The baseline census is 17 Web route files and 27 native route files, including layouts. The initial dependency census includes 339 internal component imports. Counts may change as components are reorganized; product routes and actions remain the acceptance scope.
+
+Native package compilation is available through the manual `verify-mobile-ui.yml` workflow. It uses the committed mobile version and exact workflow source commit, then calls the existing Android and iOS builders. It does not pass signing secrets, create tags, or publish a release. Core CI and its reusable Web and crypto workflows retain their existing entrypoints.

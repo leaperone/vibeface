@@ -1,0 +1,44 @@
+name: Verify / Mobile UI
+run-name: Verify / Mobile UI / ${{ github.ref_name }} / ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    name: Freeze mobile build inputs
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.mobile.outputs.version }}
+      source_sha: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: '${{ github.sha }}', persist-credentials: false}
+      - name: Read committed mobile version
+        id: mobile
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          with open("apps/mobile/app.json") as source:
+              version = json.load(source)["expo"]["extra"]["releaseVersion"]
+          print("version=" + version)
+          PY
+      - name: Check the fixed Arc source and native port mappings
+        run: python3 scripts/check-uiarc.py
+  android:
+    name: Verify Android package
+    needs: source
+    uses: ./.github/workflows/release-apps.yml
+    with:
+      source_sha: ${{ needs.source.outputs.source_sha }}
+      version: ${{ needs.source.outputs.version }}
+  ios:
+    name: Verify unsigned iOS archive
+    needs: source
+    uses: ./.github/workflows/release-ios.yml
+    with:
+      source_sha: ${{ needs.source.outputs.source_sha }}
+      version: ${{ needs.source.outputs.version }}
