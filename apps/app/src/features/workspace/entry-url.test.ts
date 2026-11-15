@@ -2907,6 +2907,39 @@ test('both channel composers retain the durable task target before the domain sn
   }
 })
 
+test('empty chat starters preserve an editable unsent draft', () => {
+  let sends = 0
+  const shared = { ...parityShared(), fresh: new Set<string>(), interrupted: [], chatSlot: { conversationId: 'chat', missing: false }, sendMessage: async () => { sends++; return true } }
+  const harness = conversationHarness(() => shared)
+  const suggestions = () => harness.render().filter(({ type, props }) => type === 'Button' && starters.general.includes(componentText(props.children)))
+  try {
+    assert.equal(harness.chatEntries().length, 0)
+    assert.equal(suggestions().length, starters.general.length)
+    const starter = suggestions()[0]
+    assert.ok(starter?.props.onClick)
+    const example = componentText(starter.props.children)
+    starter.props.onClick()
+    assert.equal(harness.composer()?.value, example)
+    assert.equal(suggestions().length, 0)
+    assert.doesNotMatch(componentText(harness.render()), /选一句填入草稿/)
+    assert.equal(sends, 0)
+
+    const change = harness.composer()?.onChange
+    assert.ok(typeof change === 'function')
+    const edited = `${example}，保留我补充的要求。`
+    change(edited)
+    assert.equal(harness.composer()?.value, edited)
+    assert.equal(suggestions().length, 0)
+    change('')
+    assert.equal(harness.composer()?.value, '')
+    assert.equal(suggestions().length, starters.general.length)
+    change(' \n\t')
+    assert.equal(harness.composer()?.value, ' \n\t')
+    assert.equal(suggestions().length, starters.general.length)
+    assert.equal(sends, 0)
+  } finally { harness.app.close() }
+})
+
 test('chat task groups stay at their originating message and orphan tasks remain available only in history', () => {
   const messages = [
     { message_id: 'one', event_hash: 'one', role: 'user', text: '核对项目', created_at_ms: 1 },
