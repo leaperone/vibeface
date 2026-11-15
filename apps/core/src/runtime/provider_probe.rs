@@ -1135,8 +1135,14 @@ exit 1
             .join(uuid::Uuid::new_v4().to_string());
         crate::config::private_dir(&dir)?;
         let bin = dir.join("provider");
-        std::fs::write(&bin, format!("#!/bin/sh\n{script}\n"))?;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700))?;
+        let body = dir.join("provider-script");
+        std::fs::write(&body, format!("#!/bin/sh\n{script}\n"))?;
+        std::fs::set_permissions(&body, std::fs::Permissions::from_mode(0o600))?;
+        // Another test's child can inherit the body's writable FD before exec closes it.
+        std::os::unix::fs::symlink(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-probe"),
+            &bin,
+        )?;
         Ok((
             dir,
             ProbeInput {
@@ -1172,6 +1178,29 @@ exit 1
             None
         );
         assert_eq!(claude_authentication_response(b"not json", false), None);
+    }
+
+    #[tokio::test]
+    async fn probe_fixture_runs_while_its_script_body_has_a_writer() -> anyhow::Result<()> {
+        let (dir, input) = fixture(
+            r#"
+[ "$*" = "auth status --json" ] || exit 9
+printf '%s\n' '{"loggedIn":false}'
+exit 1
+"#,
+        )?;
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("provider-script"))?;
+        assert_eq!(
+            claude_authentication(&input, &dir)
+                .await
+                .map_err(|issue| anyhow::anyhow!("controlled probe failed: {issue:?}"))?,
+            Some(Authentication::SignInRequired)
+        );
+        drop(writer);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[tokio::test]
