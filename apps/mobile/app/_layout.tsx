@@ -2,7 +2,7 @@ import '@/platform/polyfills'
 import '../global.css'
 
 import { useLinkingURL } from 'expo-linking'
-import { Link, Stack, router, usePathname } from 'expo-router'
+import { Link, Stack, router, usePathname, useRouter } from 'expo-router'
 import { ListChecks, MessageSquare, Settings, X } from 'lucide-react-native'
 import * as SystemUI from 'expo-system-ui'
 import { StatusBar } from 'expo-status-bar'
@@ -42,6 +42,7 @@ export default function RootLayout() {
 }
 
 function Screens() {
+  const router = useRouter()
   const workspace = useWorkspace()
   const shared = useLive()
   const [background, foreground] = useCSSVariable(['--background', '--foreground']) as [string, string]
@@ -58,7 +59,7 @@ function Screens() {
     if (device.linkTarget(link) === 'other') router.push({ pathname: '/switch-network', params: { link } })
     // Reset to home alone: navigate would stack home on the focused join page, which the protected group cannot drop, and any screen left below keeps a back button.
     else { if (router.canDismiss()) router.dismissAll(); router.replace('/') }
-  }, [url, ready])
+  }, [url, ready, router])
   const wide = useWide()
   const pathname = usePathname()
   const insets = useSafeAreaInsets()
