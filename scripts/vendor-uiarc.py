@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 COMMIT = "859606819c68787b2dccb54adcb9b08bd3272d5d"
 REPOSITORY = "https://github.com/WheatXie/uiarc-pro-reverse"
-IMPORT = re.compile(r"(?:from\s*|import\s*)[\"'](\.[^\"']+)[\"']")
+IMPORT = re.compile(r"(?m)^(?:import|export)\s+(?:type\s+)?(?:[\w{},*$\s]*\sfrom\s*)?[\"'](\.[^\"']+)[\"']")
 
 
 def sha256(data):
@@ -45,6 +45,7 @@ def main():
             parser.error(f"Missing Arc item: {entry}")
         pending.append(entry)
     seen = set()
+    acquired = {}
     while pending:
         path = pending.pop().resolve()
         if not path.is_relative_to(library) or "demo" in path.name:
@@ -59,8 +60,9 @@ def main():
             expected = manifest["files"][relative.as_posix()]["sha256"]
             if sha256(target.read_bytes()) != expected:
                 parser.error(f"Refusing to replace locally modified source: {target}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
+        elif target.exists() and target.read_bytes() != data:
+            parser.error(f"Refusing to replace untracked local source: {target}")
+        acquired[relative] = data
         manifest["files"][relative.as_posix()] = {
             "path": "src/components/arc/" + relative.as_posix(), "sha256": sha256(data),
         }
@@ -72,6 +74,10 @@ def main():
                 if resolved is None:
                     parser.error(f"Unresolved upstream import {specifier} in {path}")
                 pending.append(resolved)
+    for relative, data in acquired.items():
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
     manifest["items"] = sorted(set(manifest["items"]) | set(args.items))
     manifest["files"] = dict(sorted(manifest["files"].items()))
     manifest_file.write_text(json.dumps(manifest, indent=2) + "\n")

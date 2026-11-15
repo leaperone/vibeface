@@ -2,22 +2,33 @@
   "repository": "https://github.com/WheatXie/uiarc-pro-reverse",
   "commit": "859606819c68787b2dccb54adcb9b08bd3272d5d",
   "items": [
+    "agent-approvals",
+    "agent-run",
+    "ai-chat",
+    "ai-composer",
     "alert",
     "avatar",
     "badge",
     "button",
     "card",
+    "chat-thread",
     "checkbox",
     "dialog",
     "drawer",
     "empty-state",
     "input",
+    "metric-card",
     "popover",
     "progress",
+    "radio-group",
     "scroll-area",
+    "security-settings",
     "segmented-control",
     "select",
+    "settings-page",
+    "sidebar",
     "skeleton",
+    "stepper",
     "switch",
     "tabs",
     "textarea",
@@ -25,6 +36,38 @@
     "tooltip"
   ],
   "files": {
+    "agent-approvals/agent-approvals.module.css": {
+      "path": "src/components/arc/agent-approvals/agent-approvals.module.css",
+      "sha256": "33b567a9166fe65e59d9e10717a9a2c0cf9e4991d3d06a0adf36becc54bb98fd"
+    },
+    "agent-approvals/agent-approvals.tsx": {
+      "path": "src/components/arc/agent-approvals/agent-approvals.tsx",
+      "sha256": "8abaa3685c9d347487e760a608e6821a3764cebe1a22970f33f73bf4efa27786"
+    },
+    "agent-run/agent-run.module.css": {
+      "path": "src/components/arc/agent-run/agent-run.module.css",
+      "sha256": "01b5308f258d2c87493969779bb36195e61b2b49087423f765ba23373291c176"
+    },
+    "agent-run/agent-run.tsx": {
+      "path": "src/components/arc/agent-run/agent-run.tsx",
+      "sha256": "aebdc383dfed27dad722c6f0c40304dd6db23ce82d9bd109b539490d3151ca80"
+    },
+    "ai-chat/ai-chat.module.css": {
+      "path": "src/components/arc/ai-chat/ai-chat.module.css",
+      "sha256": "9ed1647556c7656697d1e4e054e7c623c7d4835e1d306e79d6beb5326523be9c"
+    },
+    "ai-chat/ai-chat.tsx": {
+      "path": "src/components/arc/ai-chat/ai-chat.tsx",
+      "sha256": "f2d68c351098aa08038a84221bb62897b83e0b70e542444c745a276a2f759c05"
+    },
+    "ai-composer/ai-composer.module.css": {
+      "path": "src/components/arc/ai-composer/ai-composer.module.css",
+      "sha256": "023b81951aa929f474b251fed414b67d15809da2e9e700d6bf01c673789cde80"
+    },
+    "ai-composer/ai-composer.tsx": {
+      "path": "src/components/arc/ai-composer/ai-composer.tsx",
+      "sha256": "b45cc6dcf3082d13aa6288ddf5977bc19364d3526397a0787169d08f6bb39835"
+    },
     "alert/alert.module.css": {
       "path": "src/components/arc/alert/alert.module.css",
       "sha256": "ce86d259fa778a5b1a7e0881285759fa35889b6cde73ea678e26a49f3122d439"
@@ -32,6 +75,22 @@
     "alert/alert.tsx": {
       "path": "src/components/arc/alert/alert.tsx",
       "sha256": "ddcd481e2ebc6a1cbf6f053d6de1817d5dfd40b347e0bea561cc9fda2ea54950"
+    },
+    "animated-counter/animated-counter.module.css": {
+      "path": "src/components/arc/animated-counter/animated-counter.module.css",
+      "sha256": "33b7d7f0081f4fd3907a4fafcff64444581845a58cb7b0b7844c394a2e254adf"
+    },
+    "animated-counter/animated-counter.tsx": {
+      "path": "src/components/arc/animated-counter/animated-counter.tsx",
+      "sha256": "2542f8bcd8a413c7a846d440d917a3c11a77f4e016014dfdd242c4549df01750"
+    },
+    "avatar-group/avatar-group.module.css": {
+      "path": "src/components/arc/avatar-group/avatar-group.module.css",
+      "sha256": "987f967d124195ff5eb1fc757f1563fa96fddc2cb957140be2192d6c846ff8b5"
+    },
+    "avatar-group/avatar-group.tsx": {
+      "path": "src/components/arc/avatar-group/avatar-group.tsx",
+      "sha256": "8383dc60829fb281d0ef3f532e0cb41e02cdac80776012666f478e82413aac7e"
     },
     "avatar/avatar.module.css": {
       "path": "src/components/arc/avatar/avatar.module.css",
@@ -65,6 +124,14 @@
       "path": "src/components/arc/card/card.tsx",
       "sha256": "1e82f064e152aefefb9b34e89e019cca31919ce9ddcd84b480a88775fd4ad638"
     },
+    "chat-thread/chat-thread.module.css": {
+      "path": "src/components/arc/chat-thread/chat-thread.module.css",
+      "sha256": "31ea2e7d3e7593c5d191579e005fb1aa05bc92b541f8743eed2183171ef5a7e7"
+    },
+    "chat-thread/chat-thread.tsx": {
+      "path": "src/components/arc/chat-thread/chat-thread.tsx",
+      "sha256": "4566c8390ec9b22cc9336349b1550fd6f58f7fc8c54f59471de5d498aef76c17"
+    },
     "checkbox/checkbox.module.css": {
       "path": "src/components/arc/checkbox/checkbox.module.css",
       "sha256": "6cc8ae35edbd99dac2ea3768a6db0932429ecb06febab06e048a4b94974251b6"
@@ -72,6 +139,14 @@
     "checkbox/checkbox.tsx": {
       "path": "src/components/arc/checkbox/checkbox.tsx",
       "sha256": "4759251a0b2a83320cb4078e840f61481a23be0b38b9aa7c077c2e85e6dde00d"
+    },
+    "copy-button/copy-button.module.css": {
+      "path": "src/components/arc/copy-button/copy-button.module.css",
+      "sha256": "99434829f623b8e25f55123f228a05dbe41d5655399c0faceb9a28dcc0523b46"
+    },
+    "copy-button/copy-button.tsx": {
+      "path": "src/components/arc/copy-button/copy-button.tsx",
+      "sha256": "6bf34e1070d8b96211b5e5bf0b20fa7900b170a903d50844b84410f5415952ba"
     },
     "dialog/dialog.module.css": {
       "path": "src/components/arc/dialog/dialog.module.css",
@@ -89,6 +164,14 @@
       "path": "src/components/arc/drawer/drawer.tsx",
       "sha256": "eca310cb947c8da843f1128a77a2683c4e031519081da8c08d7ee405e5bbd87a"
     },
+    "dropdown-menu/dropdown-menu.module.css": {
+      "path": "src/components/arc/dropdown-menu/dropdown-menu.module.css",
+      "sha256": "4a1a34dbbb4f327cd9843ae8df2b9ce55c3cac979cc2d5d164bd960d5bdc02ab"
+    },
+    "dropdown-menu/dropdown-menu.tsx": {
+      "path": "src/components/arc/dropdown-menu/dropdown-menu.tsx",
+      "sha256": "93bcd4952628899159bfe984c43d3d23d91aa2eddbaec2ee8bea864e67406981"
+    },
     "empty-state/empty-state.module.css": {
       "path": "src/components/arc/empty-state/empty-state.module.css",
       "sha256": "e65e4c4b6e3bd31b8925cb6a5d58e8c4826ffca6efb100f786c70428f98afc1a"
@@ -100,6 +183,22 @@
     "foundation.css": {
       "path": "src/components/arc/foundation.css",
       "sha256": "a30519d85c44722973cc328d3797800944396387d3c93a1a1297c18d1a4d3d86"
+    },
+    "hold-to-confirm/hold-to-confirm.module.css": {
+      "path": "src/components/arc/hold-to-confirm/hold-to-confirm.module.css",
+      "sha256": "1dd13d04ac68b87905adf0416c764bcd8dba0ec631a478d0fc54d3135adc335f"
+    },
+    "hold-to-confirm/hold-to-confirm.tsx": {
+      "path": "src/components/arc/hold-to-confirm/hold-to-confirm.tsx",
+      "sha256": "1d5905798dedde34e7bad029e1287a7a1620337fae3dfc3bd0d03101d06580ed"
+    },
+    "hover-card/hover-card.module.css": {
+      "path": "src/components/arc/hover-card/hover-card.module.css",
+      "sha256": "2a847a6020215674247678354139cb7a9b7b5311f86f0a7d6403a3575c83ba2d"
+    },
+    "hover-card/hover-card.tsx": {
+      "path": "src/components/arc/hover-card/hover-card.tsx",
+      "sha256": "8fe88d6df8541251d9827336614a5f7a87026992eb66a42d8f71679d274d89c2"
     },
     "input/input.module.css": {
       "path": "src/components/arc/input/input.module.css",
@@ -113,13 +212,53 @@
       "path": "src/components/arc/lib/arc-provider.tsx",
       "sha256": "bcc7358163968a9508d81586134bf8d921d75783033182f81ca9015985815884"
     },
+    "lib/media.ts": {
+      "path": "src/components/arc/lib/media.ts",
+      "sha256": "84c9244304b9e494d3904f73c07fb057268797ccacef3046933ae6d0e9b187e0"
+    },
     "lib/motion-tokens.ts": {
       "path": "src/components/arc/lib/motion-tokens.ts",
       "sha256": "bec65d2e1b180dd3c574edc60cf84e0fa336e7ff8640eba0c70bcf0ae765fb8a"
     },
+    "lib/use-copy-feedback.ts": {
+      "path": "src/components/arc/lib/use-copy-feedback.ts",
+      "sha256": "d8dd6e434d362e83be2ea1b1b7f232714c8120480537daead1c3d73d6f0b7357"
+    },
+    "metric-card/metric-card.module.css": {
+      "path": "src/components/arc/metric-card/metric-card.module.css",
+      "sha256": "733ad2b10292f583f11a7b4e21c09b0d9334bfff15c8abb52baab965dc851235"
+    },
+    "metric-card/metric-card.tsx": {
+      "path": "src/components/arc/metric-card/metric-card.tsx",
+      "sha256": "ac550e49b6e9f680f32a694dd27cb42597795465d4709f2418230fbbde865906"
+    },
     "motion-tokens.ts": {
       "path": "src/components/arc/motion-tokens.ts",
       "sha256": "81235a2bf09738ff9ad8d49ab50631d6a31541838dbc84414f8d97544c2fde73"
+    },
+    "otp-input/otp-input.module.css": {
+      "path": "src/components/arc/otp-input/otp-input.module.css",
+      "sha256": "4bcfd659a2d6597f558ae2d02214c1dabfcbc795fca8a664b1abda369a872640"
+    },
+    "otp-input/otp-input.tsx": {
+      "path": "src/components/arc/otp-input/otp-input.tsx",
+      "sha256": "9b7c948a73d93c2d31f1c031b70ba62c969689fe4625d1762d1e4418c39f30bf"
+    },
+    "password-field/password-field.module.css": {
+      "path": "src/components/arc/password-field/password-field.module.css",
+      "sha256": "75a61ff590b700812e5f62af47f7dc268b807e109ad570d4d990e7d62ed5204f"
+    },
+    "password-field/password-field.tsx": {
+      "path": "src/components/arc/password-field/password-field.tsx",
+      "sha256": "2064f0f2d6ab79aa34c82f67e6e68464ae062435cb69ede3314bd199ae84f35a"
+    },
+    "password-strength/password-strength.module.css": {
+      "path": "src/components/arc/password-strength/password-strength.module.css",
+      "sha256": "57080bc46186fa8643600e5ee609e63fc4b6c741ef23cf158f1abccc3747dd68"
+    },
+    "password-strength/password-strength.tsx": {
+      "path": "src/components/arc/password-strength/password-strength.tsx",
+      "sha256": "8271b05ab8102aaf9cf39b097d97f1112da41dc6f705c22e5842fc96e3cf8996"
     },
     "popover/popover.module.css": {
       "path": "src/components/arc/popover/popover.module.css",
@@ -137,6 +276,14 @@
       "path": "src/components/arc/progress/progress.tsx",
       "sha256": "53f96b8e42315c9c261338bd96f74d74f6db22b5de935ae3ec02e20cfb64ae1e"
     },
+    "radio-group/radio-group.module.css": {
+      "path": "src/components/arc/radio-group/radio-group.module.css",
+      "sha256": "b5a7ececee88f400799ee00c1a710a278a776a5930f76388f8f0fe99c7602929"
+    },
+    "radio-group/radio-group.tsx": {
+      "path": "src/components/arc/radio-group/radio-group.tsx",
+      "sha256": "b64932d460b1366d5bd057af9bb372003380da8afb3ec306754fafa025d8a3eb"
+    },
     "scroll-area/scroll-area.module.css": {
       "path": "src/components/arc/scroll-area/scroll-area.module.css",
       "sha256": "904fdc63e0f818ad95ea148637dcbdd3e1a7c29408928fae2126f26abdf21bbb"
@@ -144,6 +291,14 @@
     "scroll-area/scroll-area.tsx": {
       "path": "src/components/arc/scroll-area/scroll-area.tsx",
       "sha256": "82c53c56af335d0a6d808ecd4cbb3c97e8fa83ca56ccd35f71605ae8dd8b0891"
+    },
+    "security-settings/security-settings.module.css": {
+      "path": "src/components/arc/security-settings/security-settings.module.css",
+      "sha256": "cc0b7cf16dbe5db0e738ae0df9ec2fac9b36dbc09fe18c29ffc725253d5f2dc8"
+    },
+    "security-settings/security-settings.tsx": {
+      "path": "src/components/arc/security-settings/security-settings.tsx",
+      "sha256": "f7e77c2a615a25e7aec81f4e954c432c04951ca39f9103c22e6bf60084b053dd"
     },
     "segmented-control/segmented-control.module.css": {
       "path": "src/components/arc/segmented-control/segmented-control.module.css",
@@ -161,6 +316,22 @@
       "path": "src/components/arc/select/select.tsx",
       "sha256": "673dc0c887a255c87bfbabd1835606d87cfbf59ed6fd4909a28038f00f673eaa"
     },
+    "settings-page/settings-page.module.css": {
+      "path": "src/components/arc/settings-page/settings-page.module.css",
+      "sha256": "8e011a061302377a35ea12f384f3df7414d2b69e873f043512d7b678b4b9e534"
+    },
+    "settings-page/settings-page.tsx": {
+      "path": "src/components/arc/settings-page/settings-page.tsx",
+      "sha256": "e69ab43b0c235135682516ec3c49d11150917873076b6d708fff7a7fff6b8ba2"
+    },
+    "sidebar/sidebar.module.css": {
+      "path": "src/components/arc/sidebar/sidebar.module.css",
+      "sha256": "a915870b5499ec5921a6876aeba5fafa4072ab7c6a472d86ff12315f4f044b65"
+    },
+    "sidebar/sidebar.tsx": {
+      "path": "src/components/arc/sidebar/sidebar.tsx",
+      "sha256": "c8155c5dade5b91a4ce65ca7265f24777a9222686494efd28f963c71f45f45ad"
+    },
     "skeleton/skeleton.module.css": {
       "path": "src/components/arc/skeleton/skeleton.module.css",
       "sha256": "ba4b3fa1d7f9df341c4c3a5e302d43178015f15030715ddb3ced2116cecf0588"
@@ -168,6 +339,14 @@
     "skeleton/skeleton.tsx": {
       "path": "src/components/arc/skeleton/skeleton.tsx",
       "sha256": "73b97715698fa54f6f0eaeefb6a8d795977297dd998439d1e595361e5da6d3b5"
+    },
+    "stepper/stepper.module.css": {
+      "path": "src/components/arc/stepper/stepper.module.css",
+      "sha256": "3762deb9d9cda692a33c81510c811cae11aebadcd82ce58d4ea3b84b3ed5c569"
+    },
+    "stepper/stepper.tsx": {
+      "path": "src/components/arc/stepper/stepper.tsx",
+      "sha256": "7b4034915b0902b16e6dd2e54dfae4ce40fd9b2d4fd09e736f9e196d97fc6c17"
     },
     "switch/switch.module.css": {
       "path": "src/components/arc/switch/switch.module.css",
@@ -184,6 +363,22 @@
     "tabs/tabs.tsx": {
       "path": "src/components/arc/tabs/tabs.tsx",
       "sha256": "3b0aaf6f0c41ce486e697ee3c9c86ce874fb2a22b1dab433226027de7858af0a"
+    },
+    "text-morph/text-morph.module.css": {
+      "path": "src/components/arc/text-morph/text-morph.module.css",
+      "sha256": "bd51e5ba739e7b7272ad4b46fb500617aaaefb2ae4303010edaea6057f975989"
+    },
+    "text-morph/text-morph.tsx": {
+      "path": "src/components/arc/text-morph/text-morph.tsx",
+      "sha256": "24b6559369ab4e5ca84e4465f3c9e4a973f3c259e90a539f8778c0cc0b9042c2"
+    },
+    "text-shimmer/text-shimmer.module.css": {
+      "path": "src/components/arc/text-shimmer/text-shimmer.module.css",
+      "sha256": "a16da76e363bd7cec888c848b67043f5e1000f8bf9f1b3cc57a0dd01109ace4b"
+    },
+    "text-shimmer/text-shimmer.tsx": {
+      "path": "src/components/arc/text-shimmer/text-shimmer.tsx",
+      "sha256": "021bfe6d2ae791f2e4e3832473e2bb76b01e929aded277025810013045950236"
     },
     "textarea/textarea.module.css": {
       "path": "src/components/arc/textarea/textarea.module.css",

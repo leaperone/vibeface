@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
+python3 "$repo/scripts/check-uiarc.py"
 python3 "$repo/scripts/build-inputs.py" check crypto
 python3 "$repo/scripts/build-inputs.py" prepare web
 cd "$repo/apps/app"
@@ -13,6 +14,7 @@ if ! command -v pnpm >/dev/null; then
   exit 1
 fi
 pnpm install --frozen-lockfile --filter "vibeface-web..." --filter "vibeface-mobile..."
+node "$repo/scripts/check-uiarc-build.mjs"
 pnpm run generate-routes
 pnpm run test
 pnpm run typecheck

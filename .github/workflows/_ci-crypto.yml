@@ -1,6 +1,9 @@
 name: Reusable / Browser cryptography
 
 on:
+  workflow_dispatch:
+    inputs:
+      source_sha: {description: Exact source commit to build, type: string, required: true}
   workflow_call:
     inputs:
       source_sha: {type: string, required: true}
