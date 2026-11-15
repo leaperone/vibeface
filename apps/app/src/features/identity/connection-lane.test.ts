@@ -198,6 +198,48 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
 }
 
 const notMember = { principal: null, initialized: true, network_id: network, revoked: false }
+
+test('sync watermarks follow their network across entry changes and reconnects', async () => {
+  const app = deviceHarness()
+  const firstAuthor = 'd'.repeat(64), otherAuthor = 'e'.repeat(64), otherNetwork = 'f'.repeat(64)
+  const peer = { ...entry, device_id: remote }
+  const other = { ...entry, device_id: '4'.repeat(64) }
+  const verified = app.secure.verifyAuthentication()
+  const connect = async (candidate: ConnectionEntry, networkId: string, vector: Record<string, number>) => {
+    app.secure.verifyAuthentication = () => ({ ...verified, principal: { ...verified.principal, network_id: networkId }, view: { ...verified.view, network_id: networkId } })
+    const info = deferred(), subscription = deferred()
+    info.resolve({ device_id: candidate.device_id, name: 'node', version: 'test', initialized: true, network_id: networkId })
+    subscription.resolve({ vector })
+    app.holds.set('info', info); app.holds.set('subscribe', subscription)
+    await app.render().connect(candidate)
+    return app.render()
+  }
+  const subscribedVector = () => plain(app.requests.findLast(request => request.method === 'subscribe')?.params.vector)
+  try {
+    app.render(); await settle(); app.render()
+    let device = await connect(entry, network, { [firstAuthor]: 10 })
+    assert.equal(device.ready?.catchingUp?.(), false)
+    assert.deepEqual(subscribedVector(), {})
+
+    device = await connect(peer, network, { [firstAuthor]: 5 })
+    assert.equal(device.ready?.catchingUp?.(), true, 'an older entry in the same network must catch up')
+    assert.deepEqual(subscribedVector(), { [firstAuthor]: 10 })
+
+    device.disconnect()
+    device = await connect(other, otherNetwork, { [otherAuthor]: 2 })
+    assert.equal(device.ready?.catchingUp?.(), false, 'another network must not inherit the first network watermark')
+    assert.deepEqual(subscribedVector(), {})
+
+    device.disconnect()
+    device = await connect(peer, network, { [firstAuthor]: 7 })
+    assert.equal(device.ready?.catchingUp?.(), true, 'returning to the first network retains its own watermark')
+    assert.deepEqual(subscribedVector(), { [firstAuthor]: 10 })
+
+    device = await connect(entry, network, { [firstAuthor]: 10 })
+    assert.equal(device.ready?.catchingUp?.(), false)
+  } finally { app.close() }
+})
+
 const recoveryCheckpoint = '8'.repeat(64)
 function recoveryApprovalHarness() {
   const app = deviceHarness({ management: true, saved: true })
