@@ -20,6 +20,24 @@
         ],
         "createdAt": "2026-11-14T15:57:16.806Z",
         "reason": "Agent: unchanged website step-number and inner-page label typography at base 963e27b3 is intentional; this exception is limited to the website stylesheet."
+      },
+      {
+        "rule": "side-tab",
+        "value": "*",
+        "files": [
+          "apps/app/src/features/chat/chat.css"
+        ],
+        "createdAt": "2026-11-15T07:56:37.060Z",
+        "reason": "Agent: existing Markdown blockquote uses a neutral border to identify quoted content, not a decorative card accent."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#000",
+        "files": [
+          "apps/app/src/features/chat/chat.css"
+        ],
+        "createdAt": "2026-11-15T07:56:48.264Z",
+        "reason": "Agent: black is an alpha-mask stop for truncated code, not a painted UI color or palette addition."
       }
     ]
   }
