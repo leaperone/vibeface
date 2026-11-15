@@ -96,7 +96,7 @@ export function Panel({ icon, title, children }: { icon: LucideIcon; title: stri
   return <View className="gap-4">
     <View className="flex-row items-center gap-2">
       <Icon as={icon} className="text-muted-foreground" />
-      <Text role="heading" className="text-heading font-semibold">{title}</Text>
+      <Text role="heading" className="min-w-0 flex-1 text-heading font-semibold">{title}</Text>
     </View>
     {children}
   </View>

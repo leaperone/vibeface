@@ -47,10 +47,10 @@ const buttonVariants = cva(
         link: '',
       },
       size: {
-        default: cn('min-h-11 px-4 py-2', Platform.select({ web: 'has-[>svg]:px-3' })),
-        sm: cn('min-h-9 gap-1.5 px-3', Platform.select({ web: 'has-[>svg]:px-2.5' })),
+        default: cn('min-h-11 px-4 py-2', Platform.select({ ios: 'min-w-11', android: 'min-h-12 min-w-12', web: 'has-[>svg]:px-3' })),
+        sm: cn('min-h-9 gap-1.5 px-3', Platform.select({ ios: 'min-h-11 min-w-11', android: 'min-h-12 min-w-12', web: 'has-[>svg]:px-2.5' })),
         // No sm: steps; on iPad widths they would override a caller's size.
-        icon: 'size-11',
+        icon: Platform.select({ android: 'size-12', default: 'size-11' }),
       },
     },
     defaultVariants: {
