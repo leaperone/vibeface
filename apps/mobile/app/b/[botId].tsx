@@ -1,6 +1,6 @@
 import { historySections } from '@vibeface/client/workspace/model.ts'
 import { HistoryControls } from '@/features/chat/history-controls'
-import { Link, Stack, router, useFocusEffect, useLocalSearchParams } from 'expo-router'
+import { Link, Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
 import { ArrowDown, Bot, Crown, LoaderCircle, MessageSquareOff, Settings, Star } from 'lucide-react-native'
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -92,6 +92,7 @@ function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>, b
 }
 
 export default function ChatScreen() {
+  const router = useRouter()
   const { botId, routine } = useLocalSearchParams<{ botId: string; routine?: string }>()
   const workspace = useWorkspace()
   const device = useDevice()

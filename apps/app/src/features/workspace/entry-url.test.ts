@@ -1907,6 +1907,8 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       focusEffects.set(index, { run, cleanup: focused ? run() ?? undefined : undefined })
     })
   }
+  const nativeRouterModule = dependencies['expo-router']
+  const nativeRouter = typeof nativeRouterModule === 'object' && nativeRouterModule !== null && 'router' in nativeRouterModule ? nativeRouterModule.router : {}
   const require = (specifier: string): unknown => {
     if (specifier === '@vibeface/client/workspace/model.ts') {
       const override = dependencies[specifier]
@@ -1927,7 +1929,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     if (specifier === '@/platform/files') return dependencies[specifier] ?? { privateFiles: { run: async (operation: (current: () => boolean) => Promise<unknown>) => operation(() => true), retain: (uri: string) => ({ uri }), release() {}, releasePicker() {} } }
     if (specifier === '@/platform') return { mobilePlatform: { storage: platformStorage }, ...dependencies[specifier] as object }
     if (specifier === '@tanstack/react-router') return { Link: 'Link', useNavigate: () => () => {}, useRouterState: ({ select }: { select: (state: unknown) => unknown }) => select({ location: { search: {} } }), ...dependencies[specifier] as object }
-    return specifier === 'react' ? react : specifier === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : specifier === 'expo-router' ? { Link: 'Link', useFocusEffect, ...dependencies[specifier] as object } : dependencies[specifier] ?? ui
+    return specifier === 'react' ? react : specifier === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : specifier === 'expo-router' ? { Link: 'Link', useFocusEffect, useRouter: () => nativeRouter, ...dependencies[specifier] as object } : dependencies[specifier] ?? ui
   }
   const filename = fileURLToPath(new URL(path, import.meta.url))
   const source = readFileSync(filename, 'utf8') + (privateExport ? `\nexport { ${privateExport} }\n` : '')
@@ -5191,7 +5193,7 @@ test('the native switch confirmation fixes the decoded entry and never erases fo
   let url = link, erased = 0, canceled = 0
   const kept: (string | null)[] = [], failures: unknown[] = []
   const app = componentHarness('../../../../../apps/mobile/app/switch-network.tsx', {
-    'expo-router': { router: { back: () => { canceled++ } }, useLocalSearchParams: () => ({ link }) },
+    'expo-router': { router: { back() { throw new Error('module router is unbound') } }, useRouter: () => ({ back: () => { canceled++ } }), useLocalSearchParams: () => ({ link }) },
     'expo-linking': { useLinkingURL: () => url },
     '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: { members: [] }, linkTarget: () => 'other' }) },
     '@vibeface/client/identity/copy.ts': { soleManager: () => false, switchCopy: { title: '换到新的网络？', erase: () => '清除应用内数据', confirm: '换网络' } },

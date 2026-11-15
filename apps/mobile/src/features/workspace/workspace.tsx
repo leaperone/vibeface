@@ -1,5 +1,5 @@
 import { File } from 'expo-file-system'
-import { Link, Stack, router, useFocusEffect } from 'expo-router'
+import { Link, Stack, useFocusEffect, useRouter } from 'expo-router'
 import { BrainCircuit, ChevronRight, CircleQuestionMark, ListChecks, MessagesSquare, Plus, Reply, Settings, X } from 'lucide-react-native'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Pressable, ScrollView, View } from 'react-native'
@@ -72,6 +72,7 @@ export function WorkspaceTasks({ botFilter = 'all', filter = 'all' }: { botFilte
 }
 
 export function CreateTaskScreen() {
+  const router = useRouter()
   const shared = useLive()
   const { busy, error, run } = useRun()
   const [botId, setBotId] = useState(shared?.selectedBot?.bot_id ?? shared?.bots[0]?.bot_id ?? '')
@@ -108,6 +109,7 @@ export function ChannelsScreen() {
 }
 
 export function ChannelSettingsScreen({ channelId }: { channelId?: string }) {
+  const router = useRouter()
   const shared = useLive()
   const { ready } = useDevice()
   const channel = shared?.workspaceState?.channels.find((item) => item.channel_id === channelId)
@@ -166,6 +168,7 @@ export function InputStatus({ pending }: { pending: PendingMessage }) {
 }
 
 export function ScopedWorkspaceScreen({ taskId, channelId }: { taskId?: string; channelId?: string }) {
+  const router = useRouter()
   const shared = useLive()
   const chrome = useChatChrome()
   const { ready } = useDevice()

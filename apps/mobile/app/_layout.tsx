@@ -2,7 +2,7 @@ import '@/platform/polyfills'
 import '../global.css'
 
 import { useLinkingURL } from 'expo-linking'
-import { Link, Stack, router, usePathname, useRouter } from 'expo-router'
+import { Link, Stack, usePathname, useRouter } from 'expo-router'
 import { ListChecks, MessageSquare, Settings, X } from 'lucide-react-native'
 import * as SystemUI from 'expo-system-ui'
 import { StatusBar } from 'expo-status-bar'
@@ -107,16 +107,16 @@ function Screens() {
             <Stack.Screen name="new-channel" options={{ title: '新频道' }} />
             <Stack.Screen name="channel/[channelId]" options={{ title: '频道' }} />
             <Stack.Screen name="channel/[channelId]/settings" options={{ title: '频道设置' }} />
-            <Stack.Screen name="new-bot" options={{ title: '新 Bot', presentation: 'modal', headerLeft: Close }} />
+            <Stack.Screen name="new-bot" options={{ title: '新 Bot', presentation: 'modal', headerLeft: () => <Close /> }} />
             {/* Opened from the new bot sheet it is a sheet too, with no back button of its own. */}
-            <Stack.Screen name="ai" options={({ route }) => ({ title: 'Bot 与任务', headerLeft: (route.params as { sheet?: string } | undefined)?.sheet ? Close : undefined })} />
+            <Stack.Screen name="ai" options={({ route }) => ({ title: 'Bot 与任务', headerLeft: (route.params as { sheet?: string } | undefined)?.sheet ? () => <Close /> : undefined })} />
             <Stack.Screen name="settings" options={(props) => ({ title: '设置', ...root, ...viaTab(props) })} />
             <Stack.Screen name="lab" options={{ title: '实验室' }} />
             <Stack.Screen name="logs" options={{ title: '日志' }} />
             <Stack.Screen name="external-chat" options={{ title: '外部聊天' }} />
             <Stack.Screen name="transfers" options={{ title: '文件传输' }} />
             <Stack.Screen name="device/[deviceId]" options={{ title: '' }} />
-            <Stack.Screen name="add-device" options={{ title: '添加设备', presentation: 'modal', headerLeft: Close }} />
+            <Stack.Screen name="add-device" options={{ title: '添加设备', presentation: 'modal', headerLeft: () => <Close /> }} />
             <Stack.Screen name="recovery" options={{ title: '换恢复密码' }} />
             <Stack.Screen name="switch-network" options={{ headerShown: false, presentation: 'formSheet', sheetAllowedDetents: 'fitToContents', sheetGrabberVisible: true }} />
           </Stack.Protected>
@@ -147,5 +147,6 @@ function Screens() {
 
 /** A sheet's own way out, beside the swipe down that not everyone knows. */
 function Close() {
+  const router = useRouter()
   return <Button variant="ghost" size="icon" className="rounded-full" accessibilityLabel="关闭" onPress={() => router.back()}><Icon as={X} className="size-5" /></Button>
 }
