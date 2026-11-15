@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { ChevronRight, ListChecks, Plus } from 'lucide-react'
-import { EmptyState, InlineError, StatusPill, useAction } from '@/components/app/kit'
+import { ChevronRight, Plus } from 'lucide-react'
+import { InlineError, StatusPill, useAction } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -34,7 +34,7 @@ export function WorkspaceTasks({ botFilter = 'all', filter = 'all' }: { botFilte
     <div className="flex items-center justify-between gap-3"><h2 id="workspace-tasks-heading" className="text-heading font-semibold">任务对话</h2><Button type="button" variant="outline" disabled={!workspace.writable || !workspace.bots.length} onClick={() => setOpen(true)}><Plus aria-hidden="true" />新任务</Button></div>
     <p className="text-meta text-muted-foreground">每个任务保留独立对话。补充内容会继续发给这个任务。</p>
     <InlineError error={error} action={{ label: '重新读取', onClick: () => { setError(null); void workspace.readWorkspaceState().catch(setError) } }} />
-    {tasks.length ? <ul className="grid gap-3">{tasks.map((task) => <li key={task.task_id}><WorkspaceTaskLink task={task} /></li>)}</ul> : workspace.workspaceState ? <EmptyState icon={ListChecks} title={botFilter === 'all' ? '还没有任务对话' : '这个 Bot 还没有任务对话'} action={workspace.bots.length ? <Button type="button" variant="outline" disabled={!workspace.writable} onClick={() => setOpen(true)}>新任务</Button> : undefined} /> : <p role="status" className="text-meta text-muted-foreground">正在读取任务对话</p>}
+    {tasks.length ? <ul className="grid gap-3">{tasks.map((task) => <li key={task.task_id}><WorkspaceTaskLink task={task} /></li>)}</ul> : <p role="status" className="text-meta text-muted-foreground">{workspace.workspaceState ? botFilter === 'all' ? '还没有任务对话' : '这个 Bot 还没有任务对话' : '正在读取任务对话'}</p>}
     <CreateWorkspaceTask open={open} onOpenChange={setOpen} botId={botFilter === 'all' ? undefined : botFilter} />
   </section>
 }
@@ -42,7 +42,7 @@ export function WorkspaceTasks({ botFilter = 'all', filter = 'all' }: { botFilte
 export function WorkspaceTaskLink({ task }: { task: WorkspaceTask }) {
   const workspace = useWorkspace()
   const bot = workspace.bots.find((item) => item.bot_id === task.owner_bot)
-  return <Link to="/tasks/$taskId" params={{ taskId: task.task_id }} className="grid min-w-0 gap-2 rounded-xl border bg-card p-4 transition-colors hover:bg-muted/50 focus-visible:ring-3 focus-visible:ring-ring/50">
+  return <Link to="/tasks/$taskId" params={{ taskId: task.task_id }} className="grid min-w-0 gap-2 rounded-xl border bg-card p-4 [overflow-wrap:anywhere] transition-colors hover:bg-muted/50 focus-visible:ring-3 focus-visible:ring-ring/50">
     <span className="flex min-w-0 flex-wrap items-start gap-2"><span className="min-w-0 flex-1 [overflow-wrap:anywhere] font-medium">{task.title}</span><WorkspaceTaskPill task={task} /><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /></span>
     <span className="text-meta text-muted-foreground">{bot?.name ?? '所属 Bot 未加载'} · 第 {task.revision} 版{task.channel_id ? ' · 频道任务' : ''}</span>
     {task.waiting_reason ? <span className="text-meta text-warning">{task.waiting_reason}</span> : null}
