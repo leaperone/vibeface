@@ -3,8 +3,6 @@
 //! Provider output is untrusted diagnostic text. The types here keep it bounded and scrubbed
 //! before a probe can attach a safe category to a public readiness result.
 
-use std::process::ExitStatus;
-
 /// At most `limit` characters, without control characters but line breaks and tabs.
 pub(super) fn bounded(text: &str, limit: usize) -> String {
     text.chars()
@@ -165,47 +163,6 @@ fn redact_path_tokens(text: &str) -> String {
         .join(" ")
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct TerminationEvidence {
-    pub(super) success: bool,
-    pub(super) code: Option<i32>,
-    pub(super) signal: Option<i32>,
-}
-
-impl From<ExitStatus> for TerminationEvidence {
-    fn from(status: ExitStatus) -> Self {
-        #[cfg(unix)]
-        use std::os::unix::process::ExitStatusExt as _;
-
-        Self {
-            success: status.success(),
-            code: status.code(),
-            #[cfg(unix)]
-            signal: status.signal(),
-            #[cfg(not(unix))]
-            signal: None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum PendingDisconnectClassification {
-    NoPending,
-    Unknown,
-}
-
-/// A pending request remains an unknown result when the provider disconnects.
-pub(super) fn classify_pending_disconnect(
-    pending: bool,
-    _termination: Option<&TerminationEvidence>,
-) -> PendingDisconnectClassification {
-    if pending {
-        PendingDisconnectClassification::Unknown
-    } else {
-        PendingDisconnectClassification::NoPending
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,33 +180,5 @@ mod tests {
         assert!(!tail.text.contains("fixture-secret"));
         assert!(!tail.text.contains("/private/path"));
         assert_eq!(tail.safe_error(), Some("authentication_failed"));
-    }
-
-    #[test]
-    fn termination_evidence_keeps_exit_facts() {
-        let status = std::process::Command::new("sh")
-            .args(["-c", "exit 7"])
-            .status()
-            .expect("fixture process");
-        let evidence = TerminationEvidence::from(status);
-        assert!(!evidence.success);
-        assert_eq!(evidence.code, Some(7));
-    }
-
-    #[test]
-    fn pending_disconnect_is_unknown_only_when_a_request_was_pending() {
-        let evidence = TerminationEvidence {
-            success: false,
-            code: Some(1),
-            signal: None,
-        };
-        assert_eq!(
-            classify_pending_disconnect(false, Some(&evidence)),
-            PendingDisconnectClassification::NoPending
-        );
-        assert_eq!(
-            classify_pending_disconnect(true, Some(&evidence)),
-            PendingDisconnectClassification::Unknown
-        );
     }
 }
