@@ -1,13 +1,13 @@
-import { useEffect, useState, useSyncExternalStore } from "react"
-import { Link, useRouterState } from "@tanstack/react-router"
-import { ChevronRight, X } from "lucide-react"
-import { cn } from "@/lib/utils"
-import { Button } from "@/components/ui/button"
 import { terms } from "@/lib/glossary"
+import { cn } from "@/lib/utils"
+import { Link,useRouterState } from "@tanstack/react-router"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { deviceCopy } from "@vibeface/client/identity/copy.ts"
 import { parseNodeSettings } from "@vibeface/client/lib/node.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
+import { Button } from "@vibeface/uiarc/button/button.tsx"
+import { ChevronRight,X } from "lucide-react"
+import { useEffect,useState,useSyncExternalStore } from "react"
 
 const key = (device: string) => `vibeface.ai-off-hint.${device}`
 const listeners = new Set<() => void>()
@@ -45,10 +45,10 @@ export function AiOffHint({ className }: { className?: string }) {
     try { localStorage.setItem(key(entry), "dismissed") } catch {}
     listeners.forEach((listener) => listener())
   }
-  return <div className={cn("flex min-w-0 items-center rounded-lg text-meta text-info hover:bg-muted/50", className)}>
+  return <div className={cn("flex min-w-0 items-center rounded-control text-sm text-info hover:bg-surface-muted/50", className)}>
     <Link to="/devices/$deviceId" params={{ deviceId: entry }} className="flex min-h-10 min-w-0 flex-1 items-center gap-2 ps-2 max-md:min-h-11">
       <terms.ai.icon aria-hidden="true" className="size-4 shrink-0" /><span className="truncate">{deviceCopy.aiOff}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0" />
     </Link>
-    <Button type="button" variant="ghost" size="icon-sm" className="shrink-0 text-muted-foreground hover:bg-transparent max-md:size-11" aria-label="不再提示" title="不再提示" onClick={dismiss}><X aria-hidden="true" /></Button>
+    <Button type="button" variant="ghost" size="md" className="shrink-0" aria-label="不再提示" title="不再提示" onClick={dismiss}><X aria-hidden="true" /></Button>
   </div>
 }

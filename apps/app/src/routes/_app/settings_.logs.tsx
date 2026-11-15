@@ -1,17 +1,17 @@
-import { createFileRoute } from '@tanstack/react-router'
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { Bot, ChevronDown, CircleX, Code, Copy, Globe, Layers, ListChecks, MessagesSquare, MousePointerClick, RefreshCw, ScrollText, Search, Terminal, TriangleAlert, X, type LucideIcon } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { Details,EmptyState,InlineError,Segmented,Skeleton,toast } from '@/components/arc/product-kit'
 import { terms } from '@/lib/glossary'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
-import { Details, EmptyState, InlineError, Segmented, Skeleton, toast } from '@/components/app/kit'
+import { cn } from '@/lib/utils'
+import { createFileRoute } from '@tanstack/react-router'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { knownError } from '@vibeface/client/lib/errors.ts'
+import type { LogFilter,LogLevel,LogRecord,LogSource } from '@vibeface/client/lib/web-log.ts'
+import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { nodeName } from '@vibeface/client/workspace/labels.ts'
-import type { LogFilter, LogLevel, LogRecord, LogSource } from '@vibeface/client/lib/web-log.ts'
+import { Button } from '@vibeface/uiarc/button/button.tsx'
+import { Input } from '@vibeface/uiarc/input/input.tsx'
+import { Select } from "@vibeface/uiarc/select/select.tsx"
+import { Bot,ChevronDown,CircleX,Code,Copy,Globe,Layers,ListChecks,MessagesSquare,MousePointerClick,RefreshCw,ScrollText,Search,Terminal,TriangleAlert,X,type LucideIcon } from 'lucide-react'
+import { useCallback,useEffect,useRef,useState } from 'react'
 
 export const Route = createFileRoute('/_app/settings_/logs')({ component: LogsPage })
 
@@ -202,27 +202,24 @@ function LogsPage() {
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-4">
     <div className="flex items-center gap-2">
       <div className="relative min-w-0 flex-1">
-        <Search aria-hidden="true" className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
-        <Input type="search" aria-label="搜索日志" placeholder="搜索日志" className="h-10 ps-9 max-md:h-11" value={query} onChange={(event) => setQuery(event.target.value)} />
+        <Search aria-hidden="true" className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-secondary" />
+        <Input label={"搜索日志"} type="search" aria-label="搜索日志" placeholder="搜索日志" className="" value={query} onChange={(event) => setQuery(event.target.value)} />
       </div>
-      <Button type="button" variant="ghost" size="icon" className="-me-2.5 max-md:-me-3.5" aria-label="刷新" title="刷新" disabled={busy} onClick={() => { void load() }}>
+      <Button type="button" variant="ghost" size="md" className="-me-2.5 max-md:-me-3.5" aria-label="刷新" title="刷新" disabled={busy} onClick={() => { void load() }}>
         <RefreshCw aria-hidden="true" className={cn(busy && 'animate-spin')} />
       </Button>
     </div>
     <div className="flex flex-wrap items-center gap-2">
       <Segmented label="级别" labels fill value={level ?? 'all'} options={levelChoices} onChange={(value) => setLevel(value === 'all' ? undefined : value)} />
-      <NativeSelect aria-label="来源" className="ms-auto max-sm:w-full [&>select]:h-9 max-md:[&>select]:h-12" value={source ?? ''} onChange={(event) => setSource((event.target.value || undefined) as LogSource | undefined)}>
-        <NativeSelectOption value="">全部来源</NativeSelectOption>
-        {sourceChoices.map(([value, label]) => <NativeSelectOption key={value} value={value}>{label}</NativeSelectOption>)}
-      </NativeSelect>
+      <Select label={"来源"} className="ms-auto max-sm:w-full" value={"arc:" + String(source ?? '')} onValueChange={selected => { const value = selected.slice(4);  setSource((value || undefined) as LogSource | undefined)  }} options={[({ value: "arc:" + String(""), label: ["全部来源"].join("") }),sourceChoices.map(([value, label]) => ({ value: "arc:" + String(value), label: [label].join("") }))].flat().filter(option => option !== null && option !== undefined)} />
     </div>
     <InlineError error={error} />
     {records === null ? error ? null : <div className="grid gap-2" aria-busy="true"><Skeleton className="h-12" /><Skeleton className="h-12" /><Skeleton className="h-12" /></div> : records.length === 0
       ? <EmptyState icon={ScrollText} title={level || source || query ? "没有符合条件的记录" : "还没有日志"}
-        action={level || source || query ? <Button type="button" variant="outline" onClick={() => { setLevel(undefined); setSource(undefined); setQuery('') }}><X aria-hidden="true" />清除筛选</Button> : undefined} />
+        action={level || source || query ? <Button type="button" variant="secondary" onClick={() => { setLevel(undefined); setSource(undefined); setQuery('') }}><X aria-hidden="true" />清除筛选</Button> : undefined} />
       : <>
-        <p className="text-meta text-muted-foreground" aria-live="polite">{records.length >= SHOWN ? `最新 ${SHOWN} 条` : `共 ${records.length} 条`}</p>
-        <ul className="divide-y overflow-hidden rounded-xl border bg-card shadow-xs">
+        <p className="text-sm text-secondary" aria-live="polite">{records.length >= SHOWN ? `最新 ${SHOWN} 条` : `共 ${records.length} 条`}</p>
+        <ul className="divide-y overflow-hidden rounded-panel border bg-surface ">
           {records.map((record, index) => <LogRow key={`${record.ts_ms}-${index}`} record={record} name={(id) => nodeName(id, { nodes: workspace.nodes, directory: device.directory })} chat={workspace.bots.find((bot) => bot.conversation_id === record.conversation_id)?.name} task={record.work_id ? works.find((work) => work.work_id === record.work_id)?.title : undefined} open={open === index} onToggle={() => setOpen(open === index ? null : index)} onCopyAll={copyAll} />)}
         </ul>
       </>}
@@ -245,33 +242,33 @@ function LogRow({ record, name, chat, task, open, onToggle, onCopyAll }: { recor
   const names: Array<[string, string | undefined]> = [['对话', chat], ['任务', task]]
   const ids: Array<[string, string | undefined]> = [['事件', record.event], ['原文', record.message === title ? undefined : record.message], ['对话', record.conversation_id], ['任务', record.work_id], ['会话', record.thread_id]]
   return <li>
-    <button type="button" aria-expanded={open} onClick={onToggle} className="interactive-row flex w-full items-start gap-3 px-4 py-3 text-left">
-      {!Icon ? <span aria-hidden="true" className="size-4 shrink-0" /> : alert ? <Icon aria-label={alert.label} className={cn('mt-0.5 size-4 shrink-0', alert.tone)} /> : <Icon aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />}
+    <Button variant="ghost" type="button" aria-expanded={open} onClick={onToggle} className="interactive-row flex w-full items-start gap-3 px-4 py-3 text-left">
+      {!Icon ? <span aria-hidden="true" className="size-4 shrink-0" /> : alert ? <Icon aria-label={alert.label} className={cn('mt-0.5 size-4 shrink-0', alert.tone)} /> : <Icon aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-secondary" />}
       <span className="grid min-w-0 flex-1 gap-1">
-        <span className={cn('break-words', !open && 'line-clamp-2', quiet && 'text-muted-foreground', outside && 'font-mono text-meta')}>{title}</span>
-        {detail ? <span className={cn('break-words text-meta text-muted-foreground', !open && 'line-clamp-1')}>{detail}</span> : null}
-        <span className="flex min-w-0 items-center gap-2 text-meta text-muted-foreground">
+        <span className={cn('break-words', !open && 'line-clamp-2', quiet && 'text-secondary', outside && 'font-mono text-sm')}>{title}</span>
+        {detail ? <span className={cn('break-words text-sm text-secondary', !open && 'line-clamp-1')}>{detail}</span> : null}
+        <span className="flex min-w-0 items-center gap-2 text-sm text-secondary">
           <time className="shrink-0 tabular-nums" dateTime={new Date(record.ts_ms).toISOString()}>{time(record.ts_ms)}</time>
           {record.source === 'node' ? null : <span className="shrink-0">{sourceLabel[record.source]}</span>}
           {typeof record.fields?.repeated === 'number' ? <span className="shrink-0">又出现 {record.fields.repeated} 次</span> : null}
         </span>
       </span>
-      <ChevronDown aria-hidden="true" className={cn('mt-0.5 size-4 shrink-0 text-muted-foreground transition-transform duration-200', open && 'rotate-180')} />
-    </button>
-    {open ? <div className="grid gap-3 px-4 pb-4 ps-11 text-meta">
+      <ChevronDown aria-hidden="true" className={cn('mt-0.5 size-4 shrink-0 text-secondary transition-transform duration-200', open && 'rotate-180')} />
+    </Button>
+    {open ? <div className="grid gap-3 px-4 pb-4 ps-11 text-sm">
       {names.some(([, name]) => name) ? <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
-        {names.map(([label, name]) => name ? <div key={label} className="contents"><dt className="text-muted-foreground">{label}</dt><dd className="min-w-0 break-words">{name}</dd></div> : null)}
+        {names.map(([label, name]) => name ? <div key={label} className="contents"><dt className="text-secondary">{label}</dt><dd className="min-w-0 break-words">{name}</dd></div> : null)}
       </dl> : null}
       <Details label="技术详情">
         <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
-          {ids.map(([label, id]) => id ? <div key={label} className="contents"><dt>{label}</dt><dd className="min-w-0 break-all font-mono text-meta text-foreground">{id}</dd></div> : null)}
+          {ids.map(([label, id]) => id ? <div key={label} className="contents"><dt>{label}</dt><dd className="min-w-0 break-all font-mono text-sm text-foreground">{id}</dd></div> : null)}
         </dl>
-        {record.fields && Object.keys(record.fields).length ? <pre className="max-h-64 overflow-auto rounded-lg bg-muted p-3 font-mono text-meta whitespace-pre-wrap break-all text-foreground">{JSON.stringify(record.fields, null, 2)}</pre> : null}
+        {record.fields && Object.keys(record.fields).length ? <pre className="max-h-64 overflow-auto rounded-control bg-surface-muted p-3 font-mono text-sm whitespace-pre-wrap break-all text-foreground">{JSON.stringify(record.fields, null, 2)}</pre> : null}
       </Details>
       <div className="flex flex-wrap gap-2">
-        <Button type="button" size="sm" variant="outline" onClick={() => { void navigator.clipboard.writeText(JSON.stringify(record)).then(() => toast('已复制这条记录', { tone: 'success' })) }}><Copy aria-hidden="true" />复制这条</Button>
-        {record.conversation_id ? <Button type="button" size="sm" variant="outline" onClick={() => { void onCopyAll({ conversation_id: record.conversation_id }, '对话') }}><MessagesSquare aria-hidden="true" />复制对话日志</Button> : null}
-        {record.work_id ? <Button type="button" size="sm" variant="outline" onClick={() => { void onCopyAll({ work_id: record.work_id }, '任务') }}><ListChecks aria-hidden="true" />复制任务日志</Button> : null}
+        <Button type="button" size="sm" variant="secondary" onClick={() => { void navigator.clipboard.writeText(JSON.stringify(record)).then(() => toast('已复制这条记录', { tone: 'success' })) }}><Copy aria-hidden="true" />复制这条</Button>
+        {record.conversation_id ? <Button type="button" size="sm" variant="secondary" onClick={() => { void onCopyAll({ conversation_id: record.conversation_id }, '对话') }}><MessagesSquare aria-hidden="true" />复制对话日志</Button> : null}
+        {record.work_id ? <Button type="button" size="sm" variant="secondary" onClick={() => { void onCopyAll({ work_id: record.work_id }, '任务') }}><ListChecks aria-hidden="true" />复制任务日志</Button> : null}
       </div>
     </div> : null}
   </li>

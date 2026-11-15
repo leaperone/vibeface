@@ -1,8 +1,8 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react"
+import { toast } from "@/components/arc/product-kit"
 import { renderMarkdown } from "@/lib/markdown"
-import { markdownScheduler, type MarkdownResult } from "@/lib/markdown-scheduler"
+import { markdownScheduler,type MarkdownResult } from "@/lib/markdown-scheduler"
 import { cn } from "@/lib/utils"
-import { toast } from "./kit"
+import { memo,useEffect,useMemo,useRef,useState } from "react"
 
 /** Bot replies. Raw HTML is never rendered. */
 export const Markdown = memo(function Markdown({ text, className, streaming = false }: { text: string; className?: string; streaming?: boolean }) {

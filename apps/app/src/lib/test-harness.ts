@@ -35,8 +35,8 @@ export function hookHarness(lazyInitialState = false) {
   const afterRender: (() => void)[] = []
   let cursor = 0
   const react = {
-    createContext: () => ({}),
-    useContext: () => null,
+    createContext: (value: unknown) => ({ value }),
+    useContext: (context: { value: unknown }) => context.value,
     useState(initial: unknown) {
       const index = cursor++
       if (!(index in values)) {

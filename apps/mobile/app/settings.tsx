@@ -10,10 +10,10 @@ import { useWorkspace as useShared } from '@vibeface/client/workspace/context.ts
 import { ErrorText } from '@/components/action'
 import { OfflineBar } from '@/components/connection-pill'
 import { Online, SettingsGroup, SettingsRow } from '@/components/kit'
-import { Button } from '@/components/ui/button'
-import { Icon } from '@/components/ui/icon'
-import { Segmented } from '@/components/ui/segmented'
-import { Text } from '@/components/ui/text'
+import { Button } from '@/components/arc/button'
+import { Icon } from '@/components/arc/icon'
+import { Segmented } from '@/components/arc/segmented'
+import { Text } from '@/components/arc/text'
 import { useWorkspace } from '@/data/context'
 import type { Member } from '@/data/types'
 import { deviceIcon } from '@/features/devices/device-icon'
@@ -41,7 +41,7 @@ export default function Settings() {
   const open = (which: 'leave' | 'reset') => { void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning); reveal.current = true; setConfirming(which) }
   const reset = () => factoryReset(device)
   // The confirmation opens at the foot of the page, below the fold on a phone.
-  return <ScrollView ref={scroll} onContentSizeChange={() => { if (reveal.current) { reveal.current = false; scroll.current?.scrollToEnd() } }} contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
+  return <ScrollView ref={scroll} onContentSizeChange={() => { if (reveal.current) { reveal.current = false; scroll.current?.scrollToEnd() } }} contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-6 pb-12">
     {/* The home header already shows the connection; only a computer that does not answer is called out here, above the devices. */}
     <OfflineBar />
     <JoinRequests />
@@ -75,7 +75,7 @@ export default function Settings() {
       </SettingsGroup>
       {confirming === 'leave' && !device.ready ? <View className="gap-3 px-1">
         {/* Leaving is signed by the network, so it waits for a connection; an erase does not. */}
-        <View className="flex-row items-start gap-2"><Icon as={WifiOff} className="mt-1 text-muted-foreground" /><Text className="min-w-0 flex-1">连上网络才能断开。连不上的话，可以恢复出厂设置。</Text></View>
+        <View className="flex-row items-start gap-2"><Icon as={WifiOff} className="mt-1 text-muted" /><Text className="min-w-0 flex-1">连上网络才能断开。连不上的话，可以恢复出厂设置。</Text></View>
         <Button variant="ghost" className="-ms-3 self-start" onPress={() => setConfirming(null)}><Text>知道了</Text></Button>
       </View> : confirming === 'leave' && sole ? <View className="gap-3 px-1">
         <View className="flex-row items-start gap-2"><Icon as={Crown} className="mt-1 text-warning" /><Text className="min-w-0 flex-1">{onlyManagerText(self)}</Text></View>
@@ -89,7 +89,7 @@ export default function Settings() {
         <ErrorText error={error} />
         <View className="flex-row justify-end gap-2">
           <Button variant="ghost" onPress={() => setConfirming(null)}><Text>取消</Text></Button>
-          <Button variant="destructive" disabled={busy !== null} onPress={() => void run('leave', workspace.actions.leave)}><Icon as={LogOut} /><Text>断开</Text></Button>
+          <Button variant="danger" disabled={busy !== null} onPress={() => void run('leave', workspace.actions.leave)}><Icon as={LogOut} /><Text>断开</Text></Button>
         </View>
       </View> : confirming === 'reset' ? <View className="gap-3 px-1">
         {sole ? <View className="flex-row items-start gap-2"><Icon as={Crown} className="mt-1 text-warning" /><Text className="min-w-0 flex-1">{eraseSoleManagerText(self)}</Text></View> : null}
@@ -97,7 +97,7 @@ export default function Settings() {
         <ErrorText error={error} />
         <View className="flex-row justify-end gap-2">
           <Button variant="ghost" onPress={() => setConfirming(null)}><Text>取消</Text></Button>
-          <Button variant="destructive" disabled={busy !== null} onPress={() => void run('reset', reset)}><Icon as={RotateCcw} /><Text>清除</Text></Button>
+          <Button variant="danger" disabled={busy !== null} onPress={() => void run('reset', reset)}><Icon as={RotateCcw} /><Text>清除</Text></Button>
         </View>
       </View> : null}
     </View>
@@ -122,16 +122,16 @@ function SecurityStatus({ toDevices }: { toDevices(): void }) {
     {directory ? <><SettingsRow icon={Crown} label={securityCopy.managers} onPress={toDevices}>
       <View className="flex-row items-center gap-1">
         {managers === 1 ? <Icon as={TriangleAlert} className="size-4 text-warning" /> : null}
-        <Text className={managers === 1 ? 'text-meta text-warning' : 'text-meta text-muted-foreground'} style={tabular}>{securityCopy.managerCount(managers)}</Text>
-        <Icon as={ChevronUp} className="text-muted-foreground" />
+        <Text className={managers === 1 ? 'text-sm text-warning' : 'text-sm text-muted'} style={tabular}>{securityCopy.managerCount(managers)}</Text>
+        <Icon as={ChevronUp} className="text-muted" />
       </View>
     </SettingsRow>
     {pending ? <SettingsRow href="/tasks" icon={ShieldAlert} tone="danger" label={securityCopy.recovery}>
-      <Text className="text-meta text-danger" style={tabular}>{securityCopy.recoveryIn(pending.effective_at_ms - nodeClockOffset)}</Text>
-    </SettingsRow> : <SettingsRow icon={ShieldCheck} label={securityCopy.recovery}><Text className="text-meta text-muted-foreground">{securityCopy.noRecovery}</Text></SettingsRow>}</> : null}
+      <Text className="text-sm text-danger" style={tabular}>{securityCopy.recoveryIn(pending.effective_at_ms - nodeClockOffset)}</Text>
+    </SettingsRow> : <SettingsRow icon={ShieldCheck} label={securityCopy.recovery}><Text className="text-sm text-muted">{securityCopy.noRecovery}</Text></SettingsRow>}</> : null}
     <CurrentRecoveryFile />
     <SettingsRow href="/recovery" icon={KeyRound} label={securityCopy.password}>
-      {recoverySince ? <Text className="text-meta text-muted-foreground" style={tabular}>{securityCopy.changedOn(recoverySince)}</Text> : null}
+      {recoverySince ? <Text className="text-sm text-muted" style={tabular}>{securityCopy.changedOn(recoverySince)}</Text> : null}
     </SettingsRow>
   </SettingsGroup>
 }
@@ -151,7 +151,7 @@ function MemberRow({ member }: { member: Member }) {
   // Measured: 1.5pt at the default size, about 11.5pt at the 2x cap. Android centres it on the line, about 1dp high at every size.
   const fontScale = useWindowDimensions().fontScale
   const crownLift = Platform.OS === 'ios' ? -(1.5 + 10 * (Math.min(fontScale, 2) - 1)) : 1
-  const mark = (icon: LucideIcon, label: string) => <>{'\u00a0'}<Icon as={icon} accessibilityLabel={label} className="size-3.5 text-muted-foreground" style={{ transform: [{ translateY: crownLift }] }} /></>
+  const mark = (icon: LucideIcon, label: string) => <>{'\u00a0'}<Icon as={icon} accessibilityLabel={label} className="size-3.5 text-muted" style={{ transform: [{ translateY: crownLift }] }} /></>
   // The name wraps in full so the inline marks are never cut off with it. As in the web's device list, the bot mark leads to the computer whose detail holds Bot 与任务.
   return <SettingsRow href={`/device/${member.device_id}`} icon={deviceIcon(member)}
     label={<>{member.name}{member.admin ? mark(Crown, '管理设备') : null}{member.kind === 'node' && member.bot ? mark(Bot, '能运行 Bot') : null}</>}

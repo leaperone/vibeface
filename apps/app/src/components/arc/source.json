@@ -1,0 +1,75 @@
+{
+  "repository": "https://github.com/WheatXie/uiarc-pro-reverse",
+  "commit": "859606819c68787b2dccb54adcb9b08bd3272d5d",
+  "platform": "react-dom",
+  "compositions": {
+    "product-kit.tsx": [
+      "settings-page",
+      "security-settings",
+      "agent-approvals",
+      "stepper",
+      "badge",
+      "alert",
+      "empty-state",
+      "skeleton",
+      "toast"
+    ],
+    "product-kit.module.css": [
+      "settings-page",
+      "security-settings",
+      "agent-approvals",
+      "toast"
+    ],
+    "workspace-layout.module.css": [
+      "sidebar",
+      "ai-chat"
+    ],
+    "conversation-composer.tsx": [
+      "ai-composer",
+      "textarea",
+      "button",
+      "badge"
+    ],
+    "conversation-thread.tsx": [
+      "chat-thread",
+      "ai-chat",
+      "button"
+    ],
+    "conversation.module.css": [
+      "ai-chat",
+      "ai-composer",
+      "chat-thread"
+    ],
+    "task-run-summary.tsx": [
+      "agent-run",
+      "badge"
+    ],
+    "task-compositions.module.css": [
+      "agent-run",
+      "sidebar",
+      "settings-page",
+      "security-settings"
+    ],
+    "record-panel.tsx": [
+      "agent-run",
+      "settings-page"
+    ],
+    "form-field.tsx": [
+      "settings-page",
+      "input",
+      "textarea"
+    ],
+    "routed-action.tsx": [
+      "button"
+    ]
+  },
+  "adaptationNotes": {
+    "data": "Showcase bots, people, sample messages, model catalogs, simulated progress and timers are excluded. Controllers supply real workspace, directory, task, delivery and recovery state.",
+    "navigation": "Sidebar rail layout uses real router links. Desktop can hide the rail; narrow viewports use the Arc drawer and retain the product's messages, tasks and settings tabs.",
+    "conversation": "Thread observation keeps a visible history anchor, follows streaming only at the bottom and exposes unread/latest navigation. Composer preserves keyboard submission, draft callbacks, attachment validation and explicit stop.",
+    "decisions": "Approval rows keep every real allow, reject, retry and reconciliation callback. Unknown results remain unknown until product operations reconcile them.",
+    "forms": "Controls import the pinned Arc API directly. All select keys receive an internal prefix because Radix Select reserves the empty string. Product callbacks receive the original value, including the empty string.",
+    "navigationActions": "RoutedAction and ActionLink use the pinned Arc button CSS module on real anchors to preserve href, modified clicks and router navigation without nesting interactive controls.",
+    "nativeElements": "Native video, hidden attachment picker, details/summary, and data-driven settings/navigation rows preserve their platform semantics. Bot face artwork remains domain content and follows data-theme."
+  }
+}

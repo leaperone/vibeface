@@ -1,46 +1,17 @@
-# Product
+# Vibeface Web product
 
 <!-- impeccable:product-schema 1 -->
 
-## Platform
+Vibeface gives one person a workspace for directing Bot work, reviewing outcomes, and managing their own connected devices. Accounts, devices, events, attachments, routes and commands stay within that person's network.
 
-web
+The Web app supports Bot conversations, task conversations, channels, decisions, device joining, recovery, AI configuration, notifications, diagnostics and file-transfer experiments. Shared product state and operations come from `@vibeface/client`. The UI must preserve their identities, revisions and delivery outcomes.
 
-## Users
+The three narrow-screen tabs are messages, tasks and settings. A wide-screen sidebar lists real channels and Bots, with task attention and connection status. Route and back-navigation behavior remains part of the product contract.
 
-Individuals managing their own Bot conversations, tasks, devices, and recovery state.
+Conversation sends retain their draft until the recorded outcome allows it to clear. Attachment download verifies the referenced size and SHA-256. A lost write response is an unknown result; the person must reconcile it before retrying. Reconnecting or refreshing history must not replay a side effect. Task stop, approval, retry and continuation actions use the existing operations and their original identifiers.
 
-## Product Purpose
+Devices belong to the person, with explicit management rights. Removing a device, withdrawing a manager or leaving a browser retains its consequence text and confirmation. The only manager cannot leave before another management device is available. Joining verifies the safety code. Recovery retains the original password, file, lost-device and waiting-state rules.
 
-Vibeface gives one person a safe workspace for directing Bot work, reviewing outcomes, and keeping connected devices under personal control. Success means the person can understand what is waiting, act on it, and recover from uncertain delivery without repeating a side effect.
+[Arc](https://github.com/WheatXie/uiarc-pro-reverse), pinned at `859606819c68787b2dccb54adcb9b08bd3272d5d`, is the only interface system. Product compositions adapt its sidebar, conversation, agent, settings and security items to real state. They do not introduce demo activity. See [DESIGN.md](DESIGN.md) and [MIGRATION.md](MIGRATION.md) for the source mapping and verification boundaries.
 
-## Positioning
-
-The workspace separates Bot conversations from device identity and delivery state while keeping their causal context visible.
-
-## Operating Context
-
-People use the web app as a desktop or mobile browser workspace. The sidebar, inbox, task views, device views, and conversation screens are the primary operating surfaces.
-
-## Capabilities and Constraints
-
-The app supports Bot conversations, tasks, channels, inbox decisions, device joining, recovery, settings, and local/offline state. Account, device, event, attachment, route, and command data stays within the person's network. Unknown write results must be reconciled before retrying.
-
-## Brand Commitments
-
-The product name is Vibeface. Existing Bot faces and the shared cool-neutral/violet theme are retained.
-
-## Evidence on Hand
-
-Routes and components under `apps/app/src/`, shared semantic tokens in `packages/theme/theme.css`, and existing accessibility and reduced-motion handling.
-
-## Product Principles
-
-- Make the current task and its state easy to understand.
-- Keep personal network and device boundaries explicit.
-- Never imply a write succeeded when its result is unknown.
-- Prefer one clear recovery action over decorative complexity.
-
-## Accessibility & Inclusion
-
-Keyboard focus, reduced motion, safe areas, readable metadata, visible labels, and touch-sized controls are product requirements.
+The experience must account for loading, empty results, offline records, waiting decisions, unknown outcomes, long text, reduced motion and keyboard use. Product copy names the consequence and next action. UI implementation details do not belong in the person's workflow.

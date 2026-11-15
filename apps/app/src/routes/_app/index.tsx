@@ -1,8 +1,8 @@
-import { createFileRoute, Navigate } from '@tanstack/react-router'
 import { ConversationList } from '@/features/workspace/conversation-list'
+import { useIsMobile } from '@/lib/hooks/use-mobile'
+import { createFileRoute,Navigate } from '@tanstack/react-router'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { homeBot } from '@vibeface/client/workspace/home.ts'
-import { useIsMobile } from '@/lib/hooks/use-mobile'
 
 export const Route = createFileRoute('/_app/')({
   validateSearch: (search: Record<string, unknown>): { conversation?: string; work?: string; routine?: string } => ({ ...(typeof search.conversation === 'string' ? { conversation: search.conversation } : {}), ...(typeof search.work === 'string' ? { work: search.work } : {}), ...(typeof search.routine === 'string' ? { routine: search.routine } : {}) }),

@@ -1,3 +1,4 @@
+import { Textarea } from '@/components/arc/textarea'
 import * as Haptics from 'expo-haptics'
 import { Link } from 'expo-router'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -7,13 +8,12 @@ import { answerLabel, attentionLabel, approvalTask, declined, ignoredAnswer, que
 import type { AnswerResult } from '@vibeface/client/workspace/types.ts'
 import { ArrowUp, CircleAlert, CircleCheck, CircleSlash, CircleX, FolderOpen, Hand, Info, ListChecks, LoaderCircle, MessageCircleQuestionMark, Laptop, RotateCw, TriangleAlert, X, type LucideIcon } from 'lucide-react-native'
 import { useRef, useState } from 'react'
-import { Pressable, TextInput, View } from 'react-native'
+import { Pressable, View } from 'react-native'
 import { ErrorText } from '@/components/action'
 import { ActionCard, providerIcons, type Tone } from '@/components/kit'
-import { Button } from '@/components/ui/button'
-import { caret } from '@/components/ui/input'
-import { Icon } from '@/components/ui/icon'
-import { Text } from '@/components/ui/text'
+import { Button } from '@/components/arc/button'
+import { Icon } from '@/components/arc/icon'
+import { Text } from '@/components/arc/text'
 import { useWorkspace } from '@/data/context'
 import { useLive } from '@/data/live'
 import { deviceIcon } from '@/features/devices/device-icon'
@@ -82,16 +82,16 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
   const { approval, task, local } = questionMeta(question, shared?.openWorks ?? [], workspace.bots, ready?.entry.device_id)
   const project = question.about.cwd ? sharedProject(question.about.cwd, question.about.node, shared?.nodes ?? []) : null
   const { icon, tone } = looks[question.severity]
-  return <ActionCard icon={approval ? Hand : icon} tone={tone} title={ask}>
-    <Text className="text-meta text-muted-foreground">{attentionLabel(question)}{question.attention?.device_id ? ` · 处理设备 ${workspace.members.find((item) => item.device_id === question.attention?.device_id)?.name ?? '运行设备'}` : ''}</Text>
-    {question.attention?.kind === 'browser_takeover' ? <Text className="text-meta text-muted-foreground">请在运行设备的浏览器中完成操作，确认结果后再回来回答。</Text> : null}
-    {detail ? <Text className="text-body">{detail}</Text> : null}
+  return <ActionCard kind="approval" icon={approval ? Hand : icon} tone={tone} title={ask}>
+    <Text className="text-sm text-muted">{attentionLabel(question)}{question.attention?.device_id ? ` · 处理设备 ${workspace.members.find((item) => item.device_id === question.attention?.device_id)?.name ?? '运行设备'}` : ''}</Text>
+    {question.attention?.kind === 'browser_takeover' ? <Text className="text-sm text-muted">请在运行设备的浏览器中完成操作，确认结果后再回来回答。</Text> : null}
+    {detail ? <Text className="text-base">{detail}</Text> : null}
     {inTask ? null : <View className="flex-row flex-wrap items-center gap-x-3 gap-y-1">
-      {taskScope ? <Link href={`/task/${taskScope}`} asChild><Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-1"><Icon as={ListChecks} className="size-4 text-muted-foreground" /><Text className="text-meta underline">打开所属任务</Text></Pressable></Link> : null}
+      {taskScope ? <Link href={`/task/${taskScope}`} asChild><Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-1"><Icon as={ListChecks} className="size-4 text-muted" /><Text className="text-sm underline">打开所属任务</Text></Pressable></Link> : null}
       {task ? <Link href={`/b/${task.bot_id}/work/${task.work_id}`} asChild>
         <Pressable accessibilityRole="link" accessibilityLabel={`任务 ${task.title}`} className="min-h-11 min-w-0 flex-row items-center gap-1 active:opacity-60">
-          <Icon as={ListChecks} className="size-4 text-muted-foreground" />
-          <Text numberOfLines={1} className="text-meta text-muted-foreground underline">{task.title}</Text>
+          <Icon as={ListChecks} className="size-4 text-muted" />
+          <Text numberOfLines={1} className="text-sm text-muted underline">{task.title}</Text>
         </Pressable>
       </Link> : null}
       {question.about.agent ? <Meta icon={providerIcons[question.about.agent]} label="来自">{providerNames[question.about.agent]}</Meta> : null}
@@ -99,51 +99,51 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
       {local ? null : <Meta icon={member ? deviceIcon(member) : Laptop} label="设备">{member?.name ?? '另一台设备'}</Meta>}
     </View>}
     {pending ? <View role="status" className="gap-2">
-      <Text className="text-body">{displayAnswer(pending.text)}</Text>
-      <Text className="text-meta text-muted-foreground">{busy !== null ? '正在发送' : '没确认送达'}</Text>
-      <Button variant="outline" className="min-h-11 self-start" disabled={disabled} accessibilityState={{ disabled, busy: busy === 'retry' }} onPress={() => void send('retry', pending.text)}>
+      <Text className="text-base">{displayAnswer(pending.text)}</Text>
+      <Text className="text-sm text-muted">{busy !== null ? '正在发送' : '没确认送达'}</Text>
+      <Button variant="secondary" className="min-h-11 self-start" disabled={disabled} accessibilityState={{ disabled, busy: busy === 'retry' }} onPress={() => void send('retry', pending.text)}>
         <Icon as={busy === 'retry' ? LoaderCircle : RotateCw} /><Text>再试</Text>
       </Button>
     </View> : <View className="gap-2">
-      {approvalChoices.length ? <View className="flex-row flex-wrap gap-2">{approvalChoices.map((choice) => <Button key={choice.label} variant={choice.action === 'allow_once' ? 'default' : 'outline'} className="min-h-11" accessibilityLabel={choice.action === 'allow_once' ? '允许本次' : '拒绝'} disabled={disabled} accessibilityState={{ disabled, busy: busy === `permission:${choice.action}` }} onPress={() => void send(`permission:${choice.action}`, choice.label)}><Icon as={busy === `permission:${choice.action}` ? LoaderCircle : choice.action === 'allow_once' ? CircleCheck : CircleX} /><Text>{choice.action === 'allow_once' ? '允许本次' : '拒绝'}</Text></Button>)}</View> : <>
-        {question.choices.map((choice, index) => <Pressable key={index} accessibilityRole="button" accessibilityLabel={choice.label} accessibilityState={{ disabled, busy: busy === `choice:${index}` }} disabled={disabled} onPress={() => void send(`choice:${index}`, choice.label)}
-          className={cn(row, 'active:bg-muted', disabled && 'opacity-50')}>
-          {busy === `choice:${index}` ? <Icon as={LoaderCircle} className="mt-0.5 size-4 text-muted-foreground" /> : <Text className="w-4 text-center text-muted-foreground">{index + 1}</Text>}
+      {approvalChoices.length ? <View className="flex-row flex-wrap gap-2">{approvalChoices.map((choice) => <Button key={choice.label} variant={choice.action === 'allow_once' ? 'primary' : 'secondary'} className="min-h-11" accessibilityLabel={choice.action === 'allow_once' ? '允许本次' : '拒绝'} disabled={disabled} accessibilityState={{ disabled, busy: busy === `permission:${choice.action}` }} onPress={() => void send(`permission:${choice.action}`, choice.label)}><Icon as={busy === `permission:${choice.action}` ? LoaderCircle : choice.action === 'allow_once' ? CircleCheck : CircleX} /><Text>{choice.action === 'allow_once' ? '允许本次' : '拒绝'}</Text></Button>)}</View> : <>
+        {question.choices.map((choice, index) => <Button variant="ghost" key={index} accessibilityRole="button" accessibilityLabel={choice.label} accessibilityState={{ disabled, busy: busy === `choice:${index}` }} disabled={disabled} onPress={() => void send(`choice:${index}`, choice.label)}
+          className={cn(row, 'active:bg-surface-muted', disabled && 'opacity-50')}>
+          {busy === `choice:${index}` ? <Icon as={LoaderCircle} className="mt-0.5 size-4 text-muted" /> : <Text className="w-4 text-center text-muted">{index + 1}</Text>}
           <Text className="min-w-0 flex-1 font-medium">{choice.label}</Text>
-        </Pressable>)}
+        </Button>)}
         <View className="flex-row items-end gap-2">
-          <TextInput {...caret} maxFontSizeMultiplier={2} accessibilityLabel="你的回答" placeholder={question.choices.length ? '或者自己写回答' : '写下你的回答'} placeholderTextColorClassName="accent-muted-foreground"
-            className="max-h-40 min-h-11 flex-1 rounded-lg border border-border bg-card px-3 py-2.5 font-sans text-body text-foreground" value={text} maxLength={4000} editable={!disabled}
+          <Textarea maxFontSizeMultiplier={2} accessibilityLabel="你的回答" placeholder={question.choices.length ? '或者自己写回答' : '写下你的回答'}
+            className="max-h-40 min-h-11 flex-1 text-base" value={text} maxLength={4000} editable={!disabled}
             multiline textAlignVertical="top" submitBehavior="newline" onChangeText={(value) => { setText(value); setError('') }} />
-          <Button size="icon" className="size-11" accessibilityLabel="发送回答" disabled={disabled || !text.trim()} accessibilityState={{ disabled: disabled || !text.trim(), busy: busy === 'answer' }} onPress={() => void send('answer', text)}>
+          <Button iconOnly className="size-11" accessibilityLabel="发送回答" disabled={disabled || !text.trim()} accessibilityState={{ disabled: disabled || !text.trim(), busy: busy === 'answer' }} onPress={() => void send('answer', text)}>
             <Icon as={busy === 'answer' ? LoaderCircle : ArrowUp} />
           </Button>
         </View>
       </>}
       {ignorable ? <Button variant="ghost" className="min-h-11 self-start" accessibilityLabel="忽略" disabled={disabled} accessibilityState={{ disabled, busy: busy === 'ignore' }} onPress={() => void send('ignore', ignoredAnswer)}>
-        <Icon as={busy === 'ignore' ? LoaderCircle : X} className="text-muted-foreground" /><Text className="text-muted-foreground">忽略</Text>
+        <Icon as={busy === 'ignore' ? LoaderCircle : X} className="text-muted" /><Text className="text-muted">忽略</Text>
       </Button> : null}
     </View>}
     <ErrorText error={error} />
   </ActionCard>
 }
 
-const row = 'min-h-12 flex-row items-start gap-3 rounded-lg border border-border bg-card px-3 py-3'
+const row = 'min-h-12 flex-row items-start gap-3 rounded-control border border-border bg-surface px-3 py-3'
 
 function Settled({ icon, className, ask, detail, about, children }: { icon: LucideIcon; className?: string; ask: string; detail: string; about?: string; children: string }) {
   return <View role="status" className="min-h-9 flex-row items-start gap-2 py-2">
-    <Icon as={icon} className={cn('mt-0.5 size-4 text-muted-foreground', className)} />
+    <Icon as={icon} className={cn('mt-0.5 size-4 text-muted', className)} />
     <View className="min-w-0 flex-1 gap-0.5">
-      {about ? <View className="min-w-0 flex-row items-center gap-1"><Icon as={ListChecks} className="size-3.5 text-muted-foreground" /><Text numberOfLines={1} className="shrink text-meta text-muted-foreground">{about}</Text></View> : null}
-      <Text className="text-meta text-muted-foreground"><Text className="text-meta text-muted-foreground" numberOfLines={1}>{ask}</Text>{' · '}<Text className="text-meta">{children}</Text></Text>
-      {detail ? <Text className="text-meta text-muted-foreground">{detail}</Text> : null}
+      {about ? <View className="min-w-0 flex-row items-center gap-1"><Icon as={ListChecks} className="size-3.5 text-muted" /><Text numberOfLines={1} className="shrink text-sm text-muted">{about}</Text></View> : null}
+      <Text className="text-sm text-muted"><Text className="text-sm text-muted" numberOfLines={1}>{ask}</Text>{' · '}<Text className="text-sm">{children}</Text></Text>
+      {detail ? <Text className="text-sm text-muted">{detail}</Text> : null}
     </View>
   </View>
 }
 
 function Meta({ icon, label, children }: { icon: LucideIcon; label: string; children: string }) {
   return <View accessible accessibilityLabel={`${label} ${children}`} className="min-w-0 flex-row items-center gap-1">
-    <Icon as={icon} className="size-4 text-muted-foreground" />
-    <Text numberOfLines={1} className="text-meta text-muted-foreground">{children}</Text>
+    <Icon as={icon} className="size-4 text-muted" />
+    <Text numberOfLines={1} className="text-sm text-muted">{children}</Text>
   </View>
 }

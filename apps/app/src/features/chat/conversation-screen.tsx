@@ -1,40 +1,38 @@
-import { historySections } from '@vibeface/client/workspace/model.ts'
-import { HistoryControls } from './history-controls'
-import { useEffect, useRef, useState } from 'react'
-import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
-import { ArrowDown, ArrowRightLeft, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Crown, Hourglass, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, RotateCcw, RotateCw, Send, Unplug, WifiOff } from 'lucide-react'
-import { ActionCard, Details, EmptyState, InlineError, PageActions, PrimaryMark } from '@/components/app/kit'
-import { BotFace, botMood, botTint, useDark } from '@/components/app/bot-face'
-import { faceOf } from '@vibeface/client/avatar/face.ts'
-import { Button } from '@/components/ui/button'
-import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
-import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
-import { failureText, outcomeUnknown, taskError, workFailure } from '@vibeface/client/lib/errors.ts'
-import { terms } from '@/lib/glossary'
-import { ActionButton } from '@/features/workspace/present'
-import { ChatSkeleton, useCreateBot } from '@/features/workspace/workspace-shell'
-import { ConfirmCard } from '@/features/workspace/task-activity'
-import { QuestionCard } from '@/features/workspace/question-card'
-import { chatTaskState, nodeName, progressLabel, queueHoldLabels, staleTaskLabel, taskActive, taskAgent, taskCopy, taskLabel, taskProgress, taskStale } from '@vibeface/client/workspace/labels.ts'
-import type { BotChangeRecord, ManagerJob, SentBotMessage, WorkRecord } from '@vibeface/client/workspace/types.ts'
-import { botCopy, placeChanges, scheduleName, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
-import { botReadiness, pendingChecks } from '@vibeface/client/workspace/model.ts'
-import { awaitsAnswer, foldAnswers, workApproval } from '@vibeface/client/workspace/questions.ts'
+import { BotFace,botMood } from '@/components/app/bot-face'
+import { PromptInput } from '@/components/arc/conversation-composer'
+import { Chat,type ChatEntry } from '@/components/arc/conversation-thread'
+import { ActionCard,Details,EmptyState,InlineError,PageActions,PrimaryMark } from '@/components/arc/product-kit'
+import { RoutedAction } from "@/components/arc/routed-action"
 import { providerIcons } from '@/features/devices/ai-settings'
-import { providerNames, type ProviderId } from '@vibeface/client/lib/node.ts'
-import { ChangeCard } from './change-card'
-import { Chat, type ChatEntry } from './elements/chat'
-import type { ChatMessage } from './elements/message'
-import { PromptInput } from './elements/prompt-input'
-import { InputQueue, WorkspaceInputStatus } from '@/features/workspace/workspace-chat'
-import type { InputTarget } from '@vibeface/client/workspace/types.ts'
-import { awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, promptIntent, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
-import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
-import { chatTimeline, firstUnread, taskMessage } from '@vibeface/client/chat/timeline.ts'
-import { networkKey, storageOf } from '@vibeface/client/workspace/storage.ts'
+import { ActionButton } from '@/features/workspace/present'
+import { QuestionCard } from '@/features/workspace/question-card'
+import { ConfirmCard } from '@/features/workspace/task-activity'
+import { InputQueue,WorkspaceInputStatus } from '@/features/workspace/workspace-chat'
+import { ChatSkeleton,useCreateBot } from '@/features/workspace/workspace-shell'
+import { terms } from '@/lib/glossary'
 import { webPlatform } from '@/lib/platform'
+import { Link,useNavigate,useRouterState } from '@tanstack/react-router'
+import { awaitsDevice,botCanSend,botReach,canRetryJob,canSend,composerHint,promptIntent,reachDevice,runtimeLabel,starters } from '@vibeface/client/chat/protocol.ts'
+import { chatTimeline,firstUnread,taskMessage } from '@vibeface/client/chat/timeline.ts'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
+import { failureText,outcomeUnknown,taskError,workFailure } from '@vibeface/client/lib/errors.ts'
+import { providerNames,type ProviderId } from '@vibeface/client/lib/node.ts'
+import { botCopy,placeChanges,scheduleName,scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
+import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
+import { chatTaskState,nodeName,progressLabel,queueHoldLabels,staleTaskLabel,taskActive,taskAgent,taskCopy,taskLabel,taskProgress,taskStale } from '@vibeface/client/workspace/labels.ts'
+import { botReadiness,historySections,pendingChecks } from '@vibeface/client/workspace/model.ts'
+import { awaitsAnswer,foldAnswers,workApproval } from '@vibeface/client/workspace/questions.ts'
+import { networkKey,storageOf } from '@vibeface/client/workspace/storage.ts'
+import type { BotChangeRecord,InputTarget,ManagerJob,SentBotMessage,WorkRecord } from '@vibeface/client/workspace/types.ts'
+import { Button } from '@vibeface/uiarc/button/button.tsx'
+import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
+import { ArrowDown,ArrowRightLeft,Bot,ChevronRight,CircleCheck,CircleQuestionMark,CircleStop,CircleX,Crown,Hourglass,Laptop,Link2,ListChecks,LoaderCircle,MessageSquareOff,MessageSquareReply,Plus,RotateCcw,RotateCw,Send,Unplug,WifiOff } from 'lucide-react'
+import { useEffect,useRef,useState } from 'react'
+import { ChangeCard } from './change-card'
 import './chat.css'
+import type { ChatMessage } from './elements/message'
+import { HistoryControls } from './history-controls'
 
 const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'running', 'cancelling']
 // The translated cause alone: an unknown one reads as its own first line, not the generic sentence above it.
@@ -47,7 +45,7 @@ function NoBot() {
   const { bots } = useWorkspace()
   const create = useCreateBot()
   return bots.length
-    ? <EmptyState icon={Bot} title={botCopy.notFound} className="my-auto" action={<Button asChild variant="outline"><Link to="/">查看 Bot</Link></Button>} />
+    ? <EmptyState icon={Bot} title={botCopy.notFound} className="my-auto" action={<RoutedAction variant="secondary" to="/">查看 Bot</RoutedAction>} />
     : <EmptyState icon={Bot} title="还没有 Bot" className="my-auto" action={<Button type="button" onClick={create}><Plus aria-hidden="true" />新 Bot</Button>} />
 }
 
@@ -66,8 +64,6 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const { conversationId, data, chatSlot } = workspace
   const pendingMessages = workspace.pendingMessages.filter((item) => item.conversation_id === conversationId && item.target.kind === 'bot_main')
   const bot = workspace.selectedBot
-  const dark = useDark()
-  const tint = bot ? botTint(faceOf(bot.bot_id, bot.avatar).hue, dark) : undefined
   const text = drafts.get(conversationId) ?? ''
   const draftRef = useRef<ComposerDraft>({ text, files, target: selectedTarget, conversationId })
   if (draftRef.current.text !== text || draftRef.current.files !== files || draftRef.current.target !== selectedTarget || draftRef.current.conversationId !== conversationId) draftRef.current = { text, files, target: selectedTarget, conversationId }
@@ -159,10 +155,10 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
     const recordedJob = jobs.find((job) => job.reply_message_id === message.message_id || !job.reply_message_id && job.message_id === message.message_id)
     if (recordedJob?.runtime) entries.push({ key: `runtime:${recordedJob.trigger}`, node: <Details label="运行信息">{runtimeLabel(recordedJob.runtime)}</Details> })
     if (message.status === 'failed' && !recordedJob?.pending_check && (!recordedJob || !canRetryJob(recordedJob))) entries.push({ key: `query:${message.message_id}`, node: <ActionButton variant="ghost" action={() => workspace.refresh()}>再查一次</ActionButton> })
-    if (recordedJob?.state === 'reconciling' || recordedJob?.pending_check) entries.push({ key: `reconcile:${recordedJob.trigger}`, node: <ActionCard icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => workspace.refresh()}>再查一次</ActionButton>}><p className="text-meta text-muted-foreground">设备正在查询上次回复，系统不会自动重发。</p></ActionCard> })
+    if (recordedJob?.state === 'reconciling' || recordedJob?.pending_check) entries.push({ key: `reconcile:${recordedJob.trigger}`, node: <ActionCard icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => workspace.refresh()}>再查一次</ActionButton>}><p className="text-sm text-secondary">设备正在查询上次回复，系统不会自动重发。</p></ActionCard> })
     for (const job of jobs) {
       if (job.message_id !== message.message_id) continue
-      if (job.state === 'queued' && message.role === 'user') entries.push({ key: `queued-actions:${job.trigger}`, node: <p className="text-meta text-muted-foreground">{job.hold_reason ? queueHoldLabels[job.hold_reason] : '等待开始工作'}</p> })
+      if (job.state === 'queued' && message.role === 'user') entries.push({ key: `queued-actions:${job.trigger}`, node: <p className="text-sm text-secondary">{job.hold_reason ? queueHoldLabels[job.hold_reason] : '等待开始工作'}</p> })
       if ((job.state !== 'failed' && job.state !== 'rejected') || replied.has(job.reply_message_id ?? '')) continue
       // A reply that ended with no message of its own: 重试 sits on this line while the message is the newest.
       const again = message.role === 'user' && message.message_id === newest?.message_id ? retryOf(message.message_id) : undefined
@@ -188,7 +184,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const status = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.trigger === activeReply?.trigger && item.status)?.status
   // The owner holds the reply's state; when it does not answer, a waiting message shows that state as unknown.
   const remote = data?.scheduler?.remote
-  if (remote && !remote.reachable && !ownerAway && newest?.role === 'user') entries.push({ key: 'owner-unknown', node: <p role="status" className="flex min-h-7 items-center gap-2 text-meta text-muted-foreground"><Unplug aria-hidden="true" className="size-4 shrink-0" />{nodeName(remote.owner, lookup)} 连不上，回复情况未知</p> })
+  if (remote && !remote.reachable && !ownerAway && newest?.role === 'user') entries.push({ key: 'owner-unknown', node: <p role="status" className="flex min-h-7 items-center gap-2 text-sm text-secondary"><Unplug aria-hidden="true" className="size-4 shrink-0" />{nodeName(remote.owner, lookup)} 连不上，回复情况未知</p> })
   // A question waiting on the person is the status already; a spinner under it would say the bot is still thinking.
   const toAnswer = questions.filter((question) => awaitsAnswer(question, workspace.answered, folded.answers))
   const asked = toAnswer[0]
@@ -200,23 +196,23 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
     : activeReply?.state === 'claimed' ? '正在准备'
     : activeReply?.state === 'steering' ? '正在加入本轮'
     : status ? progressLabel(status) : '正在处理你的要求'
-  if (botBusy && !live.length && !asked) entries.push({ key: 'activity', node: <p role="status" className="flex min-h-7 items-center gap-2 text-meta text-muted-foreground">{stopping ? <CircleStop aria-hidden="true" className="size-4 shrink-0" />
+  if (botBusy && !live.length && !asked) entries.push({ key: 'activity', node: <p role="status" className="flex min-h-7 items-center gap-2 text-sm text-secondary">{stopping ? <CircleStop aria-hidden="true" className="size-4 shrink-0" />
     : bot ? <BotFace bot={bot} mood={workspace.connectionOnline && remote?.reachable !== false ? 'thinking' : 'asleep'} size={24} /> : null}{activity}</p> })
   entries.push(...waiting)
   // The replies and questions this chat's badge counted when it came on screen start under 新消息.
   const unread = firstUnread(timeline, workspace.fresh, (aside) => 'waiting' in aside && aside.waiting === true && workspace.fresh.has(aside.key))
   const unreadAt = unread ? entries.findIndex((entry) => entry.key === ('key' in unread ? unread.key : unread.message_id)) : -1
-  if (unreadAt >= 0) entries.splice(unreadAt, 0, { key: 'unread', node: <p className="flex items-center gap-3 text-meta text-primary before:h-px before:flex-1 before:bg-primary/40 after:h-px after:flex-1 after:bg-primary/40">新消息</p> })
+  if (unreadAt >= 0) entries.splice(unreadAt, 0, { key: 'unread', node: <p className="flex items-center gap-3 text-sm text-foreground before:h-px before:flex-1 before:bg-foreground/40 after:h-px after:flex-1 after:bg-foreground/40">新消息</p> })
 
   // Everything waiting on the person ends the conversation, so it scrolls with it instead of covering it.
   const cards = [
     ownerAway && owner && here ? <ActionCard key="owner" icon={WifiOff} title={`${nodeName(owner, lookup)} 离线，对话在等它`} actions={
-      <ActionButton variant="default" disabled={!workspace.writable} action={() => workspace.takeOver()}><ArrowRightLeft aria-hidden="true" />换到 {nodeName(here.device_id, lookup)}</ActionButton>
+      <ActionButton variant="primary" disabled={!workspace.writable} action={() => workspace.takeOver()}><ArrowRightLeft aria-hidden="true" />换到 {nodeName(here.device_id, lookup)}</ActionButton>
     } /> : null,
     unanswered.length ? <ActionCard key="unanswered" icon={MessageSquareReply} title={unanswered.length > 1 ? `${unanswered.length} 条消息没等到回复` : '这条消息没等到回复'} actions={<>
       <ActionButton variant="ghost" disabled={!workspace.writable} action={() => workspace.settleUnanswered(unanswered, 'dismiss')}>不回复</ActionButton>
-      <ActionButton variant="default" disabled={!workspace.writable || !agentReady} action={() => workspace.settleUnanswered(unanswered, 'reply')}>{here ? <><Laptop aria-hidden="true" />由 {nodeName(here.device_id, lookup)} 回复</> : '现在回复'}</ActionButton>
-    </>}>{lastUnanswered ? <p className="line-clamp-2 text-muted-foreground">{lastUnanswered.text}</p> : null}</ActionCard> : null,
+      <ActionButton variant="primary" disabled={!workspace.writable || !agentReady} action={() => workspace.settleUnanswered(unanswered, 'reply')}>{here ? <><Laptop aria-hidden="true" />由 {nodeName(here.device_id, lookup)} 回复</> : '现在回复'}</ActionButton>
+    </>}>{lastUnanswered ? <p className="line-clamp-2 text-secondary">{lastUnanswered.text}</p> : null}</ActionCard> : null,
     ...checks.map((check) => <ConfirmCard key={check.check_id} check={check} />),
   ].filter(Boolean)
   if (cards.length) entries.push({ key: 'waiting-on-you', node: <div id="chat-waiting" className="grid scroll-mb-4 gap-3">{cards}</div> })
@@ -274,36 +270,35 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
         key={conversationId}
         entries={entries}
         empty={bot ? <div className="mx-auto my-auto grid max-w-md justify-items-center gap-4 px-4 py-12 text-center">
-          <BotFace bot={bot} mood={botMood(bot, workspace)} size={96} halo={tint?.glow} />
+          <BotFace bot={bot} mood={botMood(bot, workspace)} size={96} />
           <div className="grid justify-items-center gap-1">
-            <h2 className="text-heading font-semibold">{bot.name}</h2>
+            <h2 className="text-lg font-medium">{bot.name}</h2>
             {workspace.primary === bot.conversation_id ? <PrimaryMark labeled /> : null}
           </div>
-          {!needsSetup ? <p className="text-sm leading-relaxed text-muted-foreground">说说你想完成的事，也可以随时补充要求。</p> : null}
-          {starting ? <p role="status" className="flex items-center gap-1.5 text-muted-foreground"><LoaderCircle aria-hidden="true" className={`size-4 shrink-0 ${workspace.connectionOnline ? 'animate-spin' : ''}`} />Bot 正在启动</p>
+          {!needsSetup ? <p className="text-sm leading-relaxed text-secondary">说说你想完成的事，也可以随时补充要求。</p> : null}
+          {starting ? <p role="status" className="flex items-center gap-1.5 text-secondary"><LoaderCircle aria-hidden="true" className={`size-4 shrink-0 ${workspace.connectionOnline ? 'animate-spin' : ''}`} />Bot 正在启动</p>
             : needsSetup ? <>
-            <p className="flex items-center gap-1.5 text-muted-foreground"><MessageSquareOff aria-hidden="true" className="size-4 shrink-0" />Bot 还不能回复</p>
-            {away || canSetUp ? <Button asChild><Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot.bot_id }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
-              : <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><Crown aria-hidden="true" className="size-4 shrink-0" />{setUpOnManager((directory?.members ?? []).filter((member) => member.manage).map((member) => member.name))}</p>}
+            <p className="flex items-center gap-1.5 text-secondary"><MessageSquareOff aria-hidden="true" className="size-4 shrink-0" />Bot 还不能回复</p>
+            {away || canSetUp ? <RoutedAction to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot.bot_id }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</RoutedAction>
+              : <p className="flex items-center gap-1.5 text-sm text-secondary"><Crown aria-hidden="true" className="size-4 shrink-0" />{setUpOnManager((directory?.members ?? []).filter((member) => member.manage).map((member) => member.name))}</p>}
           </>
             : <div className="flex flex-wrap justify-center gap-2">
-              {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} type="button" variant="outline" className="rounded-full text-muted-foreground hover:text-foreground" style={{ borderColor: tint?.edge }} onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
+              {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} type="button" variant="secondary" className="" onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
             </div>}
         </div> : workspace.synced ? <NoBot /> : null}
       />
       {bot && inputTarget ? <PromptInput
         id="message-text"
         above={<div className="flex max-w-full flex-col items-start gap-2">
-          {!workspace.connectionOnline ? <p role="status" className="flex min-h-8 max-w-full flex-wrap items-center gap-1.5 rounded-xl border bg-card ps-2.5 pe-1 text-meta font-medium max-md:min-h-11">
-          <WifiOff aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /><span className="min-w-0 break-words">连不上{ready ? nodeName(ready.entry.device_id, lookup) : '设备'}</span>
-          <Button type="button" variant="ghost" size="sm" className="h-7 shrink-0 rounded-full max-md:h-9" onClick={retryNow}><RotateCw aria-hidden="true" />重试连接</Button>
+          {!workspace.connectionOnline ? <p role="status" className="flex min-h-8 max-w-full flex-wrap items-center gap-1.5 rounded-panel border bg-surface ps-2.5 pe-1 text-sm font-medium max-md:min-h-11">
+          <WifiOff aria-hidden="true" className="size-4 shrink-0 text-secondary" /><span className="min-w-0 break-words">连不上{ready ? nodeName(ready.entry.device_id, lookup) : '设备'}</span>
+          <Button type="button" variant="ghost" size="sm" className="shrink-0" onClick={retryNow}><RotateCw aria-hidden="true" />重试连接</Button>
         </p> : null}
-        {waitingTarget && (targetHidden || !workspace.connectionOnline) ? <button type="button" className="flex min-h-8 max-w-full items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium transition-colors hover:bg-warning-soft active:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out motion-reduce:animate-none max-md:min-h-11 max-md:ps-3"
+        {waitingTarget && (targetHidden || !workspace.connectionOnline) ? <Button variant="ghost" type="button" className="flex max-w-full items-center gap-1.5 duration-200 ease-out motion-reduce:animate-none"
           onClick={() => document.getElementById(waitingTarget)?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })}>
-          <terms.inbox.icon aria-hidden="true" className="size-4 shrink-0 text-warning" /><span className="min-w-0 break-words">{!workspace.connectionOnline ? '最近记录 · ' : ''}{waitingCount > 1 ? `${waitingCount} 项${terms.inbox.label}` : terms.inbox.label}</span><ArrowDown aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
-        </button> : null}
+          <terms.inbox.icon aria-hidden="true" className="size-4 shrink-0 text-warning" /><span className="min-w-0 break-words">{!workspace.connectionOnline ? '最近记录 · ' : ''}{waitingCount > 1 ? `${waitingCount} 项${terms.inbox.label}` : terms.inbox.label}</span><ArrowDown aria-hidden="true" className="size-3.5 shrink-0 text-secondary" />
+        </Button> : null}
         </div>}
-        tint={tint}
         value={text}
         hint={notice}
         reason={reason}
@@ -324,7 +319,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
         }}
       >
         <InlineError error={sendError} className="basis-full" />
-        {inputTarget.kind === 'routine' ? <p className="flex basis-full items-center gap-2"><span className="min-w-0 flex-1 truncate">{targetBusy ? '补充给' : '发送给'} · 例行任务 · {scheduleName(inputTarget.trigger, data?.bot_settings, changes)}</span><Button type="button" variant="ghost" size="sm" className="max-md:min-h-11" onClick={() => setSelectedTarget('main')}>改回主聊天</Button></p> : null}
+        {inputTarget.kind === 'routine' ? <p className="flex basis-full items-center gap-2"><span className="min-w-0 flex-1 truncate">{targetBusy ? '补充给' : '发送给'} · 例行任务 · {scheduleName(inputTarget.trigger, data?.bot_settings, changes)}</span><Button type="button" variant="ghost" size="sm" className="" onClick={() => setSelectedTarget('main')}>改回主聊天</Button></p> : null}
         <InputQueue target={inputTarget} />
         {needsSetup && !starting && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot?.bot_id }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
       </PromptInput> : null}
@@ -353,7 +348,7 @@ function TaskIcon({ state, stale, away = false }: { state: string; stale: boolea
     : failed ? CircleX : state === 'interrupted' ? CircleStop
     : state === 'waiting' ? terms.approval.icon : state === 'awaiting_children' ? Hourglass
     : taskActive(state) ? LoaderCircle : CircleQuestionMark
-  return <Icon aria-hidden="true" className={`size-4 shrink-0 ${state === 'completed' ? 'text-success' : failed ? 'text-danger' : state === 'waiting' ? 'text-warning' : !stale && !away && taskActive(state) ? 'animate-spin text-info motion-reduce:animate-none' : 'text-muted-foreground'}`} />
+  return <Icon aria-hidden="true" className={`size-4 shrink-0 ${state === 'completed' ? 'text-success' : failed ? 'text-danger' : state === 'waiting' ? 'text-warning' : !stale && !away && taskActive(state) ? 'animate-spin text-info motion-reduce:animate-none' : 'text-secondary'}`} />
 }
 
 function TaskCard({ task, botId, device, here, live, away }: { task: TaskRow; botId: string; device: string; here: boolean; live: boolean; away: boolean }) {
@@ -363,13 +358,13 @@ function TaskCard({ task, botId, device, here, live, away }: { task: TaskRow; bo
   const stale = taskStale(task.state, live) || !live && task.state === 'awaiting_children'
   const label = stale ? staleTaskLabel : away ? taskCopy.away : taskLabel(task.state)
   const reason = !ongoing && task.state !== 'completed' ? workFailure(task.work).split('\n')[0] : ''
-  return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} aria-label={`${title} · ${label} · 查看任务`} className="-mx-2 flex min-h-9 items-start gap-2 rounded-lg px-2 py-2 text-meta transition-colors hover:bg-muted/60 hover:text-foreground active:bg-muted max-md:min-h-11 max-md:py-3">
+  return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} aria-label={`${title} · ${label} · 查看任务`} className="-mx-2 flex min-h-9 items-start gap-2 rounded-control px-2 py-2 text-sm transition-colors hover:bg-surface-muted/60 hover:text-foreground active:bg-surface-muted max-md:min-h-11 max-md:py-3">
     <TaskIcon state={task.state} stale={stale} away={away} />
-    <span className="min-w-0 flex-1">{ongoing ? <><span className="flex min-w-0 flex-col @sm:flex-row @sm:items-baseline @sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} here={here} label={label} agent={task.agent} className="text-meta" /></span>
-      {task.joined ? <span className="flex min-w-0 items-center gap-1 text-meta text-muted-foreground"><Link2 aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">补充到「{task.joined}」</span></span>
-        : taskActive(task.state) && task.summary ? <span className="line-clamp-2 whitespace-pre-wrap break-words text-meta text-muted-foreground">{stale ? '最近进展：' : ''}{task.summary}</span> : null}</>
-      : <><span className="text-muted-foreground">{label} · 查看任务</span>{reason ? <span className={`block break-words ${failed ? 'text-danger' : 'text-muted-foreground'}`}>{reason}</span> : null}</>}</span>
-    {task.state === 'completed' ? null : <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />}
+    <span className="min-w-0 flex-1">{ongoing ? <><span className="flex min-w-0 flex-col @sm:flex-row @sm:items-baseline @sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} here={here} label={label} agent={task.agent} className="text-sm" /></span>
+      {task.joined ? <span className="flex min-w-0 items-center gap-1 text-sm text-secondary"><Link2 aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">补充到「{task.joined}」</span></span>
+        : taskActive(task.state) && task.summary ? <span className="line-clamp-2 whitespace-pre-wrap break-words text-sm text-secondary">{stale ? '最近进展：' : ''}{task.summary}</span> : null}</>
+      : <><span className="text-secondary">{label} · 查看任务</span>{reason ? <span className={`block break-words ${failed ? 'text-danger' : 'text-secondary'}`}>{reason}</span> : null}</>}</span>
+    {task.state === 'completed' ? null : <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-secondary" />}
   </Link></div>
 }
 
@@ -383,24 +378,24 @@ function TaskHistory({ tasks, botId, name }: { tasks: TaskRow[]; botId: string; 
   const attention = tasks.filter((task) => task.attention).length
   const count = [working ? `${working} 进行中` : '', attention ? `${attention} 待处理` : ''].filter(Boolean).join(' · ')
   return <>
-    <PageActions><Button type="button" variant="ghost" size="sm" aria-label={`任务${count ? ` · ${count}` : ''}`} onClick={() => { leaving.current = false; setOpen(true) }}><ListChecks aria-hidden="true" /><span>任务</span>{count ? <span className="text-meta text-muted-foreground max-sm:sr-only">{count}</span> : null}{count ? <span className="text-meta sm:hidden">{working + attention}</span> : null}</Button></PageActions>
-    <Sheet open={open} onOpenChange={setOpen}>
-      <SheetContent className="!w-full min-w-0 gap-0 sm:!max-w-md" onCloseAutoFocus={(event) => { if (leaving.current) event.preventDefault() }}>
-        <SheetHeader className="shrink-0 pe-14"><SheetTitle>任务记录</SheetTitle><SheetDescription>{name} 的任务</SheetDescription></SheetHeader>
+    <PageActions><Button type="button" variant="ghost" size="sm" aria-label={`任务${count ? ` · ${count}` : ''}`} onClick={() => { leaving.current = false; setOpen(true) }}><ListChecks aria-hidden="true" /><span>任务</span>{count ? <span className="text-sm text-secondary max-sm:sr-only">{count}</span> : null}{count ? <span className="text-sm sm:hidden">{working + attention}</span> : null}</Button></PageActions>
+    <Drawer open={open} onOpenChange={setOpen}>
+      <DrawerContent title={"任务记录"} description={[name,"的任务"].join("")} className="!w-full min-w-0 gap-0 sm:!max-w-md" onCloseAutoFocus={(event) => { if (leaving.current) event.preventDefault() }}>
+        <div className="shrink-0 pe-14"></div>
         <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-6">
-          {!workspace.connectionOnline || workspace.incomplete ? <p role="status" className="pb-3 text-meta text-muted-foreground">{!workspace.connectionOnline ? '暂时收不到最新任务状态，显示最近记录。' : '任务记录正在同步，显示已读取的部分。'}</p> : null}
-          {!workspace.data ? <p role="status" className="py-6 text-meta text-muted-foreground">正在读取任务记录</p> : tasks.length ? <ul className="divide-y">{tasks.map((task) => {
+          {!workspace.connectionOnline || workspace.incomplete ? <p role="status" className="pb-3 text-sm text-secondary">{!workspace.connectionOnline ? '暂时收不到最新任务状态，显示最近记录。' : '任务记录正在同步，显示已读取的部分。'}</p> : null}
+          {!workspace.data ? <p role="status" className="py-6 text-sm text-secondary">正在读取任务记录</p> : tasks.length ? <ul className="divide-y">{tasks.map((task) => {
             const stale = taskStale(task.state, workspace.connectionOnline) || !workspace.connectionOnline && task.state === 'awaiting_children'
             const away = task.state === 'dispatch_waiting' && workspace.nodes.some((node) => node.device_id === task.device && !node.online)
-            return <li key={task.id}><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} onClick={() => { leaving.current = true; setOpen(false) }} className="-mx-2 flex min-h-11 min-w-0 items-start gap-2 rounded-lg px-2 py-3 hover:bg-muted/60 active:bg-muted">
+            return <li key={task.id}><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} onClick={() => { leaving.current = true; setOpen(false) }} className="-mx-2 flex min-h-11 min-w-0 items-start gap-2 rounded-control px-2 py-3 hover:bg-surface-muted/60 active:bg-surface-muted">
               <TaskIcon state={task.state} stale={stale} away={away} />
-              <span className="grid min-w-0 flex-1 gap-1"><span className="break-words font-medium">{task.work.title || '任务'}</span><span className="flex min-w-0 flex-wrap gap-x-1 text-meta text-muted-foreground"><span>{stale ? staleTaskLabel : away ? taskCopy.away : taskLabel(task.state)}</span><span aria-hidden="true">·</span><span className="min-w-0 break-words">{nodeName(task.device, { nodes: workspace.nodes, directory })}</span></span></span>
-              <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+              <span className="grid min-w-0 flex-1 gap-1"><span className="break-words font-medium">{task.work.title || '任务'}</span><span className="flex min-w-0 flex-wrap gap-x-1 text-sm text-secondary"><span>{stale ? staleTaskLabel : away ? taskCopy.away : taskLabel(task.state)}</span><span aria-hidden="true">·</span><span className="min-w-0 break-words">{nodeName(task.device, { nodes: workspace.nodes, directory })}</span></span></span>
+              <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-secondary" />
             </Link></li>
-          })}</ul> : <p className="py-6 text-meta text-muted-foreground">{!workspace.connectionOnline || workspace.incomplete ? '最近记录中还没有任务。' : '还没有任务'}</p>}
+          })}</ul> : <p className="py-6 text-sm text-secondary">{!workspace.connectionOnline || workspace.incomplete ? '最近记录中还没有任务。' : '还没有任务'}</p>}
         </div>
-      </SheetContent>
-    </Sheet>
+      </DrawerContent>
+    </Drawer>
   </>
 }
 
@@ -409,7 +404,7 @@ function TaskMeta({ device, here, label, agent, className = '' }: { device: stri
   const by = agent ? providerNames[agent] : ''
   const Agent = agent ? providerIcons[agent] : null
   const dot = <span aria-hidden="true">·</span>
-  return <span className={`flex min-w-0 shrink-0 items-center gap-1 text-muted-foreground ${className}`}>
+  return <span className={`flex min-w-0 shrink-0 items-center gap-1 text-secondary ${className}`}>
     <span aria-hidden="true" className="hidden @sm:inline">·</span>
     {Agent ? <><Agent aria-hidden="true" className="size-3.5 shrink-0" /><span className="shrink-0">{by}</span>{dot}</> : null}
     {here ? <span className="sr-only">{device}</span> : <><Laptop aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">{device}</span>{dot}</>}
@@ -420,21 +415,21 @@ function TaskMeta({ device, here, label, agent, className = '' }: { device: stri
 /** Shaped like a message from another bot, its name above the text, so both directions read as one kind of thing. */
 function SentToBot({ sent, to }: { sent: SentBotMessage; to: { name: string; bot_id?: string } }) {
   return <div className="flex min-w-0 flex-col items-start gap-1">
-    <p className="flex min-w-0 max-w-full items-center gap-1.5 text-meta text-muted-foreground">
+    <p className="flex min-w-0 max-w-full items-center gap-1.5 text-sm text-secondary">
       <Send aria-hidden="true" className="size-4 shrink-0" />
       <span className="shrink-0">发给</span>
       {to.bot_id ? <Link to="/b/$botId" params={{ botId: to.bot_id }} className="hit-area relative flex min-w-0 font-medium text-foreground underline-offset-4 hover:underline"><span className="truncate">{to.name}</span></Link>
         : <span className="min-w-0 truncate font-medium text-foreground">{to.name}</span>}
     </p>
-    <p className="line-clamp-3 min-w-0 max-w-[85%] whitespace-pre-wrap rounded-2xl border px-4 py-2 [overflow-wrap:anywhere] sm:max-w-[75%]" title={sent.text}>{sent.text}</p>
+    <p className="line-clamp-3 min-w-0 max-w-[85%] whitespace-pre-wrap rounded-panel border px-4 py-2 [overflow-wrap:anywhere] sm:max-w-[75%]" title={sent.text}>{sent.text}</p>
   </div>
 }
 
 /** `retry`: 重试, only offered while its message is the newest. */
 function JobLine({ job, retry, refresh }: { job: ManagerJob; retry?: () => Promise<void>; refresh: () => Promise<void> }) {
-  return <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-meta">
+  return <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-sm">
     <span className="flex shrink-0 items-center gap-1 text-danger"><CircleX aria-hidden="true" className="size-4 shrink-0" />Bot 没能回复</span>
-    {job.failure ? <span className="min-w-0 truncate text-muted-foreground" title={job.failure.detail}>{failureText(job.failure.kind) || failureReason(job.failure.detail)}</span> : null}
-    {retry ? <ActionButton variant="ghost" className="-ms-1 h-8 px-2 text-meta max-md:h-11" action={retry}><RotateCcw aria-hidden="true" />重试</ActionButton> : <ActionButton variant="ghost" action={refresh}>再查一次</ActionButton>}
+    {job.failure ? <span className="min-w-0 truncate text-secondary" title={job.failure.detail}>{failureText(job.failure.kind) || failureReason(job.failure.detail)}</span> : null}
+    {retry ? <ActionButton variant="ghost" className="-ms-1" action={retry}><RotateCcw aria-hidden="true" />重试</ActionButton> : <ActionButton variant="ghost" action={refresh}>再查一次</ActionButton>}
   </div>
 }

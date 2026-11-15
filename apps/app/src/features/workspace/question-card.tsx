@@ -1,20 +1,21 @@
+import { Textarea } from "@vibeface/uiarc/textarea/textarea.tsx"
 "use client"
 
-import { useRef, useState, type ReactNode } from "react"
-import { Link, useNavigate } from "@tanstack/react-router"
-import { ChevronRight, CircleAlert, CircleCheck, CircleSlash, CircleX, FolderOpen, Info, Laptop, ListChecks, MessageCircleQuestionMark, RotateCw, SendHorizontal, TriangleAlert, X, type LucideIcon } from "lucide-react"
-import { ActionCard, BusyIcon, InlineError, claimFocus, toast, useAction, type Tone } from "@/components/app/kit"
 import { BotFace } from "@/components/app/bot-face"
+import { ActionCard,BusyIcon,InlineError,claimFocus,toast,useAction,type Tone } from "@/components/arc/product-kit"
+import { providerIcons } from "@/features/devices/ai-settings"
 import { terms } from "@/lib/glossary"
 import { cn } from "@/lib/utils"
-import { Button } from "@/components/ui/button"
+import { Link,useNavigate } from "@tanstack/react-router"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
+import { providerNames } from "@vibeface/client/lib/node.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
-import { answerLabel, attentionLabel, approvalTask, declined, ignoredAnswer, questionMeta, settledAnswer, sharedProject, questionParts } from "@vibeface/client/workspace/questions.ts"
-import { providerNames } from "@vibeface/client/lib/node.ts"
-import { providerIcons } from "@/features/devices/ai-settings"
-import type { Question, Severity } from "@vibeface/client/workspace/types.ts"
+import { answerLabel,approvalTask,attentionLabel,declined,ignoredAnswer,questionMeta,questionParts,settledAnswer,sharedProject } from "@vibeface/client/workspace/questions.ts"
+import type { Question,Severity } from "@vibeface/client/workspace/types.ts"
+import { Button } from "@vibeface/uiarc/button/button.tsx"
+import { ChevronRight,CircleAlert,CircleCheck,CircleSlash,CircleX,FolderOpen,Info,Laptop,ListChecks,MessageCircleQuestionMark,RotateCw,SendHorizontal,TriangleAlert,X,type LucideIcon } from "lucide-react"
+import { useRef,useState,type ReactNode } from "react"
 
 const looks: Record<Severity, { icon: LucideIcon; tone: Tone; label?: string }> = {
   urgent: { icon: TriangleAlert, tone: "warning", label: "紧急" },
@@ -86,12 +87,12 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
     tone={tone}
     title={<>{label ? <span className="sr-only">{label}：</span> : null}<span className="[overflow-wrap:anywhere]">{ask}</span></>}
   >
-    <p className="text-meta text-muted-foreground">{attentionLabel(question)}{question.attention?.device_id ? ` · 处理设备 ${nodeName(question.attention.device_id, { nodes: workspace.nodes, directory })}` : ''}</p>
-    {question.attention?.kind === 'browser_takeover' ? <p className="text-meta text-muted-foreground">请在运行设备的浏览器中完成操作，确认结果后再回来回答。</p> : null}
+    <p className="text-sm text-secondary">{attentionLabel(question)}{question.attention?.device_id ? ` · 处理设备 ${nodeName(question.attention.device_id, { nodes: workspace.nodes, directory })}` : ''}</p>
+    {question.attention?.kind === 'browser_takeover' ? <p className="text-sm text-secondary">请在运行设备的浏览器中完成操作，确认结果后再回来回答。</p> : null}
     <Lines text={detail} />
-    {inTask ? null : <p className="flex min-w-0 items-center gap-3 text-meta text-muted-foreground">
+    {inTask ? null : <p className="flex min-w-0 items-center gap-3 text-sm text-secondary">
       {taskScope ? <Link to="/tasks/$taskId" params={{ taskId: taskScope }} className="inline-flex min-h-11 items-center gap-1 underline underline-offset-4"><ListChecks aria-hidden="true" className="size-4" />打开所属任务</Link> : null}
-      {task ? <Link to="/b/$botId/work/$workId" params={{ botId: task.bot_id, workId: task.work_id }} search={inbox ? { from: "tasks" } : {}} className="inline-flex min-w-12 items-center gap-1 rounded-md underline-offset-4 hover:text-foreground hover:underline max-md:min-h-11">
+      {task ? <Link to="/b/$botId/work/$workId" params={{ botId: task.bot_id, workId: task.work_id }} search={inbox ? { from: "tasks" } : {}} className="inline-flex min-w-12 items-center gap-1 rounded-control underline-offset-4 hover:text-foreground hover:underline max-md:min-h-11">
         <ListChecks aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">任务 </span><span className="truncate">{task.title}</span>
       </Link> : null}
       {question.about.agent ? <Meta icon={providerIcons[question.about.agent]} label="来自" compact={Boolean(task)}>{providerNames[question.about.agent]}</Meta> : null}
@@ -99,36 +100,36 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
       {/* As on task rows, only another device is named on screen. */}
       {local ? <span className="sr-only">设备 {node}</span>
         : <Meta icon={Laptop} label="设备" title={node} compact={Boolean(task)}>{node}</Meta>}
-      {inbox && question.bot && inputTarget && !taskScope ? <Link to="/b/$botId" params={{ botId: question.bot.bot_id }} search={inputTarget?.kind === "routine" ? { routine: inputTarget.trigger } : {}} title={question.bot.name} className="ms-auto inline-flex min-w-0 shrink-[2] items-center justify-end gap-1.5 rounded-md font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11 max-md:min-w-11">
-        <BotFace bot={workspace.bots.find((item) => item.bot_id === question.bot?.bot_id) ?? { bot_id: question.bot.bot_id, avatar: null }} mood="idle" size={16} /><span className="sr-only">去对话 </span><span className="truncate max-sm:sr-only">{question.bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+      {inbox && question.bot && inputTarget && !taskScope ? <Link to="/b/$botId" params={{ botId: question.bot.bot_id }} search={inputTarget?.kind === "routine" ? { routine: inputTarget.trigger } : {}} title={question.bot.name} className="ms-auto inline-flex min-w-0 shrink-[2] items-center justify-end gap-1.5 rounded-control font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11 max-md:min-w-11">
+        <BotFace bot={workspace.bots.find((item) => item.bot_id === question.bot?.bot_id) ?? { bot_id: question.bot.bot_id, avatar: null }} mood="idle" size={16} /><span className="sr-only">去对话 </span><span className="truncate max-sm:sr-only">{question.bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-secondary" />
       </Link> : null}
     </p>}
-    {pending ? <p role="status" className="flex min-w-0 flex-wrap items-center gap-x-2 text-meta text-muted-foreground">
+    {pending ? <p role="status" className="flex min-w-0 flex-wrap items-center gap-x-2 text-sm text-secondary">
       <CircleAlert aria-hidden="true" className="size-4 shrink-0 text-warning" />
       <span className="min-w-0 whitespace-pre-wrap [overflow-wrap:anywhere] text-foreground">{displayAnswer(pending.text)}</span>
       <span aria-hidden="true">·</span>{action.busy !== null ? "正在发送" : "没确认送达"}<span aria-hidden="true">·</span>
       <Button type="button" variant="ghost" disabled={disabled} aria-busy={action.busy === "retry" || undefined} onClick={() => void send("retry", pending.text)}><BusyIcon busy={action.busy === "retry"} icon={RotateCw} />再试</Button>
     </p> : <div className="grid gap-2">
-      {approvalChoices.length ? <div className="flex flex-wrap gap-2">{approvalChoices.map((choice) => <Button key={choice.label} type="button" variant={choice.action === 'allow_once' ? 'default' : 'outline'} className="min-h-11" disabled={disabled} aria-busy={action.busy === `permission:${choice.action}` || undefined} onClick={() => void send(`permission:${choice.action}`, choice.label)}><BusyIcon busy={action.busy === `permission:${choice.action}`} icon={choice.action === 'allow_once' ? CircleCheck : CircleX} />{choice.action === 'allow_once' ? '允许本次' : '拒绝'}</Button>)}</div> : <>
+      {approvalChoices.length ? <div className="flex flex-wrap gap-2">{approvalChoices.map((choice) => <Button key={choice.label} type="button" variant={choice.action === 'allow_once' ? "primary" : "secondary"} className="" disabled={disabled} aria-busy={action.busy === `permission:${choice.action}` || undefined} onClick={() => void send(`permission:${choice.action}`, choice.label)}><BusyIcon busy={action.busy === `permission:${choice.action}`} icon={choice.action === 'allow_once' ? CircleCheck : CircleX} />{choice.action === 'allow_once' ? '允许本次' : '拒绝'}</Button>)}</div> : <>
         {question.choices.length ? <div role="group" aria-label="选一个回答" className="grid min-w-0 gap-2">
-          {question.choices.map((choice, index) => <button key={index} type="button" className={row} disabled={disabled} aria-busy={action.busy === `choice:${index}` || undefined} onClick={() => void send(`choice:${index}`, choice.label)}>
-            <span aria-hidden="true" className="w-4 shrink-0 text-center tabular-nums text-muted-foreground">{action.busy === `choice:${index}` ? <BusyIcon busy /> : index + 1}</span>
+          {question.choices.map((choice, index) => <Button variant="ghost" key={index} type="button" className={"w-full justify-start whitespace-normal"} disabled={disabled} aria-busy={action.busy === `choice:${index}` || undefined} onClick={() => void send(`choice:${index}`, choice.label)}>
+            <span aria-hidden="true" className="w-4 shrink-0 text-center tabular-nums text-secondary">{action.busy === `choice:${index}` ? <BusyIcon busy /> : index + 1}</span>
             <span className="min-w-0 flex-1 whitespace-pre-wrap [overflow-wrap:anywhere]">{choice.label}</span>
-          </button>)}
+          </Button>)}
         </div> : null}
         <div className="flex min-w-0 items-end gap-2">
-          <textarea aria-label="你的回答" rows={1} placeholder={question.choices.length ? "或者自己写回答" : "写下你的回答"} className="max-h-60 min-h-11 min-w-0 flex-1 resize-none rounded-lg border bg-card px-3 py-2.5 text-body outline-none [field-sizing:content] placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50" value={text} maxLength={4000} disabled={disabled} onChange={(event) => setText(event.target.value)} />
-          <Button type="button" size="icon" className="size-11 shrink-0" aria-label="发送回答" disabled={disabled || !text.trim()} aria-busy={action.busy === "answer" || undefined} onClick={() => void send("answer", text)}><BusyIcon busy={action.busy === "answer"} icon={SendHorizontal} /></Button>
+          <Textarea label="你的回答" aria-label="你的回答" rows={1} placeholder={question.choices.length ? "或者自己写回答" : "写下你的回答"} className="max-h-60 min-w-0 flex-1 resize-none [field-sizing:content] disabled:cursor-not-allowed disabled:opacity-50" value={text} maxLength={4000} disabled={disabled} onChange={(event) => setText(event.target.value)} />
+          <Button type="button" size="md" className="shrink-0" aria-label="发送回答" disabled={disabled || !text.trim()} aria-busy={action.busy === "answer" || undefined} onClick={() => void send("answer", text)}><BusyIcon busy={action.busy === "answer"} icon={SendHorizontal} /></Button>
         </div>
       </>}
-      {ignorable ? <Button type="button" variant="ghost" className="min-h-11 justify-self-start text-muted-foreground" disabled={disabled} aria-busy={action.busy === "ignore" || undefined} onClick={() => void send("ignore", ignoredAnswer)}><BusyIcon busy={action.busy === "ignore"} icon={X} />忽略</Button> : null}
+      {ignorable ? <Button type="button" variant="ghost" className="justify-self-start" disabled={disabled} aria-busy={action.busy === "ignore" || undefined} onClick={() => void send("ignore", ignoredAnswer)}><BusyIcon busy={action.busy === "ignore"} icon={X} />忽略</Button> : null}
     </div>}
     <InlineError error={action.error} />
   </ActionCard>
 }
 
 function Lines({ text, className }: { text: string; className?: string }) {
-  return text ? <p className={cn("whitespace-pre-wrap [overflow-wrap:anywhere] text-body", className)}>{text}</p> : null
+  return text ? <p className={cn("whitespace-pre-wrap [overflow-wrap:anywhere] text-base", className)}>{text}</p> : null
 }
 
 function Settled({ ask, detail, about, mark, focus = false, role, children }: { ask: string; detail: string; about?: ReactNode; mark: ReactNode; focus?: boolean; role?: "status"; children: ReactNode }) {
@@ -140,16 +141,15 @@ function Settled({ ask, detail, about, mark, focus = false, role, children }: { 
     </span>
   </span>
   const settled = "flex min-h-9 min-w-0 items-start gap-2 px-2 py-2 outline-none"
-  if (!detail) return <p ref={focus ? claimFocus : undefined} tabIndex={-1} className={cn("-mx-2 text-meta text-muted-foreground", settled)}>{mark}{line}</p>
-  return <details className="group -mx-2 text-meta text-muted-foreground">
-    <summary ref={focus ? claimFocus : undefined} className={cn(settled, "cursor-pointer list-none rounded-md hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden")}>
+  if (!detail) return <p ref={focus ? claimFocus : undefined} tabIndex={-1} className={cn("-mx-2 text-sm text-secondary", settled)}>{mark}{line}</p>
+  return <details className="group -mx-2 text-sm text-secondary">
+    <summary ref={focus ? claimFocus : undefined} className={cn(settled, "cursor-pointer list-none rounded-control hover:text-foreground   [&::-webkit-details-marker]:hidden")}>
       {mark}{line}<ChevronRight aria-hidden="true" className="mt-0.5 size-4 shrink-0 transition-transform duration-200 group-open:rotate-90" />
     </summary>
     <Lines text={detail} className="ps-8 pe-2 pb-2" />
   </details>
 }
 
-const row = "flex min-h-12 [&_svg]:size-4 w-full min-w-0 cursor-pointer items-start gap-3 rounded-lg border bg-card px-3 py-3 text-start font-medium transition-colors hover:bg-muted outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50"
 
 /** `compact`: on a phone it gives way to the task link, so the line keeps to one row. */
 function Meta({ icon: Icon, label, title, compact = false, children }: { icon: LucideIcon; label: string; title?: string; compact?: boolean; children: ReactNode }) {

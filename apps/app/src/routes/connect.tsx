@@ -1,10 +1,10 @@
-import { useEffect } from 'react'
-import { createFileRoute, useNavigate } from '@tanstack/react-router'
-import { AuthPage } from '@/components/app/kit'
-import { returnPath } from '@vibeface/client/identity/access.ts'
+import { AuthPage } from '@/components/arc/product-kit'
 import { ConnectionScreen } from '@/features/identity/connection-screen'
 import { RecoveredStep } from '@/features/identity/recovery-controls'
+import { createFileRoute,useNavigate } from '@tanstack/react-router'
+import { returnPath } from '@vibeface/client/identity/access.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { useEffect } from 'react'
 
 export const Route = createFileRoute('/connect')({
   validateSearch: (search: Record<string, unknown>): { redirect?: string } => typeof search.redirect === 'string' ? { redirect: search.redirect } : {},

@@ -1,12 +1,12 @@
-import { useSyncExternalStore } from "react"
-import { Link, useRouterState } from "@tanstack/react-router"
-import { Laptop, Smartphone, X } from "lucide-react"
 import { cn } from "@/lib/utils"
-import { Button } from "@/components/ui/button"
+import { Link,useRouterState } from "@tanstack/react-router"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
+import { entryAddress } from "@vibeface/client/lib/node.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { isLoopback } from "@vibeface/client/workspace/labels.ts"
-import { entryAddress } from "@vibeface/client/lib/node.ts"
+import { Button } from "@vibeface/uiarc/button/button.tsx"
+import { Laptop,Smartphone,X } from "lucide-react"
+import { useSyncExternalStore } from "react"
 import { useDeviceRows } from "./devices"
 
 const key = "vibeface.second-device-hint"
@@ -38,10 +38,10 @@ export function SecondDeviceHint({ className }: { className?: string }) {
     try { localStorage.setItem(key, "dismissed") } catch {}
     listeners.forEach((listener) => listener())
   }
-  return <div className={cn("flex min-w-0 items-center rounded-lg text-meta text-muted-foreground hover:bg-muted/50", className)}>
+  return <div className={cn("flex min-w-0 items-center rounded-control text-sm text-secondary hover:bg-surface-muted/50", className)}>
     <Link to="/devices" search={{ add: localOnly ? "computer" : true }} className="flex min-h-10 min-w-0 flex-1 items-center gap-2 ps-2 hover:text-foreground max-md:min-h-11">
       <Icon aria-hidden="true" className="size-4 shrink-0" /><span className="truncate">{localOnly ? "在另一台电脑上使用" : "在手机或其他电脑上使用"}</span>
     </Link>
-    <Button type="button" variant="ghost" size="icon-sm" className="shrink-0 hover:bg-transparent max-md:size-11" aria-label="不再提示" title="不再提示" onClick={dismiss}><X aria-hidden="true" /></Button>
+    <Button type="button" variant="ghost" size="md" className="shrink-0" aria-label="不再提示" title="不再提示" onClick={dismiss}><X aria-hidden="true" /></Button>
   </div>
 }

@@ -1,6 +1,7 @@
+import { RadioMark, SelectionItem } from '@/components/arc/selection'
 import { Bot, Check, ChevronDown, ChevronRight, CircleAlert, CircleCheck, CircleDashed, List, ListChecks, LoaderCircle, Monitor, Pencil, Play, PlugZap, Plus, Sparkles, Trash2, X, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useState, type ReactNode } from 'react'
-import { Pressable, View } from 'react-native'
+import { View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { deviceCopy } from '@vibeface/client/identity/copy.ts'
@@ -8,11 +9,11 @@ import { authenticationSourceLabels, canSetProviderEnvironment, availability, su
 import { folderLabels } from '@vibeface/client/workspace/bot-settings.ts'
 import { ErrorText } from '@/components/action'
 import { CopyableId, Details, EmptyState, Skeleton, providerIcons, toneText, type Tone } from '@/components/kit'
-import { Button } from '@/components/ui/button'
-import { Icon } from '@/components/ui/icon'
-import { Input } from '@/components/ui/input'
-import { Switch } from '@/components/ui/switch'
-import { Text } from '@/components/ui/text'
+import { Button } from '@/components/arc/button'
+import { Icon } from '@/components/arc/icon'
+import { Input } from '@/components/arc/input'
+import { Switch } from '@/components/arc/switch'
+import { Text } from '@/components/arc/text'
 import { useLive } from '@/data/live'
 import { Field, PathList, Retry, useCall } from '@/features/devices/remote-settings'
 import { cn } from '@/lib/utils'
@@ -25,7 +26,7 @@ export default function AiScreen() {
   const { ready } = useDevice()
   if (!ready) return null
   if (!ready.principal.can_manage && ready.principal.source !== 'local_session') return <EmptyState icon={Sparkles} title="只有管理设备能修改" className="flex-1 justify-center" />
-  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
+  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-6 pb-12">
     <Section icon={Sparkles} title={ready.info.name || 'AI'}><AiSettings /></Section>
   </KeyboardAwareScrollView>
 }
@@ -69,7 +70,7 @@ function AiSettings() {
   const botState = response?.providers.find((item) => item.roles.includes('agent'))?.state
   const folders = response?.settings.roots.join('\n')
   useEffect(() => { if (folders !== undefined) live?.refresh().then(() => setError((shown) => shown?.at === 'refresh' ? null : shown), (cause) => { if (ready?.isCurrent()) setError({ at: 'refresh', text: messageOf(cause, '读取最新内容') }) }) }, [botState, folders])
-  if (!response) return error ? <Retry error={error.text} onRetry={load} /> : <Skeleton className="h-28 rounded-xl" />
+  if (!response) return error ? <Retry error={error.text} onRetry={load} /> : <Skeleton className="h-28 rounded-panel" />
   const { roots, manager } = response.settings
   const test = async (): Promise<AppServerLink | null> => {
     if (!ready?.isCurrent()) return null
@@ -82,12 +83,12 @@ function AiSettings() {
     error={error?.at === item.provider ? error.text : ''}
     change={(key, change) => call(`${item.provider}:${key}`, 'configure_provider', { provider: item.provider, ...change }, item.provider).then(Boolean)}
     saveAssistant={(next) => call(`${item.provider}:assistant_details`, 'configure_node', { roots, manager: next }, item.provider).then(Boolean)} />
-  const list = (items: ProviderStatus[]) => <View className="overflow-hidden rounded-xl border border-border bg-card shadow-xs dark:border-line-strong">{items.map(row)}</View>
+  const list = (items: ProviderStatus[]) => <View className="overflow-hidden rounded-panel border border-border bg-surface  ">{items.map(row)}</View>
   return <View className="gap-6">
     <View className="flex-row flex-wrap gap-x-4 gap-y-1 px-1">
       {(['bot', 'execution'] as const).map((role) => <View key={role} accessible accessibilityLabel={`${roles[role].label}，${roles[role].note}`} className="flex-row items-center gap-1.5">
-        <Icon as={roles[role].icon} className="size-4 text-muted-foreground" />
-        <Text className="text-meta text-muted-foreground"><Text className="text-meta font-medium">{roles[role].label}</Text> · {roles[role].note}</Text>
+        <Icon as={roles[role].icon} className="size-4 text-muted" />
+        <Text className="text-sm text-muted"><Text className="text-sm font-medium">{roles[role].label}</Text> · {roles[role].note}</Text>
       </View>)}
     </View>
     {shown.length ? list(shown) : null}
@@ -116,48 +117,48 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
   const working = busy.startsWith(`${item.provider}:`)
   const using = [assistant ? roles.bot : null, execution ? roles.execution : null].filter((role) => role !== null)
   return <View className={cn(!first && 'border-t border-border')}>
-    <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} accessibilityLabel={[name, ...using.map((role) => role.label), state.label].join('，')}
-      className="min-h-14 flex-row items-center gap-3 px-4 py-2 active:bg-muted" onPress={() => setOpen(!open)}>
-      <Icon as={providerIcons[item.provider]} className={usable === 'missing' ? 'text-muted-foreground/60' : 'text-muted-foreground'} />
-      <Text numberOfLines={1} className={cn('min-w-0 flex-1 font-medium', usable === 'missing' && 'text-muted-foreground')}>{name}</Text>
-      {using.map((role) => <Icon key={role.label} as={role.icon} className="size-4 text-muted-foreground" />)}
+    <Button variant="ghost" accessibilityRole="button" accessibilityState={{ expanded: open }} accessibilityLabel={[name, ...using.map((role) => role.label), state.label].join('，')}
+      className="min-h-14 flex-row items-center gap-3 px-4 py-2 active:bg-surface-muted" onPress={() => setOpen(!open)}>
+      <Icon as={providerIcons[item.provider]} className={usable === 'missing' ? 'text-muted/60' : 'text-muted'} />
+      <Text numberOfLines={1} className={cn('min-w-0 flex-1 font-medium', usable === 'missing' && 'text-muted')}>{name}</Text>
+      {using.map((role) => <Icon key={role.label} as={role.icon} className="size-4 text-muted" />)}
       <View className="flex-row items-center gap-1">
         <Icon as={state.icon} className={cn('size-4', toneText[state.tone])} />
-        <Text className={cn('text-meta', toneText[state.tone])}>{state.label}</Text>
+        <Text className={cn('text-sm', toneText[state.tone])}>{state.label}</Text>
       </View>
-      <Icon as={open ? ChevronDown : ChevronRight} className="size-4 text-muted-foreground" />
-    </Pressable>
+      <Icon as={open ? ChevronDown : ChevronRight} className="size-4 text-muted" />
+    </Button>
     {issue ? <View className="-mt-1 flex-row flex-wrap items-center gap-x-2 px-4 pb-2">
       <Icon as={CircleAlert} className="size-4 text-warning" />
-      <Text className="shrink text-meta text-warning">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ''}</Text>
+      <Text className="shrink text-sm text-warning">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ''}</Text>
       {issue.code === 'app_server_not_found' && item.app_server
-        ? <Button variant="link" className="px-0" disabled={working} onPress={() => void change('app_server', { app_server: { mode: 'spawn', socket: item.app_server?.socket ?? null } })}><Text>{deviceCopy.appServer.useSpawn}</Text></Button>
-        : open ? null : <Button variant="link" className="px-0" onPress={() => setOpen(true)}><Text>去设置</Text></Button>}
+        ? <Button variant="ghost" className="px-0" disabled={working} onPress={() => void change('app_server', { app_server: { mode: 'spawn', socket: item.app_server?.socket ?? null } })}><Text>{deviceCopy.appServer.useSpawn}</Text></Button>
+        : open ? null : <Button variant="ghost" className="px-0" onPress={() => setOpen(true)}><Text>去设置</Text></Button>}
     </View> : null}
     <View className="gap-1 px-4 pb-3">
-      <Text className="text-meta text-muted-foreground">{authenticationSourceLabels[item.authentication_source]}</Text>
-      {'issue' in readiness ? <Text className="text-meta text-muted-foreground">{probeIssueText(item.provider, readiness.issue)}</Text> : null}
+      <Text className="text-sm text-muted">{authenticationSourceLabels[item.authentication_source]}</Text>
+      {'issue' in readiness ? <Text className="text-sm text-muted">{probeIssueText(item.provider, readiness.issue)}</Text> : null}
       {item.setup && (item.provider === 'cursor' ? item.probe.authentication === 'sign_in_required' : (assistant || execution) && ['needs_setup', 'unverified'].includes(readiness.state)) ? <View className="gap-2">
-        <Text className="text-meta text-muted-foreground">{item.provider === 'cursor' ? '在运行该节点的电脑上执行以下命令，登录 Cursor 订阅账户，再点“检查可用性”。' : '在运行该节点的电脑或服务器上执行以下命令，为节点登录，再点“检查可用性”。已有私有登录不会被自动接入覆盖。'}</Text>
-        {item.setup.directory ? <Text selectable className="font-mono text-meta text-muted-foreground">{item.setup.directory}</Text> : null}
+        <Text className="text-sm text-muted">{item.provider === 'cursor' ? '在运行该节点的电脑上执行以下命令，登录 Cursor 订阅账户，再点“检查可用性”。' : '在运行该节点的电脑或服务器上执行以下命令，为节点登录，再点“检查可用性”。已有私有登录不会被自动接入覆盖。'}</Text>
+        {item.setup.directory ? <Text selectable className="font-mono text-sm text-muted">{item.setup.directory}</Text> : null}
         <CopyableId value={item.setup.command} label={`${name} 登录命令`} />
       </View> : null}
-      <Text className="text-meta text-muted-foreground">{item.probe.checked_at_ms === null ? '尚未主动检查' : `检查于 ${new Date(item.probe.checked_at_ms).toLocaleString()}`}</Text>
+      <Text className="text-sm text-muted">{item.probe.checked_at_ms === null ? '尚未主动检查' : `检查于 ${new Date(item.probe.checked_at_ms).toLocaleString()}`}</Text>
       <Button variant="ghost" className="self-start" accessibilityLabel={`${name} 检查可用性`} disabled={busy !== ''} onPress={() => void probe()}><Icon as={busy === `${item.provider}:probe` ? LoaderCircle : PlugZap} /><Text>检查可用性</Text></Button>
-      {manager && item.probe.catalog.state === 'available' && item.probe.catalog.coverage === 'partial' ? <Text className="text-meta text-muted-foreground">模型列表可能不完整，可手填其他模型。</Text> : null}
-      {manager && item.probe.catalog.state === 'unavailable' ? <Text className="text-meta text-muted-foreground">模型列表暂不可用，可继续手填。已保存的模型保持不变。</Text> : null}
+      {manager && item.probe.catalog.state === 'available' && item.probe.catalog.coverage === 'partial' ? <Text className="text-sm text-muted">模型列表可能不完整，可手填其他模型。</Text> : null}
+      {manager && item.probe.catalog.state === 'unavailable' ? <Text className="text-sm text-muted">模型列表暂不可用，可继续手填。已保存的模型保持不变。</Text> : null}
     </View>
     {open ? <>
       {item.supports.includes('agent') ? <Toggle role="bot" name={name} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', assistant ? { bot: false } : botOnChange(response, item))} /> : null}
       {item.supports.includes('execution') ? <Toggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : null}
       <View className="gap-4 border-t border-border p-4">
-        <Details label="能力验证"><Text className="text-meta text-muted-foreground">{item.provider === 'cursor' ? '已找到程序，不代表订阅登录或模型已经验证。' : '程序和密钥已配置，不代表登录或模型已经验证。'}未验证时可以尝试运行。</Text>{item.observed ? Object.entries(item.observed).map(([key, observation]) => <Text key={key} className="text-meta">{providerObservationLabels[key]} · {providerObservationStates[observation.status]}</Text>) : <Text className="text-meta text-muted-foreground">验证记录未提供。</Text>}</Details>
+        <Details label="能力验证"><Text className="text-sm text-muted">{item.provider === 'cursor' ? '已找到程序，不代表订阅登录或模型已经验证。' : '程序和密钥已配置，不代表登录或模型已经验证。'}未验证时可以尝试运行。</Text>{item.observed ? Object.entries(item.observed).map(([key, observation]) => <Text key={key} className="text-sm">{providerObservationLabels[key]} · {providerObservationStates[observation.status]}</Text>) : <Text className="text-sm text-muted">验证记录未提供。</Text>}</Details>
         {manager ? <Details label="运行 Bot" keepMounted>
           <AssistantDetails key={`${manager.provider}:${JSON.stringify([manager.model, manager.reasoning_effort, manager.backup])}`} fields={['model']} manager={manager} models={models} working={working} save={saveAssistant} />
         </Details> : null}
         {execution ? <Details label="执行任务" keepMounted>
-          <Text className={cn('text-meta', toneText[executionState.tone])}>执行模型：{executionState.label}</Text>
-          {'issue' in item.execution_readiness ? <Text className="text-meta text-muted-foreground">{probeIssueText(item.provider, item.execution_readiness.issue)}</Text> : null}
+          <Text className={cn('text-sm', toneText[executionState.tone])}>执行模型：{executionState.label}</Text>
+          {'issue' in item.execution_readiness ? <Text className="text-sm text-muted">{probeIssueText(item.provider, item.execution_readiness.issue)}</Text> : null}
           <ExecutionDetails key={`${item.execution_model}:${item.provider}`} model={item.execution_model} models={models} working={working}
             save={(model) => change('execution_model', { execution_model: model })} />
         </Details> : null}
@@ -174,7 +175,7 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
             <Variables item={item} required={false} working={working} change={change} />
           </View>
         </Details>
-        {issue?.code === 'launch_failed' ? <Details label="启动失败原因"><Text selectable className="font-mono text-meta">{issue.detail}</Text></Details> : null}
+        {issue?.code === 'launch_failed' ? <Details label="启动失败原因"><Text selectable className="font-mono text-sm">{issue.detail}</Text></Details> : null}
       </View>
     </> : null}
     {error ? <View className="px-4 pb-3"><ErrorText error={error} /></View> : null}
@@ -190,16 +191,14 @@ function Toggle({ role, name, pressed, busy, disabled, onPress }: { role: keyof 
   const { label, hint, icon } = roles[role]
   // Only one provider runs the bot, so that row draws a radio dot: tapping it moves the bot here, tapping it again turns it off, hence a toggle for assistive tech.
   // Executing tasks is a system switch any provider can have on. While a save runs the controls keep their look and ignore taps; the spinner says which one is changing.
-  if (role === 'bot') return <Pressable accessibilityRole="togglebutton" accessibilityState={{ checked: pressed, disabled }} accessibilityLabel={`${name} ${label}`} accessibilityHint={hint(name)}
-    onPress={disabled ? undefined : onPress} className="min-h-12 flex-row items-center gap-3 border-t border-border px-4 active:bg-muted">
-    <Icon as={busy ? LoaderCircle : icon} className="text-muted-foreground" />
+  if (role === 'bot') return <SelectionItem accessibilityRole="togglebutton" accessibilityState={{ checked: pressed, disabled }} accessibilityLabel={`${name} ${label}`} accessibilityHint={hint(name)}
+    onPress={disabled ? undefined : onPress} className="min-h-12 flex-row items-center gap-3 border-t border-border px-4 active:bg-surface-muted">
+    <Icon as={busy ? LoaderCircle : icon} className="text-muted" />
     <Text className="min-w-0 flex-1">{label}</Text>
-    <View className={cn('size-5 items-center justify-center rounded-full border-2', pressed ? 'border-brand' : 'border-muted-foreground')}>
-      {pressed ? <View className="size-2.5 rounded-full bg-brand" /> : null}
-    </View>
-  </Pressable>
+    <RadioMark checked={pressed} />
+  </SelectionItem>
   return <View className="min-h-12 flex-row items-center gap-3 border-t border-border px-4">
-    <Icon as={busy ? LoaderCircle : icon} className="text-muted-foreground" />
+    <Icon as={busy ? LoaderCircle : icon} className="text-muted" />
     <Text className="min-w-0 flex-1">{label}</Text>
     <Switch value={pressed} accessibilityLabel={`${name} ${label}`} accessibilityHint={hint(name)} onValueChange={disabled ? undefined : onPress} />
   </View>
@@ -208,8 +207,8 @@ function Toggle({ role, name, pressed, busy, disabled, onPress }: { role: keyof 
 const modes: [AppServerMode, string, LucideIcon][] = [['system', deviceCopy.appServer.system, Monitor], ['spawn', deviceCopy.appServer.spawn, Play]]
 const links: Record<AppServerLink['state'], [string, LucideIcon, string]> = {
   connected: ['text-success', CircleCheck, '已连接'],
-  starting: ['text-muted-foreground', LoaderCircle, '连接中'],
-  off: ['text-muted-foreground', CircleDashed, '未用于执行任务'],
+  starting: ['text-muted', LoaderCircle, '连接中'],
+  off: ['text-muted', CircleDashed, '未用于执行任务'],
   not_found: ['text-warning', CircleAlert, '未找到'],
   handshake_failed: ['text-warning', CircleAlert, '连不上'],
   launch_failed: ['text-warning', CircleAlert, '没能启动'],
@@ -233,27 +232,27 @@ function AppServerSettings({ server, working, save, test }: { server: AppServer;
   const shown = tested ?? server.link
   const [tone, icon, label] = links[shown.state]
   return <Field label="连接方式">
-    <View accessibilityRole="radiogroup" className="flex-row gap-1 self-start rounded-lg bg-muted p-1">
+    <View accessibilityRole="radiogroup" className="flex-row gap-1 self-start rounded-control bg-surface-muted p-1">
       {modes.map(([mode, text, modeIcon]) => <Button key={mode} accessibilityRole="radio" accessibilityState={{ checked: draft.mode === mode }} disabled={working}
-        variant={draft.mode === mode ? 'outline' : 'ghost'} onPress={() => { setDraft({ ...draft, mode }); setInvalid(false) }}>
+        variant={draft.mode === mode ? 'secondary' : 'ghost'} onPress={() => { setDraft({ ...draft, mode }); setInvalid(false) }}>
         <Icon as={modeIcon} /><Text>{text}</Text>
       </Button>)}
     </View>
     {draft.mode === 'system' ? <Input accessibilityLabel="App Server socket 的绝对路径" placeholder="App Server socket 的绝对路径" autoCapitalize="none" autoCorrect={false}
       className="font-mono" value={draft.socket} editable={!working} onChangeText={(socket) => { setDraft({ ...draft, socket }); setInvalid(false) }} /> : null}
-    {draft.mode === 'system' ? <Text className="text-meta text-muted-foreground">共享所选外部 App Server 的会话，不隔离该服务的数据。</Text> : null}
-    {invalid ? <Text role="alert" className="text-meta text-warning">填写运行该节点的电脑或服务器上的绝对路径。</Text> : null}
+    {draft.mode === 'system' ? <Text className="text-sm text-muted">共享所选外部 App Server 的会话，不隔离该服务的数据。</Text> : null}
+    {invalid ? <Text role="alert" className="text-sm text-warning">填写运行该节点的电脑或服务器上的绝对路径。</Text> : null}
     <View className="flex-row flex-wrap items-center gap-2">
-      {dirty ? <Button variant="outline" disabled={working} onPress={saveConnection}><Text>保存</Text></Button> : null}
+      {dirty ? <Button variant="secondary" disabled={working} onPress={saveConnection}><Text>保存</Text></Button> : null}
       <Button variant="ghost" disabled={working || testing || dirty || server.link.state === 'off'} onPress={async () => { setTesting(true); try { setTested(await test()) } finally { setTesting(false) } }}>
         <Icon as={testing ? LoaderCircle : PlugZap} /><Text>测试连接</Text>
       </Button>
     </View>
-    {dirty ? <Text className="text-meta text-muted-foreground">保存后可测试连接</Text> : <View className="flex-row items-center gap-2">
+    {dirty ? <Text className="text-sm text-muted">保存后可测试连接</Text> : <View className="flex-row items-center gap-2">
       <Icon as={icon} className={cn('size-4', tone)} />
-      <Text className={cn('shrink text-meta', tone)}>{tested ? '测试：' : ''}{label}</Text>
+      <Text className={cn('shrink text-sm', tone)}>{tested ? '测试：' : ''}{label}</Text>
     </View>}
-    {!dirty && (shown.state === 'handshake_failed' || shown.state === 'launch_failed') ? <Text selectable className="font-mono text-meta text-muted-foreground">{shown.reason}</Text> : null}
+    {!dirty && (shown.state === 'handshake_failed' || shown.state === 'launch_failed') ? <Text selectable className="font-mono text-sm text-muted">{shown.reason}</Text> : null}
   </Field>
 }
 
@@ -282,20 +281,20 @@ function AssistantDetails({ fields, manager, models, working, save }: { fields: 
         ? <ModelPicker models={models} value={draft.model} working={working} copy={copy} pick={(model) => setDraft({ ...draft, model })} other={() => { setTyping(true); setDraft({ ...draft, model: '' }) }} />
         : <View className="flex-row items-center gap-2">
           {input('model', copy.label, cursor ? 'auto' : copy.default)}
-          {models ? <Button variant="ghost" size="icon" accessibilityLabel={copy.pick} disabled={working}
+          {models ? <Button variant="ghost" iconOnly accessibilityLabel={copy.pick} disabled={working}
             onPress={() => { setTyping(false); setDraft({ ...draft, model: models.some((model) => model.id === draft.model) ? draft.model : '' }) }}><Icon as={List} /></Button> : null}
         </View>}
     </Field>
     <Field label="推理强度">
       {efforts.length ? <View className="flex-row flex-wrap gap-1">
-        {[null, ...efforts].map((effort) => <Button key={effort ?? 'default'} variant={reasoningEffort === effort ? 'outline' : 'ghost'} disabled={working} onPress={() => setDraft({ ...draft, reasoning_effort: effort })}><Text>{effort ?? '由 AI 服务决定'}</Text></Button>)}
-        <Text className="text-meta text-muted-foreground">用于下一回合，模型是否支持以 AI 服务的检查结果为准。</Text>
-      </View> : <Text className="text-meta text-muted-foreground">由 AI 服务决定</Text>}
+        {[null, ...efforts].map((effort) => <Button key={effort ?? 'default'} variant={reasoningEffort === effort ? 'secondary' : 'ghost'} disabled={working} onPress={() => setDraft({ ...draft, reasoning_effort: effort })}><Text>{effort ?? '由 AI 服务决定'}</Text></Button>)}
+        <Text className="text-sm text-muted">用于下一回合，模型是否支持以 AI 服务的检查结果为准。</Text>
+      </View> : <Text className="text-sm text-muted">由 AI 服务决定</Text>}
     </Field>
     <Details label="备用策略"><BackupPolicyEditor policy={draft.backup} disabled={working} change={(backup) => setDraft({ ...draft, backup })} /></Details>
     </> : null}
     {fields.includes('workspace') ? <Field label={folderLabels.botRun}>{input('workspace', folderLabels.botRun)}</Field> : null}
-    {dirty ? <Button variant="outline" className="self-start" disabled={working || (cursor && !(fields.includes('model') ? draft.model : manager.model).trim()) || fields.includes('model') && draft.backup.candidates.some((candidate) => !candidate.model.trim())}
+    {dirty ? <Button variant="secondary" className="self-start" disabled={working || (cursor && !(fields.includes('model') ? draft.model : manager.model).trim()) || fields.includes('model') && draft.backup.candidates.some((candidate) => !candidate.model.trim())}
       onPress={() => void save({ ...manager, ...Object.fromEntries(fields.map((key) => [key, draft[key].trim()])),
         ...(fields.includes('model') ? { reasoning_effort: reasoningEffort, backup: { ...draft.backup, candidates: draft.backup.candidates.map((candidate) => ({ ...candidate, model: candidate.model.trim() })) } } : {}) })}><Text>保存</Text></Button> : null}
   </View>
@@ -312,11 +311,11 @@ function ExecutionDetails({ model, models, working, save }: { model: string; mod
       {models && !typing ? <ModelPicker models={models} value={draft} working={working} copy={deviceCopy.executionModel} pick={setDraft} other={() => { setTyping(true); setDraft('') }} />
         : <View className="flex-row items-center gap-2">
           <Input accessibilityLabel={deviceCopy.executionModel.label} className="min-w-0 flex-1" autoCapitalize="none" autoCorrect={false} placeholder={deviceCopy.executionModel.default} value={draft} editable={!working} onChangeText={setDraft} />
-          {models ? <Button variant="ghost" size="icon" accessibilityLabel={deviceCopy.executionModel.pick} disabled={working}
+          {models ? <Button variant="ghost" iconOnly accessibilityLabel={deviceCopy.executionModel.pick} disabled={working}
             onPress={() => { setTyping(false); setDraft(models.some((choice) => choice.id === draft) ? draft : '') }}><Icon as={List} /></Button> : null}
         </View>}
     </Field>
-    {dirty ? <Button variant="outline" className="self-start" disabled={working} onPress={() => void save(draft.trim())}><Text>保存</Text></Button> : null}
+    {dirty ? <Button variant="secondary" className="self-start" disabled={working} onPress={() => void save(draft.trim())}><Text>保存</Text></Button> : null}
   </View>
 }
 
@@ -326,21 +325,21 @@ function ModelPicker({ models, value, working, copy = deviceCopy.botModel, pick,
   const options: [string, string][] = [['', copy.default], ...models.map((model): [string, string] => [model.id, model.name])]
   const shown = options.find(([id]) => id === value)?.[1] ?? value
   const choose = (next: () => void) => { setOpen(false); next() }
-  return <View className="overflow-hidden rounded-lg border border-border">
-    <Pressable accessibilityRole="button" accessibilityLabel={`${copy.label}，${shown}`} accessibilityState={{ expanded: open, disabled: working }} disabled={working}
-      className="min-h-11 flex-row items-center gap-2 px-3 active:bg-muted" onPress={() => setOpen(!open)}>
+  return <View className="overflow-hidden rounded-control border border-border">
+    <Button variant="ghost" accessibilityRole="button" accessibilityLabel={`${copy.label}，${shown}`} accessibilityState={{ expanded: open, disabled: working }} disabled={working}
+      className="min-h-11 flex-row items-center gap-2 px-3 active:bg-surface-muted" onPress={() => setOpen(!open)}>
       <Text numberOfLines={1} className="min-w-0 flex-1">{shown}</Text>
-      <Icon as={open ? ChevronDown : ChevronRight} className="size-4 text-muted-foreground" />
-    </Pressable>
+      <Icon as={open ? ChevronDown : ChevronRight} className="size-4 text-muted" />
+    </Button>
     {open ? <View accessibilityRole="radiogroup">
-      {options.map(([id, name]) => <Pressable key={id || 'default'} accessibilityRole="radio" accessibilityState={{ checked: id === value, disabled: working }} disabled={working}
-        className="min-h-11 flex-row items-center gap-3 border-t border-border px-3 active:bg-muted" onPress={() => choose(() => pick(id))}>
+      {options.map(([id, name]) => <SelectionItem key={id || 'default'} accessibilityRole="radio" accessibilityState={{ checked: id === value, disabled: working }} disabled={working}
+        className="min-h-11 flex-row items-center gap-3 border-t border-border px-3 active:bg-surface-muted" onPress={() => choose(() => pick(id))}>
         <Text numberOfLines={1} className="min-w-0 flex-1">{name}</Text>
         {id === value ? <Icon as={Check} className="size-4" /> : null}
-      </Pressable>)}
-      <Pressable accessibilityRole="button" accessibilityState={{ disabled: working }} disabled={working} className="min-h-11 flex-row items-center border-t border-border px-3 active:bg-muted" onPress={() => choose(other)}>
+      </SelectionItem>)}
+      <Button variant="ghost" accessibilityRole="button" accessibilityState={{ disabled: working }} disabled={working} className="min-h-11 flex-row items-center border-t border-border px-3 active:bg-surface-muted" onPress={() => choose(other)}>
         <Text className="min-w-0 flex-1">{copy.other}</Text>
-      </Pressable>
+      </Button>
     </View> : null}
   </View>
 }
@@ -359,17 +358,17 @@ function Variables({ item, required, working, change }: { item: ProviderStatus; 
   const rows = item.env.filter((row) => row.required === required && canSetProviderEnvironment(item.provider, row.name))
   const list = rows.map((row) => {
       const missing = item.state === 'needs_setup' && !row.set && !row.inherited && row.required
-      return <View key={row.name} className="gap-2 rounded-lg bg-muted/60 py-1 ps-3 pe-1">
+      return <View key={row.name} className="gap-2 rounded-control bg-surface-muted/60 py-1 ps-3 pe-1">
         <View className="min-h-11 flex-row items-center gap-2">
-          <Text numberOfLines={1} className={cn('min-w-0 flex-1 text-meta', !required && 'font-mono')}>{required ? keyName(row.name) : row.name}</Text>
-          <Text className={cn('text-meta', missing ? 'text-warning' : 'text-muted-foreground')}>{row.set ? '••••••' : row.inherited ? '沿用本机' : '未填'}</Text>
-          <Button variant="ghost" size="icon" accessibilityLabel={`${row.set ? '替换' : '填写'} ${row.name}`} disabled={working} onPress={() => { setEditing(row.name); setValue('') }}><Icon as={Pencil} className="size-4" /></Button>
-          {row.set ? <Button variant="ghost" size="icon" accessibilityLabel={`删除 ${row.name}`} disabled={working} onPress={() => void set(row.name, null)}><Icon as={Trash2} className="size-4" /></Button> : null}
+          <Text numberOfLines={1} className={cn('min-w-0 flex-1 text-sm', !required && 'font-mono')}>{required ? keyName(row.name) : row.name}</Text>
+          <Text className={cn('text-sm', missing ? 'text-warning' : 'text-muted')}>{row.set ? '••••••' : row.inherited ? '沿用本机' : '未填'}</Text>
+          <Button variant="ghost" iconOnly accessibilityLabel={`${row.set ? '替换' : '填写'} ${row.name}`} disabled={working} onPress={() => { setEditing(row.name); setValue('') }}><Icon as={Pencil} className="size-4" /></Button>
+          {row.set ? <Button variant="ghost" iconOnly accessibilityLabel={`删除 ${row.name}`} disabled={working} onPress={() => void set(row.name, null)}><Icon as={Trash2} className="size-4" /></Button> : null}
         </View>
         {editing === row.name ? <View className="flex-row gap-2 pe-2 pb-1">
           <Input secureTextEntry autoFocus accessibilityLabel={`${row.name} 的值`} className="min-w-0 flex-1" maxLength={4096} value={value} onChangeText={setValue} />
-          <Button variant="outline" disabled={working || !value} onPress={() => void set(row.name, value).then((ok) => { if (ok) { setEditing(null); setValue('') } })}><Text>保存</Text></Button>
-          <Button variant="ghost" size="icon" accessibilityLabel="取消" onPress={() => { setEditing(null); setValue('') }}><Icon as={X} /></Button>
+          <Button variant="secondary" disabled={working || !value} onPress={() => void set(row.name, value).then((ok) => { if (ok) { setEditing(null); setValue('') } })}><Text>保存</Text></Button>
+          <Button variant="ghost" iconOnly accessibilityLabel="取消" onPress={() => { setEditing(null); setValue('') }}><Icon as={X} /></Button>
         </View> : null}
       </View>
     })
@@ -379,20 +378,20 @@ function Variables({ item, required, working, change }: { item: ProviderStatus; 
     <Input accessibilityLabel="变量名" placeholder="变量名" className="font-mono" autoCapitalize="characters" autoCorrect={false} maxLength={256} value={newName} editable={!working} onChangeText={setNewName} />
     <View className="flex-row gap-2">
       <Input secureTextEntry accessibilityLabel="值" placeholder="值" className="min-w-0 flex-1" maxLength={4096} value={newValue} editable={!working} onChangeText={setNewValue} />
-      <Button variant="outline" disabled={working || !addName || !newValue || !canSetProviderEnvironment(item.provider, addName)} onPress={() => void set(addName, newValue).then((ok) => { if (ok) { setNewName(''); setNewValue('') } })}>
+      <Button variant="secondary" disabled={working || !addName || !newValue || !canSetProviderEnvironment(item.provider, addName)} onPress={() => void set(addName, newValue).then((ok) => { if (ok) { setNewName(''); setNewValue('') } })}>
         <Icon as={Plus} /><Text>添加</Text>
       </Button>
     </View>
-    <Text className="text-meta text-muted-foreground">只保存在这个节点上，保存后看不到原值</Text>
-    {item.provider === 'cursor' ? <Text className="text-meta text-muted-foreground">Cursor 使用本机 CLI 订阅登录，无需填写密钥或认证令牌。</Text> : null}
-    {item.app_server?.mode === 'system' ? <Text className="text-meta text-muted-foreground">用已在运行的 Codex 时，这些变量不生效</Text> : null}
+    <Text className="text-sm text-muted">只保存在这个节点上，保存后看不到原值</Text>
+    {item.provider === 'cursor' ? <Text className="text-sm text-muted">Cursor 使用本机 CLI 订阅登录，无需填写密钥或认证令牌。</Text> : null}
+    {item.app_server?.mode === 'system' ? <Text className="text-sm text-muted">用已在运行的 Codex 时，这些变量不生效</Text> : null}
   </Field>
 }
 
 function SaveRow({ value, saved, placeholder, mono, working, onChange, onSave }: { value: string; saved: string; placeholder: string; mono?: boolean; working: boolean; onChange(value: string): void; onSave(): void }) {
   return <View className="flex-row gap-2">
     <Input accessibilityLabel={placeholder} placeholder={placeholder} autoCapitalize="none" autoCorrect={false} className={cn('min-w-0 flex-1', mono && 'font-mono')} value={value} editable={!working} onChangeText={onChange} />
-    {value.trim() !== saved ? <Button variant="outline" disabled={working} onPress={onSave}><Text>保存</Text></Button> : null}
+    {value.trim() !== saved ? <Button variant="secondary" disabled={working} onPress={onSave}><Text>保存</Text></Button> : null}
   </View>
 }
 
@@ -400,7 +399,7 @@ function Section({ icon, title, children }: { icon: LucideIcon; title: string; c
   return <View className="gap-3">
     <View className="flex-row items-center gap-2">
       <Icon as={icon} />
-      <Text role="heading" numberOfLines={1} className="shrink text-heading font-semibold">{title}</Text>
+      <Text role="heading" numberOfLines={1} className="shrink text-lg font-medium">{title}</Text>
     </View>
     {children}
   </View>
@@ -409,15 +408,15 @@ function Section({ icon, title, children }: { icon: LucideIcon; title: string; c
 function BackupPolicyEditor({ policy, disabled, change }: { policy: BackupPolicy; disabled: boolean; change(policy: BackupPolicy): void }) {
   const update = (index: number, value: BackupPolicy['candidates'][number]) => change({ ...policy, candidates: policy.candidates.map((candidate, at) => at === index ? value : candidate) })
   return <View className="gap-3">
-    <View className="min-h-11 flex-row items-center gap-2"><Text className="min-w-0 flex-1 text-meta">自动尝试备用模型</Text><Switch accessibilityLabel="自动尝试备用模型" disabled={disabled || !policy.candidates.length} value={policy.automatic} onValueChange={(automatic) => change({ ...policy, automatic })} /></View>
-    <Text className="text-meta text-muted-foreground">仅在原回合明确未执行时按顺序尝试一次。使用运行设备对应 AI 服务的登录账户，可能产生该账户的费用。</Text>
-    {policy.candidates.map((candidate, index) => <View key={index} className="gap-2 rounded-lg border border-border p-2">
-      <Text className="text-meta">备用模型 {index + 1}</Text>
-      <View className="flex-row flex-wrap gap-1">{providerIds.map((provider) => <Button key={provider} variant={candidate.provider === provider ? 'outline' : 'ghost'} disabled={disabled} onPress={() => update(index, { provider, model: '', reasoning_effort: null })}><Text>{providerNames[provider]}</Text></Button>)}</View>
+    <View className="min-h-11 flex-row items-center gap-2"><Text className="min-w-0 flex-1 text-sm">自动尝试备用模型</Text><Switch accessibilityLabel="自动尝试备用模型" disabled={disabled || !policy.candidates.length} value={policy.automatic} onValueChange={(automatic) => change({ ...policy, automatic })} /></View>
+    <Text className="text-sm text-muted">仅在原回合明确未执行时按顺序尝试一次。使用运行设备对应 AI 服务的登录账户，可能产生该账户的费用。</Text>
+    {policy.candidates.map((candidate, index) => <View key={index} className="gap-2 rounded-control border border-border p-2">
+      <Text className="text-sm">备用模型 {index + 1}</Text>
+      <View className="flex-row flex-wrap gap-1">{providerIds.map((provider) => <Button key={provider} variant={candidate.provider === provider ? 'secondary' : 'ghost'} disabled={disabled} onPress={() => update(index, { provider, model: '', reasoning_effort: null })}><Text>{providerNames[provider]}</Text></Button>)}</View>
       <Input accessibilityLabel={`备用模型 ${index + 1}`} placeholder="模型名称" autoCapitalize="none" autoCorrect={false} value={candidate.model} editable={!disabled} onChangeText={(model) => update(index, { ...candidate, model })} />
-      {effortOptions(candidate.provider).length ? <View className="flex-row flex-wrap gap-1">{[null, ...effortOptions(candidate.provider)].map((effort) => <Button key={effort ?? 'default'} variant={candidate.reasoning_effort === effort ? 'outline' : 'ghost'} disabled={disabled} onPress={() => update(index, { ...candidate, reasoning_effort: effort })}><Text>{effort ?? '由 AI 服务决定'}</Text></Button>)}</View> : <Text className="text-meta text-muted-foreground">推理强度由 AI 服务决定</Text>}
+      {effortOptions(candidate.provider).length ? <View className="flex-row flex-wrap gap-1">{[null, ...effortOptions(candidate.provider)].map((effort) => <Button key={effort ?? 'default'} variant={candidate.reasoning_effort === effort ? 'secondary' : 'ghost'} disabled={disabled} onPress={() => update(index, { ...candidate, reasoning_effort: effort })}><Text>{effort ?? '由 AI 服务决定'}</Text></Button>)}</View> : <Text className="text-sm text-muted">推理强度由 AI 服务决定</Text>}
       <Button variant="ghost" disabled={disabled} onPress={() => { const candidates = policy.candidates.filter((_, at) => at !== index); change({ automatic: policy.automatic && candidates.length > 0, candidates }) }}><Text>移除备用模型</Text></Button>
     </View>)}
-    <Button variant="outline" disabled={disabled || policy.candidates.length >= 5} onPress={() => change({ ...policy, candidates: [...policy.candidates, { provider: 'codex', model: '', reasoning_effort: null }] })}><Text>添加备用模型</Text></Button>
+    <Button variant="secondary" disabled={disabled || policy.candidates.length >= 5} onPress={() => change({ ...policy, candidates: [...policy.candidates, { provider: 'codex', model: '', reasoning_effort: null }] })}><Text>添加备用模型</Text></Button>
   </View>
 }

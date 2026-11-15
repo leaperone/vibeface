@@ -1,22 +1,23 @@
-import { useLayoutEffect, useRef, useState } from 'react'
-import { Link, useNavigate } from '@tanstack/react-router'
-import { Bell, CheckCheck, ChevronRight, CircleX, EyeOff, Settings, X } from 'lucide-react'
-import { ActionCard, claimFocus } from '@/components/app/kit'
-import { terms } from '@/lib/glossary'
-import { Button } from '@/components/ui/button'
-import { useInbox } from '@/features/workspace/inbox'
-import { QuestionCard } from '@/features/workspace/question-card'
+import { ActionCard,claimFocus } from '@/components/arc/product-kit'
+import { RoutedAction } from "@/components/arc/routed-action"
 import { JoinCard } from '@/features/devices/join'
-import { WriteCard } from '@/features/workspace/write-card'
-import { ConfirmCard } from '@/features/workspace/task-activity'
+import { RecoveryPendingCard,RotateHintCard } from '@/features/identity/recovery-controls'
+import { useInbox } from '@/features/workspace/inbox'
 import { ActionButton } from '@/features/workspace/present'
-import { RecoveryPendingCard, RotateHintCard } from '@/features/identity/recovery-controls'
+import { QuestionCard } from '@/features/workspace/question-card'
+import { ConfirmCard } from '@/features/workspace/task-activity'
+import { InputTargetLink,WorkspaceInputStatus } from '@/features/workspace/workspace-chat'
+import { WriteCard } from '@/features/workspace/write-card'
+import { terms } from '@/lib/glossary'
+import { Link,useNavigate } from '@tanstack/react-router'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { workFailure } from '@vibeface/client/lib/errors.ts'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import type { InboxItem } from '@vibeface/client/workspace/inbox.ts'
-import { fixOnDevice, fixOnDeviceLabel, nodeName } from '@vibeface/client/workspace/labels.ts'
-import { InputTargetLink, WorkspaceInputStatus } from '@/features/workspace/workspace-chat'
+import { fixOnDevice,fixOnDeviceLabel,nodeName } from '@vibeface/client/workspace/labels.ts'
+import { Button } from '@vibeface/uiarc/button/button.tsx'
+import { Bell,CheckCheck,ChevronRight,CircleX,EyeOff,Settings,X } from 'lucide-react'
+import { useLayoutEffect,useRef,useState } from 'react'
 
 /** 待处理 atop the task page: every card the person acts on in place. Waiting task conversations stay in the task list below; nothing waiting, nothing shown. */
 export function PendingSection() {
@@ -53,24 +54,24 @@ export function PendingSection() {
     setBusy(null)
   }
   return <section className="grid gap-3" aria-labelledby="pending-heading">
-    <h2 id="pending-heading" className="text-heading font-semibold">{terms.inbox.label}</h2>
-    {inputs.length ? <section className="grid gap-3"><h3 className="text-meta font-medium text-muted-foreground">待确认</h3>{inputs.map((input) => <div key={input.message_id} data-pending-input="" tabIndex={-1} onFocus={() => { held.current = { key: `undelivered:${input.message_id}`, index: 0 } }} className="grid gap-2 outline-none"><p className="line-clamp-2 text-meta">{input.text}</p><InputTargetLink target={input.target} conversationId={input.conversation_id} /><WorkspaceInputStatus pending={input} /></div>)}</section> : null}
-    {attention.length ? <h3 className="mt-3 text-meta font-medium text-muted-foreground">更新</h3> : null}
+    <h2 id="pending-heading" className="text-lg font-medium">{terms.inbox.label}</h2>
+    {inputs.length ? <section className="grid gap-3"><h3 className="text-sm font-medium text-secondary">待确认</h3>{inputs.map((input) => <div key={input.message_id} data-pending-input="" tabIndex={-1} onFocus={() => { held.current = { key: `undelivered:${input.message_id}`, index: 0 } }} className="grid gap-2 outline-none"><p className="line-clamp-2 text-sm">{input.text}</p><InputTargetLink target={input.target} conversationId={input.conversation_id} /><WorkspaceInputStatus pending={input} /></div>)}</section> : null}
+    {attention.length ? <h3 className="mt-3 text-sm font-medium text-secondary">更新</h3> : null}
     {attention.length ? <div className="flex flex-wrap justify-end gap-2">
       <Button type="button" variant="ghost" disabled={busy !== null} aria-busy={busy === "ignore" || undefined} onFocus={() => { held.current = { key: bulkFocusKey, index: 0 } }} onClick={() => void action("ignore")}><EyeOff aria-hidden="true" />忽略提醒</Button>
-      <Button type="button" variant="outline" disabled={busy !== null} aria-busy={busy === "read" || undefined} onFocus={() => { held.current = { key: bulkFocusKey, index: 0 } }} onClick={() => void action("read")}><CheckCheck aria-hidden="true" />全部已读</Button>
+      <Button type="button" variant="secondary" disabled={busy !== null} aria-busy={busy === "read" || undefined} onFocus={() => { held.current = { key: bulkFocusKey, index: 0 } }} onClick={() => void action("read")}><CheckCheck aria-hidden="true" />全部已读</Button>
     </div> : null}
     <ul ref={list} className="grid gap-3" onFocus={(event) => {
       const index = [...event.currentTarget.children].findIndex((card) => card.contains(event.target))
       if (listItems[index]) held.current = { key: listItems[index].key, index }
     }}>
-      {listItems.map((item) => <li key={item.key} tabIndex={-1} className="min-w-0 outline-none animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out">
-        {item.kind === 'recovery' ? <RecoveryPendingCard /> : item.kind === 'rotate' ? <RotateHintCard /> : item.kind === 'write' ? <WriteCard kind={item.write} /> : item.kind === 'join' ? <JoinCard request={item.join} /> : item.kind === 'question' ? <QuestionCard question={item.question} inbox /> : item.kind === 'confirm' ? <ConfirmCard check={item.check} inbox /> : item.kind === 'failed' ? <FailedCard item={item} /> : item.kind === 'session' ? <SessionNotice item={item} /> : item.kind === 'attention' ? <div className="grid gap-2 rounded-xl border bg-card p-4"><p className="font-medium">{item.title}</p><p className="text-meta text-muted-foreground">{item.notification.text}</p><>{item.notification.target ? <InputTargetLink target={item.notification.target} conversationId={item.notification.conversation_id} /> : <p className="text-meta text-muted-foreground">这条更新的执行范围尚未提供。</p>}</></div> : <div className="flex min-h-14 items-center rounded-xl border bg-card shadow-xs">
-        <Link to={item.to} className="flex min-h-14 min-w-0 flex-1 items-center gap-3 interactive-row rounded-xl px-4 py-3">
+      {listItems.map((item) => <li key={item.key} tabIndex={-1} className="min-w-0 outline-none    duration-200 ease-out">
+        {item.kind === 'recovery' ? <RecoveryPendingCard /> : item.kind === 'rotate' ? <RotateHintCard /> : item.kind === 'write' ? <WriteCard kind={item.write} /> : item.kind === 'join' ? <JoinCard request={item.join} /> : item.kind === 'question' ? <QuestionCard question={item.question} inbox /> : item.kind === 'confirm' ? <ConfirmCard check={item.check} inbox /> : item.kind === 'failed' ? <FailedCard item={item} /> : item.kind === 'session' ? <SessionNotice item={item} /> : item.kind === 'attention' ? <div className="grid gap-2 rounded-panel border bg-surface p-4"><p className="font-medium">{item.title}</p><p className="text-sm text-secondary">{item.notification.text}</p><>{item.notification.target ? <InputTargetLink target={item.notification.target} conversationId={item.notification.conversation_id} /> : <p className="text-sm text-secondary">这条更新的执行范围尚未提供。</p>}</></div> : <div className="flex min-h-14 items-center rounded-panel border bg-surface ">
+        <Link to={item.to} className="flex min-h-14 min-w-0 flex-1 items-center gap-3 interactive-row rounded-panel px-4 py-3">
           <item.icon aria-hidden="true" className="size-5 shrink-0 text-warning" />
           <span className="min-w-0 flex-1 truncate font-medium">{item.title}</span>
-          {item.meta ? <span className="max-w-[40%] shrink-0 truncate text-meta text-muted-foreground" title={item.meta}>{item.meta}</span> : null}
-          <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+          {item.meta ? <span className="max-w-[40%] shrink-0 truncate text-sm text-secondary" title={item.meta}>{item.meta}</span> : null}
+          <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-secondary" />
         </Link>
       </div>}
     </li>)}
@@ -85,15 +86,15 @@ function SessionNotice({ item }: { item: Extract<InboxItem, { kind: 'session' }>
     if (workspace.writable) await workspace.ackNotification(item.notification)
     await navigate({ to: '/b/$botId', params: { botId: item.bot.bot_id } })
   }, '打开会话提醒')
-  return <button type="button" onClick={open} className="flex min-h-14 w-full min-w-0 items-center gap-3 interactive-row rounded-xl border bg-card px-4 py-3 text-left shadow-xs">
+  return <Button variant="ghost" type="button" onClick={open} className="flex w-full min-w-0 items-center gap-3 interactive-row text-left ">
     <Bell aria-hidden="true" className="size-5 shrink-0 text-warning" />
     <span className="grid min-w-0 flex-1 gap-0.5">
       <span className="truncate font-medium">{item.title}</span>
-      <span className="truncate text-meta text-muted-foreground" title={item.notification.text}>{item.notification.text || item.meta || 'Bot'}</span>
+      <span className="truncate text-sm text-secondary" title={item.notification.text}>{item.notification.text || item.meta || 'Bot'}</span>
     </span>
-    <span className="max-w-[28%] shrink-0 truncate text-meta text-muted-foreground">{item.meta}</span>
-    <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
-  </button>
+    <span className="max-w-[28%] shrink-0 truncate text-sm text-secondary">{item.meta}</span>
+    <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-secondary" />
+  </Button>
 }
 
 /** A task that did not finish: its device and why, and the device's settings when the fix is there. */
@@ -104,9 +105,9 @@ function FailedCard({ item }: { item: Extract<InboxItem, { kind: 'failed' }> }) 
   const device = nodeName(work.target_node, { nodes: workspace.nodes, directory })
   const reason = workFailure(work)
   return <ActionCard icon={CircleX} tone="danger" meta={device}
-    title={<Link to="/b/$botId/work/$workId" params={{ botId: bot.bot_id, workId: work.work_id }} search={{ from: 'tasks' }} className="-my-2 flex min-h-11 items-center rounded-sm underline-offset-4 hover:underline">{item.title}</Link>}
+    title={<Link to="/b/$botId/work/$workId" params={{ botId: bot.bot_id, workId: work.work_id }} search={{ from: 'tasks' }} className="-my-2 flex min-h-11 items-center rounded-control underline-offset-4 hover:underline">{item.title}</Link>}
     trailing={<ActionButton variant="ghost" label="关掉" disabled={!workspace.writable} action={() => workspace.dismissWork(work.conversation_id, work.work_id)}><X aria-hidden="true" /></ActionButton>}
-    actions={fixOnDevice(work) ? <Button asChild variant="outline"><Link to="/devices/$deviceId" params={{ deviceId: work.target_node }}><Settings aria-hidden="true" />{fixOnDeviceLabel(device)}</Link></Button> : undefined}>
-    {reason ? <p className="line-clamp-3 text-muted-foreground">{reason}</p> : null}
+    actions={fixOnDevice(work) ? <RoutedAction variant="secondary" to="/devices/$deviceId" params={{ deviceId: work.target_node }}><Settings aria-hidden="true" />{fixOnDeviceLabel(device)}</RoutedAction> : undefined}>
+    {reason ? <p className="line-clamp-3 text-secondary">{reason}</p> : null}
   </ActionCard>
 }

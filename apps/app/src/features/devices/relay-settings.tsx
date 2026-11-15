@@ -1,11 +1,12 @@
-import { useEffect, useRef, useState } from "react"
-import { Check, CircleCheck, Copy, LoaderCircle, RadioTower, Share2, SlidersHorizontal, TriangleAlert } from "lucide-react"
+import { BusyIcon,InlineError,SettingsDisclosure,SettingsGroup,SettingsRow,Skeleton } from "@/components/arc/product-kit"
 import { cn } from "@/lib/utils"
-import { BusyIcon, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton } from "@/components/app/kit"
-import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
-import { parseRelaySettings, parseShareLink, relayDefaults, type RelaySettings as Settings } from "@vibeface/client/lib/node.ts"
+import { parseRelaySettings,parseShareLink,relayDefaults,type RelaySettings as Settings } from "@vibeface/client/lib/node.ts"
+import { Button } from "@vibeface/uiarc/button/button.tsx"
+import { Input } from "@vibeface/uiarc/input/input.tsx"
+import { Switch } from "@vibeface/uiarc/switch/switch.tsx"
+import { Check,CircleCheck,Copy,LoaderCircle,RadioTower,Share2,SlidersHorizontal,TriangleAlert } from "lucide-react"
+import { useEffect,useRef,useState } from "react"
 
 export const relayLabel = "公共转发"
 const shareLabel = "节点链接"
@@ -27,15 +28,14 @@ export function ShareLink() {
   const copy = () => void navigator.clipboard.writeText(link).then(() => setCopied(true), () => {})
   return <SettingsGroup>
     <SettingsRow icon={Share2} label={shareLabel}>
-      {link ? <Button type="button" variant="ghost" size="icon-sm" aria-label={copied ? "已复制" : "复制"} title={copied ? "已复制" : "复制"} onClick={copy}>
+      {link ? <Button type="button" variant="ghost" size="md" aria-label={copied ? "已复制" : "复制"} title={copied ? "已复制" : "复制"} onClick={copy}>
         {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
       </Button> : error ? null : <Skeleton className="h-6 w-11" />}
     </SettingsRow>
-    {link ? <div className="px-4 py-3"><code className="block select-all break-all font-mono text-meta text-muted-foreground">{link}</code></div> : null}
+    {link ? <div className="px-4 py-3"><code className="block select-all break-all font-mono text-sm text-secondary">{link}</code></div> : null}
     {error ? <div className="px-4 py-3"><InlineError error={error} /></div> : null}
   </SettingsGroup>
 }
-const fieldLabel = "-mb-1 text-meta font-medium text-muted-foreground"
 /** Off shows the switch alone; the other states an icon, their words only on hover and for screen readers. */
 const states = {
   checking: { icon: LoaderCircle, tone: "animate-spin text-info", text: "正在从外网检查" },
@@ -89,8 +89,7 @@ export function RelaySettings() {
   const state = settings && settings.status !== "off" ? states[settings.status] : null
   const header = <SettingsRow icon={RadioTower} label={relayLabel}>
     {state ? <span role="status" title={state.text} className="inline-flex"><state.icon aria-hidden="true" className={cn("size-4", state.tone)} /><span className="sr-only">{state.text}</span></span> : null}
-    {settings ? <input type="checkbox" role="switch" className="switch" aria-label={relayLabel} checked={settings.volunteer} disabled={Boolean(busy)}
-      onChange={(event) => void call("switch", "configure_relay", { volunteer: event.target.checked })} />
+    {settings ? <Switch aria-label={relayLabel} checked={settings.volunteer} disabled={Boolean(busy)} onCheckedChange={next => { const checked = next === true;  void call("switch", "configure_relay", { volunteer: checked })  }} />
       : error ? null : <Skeleton className="h-6 w-11" />}
   </SettingsRow>
   if (!settings || !draft) return <SettingsGroup>{header}{error ? <div className="px-4 py-3"><InlineError error={error} action={{ label: "重试", onClick: () => void call("load", "relay_settings") }} /></div> : null}</SettingsGroup>
@@ -105,15 +104,15 @@ export function RelaySettings() {
     {header}
     {settings.volunteer ? <SettingsDisclosure icon={SlidersHorizontal} label="地址和限额">
       <form className="grid gap-3" onSubmit={(event) => { event.preventDefault(); save() }}>
-        <label htmlFor="relay-url" className={fieldLabel}>地址</label>
-        <Input id="relay-url" type="url" className="font-mono" placeholder="http://" value={draft.url} disabled={Boolean(busy)} onChange={(event) => setDraft({ ...draft, url: event.target.value })} />
+
+        <Input label={"地址"} id="relay-url" type="url" className="font-mono" placeholder="http://" value={draft.url} disabled={Boolean(busy)} onChange={(event) => setDraft({ ...draft, url: event.target.value })} />
         <div className="grid gap-3 sm:grid-cols-3">
           {limits.map(([key, text]) => <div key={key} className="grid gap-2">
-            <label htmlFor={`relay-${key}`} className={fieldLabel}>{text}</label>
-            <Input id={`relay-${key}`} type="number" inputMode="numeric" min={1} step={1} required className="tabular-nums" value={draft[key]} disabled={Boolean(busy)} onChange={(event) => setDraft({ ...draft, [key]: event.target.value })} />
+
+            <Input label={text} id={`relay-${key}`} type="number" inputMode="numeric" min={1} step={1} required className="tabular-nums" value={draft[key]} disabled={Boolean(busy)} onChange={(event) => setDraft({ ...draft, [key]: event.target.value })} />
           </div>)}
         </div>
-        <Button type="submit" variant="outline" className="w-fit" disabled={Boolean(busy) || unchanged}><BusyIcon busy={busy === "save"} />保存</Button>
+        <Button type="submit" variant="secondary" className="w-fit" disabled={Boolean(busy) || unchanged}><BusyIcon busy={busy === "save"} />保存</Button>
       </form>
     </SettingsDisclosure> : null}
     {error || settings.error ? <div className="px-4 py-3"><InlineError error={error || settings.error} /></div> : null}

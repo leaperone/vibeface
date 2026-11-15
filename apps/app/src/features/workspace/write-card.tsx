@@ -1,15 +1,15 @@
-import { useState } from "react"
-import { Link } from "@tanstack/react-router"
-import { Copy, Lock } from "lucide-react"
-import { ActionCard, DetailRow, Details } from "@/components/app/kit"
-import { Button } from "@/components/ui/button"
-import { useDevice } from "@vibeface/client/identity/context.tsx"
+import { ActionCard,DetailRow,Details } from "@/components/arc/product-kit"
+import { RoutedAction } from "@/components/arc/routed-action"
 import { terms } from "@/lib/glossary"
+import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
-import { nodeName } from "@vibeface/client/workspace/labels.ts"
-import { ActionButton } from "./present"
-import type { ConflictVersion } from "@vibeface/client/workspace/types.ts"
 import type { WriteCardKind } from "@vibeface/client/workspace/inbox.ts"
+import { nodeName } from "@vibeface/client/workspace/labels.ts"
+import type { ConflictVersion } from "@vibeface/client/workspace/types.ts"
+import { Button } from "@vibeface/uiarc/button/button.tsx"
+import { Copy,Lock } from "lucide-react"
+import { useState } from "react"
+import { ActionButton } from "./present"
 
 
 const summary = (version: ConflictVersion | null) => {
@@ -19,7 +19,7 @@ const summary = (version: ConflictVersion | null) => {
 }
 
 function Steps({ items }: { items: string[] }) {
-  return <ol className="grid list-decimal gap-1 ps-5 text-muted-foreground">{items.map((item) => <li key={item}>{item}</li>)}</ol>
+  return <ol className="grid list-decimal gap-1 ps-5 text-secondary">{items.map((item) => <li key={item}>{item}</li>)}</ol>
 }
 
 export function WriteCard({ kind }: { kind: WriteCardKind }) {
@@ -36,20 +36,20 @@ export function WriteCard({ kind }: { kind: WriteCardKind }) {
     ? <Button type="button" variant="ghost" onClick={() => setWaiting(false)}>返回</Button>
     : <>
       <Button type="button" variant="ghost" onClick={() => setWaiting(true)}>是，等其他设备</Button>
-      <ActionButton variant="default" action={() => workspace.confirmWritable()}>不是，继续使用</ActionButton>
+      <ActionButton variant="primary" action={() => workspace.confirmWritable()}>不是，继续使用</ActionButton>
     </>}>
-    <p className="text-muted-foreground">{!canManage ? `${unreached}打开其他设备，或在管理设备上确认。` : waiting ? `打开${away ? ` ${away}` : "你的其他设备"}，连上后会自动同步，然后就能用。` : `${unreached}它是从备份恢复的吗？`}</p>
+    <p className="text-secondary">{!canManage ? `${unreached}打开其他设备，或在管理设备上确认。` : waiting ? `打开${away ? ` ${away}` : "你的其他设备"}，连上后会自动同步，然后就能用。` : `${unreached}它是从备份恢复的吗？`}</p>
   </ActionCard>
   const conflicts = workspace.writeState.conflicts
   const authors = [...new Set(conflicts.map((item) => item.author))]
   if (kind === "forked") return <ActionCard icon={Copy} title={`${here} 的数据被复制过`}>
-    <p className="text-muted-foreground">两份记了不同的内容，它已暂停，其他设备照常用。</p>
+    <p className="text-secondary">两份记了不同的内容，它已暂停，其他设备照常用。</p>
     <Steps items={["在另一台设备上移除它", "在这台电脑上重新加入"]} />
   </ActionCard>
   const RemoveIcon = terms.remove.icon
   return <ActionCard icon={Copy} title={`${authors.map((id) => nodeName(id, lookup)).join("、")} 的数据被复制过`}
-    actions={authors[0] && canManage ? <Button asChild variant="default"><Link to="/devices/$deviceId" params={{ deviceId: authors[0] }}><RemoveIcon aria-hidden="true" />去移除</Link></Button> : undefined}>
-    <p className="text-muted-foreground">两份记了不同的内容，这部分先不算，其他内容照常。</p>
+    actions={authors[0] && canManage ? <RoutedAction variant="primary" to="/devices/$deviceId" params={{ deviceId: authors[0] }}><RemoveIcon aria-hidden="true" />去移除</RoutedAction> : undefined}>
+    <p className="text-secondary">两份记了不同的内容，这部分先不算，其他内容照常。</p>
     <Steps items={[canManage ? "移除它，保留这里先收到的那份" : "用管理设备移除它，保留先收到的那份", "在那台电脑上重新加入"]} />
     {conflicts.length ? <Details label="两份内容">
       {conflicts.map((item) => <div key={item.other.hash} className="grid gap-1 border-t pt-2 first:border-t-0 first:pt-0">

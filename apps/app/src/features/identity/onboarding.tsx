@@ -1,16 +1,16 @@
-import { useEffect, useState } from "react"
-import { useNavigate } from "@tanstack/react-router"
-import { Bot, FolderOpen, MessageSquarePlus } from "lucide-react"
-import { AuthPage, BusyIcon, FolderPath, InlineError, Panel, Steps } from "@/components/app/kit"
-import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
+import { AuthPage,BusyIcon,FolderPath,InlineError,Panel,Steps } from "@/components/arc/product-kit"
 import { AiSettings } from "@/features/devices/ai-settings"
+import { useNavigate } from "@tanstack/react-router"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { parseNodeSettings } from "@vibeface/client/lib/node.ts"
+import { folderLabels,projectChoices } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { botReadiness } from "@vibeface/client/workspace/model.ts"
-import { folderLabels, projectChoices } from "@vibeface/client/workspace/bot-settings.ts"
-import { finishOnboarding, setOnboardingStep, useOnboarding } from "./onboarding-flag"
+import { Button } from "@vibeface/uiarc/button/button.tsx"
+import { Input } from "@vibeface/uiarc/input/input.tsx"
+import { Bot,FolderOpen,MessageSquarePlus } from "lucide-react"
+import { useEffect,useState } from "react"
+import { finishOnboarding,setOnboardingStep,useOnboarding } from "./onboarding-flag"
 
 /** Steps 4 and 5 after creating a network here. Skipping step 4 still offers step 5; 待处理 and the composer point back to the device page. */
 export function Onboarding() {
@@ -53,8 +53,8 @@ export function Onboarding() {
       </div>
     </Panel> : <Panel key="bot" icon={MessageSquarePlus} title="创建第一个 Bot">
       <form className="grid gap-4" noValidate onSubmit={(event) => { event.preventDefault(); if (name.trim()) void create(); else setError(new Error("还没填名称")) }}>
-        <label className="grid gap-1.5 text-meta font-medium">名称<Input required maxLength={512} value={name} disabled={busy} onChange={(event) => setName(event.target.value)} /></label>
-        {project && shown ? <p className="flex min-w-0 items-center gap-1.5 text-meta text-muted-foreground"><FolderOpen aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{folderLabels.project}</span><FolderPath path={project.cwd} shown={shown[project.cwd]} /></p> : null}
+        <div className="grid gap-1.5 text-sm font-medium"><Input label={"名称"} required maxLength={512} value={name} disabled={busy} onChange={(event) => setName(event.target.value)} /></div>
+        {project && shown ? <p className="flex min-w-0 items-center gap-1.5 text-sm text-secondary"><FolderOpen aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{folderLabels.project}</span><FolderPath path={project.cwd} shown={shown[project.cwd]} /></p> : null}
         <InlineError error={error} />
         <div className="flex justify-between gap-2 border-t pt-4">
           <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={() => setOnboardingStep(4)}>上一步</Button>

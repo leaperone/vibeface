@@ -1,18 +1,18 @@
+import { RoutedAction } from "@/components/arc/routed-action"
 "use client"
 
-import { useId, useState, type ReactNode } from "react"
-import { Link } from "@tanstack/react-router"
-import { ChevronRight, CircleQuestionMark, CircleStop, Cpu, Unplug, WifiOff } from "lucide-react"
-import { ActionCard, DetailRow, Details, toast } from "@/components/app/kit"
 import { BotFace } from "@/components/app/bot-face"
-import { Textarea } from "@/components/ui/textarea"
-import { Button } from "@/components/ui/button"
+import { ActionCard,DetailRow,Details,toast } from "@/components/arc/product-kit"
+import { Link } from "@tanstack/react-router"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
-import { ActionButton } from "./present"
 import type { WorkCheck } from "@vibeface/client/workspace/model.ts"
 import type { PendingCheck } from "@vibeface/client/workspace/types.ts"
+import { Textarea } from "@vibeface/uiarc/textarea/textarea.tsx"
+import { ChevronRight,CircleQuestionMark,CircleStop,Cpu,Unplug,WifiOff } from "lucide-react"
+import { useId,useState,type ReactNode } from "react"
+import { ActionButton } from "./present"
 
 /** Plain-language reason; the original text stays in the details. */
 function checkReason(check: Pick<PendingCheck, "detail">): string {
@@ -32,7 +32,7 @@ const confirmIcons = { offline: WifiOff, disconnected: Unplug, unverified: Circl
 
 /** An offline device reports by itself once back, so waiting also settles it. */
 export function BackOnline({ device }: { device: string }) {
-  return <p className="text-meta text-muted-foreground">{device} 上线后会自动更新</p>
+  return <p className="text-sm text-secondary">{device} 上线后会自动更新</p>
 }
 
 /**
@@ -49,9 +49,9 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
   if (check.kind === "process") return <ActionCard
     icon={Cpu}
     title="程序还在运行"
-    trailing={<ActionButton variant="default" disabled={disabled} action={() => workspace.confirmStopped(check)}><CircleStop aria-hidden="true" />确认已停止</ActionButton>}
+    trailing={<ActionButton variant="primary" disabled={disabled} action={() => workspace.confirmStopped(check)}><CircleStop aria-hidden="true" />确认已停止</ActionButton>}
   >
-    <p className="text-muted-foreground">{checkReason(check)}程序退出后会自动处理。</p>
+    <p className="text-secondary">{checkReason(check)}程序退出后会自动处理。</p>
     <Details>
       <DetailRow label="设备" value={nodeName(workspace.data?.local_node, lookup)} />
       {check.detail ? <span>{check.detail}</span> : null}
@@ -64,11 +64,11 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
   const chatBot = inbox ? undefined : workspace.selectedBot
   const taskLink = (work: WorkCheck, title: ReactNode, className = "") => {
     const bot = botOf(work) ?? chatBot
-    return bot ? <Link to="/b/$botId/work/$workId" params={{ botId: bot.bot_id, workId: work.work_id }} search={inbox ? { from: "tasks" } : {}} className={`rounded-sm underline-offset-4 hover:underline ${className}`}>{title}</Link> : title
+    return bot ? <Link to="/b/$botId/work/$workId" params={{ botId: bot.bot_id, workId: work.work_id }} search={inbox ? { from: "tasks" } : {}} className={`rounded-control underline-offset-4 hover:underline ${className}`}>{title}</Link> : title
   }
-  const viewTask = (work: WorkCheck) => botOf(work) || chatBot ? <Button asChild variant="outline">{taskLink(work, "查看任务")}</Button> : null
+  const viewTask = (work: WorkCheck) => { const bot = botOf(work) ?? chatBot; return bot ? <RoutedAction variant="secondary" to="/b/$botId/work/$workId" params={{ botId: bot.bot_id, workId: work.work_id }} search={inbox ? { from: "tasks" } : {}}>查看任务</RoutedAction> : null }
   const settleActions = (work: WorkCheck, text = "") => <Details label="我已自行核对">
-    <p className="text-meta text-muted-foreground">只记录你的核对结论，不会重新执行任务。</p>
+    <p className="text-sm text-secondary">只记录你的核对结论，不会重新执行任务。</p>
     <div className="flex flex-wrap justify-end gap-2">
       <ActionButton variant="ghost" disabled={disabled} action={settle(work, "interrupted", text)}>没做完</ActionButton>
       <ActionButton disabled={disabled} action={settle(work, "completed", text)}>做完了</ActionButton>
@@ -79,16 +79,16 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
     title={`待确认 · ${check.works.length} 个任务`}
     meta={device}
   >
-    <p className="text-muted-foreground">{check.reason === "offline" ? "设备离线了" : "Codex 断开了"}，暂时收不到这些任务的结果。可以先查看已有记录。</p>
+    <p className="text-secondary">{check.reason === "offline" ? "设备离线了" : "Codex 断开了"}，暂时收不到这些任务的结果。可以先查看已有记录。</p>
     {check.reason === "offline" ? <BackOnline device={device} /> : null}
-    <ul className="divide-y overflow-hidden rounded-lg border bg-card">
+    <ul className="divide-y overflow-hidden rounded-control border bg-surface">
       {check.works.map((work) => {
         const bot = botOf(work)
         return <li key={work.work_id} className="grid min-h-13 min-w-0 gap-2 p-3">
           <div className="flex min-w-0 items-center gap-3">
           <span className="grid min-w-0 flex-1">
             <span className="font-medium [overflow-wrap:anywhere]" title={work.title}>{taskLink(work, <span className="line-clamp-2">{work.title || "任务结果"}</span>, "max-md:block max-md:py-2.5")}</span>
-            {bot ? <Link to="/b/$botId" params={{ botId: bot.bot_id }} className="inline-flex w-fit max-w-full min-w-0 items-center gap-1 text-meta text-muted-foreground underline-offset-4 hover:text-foreground hover:underline max-md:min-h-11">
+            {bot ? <Link to="/b/$botId" params={{ botId: bot.bot_id }} className="inline-flex w-fit max-w-full min-w-0 items-center gap-1 text-sm text-secondary underline-offset-4 hover:text-foreground hover:underline max-md:min-h-11">
               <BotFace bot={bot} mood="idle" size={16} /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span></Link> : null}
           </span>
           {viewTask(work)}
@@ -108,9 +108,9 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
   >
     <p>{reason}先查看已有记录，再决定怎么继续。</p>
     {check.reason === "offline" ? <BackOnline device={device} /> : null}
-    {bot ? <Link to="/b/$botId" params={{ botId: bot.bot_id }} className="inline-flex w-fit max-w-full min-w-0 items-center gap-1.5 rounded-md text-meta font-medium underline-offset-4 hover:underline max-md:min-h-11">
-      <BotFace bot={bot} mood="idle" size={16} /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /></Link> : null}
-    <Details label="补充说明（可选）"><Textarea id={`${id}-note`} aria-label="补充说明" rows={2} maxLength={2000} value={note} disabled={disabled} onChange={(event) => setNote(event.target.value)} /></Details>
+    {bot ? <Link to="/b/$botId" params={{ botId: bot.bot_id }} className="inline-flex w-fit max-w-full min-w-0 items-center gap-1.5 rounded-control text-sm font-medium underline-offset-4 hover:underline max-md:min-h-11">
+      <BotFace bot={bot} mood="idle" size={16} /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-secondary" /></Link> : null}
+    <Details label="补充说明（可选）"><Textarea label={"补充说明"} id={`${id}-note`} aria-label="补充说明" rows={2} maxLength={2000} value={note} disabled={disabled} onChange={(event) => setNote(event.target.value)} /></Details>
     {settleActions(check, note)}
     {check.detail ? <Details><span>{check.detail}</span></Details> : null}
   </ActionCard>

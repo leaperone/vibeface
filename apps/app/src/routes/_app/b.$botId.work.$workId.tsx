@@ -1,5 +1,5 @@
-import { createFileRoute } from '@tanstack/react-router'
 import { TaskDetail } from '@/features/workspace/task-detail'
+import { createFileRoute } from '@tanstack/react-router'
 
 export const Route = createFileRoute('/_app/b/$botId/work/$workId')({
   validateSearch: (search: Record<string, unknown>): { from?: 'tasks' } => search.from === 'tasks' ? { from: 'tasks' } : {},

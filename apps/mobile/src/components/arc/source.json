@@ -1,0 +1,72 @@
+{
+  "repository": "https://github.com/WheatXie/uiarc-pro-reverse",
+  "commit": "859606819c68787b2dccb54adcb9b08bd3272d5d",
+  "platform": "react-native",
+  "ports": {
+    "button.tsx": [
+      "button"
+    ],
+    "text.tsx": [
+      "input",
+      "ai-chat"
+    ],
+    "icon.tsx": [
+      "button"
+    ],
+    "input.tsx": [
+      "input"
+    ],
+    "textarea.tsx": [
+      "textarea"
+    ],
+    "switch.tsx": [
+      "switch"
+    ],
+    "segmented.tsx": [
+      "segmented-control"
+    ],
+    "surface.tsx": [
+      "card",
+      "settings-page",
+      "security-settings",
+      "alert",
+      "agent-approvals",
+      "empty-state"
+    ],
+    "navigation.tsx": [
+      "tabs",
+      "sidebar"
+    ],
+    "chat.tsx": [
+      "ai-chat",
+      "ai-composer",
+      "chat-thread"
+    ],
+    "selection.tsx": [
+      "radio-group",
+      "checkbox"
+    ],
+    "metric.tsx": [
+      "metric-card"
+    ],
+    "feedback.tsx": [
+      "skeleton",
+      "alert",
+      "toast"
+    ],
+    "wizard.tsx": [
+      "stepper"
+    ],
+    "popover.tsx": [
+      "popover"
+    ]
+  },
+  "adaptations": [
+    "DOM elements and browser focus become native accessibility roles and touch controls.",
+    "Native controls grow with Dynamic Type, with 44px minimum interactive targets.",
+    "Router stacks, safe areas, keyboard-aware lists, platform attachment pickers and Back remain native.",
+    "Product avatars keep their identity geometry with solid fills. Native screen composition uses generated Arc foundation tokens.",
+    "Background toast announcements remain separate from inline foreground errors and action results.",
+    "Empty-state uses source heading size/weight, 20px horizontal spacing and 32 to 48px responsive vertical inset. Its optional icon frame is omitted to retain the product requirement for plain glyphs."
+  ]
+}

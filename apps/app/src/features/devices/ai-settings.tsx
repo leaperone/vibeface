@@ -1,17 +1,20 @@
-import { useEffect, useRef, useState, type ChangeEvent, type ComponentProps, type ReactNode } from "react"
-import { Asterisk, Braces, ChevronRight, CircleAlert, CircleCheck, CircleDashed, Copy, Download, FolderOpen, FolderPlus, List, LoaderCircle, Lock, Monitor, MousePointer2, Pencil, Pi, Play, PlugZap, Plus, Power, RotateCw, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
+import { BusyIcon,Details,FolderPath,InlineError,Segmented,Skeleton,toast,toneText,type Tone } from "@/components/arc/product-kit"
+import { ActionLink } from "@/components/arc/routed-action"
+import { terms } from "@/lib/glossary"
 import { cn } from "@/lib/utils"
-import { BusyIcon, Details, FolderPath, InlineError, Segmented, Skeleton, toast, toneText, type Tone } from "@/components/app/kit"
-import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
-import { Textarea } from "@/components/ui/textarea"
-import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { deviceCopy } from "@vibeface/client/identity/copy.ts"
+import { authenticationSourceLabels,availability,botOnChange,canSetProviderEnvironment,effortOptions,folderSuggestions,localProviderIds,messageOf,modelTyped,parseAppServerLink,parseNodeSettings,parseProvider,probeIssueText,providerGroups,providerIds,providerNames,providerObservationLabels,providerObservationStates,summaryReadiness,type AppServer,type AppServerLink,type AppServerMode,type Availability,type BackupPolicy,type EndpointProtocol,type ManagerSettings,type ModelChoice,type NodeSettings,type NodeSettingsResponse,type ProviderChange,type ProviderEndpoint,type ProviderId,type ProviderIssue,type ProviderStatus } from "@vibeface/client/lib/node.ts"
 import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
-import { terms } from "@/lib/glossary"
-import { authenticationSourceLabels, canSetProviderEnvironment, localProviderIds, availability, summaryReadiness, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, parseProvider, probeIssueText, effortOptions, type ModelChoice, providerGroups, providerNames, providerObservationLabels, providerObservationStates, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderChange, type ProviderEndpoint, type EndpointProtocol, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
+import { Button } from "@vibeface/uiarc/button/button.tsx"
+import { Checkbox } from "@vibeface/uiarc/checkbox/checkbox.tsx"
+import { Input } from "@vibeface/uiarc/input/input.tsx"
+import { Select } from "@vibeface/uiarc/select/select.tsx"
+import { Switch } from "@vibeface/uiarc/switch/switch.tsx"
+import { Textarea } from "@vibeface/uiarc/textarea/textarea.tsx"
+import { Asterisk,Braces,ChevronRight,CircleAlert,CircleCheck,CircleDashed,Copy,Download,FolderOpen,FolderPlus,List,LoaderCircle,Lock,Monitor,MousePointer2,Pencil,Pi,Play,PlugZap,Plus,Power,RotateCw,SquareTerminal,Trash2,Unplug,X,type LucideIcon } from "lucide-react"
+import { useEffect,useRef,useState,type ChangeEvent,type ComponentProps,type ReactNode } from "react"
 
 const docs = "https://github.com/leaperone/vibeface/blob/main/packages/docs/"
 export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
@@ -51,13 +54,13 @@ const modes: { value: AppServerMode; label: string; icon: LucideIcon }[] = [{ va
 function LinkLine({ link, prefix = "" }: { link: AppServerLink; prefix?: string }) {
   const [tone, Icon, label] = {
     connected: ["text-success", CircleCheck, "已连接"],
-    starting: ["text-muted-foreground", LoaderCircle, "连接中"],
-    off: ["text-muted-foreground", Power, "未用于执行任务"],
+    starting: ["text-secondary", LoaderCircle, "连接中"],
+    off: ["text-secondary", Power, "未用于执行任务"],
     not_found: ["text-warning", CircleAlert, "未找到"],
     handshake_failed: ["text-warning", CircleAlert, "连不上"],
     launch_failed: ["text-warning", CircleAlert, "没能启动"],
   }[link.state] as [string, LucideIcon, string]
-  return <span role="status" className={cn("flex min-w-0 items-center gap-1.5 text-meta", tone)}>
+  return <span role="status" className={cn("flex min-w-0 items-center gap-1.5 text-sm", tone)}>
     <Icon aria-hidden="true" className={cn("size-4 shrink-0", link.state === "starting" && "animate-spin")} />
     <span className="min-w-0 truncate" title={link.state === "connected" ? link.user_agent || undefined : undefined}>{prefix}{label}</span>
   </span>
@@ -67,10 +70,10 @@ function LinkLine({ link, prefix = "" }: { link: AppServerLink; prefix?: string 
 type Display = Record<string, string>
 
 /** A path input that reads `~/…` while it rests on the saved path and shows the full path to edit. */
-function PathInput({ saved, display, value, className, ...props }: ComponentProps<"input"> & { saved: string; display: Display; value: string }) {
+function PathInput({ saved, display, value, className, ...props }: ComponentProps<typeof Input> & { saved: string; display: Display; value: string }) {
   const [editing, setEditing] = useState(false)
   const short = !editing && value === saved ? display[saved] : undefined
-  return <Input {...props} className={cn("min-w-0 font-mono text-foreground placeholder:font-sans", className)} spellCheck={false} title={short ? saved : undefined} value={short ?? value}
+  return <Input {...props} className={cn("min-w-0 font-mono placeholder:font-sans", className)} spellCheck={false} title={short ? saved : undefined} value={short ?? value}
     onFocus={() => setEditing(true)} onBlur={() => setEditing(false)} />
 }
 
@@ -82,10 +85,10 @@ function PathField({ id, label, value, display, placeholder, working, busy, onSa
   useEffect(() => setDraft(value ?? ""), [value])
   const dirty = draft.trim() !== (value ?? "")
   return <form className="grid gap-1" onSubmit={(event) => { event.preventDefault(); if (dirty) void onSave(draft.trim()) }}>
-    <label htmlFor={id} className="text-meta font-medium text-muted-foreground">{label}</label>
+
     <div className="flex min-w-0 gap-2">
-      <PathInput id={id} saved={value ?? ""} display={display} placeholder={placeholder} maxLength={4096} value={draft} disabled={working} onChange={(event) => setDraft(event.target.value)} />
-      {dirty ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
+      <PathInput label={label} id={id} saved={value ?? ""} display={display} placeholder={placeholder} maxLength={4096} value={draft} disabled={working} onChange={(event) => setDraft(event.target.value)} />
+      {dirty ? <Button type="submit" variant="secondary" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
     </div>
   </form>
 }
@@ -118,24 +121,24 @@ function AppServerSettings({ server, home, sessions, display, working, blocked, 
       event.preventDefault()
       if (dirty) void save("app_server", { app_server: { mode: draft.mode, socket: draft.socket.trim() || null } })
     }}>
-      <p className="text-meta font-medium text-muted-foreground">连接方式</p>
+      <p className="text-sm font-medium text-secondary">连接方式</p>
       <div className="flex min-w-0 flex-wrap items-center gap-2">
         <Segmented label="连接方式" labels fill value={draft.mode} options={modes} disabled={working} onChange={(mode) => setDraft({ ...draft, mode })} />
-        {dirty ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy.endsWith(":app_server")} />保存</Button> : null}
+        {dirty ? <Button type="submit" variant="secondary" disabled={working}><BusyIcon busy={busy.endsWith(":app_server")} />保存</Button> : null}
         <Button type="button" variant="ghost" disabled={working || testing || testDirty || blocked || link.state === "off"} onClick={() => void runTest()}>
           <BusyIcon busy={testing} icon={PlugZap} />测试连接
         </Button>
       </div>
       <div className="grid gap-1">
-        <label htmlFor="codex-socket" className="text-meta font-medium text-muted-foreground">{draft.mode === "system" ? "连接路径" : "你的 Codex 连接路径"}</label>
-        <Input id="codex-socket" name="socket" className="min-w-0 font-mono" placeholder={placeholders.socket} required={draft.mode === "system"} pattern="/.*" maxLength={1024} spellCheck={false}
+
+        <Input label={draft.mode === "system" ? "连接路径" : "你的 Codex 连接路径"} id="codex-socket" name="socket" className="min-w-0 font-mono" placeholder={placeholders.socket} required={draft.mode === "system"} pattern="/.*" maxLength={1024} spellCheck={false}
           value={draft.socket} disabled={working} onChange={(event) => setDraft({ ...draft, socket: event.target.value })} />
         {draft.mode === "system" ? <>
-          <p className="text-meta text-muted-foreground">填写运行 Codex 的电脑上的绝对路径。</p>
-          <p className="text-meta text-muted-foreground">共享所选外部 App Server 的会话，不隔离该服务的数据。</p>
-        </> : <p className="text-meta text-muted-foreground">只用来把回复送进你自己的 Codex 会话。</p>}
+          <p className="text-sm text-secondary">填写运行 Codex 的电脑上的绝对路径。</p>
+          <p className="text-sm text-secondary">共享所选外部 App Server 的会话，不隔离该服务的数据。</p>
+        </> : <p className="text-sm text-secondary">只用来把回复送进你自己的 Codex 会话。</p>}
       </div>
-      {testDirty ? <p role="status" className="text-meta text-muted-foreground">保存后可测试连接</p>
+      {testDirty ? <p role="status" className="text-sm text-secondary">保存后可测试连接</p>
         : blocked ? null : <LinkLine link={shown} prefix={tested ? "测试：" : ""} />}
       {!testDirty && (shown.state === "handshake_failed" || shown.state === "launch_failed") ? <Details label="原因"><code className="font-mono break-all">{shown.reason}</code></Details> : null}
     </form>
@@ -150,7 +153,7 @@ function AppServerSettings({ server, home, sessions, display, working, blocked, 
 function ManualCodex({ onboarding, working, busy, save }: { onboarding: boolean; working: boolean; busy: string; save(key: string, change: Omit<Change, "provider">): Promise<boolean> }) {
   return <Details label="手动填写">
     <div className="grid gap-3">
-      <p className="text-meta text-muted-foreground">Codex 运行目录由 Node 自动隔离管理。</p>
+      <p className="text-sm text-secondary">Codex 运行目录由 Node 自动隔离管理。</p>
       {onboarding ? null : <PathField id="manual-codex-socket" label="连接路径" value={null} display={{}} placeholder={placeholders.socket} working={working} busy={busy.endsWith(":socket")}
         onSave={(path) => save("socket", { app_server: { mode: "system", socket: path } })} />}
     </div>
@@ -319,24 +322,24 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
     <div className="grid min-w-0 gap-2 px-1">
       <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
         <div className="grid min-w-0 flex-1 basis-44 gap-1">
-          <h3 className="text-heading font-semibold">AI 服务</h3>
-          <p className="text-meta text-muted-foreground [overflow-wrap:anywhere]">{targetName ? `在「${targetName}」上检测 Codex、Claude Code 和 Cursor` : "检测这台电脑的 Codex、Claude Code 和 Cursor"}</p>
+          <h3 className="text-lg font-medium">AI 服务</h3>
+          <p className="text-sm text-secondary [overflow-wrap:anywhere]">{targetName ? `在「${targetName}」上检测 Codex、Claude Code 和 Cursor` : "检测这台电脑的 Codex、Claude Code 和 Cursor"}</p>
         </div>
-        <Button type="button" variant={compact ? "default" : "outline"} className="min-h-11" disabled={busy !== "" || needsRead} aria-busy={busy === "connect_local" || undefined} onClick={() => void connectLocal()}><BusyIcon busy={busy === "connect_local"} icon={PlugZap} />自动接入</Button>
+        <Button type="button" variant={compact ? "primary" : "secondary"} className="" disabled={busy !== "" || needsRead} aria-busy={busy === "connect_local" || undefined} onClick={() => void connectLocal()}><BusyIcon busy={busy === "connect_local"} icon={PlugZap} />自动接入</Button>
       </div>
-      <p role="status" aria-live="polite" aria-atomic="true" className="text-meta text-muted-foreground">{busy === "connect_local" ? "正在检测并补齐设置" : localResult || "保留已保存的设置和用途"}</p>
+      <p role="status" aria-live="polite" aria-atomic="true" className="text-sm text-secondary">{busy === "connect_local" ? "正在检测并补齐设置" : localResult || "保留已保存的设置和用途"}</p>
       {error?.at === null ? <InlineError error={error.cause} action={needsRead ? { label: "重新读取", onClick: () => void load() } : undefined} /> : null}
     </div>
     <div className="grid gap-2">
-    <ul className="flex flex-wrap gap-x-4 gap-y-1 px-1 text-meta text-muted-foreground" aria-label="两种用法">
+    <ul className="flex flex-wrap gap-x-4 gap-y-1 px-1 text-sm text-secondary" aria-label="两种用法">
       {(["bot", "execution"] as const).map((role) => { const { label, note, icon: RoleIcon } = roles[role]; return <li key={role} className="flex items-center gap-1.5 whitespace-nowrap">
         <RoleIcon aria-hidden="true" className="size-4 shrink-0" /><span className="font-medium text-foreground">{label}</span><span aria-hidden="true">·</span>{note}
       </li> })}
     </ul>
-    <ul className={cn("divide-y overflow-hidden rounded-xl border", !onboarding && "bg-card shadow-xs")}>
+    <ul className={cn("divide-y overflow-hidden rounded-panel border", !onboarding && "bg-surface ")}>
       {shown.map(card)}
       {folded.length ? <li><details className="details" open={!shown.length || undefined}>
-        <summary className="flex min-h-11 items-center gap-1 px-4 text-meta text-muted-foreground hover:text-foreground">
+        <summary className="flex min-h-11 items-center gap-1 px-4 text-sm text-secondary hover:text-foreground">
           <ChevronRight aria-hidden="true" className="size-4 shrink-0 transition-transform duration-200" />
           <span className="min-w-0 truncate">{compact ? `其他 AI 服务 · ${folded.length}` : `未安装 · ${folded.map((item) => providerNames[item.provider]).join("、")}`}</span>
         </summary>
@@ -362,15 +365,7 @@ const roles = {
  */
 function RoleToggle({ role, name, pressed, busy, disabled, onClick }: { role: keyof typeof roles; name: string; pressed: boolean; busy: boolean; disabled: boolean; onClick(): void }) {
   const { label, hint } = roles[role]
-  const one = role === "bot"
-  return <Button type="button" size="sm" variant="outline" aria-pressed={pressed} aria-label={`${name} ${label}`} aria-description={hint(name)} title={hint(name)} disabled={disabled}
-    className={cn("rounded-full", pressed ? "border-brand/30 bg-brand-soft hover:bg-brand-soft dark:border-brand/30 dark:bg-brand-soft dark:hover:bg-brand-soft" : "text-muted-foreground")} onClick={onClick}>
-    {busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : one ? <span aria-hidden="true" className={cn("grid size-3.5 shrink-0 place-items-center rounded-full border-[1.5px] transition-colors", pressed ? "border-brand" : "border-muted-foreground/75")}>
-      <span className={cn("size-1.5 rounded-full bg-brand transition-transform", !pressed && "scale-0")} />
-    </span> : <span aria-hidden="true" className={cn("relative h-3.5 w-6 shrink-0 rounded-full transition-colors", pressed ? "bg-brand" : "bg-muted-foreground/75")}>
-      <span className={cn("absolute top-0.5 left-0.5 size-2.5 rounded-full bg-background transition-transform", pressed && "translate-x-2.5")} />
-    </span>}<span className="whitespace-nowrap">{label}</span>
-  </Button>
+  return <Switch label={label} checked={pressed} disabled={disabled || busy} aria-label={`${name} ${label}`} aria-description={hint(name)} title={hint(name)} onCheckedChange={onClick} />
 }
 
 function ProviderCard({ item, response, onboarding, compact = false, busy, models, error, change, saveBot, test, reconcile, probe }: {
@@ -407,11 +402,11 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
   const manual = (key: string, value: Omit<Change, "provider">) => change(key, { ...value, ...(asked ? { [asked]: true } : {}) })
     .then((ok) => { if (!ok) void reconcile(); return ok })
   const binForm = <form className="grid gap-1" onSubmit={(event) => { event.preventDefault(); void change("bin", { bin: bin.trim() }) }}>
-      <label htmlFor={`${item.provider}-bin`} className="text-meta font-medium text-muted-foreground">程序</label>
+
       <div className="flex min-w-0 gap-2">
-        <PathInput id={`${item.provider}-bin`} saved={item.bin} display={display} placeholder={item.bin.split(/[\\/]/).pop()} value={bin} disabled={working}
+        <PathInput label={"程序"} id={`${item.provider}-bin`} saved={item.bin} display={display} placeholder={item.bin.split(/[\\/]/).pop()} value={bin} disabled={working}
           data-fix={issue?.code === "bin_missing" ? "" : undefined} onChange={(event) => setBin(event.target.value)} />
-        {bin.trim() !== item.bin ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy === `${item.provider}:bin`} />保存</Button> : null}
+        {bin.trim() !== item.bin ? <Button type="submit" variant="secondary" disabled={working}><BusyIcon busy={busy === `${item.provider}:bin`} />保存</Button> : null}
       </div>
     </form>
   // Keyed by the roles, so switching one drops a test result that no longer matches what runs.
@@ -429,43 +424,43 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
     {manager && item.probe.catalog.state === "available" && item.probe.catalog.coverage === "partial" ? <p>模型列表可能不完整，可手填其他模型。</p> : null}
     {manager && item.probe.catalog.state === "unavailable" ? <p>模型列表暂不可用，可继续手填。已保存的模型保持不变。</p> : null}
   </Details>
-  const checkButton = <Button type="button" variant="ghost" size="sm" className="min-h-11" aria-label={compact ? `${name} 检查可用性` : undefined} disabled={busy !== ""} onClick={() => void probe()}>
+  const checkButton = <Button type="button" variant="ghost" size="sm" className="" aria-label={compact ? `${name} 检查可用性` : undefined} disabled={busy !== ""} onClick={() => void probe()}>
     <BusyIcon busy={busy === `${item.provider}:probe`} icon={RotateCw} />{compact ? "检查" : "检查可用性"}
   </Button>
 
   // `friendly`: a key the provider needs, named after its service in the default view; any other variable shows as it is named.
   const envRow = (row: (typeof env)[number], friendly: boolean) => {
     const missing = item.state === "needs_setup" && !row.set && !row.inherited && row.required
-    return <li key={row.name} className="grid gap-2 rounded-lg bg-muted/60 py-1 ps-3 pe-1">
+    return <li key={row.name} className="grid gap-2 rounded-control bg-surface-muted/60 py-1 ps-3 pe-1">
               <div className="flex min-h-8 min-w-0 flex-wrap items-center gap-x-2">
-                {deleting === row.name && row.set ? <span className="order-first basis-full pt-2 text-meta text-foreground">删除后 Bot 用不到它</span> : null}
-                {friendly ? <span className="flex min-w-0 flex-1 items-center gap-1.5 truncate text-meta" title={row.name}><terms.secret.icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />{keyName(row.name)}</span>
-                  : <span className="min-w-0 flex-1 truncate font-mono text-meta" title={row.name}>{row.name}</span>}
-                <span className={cn("shrink-0 text-meta", missing ? "text-warning" : "text-muted-foreground")}>{row.set ? "••••••" : row.inherited ? "沿用本机" : "未填"}</span>
-                {deleting === row.name && row.set ? null : <Button type="button" variant="ghost" size="icon" aria-label={`${row.set ? "替换" : "填写"} ${row.name}`} title={row.set ? "替换" : "填写"} disabled={working}
+                {deleting === row.name && row.set ? <span className="order-first basis-full pt-2 text-sm text-foreground">删除后 Bot 用不到它</span> : null}
+                {friendly ? <span className="flex min-w-0 flex-1 items-center gap-1.5 truncate text-sm" title={row.name}><terms.secret.icon aria-hidden="true" className="size-4 shrink-0 text-secondary" />{keyName(row.name)}</span>
+                  : <span className="min-w-0 flex-1 truncate font-mono text-sm" title={row.name}>{row.name}</span>}
+                <span className={cn("shrink-0 text-sm", missing ? "text-warning" : "text-secondary")}>{row.set ? "••••••" : row.inherited ? "沿用本机" : "未填"}</span>
+                {deleting === row.name && row.set ? null : <Button type="button" variant="ghost" size="md" aria-label={`${row.set ? "替换" : "填写"} ${row.name}`} title={row.set ? "替换" : "填写"} disabled={working}
                   data-fix={missing ? "" : undefined} onClick={() => { setEditing(row.name); setValue("") }}><Pencil aria-hidden="true" /></Button>}
                 {!row.set ? null : deleting === row.name ? <>
                   <Button type="button" size="sm" variant="ghost" autoFocus onClick={() => setDeleting(null)}>取消</Button>
-                  <Button type="button" size="sm" variant="destructive" disabled={working} onClick={() => { setDeleting(null); void setVariable(`env:${row.name}`, row.name, null) }}>删除</Button>
-                </> : <Button type="button" variant="ghost" size="icon" aria-label={`删除 ${row.name}`} title="删除" disabled={working}
+                  <Button type="button" size="sm" variant="danger" disabled={working} onClick={() => { setDeleting(null); void setVariable(`env:${row.name}`, row.name, null) }}>删除</Button>
+                </> : <Button type="button" variant="ghost" size="md" aria-label={`删除 ${row.name}`} title="删除" disabled={working}
                   onClick={() => setDeleting(row.name)}><Trash2 aria-hidden="true" /></Button>}
               </div>
               {editing === row.name ? <form className="flex min-w-0 gap-2" onSubmit={(event) => {
                 event.preventDefault()
                 void setVariable(`env:${row.name}`, row.name, value).then((ok) => { if (ok) { setEditing(null); setValue("") } })
               }}>
-                <Input type="password" autoComplete="off" autoFocus aria-label={`${row.name} 的值`} className="min-w-0 bg-background" maxLength={4096} value={value} onChange={(event) => setValue(event.target.value)} />
-                <Button type="submit" variant="outline" disabled={working || !value}><BusyIcon busy={busy === `${item.provider}:env:${row.name}`} />保存</Button>
-                <Button type="button" variant="ghost" size="icon" aria-label="取消" title="取消" onClick={() => { setEditing(null); setValue("") }}><X aria-hidden="true" /></Button>
+                <Input label={`${row.name} 的值`} type="password" autoComplete="off" autoFocus aria-label={`${row.name} 的值`} className="min-w-0" maxLength={4096} value={value} onChange={(event) => setValue(event.target.value)} />
+                <Button type="submit" variant="secondary" disabled={working || !value}><BusyIcon busy={busy === `${item.provider}:env:${row.name}`} />保存</Button>
+                <Button type="button" variant="ghost" size="md" aria-label="取消" title="取消" onClick={() => { setEditing(null); setValue("") }}><X aria-hidden="true" /></Button>
               </form> : null}
             </li>
   }
   return <li>
     <div className="flex min-h-14 flex-wrap items-center gap-x-3 gap-y-2 px-4 py-3">
-      <Icon aria-hidden="true" className={cn("size-5 shrink-0", usable === "missing" ? "text-muted-foreground/60" : "text-muted-foreground")} />
+      <Icon aria-hidden="true" className={cn("size-5 shrink-0", usable === "missing" ? "text-secondary/60" : "text-secondary")} />
       <div className="grid min-w-0 flex-1">
-        <span className={cn("truncate font-medium", usable === "missing" && "text-muted-foreground")}>{name}</span>
-        <span className={cn("flex min-w-0 items-center gap-1 text-meta", toneText[state.tone])}>
+        <span className={cn("truncate font-medium", usable === "missing" && "text-secondary")}>{name}</span>
+        <span className={cn("flex min-w-0 items-center gap-1 text-sm", toneText[state.tone])}>
           <state.icon aria-hidden="true" className={cn("size-3.5 shrink-0", usable === "starting" && "animate-spin")} /><span className="truncate">{compact && usable === "unverified" ? "未验证" : state.label}</span>
         </span>
       </div>
@@ -476,46 +471,46 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
           onClick={() => execution ? void change("execution", { execution: false }) : turnOn("execution")} /> : null}
       </div>
     {compact ? <div className="flex basis-full items-center gap-3 ps-8"><div className="grid min-w-0 flex-1 gap-1">
-      <dl className="flex flex-wrap gap-x-4 gap-y-1 text-meta text-muted-foreground">
+      <dl className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-secondary">
         <div className="flex gap-1"><dt>程序</dt><dd>{!launches ? "外部服务" : item.installed ? "已找到" : "未找到"}</dd></div>
         <div className="flex gap-1"><dt>认证</dt><dd>{missingKey ? "需填写密钥" : { authenticated: "已认证", not_required: "无需登录", sign_in_required: "需登录", unverified: "未验证" }[item.probe.authentication]}</dd></div>
         <div className="flex gap-1"><dt>模型</dt><dd>{providerObservationStates[item.observed.model_known.status]}</dd></div>
       </dl>
-      <p className="text-meta text-muted-foreground">{item.state === "starting" ? "等待当前任务结束或服务启动" : item.app_server?.mode === "system" ? "沿用已选的连接方式" : !item.roles.length ? "尚未启用用途" : item.roles.map((role) => role === "agent" ? "运行 Bot" : "执行任务").join("、")}</p>
+      <p className="text-sm text-secondary">{item.state === "starting" ? "等待当前任务结束或服务启动" : item.app_server?.mode === "system" ? "沿用已选的连接方式" : !item.roles.length ? "尚未启用用途" : item.roles.map((role) => role === "agent" ? "运行 Bot" : "执行任务").join("、")}</p>
     </div>{checkButton}</div> : null}
     </div>
-    {notFound ? <div className="grid gap-2 px-4 sm:ps-12 pb-2 text-meta">
+    {notFound ? <div className="grid gap-2 px-4 sm:ps-12 pb-2 text-sm">
       <span role="status" className="flex min-w-0 items-center gap-1.5 text-warning"><Unplug aria-hidden="true" className="size-4 shrink-0" />没找到这台电脑上的 Codex</span>
       <div className="flex flex-wrap items-center gap-2">
-        <Button asChild variant="outline" size="sm"><a href={install.codex} target="_blank" rel="noopener noreferrer"><Download aria-hidden="true" />怎么装</a></Button>
+        <ActionLink variant="secondary" size="sm" href={install.codex} target="_blank" rel="noopener noreferrer"><Download aria-hidden="true" />怎么装</ActionLink>
         {asked ? <Button type="button" variant="ghost" size="sm" disabled={working} onClick={() => turnOn(asked)}><BusyIcon busy={busy === `${item.provider}:${asked}`} icon={RotateCw} />再找一次</Button> : null}
       </div>
       <ManualCodex onboarding={onboarding} working={working} busy={busy} save={manual} />
     </div> : issue?.code === "env_missing" ? <KeyField key={issue.name} name={issue.name} working={working} busy={busy === `${item.provider}:env:${issue.name}`} more={item.issues.length - 1} save={saveKey} />
-    : issue ? <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-4 sm:ps-12 pb-2 text-meta text-warning">
+    : issue ? <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-4 sm:ps-12 pb-2 text-sm text-warning">
       <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
       <span className="min-w-0">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ""}</span>
-      {issue.code === "app_server_not_found" && server ? <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" disabled={working}
-          onClick={() => void change("app_server", { app_server: { mode: "spawn", socket: server.socket } })}>{deviceCopy.appServer.useSpawn}</button>
+      {issue.code === "app_server_not_found" && server ? <Button variant="ghost" type="button" className="hit-area relative underline underline-offset-4" disabled={working}
+          onClick={() => void change("app_server", { app_server: { mode: "spawn", socket: server.socket } })}>{deviceCopy.appServer.useSpawn}</Button>
         : onboarding || issue.code === "bin_missing" ? <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={issue.code === "bin_missing" ? install[item.provider] : guide[item.provider]} target="_blank" rel="noopener noreferrer">{issue.code === "bin_missing" ? "怎么装" : "怎么设置"}</a>
-        : <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" onClick={() => openProvider(item.provider)}>去设置</button>}
+        : <Button variant="ghost" type="button" className="hit-area relative underline underline-offset-4" onClick={() => openProvider(item.provider)}>去设置</Button>}
     </p> : null}
     <div className="grid gap-1 px-4 pb-3 empty:hidden sm:ps-12">
-      <p className="text-meta text-muted-foreground">{authenticationSourceLabels[item.authentication_source]}</p>
-      {!compact && 'issue' in readiness ? <p role="status" className="text-meta text-muted-foreground">{probeIssueText(item.provider, readiness.issue)}</p> : null}
+      <p className="text-sm text-secondary">{authenticationSourceLabels[item.authentication_source]}</p>
+      {!compact && 'issue' in readiness ? <p role="status" className="text-sm text-secondary">{probeIssueText(item.provider, readiness.issue)}</p> : null}
       {item.setup && (compact || item.provider === "cursor" ? item.probe.authentication === "sign_in_required" : (bot || execution) && ["needs_setup", "unverified"].includes(readiness.state)) ? <Details label="登录方式" open={!compact || undefined}>
         <p>{item.provider === "cursor" ? "在运行 AI 的电脑上执行以下命令，登录 Cursor 订阅账户，再点“检查可用性”。" : "需要登录时，在运行 AI 的电脑上执行以下命令，再点“检查可用性”。已配置的环境认证仍优先。"}</p>
         {item.setup.directory ? <FolderPath path={item.setup.directory} shown={display[item.setup.directory]} /> : null}
         <div className="flex min-w-0 gap-2">
-          <Input readOnly aria-label={`${name} 登录命令`} className="min-w-0 font-mono" value={item.setup.command} onFocus={(event) => event.target.select()} />
-          <Button type="button" variant="outline" onClick={() => { if (item.setup) void navigator.clipboard.writeText(item.setup.command).then(() => toast("已复制认证命令", { tone: "success" }), () => toast("请选中命令后复制", { tone: "warning" })) }}><Copy aria-hidden="true" />复制命令</Button>
+          <Input label={`${name} 登录命令`} readOnly aria-label={`${name} 登录命令`} className="min-w-0 font-mono" value={item.setup.command} onFocus={(event) => event.target.select()} />
+          <Button type="button" variant="secondary" onClick={() => { if (item.setup) void navigator.clipboard.writeText(item.setup.command).then(() => toast("已复制认证命令", { tone: "success" }), () => toast("请选中命令后复制", { tone: "warning" })) }}><Copy aria-hidden="true" />复制命令</Button>
         </div>
       </Details> : null}
-      {!compact ? <div className="flex flex-wrap items-center gap-2 text-meta text-muted-foreground">{checkButton}</div> : null}
+      {!compact ? <div className="flex flex-wrap items-center gap-2 text-sm text-secondary">{checkButton}</div> : null}
       {!compact ? checkRecord : null}
     </div>
     {onboarding ? null : <details id={`provider-${item.provider}`} className="details">
-      <summary className="-mt-2 flex min-h-11 w-fit items-center gap-1 px-4 sm:ps-12 text-meta text-muted-foreground hover:text-foreground">
+      <summary className="-mt-2 flex min-h-11 w-fit items-center gap-1 px-4 sm:ps-12 text-sm text-secondary hover:text-foreground">
         <ChevronRight aria-hidden="true" className="size-4 transition-transform duration-200" />设置
       </summary>
       <div className="grid gap-4 px-4 sm:ps-12 pt-1 pb-4">
@@ -529,8 +524,8 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
             busy={busy === `${item.provider}:bot_details`} save={saveBot} />
         </Details> : null}
         {execution ? <Details label="执行任务">
-          <p role="status" className={cn("text-meta", toneText[executionState.tone])}>执行模型：{executionState.label}</p>
-          {'issue' in item.execution_readiness ? <p role="status" className="text-meta text-muted-foreground">{probeIssueText(item.provider, item.execution_readiness.issue)}</p> : null}
+          <p role="status" className={cn("text-sm", toneText[executionState.tone])}>执行模型：{executionState.label}</p>
+          {'issue' in item.execution_readiness ? <p role="status" className="text-sm text-secondary">{probeIssueText(item.provider, item.execution_readiness.issue)}</p> : null}
           <ExecutionDetails key={`${item.execution_model}:${item.provider}`} model={item.execution_model} models={models} working={working}
             busy={busy === `${item.provider}:execution_model`} save={(model) => change("execution_model", { execution_model: model })} />
         </Details> : null}
@@ -548,22 +543,22 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
           busy={busy === `${item.provider}:bot_details`} save={saveBot} /> : null}
 
         <div className="grid gap-2">
-          <p className="text-meta font-medium text-muted-foreground">环境变量</p>
+          <p className="text-sm font-medium text-secondary">环境变量</p>
           {others.length ? <ul className="grid gap-1">{others.map((row) => envRow(row, false))}</ul> : null}
 
           <form className="grid min-w-0 gap-2 sm:grid-cols-[minmax(0,11rem)_minmax(0,1fr)_auto]" onSubmit={(event) => {
             event.preventDefault()
             void setVariable("add", addName, newValue).then((ok) => { if (ok) { setNewName(""); setNewValue("") } })
           }}>
-            <Input aria-label="变量名" className="min-w-0 font-mono" placeholder="变量名" autoCapitalize="characters" spellCheck={false} maxLength={256} value={newName} disabled={working} onChange={(event) => setNewName(event.target.value)} />
+            <Input label={"变量名"} aria-label="变量名" className="min-w-0 font-mono" placeholder="变量名" autoCapitalize="characters" spellCheck={false} maxLength={256} value={newName} disabled={working} onChange={(event) => setNewName(event.target.value)} />
             <div className="flex min-w-0 gap-2 sm:contents">
-              <Input type="password" autoComplete="off" aria-label="值" className="min-w-0" placeholder="值" maxLength={4096} value={newValue} disabled={working} onChange={(event) => setNewValue(event.target.value)} />
-              <Button type="submit" variant="outline" disabled={working || !addName || !newValue || !canSetProviderEnvironment(item.provider, addName)}><BusyIcon busy={busy === `${item.provider}:add`} icon={Plus} />添加</Button>
+              <Input label={"值"} type="password" autoComplete="off" aria-label="值" className="min-w-0" placeholder="值" maxLength={4096} value={newValue} disabled={working} onChange={(event) => setNewValue(event.target.value)} />
+              <Button type="submit" variant="secondary" disabled={working || !addName || !newValue || !canSetProviderEnvironment(item.provider, addName)}><BusyIcon busy={busy === `${item.provider}:add`} icon={Plus} />添加</Button>
             </div>
           </form>
-          <p className="text-meta text-muted-foreground">只存在这台电脑上，保存后看不到原值</p>
-          {item.provider === "cursor" ? <p className="text-meta text-muted-foreground">Cursor 使用本机 CLI 订阅登录，无需填写密钥或认证令牌。</p> : null}
-          {item.app_server?.mode === "system" ? <p className="text-meta text-muted-foreground">用已在运行的 Codex 时，这些变量不生效</p> : null}
+          <p className="text-sm text-secondary">只存在这台电脑上，保存后看不到原值</p>
+          {item.provider === "cursor" ? <p className="text-sm text-secondary">Cursor 使用本机 CLI 订阅登录，无需填写密钥或认证令牌。</p> : null}
+          {item.app_server?.mode === "system" ? <p className="text-sm text-secondary">用已在运行的 Codex 时，这些变量不生效</p> : null}
         </div>
         </div>
         </Details>
@@ -585,21 +580,19 @@ function KeyField({ name, working, busy, more, save }: { name: string; working: 
     event.preventDefault()
     if (value) void save(name, value).then((ok) => { if (ok) setValue("") })
   }}>
-    <label htmlFor={`key-${name}`} title={name} className="flex min-w-0 items-center gap-1.5 text-meta text-warning">
-      <terms.secret.icon aria-hidden="true" className="size-4 shrink-0" />缺少 {label}{more > 0 ? `，还有 ${more} 项` : ""}
-    </label>
+
     <div className="flex min-w-0 gap-2">
-      <Input id={`key-${name}`} type="password" autoComplete="new-password" data-1p-ignore="" spellCheck={false} className="min-w-0" placeholder={`粘贴 ${label}`} maxLength={4096}
+      <Input label={["缺少",label,more > 0 ? `，还有 ${more} 项` : ""].join(" ")} id={`key-${name}`} type="password" autoComplete="new-password" data-1p-ignore="" spellCheck={false} className="min-w-0" placeholder={`粘贴 ${label}`} maxLength={4096}
         value={value} disabled={working} onChange={(event) => setValue(event.target.value)} />
-      <Button type="submit" variant="outline" disabled={working || !value}><BusyIcon busy={busy} />保存</Button>
+      <Button type="submit" variant="secondary" disabled={working || !value}><BusyIcon busy={busy} />保存</Button>
     </div>
-    <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><Lock aria-hidden="true" className="size-4 shrink-0" />只存在这台电脑上</p>
+    <p className="flex items-center gap-1.5 text-sm text-secondary"><Lock aria-hidden="true" className="size-4 shrink-0" />只存在这台电脑上</p>
   </form>
 }
 
 /** Why setup cannot move on yet: no provider runs the bot. A bot that still needs setup can move on; its status pill says so. */
 function BotHint() {
-  return <p role="status" className="flex items-center gap-1.5 text-meta text-muted-foreground">
+  return <p role="status" className="flex items-center gap-1.5 text-sm text-secondary">
     <CircleAlert aria-hidden="true" className="size-4 shrink-0" />选一个<terms.bot.icon aria-hidden="true" className="size-4 shrink-0" />{deviceCopy.roles.bot.label}
   </p>
 }
@@ -623,36 +616,22 @@ function BotDetails({ fields, manager, models = null, display, working, busy, sa
   const field = (key: (typeof botFields)[number], label: string, extra: { placeholder?: string; required?: boolean; plain?: boolean } = {}) => {
     const props = { name: key, value: draft[key], disabled: working, placeholder: extra.placeholder, required: extra.required,
       onChange: (event: ChangeEvent<HTMLInputElement>) => setDraft({ ...draft, [key]: event.target.value }) }
-    return <label className="grid gap-1 text-meta">{label}{extra.plain ? <Input {...props} maxLength={256} /> : <PathInput {...props} saved={manager[key]} display={display} />}</label>
+    return <div className="grid gap-1">{extra.plain ? <Input label={label} {...props} maxLength={256} /> : <PathInput label={label} {...props} saved={manager[key]} display={display} />}</div>
   }
   return <form className="grid gap-3" onSubmit={(event) => {
     event.preventDefault()
     void save({ ...manager, ...Object.fromEntries(fields.map((key) => [key, draft[key].trim()])),
       ...(fields.includes("model") ? { reasoning_effort: reasoningEffort, backup: { ...draft.backup, candidates: draft.backup.candidates.map((candidate) => ({ ...candidate, model: candidate.model.trim() })) } } : {}) })
   }}>
-    {fields.includes("model") ? models && !typing ? <label className="grid gap-1 text-meta">{copy.label}
-      <NativeSelect className="w-full" name="model" value={draft.model} disabled={working}
-        onChange={(event) => { const model = event.target.value; if (model === other) { setTyping(true); setDraft({ ...draft, model: "" }) } else setDraft({ ...draft, model }) }}>
-        <NativeSelectOption value="">{copy.default}</NativeSelectOption>
-        {models.map((model) => <NativeSelectOption key={model.id} value={model.id}>{model.name}</NativeSelectOption>)}
-        <NativeSelectOption value={other}>{copy.other}</NativeSelectOption>
-      </NativeSelect>
-    </label> : <div className="flex min-w-0 items-end gap-2">
+    {fields.includes("model") ? models && !typing ? <div className="grid gap-1 text-sm"><Select label={copy.label} className="w-full" name="model" disabled={working} value={"arc:" + String(draft.model)} onValueChange={selected => { const value = selected.slice(4);  const model = value; if (model === other) { setTyping(true); setDraft({ ...draft, model: "" }) } else setDraft({ ...draft, model })  }} options={[({ value: "arc:" + String(""), label: [copy.default].join("") }),models.map((model) => ({ value: "arc:" + String(model.id), label: [model.name].join("") })),({ value: "arc:" + String(other), label: [copy.other].join("") })].flat().filter(option => option !== null && option !== undefined)} /></div> : <div className="flex min-w-0 items-end gap-2">
       <div className="min-w-0 flex-1">{field("model", copy.label, { placeholder: cursor ? "auto" : copy.default, required: cursor, plain: true })}</div>
-      {models ? <Button type="button" variant="ghost" size="icon" aria-label={copy.pick} title={copy.pick} disabled={working}
+      {models ? <Button type="button" variant="ghost" size="md" aria-label={copy.pick} title={copy.pick} disabled={working}
         onClick={() => { setTyping(false); setDraft({ ...draft, model: models.some((model) => model.id === draft.model) ? draft.model : "" }) }}><List aria-hidden="true" /></Button> : null}
     </div> : null}
-    {fields.includes("model") ? efforts.length ? <label className="grid gap-1 text-meta">推理强度
-      <NativeSelect value={reasoningEffort ?? ""} disabled={working} onChange={(event) => setDraft({ ...draft, reasoning_effort: event.target.value || null })}>
-        <NativeSelectOption value="">由 AI 服务决定</NativeSelectOption>
-        {reasoningEffort && !efforts.includes(reasoningEffort) ? <NativeSelectOption value={reasoningEffort}>{reasoningEffort}</NativeSelectOption> : null}
-        {efforts.map((effort) => <NativeSelectOption key={effort} value={effort}>{effort}</NativeSelectOption>)}
-      </NativeSelect>
-      <span className="text-muted-foreground">用于下一回合，模型是否支持以 AI 服务的检查结果为准。</span>
-    </label> : <p className="text-meta text-muted-foreground">推理强度由 AI 服务决定</p> : null}
+    {fields.includes("model") ? efforts.length ? <div className="grid gap-1 text-sm"><Select label={["推理强度","用于下一回合，模型是否支持以 AI 服务的检查结果为准。"].join(" ")} disabled={working} value={"arc:" + String(reasoningEffort ?? "")} onValueChange={selected => { const value = selected.slice(4);  setDraft({ ...draft, reasoning_effort: value || null })  }} options={[({ value: "arc:" + String(""), label: ["由 AI 服务决定"].join("") }),reasoningEffort && !efforts.includes(reasoningEffort) ? ({ value: "arc:" + String(reasoningEffort), label: [reasoningEffort].join("") }) : null,efforts.map((effort) => ({ value: "arc:" + String(effort), label: [effort].join("") }))].flat().filter(option => option !== null && option !== undefined)} /><span className="text-secondary">用于下一回合，模型是否支持以 AI 服务的检查结果为准。</span></div> : <p className="text-sm text-secondary">推理强度由 AI 服务决定</p> : null}
     {fields.includes("model") ? <Details label="备用策略"><BackupPolicyEditor policy={draft.backup} disabled={working} change={(backup) => setDraft({ ...draft, backup })} /></Details> : null}
     {fields.includes("workspace") ? field("workspace", folderLabels.botRun) : null}
-    {dirty ? <Button type="submit" variant="outline" className="w-fit" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
+    {dirty ? <Button type="submit" variant="secondary" className="w-fit" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
   </form>
 }
 
@@ -663,21 +642,12 @@ function ExecutionDetails({ model, models, working, busy, save }: { model: strin
   const typing = chosen ?? modelTyped(model, models)
   const dirty = draft.trim() !== model
   return <form className="grid gap-2" onSubmit={(event) => { event.preventDefault(); void save(draft.trim()) }}>
-    {models && !typing ? <label className="grid gap-1 text-meta">{deviceCopy.executionModel.label}
-      <NativeSelect className="w-full" name="execution_model" value={draft} disabled={working}
-        onChange={(event) => { const value = event.target.value; if (value === other) { setTyping(true); setDraft("") } else setDraft(value) }}>
-        <NativeSelectOption value="">{deviceCopy.executionModel.default}</NativeSelectOption>
-        {models.map((choice) => <NativeSelectOption key={choice.id} value={choice.id}>{choice.name}</NativeSelectOption>)}
-        <NativeSelectOption value={other}>{deviceCopy.executionModel.other}</NativeSelectOption>
-      </NativeSelect>
-    </label> : <div className="flex min-w-0 items-end gap-2">
-      <label className="grid min-w-0 flex-1 gap-1 text-meta">{deviceCopy.executionModel.label}
-        <Input name="execution_model" value={draft} disabled={working} placeholder={deviceCopy.executionModel.default} onChange={(event) => setDraft(event.target.value)} />
-      </label>
-      {models ? <Button type="button" variant="ghost" size="icon" aria-label={deviceCopy.executionModel.pick} title={deviceCopy.executionModel.pick} disabled={working}
+    {models && !typing ? <div className="grid gap-1 text-sm"><Select label={deviceCopy.executionModel.label} className="w-full" name="execution_model" disabled={working} value={"arc:" + String(draft)} onValueChange={selected => { const value = selected.slice(4);  if (value === other) { setTyping(true); setDraft("") } else setDraft(value)  }} options={[({ value: "arc:" + String(""), label: [deviceCopy.executionModel.default].join("") }),models.map((choice) => ({ value: "arc:" + String(choice.id), label: [choice.name].join("") })),({ value: "arc:" + String(other), label: [deviceCopy.executionModel.other].join("") })].flat().filter(option => option !== null && option !== undefined)} /></div> : <div className="flex min-w-0 items-end gap-2">
+      <div className="grid min-w-0 flex-1 gap-1 text-sm"><Input label={deviceCopy.executionModel.label} name="execution_model" value={draft} disabled={working} placeholder={deviceCopy.executionModel.default} onChange={(event) => setDraft(event.target.value)} /></div>
+      {models ? <Button type="button" variant="ghost" size="md" aria-label={deviceCopy.executionModel.pick} title={deviceCopy.executionModel.pick} disabled={working}
         onClick={() => { setTyping(false); setDraft(models.some((choice) => choice.id === draft) ? draft : "") }}><List aria-hidden="true" /></Button> : null}
     </div>}
-    {dirty ? <Button type="submit" variant="outline" className="w-fit" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
+    {dirty ? <Button type="submit" variant="secondary" className="w-fit" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
   </form>
 }
 
@@ -696,27 +666,17 @@ function EndpointDetails({ endpoint, working, busy, save }: { endpoint: Provider
     event.preventDefault()
     void save("endpoint", { opencode_endpoint: { protocol, base_url: baseUrl.trim(), models, ...(token.trim() ? { api_key: token.trim() } : {}) } }).then((saved) => { if (saved) setToken("") })
   }}>
-    <label className="grid gap-1 text-meta">协议
-      <NativeSelect className="w-full" value={protocol} disabled={working} onChange={(event) => setProtocol(event.target.value as EndpointProtocol)}>
-        {Object.entries(protocolLabels).map(([value, label]) => <NativeSelectOption key={value} value={value}>{label}</NativeSelectOption>)}
-      </NativeSelect>
-    </label>
-    <label className="grid gap-1 text-meta">Base URL
-      <Input type="url" required spellCheck={false} maxLength={2048} value={baseUrl} disabled={working} onChange={(event) => setBaseUrl(event.target.value)} />
-    </label>
-    <label className="grid gap-1 text-meta">API Token
-      <Input type="password" autoComplete="new-password" data-1p-ignore="" spellCheck={false} maxLength={4096} placeholder={endpoint?.has_api_key ? "已保存，留空不改" : "可留空"}
-        value={token} disabled={working} onChange={(event) => setToken(event.target.value)} />
-    </label>
-    <label className="grid gap-1 text-meta">模型
-      <Textarea required spellCheck={false} value={modelText} disabled={working} onChange={(event) => setModelText(event.target.value)} />
-    </label>
-    <p className="text-meta text-muted-foreground">模型写成 custom/{models[0] ?? "<模型名>"}</p>
+    <div className="grid gap-1 text-sm"><Select label={"协议"} className="w-full" disabled={working} value={"arc:" + String(protocol)} onValueChange={selected => { const value = selected.slice(4);  setProtocol(value as EndpointProtocol)  }} options={[Object.entries(protocolLabels).map(([value, label]) => ({ value: "arc:" + String(value), label: [label].join("") }))].flat().filter(option => option !== null && option !== undefined)} /></div>
+    <div className="grid gap-1 text-sm"><Input label={"Base URL"} type="url" required spellCheck={false} maxLength={2048} value={baseUrl} disabled={working} onChange={(event) => setBaseUrl(event.target.value)} /></div>
+    <div className="grid gap-1 text-sm"><Input label={"API Token"} type="password" autoComplete="new-password" data-1p-ignore="" spellCheck={false} maxLength={4096} placeholder={endpoint?.has_api_key ? "已保存，留空不改" : "可留空"}
+        value={token} disabled={working} onChange={(event) => setToken(event.target.value)} /></div>
+    <div className="grid gap-1 text-sm"><Textarea label={"模型"} required spellCheck={false} value={modelText} disabled={working} onChange={(event) => setModelText(event.target.value)} /></div>
+    <p className="text-sm text-secondary">模型写成 custom/{models[0] ?? "<模型名>"}</p>
     {dirty || endpoint ? <div className="flex flex-wrap gap-2">
-      {dirty ? <Button type="submit" variant="outline" disabled={working || !baseUrl.trim() || !models.length}><BusyIcon busy={busy === "opencode:endpoint"} />保存</Button> : null}
+      {dirty ? <Button type="submit" variant="secondary" disabled={working || !baseUrl.trim() || !models.length}><BusyIcon busy={busy === "opencode:endpoint"} />保存</Button> : null}
       {!endpoint ? null : deleting ? <>
         <Button type="button" variant="ghost" autoFocus onClick={() => setDeleting(false)}>取消</Button>
-        <Button type="button" variant="destructive" disabled={working} onClick={() => { setDeleting(false); void save("endpoint_delete", { opencode_endpoint: null }) }}><BusyIcon busy={busy === "opencode:endpoint_delete"} />删除</Button>
+        <Button type="button" variant="danger" disabled={working} onClick={() => { setDeleting(false); void save("endpoint_delete", { opencode_endpoint: null }) }}><BusyIcon busy={busy === "opencode:endpoint_delete"} />删除</Button>
       </> : <Button type="button" variant="ghost" disabled={working} onClick={() => setDeleting(true)}><Trash2 aria-hidden="true" />删除</Button>}
     </div> : null}
   </form>
@@ -727,24 +687,24 @@ function Folders({ later, roots, suggested, display, busy, save }: { later: bool
   const add = () => { const path = folder.trim(); setFolder(""); if (path && !roots.includes(path)) save([...roots, path]) }
   return <section className="grid gap-2">
     <div className="grid gap-0.5 px-1">
-      <h3 className="text-meta font-medium text-muted-foreground">{terms.folders.label}</h3>
-      <p className="text-meta text-muted-foreground">{deviceCopy.folders(later)}</p>
+      <h3 className="text-sm font-medium text-secondary">{terms.folders.label}</h3>
+      <p className="text-sm text-secondary">{deviceCopy.folders(later)}</p>
     </div>
-    <div className="grid gap-2 rounded-xl border bg-card p-3 shadow-xs">
-    {roots.length ? <ul className="grid gap-1">{roots.map((root) => <li key={root} className="flex min-h-9 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3">
-      <FolderOpen aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+    <div className="grid gap-2 rounded-panel border bg-surface p-3 ">
+    {roots.length ? <ul className="grid gap-1">{roots.map((root) => <li key={root} className="flex min-h-9 min-w-0 items-center gap-2 rounded-control bg-surface-muted/60 ps-3">
+      <FolderOpen aria-hidden="true" className="size-4 shrink-0 text-secondary" />
       <FolderPath path={root} shown={display[root]} />
-      <Button type="button" variant="ghost" size="icon" aria-label={`移除 ${root}`} title="移除" disabled={busy} onClick={() => save(roots.filter((item) => item !== root))}><X aria-hidden="true" /></Button>
+      <Button type="button" variant="ghost" size="md" aria-label={`移除 ${root}`} title="移除" disabled={busy} onClick={() => save(roots.filter((item) => item !== root))}><X aria-hidden="true" /></Button>
     </li>)}</ul> : null}
-    {suggested.length && !roots.length ? <div className="grid gap-1">{suggested.map(({ path, label }) => <Button key={path} type="button" variant="outline" className="h-auto min-h-11 justify-start border-dashed border-primary/60 bg-primary/5 hover:bg-primary/10" title={path} aria-label={`添加 ${label}`} disabled={busy} onClick={() => save([path])}>
-      <FolderPlus aria-hidden="true" className="text-primary" /><FolderPath path={path} shown={label} /><span className="text-meta font-medium text-primary">添加</span>
+    {suggested.length && !roots.length ? <div className="grid gap-1">{suggested.map(({ path, label }) => <Button key={path} type="button" variant="secondary" className="h-auto justify-start" title={path} aria-label={`添加 ${label}`} disabled={busy} onClick={() => save([path])}>
+      <FolderPlus aria-hidden="true" className="text-foreground" /><FolderPath path={path} shown={label} /><span className="text-sm font-medium text-foreground">添加</span>
     </Button>)}</div>
-    : suggested.length ? <div className="flex flex-wrap gap-2">{suggested.map(({ path, label }) => <Button key={path} type="button" variant="outline" size="sm" className="font-mono" title={path} disabled={busy} onClick={() => save([...roots, path])}>
+    : suggested.length ? <div className="flex flex-wrap gap-2">{suggested.map(({ path, label }) => <Button key={path} type="button" variant="secondary" size="sm" className="font-mono" title={path} disabled={busy} onClick={() => save([...roots, path])}>
       <Plus aria-hidden="true" />{label}
     </Button>)}</div> : null}
     <div className="flex min-w-0 gap-2">
-      <Input aria-label="文件夹路径" className="min-w-0 font-mono" placeholder={roots.length || suggested.length ? "其他文件夹" : "~/projects"} value={folder} disabled={busy} onChange={(event) => setFolder(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); add() } }} />
-      <Button type="button" variant="outline" disabled={busy || !folder.trim()} onClick={add}><Plus aria-hidden="true" />添加</Button>
+      <Input label={"文件夹路径"} aria-label="文件夹路径" className="min-w-0 font-mono" placeholder={roots.length || suggested.length ? "其他文件夹" : "~/projects"} value={folder} disabled={busy} onChange={(event) => setFolder(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); add() } }} />
+      <Button type="button" variant="secondary" disabled={busy || !folder.trim()} onClick={add}><Plus aria-hidden="true" />添加</Button>
     </div>
     </div>
   </section>
@@ -753,14 +713,14 @@ function Folders({ later, roots, suggested, display, busy, save }: { later: bool
 function BackupPolicyEditor({ policy, disabled, change }: { policy: BackupPolicy; disabled: boolean; change(policy: BackupPolicy): void }) {
   const update = (index: number, value: BackupPolicy['candidates'][number]) => change({ ...policy, candidates: policy.candidates.map((candidate, at) => at === index ? value : candidate) })
   return <div className="grid gap-3">
-    <label className="flex min-h-11 items-center gap-2 text-meta"><input type="checkbox" disabled={disabled || !policy.candidates.length} checked={policy.automatic} onChange={(event) => change({ ...policy, automatic: event.target.checked })} />自动尝试备用模型</label>
-    <p className="text-meta text-muted-foreground">仅在原回合明确未执行时按顺序尝试一次。使用运行设备对应 AI 服务的登录账户，可能产生该账户的费用。</p>
-    {policy.candidates.map((candidate, index) => <div key={index} className="grid gap-2 rounded-lg border p-2">
-      <label className="grid gap-1 text-meta">备用 AI 服务 {index + 1}<NativeSelect disabled={disabled} value={candidate.provider} onChange={(event) => { const provider = providerIds.find((provider) => provider === event.target.value); if (provider) update(index, { provider, model: '', reasoning_effort: null }) }}>{providerIds.map((provider) => <NativeSelectOption key={provider} value={provider}>{providerNames[provider]}</NativeSelectOption>)}</NativeSelect></label>
-      <Input aria-label={`备用模型 ${index + 1}`} placeholder="模型名称" required value={candidate.model} disabled={disabled} onChange={(event) => update(index, { ...candidate, model: event.target.value })} />
-      {effortOptions(candidate.provider).length ? <label className="grid gap-1 text-meta">备用推理强度<NativeSelect disabled={disabled} value={candidate.reasoning_effort ?? ''} onChange={(event) => update(index, { ...candidate, reasoning_effort: event.target.value || null })}><NativeSelectOption value="">由 AI 服务决定</NativeSelectOption>{effortOptions(candidate.provider).map((effort) => <NativeSelectOption key={effort} value={effort}>{effort}</NativeSelectOption>)}</NativeSelect></label> : <p className="text-meta text-muted-foreground">推理强度由 AI 服务决定</p>}
+    <label className="flex min-h-11 items-center gap-2 text-sm"><Checkbox aria-label="自动尝试备用模型" disabled={disabled || !policy.candidates.length} checked={policy.automatic} onCheckedChange={next => { const checked = next === true;  change({ ...policy, automatic: checked })  }} />自动尝试备用模型</label>
+    <p className="text-sm text-secondary">仅在原回合明确未执行时按顺序尝试一次。使用运行设备对应 AI 服务的登录账户，可能产生该账户的费用。</p>
+    {policy.candidates.map((candidate, index) => <div key={index} className="grid gap-2 rounded-control border p-2">
+      <div className="grid gap-1 text-sm"><Select label={["备用 AI 服务",index + 1].join(" ")} disabled={disabled} value={"arc:" + String(candidate.provider)} onValueChange={selected => { const value = selected.slice(4);  const provider = providerIds.find((provider) => provider === value); if (provider) update(index, { provider, model: '', reasoning_effort: null })  }} options={[providerIds.map((provider) => ({ value: "arc:" + String(provider), label: [providerNames[provider]].join("") }))].flat().filter(option => option !== null && option !== undefined)} /></div>
+      <Input label={`备用模型 ${index + 1}`} aria-label={`备用模型 ${index + 1}`} placeholder="模型名称" required value={candidate.model} disabled={disabled} onChange={(event) => update(index, { ...candidate, model: event.target.value })} />
+      {effortOptions(candidate.provider).length ? <div className="grid gap-1 text-sm"><Select label={"备用推理强度"} disabled={disabled} value={"arc:" + String(candidate.reasoning_effort ?? '')} onValueChange={selected => { const value = selected.slice(4);  update(index, { ...candidate, reasoning_effort: value || null })  }} options={[({ value: "arc:" + String(""), label: ["由 AI 服务决定"].join("") }),effortOptions(candidate.provider).map((effort) => ({ value: "arc:" + String(effort), label: [effort].join("") }))].flat().filter(option => option !== null && option !== undefined)} /></div> : <p className="text-sm text-secondary">推理强度由 AI 服务决定</p>}
       <Button type="button" variant="ghost" disabled={disabled} onClick={() => { const candidates = policy.candidates.filter((_, at) => at !== index); change({ automatic: policy.automatic && candidates.length > 0, candidates }) }}>移除备用模型</Button>
     </div>)}
-    <Button type="button" variant="outline" disabled={disabled || policy.candidates.length >= 5} onClick={() => change({ ...policy, candidates: [...policy.candidates, { provider: 'codex', model: '', reasoning_effort: null }] })}>添加备用模型</Button>
+    <Button type="button" variant="secondary" disabled={disabled || policy.candidates.length >= 5} onClick={() => change({ ...policy, candidates: [...policy.candidates, { provider: 'codex', model: '', reasoning_effort: null }] })}>添加备用模型</Button>
   </div>
 }

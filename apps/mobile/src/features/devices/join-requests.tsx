@@ -9,9 +9,9 @@ import { deviceForm, formName } from '@vibeface/client/workspace/labels.ts'
 import { deviceIcon } from './device-icon'
 import { ErrorText } from '@/components/action'
 import { ActionCard, SafetyCode, Skeleton } from '@/components/kit'
-import { Button } from '@/components/ui/button'
-import { Switch } from '@/components/ui/switch'
-import { Text } from '@/components/ui/text'
+import { Button } from '@/components/arc/button'
+import { Switch } from '@/components/arc/switch'
+import { Text } from '@/components/arc/text'
 import { useRun } from '@/lib/use-run'
 
 /** A device this screen just allowed in. */
@@ -57,19 +57,19 @@ function JoinCard({ request, auto, onAllowed }: { request: JoinRequest; auto: bo
   // As on the web: one 一致，允许 after the codes match, with 设为管理设备 as a switch beside the request.
   const [manage, setManage] = useState(false)
   const allow = () => run('allow', async () => { const asManager = request.kind === 'client' && manage; await device.approveJoin(request.join_id, asManager); void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); onAllowed?.({ id: request.device_id, kind: request.kind, name: request.name || '新设备', manage: asManager }) })
-  return <ActionCard icon={deviceIcon({ kind: request.kind, name: request.name, current: false })} tone="info" title={`${request.name || '新设备'} 想加入`}
+  return <ActionCard kind="approval" icon={deviceIcon({ kind: request.kind, name: request.name, current: false })} tone="info" title={`${request.name || '新设备'} 想加入`}
     meta={formName[deviceForm(request.kind, request.name)]} actions={<>
     <Button variant="ghost" disabled={busy !== null} onPress={() => void run('reject', () => device.rejectJoin(request.join_id))}><Text>拒绝</Text></Button>
     {asking ? <Button disabled={busy !== null} onPress={() => void run('start', () => device.startApproval(request.join_id))}><Text>{busy === 'start' ? '处理中' : '显示安全码'}</Text></Button> : <>
       <Button disabled={!request.code || busy !== null || elsewhere} onPress={() => void allow()}><Text>{busy === 'allow' ? '处理中' : '一致，允许'}</Text></Button>
     </>}
   </>}>
-    <Text className="text-meta text-muted-foreground">{elsewhere ? '正在另一台管理设备上处理' : asking ? '两边显示同样的安全码，再允许' : request.code ? deviceCopy.compareCode : '等新设备显示安全码'}</Text>
+    <Text className="text-sm text-muted">{elsewhere ? '正在另一台管理设备上处理' : asking ? '两边显示同样的安全码，再允许' : request.code ? deviceCopy.compareCode : '等新设备显示安全码'}</Text>
     {request.code ? <SafetyCode code={request.code} /> : asking ? null : <Skeleton className="h-8 w-40" />}
     {request.kind === 'client' && !asking && !elsewhere ? <View className="flex-row items-center gap-3">
       <View className="min-w-0 flex-1">
         <Text>设为管理设备</Text>
-        <Text className="text-meta text-muted-foreground">{deviceCopy.manageHint}</Text>
+        <Text className="text-sm text-muted">{deviceCopy.manageHint}</Text>
       </View>
       <Switch accessibilityLabel="设为管理设备" accessibilityHint={deviceCopy.manageHint} value={manage} disabled={busy !== null} onValueChange={setManage} />
     </View> : null}

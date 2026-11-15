@@ -1,18 +1,20 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { Link, useNavigate } from '@tanstack/react-router'
-import { ArchiveRestore, BellRing, CalendarClock, ChevronRight, CircleCheck, CircleMinus, CirclePlus, Copy, Download, FileKey, FileWarning, Hand, Hourglass, KeyRound, Laptop, LifeBuoy, ScanLine, Shield, ShieldAlert, ShieldCheck, ShieldX, Smartphone, WifiOff, type LucideIcon } from 'lucide-react'
-import qrcode from 'qrcode-generator'
-import { cn } from '@/lib/utils'
-import { ActionCard, BusyIcon, claimFocus, Details, FilePicker, InlineError, Panel, PasswordInput, SettingsDisclosure, SettingsRow, toast, WaitingDot } from '@/components/app/kit'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { entryAddress, messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
-import { passphrase, passwordStrength, recoveryFileStem } from '@vibeface/client/lib/secure.ts'
-import { defaultBrowserName } from '@/lib/device-name'
-import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
-import { passwordCopy, recoveryChanges, recoveryCopy, securityCopy, whenText } from '@vibeface/client/identity/copy.ts'
-import { recoveryEntry, recoveryLink } from '@vibeface/client/identity/recovery-link.ts'
+import { ActionCard,BusyIcon,claimFocus,Details,FilePicker,InlineError,Panel,PasswordInput,SettingsDisclosure,SettingsRow,toast,WaitingDot } from '@/components/arc/product-kit'
 import { deviceIcon } from '@/features/devices/devices'
+import { defaultBrowserName } from '@/lib/device-name'
+import { cn } from '@/lib/utils'
+import { Link,useNavigate } from '@tanstack/react-router'
+import { useDevice,useRecoveryCode } from '@vibeface/client/identity/context.tsx'
+import { passwordCopy,recoveryChanges,recoveryCopy,securityCopy,whenText } from '@vibeface/client/identity/copy.ts'
+import { recoveryEntry,recoveryLink } from '@vibeface/client/identity/recovery-link.ts'
+import { entryAddress,messageOf,parseEntry } from '@vibeface/client/lib/node.ts'
+import { passphrase,passwordStrength,recoveryFileStem } from '@vibeface/client/lib/secure.ts'
+import { Button } from '@vibeface/uiarc/button/button.tsx'
+import { Checkbox } from "@vibeface/uiarc/checkbox/checkbox.tsx"
+import { Input } from '@vibeface/uiarc/input/input.tsx'
+import { Switch } from "@vibeface/uiarc/switch/switch.tsx"
+import { ArchiveRestore,BellRing,CalendarClock,ChevronRight,CircleCheck,CircleMinus,CirclePlus,Copy,Download,FileKey,FileWarning,Hand,Hourglass,KeyRound,Laptop,LifeBuoy,ScanLine,Shield,ShieldAlert,ShieldCheck,ShieldX,Smartphone,WifiOff,type LucideIcon } from 'lucide-react'
+import qrcode from 'qrcode-generator'
+import { useEffect,useMemo,useRef,useState,type ReactNode } from 'react'
 
 /** Where the reminder to change the recovery password leads: settings with that form open. */
 const PASSWORD_HASH = 'recovery-password'
@@ -21,7 +23,6 @@ function field(form: HTMLFormElement, name: string) { const element = form.eleme
 /** A failed try keeps the chosen file and name; only typed passwords leave the page. */
 function clearPasswords(form: HTMLFormElement) { for (const input of form.querySelectorAll<HTMLInputElement>('input[name$=password]')) input.value = '' }
 function fileOf(form: HTMLFormElement) { const element = form.elements.namedItem('bundle'); const file = element instanceof HTMLInputElement ? element.files?.[0] : null; if (!file) throw new Error('选一个恢复文件。'); return file }
-const Label = ({ label, children }: { label: string; children: ReactNode }) => <label className="grid gap-1.5 text-meta font-medium">{label}{children}</label>
 
 /** Busy and error state bound to the connection generation, so a stale result never unlocks a newer action. */
 function useGenerationRun() {
@@ -61,9 +62,9 @@ export function CurrentRecoveryFile() {
  */
 export function PasswordStrength({ id, password, tried = false }: { id: string; password: string; tried?: boolean }) {
   const strength = password ? passwordStrength(password) : null
-  if (!strength || strength.level === 'weak' && strength.problem === 'short' && !tried) return <span id={id} className={cn('text-meta font-normal', tried ? 'text-danger' : 'text-muted-foreground')}>{passwordCopy.short}</span>
+  if (!strength || strength.level === 'weak' && strength.problem === 'short' && !tried) return <span id={id} className={cn('text-sm font-normal', tried ? 'text-danger' : 'text-secondary')}>{passwordCopy.short}</span>
   const Icon = strength.level === 'weak' ? ShieldX : strength.level === 'strong' ? ShieldCheck : Shield
-  return <span id={id} className={cn('flex items-center gap-1.5 text-meta font-normal', strength.level === 'weak' ? 'text-danger' : strength.level === 'strong' ? 'text-success' : 'text-muted-foreground')}>
+  return <span id={id} className={cn('flex items-center gap-1.5 text-sm font-normal', strength.level === 'weak' ? 'text-danger' : strength.level === 'strong' ? 'text-success' : 'text-secondary')}>
     <Icon aria-hidden="true" className="size-4 shrink-0" />{passwordCopy.label[strength.level]}{strength.level === 'weak' ? <span className="min-w-0">· {passwordCopy[strength.problem]}</span> : null}
   </span>
 }
@@ -85,12 +86,12 @@ export function PhoneRecovery() {
   }, [copied])
   return <SettingsDisclosure icon={Smartphone} label={recoveryCopy.byPhone}>
     {link ? <>
-      {image ? <img src={image} alt={recoveryCopy.qr} className="size-48 rounded-lg bg-white p-2 ring-1 ring-border" /> : null}
-      <p className="flex items-center gap-2 text-meta text-muted-foreground"><ScanLine aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.scanHint}</p>
-      <Button type="button" variant="outline" size="sm" className="w-fit" onClick={() => { void navigator.clipboard.writeText(link).then(() => setCopied(true), () => {}) }}>
+      {image ? <img src={image} alt={recoveryCopy.qr} className="size-48 rounded-control bg-white p-2  " /> : null}
+      <p className="flex items-center gap-2 text-sm text-secondary"><ScanLine aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.scanHint}</p>
+      <Button type="button" variant="secondary" size="sm" className="w-fit" onClick={() => { void navigator.clipboard.writeText(link).then(() => setCopied(true), () => {}) }}>
         {copied ? <CircleCheck aria-hidden="true" className="text-success" /> : <Copy aria-hidden="true" />}{copied ? '已复制' : '复制链接'}
       </Button>
-    </> : <p className="flex items-center gap-2 text-meta text-muted-foreground"><WifiOff aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.unreachable}</p>}
+    </> : <p className="flex items-center gap-2 text-sm text-secondary"><WifiOff aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.unreachable}</p>}
   </SettingsDisclosure>
 }
 
@@ -106,7 +107,7 @@ export function RecoveryPendingCard() {
   return <ActionCard icon={ShieldAlert} tone="danger" title={recoveryCopy.pending} meta={recoveryCopy.effectiveIn(pending.effective_at_ms - device.nodeClockOffset)} actions={confirming || busy ? <>
     {/* Remount the confirmation row so focus lands on 取消 and a second press cannot confirm. */}
     <Button key={`cancel-${confirming ?? 'busy'}`} type="button" variant="ghost" autoFocus disabled={busy} onClick={() => setConfirming(null)}>取消</Button>
-    <Button key={confirming ?? 'busy'} type="button" variant={confirming === 'stop' ? 'destructive' : 'default'} className={confirming === 'stop' ? 'bg-destructive text-primary-foreground shadow-xs hover:bg-destructive/88 focus-visible:border-ring focus-visible:ring-ring/50 dark:bg-destructive dark:hover:bg-destructive/88 dark:focus-visible:ring-ring/50' : undefined} disabled={busy} aria-busy={busy || undefined} onClick={() => void run(async () => {
+    <Button key={confirming ?? 'busy'} type="button" variant={confirming === 'stop' ? "danger" : "primary"} className={confirming === "stop" ? "" : undefined} disabled={busy} aria-busy={busy || undefined} onClick={() => void run(async () => {
       if (confirming === 'confirm') {
         await device.approveRecovery(pending.checkpoint)
         toast(recoveryCopy.confirmDone, { tone: 'success' })
@@ -119,21 +120,21 @@ export function RecoveryPendingCard() {
   </> : <>
     <Button type="button" onClick={() => setConfirming('confirm')}><ShieldCheck aria-hidden="true" />{recoveryCopy.confirm}</Button>
     <Button type="button" variant="ghost" onClick={() => { device.dismissPendingRecovery(); toast(recoveryCopy.itsMeDone(pending.effective_at_ms - device.nodeClockOffset), { icon: Hourglass }) }}>{recoveryCopy.itsMe}</Button>
-    <Button type="button" variant="destructive" onClick={() => setConfirming('stop')}><Hand aria-hidden="true" />{recoveryCopy.stop}</Button>
+    <Button type="button" variant="danger" onClick={() => setConfirming('stop')}><Hand aria-hidden="true" />{recoveryCopy.stop}</Button>
   </>}>
-    {confirming || busy ? <div role="alert" className="grid gap-1 rounded-lg bg-danger-soft px-3 py-2">
+    {confirming || busy ? <div role="alert" className="grid gap-1 rounded-control bg-danger-subtle px-3 py-2">
       <p className="font-medium">{confirming === 'stop' ? recoveryCopy.stopAsk : recoveryCopy.confirmAsk}</p>
-      <p className="text-meta text-muted-foreground">{confirming === 'stop' ? recoveryCopy.stopNote : recoveryCopy.confirmNote}</p>
-    </div> : changes.some(({ added }) => !added) ? <p className="text-meta text-muted-foreground">{recoveryCopy.outIfNotStopped}</p> : null}
+      <p className="text-sm text-secondary">{confirming === 'stop' ? recoveryCopy.stopNote : recoveryCopy.confirmNote}</p>
+    </div> : changes.some(({ added }) => !added) ? <p className="text-sm text-secondary">{recoveryCopy.outIfNotStopped}</p> : null}
     {changes.length ? <ul className="grid gap-1">{changes.map(({ member, added }) => {
       const Icon = deviceIcon(member)
       const Change = added ? CirclePlus : CircleMinus
       return <li key={member.device_id} className="flex min-w-0 items-center gap-2">
         <Change role="img" aria-label={added ? '加入' : '移出'} className={cn('size-4 shrink-0', added ? 'text-warning' : 'text-danger')} />
-        <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
-        <span className={cn('truncate', !added && 'text-muted-foreground line-through')}>{member.name}</span>
-        {added ? <span className="shrink-0 rounded-md bg-warning-soft px-1.5 text-meta text-warning">{recoveryCopy.added}</span>
-          : member.device_id === device.identity?.deviceId ? <span className="shrink-0 rounded-md bg-muted px-1.5 text-meta text-muted-foreground">这个浏览器</span> : null}
+        <Icon aria-hidden="true" className="size-4 shrink-0 text-secondary" />
+        <span className={cn('truncate', !added && 'text-secondary line-through')}>{member.name}</span>
+        {added ? <span className="shrink-0 rounded-control bg-warning-subtle px-1.5 text-sm text-warning">{recoveryCopy.added}</span>
+          : member.device_id === device.identity?.deviceId ? <span className="shrink-0 rounded-control bg-surface-muted px-1.5 text-sm text-secondary">这个浏览器</span> : null}
       </li>
     })}</ul> : null}
     <InlineError error={error || null} />
@@ -146,11 +147,11 @@ export function RecoveryAlert() {
   const pending = device.pendingRecovery
   if (!pending) return null
   return <div className="mx-auto w-full max-w-(--page-width) shrink-0 px-4 pt-3 sm:px-6">
-    <Link to="/tasks" className="flex min-h-11 min-w-0 items-center gap-2.5 rounded-xl border border-danger-border bg-card py-1.5 ps-1.5 pe-3 shadow-xs transition-colors hover:bg-danger-soft">
-      <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-danger-soft text-danger ring-1 ring-danger-border"><ShieldAlert aria-hidden="true" className="size-4" /></span>
+    <Link to="/tasks" className="flex min-h-11 min-w-0 items-center gap-2.5 rounded-panel border border-danger-border bg-surface py-1.5 ps-1.5 pe-3  transition-colors hover:bg-danger-subtle">
+      <span className="grid size-8 shrink-0 place-items-center rounded-control bg-danger-subtle text-danger  ring-danger-border"><ShieldAlert aria-hidden="true" className="size-4" /></span>
       <span className="min-w-0 flex-1 truncate font-medium">{recoveryCopy.pending}</span>
-      <span className="shrink-0 text-meta text-danger tabular-nums">{recoveryCopy.effectiveIn(pending.effective_at_ms - device.nodeClockOffset)}</span>
-      <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+      <span className="shrink-0 text-sm text-danger tabular-nums">{recoveryCopy.effectiveIn(pending.effective_at_ms - device.nodeClockOffset)}</span>
+      <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-secondary" />
     </Link>
   </div>
 }
@@ -163,7 +164,7 @@ export function RotateHintCard() {
     <Button type="button" variant="ghost" onClick={device.dismissRotateHint}>{recoveryCopy.later}</Button>
     <Button type="button" onClick={() => void navigate({ to: '/settings', hash: PASSWORD_HASH })}>{recoveryCopy.rotate}</Button>
   </>}>
-    <p className="flex items-center gap-2 text-meta text-muted-foreground"><Hand aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.leakedNote}</p>
+    <p className="flex items-center gap-2 text-sm text-secondary"><Hand aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.leakedNote}</p>
   </ActionCard>
 }
 
@@ -173,22 +174,22 @@ export function SaveRecoveryFile({ code, saved, onSaved, download, busy = false 
 }) {
   const downloaded = saved || download?.done === true
   // The download button gives way to the file once it is down, and is disabled while it works; ticking the box is next.
-  const box = useRef<HTMLInputElement>(null)
+  const box = useRef<HTMLButtonElement>(null)
   const settled = downloaded && !busy
   const wasSettled = useRef(settled)
   useEffect(() => { if (settled && !wasSettled.current) claimFocus(box.current); wasSettled.current = settled }, [settled])
   return <>
-    <p className="flex items-center gap-2 text-muted-foreground"><LifeBuoy aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.why}</p>
-    <p className="flex items-center gap-2 text-muted-foreground"><FileWarning aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.onlyCopy}</p>
-    {downloaded ? <p className="flex min-h-11 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3 text-meta">
+    <p className="flex items-center gap-2 text-secondary"><LifeBuoy aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.why}</p>
+    <p className="flex items-center gap-2 text-secondary"><FileWarning aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.onlyCopy}</p>
+    {downloaded ? <p className="flex min-h-11 min-w-0 items-center gap-2 rounded-control bg-surface-muted/60 ps-3 text-sm">
       <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" /><span className="sr-only">已下载 </span>
       {/* The code is what tells files apart; on a narrow screen the shared prefix gives way first. */}
       <span title={code ? recoveryFileStem(code) : undefined} className="flex min-w-0 flex-1 py-2 font-mono whitespace-nowrap">
-        <span className="truncate text-muted-foreground">{recoveryFileStem('')}</span><span className="font-medium tracking-wide">{code}</span>
+        <span className="truncate text-secondary">{recoveryFileStem('')}</span><span className="font-medium tracking-wide">{code}</span>
       </span>
       {download ? <Button type="button" variant="ghost" disabled={busy} onClick={download.run}>重新下载</Button> : null}
     </p> : download ? <Button type="button" className="w-fit" disabled={busy} onClick={download.run}><Download aria-hidden="true" />下载恢复文件</Button> : <InlineError error="当前页面没有恢复副本。请用已另存的文件重新打开，或连接管理设备后更换恢复文件。" />}
-    <label className={cn('flex min-h-11 items-center gap-2', !downloaded && 'text-muted-foreground')}><input ref={box} type="checkbox" className="size-4" disabled={!downloaded || busy} checked={saved} onChange={(event) => onSaved(event.target.checked)} />{recoveryCopy.keptApart}</label>
+    <label className={cn('flex min-h-11 items-center gap-2', !downloaded && 'text-secondary')}><Checkbox aria-label={recoveryCopy.keptApart} ref={box} disabled={!downloaded || busy} checked={saved} onCheckedChange={next => { const checked = next === true;  onSaved(checked)  }} />{recoveryCopy.keptApart}</label>
   </>
 }
 
@@ -213,21 +214,21 @@ export function RecoveryWaiting() {
   const { recovery, dismissRecovery, unsavedRecovery, forgetUnsavedRecovery } = useDevice()
   const saving = useRef<HTMLElement>(null)
   if (recovery?.status === 'stopped') return <Panel icon={ShieldX} title={recoveryCopy.stopped}>
-    <p className="text-muted-foreground">{recoveryCopy.stoppedNote}</p>
+    <p className="text-secondary">{recoveryCopy.stoppedNote}</p>
     <Button type="button" className="w-fit justify-self-end" onClick={() => { forgetUnsavedRecovery(); dismissRecovery() }}>知道了</Button>
   </Panel>
   const at = recovery?.status === 'waiting' ? recovery.effectiveAt : null
   return <Panel icon={Hourglass} title={recoveryCopy.waiting}>
     {at === null ? null : <>
-      <p role="status" className="flex items-center gap-2 text-heading font-semibold tabular-nums"><WaitingDot />{recoveryCopy.left(at)}</p>
-      <p className="flex items-center gap-2 text-muted-foreground"><CalendarClock aria-hidden="true" className="size-4 shrink-0" /><time className="tabular-nums" dateTime={new Date(at).toISOString()}>{whenText(at)}</time>{recoveryCopy.autoEnter}</p>
+      <p role="status" className="flex items-center gap-2 text-lg font-medium tabular-nums"><WaitingDot />{recoveryCopy.left(at)}</p>
+      <p className="flex items-center gap-2 text-secondary"><CalendarClock aria-hidden="true" className="size-4 shrink-0" /><time className="tabular-nums" dateTime={new Date(at).toISOString()}>{whenText(at)}</time>{recoveryCopy.autoEnter}</p>
     </>}
-    <p className="flex items-center gap-2 text-muted-foreground"><BellRing aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.managersSee}</p>
-    <p className="flex items-center gap-2 text-muted-foreground"><Laptop aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.closeOk}</p>
+    <p className="flex items-center gap-2 text-secondary"><BellRing aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.managersSee}</p>
+    <p className="flex items-center gap-2 text-secondary"><Laptop aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.closeOk}</p>
     {/* Saving the new file is a separate thing to do now, not part of the wait. */}
     {unsavedRecovery ? <section ref={saving} className="grid gap-3 border-t pt-4">
       <h3 className="flex items-center gap-2 font-medium"><FileKey aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.saveNew}</h3>
-      <p className="flex items-center gap-2 text-meta text-muted-foreground"><KeyRound aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.samePassword}</p>
+      <p className="flex items-center gap-2 text-sm text-secondary"><KeyRound aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.samePassword}</p>
       <UnsavedRecoveryFile landing={() => saving.current?.parentElement?.querySelector('h2')} />
     </section> : null}
   </Panel>
@@ -263,25 +264,25 @@ export function RecoveryReview() {
         const required = member.device_id === review.requiredNode
         const Icon = deviceIcon(member)
         const gone = lost.includes(member.device_id)
-        return <div key={member.device_id} className="flex min-h-12 items-center gap-2 rounded-lg bg-muted/60 px-3">
-          <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+        return <div key={member.device_id} className="flex min-h-12 items-center gap-2 rounded-control bg-surface-muted/60 px-3">
+          <Icon aria-hidden="true" className="size-4 shrink-0 text-secondary" />
           <span className="grid min-w-0 flex-1 py-1.5">
-            <span className={cn('truncate', gone && 'text-muted-foreground line-through')}>{member.name}</span>
-            {gone ? <span className="text-meta text-danger">生效后移出</span> : null}
+            <span className={cn('truncate', gone && 'text-secondary line-through')}>{member.name}</span>
+            {gone ? <span className="text-sm text-danger">生效后移出</span> : null}
           </span>
-          {required ? <span className="text-meta text-muted-foreground">当前连接</span>
-            : <label className="-me-3 flex min-h-11 cursor-pointer items-center gap-2 px-3 text-meta">丢了<input type="checkbox" role="switch" className="switch" data-tone="danger" checked={gone} onChange={(event) => setLost(event.target.checked ? [...lost, member.device_id] : lost.filter((id) => id !== member.device_id))} /></label>}
+          {required ? <span className="text-sm text-secondary">当前连接</span>
+            : <label className="-me-3 flex min-h-11 cursor-pointer items-center gap-2 px-3 text-sm">丢了<Switch checked={gone} onCheckedChange={next => { const checked = next === true;  setLost(checked ? [...lost, member.device_id] : lost.filter((id) => id !== member.device_id))  }} /></label>}
         </div>
       })}
     </fieldset>
-    <p className="flex items-center gap-2 text-meta text-muted-foreground"><Hourglass aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.delay}</p>
-    <p className="flex items-center gap-2 text-meta text-muted-foreground"><Download aria-hidden="true" className="size-4 shrink-0" />会下载新的恢复文件，生效后旧文件作废</p>
+    <p className="flex items-center gap-2 text-sm text-secondary"><Hourglass aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.delay}</p>
+    <p className="flex items-center gap-2 text-sm text-secondary"><Download aria-hidden="true" className="size-4 shrink-0" />会下载新的恢复文件，生效后旧文件作废</p>
     <InlineError error={error || null} />
     <div className="flex flex-wrap justify-between gap-2">
       <Button type="button" variant="ghost" className="-ms-3" onClick={device.cancelSensitive}>取消</Button>
       <Button type="button" disabled={busy} onClick={() => void run(() => device.confirmRecovery(review.members.filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id))))}><BusyIcon busy={busy} />找回</Button>
     </div>
-    {busy ? <p className="text-meta text-muted-foreground">{recoveryCopy.cancelLate}</p> : null}
+    {busy ? <p className="text-sm text-secondary">{recoveryCopy.cancelLate}</p> : null}
   </Panel>
 }
 
@@ -308,7 +309,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
   // In settings the password is a row that folds its form out below itself; alone, a form stands as a card.
   const frame = (icon: LucideIcon, title: string, body: ReactNode, id?: string) => only ? <Panel icon={icon} title={title}>{body}</Panel> : <section ref={fold} id={id} className="grid gap-4 px-4 pt-1 pb-4 sm:ps-15">{body}</section>
   const restoreForm = open === 'restore' ? frame(ArchiveRestore, '用恢复文件找回', <>
-      <p className="text-meta text-muted-foreground">{recoveryCopy.scope}</p>
+      <p className="text-sm text-secondary">{recoveryCopy.scope}</p>
       <form className="grid gap-4" noValidate onChange={clear} onSubmit={(event) => {
         event.preventDefault(); const form = event.currentTarget
         void run(async () => {
@@ -321,21 +322,21 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
           await work
         })
       }}><fieldset disabled={busy || !!device.review} className="grid gap-4">
-        <div className="grid gap-1.5 text-meta font-medium">恢复文件<FilePicker name="bundle" accept="application/json,.json" required /></div>
-        <Label label="恢复密码"><PasswordInput name="password" autoComplete="off" required /></Label>
-        <Label label="这个浏览器叫什么？"><Input name="name" required maxLength={128} defaultValue={defaultBrowserName()} /></Label>
+        <div className="grid gap-1.5 text-sm font-medium">恢复文件<FilePicker name="bundle" accept="application/json,.json" required /></div>
+        <div ><PasswordInput label={"恢复密码"} name="password" autoComplete="off" required /></div>
+        <div ><Input label={"这个浏览器叫什么？"} name="name" required maxLength={128} defaultValue={defaultBrowserName()} /></div>
         {/* With no address yet, opening this computer's own page fills it in; typing it is the fallback. */}
-        {target ? null : <p className="flex items-center gap-2 text-meta text-muted-foreground"><Laptop aria-hidden="true" className="size-4 shrink-0" />打开要连的节点的本机页面再找回</p>}
+        {target ? null : <p className="flex items-center gap-2 text-sm text-secondary"><Laptop aria-hidden="true" className="size-4 shrink-0" />打开要连的节点的本机页面再找回</p>}
         <Details label={target ? recoveryCopy.connectTo : recoveryCopy.manual}>
-          <Label label="访问地址"><Input type="url" name="address" required defaultValue={target ? entryAddress(target) : ''} /></Label>
-          <Label label="设备编号"><Input className="font-mono" name="device_id" required pattern="[a-f0-9]{64}" defaultValue={target?.device_id || ''} autoComplete="off" spellCheck={false} /></Label>
+          <div ><Input label={"访问地址"} type="url" name="address" required defaultValue={target ? entryAddress(target) : ''} /></div>
+          <div ><Input label={"设备编号"} className="font-mono" name="device_id" required pattern="[a-f0-9]{64}" defaultValue={target?.device_id || ''} autoComplete="off" spellCheck={false} /></div>
         </Details>
         <InlineError error={error || null} />
         <div className="flex flex-wrap justify-end gap-2"><Button type="submit" aria-busy={busy || undefined}><BusyIcon busy={busy} />下一步</Button></div>
       </fieldset></form>
     </>) : null
   const passphraseForm = open === 'passphrase' ? frame(KeyRound, '换恢复密码', <>
-      <p className="text-meta text-muted-foreground">{recoveryCopy.replaceHint}</p>
+      <p className="text-sm text-secondary">{recoveryCopy.replaceHint}</p>
       {/* A failed try keeps what was typed; a change to any field takes the old error away. */}
       <form className="grid gap-4" noValidate onChange={clear} onSubmit={(event) => {
         event.preventDefault(); const form = event.currentTarget
@@ -348,17 +349,17 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
           if (!only) close()
         }, recoveryCopy.replaced)
       }}><fieldset disabled={busy || !!device.review} className="grid gap-4">
-        <div className="grid gap-1.5 text-meta font-medium">恢复文件<FilePicker name="bundle" accept="application/json,.json" required /></div>
-        <Label label="旧密码"><PasswordInput name="old_password" autoComplete="off" required /></Label>
+        <div className="grid gap-1.5 text-sm font-medium">恢复文件<FilePicker name="bundle" accept="application/json,.json" required /></div>
+        <div ><PasswordInput label={"旧密码"} name="old_password" autoComplete="off" required /></div>
         <div className="grid gap-1.5">
-          <Label label="新密码"><PasswordInput name="password" autoComplete="new-password" required aria-describedby="new-password-strength" onChange={(event) => setPassword(event.target.value)} /></Label>
+          <div ><PasswordInput label={"新密码"} name="password" autoComplete="new-password" required aria-describedby="new-password-strength" onChange={(event) => setPassword(event.target.value)} /></div>
           <PasswordStrength id="new-password-strength" password={password} tried={tried} />
         </div>
         <InlineError error={error || null} />
         <div className="flex flex-wrap justify-end gap-2">{!only ? <Button type="button" variant="ghost" onClick={close}>取消</Button> : null}<Button type="submit" aria-busy={busy || undefined}><BusyIcon busy={busy} icon={Download} />换密码并下载新文件</Button></div>
       </fieldset></form>
     </>, PASSWORD_HASH) : null
-  const done = status ? <p role="status" className={only ? 'text-meta text-success' : 'px-4 py-3 text-meta text-success'}>{status}</p> : null
+  const done = status ? <p role="status" className={only ? 'text-sm text-success' : 'px-4 py-3 text-sm text-success'}>{status}</p> : null
   const unsaved = device.unsavedRecovery && !device.recovered ? <section className="grid gap-3 px-4 pt-1 pb-4 sm:ps-15"><UnsavedRecoveryFile landing={() => row.current} /></section> : null
   if (only) return <div className="grid gap-4">{restoreForm}{passphraseForm}{done}</div>
   // Finding devices again lives on the connection page: here it would start a real two-day recovery against this person's own devices.

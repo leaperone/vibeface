@@ -8,9 +8,9 @@ import { eraseSoleManagerText, soleManager, switchCopy } from '@vibeface/client/
 import { joinDestination } from '@vibeface/client/identity/switch-network.ts'
 import { ErrorText } from '@/components/action'
 import { Panel } from '@/components/kit'
-import { Button } from '@/components/ui/button'
-import { Icon } from '@/components/ui/icon'
-import { Text } from '@/components/ui/text'
+import { Button } from '@/components/arc/button'
+import { Icon } from '@/components/arc/icon'
+import { Text } from '@/components/arc/text'
 import { factoryReset } from '@/lib/factory-reset'
 import { keepSwitchedLink, openedLink } from '@/lib/join-link'
 import { useRun } from '@/lib/use-run'
@@ -41,13 +41,13 @@ export default function SwitchNetwork() {
   return <View className="gap-4 p-6">
     <Panel icon={ArrowRightLeft} title={switchCopy.title}>
       <Text>这个加入链接指向的网络不在当前已知设备中。换网络后仍需管理设备确认加入。</Text>
-      {target ? <Text selectable className="font-mono text-meta">{target.entryId}</Text> : <ErrorText error="没有有效的加入目标。取消后重新打开链接。" />}
+      {target ? <Text selectable className="font-mono text-sm">{target.entryId}</Text> : <ErrorText error="没有有效的加入目标。取消后重新打开链接。" />}
       {sole ? <View className="flex-row items-start gap-2"><Icon as={Crown} className="mt-1 text-warning" /><Text className="min-w-0 flex-1">{eraseSoleManagerText(self)}</Text></View> : null}
-      <Text className="text-muted-foreground">{switchCopy.erase(self)}</Text>
+      <Text className="text-muted">{switchCopy.erase(self)}</Text>
       <ErrorText error={error} />
       <View className="flex-row justify-end gap-2">
         <Button variant="ghost" onPress={() => router.back()}><Text>取消</Text></Button>
-        <Button variant="destructive" disabled={busy !== null || !matches()} onPress={() => void run('switch', change)}><Icon as={ArrowRightLeft} /><Text>{switchCopy.confirm}</Text></Button>
+        <Button variant="danger" disabled={busy !== null || !matches()} onPress={() => void run('switch', change)}><Icon as={ArrowRightLeft} /><Text>{switchCopy.confirm}</Text></Button>
       </View>
     </Panel>
   </View>

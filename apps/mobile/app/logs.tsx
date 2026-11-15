@@ -6,9 +6,9 @@ import { nodeName } from '@vibeface/client/workspace/labels.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { ErrorText } from '@/components/action'
 import { Details, EmptyState, Skeleton } from '@/components/kit'
-import { Button } from '@/components/ui/button'
-import { Icon } from '@/components/ui/icon'
-import { Text } from '@/components/ui/text'
+import { Button } from '@/components/arc/button'
+import { Icon } from '@/components/arc/icon'
+import { Text } from '@/components/arc/text'
 import { useRun } from '@/lib/use-run'
 import { useLive } from '@/data/live'
 
@@ -87,13 +87,13 @@ export default function Logs() {
   const works = [...shared.openWorks, ...(shared.data?.works ?? [])]
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-3 p-4 pb-10">
     <View className="flex-row items-center justify-between gap-3">
-      <Text className="text-meta text-muted-foreground">只读显示最近 100 条</Text>
-      <Button variant="ghost" size="icon" accessibilityLabel="刷新日志" disabled={busy !== null} onPress={() => void run('load', async () => setRecords((await readLogs({ limit: 100 })).reverse()))}>
+      <Text className="text-sm text-muted">只读显示最近 100 条</Text>
+      <Button variant="ghost" iconOnly accessibilityLabel="刷新日志" disabled={busy !== null} onPress={() => void run('load', async () => setRecords((await readLogs({ limit: 100 })).reverse()))}>
         <Icon as={RefreshCw} className={busy === 'load' ? 'animate-spin' : undefined} />
       </Button>
     </View>
     {error ? <ErrorText error={error} /> : null}
-    {records === null ? error ? null : <View className="gap-2"><Skeleton className="h-16 rounded-xl" /><Skeleton className="h-16 rounded-xl" /><Skeleton className="h-16 rounded-xl" /></View>
+    {records === null ? error ? null : <View className="gap-2"><Skeleton className="h-16 rounded-panel" /><Skeleton className="h-16 rounded-panel" /><Skeleton className="h-16 rounded-panel" /></View>
       : records.length ? records.map((record, index) => {
         const bot = record.conversation_id ? shared.bots.find((item) => item.conversation_id === record.conversation_id)?.name : undefined
         const work = record.work_id ? works.find((item) => item.work_id === record.work_id)?.title : undefined
@@ -109,31 +109,31 @@ function LogRow({ record, bot, work, computer }: { record: LogRecord; bot?: stri
   const quiet = external(record)
   const message = record.message !== title && /[一-鿿]/.test(record.message) ? record.message : undefined
   const fields = record.fields && Object.keys(record.fields).length ? JSON.stringify(record.fields, null, 2) : ''
-  return <View className="rounded-xl border border-border bg-card shadow-xs dark:border-line-strong">
+  return <View className="rounded-panel border border-border bg-surface  ">
     <View accessible accessibilityLabel={`${title}，${sourceLabels[record.source]}`} className="min-h-16 flex-row items-start gap-3 px-4 py-3">
-      <Icon as={quiet ? ScrollText : record.level === 'error' ? CircleX : record.level === 'warn' ? CircleAlert : ScrollText} className={quiet ? 'mt-0.5 size-4 text-muted-foreground' : record.level === 'error' ? 'mt-0.5 size-4 text-danger' : record.level === 'warn' ? 'mt-0.5 size-4 text-warning' : 'mt-0.5 size-4 text-muted-foreground'} />
+      <Icon as={quiet ? ScrollText : record.level === 'error' ? CircleX : record.level === 'warn' ? CircleAlert : ScrollText} className={quiet ? 'mt-0.5 size-4 text-muted' : record.level === 'error' ? 'mt-0.5 size-4 text-danger' : record.level === 'warn' ? 'mt-0.5 size-4 text-warning' : 'mt-0.5 size-4 text-muted'} />
       <View className="min-w-0 flex-1 gap-1">
         <Text className="font-medium">{title}</Text>
-        {message ? <Text numberOfLines={2} className="text-meta text-muted-foreground">{message}</Text> : null}
+        {message ? <Text numberOfLines={2} className="text-sm text-muted">{message}</Text> : null}
         <View className="flex-row flex-wrap gap-x-2 gap-y-0.5">
-          <Text className="text-meta text-muted-foreground">{timeOf(record.ts_ms)}</Text>
-          <Text className="text-meta text-muted-foreground">{sourceLabels[record.source]}</Text>
-          {typeof record.fields?.repeated === 'number' ? <Text className="text-meta text-muted-foreground">又出现 {record.fields.repeated} 次</Text> : null}
-          {bot ? <Text numberOfLines={1} className="max-w-[40%] text-meta text-muted-foreground">Bot · {bot}</Text> : null}
-          {work ? <Text numberOfLines={1} className="max-w-[40%] text-meta text-muted-foreground">任务 · {work}</Text> : null}
-          {computer ? <Text numberOfLines={1} className="max-w-[40%] text-meta text-muted-foreground">设备 · {computer}</Text> : null}
+          <Text className="text-sm text-muted">{timeOf(record.ts_ms)}</Text>
+          <Text className="text-sm text-muted">{sourceLabels[record.source]}</Text>
+          {typeof record.fields?.repeated === 'number' ? <Text className="text-sm text-muted">又出现 {record.fields.repeated} 次</Text> : null}
+          {bot ? <Text numberOfLines={1} className="max-w-[40%] text-sm text-muted">Bot · {bot}</Text> : null}
+          {work ? <Text numberOfLines={1} className="max-w-[40%] text-sm text-muted">任务 · {work}</Text> : null}
+          {computer ? <Text numberOfLines={1} className="max-w-[40%] text-sm text-muted">设备 · {computer}</Text> : null}
         </View>
       </View>
     </View>
     <Details label="技术详情">
       <View className="gap-1 px-4 pb-4">
-        <Text className="text-meta text-muted-foreground">级别 · {quiet ? '外部输出' : levelLabels[record.level]}</Text>
-        <Text selectable className="font-mono text-meta text-muted-foreground">事件 · {record.event}</Text>
-        {record.message !== title ? <Text selectable className="font-mono text-meta text-muted-foreground">原文 · {record.message}</Text> : null}
-        {record.conversation_id ? <Text selectable className="font-mono text-meta text-muted-foreground">对话 · {record.conversation_id}</Text> : null}
-        {record.work_id ? <Text selectable className="font-mono text-meta text-muted-foreground">任务 · {record.work_id}</Text> : null}
-        {record.thread_id ? <Text selectable className="font-mono text-meta text-muted-foreground">会话 · {record.thread_id}</Text> : null}
-        {fields ? <Text selectable className="max-h-64 rounded-lg bg-muted p-3 font-mono text-meta">{fields}</Text> : null}
+        <Text className="text-sm text-muted">级别 · {quiet ? '外部输出' : levelLabels[record.level]}</Text>
+        <Text selectable className="font-mono text-sm text-muted">事件 · {record.event}</Text>
+        {record.message !== title ? <Text selectable className="font-mono text-sm text-muted">原文 · {record.message}</Text> : null}
+        {record.conversation_id ? <Text selectable className="font-mono text-sm text-muted">对话 · {record.conversation_id}</Text> : null}
+        {record.work_id ? <Text selectable className="font-mono text-sm text-muted">任务 · {record.work_id}</Text> : null}
+        {record.thread_id ? <Text selectable className="font-mono text-sm text-muted">会话 · {record.thread_id}</Text> : null}
+        {fields ? <Text selectable className="max-h-64 rounded-control bg-surface-muted p-3 font-mono text-sm">{fields}</Text> : null}
       </View>
     </Details>
   </View>

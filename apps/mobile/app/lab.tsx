@@ -3,10 +3,10 @@ import { ScrollView, View } from 'react-native'
 import { useExperiments, experimentsCopy } from '@vibeface/client/lib/experiments.ts'
 import { ErrorText } from '@/components/action'
 import { SettingsGroup, SettingsRow } from '@/components/kit'
-import { Button } from '@/components/ui/button'
-import { Icon } from '@/components/ui/icon'
-import { Switch } from '@/components/ui/switch'
-import { Text } from '@/components/ui/text'
+import { Button } from '@/components/arc/button'
+import { Icon } from '@/components/arc/icon'
+import { Switch } from '@/components/arc/switch'
+import { Text } from '@/components/arc/text'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { mobilePlatform } from '@/platform'
 import { useLive } from '@/data/live'
@@ -25,7 +25,7 @@ export default function Lab() {
     const name = `vibeface-diagnostics-${new Date().toISOString().slice(0, 10)}.json`
     await files.save(new TextEncoder().encode(JSON.stringify(bundle ?? null)), name)
   }, '诊断包已交给系统保存。')
-  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
+  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-6 pb-12">
     <SettingsGroup title={experimentsCopy.group}>
       <SettingsRow href="/transfers" icon={ArrowRightLeft} label="文件传输" />
       <SettingsRow icon={FlaskConical} label={experimentsCopy.label} description={experiments ? experimentsCopy.on : experimentsCopy.hint}>
@@ -35,10 +35,10 @@ export default function Lab() {
     {canInspect ? <SettingsGroup title="问题排查">
       <SettingsRow href="/logs" icon={ScrollText} label="日志" />
       <SettingsRow icon={Download} label="诊断包" description="不含登录信息和加入链接">
-        <Button variant="outline" size="sm" disabled={busy !== null} onPress={exportDiagnostics}>
+        <Button variant="secondary" size="sm" disabled={busy !== null} onPress={exportDiagnostics}>
           <Icon as={busy === 'diagnostics' ? LoaderCircle : Download} /><Text>{busy === 'diagnostics' ? '导出中' : '导出'}</Text>
         </Button>
-        {status ? <Text role="status" className="basis-full ps-11 text-meta text-success">{status}</Text> : null}
+        {status ? <Text role="status" className="basis-full ps-11 text-sm text-success">{status}</Text> : null}
         {error ? <View className="basis-full ps-11"><ErrorText error={error} /></View> : null}
       </SettingsRow>
     </SettingsGroup> : null}

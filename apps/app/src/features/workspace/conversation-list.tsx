@@ -1,17 +1,19 @@
-import { Link } from "@tanstack/react-router"
-import { Bot, MessagesSquare, Plus, WifiOff } from "lucide-react"
-import type { ReactNode } from "react"
-import { CountBadge, EmptyState, PrimaryMark, Skeleton } from "@/components/app/kit"
-import { BotFace, botMood } from "@/components/app/bot-face"
-import { Button } from "@/components/ui/button"
+import { BotFace,botMood } from "@/components/app/bot-face"
+import { CountBadge,EmptyState,PrimaryMark,Skeleton } from "@/components/arc/product-kit"
+import { RoutedAction } from "@/components/arc/routed-action"
+import listStyles from "@/components/arc/task-compositions.module.css"
 import { AiOffHint } from "@/features/devices/ai-off-hint"
 import { SecondDeviceHint } from "@/features/devices/second-device"
-import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
-import { byRecent, listTime } from "@vibeface/client/workspace/home.ts"
-import { awaitsAnswer } from "@vibeface/client/workspace/questions.ts"
-import { unreadCounts } from "@vibeface/client/chat/timeline.ts"
-import { ConnectionCapsule, MoodTag, useCreateBot } from "./workspace-shell"
 import { cn } from "@/lib/utils"
+import { Link } from "@tanstack/react-router"
+import { unreadCounts } from "@vibeface/client/chat/timeline.ts"
+import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
+import { byRecent,listTime } from "@vibeface/client/workspace/home.ts"
+import { awaitsAnswer } from "@vibeface/client/workspace/questions.ts"
+import { Button } from "@vibeface/uiarc/button/button.tsx"
+import { Bot,MessagesSquare,Plus,WifiOff } from "lucide-react"
+import type { ReactNode } from "react"
+import { ConnectionCapsule,MoodTag,useCreateBot } from "./workspace-shell"
 
 /** The phone's home: channels, then every bot by its newest message; 任务 and 待处理 are tabs. */
 export function ConversationList() {
@@ -32,15 +34,15 @@ export function ConversationList() {
     </li>
   })}</ul>
   else if (!workspace.connectionOnline) list = <EmptyState icon={WifiOff} title="正在重连" />
-  else if (!workspace.synced) list = <div className="grid gap-2" aria-hidden="true">{[0, 1, 2].map((item) => <Skeleton key={item} className="h-16 rounded-xl" />)}</div>
+  else if (!workspace.synced) list = <div className="grid gap-2" aria-hidden="true">{[0, 1, 2].map((item) => <Skeleton key={item} className="h-16 rounded-panel" />)}</div>
   else list = <EmptyState icon={Bot} title="还没有 Bot" action={workspace.writable ? <Button type="button" onClick={create}><Plus aria-hidden="true" />新 Bot</Button> : undefined} />
-  return <div className="mx-auto grid w-full max-w-(--page-width) gap-2 max-md:-mx-3 max-md:w-auto">
-    <div className="flex items-center justify-between gap-3 px-3">
-      <h2 className="text-meta font-medium text-muted-foreground">频道</h2>
-      <Button asChild variant="ghost" size="sm"><Link to="/channels">管理频道</Link></Button>
+  return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
+    <div className={listStyles.listHeader}>
+      <h2 className="text-sm font-medium text-secondary">频道</h2>
+      <RoutedAction variant="ghost" size="sm" to="/channels">管理频道</RoutedAction>
     </div>
-    {(workspace.workspaceState?.channels ?? []).map((channel) => <Link key={channel.channel_id} to="/channels/$channelId" params={{ channelId: channel.channel_id }} className="flex min-h-14 items-center gap-3 rounded-xl px-3 py-2 interactive-row"><MessagesSquare aria-hidden="true" className="size-5 text-muted-foreground" /><span className="min-w-0 truncate font-medium">{channel.title}</span></Link>)}
-    <h2 className="mt-2 px-3 text-meta font-medium text-muted-foreground">Bot</h2>
+    {(workspace.workspaceState?.channels ?? []).map((channel) => <Link key={channel.channel_id} to="/channels/$channelId" params={{ channelId: channel.channel_id }} className={listStyles.conversationRow}><MessagesSquare aria-hidden="true" className="size-5 text-secondary" /><span className="min-w-0 truncate font-medium">{channel.title}</span></Link>)}
+    <h2 className="mt-2 px-3 text-sm font-medium text-secondary">Bot</h2>
     {list}
     <footer className="relative mt-6 grid gap-1 px-1 pt-2 before:absolute before:inset-x-3 before:top-0 before:border-t before:border-border md:hidden"><AiOffHint /><SecondDeviceHint /><ConnectionCapsule side="bottom" /></footer>
   </div>
@@ -49,15 +51,15 @@ export function ConversationList() {
 type RowProps = { botId: string; avatar: ReactNode; name: string; mark?: ReactNode; preview: string; unread: number; time?: string }
 
 function Row({ botId, avatar, name, mark, preview, unread, time }: RowProps) {
-  return <Link to="/b/$botId" params={{ botId }} className="flex min-h-16 items-center gap-3 interactive-row rounded-xl px-3 py-2.5">
+  return <Link to="/b/$botId" params={{ botId }} className={listStyles.conversationRow}>
     {avatar}
     <span className="grid min-w-0 flex-1 gap-0.5">
       <span className="flex min-w-0 items-center gap-2">
-        <span className="flex min-w-0 flex-1 items-center gap-1.5"><span className={cn("min-w-0 truncate", unread ? "font-semibold" : "font-medium")}>{name}</span>{mark}</span>
-        {time ? <span className="shrink-0 text-meta text-muted-foreground tabular-nums">{time}</span> : null}
+        <span className="flex min-w-0 flex-1 items-center gap-1.5"><span className={cn("min-w-0 truncate", unread ? "font-medium" : "font-medium")}>{name}</span>{mark}</span>
+        {time ? <span className="shrink-0 text-sm text-secondary tabular-nums">{time}</span> : null}
       </span>
       {preview || unread ? <span className="flex min-w-0 items-center gap-2">
-        <span className={cn("min-w-0 flex-1 truncate text-meta", unread ? "text-foreground" : "text-muted-foreground")}>{preview}</span>
+        <span className={cn("min-w-0 flex-1 truncate text-sm", unread ? "text-foreground" : "text-secondary")}>{preview}</span>
         {unread ? <CountBadge count={unread} label={`${unread} 条未读`} /> : null}
       </span> : null}
     </span>

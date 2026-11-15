@@ -1,22 +1,25 @@
-import { useEffect, useState, type ReactNode } from "react"
-import { Link, useNavigate } from "@tanstack/react-router"
-import { ArrowRightLeft, Check, ChevronRight, Copy, Info, Pencil, RadioTower, ShieldAlert, Smartphone, Tablet, X, type LucideIcon } from "lucide-react"
-import { cn } from "@/lib/utils"
-import { BusyIcon, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, toast, useAction } from "@/components/app/kit"
-import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
-import { useDevice } from "@vibeface/client/identity/context.tsx"
-import { addOnManager, anotherManager, editOnManager, deviceCopy, soleBrowserManagerText } from "@vibeface/client/identity/copy.ts"
-import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
-import { deviceForm, deviceOnline, isLoopback } from "@vibeface/client/workspace/labels.ts"
-import { terms } from "@/lib/glossary"
-import type { NodeInfo } from "@vibeface/client/workspace/types.ts"
-import { botReadiness } from "@vibeface/client/workspace/model.ts"
-import { entryAddress, throughEntry, type Member } from "@vibeface/client/lib/node.ts"
-import { AiSettings } from "./ai-settings"
-import { RelaySettings, ShareLink, relayLabel } from "./relay-settings"
-import { JoinRequests } from "./join"
+import { BusyIcon,DetailRow,EmptyState,InlineError,SettingsDisclosure,SettingsGroup,SettingsRow,Skeleton,toast,useAction } from "@/components/arc/product-kit"
+import { RoutedAction } from "@/components/arc/routed-action"
+import deviceStyles from "@/components/arc/task-compositions.module.css"
 import { localCopy } from "@/features/workspace/local-session"
+import { terms } from "@/lib/glossary"
+import { cn } from "@/lib/utils"
+import { Link,useNavigate } from "@tanstack/react-router"
+import { useDevice } from "@vibeface/client/identity/context.tsx"
+import { addOnManager,anotherManager,deviceCopy,editOnManager,soleBrowserManagerText } from "@vibeface/client/identity/copy.ts"
+import { entryAddress,throughEntry,type Member } from "@vibeface/client/lib/node.ts"
+import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
+import { deviceForm,deviceOnline,isLoopback } from "@vibeface/client/workspace/labels.ts"
+import { botReadiness } from "@vibeface/client/workspace/model.ts"
+import type { NodeInfo } from "@vibeface/client/workspace/types.ts"
+import { Button } from "@vibeface/uiarc/button/button.tsx"
+import { Input } from "@vibeface/uiarc/input/input.tsx"
+import { Switch } from "@vibeface/uiarc/switch/switch.tsx"
+import { ArrowRightLeft,Check,ChevronRight,Copy,Info,Pencil,RadioTower,ShieldAlert,Smartphone,Tablet,X,type LucideIcon } from "lucide-react"
+import { useEffect,useState,type ReactNode } from "react"
+import { AiSettings } from "./ai-settings"
+import { JoinRequests } from "./join"
+import { RelaySettings,ShareLink,relayLabel } from "./relay-settings"
 
 type DeviceRow = {
   id: string; name: string; kind: "node" | "client"; member?: Member; node?: NodeInfo
@@ -51,13 +54,13 @@ export function deviceIcon(row: Pick<DeviceRow, "kind" | "name">): LucideIcon {
 }
 
 function Tag({ children, title }: { children: ReactNode; title?: string }) {
-  return <span title={title} className="inline-flex shrink-0 items-center gap-1 rounded-md bg-muted px-1.5 text-meta text-muted-foreground">{children}</span>
+  return <span title={title} className="inline-flex shrink-0 items-center gap-1 rounded-control bg-surface-muted px-1.5 text-sm text-secondary">{children}</span>
 }
 
 /** `compact`: the list names only the exception, so an online row shows the dot alone. */
 function Online({ online, compact = false }: { online: boolean; compact?: boolean }) {
-  return <span title={compact && online ? "在线" : undefined} className={cn("flex shrink-0 items-center gap-1.5 text-meta", online ? "text-success" : "text-muted-foreground")}>
-    <span aria-hidden="true" className={cn("size-2 rounded-full", online ? "bg-success" : "border border-muted-foreground")} /><span className={cn(compact && online && "sr-only")}>{online ? "在线" : "离线"}</span>
+  return <span title={compact && online ? "在线" : undefined} className={cn("flex shrink-0 items-center gap-1.5 text-sm", online ? "text-success" : "text-secondary")}>
+    <span aria-hidden="true" className={cn("size-2 rounded-pill", online ? "bg-success" : "border border-strong")} /><span className={cn(compact && online && "sr-only")}>{online ? "在线" : "离线"}</span>
   </span>
 }
 
@@ -81,24 +84,24 @@ export function DevicesPage({ joins = true }: { joins?: boolean }) {
     {joins ? <JoinRequests /> : null}
     <InlineError error={error} action={{ label: "重试", onClick: () => { setError(null); device.refreshDirectory().catch(setError) } }} />
     {connected ? <section className="grid min-w-0 gap-6" aria-label="当前连接的电脑">
-      <header className="flex min-w-0 flex-wrap items-center gap-3 px-1">
-        <span className="grid size-11 shrink-0 place-items-center rounded-xl bg-muted"><terms.thisComputer.icon aria-hidden="true" className="size-5 text-muted-foreground" /></span>
+      <header className={deviceStyles.deviceTitle}>
+        <terms.thisComputer.icon aria-hidden="true" className="size-6 text-secondary" />
         <div className="grid min-w-0 flex-1 basis-32 gap-1">
-          <p className="text-meta text-muted-foreground">当前连接的电脑</p>
-          <h2 className="text-heading font-semibold [overflow-wrap:anywhere]">{connected.name}</h2>
+          <p className="text-sm text-secondary">当前连接的电脑</p>
+          <h2 className="text-lg font-medium [overflow-wrap:anywhere]">{connected.name}</h2>
           <div className="flex flex-wrap items-center gap-2"><Tag>{entryLabel}</Tag>{connected.online !== undefined ? <Online online={connected.online} /> : null}</div>
         </div>
-        <Button asChild variant="ghost" className="min-h-11 max-sm:size-11 max-sm:p-0"><Link to="/devices/$deviceId" params={{ deviceId: connected.id }} title="详细设置"><span className="max-sm:sr-only">详细设置</span><ChevronRight aria-hidden="true" /></Link></Button>
+        <RoutedAction variant="ghost" className="" to="/devices/$deviceId" params={{ deviceId: connected.id }} title="详细设置"><span className="max-sm:sr-only">详细设置</span><ChevronRight aria-hidden="true" /></RoutedAction>
       </header>
-      {canEdit ? <AiSettings key={connected.id} compact targetName={local ? undefined : connected.name} /> : <p className="px-1 text-meta text-muted-foreground">{editOnManager(rows.filter((row) => row.admin).map((row) => row.name))}</p>}
+      {canEdit ? <AiSettings key={connected.id} compact targetName={local ? undefined : connected.name} /> : <p className="px-1 text-sm text-secondary">{editOnManager(rows.filter((row) => row.admin).map((row) => row.name))}</p>}
     </section> : null}
     {!rows.length ? device.directory ? <EmptyState icon={terms.myDevices.icon} title="还没有设备" /> : <div className="grid gap-2" aria-busy="true"><Skeleton className="h-14" /><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
       : [{ title: "电脑", items: rows.filter((row) => row.kind === "node") }, { title: "手机与浏览器", items: rows.filter((row) => row.kind === "client") }].filter((group) => group.items.length).map((group) => <section key={group.title} className="grid gap-2">
-        <h2 className="px-1 text-meta font-medium text-muted-foreground">{group.title}</h2>
-        <ul className="divide-y overflow-hidden rounded-xl border bg-card shadow-xs">{group.items.map((row) => {
+        <h2 className="px-1 text-sm font-medium text-secondary">{group.title}</h2>
+        <ul className={deviceStyles.deviceGroup}>{group.items.map((row) => {
         const Icon = deviceIcon(row)
-        return <li key={row.id}><Link to="/devices/$deviceId" params={{ deviceId: row.id }} className="interactive-row flex min-h-14 items-center gap-3 px-4 py-2">
-          <Icon aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
+        return <li key={row.id}><Link to="/devices/$deviceId" params={{ deviceId: row.id }} className={deviceStyles.deviceRow}>
+          <Icon aria-hidden="true" className="size-5 shrink-0 text-secondary" />
           {/* On a phone the tag drops under the name, so the name keeps the width. */}
           <span className="flex min-w-0 flex-1 flex-col items-start gap-x-2 gap-y-0.5 sm:flex-row sm:items-center"><span className="line-clamp-2 min-w-0 font-medium [overflow-wrap:anywhere]">{row.name}</span>
             <span className="flex flex-wrap gap-1 empty:hidden">
@@ -108,11 +111,11 @@ export function DevicesPage({ joins = true }: { joins?: boolean }) {
             </span>
           </span>
           {row.online !== undefined ? <Online online={row.online} compact /> : null}
-          <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+          <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-secondary" />
         </Link></li>
       })}</ul></section>)}
     <SoleBrowserManager rows={rows} />
-    {device.ready && !device.ready.principal.can_manage && rows.length ? <p className="flex min-w-0 items-center gap-1.5 px-1 text-meta text-muted-foreground">
+    {device.ready && !device.ready.principal.can_manage && rows.length ? <p className="flex min-w-0 items-center gap-1.5 px-1 text-sm text-secondary">
       <terms.admin.icon aria-hidden="true" className="size-4 shrink-0" /><span className="min-w-0 truncate">{addOnManager(rows.filter((row) => row.admin).map((row) => row.name))}</span>
     </p> : null}
   </div>
@@ -130,7 +133,7 @@ function SoleBrowserManager({ rows }: { rows: DeviceRow[] }) {
   if (!ready?.principal.can_manage || !sole || sole.kind !== "client" || deviceForm(sole.kind, sole.name) !== "browser") return null
   const next = rows.find((row) => row.kind === "client" && !row.admin)
   const link = "hit-area relative shrink-0 font-medium text-foreground underline underline-offset-4"
-  return <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-1 text-meta text-warning">
+  return <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-1 text-sm text-warning">
     <ShieldAlert aria-hidden="true" className="size-4 shrink-0" />
     <span className="min-w-0">{soleBrowserManagerText(sole.browser ? "这个浏览器" : `「${sole.name}」`)}</span>
     {next
@@ -141,9 +144,9 @@ function SoleBrowserManager({ rows }: { rows: DeviceRow[] }) {
 
 /** Captioned like a settings group, so a device reads the same as 设置. `bare`: the content brings its own cards. */
 function Section({ title, bare = false, children }: { title: string; bare?: boolean; children: ReactNode }) {
-  return <section className="grid gap-2">
-    <h3 className="px-1 text-meta font-medium text-muted-foreground">{title}</h3>
-    {bare ? children : <div className="grid gap-4 rounded-xl border bg-card p-4 shadow-xs">{children}</div>}
+  return <section className={deviceStyles.section}>
+    <h3 className="text-lg font-medium">{title}</h3>
+    {bare ? children : <div className={deviceStyles.sectionBody}>{children}</div>}
   </section>
 }
 
@@ -153,12 +156,12 @@ function DeviceTitle({ row, editable }: { row: DeviceRow; editable: boolean }) {
   const action = useAction()
   const [draft, setDraft] = useState<string | null>(null)
   const close = () => { setDraft(null); action.clear() }
-  if (draft === null) return <h2 className="min-w-0 text-title font-semibold">
-    {editable ? <button type="button" className="group flex max-w-full min-w-0 items-center gap-2 rounded-md text-start" title="改名" onClick={() => setDraft(row.name)}>
+  if (draft === null) return <h2 className="min-w-0 text-xl font-medium">
+    {editable ? <Button variant="ghost" type="button" className="group flex max-w-full min-w-0 items-center gap-2 text-start" title="改名" onClick={() => setDraft(row.name)}>
       <span className="truncate">{row.name}</span>
-      <Pencil aria-hidden="true" className="size-4 shrink-0 text-muted-foreground opacity-60 transition-opacity group-hover:opacity-100" />
+      <Pencil aria-hidden="true" className="size-4 shrink-0 text-secondary opacity-60 transition-opacity group-hover:opacity-100" />
       <span className="sr-only">改名</span>
-    </button> : <span className="block truncate" title={row.name}>{row.name}</span>}
+    </Button> : <span className="block truncate" title={row.name}>{row.name}</span>}
   </h2>
   const save = () => {
     const name = draft.trim()
@@ -167,10 +170,10 @@ function DeviceTitle({ row, editable }: { row: DeviceRow; editable: boolean }) {
   }
   return <form className="grid gap-1" onSubmit={(event) => { event.preventDefault(); save() }}>
     <div className="flex min-w-0 items-center gap-1">
-      <Input aria-label="设备名称" autoFocus required maxLength={128} className="h-9 min-w-0 text-title font-semibold" value={draft} disabled={action.busy !== null}
+      <Input label={"设备名称"} aria-label="设备名称" autoFocus required maxLength={128} className="min-w-0" value={draft} disabled={action.busy !== null}
         onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Escape") close() }} />
-      <Button type="submit" variant="ghost" size="icon" aria-label="保存" title="保存" disabled={action.busy !== null || !draft.trim()}><BusyIcon busy={action.busy === "rename"} icon={Check} /></Button>
-      <Button type="button" variant="ghost" size="icon" aria-label="取消" title="取消" disabled={action.busy !== null} onClick={close}><X aria-hidden="true" /></Button>
+      <Button type="submit" variant="ghost" size="md" aria-label="保存" title="保存" disabled={action.busy !== null || !draft.trim()}><BusyIcon busy={action.busy === "rename"} icon={Check} /></Button>
+      <Button type="button" variant="ghost" size="md" aria-label="取消" title="取消" disabled={action.busy !== null} onClick={close}><X aria-hidden="true" /></Button>
     </div>
     {action.errorKey === "rename" ? <InlineError error={action.error} /> : null}
   </form>
@@ -193,14 +196,14 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
   const RemoveIcon = terms.remove.icon
   const canManage = ready?.principal.can_manage === true
   const localSession = ready?.principal.source === "local_session"
-  if (!row) return device.directory ? <EmptyState icon={terms.myDevices.icon} title="找不到这个设备" action={<Button asChild variant="outline"><Link to="/devices">回到设备列表</Link></Button>} /> : <div className="mx-auto grid w-full max-w-(--page-width) gap-4"><Skeleton className="h-16" /><Skeleton className="h-40" /></div>
+  if (!row) return device.directory ? <EmptyState icon={terms.myDevices.icon} title="找不到这个设备" action={<RoutedAction variant="secondary" to="/devices">回到设备列表</RoutedAction>} /> : <div className="mx-auto grid w-full max-w-(--page-width) gap-4"><Skeleton className="h-16" /><Skeleton className="h-40" /></div>
   const Icon = deviceIcon(row)
   const address = row.entry && ready ? entryAddress(ready.entry) : ""
   const target = device.entries.find((item) => item.device_id === row.id) ?? (ready && row.member ? throughEntry(ready.entry, row.id) : undefined)
 
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
     <header className="flex items-center gap-4">
-      <span className="grid size-12 shrink-0 place-items-center rounded-2xl bg-muted ring-1 ring-border"><Icon aria-hidden="true" className="size-6" /></span>
+      <span className="grid size-12 shrink-0 place-items-center rounded-panel bg-surface-muted  "><Icon aria-hidden="true" className="size-6" /></span>
       <div className="grid min-w-0 gap-1">
         <DeviceTitle row={row} editable={canManage && Boolean(row.member)} />
         <div className="flex flex-wrap items-center gap-2">
@@ -209,11 +212,11 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
           {row.browser && entryName ? <Tag title={`连在「${entryName}」上`}><terms.thisComputer.icon aria-hidden="true" className="size-3.5" />{entryName}</Tag> : null}
           {row.admin ? <Tag title={terms.admin.label}><terms.admin.icon aria-hidden="true" className="size-3.5" />{terms.admin.tag}</Tag> : null}
         </div>
-        {row.online === false ? <p className="text-meta text-muted-foreground">{entryName && !row.entry ? `确认它开着，并且能连到「${entryName}」` : deviceCopy.offline}</p> : null}
+        {row.online === false ? <p className="text-sm text-secondary">{entryName && !row.entry ? `确认它开着，并且能连到「${entryName}」` : deviceCopy.offline}</p> : null}
       </div>
     </header>
 
-    {copied ? <p className="flex items-start gap-2 rounded-xl border border-warning-border bg-warning-soft p-3 text-warning">
+    {copied ? <p className="flex items-start gap-2 rounded-panel border border-warning-border bg-warning-subtle p-3 text-warning">
       <Copy aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
       <span>{row.entry ? "它的数据被复制过，已暂停。在另一台设备上移除它，再重新加入。" : canManage ? "它的数据被复制过。移除它，再在那台电脑上重新加入。" : "它的数据被复制过。用管理设备移除它，再重新加入。"}</span>
     </p> : null}
@@ -221,24 +224,22 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
     {row.kind === "node" && !copied ? row.entry && (canManage || localSession) ? <Section title={terms.ai.label} bare><AiSettings /></Section> : <Section title={terms.ai.label}>
       <div className="grid gap-1">
         <p>{deviceCopy.botStatus[deviceCopy.botState(row.bot, row.online)]}</p>
-        {canManage && target ? <Button type="button" variant="outline" className="mt-2 w-fit" disabled={action.busy !== null} onClick={() => void action.run("switch", () => device.connect(target))}><ArrowRightLeft aria-hidden="true" />切换到它</Button>
-          : <p className="text-meta text-muted-foreground">{canManage ? "连到它后才能修改" : editOnManager(rows.filter((item) => item.admin).map((item) => item.name))}</p>}
+        {canManage && target ? <Button type="button" variant="secondary" className="mt-2 w-fit" disabled={action.busy !== null} onClick={() => void action.run("switch", () => device.connect(target))}><ArrowRightLeft aria-hidden="true" />切换到它</Button>
+          : <p className="text-sm text-secondary">{canManage ? "连到它后才能修改" : editOnManager(rows.filter((item) => item.admin).map((item) => item.name))}</p>}
         {action.errorKey === "switch" ? <InlineError error={action.error} /> : null}
       </div>
     </Section> : null}
 
     {row.entry ? <Section title="在哪能打开">
       {isLoopback(address) || !address.startsWith("https:")
-        ? <p className="flex items-center gap-2"><terms.thisComputer.icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />只能在{isLoopback(address) ? "这" : "那"}台电脑上打开</p>
-        : <p className="flex items-center gap-2"><terms.address.icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />在哪都能打开</p>}
+        ? <p className="flex items-center gap-2"><terms.thisComputer.icon aria-hidden="true" className="size-4 shrink-0 text-secondary" />只能在{isLoopback(address) ? "这" : "那"}台电脑上打开</p>
+        : <p className="flex items-center gap-2"><terms.address.icon aria-hidden="true" className="size-4 shrink-0 text-secondary" />在哪都能打开</p>}
       {canManage || localSession ? <div className="grid gap-2 border-t pt-3">
         <label className="flex min-h-11 items-center justify-between gap-3">
-          <span className="grid gap-0.5"><span>{isLoopback(address) ? "在这台电脑上免加入打开" : "在那台电脑上免加入打开"}</span><span className="text-meta text-muted-foreground">{localCopy.note}</span></span>
-          <input type="checkbox" role="switch" className="switch" checked={device.localAutoAccess === true} aria-describedby="local-access-risk"
-            disabled={action.busy !== null || device.localAutoAccess === null || localSession && !device.localAutoAccess}
-            onChange={(event) => { const enabled = event.target.checked; void action.run("local", () => device.setLocalAutoAccess(enabled), "已保存") }} />
+          <span className="grid gap-0.5"><span>{isLoopback(address) ? "在这台电脑上免加入打开" : "在那台电脑上免加入打开"}</span><span className="text-sm text-secondary">{localCopy.note}</span></span>
+          <Switch checked={device.localAutoAccess === true} aria-describedby="local-access-risk" disabled={action.busy !== null || device.localAutoAccess === null || localSession && !device.localAutoAccess} onCheckedChange={next => { const checked = next === true;  const enabled = checked; void action.run("local", () => device.setLocalAutoAccess(enabled), "已保存")  }} />
         </label>
-        <p id="local-access-risk" className={cn("flex items-center gap-1.5 text-meta", device.localAutoAccess ? "text-warning" : "text-muted-foreground")}>
+        <p id="local-access-risk" className={cn("flex items-center gap-1.5 text-sm", device.localAutoAccess ? "text-warning" : "text-secondary")}>
           <ShieldAlert aria-hidden="true" className="size-4 shrink-0" />{isLoopback(address) ? "这" : "那"}台电脑上的人和程序不用批准就能看对话、改设置、替你回 Bot
         </p>
       </div> : null}
@@ -255,19 +256,17 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
         description={unmanaging ? deviceCopy.unmanageNote(rows.filter((item) => item.admin && item.id !== row.id).length) : deviceCopy.manageHint}>
         {unmanaging ? <>
           <Button type="button" size="sm" variant="ghost" autoFocus onClick={() => setUnmanaging(false)}>取消</Button>
-          <Button type="button" size="sm" variant="destructive" disabled={action.busy !== null} aria-busy={action.busy === "manage" || undefined} onClick={() => void action.run("manage", async () => { await device.setManage(row.id, false); setUnmanaging(false) }, "已取消管理")}>
+          <Button type="button" size="sm" variant="danger" disabled={action.busy !== null} aria-busy={action.busy === "manage" || undefined} onClick={() => void action.run("manage", async () => { await device.setManage(row.id, false); setUnmanaging(false) }, "已取消管理")}>
             <BusyIcon busy={action.busy === "manage"} />{deviceCopy.unmanage}
           </Button>
-        </> : <input type="checkbox" role="switch" className="switch" aria-label={terms.admin.label} checked={row.admin}
-          disabled={action.busy !== null || row.admin && !rows.some((item) => item.admin && item.id !== row.id)}
-          onChange={(event) => { if (!event.target.checked) setUnmanaging(true); else void action.run("manage", () => device.setManage(row.id, true), "已设为管理设备") }} />}
+        </> : <Switch aria-label={terms.admin.label} checked={row.admin} disabled={action.busy !== null || row.admin && !rows.some((item) => item.admin && item.id !== row.id)} onCheckedChange={next => { const checked = next === true;  if (!checked) setUnmanaging(true); else void action.run("manage", () => device.setManage(row.id, true), "已设为管理设备")  }} />}
       </SettingsRow>
       {action.errorKey === "manage" ? <div className="px-4 py-3"><InlineError error={action.error} /></div> : null}
     </SettingsGroup> : null}
 
     <SettingsGroup>
       <SettingsDisclosure icon={Info} label="详细信息">
-        <div className="grid gap-3 text-meta text-muted-foreground">
+        <div className="grid gap-3 text-sm text-secondary">
           {address ? <DetailRow label={terms.address.label} value={address} mono /> : null}
           <DetailRow label="设备编号" value={row.id} mono />
         </div>
@@ -275,7 +274,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
       {canManage && row.member && !row.entry && !row.browser ? <SettingsRow icon={RemoveIcon} tone="danger" label={terms.remove.label} description={removing ? deviceCopy.removeNotice(Boolean(row.bot)) : undefined} stacked onClick={removing ? undefined : () => setRemoving(true)}>
         {removing ? <>
           <Button type="button" size="sm" variant="ghost" onClick={() => setRemoving(false)}>取消</Button>
-          <Button type="button" size="sm" variant="destructive" disabled={action.busy !== null} aria-busy={action.busy === "remove" || undefined} onClick={() => void action.run("remove", async () => { await device.revoke(row.id); toast(`已移除「${row.name}」`, { tone: "success" }); void navigate({ to: "/devices" }) })}>
+          <Button type="button" size="sm" variant="danger" disabled={action.busy !== null} aria-busy={action.busy === "remove" || undefined} onClick={() => void action.run("remove", async () => { await device.revoke(row.id); toast(`已移除「${row.name}」`, { tone: "success" }); void navigate({ to: "/devices" }) })}>
             <BusyIcon busy={action.busy === "remove"} />移除
           </Button>
         </> : null}

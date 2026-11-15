@@ -15,6 +15,7 @@ if ! command -v pnpm >/dev/null; then
 fi
 pnpm install --frozen-lockfile --filter "vibeface-web..." --filter "vibeface-mobile..."
 node "$repo/scripts/check-uiarc-build.mjs"
+node "$repo/scripts/check-uiarc-native.cjs"
 pnpm run generate-routes
 pnpm run test
 pnpm run typecheck

@@ -12,15 +12,14 @@ import { projectName, workApproval } from '@vibeface/client/workspace/questions.
 import { workChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
 import { ActionButton, ErrorText } from '@/components/action'
 import { CopyableId, Details, EmptyState, providerIcons, toneText, type Tone } from '@/components/kit'
-import { Button } from '@/components/ui/button'
-import { Icon } from '@/components/ui/icon'
-import { Text } from '@/components/ui/text'
+import { Button } from '@/components/arc/button'
+import { Icon } from '@/components/arc/icon'
+import { Text } from '@/components/arc/text'
 import { useLive } from '@/data/live'
 import { QuestionCard } from '@/features/chat/question-card'
 import { ConfirmCard } from '@/features/chat/work'
 import { cn } from '@/lib/utils'
 import { Composer } from '@/features/chat/composer'
-import { useChatChrome } from '@/features/chat/chrome'
 import { InputStatus } from '@/features/workspace/workspace'
 import type { WorkDetail } from '@vibeface/client/workspace/types.ts'
 import { promptIntent } from '@vibeface/client/chat/protocol.ts'
@@ -37,7 +36,6 @@ export default function TaskDetailRoute() {
 
 function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
   const shared = useLive()
-  const chrome = useChatChrome()
   const { directory, ready } = useDevice()
   const router = useRouter()
   const bot = shared?.bots.find((item) => item.bot_id === botId)
@@ -80,7 +78,7 @@ function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
   const work = loaded ? { ...loaded, target: loaded.target ?? undefined } : null
   if (!shared || !bot || !work) return <><Stack.Screen options={{ title: '任务' }} /><EmptyState icon={ListChecks}
     title={readError ?? (!shared || !shared.connectionOnline ? '工作状态未知，连接后再读取' : !bot ? '找不到这个 Bot' : '正在读取工作')}
-    action={shared?.connectionOnline && bot ? <Button variant="outline" onPress={() => setRetry((value) => value + 1)}><Text>重新读取</Text></Button> : undefined} className="flex-1 justify-center" /></>
+    action={shared?.connectionOnline && bot ? <Button variant="secondary" onPress={() => setRetry((value) => value + 1)}><Text>重新读取</Text></Button> : undefined} className="flex-1 justify-center" /></>
 
   const lookup = { nodes: shared.nodes, directory }
   const asking = workApproval({ work, conversationId: bot.conversation_id, questions: shared.questions, answered: shared.answered })
@@ -110,24 +108,24 @@ function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
   // A work whose result is unknown may still write; new input waits until the result is checked.
   const inputPaused = !canContinue && (!work.outcome || unknown || work.outcome === "unverified")
   const inputIntent = canContinue || inputPaused ? promptIntent(text) : "new_task"
-  return <KeyboardAwareScrollView keyboardShouldPersistTaps="handled" bottomOffset={16} contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
+  return <KeyboardAwareScrollView keyboardShouldPersistTaps="handled" bottomOffset={16} contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-6 pb-12">
     <Stack.Screen options={{ title: work.title || '任务' }} />
     <Button variant="ghost" className="self-start" accessibilityLabel={`打开所属 Bot ${bot.name}`} onPress={() => router.push(`/b/${bot.bot_id}`)}><Icon as={Bot} /><Text>{bot.name}</Text></Button>
-    <Text className="text-meta text-muted-foreground">来源：共享历史中的工作记录。完整执行历史未提供。</Text>
+    <Text className="text-sm text-muted">来源：共享历史中的工作记录。完整执行历史未提供。</Text>
     <Button variant="ghost" className="self-start" disabled={!shared.connectionOnline} onPress={() => setRetry((value) => value + 1)}><Text>重新读取工作</Text></Button>
-    {!shared.synced || !shared.connectionOnline ? <Text className="text-meta text-warning">{!shared.connectionOnline ? '连接已断开，显示最近记录；当前状态未知。' : '当前连接尚未完成首读，显示已知记录。'}</Text> : null}
-    {readError ? <View className="gap-2"><Text className="text-danger">{readError}</Text><Button variant="outline" className="self-start" onPress={() => setRetry((value) => value + 1)}><Text>重新读取</Text></Button></View> : null}
+    {!shared.synced || !shared.connectionOnline ? <Text className="text-sm text-warning">{!shared.connectionOnline ? '连接已断开，显示最近记录；当前状态未知。' : '当前连接尚未完成首读，显示已知记录。'}</Text> : null}
+    {readError ? <View className="gap-2"><Text className="text-danger">{readError}</Text><Button variant="secondary" className="self-start" onPress={() => setRetry((value) => value + 1)}><Text>重新读取</Text></Button></View> : null}
     <View className="gap-1">
-      {taskStale(state, shared.connectionOnline && shared.synced) ? <Text className="font-medium text-muted-foreground">{staleTaskLabel}</Text> : <Text className={cn('font-medium', toneText[tone(state)])}>{taskLabel(state)}</Text>}
+      {taskStale(state, shared.connectionOnline && shared.synced) ? <Text className="font-medium text-muted">{staleTaskLabel}</Text> : <Text className={cn('font-medium', toneText[tone(state)])}>{taskLabel(state)}</Text>}
       {device || work.cwd || agent ? <View className="flex-row flex-wrap items-center gap-x-3 gap-y-1">
         {agent ? <Meta icon={providerIcons[agent]} label="AI">{providerNames[agent]}</Meta> : null}
         {device ? <Meta icon={Laptop} label="设备">{nodeName(device, lookup)}</Meta> : null}
         {work.cwd ? <Meta icon={FolderOpen} label="项目">{projectName(work.cwd)}</Meta> : null}
       </View> : null}
-      {progress?.status && active && progress.status !== 'awaiting_input' && progressLabel(progress.status) !== '进行中' ? <Text className="text-meta text-muted-foreground">{progressLabel(progress.status)}</Text> : null}
+      {progress?.status && active && progress.status !== 'awaiting_input' && progressLabel(progress.status) !== '进行中' ? <Text className="text-sm text-muted">{progressLabel(progress.status)}</Text> : null}
       {plan ? <Details label={`最近步骤摘要 · ${plan.length}`} open={active}><SummarySteps steps={plan} /></Details> : !progress?.text && work.summary && active ? <Text selectable className="mt-2">{work.summary}</Text> : null}
-      {progress?.text ? <ScrollView nestedScrollEnabled className="mt-3 max-h-96 rounded-xl bg-muted" contentContainerClassName="p-3">
-        <Text selectable className="font-mono text-meta">{progress.text}</Text>
+      {progress?.text ? <ScrollView nestedScrollEnabled className="mt-3 max-h-96 rounded-panel bg-surface-muted" contentContainerClassName="p-3">
+        <Text selectable className="font-mono text-sm">{progress.text}</Text>
       </ScrollView> : null}
     </View>
     {work.kind === 'task' ? <Details label="协调回合">
@@ -135,7 +133,7 @@ function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
         <Text>{!shared.connectionOnline || !shared.synced || shared.nodes.find((node) => node.device_id === device)?.online === false ? '当前状态未知，显示最近记录' : schedulerStatus(coordination.state).label}{coordination.lane ? ` · ${agentLaneLabels[coordination.lane]}` : ''}</Text>
         {coordination.hold_reason ? <Text>{queueHoldLabels[coordination.hold_reason]}</Text> : null}
       </> : <Text>执行设备尚未提供这个任务的协调回合观察。</Text>}
-      <Text className="text-meta text-muted-foreground">这里显示 Bot 的准备和排队情况，任务结果仍以上面的共享记录为准。</Text>
+      <Text className="text-sm text-muted">这里显示 Bot 的准备和排队情况，任务结果仍以上面的共享记录为准。</Text>
     </Details> : null}
     {asked.summary ? <Section title="交代的事"><Text selectable>{asked.summary}</Text></Section> : null}
     {result && !active ? <Section title={!failed && (work.result_text || state === 'completed') ? '结果' : '原因'}><Text selectable className={cn(failed && 'text-danger')}>{result}</Text></Section> : null}
@@ -143,16 +141,16 @@ function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
     {asking ? <QuestionCard key={asking.question_id} question={asking} inTask /> : null}
     {canStop && sharing.length ? <Section title="会一起停止">
       {sharing.map((item) => <View key={item.work_id} className="flex-row items-center gap-2">
-        <Icon as={Link2} className="size-4 text-muted-foreground" /><Text numberOfLines={1} className="shrink">{item.title || '任务'}</Text>
+        <Icon as={Link2} className="size-4 text-muted" /><Text numberOfLines={1} className="shrink">{item.title || '任务'}</Text>
       </View>)}
     </Section> : null}
-    {canStop ? <ActionButton variant="outline" className="self-start" icon={Square} iconClassName="fill-foreground" disabled={!shared.writable} action={() => shared.interruptWork(work.work_id)}>
+    {canStop ? <ActionButton variant="secondary" className="self-start" icon={Square} iconClassName="fill-foreground" disabled={!shared.writable} action={() => shared.interruptWork(work.work_id)}>
       {sharing.length ? `一起停止 ${sharing.length + 1} 个任务` : '停止任务'}
     </ActionButton> : null}
-    {failed && device && fixOnDevice(work) ? <Button variant="outline" className="self-start" onPress={() => router.push(device === ready?.entry.device_id ? '/ai' : `/device/${device}`)}>
+    {failed && device && fixOnDevice(work) ? <Button variant="secondary" className="self-start" onPress={() => router.push(device === ready?.entry.device_id ? '/ai' : `/device/${device}`)}>
       <Icon as={Settings} /><Text>{fixOnDeviceLabel(nodeName(device, lookup))}</Text>
     </Button> : null}
-    {failed || unknown || state === 'interrupted' ? <ActionButton variant="outline" className="self-start" icon={followUpIcons[next]} disabled={!shared.writable}
+    {failed || unknown || state === 'interrupted' ? <ActionButton variant="secondary" className="self-start" icon={followUpIcons[next]} disabled={!shared.writable}
       action={async () => {
         if (unknown) { await shared.refresh(); setRetry((value) => value + 1); return }
         let revision: number | undefined
@@ -172,12 +170,12 @@ function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
       {work.failure_reason && rawError(work.failure_reason) ? <Detail label="原始错误">{work.failure_reason}</Detail> : null}
       {work.cwd ? <Detail label="文件夹" mono>{work.cwd}</Detail> : null}
       <View className="gap-0.5">
-        <Text className="text-meta text-muted-foreground">任务编号</Text>
+        <Text className="text-sm text-muted">任务编号</Text>
         <CopyableId value={work.work_id} label="任务编号" />
       </View>
     </Details>
     {shared.pendingMessages.filter((item) => item.target.kind === 'work' && item.target.work_id === workId).map((item) => <InputStatus key={item.message_id} pending={item} />)}
-    <Composer chrome={chrome} value={text} onChange={setText} files={files} onFiles={setFiles} attachmentScope={JSON.stringify([ready?.principal.network_id ?? '', conversationId, ['work', workId]])} blocked={inputPaused ? (unknown || work.outcome === 'unverified' ? '先让 Bot 查结果，再继续。' : '这个工作当前不能接收补充。') : shared.canSaveMessages ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读'} sending={false} label={inputIntent === 'continue' ? `补充给 ${work.title || '这个工作'}` : '发送为新任务'} sendLabel={inputIntent === 'continue' ? '补充这个工作' : '发送为新任务'} onSend={() => {
+    <Composer value={text} onChange={setText} files={files} onFiles={setFiles} attachmentScope={JSON.stringify([ready?.principal.network_id ?? '', conversationId, ['work', workId]])} blocked={inputPaused ? (unknown || work.outcome === 'unverified' ? '先让 Bot 查结果，再继续。' : '这个工作当前不能接收补充。') : shared.canSaveMessages ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读'} sending={false} label={inputIntent === 'continue' ? `补充给 ${work.title || '这个工作'}` : '发送为新任务'} sendLabel={inputIntent === 'continue' ? '补充这个工作' : '发送为新任务'} onSend={() => {
       const submittedDraft = draft
       if (savingDrafts.current.has(submittedDraft)) return
       savingDrafts.current.add(submittedDraft)
@@ -196,27 +194,27 @@ const steps: Record<SummaryStep['state'], { icon: LucideIcon; label: string }> =
 
 function SummarySteps({ steps: items }: { steps: SummaryStep[] }) {
   return <View className="gap-2">{items.map((item, index) => <View key={index} accessible accessibilityLabel={`${steps[item.state].label} ${item.text}`} className="flex-row items-start gap-2">
-    <Icon as={steps[item.state].icon} className={cn('mt-0.5 size-4', item.state === 'done' ? 'text-success' : item.state === 'current' ? 'text-info' : 'text-muted-foreground')} /><Text selectable className="min-w-0 flex-1">{item.text}</Text>
+    <Icon as={steps[item.state].icon} className={cn('mt-0.5 size-4', item.state === 'done' ? 'text-success' : item.state === 'current' ? 'text-info' : 'text-muted')} /><Text selectable className="min-w-0 flex-1">{item.text}</Text>
   </View>)}</View>
 }
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return <View className="gap-2">
-    <Text role="heading" className="text-heading font-semibold">{title}</Text>
+    <Text role="heading" className="text-lg font-medium">{title}</Text>
     {children}
   </View>
 }
 
 function Meta({ icon, label, children }: { icon: LucideIcon; label: string; children: string }) {
   return <View accessible accessibilityLabel={`${label} ${children}`} className="min-w-0 shrink flex-row items-center gap-1">
-    <Icon as={icon} className="size-4 text-muted-foreground" />
-    <Text numberOfLines={1} className="shrink text-meta text-muted-foreground">{children}</Text>
+    <Icon as={icon} className="size-4 text-muted" />
+    <Text numberOfLines={1} className="shrink text-sm text-muted">{children}</Text>
   </View>
 }
 
 function Detail({ label, mono, children }: { label: string; mono?: boolean; children: string }) {
   return <View className="gap-0.5">
-    <Text className="text-meta text-muted-foreground">{label}</Text>
-    <Text selectable className={cn(mono && 'font-mono text-meta')}>{children}</Text>
+    <Text className="text-sm text-muted">{label}</Text>
+    <Text selectable className={cn(mono && 'font-mono text-sm')}>{children}</Text>
   </View>
 }

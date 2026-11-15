@@ -14,11 +14,11 @@ import { joinCopy } from '@vibeface/client/identity/copy.ts'
 import { recoveryTarget } from '@vibeface/client/identity/recovery-link.ts'
 import { ErrorText } from '@/components/action'
 import { Panel, SafetyCode, Skeleton } from '@/components/kit'
-import { Button } from '@/components/ui/button'
-import { Icon } from '@/components/ui/icon'
-import { Input } from '@/components/ui/input'
-import { Text } from '@/components/ui/text'
-import { Textarea } from '@/components/ui/textarea'
+import { Button } from '@/components/arc/button'
+import { Icon } from '@/components/arc/icon'
+import { Input } from '@/components/arc/input'
+import { Text } from '@/components/arc/text'
+import { Textarea } from '@/components/arc/textarea'
 import { useWorkspace } from '@/data/context'
 import { Scanner } from '@/features/devices/scanner'
 import { RecoveredStep, RecoveryRestore, RecoveryReview, RecoveryWaiting } from '@/features/recovery/recovery'
@@ -41,7 +41,7 @@ export default function JoinScreen() {
   const choosing = device.phase !== 'key_lost' && !device.review && !recovering && session.phase !== 'joining'
   // The safe-area view is not Uniwind-wrapped, so its size goes in `style`.
   return <SafeAreaView style={{ flex: 1 }}>
-    <KeyboardAwareScrollView bottomOffset={24} contentContainerClassName="w-full max-w-md grow gap-6 self-center px-4 py-12" keyboardShouldPersistTaps="handled">
+    <KeyboardAwareScrollView bottomOffset={24} contentContainerClassName="w-full max-w-md grow gap-6 self-center px-6 py-12" keyboardShouldPersistTaps="handled">
       {/* The name holds the open space; the actions sit low, where the thumb is. */}
       <View className="min-h-24 flex-1 justify-center">
         <Animated.View layout={move}><Wordmark /></Animated.View>
@@ -73,20 +73,20 @@ function Wordmark() {
       <Rect width={64} height={64} rx={16} fill={foreground} />
       <Path d="M19 21l13 24 13-24" fill="none" stroke={background} strokeWidth={6.5} strokeLinecap="round" strokeLinejoin="round" />
     </Svg>
-    <Text role="heading" className="text-title font-semibold tracking-tight">Vibeface</Text>
+    <Text role="heading" className="text-xl font-medium tracking-tight">Vibeface</Text>
   </View>
 }
 
 /** A first phone with no computer yet: Vibeface runs on a computer first, and its 添加设备 brings the phone in. */
 function NoComputer() {
   return <Pressable accessibilityRole="link" onPress={() => void openURL(joinCopy.installGuide).catch(() => {})}
-    className="-mx-3 min-h-14 flex-row items-center gap-2 rounded-lg px-4 py-2 active:bg-muted">
+    className="-mx-3 min-h-14 flex-row items-center gap-2 rounded-control px-4 py-2 active:bg-surface-muted">
     <Icon as={Laptop} />
     <View className="min-w-0 flex-1">
       <Text className="font-medium">{joinCopy.noComputer}</Text>
-      <Text className="text-meta text-muted-foreground">{joinCopy.installFirst}</Text>
+      <Text className="text-sm text-muted">{joinCopy.installFirst}</Text>
     </View>
-    <Icon as={ExternalLink} className="size-4 text-muted-foreground" />
+    <Icon as={ExternalLink} className="size-4 text-muted" />
   </Pressable>
 }
 
@@ -95,7 +95,7 @@ function LostKey() {
   const device = useDevice()
   const { busy, error, run } = useRun()
   return <Panel icon={ShieldAlert} title="需要重新加入">
-    <Text className="text-muted-foreground">{self}保存的登录信息不见了。</Text>
+    <Text className="text-muted">{self}保存的登录信息不见了。</Text>
     <ErrorText error={error} />
     <Button className="self-start" disabled={busy !== null} onPress={() => void run('restart', device.replaceLostKey)}><Text>重新开始</Text></Button>
   </Panel>
@@ -151,27 +151,27 @@ function JoinForm() {
   const failure = error || (edited ? '' : device.error)
   // Scanning leads; once there is a link it shrinks to one line, and the name and 加入 take over.
   if (ready) return <View className="gap-4">
-    <View className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
-      <Icon as={Link2} className="text-muted-foreground" />
+    <View className="min-h-11 flex-row items-center gap-2 rounded-control bg-surface-muted/60 ps-3">
+      <Icon as={Link2} className="text-muted" />
       <Text className="min-w-0 flex-1">{joinCopy.linkFilled}</Text>
-      <Button variant="ghost" size="icon" accessibilityLabel="清除链接" onPress={() => edit('')}><Icon as={X} /></Button>
+      <Button variant="ghost" iconOnly accessibilityLabel="清除链接" onPress={() => edit('')}><Icon as={X} /></Button>
     </View>
     <View className="gap-2">
-      <Text className="text-meta font-medium text-muted-foreground">{joinCopy.deviceName}</Text>
+      <Text className="text-sm font-medium text-muted">{joinCopy.deviceName}</Text>
       <Input accessibilityLabel={joinCopy.deviceName} value={name} onChangeText={setName} maxLength={64} />
     </View>
     <ErrorText error={failure} />
     <Button disabled={busy || !name.trim()} onPress={submit}><Text>{busy ? joinCopy.joining : joinCopy.join}</Text></Button>
   </View>
   return <View className="gap-4">
-    <Text role="heading" className="text-heading font-semibold">连接你的网络</Text>
-    <Text className="text-meta text-muted-foreground">{joinCopy.linkSource()}</Text>
+    <Text role="heading" className="text-lg font-medium">连接你的网络</Text>
+    <Text className="text-sm text-muted">{joinCopy.linkSource()}</Text>
     <ErrorText error={failure} />
     <Button onPress={() => setScanning(true)}><Icon as={Camera} /><Text>{joinCopy.scan}</Text></Button>
     <View className="gap-2">
-      <Text className="text-meta font-medium text-muted-foreground">{joinCopy.byLink}</Text>
+      <Text className="text-sm font-medium text-muted">{joinCopy.byLink}</Text>
       <Textarea accessibilityLabel="加入链接" placeholder={joinCopy.paste} autoCapitalize="none" autoCorrect={false} numberOfLines={4}
-        className="min-h-20 font-mono text-meta" value={invitation} onChangeText={edit} />
+        className="min-h-20 font-mono text-sm" value={invitation} onChangeText={edit} />
       {invalid ? <ErrorText error={joinCopy.notLink} /> : null}
       <Paste onText={(text) => edit(text.trim())} />
     </View>
@@ -180,7 +180,7 @@ function JoinForm() {
 
 /** iOS's own paste control reads the clipboard without asking each time; elsewhere a button reads it. */
 function Paste({ onText }: { onText: (text: string) => void }) {
-  const [fill, ink] = useCSSVariable(['--muted', '--foreground']) as [string, string]
+  const [fill, ink] = useCSSVariable(['--surface-muted', '--foreground']) as [string, string]
   if (Clipboard.isPasteButtonAvailable) return <Clipboard.ClipboardPasteButton acceptedContentTypes={['plain-text', 'url']} backgroundColor={fill} foregroundColor={ink}
     cornerStyle="medium" style={{ alignSelf: 'flex-start', height: 44, width: 104 }} onPress={(data) => { if (data.type === 'text') onText(data.text) }} />
   return <Button variant="ghost" className="-ms-3 self-start" onPress={async () => onText(await Clipboard.getStringAsync())}>
@@ -190,10 +190,10 @@ function Paste({ onText }: { onText: (text: string) => void }) {
 
 function Waiting({ code, admin, reached, error, reconnecting, onCancel }: { code: string | null; admin?: string; reached: boolean; error: string; reconnecting: boolean; onCancel: () => void }) {
   return <Panel icon={Hourglass} title={joinCopy.waiting}>
-    {reached ? <View className="flex-row items-center gap-2"><Icon as={ShieldCheck} className="size-4 text-success" /><Text className="text-meta text-muted-foreground">{joinCopy.reached}</Text></View> : null}
-    <Text role="status" className="text-muted-foreground">{code ? joinCopy.compareCode(admin) : joinCopy.showCode}</Text>
+    {reached ? <View className="flex-row items-center gap-2"><Icon as={ShieldCheck} className="size-4 text-success" /><Text className="text-sm text-muted">{joinCopy.reached}</Text></View> : null}
+    <Text role="status" className="text-muted">{code ? joinCopy.compareCode(admin) : joinCopy.showCode}</Text>
     {code ? <SafetyCode code={code} /> : <Skeleton className="h-8 w-40" />}
-    {reconnecting ? <Text className="text-meta text-muted-foreground">连接已断开，正在重连；批准后仍会继续完成加入。</Text> : null}
+    {reconnecting ? <Text className="text-sm text-muted">连接已断开，正在重连；批准后仍会继续完成加入。</Text> : null}
     <ErrorText error={error} />
     <Button variant="ghost" className="-ms-3 self-start" onPress={onCancel}><Text>取消</Text></Button>
   </Panel>

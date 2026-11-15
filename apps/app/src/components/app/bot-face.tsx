@@ -1,13 +1,13 @@
 "use client"
 
-import { useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } from "react"
-import { colors, faceOf, HALO, oklch, pose, thinkingDots, type Mood } from "@vibeface/client/avatar/face.ts"
-import { ASLEEP, faceMotion, type Frame } from "@vibeface/client/avatar/motion.ts"
+import { cn } from "@/lib/utils"
+import { colors,faceOf,HALO,pose,thinkingDots,type Mood } from "@vibeface/client/avatar/face.ts"
 import { moodOf } from "@vibeface/client/avatar/mood.ts"
+import { ASLEEP,faceMotion,type Frame } from "@vibeface/client/avatar/motion.ts"
 import type { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { questionOpen } from "@vibeface/client/workspace/questions.ts"
 import type { BotRecord } from "@vibeface/client/workspace/types.ts"
-import { cn } from "@/lib/utils"
+import { useEffect,useId,useMemo,useRef,useState,useSyncExternalStore } from "react"
 
 /**
  * One clock for every face in view. It stops while the tab is hidden or the system asks for reduced motion; a face
@@ -32,18 +32,10 @@ const followReduced = (change: () => void) => {
 }
 const followDark = (change: () => void) => {
   const observer = new MutationObserver(change)
-  observer.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] })
+  observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] })
   return () => observer.disconnect()
 }
-export const useDark = () => useSyncExternalStore(followDark, () => document.documentElement.classList.contains("dark"), () => false)
-
-/** A bot's face hue as a solid fill with legible ink on it, a soft edge for outlines, and a bright glow that stays that hue when faded, so its chat's accents read as that bot's. Same numbers as the phone app. */
-export function botTint(hue: number, dark: boolean) {
-  const glow = oklch(0.74, 0.14, hue)
-  return dark
-    ? { fill: oklch(0.78, 0.09, hue), ink: oklch(0.2, 0.03, hue), edge: oklch(0.42, 0.05, hue), glow }
-    : { fill: oklch(0.45, 0.1, hue), ink: "#fff", edge: oklch(0.86, 0.04, hue), glow }
-}
+export const useDark = () => useSyncExternalStore(followDark, () => document.documentElement.dataset.theme === "dark", () => false)
 
 function apply(frame: Frame, parts: { g: SVGGElement; ring: SVGPathElement; body: SVGPathElement; grey: SVGPathElement; left: SVGPathElement; right: SVGPathElement; dots: SVGCircleElement[] }) {
   parts.g.setAttribute("transform", transformOf(frame))
