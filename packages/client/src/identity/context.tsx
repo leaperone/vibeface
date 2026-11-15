@@ -271,7 +271,12 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   const [link, setLinkState] = useState<Link>({ kind: 'booting' })
   const linkRef = useRef<Link>({ kind: 'booting' })
   const [entrances, setEntrances] = useState<OpenEntrance[]>([])
-  const seen = useRef<Vector>({})
+  const watermarks = useRef(new Map<string, Vector>())
+  function watermark(networkId: string): Vector {
+    let vector = watermarks.current.get(networkId)
+    if (!vector) { vector = {}; watermarks.current.set(networkId, vector) }
+    return vector
+  }
   const switching = useRef(false)
   const pendingEntrance = useRef<Reconnect | null>(null)
   /** Nodes advertising on the app's LAN right now. */
@@ -364,10 +369,11 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     active.info = parseInfo(await request('info'))
     if (active.info.network_id !== principal.network_id) throw new AuthenticationError('设备授权已改变。重新连接再试。')
     setInfo(active.info)
-    const subscribed = record(await request('subscribe', { vector: { ...seen.current } }))
+    const seen = watermark(principal.network_id)
+    const subscribed = record(await request('subscribe', { vector: { ...seen } }))
     if (session.current !== active || active.generation !== generation.current) throw changed()
-    const lagging = behind(seen.current, subscribed.vector)
-    absorb(seen.current, subscribed.vector)
+    const lagging = behind(seen, subscribed.vector)
+    absorb(seen, subscribed.vector)
     if (principal.source === 'membership' && active.entry.kind === 'local') active.entry = { kind: 'gateway', address: active.entry.address, device_id: active.entry.device_id }
     setLocalAutoAccessState(typeof verified.auth.local_auto_access === 'boolean' ? verified.auth.local_auto_access : null)
     store(`network-for.${active.entry.device_id}`, principal.network_id)
@@ -407,8 +413,10 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   }
   /** While the entry catches up with what this page already showed, ask again until it has. */
   async function checkCaughtUp(active: Session) {
-    const subscribed = record(await callSession(active, 'subscribe', { vector: { ...seen.current } }))
-    if (!behind(seen.current, subscribed.vector)) { absorb(seen.current, subscribed.vector); step({ type: 'caught-up' }) }
+    if (!active.networkId) return
+    const seen = watermark(active.networkId)
+    const subscribed = record(await callSession(active, 'subscribe', { vector: { ...seen } }))
+    if (!behind(seen, subscribed.vector)) { absorb(seen, subscribed.vector); step({ type: 'caught-up' }) }
   }
   /** Tries the entry that dropped, then the other entrances by last success; backs off when all fail. */
   function scheduleReconnect(immediate = false) {

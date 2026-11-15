@@ -166,7 +166,7 @@ export const isReplyEnded = (state: string) => isJobState(state) && jobStates[st
 export const isTerminalJobState = (state: string) => isReplyEnded(state) || state === 'steered'
 export type ManagerJob = {
   trigger: string
-  state: string
+  state: JobState
   scope: SessionScope
   into?: { provider: ProviderId; attempt_id: string; thread_id: string; turn_id: string }
   receipt?: { accepted_at_ms: number; actual_turn_id: string | null }
@@ -187,7 +187,7 @@ export type ManagerJob = {
   source_node?: string
 }
 export type ScopeJob = {
-  conversation_id: string; trigger: string; scope: SessionScope; state: string; sequence: number
+  conversation_id: string; trigger: string; scope: SessionScope; state: JobState; sequence: number
   kind: 'human' | 'answer' | 'work_result' | 'agent_task' | 'workspace_task' | 'schedule' | 'bot_message'
   lane: AgentLane; source_node: string; owner: string | null; message_id: string | null; reply_message_id: string
   hold_reason?: QueueHoldReason
@@ -223,7 +223,8 @@ export type MemoryConflict = {
   expected_revision: string; actual_revision: string; reason: string
 }
 export type ConversationMemoryConflict = MemoryConflict & { history_id: string }
-export type SteerOutcome = 'answered' | 'unfinished' | 'unknown'
+export const steerOutcomes = ['answered', 'unfinished', 'unknown'] as const
+export type SteerOutcome = typeof steerOutcomes[number]
 export type SchedulerSnapshot = {
   jobs: ManagerJob[]
   local_jobs: ManagerJob[]

@@ -175,7 +175,7 @@ test('retry requires explicit not-started evidence and an affirmative job receip
   const runtime: TurnRuntime = { provider: 'claude', model: null, reasoning_effort: null, generation: 'g', session_generation: 1, delivery_id: 'd', stage: 'turn_start', execution: 'not_started', attempted_at_ms: 1, switched_from: null, switch_reason: null }
   const job: ManagerJob = { scope: { kind: 'main' }, trigger: 'm', state: 'failed', retryable: true, runtime }
   assert.equal(canRetryJob(job), true)
-  for (const changed of [{ ...job, runtime: null }, { ...job, pending_check: true }, { ...job, retryable: false }, { ...job, state: 'reconciling' }, { ...job, runtime: { ...runtime, execution: 'unknown' as const } }, { ...job, runtime: { ...runtime, execution: 'started' as const } }]) assert.equal(canRetryJob(changed), false)
+  for (const changed of [{ ...job, runtime: null }, { ...job, pending_check: true }, { ...job, retryable: false }, { ...job, state: 'reconciling' }, { ...job, runtime: { ...runtime, execution: 'unknown' as const } }, { ...job, runtime: { ...runtime, execution: 'started' as const } }] satisfies ManagerJob[]) assert.equal(canRetryJob(changed), false)
   assert.deepEqual(parseTurnRuntime(runtime), runtime)
   assert.throws(() => parseTurnRuntime({ ...runtime, execution: 'maybe' }))
   const progress = { kind: 'assignment_progress', assignment_id: 'assignment', revision: 1, state: 'accepted' }

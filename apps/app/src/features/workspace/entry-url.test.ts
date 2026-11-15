@@ -3411,8 +3411,10 @@ test('context shows scheduler observations without promising native resume or re
   const collaboration = componentHarness('./collaboration-panel.tsx', { ...dependencies,
     '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/lib/node.ts': { providerNames }, '@/features/devices/ai-settings': { providerIcons: { codex: 'CodexIcon' } },
   })
+  assert.throws(() => parseConversation({ ...context, scheduler: { scope_jobs: [], unanswered: [],
+    jobs: [{ scope: { kind: 'main' }, trigger: 'message:unsupported', state: 'future' }] } }))
   const records = parseConversation({ ...context,
-    scheduler: { scope_jobs: [], jobs: [{ scope: { kind: 'main' as const }, trigger: 'message:q', state: 'queued' }, { scope: { kind: 'main' as const }, trigger: 'message:p', state: 'publishing' }, { scope: { kind: 'main' as const }, trigger: 'message:u', state: 'future' }, { scope: { kind: 'main' as const }, trigger: 'message:d', state: 'completed' }], unanswered: [] },
+    scheduler: { scope_jobs: [], jobs: [{ scope: { kind: 'main' as const }, trigger: 'message:q', state: 'queued' }, { scope: { kind: 'main' as const }, trigger: 'message:p', state: 'publishing' }, { scope: { kind: 'main' as const }, trigger: 'message:u', state: 'unknown' }, { scope: { kind: 'main' as const }, trigger: 'message:d', state: 'completed' }], unanswered: [] },
     sessions: [{ node: 'worker', agent: 'codex', session_id: 'external', cwd: '/shared', summary: '外部摘要', muted: true, created_at_ms: 1 }],
     sent: [{ message_id: 'sent', to: 'chat', text: '协作请求', created_at_ms: 2 }],
   })
@@ -4350,7 +4352,7 @@ test('native chat folds runtime diagnostics and retains result checks without pr
     if (typeof toggle?.props.onPress === 'function') toggle.props.onPress()
     details.render('Details', row.props)
     assert.match(componentText(details.output), /Codex · 提交模型 submitted-model · 提交推理强度 high · 记录结果/)
-    for (const current of [{ ...job, state: 'reconciling' }, { ...job, state: 'failed', pending_check: true }]) {
+    for (const current of [{ ...job, state: 'reconciling' }, { ...job, state: 'failed', pending_check: true }] satisfies ManagerJob[]) {
       shared.data.scheduler!.jobs = [current]
       const cards = render().cards
       assert.equal(cards.length, 1)

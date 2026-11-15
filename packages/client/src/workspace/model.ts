@@ -1,7 +1,7 @@
 import type { Attachment, MessageRequest, PendingMessage, TranscriptMessage } from "../chat/types.ts"
 import type { OutboxItem } from "../lib/outbox.ts"
 import { array, boolean, isRecord, isSafeInteger, isText, parseProviderReadiness } from "../lib/node.ts"
-import { providerStages, type ProviderStage, type TurnRuntime } from "./types.ts"
+import { isJobState, providerStages, steerOutcomes, type ProviderStage, type TurnRuntime } from "./types.ts"
 import type { ReplyStatus } from "../chat/types.ts"
 import type {
   ConversationMemoryConflict, ConversationHistory, HistoryCoverage, HistoryPage, HistorySection, DeliveryRecord, AnswerResult, BotReadiness, CloseReason, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionChoice, QuestionSubject, SessionHandoff, Severity, TriageSettings,
@@ -363,24 +363,35 @@ function scopeJob(value: unknown): ScopeJob {
   const data = record(value), kind = data.kind, lane = agentLane(data.lane)
   if (kind !== 'human' && kind !== 'answer' && kind !== 'work_result' && kind !== 'agent_task' && kind !== 'workspace_task' && kind !== 'schedule' && kind !== 'bot_message') throw new Error('目标任务的触发类型无法识别。')
   if (!lane) throw new Error('目标任务缺少任务通道。')
-  return { conversation_id: text(data.conversation_id), trigger: text(data.trigger), kind, scope: parseSessionScope(data.scope), state: text(data.state), sequence: number(data.sequence), lane, source_node: text(data.source_node), owner: data.owner === null ? null : text(data.owner), message_id: data.message_id === null ? null : text(data.message_id), reply_message_id: text(data.reply_message_id), ...(data.hold_reason == null ? {} : { hold_reason: queueHold(data.hold_reason) }) }
+  return { conversation_id: text(data.conversation_id), trigger: text(data.trigger), kind, scope: parseSessionScope(data.scope), state: jobState(data.state), sequence: number(data.sequence), lane, source_node: text(data.source_node), owner: data.owner === null ? null : text(data.owner), message_id: data.message_id === null ? null : text(data.message_id), reply_message_id: text(data.reply_message_id), ...(data.hold_reason == null ? {} : { hold_reason: queueHold(data.hold_reason) }) }
 }
 function sentCoverage(value: unknown): SentCoverage {
   const data = record(value)
   if (data.scope !== 'main') throw new Error('Bot 发出消息的来源范围无法确认。')
   return { scope: data.scope, omitted_unknown: number(data.omitted_unknown) }
 }
+function jobState(value: unknown) {
+  const state = text(value)
+  if (!isJobState(state)) throw new Error('任务状态无法识别。')
+  return state
+}
+function steerOutcome(value: unknown): SteerOutcome | undefined {
+  if (value == null) return undefined
+  const outcome = steerOutcomes.find(candidate => candidate === value)
+  if (outcome === undefined) throw new Error('补充结果状态无法识别。')
+  return outcome
+}
 function managerJob(value: unknown): ManagerJob {
   const job = record(value)
   const into = job.into == null ? null : record(job.into), receipt = job.receipt == null ? null : record(job.receipt)
-  return { trigger: text(job.trigger), state: text(job.state), scope: parseSessionScope(job.scope), lane: agentLane(job.lane), hold_reason: queueHold(job.hold_reason),
+  return { trigger: text(job.trigger), state: jobState(job.state), scope: parseSessionScope(job.scope), lane: agentLane(job.lane), hold_reason: queueHold(job.hold_reason),
     ...(into ? { into: { provider: provider(into.provider), attempt_id: text(into.attempt_id), thread_id: text(into.thread_id), turn_id: text(into.turn_id) } } : {}),
     ...(receipt ? { receipt: { accepted_at_ms: number(receipt.accepted_at_ms), actual_turn_id: receipt.actual_turn_id == null ? null : text(receipt.actual_turn_id) } } : {}),
     ...(job.uncertain === undefined ? {} : { uncertain: flag(job.uncertain) }),
     message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id),
     failure: job.failure == null ? undefined : { kind: failureKind(record(job.failure).kind) ?? 'unknown', detail: text(record(job.failure).detail) },
     runtime: parseTurnRuntime(job.runtime), retryable: job.retryable === true && recordOrNull(job.runtime)?.execution === 'not_started' && job.pending_check !== true,
-    pending_check: job.pending_check === true, outcome: optionalText(job.outcome) as SteerOutcome | undefined, source_node: optionalText(job.source_node),
+    pending_check: job.pending_check === true, outcome: steerOutcome(job.outcome), source_node: optionalText(job.source_node),
     ...(job.context === undefined ? {} : { context: contextProjection(job.context) }),
   }
 }
@@ -958,12 +969,18 @@ function botSettings(value: unknown): BotSettings {
     ...(data.memory_conflicts === undefined ? {} : { memory_conflicts: conversationMemoryConflicts(data.memory_conflicts) }),
   }
 }
+function artifactPageRange(data: Record<string, unknown>, hash: string, offset: number) {
+  const size = number(data.size)
+  const next_offset = data.next_offset === null ? null : number(data.next_offset)
+  if (data.blob_hash !== hash || data.offset !== offset || offset < 0 || offset > size) throw new Error("产物读取响应与原请求不符。")
+  if (next_offset !== null && (next_offset <= offset || next_offset > size)) throw new Error("产物分页位置无效。")
+  return { size, next_offset }
+}
 export function parseBinaryPage(value: unknown, hash: string, offset: number) {
   const data = record(value)
-  const size = number(data.size)
+  const { size, next_offset } = artifactPageRange(data, hash, offset)
   const bytes = Uint8Array.from(atob(text(data.data)), (char) => char.charCodeAt(0))
-  const next_offset = data.next_offset === null ? null : number(data.next_offset)
-  if (data.blob_hash !== hash || data.offset !== offset || bytes.length !== (next_offset ?? size) - offset) throw new Error("下载内容与原请求不符。")
+  if (bytes.length !== (next_offset ?? size) - offset) throw new Error("下载内容与原请求不符。")
   return { bytes, next_offset, size }
 }
 
@@ -998,10 +1015,8 @@ export function signedOrder(files: readonly Attachment[]) {
 
 export function parseArtifactPage(value: unknown, hash: string, offset: number) {
   const data = record(value)
-  const size = number(data.size), content = text(data.text)
-  if (data.blob_hash !== hash || data.offset !== offset || offset > size) throw new Error("产物读取响应与原请求不符。")
-  const next_offset = data.next_offset === null ? null : number(data.next_offset)
-  if (next_offset !== null && (next_offset <= offset || next_offset > size || !content)) throw new Error("产物分页位置无效。")
+  const { size, next_offset } = artifactPageRange(data, hash, offset)
+  const content = text(data.text)
   if (new TextEncoder().encode(content).length !== (next_offset ?? size) - offset) throw new Error("产物分页内容不完整。")
   return { text: content, offset, next_offset, size }
 }
