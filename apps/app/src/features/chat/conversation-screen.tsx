@@ -409,7 +409,7 @@ function TaskMeta({ device, here, label, agent, className = '' }: { device: stri
   const by = agent ? providerNames[agent] : ''
   const Agent = agent ? providerIcons[agent] : null
   const dot = <span aria-hidden="true">·</span>
-  return <span className={`flex min-w-0 shrink-0 items-center gap-1 text-muted-foreground ${className}`}>
+  return <span className={`flex min-w-0 max-w-full items-center gap-1 text-muted-foreground ${className}`}>
     <span aria-hidden="true" className="hidden @sm:inline">·</span>
     {Agent ? <><Agent aria-hidden="true" className="size-3.5 shrink-0" /><span className="shrink-0">{by}</span>{dot}</> : null}
     {here ? <span className="sr-only">{device}</span> : <><Laptop aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">{device}</span>{dot}</>}
