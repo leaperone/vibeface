@@ -1,0 +1,213 @@
+{
+  "repository": "https://github.com/WheatXie/uiarc-pro-reverse",
+  "commit": "859606819c68787b2dccb54adcb9b08bd3272d5d",
+  "items": [
+    "alert",
+    "avatar",
+    "badge",
+    "button",
+    "card",
+    "checkbox",
+    "dialog",
+    "drawer",
+    "empty-state",
+    "input",
+    "popover",
+    "progress",
+    "scroll-area",
+    "segmented-control",
+    "select",
+    "skeleton",
+    "switch",
+    "tabs",
+    "textarea",
+    "toast",
+    "tooltip"
+  ],
+  "files": {
+    "alert/alert.module.css": {
+      "path": "src/components/arc/alert/alert.module.css",
+      "sha256": "ce86d259fa778a5b1a7e0881285759fa35889b6cde73ea678e26a49f3122d439"
+    },
+    "alert/alert.tsx": {
+      "path": "src/components/arc/alert/alert.tsx",
+      "sha256": "ddcd481e2ebc6a1cbf6f053d6de1817d5dfd40b347e0bea561cc9fda2ea54950"
+    },
+    "avatar/avatar.module.css": {
+      "path": "src/components/arc/avatar/avatar.module.css",
+      "sha256": "7a24bd77c83d3c14ac2c90905dc7d64eea7b60e8bf6eddd2e5d30dd6c96bd816"
+    },
+    "avatar/avatar.tsx": {
+      "path": "src/components/arc/avatar/avatar.tsx",
+      "sha256": "94c22aa1f558a72d3dae928b35516fe182c296636cc8c24ea9fee194718e166c"
+    },
+    "badge/badge.module.css": {
+      "path": "src/components/arc/badge/badge.module.css",
+      "sha256": "31709106e0035932ef72eafc7a035c24e468d314e6bb64c5d65efe4df907718c"
+    },
+    "badge/badge.tsx": {
+      "path": "src/components/arc/badge/badge.tsx",
+      "sha256": "c0927a45e77f340acc01d24b7b95b6097f81a4f9c2ddf99c79fa9de75fbe60b2"
+    },
+    "button/button.module.css": {
+      "path": "src/components/arc/button/button.module.css",
+      "sha256": "77323140c3f9fbad7b08dddba0db7260aa233c34c39a9d24cfa646fea287e140"
+    },
+    "button/button.tsx": {
+      "path": "src/components/arc/button/button.tsx",
+      "sha256": "d051d08351db8059c249ed92e8e5c8319ed812e1537d88b281815ffa4c17f1bb"
+    },
+    "card/card.module.css": {
+      "path": "src/components/arc/card/card.module.css",
+      "sha256": "70bd80f3f6245f519691edf4e4c4217d99fb477cf9a1305ba1e3a5b1111f5dea"
+    },
+    "card/card.tsx": {
+      "path": "src/components/arc/card/card.tsx",
+      "sha256": "1e82f064e152aefefb9b34e89e019cca31919ce9ddcd84b480a88775fd4ad638"
+    },
+    "checkbox/checkbox.module.css": {
+      "path": "src/components/arc/checkbox/checkbox.module.css",
+      "sha256": "6cc8ae35edbd99dac2ea3768a6db0932429ecb06febab06e048a4b94974251b6"
+    },
+    "checkbox/checkbox.tsx": {
+      "path": "src/components/arc/checkbox/checkbox.tsx",
+      "sha256": "4759251a0b2a83320cb4078e840f61481a23be0b38b9aa7c077c2e85e6dde00d"
+    },
+    "dialog/dialog.module.css": {
+      "path": "src/components/arc/dialog/dialog.module.css",
+      "sha256": "a71ce7476732e9a996ddf6f765585cd2c7fab6168b8715bad464916c0a36168d"
+    },
+    "dialog/dialog.tsx": {
+      "path": "src/components/arc/dialog/dialog.tsx",
+      "sha256": "eb84a7eb2ac864dc07f2825eab252eac78e9c6b889d0e9f00bf6b2b799975ade"
+    },
+    "drawer/drawer.module.css": {
+      "path": "src/components/arc/drawer/drawer.module.css",
+      "sha256": "f0bbe416307a5203eefea97940c22952914d92f8a906ecc1e4b201da10f13e01"
+    },
+    "drawer/drawer.tsx": {
+      "path": "src/components/arc/drawer/drawer.tsx",
+      "sha256": "eca310cb947c8da843f1128a77a2683c4e031519081da8c08d7ee405e5bbd87a"
+    },
+    "empty-state/empty-state.module.css": {
+      "path": "src/components/arc/empty-state/empty-state.module.css",
+      "sha256": "e65e4c4b6e3bd31b8925cb6a5d58e8c4826ffca6efb100f786c70428f98afc1a"
+    },
+    "empty-state/empty-state.tsx": {
+      "path": "src/components/arc/empty-state/empty-state.tsx",
+      "sha256": "e99e39c02b03e77738e8e8a69d12f24b6e9d5b3b66f12f1425cec32700fa69ef"
+    },
+    "foundation.css": {
+      "path": "src/components/arc/foundation.css",
+      "sha256": "a30519d85c44722973cc328d3797800944396387d3c93a1a1297c18d1a4d3d86"
+    },
+    "input/input.module.css": {
+      "path": "src/components/arc/input/input.module.css",
+      "sha256": "ef6716aa7b9f45898859735f416ac932517b94e66bed6b3d23d7aed180529bdf"
+    },
+    "input/input.tsx": {
+      "path": "src/components/arc/input/input.tsx",
+      "sha256": "16a4e761b51482e9c066f284a38171085e71ae390e4b26f9f0c18dd8af21c8f2"
+    },
+    "lib/arc-provider.tsx": {
+      "path": "src/components/arc/lib/arc-provider.tsx",
+      "sha256": "bcc7358163968a9508d81586134bf8d921d75783033182f81ca9015985815884"
+    },
+    "lib/motion-tokens.ts": {
+      "path": "src/components/arc/lib/motion-tokens.ts",
+      "sha256": "bec65d2e1b180dd3c574edc60cf84e0fa336e7ff8640eba0c70bcf0ae765fb8a"
+    },
+    "motion-tokens.ts": {
+      "path": "src/components/arc/motion-tokens.ts",
+      "sha256": "81235a2bf09738ff9ad8d49ab50631d6a31541838dbc84414f8d97544c2fde73"
+    },
+    "popover/popover.module.css": {
+      "path": "src/components/arc/popover/popover.module.css",
+      "sha256": "6b92cdac211568a53a81b1d84bcbd0728cec93f741e64074f7e9f91f673702f6"
+    },
+    "popover/popover.tsx": {
+      "path": "src/components/arc/popover/popover.tsx",
+      "sha256": "c564d1974bc55e805cb92e37ab0d5dbf48b46429353981985f50adab2c93ff4c"
+    },
+    "progress/progress.module.css": {
+      "path": "src/components/arc/progress/progress.module.css",
+      "sha256": "f0e527c419a7ebd3f9dd7faf49244fe87ea47e5153fed9f8e50fd83fd61d11a7"
+    },
+    "progress/progress.tsx": {
+      "path": "src/components/arc/progress/progress.tsx",
+      "sha256": "53f96b8e42315c9c261338bd96f74d74f6db22b5de935ae3ec02e20cfb64ae1e"
+    },
+    "scroll-area/scroll-area.module.css": {
+      "path": "src/components/arc/scroll-area/scroll-area.module.css",
+      "sha256": "904fdc63e0f818ad95ea148637dcbdd3e1a7c29408928fae2126f26abdf21bbb"
+    },
+    "scroll-area/scroll-area.tsx": {
+      "path": "src/components/arc/scroll-area/scroll-area.tsx",
+      "sha256": "82c53c56af335d0a6d808ecd4cbb3c97e8fa83ca56ccd35f71605ae8dd8b0891"
+    },
+    "segmented-control/segmented-control.module.css": {
+      "path": "src/components/arc/segmented-control/segmented-control.module.css",
+      "sha256": "029f038c7f03762cf386554f5e59768a95e6f5c8eb8b459bf3ef56cef35d1788"
+    },
+    "segmented-control/segmented-control.tsx": {
+      "path": "src/components/arc/segmented-control/segmented-control.tsx",
+      "sha256": "9e1a4bc135246c86ed2d8875a3a1266490aa38a3d7800759db630e700188e840"
+    },
+    "select/select.module.css": {
+      "path": "src/components/arc/select/select.module.css",
+      "sha256": "f700250cfa39db22e974f417d6d776e70b037e031500ca85c3c94e0c558a2b04"
+    },
+    "select/select.tsx": {
+      "path": "src/components/arc/select/select.tsx",
+      "sha256": "673dc0c887a255c87bfbabd1835606d87cfbf59ed6fd4909a28038f00f673eaa"
+    },
+    "skeleton/skeleton.module.css": {
+      "path": "src/components/arc/skeleton/skeleton.module.css",
+      "sha256": "ba4b3fa1d7f9df341c4c3a5e302d43178015f15030715ddb3ced2116cecf0588"
+    },
+    "skeleton/skeleton.tsx": {
+      "path": "src/components/arc/skeleton/skeleton.tsx",
+      "sha256": "73b97715698fa54f6f0eaeefb6a8d795977297dd998439d1e595361e5da6d3b5"
+    },
+    "switch/switch.module.css": {
+      "path": "src/components/arc/switch/switch.module.css",
+      "sha256": "3793e7ee1a4c2db46fce615c3fd76212c3c78ea005e23ae07c24b53453c1b6f7"
+    },
+    "switch/switch.tsx": {
+      "path": "src/components/arc/switch/switch.tsx",
+      "sha256": "6ab95cb9c0aaa80599cdc0605abf959a20f5030fe4ecdf57f6894274a9c5d73b"
+    },
+    "tabs/tabs.module.css": {
+      "path": "src/components/arc/tabs/tabs.module.css",
+      "sha256": "573e4a572e884b5f184efe731f2955341bb56f7ff640d2d01e3a409456ce4469"
+    },
+    "tabs/tabs.tsx": {
+      "path": "src/components/arc/tabs/tabs.tsx",
+      "sha256": "3b0aaf6f0c41ce486e697ee3c9c86ce874fb2a22b1dab433226027de7858af0a"
+    },
+    "textarea/textarea.module.css": {
+      "path": "src/components/arc/textarea/textarea.module.css",
+      "sha256": "57a9294f6f7eea903296334bf1203982b41736aa1082a83af4dc2e8bbc6a144c"
+    },
+    "textarea/textarea.tsx": {
+      "path": "src/components/arc/textarea/textarea.tsx",
+      "sha256": "1ed43b87e45b04180f1c6b8b3b7543e071bed3a6fcb2033e98015c77a8b7135a"
+    },
+    "toast/toast.module.css": {
+      "path": "src/components/arc/toast/toast.module.css",
+      "sha256": "7c971d71804b5d4b10c876a08d8a5b3caa0ef19aa7d94d0ccfdb9e291d02fa1c"
+    },
+    "toast/toast.tsx": {
+      "path": "src/components/arc/toast/toast.tsx",
+      "sha256": "cc68a59e0db6f1f1a0c1b8ec6aaa7638c08be7e13367b370f8d3f44accddba7f"
+    },
+    "tooltip/tooltip.module.css": {
+      "path": "src/components/arc/tooltip/tooltip.module.css",
+      "sha256": "a6126eda83bbbc1164018ad9df811f437098167077ca493ec5c06538e7f901f4"
+    },
+    "tooltip/tooltip.tsx": {
+      "path": "src/components/arc/tooltip/tooltip.tsx",
+      "sha256": "25ad5ea2b707da617e055f0c2fd9bcf8776775ad658e67f3e9176f3030855f9b"
+    }
+  }
+}

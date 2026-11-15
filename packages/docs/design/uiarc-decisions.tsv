@@ -1,0 +1,2 @@
+ts	phase	decision	why	evidence	result
+2026-11-15T01:13:15Z	frame	Pin Arc and preserve the complete Web and native product scope	The user selected a single library for both platforms; the upstream provides DOM components, so native controls need explicit ports	packages/docs/design/uiarc-migration.md; packages/uiarc/source.json	implementation active
