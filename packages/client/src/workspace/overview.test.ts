@@ -5,7 +5,7 @@ import { isReplyEnded, isTerminalJobState } from './types.ts'
 import test from "node:test"
 import { openWorksFromOverview, overviewFromWorkspace, parseConversation, parseOpenWorks, parseWorkspaceOverview } from "./model.ts"
 import { cardState, overviewScope, taskGroup, taskLabel, workspaceActivities } from "./labels.ts"
-import type { BotRecord, NodeInfo, OpenWork, PendingCheck, Question } from "./types.ts"
+import type { BotRecord, NodeInfo, OpenWork, PendingCheck, Question, WorkspaceActivityJob } from "./types.ts"
 
 const mainScope: SessionScope = { kind: 'main' }
 
@@ -309,7 +309,7 @@ test("workspace activities show a standalone question once across full and overv
 test("workspace activities merge same-source job observations without hiding newer or uncertain state", () => {
   const runtime = { provider: "codex" as const, model: "frozen", reasoning_effort: null, generation: "g", session_generation: 1, delivery_id: "d", stage: "run" as const, execution: "started" as const, attempted_at_ms: 2, switched_from: null, switch_reason: null }
   const overview = parseWorkspaceOverview({ jobs: [{ job_id: "job-1", conversation_id: "chat-1", trigger: "message:ordinary", state: "queued", source_node: "entry" }] })
-  const local = { conversation_id: "chat-1", job: { scope: mainScope, trigger: "message:ordinary", state: "running", runtime, failure: { kind: "unknown" as const, detail: "保留本地说明" } } }
+  const local = { conversation_id: "chat-1", job: { scope: mainScope, trigger: "message:ordinary", state: "running", runtime, failure: { kind: "unknown" as const, detail: "保留本地说明" } } } satisfies WorkspaceActivityJob
   const input = { works: [], questions: [], checks: [], overview, jobs: [local], nodes: [node("entry", true, true)] }
   const merged = workspaceActivities(input).activities
   assert.equal(merged.length, 1)
@@ -326,7 +326,7 @@ test("workspace activities merge same-source job observations without hiding new
   assert.equal(failed[0]?.kind === "turn" && failed[0].state, "failed", "a newer terminal observation is not hidden by queued overview data")
   const unknown = workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, state: "queued", pending_check: true } }] }).activities
   assert.equal(unknown[0]?.kind === "turn" && unknown[0].state, "unknown", "a pending check stays uncertain")
-  for (const state of ["reconciling", "publishing"]) {
+  for (const state of ["reconciling", "publishing"] as const) {
     const observed = workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, state } }] }).activities
     assert.equal(observed[0]?.kind === "turn" && observed[0].state, state, `${state} is not treated as an old queued observation`)
   }
@@ -357,9 +357,10 @@ test("workspace activities merge same-source job observations without hiding new
   const epochs = parseWorkspaceOverview({ jobs: [1, 2].map((owner_epoch) => ({ job_id: "same-job", conversation_id: "chat-1", trigger: "message:ordinary", state: "running", source_node: "entry", owner_epoch })) })
   assert.equal(workspaceActivities({ ...input, overview: epochs, jobs: [] }).activities[0]?.state, "unknown", "different observed ownership epochs have no ordering proof")
   const remoteUnknown = parseWorkspaceOverview({ jobs: [{ job_id: "remote-unknown", conversation_id: "chat-1", trigger: "message:ordinary", state: "unknown", source_node: "remote" }] })
-  const localCompleted = { ...local, job: { ...local.job, state: "completed", outcome: "answered" as const } }
+  const localCompleted = { ...local, job: { ...local.job, state: "completed", outcome: "answered" as const } } satisfies WorkspaceActivityJob
   assert.deepEqual(workspaceActivities({ ...input, overview: remoteUnknown, jobs: [localCompleted] }).activities.map((entry) => entry.state), ["unknown"], "local completed history cannot hide another source's unknown observation")
-  const arbitrary = workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, state: "future_state" } }] }).activities
+  const futureOverview = parseWorkspaceOverview({ jobs: [{ job_id: "future-job", conversation_id: "chat-1", trigger: "message:ordinary", state: "future_state", source_node: "entry" }] })
+  const arbitrary = workspaceActivities({ ...input, overview: futureOverview, jobs: [] }).activities
   assert.equal(arbitrary[0]?.kind === "turn" && arbitrary[0].state, "unknown", "an unrecognized scheduler state stays conservative")
   assert.equal(workspaceActivities({ ...input, overview: overviewRunning, jobs: [{ ...local, job: { ...local.job, state: "queued" } }] }).activities[0]?.state, "running", "the overview observation can be newer without preferring the local source")
   assert.equal(workspaceActivities({ ...input, nodes: [] }).activities.length, 2, "an unknown local identity cannot prove a duplicate")

@@ -4369,7 +4369,7 @@ test('native chat folds runtime diagnostics and retains result checks without pr
     if (typeof toggle?.props.onPress === 'function') toggle.props.onPress()
     details.render('Details', row.props)
     assert.match(componentText(details.output), /Codex · 提交模型 submitted-model · 提交推理强度 high · 记录结果/)
-    for (const current of [{ ...job, state: 'reconciling' }, { ...job, state: 'failed', pending_check: true }]) {
+    for (const current of [{ ...job, state: 'reconciling' }, { ...job, state: 'failed', pending_check: true }] satisfies ManagerJob[]) {
       shared.data.scheduler!.jobs = [current]
       const cards = render().cards
       assert.equal(cards.length, 1)
