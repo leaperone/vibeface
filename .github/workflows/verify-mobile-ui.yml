@@ -3,6 +3,9 @@ run-name: Verify / Mobile UI / ${{ github.ref_name }} / ${{ github.sha }}
 
 on:
   workflow_dispatch:
+  push:
+    branches-ignore: [main]
+    paths: ['.github/workflows/verify-mobile-ui.yml']
 
 permissions:
   contents: read
@@ -10,6 +13,7 @@ permissions:
 jobs:
   source:
     name: Freeze mobile build inputs
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[verify-mobile-ui]')
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.mobile.outputs.version }}

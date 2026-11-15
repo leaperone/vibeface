@@ -55,3 +55,5 @@ Project instructions reserve e2e tests, screenshots and UI acceptance runs for a
 The baseline census is 17 Web route files and 27 native route files, including layouts. The initial dependency census includes 339 internal component imports. Counts may change as components are reorganized; product routes and actions remain the acceptance scope.
 
 Native package compilation is available through the manual `verify-mobile-ui.yml` workflow. It uses the committed mobile version and exact workflow source commit, then calls the existing Android and iOS builders. It does not pass signing secrets, create tags, or publish a release. Core CI and its reusable Web and crypto workflows retain their existing entrypoints.
+
+Before GitHub registers a new workflow on the default branch, an explicit `[verify-mobile-ui]` commit that changes this workflow on a feature branch can start it once. Other feature pushes do not build native packages. After registration, use `gh workflow run verify-mobile-ui.yml --ref <branch>`.
