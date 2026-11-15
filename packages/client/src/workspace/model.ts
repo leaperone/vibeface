@@ -958,12 +958,18 @@ function botSettings(value: unknown): BotSettings {
     ...(data.memory_conflicts === undefined ? {} : { memory_conflicts: conversationMemoryConflicts(data.memory_conflicts) }),
   }
 }
+function artifactPageRange(data: Record<string, unknown>, hash: string, offset: number) {
+  const size = number(data.size)
+  const next_offset = data.next_offset === null ? null : number(data.next_offset)
+  if (data.blob_hash !== hash || data.offset !== offset || offset < 0 || offset > size) throw new Error("产物读取响应与原请求不符。")
+  if (next_offset !== null && (next_offset <= offset || next_offset > size)) throw new Error("产物分页位置无效。")
+  return { size, next_offset }
+}
 export function parseBinaryPage(value: unknown, hash: string, offset: number) {
   const data = record(value)
-  const size = number(data.size)
+  const { size, next_offset } = artifactPageRange(data, hash, offset)
   const bytes = Uint8Array.from(atob(text(data.data)), (char) => char.charCodeAt(0))
-  const next_offset = data.next_offset === null ? null : number(data.next_offset)
-  if (data.blob_hash !== hash || data.offset !== offset || bytes.length !== (next_offset ?? size) - offset) throw new Error("下载内容与原请求不符。")
+  if (bytes.length !== (next_offset ?? size) - offset) throw new Error("下载内容与原请求不符。")
   return { bytes, next_offset, size }
 }
 
@@ -998,10 +1004,8 @@ export function signedOrder(files: readonly Attachment[]) {
 
 export function parseArtifactPage(value: unknown, hash: string, offset: number) {
   const data = record(value)
-  const size = number(data.size), content = text(data.text)
-  if (data.blob_hash !== hash || data.offset !== offset || offset > size) throw new Error("产物读取响应与原请求不符。")
-  const next_offset = data.next_offset === null ? null : number(data.next_offset)
-  if (next_offset !== null && (next_offset <= offset || next_offset > size || !content)) throw new Error("产物分页位置无效。")
+  const { size, next_offset } = artifactPageRange(data, hash, offset)
+  const content = text(data.text)
   if (new TextEncoder().encode(content).length !== (next_offset ?? size) - offset) throw new Error("产物分页内容不完整。")
   return { text: content, offset, next_offset, size }
 }
