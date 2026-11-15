@@ -289,7 +289,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
             : !text.trim() ? <div className="grid min-w-0 max-w-full gap-2">
               <p className="text-meta text-muted-foreground">选一句填入草稿，可修改，不会直接发送。</p>
               <div className="flex flex-wrap justify-center gap-2">
-                {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} type="button" variant="outline" className="h-auto min-h-9 max-w-full rounded-full whitespace-normal py-1.5 text-muted-foreground hover:text-foreground max-md:h-auto max-md:min-h-11 [overflow-wrap:anywhere]" style={{ borderColor: tint?.edge }} onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
+                {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} type="button" variant="outline" className="h-auto min-h-9 max-w-full rounded-full whitespace-normal py-1.5 text-muted-foreground hover:text-foreground max-md:h-auto max-md:min-h-11 [overflow-wrap:anywhere]" style={{ borderColor: tint?.edge }} onMouseDown={(event) => event.preventDefault()} onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
               </div>
             </div> : null}
         </div> : workspace.synced ? <NoBot /> : null}
