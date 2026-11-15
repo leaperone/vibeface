@@ -46,13 +46,14 @@ export function Onboarding() {
   }
   return <AuthPage header={<Steps step={step} />}>
     {step === 4 ? <Panel icon={Bot} title="让这台电脑运行 Bot">
+      <p className="text-meta text-muted-foreground">选一项 AI 服务，让 Bot 在这台电脑上回复消息。也可以先跳过，稍后在「设备」中设置。</p>
       <AiSettings onboarding onBot={setBotOn} />
       <div className="flex justify-between gap-2 border-t pt-4">
         <Button type="button" variant="ghost" className="-ms-3" onClick={() => setOnboardingStep(5)}>稍后设置</Button>
         <Button type="button" className="ms-auto" disabled={!botOn} onClick={() => setOnboardingStep(5)}>下一步</Button>
       </div>
     </Panel> : <Panel key="bot" icon={MessageSquarePlus} title="创建第一个 Bot">
-      <p className="text-meta text-muted-foreground">先给它起个名字，再告诉它你想完成的第一件事。</p>
+      <p className="text-meta text-muted-foreground">先给它起个名字，再告诉它你想完成的第一件事。{canReply ? null : " 暂时没有设备能回复，也可以先创建，稍后在「设备」中连接或设置。"}</p>
       <form className="grid gap-4" noValidate onSubmit={(event) => { event.preventDefault(); if (name.trim()) void create(); else setError(new Error("还没填名称")) }}>
         <label className="grid gap-1.5 text-meta font-medium">名称<Input required maxLength={512} value={name} disabled={busy} onChange={(event) => setName(event.target.value)} /></label>
         {project && shown ? <p className="flex min-w-0 items-center gap-1.5 text-meta text-muted-foreground"><FolderOpen aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{folderLabels.project}</span><FolderPath path={project.cwd} shown={shown[project.cwd]} /></p> : null}

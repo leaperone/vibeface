@@ -33,7 +33,7 @@ export function ConversationList() {
   })}</ul>
   else if (!workspace.connectionOnline) list = <EmptyState icon={WifiOff} title="正在重连" />
   else if (!workspace.synced) list = <div className="grid gap-2" aria-hidden="true">{[0, 1, 2].map((item) => <Skeleton key={item} className="h-16 rounded-xl" />)}</div>
-  else list = <EmptyState icon={Bot} title="还没有 Bot" action={workspace.writable ? <Button type="button" onClick={create}><Plus aria-hidden="true" />新 Bot</Button> : undefined} />
+  else list = <EmptyState icon={Bot} title="还没有 Bot" description="给你的 Bot 起个名字，接着交代你想完成的事。" action={workspace.writable ? <Button type="button" onClick={create}><Plus aria-hidden="true" />新 Bot</Button> : undefined} />
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-2 max-md:-mx-3 max-md:w-auto">
     <div className="flex items-center justify-between gap-3 px-3">
       <h2 className="text-meta font-medium text-muted-foreground">频道</h2>
