@@ -286,12 +286,12 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
             {away || canSetUp ? <Button asChild><Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot.bot_id }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
               : <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><Crown aria-hidden="true" className="size-4 shrink-0" />{setUpOnManager((directory?.members ?? []).filter((member) => member.manage).map((member) => member.name))}</p>}
           </>
-            : <div className="grid min-w-0 max-w-full gap-2">
+            : !text.trim() ? <div className="grid min-w-0 max-w-full gap-2">
               <p className="text-meta text-muted-foreground">选一句填入草稿，可修改，不会直接发送。</p>
               <div className="flex flex-wrap justify-center gap-2">
                 {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} type="button" variant="outline" className="h-auto min-h-9 max-w-full rounded-full whitespace-normal py-1.5 text-muted-foreground hover:text-foreground max-md:h-auto max-md:min-h-11 [overflow-wrap:anywhere]" style={{ borderColor: tint?.edge }} onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
               </div>
-            </div>}
+            </div> : null}
         </div> : workspace.synced ? <NoBot /> : null}
       />
       {bot && inputTarget ? <PromptInput
