@@ -1372,7 +1372,7 @@ mod tests {
         let result = async {
             let settings = manager_settings(Provider::Cursor, workspace, "fixture-model".into());
             node.settings.lock().unwrap().manager = Some(settings.clone());
-            crate::runtime::triage::tests::bot(&node, &admin, "start-state", "Bot", &[]).await?;
+            crate::runtime::test_support::bot(&node, &admin, "start-state", "Bot", &[]).await?;
             let key = SessionKey {
                 conversation_id: "start-state".into(),
                 scope: SessionScope::Main,

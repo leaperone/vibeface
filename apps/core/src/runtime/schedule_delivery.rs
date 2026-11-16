@@ -1658,7 +1658,7 @@ mod tests {
     #[tokio::test]
     async fn saved_inputs_retry_admission_after_capacity_and_storage_failures() -> Result<()> {
         use crate::{
-            runtime::triage::tests::{bot, claim_reply, node},
+            runtime::test_support::{bot, claim_reply, node},
             scheduling::{TriggerKind, message_trigger},
         };
         for case in ["capacity", "storage"] {
@@ -1745,7 +1745,7 @@ mod tests {
     -> Result<()> {
         use crate::{
             model::EventBody,
-            runtime::triage::tests::{bot, claim_reply, node},
+            runtime::test_support::{bot, claim_reply, node},
             scheduling::{SessionScope, TriggerKind, message_trigger},
             workspace::{InputIntent, InputTarget, WORKSPACE_SCOPE, WorkspaceCommand},
         };
@@ -1844,7 +1844,7 @@ mod tests {
     #[tokio::test]
     async fn inconsistent_workspace_assignments_do_not_block_unrelated_reply_recovery() -> Result<()>
     {
-        use crate::runtime::triage::tests::{bot, claim_reply, node};
+        use crate::runtime::test_support::{bot, claim_reply, node};
         let (node, admin, directory) = node().await?;
         let result = async {
             bot(&node, &admin, "c", "Healthy reply", &[]).await?;
@@ -1892,7 +1892,7 @@ mod tests {
     async fn readiness_and_registration_failures_do_not_reserve_scheduler_budget() -> Result<()> {
         use crate::{
             model::ResolvedModel,
-            runtime::triage::tests::{bot, node},
+            runtime::test_support::{bot, node},
             work::WorkSpec,
         };
         for case in ["needs_setup", "registration"] {
@@ -1982,7 +1982,7 @@ mod tests {
     #[tokio::test]
     async fn preparation_write_failures_leave_no_native_call_or_fabricated_pending_check()
     -> Result<()> {
-        use crate::runtime::triage::tests::{bot, claim_reply, node};
+        use crate::runtime::test_support::{bot, claim_reply, node};
 
         for case in ["runtime", "runtime_and_finish", "failure_record"] {
             let (node, admin, directory) = node().await?;
@@ -2236,7 +2236,7 @@ mod tests {
     {
         use crate::{
             model::EventBody,
-            runtime::triage::tests::{bot, node, scripted_app_server},
+            runtime::test_support::{bot, node, scripted_app_server},
             scheduling::{SessionScope, message_trigger},
             workspace::{
                 AssignmentState, InputIntent, InputRequest, InputRoute, InputTarget, TaskAction,
@@ -2399,7 +2399,7 @@ mod tests {
     async fn stopping_an_unacknowledged_main_input_never_requeues_after_native_not_arrived()
     -> Result<()> {
         use crate::{
-            runtime::triage::tests::{bot, node, scripted_app_server, start_reply},
+            runtime::test_support::{bot, node, scripted_app_server, start_reply},
             scheduling::{SessionScope, message_trigger},
         };
         let (node, admin, directory) = node().await?;

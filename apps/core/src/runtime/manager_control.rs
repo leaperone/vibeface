@@ -914,9 +914,9 @@ pub(super) mod tests {
         server: &str,
         thread: &str,
     ) -> Result<(Access, PendingCheck)> {
-        super::super::triage::tests::bot(node, admin, "c", "fixture", &[]).await?;
+        super::super::test_support::bot(node, admin, "c", "fixture", &[]).await?;
         let (trigger, attempt) =
-            super::super::triage::tests::start_reply(node, admin, "confirm-stop").await?;
+            super::super::test_support::start_reply(node, admin, "confirm-stop").await?;
         let network = node
             .store
             .call("manager_control.network", move |store| store.network())
@@ -968,7 +968,7 @@ pub(super) mod tests {
             model::EventBody,
             workspace::{AssignmentState, WorkspaceCommand},
         };
-        let (node, admin, dir) = super::super::triage::tests::node().await?;
+        let (node, admin, dir) = super::super::test_support::node().await?;
         let result = async {
             let root = dir.canonicalize()?;
             let first_root = root.join("first");
@@ -980,7 +980,7 @@ pub(super) mod tests {
                 settings.roots = vec![root.clone()];
                 settings.manager = Some(manager_settings(crate::providers::Provider::Codex, root, "fixture".into()));
             }
-            super::super::triage::tests::bot(&node, &admin, "c", "Task Bot", &[]).await?;
+            super::super::test_support::bot(&node, &admin, "c", "Task Bot", &[]).await?;
             let network = node.store.call("manager_control.network", move |store| store.network()).await?.context("network")?;
             let local = node.identity.device_id()?;
             fn command(store: &mut crate::store::Store, identity: &crate::crypto::LocalIdentity,

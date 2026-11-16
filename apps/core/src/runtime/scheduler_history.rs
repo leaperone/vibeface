@@ -44,10 +44,7 @@ impl SchedulerProjection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{
-        test_support::{access, signed_main_input},
-        triage::tests::{bot, node},
-    };
+    use crate::runtime::test_support::{access, bot, node, signed_main_input};
 
     #[tokio::test]
     async fn scheduler_history_rpc_is_bounded_read_only_and_owner_scoped() -> Result<()> {

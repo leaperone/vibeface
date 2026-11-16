@@ -199,7 +199,7 @@ mod tests {
         let node = open_node(&directory, &configuration).await?;
         let result = async {
             let (admin, network) = join_network(&node).await?;
-            super::super::triage::tests::bot(&node, &admin, "chat", "Receipt fixture", &[]).await?;
+            super::super::test_support::bot(&node, &admin, "chat", "Receipt fixture", &[]).await?;
             let local = node.identity.device_id()?;
             let client = admin.device_id()?;
             let access = access(network.clone(), true, Some("chat".into()));

@@ -1681,8 +1681,9 @@ pub(crate) fn work_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::test_support::{access as test_access, signed_main_input};
-    use crate::runtime::triage::tests::{bot, claim_reply, node, start_reply};
+    use crate::runtime::test_support::{
+        access as test_access, bot, claim_reply, node, signed_main_input, start_reply,
+    };
 
     async fn post(
         node: &Runtime,

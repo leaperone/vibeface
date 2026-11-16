@@ -209,7 +209,7 @@ impl Runtime {
         let hash_part = part.clone();
         let hash = tokio::task::spawn_blocking(move || {
             #[cfg(test)]
-            super::triage::tests::pause_attachment_hash(&hash_part);
+            super::test_support::pause_attachment_hash(&hash_part);
             std::fs::read(hash_part).map(|bytes| crate::crypto::digest(&bytes))
         })
         .await??;
@@ -878,10 +878,7 @@ pub(super) fn open_works(store: &Store, network: &str, scope: Option<&str>) -> R
 #[cfg(test)]
 mod attachment_tests {
     use super::*;
-    use crate::runtime::{
-        test_support::access as test_access,
-        triage::tests::{bot, node},
-    };
+    use crate::runtime::test_support::{access as test_access, bot, node};
     use crate::workspace::{WORKSPACE_SCOPE, WorkspaceCommand};
     use base64::Engine as _;
 
@@ -937,10 +934,7 @@ mod attachment_tests {
 #[cfg(test)]
 mod conversation_history_tests {
     use super::*;
-    use crate::runtime::{
-        test_support::{access as test_access, signed_main_input},
-        triage::tests::{bot, node},
-    };
+    use crate::runtime::test_support::{access as test_access, bot, node, signed_main_input};
     use vibeface_protocol::history::HISTORY_RESPONSE_BYTES;
 
     #[tokio::test]

@@ -2281,7 +2281,7 @@ mod tests {
     }
 
     fn log(dir: &Path) -> Vec<Value> {
-        super::super::triage::tests::pi_fixture_log(dir).unwrap_or_else(|error| panic!("{error:#}"))
+        super::super::test_support::pi_fixture_log(dir).unwrap_or_else(|error| panic!("{error:#}"))
     }
 
     fn prompts(dir: &Path) -> Vec<Value> {
@@ -2357,7 +2357,7 @@ mod tests {
     async fn wait_for_abort(dir: &Path) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let aborted = super::super::triage::tests::pi_fixture_log(dir)?
+                let aborted = super::super::test_support::pi_fixture_log(dir)?
                     .iter()
                     .any(|entry| entry["abort"] == true);
                 if aborted {

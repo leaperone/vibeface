@@ -39,6 +39,8 @@ pub(crate) mod triage;
 pub use sync::{MAX_PULL_BYTES, MAX_PULL_EVENTS};
 mod schema_guard;
 #[cfg(test)]
+mod test_metrics;
+#[cfg(test)]
 mod tests;
 pub(crate) mod work;
 pub(crate) mod workspace;

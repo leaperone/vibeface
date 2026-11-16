@@ -4068,7 +4068,7 @@ mod tests {
     -> Result<()> {
         for observable in [true, false] {
             let place = Place::new().await?;
-            let (node, admin, data) = super::super::triage::tests::node().await?;
+            let (node, admin, data) = super::super::test_support::node().await?;
             let server = node.opencode.clone();
             server.set_launch(fixture(), place.env());
             let (conn, serving) = server.conn().await?;

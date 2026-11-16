@@ -1594,7 +1594,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_reuses_the_scoped_write_journal_and_revokes_access() -> Result<()> {
-        use crate::runtime::{test_bot as bot, test_node as node, test_start_reply as start_reply};
+        use crate::runtime::test_support::{bot, node, start_reply};
         let (node, admin, dir) = node().await?;
         bot(&node, &admin, "c", "Ops", &[]).await?;
         let network = node

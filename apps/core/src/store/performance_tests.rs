@@ -453,20 +453,8 @@ fn signed_history_scale() -> Result<()> {
                             workspace::projection_ancestor_walks()
                         );
                         #[cfg(unix)]
-                        {
-                            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-                            // getrusage writes the complete output structure when it succeeds.
-                            if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) }
-                                == 0
-                            {
-                                let usage = unsafe { usage.assume_init() };
-                                let bytes = if cfg!(target_os = "macos") {
-                                    usage.ru_maxrss as u64
-                                } else {
-                                    usage.ru_maxrss as u64 * 1024
-                                };
-                                eprintln!("process_peak_resident_bytes={bytes}");
-                            }
+                        if let Some(bytes) = crate::store::test_metrics::peak_resident_bytes() {
+                            eprintln!("process_peak_resident_bytes={bytes}");
                         }
                         report("page", &pages);
                         report("ingest_including_validation", &metrics.ingest_ns);
