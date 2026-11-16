@@ -1,8 +1,8 @@
 import { useFocusEffect } from 'expo-router'
-import { createContext, useCallback, useContext, useEffect, useId, useMemo, useState, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { AccessibilityInfo, AppState, View } from 'react-native'
 import Animated, { useAnimatedProps, useAnimatedStyle, useSharedValue } from 'react-native-reanimated'
-import Svg, { Circle, Defs, Path, RadialGradient, Stop } from 'react-native-svg'
+import Svg, { Circle, Path } from 'react-native-svg'
 import { useUniwind } from 'uniwind'
 import { colors, faceOf, HALO, pose, thinkingDots, type Mood } from '@vibeface/client/avatar/face.ts'
 import { ASLEEP, faceMotion, type Frame } from '@vibeface/client/avatar/motion.ts'
@@ -55,8 +55,7 @@ export function ScreenFaces({ children }: { children: ReactNode }) {
 export type FaceBot = Pick<BotRecord, 'bot_id' | 'avatar'>
 
 /** A bot's face, picked by its id and avatar and moving with its mood. Hidden from screen readers: the row says the mood. */
-/** `halo`: a still glow in the bot's tint behind the face, 1.8 times its size. `still` draws one frame and leaves the clock, for previews. */
-export function BotFace({ bot, mood, size, halo, still }: { bot: FaceBot; mood: Mood; size: number; halo?: string; still?: boolean }) {
+export function BotFace({ bot, mood, size, still }: { bot: FaceBot; mood: Mood; size: number; still?: boolean }) {
   const { theme } = useUniwind()
   const dark = theme === 'dark'
   const { bot_id: botId, avatar } = bot
@@ -65,7 +64,6 @@ export function BotFace({ bot, mood, size, halo, still }: { bot: FaceBot; mood: 
   const palette = useMemo(() => ({ awake: colors(face, dark, 1), asleep: colors(face, dark, ASLEEP) }), [face, dark])
   const reducedMotion = useReduced()
   const motionOff = useContext(Covered) || reducedMotion || still === true
-  const gradient = `face${useId().replace(/[^a-zA-Z0-9]/g, '')}`
   const motion = useMemo(() => faceMotion(botId, mood, avatar), [botId, look])
   const frame = useSharedValue<Frame>(useState(() => motion.frame(null))[0])
 
@@ -98,27 +96,11 @@ export function BotFace({ bot, mood, size, halo, still }: { bot: FaceBot; mood: 
   const ink = mood === 'asleep' ? palette.asleep.ink : palette.awake.ink
 
   return <View importantForAccessibility="no-hide-descendants" accessibilityElementsHidden style={{ width: size, height: size }}>
-    {halo ? <Svg width={size * 1.8} height={size * 1.8} style={{ position: 'absolute', left: -size * 0.4, top: -size * 0.4 }}>
-      <Defs>
-        <RadialGradient id={`${gradient}halo`}>
-          <Stop offset={0.5} stopColor={halo} stopOpacity={dark ? 0.18 : 0.14} />
-          <Stop offset={1} stopColor={halo} stopOpacity={0} />
-        </RadialGradient>
-      </Defs>
-      <Circle cx="50%" cy="50%" r="50%" fill={`url(#${gradient}halo)`} />
-    </Svg> : null}
     <Animated.View style={[{ position: 'absolute', inset: 0 }, bodyStyle]}>
       <Svg viewBox="0 0 100 100" width={size} height={size}>
-        <Defs>
-          {(['awake', 'asleep'] as const).map((key) => <RadialGradient key={key} id={`${gradient}${key}`} cx="38%" cy="30%" r="75%">
-            <Stop offset={0} stopColor={palette[key].top} />
-            <Stop offset={0.55} stopColor={palette[key].base} />
-            <Stop offset={1} stopColor={palette[key].bottom} />
-          </RadialGradient>)}
-        </Defs>
         <AnimatedPath animatedProps={ringProps} fill="none" stroke={palette.awake.ring} strokeWidth={HALO.width} />
-        <AnimatedPath animatedProps={bodyProps} fill={`url(#${gradient}awake)`} />
-        <AnimatedPath animatedProps={greyProps} fill={`url(#${gradient}asleep)`} />
+        <AnimatedPath animatedProps={bodyProps} fill={palette.awake.base} />
+        <AnimatedPath animatedProps={greyProps} fill={palette.asleep.base} />
         <AnimatedPath animatedProps={leftProps} fill={ink} />
         <AnimatedPath animatedProps={rightProps} fill={ink} />
       </Svg>

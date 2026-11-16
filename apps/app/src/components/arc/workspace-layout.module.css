@@ -1,0 +1,29 @@
+/* Arc sidebar rail and ai-chat split layout, bound to Vibeface routes and state. */
+.shell { --rail: color-mix(in oklab,var(--surface-muted) 55%,var(--surface)); --row-hover: color-mix(in oklab,var(--foreground) 4.5%,transparent); --row-active: color-mix(in oklab,var(--foreground) 7%,transparent); display: flex; height: var(--app-height,100dvh); min-height: 0; max-width: 100%; overflow: hidden; background: var(--background); color: var(--foreground); }
+:root[data-theme=dark] .shell { --rail: color-mix(in oklab,var(--background) 60%,var(--surface)); }
+.navigation { display: flex; width: 272px; flex: none; min-height: 0; flex-direction: column; background: var(--rail); border-inline-end: 1px solid var(--border); }
+.brand { display: flex; align-items: center; min-height: 76px; padding: var(--space-6); }
+.navBody { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 0 var(--space-3) var(--space-4); }
+.section { display: grid; gap: var(--space-2); margin-top: var(--space-6); }
+.sectionHeader { display: flex; min-width: 0; min-height: var(--control-height-md); align-items: center; justify-content: space-between; gap: var(--space-2); padding-inline: var(--space-3); }
+.sectionHeader > h2 { font-size: var(--text-sm); font-weight: 500; color: var(--text-secondary); }
+.list { display: grid; min-width: 0; gap: var(--space-1); list-style: none; margin: 0; padding: 0; }
+.item { position: relative; display: flex; min-width: 0; min-height: var(--control-height-md); align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-3); border-radius: var(--radius-control); background: transparent; color: var(--text-secondary); text-decoration: none; font-size: var(--text-sm); }
+.item:hover { background: var(--row-hover); color: var(--foreground); }
+.item[aria-current=page] { background: var(--row-active); color: var(--foreground); }
+.item > svg { width: 20px; height: 20px; flex: none; }
+.item > span:first-of-type { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.footer { display: grid; gap: var(--space-2); padding: var(--space-3); border-top: 1px solid var(--border-subtle); }
+.main { display: flex; flex: 1; min-height: 0; min-width: 0; flex-direction: column; overflow: hidden; }
+.header { display: flex; min-height: 76px; flex: none; align-items: center; gap: var(--space-3); padding-inline: max(var(--space-4),env(safe-area-inset-left)) max(var(--space-4),env(safe-area-inset-right)); border-bottom: 1px solid var(--border-subtle); background: var(--surface); }
+.header > h1 { display: flex; min-width: 0; flex: 1; margin: 0; font-size: var(--text-xl); font-weight: 500; overflow-wrap: anywhere; }
+.headerActions { display: flex; align-items: center; flex: none; gap: var(--space-2); }
+.page { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: var(--space-6); }
+.chat { position: relative; display: flex; min-width: 0; min-height: 0; flex: 1; }
+.chatHidden { position: absolute; inset: 76px 0 0; visibility: hidden; }
+.tabs { display: flex; flex: none; align-items: center; padding-bottom: env(safe-area-inset-bottom); border-top: 1px solid var(--border-subtle); background: var(--surface); }
+.tab { display: flex; flex: 1; min-width: 0; min-height: 64px; align-items: center; justify-content: center; gap: var(--space-2); color: var(--text-secondary); font-size: var(--text-sm); text-decoration: none; }
+.tab[aria-current=page] { color: var(--accent-strong); background: var(--accent-subtle); }
+.mobileDrawer { max-width: min(320px,calc(100% - 32px)); }
+@media(min-width: 48rem) { .header { padding-inline: var(--space-6); } .tabs { display: none; } }
+@media(max-width: 48rem) { .page { padding: var(--space-4); } .navigation { width: 100%; min-height: 100%; border: 0; } .brand { min-height: 52px; padding: var(--space-4); } }

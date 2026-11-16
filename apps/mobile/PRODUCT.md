@@ -20,7 +20,7 @@ The native app keeps Bot conversations, device identity, and delivery state conn
 
 ## Operating Context
 
-People use the mobile app one-handed and while switching between a Bot conversation, task details, device setup, and recovery. The home list, chat composer, workspace screens, sheets, and native navigation are the primary operating surfaces.
+People use the mobile app one-handed and while switching between a Bot conversation, task details, device setup, and recovery. The home list, chat composer, workspace screens, sheets, and native navigation are the primary operating surfaces. The root tabs remain 消息, 任务 and 设置. Pending decisions stay in the task screen, and channels remain reachable through their existing entry paths.
 
 ## Capabilities and Constraints
 
@@ -28,11 +28,11 @@ The app supports Bot conversations, tasks, channels, device joining, recovery, s
 
 ## Brand Commitments
 
-The product name is Vibeface. Existing Bot faces and the shared cool-neutral/violet theme are retained.
+The product name is Vibeface. The native UI uses the pinned Arc foundation with a neutral accent. Bot faces retain their identity and selected appearance, with solid fills.
 
 ## Evidence on Hand
 
-Routes and components under `apps/mobile/`, shared semantic tokens in `packages/theme/theme.css`, and existing accessibility, reduced-motion, reduced-transparency, safe-area, and keyboard-aware handling.
+Routes and components under `apps/mobile/`, generated native Arc tokens in `packages/theme/native.css` and `packages/theme/tokens.ts`, and existing accessibility, reduced-motion, reduced-transparency, safe-area, and keyboard-aware handling.
 
 ## Product Principles
 

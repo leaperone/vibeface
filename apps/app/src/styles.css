@@ -1,158 +1,45 @@
-
 @import "tailwindcss";
-@import "tw-animate-css";
-@import "shadcn/tailwind.css";
+@import "@fontsource-variable/inter";
 @import "@fontsource-variable/geist";
 @import "@fontsource-variable/geist-mono";
 @import "@vibeface/theme/theme.css";
 
-@custom-variant dark (&:where(.dark, .dark *));
-@custom-variant light (&:where(:not(.dark)));
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+@custom-variant light (&:where([data-theme="light"], [data-theme="light"] *));
 
-/* A tappable list row: tinted on hover, darker while pressed, an inset ring on keyboard focus so a card's overflow cannot clip it. */
 @utility interactive-row {
-  outline: none;
-  transition-property: background-color, color, box-shadow;
-  transition-duration: var(--default-transition-duration);
-  transition-timing-function: var(--default-transition-timing-function);
-  @media (hover: hover) {
-    &:hover { background-color: color-mix(in oklch, var(--muted) 60%, transparent); }
-  }
-  &:focus-visible { background-color: color-mix(in oklch, var(--muted) 60%, transparent); box-shadow: inset 0 0 0 2px color-mix(in oklch, var(--ring) 50%, transparent); }
-  &:active { background-color: var(--muted); }
+  transition: background-color var(--duration-fast) var(--ease-standard), color var(--duration-fast) var(--ease-standard);
+  @media (hover: hover) { &:hover { background: var(--surface-muted); } }
+  &:active { background: var(--surface-muted); }
 }
-
-/* A small control keeps its look but takes a 44px touch; the element must be positioned. */
 @utility hit-area {
-  &::after {
-    content: "";
-    position: absolute;
-    left: 50%;
-    top: 50%;
-    width: max(100%, 2.75rem);
-    height: max(100%, 2.75rem);
-    translate: -50% -50%;
-  }
+  &::after { content: ""; position: absolute; left: 50%; top: 50%; width: max(100%,var(--control-height-md)); height: max(100%,var(--control-height-md)); translate: -50% -50%; }
 }
-
-* {
-  box-sizing: border-box;
-}
-
-body {
-  margin: 0;
-  font-size: 15px;
-  line-height: 24px;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  text-rendering: optimizeLegibility;
-}
-
-/* An iOS keyboard pans the visual viewport across a layout viewport that keeps its full height, so the app follows the visible area. */
-body {
-  position: fixed;
-  inset-inline: 0;
-  top: var(--app-top, 0px);
-  height: var(--app-height, 100dvh);
-  overflow: hidden;
-}
-
-@theme inline {
-  --font-heading: var(--font-sans);
-  --font-sans: 'Geist Variable', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', system-ui, sans-serif;
-  --font-mono: 'Geist Mono Variable', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
-}
-
-:root {
-  /* Pages and the header's middle column share this width. */
-  --page-width: 48rem;
-}
-
-/* Dark: the workspace sidebar is lifted a step above the page, as a card is, and a hairline parts them. Web only; the shared theme and the sign-in page keep theirs. */
-:root.dark .workspace-shell {
-  --sidebar: oklch(0.2 0.007 270);
-  --sidebar-accent: oklch(0.26 0.009 270);
-  --sidebar-border: var(--line-soft);
-}
-
-/* Dark: a card's outline takes the theme's strong line and what sits inside it the page's soft one, so a card reads as one block. */
-:root.dark { --line-soft: var(--border); }
-:root.dark :is([data-slot="card"], .bg-card) { --border: var(--line-strong); }
-:root.dark :is([data-slot="card"], .bg-card) > * { --border: var(--line-soft); }
-.workspace-shell [data-slot="sidebar-container"] { border-color: var(--sidebar-border); }
-
-@layer base {
-  * {
-    @apply border-border outline-ring/50;
-  }
-  /* Raw links and buttons fade their hover instead of snapping; a utility transition on the element still wins. */
-  :where(a, button, summary, label, [role=button], [role=radio]) {
-    transition-property: color, background-color, border-color, text-decoration-color, box-shadow, opacity;
-    transition-duration: var(--default-transition-duration);
-    transition-timing-function: var(--default-transition-timing-function);
-  }
-  /* One keyboard ring for everything that does not draw its own: components that do set outline-none. */
-  :focus-visible { outline: 2px solid color-mix(in oklch, var(--ring) 70%, transparent); outline-offset: 2px; }
-  body {
-    @apply bg-background text-foreground;
-  }
-  html {
-    @apply font-sans;
-    color-scheme: light;
-    overflow-x: clip;
-  }
-  :root.dark { color-scheme: dark; }
-  input[type=checkbox], input[type=radio] { accent-color: var(--brand); }
-  ::selection { background: color-mix(in oklch, var(--brand) 22%, transparent); }
-  code, kbd, pre, samp { font-family: var(--font-mono); }
-  h1, h2, h3 { letter-spacing: -0.011em; text-wrap: balance; }
-  p { text-wrap: pretty; }
-  * { scrollbar-width: thin; scrollbar-color: color-mix(in oklch, var(--foreground) 18%, transparent) transparent; }
-  /* Grid items default to min-width:auto, so one long path or id would widen the whole card on phones. */
-  :where(.grid) > * { min-width: 0; }
-}
+* { box-sizing: border-box; border-color: var(--border); }
+html { font-family: var(--font-body); color: var(--foreground); background: var(--background); overflow-x: clip; }
+body { margin: 0; font-size: var(--text-base); line-height: var(--leading-body); letter-spacing: var(--tracking-body); -webkit-font-smoothing: antialiased; position: fixed; inset-inline: 0; top: var(--app-top,0px); height: var(--app-height,100dvh); overflow: hidden; }
+:root { --page-width: 48rem; }
+a { color: inherit; }
+button, input, textarea, select { font: inherit; }
+button { cursor: pointer; }
+button:disabled { cursor: not-allowed; }
+code, kbd, pre, samp { font-family: var(--font-mono); }
+h1,h2,h3,p { margin: 0; }
+h1,h2,h3 { font-weight: 500; text-wrap: balance; }
+p { text-wrap: pretty; }
+:where(.grid) > * { min-width: 0; }
 [hidden] { display: none !important; }
-/* Optical centering: these glyphs carry their weight off the box center. Percentages follow the icon size. */
-svg.lucide-play { translate: 6% 0; }
-svg.lucide-star, svg.lucide-download { translate: 0 -5%; }
-.skip-link { position: absolute; top: .5rem; left: 1rem; transform: translateY(-200%); z-index: 50; padding: .75rem; background: var(--background); }
+.skip-link { position: absolute; top: var(--space-2); left: var(--space-4); transform: translateY(-200%); z-index: 80; padding: var(--space-3); border-radius: var(--radius-control); background: var(--surface-raised); }
 .skip-link:focus { transform: translateY(0); }
-.workspace-shell { height: var(--app-height, 100dvh); min-height: 0; max-width: 100%; overflow: hidden; align-items: stretch; }
-.workspace-shell [data-slot="sidebar-container"] { height: var(--app-height, 100dvh); }
-[data-slot="sidebar"][data-mobile="true"] { max-width: min(18rem, calc(100vw - 1rem)); height: var(--app-height, 100dvh); }
 .conversation-view { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
-.workspace-notices { flex-shrink: 0; max-height: 40%; overflow-y: auto; padding: .75rem 1rem; }
-.workspace-screen { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 1rem; }
-.workspace-screen [data-slot="card-content"] { display: grid; gap: .75rem; }
-.workspace-screen [data-slot="card-content"] > dl { display: grid; gap: .75rem; }
-.workspace-screen dd, .workspace-screen code { overflow-wrap: anywhere; }
-.workspace-screen pre { max-width: 100%; overflow: auto; font-size: 13px; line-height: 20px; }
-@media (min-width: 40rem) {
-  .workspace-screen { padding: 1.5rem; }
-  .workspace-notices { padding-inline: 1.5rem; }
-}
-@media (max-width: 48rem) {
-  input, textarea, select { font-size: 1rem !important; }
-}
-
-.skeleton { opacity: 0; animation: skeleton-in 0s 300ms forwards, skeleton-pulse 1.6s 300ms ease-in-out infinite; }
-@keyframes skeleton-in { to { opacity: 1; } }
-@keyframes skeleton-pulse { 50% { opacity: .55; } }
-details.details > summary { list-style: none; cursor: pointer; }
-details.details > summary::-webkit-details-marker { display: none; }
-details.details[open] > summary svg { transform: rotate(90deg); }
+.workspace-notices { flex: none; max-height: 40%; overflow-y: auto; padding: var(--space-3) var(--space-4); }
+.workspace-screen { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: var(--space-4); }
+.workspace-screen dd,.workspace-screen code { overflow-wrap: anywhere; }
+.workspace-screen pre { max-width: 100%; overflow: auto; font-size: var(--text-sm); }
 svg.lucide { stroke-width: 1.75; }
-@media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation-duration: 0s !important; transition-duration: 0s !important; }
-  .skeleton { animation: skeleton-in 0s 300ms forwards; }
-}
-
-/* Native checkbox drawn as a switch: <input type="checkbox" role="switch" class="switch"> */
-.switch { appearance: none; position: relative; width: 2.25rem; height: 1.25rem; flex-shrink: 0; border-radius: 9999px; background: color-mix(in oklab, var(--muted-foreground) 75%, var(--background)); transition: background-color 150ms var(--ease-out); cursor: pointer; }
-.switch::before { content: ""; position: absolute; top: .125rem; left: .125rem; width: 1rem; height: 1rem; border-radius: 9999px; background: var(--background); transition: transform 150ms var(--ease-out); }
-.switch:checked { background: var(--success); }
-.switch[data-tone=danger]:checked { background: var(--danger); }
-.switch:checked::before { transform: translateX(1rem); }
-.switch:disabled { cursor: not-allowed; opacity: .35; }
-.switch:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
-
+::selection { background: var(--accent-subtle); }
+* { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+@media(min-width: 40rem) { .workspace-screen { padding: var(--space-6); } .workspace-notices { padding-inline: var(--space-6); } }
+/* iOS keeps the viewport steady when a 16px form control receives focus. */
+@media(max-width: 48rem) { input,textarea,select { font-size: var(--text-base) !important; } }
+@media(prefers-reduced-motion: reduce) { *,*::before,*::after { animation-duration: 0s !important; transition-duration: 0s !important; scroll-behavior: auto !important; } }

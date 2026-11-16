@@ -1,27 +1,27 @@
-import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { Archive, ArchiveRestore, Camera, CircleCheck, CirclePlus, FileKey, Hourglass, KeyRound, Laptop, LifeBuoy, Link2, LoaderCircle, LogIn, MessageSquareLock, MonitorSmartphone, MonitorX, QrCode, RotateCcw, Settings2, ShieldAlert, ShieldCheck, X } from 'lucide-react'
-import { AuthPage, Details, EmptyState, InlineError, Panel, PasswordInput, claimFocus, SafetyCode, Skeleton, Steps } from '@/components/app/kit'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Textarea } from '@/components/ui/textarea'
-import { addressName, hostOf } from '@vibeface/client/workspace/labels.ts'
-import { entryAddress, entryKey, messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
-import { spentInvite, spentInviteText } from '@vibeface/client/lib/errors.ts'
-import { passphrase, passwordStrength, recoveryCode } from '@vibeface/client/lib/secure.ts'
-import { defaultBrowserName, defaultComputerName, lastBrowserName, rememberBrowserName } from '@/lib/device-name'
-import { startOnboarding } from './onboarding-flag'
-import { primaryLane } from '@vibeface/client/identity/connection-lane.ts'
-import { notJoined, removedText, useDevice } from '@vibeface/client/identity/context.tsx'
-import { joinCopy, manualCopy, recoveryCopy, startCopy } from '@vibeface/client/identity/copy.ts'
+import { AuthPage,claimFocus,Details,EmptyState,InlineError,Panel,PasswordInput,SafetyCode,Skeleton,Steps } from '@/components/arc/product-kit'
 import { localCopy } from '@/features/workspace/local-session'
+import { defaultBrowserName,defaultComputerName,lastBrowserName,rememberBrowserName } from '@/lib/device-name'
 import { webPlatform } from '@/lib/platform'
+import { primaryLane } from '@vibeface/client/identity/connection-lane.ts'
+import { notJoined,removedText,useDevice } from '@vibeface/client/identity/context.tsx'
+import { joinCopy,manualCopy,recoveryCopy,startCopy } from '@vibeface/client/identity/copy.ts'
+import { APP_ORIGIN,PUBLIC_GATEWAY } from '@vibeface/client/lib/entrances.ts'
+import { spentInvite,spentInviteText } from '@vibeface/client/lib/errors.ts'
+import { entryAddress,entryKey,messageOf,parseEntry } from '@vibeface/client/lib/node.ts'
+import { passphrase,passwordStrength,recoveryCode } from '@vibeface/client/lib/secure.ts'
+import { joinTicket } from '@vibeface/client/lib/transport.ts'
+import { addressName,hostOf } from '@vibeface/client/workspace/labels.ts'
+import { Button } from '@vibeface/uiarc/button/button.tsx'
+import { Input } from '@vibeface/uiarc/input/input.tsx'
+import { Textarea } from '@vibeface/uiarc/textarea/textarea.tsx'
+import { Archive,ArchiveRestore,Camera,CircleCheck,CirclePlus,FileKey,Hourglass,KeyRound,Laptop,LifeBuoy,Link2,LoaderCircle,LogIn,MessageSquareLock,MonitorSmartphone,MonitorX,QrCode,RotateCcw,Settings2,ShieldAlert,ShieldCheck,X } from 'lucide-react'
+import { useEffect,useRef,useState,type FormEvent,type ReactNode } from 'react'
+import { CopyDiagnostics,GatewayForm } from './device-controls'
+import { startOnboarding } from './onboarding-flag'
+import { PasswordStrength,RecoveryControls,RecoveryReview,RecoveryWaiting,SaveRecoveryFile } from './recovery-controls'
 
 const NOT_JOINED = notJoined(webPlatform.self)
 const BROWSER_REMOVED = removedText(webPlatform.self)
-import { PasswordStrength, RecoveryControls, RecoveryReview, RecoveryWaiting, SaveRecoveryFile } from './recovery-controls'
-import { CopyDiagnostics, GatewayForm } from './device-controls'
-import { joinTicket } from '@vibeface/client/lib/transport.ts'
-import { APP_ORIGIN, PUBLIC_GATEWAY } from '@vibeface/client/lib/entrances.ts'
 
 type Lane = 'local' | 'invite' | 'saved' | 'recovery'
 type Purpose = 'empty' | 'link' | 'invalid'
@@ -66,7 +66,7 @@ function Scanner({ onTicket, onCancel }: { onTicket(ticket: string): void; onCan
     return () => { live = false; clearTimeout(timer); stream?.getTracks().forEach(track => track.stop()) }
   }, [])
   return <div className="grid gap-3">
-    {error ? <InlineError error={error} /> : <video ref={video} className="aspect-square w-full rounded-lg bg-black object-cover" playsInline muted aria-label="对准二维码" />}
+    {error ? <InlineError error={error} /> : <video ref={video} className="aspect-square w-full rounded-control bg-black object-cover" playsInline muted aria-label="对准二维码" />}
     <Button type="button" variant="ghost" className="-ms-3 w-fit" onClick={onCancel}>不扫了，粘贴链接</Button>
   </div>
 }
@@ -81,12 +81,12 @@ function Removed({ busy, run }: { busy: boolean; run: Run }) {
   const canRejoin = device.removedLocally || Boolean(setup?.local_launch)
   return <Panel icon={MonitorX} title={here || device.removedLocally ? '这个节点已被移出' : '所连的节点已被移出'}>
     {canRejoin ? <>
-      <p className="text-muted-foreground">点重新加入，再用已有设备的加入链接把它加回来</p>
-      <p className="flex items-center gap-2 text-meta text-muted-foreground"><Archive aria-hidden="true" className="size-4 shrink-0" />旧数据改名保留，不会删除</p>
+      <p className="text-secondary">点重新加入，再用已有设备的加入链接把它加回来</p>
+      <p className="flex items-center gap-2 text-sm text-secondary"><Archive aria-hidden="true" className="size-4 shrink-0" />旧数据改名保留，不会删除</p>
       <Button type="button" className="w-fit justify-self-end" disabled={busy} onClick={() => void run(device.rejoin)}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <RotateCcw aria-hidden="true" />}重新加入</Button>
       {commands}
     </> : <>
-      {here ? null : <p className="text-muted-foreground">在它的本机页面点“重新加入”。</p>}
+      {here ? null : <p className="text-secondary">在它的本机页面点“重新加入”。</p>}
       {commands}
     </>}
   </Panel>
@@ -94,9 +94,9 @@ function Removed({ busy, run }: { busy: boolean; run: Run }) {
 
 /** The code appears once the device that sent the link shows its own, so until then the next step is over there. */
 function JoinCode({ code, admin }: { code?: string; admin?: string }) {
-  if (!code) return <p role="status" className="flex items-center gap-2 text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 shrink-0 animate-spin" />{joinCopy.showCode}</p>
+  if (!code) return <p role="status" className="flex items-center gap-2 text-secondary"><LoaderCircle aria-hidden="true" className="size-4 shrink-0 animate-spin" />{joinCopy.showCode}</p>
   return <>
-    <p role="status" className="flex items-center gap-2 text-muted-foreground"><Hourglass aria-hidden="true" className="size-4 shrink-0" />{joinCopy.compareCode(admin)}</p>
+    <p role="status" className="flex items-center gap-2 text-secondary"><Hourglass aria-hidden="true" className="size-4 shrink-0" />{joinCopy.compareCode(admin)}</p>
     <SafetyCode code={code} />
   </>
 }
@@ -117,9 +117,6 @@ function NodeJoin() {
   </Panel>
 }
 
-function Field({ label, children }: { label: string; children: ReactNode }) {
-  return <label className="grid gap-1.5 text-meta font-medium">{label}{children}</label>
-}
 
 /**
  * The device ID of the Node at the access address: it fills in a manual address that is that Node's own. The page or
@@ -240,17 +237,17 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const quiet = notice || (!error ? membership : '')
   const failed = Boolean(error || deviceError && device.phase !== 'reconnecting')
   const alert = failed ? <InlineError error={error || deviceError} />
-    : quiet ? <p role="status" className="flex items-center gap-2 rounded-lg bg-muted/60 px-3 py-2 text-meta text-muted-foreground">{quiet === membership ? <MonitorX aria-hidden="true" className="size-4 shrink-0" /> : null}{quiet}</p> : null
+    : quiet ? <p role="status" className="flex items-center gap-2 rounded-control bg-surface-muted/60 px-3 py-2 text-sm text-secondary">{quiet === membership ? <MonitorX aria-hidden="true" className="size-4 shrink-0" /> : null}{quiet}</p> : null
   const focused = Boolean(device.review || device.joining || device.nodeJoining || device.recovery)
   const setup = device.localSetup?.kind === 'uninitialized'
   const choosing = active === 'local' && setup && !names && !creating
   const step = active === 'local' && setup && !focused ? (names ? 2 : creating ? 1 : null) : device.review?.kind === 'bootstrap' ? 3 : null
   const other = !focused && usable && !(active === 'local' && setup && (names || creating)) ? <div role="group" aria-label="其他方式" className="border-t pt-4">
-    <div className="-ms-3 flex flex-wrap gap-x-2 text-muted-foreground">
+    <div className="-ms-3 flex flex-wrap gap-x-2 text-secondary">
       {active !== 'local' && device.localSetup ? <Button variant="ghost" type="button" onClick={() => { if (setup) setCreating(true); chooseLane('local') }}>{setup ? <CirclePlus aria-hidden="true" /> : <Laptop aria-hidden="true" />}{setup ? startCopy.create : local === 'open' ? computerName : localCopy.manage}</Button> : null}
       {active !== 'saved' && device.entries.length > 0 && !removed ? <Button variant="ghost" type="button" onClick={() => chooseLane('saved')}><MonitorSmartphone aria-hidden="true" />用过的地址</Button> : null}
       {active !== 'invite' && !choosing ? <Button variant="ghost" type="button" onClick={() => chooseLane('invite')}><Link2 aria-hidden="true" />{joinCopy.byLink}</Button> : null}
-      {active !== 'recovery' ? <Button variant="ghost" type="button" onClick={() => chooseLane('recovery')}><ArchiveRestore aria-hidden="true" />用恢复文件找回<span className="text-meta font-normal">{recoveryCopy.whenLost}</span></Button> : null}
+      {active !== 'recovery' ? <Button variant="ghost" type="button" onClick={() => chooseLane('recovery')}><ArchiveRestore aria-hidden="true" />用恢复文件找回<span className="text-sm font-normal">{recoveryCopy.whenLost}</span></Button> : null}
     </div>
   </div> : null
 
@@ -259,12 +256,12 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   let alertInBody = false
   if (device.phase === 'blocked') body = <EmptyState icon={ShieldAlert} title="在节点本机打开，或用加入链接" />
   else if (device.phase === 'key_lost') body = <Panel icon={ShieldAlert} title="需要重新加入">
-    <p className="text-muted-foreground">这个浏览器保存的登录信息不见了。</p>
+    <p className="text-secondary">这个浏览器保存的登录信息不见了。</p>
     <Button type="button" className="w-fit justify-self-end" disabled={busy} onClick={() => void run(device.replaceLostKey)}>重新开始</Button>
   </Panel>
   else if (device.phase === 'removed') body = <Removed busy={busy} run={run} />
   else if (device.phase === 'restarting') body = <Panel icon={LoaderCircle} busy title="正在重新开始">
-    <p className="text-muted-foreground">旧数据已改名保留。这个节点重启好后，用加入链接把它加回来。</p>
+    <p className="text-secondary">旧数据已改名保留。这个节点重启好后，用加入链接把它加回来。</p>
   </Panel>
   else if (device.recovery) body = <RecoveryWaiting />
   else if (device.nodeJoining) body = <NodeJoin />
@@ -275,21 +272,21 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   else if (active === 'local' && setup && !names) body = <NamesStep initial={draftNames} onNext={setNames} onBack={() => setCreating(false)} />
   else if (active === 'local' && setup && names) body = <PasswordStep busy={busy || linking} disabled={!usable} names={names} onBack={() => { setDraftNames(names); setNames(null) }} run={run} />
   else if (active === 'local' && device.localSetup) body = <Panel icon={Laptop} title={device.localSetup.kind === 'initialized' ? computerName : '这个节点'}>
-    {device.localSetup.kind !== 'initialized' ? <p className="text-muted-foreground">用已有设备的加入链接，或恢复文件</p>
+    {device.localSetup.kind !== 'initialized' ? <p className="text-secondary">用已有设备的加入链接，或恢复文件</p>
       : local === 'open' ? <Button type="button" className="w-full sm:w-fit sm:justify-self-end" disabled={linking || !usable} onClick={() => void run(device.openLocalAccess)}><LogIn aria-hidden="true" />打开</Button>
       : <>
-        <p className="flex items-center gap-2 text-muted-foreground"><MessageSquareLock aria-hidden="true" className="size-4 shrink-0" />{localCopy.note}</p>
-        {device.localSetup.local_launch ? <Button type="button" variant="outline" className="w-full sm:w-fit sm:justify-self-end" disabled={linking || !usable} onClick={() => void run(device.openLocalAccess)}><Settings2 aria-hidden="true" />{localCopy.manage}</Button> : null}
+        <p className="flex items-center gap-2 text-secondary"><MessageSquareLock aria-hidden="true" className="size-4 shrink-0" />{localCopy.note}</p>
+        {device.localSetup.local_launch ? <Button type="button" variant="secondary" className="w-full sm:w-fit sm:justify-self-end" disabled={linking || !usable} onClick={() => void run(device.openLocalAccess)}><Settings2 aria-hidden="true" />{localCopy.manage}</Button> : null}
       </>}
   </Panel>
   else if (active === 'saved') body = <Panel icon={MonitorSmartphone} title="用过的地址">
     <ul className="grid gap-1">{device.entries.map((entry) => {
       const name = device.entryName(entry) || addressName(entryAddress(entry)), host = hostOf(entryAddress(entry))
-      return <li key={entryKey(entry)} className="flex min-h-11 items-center rounded-lg bg-muted/60">
-        <Button type="button" variant="ghost" className="h-auto min-h-11 min-w-0 flex-1 justify-start" title={entryAddress(entry)} disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}>
-          <span className="truncate">{name}{host && host !== name ? <span className="ms-2 text-meta text-muted-foreground">{host}</span> : null}</span>
+      return <li key={entryKey(entry)} className="flex min-h-11 items-center rounded-control bg-surface-muted/60">
+        <Button type="button" variant="ghost" className="h-auto min-w-0 flex-1 justify-start" title={entryAddress(entry)} disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}>
+          <span className="truncate">{name}{host && host !== name ? <span className="ms-2 text-sm text-secondary">{host}</span> : null}</span>
         </Button>
-        <Button type="button" variant="ghost" size="icon" className="size-11 shrink-0 text-muted-foreground" aria-label={`移除 ${name}`} title="移除" disabled={linking} onClick={() => {
+        <Button type="button" variant="ghost" size="md" className="shrink-0" aria-label={`移除 ${name}`} title="移除" disabled={linking} onClick={() => {
           try { device.removeEntry(entry); if (device.entries.length === 1) setLane(null) } catch (cause) { setError(messageOf(cause)) }
         }}><X aria-hidden="true" /></Button>
       </li>
@@ -300,23 +297,23 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     alertInBody = true
     body = <Panel icon={official ? QrCode : Link2} title={official ? '扫码加入' : thisComputer ? '把这个节点加入我的网络' : removed ? '重新加入' : '加入我的设备'}>
       {/* A failure or the removal notice already says where to go next. */}
-      {failed || removed ? null : <p className="-mt-2 text-meta text-muted-foreground">{joinCopy.linkSource(official && !thisComputer ? '你的节点' : undefined)}</p>}
+      {failed || removed ? null : <p className="-mt-2 text-sm text-secondary">{joinCopy.linkSource(official && !thisComputer ? '你的节点' : undefined)}</p>}
       {alert}
       {scanning && purpose !== 'link' ? <Scanner onTicket={(ticket) => { setInvitation(ticket); setScanning(false) }} onCancel={() => setScanning(false)} /> : <form className="grid gap-4" onSubmit={submitInvitation}>
         <fieldset disabled={linking || !usable} className="grid gap-4">
           {purpose !== 'link' && scanFirst ? <Button type="button" className="w-fit" onClick={() => setScanning(true)}><Camera aria-hidden="true" />{joinCopy.scan}</Button> : null}
           {purpose === 'empty' || purpose === 'invalid' ? <>
-            <Textarea ref={scanFirst ? undefined : claimFocus} className="h-20 min-h-0 resize-none field-sizing-fixed font-mono text-meta" name="invitation" required value={invitation} aria-label="加入链接" aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} placeholder={scanFirst ? joinCopy.paste : joinCopy.pasteFirst} onChange={(event) => setInvitation(event.target.value)} />
+            <Textarea label="加入链接" ref={scanFirst ? undefined : claimFocus} className="resize-none field-sizing-fixed font-mono" name="invitation" required value={invitation} aria-label="加入链接" aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} placeholder={scanFirst ? joinCopy.paste : joinCopy.pasteFirst} onChange={(event) => setInvitation(event.target.value)} />
             {purpose === 'invalid' ? <InlineError error={joinCopy.notLink} /> : null}
-            {scannable && !scanFirst ? <Button type="button" variant="ghost" className="-ms-3 w-fit text-muted-foreground" onClick={() => setScanning(true)}><Camera aria-hidden="true" />{joinCopy.scan}</Button> : null}
-          </> : <p className="flex min-h-11 items-center gap-2 rounded-lg bg-muted/60 ps-3">
-            <Link2 aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+            {scannable && !scanFirst ? <Button type="button" variant="ghost" className="-ms-3 w-fit" onClick={() => setScanning(true)}><Camera aria-hidden="true" />{joinCopy.scan}</Button> : null}
+          </> : <p className="flex min-h-11 items-center gap-2 rounded-control bg-surface-muted/60 ps-3">
+            <Link2 aria-hidden="true" className="size-4 shrink-0 text-secondary" />
             <span className="min-w-0 flex-1 truncate">{joinCopy.linkFilled}</span>
             <Button ref={claimFocus} type="button" variant="ghost" onClick={() => setInvitation('')}>换一个</Button>
           </p>}
           {thisComputer
-            ? <Field label="这个节点叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={defaultComputerName()} /></Field>
-            : <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={lastBrowserName() || defaultBrowserName()} /></Field>}
+            ? <div ><Input label="这个节点叫什么？" name="name" required maxLength={128} autoComplete="off" defaultValue={defaultComputerName()} /></div>
+            : <div ><Input label="这个浏览器叫什么？" name="name" required maxLength={128} autoComplete="off" defaultValue={lastBrowserName() || defaultBrowserName()} /></div>}
           {purpose === 'link' ? <Button type="submit" className="w-fit justify-self-end" aria-busy={linking || undefined}>{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}{linking ? joinCopy.joining : joinCopy.join}</Button> : null}
         </fieldset>
       </form>}
@@ -324,10 +321,10 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   }
 
   return <AuthPage header={<>
-    {standalone() && !device.entries.length && !focused ? <p className="text-meta text-muted-foreground">主屏幕上的 Vibeface 需要单独加入一次</p> : null}
+    {standalone() && !device.entries.length && !focused ? <p className="text-sm text-secondary">主屏幕上的 Vibeface 需要单独加入一次</p> : null}
     {step ? <Steps step={step} /> : null}
   </>}>
-    {linking && !focused ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />{device.queued ? `排队中，第 ${device.queued} 位` : device.phase === 'reconnecting' ? '正在重连' : '连接中'}</p> : null}
+    {linking && !focused ? <p role="status" className="flex items-center gap-2 text-sm text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />{device.queued ? `排队中，第 ${device.queued} 位` : device.phase === 'reconnecting' ? '正在重连' : '连接中'}</p> : null}
     {alertInBody ? null : alert}
     {device.phase === 'initializing' ? <Skeleton className="h-48" /> : body}
     {other}
@@ -342,10 +339,10 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
           void run(() => device.connect(parseEntry({ address, device_id: deviceId })))
         }}>
           <fieldset disabled={linking} className="grid gap-3">
-            <Field label="访问地址"><Input key={device.gateway} type="url" name="address" defaultValue={device.gateway} /></Field>
-            <Field label="设备编号"><Input className="font-mono" name="device_id" placeholder={gatewayNode ? manualCopy.optional : undefined} autoComplete="off" autoCapitalize="none" spellCheck={false} /></Field>
-            <p className="-mt-1 text-muted-foreground">{manualCopy.where}</p>
-            <Button type="submit" variant="outline" className="w-fit">连接</Button>
+            <div ><Input label="访问地址" key={device.gateway} type="url" name="address" defaultValue={device.gateway} /></div>
+            <div ><Input label="设备编号" className="font-mono" name="device_id" placeholder={gatewayNode ? manualCopy.optional : undefined} autoComplete="off" autoCapitalize="none" spellCheck={false} /></div>
+            <p className="-mt-1 text-secondary">{manualCopy.where}</p>
+            <Button type="submit" variant="secondary" className="w-fit">连接</Button>
           </fieldset>
         </form>
       </Details> : null}
@@ -358,9 +355,9 @@ type Names = { computer: string; browser: string }
 
 /** Two equal ways on for a computer not set up yet: a second computer joins the first instead of starting another network. */
 function StartChoice({ onCreate, onJoin }: { onCreate(): void; onJoin(): void }) {
-  const option = (id: string, Icon: typeof Link2, title: string, note: string, onClick: () => void) => <Button type="button" variant="outline" aria-label={title} aria-describedby={id} className="h-auto min-h-24 flex-col items-start justify-start gap-3 whitespace-normal p-4 text-start" onClick={onClick}>
-    <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-muted text-muted-foreground ring-1 ring-border"><Icon aria-hidden="true" className="size-5" /></span>
-    <span className="grid gap-0.5"><span className="text-heading font-semibold">{title}</span><span id={id} className="text-meta font-normal text-muted-foreground">{note}</span></span>
+  const option = (id: string, Icon: typeof Link2, title: string, note: string, onClick: () => void) => <Button type="button" variant="secondary" aria-label={title} aria-describedby={id} className="h-auto flex-col items-start justify-start gap-3 whitespace-normal text-start" onClick={onClick}>
+    <span className="grid size-9 shrink-0 place-items-center rounded-panel bg-surface-muted text-secondary  "><Icon aria-hidden="true" className="size-5" /></span>
+    <span className="grid gap-0.5"><span className="text-lg font-medium">{title}</span><span id={id} className="text-sm font-normal text-secondary">{note}</span></span>
   </Button>
   return <div role="group" aria-label="开始使用" className="grid gap-3 sm:grid-cols-2">
     {option('start-create-note', CirclePlus, startCopy.create, startCopy.createNote, onCreate)}
@@ -372,9 +369,9 @@ function StartChoice({ onCreate, onJoin }: { onCreate(): void; onJoin(): void })
 function NamesStep({ initial, onNext, onBack }: { initial: Names | null; onNext(names: Names): void; onBack(): void }) {
   return <Panel icon={Laptop} title="给这个节点起名">
     <form className="grid gap-4" onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; onNext({ computer: value(form, 'computer').trim(), browser: value(form, 'browser').trim() || defaultBrowserName() }) }}>
-      <Input name="computer" aria-label="这个节点叫什么？" required maxLength={128} autoComplete="off" defaultValue={initial?.computer || defaultComputerName()} />
+      <Input label="这个节点叫什么？" name="computer" aria-label="这个节点叫什么？" required maxLength={128} autoComplete="off" defaultValue={initial?.computer || defaultComputerName()} />
       <Details label="这个浏览器的名字">
-        <Input name="browser" aria-label="这个浏览器叫什么？" maxLength={128} autoComplete="off" className="text-foreground" defaultValue={initial?.browser ?? defaultBrowserName()} />
+        <Input label="这个浏览器叫什么？" name="browser" aria-label="这个浏览器叫什么？" maxLength={128} autoComplete="off" defaultValue={initial?.browser ?? defaultBrowserName()} />
       </Details>
       <div className="flex justify-between gap-2">
         <Button type="button" variant="ghost" className="-ms-3" onClick={onBack}>上一步</Button>
@@ -393,7 +390,7 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
   const [tried, setTried] = useState(false)
   const weak = passwordStrength(password).level === 'weak'
   return <Panel icon={KeyRound} title="设置恢复密码">
-    <p className="-mt-2 flex items-center gap-2 text-meta text-muted-foreground"><LifeBuoy aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.passwordWhy}</p>
+    <p className="-mt-2 flex items-center gap-2 text-sm text-secondary"><LifeBuoy aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.passwordWhy}</p>
     <form className="grid gap-4" noValidate onSubmit={(event) => {
       event.preventDefault()
       const form = event.currentTarget
@@ -406,9 +403,7 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
     }}>
       <fieldset disabled={busy || disabled} className="grid gap-4">
         <div className="grid gap-1.5">
-          <Field label="恢复密码">
-            <PasswordInput name="password" autoComplete="new-password" aria-invalid={tried && weak || undefined} aria-describedby="password-hint" onChange={(event) => { setPassword(event.target.value); setTried(false) }} />
-          </Field>
+          <div ><PasswordInput label="恢复密码" name="password" autoComplete="new-password" aria-invalid={tried && weak || undefined} aria-describedby="password-hint" onChange={(event) => { setPassword(event.target.value); setTried(false) }} /></div>
           <PasswordStrength id="password-hint" password={password} tried={tried} />
         </div>
         <div className="flex justify-between gap-2">
@@ -449,7 +444,7 @@ function BrowserJoin() {
   return <Panel icon={Hourglass} title="等待批准">
     {device.info ? <Reached /> : null}
     <JoinCode code={joining.code} admin={joining.admin} />
-    {device.phase === 'reconnecting' ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />正在重连，请求还在</p> : null}
+    {device.phase === 'reconnecting' ? <p role="status" className="flex items-center gap-2 text-sm text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />正在重连，请求还在</p> : null}
     <Button type="button" variant="ghost" className="-ms-3 w-fit" onClick={device.cancelJoin}>取消</Button>
     <Details><CopyDiagnostics lines={[['这个浏览器', device.identity?.deviceId], ['加入请求', joining.join_id]]} /></Details>
   </Panel>
@@ -457,5 +452,5 @@ function BrowserJoin() {
 
 /** The request reached one of the person's devices; both join pages say it the same way. */
 function Reached() {
-  return <p className="flex items-center gap-2 text-meta text-muted-foreground"><ShieldCheck aria-hidden="true" className="size-4 shrink-0 text-success" />{joinCopy.reached}</p>
+  return <p className="flex items-center gap-2 text-sm text-secondary"><ShieldCheck aria-hidden="true" className="size-4 shrink-0 text-success" />{joinCopy.reached}</p>
 }

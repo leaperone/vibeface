@@ -13,12 +13,12 @@ import { recoveryTarget } from '@vibeface/client/identity/recovery-link.ts'
 import { passphrase, passwordStrength, recoveryFileStem, type RecoveryFile } from '@vibeface/client/lib/secure.ts'
 import { ErrorText } from '@/components/action'
 import { ActionCard, Panel, toast } from '@/components/kit'
-import { Button } from '@/components/ui/button'
-import { Icon } from '@/components/ui/icon'
-import { Input } from '@/components/ui/input'
-import { Switch } from '@/components/ui/switch'
-import { Text } from '@/components/ui/text'
-import { Textarea } from '@/components/ui/textarea'
+import { Button } from '@/components/arc/button'
+import { Icon } from '@/components/arc/icon'
+import { Input } from '@/components/arc/input'
+import { Switch } from '@/components/arc/switch'
+import { Text } from '@/components/arc/text'
+import { Textarea } from '@/components/arc/textarea'
 import { deviceIcon } from '@/features/devices/device-icon'
 import { Scanner } from '@/features/devices/scanner'
 import { useRun } from '@/lib/use-run'
@@ -48,14 +48,14 @@ function FilePick({ picked, onPick, disabled }: { picked: PickedFile | null; onP
     }) } catch (cause) { if (live.current) Alert.alert('未能读取恢复文件', messageOf(cause)) }
     finally { picking.current = false }
   }
-  return <Button variant="outline" className="self-start" disabled={disabled} onPress={() => void choose()}>
+  return <Button variant="secondary" className="self-start" disabled={disabled} onPress={() => void choose()}>
     <Icon as={picked ? FileCheck : FileKey} className={picked ? 'text-success' : undefined} />
     <Text numberOfLines={1} className="shrink">{picked ? picked.name : '选择恢复文件'}</Text>
   </Button>
 }
 
 const passwordProps = { secureTextEntry: true, autoCapitalize: 'none', autoCorrect: false } as const
-const hint = (icon: LucideIcon, text: string, tone = 'text-muted-foreground') => <View className="flex-row items-center gap-2"><Icon as={icon} className={`size-4 ${tone}`} /><Text className={`min-w-0 flex-1 text-meta ${tone}`}>{text}</Text></View>
+const hint = (icon: LucideIcon, text: string, tone = 'text-muted') => <View className="flex-row items-center gap-2"><Icon as={icon} className={`size-4 ${tone}`} /><Text className={`min-w-0 flex-1 text-sm ${tone}`}>{text}</Text></View>
 
 /** Find devices again with the recovery file: the computer to go through from its QR code or link, then the file and its password. */
 export function RecoveryRestore({ link }: { link?: string | null }) {
@@ -78,14 +78,14 @@ export function RecoveryRestore({ link }: { link?: string | null }) {
   const locked = busy !== null || Boolean(device.review)
   if (!target) return <PickTarget onPicked={setTarget} />
   return <View className="gap-4">
-    <Text className="text-meta text-muted-foreground">{recoveryCopy.scope}</Text>
-    <View className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
-      <Icon as={Laptop} className="size-4 text-muted-foreground" />
+    <Text className="text-sm text-muted">{recoveryCopy.scope}</Text>
+    <View className="min-h-11 flex-row items-center gap-2 rounded-control bg-surface-muted/60 ps-3">
+      <Icon as={Laptop} className="size-4 text-muted" />
       <View className="min-w-0 flex-1 py-1.5">
-        <Text className="text-meta text-muted-foreground">{recoveryCopy.target}</Text>
+        <Text className="text-sm text-muted">{recoveryCopy.target}</Text>
         <Text numberOfLines={1} ellipsizeMode="middle">{entryAddress(target)}</Text>
       </View>
-      <Button variant="ghost" size="icon" accessibilityLabel="换一个节点" disabled={locked} onPress={() => setTarget(null)}><Icon as={X} /></Button>
+      <Button variant="ghost" iconOnly accessibilityLabel="换一个节点" disabled={locked} onPress={() => setTarget(null)}><Icon as={X} /></Button>
     </View>
     <FilePick picked={picked} onPick={setPicked} disabled={locked} />
     <Input {...passwordProps} accessibilityLabel="恢复密码" placeholder="恢复密码" value={password} onChangeText={setPassword} editable={!locked} />
@@ -109,11 +109,11 @@ function PickTarget({ onPicked }: { onPicked(entry: ConnectionEntry): void }) {
   }
   if (scanning) return <Scanner title={recoveryCopy.scan} onCancel={() => setScanning(false)} onScanned={(value) => { setScanning(false); take(value) }} />
   return <View className="gap-4">
-    <Text className="text-meta text-muted-foreground">{recoveryCopy.scope}</Text>
+    <Text className="text-sm text-muted">{recoveryCopy.scope}</Text>
     <Button onPress={() => setScanning(true)}><Icon as={QrCode} /><Text>{recoveryCopy.scan}</Text></Button>
     <View className="gap-2">
       <Textarea accessibilityLabel={recoveryCopy.pasteLabel} placeholder={recoveryCopy.paste} autoCapitalize="none" autoCorrect={false} numberOfLines={3}
-        className="min-h-16 font-mono text-meta" value={text} submitBehavior="blurAndSubmit" returnKeyType="done"
+        className="min-h-16 font-mono text-sm" value={text} submitBehavior="blurAndSubmit" returnKeyType="done"
         // A half-typed link can already parse to another port, so typed text is read once it is finished.
         onChangeText={value => { setText(value); setWrong(false) }} onEndEditing={event => take(event.nativeEvent.text)} />
       <Button variant="ghost" className="-ms-3 self-start" onPress={async () => take((await Clipboard.getStringAsync().catch(() => '')).trim())}>
@@ -138,14 +138,14 @@ export function RecoveryReview() {
       {[...review.members].sort((a, b) => Number(b.device_id === review.requiredNode) - Number(a.device_id === review.requiredNode)).map((member) => {
         const required = member.device_id === review.requiredNode
         const gone = lost.includes(member.device_id)
-        return <View key={member.device_id} className="min-h-12 flex-row items-center gap-2 rounded-lg bg-muted/60 px-3">
-          <Icon as={deviceIcon({ kind: member.kind, name: member.name, current: false })} className="size-4 text-muted-foreground" />
+        return <View key={member.device_id} className="min-h-12 flex-row items-center gap-2 rounded-control bg-surface-muted/60 px-3">
+          <Icon as={deviceIcon({ kind: member.kind, name: member.name, current: false })} className="size-4 text-muted" />
           <View className="min-w-0 flex-1 py-1.5">
-            <Text numberOfLines={1} className={gone ? 'text-muted-foreground line-through' : undefined}>{member.name}</Text>
-            {gone ? <Text className="text-meta text-danger">生效后移出</Text> : null}
+            <Text numberOfLines={1} className={gone ? 'text-muted line-through' : undefined}>{member.name}</Text>
+            {gone ? <Text className="text-sm text-danger">生效后移出</Text> : null}
           </View>
-          {required ? <Text className="text-meta text-muted-foreground">当前连接</Text> : <>
-            <Text className="text-meta">丢了</Text>
+          {required ? <Text className="text-sm text-muted">当前连接</Text> : <>
+            <Text className="text-sm">丢了</Text>
             <Switch accessibilityLabel={`${member.name} 丢了`} value={gone} disabled={busy !== null} onValueChange={(on) => setLost(on ? [...lost, member.device_id] : lost.filter((id) => id !== member.device_id))} />
           </>}
         </View>
@@ -158,7 +158,7 @@ export function RecoveryReview() {
       <Button variant="ghost" className="-ms-3" onPress={device.cancelSensitive}><Text>取消</Text></Button>
       <Button disabled={busy !== null} onPress={recover}><Text>{busy ? '找回中' : '找回'}</Text></Button>
     </View>
-    {busy ? <Text className="text-meta text-muted-foreground">{recoveryCopy.cancelLate}</Text> : null}
+    {busy ? <Text className="text-sm text-muted">{recoveryCopy.cancelLate}</Text> : null}
   </Panel>
 }
 
@@ -168,17 +168,17 @@ function SaveRecoveryFile({ code, saved, onSaved, save }: { code: string; saved:
   return <>
     {hint(LifeBuoy, recoveryCopy.why)}
     {hint(FileWarning, recoveryCopy.onlyCopy)}
-    {done ? <View className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
+    {done ? <View className="min-h-11 flex-row items-center gap-2 rounded-control bg-surface-muted/60 ps-3">
       <Icon as={CircleCheck} className="size-4 text-success" />
       {/* The code is what tells files apart; on a narrow screen the shared prefix gives way first. */}
-      <Text accessibilityLabel={`已打开分享 ${recoveryFileStem(code)}`} numberOfLines={1} ellipsizeMode="head" className="min-w-0 flex-1 py-2 font-mono text-meta">
-        <Text className="font-mono text-meta text-muted-foreground">{recoveryFileStem('')}</Text><Text className="font-mono text-meta font-medium tracking-wide">{code}</Text>
+      <Text accessibilityLabel={`已打开分享 ${recoveryFileStem(code)}`} numberOfLines={1} ellipsizeMode="head" className="min-w-0 flex-1 py-2 font-mono text-sm">
+        <Text className="font-mono text-sm text-muted">{recoveryFileStem('')}</Text><Text className="font-mono text-sm font-medium tracking-wide">{code}</Text>
       </Text>
       {save ? <Button variant="ghost" onPress={save.run}><Text>重新分享</Text></Button> : null}
     </View> : save ? <Button className="self-start" onPress={save.run}><Icon as={Download} /><Text>另存恢复文件</Text></Button> : <ErrorText error="应用内恢复副本已丢失。请用你已另存的恢复文件重新打开，或连接管理设备后更换恢复文件。" />}
-    {save ? <Text className="text-meta text-muted-foreground">应用内保留密封副本。关闭分享不会自动另存，请确认已保存到应用外。</Text> : null}
+    {save ? <Text className="text-sm text-muted">应用内保留密封副本。关闭分享不会自动另存，请确认已保存到应用外。</Text> : null}
     <View className="min-h-11 flex-row items-center justify-between gap-3">
-      <Text className={`min-w-0 flex-1 ${done ? '' : 'text-muted-foreground'}`}>{recoveryCopy.keptApart}</Text>
+      <Text className={`min-w-0 flex-1 ${done ? '' : 'text-muted'}`}>{recoveryCopy.keptApart}</Text>
       <Switch accessibilityLabel={recoveryCopy.keptApart} value={saved} disabled={!done} onValueChange={onSaved} />
     </View>
   </>
@@ -199,7 +199,7 @@ function UnsavedRecoveryFile() {
   const [clearError, setClearError] = useState('')
   if (!unsavedRecovery || !save) return null
   return <View className="gap-3 border-t border-border pt-4">
-    <View className="flex-row items-center gap-2"><Icon as={FileKey} className="size-4 text-muted-foreground" /><Text role="heading" className="font-medium">{recoveryCopy.saveNew}</Text></View>
+    <View className="flex-row items-center gap-2"><Icon as={FileKey} className="size-4 text-muted" /><Text role="heading" className="font-medium">{recoveryCopy.saveNew}</Text></View>
     {hint(KeyRound, recoveryCopy.samePassword)}
     <SaveRecoveryFile code={unsavedRecovery.code} saved={false} onSaved={(saved) => { if (saved) { try { forgetUnsavedRecovery() } catch (cause) { setClearError(messageOf(cause)) } } }} save={save} />
     <ErrorText error={error || clearError} />
@@ -223,22 +223,22 @@ export function RecoveryPendingCard() {
   ])
   // Stopping is the safe answer, so it leads at full weight; letting it take effect early comes last and quietest.
   return <ActionCard icon={ShieldAlert} tone="danger" title={recoveryCopy.pending} actions={<View className="w-full gap-2">
-    <Button variant="destructive" className="bg-destructive shadow-xs active:bg-destructive/90 dark:bg-destructive dark:active:bg-destructive/90" disabled={busy !== null} onPress={stop}>
-      <Icon as={Hand} className="text-primary-foreground" /><Text className="text-primary-foreground">{busy ? '处理中' : recoveryCopy.stop}</Text>
+    <Button variant="danger" disabled={busy !== null} onPress={stop}>
+      <Icon as={Hand} /><Text>{busy ? '处理中' : recoveryCopy.stop}</Text>
     </Button>
-    <Button variant="outline" disabled={busy !== null} onPress={() => { device.dismissPendingRecovery(); toast(recoveryCopy.itsMeDone(pending.effective_at_ms - device.nodeClockOffset)) }}><Text>{recoveryCopy.itsMe}</Text></Button>
+    <Button variant="secondary" disabled={busy !== null} onPress={() => { device.dismissPendingRecovery(); toast(recoveryCopy.itsMeDone(pending.effective_at_ms - device.nodeClockOffset)) }}><Text>{recoveryCopy.itsMe}</Text></Button>
     <Button variant="ghost" disabled={busy !== null} onPress={confirm}><Icon as={ShieldCheck} /><Text>{recoveryCopy.confirm}</Text></Button>
   </View>}>
     {hint(Hourglass, recoveryCopy.effectiveIn(pending.effective_at_ms - device.nodeClockOffset), 'text-danger')}
-    {changes.some(({ added }) => !added) ? <Text className="text-meta text-muted-foreground">{recoveryCopy.outIfNotStopped}</Text> : null}
+    {changes.some(({ added }) => !added) ? <Text className="text-sm text-muted">{recoveryCopy.outIfNotStopped}</Text> : null}
     {changes.map(({ member, added }) => {
       const current = member.device_id === device.identity?.deviceId
       return <View key={member.device_id} className="min-w-0 flex-row items-center gap-2">
         <Icon as={added ? CirclePlus : CircleMinus} accessibilityLabel={added ? '加入' : '移出'} className={`size-4 ${added ? 'text-warning' : 'text-danger'}`} />
-        <Icon as={deviceIcon({ kind: member.kind, name: member.name, current })} className="size-4 text-muted-foreground" />
-        <Text numberOfLines={1} className={`shrink ${added ? '' : 'text-muted-foreground line-through'}`}>{member.name}</Text>
-        {added ? <Text className="rounded-md bg-warning-soft px-1.5 text-meta text-warning">{recoveryCopy.added}</Text>
-          : current ? <Text className="rounded-md bg-muted px-1.5 text-meta text-muted-foreground">{self}</Text> : null}
+        <Icon as={deviceIcon({ kind: member.kind, name: member.name, current })} className="size-4 text-muted" />
+        <Text numberOfLines={1} className={`shrink ${added ? '' : 'text-muted line-through'}`}>{member.name}</Text>
+        {added ? <Text className="rounded-control bg-warning-subtle px-1.5 text-sm text-warning">{recoveryCopy.added}</Text>
+          : current ? <Text className="rounded-control bg-surface-muted px-1.5 text-sm text-muted">{self}</Text> : null}
       </View>
     })}
     <ErrorText error={error} />
@@ -252,11 +252,11 @@ export function RecoveryAlert({ top }: { top: number }) {
   if (!pending) return null
   return <View pointerEvents="box-none" className="absolute inset-x-0 w-full max-w-3xl self-center px-4" style={{ top: top + 8 }}>
     <Link href="/tasks" asChild>
-      <Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-2.5 rounded-xl border border-danger-border bg-card py-1.5 ps-1.5 pe-3 shadow-xs active:bg-muted">
-        <View className="size-8 items-center justify-center rounded-lg bg-danger-soft"><Icon as={ShieldAlert} className="size-4 text-danger" /></View>
+      <Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-2.5 rounded-panel border border-danger-border bg-surface py-1.5 ps-1.5 pe-3  active:bg-surface-muted">
+        <Icon as={ShieldAlert} className="size-5 text-danger" />
         <Text numberOfLines={1} className="min-w-0 flex-1 font-medium">{recoveryCopy.pending}</Text>
-        <Text className="text-meta text-danger" style={{ fontVariant: ['tabular-nums'] }}>{recoveryCopy.effectiveIn(pending.effective_at_ms - device.nodeClockOffset)}</Text>
-        <Icon as={ChevronRight} className="size-4 text-muted-foreground" />
+        <Text className="text-sm text-danger" style={{ fontVariant: ['tabular-nums'] }}>{recoveryCopy.effectiveIn(pending.effective_at_ms - device.nodeClockOffset)}</Text>
+        <Icon as={ChevronRight} className="size-4 text-muted" />
       </Pressable>
     </Link>
   </View>
@@ -278,13 +278,13 @@ export function RotateHintCard() {
 export function RecoveryWaiting() {
   const { recovery, dismissRecovery, forgetUnsavedRecovery } = useDevice()
   if (recovery?.status === 'stopped') return <Panel icon={ShieldX} title={recoveryCopy.stopped}>
-    <Text className="text-muted-foreground">{recoveryCopy.stoppedNote}</Text>
+    <Text className="text-muted">{recoveryCopy.stoppedNote}</Text>
     <Button className="self-end" onPress={() => { forgetUnsavedRecovery(); dismissRecovery() }}><Text>知道了</Text></Button>
   </Panel>
   const at = recovery?.status === 'waiting' ? recovery.effectiveAt : null
   return <Panel icon={Hourglass} title={recoveryCopy.waiting}>
     {at === null ? null : <>
-      <Text role="status" className="text-heading font-semibold" style={{ fontVariant: ['tabular-nums'] }}>{recoveryCopy.left(at)}</Text>
+      <Text role="status" className="text-lg font-medium" style={{ fontVariant: ['tabular-nums'] }}>{recoveryCopy.left(at)}</Text>
       {hint(CalendarClock, `${whenText(at)} ${recoveryCopy.autoEnter}`)}
     </>}
     {hint(BellRing, recoveryCopy.managersSee)}
@@ -313,11 +313,11 @@ export function RecoveredStep() {
 /** Under a new recovery password, as on the web: an icon and a word for how hard it is to guess, and why a weak one is refused. */
 function PasswordStrength({ password, tried }: { password: string; tried: boolean }) {
   const strength = password ? passwordStrength(password) : null
-  if (!strength || strength.level === 'weak' && strength.problem === 'short' && !tried) return <Text className={tried ? 'text-meta text-danger' : 'text-meta text-muted-foreground'}>{passwordCopy.short}</Text>
-  const tone = strength.level === 'weak' ? 'text-danger' : strength.level === 'strong' ? 'text-success' : 'text-muted-foreground'
+  if (!strength || strength.level === 'weak' && strength.problem === 'short' && !tried) return <Text className={tried ? 'text-sm text-danger' : 'text-sm text-muted'}>{passwordCopy.short}</Text>
+  const tone = strength.level === 'weak' ? 'text-danger' : strength.level === 'strong' ? 'text-success' : 'text-muted'
   return <View className="flex-row items-center gap-1.5">
     <Icon as={strength.level === 'weak' ? ShieldX : strength.level === 'strong' ? ShieldCheck : Shield} className={`size-4 ${tone}`} />
-    <Text className={`shrink text-meta ${tone}`}>{passwordCopy.label[strength.level]}{strength.level === 'weak' ? ` · ${passwordCopy[strength.problem]}` : ''}</Text>
+    <Text className={`shrink text-sm ${tone}`}>{passwordCopy.label[strength.level]}{strength.level === 'weak' ? ` · ${passwordCopy[strength.problem]}` : ''}</Text>
   </View>
 }
 
@@ -339,14 +339,14 @@ export function ReplaceRecovery() {
   }, recoveryCopy.replaced)
   const locked = busy !== null || Boolean(device.review)
   return <View className="gap-4">
-    <Text className="text-meta text-muted-foreground">{recoveryCopy.replaceHint}</Text>
+    <Text className="text-sm text-muted">{recoveryCopy.replaceHint}</Text>
     <FilePick picked={picked} onPick={change(setPicked)} disabled={locked} />
     <Input {...passwordProps} accessibilityLabel="旧密码" placeholder="旧密码" value={oldPassword} onChangeText={change(setOldPassword)} editable={!locked} />
     <View className="gap-1.5">
       <Input {...passwordProps} accessibilityLabel="新密码" placeholder="新密码" value={password} onChangeText={change(setPassword)} editable={!locked} />
       <PasswordStrength password={password} tried={tried} />
     </View>
-    {status ? <Text role="status" className="text-meta text-success">{status}</Text> : null}
+    {status ? <Text role="status" className="text-sm text-success">{status}</Text> : null}
     <ErrorText error={error} />
     <Button disabled={locked || !picked || !oldPassword || !password} onPress={submit}>
       <Text>{busy ? '处理中' : '换密码并保存新文件'}</Text>

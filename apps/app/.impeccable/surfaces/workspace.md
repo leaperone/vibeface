@@ -1,38 +1,13 @@
-# Web 工作区
+# Web workspace
 
-## Mode
+Mode: operate. The person reads the current Bot, task or channel, reviews states that need attention, and performs the next action.
 
-Operate
+Arc at `859606819c68787b2dccb54adcb9b08bd3272d5d` is the only UI authority. `src/components/arc/source.json` maps product compositions to pinned items. `packages/theme/theme.css` derives semantic colors, typography, radii and motion from foundation. The theme attribute is `data-theme`; Inter is the body face, Geist the display face and Geist Mono the code face.
 
-## Job
+The desktop sidebar rail lists real channels and Bots. Narrow screens retain messages, tasks and settings tabs and use an Arc navigation drawer. Conversation and task inspectors have separate scroll areas. Task overview uses real counts and record grouping, with no decorative hero. Settings and devices group related rows and actual controls. Joining and recovery preserve code checks and consequences.
 
-让个人快速看懂当前 Bot/任务状态，并完成下一步操作。
+Preserve product copy, route ownership, keyboard actions, async status, retained drafts, attachment validation and verified download. Preserve unknown results until reconciliation. Do not replace operations with showcase activity or computed fake progress. Every region must represent loading, empty, offline, waiting, recovery, failure, disabled state and long values.
 
-## Reading order
+Arc controls own their appearance. Product CSS Modules own layout and domain presentation. Arc foundation owns keyboard focus; all motion respects reduced-motion preferences. Native video capture and hidden attachment picking remain browser accommodations.
 
-1. 当前上下文（Bot、任务或频道）
-2. 需要注意的等待、错误或恢复状态
-3. 对话/任务内容
-4. 一个明确的下一步动作
-
-## Preserve
-
-- 侧栏导航、键盘顺序、消息与任务的独立上下文
-- 未知写入结果先对账的文案和状态
-- 现有主题、Bot face、焦点环和响应式断点
-
-## Quieting and layout decisions
-
-- 让标题、上下文和动作共享同一中列对齐线。
-- 使用邻近关系和分隔线表达列表分组，避免增加嵌套卡片。
-- 保留等待、恢复、离线的颜色，但始终配合文字或图标。
-- 页面只保留一个主任务路径；辅助动作进入现有 header action slot。
-- 宽屏使用侧栏，窄屏使用返回和抽屉；不引入新的导航模式。
-
-## Required states
-
-loading, empty, offline, waiting, recovery, failed, keyboard focus, narrow viewport, long text.
-
-## Acceptance evidence
-
-浏览器渲染检查需覆盖宽屏、窄屏、深色模式、键盘焦点、长文本和待处理状态。
+Verification uses source audit, TypeScript, existing behavior tests and a real production build. Project policy reserves screenshots, e2e and browser acceptance for an explicit user request; no visual acceptance is implied by source review or compilation.

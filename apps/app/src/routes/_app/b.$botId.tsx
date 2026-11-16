@@ -1,6 +1,6 @@
-import { createFileRoute, Outlet } from '@tanstack/react-router'
-import { useEffect } from 'react'
+import { createFileRoute,Outlet } from '@tanstack/react-router'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
+import { useEffect } from 'react'
 
 export const Route = createFileRoute('/_app/b/$botId')({ validateSearch: (search: Record<string, unknown>): { routine?: string } => typeof search.routine === 'string' ? { routine: search.routine } : {}, component: ChatRoute })
 

@@ -1,3 +1,4 @@
+import { Card } from '@/components/arc/surface'
 import { Link } from 'expo-router'
 import { AlarmClock, ArrowRight, ArrowRightLeft, BookOpen, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Cpu, Hand, Hourglass, Laptop, Link2, LoaderCircle, NotebookPen, Repeat, ScrollText, Smile, TriangleAlert, Undo2, Unplug, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { useState, type ReactNode } from 'react'
@@ -15,9 +16,9 @@ import type { AvatarEdit, BotChange, BotChangeRecord, ManagerJob, Overwritten, P
 import { BotFace } from '@/components/bot-face'
 import { ActionButton } from '@/components/action'
 import { ActionCard, Details, providerIcons } from '@/components/kit'
-import { Icon } from '@/components/ui/icon'
-import { Input } from '@/components/ui/input'
-import { Text } from '@/components/ui/text'
+import { Icon } from '@/components/arc/icon'
+import { Input } from '@/components/arc/input'
+import { Text } from '@/components/arc/text'
 import { useLive } from '@/data/live'
 import { cn } from '@/lib/utils'
 import { InputStatus } from '@/features/workspace/workspace'
@@ -67,10 +68,10 @@ export function useChatExtras(conversationId: string, botId: string) {
   })
   for (const job of jobs) {
     const at = job.reply_message_id && shown.has(job.reply_message_id) ? job.reply_message_id : job.message_id
-    if (job.runtime) add(at, { key: `runtime:${job.trigger}`, node: <Details label="运行信息"><Text className="text-meta text-muted-foreground">{runtimeLabel(job.runtime)}</Text></Details> })
-    if (job.state === 'reconciling' || job.pending_check) cards.push(<ActionCard key={`reconcile:${job.trigger}`} icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => shared.refresh()}>再查一次</ActionButton>}><Text className="text-meta text-muted-foreground">设备正在查询上次回复，系统不会自动重发。</Text></ActionCard>)
+    if (job.runtime) add(at, { key: `runtime:${job.trigger}`, node: <Details label="运行信息"><Text className="text-sm text-muted">{runtimeLabel(job.runtime)}</Text></Details> })
+    if (job.state === 'reconciling' || job.pending_check) cards.push(<ActionCard key={`reconcile:${job.trigger}`} icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => shared.refresh()}>再查一次</ActionButton>}><Text className="text-sm text-muted">设备正在查询上次回复，系统不会自动重发。</Text></ActionCard>)
     const message = data.messages.find((message) => message.message_id === job.message_id && message.role === 'user')
-    if (job.state === 'queued' && message) add(job.message_id, { key: `queued:${job.trigger}`, node: <Text className="text-meta text-muted-foreground">{job.hold_reason ? queueHoldLabels[job.hold_reason] : '等待开始工作'}</Text> })
+    if (job.state === 'queued' && message) add(job.message_id, { key: `queued:${job.trigger}`, node: <Text className="text-sm text-muted">{job.hold_reason ? queueHoldLabels[job.hold_reason] : '等待开始工作'}</Text> })
     if ((job.state === 'failed' || job.state === 'rejected') && job.message_id && shown.has(job.message_id) && !shown.has(job.reply_message_id ?? '')) add(at, { key: `job:${job.trigger}`, node: <JobLine job={job} /> })
   }
   const changes = placeChanges(data.messages, data.changes)
@@ -100,40 +101,40 @@ function TaskCard({ work, state, stale, away, joined, botId, device, agent, prog
   const href = `/b/${botId}/work/${work.work_id}` as const
   const meta = <View className="min-w-0 flex-row items-center gap-1">
     {agent ? <>
-      <Icon as={providerIcons[agent]} className="size-3.5 text-muted-foreground" />
-      <Text className="text-meta text-muted-foreground">{providerNames[agent]} ·</Text>
+      <Icon as={providerIcons[agent]} className="size-3.5 text-muted" />
+      <Text className="text-sm text-muted">{providerNames[agent]} ·</Text>
     </> : null}
-    <Icon as={Laptop} className="size-3.5 text-muted-foreground" />
-    <Text numberOfLines={1} className="shrink text-meta text-muted-foreground">{device}</Text>
-    <Text className="text-meta text-muted-foreground">· {stale ? staleTaskLabel : away ? taskCopy.away : taskLabel(state)}</Text>
+    <Icon as={Laptop} className="size-3.5 text-muted" />
+    <Text numberOfLines={1} className="shrink text-sm text-muted">{device}</Text>
+    <Text className="text-sm text-muted">· {stale ? staleTaskLabel : away ? taskCopy.away : taskLabel(state)}</Text>
   </View>
   if (!open) {
     // A failed task's text is what it said before failing, so its cause leads.
     const result = failed ? workFailure(work) : work.result_text ? work.result_text.split('\n')[0] : workFailure(work) || (state === 'interrupted' ? interruptedCopy.reason : '')
     const icon = state === 'interrupted' ? CircleStop : failed ? CircleX : CircleCheck
     return <Link href={href} asChild>
-      <Pressable accessibilityRole="link" className="-mx-2 min-h-11 flex-row items-start gap-2 rounded-lg px-2 py-2 active:bg-muted">
-        <Icon as={icon} className={cn('mt-0.5 size-4', failed ? 'text-danger' : icon === CircleCheck ? 'text-success' : 'text-muted-foreground')} />
+      <Pressable accessibilityRole="link" className="-mx-2 min-h-11 flex-row items-start gap-2 rounded-control px-2 py-2 active:bg-surface-muted">
+        <Icon as={icon} className={cn('mt-0.5 size-4', failed ? 'text-danger' : icon === CircleCheck ? 'text-success' : 'text-muted')} />
         <View className="min-w-0 flex-1">
-          <Text numberOfLines={1} className="text-meta text-foreground">{title}</Text>
+          <Text numberOfLines={1} className="text-sm text-foreground">{title}</Text>
           {meta}
-          {result ? <Text className="text-meta text-muted-foreground">{result}</Text> : null}
+          {result ? <Text className="text-sm text-muted">{result}</Text> : null}
         </View>
-        <Icon as={ChevronRight} className="mt-0.5 size-4 text-muted-foreground" />
+        <Icon as={ChevronRight} className="mt-0.5 size-4 text-muted" />
       </Pressable>
     </Link>
   }
   return <Link href={href} asChild>
-    <Pressable accessibilityRole="link" className="min-h-14 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-2 shadow-xs active:bg-muted dark:border-line-strong">
+    <Pressable accessibilityRole="link" className="min-h-14 flex-row items-center gap-3 rounded-panel border border-border bg-surface px-4 py-2  active:bg-surface-muted ">
       {/* Waiting on an answer, it only says so: the question card below asks. */}
-      <Icon as={state === 'waiting' ? Hand : state === 'awaiting_children' ? Hourglass : away ? WifiOff : active && !stale ? LoaderCircle : CircleQuestionMark} className={cn('size-5', stale || state === 'awaiting_children' ? 'text-muted-foreground' : active ? 'text-foreground' : 'text-warning')} />
+      <Icon as={state === 'waiting' ? Hand : state === 'awaiting_children' ? Hourglass : away ? WifiOff : active && !stale ? LoaderCircle : CircleQuestionMark} className={cn('size-5', stale || state === 'awaiting_children' ? 'text-muted' : active ? 'text-foreground' : 'text-warning')} />
       <View className="min-w-0 flex-1 gap-0.5">
         <Text numberOfLines={1} className="font-medium">{title}</Text>
         {meta}
-        {joined ? <View className="flex-row items-center gap-1"><Icon as={Link2} className="size-3.5 text-muted-foreground" /><Text numberOfLines={1} className="shrink text-meta text-muted-foreground">补充到「{joined}」</Text></View>
-          : active && !stale && progress ? <Text numberOfLines={1} className="text-meta text-muted-foreground">{progress}</Text> : null}
+        {joined ? <View className="flex-row items-center gap-1"><Icon as={Link2} className="size-3.5 text-muted" /><Text numberOfLines={1} className="shrink text-sm text-muted">补充到「{joined}」</Text></View>
+          : active && !stale && progress ? <Text numberOfLines={1} className="text-sm text-muted">{progress}</Text> : null}
       </View>
-      <Icon as={ChevronRight} accessibilityLabel="详情" className="size-4 text-muted-foreground" />
+      <Icon as={ChevronRight} accessibilityLabel="详情" className="size-4 text-muted" />
     </Pressable>
   </Link>
 }
@@ -145,8 +146,8 @@ function JobLine({ job }: { job: ManagerJob }) {
   const retry = shared && newest?.role === 'user' && newest.message_id === job.message_id && !outcomeUnknown(job.failure?.kind, job.failure?.detail)
     ? () => shared.retryReply(newest.message_id) : undefined
   return <View className="flex-row flex-wrap items-center gap-x-2 gap-y-1">
-    <View className="flex-row items-center gap-1"><Icon as={CircleX} className="size-4 text-danger" /><Text className="text-meta text-danger">Bot 没能回复</Text></View>
-    {reason ? <Text className="shrink text-meta text-muted-foreground">{reason}</Text> : null}
+    <View className="flex-row items-center gap-1"><Icon as={CircleX} className="size-4 text-danger" /><Text className="text-sm text-danger">Bot 没能回复</Text></View>
+    {reason ? <Text className="shrink text-sm text-muted">{reason}</Text> : null}
     {shared ? retry ? <ActionButton variant="ghost" disabled={!shared.writable} action={retry}>重试</ActionButton> : <ActionButton variant="ghost" action={() => shared.refresh()}>再查一次</ActionButton> : null}
   </View>
 }
@@ -170,14 +171,14 @@ export function ConfirmCard({ check }: { check: PendingCheck }) {
     {check.works.map((work) => <View key={work.work_id} className="gap-2">
       <Text numberOfLines={2} className="font-medium">{work.title || '任务结果'}</Text>
       <View className="flex-row gap-2">
-        <ActionButton variant="outline" disabled={!shared.writable} action={() => shared.resolveCheck(work, 'interrupted', '')}>没做完</ActionButton>
+        <ActionButton variant="secondary" disabled={!shared.writable} action={() => shared.resolveCheck(work, 'interrupted', '')}>没做完</ActionButton>
         <ActionButton disabled={!shared.writable} action={() => shared.resolveCheck(work, 'completed', '')}>做完了</ActionButton>
       </View>
     </View>)}
   </ActionCard>
   const answer = (choice: 'completed' | 'interrupted') => () => shared.resolveCheck(check, choice, note)
   return <ActionCard icon={confirmIcons[check.reason]} title={check.title || '任务结果'} actions={<>
-    <ActionButton variant="outline" disabled={!shared.writable} action={answer('interrupted')}>没做完</ActionButton>
+    <ActionButton variant="secondary" disabled={!shared.writable} action={answer('interrupted')}>没做完</ActionButton>
     <ActionButton disabled={!shared.writable} action={answer('completed')}>做完了</ActionButton>
   </>}>
     <Text>{confirmText(check, device)}它实际做完了吗？</Text>
@@ -187,14 +188,14 @@ export function ConfirmCard({ check }: { check: PendingCheck }) {
 
 /** What one turn changed in the bot, item by item; `overwritten` the changes another device replaced without seeing them. */
 function ChangeCard({ records, schedules, overwritten }: { records: BotChangeRecord[]; schedules: readonly ScheduleView[]; overwritten: readonly Overwritten[] }) {
-  return <View className="gap-3 rounded-xl border border-border bg-card p-4 shadow-xs dark:border-line-strong">
+  return <Card className="gap-3">
     <View className="flex-row items-center gap-2">
       <Icon as={CircleCheck} className="size-4 text-success" />
-      <Text role="heading" className="text-meta font-medium text-muted-foreground">{changeTitle(records.map((record) => record.change))}</Text>
+      <Text role="heading" className="text-sm font-medium text-muted">{changeTitle(records.map((record) => record.change))}</Text>
     </View>
     {records.map((record) => <ChangeRows key={record.change_id} change={record.change} conversationId={record.conversation_id} schedules={schedules}
       overwritten={overwritten.filter((item) => item.change_id === record.change_id)} />)}
-  </View>
+  </Card>
 }
 
 function ChangeRows({ change, conversationId, schedules, overwritten }: { change: BotChange; conversationId: string; schedules: readonly ScheduleView[]; overwritten: readonly Overwritten[] }) {
@@ -208,7 +209,7 @@ function ChangeRows({ change, conversationId, schedules, overwritten }: { change
       {change.name ? <ChangeRow icon={Bot} label="名称"><BeforeAfter before={change.name.before} after={change.name.after} />{note('name')}</ChangeRow> : null}
       {change.instructions ? <ChangeRow icon={ScrollText} label="说明">
         {lineDiff(change.instructions.before, change.instructions.after).slice(0, 6).map((line, index) =>
-          <Text key={index} className={cn('text-meta', line.kind === 'added' ? 'text-foreground' : 'text-muted-foreground line-through')}>{line.kind === 'added' ? '+ ' : '- '}{line.text}</Text>)}
+          <Text key={index} className={cn('text-sm', line.kind === 'added' ? 'text-foreground' : 'text-muted line-through')}>{line.kind === 'added' ? '+ ' : '- '}{line.text}</Text>)}
         {note('instructions')}
       </ChangeRow> : null}
       {change.model ? <ChangeRow icon={Cpu} label="模型" tag={providerNames[change.model.provider]}><BeforeAfter before={change.model.before || '设备默认'} after={change.model.after || '设备默认'} />{note('model')}</ChangeRow> : null}
@@ -220,7 +221,7 @@ function ChangeRows({ change, conversationId, schedules, overwritten }: { change
   if (change.kind === 'skill') {
     const skill = change.after ?? change.before!
     return <ChangeRow icon={BookOpen} label={skill.name} tag={!change.before ? '新 Skill' : !change.after ? '已删除' : '已更新'} removed={!change.after}>
-      {change.after?.description ? <Text className="text-meta text-muted-foreground">{change.after.description}</Text> : null}
+      {change.after?.description ? <Text className="text-sm text-muted">{change.after.description}</Text> : null}
     </ChangeRow>
   }
   if (change.kind === 'memory') {
@@ -239,8 +240,8 @@ function ChangeRows({ change, conversationId, schedules, overwritten }: { change
   const fired = once ? firedAt(messages, change.schedule_id, (next ?? before!).first_run_at_ms) : null
   const when = fired !== null ? `已提醒 ${formatWhen(fired)}` : at !== null ? `${once ? '' : '下次 '}${formatWhen(at)}` : ''
   return <ChangeRow icon={icon} label={next.name} tag={tag}>
-    <Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{[scheduleFrequency(next), next.enabled ? when : '已暂停'].filter(Boolean).join(' · ')}</Text>
-    <Text numberOfLines={2} className="text-meta text-muted-foreground">{next.prompt}</Text>
+    <Text className="text-sm text-muted" style={{ fontVariant: ['tabular-nums'] }}>{[scheduleFrequency(next), next.enabled ? when : '已暂停'].filter(Boolean).join(' · ')}</Text>
+    <Text numberOfLines={2} className="text-sm text-muted">{next.prompt}</Text>
   </ChangeRow>
 }
 
@@ -260,7 +261,7 @@ function OverwrittenNote({ item, change, conversationId }: { item: Overwritten; 
   return <View className="gap-1">
     <View className="flex-row gap-1.5">
       <Icon as={TriangleAlert} className="mt-0.5 size-4 text-warning" />
-      <Text className="min-w-0 flex-1 text-meta text-warning">{overwriteCopy.line(item, bot?.name ?? '这个 Bot', nodeName(item.by, { nodes: shared?.nodes ?? [], directory }))}</Text>
+      <Text className="min-w-0 flex-1 text-sm text-warning">{overwriteCopy.line(item, bot?.name ?? '这个 Bot', nodeName(item.by, { nodes: shared?.nodes ?? [], directory }))}</Text>
     </View>
     {bot && request ? <ActionButton variant="ghost" size="sm" className="self-start" icon={Undo2} disabled={!shared?.writable} action={restore}>{overwriteCopy.restore}</ActionButton> : null}
   </View>
@@ -271,16 +272,16 @@ function AvatarChange({ edit, conversationId }: { edit: AvatarEdit; conversation
   const botId = useLive()?.bots.find((bot) => bot.conversation_id === conversationId)?.bot_id ?? conversationId
   return <View accessible accessibilityRole="image" accessibilityLabel={avatarChangeWords(botId, edit.before, edit.after)} className="flex-row items-center gap-2">
     <BotFace bot={{ bot_id: botId, avatar: edit.before }} mood="idle" size={28} still />
-    <Icon as={ArrowRight} className="size-4 text-muted-foreground" />
+    <Icon as={ArrowRight} className="size-4 text-muted" />
     <BotFace bot={{ bot_id: botId, avatar: edit.after }} mood="idle" size={28} still />
   </View>
 }
 
 function ChangeRow({ icon, label, tag, removed, children }: { icon: LucideIcon; label: string; tag?: string; removed?: boolean; children?: ReactNode }) {
   return <View className="flex-row gap-3">
-    <Icon as={icon} className="mt-0.5 size-4 text-muted-foreground" />
+    <Icon as={icon} className="mt-0.5 size-4 text-muted" />
     <View className="min-w-0 flex-1 gap-1">
-      <Text><Text className={cn('font-medium', removed && 'text-muted-foreground line-through')}>{label}</Text>{tag ? <Text className="text-meta text-muted-foreground">  {tag}</Text> : null}</Text>
+      <Text><Text className={cn('font-medium', removed && 'text-muted line-through')}>{label}</Text>{tag ? <Text className="text-sm text-muted">  {tag}</Text> : null}</Text>
       {children}
     </View>
   </View>
@@ -288,8 +289,8 @@ function ChangeRow({ icon, label, tag, removed, children }: { icon: LucideIcon; 
 
 function BeforeAfter({ before, after }: { before: string; after: string }) {
   return <View className="flex-row flex-wrap items-center gap-x-2">
-    <Text className="text-muted-foreground">{before}</Text>
-    <Icon as={ArrowRight} accessibilityLabel="改为" className="size-4 text-muted-foreground" />
+    <Text className="text-muted">{before}</Text>
+    <Icon as={ArrowRight} accessibilityLabel="改为" className="size-4 text-muted" />
     <Text>{after}</Text>
   </View>
 }

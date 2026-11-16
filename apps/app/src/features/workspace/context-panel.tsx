@@ -1,24 +1,24 @@
 import { HistoryControls } from '../chat/history-controls'
 "use client"
 
-import { useLayoutEffect, useRef, useState } from "react"
-import { BrainCircuit, ChevronLeft, CircleCheck, CircleDashed, CircleHelp, CircleQuestionMark, CircleX, Cpu, EyeOff, Laptop, ListChecks, MessageCircle, MessagesSquare, ScrollText, Unplug, UserRound, type LucideIcon } from "lucide-react"
-import { Link } from "@tanstack/react-router"
-import { Button } from "@/components/ui/button"
-import { Details, SettingsGroup, SettingsRow, StatusPill, useAction, type Tone } from "@/components/app/kit"
-import { Textarea } from "@/components/ui/textarea"
-import { Input } from '@/components/ui/input'
-import { messageOf, providerNames } from "@vibeface/client/lib/node.ts"
-import { newId } from "@vibeface/client/workspace/storage.ts"
-import { memoryBase, memoryResultLabel, memorySaved, memorySyncConflictLabel, type MemoryControls } from "@vibeface/client/workspace/memory.ts"
-import { formatWhen, changeTitle, scheduleFrequency } from "@vibeface/client/workspace/bot-settings.ts"
-import { contextCoverageLabels, contextIndexLabels, contextInvalidation, contextStages, memoryConflictLabel, memoryOrigins, nativeSessionObservation, nodeName, schedulerStatus, shownState, taskLabel } from "@vibeface/client/workspace/labels.ts"
-import { runtimeLabel } from "@vibeface/client/chat/protocol.ts"
-import type { BotChange, BotRecord, BotSettings, ContextProjection, ConversationPayload, CoordinationCheck, MemoryBase, MemoryControlResult, NodeInfo, Question, WorkRecord } from "@vibeface/client/workspace/types.ts"
-import { CollaborationPanel } from "./collaboration-panel"
+import { Details,SettingsGroup,SettingsRow,StatusPill,useAction,type Tone } from "@/components/arc/product-kit"
 import { cn } from "@/lib/utils"
+import { Link } from "@tanstack/react-router"
+import { runtimeLabel } from "@vibeface/client/chat/protocol.ts"
+import { messageOf,providerNames } from "@vibeface/client/lib/node.ts"
+import { changeTitle,formatWhen,scheduleFrequency } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
-import { ScopeContextDetails, WorkspaceInputStatus } from './workspace-chat'
+import { contextCoverageLabels,contextIndexLabels,contextInvalidation,contextStages,memoryConflictLabel,memoryOrigins,nativeSessionObservation,nodeName,schedulerStatus,shownState,taskLabel } from "@vibeface/client/workspace/labels.ts"
+import { memoryBase,memoryResultLabel,memorySaved,memorySyncConflictLabel,type MemoryControls } from "@vibeface/client/workspace/memory.ts"
+import { newId } from "@vibeface/client/workspace/storage.ts"
+import type { BotChange,BotRecord,BotSettings,ContextProjection,ConversationPayload,CoordinationCheck,MemoryBase,MemoryControlResult,NodeInfo,Question,WorkRecord } from "@vibeface/client/workspace/types.ts"
+import { Button } from "@vibeface/uiarc/button/button.tsx"
+import { Input } from '@vibeface/uiarc/input/input.tsx'
+import { Textarea } from "@vibeface/uiarc/textarea/textarea.tsx"
+import { BrainCircuit,ChevronLeft,CircleCheck,CircleDashed,CircleHelp,CircleQuestionMark,CircleX,Cpu,EyeOff,Laptop,ListChecks,MessageCircle,MessagesSquare,ScrollText,Unplug,UserRound,type LucideIcon } from "lucide-react"
+import { useLayoutEffect,useRef,useState } from "react"
+import { CollaborationPanel } from "./collaboration-panel"
+import { ScopeContextDetails,WorkspaceInputStatus } from './workspace-chat'
 
 type ContextPanelProps = {
   bot: Pick<BotRecord, "bot_id" | "name">
@@ -46,21 +46,21 @@ export function ContextPanel({ bot, data, nodes, connected, onBack, memory }: Co
   const checks = data.checks
   return <div ref={root} className="grid gap-5 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
     <header className="flex min-w-0 items-start gap-2">
-      <Button type="button" variant="ghost" size="icon" className="-ms-2 shrink-0" aria-label="返回 Bot 设置" title="返回 Bot 设置" onClick={onBack}><ChevronLeft aria-hidden="true" /></Button>
+      <Button type="button" variant="ghost" size="md" className="-ms-2 shrink-0" aria-label="返回 Bot 设置" title="返回 Bot 设置" onClick={onBack}><ChevronLeft aria-hidden="true" /></Button>
       <div className="min-w-0 flex-1 pt-1">
-        <h2 className="text-heading font-semibold">上下文和会话</h2>
-        <p className="truncate text-meta text-muted-foreground">共享摘要和持久记忆，随当前聊天更新</p>
+        <h2 className="text-lg font-medium">上下文和会话</h2>
+        <p className="truncate text-sm text-secondary">共享摘要和持久记忆，随当前聊天更新</p>
       </div>
       <StatusPill tone="info" icon={MessagesSquare}>共享事实</StatusPill>
     </header>
     <HistoryControls key={`${workspace.generation}:${workspace.conversationId}`} workspace={workspace} />
     {data.scheduler?.remote?.memory_conflicts?.length ? <Details label={`负责设备的记忆冲突 · ${data.scheduler.remote.memory_conflicts.length}`}>
-      <ul className="grid gap-2">{data.scheduler.remote.memory_conflicts.map((conflict) => <li key={conflict.history_id} className="grid gap-1"><p>{memoryConflictLabel(conflict.reason)}</p><p className="break-all text-meta">记忆 {conflict.memory_id} · 预期 {conflict.expected_revision || '尚无版本'} · 当前 {conflict.actual_revision || '已移除'}</p></li>)}</ul>
+      <ul className="grid gap-2">{data.scheduler.remote.memory_conflicts.map((conflict) => <li key={conflict.history_id} className="grid gap-1"><p>{memoryConflictLabel(conflict.reason)}</p><p className="break-all text-sm">记忆 {conflict.memory_id} · 预期 {conflict.expected_revision || '尚无版本'} · 当前 {conflict.actual_revision || '已移除'}</p></li>)}</ul>
     </Details> : null}
-    <section className="relative overflow-hidden rounded-2xl border border-brand/15 bg-linear-to-br from-brand-soft/55 via-card to-card p-4 shadow-sm" aria-label="上下文概览">
-      <div aria-hidden="true" className="pointer-events-none absolute -end-10 -top-12 size-32 rounded-full bg-brand/10 blur-2xl" />
+    <section className="relative overflow-hidden rounded-panel border border-accent/15     p-4 " aria-label="上下文概览">
+      <div aria-hidden="true" className="pointer-events-none absolute -end-10 -top-12 size-32 rounded-pill bg-accent/10 blur-2xl" />
       <div className="relative grid gap-4">
-        <div className="flex min-w-0 items-center gap-3"><span className="grid size-9 shrink-0 place-items-center rounded-xl bg-brand-soft text-brand ring-1 ring-brand/20"><MessagesSquare aria-hidden="true" className="size-5" /></span><div className="min-w-0"><p className="font-medium">共享上下文</p><p className="text-meta text-muted-foreground">事实、工作和会话各自有边界</p></div></div>
+        <div className="flex min-w-0 items-center gap-3"><span className="grid size-9 shrink-0 place-items-center rounded-panel bg-accent-subtle text-accent-strong  ring-accent/20"><MessagesSquare aria-hidden="true" className="size-5" /></span><div className="min-w-0"><p className="font-medium">共享上下文</p><p className="text-sm text-secondary">事实、工作和会话各自有边界</p></div></div>
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
           <ContextStat label="消息" value={data.messages.length} />
           <ContextStat label="工作" value={works.length} />
@@ -69,14 +69,14 @@ export function ContextPanel({ bot, data, nodes, connected, onBack, memory }: Co
         </div>
       </div>
     </section>
-    <section className="grid gap-3 rounded-xl border bg-card p-4" aria-label="本轮来源和补充归属">
+    <section className="grid gap-3 rounded-panel border bg-surface p-4" aria-label="本轮来源和补充归属">
       <h3 className="font-medium">本轮来源和补充归属</h3>
-      <p className="text-meta text-muted-foreground">当前范围为 {bot.name} 的主聊天。任务、频道与例行任务使用各自的执行上下文。</p>
-      <p className="text-meta text-muted-foreground">已同步的消息和持久记忆，只有进入本轮来源记录才显示为引用。</p>
-      {!connected || data.scheduler?.remote?.reachable === false ? <p role="status" className="text-meta text-warning">目标状态未知，显示最近的上下文记录。</p> : null}
-      {data.scheduler?.context ? <ScopeContextDetails context={data.scheduler.context} /> : <p className="text-meta text-muted-foreground">本轮编译与省略记录尚未提供。</p>}
-      {workspace.pendingMessages.filter((item) => item.target.kind === 'bot_main' && item.target.bot_id === bot.bot_id).map((item) => <div key={item.message_id} className="grid gap-2"><p className="line-clamp-2 text-meta">{item.text}</p><WorkspaceInputStatus pending={item} /></div>)}
-      {(data.scheduler?.jobs ?? []).filter((job) => job.receipt).map((job) => <p key={job.trigger} className="break-all text-meta text-muted-foreground">补充 {job.message_id ?? job.trigger} · 执行服务已接受输入{job.receipt?.actual_turn_id ? ` · 实际回合 ${job.receipt.actual_turn_id}` : ' · 回合归属尚未确认'}</p>)}
+      <p className="text-sm text-secondary">当前范围为 {bot.name} 的主聊天。任务、频道与例行任务使用各自的执行上下文。</p>
+      <p className="text-sm text-secondary">已同步的消息和持久记忆，只有进入本轮来源记录才显示为引用。</p>
+      {!connected || data.scheduler?.remote?.reachable === false ? <p role="status" className="text-sm text-warning">目标状态未知，显示最近的上下文记录。</p> : null}
+      {data.scheduler?.context ? <ScopeContextDetails context={data.scheduler.context} /> : <p className="text-sm text-secondary">本轮编译与省略记录尚未提供。</p>}
+      {workspace.pendingMessages.filter((item) => item.target.kind === 'bot_main' && item.target.bot_id === bot.bot_id).map((item) => <div key={item.message_id} className="grid gap-2"><p className="line-clamp-2 text-sm">{item.text}</p><WorkspaceInputStatus pending={item} /></div>)}
+      {(data.scheduler?.jobs ?? []).filter((job) => job.receipt).map((job) => <p key={job.trigger} className="break-all text-sm text-secondary">补充 {job.message_id ?? job.trigger} · 执行服务已接受输入{job.receipt?.actual_turn_id ? ` · 实际回合 ${job.receipt.actual_turn_id}` : ' · 回合归属尚未确认'}</p>)}
     </section>
     <Details label="数据来源和边界">
       <ul className="grid gap-2">
@@ -94,27 +94,27 @@ export function ContextPanel({ bot, data, nodes, connected, onBack, memory }: Co
     </SettingsGroup>
 
     <SettingsGroup title="共享上下文">
-      <label className="grid gap-2 px-4 pt-3 text-meta">搜索这个 Bot 已加载的历史<Input type="search" value={historyQuery} onChange={(event) => setHistoryQuery(event.currentTarget.value)} placeholder="输入关键词" /><span className="text-muted-foreground">范围为 {bot.name} 当前已加载的 {data.messages.length} 条主聊天消息。</span></label>
+      <div className="grid gap-2 px-4 pt-3 text-sm"><Input label={`搜索这个 Bot 已加载的历史 范围为 ${bot.name} 当前已加载的 ${data.messages.length} 条主聊天消息。`} type="search" value={historyQuery} onChange={(event) => setHistoryQuery(event.currentTarget.value)} placeholder="输入关键词" /><span className="text-secondary">范围为 {bot.name} 当前已加载的 {data.messages.length} 条主聊天消息。</span></div>
       <SettingsRow icon={MessageCircle} label="消息摘要" description="共享聊天事实" children={<span>{data.messages.length} 条</span>} />
       {messages.length ? <Details label="查看最近消息">
         <ul className="grid gap-3">
-          {messages.map((message) => <li key={message.message_id} className="grid min-w-0 gap-1 rounded-lg border bg-card px-3 py-2">
-            <div className="flex min-w-0 items-center gap-2 text-meta">
+          {messages.map((message) => <li key={message.message_id} className="grid min-w-0 gap-1 rounded-control border bg-surface px-3 py-2">
+            <div className="flex min-w-0 items-center gap-2 text-sm">
               <span className="font-medium">{message.sender?.name ?? roleName(message.role)}</span>
-              <time className="ms-auto shrink-0 text-muted-foreground tabular-nums" dateTime={new Date(message.created_at_ms).toISOString()}>{formatWhen(message.created_at_ms)}</time>
+              <time className="ms-auto shrink-0 text-secondary tabular-nums" dateTime={new Date(message.created_at_ms).toISOString()}>{formatWhen(message.created_at_ms)}</time>
             </div>
             <p className="line-clamp-3 whitespace-pre-wrap [overflow-wrap:anywhere]">{message.text}</p>
           </li>)}
         </ul>
-      </Details> : <p className="px-4 pb-3 text-meta text-muted-foreground">还没有聊天记录</p>}
+      </Details> : <p className="px-4 pb-3 text-sm text-secondary">还没有聊天记录</p>}
       <SettingsRow icon={ListChecks} label="工作摘要" description="共享工作投影" children={<span>{works.length} 项</span>} />
       {works.length ? <Details label="查看工作摘要">
         <ul className="grid gap-2">
           {works.map((work) => <WorkSummary key={work.work_id} work={work} botId={bot.bot_id} nodes={nodes} />)}
         </ul>
-      </Details> : <p className="px-4 pb-3 text-meta text-muted-foreground">还没有工作</p>}
+      </Details> : <p className="px-4 pb-3 text-sm text-secondary">还没有工作</p>}
       <div className="grid gap-2 px-4 py-3">
-        <div className="flex flex-wrap items-center gap-2"><StatusPill tone="warning" icon={EyeOff}>完整历史摘要未提供</StatusPill><span className="text-meta text-muted-foreground">不从聊天或本机会话猜测</span></div>
+        <div className="flex flex-wrap items-center gap-2"><StatusPill tone="warning" icon={EyeOff}>完整历史摘要未提供</StatusPill><span className="text-sm text-secondary">不从聊天或本机会话猜测</span></div>
         <Details label="为什么没有完整历史摘要"><p>当前快照只提供本轮上下文的覆盖数量，不返回完整历史或交接内容。已编译不代表已发送，AI 会话缓存也不是聊天记录。</p></Details>
       </div>
     </SettingsGroup>
@@ -123,9 +123,9 @@ export function ContextPanel({ bot, data, nodes, connected, onBack, memory }: Co
       <SettingsRow icon={ScrollText} label="变更记录" description="共享聊天事实" children={<span>{changes.length} 条</span>} />
       {changes.length ? <Details label="查看变更记录">
         <ul className="grid gap-2">
-          {changes.map((record) => <li key={record.change_id} className="grid min-w-0 gap-1 rounded-lg border bg-card px-3 py-2">
-            <div className="flex min-w-0 items-center gap-2"><span className="min-w-0 truncate font-medium">{changeTitle([record.change])}</span><time className="ms-auto shrink-0 text-meta text-muted-foreground tabular-nums" dateTime={new Date(record.created_at_ms).toISOString()}>{formatWhen(record.created_at_ms)}</time></div>
-            <p className="text-meta text-muted-foreground">{changeFields(record.change)}</p>
+          {changes.map((record) => <li key={record.change_id} className="grid min-w-0 gap-1 rounded-control border bg-surface px-3 py-2">
+            <div className="flex min-w-0 items-center gap-2"><span className="min-w-0 truncate font-medium">{changeTitle([record.change])}</span><time className="ms-auto shrink-0 text-sm text-secondary tabular-nums" dateTime={new Date(record.created_at_ms).toISOString()}>{formatWhen(record.created_at_ms)}</time></div>
+            <p className="text-sm text-secondary">{changeFields(record.change)}</p>
           </li>)}
         </ul>
       </Details> : null}
@@ -143,11 +143,11 @@ export function ContextPanel({ bot, data, nodes, connected, onBack, memory }: Co
     </SettingsGroup>
 
     <section className="grid gap-3" aria-label="协作与队列">
-      <h3 className="px-1 text-meta font-medium text-muted-foreground">协作与队列</h3>
+      <h3 className="px-1 text-sm font-medium text-secondary">协作与队列</h3>
       <CollaborationPanel data={data} botId={bot.bot_id} className="gap-4" />
     </section>
 
-    <p className="px-1 text-meta text-muted-foreground">本面板只显示当前快照里的摘要。任务操作仍在任务详情中进行。</p>
+    <p className="px-1 text-sm text-secondary">本面板只显示当前快照里的摘要。任务操作仍在任务详情中进行。</p>
   </div>
 }
 
@@ -179,10 +179,10 @@ function AgentContinuity({ data, nodes, connected, memory }: { data: Conversatio
   return <SettingsGroup title="长期 Agent" footer="聊天事实和记忆保存于共享记录。AI 会话只是本机执行缓存。">
     <div className="grid gap-4 p-4">
       <div className="flex min-w-0 items-start gap-3">
-        <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-brand-soft text-brand ring-1 ring-brand/20"><BrainCircuit aria-hidden="true" className="size-5" /></span>
+        <span className="grid size-9 shrink-0 place-items-center rounded-panel bg-accent-subtle text-accent-strong  ring-accent/20"><BrainCircuit aria-hidden="true" className="size-5" /></span>
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 flex-wrap items-center gap-2"><h3 className="min-w-0 flex-1 font-medium">持续身份与后台工作</h3><StatusPill tone={status.tone} icon={status.icon}>{status.label}</StatusPill></div>
-          <p className="mt-1 text-meta text-muted-foreground">{status.detail}</p>
+          <p className="mt-1 text-sm text-secondary">{status.detail}</p>
         </div>
       </div>
       <ol className="grid gap-2 sm:grid-cols-3" aria-label="长期 Agent 的上下文层次">
@@ -192,7 +192,7 @@ function AgentContinuity({ data, nodes, connected, memory }: { data: Conversatio
       </ol>
       <div className="grid gap-2">
         <div className="flex flex-wrap items-center gap-2"><span className="font-medium">本轮上下文</span><StatusPill tone={unavailable ? 'warning' : stage?.tone ?? 'neutral'}>{unavailable ? '当前状态未知' : stage?.label ?? '未提供'}</StatusPill></div>
-        <p className="text-meta text-muted-foreground">{unavailable ? '下面保留最近读取的编译记录，当前执行和续接状态未知。' : stage?.detail ?? '当前记录未提供编译或发送状态。'}</p>
+        <p className="text-sm text-secondary">{unavailable ? '下面保留最近读取的编译记录，当前执行和续接状态未知。' : stage?.detail ?? '当前记录未提供编译或发送状态。'}</p>
         {context ? <ContextDetails context={context} /> : null}
       </div>
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
@@ -203,13 +203,13 @@ function AgentContinuity({ data, nodes, connected, memory }: { data: Conversatio
       </div>
       <MemorySummary key={memory?.conversationId} settings={data.bot_settings} context={context} memory={memory} />
       {data.bot_settings.schedules.length ? <Details label={`查看定时任务 · ${data.bot_settings.schedules.length}`}>
-        <ul className="grid gap-2">{data.bot_settings.schedules.map((schedule) => <li key={schedule.schedule_id} className={cn("grid gap-1 rounded-lg border bg-card px-3 py-2", !schedule.enabled && "text-muted-foreground")}>
+        <ul className="grid gap-2">{data.bot_settings.schedules.map((schedule) => <li key={schedule.schedule_id} className={cn("grid gap-1 rounded-control border bg-surface px-3 py-2", !schedule.enabled && "text-secondary")}>
           <div className="flex min-w-0 items-center gap-2"><span className="min-w-0 flex-1 truncate font-medium" title={schedule.name}>{schedule.name}</span><StatusPill tone={schedule.enabled ? "info" : "neutral"}>{schedule.enabled ? "启用" : "已暂停"}</StatusPill></div>
-          <p className="line-clamp-2 whitespace-pre-wrap text-meta text-muted-foreground">{schedule.prompt}</p>
-          <p className="text-meta text-muted-foreground">{scheduleFrequency(schedule)}{schedule.next_run_at_ms === null ? " · 尚未安排下一次运行" : ` · 下次 ${formatWhen(schedule.next_run_at_ms)}`}</p>
+          <p className="line-clamp-2 whitespace-pre-wrap text-sm text-secondary">{schedule.prompt}</p>
+          <p className="text-sm text-secondary">{scheduleFrequency(schedule)}{schedule.next_run_at_ms === null ? " · 尚未安排下一次运行" : ` · 下次 ${formatWhen(schedule.next_run_at_ms)}`}</p>
         </li>)}</ul>
-      </Details> : <p className="text-meta text-muted-foreground">暂无待执行定时任务</p>}
-      <div className="flex min-w-0 flex-wrap items-center gap-2 rounded-lg bg-muted/45 px-3 py-2 text-meta">
+      </Details> : <p className="text-sm text-secondary">暂无待执行定时任务</p>}
+      <div className="flex min-w-0 flex-wrap items-center gap-2 rounded-control bg-surface-muted/45 px-3 py-2 text-sm">
         <span className="font-medium">{ownerLabel}</span>
         {remote?.reachable === false ? <StatusPill tone="warning" icon={Unplug}>状态未知</StatusPill> : owner ? <StatusPill tone="info">归属已知</StatusPill> : <StatusPill tone="neutral">等待归属</StatusPill>}
       </div>
@@ -227,9 +227,9 @@ function ContextDetails({ context }: { context: ContextProjection }) {
     <p>{context.session_status?.pending_generation ? '配置已更新，当前回合继续使用原配置，下一轮生效。' : '配置变更从下一轮生效，当前回合按启动时的配置继续。'}</p>
     <p>以下为本轮编译时因预算省略的数量。省略内容仍保存在共享记录，可按需读取。</p>
     <ul className="grid grid-cols-2 gap-x-3 gap-y-1">{Object.entries(context.coverage).map(([key, count]) => typeof count === 'number' ? <li key={key}>{contextCoverageLabels[key] ?? '其他内容'} · {count}</li> : null)}{Object.entries(context.coverage.bot_indexes_omitted).map(([key, count]) => <li key={`index:${key}`}>{contextIndexLabels[key] ?? '其他索引'} · {count}</li>)}</ul>
-    <p className="text-meta">稳定内容 {context.stable_bytes} 字节 · 本轮内容 {context.dynamic_bytes} 字节</p>
-    <p className="break-all font-mono text-meta">稳定指纹 {context.stable_fingerprint}</p>
-    <p className="break-all font-mono text-meta">本轮指纹 {context.dynamic_fingerprint}</p>
+    <p className="text-sm">稳定内容 {context.stable_bytes} 字节 · 本轮内容 {context.dynamic_bytes} 字节</p>
+    <p className="break-all font-mono text-sm">稳定指纹 {context.stable_fingerprint}</p>
+    <p className="break-all font-mono text-sm">本轮指纹 {context.dynamic_fingerprint}</p>
   </Details>
 }
 
@@ -258,36 +258,36 @@ export function MemorySummary({ settings, context, memory }: { settings: BotSett
       <ContinuityStat label="提交冲突" value={settings.memory_conflicts?.length ?? null} />
       <ContinuityStat label="本轮省略" value={context?.coverage.memory_omitted ?? null} />
     </div>
-    <p className="text-meta text-muted-foreground">待提交和提交冲突来自负责设备最近的观察。Bot 待提交记忆只在本轮成功后保存。由你维护的记忆始终受保护。省略的记忆仍可按需读取。</p>
-    <Button type="button" variant="outline" className="justify-self-start" disabled={!memory?.writable || busy !== null || draft !== null} onClick={() => start()}>新增记忆</Button>
-    {draft ? <div className="grid gap-3 rounded-xl border p-3">
-      <label className="grid gap-2"><span className="text-meta font-medium">记忆内容</span><Textarea aria-label="记忆内容" rows={3} value={draft.text} disabled={busy !== null} onChange={(event) => setDraft({ ...draft, text: event.target.value })} /></label>
-      <p className="text-meta text-muted-foreground">最多 500 个字符。保存后由你维护，Bot 不会自动覆盖或恢复已删除的记忆。</p>
-      {draft.result && !memorySaved(draft.result) ? <div className="grid gap-2 text-meta" role="status"><p>{draft.result.current?.text ?? '当前记忆已删除或这台设备尚无记录。'}</p><Button type="button" variant="outline" className="justify-self-start" disabled={busy !== null} onClick={() => { setDraft({ ...draft, base: memoryBase(draft.result?.current?.metadata ?? null), result: null }); setConfirmDelete(false); clear(); setNotice("") }}>按当前版本继续编辑</Button></div> : null}
+    <p className="text-sm text-secondary">待提交和提交冲突来自负责设备最近的观察。Bot 待提交记忆只在本轮成功后保存。由你维护的记忆始终受保护。省略的记忆仍可按需读取。</p>
+    <Button type="button" variant="secondary" className="justify-self-start" disabled={!memory?.writable || busy !== null || draft !== null} onClick={() => start()}>新增记忆</Button>
+    {draft ? <div className="grid gap-3 rounded-panel border p-3">
+      <div className="grid gap-2"><Textarea label="记忆内容" aria-label="记忆内容" rows={3} value={draft.text} disabled={busy !== null} onChange={(event) => setDraft({ ...draft, text: event.target.value })} /></div>
+      <p className="text-sm text-secondary">最多 500 个字符。保存后由你维护，Bot 不会自动覆盖或恢复已删除的记忆。</p>
+      {draft.result && !memorySaved(draft.result) ? <div className="grid gap-2 text-sm" role="status"><p>{draft.result.current?.text ?? '当前记忆已删除或这台设备尚无记录。'}</p><Button type="button" variant="secondary" className="justify-self-start" disabled={busy !== null} onClick={() => { setDraft({ ...draft, base: memoryBase(draft.result?.current?.metadata ?? null), result: null }); setConfirmDelete(false); clear(); setNotice("") }}>按当前版本继续编辑</Button></div> : null}
       <div className="flex flex-wrap gap-2">
         <Button type="button" disabled={!memory?.writable || busy !== null || !draft.text.trim()} onClick={() => save(draft.text)}>{busy ? '正在查明结果…' : '保存记忆'}</Button>
-        {draft.base.version !== null ? <Button type="button" variant="outline" disabled={!memory?.writable || busy !== null} onClick={() => setConfirmDelete(true)}>删除记忆</Button> : null}
+        {draft.base.version !== null ? <Button type="button" variant="secondary" disabled={!memory?.writable || busy !== null} onClick={() => setConfirmDelete(true)}>删除记忆</Button> : null}
         <Button type="button" variant="ghost" disabled={busy !== null} onClick={() => { setDraft(null); setConfirmDelete(false); clear() }}>取消编辑</Button>
       </div>
-      {confirmDelete ? <div className="flex flex-wrap items-center gap-2"><p className="text-meta">删除后 Bot 不会自动恢复这条记忆。</p><Button type="button" variant="destructive" disabled={!memory?.writable || busy !== null} onClick={() => save(null)}>确认删除记忆</Button><Button type="button" variant="ghost" disabled={busy !== null} onClick={() => setConfirmDelete(false)}>保留记忆</Button></div> : null}
+      {confirmDelete ? <div className="flex flex-wrap items-center gap-2"><p className="text-sm">删除后 Bot 不会自动恢复这条记忆。</p><Button type="button" variant="danger" disabled={!memory?.writable || busy !== null} onClick={() => save(null)}>确认删除记忆</Button><Button type="button" variant="ghost" disabled={busy !== null} onClick={() => setConfirmDelete(false)}>保留记忆</Button></div> : null}
     </div> : null}
-    {error ? <p role="alert" className="text-meta text-destructive">{messageOf(error)} 草稿已保留，重试会先查明原操作结果。</p> : null}
-    {notice ? <p role="status" className="text-meta">{notice}</p> : null}
+    {error ? <p role="alert" className="text-sm text-danger">{messageOf(error)} 草稿已保留，重试会先查明原操作结果。</p> : null}
+    {notice ? <p role="status" className="text-sm">{notice}</p> : null}
     {settings.memory.length ? <Details label={`查看已保存记忆 · ${settings.memory.length}`}>
-      <ul className="grid gap-2">{settings.memory.map((entry) => <li key={entry.memory_id} className="grid gap-2 rounded-lg border bg-card px-3 py-2">
+      <ul className="grid gap-2">{settings.memory.map((entry) => <li key={entry.memory_id} className="grid gap-2 rounded-control border bg-surface px-3 py-2">
         <p className="whitespace-pre-wrap [overflow-wrap:anywhere]">{entry.text}</p>
-        <p className="text-meta text-muted-foreground">{memoryOrigins[entry.metadata.origin]} · {entry.metadata.user_controlled ? '由你维护，受保护' : 'Bot 可更新'} · {entry.metadata.essential ? '优先带入上下文' : '按需读取'}</p>
-        <Details label="记忆版本"><p className="break-all font-mono text-meta">数据版本 {entry.metadata.epoch} · 维护版本 {entry.metadata.control_revision} · {entry.metadata.revision}</p><p className="break-all font-mono text-meta">来源事件 {entry.metadata.source_event_hash}</p></Details>
-        <Button type="button" variant="outline" className="justify-self-start" disabled={!memory?.writable || busy !== null || draft !== null} onClick={() => start(entry)}>{entry.metadata.user_controlled ? '编辑记忆' : '编辑并接管'}</Button>
+        <p className="text-sm text-secondary">{memoryOrigins[entry.metadata.origin]} · {entry.metadata.user_controlled ? '由你维护，受保护' : 'Bot 可更新'} · {entry.metadata.essential ? '优先带入上下文' : '按需读取'}</p>
+        <Details label="记忆版本"><p className="break-all font-mono text-sm">数据版本 {entry.metadata.epoch} · 维护版本 {entry.metadata.control_revision} · {entry.metadata.revision}</p><p className="break-all font-mono text-sm">来源事件 {entry.metadata.source_event_hash}</p></Details>
+        <Button type="button" variant="secondary" className="justify-self-start" disabled={!memory?.writable || busy !== null || draft !== null} onClick={() => start(entry)}>{entry.metadata.user_controlled ? '编辑记忆' : '编辑并接管'}</Button>
       </li>)}</ul>
-    </Details> : <p className="text-meta text-muted-foreground">暂无已保存记忆</p>}
+    </Details> : <p className="text-sm text-secondary">暂无已保存记忆</p>}
     {settings.memory_conflicts?.length ? <Details label={`查看记忆冲突 · ${settings.memory_conflicts.length}`}>
-      <ul className="grid gap-2">{settings.memory_conflicts.map((conflict) => <li key={conflict.history_id} className="grid gap-1"><p>{memoryConflictLabel(conflict.reason)}</p><p className="break-all font-mono text-meta">记忆 {conflict.memory_id} · 数据版本 {conflict.expected_epoch} / {conflict.actual_epoch}</p><p className="break-all font-mono text-meta">预期 {conflict.expected_revision || '尚无版本'} · 当前 {conflict.actual_revision || '已移除'}</p></li>)}</ul>
+      <ul className="grid gap-2">{settings.memory_conflicts.map((conflict) => <li key={conflict.history_id} className="grid gap-1"><p>{memoryConflictLabel(conflict.reason)}</p><p className="break-all font-mono text-sm">记忆 {conflict.memory_id} · 数据版本 {conflict.expected_epoch} / {conflict.actual_epoch}</p><p className="break-all font-mono text-sm">预期 {conflict.expected_revision || '尚无版本'} · 当前 {conflict.actual_revision || '已移除'}</p></li>)}</ul>
     </Details> : null}
     <Details label={`查看同步冲突 · ${settings.memory_sync_conflicts.items.length}${settings.memory_sync_conflicts.has_more ? '+' : ''}`}>
-      <p className="text-meta text-muted-foreground">同步冲突记录共享历史中的其他分支，不代表未保存草稿或本轮待办。</p>
-      {settings.memory_sync_conflicts.items.length ? <ul className="grid gap-2">{settings.memory_sync_conflicts.items.map((conflict) => <li key={`${conflict.memory_id}:${conflict.losing_revision}`} className="grid gap-1"><p>{memorySyncConflictLabel(conflict.reason)}</p><p className="break-all font-mono text-meta">记忆 {conflict.memory_id}</p><p className="break-all font-mono text-meta">当前 {conflict.winning_revision} · 其他分支 {conflict.losing_revision}</p></li>)}</ul> : <p className="text-meta text-muted-foreground">当前入口未发现同步冲突</p>}
-      {settings.memory_sync_conflicts.has_more ? <p className="text-meta text-muted-foreground">仅显示前 50 项同步冲突</p> : null}
+      <p className="text-sm text-secondary">同步冲突记录共享历史中的其他分支，不代表未保存草稿或本轮待办。</p>
+      {settings.memory_sync_conflicts.items.length ? <ul className="grid gap-2">{settings.memory_sync_conflicts.items.map((conflict) => <li key={`${conflict.memory_id}:${conflict.losing_revision}`} className="grid gap-1"><p>{memorySyncConflictLabel(conflict.reason)}</p><p className="break-all font-mono text-sm">记忆 {conflict.memory_id}</p><p className="break-all font-mono text-sm">当前 {conflict.winning_revision} · 其他分支 {conflict.losing_revision}</p></li>)}</ul> : <p className="text-sm text-secondary">当前入口未发现同步冲突</p>}
+      {settings.memory_sync_conflicts.has_more ? <p className="text-sm text-secondary">仅显示前 50 项同步冲突</p> : null}
     </Details>
   </div>
 }
@@ -297,18 +297,18 @@ function providerLabel(provider: string) {
 }
 
 function ContinuityLayer({ step, label, detail, tone, status }: { step: string; label: string; detail: string; tone: Tone; status: string }) {
-  return <li className="grid min-w-0 gap-1 rounded-xl border border-border/70 bg-background/55 p-3">
-    <div className="flex min-w-0 items-center gap-2"><span aria-hidden="true" className="grid size-5 shrink-0 place-items-center rounded-full bg-muted text-meta font-semibold tabular-nums">{step}</span><span className="min-w-0 truncate font-medium">{label}</span><StatusPill tone={tone}>{status}</StatusPill></div>
-    <p className="ps-7 text-meta text-muted-foreground">{detail}</p>
+  return <li className="grid min-w-0 gap-1 rounded-panel border border-border/70 bg-background/55 p-3">
+    <div className="flex min-w-0 items-center gap-2"><span aria-hidden="true" className="grid size-5 shrink-0 place-items-center rounded-pill bg-surface-muted text-sm font-medium tabular-nums">{step}</span><span className="min-w-0 truncate font-medium">{label}</span><StatusPill tone={tone}>{status}</StatusPill></div>
+    <p className="ps-7 text-sm text-secondary">{detail}</p>
   </li>
 }
 
 function ContinuityStat({ label, value }: { label: string; value: number | null }) {
-  return <div className="grid gap-0.5 rounded-xl border border-border/70 bg-background/55 px-3 py-2"><span className="text-meta text-muted-foreground">{label}</span><span className="text-lg font-semibold tabular-nums">{value ?? "未提供"}</span></div>
+  return <div className="grid gap-0.5 rounded-panel border border-border/70 bg-background/55 px-3 py-2"><span className="text-sm text-secondary">{label}</span><span className="text-lg font-medium tabular-nums">{value ?? "未提供"}</span></div>
 }
 
 function ContextStat({ label, value }: { label: string; value: number }) {
-  return <div className="grid gap-0.5 rounded-xl border border-border/70 bg-background/55 px-3 py-2"><span className="text-meta text-muted-foreground">{label}</span><span className="text-lg font-semibold tabular-nums">{value}</span></div>
+  return <div className="grid gap-0.5 rounded-panel border border-border/70 bg-background/55 px-3 py-2"><span className="text-sm text-secondary">{label}</span><span className="text-lg font-medium tabular-nums">{value}</span></div>
 }
 
 function roleName(role: string) {
@@ -319,10 +319,10 @@ function roleName(role: string) {
 
 function WorkSummary({ work, botId, nodes }: { work: WorkRecord; botId: string; nodes: readonly NodeInfo[] }) {
   const state = shownState(work, [...nodes])
-  return <li className="min-w-0 rounded-lg border bg-card px-3 py-2">
-    <Link to="/b/$botId/work/$workId" params={{ botId, workId: work.work_id }} className="flex min-w-0 items-start gap-2 rounded-md outline-none focus-visible:ring-3 focus-visible:ring-ring/50">
+  return <li className="min-w-0 rounded-control border bg-surface px-3 py-2">
+    <Link to="/b/$botId/work/$workId" params={{ botId, workId: work.work_id }} className="flex min-w-0 items-start gap-2 rounded-control outline-none  ">
       <StatusPill tone={workTone(state)} icon={workIcon(state)}>{taskLabel(state)}</StatusPill>
-      <span className="min-w-0 flex-1"><span className="block truncate font-medium" title={work.title}>{work.title || "未命名工作"}</span>{work.summary ? <span className="block line-clamp-2 text-meta text-muted-foreground [overflow-wrap:anywhere]">{work.summary}</span> : null}</span>
+      <span className="min-w-0 flex-1"><span className="block truncate font-medium" title={work.title}>{work.title || "未命名工作"}</span>{work.summary ? <span className="block line-clamp-2 text-sm text-secondary [overflow-wrap:anywhere]">{work.summary}</span> : null}</span>
     </Link>
   </li>
 }
@@ -356,15 +356,15 @@ function QuestionSummary({ question }: { question: Question }) {
   const action = question.choices.find((choice) => choice.label === question.answer?.text)?.action
   const answer = action === 'allow_once' ? '允许本次' : action === 'deny' ? '拒绝' : question.answer?.text
   const settled = question.answer ? action === 'deny' ? '已拒绝' : "已回答" : question.closed ? "已失效" : "等待回答"
-  return <li className="grid min-w-0 gap-1 rounded-lg border bg-card px-3 py-2">
+  return <li className="grid min-w-0 gap-1 rounded-control border bg-surface px-3 py-2">
     <div className="flex min-w-0 items-center gap-2"><StatusPill tone={question.answer ? action === 'deny' ? 'danger' : "success" : question.closed ? "neutral" : "warning"} icon={question.answer ? action === 'deny' ? CircleX : CircleCheck : question.closed ? CircleX : CircleHelp}>{settled}</StatusPill><span className="min-w-0 truncate font-medium" title={question.text}>{question.text}</span></div>
-    {question.answer ? <p className="line-clamp-2 text-meta text-muted-foreground [overflow-wrap:anywhere]">{answer}</p> : null}
+    {question.answer ? <p className="line-clamp-2 text-sm text-secondary [overflow-wrap:anywhere]">{answer}</p> : null}
   </li>
 }
 
 function CheckSummary({ check }: { check: CoordinationCheck }) {
-  return <li className="grid min-w-0 gap-1 rounded-lg border bg-card px-3 py-2">
+  return <li className="grid min-w-0 gap-1 rounded-control border bg-surface px-3 py-2">
     <div className="flex min-w-0 items-center gap-2"><StatusPill tone="warning" icon={CircleQuestionMark}>需要查看</StatusPill><span className="min-w-0 truncate font-medium" title={check.trigger}>{check.trigger}</span></div>
-    {check.detail ? <p className="line-clamp-2 text-meta text-muted-foreground [overflow-wrap:anywhere]">{check.detail}</p> : null}
+    {check.detail ? <p className="line-clamp-2 text-sm text-secondary [overflow-wrap:anywhere]">{check.detail}</p> : null}
   </li>
 }

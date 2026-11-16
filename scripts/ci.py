@@ -51,7 +51,7 @@ PATH_RULES = (
     ("desktop", ("apps/desktop/src/*", "apps/desktop/tests/*")),
     ("mobile", ("apps/mobile/*", "packages/secure-native/*")),
     ("docs", ("tests/e2e/*",)),
-    ("web", ("apps/app/*", "packages/client/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
+    ("web", ("apps/app/*", "packages/client/*", "packages/theme/*", "packages/uiarc/*", "config/uiarc.json", "scripts/generate-uiarc-theme.py", "scripts/check-uiarc.py", "scripts/check-uiarc-build.mjs", "scripts/check-uiarc-native.cjs", "scripts/vendor-uiarc.py", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
     ("protocol", ("crates/protocol/*",)),
     ("bridge", ("crates/bridge/*",)),
     ("client", ("crates/client/*",)),
@@ -63,7 +63,7 @@ PATH_RULES = (
     ("control", ("crates/control/*",)),
     ("cli", ("apps/cli/*",)),
 )
-WWW_PATHS = ("apps/www/*", "packages/docs/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
+WWW_PATHS = ("apps/www/*", "packages/docs/*", "packages/theme/*", "packages/uiarc/src/foundation.css", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
 MOBILE_PATHS = ("packages/client/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
 DESKTOP_PATHS = ("package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
 SLOW_TESTS = (

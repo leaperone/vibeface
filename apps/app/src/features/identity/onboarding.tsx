@@ -1,16 +1,16 @@
-import { useEffect, useState } from "react"
-import { useNavigate } from "@tanstack/react-router"
-import { Bot, FolderOpen, MessageSquarePlus } from "lucide-react"
-import { AuthPage, BusyIcon, FolderPath, InlineError, Panel, Steps } from "@/components/app/kit"
-import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
+import { AuthPage,BusyIcon,FolderPath,InlineError,Panel,Steps } from "@/components/arc/product-kit"
 import { AiSettings } from "@/features/devices/ai-settings"
+import { useNavigate } from "@tanstack/react-router"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { parseNodeSettings } from "@vibeface/client/lib/node.ts"
+import { folderLabels,projectChoices } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { botReadiness } from "@vibeface/client/workspace/model.ts"
-import { folderLabels, projectChoices } from "@vibeface/client/workspace/bot-settings.ts"
-import { finishOnboarding, setOnboardingStep, useOnboarding } from "./onboarding-flag"
+import { Button } from "@vibeface/uiarc/button/button.tsx"
+import { Input } from "@vibeface/uiarc/input/input.tsx"
+import { Bot,FolderOpen,MessageSquarePlus } from "lucide-react"
+import { useEffect,useState } from "react"
+import { finishOnboarding,setOnboardingStep,useOnboarding } from "./onboarding-flag"
 
 /** Steps 4 and 5 after creating a network here. Skipping step 4 still offers step 5; 待处理 and the composer point back to the device page. */
 export function Onboarding() {
@@ -46,17 +46,17 @@ export function Onboarding() {
   }
   return <AuthPage header={<Steps step={step} />}>
     {step === 4 ? <Panel icon={Bot} title="让这台电脑运行 Bot">
-      <p className="text-meta text-muted-foreground">选一项 AI 服务，让 Bot 在这台电脑上回复消息。也可以先跳过，稍后在「设备」中设置。</p>
+      <p className="text-sm text-secondary">选一项 AI 服务，让 Bot 在这台电脑上回复消息。也可以先跳过，稍后在「设备」中设置。</p>
       <AiSettings onboarding onBot={setBotOn} />
       <div className="flex justify-between gap-2 border-t pt-4">
         <Button type="button" variant="ghost" className="-ms-3" onClick={() => setOnboardingStep(5)}>稍后设置</Button>
         <Button type="button" className="ms-auto" disabled={!botOn} onClick={() => setOnboardingStep(5)}>下一步</Button>
       </div>
     </Panel> : <Panel key="bot" icon={MessageSquarePlus} title="创建第一个 Bot">
-      <p className="text-meta text-muted-foreground">先给它起个名字，再告诉它你想完成的第一件事。{canReply ? null : " 暂时没有设备能回复，也可以先创建，稍后在「设备」中连接或设置。"}</p>
+      <p className="text-sm text-secondary">先给它起个名字，再告诉它你想完成的第一件事。{canReply ? null : " 暂时没有设备能回复，也可以先创建，稍后在「设备」中连接或设置。"}</p>
       <form className="grid gap-4" noValidate onSubmit={(event) => { event.preventDefault(); if (name.trim()) void create(); else setError(new Error("还没填名称")) }}>
-        <label className="grid gap-1.5 text-meta font-medium">名称<Input required maxLength={512} value={name} disabled={busy} onChange={(event) => setName(event.target.value)} /></label>
-        {project && shown ? <p className="flex min-w-0 items-center gap-1.5 text-meta text-muted-foreground"><FolderOpen aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{folderLabels.project}</span><FolderPath path={project.cwd} shown={shown[project.cwd]} /></p> : null}
+        <div className="grid gap-1.5 text-sm font-medium"><Input label="名称" required maxLength={512} value={name} disabled={busy} onChange={(event) => setName(event.target.value)} /></div>
+        {project && shown ? <p className="flex min-w-0 items-center gap-1.5 text-sm text-secondary"><FolderOpen aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{folderLabels.project}</span><FolderPath path={project.cwd} shown={shown[project.cwd]} /></p> : null}
         <InlineError error={error} />
         <div className="flex justify-between gap-2 border-t pt-4">
           <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={() => setOnboardingStep(4)}>上一步</Button>

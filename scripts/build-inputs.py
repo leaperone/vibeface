@@ -19,7 +19,7 @@ OUTPUTS = {"crypto": "apps/app/generated", "web": "apps/app/dist/client"}
 COMMON = {".gitignore", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rust-toolchain", "scripts/build-inputs.py"}
 INPUTS = {
     "crypto": ("crates/secure/", "scripts/build-web-crypto.sh", "scripts/release-rustflags.py"),
-    "web": ("apps/app/", "packages/client/", "packages/theme/", "config/public-bootstrap.json", "package.json",
+    "web": ("apps/app/", "packages/client/", "packages/theme/", "packages/uiarc/", "scripts/generate-uiarc-theme.py", "scripts/check-uiarc.py", "scripts/check-uiarc-build.mjs", "scripts/check-uiarc-native.cjs", "config/uiarc.json", "config/public-bootstrap.json", "package.json",
             "pnpm-lock.yaml", "pnpm-workspace.yaml", "scripts/build-web.sh"),
 }
 CACHE_POLICIES = (

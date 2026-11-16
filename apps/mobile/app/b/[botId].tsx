@@ -8,8 +8,7 @@ import { FlatList, Platform, Pressable, StyleSheet, View, type NativeScrollEvent
 import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller'
 import Animated, { useAnimatedStyle, useSharedValue } from 'react-native-reanimated'
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
-import { useCSSVariable, useUniwind, withUniwind } from 'uniwind'
-import { faceOf } from '@vibeface/client/avatar/face.ts'
+import { useCSSVariable, withUniwind } from 'uniwind'
 import { awaitsDevice, botReach, botCanSend, composerHint, inputTargetKey, promptIntent, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
 import { messageTimes } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -21,16 +20,15 @@ import { botCopy, scheduleName } from '@vibeface/client/workspace/bot-settings.t
 import { unreachable } from '@vibeface/client/workspace/home.ts'
 import { botMood, BotFace, ScreenFaces, type FaceBot } from '@/components/bot-face'
 import { OfflineBar } from '@/components/connection-pill'
-import { botTint, EmptyState } from '@/components/kit'
-import { Button } from '@/components/ui/button'
-import { Icon } from '@/components/ui/icon'
-import { Text } from '@/components/ui/text'
+import { EmptyState } from '@/components/kit'
+import { Button } from '@/components/arc/button'
+import { Icon } from '@/components/arc/icon'
+import { Text } from '@/components/arc/text'
 import { useWorkspace } from '@/data/context'
 import { useLive } from '@/data/live'
 import type { Attachment, ChatMessage, Conversation } from '@/data/types'
 import type { Question } from '@vibeface/client/workspace/types.ts'
 import { Composer } from '@/features/chat/composer'
-import { useChatChrome } from '@/features/chat/chrome'
 import { Message } from '@/features/chat/message'
 import { QuestionCard } from '@/features/chat/question-card'
 import { useChatExtras, type Row } from '@/features/chat/work'
@@ -81,11 +79,11 @@ function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>, b
   }
   rows.push(...chat.rest.map(question))
   const unreadAt = rows.findIndex((row) => ('message' in row ? row.message.message_id : row.key) === chat.unread)
-  if (unreadAt >= 0) rows.splice(unreadAt, 0, { key: 'unread', node: <View className="flex-row items-center gap-3"><View className="h-px flex-1 bg-primary/40" /><Text className="text-meta text-primary">新消息</Text><View className="h-px flex-1 bg-primary/40" /></View> })
+  if (unreadAt >= 0) rows.splice(unreadAt, 0, { key: 'unread', node: <View className="flex-row items-center gap-3"><View className="h-px flex-1 bg-foreground/40" /><Text className="text-sm text-foreground">新消息</Text><View className="h-px flex-1 bg-foreground/40" /></View> })
   rows.push(...extras.rest)
   if (chat.replying && !chat.messages.some((message) => message.state === 'streaming')) rows.push({
     key: 'activity',
-    node: <Fade entering={fadeIn} accessibilityRole="progressbar" className="min-h-7 flex-row items-center gap-2"><BotFace bot={bot} mood={offline ? 'asleep' : 'thinking'} size={24} /><Text className="text-meta text-muted-foreground">{chat.status ?? '思考中'}</Text></Fade>,
+    node: <Fade entering={fadeIn} accessibilityRole="progressbar" className="min-h-7 flex-row items-center gap-2"><BotFace bot={bot} mood={offline ? 'asleep' : 'thinking'} size={24} /><Text className="text-sm text-muted">{chat.status ?? '思考中'}</Text></Fade>,
   })
   if (extras.cards.length) rows.push({ key: 'waiting-on-you', node: <View className="gap-3">{extras.cards}</View> })
   return rows.reverse()
@@ -106,8 +104,6 @@ export default function ChatScreen() {
   const frame = useSafeAreaFrame().width
   const wide = useWide()
   const titleWidth = ios ? (wide ? frame - 320 : frame) - 120 : undefined
-  const { theme } = useUniwind()
-  const chrome = useChatChrome()
   const background = useCSSVariable('--background')
   const bot = workspace.bots.find((item) => item.bot_id === botId)
   const id = bot?.conversation_id
@@ -214,26 +210,25 @@ export default function ChatScreen() {
   unreadIndex.current = rows.findIndex((row) => row.key === 'unread')
   const mood = offline ? 'asleep' : botMood(bot, workspace, live)
   // The bot's hue carries from its face into the send button and starter chips, so each chat reads as that bot's.
-  const tint = botTint(faceOf(bot.bot_id, bot.avatar).hue, theme === 'dark')
   const title = <Link href={`/b/${bot.bot_id}/about`} asChild>
     <Pressable accessibilityRole="link" accessibilityLabel={[bot.name, workspace.primary === bot.conversation_id ? '主 Bot' : '', 'Bot 信息'].filter(Boolean).join('，')}
-      className={ios ? 'min-h-11 shrink flex-row items-center gap-1.5 rounded-full px-2.5 active:bg-muted/50' : '-mx-2 min-h-11 shrink flex-row items-center gap-2 self-start rounded-lg px-2 active:bg-muted'} style={{ maxWidth: titleWidth }}>
+      className={ios ? 'min-h-11 shrink flex-row items-center gap-1.5 rounded-pill px-2.5 active:bg-surface-muted/50' : '-mx-2 min-h-11 shrink flex-row items-center gap-2 self-start rounded-control px-2 active:bg-surface-muted'} style={{ maxWidth: titleWidth }}>
       <BotFace bot={bot} mood={mood} size={ios ? 24 : 28} />
-      <Text numberOfLines={1} className="shrink font-semibold">{bot.name}</Text>
-      {workspace.primary === bot.conversation_id ? <Icon as={Star} className="size-3.5 fill-muted-foreground text-muted-foreground" /> : null}
+      <Text numberOfLines={1} className="shrink font-medium">{bot.name}</Text>
+      {workspace.primary === bot.conversation_id ? <Icon as={Star} className="size-3.5 fill-muted text-muted" /> : null}
     </Pressable>
   </Link>
   // No background here: the screen paints it, and a painted view would come first natively and hide the list from scrollEdgeEffects.
   return <View className="flex-1">
     <Stack.Screen options={{
       title: bot.name,
-      headerRight: () => <Link href={`/b/${bot.bot_id}/about`} asChild><Button variant="ghost" size="icon" accessibilityLabel={`${bot.name} 设置`}><Icon as={Settings} className="size-5" /></Button></Link>,
+      headerRight: () => <Link href={`/b/${bot.bot_id}/about`} asChild><Button variant="ghost" iconOnly accessibilityLabel={`${bot.name} 设置`}><Icon as={Settings} className="size-5" /></Button></Link>,
       // iOS 26 measures the edge blur on the un-inverted list and covers every message once the chat outgrows the screen.
       scrollEdgeEffects: { top: 'hidden', bottom: 'hidden', left: 'hidden', right: 'hidden' },
       headerTransparent: ios,
       ...ios ? {
-        headerBlurEffect: chrome.kind === 'glass' ? chrome.colorScheme === 'dark' ? 'systemUltraThinMaterialDark' : 'systemUltraThinMaterialLight' : 'none',
-        headerStyle: { backgroundColor: chrome.kind === 'glass' ? 'transparent' : typeof background === 'string' ? background : undefined },
+        headerBlurEffect: 'none',
+        headerStyle: { backgroundColor: typeof background === 'string' ? background : undefined },
       } : {},
       headerTitle: () => <ScreenFaces>{title}</ScreenFaces>,
     }} />
@@ -271,20 +266,20 @@ export default function ChatScreen() {
     />
     {rows.length ? null : <Animated.View pointerEvents="box-none" style={[StyleSheet.absoluteFill, { paddingTop: header }, above]}>
       <View pointerEvents="box-none" className="flex-1 items-center justify-center gap-4 px-4">
-        <BotFace bot={bot} mood={mood} size={96} halo={tint.glow} />
+        <BotFace bot={bot} mood={mood} size={96} />
         <View className="items-center gap-1">
-          <Text role="heading" className="text-center text-heading font-semibold">{bot.name}</Text>
+          <Text role="heading" className="text-center text-lg font-medium">{bot.name}</Text>
           {workspace.primary === bot.conversation_id ? <View className="flex-row items-center gap-1">
-            <Icon as={Star} className="size-3.5 fill-muted-foreground text-muted-foreground" /><Text className="text-meta text-muted-foreground">主 Bot</Text>
+            <Icon as={Star} className="size-3.5 fill-muted text-muted" /><Text className="text-sm text-muted">主 Bot</Text>
           </View> : null}
         </View>
         {botCanSend(reach) ? <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
-          {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} variant="outline" className="rounded-full" style={{ borderColor: tint.edge }} onPress={() => setDraft({ text: example })}><Text className="text-muted-foreground">{example}</Text></Button>)}
-        </View> : starting ? <View role="status" className="flex-row items-center gap-1.5"><Icon as={LoaderCircle} className="text-muted-foreground" /><Text className="text-muted-foreground">Bot 正在启动</Text></View> : <>
-          <View className="flex-row items-center gap-1.5"><Icon as={MessageSquareOff} className="text-muted-foreground" /><Text className="text-muted-foreground">Bot 还不能回复</Text></View>
+          {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} variant="secondary" className="rounded-pill" onPress={() => setDraft({ text: example })}><Text className="text-muted">{example}</Text></Button>)}
+        </View> : starting ? <View role="status" className="flex-row items-center gap-1.5"><Icon as={LoaderCircle} className="text-muted" /><Text className="text-muted">Bot 正在启动</Text></View> : <>
+          <View className="flex-row items-center gap-1.5"><Icon as={MessageSquareOff} className="text-muted" /><Text className="text-muted">Bot 还不能回复</Text></View>
           {reach === 'offline' || canSetUp ? <Link href={setupHref} asChild>
             <Button><Icon as={Bot} /><Text>{reach === 'offline' ? '查看设备' : '设置运行 Bot 的设备'}</Text></Button>
-          </Link> : <View className="flex-row items-center gap-1.5"><Icon as={Crown} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">{setUpOnManager(workspace.members.filter((member) => member.admin).map((member) => member.name))}</Text></View>}
+          </Link> : <View className="flex-row items-center gap-1.5"><Icon as={Crown} className="size-4 text-muted" /><Text className="text-sm text-muted">{setUpOnManager(workspace.members.filter((member) => member.admin).map((member) => member.name))}</Text></View>}
         </>}
       </View>
     </Animated.View>}
@@ -293,21 +288,21 @@ export default function ChatScreen() {
     <KeyboardStickyView pointerEvents={ios ? 'box-none' : undefined} style={ios ? { position: 'absolute', bottom: 0, left: 0, right: 0 } : undefined} offset={{ closed: 0, opened: insets.bottom }}>
       <View pointerEvents={ios ? 'box-none' : undefined} style={{ paddingBottom: insets.bottom }} onLayout={ios ? (event) => { dockHeight.value = event.nativeEvent.layout.height } : undefined}>
         {scrollButton.id === id && scrollButton.visible ? <View pointerEvents="box-none" className={ios ? 'absolute -top-13 w-full max-w-3xl self-center items-end px-4' : 'absolute -top-14 w-full max-w-3xl self-center items-end px-4'}>
-          <Button variant="outline" size="icon" className="rounded-full bg-card shadow-sm" accessibilityLabel="回到底部" onPress={toLatest}><Icon as={ArrowDown} /></Button>
+          <Button variant="secondary" iconOnly className="rounded-pill bg-surface " accessibilityLabel="回到底部" onPress={toLatest}><Icon as={ArrowDown} /></Button>
         </View> : null}
-        <Composer chrome={chrome} value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })} attachmentScope={JSON.stringify([device.ready?.principal.network_id ?? '', id, inputTargetKey(inputTarget)])}
-          blocked={blocked} sending={false} onSend={send} onStop={(inputTarget.kind === 'bot_main' ? chat?.stoppable : targetBusy) ? () => void live?.stopInputTarget({ target: targetOption.target }).catch((cause) => setSendError(messageOf(cause))) : undefined} tint={tint}
+        <Composer value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })} attachmentScope={JSON.stringify([device.ready?.principal.network_id ?? '', id, inputTargetKey(inputTarget)])}
+          blocked={blocked} sending={false} onSend={send} onStop={(inputTarget.kind === 'bot_main' ? chat?.stoppable : targetBusy) ? () => void live?.stopInputTarget({ target: targetOption.target }).catch((cause) => setSendError(messageOf(cause))) : undefined}
           sendLabel={targetBusy ? '补充当前工作' : '发送'}
         >{offline || setupHint || sendError || inputTarget.kind !== 'bot_main' ? <>
           {offline ? <OfflineBar chat className="self-center" /> : setupHint ? <View role="status" className="flex-row flex-wrap items-center gap-x-2 px-2">
-            <Text className="text-meta text-muted-foreground">{setupHint}</Text>
-            {reach === 'offline' || canSetUp ? <Link href={setupHref} asChild><Button variant="ghost" size="sm" className="min-h-12"><Text>{reach === 'offline' ? '查看设备' : '去设置'}</Text></Button></Link>
-              : <Text className="text-meta text-muted-foreground">{setUpOnManager(workspace.members.filter((member) => member.admin).map((member) => member.name))}</Text>}
+            <Text className="text-sm text-muted">{setupHint}</Text>
+            {reach === 'offline' || canSetUp ? <Link href={setupHref} asChild><Button variant="ghost" size="sm"><Text>{reach === 'offline' ? '查看设备' : '去设置'}</Text></Button></Link>
+              : <Text className="text-sm text-muted">{setUpOnManager(workspace.members.filter((member) => member.admin).map((member) => member.name))}</Text>}
           </View> : null}
           {sendError ? <ErrorText error={sendError} /> : null}
           {inputTarget.kind !== "bot_main" ? <View className="flex-row items-center gap-2 px-2">
-            <Text numberOfLines={1} className="min-w-0 flex-1 text-meta text-muted-foreground">{targetBusy ? '补充给' : '发送给'} · {targetOption.label}</Text>
-            <Button variant="ghost" size="sm" className="min-h-12" onPress={() => setSelectedTarget('main')}><Text>改回主聊天</Text></Button>
+            <Text numberOfLines={1} className="min-w-0 flex-1 text-sm text-muted">{targetBusy ? '补充给' : '发送给'} · {targetOption.label}</Text>
+            <Button variant="ghost" size="sm" onPress={() => setSelectedTarget('main')}><Text>改回主聊天</Text></Button>
           </View> : null}
         </> : null}
         </Composer>

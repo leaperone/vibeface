@@ -1,20 +1,21 @@
-import { Link, createFileRoute } from '@tanstack/react-router'
-import { useEffect, useState, type ReactNode } from 'react'
-import { Bell, BellOff, Check, ChevronRight, CircleAlert, CircleCheck, Crown, Download, FlaskConical, LogOut, Monitor, Moon, Palette, Plus, ScrollText, ShieldAlert, ShieldCheck, Sun, TriangleAlert, type LucideIcon } from 'lucide-react'
-import { terms } from '@/lib/glossary'
-import { cn } from '@/lib/utils'
-import { BusyIcon, CountBadge, Segmented, SegmentedValue, SettingsGroup, SettingsRow } from '@/components/app/kit'
-import { Button } from '@/components/ui/button'
-import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
-import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
-import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { onlyManagerText, securityCopy, soleManager, waitingCopy } from '@vibeface/client/identity/copy.ts'
-import { ConnectionSettings } from '@/features/identity/device-controls'
-import { TriageSettings } from '@/features/devices/triage-settings'
+import { BusyIcon,CountBadge,Segmented,SegmentedValue,SettingsGroup,SettingsRow } from '@/components/arc/product-kit'
+import { RoutedAction } from "@/components/arc/routed-action"
 import { useOpenJoins } from '@/features/devices/join'
-import { CurrentRecoveryFile, PhoneRecovery, RecoveredStep, RecoveryControls, RecoveryReview } from '@/features/identity/recovery-controls'
+import { TriageSettings } from '@/features/devices/triage-settings'
+import { ConnectionSettings } from '@/features/identity/device-controls'
+import { CurrentRecoveryFile,PhoneRecovery,RecoveredStep,RecoveryControls,RecoveryReview } from '@/features/identity/recovery-controls'
+import { terms } from '@/lib/glossary'
+import { readTheme,setTheme,type Theme } from '@/lib/theme'
+import { cn } from '@/lib/utils'
+import { Link,createFileRoute } from '@tanstack/react-router'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { onlyManagerText,securityCopy,soleManager,waitingCopy } from '@vibeface/client/identity/copy.ts'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
-import { readTheme, setTheme, type Theme } from '@/lib/theme'
+import { Button } from '@vibeface/uiarc/button/button.tsx'
+import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
+import { Select } from "@vibeface/uiarc/select/select.tsx"
+import { Bell,BellOff,Check,ChevronRight,CircleAlert,CircleCheck,Download,FlaskConical,LogOut,Monitor,Moon,Palette,Plus,ScrollText,ShieldAlert,ShieldCheck,Sun,TriangleAlert,type LucideIcon } from 'lucide-react'
+import { useEffect,useState,type ReactNode } from 'react'
 
 export const Route = createFileRoute('/_app/settings')({ component: SettingsPage })
 
@@ -77,10 +78,8 @@ function SettingsPage() {
       </Link>
       <SettingsRow icon={Download} label="诊断包">
         <span className="flex">
-          <NativeSelect size="sm" className="focus-within:z-10 [&_select]:rounded-e-none!" aria-label="诊断包的时间范围" value={String(range)} onChange={(event) => setRange(Number(event.target.value))}>
-            {ranges.map(([value, label]) => <NativeSelectOption key={value} value={String(value)}>{label}</NativeSelectOption>)}
-          </NativeSelect>
-          <Button type="button" size="sm" variant="outline" className="relative -ms-px rounded-s-none focus-visible:z-10" disabled={exported === 'busy'} onClick={() => {
+          <Select label="诊断包的时间范围" className="focus-within:z-10" value={"arc:" + String(range)} onValueChange={selected => { const value = selected.slice(4);  setRange(Number(value))  }} options={ranges.map(([value, label]) => ({ value: "arc:" + String(value), label: label }))} />
+          <Button type="button" size="sm" variant="secondary" className="relative -ms-px focus-visible:z-10" disabled={exported === 'busy'} onClick={() => {
             setExported('busy')
             void workspace.run(async () => { saveDiagnostics(await workspace.diagnostics(Date.now() - range)); setExported('done') }, "导出诊断包")
               .finally(() => setExported((state) => state === 'busy' ? 'idle' : state))
@@ -91,30 +90,30 @@ function SettingsPage() {
     <SettingsGroup>
       <SettingsRow icon={LogOut} tone="danger" label="断开这个浏览器" onClick={() => setLeaving(true)} />
     </SettingsGroup>
-    <Sheet open={leaving} onOpenChange={setLeaving}>
-      <SheetContent side="bottom" showCloseButton={false} className="gap-0 pb-[env(safe-area-inset-bottom)] sm:mx-auto sm:max-w-md sm:rounded-t-2xl sm:border-x">
+    <Drawer open={leaving} onOpenChange={setLeaving}>
+      <DrawerContent title={sole ? onlyManagerText("这个浏览器") : "断开这个浏览器？"} description={sole ? "不能断开" : "要回来，得重新打开本机页面或用加入链接"} side="bottom" className="gap-0 pb-[env(safe-area-inset-bottom)] sm:mx-auto sm:max-w-md sm:rounded-t-2xl sm:border-x">
         {sole ? <>
-          <SheetHeader className="px-4 pt-4">
-            <SheetTitle className="flex items-start gap-2 text-body font-normal"><Crown aria-hidden="true" className="mt-1 size-4 shrink-0 text-warning" />{onlyManagerText('这个浏览器')}</SheetTitle>
-            <SheetDescription className="sr-only">不能断开</SheetDescription>
-          </SheetHeader>
+          <div className="px-4 pt-4">
+
+
+          </div>
           <div className="flex justify-end gap-2 px-4 pt-2 pb-4">
             <Button type="button" variant="ghost" onClick={() => setLeaving(false)}>知道了</Button>
             {/* With no other device to promote, the next manager has to join first. */}
-            <Button asChild><Link to="/devices" search={otherClient ? {} : { add: true }}>{otherClient ? <terms.myDevices.icon aria-hidden="true" /> : <Plus aria-hidden="true" />}{otherClient ? terms.myDevices.label : '添加设备'}</Link></Button>
+            <RoutedAction to="/devices" search={otherClient ? {} : { add: true }}>{otherClient ? <terms.myDevices.icon aria-hidden="true" /> : <Plus aria-hidden="true" />}{otherClient ? terms.myDevices.label : '添加设备'}</RoutedAction>
           </div>
         </> : <>
-          <SheetHeader className="gap-1.5 px-4 pt-4">
-            <SheetTitle className="flex items-center gap-2"><LogOut aria-hidden="true" className="size-5 text-danger" />断开这个浏览器？</SheetTitle>
-            <SheetDescription>要回来，得重新打开本机页面或用加入链接</SheetDescription>
-          </SheetHeader>
+          <div className="gap-1.5 px-4 pt-4">
+
+
+          </div>
           <div className="flex justify-end gap-2 px-4 pt-2 pb-4">
             <Button type="button" variant="ghost" onClick={() => setLeaving(false)}>取消</Button>
-            <Button type="button" variant="destructive" onClick={() => { void workspace.run(async () => { setLeaving(false); await device.leave() }, '断开这个浏览器') }}>断开</Button>
+            <Button type="button" variant="danger" onClick={() => { void workspace.run(async () => { setLeaving(false); await device.leave() }, '断开这个浏览器') }}>断开</Button>
           </div>
         </>}
-      </SheetContent>
-    </Sheet>
+      </DrawerContent>
+    </Drawer>
   </div>
 }
 
@@ -149,7 +148,7 @@ const notificationText = { on: '已开启', unsupported: '不支持', denied: '�
 function NotificationValue() {
   const workspace = useWorkspace()
   const { label, disabled, state } = workspace.notificationButton
-  if (state === 'off' && !disabled) return <Button type="button" size="sm" variant="outline" title={label} onClick={() => { void workspace.run(() => workspace.enableNotifications(), '开启提醒') }}>开启</Button>
+  if (state === 'off' && !disabled) return <Button type="button" size="sm" variant="secondary" title={label} onClick={() => { void workspace.run(() => workspace.enableNotifications(), '开启提醒') }}>开启</Button>
   return <span title={label} className={cn('inline-flex items-center gap-1', state === 'on' && 'text-success')}>
     {state === 'on' ? <CircleCheck aria-hidden="true" className="size-4" /> : state === 'denied' ? <BellOff aria-hidden="true" className="size-4" /> : null}
     {state === 'off' ? label : notificationText[state]}
