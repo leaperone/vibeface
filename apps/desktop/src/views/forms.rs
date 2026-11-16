@@ -42,12 +42,17 @@ pub struct Field {
     pub state: Entity<InputState>,
     pub area: Option<Entity<TextareaState>>,
 }
+struct TaskMetadata {
+    title: String,
+    owner_bot: String,
+}
 pub struct Form {
     pub submission_id: String,
     pub generation: u64,
     pub owner_node_id: Option<String>,
     pub editor: Editor,
     pub fields: Vec<Field>,
+    task_metadata: Option<TaskMetadata>,
     delivery_budget_id: Option<String>,
     delivery_restart_order_id: Option<String>,
     delivery_restart_intent_id: Option<String>,
@@ -143,9 +148,14 @@ impl Form {
                 ("model", "模型，空白表示设备默认", false),
                 ("effort", "推理强度，空白表示由Provider控制", false),
             ],
-            Editor::CreateTask | Editor::EditTask(..) => &[
+            Editor::CreateTask => &[
                 ("title", "任务标题", false),
                 ("owner_bot", "负责的 Bot ID", false),
+                ("request", "任务要求", false),
+                ("expected_result", "预期结果", false),
+                ("dependencies", "依赖任务 ID，逗号分隔", false),
+            ],
+            Editor::EditTask(..) => &[
                 ("request", "任务要求", false),
                 ("expected_result", "预期结果", false),
                 ("dependencies", "依赖任务 ID，逗号分隔", false),
@@ -308,6 +318,10 @@ impl Form {
             submission_id: uuid::Uuid::new_v4().to_string(),
             generation,
             owner_node_id: values.get("_owner_node_id").cloned(),
+            task_metadata: matches!(&editor, Editor::EditTask(..)).then(|| TaskMetadata {
+                title: values.get("title").cloned().unwrap_or_default(),
+                owner_bot: values.get("owner_bot").cloned().unwrap_or_default(),
+            }),
             delivery_budget_id: if matches!(&editor, Editor::Transfer) {
                 values.get("budget_id").cloned()
             } else {
@@ -369,6 +383,14 @@ impl Form {
             .flex()
             .flex_col()
             .gap_4()
+            .children(self.task_metadata.as_ref().map(|task| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(format!("任务标题（只读）：{}", task.title))
+                    .child(format!("负责的 Bot ID（只读）：{}", task.owner_bot))
+            }))
             .children(self.delivery_restart_order_id.as_ref().map(|id| div().child(format!("作为新订单再次发送：原订单 {id}。请重新选择同名、同内容的原文件；原条款和金额上限必须保持一致，不会自动确认或付款。"))))
             .children(self.delivery_budget_id.as_ref().map(|id| {
                 div().child(format!(
