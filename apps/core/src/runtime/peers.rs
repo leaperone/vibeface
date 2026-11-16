@@ -5725,7 +5725,8 @@ mod tests {
                     .context("read lost-Node recovery retirement heads")
             }?)?;
             let issued = now_ms() as u64 + 1_000 - crate::identity::RECOVERY_DELAY_MS;
-            let (waiting, _, next) = recovery_on(&ia, &state, kept, retired, issued)?;
+            let (waiting, checkpoint, next) = recovery_on(&ia, &state, kept, retired, issued)?;
+            let effective_at = checkpoint.effective_at_ms();
             assert_eq!(
                 a.install_membership(waiting)
                     .await
@@ -5734,6 +5735,7 @@ mod tests {
                 2,
                 "waiting"
             );
+            assert!(a.recovery_since_ms(&next).await?.is_none());
             a.start_recovery_timer();
             let deadline = Instant::now() + Duration::from_secs(10);
             while a
@@ -5745,12 +5747,20 @@ mod tests {
                 ensure!(Instant::now() < deadline, "the recovery never took effect");
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            let view = a
+            let installed = a
                 .membership_state()
                 .await
-                .context("read activated lost-Node recovery membership")?
-                .project()?;
+                .context("read activated lost-Node recovery membership")?;
+            // The marker records a past activation; a later wall-clock sample can precede it.
+            let before = installed.project_at(effective_at - 1)?;
+            assert_eq!(before.epoch, 2);
+            assert_eq!(before.recovery_key, view.recovery_key);
+            assert!(before.node(&lost.device_id()?).is_ok());
+            assert!(before.revocation(&lost.device_id()?).is_none());
+            let view = installed.project_at(effective_at)?;
             assert_eq!(view.epoch, 3);
+            assert_eq!(view.recovery_key, next);
+            assert!(view.node(&lost.device_id()?).is_err());
             assert!(view.revocation(&lost.device_id()?).is_some());
             anyhow::Ok(())
         }
