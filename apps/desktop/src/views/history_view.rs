@@ -220,7 +220,7 @@ pub struct HistoryList {
     keys: Vec<String>,
 }
 impl HistoryList {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             list: ListState::new(0, ListAlignment::Top, px(500.)),
             scope: String::new(),
