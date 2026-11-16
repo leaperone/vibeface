@@ -1,6 +1,7 @@
 "use client"
 
 import { cn } from "@/lib/utils"
+import { useDark } from "@/lib/hooks/use-theme"
 import { colors,faceOf,HALO,pose,thinkingDots,type Mood } from "@vibeface/client/avatar/face.ts"
 import { moodOf } from "@vibeface/client/avatar/mood.ts"
 import { ASLEEP,faceMotion,type Frame } from "@vibeface/client/avatar/motion.ts"
@@ -30,13 +31,6 @@ const followReduced = (change: () => void) => {
   reducedQuery?.addEventListener("change", change)
   return () => reducedQuery?.removeEventListener("change", change)
 }
-const followDark = (change: () => void) => {
-  const observer = new MutationObserver(change)
-  observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] })
-  return () => observer.disconnect()
-}
-export const useDark = () => useSyncExternalStore(followDark, () => document.documentElement.dataset.theme === "dark", () => false)
-
 function apply(frame: Frame, parts: { g: SVGGElement; ring: SVGPathElement; body: SVGPathElement; grey: SVGPathElement; left: SVGPathElement; right: SVGPathElement; dots: SVGCircleElement[] }) {
   parts.g.setAttribute("transform", transformOf(frame))
   parts.ring.setAttribute("d", frame.ring)

@@ -1,4 +1,5 @@
-import { BotFace,useDark } from "@/components/app/bot-face"
+import { BotFace } from "@/components/app/bot-face"
+import { useDark } from "@/lib/hooks/use-theme"
 import { cn } from "@/lib/utils"
 import { colors,EYES,HUES,OUTLINES,type Avatar,type Face } from "@vibeface/client/avatar/face.ts"
 import { eyeNames,hueNames,outlineNames,withPart } from "@vibeface/client/avatar/pick.ts"
