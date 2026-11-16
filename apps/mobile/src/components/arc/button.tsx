@@ -1,5 +1,5 @@
 import type { ComponentProps } from 'react'
-import { Pressable, View } from 'react-native'
+import { Platform, Pressable, View } from 'react-native'
 import Animated, { useAnimatedStyle, useReducedMotion, useSharedValue, withTiming } from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
 import { TextClassContext } from './text'
@@ -14,8 +14,8 @@ const appearance = {
   danger: 'border-border bg-surface active:border-danger active:bg-surface-muted',
 }
 const ink = { primary: 'text-background', secondary: 'text-foreground', ghost: 'text-secondary', danger: 'text-danger' }
-const sizing = { sm: 'min-h-9 px-3', md: 'min-h-11 px-4', lg: 'min-h-[50px] px-5' }
-const iconSizing = { sm: 'min-w-9 px-0', md: 'min-w-11 px-0', lg: 'min-w-[50px] px-0' }
+const sizing = { sm: 'min-h-9 px-3', md: Platform.OS === 'android' ? 'min-h-12 min-w-12 px-4' : 'min-h-11 px-4', lg: 'min-h-[50px] px-5' }
+const iconSizing = { sm: 'min-w-9 px-0', md: Platform.OS === 'android' ? 'min-w-12 px-0' : 'min-w-11 px-0', lg: 'min-w-[50px] px-0' }
 export type ButtonProps = ComponentProps<typeof Pressable> & {
   variant?: keyof typeof appearance
   size?: keyof typeof sizing
@@ -28,7 +28,7 @@ export function Button({ className, variant = 'primary', size = 'md', iconOnly, 
   const scale = useSharedValue(1)
   const pressed = useAnimatedStyle(() => ({ transform: [{ scale: scale.value }] }))
   const disabledOutline = disabled && (variant === 'secondary' || variant === 'danger')
-  const minimumSlop = size === 'sm' ? 4 : 0
+  const minimumSlop = size === 'sm' ? (Platform.OS === 'android' ? 6 : 4) : 0
   const targetSlop = typeof hitSlop === 'number' ? Math.max(hitSlop, minimumSlop) : {
     top: Math.max(hitSlop?.top ?? 0, minimumSlop), bottom: Math.max(hitSlop?.bottom ?? 0, minimumSlop),
     left: Math.max(hitSlop?.left ?? 0, minimumSlop), right: Math.max(hitSlop?.right ?? 0, minimumSlop),
@@ -39,6 +39,6 @@ export function Button({ className, variant = 'primary', size = 'md', iconOnly, 
       onPressIn={(event) => { scale.value = withTiming(reduced ? 1 : 0.97, tap); onPressIn?.(event) }}
       onPressOut={(event) => { scale.value = withTiming(1, tap); onPressOut?.(event) }} />
   return <TextClassContext.Provider value={cn('font-sans text-sm font-medium', ink[variant], disabled && variant === 'ghost' && 'text-muted', disabledOutline && 'text-muted')}>
-    {size === 'sm' ? <View className="min-h-11 min-w-11 justify-center p-1">{control}</View> : control}
+    {size === 'sm' ? <View className={Platform.OS === 'android' ? 'min-h-12 min-w-12 justify-center p-1.5' : 'min-h-11 min-w-11 justify-center p-1'}>{control}</View> : control}
   </TextClassContext.Provider>
 }

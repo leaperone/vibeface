@@ -1,6 +1,6 @@
 import { historySections } from '@vibeface/client/workspace/model.ts'
 import { HistoryControls } from '@/features/chat/history-controls'
-import { Link, Stack, router, useFocusEffect, useLocalSearchParams } from 'expo-router'
+import { Link, Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
 import { ArrowDown, Bot, Crown, LoaderCircle, MessageSquareOff, Settings, Star } from 'lucide-react-native'
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -90,6 +90,7 @@ function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>, b
 }
 
 export default function ChatScreen() {
+  const router = useRouter()
   const { botId, routine } = useLocalSearchParams<{ botId: string; routine?: string }>()
   const workspace = useWorkspace()
   const device = useDevice()
@@ -103,7 +104,8 @@ export default function ChatScreen() {
   // already ends where the bar's buttons begin.
   const frame = useSafeAreaFrame().width
   const wide = useWide()
-  const titleWidth = ios ? (wide ? frame - 320 : frame) - 120 : undefined
+  // Compact iPad windows also need leading room for the system window controls.
+  const titleWidth = Platform.OS === 'ios' ? (wide ? frame - 320 : frame) - (Platform.isPad && !wide ? 200 : 120) : undefined
   const background = useCSSVariable('--background')
   const bot = workspace.bots.find((item) => item.bot_id === botId)
   const id = bot?.conversation_id
@@ -273,9 +275,9 @@ export default function ChatScreen() {
             <Icon as={Star} className="size-3.5 fill-muted text-muted" /><Text className="text-sm text-muted">主 Bot</Text>
           </View> : null}
         </View>
-        {botCanSend(reach) ? <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
+        {botCanSend(reach) ? (!draft.text.trim() ? <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
           {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} variant="secondary" className="rounded-pill" onPress={() => setDraft({ text: example })}><Text className="text-muted">{example}</Text></Button>)}
-        </View> : starting ? <View role="status" className="flex-row items-center gap-1.5"><Icon as={LoaderCircle} className="text-muted" /><Text className="text-muted">Bot 正在启动</Text></View> : <>
+        </View> : null) : starting ? <View role="status" className="flex-row items-center gap-1.5"><Icon as={LoaderCircle} className="text-muted" /><Text className="text-muted">Bot 正在启动</Text></View> : <>
           <View className="flex-row items-center gap-1.5"><Icon as={MessageSquareOff} className="text-muted" /><Text className="text-muted">Bot 还不能回复</Text></View>
           {reach === 'offline' || canSetUp ? <Link href={setupHref} asChild>
             <Button><Icon as={Bot} /><Text>{reach === 'offline' ? '查看设备' : '设置运行 Bot 的设备'}</Text></Button>
