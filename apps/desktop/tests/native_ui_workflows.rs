@@ -980,6 +980,154 @@ fn full_command_queue_keeps_composer_retryable(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn form_multiline_controls_initialize_edit_and_read_back(cx: &mut TestAppContext) {
+    use views::forms::{Editor, FieldControl, Form};
+    let h = open(cx, Route::Home, fixture());
+    h.window
+        .update(cx, |_, window, cx| {
+            for (editor, keys) in [
+                (Editor::Connect, vec!["addresses"]),
+                (Editor::CreateBot, vec!["instructions"]),
+                (Editor::CreateTask, vec!["request", "expected_result"]),
+                (
+                    Editor::EditTask("task-a".into(), 9),
+                    vec!["request", "expected_result"],
+                ),
+                (Editor::ChannelPost("channel-a".into()), vec!["text"]),
+                (Editor::Memory(None), vec!["text"]),
+                (Editor::Schedule, vec!["prompt"]),
+                (Editor::NodeSettings, vec!["roots", "backup_candidates"]),
+                (Editor::Triage, vec!["projects"]),
+                (
+                    Editor::Answer("question-a".into(), "chat-a".into()),
+                    vec!["text"],
+                ),
+            ] {
+                let initial = keys
+                    .iter()
+                    .map(|&key| (key, "首行\nsecond line".into()))
+                    .collect();
+                let form = Form::new(editor, initial, 7, window, cx);
+                if matches!(form.editor, Editor::EditTask(..)) {
+                    assert_eq!(
+                        form.fields
+                            .iter()
+                            .map(|field| field.key)
+                            .collect::<Vec<_>>(),
+                        ["request", "expected_result", "dependencies"]
+                    );
+                }
+                for key in keys {
+                    let field = form.fields.iter().find(|field| field.key == key).unwrap();
+                    let FieldControl::MultiLine(state) = &field.control else {
+                        panic!("{key} must have a multiline control");
+                    };
+                    assert_eq!(state.read(cx).value(), "首行\nsecond line");
+                    assert_eq!(form.values(cx)[key], "首行\nsecond line");
+                    field.control.set_value("edited\n末行", window, cx);
+                    assert_eq!(form.values(cx)[key], "edited\n末行");
+                }
+            }
+        })
+        .unwrap();
+}
+
+#[gpui_kit::test]
+fn form_password_controls_stay_masked_single_line(cx: &mut TestAppContext) {
+    use views::forms::{Editor, FieldControl, Form};
+    let h = open(cx, Route::Home, fixture());
+    h.window
+        .update(cx, |_, window, cx| {
+            for (editor, keys) in [
+                (Editor::ConnectLocal, vec!["unlock_password"]),
+                (Editor::Connect, vec!["unlock_password"]),
+                (Editor::Join, vec!["unlock_password", "ticket"]),
+                (Editor::CreateNetwork, vec!["unlock_password", "password"]),
+                (Editor::Recovery, vec!["unlock_password", "password"]),
+                (Editor::Provider, vec!["env"]),
+                (Editor::Triage, vec!["webhook_secret"]),
+            ] {
+                let initial = keys
+                    .iter()
+                    .map(|&key| (key, "controlled secret".into()))
+                    .collect();
+                let form = Form::new(editor, initial, 7, window, cx);
+                for key in keys {
+                    let field = form.fields.iter().find(|field| field.key == key).unwrap();
+                    let FieldControl::SingleLine(state) = &field.control else {
+                        panic!("{key} must have a single-line control");
+                    };
+                    assert!(state.read(cx).is_masked());
+                    assert_eq!(form.values(cx)[key], "controlled secret");
+                    field.control.set_value("replacement secret", window, cx);
+                    assert_eq!(form.values(cx)[key], "replacement secret");
+                }
+            }
+        })
+        .unwrap();
+}
+
+#[gpui_kit::test]
+fn form_controls_keep_focus_typing_paste_and_save_values(cx: &mut TestAppContext) {
+    use gpui_kit::Focusable;
+    use views::forms::{Editor, FieldControl};
+    let mut h = open(cx, Route::Home, fixture());
+    h.window
+        .update(cx, |_, window, cx| {
+            let (name, instructions) = h.view.update(cx, |view, cx| {
+                view.edit(
+                    Editor::CreateBot,
+                    std::collections::BTreeMap::from([
+                        ("name", "Initial bot".into()),
+                        ("instructions", "initial\ninstructions".into()),
+                    ]),
+                    window,
+                    cx,
+                );
+                let form = view.form.as_ref().unwrap();
+                let FieldControl::SingleLine(name) = &form.fields[0].control else {
+                    panic!("bot name must be single-line");
+                };
+                let FieldControl::MultiLine(instructions) = &form.fields[1].control else {
+                    panic!("bot instructions must be multiline");
+                };
+                assert!(!name.read(cx).is_masked());
+                assert_eq!(form.values(cx)["cwd"], "");
+                (name.clone(), instructions.clone())
+            });
+            window.render_frame(cx);
+            window.click(gpui_kit::ElementId::from(("input", name.entity_id())), cx);
+            assert!(name.read(cx).focus_handle(cx).is_focused(window));
+            window.press("secondary-a", cx);
+            window.input("Edited bot", cx);
+            window.click(
+                gpui_kit::ElementId::from(("input", instructions.entity_id())),
+                cx,
+            );
+            assert!(instructions.read(cx).focus_handle(cx).is_focused(window));
+            window.press("secondary-a", cx);
+            window.input("typed", cx);
+            window.press("enter", cx);
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("pasted\n末行".into()));
+            window.press("secondary-v", cx);
+            let values = h.view.read(cx).form.as_ref().unwrap().values(cx);
+            assert_eq!(values["name"], "Edited bot");
+            assert_eq!(values["instructions"], "typed\npasted\n末行");
+        })
+        .unwrap();
+    click(&h, cx, "save-form");
+    let (generation, command) = scoped(h.commands.try_recv().unwrap());
+    assert_eq!(generation, 7);
+    let Command::Save { editor, values, .. } = command else {
+        panic!("edited controls must produce a save command");
+    };
+    assert!(matches!(editor, Editor::CreateBot));
+    assert_eq!(values["name"], "Edited bot");
+    assert_eq!(values["instructions"], "typed\npasted\n末行");
+    assert_eq!(values["cwd"], "");
+}
+
+#[gpui_kit::test]
 fn full_queue_preserves_manual_identity_and_ordinary_form_fields(cx: &mut TestAppContext) {
     let h = open(cx, Route::Join, fixture());
     fill_commands(&h, cx);
