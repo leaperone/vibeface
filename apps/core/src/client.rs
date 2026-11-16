@@ -4257,21 +4257,66 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_node_joins_preserve_the_first_owner_and_request() -> Result<()> {
+        use iroh::protocol::{AcceptError, ProtocolHandler, Router};
+
+        #[derive(Debug)]
+        struct HeldJoin {
+            observed: Arc<tokio::sync::Notify>,
+            done: tokio::sync::watch::Receiver<bool>,
+        }
+        impl ProtocolHandler for HeldJoin {
+            async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+                let observed = self.observed.clone();
+                let done = self.done.clone();
+                net::serve_streams(connection, move |request: Value| {
+                    let observed = observed.clone();
+                    let mut done = done.clone();
+                    async move {
+                        ensure!(request["method"] == "join", "expected the fixture join");
+                        observed.notify_one();
+                        done.wait_for(|released| *released).await?;
+                        Ok(json!({"error":"fixture entry released"}))
+                    }
+                })
+                .await;
+                Ok(())
+            }
+        }
+
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
             .join(format!("node-join-concurrent-{}", uuid::Uuid::new_v4()));
         crate::config::private_dir(&dir)?;
-        initialize_node(
-            &dir,
-            &crate::config::Config::local("127.0.0.1:4795".parse()?, vec![], false),
-            &LocalIdentity::generate(),
-        )?;
+        let mut configuration =
+            crate::config::Config::local("127.0.0.1:4795".parse()?, vec![], false);
+        configuration.network.mesh.enabled = false;
+        initialize_node(&dir, &configuration, &LocalIdentity::generate())?;
         let capability =
             crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
         let node = Arc::new(Runtime::open(&dir).await?);
+        let entry = Net::bind(
+            &LocalIdentity::generate().secret_key_hex,
+            &NetworkConfig {
+                bind: Some("127.0.0.1:0".parse()?),
+                ..Default::default()
+            },
+            0,
+            vec![],
+        )
+        .await?;
+        let join_observed = Arc::new(tokio::sync::Notify::new());
+        let (finish_entry, done) = tokio::sync::watch::channel(false);
+        let router = Router::builder(entry.endpoint.clone())
+            .accept(
+                net::JOIN,
+                HeldJoin {
+                    observed: join_observed.clone(),
+                    done,
+                },
+            )
+            .spawn();
         let result = async {
-            let link = Ticket::new(entry_only(&LocalIdentity::generate().device_id()?), [7; 32])?
-                .encode()?;
+            let link = Ticket::new(entry.share_link()?, [7; 32])?.encode()?;
             for owner in [JoinOwner::Terminal, JoinOwner::Page(capability.capability)] {
                 let (entered, running) = tokio::sync::oneshot::channel();
                 let (release, held) = std::sync::mpsc::channel();
@@ -4295,6 +4340,8 @@ mod tests {
                 assert!(futures_util::poll!(&mut second).is_pending());
                 release.send(())?;
                 assert_eq!(first.await?, NodeJoin::Waiting);
+                tokio::time::timeout(Duration::from_secs(5), join_observed.notified()).await?;
+                let pending = std::fs::read(dir.join("join.json"))?;
                 let task = node
                     .node_join
                     .lock()
@@ -4313,6 +4360,10 @@ mod tests {
                     !task.is_aborted(),
                     "a concurrent request must preserve the first join"
                 );
+                assert!(
+                    std::fs::read(dir.join("join.json"))? == pending,
+                    "a concurrent request must preserve the original commitment"
+                );
                 let current = node.node_join.lock().unwrap().take().context("join")?;
                 assert!(current.owner == JoinOwner::Terminal);
                 current.task.abort();
@@ -4321,7 +4372,10 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         }
         .await;
+        let _ = finish_entry.send(true);
         node.shutdown().await;
+        router.shutdown().await?;
+        entry.close().await;
         drop(node);
         std::fs::remove_dir_all(dir)?;
         result
