@@ -66,7 +66,6 @@ export type WorkspaceActions = {
   /** Loads the chat and keeps it live while on screen; reading it acknowledges its notifications. */
   open(conversationId: string): () => void
   send(conversationId: string, text: string, attachments: Attachment[], options?: InputOptions): Promise<void>
-  stop(conversationId: string): Promise<void>
   answer(question: Question, text: string): Promise<AnswerResult>
   /** Takes this phone out of the network; coming back takes a join link. */
   leave(): Promise<void>

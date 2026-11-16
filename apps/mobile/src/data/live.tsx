@@ -112,7 +112,6 @@ function Offline({ children }: { children: ReactNode }) {
     cancelJoin: device.cancelJoin,
     open: () => () => {},
     send: async () => { throw new Error('还没连上') },
-    stop: async () => {},
     answer: async () => { throw new Error('还没连上') },
     leave: device.leave,
   }), [device])
@@ -226,11 +225,6 @@ function Live({ children }: { children: ReactNode }) {
       async send(id, text, attachments, options) {
         await select(id)
         await latest.current.sendMessage(text, attachments.map((file) => ({ name: file.name, arrayBuffer: () => new File(file.uri).arrayBuffer() })), undefined, options)
-      },
-      async stop(id) {
-        await select(id)
-        const job = latest.current.data?.scheduler?.jobs.find((item) => ['queued', 'steering', 'claimed', 'running'].includes(item.state))
-        if (job) await latest.current.cancelManager(job.trigger)
       },
       answer: (question, text) => latest.current.answer(question, text),
       leave: device.leave,
