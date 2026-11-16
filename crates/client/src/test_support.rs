@@ -3,6 +3,7 @@ use crate::identity::PROLOGUE;
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
+use tokio_tungstenite::tungstenite::Message;
 use vibeface_secure::{Channel, Handshake, Identity};
 
 type ServerSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
