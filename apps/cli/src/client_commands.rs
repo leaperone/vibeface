@@ -93,67 +93,12 @@ impl JsonInput {
         })
     }
 
-    fn parse<T: StrictInput>(self, tag: &str) -> Result<T> {
+    fn parse<T: DeserializeOwned>(self, tag: &str) -> Result<T> {
         parse_document(self.document()?, tag)
     }
 }
 
-trait StrictInput: DeserializeOwned {
-    fn validate_document(&self, document: &Value) -> Result<()>;
-}
-
-impl StrictInput for ReadRequest {
-    fn validate_document(&self, _: &Value) -> Result<()> {
-        Ok(())
-    }
-}
-
-impl StrictInput for Action {
-    fn validate_document(&self, document: &Value) -> Result<()> {
-        use vibeface_client::wire::{Attachment, InputControl, WorkspaceCommand};
-        match self {
-            Self::Input { input, .. } => {
-                // Flattened InputRoute does not make InputRequest reject extra fields.
-                // Represent skipped fields to derive every allowed key from the native
-                // serializer. These schema values never enter the submitted request.
-                let mut shape = input.clone();
-                shape.route.expected_revision = Some(0);
-                shape.attachments.push(Attachment {
-                    hash: String::new(),
-                    size: 0,
-                    name: String::new(),
-                });
-                let shape = serde_json::to_value(shape)?;
-                let allowed = shape
-                    .as_object()
-                    .context("native input must serialize as an object")?;
-                let supplied = document
-                    .get("input")
-                    .and_then(Value::as_object)
-                    .context("input payload must be an object")?;
-                ensure!(
-                    supplied.keys().all(|key| allowed.contains_key(key)),
-                    "invalid input payload: unknown field; see this operation's --help"
-                );
-            }
-            Self::Workspace {
-                command: WorkspaceCommand::ControlInput { action, .. },
-            } => match action {
-                // Serde ignores extra map entries on internally tagged unit variants.
-                // Their native serialization defines the complete allowed payload.
-                InputControl::Release | InputControl::Cancel => ensure!(
-                    document.pointer("/command/action") == Some(&serde_json::to_value(action)?),
-                    "invalid workspace payload: unknown field; see this operation's --help"
-                ),
-                InputControl::Edit { .. } | InputControl::Move { .. } => {}
-            },
-            _ => {}
-        }
-        Ok(())
-    }
-}
-
-fn parse_document<T: StrictInput>(mut document: Value, tag: &str) -> Result<T> {
+fn parse_document<T: DeserializeOwned>(mut document: Value, tag: &str) -> Result<T> {
     let object = document
         .as_object_mut()
         .context("operation input must be a JSON object")?;
@@ -162,7 +107,7 @@ fn parse_document<T: StrictInput>(mut document: Value, tag: &str) -> Result<T> {
         "omit the outer type field; the named command selects the operation"
     );
     object.insert("type".into(), Value::String(tag.into()));
-    let request: T = serde_json::from_value(document.clone()).map_err(|error| {
+    serde_json::from_value(document).map_err(|error| {
         // Serde messages can contain invalid values, including private configuration.
         let message = error.to_string();
         let reason = if message.starts_with("unknown field") {
@@ -173,9 +118,7 @@ fn parse_document<T: StrictInput>(mut document: Value, tag: &str) -> Result<T> {
             "invalid field value or nested operation"
         };
         anyhow::anyhow!("invalid {tag} payload: {reason}; see this operation's --help")
-    })?;
-    request.validate_document(&document)?;
-    Ok(request)
+    })
 }
 
 pub fn capabilities() -> Value {

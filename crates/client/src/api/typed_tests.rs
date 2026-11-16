@@ -6,6 +6,35 @@ use vibeface_secure::{
 };
 
 #[test]
+fn strict_client_input_literals_use_the_public_sdk_boundary() {
+    let cases: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/strict-client-input.json"
+    ))
+    .unwrap();
+    for case in cases.as_array().unwrap() {
+        let id = case["id"].as_str().unwrap();
+        let document = case["document"].clone();
+        let result = match case["kind"].as_str().unwrap() {
+            "read" => serde_json::from_value::<ReadRequest>(document)
+                .map(|request| serde_json::to_value(request).unwrap()),
+            "write" => serde_json::from_value::<Action>(document)
+                .map(|action| serde_json::to_value(action).unwrap()),
+            kind => panic!("unknown fixture kind: {kind}"),
+        };
+        assert_eq!(result.is_ok(), case["accepted"].as_bool().unwrap(), "{id}");
+        if let Ok(normalized) = result {
+            assert_eq!(normalized, case["normalized"], "{id}");
+        }
+    }
+    for document in [json!({"type":"PRIVATE_READ_TYPE"}), json!({"type":null})] {
+        assert!(serde_json::from_value::<ReadRequest>(document).is_err());
+    }
+    for document in [json!({"type":"PRIVATE_ACTION_TYPE"}), json!({"type":true})] {
+        assert!(serde_json::from_value::<Action>(document).is_err());
+    }
+}
+
+#[test]
 fn typed_documents_preserve_domain_tags_and_reject_unknown_fields() -> Result<()> {
     let schedule =
         json!({"type":"schedule","conversation_id":"chat","schedule_id":"s1","action":"pause"});

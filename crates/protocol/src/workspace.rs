@@ -52,6 +52,7 @@ pub struct InputRoute {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct InputRequest {
     pub message_id: String,
     #[serde(flatten)]
@@ -94,7 +95,9 @@ pub enum AssignmentState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InputControl {
+    #[serde(deserialize_with = "empty_input_control")]
     Release,
+    #[serde(deserialize_with = "empty_input_control")]
     Cancel,
     Edit {
         text: String,
@@ -104,6 +107,13 @@ pub enum InputControl {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         before_message_id: Option<String>,
     },
+}
+
+fn empty_input_control<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Empty {}
+    Empty::deserialize(deserializer).map(|_| ())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -425,6 +435,174 @@ mod tests {
             serde_json::to_value(quiet).unwrap()["report_results"],
             serde_json::json!(false)
         );
+    }
+
+    #[test]
+    fn strict_input_request_rejects_unknown_flattened_fields() {
+        for extra in [
+            serde_json::Value::Null,
+            serde_json::json!(true),
+            serde_json::json!({"nested":"unexpected"}),
+        ] {
+            let mut input = serde_json::json!({"message_id":"m","target":{"kind":"task","task_id":"t"},"intent":"defer","sequence":0,"text":"Later","report_results":false});
+            input["unexpected_input_field"] = extra;
+            assert!(
+                serde_json::from_value::<InputRequest>(input.clone()).is_err(),
+                "accepted unknown flattened input field: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_input_controls_reject_unknown_unit_fields() {
+        for kind in ["release", "cancel"] {
+            let valid = serde_json::json!({"kind":kind});
+            let control: InputControl = serde_json::from_value(valid.clone()).unwrap();
+            assert_eq!(serde_json::to_value(control).unwrap(), valid);
+            for extra in [
+                serde_json::Value::Null,
+                serde_json::json!(true),
+                serde_json::json!({"nested":"unexpected"}),
+            ] {
+                let invalid = serde_json::json!({"kind":kind,"unexpected_control_field":extra});
+                assert!(
+                    serde_json::from_value::<InputControl>(invalid.clone()).is_err(),
+                    "accepted unknown unit control field: {invalid}"
+                );
+                let command = serde_json::json!({"kind":"control_input","message_id":"m","expected_event":"e","action":invalid});
+                assert!(serde_json::from_value::<WorkspaceCommand>(command).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn input_request_preserves_null_defaults_and_attachment_fields() {
+        let minimal = serde_json::json!({"message_id":"m","target":{"kind":"task","task_id":"t"},"intent":"defer","sequence":0,"text":"Later","report_results":false});
+        let with_null_and_empty = serde_json::json!({"message_id":"m","target":{"kind":"task","task_id":"t"},"intent":"defer","sequence":0,"expected_revision":null,"text":"Later","attachments":[],"report_results":false});
+        for document in [minimal.clone(), with_null_and_empty] {
+            let input: InputRequest = serde_json::from_value(document).unwrap();
+            assert_eq!(input.route.expected_revision, None);
+            assert!(input.attachments.is_empty());
+            assert_eq!(serde_json::to_value(input).unwrap(), minimal);
+        }
+        let full = serde_json::json!({"message_id":"m","target":{"kind":"bot_main","bot_id":"b"},"intent":"continue","sequence":4,"expected_revision":3,"text":"Read this","attachments":[{"hash":"fixture","size":1,"name":"a.txt"}],"report_results":true});
+        let input: InputRequest = serde_json::from_value(full.clone()).unwrap();
+        assert_eq!(input.route.expected_revision, Some(3));
+        assert_eq!(input.attachments[0].name, "a.txt");
+        assert!(input.report_results);
+        assert_eq!(serde_json::to_value(input).unwrap(), full);
+        for invalid in [
+            serde_json::json!({"message_id":"m","target":{"kind":"task","task_id":"t","extra":null},"intent":"defer","sequence":0,"text":"Later","report_results":false}),
+            serde_json::json!({"message_id":"m","target":{"kind":"task","task_id":"t"},"intent":"defer","sequence":0,"text":"Later","attachments":[{"hash":"fixture","size":1,"name":"a.txt","extra":true}],"report_results":false}),
+            serde_json::json!({"message_id":"m","target":{"kind":"task","task_id":"t"},"intent":"defer","sequence":0,"text":"Later","attachments":null,"report_results":false}),
+        ] {
+            assert!(serde_json::from_value::<InputRequest>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn input_controls_preserve_move_defaults_and_require_edit_attachments() {
+        for document in [
+            serde_json::json!({"kind":"move"}),
+            serde_json::json!({"kind":"move","before_message_id":null}),
+        ] {
+            let control: InputControl = serde_json::from_value(document).unwrap();
+            assert_eq!(
+                control,
+                InputControl::Move {
+                    before_message_id: None
+                }
+            );
+            assert_eq!(
+                serde_json::to_value(control).unwrap(),
+                serde_json::json!({"kind":"move"})
+            );
+        }
+        for document in [
+            serde_json::json!({"kind":"move","before_message_id":"next"}),
+            serde_json::json!({"kind":"edit","text":"Updated","attachments":[]}),
+        ] {
+            let control: InputControl = serde_json::from_value(document.clone()).unwrap();
+            assert_eq!(serde_json::to_value(control).unwrap(), document);
+        }
+        for invalid in [
+            serde_json::json!({"kind":"edit","text":"Updated"}),
+            serde_json::json!({"kind":"edit","text":"Updated","attachments":null}),
+            serde_json::json!({"kind":"edit","text":"Updated","attachments":[],"extra":true}),
+            serde_json::json!({"kind":"move","before_message_id":null,"extra":null}),
+        ] {
+            assert!(serde_json::from_value::<InputControl>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn input_routes_preserve_optional_revisions_and_reject_unknown_fields() {
+        let normalized = serde_json::json!({"target":{"kind":"task","task_id":"t"},"intent":"defer","sequence":0});
+        for document in [
+            normalized.clone(),
+            serde_json::json!({"target":{"kind":"task","task_id":"t"},"intent":"defer","sequence":0,"expected_revision":null}),
+        ] {
+            let route: InputRoute = serde_json::from_value(document).unwrap();
+            assert_eq!(route.expected_revision, None);
+            assert_eq!(serde_json::to_value(route).unwrap(), normalized);
+        }
+        let versioned = serde_json::json!({"target":{"kind":"task","task_id":"t"},"intent":"continue","sequence":4,"expected_revision":3});
+        let route: InputRoute = serde_json::from_value(versioned.clone()).unwrap();
+        assert_eq!(route.expected_revision, Some(3));
+        assert_eq!(serde_json::to_value(route).unwrap(), versioned);
+        for invalid in [
+            serde_json::json!({"target":{"kind":"task","task_id":"t"},"intent":"defer","sequence":0,"extra":null}),
+            serde_json::json!({"target":{"kind":"task","task_id":"t","extra":true},"intent":"defer","sequence":0}),
+            serde_json::json!({"target":{"kind":"task","task_id":"t"},"intent":"defer","sequence":"0"}),
+            serde_json::json!({"target":{"kind":"task","task_id":"t"},"intent":"defer","sequence":0,"expected_revision":-1}),
+        ] {
+            assert!(serde_json::from_value::<InputRoute>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn workspace_input_preserves_metadata_through_both_flattened_types() {
+        let minimal = serde_json::json!({"message_id":"m","target":{"kind":"task","task_id":"t"},"intent":"defer","sequence":0,"text":"Later","report_results":false,"conversation_id":"c","source_event":"event","created_at_ms":123});
+        let full = serde_json::json!({"message_id":"m","target":{"kind":"bot_main","bot_id":"b"},"intent":"continue","sequence":4,"expected_revision":3,"text":"Read this","attachments":[{"hash":"fixture","size":1,"name":"a.txt"}],"report_results":true,"conversation_id":"c","source_event":"event","created_at_ms":123});
+        for document in [minimal.clone(), full] {
+            let input: WorkspaceInput = serde_json::from_value(document.clone()).unwrap();
+            assert_eq!(input.conversation_id, "c");
+            assert_eq!(input.source_event, "event");
+            assert_eq!(input.created_at_ms, 123);
+            assert_eq!(
+                input.input.route.expected_revision.is_some(),
+                document.get("expected_revision").is_some()
+            );
+            assert_eq!(
+                input.input.attachments.len(),
+                document
+                    .get("attachments")
+                    .map_or(0, |value| value.as_array().unwrap().len())
+            );
+            let encoded = serde_json::to_value(&input).unwrap();
+            assert_eq!(encoded, document);
+            assert_eq!(
+                serde_json::from_value::<WorkspaceInput>(encoded).unwrap(),
+                input
+            );
+        }
+        let with_null_and_empty = serde_json::json!({"message_id":"m","target":{"kind":"task","task_id":"t"},"intent":"defer","sequence":0,"expected_revision":null,"text":"Later","attachments":[],"report_results":false,"conversation_id":"c","source_event":"event","created_at_ms":123});
+        let input: WorkspaceInput = serde_json::from_value(with_null_and_empty).unwrap();
+        assert_eq!(input.input.route.expected_revision, None);
+        assert!(input.input.attachments.is_empty());
+        assert_eq!(serde_json::to_value(input).unwrap(), minimal);
+    }
+
+    #[test]
+    fn workspace_input_and_commands_reject_unknown_nested_fields() {
+        for invalid in [
+            serde_json::json!({"message_id":"m","target":{"kind":"task","task_id":"t"},"intent":"defer","sequence":0,"text":"Later","report_results":false,"conversation_id":"c","source_event":"event","created_at_ms":123,"extra":null}),
+            serde_json::json!({"message_id":"m","target":{"kind":"task","task_id":"t","extra":true},"intent":"defer","sequence":0,"text":"Later","report_results":false,"conversation_id":"c","source_event":"event","created_at_ms":123}),
+            serde_json::json!({"message_id":"m","target":{"kind":"task","task_id":"t"},"intent":"defer","sequence":0,"text":"Later","attachments":[{"hash":"fixture","size":1,"name":"a.txt","extra":null}],"report_results":false,"conversation_id":"c","source_event":"event","created_at_ms":123}),
+        ] {
+            assert!(serde_json::from_value::<WorkspaceInput>(invalid).is_err());
+        }
+        assert!(serde_json::from_value::<WorkspaceCommand>(serde_json::json!({"kind":"control_input","message_id":"m","expected_event":"e","action":{"kind":"release"},"extra":null})).is_err());
     }
 
     #[test]
