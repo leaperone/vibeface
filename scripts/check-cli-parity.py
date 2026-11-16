@@ -346,8 +346,12 @@ HELPERS = {
     "apps/app/src/features/devices/triage-settings.tsx": ("call", 1),
     "apps/app/src/features/devices/relay-settings.tsx": ("call", 1),
 }
+# Exact browser-local expressions, with audited occurrence counts.
 LOCAL_CALLS = {
-    (W, "notifier.request()"): "platform notification permission; terminal events use client watch",
+    (W, "notifier.request()"): (1, "platform notification permission; terminal events use client watch"),
+    ("apps/app/src/lib/delivery-reservations.ts",
+     'locks.request("vibeface-delivery-intent:${key}" , { mode : "exclusive" } , async ( ) => reserve ( ))'):
+        (1, "browser lock for delivery intent reservation; no Core operation"),
 }
 
 
@@ -356,7 +360,7 @@ def literal(tokens):
 
 
 def web_inventory(root):
-    sites, classified, errors, bridge_counts, payload_sources = [], [], [], Counter(), []
+    sites, classified, errors, bridge_counts, local_counts, payload_sources = [], [], [], Counter(), Counter(), []
     files = sorted(itertools.chain((root / "packages/client/src").rglob("*.ts*"),
                                    (root / "apps/app/src").rglob("*.ts*")))
     for path in files:
@@ -398,7 +402,10 @@ def web_inventory(root):
                                    "reason": BRIDGES[rel][call.signature][1]})
                 continue
             # Narrow browser-local APIs, selected by receiver and path.
-            local_reason = LOCAL_CALLS.get((rel, call.signature))
+            local = LOCAL_CALLS.get((rel, call.signature))
+            local_reason = local[1] if local else None
+            if local:
+                local_counts[(rel, call.signature)] += 1
             if call.callee in ("navigator.locks.request", "globalThis.navigator.locks.request") and rel in (
                     "apps/app/src/lib/tabs.ts", "apps/app/src/lib/platform.ts"):
                 local_reason = "browser lock for leader election/input serialization; no Core operation"
@@ -475,6 +482,11 @@ def web_inventory(root):
             actual = bridge_counts[(rel, signature)]
             if actual != expected:
                 errors.append(f"{rel}: audited dynamic bridge count {actual}, expected {expected}: {signature}")
+    for (rel, signature), (expected, _) in LOCAL_CALLS.items():
+        if (root / rel).is_file():
+            actual = local_counts[(rel, signature)]
+            if actual != expected:
+                errors.append(f"{rel}: audited local call count {actual}, expected {expected}: {signature}")
     for rel in HELPERS:
         if not (root / rel).is_file():
             continue
@@ -634,10 +646,46 @@ def self_test():
         (root / "apps/cli/src/client_commands.rs").write_text('json!({"local_lifecycle": []})')
         (root / "packages/docs/cli-coverage.json").write_text(json.dumps({"additional_coverage": [], "transport_only": {}}))
         target.write_text(source)
+        local_file = root / "apps/app/src/lib/delivery-reservations.ts"
+        local_file.parent.mkdir(parents=True)
+        local_source = '''import type { ReserveDeliveryIntent } from '@vibeface/client/delivery/types.ts'
+
+export function webDeliveryReservations(locks: Pick<LockManager, 'request'> | undefined): ReserveDeliveryIntent {
+  return async (key, reserve) => {
+    if (!locks) throw new Error('Unavailable')
+    // Return callback failures as rejected promises so the lock manager releases ownership.
+    return locks.request(`vibeface-delivery-intent:${key}`, { mode: 'exclusive' }, async () => reserve())
+  }
+}
+'''
+        local_file.write_text(local_source)
         baseline = check(root)
         assert baseline["passed"], baseline["errors"]
         sites = baseline["web_calls"]
         assert {s["method"] for s in sites} == {"known", "reply_unanswered", "dismiss_unanswered"}
+        assert len(sites) == 3
+        assert len(baseline["classified_calls"]) == 1
+        assert baseline["classified_calls"][0]["source"] == "apps/app/src/lib/delivery-reservations.ts:7"
+        for callee in ("connection.rpc", "connection.request"):
+            local_file.write_text(local_source + f'\n{callee}(computed(), {{}});')
+            changed = check(root)
+            assert not changed["passed"] and any(
+                f"delivery-reservations.ts:11: unclassified dynamic call {callee}(" in error
+                for error in changed["errors"])
+        local_call = 'locks.request(`vibeface-delivery-intent:${key}`, { mode: "exclusive" }, async () => reserve());'
+        local_file.write_text(local_source + '\n' + local_call)
+        changed = check(root)
+        assert not changed["passed"] and any("audited local call count 2, expected 1" in error for error in changed["errors"])
+        for changed_source in (local_source.replace("locks.request(", "connection.request("),
+                               local_source.replace("'exclusive'", "'shared'")):
+            local_file.write_text(changed_source)
+            changed = check(root)
+            assert not changed["passed"] and any("delivery-reservations.ts:7: unclassified dynamic call" in error for error in changed["errors"])
+        local_file.write_text(local_source)
+        target.write_text(source + '\n' + local_call)
+        changed = check(root)
+        assert not changed["passed"] and any("synthetic.ts:6: unclassified dynamic call locks.request(" in error for error in changed["errors"])
+        target.write_text(source)
         assert "attestation" in sites[0]["payload_fields"]
         target.write_text(source + '\nconnection.rpc("new_operation", {});')
         changed = check(root)
@@ -655,7 +703,7 @@ def self_test():
         assert not changed["passed"] and any("InputTarget::NewTarget" in error for error in changed["errors"])
         protocol_file.write_text(protocol_source)
         assert check(root)["passed"]
-    print("CLI parity self-test passed: fixture passes; new Web operation, dynamic call, native variant and nested variant fail with source locations")
+    print("CLI parity self-test passed: local Web Lock classified without a Core method; lock receiver/expression/path/count changes, new Web operation, dynamic call, native variant and nested variant fail with source locations")
 
 
 def main():
