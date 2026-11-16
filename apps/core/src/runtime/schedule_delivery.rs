@@ -2274,10 +2274,7 @@ mod tests {
                             intent:InputIntent::Continue, sequence, expected_revision:Some(1) },
                         text:id.into(), attachments:vec![], report_results:true,
                     };
-                    let signed = admin.attest(&network, "c", EventBody::InputPosted {
-                        message_id:request.message_id.clone(), target:request.route.target.clone(), intent:request.route.intent,
-                        sequence, expected_revision:Some(1), text:request.text.clone(), attachments:vec![], report_results:Some(true), attestation:None,
-                    })?;
+                    let signed = admin.attest(&network, "c", crate::workspace::input_event_body(&request, None))?;
                     store.post_workspace_input(&identity, &network, request,
                         signed.attestation().cloned().context("input signature")?, now_ms())
                 };

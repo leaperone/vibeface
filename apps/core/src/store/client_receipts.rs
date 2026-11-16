@@ -23,17 +23,7 @@ impl Store {
             "receipt belongs to another client"
         );
         membership_from(&self.connection, network)?.client(client_id)?;
-        let body = EventBody::InputPosted {
-            message_id: input.message_id.clone(),
-            target: input.route.target.clone(),
-            intent: input.route.intent,
-            sequence: input.route.sequence,
-            expected_revision: input.route.expected_revision,
-            text: input.text.clone(),
-            attachments: input.attachments.clone(),
-            report_results: Some(input.report_results),
-            attestation: Some(attestation.clone()),
-        };
+        let body = crate::workspace::input_event_body(&input, Some(attestation.clone()));
         crate::crypto::verify_attestation(network, conversation, &body)?;
         let resolved = self.resolve_input_target(network, &input.route.target)?;
         ensure!(
@@ -214,6 +204,245 @@ mod tests {
         store.append_event(&node, &network, scope, signed.clone(), vec![], 2)?;
         Ok((store, network, client.device_id()?, signed))
     }
+    #[test]
+    fn input_receipt_and_post_preserve_the_original_signed_intent() -> Result<()> {
+        use crate::{identity::GovernanceEvent, workspace::InputRequest};
+
+        let node = LocalIdentity::generate();
+        let other_entry = LocalIdentity::generate();
+        let admin = node.fixture_admin();
+        let other_client = LocalIdentity::generate();
+        let mut state =
+            node.sign_network_fixture(1, vec![node.device_id()?, other_entry.device_id()?])?;
+        state.append(GovernanceEvent::grant(
+            &admin,
+            &state.project()?,
+            Member::client(&other_client, "second-client", false)?,
+        )?)?;
+        let network = state.genesis.network_id.clone();
+        let client_id = admin.device_id()?;
+        let entry_id = node.device_id()?;
+        let mut store = Store::open(":memory:")?;
+        store.install_trust_bundle(&network, &state)?;
+        for (bot_id, conversation) in [("bot", "chat"), ("other-bot", "other-chat")] {
+            let bot = admin.attest(
+                &network,
+                conversation,
+                EventBody::BotCreated {
+                    bot_id: bot_id.into(),
+                    name: bot_id.into(),
+                    instructions: String::new(),
+                    project: None,
+                    attestation: None,
+                    cause: None,
+                },
+            )?;
+            store.create_bot(
+                &node,
+                &network,
+                &BotCreateSpec {
+                    bot_id: bot_id.into(),
+                    conversation_id: conversation.into(),
+                    name: bot_id.into(),
+                    instructions: String::new(),
+                    project: None,
+                    attestation: bot.attestation().context("bot signature")?.clone(),
+                    owner: node.owner_fixture(&network, conversation, &entry_id)?,
+                },
+                1,
+            )?;
+        }
+        let input: InputRequest = serde_json::from_value(json!({
+            "message_id": "m1", "target": {"kind": "bot_main", "bot_id": "bot"},
+            "intent": "defer", "sequence": 17, "text": "hi\n雪e\u{301} ",
+            "attachments": [
+                {"hash": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae", "size": 3, "name": "一.txt"},
+                {"hash": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", "size": 5, "name": "two.txt"}
+            ],
+            "report_results": false
+        }))?;
+        let independent: EventBody = serde_json::from_str(
+            r#"{"type":"input_posted","message_id":"m1","target":{"kind":"bot_main","bot_id":"bot"},"intent":"defer","sequence":17,"text":"hi\n雪é ","attachments":[{"hash":"2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae","size":3,"name":"一.txt"},{"hash":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","size":5,"name":"two.txt"}],"report_results":false}"#,
+        )?;
+        let signed = admin.attest(&network, "chat", independent.clone())?;
+        let signature = signed.attestation().context("input signature")?.clone();
+        let expected_payload = crate::crypto::attestation_payload(&network, "chat", &signed)?;
+        let mut original = serde_json::to_value(&input)?;
+        original["conversation_id"] = json!("chat");
+        original["attestation"] = serde_json::to_value(&signature)?;
+        let before_changes = store.connection.total_changes();
+        let before_vector = store.version_vector(&network)?;
+        let absent = store.client_input_receipt(&network, &client_id, &entry_id, &original)?;
+        assert_eq!(
+            absent,
+            Some(json!({
+                "accepted": false, "code": "input_not_saved", "stored": false,
+                "entry_device_id": entry_id, "network_id": network, "client_id": client_id,
+                "conversation_id": "chat", "message_id": "m1", "target": {"kind": "bot_main", "bot_id": "bot"},
+                "reason": "原设备未保存这条输入，可选择重试原输入或不再发送。"
+            }))
+        );
+        assert_eq!(store.connection.total_changes(), before_changes);
+        assert_eq!(store.version_vector(&network)?, before_vector);
+
+        store.put_blob(&input.attachments[0].blob(), b"foo")?;
+        store.put_blob(&input.attachments[1].blob(), b"hello")?;
+
+        let saved =
+            store.post_workspace_input(&node, &network, input.clone(), signature.clone(), 10)?;
+        assert_eq!(saved.input, input);
+        assert_eq!(saved.conversation_id, "chat");
+        let envelope = store
+            .event(&network, &saved.source_event)?
+            .context("saved event")?;
+        let event: Event = serde_json::from_str(&envelope.canonical_body)?;
+        assert_eq!(envelope.hash, saved.source_event);
+        assert_eq!(
+            serde_json::to_value(&event.body)?,
+            serde_json::to_value(&signed)?
+        );
+        assert_eq!(
+            event.blobs,
+            vec![
+                BlobRef {
+                    hash: "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae".into(),
+                    size: 3
+                },
+                BlobRef {
+                    hash: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".into(),
+                    size: 5
+                },
+            ]
+        );
+        assert_eq!(
+            crate::crypto::attestation_payload(&network, "chat", &event.body)?,
+            expected_payload
+        );
+        crate::crypto::verify_attestation(&network, "chat", &event.body)?;
+        assert_eq!(
+            store.pending_workspace_input_admissions(&network)?,
+            vec!["m1"]
+        );
+        let saved_changes = store.connection.total_changes();
+        let saved_vector = store.version_vector(&network)?;
+        assert!(
+            store
+                .client_input_receipt(&network, &client_id, &entry_id, &original)?
+                .is_none()
+        );
+        let retry = store.post_workspace_input(
+            &other_entry,
+            &network,
+            input.clone(),
+            signature.clone(),
+            11,
+        )?;
+        assert_eq!(retry, saved);
+        assert_eq!(store.connection.total_changes(), saved_changes);
+        assert_eq!(store.version_vector(&network)?, saved_vector);
+        assert_eq!(
+            store.pending_workspace_input_admissions(&network)?,
+            vec!["m1"]
+        );
+        let input_count: u64 = store.connection.query_row(
+            "SELECT COUNT(*) FROM events WHERE network_id=? AND kind='input_posted'",
+            [&network],
+            |row| row.get(0),
+        )?;
+        assert_eq!(input_count, 1);
+
+        for (path, value) in [
+            ("/message_id", json!("another-id")),
+            ("/target/bot_id", json!("other-bot")),
+            ("/intent", json!("continue")),
+            ("/sequence", json!(18)),
+            ("/text", json!("hi\n雪é ")),
+            ("/report_results", json!(true)),
+            ("/attachments/0/hash", json!("c".repeat(64))),
+            ("/attachments/0/size", json!(4)),
+            ("/attachments/0/name", json!("renamed.txt")),
+        ] {
+            let mut changed = original.clone();
+            *changed.pointer_mut(path).context("mutation field")? = value;
+            let changed_input: InputRequest = serde_json::from_value(changed.clone())?;
+            assert!(
+                store
+                    .post_workspace_input(&node, &network, changed_input, signature.clone(), 12)
+                    .is_err(),
+                "{path}"
+            );
+            assert!(
+                store
+                    .client_input_receipt(&network, &client_id, &entry_id, &changed)
+                    .is_err(),
+                "{path}"
+            );
+            assert_eq!(store.connection.total_changes(), saved_changes, "{path}");
+            assert_eq!(store.version_vector(&network)?, saved_vector, "{path}");
+        }
+        let mut changed = original.clone();
+        changed["expected_revision"] = json!(1);
+        let changed_input: InputRequest = serde_json::from_value(changed.clone())?;
+        assert!(
+            store
+                .post_workspace_input(&node, &network, changed_input, signature.clone(), 12)
+                .is_err()
+        );
+        assert!(
+            store
+                .client_input_receipt(&network, &client_id, &entry_id, &changed)
+                .is_err()
+        );
+        let mut reordered = original.clone();
+        reordered["attachments"]
+            .as_array_mut()
+            .context("attachments")?
+            .swap(0, 1);
+        let reordered_input: InputRequest = serde_json::from_value(reordered.clone())?;
+        assert!(
+            store
+                .post_workspace_input(&node, &network, reordered_input, signature, 12)
+                .is_err()
+        );
+        assert!(
+            store
+                .client_input_receipt(&network, &client_id, &entry_id, &reordered)
+                .is_err()
+        );
+
+        let replacement = other_client.attest(&network, "chat", independent)?;
+        let replacement_signature = replacement
+            .attestation()
+            .context("replacement signature")?
+            .clone();
+        membership_from(&store.connection, &network)?.client(&other_client.device_id()?)?;
+        let post_error = store
+            .post_workspace_input(&node, &network, input, replacement_signature.clone(), 12)
+            .unwrap_err();
+        assert_eq!(post_error.to_string(), "input ID belongs to another signer");
+        let mut replacement_original = original;
+        replacement_original["attestation"] = serde_json::to_value(replacement_signature)?;
+        let receipt_error = store
+            .client_input_receipt(
+                &network,
+                &other_client.device_id()?,
+                &entry_id,
+                &replacement_original,
+            )
+            .unwrap_err();
+        assert_eq!(
+            receipt_error.to_string(),
+            "input ID belongs to another signer"
+        );
+        assert_eq!(store.connection.total_changes(), saved_changes);
+        assert_eq!(store.version_vector(&network)?, saved_vector);
+        assert_eq!(
+            store.pending_workspace_input_admissions(&network)?,
+            vec!["m1"]
+        );
+        Ok(())
+    }
+
     #[test]
     fn signed_receipts_verify_exact_client_network_and_payload_without_writing() -> Result<()> {
         let (store, network, client, signed) = fixture(

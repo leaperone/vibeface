@@ -17080,17 +17080,7 @@ fn workspace_signed_input_fixture(
     let signed = net.a.fixture_admin().attest(
         &net.network,
         &conversation,
-        EventBody::InputPosted {
-            message_id: input.message_id.clone(),
-            target: input.route.target.clone(),
-            intent: input.route.intent,
-            sequence: input.route.sequence,
-            expected_revision: input.route.expected_revision,
-            text: input.text.clone(),
-            attachments: input.attachments.clone(),
-            report_results: Some(input.report_results),
-            attestation: None,
-        },
+        crate::workspace::input_event_body(&input, None),
     )?;
     origin.post_workspace_input(
         author,

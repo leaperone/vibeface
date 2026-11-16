@@ -193,12 +193,7 @@ mod tests {
                 },
                 text: "saved input".into(), attachments: vec![], report_results: true,
             };
-            let signed = admin.attest(&network, "c", EventBody::InputPosted {
-                message_id: request.message_id.clone(), target: request.route.target.clone(),
-                intent: request.route.intent, sequence: request.route.sequence,
-                expected_revision: None, text: request.text.clone(), attachments: vec![],
-                report_results: Some(true), attestation: None,
-            })?;
+            let signed = admin.attest(&network, "c", crate::workspace::input_event_body(&request, None))?;
             let original = {
                 let identity = node.identity.to_owned();
                 let network = network.to_owned();

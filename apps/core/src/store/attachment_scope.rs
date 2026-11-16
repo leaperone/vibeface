@@ -315,17 +315,7 @@ mod tests {
         let signed = f.admin.attest(
             &f.network,
             "c",
-            EventBody::InputPosted {
-                message_id: id.into(),
-                target: request.route.target.clone(),
-                intent: request.route.intent,
-                sequence: request.route.sequence,
-                expected_revision: None,
-                text: request.text.clone(),
-                attachments: vec![],
-                report_results: Some(request.report_results),
-                attestation: None,
-            },
+            crate::workspace::input_event_body(&request, None),
         )?;
         Ok(f.store
             .post_workspace_input(

@@ -237,17 +237,7 @@ with socket.create_connection(('127.0.0.1', int(os.environ['CLIENT_FIXTURE_PORT'
         let signed_input = self.admin.attest(
             network,
             "scope",
-            EventBody::InputPosted {
-                message_id: input.message_id.clone(),
-                target: input.route.target.clone(),
-                intent: input.route.intent,
-                sequence: input.route.sequence,
-                expected_revision: input.route.expected_revision,
-                text: input.text.clone(),
-                attachments: input.attachments.clone(),
-                report_results: Some(input.report_results),
-                attestation: None,
-            },
+            crate::workspace::input_event_body(&input, None),
         )?;
         let network = network.clone();
         let identity = self.node.identity.clone();
