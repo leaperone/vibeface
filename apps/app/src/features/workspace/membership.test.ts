@@ -94,6 +94,7 @@ function workspace(source: 'membership' | 'local_session', readBefore: string[] 
     return undefined
   })
   const platform = {
+    reserveDeliveryIntent: async () => { throw new Error('unexpected delivery reservation') },
     secure: { attestationPayload: () => new Uint8Array() }, transport: { signClient: async () => 'signature' },
     storage: { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => stored.set(key, value) }, outbox, self: '这个浏览器',
     notifier: { name: '浏览器提醒', permission: async () => 'default', request: async () => 'default', show() {} },

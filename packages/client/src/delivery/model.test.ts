@@ -5,7 +5,9 @@ import type { ReadyConnection } from '../lib/node.ts'
 import type { Platform } from '../lib/platform.ts'
 import { createDeliveryClient } from './client.ts'
 import { amount, canRead, canRestart, checkedFile, draftFor, fromBase64, orderActions, orderSummary, orderTitle, parseBudgets, parseOrder, parseReceived, parseStatus, publicationLabel, providerChoices, receiverChoices, receivingBatches, settlementAmountsLabel, sha256, sizeLabel, toBase64, walletNotice } from './model.ts'
-import type { DeliveryDraft, DeliveryOrder, DeliveryStatus } from './types.ts'
+import type { DeliveryDraft, DeliveryOrder, DeliveryStatus, ReserveDeliveryIntent } from './types.ts'
+
+const reserveDeliveryIntent: ReserveDeliveryIntent = async (_key, reserve) => reserve()
 
 const source = '11'.repeat(32), receiver = '22'.repeat(32), provider = '33'.repeat(32)
 const uuid = '00000000-0000-4000-8000-000000000001'
@@ -155,6 +157,7 @@ test('delivery refresh keeps read-only history and file access without requestin
     })
     transport.principal = principal
     const platform: Platform = {
+      reserveDeliveryIntent,
       storage: { getItem: () => null, setItem: () => { throw new Error('a read must not write storage') } },
       onForeground: () => () => {}, foreground: () => false, self: 'test', saveRecovery: () => { throw new Error('unexpected recovery') },
       get secure(): never { throw new Error('unexpected secure API') }, get transport(): never { throw new Error('unexpected transport') },
@@ -167,7 +170,7 @@ test('delivery refresh keeps read-only history and file access without requestin
       await new Promise(resolve => setImmediate(resolve))
       assert.deepEqual(calls, [{ op: 'status' }, { op: 'list' }, { op: 'providers' }, ...(managing ? [{ op: 'budgets' }] : [])])
       assert.deepEqual(hooks.updates.slice(-4), [nextStatus, nextOrders, managing ? [budget] : [], ''])
-      const client = createDeliveryClient(transport, platform.storage)
+      const client = createDeliveryClient(transport, platform.storage, reserveDeliveryIntent)
       assert.deepEqual(await client.get(readable.order_id), readable)
       assert.equal(await client.save(readable, platform), 'saved')
       assert.deepEqual(calls.slice(-2), [{ op: 'get', order_id: readable.order_id }, { op: 'read', order_id: readable.order_id }])
@@ -183,8 +186,8 @@ test('a lost prepare response reuses its persisted intent and confirm submits on
     if (calls.length === 1) throw new Error('response lost after Node persistence')
     return { ...order(), intent_id: params.intent_id }
   })
-  await assert.rejects(createDeliveryClient(transport, storage).prepare(draft, file, status))
-  const client = createDeliveryClient(transport, storage)
+  await assert.rejects(createDeliveryClient(transport, storage, reserveDeliveryIntent).prepare(draft, file, status))
+  const client = createDeliveryClient(transport, storage, reserveDeliveryIntent)
   const prepared = await client.prepare(draft, file, status)
   assert.equal(calls[0].intent_id, calls[1].intent_id)
   await client.confirm(prepared)
@@ -207,7 +210,7 @@ test('recoverable preparation preserves exact wire bytes, saved fingerprints and
       name: 'example.txt', max_service_amount: paid ? '9007199254740993' : '0', max_gas_amount: '0', budget_id: paid ? '88'.repeat(32) : null,
       intent_id: uuid, content_base64: 'YSBmaWxlIHRoZSByZWNlaXZlciBjYW4gcmVjb3Zlcg==',
     }
-    const client = createDeliveryClient(connection(async (_method, params = {}) => { calls.push(params); return paid ? paidOrder() : order() }), storage)
+    const client = createDeliveryClient(connection(async (_method, params = {}) => { calls.push(params); return paid ? paidOrder() : order() }), storage, reserveDeliveryIntent)
     const prepared = await client.prepare({ ...draft, mode, max_service_amount: expected.max_service_amount, budget_id: expected.budget_id }, file, { ...status, paid_enabled: true })
     assert.equal(JSON.stringify(calls[0]), JSON.stringify(expected))
     assert.deepEqual(writes, [[key, saved], [`vibeface.delivery.network.client.${source}.recent`, uuid]])
@@ -218,7 +221,7 @@ test('recoverable preparation preserves exact wire bytes, saved fingerprints and
 
 test('untyped strict drafts are rejected before reading the file, persisting an intent or sending a request', async () => {
   const forbidden = () => { throw new Error('unsupported acceptance must stop before side effects') }
-  const client = createDeliveryClient(connection(async () => forbidden()), { getItem: forbidden, setItem: forbidden })
+  const client = createDeliveryClient(connection(async () => forbidden()), { getItem: forbidden, setItem: forbidden }, reserveDeliveryIntent)
   for (const mode of ['charity', 'paid']) {
     const externalDraft: unknown = { ...draft, mode, acceptance: 'strict', budget_id: '88'.repeat(32) }
     await assert.rejects(async () => {
@@ -234,7 +237,7 @@ test('untyped strict drafts are rejected before reading the file, persisting an 
 test('strict prepare and confirm wire responses remain rejected in both delivery modes', async () => {
   for (const mode of ['charity', 'paid'] satisfies DeliveryDraft['mode'][]) {
     const original = mode === 'paid' ? paidOrder() : order()
-    const client = createDeliveryClient(connection(async (_method, params = {}) => ({ ...original, intent_id: params.intent_id, acceptance: 'strict' })), { getItem: () => null, setItem: () => {} })
+    const client = createDeliveryClient(connection(async (_method, params = {}) => ({ ...original, intent_id: params.intent_id, acceptance: 'strict' })), { getItem: () => null, setItem: () => {} }, reserveDeliveryIntent)
     await assert.rejects(client.prepare({ ...draft, mode, max_service_amount: original.payment.total, budget_id: original.payment.budget_id }, file, { ...status, paid_enabled: true }), /无法识别/)
     await assert.rejects(client.confirm(original), /无法识别/)
   }
@@ -245,11 +248,11 @@ test('a local session cannot configure or confirm and storage failure prevents p
   const transport = connection(async () => { calls += 1; return order() })
   transport.principal = { ...transport.principal, source: 'local_session', can_manage: false }
   const storage = { getItem: () => null, setItem: () => { throw new Error('disk unavailable') } }
-  const local = createDeliveryClient(transport, storage)
+  const local = createDeliveryClient(transport, storage, reserveDeliveryIntent)
   await assert.rejects(local.configure({ enabled: true, charity_enabled: true, paid_enabled: false }))
   await assert.rejects(local.confirm(order()))
   transport.principal = { ...transport.principal, source: 'membership', can_manage: true }
-  await assert.rejects(createDeliveryClient(transport, storage).prepare(draft, file, status))
+  await assert.rejects(createDeliveryClient(transport, storage, reserveDeliveryIntent).prepare(draft, file, status))
   assert.equal(calls, 0)
 })
 
@@ -278,11 +281,11 @@ test('preparing B cannot erase the unknown A intent and returning to A after res
     stored.set(id, saved)
     return saved
   })
-  const firstClient = createDeliveryClient(transport, storage)
+  const firstClient = createDeliveryClient(transport, storage, reserveDeliveryIntent)
   const first = await firstClient.prepare(paidDraft, file, paidStatus)
   await assert.rejects(firstClient.confirm(first), /broadcast result unknown/)
-  await createDeliveryClient(transport, storage).prepare(paidDraft, { ...file, name: 'B.txt' }, paidStatus)
-  const resumed = await createDeliveryClient(transport, storage).prepare(paidDraft, file, paidStatus)
+  await createDeliveryClient(transport, storage, reserveDeliveryIntent).prepare(paidDraft, { ...file, name: 'B.txt' }, paidStatus)
+  const resumed = await createDeliveryClient(transport, storage, reserveDeliveryIntent).prepare(paidDraft, file, paidStatus)
   const preparations = calls.filter(call => call.op === 'prepare')
   assert.equal(preparations[0].intent_id, preparations[2].intent_id)
   assert.notEqual(preparations[0].intent_id, preparations[1].intent_id)
@@ -306,7 +309,7 @@ test('same-file retries keep a completed intent while an explicit new send check
     if (losePrepare) { losePrepare = false; throw new Error('new prepare response lost') }
     return saved
   })
-  const client = createDeliveryClient(transport, storage)
+  const client = createDeliveryClient(transport, storage, reserveDeliveryIntent)
   const first = await client.prepare(draft, file, status)
   await assert.rejects(client.prepare(draft, file, status, first.intent_id), /还没结束/)
   const complete: DeliveryOrder = { ...first, phase: 'recoverable', evidence: 'charity_receipt', windows: first.windows.map(window => ({ ...window, state: 'held' })) }
@@ -321,7 +324,7 @@ test('same-file retries keep a completed intent while an explicit new send check
   const before = calls.length
   await assert.rejects(client.prepare(draft, file, status, first.intent_id), /已有新的一次/)
   assert.equal(calls.length, before, 'another click cannot replace the new unknown intent')
-  const resumed = await createDeliveryClient(transport, storage).prepare(draft, file, status)
+  const resumed = await createDeliveryClient(transport, storage, reserveDeliveryIntent).prepare(draft, file, status)
   assert.equal(resumed.intent_id, attempted)
   await client.confirm(resumed)
   assert.deepEqual(calls.at(-1), { op: 'confirm', intent_id: resumed.intent_id })
@@ -398,7 +401,7 @@ test('protected preparation rejects missing budgets before any request; a two-or
   let requests = 0
   const a = paidOrder(), b = { ...paidOrder(), order_id: '99'.repeat(32), intent_id: '00000000-0000-4000-8000-000000000002' }
   const client = createDeliveryClient(connection(async (_method, params = {}) => { requests++; assert.equal(params.op, 'confirm_batch'); return { orders: [a, b].map(order => ({ ...order, phase: 'funding_pending' })) } }),
-    { getItem: () => null, setItem: () => {} })
+    { getItem: () => null, setItem: () => {} }, reserveDeliveryIntent)
   const paidStatus: DeliveryStatus = { ...status, paid_enabled: true }
   await assert.rejects(client.prepare({ ...draft, mode: 'paid' }, file, paidStatus), /预付预算/)
   assert.equal(requests, 0)
@@ -418,7 +421,7 @@ test('the receiver authorizes both original orders together and groups only two 
     assert.equal(params.op, 'accept_batch')
     assert.deepEqual(params.order_ids, [a.order_id, b.order_id])
     return { orders: [a, b] }
-  }), { getItem: () => null, setItem: () => {} })
+  }), { getItem: () => null, setItem: () => {} }, reserveDeliveryIntent)
   assert.deepEqual(receivingBatches([a, b, order()]), [[a.payment.budget_id, [a, b]]])
   assert.deepEqual(receivingBatches([a, { ...b, payment: { ...b.payment, budget_id: 'aa'.repeat(32) } }]), [])
   assert.deepEqual(receivingBatches([a, { ...b, phase: 'failed' }]), [])
@@ -439,10 +442,77 @@ test('the provider field offers announced devices: paid delivery those that quot
       { device_id: 'not-a-device', paid: false, offer: null, last_seen_ms: 1 },
       { device_id: source, paid: true, offer: { ...offer, price: '1.5' }, last_seen_ms: 2 },
     ] }
-  }), { getItem: () => null, setItem: () => {} })
+  }), { getItem: () => null, setItem: () => {} }, reserveDeliveryIntent)
   const providers = await client.providers()
   assert.deepEqual(asked, [['delivery', { op: 'providers' }]])
   assert.deepEqual(providers, [{ device_id: provider, paid: true, offer, last_seen_ms: 5 }, { device_id: receiver, paid: false, offer: null, last_seen_ms: 3 }], 'a malformed record drops only itself')
   assert.deepEqual(providerChoices(providers, 'paid').map(item => item.device_id), [provider])
   assert.deepEqual(providerChoices(providers, 'charity').map(item => item.device_id), [provider, receiver])
+})
+
+test('reservation storage failures stop prepare and a failed recent write retains the next retry id', async () => {
+  const calls: Record<string, unknown>[] = [], records = new Map<string, string>()
+  const transport = connection(async (_method, params = {}) => { calls.push(params); return { ...order(), intent_id: params.intent_id } })
+  for (const bad of [() => { throw new Error('read inaccessible') }, () => '{', () => JSON.stringify({ intent_id: uuid, fingerprint: 'wrong' }), () => JSON.stringify({ intent_id: 'bad', fingerprint: 'e4d2ac185fb4490bd606a5ba49f715bed1df4b5a85ffd888c0ac06f127f34eec' })]) {
+    await assert.rejects(createDeliveryClient(transport, { getItem: bad, setItem: () => assert.fail('bad records must not be overwritten') }, reserveDeliveryIntent).prepare(draft, file, status), /读不了上次/)
+  }
+  await assert.rejects(createDeliveryClient(transport, { getItem: () => null, setItem: () => { throw new Error('first write failed') } }, reserveDeliveryIntent).prepare(draft, file, status), /尚未提交/)
+  let failRecent = true
+  const storage = {
+    getItem: (key: string) => records.get(key) ?? null,
+    setItem: (key: string, value: string) => {
+      if (key.endsWith('.recent') && failRecent) throw new Error('recent write failed')
+      records.set(key, value)
+    },
+  }
+  await assert.rejects(createDeliveryClient(transport, storage, reserveDeliveryIntent).prepare(draft, file, status), /尚未提交/)
+  assert.equal(calls.length, 0)
+  const key = `vibeface.delivery.network.client.${source}.intent.e4d2ac185fb4490bd606a5ba49f715bed1df4b5a85ffd888c0ac06f127f34eec`
+  const retained = records.get(key)
+  assert.ok(retained)
+  const id: unknown = JSON.parse(retained).intent_id
+  failRecent = false
+  const retry = await createDeliveryClient(transport, storage, reserveDeliveryIntent).prepare(draft, file, status)
+  assert.equal(retry.intent_id, id)
+  assert.equal(records.get(key), retained)
+  assert.deepEqual(calls, [{ op: 'prepare', receiver_peer: receiver, provider_peer: provider, mode: 'charity', acceptance: 'recoverable', name: 'example.txt', max_service_amount: '0', max_gas_amount: '0', budget_id: null, intent_id: id, content_base64: 'YSBmaWxlIHRoZSByZWNlaXZlciBjYW4gcmVjb3Zlcg==' }])
+})
+
+function reservationGate() {
+  let release = () => {}, entered = () => {}
+  const waiting = new Promise<void>(resolve => { entered = resolve })
+  const ready = new Promise<void>(resolve => { release = resolve })
+  const reserve: ReserveDeliveryIntent = async (_key, callback) => { entered(); await ready; return callback() }
+  return { waiting, release, reserve }
+}
+
+test('connection changes while awaiting reservation stop writes and changes after reservation stop submission', { timeout: 10000 }, async () => {
+  for (const change of ['waiting', 'reserved']) {
+    let current = true, writes = 0, requests = 0
+    const transport = connection(async () => { requests++; return order() })
+    transport.isCurrent = () => current
+    const gate = reservationGate()
+    const reserve: ReserveDeliveryIntent = change === 'waiting' ? gate.reserve : async (_key, callback) => { const saved = callback(); current = false; return saved }
+    const pending = createDeliveryClient(transport, { getItem: () => null, setItem: () => { writes++ } }, reserve).prepare(draft, file, status)
+    if (change === 'waiting') { await gate.waiting; current = false; gate.release() }
+    await assert.rejects(pending, /连接已切换/)
+    assert.equal(writes, change === 'waiting' ? 0 : 2)
+    assert.equal(requests, 0)
+  }
+})
+
+test('waiting for reservation retains the original draft, file properties and selected bytes', { timeout: 10000 }, async () => {
+  const mutableDraft = { ...draft }, buffer = new Uint8Array(content)
+  const mutableFile = { ...file, arrayBuffer: async () => buffer.buffer }
+  const gate = reservationGate(), calls: Record<string, unknown>[] = [], writes: [string, string][] = []
+  const client = createDeliveryClient(connection(async (_method, params = {}) => { calls.push(params); return { ...order(), intent_id: params.intent_id } }), { getItem: () => null, setItem: (key, value) => { writes.push([key, value]) } }, gate.reserve)
+  const pending = client.prepare(mutableDraft, mutableFile, status)
+  await gate.waiting
+  mutableDraft.receiver_peer = source; mutableDraft.provider_peer = source; mutableDraft.mode = 'paid'
+  mutableDraft.max_service_amount = '99'; mutableDraft.max_gas_amount = '99'; mutableDraft.budget_id = '99'.repeat(32)
+  mutableFile.name = 'mutated.txt'; mutableFile.size = 0; buffer.fill(0)
+  gate.release()
+  const saved = await pending
+  assert.equal(writes[0][0], `vibeface.delivery.network.client.${source}.intent.e4d2ac185fb4490bd606a5ba49f715bed1df4b5a85ffd888c0ac06f127f34eec`)
+  assert.deepEqual(calls, [{ op: 'prepare', receiver_peer: receiver, provider_peer: provider, mode: 'charity', acceptance: 'recoverable', name: 'example.txt', max_service_amount: '0', max_gas_amount: '0', budget_id: null, intent_id: saved.intent_id, content_base64: 'YSBmaWxlIHRoZSByZWNlaXZlciBjYW4gcmVjb3Zlcg==' }])
 })

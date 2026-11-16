@@ -14,6 +14,7 @@ import { lostKeyText } from '@vibeface/client/identity/copy.ts'
 import LanBrowser from '../../modules/lan-browser'
 import { privateFiles } from './files'
 import { notificationOpenings } from './notification-opens'
+import { nativeDeliveryReservations } from './delivery-reservations'
 
 const store = createMMKV({ id: 'vibeface' })
 const secretKey = 'vibeface.device-secret'
@@ -105,6 +106,7 @@ export const mobilePlatform: Platform = {
   secure,
   transport,
   storage: { getItem: (key) => store.getString(key) ?? null, setItem: (key, value) => store.set(key, value) },
+  reserveDeliveryIntent: nativeDeliveryReservations,
   outbox: {
     all: async () => store.getAllKeys().filter((key) => key.startsWith(outboxPrefix)).map((key) => JSON.parse(store.getString(key)!) as OutboxItem),
     put: async (item) => store.set(outboxPrefix + item.key, JSON.stringify(item)),
