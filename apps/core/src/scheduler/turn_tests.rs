@@ -21,41 +21,47 @@ struct Fixture {
 impl Fixture {
     async fn new(task: bool, mode: &str) -> Result<Self> {
         let (node, admin, directory) = node().await?;
-        {
-            let mut settings = node.settings.lock().unwrap();
-            settings.roots = vec![directory.clone()];
-            settings.manager = Some(manager_settings(
-                Provider::Pi,
-                directory.clone(),
-                "fixture".into(),
-            ));
-            let mut providers = node.providers.lock().unwrap();
-            providers.switches.execution = [Provider::Pi].into();
-            providers.bins.insert(
-                Provider::Pi,
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/fixtures")
-                    .join(if cfg!(windows) {
-                        "fake-pi.cmd"
-                    } else {
-                        "fake-pi"
-                    }),
-            );
-            providers.env.apply(
-                Provider::Pi,
-                BTreeMap::from([
-                    (
-                        "PI_CODING_AGENT_SESSION_DIR".into(),
-                        Some(directory.join("sessions").display().to_string()),
-                    ),
-                    (
-                        "FAKE_PI_RECORDS_DIR".into(),
-                        Some(directory.join("pi-log-records").display().to_string()),
-                    ),
-                    ("FAKE_PI_MODE".into(), Some(mode.into())),
-                ]),
-            )?;
-        }
+        let (workspace, fixture_mode) = (directory.clone(), mode.to_owned());
+        node.write_providers(
+            move |target| {
+                *target.manager = Some(manager_settings(
+                    Provider::Pi,
+                    workspace.clone(),
+                    "fixture".into(),
+                ));
+                target.local.switches.execution = [Provider::Pi].into();
+                target.local.bins.insert(
+                    Provider::Pi,
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures")
+                        .join(if cfg!(windows) {
+                            "fake-pi.cmd"
+                        } else {
+                            "fake-pi"
+                        }),
+                );
+                target.local.env.apply(
+                    Provider::Pi,
+                    BTreeMap::from([
+                        (
+                            "PI_CODING_AGENT_SESSION_DIR".into(),
+                            Some(workspace.join("sessions").display().to_string()),
+                        ),
+                        (
+                            "FAKE_PI_RECORDS_DIR".into(),
+                            Some(workspace.join("pi-log-records").display().to_string()),
+                        ),
+                        ("FAKE_PI_MODE".into(), Some(fixture_mode)),
+                    ]),
+                )
+            },
+            None,
+        )
+        .await?;
+        let mut settings = node.settings_snapshot();
+        settings.roots = vec![directory.clone()];
+        node.configure_node(settings, &admin.device_id()?, None)
+            .await?;
         node.tool_url.set("http://127.0.0.1:1".into()).unwrap();
         bot(&node, &admin, "c", "Turn lifecycle", &[]).await?;
         let network = node.network_id().await?;
@@ -139,7 +145,7 @@ impl Fixture {
                             name: "Turn".into(),
                             prompt: "fixture".into(),
                             first_run_at_ms: now,
-                            every_minutes: None,
+                            every_minutes: Some(1),
                             enabled: None,
                         },
                         Provider::Pi,
@@ -363,10 +369,13 @@ async fn a_registered_backup_keeps_one_reservation_and_closes_before_a_failed_sw
     for failed_switch in [false, true] {
         let fixture = Fixture::new(false, "refuse-model").await?;
         let result = async {
-            fixture.node.settings.lock().unwrap().manager.as_mut().context("manager")?.backup = BackupPolicy {
-                automatic: true,
-                candidates: vec![BackupModel { provider: Provider::Pi, model: "backup".into(), reasoning_effort: None }],
-            };
+            fixture.node.write_providers(|target| {
+                target.manager.as_mut().context("manager")?.backup = BackupPolicy {
+                    automatic: true,
+                    candidates: vec![BackupModel { provider: Provider::Pi, model: "backup".into(), reasoning_effort: None }],
+                };
+                Ok(())
+            }, None).await?;
             fixture.sql("CREATE TABLE charges(count INTEGER);
                 CREATE TRIGGER record_charge AFTER INSERT ON budget_days BEGIN INSERT INTO charges VALUES(1); END;").await?;
             if failed_switch {
@@ -399,24 +408,28 @@ async fn a_registered_backup_keeps_one_reservation_and_closes_before_a_failed_sw
 async fn a_readiness_backup_commits_its_result_with_the_original_admission() -> Result<()> {
     let fixture = Fixture::new(false, "reply").await?;
     let result = async {
-        {
-            let mut settings = fixture.node.settings.lock().unwrap();
-            let manager = settings.manager.as_mut().context("manager")?;
-            manager.provider = Provider::Claude;
-            manager.backup = BackupPolicy {
-                automatic: true,
-                candidates: vec![BackupModel {
-                    provider: Provider::Pi,
-                    model: "backup".into(),
-                    reasoning_effort: None,
-                }],
-            };
-            let mut providers = fixture.node.providers.lock().unwrap();
-            providers.switches.execution = [Provider::Claude, Provider::Pi].into();
-            providers
-                .bins
-                .insert(Provider::Claude, fixture.directory.join("missing-claude"));
-        }
+        let missing = fixture.directory.join("missing-claude");
+        fixture
+            .node
+            .write_providers(
+                move |target| {
+                    let manager = target.manager.as_mut().context("manager")?;
+                    manager.provider = Provider::Claude;
+                    manager.backup = BackupPolicy {
+                        automatic: true,
+                        candidates: vec![BackupModel {
+                            provider: Provider::Pi,
+                            model: "backup".into(),
+                            reasoning_effort: None,
+                        }],
+                    };
+                    target.local.switches.execution = [Provider::Claude, Provider::Pi].into();
+                    target.local.bins.insert(Provider::Claude, missing);
+                    Ok(())
+                },
+                None,
+            )
+            .await?;
         assert_eq!(
             fixture.run().await?.context("invocation")?["state"],
             "completed"
