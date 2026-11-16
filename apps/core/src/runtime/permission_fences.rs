@@ -319,7 +319,7 @@ mod tests {
         crypto::LocalIdentity,
         runtime::{
             Access,
-            triage::tests::{bot, node, start_reply},
+            test_support::{bot, node, start_reply},
         },
         scheduling::SteerTarget,
         work::{Signal, WorkSpec, WorkState},
@@ -333,7 +333,7 @@ mod tests {
             .iter()
             .map(|(thread, directory)| Ok((thread.to_string(), directory.canonicalize()?)))
             .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
-        super::super::triage::tests::scripted_app_server(node, move |request| {
+        super::super::test_support::scripted_app_server(node, move |request| {
             if request["method"] == "thread/read" {
                 return match request["params"]["threadId"]
                     .as_str()
@@ -716,7 +716,7 @@ mod tests {
         let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let calls = requests.clone();
         let ended = stopped.clone();
-        super::super::triage::tests::scripted_app_server(&node, move |request| {
+        super::super::test_support::scripted_app_server(&node, move |request| {
             let method = request["method"].as_str().unwrap_or("");
             match method {
                 "thread/read" => {

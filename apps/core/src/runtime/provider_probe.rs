@@ -954,7 +954,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_generation_follows_effective_launch_and_not_probe_epochs() -> anyhow::Result<()>
     {
-        let (node, _, dir) = super::super::triage::tests::node().await?;
+        let (node, _, dir) = super::super::test_support::node().await?;
         let provider = Provider::Codex;
         let mut local = node.providers();
         local.switches.codex_app_server = AppServer {
@@ -1067,7 +1067,7 @@ mod tests {
     #[tokio::test]
     async fn a_probe_from_the_first_configuration_cannot_overwrite_its_replacement()
     -> anyhow::Result<()> {
-        let (node, _, dir) = super::super::triage::tests::node().await?;
+        let (node, _, dir) = super::super::test_support::node().await?;
         let (fixture_dir, input) = fixture(
             r#"
 [ "$*" = "auth status --json" ] || exit 9
@@ -1206,7 +1206,7 @@ exit 1
     #[tokio::test]
     async fn claude_borrowing_yields_to_private_keychain_login_before_each_launch()
     -> anyhow::Result<()> {
-        let (node, _, dir) = super::super::triage::tests::node().await?;
+        let (node, _, dir) = super::super::test_support::node().await?;
         let mut node = std::sync::Arc::try_unwrap(node)
             .map_err(|_| anyhow::anyhow!("fixture runtime is shared"))?;
         let (fixture_dir, input) = fixture(

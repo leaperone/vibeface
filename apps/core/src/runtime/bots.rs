@@ -531,8 +531,7 @@ impl Runtime {
 mod tests {
     use super::*;
     use crate::model::{Eyes, Hue, Outline};
-    use crate::runtime::test_support::access as test_access;
-    use crate::runtime::triage::tests::{bot, node, start_reply};
+    use crate::runtime::test_support::{access as test_access, bot, node, start_reply};
 
     #[tokio::test]
     async fn the_panel_writes_a_face_only_at_the_version_it_saw() -> Result<()> {

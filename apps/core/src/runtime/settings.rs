@@ -1707,7 +1707,7 @@ mod tests {
 
     #[tokio::test]
     async fn opencode_endpoint_token_is_private_and_write_only() -> Result<()> {
-        let (node, admin, dir) = super::super::triage::tests::node().await?;
+        let (node, admin, dir) = super::super::test_support::node().await?;
         let owner = admin.device_id()?;
         let endpoint = |api_key: Option<Value>| {
             let mut endpoint = json!({"protocol":"openai_compatible",
@@ -1796,7 +1796,7 @@ mod tests {
 
     #[tokio::test]
     async fn unavailable_directories_can_be_preserved_repaired_and_reattached() -> Result<()> {
-        let (node, admin, dir) = super::super::triage::tests::node().await?;
+        let (node, admin, dir) = super::super::test_support::node().await?;
         let owner = admin.device_id()?;
         let root = dir.join("root");
         crate::config::private_dir(&root)?;

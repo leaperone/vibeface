@@ -924,17 +924,8 @@ fn signed_fresh_main_ingest_scale() -> Result<()> {
                     report_samples("validation", &metrics.validation_ns);
                     report_samples("ingest", &metrics.ingest_ns);
                     #[cfg(unix)]
-                    {
-                        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-                        if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0 {
-                            let usage = unsafe { usage.assume_init() };
-                            let bytes = if cfg!(target_os = "macos") {
-                                usage.ru_maxrss as u64
-                            } else {
-                                usage.ru_maxrss as u64 * 1024
-                            };
-                            eprintln!("process_peak_resident_bytes={bytes}");
-                        }
+                    if let Some(bytes) = crate::store::test_metrics::peak_resident_bytes() {
+                        eprintln!("process_peak_resident_bytes={bytes}");
                     }
                 }
                 report_samples("complete_ingest", &totals);

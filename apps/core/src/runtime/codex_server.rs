@@ -1666,7 +1666,7 @@ mod tests {
     async fn manual_manager_confirmation_releases_codex_hold_but_refuses_a_live_turn() -> Result<()>
     {
         for completed in [true, false] {
-            let (node, admin, data) = super::super::triage::tests::node().await?;
+            let (node, admin, data) = super::super::test_support::node().await?;
             let sockets = sockets()?;
             let socket = sockets.join("manager.sock");
             let turn = Arc::new(std::sync::Mutex::new(

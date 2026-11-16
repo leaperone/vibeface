@@ -171,7 +171,7 @@ mod tests {
     use crate::runtime::test_support::access as test_access;
     use crate::{
         model::EventBody,
-        runtime::triage::tests::{bot, node},
+        runtime::test_support::{bot, node},
         workspace::{InputControl, InputIntent, InputRequest, InputRoute, InputTarget},
     };
 
