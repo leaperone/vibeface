@@ -5,7 +5,7 @@ import { View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { deviceCopy } from '@vibeface/client/identity/copy.ts'
-import { authenticationSourceLabels, canSetProviderEnvironment, availability, summaryReadiness, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, effortOptions, probeIssueText, providerGroups, providerNames, providerObservationLabels, providerObservationStates, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type ModelChoice, type NodeSettingsResponse, type ProviderChange, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
+import { authenticationSourceLabels, canSetProviderEnvironment, availability, summaryReadiness, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, effortOptions, probeIssueText, providerGroups, providerNames, providerObservationLabels, providerObservationStates, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type ModelChoice, type NodeSettingsResponse, type ProviderChange, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
 import { folderLabels } from '@vibeface/client/workspace/bot-settings.ts'
 import { ErrorText } from '@/components/action'
 import { CopyableId, Details, EmptyState, Skeleton, providerIcons, toneText, type Tone } from '@/components/kit'
@@ -15,7 +15,8 @@ import { Input } from '@/components/arc/input'
 import { Switch } from '@/components/arc/switch'
 import { Text } from '@/components/arc/text'
 import { useLive } from '@/data/live'
-import { Field, PathList, Retry, useCall } from '@/features/devices/remote-settings'
+import { Field, PathList, Retry } from '@/features/devices/remote-settings'
+import { nodeSettingsResource, useSettingsResource } from '@/features/devices/settings-resource'
 import { cn } from '@/lib/utils'
 
 /**
@@ -58,7 +59,7 @@ type Change = Omit<ProviderChange, 'provider'>
 
 function AiSettings() {
   const { ready } = useDevice()
-  const { value: response, busy, error, call, load, setError } = useCall(parseNodeSettings, 'node_settings')
+  const { value: response, busy, error, call, load, setError } = useSettingsResource(nodeSettingsResource)
   const starting = response?.providers.some((item) => item.state === 'starting')
   useEffect(() => {
     if (!starting) return

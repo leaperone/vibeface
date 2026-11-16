@@ -1,41 +1,11 @@
 import { FolderOpen, Plus, X } from 'lucide-react-native'
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { View } from 'react-native'
-import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { messageOf } from '@vibeface/client/lib/node.ts'
 import { ErrorText } from '@/components/action'
 import { Button } from '@/components/arc/button'
 import { Icon } from '@/components/arc/icon'
 import { Input } from '@/components/arc/input'
 import { Text } from '@/components/arc/text'
-
-/** Calls the connected device; a newer call or a new connection makes an older answer stale. */
-export function useCall<T>(parse: (value: unknown) => T, loadMethod: string) {
-  const { ready } = useDevice()
-  const [value, setValue] = useState<T | null>(null)
-  const [busy, setBusy] = useState('')
-  const [error, setError] = useState<{ at: string; text: string } | null>(null)
-  const sequence = useRef(0)
-  const call = async (key: string, method: string, params?: Record<string, unknown>, at = '') => {
-    if (!ready?.isCurrent()) return null
-    const connection = ready, owner = ++sequence.current
-    setBusy(key); setError(null)
-    try {
-      const result = await connection.request(method, params)
-      if (owner !== sequence.current || !connection.isCurrent()) return null
-      const latest = method === loadMethod || method.startsWith('configure') ? result : await connection.request(loadMethod)
-      if (owner !== sequence.current || !connection.isCurrent()) return null
-      setValue(parse(latest))
-      return result
-    } catch (cause) {
-      if (owner === sequence.current) setError({ at, text: messageOf(cause) })
-      return null
-    } finally { if (owner === sequence.current) setBusy('') }
-  }
-  const load = () => call('load', loadMethod)
-  useEffect(() => { setValue(null); void load(); return () => { sequence.current += 1 } }, [ready])
-  return { value, busy, error, call, load, setError }
-}
 
 /**
  * Folder paths with a remove button each, one-tap folders the device found (`suggested`) and a field to add one; a long

@@ -2531,7 +2531,7 @@ test('webhook secret saves preserve failures and newer drafts on web and mobile'
       '@vibeface/client/identity/copy.ts': { waitingCopy },
       '@vibeface/client/workspace/model.ts': workspaceModel,
       '@/lib/glossary': { terms: { externalChat: { label: '外部聊天', icon: 'Send' } } },
-      '@/features/devices/remote-settings': { useCall: () => ({ value: settings, busy: '', error: null, call: (_key: string, _method: string, params: unknown) => save(params) }) },
+      '@/features/devices/settings-resource': { useSettingsResource: () => ({ value: settings, busy: '', error: null, call: (_key: string, _method: string, params: unknown) => save(params) }) },
       'expo-clipboard': { setStringAsync: async () => assert.fail('Saving webhook settings must not copy clipboard text') },
       'react-native': { View: 'View', AccessibilityInfo: { announceForAccessibility: () => assert.fail('Saving webhook settings must not announce clipboard feedback') } },
     }, {}, platform === 'mobile' ? 'Triage' : '')
@@ -2572,19 +2572,25 @@ test('webhook secret saves preserve failures and newer drafts on web and mobile'
 })
 
 test("mobile provider probes discard settings that arrive after another call or connection", async () => {
+  const settings = (root: string): NodeSettingsResponse => ({
+    settings: { roots: [root], manager: null }, defaults: { workspace: '/project' },
+    readiness: { manager: null }, providers: [], display_paths: {}, suggested_roots: [],
+  })
+  const initial = settings('/initial'), configured = settings('/new'), late = settings('/late')
   for (const changed of ['call', 'connection', 'none']) {
     const held = pendingResult()
     let current = true, reads = 0, snapshot: unknown
     const connection = { isCurrent: () => current, request: async (method: string) => {
-      if (method === 'node_settings') return ++reads === 1 ? 'initial settings' : held.promise
-      return method === 'configure_node' ? 'new settings' : 'probe result'
+      if (method === 'node_settings') return ++reads === 1 ? initial : held.promise
+      return method === 'configure_node' ? configured : 'probe result'
     } }
-    const app = componentHarness('../../../../../apps/mobile/src/features/devices/remote-settings.tsx', {
+    const app = componentHarness('../../../../../apps/mobile/src/features/devices/settings-resource.ts', {
       '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: connection }) },
+      '@vibeface/client/lib/node.ts': nodeSettings,
     })
-    const useCall = app.module.useCall
-    assert.ok(typeof useCall === 'function')
-    app.module.Read = () => { snapshot = useCall((value: unknown) => value, 'node_settings'); return null }
+    const useSettingsResource = app.module.useSettingsResource, nodeSettingsResource = app.module.nodeSettingsResource
+    assert.ok(typeof useSettingsResource === 'function')
+    app.module.Read = () => { snapshot = useSettingsResource(nodeSettingsResource); return null }
     const state = () => {
       app.render('Read')
       assert.ok(snapshot && typeof snapshot === 'object' && 'call' in snapshot && typeof snapshot.call === 'function' && 'value' in snapshot)
@@ -2592,15 +2598,15 @@ test("mobile provider probes discard settings that arrive after another call or 
     }
     try {
       state(); await settleComponent()
-      assert.equal(state().value, 'initial settings')
-      const probe = state().call('probe', 'provider_probe')
+      assert.deepEqual(state().value, initial)
+      const probe = state().call('probe', 'provider_probe', { provider: 'codex' })
       await settleComponent()
       assert.equal(reads, 2)
-      if (changed === 'call') await state().call('save', 'configure_node')
+      if (changed === 'call') await state().call('save', 'configure_node', { roots: ['/new'], manager: null })
       if (changed === 'connection') current = false
-      held.resolve('late settings')
+      held.resolve(late)
       assert.equal(await probe, changed === 'none' ? 'probe result' : null)
-      assert.equal(state().value, changed === 'none' ? 'late settings' : changed === 'call' ? 'new settings' : 'initial settings')
+      assert.deepEqual(state().value, changed === 'none' ? late : changed === 'call' ? configured : initial)
     } finally { app.close() }
   }
 })
