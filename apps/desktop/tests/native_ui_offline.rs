@@ -1,22 +1,7 @@
 //! Controlled protocol fixture: real Noise/TCP and actual private outbox, no Provider or user data.
-#[path = "../src/app.rs"]
-#[allow(dead_code, unused_imports)]
-mod app;
-#[path = "../src/host/mod.rs"]
-#[allow(dead_code, unused_imports)]
-mod host;
-#[path = "../src/theme.rs"]
-#[allow(dead_code)]
-mod theme;
-#[path = "../src/ui.rs"]
-#[allow(dead_code)]
-mod ui;
-#[path = "../src/views/mod.rs"]
-#[allow(dead_code, unused_imports)]
-mod views;
-#[path = "../src/widgets/mod.rs"]
-#[allow(dead_code)]
-mod widgets;
+mod support {
+    pub mod node;
+}
 use anyhow::{Context, Result, ensure};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -28,16 +13,15 @@ use std::{
     },
     time::Duration,
 };
+use support::node::{ControlledNode, accept_noise};
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
 use vibeface_client::{
     Action, Client, ClientKey, Endpoint, Entry, OperationState,
     wire::{InputIntent, InputRequest, InputTarget},
 };
-use vibeface_secure::{
-    Handshake, Identity,
-    membership::{Genesis, IdentityKind, Member, NetworkState},
-};
+use vibeface_desktop::{host, ui, views};
+use vibeface_secure::{Identity, membership::NetworkState};
 use views::{
     backend::{Backend, Command, Event},
     forms::Editor,
@@ -96,19 +80,7 @@ async fn serve(
         matches!(socket.next().await.context("connect")??, Message::Text(_)),
         "connect frame missing"
     );
-    let mut handshake = Handshake::signed(false, &node, None, b"vibeface:client:v1")?;
-    let Message::Binary(first) = socket.next().await.context("first Noise")?? else {
-        anyhow::bail!("Noise frame missing")
-    };
-    handshake.read(&first)?;
-    socket
-        .send(Message::Binary(handshake.write(&[])?.into()))
-        .await?;
-    let Message::Binary(last) = socket.next().await.context("last Noise")?? else {
-        anyhow::bail!("Noise frame missing")
-    };
-    handshake.read(&last)?;
-    let mut channel = handshake.finish()?;
+    let mut channel = accept_noise(&mut socket, &node).await?;
     fixture_phase("server-noise-ready");
     while let Some(frame) = socket.next().await {
         let Message::Binary(frame) = frame? else {
@@ -184,21 +156,14 @@ async fn native_backend_cold_offline_stages_original_input_in_actual_outbox() ->
     let directory = initial_host.client_storage_dir();
     fixture_phase("create-key");
     let mut key = ClientKey::create(&directory, "controlled fixture password")?;
-    let node = Identity::generate()?;
     let client_id = key.device_id().to_owned();
-    let member = Member::new(&client_id, IdentityKind::Client, "Fixture client", true)?;
-    let genesis = Genesis::create(
-        &Identity::generate()?,
-        member,
-        Member::node(&node, "Fixture Node")?,
-    )?;
-    let network = genesis.network_id.clone();
-    let state = NetworkState::new(genesis)?;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let entry = Entry {
-        origin: format!("http://{}", listener.local_addr()?),
-        node_id: node.device_id(),
-    };
+    let ControlledNode {
+        listener,
+        identity: node,
+        state,
+        entry,
+    } = ControlledNode::new(&client_id, "Fixture client", "Fixture Node").await?;
+    let network = state.genesis.network_id.clone();
     key.remember(&network, entry.clone())?;
     drop(key);
     let effects = Arc::new(AtomicUsize::new(0));

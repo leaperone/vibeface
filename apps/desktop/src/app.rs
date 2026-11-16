@@ -1808,3 +1808,6 @@ impl Render for Desktop {
             .into_any_element()
     }
 }
+
+#[cfg(all(test, feature = "native-ui-tests"))]
+mod workflow_tests;

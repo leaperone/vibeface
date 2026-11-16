@@ -1,6 +1,4 @@
-#[allow(dead_code)]
-#[path = "../src/views/history.rs"]
-mod history;
+use vibeface_desktop::views::history;
 
 use anyhow::Result;
 use history::{ApplyResult, HistoryScope, HistoryState};

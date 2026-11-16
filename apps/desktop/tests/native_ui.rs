@@ -1,23 +1,6 @@
-#[path = "../src/host/profiles.rs"]
-#[allow(dead_code)]
-pub mod profiles;
-mod host {
-    pub use crate::profiles;
-}
-#[path = "../src/views/history.rs"]
-pub mod history;
-#[path = "../src/views/offline.rs"]
-pub mod offline;
-#[path = "../src/views/records.rs"]
-pub mod records;
-mod views {
-    pub use crate::{history, records};
-}
-#[path = "../src/ui.rs"]
-#[allow(dead_code)]
-mod ui;
 use serde_json::json;
 use ui::{ComposerDraft, Conversation, decode_list};
+use vibeface_desktop::{ui, views::offline};
 use vibeface_protocol::workspace::{Attachment, InputIntent, InputTarget};
 
 #[test]

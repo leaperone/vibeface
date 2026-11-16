@@ -1,23 +1,4 @@
-#![cfg(feature = "native-ui-tests")]
-extern crate gpui_kit as gpui;
-#[path = "../src/app.rs"]
-#[allow(dead_code, unused_imports)]
-mod app;
-#[path = "../src/host/mod.rs"]
-#[allow(dead_code, unused_imports)]
-mod host;
-#[path = "../src/theme.rs"]
-#[allow(dead_code)]
-mod theme;
-#[path = "../src/ui.rs"]
-#[allow(dead_code)]
-mod ui;
-#[path = "../src/views/mod.rs"]
-#[allow(dead_code, unused_imports)]
-mod views;
-#[path = "../src/widgets/mod.rs"]
-#[allow(dead_code)]
-mod widgets;
+use crate::{app, host, ui, views};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AnyWindowHandle, AppContext, Entity, TestAppContext, WindowOptions};
 use std::sync::Arc;
@@ -67,7 +48,7 @@ fn fixture() -> Snapshot {
         ..Default::default()
     }
 }
-fn open(cx: &mut TestAppContext, route: Route, snapshot: Snapshot) -> Harness {
+fn harness(cx: &mut TestAppContext, snapshot: &Snapshot) -> Harness {
     cx.update(gpui_kit::init);
     let (tx, commands) = mpsc::channel(32);
     let (events, event_rx) = mpsc::channel(32);
@@ -78,6 +59,17 @@ fn open(cx: &mut TestAppContext, route: Route, snapshot: Snapshot) -> Harness {
         })
         .unwrap()
     });
+    Harness {
+        window,
+        view,
+        commands,
+        events,
+        _snapshots: snapshots,
+    }
+}
+fn open(cx: &mut TestAppContext, route: Route, snapshot: Snapshot) -> Harness {
+    let h = harness(cx, &snapshot);
+    let view = &h.view;
     view.update(cx, |view, cx| {
         view.snapshot = Arc::new(snapshot);
         view.route = route;
@@ -86,13 +78,7 @@ fn open(cx: &mut TestAppContext, route: Route, snapshot: Snapshot) -> Harness {
         view.attachment_scope = Some("chat-a".into());
         cx.notify();
     });
-    Harness {
-        window,
-        view,
-        commands,
-        events,
-        _snapshots: snapshots,
-    }
+    h
 }
 fn enter_message(h: &Harness, cx: &mut TestAppContext, text: &str) {
     h.window
@@ -1547,17 +1533,13 @@ fn connected_form_waits_for_actual_workspace_before_opening_business(cx: &mut Te
 }
 
 mod prepaid_delivery {
-    use super::{app, ui, views};
+    use super::{ui, views};
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{
-        AnyWindowHandle, AppContext, Entity, Role, ScrollDelta, TestAppContext, WindowOptions,
-        point, px,
-    };
+    use gpui_kit::{Role, ScrollDelta, TestAppContext, point, px};
     use serde_json::json;
     use std::sync::Arc;
-    use tokio::sync::{mpsc, watch};
     use ui::*;
-    use views::backend::{Command, Event};
+    use views::backend::Command;
     fn order(digit: char, role: &str) -> TransferOrder {
         serde_json::from_value(json!({"order_id":digit.to_string().repeat(64),"intent_id":format!("00000000-0000-4000-8000-00000000000{}",if digit=='d'{1}else{2}),"role":role,"mode":"paid","acceptance":"recoverable","source_peer":"a".repeat(64),"receiver_peer":"b".repeat(64),"provider_peer":"c".repeat(64),"name":if role=="provider"{None}else{Some("file.bin")},"bytes":4,"sha256":if role=="provider"{None}else{Some("f".repeat(64))},"phase":if role=="sender"{"prepared"}else{"funded"},"evidence":"none","windows":[{"index":0,"bytes":4,"committed_bytes":0,"state":"pending","decryption_proven":false}],"deadlines":{"quote_expires_at":2000000000,"hold_deadline":2000000100,"key_deadline":2000000200,"open_deadline":2000000300,"retain_until":2000000400,"priority_deadline":2000000150},"payment":{"chain_id":"1","asset":format!("0x{}","3".repeat(40)),"payer":format!("0x{}","5".repeat(40)),"provider_wallet":format!("0x{}","4".repeat(40)),"budget_id":"2".repeat(64),"state":if role=="sender"{"prepared"}else{"confirmed"},"delivery_fee":"5","reservation_fee":"2","priority_fee":"3","total":"10","gas_cap":"7","earned":"0","withdrawn":"0","refunded":"0","settlement":null}})).unwrap()
     }
@@ -1613,36 +1595,15 @@ mod prepaid_delivery {
             ..Default::default()
         }
     }
-    struct Harness {
-        window: AnyWindowHandle,
-        view: Entity<app::Desktop>,
-        commands: mpsc::Receiver<Command>,
-        _events: mpsc::Sender<Event>,
-        _snapshots: watch::Sender<Arc<Snapshot>>,
-    }
+    use super::Harness;
     fn open(cx: &mut TestAppContext, snapshot: Snapshot) -> Harness {
-        cx.update(gpui_kit::init);
-        let (tx, commands) = mpsc::channel(32);
-        let (events, rx) = mpsc::channel(32);
-        let (snapshots, watch) = watch::channel(Arc::new(snapshot.clone()));
-        let (window, view) = cx.update(|cx| {
-            gpui_kit::open_window(WindowOptions::default(), cx, move |window, cx| {
-                cx.new(|cx| app::Desktop::new(tx, rx, watch, window, cx))
-            })
-            .unwrap()
-        });
-        view.update(cx, |view, cx| {
+        let h = super::harness(cx, &snapshot);
+        h.view.update(cx, |view, cx| {
             view.snapshot = Arc::new(snapshot);
             view.route = Route::Transfers;
             cx.notify();
         });
-        Harness {
-            window,
-            view,
-            commands,
-            _events: events,
-            _snapshots: snapshots,
-        }
+        h
     }
     fn click(h: &Harness, cx: &mut TestAppContext, id: &str) {
         let id = gpui_kit::SharedString::from(id.to_owned());

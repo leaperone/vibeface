@@ -1,9 +1,7 @@
-#[path = "../src/views/records.rs"]
-#[allow(dead_code)]
-mod records;
 use records::*;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use vibeface_desktop::views::records;
 
 // Literal wire fixtures follow Core's WorkProjection (apps/core/src/model.rs),
 // runtime/chat_controls.rs::work_detail and runtime/workspace.rs::workspace_history.

@@ -1,5 +1,4 @@
-#[path = "../src/host/profiles.rs"]
-mod profiles;
+use vibeface_desktop::host::profiles;
 
 use anyhow::Result;
 use profiles::{MAX_PROFILES, ProfileHints, ProfileId, ProfileRegistry};

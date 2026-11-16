@@ -21,7 +21,7 @@ pub struct Timeline {
     indices: Rc<RefCell<HashMap<String, usize>>>,
 }
 impl Timeline {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             list: ListState::new(0, ListAlignment::Bottom, px(500.)),
             rows: vec![],

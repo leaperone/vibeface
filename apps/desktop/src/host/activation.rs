@@ -51,7 +51,7 @@ impl Activation {
     }
 }
 #[derive(Default)]
-pub struct ActivationQueue {
+pub(crate) struct ActivationQueue {
     pending: VecDeque<Activation>,
 }
 impl ActivationQueue {
