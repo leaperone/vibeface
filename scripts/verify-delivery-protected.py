@@ -1508,7 +1508,7 @@ class Experiment:
         self.public_json("settlement.json", bundle)
         self.public_json("confirmed-chain.json", snapshot)
         observed = self.command(["node", self.repository / "contracts/delivery/observe-settlement.mjs", "--settlement", self.public / "settlement.json",
-                                 "--rpc-url", self.deployment["rpc_url"], "--case", "protected"], timeout=180)
+                                 "--rpc-url", self.deployment["rpc_url"]], timeout=180)
         value = json.loads(observed.stdout)
         need(value.get("status") == "PASS", "official_protected_settlement_observer_required")
         self.public_json("settlement-observation.json", value)

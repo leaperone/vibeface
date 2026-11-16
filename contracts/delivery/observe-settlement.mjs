@@ -18,12 +18,7 @@ function bareHex(value, bytes, label) {
   return `0x${value}`;
 }
 function filename(value) { assert(typeof value === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(value), 'proof paths must be relative basenames'); }
-export function observationCase(name = 'protected') {
-  assert.equal(name, 'protected', 'old Strict/ordinary runtimes were retired; use protected budget evidence or the fixed historical source');
-  return { name };
-}
-export function validateBundle(bundle, caseName = 'protected') {
-  observationCase(caseName);
+export function validateBundle(bundle) {
   keys(bundle, ['schemaVersion', 'escrow', 'asset', 'budgetId', 'orders', 'proofs', 'capsules', 'transactions']);
   assert.equal(bundle.schemaVersion, 2, 'protected evidence uses schema 2, never a relabeled old voucher/Strict bundle');
   assert(ADDRESS.test(bundle.escrow) && ADDRESS.test(bundle.asset) && HASH.test(bundle.budgetId));
@@ -93,21 +88,21 @@ export function checkRuntime(entry, code) {
 }
 
 export function parseArguments(args) {
-  assert([4, 6].includes(args.length), 'Usage: node observe-settlement.mjs --settlement <protected-bundle.json> --rpc-url <original-loopback-rpc> [--case protected]');
+  assert.equal(args.length, 4, 'Usage: node observe-settlement.mjs --settlement <protected-bundle.json> --rpc-url <original-loopback-rpc>');
   const values = {};
-  for (let i = 0; i < args.length; i += 2) { assert(['--settlement', '--rpc-url', '--case'].includes(args[i]) && values[args[i]] === undefined); values[args[i]] = args[i + 1]; }
+  for (let i = 0; i < args.length; i += 2) { assert(['--settlement', '--rpc-url'].includes(args[i]) && values[args[i]] === undefined); values[args[i]] = args[i + 1]; }
   assert(values['--settlement'] && values['--rpc-url']);
   const url = new URL(values['--rpc-url']); assert(url.protocol === 'http:' && ['127.0.0.1', '[::1]'].includes(url.hostname) && !url.username && !url.password && !url.search && !url.hash && url.pathname === '/');
-  return { bundleFile: path.resolve(values['--settlement']), rpcUrl: url.href, caseName: observationCase(values['--case']).name };
+  return { bundleFile: path.resolve(values['--settlement']), rpcUrl: url.href };
 }
 function readRegular(file) { const stat = fs.lstatSync(file); assert(stat.isFile() && stat.size > 0 && stat.size <= 1048576); return fs.readFileSync(file); }
 function same(a, b) { assert.equal(a.toLowerCase(), b.toLowerCase()); }
 function address(a, b) { assert.equal(getAddress(a), getAddress(b)); }
-export async function observe({ bundleFile, rpcUrl, caseName = 'protected' }) {
-  const report = { schemaVersion: 2, status: 'UNVERIFIED', case: caseName, scope: 'genuine protected budget on the original local chain; binary receipts require independent host verification', checks: [], transactions: [], proofs: [] };
+export async function observe({ bundleFile, rpcUrl }) {
+  const report = { schemaVersion: 2, status: 'UNVERIFIED', case: 'protected', scope: 'genuine protected budget on the original local chain; binary receipts require independent host verification', checks: [], transactions: [], proofs: [] };
   let provider;
   try {
-    const bundle = validateBundle(JSON.parse(readRegular(bundleFile)), caseName); compile({ checkTrust: true });
+    const bundle = validateBundle(JSON.parse(readRegular(bundleFile))); compile({ checkTrust: true });
     const built = artifact('DeliveryEscrow'), fields = built.abi.find(item => item.name === 'preview').inputs[0].components;
     assert.equal(fields.length, 47); assert.equal(fields[42].name, 'priorityDeadline');
     const statementType = `tuple(${fields.map(field => `${field.type} ${field.name}`).join(',')})`;
