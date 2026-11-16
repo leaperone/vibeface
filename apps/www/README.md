@@ -2,7 +2,9 @@
 
 `apps/www` builds the public portal for `www.vibeface.dev`. It contains the landing page, public downloads and community links, and the documentation pages sourced from the repository root `packages/docs/` directory.
 
-Public document links are registered in `src/lib/public-docs.ts`. Document bodies, titles, and descriptions come from `packages/docs/`; edit those source files so the website and repository keep the same instructions.
+`public-docs.json` lists public document slugs in navigation order. Each slug names a `packages/docs/<slug>.md` source file and a `/docs/<slug>` route. Files absent from this registry stay out of the portal and its search index. Document bodies, titles, and descriptions come from `packages/docs/`.
+
+After changing the registry, run `pnpm --filter vibeface-www generate:docs`. This generates `packages/docs/meta.json`, `src/lib/public-docs.ts`, and the literal file list required by the Fumadocs macro in `src/lib/source.ts`. Do not edit those generated files. `pnpm --filter vibeface-www check:docs` checks for stale output without writing files; typecheck and build also run this check, including in CI.
 
 Install dependencies from the repository root, then run the portal locally:
 

@@ -1,8 +1,10 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { Document } from 'flexsearch'
+import { readPublicDocs } from './generate-public-docs.mjs'
 
 const root = resolve('dist/client')
+const docs = readPublicDocs()
 const required = [
   'index.html',
   '404.html',
@@ -10,21 +12,7 @@ const required = [
   'community/index.html',
   'security/index.html',
   'docs/index.html',
-  'docs/overview/index.html',
-  'docs/quick-start/index.html',
-  'docs/onboarding/index.html',
-  'docs/user-guide/index.html',
-  'docs/comparison/index.html',
-  'docs/install/index.html',
-  'docs/ios/index.html',
-  'docs/bot-and-execution/index.html',
-  'docs/history-sync/index.html',
-  'docs/privacy-security/index.html',
-  'docs/node/index.html',
-  'docs/deployment/index.html',
-  'docs/troubleshooting/index.html',
-  'docs/releasing/index.html',
-  'docs/ci/index.html',
+  ...docs.map(({ slug }) => `docs/${slug}/index.html`),
   'search-index.json',
   'robots.txt',
   'sitemap.xml',
@@ -95,9 +83,8 @@ function fail(message) {
 }
 
 const docsRoot = resolve('../../packages/docs')
-const { pages } = JSON.parse(readFileSync(resolve(docsRoot, 'meta.json'), 'utf8'))
-for (const slug of pages) {
-  const source = readFileSync(resolve(docsRoot, `${slug}.md`), 'utf8')
+for (const { file, slug } of docs) {
+  const source = readFileSync(resolve(docsRoot, file), 'utf8')
   const title = source.match(/^title: (.+)$/m)?.[1]
   const description = source.match(/^description: (.+)$/m)?.[1]
   if (!title || !description) fail(`${slug} is missing public metadata`)
