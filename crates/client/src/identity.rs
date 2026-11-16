@@ -1113,9 +1113,8 @@ mod tests {
     #[tokio::test]
     async fn recovery_lost_reply_is_read_back_once_and_refusal_does_not_enroll() -> Result<()> {
         use crate::connection::Refused;
-        use futures_util::{SinkExt, StreamExt};
-        use tokio_tungstenite::tungstenite::Message;
-        use vibeface_secure::Handshake;
+        use crate::test_support::{send, server};
+        use futures_util::StreamExt;
 
         for accepted in [true, false] {
             let dir = temp_dir("recover-reconcile");
@@ -1151,18 +1150,7 @@ mod tests {
                 let mut checkpoint = None;
                 let mut writes = 0;
                 for _ in 0..3 {
-                    let (stream, _) = listener.accept().await?;
-                    let mut socket = tokio_tungstenite::accept_async(stream).await?;
-                    assert!(matches!(socket.next().await.unwrap()?, Message::Text(_)));
-                    let mut handshake = Handshake::signed(false, &node, None, PROLOGUE)?;
-                    let frame = socket.next().await.unwrap()?;
-                    handshake.read(&frame.into_data())?;
-                    socket
-                        .send(Message::Binary(handshake.write(&[])?.into()))
-                        .await?;
-                    let frame = socket.next().await.unwrap()?;
-                    handshake.read(&frame.into_data())?;
-                    let mut channel = handshake.finish()?;
+                    let (mut socket, mut channel) = server(&listener, &node).await?;
                     while let Some(frame) = socket.next().await {
                         let Some(plain) = channel.open_record(&frame?.into_data())? else {
                             continue;
@@ -1184,11 +1172,7 @@ mod tests {
                                 }
                                 let response =
                                     json!({"id":request["id"],"error":"recovery refused"});
-                                for record in
-                                    channel.seal_message(&serde_json::to_vec(&response)?)?
-                                {
-                                    socket.send(Message::Binary(record.into())).await?;
-                                }
+                                send(&mut socket, &mut channel, response).await?;
                                 break;
                             }
                             "authenticate" => {
@@ -1201,9 +1185,7 @@ mod tests {
                             method => panic!("unexpected method {method}"),
                         };
                         let response = json!({"id":request["id"],"result":result});
-                        for record in channel.seal_message(&serde_json::to_vec(&response)?)? {
-                            socket.send(Message::Binary(record.into())).await?;
-                        }
+                        send(&mut socket, &mut channel, response).await?;
                         if matches!(request["method"].as_str(), Some("info" | "authenticate")) {
                             break;
                         }

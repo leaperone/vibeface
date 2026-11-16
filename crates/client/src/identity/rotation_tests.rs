@@ -1,36 +1,6 @@
 use super::*;
-use crate::connection::tests::{receive, send};
-use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::tungstenite::Message;
-use vibeface_secure::{Channel, Handshake, membership::Genesis};
-
-pub(super) async fn accept(
-    listener: &tokio::net::TcpListener,
-    node: &Identity,
-) -> Result<(
-    tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    Channel,
-)> {
-    let (tcp, _) = listener.accept().await?;
-    let mut socket = tokio_tungstenite::accept_async(tcp).await?;
-    ensure!(
-        matches!(socket.next().await.context("connect")??, Message::Text(_)),
-        "connect missing"
-    );
-    let mut handshake = Handshake::signed(false, node, None, PROLOGUE)?;
-    let Message::Binary(first) = socket.next().await.context("first handshake")?? else {
-        bail!("expected Noise");
-    };
-    handshake.read(&first)?;
-    socket
-        .send(Message::Binary(handshake.write(&[])?.into()))
-        .await?;
-    let Message::Binary(last) = socket.next().await.context("last handshake")?? else {
-        bail!("expected Noise");
-    };
-    handshake.read(&last)?;
-    Ok((socket, handshake.finish()?))
-}
+use crate::test_support::{receive, send, server};
+use vibeface_secure::membership::Genesis;
 
 #[tokio::test]
 async fn rotation_preserves_members_and_saved_replacement_after_lost_acknowledgement() -> Result<()>
@@ -74,7 +44,7 @@ async fn rotation_preserves_members_and_saved_replacement_after_lost_acknowledge
     };
     key.remember(&state.genesis.network_id, entry.clone())?;
     let task = tokio::spawn(async move {
-        let (mut socket, mut channel) = accept(&listener, &node).await?;
+        let (mut socket, mut channel) = server(&listener, &node).await?;
         let request = receive(&mut socket, &mut channel).await?;
         assert_eq!(request["method"], "directory");
         send(
@@ -84,7 +54,7 @@ async fn rotation_preserves_members_and_saved_replacement_after_lost_acknowledge
         )
         .await?;
         socket.close(None).await?;
-        let (mut socket, mut channel) = accept(&listener, &node).await?;
+        let (mut socket, mut channel) = server(&listener, &node).await?;
         let request = receive(&mut socket, &mut channel).await?;
         assert_eq!(request["method"], "recover");
         let received: NetworkState = serde_json::from_value(request["params"].clone())?;
@@ -95,7 +65,7 @@ async fn rotation_preserves_members_and_saved_replacement_after_lost_acknowledge
         assert!(!view.client(&client_id)?.manage);
         let new_root = view.recovery_key.clone();
         socket.close(None).await?;
-        let (mut socket, mut channel) = accept(&listener, &node).await?;
+        let (mut socket, mut channel) = server(&listener, &node).await?;
         let request = receive(&mut socket, &mut channel).await?;
         assert_eq!(
             request["method"], "authenticate",

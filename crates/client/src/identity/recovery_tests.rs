@@ -1,5 +1,5 @@
 use super::*;
-use crate::connection::tests::{receive, send};
+use crate::test_support::{receive, send, server};
 use vibeface_secure::membership::Genesis;
 
 #[test]
@@ -102,7 +102,7 @@ async fn review_on_an_empty_node_lists_candidates_without_preparing_recovery() -
         node_id: new_node.device_id(),
     };
     let task = tokio::spawn(async move {
-        let (mut socket, mut channel) = rotation_tests::accept(&listener, &new_node).await?;
+        let (mut socket, mut channel) = server(&listener, &new_node).await?;
         let request = receive(&mut socket, &mut channel).await?;
         assert_eq!(request["method"], "info");
         send(
@@ -212,7 +212,7 @@ async fn selected_recovery_retires_omitted_nodes_and_resumes_the_exact_unknown_p
     let task = tokio::spawn(async move {
         let before_review = serde_json::to_value(&state)?;
         for _ in 0..2 {
-            let (mut socket, mut channel) = rotation_tests::accept(&listener, &node).await?;
+            let (mut socket, mut channel) = server(&listener, &node).await?;
             let request = receive(&mut socket, &mut channel).await?;
             assert_eq!(request["method"], "info");
             send(
@@ -235,7 +235,7 @@ async fn selected_recovery_retires_omitted_nodes_and_resumes_the_exact_unknown_p
             assert_eq!(serde_json::to_value(&state)?, before_review);
         }
 
-        let (mut socket, mut channel) = rotation_tests::accept(&listener, &node).await?;
+        let (mut socket, mut channel) = server(&listener, &node).await?;
         let request = receive(&mut socket, &mut channel).await?;
         assert_eq!(request["method"], "recover");
         let received: NetworkState = serde_json::from_value(request["params"].clone())?;
@@ -260,7 +260,7 @@ async fn selected_recovery_retires_omitted_nodes_and_resumes_the_exact_unknown_p
 
         // The first receipt is unavailable. Retrying the saved Unknown plan must only read.
         for known in [false, true] {
-            let (mut socket, mut channel) = rotation_tests::accept(&listener, &node).await?;
+            let (mut socket, mut channel) = server(&listener, &node).await?;
             let request = receive(&mut socket, &mut channel).await?;
             assert_eq!(
                 request["method"], "authenticate",

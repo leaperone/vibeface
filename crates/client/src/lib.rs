@@ -18,6 +18,9 @@ pub use local::{LocalGrant, LocalTarget};
 mod profile;
 
 mod settings;
+
+#[cfg(test)]
+mod test_support;
 pub use settings::{SettingsField, SettingsKind, SettingsReview};
 
 pub use vibeface_protocol::history;

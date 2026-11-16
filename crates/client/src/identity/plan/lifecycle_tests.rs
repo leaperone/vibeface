@@ -1,6 +1,5 @@
-use super::super::rotation_tests::accept;
 use super::*;
-use crate::connection::tests::{receive, send};
+use crate::test_support::{receive, send, server};
 
 fn saved_plan_fixture(
     kind: IdentityPlanKind,
@@ -262,7 +261,7 @@ async fn applied_creation_does_not_block_read_only_recovery_review() -> Result<(
         node_id: node.device_id(),
     };
     let task = tokio::spawn(async move {
-        let (mut socket, mut channel) = accept(&listener, &node).await?;
+        let (mut socket, mut channel) = server(&listener, &node).await?;
         let request = receive(&mut socket, &mut channel).await?;
         assert_eq!(request["method"], "info");
         send(
