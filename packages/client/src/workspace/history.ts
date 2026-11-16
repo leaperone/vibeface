@@ -139,11 +139,16 @@ export async function readConversationHistory(input: {
   current: () => boolean; apply: (page: HistoryPage) => void
 }): Promise<void> {
   let cursor = input.cursor
+  const seen = new Set<string>()
+  if (cursor !== null) seen.add(cursor)
   while (input.current()) {
     const page = parseHistoryPage(await input.rpc('conversation_history', { conversation_id: input.conversationId, section: input.section, cursor, limit: 50 }), input.conversationId, input.section)
     if (!input.current()) return
     if (page.history_authority !== input.authority) throw new Error('history changed; refresh the conversation')
-    if (page.next_cursor !== null && page.next_cursor === cursor) throw new Error('历史分页没有前进，请重新读取对话。')
+    if (page.next_cursor !== null) {
+      if (seen.has(page.next_cursor)) throw new Error('历史分页没有前进，请重新读取对话。')
+      seen.add(page.next_cursor)
+    }
     input.apply(page)
     cursor = page.next_cursor
     if (page.items.length > 0 || cursor === null) return

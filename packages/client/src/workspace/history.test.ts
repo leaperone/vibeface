@@ -84,6 +84,62 @@ test('one explicit read advances empty incomplete pages and stops on a visible p
   assert.deepEqual(received.map((item) => item.next_cursor), ['second', 'third', 'fourth'])
 })
 
+test('history reads reject cursor cycles before applying the repeated page or fetching again', async () => {
+  for (const fixture of [
+    { cursor: 'A', requested: ['A', 'B'], applied: ['B'], replies: [rawPage('messages', [], 'B'), rawPage('messages', [], 'A')] },
+    { cursor: null, requested: [null, 'A', 'B'], applied: ['A', 'B'], replies: [rawPage('messages', [], 'A'), rawPage('messages', [], 'B'), rawPage('messages', [], 'A')] },
+    { cursor: 'A', requested: ['A', 'B'], applied: ['B'], replies: [rawPage('messages', [], 'B'), rawPage('messages', [message('old', 1)], 'A')] },
+  ]) {
+    const requested: unknown[] = [], received: HistoryPage[] = []
+    await assert.rejects(readConversationHistory({ conversationId: 'chat', section: 'messages', cursor: fixture.cursor, authority: 'authority', current: () => true, apply: (value) => received.push(value), rpc: async (_method, params) => {
+      requested.push(params.cursor)
+      const reply = fixture.replies.shift()
+      if (!reply) throw new Error('controlled RPC sentinel: cursor cycle was not rejected')
+      return reply
+    } }), { message: '历史分页没有前进，请重新读取对话。' })
+    assert.deepEqual(requested, fixture.requested)
+    assert.deepEqual(received.map((item) => item.next_cursor), fixture.applied)
+    assert.equal(received.at(-1)?.complete, false)
+  }
+})
+
+test('history reads preserve long finite empty scans and stop at a visible or terminal page', async () => {
+  for (const terminal of [false, true]) {
+    const cursor = terminal ? null : 'first'
+    let calls = 0, shown = bounded()
+    await readConversationHistory({ conversationId: 'chat', section: 'messages', cursor, authority: 'authority', current: () => true, apply: (value) => { shown = mergeHistoryPage(shown, value) }, rpc: async (_method, params) => {
+      assert.equal(params.cursor, calls === 0 ? cursor : `empty-${calls}`)
+      calls++
+      if (calls <= 2048) return rawPage('messages', [], `empty-${calls}`)
+      assert.equal(calls, 2049, 'read continued past a visible or terminal page')
+      return terminal ? rawPage('messages', []) : rawPage('messages', [message('old', 1)], 'older-visible')
+    } })
+    assert.equal(calls, 2049)
+    assert.deepEqual(shown.messages.map((item) => item.message_id), terminal ? ['newest'] : ['old', 'newest'])
+    assert.deepEqual(shown.history.messages, terminal ? { next_cursor: null, complete: true } : { next_cursor: 'older-visible', complete: false })
+  }
+})
+
+test('cancelling an empty scan discards its late cyclic page and sends no next request', async () => {
+  const requests = new HistoryRequests(), request = requests.start('messages'); assert.ok(request)
+  const received: HistoryPage[] = [], requested: unknown[] = []
+  let release: (value: unknown) => void = () => {}
+  const result = readConversationHistory({ conversationId: 'chat', section: 'messages', cursor: 'A', authority: 'authority', current: request.current, apply: (value) => received.push(value), rpc: async (_method, params) => {
+    requested.push(params.cursor)
+    if (requested.length === 1) return rawPage('messages', [], 'B')
+    assert.equal(requested.length, 2, 'cancelled scan sent another request')
+    return new Promise((resolve) => { release = resolve })
+  } })
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  assert.deepEqual(requested, ['A', 'B'])
+  requests.cancel('messages')
+  release(rawPage('messages', [], 'A'))
+  await result
+  assert.deepEqual(requested, ['A', 'B'])
+  assert.deepEqual(received.map((item) => item.next_cursor), ['B'])
+  assert.equal(request.current(), false)
+})
+
 test('cancelled requests and prior connection visits cannot apply late results or erase newer requests', async () => {
   const requests = new HistoryRequests(), old = requests.start('messages'); assert.ok(old)
   assert.equal(requests.start('messages'), null)
