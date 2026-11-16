@@ -39,6 +39,7 @@ pub mod pi;
 mod provider_adapter;
 mod provider_probe;
 mod relay;
+mod reply_directory;
 mod schedule_delivery;
 mod scheduler_history;
 mod settings;
