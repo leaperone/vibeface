@@ -2,7 +2,6 @@
   "system": "Arc",
   "repository": "https://github.com/WheatXie/uiarc-pro-reverse",
   "commit": "859606819c68787b2dccb54adcb9b08bd3272d5d",
-  "baseline": "b7a901efec10ad767a3c57a05a76ecd13202f39e",
   "routes": {
     "app": [
       "src/routes/__root.tsx",

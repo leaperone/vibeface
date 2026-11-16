@@ -51,8 +51,6 @@ def source_integrity(errors):
 def resolve_import(specifier, importer, app):
     if specifier.startswith('@/'):
         candidate = app / 'src' / specifier[2:]
-    elif specifier.startswith('#components/'):
-        candidate = app / 'src/components' / specifier.removeprefix('#components/')
     elif specifier.startswith('.'):
         candidate = importer.parent / specifier
     else:
