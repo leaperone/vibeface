@@ -6,7 +6,7 @@
 use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
 use super::provider_adapter::bounded;
 use super::*;
-use crate::manager::{self, CodexTurn, ManagerConfig, ManagerError, ManagerFailure};
+use crate::manager::{self, ManagerConfig, ManagerError, ManagerFailure, TurnBinding};
 use crate::scheduling::{SteerOutcome, SteerTarget};
 use crate::work::{Probe, Signal, WorkRecord, WorkSpec};
 use futures_util::future::BoxFuture;
@@ -1185,11 +1185,11 @@ where
     }
     let projects = projects_dir(&config.provider_env);
     let resumed = previous.filter(|session| transcript(projects.as_deref(), session).is_some());
-    let prompt = match (resumed, previous, &config.codex_turn) {
+    let prompt = match (resumed, previous, &config.turn_binding) {
         (
             None,
             Some(_),
-            Some(CodexTurn {
+            Some(TurnBinding {
                 fresh_prompt: Some(fresh),
                 ..
             }),
@@ -1208,7 +1208,7 @@ where
             error(ManagerFailure::Failed, native, failure)
         });
     }
-    if let Some(turn) = &config.codex_turn {
+    if let Some(turn) = &config.turn_binding {
         processes
             .record_reply(&session, &turn.client_id, projects.as_deref())
             .map_err(|e| {
@@ -1252,7 +1252,7 @@ where
             )
         })?)
     };
-    let message = config.codex_turn.as_ref().map_or_else(
+    let message = config.turn_binding.as_ref().map_or_else(
         || uuid::Uuid::new_v4().to_string(),
         |turn| derived(MESSAGE_SEED, &turn.client_id),
     );
@@ -1376,7 +1376,7 @@ where
                 stage.enter(ProviderStage::Run);
                 *start.lock().unwrap() = manager::StartEvidence::Started;
                 if let Some(started) = config
-                    .codex_turn
+                    .turn_binding
                     .as_ref()
                     .and_then(|turn| turn.started.as_ref())
                     && let Err(callback_error) = started(message.clone()).await
@@ -1423,7 +1423,7 @@ where
             return Err(error(ManagerFailure::Failed, native, failure));
         }
     }
-    if let Some(turn) = &config.codex_turn
+    if let Some(turn) = &config.turn_binding
         && let Err(e) = (turn.record)(session.clone(), Some(message)).await
     {
         tracing::warn!(event = "claude.turn_unrecorded", error = %e, "the next Claude Code turn repeats what this one was shown");
@@ -2157,7 +2157,7 @@ pub(super) mod tests {
             tool_token: Some("tool-token-fixture".into()),
             provider_env: place.env(),
             process_started: None,
-            codex_turn: Some(CodexTurn {
+            turn_binding: Some(TurnBinding {
                 client_id: "attempt-1".into(),
                 started: None,
                 record,
@@ -2189,7 +2189,7 @@ pub(super) mod tests {
             let finished = AtomicBool::new(false);
             let started = Arc::new(AtomicBool::new(false));
             let mark = started.clone();
-            config.codex_turn.as_mut().unwrap().started = Some(Arc::new(move |_| {
+            config.turn_binding.as_mut().unwrap().started = Some(Arc::new(move |_| {
                 mark.store(true, Ordering::SeqCst);
                 Box::pin(async { Ok(()) })
             }));
@@ -2411,7 +2411,7 @@ pub(super) mod tests {
 
     fn gated_config(place: &Place, client: &str) -> ManagerConfig {
         let mut config = bot_config(place, Arc::new(|_, _| Box::pin(async { Ok(()) })));
-        config.codex_turn = Some(CodexTurn {
+        config.turn_binding = Some(TurnBinding {
             client_id: client.into(),
             started: None,
             record: Arc::new(|_, _| Box::pin(async { Ok(()) })),
@@ -3987,7 +3987,7 @@ time.sleep(0.05)
         let persisted = Arc::new(std::sync::Mutex::new(None::<String>));
         let started = Arc::new(tokio::sync::Notify::new());
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let observer = config.codex_turn.as_mut().unwrap();
+        let observer = config.turn_binding.as_mut().unwrap();
         observer.record = record;
         observer.started = Some({
             let persisted = persisted.clone();

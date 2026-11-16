@@ -905,7 +905,7 @@ async fn turn(
             }
             config.tool_token = Some(token.clone());
             config.process_started = Some(process_recorder(&node, &attempt.id));
-            config.codex_turn = Some(turn_recorder(&node, &network, &job, &server, shown.clone(), fresh_prompt));
+            config.turn_binding = Some(turn_recorder(&node, &network, &job, &server, shown.clone(), fresh_prompt));
             config.tool_env.extend([
                 ("VIBEFACE_NODE_URL".into(), local_url),
                 ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()),
@@ -1449,7 +1449,7 @@ pub(crate) fn turn_recorder(
     server: &str,
     shown: Arc<Mutex<Shown>>,
     fresh_prompt: Option<String>,
-) -> manager::CodexTurn {
+) -> manager::TurnBinding {
     let node = node.clone();
     let attempt = job
         .state
@@ -1467,7 +1467,7 @@ pub(crate) fn turn_recorder(
         .runtime
         .as_ref()
         .is_some_and(|runtime| runtime.provider == crate::providers::Provider::Cursor);
-    manager::CodexTurn {
+    manager::TurnBinding {
         client_id: attempt.clone(),
         fresh_prompt,
         started: Some(Arc::new(move |_| {
@@ -3094,7 +3094,7 @@ mod tests {
             tool_token: None,
             provider_env: BTreeMap::new(),
             process_started: None,
-            codex_turn: None,
+            turn_binding: None,
         };
         session_identity(
             &config,
