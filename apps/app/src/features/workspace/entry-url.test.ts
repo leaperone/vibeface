@@ -606,7 +606,7 @@ test("workspace preserves bot and message requests while routing native decision
           assert.equal(render().pendingMessages.find((pending) => pending.message_id === input.message_id)?.text, input.text)
           await assert.rejects(render().confirmInputEntry(input.message_id, 'gateway'), /不能重新指定/)
           await assert.rejects(render().retryPendingMessage(input.message_id), /缺少原设备记录/)
-          assert.deepEqual(queries, [], 'neither confirmation nor retry can turn an unbound saved refusal into reconciliation')
+          assert.equal(queries.length, 0, 'neither confirmation nor retry can turn an unbound saved refusal into reconciliation')
           assert.deepEqual((await memoryOutbox.all()).find((entry) => entry.key === item.key), original, 'rejected actions retain the complete original record')
           await assert.rejects(render().queryInput(input), /input not found/)
           assert.equal(queries.length, 1)
