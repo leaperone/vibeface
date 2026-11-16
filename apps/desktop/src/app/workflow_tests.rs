@@ -1,4 +1,4 @@
-use crate::{app, ui, views};
+use crate::{app, host, ui, views};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AnyWindowHandle, AppContext, Entity, TestAppContext, WindowOptions};
 use std::sync::Arc;
@@ -1539,7 +1539,7 @@ mod prepaid_delivery {
     use serde_json::json;
     use std::sync::Arc;
     use ui::*;
-    use views::backend::{Command, Event};
+    use views::backend::Command;
     fn order(digit: char, role: &str) -> TransferOrder {
         serde_json::from_value(json!({"order_id":digit.to_string().repeat(64),"intent_id":format!("00000000-0000-4000-8000-00000000000{}",if digit=='d'{1}else{2}),"role":role,"mode":"paid","acceptance":"recoverable","source_peer":"a".repeat(64),"receiver_peer":"b".repeat(64),"provider_peer":"c".repeat(64),"name":if role=="provider"{None}else{Some("file.bin")},"bytes":4,"sha256":if role=="provider"{None}else{Some("f".repeat(64))},"phase":if role=="sender"{"prepared"}else{"funded"},"evidence":"none","windows":[{"index":0,"bytes":4,"committed_bytes":0,"state":"pending","decryption_proven":false}],"deadlines":{"quote_expires_at":2000000000,"hold_deadline":2000000100,"key_deadline":2000000200,"open_deadline":2000000300,"retain_until":2000000400,"priority_deadline":2000000150},"payment":{"chain_id":"1","asset":format!("0x{}","3".repeat(40)),"payer":format!("0x{}","5".repeat(40)),"provider_wallet":format!("0x{}","4".repeat(40)),"budget_id":"2".repeat(64),"state":if role=="sender"{"prepared"}else{"confirmed"},"delivery_fee":"5","reservation_fee":"2","priority_fee":"3","total":"10","gas_cap":"7","earned":"0","withdrawn":"0","refunded":"0","settlement":null}})).unwrap()
     }
