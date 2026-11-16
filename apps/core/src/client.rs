@@ -4257,21 +4257,66 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_node_joins_preserve_the_first_owner_and_request() -> Result<()> {
+        use iroh::protocol::{AcceptError, ProtocolHandler, Router};
+
+        #[derive(Debug)]
+        struct HeldJoin {
+            observed: Arc<tokio::sync::Notify>,
+            done: tokio::sync::watch::Receiver<bool>,
+        }
+        impl ProtocolHandler for HeldJoin {
+            async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+                let observed = self.observed.clone();
+                let done = self.done.clone();
+                net::serve_streams(connection, move |request: Value| {
+                    let observed = observed.clone();
+                    let mut done = done.clone();
+                    async move {
+                        ensure!(request["method"] == "join", "expected the fixture join");
+                        observed.notify_one();
+                        done.wait_for(|released| *released).await?;
+                        Ok(json!({"error":"fixture entry released"}))
+                    }
+                })
+                .await;
+                Ok(())
+            }
+        }
+
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
             .join(format!("node-join-concurrent-{}", uuid::Uuid::new_v4()));
         crate::config::private_dir(&dir)?;
-        initialize_node(
-            &dir,
-            &crate::config::Config::local("127.0.0.1:4795".parse()?, vec![], false),
-            &LocalIdentity::generate(),
-        )?;
+        let mut configuration =
+            crate::config::Config::local("127.0.0.1:4795".parse()?, vec![], false);
+        configuration.network.mesh.enabled = false;
+        initialize_node(&dir, &configuration, &LocalIdentity::generate())?;
         let capability =
             crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
         let node = Arc::new(Runtime::open(&dir).await?);
+        let entry = Net::bind(
+            &LocalIdentity::generate().secret_key_hex,
+            &NetworkConfig {
+                bind: Some("127.0.0.1:0".parse()?),
+                ..Default::default()
+            },
+            0,
+            vec![],
+        )
+        .await?;
+        let join_observed = Arc::new(tokio::sync::Notify::new());
+        let (finish_entry, done) = tokio::sync::watch::channel(false);
+        let router = Router::builder(entry.endpoint.clone())
+            .accept(
+                net::JOIN,
+                HeldJoin {
+                    observed: join_observed.clone(),
+                    done,
+                },
+            )
+            .spawn();
         let result = async {
-            let link = Ticket::new(entry_only(&LocalIdentity::generate().device_id()?), [7; 32])?
-                .encode()?;
+            let link = Ticket::new(entry.share_link()?, [7; 32])?.encode()?;
             for owner in [JoinOwner::Terminal, JoinOwner::Page(capability.capability)] {
                 let (entered, running) = tokio::sync::oneshot::channel();
                 let (release, held) = std::sync::mpsc::channel();
@@ -4295,6 +4340,8 @@ mod tests {
                 assert!(futures_util::poll!(&mut second).is_pending());
                 release.send(())?;
                 assert_eq!(first.await?, NodeJoin::Waiting);
+                tokio::time::timeout(Duration::from_secs(5), join_observed.notified()).await?;
+                let pending = std::fs::read(dir.join("join.json"))?;
                 let task = node
                     .node_join
                     .lock()
@@ -4313,6 +4360,10 @@ mod tests {
                     !task.is_aborted(),
                     "a concurrent request must preserve the first join"
                 );
+                assert!(
+                    std::fs::read(dir.join("join.json"))? == pending,
+                    "a concurrent request must preserve the original commitment"
+                );
                 let current = node.node_join.lock().unwrap().take().context("join")?;
                 assert!(current.owner == JoinOwner::Terminal);
                 current.task.abort();
@@ -4321,7 +4372,10 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         }
         .await;
+        let _ = finish_entry.send(true);
         node.shutdown().await;
+        router.shutdown().await?;
+        entry.close().await;
         drop(node);
         std::fs::remove_dir_all(dir)?;
         result
@@ -4679,33 +4733,43 @@ mod tests {
 
         let mut session = test_session(manager.device_id()?);
         let view = state.project_at(now)?.clone();
+        let approval_at = now - RECOVERY_SKEW_MS / 2;
         let event = GovernanceEvent::unsigned(
             &view,
             &manager.device_id()?,
             GovernanceAction::Approve {
                 checkpoint: checkpoint.hash()?,
-                at_ms: now,
+                at_ms: approval_at,
             },
         )?
         .sign(&manager)?;
-        for action in [
-            GovernanceAction::Approve {
-                checkpoint: "0".repeat(64),
-                at_ms: now,
-            },
-            GovernanceAction::Approve {
-                checkpoint: checkpoint.hash()?,
-                at_ms: now + 30_000,
-            },
-            GovernanceAction::Approve {
-                checkpoint: checkpoint.hash()?,
-                at_ms: now - RECOVERY_SKEW_MS - 1,
-            },
+        for (action, expected_error) in [
+            (
+                GovernanceAction::Approve {
+                    checkpoint: "0".repeat(64),
+                    at_ms: approval_at,
+                },
+                NO_RECOVERY_WAITING,
+            ),
+            (
+                GovernanceAction::Approve {
+                    checkpoint: checkpoint.hash()?,
+                    at_ms: now + 30_000,
+                },
+                "this device's clock is too far from this Node's clock",
+            ),
+            (
+                GovernanceAction::Approve {
+                    checkpoint: checkpoint.hash()?,
+                    at_ms: now - RECOVERY_SKEW_MS - RECOVERY_SKEW_MS / 2,
+                },
+                "this device's clock is too far from this Node's clock",
+            ),
         ] {
             let mut invalid = event.clone();
             invalid.action = action;
             let invalid = invalid.sign(&manager)?;
-            assert!(
+            assert_eq!(
                 dispatch(
                     &node,
                     &mut session,
@@ -4713,7 +4777,9 @@ mod tests {
                     json!({"event":invalid})
                 )
                 .await
-                .is_err()
+                .unwrap_err()
+                .to_string(),
+                expected_error
             );
             assert_eq!(node.membership_state().await?.events.len(), 0);
             assert_eq!(node.membership_state().await?.project()?.epoch, 1);
@@ -4738,6 +4804,9 @@ mod tests {
         .await?;
         assert_eq!(first["view"]["epoch"], 2);
         assert!(first["view"]["pending"].is_null());
+        let approved: NetworkState = serde_json::from_value(first["state"].clone())?;
+        assert_eq!(approved.project_at(approval_at - 1)?.epoch, 1);
+        assert_eq!(approved.project_at(approval_at)?.epoch, 2);
         let events = node.membership_state().await?.events;
         assert_eq!(events.len(), 1);
 
@@ -4759,6 +4828,38 @@ mod tests {
     async fn identity_rpcs_admit_exactly_the_confirmed_device_over_the_gateway() -> Result<()> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         use vibeface_secure::join::{INVITE_DOMAIN, invite_hash};
+
+        const PREVIOUS_RECOVERY_SINCE_MS: i64 = 1;
+
+        async fn set_old_recovery_date(node: &Runtime) -> Result<()> {
+            let recovery_key = node.membership_state().await?.project()?.recovery_key;
+            node.store
+                .call("identity_fixture.old_recovery_date", move |store| {
+                    assert!(store.recovery_since_ms(&recovery_key)?.is_some());
+                    let changed = store.connection.execute(
+                        "UPDATE identity_meta SET value=? WHERE key='recovery_since'",
+                        [format!("{recovery_key}:{PREVIOUS_RECOVERY_SINCE_MS}")],
+                    )?;
+                    assert_eq!(changed, 1);
+                    assert_eq!(
+                        store.recovery_since_ms(&recovery_key)?,
+                        Some(PREVIOUS_RECOVERY_SINCE_MS)
+                    );
+                    Ok(())
+                })
+                .await
+        }
+
+        fn assert_fresh_recovery_date(response: &Value) {
+            let since = response["recovery_since_ms"]
+                .as_i64()
+                .expect("a changed recovery key has a display date");
+            let now = response["now_ms"]
+                .as_i64()
+                .expect("the Node reports its current time");
+            assert!(since > PREVIOUS_RECOVERY_SINCE_MS);
+            assert!(since.abs_diff(now) <= RECOVERY_SKEW_MS);
+        }
 
         // Keep request arguments and identity material out of diagnostics. Peer labels and
         // committed authority are enough to locate an admission/dispatch/delivery stall.
@@ -5093,8 +5194,8 @@ mod tests {
             let backdated = RootCheckpoint::recovery(&before, &root, &next.device_id()?, members.clone(), vec![], 0)?;
             let dropped = RootCheckpoint::recovery(&before, &root, &next.device_id()?, vec![Member::client(&replacement, "new laptop", true)?], vec![], now)?;
             let mut recovering = connect("replacement-root-recovery", replacement.clone()).await?;
-            let expires = crate::runtime::now_ms() + 60_000;
             let read_with = |signer: &LocalIdentity, checkpoints: &[&RootCheckpoint]| -> Result<Value> {
+                let expires = crate::runtime::now_ms() + 60_000;
                 let payload = format!(r#"{{"device_id":"{}","expires_at_ms":{expires},"network_id":"{network}"}}"#, replacement.device_id()?);
                 Ok(json!({"expires_at_ms":expires,"signature":signer.sign_payload(RECOVERY_READ_DOMAIN, payload.as_bytes())?,"checkpoints":checkpoints}))
             };
@@ -5105,7 +5206,9 @@ mod tests {
             let refused = |error: anyhow::Error, reason: &str| assert!(format!("{error:#}").contains(reason), "{error:#}");
             assert!(recovering.call("recover", submit(vec![&dropped])).await.is_err());
             refused(recovering.call("recover", submit(vec![&backdated])).await.unwrap_err(), RECOVERY_TOO_OLD);
+            set_old_recovery_date(&node).await?;
             let first_since = manager.call("authenticate", json!({})).await?["recovery_since_ms"].clone();
+            assert_eq!(first_since, PREVIOUS_RECOVERY_SINCE_MS);
             let waiting = recovering.call("recover", submit(vec![&checkpoint])).await?;
             assert_eq!(manager.push().await?, json!({"type":"changed"}), "a waiting recovery reaches open manager pages at once");
             assert_eq!((&waiting["principal"], &waiting["recovery"]["status"]), (&Value::Null, &json!("waiting")));
@@ -5144,13 +5247,12 @@ mod tests {
 
             let (next, stopped) = (LocalIdentity::generate(), node.membership_state().await.context("identity gateway: read authoritative membership")?);
             let effective = RootCheckpoint::recovery(&stopped, &root, &next.device_id()?, members, vec![], 0)?;
-            let started = crate::runtime::now_ms();
             let mut state = stopped.clone();
             state.recover(effective.clone())?;
             node.install_membership(state).await.context("identity gateway: install fixture effective recovery")?;
             let recovered = recovering.call("authenticate", json!({})).await?;
             assert_eq!((&recovered["principal"]["can_manage"], &recovered["principal"]["epoch"]), (&json!(true), &json!(3)));
-            assert!(recovered["recovery_since_ms"].as_i64() >= Some(started), "a new recovery key restarts the date");
+            assert_fresh_recovery_date(&recovered);
             let chain = [&checkpoint, &effective];
             refused(recovering.call("recovery_state", read_with(&root, &chain)?).await.unwrap_err(), vibeface_secure::membership::SUPERSEDED);
             let after = node.membership_state().await.context("identity gateway: read authoritative membership")?;
@@ -5162,11 +5264,16 @@ mod tests {
             let read_next = recovering.call("recovery_state", read_with(&next, &chain)?).await?;
             assert_eq!(read_next["state"]["checkpoints"][1], serde_json::to_value(&effective)?);
             let rotated = RootCheckpoint::rotation(&after, &next, &LocalIdentity::generate().device_id()?, now)?;
-            let started = crate::runtime::now_ms();
+            set_old_recovery_date(&node).await?;
+            assert_eq!(recovering.call("directory", json!({})).await?["recovery_since_ms"], PREVIOUS_RECOVERY_SINCE_MS);
             // The veto that let the root sign again is this Node's own history; the file need not carry it here.
-            recovering.call("recover", submit(vec![&checkpoint, &effective, &rotated])).await?;
-            recovering.call("recover", carrying(vec![&checkpoint, &effective, &rotated])).await?;
-            assert!(recovering.call("directory", json!({})).await?["recovery_since_ms"].as_i64() >= Some(started), "a rotation restarts the date");
+            let first_rotation = recovering.call("recover", submit(vec![&checkpoint, &effective, &rotated])).await?;
+            assert_fresh_recovery_date(&first_rotation);
+            let second_rotation = recovering.call("recover", carrying(vec![&checkpoint, &effective, &rotated])).await?;
+            assert_eq!(second_rotation["recovery_since_ms"], first_rotation["recovery_since_ms"]);
+            let directory = recovering.call("directory", json!({})).await?;
+            assert_fresh_recovery_date(&directory);
+            assert_eq!(directory["recovery_since_ms"], first_rotation["recovery_since_ms"]);
             assert_eq!(node.membership_state().await.context("identity gateway: read authoritative membership")?.project()?.recovery_key, rotated.recovery_key);
             assert!(recovering.call("recovery_state", read(&next)?).await.is_err(), "a rotation supersedes the file too");
 
