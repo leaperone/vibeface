@@ -73,6 +73,57 @@ test('scoped workspace reads retain sibling tasks without claiming complete glob
   assert.equal(stale.coverage.truncated, true)
 })
 
+test('channel and task merges compare against all loaded revisions and preserve duplicate positions', () => {
+  const snapshot = (rows: { id: string; revision: number; title: string }[]) => parseWorkspaceState({
+    channels: rows.map(({ id, revision, title }) => ({ channel_id: id, revision, title, purpose: '', members: [], coordinator_bot: 'bot', coordinator_node: 'node', owner_epoch: 1, event_hash: title, created_at_ms: 1 })),
+    tasks: rows.map(({ id, revision, title }) => ({ task_id: id, revision, title, root_task_id: id, owner_bot: 'bot', request: '', expected_result: '', source_events: [], dependencies: [], reply_only: false, action: 'continue', request_event: 'request', event_hash: title, created_at_ms: 1, updated_at_ms: 1, state: 'cancelled' })),
+    assignments: [], inputs: [], coverage: { limit: 20, truncated: false },
+  })
+  const current = snapshot([
+    { id: 'keep', revision: 2, title: 'untouched' },
+    { id: 'duplicate', revision: 5, title: 'old-high' },
+    { id: 'duplicate', revision: 2, title: 'old-low' },
+    { id: 'stale', revision: 2, title: 'stale-low' },
+    { id: 'stale', revision: 7, title: 'stale-high' },
+  ])
+  const changed = snapshot([
+    { id: 'duplicate', revision: 3, title: 'rejected' },
+    { id: 'duplicate', revision: 5, title: 'first-accepted' },
+    { id: 'duplicate', revision: 9, title: 'later-accepted' },
+    { id: 'new', revision: 9, title: 'new-first' },
+    { id: 'new', revision: 1, title: 'new-second' },
+    { id: 'stale', revision: 6, title: 'also-rejected' },
+  ])
+  const merged = mergeWorkspaceState(current, changed)
+  const expected = [
+    ['keep', 2, 'untouched'], ['duplicate', 5, 'first-accepted'], ['duplicate', 5, 'first-accepted'],
+    ['stale', 2, 'stale-low'], ['stale', 7, 'stale-high'], ['new', 9, 'new-first'], ['new', 1, 'new-second'],
+  ]
+  assert.deepEqual(merged.channels.map((item) => [item.channel_id, item.revision, item.title]), expected)
+  assert.deepEqual(merged.tasks.map((item) => [item.task_id, item.revision, item.title]), expected)
+  assert.deepEqual(current.tasks.map((item) => item.title), ['untouched', 'old-high', 'old-low', 'stale-low', 'stale-high'])
+  assert.deepEqual(mergeWorkspaceState(merged, snapshot([])), merged, 'omitted rows, including cancelled tasks, are retained')
+  assert.deepEqual(mergeWorkspaceState(null, changed).channels.map((item) => item.title), ['rejected', 'first-accepted', 'later-accepted', 'new-first', 'new-second', 'also-rejected'])
+})
+
+test('assignments and queued inputs replace every existing duplicate with the first incoming row', () => {
+  const snapshot = (rows: { id: string; label: string; cancelled: boolean }[]) => parseWorkspaceState({
+    channels: [], tasks: [], coverage: { limit: 20, truncated: false },
+    assignments: rows.map(({ id, label }) => ({ assignment_id: id, task_id: 'task', started_revision: 1, bot_id: 'bot', execution_node: 'node', bot_owner_epoch: 1, basis: {}, resource_roots: [], automatic: false, state: 'stopped', event_hash: label, created_at_ms: 1 })),
+    inputs: rows.map(({ id, label, cancelled }) => ({ input: { message_id: id, target: { kind: 'task', task_id: 'task' }, intent: 'continue', sequence: 1, text: label, report_results: true }, conversation_id: 'chat', source_event: label, control_event: label, effective_order: 1, deferred: false, cancelled })),
+  })
+  const current = snapshot([{ id: 'same', label: 'old-first', cancelled: false }, { id: 'keep', label: 'untouched', cancelled: false }, { id: 'same', label: 'old-last', cancelled: false }])
+  const changed = snapshot([{ id: 'new', label: 'new-first', cancelled: false }, { id: 'same', label: 'first-update', cancelled: true }, { id: 'new', label: 'new-last', cancelled: true }, { id: 'same', label: 'ignored-update', cancelled: false }])
+  const merged = mergeWorkspaceState(current, changed)
+  assert.deepEqual(merged.assignments.map((item) => [item.assignment_id, item.event_hash]), [
+    ['same', 'first-update'], ['keep', 'untouched'], ['same', 'first-update'], ['new', 'new-first'], ['new', 'new-last'],
+  ])
+  assert.deepEqual(merged.inputs.map((item) => [item.input.message_id, item.input.text, item.cancelled]), [
+    ['same', 'first-update', true], ['keep', 'untouched', false], ['same', 'first-update', true], ['new', 'new-first', false], ['new', 'new-last', true],
+  ])
+  assert.deepEqual(mergeWorkspaceState(merged, snapshot([])), merged)
+})
+
 test('an Assignment result declaration does not become a verified completed result', () => {
   const assignment = { assignment_id: 'assignment', task_id: 'task', started_revision: 1, bot_id: 'bot', execution_node: 'node', bot_owner_epoch: 1, basis: { author: 4 }, resource_roots: ['/project'], automatic: false, accepted_revision: 1, adopted_revision: 1, completed_revision: null, trigger_message_id: 'input', source_event: 'source', submitted_result: { revision: 2, text: 'Agent声明已完成', event_hash: 'declared-result' }, state: 'adopted', result: null, event_hash: 'assignment-event', created_at_ms: 1 }
   const state = parseWorkspaceState({ channels: [], tasks: [], assignments: [assignment], inputs: [], coverage: { limit: 20, truncated: false } })
@@ -171,6 +222,26 @@ test("a bounded push merges exact rows and retains loaded metadata until the sna
   assert.equal(next.questions, shown.questions)
   assert.equal(next.bot_settings, shown.bot_settings)
   assert.equal(mergeConversation(next, records({ messages: [message('m2', 2)] })).messages.length, 3)
+})
+
+test('pushed records retain duplicate rows with first-update precedence and shared message rank order', () => {
+  const current = { ...shown, deliveries: [],
+    messages: records({ messages: [message('same', 3), message('keep', 2), message('same', 4)] }).messages,
+    works: records({ works: [work('same', { summary: 'old-first' }), work('keep'), work('same', { summary: 'old-last' })] }).works,
+  }
+  const changed = records({
+    messages: [{ ...message('same', 5), text: 'first-update' }, { ...message('same', 1), text: 'ignored-update' }, { ...message('new', 6), text: 'new-first' }, { ...message('new', 1), text: 'new-last' }],
+    works: [work('same', { summary: 'first-update' }), work('same', { summary: 'ignored-update' }), work('new', { summary: 'new-first' }), work('new', { summary: 'new-last' })],
+  })
+  const merged = mergeConversation(current, changed)
+  assert.deepEqual(merged.messages.map((item) => [item.message_id, item.text]), [
+    ['new', 'new-last'], ['keep', 'keep'], ['same', 'first-update'], ['same', 'first-update'], ['new', 'new-first'],
+  ])
+  assert.deepEqual(merged.works.map((item) => [item.work_id, item.summary]), [
+    ['same', 'first-update'], ['keep', ''], ['same', 'first-update'], ['new', 'new-first'], ['new', 'new-last'],
+  ])
+  assert.deepEqual(mergeConversation(merged, records()), merged)
+  assert.deepEqual(current.messages.map((item) => item.rank), [rank(3), rank(2), rank(4)])
 })
 
 test("context state and queue reasons survive records without replacing a remote owner's context", () => {

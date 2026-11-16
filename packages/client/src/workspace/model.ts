@@ -1197,7 +1197,8 @@ function scheduleView(value: unknown) {
 }
 export function mergeOwnerJobs<T extends { trigger: string }>(local: T[], remote: T[], reachable: boolean): T[] {
   const preferred = reachable ? remote : local, other = reachable ? local : remote
-  return [...preferred, ...other.filter((job) => !preferred.some((known) => known.trigger === job.trigger))]
+  const preferredTriggers = new Set(preferred.map((job) => job.trigger))
+  return [...preferred, ...other.filter((job) => !preferredTriggers.has(job.trigger))]
 }
 
 function conversationMemoryConflicts(value: unknown): ConversationMemoryConflict[] | null {
