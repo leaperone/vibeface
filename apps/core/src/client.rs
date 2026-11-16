@@ -1032,11 +1032,9 @@ async fn dispatch_inner(
             let watched_scope = (params["method"] == "conversation")
                 .then(|| params["conversation_id"].as_str().map(String::from))
                 .flatten();
-            let access = Access {
+            let access = Access::User {
                 network_id: principal.network_id,
-                human: true,
-                conversation_id: None,
-                manager: None,
+                scope: crate::runtime::UserScope::Network,
             };
             let mut result = node.rpc(access.clone(), params).await?;
             if let Some(scope) = watched_scope {
@@ -2474,7 +2472,7 @@ async fn receive_value(socket: &mut ClientSocket, channel: &mut Channel) -> Resu
 mod tests {
     use super::*;
     use crate::identity::{Genesis, Member, Revocation};
-    use crate::runtime::test_support::{access as test_access, initialize_node, manager_settings};
+    use crate::runtime::test_support::{initialize_node, manager_settings};
 
     fn test_session(device_id: String) -> Session {
         Session {
@@ -3490,7 +3488,13 @@ mod tests {
         );
         assert!(node.info().get("manager_available").is_none());
         let nodes = node
-            .rpc(test_access(network, true, None), json!({"method":"nodes"}))
+            .rpc(
+                Access::User {
+                    network_id: network,
+                    scope: crate::runtime::UserScope::Network,
+                },
+                json!({"method":"nodes"}),
+            )
             .await?;
         assert_eq!(
             nodes["nodes"][0]["capabilities"]["roots"],
@@ -3884,7 +3888,13 @@ mod tests {
                 .all(|row| row["name"] != "FIXTURE_CODEX_KEY")
         );
         let nodes = node
-            .rpc(test_access(network, true, None), json!({"method":"nodes"}))
+            .rpc(
+                Access::User {
+                    network_id: network,
+                    scope: crate::runtime::UserScope::Network,
+                },
+                json!({"method":"nodes"}),
+            )
             .await?;
         assert_eq!(nodes["nodes"][0]["capabilities"]["codex"]["enabled"], false);
         let moved = dispatch(

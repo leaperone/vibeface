@@ -727,11 +727,9 @@ impl Runtime {
                     "management control requires the user"
                 );
                 let scope = field(input, "conversation_id")?;
-                let access = Access {
+                let access = Access::User {
                     network_id: network.into(),
-                    human: true,
-                    conversation_id: Some(scope.into()),
-                    manager: None,
+                    scope: crate::runtime::UserScope::Conversation(scope.into()),
                 };
                 if kind == "resolve" {
                     return self.resolve_check(&access, input).await;
@@ -2921,7 +2919,7 @@ pub(super) fn staging_room(dir: &Path, size: u64) -> Result<()> {
 mod tests {
     use super::*;
     use crate::runtime::test_support::{
-        access as test_access, initialize_node, manager_settings, provider_work, signed_main_input,
+        initialize_node, manager_settings, provider_work, signed_main_input,
     };
 
     use crate::{config, crypto::LocalIdentity};
@@ -3249,7 +3247,7 @@ mod tests {
             }?;
             a.sync_peer(&network, &target_id).await?;
             ready_member_rpc(&a, &network, &target_id).await?;
-            let access = test_access(network.clone(), true, Some("c".into()));
+            let access = crate::runtime::Access::User { network_id: network.clone(), scope: crate::runtime::UserScope::Conversation("c".into()) };
             let choice = |work_id: &str| -> Result<Value> {
                 let signed = entry.fixture_admin().attest(&network, "c", EventBody::WorkFinished {
                     work_id: work_id.into(), outcome: WorkOutcome::Completed, result_text: "checked".into(),
@@ -6467,7 +6465,10 @@ mod tests {
             ));
             a.net()?.learn(&b.net()?.addr()).await;
             let peer = ib.device_id()?;
-            let access = test_access(network.clone(), true, None);
+            let access = crate::runtime::Access::User {
+                network_id: network.clone(),
+                scope: crate::runtime::UserScope::Network,
+            };
             let listed = |nodes: Value| {
                 nodes["nodes"]
                     .as_array()
@@ -6623,7 +6624,10 @@ mod tests {
         let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
         let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
         let peer = ib.device_id()?;
-        let access = test_access(ia.fixture_network_id()?, true, None);
+        let access = crate::runtime::Access::User {
+            network_id: ia.fixture_network_id()?,
+            scope: crate::runtime::UserScope::Network,
+        };
         let listed = |nodes: Value| {
             nodes["nodes"]
                 .as_array()

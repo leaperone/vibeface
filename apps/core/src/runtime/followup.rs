@@ -9,9 +9,9 @@ impl Runtime {
         scope: &str,
         args: &Value,
     ) -> Result<Value> {
-        ensure!(access.human, "only the user moves a conversation");
+        ensure!(access.is_user(), "only the user moves a conversation");
         self.require_scope(access, scope).await?;
-        let network = &access.network_id;
+        let network = access.network_id();
         let owner = id(args, "scheduler_node")?;
         let epoch = args["epoch"].as_u64().context("epoch is required")?;
         let current = {

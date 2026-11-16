@@ -14,7 +14,7 @@ use crate::{
         Bot, Context, Event, EventBody, HashedEvent, MAX_INSTRUCTIONS_BYTES,
         MAX_SCHEDULE_PROMPT_BYTES, OpenWork, Role, ScheduleEntry, VersionVector, WorkProjection,
     },
-    runtime::{Access, Changed, Runtime},
+    runtime::{Changed, Runtime},
     scheduling::{
         JobOutcome, JobState, SchedulerJob, SessionConfig, SessionKey, SessionScope, Shown,
         TriggerKind, TurnExecution, TurnRuntime,
@@ -608,20 +608,20 @@ pub(crate) async fn session_configuration(
 /// Invocation only consumes durable admissions; imported history never creates runnable jobs.
 pub async fn run(
     node: Arc<Runtime>,
-    access: Access,
+    network: String,
     conversation: String,
     scope: SessionScope,
 ) -> Result<Option<Value>> {
     use tracing::Instrument as _;
     let span = tracing::info_span!("agent_turn", conversation_id = %conversation, work_id = tracing::field::Empty);
-    turn(node, access, conversation, scope)
+    turn(node, network, conversation, scope)
         .instrument(span)
         .await
 }
 
 async fn turn(
     node: Arc<Runtime>,
-    access: Access,
+    network: String,
     conversation: String,
     scope: SessionScope,
 ) -> Result<Option<Value>> {
@@ -629,14 +629,6 @@ async fn turn(
     if !node.writable() {
         return Ok(None);
     }
-    ensure!(
-        access
-            .conversation_id
-            .as_ref()
-            .is_none_or(|id| id == &conversation),
-        "conversation access denied"
-    );
-    let network = access.network_id.clone();
     if let Some(job) = node
         .finish_incompatible_tasks(&network, Some(&conversation))
         .await?
@@ -645,7 +637,7 @@ async fn turn(
     {
         return Ok(Some(invocation_value(&job, &network)));
     }
-    let Some(mut turn) = turn::TurnAttempt::claim(node, access, conversation, scope).await? else {
+    let Some(mut turn) = turn::TurnAttempt::claim(node, network, conversation, scope).await? else {
         return Ok(None);
     };
     let execution = std::panic::AssertUnwindSafe(turn.execute())

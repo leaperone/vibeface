@@ -1,4 +1,4 @@
-use super::{Access, Changed, Runtime, now_ms};
+use super::{Access, AgentAccess, Changed, Runtime, now_ms};
 use crate::model::{WorkKind, WorkOutcome, WorkProjection};
 use crate::scheduling::{JobOutcome, JobState, PendingCheck, SchedulerJob, TriggerKind};
 use crate::work::{Probe, WorkState};
@@ -15,17 +15,37 @@ use vibeface_bridge::{
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ManagerAccess {
-    pub attempt_id: String,
-    pub trigger: String,
-    pub permission_version: u64,
+pub struct RegisteredInvocation {
+    network_id: String,
+    conversation_id: String,
+    attempt_id: String,
+    trigger: String,
+    permission_version: u64,
+}
+
+impl RegisteredInvocation {
+    pub fn network_id(&self) -> &str {
+        &self.network_id
+    }
+    pub fn conversation_id(&self) -> &str {
+        &self.conversation_id
+    }
+    pub fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+    pub fn trigger(&self) -> &str {
+        &self.trigger
+    }
+    pub fn permission_version(&self) -> u64 {
+        self.permission_version
+    }
 }
 
 /// How long a stop waits for the conversation's owner, which first drains the reply's tools.
 const OWNER_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(crate) struct ActiveManager {
-    pub(super) access: Access,
+    pub(super) access: RegisteredInvocation,
     /// The provider the reply runs on, whatever the device switched to since.
     pub(super) provider: crate::providers::Provider,
     pub(super) token: String,
@@ -83,10 +103,15 @@ impl Runtime {
         Ok(ended)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Registration validates the target, attempt, token, provider and captured permission epoch together"
+    )]
     pub async fn register_manager_attempt(
         &self,
         token: String,
-        mut access: Access,
+        network: &str,
+        scope: &str,
         attempt_id: &str,
         trigger: &str,
         provider: crate::providers::Provider,
@@ -101,10 +126,6 @@ impl Runtime {
         if let Some(active) = controls.get(attempt_id) {
             return Ok(active.cancel.subscribe());
         }
-        let scope = access
-            .conversation_id
-            .as_deref()
-            .context("missing manager scope")?;
         let job = {
             let arg0 = (scope).to_owned();
             let arg1 = (trigger).to_owned();
@@ -117,11 +138,13 @@ impl Runtime {
         .context("manager job missing")?;
         let attempt = job.state.attempt().context("manager attempt missing")?;
         ensure!(attempt.id == attempt_id, "manager attempt mismatch");
-        access.manager = Some(ManagerAccess {
+        let access = RegisteredInvocation {
+            network_id: network.into(),
+            conversation_id: scope.into(),
             attempt_id: attempt_id.into(),
             trigger: trigger.into(),
             permission_version: attempt.permission_version,
-        });
+        };
         {
             let identity = self.identity.clone();
             let access = access.clone();
@@ -170,7 +193,10 @@ impl Runtime {
             fenced: AtomicBool::new(false),
             admission: Arc::new(RwLock::new(())),
         });
-        self.agent_tokens.lock().await.insert(token, access);
+        self.agent_tokens
+            .lock()
+            .await
+            .insert(token, AgentAccess::Invocation(access));
         controls.insert(attempt_id.into(), active);
         Ok(receiver)
     }
@@ -179,14 +205,15 @@ impl Runtime {
     pub(crate) async fn register_manager_attempt_fixture(
         &self,
         token: String,
-        access: Access,
+        access: AgentAccess,
         attempt_id: &str,
         trigger: &str,
         provider: crate::providers::Provider,
     ) -> Result<watch::Receiver<bool>> {
         self.register_manager_attempt(
             token,
-            access,
+            access.network_id(),
+            access.conversation_id(),
             attempt_id,
             trigger,
             provider,
@@ -199,11 +226,11 @@ impl Runtime {
     pub(crate) async fn manager_access_fixture(
         &self,
         token: &str,
-        access: Access,
+        access: AgentAccess,
         attempt_id: &str,
         trigger: &str,
         provider: crate::providers::Provider,
-    ) -> Result<Access> {
+    ) -> Result<AgentAccess> {
         self.register_manager_attempt_fixture(token.into(), access, attempt_id, trigger, provider)
             .await?;
         self.agent_tokens
@@ -252,21 +279,15 @@ impl Runtime {
                 );
                 let local = identity.device_id()?;
                 Self::check_manager_permission(store, &local, &access)?;
-                let manager = access
-                    .manager
-                    .as_ref()
-                    .context("manager metadata missing")?;
-                let scope = access
-                    .conversation_id
-                    .as_deref()
-                    .context("manager scope missing")?;
+                let manager = &access;
+                let scope = access.conversation_id();
                 let job = store
                     .scheduler_job(scope, &manager.trigger)?
                     .context("manager job missing")?;
                 if let Some(assignment) =
                     crate::store::workspace::workspace_assignment_for_job_from(
                         &store.connection,
-                        &access.network_id,
+                        access.network_id(),
                         &local,
                         &job,
                     )?
@@ -300,18 +321,9 @@ impl Runtime {
         if let Some(active) = active {
             active.fenced.store(true, Ordering::Release);
             self.revoke_tool_token(&active.token).await;
-            let manager = active
-                .access
-                .manager
-                .as_ref()
-                .context("manager metadata missing")?;
+            let manager = &active.access;
             {
-                let arg0 = (active
-                    .access
-                    .conversation_id
-                    .as_deref()
-                    .context("manager scope missing")?)
-                .to_owned();
+                let arg0 = (active.access.conversation_id()).to_owned();
                 let arg1 = (manager.trigger).to_owned();
                 let arg2 = (manager.attempt_id).to_owned();
                 let arg3 = manager.permission_version;
@@ -345,16 +357,13 @@ impl Runtime {
 
     pub(super) async fn manager_tool_lease(
         &self,
-        access: &Access,
-    ) -> Result<Option<OwnedRwLockReadGuard<()>>> {
-        let Some(manager) = &access.manager else {
-            return Ok(None);
-        };
+        invocation: &RegisteredInvocation,
+    ) -> Result<OwnedRwLockReadGuard<()>> {
         let active = self
             .manager_controls
             .lock()
             .await
-            .get(&manager.attempt_id)
+            .get(invocation.attempt_id())
             .cloned()
             .context("management invocation is no longer active")?;
         let guard = active.admission.clone().read_owned().await;
@@ -363,13 +372,10 @@ impl Runtime {
             "management invocation has been stopped"
         );
         ensure!(
-            active.access.network_id == access.network_id
-                && active.access.conversation_id == access.conversation_id
-                && active.access.manager.as_ref() == Some(manager),
+            active.access == *invocation,
             "management invocation scope mismatch"
         );
-        let access = access.clone();
-        let manager = manager.clone();
+        let invocation = invocation.clone();
         let identity = self.identity.clone();
         let write_state = self.write_state.clone();
         self.store
@@ -378,41 +384,31 @@ impl Runtime {
                     *write_state.borrow() == super::WriteState::Writable,
                     "Node execution authority is unavailable"
                 );
-                Self::check_manager_permission(store, &identity.device_id()?, &access)?;
+                Self::check_manager_permission(store, &identity.device_id()?, &invocation)?;
                 store.record_manager_tool_call(
-                    access
-                        .conversation_id
-                        .as_deref()
-                        .context("missing manager scope")?,
-                    &manager.trigger,
-                    &manager.attempt_id,
+                    invocation.conversation_id(),
+                    invocation.trigger(),
+                    invocation.attempt_id(),
                 )?;
                 Ok(())
             })
             .await?;
-        Ok(Some(guard))
+        Ok(guard)
     }
 
     pub(super) fn check_manager_permission(
         store: &crate::store::Store,
         local: &str,
-        access: &Access,
+        invocation: &RegisteredInvocation,
     ) -> Result<()> {
-        let Some(manager) = &access.manager else {
-            return Ok(());
-        };
-        let scope = access
-            .conversation_id
-            .as_deref()
-            .context("missing management scope")?;
         ensure!(
             store.manager_attempt_allowed_with_version(
-                &access.network_id,
+                invocation.network_id(),
                 local,
-                scope,
-                &manager.trigger,
-                &manager.attempt_id,
-                manager.permission_version,
+                invocation.conversation_id(),
+                invocation.trigger(),
+                invocation.attempt_id(),
+                invocation.permission_version(),
             )?,
             "management invocation permission is no longer valid"
         );
@@ -422,16 +418,16 @@ impl Runtime {
     /// The user's stop. A reply this Node does not hold is stopped by the conversation's owner;
     /// an unanswered request there is reported unconfirmed and never sent again.
     pub(super) async fn cancel_manager(&self, access: &Access, input: &Value) -> Result<Value> {
-        ensure!(access.human, "only the user stops a management reply");
+        ensure!(access.is_user(), "only the user stops a management reply");
         let scope = super::field(input, "conversation_id")?;
         let trigger = super::field(input, "trigger")?;
         self.require_scope(access, scope).await?;
-        let network = &access.network_id;
+        let network = access.network_id();
         let local = self.identity.device_id()?;
         let remote = {
             let scope = scope.to_owned();
             let trigger = trigger.to_owned();
-            let network = network.clone();
+            let network = network.to_owned();
             let local = local.clone();
             self.store
                 .call("manager_control.cancel_route", move |store| {
@@ -733,11 +729,11 @@ impl Runtime {
         access: &Access,
         input: &Value,
     ) -> Result<Value> {
-        ensure!(access.human, "only the user resolves pending checks");
+        ensure!(access.is_user(), "only the user resolves pending checks");
         let scope = super::field(input, "conversation_id")?;
         let check_id = super::field(input, "check_id")?;
         self.require_scope(access, scope).await?;
-        let network = &access.network_id;
+        let network = access.network_id();
         if let Some(work_id) = check_id.strip_prefix("work:") {
             return self.settle_work_check(network, scope, work_id, input).await;
         }
@@ -906,7 +902,7 @@ impl Runtime {
 #[cfg(all(test, unix))]
 pub(super) mod tests {
     use super::*;
-    use crate::runtime::test_support::{access as test_access, manager_settings};
+    use crate::runtime::test_support::manager_settings;
 
     pub(in crate::runtime) async fn pending_manager(
         node: &Runtime,
@@ -957,9 +953,75 @@ pub(super) mod tests {
                     .into_iter()
                     .find(|check| check.attempt_id == attempt)
                     .context("fixture pending check")?;
-                Ok((test_access(network, true, Some("c".into())), check))
+                Ok((
+                    crate::runtime::Access::User {
+                        network_id: network,
+                        scope: crate::runtime::UserScope::Conversation("c".into()),
+                    },
+                    check,
+                ))
             })
             .await
+    }
+
+    #[tokio::test]
+    async fn duplicate_registration_keeps_original_binding_and_does_not_issue_retry_token()
+    -> Result<()> {
+        let (node, admin, directory) = super::super::test_support::node().await?;
+        let result = async {
+            super::super::test_support::bot(&node, &admin, "c", "Fixture", &[]).await?;
+            let network = node.network_id().await?;
+            let (trigger, attempt) =
+                super::super::test_support::start_reply(&node, &admin, "duplicate").await?;
+            let epoch = node.local_permission_epoch.load(Ordering::Acquire);
+            let original = node
+                .register_manager_attempt(
+                    "original-token".into(),
+                    &network,
+                    "c",
+                    &attempt,
+                    &trigger,
+                    crate::providers::Provider::Codex,
+                    epoch,
+                )
+                .await?;
+            let retry = node
+                .register_manager_attempt(
+                    "retry-token".into(),
+                    "other-network",
+                    "other-conversation",
+                    &attempt,
+                    "other-trigger",
+                    crate::providers::Provider::Pi,
+                    epoch,
+                )
+                .await?;
+            assert!(!*original.borrow());
+            assert!(!*retry.borrow());
+            assert!(node.authorize_bearer("retry-token").await.is_none());
+            let registered = node
+                .authorize_bearer("original-token")
+                .await
+                .context("original bearer")?;
+            let invocation = registered.invocation().context("registered invocation")?;
+            assert_eq!(invocation.network_id(), network);
+            assert_eq!(invocation.conversation_id(), "c");
+            assert_eq!(invocation.attempt_id(), attempt);
+            assert_eq!(invocation.trigger(), trigger);
+            assert_eq!(
+                node.attempt_provider(&attempt).await,
+                Some(crate::providers::Provider::Codex)
+            );
+            node.fence_manager_attempt(&attempt).await?;
+            assert!(*original.borrow());
+            assert!(*retry.borrow());
+            node.finish_manager_attempt(&attempt).await;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop(node);
+        std::fs::remove_dir_all(directory)?;
+        result
     }
 
     #[tokio::test]
@@ -1013,7 +1075,7 @@ pub(super) mod tests {
                 Ok((job, first, attempt))
                             }).await?
             };
-            let _cancel = node.register_manager_attempt_fixture("lease-token".into(), test_access(network.clone(), false, Some("c".into())), &attempt, &job.trigger, crate::providers::Provider::Codex).await?;
+            let _cancel = node.register_manager_attempt_fixture("lease-token".into(), crate::runtime::AgentAccess::ReadOnly { network_id: network.clone(), conversation_id: "c".into() }, &attempt, &job.trigger, crate::providers::Provider::Codex).await?;
             drop(node.manager_input_lease(&attempt, crate::providers::Provider::Codex).await?);
             {
                 let identity = node.identity.clone(); let admin = admin.clone(); let network = network.clone(); let first = first.clone(); let local = local.clone(); let next_root = next_root.clone(); let job = job.clone();

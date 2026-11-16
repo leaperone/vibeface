@@ -967,7 +967,7 @@ mod tests {
             assert!(node.maintenance.enter().is_err());
             let refused = crate::scheduler::run(
                 node.clone(),
-                crate::runtime::test_support::access("test".into(), false, Some("chat".into())),
+                "test".into(),
                 "chat".into(),
                 crate::scheduling::SessionScope::Main,
             )

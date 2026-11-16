@@ -872,7 +872,7 @@ impl Runtime {
 
     /// Access for a tool call. Cursor installs the active attempt bearer on its owner bridge;
     /// the existing authorization and fence checks then decide whether the call is still valid.
-    pub(crate) async fn tool_access(&self, bearer: &str, _agent_id: &str) -> Option<Access> {
+    pub(crate) async fn tool_access(&self, bearer: &str, _agent_id: &str) -> Option<AgentAccess> {
         self.authorize_bearer(bearer).await
     }
 }
@@ -881,8 +881,8 @@ impl Runtime {
 mod tests {
     use super::*;
     use crate::runtime::test_support::{
-        access as test_access, initialize_node, join_network, manager_settings, open_node,
-        provider_work, signed_main_input,
+        initialize_node, join_network, manager_settings, open_node, provider_work,
+        signed_main_input,
     };
     use crate::{
         config::{self, Config},
@@ -890,8 +890,11 @@ mod tests {
     };
     use std::time::Instant;
 
-    fn access(conversation: &str) -> Access {
-        test_access("network".into(), false, Some(conversation.into()))
+    fn access(conversation: &str) -> AgentAccess {
+        crate::runtime::AgentAccess::ReadOnly {
+            network_id: "network".into(),
+            conversation_id: conversation.into(),
+        }
     }
 
     #[tokio::test]
@@ -1020,7 +1023,7 @@ mod tests {
                 .insert(token.into(), access(conversation));
         }
         let conversation =
-            |access: Option<Access>| access.and_then(|access| access.conversation_id);
+            |access: Option<AgentAccess>| access.map(|access| access.conversation_id().to_owned());
 
         assert_eq!(
             conversation(node.tool_access("attempt-a", "agent-a").await).as_deref(),
@@ -1034,7 +1037,7 @@ mod tests {
         assert!(
             node.tool_access("attempt-a", "agent-b")
                 .await
-                .is_some_and(|access| access.conversation_id.as_deref() == Some("conversation-a"))
+                .is_some_and(|access| access.conversation_id() == "conversation-a")
         );
 
         node.revoke_tool_token("attempt-a").await;

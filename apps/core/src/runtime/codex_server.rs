@@ -1688,8 +1688,10 @@ mod tests {
             drop(lease);
             node.codex.retarget(CodexTarget::Off);
             let input = json!({"conversation_id":"c","check_id":check.check_id});
-            let mut agent = access.clone();
-            agent.human = false;
+            let agent = Access::Agent(AgentAccess::ReadOnly {
+                network_id: access.network_id().into(),
+                conversation_id: "c".into(),
+            });
             assert!(node.resolve_check(&agent, &input).await.is_err());
             assert!(node.resolve_check(&access, &input).await.is_err());
             assert_eq!(

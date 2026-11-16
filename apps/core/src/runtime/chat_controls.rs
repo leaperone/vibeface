@@ -36,12 +36,12 @@ fn artifact_page(hash: &str, bytes: &[u8], offset: u64, limit: u64) -> Result<Va
 
 impl Runtime {
     pub(super) async fn work_detail(&self, access: &Access, input: &Value) -> Result<Value> {
-        ensure!(access.human, "work detail access requires the user");
+        ensure!(access.is_user(), "work detail access requires the user");
         let scope = id(input, "conversation_id")?;
         let work_id = id(input, "work_id")?;
         self.require_scope(access, &scope).await?;
         let (work, target, sources) = {
-            let network = access.network_id.clone();
+            let network = access.network_id().to_owned();
             self.store
                 .call("chat_controls.work_detail", move |store| {
                     let work = store.work(&network, &work_id)?.context("work not found")?;
@@ -66,15 +66,15 @@ impl Runtime {
             return self.require_scope(access, scope).await;
         }
         ensure!(
-            access.human && access.conversation_id.is_none(),
+            access.is_user() && access.conversation_id().is_none(),
             "workspace attachments need the user's personal network access"
         );
         let state = self.membership_state().await?;
         ensure!(
-            state.genesis.network_id == access.network_id,
+            state.genesis.network_id == access.network_id(),
             "wrong personal network"
         );
-        let network = access.network_id.clone();
+        let network = access.network_id().to_owned();
         let local = self.identity.device_id()?;
         self.store
             .call("chat_controls.attachment_scope", move |store| {
@@ -85,7 +85,7 @@ impl Runtime {
     }
 
     pub(super) async fn read_artifact(&self, access: &Access, input: &Value) -> Result<Value> {
-        ensure!(access.human, "artifact access requires the user");
+        ensure!(access.is_user(), "artifact access requires the user");
         let scope = field(input, "conversation_id")?;
         self.require_attachment_scope(access, scope).await?;
         let hash = field(input, "blob_hash")?;
@@ -93,7 +93,7 @@ impl Runtime {
             use base64::Engine as _;
             let offset = input["offset"].as_u64().unwrap_or(0);
             let (size, bytes) = {
-                let network_id = access.network_id.to_owned();
+                let network_id = access.network_id().to_owned();
                 let scope = scope.to_owned();
                 let hash = hash.to_owned();
                 self.store
@@ -109,7 +109,7 @@ impl Runtime {
                 "data":base64::engine::general_purpose::STANDARD.encode(&bytes)}));
         }
         let (_, bytes) = {
-            let network_id = access.network_id.to_owned();
+            let network_id = access.network_id().to_owned();
             let scope = scope.to_owned();
             let hash = hash.to_owned();
             self.store
@@ -131,7 +131,7 @@ impl Runtime {
     pub(super) async fn upload_attachment(&self, access: &Access, input: &Value) -> Result<Value> {
         use base64::Engine as _;
         use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
-        ensure!(access.human, "only the user sends attachments");
+        ensure!(access.is_user(), "only the user sends attachments");
         let scope = field(input, "conversation_id")?;
         self.require_attachment_scope(access, scope).await?;
         let blob = BlobRef {
@@ -251,7 +251,7 @@ impl Runtime {
             |_| Ok(()),
         )
         .await?;
-        let network = &access.network_id;
+        let network = access.network_id();
         let projection = self.scheduler_projection()?;
         let local_manager = self.scheduler_manager_metadata();
         let owner = self.scheduler_owner_observation(network, scope).await?;
@@ -283,7 +283,7 @@ impl Runtime {
             history_starts,
             history_authority,
         ) = {
-            let (network, scope, local) = (network.clone(), scope.to_owned(), local.clone());
+            let (network, scope, local) = (network.to_owned(), scope.to_owned(), local.clone());
             self.read_display(
                 access,
                 input,
@@ -551,7 +551,7 @@ impl Runtime {
         }
         let projection = self.scheduler_projection()?;
         let manager = self.scheduler_manager_metadata();
-        let network = access.network_id.clone();
+        let network = access.network_id().to_owned();
         let page = self
             .read_display(
                 access,
@@ -878,7 +878,7 @@ pub(super) fn open_works(store: &Store, network: &str, scope: Option<&str>) -> R
 #[cfg(test)]
 mod attachment_tests {
     use super::*;
-    use crate::runtime::test_support::{access as test_access, bot, node};
+    use crate::runtime::test_support::{bot, node};
     use crate::workspace::{WORKSPACE_SCOPE, WorkspaceCommand};
     use base64::Engine as _;
 
@@ -889,13 +889,13 @@ mod attachment_tests {
         let result = async {
             bot(&node, &admin, "c", "Channel bot", &[]).await?;
             let network = node.network_id().await?;
-            let access = test_access(network.clone(), true, None);
+            let access = crate::runtime::Access::User { network_id: network.clone(), scope: crate::runtime::UserScope::Network };
             let bytes = b"workspace channel attachment";
             let attachment = Attachment { hash: crate::crypto::digest(bytes), size: bytes.len() as u64, name: "channel.txt".into() };
             let upload = json!({"conversation_id":WORKSPACE_SCOPE,"hash":attachment.hash,"size":bytes.len(),"offset":0,
                 "data":base64::engine::general_purpose::STANDARD.encode(bytes)});
-            for restricted in [test_access(network.clone(), false, None), test_access(network.clone(), false, Some("c".into())),
-                test_access(network.clone(), true, Some("c".into())), test_access("another-network".into(), true, None)] {
+            for restricted in [Access::Agent(AgentAccess::ReadOnly { network_id: network.clone(), conversation_id: WORKSPACE_SCOPE.into() }), Access::Agent(AgentAccess::ReadOnly { network_id: network.clone(), conversation_id: "c".into() }),
+                crate::runtime::Access::User { network_id: network.clone(), scope: crate::runtime::UserScope::Conversation("c".into()) }, crate::runtime::Access::User { network_id: "another-network".into(), scope: crate::runtime::UserScope::Network }] {
                 assert!(node.upload_attachment(&restricted, &upload).await.is_err());
             }
             assert_eq!(node.upload_attachment(&access, &upload).await?, json!({"offset":bytes.len(),"complete":true}));
@@ -916,8 +916,8 @@ mod attachment_tests {
             assert_eq!(base64::engine::general_purpose::STANDARD.decode(reply["data"].as_str().context("binary page")?)?, bytes);
             let text = node.read_artifact(&access, &json!({"conversation_id":WORKSPACE_SCOPE,"blob_hash":attachment.hash})).await?;
             assert_eq!(text["text"], "workspace channel attachment");
-            for restricted in [test_access(network.clone(), false, None), test_access(network.clone(), false, Some("c".into())),
-                test_access(network.clone(), true, Some("c".into())), test_access("another-network".into(), true, None)] {
+            for restricted in [Access::Agent(AgentAccess::ReadOnly { network_id: network.clone(), conversation_id: WORKSPACE_SCOPE.into() }), Access::Agent(AgentAccess::ReadOnly { network_id: network.clone(), conversation_id: "c".into() }),
+                crate::runtime::Access::User { network_id: network.clone(), scope: crate::runtime::UserScope::Conversation("c".into()) }, crate::runtime::Access::User { network_id: "another-network".into(), scope: crate::runtime::UserScope::Network }] {
                 assert!(node.read_artifact(&restricted, &read).await.is_err());
             }
             assert!(node.read_artifact(&access, &json!({"conversation_id":"c","blob_hash":attachment.hash})).await.is_err());
@@ -934,7 +934,7 @@ mod attachment_tests {
 #[cfg(test)]
 mod conversation_history_tests {
     use super::*;
-    use crate::runtime::test_support::{access as test_access, bot, node, signed_main_input};
+    use crate::runtime::test_support::{bot, node, signed_main_input};
     use vibeface_protocol::history::HISTORY_RESPONSE_BYTES;
 
     #[tokio::test]
@@ -943,7 +943,7 @@ mod conversation_history_tests {
         let result = async {
             bot(&node, &admin, "history", "History", &[]).await?;
             let network = node.network_id().await?;
-            let access = test_access(network.clone(), true, None);
+            let access = crate::runtime::Access::User { network_id: network.clone(), scope: crate::runtime::UserScope::Network };
             let bodies = (0..1024).map(|index| signed_main_input(&admin, &network, "history",
                 &format!("message-{index}"), &format!("{index}:{}", "完整消息".repeat(1024)), vec![], index + 1))
                 .collect::<Result<Vec<_>>>()?;
@@ -979,9 +979,9 @@ mod conversation_history_tests {
                 cursor = page["next_cursor"].as_str().map(str::to_owned);
             }
             assert_eq!(serde_json::to_value(all)?, serde_json::to_value(oracle)?);
-            for denied in [test_access("wrong-network".into(), true, None),
-                test_access(network.clone(), false, None),
-                test_access(network.clone(), true, Some("other".into()))] {
+            for denied in [crate::runtime::Access::User { network_id: "wrong-network".into(), scope: crate::runtime::UserScope::Network },
+                Access::Agent(AgentAccess::ReadOnly { network_id: network.clone(), conversation_id: "history".into() }),
+                crate::runtime::Access::User { network_id: network.clone(), scope: crate::runtime::UserScope::Conversation("other".into()) }] {
                 assert!(node.rpc(denied, json!({"method":"conversation_history","conversation_id":"history","section":"messages"})).await.is_err());
             }
             let delete = admin.attest(&network, "history", EventBody::BotDeleted {attestation:None,cause:None})?;
