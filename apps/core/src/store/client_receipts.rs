@@ -14,7 +14,7 @@ impl Store {
         let conversation = original["conversation_id"]
             .as_str()
             .context("original conversation is missing")?;
-        let input: crate::workspace::InputRequest = serde_json::from_value(original.clone())?;
+        let input = crate::workspace::parse_message_input(original)?;
         let attestation: Attestation = serde_json::from_value(original["attestation"].clone())?;
         vibeface_protocol::validate_id(&input.message_id).map_err(anyhow::Error::msg)?;
         ensure!(input.route.sequence > 0, "invalid input sequence");
@@ -364,7 +364,7 @@ mod tests {
         ] {
             let mut changed = original.clone();
             *changed.pointer_mut(path).context("mutation field")? = value;
-            let changed_input: InputRequest = serde_json::from_value(changed.clone())?;
+            let changed_input = crate::workspace::parse_message_input(&changed)?;
             assert!(
                 store
                     .post_workspace_input(&node, &network, changed_input, signature.clone(), 12)
@@ -382,7 +382,7 @@ mod tests {
         }
         let mut changed = original.clone();
         changed["expected_revision"] = json!(1);
-        let changed_input: InputRequest = serde_json::from_value(changed.clone())?;
+        let changed_input = crate::workspace::parse_message_input(&changed)?;
         assert!(
             store
                 .post_workspace_input(&node, &network, changed_input, signature.clone(), 12)
@@ -398,7 +398,7 @@ mod tests {
             .as_array_mut()
             .context("attachments")?
             .swap(0, 1);
-        let reordered_input: InputRequest = serde_json::from_value(reordered.clone())?;
+        let reordered_input = crate::workspace::parse_message_input(&reordered)?;
         assert!(
             store
                 .post_workspace_input(&node, &network, reordered_input, signature, 12)

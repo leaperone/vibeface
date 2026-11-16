@@ -28,6 +28,71 @@ fn write_json(request: Request) -> Value {
 }
 
 #[test]
+fn strict_client_input_literals_use_named_clap_commands() {
+    let cases: Value = serde_json::from_str(include_str!(
+        "../../../../crates/client/tests/fixtures/strict-client-input.json"
+    ))
+    .unwrap();
+    for case in cases.as_array().unwrap() {
+        let id = case["id"].as_str().unwrap();
+        let kind = case["kind"].as_str().unwrap();
+        let command = case["command"].as_str().unwrap();
+        let mut payload = case["document"].clone();
+        payload.as_object_mut().unwrap().remove("type");
+        let payload = payload.to_string();
+        let result = TestCli::try_parse_from(["vibeface", kind, command, "--input", &payload])
+            .unwrap_or_else(|error| panic!("{id}: {error}"))
+            .command
+            .into_request();
+        assert_eq!(result.is_ok(), case["accepted"].as_bool().unwrap(), "{id}");
+        match result {
+            Ok(request) => {
+                let normalized = match (kind, request) {
+                    ("read", Request::Read(request)) => serde_json::to_value(request).unwrap(),
+                    ("write", Request::Write(action)) => serde_json::to_value(action).unwrap(),
+                    _ => panic!("fixture command returned the wrong request kind: {id}"),
+                };
+                assert_eq!(normalized, case["normalized"], "{id}");
+            }
+            Err(error) => {
+                assert_eq!(
+                    format!("{error:#}"),
+                    case["cli_error"].as_str().unwrap(),
+                    "{id}"
+                );
+                assert_eq!(
+                    error.chain().count(),
+                    1,
+                    "input error retained a source: {id}"
+                );
+                if let Some(markers) = case["private_markers"].as_array() {
+                    for marker in markers {
+                        assert!(
+                            !format!("{error:?}").contains(marker.as_str().unwrap()),
+                            "input error exposed a private marker: {id}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        format!(
+            "{:#}",
+            parse(&[
+                "read",
+                "home",
+                "--input",
+                r#"{"type":"PRIVATE_OUTER_TYPE"}"#
+            ])
+            .err()
+            .unwrap()
+        ),
+        "omit the outer type field; the named command selects the operation"
+    );
+}
+
+#[test]
 fn no_input_reads_and_native_history_defaults_are_usable() {
     assert_eq!(
         read_json(parse(&["read", "home"]).unwrap()),
