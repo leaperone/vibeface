@@ -9,7 +9,6 @@ use crate::{
 };
 use gpui_kit::{component::button::Button, *};
 use std::collections::BTreeMap;
-use vibeface_protocol::workspace::WorkspaceCommand;
 
 impl Desktop {
     pub(crate) fn bot_context_header(&self, cx: &mut Context<Self>) -> AnyElement {
