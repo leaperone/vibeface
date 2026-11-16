@@ -4775,6 +4775,38 @@ mod tests {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         use vibeface_secure::join::{INVITE_DOMAIN, invite_hash};
 
+        const PREVIOUS_RECOVERY_SINCE_MS: i64 = 1;
+
+        async fn set_old_recovery_date(node: &Runtime) -> Result<()> {
+            let recovery_key = node.membership_state().await?.project()?.recovery_key;
+            node.store
+                .call("identity_fixture.old_recovery_date", move |store| {
+                    assert!(store.recovery_since_ms(&recovery_key)?.is_some());
+                    let changed = store.connection.execute(
+                        "UPDATE identity_meta SET value=? WHERE key='recovery_since'",
+                        [format!("{recovery_key}:{PREVIOUS_RECOVERY_SINCE_MS}")],
+                    )?;
+                    assert_eq!(changed, 1);
+                    assert_eq!(
+                        store.recovery_since_ms(&recovery_key)?,
+                        Some(PREVIOUS_RECOVERY_SINCE_MS)
+                    );
+                    Ok(())
+                })
+                .await
+        }
+
+        fn assert_fresh_recovery_date(response: &Value) {
+            let since = response["recovery_since_ms"]
+                .as_i64()
+                .expect("a changed recovery key has a display date");
+            let now = response["now_ms"]
+                .as_i64()
+                .expect("the Node reports its current time");
+            assert!(since > PREVIOUS_RECOVERY_SINCE_MS);
+            assert!(since.abs_diff(now) <= RECOVERY_SKEW_MS);
+        }
+
         // Keep request arguments and identity material out of diagnostics. Peer labels and
         // committed authority are enough to locate an admission/dispatch/delivery stall.
         struct IdentityPeer {
@@ -5108,8 +5140,8 @@ mod tests {
             let backdated = RootCheckpoint::recovery(&before, &root, &next.device_id()?, members.clone(), vec![], 0)?;
             let dropped = RootCheckpoint::recovery(&before, &root, &next.device_id()?, vec![Member::client(&replacement, "new laptop", true)?], vec![], now)?;
             let mut recovering = connect("replacement-root-recovery", replacement.clone()).await?;
-            let expires = crate::runtime::now_ms() + 60_000;
             let read_with = |signer: &LocalIdentity, checkpoints: &[&RootCheckpoint]| -> Result<Value> {
+                let expires = crate::runtime::now_ms() + 60_000;
                 let payload = format!(r#"{{"device_id":"{}","expires_at_ms":{expires},"network_id":"{network}"}}"#, replacement.device_id()?);
                 Ok(json!({"expires_at_ms":expires,"signature":signer.sign_payload(RECOVERY_READ_DOMAIN, payload.as_bytes())?,"checkpoints":checkpoints}))
             };
@@ -5120,7 +5152,9 @@ mod tests {
             let refused = |error: anyhow::Error, reason: &str| assert!(format!("{error:#}").contains(reason), "{error:#}");
             assert!(recovering.call("recover", submit(vec![&dropped])).await.is_err());
             refused(recovering.call("recover", submit(vec![&backdated])).await.unwrap_err(), RECOVERY_TOO_OLD);
+            set_old_recovery_date(&node).await?;
             let first_since = manager.call("authenticate", json!({})).await?["recovery_since_ms"].clone();
+            assert_eq!(first_since, PREVIOUS_RECOVERY_SINCE_MS);
             let waiting = recovering.call("recover", submit(vec![&checkpoint])).await?;
             assert_eq!(manager.push().await?, json!({"type":"changed"}), "a waiting recovery reaches open manager pages at once");
             assert_eq!((&waiting["principal"], &waiting["recovery"]["status"]), (&Value::Null, &json!("waiting")));
@@ -5159,13 +5193,12 @@ mod tests {
 
             let (next, stopped) = (LocalIdentity::generate(), node.membership_state().await.context("identity gateway: read authoritative membership")?);
             let effective = RootCheckpoint::recovery(&stopped, &root, &next.device_id()?, members, vec![], 0)?;
-            let started = crate::runtime::now_ms();
             let mut state = stopped.clone();
             state.recover(effective.clone())?;
             node.install_membership(state).await.context("identity gateway: install fixture effective recovery")?;
             let recovered = recovering.call("authenticate", json!({})).await?;
             assert_eq!((&recovered["principal"]["can_manage"], &recovered["principal"]["epoch"]), (&json!(true), &json!(3)));
-            assert!(recovered["recovery_since_ms"].as_i64() >= Some(started), "a new recovery key restarts the date");
+            assert_fresh_recovery_date(&recovered);
             let chain = [&checkpoint, &effective];
             refused(recovering.call("recovery_state", read_with(&root, &chain)?).await.unwrap_err(), vibeface_secure::membership::SUPERSEDED);
             let after = node.membership_state().await.context("identity gateway: read authoritative membership")?;
@@ -5177,11 +5210,16 @@ mod tests {
             let read_next = recovering.call("recovery_state", read_with(&next, &chain)?).await?;
             assert_eq!(read_next["state"]["checkpoints"][1], serde_json::to_value(&effective)?);
             let rotated = RootCheckpoint::rotation(&after, &next, &LocalIdentity::generate().device_id()?, now)?;
-            let started = crate::runtime::now_ms();
+            set_old_recovery_date(&node).await?;
+            assert_eq!(recovering.call("directory", json!({})).await?["recovery_since_ms"], PREVIOUS_RECOVERY_SINCE_MS);
             // The veto that let the root sign again is this Node's own history; the file need not carry it here.
-            recovering.call("recover", submit(vec![&checkpoint, &effective, &rotated])).await?;
-            recovering.call("recover", carrying(vec![&checkpoint, &effective, &rotated])).await?;
-            assert!(recovering.call("directory", json!({})).await?["recovery_since_ms"].as_i64() >= Some(started), "a rotation restarts the date");
+            let first_rotation = recovering.call("recover", submit(vec![&checkpoint, &effective, &rotated])).await?;
+            assert_fresh_recovery_date(&first_rotation);
+            let second_rotation = recovering.call("recover", carrying(vec![&checkpoint, &effective, &rotated])).await?;
+            assert_eq!(second_rotation["recovery_since_ms"], first_rotation["recovery_since_ms"]);
+            let directory = recovering.call("directory", json!({})).await?;
+            assert_fresh_recovery_date(&directory);
+            assert_eq!(directory["recovery_since_ms"], first_rotation["recovery_since_ms"]);
             assert_eq!(node.membership_state().await.context("identity gateway: read authoritative membership")?.project()?.recovery_key, rotated.recovery_key);
             assert!(recovering.call("recovery_state", read(&next)?).await.is_err(), "a rotation supersedes the file too");
 
