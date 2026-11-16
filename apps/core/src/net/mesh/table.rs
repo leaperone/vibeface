@@ -3,7 +3,7 @@
 //! memory; each change comes back as [`Write`]s the caller hands to [`Store`] later, in a batch
 //! and without holding the table. The relay tables in the same file belong to their callers.
 use super::record::{MeshRecord, SignedMeshRecord};
-use anyhow::{Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use rusqlite::{Connection, OpenFlags, params};
 use std::{
     collections::{HashMap, HashSet},
@@ -21,6 +21,7 @@ pub const KEEP_MS: u64 = 30 * 24 * 3600 * 1000;
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS mesh_records(device_id TEXT PRIMARY KEY, seq INTEGER NOT NULL,
   expires_at INTEGER NOT NULL, first_seen_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
+  admission_order INTEGER NOT NULL UNIQUE CHECK(admission_order > 0),
   reachable TEXT NOT NULL, record TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS mesh_relays(url TEXT PRIMARY KEY, device_id TEXT NOT NULL,
   history INTEGER NOT NULL, latency_ms INTEGER, ip TEXT, last_ok_at INTEGER,
@@ -45,10 +46,16 @@ impl Entry {
     }
 }
 
+struct StoredEntry {
+    entry: Entry,
+    /// Local admission order, independent of record and reception timestamps.
+    admission_order: i64,
+}
+
 /// A change of the table still to be written to `mesh.sqlite3`.
 #[derive(Debug)]
 pub enum Write {
-    Put(Entry),
+    Put { entry: Entry, admission_order: i64 },
     Delete(String),
 }
 
@@ -64,11 +71,20 @@ impl Store {
         let transaction = self.0.transaction()?;
         for write in writes {
             match write {
-                Write::Put(entry) => {
+                Write::Put {
+                    entry,
+                    admission_order,
+                } => {
                     transaction.execute(
-                        "INSERT OR REPLACE INTO mesh_records(device_id, seq, expires_at,
-                           first_seen_at, last_seen_at, reachable, record)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        "INSERT INTO mesh_records(device_id, seq, expires_at,
+                           first_seen_at, last_seen_at, reachable, record, admission_order)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                         ON CONFLICT(device_id) DO UPDATE SET seq = excluded.seq,
+                           expires_at = excluded.expires_at,
+                           first_seen_at = excluded.first_seen_at,
+                           last_seen_at = excluded.last_seen_at,
+                           reachable = excluded.reachable, record = excluded.record,
+                           admission_order = excluded.admission_order",
                         params![
                             entry.record.device_id,
                             entry.record.seq as i64,
@@ -79,6 +95,7 @@ impl Store {
                                 .as_str()
                                 .unwrap_or_default(),
                             serde_json::to_string(&entry.signed)?,
+                            admission_order,
                         ],
                     )?;
                 }
@@ -94,7 +111,8 @@ impl Store {
 }
 
 pub struct Table {
-    entries: HashMap<String, Entry>,
+    entries: HashMap<String, StoredEntry>,
+    last_admission_order: i64,
     own: String,
     network: String,
     capacity: usize,
@@ -106,19 +124,31 @@ pub struct Table {
 impl Table {
     /// Loads the records of `network` seen in the last 30 days; `own` is this Node's device ID.
     pub fn open(path: &Path, own: &str, network: &str, now_ms: u64) -> Result<(Self, Store)> {
-        let db = crate::store::private_file_connection(path)?;
+        let mut db = crate::store::private_file_connection(path)?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
-        db.execute_batch(&format!("PRAGMA journal_mode=WAL;{SCHEMA}"))?;
-        db.execute(
+        let transaction = db.transaction()?;
+        transaction.execute_batch(SCHEMA)?;
+        let (mut entries, stale) = load(&transaction, network)
+            .context("mesh cache records do not have the required format")?;
+        let last_admission_order = entries
+            .values()
+            .map(|entry| entry.admission_order)
+            .max()
+            .unwrap_or(0);
+        let before = now_ms.saturating_sub(KEEP_MS);
+        transaction.execute(
             "DELETE FROM mesh_records WHERE last_seen_at < ?1",
-            [now_ms.saturating_sub(KEEP_MS) as i64],
+            [before as i64],
         )?;
-        let (entries, stale) = load(&db, network)?;
+        entries.retain(|_, entry| entry.entry.last_seen_ms >= before);
         for device in stale {
-            db.execute("DELETE FROM mesh_records WHERE device_id = ?1", [device])?;
+            transaction.execute("DELETE FROM mesh_records WHERE device_id = ?1", [device])?;
         }
+        transaction.commit()?;
+        db.execute_batch("PRAGMA journal_mode=WAL;")?;
         let table = Self {
             entries,
+            last_admission_order,
             own: own.to_owned(),
             network: network.to_owned(),
             capacity: CAPACITY,
@@ -159,7 +189,9 @@ impl Table {
                 continue;
             }
             match self.entries.get(&record.device_id) {
-                Some(entry) if record.seq < entry.record.seq.saturating_add(MIN_INTERVAL_MS) => {
+                Some(entry)
+                    if record.seq < entry.entry.record.seq.saturating_add(MIN_INTERVAL_MS) =>
+                {
                     continue;
                 }
                 None if !self.protected.contains(&record.device_id) && !admit(&record) => {
@@ -187,35 +219,35 @@ impl Table {
     }
 
     pub fn get(&self, device_id: &str) -> Option<&Entry> {
-        self.entries.get(device_id)
+        self.entries.get(device_id).map(|entry| &entry.entry)
     }
 
     /// Every record held, expired ones too.
     pub fn entries(&self) -> impl Iterator<Item = &Entry> {
-        self.entries.values()
+        self.entries.values().map(|entry| &entry.entry)
     }
 
     pub fn online(&self, now_ms: u64) -> impl Iterator<Item = &Entry> {
-        self.entries
-            .values()
-            .filter(move |entry| entry.online(now_ms))
+        self.entries().filter(move |entry| entry.online(now_ms))
     }
 
     /// The records a full table drops for new devices, one 64th of it in one scan: the expired
-    /// ones seen longest ago first, then the ones first seen most recently, so records known for
+    /// ones seen longest ago first, then the ones admitted most recently, so records known for
     /// long outlast a flood of new ones. This Node's own record and protected ones are never
     /// dropped.
     fn victims(&self, now_ms: u64) -> Vec<String> {
         let mut droppable: Vec<((bool, u64), &str)> = self
             .entries
             .values()
-            .filter(|entry| {
+            .filter(|stored| {
+                let entry = &stored.entry;
                 entry.record.device_id != self.own
                     && !self.protected.contains(&entry.record.device_id)
             })
-            .map(|entry| {
+            .map(|stored| {
+                let entry = &stored.entry;
                 let key = if entry.online(now_ms) {
-                    (true, u64::MAX - entry.first_seen_ms)
+                    (true, u64::MAX - stored.admission_order as u64)
                 } else {
                     (false, entry.last_seen_ms)
                 };
@@ -234,7 +266,8 @@ impl Table {
     }
 
     /// Holds `record`, dropping others when the table is full; returns false when the table is
-    /// full of records that stay and `record` is neither this Node's nor protected.
+    /// full of records that stay and `record` is neither this Node's nor protected, or a new
+    /// device would exhaust the persisted admission order.
     fn put(
         &mut self,
         signed: SignedMeshRecord,
@@ -243,7 +276,14 @@ impl Table {
         writes: &mut Vec<Write>,
     ) -> bool {
         let held = self.entries.get(&record.device_id);
-        let first_seen_ms = held.map_or(now_ms, |entry| entry.first_seen_ms);
+        let first_seen_ms = held.map_or(now_ms, |entry| entry.entry.first_seen_ms);
+        let admission_order = match held {
+            Some(entry) => entry.admission_order,
+            None => match self.last_admission_order.checked_add(1) {
+                Some(order) => order,
+                None => return false,
+            },
+        };
         if held.is_none() && self.entries.len() >= self.capacity {
             let victims = self.victims(now_ms);
             if victims.is_empty()
@@ -263,9 +303,18 @@ impl Table {
             first_seen_ms,
             last_seen_ms: now_ms,
         };
-        self.entries
-            .insert(entry.record.device_id.clone(), entry.clone());
-        writes.push(Write::Put(entry));
+        self.entries.insert(
+            entry.record.device_id.clone(),
+            StoredEntry {
+                entry: entry.clone(),
+                admission_order,
+            },
+        );
+        self.last_admission_order = self.last_admission_order.max(admission_order);
+        writes.push(Write::Put {
+            entry,
+            admission_order,
+        });
         true
     }
 }
@@ -286,20 +335,31 @@ pub fn read(path: &Path, network: &str) -> Result<Vec<Entry>> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     db.busy_timeout(std::time::Duration::from_secs(5))?;
-    Ok(load(&db, network)?.0.into_values().collect())
+    Ok(load(&db, network)?
+        .0
+        .into_values()
+        .map(|entry| entry.entry)
+        .collect())
 }
 
 /// The rows of `network`, and the devices whose rows belong elsewhere or no longer parse.
-fn load(db: &Connection, network: &str) -> Result<(HashMap<String, Entry>, Vec<String>)> {
+fn load(db: &Connection, network: &str) -> Result<(HashMap<String, StoredEntry>, Vec<String>)> {
     let mut entries = HashMap::new();
     let mut stale = Vec::new();
-    let mut statement =
-        db.prepare("SELECT device_id, first_seen_at, last_seen_at, record FROM mesh_records")?;
+    let mut admission_orders = HashSet::new();
+    let mut statement = db.prepare(
+        "SELECT device_id, first_seen_at, last_seen_at, record, admission_order FROM mesh_records",
+    )?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
         let device: String = row.get(0)?;
         let first_seen_ms = row.get::<_, i64>(1)? as u64;
         let last_seen_ms = row.get::<_, i64>(2)? as u64;
+        let admission_order: i64 = row.get(4)?;
+        ensure!(
+            admission_order > 0 && admission_orders.insert(admission_order),
+            "mesh admission orders must be positive and unique"
+        );
         let loaded = serde_json::from_str::<SignedMeshRecord>(&row.get::<_, String>(3)?)
             .ok()
             .and_then(|signed| {
@@ -311,11 +371,14 @@ fn load(db: &Connection, network: &str) -> Result<(HashMap<String, Entry>, Vec<S
             Some((signed, record)) => {
                 entries.insert(
                     device,
-                    Entry {
-                        signed,
-                        record,
-                        first_seen_ms,
-                        last_seen_ms,
+                    StoredEntry {
+                        entry: Entry {
+                            signed,
+                            record,
+                            first_seen_ms,
+                            last_seen_ms,
+                        },
+                        admission_order,
                     },
                 );
             }
@@ -363,6 +426,255 @@ mod tests {
 
     fn insert(table: &mut Table, records: Vec<SignedMeshRecord>, now: u64) -> usize {
         table.insert(records, now, |_| true).0.len()
+    }
+
+    #[test]
+    fn a_clock_backstep_does_not_replace_known_records_with_newcomers() -> Result<()> {
+        let own = vibeface_secure::Identity::generate()?;
+        let [a, b, c, d] = std::array::from_fn(|_| vibeface_secure::Identity::generate().unwrap());
+        let dir = dir("admission-backstep");
+        let (mut table, _) = Table::open(&dir.join("mesh.sqlite3"), &own.device_id(), "lab", NOW)?;
+        table.set_capacity(3);
+        assert_eq!(
+            insert(&mut table, vec![signed(&a, NOW), signed(&b, NOW)], NOW),
+            2
+        );
+        assert_eq!(insert(&mut table, vec![signed(&c, NOW)], NOW - 1_000), 1);
+        assert_eq!(insert(&mut table, vec![signed(&d, NOW)], NOW - 999), 1);
+        assert_eq!(
+            [
+                seq(&table, &a),
+                seq(&table, &b),
+                seq(&table, &c),
+                seq(&table, &d)
+            ],
+            [Some(NOW), Some(NOW), None, Some(NOW)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn equal_reception_times_keep_admission_order() -> Result<()> {
+        let own = vibeface_secure::Identity::generate()?;
+        let mut peers: [_; 4] =
+            std::array::from_fn(|_| vibeface_secure::Identity::generate().unwrap());
+        peers.sort_by_key(|peer| peer.device_id());
+        let [a, b, c, d] = peers;
+        let dir = dir("equal-admission-times");
+        let (mut table, _) = Table::open(&dir.join("mesh.sqlite3"), &own.device_id(), "lab", NOW)?;
+        table.set_capacity(3);
+        for peer in [&a, &b, &c, &d] {
+            assert_eq!(insert(&mut table, vec![signed(peer, NOW)], NOW), 1);
+        }
+        assert_eq!(
+            [
+                seq(&table, &a),
+                seq(&table, &b),
+                seq(&table, &c),
+                seq(&table, &d)
+            ],
+            [Some(NOW), Some(NOW), None, Some(NOW)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn queued_updates_and_readmissions_preserve_order_across_a_restart() -> Result<()> {
+        let own = vibeface_secure::Identity::generate()?;
+        let [a, b, c, d, e] =
+            std::array::from_fn(|_| vibeface_secure::Identity::generate().unwrap());
+        let dir = dir("persisted-admission-order");
+        let path = dir.join("mesh.sqlite3");
+        let (mut table, mut store) = Table::open(&path, &own.device_id(), "lab", NOW)?;
+        table.set_capacity(3);
+        let (accepted, mut pending) =
+            table.insert(vec![signed(&a, NOW), signed(&b, NOW)], NOW, |_| true);
+        assert_eq!(accepted.len(), 2);
+        for (peer, seq, received) in [
+            (&c, NOW, NOW - 1_000),
+            (&a, NOW + 30_000, NOW - 900),
+            (&d, NOW, NOW - 999),
+            (&c, NOW, NOW - 998),
+        ] {
+            let (accepted, writes) = table.insert(vec![signed(peer, seq)], received, |_| true);
+            assert_eq!(accepted.len(), 1);
+            pending.extend(writes);
+        }
+        assert_eq!(
+            [
+                seq(&table, &a),
+                seq(&table, &b),
+                seq(&table, &c),
+                seq(&table, &d)
+            ],
+            [Some(NOW + 30_000), Some(NOW), Some(NOW), None]
+        );
+        let later = pending.split_off(3);
+        store.apply(pending)?;
+        store.apply(later)?;
+        drop((table, store));
+
+        let (mut table, mut store) = Table::open(&path, &own.device_id(), "lab", NOW - 997)?;
+        table.set_capacity(3);
+        assert_eq!(seq(&table, &a), Some(NOW + 30_000));
+        let held = table.get(&a.device_id()).unwrap();
+        assert_eq!((held.first_seen_ms, held.last_seen_ms), (NOW, NOW - 900));
+        let (accepted, writes) = table.insert(vec![signed(&e, NOW)], NOW - 2_000, |_| true);
+        assert_eq!(accepted.len(), 1);
+        store.apply(writes)?;
+        assert_eq!(
+            [
+                seq(&table, &a),
+                seq(&table, &b),
+                seq(&table, &c),
+                seq(&table, &e)
+            ],
+            [Some(NOW + 30_000), Some(NOW), None, Some(NOW)]
+        );
+        assert_eq!(
+            store.0.query_row(
+                "SELECT admission_order, first_seen_at, last_seen_at FROM mesh_records
+                 WHERE device_id = ?1",
+                [e.device_id()],
+                |row| Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, u64>(2)?
+                ))
+            )?,
+            (6, NOW - 2_000, NOW - 2_000)
+        );
+        assert_eq!(
+            store.0.query_row(
+                "SELECT admission_order FROM mesh_records WHERE device_id = ?1",
+                [a.device_id()],
+                |row| row.get::<_, i64>(0)
+            )?,
+            1
+        );
+        assert_eq!(read(&path, "lab")?.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn own_and_protected_records_survive_newer_admissions_and_expiry() -> Result<()> {
+        let [own, member, a, b, c] =
+            std::array::from_fn(|_| vibeface_secure::Identity::generate().unwrap());
+        let dir = dir("protected-admission-order");
+        let (mut table, _) = Table::open(&dir.join("mesh.sqlite3"), &own.device_id(), "lab", NOW)?;
+        table.set_capacity(3);
+        table.set_protected(HashSet::from([member.device_id()]));
+        let signed_own = signed(&own, NOW);
+        let own_record = signed_own.open("lab", NOW)?;
+        assert_eq!(table.insert_own(signed_own, own_record, NOW).len(), 1);
+        for (peer, received) in [(&member, NOW - 1), (&a, NOW - 2), (&b, NOW - 3)] {
+            assert_eq!(insert(&mut table, vec![signed(peer, NOW)], received), 1);
+        }
+        let later = NOW + u64::from(DEFAULT_TTL_S) * 1_000 + 1;
+        assert_eq!(insert(&mut table, vec![signed(&c, later)], later), 1);
+        assert_eq!(
+            [
+                seq(&table, &own),
+                seq(&table, &member),
+                seq(&table, &a),
+                seq(&table, &b),
+                seq(&table, &c)
+            ],
+            [Some(NOW), Some(NOW), None, None, Some(later)]
+        );
+        assert_eq!(table.entries().count(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn exhausted_admission_order_refuses_new_devices_before_eviction() -> Result<()> {
+        let [own, a, b, c] =
+            std::array::from_fn(|_| vibeface_secure::Identity::generate().unwrap());
+        let dir = dir("admission-order-overflow");
+        let path = dir.join("mesh.sqlite3");
+        let (mut table, mut store) = Table::open(&path, &own.device_id(), "lab", NOW)?;
+        store.apply(
+            table
+                .insert(vec![signed(&a, NOW), signed(&b, NOW)], NOW, |_| true)
+                .1,
+        )?;
+        store.0.execute(
+            "UPDATE mesh_records SET admission_order = ?1 WHERE device_id = ?2",
+            params![i64::MAX, b.device_id()],
+        )?;
+        drop((table, store));
+
+        let (mut table, mut store) = Table::open(&path, &own.device_id(), "lab", NOW)?;
+        table.set_capacity(2);
+        let (accepted, writes) = table.insert(vec![signed(&c, NOW)], NOW, |_| true);
+        assert!(accepted.is_empty() && writes.is_empty());
+        assert_eq!(
+            [seq(&table, &a), seq(&table, &b), seq(&table, &c)],
+            [Some(NOW), Some(NOW), None]
+        );
+        let (accepted, writes) =
+            table.insert(vec![signed(&a, NOW + 30_000)], NOW + 30_000, |_| true);
+        assert_eq!(accepted.len(), 1);
+        store.apply(writes)?;
+        assert_eq!(seq(&table, &a), Some(NOW + 30_000));
+        assert_eq!(read(&path, "lab")?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn admission_order_conflicts_do_not_replace_another_device() -> Result<()> {
+        let [own, a, b] = std::array::from_fn(|_| vibeface_secure::Identity::generate().unwrap());
+        let dir = dir("admission-order-conflict");
+        let path = dir.join("mesh.sqlite3");
+        let (mut table, mut store) = Table::open(&path, &own.device_id(), "lab", NOW)?;
+        store.apply(table.insert(vec![signed(&a, NOW)], NOW, |_| true).1)?;
+        let (mut other, _) = Table::open(&dir.join("other.sqlite3"), &own.device_id(), "lab", NOW)?;
+        let writes = other.insert(vec![signed(&b, NOW)], NOW, |_| true).1;
+        assert!(store.apply(writes).is_err());
+        let persisted = read(&path, "lab")?;
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].record.device_id, a.device_id());
+        assert_eq!(persisted[0].record.seq, NOW);
+        Ok(())
+    }
+
+    #[test]
+    fn a_cache_without_admission_order_is_rejected_without_changes() -> Result<()> {
+        let dir = dir("unsupported-mesh-cache");
+        let path = dir.join("mesh.sqlite3");
+        let db = crate::store::private_file_connection(&path)?;
+        db.execute_batch(
+            "CREATE TABLE mesh_records(device_id TEXT PRIMARY KEY, seq INTEGER NOT NULL,
+               expires_at INTEGER NOT NULL, first_seen_at INTEGER NOT NULL,
+               last_seen_at INTEGER NOT NULL, reachable TEXT NOT NULL, record TEXT NOT NULL);
+             INSERT INTO mesh_records VALUES('kept', 1, 2, 3, 4, 'unknown', '{}');",
+        )?;
+        drop(db);
+        let before = std::fs::read(&path)?;
+        let own = vibeface_secure::Identity::generate()?;
+        let error = Table::open(&path, &own.device_id(), "lab", NOW)
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("admission_order"));
+        assert_eq!(std::fs::read(&path)?, before);
+        let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        assert_eq!(
+            db.query_row(
+                "SELECT device_id, last_seen_at FROM mesh_records",
+                [],
+                |row| { Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)) }
+            )?,
+            ("kept".to_owned(), 4)
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            1
+        );
+        Ok(())
     }
 
     #[test]

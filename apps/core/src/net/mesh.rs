@@ -633,7 +633,7 @@ impl Mesh {
         self.flush();
     }
 
-    /// Queues `writes` for the writer.
+    /// Queues `writes` before the caller releases the table lock.
     fn queue(&self, writes: Vec<Write>) {
         if !writes.is_empty() {
             self.pending.lock().expect("mesh writes").extend(writes);
@@ -643,8 +643,9 @@ impl Mesh {
 
     /// Writes the pending changes in one transaction, without holding the table.
     fn flush(&self) {
+        let mut store = self.store.lock().expect("mesh store");
         let writes = std::mem::take(&mut *self.pending.lock().expect("mesh writes"));
-        if let Err(error) = self.store.lock().expect("mesh store").apply(writes) {
+        if let Err(error) = store.apply(writes) {
             tracing::warn!(event = "mesh.table_failed", %error);
         }
     }
@@ -932,7 +933,7 @@ impl Mesh {
         delivery: Delivery,
     ) -> (Vec<MeshRecord>, bool) {
         let mut limited = false;
-        let (accepted, writes) = {
+        let accepted = {
             let mut table = self.table.lock().expect("mesh table");
             let from = match delivery {
                 Delivery::Asked => None,
@@ -952,7 +953,7 @@ impl Mesh {
                 limited |= !admitted;
                 admitted
             };
-            let inserted = table.insert(records, now_ms(), admit);
+            let (accepted, writes) = table.insert(records, now_ms(), admit);
             if limited
                 && let Some(bucket) = bucket
                 && bucket
@@ -966,9 +967,9 @@ impl Mesh {
                     "dropped new records past a neighbor's limit"
                 );
             }
-            inserted
+            self.queue(writes);
+            accepted
         };
-        self.queue(writes);
         if !accepted.is_empty() {
             self.changes.send_modify(|generation| *generation += 1);
         }
@@ -1175,12 +1176,11 @@ impl Mesh {
             && record.addrs.pop().is_some()
         {}
         let signed = SignedMeshRecord::sign(&record, |payload| self.sign(payload))?;
-        let writes = self
-            .table
-            .lock()
-            .expect("mesh table")
-            .insert_own(signed.clone(), record, now);
-        self.queue(writes);
+        {
+            let mut table = self.table.lock().expect("mesh table");
+            let writes = table.insert_own(signed.clone(), record, now);
+            self.queue(writes);
+        }
         self.changes.send_modify(|generation| *generation += 1);
         self.broadcast(&signed).await;
         Ok(true)
