@@ -19,6 +19,39 @@ use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::mpsc;
 use vibeface_protocol::workspace::{InputIntent, InputTarget, WorkspaceCommand};
 
+struct InputFixture {
+    input: Entity<InputState>,
+    actions: u64,
+    submitted: String,
+    _input_events: Subscription,
+}
+impl InputFixture {
+    fn new(window: &mut Window, cx: &mut Context<Desktop>) -> Self {
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("输入 native-gpui-fixture 并按 Enter")
+        });
+        let input_events = cx.subscribe(&input, |this, _, event, cx| {
+            if matches!(event, InputEvent::PressEnter { .. })
+                && let Some(fixture) = &mut this.fixture
+            {
+                fixture.submit(cx);
+                cx.notify();
+            }
+        });
+        Self {
+            input,
+            actions: 0,
+            submitted: String::new(),
+            _input_events: input_events,
+        }
+    }
+
+    fn submit(&mut self, cx: &App) {
+        self.submitted = self.input.read(cx).value().to_string();
+        self.actions += 1;
+    }
+}
+
 pub struct Desktop {
     pub route: Route,
     pub snapshot: Arc<Snapshot>,
@@ -48,11 +81,7 @@ pub struct Desktop {
     record_cache: std::collections::HashMap<String, (String, crate::widgets::markdown::Markdown)>,
     _appearance: Subscription,
     pub credential_scope: String,
-    pub fixture: bool,
-    pub fixture_input: Entity<InputState>,
-    pub fixture_actions: u64,
-    pub fixture_submitted: String,
-    _input_events: Subscription,
+    fixture: Option<InputFixture>,
     tx: mpsc::Sender<Command>,
     _events: gpui_kit::Task<()>,
     pub notice: Option<String>,
@@ -69,16 +98,6 @@ impl Desktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let fixture_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("输入 native-gpui-fixture 并按 Enter")
-        });
-        let input_events = cx.subscribe(&fixture_input, |this, _, event, cx| {
-            if this.fixture && matches!(event, InputEvent::PressEnter { .. }) {
-                this.fixture_submitted = this.fixture_input.read(cx).value().to_string();
-                this.fixture_actions += 1;
-                cx.notify();
-            }
-        });
         let history_query =
             cx.new(|cx| InputState::new(window, cx).placeholder("搜索当前读取的历史"));
         let history_events = cx.subscribe(&history_query, |_, _, event, cx| {
@@ -188,11 +207,7 @@ impl Desktop {
             record_cache: std::collections::HashMap::new(),
             _appearance: appearance,
             credential_scope: String::new(),
-            fixture: false,
-            fixture_input,
-            fixture_actions: 0,
-            fixture_submitted: String::new(),
-            _input_events: input_events,
+            fixture: None,
             tx,
             _events: event_task,
             notice: None,
@@ -457,14 +472,30 @@ impl Desktop {
         true
     }
     pub fn configure_fixture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.fixture = true;
         self.form = None;
-        self.fixture_input
+        let fixture = self
+            .fixture
+            .get_or_insert_with(|| InputFixture::new(window, cx));
+        fixture
+            .input
             .update(cx, |state, cx| state.focus(window, cx));
         cx.notify();
     }
     pub fn fixture_report(&self, window: &Window, cx: &App) -> serde_json::Value {
-        serde_json::json!({"runtime_ui":"gpui","phase":"completed","window_opened":true,"pid":std::process::id(),"node_started":false,"controlled_fixture":true,"input_text":self.fixture_input.read(cx).value().to_string(),"submitted_text":self.fixture_submitted,"action_count":self.fixture_actions,"focused":self.fixture_input.read(cx).focus_handle(cx).is_focused(window),"ime_verified":false})
+        let (input_text, submitted_text, action_count, focused) =
+            self.fixture.as_ref().map_or_else(
+                || (String::new(), "", 0, false),
+                |fixture| {
+                    let input = fixture.input.read(cx);
+                    (
+                        input.value().to_string(),
+                        fixture.submitted.as_str(),
+                        fixture.actions,
+                        input.focus_handle(cx).is_focused(window),
+                    )
+                },
+            );
+        serde_json::json!({"runtime_ui":"gpui","phase":"completed","window_opened":true,"pid":std::process::id(),"node_started":false,"controlled_fixture":true,"input_text":input_text,"submitted_text":submitted_text,"action_count":action_count,"focused":focused,"ime_verified":false})
     }
     pub fn send(&mut self, command: Command, cx: &mut Context<Self>) {
         self.enqueue(command, cx);
@@ -1374,7 +1405,7 @@ impl Desktop {
 impl Render for Desktop {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.palette();
-        if self.fixture {
+        if let Some(fixture) = &self.fixture {
             return div()
                 .size_full()
                 .bg(p.background)
@@ -1384,18 +1415,18 @@ impl Render for Desktop {
                 .flex_col()
                 .gap_4()
                 .child("Vibeface 原生输入验收夹具")
-                .child(Input::new(&self.fixture_input).aria_label("原生输入验收"))
+                .child(Input::new(&fixture.input).aria_label("原生输入验收"))
                 .child(
                     Button::new("fixture-submit")
                         .label("提交验收输入")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.fixture_submitted =
-                                this.fixture_input.read(cx).value().to_string();
-                            this.fixture_actions += 1;
-                            cx.notify();
+                            if let Some(fixture) = &mut this.fixture {
+                                fixture.submit(cx);
+                                cx.notify();
+                            }
                         })),
                 )
-                .child(format!("已执行 {} 次输入动作", self.fixture_actions))
+                .child(format!("已执行 {} 次输入动作", fixture.actions))
                 .into_any_element();
         }
         let p = self.palette();
