@@ -108,7 +108,7 @@ mod tests {
 
     #[test]
     fn input_event_body_preserves_literal_attestation_payload() -> Result<()> {
-        let network = "0".repeat(64);
+        let network = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
         let input: InputRequest = serde_json::from_value(json!({
             "message_id": "m1",
             "target": {"kind": "channel_task", "channel_id": "channel", "task_id": "task", "bot_id": "bot"},
@@ -123,7 +123,7 @@ mod tests {
         let expected: Value = serde_json::from_str(
             r#"{"type":"input_posted","message_id":"m1","target":{"kind":"channel_task","channel_id":"channel","task_id":"task","bot_id":"bot"},"intent":"new_task","sequence":17,"expected_revision":7,"text":"hi\n雪é ","attachments":[{"hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":5,"name":"一.txt"},{"hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":3,"name":"two.txt"}],"report_results":false}"#,
         )?;
-        let payload = r#"{"body":{"attachments":[{"hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","name":"一.txt","size":5},{"hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":"two.txt","size":3}],"expected_revision":7,"intent":"new_task","message_id":"m1","report_results":false,"sequence":17,"target":{"bot_id":"bot","channel_id":"channel","kind":"channel_task","task_id":"task"},"text":"hi\n雪é ","type":"input_posted"},"network_id":"0000000000000000000000000000000000000000000000000000000000000000","scope_id":"chat"}"#;
+        let payload = r#"{"body":{"attachments":[{"hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","name":"一.txt","size":5},{"hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":"two.txt","size":3}],"expected_revision":7,"intent":"new_task","message_id":"m1","report_results":false,"sequence":17,"target":{"bot_id":"bot","channel_id":"channel","kind":"channel_task","task_id":"task"},"text":"hi\n雪é ","type":"input_posted"},"network_id":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","scope_id":"chat"}"#;
         let unsigned = input_event_body(&input, None);
         assert_eq!(serde_json::to_value(&unsigned)?, expected);
         assert_eq!(
@@ -168,7 +168,7 @@ mod tests {
                 InputIntent::Continue,
                 None,
                 r#"{"type":"input_posted","message_id":"original","target":{"kind":"bot_main","bot_id":"main"},"intent":"continue","sequence":0,"text":" ","report_results":true}"#,
-                r#"{"body":{"intent":"continue","message_id":"original","report_results":true,"sequence":0,"target":{"bot_id":"main","kind":"bot_main"},"text":" ","type":"input_posted"},"network_id":"0000000000000000000000000000000000000000000000000000000000000000","scope_id":"scope"}"#,
+                r#"{"body":{"intent":"continue","message_id":"original","report_results":true,"sequence":0,"target":{"bot_id":"main","kind":"bot_main"},"text":" ","type":"input_posted"},"network_id":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","scope_id":"scope"}"#,
             ),
             (
                 InputTarget::Task {
@@ -177,7 +177,7 @@ mod tests {
                 InputIntent::Defer,
                 Some(0),
                 r#"{"type":"input_posted","message_id":"original","target":{"kind":"task","task_id":"task"},"intent":"defer","sequence":0,"expected_revision":0,"text":" ","report_results":true}"#,
-                r#"{"body":{"expected_revision":0,"intent":"defer","message_id":"original","report_results":true,"sequence":0,"target":{"kind":"task","task_id":"task"},"text":" ","type":"input_posted"},"network_id":"0000000000000000000000000000000000000000000000000000000000000000","scope_id":"scope"}"#,
+                r#"{"body":{"expected_revision":0,"intent":"defer","message_id":"original","report_results":true,"sequence":0,"target":{"kind":"task","task_id":"task"},"text":" ","type":"input_posted"},"network_id":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","scope_id":"scope"}"#,
             ),
             (
                 InputTarget::Work {
@@ -186,7 +186,7 @@ mod tests {
                 InputIntent::NewTask,
                 None,
                 r#"{"type":"input_posted","message_id":"original","target":{"kind":"work","work_id":"work"},"intent":"new_task","sequence":0,"text":" ","report_results":true}"#,
-                r#"{"body":{"intent":"new_task","message_id":"original","report_results":true,"sequence":0,"target":{"kind":"work","work_id":"work"},"text":" ","type":"input_posted"},"network_id":"0000000000000000000000000000000000000000000000000000000000000000","scope_id":"scope"}"#,
+                r#"{"body":{"intent":"new_task","message_id":"original","report_results":true,"sequence":0,"target":{"kind":"work","work_id":"work"},"text":" ","type":"input_posted"},"network_id":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","scope_id":"scope"}"#,
             ),
             (
                 InputTarget::Routine {
@@ -196,7 +196,7 @@ mod tests {
                 InputIntent::Continue,
                 None,
                 r#"{"type":"input_posted","message_id":"original","target":{"kind":"routine","bot_id":"routine","trigger":"daily:7"},"intent":"continue","sequence":0,"text":" ","report_results":true}"#,
-                r#"{"body":{"intent":"continue","message_id":"original","report_results":true,"sequence":0,"target":{"bot_id":"routine","kind":"routine","trigger":"daily:7"},"text":" ","type":"input_posted"},"network_id":"0000000000000000000000000000000000000000000000000000000000000000","scope_id":"scope"}"#,
+                r#"{"body":{"intent":"continue","message_id":"original","report_results":true,"sequence":0,"target":{"bot_id":"routine","kind":"routine","trigger":"daily:7"},"text":" ","type":"input_posted"},"network_id":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","scope_id":"scope"}"#,
             ),
             (
                 InputTarget::ChannelMember {
@@ -206,7 +206,7 @@ mod tests {
                 InputIntent::Defer,
                 Some(0),
                 r#"{"type":"input_posted","message_id":"original","target":{"kind":"channel_member","channel_id":"channel","bot_id":"member"},"intent":"defer","sequence":0,"expected_revision":0,"text":" ","report_results":true}"#,
-                r#"{"body":{"expected_revision":0,"intent":"defer","message_id":"original","report_results":true,"sequence":0,"target":{"bot_id":"member","channel_id":"channel","kind":"channel_member"},"text":" ","type":"input_posted"},"network_id":"0000000000000000000000000000000000000000000000000000000000000000","scope_id":"scope"}"#,
+                r#"{"body":{"expected_revision":0,"intent":"defer","message_id":"original","report_results":true,"sequence":0,"target":{"bot_id":"member","channel_id":"channel","kind":"channel_member"},"text":" ","type":"input_posted"},"network_id":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","scope_id":"scope"}"#,
             ),
         ];
         let client = LocalIdentity::generate();
@@ -229,7 +229,11 @@ mod tests {
                 serde_json::from_str::<Value>(expected)?
             );
             assert_eq!(
-                attestation_payload(&"0".repeat(64), "scope", &body)?,
+                attestation_payload(
+                    "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+                    "scope",
+                    &body
+                )?,
                 payload.as_bytes()
             );
             let attestation = Attestation {
@@ -243,7 +247,11 @@ mod tests {
             let mut expected_signed: Value = serde_json::from_str(expected)?;
             expected_signed["attestation"] = serde_json::to_value(&attestation)?;
             assert_eq!(serde_json::to_value(&signed)?, expected_signed);
-            verify_attestation(&"0".repeat(64), "scope", &signed)?;
+            verify_attestation(
+                "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+                "scope",
+                &signed,
+            )?;
         }
         Ok(())
     }

@@ -256,13 +256,13 @@ mod tests {
             "message_id": "m1", "target": {"kind": "bot_main", "bot_id": "bot"},
             "intent": "defer", "sequence": 17, "text": "hi\n雪e\u{301} ",
             "attachments": [
-                {"hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size": 3, "name": "一.txt"},
-                {"hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "size": 5, "name": "two.txt"}
+                {"hash": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae", "size": 3, "name": "一.txt"},
+                {"hash": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", "size": 5, "name": "two.txt"}
             ],
             "report_results": false
         }))?;
         let independent: EventBody = serde_json::from_str(
-            r#"{"type":"input_posted","message_id":"m1","target":{"kind":"bot_main","bot_id":"bot"},"intent":"defer","sequence":17,"text":"hi\n雪é ","attachments":[{"hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":3,"name":"一.txt"},{"hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":5,"name":"two.txt"}],"report_results":false}"#,
+            r#"{"type":"input_posted","message_id":"m1","target":{"kind":"bot_main","bot_id":"bot"},"intent":"defer","sequence":17,"text":"hi\n雪é ","attachments":[{"hash":"2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae","size":3,"name":"一.txt"},{"hash":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","size":5,"name":"two.txt"}],"report_results":false}"#,
         )?;
         let signed = admin.attest(&network, "chat", independent.clone())?;
         let signature = signed.attestation().context("input signature")?.clone();
@@ -285,6 +285,9 @@ mod tests {
         assert_eq!(store.connection.total_changes(), before_changes);
         assert_eq!(store.version_vector(&network)?, before_vector);
 
+        store.put_blob(&input.attachments[0].blob(), b"foo")?;
+        store.put_blob(&input.attachments[1].blob(), b"hello")?;
+
         let saved =
             store.post_workspace_input(&node, &network, input.clone(), signature.clone(), 10)?;
         assert_eq!(saved.input, input);
@@ -302,11 +305,11 @@ mod tests {
             event.blobs,
             vec![
                 BlobRef {
-                    hash: "a".repeat(64),
+                    hash: "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae".into(),
                     size: 3
                 },
                 BlobRef {
-                    hash: "b".repeat(64),
+                    hash: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".into(),
                     size: 5
                 },
             ]
