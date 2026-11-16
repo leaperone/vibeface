@@ -3228,17 +3228,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let resolved = resolve_input_target_from(&tx, network, &input.route.target)?;
-        let body = EventBody::InputPosted {
-            message_id: input.message_id.clone(),
-            target: input.route.target.clone(),
-            intent: input.route.intent,
-            sequence: input.route.sequence,
-            expected_revision: input.route.expected_revision,
-            text: input.text.clone(),
-            attachments: input.attachments.clone(),
-            report_results: Some(input.report_results),
-            attestation: Some(attestation),
-        };
+        let body = crate::workspace::input_event_body(&input, Some(attestation));
         crate::crypto::verify_attestation(network, &resolved.conversation_id, &body)?;
         membership_from(&tx, network)?.client(
             &body
