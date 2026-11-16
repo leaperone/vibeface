@@ -2,8 +2,10 @@
 pub mod activation;
 mod bootstrap;
 #[cfg(test)]
-#[path = "../../tests/fixtures/rustc.rs"]
-pub(crate) mod fixture_rustc;
+#[path = "../../tests/support/rustc.rs"]
+mod fixture_rustc;
+#[cfg(test)]
+mod fixture_rustc_tests;
 pub(crate) mod lifecycle;
 mod model;
 mod operator;

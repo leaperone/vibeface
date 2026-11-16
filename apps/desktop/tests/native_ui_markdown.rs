@@ -1,7 +1,6 @@
 #![cfg(feature = "native-ui-tests")]
+use vibeface_desktop::widgets::markdown as markdown_view;
 extern crate gpui_kit as gpui;
-#[path = "../src/widgets/markdown.rs"]
-mod markdown_view;
 use gpui_kit::http_client::{AsyncBody, HttpClient, Request, Response, Url};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{

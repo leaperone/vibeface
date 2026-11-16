@@ -1,22 +1,9 @@
 //! Real Noise client and actor. Delayed reads stay held until explicit test barriers release.
-#[path = "../src/app.rs"]
-#[allow(dead_code, unused_imports)]
-mod app;
-#[path = "../src/host/mod.rs"]
-#[allow(dead_code, unused_imports)]
-mod host;
-#[path = "../src/theme.rs"]
-#[allow(dead_code)]
-mod theme;
-#[path = "../src/ui.rs"]
-#[allow(dead_code)]
-mod ui;
-#[path = "../src/views/mod.rs"]
-#[allow(dead_code, unused_imports)]
-mod views;
-#[path = "../src/widgets/mod.rs"]
-#[allow(dead_code)]
-mod widgets;
+mod support {
+    pub mod node;
+}
+use support::node::{ControlledNode, accept_noise};
+use vibeface_desktop::{host, ui, views};
 
 use anyhow::{Context, Result, ensure};
 use futures_util::{SinkExt, StreamExt};
@@ -36,10 +23,7 @@ use vibeface_protocol::{
     history::HistorySection,
     workspace::{InputIntent, InputTarget},
 };
-use vibeface_secure::{
-    Handshake, Identity,
-    membership::{Genesis, IdentityKind, Member, NetworkState},
-};
+use vibeface_secure::{Identity, membership::NetworkState};
 use views::{
     backend::{Backend, Command, Event},
     forms::Editor,
@@ -117,19 +101,7 @@ async fn serve(
         ),
         "gateway connect frame missing"
     );
-    let mut handshake = Handshake::signed(false, &node, None, b"vibeface:client:v1")?;
-    let Message::Binary(first) = socket.next().await.context("first Noise")?? else {
-        anyhow::bail!("Noise frame missing");
-    };
-    handshake.read(&first)?;
-    socket
-        .send(Message::Binary(handshake.write(&[])?.into()))
-        .await?;
-    let Message::Binary(last) = socket.next().await.context("last Noise")?? else {
-        anyhow::bail!("Noise frame missing");
-    };
-    handshake.read(&last)?;
-    let mut channel = handshake.finish()?;
+    let mut channel = accept_noise(&mut socket, &node).await?;
     let mut held_home: Option<Value> = None;
     let mut held_history: Option<Value> = None;
     let mut held_delivery: Option<Value> = None;
@@ -268,20 +240,14 @@ async fn delayed_reads_leave_stop_and_durable_input_responsive_and_fence_old_pag
     let host = host::DesktopHost::open(profile.clone(), profile.join("runtime"), true)?;
     let directory = host.client_storage_dir();
     let mut key = ClientKey::create(&directory, "controlled fixture password")?;
-    let node = Identity::generate()?;
     let client_id = key.device_id().to_owned();
-    let genesis = Genesis::create(
-        &Identity::generate()?,
-        Member::new(&client_id, IdentityKind::Client, "Fixture client", true)?,
-        Member::node(&node, "Fixture Node")?,
-    )?;
-    let network = genesis.network_id.clone();
-    let state = NetworkState::new(genesis)?;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let entry = vibeface_client::Entry {
-        origin: format!("http://{}", listener.local_addr()?),
-        node_id: node.device_id(),
-    };
+    let ControlledNode {
+        listener,
+        identity: node,
+        state,
+        entry,
+    } = ControlledNode::new(&client_id, "Fixture client", "Fixture Node").await?;
+    let network = state.genesis.network_id.clone();
     key.remember(&network, entry.clone())?;
     drop(key);
     let probe = Arc::new(Probe::default());

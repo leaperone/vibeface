@@ -1,8 +1,8 @@
-use host::fixture_rustc;
-
-#[allow(dead_code, unused_imports)]
-#[path = "../src/host/mod.rs"]
-mod host;
+use vibeface_desktop::host;
+mod support {
+    pub mod rustc;
+}
+use support::rustc as fixture_rustc;
 
 use anyhow::{Context, Result, bail};
 use host::{

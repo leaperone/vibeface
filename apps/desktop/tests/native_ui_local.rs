@@ -1,24 +1,14 @@
 //! Actual local grants, Noise clients, profile storage, and exclusive SQLite leases.
-use host::fixture_rustc;
+use vibeface_desktop::{host, ui, views};
+mod support {
+    pub mod node;
+    pub mod rustc;
+}
+use support::{
+    node::{ControlledNode, accept_noise},
+    rustc as fixture_rustc,
+};
 
-#[path = "../src/app.rs"]
-#[allow(dead_code, unused_imports)]
-mod app;
-#[path = "../src/host/mod.rs"]
-#[allow(dead_code, unused_imports)]
-mod host;
-#[path = "../src/theme.rs"]
-#[allow(dead_code)]
-mod theme;
-#[path = "../src/ui.rs"]
-#[allow(dead_code)]
-mod ui;
-#[path = "../src/views/mod.rs"]
-#[allow(dead_code, unused_imports)]
-mod views;
-#[path = "../src/widgets/mod.rs"]
-#[allow(dead_code)]
-mod widgets;
 use anyhow::{Context, Result, ensure};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -38,10 +28,7 @@ use tokio::{
 use tokio_tungstenite::tungstenite::Message;
 use vibeface_bridge::platform::privatefs;
 use vibeface_client::{Client, ClientKey, Endpoint, Entry, OfflineBlockReason};
-use vibeface_secure::{
-    Handshake, Identity,
-    membership::{Genesis, IdentityKind, Member, NetworkState},
-};
+use vibeface_secure::{Identity, membership::NetworkState};
 use views::{
     backend::{Backend, Command, Event},
     forms::Editor,
@@ -184,19 +171,7 @@ impl LocalNode {
             .unwrap()
             .insert(client.clone(), disconnect.clone());
         self.connections.lock().unwrap().push(disconnect.clone());
-        let mut handshake = Handshake::signed(false, &self.node, None, b"vibeface:client:v1")?;
-        let Message::Binary(first) = socket.next().await.context("local first Noise")?? else {
-            anyhow::bail!("local Noise expected")
-        };
-        handshake.read(&first)?;
-        socket
-            .send(Message::Binary(handshake.write(&[])?.into()))
-            .await?;
-        let Message::Binary(last) = socket.next().await.context("local last Noise")?? else {
-            anyhow::bail!("local Noise expected")
-        };
-        handshake.read(&last)?;
-        let mut channel = handshake.finish()?;
+        let mut channel = accept_noise(&mut socket, &self.node).await?;
         loop {
             let frame = tokio::select! {_=disconnect.notified()=>break,frame=socket.next()=>frame};
             let Some(frame) = frame else { break };
@@ -301,17 +276,12 @@ impl Fixture {
         let b_key = ClientKey::create(&b_dir, PASSWORD)?;
         let b = b_key.device_id().to_owned();
         drop((a_key, b_key, registry));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let node_key = Identity::generate()?;
-        let entry = Entry {
-            origin: format!("http://{}", listener.local_addr()?),
-            node_id: node_key.device_id(),
-        };
-        let state = NetworkState::new(Genesis::create(
-            &Identity::generate()?,
-            Member::new(&a, IdentityKind::Client, "Controlled A", true)?,
-            Member::node(&node_key, "Controlled Node")?,
-        )?)?;
+        let ControlledNode {
+            listener,
+            identity: node_key,
+            state,
+            entry,
+        } = ControlledNode::new(&a, "Controlled A", "Controlled Node").await?;
         let node_dir = profile.join("node");
         privatefs::create_dir(&node_dir)?;
         privatefs::write_atomic(&node_dir.join("config.json"), b"{}")?;
