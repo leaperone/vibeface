@@ -10,7 +10,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { messageOf } from '@vibeface/client/lib/node.ts'
 import { inputTargetKey, promptIntent } from '@vibeface/client/chat/protocol.ts'
 import { networkKey, newId, storageOf } from '@vibeface/client/workspace/storage.ts'
-import type { ContextProjection, InputReceipt, InputTarget, PendingMessage, ScopeContext, WorkspaceCommand, WorkspaceHistory, WorkspaceTask } from '@vibeface/client/workspace/types.ts'
+import type { ContextProjection, InputReceipt, InputTarget, PendingMessage, ScopeContext, WorkspaceChannel, WorkspaceCommand, WorkspaceHistory, WorkspaceTask } from '@vibeface/client/workspace/types.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { Details, EmptyState } from '@/components/kit'
 import { Button } from '@/components/arc/button'
@@ -109,33 +109,90 @@ export function ChannelsScreen() {
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-6 pb-12"><Stack.Screen options={{ title: '频道' }} /><Link href="/new-channel" asChild><Button disabled={!shared?.writable || !shared.bots.length}><Icon as={Plus} /><Text>新频道</Text></Button></Link>{channels.map((channel) => <Link key={channel.channel_id} href={`/channel/${channel.channel_id}`} asChild><Pressable accessibilityRole="link" className="min-h-16 gap-2 rounded-panel border border-border bg-surface p-4 active:bg-surface-muted"><View className="flex-row items-center gap-2"><Icon as={MessagesSquare} className="text-muted" /><Text className="min-w-0 flex-1 font-medium">{channel.title}</Text><Icon as={ChevronRight} className="size-4 text-muted" /></View>{channel.purpose ? <Text className="text-sm text-muted">{channel.purpose}</Text> : null}<Text className="text-sm text-muted">{channel.members.length} 个 Bot · 默认协调 {shared?.bots.find((bot) => bot.bot_id === channel.coordinator_bot)?.name ?? 'Bot 未加载'}</Text></Pressable></Link>)}{!channels.length ? <EmptyState icon={MessagesSquare} title={shared?.workspaceState ? '还没有频道' : '正在读取频道'} action={<Button variant="secondary" onPress={() => void run('read-channels', async () => { await shared?.readWorkspaceState() })}><Text>重新读取</Text></Button>} /> : null}{error ? <ErrorText error={error} /> : null}</ScrollView>
 }
 
+type ChannelFields = Pick<WorkspaceChannel, 'channel_id' | 'title' | 'purpose' | 'members' | 'coordinator_bot' | 'coordinator_node'>
+type ChannelDraft = ChannelFields & (
+  | { kind: 'create' }
+  | { kind: 'edit'; expected_revision: WorkspaceChannel['revision']; owner_epoch: WorkspaceChannel['owner_epoch'] }
+)
+type ChannelSource = { kind: 'create'; node: string } | { kind: 'edit'; channel: WorkspaceChannel }
+type ChannelRead = { owner: string } & (
+  | { kind: 'loading' }
+  | { kind: 'ready'; channel: WorkspaceChannel }
+  | { kind: 'missing' }
+  | { kind: 'error'; error: string }
+)
+
 export function ChannelSettingsScreen({ channelId }: { channelId?: string }) {
-  const router = useRouter()
   const shared = useLive()
   const { ready } = useDevice()
-  const channel = shared?.workspaceState?.channels.find((item) => item.channel_id === channelId)
-  const [title, setTitle] = useState(channel?.title ?? '')
-  const [purpose, setPurpose] = useState(channel?.purpose ?? '')
-  const [members, setMembers] = useState(channel?.members ?? shared?.bots.map((bot) => bot.bot_id) ?? [])
-  const [coordinator, setCoordinator] = useState(channel?.coordinator_bot ?? shared?.bots[0]?.bot_id ?? '')
-  const [node, setNode] = useState(channel?.coordinator_node ?? ready?.entry.device_id ?? '')
-  const id = useRef(channelId ?? newId())
+  const owner = JSON.stringify([ready?.principal.network_id, ready?.principal.device_id, shared?.generation, channelId ?? null])
+  const currentOwner = useRef(owner)
+  currentOwner.current = owner
+  const latest = useRef(shared)
+  latest.current = shared
+  const [read, setRead] = useState<ChannelRead>({ owner, kind: 'loading' })
+  const [attempt, setAttempt] = useState(0)
+  const connected = Boolean(shared && ready)
+  useEffect(() => {
+    const workspace = latest.current
+    if (channelId === undefined || !connected || !workspace) return
+    let active = true
+    const current = () => active && currentOwner.current === owner && workspace.isCurrent()
+    setRead({ owner, kind: 'loading' })
+    void (async () => {
+      if (!current()) return
+      try {
+        const result = await workspace.readWorkspaceState({ channel_id: channelId })
+        if (!current()) return
+        const channel = result.channels.find((item) => item.channel_id === channelId)
+        setRead(channel ? { owner, kind: 'ready', channel } : { owner, kind: 'missing' })
+      } catch (cause) { if (current()) setRead({ owner, kind: 'error', error: messageOf(cause) }) }
+    })()
+    return () => { active = false }
+  }, [owner, connected, attempt])
+  const ownedRead = read.owner === owner ? read : null
+  const cached = shared?.workspaceState?.channels.find((item) => item.channel_id === channelId)
+  const loaded = ownedRead?.kind === 'ready' ? ownedRead.channel : null
+  const channel = loaded && (!cached || loaded.revision > cached.revision) ? loaded : cached
+  if (!shared || !ready || channelId !== undefined && (ownedRead?.kind !== 'ready' || !channel)) {
+    const title = ownedRead?.kind === 'error' ? ownedRead.error : ownedRead?.kind === 'missing' ? '没有找到这个频道' : '正在读取频道设置'
+    const retry = ownedRead?.kind === 'error' || ownedRead?.kind === 'missing'
+    return <View className="flex-1"><Stack.Screen options={{ title: channelId !== undefined ? '频道设置' : '新频道' }} /><EmptyState icon={MessagesSquare} title={title} className="flex-1 justify-center" action={retry ? <Button variant="secondary" onPress={() => setAttempt((current) => current + 1)}><Text>重新读取</Text></Button> : undefined} /></View>
+  }
+  const source: ChannelSource = channelId !== undefined && channel ? { kind: 'edit', channel } : { kind: 'create', node: ready.entry.device_id }
+  return <ChannelForm key={owner} source={source} shared={shared} isCurrent={() => currentOwner.current === owner && shared.isCurrent()} />
+}
+
+function ChannelForm({ source, shared, isCurrent }: { source: ChannelSource; shared: NonNullable<ReturnType<typeof useLive>>; isCurrent: () => boolean }) {
+  const router = useRouter()
+  const [draft, setDraft] = useState<ChannelDraft>(() => source.kind === 'edit' ? {
+    kind: 'edit', channel_id: source.channel.channel_id, title: source.channel.title, purpose: source.channel.purpose,
+    members: [...source.channel.members], coordinator_bot: source.channel.coordinator_bot, coordinator_node: source.channel.coordinator_node,
+    expected_revision: source.channel.revision, owner_epoch: source.channel.owner_epoch,
+  } : {
+    kind: 'create', channel_id: newId(), title: '', purpose: '', members: shared.bots.map((bot) => bot.bot_id),
+    coordinator_bot: shared.bots[0]?.bot_id ?? '', coordinator_node: source.node,
+  })
+  const { title, purpose, members, coordinator_bot: coordinator, coordinator_node: node } = draft
+  const conflict = draft.kind === 'edit' && source.kind === 'edit' && (draft.expected_revision !== source.channel.revision || draft.owner_epoch !== source.channel.owner_epoch)
   const submission = useRef<Extract<WorkspaceCommand, { kind: 'create_channel' | 'configure_channel' }> | null>(null)
+  const active = useRef(true)
+  useEffect(() => { active.current = true; return () => { active.current = false } }, [])
   const { error, busy, run } = useRun()
-  return <KeyboardAwareScrollView mode="layout" keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-6 pb-12"><Stack.Screen options={{ title: channelId ? '频道设置' : '新频道' }} />
-    <View className="gap-2"><Text nativeID="channel-title-label" className="text-sm font-medium">频道名称</Text><Input editable={!submission.current} accessibilityLabel="频道名称" accessibilityLabelledBy="channel-title-label" value={title} onChangeText={setTitle} maxLength={512} placeholder="例如：官网改版" /></View><View className="gap-2"><Text nativeID="channel-purpose-label" className="text-sm font-medium">频道目标</Text><Input editable={!submission.current} accessibilityLabel="频道目标" accessibilityLabelledBy="channel-purpose-label" value={purpose} onChangeText={setPurpose} maxLength={8192} multiline placeholder="说明这个频道要完成什么" /></View>
-    <Text role="heading" className="text-sm font-medium">Bot 成员</Text><View className="gap-2">{shared?.bots.map((bot) => <SelectionItem key={bot.bot_id} accessibilityRole="checkbox" accessibilityState={{ checked: members.includes(bot.bot_id) }} accessibilityLabel={bot.name} disabled={Boolean(submission.current)} className={cn('min-h-11 flex-row items-center gap-3 rounded-panel border px-3 py-2', members.includes(bot.bot_id) ? 'border-accent bg-accent-subtle' : 'border-border bg-surface')} onPress={() => setMembers((current) => current.includes(bot.bot_id) ? current.filter((value) => value !== bot.bot_id) : [...current, bot.bot_id])}><Text className="flex-1">{bot.name}</Text><Text>{members.includes(bot.bot_id) ? '已加入' : '加入'}</Text></SelectionItem>)}</View>
-    <Text role="heading" className="text-sm font-medium">默认协调 Bot</Text><View className="flex-row flex-wrap gap-2">{shared?.bots.filter((bot) => members.includes(bot.bot_id)).map((bot) => <Button key={bot.bot_id} variant={coordinator === bot.bot_id ? 'primary' : 'secondary'} disabled={Boolean(submission.current)} onPress={() => setCoordinator(bot.bot_id)} accessibilityState={{ selected: coordinator === bot.bot_id }}><Text>{bot.name}</Text></Button>)}</View>
-    <Text role="heading" className="text-sm font-medium">协调设备</Text><View className="gap-2">{shared?.nodes.filter((item) => !item.revoked).map((item) => <Button key={item.device_id} variant={node === item.device_id ? 'primary' : 'secondary'} disabled={Boolean(submission.current)} onPress={() => setNode(item.device_id)} accessibilityState={{ selected: node === item.device_id }}><Text>{item.name}{item.online ? '' : ' · 离线'}</Text></Button>)}</View>
-    <Text className="text-sm text-muted">频道消息由默认协调 Bot 承接。</Text>{error ? <ErrorText error={error} /> : null}<Button disabled={Boolean(busy) || !shared?.writable} onPress={() => void run('save-channel', async () => {
-      if (!shared || !title.trim() || !members.length || !members.includes(coordinator)) throw new Error('请填写频道名称，选择成员并将默认协调 Bot 加入成员。')
-      if (channelId && !channel) throw new Error('尚未读取频道设置，请返回频道重新打开。')
-      const configuration = { channel_id: id.current, title: title.trim(), purpose: purpose.trim(), members, coordinator_bot: coordinator, coordinator_node: node }
-      const command: Extract<WorkspaceCommand, { kind: 'create_channel' | 'configure_channel' }> = submission.current ?? (channel ? { kind: 'configure_channel', ...configuration, expected_revision: channel.revision, owner_epoch: channel.owner_epoch } : { kind: 'create_channel', ...configuration })
+  return <KeyboardAwareScrollView mode="layout" keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-6 pb-12"><Stack.Screen options={{ title: draft.kind === 'edit' ? '频道设置' : '新频道' }} />
+    <View className="gap-2"><Text nativeID="channel-title-label" className="text-sm font-medium">频道名称</Text><Input editable={!submission.current} accessibilityLabel="频道名称" accessibilityLabelledBy="channel-title-label" value={title} onChangeText={(value) => setDraft((current) => ({ ...current, title: value }))} maxLength={512} placeholder="例如：官网改版" /></View><View className="gap-2"><Text nativeID="channel-purpose-label" className="text-sm font-medium">频道目标</Text><Input editable={!submission.current} accessibilityLabel="频道目标" accessibilityLabelledBy="channel-purpose-label" value={purpose} onChangeText={(value) => setDraft((current) => ({ ...current, purpose: value }))} maxLength={8192} multiline placeholder="说明这个频道要完成什么" /></View>
+    <Text role="heading" className="text-sm font-medium">Bot 成员</Text><View className="gap-2">{shared.bots.map((bot) => <SelectionItem key={bot.bot_id} accessibilityRole="checkbox" accessibilityState={{ checked: members.includes(bot.bot_id) }} accessibilityLabel={bot.name} disabled={Boolean(submission.current)} className={cn('min-h-11 flex-row items-center gap-3 rounded-panel border px-3 py-2', members.includes(bot.bot_id) ? 'border-accent bg-accent-subtle' : 'border-border bg-surface')} onPress={() => setDraft((current) => ({ ...current, members: current.members.includes(bot.bot_id) ? current.members.filter((value) => value !== bot.bot_id) : [...current.members, bot.bot_id] }))}><Text className="flex-1">{bot.name}</Text><Text>{members.includes(bot.bot_id) ? '已加入' : '加入'}</Text></SelectionItem>)}</View>
+    <Text role="heading" className="text-sm font-medium">默认协调 Bot</Text><View className="flex-row flex-wrap gap-2">{shared.bots.filter((bot) => members.includes(bot.bot_id)).map((bot) => <Button key={bot.bot_id} variant={coordinator === bot.bot_id ? 'primary' : 'secondary'} disabled={Boolean(submission.current)} onPress={() => setDraft((current) => ({ ...current, coordinator_bot: bot.bot_id }))} accessibilityState={{ selected: coordinator === bot.bot_id }}><Text>{bot.name}</Text></Button>)}</View>
+    <Text role="heading" className="text-sm font-medium">协调设备</Text><View className="gap-2">{shared.nodes.filter((item) => !item.revoked).map((item) => <Button key={item.device_id} variant={node === item.device_id ? 'primary' : 'secondary'} disabled={Boolean(submission.current)} onPress={() => setDraft((current) => ({ ...current, coordinator_node: item.device_id }))} accessibilityState={{ selected: node === item.device_id }}><Text>{item.name}{item.online ? '' : ' · 离线'}</Text></Button>)}</View>
+    <Text className="text-sm text-muted">频道消息由默认协调 Bot 承接。</Text>{conflict ? <Text role="status" className="text-sm text-warning">频道设置已在其他地方更新。当前编辑已保留，保存仍使用打开时的版本；请返回后重新打开以读取最新设置。</Text> : null}{error ? <ErrorText error={error} /> : null}<Button disabled={Boolean(busy) || !shared.writable} onPress={() => void run('save-channel', async () => {
+      if (!isCurrent() || !active.current) return
+      if (!title.trim() || !members.length || !members.includes(coordinator)) throw new Error('请填写频道名称，选择成员并将默认协调 Bot 加入成员。')
+      const configuration = { channel_id: draft.channel_id, title: title.trim(), purpose: purpose.trim(), members, coordinator_bot: coordinator, coordinator_node: node }
+      const command: Extract<WorkspaceCommand, { kind: 'create_channel' | 'configure_channel' }> = submission.current ?? (draft.kind === 'edit' ? { kind: 'configure_channel', ...configuration, expected_revision: draft.expected_revision, owner_epoch: draft.owner_epoch } : { kind: 'create_channel', ...configuration })
       submission.current = command
       await shared.workspaceCommand(command)
-      router.replace(`/channel/${id.current}`)
-    })}><Text>{busy ? '正在保存' : channelId ? '保存频道' : '创建频道'}</Text></Button>
+      if (active.current && isCurrent()) router.replace(`/channel/${command.channel_id}`)
+    })}><Text>{busy ? '正在保存' : draft.kind === 'edit' ? '保存频道' : '创建频道'}</Text></Button>
   </KeyboardAwareScrollView>
 }
 

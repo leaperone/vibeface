@@ -14,7 +14,7 @@ import { entryAddress, entryJson, entryKey, messageOf, parseEntry, parseInfo, pr
 import * as nodeSettings from "@vibeface/client/lib/node.ts"
 import type { OutboxItem } from '@vibeface/client/lib/outbox.ts'
 import type { NodeSettingsResponse, ProviderReadiness, ProviderStatus, ReadyConnection } from "@vibeface/client/lib/node.ts"
-import type { HistorySection, InputReceipt, InputOptions, InputTarget, ManagerJob, PendingMessage, WorkRecord, WorkspaceDomainState } from "@vibeface/client/workspace/types.ts"
+import type { HistorySection, InputReceipt, InputOptions, InputTarget, ManagerJob, PendingMessage, WorkRecord, WorkspaceChannel, WorkspaceCommand, WorkspaceDomainState, WorkspaceFilter } from "@vibeface/client/workspace/types.ts"
 import { cardState, nodeName, taskGroup } from "@vibeface/client/workspace/labels.ts"
 import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "@vibeface/client/workspace/model.ts"
 import { botCopy, folderLabels, folderSetup, placeChanges, projectChoices, projectKey, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
@@ -1873,7 +1873,7 @@ test("workspace preserves bot and message requests while routing native decision
   }
 })
 
-function componentHarness(path: string, dependencies: Record<string, unknown>, globals: Record<string, unknown> = {}, privateExport = '') {
+function componentHarness(path: string, dependencies: Record<string, unknown>, globals: Record<string, unknown> = {}, privateExport = '', realModules: Record<string, string> = {}) {
   const hooks = hookHarness(true), { values, effects, afterRender } = hooks
   const focusEffects = new Map<number, { run: () => (() => void) | void; cleanup?: () => void }>()
   type Props = Record<string, unknown> & { name?: string; type?: string; role?: string; disabled?: boolean; value?: unknown; onChange?: (event: unknown) => void; onSubmit?: (event?: unknown) => void; onClick?: () => void; action?: () => Promise<unknown> }
@@ -1912,13 +1912,14 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   const nativeRouterModule = dependencies['expo-router']
   const nativeRouter = typeof nativeRouterModule === 'object' && nativeRouterModule !== null && 'router' in nativeRouterModule ? nativeRouterModule.router : {}
   const require = (specifier: string): unknown => {
+    if (realModules[specifier]) return loadComponentModule(fileURLToPath(new URL(realModules[specifier], import.meta.url)))
     if (specifier === '@/components/arc/routed-action') return { RoutedAction: 'Link', ActionLink: 'a' }
     if (specifier === '@/components/arc/task-run-summary') return { TaskRunSummary: function TaskRunSummary() {} }
     if (path.includes('/mobile/') && specifier === '@/components/arc/input') return { Input: 'TextInput' }
     if (path.includes('/mobile/') && specifier === '@/components/arc/textarea') return { Textarea: 'TextInput' }
     if (path.includes('/mobile/') && specifier === '@/components/arc/chat') return { ComposerInput: 'TextInput', ComposerPanel: 'ComposerPanel', MessageBubble: 'View' }
     if (path.includes('/mobile/') && specifier === '@/components/arc/selection') return { SelectionItem: 'Pressable' }
-    if (path.includes('/mobile/') && specifier === '@/lib/use-clipboard') return loadClipboard(fileURLToPath(new URL('../../../../../apps/mobile/src/lib/use-clipboard.ts', import.meta.url)))
+    if (path.includes('/mobile/') && specifier === '@/lib/use-clipboard') return loadComponentModule(fileURLToPath(new URL('../../../../../apps/mobile/src/lib/use-clipboard.ts', import.meta.url)))
     if (specifier === '@vibeface/client/workspace/model.ts') {
       const override = dependencies[specifier]
       return { ...workspaceModel, ...(typeof override === 'object' && override !== null ? override : {}) }
@@ -1940,7 +1941,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     if (specifier === '@tanstack/react-router') return { Link: 'Link', useNavigate: () => () => {}, useRouterState: ({ select }: { select: (state: unknown) => unknown }) => select({ location: { search: {} } }), ...dependencies[specifier] as object }
     return specifier === 'react' ? react : specifier === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : specifier === 'expo-router' ? { Link: 'Link', useFocusEffect, useRouter: () => nativeRouter, ...dependencies[specifier] as object } : dependencies[specifier] ?? ui
   }
-  const loadClipboard = moduleLoader(createContext({ setTimeout, clearTimeout, ...globals }), specifier => require(specifier))
+  const loadComponentModule = moduleLoader(createContext({ setTimeout, clearTimeout, ...globals }), specifier => require(specifier))
   const filename = fileURLToPath(new URL(path, import.meta.url))
   const source = readFileSync(filename, 'utf8') + (privateExport ? `\nexport { ${privateExport} }\n` : '')
   const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
@@ -2007,6 +2008,188 @@ const pendingResult = () => {
   return { promise, resolve, reject }
 }
 const settleComponent = () => new Promise(setImmediate)
+
+test('Mobile channel drafts load once, retain their revision and reset with their owner', async () => {
+  const path = '../../../../../apps/mobile/src/features/workspace/workspace.tsx'
+  const channel = (id: string, revision = 4): WorkspaceChannel => ({ channel_id: id, title: `频道 ${id}`, purpose: `目标 ${id}`, members: ['b'], coordinator_bot: 'b', coordinator_node: 'worker', owner_epoch: 2, revision, event_hash: `event-${revision}`, created_at_ms: 1 })
+  const ready = { principal: { network_id: 'network-one', device_id: 'phone' }, entry: { device_id: 'entry' } }
+  let generation = 1, current = true, save = pendingResult(), nextId = 0
+  const coldRead = pendingResult(), reads: WorkspaceFilter[] = []
+  const commands: WorkspaceCommand[] = [], navigations: string[] = [], channels: WorkspaceChannel[] = Array.from({ length: 256 }, (_,index) => channel(`window-${index}`))
+  const shared = {
+    generation, writable: true, workspaceState: { channels }, isCurrent: () => current,
+    readWorkspaceState: (filter: WorkspaceFilter) => { reads.push(filter); return reads.length === 1 ? coldRead.promise : Promise.resolve({ channels: shared.workspaceState.channels.filter((item) => item.channel_id === filter.channel_id) }) },
+    bots: [{ bot_id: 'a', name: 'Bot A' }, { bot_id: 'b', name: 'Bot B' }],
+    nodes: [{ device_id: 'entry', name: '入口', online: true, revoked: false }, { device_id: 'worker', name: '工作机', online: true, revoked: false }],
+    workspaceCommand: (command: WorkspaceCommand) => { commands.push(command); return save.promise },
+  }
+  const dependencies = {
+    '@/data/live': { useLive: () => ({ ...shared }) },
+    '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready, connectionGeneration: () => generation }) },
+    '@vibeface/client/lib/node.ts': { messageOf },
+    '@vibeface/client/workspace/storage.ts': { newId: () => `new-${++nextId}` },
+    '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
+    'expo-router': { Stack: { Screen: 'Screen' }, useRouter: () => ({ replace: (url: string) => navigations.push(url) }) },
+  }
+  const screen = componentHarness(path, dependencies)
+  let form: ReturnType<typeof componentHarness> | undefined, key: string | undefined
+  const render = (channelId?: string) => {
+    const child = screen.render('ChannelSettingsScreen', { channelId }).find(({ type }) => typeof type === 'function' && type.name === 'ChannelForm')
+    if (!child) { form?.close(); form = undefined; key = undefined; return [] }
+    if (child.key !== key) {
+      form?.close()
+      form = componentHarness(path, dependencies, {}, 'ChannelForm', { '@/lib/use-run': '../../../../../apps/mobile/src/lib/use-run.ts' })
+      key = child.key
+    }
+    assert.ok(form)
+    return form.render('ChannelForm', child.props)
+  }
+  const field = (label: string, id?: string) => render(id).find(({ type, props }) => type === 'TextInput' && props.accessibilityLabel === label)?.props
+  const change = (label: string, value: string, id?: string) => { const action = field(label, id)?.onChangeText; assert.equal(typeof action, 'function'); if (typeof action === 'function') action(value) }
+  const press = (label: string, id?: string) => { const action = render(id).find(({ type, props }) => type === 'Button' && componentText(props.children) === label)?.props.onPress; assert.equal(typeof action, 'function'); if (typeof action === 'function') action() }
+  const selected = (id: string) => render(id).filter(({ props }) => props.accessibilityState && workspaceModel.record(props.accessibilityState).selected === true).map(({ props }) => componentText(props.children))
+  try {
+    assert.equal(render('one').length, 0)
+    assert.equal(screen.render('ChannelSettingsScreen', { channelId: 'one' }).find(({ type }) => type === 'EmptyState')?.props.title, '正在读取频道设置')
+    assert.deepEqual(JSON.parse(JSON.stringify(reads)), [{ channel_id: 'one' }])
+    coldRead.resolve({ channels: [channel('one')] }); await settleComponent()
+    assert.equal(field('频道名称', 'one')?.value, '频道 one')
+    assert.equal(field('频道目标', 'one')?.value, '目标 one')
+    assert.deepEqual(selected('one'), ['Bot B', '工作机'])
+    assert.deepEqual(render('one').filter(({ type, props }) => type === 'Pressable' && workspaceModel.record(props.accessibilityState).checked === true).map(({ props }) => props.accessibilityLabel), ['Bot B'])
+    change('频道名称', '本地标题', 'one'); change('频道目标', '本地目标', 'one')
+    const member = render('one').find(({ type, props }) => type === 'Pressable' && props.accessibilityLabel === 'Bot A')?.props.onPress
+    assert.equal(typeof member, 'function'); if (typeof member === 'function') member()
+    press('Bot A', 'one'); press('入口', 'one')
+    shared.workspaceState.channels = [{ ...channel('one', 5), title: '远端标题', purpose: '远端目标', owner_epoch: 3 }]
+    assert.equal(field('频道名称', 'one')?.value, '本地标题')
+    assert.equal(field('频道目标', 'one')?.value, '本地目标')
+    assert.deepEqual(selected('one'), ['Bot A', '入口'])
+    assert.match(componentText(form?.output), /频道设置已在其他地方更新/)
+    assert.equal(reads.length, 1, 'ordinary shared object and revision changes never restart the scoped read')
+    press('保存频道', 'one'); press('正在保存', 'one')
+    assert.equal(commands.length, 1, 'pending saves do not submit twice')
+    assert.deepEqual(JSON.parse(JSON.stringify(commands[0])), { kind: 'configure_channel', channel_id: 'one', title: '本地标题', purpose: '本地目标', members: ['b', 'a'], coordinator_bot: 'a', coordinator_node: 'entry', expected_revision: 4, owner_epoch: 2 })
+    save.reject(new Error('保存结果尚未确认')); await settleComponent()
+    assert.equal(field('频道名称', 'one')?.editable, false)
+    assert.equal(render('one').find(({ type }) => type === 'ErrorText')?.props.error, '保存结果尚未确认')
+    save = pendingResult(); press('保存频道', 'one')
+    assert.equal(commands[1], commands[0], 'unknown-result retry preserves the original command identity')
+    save.resolve(undefined); await settleComponent()
+    assert.deepEqual(navigations, ['/channel/one'])
+
+    shared.workspaceState.channels.push(channel('two', 9))
+    render('two'); await settleComponent()
+    assert.equal(field('频道名称', 'two')?.value, '频道 two')
+    save = pendingResult(); press('保存频道', 'two')
+    const lateId = save
+    screen.render('ChannelSettingsScreen', { channelId: 'one' })
+    lateId.resolve(undefined); await settleComponent()
+    assert.deepEqual(navigations, ['/channel/one'], 'a previous route never navigates even before its form unmounts')
+    assert.equal(field('频道名称', 'one')?.value, '远端标题')
+    assert.equal(field('频道名称', 'one')?.editable, true)
+    assert.equal(render('one').find(({ type }) => type === 'ErrorText'), undefined)
+
+    change('频道名称', '旧网络草稿', 'one')
+    save = pendingResult(); press('保存频道', 'one')
+    const lateNetwork = save
+    ready.principal.network_id = 'network-two'
+    shared.workspaceState.channels = [{ ...channel('one', 12), title: '新网络频道' }]
+    render('one'); await settleComponent()
+    assert.equal(field('频道名称', 'one')?.value, '新网络频道')
+    lateNetwork.resolve(undefined); await settleComponent()
+    assert.deepEqual(navigations, ['/channel/one'])
+    change('频道名称', '旧设备草稿', 'one'); ready.principal.device_id = 'another-phone'
+    render('one'); await settleComponent()
+    assert.equal(field('频道名称', 'one')?.value, '新网络频道')
+    change('频道名称', '旧连接草稿', 'one'); generation++; shared.generation = generation
+    render('one'); await settleComponent()
+    assert.equal(field('频道名称', 'one')?.value, '新网络频道')
+    save = pendingResult(); press('保存频道', 'one'); current = false
+    save.resolve(undefined); await settleComponent()
+    assert.deepEqual(navigations, ['/channel/one'], 'a stale workspace never navigates after save')
+    current = true
+
+    assert.equal(field('频道名称')?.value, '')
+    change('频道名称', '新频道')
+    save = pendingResult(); press('创建频道')
+    assert.deepEqual(JSON.parse(JSON.stringify(commands.at(-1))), { kind: 'create_channel', channel_id: 'new-1', title: '新频道', purpose: '', members: ['a', 'b'], coordinator_bot: 'a', coordinator_node: 'entry' })
+    form?.close(); form = undefined
+    save.resolve(undefined); await settleComponent()
+    assert.deepEqual(navigations, ['/channel/one'], 'an unmounted form never navigates after save')
+  } finally { form?.close(); screen.close() }
+})
+
+test('Mobile channel scoped reads settle missing records, retry failures and ignore stale owners', async () => {
+  const ready = { principal: { network_id: 'network', device_id: 'phone' }, entry: { device_id: 'entry' } }
+  let current = true
+  const requests: { filter: WorkspaceFilter; result: ReturnType<typeof pendingResult> }[] = []
+  const shared = {
+    generation: 1, workspaceState: { channels: [] }, isCurrent: () => current,
+    readWorkspaceState: (filter: WorkspaceFilter) => { const result = pendingResult(); requests.push({ filter, result }); return result.promise },
+  }
+  const app = componentHarness('../../../../../apps/mobile/src/features/workspace/workspace.tsx', {
+    '@/data/live': { useLive: () => ({ ...shared }) },
+    '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready }) },
+    '@vibeface/client/lib/node.ts': { messageOf }, 'expo-router': { Stack: { Screen: 'Screen' } },
+  })
+  const render = (channelId?: string) => app.render('ChannelSettingsScreen', { channelId })
+  const notice = (id: string) => render(id).find(({ type }) => type === 'EmptyState')?.props.title
+  const form = (id: string) => render(id).find(({ type }) => typeof type === 'function' && type.name === 'ChannelForm')
+  const retry = (id: string) => {
+    const action = render(id).find(({ type, props }) => type === 'Button' && componentText(props.children) === '重新读取')?.props.onPress
+    assert.equal(typeof action, 'function'); if (typeof action === 'function') action()
+    render(id)
+  }
+  const response = (id: string) => ({ channels: [{ channel_id: id, title: `频道 ${id}`, purpose: '明确的目标', members: ['bot'], coordinator_bot: 'bot', coordinator_node: 'worker', revision: 7, owner_epoch: 3 }] })
+  try {
+    assert.equal(notice('missing'), '正在读取频道设置')
+    assert.deepEqual(JSON.parse(JSON.stringify(requests[0].filter)), { channel_id: 'missing' })
+    requests[0].result.resolve({ channels: [] }); await settleComponent()
+    assert.equal(notice('missing'), '没有找到这个频道')
+    assert.equal(form('missing'), undefined, 'not-found never becomes a create form')
+    retry('missing')
+    assert.equal(notice('missing'), '正在读取频道设置')
+    assert.equal(requests.length, 2)
+    requests[1].result.reject(new Error('无法读取这个频道')); await settleComponent()
+    assert.equal(notice('missing'), '无法读取这个频道')
+    assert.equal(form('missing'), undefined)
+    retry('missing')
+    assert.deepEqual(JSON.parse(JSON.stringify(requests[2].filter)), { channel_id: 'missing' })
+    requests[2].result.resolve(response('missing')); await settleComponent()
+    assert.ok(form('missing'))
+    assert.equal(notice('missing'), undefined)
+
+    for (const outcome of ['resolve', 'reject']) {
+      render(`old-${outcome}`)
+      const old = requests.at(-1)
+      assert.ok(old)
+      ready.principal.network_id = `network-${outcome}`
+      assert.equal(notice('new'), '正在读取频道设置')
+      const fresh = requests.at(-1)
+      assert.ok(fresh && fresh !== old)
+      if (outcome === 'resolve') old.result.resolve(response(`old-${outcome}`))
+      else old.result.reject(new Error('旧网络读取失败'))
+      await settleComponent()
+      assert.equal(notice('new'), '正在读取频道设置', 'an old response or error cannot settle the new owner')
+      assert.equal(form('new'), undefined)
+      fresh.result.resolve(response('new')); await settleComponent()
+      assert.ok(form('new'))
+      assert.equal(notice('new'), undefined)
+    }
+    render('disconnected'); current = false
+    requests.at(-1)?.result.resolve(response('disconnected')); await settleComponent()
+    assert.equal(form('disconnected'), undefined, 'a non-current workspace cannot accept a response')
+    current = true
+    render('unmounted')
+    app.close()
+    requests.at(-1)?.result.reject(new Error('卸载后读取失败')); await settleComponent()
+    assert.equal(notice('unmounted'), '正在读取频道设置', 'an unmounted screen ignores late failures')
+    const count = requests.length
+    render()
+    assert.equal(requests.length, count, 'create mode never starts a scoped channel read')
+  } finally { app.close() }
+})
 
 const elementText = (node: unknown): string => typeof node === 'string' ? node : Array.isArray(node) ? node.map(elementText).join('')
   : node && typeof node === 'object' && 'props' in node && node.props && typeof node.props === 'object' && 'children' in node.props ? elementText(node.props.children) : ''
