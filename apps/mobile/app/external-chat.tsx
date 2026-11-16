@@ -1,5 +1,4 @@
-import * as Clipboard from 'expo-clipboard'
-import { CircleCheck, CircleHelp, CircleX, Copy, Inbox, Layers, LoaderCircle, MessageSquareShare, Plus, Trash2, X, Zap, type LucideIcon } from 'lucide-react-native'
+import { Check, CircleCheck, CircleHelp, CircleX, Copy, Inbox, Layers, LoaderCircle, MessageSquareShare, Plus, Trash2, X, Zap, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useState } from 'react'
 import { Linking, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
@@ -17,6 +16,7 @@ import { Segmented } from '@/components/arc/segmented'
 import { Text } from '@/components/arc/text'
 import { Field, PathList, Retry, useCall } from '@/features/devices/remote-settings'
 import { cn } from '@/lib/utils'
+import { useClipboardAction } from '@/lib/use-clipboard'
 
 const outlets: [Outlet, string, LucideIcon][] = [['record', waitingCopy.outlets.record, Inbox], ['both', waitingCopy.outlets.both, Layers]]
 
@@ -39,6 +39,7 @@ function Triage() {
   const [secret, setSecret] = useState('')
   const [label, setLabel] = useState('')
   const [token, setToken] = useState('')
+  const clipboard = useClipboardAction(token)
   const [test, setTest] = useState<{ ok: boolean; text: string } | null>(null)
   useEffect(() => { if (settings) setUrl(settings.webhook_url) }, [settings?.webhook_url])
   if (!settings) return error ? <Retry error={error.text} onRetry={load} /> : <Skeleton className="h-24 rounded-panel" />
@@ -106,11 +107,11 @@ function Triage() {
         {connect}
         <Details label="让外部聊天代你回答">
           <Field label="地址"><Text selectable numberOfLines={1} className="rounded-control bg-surface-muted/60 px-3 py-2 font-mono text-sm">{settings.decision_url}</Text></Field>
-          {token ? <View className="flex-row items-center gap-2 rounded-control border border-warning-border bg-warning-subtle ps-3">
+          {token ? <View className="gap-1"><View className="flex-row items-center gap-2 rounded-control border border-warning-border bg-warning-subtle ps-3">
             <Text selectable className="min-w-0 flex-1 font-mono text-sm">{token}</Text>
-            <Button variant="ghost" iconOnly accessibilityLabel="复制授权码" accessibilityHint="只显示这一次" onPress={() => void Clipboard.setStringAsync(token)}><Icon as={Copy} /></Button>
+            <Button variant="ghost" iconOnly accessibilityLabel={clipboard.copied ? '已复制授权码' : '复制授权码'} accessibilityHint="只显示这一次" disabled={clipboard.busy} onPress={() => void clipboard.copy(token)}><Icon as={clipboard.copied ? Check : Copy} /></Button>
             <Button variant="ghost" iconOnly accessibilityLabel="收起" onPress={() => setToken('')}><Icon as={X} /></Button>
-          </View> : null}
+          </View><ErrorText error={clipboard.error} /></View> : null}
           {settings.decision_tokens.map((item) => <View key={item.token_id} className="min-h-11 flex-row items-center gap-2 rounded-control bg-surface-muted/60 ps-3">
             <Text numberOfLines={1} className="min-w-0 flex-1 text-sm">{item.label || '未命名'}</Text>
             <Text className="text-sm text-muted">{new Date(item.created_ms).toLocaleDateString()}</Text>

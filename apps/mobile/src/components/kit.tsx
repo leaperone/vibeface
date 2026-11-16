@@ -1,20 +1,21 @@
 import { WizardStep } from '@/components/arc/wizard'
 import { ToastNotice } from '@/components/arc/feedback'
 export { Skeleton } from '@/components/arc/feedback'
-import * as Clipboard from 'expo-clipboard'
 import { Link, type Href } from 'expo-router'
 import { Asterisk, Braces, Check, ChevronRight, CircleAlert, CircleCheck, Copy, Info, MousePointer2, Pi, SquareTerminal, TriangleAlert, Wifi, WifiOff, type LucideIcon } from 'lucide-react-native'
-import { Children, Fragment, isValidElement, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
+import { Children, Fragment, isValidElement, useState, useSyncExternalStore, type ReactNode } from 'react'
 import { AccessibilityInfo, Pressable, View } from 'react-native'
 import Animated, { LayoutAnimationConfig, useAnimatedStyle, useSharedValue, withTiming } from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
 import { AlertPanel, ApprovalPanel, Empty, SettingsSection } from '@/components/arc/surface'
 import type { ProviderId } from '@vibeface/client/lib/node.ts'
 import { Button } from '@/components/arc/button'
+import { ErrorText } from '@/components/action'
 import { Icon } from '@/components/arc/icon'
 import { Text } from '@/components/arc/text'
 import { fadeIn, fadeOut, glide, move } from '@/lib/motion'
 import { cn } from '@/lib/utils'
+import { useClipboardAction } from '@/lib/use-clipboard'
 
 const AnimatedView = withUniwind(Animated.View)
 
@@ -101,19 +102,11 @@ export function SafetyCode({ code }: { code: string }) {
 
 /** A long id on one line with its middle elided, and a copy button that turns into a check for a moment; the id keeps its width. */
 export function CopyableId({ value, label }: { value: string; label: string }) {
-  const [copied, setCopied] = useState(false)
-  const timer = useRef<ReturnType<typeof setTimeout>>(undefined)
-  useEffect(() => () => clearTimeout(timer.current), [])
-  return <View className="min-h-11 flex-row items-center gap-2 rounded-control bg-surface-muted/60 ps-3">
+  const { busy, copied, error, copy } = useClipboardAction(value)
+  return <View className="gap-1"><View className="min-h-11 flex-row items-center gap-2 rounded-control bg-surface-muted/60 ps-3">
     <Text numberOfLines={1} ellipsizeMode="middle" className="min-w-0 flex-1 font-mono text-sm">{value}</Text>
-    <Button variant="ghost" iconOnly accessibilityLabel={`复制${label}`} onPress={() => {
-      void Clipboard.setStringAsync(value)
-      setCopied(true)
-      AccessibilityInfo.announceForAccessibility('已复制')
-      clearTimeout(timer.current)
-      timer.current = setTimeout(() => setCopied(false), 1500)
-    }}><Icon as={copied ? Check : Copy} className={cn('size-4', copied && 'text-success')} /></Button>
-  </View>
+    <Button variant="ghost" iconOnly accessibilityLabel={`复制${label}`} disabled={busy} onPress={() => void copy(value)}><Icon as={copied ? Check : Copy} className={cn('size-4', copied && 'text-success')} /></Button>
+  </View><ErrorText error={error} /></View>
 }
 
 export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }

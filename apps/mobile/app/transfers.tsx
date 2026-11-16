@@ -1,6 +1,5 @@
 import { Card } from '@/components/arc/surface'
 import { SelectionItem } from '@/components/arc/selection'
-import * as Clipboard from 'expo-clipboard'
 import { ArrowDownLeft, ArrowDownToLine, ArrowRightLeft, ArrowUpRight, Check, CircleCheck, Copy, Crown, File, FlaskConical, Laptop, LoaderCircle, RefreshCw, ShieldCheck, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { View } from 'react-native'
@@ -19,6 +18,7 @@ import { Segmented } from '@/components/arc/segmented'
 import { Switch } from '@/components/arc/switch'
 import { Text } from '@/components/arc/text'
 import { useRun } from '@/lib/use-run'
+import { useClipboardAction } from '@/lib/use-clipboard'
 import { cn } from '@/lib/utils'
 import { mobilePlatform } from '@/platform'
 
@@ -247,8 +247,8 @@ function InputField({ label, hint, value, disabled, onChange, peer, numeric }: {
 
 /** The 64-character ID stays unseen; this copies it to send to whoever sends a file. */
 function CopyConnectionId({ value }: { value: string }) {
-  const [copied, setCopied] = useState(false)
-  return <Button variant="secondary" className="self-start" onPress={() => { void Clipboard.setStringAsync(value).then(() => setCopied(true), () => {}) }}>
+  const { busy, copied, error, copy } = useClipboardAction(value)
+  return <View className="gap-1"><Button variant="secondary" className="self-start" disabled={busy} onPress={() => void copy(value)}>
     <Icon as={copied ? Check : Copy} className={copied ? 'text-success' : undefined} /><Text>{copied ? '已复制' : '复制连接 ID'}</Text>
-  </Button>
+  </Button><ErrorText error={error} /></View>
 }
