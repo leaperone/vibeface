@@ -124,6 +124,100 @@ fn scoped(command: Command) -> (u64, Command) {
     }
 }
 
+#[gpui_kit::test]
+fn controlled_input_fixture_preserves_report_actions_and_reconfiguration(cx: &mut TestAppContext) {
+    let mut h = open(cx, Route::Home, Snapshot::default());
+    h.window
+        .update(cx, |_, window, cx| {
+            assert_eq!(
+                h.view.read(cx).fixture_report(window, cx),
+                serde_json::json!({
+                    "runtime_ui": "gpui",
+                    "phase": "completed",
+                    "window_opened": true,
+                    "pid": std::process::id(),
+                    "node_started": false,
+                    "controlled_fixture": true,
+                    "input_text": "",
+                    "submitted_text": "",
+                    "action_count": 0,
+                    "focused": false,
+                    "ime_verified": false,
+                })
+            );
+            h.view.update(cx, |view, cx| {
+                assert!(view.accept_join_activation("controlled-invitation".into(), window, cx));
+                assert!(view.form.is_some());
+                view.configure_fixture(window, cx);
+                assert!(view.form.is_none());
+            });
+            window.render_frame(cx);
+            window.input("native-gpui-fixture", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    h.window
+        .update(cx, |_, window, cx| {
+            h.view.update(cx, |view, cx| {
+                let report = view.fixture_report(window, cx);
+                assert_eq!(report["input_text"], "native-gpui-fixture");
+                assert_eq!(report["submitted_text"], "native-gpui-fixture");
+                assert_eq!(report["action_count"], 1);
+                assert_eq!(report["focused"], true);
+                view.composer
+                    .update(cx, |state, cx| state.focus(window, cx));
+                assert_eq!(view.fixture_report(window, cx)["focused"], false);
+                view.configure_fixture(window, cx);
+                view.configure_fixture(window, cx);
+                let report = view.fixture_report(window, cx);
+                assert_eq!(report["input_text"], "native-gpui-fixture");
+                assert_eq!(report["submitted_text"], "native-gpui-fixture");
+                assert_eq!(report["action_count"], 1);
+                assert_eq!(report["focused"], true);
+            });
+            window.render_frame(cx);
+            window.press("secondary-a", cx);
+            window.input("button-input", cx);
+        })
+        .unwrap();
+    click(&h, cx, "fixture-submit");
+    h.window
+        .update(cx, |_, window, cx| {
+            let report = h.view.read(cx).fixture_report(window, cx);
+            assert_eq!(report["input_text"], "button-input");
+            assert_eq!(report["submitted_text"], "button-input");
+            assert_eq!(report["action_count"], 2);
+            h.view
+                .update(cx, |view, cx| view.configure_fixture(window, cx));
+            window.render_frame(cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    h.window
+        .update(cx, |_, window, cx| {
+            assert_eq!(
+                h.view.read(cx).fixture_report(window, cx),
+                serde_json::json!({
+                    "runtime_ui": "gpui",
+                    "phase": "completed",
+                    "window_opened": true,
+                    "pid": std::process::id(),
+                    "node_started": false,
+                    "controlled_fixture": true,
+                    "input_text": "button-input",
+                    "submitted_text": "button-input",
+                    "action_count": 3,
+                    "focused": true,
+                    "ime_verified": false,
+                })
+            );
+        })
+        .unwrap();
+    assert!(h.commands.try_recv().is_err());
+}
+
 fn task_actions_fixture() -> Snapshot {
     let mut snapshot = fixture();
     snapshot.tasks = vec![
