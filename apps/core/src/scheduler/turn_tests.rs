@@ -412,6 +412,7 @@ async fn a_registered_backup_keeps_one_reservation_and_closes_before_a_failed_sw
             if failed_switch {
                 fixture.sql("CREATE TRIGGER fail_switch BEFORE UPDATE OF session_generation ON scheduler_sessions
                     WHEN NEW.session_generation > OLD.session_generation
+                        AND OLD.active IS NOT NULL AND NEW.active = OLD.active
                     BEGIN SELECT RAISE(FAIL,'controlled backup switch write failure'); END;").await?;
             }
             assert_eq!(fixture.run().await?.context("invocation")?["state"], "failed");
