@@ -4,17 +4,15 @@ import * as Haptics from 'expo-haptics'
 import * as ImagePicker from 'expo-image-picker'
 import { ArrowUp, LoaderCircle, Paperclip, Square, X } from 'lucide-react-native'
 import { useEffect, useRef, type ReactNode } from 'react'
-import { ActionSheetIOS, Alert, Platform, Pressable, ScrollView, TextInput, View } from 'react-native'
-import { Button } from '@/components/ui/button'
-import { caret } from '@/components/ui/input'
-import { Icon } from '@/components/ui/icon'
-import { Text } from '@/components/ui/text'
+import { ActionSheetIOS, Alert, Platform, ScrollView, View } from 'react-native'
+import { Button } from '@/components/arc/button'
+import { Icon } from '@/components/arc/icon'
+import { Text } from '@/components/arc/text'
 import type { Attachment } from '@/data/types'
 import { privateFiles } from '@/platform/files'
-import { ChatMaterial, type ChatChrome } from './chrome'
+import { ComposerInput, ComposerPanel } from '@/components/arc/chat'
 
 type Props = {
-  chrome: ChatChrome
   value: string
   onChange: (value: string) => void
   files: Attachment[]
@@ -27,15 +25,13 @@ type Props = {
   onStop?: () => void
   /** Status and actions shown below the input. */
   children?: ReactNode
-  /** The bot's accent for the live send button; the neutral fill without it. */
-  tint?: { fill: string; ink: string }
   /** A small control beside the send button, inside the box. */
   target?: ReactNode
   sendLabel?: string
   label?: string
 }
 
-export function Composer({ chrome, value, onChange, files, onFiles, attachmentScope, blocked, sending, onSend, onStop, children, tint, target, sendLabel = '发送', label = '给 Bot 发消息' }: Props) {
+export function Composer({ value, onChange, files, onFiles, attachmentScope, blocked, sending, onSend, onStop, children, target, sendLabel = '发送', label = '给 Bot 发消息' }: Props) {
   const ios = Platform.OS === 'ios'
   const enabled = !blocked && !sending
   const latest = useRef({ files, onFiles, attachmentScope, enabled, generation: 0, mounted: true })
@@ -48,7 +44,6 @@ export function Composer({ chrome, value, onChange, files, onFiles, attachmentSc
   const picking = useRef(false)
   const drafting = value.trim().length > 0 || files.length > 0
   const canSend = !blocked && !sending && drafting
-  const armed = canSend
   const pick = async (source: 'photos' | 'files', generation: number) => {
     if (picking.current || !latest.current.mounted || !latest.current.enabled || latest.current.generation !== generation) return
     picking.current = true
@@ -98,43 +93,28 @@ export function Composer({ chrome, value, onChange, files, onFiles, attachmentSc
       { text: '取消', style: 'cancel' },
     ])
   }
-  const attach = <Button variant="ghost" size="icon" className={ios ? 'size-13 rounded-full' : 'rounded-full'} accessibilityLabel={files.length ? `添加附件，已选 ${files.length} 个` : '添加附件'} disabled={!enabled} onPress={choose}>
-    <Icon as={Paperclip} className="text-muted-foreground" />
+  const attach = <Button variant="ghost" iconOnly accessibilityLabel={files.length ? `添加附件，已选 ${files.length} 个` : '添加附件'} disabled={!enabled} onPress={choose}>
+    <Icon as={Paperclip} className="text-secondary" />
   </Button>
-  const controls = <>
-    {onStop ? <Button instant size="icon" variant="outline" className="rounded-full shadow-none" accessibilityLabel="停止" onPress={onStop}>
-      <Icon as={Square} className="fill-foreground" />
-    </Button> : null}
-    <Button instant size="icon" variant="default" className="rounded-full shadow-none" style={armed && tint ? { backgroundColor: tint.fill } : undefined} accessibilityLabel={sending ? '本地保存中' : sendLabel} disabled={!canSend}
+  const controls = <View className="flex-row items-center gap-2">
+    {onStop ? <Button iconOnly variant="secondary" accessibilityLabel="停止" onPress={onStop}><Icon as={Square} className="fill-foreground" /></Button> : null}
+    <Button iconOnly accessibilityLabel={sending ? '本地保存中' : sendLabel} accessibilityState={{ busy: sending }} disabled={!canSend}
       onPress={sending ? undefined : () => { void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); onSend() }}>
-      {sending ? <Icon as={LoaderCircle} /> : <Icon as={ArrowUp} color={armed ? tint?.ink : undefined} />}
+      <Icon as={sending ? LoaderCircle : ArrowUp} />
     </Button>
-  </>
-  const input = <TextInput {...caret} maxFontSizeMultiplier={2} accessibilityLabel={label} placeholder={blocked ?? '发消息'} placeholderTextColorClassName="accent-muted-foreground" multiline maxLength={100000}
-    className={ios ? 'max-h-40 min-h-11 min-w-0 flex-1 ps-3.5 pe-2 py-2.5 font-sans text-body text-foreground' : 'max-h-40 min-h-11 px-4 pt-3 pb-1 font-sans text-body text-foreground'} value={value} onChangeText={onChange} />
-  const box = <>
-    {files.length ? <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerClassName="gap-2 px-3 pt-3">
-      {files.map((file, index) => <View key={`${file.uri}:${index}`} className="max-w-48 flex-row items-center rounded-full bg-muted ps-3">
-        <Text numberOfLines={1} className="shrink text-meta">{file.name}</Text>
-        <Pressable accessibilityRole="button" accessibilityLabel={`移除 ${file.name}`} hitSlop={6} className="size-8 items-center justify-center" onPress={() => { try { privateFiles.release(file.uri); onFiles(files.filter((_, at) => at !== index)) } catch (cause) { Alert.alert('未能移除附件', cause instanceof Error ? cause.message : '请重试。') } }}>
-          <Icon as={X} className="size-3.5" />
-        </Pressable>
-      </View>)}
-    </ScrollView> : null}
-    {ios ? <View className="min-h-13 flex-row items-end p-1">
-      {input}<View className="flex-row gap-1">{target}{controls}</View>
-    </View> : <>
-      {input}
-      <View className="flex-row items-center justify-between ps-0.5 pe-1.5 pb-1.5"><View className="flex-row items-center">{attach}{target}</View>{controls}</View>
-    </>}
-  </>
-  return <View pointerEvents={ios ? 'box-none' : undefined} className={ios ? 'gap-2 px-4 pb-2' : 'gap-2 bg-background px-4 pb-3'}>
-    {ios ? <View pointerEvents="box-none" className="w-full max-w-3xl flex-row items-end gap-2 self-center">
-      <ChatMaterial chrome={chrome} className="size-13">{attach}</ChatMaterial>
-      <ChatMaterial chrome={chrome} className="min-w-0 flex-1">{box}</ChatMaterial>
-    </View> : <View className="w-full max-w-3xl self-center rounded-2xl border border-input bg-card shadow-sm">{box}</View>}
-    {blocked && value || children ? <View className={ios ? 'w-full max-w-3xl self-center rounded-xl bg-card py-1' : 'w-full max-w-3xl self-center'}>
-      {blocked && value ? <Text className="px-2 text-meta text-muted-foreground">{blocked}</Text> : null}
+  </View>
+  const input = <ComposerInput maxFontSizeMultiplier={2} accessibilityLabel={label} placeholder={blocked ?? '发消息'} multiline maxLength={100000}
+    value={value} onChangeText={onChange} />
+  const attachments = files.length ? <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerClassName="gap-2 px-2 pt-2">
+    {files.map((file, index) => <View key={`${file.uri}:${index}`} className="max-w-60 flex-row items-center gap-2 rounded-control bg-surface-muted ps-3">
+      <Icon as={Paperclip} className="text-secondary" /><Text numberOfLines={1} className="shrink text-sm">{file.name}</Text>
+      <Button variant="ghost" iconOnly accessibilityLabel={`移除 ${file.name}`} onPress={() => { try { privateFiles.release(file.uri); onFiles(files.filter((_, at) => at !== index)) } catch (cause) { Alert.alert('未能移除附件', cause instanceof Error ? cause.message : '请重试。') } }}><Icon as={X} /></Button>
+    </View>)}
+  </ScrollView> : undefined
+  return <View className="gap-2 bg-background px-4 pb-3">
+    <View className="w-full max-w-3xl self-center"><ComposerPanel attachments={attachments} editor={input} actions={<><View className="flex-row items-center gap-1">{attach}{target}</View>{controls}</>} /></View>
+    {blocked && value || children ? <View className="w-full max-w-3xl gap-2 self-center px-2">
+      {blocked && value ? <Text className="text-sm text-muted">{blocked}</Text> : null}
       {children}
     </View> : null}
   </View>

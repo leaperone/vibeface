@@ -1,23 +1,23 @@
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router'
 import { ArrowRightLeft, Bot, Check, Crown, Laptop, MonitorSmartphone, Pencil, Sparkles, Trash2, X } from 'lucide-react-native'
 import { useState } from 'react'
-import { Alert, Pressable, ScrollView, View } from 'react-native'
+import { Alert, ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { deviceCopy } from '@vibeface/client/identity/copy.ts'
 import { throughEntry } from '@vibeface/client/lib/node.ts'
 import { ErrorText } from '@/components/action'
 import { CopyableId, Details, EmptyState, Online, SettingsGroup, SettingsRow } from '@/components/kit'
-import { Button } from '@/components/ui/button'
-import { Icon } from '@/components/ui/icon'
-import { Input } from '@/components/ui/input'
-import { Switch } from '@/components/ui/switch'
-import { Text } from '@/components/ui/text'
+import { Button } from '@/components/arc/button'
+import { Icon } from '@/components/arc/icon'
+import { Input } from '@/components/arc/input'
+import { Switch } from '@/components/arc/switch'
+import { Text } from '@/components/arc/text'
 import { useWorkspace } from '@/data/context'
 import { deviceIcon } from '@/features/devices/device-icon'
 import { self } from '@/platform'
 import { useRun } from '@/lib/use-run'
 
-const tag = 'flex-row items-center gap-1 rounded-md bg-muted px-1.5'
+const tag = 'flex-row items-center gap-1 rounded-control bg-surface-muted px-1.5'
 
 export default function DeviceDetail() {
   const router = useRouter()
@@ -33,20 +33,20 @@ export default function DeviceDetail() {
   const removable = device.ready?.principal.can_manage === true && !member.admin && !member.current && !member.entry
   const entryName = members.find((item) => item.entry)?.name
   const target = device.entries.find((item) => item.device_id === member.device_id) ?? (device.ready ? throughEntry(device.ready.entry, member.device_id) : undefined)
-  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
+  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-6 pb-12">
     <Stack.Screen options={{ title: '' }} />
     <View className="flex-row items-center gap-4">
-      <View className="size-12 items-center justify-center rounded-2xl bg-muted ring-1 ring-border"><Icon as={deviceIcon(member)} className="size-6" /></View>
+      <Icon as={deviceIcon(member)} className="size-6 text-secondary" />
       <View className="min-w-0 flex-1 gap-1">
         <DeviceTitle deviceId={member.device_id} name={member.name} editable={device.ready?.principal.can_manage === true} />
         <View className="flex-row flex-wrap items-center gap-2">
-          <View className={tag}><Text className="text-meta text-muted-foreground">{member.kind === 'node' ? '节点' : '客户端'}</Text></View>
+          <View className={tag}><Text className="text-sm text-muted">{member.kind === 'node' ? '节点' : '客户端'}</Text></View>
           {member.online !== undefined ? <Online online={member.online} /> : null}
-          {member.current || member.entry ? <View className={tag}><Text className="text-meta text-muted-foreground">{member.current ? self : '当前连接'}</Text></View> : null}
-          {member.current && entryName ? <View className={tag} accessibilityLabel={`连在「${entryName}」上`}><Icon as={Laptop} className="size-3.5 text-muted-foreground" /><Text className="text-meta text-muted-foreground">{entryName}</Text></View> : null}
-          {member.admin ? <View className={tag}><Icon as={Crown} className="size-3.5 text-muted-foreground" /><Text className="text-meta text-muted-foreground">管理</Text></View> : null}
+          {member.current || member.entry ? <View className={tag}><Text className="text-sm text-muted">{member.current ? self : '当前连接'}</Text></View> : null}
+          {member.current && entryName ? <View className={tag} accessibilityLabel={`连在「${entryName}」上`}><Icon as={Laptop} className="size-3.5 text-muted" /><Text className="text-sm text-muted">{entryName}</Text></View> : null}
+          {member.admin ? <View className={tag}><Icon as={Crown} className="size-3.5 text-muted" /><Text className="text-sm text-muted">管理</Text></View> : null}
         </View>
-        {member.online === false ? <Text className="text-meta text-muted-foreground">{deviceCopy.offline}</Text> : null}
+        {member.online === false ? <Text className="text-sm text-muted">{deviceCopy.offline}</Text> : null}
       </View>
     </View>
     {/* The AI page sets up the computer this phone connects through; any other computer shows how its bot stands, as on the web. */}
@@ -72,7 +72,7 @@ export default function DeviceDetail() {
       </SettingsRow>
     </SettingsGroup> : null}
     <Details>
-      <Text className="text-meta text-muted-foreground">设备编号</Text>
+      <Text className="text-sm text-muted">设备编号</Text>
       <CopyableId value={member.device_id} label="设备编号" />
     </Details>
     {removable ? <SettingsGroup>
@@ -82,7 +82,7 @@ export default function DeviceDetail() {
           <ErrorText error={error} />
           <View className="flex-row flex-wrap justify-end gap-2">
             <Button variant="ghost" onPress={() => { clear(); setRemoving(false) }}><Text>取消</Text></Button>
-            <Button variant="destructive" disabled={busy !== null} onPress={() => void run('remove', async () => { await device.revoke(member.device_id); router.back() })}>
+            <Button variant="danger" disabled={busy !== null} onPress={() => void run('remove', async () => { await device.revoke(member.device_id); router.back() })}>
               <Icon as={Trash2} /><Text>{busy ? '移除中' : '移除'}</Text>
             </Button>
           </View>
@@ -98,11 +98,11 @@ function DeviceTitle({ deviceId, name, editable }: { deviceId: string; name: str
   const { busy, error, run } = useRun()
   const [draft, setDraft] = useState<string | null>(null)
   if (draft === null) return editable
-    ? <Pressable accessibilityRole="button" accessibilityLabel={`改名 ${name}`} onPress={() => setDraft(name)} className="min-h-11 flex-row items-center gap-2">
-      <Text role="heading" className="shrink text-title font-semibold">{name}</Text>
-      <Icon as={Pencil} className="size-4 text-muted-foreground" />
-    </Pressable>
-    : <Text role="heading" className="text-title font-semibold">{name}</Text>
+    ? <Button variant="ghost" accessibilityRole="button" accessibilityLabel={`改名 ${name}`} onPress={() => setDraft(name)} className="min-h-11 flex-row items-center gap-2">
+      <Text role="heading" className="shrink text-xl font-medium">{name}</Text>
+      <Icon as={Pencil} className="size-4 text-muted" />
+    </Button>
+    : <Text role="heading" className="text-xl font-medium">{name}</Text>
   const save = () => {
     const next = draft.trim()
     if (next === name) return setDraft(null)
@@ -112,8 +112,8 @@ function DeviceTitle({ deviceId, name, editable }: { deviceId: string; name: str
     <View className="flex-row items-center gap-1">
       <Input accessibilityLabel="设备名称" autoFocus maxLength={128} className="min-w-0 flex-1" value={draft} editable={busy === null}
         onChangeText={setDraft} onSubmitEditing={save} returnKeyType="done" />
-      <Button variant="ghost" size="icon" accessibilityLabel="保存" disabled={busy !== null || !draft.trim()} onPress={save}><Icon as={Check} /></Button>
-      <Button variant="ghost" size="icon" accessibilityLabel="取消" disabled={busy !== null} onPress={() => setDraft(null)}><Icon as={X} /></Button>
+      <Button variant="ghost" iconOnly accessibilityLabel="保存" disabled={busy !== null || !draft.trim()} onPress={save}><Icon as={Check} /></Button>
+      <Button variant="ghost" iconOnly accessibilityLabel="取消" disabled={busy !== null} onPress={() => setDraft(null)}><Icon as={X} /></Button>
     </View>
     <ErrorText error={error} />
   </View>

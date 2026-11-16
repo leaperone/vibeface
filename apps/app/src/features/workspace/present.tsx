@@ -1,10 +1,9 @@
 "use client"
 
-import { useState, type ReactNode } from "react"
-import { Button } from "@/components/ui/button"
-import { Spinner } from "@/components/ui/spinner"
-import { InlineError } from "@/components/app/kit"
+import { InlineError } from "@/components/arc/product-kit"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
+import { Button } from "@vibeface/uiarc/button/button.tsx"
+import { useState,type ReactNode } from "react"
 
 export function ActionButton({
   children,
@@ -20,7 +19,7 @@ export function ActionButton({
   title?: string
   /** Makes it an icon button: `children` is the icon, `label` its accessible name and tooltip. */
   label?: string
-  variant?: "default" | "secondary" | "ghost" | "destructive"
+  variant?: "primary" | "secondary" | "ghost" | "danger"
   disabled?: boolean
   action: () => Promise<void>
 }) {
@@ -34,11 +33,11 @@ export function ActionButton({
       type="button"
       variant={variant}
       className={className}
-      size={label ? "icon" : undefined}
+      size="md"
       title={title ?? label}
       aria-label={label}
       disabled={disabled || busy}
-      aria-busy={busy}
+      loading={busy}
       onClick={() => {
         if (busy) return
         const generation = workspace.generation
@@ -47,8 +46,7 @@ export function ActionButton({
         void action().catch(setFailure).finally(() => setBusyGeneration(owner => owner === generation ? null : owner))
       }}
     >
-      {busy ? <Spinner /> : null}
-      {busy && label ? null : children}
+      {children}
     </Button>
     <InlineError error={failure} />
     </span>

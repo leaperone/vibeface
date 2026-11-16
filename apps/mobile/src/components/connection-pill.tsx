@@ -1,12 +1,14 @@
+import { PopoverPanel } from '@/components/arc/popover'
 import { ArrowRightLeft, RefreshCw, RotateCw, ShieldCheck, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState } from 'react'
+import { useReducedMotion } from 'react-native-reanimated'
 import { Modal, Pressable, useWindowDimensions, View, type HostInstance } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { offlineCopy } from '@vibeface/client/identity/copy.ts'
 import { unreachable } from '@vibeface/client/workspace/home.ts'
-import { Button } from '@/components/ui/button'
-import { Icon } from '@/components/ui/icon'
-import { Text } from '@/components/ui/text'
+import { Button } from '@/components/arc/button'
+import { Icon } from '@/components/arc/icon'
+import { Text } from '@/components/arc/text'
 import { toneText, type Tone } from '@/components/kit'
 import { useWorkspace } from '@/data/context'
 import type { Connection } from '@/data/types'
@@ -28,8 +30,8 @@ export function ConnectionPill({ connection }: { connection: Connection }) {
   const look = looks[connection.state]
   return <View accessible accessibilityLabel={describe(connection)} className="min-h-11 flex-row items-center gap-2 px-2 py-2">
     <Icon as={look.icon} className={cn('size-4', toneText[look.tone])} />
-    <Text className="min-w-0 flex-1 text-meta">{connection.entry || label(connection)}</Text>
-    {connection.entry ? <Text className="text-meta text-muted-foreground">{label(connection)}</Text> : null}
+    <Text className="min-w-0 flex-1 text-sm">{connection.entry || label(connection)}</Text>
+    {connection.entry ? <Text className="text-sm text-muted">{label(connection)}</Text> : null}
   </View>
 }
 
@@ -39,6 +41,7 @@ export function ConnectionMenu({ connection }: { connection: Connection }) {
   const button = useRef<HostInstance>(null)
   const window = useWindowDimensions()
   const [open, setOpen] = useState(false)
+  const reducedMotion = useReducedMotion()
   // Kept after closing, so the card fades out with the modal instead of vanishing under its still-present backdrop.
   const [at, setAt] = useState<{ x: number; y: number } | null>(null)
   // A rotation or resize moves the icon away from where the card was placed.
@@ -46,15 +49,15 @@ export function ConnectionMenu({ connection }: { connection: Connection }) {
   // A little left of and, by its padding, below the large title's first glyph, so no stroke shows past the rounded corner.
   const left = at ? Math.max(8, at.x - 8) : 0
   return <>
-    <Pressable ref={button} onPress={() => button.current?.measureInWindow((x, y, _width, height) => { setAt({ x, y: y + height }); setOpen(true) })}
-      accessibilityRole="button" accessibilityLabel={`连接：${describe(connection)}`} className="size-11 items-center justify-center rounded-full active:bg-muted">
+    <Button variant="ghost" iconOnly ref={button} onPress={() => button.current?.measureInWindow((x, y, _width, height) => { setAt({ x, y: y + height }); setOpen(true) })}
+      accessibilityRole="button" accessibilityLabel={`连接：${describe(connection)}`} className="size-11 items-center justify-center rounded-pill active:bg-surface-muted">
       <Icon as={look.icon} className={cn('size-5', toneText[look.tone])} />
-    </Pressable>
-    <Modal transparent statusBarTranslucent navigationBarTranslucent visible={open} animationType="fade" onRequestClose={() => setOpen(false)}>
+    </Button>
+    <Modal transparent statusBarTranslucent navigationBarTranslucent visible={open} animationType={reducedMotion ? 'none' : 'fade'} onRequestClose={() => setOpen(false)}>
       <Pressable className="absolute inset-0" onPress={() => setOpen(false)} accessibilityRole="button" accessibilityLabel="关闭" />
-      {at ? <View style={{ position: 'absolute', left, top: at.y + 4, width: Math.min(320, window.width - left - 8) }} className="rounded-xl border border-border bg-background px-2 py-1 shadow-lg">
+      {at ? <PopoverPanel style={{ position: 'absolute', left, top: at.y + 4, width: Math.min(320, window.width - left - 8) }} className="py-2">
         <ConnectionPill connection={connection} />
-      </View> : null}
+      </PopoverPanel> : null}
     </Modal>
   </>
 }
@@ -68,9 +71,9 @@ export function OfflineBar({ chat, className }: { chat?: boolean; className?: st
   const { connection } = useWorkspace()
   if (!unreachable(device.link)) return null
   const title = offlineCopy.title(connection.entry)
-  return <View role="status" className={cn('min-h-11 flex-row items-center gap-2 rounded-full border border-border bg-card ps-3 pe-1 shadow-sm', className)}>
-    <Icon as={WifiOff} className="size-4 text-muted-foreground" />
-    <Text numberOfLines={2} className={cn('min-w-0 text-meta font-medium', chat ? 'shrink' : 'flex-1')}>{chat ? title : `${title}，${offlineCopy.hint}`}</Text>
-    <Button variant="ghost" size="sm" className="min-h-11 rounded-full" onPress={device.retryNow}><Icon as={RotateCw} className="size-4" /><Text>{chat ? offlineCopy.retryConnect : offlineCopy.retry}</Text></Button>
+  return <View role="status" className={cn('min-h-11 flex-row items-center gap-2 rounded-pill border border-border bg-surface ps-3 pe-1 ', className)}>
+    <Icon as={WifiOff} className="size-4 text-muted" />
+    <Text numberOfLines={2} className={cn('min-w-0 text-sm font-medium', chat ? 'shrink' : 'flex-1')}>{chat ? title : `${title}，${offlineCopy.hint}`}</Text>
+    <Button variant="ghost" size="sm" onPress={device.retryNow}><Icon as={RotateCw} className="size-4" /><Text>{chat ? offlineCopy.retryConnect : offlineCopy.retry}</Text></Button>
   </View>
 }

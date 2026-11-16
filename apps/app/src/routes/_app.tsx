@@ -1,12 +1,12 @@
-import { lazy, Suspense, useState } from 'react'
-import { Navigate, Outlet, createFileRoute, useNavigate, useRouterState } from '@tanstack/react-router'
+import { useOnboarding } from '@/features/identity/onboarding-flag'
+import { ShellSkeleton,WorkspaceShell } from '@/features/workspace/workspace-shell'
+import { webPlatform } from '@/lib/platform'
+import { createFileRoute,Navigate,Outlet,useNavigate,useRouterState } from '@tanstack/react-router'
 import { accessOf } from '@vibeface/client/identity/access.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { useOnboarding } from '@/features/identity/onboarding-flag'
 import { WorkspaceProvider } from '@vibeface/client/workspace/context.tsx'
-import { ShellSkeleton, WorkspaceShell } from '@/features/workspace/workspace-shell'
-import { webPlatform } from '@/lib/platform'
 import type { InputTarget } from '@vibeface/client/workspace/types.ts'
+import { lazy,Suspense,useState } from 'react'
 
 const Onboarding = lazy(() => import('@/features/identity/onboarding').then((module) => ({ default: module.Onboarding })))
 

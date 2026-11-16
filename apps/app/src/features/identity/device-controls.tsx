@@ -1,13 +1,13 @@
-import { useEffect, useState, type ReactNode } from 'react'
-import { Check, Copy, RotateCcw, Wifi, WifiOff, X } from 'lucide-react'
+import { Details,InlineError,SettingsDisclosure } from '@/components/arc/product-kit'
 import { terms } from '@/lib/glossary'
-import { Details, InlineError, SettingsDisclosure } from '@/components/app/kit'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { entryAddress, entryKey, parseEntry, type ConnectionEntry } from '@vibeface/client/lib/node.ts'
-import { addressName, hostOf } from '@vibeface/client/workspace/labels.ts'
-import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { entryAddress,entryKey,parseEntry,type ConnectionEntry } from '@vibeface/client/lib/node.ts'
+import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
+import { addressName,hostOf } from '@vibeface/client/workspace/labels.ts'
+import { Button } from '@vibeface/uiarc/button/button.tsx'
+import { Input } from '@vibeface/uiarc/input/input.tsx'
+import { Check,Copy,RotateCcw,Wifi,WifiOff,X } from 'lucide-react'
+import { useEffect,useState,type ReactNode } from 'react'
 
 /** The ids support asks for, copied as one block instead of shown. */
 export function CopyDiagnostics({ lines, label = '复制诊断信息' }: { lines: Array<[string, ReactNode]>; label?: string }) {
@@ -18,7 +18,7 @@ export function CopyDiagnostics({ lines, label = '复制诊断信息' }: { lines
     return () => clearTimeout(timer)
   }, [copied])
   const text = lines.filter(([, value]) => value !== '' && value != null).map(([label, value]) => `${label}: ${value}`).join('\n')
-  return <Button type="button" variant="outline" className="w-fit" onClick={() => { void navigator.clipboard?.writeText(text).then(() => setCopied(true)) }}>
+  return <Button type="button" variant="secondary" className="w-fit" onClick={() => { void navigator.clipboard?.writeText(text).then(() => setCopied(true)) }}>
     {copied ? <Check aria-hidden="true" className="text-success" /> : <Copy aria-hidden="true" />}<span role={copied ? 'status' : undefined}>{copied ? '已复制' : label}</span>
   </Button>
 }
@@ -37,9 +37,9 @@ export function GatewayForm() {
       event.preventDefault()
       choose((event.currentTarget.elements.namedItem('gateway') as HTMLInputElement).value.trim())
     }}>
-      <Input type="url" name="gateway" aria-label="接入地址" defaultValue={device.gateway} onChange={() => setSaved(false)} autoComplete="off" spellCheck={false} />
+      <Input label="接入地址" type="url" name="gateway" aria-label="接入地址" defaultValue={device.gateway} onChange={() => setSaved(false)} autoComplete="off" spellCheck={false} />
       <div className="flex flex-wrap gap-2">
-        <Button type="submit" variant="outline" className="w-fit">{saved ? <Check aria-hidden="true" className="text-success" /> : null}<span role={saved ? 'status' : undefined}>{saved ? '已保存' : '保存'}</span></Button>
+        <Button type="submit" variant="secondary" className="w-fit">{saved ? <Check aria-hidden="true" className="text-success" /> : null}<span role={saved ? 'status' : undefined}>{saved ? '已保存' : '保存'}</span></Button>
         {device.gateway !== device.defaultGateway ? <Button type="button" variant="ghost" className="w-fit" onClick={() => choose(null)}><RotateCcw aria-hidden="true" />恢复默认</Button> : null}
       </div>
     </form>
@@ -62,10 +62,10 @@ export function ConnectionSettings() {
   const others = entries.filter((entry) => entryKey(entry) !== current)
   const name = (entry: ConnectionEntry) => device.entryName(entry) || addressName(entryAddress(entry))
   return <SettingsDisclosure icon={connectionOnline ? Wifi : WifiOff} label="连接" value={<span title={entryAddress(ready.entry)}>{name(ready.entry)}</span>}>
-    <p className="flex min-w-0 items-center justify-between gap-3 text-meta"><span className="shrink-0 text-muted-foreground">{terms.address.label}</span><span className="truncate" title={entryAddress(ready.entry)}>{hostOf(entryAddress(ready.entry)) || entryAddress(ready.entry)}</span></p>
-    {others.length ? <ul className="grid gap-1" aria-label="用过的地址">{others.map((entry) => <li key={entryKey(entry)} className="flex min-h-9 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3 text-meta">
+    <p className="flex min-w-0 items-center justify-between gap-3 text-sm"><span className="shrink-0 text-secondary">{terms.address.label}</span><span className="truncate" title={entryAddress(ready.entry)}>{hostOf(entryAddress(ready.entry)) || entryAddress(ready.entry)}</span></p>
+    {others.length ? <ul className="grid gap-1" aria-label="用过的地址">{others.map((entry) => <li key={entryKey(entry)} className="flex min-h-9 min-w-0 items-center gap-2 rounded-control bg-surface-muted/60 ps-3 text-sm">
       <span className="min-w-0 flex-1 truncate" title={entryAddress(entry)}>{name(entry)}</span>
-      <Button type="button" variant="ghost" size="icon" aria-label="从列表删掉这个地址" title="从列表删掉这个地址" onClick={() => { try { device.removeEntry(entry) } catch (cause) { setError(cause) } }}><X aria-hidden="true" /></Button>
+      <Button type="button" variant="ghost" size="md" aria-label="从列表删掉这个地址" title="从列表删掉这个地址" onClick={() => { try { device.removeEntry(entry) } catch (cause) { setError(cause) } }}><X aria-hidden="true" /></Button>
     </li>)}</ul> : null}
     <CopyDiagnostics lines={[['个人网络', directory?.network_id || ready.principal.network_id], ['授权版本', directory?.epoch], ['这个浏览器', identity?.deviceId], ['当前连接', ready.entry.device_id]]} />
     <GatewayForm />
@@ -75,9 +75,9 @@ export function ConnectionSettings() {
         const field = (name: string) => (form.elements.namedItem(name) as HTMLInputElement).value.trim()
         try { device.saveEntry(parseEntry({ address: field('address'), device_id: field('device_id') })); form.reset(); setError(null) } catch (cause) { setError(cause) }
       }}>
-        <Input type="url" name="address" aria-label="访问地址" placeholder="https://" />
-        <Input className="font-mono" name="device_id" aria-label="设备编号" placeholder="设备编号" autoComplete="off" autoCapitalize="none" spellCheck={false} />
-        <Button type="submit" variant="outline" className="w-fit">保存</Button>
+        <Input label="访问地址" type="url" name="address" aria-label="访问地址" placeholder="https://" />
+        <Input label="设备编号" className="font-mono" name="device_id" aria-label="设备编号" placeholder="设备编号" autoComplete="off" autoCapitalize="none" spellCheck={false} />
+        <Button type="submit" variant="secondary" className="w-fit">保存</Button>
       </form>
     </Details>
     {error ? <InlineError error={error} /> : null}

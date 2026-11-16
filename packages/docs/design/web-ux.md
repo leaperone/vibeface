@@ -26,56 +26,44 @@
 
 ## 视觉规范
 
-网页和手机 App 共用这套规范。颜色、字号、圆角、阴影和动效曲线的 token 都在 `packages/theme/theme.css`，两端只做平台必需的适配；手机 App 在 `apps/mobile/global.css` 覆盖字号。字体用 Geist，等宽用 Geist Mono；Geist 不含中文字形，中文落到系统字体。
+网页和手机 App 统一使用 [Arc](uiarc-migration.md)。源码固定在 `packages/uiarc/src`，来源与哈希记录在 `packages/uiarc/source.json`。旧 shadcn 和 React Native Reusables 控件不再作为开发入口。
 
-**间距。** 4px 基准，只用 4、8、12、16、24、32、48。卡片内边距 16，卡片间距 12，区块间距 24，页面左右边距桌面 24、手机 16。手机 App 的滚动页底部另留 40。
+`packages/theme/theme.css`、`native.css` 和 `tokens.ts` 由 `scripts/generate-uiarc-theme.py` 从 Arc foundation 和 motion tokens 生成。Web 使用 `data-theme` 切换明暗主题，Mobile 通过 Uniwind 使用相同的原生颜色。不要在页面或控件里维护另一份色板和尺寸表。
 
-**字号层级。** 只用五级，行高写在括号里。
+**字体和字重。** 正文、控件和小标题使用 Inter，展示标题使用 Geist，代码和编号使用 Geist Mono。中文使用系统回退字体。只用 400 和 500 字重；通过字号、留白和颜色建立层级。
 
-| 用途 | 网页 | 手机 App | 字重 |
-|---|---|---|---|
-| 页面标题 | 20（28） | 22（28） | 600 |
-| 区块标题、卡片标题 | 16（24） | 17（24） | 600 |
-| 正文、消息 | 15（24） | 16（24） | 400 |
-| 次要说明、标签 | 13（20） | 13（18） | 400 或 500 |
-| 编号、时间、代码 | 13（20） | 13（18） | 400，等宽，数字用 `tabular-nums` |
-
-网页标题字距 -0.011em；手机 App 标题不收字距，避免中文挤在一起。安全码和核对码用 24px 等宽、字间距 0.1em，分组之间空一格。
-
-**圆角。** 控件 `rounded-lg`，卡片 `rounded-xl`，消息输入框和用户气泡 `rounded-2xl`，气泡带尾角。
-
-**颜色语义。** 四种语义色各有前景、柔和背景、边框三档，明暗两套，用 OKLCH 定义在 `theme.css`。
-
-| 语义 | 用途 | icon |
+| 用途 | Arc token | 大小 |
 |---|---|---|
-| 成功（绿） | 在线、已同意、已完成 | `CircleCheck` |
-| 警告（琥珀） | 需要你同意、待确认、有风险、只读 | `TriangleAlert`、`Hand` |
-| 危险（红） | 失败、拒绝后的状态、移除设备、离线超过一天 | `CircleX`、`Ban` |
-| 信息（蓝） | 同步中、切换中、提示 | `Info`、`RefreshCw` |
+| 页面标题 | `text-xl` | 22px |
+| 区块标题 | `text-lg` | 18px |
+| 正文、消息 | `text-base` | 16px |
+| 控件、次要说明 | `text-sm` | 14px |
+| 时间和紧凑元数据 | `text-xs` | 12px |
 
-颜色不单独传达含义，必须同时有 icon 和文字。所有普通文本与所在表面的对比度不低于 4.5:1，包括 13px 的次要说明、标签和语义色文字。3:1 只用于 18.66px 粗体或 24px 以上的大字、图形和控件边界。
+数字列使用 `tabular-nums`。原生控件随系统字号增长，不裁掉文字。字号以 Arc foundation 为准。
 
-品牌紫只用于焦点环、未读计数、选中、开启提醒的入口和 logo。
+**间距和圆角。** 使用 Arc 的 4px 间距网格。控件圆角为 `rounded-control`，18px；面板为 `rounded-panel`，26px；独立内容边界为 `rounded-surface`，34px。默认可点击控件至少 44px 高；原生系统的更大触控要求优先。普通卡片只用边框，阴影保留给浮层。
 
-**Bot 色调。** 每个 Bot 的脸色相点亮它对话里的两处：可发送时的发送按钮，开场建议的边框。空对话页的脸后有一圈同色调的静止光晕，约 1.8 倍脸径。数值见 `botTint`，两端相同。
+**颜色。** 页面使用 `background`，内容边界使用 `surface`，浮层使用 `surface-raised`，弱分组和悬停使用 `surface-muted`。正文使用 `foreground`，辅助文字使用 `text-secondary` 和 `text-muted`。选中、进度和强调使用 Arc 的 `accent`，不再保留独立的紫色品牌控件主题。
 
-**icon。** 只用 lucide，描边 1.75。行内 16px，导航和状态 20px，空状态 32px。纯 icon 按钮必须有 `aria-label` 和 tooltip。同一概念在全站使用一致的 icon。
+| 语义 | 用途 | 图标 |
+|---|---|---|
+| `success` | 在线、已同意、已完成 | `CircleCheck` |
+| `warning` | 等待决定、待确认、只读 | `TriangleAlert`、`Hand` |
+| `danger` | 失败、移除、拒绝 | `CircleX`、`Ban` |
+| `info` | 同步中、切换中、提示 | `Info`、`RefreshCw` |
 
-**统一组件。**
+状态始终有图标或文字，不能只靠颜色。`-subtle` 和 `-border` 由同一 Arc 语义色生成。Bot face 保留身份数据和形状，页面控件统一使用 Arc 色彩，不加身份光晕或装饰渐变。
 
-- `EmptyState`：64px `bg-muted` 圆角底块里放 32px icon，一行标题、最多一行说明、一个主按钮。
-- `Skeleton`：与真实布局同形，持续超过 300ms 才显示，避免闪烁。
-- `InlineError`：红色 icon 加一句话加一个动作，放在出错控件下方。
-- `StatusPill`：icon 加 2 到 4 字。
-- 待处理卡片：加入和待确认事项共用一致布局。头部是 icon、类型和设备，正文最多三行，底部是并列的按钮；只有一个按钮时放在标题行右侧。手机 App 的找回提醒例外，三个按钮满宽纵向排列，“拦下”在最上面。任务页的待处理分区和对话内共用这个组件。
-- `SafetyCode`：分组的大号等宽数字，不带复制按钮，读屏时逐位朗读。
-- `Details`：默认折叠的“详细信息”，下文的禁用词只能出现在它里面；设置页的折叠行 `SettingsDisclosure` 同样默认折叠，视同 `Details`。
-- `Toast`：只用于瞬时反馈，在输入框上方（桌面靠右），最多同时两条。要人处理的事进待处理，不用 toast。手机 App 的 toast 在页面底部，有标签栏时在标签栏上方，读屏会朗读；恢复审核需要确认时使用系统弹窗，操作失败在卡片内显示行内错误。
-- `PageActions`：页面自己的操作放在页头右侧，桌面 icon 加短文字，手机只留 icon。
+**组件。** Web 直接使用固定来源的 Arc Button、Input、Textarea、Select、Switch、Checkbox、Drawer 等组件。侧栏、对话、任务和设置使用相应 Arc 区块的布局规则，并接入真实产品数据。不要把库内演示的人物、模型选项或模拟任务复制进产品。
 
-**暗色。** 默认跟随系统。暗色下卡片用比背景亮一档的表面色，不加阴影，外框用 `--line-strong`，卡内分隔线用 `--border`；只有浮层保留阴影。警告色背景透明度不超过 10%，避免琥珀色整块发亮。
+Mobile 的原生移植位于 `apps/mobile/src/components/arc`，`source.json` 标明每个移植对应的 Arc 项目。导航、返回、手势、键盘、安全区域和附件选择保留平台行为。原生移植使用同一套 token，不嵌入 WebView。
 
-**动效。** 只用于状态变化。只有两档时长：按压、颜色和悬停 150ms，出现、消失、折叠和布局 200ms；曲线统一 `--ease-out`，不回弹。按钮按压缩放 0.97，列表行只变底色，手机底部标签按下没有变化；新消息例外，180ms 上移 5px 淡入；分段控件的选中块滑过去。遵守 `prefers-reduced-motion`。
+前景操作在控件旁显示结果或错误；toast 只用于短暂的后台反馈。待处理事项仍位于任务页顶部。风险确认、恢复和未知写入结果的语义保持不变。
+
+**动效和焦点。** 时长、曲线和按压来自 Arc motion tokens。Web 使用 Arc 自带的键盘焦点规则；原生动画遵守系统减少动态效果设置。列表、抽屉和控件不能通过装饰动效遮住状态。
+
+UI 修改后运行 `pnpm check:ui`。检查会验证来源哈希、生成 token、既有路由和旧 UI 依赖。e2e、截图和界面验收仍按项目的明确授权规则执行。
 
 ## 文案规范
 

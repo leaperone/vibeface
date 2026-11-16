@@ -1,17 +1,17 @@
+import { NavigationRail } from '@/components/arc/navigation'
 import { Link, usePathname, type Href } from 'expo-router'
-import { BellRing, Bot, ChevronRight, Inbox, ListChecks, MessagesSquare, Plus, RotateCw, Settings, ShieldAlert, Star, WifiOff, X } from 'lucide-react-native'
+import { BellRing, Bot, ChevronRight, Inbox, ListChecks, MessageSquare, MessagesSquare, Plus, RotateCw, Settings, ShieldAlert, Star, WifiOff, X } from 'lucide-react-native'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Alert, Pressable, ScrollView, View } from 'react-native'
 import Animated, { LayoutAnimationConfig } from 'react-native-reanimated'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
-import { useUniwind, withUniwind } from 'uniwind'
+import { withUniwind } from 'uniwind'
 import { ConnectionMenu, OfflineBar } from '@/components/connection-pill'
 import { botMood, BotFace } from '@/components/bot-face'
-import { faceOf } from '@vibeface/client/avatar/face.ts'
-import { Badge, botTint, EmptyState, Skeleton } from '@/components/kit'
-import { Button } from '@/components/ui/button'
-import { Icon } from '@/components/ui/icon'
-import { Text } from '@/components/ui/text'
+import { Badge, EmptyState, Skeleton } from '@/components/kit'
+import { Button } from '@/components/arc/button'
+import { Icon } from '@/components/arc/icon'
+import { Text } from '@/components/arc/text'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { offlineCopy, recoveryCopy, waitingCopy } from '@vibeface/client/identity/copy.ts'
 import { moodLabel } from '@vibeface/client/avatar/mood.ts'
@@ -38,7 +38,6 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
   const wide = useWide()
   const workspace = useWorkspace()
   const device = useDevice()
-  const dark = useUniwind().theme === 'dark'
   const pathname = usePathname()
   const insets = useSafeAreaInsets()
   const shared = useLive()
@@ -55,45 +54,49 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
   // The sidebar swaps the open screen rather than stacking another, keeping home underneath for when the window narrows.
   const replace = sidebar === true && pathname !== '/'
   // Entering animations skip the first render, so only a 待处理 card that appears later fades in.
-  return <LayoutAnimationConfig skipEntering><ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName={cn('px-2', sidebar ? 'grow' : 'w-full max-w-3xl self-center pb-8')}
+  return <LayoutAnimationConfig skipEntering><ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName={cn('px-3', sidebar ? 'grow' : 'w-full max-w-3xl self-center pb-8')}
     contentContainerStyle={sidebar ? { paddingTop: insets.top, paddingBottom: insets.bottom + 32 } : { minHeight }}>
-    {sidebar ? <View className="mb-2 flex-row items-center ps-3 pt-2">
-      <Text role="heading" className="flex-1 text-title font-semibold">消息</Text>
-      <ConnectionMenu connection={workspace.connection} />
-      <Link href="/tasks" replace={replace} asChild><Button variant="ghost" size="icon" className={cn('size-11 rounded-full', active('/tasks') && 'bg-muted')} accessibilityLabel="任务" accessibilityState={{ selected: active('/tasks') }}><Icon as={ListChecks} /></Button></Link>
-      <NewBotButton className="size-11 rounded-full" />
-      <Link href="/settings" replace={replace} asChild><Button variant="ghost" size="icon" className={cn('-me-1 size-11 rounded-full', active('/settings') && 'bg-muted')} accessibilityLabel="设置" accessibilityState={{ selected: active('/settings') }}><Icon as={Settings} className="size-5" /></Button></Link>
-    </View> : null}
+    {sidebar ? <>
+      <View className="min-h-16 flex-row items-center gap-2 px-4 py-3">
+        <Text role="heading" className="min-w-0 flex-1 text-xl font-medium">消息</Text>
+        <ConnectionMenu connection={workspace.connection} /><NewBotButton />
+      </View>
+      <NavigationRail items={[
+        { href: '/', label: '消息', icon: MessageSquare, selected: pathname === '/' },
+        { href: '/tasks', label: '任务', icon: ListChecks, selected: active('/tasks'), notice: <Badge count={waiting} /> },
+        { href: '/settings', label: '设置', icon: Settings, selected: active('/settings') },
+      ]} />
+    </> : null}
     {empty === 'unreachable' && !bots.length ? null : <OfflineBar className="mx-1 mb-2 mt-1" />}
     {waiting ? <Item key="pending" layout={move} entering={fadeIn} exiting={fadeOut} className="mb-2 mt-1">
       <Link href="/tasks" replace={replace} asChild>
-        <Pressable accessibilityState={{ selected: active('/tasks') }} className={cn('min-h-16 flex-row items-center gap-3 rounded-xl border px-3 py-2.5 active:bg-muted', device.pendingRecovery ? 'border-danger-border bg-danger-soft' : 'border-warning-border bg-warning-soft', active('/tasks') && (device.pendingRecovery ? 'border-danger' : 'border-warning'))}>
-          <View className={cn('size-11 items-center justify-center rounded-full', device.pendingRecovery ? 'bg-danger/15' : 'bg-warning/15')}><Icon as={device.pendingRecovery ? ShieldAlert : Inbox} className={device.pendingRecovery ? 'text-danger' : 'text-warning'} /></View>
-          <Text numberOfLines={1} className="min-w-0 flex-1 font-semibold">{device.pendingRecovery ? recoveryCopy.pending : `${waiting} 件事等你决定`}</Text>
-          <Icon as={ChevronRight} className="text-muted-foreground" />
+        <Pressable accessibilityState={{ selected: active('/tasks') }} className={cn('min-h-16 flex-row items-center gap-3 rounded-panel border px-3 py-2.5 active:bg-surface-muted', device.pendingRecovery ? 'border-danger-border bg-danger-subtle' : 'border-warning-border bg-warning-subtle', active('/tasks') && (device.pendingRecovery ? 'border-danger' : 'border-warning'))}>
+          <Icon as={device.pendingRecovery ? ShieldAlert : Inbox} className={cn('size-5', device.pendingRecovery ? 'text-danger' : 'text-warning')} />
+          <Text numberOfLines={1} className="min-w-0 flex-1 font-medium">{device.pendingRecovery ? recoveryCopy.pending : `${waiting} 件事等你决定`}</Text>
+          <Icon as={ChevronRight} className="text-muted" />
         </Pressable>
       </Link>
     </Item> : null}
     <NotifyTip />
-    <View className="mt-2 flex-row items-center px-3"><Text role="heading" className="flex-1 text-meta font-medium text-muted-foreground">频道</Text><Link href="/channels" replace={replace} asChild><Button variant="ghost" size="icon" accessibilityLabel="管理频道"><Icon as={Plus} className="text-muted-foreground" /></Button></Link></View>
-    {(shared?.workspaceState?.channels ?? []).map((channel) => <Link key={channel.channel_id} href={`/channel/${channel.channel_id}`} replace={replace} asChild><Pressable accessibilityRole="link" accessibilityState={{ selected: active(`/channel/${channel.channel_id}`) }} className={cn('min-h-14 flex-row items-center gap-3 rounded-xl px-3 py-3 active:bg-muted', active(`/channel/${channel.channel_id}`) && 'bg-muted')}><Icon as={MessagesSquare} className="text-muted-foreground" /><Text numberOfLines={1} className="min-w-0 flex-1 font-medium">{channel.title}</Text><Icon as={ChevronRight} className="size-4 text-muted-foreground" /></Pressable></Link>)}
-    {!shared?.workspaceState?.channels.length ? <Link href="/channels" replace={replace} asChild><Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-3 rounded-xl px-3 py-2 active:bg-muted"><Icon as={MessagesSquare} className="text-muted-foreground" /><Text className="text-meta text-muted-foreground">查看频道</Text></Pressable></Link> : null}
-    <Text role="heading" className="mb-1 mt-4 px-3 text-meta font-medium text-muted-foreground">Bot</Text>
+    <View className="mt-2 flex-row items-center px-3"><Text role="heading" className="flex-1 text-sm font-medium text-muted">频道</Text><Link href="/channels" replace={replace} asChild><Button variant="ghost" iconOnly accessibilityLabel="管理频道"><Icon as={Plus} className="text-muted" /></Button></Link></View>
+    {(shared?.workspaceState?.channels ?? []).map((channel) => <Link key={channel.channel_id} href={`/channel/${channel.channel_id}`} replace={replace} asChild><Pressable accessibilityRole="link" accessibilityState={{ selected: active(`/channel/${channel.channel_id}`) }} className={cn('min-h-14 flex-row items-center gap-3 rounded-control px-3 py-3 active:bg-surface-muted', active(`/channel/${channel.channel_id}`) && 'bg-surface-muted')}><Icon as={MessagesSquare} className="text-muted" /><Text numberOfLines={1} className="min-w-0 flex-1 font-medium">{channel.title}</Text><Icon as={ChevronRight} className="size-4 text-muted" /></Pressable></Link>)}
+    {!shared?.workspaceState?.channels.length ? <Link href="/channels" replace={replace} asChild><Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-3 rounded-panel px-3 py-2 active:bg-surface-muted"><Icon as={MessagesSquare} className="text-muted" /><Text className="text-sm text-muted">查看频道</Text></Pressable></Link> : null}
+    <Text role="heading" className="mb-1 mt-4 px-3 text-sm font-medium text-muted">Bot</Text>
     {bots.length ? bots.map((bot, index) => {
       const last = bot.last_message, mood = botMood(bot, workspace, shared), primary = workspace.primary === bot.conversation_id
       return <Item key={bot.bot_id} layout={move}>
-        <Row href={`/b/${bot.bot_id}`} replace={replace} active={active(`/b/${bot.bot_id}`)} avatar={<BotFace bot={bot} mood={mood} size={44} still={sidebar === true && !wide} />} name={bot.name} tint={botTint(faceOf(bot.bot_id, bot.avatar).hue, dark)}
-          mark={primary ? <Icon as={Star} className="size-3.5 fill-muted-foreground text-muted-foreground" /> : null}
+        <Row href={`/b/${bot.bot_id}`} replace={replace} active={active(`/b/${bot.bot_id}`)} avatar={<BotFace bot={bot} mood={mood} size={44} still={sidebar === true && !wide} />} name={bot.name}
+          mark={primary ? <Icon as={Star} className="size-3.5 fill-muted text-muted" /> : null}
           label={[bot.name, primary ? '主 Bot' : '', moodLabel[mood]].filter(Boolean).join('，')}
           unread={workspace.unread[bot.conversation_id] ?? 0} time={last ? listTime(last.created_at_ms, now) : undefined}
           preview={last ? `${last.role === 'user' ? '你：' : ''}${last.text}` : '还没有消息'} />
-        {index < bots.length - 1 ? <View className="ms-[68px] h-px bg-border" /> : null}
+        {index < bots.length - 1 ? <View className="ms-[76px] h-px bg-border-subtle" /> : null}
       </Item>
     }) : empty === 'unreachable' ? <View className="flex-1 justify-center"><EmptyState icon={WifiOff} title={offlineCopy.title(workspace.connection.entry)} action={
       <Button className="min-h-11" onPress={device.retryNow}><Icon as={RotateCw} /><Text>{offlineCopy.retry}</Text></Button>} /></View>
     : empty === 'loading' ? <View accessibilityLabel="正在读取 Bot">{[0, 1, 2].map((item) => <View key={item} className="min-h-16 flex-row items-center gap-3 px-3 py-2.5">
-      <Skeleton className="size-11 rounded-full" />
-      <View className="flex-1 gap-2"><Skeleton className="h-3.5 w-1/3 rounded-full" /><Skeleton className="h-3 w-2/3 rounded-full" /></View>
+      <Skeleton className="size-11 rounded-pill" />
+      <View className="flex-1 gap-2"><Skeleton className="h-3.5 w-1/3 rounded-pill" /><Skeleton className="h-3 w-2/3 rounded-pill" /></View>
     </View>)}</View> : <View className="flex-1 justify-center"><EmptyState icon={Bot} title="还没有 Bot" action={canCreate ? <Link href="/new-bot" asChild>
       <Button className="min-h-11"><Icon as={Plus} /><Text>新 Bot</Text></Button>
     </Link> : undefined} /></View>}
@@ -104,9 +107,9 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
 export function NewBotButton({ className }: { className?: string }) {
   const shared = useLive()
   const { connection } = useWorkspace()
-  if (shared && (shared.writable || shared.pendingBot)) return <Link href="/new-bot" asChild><Button variant="ghost" size="icon" className={className} accessibilityLabel="新 Bot"><Icon as={Plus} /></Button></Link>
+  if (shared && (shared.writable || shared.pendingBot)) return <Link href="/new-bot" asChild><Button variant="ghost" iconOnly className={className} accessibilityLabel="新 Bot"><Icon as={Plus} /></Button></Link>
   const reason = shared ? shared.readOnlyNotice || shared.writeNotice || '稍等，正在同步' : `${offlineCopy.title(connection.entry)}，连上后才能新建`
-  return <Button variant="ghost" size="icon" className={cn('opacity-50', className)} accessibilityLabel="新 Bot" accessibilityState={{ disabled: true }} accessibilityHint={reason}
+  return <Button variant="ghost" iconOnly className={cn('opacity-50', className)} accessibilityLabel="新 Bot" accessibilityState={{ disabled: true }} accessibilityHint={reason}
     onPress={() => Alert.alert('暂时不能新建 Bot', reason)}><Icon as={Plus} /></Button>
 }
 
@@ -120,32 +123,32 @@ function NotifyTip() {
   const { busy, error, run } = useRun()
   if (closed || !shared?.synced || shared.notificationButton.state !== 'off' || shared.notificationButton.disabled) return null
   return <Item key="notify" layout={move} entering={fadeIn} exiting={fadeOut} className="mb-2 mt-1 gap-1">
-    <View className="min-h-16 flex-row flex-wrap items-center gap-3 rounded-xl border border-border bg-card py-2.5 ps-3 pe-1">
+    <View className="min-h-16 flex-row flex-wrap items-center gap-3 rounded-panel border border-border bg-surface py-2.5 ps-3 pe-1">
       <View className="min-w-48 flex-1 flex-row items-center gap-3">
-        <View className="size-11 items-center justify-center rounded-full bg-brand/10"><Icon as={BellRing} className="text-brand" /></View>
+        <View className="size-11 items-center justify-center"><Icon as={BellRing} className="text-accent" /></View>
         <Text className="min-w-0 flex-1 font-medium" >{waitingCopy.notifyTip}</Text>
       </View>
       <View className="basis-full flex-row items-center justify-end">
-        <Button size="sm" className="min-h-12" disabled={busy !== null} onPress={() => void run('notify', shared.enableNotifications)}><Text>{waitingCopy.notifyOn}</Text></Button>
-        <Button variant="ghost" size="icon" accessibilityLabel="关闭" onPress={() => { writeStorage(tipClosed, true); setClosed(true) }}><Icon as={X} className="text-muted-foreground" /></Button>
+        <Button size="sm" disabled={busy !== null} onPress={() => void run('notify', shared.enableNotifications)}><Text>{waitingCopy.notifyOn}</Text></Button>
+        <Button variant="ghost" iconOnly accessibilityLabel="关闭" onPress={() => { writeStorage(tipClosed, true); setClosed(true) }}><Icon as={X} className="text-muted" /></Button>
       </View>
     </View>
     {error ? <View className="px-3"><ErrorText error={error} /></View> : null}
   </Item>
 }
 
-function Row({ href, replace, active, avatar, name, mark, label, preview, unread, time, tint }: { href: Href; replace: boolean; active: boolean; avatar: ReactNode; name: string; mark?: ReactNode; label?: string; preview: string; unread: number; time?: string; tint: { fill: string; ink: string } }) {
+function Row({ href, replace, active, avatar, name, mark, label, preview, unread, time }: { href: Href; replace: boolean; active: boolean; avatar: ReactNode; name: string; mark?: ReactNode; label?: string; preview: string; unread: number; time?: string }) {
   return <Link href={href} replace={replace} asChild>
-    <Pressable accessibilityLabel={label && [label, preview, time, unread ? `${unread} 条未读` : ''].filter(Boolean).join('，')} accessibilityState={{ selected: active }} className={cn('min-h-16 flex-row items-center gap-3 rounded-xl px-3 py-2.5 active:bg-muted', active && 'bg-muted')}>
+    <Pressable accessibilityLabel={label && [label, preview, time, unread ? `${unread} 条未读` : ''].filter(Boolean).join('，')} accessibilityState={{ selected: active }} className={cn('min-h-16 flex-row items-center gap-3 rounded-control px-4 py-4 active:bg-surface-muted', active && 'bg-surface-muted')}>
       {avatar}
       <View className="min-w-0 flex-1 gap-0.5">
         <View className="flex-row items-center gap-2">
-          <View className="min-w-0 flex-1 flex-row items-center gap-1.5"><Text numberOfLines={1} className={cn('shrink', unread ? 'font-semibold' : 'font-medium')}>{name}</Text>{mark}</View>
-          {time ? <Text maxFontSizeMultiplier={1.4} className="text-meta text-muted-foreground" style={[{ fontVariant: ['tabular-nums'] }, unread ? { color: tint.fill } : null]}>{time}</Text> : null}
+          <View className="min-w-0 flex-1 flex-row items-center gap-1.5"><Text numberOfLines={1} className={cn('shrink', unread ? 'font-medium' : 'font-medium')}>{name}</Text>{mark}</View>
+          {time ? <Text maxFontSizeMultiplier={1.4} className={cn('text-sm', unread ? 'text-accent' : 'text-muted')} style={{ fontVariant: ['tabular-nums'] }}>{time}</Text> : null}
         </View>
         <View className="flex-row items-center gap-2">
-          <Text numberOfLines={1} className={cn('min-w-0 flex-1 text-meta', unread ? 'text-foreground' : 'text-muted-foreground')}>{preview}</Text>
-          <Badge count={unread} fill={tint.fill} ink={tint.ink} />
+          <Text numberOfLines={1} className={cn('min-w-0 flex-1 text-sm', unread ? 'text-foreground' : 'text-muted')}>{preview}</Text>
+          <Badge count={unread} />
         </View>
       </View>
     </Pressable>

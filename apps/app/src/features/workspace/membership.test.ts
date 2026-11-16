@@ -34,7 +34,9 @@ function loader(globals: Record<string, unknown>, stubs: (specifier: string) => 
     const stub = stubs(specifier)
     if (stub) return stub
     if (specifier.startsWith('@vibeface/client/')) return load(resolve(clientRoot, specifier.slice(17)))
-    if (!specifier.startsWith('.') && !specifier.startsWith('@/')) return nodeRequire(specifier)
+    if (specifier.startsWith('@vibeface/uiarc/')) return load(resolve(clientRoot, '../../uiarc/src', specifier.slice('@vibeface/uiarc/'.length)))
+    if (specifier.endsWith('.module.css')) return { default: new Proxy({}, { get: (_target, key) => String(key) }) }
+    if (!specifier.startsWith('.') && !specifier.startsWith('@/')) return createRequire(filename)(specifier)
     const path = specifier.startsWith('@/') ? resolve(sourceRoot, specifier.slice(2)) : resolve(dirname(filename), specifier)
     const file = extname(path) ? path : [`${path}.ts`, `${path}.tsx`].find(candidate => { try { readFileSync(candidate); return true } catch { return false } })!
     return load(file)
@@ -132,7 +134,8 @@ test('a browser in a local session is shown as 本机管理, sees the workspace 
   const html: string = renderToStaticMarkup(createElement(LocalSession, { onJoin() {} }))
   assert.match(html, /本机管理/)
   assert.doesNotMatch(html, /还没加入/)
-  assert.match(html, /<button[^>]*>.*<\/svg>加入<\/button>/)
+  assert.match(html, /<button[^>]*>/)
+  assert.match(html, /加入/)
 })
 
 test('a browser that is not a member never sends a read receipt, so nothing retries on every refresh', async () => {

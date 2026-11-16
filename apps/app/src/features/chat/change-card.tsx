@@ -1,18 +1,18 @@
-import { useId, type ReactNode } from 'react'
-import { AlarmClock, ArrowRight, BookOpen, Bot, CircleCheck, CirclePause, Cpu, Minus, Trash2, NotebookPen, Plus, Repeat, ScrollText, Smile, TriangleAlert, Undo2, type LucideIcon } from 'lucide-react'
-import { cn } from '@/lib/utils'
-import { providerNames } from '@vibeface/client/lib/node.ts'
-import { Details } from '@/components/app/kit'
 import { BotFace } from '@/components/app/bot-face'
-import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
-import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { nodeName } from '@vibeface/client/workspace/labels.ts'
-import { ActionButton } from '@/features/workspace/present'
+import { Details } from '@/components/arc/product-kit'
 import { openSchedule } from '@/features/workspace/bot-panel'
-import type { AvatarEdit } from '@vibeface/client/workspace/types.ts'
+import { ActionButton } from '@/features/workspace/present'
+import { cn } from '@/lib/utils'
 import { avatarChangeWords } from '@vibeface/client/avatar/pick.ts'
-import { changeTitle, firedAt, formatWhen, lineDiff, overwriteCopy, restoreRequest, scheduleDetail, scheduleFrequency, type DiffLine } from '@vibeface/client/workspace/bot-settings.ts'
-import type { BotChange, BotChangeRecord, BotSchedule, BotSkill, Overwritten, ScheduleView, SkillSet } from '@vibeface/client/workspace/types.ts'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { providerNames } from '@vibeface/client/lib/node.ts'
+import { changeTitle,firedAt,formatWhen,lineDiff,overwriteCopy,restoreRequest,scheduleDetail,scheduleFrequency,type DiffLine } from '@vibeface/client/workspace/bot-settings.ts'
+import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
+import { nodeName } from '@vibeface/client/workspace/labels.ts'
+import type { AvatarEdit,BotChange,BotChangeRecord,BotSchedule,BotSkill,Overwritten,ScheduleView,SkillSet } from '@vibeface/client/workspace/types.ts'
+import { Button } from "@vibeface/uiarc/button/button.tsx"
+import { AlarmClock,ArrowRight,BookOpen,Bot,CircleCheck,CirclePause,Cpu,Minus,NotebookPen,Plus,Repeat,ScrollText,Smile,Trash2,TriangleAlert,Undo2,type LucideIcon } from 'lucide-react'
+import { useId,type ReactNode } from 'react'
 
 /**
  * What one turn of the conversation changed, item by item, before → after. `schedules` are the conversation's schedules now;
@@ -21,10 +21,10 @@ import type { BotChange, BotChangeRecord, BotSchedule, BotSkill, Overwritten, Sc
 export function ChangeCard({ records, schedules, overwritten }: { records: BotChangeRecord[]; schedules: readonly ScheduleView[]; overwritten: readonly Overwritten[] }) {
   const id = useId()
   const changes = records.map((record) => record.change)
-  return <section aria-labelledby={id} className="grid gap-3 rounded-xl border bg-card shadow-xs p-4">
+  return <section aria-labelledby={id} className="grid gap-3 rounded-panel border bg-surface  p-4">
     <header className="flex items-center gap-2">
       <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />
-      <h3 id={id} className="text-meta font-medium text-muted-foreground">{changeTitle(changes)}</h3>
+      <h3 id={id} className="text-sm font-medium text-secondary">{changeTitle(changes)}</h3>
     </header>
     <ul className="grid gap-4">
       {records.map((record) => <ChangeRows key={record.change_id} change={record.change} conversationId={record.conversation_id} schedules={schedules}
@@ -64,12 +64,12 @@ function OverwrittenNote({ item, change, conversationId }: { item: Overwritten; 
     if ('avatar' in request) await workspace.setBotAvatar(conversationId, bot.avatar_version, request.avatar)
     else await workspace.sendMessage(request.text)
   }
-  return <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-meta">
+  return <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-sm">
     <p className="flex min-w-0 items-start gap-1.5 text-warning [overflow-wrap:anywhere]">
       <TriangleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
       {overwriteCopy.line(item, bot?.name ?? '这个 Bot', nodeName(item.by, { nodes: workspace.nodes, directory }))}
     </p>
-    {bot && request ? <ActionButton variant="ghost" className="h-7 px-2 text-meta max-md:h-11" action={restore}><Undo2 aria-hidden="true" />{overwriteCopy.restore}</ActionButton> : null}
+    {bot && request ? <ActionButton variant="ghost" action={restore}><Undo2 aria-hidden="true" />{overwriteCopy.restore}</ActionButton> : null}
   </div>
 }
 
@@ -77,11 +77,11 @@ const skillCount = (set: SkillSet) => set === null ? '全部' : `${set.length} �
 
 function Row({ icon: Icon, label, tag, removed, children }: { icon: LucideIcon; label: ReactNode; tag?: string; removed?: boolean; children?: ReactNode }) {
   return <li className="grid grid-cols-[1rem_minmax(0,1fr)] gap-x-3">
-    <Icon aria-hidden="true" className="mt-1 size-4 text-muted-foreground" />
+    <Icon aria-hidden="true" className="mt-1 size-4 text-secondary" />
     <div className="grid min-w-0 gap-1">
       <p className="flex min-w-0 flex-wrap items-baseline gap-x-2 [overflow-wrap:anywhere]">
-        <span className={cn('font-medium', removed && 'text-muted-foreground line-through')}>{label}</span>
-        {tag ? <span className="text-meta text-muted-foreground">{tag}</span> : null}
+        <span className={cn('font-medium', removed && 'text-secondary line-through')}>{label}</span>
+        {tag ? <span className="text-sm text-secondary">{tag}</span> : null}
       </p>
       {children}
     </div>
@@ -91,8 +91,8 @@ function Row({ icon: Icon, label, tag, removed, children }: { icon: LucideIcon; 
 /** "Old → new" inline, wrapping when long. */
 function BeforeAfter({ before, after, className }: { before: string; after: string; className?: string }) {
   return <p className={cn('flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 [overflow-wrap:anywhere]', className)}>
-    <span className="text-muted-foreground">{before}</span>
-    <ArrowRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+    <span className="text-secondary">{before}</span>
+    <ArrowRight aria-hidden="true" className="size-4 shrink-0 text-secondary" />
     <span className="sr-only">改为</span>
     <span>{after}</span>
   </p>
@@ -103,14 +103,14 @@ function AvatarChange({ edit, conversationId }: { edit: AvatarEdit; conversation
   const botId = useWorkspace().bots.find((bot) => bot.conversation_id === conversationId)?.bot_id ?? conversationId
   return <p role='img' aria-label={avatarChangeWords(botId, edit.before, edit.after)} className='flex items-center gap-2'>
     <BotFace bot={{ bot_id: botId, avatar: edit.before }} mood='idle' size={28} still />
-    <ArrowRight aria-hidden='true' className='size-4 shrink-0 text-muted-foreground' />
+    <ArrowRight aria-hidden='true' className='size-4 shrink-0 text-secondary' />
     <BotFace bot={{ bot_id: botId, avatar: edit.after }} mood='idle' size={28} still />
   </p>
 }
 
 /** Removed lines struck through, added lines highlighted; long diffs fold after a few lines. */
 function DiffLines({ lines, limit = 6 }: { lines: DiffLine[]; limit?: number }) {
-  if (!lines.length) return <p className="text-meta text-muted-foreground">只调整了空行</p>
+  if (!lines.length) return <p className="text-sm text-secondary">只调整了空行</p>
   const shown = lines.length > limit ? lines.slice(0, limit - 2) : lines
   const rest = lines.slice(shown.length)
   return <>
@@ -120,10 +120,10 @@ function DiffLines({ lines, limit = 6 }: { lines: DiffLine[]; limit?: number }) 
 }
 
 function DiffList({ lines }: { lines: DiffLine[] }) {
-  return <ul className="grid gap-0.5 text-body">
+  return <ul className="grid gap-0.5 text-base">
     {lines.map((line, index) => {
       const added = line.kind === 'added'
-      return <li key={index} className={cn('flex min-w-0 gap-2 rounded-md px-2 py-0.5 whitespace-pre-wrap [overflow-wrap:anywhere] [word-break:normal]', added ? 'bg-success-soft text-foreground' : 'text-muted-foreground')}>
+      return <li key={index} className={cn('flex min-w-0 gap-2 rounded-control px-2 py-0.5 whitespace-pre-wrap [overflow-wrap:anywhere] [word-break:normal]', added ? 'bg-success-subtle text-foreground' : 'text-secondary')}>
         {added ? <Plus aria-hidden="true" className="mt-1 size-4 shrink-0 text-success" /> : <Minus aria-hidden="true" className="mt-1 size-4 shrink-0" />}
         <span className="sr-only">{added ? '新增：' : '删去：'}</span>
         <span className={cn('min-w-0', !added && 'line-through')}>{line.text}</span>
@@ -138,8 +138,8 @@ function SkillRow({ before, after }: { before: BotSkill | null; after: BotSkill 
   const body = !after ? null : !before ? <p className="whitespace-pre-wrap text-foreground [word-break:normal] [overflow-wrap:anywhere]">{after.body}</p>
     : before.body !== after.body ? <DiffLines lines={lineDiff(before.body, after.body)} limit={Infinity} /> : null
   return <Row icon={BookOpen} label={skill.name} tag={!before ? '新 Skill' : !after ? '已删除' : '已更新'} removed={!after}>
-    {renamed ? <BeforeAfter className="text-meta" before={before.name} after={after.name} /> : null}
-    {after?.description ? <p className="text-meta text-muted-foreground">{after.description}</p> : null}
+    {renamed ? <BeforeAfter className="text-sm" before={before.name} after={after.name} /> : null}
+    {after?.description ? <p className="text-sm text-secondary">{after.description}</p> : null}
     {body ? <Details label={before ? '内容改动' : '内容'}>{body}</Details> : null}
   </Row>
 }
@@ -160,11 +160,11 @@ function ScheduleRow({ id, before, after, current }: { id: string; before: BotSc
   const next = once ? after.first_run_at_ms : current?.enabled ? current.next_run_at_ms : null
   const detail = scheduleDetail(after)
   // One still listed opens the bot panel on it, where it is paused, resumed or deleted.
-  const label = current && fired === null ? <button type="button" className="rounded-sm text-left underline-offset-4 outline-none hover:underline focus-visible:ring-3 focus-visible:ring-ring/50" onClick={() => openSchedule(current.schedule_id)}>{after.name}</button> : after.name
+  const label = current && fired === null ? <Button variant="ghost" type="button" className="text-left underline-offset-4 " onClick={() => openSchedule(current.schedule_id)}>{after.name}</Button> : after.name
   return <Row icon={icon} label={label} tag={tag}>
-    {before && before.name !== after.name ? <BeforeAfter className="text-meta" before={before.name} after={after.name} /> : null}
-    {previous !== frequency ? <BeforeAfter className="text-meta" before={previous} after={frequency} /> : null}
-    <p className="flex flex-wrap items-center gap-x-2 text-meta text-muted-foreground tabular-nums">
+    {before && before.name !== after.name ? <BeforeAfter className="text-sm" before={before.name} after={after.name} /> : null}
+    {previous !== frequency ? <BeforeAfter className="text-sm" before={previous} after={frequency} /> : null}
+    <p className="flex flex-wrap items-center gap-x-2 text-sm text-secondary tabular-nums">
       {previous === frequency ? <span>{frequency}</span> : null}
       {/* A repeating schedule no longer listed was deleted since; one listed says whether it is paused now, not then. */}
       {fired !== null ? <span className="inline-flex items-center gap-1"><CircleCheck aria-hidden="true" className="size-4" />已提醒 {formatWhen(fired)}</span>

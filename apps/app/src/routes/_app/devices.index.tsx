@@ -1,8 +1,8 @@
-import { useState } from 'react'
-import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { AddDevice } from '@/features/devices/add-device'
 import { DevicesPage } from '@/features/devices/devices'
+import { createFileRoute,useNavigate } from '@tanstack/react-router'
 import { botSearch } from '@vibeface/client/workspace/home.ts'
+import { useState } from 'react'
 
 export const Route = createFileRoute('/_app/devices/')({
   validateSearch: (search: Record<string, unknown>): { add?: true | 'computer'; manage?: true; bot?: string } => ({ ...(search.add === true || search.add === 'true' ? { add: true as const } : search.add === 'computer' ? { add: 'computer' as const } : {}), ...(search.manage === true || search.manage === 'true' ? { manage: true as const } : {}), ...botSearch(search) }),

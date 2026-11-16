@@ -1,7 +1,10 @@
 {
   "name": "@vibeface/theme",
   "private": true,
+  "type": "module",
   "exports": {
-    "./theme.css": "./theme.css"
+    "./theme.css": "./theme.css",
+    "./native.css": "./native.css",
+    "./tokens": "./tokens.ts"
   }
 }

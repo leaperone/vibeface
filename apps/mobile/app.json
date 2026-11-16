@@ -76,9 +76,9 @@
             "fonts": [
               "./node_modules/@expo-google-fonts/geist/400Regular/Geist_400Regular.ttf",
               "./node_modules/@expo-google-fonts/geist/500Medium/Geist_500Medium.ttf",
-              "./node_modules/@expo-google-fonts/geist/600SemiBold/Geist_600SemiBold.ttf",
-              "./node_modules/@expo-google-fonts/geist/700Bold/Geist_700Bold.ttf",
-              "./node_modules/@expo-google-fonts/geist-mono/400Regular/GeistMono_400Regular.ttf"
+              "./node_modules/@expo-google-fonts/geist-mono/400Regular/GeistMono_400Regular.ttf",
+              "./node_modules/@expo-google-fonts/inter/400Regular/Inter_400Regular.ttf",
+              "./node_modules/@expo-google-fonts/inter/500Medium/Inter_500Medium.ttf"
             ]
           },
           "android": {
@@ -93,14 +93,6 @@
                   {
                     "path": "./node_modules/@expo-google-fonts/geist/500Medium/Geist_500Medium.ttf",
                     "weight": 500
-                  },
-                  {
-                    "path": "./node_modules/@expo-google-fonts/geist/600SemiBold/Geist_600SemiBold.ttf",
-                    "weight": 600
-                  },
-                  {
-                    "path": "./node_modules/@expo-google-fonts/geist/700Bold/Geist_700Bold.ttf",
-                    "weight": 700
                   }
                 ]
               },
@@ -110,6 +102,19 @@
                   {
                     "path": "./node_modules/@expo-google-fonts/geist-mono/400Regular/GeistMono_400Regular.ttf",
                     "weight": 400
+                  }
+                ]
+              },
+              {
+                "fontFamily": "Inter",
+                "fontDefinitions": [
+                  {
+                    "path": "./node_modules/@expo-google-fonts/inter/400Regular/Inter_400Regular.ttf",
+                    "weight": 400
+                  },
+                  {
+                    "path": "./node_modules/@expo-google-fonts/inter/500Medium/Inter_500Medium.ttf",
+                    "weight": 500
                   }
                 ]
               }

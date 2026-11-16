@@ -1,9 +1,10 @@
-import type { KeyboardEvent, ReactNode } from "react"
-import { Eye, LoaderCircle, Palette, RotateCcw, Shapes, type LucideIcon } from "lucide-react"
-import { colors, EYES, HUES, OUTLINES, type Avatar, type Face } from "@vibeface/client/avatar/face.ts"
-import { eyeNames, hueNames, outlineNames, withPart } from "@vibeface/client/avatar/pick.ts"
-import { BotFace, useDark } from "@/components/app/bot-face"
+import { BotFace,useDark } from "@/components/app/bot-face"
 import { cn } from "@/lib/utils"
+import { colors,EYES,HUES,OUTLINES,type Avatar,type Face } from "@vibeface/client/avatar/face.ts"
+import { eyeNames,hueNames,outlineNames,withPart } from "@vibeface/client/avatar/pick.ts"
+import { Button } from "@vibeface/uiarc/button/button.tsx"
+import { Eye,LoaderCircle,Palette,RotateCcw,Shapes,type LucideIcon } from "lucide-react"
+import type { KeyboardEvent,ReactNode } from "react"
 
 /**
  * Outline, eyes and colour as radio rows of still previews, and a way back to the face the id gives. Each press applies
@@ -25,16 +26,16 @@ export function AvatarPicker({ botId, avatar, face, disabled, busy, pick }: { bo
     </Choices>
     <Choices icon={Palette} label="颜色">
       {HUES.map((hue) => <Choice key={hue} label={hueNames[hue]} on={face.hue === hue} disabled={off} onPress={() => pick(withPart(face, { hue }))}>
-        <span aria-hidden="true" className="size-6 rounded-full" style={{ background: colors({ ...face, hue }, dark, 1).base }} />
+        <span aria-hidden="true" className="size-6 rounded-pill" style={{ background: colors({ ...face, hue }, dark, 1).base }} />
       </Choice>)}
     </Choices>
     <div className="flex min-h-11 items-center gap-2">
-      <button type="button" aria-disabled={off || !avatar || undefined} onClick={off || !avatar ? undefined : () => pick(null)}
-        className={cn("flex min-h-11 items-center gap-2 rounded-lg px-2 text-meta text-muted-foreground outline-none transition-colors focus-visible:ring-3 focus-visible:ring-ring/50",
-          off || !avatar ? "cursor-not-allowed opacity-50" : "hover:bg-muted hover:text-foreground")}>
+      <Button variant="ghost" type="button" aria-disabled={off || !avatar || undefined} onClick={off || !avatar ? undefined : () => pick(null)}
+        className={cn("flex items-center gap-2 ",
+          off || !avatar ? "cursor-not-allowed opacity-50" : "")}>
         <RotateCcw aria-hidden="true" className="size-4" />恢复默认
-      </button>
-      <span role="status" className="flex items-center gap-1 text-meta text-muted-foreground">
+      </Button>
+      <span role="status" className="flex items-center gap-1 text-sm text-secondary">
         {busy ? <><LoaderCircle aria-hidden="true" className="size-4 animate-spin motion-reduce:animate-none" />正在换</> : null}
       </span>
     </div>
@@ -54,17 +55,17 @@ function moveFocus(event: KeyboardEvent<HTMLDivElement>) {
 
 function Choices({ icon: Icon, label, children }: { icon: LucideIcon; label: string; children: ReactNode }) {
   return <div className="flex items-center gap-1">
-    <Icon aria-hidden="true" className="mx-2 size-4 shrink-0 text-muted-foreground" />
+    <Icon aria-hidden="true" className="mx-2 size-4 shrink-0 text-secondary" />
     <div role="radiogroup" aria-label={label} onKeyDown={moveFocus} className="flex flex-wrap gap-0.5">{children}</div>
   </div>
 }
 
 /** `aria-disabled` rather than `disabled`, so focus stays on the row while a pick is written. */
 function Choice({ label, on, disabled, onPress, children }: { label: string; on: boolean; disabled: boolean; onPress: () => void; children: ReactNode }) {
-  return <button type="button" role="radio" aria-checked={on} aria-label={label} title={label} aria-disabled={disabled || undefined} tabIndex={on ? 0 : -1}
+  return <Button variant={on ? "secondary" : "ghost"} type="button" role="radio" aria-checked={on} aria-label={label} title={label} aria-disabled={disabled || undefined} tabIndex={on ? 0 : -1}
     onClick={on || disabled ? undefined : onPress}
-    className={cn("grid size-11 place-items-center rounded-lg outline-none transition-colors focus-visible:ring-3 focus-visible:ring-ring/50",
-      disabled ? "cursor-not-allowed" : "hover:bg-muted", on ? "bg-muted ring-2 ring-brand ring-inset" : disabled && "opacity-50")}>
+    className={cn("grid place-items-center ",
+      disabled ? "cursor-not-allowed" : "", on ? "" : disabled && "opacity-50")}>
     {children}
-  </button>
+  </Button>
 }

@@ -1,0 +1,64 @@
+{
+  "system": "Arc",
+  "repository": "https://github.com/WheatXie/uiarc-pro-reverse",
+  "commit": "859606819c68787b2dccb54adcb9b08bd3272d5d",
+  "baseline": "b7a901efec10ad767a3c57a05a76ecd13202f39e",
+  "routes": {
+    "app": [
+      "src/routes/__root.tsx",
+      "src/routes/_app.tsx",
+      "src/routes/_app/b.$botId.tsx",
+      "src/routes/_app/b.$botId.work.$workId.tsx",
+      "src/routes/_app/channels.$channelId.tsx",
+      "src/routes/_app/channels.index.tsx",
+      "src/routes/_app/devices.$deviceId.tsx",
+      "src/routes/_app/devices.index.tsx",
+      "src/routes/_app/index.tsx",
+      "src/routes/_app/settings.tsx",
+      "src/routes/_app/settings_.lab.tsx",
+      "src/routes/_app/settings_.lab_.transfers.tsx",
+      "src/routes/_app/settings_.logs.tsx",
+      "src/routes/_app/tasks.tsx",
+      "src/routes/_app/tasks_.$taskId.tsx",
+      "src/routes/connect.tsx",
+      "src/routes/join.tsx"
+    ],
+    "mobile": [
+      "app/+native-intent.tsx",
+      "app/_layout.tsx",
+      "app/add-device.tsx",
+      "app/ai.tsx",
+      "app/b/[botId].tsx",
+      "app/b/[botId]/about.tsx",
+      "app/b/[botId]/context.tsx",
+      "app/b/[botId]/work/[workId].tsx",
+      "app/channel/[channelId].tsx",
+      "app/channel/[channelId]/settings.tsx",
+      "app/channels.tsx",
+      "app/device/[deviceId].tsx",
+      "app/external-chat.tsx",
+      "app/index.tsx",
+      "app/join.tsx",
+      "app/lab.tsx",
+      "app/logs.tsx",
+      "app/new-bot.tsx",
+      "app/new-channel.tsx",
+      "app/new-task.tsx",
+      "app/recovery.tsx",
+      "app/settings.tsx",
+      "app/switch-network.tsx",
+      "app/task/[taskId].tsx",
+      "app/task/[taskId]/context.tsx",
+      "app/tasks.tsx",
+      "app/transfers.tsx"
+    ]
+  },
+  "presentationOwners": {
+    "app": {
+      "src/routes/_app/b.$botId.tsx": "src/features/workspace/workspace-shell.tsx"
+    },
+    "mobile": {
+      "app/+native-intent.tsx": null
+    }
+  }
+}

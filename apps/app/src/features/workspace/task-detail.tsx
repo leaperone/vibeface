@@ -1,27 +1,30 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react"
-import { Link, useNavigate } from "@tanstack/react-router"
-import { Bot, ChevronLeft, Circle, CircleCheck, CircleDot, CircleQuestionMark, CircleStop, FolderOpen, Laptop, Link2, ListChecks, Play, RotateCw, SearchCheck, Settings, X } from "lucide-react"
-import { BusyIcon, Details, DetailRow, EmptyState, InlineError, StatusPill, toast, useAction, type Tone } from "@/components/app/kit"
 import { Markdown } from "@/components/app/markdown"
-import { Button } from "@/components/ui/button"
-import { cn } from "@/lib/utils"
-import { useDevice } from "@vibeface/client/identity/context.tsx"
-import { outcomeUnknown, rawError, workFailure } from "@vibeface/client/lib/errors.ts"
-import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
-import { workChecks, type WorkCheck } from "@vibeface/client/workspace/model.ts"
-import { BackOnline, confirmText } from "./task-activity"
-import { ActionButton } from "./present"
-import { QuestionCard } from "./question-card"
-import { agentLaneLabels, fixOnDevice, fixOnDeviceLabel, nodeName, parseSummarySteps, progressLabel, promptSummary, queueHoldLabels, schedulerStatus, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskProgress, taskStale, followUp, followUpCopy, type FollowUp, type SummaryStep } from "@vibeface/client/workspace/labels.ts"
-import { providerNames } from "@vibeface/client/lib/node.ts"
+import { PromptInput } from "@/components/arc/conversation-composer"
+import { BusyIcon,DetailRow,Details,EmptyState,InlineError,StatusPill,toast,useAction,type Tone } from "@/components/arc/product-kit"
+import { RoutedAction } from "@/components/arc/routed-action"
+import taskStyles from "@/components/arc/task-compositions.module.css"
 import { providerIcons } from "@/features/devices/ai-settings"
 import { CopyDiagnostics } from "@/features/identity/device-controls"
-import { projectName, workApproval } from "@vibeface/client/workspace/questions.ts"
-import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
-import type { WorkDetail } from '@vibeface/client/workspace/types.ts'
-import { PromptInput } from "@/features/chat/elements/prompt-input"
-import { InputQueue, WorkspaceInputStatus } from "./workspace-chat"
+import { cn } from "@/lib/utils"
+import { Link,useNavigate } from "@tanstack/react-router"
 import { promptIntent } from "@vibeface/client/chat/protocol.ts"
+import { useDevice } from "@vibeface/client/identity/context.tsx"
+import { outcomeUnknown,rawError,workFailure } from "@vibeface/client/lib/errors.ts"
+import { providerNames } from "@vibeface/client/lib/node.ts"
+import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
+import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
+import { agentLaneLabels,fixOnDevice,fixOnDeviceLabel,followUp,followUpCopy,nodeName,parseSummarySteps,progressLabel,promptSummary,queueHoldLabels,schedulerStatus,shownState,staleTaskLabel,taskActive,taskAgent,taskLabel,taskProgress,taskStale,type FollowUp,type SummaryStep } from "@vibeface/client/workspace/labels.ts"
+import { workChecks,type WorkCheck } from "@vibeface/client/workspace/model.ts"
+import { projectName,workApproval } from "@vibeface/client/workspace/questions.ts"
+import type { WorkDetail } from '@vibeface/client/workspace/types.ts'
+import { Button } from "@vibeface/uiarc/button/button.tsx"
+import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
+import { Bot,ChevronLeft,Circle,CircleCheck,CircleDot,CircleQuestionMark,CircleStop,FolderOpen,Laptop,Link2,ListChecks,Play,RotateCw,SearchCheck,Settings,X } from "lucide-react"
+import { useEffect,useId,useRef,useState,useSyncExternalStore } from "react"
+import { ActionButton } from "./present"
+import { QuestionCard } from "./question-card"
+import { BackOnline,confirmText } from "./task-activity"
+import { InputQueue,WorkspaceInputStatus } from "./workspace-chat"
 
 const tone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["waiting", "awaiting_confirmation"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
 type ComposerDraft = { text: string; files: File[]; workId: string; conversationId: string }
@@ -43,19 +46,6 @@ const followWidth = (change: () => void) => {
   const query = window.matchMedia(WIDE)
   query.addEventListener("change", change)
   return () => query.removeEventListener("change", change)
-}
-
-/** Everything outside `keep` stops taking focus and leaves the accessibility tree; live regions such as toasts stay heard. */
-function inertAround(keep: Element) {
-  const covered: Element[] = []
-  for (let node = keep; node.parentElement?.parentElement; node = node.parentElement) {
-    for (const sibling of node.parentElement.children) {
-      if (sibling === node || sibling.hasAttribute("inert") || sibling.hasAttribute("aria-live")) continue
-      sibling.setAttribute("inert", "")
-      covered.push(sibling)
-    }
-  }
-  return () => { for (const element of covered) element.removeAttribute("inert") }
 }
 
 /**
@@ -129,9 +119,6 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const close = () => void navigate(leave)
   const modal = !useSyncExternalStore(followWidth, () => window.matchMedia(WIDE).matches, () => true)
   const titleId = useId()
-  const layer = useRef<HTMLDivElement>(null)
-  // A layout effect, so the chat is live again before holdFocus returns focus to the task link in it.
-  useLayoutEffect(() => modal && layer.current ? inertAround(layer.current) : undefined, [modal])
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => { if (event.key === "Escape" && !event.defaultPrevented) close() }
     window.addEventListener("keydown", onKey)
@@ -158,68 +145,66 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const inputPaused = !canContinue && (!work?.outcome || unknown || work?.outcome === "unverified")
   const inputIntent = canContinue || inputPaused ? promptIntent(input) : "new_task"
 
-  return <div ref={layer} className="contents">
-  {/* Clicking it must not move focus to the page behind, or React hands focus back there instead of to the task link. */}
-  <div aria-hidden="true" onMouseDown={(event) => event.preventDefault()} onClick={close} className="fixed inset-0 z-40 hidden bg-black/40 animate-in dark:bg-black/60 fade-in-0 motion-reduce:animate-none md:block lg:hidden" />
-  <aside ref={holdFocus} tabIndex={-1} {...modal ? { role: "dialog", "aria-modal": true, "aria-labelledby": titleId, "data-state": "open" } : { "aria-label": "任务详情" }} className="fixed inset-0 z-40 flex flex-col bg-background outline-none md:left-auto md:z-50 md:w-[min(420px,90vw)] md:border-l md:bg-popover md:shadow-xl md:max-lg:animate-in md:max-lg:slide-in-from-right motion-reduce:animate-none lg:static lg:z-auto lg:w-[420px] lg:shrink-0 lg:bg-background lg:shadow-none">
-    <header className="flex min-h-14 shrink-0 items-center gap-2 border-b px-4 py-2">
+  const content = <>
+    {modal && state ? <div className="pb-4"><StatusPill tone={tone(state)}>{taskStale(state, workspace.connectionOnline) ? staleTaskLabel : taskLabel(state)}</StatusPill></div> : null}
+    <header hidden={modal} className="flex min-h-14 shrink-0 items-center gap-2 border-b px-4 py-2">
       {/* Full screen on a phone, so it leaves like a page, from the start of its header. */}
-      <Button asChild variant="ghost" size="icon" className="-ms-2 md:hidden"><Link {...leave} aria-label="返回" title="返回"><ChevronLeft aria-hidden="true" /></Link></Button>
-      <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground max-md:hidden" />
-      <h2 id={titleId} className="line-clamp-2 min-w-0 flex-1 text-heading font-semibold [overflow-wrap:anywhere]" title={work?.title}>{work?.title || "任务"}</h2>
+      <RoutedAction variant="ghost" size="md" className="-ms-2 md:hidden" {...leave} aria-label="返回" title="返回"><ChevronLeft aria-hidden="true" /></RoutedAction>
+      <ListChecks aria-hidden="true" className="size-5 shrink-0 text-secondary max-md:hidden" />
+      <h2 id={titleId} className="line-clamp-2 min-w-0 flex-1 text-lg font-medium [overflow-wrap:anywhere]" title={work?.title}>{work?.title || "任务"}</h2>
       {state ? taskStale(state, workspace.connectionOnline) ? <StatusPill>{staleTaskLabel}</StatusPill> : <StatusPill tone={tone(state)}>{taskLabel(state)}</StatusPill> : null}
-      <Button asChild variant="ghost" size="icon" className="max-md:hidden"><Link {...leave} aria-label="关闭" title="关闭"><X aria-hidden="true" /></Link></Button>
+      <RoutedAction variant="ghost" size="md" className="max-md:hidden" {...leave} aria-label="关闭" title="关闭"><X aria-hidden="true" /></RoutedAction>
     </header>
-    {!work ? <div className="grid gap-3 p-4"><EmptyState icon={ListChecks} title={!bot ? '找不到这个 Bot' : !workspace.connectionOnline ? '工作状态未知，连接后再读取' : readFailure ? '未能读取这个工作' : '正在读取工作'} /><InlineError error={readFailure} />{bot ? <Button type="button" variant="outline" className="justify-self-start" disabled={!workspace.connectionOnline} onClick={() => setRetry((value) => value + 1)}>重新读取</Button> : null}</div> : <div className="grid min-h-0 flex-1 content-start gap-4 overflow-y-auto p-4">
-      {bot ? <Link to="/b/$botId" params={{ botId }} className="flex min-h-11 w-fit items-center gap-1.5 rounded-md text-meta font-medium underline-offset-4 hover:underline"><Bot aria-hidden="true" className="size-4" /><span className="sr-only">所属 Bot </span>{bot.name}</Link> : null}
-      <div className="grid gap-1"><p className="text-meta text-muted-foreground">来源：共享历史中的工作记录。完整执行历史未提供。</p><Button type="button" variant="ghost" size="sm" className="justify-self-start" disabled={!workspace.connectionOnline} onClick={() => setRetry((value) => value + 1)}>重新读取工作</Button></div>
-      {!workspace.connectionOnline ? <p role="status" className="text-meta text-warning">连接已断开，显示最近记录；当前状态未知。</p> : null}
+    {!work ? <div className="grid gap-3 p-4"><EmptyState icon={ListChecks} title={!bot ? '找不到这个 Bot' : !workspace.connectionOnline ? '工作状态未知，连接后再读取' : readFailure ? '未能读取这个工作' : '正在读取工作'} /><InlineError error={readFailure} />{bot ? <Button type="button" variant="secondary" className="justify-self-start" disabled={!workspace.connectionOnline} onClick={() => setRetry((value) => value + 1)}>重新读取</Button> : null}</div> : <div className="grid min-h-0 flex-1 content-start gap-4 overflow-y-auto p-4">
+      {bot ? <Link to="/b/$botId" params={{ botId }} className="flex min-h-11 w-fit items-center gap-1.5 rounded-control text-sm font-medium underline-offset-4 hover:underline"><Bot aria-hidden="true" className="size-4" /><span className="sr-only">所属 Bot </span>{bot.name}</Link> : null}
+      <div className="grid gap-1"><p className="text-sm text-secondary">来源：共享历史中的工作记录。完整执行历史未提供。</p><Button type="button" variant="ghost" size="sm" className="justify-self-start" disabled={!workspace.connectionOnline} onClick={() => setRetry((value) => value + 1)}>重新读取工作</Button></div>
+      {!workspace.connectionOnline ? <p role="status" className="text-sm text-warning">连接已断开，显示最近记录；当前状态未知。</p> : null}
       <InlineError error={readFailure} action={{ label: '重新读取', onClick: () => setRetry((value) => value + 1) }} />
-      {device || work.cwd || agent ? <p className="flex min-w-0 items-center gap-x-3 text-meta text-muted-foreground">
+      {device || work.cwd || agent ? <p className="flex min-w-0 items-center gap-x-3 text-sm text-secondary">
         {agent && AgentIcon ? <span className="flex shrink-0 items-center gap-1.5"><AgentIcon aria-hidden="true" className="size-4 shrink-0" />{providerNames[agent]}</span> : null}
         {device ? <span className="flex min-w-0 items-center gap-1.5"><Laptop aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">设备 </span><span className="truncate">{nodeName(device, lookup)}</span></span> : null}
         {work.cwd ? <span className="flex min-w-0 items-center gap-1.5" title={work.cwd}><FolderOpen aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{folderLabels.project} </span><span className="truncate">{projectName(work.cwd)}</span></span> : null}
       </p> : null}
-      {progressHeadline ? <p className="line-clamp-2 break-words text-meta text-muted-foreground">{stale ? '最近进展：' : ''}{progressHeadline}</p> : null}
+      {progressHeadline ? <p className="line-clamp-2 break-words text-sm text-secondary">{stale ? '最近进展：' : ''}{progressHeadline}</p> : null}
       {work.kind === 'task' ? <Details label="协调回合">
         {coordination ? <>
           <p>{!workspace.connectionOnline || workspace.nodes.find((node) => node.device_id === device)?.online === false ? '当前状态未知，显示最近记录' : schedulerStatus(coordination.state).label}{coordination.lane ? ` · ${agentLaneLabels[coordination.lane]}` : ''}</p>
           {coordination.hold_reason ? <p>{queueHoldLabels[coordination.hold_reason]}</p> : null}
         </> : <p>执行设备尚未提供这个任务的协调回合观察。</p>}
-        <p className="text-meta text-muted-foreground">这里显示 Bot 的准备和排队情况，任务结果仍以上面的共享记录为准。</p>
+        <p className="text-sm text-secondary">这里显示 Bot 的准备和排队情况，任务结果仍以上面的共享记录为准。</p>
       </Details> : null}
       {plan ? <Details label={`最近步骤摘要 · ${plan.length}`} open={taskActive(state)}><SummarySteps steps={plan} /></Details> : null}
-      {taskActive(state) && (progressText || !plan && work.summary) ? <Details label="详细进展"><p className="max-h-[50dvh] overflow-auto whitespace-pre-wrap break-words text-meta">{progressText || work.summary || ""}</p></Details> : null}
-      {asked.summary ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">交代的事</h3><p className="break-words">{asked.summary}</p></section> : null}
-      {result && !taskActive(state) && !check ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">{failed || !work.result_text ? "原因" : "结果"}</h3>{!failed && work.result_text ? <Markdown text={result} /> : <p className={`whitespace-pre-wrap break-words ${failed ? "text-danger" : ""}`}>{result}</p>}</section> : null}
-      {check ? <section className="grid gap-3 rounded-xl border border-warning-border bg-warning-soft p-3">
+      {taskActive(state) && (progressText || !plan && work.summary) ? <Details label="详细进展"><p className="max-h-[50dvh] overflow-auto whitespace-pre-wrap break-words text-sm">{progressText || work.summary || ""}</p></Details> : null}
+      {asked.summary ? <section className="grid gap-1"><h3 className="text-sm font-medium text-secondary">交代的事</h3><p className="break-words">{asked.summary}</p></section> : null}
+      {result && !taskActive(state) && !check ? <section className="grid gap-1"><h3 className="text-sm font-medium text-secondary">{failed || !work.result_text ? "原因" : "结果"}</h3>{!failed && work.result_text ? <Markdown text={result} /> : <p className={`whitespace-pre-wrap break-words ${failed ? "text-danger" : ""}`}>{result}</p>}</section> : null}
+      {check ? <section className="grid gap-3 rounded-panel border border-warning-border bg-warning-subtle p-3">
         <h3 className="flex items-center gap-2 font-medium"><CircleQuestionMark aria-hidden="true" className="size-4 shrink-0 text-warning" />还不知道做完没有</h3>
-        <p className="text-meta text-muted-foreground">{confirmText(check, nodeName(device, lookup))}</p>
+        <p className="text-sm text-secondary">{confirmText(check, nodeName(device, lookup))}</p>
         {check.reason === "offline" ? <BackOnline device={nodeName(device, lookup)} /> : null}
-        <ActionButton variant="default" className="w-fit justify-self-end" disabled={!canAskCheck || action.busy !== null} action={checkResult}><SearchCheck aria-hidden="true" />先查结果</ActionButton>
+        <ActionButton variant="primary" className="w-fit justify-self-end" disabled={!canAskCheck || action.busy !== null} action={checkResult}><SearchCheck aria-hidden="true" />先查结果</ActionButton>
         <Details label="我已自行核对">
-          <p className="text-meta text-muted-foreground">只记录你的核对结论，不会重新执行任务。</p>
+          <p className="text-sm text-secondary">只记录你的核对结论，不会重新执行任务。</p>
           <div className="flex flex-wrap justify-end gap-2">
             <ActionButton disabled={!workspace.writable} action={settle("interrupted")}>没做完</ActionButton>
-            <ActionButton variant="default" disabled={!workspace.writable} action={settle("completed")}>做完了</ActionButton>
+            <ActionButton variant="primary" disabled={!workspace.writable} action={settle("completed")}>做完了</ActionButton>
           </div>
         </Details>
       </section> : null}
-      {sharing.length && stop ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">会一起停止</h3>
-        <ul className="grid gap-1">{sharing.map((item) => <li key={item.work_id} className="flex min-w-0 items-center gap-2"><Link2 aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /><span className="truncate">{item.title || "任务"}</span></li>)}</ul></section> : null}
+      {sharing.length && stop ? <section className="grid gap-1"><h3 className="text-sm font-medium text-secondary">会一起停止</h3>
+        <ul className="grid gap-1">{sharing.map((item) => <li key={item.work_id} className="flex min-w-0 items-center gap-2"><Link2 aria-hidden="true" className="size-4 shrink-0 text-secondary" /><span className="truncate">{item.title || "任务"}</span></li>)}</ul></section> : null}
       {asking ? <QuestionCard key={asking.question_id} question={asking} inTask /> : null}
       {stop ? <div className="grid gap-2">
         {confirming || action.busy === "stop" ? <div className="flex flex-wrap items-center gap-2">
           <Button type="button" variant="ghost" disabled={action.busy !== null} onClick={() => setConfirming(false)}>取消</Button>
-          <Button type="button" variant="destructive" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("stop", stop).finally(() => setConfirming(false))}><CircleStop aria-hidden="true" />{action.busy === "stop" ? "正在请求停止…" : "确认停止"}</Button>
-          <span className="text-meta text-muted-foreground">停下后不会自动接着做</span>
-        </div> : <Button type="button" variant="outline" className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => setConfirming(true)}><CircleStop aria-hidden="true" />{sharing.length ? `一起停止 ${sharing.length + 1} 个任务` : "停止任务"}</Button>}
+          <Button type="button" variant="danger" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("stop", stop).finally(() => setConfirming(false))}><CircleStop aria-hidden="true" />{action.busy === "stop" ? "正在请求停止…" : "确认停止"}</Button>
+          <span className="text-sm text-secondary">停下后不会自动接着做</span>
+        </div> : <Button type="button" variant="secondary" className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => setConfirming(true)}><CircleStop aria-hidden="true" />{sharing.length ? `一起停止 ${sharing.length + 1} 个任务` : "停止任务"}</Button>}
         <InlineError error={action.error} />
       </div> : null}
       {(!check && (failed || unknown || state === "interrupted")) ? <div className="grid gap-2"><div className="flex flex-wrap gap-2">
-        {failed && device && fixOnDevice(work) ? <Button asChild variant="outline"><Link to="/devices/$deviceId" params={{ deviceId: device }}><Settings aria-hidden="true" />{fixOnDeviceLabel(nodeName(device, lookup))}</Link></Button> : null}
+        {failed && device && fixOnDevice(work) ? <RoutedAction variant="secondary" to="/devices/$deviceId" params={{ deviceId: device }}><Settings aria-hidden="true" />{fixOnDeviceLabel(nodeName(device, lookup))}</RoutedAction> : null}
         {/* After a failure trying again is the next step; a task the person stopped only offers it. */}
-        <Button type="button" variant={state === "interrupted" ? "outline" : "default"} className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("retry", async () => {
+        <Button type="button" variant={state === "interrupted" ? "secondary" : "primary"} className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("retry", async () => {
           if (unknown) { await checkResult(); return }
           let revision: number | undefined
           if (taskTarget) {
@@ -243,7 +228,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       </Details>
       {workspace.pendingMessages.filter((item) => item.target.kind === 'work' && item.target.work_id === workId).map((item) => <WorkspaceInputStatus key={item.message_id} pending={item} />)}
     </div>}
-    {work ? <div className="shrink-0 border-t p-3"><PromptInput value={input} onChange={setInput} files={files} onFiles={setFiles} hint="" reason={inputPaused ? (unknown || work.outcome === "unverified" ? "先让 Bot 查结果，再继续。" : "这个工作当前不能接收补充。") : workspace.readOnlyNotice || workspace.writeNotice} disabled={!workspace.canSaveMessages || inputPaused} label={inputIntent === "continue" ? `补充给 ${work.title || '这个工作'}` : '发送为新任务'} sendLabel={inputIntent === "continue" ? "补充这个工作" : "发送为新任务"} target={<><span className="text-meta text-muted-foreground">{inputIntent === "continue" ? '补充给' : '新任务 · 接着'} · {work.title || '这个工作'}</span><InputQueue target={{ kind: "work", work_id: workId }} /></>} onSubmit={() => {
+    {work ? <div className="shrink-0 border-t p-3"><PromptInput value={input} onChange={setInput} files={files} onFiles={setFiles} hint="" reason={inputPaused ? (unknown || work.outcome === "unverified" ? "先让 Bot 查结果，再继续。" : "这个工作当前不能接收补充。") : workspace.readOnlyNotice || workspace.writeNotice} disabled={!workspace.canSaveMessages || inputPaused} label={inputIntent === "continue" ? `补充给 ${work.title || '这个工作'}` : '发送为新任务'} sendLabel={inputIntent === "continue" ? "补充这个工作" : "发送为新任务"} target={<><span className="text-sm text-secondary">{inputIntent === "continue" ? '补充给' : '新任务 · 接着'} · {work.title || '这个工作'}</span><InputQueue target={{ kind: "work", work_id: workId }} /></>} onSubmit={() => {
       const submittedDraft = draft
       if (savingDrafts.current.has(submittedDraft)) return
       savingDrafts.current.add(submittedDraft)
@@ -251,8 +236,8 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       setSendError(null)
       void workspace.sendMessage(text, selectedFiles, undefined, { target: { kind: 'work', work_id: workId }, intent: inputIntent, conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !workspace.isCurrent() || draftRef.current !== submittedDraft) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') void navigate({ to: '/tasks/$taskId', params: { taskId: saved.target.task_id } }) } }).then((saved) => { if (saved && draftRef.current === submittedDraft) { setInput((current) => current === text ? '' : current); setFiles((current) => current === selectedFiles ? [] : current) } }).catch(setSendError).finally(() => { savingDrafts.current.delete(submittedDraft) })
     }}><InlineError error={sendError} /></PromptInput></div> : null}
-  </aside>
-  </div>
+  </>
+  return modal ? <Drawer open onOpenChange={open => { if (!open) close() }}><DrawerContent side="right" title={work?.title || "任务"} description="任务详情" className={taskStyles.drawer}>{content}</DrawerContent></Drawer> : <aside ref={holdFocus} tabIndex={-1} aria-label="任务详情" className={taskStyles.aside}>{content}</aside>
 }
 
 const followUpIcons: Record<FollowUp, typeof Circle> = { check: SearchCheck, resume: Play, retry: RotateCw }
@@ -260,12 +245,12 @@ const followUpIcons: Record<FollowUp, typeof Circle> = { check: SearchCheck, res
 const steps: Record<SummaryStep["state"], { icon: typeof Circle; className: string; label: string }> = {
   done: { icon: CircleCheck, className: "text-success", label: "已完成" },
   current: { icon: CircleDot, className: "text-info", label: "进行中" },
-  pending: { icon: Circle, className: "text-muted-foreground", label: "待做" },
+  pending: { icon: Circle, className: "text-secondary", label: "待做" },
 }
 
 function SummarySteps({ steps: items }: { steps: SummaryStep[] }) {
   return <ol className="grid gap-1.5">{items.map((item, index) => {
     const step = steps[item.state]
-    return <li key={`${item.state}:${index}`} className={cn("flex min-w-0 items-start gap-2", item.state === "pending" && "text-muted-foreground")}><step.icon aria-hidden="true" className={cn("mt-0.5 size-4 shrink-0", step.className)} /><span className="sr-only">{step.label} </span><span className="break-words">{item.text}</span></li>
+    return <li key={`${item.state}:${index}`} className={cn("flex min-w-0 items-start gap-2", item.state === "pending" && "text-secondary")}><step.icon aria-hidden="true" className={cn("mt-0.5 size-4 shrink-0", step.className)} /><span className="sr-only">{step.label} </span><span className="break-words">{item.text}</span></li>
   })}</ol>
 }

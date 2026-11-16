@@ -1,24 +1,27 @@
 import { cloneElement, isValidElement, useMemo, type ReactElement, type ReactNode } from 'react'
 import { ScrollView, View, type TextProps, type TextStyle, type ViewStyle } from 'react-native'
 import { Renderer, useMarkdown, type MarkedStyles } from 'react-native-marked'
-import { useCSSVariable, useUniwind } from 'uniwind'
+import { useUniwind } from 'uniwind'
+import { arcColors, arcTokens } from '@vibeface/theme/tokens'
 
 /** A bot's reply, styled with the type roles and the shared colour tokens. */
 export function Markdown({ text }: { text: string }) {
   const { theme } = useUniwind()
-  const [foreground, muted, border, mutedForeground] = useCSSVariable(['--foreground', '--muted', '--border', '--muted-foreground']) as string[]
-  const [bodySize, bodyLine, headingSize, headingLine, metaSize, metaLine] = useCSSVariable(['--text-body', '--text-body--line-height', '--text-heading', '--text-heading--line-height', '--text-meta', '--text-meta--line-height']) as number[]
+  const palette = theme === 'dark' ? arcColors.dark : arcColors.light
+  const { foreground, border, 'surface-muted': muted, 'text-secondary': mutedForeground } = palette
+  const bodySize = arcTokens.fontSize.base, bodyLine = 24
+  const headingSize = arcTokens.fontSize.base, headingLine = 24
+  const metaSize = arcTokens.fontSize.sm, metaLine = 20
   const styles = useMemo<MarkedStyles>(() => {
-    const body = { fontFamily: 'Geist', fontSize: bodySize, lineHeight: bodyLine, color: foreground }
+    const body = { fontFamily: 'Inter', fontSize: bodySize, lineHeight: bodyLine, color: foreground }
     // Every level is one heading, as on the web; the library's own sizes, margins and h1/h2 rules are reset. Blocks
     // sit 12 apart (paragraphs pad 6 each side) and a heading takes 4 more above.
-    const heading = { ...body, fontSize: headingSize, lineHeight: headingLine, fontWeight: '600' as const, marginVertical: 0, paddingTop: 10, paddingBottom: 6, borderBottomWidth: 0 }
+    const heading = { ...body, fontSize: headingSize, lineHeight: headingLine, fontWeight: '500' as const, marginVertical: 0, paddingTop: 10, paddingBottom: 6, borderBottomWidth: 0 }
     return {
-      text: body, paragraph: { marginVertical: 0, paddingVertical: 6 }, li: { ...body, fontVariant: ['tabular-nums'] }, strong: { ...body, fontWeight: '600' },
+      text: body, paragraph: { marginVertical: 0, paddingVertical: 6 }, li: { ...body, fontVariant: ['tabular-nums'] }, strong: { ...body, fontWeight: '500' },
       h1: heading, h2: heading, h3: heading, h4: heading,
       link: { ...body, textDecorationLine: 'underline' },
-      // 0.9em on foreground at 8% (hex alpha 14); the theme's foreground is an opaque #rrggbb.
-      codespan: { fontFamily: 'Geist Mono', fontSize: bodySize * 0.9, fontStyle: 'normal', fontWeight: '400', backgroundColor: `${foreground}14`, color: foreground },
+      codespan: { fontFamily: 'Geist Mono', fontSize: metaSize, fontStyle: 'normal', fontWeight: '400', backgroundColor: muted, color: foreground },
       code: { padding: 12 },
       codeText: { fontFamily: 'Geist Mono', fontSize: metaSize, lineHeight: metaLine, color: foreground },
       blockquote: { borderLeftColor: border, borderLeftWidth: 3, paddingLeft: 12 },
@@ -27,7 +30,7 @@ export function Markdown({ text }: { text: string }) {
       em: { ...body, fontStyle: 'italic', color: mutedForeground },
     }
   }, [foreground, muted, border, mutedForeground, bodySize, bodyLine, headingSize, headingLine, metaSize, metaLine])
-  const renderer = useMemo(() => new Reply({ backgroundColor: muted, borderColor: border, borderWidth: 1, borderRadius: 14, marginVertical: 6, overflow: 'hidden' }), [muted, border])
+  const renderer = useMemo(() => new Reply({ backgroundColor: muted, borderColor: border, borderWidth: 1, borderRadius: arcTokens.radius.control, marginVertical: 6, overflow: 'hidden' }), [muted, border])
   // A new theme object would re-parse every reply on screen each time the chat renders.
   const colors = useMemo(() => ({ colors: { text: foreground, link: foreground, border, code: muted } }), [foreground, border, muted])
   const nodes = useMarkdown(text, {

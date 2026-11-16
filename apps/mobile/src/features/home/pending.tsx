@@ -6,9 +6,9 @@ import Animated from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
 import { ErrorText, useAction } from '@/components/action'
 import { ActionCard } from '@/components/kit'
-import { Button } from '@/components/ui/button'
-import { Icon } from '@/components/ui/icon'
-import { Text } from '@/components/ui/text'
+import { Button } from '@/components/arc/button'
+import { Icon } from '@/components/arc/icon'
+import { Text } from '@/components/arc/text'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import type { InboxItem } from '@vibeface/client/workspace/inbox.ts'
 import { workFailure } from '@vibeface/client/lib/errors.ts'
@@ -55,15 +55,15 @@ export function PendingSection() {
   const attention = items.filter((item): item is Extract<InboxItem, { kind: 'attention' }> => item.kind === 'attention')
   if (!items.length) return null
   return <View className="gap-3">
-    <Text role="heading" className="px-1 text-heading font-semibold">待处理</Text>
+    <Text role="heading" className="px-1 text-lg font-medium">待处理</Text>
     {items.map((item) => item.kind === 'recovery' ? <RecoveryPendingCard key={item.key} /> : null)}
-    {inputs.length ? <View className="gap-3"><Text role="heading" className="px-1 text-meta font-medium text-muted-foreground">待确认</Text>{inputs.map((input) => <View key={input.message_id} className="gap-2"><Text numberOfLines={2} className="text-meta">{input.text}</Text><InputLocation target={input.target} conversationId={input.conversation_id} /><InputStatus pending={input} /></View>)}</View> : null}
-    {attention.length ? <Text role="heading" className="mt-3 px-1 text-meta font-medium text-muted-foreground">更新</Text> : null}
+    {inputs.length ? <View className="gap-3"><Text role="heading" className="px-1 text-sm font-medium text-muted">待确认</Text>{inputs.map((input) => <View key={input.message_id} className="gap-2"><Text numberOfLines={2} className="text-sm">{input.text}</Text><InputLocation target={input.target} conversationId={input.conversation_id} /><InputStatus pending={input} /></View>)}</View> : null}
+    {attention.length ? <Text role="heading" className="mt-3 px-1 text-sm font-medium text-muted">更新</Text> : null}
     {attention.length && shared ? <View className="flex-row flex-wrap justify-end gap-2">
       <Button variant="ghost" disabled={busy !== null} accessibilityLabel="忽略提醒" onPress={() => void run('ignore', async () => { shared.ignoreNotifications(attention.map((item) => item.notification.notification_id)) }, '已忽略提醒，仅此设备隐藏。')}><Icon as={EyeOff} /><Text>忽略提醒</Text></Button>
-      <Button variant="outline" disabled={busy !== null} accessibilityLabel="全部已读" onPress={() => void run('read', async () => { await shared.markNotificationsRead(attention.map((item) => item.notification.notification_id)) }, '提醒已标记为已读。')}><Icon as={CheckCheck} /><Text>全部已读</Text></Button>
+      <Button variant="secondary" disabled={busy !== null} accessibilityLabel="全部已读" onPress={() => void run('read', async () => { await shared.markNotificationsRead(attention.map((item) => item.notification.notification_id)) }, '提醒已标记为已读。')}><Icon as={CheckCheck} /><Text>全部已读</Text></Button>
     </View> : null}
-    {error ? <ErrorText error={error} /> : status ? <Text role="status" className="text-meta text-muted-foreground">{status}</Text> : null}
+    {error ? <ErrorText error={error} /> : status ? <Text role="status" className="text-sm text-muted">{status}</Text> : null}
     {items.map((item) => item.kind === 'rotate' ? <RotateHintCard key={item.key} />
       : item.kind === 'confirm' ? <ConfirmCard key={item.key} check={item.check} />
       : item.kind === 'undelivered' ? null
@@ -74,7 +74,7 @@ export function PendingSection() {
     {open.length ? open.map((questions) => <Group key={questions[0].bot?.bot_id ?? ''} layout={move} className="gap-2">
       {questions[0].bot ? <Link href={`/b/${questions[0].bot.bot_id}`} replace={wide} asChild>
         <Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-1 self-start">
-          <Icon as={Bot} className="size-4" /><Text className="font-medium">{questions[0].bot.name}</Text><Icon as={ChevronRight} className="size-4 text-muted-foreground" />
+          <Icon as={Bot} className="size-4" /><Text className="font-medium">{questions[0].bot.name}</Text><Icon as={ChevronRight} className="size-4 text-muted" />
         </Pressable>
       </Link> : null}
       {questions.map((question) => <Animated.View key={question.question_id} layout={move}><QuestionCard question={question} /></Animated.View>)}
@@ -98,14 +98,14 @@ function rowHref(item: Row, chat: string | undefined, entry: string | undefined)
 }
 
 function ItemRow({ item, href, replace }: { item: Row; href: Href | null; replace: boolean }) {
-  const card = 'min-h-14 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-3 shadow-xs dark:border-line-strong'
+  const card = 'min-h-14 flex-row items-center gap-3 rounded-panel border border-border bg-surface px-4 py-3  '
   const body = <>
     <Icon as={item.kind === 'write' && item.write === 'read_only' ? Lock : rowIcons[item.kind]} className="size-5 text-warning" />
     <Text numberOfLines={2} className="min-w-0 flex-1 font-medium">{item.title}</Text>
-    {item.meta ? <Text numberOfLines={1} className="max-w-[40%] text-meta text-muted-foreground">{item.meta}</Text> : null}
-    {href ? <Icon as={ChevronRight} className="text-muted-foreground" /> : null}
+    {item.meta ? <Text numberOfLines={1} className="max-w-[40%] text-sm text-muted">{item.meta}</Text> : null}
+    {href ? <Icon as={ChevronRight} className="text-muted" /> : null}
   </>
-  return href ? <Link href={href} replace={replace} asChild><Pressable accessibilityRole="link" className={`${card} active:bg-muted`}>{body}</Pressable></Link> : <View className={card}>{body}</View>
+  return href ? <Link href={href} replace={replace} asChild><Pressable accessibilityRole="link" className={`${card} active:bg-surface-muted`}>{body}</Pressable></Link> : <View className={card}>{body}</View>
 }
 
 /**
@@ -120,13 +120,13 @@ function FailedCard({ item, replace }: { item: Extract<InboxItem, { kind: 'faile
   const target = item.work.target_node
   return <ActionCard icon={CircleX} tone="danger" meta={item.meta}
     title={<Link href={`/b/${item.bot.bot_id}/work/${item.work.work_id}`} replace={replace} className="underline">{item.title}</Link>}
-    trailing={<Button variant="ghost" size="icon" accessibilityLabel="关掉" disabled={!shared?.writable || busy !== null} onPress={() => void run('dismiss', () => shared!.dismissWork(item.work.conversation_id, item.work.work_id))}>
-      <Icon as={busy ? LoaderCircle : X} className="text-muted-foreground" />
+    trailing={<Button variant="ghost" iconOnly accessibilityLabel="关掉" disabled={!shared?.writable || busy !== null} onPress={() => void run('dismiss', () => shared!.dismissWork(item.work.conversation_id, item.work.work_id))}>
+      <Icon as={busy ? LoaderCircle : X} className="text-muted" />
     </Button>}
     actions={fixOnDevice(item.work) ? <Link href={target === device.ready?.entry.device_id ? '/ai' : `/device/${target}`} asChild>
-      <Button variant="outline"><Icon as={Settings} /><Text>{fixOnDeviceLabel(item.meta ?? '')}</Text></Button>
+      <Button variant="secondary"><Icon as={Settings} /><Text>{fixOnDeviceLabel(item.meta ?? '')}</Text></Button>
     </Link> : undefined}>
-    {reason ? <Text numberOfLines={3} className="text-muted-foreground">{reason}</Text> : null}
+    {reason ? <Text numberOfLines={3} className="text-muted">{reason}</Text> : null}
     <ErrorText error={error} />
   </ActionCard>
 }

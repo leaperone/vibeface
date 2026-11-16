@@ -7,15 +7,16 @@ import { failureText, rawError, replyFailure } from '@vibeface/client/lib/errors
 import { ActionButton } from '@/components/action'
 import { BotFace, type FaceBot } from '@/components/bot-face'
 import { Details } from '@/components/kit'
-import { Icon } from '@/components/ui/icon'
-import { Text } from '@/components/ui/text'
+import { MessageBubble } from '@/components/arc/chat'
+import { Icon } from '@/components/arc/icon'
+import { Text } from '@/components/arc/text'
 import type { ChatMessage } from '@/data/types'
-import { easeOut } from '@/lib/motion'
+import { easeOut, settle } from '@/lib/motion'
 import { Markdown } from './markdown'
 
 const Rise = withUniwind(Animated.View)
 // As on the web: a new message rises 5px into place once.
-const rise = FadeInDown.duration(180).easing(easeOut).withInitialValues({ transform: [{ translateY: 5 }] }).reduceMotion(ReduceMotion.System)
+const rise = FadeInDown.duration(settle).easing(easeOut).withInitialValues({ transform: [{ translateY: 5 }] }).reduceMotion(ReduceMotion.System)
 
 const ended: Record<string, string> = { stopped: '已中断', interrupted: '已中断', failed: '失败' }
 
@@ -32,23 +33,23 @@ export const Message = memo(function Message({ message, bot, time: shown, offlin
   const cause = failed ? replyFailure(message.failure, message.detail) : failureText(message.failure)
   const raw = failed && message.detail ? rawError(message.detail) : ''
   const entering = message.created_at_ms > Date.now() - 2000 ? rise : undefined
-  const time = shown ? <Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{shown}</Text> : null
+  const time = shown ? <Text className="text-sm text-muted" style={{ fontVariant: ['tabular-nums'] }}>{shown}</Text> : null
   if (user) return <Rise entering={entering} className="max-w-[85%] items-end gap-1 self-end">
-    <View className="rounded-2xl rounded-br-md bg-secondary px-4 py-2 ring-1 ring-border/60">
+    <MessageBubble>
       {/* A message may be only its files. */}
-      {message.text ? <Text selectable className="text-secondary-foreground">{message.text}</Text>
-        : <View className="flex-row items-center gap-1"><Icon as={Paperclip} className="text-secondary-foreground" /><Text className="text-secondary-foreground">{message.attachments?.length ?? 0} 个文件</Text></View>}
-    </View>
-    {message.state === 'sending' ? <Icon as={Clock} accessibilityLabel="发送中" className="text-muted-foreground" /> : time}
+      {message.text ? <Text selectable className="text-foreground">{message.text}</Text>
+        : <View className="flex-row items-center gap-1"><Icon as={Paperclip} className="text-foreground" /><Text className="text-foreground">{message.attachments?.length ?? 0} 个文件</Text></View>}
+    </MessageBubble>
+    {message.state === 'sending' ? <Icon as={Clock} accessibilityLabel="发送中" className="text-muted" /> : time}
   </Rise>
   if (message.role === 'bot') return <Rise entering={entering} className="max-w-[85%] items-start gap-1">
     <View className="flex-row items-center gap-1.5">
-      <Icon as={Bot} className="text-muted-foreground" />
-      <Text numberOfLines={1} className="shrink text-meta text-muted-foreground">{message.sender?.name ?? '另一个 Bot'}</Text>
+      <Icon as={Bot} className="text-muted" />
+      <Text numberOfLines={1} className="shrink text-sm text-muted">{message.sender?.name ?? '另一个 Bot'}</Text>
     </View>
-    <View className="rounded-2xl border border-border bg-muted px-4 py-2">
+    <MessageBubble>
       <Markdown text={message.text} />
-    </View>
+    </MessageBubble>
     {time}
   </Rise>
   return <Rise entering={entering} className="gap-1">
@@ -57,11 +58,11 @@ export const Message = memo(function Message({ message, bot, time: shown, offlin
       <BotFace bot={bot} mood={offline ? 'asleep' : 'replying'} size={24} />
     </View> : null}
     {stopped ? <View className="flex-row flex-wrap items-center gap-x-2 gap-y-1">
-      <View className="flex-row items-center gap-1"><Icon as={failed ? CircleX : CirclePause} className={failed ? 'text-danger' : 'text-muted-foreground'} /><Text className={failed ? 'text-meta text-danger' : 'text-meta text-muted-foreground'}>{stopped}</Text></View>
-      {cause ? <Text className="shrink text-meta text-muted-foreground">{cause}</Text> : null}
+      <View className="flex-row items-center gap-1"><Icon as={failed ? CircleX : CirclePause} className={failed ? 'text-danger' : 'text-muted'} /><Text className={failed ? 'text-sm text-danger' : 'text-sm text-muted'}>{stopped}</Text></View>
+      {cause ? <Text className="shrink text-sm text-muted">{cause}</Text> : null}
       {retry ? <ActionButton variant="ghost" icon={RotateCcw} action={retry}>重试</ActionButton> : null}
     </View> : null}
-    {raw ? <Details><Text selectable className="font-mono text-meta text-muted-foreground">{raw}</Text></Details> : null}
+    {raw ? <Details><Text selectable className="font-mono text-sm text-muted">{raw}</Text></Details> : null}
     {time ? <View className="-mt-1.5">{time}</View> : null}
   </Rise>
 })

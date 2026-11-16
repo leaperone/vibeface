@@ -1,17 +1,17 @@
-import { useEffect, useRef, useState } from "react"
-import { CircleAlert, CircleCheck, Clock, Copy, Download, Laptop, Link2, Plus, Smartphone, SquareTerminal } from "lucide-react"
-import { Link } from "@tanstack/react-router"
-import qrcode from "qrcode-generator"
-import { BusyIcon, Details, InlineError, PageActions, Segmented } from "@/components/app/kit"
-import { Button } from "@/components/ui/button"
-import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
-import { Textarea } from "@/components/ui/textarea"
+import { BusyIcon,Details,InlineError,PageActions,Segmented } from "@/components/arc/product-kit"
+import { RoutedAction } from "@/components/arc/routed-action"
 import { terms } from "@/lib/glossary"
-import { useDevice } from "@vibeface/client/identity/context.tsx"
 import type { Invitation } from "@vibeface/client/identity/context.tsx"
-import { addDeviceCopy, deviceCopy, joinCopy } from "@vibeface/client/identity/copy.ts"
+import { useDevice } from "@vibeface/client/identity/context.tsx"
+import { addDeviceCopy,deviceCopy,joinCopy } from "@vibeface/client/identity/copy.ts"
 import { messageOf } from "@vibeface/client/lib/node.ts"
-import { JoinRequests, useOpenJoins, type Added } from "./join"
+import { Button } from "@vibeface/uiarc/button/button.tsx"
+import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
+import { Textarea } from "@vibeface/uiarc/textarea/textarea.tsx"
+import { CircleAlert,CircleCheck,Clock,Copy,Download,Laptop,Link2,Plus,Smartphone,SquareTerminal } from "lucide-react"
+import qrcode from "qrcode-generator"
+import { useEffect,useRef,useState } from "react"
+import { JoinRequests,useOpenJoins,type Added } from "./join"
 
 /** `image`: the QR code of the link, which the Vibeface app scans. */
 type Share = Invitation & { image: string | null }
@@ -52,7 +52,6 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
   // What 链接原文 shows: the last thing someone tried to copy.
   const [shown, setShown] = useState<"link" | "command">("link")
   const [kind, setKind] = useState<Kind>("phone")
-  const sheet = useRef<HTMLDivElement>(null)
   useEffect(() => {
     if (!copied) return
     const timer = setTimeout(() => setCopied(null), 2000)
@@ -100,7 +99,7 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
   }, "") }
   const raw = useRef<HTMLTextAreaElement>(null)
   useEffect(() => { if (copyFailed) { raw.current?.focus(); raw.current?.select() } }, [copyFailed])
-  const copyButton = (what: "link" | "command", value: string, label: string, solid: boolean) => <Button type="button" variant={solid && !requests ? "default" : "outline"} className="w-fit" disabled={busy} onClick={() => copy(what, value)}>
+  const copyButton = (what: "link" | "command", value: string, label: string, solid: boolean) => <Button type="button" variant={solid && !requests ? "primary" : "secondary"} className="w-fit" disabled={busy} onClick={() => copy(what, value)}>
     {copied === what ? <CircleCheck aria-hidden="true" /> : <Copy aria-hidden="true" />}{copied === what ? "已复制" : label}
   </Button>
   const show = () => { setOpen(true); if (!result && !requests) generate() }
@@ -115,61 +114,60 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
 
   return <>
     <PageActions>
-      <Button type="button" variant="ghost" size="icon" className="md:hidden" aria-label="添加设备" title="添加设备" onClick={show}><Plus aria-hidden="true" /></Button>
-      <Button type="button" variant={requests ? "outline" : "default"} className="max-md:hidden" onClick={show}><Plus aria-hidden="true" />添加设备</Button>
+      <Button type="button" variant="ghost" size="md" className="md:hidden" aria-label="添加设备" title="添加设备" onClick={show}><Plus aria-hidden="true" /></Button>
+      <Button type="button" variant={requests ? "secondary" : "primary"} className="max-md:hidden" onClick={show}><Plus aria-hidden="true" />添加设备</Button>
     </PageActions>
-    <Sheet open={open} onOpenChange={(next) => { setOpen(next); if (!next) { setAdded(null); setAsManager(false) } }}>
+    <Drawer open={open} onOpenChange={(next) => { setOpen(next); if (!next) { setAdded(null); setAsManager(false) } }}>
       {/* A waiting request leads the sheet; its first control is 设为管理设备, which should not take focus on its own. */}
-      <SheetContent ref={sheet} className="!w-full max-sm:!border-l-0 overflow-y-auto sm:!max-w-md" onOpenAutoFocus={(event) => { if (requests) { event.preventDefault(); sheet.current?.focus() } }}>
-        <SheetHeader className="pr-14"><SheetTitle tabIndex={-1} className="outline-none">添加设备</SheetTitle><SheetDescription className="sr-only">在新设备上打开链接，安全码一致后允许</SheetDescription></SheetHeader>
-        <div className="grid gap-6 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
+      <DrawerContent title="添加设备" description="在新设备上打开链接，安全码一致后允许" className="!w-full max-sm:!border-l-0 overflow-y-auto sm:!max-w-md" onOpenAutoFocus={(event) => { if (requests) { event.preventDefault(); if (event.target instanceof HTMLElement) event.target.focus() } }}>
+        <div className="grid gap-6 pb-[env(safe-area-inset-bottom)]">
           {/* A device already asking is the next thing to act on, so it comes before a new link. */}
           <JoinRequests issuing={result !== null} manage={asManager} onAllowed={(device) => { setAdded(device); setAsManager(false); setResult(null); setError(""); setCopyFailed(false) }} />
           {added && !requests ? <div className="grid gap-3">
             <p role="status" className="flex min-w-0 items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" /><span className="truncate" title={added.name}>{added.manage ? deviceCopy.addedManager(added.name) : `已添加「${added.name}」`}</span></p>
             <div className="flex flex-wrap gap-2">
-              {added.kind === "node" ? <Button asChild><Link to="/devices/$deviceId" params={{ deviceId: added.id }} onClick={() => setOpen(false)}><terms.ai.icon aria-hidden="true" />{addDeviceCopy.setUpAi}</Link></Button> : null}
-              <Button type="button" variant={added.kind === "node" ? "outline" : "default"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Plus} />{addDeviceCopy.addAnother}</Button>
+              {added.kind === "node" ? <RoutedAction to="/devices/$deviceId" params={{ deviceId: added.id }} onClick={() => setOpen(false)}><terms.ai.icon aria-hidden="true" />{addDeviceCopy.setUpAi}</RoutedAction> : null}
+              <Button type="button" variant={added.kind === "node" ? "secondary" : "primary"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Plus} />{addDeviceCopy.addAnother}</Button>
             </div>
-          </div> : !result || (used && !requests) ? <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Link2} />生成链接</Button> : null}
+          </div> : !result || (used && !requests) ? <Button type="button" variant={requests ? "secondary" : "primary"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Link2} />生成链接</Button> : null}
           {result && !used ? <div className="grid gap-3">
             <Segmented label="新设备是" labels fill value={kind} options={[...kinds]} onChange={(next) => { setKind(next); setCopied(null); setCopyFailed(false); setError(""); setShown("link") }} />
             {kind === "phone" ? <>
-              <p className="text-meta text-muted-foreground">{addDeviceCopy.clientHint}</p>
-              {result.image ? <img className="size-56 justify-self-center rounded-lg bg-white p-2" src={result.image} alt="用手机 App 扫码" /> : null}
-              <p className="flex items-center justify-center gap-1.5 text-meta text-muted-foreground"><Smartphone aria-hidden="true" className="size-4 shrink-0" />用手机 App 扫码</p>
+              <p className="text-sm text-secondary">{addDeviceCopy.clientHint}</p>
+              {result.image ? <img className="size-56 justify-self-center rounded-control bg-white p-2" src={result.image} alt="用手机 App 扫码" /> : null}
+              <p className="flex items-center justify-center gap-1.5 text-sm text-secondary"><Smartphone aria-hidden="true" className="size-4 shrink-0" />用手机 App 扫码</p>
               {copyButton("link", result.link, "复制链接", true)}
             </> : <>
               <ol className="grid gap-3">
                 <li className="flex min-w-0 items-center gap-3"><Step n={1} />{copyButton("link", result.link, "复制链接", true)}</li>
-                <li className="flex min-w-0 items-start gap-3"><Step n={2} /><Laptop aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" /><span className="min-w-0 [overflow-wrap:anywhere]">{addDeviceCopy.openThere}</span></li>
+                <li className="flex min-w-0 items-start gap-3"><Step n={2} /><Laptop aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-secondary" /><span className="min-w-0 [overflow-wrap:anywhere]">{addDeviceCopy.openThere}</span></li>
               </ol>
-              <p className="flex min-w-0 flex-wrap items-center gap-x-1.5 text-meta text-muted-foreground">
+              <p className="flex min-w-0 flex-wrap items-center gap-x-1.5 text-sm text-secondary">
                 <Download aria-hidden="true" className="size-4 shrink-0" />{addDeviceCopy.installThere}
                 <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={joinCopy.installGuide} target="_blank" rel="noopener noreferrer">{addDeviceCopy.installHow}</a>
               </p>
               <div className="grid gap-2 border-t pt-3">
-                <p className="flex min-w-0 items-center gap-1.5 text-meta text-muted-foreground"><SquareTerminal aria-hidden="true" className="size-4 shrink-0" />{addDeviceCopy.orCommand}</p>
+                <p className="flex min-w-0 items-center gap-1.5 text-sm text-secondary"><SquareTerminal aria-hidden="true" className="size-4 shrink-0" />{addDeviceCopy.orCommand}</p>
                 {copyButton("command", addDeviceCopy.command(result.link), addDeviceCopy.copyCommand, false)}
               </div>
             </>}
-            <ul className="grid gap-1.5 text-meta text-muted-foreground">
+            <ul className="grid gap-1.5 text-sm text-secondary">
               <li className="flex items-center gap-1.5"><terms.safetyCode.icon aria-hidden="true" className="size-4 shrink-0" />{addDeviceCopy.compare}</li>
               <li className="flex items-center gap-1.5"><Clock aria-hidden="true" className="size-4 shrink-0" />只发给自己的设备，10 分钟内有效</li>
             </ul>
-            {copyFailed ? <p role="alert" className="flex items-center gap-2 text-meta text-danger"><CircleAlert aria-hidden="true" className="size-4 shrink-0" />{addDeviceCopy.copyFailed}</p> : null}
+            {copyFailed ? <p role="alert" className="flex items-center gap-2 text-sm text-danger"><CircleAlert aria-hidden="true" className="size-4 shrink-0" />{addDeviceCopy.copyFailed}</p> : null}
             <Details key={copyFailed ? "open" : "folded"} label="链接原文" open={copyFailed || undefined}>
-              <Textarea ref={raw} readOnly aria-label="链接原文" className="min-h-24 font-mono text-meta" value={shown === "command" ? addDeviceCopy.command(result.link) : result.link} onFocus={(event) => event.target.select()} />
+              <Textarea label="链接原文" ref={raw} readOnly aria-label="链接原文" className="font-mono" value={shown === "command" ? addDeviceCopy.command(result.link) : result.link} onFocus={(event) => event.target.select()} />
             </Details>
           </div> : null}
-          {status ? <p role="status" className="text-meta text-success">{status}</p> : null}
+          {status ? <p role="status" className="text-sm text-success">{status}</p> : null}
           <InlineError error={error || null} />
         </div>
-      </SheetContent>
-    </Sheet>
+      </DrawerContent>
+    </Drawer>
   </>
 }
 
 function Step({ n }: { n: number }) {
-  return <span aria-hidden="true" className="grid size-6 shrink-0 place-items-center rounded-full bg-muted text-meta font-medium tabular-nums text-muted-foreground">{n}</span>
+  return <span aria-hidden="true" className="grid size-6 shrink-0 place-items-center rounded-pill bg-surface-muted text-sm font-medium tabular-nums text-secondary">{n}</span>
 }

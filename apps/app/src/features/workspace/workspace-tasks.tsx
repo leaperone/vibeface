@@ -1,15 +1,16 @@
-import { useEffect, useRef, useState } from 'react'
-import { Link, useNavigate } from '@tanstack/react-router'
-import { ChevronRight, Plus } from 'lucide-react'
-import { InlineError, StatusPill, useAction } from '@/components/app/kit'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Textarea } from '@/components/ui/textarea'
-import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
-import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
+import { InlineError,StatusPill,useAction } from '@/components/arc/product-kit'
+import taskStyles from "@/components/arc/task-compositions.module.css"
+import { Link,useNavigate } from '@tanstack/react-router'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { newId } from '@vibeface/client/workspace/storage.ts'
-import type { WorkspaceCommand, WorkspaceTask } from '@vibeface/client/workspace/types.ts'
+import type { WorkspaceCommand,WorkspaceTask } from '@vibeface/client/workspace/types.ts'
+import { Button } from '@vibeface/uiarc/button/button.tsx'
+import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
+import { Input } from '@vibeface/uiarc/input/input.tsx'
+import { Select } from "@vibeface/uiarc/select/select.tsx"
+import { Textarea } from '@vibeface/uiarc/textarea/textarea.tsx'
+import { ChevronRight,Plus } from 'lucide-react'
+import { useEffect,useRef,useState } from 'react'
 
 const workspaceTaskLabels: Record<WorkspaceTask['state'], string> = {
   not_started: '未开始', running: '执行中', waiting_dependencies: '等待依赖', waiting_user: '等待你决定',
@@ -31,10 +32,10 @@ export function WorkspaceTasks({ botFilter = 'all', filter = 'all' }: { botFilte
   const groups = { attention: ['waiting_user', 'needs_reconciliation', 'update_pending', 'stop_pending'], working: ['running'], waiting: ['not_started', 'waiting_dependencies', 'deferred'] }
   const tasks = (workspace.workspaceState?.tasks ?? []).filter((task) => (botFilter === 'all' || task.owner_bot === botFilter) && (filter === 'all' || groups[filter].includes(task.state)))
   return <section className="grid gap-3" aria-labelledby="workspace-tasks-heading">
-    <div className="flex items-center justify-between gap-3"><h2 id="workspace-tasks-heading" className="text-heading font-semibold">任务对话</h2><Button type="button" variant="outline" disabled={!workspace.writable || !workspace.bots.length} onClick={() => setOpen(true)}><Plus aria-hidden="true" />新任务</Button></div>
-    <p className="text-meta text-muted-foreground">每个任务保留独立对话。补充内容会继续发给这个任务。</p>
+    <div className="flex items-center justify-between gap-3"><h2 id="workspace-tasks-heading" className="text-lg font-medium">任务对话</h2><Button type="button" variant="secondary" disabled={!workspace.writable || !workspace.bots.length} onClick={() => setOpen(true)}><Plus aria-hidden="true" />新任务</Button></div>
+    <p className="text-sm text-secondary">每个任务保留独立对话。补充内容会继续发给这个任务。</p>
     <InlineError error={error} action={{ label: '重新读取', onClick: () => { setError(null); void workspace.readWorkspaceState().catch(setError) } }} />
-    {tasks.length ? <ul className="grid gap-3">{tasks.map((task) => <li key={task.task_id}><WorkspaceTaskLink task={task} /></li>)}</ul> : <p role="status" className="text-meta text-muted-foreground">{workspace.workspaceState ? botFilter === 'all' ? '还没有任务对话' : '这个 Bot 还没有任务对话' : '正在读取任务对话'}</p>}
+    {tasks.length ? <ul className="grid gap-3">{tasks.map((task) => <li key={task.task_id}><WorkspaceTaskLink task={task} /></li>)}</ul> : <p role="status" className="text-sm text-secondary">{workspace.workspaceState ? botFilter === 'all' ? '还没有任务对话' : '这个 Bot 还没有任务对话' : '正在读取任务对话'}</p>}
     <CreateWorkspaceTask open={open} onOpenChange={setOpen} botId={botFilter === 'all' ? undefined : botFilter} />
   </section>
 }
@@ -42,10 +43,10 @@ export function WorkspaceTasks({ botFilter = 'all', filter = 'all' }: { botFilte
 export function WorkspaceTaskLink({ task }: { task: WorkspaceTask }) {
   const workspace = useWorkspace()
   const bot = workspace.bots.find((item) => item.bot_id === task.owner_bot)
-  return <Link to="/tasks/$taskId" params={{ taskId: task.task_id }} className="grid min-w-0 gap-2 rounded-xl border bg-card p-4 [overflow-wrap:anywhere] transition-colors hover:bg-muted/50 focus-visible:ring-3 focus-visible:ring-ring/50">
-    <span className="flex min-w-0 flex-wrap items-start gap-2"><span className="min-w-0 flex-1 [overflow-wrap:anywhere] font-medium">{task.title}</span><WorkspaceTaskPill task={task} /><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /></span>
-    <span className="text-meta text-muted-foreground">{bot?.name ?? '所属 Bot 未加载'} · 第 {task.revision} 版{task.channel_id ? ' · 频道任务' : ''}</span>
-    {task.waiting_reason ? <span className="text-meta text-warning">{task.waiting_reason}</span> : null}
+  return <Link to="/tasks/$taskId" params={{ taskId: task.task_id }} className={`${taskStyles.record} [overflow-wrap:anywhere]`}>
+    <span className="flex min-w-0 flex-wrap items-start gap-2"><span className="min-w-0 flex-1 [overflow-wrap:anywhere] font-medium">{task.title}</span><WorkspaceTaskPill task={task} /><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-secondary" /></span>
+    <span className="text-sm text-secondary">{bot?.name ?? '所属 Bot 未加载'} · 第 {task.revision} 版{task.channel_id ? ' · 频道任务' : ''}</span>
+    {task.waiting_reason ? <span className="text-sm text-warning">{task.waiting_reason}</span> : null}
   </Link>
 }
 
@@ -61,9 +62,10 @@ function CreateWorkspaceTask({ open, onOpenChange, botId }: { open: boolean; onO
   useEffect(() => { if (!submission.current) setSelected(botId ?? '') }, [botId])
   const selectedId = workspace.bots.find((bot) => bot.bot_id === selected)?.bot_id
     ?? workspace.bots.find((bot) => bot.bot_id === (botId ?? workspace.selectedBot?.bot_id))?.bot_id ?? workspace.bots[0]?.bot_id ?? ''
-  return <Sheet open={open} onOpenChange={onOpenChange}><SheetContent className="overflow-y-auto"><SheetHeader><SheetTitle>新任务</SheetTitle><SheetDescription>选择 Bot，任务后续的补充留在同一个对话里。</SheetDescription></SheetHeader>
-    <form className="grid gap-4 px-4 pb-6" onSubmit={(event) => { event.preventDefault(); void action.run('create-task', async () => {
-      const owner = workspace.bots.find((bot) => bot.bot_id === (submission.current?.owner_bot ?? selectedId))
+  const ownerBotId = submission.current?.owner_bot ?? selectedId
+  return <Drawer open={open} onOpenChange={onOpenChange}><DrawerContent title="新任务" description="选择 Bot，任务后续的补充留在同一个对话里。" className="overflow-y-auto">
+    <form className="grid gap-4" onSubmit={(event) => { event.preventDefault(); void action.run('create-task', async () => {
+      const owner = workspace.bots.find((bot) => bot.bot_id === ownerBotId)
       if (!owner) throw new Error('请选择一个 Bot。')
       const command: Extract<WorkspaceCommand, { kind: 'create_task' }> = submission.current ?? { kind: 'create_task', task_id: taskId.current, owner_bot: owner.bot_id, title: title.trim(), request: request.trim(), expected_result: title.trim(), source_events: [], dependencies: [], reply_only: false }
       submission.current = command
@@ -76,11 +78,11 @@ function CreateWorkspaceTask({ open, onOpenChange, botId }: { open: boolean; onO
       await navigate({ to: '/tasks/$taskId', params: { taskId: task.task_id } })
       submission.current = null; taskId.current = newId(); setTitle(''); setRequest('')
     }) }}>
-      <label className="grid gap-2 text-meta font-medium">交给哪个 Bot<NativeSelect aria-label="任务 Bot" required disabled={Boolean(submission.current)} value={submission.current?.owner_bot ?? selectedId} onChange={(event) => setSelected(event.currentTarget.value)}>{workspace.bots.map((bot) => <NativeSelectOption key={bot.bot_id} value={bot.bot_id}>{bot.name}</NativeSelectOption>)}</NativeSelect></label>
-      <label className="grid gap-2 text-meta font-medium">任务名称<Input required readOnly={Boolean(submission.current)} maxLength={512} value={title} onChange={(event) => setTitle(event.currentTarget.value)} placeholder="例如：检查官网导航" /></label>
-      <label className="grid gap-2 text-meta font-medium">交代内容<Textarea required readOnly={Boolean(submission.current)} maxLength={100000} className="min-h-36" value={request} onChange={(event) => setRequest(event.currentTarget.value)} placeholder="描述要完成的事情和需要保留的约束" /></label>
-      <InlineError error={action.error} />{submission.current ? <p role="status" className="text-meta text-muted-foreground">原交代已保留，重试会继续确认同一个任务。</p> : null}
+      <div className="grid gap-2 text-sm font-medium"><Select required label="交给哪个 Bot" placeholder="请选择一个 Bot" disabled={Boolean(submission.current)} value={ownerBotId ? "arc:" + ownerBotId : ""} onValueChange={selected => { const value = selected.slice(4);  setSelected(value)  }} options={workspace.bots.map((bot) => ({ value: "arc:" + bot.bot_id, label: bot.name }))} /></div>
+      <div className="grid gap-2 text-sm font-medium"><Input label="任务名称" required readOnly={Boolean(submission.current)} maxLength={512} value={title} onChange={(event) => setTitle(event.currentTarget.value)} placeholder="例如：检查官网导航" /></div>
+      <div className="grid gap-2 text-sm font-medium"><Textarea label="交代内容" required readOnly={Boolean(submission.current)} maxLength={100000} value={request} onChange={(event) => setRequest(event.currentTarget.value)} placeholder="描述要完成的事情和需要保留的约束" /></div>
+      <InlineError error={action.error} />{submission.current ? <p role="status" className="text-sm text-secondary">原交代已保留，重试会继续确认同一个任务。</p> : null}
       <Button type="submit" disabled={Boolean(action.busy) || !workspace.writable || !selectedId}>{action.busy ? '正在保存任务' : '创建并发送'}</Button>
     </form>
-  </SheetContent></Sheet>
+  </DrawerContent></Drawer>
 }

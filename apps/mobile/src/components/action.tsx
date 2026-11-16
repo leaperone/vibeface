@@ -1,10 +1,11 @@
+import { InlineError } from '@/components/arc/feedback'
 import { CircleAlert, LoaderCircle, type LucideIcon } from 'lucide-react-native'
 import { useState, type ReactNode } from 'react'
 import { View } from 'react-native'
 import { messageOf } from '@vibeface/client/lib/node.ts'
-import { Button, type ButtonProps } from '@/components/ui/button'
-import { Icon } from '@/components/ui/icon'
-import { Text } from '@/components/ui/text'
+import { Button, type ButtonProps } from '@/components/arc/button'
+import { Icon } from '@/components/arc/icon'
+import { Text } from '@/components/arc/text'
 
 /** One action at a time per screen part: which one runs, and why the last one failed. */
 export function useAction() {
@@ -20,10 +21,10 @@ export function useAction() {
 }
 
 export function ErrorText({ error }: { error: string }) {
-  return error ? <View role="alert" accessible className="flex-row items-start gap-2">
+  return error ? <InlineError>
     <Icon as={CircleAlert} className="mt-0.5 text-danger" />
-    <Text className="min-w-0 flex-1 text-meta text-danger">{error}</Text>
-  </View> : null
+    <Text className="min-w-0 flex-1 text-sm text-secondary">{error}</Text>
+  </InlineError> : null
 }
 
 /** A button that runs its action, spins while it runs and shows why it failed under it. */

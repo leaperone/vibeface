@@ -17,7 +17,7 @@ function render(props: { text: string; streaming?: boolean }) {
     if (specifier === "@/lib/markdown") return { renderMarkdown: (text: string) => { parses++; return renderMarkdown(text) } }
     if (specifier === "@/lib/markdown-scheduler") return { markdownScheduler: { connect: () => { throw new Error("SSR must not connect a worker") } } }
     if (specifier === "@/lib/utils") return { cn: (...values: unknown[]) => values.filter(Boolean).join(" ") }
-    if (specifier === "./kit") return { toast: () => {} }
+    if (specifier === "@/components/arc/product-kit") return { toast: () => {} }
     return require(specifier)
   })
   const component = load(fileURLToPath(new URL("../components/app/markdown.tsx", import.meta.url))).Markdown

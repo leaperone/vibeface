@@ -1,14 +1,15 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react"
-import { CircleX } from "lucide-react"
-import { ActionCard, claimFocus, Details, DetailRow, InlineError, SafetyCode, Skeleton, toast, useAction } from "@/components/app/kit"
-import { Button } from "@/components/ui/button"
+import { ActionCard,claimFocus,DetailRow,Details,InlineError,SafetyCode,Skeleton,toast,useAction } from "@/components/arc/product-kit"
+import { terms } from "@/lib/glossary"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { deviceCopy } from "@vibeface/client/identity/copy.ts"
 import type { JoinRequest } from "@vibeface/client/lib/node.ts"
-import { deviceIcon } from "./devices"
 import { openJoins } from "@vibeface/client/workspace/inbox.ts"
-import { deviceForm, formName } from "@vibeface/client/workspace/labels.ts"
-import { terms } from "@/lib/glossary"
+import { deviceForm,formName } from "@vibeface/client/workspace/labels.ts"
+import { Button } from "@vibeface/uiarc/button/button.tsx"
+import { Checkbox } from "@vibeface/uiarc/checkbox/checkbox.tsx"
+import { CircleX } from "lucide-react"
+import { useEffect,useLayoutEffect,useRef,useState } from "react"
+import { deviceIcon } from "./devices"
 
 /** Requests an admin can still act on. */
 export const useOpenJoins = (): JoinRequest[] => openJoins(useDevice())
@@ -91,10 +92,10 @@ export function JoinCard({ request, auto = false, manage: asManager = false, onA
       : <Button ref={allow} type="button" disabled={!request.code || busy || elsewhere} onClick={() => void action.run("allow", async () => { await device.approveJoin(request.join_id, request.kind === "client" && manage); onAllowed?.({ id: request.device_id, kind: request.kind, name: request.name || "新设备", manage: request.kind === "client" && manage }) }, onAllowed ? undefined : manage && request.kind === "client" ? deviceCopy.addedManager(request.name || "新设备") : "已允许加入")}>{action.busy === "allow" ? "处理中" : "一致，允许"}</Button>}
     </>}
   >
-    <p className="text-meta text-muted-foreground">{elsewhere ? "正在另一台管理设备上处理" : request.status === "pending" && !auto ? "点“显示安全码”，新设备上会出现同样的码" : request.code ? deviceCopy.compareCode : "等新设备显示安全码"}</p>
+    <p className="text-sm text-secondary">{elsewhere ? "正在另一台管理设备上处理" : request.status === "pending" && !auto ? "点“显示安全码”，新设备上会出现同样的码" : request.code ? deviceCopy.compareCode : "等新设备显示安全码"}</p>
     {request.code ? <SafetyCode code={request.code} /> : request.status === "pending" && !auto ? null : <Skeleton className="h-8 w-40" />}
-    {request.kind === "client" ? <div><label className="flex min-h-11 w-fit items-center gap-2 text-meta md:min-h-9"><input type="checkbox" className="size-4" checked={manage} disabled={busy} onChange={(event) => setManage(event.target.checked)} />设为{terms.admin.label}</label>
-      <p className="ps-6 text-meta text-muted-foreground">{deviceCopy.manageHint}</p></div> : null}
+    {request.kind === "client" ? <div><label className="flex min-h-11 w-fit items-center gap-2 text-sm md:min-h-9"><Checkbox aria-label={`设为${terms.admin.label}`} checked={manage} disabled={busy} onCheckedChange={next => { const checked = next === true;  setManage(checked)  }} />设为{terms.admin.label}</label>
+      <p className="ps-6 text-sm text-secondary">{deviceCopy.manageHint}</p></div> : null}
     <InlineError error={action.error} />
     <Details>
       <DetailRow label="设备编号" value={request.device_id} mono />

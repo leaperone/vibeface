@@ -1,4 +1,10 @@
-import { createCn } from "cn/config"
+type ClassValue = string | number | false | null | undefined | ClassValue[] | { [className: string]: unknown }
 
-// Without the theme's sizes, a merge reads text-meta as a color and drops it beside text-muted-foreground.
-export const cn = createCn({ extend: { classGroups: { "font-size": [{ text: ["title", "heading", "body", "meta"] }] } } })
+export function cn(...values: ClassValue[]): string {
+  return values.flatMap(value => {
+    if (!value) return []
+    if (typeof value === 'string' || typeof value === 'number') return [String(value)]
+    if (Array.isArray(value)) return [cn(...value)]
+    return Object.keys(value).filter(key => value[key])
+  }).join(' ')
+}

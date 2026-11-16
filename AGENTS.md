@@ -14,6 +14,8 @@
 - 发版、版本递增、创建或推送发布 tag 前，先读 `.agents/skills/release/SKILL.md`；合并或验收通过不构成发布授权。
 - 任何新功能在独立分支产生首个提交后，立即 push 并创建 PR。当前开发分支 PR 不自动触发 GitHub Actions，须运行相关本地检查；需要远端验证时手动触发对应 workflow。继续开发，不阻塞等待已启动的远端构建，异步巡查并修复失败。避免频繁本地编译，仅在定位问题或必要验收时执行最小相关验证；最终交付前核对最终 HEAD 的必要检查结果，不将 pending 视为通过。
 - 只执行相关验证。安全与同步行为优先在对应 Rust 模块验证，验收须覆盖真实进程及制品。
+- Web 工作区和 Mobile 的唯一 UI 体系是 `WheatXie/uiarc-pro-reverse` 的 Arc。新增或修改界面先读 `packages/docs/design/uiarc-migration.md`。Web 使用 `packages/uiarc` 中记录来源的组件；Mobile 使用 `apps/mobile/src/components/arc` 的同源原生移植。禁止重新加入 shadcn/ui、React Native Reusables 或另一套组件库、主题和控件样式。
+- 颜色、字体、圆角、控件尺寸和动效来自固定版本的 Arc foundation。运行 `pnpm generate:ui` 生成两端 token，不手改生成文件。新增 Arc 项目使用 `scripts/vendor-uiarc.py` 获取来源并记录哈希；原生移植在 `source.json` 标注对应 Arc 项目。UI 改动必须通过 `pnpm check:ui`。
 - 主分支 CI 保留核心检查；同步、恢复、调度和工具执行改动须按 `packages/docs/ci.md` 补跑相关本地专项并记录结果。CI 只用受控协议夹具，不调用真实 AI Provider 或读取模型密钥。
 
 - e2e 测试、截图和界面验收只在用户明确要求时编写或运行，不作为默认验收、preflight 或 CI 步骤。被要求时先读 `.agents/skills/e2e/SKILL.md`，启动方式见 `packages/docs/e2e.md`。

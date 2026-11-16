@@ -8,10 +8,10 @@ import { useDevice, type Invitation } from '@vibeface/client/identity/context.ts
 import { addDeviceCopy, deviceCopy, joinCopy } from '@vibeface/client/identity/copy.ts'
 import { ErrorText } from '@/components/action'
 import { Details, EmptyState } from '@/components/kit'
-import { Button } from '@/components/ui/button'
-import { Icon } from '@/components/ui/icon'
-import { Segmented } from '@/components/ui/segmented'
-import { Text } from '@/components/ui/text'
+import { Button } from '@/components/arc/button'
+import { Icon } from '@/components/arc/icon'
+import { Segmented } from '@/components/arc/segmented'
+import { Text } from '@/components/arc/text'
 import { JoinRequests, useOpenJoins, type Added } from '@/features/devices/join-requests'
 import { QrCode } from '@/features/devices/qr-code'
 import { useRun } from '@/lib/use-run'
@@ -61,19 +61,19 @@ export default function AddDevice() {
     opened.current = ready
     generate()
   }, [ready])
-  const copyLink = result ? <Button variant={requests ? 'outline' : 'default'} disabled={busy !== null} onPress={() => void run('copy', () => Clipboard.setStringAsync(result.link).then(() => setCopied('link')))}>
+  const copyLink = result ? <Button variant={requests ? 'secondary' : 'primary'} disabled={busy !== null} onPress={() => void run('copy', () => Clipboard.setStringAsync(result.link).then(() => setCopied('link')))}>
     <Icon as={copied === 'link' ? Check : Copy} /><Text>{copied === 'link' ? '已复制' : '复制链接'}</Text>
   </Button> : null
   if (!ready?.principal.can_manage) return <EmptyState icon={ShieldAlert} title="只有管理设备能添加设备" />
 
-  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
+  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-6 pb-12">
     {added && !requests ? <View className="gap-3">
       <View role="status" className="flex-row items-center gap-2"><Icon as={CircleCheck} className="size-4 text-success" /><Text numberOfLines={1} className="flex-1 text-success">{added.manage ? deviceCopy.addedManager(added.name) : `已添加「${added.name}」`}</Text></View>
       <View className="flex-row flex-wrap gap-2">
         {added.kind === 'node' ? <Button onPress={() => router.replace(`/device/${added.id}`)}><Icon as={Sparkles} /><Text>{addDeviceCopy.setUpAi}</Text></Button> : null}
-        <Button variant={added.kind === 'node' ? 'outline' : 'default'} disabled={busy !== null} onPress={generate}><Icon as={Plus} /><Text>{busy === 'create' ? '生成中' : addDeviceCopy.addAnother}</Text></Button>
+        <Button variant={added.kind === 'node' ? 'secondary' : 'primary'} disabled={busy !== null} onPress={generate}><Icon as={Plus} /><Text>{busy === 'create' ? '生成中' : addDeviceCopy.addAnother}</Text></Button>
       </View>
-    </View> : !result || used && !requests ? requests ? <Button variant="outline" className="self-start" disabled={busy !== null} onPress={generate}>
+    </View> : !result || used && !requests ? requests ? <Button variant="secondary" className="self-start" disabled={busy !== null} onPress={generate}>
       <Icon as={Link2} /><Text>{busy === 'create' ? '生成中' : '生成链接'}</Text>
     </Button> : <EmptyState icon={Link2} title="让新设备扫码加入" action={<Button disabled={busy !== null} onPress={generate}>
       <Text>{busy === 'create' ? '生成中' : '生成链接'}</Text>
@@ -82,39 +82,39 @@ export default function AddDevice() {
     {result && !used ? <View className="gap-4">
       <Segmented options={kinds} value={kind} onChange={(next) => { setKind(next); setCopied(null) }} />
       {kind === 'phone' ? <>
-        <Text className="text-meta text-muted-foreground">{addDeviceCopy.clientHint}</Text>
+        <Text className="text-sm text-muted">{addDeviceCopy.clientHint}</Text>
         <QrCode value={result.link} label="用手机 App 扫码" />
         <View className="flex-row flex-wrap justify-center gap-2">
           {copyLink}
-          <Button variant="outline" onPress={() => { void Share.share({ message: result.link }).catch(() => {}) }}>
+          <Button variant="secondary" onPress={() => { void Share.share({ message: result.link }).catch(() => {}) }}>
             <Icon as={Share2} /><Text>分享</Text>
           </Button>
         </View>
       </> : <View className="gap-3">
         <View className="flex-row items-center gap-3"><Step n={1} />{copyLink}
-          <Button variant="ghost" size="icon" accessibilityLabel="分享链接" onPress={() => { void Share.share({ message: result.link }).catch(() => {}) }}><Icon as={Share2} /></Button>
+          <Button variant="ghost" iconOnly accessibilityLabel="分享链接" onPress={() => { void Share.share({ message: result.link }).catch(() => {}) }}><Icon as={Share2} /></Button>
         </View>
-        <View className="flex-row items-center gap-3"><Step n={2} /><Icon as={Laptop} className="size-4 text-muted-foreground" /><Text className="shrink">{addDeviceCopy.openThere}</Text></View>
+        <View className="flex-row items-center gap-3"><Step n={2} /><Icon as={Laptop} className="size-4 text-muted" /><Text className="shrink">{addDeviceCopy.openThere}</Text></View>
         <Details label="安装节点">
           <Pressable accessibilityRole="link" onPress={() => void openURL(joinCopy.installGuide).catch(() => {})} className="min-h-11 flex-row flex-wrap items-center gap-1.5">
-            <Icon as={Download} className="size-4 text-muted-foreground" />
-            <Text className="text-meta text-muted-foreground">{addDeviceCopy.installThere}</Text>
-            <Text className="text-meta font-medium underline">{addDeviceCopy.installHow}</Text>
+            <Icon as={Download} className="size-4 text-muted" />
+            <Text className="text-sm text-muted">{addDeviceCopy.installThere}</Text>
+            <Text className="text-sm font-medium underline">{addDeviceCopy.installHow}</Text>
           </Pressable>
           <View className="gap-2 border-t border-border pt-3">
-            <View className="flex-row items-center gap-1.5"><Icon as={SquareTerminal} className="size-4 text-muted-foreground" /><Text className="shrink text-meta text-muted-foreground">{addDeviceCopy.orCommand}</Text></View>
+            <View className="flex-row items-center gap-1.5"><Icon as={SquareTerminal} className="size-4 text-muted" /><Text className="shrink text-sm text-muted">{addDeviceCopy.orCommand}</Text></View>
             <View className="flex-row items-center gap-2">
-              <Button variant="outline" disabled={busy !== null} onPress={() => void run('copy', () => Clipboard.setStringAsync(addDeviceCopy.command(result.link)).then(() => setCopied('command')))}>
+              <Button variant="secondary" disabled={busy !== null} onPress={() => void run('copy', () => Clipboard.setStringAsync(addDeviceCopy.command(result.link)).then(() => setCopied('command')))}>
                 <Icon as={copied === 'command' ? Check : Copy} /><Text>{copied === 'command' ? '已复制' : addDeviceCopy.copyCommand}</Text>
               </Button>
-              <Button variant="ghost" size="icon" accessibilityLabel="分享命令" onPress={() => { void Share.share({ message: addDeviceCopy.command(result.link) }).catch(() => {}) }}><Icon as={Share2} /></Button>
+              <Button variant="ghost" iconOnly accessibilityLabel="分享命令" onPress={() => { void Share.share({ message: addDeviceCopy.command(result.link) }).catch(() => {}) }}><Icon as={Share2} /></Button>
             </View>
           </View>
         </Details>
       </View>}
       <View className="gap-1.5">
-        <View className="flex-row items-center gap-1.5"><Icon as={ScanEye} className="size-4 text-muted-foreground" /><Text className="shrink text-meta text-muted-foreground">{addDeviceCopy.compare}</Text></View>
-        <View className="flex-row items-center gap-1.5"><Icon as={Clock} className="size-4 text-muted-foreground" /><Text className="shrink text-meta text-muted-foreground">只给自己的设备，10 分钟有效</Text></View>
+        <View className="flex-row items-center gap-1.5"><Icon as={ScanEye} className="size-4 text-muted" /><Text className="shrink text-sm text-muted">{addDeviceCopy.compare}</Text></View>
+        <View className="flex-row items-center gap-1.5"><Icon as={Clock} className="size-4 text-muted" /><Text className="shrink text-sm text-muted">只给自己的设备，10 分钟有效</Text></View>
       </View>
     </View> : null}
     <ErrorText error={error} />
@@ -122,5 +122,5 @@ export default function AddDevice() {
 }
 
 function Step({ n }: { n: number }) {
-  return <View accessibilityElementsHidden importantForAccessibility="no-hide-descendants" className="size-6 items-center justify-center rounded-full bg-muted"><Text className="text-meta font-medium text-muted-foreground">{n}</Text></View>
+  return <View accessibilityElementsHidden importantForAccessibility="no-hide-descendants" className="size-6 items-center justify-center rounded-pill bg-surface-muted"><Text className="text-sm font-medium text-muted">{n}</Text></View>
 }

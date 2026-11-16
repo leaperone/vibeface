@@ -1,93 +1,39 @@
----
-name: Vibeface Mobile App
-description: A native workspace for conversations, tasks, devices, and recovery.
-colors:
-  background-light: "oklch(1 0 0)"
-  background-dark: "oklch(0.175 0.006 270)"
-  foreground-light: "oklch(0.21 0.012 270)"
-  foreground-dark: "oklch(0.955 0.004 270)"
-  primary-light: "oklch(0.24 0.016 270)"
-  primary-foreground-light: "oklch(0.985 0.002 270)"
-  primary-dark: "oklch(0.94 0.005 270)"
-  primary-foreground-dark: "oklch(0.2 0.01 270)"
-  brand-light: "oklch(0.53 0.2 280)"
-  brand-dark: "oklch(0.72 0.15 280)"
-  muted-light: "oklch(0.965 0.004 270)"
-  muted-dark: "oklch(0.245 0.008 270)"
-typography:
-  body:
-    fontFamily: "Geist"
-    fontSize: "16px"
-    lineHeight: "24px"
-  meta:
-    fontFamily: "Geist"
-    fontSize: "13px"
-    lineHeight: "18px"
-rounded:
-  base: "0.625rem"
-  control: "0.625rem"
-  xl: "0.875rem"
-spacing:
-  unit: "4px"
-  screen: "16px"
-components:
-  button-primary:
-    backgroundColor: "{colors.primary-light}"
-    textColor: "{colors.primary-foreground-light}"
-    rounded: "{rounded.control}"
-  card:
-    backgroundColor: "{colors.background-light}"
-    rounded: "{rounded.xl}"
----
+# Native Arc design
 
-# Design System: Vibeface Mobile App
+The native app ports [WheatXie/uiarc-pro-reverse](https://github.com/WheatXie/uiarc-pro-reverse) at `859606819c68787b2dccb54adcb9b08bd3272d5d`. Port ownership and upstream item names are recorded in [source.json](src/components/arc/source.json). Product callbacks, copy, routes and live state remain in the app and feature modules.
 
-## Overview
+## Foundation
 
-**Creative North Star: "Quiet personal workspace"**
+`global.css` imports the generated `@vibeface/theme/native.css`. Native code reads `arcTokens` and `arcColors` from the same generated package. Use the neutral Arc accent, semantic status colors, and automatic light/dark variants. Do not add local palettes.
 
-This description records the incumbent interface; the source tokens below define the system.
+Inter is the body and control face. Body text is 16px, metadata and controls are 14px, and small headings use 18px or 22px. Geist is reserved for native large navigation titles. Weights are 400 and 500. Geist Mono is available for IDs, commands and technical records. Native text retains Dynamic Type.
 
-The mobile app is an Operate surface designed around one-handed progress: choose a Bot, read the current work, and act without losing context. Shared cool neutrals and violet brand accents keep the native shell calm; platform materials appear only where the OS supports them and are disabled when reduced transparency is enabled.
+Controls and alerts have 18px corners. The pinned card uses 26px corners and 20px content padding; approval panels use their source 24px corners and 20px padding. Alerts and approval panels keep neutral surfaces and borders, with status color on the icon. Spacing follows Arc's 4px grid. Buttons grow with text and provide minimum interactive targets of 44pt on iOS and 48dp on Android. Small Arc buttons retain 36px visuals inside a padded 44pt iOS or 48dp Android hit container, with at least 4pt or 6dp of hitSlop on every edge. Default and icon buttons use a 48dp minimum on Android without adding a wrapper. Large buttons are 50px. Selection groups use a 44px touch target even when the visual marker is smaller.
 
-**Key Characteristics:** native, calm, task-first, accessible, interruption-aware.
+## Native ports and product regions
 
-## Colors
+| Region | Arc items | Native composition |
+| --- | --- | --- |
+| Actions and fields | button, input, textarea | Four button variants: primary, secondary, ghost, danger. Border-only field focus, inline errors and existing loading states. |
+| Selection | switch, radio-group, checkbox, segmented-control | Native accessibility roles, fixed hit targets, selection color and a moving segmented highlight. |
+| Navigation and home | tabs, sidebar | Three existing root tabs: 消息, 任务, 设置. Wide windows use a muted rail and real route links. Channels remain in their existing entry paths. |
+| Chat | ai-chat, ai-composer, chat-thread | Neutral message bubbles, full-width assistant replies, one bordered multiline composer and attachment chips. |
+| Tasks and decisions | agent-run, agent-approvals, metric-card, alert | Task counts and filters, status rows, approval panels and inline accept/reject/retry controls. 待处理 remains at the top of the task screen. |
+| Settings and devices | settings-page, security-settings, card | Section headings, divided settings rows, plain icons and native navigation. |
+| Joining and recovery | stepper, input, alert, button | Existing scan/paste/recovery stages, safety-code checks, cancellation and confirmation. |
+| Transfers and logs | card, agent-run, progress | Real transfer records, budgets, deadlines, audit details, native file operations and existing retry controls. |
+| Feedback | skeleton, alert, toast | Finite skeleton pulse, persistent foreground errors and a separately announced background queue. |
 
-Mobile consumes the same semantic tokens from `packages/theme/theme.css` through Uniwind. Default buttons use the neutral `primary`/`primary-foreground` pair. Violet marks brand and focus; the chat send control may use the current Bot tint. Muted surfaces group content; success, warning, danger, and info states remain text-and-icon backed.
+There are no React Native Reusables components, CVA, slot wrappers or WebViews. Custom action glyph tiles and decorative glows are removed. Bot faces preserve identity, shape, chosen color and status data, with solid fills. Their motion follows the existing shared avatar engine and stops for reduced motion and covered screens.
 
-## Typography
+## Platform behavior
 
-Geist is used for UI text and Geist Mono for code, IDs, and logs. The existing 16/24 body and 13/18 metadata scale favors readable mobile density. Keep headings short enough to wrap without hiding the action that follows.
+Expo Router stacks own native headers, modal presentation, Back and edge gestures. Safe-area padding, keyboard-aware scrolling, sticky composer placement, selection retention, private attachment lifecycle and native camera/file/share/paste controls remain platform owned. Chat panels use an opaque Arc surface on iOS and Android.
 
-## Layout
+Arc timing and easing come from the generated tokens. Control presses, entry, exit and layout changes respect reduced motion. Native screen-reader roles, labels, selected/checked/expanded states and announcements remain attached to the real controls. Color never substitutes for a status label.
 
-Screens use safe-area insets, a centered max-width on wide windows, and a single vertical reading path on phones. Chat keeps the composer attached to the bottom while messages scroll independently. Use 44px minimum controls and preserve native back, keyboard, and modal focus behavior.
+Unknown write outcomes remain unknown. A visual change cannot create a success state, retry a write automatically, bypass reconciliation or unlock a pending submission.
 
-## Elevation & Depth
+## Verification
 
-Prefer tonal grouping and native sheets. `ChatMaterial` may use iOS Liquid Glass when available and falls back to a solid bordered surface; reduced transparency always wins. Avoid decorative blur or stacked shadows.
-
-## Shapes
-
-Rounded 12–14px cards and 24–26px chat materials establish the current language. Pills are for compact status or attachment tokens. Borders and active fills must remain visible in both themes.
-
-## Components
-
-- **Button/Input/Text primitives:** shared Uniwind variants with accessible labels and selected/disabled states.
-- **Chat bubbles and composer:** distinct sender grouping, attachment controls, stop/send actions, and keyboard-safe layout.
-- **Home list and workspace rows:** compact identity plus state, with clear press feedback.
-- **Notification prompt:** keep the action group below the explanation so the notification prompt remains readable at every width and text size.
-- **Sheets and modals:** protected focus for target selection, recovery, and queue actions.
-- **EmptyState and ErrorText:** a concise explanation and one retry or recovery action.
-
-## Do's and Don'ts
-
-- Do honor safe areas, dynamic type constraints, reduced motion, and reduced transparency.
-- Do keep destructive or uncertain operations explicit and recoverable.
-- Do use the shared semantic theme instead of literal per-screen colors.
-- Do keep touch targets at least 44px even when the icon is smaller.
-- Don't replace native navigation or sheets with web-style scaffolding.
-- Don't use blur, gradients, or animation as decoration.
-- Don't rely on color alone for connection, delivery, or recovery state.
-- Don't add a second mobile design language beside the existing UI primitives.
+Run `pnpm --filter vibeface-mobile typecheck`, `pnpm --filter vibeface-mobile test:unit`, `python3 scripts/check-uiarc.py`, and the lightweight Expo production export during integration. Type checks, source audits and exports do not prove native device behavior or visual parity. This task does not run emulators, screenshots or UI acceptance tests.

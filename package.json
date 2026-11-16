@@ -10,6 +10,8 @@
     "typescript": "^6.0.3"
   },
   "scripts": {
+    "check:ui": "python3 scripts/check-uiarc.py && node scripts/check-uiarc-build.mjs && node scripts/check-uiarc-native.cjs",
+    "generate:ui": "python3 scripts/generate-uiarc-theme.py",
     "test:e2e": "e2e run --config tests/e2e/e2e.config.ts",
     "test:e2e:check": "tsc --noEmit -p tests/e2e/tsconfig.e2e.json && node --check scripts/e2e-node.mjs"
   }

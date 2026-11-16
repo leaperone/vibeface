@@ -1,3 +1,5 @@
+import * as deliveryModel from '@vibeface/client/delivery/model.ts'
+import { transferSelection, type DeliveryBudget } from '@vibeface/client/delivery/types.ts'
 import { parseChanged } from '@vibeface/client/lib/progress.ts'
 import * as workspaceHistory from '@vibeface/client/workspace/history.ts'
 import { completeHistory } from '@vibeface/client/workspace/history-fixture.ts'
@@ -756,12 +758,12 @@ test("workspace preserves bot and message requests while routing native decision
     conversationHold = null
     scheduler = null
     transcript = []
-    stored.set("vibeface.ignored-inbox.client.network", JSON.stringify(["from-other-tab"]))
+    stored.set("vibeface.ignored-inbox.client.network", JSON.stringify([""]))
     unreadNotifications = [{ notification_id: "local-note", kind: "manager_attention", text: "看看进展", conversation_id: "chat", target: { kind: "bot_main", bot_id: "bot" } }]
     render().setView("tasks")
     await render().refresh()
     render().ignoreNotifications(["local-note"])
-    assert.deepEqual(JSON.parse(stored.get("vibeface.ignored-inbox.client.network") ?? "null"), ["from-other-tab", "local-note"], "ignoring merges the latest local storage from another tab")
+    assert.deepEqual(JSON.parse(stored.get("vibeface.ignored-inbox.client.network") ?? "null"), ["", "local-note"], "ignoring merges the latest local storage from another tab")
     unreadNotifications = []
     render().setView("chat")
     failMessage = true
@@ -780,7 +782,7 @@ test("workspace preserves bot and message requests while routing native decision
     let inputWork = Promise.resolve()
     const inputUi = componentHarness('./workspace-chat.tsx', {
       '@vibeface/client/workspace/context.tsx': { useWorkspace: () => render() }, '@vibeface/client/chat/protocol.ts': { promptIntent, inputTargetKey },
-      '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, action: () => Promise<void>) => { inputWork = action().catch((cause) => { inputUiErrors.push(String(cause)) }); return inputWork } }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
+      '@/components/arc/product-kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, action: () => Promise<void>) => { inputWork = action().catch((cause) => { inputUiErrors.push(String(cause)) }); return inputWork } }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
     })
     const inputButton = (label: string) => {
       const saved = render().pendingMessages.find((item) => item.message_id === pending.message_id)
@@ -1263,7 +1265,7 @@ test("workspace preserves bot and message requests while routing native decision
           const shared = { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => render() }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: activeConnection, directory: null }) }, '@vibeface/client/chat/protocol.ts': { promptIntent, inputTargetKey } }
           const scope = componentHarness('./workspace-chat.tsx', shared, { setInterval: () => 1, clearInterval() {} }, 'ScopedConversation')
           const props = { target, conversationId: otherBot.conversation_id, label: '附件任务', ...(channel ? { channelId: 'attachment-channel' } : {}) }
-          const chat = componentHarness('../chat/elements/chat.tsx', { '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') } })
+          const chat = componentHarness('../../components/arc/conversation-thread.tsx', { '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') } })
           const message = componentHarness('../chat/elements/message.tsx', { ...shared, '@vibeface/client/chat/protocol.ts': { promptIntent, messageKey, replyStatusLabel }, '@vibeface/client/lib/errors.ts': errors })
           let downloads = 0
           const artifact = componentHarness('../chat/elements/artifact.tsx', { ...shared, '@vibeface/client/workspace/model.ts': { formatSize } }, { crypto, Blob, URL: { createObjectURL: () => 'blob:fixture', revokeObjectURL() {} }, document: { createElement: () => ({ click() { downloads++ } }) }, window: { setTimeout: () => 1 } })
@@ -1667,7 +1669,7 @@ test("workspace preserves bot and message requests while routing native decision
         assert.ok(typeof jump === 'function'); jump()
         assert.deepEqual(offsets, [-492], 'the inverted list jumps to the negative actual native top inset')
         for (const [nextTheme, nextGlass, blur, background] of [
-          ['light', true, 'systemUltraThinMaterialLight', 'transparent'], ['dark', true, 'systemUltraThinMaterialDark', 'transparent'],
+          ['light', true, 'none', 'white'], ['dark', true, 'none', 'black'],
           ['light', false, 'none', 'white'], ['dark', false, 'none', 'black'],
         ] satisfies [string, boolean, string, string][]) {
           theme = nextTheme; glass = nextGlass
@@ -1725,7 +1727,7 @@ test("workspace preserves bot and message requests while routing native decision
         let closeWork = Promise.resolve()
         const status = componentHarness('./workspace-chat.tsx', {
           '@vibeface/client/workspace/context.tsx': { useWorkspace: () => render() }, '@vibeface/client/chat/protocol.ts': { promptIntent, inputTargetKey },
-          '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, action: () => Promise<void>) => { closeWork = action(); return closeWork } }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
+          '@/components/arc/product-kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, action: () => Promise<void>) => { closeWork = action(); return closeWork } }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
         })
         try {
           const sharedHistory = JSON.parse(JSON.stringify(await render().readWorkspaceHistory()))
@@ -1910,6 +1912,12 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   const nativeRouterModule = dependencies['expo-router']
   const nativeRouter = typeof nativeRouterModule === 'object' && nativeRouterModule !== null && 'router' in nativeRouterModule ? nativeRouterModule.router : {}
   const require = (specifier: string): unknown => {
+    if (specifier === '@/components/arc/routed-action') return { RoutedAction: 'Link', ActionLink: 'a' }
+    if (specifier === '@/components/arc/task-run-summary') return { TaskRunSummary: function TaskRunSummary() {} }
+    if (path.includes('/mobile/') && specifier === '@/components/arc/input') return { Input: 'TextInput' }
+    if (path.includes('/mobile/') && specifier === '@/components/arc/textarea') return { Textarea: 'TextInput' }
+    if (path.includes('/mobile/') && specifier === '@/components/arc/chat') return { ComposerInput: 'TextInput', ComposerPanel: 'ComposerPanel', MessageBubble: 'View' }
+    if (path.includes('/mobile/') && specifier === '@/components/arc/selection') return { SelectionItem: 'Pressable' }
     if (specifier === '@vibeface/client/workspace/model.ts') {
       const override = dependencies[specifier]
       return { ...workspaceModel, ...(typeof override === 'object' && override !== null ? override : {}) }
@@ -2001,59 +2009,19 @@ const settleComponent = () => new Promise(setImmediate)
 const elementText = (node: unknown): string => typeof node === 'string' ? node : Array.isArray(node) ? node.map(elementText).join('')
   : node && typeof node === 'object' && 'props' in node && node.props && typeof node.props === 'object' && 'children' in node.props ? elementText(node.props.children) : ''
 
-test('native chat glass follows accessibility events without replacing its input content', async () => {
-  const initial = pendingResult(), platform = { OS: 'ios' }
-  const absoluteFill = { position: 'absolute', top: 0, right: 0, bottom: 0, left: 0 }
-  let theme = 'light', supported = true, liquid = true, removed = 0, reads = 0, change = (_enabled: boolean) => {}
-  const app = componentHarness('../../../../../apps/mobile/src/features/chat/chrome.tsx', {
-    'expo-glass-effect': { GlassView: 'GlassView', isGlassEffectAPIAvailable: () => supported, isLiquidGlassAvailable: () => liquid },
-    'react-native': { View: 'View', Platform: platform, StyleSheet: { absoluteFill }, AccessibilityInfo: {
-      isReduceTransparencyEnabled: () => { reads++; return initial.promise },
-      addEventListener: (name: string, listener: typeof change) => { assert.equal(name, 'reduceTransparencyChanged'); change = listener; return { remove() { removed++ } } },
-    } },
-    'uniwind': { useUniwind: () => ({ theme }) },
-  })
-  const read = () => {
-    app.render('useChatChrome')
-    const chrome = app.output
-    assert.ok(chrome && typeof chrome === 'object' && 'kind' in chrome)
-    return chrome
-  }
-  const input = { type: 'TextInput', props: { value: '保留输入中的草稿', selection: { start: 2, end: 2 } } }
-  const material = (chrome: ReturnType<typeof read>) => {
-    const elements = app.render('ChatMaterial', { chrome, children: input })
+test('the native Arc composer keeps the same editor and attachment nodes inside its panel', () => {
+  const app = componentHarness('../../../../../apps/mobile/src/components/arc/chat.tsx', { 'react-native': { View: 'View', TextInput: 'TextInput' }, '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') } })
+  const editor = { type: 'TextInput', props: { value: '保留输入中的草稿', selection: { start: 2, end: 2 } } }
+  const attachments = { type: 'View', props: { children: '待发送文件' } }
+  const actions = { type: 'Button', props: { children: '发送' } }
+  try {
+    const elements = app.render('ComposerPanel', { editor, attachments, actions })
     const root = elements.at(-1)
     assert.equal(root?.type, 'View')
     assert.ok(Array.isArray(root?.props.children))
-    assert.equal(root.props.children[1], input, 'the same input stays in the same child slot beneath a fixed View')
-    const background = elements.find(({ props }) => props.pointerEvents === 'none')
-    assert.ok(background)
-    const style = background.props.style
-    assert.deepEqual(Object.assign({}, ...(Array.isArray(style) ? style : [style])), { ...absoluteFill, borderRadius: 26 }, 'both material backgrounds fill their native parent')
-    return elements
-  }
-  try {
-    assert.equal(read().kind, 'solid', 'the first render waits for the accessibility setting')
-    change(false)
-    initial.resolve(true)
-    await settleComponent()
-    const glass = read()
-    assert.equal(glass.kind, 'glass', 'a late initial read cannot overwrite a newer settings event')
-    assert.equal(material(glass).find(({ type }) => type === 'GlassView')?.props.colorScheme, 'light')
-    theme = 'dark'
-    assert.equal(material(read()).find(({ type }) => type === 'GlassView')?.props.colorScheme, 'dark')
-    change(true)
-    const solid = read()
-    assert.equal(solid.kind, 'solid')
-    assert.equal(material(solid).some(({ type }) => type === 'GlassView'), false)
-    change(false); liquid = false
-    assert.equal(read().kind, 'solid', 'Liquid Glass availability is checked independently of the API')
-    assert.equal(removed, 1)
-    supported = false; liquid = true
-    assert.equal(read().kind, 'solid')
-    supported = true; platform.OS = 'android'
-    assert.equal(read().kind, 'solid')
-    assert.equal(reads, 1, 'unsupported platforms do not subscribe or read iOS accessibility settings')
+    assert.equal(root.props.children[0], attachments)
+    assert.equal(root.props.children[1], editor, 'layout leaves the editor and its selection intact')
+    assert.equal(elements.find(({ props }) => props.children === actions)?.type, 'View')
   } finally { app.close() }
 })
 
@@ -2327,7 +2295,7 @@ test("provider cards keep summary readiness, setup and execution details in thei
       '@vibeface/client/identity/copy.ts': { deviceCopy },
       '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') },
       '@/lib/glossary': { terms: { bot: { icon: 'Bot' }, task: { icon: 'ListChecks' } } },
-      '@/components/app/kit': kit,
+      '@/components/arc/product-kit': kit,
       '@/components/kit': kit,
     }, {}, name)
     const props = { item, response, onboarding: false, first: true, busy: '', models: null, error: '' }
@@ -2335,7 +2303,7 @@ test("provider cards keep summary readiness, setup and execution details in thei
       let elements = app.render(name, props)
       if (platform === 'mobile') {
         assert.equal(elements.some(({ props }) => props.label === '执行任务'), false, 'execution details start collapsed')
-        const expand = elements.find(({ type, props }) => type === 'Pressable' && props.accessibilityRole === 'button')?.props.onPress
+        const expand = elements.find(({ type, props }) => (type === 'Pressable' || type === 'Button') && props.accessibilityRole === 'button')?.props.onPress
         assert.ok(typeof expand === 'function')
         expand()
         elements = app.render(name, props)
@@ -2571,7 +2539,7 @@ test('both pending input controls retry only a matching safe refusal and keep al
     }
     const app = componentHarness(platform === 'web' ? './workspace-chat.tsx' : '../../../../../apps/mobile/src/features/workspace/workspace.tsx', {
       '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared }, '@vibeface/client/chat/protocol.ts': { promptIntent, inputTargetKey },
-      '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: async (_key: string, action: () => Promise<void>) => action() }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
+      '@/components/arc/product-kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: async (_key: string, action: () => Promise<void>) => action() }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
       '@/lib/use-run': { useRun: () => ({ busy: null, error: '', run: async (_key: string, action: () => Promise<void>) => action() }) }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
     })
     const render = () => app.render(platform === 'web' ? 'WorkspaceInputStatus' : 'InputStatus', { pending })
@@ -2668,12 +2636,19 @@ test('new task creation uses the displayed default Bot after the catalog loads a
     if (mode === 'filter') { shared.bots = [parityBot, other]; botId = parityBot.bot_id }
     const app = componentHarness('./workspace-tasks.tsx', {
       '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/workspace/storage.ts': { newId: () => 'created-task' },
-      '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: async (_key: string, action: () => Promise<void>) => action() }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
+      '@/components/arc/product-kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: async (_key: string, action: () => Promise<void>) => action() }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
     }, {}, 'CreateWorkspaceTask')
     const render = () => app.render('CreateWorkspaceTask', { open: true, onOpenChange() {}, botId })
-    const owner = () => render().find(({ type }) => type === 'NativeSelect')?.props.value
+    const owner = () => String(render().find(({ type }) => type === 'Select')?.props.value).slice(4)
     try {
-      if (mode === 'cold') { assert.equal(owner(), ''); shared.bots = [parityBot] }
+      if (mode === 'cold') {
+        assert.equal(owner(), '')
+        const empty = render().find(({ type }) => type === 'Select')
+        assert.equal(empty?.props.value, '', 'required selection stays empty until a Bot is available')
+        assert.equal(empty?.props.required, true)
+        assert.deepEqual(JSON.parse(JSON.stringify(empty?.props.options)), [])
+        shared.bots = [parityBot]
+      }
       else { assert.equal(owner(), parityBot.bot_id); botId = other.bot_id; render() }
       const expected = mode === 'cold' ? parityBot.bot_id : other.bot_id
       assert.equal(owner(), expected, 'the visible default is also the command owner without changing the select')
@@ -2686,6 +2661,32 @@ test('new task creation uses the displayed default Bot after the catalog loads a
       assert.equal((commands[0] as { owner_bot: string }).owner_bot, expected)
     } finally { app.close() }
   }
+})
+
+test('the required paid transfer budget stays empty until a real budget is selected', () => {
+  const budget = { budget_id: 'budget-1', payer: 'wallet', payee: 'payee', provider_peer: 'provider', asset: 'asset', deposit: '10', free: '10', locked: '0', earned: '0', withdrawn: '0', refunded: '0', state: 'open', gas_cap: '1', ready_windows: [] } satisfies DeliveryBudget
+  const delivery = { status: { enabled: true, charity_enabled: true, paid_enabled: true, node_peer: 'sender', wallet: { state: 'unlocked', address: 'wallet' }, max_file_bytes: 1024, receiver_key: null }, budgets: [budget], orders: [], providers: [], selected: null, busy: null, canManage: true }
+  const app = componentHarness('../lab/transfers.tsx', {
+    '@vibeface/client/delivery/client.ts': { useDelivery: () => delivery },
+    '@vibeface/client/delivery/model.ts': deliveryModel,
+    '@vibeface/client/delivery/types.ts': { transferSelection },
+    '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
+    '@/lib/glossary': { terms: new Proxy({}, { get: (_target, name) => ({ label: String(name), icon: String(name) }) }) },
+    '@/components/arc/product-kit': { Segmented: 'Segmented', useAction: () => ({ busy: null }) },
+  }, {}, 'TransferPage')
+  const render = () => app.render('TransferPage', { connection: {} })
+  try {
+    const mode = render().find(({ type }) => type === 'Segmented')
+    assert.ok(mode)
+    ;(mode.props.onChange as (value: string) => void)('paid')
+    const empty = render().find(({ type, props }) => type === 'Select' && props.id === 'transfer-budget')
+    assert.ok(empty)
+    assert.equal(empty.props.required, true)
+    assert.equal(empty.props.value, '', 'the native required field has no artificial selected value')
+    assert.deepEqual(JSON.parse(JSON.stringify(empty.props.options)), [{ value: 'arc:budget-1', label: 'budget-1 · 可分配 10' }])
+    ;(empty.props.onValueChange as (value: string) => void)('arc:budget-1')
+    assert.equal(render().find(({ type, props }) => type === 'Select' && props.id === 'transfer-budget')?.props.value, 'arc:budget-1')
+  } finally { app.close() }
 })
 
 test('routine input links preserve their exact trigger', () => {
@@ -2913,7 +2914,7 @@ test('empty chat starters preserve an editable unsent draft', () => {
   let sends = 0
   const shared = { ...parityShared(), fresh: new Set<string>(), interrupted: [], chatSlot: { conversationId: 'chat', missing: false }, sendMessage: async () => { sends++; return true } }
   const harness = conversationHarness(() => shared)
-  const suggestions = () => harness.render().filter(({ type, props }) => type === 'Button' && starters.general.includes(componentText(props.children)))
+  const suggestions = () => harness.render().filter(({ type, props }) => (type === 'Button' || type === 'button') && starters.general.includes(componentText(props.children)))
   try {
     assert.equal(harness.chatEntries().length, 0)
     assert.equal(suggestions().length, starters.general.length)
@@ -3009,10 +3010,10 @@ test('chat task history keeps completed and unknown records while counting only 
     assert.equal(label(), '任务 · 1 进行中 · 1 待处理', 'answered approvals and closed historical failures stop counting')
     const trigger = render().find(({ type }) => type === 'Button')
     trigger?.props.onClick?.()
-    assert.equal(render().find(({ type }) => type === 'Sheet')?.props.open, true)
-    const onCloseAutoFocus = render().find(({ type }) => type === 'SheetContent')?.props.onCloseAutoFocus as (event: { preventDefault(): void }) => void
+    assert.equal(render().find(({ type }) => type === 'Drawer')?.props.open, true)
+    const onCloseAutoFocus = render().find(({ type }) => type === 'DrawerContent')?.props.onCloseAutoFocus as (event: { preventDefault(): void }) => void
     render().find(({ type }) => type === 'Link')?.props.onClick?.()
-    assert.equal(render().find(({ type }) => type === 'Sheet')?.props.open, false, 'navigation closes the sheet first')
+    assert.equal(render().find(({ type }) => type === 'Drawer')?.props.open, false, 'navigation closes the sheet first')
     let prevented = false
     const closeFocus = () => onCloseAutoFocus({ preventDefault() { prevented = true } })
     closeFocus()
@@ -3032,7 +3033,7 @@ test('the retained conversation only mounts task history on its exact chat route
   const app = componentHarness('./workspace-shell.tsx', {
     '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: null, directory: null }) },
     '@tanstack/react-router': { Link: 'Link', useNavigate: () => () => {}, useRouterState: ({ select }: { select: (state: unknown) => unknown }) => select({ location: { pathname, search: {} } }) },
-    '@/components/ui/sidebar': { useSidebar: () => ({ isMobile: false, setOpenMobile() {} }) }, './inbox': { useInbox: () => [] },
+    './inbox': { useInbox: () => [] },
     '@/features/devices/join': { useOpenJoins: () => [] }, '@vibeface/client/workspace/inbox.ts': { waitingItems: () => [] },
     '@vibeface/client/workspace/home.ts': { backTo: () => undefined }, '@/lib/glossary': { terms: Object.fromEntries(['inbox', 'task', 'myDevices', 'settings'].map((key) => [key, { label: key, icon: key }])) },
     '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
@@ -3092,7 +3093,7 @@ function taskOverviewHarness(
     app,
     render: () => app.render(platform === 'web' ? 'TasksOverview' : 'TasksScreen'),
     cardName: platform === 'web' ? 'TaskOverviewCard' : 'TaskRow',
-    mastheadName: platform === 'web' ? 'WorkspaceMasthead' : 'MobileMasthead',
+    mastheadName: platform === 'web' ? 'TaskRunSummary' : 'MobileMasthead',
   }
 }
 
@@ -3276,7 +3277,7 @@ test('both work details read terminal shared records outside Main and discard la
       '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared },
       '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': taskLabels,
       '@vibeface/client/workspace/questions.ts': workspaceQuestions, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/lib/node.ts': { providerNames, messageOf }, '@vibeface/client/lib/errors.ts': errors,
-      '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: () => Promise.resolve() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) }),
+      '@/components/arc/product-kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: () => Promise.resolve() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) }),
       '@/components/kit': { providerIcons: { codex: 'CodexIcon' }, toneText: {} }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
     }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } }, platform === 'native' ? 'TaskDetail' : '')
     const render = () => app.render('TaskDetail', { botId: 'bot', workId })
@@ -3315,7 +3316,7 @@ test('terminal work followups retain their Task identity or explicitly create a 
       '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared },
       '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': taskLabels,
       '@vibeface/client/workspace/questions.ts': workspaceQuestions, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/lib/node.ts': { providerNames, messageOf }, '@vibeface/client/lib/errors.ts': errors,
-      '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: async (_key: string, action: () => Promise<void>) => action() }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
+      '@/components/arc/product-kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: async (_key: string, action: () => Promise<void>) => action() }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
       '@/components/kit': { providerIcons: { codex: 'CodexIcon' }, toneText: {} }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
       './task-activity': { confirmText: () => '设备无法报告结果', BackOnline: 'BackOnline' },
     }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } }, platform === 'native' ? 'TaskDetail' : '')
@@ -3368,7 +3369,7 @@ test('both task details bind approval to current unfinished work and keep stops 
       '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared },
       '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': taskLabels,
       '@vibeface/client/workspace/questions.ts': workspaceQuestions, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/lib/node.ts': { providerNames, messageOf }, '@vibeface/client/lib/errors.ts': errors,
-      '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: () => Promise.resolve() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) }),
+      '@/components/arc/product-kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: () => Promise.resolve() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) }),
       '@/components/kit': { providerIcons: { codex: 'CodexIcon' }, toneText: {} }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
       './task-activity': { confirmText: () => '设备无法报告结果', BackOnline: 'BackOnline' },
     }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } }, platform === 'native' ? 'TaskDetail' : '')
@@ -3672,12 +3673,12 @@ test("task filters leave live confirmations and questions to 待处理 and keep 
   try {
     let elements = app.render("TasksOverview")
     assert.equal(elements.some(({ type }) => type === "PendingSection"), true)
-    assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 2, "live checks and questions act in 待处理 and still count")
+    assert.equal(named(elements, "TaskRunSummary")?.props.attention, 2, "live checks and questions act in 待处理 and still count")
     const selectBot = named(elements, "TaskFilters")?.props.onBotFilter
     assert.ok(typeof selectBot === "function")
     selectBot("a")
     elements = app.render("TasksOverview")
-    assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 1)
+    assert.equal(named(elements, "TaskRunSummary")?.props.attention, 1)
     assert.equal(nestedElements(elements, ["AttentionActivity"]).some(({ type }) => type === "ConfirmCard" || type === "QuestionCard"), false)
     assert.equal(named(elements, "WorkspaceEmpty"), undefined, "the task list does not claim emptiness under waiting items")
     inbox = []
@@ -3771,7 +3772,7 @@ test('bound permission choices show readable actions and return their original s
       '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { device_id: 'client' } } }) },
       '@vibeface/client/workspace/questions.ts': workspaceQuestions, '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/lib/errors.ts': errors,
       '@/lib/glossary': { terms: { approval: { icon: 'Hand' } } },
-      '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: async (_key: string, run: () => Promise<void>) => { try { await run() } catch {} } }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
+      '@/components/arc/product-kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: async (_key: string, run: () => Promise<void>) => { try { await run() } catch {} } }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
       '@tanstack/react-router': { Link: 'Link', useNavigate: () => () => {} }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
       'expo-haptics': { notificationAsync: async () => {}, NotificationFeedbackType: { Success: 'success' } },
     })
@@ -3789,7 +3790,7 @@ test('bound permission choices show readable actions and return their original s
       assert.match(componentText(elements), /允许本次/)
       assert.match(componentText(elements), /拒绝/)
       assert.doesNotMatch(componentText(elements), /decision|accept|decline/)
-      assert.equal(elements.some(({ type }) => type === 'textarea' || type === 'TextInput'), false)
+      assert.equal(elements.some(({ type }) => type === 'Textarea' || type === 'TextInput'), false)
       assert.doesNotMatch(componentText(elements), /忽略/, 'a held approval takes only its own actions')
       shared.writable = false; press(); assert.equal(sent.length, 0)
       shared.writable = true; press(); assert.deepEqual(sent, [raw])
@@ -3814,17 +3815,17 @@ test("question cards send a choice on tap, send written text from the last line,
   const toasts: { text: string; action?: { label: string; onClick(): void } }[] = [], visited: unknown[] = []
   const kit = new Proxy({ useAction: () => ({ busy: actionBusy, error: null, run: (_key: string, work: () => Promise<void>) => work() }), toast: (text: string, options: { action?: { label: string; onClick(): void } } = {}) => { toasts.push({ text, action: options.action }) } }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
   const router = { Link: 'Link', useNavigate: () => (target: unknown) => { visited.push(target) } }
-  const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { device_id: 'web', source: 'membership', can_manage: false } } }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '工作电脑' }, '@vibeface/client/workspace/questions.ts': { answerLabel, attentionLabel, approvalTask, declined, ignoredAnswer, questionMeta, questionParts, settledAnswer, sharedProject }, '@/components/app/kit': kit, '@tanstack/react-router': router })
+  const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { device_id: 'web', source: 'membership', can_manage: false } } }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '工作电脑' }, '@vibeface/client/workspace/questions.ts': { answerLabel, attentionLabel, approvalTask, declined, ignoredAnswer, questionMeta, questionParts, settledAnswer, sharedProject }, '@/components/arc/product-kit': kit, '@tanstack/react-router': router })
   const longChoice = '只在本机验证完整配置并保留现有服务，检查通过后再决定是否发布'
   const question = { target: { kind: 'bot_main', bot_id: 'bot' }, question_id: 'q1', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '\n是否允许继续？\n已完成本机检查。\n\n线上结果未知。', choices: [{ label: '允许' }, { label: longChoice }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/path/to/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null, closed: null }
   const render = (props: object = {}) => app.render('QuestionCard', { question, ...props })
   const tap = async (label: string, props: object = {}) => {
-    const button = render(props).find(({ type, props }) => (type === 'button' || type === 'Button') && (props['aria-label'] === label || componentText(props.children).includes(label)))
+    const button = render(props).find(({ type, props }) => (type === 'Button' || type === 'Button') && (props['aria-label'] === label || componentText(props.children).includes(label)))
     assert.ok(button?.props.onClick, `missing button ${label}`)
     button.props.onClick(); await settleComponent()
   }
   const write = (value: string) => {
-    const input = render().find(({ type }) => type === 'textarea')
+    const input = render().find(({ type }) => type === 'Textarea')
     assert.ok(input?.props.onChange)
     input.props.onChange({ target: { value } })
   }
@@ -3832,8 +3833,8 @@ test("question cards send a choice on tap, send written text from the last line,
   try {
     let elements = render()
     assert.match(componentText(elements), /web[^]*工作电脑/, 'the context identifies its project and device')
-    assert.deepEqual(elements.filter(({ type }) => type === 'button').map(({ props }) => componentText(props.children)), ['1允许', `2${longChoice}`, '3停下'], 'one numbered row per real choice')
-    const input = elements.find(({ type }) => type === 'textarea')
+    assert.deepEqual(elements.filter(({ type, props }) => type === 'Button' && props.className === 'w-full justify-start whitespace-normal').map(({ props }) => componentText(props.children)), ['1允许', `2${longChoice}`, '3停下'], 'one numbered row per real choice')
+    const input = elements.find(({ type }) => type === 'Textarea')
     assert.equal(input?.props.rows, 1, 'the last line waits for a written answer')
     assert.equal(input?.props['aria-label'], '你的回答')
     assert.equal(input?.props.onKeyDown, undefined, 'Enter and IME stay native textarea input')
@@ -3854,7 +3855,7 @@ test("question cards send a choice on tap, send written text from the last line,
     write('新回答')
     workspace.writable = false
     elements = render()
-    assert.equal(elements.filter(({ type }) => type === 'button' || type === 'textarea').every(({ props }) => props.disabled === true), true)
+    assert.equal(elements.filter(({ type }) => type === 'Button' || type === 'Textarea').every(({ props }) => props.disabled === true), true)
     await tap('停下'); await tap('忽略')
     assert.equal(sent.length, count, 'the send handler also enforces read-only state')
     workspace.writable = true
@@ -3862,7 +3863,7 @@ test("question cards send a choice on tap, send written text from the last line,
     assert.deepEqual(plain(sent.at(-1)), [question, ignoredAnswer], 'ignoring sends the fixed answer')
     workspace.pendingAnswers = [{ question_id: 'q1', text: '继续\n原文' }]
     elements = render()
-    assert.equal(elements.some(({ type }) => type === 'button' || type === 'textarea'), false, 'a pending answer cannot be replaced')
+    assert.equal(elements.some(({ type,props }) => type === 'Button' && props.className === 'w-full justify-start whitespace-normal' || type === 'Textarea'), false, 'a pending answer cannot be replaced')
     assert.match(componentText(elements), /没确认送达/)
     const retry = elements.find(({ type, props }) => type === 'Button' && componentText(props.children).includes('再试'))
     assert.ok(retry?.props.onClick)
@@ -3877,7 +3878,7 @@ test("question cards send a choice on tap, send written text from the last line,
     workspace.answered = { q1: '允许' }
     elements = render({ question: { ...question, closed: 'request_lost', answer: { text: '停下' } }, answer: '过时答案' })
     assert.match(componentText(elements), /已由另一端回答：停下/, 'the network winner takes precedence over a folded answer, closed state and pending retry')
-    assert.equal(elements.some(({ type }) => type === 'Button' || type === 'button'), false)
+    assert.equal(elements.some(({ type }) => type === 'Button' || type === 'Button'), false)
     workspace.pendingAnswers = []
     elements = render()
     assert.match(componentText(elements), /已回答 · 允许/, 'a shared answer folds the card immediately')
@@ -3889,7 +3890,7 @@ test("question cards send a choice on tap, send written text from the last line,
     workspace.answered = {}
     elements = render({ question: { ...question, closed: 'request_lost' } })
     assert.match(componentText(elements), /已失效/)
-    assert.equal(elements.some(({ type }) => type === 'Button' || type === 'button'), false)
+    assert.equal(elements.some(({ type }) => type === 'Button' || type === 'Button'), false)
     await tap('允许', { inbox: true })
     await tap('忽略', { inbox: true })
     assert.deepEqual(toasts.map(({ text }) => text), ['已回答', '已忽略'])
@@ -3908,13 +3909,13 @@ test("a question without choices offers only the answer line and 忽略", () => 
     '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
     '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备' },
     '@vibeface/client/workspace/questions.ts': { answerLabel, attentionLabel, approvalTask, declined, ignoredAnswer, questionMeta, questionParts, settledAnswer, sharedProject },
-    '@/components/app/kit': { useAction: () => ({ busy: null, error: null }) },
+    '@/components/arc/product-kit': { useAction: () => ({ busy: null, error: null }) },
     '@tanstack/react-router': { useNavigate: () => () => {} },
   })
   try {
     const elements = app.render('QuestionCard', { question: { question_id: 'free', text: '需要什么配置？', choices: [], severity: 'attention', about: { node: 'worker', session_id: 's', cwd: '' }, answer: null, closed: null } })
-    assert.equal(elements.find(({ type }) => type === 'textarea')?.props.rows, 1)
-    assert.equal(elements.some(({ type }) => type === 'button'), false)
+    assert.equal(elements.find(({ type }) => type === 'Textarea')?.props.rows, 1)
+    assert.equal(elements.some(({ type,props }) => type === 'Button' && props.className === 'w-full justify-start whitespace-normal'), false)
     assert.ok(elements.some(({ type, props }) => type === 'Button' && componentText(props.children).includes('忽略')))
   } finally { app.close() }
 })
@@ -3994,7 +3995,7 @@ test("remounted question cards identify the answer author and reserve warning st
         '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { principal: { device_id: 'self', source: 'membership', can_manage: false } } }) },
         '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备' },
         '@vibeface/client/workspace/questions.ts': { answerLabel, attentionLabel, approvalTask, declined, ignoredAnswer, questionMeta, questionParts, settledAnswer, sharedProject },
-        '@/components/app/kit': { useAction: () => ({ busy: null, error: null }) },
+        '@/components/arc/product-kit': { useAction: () => ({ busy: null, error: null }) },
         '@tanstack/react-router': { useNavigate: () => () => {} },
       })
       try {
@@ -4037,7 +4038,7 @@ test("task overview keeps pending decisions with their task and every real task 
   try {
     const elements = app.render('TasksOverview')
     assert.deepEqual(elements.filter(({ props }) => props.work).map(({ props }) => (props.work as { work_id: string }).work_id), ['held', 'running'], 'a task waiting for confirmation remains visible before active tasks')
-    assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === 'WorkspaceMasthead')?.props.attention, 1, 'the same task, question and confirmation are counted once')
+    assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === 'TaskRunSummary')?.props.attention, 1, 'the same task, question and confirmation are counted once')
     assert.equal(elements.some(({ type }) => type === 'QuestionCard' || type === 'ConfirmCard'), false, 'the question and confirmation act only in 待处理')
     assert.equal(elements.some(({ props }) => typeof props.children === 'string' && props.children === '2 项任务'), true)
   } finally { app.close() }
@@ -4052,10 +4053,10 @@ test("any entrance stops an unfinished task once, after a confirming second tap,
     return { work: { ...work, target: work.target ?? null, source_events: ['a'.repeat(64)], conversation_id: input.conversation_id }, coverage: { source: 'shared_history', complete: false } }
   } }
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
-  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { ...taskLabels, nodeName: () => '设备', promptSummary, taskActive: () => true, taskLabel: () => '', taskStale: () => false, staleTaskLabel: '', progressLabel: () => '', shownState: (work: { state: string }) => work.state, taskAgent: () => null, followUp, followUpCopy }, '@vibeface/client/lib/errors.ts': errors, '@vibeface/client/workspace/questions.ts': workspaceQuestions }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } })
+  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/arc/product-kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { ...taskLabels, nodeName: () => '设备', promptSummary, taskActive: () => true, taskLabel: () => '', taskStale: () => false, staleTaskLabel: '', progressLabel: () => '', shownState: (work: { state: string }) => work.state, taskAgent: () => null, followUp, followUpCopy }, '@vibeface/client/lib/errors.ts': errors, '@vibeface/client/workspace/questions.ts': workspaceQuestions }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } })
   const render = async () => { workspace.data = { ...data }; workspace.openWorks = data.works.map((item) => ({ ...item, conversation_id: 'chat' })); app.render('TaskDetail', { botId: 'bot', workId: 'work' }); await settleComponent(); return app.render('TaskDetail', { botId: 'bot', workId: 'work' }) }
-  const stop = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'destructive')
-  const ask = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'outline' && [props.children].flat().some((child) => typeof child === 'string' && child.includes('停止')))
+  const stop = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'danger')
+  const ask = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'secondary' && [props.children].flat().some((child) => typeof child === 'string' && child.includes('停止')))
   try {
     const work = parityWork({ target_node: 'worker', cwd: '/p', title: '工作', prompt: '工作', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null })
     data.works = [{ ...work, state: 'unverified' }]
@@ -4082,48 +4083,23 @@ test("any entrance stops an unfinished task once, after a confirming second tap,
   } finally { app.close() }
 })
 
-test("below lg the task panel is a modal dialog that makes the rest of the page inert, and beside the chat it is not", () => {
-  const workspace = { ...parityShared(), generation: 1, nodes: [], liveProgress: [], writable: true, pendingMessages: [], canSaveMessages: true, questions: [], data: { local_node: 'worker', questions: [], works: [{ work_id: 'work', target_node: 'worker', cwd: '/p', title: '整理日志', prompt: '', state: 'completed', summary: '', outcome: 'completed', result_text: '好了', failure_reason: null }] } }
+test("task detail delegates narrow-screen modal behavior to Arc and remains an inline inspector on wide screens", () => {
+  let wide = false, closed = 0
+  const workspace = { ...parityShared(), generation: 1, nodes: [], liveProgress: [], writable: true, pendingMessages: [], canSaveMessages: true, questions: [], data: { local_node: 'worker', questions: [], works: [] } }
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: () => Promise.resolve() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
-  let wide = false
-  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { ...taskLabels, nodeName: () => '设备', promptSummary, taskActive: () => false, taskLabel: () => '', taskStale: () => false, staleTaskLabel: '', progressLabel: () => '', shownState: (work: { state: string }) => work.state, taskAgent: () => null, followUp, followUpCopy }, '@vibeface/client/lib/errors.ts': errors, '@vibeface/client/workspace/questions.ts': workspaceQuestions }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: (query: string) => ({ matches: query === '(min-width: 1024px)' && wide }) } })
-  // A page shaped like the shell: the panel's layer beside the chat, a header above, a sidebar and the toast region outside.
-  type Node = { name: string; attributes: Set<string>; parentElement: Node | null; children: Node[]; hasAttribute(name: string): boolean; setAttribute(name: string): void; removeAttribute(name: string): void }
-  const node = (name: string, children: Node[] = [], attributes: string[] = []): Node => {
-    const self: Node = { name, attributes: new Set(attributes), parentElement: null, children, hasAttribute: (key) => self.attributes.has(key), setAttribute: (key) => { self.attributes.add(key) }, removeAttribute: (key) => { self.attributes.delete(key) } }
-    for (const child of children) child.parentElement = self
-    return self
-  }
-  const layer = node('layer'), chat = node('chat'), header = node('header'), sidebar = node('sidebar'), toasts = node('toasts', [], ['aria-live']), hidden = node('hidden', [], ['inert'])
-  const head = node('head')
-  node('html', [head, node('body', [node('shell', [sidebar, node('main', [header, node('row', [chat, layer])])]), toasts, hidden])])
-  const inert = () => [chat, header, sidebar, toasts, hidden, layer, head].filter((item) => item.hasAttribute('inert')).map((item) => item.name)
-  const render = () => {
-    const elements = app.render('TaskDetail', { botId: 'bot', workId: 'work' })
-    return { panel: elements.find(({ type }) => type === 'aside')?.props ?? {}, title: elements.find(({ type }) => type === 'h2')?.props ?? {}, layer: elements.find(({ props }) => props.className === 'contents')?.props.ref as { current: unknown } }
-  }
+  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => { closed++ }, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/arc/product-kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { ...taskLabels, nodeName: () => '设备', shownState: () => '', taskAgent: () => null, followUp, followUpCopy }, '@vibeface/client/lib/errors.ts': errors, '@vibeface/client/workspace/questions.ts': workspaceQuestions }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: wide }) } })
+  const render = () => app.render('TaskDetail', { botId: 'bot', workId: 'work' })
   try {
-    const first = render()
-    assert.equal(first.panel.role, 'dialog')
-    assert.equal(first.panel['aria-modal'], true)
-    assert.equal(first.panel['aria-labelledby'], first.title.id, 'the dialog is named by its title')
-    first.layer.current = layer
+    const narrow = render()
+    const drawer = narrow.find(({ type }) => type === 'Drawer')
+    assert.equal(drawer?.props.open, true)
+    assert.equal(narrow.find(({ type }) => type === 'DrawerContent')?.props.title, '任务')
+    ;(drawer?.props.onOpenChange as (open: boolean) => void)(false)
+    assert.equal(closed, 1, 'Escape, outside click and Arc close return through the route callback')
     wide = true
-    const beside = render().panel
-    assert.equal(beside.role, undefined, 'beside the chat the panel is not a dialog')
-    assert.equal(beside['aria-modal'], undefined)
-    assert.equal(beside['aria-label'], '任务详情')
-    assert.deepEqual(inert(), ['hidden'], 'and nothing else is made inert')
-    wide = false
-    render()
-    assert.deepEqual(inert(), ['chat', 'header', 'sidebar', 'hidden'], 'narrowing the window covers the page but not the panel, the toasts or <head>')
-    wide = true
-    render()
-    assert.deepEqual(inert(), ['hidden'], 'widening it gives the page back, leaving what was inert before alone')
-    wide = false
-    render()
-    app.close()
-    assert.deepEqual(inert(), ['hidden'], 'closing the panel gives the page back')
+    const beside = render()
+    assert.equal(beside.some(({ type }) => type === 'Drawer'), false)
+    assert.equal(beside.find(({ type }) => type === 'aside')?.props['aria-label'], '任务详情')
   } finally { app.close() }
 })
 
@@ -4131,9 +4107,10 @@ test("bot projects use online manager capabilities and preserve device names", (
   const node = { device_id: 'worker', name: '工作电脑', local: false, online: true, revoked: false, capabilities: { manager: 'codex', roots: ['/path/to/a/long/path/to/project'] } }
   const app = componentHarness('./bot-form.tsx', { '@tanstack/react-router': { useNavigate: () => () => {} }, '@vibeface/client/workspace/bot-settings.ts': { folderLabels, folderSetup, projectChoices, projectKey }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({ generation: 1, nodes: [node, { ...node, device_id: 'no-agent', name: '无 Agent', capabilities: { manager: null, roots: ['/unavailable'] } }], pendingBot: null, writable: true }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName }, '@vibeface/client/workspace/questions.ts': { projectName } })
   try {
-    const projects = app.render('BotForm', { open: true, onOpenChange() {}, restoreFocus() {} }).filter(({ type, props }) => type === 'NativeSelectOption' && props.value)
-    assert.equal(projects.length, 1)
-    assert.equal(projects[0].props.children, '工作电脑 · project', 'the folder name stays readable in a narrow select')
+    const projects = app.render('BotForm', { open: true, onOpenChange() {}, restoreFocus() {} }).find(({ type }) => type === 'Select')?.props.options as { value: string; label: string }[]
+    const named = projects.filter(option => option.value !== 'arc:')
+    assert.equal(named.length, 1)
+    assert.equal(named[0].label, '工作电脑 · project', 'the folder name stays readable in a narrow select')
   } finally { app.close() }
 })
 
@@ -4259,7 +4236,7 @@ test("artifact reads retain their offset while old responses cannot append or un
 
 test("a long message of the user's folds behind an icon button; a short one does not", () => {
   const app = componentHarness('../chat/elements/message.tsx', {})
-  const toggle = (text: string) => app.render('FoldedText', { text }).find(({ type }) => type === 'button')?.props
+  const toggle = (text: string) => app.render('FoldedText', { text }).find(({ type }) => type === 'Button')?.props
   assert.equal(toggle('短消息'), undefined)
   const lines = (count: number) => Array(count).fill('一行').join('\n')
   assert.equal(toggle(lines(12)), undefined)
@@ -4274,41 +4251,45 @@ test("a long message of the user's folds behind an icon button; a short one does
   }
 })
 
-test("a toast's action is a 44px touch target on phones and stays compact on desktop", () => {
-  const app = componentHarness('../../components/app/kit.tsx', { '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') } })
-  app.render('Toaster')
-  const kit = app.module
-  ;(kit.toast as (text: string, options: object) => void)('已发出', { persist: true, action: { label: '查看', onClick() {} } })
-  const action = app.render('Toaster').find(({ props }) => props.children === '查看')?.props
-  assert.match(String(action?.className), /(^| )h-11( |$)/)
-  assert.match(String(action?.className), /md:h-7/)
+test("a toast action invokes its callback and dismisses the corresponding background notice", () => {
+  const app = componentHarness('../../components/arc/product-kit.tsx', { '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') } })
+  let opened = 0
+  try {
+    ;(app.module.toast as (text: string, options: object) => void)('已发出', { persist: true, action: { label: '查看', onClick() { opened++ } } })
+    const action = app.render('Toaster').find(({ type, props }) => type === 'Button' && props.children === '查看')
+    assert.ok(action)
+    action.props.onClick?.()
+    assert.equal(opened, 1)
+    assert.equal(app.render('Toaster').some(({ props }) => props.children === '查看'), false)
+  } finally { app.close() }
 })
 
-test("a segmented control is one Tab stop whose arrow keys move and select, wrapping at the ends", () => {
-  const app = componentHarness('../../components/app/kit.tsx', { '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') } })
-  const options = ['light', 'dark', 'system'].map((value) => ({ value, label: value }))
-  let value = 'dark', focused = -1
-  const radios = options.map((_, index) => ({ focus: () => { focused = index } }))
-  const radio = () => radios[options.findIndex((option) => option.value === value)] ?? radios[focused]
-  const render = (props: object = {}) => app.render('Segmented', { label: '外观', value, options, onChange: (next: string) => { value = next }, ...props })
-  const press = (key: string, props?: object) => {
-    let prevented = false
-    ;(render(props).find(({ props }) => props.role === 'radiogroup')?.props.onKeyDown as (event: unknown) => void)({ key, preventDefault: () => { prevented = true }, target: radio(), currentTarget: { querySelectorAll: () => radios } })
-    return prevented
-  }
-  assert.deepEqual(render().filter(({ props }) => props.role === 'radio').map(({ props }) => props.tabIndex), [-1, 0, -1])
-  assert.ok(press('ArrowRight')); assert.equal(value, 'system'); assert.equal(focused, 2)
-  press('ArrowDown'); assert.equal(value, 'light', 'wraps past the last option'); assert.equal(focused, 0)
-  press('ArrowLeft'); assert.equal(value, 'system', 'wraps past the first option')
-  press('ArrowUp'); assert.equal(value, 'dark')
-  press('Home'); assert.equal(value, 'light')
-  press('End'); assert.equal(value, 'system'); assert.equal(focused, 2)
-  assert.equal(press('Tab'), false, 'Tab leaves the group')
-  assert.equal(press('ArrowLeft', { disabled: true }), false); assert.equal(value, 'system')
-  value = 'unknown'; focused = 1
-  press('ArrowRight'); assert.equal(value, 'system', "arrows move from the focused option even when a change did not take")
-  value = 'unknown'
-  assert.deepEqual(render().filter(({ props }) => props.role === 'radio').map(({ props }) => props.tabIndex), [0, -1, -1], "with nothing checked the first option takes the Tab stop")
+test("Arc segmented control keeps one Tab stop and arrow navigation; product saving gates changes", () => {
+  const options = ['light','dark','system'].map(value => ({ value,label:value }))
+  let value = 'dark', focused = ''
+  const app = componentHarness('../../../../../packages/uiarc/src/segmented-control/segmented-control.tsx', { 'motion/react': { LayoutGroup: 'LayoutGroup', motion: { div: 'div', span: 'span' }, useReducedMotion: () => true }, '../lib/motion-tokens': { motionTokens: {} } }, { CSS: { escape: (text: string) => text } })
+  const render = () => app.render('default', { label: '外观', value, options, onValueChange: (next: string) => { value = next } })
+  try {
+    const track = render().find(({ props }) => props.ref)
+    assert.ok(track)
+    workspaceModel.record(track.props.ref).current = { querySelector: (selector: string) => ({ focus: () => { focused = selector } }) }
+    const press = (key: string) => { let prevented = false; const button = render().find(({ props }) => props['aria-pressed'] === true) ?? render().find(({ props }) => props['data-value']); (button?.props.onKeyDown as (event: unknown) => void)({ key,preventDefault: () => { prevented = true } }); return prevented }
+    assert.deepEqual(render().filter(({ props }) => props['data-value']).map(({ props }) => props.tabIndex),[-1,0,-1])
+    assert.ok(press('ArrowRight')); assert.equal(value,'system'); assert.match(focused,/system/)
+    press('ArrowRight'); assert.equal(value,'light')
+    press('ArrowLeft'); assert.equal(value,'system')
+    press('Home'); assert.equal(value,'light')
+    press('End'); assert.equal(value,'system')
+    assert.equal(press('Tab'),false)
+    value = 'unknown'
+    assert.deepEqual(render().filter(({ props }) => props['data-value']).map(({ props }) => props.tabIndex),[0,-1,-1])
+  } finally { app.close() }
+  const product = componentHarness('../../components/arc/product-kit.tsx', {})
+  try {
+    const segment = product.render('Segmented', { label: '外观',value:'dark',options,disabled:true,onChange: () => { throw new Error('saving must not submit another change') } }).find(({ props }) => props.onValueChange)
+    assert.ok(segment)
+    ;(segment.props.onValueChange as (next: string) => void)('light')
+  } finally { product.close() }
 })
 
 test('recovery restore clears submitted passwords before waiting and keeps the chosen file and name', async () => {
@@ -4845,7 +4826,7 @@ test('queued input edits and cancellation use the exact input CAS and leave the 
   }
   const app = componentHarness('./workspace-chat.tsx', {
     '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared },
-    '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error, run: async (_key: string, action: () => Promise<void>) => { try { await action() } catch (cause) { error = cause } } }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
+    '@/components/arc/product-kit': new Proxy({ useAction: () => ({ busy: null, error, run: async (_key: string, action: () => Promise<void>) => { try { await action() } catch (cause) { error = cause } } }) }, { get: (value, name) => (value as Record<string | symbol, unknown>)[name] ?? String(name) }),
   })
   const render = () => app.render('InputQueue', { target })
   const press = async (label: string) => { const button = render().find(({ type, props }) => type === 'Button' && componentText(props.children) === label); assert.ok(button && typeof button.props.onClick === 'function'); button.props.onClick(); await settleComponent() }
@@ -4877,7 +4858,7 @@ test('task detail keeps long progress collapsed by default and finished tasks ke
   const app = componentHarness('./task-detail.tsx', {
     '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' },
     '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace },
-    '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: (_kind: string, action: () => Promise<void>) => action() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) }),
+    '@/components/arc/product-kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: (_kind: string, action: () => Promise<void>) => action() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) }),
     '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
     '@vibeface/client/workspace/labels.ts': taskLabels,
     '@vibeface/client/lib/errors.ts': errors,
@@ -4915,7 +4896,7 @@ test('unknown task detail reads its exact work without starting a Main request a
   const app = componentHarness('./task-detail.tsx', {
     '@tanstack/react-router': { useNavigate: () => () => { navigated = true }, Link: 'Link' },
     '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace },
-    '@/components/app/kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: (_kind: string, action: () => Promise<void>) => action() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) }),
+    '@/components/arc/product-kit': new Proxy({ useAction: () => ({ busy: null, error: null, run: (_kind: string, action: () => Promise<void>) => action() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) }),
     '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
     '@vibeface/client/workspace/labels.ts': taskLabels,
     '@vibeface/client/lib/errors.ts': errors,
@@ -5128,16 +5109,16 @@ test('a missing native or web recovery copy never enables external-save confirma
       '@vibeface/client/identity/copy.ts': { recoveryCopy: { why: '', onlyCopy: '', keptApart: '文件和密码分开保存' } },
       '@vibeface/client/lib/secure.ts': { recoveryFileStem: (code: string) => code },
       '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
-      '@/components/app/kit': { claimFocus() {}, InlineError: 'InlineError' },
+      '@/components/arc/product-kit': { claimFocus() {}, InlineError: 'InlineError' },
     }, {}, path.includes('/mobile/') ? 'SaveRecoveryFile' : '')
     try {
       const missing = app.render(name, { code: 'ABCDEF12', saved: false, onSaved() {} })
-      const confirmation = missing.find(({ props }) => props.type === 'checkbox' || props.accessibilityLabel === '文件和密码分开保存')
+      const confirmation = missing.find(({ props }) => props.type === 'checkbox' || props['aria-label'] === '文件和密码分开保存' || props.accessibilityLabel === '文件和密码分开保存')
       assert.equal(confirmation?.props.disabled, true)
       const handed = app.render(name, { code: 'ABCDEF12', saved: false, onSaved() {}, [saveProp]: { done: true, run() {} } })
-      assert.equal(handed.find(({ props }) => props.type === 'checkbox' || props.accessibilityLabel === '文件和密码分开保存')?.props.disabled, false)
+      assert.equal(handed.find(({ props }) => props.type === 'checkbox' || props['aria-label'] === '文件和密码分开保存' || props.accessibilityLabel === '文件和密码分开保存')?.props.disabled, false)
       const confirmed = app.render(name, { code: 'ABCDEF12', saved: true, onSaved() {} })
-      assert.equal(confirmed.find(({ props }) => props.type === 'checkbox' || props.accessibilityLabel === '文件和密码分开保存')?.props.disabled, false)
+      assert.equal(confirmed.find(({ props }) => props.type === 'checkbox' || props['aria-label'] === '文件和密码分开保存' || props.accessibilityLabel === '文件和密码分开保存')?.props.disabled, false)
     } finally { app.close() }
   }
 })
@@ -5210,12 +5191,12 @@ test('the native switch confirmation fixes the decoded entry and never erases fo
     assert.ok(typeof cancel === 'function'); cancel()
     assert.equal(canceled, 1); assert.equal(erased, 0)
     url = 'vibeface://join/vibeface1different'
-    const changed = app.render('default').find(({ props }) => props.variant === 'destructive')?.props
+    const changed = app.render('default').find(({ props }) => props.variant === 'danger')?.props
     assert.equal(changed?.disabled, true)
     assert.ok(typeof changed?.onPress === 'function'); changed.onPress(); await settleComponent()
     assert.equal(erased, 0); assert.equal(failures.length, 1)
     url = link
-    const confirmed = app.render('default').find(({ props }) => props.variant === 'destructive')?.props
+    const confirmed = app.render('default').find(({ props }) => props.variant === 'danger')?.props
     assert.equal(confirmed?.disabled, false)
     assert.ok(typeof confirmed?.onPress === 'function'); confirmed.onPress(); await settleComponent()
     assert.equal(erased, 1); assert.deepEqual(kept, [link])
@@ -5261,10 +5242,10 @@ test('the Web chat keeps the first visible identity and offset through older pag
   const view = { scrollTop: 200, scrollHeight: 1000, clientHeight: 200, getBoundingClientRect: () => ({ top: 0 }),
     querySelectorAll: () => positions.map((item) => ({ dataset: { historyKey: item.key }, getBoundingClientRect: () => ({ top: item.top - view.scrollTop, bottom: item.top + 100 - view.scrollTop }) })), querySelector: () => ({}),
   }
-  const chat = componentHarness('../chat/elements/chat.tsx', { '@vibeface/client/chat/timeline.ts': { messageTimes }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') } }, { ResizeObserver: class { observe() {} disconnect() {} }, matchMedia: () => ({ matches: true }) })
+  const chat = componentHarness('../../components/arc/conversation-thread.tsx', { '@vibeface/client/chat/timeline.ts': { messageTimes }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') } }, { ResizeObserver: class { observe() {} disconnect() {} }, matchMedia: () => ({ matches: true }) })
   const render = (keys: string[]) => chat.render('Chat', { entries: keys.map(row), empty: null })
   try {
-    const viewport = render(['one', 'two', 'three']).find((element) => element.type === 'MessageScrollerViewport')
+    const viewport = render(['one', 'two', 'three']).find((element) => element.type === 'div' && element.props.role === 'log')
     assert.ok(viewport)
     workspaceModel.record(viewport.props.ref).current = view
     assert.equal(typeof viewport.props.onScroll, 'function')
@@ -5272,13 +5253,13 @@ test('the Web chat keeps the first visible identity and offset through older pag
     positions = [{ key: 'older', top: 0 }, { key: 'one', top: 150 }, { key: 'two', top: 350 }, { key: 'three', top: 550 }]
     let elements = render(['older', 'one', 'two', 'three'])
     assert.equal(view.scrollTop, 350)
-    assert.equal(elements.find((element) => element.type === 'MessageScrollerProvider')?.props.autoScroll, false)
+    assert.equal(elements.some((element) => element.type === 'Button' && element.props['aria-label'] === '回到最新消息'), true)
     positions.push({ key: 'pushed', top: 750 }); view.scrollHeight = 1200
     render(['older', 'one', 'two', 'three', 'pushed'])
     assert.equal(view.scrollTop, 350)
     positions = positions.map((item) => item.key === 'two' || item.key === 'three' || item.key === 'pushed' ? { ...item, top: item.top + 40 } : item)
     elements = render(['older', 'one', 'two', 'three', 'pushed'])
     assert.equal(view.scrollTop, 390)
-    assert.equal(elements.find((element) => element.type === 'MessageScrollerProvider')?.props.autoScroll, false)
+    assert.equal(elements.some((element) => element.type === 'Button' && element.props['aria-label'] === '回到最新消息'), true)
   } finally { chat.close() }
 })
