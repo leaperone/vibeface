@@ -124,6 +124,114 @@ fn scoped(command: Command) -> (u64, Command) {
     }
 }
 
+fn task_actions_fixture() -> Snapshot {
+    let mut snapshot = fixture();
+    snapshot.tasks = vec![
+        ui::Task {
+            task_id: "task-a".into(),
+            title: "Other task".into(),
+            revision: 3,
+            ..Default::default()
+        },
+        ui::Task {
+            task_id: "task-b".into(),
+            owner_bot: "bot-b".into(),
+            title: "Beta task".into(),
+            request: "首行\nBeta request".into(),
+            expected_result: "Beta result\n末行".into(),
+            dependencies: vec!["task-a".into(), "task-c".into()],
+            revision: 9,
+            ..Default::default()
+        },
+    ];
+    snapshot
+}
+
+#[gpui_kit::test]
+fn task_list_and_detail_controls_send_the_exact_task_revision(cx: &mut TestAppContext) {
+    use vibeface_protocol::workspace::{TaskAction, WorkspaceCommand};
+    for (route, prefix) in [
+        (Route::Tasks, "task-task-b-"),
+        (Route::Task("task-b".into()), ""),
+    ] {
+        let mut h = open(cx, route, task_actions_fixture());
+        cx.simulate_window_resize(
+            h.window,
+            gpui_kit::size(gpui_kit::px(1100.), gpui_kit::px(1800.)),
+        );
+        for (label, action) in [
+            ("继续", TaskAction::Continue),
+            ("停止", TaskAction::Stop),
+            ("延后", TaskAction::Defer),
+            ("取消", TaskAction::Cancel),
+        ] {
+            click(&h, cx, &format!("{prefix}{label}"));
+            let (generation, command) = scoped(h.commands.try_recv().expect("task control"));
+            assert_eq!(generation, 7);
+            let Command::Workspace(command) = command else {
+                panic!("task control must send a workspace command");
+            };
+            assert_eq!(
+                command,
+                WorkspaceCommand::ControlTask {
+                    task_id: "task-b".into(),
+                    expected_revision: 9,
+                    action,
+                }
+            );
+            assert!(h.commands.try_recv().is_err());
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn task_list_and_detail_edit_prefill_and_save_only_supported_fields(cx: &mut TestAppContext) {
+    use views::forms::Editor;
+    for (route, editor_id) in [
+        (Route::Tasks, "revise-task-b"),
+        (Route::Task("task-b".into()), "task-revise"),
+    ] {
+        let mut h = open(cx, route, task_actions_fixture());
+        cx.simulate_window_resize(
+            h.window,
+            gpui_kit::size(gpui_kit::px(1100.), gpui_kit::px(1800.)),
+        );
+        click(&h, cx, editor_id);
+        h.view.read_with(cx, |view, cx| {
+            let form = view.form.as_ref().expect("task editor");
+            assert!(matches!(&form.editor, Editor::EditTask(id, 9) if id == "task-b"));
+            assert_eq!(form.generation, 7);
+            assert_eq!(
+                form.fields
+                    .iter()
+                    .map(|field| field.key)
+                    .collect::<Vec<_>>(),
+                ["request", "expected_result", "dependencies"]
+            );
+            let values = form.values(cx);
+            assert_eq!(values["request"], "首行\nBeta request");
+            assert_eq!(values["expected_result"], "Beta result\n末行");
+            assert_eq!(values["dependencies"], "task-a,task-c");
+            assert_eq!(values.len(), 4);
+            assert!(!values["_submission_id"].is_empty());
+        });
+        assert!(h.commands.try_recv().is_err());
+        click(&h, cx, "save-form");
+        let (generation, command) = scoped(h.commands.try_recv().expect("save task revision"));
+        assert_eq!(generation, 7);
+        let Command::Save { editor, values, .. } = command else {
+            panic!("task editor must send a save command");
+        };
+        assert!(matches!(editor, Editor::EditTask(id, 9) if id == "task-b"));
+        assert_eq!(values["request"], "首行\nBeta request");
+        assert_eq!(values["expected_result"], "Beta result\n末行");
+        assert_eq!(values["dependencies"], "task-a,task-c");
+        assert_eq!(values.len(), 4);
+        assert!(!values["_submission_id"].is_empty());
+        assert!(h.commands.try_recv().is_err());
+    }
+}
+
 #[gpui_kit::test]
 fn explicit_task_selection_routes_to_its_owner_not_the_open_bot(cx: &mut TestAppContext) {
     let mut snapshot = fixture();
