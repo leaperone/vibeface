@@ -24,12 +24,13 @@ const MAX_QUEUED = 100
 
 const bytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length
 
-/** Shrinks a record until the device accepts it: fields first, then the message. */
+/** Shrinks fields first, then the message; rejects records still over budget after the message is exhausted. */
 export function fit(record: WebRecord): WebRecord {
   if (bytes(record) <= MAX_RECORD_BYTES) return record
   let fitted: WebRecord = { ...record, fields: record.fields && { truncated: true } }
   let message = record.message
   while (bytes(fitted) > MAX_RECORD_BYTES) {
+    if (!message.length) throw new Error("Log record exceeds size limit.")
     message = message.slice(0, Math.floor(message.length * 0.8))
     fitted = { ...fitted, message: `${message}…` }
   }
@@ -72,7 +73,8 @@ export function createReporter() {
   }
   return {
     report(record: WebRecord) {
-      queue.push(fit(record))
+      // Malformed records are dropped without interrupting the action being reported.
+      try { queue.push(fit(record)) } catch { return }
       if (queue.length > MAX_QUEUED) queue.splice(0, queue.length - MAX_QUEUED)
       schedule()
     },
