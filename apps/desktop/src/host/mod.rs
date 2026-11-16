@@ -8,6 +8,8 @@ mod fixture_rustc;
 mod fixture_rustc_tests;
 pub(crate) mod lifecycle;
 mod model;
+#[cfg(test)]
+mod native_tests;
 mod operator;
 pub mod platform;
 pub mod profiles;

@@ -1,8 +1,5 @@
-use vibeface_desktop::host;
-mod support {
-    pub mod rustc;
-}
-use support::rustc as fixture_rustc;
+use super::fixture_rustc;
+use crate::host;
 
 use anyhow::{Context, Result, bail};
 use host::{
@@ -421,7 +418,11 @@ async fn killing_the_synthetic_gui_parent_delivers_eof_to_only_its_owned_child()
         .initialize()
         .context("provision private parent-death Node fixture")?;
     let mut parent = tokio::process::Command::new(std::env::current_exe()?)
-        .args(["--exact", "native_host_parent_fixture", "--nocapture"])
+        .args([
+            "--exact",
+            "host::native_tests::native_host_parent_fixture",
+            "--nocapture",
+        ])
         .env("VF_NATIVE_HOST_SYNTHETIC_PARENT", &fixture.root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
