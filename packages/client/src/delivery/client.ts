@@ -84,7 +84,7 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
         if (previous?.intent_id !== intentId(restartIntentId)) throw new Error('再次发送须选择原订单相同的文件和条款；已有新的一次请先点“检查进度”。')
         const observed = await findIntent(restartIntentId)
         if (!observed || !canRestart(observed)) throw new Error('原来那次发送还没结束。先查看原订单，不会另付一笔。')
-        if (observed.mode !== draft.mode || observed.acceptance !== draft.acceptance || observed.receiver_peer !== params.receiver_peer || observed.provider_peer !== params.provider_peer
+        if (observed.mode !== draft.mode || observed.receiver_peer !== params.receiver_peer || observed.provider_peer !== params.provider_peer
           || observed.name !== name || observed.sha256 !== digest || observed.bytes !== file.size) throw new Error('原来那次发送的文件或条款对不上，不能创建新订单。')
         if (pending(fingerprint)?.intent_id !== previous.intent_id) throw new Error('这个文件的发送记录已在另一处更新，请先刷新并查看原订单。')
       }
@@ -97,7 +97,7 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
       catch { throw new Error('无法保存这次发送记录，尚未提交。请允许保存本地数据后重试。') }
       const order = parseOrder(await request('prepare', { ...params, intent_id: intent.intent_id, content_base64: toBase64(bytes) }))
       if (order.intent_id !== intent.intent_id || order.role !== 'sender' || order.source_peer !== status.node_peer || order.receiver_peer !== params.receiver_peer || order.provider_peer !== params.provider_peer
-        || order.mode !== draft.mode || order.acceptance !== draft.acceptance || order.name !== name || order.sha256 !== digest || order.bytes !== file.size
+        || order.mode !== draft.mode || order.name !== name || order.sha256 !== digest || order.bytes !== file.size
         || order.payment.budget_id !== params.budget_id || BigInt(order.payment.total) > BigInt(params.max_service_amount) || BigInt(order.payment.gas_cap) > BigInt(params.max_gas_amount)) throw new Error('设备返回的订单与本次选择不一致，未确认付款。请先查看原订单。')
       return order
     },

@@ -3,7 +3,7 @@ import { BusyIcon,Details,EmptyState,InlineError,Segmented,useAction } from '@/c
 import { terms } from '@/lib/glossary'
 import { webPlatform } from '@/lib/platform'
 import { useDelivery } from '@vibeface/client/delivery/client.ts'
-import { canRestart,changeMode,deadlineRows,evidenceLabels,modeOptions,orderActions,orderHeading,orderStatus,orderSummary,orderTitle,providerChoices,publicationLabel,receiverChoices,receivingBatches,settlementAmountsLabel,sizeLabel,transferCopy,walletNotice } from '@vibeface/client/delivery/model.ts'
+import { canRestart,deadlineRows,evidenceLabels,modeOptions,orderActions,orderHeading,orderStatus,orderSummary,orderTitle,providerChoices,publicationLabel,receiverChoices,receivingBatches,settlementAmountsLabel,sizeLabel,transferCopy,walletNotice } from '@vibeface/client/delivery/model.ts'
 import { transferSelection,type DeliveryDraft,type DeliveryOrder,type DeliverySettings,type TransferFile } from '@vibeface/client/delivery/types.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { messageOf } from '@vibeface/client/lib/node.ts'
@@ -98,7 +98,7 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
             </Button>
           </li>)}</ul> : null}
           <FieldNote>{transferCopy.providerHint}</FieldNote></FormField>
-        <Segmented label="传输方式" value={draft.mode} options={modeOptions} labels disabled={working} onChange={mode => setDraft(changeMode(draft, mode))} />
+        <Segmented label="传输方式" value={draft.mode} options={modeOptions} labels disabled={working} onChange={mode => setDraft({ ...draft, mode })} />
         {draft.mode === 'paid' ? <>
           <p className="text-sm text-secondary">{transferCopy.protected}</p>
           <FormField>

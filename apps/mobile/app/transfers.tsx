@@ -7,7 +7,7 @@ import { View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useDelivery } from '@vibeface/client/delivery/client.ts'
-import { canRestart, changeMode, deadlineRows, draftFor, evidenceLabels, modeOptions, orderActions, orderHeading, orderStatus, orderSummary, orderTitle, publicationLabel, receiverChoices, receivingBatches, settlementAmountsLabel, sizeLabel, transferCopy, walletNotice } from '@vibeface/client/delivery/model.ts'
+import { canRestart, deadlineRows, draftFor, evidenceLabels, modeOptions, orderActions, orderHeading, orderStatus, orderSummary, orderTitle, publicationLabel, receiverChoices, receivingBatches, settlementAmountsLabel, sizeLabel, transferCopy, walletNotice } from '@vibeface/client/delivery/model.ts'
 import { transferSelection, type DeliveryDraft, type DeliveryOrder, type DeliverySettings, type TransferFile } from '@vibeface/client/delivery/types.ts'
 import { useExperiments } from '@vibeface/client/lib/experiments.ts'
 import { ErrorText } from '@/components/action'
@@ -103,7 +103,7 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
           <Details label={transferCopy.otherDevice} open={!picked && Boolean(draft.receiver_peer)}>{receiverId}</Details>
         </View> : receiverId}
         <InputField label={transferCopy.provider} hint={transferCopy.providerHint} value={draft.provider_peer} disabled={working} onChange={provider_peer => setDraft({ ...draft, provider_peer })} peer />
-        {paid ? <Segmented options={modeOptions} value={draft.mode} disabled={working} onChange={mode => setDraft(changeMode(draft, mode))} /> : null}
+        {paid ? <Segmented options={modeOptions} value={draft.mode} disabled={working} onChange={mode => setDraft({ ...draft, mode })} /> : null}
         {sending.mode === 'paid' ? <>
           <Text className="text-sm text-muted">{transferCopy.protected}</Text>
           <Text className="text-sm font-medium">预付预算</Text>

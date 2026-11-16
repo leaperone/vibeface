@@ -4,7 +4,7 @@ import test from 'node:test'
 import type { ReadyConnection } from '../lib/node.ts'
 import type { Platform } from '../lib/platform.ts'
 import { createDeliveryClient } from './client.ts'
-import { amount, canRead, canRestart, changeMode, checkedFile, draftFor, fromBase64, orderActions, orderSummary, orderTitle, parseBudgets, parseOrder, parseReceived, parseStatus, publicationLabel, providerChoices, receiverChoices, receivingBatches, settlementAmountsLabel, sha256, sizeLabel, toBase64, walletNotice } from './model.ts'
+import { amount, canRead, canRestart, checkedFile, draftFor, fromBase64, orderActions, orderSummary, orderTitle, parseBudgets, parseOrder, parseReceived, parseStatus, publicationLabel, providerChoices, receiverChoices, receivingBatches, settlementAmountsLabel, sha256, sizeLabel, toBase64, walletNotice } from './model.ts'
 import type { DeliveryDraft, DeliveryOrder, DeliveryStatus } from './types.ts'
 
 const source = '11'.repeat(32), receiver = '22'.repeat(32), provider = '33'.repeat(32)
@@ -191,6 +191,55 @@ test('a lost prepare response reuses its persisted intent and confirm submits on
   assert.deepEqual(calls[2], { op: 'confirm', intent_id: prepared.intent_id })
 })
 
+test('recoverable preparation preserves exact wire bytes, saved fingerprints and confirmation ids in both modes', async () => {
+  for (const mode of ['charity', 'paid'] satisfies DeliveryDraft['mode'][]) {
+    const paid = mode === 'paid'
+    const fingerprint = paid ? '0381cb0459e5a0dce80dc0a232bee292930d47ab172b0ff8dee6745d63ea9b6f' : 'e4d2ac185fb4490bd606a5ba49f715bed1df4b5a85ffd888c0ac06f127f34eec'
+    const key = `vibeface.delivery.network.client.${source}.intent.${fingerprint}`
+    const saved = JSON.stringify({ intent_id: uuid, fingerprint })
+    const writes: [string, string][] = [], calls: Record<string, unknown>[] = []
+    const storage = {
+      getItem: (requested: string) => { assert.equal(requested, key); return saved },
+      setItem: (requested: string, value: string) => { writes.push([requested, value]) },
+    }
+    const expected = {
+      op: 'prepare', receiver_peer: receiver, provider_peer: provider, mode, acceptance: 'recoverable',
+      name: 'example.txt', max_service_amount: paid ? '9007199254740993' : '0', max_gas_amount: '0', budget_id: paid ? '88'.repeat(32) : null,
+      intent_id: uuid, content_base64: 'YSBmaWxlIHRoZSByZWNlaXZlciBjYW4gcmVjb3Zlcg==',
+    }
+    const client = createDeliveryClient(connection(async (_method, params = {}) => { calls.push(params); return paid ? paidOrder() : order() }), storage)
+    const prepared = await client.prepare({ ...draft, mode, max_service_amount: expected.max_service_amount, budget_id: expected.budget_id }, file, { ...status, paid_enabled: true })
+    assert.equal(JSON.stringify(calls[0]), JSON.stringify(expected))
+    assert.deepEqual(writes, [[key, saved], [`vibeface.delivery.network.client.${source}.recent`, uuid]])
+    await client.confirm(prepared)
+    assert.deepEqual(calls[1], { op: 'confirm', intent_id: uuid })
+  }
+})
+
+test('untyped strict drafts are rejected before reading the file, persisting an intent or sending a request', async () => {
+  const forbidden = () => { throw new Error('unsupported acceptance must stop before side effects') }
+  const client = createDeliveryClient(connection(async () => forbidden()), { getItem: forbidden, setItem: forbidden })
+  for (const mode of ['charity', 'paid']) {
+    const externalDraft: unknown = { ...draft, mode, acceptance: 'strict', budget_id: '88'.repeat(32) }
+    await assert.rejects(async () => {
+      await Reflect.apply(client.prepare, client, [externalDraft, { ...file, arrayBuffer: forbidden }, { ...status, paid_enabled: true }])
+    }, mode === 'charity' ? /免费传输不能选/ : /Strict/)
+    const projected: unknown = Reflect.apply(draftFor, undefined, [externalDraft, false])
+    await assert.rejects(async () => {
+      await Reflect.apply(client.prepare, client, [projected, { ...file, arrayBuffer: forbidden }, status])
+    }, /免费传输不能选/)
+  }
+})
+
+test('strict prepare and confirm wire responses remain rejected in both delivery modes', async () => {
+  for (const mode of ['charity', 'paid'] satisfies DeliveryDraft['mode'][]) {
+    const original = mode === 'paid' ? paidOrder() : order()
+    const client = createDeliveryClient(connection(async (_method, params = {}) => ({ ...original, intent_id: params.intent_id, acceptance: 'strict' })), { getItem: () => null, setItem: () => {} })
+    await assert.rejects(client.prepare({ ...draft, mode, max_service_amount: original.payment.total, budget_id: original.payment.budget_id }, file, { ...status, paid_enabled: true }), /无法识别/)
+    await assert.rejects(client.confirm(original), /无法识别/)
+  }
+})
+
 test('a local session cannot configure or confirm and storage failure prevents prepare submission', async () => {
   let calls = 0
   const transport = connection(async () => { calls += 1; return order() })
@@ -204,12 +253,7 @@ test('a local session cannot configure or confirm and storage failure prevents p
   assert.equal(calls, 0)
 })
 
-test('charity resets strict mode and rejects every financial or strong proof field at the shared boundary', async () => {
-  assert.equal(changeMode({ ...draft, mode: 'paid', acceptance: 'strict' }, 'charity').acceptance, 'recoverable')
-  let calls = 0
-  const client = createDeliveryClient(connection(async () => { calls += 1; return order() }), { getItem: () => null, setItem: () => { throw new Error('must not store a strict charity intent') } })
-  await assert.rejects(client.prepare({ ...draft, acceptance: 'strict' }, file, status), /免费传输不能选/)
-  assert.equal(calls, 0)
+test('charity rejects strict acceptance and every financial or strong proof field at the shared wire boundary', () => {
   assert.throws(() => parseOrder({ ...order(), acceptance: 'strict' }))
   for (const field of ['chain_id', 'asset', 'payer', 'provider_wallet', 'tx_hash']) assert.throws(() => parseOrder({ ...order(), payment: { ...order().payment, [field]: field === 'chain_id' ? '31337' : field === 'tx_hash' ? `0x${'88'.repeat(32)}` : `0x${'88'.repeat(20)}` } }))
   for (const field of ['delivery_fee', 'reservation_fee', 'priority_fee', 'total', 'gas_cap', 'earned', 'withdrawn', 'refunded']) assert.throws(() => parseOrder({ ...order(), payment: { ...order().payment, [field]: '1' } }))
@@ -325,8 +369,8 @@ test('a record reads as file name and one plain line, and offers only what this 
 })
 
 test('without 实验功能 a send is free whatever mode the draft last held', () => {
-  const paid: DeliveryDraft = { receiver_peer: receiver, provider_peer: provider, mode: 'paid', acceptance: 'strict', max_service_amount: '5', max_gas_amount: '7', budget_id: '88'.repeat(32) }
-  assert.deepEqual(draftFor(paid, false), { ...paid, mode: 'charity', acceptance: 'recoverable' })
+  const paid: DeliveryDraft = { receiver_peer: receiver, provider_peer: provider, mode: 'paid', acceptance: 'recoverable', max_service_amount: '5', max_gas_amount: '7', budget_id: '88'.repeat(32) }
+  assert.deepEqual(draftFor(paid, false), { ...paid, mode: 'charity' })
   assert.equal(draftFor(paid, true), paid)
 })
 
@@ -350,14 +394,13 @@ test('protected budgets enforce exact conservation and fixed roles at the shared
   assert.throws(() => parseOrder({ ...paidOrder(), acceptance: 'strict' }))
 })
 
-test('protected preparation rejects missing budgets or Strict before any request; a two-order confirmation preserves both exact authorizations', async () => {
+test('protected preparation rejects missing budgets before any request; a two-order confirmation preserves both exact authorizations', async () => {
   let requests = 0
   const a = paidOrder(), b = { ...paidOrder(), order_id: '99'.repeat(32), intent_id: '00000000-0000-4000-8000-000000000002' }
   const client = createDeliveryClient(connection(async (_method, params = {}) => { requests++; assert.equal(params.op, 'confirm_batch'); return { orders: [a, b].map(order => ({ ...order, phase: 'funding_pending' })) } }),
     { getItem: () => null, setItem: () => {} })
   const paidStatus: DeliveryStatus = { ...status, paid_enabled: true }
   await assert.rejects(client.prepare({ ...draft, mode: 'paid' }, file, paidStatus), /预付预算/)
-  await assert.rejects(client.prepare({ ...draft, mode: 'paid', budget_id: a.payment.budget_id, acceptance: 'strict' }, file, paidStatus), /Strict/)
   assert.equal(requests, 0)
   const confirmed = await client.confirmBatch([a, b])
   assert.equal(confirmed.length, 2); assert.equal(confirmed[0].payment.budget_id, a.payment.budget_id); assert.equal(requests, 1)
