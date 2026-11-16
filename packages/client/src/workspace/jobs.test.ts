@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { parseHistoryPage } from './model.ts'
+import { mergeOwnerJobs, parseHistoryPage } from './model.ts'
 
 function managerJob(value: unknown) {
   const page = parseHistoryPage({ conversation_id: 'chat', history_authority: 'owner', section: 'jobs',
@@ -10,6 +10,22 @@ function managerJob(value: unknown) {
 }
 
 const job = { trigger: 'message:input', scope: { kind: 'main' }, state: 'steered' }
+
+test('owner jobs retain source order and duplicates while preferring the reachable owner', () => {
+  const local = [{ trigger: 'same', label: 'local-first' }, { trigger: 'local', label: 'local-only-first' }, { trigger: 'same', label: 'local-last' }, { trigger: 'local', label: 'local-only-last' }]
+  const remote = [{ trigger: 'remote', label: 'remote-only-first' }, { trigger: 'same', label: 'remote-first' }, { trigger: 'remote', label: 'remote-only-last' }, { trigger: 'same', label: 'remote-last' }]
+  assert.deepEqual(mergeOwnerJobs(local, remote, true).map((item) => item.label), [
+    'remote-only-first', 'remote-first', 'remote-only-last', 'remote-last', 'local-only-first', 'local-only-last',
+  ])
+  assert.deepEqual(mergeOwnerJobs(local, remote, false).map((item) => item.label), [
+    'local-first', 'local-only-first', 'local-last', 'local-only-last', 'remote-only-first', 'remote-only-last',
+  ])
+  assert.deepEqual(mergeOwnerJobs([], remote, false), remote)
+  assert.deepEqual(mergeOwnerJobs(local, [], true), local)
+  assert.deepEqual(mergeOwnerJobs([], [], true), [])
+  assert.deepEqual(local.map((item) => item.label), ['local-first', 'local-only-first', 'local-last', 'local-only-last'])
+  assert.deepEqual(remote.map((item) => item.label), ['remote-only-first', 'remote-first', 'remote-only-last', 'remote-last'])
+})
 
 test('steered jobs accept only the protocol outcomes', () => {
   for (const outcome of ['answered', 'unfinished', 'unknown']) {
