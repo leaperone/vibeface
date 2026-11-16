@@ -279,15 +279,114 @@ async fn the_cli_client_governs_a_node_that_checks_every_signature() -> Result<(
             },
         )
         .await?;
+        let backup_path = second_recovery.backup_path().to_owned();
+        let backup = std::fs::read(&backup_path)?;
         second_recovery.submit(&mut rescuer).await?;
-        session.settle_recovery(true).await?;
-        second_recovery.reconcile(&mut rescuer).await?;
-        assert_eq!(second_recovery.state(),client::IdentityOperationState::Applied);
-        second_recovery.discard()?;
-        let view = view().await?;
-        assert!(view.pending.is_none());
-        assert!(view.member(&rescuer_id)?.manage);
-        assert!(view.member(&admin_id)?.manage);
+        let submitted_state = node.membership_state().await?;
+        let checkpoint = submitted_state
+            .checkpoints
+            .last()
+            .context("submitted recovery")?
+            .clone();
+        assert_eq!(checkpoint.epoch, 3);
+        let checkpoint_hash = checkpoint.hash()?;
+        let approval = session.settle_recovery(true).await?;
+        let approved_state: vibeface_secure::membership::NetworkState =
+            serde_json::from_value(approval["state"].clone())?;
+        assert_eq!(approved_state.genesis, submitted_state.genesis);
+        assert_eq!(approved_state.checkpoints, submitted_state.checkpoints);
+        assert_eq!(approved_state.checkpoints.len(), checkpoint_count + 1);
+        assert_eq!(
+            approved_state.events.len(),
+            submitted_state.events.len() + 1
+        );
+        assert!(
+            submitted_state
+                .events
+                .iter()
+                .all(|event| approved_state.events.contains(event))
+        );
+        let approvals: Vec<_> = approved_state
+            .events
+            .iter()
+            .filter_map(|event| match &event.action {
+                vibeface_secure::membership::GovernanceAction::Approve { checkpoint, at_ms }
+                    if checkpoint == &checkpoint_hash =>
+                {
+                    Some((event, *at_ms))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(approvals.len(), 1);
+        let (approval_event, approved_at) = approvals[0];
+        assert_eq!(approval_event.issuer, admin_id);
+        // Signed history takes effect at its approval time, independently of later wall-clock samples.
+        let approved_view = approved_state.project_at(approved_at)?;
+        assert_eq!(approved_view.epoch, 3);
+        assert!(approved_view.pending.is_none());
+        assert!(approved_view.member(&rescuer_id)?.manage);
+        assert!(approved_view.member(&admin_id)?.manage);
+
+        let receipt = second_recovery.reconcile(&mut rescuer).await?;
+        assert_eq!(receipt["network_id"], approved_state.genesis.network_id);
+        let expected = if receipt["state"].is_null() {
+            assert_eq!(
+                receipt["recovery"],
+                json!({
+                    "status":"waiting", "checkpoint_hash":checkpoint_hash, "effective_at_ms":approved_at
+                })
+            );
+            assert!(receipt["now_ms"].as_u64().context("waiting receipt time")? < approved_at);
+            client::IdentityOperationState::Recorded
+        } else {
+            let receipt_state: vibeface_secure::membership::NetworkState =
+                serde_json::from_value(receipt["state"].clone())?;
+            assert_eq!(receipt_state, approved_state);
+            let now = receipt["now_ms"]
+                .as_u64()
+                .context("recovery receipt time")?;
+            let receipt_view = receipt_state.project_at(now)?;
+            assert_eq!(receipt["view"], serde_json::to_value(&receipt_view)?);
+            if now < approved_at {
+                assert_eq!(receipt_view.epoch, 1);
+                let pending = receipt_view.pending.context("waiting approved recovery")?;
+                assert_eq!(pending.checkpoint, checkpoint_hash);
+                assert_eq!(pending.effective_at_ms, approved_at);
+                client::IdentityOperationState::Recorded
+            } else {
+                assert_eq!(receipt_view.epoch, 3);
+                assert!(receipt_view.pending.is_none());
+                assert!(receipt_view.member(&rescuer_id)?.manage);
+                assert!(receipt_view.member(&admin_id)?.manage);
+                client::IdentityOperationState::Applied
+            }
+        };
+        assert_eq!(second_recovery.state(), expected);
+        if expected == client::IdentityOperationState::Applied {
+            second_recovery.discard()?;
+            assert!(!client::IdentityPlan::exists(&rescuer));
+        } else {
+            let journal_path = dir.join("rescuer").join("identity-operation.json");
+            let journal = std::fs::read(&journal_path)?;
+            let metadata = serde_json::to_value(
+                client::IdentityPlan::inspect(&rescuer, PASSWORD)?
+                    .context("recorded recovery metadata")?,
+            )?;
+            drop(second_recovery);
+            assert!(client::IdentityPlan::discard_saved(&rescuer, PASSWORD).is_err());
+            assert!(!client::IdentityPlan::discard_applied(&rescuer, PASSWORD)?);
+            assert_eq!(std::fs::read(&journal_path)?, journal);
+            assert_eq!(
+                serde_json::to_value(
+                    client::IdentityPlan::inspect(&rescuer, PASSWORD)?
+                        .context("retained recovery metadata")?
+                )?,
+                metadata
+            );
+            assert!(client::IdentityPlan::exists(&rescuer));
+        }
+        assert_eq!(std::fs::read(&backup_path)?, backup);
         Ok(())
     }
     .await;

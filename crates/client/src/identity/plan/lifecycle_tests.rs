@@ -157,6 +157,82 @@ fn saved_discard_preserves_unknown_and_recorded_until_a_stopped_receipt() -> Res
 }
 
 #[test]
+fn approved_recovery_receipts_follow_the_signed_activation_boundary() -> Result<()> {
+    for (offset, waiting_summary, expected) in [
+        (-1_i64, false, IdentityOperationState::Recorded),
+        (-1, true, IdentityOperationState::Recorded),
+        (0, false, IdentityOperationState::Applied),
+        (1, false, IdentityOperationState::Applied),
+    ] {
+        let (dir, mut key, mut plan, mut state, _) =
+            saved_plan_fixture(IdentityPlanKind::Recovery)?;
+        let checkpoint = state.checkpoints[0].clone();
+        let hash = checkpoint.hash()?;
+        let approved_at = checkpoint.issued_at_ms + 1;
+        state.append(
+            GovernanceEvent::unsigned(
+                &state.project_at(checkpoint.issued_at_ms)?,
+                key.device_id(),
+                GovernanceAction::Approve {
+                    checkpoint: hash.clone(),
+                    at_ms: approved_at,
+                },
+            )?
+            .sign(&key.identity)?,
+        )?;
+        let receipt_at = approved_at
+            .checked_add_signed(offset)
+            .context("receipt time")?;
+        let view = state.project_at(receipt_at)?;
+        if offset < 0 {
+            assert_eq!(view.epoch, 1);
+            let pending = view
+                .pending
+                .context("approved recovery is not active yet")?;
+            assert_eq!(pending.checkpoint, hash);
+            assert_eq!(pending.effective_at_ms, approved_at);
+        } else {
+            assert_eq!(view.epoch, 2);
+            assert!(view.pending.is_none());
+            assert!(view.client(key.device_id())?.manage);
+        }
+        let request = plan.plan.request_bytes.clone();
+        let backup_path = plan.backup_path().to_owned();
+        let backup = std::fs::read(&backup_path)?;
+        let receipt = if waiting_summary {
+            json!({
+                "network_id":state.genesis.network_id,
+                "recovery":{"status":"waiting","checkpoint_hash":hash,"effective_at_ms":approved_at}
+            })
+        } else {
+            json!({"network_id":state.genesis.network_id,"state":state,"now_ms":receipt_at})
+        };
+        plan.record_receipt(&mut key, &receipt)?;
+        assert_eq!(plan.state(), expected);
+        assert_eq!(plan.plan.request_bytes, request);
+        assert_eq!(plan.plan.checkpoint.as_ref(), Some(&checkpoint));
+        assert_eq!(std::fs::read(&backup_path)?, backup);
+        drop(plan);
+        let journal = std::fs::read(key.dir.join(PLAN_FILE))?;
+        let saved = IdentityPlan::load(&key, "recovery password")?;
+        assert_eq!(saved.state(), expected);
+        assert_eq!(saved.plan.request_bytes, request);
+        drop(saved);
+        if expected == IdentityOperationState::Recorded {
+            assert!(IdentityPlan::discard_saved(&key, "recovery password").is_err());
+            assert!(!IdentityPlan::discard_applied(&key, "recovery password")?);
+            assert_eq!(std::fs::read(key.dir.join(PLAN_FILE))?, journal);
+        } else {
+            assert!(IdentityPlan::discard_applied(&key, "recovery password")?);
+            assert!(!IdentityPlan::exists(&key));
+        }
+        assert_eq!(std::fs::read(&backup_path)?, backup);
+        std::fs::remove_dir_all(dir)?;
+    }
+    Ok(())
+}
+
+#[test]
 fn applied_receipts_allow_idempotent_cleanup_without_removing_backups() -> Result<()> {
     for kind in [
         IdentityPlanKind::Creation,
