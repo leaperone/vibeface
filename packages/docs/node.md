@@ -368,7 +368,7 @@ iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vib
 | 命令 | 身份 | 用途 |
 |---|---|---|
 | `call <method> [json]` | 本机操作者 | 直接调用一个客户端方法；需要管理客户端签名的 `invite`、`approve`、`grant`、`revoke`、`veto`、`approve_recovery`、`recover`、`recovery_state`、`join`、`join_withdraw` 和不带 `join_id` 的 `join_status` 被拒绝，`subscribe`、`log`、`local_access`、`node_join` 不经维护 socket 提供 |
-| `config set <key> <value>` | 本机操作者 | 改 `config.json` 一项。值按 JSON 解析，不是 JSON 时当字符串；`null` 恢复默认；`mesh.` 即 `network.mesh.`。按加载时的规则校验，不接受 token 和 `provider_env`；值写 `-` 时从标准输入读。Node 运行中时回复带 `restart_required: true`，重启后生效 |
+| `config set <key> <value>` | 本机操作者 | 改 `config.json` 一项。值按 JSON 解析，不是 JSON 时当字符串；`null` 恢复默认；全网配置使用 `network.mesh.*`。按加载时的规则校验，不接受 token 和 `provider_env`；值写 `-` 时从标准输入读。Node 运行中时回复带 `restart_required: true`，重启后生效 |
 | `node settings / configure / write-state / confirm-writable / diagnostics / rejoin` | 本机操作者 | 项目目录（`--root`、`--no-roots`）、本机 Bot（`--manager <JSON>`、`--no-manager`）、恢复后确认可写、诊断包、被移出后重新开始 |
 | `provider configure / probe / models / test-codex` | 本机操作者 | 改 Provider（`codex`、`claude`、`opencode`、`cursor`、`pi`）设置、检查就绪、列模型、测 App Server；`configure` 的 JSON 写 `-` 时从标准输入读，带 API key 的 `env` 用这种方式传 |
 | `bots list / memory` | 本机操作者 | 列 Bot、读一条记忆 |
@@ -421,23 +421,23 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 
 两台 Node 不能直连时经 relay 转发。relay 只转发 QUIC 密文；默认只接纳本 Node、当前成员 Node 和持有本 Node 所发邀请的加入者，设了 `relay_operator_token` 时另外接纳持该令牌的设备，`relay_open` 时接纳任何设备，见 [私有 relay](#私有-relay)。不使用 n0 公共 relay。网络设置在 `init` 或首次直接启动时写入 `config.json`，之后用 `vibeface config set` 修改，重启生效；`vibeface mesh bootstrap` 和网页的**公共转发**不用重启：
 
-| 参数 | `config.json` 中的 `network` 字段 | 作用 |
+| 参数 | `config.json` 路径 | 作用 |
 |---|---|---|
-| `--relay <URL>` | `relays` | 其他 Node 的 relay，写成 `{"url": …}`，可重复，最多 16 个 |
-| `--relay-token <URL>=<FILE>` | `relays[].token` | 某个 `--relay` 要求的令牌，从文件读取 |
-| `--relay-listen <ADDR>` | `relay_listen` | 运行 TCP relay |
-| `--relay-url <URL>` | `relay_url` | 其他 Node 访问本 relay 的 URL，必须明确提供其他 Node 可访问的 URL |
-| `--relay-operator-token <FILE>` | `relay_operator_token` | 个人网络以外的设备出示这个令牌即可使用本 relay |
-| `--relay-open` | `relay_open` | 本 relay 接纳任何设备，必须同时设 `relay_rate` 和 `relay_max_clients`，不能与运营者令牌同用 |
-| `--relay-rate <BYTES>` | `relay_rate` | relay 每秒从每个连接读取的字节数，默认不限 |
-| `--relay-max-clients <N>` | `relay_max_clients` | relay 同时保持的个人网络以外的连接数，默认不限 |
-| `--relay-max-clients-per-ip <N>` | `relay_max_clients_per_ip` | 同一来源地址（IPv6 按 /56 计）同时保持的 TCP 连接数，含成员，默认不限 |
-| 无 | `relay_blocked` | relay 拒绝的设备编号 |
-| `--no-mesh` | `mesh.enabled` | 不加入全网；`init` 默认加入 |
-| `--mesh-network <NAME>` | `mesh.network` | 全网名称，默认 `vibeface`；换名时不带默认 bootstrap 节点 |
-| `--bootstrap <LINK>` | `mesh.bootstrap` | 你认识的第一台 Node 的节点链接 `vibeface://node/<device-id>?addr=<host>:<UDP-port>&relay=<URL>`，可重复，最多 16 个，替换默认的官方公共节点 |
-| 无 | `mesh.allow_private` | 采用私网和回环地址上的 relay 与网关，默认关闭 |
-| 无 | `bind` | iroh 的 UDP 监听地址，默认在 `listen` 的端口上监听全部 IPv4 和 IPv6 网卡 |
+| `--relay <URL>` | `network.relays` | 其他 Node 的 relay，写成 `{"url": …}`，可重复，最多 16 个 |
+| `--relay-token <URL>=<FILE>` | `network.relays[].token` | 某个 `--relay` 要求的令牌，从文件读取 |
+| `--relay-listen <ADDR>` | `network.relay_listen` | 运行 TCP relay |
+| `--relay-url <URL>` | `network.relay_url` | 其他 Node 访问本 relay 的 URL，必须明确提供其他 Node 可访问的 URL |
+| `--relay-operator-token <FILE>` | `network.relay_operator_token` | 个人网络以外的设备出示这个令牌即可使用本 relay |
+| `--relay-open` | `network.relay_open` | 本 relay 接纳任何设备，必须同时设 `relay_rate` 和 `relay_max_clients`，不能与运营者令牌同用 |
+| `--relay-rate <BYTES>` | `network.relay_rate` | relay 每秒从每个连接读取的字节数，默认不限 |
+| `--relay-max-clients <N>` | `network.relay_max_clients` | relay 同时保持的个人网络以外的连接数，默认不限 |
+| `--relay-max-clients-per-ip <N>` | `network.relay_max_clients_per_ip` | 同一来源地址（IPv6 按 /56 计）同时保持的 TCP 连接数，含成员，默认不限 |
+| 无 | `network.relay_blocked` | relay 拒绝的设备编号 |
+| `--no-mesh` | `network.mesh.enabled` | 不加入全网；`init` 默认加入 |
+| `--mesh-network <NAME>` | `network.mesh.network` | 全网名称，默认 `vibeface`；换名时不带默认 bootstrap 节点 |
+| `--bootstrap <LINK>` | `network.mesh.bootstrap` | 你认识的第一台 Node 的节点链接 `vibeface://node/<device-id>?addr=<host>:<UDP-port>&relay=<URL>`，可重复，最多 16 个，替换默认的官方公共节点 |
+| 无 | `network.mesh.allow_private` | 采用私网和回环地址上的 relay 与网关，默认关闭 |
+| 无 | `network.bind` | iroh 的 UDP 监听地址，默认在 `listen` 的端口上监听全部 IPv4 和 IPv6 网卡 |
 
 浏览器转发的设置在 `config.json` 顶层的 `forwarding`：`--forward-any`（`any`）转发给任何设备，默认只转发给本网络的 Node；`--forward-sessions`（`sessions`）是同时转发的会话数，默认 256；`--forward-queue`（`queue`）是等待名额的会话数，默认 0，两者之和最多 256；`--forward-rate`（`rate`）是每个会话每秒的字节数，默认不限；`--forward-per-ip`（`per_ip`）是同一浏览器地址（IPv6 按 /56 计）在 `listen` 上最多同时保持的 `/api/client` 连接数，含目标为本 Node 的会话，超出时在升级前回 HTTP 429，默认不限；`--trusted-proxy`（`trusted_proxies`，可重复）列出反代的地址，只有来自这些地址的连接才按单个 `X-Real-IP` 认定浏览器地址，其余以 TCP 对端为准；`/api/decision` 的预算（同时 16 个、每分钟 256 个来源、每来源 12 次）按同一地址认定。
 
@@ -530,11 +530,11 @@ vibeface mesh bootstrap remove <设备编号>
 
 两种 `vibeface://` 链接用途不同：节点链接 `vibeface://node/<设备编号>?addr=<主机>:<UDP 端口>&relay=<URL>` 说明一台 Node 是谁、在哪里，最多 4 个 `addr`、1 个 `relay`，公开无妨，用作 bootstrap；加入链接 `vibeface://join/vibeface1…` 加入个人网络，含一次性 secret，只交给自己的设备。`vibeface mesh share` 打印运行中的 Node 的节点链接，网页设备页「公共转发」旁的「节点链接」显示同一条并可复制。格式见[两种链接](design/mesh.md#两种链接)。
 
-`mesh bootstrap add|remove` 写入 `config.json` 的 `network.mesh.bootstrap`，Node 运行时立即改用新列表。开关全网或换网络名时，用 `vibeface config set mesh.enabled false` 或 `vibeface config set mesh.network <名称>` 后重启 Node，不要重新运行 `init`，也不需要重新创建个人网络。
+`mesh bootstrap add|remove` 写入 `config.json` 的 `network.mesh.bootstrap`，Node 运行时立即改用新列表。开关全网或换网络名时，用 `vibeface config set network.mesh.enabled false` 或 `vibeface config set network.mesh.network <名称>` 后重启 Node，不要重新运行 `init`，也不需要重新创建个人网络。
 
 Node 从整张表里抽取开放 relay 并行验证，先按历史通过次数、再按延迟取最好的 8 台加入候选，同一网段（IPv4 /24、IPv6 /48）只取 1 台，iroh 从中选 home relay。配置的 relay、本个人网络成员的 relay、bootstrap 节点的 relay 和自己的 relay 始终保留。私网和回环地址上的 relay 与网关默认不用，`network.mesh.allow_private` 打开后才用，供局域网和测试使用。
 
-网卡上看不到公网地址的 Node（如云主机上的容器）用 `vibeface config set mesh.advertise '["<公网 IP>:<UDP 端口>"]'` 宣告它，最多 8 条，排在全网记录和节点链接的最前面，重启后生效。见[两种链接](design/mesh.md#两种链接)。
+网卡上看不到公网地址的 Node（如云主机上的容器）用 `vibeface config set network.mesh.advertise '["<公网 IP>:<UDP 端口>"]'` 宣告它，最多 8 条，排在全网记录和节点链接的最前面，重启后生效。见[两种链接](design/mesh.md#两种链接)。
 
 全网不保证所有 NAT 类型都能直连。对称 NAT、UDP 被封锁或双方没有可用直连路径时，业务流量经 relay 转发，Node 自动选择。
 

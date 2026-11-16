@@ -56,14 +56,14 @@ vibeface init --data-dir /opt/apps/vibeface-node/state --listen 0.0.0.0:4792 --t
   --relay-open --relay-rate 16384 --relay-max-clients 128 --relay-max-clients-per-ip 8 \
   --forward-any --forward-sessions 32 --forward-queue 192 --forward-rate 262144 \
   --forward-per-ip 8
-vibeface config set --data-dir /opt/apps/vibeface-node/state mesh.advertise '["84.54.3.78:4792"]'
+vibeface config set --data-dir /opt/apps/vibeface-node/state network.mesh.advertise '["84.54.3.78:4792"]'
 touch /opt/apps/vibeface-node/state/node.lock
 chown -R 1001:1001 /opt/apps/vibeface-node/state && chmod 0700 /opt/apps/vibeface-node/state
 ```
 
 迁移已有节点时不要运行 `init`。先停止旧容器并关闭其自动重启，再复制完整数据目录、外部 TLS 文件与已验证镜像；保留设备身份，只修改目标主机的 `network.mesh.advertise`。新旧主机不能同时运行同一身份。回滚前先停目标节点，将其最新一致状态回迁，再启动旧节点。
 
-容器里看不到宿主公网 IP，`mesh.advertise`（即 `network.mesh.advertise`）写明公网地址，全网记录和节点链接才带上它；guard 不检查这一项。镜像里只有 `vibeface-core`，没有 `vibeface` CLI，所以已部署的节点在容器里用 `python3` 读出 `/data/config.json`，加上 `network.mesh.advertise`，写临时文件后原子替换，保留原权限，再重启容器。先升级到认识这个字段的版本，再改配置；旧版读到未知字段会拒绝启动。
+容器里看不到宿主公网 IP，`network.mesh.advertise` 写明公网地址，全网记录和节点链接才带上它；guard 不检查这一项。镜像里只有 `vibeface-core`，没有 `vibeface` CLI，所以已部署的节点在容器里用 `python3` 读出 `/data/config.json`，加上 `network.mesh.advertise`，写临时文件后原子替换，保留原权限，再重启容器。先升级到认识这个字段的版本，再改配置；旧版读到未知字段会拒绝启动。
 
 `init` 不建 `node.lock`，Node 第一次启动才建；激活脚本和 guard 都要求它已存在，用它做离线锁，所以初始化后手动建好。
 

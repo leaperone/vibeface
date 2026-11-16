@@ -9,11 +9,11 @@
 | 字段 | 含义 |
 |---|---|
 | `v` | 记录格式版本，当前为 1 |
-| `network` | `mesh.network`，默认 `vibeface` |
+| `network` | `network.mesh.network`，默认 `vibeface` |
 | `device_id` | 设备编号，即 iroh EndpointId |
 | `seq` | 毫秒时间戳，单调递增，大者胜 |
 | `ttl_s` | 有效期，默认 1800 秒 |
-| `addrs` | 直连地址，最多 8 条：先是 `mesh.advertise`，再是公网观察地址与本机绑定地址，不含别人的地址 |
+| `addrs` | 直连地址，最多 8 条：先是 `network.mesh.advertise`，再是公网观察地址与本机绑定地址，不含别人的地址 |
 | `relay_url` | 当前 home relay |
 | `reachable` | `public`、`nat` 或 `unknown`，只影响别人选入网起点的顺序 |
 | `roles` | `relay`、`gateway`、`service`，最多 4 个 |
@@ -39,9 +39,9 @@
 | 节点链接 | `vibeface://node/<设备编号>?addr=<主机>:<UDP 端口>&relay=<URL>` | 说明一台 Node 是谁、在哪里。可当 bootstrap，公开无妨 |
 | 加入链接 | `vibeface://join/vibeface1…` | 加入一个个人网络，含一次性 secret，只交给自己的设备 |
 
-节点链接最多 4 个 `addr`、1 个 `relay`，`addr` 的主机是 IP 或小写域名，`relay` 是最长 256 个字符、只含可见 ASCII 且不含 `` &#?%"<>\`{}|^ `` 的 http(s) URL，整条链接最长 2048 个字符。地址和 relay 只是拨号提示，QUIC 握手证明对端就是这台设备。`share_link` 返回本机当前的节点链接：`mesh.advertise` 在前，再是公网、局域网和回环地址，去掉 IPv6 链路本地地址，加上当前 home relay。
+节点链接最多 4 个 `addr`、1 个 `relay`，`addr` 的主机是 IP 或小写域名，`relay` 是最长 256 个字符、只含可见 ASCII 且不含 `` &#?%"<>\`{}|^ `` 的 http(s) URL，整条链接最长 2048 个字符。地址和 relay 只是拨号提示，QUIC 握手证明对端就是这台设备。`share_link` 返回本机当前的节点链接：`network.mesh.advertise` 在前，再是公网、局域网和回环地址，去掉 IPv6 链路本地地址，加上当前 home relay。
 
-`mesh.advertise` 是网卡上看不到、别人却能直连的 UDP 地址，最多 8 条、不重复，须有主机和端口，例如容器里的 Node 写宿主公网 IP 和映射端口：`vibeface config set mesh.advertise '["203.0.113.7:4792"]'`。它在记录和节点链接里排第一；端口和本机绑定端口相同时与网卡上的公网地址一样算 `public`。
+`network.mesh.advertise` 是网卡上看不到、别人却能直连的 UDP 地址，最多 8 条、不重复，须有主机和端口，例如容器里的 Node 写宿主公网 IP 和映射端口：`vibeface config set network.mesh.advertise '["203.0.113.7:4792"]'`。它在记录和节点链接里排第一；端口和本机绑定端口相同时与网卡上的公网地址一样算 `public`。
 
 加入链接的票据是 postcard 编码再小写 base32，内容是版本、入口 Node 的节点链接和 32 字节 secret，`vibeface1` 之后的 base32 正文最长 2400 个字符。入口 Node 在 `invite` 应答里给出自己的节点链接，管理设备把它和 secret 一起编进票据。新设备先把票据里的地址和 relay 放进地址簿，入口的 relay 同时拿到邀请凭证；再查全网和配置的 relay。新设备关闭全网、用别的网络名，或 bootstrap 节点连不上时，照样能连到入口。
 
@@ -49,7 +49,7 @@
 
 主题 ID 由 `SHA-256("vibeface:mesh:v1:" ‖ network)` 派生，gossip 与交换各用一条带网络名的 ALPN：`vibeface/mesh-gossip/<network>/1`、`vibeface/mesh/<network>/1`。测试用随机网络名，不会进入真实网络。
 
-启动时同时尝试本地旧表里最近见过且公网可达的 8 台（`mesh.allow_private` 打开时也含带地址的私网记录）和 `mesh.bootstrap`；本个人网络的成员 Node 在成员列表变化时加入。任一连上就加入主题。`mesh.bootstrap` 的每一项是节点链接，至少带一个 `addr` 或 `relay`，可以是你认识的任何一台 Node：在那台 Node 上运行 `vibeface mesh share`，或在网页设备页的「节点链接」复制。没有邻居时从 30 秒起加倍重试，最长间隔 5 分钟，个人网络内的功能不受影响。邻居少于 3 台时，每 5 分钟重新加入不在邻居里的 bootstrap 节点，bootstrap 节点重启后会重新连上；邻居更多时不打扰 bootstrap 节点，因为每次加入都会挤掉它最多 5 个邻居中的一个。
+启动时同时尝试本地旧表里最近见过且公网可达的 8 台（`network.mesh.allow_private` 打开时也含带地址的私网记录）和 `network.mesh.bootstrap`；本个人网络的成员 Node 在成员列表变化时加入。任一连上就加入主题。`network.mesh.bootstrap` 的每一项是节点链接，至少带一个 `addr` 或 `relay`，可以是你认识的任何一台 Node：在那台 Node 上运行 `vibeface mesh share`，或在网页设备页的「节点链接」复制。没有邻居时从 30 秒起加倍重试，最长间隔 5 分钟，个人网络内的功能不受影响。邻居少于 3 台时，每 5 分钟重新加入不在邻居里的 bootstrap 节点，bootstrap 节点重启后会重新连上；邻居更多时不打扰 bootstrap 节点，因为每次加入都会挤掉它最多 5 个邻居中的一个。
 
 gossip 只送新消息，单条消息最多 4096 字节。两台 Node 成为邻居时，各自向对方要摘要：请求带一个 Bloom 过滤器，装着自己持有的 `(device_id, seq)`，每条约 16 位、最多 64 KiB，每次随机换种子；对方只回过滤器里没有的记录。过滤器误判时那条记录这一轮拿不到，下一次拉取或该设备的下一次宣告会补上。同一条流也回答按设备编号的查询，作为表里没有目标时的兜底。
 
@@ -77,7 +77,7 @@ Node 在网页设备页打开「公共转发」或运行 `vibeface relay volunte
 
 其他 Node 每 5 分钟、以及表变化时（最多每分钟一次）重选 relay。每轮从整张表的 `access: open` relay 里取 32 台：先取历史上通过检查最多的，再从其余里随机取；同一网段（IPv4 /24、IPv6 /48，按之前检查时解析到的地址或 URL 里的 IP）最多取 2 台。其中 240 秒内没检查过的并行用 `/generate_204` 和真实握手检查。排名先看历史通过次数（每次通过加 1，最多 288，失败一次减半），再看延迟；连续 3 次失败的不用；同一网段只采用 1 台，取最好的 8 台加入 relay 列表。iroh 在其中按延迟选 home relay。检查结果保存在 `mesh_relays`。配置的 relay、本个人网络成员运行的 relay、bootstrap 节点的 relay（节点链接里的 `relay`，以及它记录里宣告的开放 relay）和自己的 relay 始终保留，不参与排名。`mesh_relays` 和 `relay_usage` 里 30 天没有更新的行在启动和每轮重选时删除。
 
-私网和回环地址上的 relay 与网关默认不采用、不探测，记录里私网主机上的 `relay_url` 也不当拨号地址，`mesh.allow_private` 打开后才采用，供局域网和测试使用。
+私网和回环地址上的 relay 与网关默认不采用、不探测，记录里私网主机上的 `relay_url` 也不当拨号地址，`network.mesh.allow_private` 打开后才采用，供局域网和测试使用。
 
 ## 浏览器入口
 

@@ -8,9 +8,9 @@ use std::path::Path;
 
 impl Config {
     /// Sets `key`, a dotted path into config.json, to `value` and saves the result, refusing
-    /// one `Config::load` would refuse. `mesh.` stands for `network.mesh.`; `null` restores a
-    /// field's default. Relay tokens come from files at `init` and provider variables from
-    /// `provider configure`, never from this command.
+    /// one `Config::load` would refuse. `null` restores a field's default. Relay tokens come
+    /// from files at `init` and provider variables from `provider configure`, never from
+    /// this command.
     pub fn set(dir: &Path, key: &str, value: Value) -> Result<()> {
         let path = config_path(key)?;
         ensure!(
@@ -50,17 +50,14 @@ impl Config {
 }
 
 fn config_path(key: &str) -> Result<Vec<String>> {
-    let mut path: Vec<String> = key.split('.').map(str::to_owned).collect();
-    if path.first().is_some_and(|first| first == "mesh") {
-        path.insert(0, "network".into());
-    }
+    let path: Vec<String> = key.split('.').map(str::to_owned).collect();
     for segment in &path {
         if segment.is_empty()
             || !segment
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
         {
-            bail!("a config key is a dotted path such as mesh.allow_private");
+            bail!("a config key is a dotted path such as network.mesh.allow_private");
         }
     }
     Ok(path)
@@ -92,8 +89,8 @@ mod tests {
     #[test]
     fn set_changes_one_value_and_refuses_what_loading_would_refuse() -> Result<()> {
         let dir = node_dir()?;
-        Config::set(&dir, "mesh.allow_private", json!(true))?;
-        Config::set(&dir, "mesh.network", json!("lab-1"))?;
+        Config::set(&dir, "network.mesh.allow_private", json!(true))?;
+        Config::set(&dir, "network.mesh.network", json!("lab-1"))?;
         Config::set(&dir, "network.mesh.enabled", json!(true))?;
         Config::set(&dir, "timeout_secs", json!(30))?;
         let loaded = Config::load(&dir)?;
@@ -104,8 +101,16 @@ mod tests {
         );
         let before = std::fs::read(dir.join("config.json"))?;
         for (key, value, error) in [
-            ("mesh.network", json!("Not Valid"), "invalid mesh.network"),
-            ("mesh.no_such_field", json!(1), "invalid mesh.no_such_field"),
+            (
+                "network.mesh.network",
+                json!("Not Valid"),
+                "invalid network.mesh.network",
+            ),
+            (
+                "network.mesh.no_such_field",
+                json!(1),
+                "invalid network.mesh.no_such_field",
+            ),
             ("timeout_secs", json!(0), "invalid timeout_secs"),
             ("network.relay_operator_token", json!("00"), "relay tokens"),
             (
@@ -122,10 +127,34 @@ mod tests {
         ] {
             let refused = Config::set(&dir, key, value).unwrap_err();
             assert!(refused.to_string().contains(error), "{key}: {refused:#}");
+            assert_eq!(std::fs::read(dir.join("config.json"))?, before, "{key}");
         }
-        assert_eq!(std::fs::read(dir.join("config.json"))?, before);
-        Config::set(&dir, "mesh.network", Value::Null)?;
+        Config::set(&dir, "network.mesh.network", Value::Null)?;
         assert_eq!(Config::load(&dir)?.network.mesh.network, "vibeface");
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn set_refuses_noncanonical_mesh_paths_without_changing_the_file() -> Result<()> {
+        let dir = node_dir()?;
+        let before = std::fs::read(dir.join("config.json"))?;
+        for (key, value) in [
+            ("mesh.enabled", json!(true)),
+            ("mesh.network", json!("lab-1")),
+            ("mesh.bootstrap", json!([])),
+            ("mesh.allow_private", json!(true)),
+            ("mesh.advertise", json!(["203.0.113.7:4792"])),
+            ("mesh.network", Value::Null),
+        ] {
+            let refused = Config::set(&dir, key, value).unwrap_err();
+            assert_eq!(refused.to_string(), format!("invalid {key}"));
+            assert!(
+                format!("{refused:#}").contains("unknown field `mesh`"),
+                "{key}: {refused:#}"
+            );
+            assert_eq!(std::fs::read(dir.join("config.json"))?, before, "{key}");
+        }
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

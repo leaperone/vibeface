@@ -56,7 +56,7 @@
 | `relay_blocked` | 无 | relay 拒绝的设备编号 |
 | `mesh` | `--no-mesh`、`--mesh-network NAME`、`--bootstrap URL` | `{enabled, network, bootstrap, allow_private}`，见[全网](#全网)。省略时关闭；`init` 和首次直接启动写 `enabled: true`、`network: "vibeface"` 和官方 bootstrap 节点 |
 
-iroh 默认开启路由器端口映射；配置了 `network.bind` 时关闭，不发布未配置的路由器地址。`relay_url`、`relay_operator_token`、`relay_open`、`relay_rate`、`relay_max_clients`、`relay_max_clients_per_ip` 和 `relay_blocked` 要求 `relay_listen`；`relay_open` 要求 `relay_rate` 和 `relay_max_clients`，且不能有 `relay_operator_token`；relay 监听通配地址时必须给 `relay_url`。`mesh.bootstrap` 最多 16 个，同一设备只列一次；给了 `--bootstrap` 或换了 `--mesh-network` 时不再带官方 bootstrap 节点。
+iroh 默认开启路由器端口映射；配置了 `network.bind` 时关闭，不发布未配置的路由器地址。`relay_url`、`relay_operator_token`、`relay_open`、`relay_rate`、`relay_max_clients`、`relay_max_clients_per_ip` 和 `relay_blocked` 要求 `relay_listen`；`relay_open` 要求 `relay_rate` 和 `relay_max_clients`，且不能有 `relay_operator_token`；relay 监听通配地址时必须给 `relay_url`。`network.mesh.bootstrap` 最多 16 个，同一设备只列一次；给了 `--bootstrap` 或换了 `--mesh-network` 时不再带官方 bootstrap 节点。
 
 启用管理 Agent 时，`manager` 对象包含以下全部字段。Cursor 模式要求非空 `model`，Codex 模式可用空字符串选择其默认模型。
 
@@ -534,9 +534,9 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 接收端验签，核对网络名、有效期和大小后才入表；同一设备只留一条，新记录的 `seq` 必须不小于已持有记录的 `seq` 加 30 秒。表最多 65536 条，保存在数据目录的 `mesh.sqlite3`，保留 30 天内见过的记录，删除后从 bootstrap 节点重新入网。
 
-`mesh.bootstrap` 的每一项是节点链接 `vibeface://node/<device-id>?addr=<host>:<UDP-port>&relay=<URL>`，最多 4 个 `addr`、1 个 `relay`，至少有其一；relay 只是拨号提示，不加入 relay 列表。`vibeface mesh share` 或 `share_link` 给出本机的节点链接。官方 bootstrap 节点由仓库文件 `config/public-bootstrap.json` 的 `issuer`、`udp_host`、`udp_port` 和 `relay_url` 生成，Core 用 `include_str!` 编入同一文件，不另抄一份。QUIC 握手证明对端就是这台设备，编号不符时连接失败。`vibeface mesh bootstrap add|remove` 改写这个列表，Node 运行时立即生效。
+`network.mesh.bootstrap` 的每一项是节点链接 `vibeface://node/<device-id>?addr=<host>:<UDP-port>&relay=<URL>`，最多 4 个 `addr`、1 个 `relay`，至少有其一；relay 只是拨号提示，不加入 relay 列表。`vibeface mesh share` 或 `share_link` 给出本机的节点链接。官方 bootstrap 节点由仓库文件 `config/public-bootstrap.json` 的 `issuer`、`udp_host`、`udp_port` 和 `relay_url` 生成，Core 用 `include_str!` 编入同一文件，不另抄一份。QUIC 握手证明对端就是这台设备，编号不符时连接失败。`vibeface mesh bootstrap add|remove` 改写这个列表，Node 运行时立即生效。
 
-角色只说明一台设备愿意提供什么：`relay {url, access, rate, max_clients, offer?}`、`gateway {url}`、`service {service, offer?}`。采用方先验证：relay 用 `/generate_204` 和真实握手，网关请求 `<url>/api/info` 并核对设备编号；私网和回环地址只在 `mesh.allow_private` 时采用。运行 relay 的 Node 经 `configure_relay`（网页**公共转发**、`vibeface relay volunteer on|off`）开放 relay，请邻居从外部探测通过后才宣告 `relay` 角色。
+角色只说明一台设备愿意提供什么：`relay {url, access, rate, max_clients, offer?}`、`gateway {url}`、`service {service, offer?}`。采用方先验证：relay 用 `/generate_204` 和真实握手，网关请求 `<url>/api/info` 并核对设备编号；私网和回环地址只在 `network.mesh.allow_private` 时采用。运行 relay 的 Node 经 `configure_relay`（网页**公共转发**、`vibeface relay volunteer on|off`）开放 relay，请邻居从外部探测通过后才宣告 `relay` 角色。
 
 `vibeface join` 和本机网页的 `node_join` 先用票据里的直连地址和 home relay，同时在全网表里查发出邀请的 Node，表里没有时问邻居，再加上配置的 relay；入口的 home relay 不开放时带邀请令牌，全网表里查不到入口时，没有配置令牌的 relay 也带邀请令牌。`vibeface status` 的 `Mesh` 和 `vibeface mesh status` 显示全网是否开启、网络名、记录数和邻居数。入网失败按退避重试，不影响个人网络内的功能。
 
