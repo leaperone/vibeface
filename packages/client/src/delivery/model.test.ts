@@ -3,8 +3,9 @@ import { registerHooks } from 'node:module'
 import test from 'node:test'
 import type { ReadyConnection } from '../lib/node.ts'
 import type { Platform } from '../lib/platform.ts'
+import { bytesToBase64, sha256Hex } from '../lib/byte-codec.ts'
 import { createDeliveryClient } from './client.ts'
-import { amount, canRead, canRestart, checkedFile, draftFor, fromBase64, orderActions, orderSummary, orderTitle, parseBudgets, parseOrder, parseReceived, parseStatus, publicationLabel, providerChoices, receiverChoices, receivingBatches, settlementAmountsLabel, sha256, sizeLabel, toBase64, walletNotice } from './model.ts'
+import { amount, canRead, canRestart, checkedFile, draftFor, fromBase64, orderActions, orderSummary, orderTitle, parseBudgets, parseOrder, parseReceived, parseStatus, publicationLabel, providerChoices, receiverChoices, receivingBatches, settlementAmountsLabel, sizeLabel, walletNotice } from './model.ts'
 import type { DeliveryDraft, DeliveryOrder, DeliveryStatus, ReserveDeliveryIntent } from './types.ts'
 
 const reserveDeliveryIntent: ReserveDeliveryIntent = async (_key, reserve) => reserve()
@@ -12,7 +13,7 @@ const reserveDeliveryIntent: ReserveDeliveryIntent = async (_key, reserve) => re
 const source = '11'.repeat(32), receiver = '22'.repeat(32), provider = '33'.repeat(32)
 const uuid = '00000000-0000-4000-8000-000000000001'
 const content = new TextEncoder().encode('a file the receiver can recover')
-const digest = await sha256(content)
+const digest = await sha256Hex(content)
 function order(): DeliveryOrder {
   return {
     order_id: '44'.repeat(32), intent_id: uuid, role: 'sender', mode: 'charity', acceptance: 'recoverable', source_peer: source, receiver_peer: receiver, provider_peer: provider,
@@ -69,9 +70,9 @@ test('uncertain chain results label retained settlement amounts as the last reco
 })
 
 test('a received file is saved only after exact content, length, name and digest agree', async () => {
-  const received = { name: 'example.txt', bytes: content.length, content_base64: toBase64(content), sha256: digest }
+  const received = { name: 'example.txt', bytes: content.length, content_base64: bytesToBase64(content), sha256: digest }
   assert.deepEqual(await checkedFile(parseReceived(received, 131072), order()), content)
-  await assert.rejects(checkedFile({ ...received, content_base64: toBase64(new Uint8Array(content.length)) }, order()))
+  await assert.rejects(checkedFile({ ...received, content_base64: bytesToBase64(new Uint8Array(content.length)) }, order()))
   await assert.rejects(checkedFile({ ...received, name: 'other.txt' }, order()))
   await assert.rejects(checkedFile({ ...received, bytes: content.length - 1 }, order()))
   assert.throws(() => parseReceived({ ...received, name: '../file' }, 131072))
@@ -151,7 +152,7 @@ test('delivery refresh keeps read-only history and file access without requestin
         case 'providers': return { providers: [] }
         case 'budgets': if (!managing) throw new Error('budget permission denied'); return { budgets: [budget] }
         case 'get': assert.equal(params.order_id, readable.order_id); return readable
-        case 'read': assert.equal(params.order_id, readable.order_id); return { name: readable.name, bytes: content.length, content_base64: toBase64(content), sha256: digest }
+        case 'read': assert.equal(params.order_id, readable.order_id); return { name: readable.name, bytes: content.length, content_base64: bytesToBase64(content), sha256: digest }
         default: throw new Error('unexpected delivery request')
       }
     })
@@ -277,7 +278,7 @@ test('preparing B cannot erase the unknown A intent and returning to A after res
       stored.set(id, { ...previous, phase: 'reconciling', payment: { ...previous.payment, state: 'unknown' } })
       throw new Error('A signed transaction persisted, broadcast result unknown')
     }
-    const saved = stored.get(id) ?? { ...paidOrder(), name: typeof params.name === 'string' ? params.name : '', intent_id: id, order_id: await sha256(new TextEncoder().encode(id)) }
+    const saved = stored.get(id) ?? { ...paidOrder(), name: typeof params.name === 'string' ? params.name : '', intent_id: id, order_id: await sha256Hex(new TextEncoder().encode(id)) }
     stored.set(id, saved)
     return saved
   })
@@ -304,7 +305,7 @@ test('same-file retries keep a completed intent while an explicit new send check
     calls.push(params)
     const id = typeof params.intent_id === 'string' ? params.intent_id : ''
     if (params.op === 'find_intent') return { order: lookupMissing ? null : stored.get(id) ?? null }
-    const saved = stored.get(id) ?? { ...order(), intent_id: id, order_id: await sha256(new TextEncoder().encode(id)) }
+    const saved = stored.get(id) ?? { ...order(), intent_id: id, order_id: await sha256Hex(new TextEncoder().encode(id)) }
     stored.set(id, saved)
     if (losePrepare) { losePrepare = false; throw new Error('new prepare response lost') }
     return saved
@@ -515,4 +516,17 @@ test('waiting for reservation retains the original draft, file properties and se
   const saved = await pending
   assert.equal(writes[0][0], `vibeface.delivery.network.client.${source}.intent.e4d2ac185fb4490bd606a5ba49f715bed1df4b5a85ffd888c0ac06f127f34eec`)
   assert.deepEqual(calls, [{ op: 'prepare', receiver_peer: receiver, provider_peer: provider, mode: 'charity', acceptance: 'recoverable', name: 'example.txt', max_service_amount: '0', max_gas_amount: '0', budget_id: null, intent_id: saved.intent_id, content_base64: 'YSBmaWxlIHRoZSByZWNlaXZlciBjYW4gcmVjb3Zlcg==' }])
+})
+
+test('delivery retains canonical base64 errors and validates the received field budget before decoding', async () => {
+  assert.deepEqual(fromBase64('Zg=='), new Uint8Array([102]))
+  assert.deepEqual(fromBase64(''), new Uint8Array())
+  assert.throws(() => fromBase64('Zh=='), { message: '文件编码不是规范格式。' })
+  for (const value of ['Zg', ' Zg==\n', 'Zg===', '*', '_w==']) assert.throws(() => fromBase64(value), { message: '文件编码无效。' })
+  const received = { name: 'example.txt', bytes: 1, content_base64: 'Zg==', sha256: '0'.repeat(64) }
+  assert.deepEqual(parseReceived(received, 1), received)
+  assert.throws(() => parseReceived({ ...received, content_base64: 'Zg==A' }, 1), { message: '取回文件超过当前设备上限。' })
+  assert.throws(() => parseReceived({ ...received, content_base64: null }, 1), { message: '文件内容缺失。' })
+  await assert.rejects(checkedFile({ ...received, content_base64: 'Zh==' }, order()), { message: '文件编码不是规范格式。' })
+  await assert.rejects(checkedFile({ ...received, content_base64: '*' }, order()), { message: '文件编码无效。' })
 })

@@ -43,3 +43,12 @@ test('text pagination measures UTF-8 bytes and permits an empty terminal page', 
     { text: '', offset: 0, next_offset: null, size: 0 })
   assert.throws(() => parseArtifactPage({ blob_hash: 'hash', offset: 0, next_offset: 1, size: 4, text: '中' }, 'hash', 0))
 })
+
+test('binary pages keep permissive base64 decoding but enforce their own byte range', () => {
+  for (const data of ['Zg', ' Zg==\n', 'Zh==']) {
+    assert.deepEqual(parseBinaryPage({ blob_hash: 'hash', offset: 0, next_offset: null, size: 1, data }, 'hash', 0),
+      { bytes: new Uint8Array([102]), next_offset: null, size: 1 })
+  }
+  assert.throws(() => parseBinaryPage({ blob_hash: 'hash', offset: 0, next_offset: null, size: 2, data: 'Zg==' }, 'hash', 0), { message: '下载内容与原请求不符。' })
+  assert.throws(() => parseBinaryPage({ blob_hash: 'hash', offset: 0, next_offset: null, size: 1, data: '*' }, 'hash', 0), { name: 'InvalidCharacterError' })
+})

@@ -3,6 +3,7 @@ import type { ReadyConnection } from "../lib/node.ts"
 import { messageOf } from "../lib/node.ts"
 import { parseLogs, reportLog, type LogFilter } from "../lib/web-log.ts"
 import { enqueue, settle, type OutboxItem, type OutboxStore } from "../lib/outbox.ts"
+import { base64ToBytes, bytesToBase64, sha256Hex } from "../lib/byte-codec.ts"
 import { requestKey } from "../lib/secure.ts"
 import { notificationForOpening, type Platform } from "../lib/platform.ts"
 import type { Tabs } from "../identity/context.tsx"
@@ -791,21 +792,17 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const prepareAttachment = async (file: AttachmentFile) => {
     const bytes = new Uint8Array(await file.arrayBuffer())
     if (!bytes.length || bytes.length > attachmentLimit) throw new Error(`附件「${file.name}」需在 64 MiB 以内且不能为空。`)
-    const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((byte) => byte.toString(16).padStart(2, "0")).join("")
-    let binary = ''
-    for (let index = 0; index < bytes.length; index += 0x8000) binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000))
-    return { hash, size: bytes.length, name: attachmentName(file.name), data: btoa(binary) }
+    const hash = await sha256Hex(bytes)
+    return { hash, size: bytes.length, name: attachmentName(file.name), data: bytesToBase64(bytes) }
   }
   const uploadAttachment = async (id: string, file: NonNullable<OutboxItem['uploads']>[number]) => {
-    const bytes = Uint8Array.from(atob(file.data), (character) => character.charCodeAt(0))
+    const bytes = base64ToBytes(file.data)
     if (!bytes.length || bytes.length !== file.size || bytes.length > attachmentLimit) throw new Error('本地附件内容不完整，已保留原输入。')
     let offset = 0
     for (;;) {
       requireCurrent()
       const chunk = bytes.subarray(offset, offset + 1024 * 1024)
-      let binary = ""
-      for (let index = 0; index < chunk.length; index += 0x8000) binary += String.fromCharCode(...chunk.subarray(index, index + 0x8000))
-      const reply = record(await connection.rpc("upload_attachment", { conversation_id: id, hash: file.hash, size: bytes.length, offset, data: btoa(binary) }))
+      const reply = record(await connection.rpc("upload_attachment", { conversation_id: id, hash: file.hash, size: bytes.length, offset, data: bytesToBase64(chunk) }))
       if (reply.complete === true) return
       if (typeof reply.offset !== 'number' || !Number.isSafeInteger(reply.offset) || reply.offset < 0 || reply.offset > bytes.length || reply.offset === offset) throw new Error('附件上传进度无效，已保留原输入。')
       offset = reply.offset

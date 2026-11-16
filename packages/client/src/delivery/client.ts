@@ -2,7 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReadyConnection } from '../lib/node.ts'
 import { messageOf, record, same } from '../lib/node.ts'
 import type { KeyValue, Platform } from '../lib/platform.ts'
-import { amount, canRead, canRestart, checkedFile, fileName, intentId, needsRefresh, orderActions, parseBudgets, parseOrder, parseOrders, parsePending, parseProviders, parseReceived, parseStatus, peer, sha256, toBase64 } from './model.ts'
+import { bytesToBase64, sha256Hex } from '../lib/byte-codec.ts'
+import { amount, canRead, canRestart, checkedFile, fileName, intentId, needsRefresh, orderActions, parseBudgets, parseOrder, parseOrders, parsePending, parseProviders, parseReceived, parseStatus, peer } from './model.ts'
 import type { DeliveryBudget, DeliveryDraft, DeliveryOrder, DeliveryProvider, DeliverySettings, DeliveryStatus, PendingIntent, ReserveDeliveryIntent, TransferFile } from './types.ts'
 
 function authorization(order: DeliveryOrder) {
@@ -73,13 +74,13 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
       if (!Number.isSafeInteger(size) || size < 0 || size > status.max_file_bytes) throw new Error(`文件须在 ${status.max_file_bytes} 字节以内。`)
       const bytes = new Uint8Array(await file.arrayBuffer()).slice()
       if (bytes.length !== size) throw new Error('文件读取大小发生变化，请重新选择。')
-      const name = fileName(selectedName), digest = await sha256(bytes)
+      const name = fileName(selectedName), digest = await sha256Hex(bytes)
       const params = {
         receiver_peer: peer(terms.receiver_peer.trim()), provider_peer: peer(terms.provider_peer.trim()), mode: terms.mode, acceptance: terms.acceptance,
         name, max_service_amount: amount(terms.mode === 'charity' ? '0' : terms.max_service_amount.trim()), max_gas_amount: amount(terms.mode === 'charity' ? '0' : terms.max_gas_amount.trim()),
         budget_id: terms.mode === 'paid' ? peer(terms.budget_id) : null,
       }
-      const fingerprint = await sha256(new TextEncoder().encode(JSON.stringify({ ...params, sha256: digest, bytes: size })))
+      const fingerprint = await sha256Hex(new TextEncoder().encode(JSON.stringify({ ...params, sha256: digest, bytes: size })))
       if (restartIntentId !== undefined) {
         const previous = pending(fingerprint)
         if (previous?.intent_id !== intentId(restartIntentId)) throw new Error('再次发送须选择原订单相同的文件和条款；已有新的一次请先点“检查进度”。')
@@ -100,7 +101,7 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
         catch { throw new Error('无法保存这次发送记录，尚未提交。请允许保存本地数据后重试。') }
         return intent
       })
-      const order = parseOrder(await request('prepare', { ...params, intent_id: intent.intent_id, content_base64: toBase64(bytes) }))
+      const order = parseOrder(await request('prepare', { ...params, intent_id: intent.intent_id, content_base64: bytesToBase64(bytes) }))
       if (order.intent_id !== intent.intent_id || order.role !== 'sender' || order.source_peer !== nodePeer || order.receiver_peer !== params.receiver_peer || order.provider_peer !== params.provider_peer
         || order.mode !== terms.mode || order.name !== name || order.sha256 !== digest || order.bytes !== size
         || order.payment.budget_id !== params.budget_id || BigInt(order.payment.total) > BigInt(params.max_service_amount) || BigInt(order.payment.gas_cap) > BigInt(params.max_gas_amount)) throw new Error('设备返回的订单与本次选择不一致，未确认付款。请先查看原订单。')

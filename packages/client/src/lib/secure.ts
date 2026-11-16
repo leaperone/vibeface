@@ -1,3 +1,4 @@
+import { sha256Hex } from './byte-codec.ts'
 import type { SecureApi, SecureIdentity } from '../secure-api.ts'
 import { array, nodeNow, parsePrincipal, parseView, record, same, text } from './node.ts'
 import type { ClientPrincipal, MembershipView, PublicIdentity } from './node.ts'
@@ -11,7 +12,7 @@ export async function requestKey(payload: Uint8Array, signer: string): Promise<s
   const identity = encoder.encode(signer)
   const signed = new Uint8Array(payload.length + identity.length)
   signed.set(payload); signed.set(identity, payload.length)
-  return [...new Uint8Array(await crypto.subtle.digest('SHA-256', signed))].map(byte => byte.toString(16).padStart(2, '0')).join('')
+  return sha256Hex(signed)
 }
 /** What the device already trusts before it reads an authentication answer. */
 export type AuthenticationTrust = { kind: 'network'; networkId: string } | { kind: 'root'; networkId: string; genesis: unknown; checkpoint?: unknown } | { kind: 'local'; networkId: string; nodeId: string }
@@ -132,7 +133,7 @@ export function passphrase(password: string): string {
 /** The code a person matches between the settings page and a file name; never the key itself. */
 export async function recoveryCode(recoveryKey: string): Promise<string> {
   const key = Uint8Array.from(recoveryKey.match(/../g) ?? [], (pair) => parseInt(pair, 16))
-  return [...new Uint8Array(await crypto.subtle.digest('SHA-256', key)).slice(0, 4)].map((byte) => byte.toString(16).padStart(2, '0')).join('').toUpperCase()
+  return (await sha256Hex(key)).slice(0, 8).toUpperCase()
 }
 /** The recovery file's name stem: the code people match against the file they kept. */
 export const recoveryFileStem = (code: string) => `vibeface-recovery-${code}`

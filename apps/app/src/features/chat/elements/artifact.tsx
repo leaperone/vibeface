@@ -3,6 +3,7 @@ import { RecordBody,RecordPanel } from "@/components/arc/record-panel"
 import { ActionButton } from '@/features/workspace/present'
 import type { Attachment } from '@vibeface/client/chat/types.ts'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
+import { sha256Hex } from '@vibeface/client/lib/byte-codec.ts'
 import { formatSize } from '@vibeface/client/workspace/model.ts'
 import { Button } from '@vibeface/uiarc/button/button.tsx'
 import { Download,Eye,EyeOff,File } from 'lucide-react'
@@ -55,7 +56,7 @@ export function Artifact({ file: { hash, size, name }, conversationId }: { file:
           }
           const whole = new Uint8Array(size)
           parts.reduce((at, part) => { whole.set(part, at); return at + part.length }, 0)
-          const digest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', whole))].map((byte) => byte.toString(16).padStart(2, '0')).join('')
+          const digest = await sha256Hex(whole)
           if (digest !== hash) throw new Error('下载内容与原请求不符。')
           const url = URL.createObjectURL(new Blob([whole]))
           const link = document.createElement('a')
