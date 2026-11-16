@@ -3,7 +3,7 @@ import type { ConnectionEntry, LocalSetup, PublicIdentity, ReadyConnection } fro
 import type { OutboxStore } from './outbox.ts'
 import type { Transport } from './transport.ts'
 import type { NotificationRecord } from '../workspace/types.ts'
-import type { TransferFile } from '../delivery/types.ts'
+import type { ReserveDeliveryIntent, TransferFile } from '../delivery/types.ts'
 
 /** Synchronous string storage that survives restarts, like the browser's `localStorage`. */
 export type KeyValue = { getItem(key: string): string | null; setItem(key: string, value: string): void }
@@ -54,6 +54,7 @@ export type Platform = {
   secure: SecureApi
   transport: Transport
   storage: KeyValue
+  reserveDeliveryIntent: ReserveDeliveryIntent
   outbox: OutboxStore
   notifier: Notifier
   /** Whether this surface has a route for session handoff alerts. */

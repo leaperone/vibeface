@@ -7,6 +7,7 @@ import { lostKeyText } from '@vibeface/client/identity/copy.ts'
 import { indexedOutbox } from './indexed-outbox'
 import { localPage } from './local-page'
 import { joinTabs } from './tabs'
+import { webDeliveryReservations } from './delivery-reservations'
 
 const secure: SecureApi = wasm
 const lostKeyMessage = lostKeyText('这个浏览器')
@@ -85,6 +86,7 @@ const browserPlatform: Platform = {
   secure,
   transport: createTransport(secure, browserKeys),
   storage: { getItem: key => typeof localStorage === 'undefined' ? null : localStorage.getItem(key), setItem: (key, value) => localStorage.setItem(key, value) },
+  reserveDeliveryIntent: webDeliveryReservations(globalThis.navigator?.locks),
   outbox: indexedOutbox(),
   inputLock: (name, save) => globalThis.navigator?.locks ? navigator.locks.request(`vibeface-input:${name}`, save) : save(),
   notifier,

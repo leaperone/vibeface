@@ -181,7 +181,9 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
     return load(extname(path) ? path : `${path}.ts`)
   })
   const Provider = load(resolve(clientRoot, 'identity/context.tsx')).DeviceProvider
-  const platform = { secure: {}, transport, storage: sandbox.localStorage, page: load(resolve(sourceRoot, 'lib/local-page.ts')).localPage, self: '这个浏览器', saveRecovery(_bytes: Uint8Array, _name: string) {}, recoveryStorage: undefined as Platform['recoveryStorage'], joinTabs: undefined as Platform['joinTabs'], erase: undefined as Platform['erase'] }
+  const platform = {
+    reserveDeliveryIntent: async () => { throw new Error('unexpected delivery reservation') },
+    secure: {}, transport, storage: sandbox.localStorage, page: load(resolve(sourceRoot, 'lib/local-page.ts')).localPage, self: '这个浏览器', saveRecovery(_bytes: Uint8Array, _name: string) {}, recoveryStorage: undefined as Platform['recoveryStorage'], joinTabs: undefined as Platform['joinTabs'], erase: undefined as Platform['erase'] }
   let tabReceive: ((serialized: string) => void) | undefined
   const enableTabs = () => { platform.joinTabs = (_name, handlers) => { tabReceive = value => handlers.message(JSON.parse(value)); const stop = handlers.lead(); return { post() {}, close() { tabReceive = undefined; stop?.() } } } }
   let restarts = 0

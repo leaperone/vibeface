@@ -3,7 +3,7 @@ import type { ReadyConnection } from '../lib/node.ts'
 import { messageOf, record, same } from '../lib/node.ts'
 import type { KeyValue, Platform } from '../lib/platform.ts'
 import { amount, canRead, canRestart, checkedFile, fileName, intentId, needsRefresh, orderActions, parseBudgets, parseOrder, parseOrders, parsePending, parseProviders, parseReceived, parseStatus, peer, sha256, toBase64 } from './model.ts'
-import type { DeliveryBudget, DeliveryDraft, DeliveryOrder, DeliveryProvider, DeliverySettings, DeliveryStatus, PendingIntent, TransferFile } from './types.ts'
+import type { DeliveryBudget, DeliveryDraft, DeliveryOrder, DeliveryProvider, DeliverySettings, DeliveryStatus, PendingIntent, ReserveDeliveryIntent, TransferFile } from './types.ts'
 
 function authorization(order: DeliveryOrder) {
   const p = order.payment
@@ -16,7 +16,7 @@ export function shouldPollDelivery(enabled: boolean, orders: readonly DeliveryOr
   return enabled || orders.some(needsRefresh)
 }
 
-export function createDeliveryClient(connection: ReadyConnection, storage: KeyValue) {
+export function createDeliveryClient(connection: ReadyConnection, storage: KeyValue, reserveDeliveryIntent: ReserveDeliveryIntent) {
   const intentPrefix = `vibeface.delivery.${connection.principal.network_id}.${connection.principal.device_id}.${connection.entry.device_id}`
   const current = () => {
     if (!connection.isCurrent()) throw new Error('连接已切换。先查询原订单，不会自动重新付款。')
@@ -65,39 +65,44 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
     async configure(settings: DeliverySettings) { manage(); return parseStatus(await request('configure', settings)) },
     async prepare(draft: DeliveryDraft, file: TransferFile, status: DeliveryStatus, restartIntentId?: string) {
       manage()
-      if (draft.mode === 'charity' && draft.acceptance !== 'recoverable') throw new Error('免费传输不能选“对方打开后付款”。')
-      if (draft.mode === 'paid' && draft.acceptance !== 'recoverable') throw new Error('受保护付费仅支持可恢复验收，暂不支持 Strict。')
-      if (draft.mode === 'paid' && draft.budget_id === null) throw new Error('先选择已建立的预付预算。')
-      if (!status.enabled || draft.mode === 'charity' && !status.charity_enabled || draft.mode === 'paid' && !status.paid_enabled) throw new Error('这台设备尚未启用所选传输方式。')
-      if (!Number.isSafeInteger(file.size) || file.size < 0 || file.size > status.max_file_bytes) throw new Error(`文件须在 ${status.max_file_bytes} 字节以内。`)
-      const bytes = new Uint8Array(await file.arrayBuffer())
-      if (bytes.length !== file.size) throw new Error('文件读取大小发生变化，请重新选择。')
-      const name = fileName(file.name), digest = await sha256(bytes)
+      const terms = { ...draft }, size = file.size, selectedName = file.name, nodePeer = status.node_peer
+      if (terms.mode === 'charity' && terms.acceptance !== 'recoverable') throw new Error('免费传输不能选“对方打开后付款”。')
+      if (terms.mode === 'paid' && terms.acceptance !== 'recoverable') throw new Error('受保护付费仅支持可恢复验收，暂不支持 Strict。')
+      if (terms.mode === 'paid' && terms.budget_id === null) throw new Error('先选择已建立的预付预算。')
+      if (!status.enabled || terms.mode === 'charity' && !status.charity_enabled || terms.mode === 'paid' && !status.paid_enabled) throw new Error('这台设备尚未启用所选传输方式。')
+      if (!Number.isSafeInteger(size) || size < 0 || size > status.max_file_bytes) throw new Error(`文件须在 ${status.max_file_bytes} 字节以内。`)
+      const bytes = new Uint8Array(await file.arrayBuffer()).slice()
+      if (bytes.length !== size) throw new Error('文件读取大小发生变化，请重新选择。')
+      const name = fileName(selectedName), digest = await sha256(bytes)
       const params = {
-        receiver_peer: peer(draft.receiver_peer.trim()), provider_peer: peer(draft.provider_peer.trim()), mode: draft.mode, acceptance: draft.acceptance,
-        name, max_service_amount: amount(draft.mode === 'charity' ? '0' : draft.max_service_amount.trim()), max_gas_amount: amount(draft.mode === 'charity' ? '0' : draft.max_gas_amount.trim()),
-        budget_id: draft.mode === 'paid' ? peer(draft.budget_id) : null,
+        receiver_peer: peer(terms.receiver_peer.trim()), provider_peer: peer(terms.provider_peer.trim()), mode: terms.mode, acceptance: terms.acceptance,
+        name, max_service_amount: amount(terms.mode === 'charity' ? '0' : terms.max_service_amount.trim()), max_gas_amount: amount(terms.mode === 'charity' ? '0' : terms.max_gas_amount.trim()),
+        budget_id: terms.mode === 'paid' ? peer(terms.budget_id) : null,
       }
-      const fingerprint = await sha256(new TextEncoder().encode(JSON.stringify({ ...params, sha256: digest, bytes: file.size })))
-      const previous = pending(fingerprint)
+      const fingerprint = await sha256(new TextEncoder().encode(JSON.stringify({ ...params, sha256: digest, bytes: size })))
       if (restartIntentId !== undefined) {
+        const previous = pending(fingerprint)
         if (previous?.intent_id !== intentId(restartIntentId)) throw new Error('再次发送须选择原订单相同的文件和条款；已有新的一次请先点“检查进度”。')
         const observed = await findIntent(restartIntentId)
         if (!observed || !canRestart(observed)) throw new Error('原来那次发送还没结束。先查看原订单，不会另付一笔。')
-        if (observed.mode !== draft.mode || observed.receiver_peer !== params.receiver_peer || observed.provider_peer !== params.provider_peer
-          || observed.name !== name || observed.sha256 !== digest || observed.bytes !== file.size) throw new Error('原来那次发送的文件或条款对不上，不能创建新订单。')
-        if (pending(fingerprint)?.intent_id !== previous.intent_id) throw new Error('这个文件的发送记录已在另一处更新，请先刷新并查看原订单。')
+        if (observed.mode !== terms.mode || observed.receiver_peer !== params.receiver_peer || observed.provider_peer !== params.provider_peer
+          || observed.name !== name || observed.sha256 !== digest || observed.bytes !== size) throw new Error('原来那次发送的文件或条款对不上，不能创建新订单。')
       }
-      const intent = previous && restartIntentId === undefined ? previous : { intent_id: crypto.randomUUID(), fingerprint }
-      current()
-      try {
-        storage.setItem(`${intentPrefix}.intent.${fingerprint}`, JSON.stringify(intent))
-        storage.setItem(`${intentPrefix}.recent`, intent.intent_id)
-      }
-      catch { throw new Error('无法保存这次发送记录，尚未提交。请允许保存本地数据后重试。') }
+      const intent = await reserveDeliveryIntent(`${intentPrefix}.intent.${fingerprint}`, () => {
+        current()
+        const previous = pending(fingerprint)
+        if (restartIntentId !== undefined && previous?.intent_id !== restartIntentId) throw new Error('这个文件的发送记录已在另一处更新，请先刷新并查看原订单。')
+        const intent = previous && restartIntentId === undefined ? previous : { intent_id: crypto.randomUUID(), fingerprint }
+        try {
+          storage.setItem(`${intentPrefix}.intent.${fingerprint}`, JSON.stringify(intent))
+          storage.setItem(`${intentPrefix}.recent`, intent.intent_id)
+        }
+        catch { throw new Error('无法保存这次发送记录，尚未提交。请允许保存本地数据后重试。') }
+        return intent
+      })
       const order = parseOrder(await request('prepare', { ...params, intent_id: intent.intent_id, content_base64: toBase64(bytes) }))
-      if (order.intent_id !== intent.intent_id || order.role !== 'sender' || order.source_peer !== status.node_peer || order.receiver_peer !== params.receiver_peer || order.provider_peer !== params.provider_peer
-        || order.mode !== draft.mode || order.name !== name || order.sha256 !== digest || order.bytes !== file.size
+      if (order.intent_id !== intent.intent_id || order.role !== 'sender' || order.source_peer !== nodePeer || order.receiver_peer !== params.receiver_peer || order.provider_peer !== params.provider_peer
+        || order.mode !== terms.mode || order.name !== name || order.sha256 !== digest || order.bytes !== size
         || order.payment.budget_id !== params.budget_id || BigInt(order.payment.total) > BigInt(params.max_service_amount) || BigInt(order.payment.gas_cap) > BigInt(params.max_gas_amount)) throw new Error('设备返回的订单与本次选择不一致，未确认付款。请先查看原订单。')
       return order
     },
@@ -142,7 +147,7 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
 }
 
 export function useDelivery(connection: ReadyConnection, platform: Platform) {
-  const client = useMemo(() => createDeliveryClient(connection, platform.storage), [connection, platform.storage])
+  const client = useMemo(() => createDeliveryClient(connection, platform.storage, platform.reserveDeliveryIntent), [connection, platform.storage, platform.reserveDeliveryIntent])
   const canManage = connection.principal.source === 'membership' && connection.principal.can_manage
   const [status, setStatus] = useState<DeliveryStatus | null>(null)
   const [orders, setOrders] = useState<DeliveryOrder[]>([])

@@ -103,6 +103,8 @@ export type TransferFile = {
 }
 export type ReceivedFile = { name: string; content_base64: string; sha256: string; bytes: number }
 export type PendingIntent = { intent_id: string; fingerprint: string }
+/** Serializes the synchronous read/reuse/create and persistence of one full intent key. */
+export type ReserveDeliveryIntent = (key: string, reserve: () => PendingIntent) => Promise<PendingIntent>
 
 /** A selection owns its private copy; an operation holds it until its promise settles. */
 export function transferSelection() {
