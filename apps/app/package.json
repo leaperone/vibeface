@@ -2,10 +2,6 @@
   "name": "vibeface-web",
   "private": true,
   "type": "module",
-  "imports": {
-    "#components/*": "./src/components/*",
-    "#hooks/*": "./src/lib/hooks/*"
-  },
   "scripts": {
     "dev": "vite dev --port 3000",
     "generate-routes": "tsr generate",

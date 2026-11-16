@@ -6,6 +6,6 @@ The migration preserves the three root destinations, 消息、任务、设置. P
 
 The source corrections from independent review include neutral alert and approval panels, Card radius 26px with 20px padding, per-size Arc line heights, and 44px interactive containers around 36px small buttons. Severity appears in the status glyph and copy.
 
-Run `node scripts/check-uiarc-native.cjs` from the repository root to check the actual iOS and Android styles produced by Uniwind. Run `node scripts/check-uiarc-parity.cjs` to compare the original product copy and event expressions against the migration baseline. The recorded baseline has 1,039 Chinese copy instances and 288 event bindings across 51 product modules.
+Run `node scripts/check-uiarc-native.cjs` from the repository root to check the actual iOS and Android styles produced by Uniwind. Official Arc checks are `pnpm check:ui`.
 
 These checks supplement the mobile type check, unit suite and Expo production export. They do not replace installed-app, screen-reader, keyboard, gesture or visual acceptance on a device. This migration did not run device or screenshot acceptance.
