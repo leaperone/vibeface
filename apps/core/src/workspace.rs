@@ -127,7 +127,7 @@ mod tests {
         let unsigned = input_event_body(&input, None);
         assert_eq!(serde_json::to_value(&unsigned)?, expected);
         assert_eq!(
-            attestation_payload(&network, "chat", &unsigned)?,
+            attestation_payload(network, "chat", &unsigned)?,
             payload.as_bytes()
         );
 
@@ -145,16 +145,16 @@ mod tests {
         assert_eq!(serde_json::to_value(&signed)?, expected_signed);
         assert_eq!(signed.attestation(), Some(&attestation));
         assert_eq!(
-            attestation_payload(&network, "chat", &signed)?,
+            attestation_payload(network, "chat", &signed)?,
             payload.as_bytes()
         );
-        verify_attestation(&network, "chat", &signed)?;
+        verify_attestation(network, "chat", &signed)?;
         assert_eq!(
-            request_key(&network, "chat", &signed, "entry-one")?,
-            request_key(&network, "chat", &signed, "entry-two")?,
+            request_key(network, "chat", &signed, "entry-one")?,
+            request_key(network, "chat", &signed, "entry-two")?,
         );
         let independent: crate::model::EventBody = serde_json::from_value(expected_signed)?;
-        verify_attestation(&network, "chat", &independent)?;
+        verify_attestation(network, "chat", &independent)?;
         Ok(())
     }
 
