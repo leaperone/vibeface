@@ -963,11 +963,7 @@ async fn status(options: Access) -> Result<()> {
                     Some(false) => "unreachable",
                     None => "not tried yet",
                 };
-                let synced = peer["synced_ms"]
-                    .as_i64()
-                    .map_or("never synced".into(), |at| {
-                        format!("synced {}s ago", now.saturating_sub(at) / 1000)
-                    });
+                let synced = plain_sync_description(peer["synced_ms"].as_i64(), now);
                 println!(
                     "Peer: {} ({}) {link}, {synced}",
                     peer["name"].as_str().unwrap_or_default(),
@@ -984,6 +980,12 @@ async fn status(options: Access) -> Result<()> {
         "node is not reachable through its private maintenance socket"
     );
     Ok(())
+}
+
+fn plain_sync_description(synced_ms: Option<i64>, now_ms: i64) -> String {
+    synced_ms.map_or("never synced".into(), |at| {
+        format!("synced {}s ago", now_ms.saturating_sub(at).max(0) / 1000)
+    })
 }
 
 async fn mesh(options: MeshOptions) -> Result<()> {
@@ -2490,6 +2492,45 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_sync_description_clamps_future_timestamp() {
+        assert_eq!(plain_sync_description(Some(3001), 1000), "synced 0s ago");
+    }
+
+    #[test]
+    fn plain_sync_description_preserves_missing_and_seconds_format() {
+        assert_eq!(plain_sync_description(None, 1000), "never synced");
+        for (now_ms, expected) in [
+            (1000, "synced 0s ago"),
+            (1999, "synced 0s ago"),
+            (2000, "synced 1s ago"),
+            (2999, "synced 1s ago"),
+            (62000, "synced 61s ago"),
+        ] {
+            assert_eq!(plain_sync_description(Some(1000), now_ms), expected);
+        }
+    }
+
+    #[test]
+    fn plain_sync_description_saturates_timestamp_extremes() {
+        assert_eq!(
+            plain_sync_description(Some(i64::MIN), i64::MAX),
+            "synced 9223372036854775s ago"
+        );
+        assert_eq!(
+            plain_sync_description(Some(i64::MAX), i64::MIN),
+            "synced 0s ago"
+        );
+        assert_eq!(
+            plain_sync_description(Some(i64::MAX), i64::MAX),
+            "synced 0s ago"
+        );
+        assert_eq!(
+            plain_sync_description(Some(i64::MIN), i64::MIN),
+            "synced 0s ago"
+        );
+    }
 
     pub(crate) fn mark_runnable(path: &Path) {
         #[cfg(unix)]
