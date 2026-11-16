@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::Request};
-use vibeface_bridge::platform::privatefs;
+use vibeface_bridge::{platform::privatefs, transport};
 use zeroize::Zeroizing;
 
 const HTTP_LIMIT: usize = 16 * 1024;
@@ -260,28 +260,17 @@ impl LocalGrant {
 }
 
 async fn decode<T: serde::de::DeserializeOwned>(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     refusal: &'static str,
 ) -> Result<T> {
     ensure!(response.status() == reqwest::StatusCode::OK, "{refusal}");
-    ensure!(
-        response
-            .content_length()
-            .is_none_or(|length| length <= HTTP_LIMIT as u64),
-        "local HTTP response too large"
-    );
     let mut bytes = Zeroizing::new(Vec::new());
-    while let Some(chunk) = response
-        .chunk()
+    transport::body(response, HTTP_LIMIT, &mut bytes)
         .await
-        .map_err(|_| anyhow!("local HTTP response interrupted"))?
-    {
-        ensure!(
-            bytes.len() + chunk.len() <= HTTP_LIMIT,
-            "local HTTP response too large"
-        );
-        bytes.extend_from_slice(&chunk);
-    }
+        .map_err(|error| match error {
+            transport::BodyError::TooLarge => anyhow!("local HTTP response too large"),
+            transport::BodyError::Read(_) => anyhow!("local HTTP response interrupted"),
+        })?;
     serde_json::from_slice(&bytes).map_err(|_| anyhow!("invalid local HTTP response"))
 }
 

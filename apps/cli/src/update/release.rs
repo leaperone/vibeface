@@ -14,12 +14,12 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use vibeface_bridge::platform::privatefs;
+use vibeface_bridge::{platform::privatefs, transport};
 use vibeface_control::{DATA_EPOCH, UPDATE_PROTOCOL};
 
 const API: &str = "https://api.github.com/repos/leaperone/vibeface";
 const MAX_PAGES: usize = 20;
-const MAX_JSON: u64 = 4 * 1024 * 1024;
+const MAX_JSON: usize = 4 * 1024 * 1024;
 const MAX_ARCHIVE: u64 = 128 * 1024 * 1024;
 const MAX_UNPACKED: u64 = 512 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
@@ -495,24 +495,23 @@ fn request(client: &Client, url: Url, token: Option<&str>) -> reqwest::RequestBu
     }
 }
 
-async fn get_bytes(client: &Client, url: &str, limit: u64) -> Result<Vec<u8>> {
-    let mut response = response(client, url).await?;
-    ensure!(
-        response.content_length().is_none_or(|size| size <= limit),
-        "release response exceeds limit"
-    );
+async fn get_bytes(client: &Client, url: &str, limit: usize) -> Result<Vec<u8>> {
+    let response = response(client, url).await?;
+    release_body(response, limit).await
+}
+
+async fn release_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        ensure!(
-            body.len() as u64 + chunk.len() as u64 <= limit,
-            "release response exceeds limit"
-        );
-        body.extend_from_slice(&chunk);
-    }
+    transport::body(response, limit, &mut body)
+        .await
+        .map_err(|error| match error {
+            transport::BodyError::TooLarge => anyhow::anyhow!("release response exceeds limit"),
+            transport::BodyError::Read(error) => error.into(),
+        })?;
     Ok(body)
 }
 
-async fn get_optional_bytes(client: &Client, url: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+async fn get_optional_bytes(client: &Client, url: &str, limit: usize) -> Result<Option<Vec<u8>>> {
     let url = Url::parse(url)?;
     ensure!(trusted_url(&url), "update URL is not approved");
     let token = std::env::var("GITHUB_TOKEN").ok();
@@ -524,22 +523,11 @@ async fn get_optional_bytes(client: &Client, url: &str, limit: u64) -> Result<Op
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
-    let mut response = response
+    let response = response
         .error_for_status()
+        .map_err(reqwest::Error::without_url)
         .context("fetch release completion manifest")?;
-    ensure!(
-        response.content_length().is_none_or(|size| size <= limit),
-        "release response exceeds limit"
-    );
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        ensure!(
-            body.len() + chunk.len() <= limit as usize,
-            "release response exceeds limit"
-        );
-        body.extend_from_slice(&chunk);
-    }
-    Ok(Some(body))
+    release_body(response, limit).await.map(Some)
 }
 
 /// Download and verify the complete package, then atomically publish its directory.
