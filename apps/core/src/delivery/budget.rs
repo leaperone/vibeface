@@ -1783,6 +1783,16 @@ impl Delivery {
         claim: &mut PublicationClaim,
         execute: bool,
     ) -> Result<()> {
+        self.reconcile_publication_with_clock(chain, claim, execute, super::now)
+            .await
+    }
+    async fn reconcile_publication_with_clock(
+        &self,
+        chain: &chain::Chain,
+        claim: &mut PublicationClaim,
+        execute: bool,
+        local_clock: impl Fn() -> u64,
+    ) -> Result<()> {
         let candidate = claim.state.take_settlement_candidate();
         let record = self.budget_record(&claim.terms.budget_id)?;
         ensure!(
@@ -1896,7 +1906,7 @@ impl Delivery {
             };
         }
         let (chain_now, base_fee) = chain.publication_clock().await?;
-        let local_now = super::now();
+        let local_now = local_clock();
         if let Some(first_possible_at) = disclosed
             && rights_ended
             && !claim.attempts.is_empty()
@@ -1942,7 +1952,7 @@ impl Delivery {
             claim.risk = nonce_risk.or_else(|| Some("windows earned less than the authorized whole-order amount; original bonus conditions were missed".into()));
             return self.save_claim(claim);
         }
-        let now = super::now().max(chain_now);
+        let now = local_clock().max(chain_now);
         let cleanup_started = self.with_store(|s| {
             for id in &claim.attempts {
                 if !s.publication_recoveries(id)?.is_empty() {
@@ -2075,7 +2085,7 @@ impl Delivery {
         // Signing is private. Recheck immediately before the first possible E-bearing RPC.
         chain.verify_position(&position).await?;
         let (chain_now, latest_base_fee) = chain.publication_clock().await?;
-        let now = super::now().max(chain_now);
+        let now = local_clock().max(chain_now);
         ensure!(
             claim.terms.policy.disclosure_allowed(
                 &claim.state,
@@ -2102,7 +2112,7 @@ impl Delivery {
         );
         // The nonce/balance reads can consume the first-disclosure margin too.
         let (chain_now, _) = chain.publication_clock().await?;
-        let now = super::now().max(chain_now);
+        let now = local_clock().max(chain_now);
         ensure!(
             claim.terms.policy.disclosure_allowed(
                 &claim.state,
@@ -2228,6 +2238,7 @@ mod tests {
         orders: Vec<StoredOrder>,
         dir: std::path::PathBuf,
         now: u64,
+        clock: std::time::Instant,
     }
 
     struct NonceObservation {
@@ -3088,7 +3099,13 @@ mod tests {
                 orders,
                 dir,
                 now,
+                clock,
             })
+        }
+        fn local_clock(&self) -> impl Fn() -> u64 + use<> {
+            let now = self.now;
+            let clock = self.clock;
+            move || now + clock.elapsed().as_secs()
         }
         async fn provider() -> Result<Self> {
             let mut fixture = Self::with_claims([3, 3], false).await?;
@@ -3614,6 +3631,7 @@ mod tests {
     -> Result<()> {
         for outcome in ["confirmed", "reverted", "unknown"] {
             let mut fixture = PublicationFixture::new([3, 3]).await?;
+            let local_clock = fixture.local_clock();
             {
                 let mut observed = fixture.observation.lock().unwrap();
                 observed.receipt_status = u64::from(outcome == "confirmed");
@@ -3622,7 +3640,12 @@ mod tests {
             let before = fixture.original_transactions()?;
             fixture
                 .delivery
-                .reconcile_publication(&fixture.rpc.chain, &mut fixture.claims[0], false)
+                .reconcile_publication_with_clock(
+                    &fixture.rpc.chain,
+                    &mut fixture.claims[0],
+                    false,
+                    &local_clock,
+                )
                 .await?;
             assert!(matches!(
                 fixture.claims[0].state,
@@ -3655,6 +3678,7 @@ mod tests {
             [([4, 4], false, 0), ([3, 4], false, 0), ([3, 3], true, 1)]
         {
             let mut fixture = PublicationFixture::new(phases).await?;
+            let local_clock = fixture.local_clock();
             {
                 let mut observed = fixture.observation.lock().unwrap();
                 observed.refunded_bonus = refunded_bonus;
@@ -3664,7 +3688,12 @@ mod tests {
             for claim in &mut fixture.claims {
                 fixture
                     .delivery
-                    .reconcile_publication(&fixture.rpc.chain, claim, false)
+                    .reconcile_publication_with_clock(
+                        &fixture.rpc.chain,
+                        claim,
+                        false,
+                        &local_clock,
+                    )
                     .await?;
                 assert!(claim.occupies_publication_window(fixture.now)?);
             }
@@ -3678,8 +3707,19 @@ mod tests {
             for claim in &mut fixture.claims {
                 fixture
                     .delivery
-                    .reconcile_publication(&fixture.rpc.chain, claim, false)
+                    .reconcile_publication_with_clock(
+                        &fixture.rpc.chain,
+                        claim,
+                        false,
+                        &local_clock,
+                    )
                     .await?;
+                assert!(
+                    matches!(claim.state, ClaimState::FinalSettled { .. }),
+                    "phases={phases:?}, refunded_bonus={refunded_bonus}, state={:?}, risk={:?}",
+                    claim.state,
+                    claim.risk
+                );
             }
             let mut settings = fixture.delivery.config();
             settings.enabled = true;
@@ -3690,12 +3730,10 @@ mod tests {
                 .queue_publication(&fixture.rpc.chain, &id, &fixture.orders[2..])
                 .await?;
             let claims = fixture.delivery.claims()?;
-            assert_eq!(claims.len(), 3);
-            assert!(
-                fixture
-                    .claims
-                    .iter()
-                    .all(|claim| matches!(claim.state, ClaimState::FinalSettled { .. }))
+            assert_eq!(
+                claims.len(),
+                3,
+                "phases={phases:?}, refunded_bonus={refunded_bonus}"
             );
             let new = claims
                 .iter()
@@ -3722,26 +3760,124 @@ mod tests {
                 }
                 let result = fixture
                     .delivery
-                    .reconcile_publication(&fixture.rpc.chain, &mut fixture.claims[0], false)
+                    .reconcile_publication_with_clock(
+                        &fixture.rpc.chain,
+                        &mut fixture.claims[0],
+                        false,
+                        &local_clock,
+                    )
                     .await;
                 if history == "reorg" {
-                    assert!(result.is_err());
+                    assert!(
+                        result.is_err(),
+                        "history={history}, phases={phases:?}, refunded_bonus={refunded_bonus}"
+                    );
                     fixture.delivery.save_claim(&fixture.claims[0])?;
                 } else {
-                    result?;
+                    result.with_context(|| {
+                        format!(
+                            "history={history}, phases={phases:?}, refunded_bonus={refunded_bonus}"
+                        )
+                    })?;
                 }
-                assert!(matches!(
-                    fixture.claims[0].state,
-                    ClaimState::DisclosedOutstanding {
-                        settlement_candidate: None,
-                        ..
-                    }
-                ));
+                assert!(
+                    matches!(
+                        fixture.claims[0].state,
+                        ClaimState::DisclosedOutstanding {
+                            settlement_candidate: None,
+                            ..
+                        }
+                    ),
+                    "history={history}, phases={phases:?}, refunded_bonus={refunded_bonus}"
+                );
                 assert_eq!(
                     fixture.claims[0].state.first_possible_at(),
                     Some(fixture.now - 100)
                 );
                 assert!(fixture.claims[0].occupies_publication_window(fixture.now)?);
+            }
+            fixture.assert_read_only(&before)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn backward_local_clock_keeps_claims_active_while_matching_clock_allows_a_new_queue()
+    -> Result<()> {
+        for backward in [true, false] {
+            let mut fixture = PublicationFixture::new([3, 3]).await?;
+            let local_clock = fixture.local_clock();
+            let fixture_now = fixture.now;
+            let clock = || {
+                if backward {
+                    fixture_now - 4
+                } else {
+                    local_clock()
+                }
+            };
+            {
+                let mut observed = fixture.observation.lock().unwrap();
+                observed.refunded_bonus = true;
+                observed.receipt_status = 1;
+            }
+            let before = fixture.original_transactions()?;
+            fixture.age_candidates()?;
+            for claim in &mut fixture.claims {
+                fixture
+                    .delivery
+                    .reconcile_publication_with_clock(&fixture.rpc.chain, claim, false, &clock)
+                    .await?;
+            }
+            let mut settings = fixture.delivery.config();
+            settings.enabled = true;
+            settings.paid_enabled = true;
+            fixture.delivery.configure_local(settings)?;
+            let id = fixture.orders[2].view.payment.budget_id.as_ref().unwrap();
+            fixture
+                .delivery
+                .queue_publication(&fixture.rpc.chain, id, &fixture.orders[2..])
+                .await?;
+            let claims = fixture.delivery.claims()?;
+            let mut states = claims
+                .iter()
+                .map(|claim| claim.state.name())
+                .collect::<Vec<_>>();
+            states.sort_unstable();
+            if backward {
+                assert_eq!(states, ["disclosed_outstanding", "disclosed_outstanding"]);
+                for claim in &claims {
+                    assert!(matches!(
+                        claim.state,
+                        ClaimState::DisclosedOutstanding {
+                            settlement_candidate: None,
+                            ..
+                        }
+                    ));
+                    assert_eq!(
+                        claim.risk.as_deref(),
+                        Some(
+                            "windows earned less than the authorized whole-order amount; original bonus conditions were missed"
+                        )
+                    );
+                }
+            } else {
+                assert_eq!(states, ["final_settled", "final_settled", "private_ready"]);
+                let new = claims
+                    .iter()
+                    .find(|claim| &claim.terms.budget_id == id)
+                    .unwrap();
+                assert_eq!(new.terms.items.len(), 2);
+                for item in &new.terms.items {
+                    assert_eq!(
+                        fixture
+                            .delivery
+                            .with_store(|store| store.value(&claim_window_key(&item.window)))?,
+                        Some(new.id.as_bytes().to_vec())
+                    );
+                }
+            }
+            for transaction in fixture.original_transactions()? {
+                assert_eq!(transaction.phase, "confirmed");
             }
             fixture.assert_read_only(&before)?;
         }
@@ -3767,6 +3903,7 @@ mod tests {
             "current_reorg",
         ] {
             let mut fixture = PublicationFixture::new([3, 4]).await?;
+            let local_clock = fixture.local_clock();
             fixture.age_candidates()?;
             {
                 let mut observed = fixture.observation.lock().unwrap();
@@ -3795,7 +3932,7 @@ mod tests {
                         ..
                     } = &mut claim.state
                     {
-                        candidate.observed_at = super::super::now();
+                        candidate.observed_at = local_clock();
                     }
                 }
             }
@@ -3820,10 +3957,11 @@ mod tests {
                     assert!(
                         tokio::time::timeout(
                             std::time::Duration::ZERO,
-                            fixture.delivery.reconcile_publication(
+                            fixture.delivery.reconcile_publication_with_clock(
                                 &fixture.rpc.chain,
                                 claim,
-                                false
+                                false,
+                                &local_clock,
                             )
                         )
                         .await
@@ -3841,10 +3979,15 @@ mod tests {
                 }
                 let result = fixture
                     .delivery
-                    .reconcile_publication(&fixture.rpc.chain, claim, false)
+                    .reconcile_publication_with_clock(
+                        &fixture.rpc.chain,
+                        claim,
+                        false,
+                        &local_clock,
+                    )
                     .await;
                 if matches!(case, "rpc" | "reorg" | "moved_receipt" | "current_reorg") {
-                    assert!(result.is_err());
+                    assert!(result.is_err(), "case={case}");
                     fixture.delivery.save_claim(claim)?;
                 } else {
                     result?;
