@@ -1,4 +1,5 @@
 import * as deliveryModel from '@vibeface/client/delivery/model.ts'
+import * as byteCodec from '@vibeface/client/lib/byte-codec.ts'
 import { transferSelection, type DeliveryBudget } from '@vibeface/client/delivery/types.ts'
 import { parseChanged } from '@vibeface/client/lib/progress.ts'
 import * as workspaceHistory from '@vibeface/client/workspace/history.ts'
@@ -1916,6 +1917,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   const nativeRouter = typeof nativeRouterModule === 'object' && nativeRouterModule !== null && 'router' in nativeRouterModule ? nativeRouterModule.router : {}
   const require = (specifier: string): unknown => {
     if (realModules[specifier]) return loadComponentModule(fileURLToPath(new URL(realModules[specifier], import.meta.url)))
+    if (specifier === '@vibeface/client/lib/byte-codec.ts') return dependencies[specifier] ?? byteCodec
     if (specifier === '@/lib/qr-code') return loadQr(fileURLToPath(new URL('../../lib/qr-code.ts', import.meta.url)))
     if (specifier === 'qrcode-generator') return dependencies[specifier] ?? qrcode
     if (specifier === '@/components/arc/routed-action') return { RoutedAction: 'Link', ActionLink: 'a' }
