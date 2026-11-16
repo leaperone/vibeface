@@ -1,5 +1,4 @@
 export type DeliveryMode = 'charity' | 'paid'
-export type Acceptance = 'recoverable' | 'strict'
 export type DeliveryPhase = 'prepared' | 'funding_pending' | 'proving' | 'funded' | 'transferring' | 'cipher_held' | 'key_published' | 'recoverable' | 'paid' | 'partial' | 'refunded' | 'reconciling' | 'key_unavailable' | 'failed'
 export type DeliveryEvidence = 'none' | 'charity_receipt' | 'ciphertext_held' | 'recoverable' | 'decryption_proven'
 export type PaymentState = 'free' | 'prepared' | 'confirmed' | 'earned' | 'withdrawn' | 'refunded' | 'unknown' | 'failed'
@@ -70,7 +69,7 @@ export type DeliveryOrder = {
   intent_id: string
   role: 'sender' | 'receiver' | 'provider'
   mode: DeliveryMode
-  acceptance: Acceptance
+  acceptance: 'recoverable'
   source_peer: string
   receiver_peer: string
   provider_peer: string
@@ -90,7 +89,7 @@ export type DeliveryDraft = {
   receiver_peer: string
   provider_peer: string
   mode: DeliveryMode
-  acceptance: Acceptance
+  acceptance: 'recoverable'
   max_service_amount: string
   max_gas_amount: string
   budget_id: string | null

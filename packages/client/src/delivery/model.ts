@@ -97,7 +97,7 @@ export function parseOrder(value: unknown): DeliveryOrder {
   const windows = array(v.windows)
   if (windows.length > 16) throw new Error('订单分段数超过上限。')
   const order: DeliveryOrder = {
-    order_id: peer(v.order_id), intent_id: intentId(v.intent_id), role: member(v.role, ['sender', 'receiver', 'provider']), mode: member(v.mode, ['charity', 'paid']), acceptance: member(v.acceptance, ['recoverable', 'strict']),
+    order_id: peer(v.order_id), intent_id: intentId(v.intent_id), role: member(v.role, ['sender', 'receiver', 'provider']), mode: member(v.mode, ['charity', 'paid']), acceptance: member(v.acceptance, ['recoverable']),
     source_peer: peer(v.source_peer), receiver_peer: peer(v.receiver_peer), provider_peer: peer(v.provider_peer), name: nullable(v.name, fileName), bytes: integer(v.bytes, protocolMaxBytes), sha256: nullable(v.sha256, peer),
     phase: member(v.phase, ['prepared', 'funding_pending', 'proving', 'funded', 'transferring', 'cipher_held', 'key_published', 'recoverable', 'paid', 'partial', 'refunded', 'reconciling', 'key_unavailable', 'failed']),
     evidence: member(v.evidence, ['none', 'charity_receipt', 'ciphertext_held', 'recoverable', 'decryption_proven']), payment: payment(v.payment), deadlines: deadlines(v.deadlines),
@@ -110,10 +110,10 @@ export function parseOrder(value: unknown): DeliveryOrder {
   }
   if (order.mode === 'charity') {
     const p = order.payment
-    if (order.acceptance !== 'recoverable' || p.state !== 'free' || [p.delivery_fee, p.reservation_fee, p.priority_fee, p.total, p.gas_cap, p.earned, p.withdrawn, p.refunded].some(value => value !== '0')
+    if (p.state !== 'free' || [p.delivery_fee, p.reservation_fee, p.priority_fee, p.total, p.gas_cap, p.earned, p.withdrawn, p.refunded].some(value => value !== '0')
       || [p.chain_id, p.asset, p.payer, p.provider_wallet, p.tx_hash, p.budget_id, p.settlement].some(value => value !== null)
       || !['none', 'charity_receipt'].includes(order.evidence) || order.windows.some(window => window.decryption_proven)) throw new Error('免费订单不能带付款或付款条件。')
-  } else if (order.acceptance !== 'recoverable' || order.payment.state === 'free' || order.payment.chain_id === null || order.payment.asset === null || order.payment.payer === null || order.payment.provider_wallet === null || order.payment.budget_id === null) throw new Error('受保护订单需要固定预付预算，只支持可恢复验收。')
+  } else if (order.payment.state === 'free' || order.payment.chain_id === null || order.payment.asset === null || order.payment.payer === null || order.payment.provider_wallet === null || order.payment.budget_id === null) throw new Error('受保护订单需要固定预付预算，只支持可恢复验收。')
   if (order.mode === 'paid') {
     const d = order.deadlines
     if (!d || d.quote_expires_at === 0 || d.quote_expires_at > d.hold_deadline || d.hold_deadline >= d.key_deadline || d.key_deadline > d.open_deadline || d.open_deadline > d.retain_until
@@ -159,11 +159,8 @@ export function parsePending(value: unknown): PendingIntent {
   const v = record(value)
   return { intent_id: intentId(v.intent_id), fingerprint: peer(v.fingerprint) }
 }
-export function changeMode(draft: DeliveryDraft, mode: DeliveryMode): DeliveryDraft {
-  return { ...draft, mode, acceptance: mode === 'charity' ? 'recoverable' : draft.acceptance }
-}
 /** What gets sent: without 实验功能 only free delivery, since paid runs on a test chain. */
-export const draftFor = (draft: DeliveryDraft, experiments: boolean): DeliveryDraft => experiments ? draft : changeMode(draft, 'charity')
+export const draftFor = (draft: DeliveryDraft, experiments: boolean): DeliveryDraft => experiments ? draft : { ...draft, mode: 'charity' }
 export function canRestart(order: DeliveryOrder): boolean {
   if (order.role !== 'sender') return false
   if (order.mode === 'charity') return order.phase === 'recoverable' && order.evidence === 'charity_receipt' && order.windows.length > 0
