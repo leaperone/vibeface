@@ -7339,14 +7339,6 @@ def delivery_charity_acceptance(options):
 
 
 
-def delivery_ui_selfcheck(_options):
-    raise ValueError("the former Strict delivery UI controller selfcheck is retired; use --delivery-protected-selfcheck for the current driver without starting processes or proofs")
-
-
-def delivery_paid_acceptance(options):
-    raise ValueError("the former Strict/13-proof delivery runner is retired; protected delivery uses prepaid budgets, confirm_batch and explicit provider budget flush with schema-2 evidence")
-
-
 def delivery_protected_selfcheck():
     driver = runpy.run_path(str(Path(__file__).resolve().with_name("verify-delivery-protected.py")))
     driver["self_test"]()
@@ -7762,25 +7754,21 @@ if __name__ == "__main__":
         modes.add_argument("--native-clipboard-selfcheck", action="store_true", help=argparse.SUPPRESS)
         modes.add_argument("--client-response-drop-selfcheck", action="store_true", help=argparse.SUPPRESS)
         modes.add_argument("--delivery-charity", action="store_true", help="check the free mesh, charity transfer, loopback service boundaries and durable restart")
-        modes.add_argument("--delivery", action="store_true", help="retired Strict full-delivery runner; fails explicitly without starting paid work")
         modes.add_argument("--delivery-protected", action="store_true", help="run fresh two-order protected budgets with five genuine receipts in the bounded Linux proof sandbox")
         modes.add_argument("--delivery-protected-selfcheck", action="store_true", help="check the protected driver without starting a Node, chain, proof or socket")
-        modes.add_argument("--delivery-ui-selfcheck", action="store_true", help="retired Strict UI controller selfcheck; rejects before writing or starting work")
         parser.add_argument("--delivery-profile", type=Path, default=Path(__file__).resolve().parents[1] / "crates/delivery/proof/profile.json")
         parser.add_argument("--delivery-source-root", type=Path, default=Path(__file__).resolve().parents[1])
         parser.add_argument("--delivery-probe", type=Path)
         parser.add_argument("--delivery-config", type=Path)
         parser.add_argument("--delivery-run-dir", type=Path, help="fresh protected evidence directory inside this worktree's .artifacts")
-        parser.add_argument("--delivery-ui-control", type=Path)
-        parser.add_argument("--delivery-ui-timeout-ms", type=int, default=43_200_000)
         parser.add_argument("--fixture-kind", choices=("single", "delivery", "workspace", "mesh", "cursor"), default="single", help=argparse.SUPPRESS)
         parser.add_argument("--fixture-port", type=int, help=argparse.SUPPRESS)
         parser.add_argument("--fixture-profile", type=Path, default=Path(__file__).resolve().parents[1] / "crates/delivery/proof/profile.json", help=argparse.SUPPRESS)
         arguments = parser.parse_args()
         try:
-            needs_process = not (arguments.delivery_ui_selfcheck or arguments.native_provider_selfcheck
+            needs_process = not (arguments.native_provider_selfcheck
                                  or arguments.native_clipboard_selfcheck or arguments.npm_baseline_pin
-                                 or arguments.delivery or arguments.delivery_protected_selfcheck
+                                 or arguments.delivery_protected_selfcheck
                                  or arguments.client_response_drop_selfcheck)
             if needs_process:
                 require(arguments.binary is not None, "--binary is required for Node process acceptance")
@@ -7803,7 +7791,6 @@ if __name__ == "__main__":
                 arguments.app_dir = arguments.app_dir.resolve(strict=True)
                 require(arguments.app_dir.is_dir(), "the explicit App output directory exists")
                 os.environ["VIBEFACE_APP_DIR"] = str(arguments.app_dir)
-            require(30_000 <= arguments.delivery_ui_timeout_ms <= 86_400_000, "UI acceptance has a bounded explicit execution deadline")
             if arguments.npm_baseline_pin:
                 pin_npm_baseline(arguments)
             elif arguments.native_provider_selfcheck:
@@ -7812,8 +7799,6 @@ if __name__ == "__main__":
                 native_clipboard_selfcheck(arguments)
             elif arguments.client_response_drop_selfcheck:
                 client_response_drop_selfcheck()
-            elif arguments.delivery_ui_selfcheck:
-                delivery_ui_selfcheck(arguments)
             elif arguments.delivery_protected_selfcheck:
                 delivery_protected_selfcheck()
             elif arguments.delivery_protected:
@@ -7821,8 +7806,6 @@ if __name__ == "__main__":
             elif arguments.e2e_fixture:
                 require(arguments.fixture_port is not None, "e2e fixture requires its allocated port")
                 e2e_fixture(arguments)
-            elif arguments.delivery:
-                delivery_paid_acceptance(arguments)
             elif arguments.delivery_charity:
                 delivery_charity_acceptance(arguments)
             elif arguments.mesh:
