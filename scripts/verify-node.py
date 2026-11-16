@@ -6424,7 +6424,7 @@ def mesh_acceptance(options):
         node = Node(run, name, binary, workspace, helper, init_args=[
             "--root", str(workspace), "--mesh-network", network, *[arg for url in bootstrap for arg in ("--bootstrap", url)]])
         nodes.append(node)
-        node_cli(node, "config", "set", "mesh.allow_private", "true")
+        node_cli(node, "config", "set", "network.mesh.allow_private", "true")
         mesh = json.loads((node.directory / "config.json").read_text())["network"]["mesh"]
         require(mesh == {"enabled": True, "network": network, "bootstrap": list(bootstrap), "allow_private": True,
                          "advertise": []},
@@ -7433,7 +7433,7 @@ os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:
             member = Node(run, "member", binary, workspace, helper, init_args=[
                 "--root", str(workspace), "--mesh-network", mesh, "--bootstrap", public.mesh_address])
             nodes["member"] = member
-            node_cli(member, "config", "set", "mesh.allow_private", "true")
+            node_cli(member, "config", "set", "network.mesh.allow_private", "true")
             configure_cursor(public)
             configure_cursor(member)
             public.start()

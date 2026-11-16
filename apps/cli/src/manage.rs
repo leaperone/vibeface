@@ -330,7 +330,8 @@ pub struct ConfigOptions {
 
 #[derive(Subcommand)]
 pub enum ConfigAction {
-    /// Set one config.json value, such as mesh.allow_private true or mesh.bootstrap '[...]'.
+    /// Set one config.json value, such as network.mesh.allow_private true or
+    /// network.mesh.bootstrap '[...]'.
     /// The value is JSON, or text when it is not; null restores the default; `-` reads it from
     /// standard input.
     Set { key: String, value: String },
@@ -1315,14 +1316,15 @@ mod tests {
         );
         assert_eq!(config_value("lab-1"), json!("lab-1"));
         assert_eq!(config_value("null"), Value::Null);
-        let Command::Config(options) = parse(&["config", "set", "mesh.allow_private", "true"])?
+        let Command::Config(options) =
+            parse(&["config", "set", "network.mesh.allow_private", "true"])?
         else {
             bail!("config")
         };
         let ConfigAction::Set { key, value } = options.command;
         assert_eq!(
             (key.as_str(), value.as_str()),
-            ("mesh.allow_private", "true")
+            ("network.mesh.allow_private", "true")
         );
         Ok(())
     }

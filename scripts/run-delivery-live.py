@@ -3113,7 +3113,7 @@ def self_test_protected(original):
         assert member_call.kwargs == {"init_args": ["--root", str(run / "workspace"), "--mesh-network", mesh,
             "--bootstrap", public.mesh_address]}
         public.configure_mesh.assert_called_once_with(mesh)
-        configure.assert_called_once_with(member, "config", "set", "mesh.allow_private", "true")
+        configure.assert_called_once_with(member, "config", "set", "network.mesh.allow_private", "true")
         public.start.assert_called_once_with()
         member.start.assert_not_called()
         for node in (public, member):
