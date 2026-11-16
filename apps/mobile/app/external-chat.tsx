@@ -5,7 +5,6 @@ import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { waitingCopy } from '@vibeface/client/identity/copy.ts'
 import { webhookTestResult } from '@vibeface/client/lib/errors.ts'
-import { parseTriageSettings } from '@vibeface/client/workspace/model.ts'
 import type { Outlet } from '@vibeface/client/workspace/types.ts'
 import { ErrorText } from '@/components/action'
 import { Details, EmptyState, Skeleton } from '@/components/kit'
@@ -14,7 +13,8 @@ import { Icon } from '@/components/arc/icon'
 import { Input } from '@/components/arc/input'
 import { Segmented } from '@/components/arc/segmented'
 import { Text } from '@/components/arc/text'
-import { Field, PathList, Retry, useCall } from '@/features/devices/remote-settings'
+import { Field, PathList, Retry } from '@/features/devices/remote-settings'
+import { triageSettingsResource, useSettingsResource, type TriageChange } from '@/features/devices/settings-resource'
 import { cn } from '@/lib/utils'
 import { useClipboardAction } from '@/lib/use-clipboard'
 
@@ -34,7 +34,7 @@ export default function ExternalChat() {
 }
 
 function Triage() {
-  const { value: settings, busy, error, call, load } = useCall(parseTriageSettings, 'triage_settings')
+  const { value: settings, busy, error, call, load } = useSettingsResource(triageSettingsResource)
   const [url, setUrl] = useState('')
   const [secret, setSecret] = useState('')
   const [label, setLabel] = useState('')
@@ -44,7 +44,7 @@ function Triage() {
   useEffect(() => { if (settings) setUrl(settings.webhook_url) }, [settings?.webhook_url])
   if (!settings) return error ? <Retry error={error.text} onRetry={load} /> : <Skeleton className="h-24 rounded-panel" />
   const config = { default_outlet: settings.default_outlet, projects: settings.projects, webhook_url: settings.webhook_url, scan_codex_sessions: settings.scan_codex_sessions, codex_sessions: settings.codex_sessions }
-  const save = (key: string, patch: Partial<typeof config>, extra: Record<string, unknown> = {}) => {
+  const save = (key: string, patch: Partial<typeof config>, extra: Pick<TriageChange, 'webhook_secret'> = {}) => {
     const next = { ...config, ...patch }
     return call(key, 'configure_triage', { ...next, webhook_url: next.webhook_url.trim() || null, ...extra })
   }
