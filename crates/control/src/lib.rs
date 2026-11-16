@@ -371,36 +371,51 @@ mod tests {
         Ok(())
     }
 
-    /// A one-megabyte-and-one-byte file the fixtures below pour into their standard output.
-    fn oversized_file() -> Result<PathBuf> {
-        let path =
-            std::env::temp_dir().join(format!("vibeface-control-bulk-{}", uuid::Uuid::new_v4()));
-        std::fs::write(&path, vec![b'.'; MAX_CONTROL_PACKET + 1])?;
-        Ok(path)
+    enum FixtureKind {
+        Output,
+        Status,
     }
 
-    /// Writes an executable fixture that behaves the same on either family, and returns its path.
-    ///
-    /// A shell script is the shortest way to ask for exactly the output size and exit status a
-    /// test needs, and the two families spell that differently.
-    fn fixture(name: &str, unix_body: &str, windows_body: &str) -> Result<PathBuf> {
-        let _ = windows_body;
-        let _ = unix_body;
-        #[cfg(unix)]
-        let (suffix, body) = ("", format!("#!/bin/sh\n{unix_body}"));
-        #[cfg(windows)]
-        let (suffix, body) = (".cmd", format!("@echo off\r\n{windows_body}"));
-        let path = std::env::temp_dir().join(format!(
-            "vibeface-control-{name}-{}{suffix}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::write(&path, body)?;
+    struct ChildFixture {
+        directory: PathBuf,
+        executable: PathBuf,
+    }
+
+    fn fixture(kind: FixtureKind) -> Result<ChildFixture> {
+        let directory =
+            std::env::temp_dir().join(format!("vibeface-control-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory)?;
+        let executable = directory.join(if cfg!(windows) { "core.cmd" } else { "core" });
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+            let script = match kind {
+                FixtureKind::Output => "output.sh",
+                FixtureKind::Status => "status.sh",
+            };
+            std::os::unix::fs::symlink(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures")
+                    .join(script),
+                &executable,
+            )?;
         }
-        Ok(path)
+        #[cfg(windows)]
+        std::fs::write(
+            &executable,
+            match kind {
+                FixtureKind::Output => "@echo off\r\ntype \"%~dp0stdout\"\r\n",
+                FixtureKind::Status => {
+                    "@echo off\r\nmore > nul\r\necho {\"ok\":true,\"result\":{}}\r\nexit /b 7\r\n"
+                }
+            },
+        )?;
+        if matches!(kind, FixtureKind::Output) {
+            std::fs::write(directory.join("stdout"), vec![b'.'; MAX_CONTROL_PACKET + 1])?;
+        }
+        Ok(ChildFixture {
+            directory,
+            executable,
+        })
     }
 
     /// A child that stays alive after closing its streams, used to reach the wait deadline.
@@ -422,15 +437,9 @@ mod tests {
 
     #[tokio::test]
     async fn control_client_bounds_child_output_before_waiting_for_exit() -> Result<()> {
-        let bulk = oversized_file()?;
-        let quoted = bulk.display();
-        let path = fixture(
-            "output",
-            &format!("cat '{quoted}'\n"),
-            &format!("type \"{quoted}\"\r\n"),
-        )?;
+        let fixture = fixture(FixtureKind::Output)?;
         let error = request(
-            &path,
+            &fixture.executable,
             &ControlRequest::Inspect {
                 data_dir: std::env::temp_dir().join("vibeface-control-test"),
             },
@@ -438,20 +447,15 @@ mod tests {
         .await
         .expect_err("oversized child output must be rejected");
         assert!(error.to_string().contains("stdout exceeds"), "{error:#}");
-        std::fs::remove_file(path)?;
-        std::fs::remove_file(bulk)?;
+        std::fs::remove_dir_all(fixture.directory)?;
         Ok(())
     }
 
     #[tokio::test]
     async fn control_client_rejects_ok_response_from_nonzero_child() -> Result<()> {
-        let path = fixture(
-            "status",
-            "cat >/dev/null\nprintf '%s\\n' '{\"ok\":true,\"result\":{}}'\nexit 7\n",
-            "more > nul\r\necho {\"ok\":true,\"result\":{}}\r\nexit /b 7\r\n",
-        )?;
+        let fixture = fixture(FixtureKind::Status)?;
         let error = request(
-            &path,
+            &fixture.executable,
             &ControlRequest::Inspect {
                 data_dir: std::env::temp_dir().join("vibeface-control-test"),
             },
@@ -462,7 +466,7 @@ mod tests {
             error.to_string().contains("core control process failed"),
             "{error:#}"
         );
-        std::fs::remove_file(path)?;
+        std::fs::remove_dir_all(fixture.directory)?;
         Ok(())
     }
 
