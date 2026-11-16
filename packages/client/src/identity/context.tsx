@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
+import { base64ToBytes, bytesToBase64, bytesToHex, sha256Hex } from '../lib/byte-codec.ts'
 import { joinLink, joinTicket, unreachableText, validEndpoint, validTarget } from '../lib/transport.ts'
 import type { DeviceChannel, JoinLink } from '../lib/transport.ts'
 import { array, boolean, deviceName, entryJson, entryKey, messageOf, nodeNow, parseEntry, parseInfo, parseJoinRequest, parseView, record, same, text } from '../lib/node.ts'
@@ -114,14 +115,12 @@ type KeptRecovery = UnsavedRecovery & { bytes: Uint8Array }
 const UNSAVED_KEY = 'vibeface.unsaved-recovery'
 /** This tab's session storage, where it exists: a reload keeps the sealed file, closing the tab drops it. */
 function tabStorage(): Storage | null { try { return globalThis.sessionStorage ?? null } catch { return null } }
-const toBase64 = (bytes: Uint8Array) => { let binary = ''; for (const byte of bytes) binary += String.fromCharCode(byte); return btoa(binary) }
-const fromBase64 = (text: string) => Uint8Array.from(atob(text), char => char.charCodeAt(0))
 function loadKept(platform: Platform): KeptRecovery | null {
   try {
     const value: unknown = JSON.parse((platform.recoveryStorage ? platform.recoveryStorage.read() : tabStorage()?.getItem(UNSAVED_KEY)) ?? 'null')
     if (!value || typeof value !== 'object') return null
     const { name, code, attempted, data } = record(value)
-    return typeof name === 'string' && !/[\\/]/.test(name) && typeof code === 'string' && /^[A-F0-9]{8}$/.test(code) && name.startsWith(`vibeface-recovery-${code}`) && typeof data === 'string' ? { name, code, attempted: attempted === true, bytes: fromBase64(data) } : null
+    return typeof name === 'string' && !/[\\/]/.test(name) && typeof code === 'string' && /^[A-F0-9]{8}$/.test(code) && name.startsWith(`vibeface-recovery-${code}`) && typeof data === 'string' ? { name, code, attempted: attempted === true, bytes: base64ToBytes(data) } : null
   } catch { return null }
 }
 class AuthenticationError extends Error {}
@@ -136,8 +135,7 @@ export const removedText = (self: string) => `${self}已被移除。在管理设
 const NODE_JOIN_TRIES = 5
 const changed = () => new Error('设备连接已切换。原操作结果需要确认，不会自动重发。')
 const superseded = () => new Error('这个恢复文件已作废。改用最近一次下载的那份。')
-const hex = (bytes: Uint8Array) => [...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('')
-const randomHex = () => hex(crypto.getRandomValues(new Uint8Array(32)))
+const randomHex = () => bytesToHex(crypto.getRandomValues(new Uint8Array(32)))
 /** Saved connections, pins and pending joins in this device's storage. */
 function deviceStore(storage: KeyValue, self: string) {
   const { readStorage, writeStorage } = storageOf(storage)
@@ -705,13 +703,13 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   async function createInvitation(): Promise<Invitation> {
     const connection = managing(), request = scoped()
     const secret = crypto.getRandomValues(new Uint8Array(32))
-    const inviteHash = hex(new Uint8Array(await crypto.subtle.digest('SHA-256', secret)))
+    const inviteHash = await sha256Hex(secret)
     const expiresAt = Date.now() + INVITE_TTL_MS
     const record_ = { network_id: connection.principal.network_id, invite_hash: inviteHash, issuer: own().deviceId, expires_at_ms: expiresAt, signature: '' }
     record_.signature = await signClient('identity-invite', inviteSigningPayload(JSON.stringify(record_)))
     const result = record(await request('invite', { record: record_ }))
     // The ticket carries the entry's node link, so a new device reaches it at its addresses and relay.
-    const ticket = ticketEncode(String(result.entry), hex(secret))
+    const ticket = ticketEncode(String(result.entry), bytesToHex(secret))
     secret.fill(0)
     if (validTarget(JSON.parse(platform.secure.ticketDecode(ticket)).entry_id) !== connection.entry.device_id) throw new Error('加入链接指向的设备和当前连接的不一致。')
     return { link: joinLink(ticket), expiresAt }
@@ -1103,7 +1101,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     page.open(url.href)
   }
   function setKept(next: KeptRecovery | null) {
-    const serialized = next && JSON.stringify({ name: next.name, code: next.code, attempted: next.attempted, data: toBase64(next.bytes) })
+    const serialized = next && JSON.stringify({ name: next.name, code: next.code, attempted: next.attempted, data: bytesToBase64(next.bytes) })
     if (platform.recoveryStorage) platform.recoveryStorage.write(serialized)
     else { const storage = tabStorage(); if (serialized) storage?.setItem(UNSAVED_KEY, serialized); else storage?.removeItem(UNSAVED_KEY) }
     if (kept.current && kept.current.bytes !== next?.bytes) kept.current.bytes.fill(0)

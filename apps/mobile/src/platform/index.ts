@@ -9,7 +9,7 @@ import { lan as nativeLan, secure, type NativeIdentity } from '@vibeface/secure-
 import type { OutboxItem } from '@vibeface/client/lib/outbox.ts'
 import type { Lan, Notifier, Permission, Platform } from '@vibeface/client/lib/platform.ts'
 import { createTransport, type DeviceKeys } from '@vibeface/client/lib/transport.ts'
-import { sha256 } from '@vibeface/client/delivery/model.ts'
+import { sha256Hex } from '@vibeface/client/lib/byte-codec.ts'
 import { lostKeyText } from '@vibeface/client/identity/copy.ts'
 import LanBrowser from '../../modules/lan-browser'
 import { privateFiles } from './files'
@@ -164,7 +164,7 @@ export const mobilePlatform: Platform = {
         file.create()
         await file.write(bytes)
         const saved = await file.bytes()
-        if (saved.length !== bytes.length || await sha256(saved) !== await sha256(bytes)) throw new Error('保存后的文件对不上，重新取回再试。')
+        if (saved.length !== bytes.length || await sha256Hex(saved) !== await sha256Hex(bytes)) throw new Error('保存后的文件对不上，重新取回再试。')
         if (current() && await Sharing.isAvailableAsync() && current()) await Sharing.shareAsync(file.uri, { mimeType: 'application/octet-stream', dialogTitle: '导出文件副本' })
         return 'saved'
       })

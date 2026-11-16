@@ -1,3 +1,4 @@
+import { base64ToBytes, bytesToBase64, sha256Hex } from '../lib/byte-codec.ts'
 import { array, boolean, record, text, type Member } from '../lib/node.ts'
 import type { DeliveryBudget, DeliveryDeadlines, DeliveryDraft, DeliveryEvidence, DeliveryMode, DeliveryOrder, DeliveryPayment, DeliveryPhase, DeliveryProvider, DeliveryStatus, PendingIntent, PaymentState, ReceivedFile } from './types.ts'
 
@@ -136,23 +137,15 @@ export function parseReceived(value: unknown, limit: number): ReceivedFile {
   if (content.length > 4 * Math.ceil(limit / 3)) throw new Error('取回文件超过当前设备上限。')
   return { name: fileName(v.name), content_base64: content, sha256: peer(v.sha256), bytes: integer(v.bytes, limit) }
 }
-export function toBase64(bytes: Uint8Array): string {
-  let binary = ''
-  for (const byte of bytes) binary += String.fromCharCode(byte)
-  return btoa(binary)
-}
 export function fromBase64(value: string): Uint8Array {
   if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) throw new Error('文件编码无效。')
-  const bytes = Uint8Array.from(atob(value), char => char.charCodeAt(0))
-  if (toBase64(bytes) !== value) throw new Error('文件编码不是规范格式。')
+  const bytes = base64ToBytes(value)
+  if (bytesToBase64(bytes) !== value) throw new Error('文件编码不是规范格式。')
   return bytes
-}
-export async function sha256(bytes: Uint8Array): Promise<string> {
-  return [...new Uint8Array(await crypto.subtle.digest('SHA-256', new Uint8Array(bytes)))].map(byte => byte.toString(16).padStart(2, '0')).join('')
 }
 export async function checkedFile(file: ReceivedFile, order: DeliveryOrder): Promise<Uint8Array> {
   const bytes = fromBase64(file.content_base64)
-  if (bytes.length !== file.bytes || file.bytes !== order.bytes || order.name !== null && file.name !== order.name || order.sha256 !== null && file.sha256 !== order.sha256 || await sha256(bytes) !== file.sha256) throw new Error('文件摘要、名称或大小与订单不一致，未保存。')
+  if (bytes.length !== file.bytes || file.bytes !== order.bytes || order.name !== null && file.name !== order.name || order.sha256 !== null && file.sha256 !== order.sha256 || await sha256Hex(bytes) !== file.sha256) throw new Error('文件摘要、名称或大小与订单不一致，未保存。')
   return bytes
 }
 export function parsePending(value: unknown): PendingIntent {

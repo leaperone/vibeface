@@ -1,5 +1,6 @@
 import init, * as wasm from '../../generated/vibeface_secure.js'
 import type { Notifier, Platform } from '@vibeface/client/lib/platform.ts'
+import { bytesToHex } from '@vibeface/client/lib/byte-codec.ts'
 import { createTransport } from '@vibeface/client/lib/transport.ts'
 import type { DeviceKeys } from '@vibeface/client/lib/transport.ts'
 import type { SecureApi } from '@vibeface/client/secure-api.ts'
@@ -11,7 +12,6 @@ import { webDeliveryReservations } from './delivery-reservations'
 
 const secure: SecureApi = wasm
 const lostKeyMessage = lostKeyText('这个浏览器')
-const hex = (bytes: ArrayBuffer) => [...new Uint8Array(bytes)].map(value => value.toString(16).padStart(2, '0')).join('')
 type StoredKey = { privateKey: CryptoKey; deviceId: string; created_at: number }
 
 function database() {
@@ -56,7 +56,7 @@ const browserKeys: DeviceKeys = {
       let pair: CryptoKeyPair
       try { pair = await crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']) as CryptoKeyPair }
       catch { throw new Error('这个浏览器版本太旧。更新浏览器后重试。') }
-      const candidate: StoredKey = { privateKey: pair.privateKey, deviceId: hex(await crypto.subtle.exportKey('raw', pair.publicKey)), created_at: Date.now() }
+      const candidate: StoredKey = { privateKey: pair.privateKey, deviceId: bytesToHex(new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey))), created_at: Date.now() }
       await keys('readwrite', store => store.add(candidate, 'device'))
       record = await keys<StoredKey | undefined>('readonly', store => store.get('device'))
       try { localStorage.setItem('vibeface.device-created', 'true') } catch {}
@@ -68,7 +68,7 @@ const browserKeys: DeviceKeys = {
   async remove() { await keys('readwrite', store => store.delete('device')); device = undefined },
   async sign(message) {
     if (!device) throw new Error('这个浏览器还没准备好。刷新页面再试。')
-    return hex(await crypto.subtle.sign({ name: 'Ed25519' }, device.privateKey, new Uint8Array(message)))
+    return bytesToHex(new Uint8Array(await crypto.subtle.sign({ name: 'Ed25519' }, device.privateKey, new Uint8Array(message))))
   },
 }
 

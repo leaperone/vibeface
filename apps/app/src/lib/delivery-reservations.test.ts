@@ -3,7 +3,7 @@ import test from 'node:test'
 import type { TestContext } from 'node:test'
 import { Worker } from 'node:worker_threads'
 import { createDeliveryClient } from '@vibeface/client/delivery/client.ts'
-import { sha256 } from '@vibeface/client/delivery/model.ts'
+import { sha256Hex } from '@vibeface/client/lib/byte-codec.ts'
 import { nativeDeliveryReservations } from '../../../mobile/src/platform/delivery-reservations.ts'
 import { completed, connection, content, draft, file, fingerprint, intentKey, oldId, responseLost, status, wireBytes } from './delivery-reservations.fixture.ts'
 
@@ -22,7 +22,7 @@ async function actors(t: TestContext, records: Map<string, string>, options: Act
   const ready: { worker: Worker; key: string }[] = [], finds: Worker[] = [], reads: { key: string; value: string | null }[] = []
   const calls: Call[] = [], writes: { key: string; value: string }[] = [], errors: (string | null)[] = []
   const heldReads: (() => void)[] = [], heldPrepares: Worker[] = []
-  const original = completed(await sha256(content))
+  const original = completed(await sha256Hex(content))
   const workers: Worker[] = []
   t.after(async () => { await Promise.all(workers.map(worker => worker.terminate())) })
   await Promise.all(options.map((option, actor) => new Promise<void>((resolve, reject) => {

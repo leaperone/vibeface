@@ -1,3 +1,4 @@
+import { base64ToBytes } from "../lib/byte-codec.ts"
 import type { Attachment, MessageRequest, PendingMessage, TranscriptMessage } from "../chat/types.ts"
 import type { OutboxItem } from "../lib/outbox.ts"
 import { array, boolean, isRecord, isSafeInteger, isText, parseProviderReadiness } from "../lib/node.ts"
@@ -979,7 +980,7 @@ function artifactPageRange(data: Record<string, unknown>, hash: string, offset: 
 export function parseBinaryPage(value: unknown, hash: string, offset: number) {
   const data = record(value)
   const { size, next_offset } = artifactPageRange(data, hash, offset)
-  const bytes = Uint8Array.from(atob(text(data.data)), (char) => char.charCodeAt(0))
+  const bytes = base64ToBytes(text(data.data))
   if (bytes.length !== (next_offset ?? size) - offset) throw new Error("下载内容与原请求不符。")
   return { bytes, next_offset, size }
 }
