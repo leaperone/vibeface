@@ -1,6 +1,7 @@
 //! Drives the work state machine from what the providers report and read back. Provider signals
 //! go through `Store::apply_work_signal`, so the journal, the DAG and the UI agree.
 use super::agent_tools::ExecutionProviderRequest;
+use super::execution_directory::{CanonicalExecutionPath, DirectoryAuthorizationError};
 use super::*;
 use crate::scheduling::task_trigger;
 use crate::store::admission::{AdmissionRejected, authorize_peer_node_from};
@@ -174,28 +175,17 @@ impl Runtime {
         settings: &WorkDispatchSettings,
     ) -> Result<()> {
         if spec.thread.is_none() || !spec.cwd.is_empty() {
-            let path = std::fs::canonicalize(&spec.cwd).context("execution path does not exist")?;
-            let roots = settings
-                .roots
-                .iter()
-                .map(std::fs::canonicalize)
-                .collect::<Vec<_>>();
-            let allowed = roots
-                .iter()
-                .filter_map(|root| root.as_ref().ok())
-                .any(|root| path.starts_with(root));
-            if !allowed {
-                for root in roots {
-                    root.context("configured execution root cannot be resolved")?;
-                }
-            }
-            ensure!(
-                allowed,
-                AdmissionRejected::new(
-                    "execution path is outside configured roots; ask the user to allow its folder with propose_provider_config roots"
-                )
-            );
-            ensure!(path.is_dir(), "execution path must be a directory");
+            CanonicalExecutionPath::resolve(Path::new(&spec.cwd))
+                .context("execution path does not exist")?
+                .authorize(&settings.roots)
+                .map_err(|error| match error {
+                    // Dispatch historically leaves these failures retryable.
+                    DirectoryAuthorizationError::NotDirectory
+                    | DirectoryAuthorizationError::Metadata(_) => {
+                        anyhow::anyhow!("execution path must be a directory")
+                    }
+                    error => error.into(),
+                })?;
         }
         let conversation = store
             .conversation(network, &spec.conversation)?
@@ -1547,5 +1537,75 @@ impl Runtime {
         }) {
             tracing::debug!(%error, "App Server event worker skipped while the Node is shutting down");
         }
+    }
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_directory_errors_keep_their_admission_classification() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!(
+            "vibeface-dispatch-directory-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let allowed = directory.join("allowed");
+        std::fs::create_dir_all(&allowed)?;
+        let file = allowed.join("file");
+        std::fs::write(&file, b"")?;
+        let store = Store::open(":memory:")?;
+        let settings = WorkDispatchSettings {
+            identity: LocalIdentity::generate(),
+            roots: vec![allowed],
+            manager: None,
+            providers: Default::default(),
+        };
+        let mut request = WorkRequest {
+            work_id: "work".into(),
+            conversation: "conversation".into(),
+            trigger: "message:message".into(),
+            target: "target".into(),
+            dispatcher: "dispatcher".into(),
+            call_ref: "call".into(),
+            kind: RequestedWorkKind::Task,
+            model: None,
+            cwd: file.to_str().context("file")?.into(),
+            title: "work".into(),
+            prompt: "work".into(),
+            continues: None,
+            parent: None,
+            thread: None,
+        };
+        let file_error =
+            Runtime::authorize_dispatch(&store, "network", &request, WorkKind::Task, &settings)
+                .unwrap_err();
+        assert_eq!(file_error.to_string(), "execution path must be a directory");
+        assert!(!file_error.is::<AdmissionRejected>());
+        assert!(!file_error.is::<std::io::Error>());
+
+        request.cwd = directory.to_str().context("outside")?.into();
+        let outside =
+            Runtime::authorize_dispatch(&store, "network", &request, WorkKind::Task, &settings)
+                .unwrap_err();
+        assert!(outside.is::<AdmissionRejected>());
+        assert_eq!(
+            outside.to_string(),
+            "execution path is outside configured roots; ask the user to allow its folder with propose_provider_config roots"
+        );
+
+        request.cwd = directory
+            .join("missing")
+            .to_str()
+            .context("missing")?
+            .into();
+        let missing =
+            Runtime::authorize_dispatch(&store, "network", &request, WorkKind::Task, &settings)
+                .unwrap_err();
+        assert!(!missing.is::<AdmissionRejected>());
+        assert!(missing.is::<std::io::Error>());
+        assert_eq!(missing.to_string(), "execution path does not exist");
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
     }
 }
