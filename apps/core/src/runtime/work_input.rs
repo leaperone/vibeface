@@ -1,3 +1,4 @@
+use super::execution_directory::CanonicalExecutionPath;
 use super::*;
 use crate::scheduling::SteerTarget;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
@@ -63,17 +64,18 @@ impl Runtime {
         } else {
             PathBuf::from(cwd)
         };
-        let actual = actual
-            .canonicalize()
+        let actual = CanonicalExecutionPath::resolve(&actual)
             .context("native work directory does not exist")?;
         if !cwd.is_empty() {
             ensure!(
-                PathBuf::from(cwd).canonicalize()? == actual,
+                PathBuf::from(cwd).canonicalize()? == actual.as_path(),
                 "declared work directory differs from the native session"
             );
         }
+        // The directory can be replaced after the identity check; resolve it again for admission.
         self.allowed_path(
             actual
+                .as_path()
                 .to_str()
                 .context("native work directory is not UTF-8")?,
         )
@@ -521,5 +523,117 @@ impl Runtime {
             })
             .await?;
         Ok(guard)
+    }
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::*;
+    use crate::runtime::test_support::{node, scripted_app_server};
+    use crate::store::admission::AdmissionRejected;
+
+    #[tokio::test]
+    async fn native_directory_checks_canonical_identity_and_current_roots() -> Result<()> {
+        let (node, _, directory) = node().await?;
+        let allowed = directory.join("allowed");
+        let outside = directory.join("outside");
+        let alias = directory.join("alias");
+        std::fs::create_dir(&allowed)?;
+        std::fs::create_dir(&outside)?;
+        let allowed = allowed.canonicalize()?;
+        let outside = outside.canonicalize()?;
+        vibeface_bridge::platform::privatefs::link_dir(&allowed, &alias)?;
+        node.settings.lock().unwrap().roots = vec![allowed.clone()];
+        let served = allowed.clone();
+        let _requests = scripted_app_server(&node, move |request| {
+            if request["method"] == "thread/read" {
+                json!({"result":{"thread":{"cwd":served,"turns":[]}}})
+            } else {
+                json!({"result":{}})
+            }
+        })
+        .await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while node.codex.status().await["connection"]["state"] != "connected" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            node.work_native_directory(Provider::Codex, None, alias.to_str().context("alias")?)
+                .await?,
+            allowed
+        );
+        assert_eq!(
+            node.work_native_directory(
+                Provider::Codex,
+                Some("thread"),
+                alias.to_str().context("alias")?
+            )
+            .await?,
+            allowed
+        );
+        assert_eq!(
+            node.work_native_directory(Provider::Codex, Some("thread"), "")
+                .await?,
+            allowed
+        );
+        let mismatch = node
+            .work_native_directory(
+                Provider::Codex,
+                Some("thread"),
+                outside.to_str().context("outside")?,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            mismatch.to_string(),
+            "declared work directory differs from the native session"
+        );
+        assert!(!mismatch.is::<AdmissionRejected>());
+
+        let file = allowed.join("file");
+        std::fs::write(&file, b"")?;
+        let not_directory = node
+            .work_native_directory(Provider::Codex, None, file.to_str().context("file")?)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            not_directory.to_string(),
+            "execution path must be a directory"
+        );
+        assert!(not_directory.is::<AdmissionRejected>());
+        let missing = node
+            .work_native_directory(
+                Provider::Codex,
+                None,
+                allowed.join("missing").to_str().context("missing")?,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(missing.to_string(), "native work directory does not exist");
+        assert!(!missing.is::<AdmissionRejected>());
+        assert!(missing.is::<std::io::Error>());
+
+        node.settings.lock().unwrap().roots = vec![outside];
+        let revoked = node
+            .work_native_directory(Provider::Codex, Some("thread"), "")
+            .await
+            .unwrap_err();
+        assert!(revoked.is::<AdmissionRejected>());
+        assert_eq!(
+            revoked.to_string(),
+            "execution path is outside configured roots; ask the user to allow its folder with propose_provider_config roots"
+        );
+        node.settings.lock().unwrap().roots = vec![allowed.clone()];
+        assert_eq!(
+            node.work_native_directory(Provider::Codex, Some("thread"), "")
+                .await?,
+            allowed
+        );
+        node.shutdown().await;
+        drop(node);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
     }
 }
