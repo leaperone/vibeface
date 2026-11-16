@@ -1243,7 +1243,7 @@ impl Runtime {
         let scope = id(input, "conversation_id")?;
         self.require_scope(access, &scope).await?;
         let message_id = id(input, "message_id")?;
-        let request: crate::workspace::InputRequest = serde_json::from_value(input.clone())
+        let request: crate::workspace::InputRequest = crate::workspace::parse_message_input(input)
             .context(
                 "message requires a typed target, intent, sequence and explicit report_results",
             )?;

@@ -16,6 +16,19 @@ pub const MAX_AUTOMATIC_ASSIGNMENTS: usize = 8;
 pub const MAX_TASK_DEPTH: usize = 4;
 pub const MAX_MEMBER_REPLIES: usize = 2;
 
+/// RPC dispatch, scope checks and attestation validation own these envelope fields.
+pub(crate) fn parse_message_input(
+    envelope: &serde_json::Value,
+) -> Result<InputRequest, serde_json::Error> {
+    let mut document = envelope.clone();
+    if let Some(fields) = document.as_object_mut() {
+        for name in ["method", "client_id", "conversation_id", "attestation"] {
+            fields.remove(name);
+        }
+    }
+    serde_json::from_value(document)
+}
+
 pub(crate) fn input_event_body(
     input: &InputRequest,
     attestation: Option<crate::model::Attestation>,
@@ -105,6 +118,46 @@ mod tests {
     };
     use anyhow::Result;
     use serde_json::{Value, json};
+
+    #[test]
+    fn message_input_accepts_only_known_rpc_metadata_without_changing_the_envelope() -> Result<()> {
+        let envelope = json!({
+            "method": "message", "client_id": "client", "conversation_id": "chat",
+            "attestation": {"device_id": "client", "signature": "signature"},
+            "message_id": "m", "target": {"kind": "bot_main", "bot_id": "bot"},
+            "intent": "continue", "sequence": 1, "text": "hi", "report_results": true
+        });
+        let original = envelope.clone();
+        let expected = InputRequest {
+            message_id: "m".into(),
+            route: InputRoute {
+                target: InputTarget::BotMain {
+                    bot_id: "bot".into(),
+                },
+                intent: InputIntent::Continue,
+                sequence: 1,
+                expected_revision: None,
+            },
+            text: "hi".into(),
+            attachments: vec![],
+            report_results: true,
+        };
+        assert_eq!(parse_message_input(&envelope)?, expected);
+        assert_eq!(envelope, original);
+        let mut receipt = envelope.clone();
+        receipt.as_object_mut().unwrap().remove("method");
+        receipt.as_object_mut().unwrap().remove("client_id");
+        assert_eq!(parse_message_input(&receipt)?, expected);
+        for extra in [Value::Null, json!(true), json!({"nested": "extra"})] {
+            let mut invalid = envelope.clone();
+            invalid["unexpected_input_field"] = extra.clone();
+            assert!(parse_message_input(&invalid).is_err());
+            let mut invalid = envelope.clone();
+            invalid["target"]["unexpected_target_field"] = extra;
+            assert!(parse_message_input(&invalid).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn input_event_body_preserves_literal_attestation_payload() -> Result<()> {
