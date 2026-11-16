@@ -12,6 +12,7 @@ use gpui_kit::{
     *,
 };
 use std::collections::BTreeMap;
+use vibeface_protocol::amount::Amount;
 
 const RELAY_FEE_AUTHORIZATION_NOTE: &str =
     "中转设备的链费支出沿用本机既有授权、限额和公开规则；付款方的金额不是中转设备的支出限额。";
@@ -764,8 +765,11 @@ impl Desktop {
         }
         for (accept, label) in [(false, "确认两笔原订单"), (true, "接收两笔原订单")] {
             for orders in transfer_batches(&d.orders, accept, now) {
-                let total = transfer_sum(orders.iter().map(|order| order.payment.total.as_str()))
-                    .unwrap_or_else(|_| "待核对".into());
+                let total = Amount::checked_sum_decimal(
+                    orders.iter().map(|order| order.payment.total.as_str()),
+                )
+                .map(|total| total.to_string())
+                .unwrap_or_else(|_| "待核对".into());
                 let budget = orders[0].payment.budget_id.clone().unwrap_or_default();
                 let mut row =
                     self.row(label, format!("固定预算 {budget} · 两单服务费合计 {total}"));
@@ -1202,8 +1206,11 @@ impl Desktop {
                     .child(self.transfer_order_review(order));
             }
             Command::DeliveryConfirmBatch(orders) | Command::DeliveryAcceptBatch(orders) => {
-                let total = transfer_sum(orders.iter().map(|order| order.payment.total.as_str()))
-                    .unwrap_or_else(|_| "金额待核对，不能提交".into());
+                let total = Amount::checked_sum_decimal(
+                    orders.iter().map(|order| order.payment.total.as_str()),
+                )
+                .map(|total| total.to_string())
+                .unwrap_or_else(|_| "金额待核对，不能提交".into());
                 review = review
                     .aria_label(format!(
                         "两笔原订单 {} 和 {} · 预算 {} · 服务费合计 {total}",

@@ -1,6 +1,8 @@
 //! Immutable native view models. Wire parsing runs on the client task, never in render.
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use vibeface_protocol::amount::Amount;
 use vibeface_protocol::workspace::{Attachment, InputIntent, InputTarget};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1124,51 +1126,35 @@ pub fn validate_transfer_order(order: &TransferOrder) -> anyhow::Result<()> {
                     && window.committed_bytes <= window.bytes + 68),
         "订单片段或大小无效"
     );
-    for amount in [
-        &order.payment.delivery_fee,
-        &order.payment.reservation_fee,
-        &order.payment.priority_fee,
-        &order.payment.total,
-        &order.payment.gas_cap,
-        &order.payment.earned,
-        &order.payment.withdrawn,
-        &order.payment.refunded,
-    ] {
-        anyhow::ensure!(transfer_amount_valid(amount), "订单金额无效");
-    }
+    let delivery_fee =
+        Amount::from_decimal_str(&order.payment.delivery_fee).context("订单金额无效")?;
+    let reservation_fee =
+        Amount::from_decimal_str(&order.payment.reservation_fee).context("订单金额无效")?;
+    let priority_fee =
+        Amount::from_decimal_str(&order.payment.priority_fee).context("订单金额无效")?;
+    let total = Amount::from_decimal_str(&order.payment.total).context("订单金额无效")?;
+    let earned = Amount::from_decimal_str(&order.payment.earned).context("订单金额无效")?;
+    let withdrawn = Amount::from_decimal_str(&order.payment.withdrawn).context("订单金额无效")?;
+    let refunded = Amount::from_decimal_str(&order.payment.refunded).context("订单金额无效")?;
+    Amount::from_decimal_str(&order.payment.gas_cap).context("订单金额无效")?;
     anyhow::ensure!(
-        transfer_sum([
-            order.payment.delivery_fee.as_str(),
-            order.payment.reservation_fee.as_str(),
-            order.payment.priority_fee.as_str()
-        ])? == order.payment.total
-            && transfer_amount_at_most(&order.payment.withdrawn, &order.payment.earned)
-            && transfer_amount_at_most(
-                &transfer_sum([
-                    order.payment.earned.as_str(),
-                    order.payment.refunded.as_str()
-                ])?,
-                &order.payment.total
-            ),
+        delivery_fee
+            .checked_add(&reservation_fee)
+            .and_then(|sum| sum.checked_add(&priority_fee))
+            .context("订单金额不守恒")?
+            == total
+            && withdrawn <= earned
+            && earned.checked_add(&refunded).context("订单金额不守恒")? <= total,
         "订单金额不守恒"
     );
     if let Some(settlement) = &order.payment.settlement {
-        anyhow::ensure!(
-            [
-                &settlement.earned,
-                &settlement.withdrawn,
-                &settlement.refunded
-            ]
-            .iter()
-            .all(|value| transfer_amount_valid(value))
-                && transfer_amount_at_most(&settlement.withdrawn, &settlement.earned),
-            "预算结算金额无效"
-        );
+        let earned = Amount::from_decimal_str(&settlement.earned).context("预算结算金额无效")?;
+        let withdrawn =
+            Amount::from_decimal_str(&settlement.withdrawn).context("预算结算金额无效")?;
+        Amount::from_decimal_str(&settlement.refunded).context("预算结算金额无效")?;
+        anyhow::ensure!(withdrawn <= earned, "预算结算金额无效");
         if let Some(publication) = &settlement.publication {
-            anyhow::ensure!(
-                transfer_amount_valid(&publication.total_amount),
-                "批次公开状态无效"
-            );
+            Amount::from_decimal_str(&publication.total_amount).context("批次公开状态无效")?;
         }
     }
     if order.role == "provider" {
@@ -1209,7 +1195,7 @@ pub fn validate_transfer_order(order: &TransferOrder) -> anyhow::Result<()> {
                     .payment
                     .chain_id
                     .as_deref()
-                    .is_some_and(transfer_amount_valid)
+                    .is_some_and(|value| Amount::from_decimal_str(value).is_ok())
                 && order.payment.asset.is_some()
                 && order.payment.payer.is_some()
                 && order.payment.provider_wallet.is_some(),
@@ -1489,48 +1475,6 @@ pub fn connection_endpoint(
     Ok(endpoint)
 }
 
-const TRANSFER_MAX_AMOUNT: &str =
-    "115792089237316195423570985008687907853269984665640564039457584007913129639935";
-pub fn transfer_amount_valid(value: &str) -> bool {
-    !value.is_empty()
-        && value.bytes().all(|byte| byte.is_ascii_digit())
-        && (value == "0" || !value.starts_with('0'))
-        && (value.len() < TRANSFER_MAX_AMOUNT.len()
-            || value.len() == TRANSFER_MAX_AMOUNT.len() && value <= TRANSFER_MAX_AMOUNT)
-}
-pub fn transfer_amount_at_most(value: &str, cap: &str) -> bool {
-    transfer_amount_valid(value)
-        && transfer_amount_valid(cap)
-        && (value.len() < cap.len() || value.len() == cap.len() && value <= cap)
-}
-pub fn transfer_sum<'a>(amounts: impl IntoIterator<Item = &'a str>) -> anyhow::Result<String> {
-    let mut total = "0".to_owned();
-    for amount in amounts {
-        anyhow::ensure!(
-            transfer_amount_valid(amount),
-            "金额须为256位范围内的最小单位非负整数"
-        );
-        let mut a = total.bytes().rev();
-        let mut b = amount.bytes().rev();
-        let mut carry = 0;
-        let mut digits = vec![];
-        loop {
-            let left = a.next();
-            let right = b.next();
-            if left.is_none() && right.is_none() && carry == 0 {
-                break;
-            }
-            let sum =
-                left.map_or(0, |byte| byte - b'0') + right.map_or(0, |byte| byte - b'0') + carry;
-            digits.push(b'0' + sum % 10);
-            carry = sum / 10;
-        }
-        digits.reverse();
-        total = digits.into_iter().map(char::from).collect();
-        anyhow::ensure!(transfer_amount_valid(&total), "金额合计超出256位范围");
-    }
-    Ok(total)
-}
 fn transfer_peer_valid(peer: &str) -> bool {
     peer.len() == 64
         && peer
@@ -1566,28 +1510,20 @@ pub fn validate_transfer_budget(budget: &TransferBudget) -> anyhow::Result<()> {
             && ["open", "closing", "closed"].contains(&budget.state.as_str()),
         "预算角色或状态无效"
     );
+    let deposit = Amount::from_decimal_str(&budget.deposit).context("预算金额无效")?;
+    let free = Amount::from_decimal_str(&budget.free).context("预算金额无效")?;
+    let locked = Amount::from_decimal_str(&budget.locked).context("预算金额无效")?;
+    let earned = Amount::from_decimal_str(&budget.earned).context("预算金额无效")?;
+    let withdrawn = Amount::from_decimal_str(&budget.withdrawn).context("预算金额无效")?;
+    let refunded = Amount::from_decimal_str(&budget.refunded).context("预算金额无效")?;
+    Amount::from_decimal_str(&budget.gas_cap).context("预算金额无效")?;
     anyhow::ensure!(
-        [
-            &budget.deposit,
-            &budget.free,
-            &budget.locked,
-            &budget.earned,
-            &budget.withdrawn,
-            &budget.refunded,
-            &budget.gas_cap
-        ]
-        .iter()
-        .all(|value| transfer_amount_valid(value)),
-        "预算金额无效"
-    );
-    anyhow::ensure!(
-        transfer_sum([
-            budget.free.as_str(),
-            budget.locked.as_str(),
-            budget.earned.as_str(),
-            budget.refunded.as_str()
-        ])? == budget.deposit
-            && transfer_amount_at_most(&budget.withdrawn, &budget.earned),
+        free.checked_add(&locked)
+            .and_then(|sum| sum.checked_add(&earned))
+            .and_then(|sum| sum.checked_add(&refunded))
+            .context("预算账目不守恒")?
+            == deposit
+            && withdrawn <= earned,
         "预算账目不守恒"
     );
     let mut windows = std::collections::HashSet::new();
