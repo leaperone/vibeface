@@ -1480,24 +1480,10 @@ impl Claude {
             .context("Claude pidfile has no parent")?
             .join("claude")
             .join("replies");
-        match std::fs::read_dir(replies) {
-            Ok(entries) => {
-                for entry in entries {
-                    let path = entry?.path();
-                    if path
-                        .extension()
-                        .is_some_and(|extension| extension == "json")
-                    {
-                        let locator: ReplyLocator = serde_json::from_slice(&std::fs::read(path)?)?;
-                        if locator.session == session {
-                            roots.insert(locator.projects);
-                        }
-                    }
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        roots.extend(super::reply_directory::read(&replies, |bytes| {
+            let locator: ReplyLocator = serde_json::from_slice(bytes)?;
+            Ok((locator.session == session).then_some(locator.projects))
+        })?);
         let mut directories = BTreeSet::new();
         for root in roots {
             if let Some(path) = transcript(Some(&root), session) {
@@ -2138,6 +2124,104 @@ pub(super) mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[tokio::test]
+    async fn native_directory_checks_transcripts_discovered_in_reply_files() -> Result<()> {
+        let place = Place::new()?;
+        let reader = Claude {
+            processes: Arc::new(Processes::new(place.dir.join(PIDFILE))),
+            live: Default::default(),
+            starting: Default::default(),
+            projects: Default::default(),
+        };
+        let session = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            reader
+                .native_directory(&session)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "the Claude session has no unique local directory"
+        );
+        let replies = place.dir.join("claude/replies");
+        config::private_dir(&replies)?;
+        config::private_write(&replies.join("ignored.txt"), b"not json")?;
+        config::private_write(&replies.join("ignored.JSON"), b"not json")?;
+        let root = place.dir.join("projects-a");
+        let write_locator = |name: &str, session: &str, root: &Path| -> Result<()> {
+            config::private_write(
+                &replies.join(name),
+                &serde_json::to_vec(&json!({
+                    "session": session, "projects": root, "message": "fixture-message"
+                }))?,
+            )
+        };
+        let write_transcript = |root: &Path, cwd: &Path| -> Result<PathBuf> {
+            let project = root.join("fixture-project");
+            config::private_dir(&project)?;
+            let path = project.join(format!("{session}.jsonl"));
+            config::private_write(&path, &serde_json::to_vec(&json!({"cwd": cwd}))?)?;
+            Ok(path)
+        };
+        write_locator("unrelated.json", &uuid::Uuid::new_v4().to_string(), &root)?;
+        write_locator("first.json", &session, &root)?;
+        write_locator("duplicate.json", &session, &root)?;
+        assert_eq!(
+            reader
+                .native_directory(&session)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "the Claude session has no unique local directory",
+            "a locator alone does not prove there is a native session"
+        );
+        let workspace = place.dir.join("work");
+        write_transcript(&root, &workspace)?;
+        assert_eq!(reader.native_directory(&session).await?, workspace);
+
+        config::private_write(&replies.join("malformed.json"), b"not json")?;
+        let error = reader.native_directory(&session).await.unwrap_err();
+        assert!(error.downcast_ref::<serde_json::Error>().is_some());
+        config::private_write(&replies.join("malformed.json"), br#"{"session":"other"}"#)?;
+        let error = reader.native_directory(&session).await.unwrap_err();
+        assert!(error.downcast_ref::<serde_json::Error>().is_some());
+        std::fs::remove_file(replies.join("malformed.json"))?;
+
+        let second_root = place.dir.join("projects-b");
+        write_locator("distinct-root.json", &session, &second_root)?;
+        let second_transcript = write_transcript(&second_root, &workspace)?;
+        assert_eq!(reader.native_directory(&session).await?, workspace);
+        write_transcript(&second_root, &place.dir.join("other-workspace"))?;
+        assert_eq!(
+            reader
+                .native_directory(&session)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "the Claude session has no unique local directory"
+        );
+        write_transcript(&second_root, Path::new("relative"))?;
+        assert_eq!(
+            reader
+                .native_directory(&session)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "the Claude session directory is not absolute"
+        );
+        config::private_write(&second_transcript, b"{}")?;
+        assert_eq!(
+            reader
+                .native_directory(&session)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "the Claude transcript has no native directory"
+        );
+        std::fs::remove_file(second_transcript)?;
+        assert_eq!(reader.native_directory(&session).await?, workspace);
+        Ok(())
     }
 
     fn bot_config(place: &Place, record: manager::TurnRecorder) -> ManagerConfig {

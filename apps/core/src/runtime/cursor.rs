@@ -214,29 +214,18 @@ impl CursorExecutor {
             );
             return Ok(owner.workspace);
         }
-        let mut directories = std::collections::BTreeSet::new();
-        match std::fs::read_dir(self.data_dir.join("cursor").join("replies")) {
-            Ok(entries) => {
-                for entry in entries {
-                    let path = entry?.path();
-                    if path
-                        .extension()
-                        .is_some_and(|extension| extension == "json")
-                    {
-                        let locator: ReplyLocator = serde_json::from_slice(&std::fs::read(path)?)?;
-                        if locator.agent == session {
-                            ensure!(
-                                locator.workspace.is_absolute(),
-                                "the Cursor reply directory is not absolute"
-                            );
-                            directories.insert(locator.workspace);
-                        }
-                    }
-                }
+        let replies = self.data_dir.join("cursor").join("replies");
+        let directories = super::reply_directory::read(&replies, |bytes| {
+            let locator: ReplyLocator = serde_json::from_slice(bytes)?;
+            if locator.agent != session {
+                return Ok(None);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+            ensure!(
+                locator.workspace.is_absolute(),
+                "the Cursor reply directory is not absolute"
+            );
+            Ok(Some(locator.workspace))
+        })?;
         ensure!(
             directories.len() == 1,
             "the Cursor session has no unique private owner directory"
@@ -903,6 +892,114 @@ mod tests {
 
     fn access(conversation: &str) -> Access {
         test_access("network".into(), false, Some(conversation.into()))
+    }
+
+    #[tokio::test]
+    async fn native_directory_reads_reply_files_without_starting_a_bridge() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("cursor-replies-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let result = async {
+            let executor = CursorExecutor::new(
+                Default::default(),
+                Arc::new(StdMutex::new(crate::providers::Local {
+                    switches: Default::default(),
+                    bins: Default::default(),
+                    env: Default::default(),
+                })),
+                dir.clone(),
+                10,
+            )?;
+            assert_eq!(
+                executor
+                    .native_directory("agent-a")
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "the Cursor session has no unique private owner directory"
+            );
+            let replies = dir.join("cursor/replies");
+            config::private_dir(&replies)?;
+            config::private_write(&replies.join("ignored.txt"), b"not json")?;
+            config::private_write(&replies.join("ignored.JSON"), b"not json")?;
+            let write = |name: &str, agent: &str, workspace: &Path| -> Result<()> {
+                config::private_write(
+                    &replies.join(name),
+                    &serde_json::to_vec(&json!({
+                        "agent": agent,
+                        "owner": "fixture-owner",
+                        "workspace": workspace,
+                        "executable": "fixture-bridge",
+                        "local_store_root": "fixture-store",
+                        "provider_identity": "fixture-identity"
+                    }))?,
+                )
+            };
+            write("unrelated.json", "agent-b", Path::new("relative"))?;
+            let workspace = dir.join("workspace");
+            write("first.json", "agent-a", &workspace)?;
+            write("duplicate.json", "agent-a", &workspace)?;
+            assert_eq!(executor.native_directory("agent-a").await?, workspace);
+
+            config::private_write(&replies.join("malformed.json"), b"not json")?;
+            let error = executor.native_directory("agent-a").await.unwrap_err();
+            assert!(error.downcast_ref::<serde_json::Error>().is_some());
+            config::private_write(&replies.join("malformed.json"), br#"{"agent":"agent-b"}"#)?;
+            let error = executor.native_directory("agent-a").await.unwrap_err();
+            assert!(error.downcast_ref::<serde_json::Error>().is_some());
+            std::fs::remove_file(replies.join("malformed.json"))?;
+            std::fs::create_dir(replies.join("directory.json"))?;
+            let error = executor.native_directory("agent-a").await.unwrap_err();
+            assert!(error.downcast_ref::<std::io::Error>().is_some());
+            std::fs::remove_dir(replies.join("directory.json"))?;
+
+            write("distinct.json", "agent-a", &dir.join("other-workspace"))?;
+            assert_eq!(
+                executor
+                    .native_directory("agent-a")
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "the Cursor session has no unique private owner directory"
+            );
+            std::fs::remove_file(replies.join("distinct.json"))?;
+            write("relative.json", "agent-a", Path::new("relative"))?;
+            assert_eq!(
+                executor
+                    .native_directory("agent-a")
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "the Cursor reply directory is not absolute"
+            );
+            std::fs::remove_file(replies.join("relative.json"))?;
+            assert_eq!(executor.native_directory("agent-a").await?, workspace);
+            #[cfg(unix)]
+            {
+                write(
+                    "symlink-source.json",
+                    "agent-a",
+                    &dir.join("linked-workspace"),
+                )?;
+                let source = dir.join("symlink-source.json");
+                std::fs::rename(replies.join("symlink-source.json"), &source)?;
+                let link = replies.join("linked.json");
+                std::os::unix::fs::symlink(&source, &link)?;
+                assert_eq!(
+                    executor
+                        .native_directory("agent-a")
+                        .await
+                        .unwrap_err()
+                        .to_string(),
+                    "the Cursor session has no unique private owner directory"
+                );
+                std::fs::remove_file(link)?;
+                assert_eq!(executor.native_directory("agent-a").await?, workspace);
+            }
+            Ok(())
+        }
+        .await;
+        std::fs::remove_dir_all(dir)?;
+        result
     }
 
     #[tokio::test]
