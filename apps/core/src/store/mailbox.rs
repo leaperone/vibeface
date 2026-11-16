@@ -45,6 +45,10 @@ fn key(network: &str, conversation: &str, trigger: &str) -> String {
     )
 }
 
+fn mailbox_error(detail: &str) -> String {
+    crate::logging::scrub(detail).chars().take(512).collect()
+}
+
 fn load_key(connection: &Connection, key: &str) -> Result<Option<MailboxRecord>> {
     let value = connection
         .query_row(
@@ -215,7 +219,7 @@ impl Store {
         };
         record.next_attempt_ms =
             now_ms + BACKOFF_MS * (1_i64 << record.attempts.saturating_sub(1).min(5));
-        record.last_error = Some(crate::logging::scrub(detail).chars().take(512).collect());
+        record.last_error = Some(mailbox_error(detail));
         save(&tx, &record)?;
         Ok(tx.commit()?)
     }
@@ -267,7 +271,7 @@ impl Store {
         let mut record = load_key(&tx, &key(network, conversation, trigger))?.unwrap_or(candidate);
         record.state = MailboxState::Dead;
         record.next_attempt_ms = now_ms;
-        record.last_error = Some(crate::logging::scrub(detail).chars().take(512).collect());
+        record.last_error = Some(mailbox_error(detail));
         save(&tx, &record)?;
         tx.execute(
             "DELETE FROM scheduler_outbox WHERE conversation_id=? AND trigger=?",
@@ -291,6 +295,68 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_persisted_error(detail: &str, expected: &str) {
+        let mut store = Store::open(":memory:").unwrap();
+        for (trigger, unknown, state) in [
+            ("message:failed", Some(false), MailboxState::Queued),
+            ("message:unknown", Some(true), MailboxState::Unknown),
+            ("message:rejected", None, MailboxState::Dead),
+        ] {
+            queue(&store.connection, "n", "c", trigger, 1).unwrap();
+            match unknown {
+                Some(unknown) => store
+                    .mailbox_failed("n", "c", trigger, unknown, detail, 2)
+                    .unwrap(),
+                None => store
+                    .mailbox_rejected("n", "c", trigger, detail, 2)
+                    .unwrap(),
+            }
+            let record = store.mailbox_for_test("n", "c", trigger).unwrap().unwrap();
+            assert_eq!(record.state, state);
+            assert_eq!(record.last_error.as_deref(), Some(expected), "{trigger}");
+        }
+    }
+
+    #[test]
+    fn mailbox_errors_preserve_unicode_and_controls() {
+        assert_persisted_error("投递失败🙂\n\t\0重试\r", "投递失败🙂\n\t\0重试\r");
+    }
+
+    #[test]
+    fn mailbox_errors_limit_unicode_scalars() {
+        let detail = format!("{}中🙂\n\t\0结束abcde尾部", "0123456789".repeat(50));
+        assert_persisted_error(
+            &detail,
+            concat!(
+                "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789",
+                "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789",
+                "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789",
+                "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789",
+                "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789",
+                "中🙂\n\t\0结束abcde",
+            ),
+        );
+    }
+
+    #[test]
+    fn mailbox_errors_scrub_bearer_credentials_before_truncation() {
+        let detail = format!(
+            "{}Bearer synthetic-mailbox-test-token-0123456789尾部",
+            "0123456789".repeat(50)
+        );
+        assert_persisted_error(
+            &detail,
+            concat!(
+                "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789",
+                "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789",
+                "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789",
+                "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789",
+                "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789",
+                "Bearer [reda",
+            ),
+        );
+    }
 
     fn connection() -> Connection {
         let connection = Connection::open_in_memory().unwrap();
