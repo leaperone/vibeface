@@ -9,9 +9,9 @@ export function StaticSearchDialog(props: SharedProps) {
   const search = useDocsSearch({ client })
   return <SearchDialog {...props} {...search}>
     <SearchDialogOverlay />
-    <SearchDialogContent>
+    <SearchDialogContent className="site-search-dialog">
       <SearchDialogHeader><SearchDialogIcon /><SearchDialogInput /><SearchDialogClose /></SearchDialogHeader>
-      <SearchDialogList />
+      <SearchDialogList className="site-search-results" />
       <SearchDialogFooter />
     </SearchDialogContent>
   </SearchDialog>

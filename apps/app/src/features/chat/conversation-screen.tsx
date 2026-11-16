@@ -26,6 +26,7 @@ import { awaitsAnswer,foldAnswers,workApproval } from '@vibeface/client/workspac
 import { networkKey,storageOf } from '@vibeface/client/workspace/storage.ts'
 import type { BotChangeRecord,InputTarget,ManagerJob,SentBotMessage,WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { Button } from '@vibeface/uiarc/button/button.tsx'
+import buttonStyles from '@vibeface/uiarc/button/button.module.css'
 import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
 import { ArrowDown,ArrowRightLeft,Bot,ChevronRight,CircleCheck,CircleQuestionMark,CircleStop,CircleX,Crown,Hourglass,Laptop,Link2,ListChecks,LoaderCircle,MessageSquareOff,MessageSquareReply,Plus,RotateCcw,RotateCw,Send,Unplug,WifiOff } from 'lucide-react'
 import { useEffect,useRef,useState } from 'react'
@@ -46,7 +47,7 @@ function NoBot() {
   const create = useCreateBot()
   return bots.length
     ? <EmptyState icon={Bot} title={botCopy.notFound} className="my-auto" action={<RoutedAction variant="secondary" to="/">查看 Bot</RoutedAction>} />
-    : <EmptyState icon={Bot} title="还没有 Bot" className="my-auto" action={<Button type="button" onClick={create}><Plus aria-hidden="true" />新 Bot</Button>} />
+    : <EmptyState icon={Bot} title="还没有 Bot" description="给你的 Bot 起个名字，接着交代你想完成的事。" className="my-auto" action={<Button type="button" onClick={create}><Plus aria-hidden="true" />新 Bot</Button>} />
 }
 
 /** `missing`: the route names a bot this network does not have. */
@@ -269,22 +270,25 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
       <Chat
         key={conversationId}
         entries={entries}
-        empty={bot ? <div className="mx-auto my-auto grid max-w-md justify-items-center gap-4 px-4 py-12 text-center">
+        empty={bot ? <div className="mx-auto my-auto grid w-full min-w-0 max-w-md justify-items-center gap-4 px-4 py-12 text-center">
           <BotFace bot={bot} mood={botMood(bot, workspace)} size={96} />
-          <div className="grid justify-items-center gap-1">
-            <h2 className="text-lg font-medium">{bot.name}</h2>
+          <div className="grid min-w-0 max-w-full justify-items-center gap-1">
+            <h2 className="max-w-full text-lg font-medium [overflow-wrap:anywhere]">{bot.name}</h2>
             {workspace.primary === bot.conversation_id ? <PrimaryMark labeled /> : null}
           </div>
-          {!needsSetup ? <p className="text-sm leading-relaxed text-secondary">说说你想完成的事，也可以随时补充要求。</p> : null}
+          {!needsSetup ? <p className="text-sm leading-relaxed text-secondary">说说你想完成的第一件事，也可以随时补充要求。</p> : null}
           {starting ? <p role="status" className="flex items-center gap-1.5 text-secondary"><LoaderCircle aria-hidden="true" className={`size-4 shrink-0 ${workspace.connectionOnline ? 'animate-spin' : ''}`} />Bot 正在启动</p>
             : needsSetup ? <>
             <p className="flex items-center gap-1.5 text-secondary"><MessageSquareOff aria-hidden="true" className="size-4 shrink-0" />Bot 还不能回复</p>
             {away || canSetUp ? <RoutedAction to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot.bot_id }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</RoutedAction>
               : <p className="flex items-center gap-1.5 text-sm text-secondary"><Crown aria-hidden="true" className="size-4 shrink-0" />{setUpOnManager((directory?.members ?? []).filter((member) => member.manage).map((member) => member.name))}</p>}
           </>
-            : <div className="flex flex-wrap justify-center gap-2">
-              {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} type="button" variant="secondary" onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
-            </div>}
+            : !text.trim() ? <div className="grid min-w-0 max-w-full gap-2">
+              <p className="text-sm text-secondary">选一句填入草稿，可修改，不会直接发送。</p>
+              <div className="flex flex-wrap justify-center gap-2">
+                {starters[bot.project ? 'project' : 'general'].map((example) => <button key={example} type="button" className={`${buttonStyles.button} ${buttonStyles.secondary} h-auto max-w-full whitespace-normal! py-2! [overflow-wrap:anywhere]`} onMouseDown={(event) => event.preventDefault()} onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</button>)}
+              </div>
+            </div> : null}
         </div> : workspace.synced ? <NoBot /> : null}
       />
       {bot && inputTarget ? <PromptInput
@@ -403,7 +407,7 @@ function TaskMeta({ device, here, label, agent, className = '' }: { device: stri
   const by = agent ? providerNames[agent] : ''
   const Agent = agent ? providerIcons[agent] : null
   const dot = <span aria-hidden="true">·</span>
-  return <span className={`flex min-w-0 shrink-0 items-center gap-1 text-secondary ${className}`}>
+  return <span className={`flex min-w-0 max-w-full items-center gap-1 text-secondary ${className}`}>
     <span aria-hidden="true" className="hidden @sm:inline">·</span>
     {Agent ? <><Agent aria-hidden="true" className="size-3.5 shrink-0" /><span className="shrink-0">{by}</span>{dot}</> : null}
     {here ? <span className="sr-only">{device}</span> : <><Laptop aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">{device}</span>{dot}</>}

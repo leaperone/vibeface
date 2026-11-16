@@ -2324,15 +2324,16 @@ mod tests {
         }
     }
 
-    fn gated_bot(dir: &Path, pi: &Arc<Pi>, mode: &str, client: &str) -> ManagerConfig {
-        let mut config = bot(dir, pi, mode, None);
+    fn gated_bot(
+        dir: &Path,
+        pi: &Arc<Pi>,
+        mode: &str,
+        client: &str,
+        turns: &Turns,
+    ) -> ManagerConfig {
+        let mut config = bot(dir, pi, mode, Some(turns));
         config.provider_env = gated_env(dir, mode);
-        config.codex_turn = Some(CodexTurn {
-            client_id: client.into(),
-            started: None,
-            record: Arc::new(|_, _| Box::pin(async { anyhow::Ok(()) })),
-            fresh_prompt: None,
-        });
+        config.codex_turn.as_mut().unwrap().client_id = client.into();
         config
     }
 
@@ -2380,7 +2381,9 @@ mod tests {
     ) -> Result<()> {
         let mut tasks = Vec::with_capacity(16);
         let mut stops = Vec::with_capacity(16);
+        let mut turns = Vec::with_capacity(16);
         for index in 0..16 {
+            let recorded = Turns::default();
             let config = gated_bot(
                 dir,
                 pi,
@@ -2390,7 +2393,9 @@ mod tests {
                     "reply"
                 },
                 &format!("client-{index}"),
+                &recorded,
             );
+            turns.push(recorded);
             let prompt = format!("marker-{index}");
             let (stop, cancel) = tokio::sync::watch::channel(false);
             stops.push(stop);
@@ -2408,6 +2413,9 @@ mod tests {
         }
         let gated = async {
             wait_for_gate(dir).await?;
+            for recorded in &turns {
+                started(recorded).await;
+            }
             if first == Some(ManagerFailure::Cancelled) {
                 stops[0].send(true)?;
                 wait_for_abort(dir).await?;

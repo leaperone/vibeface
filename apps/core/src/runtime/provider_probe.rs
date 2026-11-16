@@ -1,10 +1,7 @@
 use super::{
     Runtime,
     codex_server::Link,
-    provider_adapter::{
-        PendingDisconnectClassification, ScrubbedStderrTail, TerminationEvidence,
-        classify_pending_disconnect, safe_model_text,
-    },
+    provider_adapter::{ScrubbedStderrTail, safe_model_text},
 };
 use crate::config::ManagerSettings;
 use crate::providers::{
@@ -449,23 +446,16 @@ async fn finish_stderr(task: Option<JoinHandle<ScrubbedStderrTail>>) -> Scrubbed
         .unwrap_or_default()
 }
 
-fn issue_with_evidence(
+fn probe_issue(
     stage: ProbeStage,
     code: ProbeCode,
     tail: &ScrubbedStderrTail,
     pending: bool,
-    termination: Option<&TerminationEvidence>,
 ) -> ProbeIssue {
     let mut issue = ProbeIssue::new(stage, code);
     issue.safe_error = tail
         .safe_error()
-        .or_else(|| {
-            matches!(
-                classify_pending_disconnect(pending, termination),
-                PendingDisconnectClassification::Unknown
-            )
-            .then_some("provider_disconnected")
-        })
+        .or(pending.then_some("provider_disconnected"))
         .map(str::to_owned);
     issue
 }
@@ -548,9 +538,6 @@ async fn claude_authentication(
     .await
     .ok()
     .flatten();
-    let termination = status
-        .as_ref()
-        .map(|status| TerminationEvidence::from(*status));
     let pending = status.is_none() || bytes.is_empty();
     drop(process);
     let tail = finish_stderr(stderr).await;
@@ -560,18 +547,12 @@ async fn claude_authentication(
     {
         return Ok(Some(authentication));
     }
-    if !tail.is_empty()
-        || matches!(
-            classify_pending_disconnect(pending, termination.as_ref()),
-            PendingDisconnectClassification::Unknown
-        )
-    {
-        return Err(issue_with_evidence(
+    if !tail.is_empty() || pending {
+        return Err(probe_issue(
             ProbeStage::Authentication,
             ProbeCode::AuthenticationUnverified,
             &tail,
             pending,
-            termination.as_ref(),
         ));
     }
     Ok(None)
@@ -640,29 +621,19 @@ async fn pi_catalog(
     .await
     .ok()
     .flatten();
-    let termination = process
-        .child
-        .try_wait()
-        .ok()
-        .flatten()
-        .map(TerminationEvidence::from);
+    // Reap an exited child before cleanup without treating its exit as an RPC result.
+    let _ = process.child.try_wait();
     drop(process);
     let tail = finish_stderr(stderr).await;
     if catalog.is_some() {
         return Ok(catalog);
     }
-    if !tail.is_empty()
-        || matches!(
-            classify_pending_disconnect(pending, termination.as_ref()),
-            PendingDisconnectClassification::Unknown
-        )
-    {
-        return Err(issue_with_evidence(
+    if !tail.is_empty() || pending {
+        return Err(probe_issue(
             ProbeStage::ModelList,
             ProbeCode::CatalogUnavailable,
             &tail,
             pending,
-            termination.as_ref(),
         ));
     }
     Ok(None)
@@ -757,6 +728,48 @@ mod tests {
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
     use vibeface_bridge::agent::{CursorAuthentication, CursorModel};
+
+    #[test]
+    fn probe_issue_keeps_safe_diagnostics_and_pending_fallback() {
+        for (stage, code, stage_name, code_name) in [
+            (
+                ProbeStage::Authentication,
+                ProbeCode::AuthenticationUnverified,
+                "authentication",
+                "authentication_unverified",
+            ),
+            (
+                ProbeStage::ModelList,
+                ProbeCode::CatalogUnavailable,
+                "model_list",
+                "catalog_unavailable",
+            ),
+        ] {
+            for (pending, stderr, safe_error) in [
+                (false, "", None),
+                (true, "", Some("provider_disconnected")),
+                (
+                    false,
+                    "Authorization: Bearer fixture-secret at /private/provider",
+                    Some("authentication_failed"),
+                ),
+                (
+                    true,
+                    "Authorization: Bearer fixture-secret at /private/provider",
+                    Some("authentication_failed"),
+                ),
+                (true, "child stopped", Some("provider_error")),
+            ] {
+                let tail = ScrubbedStderrTail::from_bytes(stderr.as_bytes());
+                let issue = probe_issue(stage, code, &tail, pending);
+                let mut expected = json!({"stage": stage_name, "code": code_name});
+                if let Some(safe_error) = safe_error {
+                    expected["safe_error"] = json!(safe_error);
+                }
+                assert_eq!(serde_json::to_value(issue).unwrap(), expected);
+            }
+        }
+    }
 
     async fn cursor_probe_node(
         env: BTreeMap<String, String>,
@@ -1122,8 +1135,14 @@ exit 1
             .join(uuid::Uuid::new_v4().to_string());
         crate::config::private_dir(&dir)?;
         let bin = dir.join("provider");
-        std::fs::write(&bin, format!("#!/bin/sh\n{script}\n"))?;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700))?;
+        let body = dir.join("provider-script");
+        std::fs::write(&body, format!("#!/bin/sh\n{script}\n"))?;
+        std::fs::set_permissions(&body, std::fs::Permissions::from_mode(0o600))?;
+        // Another test's child can inherit the body's writable FD before exec closes it.
+        std::os::unix::fs::symlink(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-probe"),
+            &bin,
+        )?;
         Ok((
             dir,
             ProbeInput {
@@ -1159,6 +1178,29 @@ exit 1
             None
         );
         assert_eq!(claude_authentication_response(b"not json", false), None);
+    }
+
+    #[tokio::test]
+    async fn probe_fixture_runs_while_its_script_body_has_a_writer() -> anyhow::Result<()> {
+        let (dir, input) = fixture(
+            r#"
+[ "$*" = "auth status --json" ] || exit 9
+printf '%s\n' '{"loggedIn":false}'
+exit 1
+"#,
+        )?;
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("provider-script"))?;
+        assert_eq!(
+            claude_authentication(&input, &dir)
+                .await
+                .map_err(|issue| anyhow::anyhow!("controlled probe failed: {issue:?}"))?,
+            Some(Authentication::SignInRequired)
+        );
+        drop(writer);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[tokio::test]

@@ -1,0 +1,26 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "side-tab",
+        "value": "*",
+        "files": [
+          "src/features/chat/chat.css"
+        ],
+        "createdAt": "2026-11-15T07:59:13.526Z",
+        "reason": "Agent: existing Markdown blockquote uses a neutral border to identify quoted content, not a decorative card accent."
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#000",
+        "files": [
+          "src/features/chat/chat.css"
+        ],
+        "createdAt": "2026-11-15T07:59:13.547Z",
+        "reason": "Agent: black is an alpha-mask stop for truncated code, not a painted UI color or palette addition."
+      }
+    ]
+  }
+}

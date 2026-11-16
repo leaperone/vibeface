@@ -79,7 +79,7 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
 
   return (
     <Drawer open={open} onOpenChange={onOpenChange}>
-      <DrawerContent title={pending ? "再试一次" : "新 Bot"} description={pending ? "上次没确认是否建好，内容保持不变。" : "起个名字，就能开始聊。"} className="!w-full max-sm:!border-l-0 overflow-y-auto sm:!max-w-lg" onCloseAutoFocus={(event) => { event.preventDefault(); restoreFocus() }}>
+      <DrawerContent title={pending ? "再试一次" : "新 Bot"} description={pending ? "上次没确认是否建好，内容保持不变。" : "给它起个名字，创建后再交代想完成的事。"} className="!w-full max-sm:!border-l-0 overflow-y-auto sm:!max-w-lg" onCloseAutoFocus={(event) => { event.preventDefault(); restoreFocus() }}>
         <form className="space-y-6 pb-[env(safe-area-inset-bottom)]" noValidate onSubmit={(event) => { void submit(event) }}>
           {pending && rejected && !busy ? <p role="status" className="rounded-control bg-surface-muted p-3 text-sm">上次没建成，确认后可以修改。</p> : null}
           <FormField>
