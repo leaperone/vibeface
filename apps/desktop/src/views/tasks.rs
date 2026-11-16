@@ -1,11 +1,16 @@
 use crate::{
     app::Desktop,
     ui::Route,
-    views::{backend::Command, forms::Editor, records::HistoryBody},
+    views::{
+        backend::Command,
+        forms::Editor,
+        records::HistoryBody,
+        task_actions::{task_controls, task_editor},
+    },
 };
 use gpui_kit::{component::button::Button, *};
 use std::collections::BTreeMap;
-use vibeface_protocol::workspace::{InputTarget, TaskAction, WorkspaceCommand};
+use vibeface_protocol::workspace::{InputTarget, WorkspaceCommand};
 impl Desktop {
     pub(crate) fn task_detail(&self, cx: &mut Context<Self>) -> AnyElement {
         let Route::Task(task_id) = &self.route else {
@@ -61,20 +66,9 @@ impl Desktop {
                 },
             );
         }
+        let (editor, values) = task_editor(task);
         page = page
-            .child(self.open_editor(
-                "task-revise",
-                "修改任务",
-                Editor::EditTask(task.task_id.clone(), task.revision),
-                BTreeMap::from([
-                    ("title", task.title.clone()),
-                    ("owner_bot", task.owner_bot.clone()),
-                    ("request", task.request.clone()),
-                    ("expected_result", task.expected_result.clone()),
-                    ("dependencies", task.dependencies.join(",")),
-                ]),
-                cx,
-            ))
+            .child(self.open_editor("task-revise", "修改任务", editor, values, cx))
             .child(self.open_editor(
                 "task-assign",
                 "分派执行",
@@ -85,22 +79,8 @@ impl Desktop {
                 ]),
                 cx,
             ));
-        for (label, action) in [
-            ("继续", TaskAction::Continue),
-            ("停止", TaskAction::Stop),
-            ("延后", TaskAction::Defer),
-            ("取消", TaskAction::Cancel),
-        ] {
-            page = page.child(self.button(
-                label,
-                label,
-                Command::Workspace(WorkspaceCommand::ControlTask {
-                    task_id: task.task_id.clone(),
-                    expected_revision: task.revision,
-                    action,
-                }),
-                cx,
-            ));
+        for (label, command) in task_controls(task) {
+            page = page.child(self.button(label, label, command, cx));
         }
         for assignment in self
             .snapshot

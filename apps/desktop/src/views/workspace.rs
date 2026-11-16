@@ -1,11 +1,14 @@
 use crate::{
     app::Desktop,
     ui::*,
-    views::{backend::Command, forms::Editor},
+    views::{
+        backend::Command,
+        forms::Editor,
+        task_actions::{task_controls, task_editor},
+    },
 };
 use gpui_kit::{component::button::Button, *};
 use std::collections::BTreeMap;
-use vibeface_protocol::workspace::{TaskAction, WorkspaceCommand};
 
 impl Desktop {
     pub(crate) fn bot_context_header(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -116,13 +119,7 @@ impl Desktop {
             ),
         );
         for task in &self.snapshot.tasks {
-            let values = BTreeMap::from([
-                ("title", task.title.clone()),
-                ("owner_bot", task.owner_bot.clone()),
-                ("request", task.request.clone()),
-                ("expected_result", task.expected_result.clone()),
-                ("dependencies", task.dependencies.join(",")),
-            ]);
+            let (editor, values) = task_editor(task);
             let mut row = self
                 .row(
                     task.title.clone(),
@@ -137,25 +134,16 @@ impl Desktop {
                 .child(self.open_editor(
                     SharedString::from(format!("revise-{}", task.task_id)),
                     "修改任务",
-                    Editor::EditTask(task.task_id.clone(), task.revision),
+                    editor,
                     values,
                     cx,
                 ));
             let mut actions = div().flex().gap_2();
-            for (label, action) in [
-                ("继续", TaskAction::Continue),
-                ("停止", TaskAction::Stop),
-                ("延后", TaskAction::Defer),
-                ("取消", TaskAction::Cancel),
-            ] {
+            for (label, command) in task_controls(task) {
                 actions = actions.child(self.button(
                     SharedString::from(format!("task-{}-{label}", task.task_id)),
                     label,
-                    Command::Workspace(WorkspaceCommand::ControlTask {
-                        task_id: task.task_id.clone(),
-                        expected_revision: task.revision,
-                        action,
-                    }),
+                    command,
                     cx,
                 ));
             }

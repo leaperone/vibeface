@@ -7,6 +7,7 @@ pub mod history_view;
 pub mod offline;
 pub mod records;
 pub mod settings;
+mod task_actions;
 pub mod tasks;
 pub mod work_detail;
 pub mod workspace;
