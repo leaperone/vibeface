@@ -7,7 +7,6 @@ use crate::{
     store::bot_settings::ChangeRequest,
     work::WorkSpec,
 };
-use anyhow::Context as _;
 use std::time::Duration;
 
 struct Fixture {
@@ -62,6 +61,15 @@ impl Fixture {
         settings.roots = vec![directory.clone()];
         node.configure_node(settings, &admin.device_id()?, None)
             .await?;
+        ensure!(
+            node.apply_provider_launches().await?,
+            "fixture configuration stayed pending"
+        );
+        let readiness = node.provider_readiness(Provider::Pi, "fixture").await;
+        ensure!(
+            readiness.can_attempt(),
+            "fixture Pi readiness: {readiness:?}"
+        );
         node.tool_url.set("http://127.0.0.1:1".into()).unwrap();
         bot(&node, &admin, "c", "Turn lifecycle", &[]).await?;
         let network = node.network_id().await?;
@@ -145,7 +153,7 @@ impl Fixture {
                             name: "Turn".into(),
                             prompt: "fixture".into(),
                             first_run_at_ms: now,
-                            every_minutes: Some(1),
+                            every_minutes: Some(5),
                             enabled: None,
                         },
                         Provider::Pi,
@@ -256,7 +264,7 @@ async fn admission_errors_release_registration_and_refund_without_native_executi
         let fixture = Fixture::new(case != "activation", "reply").await?;
         let result = async {
             fixture.sql("CREATE TABLE activated(count INTEGER); CREATE TABLE charged(count INTEGER);
-                CREATE TRIGGER activation_record AFTER UPDATE OF state ON scheduler_jobs WHEN NEW.state='running'
+                CREATE TRIGGER activation_record AFTER UPDATE OF state ON scheduler_jobs WHEN NEW.state='running' AND OLD.state!='running'
                 BEGIN INSERT INTO activated VALUES(1); END;
                 CREATE TRIGGER charge_record AFTER INSERT ON budget_days BEGIN INSERT INTO charged VALUES(1); END;").await?;
             fixture.sql(match case {
@@ -268,18 +276,21 @@ async fn admission_errors_release_registration_and_refund_without_native_executi
                     WHEN json_extract(NEW.runtime,'$.execution')='unknown'
                     BEGIN SELECT RAISE(FAIL,'controlled pre-submission write failure'); END;",
             }).await?;
-            assert_eq!(fixture.run().await?.context("failed invocation")?["state"], "failed", "{case}");
+            let invocation = fixture.run().await.with_context(|| format!("run admission failure case {case}"))?.context("failed invocation")?;
             let (job, budget, native, pending) = fixture.facts().await?;
-            assert!(matches!(job.state, JobState::Failed { .. }), "{case}: {:?}", job.state);
+            assert_eq!(invocation["state"], "failed", "{case}: {:?}", job.state);
+            let JobState::Failed { failure, .. } = &job.state else { bail!("{case}: unexpected state {:?}", job.state) };
+            let expected_fault = match case { "budget" => "controlled budget reservation failure", "activation" => "controlled local activation failure", _ => "controlled pre-submission write failure" };
+            ensure!(failure.detail.contains(expected_fault), "{case} did not reach {expected_fault}: {failure:?}");
             assert_eq!((budget, native, pending, fixture.prompts()?), (0, 0, 0, 0), "{case}");
             assert_eq!(job.runtime.context("runtime")?.execution, TurnExecution::NotStarted, "{case}");
-            fixture.node.store.call("turn_test.admission_boundaries", move |store| {
+            let boundaries = fixture.node.store.call("turn_test.admission_boundaries", move |store| {
                 let activated: u64 = store.connection.query_row("SELECT count(*) FROM activated", [], |row| row.get(0))?;
                 let charged: u64 = store.connection.query_row("SELECT count(*) FROM charged", [], |row| row.get(0))?;
-                // AgentTask registration marks Running before budget admission and local publication.
-                assert_eq!((activated, charged), match case { "budget" => (1, 0), "activation" => (0, 1), _ => (1, 1) });
-                Ok(())
+                Ok((activated, charged))
             }).await?;
+            // AgentTask registration marks Running before budget admission and local publication.
+            assert_eq!(boundaries, match case { "budget" => (1, 0), "activation" => (0, 1), _ => (1, 1) }, "{case}");
             assert!(fixture.node.agent_tokens.lock().await.is_empty());
             assert!(fixture.node.manager_controls.lock().await.is_empty());
             Ok(())
@@ -291,23 +302,42 @@ async fn admission_errors_release_registration_and_refund_without_native_executi
 
 #[tokio::test]
 async fn a_failed_primary_refund_consumes_its_reservation_before_the_final_window() -> Result<()> {
-    let fixture = Fixture::new(false, "reply").await?;
-    let result = async {
-        let mut owner = fixture.owner().await?;
-        fixture.sql("CREATE TRIGGER fail_refund BEFORE UPDATE OF used ON budget_days WHEN NEW.used < OLD.used
-            BEGIN SELECT RAISE(FAIL,'controlled refund failure'); END;").await?;
-        assert!(owner.refund_budget().await.is_err());
-        assert!(owner.budget.is_none());
-        fixture.sql("DROP TRIGGER fail_refund;").await?;
-        assert_eq!(owner.finish(Err(anyhow::anyhow!("controlled local failure"))).await?["state"], "failed");
-        let (_, budget, native, pending) = fixture.facts().await?;
-        // If finish reuses the failed refund's reservation, dropping the fault would make this 0.
-        assert_eq!((budget, native, pending, fixture.prompts()?), (1, 0, 0, 0));
-        assert!(fixture.node.agent_tokens.lock().await.is_empty());
-        assert!(fixture.node.manager_controls.lock().await.is_empty());
-        Ok(())
-    }.await;
-    fixture.close(result).await
+    for case in ["refund", "terminal", "failure_record"] {
+        let fixture = Fixture::new(false, "reply").await?;
+        let result = async {
+            let owner = fixture.owner().await?;
+            fixture.sql(match case {
+                "refund" => "CREATE TRIGGER fail_refund BEFORE UPDATE OF used ON budget_days WHEN NEW.used < OLD.used
+                    BEGIN SELECT RAISE(FAIL,'controlled primary refund failure'); END;",
+                "terminal" => "CREATE TRIGGER fail_terminal BEFORE UPDATE OF state ON scheduler_jobs WHEN NEW.state='failed'
+                    BEGIN SELECT RAISE(FAIL,'controlled terminal write failure'); END;",
+                _ => "CREATE TRIGGER fail_failure_record BEFORE UPDATE OF runtime ON scheduler_jobs WHEN NEW.runtime IS NOT NULL
+                    BEGIN SELECT RAISE(FAIL,'controlled failure recording failure'); END;",
+            }).await?;
+            // Every fault leaves a final Err before any reply is committed. failure_record
+            // skips the primary refund, so only the fallback window can return its unit.
+            let error = owner.finish(Err(anyhow::anyhow!("controlled local failure"))).await.expect_err(case);
+            let detail = format!("{error:#}");
+            let expected_fault = match case { "refund" => "controlled primary refund failure", "terminal" => "controlled terminal write failure", _ => "controlled failure recording failure" };
+            assert!(detail.contains(expected_fault), "{case}: {detail}");
+            // A retained first-window reservation would retry the failing refund, or try to
+            // subtract a second unit after the terminal-write fault, and add this context.
+            assert!(!detail.contains("scheduler budget refund failed"), "{case}: {detail}");
+            let (job, budget, native, pending) = fixture.facts().await?;
+            assert!(matches!(job.state, JobState::Running { .. }), "{case}: {:?}", job.state);
+            assert_eq!((budget, native, pending, fixture.prompts()?), (u64::from(case == "refund"), 0, 0, 0), "{case}");
+            let network = fixture.network.clone();
+            let replies = fixture.node.store.call("turn_test.no_refund_failure_reply", move |store| {
+                Ok(store.messages(&network, "c")?.into_iter().filter(|message| message.role == Role::Assistant).count())
+            }).await?;
+            assert_eq!(replies, 0, "{case}");
+            assert!(fixture.node.agent_tokens.lock().await.is_empty());
+            assert!(fixture.node.manager_controls.lock().await.is_empty());
+            Ok(())
+        }.await;
+        fixture.close(result).await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -376,6 +406,7 @@ async fn a_registered_backup_keeps_one_reservation_and_closes_before_a_failed_sw
                 };
                 Ok(())
             }, None).await?;
+            ensure!(fixture.node.apply_provider_launches().await?, "backup configuration stayed pending");
             fixture.sql("CREATE TABLE charges(count INTEGER);
                 CREATE TRIGGER record_charge AFTER INSERT ON budget_days BEGIN INSERT INTO charges VALUES(1); END;").await?;
             if failed_switch {
@@ -430,6 +461,10 @@ async fn a_readiness_backup_commits_its_result_with_the_original_admission() -> 
                 None,
             )
             .await?;
+        ensure!(
+            fixture.node.apply_provider_launches().await?,
+            "readiness backup configuration stayed pending"
+        );
         assert_eq!(
             fixture.run().await?.context("invocation")?["state"],
             "completed"
