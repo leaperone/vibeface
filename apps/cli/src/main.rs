@@ -12,7 +12,7 @@ use std::{
     process::Command,
     time::Duration,
 };
-use vibeface_bridge::platform::privatefs;
+use vibeface_bridge::{platform::privatefs, transport};
 use vibeface_control::{
     ControlRequest,
     maintenance::{self, MaintenanceCommand, SecretString, WalletCommand},
@@ -1792,15 +1792,14 @@ async fn post_tool(
     Ok(reply["result"].clone())
 }
 
-async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
+async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>> {
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        ensure!(
-            body.len().saturating_add(chunk.len()) <= 1024 * 1024,
-            "node response exceeds 1 MiB"
-        );
-        body.extend_from_slice(&chunk);
-    }
+    transport::body(response, 1024 * 1024, &mut body)
+        .await
+        .map_err(|error| match error {
+            transport::BodyError::TooLarge => anyhow::anyhow!("node response exceeds 1 MiB"),
+            transport::BodyError::Read(error) => error.into(),
+        })?;
     Ok(body)
 }
 

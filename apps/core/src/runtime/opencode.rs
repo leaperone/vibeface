@@ -557,7 +557,8 @@ impl Opencode {
         }
         let response = request.send().await?;
         let status = response.status().as_u16();
-        let bytes = transport::body(response, transport::BODY_BYTES).await?;
+        let mut bytes = Vec::new();
+        transport::body(response, transport::BODY_BYTES, &mut bytes).await?;
         let body = match serde_json::from_slice(&bytes) {
             Ok(body) => body,
             Err(_) if bytes.is_empty() => Value::Null,

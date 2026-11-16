@@ -83,22 +83,57 @@ impl<R: AsyncBufRead + Unpin> Lines<R> {
     }
 }
 
-/// Reads HTTP bodies incrementally, including chunked bodies with no Content-Length.
-pub async fn body(mut response: reqwest::Response, limit: usize) -> anyhow::Result<Vec<u8>> {
-    anyhow::ensure!(
-        response
-            .content_length()
-            .is_none_or(|size| size <= limit as u64),
-        "provider HTTP body exceeds its memory budget"
-    );
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        if chunk.len() > limit.saturating_sub(bytes.len()) {
-            return Err(limit_error("HTTP body").into());
+/// A body exceeded the caller's limit or could not be read completely.
+#[derive(Debug)]
+pub enum BodyError {
+    TooLarge,
+    Read(reqwest::Error),
+}
+
+impl std::fmt::Display for BodyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge => formatter.write_str("HTTP body exceeds its memory budget"),
+            Self::Read(error) => std::fmt::Display::fmt(error, formatter),
         }
-        extend(&mut bytes, &chunk, limit);
     }
-    Ok(bytes)
+}
+
+impl std::error::Error for BodyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TooLarge => None,
+            Self::Read(error) => Some(error),
+        }
+    }
+}
+
+/// Appends an HTTP body within `limit`, including any bytes already in the buffer.
+/// The caller owns the buffer throughout reads, failures and cancellation, so sensitive
+/// bodies can use a `Zeroizing<Vec<u8>>`. Status and trust checks belong to the caller.
+pub async fn body(
+    mut response: reqwest::Response,
+    limit: usize,
+    bytes: &mut Vec<u8>,
+) -> Result<(), BodyError> {
+    let remaining = limit.checked_sub(bytes.len()).ok_or(BodyError::TooLarge)?;
+    if response
+        .content_length()
+        .is_some_and(|size| size > remaining as u64)
+    {
+        return Err(BodyError::TooLarge);
+    }
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| BodyError::Read(error.without_url()))?
+    {
+        if chunk.len() > limit.saturating_sub(bytes.len()) {
+            return Err(BodyError::TooLarge);
+        }
+        extend(bytes, &chunk, limit);
+    }
+    Ok(())
 }
 
 /// Parses one SSE event at a time from borrowed chunks. Both the current line and all data
@@ -619,16 +654,85 @@ mod tests {
 
     #[tokio::test]
     async fn http_budget_checks_known_and_chunked_lengths_and_small_json() {
-        let response = http_response(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\n123456789",
-        )
-        .await;
-        assert!(body(response, 8).await.is_err());
-        let response = http_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\n12345\r\n5\r\n67890\r\n0\r\n\r\n").await;
-        assert!(body(response, 8).await.is_err());
+        for wire in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\n123456789".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\n12345\r\n4\r\n6789\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n123456789",
+        ] {
+            let response = http_response(wire).await;
+            let mut bytes = Vec::new();
+            assert!(matches!(
+                body(response, 8, &mut bytes).await,
+                Err(BodyError::TooLarge)
+            ));
+            assert!(bytes.len() <= 8 && bytes.capacity() <= 8);
+        }
+        for wire in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n12345678".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\n1234\r\n4\r\n5678\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n12345678",
+        ] {
+            let response = http_response(wire).await;
+            let mut bytes = Vec::new();
+            body(response, 8, &mut bytes).await.unwrap();
+            assert_eq!(bytes, b"12345678");
+            assert!(bytes.capacity() <= 8);
+        }
         let response =
             http_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
                 .await;
-        assert_eq!(body(response, 8).await.unwrap(), b"{}");
+        let mut bytes = Vec::new();
+        body(response, 8, &mut bytes).await.unwrap();
+        assert_eq!(bytes, b"{}");
+    }
+
+    #[tokio::test]
+    async fn http_body_counts_existing_bytes_and_accepts_empty_bodies() {
+        let response =
+            http_response(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+        let mut bytes = Vec::new();
+        body(response, 0, &mut bytes).await.unwrap();
+        assert_eq!(bytes, b"");
+
+        let response =
+            http_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\ncd")
+                .await;
+        let mut bytes = b"ab".to_vec();
+        body(response, 4, &mut bytes).await.unwrap();
+        assert_eq!(bytes, b"abcd");
+
+        let response =
+            http_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\ncd")
+                .await;
+        let mut bytes = b"ab".to_vec();
+        assert!(matches!(
+            body(response, 3, &mut bytes).await,
+            Err(BodyError::TooLarge)
+        ));
+        assert_eq!(bytes, b"ab");
+    }
+
+    #[tokio::test]
+    async fn http_body_reports_interruption_without_returning_a_complete_body_or_url() {
+        let response = http_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n3\r\nd").await;
+        let mut bytes = Vec::new();
+        let error = body(response, 8, &mut bytes).await.unwrap_err();
+        let BodyError::Read(error) = error else {
+            panic!("truncated HTTP body was not classified as a read failure");
+        };
+        assert!(error.url().is_none());
+        assert!(bytes.len() <= 8 && bytes.capacity() <= 8);
+    }
+
+    #[tokio::test]
+    async fn http_body_does_not_treat_status_as_a_collection_policy() {
+        let response = http_response(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        )
+        .await;
+        let mut bytes = Vec::new();
+        body(response, 8, &mut bytes).await.unwrap();
+        assert_eq!(bytes, b"{}");
     }
 }
