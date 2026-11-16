@@ -10,6 +10,8 @@ import test from "node:test"
 import { fileURLToPath } from "node:url"
 import { createContext, Script } from "node:vm"
 import { JsxEmit, ModuleKind, transpileModule } from "typescript"
+import qrcode from 'qrcode-generator'
+import * as recoveryLinks from '@vibeface/client/identity/recovery-link.ts'
 import { entryAddress, entryJson, entryKey, messageOf, parseEntry, parseInfo, providerNames } from "@vibeface/client/lib/node.ts"
 import * as nodeSettings from "@vibeface/client/lib/node.ts"
 import type { OutboxItem } from '@vibeface/client/lib/outbox.ts'
@@ -1913,6 +1915,8 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   const nativeRouter = typeof nativeRouterModule === 'object' && nativeRouterModule !== null && 'router' in nativeRouterModule ? nativeRouterModule.router : {}
   const require = (specifier: string): unknown => {
     if (realModules[specifier]) return loadComponentModule(fileURLToPath(new URL(realModules[specifier], import.meta.url)))
+    if (specifier === '@/lib/qr-code') return loadQr(fileURLToPath(new URL('../../lib/qr-code.ts', import.meta.url)))
+    if (specifier === 'qrcode-generator') return dependencies[specifier] ?? qrcode
     if (specifier === '@/components/arc/routed-action') return { RoutedAction: 'Link', ActionLink: 'a' }
     if (specifier === '@/components/arc/task-run-summary') return { TaskRunSummary: function TaskRunSummary() {} }
     if (path.includes('/mobile/') && specifier === '@/components/arc/input') return { Input: 'TextInput' }
@@ -1942,6 +1946,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     return specifier === 'react' ? react : specifier === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : specifier === 'expo-router' ? { Link: 'Link', useFocusEffect, useRouter: () => nativeRouter, ...dependencies[specifier] as object } : dependencies[specifier] ?? ui
   }
   const loadComponentModule = moduleLoader(createContext({ setTimeout, clearTimeout, ...globals }), specifier => require(specifier))
+  const loadQr = moduleLoader(createContext({}), specifier => require(specifier))
   const filename = fileURLToPath(new URL(path, import.meta.url))
   const source = readFileSync(filename, 'utf8') + (privateExport ? `\nexport { ${privateExport} }\n` : '')
   const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
@@ -5158,6 +5163,53 @@ test("the invitation's QR code is its link, for the app", async () => {
   assert.deepEqual(local.encoded, ['vibeface://join/vibeface1test'])
   assert.equal(local.tree.find(({ type }) => type === 'img')?.props.alt, '用手机 App 扫码')
   assert.ok(local.tree.some(({ type, props }) => type === 'p' && [props.children].flat().includes('用手机 App 扫码')))
+})
+
+test("an oversized invitation keeps its full link visible and copyable when QR encoding fails", async () => {
+  const link = `vibeface://join/${'a'.repeat(5000)}`
+  const copied: string[] = []
+  const device = { connectionGeneration: () => 1, ready: { isCurrent: () => true, principal: { can_manage: true } }, createInvitation: async () => ({ link, expiresAt: Date.now() + 600_000 }), refreshDirectory: async () => {} }
+  const app = componentHarness('../devices/add-device.tsx', {
+    '@vibeface/client/identity/context.tsx': { useDevice: () => device }, './join': { JoinRequests: () => null, useOpenJoins: () => [] }, '@/lib/glossary': { terms: { safetyCode: { icon: 'ScanEye' } } },
+    '@vibeface/client/lib/node.ts': { messageOf },
+  }, { navigator: { clipboard: { writeText: async (value: string) => { copied.push(value) } } }, setInterval: () => 0, clearInterval: () => {} })
+  try {
+    app.render('AddDevice')
+    app.render('AddDevice').find(({ props }) => [props.children].flat().includes('生成链接'))?.props.onClick?.()
+    await settleComponent()
+    const tree = app.render('AddDevice')
+    assert.equal(tree.some(({ type }) => type === 'img'), false)
+    assert.ok(tree.some(({ props }) => props.error === '无法生成二维码，请复制链接。'))
+    assert.equal(tree.find(({ props }) => props.label === '链接原文' && 'open' in props)?.props.open, true)
+    assert.equal(tree.find(({ props }) => props.readOnly)?.props.value, link)
+    const copy = tree.find(({ props }) => [props.children].flat().includes('复制链接'))?.props
+    assert.ok(copy?.onClick)
+    copy.onClick()
+    await settleComponent()
+    assert.deepEqual(copied, [link])
+  } finally { app.close() }
+})
+
+test("an oversized phone recovery link stays visible and copyable when QR encoding fails", async () => {
+  const address = `https://node.example/${'a'.repeat(5000)}`
+  const link = `vibeface://join?recover=target&address=https%3A%2F%2Fnode.example%2F${'a'.repeat(5000)}`
+  const copied: string[] = []
+  const app = componentHarness('../identity/recovery-controls.tsx', {
+    '@vibeface/client/identity/context.tsx': { useDevice: () => ({ entrances: [], ready: { entry: { kind: 'gateway', address, device_id: 'target' } } }) },
+    '@vibeface/client/identity/recovery-link.ts': recoveryLinks,
+  }, { navigator: { clipboard: { writeText: async (value: string) => { copied.push(value) } } }, setTimeout, clearTimeout })
+  try {
+    const tree = app.render('PhoneRecovery')
+    assert.equal(tree.some(({ type }) => type === 'img'), false)
+    assert.ok(tree.some(({ props }) => props.error === '无法生成二维码，请复制链接。'))
+    assert.equal(tree.find(({ props }) => props.readOnly)?.props.value, link)
+    const copy = tree.find(({ props }) => [props.children].flat().includes('复制链接'))?.props
+    assert.ok(copy?.onClick)
+    copy.onClick()
+    await settleComponent()
+    assert.deepEqual(copied, [link])
+    assert.match(componentText(app.render('PhoneRecovery')), /已复制/)
+  } finally { app.close() }
 })
 
 test("an entry is stored in the one form Nodes send it in, and a LAN entry as its device id and addresses", () => {
