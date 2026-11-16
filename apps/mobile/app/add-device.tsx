@@ -1,4 +1,3 @@
-import * as Clipboard from 'expo-clipboard'
 import { openURL } from 'expo-linking'
 import { useRouter } from 'expo-router'
 import { Check, CircleCheck, Clock, Copy, Download, Laptop, Link2, Plus, ScanEye, Share2, ShieldAlert, Smartphone, Sparkles, SquareTerminal } from 'lucide-react-native'
@@ -15,6 +14,7 @@ import { Text } from '@/components/arc/text'
 import { JoinRequests, useOpenJoins, type Added } from '@/features/devices/join-requests'
 import { QrCode } from '@/features/devices/qr-code'
 import { useRun } from '@/lib/use-run'
+import { useClipboardAction } from '@/lib/use-clipboard'
 
 const kinds = [{ value: 'phone', label: addDeviceCopy.client, icon: Smartphone }, { value: 'computer', label: addDeviceCopy.node, icon: Laptop }] as const
 type Kind = (typeof kinds)[number]['value']
@@ -25,14 +25,10 @@ export default function AddDevice() {
   const device = useDevice()
   const { ready } = device
   const { busy, error, run } = useRun()
-  const [copied, setCopied] = useState<'link' | 'command' | null>(null)
   const [kind, setKind] = useState<Kind>('phone')
-  useEffect(() => {
-    if (!copied) return
-    const timer = setTimeout(() => setCopied(null), 2000)
-    return () => clearTimeout(timer)
-  }, [copied])
   const [result, setResult] = useState<Invitation | null>(null)
+  const clipboard = useClipboardAction(result, 2000)
+  const copied = clipboard.copied
   const [added, setAdded] = useState<Added | null>(null)
   const requests = useOpenJoins().length > 0
   // A link is single-use: once a device has answered it, it is spent.
@@ -61,7 +57,7 @@ export default function AddDevice() {
     opened.current = ready
     generate()
   }, [ready])
-  const copyLink = result ? <Button variant={requests ? 'secondary' : 'primary'} disabled={busy !== null} onPress={() => void run('copy', () => Clipboard.setStringAsync(result.link).then(() => setCopied('link')))}>
+  const copyLink = result ? <Button variant={requests ? 'secondary' : 'primary'} disabled={busy !== null} onPress={() => void run('copy', async () => { await clipboard.copy(result.link, 'link') })}>
     <Icon as={copied === 'link' ? Check : Copy} /><Text>{copied === 'link' ? '已复制' : '复制链接'}</Text>
   </Button> : null
   if (!ready?.principal.can_manage) return <EmptyState icon={ShieldAlert} title="只有管理设备能添加设备" />
@@ -80,7 +76,7 @@ export default function AddDevice() {
     </Button>} /> : null}
     <JoinRequests issuing={result !== null} onAllowed={(device) => { setAdded(device); setResult(null) }} />
     {result && !used ? <View className="gap-4">
-      <Segmented options={kinds} value={kind} onChange={(next) => { setKind(next); setCopied(null) }} />
+      <Segmented options={kinds} value={kind} onChange={(next) => { setKind(next); clipboard.reset() }} />
       {kind === 'phone' ? <>
         <Text className="text-sm text-muted">{addDeviceCopy.clientHint}</Text>
         <QrCode value={result.link} label="用手机 App 扫码" />
@@ -104,7 +100,7 @@ export default function AddDevice() {
           <View className="gap-2 border-t border-border pt-3">
             <View className="flex-row items-center gap-1.5"><Icon as={SquareTerminal} className="size-4 text-muted" /><Text className="shrink text-sm text-muted">{addDeviceCopy.orCommand}</Text></View>
             <View className="flex-row items-center gap-2">
-              <Button variant="secondary" disabled={busy !== null} onPress={() => void run('copy', () => Clipboard.setStringAsync(addDeviceCopy.command(result.link)).then(() => setCopied('command')))}>
+              <Button variant="secondary" disabled={busy !== null} onPress={() => void run('copy', async () => { await clipboard.copy(addDeviceCopy.command(result.link), 'command') })}>
                 <Icon as={copied === 'command' ? Check : Copy} /><Text>{copied === 'command' ? '已复制' : addDeviceCopy.copyCommand}</Text>
               </Button>
               <Button variant="ghost" iconOnly accessibilityLabel="分享命令" onPress={() => { void Share.share({ message: addDeviceCopy.command(result.link) }).catch(() => {}) }}><Icon as={Share2} /></Button>
@@ -117,7 +113,7 @@ export default function AddDevice() {
         <View className="flex-row items-center gap-1.5"><Icon as={Clock} className="size-4 text-muted" /><Text className="shrink text-sm text-muted">只给自己的设备，10 分钟有效</Text></View>
       </View>
     </View> : null}
-    <ErrorText error={error} />
+    <ErrorText error={error || clipboard.error} />
   </ScrollView>
 }
 

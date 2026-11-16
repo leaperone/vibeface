@@ -1918,6 +1918,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     if (path.includes('/mobile/') && specifier === '@/components/arc/textarea') return { Textarea: 'TextInput' }
     if (path.includes('/mobile/') && specifier === '@/components/arc/chat') return { ComposerInput: 'TextInput', ComposerPanel: 'ComposerPanel', MessageBubble: 'View' }
     if (path.includes('/mobile/') && specifier === '@/components/arc/selection') return { SelectionItem: 'Pressable' }
+    if (path.includes('/mobile/') && specifier === '@/lib/use-clipboard') return loadClipboard(fileURLToPath(new URL('../../../../../apps/mobile/src/lib/use-clipboard.ts', import.meta.url)))
     if (specifier === '@vibeface/client/workspace/model.ts') {
       const override = dependencies[specifier]
       return { ...workspaceModel, ...(typeof override === 'object' && override !== null ? override : {}) }
@@ -1939,6 +1940,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     if (specifier === '@tanstack/react-router') return { Link: 'Link', useNavigate: () => () => {}, useRouterState: ({ select }: { select: (state: unknown) => unknown }) => select({ location: { search: {} } }), ...dependencies[specifier] as object }
     return specifier === 'react' ? react : specifier === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : specifier === 'expo-router' ? { Link: 'Link', useFocusEffect, useRouter: () => nativeRouter, ...dependencies[specifier] as object } : dependencies[specifier] ?? ui
   }
+  const loadClipboard = moduleLoader(createContext({ setTimeout, clearTimeout, ...globals }), specifier => require(specifier))
   const filename = fileURLToPath(new URL(path, import.meta.url))
   const source = readFileSync(filename, 'utf8') + (privateExport ? `\nexport { ${privateExport} }\n` : '')
   const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
@@ -2342,6 +2344,8 @@ test('webhook secret saves preserve failures and newer drafts on web and mobile'
       '@vibeface/client/workspace/model.ts': workspaceModel,
       '@/lib/glossary': { terms: { externalChat: { label: '外部聊天', icon: 'Send' } } },
       '@/features/devices/remote-settings': { useCall: () => ({ value: settings, busy: '', error: null, call: (_key: string, _method: string, params: unknown) => save(params) }) },
+      'expo-clipboard': { setStringAsync: async () => assert.fail('Saving webhook settings must not copy clipboard text') },
+      'react-native': { View: 'View', AccessibilityInfo: { announceForAccessibility: () => assert.fail('Saving webhook settings must not announce clipboard feedback') } },
     }, {}, platform === 'mobile' ? 'Triage' : '')
     const render = () => app.render(name)
     const field = () => {
