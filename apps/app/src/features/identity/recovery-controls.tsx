@@ -2,6 +2,7 @@ import { ActionCard,BusyIcon,claimFocus,Details,FilePicker,InlineError,Panel,Pas
 import { deviceIcon } from '@/features/devices/devices'
 import { defaultBrowserName } from '@/lib/device-name'
 import { cn } from '@/lib/utils'
+import { encodeQrCode } from '@/lib/qr-code'
 import { Link,useNavigate } from '@tanstack/react-router'
 import { useDevice,useRecoveryCode } from '@vibeface/client/identity/context.tsx'
 import { passwordCopy,recoveryChanges,recoveryCopy,securityCopy,whenText } from '@vibeface/client/identity/copy.ts'
@@ -12,8 +13,8 @@ import { Button } from '@vibeface/uiarc/button/button.tsx'
 import { Checkbox } from "@vibeface/uiarc/checkbox/checkbox.tsx"
 import { Input } from '@vibeface/uiarc/input/input.tsx'
 import { Switch } from "@vibeface/uiarc/switch/switch.tsx"
+import { Textarea } from '@vibeface/uiarc/textarea/textarea.tsx'
 import { ArchiveRestore,BellRing,CalendarClock,ChevronRight,CircleCheck,CircleMinus,CirclePlus,Copy,Download,FileKey,FileWarning,Hand,Hourglass,KeyRound,Laptop,LifeBuoy,ScanLine,Shield,ShieldAlert,ShieldCheck,ShieldX,Smartphone,WifiOff,type LucideIcon } from 'lucide-react'
-import qrcode from 'qrcode-generator'
 import { useEffect,useMemo,useRef,useState,type ReactNode } from 'react'
 
 /** Where the reminder to change the recovery password leads: settings with that form open. */
@@ -74,10 +75,7 @@ export function PhoneRecovery() {
   const device = useDevice()
   const entry = recoveryEntry(device.entrances, device.ready?.entry ?? null)
   const link = entry ? recoveryLink(entry) : null
-  const image = useMemo(() => {
-    if (!link) return null
-    try { const code = qrcode(0, 'M'); code.addData(link); code.make(); return code.createDataURL(4, 16) } catch { return null }
-  }, [link])
+  const qr = useMemo(() => encodeQrCode(link ?? ''), [link])
   const [copied, setCopied] = useState(false)
   useEffect(() => {
     if (!copied) return
@@ -86,8 +84,13 @@ export function PhoneRecovery() {
   }, [copied])
   return <SettingsDisclosure icon={Smartphone} label={recoveryCopy.byPhone}>
     {link ? <>
-      {image ? <img src={image} alt={recoveryCopy.qr} className="size-48 rounded-control bg-white p-2  " /> : null}
-      <p className="flex items-center gap-2 text-sm text-secondary"><ScanLine aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.scanHint}</p>
+      {qr.kind === 'encoded' ? <>
+        <img src={qr.image} alt={recoveryCopy.qr} className="size-48 rounded-control bg-white p-2  " />
+        <p className="flex items-center gap-2 text-sm text-secondary"><ScanLine aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.scanHint}</p>
+      </> : <>
+        <InlineError error="无法生成二维码，请复制链接。" />
+        <Textarea label="链接原文" readOnly className="font-mono" value={link} onFocus={(event) => event.target.select()} />
+      </>}
       <Button type="button" variant="secondary" size="sm" className="w-fit" onClick={() => { void navigator.clipboard.writeText(link).then(() => setCopied(true), () => {}) }}>
         {copied ? <CircleCheck aria-hidden="true" className="text-success" /> : <Copy aria-hidden="true" />}{copied ? '已复制' : '复制链接'}
       </Button>

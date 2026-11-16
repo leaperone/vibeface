@@ -1,6 +1,7 @@
 import { BusyIcon,Details,InlineError,PageActions,Segmented } from "@/components/arc/product-kit"
 import { RoutedAction } from "@/components/arc/routed-action"
 import { terms } from "@/lib/glossary"
+import { encodeQrCode,type QrCodeResult } from "@/lib/qr-code"
 import type { Invitation } from "@vibeface/client/identity/context.tsx"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { addDeviceCopy,deviceCopy,joinCopy } from "@vibeface/client/identity/copy.ts"
@@ -9,17 +10,13 @@ import { Button } from "@vibeface/uiarc/button/button.tsx"
 import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
 import { Textarea } from "@vibeface/uiarc/textarea/textarea.tsx"
 import { CircleAlert,CircleCheck,Clock,Copy,Download,Laptop,Link2,Plus,Smartphone,SquareTerminal } from "lucide-react"
-import qrcode from "qrcode-generator"
 import { useEffect,useRef,useState } from "react"
 import { JoinRequests,useOpenJoins,type Added } from "./join"
 
-/** `image`: the QR code of the link, which the Vibeface app scans. */
-type Share = Invitation & { image: string | null }
+type Share = Invitation & { qr: QrCodeResult }
 
 function share(invitation: Invitation): Share {
-  let image: string | null = null
-  try { const code = qrcode(0, "M"); code.addData(invitation.link); code.make(); image = code.createDataURL(4, 16) } catch {}
-  return { ...invitation, image }
+  return { ...invitation, qr: encodeQrCode(invitation.link) }
 }
 
 const kinds = [{ value: "phone", label: addDeviceCopy.client, icon: Smartphone }, { value: "computer", label: addDeviceCopy.node, icon: Laptop }] as const
@@ -134,8 +131,10 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
             <Segmented label="新设备是" labels fill value={kind} options={[...kinds]} onChange={(next) => { setKind(next); setCopied(null); setCopyFailed(false); setError(""); setShown("link") }} />
             {kind === "phone" ? <>
               <p className="text-sm text-secondary">{addDeviceCopy.clientHint}</p>
-              {result.image ? <img className="size-56 justify-self-center rounded-control bg-white p-2" src={result.image} alt="用手机 App 扫码" /> : null}
-              <p className="flex items-center justify-center gap-1.5 text-sm text-secondary"><Smartphone aria-hidden="true" className="size-4 shrink-0" />用手机 App 扫码</p>
+              {result.qr.kind === "encoded" ? <>
+                <img className="size-56 justify-self-center rounded-control bg-white p-2" src={result.qr.image} alt="用手机 App 扫码" />
+                <p className="flex items-center justify-center gap-1.5 text-sm text-secondary"><Smartphone aria-hidden="true" className="size-4 shrink-0" />用手机 App 扫码</p>
+              </> : <InlineError error="无法生成二维码，请复制链接。" />}
               {copyButton("link", result.link, "复制链接", true)}
             </> : <>
               <ol className="grid gap-3">
@@ -156,7 +155,7 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
               <li className="flex items-center gap-1.5"><Clock aria-hidden="true" className="size-4 shrink-0" />只发给自己的设备，10 分钟内有效</li>
             </ul>
             {copyFailed ? <p role="alert" className="flex items-center gap-2 text-sm text-danger"><CircleAlert aria-hidden="true" className="size-4 shrink-0" />{addDeviceCopy.copyFailed}</p> : null}
-            <Details key={copyFailed ? "open" : "folded"} label="链接原文" open={copyFailed || undefined}>
+            <Details key={copyFailed || result.qr.kind !== "encoded" ? "open" : "folded"} label="链接原文" open={copyFailed || result.qr.kind !== "encoded" || undefined}>
               <Textarea label="链接原文" ref={raw} readOnly aria-label="链接原文" className="font-mono" value={shown === "command" ? addDeviceCopy.command(result.link) : result.link} onFocus={(event) => event.target.select()} />
             </Details>
           </div> : null}
