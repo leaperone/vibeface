@@ -374,7 +374,7 @@ impl Runtime {
             tool_token: None,
             provider_env,
             process_started: None,
-            codex_turn: None,
+            turn_binding: None,
         })
     }
 

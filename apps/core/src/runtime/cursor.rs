@@ -989,7 +989,7 @@ mod tests {
             tool_token: None,
             provider_env: variables,
             process_started: None,
-            codex_turn: Some(crate::manager::CodexTurn {
+            turn_binding: Some(crate::manager::TurnBinding {
                 client_id: "bot-attempt".into(),
                 record: Arc::new(move |agent, run| {
                     recorded
@@ -1122,7 +1122,7 @@ mod tests {
         config::private_dir(&blocked)?;
         let mut blocked_config = config.clone();
         blocked_config
-            .codex_turn
+            .turn_binding
             .as_mut()
             .context("turn recorder")?
             .client_id = "blocked-attempt".into();
@@ -1424,7 +1424,7 @@ mod tests {
                     })
                 })
             });
-            running_config.codex_turn = Some(observer);
+            running_config.turn_binding = Some(observer);
             let saved = persisted.clone();
             let persist_node = node.clone();
             let persist_trigger = job.trigger.clone();
@@ -1560,7 +1560,7 @@ mod tests {
             let (job, shown) = claim(&node, &admin, &network, "completed", &configuration).await?;
             let attempt = job.state.attempt().unwrap().id.clone();
             let mut completed_config = config;
-            completed_config.codex_turn = Some(crate::scheduler::turn_recorder(
+            completed_config.turn_binding = Some(crate::scheduler::turn_recorder(
                 &node,
                 &network,
                 &job,

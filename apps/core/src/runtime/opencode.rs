@@ -1107,7 +1107,7 @@ impl Opencode {
                     .map_err(|f| failed(previous, f))?;
                 // A session opencode no longer has is replaced by a new one, which needs it all.
                 let fresh = previous
-                    .and(config.codex_turn.as_ref())
+                    .and(config.turn_binding.as_ref())
                     .and_then(|turn| turn.fresh_prompt.as_deref());
                 (id, fresh.unwrap_or(prompt))
             }
@@ -1122,7 +1122,7 @@ impl Opencode {
                 failed(native, own(&format!("persist the opencode session: {e}")))
             });
         }
-        let message = match &config.codex_turn {
+        let message = match &config.turn_binding {
             Some(turn) => {
                 (turn.record)(session.clone(), None)
                     .await
@@ -1199,7 +1199,7 @@ impl Opencode {
         *start.lock().unwrap() = manager::StartEvidence::Started;
         self.touch(&session);
         stage.enter(ProviderStage::Record);
-        if let Some(turn) = &config.codex_turn
+        if let Some(turn) = &config.turn_binding
             && let Err(e) = (turn.record)(session.clone(), Some(message.clone())).await
         {
             let kind = if self.stop_run(&conn, &session, &message).await {
@@ -1317,7 +1317,7 @@ impl Opencode {
                     };
                 if native_started {
                     if let Some(started) = config
-                        .codex_turn
+                        .turn_binding
                         .as_ref()
                         .and_then(|turn| turn.started.as_ref())
                         && let Err(error) = started(message.clone()).await
@@ -2127,7 +2127,7 @@ impl Executor for Opencode {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::manager::{CodexTurn, Sdk, run_manager};
+    use crate::manager::{Sdk, TurnBinding, run_manager};
     use crate::runtime::test_support::{join_network, open_node, provider_work};
     use axum::extract::{Path as UrlPath, Query, Request, State};
     use axum::http::{StatusCode, header};
@@ -2684,7 +2684,7 @@ mod tests {
             tool_token: Some("tool-token-fixture".into()),
             provider_env: launch.env,
             process_started: None,
-            codex_turn: Some(CodexTurn {
+            turn_binding: Some(TurnBinding {
                 client_id: client.into(),
                 started: None,
                 record: Arc::new(move |session, turn| {
@@ -3035,7 +3035,7 @@ mod tests {
         let recorded_starts = native_starts.clone();
         let start_ready = Arc::new(tokio::sync::Notify::new());
         let marked = start_ready.clone();
-        config.codex_turn.as_mut().unwrap().started = Some(Arc::new(move |turn| {
+        config.turn_binding.as_mut().unwrap().started = Some(Arc::new(move |turn| {
             recorded_starts.lock().unwrap().push(turn);
             marked.notify_one();
             Box::pin(async { Ok(()) })
@@ -3470,7 +3470,7 @@ mod tests {
         let mut config = bot(&place, &server, "queued-attempt", &turns);
         let native_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let marked = native_started.clone();
-        config.codex_turn.as_mut().unwrap().started = Some(Arc::new(move |_| {
+        config.turn_binding.as_mut().unwrap().started = Some(Arc::new(move |_| {
             marked.store(true, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         }));

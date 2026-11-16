@@ -6,7 +6,7 @@ use super::claude::{Guide, Processes};
 use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
 use super::provider_adapter::bounded;
 use super::*;
-use crate::manager::{CodexTurn, ManagerConfig, ManagerError, ManagerFailure};
+use crate::manager::{ManagerConfig, ManagerError, ManagerFailure, TurnBinding};
 use crate::scheduling::{SteerOutcome, SteerTarget};
 use crate::work::{Probe, Signal, WorkRecord, WorkSpec};
 use base64::Engine as _;
@@ -1161,11 +1161,11 @@ impl Pi {
             (Some(_), Some(id)) => id.to_owned(),
             _ => uuid::Uuid::new_v4().to_string(),
         };
-        let prompt = match (&resumed, previous, &config.codex_turn) {
+        let prompt = match (&resumed, previous, &config.turn_binding) {
             (
                 None,
                 Some(_),
-                Some(CodexTurn {
+                Some(TurnBinding {
                     fresh_prompt: Some(fresh),
                     ..
                 }),
@@ -1223,7 +1223,7 @@ impl Pi {
                 })?;
         let native = Some(session.as_str());
         stage.enter(ProviderStage::Record);
-        if let Some(turn) = &config.codex_turn
+        if let Some(turn) = &config.turn_binding
             && let Err(e) = self.record_reply(&session, &turn.client_id, prompt)
         {
             process.end().await;
@@ -1256,7 +1256,7 @@ impl Pi {
                 )
             });
         }
-        if let Some(turn) = &config.codex_turn
+        if let Some(turn) = &config.turn_binding
             && let Err(e) = (turn.record)(session.clone(), None).await
         {
             process.end().await;
@@ -1314,7 +1314,7 @@ impl Pi {
             turn: turn.clone(),
         };
         stage.enter(ProviderStage::Record);
-        let recorded = match &config.codex_turn {
+        let recorded = match &config.turn_binding {
             Some(record) => {
                 async {
                     (record.record)(session.clone(), Some(turn.clone())).await?;
@@ -2234,7 +2234,7 @@ mod transport_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::manager::{CodexTurn, Sdk, run_manager};
+    use crate::manager::{Sdk, TurnBinding, run_manager};
     use crate::runtime::test_support::{
         assert_work_outcome, join_network, open_node, provider_work,
     };
@@ -2292,9 +2292,9 @@ mod tests {
     }
 
     fn bot(dir: &Path, pi: &Arc<Pi>, mode: &str, turns: Option<&Turns>) -> ManagerConfig {
-        let codex_turn = turns.map(|turns| {
+        let turn_binding = turns.map(|turns| {
             let turns = turns.clone();
-            CodexTurn {
+            TurnBinding {
                 client_id: "client".into(),
                 started: None,
                 record: Arc::new(move |session, turn| {
@@ -2320,7 +2320,7 @@ mod tests {
             tool_token: Some("tool-token-fixture".into()),
             provider_env: env(dir, mode),
             process_started: None,
-            codex_turn,
+            turn_binding,
         }
     }
 
@@ -2333,7 +2333,7 @@ mod tests {
     ) -> ManagerConfig {
         let mut config = bot(dir, pi, mode, Some(turns));
         config.provider_env = gated_env(dir, mode);
-        config.codex_turn.as_mut().unwrap().client_id = client.into();
+        config.turn_binding.as_mut().unwrap().client_id = client.into();
         config
     }
 
@@ -2773,7 +2773,7 @@ mod tests {
         let recorded_starts = native_starts.clone();
         let start_ready = Arc::new(tokio::sync::Notify::new());
         let marked = start_ready.clone();
-        config.codex_turn.as_mut().unwrap().started = Some(Arc::new(move |turn| {
+        config.turn_binding.as_mut().unwrap().started = Some(Arc::new(move |turn| {
             recorded_starts.lock().unwrap().push(turn);
             marked.notify_one();
             Box::pin(async { Ok(()) })
@@ -2918,7 +2918,7 @@ mod tests {
         for index in 0..2 {
             let recorded = Turns::default();
             let mut config = bot(&dir, &pi, "wait", Some(&recorded));
-            config.codex_turn.as_mut().unwrap().client_id = format!("client-{index}");
+            config.turn_binding.as_mut().unwrap().client_id = format!("client-{index}");
             let (stop, cancel) = watch::channel(false);
             stops.push(stop);
             turns.push(recorded);

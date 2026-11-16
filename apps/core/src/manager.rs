@@ -156,22 +156,22 @@ impl Sdk {
     }
 }
 
-/// Records a turn's `(thread, turn)` on the App Server; the turn is `None` before `turn/start`.
+/// Records the provider's native session and its turn ID once the turn is known.
 pub type TurnRecorder = Arc<
     dyn Fn(String, Option<String>) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>
         + Send
         + Sync,
 >;
 
-/// How the Node finds a Codex turn again: its user message carries `client_id`, and `record`
-/// keeps where it runs before anything can run in it.
+/// Binds delivery and start recording to a provider's native turn. `client_id` identifies
+/// the attempt, and `record` persists its native session and turn IDs.
 #[derive(Clone)]
-pub struct CodexTurn {
+pub struct TurnBinding {
     pub client_id: String,
     pub record: TurnRecorder,
     pub started: Option<agent::RunStarted>,
-    /// The prompt for a new thread, sent instead when the resumed thread is gone: the turn's
-    /// own prompt then leaves out what only the old thread had seen.
+    /// The prompt for a new session, sent when the previous session is gone: the turn's
+    /// own prompt leaves out context that only the previous session had seen.
     pub fresh_prompt: Option<String>,
 }
 
@@ -192,7 +192,7 @@ pub struct ManagerConfig {
     /// The variables this Node set for the provider of `sdk`, over its own environment.
     pub provider_env: BTreeMap<String, String>,
     pub process_started: Option<agent::ProcessStarted>,
-    pub codex_turn: Option<CodexTurn>,
+    pub turn_binding: Option<TurnBinding>,
 }
 
 impl ManagerConfig {
@@ -391,9 +391,9 @@ where
                 )
             })?;
             let native_agent = Arc::new(std::sync::Mutex::new(None::<String>));
-            let record = config.codex_turn.as_ref().map(|turn| turn.record.clone());
+            let record = config.turn_binding.as_ref().map(|turn| turn.record.clone());
             let started = config
-                .codex_turn
+                .turn_binding
                 .as_ref()
                 .and_then(|turn| turn.started.clone());
             let record_for_start = record.clone();
@@ -428,7 +428,7 @@ where
                 });
             let turn = CursorTurn {
                 owner: owner.into(),
-                client_id: config.codex_turn.as_ref().map_or_else(
+                client_id: config.turn_binding.as_ref().map_or_else(
                     || uuid::Uuid::new_v4().to_string(),
                     |turn| turn.client_id.clone(),
                 ),
@@ -456,7 +456,7 @@ where
                         let record = record.clone();
                         async move {
                             persist_session(id.clone()).await?;
-                            if let Some(native) = &config.codex_turn {
+                            if let Some(native) = &config.turn_binding {
                                 crate::runtime::record_cursor_reply(
                                     &locator_turn,
                                     &config.provider_env,
@@ -487,7 +487,7 @@ where
             Ok(result)
         }
         Sdk::Codex { socket, launch } => {
-            if let (Some(lease), Some(turn)) = (launch, &config.codex_turn) {
+            if let (Some(lease), Some(turn)) = (launch, &config.turn_binding) {
                 lease
                     .lock()
                     .expect("Codex lease")
@@ -792,11 +792,11 @@ where
         }
         None => None,
     };
-    let prompt = match (&resumed, previous, &config.codex_turn) {
+    let prompt = match (&resumed, previous, &config.turn_binding) {
         (
             None,
             Some(_),
-            Some(CodexTurn {
+            Some(TurnBinding {
                 fresh_prompt: Some(fresh),
                 ..
             }),
@@ -829,7 +829,7 @@ where
             failed(native, own(format!("persist the Codex thread: {e}")))
         });
     }
-    let client_id = match &config.codex_turn {
+    let client_id = match &config.turn_binding {
         Some(turn) => {
             (turn.record)(thread.clone(), None)
                 .await
@@ -872,7 +872,7 @@ where
     .map_err(|e| error(ManagerFailure::Unknown, native, own(e.to_string())))?;
     *start.lock().unwrap() = StartEvidence::Started;
     stage.enter(ProviderStage::Record);
-    if let Some(record) = &config.codex_turn {
+    if let Some(record) = &config.turn_binding {
         let recorded: Result<()> = async {
             (record.record)(thread.clone(), Some(turn.clone())).await?;
             if let Some(started) = &record.started {
@@ -1264,7 +1264,7 @@ mod tests {
             tool_token: None,
             provider_env: BTreeMap::new(),
             process_started: None,
-            codex_turn: None,
+            turn_binding: None,
         }
     }
 
@@ -1816,7 +1816,7 @@ mod tests {
             tool_cli: Some("/opt/vibeface".into()),
             instructions: "fixed-thread-guide".into(),
             tool_token: Some("turn-token-secret".into()),
-            codex_turn: Some(CodexTurn {
+            turn_binding: Some(TurnBinding {
                 client_id: "attempt-1".into(),
                 started: Some(Arc::new(move |turn| {
                     assert_eq!(
@@ -1966,7 +1966,7 @@ mod tests {
     async fn a_new_thread_in_place_of_a_lost_one_gets_the_full_prompt() {
         let fake = fake_app_server(Turn::Answers).await;
         let config = ManagerConfig {
-            codex_turn: Some(CodexTurn {
+            turn_binding: Some(TurnBinding {
                 client_id: "attempt-1".into(),
                 started: None,
                 record: Arc::new(|_, _| Box::pin(async { Ok(()) })),
@@ -2022,7 +2022,7 @@ mod tests {
     fn concurrent_codex(fake: &ConcurrentFake, client: &str) -> ManagerConfig {
         let mut config = codex(workspace(&fake.directory), fake.socket.clone());
         config.timeout_secs = 30;
-        config.codex_turn = Some(CodexTurn {
+        config.turn_binding = Some(TurnBinding {
             client_id: client.into(),
             started: None,
             record: Arc::new(|_, _| Box::pin(async { Ok(()) })),
