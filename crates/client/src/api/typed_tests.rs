@@ -1,5 +1,5 @@
 use super::*;
-use crate::connection::tests::{receive, send, server};
+use crate::test_support::{receive, send, server};
 use vibeface_secure::{
     Identity,
     membership::{Genesis, Member, NetworkState},
@@ -188,7 +188,7 @@ async fn fixture_with_unanswered(
     });
     let node = Identity::from_secret_hex(&node.secret_hex())?;
     let task = tokio::spawn(async move {
-        let (mut socket, mut channel) = server(listener, &node).await?;
+        let (mut socket, mut channel) = server(&listener, &node).await?;
         let mut pushed = pushes_on_write.map(|sender| sender.subscribe());
         loop {
             let request = if let Some(pushes) = pushed.as_mut() {

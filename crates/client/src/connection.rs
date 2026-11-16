@@ -518,51 +518,10 @@ pub(crate) fn client_url(origin: &str) -> Result<String> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
-    type ServerSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
-    pub(crate) async fn server(
-        listener: tokio::net::TcpListener,
-        identity: &Identity,
-    ) -> Result<(ServerSocket, Channel)> {
-        let (tcp, _) = listener.accept().await?;
-        let mut socket = tokio_tungstenite::accept_async(tcp).await?;
-        let connect = socket.next().await.context("connect frame")??;
-        ensure!(matches!(connect, Message::Text(_)), "connect frame missing");
-        let mut handshake = Handshake::signed(false, identity, None, PROLOGUE)?;
-        let Message::Binary(first) = socket.next().await.context("first handshake")?? else {
-            bail!("expected Noise")
-        };
-        handshake.read(&first)?;
-        socket
-            .send(Message::Binary(handshake.write(&[])?.into()))
-            .await?;
-        let Message::Binary(last) = socket.next().await.context("last handshake")?? else {
-            bail!("expected Noise")
-        };
-        handshake.read(&last)?;
-        Ok((socket, handshake.finish()?))
-    }
-    pub(crate) async fn receive(socket: &mut ServerSocket, channel: &mut Channel) -> Result<Value> {
-        loop {
-            let Message::Binary(bytes) = socket.next().await.context("frame")?? else {
-                continue;
-            };
-            if let Some(bytes) = channel.open_record(&bytes)? {
-                return Ok(serde_json::from_slice(&bytes)?);
-            }
-        }
-    }
-    pub(crate) async fn send(
-        socket: &mut ServerSocket,
-        channel: &mut Channel,
-        value: Value,
-    ) -> Result<()> {
-        for bytes in channel.seal_message(&serde_json::to_vec(&value)?)? {
-            socket.send(Message::Binary(bytes.into())).await?;
-        }
-        Ok(())
-    }
+    use crate::test_support::{receive, send, server};
+
     #[tokio::test]
     async fn noise_multiplexes_out_of_order_responses_and_keeps_pushes() -> Result<()> {
         let node = Identity::generate()?;
@@ -571,7 +530,7 @@ pub(crate) mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let origin = format!("http://{}", listener.local_addr()?);
         let node_task = tokio::spawn(async move {
-            let (mut socket, mut channel) = server(listener, &node).await?;
+            let (mut socket, mut channel) = server(&listener, &node).await?;
             let one = receive(&mut socket, &mut channel).await?;
             let two = receive(&mut socket, &mut channel).await?;
             send(
@@ -619,7 +578,7 @@ pub(crate) mod tests {
         let (seen_tx, seen_rx) = oneshot::channel();
         let (continue_tx, continue_rx) = oneshot::channel();
         let server_task = tokio::spawn(async move {
-            let (mut socket, mut channel) = server(listener, &node).await?;
+            let (mut socket, mut channel) = server(&listener, &node).await?;
             let first = receive(&mut socket, &mut channel).await?;
             let _ = seen_tx.send(());
             continue_rx.await?;
@@ -658,7 +617,7 @@ pub(crate) mod tests {
         let wrong = Identity::generate()?.device_id();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let origin = format!("http://{}", listener.local_addr()?);
-        let server_task = tokio::spawn(async move { server(listener, &node).await });
+        let server_task = tokio::spawn(async move { server(&listener, &node).await });
         assert!(Connection::open(&origin, &client, &wrong).await.is_err());
         server_task.abort();
         Ok(())
@@ -667,8 +626,8 @@ pub(crate) mod tests {
 
 #[cfg(test)]
 mod admission_tests {
-    use super::tests::{receive, send, server};
     use super::*;
+    use crate::test_support::{receive, send, server};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
@@ -732,7 +691,7 @@ mod admission_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let origin = format!("http://{}", listener.local_addr()?);
         let task = tokio::spawn(async move {
-            let (mut socket, mut channel) = server(listener, &node).await?;
+            let (mut socket, mut channel) = server(&listener, &node).await?;
             let request = receive(&mut socket, &mut channel).await?;
             assert_eq!(request["method"], "read-after-blocked-write");
             send(
@@ -769,8 +728,8 @@ mod admission_tests {
 
 #[cfg(test)]
 mod preferred_tests {
-    use super::tests::{receive, send, server};
     use super::*;
+    use crate::test_support::{receive, send, server};
     #[tokio::test]
     async fn preferred_route_attempts_numeric_direct_transport_then_pins_the_same_gateway_node()
     -> Result<()> {
@@ -792,7 +751,7 @@ mod preferred_tests {
             node_id: node_id.clone(),
         };
         let task = tokio::spawn(async move {
-            let (mut socket, mut channel) = server(listener, &node).await?;
+            let (mut socket, mut channel) = server(&listener, &node).await?;
             let connected_at = tokio::time::Instant::now();
             let request = receive(&mut socket, &mut channel).await?;
             assert_eq!(request["method"], "read");

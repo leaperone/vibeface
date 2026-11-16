@@ -2780,7 +2780,7 @@ fn valid_hash(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connection::tests::{receive, send, server};
+    use crate::test_support::{receive, send, server};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use vibeface_secure::{
         Identity,
@@ -2831,7 +2831,7 @@ mod tests {
             let fixture_input = input.clone();
             let fixture_client_id = fixture_client_id.clone();
             let task = tokio::spawn(async move {
-                let (mut socket, mut channel) = server(listener, &fixture_node).await?;
+                let (mut socket, mut channel) = server(&listener, &fixture_node).await?;
                 loop {
                     let request = receive(&mut socket, &mut channel).await?;
                     let result = match request["method"].as_str() {
@@ -3504,7 +3504,7 @@ fn write_gate_value(value: &Value) -> Result<u8> {
 #[cfg(test)]
 mod offline_tests {
     use super::*;
-    use crate::connection::tests::{receive, send, server};
+    use crate::test_support::{receive, send, server};
     use vibeface_secure::{
         Identity,
         membership::{Genesis, Member, NetworkState},
@@ -3694,7 +3694,7 @@ mod offline_tests {
             node_id: node.device_id(),
         };
         let task = tokio::spawn(async move {
-            let (mut socket, mut channel) = server(listener, &node).await?;
+            let (mut socket, mut channel) = server(&listener, &node).await?;
             loop {
                 let request = match receive(&mut socket, &mut channel).await {
                     Ok(value) => value,
@@ -4375,7 +4375,7 @@ fn terminal_reply(state: &Value) -> bool {
 #[cfg(test)]
 mod prepaid_tests {
     use super::*;
-    use crate::connection::tests::{receive, send, server};
+    use crate::test_support::{receive, send, server};
     use vibeface_secure::{
         Identity,
         membership::{Genesis, Member, NetworkState},
@@ -4440,7 +4440,7 @@ mod prepaid_tests {
             node_id: node.device_id(),
         };
         let task = tokio::spawn(async move {
-            let (mut socket, mut channel) = server(listener, &node).await?;
+            let (mut socket, mut channel) = server(&listener, &node).await?;
             loop {
                 let request = match receive(&mut socket, &mut channel).await {
                     Ok(request) => request,
