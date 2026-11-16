@@ -8625,6 +8625,25 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn events_dedupe_and_questions_go_once_to_the_owner_and_signed_webhooks() -> Result<()> {
+        async fn deliver_until(
+            node: &Runtime,
+            received: &std::sync::Mutex<Vec<(axum::http::HeaderMap, String)>>,
+            expected: usize,
+        ) -> Result<()> {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    node.deliver_webhooks().await?;
+                    let count = received.lock().unwrap().len();
+                    if count >= expected {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .context("queued webhook did not reach the fixture receiver")?
+        }
+
         let (node, admin, dir) = node().await?;
         let received = Arc::new(std::sync::Mutex::new(
             Vec::<(axum::http::HeaderMap, String)>::new(),
@@ -8694,12 +8713,14 @@ pub(super) mod tests {
             assert_eq!((asked[0]["severity"].clone(), asked[0]["text"].clone(), asked[0]["conversation_id"].clone()),
                 (json!("urgent"), json!("测试失败，要修吗？"), json!("c")));
 
+            deliver_until(&node, &received, 1).await?;
             node.deliver_webhooks().await?;
-            node.deliver_webhooks().await?;
+            assert_eq!(received.lock().unwrap().len(), 1, "the question is delivered once before its answer");
             let question = raised["question_id"].as_str().unwrap();
             assert_eq!(answer(&node, question, "修").await?, "answered");
             node.send_answered().await?;
             node.send_answered().await?;
+            deliver_until(&node, &received, 2).await?;
             node.deliver_webhooks().await?;
             let received = received.lock().unwrap().clone();
             assert_eq!(received.len(), 2, "the question and its answer, once each");
@@ -8737,6 +8758,7 @@ pub(super) mod tests {
             }?;
             node.send_answered().await?;
             node.send_answered().await?;
+            deliver_until(&node, &log, 3).await?;
             node.deliver_webhooks().await?;
             let received = log.lock().unwrap().clone();
             assert_eq!(received.len(), 3, "the winning answer follows once");
@@ -8751,9 +8773,10 @@ pub(super) mod tests {
                     store.connection.execute("INSERT INTO triage_outbox(event_id,body,state,attempts,next_ms) VALUES(?,'history',?,0,0)",
                         params![format!("history-{index}"), if index % 2 == 0 { "delivered" } else { "dead" }])?;
                 }
+                let now = now_ms();
                 store.connection.execute("INSERT INTO triage_outbox(event_id,body,state,attempts,next_ms) VALUES('future','later','pending',0,?1),('due','now','pending',0,?2)",
-                    params![now_ms() + 60_000, now_ms()])?;
-                let due = outbox_from(&store.connection, now_ms())?;
+                    params![now + 60_000, now])?;
+                let due = outbox_from(&store.connection, now)?;
                 assert_eq!(due.len(), 1);
                 assert_eq!(due[0].event_id, "due");
                 assert_eq!(store.connection.query_row("SELECT count(*) FROM triage_outbox WHERE event_id LIKE 'history-%'", [], |row| row.get::<_, usize>(0))?, 128);
