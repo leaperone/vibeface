@@ -1,4 +1,5 @@
 use super::*;
+use vibeface_protocol::amount::Amount;
 
 impl Backend {
     pub(super) async fn save_delivery(&mut self, values: BTreeMap<String, String>) -> Result<()> {
@@ -7,6 +8,8 @@ impl Backend {
         let get = |key: &str| values.get(key).cloned().unwrap_or_default();
         {
             ensure!(self.state.can_manage, "仅管理设备可准备订单");
+            Amount::from_decimal_str(&get("max_service_amount")).context("服务费上限无效")?;
+            Amount::from_decimal_str(&get("max_gas_amount")).context("链费上限无效")?;
             let mode: vibeface_client::DeliveryMode = serde_json::from_value(json!(get("mode")))?;
             ensure!(
                 get("acceptance").is_empty() || get("acceptance") == "recoverable",

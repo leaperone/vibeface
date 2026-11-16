@@ -14,6 +14,7 @@ use std::sync::{
 };
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tokio::sync::{Semaphore, broadcast, watch};
+use vibeface_protocol::amount::Amount;
 
 // Serde's internally tagged unit decoder ignores map entries even with deny_unknown_fields.
 fn empty_operation<'de, D: serde::Deserializer<'de>>(
@@ -2996,6 +2997,9 @@ fn canonical_budget_batch(mut batch: DeliveryBudgetBatch) -> Result<DeliveryBudg
 }
 fn validate_new_delivery_prepare(prepare: &DeliveryPrepare) -> Result<()> {
     uuid::Uuid::parse_str(&prepare.intent_id)?;
+    Amount::from_decimal_str(&prepare.max_service_amount)
+        .context("invalid delivery service cap")?;
+    Amount::from_decimal_str(&prepare.max_gas_amount).context("invalid delivery gas cap")?;
     ensure!(
         matches!(&prepare.acceptance, DeliveryAcceptance::Recoverable),
         "new deliveries support recoverable acceptance only"
@@ -3077,7 +3081,7 @@ fn delivery_authorization(order: &Value) -> Result<Value> {
         "gas_cap",
     ] {
         let amount = delivery_text(payment, field)?;
-        ensure!(decimal_at_most(amount, amount), "invalid protected amount");
+        Amount::from_decimal_str(amount).with_context(|| format!("invalid protected {field}"))?;
     }
     ensure!(
         order["bytes"].as_u64().is_some(),
@@ -3448,28 +3452,12 @@ fn validate_delivery_prepare(request: &Value, order: &Value) -> Result<()> {
         let maximum = request[maximum]
             .as_str()
             .context("delivery maximum missing")?;
-        ensure!(
-            decimal_at_most(actual, maximum),
-            "delivery exceeds authorized budget"
-        );
+        let actual = Amount::from_decimal_str(actual).context("invalid delivery amount")?;
+        let maximum = Amount::from_decimal_str(maximum).context("invalid delivery maximum")?;
+        ensure!(actual <= maximum, "delivery exceeds authorized budget");
     }
     Ok(())
 }
-fn decimal_at_most(actual: &str, maximum: &str) -> bool {
-    if actual.is_empty()
-        || maximum.is_empty()
-        || !actual
-            .bytes()
-            .chain(maximum.bytes())
-            .all(|b| b.is_ascii_digit())
-    {
-        return false;
-    }
-    let actual = actual.trim_start_matches('0');
-    let maximum = maximum.trim_start_matches('0');
-    actual.len() < maximum.len() || actual.len() == maximum.len() && actual <= maximum
-}
-
 fn input_lane(conversation_id: &str, target: &InputTarget) -> Result<String> {
     let target = match target {
         InputTarget::Task { task_id } | InputTarget::ChannelTask { task_id, .. } => {
@@ -4643,6 +4631,130 @@ mod prepaid_tests {
         prepare.budget_id = Some("d".repeat(64));
         assert!(validate_new_delivery_prepare(&prepare).is_err());
         assert!(canonical_delivery_pair(["a".repeat(64), "a".repeat(64)], false).is_err());
+        Ok(())
+    }
+    fn prepare_request() -> DeliveryPrepare {
+        DeliveryPrepare {
+            intent_id: "00000000-0000-4000-8000-000000000001".into(),
+            receiver_peer: "b".repeat(64),
+            provider_peer: "c".repeat(64),
+            mode: DeliveryMode::Paid,
+            acceptance: DeliveryAcceptance::Recoverable,
+            name: "fixture-1.bin".into(),
+            content_base64: "AQ==".into(),
+            max_service_amount: "2".into(),
+            max_gas_amount: "3".into(),
+            budget_id: Some("d".repeat(64)),
+        }
+    }
+    #[test]
+    fn prepare_and_authorization_reject_noncanonical_amounts_on_either_side() -> Result<()> {
+        let request = serde_json::to_value(prepare_request())?;
+        let order = orders(&"a".repeat(64), false)[0].clone();
+        validate_delivery_prepare(&request, &order)?;
+        let authorization = delivery_authorization(&order)?;
+        assert_eq!(authorization["payment"]["total"], "2");
+        assert_eq!(
+            authorization["intent_id"],
+            "00000000-0000-4000-8000-000000000001"
+        );
+        let mut changed = order.clone();
+        changed["payment"]["total"] = json!("3");
+        assert!(validate_delivery_prepare(&request, &changed).is_err());
+        let mut larger_cap = request.clone();
+        larger_cap["max_service_amount"] = json!("10");
+        changed["payment"]["total"] = json!("9");
+        validate_delivery_prepare(&larger_cap, &changed)?;
+        for invalid in [
+            "00".to_owned(),
+            "01".into(),
+            "115792089237316195423570985008687907853269984665640564039457584007913129639936".into(),
+            "9".repeat(10_000),
+        ] {
+            for (actual, maximum) in [
+                ("total", "max_service_amount"),
+                ("gas_cap", "max_gas_amount"),
+            ] {
+                let mut changed = order.clone();
+                changed["payment"][actual] = json!(invalid);
+                assert!(validate_delivery_prepare(&request, &changed).is_err());
+                let mut changed = request.clone();
+                changed[maximum] = json!(invalid);
+                assert!(validate_delivery_prepare(&changed, &order).is_err());
+                let prepare: DeliveryPrepare = serde_json::from_value(changed)?;
+                assert!(validate_new_delivery_prepare(&prepare).is_err());
+            }
+            for field in [
+                "delivery_fee",
+                "reservation_fee",
+                "priority_fee",
+                "total",
+                "gas_cap",
+            ] {
+                let mut changed = order.clone();
+                changed["payment"][field] = json!(invalid);
+                assert!(delivery_authorization(&changed).is_err());
+            }
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn malformed_new_and_restored_caps_never_reach_write_admission() -> Result<()> {
+        let setup = setup_prepaid(false, false, false).await?;
+        for field in ["max_service_amount", "max_gas_amount"] {
+            let mut request = serde_json::to_value(prepare_request())?;
+            request[field] = json!("00");
+            let malformed: DeliveryPrepare = serde_json::from_value(request)?;
+            assert!(
+                setup
+                    .client
+                    .stage(Action::Delivery(DeliveryAction::Prepare(malformed)))
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(setup.client.pending().await?.is_empty());
+        let mut operation = setup
+            .client
+            .prepare(Action::Delivery(DeliveryAction::Prepare(prepare_request())))?;
+        let mut request: Value = serde_json::from_slice(&operation.bytes)?;
+        request["params"]["max_service_amount"] = json!("00");
+        operation.bytes = serde_json::to_vec(&request)?;
+        let original_bytes = operation.bytes.clone();
+        let id = operation.snapshot.id.clone();
+        let staged = setup
+            .client
+            .stored(move |db| db.prepare(&operation))
+            .await?;
+        assert_eq!(staged.state, OperationState::Prepared);
+        assert_eq!(staged.id, "prepare-00000000-0000-4000-8000-000000000001");
+        assert!(setup.client.send_staged(&id).await.is_err());
+        let lookup = id.clone();
+        let restored = setup.client.stored(move |db| db.get(&lookup)).await?;
+        assert_eq!(restored.snapshot.state, OperationState::Prepared);
+        assert_eq!(restored.bytes, original_bytes);
+        let lookup = id.clone();
+        setup.client.stored(move |db| db.begin(&lookup)).await?;
+        let unknown = setup.client.send_staged(&id).await?;
+        assert_eq!(unknown.state, OperationState::Unknown);
+        assert_eq!(unknown.id, "prepare-00000000-0000-4000-8000-000000000001");
+        let lookup = id.clone();
+        assert_eq!(
+            setup
+                .client
+                .stored(move |db| Ok(db.get(&lookup)?.bytes))
+                .await?,
+            original_bytes
+        );
+        {
+            let evidence = setup.evidence.lock().unwrap();
+            assert_eq!(evidence.mutation_count, 0);
+            assert!(!evidence.reads.iter().any(|op| op == "prepare"));
+        }
+        setup.client.close();
+        setup.server.await??;
+        drop(setup.client);
+        std::fs::remove_dir_all(setup.dir)?;
         Ok(())
     }
     #[tokio::test]

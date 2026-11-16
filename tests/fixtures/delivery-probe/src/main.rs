@@ -290,8 +290,15 @@ fn mesh_checks() -> Result<Value> {
     );
     Ok(
         json!({"valid":true,"expiredRejected":true,"aheadRejected":true,"badSignatureRejected":true,
-        "oversizeRejected":true,"wrongNetworkRejected":true,
-        "productSourceSha256":hex::encode(Sha256::digest(include_bytes!(concat!(env!("VIBEFACE_PROBE_SOURCE_ROOT"), "/apps/core/src/net/mesh/record.rs"))))}),
+                "oversizeRejected":true,"wrongNetworkRejected":true,
+                "productSourcesSha256":{
+        "apps/core/src/net/mesh/record.rs":hex::encode(Sha256::digest(include_bytes!(concat!(env!("VIBEFACE_PROBE_SOURCE_ROOT"), "/apps/core/src/net/mesh/record.rs")))),
+        "crates/protocol/Cargo.toml":hex::encode(Sha256::digest(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../crates/protocol/Cargo.toml")))),
+        "crates/protocol/src/lib.rs":hex::encode(Sha256::digest(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../crates/protocol/src/lib.rs")))),
+        "crates/protocol/src/amount.rs":hex::encode(Sha256::digest(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../crates/protocol/src/amount.rs")))),
+        "crates/protocol/src/history.rs":hex::encode(Sha256::digest(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../crates/protocol/src/history.rs")))),
+        "crates/protocol/src/workspace.rs":hex::encode(Sha256::digest(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../crates/protocol/src/workspace.rs"))))
+        }}),
     )
 }
 #[tokio::main]

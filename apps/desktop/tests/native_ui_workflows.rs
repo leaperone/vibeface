@@ -1630,7 +1630,12 @@ mod prepaid_delivery {
         assert!(!transfer_confirmable(&order, 1));
         assert!(!transfer_acceptable(&order));
         assert_eq!(
-            transfer_sum(["340282366920938463463374607431768211455", "1"]).unwrap(),
+            vibeface_protocol::amount::Amount::checked_sum_decimal([
+                "340282366920938463463374607431768211455",
+                "1"
+            ])
+            .unwrap()
+            .as_str(),
             "340282366920938463463374607431768211456"
         );
     }

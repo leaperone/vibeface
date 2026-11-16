@@ -1,5 +1,6 @@
 use super::*;
 use std::path::Path;
+use vibeface_protocol::amount::Amount;
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct TransferTerms {
@@ -90,6 +91,8 @@ impl Backend {
     ) -> Result<String> {
         let client = self.client()?;
         let terms: TransferTerms = serde_json::from_value(terms)?;
+        Amount::from_decimal_str(&terms.service_cap).context("服务费上限无效")?;
+        Amount::from_decimal_str(&terms.gas_cap).context("链费上限无效")?;
         let target = self
             .active_entry
             .as_ref()
@@ -184,6 +187,8 @@ impl Backend {
         service_cap: &str,
         gas_cap: &str,
     ) -> Result<TransferBudget> {
+        let service_cap = Amount::from_decimal_str(service_cap).context("服务费上限无效")?;
+        Amount::from_decimal_str(gas_cap).context("链费上限无效")?;
         let status: Delivery = serde_json::from_value(
             self.client()?
                 .read(ReadRequest::Delivery(DeliveryRead::Status))
@@ -211,7 +216,7 @@ impl Backend {
                 && budget.provider_peer == provider
                 && budget.payer.eq_ignore_ascii_case(payer)
                 && budget.gas_cap == gas_cap
-                && transfer_amount_at_most(service_cap, &budget.free),
+                && service_cap <= Amount::from_decimal_str(&budget.free).context("预算金额无效")?,
             "预算角色、开放状态、可用金额或累计链费授权不一致"
         );
         let providers: Vec<TransferProvider> = decode_list(
@@ -281,9 +286,13 @@ impl Backend {
             order.payment.budget_id == terms.budget_id,
             "订单预算与原本机发送意图不同，未确认付款"
         );
+        let total = Amount::from_decimal_str(&order.payment.total).context("订单金额无效")?;
+        let gas_cap = Amount::from_decimal_str(&order.payment.gas_cap).context("订单金额无效")?;
+        let service_maximum =
+            Amount::from_decimal_str(&terms.service_cap).context("服务费上限无效")?;
+        let gas_maximum = Amount::from_decimal_str(&terms.gas_cap).context("链费上限无效")?;
         ensure!(
-            amount_at_most(&order.payment.total, &terms.service_cap)
-                && amount_at_most(&order.payment.gas_cap, &terms.gas_cap),
+            total <= service_maximum && gas_cap <= gas_maximum,
             "订单费用超过原最高金额，尚未确认付款"
         );
         Ok(())
@@ -319,6 +328,9 @@ pub(super) fn can_restart_transfer(order: &TransferOrder) -> bool {
                 matches!(window.state.as_str(), "held" | "key_published" | "earned")
             });
     }
+    let Ok(total) = Amount::from_decimal_str(&order.payment.total) else {
+        return false;
+    };
     order.phase == "paid"
         && matches!(
             order.payment.state.as_str(),
@@ -326,11 +338,11 @@ pub(super) fn can_restart_transfer(order: &TransferOrder) -> bool {
         )
         && !order.windows.is_empty()
         && order.windows.iter().all(|window| window.state == "earned")
-        && transfer_sum([
+        && Amount::checked_sum_decimal([
             order.payment.earned.as_str(),
             order.payment.refunded.as_str(),
         ])
-        .is_ok_and(|settled| settled == order.payment.total)
+        .is_ok_and(|settled| settled == total)
         || order.phase == "refunded"
             && order.payment.state == "refunded"
             && order.payment.refunded == order.payment.total
@@ -356,6 +368,10 @@ fn validate_restart_intent(
         "原发送不属于当前网络、身份或目标设备"
     );
     let terms = &intent.terms;
+    let total = Amount::from_decimal_str(&order.payment.total).context("订单金额无效")?;
+    let gas_cap = Amount::from_decimal_str(&order.payment.gas_cap).context("订单金额无效")?;
+    let service_maximum = Amount::from_decimal_str(&terms.service_cap).context("服务费上限无效")?;
+    let gas_maximum = Amount::from_decimal_str(&terms.gas_cap).context("链费上限无效")?;
     ensure!(
         terms.receiver == order.receiver_peer
             && terms.provider == order.provider_peer
@@ -365,27 +381,12 @@ fn validate_restart_intent(
             && order.bytes == terms.bytes
             && order.sha256.as_deref() == Some(terms.sha256.as_str())
             && terms.budget_id == order.payment.budget_id
-            && amount_at_most(&order.payment.total, &terms.service_cap)
-            && amount_at_most(&order.payment.gas_cap, &terms.gas_cap),
+            && total <= service_maximum
+            && gas_cap <= gas_maximum,
         "原文件、预算或最高金额与本机发送条款不一致"
     );
     Ok(())
 }
-fn amount_at_most(amount: &str, cap: &str) -> bool {
-    if amount.is_empty()
-        || cap.is_empty()
-        || !amount
-            .bytes()
-            .chain(cap.bytes())
-            .all(|b| b.is_ascii_digit())
-    {
-        return false;
-    }
-    let amount = amount.trim_start_matches('0');
-    let cap = cap.trim_start_matches('0');
-    amount.len() < cap.len() || amount.len() == cap.len() && amount <= cap
-}
-
 async fn remember_transfer_intent(
     path: PathBuf,
     network: String,
@@ -441,6 +442,8 @@ async fn remember_transfer_intent(
 }
 fn validate_order_budget(order: &TransferOrder, budget: &TransferBudget) -> Result<()> {
     validate_transfer_budget(budget)?;
+    let total = Amount::from_decimal_str(&order.payment.total).context("订单金额无效")?;
+    let free = Amount::from_decimal_str(&budget.free).context("预算金额无效")?;
     ensure!(
         budget.state == "open"
             && order.payment.budget_id.as_deref() == Some(budget.budget_id.as_str())
@@ -461,7 +464,7 @@ fn validate_order_budget(order: &TransferOrder, budget: &TransferBudget) -> Resu
                 .as_deref()
                 .is_some_and(|asset| asset.eq_ignore_ascii_case(&budget.asset))
             && order.payment.gas_cap == budget.gas_cap
-            && transfer_amount_at_most(&order.payment.total, &budget.free),
+            && total <= free,
         "原订单与当前预算角色、资产、可用金额或链费授权不一致"
     );
     Ok(())
@@ -521,13 +524,12 @@ impl Backend {
         validate_transfer_pair(&current, accept, vibeface_protocol::now_ms() / 1000)?;
         if !accept {
             let budget = self.check_order_budget(&current[0]).await?;
-            ensure!(
-                transfer_amount_at_most(
-                    &transfer_sum(current.iter().map(|order| order.payment.total.as_str()))?,
-                    &budget.free
-                ),
-                "两笔原订单合计超过当前预算可用金额"
-            );
+            let total = Amount::checked_sum_decimal(
+                current.iter().map(|order| order.payment.total.as_str()),
+            )
+            .context("订单金额不守恒")?;
+            let free = Amount::from_decimal_str(&budget.free).context("预算金额无效")?;
+            ensure!(total <= free, "两笔原订单合计超过当前预算可用金额");
         }
         Ok(current)
     }
@@ -708,6 +710,129 @@ mod prepaid_tests {
         Ok(())
     }
     #[test]
+    fn order_and_budget_boundaries_enforce_canonical_uint256_accounting() -> Result<()> {
+        let original = order();
+        validate_transfer_order(&original)?;
+        validate_transfer_budget(&budget())?;
+        for invalid in [
+            "00",
+            "01",
+            "115792089237316195423570985008687907853269984665640564039457584007913129639936",
+        ] {
+            for field in [
+                "delivery_fee",
+                "reservation_fee",
+                "priority_fee",
+                "total",
+                "gas_cap",
+                "earned",
+                "withdrawn",
+                "refunded",
+                "chain_id",
+            ] {
+                let mut wire = serde_json::to_value(&original)?;
+                wire["payment"][field] = json!(invalid);
+                let changed: TransferOrder = serde_json::from_value(wire)?;
+                assert!(validate_transfer_order(&changed).is_err(), "{field}");
+            }
+            for field in [
+                "deposit",
+                "free",
+                "locked",
+                "earned",
+                "withdrawn",
+                "refunded",
+                "gas_cap",
+            ] {
+                let mut wire = serde_json::to_value(budget())?;
+                wire[field] = json!(invalid);
+                let changed: TransferBudget = serde_json::from_value(wire)?;
+                assert!(validate_transfer_budget(&changed).is_err(), "{field}");
+            }
+        }
+        let mut large = original.clone();
+        large.payment.delivery_fee = "340282366920938463463374607431768211455".into();
+        large.payment.reservation_fee = "1".into();
+        large.payment.priority_fee = "0".into();
+        large.payment.total = "340282366920938463463374607431768211456".into();
+        validate_transfer_order(&large)?;
+        let mut large_budget = budget();
+        large_budget.deposit = "340282366920938463463374607431768211456".into();
+        large_budget.free = "340282366920938463463374607431768211455".into();
+        large_budget.locked = "1".into();
+        validate_transfer_budget(&large_budget)?;
+        large.payment.delivery_fee =
+            "115792089237316195423570985008687907853269984665640564039457584007913129639935".into();
+        large.payment.total = large.payment.delivery_fee.clone();
+        assert!(validate_transfer_order(&large).is_err());
+        large_budget.free = large.payment.delivery_fee.clone();
+        large_budget.deposit = large_budget.free.clone();
+        assert!(validate_transfer_budget(&large_budget).is_err());
+        let mut changed = original.clone();
+        changed.payment.earned = "9".into();
+        changed.payment.refunded = "2".into();
+        assert!(validate_transfer_order(&changed).is_err());
+        changed.payment.refunded = "0".into();
+        changed.payment.withdrawn = "10".into();
+        assert!(validate_transfer_order(&changed).is_err());
+        let mut changed = budget();
+        changed.withdrawn = "1".into();
+        assert!(validate_transfer_budget(&changed).is_err());
+        changed.withdrawn = "0".into();
+        changed.locked = "1".into();
+        assert!(validate_transfer_budget(&changed).is_err());
+        Ok(())
+    }
+    #[test]
+    fn settlement_publication_and_private_charity_views_keep_their_boundaries() -> Result<()> {
+        let mut paid = order();
+        paid.payment.settlement = Some(TransferSettlement {
+            earned: "9".into(),
+            withdrawn: "1".into(),
+            refunded: "0".into(),
+            publication: Some(TransferPublication {
+                state: TransferPublicationState::DisclosedOutstanding,
+                total_amount: "9".into(),
+                economic_cutoff: 1,
+                availability_risk: None,
+            }),
+        });
+        validate_transfer_order(&paid)?;
+        for field in ["earned", "withdrawn", "refunded"] {
+            let mut wire = serde_json::to_value(&paid)?;
+            wire["payment"]["settlement"][field] = json!("00");
+            assert!(validate_transfer_order(&serde_json::from_value(wire)?).is_err());
+        }
+        let mut wire = serde_json::to_value(&paid)?;
+        wire["payment"]["settlement"]["publication"]["total_amount"] = json!("00");
+        assert!(validate_transfer_order(&serde_json::from_value(wire)?).is_err());
+        let mut charity = order();
+        charity.mode = "charity".into();
+        charity.payment = Payment {
+            state: "free".into(),
+            delivery_fee: "0".into(),
+            reservation_fee: "0".into(),
+            priority_fee: "0".into(),
+            total: "0".into(),
+            gas_cap: "0".into(),
+            earned: "0".into(),
+            withdrawn: "0".into(),
+            refunded: "0".into(),
+            ..Payment::default()
+        };
+        validate_transfer_order(&charity)?;
+        charity.payment.total = "00".into();
+        assert!(validate_transfer_order(&charity).is_err());
+        charity.payment.total = "0".into();
+        charity.role = "provider".into();
+        assert!(validate_transfer_order(&charity).is_err());
+        charity.name = None;
+        assert!(validate_transfer_order(&charity).is_err());
+        charity.sha256 = None;
+        validate_transfer_order(&charity)?;
+        Ok(())
+    }
+    #[test]
     fn fresh_quote_budget_and_caps_cannot_drift_from_the_original_review() -> Result<()> {
         let original = order();
         let budget = budget();
@@ -761,6 +886,38 @@ mod restart_tests {
                 "provider_wallet":format!("0x{}","4".repeat(40)),"budget_id":"2".repeat(64),"state":"earned",
                 "delivery_fee":"5","reservation_fee":"2","priority_fee":"3","total":"10","gas_cap":"7",
                 "earned":"10","withdrawn":"0","refunded":"0","settlement":null}})).unwrap()
+    }
+    #[test]
+    fn restart_rejects_malformed_stored_caps_without_normalizing_them() -> Result<()> {
+        let id = "00000000-0000-4000-8000-000000000001";
+        let order = terminal(id);
+        let mut intent = TransferIntent {
+            intent_id: id.into(),
+            network_id: "network".into(),
+            client_id: "client".into(),
+            target_node: "a".repeat(64),
+            terms: terms(),
+        };
+        validate_restart_intent(&intent, &order, "network", "client", &"a".repeat(64))?;
+        for invalid in [
+            "0100",
+            "00",
+            "115792089237316195423570985008687907853269984665640564039457584007913129639936",
+        ] {
+            intent.terms = terms();
+            intent.terms.service_cap = invalid.into();
+            assert!(
+                validate_restart_intent(&intent, &order, "network", "client", &"a".repeat(64))
+                    .is_err()
+            );
+            intent.terms = terms();
+            intent.terms.gas_cap = invalid.into();
+            assert!(
+                validate_restart_intent(&intent, &order, "network", "client", &"a".repeat(64))
+                    .is_err()
+            );
+        }
+        Ok(())
     }
     #[tokio::test]
     async fn ordinary_prepare_reuses_intent_and_only_explicit_terminal_restart_replaces_it()

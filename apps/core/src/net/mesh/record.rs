@@ -1,8 +1,9 @@
 // A Node's signed public record on the mesh. The delivery probe includes this file and pins its
-// SHA-256, so it uses only anyhow, serde, serde_json, vibeface_secure and std.
+// SHA-256, so its dependencies must also be available to that fixture.
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv6Addr, SocketAddr};
+use vibeface_protocol::amount::Amount;
 
 pub const DOMAIN: &str = "mesh-v1";
 pub const MAX_PAYLOAD: usize = 1024;
@@ -91,7 +92,7 @@ pub struct Offer {
 impl Offer {
     pub fn check(&self) -> Result<()> {
         self.settlement.validate()?;
-        ensure!(uint256_decimal(&self.price), "invalid offer price");
+        Amount::from_decimal_str(&self.price).context("invalid offer price")?;
         Ok(())
     }
 }
@@ -127,16 +128,6 @@ fn wallet_address(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         && value[2..].bytes().any(|b| b != b'0')
-}
-
-/// A canonical decimal uint256: digits without a leading zero, at most `2^256 - 1`.
-fn uint256_decimal(value: &str) -> bool {
-    const MAX: &str =
-        "115792089237316195423570985008687907853269984665640564039457584007913129639935";
-    !value.is_empty()
-        && value.bytes().all(|b| b.is_ascii_digit())
-        && (value.len() == 1 || !value.starts_with('0'))
-        && (value.len() < MAX.len() || (value.len() == MAX.len() && value <= MAX))
 }
 
 impl SignedMeshRecord {
@@ -433,21 +424,24 @@ mod tests {
         }
         let max = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
         let over = "115792089237316195423570985008687907853269984665640564039457584007913129639936";
-        for price in [
-            "0",
-            "1",
-            "01",
-            "",
-            "-1",
-            "1.5",
-            max,
-            over,
-            &format!("1{max}"),
-        ] {
-            assert_eq!(
-                uint256_decimal(price),
-                vibeface_delivery::Amount::from_decimal_str(price).is_ok(),
-                "{price}"
+        for price in ["0", "1", max] {
+            assert!(
+                Offer {
+                    price: price.into(),
+                    ..offer.clone()
+                }
+                .check()
+                .is_ok()
+            );
+        }
+        for price in ["00", "01", "", "-1", "1.5", over, &"1".repeat(79)] {
+            assert!(
+                Offer {
+                    price: price.into(),
+                    ..offer.clone()
+                }
+                .check()
+                .is_err()
             );
         }
         for wallet in [

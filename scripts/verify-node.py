@@ -7129,8 +7129,10 @@ def delivery_probe(options, run, actor, targets, order_id, *, action=None):
     public = json.loads(result.stdout)
     require(public.get("passed") is True, "probe returned a positive bounded result")
     if action is None:
-        require(public["mesh"]["productSourceSha256"] == file_sha256(source / "apps/core/src/net/mesh/record.rs"),
-                "probe opens mesh records with the current product implementation")
+        mesh_sources = ["apps/core/src/net/mesh/record.rs", "crates/protocol/Cargo.toml",
+                        *sorted(path.relative_to(source).as_posix() for path in (source / "crates/protocol/src").rglob("*.rs"))]
+        require(public["mesh"]["productSourcesSha256"] == {path: file_sha256(source / path) for path in mesh_sources},
+                "probe opens mesh records with the current product implementation and protocol dependency")
     return public
 
 

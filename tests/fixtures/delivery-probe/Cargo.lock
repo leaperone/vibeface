@@ -3562,8 +3562,16 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "vibeface-protocol",
  "vibeface-secure",
  "zeroize",
+]
+
+[[package]]
+name = "vibeface-protocol"
+version = "0.0.1"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
