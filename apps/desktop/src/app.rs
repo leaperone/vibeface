@@ -1015,9 +1015,7 @@ impl Desktop {
         {
             for field in &form.fields {
                 if ["unlock_password", "password", "ticket", "token"].contains(&field.key) {
-                    field
-                        .state
-                        .update(cx, |state, cx| state.set_value("", window, cx));
+                    field.control.set_value("", window, cx);
                 }
             }
         }
@@ -1339,9 +1337,9 @@ impl Desktop {
             .as_ref()
             .and_then(|form| form.fields.iter().find(|field| field.key == key))
         {
-            field.state.update(cx, |state, cx| {
-                state.set_value(path.display().to_string(), window, cx)
-            });
+            field
+                .control
+                .set_value(path.display().to_string(), window, cx);
         }
         cx.notify();
     }
@@ -1363,9 +1361,7 @@ impl Desktop {
                             && let Some(form) = &this.form
                             && let Some(field) = form.fields.iter().find(|f| f.key == "file")
                         {
-                            field
-                                .state
-                                .update(cx, |state, cx| state.set_value(path, window, cx));
+                            field.control.set_value(path, window, cx);
                         }
                         cx.notify();
                     });
