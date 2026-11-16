@@ -16,13 +16,13 @@ VIBEFACE_E2E_APP_DIR=/absolute/path/to/apps/app/dist/client \
 pnpm test:e2e
 ```
 
-程序的构建步骤见[源码构建](releasing.md#源码构建)。本地默认把 Chromium 下载到 `tests/e2e/.artifacts/browsers/`。e2e 只在本地运行，CI 不执行。
+程序的构建步骤见[源码构建](releasing.md#源码构建)。本地默认把 Chromium 下载到 `tests/e2e/.artifacts/browsers/`。e2e 只在用户明确要求时于本地运行，CI 不执行这些界面用例。
 
 每项测试创建独立 Node 数据目录，使用随机本机端口，关闭 Codex 会话扫描。默认 fixture 关闭模型执行；`workspaceTest` 启用本次测试的受控 Codex 程序，不连接真实模型。测试结束后停止自己的进程，不连接已有 Node。测试控制口只监听 loopback，认证材料保存在 owner-only 文件。Node 数据和控制文件位于 `.artifacts/e2e/`，runner 日志、报告和下载文件位于 `tests/e2e/.artifacts/`，都不会提交。恢复密码每次随机生成，通过 e2e secrets 传入。
 
 所有 Web fixture 显式选择受控 Cursor CLI，避免 AI 设置的自动探针启动 PATH 中的个人 CLI。`onboarding.e2e.ts` 的 Cursor 场景从旧 SDK 程序选择开始，在受控 PATH 中发现并保存官方入口，核对未登录提示、无密钥输入、受控 CLI 登录后返回页面的认证与模型状态，以及 Bot 和执行用途仍关闭。全过程不发送模型提示。
 
-核心测试依次建网、下载恢复文件、跳过 AI 设置、创建 Bot，再刷新确认它仍存在。传输测试启动发送 Node、接收 Node 和运行 relay 的公共节点，经真实界面创建两个独立个人网络，从“设置 → 实验室”开启文件传输，再到 `/settings/lab/transfers` 确认零费用订单，接受订单并重启接收 Node。它还关闭实验并刷新，检查记录仍在、已收到文件仍可保存、重开不新增订单且不改变原传输方式。浏览器下载的原文件必须通过 SHA-256 核对，免费过程不创建钱包或调用链上 RPC。这些测试不需要模型或登录。CI 使用本次提交打包出的 Linux 程序运行。
+核心测试依次建网、下载恢复文件、跳过 AI 设置、创建 Bot，再刷新确认它仍存在。传输测试启动发送 Node、接收 Node 和运行 relay 的公共节点，经真实界面创建两个独立个人网络，从“设置 → 实验室”开启文件传输，再到 `/settings/lab/transfers` 确认零费用订单，接受订单并重启接收 Node。它还关闭实验并刷新，检查记录仍在、已收到文件仍可保存、重开不新增订单且不改变原传输方式。浏览器下载的原文件必须通过 SHA-256 核对，免费过程不创建钱包或调用链上 RPC。这些测试不需要模型或登录。
 
 headless 传输测试仅阻止临时文件输入打开原生系统选择框，再用真实 `setInputFiles` 选择任务内文件。文件输入的 change 事件、原文件内容、产品加密和 Node 请求均保留真实路径。下载结果仍需独立核对 SHA-256。
 
@@ -91,7 +91,7 @@ python3 scripts/verify-node.py --delivery-charity \
 
 本轮 proof 构建和新genuine驱动不得放宽原7200秒证明硬界、现有 deadline、11GiB/zero-swap/64PIDs、image/profile 或时钟。需要界面验收时按本文件 e2e 规则执行最小真实表面；源码、类型检查、HTTP200 或合约测试都不代替浏览器/设备证据。操作和安全模型见 [受保护预算](paid-delivery.md)；链上观察格式见 `contracts/delivery/README.md`。
 
-宿主和手动 CI 使用同一个正式入口。先运行纯自检，再提供当前 clean HEAD 的 Linux package 下载目录或已解包目录：
+以下是本机正式入口，Actions 不提供受保护交付实验 job。先运行纯自检，再提供当前 clean HEAD 的 Linux package 下载目录或已解包目录：
 
 ```sh
 python3 scripts/run-delivery-live.py --protected-selfcheck
@@ -116,6 +116,8 @@ canonical 入口监督 native 与 tracked restart observer 两个同级子进程
 容器核对 package checksum、`BUILD-INFO.json`、当前 JS/WASM 和 build-input receipts，先以真实 Web 资源进程检查实测 package 的 libc。仅当日志实际证明 GLIBC 不兼容时，按当前 clean HEAD 和现有 release flags 重建 CLI/Core，并再次检查真实资源进程。package 的检查状态、实际使用的 binary 来源及摘要分别写入 `artifact-provenance.json`，不能用 bare binary hash 自证源码来源。随后调用固定 guest 安装器和官方 `build.sh`，核对 image/profile/ELF，生成配置，再由 native 子进程经既有 `--protected-config` 调用 verify-node 的 `delivery_protected_acceptance` helper。Web 资源进程检查不代表渲染验收。
 
 输出位于 `.artifacts/vdp/protected-runs/<run-id>/`；可用 `--protected-run-dir` 指定另一个全新任务目录。公开导出目录是本轮 run 的 `public-export-<opaque>/`。其中包括逐项认证且当前摘要匹配的 receipts/metadata、原链公开观察、制品来源、资源状态和最终摘要。导出的 `progress.json` 只保留受控状态与合格清单，完整原生终态结果由摘要认证的 `native-result.json` 保留。
+
+`verify-delivery-protected.py` 在停止本任务子进程、核对资源清理后写入 `native-result.json`。canonical 宿主入口等待 native 与 observer 退出，停止并移除自己的容器，再生成公开 `summary.json`。操作者须核对这些实际结果，并负责本任务留存的私有 run、配置、钱包和缓存；没有 CI 代为清理或发布验收收据。
 
 observer 只导出固定字段投影 `restart-observer-summary.json`，包含受控状态、计数、条件布尔、相对 run/配置内容绑定与 script/prover/native-result 摘要，以及 supervisor 实际 wait 得到的两个退出码。原 native 全通过、observer 完整窗口全通过、两者真实 exit0 才能整体 PASS。result 自称 PASS、observer 尚未退出、缺窗或 INCONCLUSIVE 均不够。账户原始快照、RPC payload、私有 observer result/诊断不能导出。原生 get 的 proof deadline 诊断保持中性，同一句 Core 错误也可能来自 info30秒或 verify120秒；`node_proof_timeout_seconds=7200` 是 prove 配置，不单独证明具体耗时。
 
@@ -226,11 +228,11 @@ pnpm exec e2e run --config tests/e2e/e2e.workspace.native.config.ts workspace.na
 
 ## 验证原生 Provider 设置和队列取消
 
-CI 不再构建模拟器 App 或运行这个 Provider 原生用例；需要时按上文在本机构建当前 checkout 的 Simulator App、宿主 Node、Web 和 WASM，再在专属模拟器上运行。缺少 runtime、模拟器启动失败或 driver 不可用都会使验收失败，构建成功不能代替 UI 结果。
+`.github/workflows/verify-mobile-ui.yml` 冻结源码与移动端版本并检查 Arc，再复用 `release-apps.yml` 和 `release-ios.yml` 构建 Android 包与 iOS 设备归档。它不运行这个 Provider 用例，也不生成 Simulator App 或原生 UI 收据。只有用户明确要求原生界面验收时，才按上文在本机构建当前 checkout 的 Simulator App、宿主 Node、Web 和 WASM，并满足下述身份前提。缺少 runtime、模拟器启动失败或 driver 不可用都会使验收失败，构建成功不能代替 UI 结果。
 
 宿主构建前还要求 HEAD 等于本次提交，且 `git status --porcelain --untracked-files=normal` 为空。DerivedData 和 Simulator zip 位于已忽略的 `.artifacts/native/`，不会干扰这个检查。Expo prebuild 改变源码时必须先解决，不能继续把脏源码产物记为当前提交。
 
-本地运行使用[验证原生接收和本地文件](#验证原生接收和本地文件)一节的四个明确产物与 simulator 环境变量，并补充当前源码身份。仅选择 Provider 用例，不运行公益文件用例。Node 端的 `native_provider_clipboard` 总是核对 CI 身份：要设置 `GITHUB_RUN_ID` 和 `GITHUB_RUN_ATTEMPT`，模拟器名为 `vibeface-provider-<run>-<attempt>`，并把它的 UUID 写入 `.artifacts/native/simulator.txt`，否则本地运行在这一步失败。
+本地运行使用[验证原生接收和本地文件](#验证原生接收和本地文件)一节的四个明确产物与 simulator 环境变量，并补充当前源码身份。仅选择 Provider 用例，不运行公益文件用例。Node 端的 `native_provider_clipboard` 仍强制核对 CI 格式的任务身份。`GITHUB_RUN_ID` 和 `GITHUB_RUN_ATTEMPT` 必须是数字，专属模拟器必须名为 `vibeface-provider-<run>-<attempt>`，且其 UUID 与本 worktree 内常规文件 `.artifacts/native/simulator.txt` 一致，设备清单中必须唯一且处于 Booted 状态。当前 Actions 没有提供这条 Provider 验收链；下面的本地命令不会分配 run/attempt，也不会准备上述 marker。缺少这些前提会在剪贴板步骤失败。现有检查只验证字段格式及本地设备绑定，不核验 GitHub 运行的真实性，不能将手工填写的数字作为 CI 来源证据。
 
 ```sh
 umask 077
@@ -248,13 +250,11 @@ pnpm exec e2e run --config tests/e2e/e2e.native.config.ts --grep '^provider ' \
 
 native config 默认关闭 trace 和整段 video。原始日志、自动失败截图、e2e report、邀请、恢复文件、Node 数据与 driver 状态都属于私有材料，不能递归上传 `.artifacts/native/`。需要共享时只取固定的 `provider.json`、`provider-probe.json`、`provider-initial.png`、`provider-selectable.png`、`provider-controlled.png`、`provider-typed.png` 和 `terminology-device-kinds.png`。`provider-probe.json` 只记录首轮检查的 `link`、`readiness`、`authentication`、`catalog` 和 `checked` 五个固定状态字段。
 
-`provider-initial.png` 是唯一的配对前诊断图。它只在本次 CI 新建的专属 simulator 上，重新安装、清除钥匙串并启动 App 后主动拍摄，且早于剪贴板写入和邀请输入。用例核对 simulator 文件、实际 UUID、Booted 状态以及包含当前 run ID 和 attempt 的专属名称。此时 App 尚未接收邀请、登录命令或凭证，也没有旧应用数据；初始图只用于查看路由、系统弹窗和空表单。`terminology-device-kinds.png` 在配对后的“添加设备”面板记录节点与客户端分类，其他三张图在配对后的设置页保存。诊断图不代表配对或表单验收通过。导航诊断仅记录固定阶段和已知界面的布尔状态，不输出界面文本、加入链接、命令或剪贴板内容。CI 按固定键与布尔类型校验后，将该诊断并入公开的 `provider.json`，不上传原始页面树或测试日志。最终收据只有在一个目标测试真实通过、fixture 退出、专属 simulator 删除和私有状态清理后才标为 `passed`。
+`provider-initial.png` 是唯一的配对前诊断图。操作者须使用本任务新建的专属 simulator；用例重新安装、清除钥匙串并启动 App 后主动拍摄，早于剪贴板写入和邀请输入。用例与 Node helper 核对 simulator 文件、实际 UUID、Booted 状态以及包含当前 run ID 和 attempt 的专属名称。此时 App 尚未接收邀请、登录命令或凭证，也没有旧应用数据；初始图只用于查看路由、系统弹窗和空表单。`terminology-device-kinds.png` 在配对后的“添加设备”面板记录节点与客户端分类，其他三张图在配对后的设置页保存。诊断图不代表配对或表单验收通过。用例单独写入 `provider-navigation.json`，只记录固定阶段和已知界面的布尔状态，不输出界面文本、加入链接、命令或剪贴板内容。
 
-失败收据与 stdout 保留固定阶段、报告是否可读，以及从实际 e2e report 提取的受限错误码、固定 `engine_reason` 和 `engine_timeout_kind`、已知 API 名和两个验收文件的行号。`completed_poll_samples` 只来自唯一合法的既有 expect 采样事件；零表示没有记录完成的采样，字段缺失不补零。错误 message、stack、locator label、值和原始报告不会导出。
+`native-transfers.e2e.ts` 在 Provider 用例的 UI 步骤通过后写入 `provider.json`，状态为 `ui_passed`。`native-fixture.ts` 在受控 fixture 及其 Node 进程正常退出、删除邀请文件后写入 `cleanup.json`。当前没有 Actions 将导航诊断并入 `provider.json`，也没有在删除模拟器后生成最终 `passed` 收据的任务。失败时读取本任务的私有 e2e report 和日志，不把缺失的 UI 收据当作通过。
 
-已有失败语义快照通过文件与元数据校验时，`failure_screen` 只记录欢迎、已填入链接、邀请输入、设备名输入、加入按钮及已知无效或失效提示是否被报告。`true` 是正向出现，`null` 是未知，不能当作控件不存在。快照采集为 best effort，可能缺失或裁剪；没有截断标记也不证明树完整，不能从语义文本恢复原生控件类型或输入读回值。该投影不新增 UI 读取，也不改变原 fill、用例或清理的成败。报告尚未生成时仍保留失败阶段，完整私有日志随后按原清理规则删除。
-
-本地用例产生的 `ui_passed` 仅表示 UI 步骤已完成；本地操作者仍须关闭并删除本人创建的专属 simulator，并核对 fixture 清理结果。这个入口覆盖 iOS Simulator 与受控 Provider，不代表 Android UI、iPhone 真机、真实登录或真实模型已经验收。
+本地操作者须核对 runner 结果和 fixture 清理结果，关闭并删除本人创建的专属 simulator，按任务要求清理私有日志、Node 数据和 driver 状态，并分别记录结果。`ui_passed` 不证明这些清理已完成。这个入口覆盖 iOS Simulator 与受控 Provider，不代表 Android UI、iPhone 真机、真实登录或真实模型已经验收。
 
 ## 验证原生聊天回到底部
 
