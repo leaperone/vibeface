@@ -1057,7 +1057,7 @@ fn form_password_controls_stay_masked_single_line(cx: &mut TestAppContext) {
                     let FieldControl::SingleLine(state) = &field.control else {
                         panic!("{key} must have a single-line control");
                     };
-                    assert!(state.read(cx).is_masked());
+                    assert!(state.read(cx).presentation().is_masked());
                     assert_eq!(form.values(cx)[key], "controlled secret");
                     field.control.set_value("replacement secret", window, cx);
                     assert_eq!(form.values(cx)[key], "replacement secret");
@@ -1091,7 +1091,7 @@ fn form_controls_keep_focus_typing_paste_and_save_values(cx: &mut TestAppContext
                 let FieldControl::MultiLine(instructions) = &form.fields[1].control else {
                     panic!("bot instructions must be multiline");
                 };
-                assert!(!name.read(cx).is_masked());
+                assert!(!name.read(cx).presentation().is_masked());
                 assert_eq!(form.values(cx)["cwd"], "");
                 (name.clone(), instructions.clone())
             });
