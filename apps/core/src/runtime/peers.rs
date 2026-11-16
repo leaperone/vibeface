@@ -5122,9 +5122,9 @@ mod tests {
         Ok(state)
     }
 
-    /// Long enough ago to be due by the wall clock.
+    /// Already overdue by the protocol's clock-skew allowance.
     fn overdue() -> u64 {
-        now_ms() as u64 - crate::identity::RECOVERY_DELAY_MS - 1_000
+        now_ms() as u64 - crate::identity::RECOVERY_DELAY_MS - crate::identity::RECOVERY_SKEW_MS
     }
 
     async fn ready_member_rpc(node: &Runtime, network: &str, peer: &str) -> Result<()> {

@@ -4679,33 +4679,43 @@ mod tests {
 
         let mut session = test_session(manager.device_id()?);
         let view = state.project_at(now)?.clone();
+        let approval_at = now - RECOVERY_SKEW_MS / 2;
         let event = GovernanceEvent::unsigned(
             &view,
             &manager.device_id()?,
             GovernanceAction::Approve {
                 checkpoint: checkpoint.hash()?,
-                at_ms: now,
+                at_ms: approval_at,
             },
         )?
         .sign(&manager)?;
-        for action in [
-            GovernanceAction::Approve {
-                checkpoint: "0".repeat(64),
-                at_ms: now,
-            },
-            GovernanceAction::Approve {
-                checkpoint: checkpoint.hash()?,
-                at_ms: now + 30_000,
-            },
-            GovernanceAction::Approve {
-                checkpoint: checkpoint.hash()?,
-                at_ms: now - RECOVERY_SKEW_MS - 1,
-            },
+        for (action, expected_error) in [
+            (
+                GovernanceAction::Approve {
+                    checkpoint: "0".repeat(64),
+                    at_ms: approval_at,
+                },
+                NO_RECOVERY_WAITING,
+            ),
+            (
+                GovernanceAction::Approve {
+                    checkpoint: checkpoint.hash()?,
+                    at_ms: now + 30_000,
+                },
+                "this device's clock is too far from this Node's clock",
+            ),
+            (
+                GovernanceAction::Approve {
+                    checkpoint: checkpoint.hash()?,
+                    at_ms: now - RECOVERY_SKEW_MS - RECOVERY_SKEW_MS / 2,
+                },
+                "this device's clock is too far from this Node's clock",
+            ),
         ] {
             let mut invalid = event.clone();
             invalid.action = action;
             let invalid = invalid.sign(&manager)?;
-            assert!(
+            assert_eq!(
                 dispatch(
                     &node,
                     &mut session,
@@ -4713,7 +4723,9 @@ mod tests {
                     json!({"event":invalid})
                 )
                 .await
-                .is_err()
+                .unwrap_err()
+                .to_string(),
+                expected_error
             );
             assert_eq!(node.membership_state().await?.events.len(), 0);
             assert_eq!(node.membership_state().await?.project()?.epoch, 1);
@@ -4738,6 +4750,9 @@ mod tests {
         .await?;
         assert_eq!(first["view"]["epoch"], 2);
         assert!(first["view"]["pending"].is_null());
+        let approved: NetworkState = serde_json::from_value(first["state"].clone())?;
+        assert_eq!(approved.project_at(approval_at - 1)?.epoch, 1);
+        assert_eq!(approved.project_at(approval_at)?.epoch, 2);
         let events = node.membership_state().await?.events;
         assert_eq!(events.len(), 1);
 
