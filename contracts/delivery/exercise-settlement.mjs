@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { pathToFileURL } from 'node:url';
-import { observe, parseArguments, validateBundle, observationCase } from './observe-settlement.mjs';
+import { observe, parseArguments, validateBundle } from './observe-settlement.mjs';
 
 function selfTest() {
   const hash = n => `0x${n.toString(16).padStart(64, '0')}`;
@@ -24,9 +24,12 @@ function selfTest() {
   mutate(value => { value.capsules[1] = value.capsules[0]; });
   mutate(value => { value.transactions.raw = 'unbroadcast'; });
   mutate(value => { value.transactions.deployments = [hash(17), hash(18)]; });
-  assert.throws(() => observationCase('strict'));
-  assert.throws(() => observationCase('ordinary'));
-  assert.equal(parseArguments(['--settlement', '/fixture/public.json', '--rpc-url', 'http://127.0.0.1:8545']).caseName, 'protected');
+  const args = ['--settlement', '/fixture/public.json', '--rpc-url', 'http://127.0.0.1:8545'];
+  assert.deepEqual(parseArguments(args), { bundleFile: '/fixture/public.json', rpcUrl: 'http://127.0.0.1:8545/' });
+  assert.throws(() => parseArguments([...args, '--case', 'protected']));
+  assert.throws(() => parseArguments(['--case', 'protected', '--rpc-url', 'http://127.0.0.1:8545']));
+  assert.throws(() => parseArguments(['--settlement', '/fixture/public.json', '--settlement', '/fixture/other.json']));
+  assert.throws(() => parseArguments([...args, '--unknown']));
   assert.throws(() => parseArguments(['--settlement', '/fixture/public.json', '--rpc-url', 'https://example.com']));
   console.log('PASS protected evidence boundaries: two distinct slots, exact proof coverage, relative public paths, unique transactions and no private raw export; no chain, Node or proof ran');
 }
