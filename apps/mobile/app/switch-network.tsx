@@ -1,4 +1,4 @@
-import { router, useLocalSearchParams } from 'expo-router'
+import { useLocalSearchParams, useRouter } from 'expo-router'
 import { useLinkingURL } from 'expo-linking'
 import { useState } from 'react'
 import { ArrowRightLeft, Crown } from 'lucide-react-native'
@@ -20,6 +20,7 @@ const decode = (ticket: string) => mobilePlatform.secure.ticketDecode(ticket)
 
 /** A join link from another network: the phone erases itself, and the join page that follows picks the same link up. */
 export default function SwitchNetwork() {
+  const router = useRouter()
   const device = useDevice()
   const { busy, error, run } = useRun()
   const { link } = useLocalSearchParams<{ link?: string }>()

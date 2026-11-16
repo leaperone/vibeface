@@ -16,7 +16,7 @@ import { mobilePlatform } from '@/platform'
 import { WorkspaceProvider } from './context'
 import type { ChatMessage, Connection, Conversation, Member, Session, Workspace, WorkspaceActions } from './types'
 import type { InputTarget } from '@vibeface/client/workspace/types.ts'
-import { router } from 'expo-router'
+import { useRouter } from 'expo-router'
 
 const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'running', 'cancelling']
 const streamingStates = [...busyStates, 'publishing']
@@ -86,6 +86,7 @@ function useConnection(): { session: Session; connection: Connection } {
 }
 
 function Device({ children }: { children: ReactNode }) {
+  const router = useRouter()
   const device = useDevice()
   const { ready } = device
   if (!ready) return <Offline>{children}</Offline>

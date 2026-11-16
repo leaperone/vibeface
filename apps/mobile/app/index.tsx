@@ -1,4 +1,4 @@
-import { Stack, router, useLocalSearchParams } from 'expo-router'
+import { Stack, useLocalSearchParams, useRouter } from 'expo-router'
 import { useEffect } from 'react'
 import { useHeaderHeight } from 'expo-router/react-navigation'
 import { MessageSquare } from 'lucide-react-native'
@@ -12,6 +12,7 @@ import { useWide } from '@/lib/layout'
 
 /** The phone's home; on a wide window the list lives in the sidebar and this pane only waits for a choice. */
 export default function Home() {
+  const router = useRouter()
   const wide = useWide()
   const workspace = useWorkspace()
   const { conversation, work, routine } = useLocalSearchParams<{ conversation?: string; work?: string; routine?: string }>()
@@ -20,7 +21,7 @@ export default function Home() {
     if (!bot || !conversation) return
     if (work) router.replace(`/b/${bot.bot_id}/work/${work}`)
     else router.replace({ pathname: '/b/[botId]', params: { botId: bot.bot_id, ...(routine ? { routine } : {}) } })
-  }, [conversation, work, routine, bot?.bot_id])
+  }, [conversation, work, routine, bot?.bot_id, router])
   const bar = useHeaderHeight()
   const frame = useSafeAreaFrame()
   const insets = useSafeAreaInsets()

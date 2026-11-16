@@ -1,4 +1,4 @@
-import { Stack, router, useLocalSearchParams } from 'expo-router'
+import { Stack, useLocalSearchParams, useRouter } from 'expo-router'
 import { ArrowRightLeft, Bot, Check, Crown, Laptop, MonitorSmartphone, Pencil, Sparkles, Trash2, X } from 'lucide-react-native'
 import { useState } from 'react'
 import { Alert, ScrollView, View } from 'react-native'
@@ -20,6 +20,7 @@ import { useRun } from '@/lib/use-run'
 const tag = 'flex-row items-center gap-1 rounded-control bg-surface-muted px-1.5'
 
 export default function DeviceDetail() {
+  const router = useRouter()
   const { deviceId } = useLocalSearchParams<{ deviceId: string }>()
   const device = useDevice()
   const { members } = useWorkspace()

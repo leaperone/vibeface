@@ -63,7 +63,7 @@
   },
   "adaptations": [
     "DOM elements and browser focus become native accessibility roles and touch controls.",
-    "Native controls grow with Dynamic Type, with 44px minimum interactive targets.",
+    "Native buttons grow with Dynamic Type, with default 44pt minimum interactive targets on iOS and 48dp on Android. Explicit caller sizing retains its existing precedence. Small buttons keep 36px visuals inside platform-sized padded hit containers; Android default and icon buttons use a 48dp minimum.",
     "Router stacks, safe areas, keyboard-aware lists, platform attachment pickers and Back remain native.",
     "Product avatars keep their identity geometry with solid fills. Native screen composition uses generated Arc foundation tokens.",
     "Background toast announcements remain separate from inline foreground errors and action results.",

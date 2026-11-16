@@ -11,7 +11,7 @@ export function Scanner({ title, onScanned, onCancel }: { title: string; onScann
   if (!permission) return null
   if (!permission.granted) return <Panel icon={Camera} title={title}>
     <Text className="text-muted">需要相机权限才能扫码，也可以粘贴链接</Text>
-    <View className="flex-row gap-2">
+    <View className="flex-row flex-wrap gap-2">
       <Button variant="ghost" onPress={onCancel}><Text>不扫了，粘贴链接</Text></Button>
       <Button onPress={request}><Text>允许使用相机</Text></Button>
     </View>

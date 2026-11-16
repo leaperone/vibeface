@@ -1,6 +1,6 @@
 import * as Clipboard from 'expo-clipboard'
 import { openURL } from 'expo-linking'
-import { router } from 'expo-router'
+import { useRouter } from 'expo-router'
 import { Check, CircleCheck, Clock, Copy, Download, Laptop, Link2, Plus, ScanEye, Share2, ShieldAlert, Smartphone, Sparkles, SquareTerminal } from 'lucide-react-native'
 import { useEffect, useRef, useState } from 'react'
 import { Pressable, ScrollView, Share, View } from 'react-native'
@@ -21,6 +21,7 @@ type Kind = (typeof kinds)[number]['value']
 
 /** "添加设备": one single-use link the new device opens (a QR for phones, its own Vibeface page for computers), then both sides compare the safety code. */
 export default function AddDevice() {
+  const router = useRouter()
   const device = useDevice()
   const { ready } = device
   const { busy, error, run } = useRun()
