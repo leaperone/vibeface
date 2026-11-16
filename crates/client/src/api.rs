@@ -612,8 +612,12 @@ pub struct ClientEvent {
     pub payload: Value,
 }
 
+mod policy;
+use policy::ActionPolicy;
 mod reader;
 pub use reader::ClientReader;
+#[cfg(test)]
+mod policy_tests;
 #[cfg(test)]
 mod typed_tests;
 
@@ -1318,27 +1322,24 @@ impl Client {
         action: Action,
         mut prerequisites: Vec<String>,
     ) -> Result<OperationSnapshot> {
+        let policy = action.policy();
         ensure!(
-            if safety_action(&action) {
-                self.can_write()
-            } else {
-                self.can_save_locally()
+            match policy {
+                ActionPolicy::SafetyStop => self.can_write(),
+                ActionPolicy::MemberWrite
+                | ActionPolicy::ManagingMemberWrite
+                | ActionPolicy::NodeControl
+                | ActionPolicy::EnableLocalAccess => self.can_save_locally(),
             },
             "this profile cannot stage this intent"
         );
-        if matches!(
-            &action,
-            Action::Delivery(_)
-                | Action::NodeSettings(_)
-                | Action::ProviderSettings(_)
-                | Action::Triage(_)
-                | Action::Relay { .. }
-                | Action::CreateDecisionToken { .. }
-                | Action::RevokeDecisionToken { .. }
-                | Action::ConfirmWritable
-                | Action::TestWebhook
-                | Action::LocalAccess { .. }
-        ) {
+        let requires_manager = match policy {
+            ActionPolicy::MemberWrite | ActionPolicy::SafetyStop => false,
+            ActionPolicy::ManagingMemberWrite
+            | ActionPolicy::NodeControl
+            | ActionPolicy::EnableLocalAccess => true,
+        };
+        if requires_manager {
             ensure!(
                 matches!(
                     self.authority,
@@ -1359,23 +1360,15 @@ impl Client {
         mut action: Action,
         prerequisites: Vec<String>,
     ) -> Result<OperationSnapshot> {
-        let local_control = matches!(
-            &action,
-            Action::NodeSettings(_)
-                | Action::ProviderSettings(_)
-                | Action::Triage(_)
-                | Action::Relay { .. }
-                | Action::CreateDecisionToken { .. }
-                | Action::RevokeDecisionToken { .. }
-                | Action::ConfirmWritable
-                | Action::TestWebhook
-                | Action::LocalAccess { .. }
-        );
+        let permits_fork = match action.policy() {
+            ActionPolicy::MemberWrite | ActionPolicy::ManagingMemberWrite => false,
+            ActionPolicy::NodeControl
+            | ActionPolicy::EnableLocalAccess
+            | ActionPolicy::SafetyStop => true,
+        };
         ensure!(
             !self.revoked.load(Ordering::Acquire)
-                && (self.write_gate.load(Ordering::Acquire) != 2
-                    || safety_action(&action)
-                    || local_control),
+                && (self.write_gate.load(Ordering::Acquire) != 2 || permits_fork),
             "known revoked or forked profile cannot stage new network work"
         );
         let known=match &action {
@@ -1436,36 +1429,26 @@ impl Client {
     }
     /// Local staging survives transport loss; only an admitted writer changes Prepared to Unknown.
     pub async fn submit(&self, action: Action) -> Result<OperationSnapshot> {
+        let policy = action.policy();
         if matches!(self.authority, ClientAuthority::LocalSession) {
             ensure!(
-                !matches!(&action, Action::LocalAccess { enabled: true }),
+                policy != ActionPolicy::EnableLocalAccess,
                 "only a managing member can enable local access"
             );
         }
-        let node_operator = matches!(
-            &action,
-            Action::NodeSettings(_)
-                | Action::ProviderSettings(_)
-                | Action::Triage(_)
-                | Action::Relay { .. }
-                | Action::TestWebhook
-                | Action::LocalAccess { .. }
-                | Action::CreateDecisionToken { .. }
-                | Action::RevokeDecisionToken { .. }
-                | Action::ConfirmWritable
-        );
-        let allowed = if node_operator {
-            self.can_configure_node() && self.active.load(Ordering::Acquire)
-        } else if matches!(&action, Action::Delivery(_)) {
-            self.can_save_locally()
-                && matches!(
-                    self.authority,
-                    ClientAuthority::Membership { can_manage: true }
-                )
-        } else if safety_action(&action) {
-            self.can_write()
-        } else {
-            self.can_save_locally()
+        let allowed = match policy {
+            ActionPolicy::NodeControl | ActionPolicy::EnableLocalAccess => {
+                self.can_configure_node() && self.active.load(Ordering::Acquire)
+            }
+            ActionPolicy::ManagingMemberWrite => {
+                self.can_save_locally()
+                    && matches!(
+                        self.authority,
+                        ClientAuthority::Membership { can_manage: true }
+                    )
+            }
+            ActionPolicy::SafetyStop => self.can_write(),
+            ActionPolicy::MemberWrite => self.can_save_locally(),
         };
         ensure!(allowed, "this client is not authorized for this operation");
         let client = self.clone();
@@ -1500,31 +1483,37 @@ impl Client {
         {
             return Ok(operation.snapshot);
         }
-        let request: Value = serde_json::from_slice(&operation.bytes)?;
-        let safety = safety_request(&request);
-        let network_write =
-            (request["method"] == "rpc" || request["method"] == "delivery") && !safety;
-        if safety && !self.can_control() {
-            return Ok(operation.snapshot);
-        }
-        if network_write && !self.can_send_online() {
-            return Ok(operation.snapshot);
-        }
-        if request["method"] == "delivery" {
-            ensure!(
-                matches!(
-                    self.authority,
-                    ClientAuthority::Membership { can_manage: true }
-                ),
-                "delivery requires current management permission"
-            );
-        }
-        if !network_write && !safety {
-            ensure!(
-                self.can_configure_node(),
-                "Node operation requires current owner permission"
-            );
-        }
+        let policy = policy::stored_policy(&operation)?;
+        let network_write = match policy {
+            ActionPolicy::MemberWrite | ActionPolicy::ManagingMemberWrite => {
+                if !self.can_send_online() {
+                    return Ok(operation.snapshot);
+                }
+                if policy == ActionPolicy::ManagingMemberWrite {
+                    ensure!(
+                        matches!(
+                            self.authority,
+                            ClientAuthority::Membership { can_manage: true }
+                        ),
+                        "delivery requires current management permission"
+                    );
+                }
+                true
+            }
+            ActionPolicy::SafetyStop => {
+                if !self.can_control() {
+                    return Ok(operation.snapshot);
+                }
+                false
+            }
+            ActionPolicy::NodeControl | ActionPolicy::EnableLocalAccess => {
+                ensure!(
+                    self.can_configure_node(),
+                    "Node operation requires current owner permission"
+                );
+                false
+            }
+        };
         let check = id.clone();
         if !self.stored(move |db| db.can_begin(&check)).await? {
             return self.stored(move |db| Ok(db.get(&id)?.snapshot)).await;
@@ -3694,15 +3683,15 @@ mod offline_tests {
         Ok(())
     }
 
-    struct Evidence {
-        counts: BTreeMap<String, u32>,
-        inputs: BTreeMap<String, Value>,
-        write_state: String,
-        revoked: bool,
-        controls: Vec<Value>,
-        settings: Value,
+    pub(super) struct Evidence {
+        pub(super) counts: BTreeMap<String, u32>,
+        pub(super) inputs: BTreeMap<String, Value>,
+        pub(super) write_state: String,
+        pub(super) revoked: bool,
+        pub(super) controls: Vec<Value>,
+        pub(super) settings: Value,
     }
-    async fn fixture(
+    pub(super) async fn fixture(
         node_secret: &str,
         state: NetworkState,
         client_id: String,
@@ -3710,6 +3699,7 @@ mod offline_tests {
         drop_message: Option<String>,
     ) -> Result<(Endpoint, tokio::task::JoinHandle<Result<()>>)> {
         let node = Identity::from_secret_hex(node_secret)?;
+        let can_manage = state.project()?.client(&client_id)?.manage;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let entry = crate::Entry {
             origin: format!("http://{}", listener.local_addr()?),
@@ -3727,7 +3717,7 @@ mod offline_tests {
                         if evidence.lock().expect("fixture evidence").revoked {
                             json!({"initialized":true,"principal":null,"revoked":true})
                         } else {
-                            json!({"network_id":state.genesis.network_id,"principal":{"source":"membership","device_id":client_id,"can_manage":true}})
+                            json!({"network_id":state.genesis.network_id,"principal":{"source":"membership","device_id":client_id,"can_manage":can_manage}})
                         }
                     }
                     Some("directory") => {
@@ -3763,6 +3753,14 @@ mod offline_tests {
                     }
                     Some("node_settings") => {
                         json!({"settings":evidence.lock().expect("fixture evidence").settings,"providers":[{"provider":"codex","env":{"SYNTHETIC_KEY":{"set":true}}}]})
+                    }
+                    Some(
+                        method
+                        @ ("local_access" | "test_webhook" | "confirm_writable" | "delivery"),
+                    ) => {
+                        let mut saved = evidence.lock().expect("fixture evidence");
+                        *saved.counts.entry(method.into()).or_default() += 1;
+                        json!({})
                     }
                     Some("rpc") => match request["params"]["method"].as_str() {
                         Some("cancel_manager") => {
@@ -3862,7 +3860,7 @@ mod offline_tests {
         });
         Ok((Endpoint::Gateway(entry), task))
     }
-    fn input(id: &str, target: InputTarget) -> Action {
+    pub(super) fn input(id: &str, target: InputTarget) -> Action {
         Action::Input {
             conversation_id: "chat".into(),
             input: InputRequest {
@@ -3879,7 +3877,7 @@ mod offline_tests {
             },
         }
     }
-    fn provider_change() -> ProviderSettings {
+    pub(super) fn provider_change() -> ProviderSettings {
         ProviderSettings {
             provider: Provider::Codex,
             bot: None,
@@ -4379,16 +4377,6 @@ mod offline_tests {
     }
 }
 
-fn safety_action(action: &Action) -> bool {
-    matches!(action, Action::StopReply { .. } | Action::StopWork { .. })
-}
-fn safety_request(request: &Value) -> bool {
-    request["method"] == "rpc"
-        && matches!(
-            request["params"]["method"].as_str(),
-            Some("cancel_manager" | "interrupt_work")
-        )
-}
 fn terminal_reply(state: &Value) -> bool {
     matches!(
         state.as_str(),
