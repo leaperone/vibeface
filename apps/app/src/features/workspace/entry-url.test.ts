@@ -1055,7 +1055,7 @@ test("workspace preserves bot and message requests while routing native decision
       assert.equal(render().pendingMessages.length, 0)
     })
 
-    await t.test('two tabs preserve target order while the earlier input is still signing', async () => {
+    await t.test('two tabs preserve target order while the earlier input is still signing', { timeout: 10_000 }, async () => {
       const otherHooks = hookHarness()
       const loadOther = moduleLoader(sandbox, (specifier, filename) => {
         if (specifier === 'react') return otherHooks.react
@@ -1081,6 +1081,12 @@ test("workspace preserves bot and message requests while routing native decision
       }
       const previousBots = knownBots, previousTranscript = transcript, previousMessages = messages.length
       const previousOutbox = new Map(outboxItems)
+      const submitted = deferred(), sendingConnection = activeConnection, request = sendingConnection.rpc
+      sendingConnection.rpc = async (method, params) => {
+        const result = await request(method, params)
+        if (method === 'message' && params?.text === 'second tab input') submitted.resolve(result)
+        return result
+      }
       const independentBot = { ...bot, bot_id: 'other-tab-bot', conversation_id: 'other-tab-chat' }
       let first: Promise<boolean> | undefined, second: Promise<boolean> | undefined, sameTabSecond: Promise<boolean> | undefined, independent: Promise<boolean> | undefined
       try {
@@ -1103,6 +1109,7 @@ test("workspace preserves bot and message requests while routing native decision
         assert.deepEqual(messages.slice(before).map((message) => message.text), ['independent tab input'], 'a later tab cannot submit ahead of the input still being signed')
         gate.resolve(null)
         assert.deepEqual(await Promise.all([first, sameTabSecond, second, independent]), [true, true, true, true])
+        await submitted.promise
         await render().refresh(); await drainOutbox()
         assert.deepEqual(messages.slice(before).map((message) => message.text), ['independent tab input', 'first tab input', 'earlier same tab second input', 'second tab input'])
         assert.equal(Number(messages[before + 2].sequence), Number(messages[before + 1].sequence) + 1)
@@ -1110,6 +1117,7 @@ test("workspace preserves bot and message requests while routing native decision
       } finally {
         gate.resolve(null)
         await Promise.allSettled([first, sameTabSecond, second, independent])
+        sendingConnection.rpc = request
         platform.transport.signClient = sign
         knownBots = previousBots
         for (const effect of otherHooks.effects.values()) effect.cleanup?.()
