@@ -324,7 +324,7 @@ function ScopedWorkspaceContent({ taskId, channelId }: { taskId?: string; channe
   const channel = shared?.workspaceState?.channels.find((item) => item.channel_id === channelId)
   const tasks = (shared?.workspaceState?.tasks ?? []).filter((item) => channelId ? item.channel_id === channelId : item.task_id === taskId)
   const selectedTaskId = taskId ?? (selected.startsWith('task:') ? selected.slice(5) : undefined)
-  const task = selectedTaskId ? tasks.find((item) => item.task_id === selectedTaskId) : tasks.findLast((item) => item.owner_bot === (recipient || channel?.coordinator_bot) && !['completed', 'cancelled'].includes(item.state))
+  const task = selectedTaskId ? tasks.find((item) => item.task_id === selectedTaskId) : undefined
   const pendingTask = savedInput ?? shared?.pendingMessages.find((input) => (input.target.kind === 'task' || input.target.kind === 'channel_task') && input.target.task_id === selectedTaskId)
   const bot = shared?.bots.find((item) => task ? item.bot_id === task.owner_bot : pendingTask ? item.conversation_id === pendingTask.conversation_id : item.bot_id === (recipient || channel?.coordinator_bot))
   viewportReady.current = Boolean(shared && bot && (!taskId || task || pendingTask) && (!channelId || channel))
@@ -465,12 +465,14 @@ function ScopedWorkspaceContent({ taskId, channelId }: { taskId?: string; channe
         ...(expectedRevision !== undefined ? { expected_revision: expectedRevision } : {}),
         onSaved: input => {
           // Clearing belongs to the captured durable draft even when saving selects a newly created task.
-          savedDraft = draft.clear(prepared.snapshot).catch(cause => { if (current()) setError(messageOf(cause)); return false })
-          if (savedSelection !== selectionRevision.current || !current()) return
-          if (channelId && input.target.kind === 'channel_task' && input.target.channel_id === channelId) {
-            setSavedInput(input); setSelected(`task:${input.target.task_id}`); setRecipient(input.target.bot_id)
-            storage.writeStorage(selectionKey, { bot_id: input.target.bot_id, task_id: input.target.task_id })
-          } else if (!channelId && (input.target.kind === 'task' || input.target.kind === 'channel_task') && input.target.task_id !== taskId) router.push(`/task/${input.target.task_id}`)
+          savedDraft = draft.clear(prepared.snapshot).then(cleared => {
+            if (!cleared || savedSelection !== selectionRevision.current || !current()) return cleared
+            if (channelId && input.target.kind === 'channel_task' && input.target.channel_id === channelId) {
+              setSavedInput(input); setSelected(`task:${input.target.task_id}`); setRecipient(input.target.bot_id)
+              storage.writeStorage(selectionKey, { bot_id: input.target.bot_id, task_id: input.target.task_id })
+            } else if (!channelId && (input.target.kind === 'task' || input.target.kind === 'channel_task') && input.target.task_id !== taskId) router.push(`/task/${input.target.task_id}`)
+            return cleared
+          }).catch(cause => { if (current()) setError(messageOf(cause)); return false })
         },
       })
       if (!saved) throw new Error('消息尚未保存，草稿已保留。')

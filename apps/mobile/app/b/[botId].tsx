@@ -241,8 +241,9 @@ export default function ChatScreen() {
       const lease = chatDrafts.lease(snapshot)
       try {
         await workspace.actions.send(id, snapshot.text.trim(), lease.files, { target: targetOption.target, intent: promptIntent(snapshot.text), conversation_id: id, onSaved: (input) => {
-          void draft.clear(snapshot).catch((cause) => { if (currentScope.current === scope) setSendError(messageOf(cause)) })
-          if (routeActive.current && currentScope.current === scope && live?.isCurrent() && latestLive.current?.conversationId === id && (input.target.kind === 'task' || input.target.kind === 'channel_task')) router.push(`/task/${input.target.task_id}`)
+          void draft.clear(snapshot).then((cleared) => {
+            if (cleared && routeActive.current && currentScope.current === scope && live?.isCurrent() && latestLive.current?.conversationId === id && (input.target.kind === 'task' || input.target.kind === 'channel_task')) router.push(`/task/${input.target.task_id}`)
+          }).catch((cause) => { if (currentScope.current === scope) setSendError(messageOf(cause)) })
         } })
       } finally { lease.release() }
     })().catch((cause) => { if (currentScope.current === scope) setSendError(messageOf(cause)) }).finally(() => {
