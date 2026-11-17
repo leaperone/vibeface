@@ -15,80 +15,17 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     fs,
     io::Read,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    num::{NonZeroU32, NonZeroUsize},
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     time::Duration,
 };
 use vibeface_bridge::platform::{clock, privatefs, program};
 
-pub const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4790);
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InitOptions {
-    data_dir: PathBuf,
-    #[serde(default = "default_listen")]
-    listen: SocketAddr,
-    #[serde(default = "default_local_listen")]
-    local_listen: SocketAddr,
-    public_url: Option<String>,
-    #[serde(default)]
-    tls: bool,
-    #[serde(default)]
-    no_web: bool,
-    #[serde(default)]
-    allowed_origins: Vec<String>,
-    #[serde(default)]
-    roots: Vec<PathBuf>,
-    #[serde(default)]
-    no_local_auto_access: bool,
-    #[serde(default)]
-    allow_insecure_lan: bool,
-    #[serde(default)]
-    relays: Vec<String>,
-    /// `(relay URL, token file)`: the token this Node presents to one of `relays`.
-    #[serde(default)]
-    relay_tokens: Vec<(String, PathBuf)>,
-    relay_listen: Option<SocketAddr>,
-    relay_url: Option<String>,
-    /// File with the token this Node's relay asks of devices outside its personal network.
-    relay_operator_token: Option<PathBuf>,
-    #[serde(default)]
-    relay_open: bool,
-    relay_rate: Option<NonZeroU32>,
-    relay_max_clients: Option<NonZeroUsize>,
-    relay_max_clients_per_ip: Option<NonZeroUsize>,
-    #[serde(default)]
-    forward_any: bool,
-    forward_sessions: Option<usize>,
-    forward_queue: Option<usize>,
-    forward_rate: Option<NonZeroU32>,
-    forward_per_ip: Option<NonZeroUsize>,
-    #[serde(default)]
-    trusted_proxies: Vec<IpAddr>,
-    manager: Option<Provider>,
-    workspace: Option<PathBuf>,
-    model: Option<String>,
-    #[serde(default)]
-    bins: Vec<(Provider, PathBuf)>,
-    codex_socket: Option<PathBuf>,
-    #[serde(default)]
-    no_mesh: bool,
-    mesh_network: Option<String>,
-    /// Replaces the default bootstrap node.
-    #[serde(default)]
-    bootstrap: Vec<String>,
-}
-
-fn default_listen() -> SocketAddr {
-    DEFAULT_LISTEN
-}
+use vibeface_control::init::{DEFAULT_LISTEN, InitOptions, InitProvider};
 
 /// The mesh a fresh Node joins. The default bootstrap node is on the default network only.
 fn init_mesh(no_mesh: bool, network: Option<String>, bootstrap: Vec<String>) -> Result<MeshConfig> {
@@ -108,17 +45,10 @@ fn init_mesh(no_mesh: bool, network: Option<String>, bootstrap: Vec<String>) -> 
     mesh.validate()?;
     Ok(mesh)
 }
-fn default_local_listen() -> SocketAddr {
-    config::DEFAULT_LOCAL_LISTEN
-}
 
 pub async fn handle(request: vibeface_control::ControlRequest) -> Result<Value> {
     match request {
-        vibeface_control::ControlRequest::Init { options } => {
-            let options: InitOptions =
-                serde_json::from_value(options).context("invalid init options")?;
-            initialize_from_options(options)
-        }
+        vibeface_control::ControlRequest::Init { options } => initialize_from_options(*options),
         vibeface_control::ControlRequest::Inspect { data_dir } => inspect(&data_dir).await,
         vibeface_control::ControlRequest::DiscoverLocalNodes {
             app_profile_dir,
@@ -555,6 +485,16 @@ pub fn prepare_start(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn init_provider(provider: InitProvider) -> Provider {
+    match provider {
+        InitProvider::Codex => Provider::Codex,
+        InitProvider::Cursor => Provider::Cursor,
+        InitProvider::Claude => Provider::Claude,
+        InitProvider::Pi => Provider::Pi,
+        InitProvider::Opencode => Provider::Opencode,
+    }
+}
+
 fn initialize_from_options(options: InitOptions) -> Result<Value> {
     validate_data_dir(&options.data_dir)?;
     let roots: Vec<_> = options
@@ -568,7 +508,11 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
     configuration.web_enabled = !options.no_web;
     configuration.local_auto_access = !options.no_local_auto_access;
     configuration.allowed_origins = options.allowed_origins;
-    configuration.bins = options.bins.into_iter().collect();
+    configuration.bins = options
+        .bins
+        .into_iter()
+        .map(|(provider, path)| (init_provider(provider), path))
+        .collect();
     if let Some(socket) = options.codex_socket {
         configuration.providers.codex_app_server = AppServer {
             mode: AppServerMode::System,
@@ -576,6 +520,7 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
         };
     }
     if let Some(provider) = options.manager {
+        let provider = init_provider(provider);
         let workspace = options
             .workspace
             .context("--manager requires --workspace")?;
@@ -783,9 +728,60 @@ fn start_over(dir: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        net::Ipv4Addr,
+        num::{NonZeroU32, NonZeroUsize},
+    };
 
     fn temp_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("vibeface-{label}-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn init_provider_adapter_preserves_every_wire_provider() {
+        for (wire, internal) in [
+            (InitProvider::Codex, Provider::Codex),
+            (InitProvider::Cursor, Provider::Cursor),
+            (InitProvider::Claude, Provider::Claude),
+            (InitProvider::Pi, Provider::Pi),
+            (InitProvider::Opencode, Provider::Opencode),
+        ] {
+            assert_eq!(init_provider(wire), internal);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_init_requests_leave_the_target_directory_absent() {
+        let dir = temp_dir("invalid-init-wire");
+        for invalid in [
+            json!({"unexpected": true}),
+            json!({"bins": [["unknown", "/agent"]]}),
+            json!({"forward_rate": 0}),
+            json!({"listen": "invalid"}),
+        ] {
+            let mut options = invalid;
+            options["data_dir"] = json!(dir);
+            assert!(
+                serde_json::from_value::<vibeface_control::ControlRequest>(json!({
+                    "command": "init", "options": options
+                }))
+                .is_err()
+            );
+            assert!(!dir.exists());
+        }
+        let request: vibeface_control::ControlRequest = serde_json::from_value(json!({
+            "command": "init", "options": {"data_dir": dir, "manager": "codex"}
+        }))
+        .unwrap();
+        let error = handle(request).await.unwrap_err();
+        assert!(error.to_string().contains("--manager requires --workspace"));
+        assert!(!dir.exists());
+        let request = vibeface_control::ControlRequest::Init {
+            options: Box::new(InitOptions::new(PathBuf::from("relative-node"))),
+        };
+        let error = handle(request).await.unwrap_err();
+        assert!(error.to_string().contains("absolute data directory"));
+        assert!(!dir.exists());
     }
 
     #[test]
