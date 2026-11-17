@@ -48,6 +48,7 @@ def build(service, tag, output):
         if not context.exists():
             continue
         shutil.copy2(ROOT / 'deploy/runtime.py', context / 'runtime.py')
+        shutil.copy2(ROOT / 'scripts/release_component_identity.py', context / 'release_component_identity.py')
         if component == 'core':
             shutil.copy2(ROOT / 'config/public-bootstrap.json', context / 'public-bootstrap.json')
             dockerfile = ROOT / 'deploy/core.Dockerfile'

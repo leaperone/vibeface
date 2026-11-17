@@ -11,7 +11,7 @@ import zipfile
 
 SOURCE = Path(__file__).resolve().parents[2]
 BASE = 'e2093b537da3ba0b6f3fed057d81ab60bc54dd51'
-MODULES = ('release_format', 'release_context', 'release_source', 'release_archive',
+MODULES = ('release_component_identity', 'release_format', 'release_context', 'release_source', 'release_archive',
            'release_inventory', 'release_github', 'release_publisher', 'release_assembly')
 TARGETS = ('aarch64-apple-darwin', 'aarch64-unknown-linux-gnu',
            'x86_64-unknown-linux-gnu', 'x86_64-pc-windows-msvc')

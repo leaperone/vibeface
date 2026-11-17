@@ -4,7 +4,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/vibeface
 COPY component/ ./
-COPY runtime.py ./runtime.py
+COPY runtime.py release_component_identity.py ./
 COPY public-bootstrap.json ./public-bootstrap.json
 RUN python3 runtime.py info > /dev/null
 STOPSIGNAL SIGTERM
