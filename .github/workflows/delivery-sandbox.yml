@@ -1,0 +1,162 @@
+name: Verify / Delivery Sandbox
+run-name: Delivery Sandbox / source ${{ inputs.source_sha }} / controller ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Same-repository source commit, exactly 40 lowercase hexadecimal characters
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  delivery-sandbox:
+    runs-on: ubuntu-24.04
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+    steps:
+      - name: Validate immutable source input
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+
+          if re.fullmatch(r"[0-9a-f]{40}", os.environ["SOURCE_SHA"]) is None:
+              raise SystemExit("source_sha must be exactly 40 lowercase hexadecimal characters")
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Record controller and checked-out source provenance
+        id: source
+        env:
+          CONTROLLER_HEAD_SHA: ${{ github.sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          if source != os.environ["SOURCE_SHA"]:
+              raise SystemExit("Checked-out HEAD differs from source_sha")
+          if subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=normal"]):
+              raise SystemExit("Source checkout must be clean before verification")
+          if Path(".artifacts/vdp").exists():
+              raise SystemExit("Delivery output directory must be absent before verification")
+          provenance = {
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "workflow": os.environ["GITHUB_WORKFLOW"],
+              "workflowRef": os.environ["WORKFLOW_REF"],
+              "workflowSha": os.environ["WORKFLOW_SHA"],
+              "controllerHeadSha": os.environ["CONTROLLER_HEAD_SHA"],
+              "sourceSha": source,
+              "runId": os.environ["GITHUB_RUN_ID"],
+              "runAttempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "complete": False,
+              "commands": [
+                  "python3 scripts/check-delivery.py --check-fixtures",
+                  "python3 scripts/check-delivery.py --sandbox",
+              ],
+          }
+          output = Path(".artifacts/vdp/delivery-sandbox-provenance.json")
+          output.parent.mkdir(parents=True, exist_ok=True)
+          output.write_text(json.dumps(provenance, indent=2) + "\n")
+          print(json.dumps(provenance, indent=2))
+          PY
+      - name: Require the runner's existing Docker daemon
+        run: docker info > /dev/null
+      - name: Check public delivery fixtures when present
+        id: fixtures
+        run: python3 scripts/check-delivery.py --check-fixtures
+      - name: Run the original default Delivery Sandbox
+        id: sandbox
+        run: python3 scripts/check-delivery.py --sandbox
+      - name: Require the checked-out source to remain unchanged
+        id: unchanged
+        if: ${{ always() && steps.source.outcome == 'success' }}
+        env:
+          FIXTURES_OUTCOME: ${{ steps.fixtures.outcome }}
+          SANDBOX_OUTCOME: ${{ steps.sandbox.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          if source != os.environ["SOURCE_SHA"]:
+              raise SystemExit("Source HEAD changed during verification")
+          if subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=normal"]):
+              raise SystemExit("Source files changed during verification")
+          output = Path(".artifacts/vdp/delivery-sandbox-provenance.json")
+          provenance = json.loads(output.read_text())
+          provenance.update({
+              "sourceUnchanged": True,
+              "fixturesOutcome": os.environ["FIXTURES_OUTCOME"],
+              "sandboxOutcome": os.environ["SANDBOX_OUTCOME"],
+          })
+          output.write_text(json.dumps(provenance, indent=2) + "\n")
+          PY
+      - name: Check and record public result completeness
+        if: ${{ always() && steps.unchanged.outcome == 'success' }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path(".artifacts/vdp")
+          output = root / "delivery-sandbox-provenance.json"
+          provenance = json.loads(output.read_text())
+          expected = [
+              "host-info.json", "proof-results.json", "public-vectors.json",
+              "contracts/settlement-report.json", "contracts/cross-language-results.json",
+              "contracts/official-verifier-results.json",
+          ]
+          fixtures = Path("crates/delivery/proof/fixtures")
+          if fixtures.exists():
+              expected.append("contracts/delivery-proof-results.json")
+          results = {}
+          for name in expected:
+              file = root / name
+              if file.is_file() and not file.is_symlink():
+                  data = file.read_bytes()
+                  json.loads(data)
+                  results[name] = {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+          missing = sorted(set(expected) - results.keys())
+          succeeded = provenance["fixturesOutcome"] == provenance["sandboxOutcome"] == "success"
+          provenance.update({"fixturesPresent": fixtures.exists(), "publicResults": results,
+              "missingPublicResults": missing, "complete": False})
+          output.write_text(json.dumps(provenance, indent=2) + "\n")
+          if succeeded:
+              if missing:
+                  raise SystemExit("Successful sandbox is missing public results: " + ", ".join(missing))
+              provenance["complete"] = True
+              output.write_text(json.dumps(provenance, indent=2) + "\n")
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() && steps.unchanged.outcome == 'success' }}
+        with:
+          name: delivery-sandbox-${{ inputs.source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .artifacts/vdp/delivery-sandbox-provenance.json
+            .artifacts/vdp/host-info.json
+            .artifacts/vdp/proof-results.json
+            .artifacts/vdp/public-vectors.json
+            .artifacts/vdp/contracts/settlement-report.json
+            .artifacts/vdp/contracts/cross-language-results.json
+            .artifacts/vdp/contracts/official-verifier-results.json
+            .artifacts/vdp/contracts/delivery-proof-results.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
