@@ -136,24 +136,32 @@ export const mobilePlatform: Platform = {
         const picked = await DocumentPicker.getDocumentAsync({ copyToCacheDirectory: true, multiple: false })
         const asset = picked.assets?.[0]
         if (picked.canceled || !asset) return null
+        let candidate: File | undefined
         try {
-          if (!current()) return null
-          const file = await privateFiles.retainAsync(asset.uri)
-          if (!current()) { privateFiles.release(file.uri); return null }
-          let disposed = false
-          let readers = 0
-          const cleanup = () => { if (disposed && readers === 0) privateFiles.release(file.uri) }
-          return {
-            name: asset.name, size: file.size,
-            async arrayBuffer() {
-              if (disposed) throw new Error('请重新选择文件。')
-              readers++
-              try { return await privateFiles.run(async () => file.arrayBuffer()) }
-              finally { readers--; cleanup() }
-            },
-            dispose() { disposed = true; cleanup() },
-          }
-        } finally { privateFiles.releasePicker(asset.uri) }
+          try {
+            if (!current()) return null
+            const file = await privateFiles.retain(asset.uri)
+            candidate = file
+            if (!current()) { privateFiles.release(file.uri); candidate = undefined; return null }
+            let disposed = false
+            let readers = 0
+            const cleanup = () => { if (disposed && readers === 0) privateFiles.release(file.uri) }
+            return {
+              name: asset.name, size: file.size,
+              async arrayBuffer() {
+                if (disposed) throw new Error('请重新选择文件。')
+                readers++
+                try { return await privateFiles.run(async () => file.arrayBuffer()) }
+                finally { readers--; cleanup() }
+              },
+              dispose() { disposed = true; cleanup() },
+            }
+          } finally { privateFiles.releasePicker(asset.uri) }
+        } catch (cause) {
+          try { if (candidate) privateFiles.release(candidate.uri) }
+          catch (cleanup) { throw new AggregateError([cause, cleanup], '未能选择文件或清理选择副本。') }
+          throw cause
+        }
       })
     },
     async save(bytes, name) {

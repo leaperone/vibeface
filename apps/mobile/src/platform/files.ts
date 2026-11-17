@@ -37,20 +37,16 @@ function releasePicker(uri: string) {
   index.remove(key)
 }
 
-function retain(uri: string) {
-  available()
-  selections.create({ idempotent: true, intermediates: true })
-  const file = new File(selections, crypto.randomUUID())
-  try { new File(uri).copySync(file); return file }
-  catch (cause) { if (file.exists) file.delete(); throw cause }
-}
-
-async function retainAsync(uri: string) {
+async function retain(uri: string): Promise<File> {
   available()
   selections.create({ idempotent: true, intermediates: true })
   const file = new File(selections, crypto.randomUUID())
   try { await new File(uri).copy(file); return file }
-  catch (cause) { if (file.exists) file.delete(); throw cause }
+  catch (cause) {
+    try { if (file.exists) file.delete() }
+    catch (cleanup) { throw new AggregateError([cause, cleanup], '附件复制失败，且未能清理部分副本。') }
+    throw cause
+  }
 }
 
 function release(uri: string) {
@@ -119,4 +115,4 @@ async function erase(clear: () => Promise<void>) {
   } finally { erasing = false }
 }
 
-export const privateFiles = { run, retain, retainAsync, release, releasePicker, recoveryStorage, erase, recovery, transfers }
+export const privateFiles = { run, retain, release, releasePicker, recoveryStorage, erase, recovery, transfers }
