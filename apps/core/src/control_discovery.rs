@@ -33,13 +33,7 @@ enum UnavailableReason {
     InspectionUnavailable,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum NodeStatus {
-    Running,
-    Stopped,
-    Unavailable,
-}
+use vibeface_control::inspection::{Inspection, NodeStatus};
 
 #[derive(Debug, Serialize)]
 struct NodeSummary {
@@ -145,45 +139,21 @@ async fn inspect_candidates(
     Ok(json!({"nodes": nodes, "warnings": warnings}))
 }
 
-fn summarize(sources: Vec<Source>, info: &Value) -> std::result::Result<NodeSummary, &'static str> {
-    let status = match info.get("status").and_then(Value::as_str) {
-        Some("running") => NodeStatus::Running,
-        Some("stopped") => NodeStatus::Stopped,
-        Some("unavailable") => NodeStatus::Unavailable,
-        _ => return Err("candidate_inspection_incomplete"),
-    };
-    let device_id = info
-        .get("device_id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-        .ok_or("candidate_inspection_incomplete")?;
-    let data_dir = info
-        .get("data_dir")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .ok_or("candidate_inspection_incomplete")?;
-    let local_listen = info
-        .get("local_listen")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or("candidate_inspection_incomplete")?;
-    let listen = info
-        .get("listen")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or("candidate_inspection_incomplete")?;
-    let web_enabled = info
-        .get("web_enabled")
-        .and_then(Value::as_bool)
-        .ok_or("candidate_inspection_incomplete")?;
-    let core_version = info
-        .get("core_version")
-        .and_then(Value::as_str)
-        .ok_or("candidate_inspection_incomplete")?
-        .to_owned();
-    let unavailable_reason = (status == NodeStatus::Unavailable).then(|| {
-        match info.get("error").and_then(Value::as_str).unwrap_or("") {
+fn summarize(
+    sources: Vec<Source>,
+    info: &Inspection,
+) -> std::result::Result<NodeSummary, &'static str> {
+    info.validate()
+        .map_err(|_| "candidate_inspection_incomplete")?;
+    let status = info.status;
+    let device_id = &info.device_id;
+    let data_dir = info.data_dir.clone();
+    let local_listen = info.local_listen.to_string();
+    let listen = info.listen.to_string();
+    let web_enabled = info.web_enabled;
+    let core_version = info.core_version.clone();
+    let unavailable_reason =
+        (status == NodeStatus::Unavailable).then(|| match info.error.as_deref().unwrap_or("") {
             error if error.contains("identity does not match") => {
                 UnavailableReason::IdentityMismatch
             }
@@ -191,8 +161,7 @@ fn summarize(sources: Vec<Source>, info: &Value) -> std::result::Result<NodeSumm
                 UnavailableReason::MaintenanceUnavailable
             }
             _ => UnavailableReason::InspectionUnavailable,
-        }
-    });
+        });
     Ok(NodeSummary {
         status,
         device_id: device_id.to_owned(),
@@ -533,11 +502,17 @@ mod tests {
     #[test]
     fn inspect_projection_distinguishes_healthy_stopped_and_identity_mismatch_without_raw_error() {
         let make = |status: &str, error: Value| {
-            json!({
-                "status": status, "device_id":"device-fixture", "data_dir": std::env::temp_dir().join("controlled Node"),
+            Inspection::from_value(json!({
+                "status": status, "device_id":"a".repeat(64), "data_dir": std::env::temp_dir().join("controlled Node"),
                 "local_listen":"127.0.0.1:4791", "listen":"127.0.0.1:4790",
-                "web_enabled":true, "core_version":"0.0.1-fixture", "error":error
-            })
+                "web_enabled":true, "core_version":"0.0.1-fixture",
+                "error": if status == "running" { Value::Null } else if error.is_null() { json!("fixture stopped") } else { error },
+                "maintenance_socket": vibeface_bridge::platform::ipc::Endpoint::in_private_dir(&std::env::temp_dir(), "fixture.sock").unwrap().path(),
+                "public_url":"http://127.0.0.1:4790", "http_enabled":status == "running",
+                "version":(status == "running").then_some("0.0.1-fixture"), "write_state":null,
+                "mesh":{"enabled":false,"network":"vibeface","records":null,"neighbors":null},
+                "peers":(status == "running").then_some(Vec::<String>::new())
+            })).unwrap()
         };
         let running = summarize(vec![Source::Remembered], &make("running", Value::Null)).unwrap();
         let stopped = summarize(vec![Source::UserService], &make("stopped", Value::Null)).unwrap();

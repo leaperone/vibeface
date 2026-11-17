@@ -1,4 +1,7 @@
 //! Core-owned one-shot operations used by the sibling CLI.
+use vibeface_control::inspection::{
+    Inspection, MeshStatus, NodeStatus, PeerPath, PeerStatus, WriteState,
+};
 
 use crate::{
     config::{self, Config, ManagerSettings},
@@ -51,7 +54,9 @@ fn init_mesh(no_mesh: bool, network: Option<String>, bootstrap: Vec<String>) -> 
 pub async fn handle(request: vibeface_control::ControlRequest) -> Result<Value> {
     match request {
         vibeface_control::ControlRequest::Init { options } => initialize_from_options(*options),
-        vibeface_control::ControlRequest::Inspect { data_dir } => inspect(&data_dir).await,
+        vibeface_control::ControlRequest::Inspect { data_dir } => {
+            Ok(serde_json::to_value(inspect(&data_dir).await?)?)
+        }
         vibeface_control::ControlRequest::DiscoverLocalNodes {
             app_profile_dir,
             remembered_data_dirs,
@@ -223,7 +228,7 @@ fn authoritative_core_version(health: Option<&maintenance::Health>) -> &str {
     }
 }
 
-pub async fn inspect(data_dir: &Path) -> Result<Value> {
+pub async fn inspect(data_dir: &Path) -> Result<Inspection> {
     validate_data_dir(data_dir)?;
     let data_dir = fs::canonicalize(data_dir)
         .context("initialized data directory is required; run vibeface init first")?;
@@ -239,34 +244,79 @@ pub async fn inspect(data_dir: &Path) -> Result<Value> {
         Ok(health)
     });
     let status = match &health {
-        Ok(_) => "running",
-        Err(error) if stopped(error) => "stopped",
-        Err(_) => "unavailable",
+        Ok(_) => NodeStatus::Running,
+        Err(error) if stopped(error) => NodeStatus::Stopped,
+        Err(_) => NodeStatus::Unavailable,
     };
     let running_mesh = health.as_ref().ok().and_then(|health| health.mesh.as_ref());
     let error = health.as_ref().err().map(|error| format!("{error:#}"));
-    Ok(json!({
-        "status": status,
-        "device_id": device_id,
-        "data_dir": data_dir,
-        "maintenance_socket": socket,
-        "listen": configuration.listen,
-        "local_listen": configuration.local_listen,
-        "public_url": configuration.public_url,
-        "web_enabled": health.as_ref().map_or(configuration.web_enabled, |health| health.web_enabled),
-        "http_enabled": health.as_ref().is_ok_and(|health| health.http_enabled),
-        "version": health.as_ref().ok().map(|health| &health.version),
-        "write_state": health.as_ref().ok().and_then(|health| health.write_state),
-        "mesh": {
-            "enabled": configuration.network.mesh.enabled,
-            "network": configuration.network.mesh.network,
-            "records": running_mesh.map(|mesh| mesh.records),
-            "neighbors": running_mesh.map(|mesh| mesh.neighbors),
+    let mut inspected = Inspection {
+        status,
+        device_id,
+        data_dir,
+        maintenance_socket: socket,
+        listen: configuration.listen,
+        local_listen: configuration.local_listen,
+        public_url: configuration.public_url,
+        web_enabled: health
+            .as_ref()
+            .map_or(configuration.web_enabled, |health| health.web_enabled),
+        http_enabled: health.as_ref().is_ok_and(|health| health.http_enabled),
+        version: health.as_ref().ok().map(|health| health.version.clone()),
+        write_state: health
+            .as_ref()
+            .ok()
+            .and_then(|health| health.write_state)
+            .map(|state| match state {
+                crate::store::WriteState::Aligning => WriteState::Aligning,
+                crate::store::WriteState::ReadOnly => WriteState::ReadOnly,
+                crate::store::WriteState::Writable => WriteState::Writable,
+                crate::store::WriteState::Forked => WriteState::Forked,
+            }),
+        mesh: MeshStatus {
+            enabled: configuration.network.mesh.enabled,
+            network: configuration.network.mesh.network,
+            records: running_mesh.map(|mesh| mesh.records),
+            neighbors: running_mesh.map(|mesh| mesh.neighbors),
         },
-        "peers": health.as_ref().ok().map(|health| &health.peers),
-        "core_version": authoritative_core_version(health.as_ref().ok()),
-        "error": error,
-    }))
+        peers: health.as_ref().ok().map(|health| {
+            health
+                .peers
+                .iter()
+                .map(|peer| PeerStatus {
+                    device_id: peer.device_id.clone(),
+                    name: peer.name.clone(),
+                    path: peer.path.map(|path| match path {
+                        crate::net::PathKind::Direct => PeerPath::Direct,
+                        crate::net::PathKind::Relay => PeerPath::Relay,
+                    }),
+                    reachable: peer.reachable,
+                    synced_ms: peer.synced_ms,
+                })
+                .collect()
+        }),
+        core_version: authoritative_core_version(health.as_ref().ok()).to_owned(),
+        error,
+    };
+    if let Err(error) = inspected.validate() {
+        // A syntactically healthy IPC reply can still contain invalid contract facts. It does
+        // not prove a stopped Node, and its version/identity must never become authority.
+        if inspected.status != NodeStatus::Running {
+            return Err(error);
+        }
+        inspected.status = NodeStatus::Unavailable;
+        inspected.web_enabled = configuration.web_enabled;
+        inspected.http_enabled = false;
+        inspected.version = None;
+        inspected.write_state = None;
+        inspected.peers = None;
+        inspected.mesh.records = None;
+        inspected.mesh.neighbors = None;
+        inspected.core_version = env!("CARGO_PKG_VERSION").to_owned();
+        inspected.error = Some(format!("invalid maintenance health: {error:#}"));
+        inspected.validate()?;
+    }
+    Ok(inspected)
 }
 
 async fn access(data_dir: &Path) -> Result<Value> {
@@ -362,19 +412,19 @@ async fn access(data_dir: &Path) -> Result<Value> {
         )));
     }
     Ok(
-        json!({"url":url.to_string(),"device_id":device_id,"local":false,"capability":capability,"maintenance_socket":info["maintenance_socket"]}),
+        json!({"url":url.to_string(),"device_id":device_id,"local":false,"capability":capability,"maintenance_socket":info.maintenance_socket}),
     )
 }
 
 async fn local_setup(data_dir: &Path) -> Result<Value> {
     let info = inspect(data_dir).await?;
     ensure!(
-        info["web_enabled"] == true && !Config::load(data_dir)?.forwarding.any,
+        info.web_enabled && !Config::load(data_dir)?.forwarding.any,
         "this Node has no local browser setup"
     );
     let launcher = Launcher::read(data_dir)?;
     ensure!(
-        info["device_id"] == launcher.node_id,
+        info.device_id == launcher.node_id,
         "local launcher does not match this node"
     );
     let result: Value = reqwest::Client::builder()
@@ -397,7 +447,7 @@ async fn local_setup(data_dir: &Path) -> Result<Value> {
         &result["entry"]["device_id"]
     };
     ensure!(
-        device == &info["device_id"],
+        device.as_str() == Some(info.device_id.as_str()),
         "local setup does not match this node"
     );
     Ok(result)
@@ -813,9 +863,9 @@ mod tests {
         Config::local("127.0.0.1:4790".parse()?, vec![dir.clone()], false).save(&dir)?;
         config::private_write(&dir.join("identity.json"), &serde_json::to_vec(&identity)?)?;
         let inspected = inspect(&dir).await?;
-        assert_eq!(inspected["status"], "stopped");
-        assert!(inspected["version"].is_null());
-        assert_eq!(inspected["core_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(inspected.status, NodeStatus::Stopped);
+        assert!(inspected.version.is_none());
+        assert_eq!(inspected.core_version, env!("CARGO_PKG_VERSION"));
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

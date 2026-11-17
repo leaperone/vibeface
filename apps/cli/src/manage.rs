@@ -465,24 +465,15 @@ impl ClientAccess {
             client::Endpoint::Gateway(entry.clone()).validate()?;
             return Ok(entry);
         }
-        let info = crate::control(ControlRequest::Inspect {
-            data_dir: self.data_dir.clone(),
-        })
-        .await;
+        let info = crate::inspect_node(&self.data_dir).await;
         let origin = match (&self.url, &info) {
             (Some(url), _) => url.clone(),
-            (None, Ok(info)) => info["public_url"]
-                .as_str()
-                .context("the local Node has no Gateway URL")?
-                .to_owned(),
+            (None, Ok(info)) => info.public_url.clone(),
             (None, Err(error)) => bail!("no local Node ({error:#}); pass --url"),
         };
         let node_id = match (node, &info) {
             (Some(node), _) => node,
-            (None, Ok(info)) => info["device_id"]
-                .as_str()
-                .context("the local Node has no device ID")?
-                .to_owned(),
+            (None, Ok(info)) => info.device_id.clone(),
             (None, Err(error)) => bail!("no local Node ({error:#})"),
         };
         Ok(Entry { origin, node_id })
@@ -500,14 +491,10 @@ impl ClientAccess {
     }
 
     async fn capability_for(&self, entry: &Entry) -> Result<String> {
-        let info = crate::control(ControlRequest::Inspect {
-            data_dir: self.data_dir.clone(),
-        })
-        .await?;
-        ensure!(
-            info["device_id"].as_str() == Some(entry.node_id.as_str()),
-            "setup capability belongs to the local Node; select it or recover an initialized remote Node"
-        );
+        let info = crate::inspect_node(&self.data_dir).await?;
+        info.require_identity(&vibeface_control::inspection::NodeIdentity {
+            data_dir: std::fs::canonicalize(&self.data_dir)?, device_id: entry.node_id.clone(),
+        }).context("setup capability belongs to the local Node; select it or recover an initialized remote Node")?;
         self.capability()
     }
 }

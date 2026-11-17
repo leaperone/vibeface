@@ -2,7 +2,7 @@
 //! into a temporary sealed-runtime directory. It never calls a provider or system service.
 use std::{
     env, fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     thread,
     time::Duration,
@@ -61,15 +61,29 @@ fn write(path: &Path, bytes: impl AsRef<[u8]>) {
     }
 }
 fn inspect(path: &Path) -> String {
+    let running = path.join("running").exists();
+    let socket = if cfg!(windows) {
+        r"\\.\pipe\vibeface-fixture".to_owned()
+    } else {
+        path.join("fixture.sock").to_string_lossy().into_owned()
+    };
     format!(
-        "{{\"data_dir\":{},\"device_id\":{},\"status\":{},\"local_listen\":\"127.0.0.1:4791\",\"listen\":\"127.0.0.1:4790\",\"web_enabled\":true,\"core_version\":\"2.0.0\",\"error\":null}}",
+        r#"{{"data_dir":{},"device_id":{},"status":{},"local_listen":"127.0.0.1:4791","listen":"127.0.0.1:4790","web_enabled":true,"core_version":"2.0.0","error":{},"maintenance_socket":{},"public_url":"http://127.0.0.1:4790","http_enabled":{running},"version":{},"write_state":null,"mesh":{{"enabled":false,"network":"vibeface","records":null,"neighbors":null}},"peers":{}}}"#,
         string(&path.to_string_lossy()),
         string(&fs::read_to_string(path.join("fixture.identity")).unwrap_or_else(|_| ID.into())),
-        string(if path.join("running").exists() {
-            "running"
+        string(if running { "running" } else { "stopped" }),
+        if running {
+            "null".into()
         } else {
-            "stopped"
-        })
+            string("fixture stopped")
+        },
+        string(&socket),
+        if running {
+            string("2.0.0")
+        } else {
+            "null".into()
+        },
+        if running { "[]" } else { "null" },
     )
 }
 fn status(profile: &Path) -> String {
@@ -106,11 +120,11 @@ fn status(profile: &Path) -> String {
     );
     if !installed {
         return format!(
-            "{{\"ok\":true,\"state\":\"not_installed\",\"device_id\":null,\"data_dir\":null,\"service_id\":null,\"managed_root\":null,\"service_running\":null,\"core_status\":null,\"runtime_update\":{update}}}"
+            "{{\"state\":\"not_installed\",\"device_id\":null,\"data_dir\":null,\"service_id\":null,\"managed_root\":null,\"service_running\":null,\"core_status\":null,\"runtime_update\":{update}}}"
         );
     }
     format!(
-        "{{\"ok\":true,\"state\":{},\"device_id\":{},\"data_dir\":{},\"service_id\":\"fixture.service\",\"managed_root\":{},\"service_running\":{running},\"core_status\":{},\"runtime_update\":{update}}}",
+        "{{\"state\":{},\"device_id\":{},\"data_dir\":{},\"service_id\":\"fixture.service\",\"managed_root\":{},\"service_running\":{running},\"core_status\":{},\"runtime_update\":{update}}}",
         string(if running {
             "installed"
         } else {
@@ -159,6 +173,19 @@ fn main() {
     } else if args.first().is_some_and(|arg| arg == "desktop-node") {
         let profile = option(&args, "--profile-dir").unwrap();
         let action = args.last().unwrap().as_str();
+        let mut calls = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(profile.join("fixture.calls"))
+            .unwrap();
+        writeln!(calls, "{}", args.join("\t")).unwrap();
+        if action == "status" && profile.join("fixture.status").exists() {
+            println!(
+                "{}",
+                fs::read_to_string(profile.join("fixture.status")).unwrap()
+            );
+            return;
+        }
         if profile.join("fixture.overflow").exists() {
             println!("{}", "x".repeat(65537));
             return;
@@ -185,6 +212,30 @@ fn main() {
                 let _ = fs::remove_file(profile.join("node/running"));
             }
             _ => panic!("unexpected CLI action"),
+        }
+        if action == "update" && profile.join("fixture.timeout-after-mutation").exists() {
+            // Publish the PID only after the real mutation above has committed. Keep both
+            // output pipes open so the production deadline, kill and wait paths must run.
+            let pending = profile.join("fixture.mutation-written.pending");
+            write(&pending, std::process::id().to_string());
+            fs::rename(&pending, profile.join("fixture.mutation-written")).unwrap();
+            loop {
+                thread::park();
+            }
+        }
+        if action != "status" && profile.join("fixture.nonzero-mutation").exists() {
+            std::process::exit(1);
+        }
+        if action != "status" && profile.join("fixture.mutation-status").exists() {
+            println!(
+                "{}",
+                fs::read_to_string(profile.join("fixture.mutation-status")).unwrap()
+            );
+            return;
+        }
+        if action != "status" && profile.join("fixture.bad-mutation").exists() {
+            println!("{{broken");
+            return;
         }
         println!("{}", status(&profile));
     } else {

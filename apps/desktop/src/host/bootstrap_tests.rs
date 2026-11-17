@@ -98,10 +98,11 @@ struct Fixture {
 impl Fixture {
     fn new() -> Result<Self> {
         let root = std::env::temp_dir().join(format!("vf-bootstrap-{}", uuid::Uuid::new_v4()));
+        privatefs::create_dir(&root)?;
+        let root = std::fs::canonicalize(root)?;
         let profile = root.join("profile");
         let runtime = root.join("runtime");
         let node = identity(&profile.join("node"));
-        privatefs::create_dir(&root)?;
         privatefs::create_dir(&profile)?;
         privatefs::create_dir(&runtime)?;
         privatefs::create_dir(&node.data_dir)?;
@@ -153,7 +154,14 @@ impl Fixture {
                     "listen": "127.0.0.1:4790",
                     "web_enabled": true,
                     "core_version": "0.0.1",
-                    "error": null
+                    "maintenance_socket": vibeface_bridge::platform::ipc::Endpoint::in_private_dir(&self.profile, "fixture.sock")?.path(),
+                    "public_url": "http://127.0.0.1:4790",
+                    "http_enabled": status == "running",
+                    "version": (status == "running").then_some("0.0.1"),
+                    "write_state": null,
+                    "mesh": {"enabled":false,"network":"vibeface","records":null,"neighbors":null},
+                    "peers": (status == "running").then_some(Vec::<String>::new()),
+                    "error": (status != "running").then_some("fixture stopped")
                 }
             }))?,
         )

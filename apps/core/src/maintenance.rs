@@ -733,7 +733,10 @@ mod tests {
         let permissions = privatefs::is_private(&dir)?;
 
         let inspected = crate::control::inspect(&dir).await?;
-        assert_eq!(inspected["status"], "stopped");
+        assert_eq!(
+            inspected.status,
+            vibeface_control::inspection::NodeStatus::Stopped
+        );
         assert!(
             !runtime_dir.exists(),
             "read-only inspection must not create the endpoint directory"

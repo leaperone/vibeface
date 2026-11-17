@@ -118,10 +118,12 @@ impl Fixture {
     async fn new() -> Result<Self> {
         let key = uuid::Uuid::new_v4().simple().to_string();
         let root = std::env::temp_dir().join(format!("vfo-{}", &key[..12]));
+        privatefs::create_dir(&root)?;
+        let root = std::fs::canonicalize(root)?;
         let profile = root.join("profile");
         let runtime = root.join("runtime");
         let node = profile.join("node");
-        for path in [&root, &profile, &runtime, &node] {
+        for path in [&profile, &runtime, &node] {
             privatefs::create_dir(path)?;
         }
         let identity = NodeIdentity {
@@ -287,7 +289,12 @@ impl Fixture {
                 "result": {
                     "data_dir":data_dir, "device_id":device_id, "status":status,
                     "local_listen":"127.0.0.1:4791", "listen":"127.0.0.1:4790", "web_enabled":true,
-                    "core_version":"0.0.1", "maintenance_socket":self.socket, "error":null
+                    "core_version":"0.0.1", "maintenance_socket":self.socket,
+                    "public_url":"http://127.0.0.1:4790", "http_enabled":status == "running",
+                    "version":(status == "running").then_some("0.0.1"), "write_state":null,
+                    "mesh":{"enabled":false,"network":"vibeface","records":null,"neighbors":null},
+                    "peers":(status == "running").then_some(Vec::<String>::new()),
+                    "error":(status != "running").then_some("fixture stopped")
                 }
             }))?,
         )
