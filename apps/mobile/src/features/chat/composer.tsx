@@ -16,7 +16,7 @@ type Props = {
   value: string
   onChange: (value: string) => void
   files: Attachment[]
-  onFiles: (files: Attachment[]) => void
+  onFiles: (files: Attachment[]) => void | Promise<void>
   attachmentScope: string
   /** Why sending is off, in place of the placeholder, or under the box while it holds a draft; null when it is allowed. */
   blocked: string | null
@@ -60,16 +60,16 @@ export function Composer({ value, onChange, files, onFiles, attachmentScope, blo
             if (!current() || !fileCurrent()) return
             for (const asset of picked.assets) {
               const file = new File(asset.uri)
-              added.push({ uri: privateFiles.retain(asset.uri).uri, name: asset.fileName || file.name, size: asset.fileSize ?? file.size, mimeType: asset.mimeType || file.type || null })
+              added.push({ uri: (await privateFiles.retain(asset.uri)).uri, name: asset.fileName || file.name, size: asset.fileSize ?? file.size, mimeType: asset.mimeType || file.type || null })
             }
           } else {
             const picked = await DocumentPicker.getDocumentAsync({ multiple: true, copyToCacheDirectory: true })
             if (picked.canceled) return
             sources.push(...picked.assets.map(asset => asset.uri))
             if (!current() || !fileCurrent()) return
-            for (const asset of picked.assets) added.push({ uri: privateFiles.retain(asset.uri).uri, name: asset.name, size: asset.size ?? null, mimeType: asset.mimeType ?? null })
+            for (const asset of picked.assets) added.push({ uri: (await privateFiles.retain(asset.uri)).uri, name: asset.name, size: asset.size ?? null, mimeType: asset.mimeType ?? null })
           }
-          if (current()) latest.current.onFiles([...latest.current.files, ...added])
+          if (current()) await latest.current.onFiles([...latest.current.files, ...added])
           else for (const file of added) privateFiles.release(file.uri)
         } catch (cause) { for (const file of added) privateFiles.release(file.uri); throw cause }
         finally { for (const uri of sources) privateFiles.releasePicker(uri) }
@@ -108,7 +108,7 @@ export function Composer({ value, onChange, files, onFiles, attachmentScope, blo
   const attachments = files.length ? <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerClassName="gap-2 px-2 pt-2">
     {files.map((file, index) => <View key={`${file.uri}:${index}`} className="max-w-60 flex-row items-center gap-2 rounded-control bg-surface-muted ps-3">
       <Icon as={Paperclip} className="text-secondary" /><Text numberOfLines={1} className="shrink text-sm">{file.name}</Text>
-      <Button variant="ghost" iconOnly accessibilityLabel={`移除 ${file.name}`} onPress={() => { try { privateFiles.release(file.uri); onFiles(files.filter((_, at) => at !== index)) } catch (cause) { Alert.alert('未能移除附件', cause instanceof Error ? cause.message : '请重试。') } }}><Icon as={X} /></Button>
+      <Button variant="ghost" iconOnly accessibilityLabel={`移除 ${file.name}`} disabled={!enabled} onPress={() => { void (async () => { try { await onFiles(files.filter((_, at) => at !== index)); privateFiles.release(file.uri) } catch (cause) { Alert.alert('未能移除附件', cause instanceof Error ? cause.message : '请重试。') } })() }}><Icon as={X} /></Button>
     </View>)}
   </ScrollView> : undefined
   return <View className="gap-2 bg-background px-4 pb-3">
