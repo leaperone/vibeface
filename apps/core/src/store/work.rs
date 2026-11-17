@@ -20,65 +20,103 @@ const REMOVED: &str = "设备已移除，结果无法确认。";
 
 const RUN_COLUMNS: &str = "work_id,conversation_id,kind,state,thread_id,turn_id,codex_epoch,outcome,evidence,probe,result_text,send_by_ms,progress,progress_at_ms";
 
-type RunRow = (
-    String,
-    String,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<u64>,
-    Option<String>,
-    Option<String>,
-    Option<bool>,
-    String,
-    i64,
-    String,
-    i64,
-);
+struct DbRunRow {
+    work_id: String,
+    conversation_id: String,
+    kind: String,
+    state: String,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    codex_epoch: Option<u64>,
+    outcome: Option<String>,
+    evidence: Option<String>,
+    probe: Option<bool>,
+    result_text: String,
+    send_by_ms: i64,
+    progress: String,
+    progress_at_ms: i64,
+}
 
-fn record_from(row: RunRow) -> Result<WorkRecord> {
-    let (work_id, conversation, kind, state, thread, turn, epoch, outcome, evidence, probe) = (
-        row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9,
-    );
-    let handle = match (thread.clone(), turn, epoch) {
-        (Some(thread_id), Some(turn_id), Some(epoch)) => Some(Handle {
-            thread_id,
-            turn_id,
-            epoch,
-        }),
-        _ => None,
-    };
-    let state = match state.as_str() {
-        "accepted" => WorkState::Accepted,
-        "starting" => WorkState::Starting { thread },
-        "running" => WorkState::Running {
-            handle: handle.context("work run handle missing")?,
-        },
-        "interrupting" => WorkState::Interrupting {
-            handle: handle.context("work run handle missing")?,
-        },
-        "finished" => WorkState::Finished {
-            outcome: enum_from(&outcome.context("work run outcome missing")?)?,
-        },
-        "unverified" => WorkState::Unverified {
-            thread: thread.filter(|_| handle.is_none()),
-            handle,
-            evidence: evidence.unwrap_or_default(),
-            probe: probe.unwrap_or(false),
-        },
-        other => bail!("unknown work run state {other}"),
-    };
-    Ok(WorkRecord {
-        work_id,
-        conversation,
-        kind: enum_from(&kind)?,
-        state,
-        text: row.10,
-        send_by_ms: row.11,
-        progress: row.12,
-        progress_at_ms: row.13,
-    })
+impl DbRunRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            work_id: row.get("work_id")?,
+            conversation_id: row.get("conversation_id")?,
+            kind: row.get("kind")?,
+            state: row.get("state")?,
+            thread_id: row.get("thread_id")?,
+            turn_id: row.get("turn_id")?,
+            codex_epoch: row.get("codex_epoch")?,
+            outcome: row.get("outcome")?,
+            evidence: row.get("evidence")?,
+            probe: row.get("probe")?,
+            result_text: row.get("result_text")?,
+            send_by_ms: row.get("send_by_ms")?,
+            progress: row.get("progress")?,
+            progress_at_ms: row.get("progress_at_ms")?,
+        })
+    }
+}
+
+impl TryFrom<DbRunRow> for WorkRecord {
+    type Error = anyhow::Error;
+
+    fn try_from(row: DbRunRow) -> Result<Self> {
+        let DbRunRow {
+            work_id,
+            conversation_id: conversation,
+            kind,
+            state,
+            thread_id: thread,
+            turn_id: turn,
+            codex_epoch: epoch,
+            outcome,
+            evidence,
+            probe,
+            result_text: text,
+            send_by_ms,
+            progress,
+            progress_at_ms,
+        } = row;
+        let handle = match (thread.clone(), turn, epoch) {
+            (Some(thread_id), Some(turn_id), Some(epoch)) => Some(Handle {
+                thread_id,
+                turn_id,
+                epoch,
+            }),
+            _ => None,
+        };
+        let state = match state.as_str() {
+            "accepted" => WorkState::Accepted,
+            "starting" => WorkState::Starting { thread },
+            "running" => WorkState::Running {
+                handle: handle.context("work run handle missing")?,
+            },
+            "interrupting" => WorkState::Interrupting {
+                handle: handle.context("work run handle missing")?,
+            },
+            "finished" => WorkState::Finished {
+                outcome: enum_from(&outcome.context("work run outcome missing")?)?,
+            },
+            "unverified" => WorkState::Unverified {
+                thread: thread.filter(|_| handle.is_none()),
+                handle,
+                evidence: evidence.unwrap_or_default(),
+                probe: probe.unwrap_or(false),
+            },
+            other => bail!("unknown work run state {other}"),
+        };
+        Ok(WorkRecord {
+            work_id,
+            conversation,
+            kind: enum_from(&kind)?,
+            state,
+            text,
+            send_by_ms,
+            progress,
+            progress_at_ms,
+        })
+    }
 }
 
 fn query_runs(
@@ -100,28 +138,9 @@ fn query_runs_sql(
 ) -> Result<Vec<WorkRecord>> {
     let mut statement = connection.prepare(sql)?;
     let rows = statement
-        .query_map(params, run_row)?
-        .collect::<rusqlite::Result<Vec<RunRow>>>()?;
-    rows.into_iter().map(record_from).collect()
-}
-
-fn run_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
-    Ok((
-        r.get(0)?,
-        r.get(1)?,
-        r.get(2)?,
-        r.get(3)?,
-        r.get(4)?,
-        r.get(5)?,
-        r.get(6)?,
-        r.get(7)?,
-        r.get(8)?,
-        r.get(9)?,
-        r.get(10)?,
-        r.get(11)?,
-        r.get(12)?,
-        r.get(13)?,
-    ))
+        .query_map(params, DbRunRow::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(WorkRecord::try_from).collect()
 }
 
 fn load_run(connection: &Connection, work_id: &str) -> Result<Option<WorkRecord>> {
@@ -607,7 +626,7 @@ fn settle_local_from(connection: &Connection, network: &str) -> Result<()> {
         .map(|column| format!("r.{column}"))
         .collect::<Vec<_>>()
         .join(",");
-    let sql = format!("SELECT {columns},json_extract(w.finish,'$.outcome') FROM work_runs r CROSS JOIN works w
+    let sql = format!("SELECT {columns},json_extract(w.finish,'$.outcome') AS settled_outcome FROM work_runs r CROSS JOIN works w
         WHERE w.network_id=?1 AND w.work_id=r.work_id AND r.state IN ('unverified','accepted','starting')
             AND w.dispatch IS NOT NULL AND w.finish IS NOT NULL
             AND json_extract(w.finish,'$.outcome')<>?2 ORDER BY r.work_id");
@@ -615,11 +634,16 @@ fn settle_local_from(connection: &Connection, network: &str) -> Result<()> {
         .prepare(&sql)?
         .query_map(
             params![network, enum_text(&WorkOutcome::Unverified)],
-            |row| Ok((run_row(row)?, row.get::<_, String>(14)?)),
+            |row| {
+                Ok((
+                    DbRunRow::from_row(row)?,
+                    row.get::<_, String>("settled_outcome")?,
+                ))
+            },
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (row, outcome) in rows {
-        let mut record = record_from(row)?;
+        let mut record = WorkRecord::try_from(row)?;
         transition(&mut record, Signal::Settled(enum_from(&outcome)?));
         save_run(connection, &record)?;
     }
@@ -922,4 +946,187 @@ fn query_stops(
             })
         })?
         .collect::<rusqlite::Result<_>>()?)
+}
+
+#[cfg(test)]
+mod db_row_codec_tests {
+    use super::*;
+
+    fn record(state: WorkState) -> WorkRecord {
+        WorkRecord {
+            work_id: "work".into(),
+            conversation: "conversation".into(),
+            kind: WorkKind::Agent(crate::providers::Provider::Codex),
+            state,
+            text: "final answer".into(),
+            send_by_ms: 123,
+            progress: "latest progress".into(),
+            progress_at_ms: 97,
+        }
+    }
+
+    #[test]
+    fn run_states_reopen_and_decode_reordered_columns() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("vibeface-run-codec-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let path = dir.join("node.sqlite3");
+        let store = Store::open(&path)?;
+        let handle = Handle {
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            epoch: 41,
+        };
+        let states = [
+            WorkState::Accepted,
+            WorkState::Starting { thread: None },
+            WorkState::Starting {
+                thread: Some("starting-thread".into()),
+            },
+            WorkState::Running {
+                handle: handle.clone(),
+            },
+            WorkState::Interrupting {
+                handle: handle.clone(),
+            },
+            WorkState::Finished {
+                outcome: WorkOutcome::Completed,
+            },
+            WorkState::Finished {
+                outcome: WorkOutcome::Failed,
+            },
+            WorkState::Finished {
+                outcome: WorkOutcome::Interrupted,
+            },
+            WorkState::Finished {
+                outcome: WorkOutcome::Rejected,
+            },
+            WorkState::Finished {
+                outcome: WorkOutcome::Unverified,
+            },
+            WorkState::Unverified {
+                handle: Some(handle),
+                thread: None,
+                evidence: "unknown".into(),
+                probe: true,
+            },
+            WorkState::Unverified {
+                handle: None,
+                thread: Some("late-thread".into()),
+                evidence: "late start".into(),
+                probe: false,
+            },
+            WorkState::Unverified {
+                handle: None,
+                thread: None,
+                evidence: String::new(),
+                probe: false,
+            },
+        ];
+        let mut expected = Vec::new();
+        for (index, state) in states.into_iter().enumerate() {
+            let mut value = record(state);
+            value.work_id = format!("work-{index:02}");
+            if index % 2 == 0 {
+                value.kind = WorkKind::Task;
+            }
+            save_run(&store.connection, &value)?;
+            expected.push(value);
+        }
+        assert_eq!(query_runs(&store.connection, "1", [])?, expected);
+        drop(store);
+        let store = Store::open(&path)?;
+        assert_eq!(query_runs(&store.connection, "1", [])?, expected);
+        assert_eq!(
+            query_runs_sql(
+                &store.connection,
+                "SELECT progress_at_ms,progress,send_by_ms,result_text,probe,evidence,outcome,codex_epoch,turn_id,thread_id,state,kind,conversation_id,work_id FROM work_runs ORDER BY work_id",
+                []
+            )?,
+            expected
+        );
+        drop(store);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn run_codec_preserves_required_handle_and_enum_rejections_and_null_defaults() -> Result<()> {
+        let store = Store::open(":memory:")?;
+        let handle = Handle {
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            epoch: 41,
+        };
+        for state in [
+            WorkState::Running {
+                handle: handle.clone(),
+            },
+            WorkState::Interrupting { handle },
+        ] {
+            for column in ["thread_id", "turn_id", "codex_epoch"] {
+                save_run(&store.connection, &record(state.clone()))?;
+                store
+                    .connection
+                    .execute(&format!("UPDATE work_runs SET {column}=NULL"), [])?;
+                let error = query_runs(&store.connection, "1", []).unwrap_err();
+                assert!(
+                    error.to_string().contains("work run handle missing"),
+                    "{state:?}/{column}: {error}"
+                );
+            }
+        }
+        for (column, value) in [
+            ("state", "unknown"),
+            ("kind", "{"),
+            ("outcome", "\"unknown\""),
+        ] {
+            save_run(
+                &store.connection,
+                &record(WorkState::Finished {
+                    outcome: WorkOutcome::Completed,
+                }),
+            )?;
+            store
+                .connection
+                .execute(&format!("UPDATE work_runs SET {column}=?"), [value])?;
+            assert!(query_runs(&store.connection, "1", []).is_err(), "{column}");
+        }
+        save_run(
+            &store.connection,
+            &record(WorkState::Finished {
+                outcome: WorkOutcome::Completed,
+            }),
+        )?;
+        store
+            .connection
+            .execute("UPDATE work_runs SET outcome=NULL", [])?;
+        assert!(query_runs(&store.connection, "1", []).is_err());
+        let expected = record(WorkState::Unverified {
+            handle: None,
+            thread: Some("late-thread".into()),
+            evidence: String::new(),
+            probe: false,
+        });
+        save_run(&store.connection, &expected)?;
+        store
+            .connection
+            .execute("UPDATE work_runs SET evidence=NULL,probe=NULL", [])?;
+        assert_eq!(load_run(&store.connection, "work")?, Some(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn settled_run_uses_joined_outcome_instead_of_local_outcome() -> Result<()> {
+        let store = Store::open(":memory:")?;
+        save_run(&store.connection, &record(WorkState::Accepted))?;
+        store.connection.execute(r#"INSERT INTO works(network_id,work_id,conversation_id,dispatch,finish) VALUES('network','work','conversation','{}','{"outcome":"completed"}')"#, [])?;
+        settle_local_from(&store.connection, "network")?;
+        assert_eq!(
+            load_run(&store.connection, "work")?,
+            Some(record(WorkState::Finished {
+                outcome: WorkOutcome::Completed
+            }))
+        );
+        Ok(())
+    }
 }
