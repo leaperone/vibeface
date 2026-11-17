@@ -1152,9 +1152,10 @@ test("workspace preserves bot and message requests while routing native decision
       assert.equal(render().pendingMessages.length, 0)
     })
 
-    await t.test('a locally created channel task receives follow-ups before its create command is acknowledged', async () => {
+    await t.test('a locally created channel task receives follow-ups before its create command is acknowledged', { timeout: 10_000 }, async () => {
       const current = activeConnection, originalRpc = current.rpc
-      const creating = deferred()
+      const originalAll = platform.outbox.all, checking = deferred(), continueCheck = deferred()
+      const creating = deferred(), creationStarted = deferred()
       const commands: Record<string, unknown>[] = []
       const saved: PendingMessage[] = []
       const before = messages.length
@@ -1169,7 +1170,7 @@ test("workspace preserves bot and message requests while routing native decision
           assert.ok(command.kind === 'create_task')
           assert.ok(command.expected_result.trim(), 'Node valid_text rejects an empty expected result')
           assert.ok(new TextEncoder().encode(command.expected_result).length <= 16384)
-          commands.push(JSON.parse(JSON.stringify(body))); return creating.promise
+          commands.push(JSON.parse(JSON.stringify(body))); creationStarted.resolve(null); return creating.promise
         }
         if (method === 'workspace_history') return {
           history_authority: 'authority', next_cursor: null, complete: true, events: messages.slice(before).map((message, index) => ({ event_hash: String(message.message_id), created_at_ms: index + 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }, body: { ...message, type: 'input_posted' } })),
@@ -1185,12 +1186,22 @@ test("workspace preserves bot and message requests while routing native decision
         assert.ok(first.target.kind === 'channel_task')
         assert.equal(first.expected_revision, 1)
         assert.equal(first.conversation_id, 'chat')
+        await creationStarted.promise
         const target = first.target
         const plainTarget = JSON.parse(JSON.stringify(target))
-        assert.deepEqual(await Promise.all([
-          render().sendMessage('channel two', [], undefined, { target }),
-          render().sendMessage('channel three', [], undefined, { target, expected_revision: first.expected_revision, conversation_id: first.conversation_id }),
-        ]), [true, true])
+        let holdNextCheck = true
+        platform.outbox.all = async () => {
+          const hold = holdNextCheck
+          holdNextCheck = false
+          if (hold) { checking.resolve(null); await continueCheck.promise }
+          return originalAll()
+        }
+        const second = render().sendMessage('channel two', [], undefined, { target })
+        await checking.promise
+        const third = render().sendMessage('channel three', [], undefined, { target, expected_revision: first.expected_revision, conversation_id: first.conversation_id })
+        await drainOutbox()
+        continueCheck.resolve(null)
+        assert.deepEqual(await Promise.all([second, third]), [true, true])
         await drainOutbox()
         assert.equal(commands.length, 1, 'only the original creation is submitted while its acknowledgement is held')
         assert.equal(messages.length, before, 'input delivery waits behind its real task creation')
@@ -1206,7 +1217,7 @@ test("workspace preserves bot and message requests while routing native decision
         assert.deepEqual(messages.slice(before).map((message) => message.target), [plainTarget, plainTarget, plainTarget])
         await render().readWorkspaceHistory({ task_id: target.task_id })
         assert.equal(render().pendingMessages.length, 0)
-      } finally { current.rpc = originalRpc }
+      } finally { continueCheck.resolve(null); platform.outbox.all = originalAll; current.rpc = originalRpc }
     })
 
     await t.test('Main and Work NewTask, explicit or from the prompt, use a real valid expected result and preserve Work sources', async () => {

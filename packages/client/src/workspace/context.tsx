@@ -1190,8 +1190,11 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   flushMessagesRef.current = flushMessages
   const canSaveMessages = !ledgerFailed && joined && booted && loadedMessageConnection.current === connection && renderedConnection.current === connection && writeState.state === 'writable' && bots.length > 0
   const sendMessage = async (text: string, files: AttachmentFile[] = [], sent: Attachment[] = [], options?: InputOptions) => {
-    await outbox.all(); ledgerGuard()
-    if (!canSaveMessages || !alive.current) throw new Error(writeState.state === 'writable' ? '先读取已授权的工作区，再保存输入。' : writeNotices[writeState.state])
+    ledgerGuard()
+    if (!canSaveMessages || !alive.current) {
+      await outbox.all(); ledgerGuard()
+      throw new Error(writeState.state === 'writable' ? '先读取已授权的工作区，再保存输入。' : writeNotices[writeState.state])
+    }
     const selected = bots.find((bot) => bot.conversation_id === activeId.current)
     let target: InputTarget = options?.target ?? (selected ? { kind: 'bot_main', bot_id: selected.bot_id } : (() => { throw new Error('还没选 Bot。先选一个。') })())
     const id = targetConversation(target, options?.conversation_id)
@@ -1219,6 +1222,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const previous = saves.get(lane) ?? Promise.resolve()
     localMessageSaves.current += 1; setMessageBusy(true)
     const save = inputLock(outboxKey('input-save', lane), () => previous.catch(() => {}).then(async () => {
+      await outbox.all(); ledgerGuard()
       const uploads = await Promise.all(files.map(prepareAttachment))
       ledgerGuard()
       if (renderedConnection.current !== connection || !alive.current) throw new Error('工作区已切换，输入仍留在编辑器。')
