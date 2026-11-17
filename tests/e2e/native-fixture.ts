@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { insideTaskArtifacts } from '../support/artifact-paths';
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
@@ -28,8 +29,7 @@ export async function nativeFixture(kind: 'delivery' | 'workspace', artifacts: s
   }
   const invitation = process.env.VIBEFACE_E2E_NATIVE_INVITATION_FILE ?? resolve(artifacts, 'invitation.txt');
   const invitationRoot = kind === 'delivery' ? resolve(root, '.artifacts/native') : artifacts;
-  const inside = relative(invitationRoot, resolve(invitation));
-  assert(inside && !inside.startsWith('..') && !inside.startsWith('/'), 'Only this task can receive an invitation');
+  assert(insideTaskArtifacts(invitationRoot, resolve(invitation), { allowRoot: false }), 'Only this task can receive an invitation');
   await unlink(invitation).catch(error => { if (error.code !== 'ENOENT') throw error; });
   const listener = createServer();
   await new Promise<void>((done, fail) => { listener.once('error', fail); listener.listen(0, '127.0.0.1', done); });
