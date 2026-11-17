@@ -1,4 +1,6 @@
-use crate::terminal::{NodeStatus, RunState, age, safe_text, shorten, use_emphasis};
+use crate::terminal::{
+    Label, NodeStatus, PeerDisplay, RunState, age, safe_text, shorten, use_emphasis,
+};
 use anyhow::{Context, Result, ensure};
 use crossterm::{
     cursor::{Hide, Show},
@@ -25,7 +27,6 @@ use std::{
     time::{Duration, Instant},
 };
 use vibeface_bridge::platform::stop::{self, Stops};
-use vibeface_control::ControlRequest;
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 const RAW: u8 = 1;
@@ -271,8 +272,9 @@ enum Input {
 }
 
 async fn inspect(core: PathBuf, data_dir: PathBuf) -> Result<NodeStatus> {
-    let value = vibeface_control::request(&core, &ControlRequest::Inspect { data_dir }).await?;
-    NodeStatus::parse(value)
+    Ok(vibeface_control::inspection::inspect(&core, &data_dir)
+        .await?
+        .into())
 }
 
 pub async fn run(data_dir: PathBuf) -> Result<()> {
@@ -736,14 +738,17 @@ mod tests {
     }
 
     fn node() -> NodeStatus {
-        NodeStatus::parse(json!({
-            "status":"running", "device_id":"local-device-id", "data_dir":test_data_dir(), "listen":"127.0.0.1:4790",
+        vibeface_control::inspection::Inspection::from_value(json!({
+            "status":"running", "device_id":"a".repeat(64), "data_dir":test_data_dir(), "listen":"127.0.0.1:4790",
             "web_enabled":true, "core_version":"0.0.1", "write_state":"writable",
+            "maintenance_socket":vibeface_bridge::platform::ipc::Endpoint::in_private_dir(&std::env::temp_dir(), "fixture.sock").unwrap().path(),
+            "local_listen":"127.0.0.1:4791","public_url":"http://127.0.0.1:4790","http_enabled":true,
+            "version":"0.0.1","error":null,"mesh":{"enabled":false,"network":"vibeface","records":null,"neighbors":null},
             "peers":[
-                {"device_id":"peer-a", "name":"设备 e\u{301} 👩‍💻 \u{1b}]52;c;secret\u{7}\u{202e}extra long name", "path":"direct", "reachable":true, "synced_ms":1},
-                {"device_id":"peer-b", "name":"Build", "path":null, "reachable":null, "synced_ms":null}
+                {"device_id":"b".repeat(64), "name":"设备 e\u{301} 👩‍💻 \u{1b}]52;c;secret\u{7}\u{202e}extra long name", "path":"direct", "reachable":true, "synced_ms":1},
+                {"device_id":"c".repeat(64), "name":"Build", "path":null, "reachable":null, "synced_ms":null}
             ]
-        })).unwrap()
+        })).unwrap().into()
     }
 
     fn render(app: &mut App, width: u16, height: u16) -> String {
@@ -816,10 +821,10 @@ mod tests {
                 app.help = false;
             }
         }
-        app.selected_device = Some("peer-a".into());
+        app.selected_device = Some("b".repeat(64));
         app.view = View::Details;
         let output = render(&mut app, 45, 24);
-        assert!(output.contains("peer-a"));
+        assert!(output.contains("bbbbbbbb"));
         assert!(output.contains("\\u{1b}"));
         app.detail_scroll = u16::MAX;
         assert!(render(&mut app, 45, 24).contains("Last sync"));
@@ -838,11 +843,17 @@ mod tests {
         assert!(unavailable.contains("r retry"));
         app.finish_reading(Ok(node()));
         app.select(2);
-        assert_eq!(app.selected_device.as_deref(), Some("peer-b"));
+        assert_eq!(
+            app.selected_device.as_deref(),
+            Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+        );
         let mut reordered = node();
         reordered.peers.as_mut().unwrap().reverse();
         app.finish_reading(Ok(reordered));
-        assert_eq!(app.selected_device.as_deref(), Some("peer-b"));
+        assert_eq!(
+            app.selected_device.as_deref(),
+            Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+        );
         assert_eq!(app.selected_index(), 1);
         app.finish_reading(Err(anyhow::anyhow!("read failed\u{1b}[2J")));
         assert!(app.reading.snapshot().is_some());
@@ -852,7 +863,7 @@ mod tests {
         assert!(output.contains("Refresh failed"));
         assert!(output.contains("Last successful update"));
         assert!(output.contains("STALE"));
-        app.selected_device = Some("local-device-id".into());
+        app.selected_device = Some("a".repeat(64));
         app.view = View::Details;
         assert!(render(&mut app, 100, 28).contains("Last known status"));
         assert!(!output.contains('\u{1b}'));

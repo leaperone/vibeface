@@ -1,12 +1,11 @@
 use crate::update;
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Subcommand};
-use serde::Deserialize;
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use update::release::{PROGRAMS, SERVICE_SCRIPT};
-use vibeface_control::{self, ControlRequest};
+use vibeface_control::inspection::Inspection;
 
 #[derive(Args)]
 pub struct Service {
@@ -53,13 +52,6 @@ impl Action {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct InspectResult {
-    data_dir: PathBuf,
-    device_id: String,
-    maintenance_socket: PathBuf,
-}
-
 fn absolute_path(value: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(value);
     if path.is_absolute() {
@@ -84,29 +76,8 @@ fn core_binary() -> Result<PathBuf> {
     vibeface_control::sibling_core(&std::env::current_exe()?)
 }
 
-async fn inspect(data: &Path) -> Result<InspectResult> {
-    let value = vibeface_control::request(
-        &core_binary()?,
-        &ControlRequest::Inspect {
-            data_dir: data.to_owned(),
-        },
-    )
-    .await?;
-    let result: InspectResult =
-        serde_json::from_value(value).context("invalid core inspect response")?;
-    ensure!(
-        result.data_dir == data,
-        "core inspected a different data directory"
-    );
-    ensure!(
-        !result.device_id.is_empty(),
-        "core inspect returned no device identity"
-    );
-    ensure!(
-        !result.maintenance_socket.as_os_str().is_empty(),
-        "core inspect returned no maintenance socket"
-    );
-    Ok(result)
+async fn inspect(data: &Path) -> Result<Inspection> {
+    vibeface_control::inspection::inspect(&core_binary()?, data).await
 }
 
 fn command(root: &Path, data: &Path, executable: &Path, action: Action) -> Result<Command> {

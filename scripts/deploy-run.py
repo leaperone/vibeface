@@ -122,7 +122,20 @@ def core_smoke(identity, info, output):
         result = json.loads(docker('run', '--rm', '-i', *base, '--user', '1001:1001', '--entrypoint',
                                   '/opt/vibeface/vibeface-core', identity, '--control',
                                   input='{"command":"inspect","data_dir":"/data"}'))
-        device = result['result']['device_id']
+        release.require(isinstance(result, dict) and result.get('ok') is True
+                        and isinstance(result.get('result'), dict),
+                        'isolated Core inspection failed')
+        inspected = result['result']
+        release.require(set(inspected) == {'status', 'device_id', 'data_dir', 'maintenance_socket',
+                        'listen', 'local_listen', 'public_url', 'web_enabled', 'http_enabled',
+                        'version', 'write_state', 'mesh', 'peers', 'core_version', 'error'}
+                        and inspected['data_dir'] == '/data'
+                        and inspected['status'] == 'stopped'
+                        and isinstance(inspected['device_id'], str)
+                        and len(inspected['device_id']) == 64
+                        and all(char in '0123456789abcdef' for char in inspected['device_id']),
+                        'isolated Core inspection did not identify the stopped fixture')
+        device = inspected['device_id']
         environment = ['-e', 'VIBEFACE_ROLE=node', '-e', 'VIBEFACE_LISTEN=127.0.0.1:4793',
                        '-e', 'VIBEFACE_EXPECTED_VERSION=' + info['version'],
                        '-e', 'VIBEFACE_EXPECTED_SOURCE=' + info['source_sha'],

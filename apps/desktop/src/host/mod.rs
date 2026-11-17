@@ -183,26 +183,17 @@ impl DesktopHost {
     pub async fn inspect(&self, path: &Path) -> Result<Inspect> {
         model::safe_path(path)?;
         ensure!(initialized(path)?, "节点尚未初始化。");
-        let inspected: Inspect = serde_json::from_value(
-            self.request(&ControlRequest::Inspect {
-                data_dir: path.into(),
-            })
-            .await?,
-        )?;
-        inspected.validate()?;
-        ensure!(
-            std::fs::canonicalize(path)? == std::fs::canonicalize(&inspected.data_dir)?,
-            "Core 返回了另一个节点目录。"
-        );
+        let core = self.core();
+        ensure!(executable(&core), "安装包缺少可运行的 Core。");
+        let inspected = vibeface_control::inspection::inspect(&core, path).await?;
         Ok(inspected)
     }
     async fn verify(&self, expected: &NodeIdentity, status: Option<NodeStatus>) -> Result<Inspect> {
         expected.validate()?;
         let inspected = self.inspect(&expected.data_dir).await?;
-        ensure!(
-            inspected.device_id == expected.device_id,
-            "节点身份已变化，请重新扫描。"
-        );
+        inspected
+            .require_identity(expected)
+            .context("节点身份已变化，请重新扫描。")?;
         if let Some(status) = status {
             ensure!(
                 inspected.status == status,

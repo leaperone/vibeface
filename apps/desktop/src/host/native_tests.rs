@@ -321,6 +321,63 @@ async fn service_and_runtime_updates_remain_distinct_and_require_fresh_state() -
     assert!(fixture.node().join("identity.json").exists());
     Ok(())
 }
+#[tokio::test]
+async fn malformed_mutation_is_reconciled_by_status_without_repeating_the_write() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.initialize()?;
+    let mut host = fixture.open(false)?;
+    host.background(BackgroundAction::Install).await?;
+    privatefs::write_atomic(
+        &fixture.profile.join("fixture.availability"),
+        b"newer_available",
+    )?;
+    privatefs::write_atomic(&fixture.profile.join("fixture.bad-mutation"), b"")?;
+    assert!(host.background(BackgroundAction::Update).await.is_err());
+    let calls = std::fs::read_to_string(fixture.profile.join("fixture.calls"))?;
+    let updates: Vec<_> = calls
+        .lines()
+        .filter(|line| line.ends_with("\tupdate"))
+        .collect();
+    assert_eq!(updates.len(), 1, "unknown mutation is never retried");
+    assert!(updates[0].contains(&format!("--expected-device-id\t{}\tupdate", "a".repeat(64))));
+    assert!(calls.lines().last().unwrap().ends_with("\tstatus"));
+    assert_eq!(
+        host.snapshot()
+            .background
+            .unwrap()
+            .runtime_update
+            .availability,
+        UpdateAvailability::Current
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn unavailable_core_never_qualifies_for_stopped_recovery() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.initialize()?;
+    let mut host = fixture.open(false)?;
+    host.background(BackgroundAction::Install).await?;
+    host.background(BackgroundAction::Stop).await?;
+    let wire = serde_json::json!({
+        "state":"installed_stopped", "device_id":"a".repeat(64), "data_dir":fixture.node(),
+        "service_id":"fixture.service", "managed_root":fixture.profile.join("managed"),
+        "service_running":false, "core_status":"unavailable",
+        "runtime_update":{"bundled_version":"2.0.0","installed_version":"2.0.0",
+            "running_version":null,"availability":"current","recovery_required":true}
+    });
+    privatefs::write_atomic(
+        &fixture.profile.join("fixture.status"),
+        &serde_json::to_vec(&wire)?,
+    )?;
+    let observed = host.background(BackgroundAction::Status).await?;
+    assert_eq!(observed.core_status, Some(NodeStatus::Unavailable));
+    assert!(host.background(BackgroundAction::Update).await.is_err());
+    let calls = std::fs::read_to_string(fixture.profile.join("fixture.calls"))?;
+    assert!(!calls.lines().any(|line| line.ends_with("\tupdate")));
+    Ok(())
+}
+
 #[test]
 fn activation_parser_queue_and_cancelled_file_save_preserve_intent() -> Result<()> {
     let ticket = "vibeface1abc123";

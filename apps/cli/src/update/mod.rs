@@ -1,3 +1,4 @@
+use vibeface_control::inspection::{Inspection, NodeIdentity, NodeStatus};
 pub mod release;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -13,7 +14,7 @@ use std::{
 };
 use tokio::process::Command;
 use vibeface_bridge::platform::privatefs;
-use vibeface_control::{self, ControlRequest, maintenance};
+use vibeface_control::{self, maintenance};
 
 #[derive(Args)]
 pub struct Update {
@@ -102,19 +103,6 @@ struct CommittedBackup {
 }
 
 #[derive(Debug, Deserialize)]
-struct InspectResult {
-    status: String,
-    device_id: String,
-    data_dir: PathBuf,
-    maintenance_socket: PathBuf,
-    listen: SocketAddr,
-    http_enabled: bool,
-    core_version: String,
-    #[serde(default)]
-    error: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 struct MaintenanceHealth {
     device_id: String,
     version: String,
@@ -140,25 +128,8 @@ fn core_binary() -> Result<PathBuf> {
     vibeface_control::sibling_core(&std::env::current_exe()?)
 }
 
-async fn inspect(data: &Path, core: &Path) -> Result<InspectResult> {
-    let value = vibeface_control::request(
-        core,
-        &ControlRequest::Inspect {
-            data_dir: data.to_owned(),
-        },
-    )
-    .await?;
-    let result: InspectResult =
-        serde_json::from_value(value).context("invalid core inspect response")?;
-    ensure!(
-        result.data_dir == data,
-        "core inspected a different data directory"
-    );
-    ensure!(
-        !result.device_id.is_empty(),
-        "core inspect returned no device identity"
-    );
-    Ok(result)
+async fn inspect(data: &Path, core: &Path) -> Result<Inspection> {
+    vibeface_control::inspection::inspect(core, data).await
 }
 
 fn private_dir(path: &Path) -> Result<()> {
@@ -849,19 +820,23 @@ pub(crate) async fn recover_desktop_managed(data: &Path, managed_root: &Path) ->
     let current = installed(&policy.install_root)?;
     let inspected = inspect(data, &current.join(PROGRAMS[1])).await?;
     ensure!(
-        inspected.status != "running",
+        inspected.status == NodeStatus::Stopped,
         "desktop_node_recovery_required"
     );
-    ensure!(
-        inspected.device_id == journal.device_id,
-        "update journal belongs to another node"
-    );
+    inspected
+        .require_identity(&NodeIdentity {
+            data_dir: data.to_owned(),
+            device_id: journal.device_id.clone(),
+        })
+        .context("update journal belongs to another node")?;
     let descriptor = crate::desktop_node::managed_service_for_data(data)?
         .context("stopped recovery requires this Desktop profile's managed Node receipt")?;
-    ensure!(
-        inspected.device_id == descriptor.device_id,
-        "Desktop Node identity changed since service installation"
-    );
+    inspected
+        .require_identity(&NodeIdentity {
+            data_dir: data.to_owned(),
+            device_id: descriptor.device_id.clone(),
+        })
+        .context("Desktop Node identity changed since service installation")?;
     let service = Service::desktop(descriptor);
     recover_with_service(&policy, data, &service, RecoveryMode::KeepStopped).await
 }
@@ -992,7 +967,7 @@ where
     if data.join("update-pending.json").exists() && release.resume_service {
         let inspected = inspect(data, &release.previous.join(PROGRAMS[1])).await?;
         ensure!(
-            inspected.status != "running",
+            inspected.status == NodeStatus::Stopped,
             "desktop_node_recovery_required"
         );
     }
@@ -1015,12 +990,14 @@ where
     };
     if release.resume_service {
         let inspected = inspect(data, &release.previous.join(PROGRAMS[1])).await?;
+        inspected
+            .require_identity(&NodeIdentity {
+                data_dir: data.to_owned(),
+                device_id: release.device_id.clone(),
+            })
+            .context("running node identity changed")?;
         ensure!(
-            inspected.device_id == release.device_id,
-            "running node identity changed"
-        );
-        ensure!(
-            inspected.status == "running",
+            inspected.status == NodeStatus::Running,
             "registered service and Core health disagree"
         );
         let lease = match maintenance::acquire(&inspected.maintenance_socket).await {
@@ -1124,7 +1101,7 @@ async fn healthy(data: &Path, package: &Path, device_id: &str) -> Result<()> {
     for _ in 0..150 {
         match inspect(data, &package.join(PROGRAMS[1])).await {
             Ok(inspected) => {
-                if inspected.status != "running" {
+                if inspected.status != NodeStatus::Running {
                     last = inspected
                         .error
                         .unwrap_or_else(|| "node is not running".into());
@@ -1386,7 +1363,7 @@ fn backup(source: &Path, destination: &Path) -> Result<()> {
     privatefs::sync_dir(destination)
 }
 
-async fn prepare_firewall(inspected: &InspectResult, root: &Path, candidate: &Path) -> Result<()> {
+async fn prepare_firewall(inspected: &Inspection, root: &Path, candidate: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         if inspected.listen.ip().is_loopback() {
@@ -1488,10 +1465,13 @@ impl Service {
     async fn load(data: &Path) -> Result<Self> {
         if let Some(desktop) = crate::desktop_node::managed_service_for_data(data)? {
             let binary = core_binary()?;
-            ensure!(
-                inspect(data, &binary).await?.device_id == desktop.device_id,
-                "Desktop Node identity changed since service installation"
-            );
+            inspect(data, &binary)
+                .await?
+                .require_identity(&NodeIdentity {
+                    data_dir: data.to_owned(),
+                    device_id: desktop.device_id.clone(),
+                })
+                .context("Desktop Node identity changed since service installation")?;
             ensure!(
                 crate::desktop_node::managed_service_registered(&desktop).await?,
                 "Desktop Node service registration is missing"
@@ -1899,16 +1879,19 @@ mod tests {
         let root = sandbox();
         let candidate = package(&root, "9.0.0");
         let data = root.join("data");
+        private_dir(&data)?;
         let marker = root.join("candidate-inspected");
         let response = serde_json::json!({"ok":true,"result":{
-            "status":"running","device_id":"unexpected","data_dir":data,
+            "status":"running","device_id":"b".repeat(64),"data_dir":data,
             "maintenance_socket":root.join("socket"),"listen":"127.0.0.1:4790",
-            "http_enabled":false,
-            "version":"9.0.0","core_version":"9.0.0"
+            "web_enabled":false,"http_enabled":false,
+            "version":"9.0.0","core_version":"9.0.0", "local_listen":"127.0.0.1:4791",
+            "public_url":"http://127.0.0.1:4790", "write_state":null,"error":null,
+            "mesh":{"enabled":false,"network":"vibeface","records":null,"neighbors":null},"peers":[]
         }});
         let mut old_inspect = response["result"].clone();
         old_inspect.as_object_mut().unwrap().remove("core_version");
-        assert!(serde_json::from_value::<InspectResult>(old_inspect).is_err());
+        assert!(serde_json::from_value::<Inspection>(old_inspect).is_err());
         let core = candidate.join(PROGRAMS[1]);
         fs::write(
             &core,
@@ -1919,13 +1902,29 @@ mod tests {
             ),
         )?;
         mark_runnable(&core);
-        let error = healthy(&data, &candidate, "expected").await.unwrap_err();
+        let error = healthy(
+            &data,
+            &candidate,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .await
+        .unwrap_err();
         assert!(marker.exists(), "health must execute the candidate Core");
         assert!(error.to_string().contains("unexpected version or identity"));
         for (case, (web_enabled, http_enabled, http_device, succeeds)) in [
             (false, false, "other", true),
-            (true, true, "expected", true),
-            (false, true, "expected", true),
+            (
+                true,
+                true,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                true,
+            ),
+            (
+                false,
+                true,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                true,
+            ),
             (false, true, "other", false),
         ]
         .into_iter()
@@ -1938,7 +1937,7 @@ mod tests {
                 while stream.read_u8().await? != b'\n' {}
                 let response = serde_json::json!({
                     "protocol":maintenance::PROTOCOL,"status":"healthy",
-                    "health":{"device_id":"expected","version":"9.0.0"}
+                    "health":{"device_id":"a".repeat(64),"version":"9.0.0"}
                 });
                 stream.write_all(&serde_json::to_vec(&response)?).await?;
                 stream.write_all(b"\n").await?;
@@ -1968,10 +1967,12 @@ mod tests {
                 Ok::<_, anyhow::Error>(())
             });
             let response = serde_json::json!({"ok":true,"result":{
-                "status":"running","device_id":"expected","data_dir":data,
+                "status":"running","device_id":"a".repeat(64),"data_dir":data,
                 "maintenance_socket":endpoint.path(),"listen":listen,
                 "web_enabled":web_enabled,"http_enabled":http_enabled,
-                "version":"9.0.0","core_version":"9.0.0"
+                "version":"9.0.0","core_version":"9.0.0", "local_listen":"127.0.0.1:4791",
+            "public_url":"http://127.0.0.1:4790", "write_state":null,"error":null,
+            "mesh":{"enabled":false,"network":"vibeface","records":null,"neighbors":null},"peers":[]
             }});
             fs::write(
                 &core,
@@ -1979,7 +1980,11 @@ mod tests {
             )?;
             let result = tokio::time::timeout(
                 Duration::from_secs(3),
-                healthy(&data, &candidate, "expected"),
+                healthy(
+                    &data,
+                    &candidate,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ),
             )
             .await?;
             maintenance_server.await??;

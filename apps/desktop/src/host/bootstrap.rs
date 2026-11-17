@@ -2,7 +2,7 @@ use super::{DesktopHost, NodeIdentity, NodeStatus, model};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::Value;
-use std::{fmt, net::SocketAddr};
+use std::fmt;
 use vibeface_control::{ControlRequest, LocalHttpCredential};
 use zeroize::Zeroizing;
 
@@ -135,10 +135,7 @@ impl DesktopHost {
             launcher.node_id == expected.device_id,
             "本机设置启动器身份与所选节点不一致。"
         );
-        let listen: SocketAddr = inspected
-            .local_listen
-            .parse()
-            .context("本机节点监听地址无效。")?;
+        let listen = inspected.local_listen;
         ensure!(listen.ip().is_loopback(), "本机设置入口必须位于回环地址。");
         let origin = reqwest::Url::parse(&format!("http://{listen}"))?;
         launcher.require_origin(&origin)?;

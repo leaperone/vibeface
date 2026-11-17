@@ -153,7 +153,14 @@ impl Fixture {
                     "listen": "127.0.0.1:4790",
                     "web_enabled": true,
                     "core_version": "0.0.1",
-                    "error": null
+                    "maintenance_socket": vibeface_bridge::platform::ipc::Endpoint::in_private_dir(&self.profile, "fixture.sock")?.path(),
+                    "public_url": "http://127.0.0.1:4790",
+                    "http_enabled": status == "running",
+                    "version": (status == "running").then_some("0.0.1"),
+                    "write_state": null,
+                    "mesh": {"enabled":false,"network":"vibeface","records":null,"neighbors":null},
+                    "peers": (status == "running").then_some(Vec::<String>::new()),
+                    "error": (status != "running").then_some("fixture stopped")
                 }
             }))?,
         )

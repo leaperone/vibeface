@@ -1,14 +1,9 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::Result;
 use clap::builder::styling::Styles;
 use crossterm::style::Stylize;
 use ratatui::{style::Style, text::Span};
-use serde::Deserialize;
 use serde_json::Value;
-use std::{
-    io::{self, Write},
-    net::SocketAddr,
-    path::PathBuf,
-};
+use std::io::{self, Write};
 
 pub fn help_styles() -> Styles {
     let strong = clap::builder::styling::Style::new().bold();
@@ -23,16 +18,13 @@ pub fn use_emphasis() -> bool {
     std::env::var_os("NO_COLOR").is_none() && std::env::var("TERM").is_ok_and(|term| term != "dumb")
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RunState {
-    Running,
-    Stopped,
-    Unavailable,
+use vibeface_control::inspection::{Inspection, MeshStatus};
+pub use vibeface_control::inspection::{NodeStatus as RunState, PeerPath, PeerStatus, WriteState};
+pub trait Label {
+    fn label(self) -> &'static str;
 }
-
-impl RunState {
-    pub fn label(self) -> &'static str {
+impl Label for RunState {
+    fn label(self) -> &'static str {
         match self {
             Self::Running => "RUNNING",
             Self::Stopped => "STOPPED",
@@ -41,17 +33,8 @@ impl RunState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WriteState {
-    Aligning,
-    ReadOnly,
-    Writable,
-    Forked,
-}
-
-impl WriteState {
-    pub fn label(self) -> &'static str {
+impl Label for WriteState {
+    fn label(self) -> &'static str {
         match self {
             Self::Aligning => "aligning",
             Self::ReadOnly => "read_only",
@@ -61,15 +44,8 @@ impl WriteState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PeerPath {
-    Direct,
-    Relay,
-}
-
-impl PeerPath {
-    pub fn label(self) -> &'static str {
+impl Label for PeerPath {
+    fn label(self) -> &'static str {
         match self {
             Self::Direct => "direct",
             Self::Relay => "relay",
@@ -77,17 +53,13 @@ impl PeerPath {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct PeerStatus {
-    pub device_id: String,
-    pub name: String,
-    pub path: Option<PeerPath>,
-    pub reachable: Option<bool>,
-    pub synced_ms: Option<i64>,
+pub trait PeerDisplay {
+    fn reachability(&self) -> &'static str;
+    fn path_label(&self) -> &'static str;
+    fn last_sync(&self, now_ms: i64) -> String;
 }
-
-impl PeerStatus {
-    pub fn reachability(&self) -> &'static str {
+impl PeerDisplay for PeerStatus {
+    fn reachability(&self) -> &'static str {
         match self.reachable {
             Some(true) => "reachable",
             Some(false) => "unreachable",
@@ -95,11 +67,11 @@ impl PeerStatus {
         }
     }
 
-    pub fn path_label(&self) -> &'static str {
+    fn path_label(&self) -> &'static str {
         self.path.map_or("unknown path", PeerPath::label)
     }
 
-    pub fn last_sync(&self, now_ms: i64) -> String {
+    fn last_sync(&self, now_ms: i64) -> String {
         self.synced_ms.map_or_else(
             || "never synced".into(),
             |at| {
@@ -112,42 +84,27 @@ impl PeerStatus {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct NodeStatus {
-    pub status: RunState,
-    pub device_id: String,
-    pub data_dir: PathBuf,
-    pub listen: SocketAddr,
-    pub web_enabled: bool,
-    pub version: Option<String>,
-    pub core_version: String,
-    pub write_state: Option<WriteState>,
-    pub peers: Option<Vec<PeerStatus>>,
-    pub error: Option<String>,
-    #[serde(default)]
-    pub mesh: Value,
-}
-
-impl NodeStatus {
-    pub fn parse(value: Value) -> Result<Self> {
-        let node: Self = serde_json::from_value(value).context("invalid Node status response")?;
-        ensure!(!node.device_id.is_empty(), "Node status has no device ID");
-        ensure!(
-            node.data_dir.is_absolute(),
-            "Node status has a relative data directory"
-        );
-        ensure!(
-            !node.core_version.is_empty(),
-            "Node status has no Core version"
-        );
-        if let Some(peers) = &node.peers {
-            for peer in peers {
-                ensure!(!peer.device_id.is_empty(), "peer status has no device ID");
-            }
-        }
-        Ok(node)
+/// Terminal presentation over the already validated shared observation.
+#[derive(Clone, Debug)]
+pub struct NodeStatus(Inspection);
+impl From<Inspection> for NodeStatus {
+    fn from(value: Inspection) -> Self {
+        Self(value)
     }
-
+}
+impl std::ops::Deref for NodeStatus {
+    type Target = Inspection;
+    fn deref(&self) -> &Inspection {
+        &self.0
+    }
+}
+#[cfg(test)]
+impl std::ops::DerefMut for NodeStatus {
+    fn deref_mut(&mut self) -> &mut Inspection {
+        &mut self.0
+    }
+}
+impl NodeStatus {
     pub fn version(&self) -> &str {
         self.version.as_deref().unwrap_or(&self.core_version)
     }
@@ -171,16 +128,12 @@ impl NodeStatus {
 }
 
 /// `on · vibeface · 12 records · 3 neighbors` from the `mesh` object of a Node status.
-pub fn mesh_summary(mesh: &Value) -> Option<String> {
-    if !mesh["enabled"].as_bool()? {
+pub fn mesh_summary(mesh: &MeshStatus) -> Option<String> {
+    if !mesh.enabled {
         return Some("off".into());
     }
-    let mut summary = format!(
-        "on · {}",
-        safe_text(mesh["network"].as_str().unwrap_or_default())
-    );
-    if let (Some(records), Some(neighbors)) = (mesh["records"].as_u64(), mesh["neighbors"].as_u64())
-    {
+    let mut summary = format!("on · {}", safe_text(&mesh.network));
+    if let (Some(records), Some(neighbors)) = (mesh.records, mesh.neighbors) {
         summary.push_str(&format!(" · {records} records · {neighbors} neighbors"));
     }
     Some(summary)
@@ -406,14 +359,20 @@ mod tests {
 
     #[test]
     fn status_preserves_unknown_peers_and_validates_the_display_boundary() {
-        let value = json!({"status":"stopped","device_id":"local","data_dir":test_data_dir(),"listen":"127.0.0.1:4790","web_enabled":true,"core_version":"0.0.1","peers":null});
-        let node = NodeStatus::parse(value.clone()).unwrap();
+        let value = json!({"status":"stopped","device_id":"a".repeat(64),"data_dir":test_data_dir(),"listen":"127.0.0.1:4790","web_enabled":true,"core_version":"0.0.1","peers":null,
+            "maintenance_socket":vibeface_bridge::platform::ipc::Endpoint::in_private_dir(&std::env::temp_dir(), "fixture.sock").unwrap().path(),
+            "local_listen":"127.0.0.1:4791","public_url":"http://127.0.0.1:4790","http_enabled":false,
+            "version":null,"write_state":null,"error":"fixture stopped","mesh":{"enabled":false,"network":"vibeface","records":null,"neighbors":null}});
+        let node = NodeStatus::from(Inspection::from_value(value.clone()).unwrap());
         assert!(node.peers.is_none());
         assert_eq!(node.peer_summary(), "Peer status unavailable");
         let mut empty = value.clone();
         empty["peers"] = json!([]);
+        empty["status"] = json!("running");
+        empty["version"] = json!("0.0.1");
+        empty["error"] = Value::Null;
         assert_eq!(
-            NodeStatus::parse(empty).unwrap().peer_summary(),
+            NodeStatus::from(Inspection::from_value(empty).unwrap()).peer_summary(),
             "0 peers · 0 reachable"
         );
         for (key, invalid) in [
@@ -424,7 +383,7 @@ mod tests {
         ] {
             let mut invalid_value = value.clone();
             invalid_value[key] = invalid;
-            assert!(NodeStatus::parse(invalid_value).is_err(), "{key}");
+            assert!(Inspection::from_value(invalid_value).is_err(), "{key}");
         }
         let peer: PeerStatus = serde_json::from_value(json!({"device_id":"peer","name":"Build","path":null,"reachable":null,"synced_ms":null})).unwrap();
         assert_eq!(peer.reachability(), "not tried yet");

@@ -954,72 +954,67 @@ async fn control(request: ControlRequest) -> Result<Value> {
     vibeface_control::request(&core_binary()?, &request).await
 }
 
+async fn inspect_node(data_dir: &Path) -> Result<vibeface_control::inspection::Inspection> {
+    vibeface_control::inspection::inspect(&core_binary()?, data_dir).await
+}
+
 async fn inspect_socket(data_dir: &Path) -> Result<PathBuf> {
-    let info = control(ControlRequest::Inspect {
-        data_dir: data_dir.to_owned(),
-    })
-    .await?;
-    info["maintenance_socket"]
-        .as_str()
-        .map(PathBuf::from)
-        .context("core did not return a maintenance socket")
+    Ok(inspect_node(data_dir).await?.maintenance_socket)
 }
 
 async fn status(options: Access) -> Result<()> {
-    let mut result = control(ControlRequest::Inspect {
-        data_dir: options.data_dir.clone(),
-    })
-    .await?;
+    let inspected = inspect_node(&options.data_dir).await?;
+    let mut result = serde_json::to_value(&inspected)?;
     result["cli_version"] = json!(env!("CARGO_PKG_VERSION"));
     if options.json {
         println!("{}", serde_json::to_string(&result)?);
     } else if std::io::stdout().is_terminal() {
-        terminal::print_status(&terminal::NodeStatus::parse(result.clone())?)?;
+        terminal::print_status(&terminal::NodeStatus::from(inspected.clone()))?;
     } else {
+        use terminal::{Label, PeerDisplay};
         println!(
             "Peer ID: {}\nStatus: {}\nListen: {}\nData: {}",
-            result["device_id"].as_str().unwrap_or_default(),
-            result["status"].as_str().unwrap_or_default(),
-            result["listen"].as_str().unwrap_or_default(),
-            result["data_dir"].as_str().unwrap_or_default()
+            inspected.device_id,
+            inspected.status.label().to_ascii_lowercase(),
+            inspected.listen,
+            inspected.data_dir.display()
         );
-        if let Some(version) = result["version"]
-            .as_str()
-            .or_else(|| result["core_version"].as_str())
-        {
-            println!("Version: {version}");
+        println!(
+            "Version: {}",
+            inspected
+                .version
+                .as_deref()
+                .unwrap_or(&inspected.core_version)
+        );
+        println!(
+            "Web: {}",
+            if inspected.web_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        if let Some(state) = inspected.write_state {
+            println!("Writes: {}", state.label());
         }
-        if let Some(web) = result["web_enabled"].as_bool() {
-            println!("Web: {}", if web { "enabled" } else { "disabled" });
-        }
-        if let Some(write_state) = result["write_state"].as_str() {
-            println!("Writes: {write_state}");
-        }
-        if let Some(mesh) = terminal::mesh_summary(&result["mesh"]) {
+        if let Some(mesh) = terminal::mesh_summary(&inspected.mesh) {
             println!("Mesh: {mesh}");
         }
-        if let Some(peers) = result["peers"].as_array() {
-            let now = now_ms();
-            for peer in peers {
-                let link = match peer["reachable"].as_bool() {
-                    Some(true) => "reachable",
-                    Some(false) => "unreachable",
-                    None => "not tried yet",
-                };
-                let synced = plain_sync_description(peer["synced_ms"].as_i64(), now);
-                println!(
-                    "Peer: {} ({}) {link}, {synced}",
-                    peer["name"].as_str().unwrap_or_default(),
-                    peer["device_id"].as_str().unwrap_or_default()
-                );
-            }
+        for peer in inspected.peers.iter().flatten() {
+            println!(
+                "Peer: {} ({}) {}, {}",
+                peer.name,
+                peer.device_id,
+                peer.reachability(),
+                plain_sync_description(peer.synced_ms, now_ms())
+            );
         }
-        if let Some(error) = result["error"].as_str() {
+        if let Some(error) = &inspected.error {
             println!("Detail: {error}");
         }
     }
     ensure!(
-        result["status"] == "running",
+        inspected.status == vibeface_control::inspection::NodeStatus::Running,
         "node is not reachable through its private maintenance socket"
     );
     Ok(())
@@ -1169,13 +1164,13 @@ async fn access(options: LocalEntry) -> Result<()> {
 
 async fn join(options: Join) -> Result<()> {
     let data_dir = options.data_dir.clone();
-    let running = control(ControlRequest::Inspect {
-        data_dir: data_dir.clone(),
-    })
-    .await
-    .ok()
-    .and_then(|value| value["status"].as_str().map(|status| status == "running"))
-    .unwrap_or(false);
+    let running = match inspect_node(&data_dir).await?.status {
+        vibeface_control::inspection::NodeStatus::Running => true,
+        vibeface_control::inspection::NodeStatus::Stopped => false,
+        vibeface_control::inspection::NodeStatus::Unavailable => {
+            bail!("Node inspection is unavailable; refusing offline join")
+        }
+    };
     if !running {
         let result = control(ControlRequest::Join {
             data_dir: data_dir.clone(),

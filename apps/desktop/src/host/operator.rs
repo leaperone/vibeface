@@ -227,9 +227,7 @@ impl DesktopHost {
             "请先选择并核对要配置的本机节点。"
         );
         let inspected = self.verify(expected, Some(NodeStatus::Running)).await?;
-        let socket = inspected
-            .maintenance_socket
-            .context("所选节点没有报告本机维护入口。")?;
+        let socket = inspected.maintenance_socket;
         // The descriptor comes only from the fixed bundled Core inspect, after its own
         // identity/health check. Peer credentials and private endpoint checks remain mandatory.
         let endpoint = Endpoint::from_path(&socket)?;

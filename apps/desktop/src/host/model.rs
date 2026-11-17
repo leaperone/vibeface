@@ -19,72 +19,8 @@ pub(crate) fn safe_path(path: &Path) -> Result<()> {
     );
     Ok(())
 }
-pub(crate) fn device_id(id: &str) -> Result<()> {
-    ensure!(
-        id.len() == 64
-            && id
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-        "节点身份无效。"
-    );
-    Ok(())
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct NodeIdentity {
-    pub data_dir: PathBuf,
-    pub device_id: String,
-}
-impl NodeIdentity {
-    pub(crate) fn validate(&self) -> Result<()> {
-        safe_path(&self.data_dir)?;
-        device_id(&self.device_id)
-    }
-}
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeStatus {
-    Running,
-    Stopped,
-    Unavailable,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Inspect {
-    pub data_dir: PathBuf,
-    pub device_id: String,
-    pub status: NodeStatus,
-    pub local_listen: String,
-    pub listen: String,
-    pub web_enabled: bool,
-    pub core_version: String,
-    #[serde(default)]
-    pub maintenance_socket: Option<PathBuf>,
-    #[serde(default)]
-    pub error: Option<String>,
-}
-impl Inspect {
-    pub fn identity(&self) -> NodeIdentity {
-        NodeIdentity {
-            data_dir: self.data_dir.clone(),
-            device_id: self.device_id.clone(),
-        }
-    }
-    pub(crate) fn validate(&self) -> Result<()> {
-        self.identity().validate()?;
-        ensure!(
-            !self.core_version.is_empty() && self.core_version.len() <= 160,
-            "节点版本无效。"
-        );
-        for value in [&self.local_listen, &self.listen] {
-            ensure!(
-                !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control),
-                "节点监听地址无效。"
-            );
-        }
-        Ok(())
-    }
-}
+pub(crate) use vibeface_control::inspection::validate_device_id as device_id;
+pub use vibeface_control::inspection::{Inspection as Inspect, NodeIdentity, NodeStatus};
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeSource {
@@ -147,20 +83,23 @@ impl LocalNode {
         if self.status == NodeStatus::Unavailable {
             ensure!(self.unavailable_reason.is_some(), "节点不可用原因缺失。");
         } else {
-            let inspected = Inspect {
-                data_dir: self.data_dir.clone(),
-                device_id: self.device_id.clone(),
-                status: self.status,
-                local_listen: self.local_listen.clone().unwrap_or_default(),
-                listen: self.listen.clone().unwrap_or_default(),
-                web_enabled: self
-                    .web_enabled
-                    .ok_or_else(|| anyhow::anyhow!("节点接入状态缺失。"))?,
-                core_version: self.core_version.clone().unwrap_or_default(),
-                maintenance_socket: None,
-                error: None,
-            };
-            inspected.validate()?;
+            for listen in [&self.local_listen, &self.listen] {
+                let value = listen
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("节点监听地址缺失。"))?;
+                value.parse::<std::net::SocketAddr>()?;
+            }
+            ensure!(self.web_enabled.is_some(), "节点接入状态缺失。");
+            let version = self
+                .core_version
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("节点版本缺失。"))?;
+            ensure!(
+                !version.is_empty()
+                    && version.len() <= 160
+                    && !version.chars().any(char::is_control),
+                "节点版本无效。"
+            );
         }
         Ok(())
     }

@@ -295,7 +295,7 @@ impl Fixture {
         privatefs::write_atomic(
             &profile.join("fixture-inspect.json"),
             &serde_json::to_vec(
-                &json!({"ok":true,"result":{"data_dir":node_dir,"device_id":entry.node_id,"status":"running","local_listen":entry.origin.trim_start_matches("http://"),"listen":"127.0.0.1:1","web_enabled":true,"core_version":"controlled","error":null}}),
+                &json!({"ok":true,"result":{"data_dir":node_dir,"device_id":entry.node_id,"status":"running","local_listen":entry.origin.trim_start_matches("http://"),"listen":"127.0.0.1:1","web_enabled":true,"core_version":"controlled","error":null,"maintenance_socket":vibeface_bridge::platform::ipc::Endpoint::in_private_dir(&node_dir,"fixture.sock")?.path(),"public_url":entry.origin,"http_enabled":true,"version":"controlled","write_state":null,"mesh":{"enabled":false,"network":"vibeface","records":null,"neighbors":null},"peers":[]}}),
             )?,
         )?;
         let source = root.join("inspector.rs");

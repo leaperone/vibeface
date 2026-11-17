@@ -11,7 +11,8 @@ use std::{
     time::Duration,
 };
 use vibeface_bridge::platform::privatefs;
-use vibeface_control::{ControlRequest, DATA_EPOCH, UPDATE_PROTOCOL};
+use vibeface_control::inspection::{Inspection, NodeIdentity, NodeStatus};
+use vibeface_control::{DATA_EPOCH, UPDATE_PROTOCOL};
 
 const RECEIPT: &str = "desktop-node.json";
 const MAX_RECEIPT: u64 = 16 * 1024;
@@ -72,28 +73,9 @@ enum Action {
     Uninstall,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "snake_case")]
-struct RuntimeUpdateJson {
-    bundled_version: String,
-    installed_version: Option<String>,
-    running_version: Option<String>,
-    availability: &'static str,
-    recovery_required: bool,
-}
-
-#[derive(Serialize)]
-struct ResultJson {
-    ok: bool,
-    state: &'static str,
-    device_id: Option<String>,
-    data_dir: Option<PathBuf>,
-    service_id: Option<String>,
-    managed_root: Option<PathBuf>,
-    service_running: Option<bool>,
-    core_status: Option<String>,
-    runtime_update: RuntimeUpdateJson,
-}
+use vibeface_control::managed_node::{
+    ManagedNodeStatus, RuntimeUpdate, ServiceState, UpdateAvailability,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -108,17 +90,10 @@ pub(crate) struct Receipt {
 }
 
 /// The identity and runtime fields this CLI needs from Core's full health report.
-#[derive(Deserialize)]
-struct InspectResult {
-    data_dir: PathBuf,
-    device_id: String,
-    status: String,
-    core_version: String,
-}
 
-fn running_core_version(inspected: &InspectResult) -> Result<&str> {
+fn running_core_version(inspected: &Inspection) -> Result<&str> {
     ensure!(
-        !inspected.core_version.is_empty(),
+        inspected.status == NodeStatus::Running,
         "Core inspect did not report a program version"
     );
     Ok(inspected.core_version.as_str())
@@ -235,24 +210,9 @@ async fn wait_data_unlocked(data: &Path) -> Result<()> {
     }
 }
 
-async fn inspect(data: &Path, bundled: &Path) -> Result<InspectResult> {
-    let binary = bundled.join(crate::update::release::PROGRAMS[1]);
-    let value = vibeface_control::request(
-        &binary,
-        &ControlRequest::Inspect {
-            data_dir: data.to_owned(),
-        },
-    )
-    .await?;
-    let result: InspectResult =
-        serde_json::from_value(value).context("Core returned invalid Node identity")?;
-    ensure!(
-        result.data_dir == data
-            && !result.device_id.is_empty()
-            && ["running", "stopped", "unavailable"].contains(&result.status.as_str()),
-        "Core inspected a different or invalid Node"
-    );
-    Ok(result)
+async fn inspect(data: &Path, bundled: &Path) -> Result<Inspection> {
+    vibeface_control::inspection::inspect(&bundled.join(crate::update::release::PROGRAMS[1]), data)
+        .await
 }
 
 fn verify_bundled_source(package: &Path) -> Result<()> {
@@ -453,34 +413,34 @@ fn runtime_update_for_packages(
     bundled: &Path,
     installed: Option<&Path>,
     running_version: Option<&str>,
-) -> Result<RuntimeUpdateJson> {
+) -> Result<RuntimeUpdate> {
     let bundled_version = bundled_package_version(bundled)?;
     let installed_version = installed.map(managed_package_version).transpose()?;
     let availability = match installed {
-        None => "not_installed",
+        None => UpdateAvailability::NotInstalled,
         Some(current) => {
             let bundled_parsed = parse_release_version(&bundled_version)?;
             let current_parsed = parse_release_version(installed_version.as_deref().unwrap())?;
             if bundled_parsed < current_parsed {
-                "downgrade_refused"
+                UpdateAvailability::DowngradeRefused
             } else if bundled_parsed == current_parsed {
                 if crate::update::release::same_package_bytes(bundled, current)? {
                     if running_version
                         .is_some_and(|running| installed_version.as_deref() != Some(running))
                     {
-                        "newer_available"
+                        UpdateAvailability::NewerAvailable
                     } else {
-                        "current"
+                        UpdateAvailability::Current
                     }
                 } else {
-                    "immutable_conflict"
+                    UpdateAvailability::ImmutableConflict
                 }
             } else {
-                "newer_available"
+                UpdateAvailability::NewerAvailable
             }
         }
     };
-    Ok(RuntimeUpdateJson {
+    Ok(RuntimeUpdate {
         bundled_version,
         installed_version,
         running_version: running_version.map(str::to_owned),
@@ -652,8 +612,13 @@ async fn wait_health(data: &Path, bundled: &Path, expected: &str) -> Result<()> 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         if let Ok(result) = inspect(data, bundled).await
-            && result.device_id == expected
-            && result.status == "running"
+            && result
+                .require_identity(&NodeIdentity {
+                    data_dir: data.to_owned(),
+                    device_id: expected.to_owned(),
+                })
+                .is_ok()
+            && result.status == NodeStatus::Running
         {
             return Ok(());
         }
@@ -668,7 +633,7 @@ fn runtime_update_for_receipt(
     receipt: Option<&Receipt>,
     bundled: &Path,
     running_version: Option<&str>,
-) -> Result<RuntimeUpdateJson> {
+) -> Result<RuntimeUpdate> {
     let installed = receipt
         .map(|value| managed_current(&value.managed_root))
         .transpose()?;
@@ -680,10 +645,10 @@ fn runtime_update_for_receipt(
 }
 
 fn emit(
-    state: &'static str,
+    state: ServiceState,
     receipt: Option<&Receipt>,
     service_running: Option<bool>,
-    core_status: Option<String>,
+    core_status: Option<NodeStatus>,
     running_version: Option<&str>,
     bundled: &Path,
 ) -> Result<()> {
@@ -697,31 +662,31 @@ fn emit(
 }
 
 fn output(
-    state: &'static str,
+    state: ServiceState,
     receipt: Option<&Receipt>,
     service_running: Option<bool>,
-    core_status: Option<String>,
-    runtime_update: RuntimeUpdateJson,
+    core_status: Option<NodeStatus>,
+    runtime_update: RuntimeUpdate,
 ) -> Result<()> {
-    let receipt = receipt.filter(|_| state != "not_installed");
-    let service_running = (state != "not_installed")
+    let receipt = receipt.filter(|_| state != ServiceState::NotInstalled);
+    let service_running = (state != ServiceState::NotInstalled)
         .then_some(service_running)
         .flatten();
-    let core_status = (state != "not_installed").then_some(core_status).flatten();
-    println!(
-        "{}",
-        serde_json::to_string(&ResultJson {
-            ok: true,
-            state,
-            device_id: receipt.map(|value| value.device_id.clone()),
-            data_dir: receipt.map(|value| value.data_dir.clone()),
-            service_id: receipt.map(|value| value.service_id.clone()),
-            managed_root: receipt.map(|value| value.managed_root.clone()),
-            service_running,
-            core_status,
-            runtime_update,
-        })?
-    );
+    let core_status = (state != ServiceState::NotInstalled)
+        .then_some(core_status)
+        .flatten();
+    let result = ManagedNodeStatus {
+        state,
+        device_id: receipt.map(|value| value.device_id.clone()),
+        data_dir: receipt.map(|value| value.data_dir.clone()),
+        service_id: receipt.map(|value| value.service_id.clone()),
+        managed_root: receipt.map(|value| value.managed_root.clone()),
+        service_running,
+        core_status,
+        runtime_update,
+    };
+    result.validate()?;
+    println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
 
@@ -734,7 +699,7 @@ pub async fn run(options: DesktopNode) -> Result<()> {
 
 struct VerifiedRelease {
     service_running: bool,
-    core_status: String,
+    core_status: NodeStatus,
     running_version: Option<String>,
 }
 
@@ -778,31 +743,36 @@ async fn prove_switched_release(
     }
     let native = native_service(&package, data, &receipt.service_id).await?;
     let inspected = inspect(data, bundled).await?;
-    if inspected.device_id != receipt.device_id {
-        return Err(OperationFailure::UpdateRefused.into());
-    }
+    inspected
+        .require_identity(&NodeIdentity {
+            data_dir: receipt.data_dir.clone(),
+            device_id: receipt.device_id.clone(),
+        })
+        .context(OperationFailure::UpdateRefused)?;
     if resume_service {
         if !(native.installed && native.running) {
             return Err(OperationFailure::Service.into());
         }
-        if inspected.status != "running" || running_core_version(&inspected)? != bundled_version {
+        if inspected.status != NodeStatus::Running
+            || running_core_version(&inspected)? != bundled_version
+        {
             return Err(OperationFailure::Health.into());
         }
         Ok(VerifiedRelease {
             service_running: true,
-            core_status: "running".into(),
+            core_status: NodeStatus::Running,
             running_version: Some(bundled_version.to_owned()),
         })
     } else {
         if !(native.installed && !native.running) {
             return Err(OperationFailure::Service.into());
         }
-        if inspected.status != "stopped" {
+        if inspected.status != NodeStatus::Stopped {
             return Err(OperationFailure::Health.into());
         }
         Ok(VerifiedRelease {
             service_running: false,
-            core_status: "stopped".into(),
+            core_status: NodeStatus::Stopped,
             running_version: None,
         })
     }
@@ -819,7 +789,7 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
             Err(ref error) if error.kind() == io::ErrorKind::NotFound
         )
     {
-        return emit("not_installed", None, None, None, None, bundled);
+        return emit(ServiceState::NotInstalled, None, None, None, None, bundled);
     }
     let profile = canonical_profile(&options.profile_dir)?;
     let root = profile.join("node-runtime");
@@ -827,7 +797,7 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
     match options.action {
         Action::Status => {
             let Some(receipt) = existing.as_ref() else {
-                return emit("not_installed", None, None, None, None, bundled);
+                return emit(ServiceState::NotInstalled, None, None, None, None, bundled);
             };
             let data = data_dir(&profile)?;
             ensure!(
@@ -843,13 +813,27 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                 .as_deref()
                 .is_some_and(|id| id != receipt.device_id)
             {
-                return emit("conflict", Some(receipt), None, None, None, bundled);
+                return emit(
+                    ServiceState::Conflict,
+                    Some(receipt),
+                    None,
+                    None,
+                    None,
+                    bundled,
+                );
             }
             if !matches!(
                 crate::update::desktop_policy_matches(&data, &receipt.managed_root),
                 Ok(true)
             ) {
-                return emit("conflict", Some(receipt), None, None, None, bundled);
+                return emit(
+                    ServiceState::Conflict,
+                    Some(receipt),
+                    None,
+                    None,
+                    None,
+                    bundled,
+                );
             }
             let package = managed_current(&receipt.managed_root)?;
             let native = native_service(&package, &data, &receipt.service_id).await;
@@ -858,15 +842,15 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                 (Ok(native), Ok(core)) if core.device_id == receipt.device_id => {
                     let state = if native.installed {
                         if native.running {
-                            "installed"
+                            ServiceState::Installed
                         } else {
-                            "installed_stopped"
+                            ServiceState::InstalledStopped
                         }
                     } else {
-                        "partial"
+                        ServiceState::Partial
                     };
-                    let core_status = core.status.clone();
-                    let running_version = if native.running && core_status == "running" {
+                    let core_status = core.status;
+                    let running_version = if native.running && core_status == NodeStatus::Running {
                         Some(running_core_version(&core)?.to_owned())
                     } else {
                         None
@@ -881,14 +865,14 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                     )
                 }
                 (Ok(native), Ok(core)) => {
-                    let core_status = core.status.clone();
-                    let running_version = if native.running && core_status == "running" {
+                    let core_status = core.status;
+                    let running_version = if native.running && core_status == NodeStatus::Running {
                         Some(running_core_version(&core)?.to_owned())
                     } else {
                         None
                     };
                     emit(
-                        "conflict",
+                        ServiceState::Conflict,
                         Some(receipt),
                         Some(native.running),
                         Some(core_status),
@@ -896,8 +880,22 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                         bundled,
                     )
                 }
-                (Err(_), _) => emit("conflict", Some(receipt), None, None, None, bundled),
-                (_, Err(_)) => emit("unavailable", Some(receipt), None, None, None, bundled),
+                (Err(_), _) => emit(
+                    ServiceState::Conflict,
+                    Some(receipt),
+                    None,
+                    None,
+                    None,
+                    bundled,
+                ),
+                (_, Err(_)) => emit(
+                    ServiceState::Unavailable,
+                    Some(receipt),
+                    None,
+                    None,
+                    None,
+                    bundled,
+                ),
             }
         }
         action => {
@@ -915,10 +913,12 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                 Action::Status | Action::Update | Action::Stop => {}
             }
             let inspected = inspect(&data, bundled).await?;
-            ensure!(
-                inspected.device_id == expected,
-                "Node identity changed; refusing service operation"
-            );
+            inspected
+                .require_identity(&NodeIdentity {
+                    data_dir: data.clone(),
+                    device_id: expected.to_owned(),
+                })
+                .context("Node identity changed; refusing service operation")?;
             match action {
                 Action::Install => {
                     if let Some(receipt) = existing.as_ref() {
@@ -936,14 +936,14 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                         let native = native_service(&package, &data, &receipt.service_id).await?;
                         if native.installed && native.running {
                             ensure!(
-                                inspected.status == "running",
+                                inspected.status == NodeStatus::Running,
                                 "registered service and Core health disagree"
                             );
                             emit(
-                                "installed",
+                                ServiceState::Installed,
                                 Some(receipt),
                                 Some(true),
-                                Some("running".into()),
+                                Some(NodeStatus::Running),
                                 Some(running_core_version(&inspected)?),
                                 bundled,
                             )?;
@@ -953,6 +953,10 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                     } else {
                         require_data_unlocked(&data)?;
                     }
+                    ensure!(
+                        inspected.status == NodeStatus::Stopped,
+                        OperationFailure::Health
+                    );
                     let source = bundled.to_path_buf();
                     let requested_root = profile.join("node-runtime");
                     ensure!(
@@ -982,11 +986,19 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                         "background service manager did not confirm the installed Node"
                     );
                     let final_inspect = inspect(&data, bundled).await?;
+                    final_inspect.require_identity(&NodeIdentity {
+                        data_dir: data.clone(),
+                        device_id: expected.to_owned(),
+                    })?;
+                    ensure!(
+                        final_inspect.status == NodeStatus::Running,
+                        OperationFailure::Health
+                    );
                     emit(
-                        "installed",
+                        ServiceState::Installed,
                         Some(&receipt),
                         Some(true),
-                        Some("running".into()),
+                        Some(NodeStatus::Running),
                         Some(running_core_version(&final_inspect)?),
                         bundled,
                     )
@@ -1010,7 +1022,7 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                     let installed = managed_current(&receipt.managed_root)?;
                     if recovery_required(&data) {
                         let native = native_service(&installed, &data, &receipt.service_id).await?;
-                        if native.running || inspected.status == "running" {
+                        if native.running || inspected.status != NodeStatus::Stopped {
                             anyhow::bail!(OperationFailure::RecoveryRequired);
                         }
                         crate::update::recover_desktop_managed(&data, &receipt.managed_root)
@@ -1018,10 +1030,13 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                     }
                     let source = bundled.to_path_buf();
                     let fresh = inspect(&data, bundled).await?;
-                    if fresh.device_id != expected {
-                        anyhow::bail!(OperationFailure::UpdateRefused);
-                    }
-                    let running_version = if fresh.status == "running" {
+                    fresh
+                        .require_identity(&NodeIdentity {
+                            data_dir: data.clone(),
+                            device_id: expected.to_owned(),
+                        })
+                        .context(OperationFailure::UpdateRefused)?;
+                    let running_version = if fresh.status == NodeStatus::Running {
                         Some(running_core_version(&fresh)?.to_owned())
                     } else {
                         None
@@ -1038,50 +1053,54 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                     };
                     if !native.installed {
                         return emit(
-                            "partial",
+                            ServiceState::Partial,
                             Some(receipt),
                             Some(native.running),
-                            Some(fresh.status.clone()),
-                            running_version.as_deref(),
+                            Some(fresh.status),
+                            running_version.as_deref().filter(|_| native.running),
                             bundled,
                         );
                     }
                     match update_meta.availability {
-                        "current" => {
+                        UpdateAvailability::Current => {
                             if native.running
-                                && (fresh.status != "running"
+                                && (fresh.status != NodeStatus::Running
                                     || running_core_version(&fresh)?
                                         != bundled_package_version(&source)?)
                             {
                                 anyhow::bail!(OperationFailure::UpdateRefused);
                             }
-                            let core_status = if native.running && fresh.status == "running" {
-                                "running".to_string()
-                            } else if fresh.status == "stopped" {
-                                "stopped".to_string()
-                            } else {
-                                fresh.status.clone()
-                            };
+                            let core_status =
+                                if native.running && fresh.status == NodeStatus::Running {
+                                    NodeStatus::Running
+                                } else if fresh.status == NodeStatus::Stopped {
+                                    NodeStatus::Stopped
+                                } else {
+                                    fresh.status
+                                };
                             return emit(
                                 if native.running {
-                                    "installed"
+                                    ServiceState::Installed
                                 } else {
-                                    "installed_stopped"
+                                    ServiceState::InstalledStopped
                                 },
                                 Some(receipt),
                                 Some(native.running),
                                 Some(core_status),
-                                running_version.as_deref(),
+                                running_version.as_deref().filter(|_| native.running),
                                 bundled,
                             );
                         }
-                        "newer_available" => {}
-                        "downgrade_refused" | "immutable_conflict" => {
+                        UpdateAvailability::NewerAvailable => {}
+                        UpdateAvailability::DowngradeRefused
+                        | UpdateAvailability::ImmutableConflict => {
                             anyhow::bail!(OperationFailure::UpdateRefused)
                         }
                         _ => anyhow::bail!(OperationFailure::UpdateRefused),
                     }
-                    if (fresh.status == "running") != native.running {
+                    if fresh.status == NodeStatus::Unavailable
+                        || (fresh.status == NodeStatus::Running) != native.running
+                    {
                         anyhow::bail!(OperationFailure::UpdateRefused);
                     }
                     let bundled_version = bundled_package_version(&source)?;
@@ -1150,9 +1169,9 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                         .context(OperationFailure::Health)?;
                     emit(
                         if snapshot.service_running {
-                            "installed"
+                            ServiceState::Installed
                         } else {
-                            "installed_stopped"
+                            ServiceState::InstalledStopped
                         },
                         Some(receipt),
                         Some(snapshot.service_running),
@@ -1162,6 +1181,10 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                     )
                 }
                 Action::Start => {
+                    ensure!(
+                        inspected.status == NodeStatus::Stopped,
+                        OperationFailure::Health
+                    );
                     let receipt = existing.as_ref().context("Desktop Node is not installed")?;
                     ensure!(
                         receipt.device_id == expected && receipt.data_dir == data,
@@ -1181,11 +1204,19 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                         "background service manager did not confirm the started Node"
                     );
                     let final_inspect = inspect(&data, bundled).await?;
+                    final_inspect.require_identity(&NodeIdentity {
+                        data_dir: data.clone(),
+                        device_id: expected.to_owned(),
+                    })?;
+                    ensure!(
+                        final_inspect.status == NodeStatus::Running,
+                        OperationFailure::Health
+                    );
                     emit(
-                        "installed",
+                        ServiceState::Installed,
                         Some(receipt),
                         Some(true),
-                        Some("running".into()),
+                        Some(NodeStatus::Running),
                         Some(running_core_version(&final_inspect)?),
                         bundled,
                     )
@@ -1210,11 +1241,20 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                         native.installed && !native.running,
                         "background service manager did not confirm the stopped Node"
                     );
+                    let final_inspect = inspect(&data, bundled).await?;
+                    final_inspect.require_identity(&NodeIdentity {
+                        data_dir: data.clone(),
+                        device_id: expected.to_owned(),
+                    })?;
+                    ensure!(
+                        final_inspect.status == NodeStatus::Stopped,
+                        OperationFailure::Health
+                    );
                     emit(
-                        "installed_stopped",
+                        ServiceState::InstalledStopped,
                         Some(receipt),
                         Some(false),
-                        Some("stopped".into()),
+                        Some(final_inspect.status),
                         None,
                         bundled,
                     )
@@ -1241,10 +1281,10 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                     );
                     fs::remove_file(receipt_path(&receipt.managed_root))?;
                     emit(
-                        "not_installed",
+                        ServiceState::NotInstalled,
                         None,
                         Some(false),
-                        Some("stopped".into()),
+                        Some(NodeStatus::Stopped),
                         None,
                         bundled,
                     )
@@ -1382,7 +1422,7 @@ mod tests {
     fn install_test_receipt(profile: &Path, data: &Path, root: &Path) -> Receipt {
         Receipt {
             schema: 1,
-            device_id: "device-fixture".into(),
+            device_id: "a".repeat(64),
             data_dir: data.to_path_buf(),
             managed_root: root.to_path_buf(),
             service_id: service_id(profile),
@@ -1465,7 +1505,7 @@ mod tests {
     }
 
     #[test]
-    fn inspect_projects_required_fields_from_cores_full_health_report() {
+    fn inspect_decodes_the_complete_core_health_report() {
         let report = serde_json::json!({
             "data_dir": "/fixture/node",
             "device_id": "a".repeat(64),
@@ -1475,17 +1515,18 @@ mod tests {
             "maintenance_socket": "/fixture/node/maintenance.sock",
             "listen": "127.0.0.1:4790",
             "local_listen": "127.0.0.1:4791",
-            "public_url": null,
+            "public_url": "http://127.0.0.1:4790",
+            "http_enabled": true,
             "web_enabled": true,
             "write_state": null,
             "mesh": {"enabled": true, "network": "vibeface", "records": 4, "neighbors": 2},
             "peers": [],
             "error": null
         });
-        let inspected: InspectResult = serde_json::from_value(report.clone()).unwrap();
+        let inspected: Inspection = serde_json::from_value(report.clone()).unwrap();
         assert_eq!(inspected.data_dir, Path::new("/fixture/node"));
         assert_eq!(inspected.device_id, "a".repeat(64));
-        assert_eq!(inspected.status, "running");
+        assert_eq!(inspected.status, NodeStatus::Running);
         assert_eq!(
             running_core_version(&inspected).unwrap(),
             "0.0.1-hourly.2026110812"
@@ -1495,7 +1536,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("device_id");
-        assert!(serde_json::from_value::<InspectResult>(missing_identity).is_err());
+        assert!(serde_json::from_value::<Inspection>(missing_identity).is_err());
     }
 
     #[test]
@@ -1504,25 +1545,25 @@ mod tests {
         let bundled = sealed_fixture_version(&root.join("bundled"), env!("CARGO_PKG_VERSION"));
         let installed = sealed_fixture_version(&root.join("installed"), "0.0.1-hourly.2026110712");
         let newer = runtime_update_for_packages(&bundled, Some(&installed), None).unwrap();
-        assert_eq!(newer.availability, "newer_available");
+        assert_eq!(newer.availability, UpdateAvailability::NewerAvailable);
         let matching = sealed_fixture_version(&root.join("matching"), env!("CARGO_PKG_VERSION"));
         let current = runtime_update_for_packages(&matching, Some(&matching), None).unwrap();
-        assert_eq!(current.availability, "current");
+        assert_eq!(current.availability, UpdateAvailability::Current);
         let downgraded =
             sealed_fixture_version(&root.join("downgraded"), "0.0.1-hourly.2026110612");
         let downgrade = runtime_update_for_packages(&downgraded, Some(&installed), None).unwrap();
-        assert_eq!(downgrade.availability, "downgrade_refused");
+        assert_eq!(downgrade.availability, UpdateAvailability::DowngradeRefused);
         let same_version = sealed_fixture_version(&root.join("same"), "0.0.1-hourly.2026110712");
         fs::write(installed.join("web/index.html"), b"changed-bytes").unwrap();
         let conflict = runtime_update_for_packages(&same_version, Some(&installed), None).unwrap();
-        assert_eq!(conflict.availability, "immutable_conflict");
+        assert_eq!(conflict.availability, UpdateAvailability::ImmutableConflict);
         let mismatch = runtime_update_for_packages(
             &matching,
             Some(&matching),
             Some("0.0.1-hourly.2026110612"),
         )
         .unwrap();
-        assert_eq!(mismatch.availability, "newer_available");
+        assert_eq!(mismatch.availability, UpdateAvailability::NewerAvailable);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1709,7 +1750,7 @@ mod tests {
         fs::write(data.join("config.json"), b"config").unwrap();
         fs::write(
             data.join("identity.json"),
-            br#"{"device_id":"device-fixture"}"#,
+            br#"{"device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
         )
         .unwrap();
         let managed_root = profile.join("node-runtime");
@@ -1755,7 +1796,7 @@ mod tests {
                 let error = dispatch(
                     DesktopNode {
                         profile_dir: profile.clone(),
-                        expected_device_id: Some("device-fixture".into()),
+                        expected_device_id: Some("a".repeat(64)),
                         action,
                     },
                     &bundled,
