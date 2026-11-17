@@ -3,7 +3,7 @@ use crate::{
     crypto::LocalIdentity,
     model::{ResolvedModel, WorkKind},
     providers::Provider,
-    runtime::test_support::{access, bot, manager_settings, node, signed_main_input},
+    runtime::test_support::{bot, manager_settings, node, signed_main_input},
     store::bot_settings::ChangeRequest,
     work::WorkSpec,
 };
@@ -186,7 +186,7 @@ impl Fixture {
             Duration::from_secs(10),
             super::super::run(
                 self.node.clone(),
-                access(self.network.clone(), false, Some("c".into())),
+                self.network.clone(),
                 "c".into(),
                 self.scope.clone(),
             ),
@@ -197,7 +197,7 @@ impl Fixture {
     async fn owner(&self) -> Result<TurnAttempt> {
         let mut owner = TurnAttempt::claim(
             self.node.clone(),
-            access(self.network.clone(), false, Some("c".into())),
+            self.network.clone(),
             "c".into(),
             self.scope.clone(),
         )
@@ -208,7 +208,8 @@ impl Fixture {
             .node
             .register_manager_attempt(
                 owner.phase.round()?.token.clone(),
-                owner.access.clone(),
+                &owner.network,
+                &owner.conversation,
                 &owner.attempt.id,
                 &owner.job.trigger,
                 Provider::Pi,

@@ -273,7 +273,7 @@ impl Runtime {
         scope: &str,
         targets: Vec<String>,
     ) -> Result<ObservationGuard> {
-        ensure!(access.human, "progress observation requires a client");
+        ensure!(access.is_user(), "progress observation requires a client");
         self.require_scope(access, scope).await?;
         let local = self.identity.device_id()?;
         let targets = targets
@@ -282,7 +282,7 @@ impl Runtime {
             .collect::<BTreeSet<_>>();
         ensure!(targets.len() <= MAX_TARGETS, "too many progress sources");
         {
-            let (network, targets) = (access.network_id.clone(), targets.clone());
+            let (network, targets) = (access.network_id().to_owned(), targets.clone());
             self.store
                 .call("observation.authorize_targets", move |store| {
                     for target in &targets {
@@ -305,7 +305,7 @@ impl Runtime {
         state.leases.insert(
             id.clone(),
             Lease {
-                network: access.network_id.clone(),
+                network: access.network_id().to_owned(),
                 scope: scope.into(),
                 targets,
                 expires: Instant::now() + LEASE,
@@ -334,16 +334,7 @@ impl Runtime {
         );
         let scope = field(input, "conversation_id")?;
         self.membership_state().await?;
-        self.require_scope(
-            &Access {
-                network_id: network.into(),
-                human: false,
-                conversation_id: Some(scope.into()),
-                manager: None,
-            },
-            scope,
-        )
-        .await?;
+        self.require_conversation(network, scope).await?;
         {
             let network = network.to_owned();
             let origin = origin.to_owned();
@@ -427,16 +418,8 @@ impl Runtime {
                     })
                     .await
             }?;
-            self.require_scope(
-                &Access {
-                    network_id: stream.network.clone(),
-                    human: true,
-                    conversation_id: Some(stream.scope.clone()),
-                    manager: None,
-                },
-                &stream.scope,
-            )
-            .await
+            self.require_conversation(&stream.network, &stream.scope)
+                .await
         }
         .await;
         if let Err(error) = authorized {

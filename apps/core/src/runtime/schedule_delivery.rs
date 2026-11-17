@@ -828,15 +828,13 @@ impl Runtime {
             if !self.prepare_scope_input(network, key).await? {
                 return Ok(ran);
             }
-            let access = Access {
-                network_id: network.into(),
-                human: false,
-                conversation_id: Some(scope.into()),
-                manager: None,
-            };
-            let Some(result) =
-                crate::scheduler::run(self.clone(), access, scope.into(), key.scope.clone())
-                    .await?
+            let Some(result) = crate::scheduler::run(
+                self.clone(),
+                network.into(),
+                scope.into(),
+                key.scope.clone(),
+            )
+            .await?
             else {
                 return Ok(ran);
             };
@@ -1197,7 +1195,10 @@ impl Runtime {
         access: &Access,
         input: &Value,
     ) -> Result<Value> {
-        ensure!(access.human, "agents cannot recursively invoke managers");
+        ensure!(
+            access.is_user(),
+            "agents cannot recursively invoke managers"
+        );
         let conversation = id(input, "conversation_id")?;
         self.require_scope(access, &conversation).await?;
         match self.accept_chat_message_inner(access, input).await {
@@ -1207,7 +1208,7 @@ impl Runtime {
                 let stored = self
                     .store
                     .call("workspace_input_evidence", {
-                        let network_id = access.network_id.to_owned();
+                        let network_id = access.network_id().to_owned();
                         let conversation = conversation.clone();
                         let message_id = message_id.to_owned();
                         move |store| store.input_evidence(&network_id, &conversation, &message_id)
@@ -1238,8 +1239,11 @@ impl Runtime {
         input: &Value,
     ) -> Result<Value> {
         let _work = self.maintenance.enter()?;
-        ensure!(access.human, "agents cannot recursively invoke managers");
-        let network = &access.network_id;
+        ensure!(
+            access.is_user(),
+            "agents cannot recursively invoke managers"
+        );
+        let network = access.network_id();
         let scope = id(input, "conversation_id")?;
         self.require_scope(access, &scope).await?;
         let message_id = id(input, "message_id")?;
@@ -1261,7 +1265,7 @@ impl Runtime {
         let local = self.identity.device_id()?;
         let (message, receipt) = {
             let identity = self.identity.clone();
-            let network = network.clone();
+            let network = network.to_owned();
             let scope = scope.clone();
             let message_id = message_id.clone();
             let attestation = attestation(input)?;
@@ -1391,14 +1395,14 @@ impl Runtime {
         dismiss: bool,
     ) -> Result<Value> {
         let _work = self.maintenance.enter()?;
-        ensure!(access.human, "only the user asks for these replies");
-        let network = &access.network_id;
+        ensure!(access.is_user(), "only the user asks for these replies");
+        let network = access.network_id();
         let scope = id(input, "conversation_id")?;
         self.require_scope(access, &scope).await?;
         let message_ids: Vec<String> = serde_json::from_value(input["message_ids"].clone())
             .context("message_ids must be a list of message IDs")?;
         let local = self.identity.device_id()?;
-        let query_network = network.clone();
+        let query_network = network.to_owned();
         let query_scope = scope.clone();
         let receipts = self
             .store
@@ -1651,9 +1655,7 @@ fn attachment_mime(name: &str, bytes: &[u8]) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::test_support::{
-        access as test_access, manager_settings, signed_main_input,
-    };
+    use crate::runtime::test_support::{manager_settings, signed_main_input};
 
     #[tokio::test]
     async fn saved_inputs_retry_admission_after_capacity_and_storage_failures() -> Result<()> {
@@ -1693,7 +1695,7 @@ mod tests {
                 let input = json!({"conversation_id":"c","message_id":message_id,
                     "target":{"kind":"bot_main","bot_id":"c"},"intent":"continue","sequence":1,
                     "text":"saved input","attachments":[],"report_results":true,"attestation":signed.attestation()});
-                let access = test_access(network.clone(), true, Some("c".into()));
+                let access = crate::runtime::Access::User { network_id: network.clone(), scope: crate::runtime::UserScope::Conversation("c".into()) };
                 let accepted = node.accept_chat_message(&access, &input).await?;
                 assert_eq!(accepted["accepted"], true);
                 assert_eq!(accepted["state"], "pending_admission");
@@ -1774,7 +1776,7 @@ mod tests {
                 Ok(())
                 }
             }).await?;
-            let access = test_access(network.clone(), true, Some("c".into()));
+            let access = crate::runtime::Access::User { network_id: network.clone(), scope: crate::runtime::UserScope::Conversation("c".into()) };
             let accepted = node.accept_chat_message(&access, &input).await?;
             assert_eq!(accepted["accepted"], true);
             assert_eq!(accepted["state"], "pending_admission");
@@ -1798,7 +1800,7 @@ mod tests {
                 "target":{"kind":"task","task_id":"task"},"intent":"continue","sequence":1,
                 "expected_revision":1,"text":"task input","attachments":[],"report_results":true,
                 "attestation":signed.attestation()});
-            let access = test_access(network.clone(), true, Some("task-bot".into()));
+            let access = crate::runtime::Access::User { network_id: network.clone(), scope: crate::runtime::UserScope::Conversation("task-bot".into()) };
             let accepted = node.accept_chat_message(&access, &input).await?;
             assert_eq!(accepted["accepted"], true);
             assert_eq!(accepted["state"], "pending_admission");
@@ -1938,7 +1940,7 @@ mod tests {
                 }
                 let (running_node, running_network, running_id) = (node.clone(), network.clone(), work_id.clone());
                 let running = tokio::spawn(async move {
-                    crate::scheduler::run(running_node, test_access(running_network, false, Some("c".into())), "c".into(),
+                    crate::scheduler::run(running_node, running_network, "c".into(),
                         crate::scheduling::SessionScope::Task { work_id: running_id }).await
                 });
                 if case == "registration" {
@@ -2023,7 +2025,7 @@ mod tests {
                     }).await?;
                 }
                 let invocation = tokio::time::timeout(Duration::from_secs(5), crate::scheduler::run(
-                    node.clone(), test_access(network.clone(), false, Some("c".into())),
+                    node.clone(), network.clone(),
                     "c".into(), crate::scheduling::SessionScope::Main,
                 )).await?;
                 if case == "runtime" {
@@ -2430,7 +2432,7 @@ mod tests {
                 Ok(pending)
                 }).await?
             };
-            node.cancel_manager(&test_access(network.clone(), true, Some("c".into())),
+            node.cancel_manager(&crate::runtime::Access::User { network_id: network.clone(), scope: crate::runtime::UserScope::Conversation("c".into()) },
                 &json!({"conversation_id":"c","trigger":trigger})).await?;
             let mut requests = scripted_app_server(&node, |request| {
                 if request["method"] == "thread/read" {

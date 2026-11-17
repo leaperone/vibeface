@@ -6,11 +6,11 @@ impl Runtime {
         access: &Access,
         input: &Value,
     ) -> Result<Value> {
-        ensure!(access.human, "only the user creates Bots");
+        ensure!(access.is_user(), "only the user creates Bots");
         let bot_id = id(input, "bot_id")?;
         let scope = id(input, "conversation_id")?;
-        if let Some(allowed) = &access.conversation_id {
-            ensure!(allowed == &scope, "outside this client's conversation");
+        if let Some(allowed) = access.conversation_id() {
+            ensure!(allowed == scope, "outside this client's conversation");
         }
         let name = field(input, "name")?;
         let instructions = input
@@ -24,7 +24,7 @@ impl Runtime {
             .map(|value| serde_json::from_value(value.clone()))
             .transpose()?;
         let existing = {
-            let network_id = access.network_id.to_owned();
+            let network_id = access.network_id().to_owned();
             self.store
                 .call("bots.bots", move |store| store.bots(&network_id))
                 .await
@@ -32,12 +32,12 @@ impl Runtime {
         .iter()
         .any(|bot| bot.bot_id == bot_id);
         if !existing && let Some(project) = &project {
-            self.validate_bot_project(&access.network_id, project)
+            self.validate_bot_project(access.network_id(), project)
                 .await?;
         }
         let bot = {
             let identity = self.identity.to_owned();
-            let network_id = access.network_id.to_owned();
+            let network_id = access.network_id().to_owned();
             let spec = BotCreateSpec {
                 conversation_id: scope.clone(),
                 bot_id,
@@ -53,24 +53,24 @@ impl Runtime {
                 })
                 .await
         }?;
-        self.publish_changed(&access.network_id, &scope, Changed::Event(&bot.event_hash));
+        self.publish_changed(access.network_id(), &scope, Changed::Event(&bot.event_hash));
         Ok(json!({"bot":bot}))
     }
 
     pub(super) async fn bots(&self, access: &Access) -> Result<Value> {
         ensure!(
-            access.human,
+            access.is_user(),
             "Bot definitions are unavailable to Agent tokens"
         );
         let state = self.membership_state().await?;
         ensure!(
-            state.genesis.network_id == access.network_id,
+            state.genesis.network_id == access.network_id(),
             "wrong personal network"
         );
         let (bots, mut last, mut busy, primary, successor) = {
             let (network, allowed_scope, local) = (
-                access.network_id.clone(),
-                access.conversation_id.clone(),
+                access.network_id().to_owned(),
+                access.conversation_id().map(str::to_owned),
                 self.identity.device_id()?,
             );
             self.store
@@ -112,14 +112,17 @@ impl Runtime {
     /// The user pauses, resumes or deletes a schedule; the scheduler reads the projection, so a
     /// paused one is not queued and a queued run is cancelled when claimed.
     pub(super) async fn control_schedule(&self, access: &Access, input: &Value) -> Result<Value> {
-        ensure!(access.human, "only the user pauses or deletes a schedule");
+        ensure!(
+            access.is_user(),
+            "only the user pauses or deletes a schedule"
+        );
         let scope = id(input, "conversation_id")?;
         let schedule_id = id(input, "schedule_id")?;
         let action: ScheduleAction = serde_json::from_value(input["action"].clone())
             .context("action is pause, resume or delete")?;
         let written = {
             let identity = self.identity.to_owned();
-            let network_id = access.network_id.to_owned();
+            let network_id = access.network_id().to_owned();
             let scope = scope.to_owned();
             let schedule_id = schedule_id.to_owned();
             let attestation_input = attestation(input)?;
@@ -138,14 +141,14 @@ impl Runtime {
                 .await
         }?;
         if let Some(hash) = &written {
-            self.publish_changed(&access.network_id, &scope, Changed::Event(hash));
+            self.publish_changed(access.network_id(), &scope, Changed::Event(hash));
             self.schedule_wakeup.notify_one();
         }
         Ok(json!({"written":written.is_some()}))
     }
 
     pub(super) async fn control_memory(&self, access: &Access, input: &Value) -> Result<Value> {
-        ensure!(access.human, "only the user controls memory");
+        ensure!(access.is_user(), "only the user controls memory");
         let scope = id(input, "conversation_id")?;
         self.require_scope(access, &scope).await?;
         let command = crate::store::bot_settings::MemoryControlCommand {
@@ -159,7 +162,7 @@ impl Runtime {
         };
         let result = {
             let identity = self.identity.to_owned();
-            let network_id = access.network_id.to_owned();
+            let network_id = access.network_id().to_owned();
             let scope = scope.to_owned();
             self.store
                 .call("bots.control_memory", move |store| {
@@ -168,13 +171,13 @@ impl Runtime {
                 .await
         }?;
         if result.state == MemoryControlStatus::Applied {
-            self.publish_changed(&access.network_id, &scope, Changed::Reload);
+            self.publish_changed(access.network_id(), &scope, Changed::Reload);
         }
         Ok(json!(result))
     }
 
     pub(super) async fn memory_state(&self, access: &Access, input: &Value) -> Result<Value> {
-        ensure!(access.human, "only the user reads memory state");
+        ensure!(access.is_user(), "only the user reads memory state");
         let scope = id(input, "conversation_id")?;
         self.require_scope(access, &scope).await?;
         let memory_id = id(input, "memory_id")?;
@@ -183,8 +186,10 @@ impl Runtime {
             .map(|value| value.as_str().context("operation_id must be a string"))
             .transpose()?;
         let state = {
-            let (network, operation_id) =
-                (access.network_id.clone(), operation_id.map(str::to_owned));
+            let (network, operation_id) = (
+                access.network_id().to_owned(),
+                operation_id.map(str::to_owned),
+            );
             self.store
                 .read("bots.memory_state", move |store| {
                     store
@@ -203,12 +208,12 @@ impl Runtime {
         access: &Access,
         input: &Value,
     ) -> Result<Value> {
-        ensure!(access.human, "only the user deletes a bot here");
+        ensure!(access.is_user(), "only the user deletes a bot here");
         let scope = id(input, "conversation_id")?;
-        if let Some(allowed) = &access.conversation_id {
-            ensure!(allowed == &scope, "outside this client's conversation");
+        if let Some(allowed) = access.conversation_id() {
+            ensure!(allowed == scope, "outside this client's conversation");
         }
-        let network = &access.network_id;
+        let network = access.network_id();
         let written = {
             let identity = self.identity.to_owned();
             let network = network.to_owned();
@@ -315,14 +320,14 @@ impl Runtime {
 
     /// The user's choice of the bot that judges what comes in without an owner.
     pub(super) async fn set_primary_bot(&self, access: &Access, input: &Value) -> Result<Value> {
-        ensure!(access.human, "only the user picks the primary bot");
+        ensure!(access.is_user(), "only the user picks the primary bot");
         let scope = id(input, "conversation_id")?;
-        if let Some(allowed) = &access.conversation_id {
-            ensure!(allowed == &scope, "outside this client's conversation");
+        if let Some(allowed) = access.conversation_id() {
+            ensure!(allowed == scope, "outside this client's conversation");
         }
         ensure!(
             {
-                let network_id = access.network_id.to_owned();
+                let network_id = access.network_id().to_owned();
                 let scope = scope.to_owned();
                 self.store
                     .call("bots.bot_for_conversation", move |store| {
@@ -335,7 +340,7 @@ impl Runtime {
         );
         let event = self
             .append(
-                &access.network_id,
+                access.network_id(),
                 BOTS_SCOPE,
                 EventBody::PrimaryBotSet {
                     conversation_id: scope,
@@ -344,19 +349,19 @@ impl Runtime {
             )
             .await?;
         tracing::info!(event = "bot.primary", "primary bot set");
-        self.publish_changed(&access.network_id, BOTS_SCOPE, Changed::Event(&event.hash));
+        self.publish_changed(access.network_id(), BOTS_SCOPE, Changed::Event(&event.hash));
         Ok(json!({"primary":({
-            let network_id = access.network_id.to_owned();
+            let network_id = access.network_id().to_owned();
             self.store.call("bots.primary_bot", move |store| store.primary_bot(&network_id)).await
         }?)}))
     }
 
     /// The user moves a bot's project folder, or clears it; asking for the current one writes nothing.
     pub(super) async fn set_bot_project(&self, access: &Access, input: &Value) -> Result<Value> {
-        ensure!(access.human, "only the user moves a bot's project");
+        ensure!(access.is_user(), "only the user moves a bot's project");
         let scope = id(input, "conversation_id")?;
-        if let Some(allowed) = &access.conversation_id {
-            ensure!(allowed == &scope, "outside this client's conversation");
+        if let Some(allowed) = access.conversation_id() {
+            ensure!(allowed == scope, "outside this client's conversation");
         }
         let project: Option<BotProject> = input
             .get("project")
@@ -364,7 +369,7 @@ impl Runtime {
             .map(|value| serde_json::from_value(value.clone()))
             .transpose()?;
         let bot = {
-            let network_id = access.network_id.to_owned();
+            let network_id = access.network_id().to_owned();
             let scope = scope.to_owned();
             self.store
                 .call("bots.bot_for_conversation", move |store| {
@@ -377,12 +382,12 @@ impl Runtime {
             return Ok(json!({"bot":bot}));
         }
         if let Some(project) = &project {
-            self.validate_bot_project(&access.network_id, project)
+            self.validate_bot_project(access.network_id(), project)
                 .await?;
         }
         let event = self
             .append(
-                &access.network_id,
+                access.network_id(),
                 &scope,
                 EventBody::BotProjectSet {
                     project,
@@ -395,9 +400,9 @@ impl Runtime {
             conversation_id = scope,
             "bot project set"
         );
-        self.publish_changed(&access.network_id, &scope, Changed::Event(&event.hash));
+        self.publish_changed(access.network_id(), &scope, Changed::Event(&event.hash));
         Ok(json!({"bot":({
-            let network_id = access.network_id.to_owned();
+            let network_id = access.network_id().to_owned();
             let scope = scope.to_owned();
             self.store.call("bots.bot_for_conversation", move |store| store.bot_for_conversation(&network_id, &scope)).await
         }?)}))
@@ -408,10 +413,10 @@ impl Runtime {
     /// write landed reads it back. Otherwise the write holds only at that version: any later
     /// change gives a new one, so a replay cannot undo it even when the face went back.
     pub(super) async fn set_bot_avatar(&self, access: &Access, input: &Value) -> Result<Value> {
-        ensure!(access.human, "only the user picks a bot's face here");
+        ensure!(access.is_user(), "only the user picks a bot's face here");
         let scope = id(input, "conversation_id")?;
-        if let Some(allowed) = &access.conversation_id {
-            ensure!(allowed == &scope, "outside this client's conversation");
+        if let Some(allowed) = access.conversation_id() {
+            ensure!(allowed == scope, "outside this client's conversation");
         }
         let field = |key: &str| input.get(key).context("version and avatar are required");
         let version: Option<String> = serde_json::from_value(field("version")?.clone())
@@ -420,13 +425,13 @@ impl Runtime {
             .context("a face is an outline, eyes and hue, or null")?;
         let membership = self.membership_state().await?;
         ensure!(
-            membership.genesis.network_id == access.network_id,
+            membership.genesis.network_id == access.network_id(),
             "wrong personal network"
         );
         let (bot, event) = {
             let (identity, network, scope) = (
                 self.identity.clone(),
-                access.network_id.clone(),
+                access.network_id().to_owned(),
                 scope.clone(),
             );
             let signature_input = json!({"attestation":input["attestation"]});
@@ -466,7 +471,7 @@ impl Runtime {
             conversation_id = scope,
             "bot face set"
         );
-        self.publish_changed(&access.network_id, &scope, Changed::Event(&event.hash));
+        self.publish_changed(access.network_id(), &scope, Changed::Event(&event.hash));
         Ok(json!({"bot":bot}))
     }
 
@@ -531,7 +536,7 @@ impl Runtime {
 mod tests {
     use super::*;
     use crate::model::{Eyes, Hue, Outline};
-    use crate::runtime::test_support::{access as test_access, bot, node, start_reply};
+    use crate::runtime::test_support::{bot, node, start_reply};
 
     #[tokio::test]
     async fn the_panel_writes_a_face_only_at_the_version_it_saw() -> Result<()> {
@@ -550,8 +555,13 @@ mod tests {
             face(Outline::Cloud, Eyes::Wide, 285)?,
             face(Outline::Bean, Eyes::Dot, 155)?,
         );
-        let client =
-            |scope: Option<&str>| test_access(network.clone(), true, scope.map(Into::into));
+        let client = |scope: Option<&str>| crate::runtime::Access::User {
+            network_id: network.clone(),
+            scope: scope
+                .map(Into::into)
+                .map(crate::runtime::UserScope::Conversation)
+                .unwrap_or(crate::runtime::UserScope::Network),
+        };
         let request =
             |scope: &str, version: Option<String>, avatar: Option<Avatar>| -> Result<Value> {
                 let signed = admin.attest(
@@ -601,10 +611,9 @@ mod tests {
                 anyhow::Ok((bot.avatar, bot.avatar_version))
             }
         };
-        let reader = Access {
-            human: false,
-            conversation_id: Some("d".into()),
-            ..client(None)
+        let reader = AgentAccess::ReadOnly {
+            network_id: network.clone(),
+            conversation_id: "d".into(),
         };
         let listed = node.tool(reader.clone(), "list_bots", json!({})).await?;
         let derived = Avatar::derived("c");
@@ -620,10 +629,10 @@ mod tests {
         );
 
         let pick = request("c", None, Some(cloud))?;
-        let agent = Access {
-            human: false,
-            ..client(None)
-        };
+        let agent = Access::Agent(AgentAccess::ReadOnly {
+            network_id: network.clone(),
+            conversation_id: "c".into(),
+        });
         assert!(
             node.rpc(agent, pick.clone()).await.is_err(),
             "agents never pick a face"
@@ -725,7 +734,10 @@ mod tests {
         bot(&node, &admin, "c", "Ops", &[]).await?;
         let network = node.membership_state().await?.genesis.network_id;
         let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
-        let idle = test_access(network, false, Some("c".into()));
+        let idle = crate::runtime::AgentAccess::ReadOnly {
+            network_id: network,
+            conversation_id: "c".into(),
+        };
         let live = node
             .manager_access_fixture(
                 "token",

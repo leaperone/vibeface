@@ -50,8 +50,8 @@ fn receipt_identity(value: &Value, message_id: &str, target: &InputTarget) -> Re
 
 impl Runtime {
     pub(super) async fn scope_context(&self, access: &Access, input: &Value) -> Result<Value> {
-        ensure!(access.human, "scope context access requires the user");
-        let network = &access.network_id;
+        ensure!(access.is_user(), "scope context access requires the user");
+        let network = access.network_id();
         let conversation = id(input, "conversation_id")?;
         self.require_scope(access, &conversation).await?;
         let target: InputTarget =
@@ -104,8 +104,8 @@ impl Runtime {
     }
 
     pub(super) async fn input_receipt(&self, access: &Access, input: &Value) -> Result<Value> {
-        ensure!(access.human, "input receipt access requires the user");
-        let network = &access.network_id;
+        ensure!(access.is_user(), "input receipt access requires the user");
+        let network = access.network_id();
         let message_id = id(input, "message_id")?;
         let conversation = id(input, "conversation_id")?;
         self.require_scope(access, &conversation).await?;
@@ -188,7 +188,7 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::test_support::{access, join_network, open_node, signed_main_input};
+    use crate::runtime::test_support::{join_network, open_node, signed_main_input};
 
     #[tokio::test]
     async fn original_entry_reconciliation_requires_exact_authority_and_retained_absence()
@@ -202,7 +202,7 @@ mod tests {
             super::super::test_support::bot(&node, &admin, "chat", "Receipt fixture", &[]).await?;
             let local = node.identity.device_id()?;
             let client = admin.device_id()?;
-            let access = access(network.clone(), true, Some("chat".into()));
+            let access = crate::runtime::Access::User { network_id: network.clone(), scope: crate::runtime::UserScope::Conversation("chat".into()) };
             let signed = signed_main_input(&admin, &network, "chat", "missing", "original input", vec![], 1)?;
             let original = json!({"conversation_id":"chat","message_id":"missing",
                 "target":{"kind":"bot_main","bot_id":"chat"},"intent":"continue","sequence":1,
@@ -218,7 +218,7 @@ mod tests {
             assert_eq!(not_saved["conversation_id"], "chat");
             assert_eq!(not_saved["message_id"], "missing");
             assert_eq!(not_saved["target"], original["target"]);
-            let other_network = crate::runtime::test_support::access("0".repeat(64), true, Some("chat".into()));
+            let other_network = crate::runtime::Access::User { network_id: "0".repeat(64), scope: crate::runtime::UserScope::Conversation("chat".into()) };
             assert!(node.input_receipt(&other_network, &query).await.is_err());
             for (pointer, value) in [
                 ("/entry_device_id", json!("another-entry")),

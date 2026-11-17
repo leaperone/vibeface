@@ -18,8 +18,13 @@ pub(super) struct ExecutionProviderRequest<'a> {
 
 impl Runtime {
     /// The one entry for coordination tools: Cursor MCP and `vibeface tool` both land here.
-    pub async fn tool(self: &Arc<Self>, access: Access, name: &str, args: Value) -> Result<Value> {
-        let conversation_id = access.conversation_id.clone();
+    pub async fn tool(
+        self: &Arc<Self>,
+        access: AgentAccess,
+        name: &str,
+        args: Value,
+    ) -> Result<Value> {
+        let conversation_id = access.conversation_id().to_owned();
         let asked_work = args["work_id"].as_str().map(str::to_owned);
         let mut stage = "validation";
         let result = match Tool::invocation(name, args.clone()) {
@@ -39,7 +44,7 @@ impl Runtime {
                 }),
             Err(error) => Err(ToolFailure::new(name, &args, stage, false, &error).into()),
         };
-        let conversation_id = conversation_id.as_deref();
+        let conversation_id = Some(conversation_id.as_str());
         match &result {
             Ok(value) => {
                 let work_id = value["work_id"].as_str().or(asked_work.as_deref());
@@ -60,29 +65,26 @@ impl Runtime {
 
     async fn run_tool(
         self: &Arc<Self>,
-        access: Access,
+        access: AgentAccess,
         tool: Tool,
         args: Value,
         stage: &mut &'static str,
     ) -> Result<Value> {
         *stage = "authorization";
         let _work = self.maintenance.enter()?;
-        ensure!(!access.human, "tool endpoint requires a scoped Agent token");
-        let scope = access
-            .conversation_id
-            .clone()
-            .context("missing tool scope")?;
-        self.require_scope(&access, &scope).await?;
+        let scope = access.conversation_id().to_owned();
+        self.require_conversation(access.network_id(), &scope)
+            .await?;
         let name = tool.name();
         ensure!(
-            tool.effect() == Effect::Read || access.manager.is_some(),
+            tool.effect() == Effect::Read || access.invocation().is_some(),
             "work changes require a live agent invocation"
         );
-        let mut kind = if let Some(manager) = &access.manager {
+        let mut kind = if let Some(manager) = access.invocation() {
             Some(
                 {
                     let arg0 = (scope).to_owned();
-                    let arg1 = (manager.trigger).to_owned();
+                    let arg1 = (manager.trigger()).to_owned();
                     self.store
                         .call("agent_tools.scheduler_job", move |store| {
                             store.scheduler_job(&arg0, &arg1)
@@ -101,13 +103,17 @@ impl Runtime {
                 "{name} is not offered in a {kind:?} turn"
             );
         }
-        let _lease =
-            tokio::time::timeout(Duration::from_secs(20), self.manager_tool_lease(&access))
-                .await
-                .context("agent tool admission timed out")??;
+        let _lease = match access.invocation() {
+            Some(invocation) => Some(
+                tokio::time::timeout(Duration::from_secs(20), self.manager_tool_lease(invocation))
+                    .await
+                    .context("agent tool admission timed out")??,
+            ),
+            None => None,
+        };
         *stage = "execution";
-        let network = access.network_id.as_str();
-        if let Some(manager) = &access.manager {
+        let network = access.network_id();
+        if let Some(manager) = access.invocation() {
             let network = network.to_owned();
             let scope = scope.clone();
             let manager = manager.clone();
@@ -116,7 +122,7 @@ impl Runtime {
                 .store
                 .call("agent_tools.validate_scope", move |store| {
                     let job = store
-                        .scheduler_job(&scope, &manager.trigger)?
+                        .scheduler_job(&scope, manager.trigger())?
                         .context("this turn is not running here")?;
                     if let crate::scheduling::SessionScope::WorkspaceTask { task_id } = &job.scope {
                         let task = store
@@ -178,7 +184,7 @@ impl Runtime {
                 self.agent_history(&access, &scope, tool, &args).await
             }
             Tool::Nodes => {
-                self.rpc_inner(access.clone(), json!({"method":"nodes"}))
+                self.rpc_inner(Access::Agent(access.clone()), json!({"method":"nodes"}))
                     .await
             }
             Tool::Context => self.agent_context(&access, &scope, &args).await,
@@ -191,11 +197,10 @@ impl Runtime {
                     self.store
                         .call("agent_tools.work_status", move |store| {
                             let job = access
-                                .manager
-                                .as_ref()
+                                .invocation()
                                 .map(|manager| {
                                     store
-                                        .scheduler_job(&scope, &manager.trigger)?
+                                        .scheduler_job(&scope, manager.trigger())?
                                         .context("this turn is not running here")
                                 })
                                 .transpose()?;
@@ -254,7 +259,7 @@ impl Runtime {
             }
             Tool::Recall => {
                 let query = args["query"].as_str().map(str::to_lowercase);
-                let manager = access.manager.as_ref();
+                let manager = access.invocation();
                 let network = network.to_owned();
                 let scope = scope.clone();
                 let manager = manager.cloned();
@@ -273,8 +278,8 @@ impl Runtime {
                         if let Some(manager) = manager {
                             for mutation in store.staged_memory_overlay(
                                 &scope,
-                                &manager.trigger,
-                                &manager.attempt_id,
+                                manager.trigger(),
+                                manager.attempt_id(),
                             )? {
                                 notes.retain(|note| note.memory_id != mutation.memory_id);
                                 if let Some(text) = mutation.after {
@@ -352,11 +357,10 @@ impl Runtime {
                 self.store
                     .call("agent_tools.listsessions", move |store| {
                         let job = access
-                            .manager
-                            .as_ref()
+                            .invocation()
                             .map(|manager| {
                                 store
-                                    .scheduler_job(&scope, &manager.trigger)?
+                                    .scheduler_job(&scope, manager.trigger())?
                                     .context("this turn is not running here")
                             })
                             .transpose()?;
@@ -387,14 +391,13 @@ impl Runtime {
             }
             Tool::DeleteBot => {
                 let manager = access
-                    .manager
-                    .as_ref()
+                    .invocation()
                     .context("deleting a bot requires an agent invocation")?;
                 let (deleted, event) = {
                     let arg0 = (self.identity).to_owned();
                     let arg1 = (network).to_owned();
                     let arg2 = (scope).to_owned();
-                    let arg3 = (manager.trigger).to_owned();
+                    let arg3 = (manager.trigger()).to_owned();
                     let arg4 = (field(&args, "bot")?).to_owned();
                     self.store
                         .call("agent_tools.delete_bot_in_turn", move |store| {
@@ -415,8 +418,7 @@ impl Runtime {
             }
             Tool::CreateBot => {
                 let manager = access
-                    .manager
-                    .as_ref()
+                    .invocation()
                     .context("creating a bot requires an agent invocation")?;
                 let call_ref = field(&args, "call_ref")?;
                 let optional = |key: &str| args[key].as_str().filter(|value| !value.is_empty());
@@ -428,7 +430,7 @@ impl Runtime {
                     (None, None) => None,
                     _ => bail!("give project_node and project_cwd together"),
                 };
-                let (bot_id, _) = created_bot_id(&scope, &manager.trigger, call_ref);
+                let (bot_id, _) = created_bot_id(&scope, manager.trigger(), call_ref);
                 let existing = {
                     let arg0 = (network).to_owned();
                     self.store
@@ -444,7 +446,7 @@ impl Runtime {
                     let identity = self.identity.clone();
                     let network = network.to_owned();
                     let scope = scope.clone();
-                    let trigger = manager.trigger.clone();
+                    let trigger = manager.trigger().to_owned();
                     let call_ref = call_ref.to_owned();
                     let name = field(&args, "name")?.to_owned();
                     let instructions = optional("instructions").unwrap_or("").to_owned();
@@ -473,14 +475,13 @@ impl Runtime {
             }
             Tool::MessageBot => {
                 let manager = access
-                    .manager
-                    .as_ref()
+                    .invocation()
                     .context("messaging a bot requires an agent invocation")?;
                 let (message, receipt, written) = {
                     let arg0 = (self.identity).to_owned();
                     let arg1 = (network).to_owned();
                     let arg2 = (scope).to_owned();
-                    let arg3 = (manager.trigger).to_owned();
+                    let arg3 = (manager.trigger()).to_owned();
                     let arg4 = (field(&args, "call_ref")?).to_owned();
                     let arg5 = (field(&args, "bot")?).to_owned();
                     let arg6 = (field(&args, "text")?).to_owned();
@@ -532,8 +533,7 @@ impl Runtime {
             | Tool::RemoveSchedule
             | Tool::Remind => {
                 let manager = access
-                    .manager
-                    .as_ref()
+                    .invocation()
                     .context("bot changes require an agent invocation")?;
                 let call_ref = field(&args, "call_ref")?.to_owned();
                 let mut request = args;
@@ -554,7 +554,7 @@ impl Runtime {
                     let arg0 = (self.identity).to_owned();
                     let arg1 = (network).to_owned();
                     let arg2 = (scope).to_owned();
-                    let arg3 = (manager.trigger).to_owned();
+                    let arg3 = (manager.trigger()).to_owned();
                     let arg4 = (call_ref).to_owned();
                     let arg5 = request;
                     let arg6 = provider;
@@ -584,8 +584,7 @@ impl Runtime {
             }
             Tool::Remember | Tool::Forget => {
                 let manager = access
-                    .manager
-                    .as_ref()
+                    .invocation()
                     .context("memory changes require an agent invocation")?;
                 let call_ref = field(&args, "call_ref")?.to_owned();
                 let mut request = args;
@@ -599,8 +598,8 @@ impl Runtime {
                 {
                     let arg0 = (network).to_owned();
                     let arg1 = (scope).to_owned();
-                    let arg2 = (manager.trigger).to_owned();
-                    let arg3 = (manager.attempt_id).to_owned();
+                    let arg2 = (manager.trigger()).to_owned();
+                    let arg3 = (manager.attempt_id()).to_owned();
                     let arg4 = (call_ref).to_owned();
                     let arg5 = request;
                     self.store
@@ -643,10 +642,9 @@ impl Runtime {
             }
             Tool::ProposeProviderConfig => {
                 let manager = access
-                    .manager
-                    .as_ref()
+                    .invocation()
                     .context("a proposal requires an agent invocation")?;
-                self.propose_provider_config(network, &scope, &manager.trigger, args)
+                self.propose_provider_config(network, &scope, manager.trigger(), args)
                     .await
             }
             Tool::ApplyProviderConfig => {
@@ -685,35 +683,31 @@ impl Runtime {
 
     async fn agent_workspace(
         &self,
-        access: &Access,
+        access: &AgentAccess,
         conversation: &str,
         tool: Tool,
         args: &Value,
     ) -> Result<Value> {
-        let network = &access.network_id;
+        let network = access.network_id();
         let access = access.clone();
         let conversation = conversation.to_owned();
         let args = args.clone();
         let identity = self.identity.clone();
         let (value, written) = self.store.call("agent_tools.workspace", move |store| {
-            let network = &access.network_id;
+            let network = access.network_id();
             let conversation = conversation.as_str();
             let args = &args;
             let mut written = None;
             let value = (|| -> Result<Value> {
-        let job = access
-            .manager
-            .as_ref()
+        let job = access.invocation()
             .map(|manager| {
                 store
-                    .scheduler_job(conversation, &manager.trigger)?
+                    .scheduler_job(conversation, manager.trigger())?
                     .context("this turn is not running here")
             })
             .transpose()?;
         if tool == Tool::WorkspaceCommand {
-            let manager = access
-                .manager
-                .as_ref()
+            let manager = access.invocation()
                 .context("workspace commands need a current Bot turn")?;
             let job = job.as_ref().context("this turn is not running here")?;
             let command: crate::workspace::WorkspaceCommand =
@@ -723,7 +717,7 @@ impl Runtime {
                 crate::crypto::digest(&serde_json::to_vec(&(
                     network,
                     conversation,
-                    &manager.trigger,
+                    manager.trigger(),
                     field(args, "call_ref")?
                 ))?)
             );
@@ -846,7 +840,7 @@ impl Runtime {
 
     async fn agent_history(
         &self,
-        access: &Access,
+        access: &AgentAccess,
         scope: &str,
         tool: Tool,
         args: &Value,
@@ -856,21 +850,19 @@ impl Runtime {
         let args = args.clone();
         self.store.call("agent_tools.agent_history", move |store| {
 
-        let job = access
-            .manager
-            .as_ref()
+        let job = access.invocation()
             .map(|manager| {
                 store
-                    .scheduler_job(&scope, &manager.trigger)?
+                    .scheduler_job(&scope, manager.trigger())?
                     .context("this turn is not running here")
             })
             .transpose()?;
         let mut basis = job
             .as_ref()
             .map(|job| job.basis.clone())
-            .unwrap_or(store.version_vector(&access.network_id)?);
+            .unwrap_or(store.version_vector(access.network_id())?);
         if let Some(job) = &job {
-            for event in store.scheduler_late_inputs(&access.network_id, job)? {
+            for event in store.scheduler_late_inputs(access.network_id(), job)? {
                 let seq = basis.entry(event.event.author).or_default();
                 *seq = (*seq).max(event.event.seq);
             }
@@ -885,16 +877,16 @@ impl Runtime {
         } else {
             let (author, seq) = position(at, &basis)?;
             let event = store
-                .scope_event(&access.network_id, &scope, author, seq)?
+                .scope_event(access.network_id(), &scope, author, seq)?
                 .context("no event with this author and seq in this conversation")?;
             if let Some(job) = &job {
                 ensure!(
-                    store.scheduler_event_allowed(&access.network_id, job, &event)?,
+                    store.scheduler_event_allowed(access.network_id(), job, &event)?,
                     "event is outside this turn scope and delivered inputs"
                 );
             } else {
                 ensure!(
-                    store.main_event_allowed(&access.network_id, &scope, &event)?,
+                    store.main_event_allowed(access.network_id(), &scope, &event)?,
                     "event is outside this Main scope"
                 );
             }
@@ -908,7 +900,7 @@ impl Runtime {
             let (author, seq, _) = at.context("at is required")?;
             let mut result = event_page(
                 store,
-                &access.network_id,
+                access.network_id(),
                 &scope,
                 author,
                 seq,
@@ -926,7 +918,7 @@ impl Runtime {
         let limit = args["limit"].as_u64().unwrap_or(20) as usize;
         let (events, mut more) = match &job {
             Some(job) => store.scheduler_history_page(
-                &access.network_id,
+                access.network_id(),
                 job,
                 at,
                 crate::store::HistoryFilter {
@@ -937,7 +929,7 @@ impl Runtime {
                 100,
             )?,
             None => store.main_history_page(
-                &access.network_id,
+                access.network_id(),
                 &scope,
                 &basis,
                 at,
@@ -984,19 +976,22 @@ impl Runtime {
 
     /// Reads history as of the turn's basis, the same history its prompt was built from, so a
     /// position the prompt names still points at the same event while new ones arrive.
-    async fn agent_context(&self, access: &Access, scope: &str, args: &Value) -> Result<Value> {
+    async fn agent_context(
+        &self,
+        access: &AgentAccess,
+        scope: &str,
+        args: &Value,
+    ) -> Result<Value> {
         let access = access.clone();
         let scope = scope.to_owned();
         let args = args.clone();
         self.store.call("agent_tools.agent_context", move |store| {
-            let network = access.network_id.as_str();
+            let network = access.network_id();
 
-        let job = access
-            .manager
-            .as_ref()
+        let job = access.invocation()
             .map(|manager| {
                 store
-                    .scheduler_job(&scope, &manager.trigger)?
+                    .scheduler_job(&scope, manager.trigger())?
                     .context("this turn is not running here")
             })
             .transpose()?;
@@ -1126,11 +1121,15 @@ impl Runtime {
     }).await
     }
 
-    async fn call_lookup(&self, access: &Access, scope: &str, call_ref: &str) -> Result<Value> {
-        let network = access.network_id.as_str();
+    async fn call_lookup(
+        &self,
+        access: &AgentAccess,
+        scope: &str,
+        call_ref: &str,
+    ) -> Result<Value> {
+        let network = access.network_id();
         let manager = access
-            .manager
-            .as_ref()
+            .invocation()
             .context("call lookup requires an agent invocation")?;
         let network = network.to_owned();
         let scope = scope.to_owned();
@@ -1140,7 +1139,7 @@ impl Runtime {
         self.store.call("agent_tools.call_lookup", move |store| {
 
         let job = store
-            .scheduler_job(&scope, &manager.trigger)?
+            .scheduler_job(&scope, manager.trigger())?
             .context("this turn is not registered here")?;
         let work_trigger =
             store.scheduler_work_trigger(&network, &local, &job)?;
@@ -1156,21 +1155,21 @@ impl Runtime {
             return Ok(dispatch_row(&dispatch));
         }
         if let Some(change) =
-            store.bot_change(&network, &change_id(&scope, &manager.trigger, &call_ref))?
+            store.bot_change(&network, &change_id(&scope, manager.trigger(), &call_ref))?
         {
             return Ok(json!(change));
         }
         if let Some(staged) =
-            store.staged_memory_call(&scope, &manager.trigger, &manager.attempt_id, &call_ref)?
+            store.staged_memory_call(&scope, manager.trigger(), manager.attempt_id(), &call_ref)?
         {
             return Ok(staged);
         }
         if let Some(message) =
-            store.bot_message(&network, &bot_message_id(&scope, &manager.trigger, &call_ref))?
+            store.bot_message(&network, &bot_message_id(&scope, manager.trigger(), &call_ref))?
         {
             return Ok(json!(message));
         }
-        let (bot_id, _) = created_bot_id(&scope, &manager.trigger, &call_ref);
+        let (bot_id, _) = created_bot_id(&scope, manager.trigger(), &call_ref);
         let bot = store
             .bots(&network)?
             .into_iter()
@@ -1188,19 +1187,18 @@ impl Runtime {
     /// itself; another device's bot gets the task instead.
     async fn track_work(
         self: &Arc<Self>,
-        access: &Access,
+        access: &AgentAccess,
         scope: &str,
         args: &Value,
     ) -> Result<Value> {
-        let network = access.network_id.as_str();
+        let network = access.network_id();
         let manager = access
-            .manager
-            .as_ref()
+            .invocation()
             .context("dispatch requires an agent invocation")?;
         let call_ref = field(args, "call_ref")?;
         let local = self.identity.device_id()?;
         let optional = |key: &str| args[key].as_str().map(String::from);
-        let task = manager.trigger.strip_prefix("task:");
+        let task = manager.trigger().strip_prefix("task:");
         let target = match task {
             Some(_) => local.clone(),
             None => optional("target_node").unwrap_or_else(|| local.clone()),
@@ -1227,7 +1225,7 @@ impl Runtime {
             self.store
                 .call("agent_tools.work_trigger", move |store| {
                     let job = store
-                        .scheduler_job(&scope, &manager.trigger)?
+                        .scheduler_job(&scope, manager.trigger())?
                         .context("this turn is not registered here")?;
                     store.scheduler_work_trigger(&network, &local, &job)
                 })
@@ -1681,9 +1679,7 @@ pub(crate) fn work_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::test_support::{
-        access as test_access, bot, claim_reply, node, signed_main_input, start_reply,
-    };
+    use crate::runtime::test_support::{bot, claim_reply, node, signed_main_input, start_reply};
 
     async fn post(
         node: &Runtime,
@@ -1751,7 +1747,10 @@ mod tests {
         }
         let elsewhere = post(&node, &admin, &network, "d", "secret", "needle-private").await?;
         let (trigger, attempt) = start_reply(&node, &admin, "trigger").await?;
-        let idle = test_access(network.clone(), false, Some("c".into()));
+        let idle = crate::runtime::AgentAccess::ReadOnly {
+            network_id: network.clone(),
+            conversation_id: "c".into(),
+        };
         let access = node
             .manager_access_fixture("tools-history", idle, &attempt, &trigger, Provider::Codex)
             .await?;
@@ -1849,7 +1848,10 @@ mod tests {
             .await?
             .context("network")?;
         let (trigger, attempt) = start_reply(&node, &admin, "trigger").await?;
-        let idle = test_access(network.clone(), false, Some("c".into()));
+        let idle = crate::runtime::AgentAccess::ReadOnly {
+            network_id: network.clone(),
+            conversation_id: "c".into(),
+        };
         let access = node
             .manager_access_fixture(
                 "tools-replay",
@@ -1968,7 +1970,10 @@ mod tests {
                 .execution,
             TurnExecution::NotStarted
         );
-        let idle = test_access(network.clone(), false, Some("c".into()));
+        let idle = crate::runtime::AgentAccess::ReadOnly {
+            network_id: network.clone(),
+            conversation_id: "c".into(),
+        };
         let mut runtime = TurnRuntime {
             provider: Provider::Codex,
             model: Some("primary".into()),
@@ -2013,10 +2018,9 @@ mod tests {
             .cloned()
             .context("old bearer access")?;
         let original_permission = old
-            .manager
-            .as_ref()
+            .invocation()
             .context("old manager")?
-            .permission_version;
+            .permission_version();
         node.seal_manager_tools(&attempt).await?;
         node.finish_manager_attempt(&attempt).await;
         assert!(!node.agent_tokens.lock().await.contains_key("old-token"));
@@ -2075,10 +2079,9 @@ mod tests {
             .context("new bearer access")?;
         assert!(
             current
-                .manager
-                .as_ref()
+                .invocation()
                 .context("current manager")?
-                .permission_version
+                .permission_version()
                 > original_permission
         );
         let local = node.identity.device_id()?;
@@ -2088,8 +2091,19 @@ mod tests {
             let current = current.clone();
             node.store
                 .call("agent_tools.permission_fixture", move |store| {
-                    assert!(Runtime::check_manager_permission(store, &local, &old).is_err());
-                    Runtime::check_manager_permission(store, &local, &current)?;
+                    assert!(
+                        Runtime::check_manager_permission(
+                            store,
+                            &local,
+                            old.invocation().context("old invocation")?
+                        )
+                        .is_err()
+                    );
+                    Runtime::check_manager_permission(
+                        store,
+                        &local,
+                        current.invocation().context("current invocation")?,
+                    )?;
                     Ok(())
                 })
                 .await?;

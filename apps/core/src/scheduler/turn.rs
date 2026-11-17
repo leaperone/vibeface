@@ -10,7 +10,6 @@ use vibeface_bridge::agent::AgentResult;
 
 pub(super) struct TurnAttempt {
     node: Arc<Runtime>,
-    access: Access,
     network: String,
     conversation: String,
     scope: SessionScope,
@@ -238,11 +237,10 @@ pub(super) struct RecordedReply(Value);
 impl TurnAttempt {
     pub(super) async fn claim(
         node: Arc<Runtime>,
-        access: Access,
+        network: String,
         conversation: String,
         scope: SessionScope,
     ) -> Result<Option<Self>> {
-        let network = access.network_id.clone();
         let PreparedTurn {
             permission_epoch,
             settings,
@@ -309,7 +307,6 @@ impl TurnAttempt {
         };
         Ok(Some(Self {
             node,
-            access,
             network,
             conversation,
             scope,
@@ -763,7 +760,8 @@ impl TurnAttempt {
             .node
             .register_manager_attempt(
                 self.phase.round()?.token.clone(),
-                self.access.clone(),
+                &self.network,
+                &self.conversation,
                 &self.attempt.id,
                 &self.job.trigger,
                 provider,

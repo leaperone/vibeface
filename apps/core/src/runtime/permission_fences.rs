@@ -313,12 +313,12 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::test_support::{access as test_access, manager_settings, provider_work};
+    use crate::runtime::test_support::{manager_settings, provider_work};
     use crate::store::admission::AdmissionRejected;
     use crate::{
         crypto::LocalIdentity,
         runtime::{
-            Access,
+            AgentAccess,
             test_support::{bot, node, start_reply},
         },
         scheduling::SteerTarget,
@@ -359,7 +359,7 @@ mod tests {
         node: &Runtime,
         admin: &LocalIdentity,
         directory: &Path,
-    ) -> Result<(String, String, Access, watch::Receiver<bool>)> {
+    ) -> Result<(String, String, AgentAccess, watch::Receiver<bool>)> {
         let directory = directory.canonicalize()?;
         {
             let mut settings = node.settings.lock().unwrap();
@@ -387,7 +387,10 @@ mod tests {
         let cancel = node
             .register_manager_attempt_fixture(
                 "permission-token".into(),
-                test_access(network, false, Some("c".into())),
+                crate::runtime::AgentAccess::ReadOnly {
+                    network_id: network,
+                    conversation_id: "c".into(),
+                },
                 &attempt,
                 &trigger,
                 Provider::Codex,
@@ -481,7 +484,7 @@ mod tests {
         ] {
             let (node, admin, directory) = node().await?;
             let (trigger, attempt, access, cancel) = active_turn(&node, &admin, &directory).await?;
-            let network = &access.network_id;
+            let network = access.network_id();
             let target =
                 running_work(&node, network, &directory, "running", Provider::Codex).await?;
             native_directories(&node, &[("thread-running", &directory)]).await?;
@@ -499,7 +502,7 @@ mod tests {
             };
             let before = {
                 let identity = node.identity.clone();
-                let network = network.clone();
+                let network = network.to_owned();
                 let queued = queued.clone();
                 node.store
                     .call("fixture_queued_work", move |store| {
@@ -521,7 +524,11 @@ mod tests {
                     .await
                     .is_err()
             );
-            assert!(node.manager_tool_lease(&access).await.is_err());
+            assert!(
+                node.manager_tool_lease(access.invocation().context("registered invocation")?)
+                    .await
+                    .is_err()
+            );
             assert!(node.work_input_lease(network, "c", &target).await.is_err());
             assert!(node.work_start_lease(network, &queued, None).await.is_err());
             assert!(
@@ -541,7 +548,7 @@ mod tests {
                 .is_err()
             );
             {
-                let network = network.clone();
+                let network = network.to_owned();
                 let trigger = trigger.clone();
                 node.store
                     .call("fixture_fenced_state", move |store| {
@@ -566,7 +573,11 @@ mod tests {
                     node.set_write_state(network, &[state], crate::store::WriteState::Writable)
                         .await
                 );
-                assert!(node.manager_tool_lease(&access).await.is_err());
+                assert!(
+                    node.manager_tool_lease(access.invocation().context("registered invocation")?)
+                        .await
+                        .is_err()
+                );
                 assert!(
                     node.work_start_lease(network, &queued, None).await.is_err(),
                     "restoring write authority cannot replay fenced work"
@@ -586,7 +597,7 @@ mod tests {
             .store(u64::MAX, Ordering::Release);
         assert!(
             node.set_write_state(
-                &access.network_id,
+                access.network_id(),
                 &[crate::store::WriteState::Writable],
                 crate::store::WriteState::ReadOnly
             )
@@ -596,14 +607,18 @@ mod tests {
         assert!(
             !node
                 .set_write_state(
-                    &access.network_id,
+                    access.network_id(),
                     &[crate::store::WriteState::ReadOnly],
                     crate::store::WriteState::Writable
                 )
                 .await
         );
         assert!(!node.writable());
-        assert!(node.manager_tool_lease(&access).await.is_err());
+        assert!(
+            node.manager_tool_lease(access.invocation().context("registered invocation")?)
+                .await
+                .is_err()
+        );
         drop(node);
         std::fs::remove_dir_all(directory)?;
         Ok(())
@@ -648,7 +663,11 @@ mod tests {
         assert!(task.await.expect_err("cancelled revocation").is_cancelled());
         release.send(())?;
         holding.await??;
-        assert!(node.manager_tool_lease(&access).await.is_err());
+        assert!(
+            node.manager_tool_lease(access.invocation().context("registered invocation")?)
+                .await
+                .is_err()
+        );
         assert!(
             node.manager_input_lease(&attempt, Provider::Codex)
                 .await
@@ -664,9 +683,9 @@ mod tests {
     -> Result<()> {
         let (node, admin, directory) = node().await?;
         let (_, _, access, cancel) = active_turn(&node, &admin, &directory).await?;
-        let network = &access.network_id;
+        let network = access.network_id();
         let identity = node.identity.clone();
-        let fixture_network = network.clone();
+        let fixture_network = network.to_owned();
         let fork = node
             .store
             .call("fixture_pre_dispatch_fork", move |store| {
@@ -698,7 +717,7 @@ mod tests {
             thread: Some("thread-remote".into()),
             ..provider_work(Provider::Codex, &remote.device_id()?, &directory, "remote")
         };
-        let fixture_network = network.clone();
+        let fixture_network = network.to_owned();
         node.store.call("fixture_unowned_journals", move |store| {
             // Even an accidentally retained remote acceptance row must not grant local stop authority.
             store.accept_work_fixture(&remote, &fixture_network, remote_spec, now_ms())?;
@@ -751,7 +770,7 @@ mod tests {
             }
         })
         .await?;
-        let fixture_network = network.clone();
+        let fixture_network = network.to_owned();
         let before = node
             .store
             .call("fixture_ingest_pre_dispatch_fork", move |store| {
@@ -785,7 +804,7 @@ mod tests {
             *requests.lock().unwrap(),
             vec!["thread/read", "turn/interrupt", "thread/read"]
         );
-        let query_network = network.clone();
+        let query_network = network.to_owned();
         node.store
             .call("fixture_forked_state", move |store| {
                 assert_eq!(store.version_vector(&query_network)?, before);
@@ -968,7 +987,10 @@ mod tests {
                 .await
                 .is_err()
         );
-        drop(node.manager_tool_lease(&access).await?);
+        drop(
+            node.manager_tool_lease(access.invocation().context("registered invocation")?)
+                .await?,
+        );
         assert!(matches!(
             {
                 let trigger = trigger.clone();
@@ -1000,7 +1022,7 @@ mod tests {
         let removed = directory.join("removed");
         std::fs::create_dir(&removed)?;
         let removed = removed.canonicalize()?;
-        let network = &access.network_id;
+        let network = access.network_id();
         let target = running_work(&node, network, &removed, "removed", Provider::Codex).await?;
         let kept =
             running_work(&node, network, &retained_alias, "retained", Provider::Codex).await?;
@@ -1028,7 +1050,11 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(node.manager_tool_lease(&access).await.is_err());
+        assert!(
+            node.manager_tool_lease(access.invocation().context("registered invocation")?)
+                .await
+                .is_err()
+        );
         assert!(node.work_input_lease(network, "c", &target).await.is_err());
         drop(node.work_input_lease(network, "c", &kept).await?);
         {
@@ -1059,7 +1085,8 @@ mod tests {
         let stale = node
             .register_manager_attempt(
                 "stale-prepared".into(),
-                access.clone(),
+                access.network_id(),
+                access.conversation_id(),
                 &attempt,
                 &trigger,
                 Provider::Codex,
@@ -1080,7 +1107,7 @@ mod tests {
     -> Result<()> {
         let (node, admin, directory) = node().await?;
         let (trigger, attempt, access, cancel) = active_turn(&node, &admin, &directory).await?;
-        let network = &access.network_id;
+        let network = access.network_id();
         let codex_directory = directory.join("codex-work");
         let pi_directory = directory.join("pi-work");
         std::fs::create_dir(&codex_directory)?;
@@ -1117,7 +1144,11 @@ mod tests {
         .await?;
         drop(save);
         assert!(*cancel.borrow());
-        assert!(node.manager_tool_lease(&access).await.is_err());
+        assert!(
+            node.manager_tool_lease(access.invocation().context("registered invocation")?)
+                .await
+                .is_err()
+        );
         node.store
             .call("fixture_revoked_provider", move |store| {
                 assert!(matches!(

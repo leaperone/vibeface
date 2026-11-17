@@ -53,15 +53,6 @@ pub(super) async fn open_node(dir: &Path, configuration: &Config) -> Result<Arc<
     Ok(Arc::new(Runtime::open(dir).await?))
 }
 
-pub(crate) fn access(network_id: String, human: bool, conversation_id: Option<String>) -> Access {
-    Access {
-        network_id,
-        human,
-        conversation_id,
-        manager: None,
-    }
-}
-
 pub(crate) fn signed_main_input(
     admin: &LocalIdentity,
     network: &str,

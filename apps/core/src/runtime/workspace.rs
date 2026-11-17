@@ -4,7 +4,7 @@ use crate::workspace::{WORKSPACE_SCOPE, WorkspaceCommand, WorkspaceCommandNotSav
 impl Runtime {
     pub(super) async fn workspace_command(&self, access: &Access, input: &Value) -> Result<Value> {
         ensure!(
-            access.human && access.conversation_id.is_none(),
+            access.is_user() && access.conversation_id().is_none(),
             "workspace commands need the user's personal network access"
         );
         ensure!(
@@ -14,7 +14,7 @@ impl Runtime {
         let command: WorkspaceCommand = serde_json::from_value(input["command"].clone())
             .context("invalid workspace command")?;
         if {
-            let network_id = access.network_id.to_owned();
+            let network_id = access.network_id().to_owned();
             let command_id = id(input, "command_id")?;
             self.store
                 .call("workspace.workspace_command_recorded", move |store| {
@@ -23,12 +23,12 @@ impl Runtime {
                 .await
         }? {
             return self
-                .accept_workspace_command(&access.network_id, input)
+                .accept_workspace_command(access.network_id(), input)
                 .await;
         }
         if let WorkspaceCommand::ControlInput { message_id, .. } = &command {
             let owner = {
-                let (network, message_id) = (access.network_id.clone(), message_id.clone());
+                let (network, message_id) = (access.network_id().to_owned(), message_id.clone());
                 self.store
                     .call("workspace.input_owner", move |store| {
                         let input = store
@@ -41,10 +41,10 @@ impl Runtime {
                     .await?
             };
             if owner != self.identity.device_id()? {
-                return self.peer_request(&access.network_id, &owner, json!({"type":"workspace_command","command_id":id(input,"command_id")?,"command":command,"attestation":attestation(input)?})).await;
+                return self.peer_request(access.network_id(), &owner, json!({"type":"workspace_command","command_id":id(input,"command_id")?,"command":command,"attestation":attestation(input)?})).await;
             }
         }
-        self.accept_workspace_command(&access.network_id, input)
+        self.accept_workspace_command(access.network_id(), input)
             .await
     }
     pub(super) async fn accept_workspace_command(
@@ -105,7 +105,7 @@ impl Runtime {
     }
     pub(super) async fn workspace_state(&self, access: &Access, input: &Value) -> Result<Value> {
         ensure!(
-            access.human && access.conversation_id.is_none(),
+            access.is_user() && access.conversation_id().is_none(),
             "workspace reads need the user's personal network access"
         );
         let channel = input
@@ -118,7 +118,7 @@ impl Runtime {
             .transpose()?;
         let limit = domain_limit(input)?;
         Ok(serde_json::to_value({
-            let network_id = access.network_id.to_owned();
+            let network_id = access.network_id().to_owned();
             let channel = channel.clone();
             let task = task.clone();
             self.read_display(access, input, "workspace.workspace_state", move |store| {
@@ -129,7 +129,7 @@ impl Runtime {
     }
     pub(super) async fn workspace_history(&self, access: &Access, input: &Value) -> Result<Value> {
         ensure!(
-            access.human && access.conversation_id.is_none(),
+            access.is_user() && access.conversation_id().is_none(),
             "workspace reads need the user's personal network access"
         );
         let channel = input
@@ -142,7 +142,7 @@ impl Runtime {
             .transpose()?;
         let limit = domain_limit(input)?;
         let (events, truncated) = {
-            let network_id = access.network_id.to_owned();
+            let network_id = access.network_id().to_owned();
             let channel = channel.clone();
             let task = task.clone();
             self.read_display(access, input, "workspace.workspace_history", move |store| {
@@ -168,7 +168,6 @@ fn domain_limit(input: &Value) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::test_support::access as test_access;
     use crate::{
         model::EventBody,
         runtime::test_support::{bot, node},
@@ -210,7 +209,7 @@ mod tests {
                 })?;
                 Ok(json!({"command_id":command_id,"command":command,"attestation":signed.attestation().context("control signature")?}))
             };
-            let access = test_access(network.clone(), true, None);
+            let access = crate::runtime::Access::User { network_id: network.clone(), scope: crate::runtime::UserScope::Network };
             let before = {
                 let network = network.to_owned();
                 node.store.call("workspace.version_vector", move |store| store.version_vector(&network)).await

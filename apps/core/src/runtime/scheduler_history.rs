@@ -44,7 +44,7 @@ impl SchedulerProjection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::test_support::{access, bot, node, signed_main_input};
+    use crate::runtime::test_support::{bot, node, signed_main_input};
 
     #[tokio::test]
     async fn scheduler_history_rpc_is_bounded_read_only_and_owner_scoped() -> Result<()> {
@@ -73,7 +73,7 @@ mod tests {
             let before = runtime.store.read("scheduler_history_rpc.before", |store| {
                 Ok(store.connection.query_row("SELECT total_changes()", [], |row| row.get::<_, u64>(0))?)
             }).await?;
-            let principal = access(network.clone(), true, None);
+            let principal = crate::runtime::Access::User { network_id: network.clone(), scope: crate::runtime::UserScope::Network };
             let snapshot = runtime.rpc(principal.clone(), json!({"method":"conversation", "conversation_id":"history"})).await?;
             assert!(serde_json::to_vec(&snapshot)?.len() < HISTORY_RESPONSE_BYTES);
             for section in ["jobs", "scope_jobs", "checks", "deliveries", "unanswered", "owner_jobs", "owner_scope_jobs", "owner_memory_conflicts"] {
@@ -132,7 +132,7 @@ mod tests {
             let cursor = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&wrapped)?);
             assert!(runtime.rpc(principal.clone(), json!({"method":"conversation_history",
                 "conversation_id":"history","section":"owner_jobs","cursor":cursor})).await.is_err());
-            assert!(runtime.rpc(access(network.clone(), false, None), json!({"method":"conversation_history",
+            assert!(runtime.rpc(Access::Agent(AgentAccess::ReadOnly { network_id: network.clone(), conversation_id: "history".into() }), json!({"method":"conversation_history",
                 "conversation_id":"history","section":"owner_jobs"})).await.is_err());
             let after = runtime.store.read("scheduler_history_rpc.after", |store| {
                 Ok(store.connection.query_row("SELECT total_changes()", [], |row| row.get::<_, u64>(0))?)
@@ -214,11 +214,9 @@ impl Runtime {
                 },
             )
             .await?;
-        let access = Access {
+        let access = Access::User {
             network_id: network.into(),
-            human: true,
-            conversation_id: Some(scope.into()),
-            manager: None,
+            scope: crate::runtime::UserScope::Conversation(scope.into()),
         };
         let input = json!({"conversation_id":scope});
         let query_network = network.to_owned();
@@ -379,11 +377,9 @@ impl Runtime {
         let query_local = local.clone();
         // Peer authentication is established by the transport. Reuse the display fence so
         // membership, conversation existence, ownership and page all share one read.
-        let access = Access {
+        let access = Access::User {
             network_id: network.into(),
-            human: true,
-            conversation_id: Some(request.conversation_id.clone()),
-            manager: None,
+            scope: crate::runtime::UserScope::Conversation(request.conversation_id.clone()),
         };
         let requested_section = request.section;
         self.read_display(&access, input, "owner_history", move |store| {
@@ -443,7 +439,7 @@ impl Runtime {
         access: &Access,
         input: &Value,
     ) -> Result<Value> {
-        let network = access.network_id.clone();
+        let network = access.network_id().to_owned();
         let scope = field(input, "conversation_id")?.to_owned();
         let query_network = network.clone();
         let query_scope = scope.clone();

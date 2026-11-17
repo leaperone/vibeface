@@ -49,7 +49,7 @@ mod work;
 mod work_input;
 mod workspace;
 pub(crate) use cursor::record_reply as record_cursor_reply;
-pub use manager_control::ManagerAccess;
+pub use manager_control::RegisteredInvocation;
 pub(crate) use observation::{ObservationGuard, native_progress};
 pub use settings::NodeSettings;
 pub use triage::{
@@ -119,11 +119,79 @@ mod node_display_names_tests {
 }
 
 #[derive(Clone)]
-pub struct Access {
-    pub network_id: String,
-    pub human: bool,
-    pub conversation_id: Option<String>,
-    pub manager: Option<ManagerAccess>,
+pub enum Access {
+    User {
+        network_id: String,
+        scope: UserScope,
+    },
+    Agent(AgentAccess),
+}
+
+#[derive(Clone)]
+pub enum UserScope {
+    Network,
+    Conversation(String),
+}
+
+#[derive(Clone)]
+pub enum AgentAccess {
+    ReadOnly {
+        network_id: String,
+        conversation_id: String,
+    },
+    Invocation(RegisteredInvocation),
+}
+
+impl Access {
+    pub fn network_id(&self) -> &str {
+        match self {
+            Self::User { network_id, .. } => network_id,
+            Self::Agent(agent) => agent.network_id(),
+        }
+    }
+
+    pub fn conversation_id(&self) -> Option<&str> {
+        match self {
+            Self::User {
+                scope: UserScope::Network,
+                ..
+            } => None,
+            Self::User {
+                scope: UserScope::Conversation(id),
+                ..
+            } => Some(id),
+            Self::Agent(agent) => Some(agent.conversation_id()),
+        }
+    }
+
+    fn is_user(&self) -> bool {
+        matches!(self, Self::User { .. })
+    }
+}
+
+impl AgentAccess {
+    pub fn network_id(&self) -> &str {
+        match self {
+            Self::ReadOnly { network_id, .. } => network_id,
+            Self::Invocation(invocation) => invocation.network_id(),
+        }
+    }
+
+    pub fn conversation_id(&self) -> &str {
+        match self {
+            Self::ReadOnly {
+                conversation_id, ..
+            } => conversation_id,
+            Self::Invocation(invocation) => invocation.conversation_id(),
+        }
+    }
+
+    fn invocation(&self) -> Option<&RegisteredInvocation> {
+        match self {
+            Self::ReadOnly { .. } => None,
+            Self::Invocation(invocation) => Some(invocation),
+        }
+    }
 }
 
 const WORKSPACE_OVERVIEW_SCHEMA: u32 = 1;
@@ -480,7 +548,7 @@ pub struct Runtime {
     have_wakeup: Arc<tokio::sync::Notify>,
     outbox_wakeup: tokio::sync::Notify,
     pub events: broadcast::Sender<Update>,
-    pub agent_tokens: Mutex<HashMap<String, Access>>,
+    pub agent_tokens: Mutex<HashMap<String, AgentAccess>>,
     pub(crate) manager_controls: Mutex<HashMap<String, Arc<manager_control::ActiveManager>>>,
     #[cfg(test)]
     pub(crate) claim_to_start_barrier:
@@ -1108,7 +1176,7 @@ impl Runtime {
     ) -> Result<()> {
         self.background_tasks.spawn(task)
     }
-    pub async fn authorize_bearer(&self, token: &str) -> Option<Access> {
+    pub async fn authorize_bearer(&self, token: &str) -> Option<AgentAccess> {
         self.agent_tokens.lock().await.get(token).cloned()
     }
     /// Stops the managed App Server, the Claude Code, pi and opencode processes and the Cursor
@@ -1199,7 +1267,7 @@ impl Runtime {
     /// A bounded, human-only projection of the facts this Node has locally.
     async fn workspace_overview(&self, access: &Access, input: &Value) -> Result<Value> {
         ensure!(
-            access.human,
+            access.is_user(),
             "workspace overview is unavailable to Agent tokens"
         );
         ensure!(
@@ -1210,17 +1278,17 @@ impl Runtime {
         let include_finished = workspace_bool(input, "include_finished", false)?;
         let include_sessions = workspace_bool(input, "include_sessions", true)?;
         let requested_scope = input.get("conversation_id").and_then(Value::as_str);
-        if let Some(allowed_scope) = access.conversation_id.as_deref() {
+        if let Some(allowed_scope) = access.conversation_id() {
             ensure!(
                 requested_scope.is_none_or(|scope| scope == allowed_scope),
                 "outside this tool's conversation"
             );
         }
-        let scope_filter = access.conversation_id.as_deref().or(requested_scope);
-        let network = &access.network_id;
+        let scope_filter = access.conversation_id().or(requested_scope);
+        let network = access.network_id();
         let local = self.identity.device_id()?;
 
-        let query_network = network.clone();
+        let query_network = network.to_owned();
         let query_scope = scope_filter.map(str::to_owned);
         let projection = self.scheduler_projection()?;
         let (
@@ -1635,13 +1703,13 @@ impl Runtime {
         operation: &'static str,
         read: impl FnOnce(&Store) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        ensure!(access.human, "display snapshot requires the user");
+        ensure!(access.is_user(), "display snapshot requires the user");
         let (_, authority) = self.ready_client_membership().await?;
         let authority = authority.context("personal network is not installed")?;
-        let network = access.network_id.clone();
+        let network = access.network_id().to_owned();
         let local = self.identity.device_id()?;
         let scope = input["conversation_id"].as_str().map(str::to_owned);
-        if let (Some(allowed), Some(scope)) = (&access.conversation_id, &scope) {
+        if let (Some(allowed), Some(scope)) = (access.conversation_id(), &scope) {
             ensure!(allowed == scope, "outside this tool's conversation");
         }
         self.store
@@ -1670,13 +1738,27 @@ impl Runtime {
     async fn require_scope(&self, access: &Access, scope: &str) -> Result<()> {
         let state = self.membership_state().await?;
         ensure!(
-            state.genesis.network_id == access.network_id,
+            state.genesis.network_id == access.network_id(),
             "wrong personal network"
         );
-        if let Some(allowed) = &access.conversation_id {
+        if let Some(allowed) = access.conversation_id() {
             ensure!(allowed == scope, "outside this tool's conversation");
         }
-        let network = access.network_id.clone();
+        self.require_local_conversation(access.network_id(), scope)
+            .await
+    }
+
+    async fn require_conversation(&self, network: &str, scope: &str) -> Result<()> {
+        let state = self.membership_state().await?;
+        ensure!(
+            state.genesis.network_id == network,
+            "wrong personal network"
+        );
+        self.require_local_conversation(network, scope).await
+    }
+
+    async fn require_local_conversation(&self, network: &str, scope: &str) -> Result<()> {
+        let network = network.to_owned();
         let scope = scope.to_owned();
         let local = self.identity.device_id()?;
         self.store
@@ -1711,33 +1793,38 @@ impl Runtime {
     }
 
     pub async fn rpc(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
-        let _lease = self.manager_tool_lease(&access).await?;
+        let _lease = match &access {
+            Access::Agent(AgentAccess::Invocation(invocation)) => {
+                Some(self.manager_tool_lease(invocation).await?)
+            }
+            Access::User { .. } | Access::Agent(AgentAccess::ReadOnly { .. }) => None,
+        };
         self.rpc_inner(access, input).await
     }
     async fn rpc_inner(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
         let _work = self.maintenance.enter()?;
         let method = field(&input, "method")?;
-        if !access.human {
+        if !access.is_user() {
             ensure!(method == "nodes", "method unavailable to Agent tokens");
         }
-        let snapshot = access.human && snapshot_rpc(method);
-        let network = &access.network_id;
+        let snapshot = access.is_user() && snapshot_rpc(method);
+        let network = access.network_id();
         let node_id = self.identity.device_id()?;
         if snapshot {
             let (_, current) = self.ready_client_membership().await?;
             let current = current.context("personal network is not installed")?;
             ensure!(
-                current.genesis.network_id == *network,
+                current.genesis.network_id == network,
                 "wrong personal network"
             );
             current.project()?.node(&node_id)?;
         } else {
             let current = self.membership_state().await?;
             ensure!(
-                current.genesis.network_id == *network,
+                current.genesis.network_id == network,
                 "wrong personal network"
             );
-            let authorized_network = network.clone();
+            let authorized_network = network.to_owned();
             self.store
                 .call("authorize_rpc", move |store| {
                     store.authorize_node(&authorized_network, &node_id)
@@ -1753,7 +1840,7 @@ impl Runtime {
         }
         match method {
             "nodes" => {
-                let query_network = network.clone();
+                let query_network = network.to_owned();
                 let bundle = self
                     .store
                     .call("node_membership", move |store| {
@@ -1762,7 +1849,7 @@ impl Runtime {
                     .await?
                     .context("unknown network")?;
                 let local = self.identity.device_id()?;
-                let query_network = network.clone();
+                let query_network = network.to_owned();
                 let heads = self
                     .store
                     .call("node_heads", move |store| store.heads(&query_network))
@@ -1818,7 +1905,7 @@ impl Runtime {
                 Ok(json!({"nodes":nodes}))
             }
             "conversations" => {
-                let network = network.clone();
+                let network = network.to_owned();
                 let conversations = self
                     .read_display(&access, &input, "conversations", move |store| {
                         store.conversations(&network)
@@ -1827,12 +1914,12 @@ impl Runtime {
                 Ok(json!({"conversations":conversations}))
             }
             "create_conversation" => {
-                ensure!(access.human, "only the user creates conversations");
+                ensure!(access.is_user(), "only the user creates conversations");
                 let scope = id(&input, "conversation_id")?;
                 let title = field(&input, "title")?;
                 ensure!(title.len() <= 512, "title too long");
                 let identity = self.identity.clone();
-                let query_network = network.clone();
+                let query_network = network.to_owned();
                 let query_scope = scope.clone();
                 let title = title.to_owned();
                 let owner = first_owner(&input)?;
@@ -1855,8 +1942,8 @@ impl Runtime {
             "conversation" => self.conversation_snapshot(&access, &input).await,
             "conversation_history" => self.conversation_history(&access, &input).await,
             "open_works" => {
-                ensure!(access.human, "only clients list open works");
-                let network = network.clone();
+                ensure!(access.is_user(), "only clients list open works");
+                let network = network.to_owned();
                 let works = self
                     .read_display(&access, &input, "open_works", move |store| {
                         chat_controls::open_works(store, &network, None)
@@ -1869,10 +1956,10 @@ impl Runtime {
             "workspace_command" => self.workspace_command(&access, &input).await,
             "signed_receipt" => {
                 ensure!(
-                    access.human && access.conversation_id.is_none(),
+                    access.is_user() && access.conversation_id().is_none(),
                     "signed receipt requires the authenticated user"
                 );
-                let network = network.clone();
+                let network = network.to_owned();
                 let client = field(&input, "client_id")?.to_owned();
                 let scope = id(&input, "scope_id")?;
                 let body = input["body"].clone();
@@ -1885,14 +1972,14 @@ impl Runtime {
             }
             "workspace_command_receipt" => {
                 ensure!(
-                    access.human && access.conversation_id.is_none(),
+                    access.is_user() && access.conversation_id().is_none(),
                     "workspace receipt requires the authenticated user"
                 );
                 ensure!(
                     input.get("cause").is_none() && input.get("acting_assignment").is_none(),
                     "receipt must identify the original user command"
                 );
-                let network = network.clone();
+                let network = network.to_owned();
                 let client = field(&input, "client_id")?.to_owned();
                 let command_id = id(&input, "command_id")?;
                 let command = serde_json::from_value(input["command"].clone())?;
@@ -1921,13 +2008,13 @@ impl Runtime {
             "read_artifact" => self.read_artifact(&access, &input).await,
             "upload_attachment" => self.upload_attachment(&access, &input).await,
             "interrupt_work" => {
-                ensure!(access.human, "only the user stops work");
+                ensure!(access.is_user(), "only the user stops work");
                 let scope = scope.context("conversation_id is required")?;
                 self.stop_work(network, &scope, &id(&input, "work_id")?)
                     .await
             }
             "codex_state" => {
-                ensure!(access.human, "only the user reaches the App Server");
+                ensure!(access.is_user(), "only the user reaches the App Server");
                 self.codex_state(network, &input).await
             }
             "bots" => self.bots(&access).await,
@@ -1946,7 +2033,7 @@ impl Runtime {
             "dismiss_unanswered" => self.settle_unanswered(&access, &input, true).await,
             "resolve" => self.resolve_check(&access, &input).await,
             "notifications" => {
-                let network = network.clone();
+                let network = network.to_owned();
                 let client = field(&input, "client_id")?.to_owned();
                 let notifications = self
                     .read_display(&access, &input, "notifications", move |store| {
@@ -1956,10 +2043,10 @@ impl Runtime {
                 Ok(json!({"notifications":notifications}))
             }
             "dismiss_work" => {
-                ensure!(access.human, "only clients close failed works");
+                ensure!(access.is_user(), "only clients close failed works");
                 let scope = scope.context("conversation_id is required")?;
                 let work_id = id(&input, "work_id")?;
-                let query_network = network.clone();
+                let query_network = network.to_owned();
                 let query_scope = scope.clone();
                 let query_work = work_id.clone();
                 let failed = self
@@ -1990,10 +2077,10 @@ impl Runtime {
                 Ok(json!({"dismissed":true}))
             }
             "ack" => {
-                ensure!(access.human, "only clients acknowledge notifications");
+                ensure!(access.is_user(), "only clients acknowledge notifications");
                 let notification = id(&input, "notification_id")?;
                 let client = id(&input, "client_id")?;
-                let query_network = network.clone();
+                let query_network = network.to_owned();
                 let query_client = client.clone();
                 let pending = self
                     .store

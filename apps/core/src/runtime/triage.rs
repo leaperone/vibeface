@@ -3098,7 +3098,7 @@ impl Runtime {
     }
 
     pub(super) async fn questions(&self, access: &Access) -> Result<Value> {
-        let network = access.network_id.clone();
+        let network = access.network_id().to_owned();
         let questions = self
             .store
             .read("triage.questions", move |store| {
@@ -3110,10 +3110,10 @@ impl Runtime {
 
     /// The user's answer, signed by their device, to a question in any chat.
     pub(super) async fn answer_question(&self, access: &Access, input: &Value) -> Result<Value> {
-        ensure!(access.human, "only the user answers questions");
+        ensure!(access.is_user(), "only the user answers questions");
         let answered = self
             .post_answer(
-                &access.network_id,
+                access.network_id(),
                 &super::id(input, "question_id")?,
                 super::field(input, "text")?,
                 Some(super::attestation(input)?),
@@ -3375,9 +3375,9 @@ fn rollouts(root: &Path, since_ms: i64) -> Vec<PathBuf> {
 pub(super) mod tests {
     use super::*;
     use crate::runtime::test_support::{
-        HASH_PAUSES, access as test_access, bare_node, bot, claim_reply, instructed_bot,
-        manager_settings, named_socket, node, node_at, node_with, pi_fixture_log, provider_work,
-        scripted_app_server, signed_main_input, start_reply, start_reply_in,
+        HASH_PAUSES, bare_node, bot, claim_reply, instructed_bot, manager_settings, named_socket,
+        node, node_at, node_with, pi_fixture_log, provider_work, scripted_app_server,
+        signed_main_input, start_reply, start_reply_in,
     };
     use crate::{
         config::Config,
@@ -5127,7 +5127,7 @@ pub(super) mod tests {
                 Arc::new(std::sync::Mutex::new(Default::default())), None);
             (native.record)(native_thread.into(), Some(native_turn.into())).await?;
             native.started.context("Task native start callback")?(native_turn.into()).await?;
-            let _cancel = node.register_manager_attempt_fixture("held-task-token".into(), test_access(network.clone(), false, Some("c".into())), &task_attempt, &trigger, Provider::Codex).await?;
+            let _cancel = node.register_manager_attempt_fixture("held-task-token".into(), crate::runtime::AgentAccess::ReadOnly { network_id: network.clone(), conversation_id: "c".into() }, &task_attempt, &trigger, Provider::Codex).await?;
             node.on_codex_request(&handed).await;
             let (question, request_id) = raise_for(&node).await?;
             let card = {
@@ -5231,7 +5231,10 @@ pub(super) mod tests {
             },
         )?;
         node.workspace_command(
-            &test_access(network, true, None),
+            &crate::runtime::Access::User {
+                network_id: network,
+                scope: crate::runtime::UserScope::Network,
+            },
             &json!({"command_id":id,"command":command,"attestation":signed.attestation()}),
         )
         .await?;
@@ -6041,11 +6044,11 @@ pub(super) mod tests {
             assert_eq!(attributions(&node, "c").await?, 1);
 
             let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
-            let idle = test_access(network.clone(), false, Some("c".into()));
+            let idle = crate::runtime::AgentAccess::ReadOnly { network_id: network.clone(), conversation_id: "c".into() };
             let live = node.manager_access_fixture(
                 "token", idle.clone(), &attempt, &trigger, crate::providers::Provider::Codex,
             ).await?;
-            let hand = |access: &Access, session: &str, how: Value| {
+            let hand = |access: &crate::runtime::AgentAccess, session: &str, how: Value| {
                 let (node, local, access, session) = (&node, &local, access.clone(), session.to_owned());
                 async move {
                     let seen = version_of(node, &session).await?;
@@ -6648,7 +6651,10 @@ pub(super) mod tests {
                     })
                     .await
             }?;
-            let access = test_access(network, false, Some("c".into()));
+            let access = crate::runtime::AgentAccess::ReadOnly {
+                network_id: network,
+                conversation_id: "c".into(),
+            };
             let all = node.tool(access.clone(), "work_status", json!({})).await?;
             assert_eq!(
                 (&all["works"][0]["work_id"], &all["works"][0]["state"]),
@@ -6704,7 +6710,10 @@ pub(super) mod tests {
             };
             assert_eq!(node.queue_event(held).await?["status"], "accepted");
 
-            let access = test_access(network.clone(), false, Some("c".into()));
+            let access = crate::runtime::AgentAccess::ReadOnly {
+                network_id: network.clone(),
+                conversation_id: "c".into(),
+            };
             let access = node
                 .manager_access_fixture(
                     "token",
@@ -6749,7 +6758,7 @@ pub(super) mod tests {
             bot(&node, &admin, "c", "前端", &[]).await?;
             let network = node.network_id().await?;
             let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
-            let access = test_access(network.clone(), false, Some("c".into()));
+            let access = crate::runtime::AgentAccess::ReadOnly { network_id: network.clone(), conversation_id: "c".into() };
             let access = node.manager_access_fixture(
                 "token", access.clone(), &attempt, &trigger, crate::providers::Provider::Codex,
             ).await?;
@@ -6880,7 +6889,10 @@ pub(super) mod tests {
             bot(&node, &admin, "c", "前端", &[]).await?;
             let network = node.network_id().await?;
             let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
-            let access = test_access(network.clone(), false, Some("c".into()));
+            let access = crate::runtime::AgentAccess::ReadOnly {
+                network_id: network.clone(),
+                conversation_id: "c".into(),
+            };
             let access = node
                 .manager_access_fixture(
                     "token",
@@ -6978,7 +6990,7 @@ pub(super) mod tests {
             bot(&node, &admin, "c", "前端", &[]).await?;
             let network = node.network_id().await?;
             let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
-            let access = test_access(network.clone(), false, Some("c".into()));
+            let access = crate::runtime::AgentAccess::ReadOnly { network_id: network.clone(), conversation_id: "c".into() };
             let access = node.manager_access_fixture(
                 "token", access.clone(), &attempt, &trigger, Provider::Claude,
             ).await?;
@@ -7064,7 +7076,10 @@ pub(super) mod tests {
             bot(&node, &admin, "c", "前端", &[]).await?;
             let network = node.network_id().await?;
             let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
-            let access = test_access(network.clone(), false, Some("c".into()));
+            let access = crate::runtime::AgentAccess::ReadOnly {
+                network_id: network.clone(),
+                conversation_id: "c".into(),
+            };
             let access = node
                 .manager_access_fixture(
                     "token",
@@ -8139,7 +8154,10 @@ pub(super) mod tests {
         with_node(async |node, admin, _| {
             bot(&node, &admin, "c", "Attachments", &[]).await?;
             let network = node.network_id().await?;
-            let access = test_access(network.clone(), true, None);
+            let access = crate::runtime::Access::User {
+                network_id: network.clone(),
+                scope: crate::runtime::UserScope::Network,
+            };
             let content = vec![b'a'; 1024 * 1024 + 16];
             let hash = crate::crypto::digest(&content);
             let chunk = |offset: usize, bytes: &[u8]| {
@@ -8249,7 +8267,10 @@ pub(super) mod tests {
             let bad_hash = crate::crypto::digest(b"good");
             let failed = node
                 .upload_attachment(
-                    &test_access(network, true, None),
+                    &crate::runtime::Access::User {
+                        network_id: network,
+                        scope: crate::runtime::UserScope::Network,
+                    },
                     &json!({"conversation_id":"c","hash":bad_hash,"size":4,"offset":0,
                     "data":base64::engine::general_purpose::STANDARD.encode(b"evil")}),
                 )
@@ -8945,7 +8966,7 @@ pub(super) mod tests {
 
     async fn task_at_start(
         node: &Arc<Runtime>,
-        access: Access,
+        network: String,
         request: &crate::work::WorkRequest,
     ) -> Result<(
         Arc<tokio::sync::Notify>,
@@ -8961,7 +8982,7 @@ pub(super) mod tests {
         };
         let running =
             tokio::spawn(
-                async move { crate::scheduler::run(node, access, conversation, scope).await },
+                async move { crate::scheduler::run(node, network, conversation, scope).await },
             );
         tokio::time::timeout(Duration::from_secs(5), claimed.notified()).await?;
         Ok((resume, running))
@@ -9140,7 +9161,7 @@ pub(super) mod tests {
             bot(&node, &admin, "c", "Bot", &[]).await?;
             let network = node.network_id().await?;
             let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
-            let access = node.manager_access_fixture("thread-retry-token", test_access(network.clone(), false, Some("c".into())), &attempt, &trigger, Provider::Codex).await?;
+            let access = node.manager_access_fixture("thread-retry-token", crate::runtime::AgentAccess::ReadOnly { network_id: network.clone(), conversation_id: "c".into() }, &attempt, &trigger, Provider::Codex).await?;
             let mut original = Vec::new();
             for (call, explicit, model) in [("explicit", true, Some("frozen")), ("implicit", false, Some("frozen")), ("explicit-default", true, None), ("implicit-default", false, None)] {
                 {
@@ -9367,7 +9388,10 @@ pub(super) mod tests {
             let access = node
                 .manager_access_fixture(
                     "user-codex-token",
-                    test_access(network.clone(), false, Some("c".into())),
+                    crate::runtime::AgentAccess::ReadOnly {
+                        network_id: network.clone(),
+                        conversation_id: "c".into(),
+                    },
                     &attempt,
                     &trigger,
                     Provider::Codex,
@@ -9775,7 +9799,7 @@ pub(super) mod tests {
             bot(&node, &admin, "c", "Bot", &[]).await.context("create frozen-selection Bot")?;
             let network = node.network_id().await.context("read frozen-selection network")?;
             let (trigger, attempt) = start_reply(&node, &admin, "m1").await.context("start frozen-selection manager attempt")?;
-            let access = node.manager_access_fixture("retry-token", test_access(network.clone(), false, Some("c".into())), &attempt, &trigger, Provider::Codex).await.context("authorize frozen-selection manager attempt")?;
+            let access = node.manager_access_fixture("retry-token", crate::runtime::AgentAccess::ReadOnly { network_id: network.clone(), conversation_id: "c".into() }, &attempt, &trigger, Provider::Codex).await.context("authorize frozen-selection manager attempt")?;
             let args = |call: &str, explicit: bool| -> Result<Value> {
                 let cwd = dir.join(call);
                 std::fs::create_dir(&cwd)?;
@@ -9877,7 +9901,7 @@ pub(super) mod tests {
                     assert!(node.schedule_workers.lock().await.insert((network.clone(), crate::scheduling::SessionKey { conversation_id: "c".into(), scope: crate::scheduling::SessionScope::Main })));
                     node.schedule_tick().await?;
                 } else {
-                    crate::scheduler::run(node.clone(), test_access(network.clone(), false, Some("c".into())), "c".into(), crate::scheduling::SessionScope::Task { work_id: request.work_id.clone() }).await?.context("refusal invocation")?;
+                    crate::scheduler::run(node.clone(), network.clone(), "c".into(), crate::scheduling::SessionScope::Task { work_id: request.work_id.clone() }).await?.context("refusal invocation")?;
                 }
                 assert_refused_task(&node, &network, &request, if current.is_none() { FailureKind::NoBot } else { FailureKind::ExecutionDisabled }).await?;
                 let refused = {
@@ -9955,12 +9979,7 @@ pub(super) mod tests {
                     Some("fake/frozen"),
                 )
                 .await?;
-                let (resume, running) = task_at_start(
-                    &node,
-                    test_access(network.clone(), false, Some("c".into())),
-                    &request,
-                )
-                .await?;
+                let (resume, running) = task_at_start(&node, network.clone(), &request).await?;
                 let initial = {
                     let trigger = (crate::scheduling::task_trigger(&request.work_id)).to_owned();
                     node.store
@@ -10052,12 +10071,7 @@ pub(super) mod tests {
                 Some("fake/frozen"),
             )
             .await?;
-            let (resume, running) = task_at_start(
-                &node,
-                test_access(network.clone(), false, Some("c".into())),
-                &request,
-            )
-            .await?;
+            let (resume, running) = task_at_start(&node, network.clone(), &request).await?;
             let trigger = crate::scheduling::task_trigger(&request.work_id);
             let job = {
                 let trigger = (trigger).to_owned();
@@ -10205,7 +10219,7 @@ pub(super) mod tests {
                     Duration::from_secs(15),
                     crate::scheduler::run(
                         node.clone(),
-                        test_access(network.clone(), false, Some("c".into())),
+                        network.clone(),
                         "c".into(),
                         match trigger.strip_prefix("task:") {
                             Some(work_id) => crate::scheduling::SessionScope::Task {

@@ -1344,7 +1344,7 @@ fn static_response(file: static_assets::StaticFile, cache: &'static str) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::test_support::{access as test_access, initialize_node};
+    use crate::runtime::test_support::initialize_node;
 
     #[test]
     fn a_renewed_certificate_is_served_without_a_restart() -> Result<()> {
@@ -1605,7 +1605,10 @@ mod tests {
         let (trigger, attempt) = start_reply(&node, &admin, "mcp-trigger").await?;
         node.register_manager_attempt_fixture(
             "mcp-current-attempt".into(),
-            test_access(network.clone(), false, Some("c".into())),
+            crate::runtime::AgentAccess::ReadOnly {
+                network_id: network.clone(),
+                conversation_id: "c".into(),
+            },
             &attempt,
             &trigger,
             crate::providers::Provider::Cursor,
@@ -1637,8 +1640,10 @@ mod tests {
             let missing_ref:Value=call(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_bot","arguments":{"name":"Duplicate"}}})).await?.json().await?;
             assert_eq!(missing_ref["result"]["isError"],true);
             assert_eq!(basis,{ let network = network.clone(); node.store.call("fixture_version_vector", move |store| store.version_vector(&network)).await? });
-            let mut wrong=node.agent_tokens.lock().await.get("mcp-current-attempt").cloned().context("token")?;
-            wrong.network_id="another-personal-network".into();
+            let wrong = crate::runtime::AgentAccess::ReadOnly {
+                network_id: "another-personal-network".into(),
+                conversation_id: "c".into(),
+            };
             node.agent_tokens.lock().await.insert("wrong-network".into(),wrong);
             let wrong:Value=client.post(&url).bearer_auth("wrong-network").json(&json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"context","arguments":{}}})).send().await?.json().await?;
             assert_eq!(wrong["result"]["isError"],true);
