@@ -2022,6 +2022,7 @@ impl Runtime {
             Ok(BusinessCommand::WorkspaceHistory(_)) => {
                 self.workspace_history(&access, input).await
             }
+            Ok(BusinessCommand::MessageSearch(_)) => self.message_search(&access, input).await,
             Ok(BusinessCommand::Message(_)) => self.accept_chat_message(&access, input).await,
             Ok(BusinessCommand::InputReceipt(_)) => self.input_receipt(&access, input).await,
             Ok(BusinessCommand::ScopeContext(_)) => self.scope_context(&access, input).await,

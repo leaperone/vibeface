@@ -242,7 +242,7 @@ test('new draft defaults become explicit signed booleans, and false survives dur
 test('untyped message, queued input and history boundaries require explicit report_results booleans', () => {
   const body = { message_id: 'input', target: { kind: 'bot_main', bot_id: 'bot' }, intent: 'continue', sequence: 1, text: '原输入' }
   const queue = (input: unknown) => ({ channels: [], tasks: [], assignments: [], inputs: [{ input, conversation_id: 'chat', source_event: 'source', control_event: 'control', effective_order: 1, deferred: false, cancelled: false }], coverage: { limit: 20, truncated: false } })
-  const history = (input: object) => ({ events: [{ event_hash: 'event', created_at_ms: 1, scope_id: 'chat', kind: 'input_posted', body: { type: 'input_posted', ...input }, speaker: { kind: 'human', device_id: 'client' } }], coverage: { limit: 20, truncated: false, scope: 'workspace' } })
+  const history = (input: object) => ({ next_cursor: null, complete: true, events: [{ event_hash: 'event', created_at_ms: 1, scope_id: 'chat', kind: 'input_posted', body: { type: 'input_posted', ...input }, speaker: { kind: 'human', device_id: 'client' } }], coverage: { limit: 20, truncated: false, scope: 'workspace' } })
   for (const report_results of [undefined, null, 0, 1, 'true', 'false', {}, []]) {
     const input = { ...body, ...(report_results === undefined ? {} : { report_results }) }
     assert.throws(() => parseMessageRequest({ conversation_id: 'chat', ...input }), /report_results/)

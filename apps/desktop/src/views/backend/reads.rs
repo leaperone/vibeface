@@ -437,6 +437,7 @@ impl Backend {
                         history: Some(
                             client
                                 .read(ReadRequest::WorkspaceHistory {
+                                    cursor: None,
                                     channel_id: channel.clone(),
                                     task_id: task.clone(),
                                     limit: 100,
@@ -461,6 +462,7 @@ impl Backend {
                             Some(InputTarget::Task { task_id }) => Some(
                                 client
                                     .read(ReadRequest::WorkspaceHistory {
+                                        cursor: None,
                                         channel_id: None,
                                         task_id: Some(task_id.clone()),
                                         limit: 100,
@@ -474,6 +476,7 @@ impl Backend {
                             }) => Some(
                                 client
                                     .read(ReadRequest::WorkspaceHistory {
+                                        cursor: None,
                                         channel_id: Some(channel_id.clone()),
                                         task_id: Some(task_id.clone()),
                                         limit: 100,

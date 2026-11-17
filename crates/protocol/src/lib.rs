@@ -72,3 +72,5 @@ mod tests {
 pub mod workspace;
 
 pub mod history;
+
+pub mod message_search;

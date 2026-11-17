@@ -255,6 +255,7 @@ business_commands! {
     WorkspaceCommandReceipt("workspace_command_receipt") => (Read, AuthoritativeWriter, None);
     WorkspaceState("workspace_state") => (Read, CommittedDisplay, None);
     WorkspaceHistory("workspace_history") => (Read, CommittedDisplay, None);
+    MessageSearch("message_search") => (Read, CommittedDisplay, None);
     Message("message") => (Ordered, AuthoritativeWriter, None);
     InputReceipt("input_receipt") => (Read, AuthoritativeWriter, None);
     ScopeContext("scope_context") => (Read, AuthoritativeWriter, None);
@@ -368,6 +369,12 @@ mod tests {
             ),
             (
                 "workspace_history",
+                Lane::Read,
+                ReadConsistency::CommittedDisplay,
+                SessionEffect::None,
+            ),
+            (
+                "message_search",
                 Lane::Read,
                 ReadConsistency::CommittedDisplay,
                 SessionEffect::None,

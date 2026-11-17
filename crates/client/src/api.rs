@@ -44,8 +44,10 @@ pub enum ReadRequest {
     WorkspaceHistory {
         channel_id: Option<String>,
         task_id: Option<String>,
+        cursor: Option<String>,
         limit: usize,
     },
+    MessageSearch(vibeface_protocol::message_search::MessageSearchRequest),
     #[serde(deserialize_with = "empty_operation")]
     Nodes,
     #[serde(deserialize_with = "empty_operation")]
@@ -2671,6 +2673,7 @@ impl ReadRequest {
             Self::WorkspaceHistory {
                 channel_id,
                 task_id,
+                cursor,
                 limit,
             } => {
                 let mut params = json!({"limit":limit});
@@ -2680,8 +2683,16 @@ impl ReadRequest {
                 if let Some(id) = task_id {
                     params["task_id"] = json!(id);
                 }
+                if let Some(cursor) = cursor {
+                    params["cursor"] = json!(cursor);
+                }
                 (true, "workspace_history", params)
             }
+            Self::MessageSearch(request) => (
+                true,
+                "message_search",
+                serde_json::to_value(request).expect("search request contains only wire fields"),
+            ),
             Self::Nodes => (true, "nodes", json!({})),
             Self::NodeSettings => (false, "node_settings", json!({})),
             Self::Logs => (false, "logs", json!({})),
@@ -2786,6 +2797,33 @@ mod tests {
         Identity,
         membership::{Genesis, Member, NetworkState},
     };
+
+    #[test]
+    fn workspace_history_and_message_search_preserve_typed_scope_and_cursor_on_wire() -> Result<()>
+    {
+        let history: ReadRequest = serde_json::from_value(
+            json!({"type":"workspace_history","channel_id":"channel","task_id":"task","cursor":"older","limit":2}),
+        )?;
+        let (rpc, method, params) = history.wire();
+        assert!(rpc);
+        assert_eq!(method, "workspace_history");
+        assert_eq!(
+            params,
+            json!({"channel_id":"channel","task_id":"task","cursor":"older","limit":2})
+        );
+        let search: ReadRequest = serde_json::from_value(
+            json!({"type":"message_search","scope":{"kind":"task","task_id":"task"},"query":"中文 %_","cursor":"older","limit":2}),
+        )?;
+        let (rpc, method, params) = search.wire();
+        assert!(rpc);
+        assert_eq!(method, "message_search");
+        assert_eq!(
+            params,
+            json!({"scope":{"kind":"task","task_id":"task"},"query":"中文 %_","cursor":"older","limit":2})
+        );
+        assert!(serde_json::from_value::<ReadRequest>(json!({"type":"message_search","scope":{"kind":"task","task_id":"task","bot_id":"other"},"query":"x"})).is_err());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn lost_receipt_and_restart_query_the_original_operation_without_duplicate_effect()

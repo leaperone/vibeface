@@ -294,6 +294,10 @@ Memory 的 metadata 为 `{epoch, revision, control_revision, source_event_hash, 
 
 连接身份绑定或会话权限检查失败仍返回 RPC 错误。进入 `message` 处理后的未保存拒绝返回 `{accepted:false, code:"input_not_saved", stored:false, message_id, reason}`。同一消息 ID 已有内容冲突时返回 `code:"input_conflict"` 和 `stored:true`，保留原记录。`accepted:true` 表示输入已保存，执行阶段仍以 `receipt` 为准。
 
+`workspace_history` 接受 `channel_id?`、`task_id?`、`limit?`（1–512，默认 256）和 `cursor?`。每页 `events` 保持 `(lamport, created_at_ms, hash)` 的旧到新顺序；用 `next_cursor` 向前读取更早历史，直到 `complete=true`。`coverage.truncated` 与 `!complete` 相同。游标绑定个人网络、确切频道/任务过滤和投影授权，并校验签名；不能跨范围复用。Node 重启或授权/投影变化使旧游标失效，客户端须重新读取第一页。响应有字节预算，页内记录可以少于 `limit`。
+
+`message_search` 只允许个人网络用户读取，Agent token 和 conversation-scoped 用户不能调用。请求为 `{scope, query, cursor?, limit?}`，其中 scope 是 `{kind:"bot_main", bot_id}`、`{kind:"task", task_id}` 或 `{kind:"channel", channel_id}`；`query` 是 1–1024 字节的非空白文字，`limit` 为 1–100（默认 50）。匹配当前提交消息的可见正文，按 Unicode 小写后做字面子串匹配；JSON 字段、ID、附件名、任务请求和工作提示词不参与匹配。Bot Main 沿用 Main 消息范围，任务消息不会混入。结果回显 `scope/query`，`items` 提供 `event_hash`、`message_id`、`conversation_id`、稳定 `rank`、`created_at_ms`、`text` 和已核验 `speaker`。页内旧到新，用 `next_cursor` 继续读取更早结果直到 `complete=true`；搜索游标额外绑定确切 query。`coverage={source:"committed_server_history",limit}` 表示当前 Node 已持有的已提交历史，不代表其他离线 Node 尚未同步的内容。两种读取都不追加事件、不回放执行或产生副作用。
+
 `workspace_command` 持久化频道、任务、Assignment 和队列控制命令。相同 command ID 回读原结果，改变内容须换 ID。 ControlInput 在追加前明确因 CAS 或资格校验被拒绝时，返回 `{accepted:false, code:"workspace_command_not_saved", stored:false, command_id, reason}`。该证据只表示这次控制命令未保存，不授予重发输入的权限。客户端绑定确切控制 ID 后重新查询原输入；IO、提交或转发结果不明时保留原控制身份继续对账。`workspace_state` 与 `workspace_history` 是有界共享投影，保留截断说明和已核验发言身份。`scope_context` 返回确切目标的本机编译来源与省略数量，`input_receipt` 返回该消息的逐阶段证据。Main 快照只包含 Main 消息和私有 job 投影；`scope_jobs` 另供明确目标选择，不携带原始提示、错误正文或私密会话内容。 `input_receipt.control_event` 是确切输入控制事件的哈希，不可达时为 null。`retry_safe=true` 必须带有效控制引用，未知结果始终为 false。
 
 调度 job 以 `(conversation_id, trigger)` 为键，`trigger` 为 `message:<message_id>`、`work:<work_id>`、`task:<work_id>`、`assignment:<assignment_id>`、`schedule:<schedule_id>:<slot_ms>` 或 `bot_message:<message_id>`，重试和同步都不会产生第二个 job。`message` 返回 `accepted`、`state`、`trigger`、`message_id` 和 `receipt`：

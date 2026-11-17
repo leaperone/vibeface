@@ -141,18 +141,48 @@ impl Runtime {
             .map(|_| id(input, "task_id"))
             .transpose()?;
         let limit = domain_limit(input)?;
-        let (events, truncated) = {
-            let network_id = access.network_id().to_owned();
-            let channel = channel.clone();
-            let task = task.clone();
-            self.read_display(access, input, "workspace.workspace_history", move |store| {
-                store.workspace_history(&network_id, channel.as_deref(), task.as_deref(), limit)
+        let cursor = input
+            .get("cursor")
+            .map(|value| {
+                value
+                    .as_str()
+                    .context("invalid history cursor")
+                    .map(str::to_owned)
             })
-            .await
-        }?;
-        Ok(
-            json!({"events":events,"coverage":{"limit":limit,"truncated":truncated,"scope":if task.is_some(){"task"}else if channel.is_some(){"channel"}else{"workspace"}}}),
-        )
+            .transpose()?;
+        let network_id = access.network_id().to_owned();
+        Ok(serde_json::to_value(
+            self.read_display(access, input, "workspace.workspace_history", move |store| {
+                store.workspace_history(
+                    &network_id,
+                    channel.as_deref(),
+                    task.as_deref(),
+                    cursor.as_deref(),
+                    limit,
+                )
+            })
+            .await?,
+        )?)
+    }
+    pub(super) async fn message_search(&self, access: &Access, input: &Value) -> Result<Value> {
+        ensure!(
+            access.is_user() && access.conversation_id().is_none(),
+            "message search needs the user's personal network access"
+        );
+        let mut fields = input.clone();
+        if let Some(fields) = fields.as_object_mut() {
+            fields.remove("method");
+            fields.remove("client_id");
+        }
+        let request: vibeface_protocol::message_search::MessageSearchRequest =
+            serde_json::from_value(fields).context("invalid message search request")?;
+        let network = access.network_id().to_owned();
+        Ok(serde_json::to_value(
+            self.read_display(access, input, "workspace.message_search", move |store| {
+                store.message_search(&network, &request)
+            })
+            .await?,
+        )?)
     }
 }
 fn domain_limit(input: &Value) -> Result<usize> {
@@ -255,6 +285,62 @@ mod tests {
                 let network = network.to_owned();
                 node.store.call("workspace.version_vector", move |store| store.version_vector(&network)).await
             }?, committed);
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        let socket = node
+            .providers()
+            .switches
+            .codex_app_server
+            .socket
+            .context("fixture socket")?;
+        let _ = std::fs::remove_file(socket);
+        drop(node);
+        std::fs::remove_dir_all(directory)?;
+        result
+    }
+    #[tokio::test]
+    async fn message_search_dispatch_is_read_only_and_rejects_agent_and_scoped_user_access()
+    -> Result<()> {
+        let (node, admin, directory) = node().await?;
+        let result = async {
+            bot(&node, &admin, "c", "Search", &[]).await?;
+            let network = node.store.call("search.network", |store| store.network()).await?.context("network")?;
+            let bot_id = {
+                let network = network.clone();
+                node.store.call("search.bot", move |store| Ok(store.bot_for_conversation(&network, "c")?.context("Bot")?.bot_id)).await?
+            };
+            let before = {
+                let network = network.clone();
+                node.store.call("search.before", move |store| store.version_vector(&network)).await?
+            };
+            let request = json!({"method":"message_search","scope":{"kind":"bot_main","bot_id":bot_id},"query":"中文"});
+            let user = Access::User { network_id: network.clone(), scope: UserScope::Network };
+            let page = node.rpc(user.clone(), crate::command::business_fixture(request.clone())).await?;
+            assert_eq!(page["scope"], request["scope"]);
+            assert_eq!(page["query"], "中文");
+            assert_eq!(page["items"], json!([]));
+            assert_eq!(page["complete"], true);
+            assert_eq!(page["coverage"]["source"], "committed_server_history");
+            for scope in [json!({"kind":"bot_main","bot_id":"other"}), json!({"kind":"task","task_id":"other"}), json!({"kind":"channel","channel_id":"other"})] {
+                let request = json!({"method":"message_search","scope":scope,"query":"中文"});
+                for access in [
+                    Access::Agent(AgentAccess::ReadOnly { network_id: network.clone(), conversation_id: "c".into() }),
+                    Access::User { network_id: network.clone(), scope: UserScope::Conversation("c".into()) },
+                ] {
+                    let error = node.rpc(access, crate::command::business_fixture(request.clone())).await.expect_err("scoped access cannot use personal search");
+                    assert!(error.to_string().contains("Agent tokens") || error.to_string().contains("personal network access"), "{error:#}");
+                }
+            }
+            for extra in [json!({"conversation_id":"c"}), json!({"unknown":true}), json!({"scope":{"kind":"bot_main","bot_id":bot_id,"task_id":"other"}})] {
+                let mut invalid = request.clone();
+                invalid.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+                assert!(node.rpc(user.clone(), crate::command::business_fixture(invalid)).await.is_err());
+            }
+            let after = {
+                let network = network.clone();
+                node.store.call("search.after", move |store| store.version_vector(&network)).await?
+            };
+            assert_eq!(before, after);
             Ok::<_, anyhow::Error>(())
         }.await;
         let socket = node

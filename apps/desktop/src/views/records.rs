@@ -375,6 +375,8 @@ pub struct WorkspaceHistory {
     pub task_id: Option<String>,
     pub events: Vec<HistoryEvent>,
     pub coverage: HistoryCoverage,
+    pub next_cursor: Option<String>,
+    pub complete: bool,
 }
 
 pub fn parse_workspace_history(
@@ -398,6 +400,8 @@ pub fn parse_workspace_history(
     struct Wire {
         events: Vec<WireEvent>,
         coverage: HistoryCoverage,
+        next_cursor: Option<String>,
+        complete: bool,
     }
     valid_id(network)?;
     if let Some(id) = channel {
@@ -426,6 +430,16 @@ pub fn parse_workspace_history(
         HistoryScope::Workspace
     };
     ensure!(wire.coverage.scope == expected, "历史范围与请求不一致");
+    ensure!(
+        wire.complete == wire.next_cursor.is_none() && wire.coverage.truncated == !wire.complete,
+        "历史分页覆盖信息不一致"
+    );
+    ensure!(
+        wire.next_cursor
+            .as_ref()
+            .is_none_or(|cursor| !cursor.is_empty() && cursor.len() <= 8192),
+        "历史游标格式错误"
+    );
     ensure!(
         (1..=512).contains(&wire.coverage.limit) && wire.events.len() <= wire.coverage.limit,
         "历史条数超过读取范围"
@@ -574,6 +588,8 @@ pub fn parse_workspace_history(
         task_id: task.map(str::to_owned),
         events,
         coverage: wire.coverage,
+        next_cursor: wire.next_cursor,
+        complete: wire.complete,
     })
 }
 
