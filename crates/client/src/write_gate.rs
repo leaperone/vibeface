@@ -90,6 +90,23 @@ impl AtomicWriteGate {
         snapshot >> 2 == generation.0 && Self::decode(snapshot) == WriteGate::Writable
     }
 
+    // Keep the existing CAS semantics on MSRV 1.91, where try_update is unstable.
+    fn update(&self, mut update: impl FnMut(u64) -> Option<u64>) -> std::result::Result<u64, u64> {
+        let mut previous = self.0.load(Ordering::Acquire);
+        loop {
+            let Some(next) = update(previous) else {
+                return Err(previous);
+            };
+            match self
+                .0
+                .compare_exchange_weak(previous, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(current) => previous = current,
+            }
+        }
+    }
+
     /// Publish the replacement's owner and initial observation atomically, before
     /// its cache job runs and before the replaced connection is closed.
     pub(crate) fn begin_generation(&self, observed: WriteGate) -> Result<WriteGateGeneration> {
@@ -127,14 +144,12 @@ impl AtomicWriteGate {
         generation: WriteGateGeneration,
         observed: WriteGate,
     ) -> WriteGate {
-        let previous = self
-            .0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |snapshot| {
-                if snapshot >> 2 != generation.0 && observed != WriteGate::Forked {
-                    return None;
-                }
-                Some((snapshot & !3) | u64::from(u8::from(Self::decode(snapshot).merge(observed))))
-            });
+        let previous = self.update(|snapshot| {
+            if snapshot >> 2 != generation.0 && observed != WriteGate::Forked {
+                return None;
+            }
+            Some((snapshot & !3) | u64::from(u8::from(Self::decode(snapshot).merge(observed))))
+        });
         match previous {
             Ok(snapshot) => Self::decode(snapshot).merge(observed),
             Err(snapshot) => Self::decode(snapshot),
@@ -143,14 +158,13 @@ impl AtomicWriteGate {
 
     pub(crate) fn confirm_fork(&self) {
         // A confirmed fork remains valid even when its observing generation was replaced.
-        self.0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |snapshot| {
-                Some(
-                    (snapshot & !3)
-                        | u64::from(u8::from(Self::decode(snapshot).merge(WriteGate::Forked))),
-                )
-            })
-            .expect("a fork always has a merged value");
+        self.update(|snapshot| {
+            Some(
+                (snapshot & !3)
+                    | u64::from(u8::from(Self::decode(snapshot).merge(WriteGate::Forked))),
+            )
+        })
+        .expect("a fork always has a merged value");
     }
 
     /// The caller holds its outbox mutex for the entire callback. Never persist a
