@@ -1,11 +1,6 @@
 //! Bounded reads retain the authoritative scope resolver for every historical card.
-use super::{
-    conversation_history::{HistoryBoundary, history_page},
-    *,
-};
-use vibeface_protocol::history::{
-    HISTORY_MAX_LIMIT, HISTORY_PAGE_BYTES, HistoryPage, HistorySection,
-};
+use super::{conversation_history::HistoryBoundary, history_page_collector::HistoryCollector, *};
+use vibeface_protocol::history::{HISTORY_MAX_LIMIT, HistoryPage, HistorySection};
 
 impl Store {
     /// Coverage counts do not need the outgoing message text or its attachment metadata.
@@ -206,14 +201,9 @@ impl Store {
             second_id,
             limit + 1
         ])?;
-        let mut boundary = before.clone();
-        let mut items = Vec::new();
-        let mut bytes = 0;
-        let mut scanned = 0;
-        let mut has_more = false;
+        let mut collector = HistoryCollector::new(before.clone(), limit);
         while let Some(row) = rows.next()? {
-            if scanned == limit {
-                has_more = true;
+            if !collector.can_scan_candidate() {
                 break;
             }
             let rank = row.get(0)?;
@@ -223,37 +213,20 @@ impl Store {
                 id.push_str(&row.get::<_, String>(2)?);
             }
             let item = project(&id)?;
-            if let Some(item) = &item {
-                let size = serde_json::to_vec(item)?.len() + 1;
-                if !items.is_empty() && bytes + size > HISTORY_PAGE_BYTES {
-                    has_more = true;
-                    break;
-                }
-                bytes += size;
-            }
-            boundary = Some(HistoryBoundary { rank, id });
-            scanned += 1;
-            if let Some(item) = item {
-                items.push(item);
+            if !collector.include(HistoryBoundary { rank, id }, item)? {
+                break;
             }
         }
-        items.reverse();
-        history_page(
-            network,
-            conversation,
-            section,
-            authority,
-            boundary,
-            items,
-            has_more,
-        )
+        collector.finish(network, conversation, section, authority)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::conversation_history::history_page;
     use super::*;
     use crate::{providers::Provider, workspace::InputTarget};
+    use vibeface_protocol::history::HISTORY_PAGE_BYTES;
 
     struct Fixture {
         store: Store,
@@ -571,6 +544,25 @@ mod tests {
         )?;
         assert_eq!(second.items[0]["session_id"], "s0");
         assert!(second.complete);
+        // The soft budget must not make a single large projection inaccessible.
+        let oversized = "x".repeat(HISTORY_PAGE_BYTES + 1);
+        f.store.connection.execute(
+            "UPDATE session_owners SET attribution=json_set(attribution,'$.summary',?) WHERE session_id='s1'", [&oversized],
+        )?;
+        let oversized_page = f
+            .store
+            .conversation_sessions_page(&f.network, "c", None, 100)?;
+        assert_eq!(oversized_page.items.len(), 1);
+        assert_eq!(oversized_page.items[0]["summary"], oversized);
+        assert!(!oversized_page.complete);
+        let remaining = f.store.conversation_sessions_page(
+            &f.network,
+            "c",
+            oversized_page.next_cursor.as_deref(),
+            100,
+        )?;
+        assert_eq!(remaining.items[0]["session_id"], "s0");
+        assert!(remaining.complete);
         let huge = "x".repeat(vibeface_protocol::history::HISTORY_RESPONSE_BYTES);
         f.store.connection.execute(
             "UPDATE session_owners SET attribution=json_set(attribution,'$.summary',?) WHERE session_id='s1'", [&huge],
@@ -579,6 +571,33 @@ mod tests {
             f.store
                 .conversation_sessions_page(&f.network, "c", None, 1)
                 .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn equal_rank_sessions_continue_by_both_node_and_session() -> Result<()> {
+        let f = fixture()?;
+        for (node, session) in [("a", "z"), ("b", "a"), ("b", "z")] {
+            f.store.connection.execute(
+                "INSERT INTO session_owners(network_id,conversation_id,node,session_id,rank,attribution,created_at_ms)
+                 VALUES(?1,'c',?2,?3,'same-rank','{}',10)",
+                params![f.network, node, session],
+            )?;
+        }
+        let sessions = all_pages(|cursor| {
+            f.store
+                .conversation_sessions_page(&f.network, "c", cursor, 1)
+        })?;
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|value| (
+                    value["node"].as_str().unwrap(),
+                    value["session_id"].as_str().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            [("a", "z"), ("b", "a"), ("b", "z")]
         );
         Ok(())
     }

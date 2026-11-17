@@ -1,12 +1,11 @@
 //! Settings pages use stable IDs. Clients sort loaded skills and schedules by their names.
 use super::{
     conversation_history::{HistoryBoundary, history_page},
+    history_page_collector::{HistoryCollector, SerializedByteBudget},
     *,
 };
 use crate::scheduling::MemoryConflict;
-use vibeface_protocol::history::{
-    HISTORY_MAX_LIMIT, HISTORY_PAGE_BYTES, HistoryPage, HistorySection,
-};
+use vibeface_protocol::history::{HISTORY_MAX_LIMIT, HistoryPage, HistorySection};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConversationMemoryConflict {
@@ -164,14 +163,9 @@ impl Store {
             before.as_ref().map(|b| b.id.as_str()),
             limit + 1
         ])?;
-        let mut boundary = before.clone();
-        let mut items = Vec::new();
-        let mut bytes = 0;
-        let mut scanned = 0;
-        let mut has_more = false;
+        let mut collector = HistoryCollector::new(before.clone(), limit);
         while let Some(row) = rows.next()? {
-            if scanned == limit {
-                has_more = true;
+            if !collector.can_scan_candidate() {
                 break;
             }
             let rank: String = row.get(0)?;
@@ -182,30 +176,11 @@ impl Store {
                 id.clone()
             };
             let item = project(&lookup)?;
-            if let Some(item) = &item {
-                let size = serde_json::to_vec(item)?.len() + 1;
-                if !items.is_empty() && bytes + size > HISTORY_PAGE_BYTES {
-                    has_more = true;
-                    break;
-                }
-                bytes += size;
-            }
-            boundary = Some(HistoryBoundary { rank, id });
-            scanned += 1;
-            if let Some(item) = item {
-                items.push(item);
+            if !collector.include(HistoryBoundary { rank, id }, item)? {
+                break;
             }
         }
-        items.reverse();
-        history_page(
-            network,
-            conversation,
-            section,
-            authority,
-            boundary,
-            items,
-            has_more,
-        )
+        collector.finish(network, conversation, section, authority)
     }
 
     /// SQL counts only the active sessions' staged entries, without deserializing SDK state.
@@ -261,7 +236,7 @@ impl Store {
         ])?;
         let mut boundary = before.clone();
         let mut items = Vec::new();
-        let mut bytes = 0;
+        let mut bytes = SerializedByteBudget::default();
         let mut scanned_sessions = 0;
         let mut has_more = false;
         'sessions: while let Some(session) = sessions.next()? {
@@ -309,12 +284,10 @@ impl Store {
                     history_id: digest(&serde_json::to_vec(&(&scope, &body, occurrence))?),
                     conflict: serde_json::from_str(&body)?,
                 };
-                let size = serde_json::to_vec(&conflict)?.len() + 1;
-                if !items.is_empty() && bytes + size > HISTORY_PAGE_BYTES {
+                if !bytes.try_include(&conflict)? {
                     has_more = true;
                     break 'sessions;
                 }
-                bytes += size;
                 boundary = Some(HistoryBoundary {
                     rank: scope.clone(),
                     id: serde_json::to_string(&ConflictBoundary {
@@ -368,11 +341,7 @@ impl Store {
             None => 13,
         };
         ensure!((0..=13).contains(&start), "invalid overwritten setting");
-        let mut boundary = before.clone();
-        let mut items = Vec::new();
-        let mut bytes = 0;
-        let mut scanned = 0;
-        let mut has_more = false;
+        let mut collector = HistoryCollector::new(before.clone(), limit);
         'settings: for number in (0..=start).rev() {
             let head: Option<(String, String, String)> = self.connection.query_row(
                 "SELECT rank,by,after_value FROM conversation_setting_writes WHERE network_id=? AND conversation_id=? AND setting=? ORDER BY rank DESC LIMIT 1",
@@ -410,11 +379,10 @@ impl Store {
                 number,
                 cutoff.unwrap_or_default(),
                 until,
-                limit - scanned + 1
+                collector.remaining_with_lookahead()
             ])?;
             while let Some(row) = rows.next()? {
-                if scanned == limit {
-                    has_more = true;
+                if !collector.can_scan_candidate() {
                     break 'settings;
                 }
                 let rank: String = row.get(0)?;
@@ -455,33 +423,148 @@ impl Store {
                 } else {
                     None
                 };
-                if let Some(item) = &item {
-                    let size = serde_json::to_vec(item)?.len() + 1;
-                    if !items.is_empty() && bytes + size > HISTORY_PAGE_BYTES {
-                        has_more = true;
-                        break 'settings;
-                    }
-                    bytes += size;
-                }
-                boundary = Some(HistoryBoundary {
-                    rank: format!("{number}:{rank}"),
-                    id: hash,
-                });
-                scanned += 1;
-                if let Some(item) = item {
-                    items.push(item);
+                if !collector.include(
+                    HistoryBoundary {
+                        rank: format!("{number}:{rank}"),
+                        id: hash,
+                    },
+                    item,
+                )? {
+                    break 'settings;
                 }
             }
         }
-        items.reverse();
-        history_page(
+        collector.finish(
             network,
             conversation,
             HistorySection::Overwritten,
             authority,
-            boundary,
-            items,
-            has_more,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> Result<(Store, String)> {
+        let identity = LocalIdentity::generate();
+        let network = identity.fixture_network_id()?;
+        let state = identity.sign_network_fixture(1, vec![identity.device_id()?])?;
+        let mut store = Store::open(":memory:")?;
+        store.install_trust_bundle(&network, &state)?;
+        Ok((store, network))
+    }
+
+    #[test]
+    fn overwritten_candidate_limit_continues_across_settings_without_emitting() -> Result<()> {
+        let (store, network) = fixture()?;
+        // Writes without a main change still consume candidates. The budget spans settings,
+        // rather than resetting when traversal leaves instructions for the older name writes.
+        for setting in [0, 1] {
+            for rank in ["a", "b", "c"] {
+                store.connection.execute(
+                    "INSERT INTO conversation_setting_writes(network_id,conversation_id,setting,rank,event_hash,by,saw,after_value)
+                     VALUES(?1,'c',?2,?3,?3,'writer','null','null')",
+                    params![network, setting, rank],
+                )?;
+            }
+        }
+        let first = store.conversation_overwritten_page(&network, "c", None, 3)?;
+        assert!(first.items.is_empty());
+        assert!(!first.complete);
+        let (_, boundary) = store.history_cursor(
+            &network,
+            "c",
+            HistorySection::Overwritten,
+            first.next_cursor.as_deref(),
+        )?;
+        let boundary = boundary.context("continuation")?;
+        assert_eq!((boundary.rank.as_str(), boundary.id.as_str()), ("0:b", "b"));
+        let second =
+            store.conversation_overwritten_page(&network, "c", first.next_cursor.as_deref(), 3)?;
+        assert!(second.items.is_empty());
+        assert!(second.complete);
+        assert!(second.next_cursor.is_none());
+        Ok(())
+    }
+
+    fn add_conflicts(store: &Store, scope: &str, reasons: &[&str]) -> Result<()> {
+        let conflicts = reasons
+            .iter()
+            .map(|reason| MemoryConflict {
+                call_ref: "call".into(),
+                memory_id: "memory".into(),
+                expected_epoch: 1,
+                actual_epoch: 2,
+                expected_revision: "old".into(),
+                actual_revision: "new".into(),
+                reason: (*reason).into(),
+            })
+            .collect::<Vec<_>>();
+        store.connection.execute(
+            "INSERT INTO scheduler_sessions(conversation_id,scope,next_sequence,covers,owner_epoch,permission_version,shown)
+             VALUES('c',?1,1,'{}',1,1,?2)",
+            params![scope, serde_json::to_string(&serde_json::json!({"memory_conflicts":conflicts}))?],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn local_conflicts_count_emitted_items_separately_from_scanned_sessions() -> Result<()> {
+        let (store, network) = fixture()?;
+        add_conflicts(&store, "z-empty", &[])?;
+        add_conflicts(&store, "y-full", &["older", "newer"])?;
+        add_conflicts(&store, "x-older", &["last"])?;
+        let first = store.conversation_memory_conflicts_page(&network, "c", None, 2)?;
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|item| item.conflict.reason.as_str())
+                .collect::<Vec<_>>(),
+            ["older", "newer"]
+        );
+        assert!(!first.complete);
+        let second = store.conversation_memory_conflicts_page(
+            &network,
+            "c",
+            first.next_cursor.as_deref(),
+            2,
+        )?;
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].conflict.reason, "last");
+        assert!(second.complete);
+        Ok(())
+    }
+
+    #[test]
+    fn local_conflict_byte_continuation_keeps_the_unemitted_offset() -> Result<()> {
+        let (store, network) = fixture()?;
+        let oversized = "x".repeat(vibeface_protocol::history::HISTORY_PAGE_BYTES + 1);
+        add_conflicts(&store, "main", &["older", &oversized])?;
+        let first = store.conversation_memory_conflicts_page(&network, "c", None, 100)?;
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0].conflict.reason, oversized);
+        let (_, boundary) = store.history_cursor(
+            &network,
+            "c",
+            HistorySection::MemoryConflicts,
+            first.next_cursor.as_deref(),
+        )?;
+        let boundary = boundary.context("continuation")?;
+        let position: ConflictBoundary = serde_json::from_str(&boundary.id)?;
+        assert_eq!(boundary.rank, "main");
+        assert_eq!(position.offset, 1);
+        let second = store.conversation_memory_conflicts_page(
+            &network,
+            "c",
+            first.next_cursor.as_deref(),
+            100,
+        )?;
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].conflict.reason, "older");
+        assert!(second.complete);
+        Ok(())
     }
 }
