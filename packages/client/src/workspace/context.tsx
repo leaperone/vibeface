@@ -327,7 +327,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       if (messageOf(caught).includes('refresh the conversation')) {
         historyRequests.current.reset()
         setHistoryLoading(new Set())
-        conversationReads.current.clearConfirmation()
+        conversationReads.current.invalidate()
         readConnection.current = null
         if (conversationCache) setDataOrigin('cache')
         else { dataRef.current = null; setData(null); setDataOrigin('none') }
@@ -500,6 +500,10 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
         else await readConversation(activeId.current)
       }
       requireCurrent()
+      if (activeId.current && !conversationReads.current.confirmed()) {
+        resolveRefresh()
+        return
+      }
       readConnection.current = connection
       readGeneration.current = connectionGeneration
       loadedMessageConnection.current = connection
