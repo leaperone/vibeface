@@ -897,6 +897,16 @@ def workflow_contract_self_test():
     def block(workflow, job):
         return re.search(rf"(?ms)^  {re.escape(job)}:\n(.*?)(?=^  [\w-]+:\n|\Z)", workflows[workflow].split("\njobs:\n", 1)[1])[1]
 
+    def mapping_keys(text, indentation):
+        keys = []
+        for line in text.splitlines():
+            if not line.startswith(" " * indentation) or len(line) <= indentation or line[indentation].isspace() or line[indentation] == "#":
+                continue
+            entry = re.fullmatch(r"([^:]+):(?:[ \t].*)?", line[indentation:].rstrip())
+            assert entry is not None, "Workflow mapping declarations must use canonical keys"
+            keys.append(entry[1].strip())
+        return keys
+
     inventory = {
         "ci.yml": ["plan", *JOBS, "ci-gate"],
     }
@@ -923,11 +933,11 @@ def workflow_contract_self_test():
             assert "workflow_dispatch:" not in selected
         else:
             events = selected.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
-            assert set(re.findall(r"(?m)^  ([\w-]+):$", events)) == {"workflow_call", "workflow_dispatch"}
+            assert sorted(mapping_keys(events, 2)) == ["workflow_call", "workflow_dispatch"]
             manual = events.split("  workflow_dispatch:\n", 1)[1]
-            assert re.findall(r"(?m)^      ([\w-]+):$", manual) == ["source_sha"]
+            assert mapping_keys(manual, 6) == ["source_sha"]
             assert "        type: string\n        required: true" in manual
-            assert re.findall(r"(?m)^  ([\w-]+):$", selected.split("\njobs:\n", 1)[1]) == ["build"]
+            assert mapping_keys(selected.split("\njobs:\n", 1)[1], 2) == ["build"]
             crypto_job = block(filename, "build")
             assert 're.fullmatch(r"[0-9a-f]{40}", os.environ["SOURCE_SHA"])' in crypto_job
             assert "SOURCE_SHA: ${{ inputs.source_sha }}" in crypto_job
