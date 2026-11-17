@@ -1,5 +1,5 @@
 //! Last verified public membership evidence. It only authorizes local storage while offline.
-use crate::{ClientAuthority, ClientKey, OfflineBlockReason};
+use crate::{ClientAuthority, ClientKey, OfflineBlockReason, write_gate::WriteGate};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use vibeface_secure::membership::NetworkState;
@@ -12,7 +12,7 @@ pub(crate) struct CachedProfile {
     pub target_node: String,
     pub state: NetworkState,
     pub observed_at_ms: u64,
-    pub write_gate: u8,
+    pub write_gate: WriteGate,
     pub revoked: bool,
 }
 impl CachedProfile {
@@ -25,14 +25,13 @@ impl CachedProfile {
                 && self.state.genesis.network_id == self.network_id,
             "cached profile belongs to another network, client or target"
         );
-        ensure!(self.write_gate <= 3, "invalid cached write state");
         self.state.project_at(self.observed_at_ms)?.node(target)?;
         let view = self
             .state
             .project_at(vibeface_protocol::now_ms().max(self.observed_at_ms))?;
         let blocked = if self.revoked {
             Some(OfflineBlockReason::Revoked)
-        } else if self.write_gate == 2 {
+        } else if self.write_gate == WriteGate::Forked {
             Some(OfflineBlockReason::Forked)
         } else if key.network_id().is_none() {
             Some(OfflineBlockReason::NotEnrolled)
@@ -85,7 +84,7 @@ mod tests {
             target_node: node.device_id(),
             state,
             observed_at_ms: vibeface_protocol::now_ms(),
-            write_gate: 1,
+            write_gate: WriteGate::Writable,
             revoked: false,
         };
         assert_eq!(
@@ -100,7 +99,7 @@ mod tests {
             }
         );
         proof.revoked = false;
-        proof.write_gate = 2;
+        proof.write_gate = WriteGate::Forked;
         assert_eq!(
             proof.verify_offline(&key, &node.device_id())?,
             ClientAuthority::PrivateDataOnly {

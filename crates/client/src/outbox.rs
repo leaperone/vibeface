@@ -1,5 +1,5 @@
 //! Private durable operations. A committed unknown outcome blocks its original write lane.
-use crate::wire::Attachment;
+use crate::{wire::Attachment, write_gate::WriteGate};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -186,9 +186,15 @@ impl Outbox {
         };
         Ok(outbox)
     }
-    pub(crate) fn cache_profile(&self, profile: &crate::profile::CachedProfile) -> Result<()> {
+    pub(crate) fn cache_profile(
+        &self,
+        profile: &crate::profile::CachedProfile,
+    ) -> Result<WriteGate> {
+        let mut profile = profile.clone();
         ensure!(
-            profile.network_id == self.network && profile.client_id == self.client,
+            profile.network_id == self.network
+                && profile.client_id == self.client
+                && profile.state.genesis.network_id == self.network,
             "profile cache identity mismatch"
         );
         let existing: Option<Vec<u8>> = self
@@ -200,7 +206,7 @@ impl Outbox {
             )
             .optional()?;
         if let Some(existing) = existing {
-            let known: crate::profile::CachedProfile = serde_json::from_slice(&existing)?;
+            let known = self.decode_profile(&profile.target_node, &existing)?;
             if known.revoked && !profile.revoked {
                 let prior = known.state.project_at(known.observed_at_ms)?;
                 let fresh = profile.state.project_at(profile.observed_at_ms)?;
@@ -211,12 +217,9 @@ impl Outbox {
                 fresh.client(&profile.client_id)?;
                 fresh.node(&profile.target_node)?;
             }
-            ensure!(
-                known.write_gate != 2 || profile.write_gate == 2,
-                "known Node fork cannot be overwritten by older write status"
-            );
+            profile.write_gate = known.write_gate.merge(profile.write_gate);
         }
-        let bytes = serde_json::to_vec(profile)?;
+        let bytes = serde_json::to_vec(&profile)?;
         ensure!(
             bytes.len() <= 4 * 1024 * 1024,
             "profile proof exceeds cache limit"
@@ -233,7 +236,7 @@ impl Outbox {
         )?;
         ensure!(count < 64 || exists, "too many cached Node profiles");
         self.db.execute("INSERT INTO verified_profiles VALUES(?1,?2) ON CONFLICT(target) DO UPDATE SET payload=excluded.payload",params![profile.target_node,bytes])?;
-        Ok(())
+        Ok(profile.write_gate)
     }
     pub(crate) fn cached_profile(&self, target: &str) -> Result<crate::profile::CachedProfile> {
         let bytes: Vec<u8> = self.db.query_row(
@@ -241,17 +244,26 @@ impl Outbox {
             [target],
             |row| row.get(0),
         )?;
+        self.decode_profile(target, &bytes)
+    }
+    fn decode_profile(&self, target: &str, bytes: &[u8]) -> Result<crate::profile::CachedProfile> {
         ensure!(
             bytes.len() <= 4 * 1024 * 1024,
             "profile cache exceeds limit"
         );
-        Ok(serde_json::from_slice(&bytes)?)
+        let profile: crate::profile::CachedProfile = serde_json::from_slice(bytes)?;
+        ensure!(
+            profile.target_node == target
+                && profile.network_id == self.network
+                && profile.client_id == self.client
+                && profile.state.genesis.network_id == self.network,
+            "profile cache binding mismatch"
+        );
+        Ok(profile)
     }
-    pub(crate) fn cache_write_gate(&self, target: &str, gate: u8) -> Result<()> {
+    pub(crate) fn cache_write_gate(&self, target: &str, gate: WriteGate) -> Result<WriteGate> {
         let mut profile = self.cached_profile(target)?;
-        if profile.write_gate != 2 {
-            profile.write_gate = gate;
-        }
+        profile.write_gate = profile.write_gate.merge(gate);
         self.cache_profile(&profile)
     }
     pub(crate) fn invalidate_profile(&self, target: &str) -> Result<()> {
@@ -267,7 +279,7 @@ impl Outbox {
             Err(error) => return Err(error),
         };
         profile.revoked = true;
-        self.cache_profile(&profile)
+        self.cache_profile(&profile).map(|_| ())
     }
     pub(crate) fn reserve_sequence(&mut self, lane: &str) -> Result<u64> {
         let tx = self
@@ -768,6 +780,115 @@ impl Outbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn cached_proof() -> Result<crate::profile::CachedProfile> {
+        use vibeface_secure::{
+            Identity,
+            membership::{Genesis, Member, NetworkState},
+        };
+        let client = Identity::generate()?;
+        let node = Identity::generate()?;
+        let state = NetworkState::new(Genesis::create(
+            &Identity::generate()?,
+            Member::client(&client, "client", true)?,
+            Member::node(&node, "node")?,
+        )?)?;
+        Ok(crate::profile::CachedProfile {
+            network_id: state.genesis.network_id.clone(),
+            client_id: client.device_id(),
+            target_node: node.device_id(),
+            state,
+            observed_at_ms: vibeface_protocol::now_ms(),
+            write_gate: WriteGate::Writable,
+            revoked: false,
+        })
+    }
+
+    #[test]
+    fn cache_refreshes_and_reopen_cannot_erase_a_confirmed_fork() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("native-gate-cache-{}", uuid::Uuid::new_v4()));
+        let proof = cached_proof()?;
+        let db = Outbox::open(&dir, &proof.network_id, &proof.client_id)?;
+        assert_eq!(db.cache_profile(&proof)?, WriteGate::Writable);
+        assert_eq!(
+            db.cache_write_gate(&proof.target_node, WriteGate::Forked)?,
+            WriteGate::Forked
+        );
+        for stale in [
+            WriteGate::Unknown,
+            WriteGate::Writable,
+            WriteGate::Restricted,
+        ] {
+            assert_eq!(
+                db.cache_write_gate(&proof.target_node, stale)?,
+                WriteGate::Forked
+            );
+            let mut refreshed = proof.clone();
+            refreshed.write_gate = stale;
+            assert_eq!(db.cache_profile(&refreshed)?, WriteGate::Forked);
+            assert_eq!(
+                db.cached_profile(&proof.target_node)?.write_gate,
+                WriteGate::Forked
+            );
+        }
+        drop(db);
+        let reopened = Outbox::open(&dir, &proof.network_id, &proof.client_id)?;
+        assert_eq!(
+            reopened.cached_profile(&proof.target_node)?.write_gate,
+            WriteGate::Forked
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_or_misbound_cached_gates_are_rejected_before_read_or_refresh() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("native-gate-corrupt-{}", uuid::Uuid::new_v4()));
+        let proof = cached_proof()?;
+        let db = Outbox::open(&dir, &proof.network_id, &proof.client_id)?;
+        db.cache_profile(&proof)?;
+        let valid = serde_json::to_value(&proof)?;
+        let mut invalid = vec![b"not JSON".to_vec()];
+        for value in [
+            serde_json::json!(4),
+            serde_json::json!(255),
+            serde_json::json!(-1),
+            serde_json::json!("forked"),
+            Value::Null,
+        ] {
+            let mut bad = valid.clone();
+            bad["write_gate"] = value;
+            invalid.push(serde_json::to_vec(&bad)?);
+        }
+        for field in ["network_id", "client_id", "target_node"] {
+            let mut bad = valid.clone();
+            bad[field] = serde_json::json!("another identity");
+            invalid.push(serde_json::to_vec(&bad)?);
+        }
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove("write_gate");
+        invalid.push(serde_json::to_vec(&missing)?);
+        for bytes in invalid {
+            db.db.execute(
+                "UPDATE verified_profiles SET payload=?1 WHERE target=?2",
+                params![bytes, proof.target_node],
+            )?;
+            assert!(db.cached_profile(&proof.target_node).is_err());
+            assert!(
+                db.cache_write_gate(&proof.target_node, WriteGate::Writable)
+                    .is_err()
+            );
+            assert!(
+                db.cache_profile(&proof).is_err(),
+                "refresh must not hide damaged evidence"
+            );
+        }
+        drop(db);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     #[test]
     fn stored_network_requires_the_outbox_lease_before_reading_sqlite() -> Result<()> {
         let dir =

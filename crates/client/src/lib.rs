@@ -16,6 +16,7 @@ pub mod local;
 pub use local::{LocalGrant, LocalTarget};
 
 mod profile;
+mod write_gate;
 
 mod settings;
 
