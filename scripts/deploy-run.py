@@ -122,11 +122,11 @@ def core_smoke(identity, info, output):
         result = json.loads(docker('run', '--rm', '-i', *base, '--user', '1001:1001', '--entrypoint',
                                   '/opt/vibeface/vibeface-core', identity, '--control',
                                   input='{"command":"inspect","data_dir":"/data"}'))
-        release.require(isinstance(result, dict) and result.get('ok') is True
+        release_format.require(isinstance(result, dict) and result.get('ok') is True
                         and isinstance(result.get('result'), dict),
                         'isolated Core inspection failed')
         inspected = result['result']
-        release.require(set(inspected) == {'status', 'device_id', 'data_dir', 'maintenance_socket',
+        release_format.require(set(inspected) == {'status', 'device_id', 'data_dir', 'maintenance_socket',
                         'listen', 'local_listen', 'public_url', 'web_enabled', 'http_enabled',
                         'version', 'write_state', 'mesh', 'peers', 'core_version', 'error'}
                         and inspected['data_dir'] == '/data'
