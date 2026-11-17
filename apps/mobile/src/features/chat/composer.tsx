@@ -8,16 +8,17 @@ import { ActionSheetIOS, Alert, Platform, ScrollView, View } from 'react-native'
 import { Button } from '@/components/arc/button'
 import { Icon } from '@/components/arc/icon'
 import { Text } from '@/components/arc/text'
-import type { Attachment } from '@/data/types'
+import type { Attachment, PickedAttachment } from '@/data/types'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { privateFiles } from '@/platform/files'
 import { ComposerInput, ComposerPanel } from '@/components/arc/chat'
 
-type Props = {
+type Props<Selected extends Attachment> = {
   value: string
   onChange: (value: string) => void
-  files: Attachment[]
-  onFiles: (files: Attachment[]) => void | Promise<void>
+  files: readonly Selected[]
+  onFiles: (files: Selected[]) => void | Promise<void>
+  onPickFiles: (files: PickedAttachment[]) => void | Promise<void>
   attachmentScope: string
   /** Why sending is off, in place of the placeholder, or under the box while it holds a draft; null when it is allowed. */
   blocked: string | null
@@ -32,14 +33,14 @@ type Props = {
   label?: string
 }
 
-export function Composer({ value, onChange, files, onFiles, attachmentScope, blocked, sending, onSend, onStop, children, target, sendLabel = '发送', label = '给 Bot 发消息' }: Props) {
+export function Composer<Selected extends Attachment>({ value, onChange, files, onFiles, onPickFiles, attachmentScope, blocked, sending, onSend, onStop, children, target, sendLabel = '发送', label = '给 Bot 发消息' }: Props<Selected>) {
   const device = useDevice()
   const connectionGeneration = device.connectionGeneration()
   const ios = Platform.OS === 'ios'
   const enabled = !blocked && !sending
-  const latest = useRef({ files, onFiles, attachmentScope, enabled, device, connectionGeneration, generation: 0, mounted: true })
+  const latest = useRef({ onPickFiles, attachmentScope, enabled, device, connectionGeneration, generation: 0, mounted: true })
   if (latest.current.attachmentScope !== attachmentScope || latest.current.enabled !== enabled || latest.current.connectionGeneration !== connectionGeneration) latest.current.generation++
-  latest.current = { ...latest.current, files, onFiles, attachmentScope, enabled, device, connectionGeneration }
+  latest.current = { ...latest.current, onPickFiles, attachmentScope, enabled, device, connectionGeneration }
   useEffect(() => {
     latest.current.mounted = true
     return () => { latest.current.mounted = false; latest.current.generation++ }
@@ -56,7 +57,7 @@ export function Composer({ value, onChange, files, onFiles, attachmentScope, blo
     try {
       await privateFiles.run(async (active) => {
         fileCurrent = active
-        const sources: string[] = [], owned: File[] = [], added: Attachment[] = [], errors: unknown[] = []
+        const sources: string[] = [], owned: File[] = [], added: PickedAttachment[] = [], errors: unknown[] = []
         let handedOff = false
         try {
           if (source === 'photos') {
@@ -69,7 +70,7 @@ export function Composer({ value, onChange, files, onFiles, attachmentScope, blo
               owned.push(candidate)
               if (!current() || !fileCurrent()) return
               const file = new File(asset.uri)
-              added.push({ uri: candidate.uri, name: asset.fileName || file.name, size: asset.fileSize ?? file.size, mimeType: asset.mimeType || file.type || null })
+              added.push({ ...privateFiles.ownedFile(candidate), name: asset.fileName || file.name, size: asset.fileSize ?? file.size, mimeType: asset.mimeType || file.type || null })
             }
           } else {
             const picked = await DocumentPicker.getDocumentAsync({ multiple: true, copyToCacheDirectory: true })
@@ -80,12 +81,13 @@ export function Composer({ value, onChange, files, onFiles, attachmentScope, blo
               const candidate = await privateFiles.retain(asset.uri)
               owned.push(candidate)
               if (!current() || !fileCurrent()) return
-              added.push({ uri: candidate.uri, name: asset.name, size: asset.size ?? null, mimeType: asset.mimeType ?? null })
+              added.push({ ...privateFiles.ownedFile(candidate), name: asset.name, size: asset.size ?? null, mimeType: asset.mimeType ?? null })
             }
           }
           if (current() && fileCurrent()) {
-            await latest.current.onFiles([...latest.current.files, ...added])
+            const completion = latest.current.onPickFiles(added)
             handedOff = true
+            await completion
           }
         } catch (cause) { errors.push(cause) }
         finally {
@@ -132,7 +134,7 @@ export function Composer({ value, onChange, files, onFiles, attachmentScope, blo
   const attachments = files.length ? <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerClassName="gap-2 px-2 pt-2">
     {files.map((file, index) => <View key={`${file.uri}:${index}`} className="max-w-60 flex-row items-center gap-2 rounded-control bg-surface-muted ps-3">
       <Icon as={Paperclip} className="text-secondary" /><Text numberOfLines={1} className="shrink text-sm">{file.name}</Text>
-      <Button variant="ghost" iconOnly accessibilityLabel={`移除 ${file.name}`} disabled={!enabled} onPress={() => { void (async () => { try { await onFiles(files.filter((_, at) => at !== index)); privateFiles.release(file.uri) } catch (cause) { Alert.alert('未能移除附件', cause instanceof Error ? cause.message : '请重试。') } })() }}><Icon as={X} /></Button>
+      <Button variant="ghost" iconOnly accessibilityLabel={`移除 ${file.name}`} disabled={!enabled} onPress={() => { void (async () => { try { await onFiles(files.filter((_, at) => at !== index)) } catch (cause) { Alert.alert('未能移除附件', cause instanceof Error ? cause.message : '请重试。') } })() }}><Icon as={X} /></Button>
     </View>)}
   </ScrollView> : undefined
   return <View className="gap-2 bg-background px-4 pb-3">

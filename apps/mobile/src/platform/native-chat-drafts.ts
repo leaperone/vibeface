@@ -19,7 +19,7 @@ const repository = createChatDrafts({
           await new File(attachment.uri).copy(copy)
           if (!current()) throw new Error('应用内数据正在清除，请稍后重试。')
           if (!copy.exists || (attachment.size !== null && copy.size !== attachment.size)) throw new Error('附件没能完整保留，请重新选择。')
-          return { ...attachment, uri: copy.uri, size: copy.size }
+          return { uri: copy.uri, name: attachment.name, size: copy.size, mimeType: attachment.mimeType }
         } catch (cause) { if (copy.exists) copy.delete(); throw cause }
       })
     },
@@ -27,11 +27,30 @@ const repository = createChatDrafts({
   },
 })
 
-const selectionUsers = new Map<string, number>(), retiredSelections = new Set<string>()
+const selectionUsers = new Map<string, number>(), retiredSelections = new Set<string>(), ownedSelections = new Set<string>()
 export const chatDrafts = {
   ...repository,
+  lease(snapshot: Parameters<typeof repository.lease>[0]) {
+    const lease = repository.lease(snapshot)
+    let active = true
+    return {
+      files: lease.files.map((file) => ({
+        ...file,
+        async arrayBuffer() {
+          if (!active) throw new Error('附件读取已结束，请重新发送。')
+          return privateFiles.run(async () => {
+            const reader = repository.lease({ ...snapshot, files: [file] })
+            try { return await new File(file.uri).arrayBuffer() }
+            finally { reader.release() }
+          })
+        },
+      })),
+      release() { if (active) { active = false; lease.release() } },
+    }
+  },
   async write(...args: Parameters<typeof repository.write>) {
     const input = new Set(args[1].files.map(file => file.uri))
+    for (const file of args[1].files) if ('dispose' in file && typeof file.dispose === 'function') ownedSelections.add(file.uri)
     for (const uri of input) selectionUsers.set(uri, (selectionUsers.get(uri) ?? 0) + 1)
     try {
       const saved = await repository.write(...args)
@@ -44,8 +63,12 @@ export const chatDrafts = {
         else {
           selectionUsers.delete(uri)
           if (retiredSelections.has(uri)) {
-            try { privateFiles.release(uri); retiredSelections.delete(uri) } catch { /* Erase also clears picker selections. */ }
+            try {
+              if (!ownedSelections.has(uri)) privateFiles.release(uri)
+              retiredSelections.delete(uri)
+            } catch { /* Erase also clears picker selections. */ }
           }
+          ownedSelections.delete(uri)
         }
       }
     }

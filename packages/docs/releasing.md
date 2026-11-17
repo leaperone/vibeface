@@ -99,6 +99,9 @@ Web 资源在 `apps/app/dist/client`，Core 只读取静态输出，不运行 SS
 
 ```sh
 python3 -B scripts/release.py self-test
+python3 -B scripts/tests/release/test_cli.py
+python3 -B scripts/tests/release/test_publisher.py
+python3 -B scripts/tests/release/test_source.py
 python3 -B scripts/hourly.py --self-test
 python3 -B scripts/check-release-workflow.py --self-test
 python3 -B scripts/release-dispatch.py --self-test
@@ -107,4 +110,4 @@ node scripts/package-npm.mjs --self-test
 node scripts/build-desktop.mjs --self-test
 ```
 
-源码构建、CI 分层与受控进程检查见[CI 说明](ci.md)。官方 Core/App/WWW 上线使用精确已完成 Release，见[服务部署](service-deployments.md)。
+发布工具的职责与最小复制依赖见[模块边界](design/release-modules.md)。源码构建、CI 分层与受控进程检查见[CI 说明](ci.md)。官方 Core/App/WWW 上线使用精确已完成 Release，见[服务部署](service-deployments.md)。

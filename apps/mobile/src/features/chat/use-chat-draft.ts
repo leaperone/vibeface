@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { chatDrafts, type DraftScope, type DraftSnapshot } from '@/platform/native-chat-drafts'
-import type { Attachment } from '@/data/types'
+import type { Attachment, PickedAttachment } from '@/data/types'
 import { privateFiles } from '@/platform/files'
+import { selectionOwner } from '@vibeface/client/lib/selection.ts'
 
 export function useChatDraft(scope: DraftScope) {
   const key = JSON.stringify([scope.networkId, scope.deviceId, scope.conversationId, scope.inputTarget])
@@ -62,6 +63,20 @@ export function useChatDraft(scope: DraftScope) {
       void persist().catch(() => {})
     },
     async changeFiles(files: Attachment[]) { owner.files = files; await persist() },
+    async addFiles(files: PickedAttachment[]) {
+      if (!files.length) return
+      const selection = selectionOwner<PickedAttachment>((cause) => {
+        if (current.current === owner) setView((previous) => ({ ...previous, error: cause.message }))
+        else console.error('选择副本清理失败，副本保留待清除。', cause)
+      })
+      selection.replace(files)
+      try {
+        await selection.use(async (picked) => {
+          owner.files = [...owner.files, ...picked]
+          await persist()
+        })
+      } finally { selection.close() }
+    },
     async flush(): Promise<DraftSnapshot> {
       const sequence = owner.sequence
       const snapshot = await owner.tail

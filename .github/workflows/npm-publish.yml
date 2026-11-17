@@ -88,8 +88,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           version="${RELEASE_TAG#cli-v}"
-          channel=latest
-          if [[ "$version" == *-hourly.* ]]; then channel=hourly; elif [[ "$version" == *-rc.* ]]; then channel=rc; fi
+          channel="$(node --input-type=module -e 'import { parseReleaseTag, npmDistTag } from "./scripts/release-contract.mjs"; const parsed = parseReleaseTag(process.env.RELEASE_TAG); if (parsed.app !== "cli") throw new Error("CLI tag required"); console.log(npmDistTag(parsed.channel));')"
           npm publish ".artifacts/npm/leaperone-vibeface-$version.tgz" --tag "$channel" --access public --dry-run --ignore-scripts --registry=https://registry.npmjs.org/
       - name: Publish once using OIDC and reconcile the registry
         if: ${{ inputs.publish }}

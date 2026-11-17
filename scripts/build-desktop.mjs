@@ -6,68 +6,32 @@ import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { PLATFORMS, platformFor, DESKTOP_SCHEMA as SCHEMA_VERSION, parseReleaseVersion, programNames, desktopPayloadNames, validateBuildInfoShape } from './release-contract.mjs';
+import { readContracts, readOwnVersion, readNativeUi } from './release-metadata.mjs';
 import { hash, relativeFiles, readSealedRuntime, verifySealedRuntime } from './sealed-runtime.mjs';
 import { requireAuthenticode, signNative } from './windows-signing.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
 const desktop = path.join(repo, 'apps/desktop');
-const NATIVE_UI = { ui: 'gpui', gpui_kit: '0.9.1', gpui: '0.3.12' };
-const SCHEMA_VERSION = 2;
-const PLATFORMS = {
-  'aarch64-apple-darwin': { platform: 'darwin', flag: '--mac', installer: 'dmg', exe: '', signing: 'developer-id-notarized' },
-  'x86_64-pc-windows-msvc': { platform: 'win32', flag: '--win', installer: 'exe', exe: '.exe', signing: 'authenticode' },
-  'x86_64-unknown-linux-gnu': { platform: 'linux', flag: '--linux', installer: 'AppImage', exe: '', signing: 'platform-checksums', arch: 'x64' },
-  'aarch64-unknown-linux-gnu': { platform: 'linux', flag: '--linux', installer: 'AppImage', exe: '', signing: 'platform-checksums', arch: 'arm64' },
-};
-const BUILD_FIELDS = ['version', 'target', 'source_commit', 'update_protocol', 'data_epoch',
-  'core_version', 'core_source_commit', 'app_version', 'app_source_commit'];
-
 const run = (program, args, options = {}) =>
   execFileSync(program, args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, ...options });
 const writeJson = (file, value) => fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
 
-function controlConstant(name) {
-  const source = fs.readFileSync(path.join(repo, 'crates/control/src/lib.rs'), 'utf8');
-  const value = Number(new RegExp(`pub const ${name}: u32 = (\\d+);`).exec(source)?.[1]);
-  assert(Number.isSafeInteger(value), `missing ${name}`);
-  return value;
-}
-
-function releaseVersion(version) {
-  assert(typeof version === 'string' && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-(hourly\.\d{10}|rc\.[1-9]\d*))?$/.test(version),
-    'invalid component release version');
-  return version;
-}
-
-function desktopVersion() {
-  return releaseVersion(/^version = "([^"]+)"$/m.exec(fs.readFileSync(path.join(desktop, 'Cargo.toml'), 'utf8'))?.[1]);
-}
-
 /** Read a sealed runtime bundle and prove every byte still matches its own FILES.sha256. */
-function readRuntime(directory, target, version, sourceCommit) {
-  const { exe } = PLATFORMS[target];
+function readRuntime(directory, target, contracts, version, sourceCommit) {
+  platformFor(target);
   const info = JSON.parse(fs.readFileSync(path.join(directory, 'BUILD-INFO.json'), 'utf8'));
-  assert.deepEqual(Object.keys(info).sort(), [...BUILD_FIELDS].sort(), 'unsupported build info fields');
+  validateBuildInfoShape(info, contracts);
   assert.equal(path.basename(directory), `vibeface-${version ?? info.version}-${target}`, 'the runtime directory must be the released CLI bundle for this platform');
-  assert.deepEqual([info.version, info.target, info.source_commit, info.update_protocol, info.data_epoch],
-    [version ?? info.version, target, sourceCommit ?? info.source_commit, controlConstant('UPDATE_PROTOCOL'), controlConstant('DATA_EPOCH')],
+  assert.deepEqual([info.version, info.target, info.source_commit],
+    [version ?? info.version, target, sourceCommit ?? info.source_commit],
     'the bundled runtime is not this platform, version and source');
-  for (const field of ['version', 'core_version', 'app_version']) releaseVersion(info[field]);
-  for (const field of ['source_commit', 'core_source_commit', 'app_source_commit']) {
-    assert(typeof info[field] === 'string' && /^[a-f0-9]{40}$/.test(info[field]), 'invalid component source commit');
-  }
   const sealed = readSealedRuntime(directory);
-  for (const name of [`vibeface${exe}`, `vibeface-core${exe}`, 'web/index.html', 'web/vibeface_secure.js',
+  for (const name of [...programNames(target), 'web/index.html', 'web/vibeface_secure.js',
     'web/vibeface_secure_bg.wasm', 'README.md', 'RUNTIME-REQUIREMENTS.md']) {
     assert(sealed.has(name), `the runtime is missing ${name}`);
   }
   return { info, sealed };
-}
-
-function readDesktopPackage(version) {
-  const manifest = fs.readFileSync(path.join(desktop, 'Cargo.toml'), 'utf8');
-  assert(manifest.includes(`version = "${version}"`), 'desktop package version does not match its release');
-  assert(manifest.includes('gpui-kit = "=0.9.1"'), 'desktop must pin the verified GPUI kit');
 }
 
 /** Signing identity resolution: real credentials or an explicitly recorded unsigned preview. */
@@ -192,7 +156,7 @@ function buildWindowsInstallerFixture(portableDirectory, outputDirectory, mode =
   const runtime = JSON.parse(fs.readFileSync(path.join(payload, 'resources/runtime/BUILD-INFO.json'), 'utf8'));
   assert.equal(runtime.target, 'x86_64-pc-windows-msvc', 'installer fixture requires the verified Windows runtime');
   const sourceInfo = JSON.parse(fs.readFileSync(path.join(payload, 'resources/desktop-build.json'), 'utf8'));
-  releaseVersion(sourceInfo.version);
+  parseReleaseVersion(sourceInfo.version);
   assert(/^[a-f0-9]{40}$/.test(sourceInfo.source_commit), 'invalid desktop payload source');
   const installer = path.join(outputDirectory, { upgrade: 'upgrade-fixture.exe', diagnostic: 'diagnostic-fixture.exe', normal: 'normal-fixture.exe' }[mode]);
   run(process.env.MAKENSIS || path.join(process.env['ProgramFiles(x86)'] || 'C:/Program Files (x86)', 'NSIS', 'makensis.exe'),
@@ -207,22 +171,22 @@ function buildWindowsInstallerFixture(portableDirectory, outputDirectory, mode =
 }
 
 async function build({ target, runtimeDir, output, runtimeArchive, sign }) {
-  const platform = PLATFORMS[target];
-  assert(platform, `--target must be one of ${Object.keys(PLATFORMS).join(', ')}`);
+  const platform = platformFor(target);
   assert.equal(process.platform, platform.platform, `${target} desktop applications are built on their own platform`);
   if (platform.platform === 'linux') assert.equal(process.arch, platform.arch, `${target} desktop applications are built on their matching native architecture`);
-  const version = desktopVersion();
+  const version = readOwnVersion(repo, 'desktop');
+  const nativeUi = readNativeUi(repo);
+  const contracts = readContracts(repo);
   assert.equal(run('git', ['status', '--porcelain'], { cwd: repo }).trim(), '', 'desktop packaging source must be clean');
   const sourceCommit = run('git', ['rev-parse', 'HEAD'], { cwd: repo }).trim();
   assert(/^[0-9a-f]{40}$/.test(sourceCommit), 'a full source commit is required');
 
-  const { info: runtime, sealed } = readRuntime(runtimeDir, target);
-  readDesktopPackage(version);
+  const { info: runtime, sealed } = readRuntime(runtimeDir, target, contracts);
   const archive = runtimeArchive ?? path.join(path.dirname(runtimeDir), `vibeface-${runtime.version}-${target}.tar.gz`);
   assert.equal(path.basename(archive), `vibeface-${runtime.version}-${target}.tar.gz`, 'runtime archive does not match the sealed CLI bundle');
   assert(fs.statSync(archive).isFile(), `the released runtime archive is required beside --runtime-dir or named with --runtime-archive`);
   const { signed, signing } = signingState(target, sign);
-  const channel = version.includes('-hourly.') ? 'hourly' : version.includes('-rc.') ? 'rc' : 'stable';
+  const channel = parseReleaseVersion(version).channel;
   assert(signed || channel !== 'stable' || target.endsWith('-unknown-linux-gnu'),
     'a stable desktop distribution requires a configured signer except on Linux, which uses checksums and provenance');
   if (signed && target === 'x86_64-pc-windows-msvc') {
@@ -292,7 +256,7 @@ async function build({ target, runtimeDir, output, runtimeArchive, sign }) {
   }
   zip(appRoot, path.join(produced, `${base}.zip`), mac);
   verifySealedRuntime(path.join(resources, 'runtime'), sealed);
-  const payloads = [`${base}.${platform.installer}`, `${base}.zip`];
+  const payloads = desktopPayloadNames(version, target);
   fs.mkdirSync(output, { recursive: true });
   const artifacts = {};
   for (const name of payloads) {
@@ -305,7 +269,7 @@ async function build({ target, runtimeDir, output, runtimeArchive, sign }) {
   }
   const receipt = {
     schema: SCHEMA_VERSION, app: 'desktop', target, version, tag: `desktop-v${version}`, channel,
-    source_commit: sourceCommit, ...NATIVE_UI, signed, signing,
+    source_commit: sourceCommit, ...nativeUi, signed, signing,
     runtime: { version: runtime.version, source_commit: runtime.source_commit, archive: path.basename(archive), sha256: hash(archive) }, artifacts,
   };
   writeJson(path.join(output, `${base}.provenance.json`), receipt);
@@ -317,6 +281,7 @@ async function build({ target, runtimeDir, output, runtimeArchive, sign }) {
 }
 
 function selfTest() {
+  const contracts = Object.freeze({ data_epoch: 1, update_protocol: 1 });
   const artifacts = path.join(repo, '.artifacts');
   fs.mkdirSync(artifacts, { recursive: true });
   const scratch = fs.mkdtempSync(path.join(artifacts, 'desktop-build-'));
@@ -339,17 +304,17 @@ function selfTest() {
       fs.writeFileSync(path.join(bundle, name), content);
     }
     writeJson(path.join(bundle, 'BUILD-INFO.json'), {
-      version, target, source_commit: commit, update_protocol: controlConstant('UPDATE_PROTOCOL'),
-      data_epoch: controlConstant('DATA_EPOCH'), core_version: '2.3.4', core_source_commit: 'b'.repeat(40),
+      version, target, source_commit: commit, update_protocol: 1,
+      data_epoch: 1, core_version: '2.3.4', core_source_commit: 'b'.repeat(40),
       app_version: '3.4.5-rc.2', app_source_commit: 'c'.repeat(40),
     });
     const seal = () => fs.writeFileSync(path.join(bundle, 'FILES.sha256'),
       relativeFiles(bundle).filter(name => name !== 'FILES.sha256')
         .map(name => `${hash(path.join(bundle, name))}  ${name}\n`).join(''));
     seal();
-    const sealed = readRuntime(bundle, target, version, commit).sealed;
+    const sealed = readRuntime(bundle, target, contracts, version, commit).sealed;
     assert.equal(sealed.size, Object.keys(entries).length + 1, 'the sealed set covers every runtime file');
-    const independent = readRuntime(bundle, target).info;
+    const independent = readRuntime(bundle, target, contracts).info;
     assert.deepEqual([independent.version, independent.core_version, independent.app_version],
       ['9.9.9-hourly.2026110712', '2.3.4', '3.4.5-rc.2']);
     assert.deepEqual([independent.source_commit, independent.core_source_commit, independent.app_source_commit],
@@ -365,9 +330,9 @@ function selfTest() {
     assert.throws(() => verifySealedRuntime(packaged, sealed), /changed the set of runtime files/);
 
     for (const [label, mutate, expected] of [
-      ['a foreign source commit', () => readRuntime(bundle, target, version, 'b'.repeat(40)), /platform, version and source/],
-      ['another platform', () => readRuntime(bundle, 'x86_64-pc-windows-msvc', version, commit), /released CLI bundle for this platform/],
-      ['another version', () => readRuntime(bundle, target, '1.2.3', commit), /released CLI bundle for this platform/],
+      ['a foreign source commit', () => readRuntime(bundle, target, contracts, version, 'b'.repeat(40)), /platform, version and source/],
+      ['another platform', () => readRuntime(bundle, 'x86_64-pc-windows-msvc', contracts, version, commit), /released CLI bundle for this platform/],
+      ['another version', () => readRuntime(bundle, target, contracts, '1.2.3', commit), /released CLI bundle for this platform/],
     ]) {
       assert.throws(mutate, expected, label);
     }
@@ -376,16 +341,16 @@ function selfTest() {
       ['an extra build info field', { legacy: true }, /unsupported build info fields/],
       ['an invalid component version', { core_version: 'invalid' }, /invalid component release version/],
       ['an invalid component source', { app_source_commit: 'short' }, /invalid component source commit/],
-      ['another data epoch', { data_epoch: 2 }, /platform, version and source/],
+      ['another data epoch', { data_epoch: 2 }, /protocol or data epoch/],
     ]) {
       writeJson(path.join(bundle, 'BUILD-INFO.json'), { ...info, ...change });
       seal();
-      assert.throws(() => readRuntime(bundle, target, version, commit), expected, label);
+      assert.throws(() => readRuntime(bundle, target, contracts, version, commit), expected, label);
     }
     writeJson(path.join(bundle, 'BUILD-INFO.json'), info);
     seal();
     fs.appendFileSync(path.join(bundle, 'web/index.html'), 'tampered');
-    assert.throws(() => readRuntime(bundle, target, version, commit), /changed the sealed runtime file web\/index.html/);
+    assert.throws(() => readRuntime(bundle, target, contracts, version, commit), /changed the sealed runtime file web\/index.html/);
 
     assert.deepEqual(signingState('x86_64-pc-windows-msvc', false), { signed: false, signing: 'unsigned-development-preview' });
     assert.deepEqual(signingState('aarch64-apple-darwin', false), { signed: false, signing: 'unsigned-development-preview' });

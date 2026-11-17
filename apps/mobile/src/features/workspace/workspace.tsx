@@ -1,6 +1,5 @@
 import { Card } from '@/components/arc/surface'
 import { SelectionItem } from '@/components/arc/selection'
-import { File } from 'expo-file-system'
 import { Link, Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router'
 import { BrainCircuit, ChevronRight, CircleQuestionMark, ListChecks, MessagesSquare, Plus, Reply, Search, Settings, X } from 'lucide-react-native'
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
@@ -452,7 +451,7 @@ function ScopedWorkspaceContent({ taskId, channelId }: { taskId?: string; channe
         const uploads: { name: string; arrayBuffer(): Promise<ArrayBuffer> }[] = []
         for (const file of lease.files) {
           if (!current() || !fileCurrent()) throw new Error('发送准备已中止，草稿已保留。')
-          const bytes = await new File(file.uri).arrayBuffer()
+          const bytes = await file.arrayBuffer()
           uploads.push({ name: file.name, arrayBuffer: async () => bytes })
           if (current()) setPreparation({ scope: draftKey, state: { kind: 'preparing', completed: uploads.length, total: lease.files.length } })
         }
@@ -517,7 +516,7 @@ function ScopedWorkspaceContent({ taskId, channelId }: { taskId?: string; channe
       {cacheError ? <Text accessibilityLiveRegion="polite" className="text-sm text-warning">{cacheError}</Text> : null}
       {actionError ? <ErrorText error={actionError} /> : null}
     </KeyboardAwareScrollView>
-    <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}><View style={{ paddingBottom: insets.bottom }}><Composer value={draft.text} onChange={draft.changeText} files={draft.files} onFiles={draft.changeFiles} attachmentScope={draftKey} blocked={shared.canSaveMessages ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读'} sending={Boolean(phase)} label={`发给 ${label}`} sendLabel={active ? '补充当前工作' : '发送'} target={channelId && selectedTaskId ? <Button variant="ghost" iconOnly className="rounded-pill" accessibilityLabel="结束回复这个任务" onPress={() => { selectionRevision.current++; setSelected(''); setRecipient(''); setSavedInput(null); storage.writeStorage(selectionKey, null) }}><Icon as={X} className="text-muted" /></Button> : undefined} onStop={task && !['completed', 'cancelled', 'deferred'].includes(task.state) ? () => { const scope = draftKey; void shared.stopInputTarget({ target, expected_revision: task.revision }).catch(cause => { if (shared.isCurrent() && routeActive.current && currentDraft.current === scope) setError(messageOf(cause)) }) } : undefined} onSend={() => void send()}>
+    <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}><View style={{ paddingBottom: insets.bottom }}><Composer value={draft.text} onChange={draft.changeText} files={draft.files} onFiles={draft.changeFiles} onPickFiles={draft.addFiles} attachmentScope={draftKey} blocked={shared.canSaveMessages ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读'} sending={Boolean(phase)} label={`发给 ${label}`} sendLabel={active ? '补充当前工作' : '发送'} target={channelId && selectedTaskId ? <Button variant="ghost" iconOnly className="rounded-pill" accessibilityLabel="结束回复这个任务" onPress={() => { selectionRevision.current++; setSelected(''); setRecipient(''); setSavedInput(null); storage.writeStorage(selectionKey, null) }}><Icon as={X} className="text-muted" /></Button> : undefined} onStop={task && !['completed', 'cancelled', 'deferred'].includes(task.state) ? () => { const scope = draftKey; void shared.stopInputTarget({ target, expected_revision: task.revision }).catch(cause => { if (shared.isCurrent() && routeActive.current && currentDraft.current === scope) setError(messageOf(cause)) }) } : undefined} onSend={() => void send()}>
       <SendPreparation state={preparationState} />{draft.error ? <ErrorText error={draft.error} /> : null}{draft.missingFiles.length ? <View className="gap-1"><Text className="text-sm text-warning">草稿附件已被清除：{draft.missingFiles.join('、')}。请重新选择附件。</Text><Button variant="ghost" onPress={() => void draft.changeFiles(draft.files).catch(cause => { if (currentDraft.current === draftKey) setError(messageOf(cause)) })}><Text>移除缺失附件记录</Text></Button></View> : null}{error ? <ErrorText error={error} /> : null}
     </Composer></View></KeyboardStickyView>
   </View>

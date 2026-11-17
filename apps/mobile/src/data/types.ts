@@ -1,3 +1,4 @@
+import type { OwnedPickedFile } from '../platform/files'
 import type { TranscriptMessage } from '@vibeface/client/chat/types.ts'
 import type { AnswerResult, BotReadiness, BotRecord, InputOptions, Question, WorkRecord } from '@vibeface/client/workspace/types.ts'
 
@@ -40,8 +41,9 @@ export type Conversation = {
   blocked: string | null
 }
 
-/** A file picked for the next message. */
 export type Attachment = { uri: string; name: string; size: number | null; mimeType: string | null }
+export type PickedAttachment = Attachment & Omit<OwnedPickedFile, 'size'>
+export type OutgoingAttachment = Pick<PickedAttachment, 'name' | 'arrayBuffer'>
 
 /** `bot`: how the device's bot stands right now, `null` with none; removing it stops that bot. `online`: known for computers only. */
 export type Member = { device_id: string; name: string; kind: 'node' | 'client'; admin: boolean; online: boolean | undefined; current: boolean; entry: boolean; bot: BotReadiness | null }
@@ -68,7 +70,7 @@ export type WorkspaceActions = {
   cancelJoin(): void
   /** Loads the chat and keeps it live while on screen; reading it acknowledges its notifications. */
   open(conversationId: string): () => void
-  send(conversationId: string, text: string, attachments: Attachment[], options?: InputOptions): Promise<void>
+  send(conversationId: string, text: string, attachments: readonly OutgoingAttachment[], options?: InputOptions): Promise<void>
   answer(question: Question, text: string): Promise<AnswerResult>
   /** Takes this phone out of the network; coming back takes a join link. */
   leave(): Promise<void>

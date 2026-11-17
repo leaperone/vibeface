@@ -55,7 +55,7 @@ export function createChatDrafts({ storage, files, revision }: { storage: Storag
           if (!files.exists(file.uri)) throw new Error(`附件「${file.name}」已被系统清除，请重新选择。`)
           const owned = previous?.files.some(saved => saved.uri === file.uri)
           const copy = owned && files.owns(file.uri) ? file : await files.retain(file)
-          retained.push(copy)
+          retained.push({ uri: copy.uri, name: copy.name, size: copy.size, mimeType: copy.mimeType })
           if (copy !== file) added.push(copy)
         }
         const saved = { text: draft.text, files: retained, revision: revision() }

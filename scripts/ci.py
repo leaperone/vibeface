@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """Select CI coverage once, run its Rust test tiers, and check the final gate."""
 
+import sys
+sys.dont_write_bytecode = True
+import release_archive
+import release_context
+import release_format
+import release_source
+
 import argparse
 import datetime
 import fnmatch
@@ -10,12 +17,9 @@ import os
 from pathlib import Path
 import re
 import subprocess
-import sys
 import tempfile
 import time
 import urllib.request
-
-import release
 
 
 PACKAGES = ("vibeface-protocol", "vibeface-bridge", "vibeface-secure", "vibeface-client", "vibeface-core", "vibeface-control", "vibeface", "vibeface-secure-ffi", "vibeface-delivery")
@@ -42,8 +46,12 @@ CRATES = {
     "delivery": "vibeface-delivery",
 }
 WEB_UNIT_TEST = re.compile(r"apps/app/src/(?:lib/[^/]+|features/[^/]+/[^/]+)\.test\.ts")
+RELEASE_TOOL_PATHS = ("scripts/release-contract.mjs", "scripts/release-metadata.mjs", "scripts/test-release-contract.mjs",
+                      "scripts/fixtures/release-contract.json", "scripts/build-desktop.mjs", "scripts/verify-desktop.mjs",
+                      "scripts/package-npm.mjs", "scripts/publish-npm.mjs", "scripts/sealed-runtime.mjs")
 PATH_RULES = (
     ("delivery", ("crates/delivery/*", "crates/delivery/proof/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "apps/core/src/delivery/*", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/net/mesh/record.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/verify-delivery-protected.py", "scripts/verify-delivery-restart-observer.py")),
+    ("full", ('scripts/release_format.py', 'scripts/release_context.py', 'scripts/release_source.py', 'scripts/release_archive.py', 'scripts/release_inventory.py', 'scripts/release_github.py', 'scripts/release_publisher.py', 'scripts/release_assembly.py', "scripts/tests/release/*", "scripts/tests/__init__.py")),
     ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "crates/control/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
     ("www", ("apps/www/*",)),
     ("docs", ("README.md", "README.zh-CN.md", "AGENTS.md", "CLAUDE.md", "packages/docs/*")),
@@ -104,7 +112,9 @@ def local_process_modes(paths, full):
 def make_plan(paths, event="pull_request", ref_type="branch", channel="hourly", *, package_policy="standard"):
     scopes = set()
     for path in paths:
-        if WEB_UNIT_TEST.fullmatch(path):
+        if path in RELEASE_TOOL_PATHS:
+            scopes.add("release-tools")
+        elif WEB_UNIT_TEST.fullmatch(path):
             scopes.add("web-tests")
         elif path.startswith("apps/app/") and path.endswith((".test.ts", ".test.tsx")):
             scopes.add("full")
@@ -122,7 +132,7 @@ def make_plan(paths, event="pull_request", ref_type="branch", channel="hourly", 
 
 def scope_plan(scopes, event, ref_type, channel, *, package_policy="standard"):
     if (
-        scopes - {"full", "docs", "web", "web-tests", "www", "mobile", "desktop", *DEPENDENTS}
+        scopes - {"full", "docs", "release-tools", "web", "web-tests", "www", "mobile", "desktop", *DEPENDENTS}
         or event not in {"pull_request", "push", "schedule", "workflow_dispatch", "merge_group"}
         or ref_type not in {"branch", "tag"}
         or channel not in {"stable", "rc", "hourly"}
@@ -155,7 +165,7 @@ def scope_plan(scopes, event, ref_type, channel, *, package_policy="standard"):
         "full": full,
         "extended": extended,
         "check_msrv": bool(packages) and extended,
-        "docs_only": not crypto and not packages and not mobile and not desktop,
+        "docs_only": not crypto and not packages and not mobile and not desktop and "release-tools" not in scopes,
         "event": event,
         "package_policy": package_policy,
         "ref_type": ref_type,
@@ -311,7 +321,7 @@ def release_metadata(ref_type, ref_name):
     if ref_type == "tag":
         if ref_name != f"cli-v{version}":
             raise ValueError("Release tag must exactly match the Cargo version")
-        release.validate_source(git("rev-parse", "HEAD").decode().strip(), "cli")
+        release_source.validate_source(git("rev-parse", "HEAD").decode().strip(), "cli")
     return {"version": version, "msrv": package["rust_version"], "channel": channel, "prerelease": channel != "stable"}
 
 
@@ -543,8 +553,26 @@ def self_test():
         assert make_plan([path])["required_jobs"] == ["quick-check"]
     assert make_plan(["README.zh-CN.md", "apps/core/src/api.rs"])["rust_packages"] == ["vibeface-core"]
     for path in ("README.zh-CN.md.rs", ".agents/skills/release/SKILL.md", "scripts/release.py", "scripts/hourly.py",
-                 "apps/desktop/build/installer.nsi", "scripts/build-desktop.mjs"):
+                 'scripts/release_format.py', 'scripts/release_context.py', 'scripts/release_source.py', 'scripts/release_archive.py', 'scripts/release_inventory.py', 'scripts/release_github.py', 'scripts/release_publisher.py', 'scripts/release_assembly.py', "scripts/tests/release/test_cli.py", "scripts/tests/release/test_publisher.py", "scripts/tests/release/test_source.py",
+                 "apps/desktop/build/installer.nsi"):
         assert make_plan([path])["full"]
+    for path in RELEASE_TOOL_PATHS:
+        selected = make_plan([path])
+        assert selected["required_jobs"] == ["quick-check"] and not selected["full"] and not selected["docs_only"]
+        assert not selected["desktop"] and not selected["web"] and not selected["local_process_modes"]
+    # Linux import fixtures do not exercise Windows ACL/signing: keep the original full gates.
+    required_full = ["quick-check", "crypto-web", "web", "mobile-check", "desktop-check",
+                     "rust-check", "rust-fast", "delivery", "package", "www"]
+    for path in ("scripts/windows-signing.mjs", "scripts/private-control.mjs"):
+        selected = make_plan([path])
+        assert selected["full"] and not selected["docs_only"] and selected["required_jobs"] == required_full
+    # A quick-only Node path does not imply the complete AUTO19 change is quick-only.
+    auto19_paths = [*(path for path in RELEASE_TOOL_PATHS if path != "scripts/sealed-runtime.mjs"), ".github/workflows/ci.yml", ".github/workflows/npm-publish.yml",
+                    ".preflight.toml", "packages/docs/design/release-modules.md", "scripts/ci.py",
+                    "scripts/hourly.py", "scripts/test_release_trains.py", "scripts/check-release-workflow.py"]
+    assert len(auto19_paths) == 16
+    selected = make_plan(auto19_paths)
+    assert selected["full"] and not selected["docs_only"] and selected["required_jobs"] == required_full
     assert docs["local_process_modes"] == [] and www["local_process_modes"] == []
     assert make_plan(["apps/core/src/store/bot_settings.rs"])["local_process_modes"] == ["memory-sync", "phase5"]
     assert make_plan(["apps/core/src/agent_context.rs"])["local_process_modes"] == ["memory-sync", "chat-agent"]
@@ -755,7 +783,7 @@ def self_test():
         coverage_self_test(directory, base, new_base)
         for version, channel in (("1.2.3", "stable"), ("1.2.3-rc.2", "rc"), ("1.2.3-hourly.2026101923", "hourly")):
             cargo_metadata = {"packages": [{"name": "vibeface", "version": version, "rust_version": "1.89"}]}
-            with patch("subprocess.check_output", return_value=json.dumps(cargo_metadata)), patch(f"{__name__}.git", return_value=b"a" * 40), patch("release.validate_source") as ancestor:
+            with patch("subprocess.check_output", return_value=json.dumps(cargo_metadata)), patch(f"{__name__}.git", return_value=b"a" * 40), patch("release_source.validate_source") as ancestor:
                 assert release_metadata("branch", "")["channel"] == channel
                 assert release_metadata("tag", f"cli-v{version}")["prerelease"] == (channel != "stable")
                 ancestor.assert_called_once_with("a" * 40, "cli")
@@ -1204,7 +1232,7 @@ def release_privacy_test(root, scratch):
 
     with tempfile.TemporaryDirectory(prefix="release-", dir=scratch) as directory:
         repo = Path(directory)
-        for name in ("scripts/release.py", "scripts/offline-docs.py", "scripts/offline-docs.json", "README.zh-CN.md", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/app/package.json", "apps/mobile/app.json", "apps/desktop/Cargo.toml", "scripts/package-node.sh", "scripts/release-rustflags.py", "scripts/build-inputs.py", "scripts/install-node-service.sh", "Cargo.toml", "crates/control/src/lib.rs", "README.md"):
+        for name in ('scripts/release_format.py', 'scripts/release_context.py', 'scripts/release_source.py', 'scripts/release_archive.py', 'scripts/release_inventory.py', 'scripts/release_github.py', 'scripts/release_publisher.py', 'scripts/release_assembly.py', "scripts/release.py", "scripts/offline-docs.py", "scripts/offline-docs.json", "README.zh-CN.md", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/app/package.json", "apps/mobile/app.json", "apps/desktop/Cargo.toml", "scripts/package-node.sh", "scripts/release-rustflags.py", "scripts/build-inputs.py", "scripts/install-node-service.sh", "Cargo.toml", "crates/control/src/lib.rs", "README.md"):
             target = repo / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(root / name, target)
@@ -1281,17 +1309,17 @@ def release_privacy_test(root, scratch):
             assert archive.getmember(f"{package}/vibeface-core").mode & 0o111
             info = json.load(archive.extractfile(f"{package}/BUILD-INFO.json"))
             assert [info[key] for key in ("version", "core_version", "app_version")] == ["1.2.3-hourly.2026111400", "2.3.4", "3.4.5-rc.2"]
-            assert archive.extractfile(f"{package}/RUNTIME-REQUIREMENTS.md").read() == release.RUNTIME_REQUIREMENTS.encode("utf-8")
+            assert archive.extractfile(f"{package}/RUNTIME-REQUIREMENTS.md").read() == release_archive.RUNTIME_REQUIREMENTS.encode("utf-8")
             unpacked = repo / ".artifacts/sealed-fixture"
             archive.extractall(unpacked, filter="data")
-        assert release.verify_bundle(unpacked / package, "x86_64-unknown-linux-gnu", {
+        assert release_archive.verify_bundle(unpacked / package, "x86_64-unknown-linux-gnu", {
             "version": "1.2.3-hourly.2026111400", "source_commit": info["source_commit"],
             "dependencies": {"core": {"version": "2.3.4", "source_commit": info["source_commit"]},
                              "app": {"version": "3.4.5-rc.2", "source_commit": info["source_commit"]}},
         }) == info
         from unittest.mock import patch
-        with patch.object(release, "ROOT", repo), patch.dict(os.environ, {"PACKAGE_TARGET": "x86_64-unknown-linux-gnu"}):
-            sealed = release.seal_bundle(unpacked / package,
+        with patch.object(release_context, 'ROOT', repo), patch.dict(os.environ, {"PACKAGE_TARGET": "x86_64-unknown-linux-gnu"}):
+            sealed = release_archive.seal_bundle(unpacked / package,
                                          {"version": "2.3.4", "source_commit": "b" * 40},
                                          {"version": "3.4.5-rc.2", "source_commit": "c" * 40})
         assert json.loads((unpacked / package / "BUILD-INFO.json").read_text()) == {
@@ -1299,7 +1327,7 @@ def release_privacy_test(root, scratch):
             "update_protocol": 1, "data_epoch": 1, "core_version": "2.3.4", "core_source_commit": "b" * 40,
             "app_version": "3.4.5-rc.2", "app_source_commit": "c" * 40,
         }
-        release.verify_build_info(sealed)
+        release_format.verify_build_info(sealed, release_context.contracts())
         (repo / "scripts/release-rustflags.py").write_text('raise RuntimeError("fixture failure")')
         generated()
         marker.unlink()

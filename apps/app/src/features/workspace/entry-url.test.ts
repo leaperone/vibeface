@@ -1,6 +1,7 @@
 import * as deliveryModel from '@vibeface/client/delivery/model.ts'
 import * as byteCodec from '@vibeface/client/lib/byte-codec.ts'
-import { transferSelection, type DeliveryBudget } from '@vibeface/client/delivery/types.ts'
+import { type DeliveryBudget } from '@vibeface/client/delivery/types.ts'
+import { selectionOwner } from '@vibeface/client/lib/selection.ts'
 import { parseChanged } from '@vibeface/client/lib/progress.ts'
 import * as workspaceHistory from '@vibeface/client/workspace/history.ts'
 import { completeHistory } from '@vibeface/client/workspace/history-fixture.ts'
@@ -1425,6 +1426,7 @@ test("workspace preserves bot and message requests while routing native decision
       let glass = false, theme = 'light'
       let dockHeight: { value: number } | undefined, emptyPadding = () => ({ paddingBottom: 0 })
       const chat = componentHarness('../../../../../apps/mobile/app/b/[botId].tsx', {
+        'expo-file-system': { File: SelectedFile },
         'expo-router': { Stack: { Screen: 'Screen' }, router: { push: (target: string) => { nativeNavigations.push(target) } }, useLocalSearchParams: () => ({ botId: botA.bot_id, routine }) },
         '@vibeface/client/lib/node.ts': { messageOf },
         '@/platform': { mobilePlatform: { storage: browser.localStorage } },
@@ -1541,7 +1543,7 @@ test("workspace preserves bot and message requests while routing native decision
         const mainActions = mobile().actions, originalMainSend = mainActions.send
         mainActions.send = (...args) => { const saved = originalMainSend(...args); mainSaves.push(saved); return saved }
         const composer = () => chat.render('default').find(({ type }) => type === 'Composer')?.props
-        const attach = (uri: string) => { const input = composer()?.onFiles; assert.ok(typeof input === 'function'); const files = [{ uri, name: uri.split('/').at(-1) ?? 'file', size: 3, mimeType: null }]; input(files); return files }
+        const attach = (uri: string) => { const remove = composer()?.onFiles; assert.ok(typeof remove === 'function'); remove([]); const input = composer()?.onPickFiles; assert.ok(typeof input === 'function'); const files = [{ uri, name: uri.split('/').at(-1) ?? 'file', size: 3, mimeType: null }]; input(files.map(file => ({ ...file, arrayBuffer: async () => { const held = fileReads.get(uri); assert.ok(held); return await held.promise }, text: async () => '', dispose() {} }))); return files }
         const sendDraft = () => { const send = composer()?.onSend; assert.ok(typeof send === 'function'); send() }
         const storedDraft = () => chat.drafts.read({ networkId: 'network', deviceId: 'client', conversationId: 'chat', inputTarget: routine ? `routine:${routine}` : 'main' }).text
         const preparing = deferred(); fileReads.set('file:///first.txt', preparing)
@@ -2002,7 +2004,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   let draftRevision = 0
   // Virtual files keep stable URIs, with counted references for independent durable owners.
   const retainedDraftFiles = new Map<string, number>()
-  const chatDrafts = createChatDrafts({
+  const draftRepository = createChatDrafts({
     storage: { get: key => draftStorage.get(key), set: (key, value) => { draftStorage.set(key, value) }, remove: key => { draftStorage.delete(key) } },
     revision: () => `revision-${++draftRevision}`,
     files: {
@@ -2012,7 +2014,22 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       release: uri => { const remaining = (retainedDraftFiles.get(uri) ?? 1) - 1; if (remaining) retainedDraftFiles.set(uri, remaining); else retainedDraftFiles.delete(uri) },
     },
   })
-  const nativePureModules = new Set(['@/features/chat/use-chat-draft', '@/platform/reading-position', '@/platform/chat-location', '@/platform/workspace-history', '@/platform/viewport-read', '@/platform/native-workspace-history-cache'])
+  const chatDrafts = {
+    ...draftRepository,
+    lease(snapshot: Parameters<typeof draftRepository.lease>[0]) {
+      const lease = draftRepository.lease(snapshot)
+      return { ...lease, files: lease.files.map(file => ({ ...file, async arrayBuffer() {
+        const filesystem = dependencies['expo-file-system']
+        assert.ok(filesystem && typeof filesystem === 'object' && 'File' in filesystem && typeof filesystem.File === 'function')
+        const native: unknown = Reflect.construct(filesystem.File, [file.uri])
+        assert.ok(native && typeof native === 'object' && 'arrayBuffer' in native && typeof native.arrayBuffer === 'function')
+        const bytes: unknown = await Reflect.apply(native.arrayBuffer, native, [])
+        assert.ok(bytes instanceof ArrayBuffer)
+        return bytes
+      } })) }
+    },
+  }
+  const nativePureModules = new Set(['@/lib/use-selection-owner', '@/features/chat/use-chat-draft', '@/platform/reading-position', '@/platform/chat-location', '@/platform/workspace-history', '@/platform/viewport-read', '@/platform/native-workspace-history-cache'])
   const useFocusEffect = (run: () => (() => void) | void) => {
     const index = hooks.next(), previous = focusEffects.get(index)
     if (!previous || previous.run !== run) afterRender.push(() => {
@@ -2025,6 +2042,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   const require = (specifier: string): unknown => {
     if (nativePureModules.has(specifier)) return loadComponentModule(fileURLToPath(new URL(`../../../../../apps/mobile/src/${specifier.slice(2)}.ts`, import.meta.url)))
     if (specifier === './cached') return loadComponentModule(fileURLToPath(new URL('../../../../../apps/mobile/src/data/cached.ts', import.meta.url)))
+    if (specifier === '@vibeface/client/lib/selection.ts') return { selectionOwner }
     if (specifier === '@vibeface/client/workspace/conversation-cache.ts') return conversationCache
     if (specifier === '@/platform/native-chat-drafts') return { chatDrafts }
     if (specifier === '@vibeface/client/workspace/system-notifications.ts') return systemNotifications
@@ -2060,7 +2078,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       const identity = dependencies[specifier] as { useDevice?: () => object } | undefined
       return { ...identity, useDevice: () => ({ connectionGeneration: () => 0, ...identity?.useDevice?.() }) }
     }
-    if (specifier === '@/platform/files') return dependencies[specifier] ?? { privateFiles: { run: async (operation: (current: () => boolean) => Promise<unknown>) => operation(() => true), retain: async (uri: string) => ({ uri }), release() {}, releasePicker() {} } }
+    if (specifier === '@/platform/files') return dependencies[specifier] ?? { privateFiles: { run: async (operation: (current: () => boolean) => Promise<unknown>) => operation(() => true), retain: async (uri: string) => ({ uri }), ownedFile: (file: { uri: string }) => ({ ...file, text: async () => '', arrayBuffer: async () => new ArrayBuffer(0), dispose() {} }), release() {}, releasePicker() {} } }
     if (specifier === '@/platform') return { mobilePlatform: { storage: platformStorage }, ...dependencies[specifier] as object }
     if (specifier === '@tanstack/react-router') return { Link: 'Link', useNavigate: () => () => {}, useRouterState: ({ select }: { select: (state: unknown) => unknown }) => select({ location: { search: {} } }), ...dependencies[specifier] as object }
     return specifier === 'react' ? react : specifier === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : specifier === 'expo-router' ? { Link: 'Link', useFocusEffect, useRouter: () => nativeRouter, ...dependencies[specifier] as object } : dependencies[specifier] ?? ui
@@ -3022,7 +3040,7 @@ test('the required paid transfer budget stays empty until a real budget is selec
   const app = componentHarness('../lab/transfers.tsx', {
     '@vibeface/client/delivery/client.ts': { useDelivery: () => delivery },
     '@vibeface/client/delivery/model.ts': deliveryModel,
-    '@vibeface/client/delivery/types.ts': { transferSelection },
+    '@vibeface/client/lib/selection.ts': { selectionOwner },
     '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
     '@/lib/glossary': { terms: new Proxy({}, { get: (_target, name) => ({ label: String(name), icon: String(name) }) }) },
     '@/components/arc/product-kit': { Segmented: 'Segmented', useAction: () => ({ busy: null }) },
@@ -3126,10 +3144,11 @@ test('composers save each pending draft once and let edited drafts save independ
     const composer = () => { const props = render().find(({ type }) => type === (example.native ? 'Composer' : 'PromptInput'))?.props; assert.ok(props); return props }
     const submit = () => { const send = composer()[example.native ? 'onSend' : 'onSubmit']; assert.ok(typeof send === 'function'); send() }
     const attach = (name: string) => {
-      const input = composer().onFiles; assert.ok(typeof input === 'function')
+      if (example.native) { const remove = composer().onFiles; assert.ok(typeof remove === 'function'); remove([]) }
+      const input = composer()[example.native ? 'onPickFiles' : 'onFiles']; assert.ok(typeof input === 'function')
       const files = example.native ? [{ uri: `file:///${name}`, name, size: 3, mimeType: 'text/plain' }] : [{ name, arrayBuffer: () => read(name) }]
-      input(files)
-      return files
+      input(example.native ? files.map(file => ({ ...file, arrayBuffer: () => read(name), text: async () => '', dispose() {} })) : files)
+      return example.native ? composer().files : files
     }
     try {
       render(); await settleComponent()
@@ -5270,7 +5289,7 @@ test('native composer adds photos and files without replacing current attachment
       const callback = ++renders
       return app.render('Composer', {
         chrome: { kind: 'solid' }, value: '保留草稿', onChange() {}, files, attachmentScope: JSON.stringify(['network', 'chat', ['bot_main', 'bot'], 'continue']),
-        onFiles(next: Attachment[]) { usedCallback = callback; updates++; files = next }, blocked: null, sending: false, onSend() {},
+        onFiles(next: Attachment[]) { usedCallback = callback; updates++; files = next }, onPickFiles(added: import('../../../../../apps/mobile/src/data/types.ts').PickedAttachment[]) { usedCallback = callback; updates++; files = [...files, ...added] }, blocked: null, sending: false, onSend() {},
       })
     }
     const choose = (index: number) => {
@@ -6061,6 +6080,7 @@ function nativeFileFixture() {
     textSync() { return new TextDecoder().decode(files.get(this.uri)) }
     async text() { return this.textSync() }
     async bytes() { return files.get(this.uri)?.slice() ?? new Uint8Array() }
+    async arrayBuffer() { return Uint8Array.from(await this.bytes()).buffer }
     async copy(destination: File): Promise<void> { const value = files.get(this.uri); assert.ok(value); destination.writeSync(value) }
     copySync(): never { assert.fail('attachment retain must use async copy') }
     moveSync(destination: File) { const value = files.get(this.uri); assert.ok(value); destination.writeSync(value); files.delete(this.uri); this.uri = destination.uri }

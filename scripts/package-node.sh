@@ -64,9 +64,9 @@ web="$repo/apps/app/dist/client"
 release_rustflags="$(python3 "$repo/scripts/release-rustflags.py")"
 CARGO_ENCODED_RUSTFLAGS="$release_rustflags" cargo "${build_args[@]}"
 [[ -x "$cli_binary" && -x "$core_binary" ]] || { printf 'Release binaries are missing: %s and %s\n' "$cli_binary" "$core_binary" >&2; exit 1; }
-version="$(PYTHONPATH="$repo/scripts" python3 - <<'PY2'
-import release
-print(release.read_version('cli'))
+version="$(PYTHONPATH="$repo/scripts" python3 -B - <<'PY2'
+import release_context
+print(release_context.read_version('cli'))
 PY2
 )"
 [[ -n "$version" && -n "$target" ]] || { echo 'Could not determine package version or target.' >&2; exit 1; }
@@ -108,16 +108,16 @@ cp -a "$web/." "$package/web/"
 cp "$repo/scripts/install-node-service.sh" "$package/scripts/"
 python3 "$repo/scripts/offline-docs.py" "$package"
 if [[ -f "$repo/LICENSE" ]]; then cp "$repo/LICENSE" "$package/"; fi
-PACKAGE_TARGET="$target" PYTHONPATH="$repo/scripts" python3 - "$package" "$output/$name.tar.gz" <<'PY'
+PACKAGE_TARGET="$target" PYTHONPATH="$repo/scripts" python3 -B - "$package" "$output/$name.tar.gz" <<'PY'
 import os
 from pathlib import Path
 import sys
 
-import release
+import release_archive
 
 package, archive = map(Path, sys.argv[1:])
-release.write_runtime_requirements(package, os.environ['PACKAGE_TARGET'])
-release.seal_bundle(package)
-release.public_archive(package, archive)
+release_archive.write_runtime_requirements(package, os.environ['PACKAGE_TARGET'])
+release_archive.seal_bundle(package)
+release_archive.public_archive(package, archive)
 PY
 printf 'Package: %s\nChecksum: %s\n' "$output/$name.tar.gz" "$output/$name.tar.gz.sha256"

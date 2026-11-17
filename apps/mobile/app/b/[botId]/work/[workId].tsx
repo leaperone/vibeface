@@ -1,7 +1,7 @@
+import { useSelectionOwner } from '@/lib/use-selection-owner'
 import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router'
 import { Bot, Circle, CircleCheck, CircleDot, FolderOpen, Laptop, Link2, ListChecks, Play, RotateCw, SearchCheck, Settings, Square, type LucideIcon } from 'lucide-react-native'
 import { useCallback, useRef, useState, type ReactNode } from 'react'
-import { File } from 'expo-file-system'
 import { ScrollView, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -23,10 +23,10 @@ import { Composer } from '@/features/chat/composer'
 import { InputStatus } from '@/features/workspace/workspace'
 import type { WorkDetail } from '@vibeface/client/workspace/types.ts'
 import { promptIntent } from '@vibeface/client/chat/protocol.ts'
-import type { Attachment } from '@/data/types'
+import type { PickedAttachment } from '@/data/types'
 
 const tone = (state: string): Tone => state === 'failed' ? 'danger' : state === 'completed' ? 'success' : ['awaiting_confirmation', 'stop_timed_out'].includes(state) ? 'warning' : 'neutral'
-type ComposerDraft = { text: string; files: Attachment[]; workId: string; conversationId: string }
+type ComposerDraft = { text: string; files: PickedAttachment[]; workId: string; conversationId: string }
 
 /** One task of a bot's chat, as the web's task panel: progress, result, stop and the details behind it. */
 export default function TaskDetailRoute() {
@@ -43,12 +43,22 @@ function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
   const [detail, setDetail] = useState<{ generation: number; value: WorkDetail } | null>(null)
   const [retry, setRetry] = useState(0)
   const [text, setText] = useState('')
-  const [files, setFiles] = useState<Attachment[]>([])
+  const [files, setFiles] = useState<PickedAttachment[]>([])
+  const filesRef = useRef(files)
+  const selection = useSelectionOwner<PickedAttachment>(ready?.principal.network_id, () => { filesRef.current = []; setFiles([]) }, (cause) => setCleanupError(messageOf(cause)))
+  const changeFiles = (next: PickedAttachment[]) => {
+    if (filesRef.current === next) return
+    if (!selection.current?.replace(next)) return
+    filesRef.current = next
+    draftRef.current = { ...draftRef.current, files: next }
+    setFiles(next)
+  }
+  const changeText = (value: string) => { if (draftRef.current.text !== value) draftRef.current = { ...draftRef.current, text: value }; setText(value) }
   const [sendError, setSendError] = useState('')
+  const [cleanupError, setCleanupError] = useState('')
   const conversationId = bot?.conversation_id ?? ''
   const draftRef = useRef<ComposerDraft>({ text, files, workId, conversationId })
   if (draftRef.current.text !== text || draftRef.current.files !== files || draftRef.current.workId !== workId || draftRef.current.conversationId !== conversationId) draftRef.current = { text, files, workId, conversationId }
-  const draft = draftRef.current
   const savingDrafts = useRef(new Set<ComposerDraft>())
   const routeActive = useRef(false)
   const latest = useRef(shared)
@@ -175,14 +185,16 @@ function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
       </View>
     </Details>
     {shared.pendingMessages.filter((item) => item.target.kind === 'work' && item.target.work_id === workId).map((item) => <InputStatus key={item.message_id} pending={item} />)}
-    <Composer value={text} onChange={setText} files={files} onFiles={setFiles} attachmentScope={JSON.stringify([ready?.principal.network_id ?? '', conversationId, ['work', workId]])} blocked={inputPaused ? (unknown || work.outcome === 'unverified' ? '先让 Bot 查结果，再继续。' : '这个工作当前不能接收补充。') : shared.canSaveMessages ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读'} sending={false} label={inputIntent === 'continue' ? `补充给 ${work.title || '这个工作'}` : '发送为新任务'} sendLabel={inputIntent === 'continue' ? '补充这个工作' : '发送为新任务'} onSend={() => {
-      const submittedDraft = draft
+    <Composer value={text} onChange={changeText} files={files} onFiles={changeFiles} onPickFiles={(added) => { if (!selection.current) throw new Error('附件选择已结束，请重新选择。'); changeFiles([...filesRef.current, ...added]) }} attachmentScope={JSON.stringify([ready?.principal.network_id ?? '', conversationId, ['work', workId]])} blocked={inputPaused ? (unknown || work.outcome === 'unverified' ? '先让 Bot 查结果，再继续。' : '这个工作当前不能接收补充。') : shared.canSaveMessages ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读'} sending={false} label={inputIntent === 'continue' ? `补充给 ${work.title || '这个工作'}` : '发送为新任务'} sendLabel={inputIntent === 'continue' ? '补充这个工作' : '发送为新任务'} onSend={() => {
+      const submittedDraft = draftRef.current
       if (savingDrafts.current.has(submittedDraft)) return
       savingDrafts.current.add(submittedDraft)
-      const submitted = text, selectedFiles = files
+      const { text: submitted, files: selectedFiles } = submittedDraft
+      const owner = selection.current!
       setSendError('')
-      void shared.sendMessage(submitted, selectedFiles.map((file) => ({ name: file.name, arrayBuffer: () => new File(file.uri).arrayBuffer() })), undefined, { target: { kind: 'work', work_id: workId }, intent: inputIntent, conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !shared.isCurrent() || draftRef.current !== submittedDraft) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') router.push(`/task/${saved.target.task_id}`) } }).then((saved) => { if (saved && draftRef.current === submittedDraft) { setText((current) => current === submitted ? '' : current); setFiles((current) => current === selectedFiles ? [] : current) } }).catch((cause) => setSendError(messageOf(cause))).finally(() => { savingDrafts.current.delete(submittedDraft) })
-    }}>{sendError ? <ErrorText error={sendError} /> : null}</Composer>
+      const save = () => shared.sendMessage(submitted, selectedFiles.map((file) => ({ name: file.name, arrayBuffer: file.arrayBuffer })), undefined, { target: { kind: 'work', work_id: workId }, intent: inputIntent, conversation_id: work.conversation_id, onSaved: (saved) => { if (!routeActive.current || !shared.isCurrent() || draftRef.current !== submittedDraft) return; if (saved.target.kind === 'task' || saved.target.kind === 'channel_task') router.push(`/task/${saved.target.task_id}`) } })
+      void (selectedFiles.length ? owner.use(save) : save()).then((saved) => { if (saved && selection.current === owner && draftRef.current === submittedDraft) { setText((current) => current === submitted ? '' : current); if (filesRef.current === selectedFiles) changeFiles([]) } }).catch((cause) => setSendError(messageOf(cause))).finally(() => { savingDrafts.current.delete(submittedDraft) })
+    }}>{sendError || cleanupError ? <ErrorText error={sendError || cleanupError} /> : null}</Composer>
   </KeyboardAwareScrollView>
 }
 

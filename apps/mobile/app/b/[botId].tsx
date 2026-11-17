@@ -349,7 +349,7 @@ export default function ChatScreen() {
         {scrollButton.id === id && scrollButton.visible ? <View pointerEvents="box-none" className={ios ? 'absolute -top-13 w-full max-w-3xl self-center items-end px-4' : 'absolute -top-14 w-full max-w-3xl self-center items-end px-4'}>
           <Button variant="secondary" iconOnly className="rounded-pill bg-surface " accessibilityLabel="回到底部" onPress={toLatest}><Icon as={ArrowDown} /></Button>
         </View> : null}
-        <Composer value={draft.text} onChange={draft.changeText} files={draft.files} onFiles={draft.changeFiles} attachmentScope={JSON.stringify([workspace.networkId, id, inputTargetKey(inputTarget)])}
+        <Composer value={draft.text} onChange={draft.changeText} files={draft.files} onFiles={draft.changeFiles} onPickFiles={draft.addFiles} attachmentScope={JSON.stringify([workspace.networkId, id, inputTargetKey(inputTarget)])}
           blocked={blocked} sending={sendingScope === draftScopeKey} onSend={send} onStop={(inputTarget.kind === 'bot_main' ? chat?.stoppable : targetBusy) ? () => void live?.stopInputTarget({ target: targetOption.target }).catch((cause) => setSendError(messageOf(cause))) : undefined}
           sendLabel={targetBusy ? '补充当前工作' : '发送'}
         >

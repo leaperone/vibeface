@@ -1,5 +1,4 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { File } from 'expo-file-system'
 import * as Notifications from 'expo-notifications'
 import { chatTimeline, firstUnread, unreadCounts } from '@vibeface/client/chat/timeline.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
@@ -16,7 +15,6 @@ import { storageOf } from '@vibeface/client/workspace/storage.ts'
 import { isSessionNotification, type BotRecord } from '@vibeface/client/workspace/types.ts'
 import { awaitsAnswer, foldAnswers } from '@vibeface/client/workspace/questions.ts'
 import { mobilePlatform } from '@/platform'
-import { privateFiles } from '@/platform/files'
 import { remoteNotifications } from '@/platform/remote-notifications'
 import { cachedConversation, localConversations } from './cached'
 import { WorkspaceProvider } from './context'
@@ -248,7 +246,7 @@ function Live({ children }: { children: ReactNode }) {
         const workspace = latest.current
         const bot = workspace.bots.find((item) => item.conversation_id === id)
         if (!bot || !workspace.isCurrent()) throw new Error('原对话尚未读取，请重新连接后发送。')
-        await workspace.sendMessage(text, attachments.map((file) => ({ name: file.name, arrayBuffer: () => privateFiles.run(async () => new File(file.uri).arrayBuffer()) })), undefined, { ...options, conversation_id: id, target: options?.target ?? { kind: 'bot_main', bot_id: bot.bot_id } })
+        await workspace.sendMessage(text, attachments.map((file) => ({ name: file.name, arrayBuffer: file.arrayBuffer })), undefined, { ...options, conversation_id: id, target: options?.target ?? { kind: 'bot_main', bot_id: bot.bot_id } })
       },
       answer: (question, text) => latest.current.answer(question, text),
       leave: device.leave,

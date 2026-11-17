@@ -1,0 +1,238 @@
+{
+  "versions": [
+    {
+      "value": "0.0.1",
+      "channel": "stable",
+      "npm": "latest",
+      "parts": [
+        "0",
+        "0",
+        "1"
+      ]
+    },
+    {
+      "value": "1.2.3-rc.1",
+      "channel": "rc",
+      "npm": "rc",
+      "parts": [
+        "1",
+        "2",
+        "3",
+        "1"
+      ]
+    },
+    {
+      "value": "1.2.3-rc.10",
+      "channel": "rc",
+      "npm": "rc",
+      "parts": [
+        "1",
+        "2",
+        "3",
+        "10"
+      ]
+    },
+    {
+      "value": "9007199254740993.2.3",
+      "channel": "stable",
+      "npm": "latest",
+      "parts": [
+        "9007199254740993",
+        "2",
+        "3"
+      ]
+    },
+    {
+      "value": "1.2.3-hourly.2024022923",
+      "channel": "hourly",
+      "npm": "hourly",
+      "parts": [
+        "1",
+        "2",
+        "3",
+        "2024022923"
+      ]
+    },
+    {
+      "value": "1.2.3-hourly.2000022900",
+      "channel": "hourly",
+      "npm": "hourly",
+      "parts": [
+        "1",
+        "2",
+        "3",
+        "2000022900"
+      ]
+    },
+    {
+      "value": "1.2.3-hourly.0001010100",
+      "channel": "hourly",
+      "npm": "hourly",
+      "parts": [
+        "1",
+        "2",
+        "3",
+        "1010100"
+      ]
+    },
+    {
+      "value": "1.2.3-hourly.9999123123",
+      "channel": "hourly",
+      "npm": "hourly",
+      "parts": [
+        "1",
+        "2",
+        "3",
+        "9999123123"
+      ]
+    },
+    {
+      "value": "1.2.3-hourly.2026101900",
+      "channel": "hourly",
+      "npm": "hourly",
+      "parts": [
+        "1",
+        "2",
+        "3",
+        "2026101900"
+      ]
+    }
+  ],
+  "invalid": [
+    "01.2.3",
+    "1.02.3",
+    "1.2.03",
+    "1.2.3-rc.0",
+    "1.2.3-rc.01",
+    "1.2.3+build",
+    "1.2.3-nightly.1",
+    "1.2.3 ",
+    "1.2.3\n",
+    "1.2.3-hourly.2026022912",
+    "1.2.3-hourly.1900022900",
+    "1.2.3-hourly.2100022900",
+    "1.2.3-hourly.2026043100",
+    "1.2.3-hourly.2026130100",
+    "1.2.3-hourly.2026010000",
+    "1.2.3-hourly.0000010100",
+    "1.2.3-hourly.2026101924",
+    "1.2.3-hourly.20261019",
+    "1.2.3-hourly.202610190",
+    "1.2.3-hourly.2026101900.1",
+    "1.2.3-hourly.２０２６１０１９００",
+    "1.2.3-hourly.2026101900\n",
+    "1.2.3-rc.١"
+  ],
+  "comparisons": [
+    [
+      "9007199254740993.2.3",
+      "9007199254740992.2.3",
+      1
+    ],
+    [
+      "1.2.3-rc.10",
+      "1.2.3-rc.2",
+      1
+    ],
+    [
+      "1.2.3-hourly.2026010200",
+      "1.2.3-hourly.2026010123",
+      1
+    ],
+    [
+      "1.10.0",
+      "1.9.9",
+      1
+    ],
+    [
+      "1.2.3",
+      "1.2.3",
+      0
+    ],
+    [
+      "1.2.3",
+      "1.2.4",
+      -1
+    ]
+  ],
+  "crossChannel": [
+    [
+      "1.2.3",
+      "1.2.3-rc.1"
+    ],
+    [
+      "1.2.3-hourly.2026101900",
+      "1.2.3-rc.1"
+    ],
+    [
+      "1.2.3",
+      "1.2.3-hourly.2026101900"
+    ]
+  ],
+  "platforms": [
+    {
+      "target": "aarch64-apple-darwin",
+      "host": "darwin-arm64",
+      "exe": "",
+      "service": "sh",
+      "installer": "dmg",
+      "signing": "developer-id-notarized",
+      "programs": [
+        "vibeface",
+        "vibeface-core"
+      ]
+    },
+    {
+      "target": "aarch64-unknown-linux-gnu",
+      "host": "linux-arm64",
+      "exe": "",
+      "service": "sh",
+      "installer": "AppImage",
+      "signing": "platform-checksums",
+      "programs": [
+        "vibeface",
+        "vibeface-core"
+      ]
+    },
+    {
+      "target": "x86_64-unknown-linux-gnu",
+      "host": "linux-x64",
+      "exe": "",
+      "service": "sh",
+      "installer": "AppImage",
+      "signing": "platform-checksums",
+      "programs": [
+        "vibeface",
+        "vibeface-core"
+      ]
+    },
+    {
+      "target": "x86_64-pc-windows-msvc",
+      "host": "win32-x64",
+      "exe": ".exe",
+      "service": "ps1",
+      "installer": "exe",
+      "signing": "authenticode",
+      "programs": [
+        "vibeface.exe",
+        "vibeface-core.exe"
+      ]
+    }
+  ],
+  "unsupportedTargets": [
+    "x86_64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-pc-windows-msvc",
+    "unknown",
+    "toString",
+    "__proto__"
+  ],
+  "ownVersions": {
+    "core": "2.3.4",
+    "app": "3.4.5-rc.2",
+    "cli": "1.2.3-hourly.2026101909",
+    "desktop": "9.9.9-hourly.2026110712",
+    "mobile": "7.8.9-rc.2",
+    "www": "0.0.1"
+  }
+}
