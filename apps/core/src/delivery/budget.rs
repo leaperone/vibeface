@@ -2361,10 +2361,14 @@ mod tests {
                     })?,
                 )
             })?;
+            // These cases require an expired or unexpired claim, not a clock-boundary test.
+            // Keep that fact stable across wallet work and reopening after a wall-clock step.
+            const CUTOFF_DISTANCE_SECONDS: u64 = 24 * 60 * 60;
+            let now = super::super::now();
             let cutoff = if expired {
-                super::super::now() - 1
+                now - CUTOFF_DISTANCE_SECONDS
             } else {
-                super::super::now() + 100
+                now + CUTOFF_DISTANCE_SECONDS
             };
             let mut claim = PublicationClaim {
                 id: "aa".repeat(32),
