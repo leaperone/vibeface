@@ -1593,7 +1593,7 @@ impl Delivery {
                     self.save_claim(&claim)?;
                 }
             }
-            claim.checked_at_ms = crate::runtime::now_ms();
+            claim.checked_at_ms = crate::clock::now_ms();
             self.save_claim(&claim)?;
         }
         Ok(())
@@ -3267,7 +3267,7 @@ mod tests {
         };
         let mark_historical = |order: &mut StoredOrder| {
             order.settlement_complete = true;
-            order.chain_observed_at_ms = crate::runtime::now_ms();
+            order.chain_observed_at_ms = crate::clock::now_ms();
             order.view.phase = super::super::types::Phase::Paid;
             order.view.payment.state = super::super::types::PaymentState::Withdrawn;
             order.view.payment.settlement = Some(super::super::types::BudgetSettlement {

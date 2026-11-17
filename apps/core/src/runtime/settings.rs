@@ -1,5 +1,6 @@
 use super::Runtime;
 use super::codex_server::Link;
+use crate::clock::now_ms;
 use crate::config::{Config, ManagerSettings};
 use crate::discovery::{self, Paths, Target};
 use crate::manager::{ManagerConfig, Sdk};
@@ -1238,7 +1239,7 @@ impl Runtime {
             let scope = scope.to_owned();
             self.store
                 .call("settings.ask", move |store| {
-                    store.ask(&identity, &network, &scope, body, super::now_ms())
+                    store.ask(&identity, &network, &scope, body, now_ms())
                 })
                 .await
         }?;

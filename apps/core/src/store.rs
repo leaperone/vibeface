@@ -150,7 +150,7 @@ pub(crate) fn install_trust_bundle_in(
     if flipped {
         connection.execute(
             "INSERT INTO identity_meta(key,value) VALUES('recovery_since',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [format!("{}:{}", view.recovery_key, crate::runtime::now_ms())],
+            [format!("{}:{}", view.recovery_key, crate::clock::now_ms())],
         )?;
         connection.execute("DELETE FROM invites", [])?;
     }
@@ -357,7 +357,7 @@ impl Store {
         network_id: &str,
         envelopes: &[SignedEvent],
     ) -> Result<Ingested> {
-        self.ingest_events_with_seen_at(network_id, envelopes, crate::runtime::now_ms())
+        self.ingest_events_with_seen_at(network_id, envelopes, crate::clock::now_ms())
     }
 
     #[cfg(test)]

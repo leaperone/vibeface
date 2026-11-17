@@ -422,7 +422,7 @@ impl TurnAttempt {
             delivery_id: self.attempt.id.clone(),
             stage: ProviderStage::Validate,
             execution: TurnExecution::NotStarted,
-            attempted_at_ms: crate::runtime::now_ms(),
+            attempted_at_ms: crate::clock::now_ms(),
             switched_from: None,
             switch_reason: None,
         };
@@ -515,7 +515,7 @@ impl TurnAttempt {
         let dispatches = store.undelivered_dispatches(&network, &conversation)?.into_iter().filter_map(|dispatch| match store.scheduler_work_in_scope(&network,&job,&dispatch.spec.work_id) {
             Ok(true) => Some(Ok(dispatch)), Ok(false) => None, Err(error) => Some(Err(error)),
         }).collect::<Result<Vec<_>>>()?;
-        let mut bot = bot_value(store, &network, &conversation, crate::runtime::now_ms())?;
+        let mut bot = bot_value(store, &network, &conversation, crate::clock::now_ms())?;
         if let Some(sessions)=bot["sessions"].as_array_mut() {
             let mut filtered=Vec::new();
             for session in sessions.drain(..) {
@@ -902,7 +902,7 @@ impl TurnAttempt {
                             &job,
                             1,
                             limit,
-                            crate::runtime::now_ms(),
+                            crate::clock::now_ms(),
                         )
                     })
                     .await?,
@@ -1011,7 +1011,7 @@ impl TurnAttempt {
             session_generation: self.claimed.session_generation,
             stage: ProviderStage::Validate,
             execution: TurnExecution::NotStarted,
-            attempted_at_ms: crate::runtime::now_ms(),
+            attempted_at_ms: crate::clock::now_ms(),
             switched_from: Some(crate::scheduling::RuntimeSelection {
                 provider: previous.provider,
                 model: previous.model,
@@ -1097,7 +1097,7 @@ impl TurnAttempt {
                     &attempt_id,
                     outcome,
                     &text,
-                    crate::runtime::now_ms(),
+                    crate::clock::now_ms(),
                 )
             })
             .await?;
@@ -1229,7 +1229,7 @@ impl TurnAttempt {
                         &identity,
                         &network,
                         &job,
-                        crate::runtime::now_ms(),
+                        crate::clock::now_ms(),
                     )
                 })
                 .await

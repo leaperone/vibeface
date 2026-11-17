@@ -7,7 +7,7 @@
 use super::{AuthorizationView, GovernanceAction, GovernanceEvent, IdentityKind, NetworkState};
 use crate::crypto;
 use crate::store::Store;
-use crate::{crypto::random_hex, runtime::now_ms};
+use crate::{clock::now_ms, crypto::random_hex};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};

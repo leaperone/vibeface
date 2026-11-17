@@ -1,6 +1,7 @@
 //! The public mesh. Every Node holds the signed records of the Nodes it has heard of, spread by
 //! gossip and pulled from neighbors, and finds devices, gateways and delivery providers there.
 //! A Node first joins through its bootstrap nodes, which are ordinary Nodes too.
+use crate::clock::now_ms_u64 as now_ms;
 pub mod record;
 pub mod table;
 
@@ -260,10 +261,6 @@ fn topic(network: &str) -> TopicId {
     hash.update(b"vibeface:mesh:v1:");
     hash.update(network.as_bytes());
     TopicId::from_bytes(hash.finalize().into())
-}
-
-fn now_ms() -> u64 {
-    crate::runtime::now_ms() as u64
 }
 
 /// Whether `url` names a host outside private and loopback networks, judging names by their

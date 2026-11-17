@@ -1,3 +1,4 @@
+use crate::clock::now_ms;
 use crate::command::{
     BusinessCommand, BusinessInput, BusinessMethodError, BusinessRejection, ReadConsistency,
 };
@@ -19,7 +20,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, broadcast, mpsc};
 use vibeface_protocol::valid_business_id;
@@ -593,13 +594,6 @@ pub struct Runtime {
     rejoin: tokio::sync::Notify,
     /// Budget of records browsers and local processes may add to the log.
     pub(crate) log_intake: crate::logging::RateLimit,
-}
-pub fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64
 }
 fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
     let s = v[key]

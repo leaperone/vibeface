@@ -3,6 +3,7 @@ use super::{
     codex_server::Link,
     provider_adapter::{ScrubbedStderrTail, safe_model_text},
 };
+use crate::clock::now_ms;
 use crate::config::ManagerSettings;
 use crate::providers::{
     self, AppServer, AppServerMode, Authentication, CatalogCoverage, EffortOptions, LaunchCheck,
@@ -377,7 +378,7 @@ impl Runtime {
                 _ => {}
             }
         }
-        probe.checked_at_ms = Some(super::now_ms());
+        probe.checked_at_ms = Some(now_ms());
         if self.probe_input(provider, &self.providers()) == input {
             let mut cache = self
                 .provider_probes

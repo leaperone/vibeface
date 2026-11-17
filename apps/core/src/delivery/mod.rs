@@ -747,7 +747,7 @@ impl Delivery {
         let mut providers: Vec<(u64, Value)> = match node.net().ok().and_then(|net| net.mesh()) {
             Some(mesh) => mesh
                 .table()
-                .online(crate::runtime::now_ms() as u64)
+                .online(crate::clock::now_ms_u64())
                 .filter(|entry| entry.record.device_id != own)
                 .filter_map(|entry| {
                     entry.record.roles.iter().find_map(|role| match role {
@@ -994,7 +994,7 @@ impl Delivery {
                     order.authorized_by = Some(device.into());
                     order.allocation_batch = ids.clone();
                     order.view.phase = Phase::FundingPending;
-                    order.view.updated_at_ms = crate::runtime::now_ms();
+                    order.view.updated_at_ms = crate::clock::now_ms();
                 }
                 self.with_store(|store| store.save_authorized_batch(&orders))?;
                 self.wakeup.notify_one();
@@ -1130,7 +1130,7 @@ impl Delivery {
                     order.authorized_by = Some(device.into());
                     order.resume_requested = true;
                     order.view.error = None;
-                    order.view.updated_at_ms = crate::runtime::now_ms();
+                    order.view.updated_at_ms = crate::clock::now_ms();
                 }
                 self.with_store(|store| store.save_authorized_batch(&orders))?;
                 self.wakeup.notify_one();
@@ -1217,7 +1217,7 @@ impl Delivery {
         }
     }
     fn save(&self, order: &mut StoredOrder) -> Result<()> {
-        order.view.updated_at_ms = crate::runtime::now_ms();
+        order.view.updated_at_ms = crate::clock::now_ms();
         self.with_store(|store| store.save_order(order))
     }
 }
@@ -1232,7 +1232,7 @@ impl std::fmt::Display for ReceivingKeyUnavailable {
 impl std::error::Error for ReceivingKeyUnavailable {}
 
 fn now() -> u64 {
-    (crate::runtime::now_ms().max(0) as u64) / 1000
+    (crate::clock::now_ms().max(0) as u64) / 1000
 }
 fn random_word() -> Word {
     rand::random()

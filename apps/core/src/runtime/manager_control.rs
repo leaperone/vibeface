@@ -1,4 +1,5 @@
-use super::{Access, AgentAccess, Changed, Runtime, now_ms};
+use super::{Access, AgentAccess, Changed, Runtime};
+use crate::clock::now_ms;
 use crate::model::{WorkKind, WorkOutcome, WorkProjection};
 use crate::scheduling::{JobOutcome, JobState, PendingCheck, SchedulerJob, TriggerKind};
 use crate::work::{Probe, WorkState};

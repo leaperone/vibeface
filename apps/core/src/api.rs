@@ -608,7 +608,7 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
                         request.headers(),
                         &app.node.config.forwarding.trusted_proxies,
                     ),
-                    crate::runtime::now_ms(),
+                    crate::clock::now_ms(),
                 )
                 .map(Some)
         } else {
@@ -1208,7 +1208,7 @@ async fn log(State(app): State<App>, Json(input): Json<Value>) -> ApiResult<Json
         &format!("local-{source:?}"),
         source,
         &input["records"],
-        crate::runtime::now_ms(),
+        crate::clock::now_ms(),
     )
     .map_err(ApiError::bad)?;
     Ok(Json(json!({"accepted":accepted})))

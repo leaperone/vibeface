@@ -851,7 +851,7 @@ async fn dispatch_inner(
         }
         ClientCommand::Directory(_params) => {
             let state = node.membership_state().await?;
-            let now = crate::runtime::now_ms();
+            let now = crate::clock::now_ms();
             let view = state.project_at(now as u64)?;
             let since = node.recovery_since_ms(&view.recovery_key).await?;
             Ok(json!({"view":view,"state":state,"recovery_since_ms":since,"now_ms":now}))
@@ -874,7 +874,7 @@ async fn dispatch_inner(
                 &session.device_id,
                 crate::logging::Source::Web,
                 &params["records"],
-                crate::runtime::now_ms(),
+                crate::clock::now_ms(),
             )?;
             Ok(json!({"accepted":accepted}))
         }
@@ -1273,7 +1273,7 @@ async fn dispatch_inner(
             let mut state = node.membership_state().await?;
             // A retry after the veto landed finds nothing waiting, and changes nothing.
             if !state.events.contains(&event) {
-                let now = crate::runtime::now_ms() as u64;
+                let now = crate::clock::now_ms_u64();
                 ensure!(
                     at_ms.abs_diff(now) <= RECOVERY_SKEW_MS,
                     "this device's clock is too far from this Node's clock"
@@ -1317,7 +1317,7 @@ async fn dispatch_inner(
                     event.epoch == view.epoch,
                     "invalid recovery approval signer or action"
                 );
-                let now = crate::runtime::now_ms() as u64;
+                let now = crate::clock::now_ms_u64();
                 ensure!(
                     *at_ms <= now && now - *at_ms <= RECOVERY_SKEW_MS,
                     "this device's clock is too far from this Node's clock"
@@ -1343,7 +1343,7 @@ async fn dispatch_inner(
             }
             // The approved directory can remove its signer before the reply is sent.
             let state = node.membership_state().await?;
-            let now = crate::runtime::now_ms() as u64;
+            let now = crate::clock::now_ms_u64();
             let view = state.project_at(now)?;
             Ok(json!({"state":state,"view":view,"now_ms":now}))
         }
@@ -1357,7 +1357,7 @@ async fn dispatch_inner(
             let expires = params["expires_at_ms"]
                 .as_i64()
                 .context("expires_at_ms must be an integer")?;
-            let now = crate::runtime::now_ms();
+            let now = crate::clock::now_ms();
             ensure!(
                 expires > now && expires <= now + 120_000,
                 "recovery proof expired"
@@ -1479,7 +1479,7 @@ fn optional<T: serde::de::DeserializeOwned + Default>(params: &Value, key: &str)
 /// capability. A retry of an installed recovery changes nothing.
 async fn recover(node: &Runtime, session: &Session, params: &Value) -> Result<()> {
     let empty = NetworkState::new(from_field(params, "genesis")?)?;
-    let now = crate::runtime::now_ms() as u64;
+    let now = crate::clock::now_ms_u64();
     let node_id = node.identity.device_id()?;
     if !node.has_membership().await? {
         // An empty Node starts a network of its own, which its one-time capability authorizes,
@@ -1797,7 +1797,7 @@ async fn authentication(node: &Runtime, session: &Session) -> Result<Value> {
     }
     let state = node.membership_state().await?;
     // The browser checks the view against the state at this same time.
-    let now = crate::runtime::now_ms();
+    let now = crate::clock::now_ms();
     let view = state.project_at(now as u64)?;
     match principal(node, session).await {
         Ok(principal) => Ok(
@@ -2930,7 +2930,7 @@ mod tests {
             network_id: target.identity.fixture_network_id()?,
             invite_hash: ticket.invite_hash(),
             issuer: admin.device_id()?,
-            expires_at_ms: crate::runtime::now_ms() + 60_000,
+            expires_at_ms: crate::clock::now_ms() + 60_000,
             signature: String::new(),
         };
         record.signature = admin.sign_payload(INVITE_DOMAIN, &record.signing_payload()?)?;
@@ -4716,7 +4716,7 @@ mod tests {
             Member::client(&manager, "manager", true)?,
             Member::node(&node, "node")?,
         )?)?;
-        let now = crate::runtime::now_ms() as u64 - 100;
+        let now = crate::clock::now_ms_u64() - 100;
         let mut latest = String::new();
         for at_ms in [now, now + 1] {
             let mut members = state.genesis.members();
@@ -4770,7 +4770,7 @@ mod tests {
             Member::client(&manager, "manager", true)?,
             Member::node(&node.identity, "node")?,
         )?)?;
-        let now = crate::runtime::now_ms() as u64;
+        let now = crate::clock::now_ms_u64();
         let checkpoint = RootCheckpoint::recovery(
             &state,
             &root,
@@ -5086,7 +5086,7 @@ mod tests {
                     network_id: network.clone(),
                     invite_hash: invite_hash(&secret),
                     issuer: admin.device_id()?,
-                    expires_at_ms: crate::runtime::now_ms() + 60_000,
+                    expires_at_ms: crate::clock::now_ms() + 60_000,
                     signature: String::new(),
                 };
                 record.signature = admin.sign_payload(INVITE_DOMAIN, &record.signing_payload()?)?;
@@ -5240,13 +5240,13 @@ mod tests {
                 Member::client(&replacement, "new laptop", true)?,
                 Member::node(&node.identity, "node")?,
             ];
-            let now = crate::runtime::now_ms() as u64;
+            let now = crate::clock::now_ms_u64();
             let checkpoint = RootCheckpoint::recovery(&before, &root, &next.device_id()?, members.clone(), vec![], now)?;
             let backdated = RootCheckpoint::recovery(&before, &root, &next.device_id()?, members.clone(), vec![], 0)?;
             let dropped = RootCheckpoint::recovery(&before, &root, &next.device_id()?, vec![Member::client(&replacement, "new laptop", true)?], vec![], now)?;
             let mut recovering = connect("replacement-root-recovery", replacement.clone()).await?;
             let read_with = |signer: &LocalIdentity, checkpoints: &[&RootCheckpoint]| -> Result<Value> {
-                let expires = crate::runtime::now_ms() + 60_000;
+                let expires = crate::clock::now_ms() + 60_000;
                 let payload = format!(r#"{{"device_id":"{}","expires_at_ms":{expires},"network_id":"{network}"}}"#, replacement.device_id()?);
                 Ok(json!({"expires_at_ms":expires,"signature":signer.sign_payload(RECOVERY_READ_DOMAIN, payload.as_bytes())?,"checkpoints":checkpoints}))
             };

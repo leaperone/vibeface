@@ -7512,7 +7512,7 @@ fn answer_signature(net: &Net, scope: &str, question: &str, text: &str) -> Resul
 }
 
 fn sync(from: &Store, to: &mut Store, net: &Net) -> Result<()> {
-    sync_at(from, to, net, crate::runtime::now_ms())
+    sync_at(from, to, net, crate::clock::now_ms())
 }
 
 fn sync_at(from: &Store, to: &mut Store, net: &Net, seen_at_ms: i64) -> Result<()> {

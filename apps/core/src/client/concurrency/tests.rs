@@ -254,7 +254,7 @@ with socket.create_connection(('127.0.0.1', int(os.environ['CLIENT_FIXTURE_PORT'
                         scheduler_node: node_id.clone(),
                         attestation: owner.attestation().cloned().context("owner attestation")?,
                     },
-                    crate::runtime::now_ms(),
+                    crate::clock::now_ms(),
                 )?;
                 store.append_event(
                     &identity,
@@ -262,7 +262,7 @@ with socket.create_connection(('127.0.0.1', int(os.environ['CLIENT_FIXTURE_PORT'
                     "scope",
                     bot,
                     vec![],
-                    crate::runtime::now_ms(),
+                    crate::clock::now_ms(),
                 )?;
                 store.post_workspace_input(
                     &identity,
@@ -272,7 +272,7 @@ with socket.create_connection(('127.0.0.1', int(os.environ['CLIENT_FIXTURE_PORT'
                         .attestation()
                         .cloned()
                         .context("fixture input signature")?,
-                    crate::runtime::now_ms(),
+                    crate::clock::now_ms(),
                 )?;
                 store.accept_work(
                     &identity,
@@ -297,7 +297,7 @@ with socket.create_connection(('127.0.0.1', int(os.environ['CLIENT_FIXTURE_PORT'
                         provider: Provider::Pi,
                         model: None,
                     },
-                    crate::runtime::now_ms(),
+                    crate::clock::now_ms(),
                 )?;
                 Ok(())
             })
@@ -1130,7 +1130,7 @@ async fn a_completed_invite_does_not_release_its_result_after_the_manager_is_rev
         network_id: fixture.state.genesis.network_id.clone(),
         invite_hash: invite_hash(&[3; 32]),
         issuer: fixture.admin.device_id()?,
-        expires_at_ms: crate::runtime::now_ms() + 60_000,
+        expires_at_ms: crate::clock::now_ms() + 60_000,
         signature: String::new(),
     };
     record.signature = fixture
