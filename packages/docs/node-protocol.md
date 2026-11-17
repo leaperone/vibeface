@@ -522,6 +522,8 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 | `pending_joins`、`approve_join` | 汇总其他入口上的加入请求，把批准转发到保存请求的 Node |
 | `join_changed` | 保存请求的 Node 告知本机持有的加入请求有变化，不带请求内容；收到的 Node 向本机客户端推送不带会话的 `changed`，不回传、不转发。同步正常但 3 秒内没有送达的 Node 在 3 秒后补发一次 |
 
+`addresses` 请求为 `{ type: "addresses", network_id, records }`，回复为 `{ records }`；两者的 `records` 都是必填的签名地址记录数组，显式 `[]` 表示只拉取。外层额外字段不改变现有路由行为。缺失、null、错误类型或任意元素结构错误会在合并前整批拒绝，返回固定的脱敏协议错误，不写入合法前缀。结构合法的记录仍逐条验签并核对个人网络和当前 Node 成员资格；无效记录被跳过，其余有效记录正常接受，保留现有 256 条上限与 seq 高水位规则。地址交换失败不阻断后续历史同步。
+
 ### Relay 与公共节点
 
 启用 `relay_listen` 的 Node 运行 `iroh-relay` 服务。relay 接纳本 Node 自己、当前成员 Node，以及带有效邀请令牌 `SHA256("vibeface:relay:v1" ‖ invite_hash)` 的加入者，所以只能经这台 relay 连通的新 Node 要用运行 relay 的 Node 发出的邀请；配置了 `relay_operator_token` 时另外接纳持该令牌的设备，`relay_open` 时接纳任何设备。`relay_blocked` 里的设备一律拒绝，本 Node 与成员 Node 以外的连接超出 `relay_max_clients` 时拒绝，`relay_rate` 限制从每个连接读取的速率。relay 始终只监听回环，由本 Node 在 `relay_listen` 上接收 TCP 连接再转给它；设了 `relay_max_clients_per_ip` 时，同一 IPv4 地址或 IPv6 /56 超出上限的连接直接关闭。前置代理为每条连接生成随机的一次性私有绑定，替换首个请求自带的同名头，准入时必须消费有效绑定，成员 Node 也不例外。缺失、伪造、已消费或重复的绑定均拒绝，所以健康检查之后经 keepalive 或管线化发来的未绑定升级，以及绕过前置代理的未绑定后端连接，都不能接入 relay。转发的连接任一方向结束即关闭两端，客户端连接开启 TCP keepalive。relay 看不到内容，但能看到哪些设备连接它、彼此何时通信和流量大小。
