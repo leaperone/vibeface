@@ -201,6 +201,7 @@ test("workspace preserves bot and message requests while routing native decision
   assert.equal(typeof workspaceModule.useWorkspaceState, "function")
   const { useWorkspaceState } = workspaceModule as { useWorkspaceState(platform: unknown, connection: ReadyConnection): Workspace }
   const platform = {
+    conversationCache: false,
     reserveDeliveryIntent: async () => { throw new Error('unexpected delivery reservation') },
     secure: { attestationPayload: (network: string, scope: string, body: string) => { const event = JSON.parse(body); assert.equal(typeof event.type, "string"); assert.equal(event.attestation, undefined); return `${network}|${scope}|${body}` } },
     transport: { signClient: async (domain: string, payload: string) => { signed.push(`${domain}|${payload}`); return "signature" } },
@@ -742,6 +743,83 @@ test("workspace preserves bot and message requests while routing native decision
         await render().selectBot(bot)
         await render().refresh()
       }
+    })
+    await t.test('history authority invalidation cancels an in-flight Alpha snapshot until a queued Beta workspace refresh confirms it', async (race) => {
+      for (const cacheEnabled of [false, true]) await race.test(cacheEnabled ? 'cached mobile view' : 'default Web view', async () => {
+        const originalRpc = connection.rpc, originalTimeout = sandbox.setTimeout, originalClearTimeout = sandbox.clearTimeout
+        const originalCache = platform.conversationCache
+        const timers = new Map<number, () => void>()
+        let timerId = 0, phase: 'confirmed' | 'alpha-refresh' | 'beta-refresh' = 'confirmed'
+        const alphaStarted = deferred(), oldAlpha = deferred(), betaStarted = deferred(), beta = deferred()
+        const row = (message_id: string, rank: string) => ({ message_id, event_hash: message_id, rank, role: 'user', text: message_id, created_at_ms: 1 })
+        const snapshot = (authority: string, message_id: string) => ({ ...context, history_authority: authority, messages: [row(message_id, '2')], history: { ...completeHistory(), messages: { next_cursor: `${authority}-cursor`, complete: false } } })
+        const confirmedAlpha = snapshot('alpha', 'confirmed-alpha'), lateAlpha = snapshot('alpha', 'late-alpha'), confirmedBeta = snapshot('beta', 'confirmed-beta')
+        const pages: Record<string, unknown>[] = []
+        let refreshing: Promise<void> | undefined, invalidated: Promise<void> | undefined
+        platform.conversationCache = cacheEnabled
+        sandbox.setTimeout = (run: () => void) => { const id = ++timerId; timers.set(id, run); return id }
+        sandbox.clearTimeout = (id: number) => { timers.delete(id) }
+        connection.rpc = async (method, params = {}) => {
+          if (method === 'conversation') {
+            if (phase === 'alpha-refresh') { alphaStarted.resolve(undefined); return oldAlpha.promise }
+            if (phase === 'beta-refresh') { betaStarted.resolve(undefined); return beta.promise }
+            return confirmedAlpha
+          }
+          if (method === 'conversation_history') {
+            pages.push(params)
+            if (phase === 'alpha-refresh') throw new Error('history changed; refresh the conversation')
+            return { conversation_id: 'chat', section: 'messages', history_authority: 'beta', items: [row('older-beta', '1')], next_cursor: null, complete: true }
+          }
+          return originalRpc(method, params)
+        }
+        try {
+          await reload(); await render().refresh()
+          const alpha = render()
+          assert.equal(alpha.dataOrigin, 'network')
+          assert.equal(alpha.data?.history_authority, 'alpha')
+          assert.equal(alpha.writable, true)
+          phase = 'alpha-refresh'
+          refreshing = alpha.refresh()
+          await alphaStarted.promise
+          invalidated = render().loadHistory('messages')
+          await settleComponent()
+          assert.equal(pages[0]?.cursor, 'alpha-cursor')
+          assert.equal(render().dataOrigin, cacheEnabled ? 'cache' : 'none')
+          assert.equal(render().writable, false, 'an invalidated cursor pauses writes even while older workspace metadata is being refreshed')
+          phase = 'beta-refresh'
+          oldAlpha.resolve(lateAlpha)
+          await Promise.all([refreshing, invalidated])
+          const stale = render()
+          assert.equal(stale.dataOrigin, cacheEnabled ? 'cache' : 'none', 'the late Alpha request cannot reapply a network origin after its read owner is invalidated')
+          assert.deepEqual(Array.from(stale.data?.messages ?? [], message => message.message_id), cacheEnabled ? ['confirmed-alpha'] : [])
+          assert.equal(stale.writable, false, 'the old full refresh cannot grant writes using its cancelled conversation read')
+          assert.equal(stale.synced, false)
+          await assert.rejects(stale.loadHistory('messages'), /先选择并读取对话/, 'an unconfirmed Alpha view cannot authorize another page')
+          assert.equal(timers.size, 1, 'the complete Beta refresh is queued separately from the stale Alpha request')
+          const queued = [...timers.values()]; timers.clear(); queued.forEach(run => run())
+          await betaStarted.promise
+          assert.equal(render().writable, false, 'queued metadata alone cannot authorize writes before Beta returns')
+          assert.equal(render().dataOrigin, cacheEnabled ? 'cache' : 'none')
+          beta.resolve(confirmedBeta)
+          await settleComponent()
+          const recovered = render()
+          assert.equal(recovered.dataOrigin, 'network')
+          assert.equal(recovered.data?.history_authority, 'beta')
+          assert.equal(recovered.writable, true)
+          assert.equal(recovered.synced, true)
+          await recovered.loadHistory('messages')
+          assert.equal(pages.at(-1)?.cursor, 'beta-cursor')
+          assert.deepEqual(Array.from(render().data?.messages ?? [], message => message.message_id), ['older-beta', 'confirmed-beta'])
+          assert.equal(render().data?.history.messages.complete, true)
+        } finally {
+          oldAlpha.resolve(lateAlpha); beta.resolve(confirmedBeta)
+          await Promise.allSettled([refreshing, invalidated])
+          timers.clear()
+          sandbox.setTimeout = originalTimeout; sandbox.clearTimeout = originalClearTimeout
+          connection.rpc = originalRpc; platform.conversationCache = originalCache
+          await reload(); await render().refresh()
+        }
+      })
     })
     const retryMessage = { message_id: "retry-1", event_hash: "retry-event", role: "user", text: "改 README", created_at_ms: 1 }
     const retryScheduler = { scope_jobs: [], jobs: [{ scope: { kind: 'main' as const }, trigger: "message:retry-1", state: "failed", message_id: "retry-1", failure: { kind: "rejected", detail: "没有执行" } }], unanswered: [] }
