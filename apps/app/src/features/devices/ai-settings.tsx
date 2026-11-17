@@ -1,3 +1,4 @@
+import { useClipboard } from "@/lib/use-clipboard"
 import { BusyIcon,Details,FolderPath,InlineError,Segmented,Skeleton,toast,toneText,type Tone } from "@/components/arc/product-kit"
 import { ActionLink } from "@/components/arc/routed-action"
 import { terms } from "@/lib/glossary"
@@ -372,6 +373,7 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
   item: ProviderStatus; response: NodeSettingsResponse; onboarding: boolean; compact?: boolean; busy: string; models: ModelChoice[] | null; error: unknown
   change(key: string, value: Omit<Change, "provider">): Promise<boolean>; saveBot(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>; reconcile(): Promise<boolean>; probe(): Promise<void>
 }) {
+  const clipboard = useClipboard(item.setup?.command, { duration: null, onCopied: () => toast("已复制认证命令", { tone: "success" }), onFailed: () => toast("请选中命令后复制", { tone: "warning" }) })
   const name = providerNames[item.provider], Icon = providerIcons[item.provider]
   const display = response.display_paths
   const bot = item.roles.includes("agent"), execution = item.roles.includes("execution")
@@ -503,7 +505,7 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
         {item.setup.directory ? <FolderPath path={item.setup.directory} shown={display[item.setup.directory]} /> : null}
         <div className="flex min-w-0 gap-2">
           <Input label={`${name} 登录命令`} readOnly aria-label={`${name} 登录命令`} className="min-w-0 font-mono" value={item.setup.command} onFocus={(event) => event.target.select()} />
-          <Button type="button" variant="secondary" onClick={() => { if (item.setup) void navigator.clipboard.writeText(item.setup.command).then(() => toast("已复制认证命令", { tone: "success" }), () => toast("请选中命令后复制", { tone: "warning" })) }}><Copy aria-hidden="true" />复制命令</Button>
+          <Button type="button" variant="secondary" onClick={() => { if (item.setup) void clipboard.copy(item.setup.command) }}><Copy aria-hidden="true" />复制命令</Button>
         </div>
       </Details> : null}
       {!compact ? <div className="flex flex-wrap items-center gap-2 text-sm text-secondary">{checkButton}</div> : null}

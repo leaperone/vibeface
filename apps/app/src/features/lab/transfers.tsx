@@ -1,3 +1,4 @@
+import { useClipboard } from '@/lib/use-clipboard'
 import { FieldNote,FormField } from "@/components/arc/form-field"
 import { BusyIcon,Details,EmptyState,InlineError,Segmented,useAction } from '@/components/arc/product-kit'
 import { terms } from '@/lib/glossary'
@@ -227,16 +228,11 @@ function Feedback({ error, notice }: { error: string; notice: string }) {
 
 /** Only the button that copies the 64-character ID, to send to whoever sends a file. */
 function ConnectionId({ value }: { value: string }) {
-  const [copied, setCopied] = useState(false)
-  useEffect(() => {
-    if (!copied) return
-    const timer = setTimeout(() => setCopied(false), 2000)
-    return () => clearTimeout(timer)
-  }, [copied])
+  const { copied, copy } = useClipboard(value)
   return <div className="grid gap-1 text-sm">
     <span className="text-secondary">{transferCopy.connectionId}</span>
     <span className="flex min-w-0 items-center gap-2">
-      <Button type="button" variant="secondary" size="sm" className="shrink-0" onClick={() => { void navigator.clipboard.writeText(value).then(() => setCopied(true), () => {}) }}>{copied ? <CircleCheck aria-hidden="true" /> : <Copy aria-hidden="true" />}{copied ? '已复制' : '复制'}</Button>
+      <Button type="button" variant="secondary" size="sm" className="shrink-0" onClick={() => { void copy(value) }}>{copied ? <CircleCheck aria-hidden="true" /> : <Copy aria-hidden="true" />}{copied ? '已复制' : '复制'}</Button>
     </span>
   </div>
 }

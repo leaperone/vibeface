@@ -1,3 +1,4 @@
+import { useClipboard } from '@/lib/use-clipboard'
 import { Details,EmptyState,InlineError,Segmented,Skeleton,toast } from '@/components/arc/product-kit'
 import { terms } from '@/lib/glossary'
 import { cn } from '@/lib/utils'
@@ -234,6 +235,7 @@ function time(ms: number) {
 
 /** `chat` and `task`: the names shown instead of their IDs, which stay under the technical details. */
 function LogRow({ record, name, chat, task, open, onToggle, onCopyAll }: { record: LogRecord; name: (device?: string) => string; chat?: string; task?: string; open: boolean; onToggle(): void; onCopyAll(filter: LogFilter, what: string): Promise<void> }) {
+  const clipboard = useClipboard(record, { duration: null, onCopied: () => toast('已复制这条记录', { tone: 'success' }), onFailed: () => toast('复制失败，请重试。', { tone: 'warning' }) })
   const outside = external(record)
   const alert = outside ? undefined : alertLook[record.level]
   const quiet = outside || record.level === 'debug' || record.level === 'trace'
@@ -266,7 +268,7 @@ function LogRow({ record, name, chat, task, open, onToggle, onCopyAll }: { recor
         {record.fields && Object.keys(record.fields).length ? <pre className="max-h-64 overflow-auto rounded-control bg-surface-muted p-3 font-mono text-sm whitespace-pre-wrap break-all text-foreground">{JSON.stringify(record.fields, null, 2)}</pre> : null}
       </Details>
       <div className="flex flex-wrap gap-2">
-        <Button type="button" size="sm" variant="secondary" onClick={() => { void navigator.clipboard.writeText(JSON.stringify(record)).then(() => toast('已复制这条记录', { tone: 'success' })) }}><Copy aria-hidden="true" />复制这条</Button>
+        <Button type="button" size="sm" variant="secondary" onClick={() => { void clipboard.copy(JSON.stringify(record)) }}><Copy aria-hidden="true" />复制这条</Button>
         {record.conversation_id ? <Button type="button" size="sm" variant="secondary" onClick={() => { void onCopyAll({ conversation_id: record.conversation_id }, '对话') }}><MessagesSquare aria-hidden="true" />复制对话日志</Button> : null}
         {record.work_id ? <Button type="button" size="sm" variant="secondary" onClick={() => { void onCopyAll({ work_id: record.work_id }, '任务') }}><ListChecks aria-hidden="true" />复制任务日志</Button> : null}
       </div>

@@ -1,6 +1,7 @@
 import { ActionCard,BusyIcon,claimFocus,Details,FilePicker,InlineError,Panel,PasswordInput,SettingsDisclosure,SettingsRow,toast,WaitingDot } from '@/components/arc/product-kit'
 import { deviceIcon } from '@/features/devices/devices'
 import { defaultBrowserName } from '@/lib/device-name'
+import { useClipboard } from '@/lib/use-clipboard'
 import { cn } from '@/lib/utils'
 import { encodeQrCode } from '@/lib/qr-code'
 import { Link,useNavigate } from '@tanstack/react-router'
@@ -76,12 +77,7 @@ export function PhoneRecovery() {
   const entry = recoveryEntry(device.entrances, device.ready?.entry ?? null)
   const link = entry ? recoveryLink(entry) : null
   const qr = useMemo(() => encodeQrCode(link ?? ''), [link])
-  const [copied, setCopied] = useState(false)
-  useEffect(() => {
-    if (!copied) return
-    const timer = setTimeout(() => setCopied(false), 2000)
-    return () => clearTimeout(timer)
-  }, [copied])
+  const { copied, copy } = useClipboard(link)
   return <SettingsDisclosure icon={Smartphone} label={recoveryCopy.byPhone}>
     {link ? <>
       {qr.kind === 'encoded' ? <>
@@ -91,7 +87,7 @@ export function PhoneRecovery() {
         <InlineError error="无法生成二维码，请复制链接。" />
         <Textarea label="链接原文" readOnly className="font-mono" value={link} onFocus={(event) => event.target.select()} />
       </>}
-      <Button type="button" variant="secondary" size="sm" className="w-fit" onClick={() => { void navigator.clipboard.writeText(link).then(() => setCopied(true), () => {}) }}>
+      <Button type="button" variant="secondary" size="sm" className="w-fit" onClick={() => { void copy(link) }}>
         {copied ? <CircleCheck aria-hidden="true" className="text-success" /> : <Copy aria-hidden="true" />}{copied ? '已复制' : '复制链接'}
       </Button>
     </> : <p className="flex items-center gap-2 text-sm text-secondary"><WifiOff aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.unreachable}</p>}
