@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
+import { insideTaskArtifacts } from '../support/artifact-paths';
 import { execFile } from 'node:child_process';
 import { readFile, writeFile } from 'node:fs/promises';
-import { relative, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { test as base } from '@e2e-dev/mobile';
 import { expect, secrets } from 'e2e';
@@ -22,8 +23,7 @@ const test = base.extend<{ network: NativeWorkspace }>({
       assert(url.protocol === 'http:' && url.hostname === '127.0.0.1', 'The native app connects only to this isolated Node');
       const gate = (name: string) => {
         const value = text(record(fixture.gates)[name]);
-        const inside = relative(artifacts, resolve(value));
-        assert(inside && !inside.startsWith('..') && !inside.startsWith('/'), 'Native gates remain in this fixture');
+        assert(insideTaskArtifacts(artifacts, resolve(value), { allowRoot: false }), 'Native gates remain in this fixture');
         return value;
       };
       await call({ op: 'workspace_native_setup', invitation_file: invitation });

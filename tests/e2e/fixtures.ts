@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
+import { insideTaskArtifacts } from '../support/artifact-paths';
 import { lstat, readFile } from 'node:fs/promises';
-import { relative, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import { test as base } from '@e2e-dev/web';
 
 const root = resolve(import.meta.dirname, '../..');
@@ -26,8 +27,7 @@ function node(value: unknown): NodeInfo {
   assert(entry === null || entry.origin === url.origin && entry.pathname === '/' && !entry.search && /^#bootstrap=[A-Za-z0-9_-]+$/.test(entry.hash), 'The owner access link opens this Node with its bootstrap entry in the fragment');
   const peer = text(fields.peer), directory = text(fields.directory);
   assert(/^[a-f0-9]{64}$/.test(peer), 'Fixture peer is a Node identity');
-  const inside = relative(artifacts, resolve(directory));
-  assert(inside && !inside.startsWith('..') && !inside.startsWith('/'), 'Fixture data remains in this task');
+  assert(insideTaskArtifacts(artifacts, resolve(directory), { allowRoot: false }), 'Fixture data remains in this task');
   return { url: url.origin, entry: entry === null ? null : entry.href, peer, directory };
 }
 function owner(info: NodeInfo): OwnerNode {
@@ -161,8 +161,7 @@ export const workspaceTest = base.extend<{ workspace: WorkspaceFixture }>({
       const paths = record(ready.gates);
       const gate = (name: WorkspaceGate) => {
         const path = text(paths[name]);
-        const inside = relative(artifacts, resolve(path));
-        assert(inside && !inside.startsWith('..') && !inside.startsWith('/'), 'Controlled gates remain in this task');
+        assert(insideTaskArtifacts(artifacts, resolve(path), { allowRoot: false }), 'Controlled gates remain in this task');
         return path;
       };
       await use({ source, gates: { taskA: gate('taskA'), taskB: gate('taskB'), main: gate('main'), channel: gate('channel') },

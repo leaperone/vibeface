@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { relative, resolve } from 'node:path';
+import { insideTaskArtifacts } from '../support/artifact-paths';
+import { resolve } from 'node:path';
 import type { mobile } from '@e2e-dev/mobile';
 import type { E2EConfig } from 'e2e';
 
@@ -10,12 +11,10 @@ export function nativeIosInputs({ taskRoot, invitation, env }: { taskRoot: strin
   const agentDeviceHome = env.AGENT_DEVICE_HOME ?? resolve(taskRoot, 'agent-device');
   const agentDeviceStateDir = env.AGENT_DEVICE_STATE_DIR ?? resolve(taskRoot, 'agent-device');
   for (const state of [agentDeviceHome, agentDeviceStateDir]) {
-    const location = relative(taskRoot, resolve(state));
-    assert(location && !location.startsWith('..') && !location.startsWith('/'), 'Native driver state remains in this task');
+    assert(insideTaskArtifacts(taskRoot, resolve(state), { allowRoot: false }), 'Native driver state remains in this task');
   }
   const invitationFile = env.VIBEFACE_E2E_NATIVE_INVITATION_FILE ?? invitation;
-  const inside = relative(taskRoot, resolve(invitationFile));
-  assert(inside && !inside.startsWith('..') && !inside.startsWith('/'), 'Native invitation remains in this task');
+  assert(insideTaskArtifacts(taskRoot, resolve(invitationFile), { allowRoot: false }), 'Native invitation remains in this task');
   return { app: resolve(app), simulator, agentDeviceHome, agentDeviceStateDir, invitation: invitationFile };
 }
 

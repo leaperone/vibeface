@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
+import { insideTaskArtifacts } from '../support/artifact-paths';
 import { createHash, randomBytes } from 'node:crypto';
 import { copyFile, mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
-import { join, relative, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { execFile } from 'node:child_process';
 import { test as base } from '@e2e-dev/mobile';
@@ -29,8 +30,7 @@ function driverFailurePointer(error: unknown): Record<string, unknown> {
       if (typeof source.logPath === 'string' && source.logPath.length <= 4096 && !/[\u0000-\u001f]/.test(source.logPath)) {
         const stateDir = resolve(root, '.artifacts/native/agent-device');
         const logPath = resolve(source.logPath);
-        const relativePath = relative(stateDir, logPath);
-        if (relativePath && !relativePath.startsWith('..') && !relativePath.startsWith('/')) pointer.log_path = logPath;
+        if (insideTaskArtifacts(stateDir, logPath, { allowRoot: false })) pointer.log_path = logPath;
       }
       if (typeof source.message === 'string' && /daemon request timed out/i.test(source.message)) pointer.message_kind = 'daemon_request_timeout';
     }

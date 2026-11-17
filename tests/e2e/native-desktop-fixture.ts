@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
+import { insideTaskArtifacts } from '../support/artifact-paths';
 import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
-import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { isAbsolute, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 
 const execute = promisify(execFile);
@@ -18,8 +19,7 @@ export async function nativeDesktopAcceptance() {
   assert(application && isAbsolute(application), 'Name the built native Desktop application with VIBEFACE_E2E_DESKTOP_APP');
   assert(runtime && isAbsolute(runtime), 'Name the same-source sealed runtime with VIBEFACE_E2E_DESKTOP_RUNTIME');
   const artifacts = resolve(process.env.VIBEFACE_E2E_DESKTOP_OUTPUT ?? resolve(root, '.artifacts/native-desktop-acceptance'));
-  const location = relative(resolve(root, '.artifacts'), artifacts);
-  assert(location && location.split(sep)[0] !== '..' && !isAbsolute(location), 'Native evidence stays under this task workspace artifacts');
+  assert(insideTaskArtifacts(resolve(root, '.artifacts'), artifacts, { allowRoot: false }), 'Native evidence stays under this task workspace artifacts');
   await mkdir(artifacts, { recursive: true });
   const output = await mkdtemp(resolve(artifacts, 'window-'));
   try {
