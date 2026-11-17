@@ -328,7 +328,7 @@ impl DesktopHost {
         }
         if !initialized(path)? {
             self.request(&ControlRequest::Init {
-                options: vibeface_control::init::InitOptions::new(path.to_path_buf()),
+                options: Box::new(vibeface_control::init::InitOptions::new(path.to_path_buf())),
             })
             .await?;
         }

@@ -48,7 +48,7 @@ fn init_mesh(no_mesh: bool, network: Option<String>, bootstrap: Vec<String>) -> 
 
 pub async fn handle(request: vibeface_control::ControlRequest) -> Result<Value> {
     match request {
-        vibeface_control::ControlRequest::Init { options } => initialize_from_options(options),
+        vibeface_control::ControlRequest::Init { options } => initialize_from_options(*options),
         vibeface_control::ControlRequest::Inspect { data_dir } => inspect(&data_dir).await,
         vibeface_control::ControlRequest::DiscoverLocalNodes {
             app_profile_dir,
@@ -777,7 +777,7 @@ mod tests {
         assert!(error.to_string().contains("--manager requires --workspace"));
         assert!(!dir.exists());
         let request = vibeface_control::ControlRequest::Init {
-            options: InitOptions::new(PathBuf::from("relative-node")),
+            options: Box::new(InitOptions::new(PathBuf::from("relative-node"))),
         };
         let error = handle(request).await.unwrap_err();
         assert!(error.to_string().contains("absolute data directory"));

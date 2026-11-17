@@ -854,7 +854,7 @@ async fn main() -> Result<()> {
         }
         Some(Action::Init(options)) => {
             let result = control(ControlRequest::Init {
-                options: (*options).into(),
+                options: Box::new((*options).into()),
             })
             .await?;
             println!("Vibeface 已就绪");
@@ -2640,7 +2640,10 @@ mod tests {
             "controlled-node-link",
         ]);
         assert_eq!(
-            serde_json::to_value(ControlRequest::Init { options }).unwrap(),
+            serde_json::to_value(ControlRequest::Init {
+                options: Box::new(options),
+            })
+            .unwrap(),
             json!({
                 "command": "init", "options": {
                     "data_dir": TEST_DATA_NODE,
