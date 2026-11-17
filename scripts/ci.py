@@ -829,6 +829,7 @@ def self_test():
     assert "name: crypto-web-${{ github.sha }}" in package and "name: web-${{ github.sha }}" in package
     workflow_contract_self_test()
     quick = re.search(r"(?ms)^  quick-check:\n(.*?)(?=^  \w|\Z)", workflow)[1]
+    assert "fetch-depth: 0" in quick, "Release CLI baseline tests require repository history"
     assert quick.count("python3 scripts/check-source.py") == 1
     assert all(name in quick for name in ("scripts/verify-delivery-protected.py", "scripts/verify-delivery-restart-observer.py"))
     config = (root / "crates/control/src/lib.rs").read_text()
