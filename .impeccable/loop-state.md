@@ -164,3 +164,11 @@ A9 Docs36/40，无P0/P1，但有2项P2：深色目录焦点框过暗、首次成
 快速上手保留平台/完整包/格式编号/新旧目录安全限制，解释Hourly、CLI/Core/App和data epoch含义；把glibc连到安装文档新增的只读getconf检查。平台选择、包组成与格式约束均核对现有install.sh/安装文档，不新增支持承诺、不运行安装器。
 
 验证：WWW14项单测、typecheck/e2e类型、生产构建、静态22HTML/25输出通过；浏览器3/3包括暗色减少动态的真实焦点outline>=2px、对比>=3、初始聚焦与首页导航。首次测试失败按失败留证，后续保持阈值后通过（round10-www-e2e-stable）。根已查看当前暗色截图。准备A10/B10定向复评，App源码继续未改，当前App仍为A7的36/40；不伪造App新评分。
+
+## 最终独立结论：质量目标已达成
+
+A10 Docs36/40，无P0/P1/P2，2个P3为安装解释密度与恢复搜索排序；B10当前文档/官网定向审计19/20，issues=[]，light/dark、normal/reduce、forced-colors、目录/TOC/焦点/叠层/两次503重试与HTTP query路径通过。性能保守3分，未将本机无错误当全面CPU/低端网络认证。
+
+App继续使用A7实际36/40（git diff 8ae97b9d HEAD的apps/app、client、theme、uiarc为空），官网A7为31/32，A10补充首页焦点sanity通过；没有把未改目标称作新重评分。当前相关范围无已知未解P0/P1/P2，剩余只有低影响P3。独立代码复审、对应行为/类型/构建和真实浏览器验收均完成，原失败日志与每轮分数如实保留。
+
+本轮唯一PR671，验证源码提交d0d72381。最终报告、文件清单、静态zip及选定夹具截图导出至/root/home/artifacts/vibeface-impeccable-quality-loop-20261117（不含keys、profile、fixture info或私有runtime）。将记录当前结论后完成已授权合并和仅本任务进程清理。原audit-full-20261116的28个未提交文件仍保留。
