@@ -456,8 +456,69 @@ impl DesktopHost {
             }
             identity
         };
-        let result =
-            service::invoke(&cli, &self.profile_dir, action, Some(&identity.device_id)).await;
+        let result = service::invoke(&cli, &self.profile_dir, action, Some(&identity.device_id))
+            .await
+            .and_then(|result| {
+                if action == BackgroundAction::Uninstall {
+                    ensure!(
+                        result.state == ServiceState::NotInstalled,
+                        "后台服务移除尚未确认。"
+                    );
+                } else {
+                    ensure!(
+                        result.identity().as_ref() == Some(&identity),
+                        "后台服务操作后节点身份不一致。"
+                    );
+                    match action {
+                        BackgroundAction::Install | BackgroundAction::Start => ensure!(
+                            result.state == ServiceState::Installed
+                                && result.service_running == Some(true)
+                                && result.core_status == Some(NodeStatus::Running),
+                            "后台节点启动尚未确认。"
+                        ),
+                        BackgroundAction::Stop => ensure!(
+                            result.state == ServiceState::InstalledStopped
+                                && result.service_running == Some(false)
+                                && result.core_status == Some(NodeStatus::Stopped),
+                            "后台节点停止尚未确认。"
+                        ),
+                        _ => {}
+                    }
+                    if action == BackgroundAction::Update {
+                        // Recovery may complete even when the OS service registration is absent.
+                        // Preserve CLI partial state so the user can remove or reinstall explicitly.
+                        if fresh.runtime_update.recovery_required
+                            && result.state == ServiceState::Partial
+                            && !result.runtime_update.recovery_required
+                        {
+                            return Ok(result);
+                        }
+                        let update = &result.runtime_update;
+                        ensure!(
+                            !update.recovery_required
+                                && update.availability == UpdateAvailability::Current
+                                && update.installed_version.as_ref()
+                                    == Some(&update.bundled_version),
+                            "后台更新版本尚未确认。"
+                        );
+                        let expected_running = fresh.service_running == Some(true)
+                            && fresh.core_status == Some(NodeStatus::Running);
+                        ensure!(
+                            result.service_running == Some(expected_running)
+                                && result.core_status
+                                    == Some(if expected_running {
+                                        NodeStatus::Running
+                                    } else {
+                                        NodeStatus::Stopped
+                                    })
+                                && update.running_version.as_ref()
+                                    == expected_running.then_some(&update.bundled_version),
+                            "后台更新运行状态尚未确认。"
+                        );
+                    }
+                }
+                Ok(result)
+            });
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -469,48 +530,6 @@ impl DesktopHost {
             }
         };
         self.background = Some(result.clone());
-        if action == BackgroundAction::Uninstall {
-            ensure!(
-                result.state == ServiceState::NotInstalled,
-                "后台服务移除尚未确认。"
-            );
-        } else {
-            ensure!(
-                result.identity().as_ref() == Some(&identity),
-                "后台服务操作后节点身份不一致。"
-            );
-            if action == BackgroundAction::Update {
-                // Recovery may complete even when the OS service registration is absent.
-                // Preserve CLI partial state so the user can remove or reinstall explicitly.
-                if fresh.runtime_update.recovery_required
-                    && result.state == ServiceState::Partial
-                    && !result.runtime_update.recovery_required
-                {
-                    return Ok(result);
-                }
-                let update = &result.runtime_update;
-                ensure!(
-                    !update.recovery_required
-                        && update.availability == UpdateAvailability::Current
-                        && update.installed_version.as_ref() == Some(&update.bundled_version),
-                    "后台更新版本尚未确认。"
-                );
-                let expected_running = fresh.service_running == Some(true)
-                    && fresh.core_status == Some(NodeStatus::Running);
-                ensure!(
-                    result.service_running == Some(expected_running)
-                        && result.core_status
-                            == Some(if expected_running {
-                                NodeStatus::Running
-                            } else {
-                                NodeStatus::Stopped
-                            })
-                        && update.running_version.as_ref()
-                            == expected_running.then_some(&update.bundled_version),
-                    "后台更新运行状态尚未确认。"
-                );
-            }
-        }
         Ok(result)
     }
     /// Attached Nodes and installed user services deliberately have no quit operation here.

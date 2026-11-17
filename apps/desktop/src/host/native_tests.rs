@@ -65,6 +65,7 @@ impl Fixture {
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         ));
         privatefs::create_dir(&root)?;
+        let root = std::fs::canonicalize(root)?;
         let profile = root.join("profile");
         let runtime = root.join("runtime");
         privatefs::create_dir(&profile)?;
@@ -314,41 +315,187 @@ async fn service_and_runtime_updates_remain_distinct_and_require_fresh_state() -
     host.shutdown().await?;
     assert!(fixture.node().join("running").exists());
     host.background(BackgroundAction::Stop).await?;
+    let started = host.background(BackgroundAction::Start).await?;
+    assert_eq!(started.state, ServiceState::Installed);
+    assert_eq!(started.service_running, Some(true));
+    assert_eq!(started.core_status, Some(NodeStatus::Running));
+    host.background(BackgroundAction::Stop).await?;
     privatefs::write_atomic(&fixture.profile.join("fixture.recovery"), b"")?;
-    host.background(BackgroundAction::Update).await?;
+    let partial = serde_json::json!({
+        "state":"partial", "device_id":"a".repeat(64), "data_dir":fixture.node(),
+        "service_id":"fixture.service", "managed_root":fixture.profile.join("managed"),
+        "service_running":false, "core_status":"stopped",
+        "runtime_update":{"bundled_version":"2.0.0","installed_version":"2.0.0",
+            "running_version":null,"availability":"current","recovery_required":false}
+    });
+    privatefs::write_atomic(
+        &fixture.profile.join("fixture.mutation-status"),
+        &serde_json::to_vec(&partial)?,
+    )?;
+    let recovered = host.background(BackgroundAction::Update).await?;
+    assert_eq!(recovered.state, ServiceState::Partial);
+    assert!(!recovered.runtime_update.recovery_required);
+    assert_eq!(
+        host.snapshot().background.unwrap().state,
+        ServiceState::Partial
+    );
+    std::fs::remove_file(fixture.profile.join("fixture.mutation-status"))?;
     let removed = host.background(BackgroundAction::Uninstall).await?;
     assert_eq!(removed.state, ServiceState::NotInstalled);
     assert!(fixture.node().join("identity.json").exists());
     Ok(())
 }
 #[tokio::test]
-async fn malformed_mutation_is_reconciled_by_status_without_repeating_the_write() -> Result<()> {
-    let fixture = Fixture::new()?;
-    fixture.initialize()?;
-    let mut host = fixture.open(false)?;
-    host.background(BackgroundAction::Install).await?;
-    privatefs::write_atomic(
-        &fixture.profile.join("fixture.availability"),
-        b"newer_available",
-    )?;
-    privatefs::write_atomic(&fixture.profile.join("fixture.bad-mutation"), b"")?;
-    assert!(host.background(BackgroundAction::Update).await.is_err());
-    let calls = std::fs::read_to_string(fixture.profile.join("fixture.calls"))?;
-    let updates: Vec<_> = calls
-        .lines()
-        .filter(|line| line.ends_with("\tupdate"))
-        .collect();
-    assert_eq!(updates.len(), 1, "unknown mutation is never retried");
-    assert!(updates[0].contains(&format!("--expected-device-id\t{}\tupdate", "a".repeat(64))));
-    assert!(calls.lines().last().unwrap().ends_with("\tstatus"));
-    assert_eq!(
-        host.snapshot()
-            .background
-            .unwrap()
-            .runtime_update
-            .availability,
-        UpdateAvailability::Current
-    );
+async fn failed_mutations_are_reconciled_by_status_without_repeating_the_write() -> Result<()> {
+    for fault in ["fixture.bad-mutation", "fixture.nonzero-mutation"] {
+        let fixture = Fixture::new()?;
+        fixture.initialize()?;
+        let mut host = fixture.open(false)?;
+        host.background(BackgroundAction::Install).await?;
+        privatefs::write_atomic(
+            &fixture.profile.join("fixture.availability"),
+            b"newer_available",
+        )?;
+        privatefs::write_atomic(&fixture.profile.join(fault), b"")?;
+        assert!(host.background(BackgroundAction::Update).await.is_err());
+        let calls = std::fs::read_to_string(fixture.profile.join("fixture.calls"))?;
+        let updates: Vec<_> = calls
+            .lines()
+            .filter(|line| line.ends_with("\tupdate"))
+            .collect();
+        assert_eq!(updates.len(), 1, "unknown mutation is never retried");
+        assert!(updates[0].contains(&format!("--expected-device-id\t{}\tupdate", "a".repeat(64))));
+        assert!(calls.lines().last().unwrap().ends_with("\tstatus"));
+        let reconciled = host.snapshot().background.unwrap();
+        assert_eq!(
+            reconciled.runtime_update.availability,
+            UpdateAvailability::Current
+        );
+        assert_eq!(reconciled.identity(), Some(fixture.identity()));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn legal_status_does_not_confirm_an_unfinished_background_action() -> Result<()> {
+    for (action, argument, state, service_running, core_status) in [
+        (
+            BackgroundAction::Install,
+            "install",
+            "installed",
+            Some(true),
+            Some("unavailable"),
+        ),
+        (BackgroundAction::Install, "install", "conflict", None, None),
+        (
+            BackgroundAction::Install,
+            "install",
+            "partial",
+            Some(true),
+            Some("running"),
+        ),
+        (
+            BackgroundAction::Start,
+            "start",
+            "installed",
+            Some(true),
+            Some("unavailable"),
+        ),
+        (BackgroundAction::Start, "start", "conflict", None, None),
+        (
+            BackgroundAction::Start,
+            "start",
+            "partial",
+            Some(true),
+            Some("running"),
+        ),
+        (
+            BackgroundAction::Stop,
+            "stop",
+            "installed",
+            Some(true),
+            Some("running"),
+        ),
+        (
+            BackgroundAction::Stop,
+            "stop",
+            "installed_stopped",
+            Some(false),
+            Some("unavailable"),
+        ),
+        (
+            BackgroundAction::Stop,
+            "stop",
+            "partial",
+            Some(false),
+            Some("stopped"),
+        ),
+    ] {
+        let fixture = Fixture::new()?;
+        fixture.initialize()?;
+        let mut host = fixture.open(false)?;
+        if action != BackgroundAction::Install {
+            host.background(BackgroundAction::Install).await?;
+            if action == BackgroundAction::Start {
+                host.background(BackgroundAction::Stop).await?;
+            }
+        }
+        let wire = serde_json::json!({
+            "state":state, "device_id":"a".repeat(64), "data_dir":fixture.node(),
+            "service_id":"fixture.service", "managed_root":fixture.profile.join("managed"),
+            "service_running":service_running, "core_status":core_status,
+            "runtime_update":{"bundled_version":"2.0.0","installed_version":"2.0.0",
+                "running_version":(service_running == Some(true) && core_status == Some("running"))
+                    .then_some("2.0.0"),
+                "availability":"current","recovery_required":false}
+        });
+        // This counterexample must remain a legitimate observation with the expected identity.
+        let observed: host::ManagedNodeStatus = serde_json::from_value(wire.clone())?;
+        observed.validate()?;
+        assert_eq!(observed.identity(), Some(fixture.identity()));
+        privatefs::write_atomic(
+            &fixture.profile.join("fixture.mutation-status"),
+            &serde_json::to_vec(&wire)?,
+        )?;
+        privatefs::write_atomic(&fixture.profile.join("fixture.calls"), b"")?;
+        let error = host.background(action).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(if action == BackgroundAction::Stop {
+                    "后台节点停止尚未确认"
+                } else {
+                    "后台节点启动尚未确认"
+                })
+        );
+        let calls = std::fs::read_to_string(fixture.profile.join("fixture.calls"))?;
+        let calls: Vec<_> = calls.lines().collect();
+        assert_eq!(
+            calls.len(),
+            3,
+            "one preflight, one mutation, one reconciliation"
+        );
+        assert!(calls[0].ends_with("\tstatus"));
+        assert!(calls[1].ends_with(&format!(
+            "\t--expected-device-id\t{}\t{argument}",
+            fixture.identity().device_id
+        )));
+        assert!(calls[2].ends_with("\tstatus"));
+        assert_eq!(
+            std::fs::read_to_string(fixture.profile.join("fixture.last-action"))?,
+            argument
+        );
+        let reconciled = host.snapshot().background.unwrap();
+        assert_eq!(reconciled.identity(), Some(fixture.identity()));
+        assert_eq!(
+            reconciled.core_status,
+            Some(if action == BackgroundAction::Stop {
+                NodeStatus::Stopped
+            } else {
+                NodeStatus::Running
+            })
+        );
+    }
     Ok(())
 }
 

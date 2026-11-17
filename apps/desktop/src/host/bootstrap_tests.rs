@@ -98,10 +98,11 @@ struct Fixture {
 impl Fixture {
     fn new() -> Result<Self> {
         let root = std::env::temp_dir().join(format!("vf-bootstrap-{}", uuid::Uuid::new_v4()));
+        privatefs::create_dir(&root)?;
+        let root = std::fs::canonicalize(root)?;
         let profile = root.join("profile");
         let runtime = root.join("runtime");
         let node = identity(&profile.join("node"));
-        privatefs::create_dir(&root)?;
         privatefs::create_dir(&profile)?;
         privatefs::create_dir(&runtime)?;
         privatefs::create_dir(&node.data_dir)?;

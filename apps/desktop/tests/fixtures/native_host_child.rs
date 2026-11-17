@@ -213,6 +213,16 @@ fn main() {
             }
             _ => panic!("unexpected CLI action"),
         }
+        if action != "status" && profile.join("fixture.nonzero-mutation").exists() {
+            std::process::exit(1);
+        }
+        if action != "status" && profile.join("fixture.mutation-status").exists() {
+            println!(
+                "{}",
+                fs::read_to_string(profile.join("fixture.mutation-status")).unwrap()
+            );
+            return;
+        }
         if action != "status" && profile.join("fixture.bad-mutation").exists() {
             println!("{{broken");
             return;

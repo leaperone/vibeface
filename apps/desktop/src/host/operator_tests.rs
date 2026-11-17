@@ -118,10 +118,12 @@ impl Fixture {
     async fn new() -> Result<Self> {
         let key = uuid::Uuid::new_v4().simple().to_string();
         let root = std::env::temp_dir().join(format!("vfo-{}", &key[..12]));
+        privatefs::create_dir(&root)?;
+        let root = std::fs::canonicalize(root)?;
         let profile = root.join("profile");
         let runtime = root.join("runtime");
         let node = profile.join("node");
-        for path in [&root, &profile, &runtime, &node] {
+        for path in [&profile, &runtime, &node] {
             privatefs::create_dir(path)?;
         }
         let identity = NodeIdentity {

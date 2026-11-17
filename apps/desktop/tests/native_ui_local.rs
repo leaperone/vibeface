@@ -261,9 +261,11 @@ impl Drop for Fixture {
 impl Fixture {
     async fn new() -> Result<(Self, host::DesktopHost)> {
         let root = std::env::temp_dir().join(format!("vf-local-profiles-{}", uuid::Uuid::new_v4()));
+        privatefs::create_dir(&root)?;
+        let root = std::fs::canonicalize(root)?;
         let profile = root.join("profile");
         let runtime = root.join("runtime");
-        for directory in [&root, &profile, &runtime] {
+        for directory in [&profile, &runtime] {
             privatefs::create_dir(directory)?;
         }
         let mut host = host::DesktopHost::open(profile.clone(), runtime.clone(), true)?;
