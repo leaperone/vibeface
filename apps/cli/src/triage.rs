@@ -5,17 +5,17 @@
 
 use anyhow::{Context, Result};
 use clap::ValueEnum;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
-use vibeface_control::observation::{hex32, question_lines};
+pub use vibeface_control::observation::{HookEvent, Source};
+use vibeface_control::observation::{Kind, RequestKind, hex32, question_lines};
+use vibeface_control::provider::Provider as WireProvider;
 
 pub const HOOK_ANSWER_WITHIN_SECS: u64 = 30;
 pub const SPOOL_DIR: &str = "hook-spool";
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum Provider {
     #[default]
     Codex,
@@ -23,6 +23,18 @@ pub enum Provider {
     Claude,
     Pi,
     Opencode,
+}
+
+impl From<Provider> for WireProvider {
+    fn from(provider: Provider) -> Self {
+        match provider {
+            Provider::Codex => Self::Codex,
+            Provider::Cursor => Self::Cursor,
+            Provider::Claude => Self::Claude,
+            Provider::Pi => Self::Pi,
+            Provider::Opencode => Self::Opencode,
+        }
+    }
 }
 
 impl Provider {
@@ -79,63 +91,11 @@ pub enum Watch {
     },
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Source {
-    #[default]
-    Hook,
-    AppServer,
-    SessionScan,
-    Test,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Kind {
-    #[default]
-    TurnEnd,
-    NeedsInput,
-    Notification,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RequestKind {
-    Permission,
-    Question,
-    Continue,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct AgentEvent {
-    pub schema_version: u32,
-    pub event_id: String,
-    pub source: Source,
-    pub host: String,
-    pub node: String,
-    pub agent: Provider,
-    pub event: Kind,
-    pub status: Option<String>,
-    pub session_id: String,
-    pub turn_id: String,
-    pub cwd: String,
-    pub repo: Option<String>,
-    pub git_branch: Option<String>,
-    pub git_head: Option<String>,
-    pub last_message: String,
-    pub detail: String,
-    pub ts_ms: i64,
-    pub test: bool,
-    pub request_id: Option<String>,
-    pub hold: Option<RequestKind>,
-}
-
 fn string(input: &Value, key: &str) -> String {
     input[key].as_str().unwrap_or_default().to_owned()
 }
 
-pub fn from_hook(agent: Provider, input: &Value, transcript_bytes: u64) -> Option<AgentEvent> {
+pub fn from_hook(agent: Provider, input: &Value, transcript_bytes: u64) -> Option<HookEvent> {
     match agent {
         Provider::Codex => from_codex_hook(input),
         Provider::Claude => from_claude_hook(input, transcript_bytes),
@@ -145,15 +105,15 @@ pub fn from_hook(agent: Provider, input: &Value, transcript_bytes: u64) -> Optio
     }
 }
 
-fn from_codex_hook(input: &Value) -> Option<AgentEvent> {
+fn from_codex_hook(input: &Value) -> Option<HookEvent> {
     let (event, status, detail) = match input["hook_event_name"].as_str()? {
         "Stop" => (Kind::TurnEnd, Some("completed".to_owned()), String::new()),
         "PermissionRequest" => (Kind::NeedsInput, None, string(input, "tool_name")),
         _ => return None,
     };
-    Some(AgentEvent {
+    Some(HookEvent {
         source: Source::Hook,
-        agent: Provider::Codex,
+        agent: Provider::Codex.into(),
         event,
         status,
         session_id: string(input, "session_id"),
@@ -192,7 +152,7 @@ fn describe_request(input: &Value) -> String {
     )
 }
 
-fn from_claude_hook(input: &Value, transcript_bytes: u64) -> Option<AgentEvent> {
+fn from_claude_hook(input: &Value, transcript_bytes: u64) -> Option<HookEvent> {
     let (event, status, detail) = match input["hook_event_name"].as_str()? {
         "Stop" => (Kind::TurnEnd, Some("completed".to_owned()), String::new()),
         "StopFailure" => (
@@ -226,9 +186,9 @@ fn from_claude_hook(input: &Value, transcript_bytes: u64) -> Option<AgentEvent> 
     } else {
         format!("tx:{transcript_bytes}")
     };
-    Some(AgentEvent {
+    Some(HookEvent {
         source: Source::Hook,
-        agent: Provider::Claude,
+        agent: Provider::Claude.into(),
         event,
         status,
         session_id: string(input, "session_id"),
@@ -241,16 +201,16 @@ fn from_claude_hook(input: &Value, transcript_bytes: u64) -> Option<AgentEvent> 
     })
 }
 
-fn from_pi_extension(input: &Value) -> Option<AgentEvent> {
+fn from_pi_extension(input: &Value) -> Option<HookEvent> {
     let (status, detail) = match input["stop_reason"].as_str()? {
         "stop" => ("completed", String::new()),
         "length" => ("failed", "pi stopped at the model's output limit".into()),
         "error" => ("failed", string(input, "error")),
         _ => return None,
     };
-    Some(AgentEvent {
+    Some(HookEvent {
         source: Source::Hook,
-        agent: Provider::Pi,
+        agent: Provider::Pi.into(),
         event: Kind::TurnEnd,
         status: Some(status.into()),
         session_id: string(input, "session_id"),
@@ -263,7 +223,7 @@ fn from_pi_extension(input: &Value) -> Option<AgentEvent> {
     })
 }
 
-fn from_opencode_plugin(input: &Value) -> Option<AgentEvent> {
+fn from_opencode_plugin(input: &Value) -> Option<HookEvent> {
     let request = || input["request_id"].as_str().filter(|id| !id.is_empty());
     let (event, status, turn_id, detail, hold) = match input["event"].as_str()? {
         "session.idle" => {
@@ -300,9 +260,9 @@ fn from_opencode_plugin(input: &Value) -> Option<AgentEvent> {
         ),
         _ => return None,
     };
-    Some(AgentEvent {
+    Some(HookEvent {
         source: Source::Hook,
-        agent: Provider::Opencode,
+        agent: Provider::Opencode.into(),
         event,
         status: status.map(String::from),
         session_id: string(input, "session_id"),
@@ -467,10 +427,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn raw_hooks_normalize_to_literal_wire_without_trusted_fields() {
+        let event = from_hook(
+            Provider::Codex,
+            &json!({
+                "hook_event_name":"Stop","session_id":"s","turn_id":"t","cwd":"/p",
+                "last_assistant_message":"done","unknown_provider_field":1,
+                "node":"forged","request_id":"forged","host":"forged","event_id":"forged"
+            }),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            json!({
+                "source":"hook","agent":"codex","event":"turn_end","status":"completed",
+                "session_id":"s","turn_id":"t","cwd":"/p","repo":null,
+                "git_branch":null,"git_head":null,"last_message":"done","detail":"",
+                "ts_ms":0,"test":false,"hold":null
+            })
+        );
+        let permission = from_hook(Provider::Claude, &json!({"hook_event_name":"PermissionRequest","session_id":"s","tool_name":"Bash","tool_input":{"command":"ls"}}), 42).unwrap();
+        assert_eq!(permission.turn_id, "tx:42:4ee223773504b973533233930dbdd57f");
+        assert_eq!(permission.hold, Some(RequestKind::Permission));
+        assert_eq!(
+            permission.detail,
+            r#"Bash. Answer with {"behavior":"allow"} or {"behavior":"deny","message":"WHY"}."#
+        );
+        assert!(from_hook(Provider::Cursor, &json!({"hook_event_name":"Stop"}), 0).is_none());
+        assert!(Provider::Cursor.watch().is_none());
+        let codex_permission = from_hook(
+            Provider::Codex,
+            &json!({"hook_event_name":"PermissionRequest","session_id":"s","tool_name":"Bash"}),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            (codex_permission.event, codex_permission.hold),
+            (Kind::NeedsInput, None)
+        );
+        for provider in Provider::ALL {
+            let wire = WireProvider::from(provider);
+            assert_eq!(wire.name(), provider.name());
+        }
+    }
+
+    #[test]
     fn hook_mapping_preserves_provider_specific_fields() {
         let event = from_hook(Provider::Codex, &json!({"hook_event_name":"Stop","session_id":"s","turn_id":"t","cwd":"/p","last_assistant_message":"done"}), 0).unwrap();
         assert_eq!(event.status.as_deref(), Some("completed"));
-        assert_eq!(event.agent, Provider::Codex);
+        assert_eq!(event.agent, WireProvider::Codex);
         let event = from_hook(
             Provider::Pi,
             &json!({"stop_reason":"length","session_id":"s","turn_id":"t","cwd":"/p"}),

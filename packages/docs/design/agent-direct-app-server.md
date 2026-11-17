@@ -157,14 +157,16 @@ Codex Bot 在 App Server 上的协调回合总是用 `sandboxMode=danger-full-ac
 
 `vibeface hook` 从 stdin 读 hook 输入，补上 git 分支和提交，POST 到本机 Node 的 `/api/hooks`。该路由只在本机监听器上，只接受回环地址、没有 `Origin` 和转发头、并带所有者 bearer 的 JSON 请求：`vibeface hook` 读取数据目录私有的 `local-access.json`，按其中记录的 origin 发请求并附 capability，浏览器跨站请求和读不到该目录的进程一律拒绝；同一 OS 账户的完整 Shell 不在此隔离之内。Node 不在线时写入数据目录的 `hook-spool/`，Node 每次扫描（启动 5 秒后，之后每 5 分钟）时读入。Node 第一次见到启动前就存在的 rollout 文件时从文件末尾开始读，不把历史当新事件。hook 总是以 0 退出，连接超时 2 秒，上报总超时 5 秒；事件带 `hold`（会话挂着请求等回答：Claude Code 的 `PermissionRequest`、pi 的回合结束、OpenCode 的 `permission.asked` 和 `question.asked`）时，hook 再向 `/api/hooks/wait` 等最多 40 秒，Node 给这类请求的回答期限是 30 秒（`HOOK_ANSWER_WITHIN`）。
 
-统一事件格式（schema_version 1）：
+Core 封装后的存储与脱敏输出格式（普通事件 schema_version 1）：
 
 ```text
 { schema_version, event_id, source, host, node, agent, event, status, session_id, turn_id,
   cwd, repo, git_branch, git_head, last_message, detail, ts_ms, test, request_id, hold }
 ```
 
-- `agent`：`codex`、`claude`、`pi` 或 `opencode`。`event`：`turn_end`、`needs_input`、`notification`。`status`：`completed`、`failed`、`interrupted` 或空。
+外部 `/api/hooks`、CLI dry-run 和离线 spool 使用共享 `HookEvent`：上述格式去掉 `schema_version`、`event_id`、`node`、`host`、`request_id` 五个字段，共 15 字段；外部发送这五个字段（即使为空）会被拒绝。Core 用本机身份封装，只有已捕获的活请求才能绑定 `request_id`。`_request` 是单独的不可信请求描述，不携带传输或回答权限。离线 spool 清除 `hold` 与 `_request`，恢复不会重建活请求。
+
+- `agent`：`codex`、`cursor`、`claude`、`pi` 或 `opencode`；Cursor 当前没有 hook 适配器。`event`：`turn_end`、`needs_input`、`notification`。`status`：`completed`、`failed`、`interrupted` 或空。
 - `event_id = sha256(node, agent, session_id, turn_key, event)` 的前 32 个十六进制字符。`turn_key` 是回合编号；Claude 没有回合编号，用 transcript 的字节长度。同一回合从 hook、App Server 和扫描进来得到同一个 `event_id`，只处理一次。
 - `last_message` 最多 4000 字，`detail` 最多 2000 字。
 
