@@ -46,6 +46,9 @@ CRATES = {
     "delivery": "vibeface-delivery",
 }
 WEB_UNIT_TEST = re.compile(r"apps/app/src/(?:lib/[^/]+|features/[^/]+/[^/]+)\.test\.ts")
+RELEASE_TOOL_PATHS = ("scripts/release-contract.mjs", "scripts/release-metadata.mjs", "scripts/test-release-contract.mjs",
+                      "scripts/fixtures/release-contract.json", "scripts/build-desktop.mjs", "scripts/verify-desktop.mjs",
+                      "scripts/package-npm.mjs", "scripts/publish-npm.mjs", "scripts/sealed-runtime.mjs")
 PATH_RULES = (
     ("delivery", ("crates/delivery/*", "crates/delivery/proof/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "apps/core/src/delivery/*", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/net/mesh/record.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/verify-delivery-protected.py", "scripts/verify-delivery-restart-observer.py")),
     ("full", ('scripts/release_format.py', 'scripts/release_context.py', 'scripts/release_source.py', 'scripts/release_archive.py', 'scripts/release_inventory.py', 'scripts/release_github.py', 'scripts/release_publisher.py', 'scripts/release_assembly.py', "scripts/tests/release/*", "scripts/tests/__init__.py")),
@@ -109,7 +112,9 @@ def local_process_modes(paths, full):
 def make_plan(paths, event="pull_request", ref_type="branch", channel="hourly", *, package_policy="standard"):
     scopes = set()
     for path in paths:
-        if WEB_UNIT_TEST.fullmatch(path):
+        if path in RELEASE_TOOL_PATHS:
+            scopes.add("release-tools")
+        elif WEB_UNIT_TEST.fullmatch(path):
             scopes.add("web-tests")
         elif path.startswith("apps/app/") and path.endswith((".test.ts", ".test.tsx")):
             scopes.add("full")
@@ -127,7 +132,7 @@ def make_plan(paths, event="pull_request", ref_type="branch", channel="hourly", 
 
 def scope_plan(scopes, event, ref_type, channel, *, package_policy="standard"):
     if (
-        scopes - {"full", "docs", "web", "web-tests", "www", "mobile", "desktop", *DEPENDENTS}
+        scopes - {"full", "docs", "release-tools", "web", "web-tests", "www", "mobile", "desktop", *DEPENDENTS}
         or event not in {"pull_request", "push", "schedule", "workflow_dispatch", "merge_group"}
         or ref_type not in {"branch", "tag"}
         or channel not in {"stable", "rc", "hourly"}
@@ -160,7 +165,7 @@ def scope_plan(scopes, event, ref_type, channel, *, package_policy="standard"):
         "full": full,
         "extended": extended,
         "check_msrv": bool(packages) and extended,
-        "docs_only": not crypto and not packages and not mobile and not desktop,
+        "docs_only": not crypto and not packages and not mobile and not desktop and "release-tools" not in scopes,
         "event": event,
         "package_policy": package_policy,
         "ref_type": ref_type,
@@ -549,8 +554,25 @@ def self_test():
     assert make_plan(["README.zh-CN.md", "apps/core/src/api.rs"])["rust_packages"] == ["vibeface-core"]
     for path in ("README.zh-CN.md.rs", ".agents/skills/release/SKILL.md", "scripts/release.py", "scripts/hourly.py",
                  'scripts/release_format.py', 'scripts/release_context.py', 'scripts/release_source.py', 'scripts/release_archive.py', 'scripts/release_inventory.py', 'scripts/release_github.py', 'scripts/release_publisher.py', 'scripts/release_assembly.py', "scripts/tests/release/test_cli.py", "scripts/tests/release/test_publisher.py", "scripts/tests/release/test_source.py",
-                 "apps/desktop/build/installer.nsi", "scripts/build-desktop.mjs"):
+                 "apps/desktop/build/installer.nsi"):
         assert make_plan([path])["full"]
+    for path in RELEASE_TOOL_PATHS:
+        selected = make_plan([path])
+        assert selected["required_jobs"] == ["quick-check"] and not selected["full"] and not selected["docs_only"]
+        assert not selected["desktop"] and not selected["web"] and not selected["local_process_modes"]
+    # Linux import fixtures do not exercise Windows ACL/signing: keep the original full gates.
+    required_full = ["quick-check", "crypto-web", "web", "mobile-check", "desktop-check",
+                     "rust-check", "rust-fast", "delivery", "package", "www"]
+    for path in ("scripts/windows-signing.mjs", "scripts/private-control.mjs"):
+        selected = make_plan([path])
+        assert selected["full"] and not selected["docs_only"] and selected["required_jobs"] == required_full
+    # A quick-only Node path does not imply the complete AUTO19 change is quick-only.
+    auto19_paths = [*(path for path in RELEASE_TOOL_PATHS if path != "scripts/sealed-runtime.mjs"), ".github/workflows/ci.yml", ".github/workflows/npm-publish.yml",
+                    ".preflight.toml", "packages/docs/design/release-modules.md", "scripts/ci.py",
+                    "scripts/hourly.py", "scripts/test_release_trains.py", "scripts/check-release-workflow.py"]
+    assert len(auto19_paths) == 16
+    selected = make_plan(auto19_paths)
+    assert selected["full"] and not selected["docs_only"] and selected["required_jobs"] == required_full
     assert docs["local_process_modes"] == [] and www["local_process_modes"] == []
     assert make_plan(["apps/core/src/store/bot_settings.rs"])["local_process_modes"] == ["memory-sync", "phase5"]
     assert make_plan(["apps/core/src/agent_context.rs"])["local_process_modes"] == ["memory-sync", "chat-agent"]

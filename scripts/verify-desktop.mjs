@@ -6,49 +6,25 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { PLATFORMS, platformFor, DESKTOP_SCHEMA as SCHEMA_VERSION, SIGNING_STATES, parseReleaseVersion, programNames, desktopPayloadNames, validateBuildInfoShape } from './release-contract.mjs';
+import { readContracts, readOwnVersion, readNativeUi } from './release-metadata.mjs';
 import { hash, relativeFiles, readSealedRuntime } from './sealed-runtime.mjs';
 import { inspectAuthenticode, requireAuthenticode } from './windows-signing.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
-const NATIVE_UI = { ui: 'gpui', gpui_kit: '0.9.1', gpui: '0.3.12' };
-const SCHEMA_VERSION = 2;
-const SIGNING_STATES = ['developer-id-notarized', 'authenticode', 'unsigned-development-preview', 'platform-checksums'];
-const PLATFORMS = {
-  'aarch64-apple-darwin': { installer: 'dmg', exe: '', signing: 'developer-id-notarized' },
-  'x86_64-pc-windows-msvc': { installer: 'exe', exe: '.exe', signing: 'authenticode' },
-  'x86_64-unknown-linux-gnu': { installer: 'AppImage', exe: '', signing: 'platform-checksums' },
-  'aarch64-unknown-linux-gnu': { installer: 'AppImage', exe: '', signing: 'platform-checksums' },
-};
-
 const run = (program, args, options = {}) =>
   execFileSync(program, args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, ...options });
 
-function releaseVersion(version) {
-  assert(typeof version === 'string' && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-(hourly\.\d{10}|rc\.[1-9]\d*))?$/.test(version),
-    'invalid component release version');
-  return version;
-}
-
-function readRuntimeInfo(runtime) {
+function readRuntimeInfo(runtime, contracts) {
   const info = JSON.parse(fs.readFileSync(path.join(runtime, 'BUILD-INFO.json'), 'utf8'));
-  assert.deepEqual(Object.keys(info).sort(), ['version', 'target', 'source_commit', 'update_protocol', 'data_epoch',
-    'core_version', 'core_source_commit', 'app_version', 'app_source_commit'].sort(), 'unsupported build info fields');
-  for (const field of ['version', 'core_version', 'app_version']) releaseVersion(info[field]);
-  for (const field of ['source_commit', 'core_source_commit', 'app_source_commit']) {
-    assert(typeof info[field] === 'string' && /^[a-f0-9]{40}$/.test(info[field]), 'invalid component source commit');
-  }
-  const control = fs.readFileSync(path.join(repo, 'crates/control/src/lib.rs'), 'utf8');
-  for (const [field, constant] of [['data_epoch', 'DATA_EPOCH'], ['update_protocol', 'UPDATE_PROTOCOL']]) {
-    const expected = Number(new RegExp(`pub const ${constant}: u32 = (\\d+);`).exec(control)?.[1]);
-    assert(Number.isSafeInteger(expected) && info[field] === expected, 'unsupported runtime protocol or data epoch');
-  }
+  validateBuildInfoShape(info, contracts);
   return info;
 }
 
-function readReceipt(input, target, version) {
-  const platform = PLATFORMS[target];
+function readReceipt(input, target, version, nativeUi) {
+  const platform = platformFor(target);
   const base = `vibeface-desktop-${version}-${target}`;
-  const payloads = [`${base}.${platform.installer}`, `${base}.zip`];
+  const payloads = desktopPayloadNames(version, target);
   const expected = [`${base}.provenance.json`, ...payloads.flatMap(name => [name, `${name}.sha256`])].sort();
   assert.deepEqual(relativeFiles(input).filter(name => name !== 'release.json'), expected,
     'the desktop asset set is incomplete or carries extra files');
@@ -59,10 +35,10 @@ function readReceipt(input, target, version) {
   assert.equal(receipt.app, 'desktop');
   assert.equal(receipt.target, target);
   assert.equal(receipt.version, version);
-  releaseVersion(version);
+  parseReleaseVersion(version);
   assert.equal(receipt.tag, `desktop-v${version}`);
-  assert.equal(receipt.channel, version.includes('-hourly.') ? 'hourly' : version.includes('-rc.') ? 'rc' : 'stable');
-  for (const [key, value] of Object.entries(NATIVE_UI)) assert.equal(receipt[key], value, 'the desktop application must ship the pinned native GPUI version');
+  assert.equal(receipt.channel, parseReleaseVersion(version).channel);
+  for (const [key, value] of Object.entries(nativeUi)) assert.equal(receipt[key], value, 'the desktop application must ship the pinned native GPUI version');
   assert(/^[a-f0-9]{40}$/.test(receipt.source_commit), 'invalid desktop source commit');
   assert(SIGNING_STATES.includes(receipt.signing) && typeof receipt.signed === 'boolean', 'invalid desktop signing status');
   assert.equal(receipt.signed, ['developer-id-notarized', 'authenticode'].includes(receipt.signing), 'desktop signing status and signed flag disagree');
@@ -70,7 +46,7 @@ function readReceipt(input, target, version) {
   assert(target.endsWith('-unknown-linux-gnu') ? receipt.signing === 'platform-checksums' : receipt.signing !== 'platform-checksums',
     'desktop signing status does not match its platform');
   assert.deepEqual(Object.keys(receipt.runtime).sort(), ['version', 'source_commit', 'archive', 'sha256'].sort(), 'unsupported desktop runtime fields');
-  releaseVersion(receipt.runtime.version);
+  parseReleaseVersion(receipt.runtime.version);
   assert(typeof receipt.runtime.source_commit === 'string' && /^[a-f0-9]{40}$/.test(receipt.runtime.source_commit), 'invalid runtime source commit');
   assert.equal(receipt.runtime.archive, `vibeface-${receipt.runtime.version}-${target}.tar.gz`, 'the runtime must be this platform CLI bundle');
   assert(/^[a-f0-9]{64}$/.test(receipt.runtime.sha256), 'invalid runtime digest');
@@ -105,8 +81,8 @@ function verifyNativeBinary(executable, target) {
 }
 
 /** The packaged application layout and the sealed runtime it carries, after any signing. */
-function verifyApplication(root, target, receipt) {
-  const platform = PLATFORMS[target];
+function verifyApplication(root, target, receipt, contracts) {
+  platformFor(target);
   const mac = target === 'aarch64-apple-darwin';
   const windows = target === 'x86_64-pc-windows-msvc';
   const application = mac ? path.join(root, 'Vibeface.app') : root;
@@ -134,11 +110,11 @@ function verifyApplication(root, target, receipt) {
     { version: receipt.version, source_commit: receipt.source_commit }, 'the packaged desktop payload identity differs from its receipt');
   const runtime = path.join(resources, 'runtime');
   const sealed = readSealedRuntime(runtime);
-  for (const name of [`vibeface${platform.exe}`, `vibeface-core${platform.exe}`, 'web/index.html',
+  for (const name of [...programNames(target), 'web/index.html',
     'web/vibeface_secure.js', 'web/vibeface_secure_bg.wasm']) {
     assert(sealed.has(name), `the bundled runtime is missing ${name}`);
   }
-  const info = readRuntimeInfo(runtime);
+  const info = readRuntimeInfo(runtime, contracts);
   assert.deepEqual([info.version, info.target, info.source_commit],
     [receipt.runtime.version, target, receipt.runtime.source_commit], 'the bundled runtime differs from the CLI identity in the receipt');
   return { application, resources, runtime, sealed };
@@ -212,15 +188,17 @@ function extract(archive, destination) {
 }
 
 function verify({ target, input, distribution, scratch }) {
-  assert(PLATFORMS[target], `--target must be one of ${Object.keys(PLATFORMS).join(', ')}`);
-  const version = releaseVersion(/^version = "([^"]+)"$/m.exec(fs.readFileSync(path.join(repo, 'apps/desktop/Cargo.toml'), 'utf8'))?.[1]);
-  const { receipt } = readReceipt(input, target, version);
+  platformFor(target);
+  const version = readOwnVersion(repo, 'desktop');
+  const nativeUi = readNativeUi(repo);
+  const contracts = readContracts(repo);
+  const { receipt } = readReceipt(input, target, version, nativeUi);
   assert.equal(receipt.source_commit, run('git', ['rev-parse', 'HEAD'], { cwd: repo }).trim(), 'desktop receipt source does not match this checkout');
   const checksumProtectedLinux = target.endsWith('-unknown-linux-gnu') && receipt.signing === 'platform-checksums';
   assert(!distribution || receipt.signed || checksumProtectedLinux, 'a stable distribution requires a signed application or Linux checksums and provenance');
   assert(receipt.signed || checksumProtectedLinux || receipt.channel !== 'stable', 'a stable channel desktop build must be signed');
   const extracted = extract(path.join(input, `vibeface-desktop-${version}-${target}.zip`), path.join(scratch, 'app'));
-  const packaged = verifyApplication(extracted, target, receipt);
+  const packaged = verifyApplication(extracted, target, receipt, contracts);
   const { application } = packaged;
   const signature = verifySignature(application, target, receipt);
   if (target.endsWith('-unknown-linux-gnu')) {
@@ -229,7 +207,7 @@ function verify({ target, input, distribution, scratch }) {
     const image = path.join(input, `vibeface-desktop-${version}-${target}.AppImage`);
     fs.chmodSync(image, 0o755);
     run(image, ['--appimage-extract'], { cwd: imageRoot });
-    const installed = verifyApplication(path.join(imageRoot, 'squashfs-root'), target, receipt);
+    const installed = verifyApplication(path.join(imageRoot, 'squashfs-root'), target, receipt, contracts);
     assert.deepEqual([...installed.sealed], [...packaged.sealed], 'AppImage runtime differs from portable ZIP');
     assert.equal(hash(path.join(installed.application, 'vibeface')), hash(path.join(application, 'vibeface')), 'AppImage native executable differs from portable ZIP');
   } else if (target.endsWith('-apple-darwin')) {
@@ -237,7 +215,7 @@ function verify({ target, input, distribution, scratch }) {
     fs.mkdirSync(mount);
     run('hdiutil', ['attach', '-readonly', '-nobrowse', '-mountpoint', mount, path.join(input, `vibeface-desktop-${version}-${target}.dmg`)]);
     try {
-      const installed = verifyApplication(mount, target, receipt);
+      const installed = verifyApplication(mount, target, receipt, contracts);
       verifySignature(installed.application, target, receipt);
       assert.deepEqual([...installed.sealed], [...packaged.sealed], 'DMG runtime differs from portable ZIP');
       assert.equal(hash(path.join(installed.application, 'Contents/MacOS/Vibeface')), hash(path.join(application, 'Contents/MacOS/Vibeface')), 'DMG native executable differs from portable ZIP');
@@ -251,6 +229,8 @@ function verify({ target, input, distribution, scratch }) {
 }
 
 function selfTest() {
+  const contracts = Object.freeze({ data_epoch: 1, update_protocol: 1 });
+  const nativeUi = Object.freeze({ ui: 'gpui', gpui_kit: '0.9.1', gpui: '0.3.12' });
   const artifacts = path.join(repo, '.artifacts');
   fs.mkdirSync(artifacts, { recursive: true });
   const scratch = fs.mkdtempSync(path.join(artifacts, 'desktop-verify-'));
@@ -274,7 +254,7 @@ function selfTest() {
       fs.writeFileSync(file, content);
     };
     const buildFixture = (target, changes = {}) => {
-      const platform = PLATFORMS[target];
+      const platform = platformFor(target);
       const mac = target === 'aarch64-apple-darwin';
       const windows = target === 'x86_64-pc-windows-msvc';
       const root = fs.mkdtempSync(path.join(scratch, 'fixture-'));
@@ -319,7 +299,7 @@ function selfTest() {
         .filter(name => name !== 'FILES.sha256').map(name => `${hash(path.join(runtime, name))}  ${name}\n`).join(''));
       const receipt = {
         schema: SCHEMA_VERSION, app: 'desktop', target, version, tag: `desktop-v${version}`, channel: 'hourly',
-        source_commit: commit, ...NATIVE_UI, signed: false,
+        source_commit: commit, ...nativeUi, signed: false,
         signing: target.endsWith('-unknown-linux-gnu') ? 'platform-checksums' : 'unsigned-development-preview',
         runtime: { version: runtimeVersion, source_commit: runtimeCommit, archive: `vibeface-${runtimeVersion}-${target}.tar.gz`, sha256: 'b'.repeat(64) },
         artifacts: {}, ...changes,
@@ -329,45 +309,45 @@ function selfTest() {
 
     for (const target of Object.keys(PLATFORMS)) {
       const { root, receipt, runtime } = buildFixture(target);
-      const verified = verifyApplication(root, target, receipt);
-      assert.deepEqual(readRuntimeInfo(runtime), { version: '2.3.4', target, source_commit: 'b'.repeat(40), data_epoch: 1, update_protocol: 1,
+      const verified = verifyApplication(root, target, receipt, contracts);
+      assert.deepEqual(readRuntimeInfo(runtime, contracts), { version: '2.3.4', target, source_commit: 'b'.repeat(40), data_epoch: 1, update_protocol: 1,
         core_version: '3.4.5-rc.1', core_source_commit: 'c'.repeat(40), app_version: '4.5.6', app_source_commit: 'd'.repeat(40) });
       assert(verified.sealed.size >= 6, `${target} fixture seals its runtime`);
       const host = target.endsWith('-apple-darwin') ? path.join(verified.application, 'Contents/MacOS/Vibeface') : path.join(root, target.includes('-windows-') ? 'Vibeface.exe' : 'vibeface');
       const native = fs.readFileSync(host);
       fs.writeFileSync(host, '#!/bin/sh\nexit 0\n');
-      assert.throws(() => verifyApplication(root, target, receipt), /native executable header/);
+      assert.throws(() => verifyApplication(root, target, receipt, contracts), /native executable header/);
       fs.writeFileSync(host, native);
       fs.appendFileSync(path.join(runtime, 'web/index.html'), 'resigned');
-      assert.throws(() => verifyApplication(root, target, receipt), /changed the sealed runtime file web\/index.html/);
+      assert.throws(() => verifyApplication(root, target, receipt, contracts), /changed the sealed runtime file web\/index.html/);
     }
 
     const { root, receipt, runtime } = buildFixture('aarch64-apple-darwin');
     fs.writeFileSync(path.join(runtime, 'extra.txt'), 'x');
-    assert.throws(() => verifyApplication(root, 'aarch64-apple-darwin', receipt), /changed the set of runtime files/);
+    assert.throws(() => verifyApplication(root, 'aarch64-apple-darwin', receipt, contracts), /changed the set of runtime files/);
     fs.rmSync(path.join(runtime, 'extra.txt'));
-    const originalInfo = readRuntimeInfo(runtime);
+    const originalInfo = readRuntimeInfo(runtime, contracts);
     fs.writeFileSync(path.join(runtime, 'BUILD-INFO.json'),
       `${JSON.stringify({ ...originalInfo, source_commit: 'c'.repeat(40) }, null, 2)}\n`);
     fs.writeFileSync(path.join(runtime, 'FILES.sha256'), relativeFiles(runtime)
       .filter(name => name !== 'FILES.sha256').map(name => `${hash(path.join(runtime, name))}  ${name}\n`).join(''));
-    assert.throws(() => verifyApplication(root, 'aarch64-apple-darwin', receipt), /differs from the CLI identity/);
+    assert.throws(() => verifyApplication(root, 'aarch64-apple-darwin', receipt, contracts), /differs from the CLI identity/);
     const foreignPayload = buildFixture('aarch64-apple-darwin');
     write(path.join(foreignPayload.root, 'Vibeface.app/Contents/Resources/desktop-build.json'),
       JSON.stringify({ version, source_commit: runtimeCommit }));
-    assert.throws(() => verifyApplication(foreignPayload.root, 'aarch64-apple-darwin', foreignPayload.receipt), /desktop payload identity/);
+    assert.throws(() => verifyApplication(foreignPayload.root, 'aarch64-apple-darwin', foreignPayload.receipt, contracts), /desktop payload identity/);
 
     const missing = buildFixture('aarch64-apple-darwin');
     fs.rmSync(path.join(missing.runtime, 'web/vibeface_secure.js'));
     fs.writeFileSync(path.join(missing.runtime, 'FILES.sha256'), relativeFiles(missing.runtime)
       .filter(name => name !== 'FILES.sha256').map(name => `${hash(path.join(missing.runtime, name))}  ${name}\n`).join(''));
-    assert.throws(() => verifyApplication(missing.root, 'aarch64-apple-darwin', missing.receipt),
+    assert.throws(() => verifyApplication(missing.root, 'aarch64-apple-darwin', missing.receipt, contracts),
       /bundled runtime is missing web\/vibeface_secure.js/);
 
     // Asset sets: exact names, honest checksums and a signing status nobody can overstate.
     const assetSet = (target, changes = {}, mutate = () => {}) => {
       const input = fs.mkdtempSync(path.join(scratch, 'assets-'));
-      const platform = PLATFORMS[target];
+      const platform = platformFor(target);
       const base = `vibeface-desktop-${version}-${target}`;
       const artifactDigests = {};
       for (const name of [`${base}.${platform.installer}`, `${base}.zip`]) {
@@ -381,13 +361,13 @@ function selfTest() {
       mutate(input, base);
       return input;
     };
-    for (const target of Object.keys(PLATFORMS)) readReceipt(assetSet(target), target, version);
+    for (const target of Object.keys(PLATFORMS)) readReceipt(assetSet(target), target, version, nativeUi);
     assert.throws(() => readReceipt(assetSet('aarch64-apple-darwin', {}, input =>
-      fs.writeFileSync(path.join(input, 'extra.txt'), 'x')), 'aarch64-apple-darwin', version), /incomplete or carries extra files/);
+      fs.writeFileSync(path.join(input, 'extra.txt'), 'x')), 'aarch64-apple-darwin', version, nativeUi), /incomplete or carries extra files/);
     assert.throws(() => readReceipt(assetSet('aarch64-apple-darwin', {}, (input, base) =>
-      fs.rmSync(path.join(input, `${base}.zip.sha256`))), 'aarch64-apple-darwin', version), /incomplete or carries extra files/);
+      fs.rmSync(path.join(input, `${base}.zip.sha256`))), 'aarch64-apple-darwin', version, nativeUi), /incomplete or carries extra files/);
     assert.throws(() => readReceipt(assetSet('aarch64-apple-darwin', {}, (input, base) =>
-      fs.writeFileSync(path.join(input, `${base}.dmg`), 'changed')), 'aarch64-apple-darwin', version), /payload digest mismatch/);
+      fs.writeFileSync(path.join(input, `${base}.dmg`), 'changed')), 'aarch64-apple-darwin', version, nativeUi), /payload digest mismatch/);
     for (const [label, changes, expected] of [
       ['a faked signature claim', { signed: true }, /signing status and signed flag disagree/],
       ['Authenticode claimed on macOS', { signed: true, signing: 'authenticode' }, /signing kind does not match/],
@@ -398,7 +378,7 @@ function selfTest() {
       ['an invalid runtime source', { runtime: { version: runtimeVersion, source_commit: 'bad', archive: `vibeface-${runtimeVersion}-aarch64-apple-darwin.tar.gz`, sha256: 'b'.repeat(64) } }, /invalid runtime source/],
       ['an extra receipt field', { legacy: true }, /unsupported desktop receipt fields/],
     ]) {
-      assert.throws(() => readReceipt(assetSet('aarch64-apple-darwin', changes), 'aarch64-apple-darwin', version), expected, label);
+      assert.throws(() => readReceipt(assetSet('aarch64-apple-darwin', changes), 'aarch64-apple-darwin', version, nativeUi), expected, label);
     }
     console.log('desktop verification self-test passed: exact asset sets, payload checksums, packaged layout, sealed runtime immutability and honest signing status.');
   } finally {

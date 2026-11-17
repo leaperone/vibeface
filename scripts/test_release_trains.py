@@ -45,6 +45,15 @@ class ReleaseTrains(unittest.TestCase):
             self.assert_changed_inputs('scripts/' + module + '.py', set(release_format.APPS))
         self.assert_changed_inputs('scripts/tests/release/test_cli.py', set())
 
+    def test_node_release_inputs_follow_actual_consumers(self):
+        for name in ('release-contract.mjs', 'release-metadata.mjs'):
+            self.assert_changed_inputs('scripts/' + name, {'cli', 'desktop'})
+        for name in ('windows-signing.mjs', 'private-control.mjs'):
+            self.assert_changed_inputs('scripts/' + name, {'core', 'cli', 'desktop'})
+        self.assert_changed_inputs('scripts/sealed-runtime.mjs', {'desktop'})
+        self.assert_changed_inputs('scripts/test-release-contract.mjs', set())
+        self.assert_changed_inputs('scripts/fixtures/release-contract.json', set())
+
     def test_portable_desktop_zip_accepts_epoch_runtime_files(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

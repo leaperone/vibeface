@@ -4,35 +4,14 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { appendFileSync, readFileSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 
+import { parseReleaseVersion, parseReleaseTag, npmDistTag, compareWithinChannel } from './release-contract.mjs';
+
 const repository = 'leaperone/vibeface';
 const workflow = '.github/workflows/release.yml';
 const producerJob = 'collect';
 const publisherJob = 'publish-cli';
 const registry = 'https://registry.npmjs.org/';
 const packageName = '@leaperone/vibeface';
-
-function hourly(version) {
-  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-hourly\.(\d{10})$/.exec(version);
-  assert(match, 'invalid canonical Hourly version');
-  const [year, month, day, hour] = [match[4].slice(0, 4), match[4].slice(4, 6), match[4].slice(6, 8), match[4].slice(8)];
-  const stamp = `${year}-${month}-${day}T${hour}:00:00Z`;
-  assert(Number(year) > 0 && Number(hour) < 24 && new Date(stamp).toISOString().startsWith(stamp.slice(0, 13)), 'invalid Hourly date');
-  return match.slice(1).map(BigInt);
-}
-
-function releaseVersion(version) {
-  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(hourly)\.(\d{10})|-(rc)\.([1-9]\d*))?$/.exec(version);
-  assert(match, 'invalid canonical CLI version');
-  const channel = match[4] ? 'hourly' : match[6] ? 'rc' : 'latest';
-  if (channel === 'hourly') hourly(version);
-  return { channel, parts: [match[1], match[2], match[3], ...(match[5] || match[7] ? [match[5] ?? match[7]] : [])].map(BigInt) };
-}
-
-function compare(left, right) {
-  const before = releaseVersion(right), after = releaseVersion(left);
-  assert.equal(after.channel, before.channel, 'npm dist-tag must point to its own CLI channel');
-  return after.parts.map((part, index) => part - before.parts[index]).find(part => part !== 0n) ?? 0n;
-}
 
 function github(endpoint, key) {
   const args = ['api', `repos/${repository}/${endpoint}`];
@@ -50,8 +29,7 @@ function completedJob(api, runId, leaf, message) {
 }
 
 function resolveArtifact({ tag, sha, runId, artifactId, workflowRef }, api = github, now = Date.now()) {
-  assert(/^cli-v(0|[1-9][0-9]*)\./.test(tag), 'CLI cli-v tag is required');
-  releaseVersion(tag.slice(5));
+  assert.equal(parseReleaseTag(tag).app, 'cli', 'CLI cli-v tag is required');
   assert(/^[a-f0-9]{40}$/.test(sha), 'full source SHA is required');
   assert(/^[1-9]\d*$/.test(runId), 'current workflow run id is required');
   assert.equal(workflowRef, `${repository}/.github/workflows/${artifactId ? 'release.yml' : 'npm-publish.yml'}@refs/tags/${tag}`,
@@ -112,22 +90,22 @@ async function readRegistry(request = fetch) {
 }
 
 function registryState(packument, version, integrity) {
-  const { channel } = releaseVersion(version);
+  const channel = npmDistTag(parseReleaseVersion(version).channel);
   if (packument === null) return 'absent';
   const object = value => value && typeof value === 'object' && !Array.isArray(value);
   assert(object(packument) && object(packument.versions) && object(packument['dist-tags']), 'invalid npm packument');
   const current = packument.versions[version];
   const latest = packument['dist-tags'][channel];
   if (latest !== undefined) {
-    assert.equal(releaseVersion(latest).channel, channel, 'npm dist-tag must point to its own CLI channel');
+    assert.equal(npmDistTag(parseReleaseVersion(latest).channel), channel, 'npm dist-tag must point to its own CLI channel');
     assert(typeof packument.versions[latest]?.dist?.integrity === 'string', `${channel} points to a missing registry version`);
   }
   if (current !== undefined) {
     assert.equal(current?.dist?.integrity, integrity, 'published version integrity mismatch');
-    return latest !== undefined && compare(latest, version) >= 0n ? 'complete' : 'unreconciled';
+    return latest !== undefined && compareWithinChannel(latest, version) >= 0n ? 'complete' : 'unreconciled';
   }
   // Releases can finish out of order; an older version must not move its dist-tag back.
-  return latest === undefined || compare(version, latest) > 0n ? 'absent' : 'superseded';
+  return latest === undefined || compareWithinChannel(version, latest) > 0n ? 'absent' : 'superseded';
 }
 
 async function publishOnce(version, integrity, { read = readRegistry, publish, pause = sleep, attempts = 60 }) {
@@ -173,7 +151,7 @@ async function selfTest() {
       return key || endpoint.includes('/artifacts/') ? value : { ...value, head_branch: cliTag };
     }), { artifact_id: '11', run_id: '7' });
   }
-  assert.throws(() => resolveArtifact({ ...context, tag: `v${version}` }, api), /CLI cli-v tag/);
+  assert.throws(() => resolveArtifact({ ...context, tag: `v${version}` }, api), /invalid release tag/);
   // A published CLI whose npm job failed is still recoverable by hand.
   assert.deepEqual(resolveArtifact(manual, api), { artifact_id: '11', run_id: '7' });
   assert.throws(() => resolveArtifact({ ...context, artifactId: '' }, api), /calling workflow mismatch/);
@@ -241,8 +219,8 @@ async function selfTest() {
   assert.equal(registryState(packument(newer, false), version, integrity), 'superseded');
   assert.equal(registryState({ versions: {}, 'dist-tags': {} }, version, integrity), 'absent');
   assert.equal(await publishOnce(version, integrity, { read: async () => packument(newer, false), publish: () => assert.fail('superseded must not publish') }), 'superseded');
-  assert.throws(() => hourly('0.0.1-nightly.20261106.1'), /invalid canonical Hourly version/);
-  assert.throws(() => hourly('0.0.1-hourly.2026110624'), /invalid Hourly date/);
+  assert.throws(() => parseReleaseVersion('0.0.1-nightly.20261106.1'), /invalid component release version/);
+  assert.throws(() => parseReleaseVersion('0.0.1-hourly.2026110624'), /invalid hourly date/);
   for (const value of [{}, [], { versions: [], 'dist-tags': {} }, { versions: {}, 'dist-tags': { hourly: 'latest' } }]) {
     assert.throws(() => registryState(value, version, integrity));
   }
@@ -288,9 +266,9 @@ try {
     assert.equal(process.env.GITHUB_REPOSITORY, repository, 'publication only accepts the upstream repository');
     const tag = process.env.RELEASE_TAG ?? '';
     assert.equal(process.env.GITHUB_REF, `refs/tags/${tag}`, 'workflow ref must match the release tag');
-    assert(/^cli-v(0|[1-9][0-9]*)\./.test(tag), 'CLI cli-v tag is required');
-    const version = tag.slice(5);
-    const { channel } = releaseVersion(version);
+    assert.equal(parseReleaseTag(tag).app, 'cli', 'CLI cli-v tag is required');
+    const version = parseReleaseTag(tag).version;
+    const channel = npmDistTag(parseReleaseVersion(version).channel);
     if (command === 'artifact') {
       const result = resolveArtifact({ tag, sha: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID,
         artifactId: process.env.NPM_ARTIFACT_ID, workflowRef: process.env.GITHUB_WORKFLOW_REF });

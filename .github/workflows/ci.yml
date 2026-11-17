@@ -105,9 +105,14 @@ jobs:
         run: |
           node --check scripts/crypto-client.mjs
           node --check apps/cli/npm/bin/vibeface.mjs
+          node --check scripts/release-contract.mjs
+          node --check scripts/release-metadata.mjs
+          node --check scripts/test-release-contract.mjs
+          node --check scripts/publish-npm.mjs
           node --check scripts/package-npm.mjs
           node --check scripts/build-desktop.mjs
           node --check scripts/verify-desktop.mjs
+          node scripts/test-release-contract.mjs --cli-fixtures
           node scripts/package-npm.mjs --self-test
           node scripts/publish-npm.mjs --self-test
           node scripts/build-desktop.mjs --self-test

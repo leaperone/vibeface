@@ -264,7 +264,9 @@ def check_helpers(helpers):
             and 'artifact-ids: ${{ steps.artifact.outputs.artifact_id }}' in npm
             and 'run-id: ${{ steps.artifact.outputs.run_id }}' in npm
             and 'scripts/release.py plan --app cli --tag "$RELEASE_TAG" --require-main --publish' in npm
-            and 'node scripts/publish-npm.mjs artifact' in npm and 'node scripts/publish-npm.mjs publish' in npm,
+            and 'node scripts/publish-npm.mjs artifact' in npm and 'node scripts/publish-npm.mjs publish' in npm
+            and 'parseReleaseTag(process.env.RELEASE_TAG)' in npm and 'npmDistTag(parsed.channel)' in npm
+            and './scripts/release-contract.mjs' in npm,
             'npm must preserve CLI provenance, original artifacts, OIDC and reconciliation')
 
 
@@ -425,6 +427,9 @@ def self_test(entries, helpers, hourly, deployment, deployment_entries):
         ('release-desktop.yml', '--dependency cli', '--dependency core'),
         ('release-desktop.yml', 'actions: read', 'actions: none'),
         ('release-deploy.yml', 'scripts/release-dispatch.py', 'scripts/dispatch-without-wait.py'),
+        ('npm-publish.yml', 'parseReleaseTag(process.env.RELEASE_TAG)', 'parseReleaseTag("cli-v1.2.3")'),
+        ('npm-publish.yml', 'npmDistTag(parsed.channel)', '"latest"'),
+        ('npm-publish.yml', './scripts/release-contract.mjs', './scripts/unvalidated-channel.mjs'),
         ('npm-publish.yml', '--app cli', '--app app'),
         ('npm-publish.yml', 'id-token: write', 'id-token: none'),
         ('npm-publish.yml', 'run-id: ${{ steps.artifact.outputs.run_id }}', 'run-id: 123'),
