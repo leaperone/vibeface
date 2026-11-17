@@ -41,6 +41,9 @@ import { notificationOpenings } from '../../../../../apps/mobile/src/platform/no
 import type { NotificationDestination } from '@vibeface/client/lib/platform.ts'
 import { hookHarness, moduleLoader } from '../../lib/test-harness.ts'
 import { cn } from '../../lib/utils.ts'
+import { createChatDrafts } from '../../../../../apps/mobile/src/platform/chat-drafts.ts'
+import * as conversationCache from '@vibeface/client/workspace/conversation-cache.ts'
+import * as systemNotifications from '@vibeface/client/workspace/system-notifications.ts'
 
 test("bulk inbox actions re-arm focus after an intervening list update", () => {
   const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "pending-section.tsx"), "utf8")
@@ -203,7 +206,7 @@ test("workspace preserves bot and message requests while routing native decision
     transport: { signClient: async (domain: string, payload: string) => { signed.push(`${domain}|${payload}`); return "signature" } },
     storage: browser.localStorage, outbox: memoryOutbox, self: "这个浏览器",
     inputLock: <T,>(name: string, save: () => Promise<T>) => globalThis.navigator.locks.request(name, save),
-    notifier: { name: "浏览器提醒", permission: async () => "default", request: async () => "default", show() {} },
+    notifier: { name: "浏览器提醒", permission: async () => "default", request: async () => "default", async show() {} },
     onForeground: () => () => {}, foreground: () => true,
   }
   const bot = { bot_id: "bot", conversation_id: "chat", name: "Bot", instructions: "处理项目", models: {}, skills: null, avatar: null, avatar_version: null, event_hash: "bot-event", last_message: null, busy: null }
@@ -538,7 +541,7 @@ test("workspace preserves bot and message requests while routing native decision
           const receipt: InputReceipt = { message_id: input.message_id, target: input.target, stage: result === 'unknown' ? 'unknown' : 'entry_accepted', actual_turn_id: null, reason: '原输入已有记录', retry_safe: false, control_event: null }
           let firstQuery = true, holdWrite = true
           connection.rpc = async (method, body = {}) => {
-            if (method === 'workspace_history') return { events: [{ event_hash: 'input-event', created_at_ms: 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { ...item.params, type: 'input_posted' } }], coverage: { limit: 128, truncated: false, scope: 'workspace' } }
+            if (method === 'workspace_history') return { history_authority: 'authority', next_cursor: null, complete: true, events: [{ event_hash: 'input-event', created_at_ms: 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { ...item.params, type: 'input_posted' } }], coverage: { limit: 128, truncated: false, scope: 'workspace' } }
             if (method !== 'input_receipt') return originalRpc(method, body)
             if (firstQuery) { firstQuery = false; return absence }
             return receipt
@@ -701,6 +704,8 @@ test("workspace preserves bot and message requests while routing native decision
         await previousVisit
         assert.equal(render().data?.messages.some((item) => item.message_id === 'wrong-visit'), false)
         held = null
+        await render().selectBot(bot)
+        await render().refresh()
         await render().loadHistory('works')
         assert.equal(render().data?.works.find((item) => item.work_id === 'older-work')?.state, 'running')
         held = deferred()
@@ -1148,7 +1153,7 @@ test("workspace preserves bot and message requests while routing native decision
           commands.push(JSON.parse(JSON.stringify(body))); return creating.promise
         }
         if (method === 'workspace_history') return {
-          events: messages.slice(before).map((message, index) => ({ event_hash: String(message.message_id), created_at_ms: index + 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { ...message, type: 'input_posted' } })),
+          history_authority: 'authority', next_cursor: null, complete: true, events: messages.slice(before).map((message, index) => ({ event_hash: String(message.message_id), created_at_ms: index + 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { ...message, type: 'input_posted' } })),
           coverage: { limit: 128, truncated: false, scope: 'task' },
         }
         return originalRpc(method, body)
@@ -1205,7 +1210,7 @@ test("workspace preserves bot and message requests while routing native decision
             domain = { ...domain, tasks: [{ ...command, root_task_id: command.task_id, revision: 1, action: 'continue', request_event: event, event_hash: event, created_at_ms: 1, updated_at_ms: 1, state: 'not_started' }] }
             return { ...domain, command_id: body.command_id, event_hash: event, duplicate: false }
           }
-          if (method === 'workspace_history') return { events: messages.slice(before).map((message, index) => ({ event_hash: String(message.message_id), created_at_ms: index + 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { ...message, type: 'input_posted' } })), coverage: { limit: 128, truncated: false, scope: 'task' } }
+          if (method === 'workspace_history') return { history_authority: 'authority', next_cursor: null, complete: true, events: messages.slice(before).map((message, index) => ({ event_hash: String(message.message_id), created_at_ms: index + 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { ...message, type: 'input_posted' } })), coverage: { limit: 128, truncated: false, scope: 'task' } }
           return originalRpc(method, body)
         }
         try {
@@ -1253,7 +1258,7 @@ test("workspace preserves bot and message requests while routing native decision
       let delayedMainRead: ReturnType<typeof deferred> | null = null
       let target: InputTarget = { kind: 'task', task_id: 'attachment-task' }
       current.rpc = async (method, body = {}) => {
-        if (method === 'workspace_history') return { events: [{ event_hash: 'attachment-event', created_at_ms: 1, scope_id: otherBot.conversation_id, kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { type: 'input_posted', report_results: true, message_id: 'attachment-input', target, intent: 'continue', sequence: 1, expected_revision: 1, text: '任务附件', attachments: [{ hash, size: bytes.length, name: 'scope.txt' }] } }], coverage: { limit: 128, truncated: false, scope: target.kind === 'task' ? 'task' : 'channel' } }
+        if (method === 'workspace_history') return { history_authority: 'authority', next_cursor: null, complete: true, events: [{ event_hash: 'attachment-event', created_at_ms: 1, scope_id: otherBot.conversation_id, kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { type: 'input_posted', report_results: true, message_id: 'attachment-input', target, intent: 'continue', sequence: 1, expected_revision: 1, text: '任务附件', attachments: [{ hash, size: bytes.length, name: 'scope.txt' }] } }], coverage: { limit: 128, truncated: false, scope: target.kind === 'task' ? 'task' : 'channel' } }
         if (method === 'read_artifact') {
           calls.push(JSON.parse(JSON.stringify(body)))
           if (delayedMainRead) return delayedMainRead.promise
@@ -1320,7 +1325,9 @@ test("workspace preserves bot and message requests while routing native decision
         '@vibeface/client/chat/protocol.ts': { promptIntent, botReach, composerHint }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, messageTimes, taskMessage, unreadCounts },
         '@vibeface/client/workspace/bot-settings.ts': { botCopy }, '@vibeface/client/workspace/inbox.ts': { inboxItems }, '@vibeface/client/workspace/labels.ts': taskLabels,
         '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers }, '@vibeface/client/workspace/storage.ts': { storageOf }, '@vibeface/client/workspace/types.ts': { isSessionNotification: () => false },
-        '@/platform': { mobilePlatform: { storage: browser.localStorage } }, './context': { WorkspaceProvider: 'NativeWorkspace' },
+        '@/platform/remote-notifications': { remoteNotifications: { sync: async () => {} } },
+        'expo-notifications': { setBadgeCountAsync: async () => {}, addPushTokenListener: () => ({ remove() {} }) },
+        '@/platform': { mobilePlatform: { storage: browser.localStorage, onForeground: () => () => {} } }, './context': { WorkspaceProvider: 'NativeWorkspace' },
       }, {}, 'Live')
       type NativeWorkspace = import('../../../../../apps/mobile/src/data/types.ts').Workspace
       const mainSaves: ReturnType<NativeWorkspace['actions']['send']>[] = []
@@ -1456,9 +1463,9 @@ test("workspace preserves bot and message requests while routing native decision
         const mainActions = mobile().actions, originalMainSend = mainActions.send
         mainActions.send = (...args) => { const saved = originalMainSend(...args); mainSaves.push(saved); return saved }
         const composer = () => chat.render('default').find(({ type }) => type === 'Composer')?.props
-        const attach = (uri: string) => { const input = composer()?.onFiles; assert.ok(typeof input === 'function'); const files = [{ uri, name: uri.split('/').at(-1), size: 3 }]; input(files); return files }
+        const attach = (uri: string) => { const input = composer()?.onFiles; assert.ok(typeof input === 'function'); const files = [{ uri, name: uri.split('/').at(-1) ?? 'file', size: 3, mimeType: null }]; input(files); return files }
         const sendDraft = () => { const send = composer()?.onSend; assert.ok(typeof send === 'function'); send() }
-        const storedDraft = () => JSON.parse(stored.get(`vibeface.${networkKey('bot-drafts', 'network')}`) ?? '{}').chat
+        const storedDraft = () => chat.drafts.read({ networkId: 'network', deviceId: 'client', conversationId: 'chat', inputTarget: routine ? `routine:${routine}` : 'main' }).text
         const preparing = deferred(); fileReads.set('file:///first.txt', preparing)
         const sentBefore = messages.length
         composer()?.onChange?.('原草稿仍在准备附件')
@@ -1472,12 +1479,14 @@ test("workspace preserves bot and message requests while routing native decision
         composer()?.onChange?.('后来输入的内容')
         const laterFiles = attach('file:///later.txt')
         sendDraft(); await settleComponent()
-        assert.equal(mainSaves.length, 2, 'editing creates a separate draft that can save while the first is preparing')
+        assert.equal(mainSaves.length, 1, 'the native scope retains edits while the first draft is still preparing')
         preparing.resolve(new Uint8Array([1, 2, 3]).buffer)
         await mainSaves[0]; await settleComponent(); mobile()
         assert.equal(composer()?.value, '后来输入的内容')
-        assert.equal(composer()?.files, laterFiles, 'local acceptance cannot remove attachments selected after submission')
+        assert.deepEqual(JSON.parse(JSON.stringify(composer()?.files)), laterFiles, 'local acceptance cannot remove attachments selected after submission')
         assert.equal(storedDraft(), '后来输入的内容')
+        sendDraft(); sendDraft(); await settleComponent()
+        assert.equal(mainSaves.length, 2, 'the newer draft submits exactly once after the earlier save finishes')
         preparingLater.resolve(new Uint8Array([4, 5, 6]).buffer)
         await mainSaves[1]; await settleComponent(); mobile()
         assert.equal(composer()?.value, '')
@@ -1515,27 +1524,31 @@ test("workspace preserves bot and message requests while routing native decision
         const pendingRoutine = 'schedule:pending-draft'
         routine = pendingRoutine
         chat.render('default'); chat.render('default')
+        assert.equal(composer()?.value, '', 'a routine opens its own durable draft')
+        assert.deepEqual(JSON.parse(JSON.stringify(composer()?.files)), [])
+        composer()?.onChange?.('切换目标仍是独立输入'); attach('file:///options.txt')
         sendDraft(); sendDraft(); await settleComponent()
-        assert.equal(mainSaves.length, optionStart + 2, 'changing only target saves a distinct input with the same text and attachment')
+        assert.equal(mainSaves.length, optionStart + 2, 'another target can prepare its own draft independently')
         routine = undefined
         chat.render('default'); chat.render('default')
         sendDraft(); sendDraft(); await settleComponent()
-        assert.equal(mainSaves.length, optionStart + 3, 'returning to Main preserves a separate input identity')
+        assert.equal(mainSaves.length, optionStart + 2, 'returning to Main cannot duplicate its still-pending input')
         routine = pendingRoutine
         chat.render('default'); chat.render('default')
+        composer()?.onChange?.('当前例行任务草稿'); await settleComponent()
         changingOptions.resolve(new Uint8Array([13, 14, 15]).buffer)
         await Promise.all(mainSaves.slice(optionStart)); await settleComponent(); mobile()
-        assert.equal(composer()?.value, '切换目标仍是独立输入')
-        assert.equal(composer()?.files, optionFiles, 'an earlier target cannot clear the current attachment')
-        assert.equal(storedDraft(), '切换目标仍是独立输入')
+        assert.equal(composer()?.value, '当前例行任务草稿')
+        assert.deepEqual(JSON.parse(JSON.stringify(composer()?.files)), optionFiles, 'an earlier revision cannot clear the current attachment')
+        assert.equal(storedDraft(), '当前例行任务草稿')
         const optionMainTarget = { kind: 'bot_main', bot_id: botA.bot_id }, optionRoutineTarget = { kind: 'routine', bot_id: botA.bot_id, trigger: pendingRoutine }
-        assert.deepEqual(messages.slice(optionMessages).map(message => JSON.stringify([message.target, message.intent])).sort(), [[optionMainTarget, 'continue'], [optionRoutineTarget, 'continue'], [optionMainTarget, 'continue']].map(value => JSON.stringify(value)).sort(), 'chat input steers by default')
-        sendDraft(); await mainSaves.at(-1); await settleComponent(); mobile()
-        assert.equal(mainSaves.length, optionStart + 4)
+        assert.deepEqual(messages.slice(optionMessages).map(message => JSON.stringify([message.target, message.intent])).sort(), [[optionMainTarget, 'continue'], [optionRoutineTarget, 'continue']].map(value => JSON.stringify(value)).sort(), 'chat input steers by default')
+        sendDraft(); await settleComponent(); await mainSaves.at(-1); await settleComponent(); mobile()
+        assert.equal(mainSaves.length, optionStart + 3)
         assert.equal(composer()?.value, '')
         assert.equal(storedDraft(), '', 'the matching target still clears after durable acceptance')
-        assert.deepEqual(messages.slice(optionMessages).map(message => JSON.stringify([message.target, message.intent])).sort(), [[optionMainTarget, 'continue'], [optionRoutineTarget, 'continue'], [optionMainTarget, 'continue'], [optionRoutineTarget, 'continue']].map(value => JSON.stringify(value)).sort())
-        assert.equal(new Set(messages.slice(optionMessages).map(message => message.message_id)).size, 4)
+        assert.deepEqual(messages.slice(optionMessages).map(message => JSON.stringify([message.target, message.intent])).sort(), [[optionMainTarget, 'continue'], [optionRoutineTarget, 'continue'], [optionRoutineTarget, 'continue']].map(value => JSON.stringify(value)).sort())
+        assert.equal(new Set(messages.slice(optionMessages).map(message => message.message_id)).size, 3)
         routine = undefined
         chat.render('default'); chat.render('default')
         mainActions.send = originalMainSend
@@ -1725,7 +1738,7 @@ test("workspace preserves bot and message requests while routing native decision
         await memoryOutbox.put(saved); await render().queryInput(head)
         const rpcConnection = activeConnection, originalRpc = rpcConnection.rpc
         const closeCalls: string[] = []
-        const history = { events: [{ event_hash: 'a'.repeat(64), created_at_ms: 1, scope_id: head.conversation_id, kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { ...messages[before], type: 'input_posted' } }], coverage: { limit: 128, truncated: false, scope: 'workspace' } }
+        const history = { history_authority: 'authority', next_cursor: null, complete: true, events: [{ event_hash: 'a'.repeat(64), created_at_ms: 1, scope_id: head.conversation_id, kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { ...messages[before], type: 'input_posted' } }], coverage: { limit: 128, truncated: false, scope: 'workspace' } }
         rpcConnection.rpc = async (method, body = {}) => { closeCalls.push(method); return method === 'workspace_history' ? history : originalRpc(method, body) }
         let closeWork = Promise.resolve()
         const status = componentHarness('./workspace-chat.tsx', {
@@ -1876,28 +1889,30 @@ test("workspace preserves bot and message requests while routing native decision
   }
 })
 
-function componentHarness(path: string, dependencies: Record<string, unknown>, globals: Record<string, unknown> = {}, privateExport = '', realModules: Record<string, string> = {}) {
-  const hooks = hookHarness(true), { values, effects, afterRender } = hooks
+type Props = Record<string, unknown> & { name?: string; type?: string; role?: string; disabled?: boolean; value?: unknown; onChange?: (event: unknown) => void; onSubmit?: (event?: unknown) => void; onClick?: () => void; action?: () => Promise<unknown> }
+type FixtureElement = { type: unknown; props: Props; key?: string }
+type ComponentFixture = {
+  render(name: string, props?: unknown): FixtureElement[]
+  focus(): void
+  blur(): void
+  close(): void
+  readonly output: unknown
+  module: Record<string, unknown>
+  readonly drafts: ReturnType<typeof createChatDrafts>
+  ownsDraftFile(uri: string): boolean
+}
+
+function componentHarness(path: string, dependencies: Record<string, unknown>, globals: Record<string, unknown> = {}, privateExport = '', realModules: Record<string, string> = {}): ComponentFixture {
+  const hooks = hookHarness(true), { effects, afterRender } = hooks
   const focusEffects = new Map<number, { run: () => (() => void) | void; cleanup?: () => void }>()
-  type Props = Record<string, unknown> & { name?: string; type?: string; role?: string; disabled?: boolean; value?: unknown; onChange?: (event: unknown) => void; onSubmit?: (event?: unknown) => void; onClick?: () => void; action?: () => Promise<unknown> }
   const elements: { type: unknown; props: Props; key?: string }[] = []
   let focused = true, output: unknown
+  let scopedChild: { key?: string; name: string; app: ComponentFixture } | undefined
   const react = {
     ...hooks.react,
     lazy: () => 'Lazy', Suspense: 'Suspense',
     useId: () => 'component',
     useSyncExternalStore: (_subscribe: unknown, snapshot: () => unknown) => snapshot(),
-    useCallback(callback: unknown, dependencies: unknown[]) {
-      const index = hooks.next()
-      const previous = values[index] as { callback: unknown; dependencies: unknown[] } | undefined
-      if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) values[index] = { callback, dependencies }
-      return (values[index] as { callback: unknown }).callback
-    },
-    useMemo(read: () => unknown, dependencies: unknown[]) {
-      const index = hooks.next(), previous = values[index] as { value: unknown; dependencies: unknown[] } | undefined
-      if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) values[index] = { value: read(), dependencies }
-      return (values[index] as { value: unknown }).value
-    },
     useLayoutEffect: hooks.react.useEffect,
   }
   const jsx = (type: unknown, props: Props, key?: string) => { const element = key === undefined ? { type, props } : { type, props, key }; elements.push(element); return element }
@@ -1905,6 +1920,21 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   const module: { exports: Record<string, unknown> } = { exports: {} }
   const draftStorage = new Map<string, string>()
   const platformStorage = { getItem: (key: string) => draftStorage.get(key) ?? null, setItem: (key: string, value: string) => { draftStorage.set(key, value) } }
+  // Keep the real draft repository and hook: only native storage and file ownership are controlled.
+  let draftRevision = 0
+  // Virtual files keep stable URIs, with counted references for independent durable owners.
+  const retainedDraftFiles = new Map<string, number>()
+  const chatDrafts = createChatDrafts({
+    storage: { get: key => draftStorage.get(key), set: (key, value) => { draftStorage.set(key, value) }, remove: key => { draftStorage.delete(key) } },
+    revision: () => `revision-${++draftRevision}`,
+    files: {
+      exists: uri => uri.startsWith('file:') || retainedDraftFiles.has(uri),
+      owns: uri => retainedDraftFiles.has(uri),
+      retain: async file => { retainedDraftFiles.set(file.uri, (retainedDraftFiles.get(file.uri) ?? 0) + 1); return { ...file } },
+      release: uri => { const remaining = (retainedDraftFiles.get(uri) ?? 1) - 1; if (remaining) retainedDraftFiles.set(uri, remaining); else retainedDraftFiles.delete(uri) },
+    },
+  })
+  const nativePureModules = new Set(['@/features/chat/use-chat-draft', '@/platform/reading-position', '@/platform/chat-location', '@/platform/workspace-history', '@/platform/viewport-read', '@/platform/native-workspace-history-cache'])
   const useFocusEffect = (run: () => (() => void) | void) => {
     const index = hooks.next(), previous = focusEffects.get(index)
     if (!previous || previous.run !== run) afterRender.push(() => {
@@ -1915,6 +1945,11 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   const nativeRouterModule = dependencies['expo-router']
   const nativeRouter = typeof nativeRouterModule === 'object' && nativeRouterModule !== null && 'router' in nativeRouterModule ? nativeRouterModule.router : {}
   const require = (specifier: string): unknown => {
+    if (nativePureModules.has(specifier)) return loadComponentModule(fileURLToPath(new URL(`../../../../../apps/mobile/src/${specifier.slice(2)}.ts`, import.meta.url)))
+    if (specifier === './cached') return loadComponentModule(fileURLToPath(new URL('../../../../../apps/mobile/src/data/cached.ts', import.meta.url)))
+    if (specifier === '@vibeface/client/workspace/conversation-cache.ts') return conversationCache
+    if (specifier === '@/platform/native-chat-drafts') return { chatDrafts }
+    if (specifier === '@vibeface/client/workspace/system-notifications.ts') return systemNotifications
     if (realModules[specifier]) return loadComponentModule(fileURLToPath(new URL(realModules[specifier], import.meta.url)))
     if (specifier === '@vibeface/client/lib/byte-codec.ts') return dependencies[specifier] ?? byteCodec
     if (specifier === '@/lib/qr-code') return loadQr(fileURLToPath(new URL('../../lib/qr-code.ts', import.meta.url)))
@@ -1952,7 +1987,10 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     if (specifier === '@tanstack/react-router') return { Link: 'Link', useNavigate: () => () => {}, useRouterState: ({ select }: { select: (state: unknown) => unknown }) => select({ location: { search: {} } }), ...dependencies[specifier] as object }
     return specifier === 'react' ? react : specifier === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : specifier === 'expo-router' ? { Link: 'Link', useFocusEffect, useRouter: () => nativeRouter, ...dependencies[specifier] as object } : dependencies[specifier] ?? ui
   }
-  const loadComponentModule = moduleLoader(createContext({ setTimeout, clearTimeout, ...globals }), specifier => require(specifier))
+  const loadComponentModule = moduleLoader(createContext({ setTimeout, clearTimeout, TextEncoder, TextDecoder, Uint8Array, Error, ...globals }), (specifier, filename) => {
+    if (specifier.startsWith('.') && !specifier.endsWith('.tsx')) return loadComponentModule(resolve(dirname(filename), specifier.endsWith('.ts') ? specifier : `${specifier}.ts`))
+    return require(specifier)
+  })
   const loadQr = moduleLoader(createContext({}), specifier => require(specifier))
   const filename = fileURLToPath(new URL(path, import.meta.url))
   const source = readFileSync(filename, 'utf8') + (privateExport ? `\nexport { ${privateExport} }\n` : '')
@@ -1965,13 +2003,27 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       assert.ok(typeof component === 'function')
       output = component(props)
       afterRender.splice(0).forEach(run => run())
+      if (name === 'ScopedWorkspaceScreen') {
+        const child = elements.find(element => typeof element.type === 'function' && ['ScopedWorkspaceContent', 'OfflineWorkspaceHistory'].includes(element.type.name))
+        if (child && typeof child.type === 'function') {
+          if (!scopedChild || scopedChild.key !== child.key || scopedChild.name !== child.type.name) {
+            scopedChild?.app.close()
+            scopedChild = { key: child.key, name: child.type.name, app: componentHarness(path, dependencies, globals, child.type.name, realModules) }
+          }
+          const nested = scopedChild.app.render(scopedChild.name, child.props)
+          output = scopedChild.app.output
+          return [...elements, ...nested]
+        }
+      }
       return elements
     },
-    focus() { if (!focused) { focused = true; for (const effect of focusEffects.values()) effect.cleanup = effect.run() ?? undefined } },
-    blur() { if (focused) { focused = false; for (const effect of focusEffects.values()) { effect.cleanup?.(); effect.cleanup = undefined } } },
-    close() { for (const effect of [...effects.values(), ...focusEffects.values()]) effect.cleanup?.() },
+    focus() { scopedChild?.app.focus(); if (!focused) { focused = true; for (const effect of focusEffects.values()) effect.cleanup = effect.run() ?? undefined } },
+    blur() { scopedChild?.app.blur(); if (focused) { focused = false; for (const effect of focusEffects.values()) { effect.cleanup?.(); effect.cleanup = undefined } } },
+    close() { scopedChild?.app.close(); for (const effect of [...effects.values(), ...focusEffects.values()]) effect.cleanup?.() },
     get output() { return output },
     module: module.exports,
+    get drafts() { return scopedChild?.app.drafts ?? chatDrafts },
+    ownsDraftFile: uri => scopedChild ? scopedChild.app.ownsDraftFile(uri) : retainedDraftFiles.has(uri),
   }
 }
 
@@ -2949,13 +3001,13 @@ test('composers save each pending draft once and let edited drafts save independ
       ...parityShared(), data: parseConversation({ ...context, works: [parityWork()] }), workspaceState: domain,
       chatSlot: { conversationId: 'chat', missing: false }, fresh: new Set<string>(), interrupted: [], view: 'chat',
       readWork: async () => ({ work: { ...parityWork(), conversation_id: 'chat', target: null, source_events: [] }, coverage: { source: 'shared_history', complete: false } }),
-      readWorkspaceState: async () => domain, readWorkspaceHistory: async () => ({ events: [], coverage: { limit: 128, truncated: false, scope: 'channel' } }),
+      readWorkspaceState: async () => domain, readWorkspaceHistory: async (filter: WorkspaceFilter) => ({ history_authority: 'authority', next_cursor: null, complete: true, events: [], coverage: { limit: 128, truncated: false, scope: filter.task_id ? 'task' : 'channel' } }),
       sendMessage: (text: string, files: ReadableFile[], _sent: unknown, options: InputOptions) => {
         attempts.push({ text, files: files.map((file) => file.name), target: options.target, intent: options.intent })
         const taskId = `created-task-${attempts.length}`
         const save = Promise.all(files.map(async (file) => ({ name: file.name, bytes: Array.from(new Uint8Array(await file.arrayBuffer())) }))).then((attachments) => {
           saved.push({ text, attachments })
-          if (options.intent === 'new_task') options.onSaved?.({ report_results: true, message_id: `input-${taskId}`, conversation_id: 'chat', target: { kind: 'task', task_id: taskId }, intent: 'continue', expected_revision: 1, sequence: attempts.length, text, attachments: [], created_at_ms: 1, delivery: 'saved' })
+          options.onSaved?.({ report_results: true, message_id: `input-${taskId}`, conversation_id: 'chat', target: options.intent === 'new_task' ? { kind: 'task', task_id: taskId } : options.target, intent: 'continue', expected_revision: 1, sequence: attempts.length, text, attachments: [], created_at_ms: 1, delivery: 'saved' })
           return true
         })
         saves.push(save)
@@ -2964,7 +3016,8 @@ test('composers save each pending draft once and let edited drafts save independ
     }
     const app = componentHarness(example.path, {
       '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared },
-      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { network_id: 'network', can_manage: false, source: 'membership' } } }) },
+      '@/data/context': { useWorkspace: () => ({ networkId: 'network', deviceId: 'phone', bots: shared.bots, conversations: {}, members: [], actions: {} }) },
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { network_id: 'network', device_id: 'phone', can_manage: false, source: 'membership' }, isCurrent: () => true } }) },
       '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/lib/node.ts': { providerNames, messageOf }, '@vibeface/client/lib/errors.ts': errors,
       '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
       '@vibeface/client/workspace/bot-settings.ts': { botCopy, folderLabels, placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage },
@@ -2972,7 +3025,8 @@ test('composers save each pending draft once and let edited drafts save independ
       '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) },
       '@/components/kit': { providerIcons: { codex: 'CodexIcon' }, toneText: {} }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
       '@tanstack/react-router': { useNavigate: () => (target: unknown) => { navigations.push(target) } },
-      'expo-router': { Stack: { Screen: 'Screen' }, router: { push: (target: unknown) => { navigations.push(target) } }, useRouter: () => ({ push: (target: unknown) => { navigations.push(target) }, back() {} }) },
+      'react-native': { AppState: { currentState: 'active', addEventListener: () => ({ remove() {} }) } },
+      'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({}), router: { push: (target: unknown) => { navigations.push(target) } }, useRouter: () => ({ push: (target: unknown) => { navigations.push(target) }, back() {} }) },
       'expo-file-system': { File: class { uri: string; constructor(uri: string) { this.uri = uri } arrayBuffer() { return read(this.uri.split('/').at(-1) ?? '') } } },
       'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 0 }) },
       '@/lib/use-run': { useRun: () => ({ busy: null, error: '', run: async (_key: string, action: () => Promise<void>) => action() }) },
@@ -2988,6 +3042,49 @@ test('composers save each pending draft once and let edited drafts save independ
     }
     try {
       render(); await settleComponent()
+      if (example.component === 'ScopedWorkspaceScreen') {
+        const target: InputTarget = example.name.endsWith('Task') ? { kind: 'task', task_id: 'task' } : { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' }
+        const first = pendingResult(); reads.set('first.txt', first)
+        composer().onChange?.('第一份草稿'); attach('first.txt'); await settleComponent()
+        const original = app.drafts.read({ networkId: 'network', deviceId: 'phone', conversationId: 'chat', inputTarget: inputTargetKey(target) })
+        submit(); submit(); await settleComponent()
+        assert.equal(attempts.length, 0, 'native preparation reads the complete attachment before local enqueue')
+        assert.equal(composer().sending, true)
+        const later = pendingResult(); reads.set('later.txt', later)
+        composer().onChange?.('第二份草稿'); attach('later.txt'); await settleComponent(); submit(); await settleComponent()
+        assert.equal(attempts.length, 0, 'one native scope keeps a single preparation while its newer draft remains editable')
+        assert.ok(app.ownsDraftFile(original.files[0].uri), 'the submitted attachment lease survives replacement by the new draft')
+        first.resolve(new Uint8Array([1, 2, 3]).buffer); await settleComponent(); await saves[0]; await settleComponent()
+        assert.equal(attempts.length, 1)
+        assert.equal(composer().value, '第二份草稿')
+        assert.deepEqual(JSON.parse(JSON.stringify(composer().files)), [{ uri: 'file:///later.txt', name: 'later.txt', size: 3, mimeType: 'text/plain' }], 'acceptance of the first draft preserves the newer attachments')
+        assert.equal(app.ownsDraftFile(original.files[0].uri), false, 'the retired submitted copy releases after byte preparation and acceptance')
+        submit(); submit(); await settleComponent()
+        assert.equal(attempts.length, 1, 'the next native draft still waits for its own attachment bytes')
+        later.resolve(new Uint8Array([4, 5, 6]).buffer); await settleComponent(); await saves[1]; await settleComponent()
+        assert.equal(attempts.length, 2)
+        assert.equal(composer().value, '')
+        assert.deepEqual(JSON.parse(JSON.stringify(composer().files)), [])
+        assert.deepEqual(saved, [
+          { text: '第一份草稿', attachments: [{ name: 'first.txt', bytes: [1, 2, 3] }] },
+          { text: '第二份草稿', attachments: [{ name: 'later.txt', bytes: [4, 5, 6] }] },
+        ])
+        assert.deepEqual(JSON.parse(JSON.stringify(attempts.map(item => item.target))), [target, target])
+        const failed = pendingResult(); reads.set('retry.txt', failed)
+        composer().onChange?.('原样重试'); attach('retry.txt'); await settleComponent(); submit(); await settleComponent()
+        failed.reject(new Error('file unavailable')); await settleComponent()
+        assert.equal(attempts.length, 2, 'a failed native read cannot enqueue an incomplete input')
+        assert.equal(composer().value, '原样重试')
+        const retryFiles = composer().files
+        assert.ok(Array.isArray(retryFiles)); assert.equal(workspaceModel.record(retryFiles[0]).name, 'retry.txt')
+        assert.equal(render().find(({ type }) => type === 'ErrorText')?.props.error, messageOf(new Error('file unavailable')))
+        const retry = pendingResult(); reads.set('retry.txt', retry); submit(); submit(); await settleComponent()
+        retry.resolve(new Uint8Array([7, 8, 9]).buffer); await settleComponent(); await saves[2]; await settleComponent()
+        assert.equal(attempts.length, 3, 'a failed preparation releases the scope for exactly one retry')
+        assert.equal(composer().value, '')
+        assert.deepEqual(saved.at(-1), { text: '原样重试', attachments: [{ name: 'retry.txt', bytes: [7, 8, 9] }] })
+        return
+      }
       const first = pendingResult(); reads.set('first.txt', first)
       composer().onChange?.('第一份草稿'); attach('first.txt'); submit(); submit()
       composer().onChange?.('第一份草稿'); submit(); await settleComponent()
@@ -3050,10 +3147,11 @@ test('both channel composers retain the durable task target before the domain sn
     const durable: PendingMessage = { report_results: true, message_id: 'locally-saved', conversation_id: 'chat', target: { kind: 'channel_task', channel_id: 'channel', task_id: 'stable-task', bot_id: 'bot' }, intent: 'continue', expected_revision: 1, sequence: 1, text: 'first', created_at_ms: 1, delivery: 'saved' }
     const pendingMessages: PendingMessage[] = []
     const sends: InputOptions[] = []
+    let nativeSaveHold: ReturnType<typeof pendingResult> | null = null
     const shared = { ...parityShared(), workspaceState: domain, pendingMessages,
       readWorkspaceState: async () => domain,
-      readWorkspaceHistory: async () => ({ events: [], coverage: { limit: 128, truncated: false, scope: 'channel' } }),
-      sendMessage: async (_text: string, _files: unknown[], _sent: unknown, options?: InputOptions) => { assert.ok(options); sends.push(options); const saved: PendingMessage = options.target.kind === 'channel_member' && options.target.bot_id === 'other' ? { ...durable, conversation_id: 'other-chat', target: { kind: 'channel_task', channel_id: 'channel', task_id: 'other-task', bot_id: 'other' } } : durable; shared.pendingMessages = [saved]; options.onSaved?.(saved); return true },
+      readWorkspaceHistory: async (filter: WorkspaceFilter) => ({ history_authority: 'authority', next_cursor: null, complete: true, events: [], coverage: { limit: 128, truncated: false, scope: filter.task_id ? 'task' : 'channel' } }),
+      sendMessage: async (_text: string, _files: unknown[], _sent: unknown, options?: InputOptions) => { assert.ok(options); sends.push(options); await nativeSaveHold?.promise; const saved: PendingMessage = options.target.kind === 'channel_member' && options.target.bot_id === 'other' ? { ...durable, conversation_id: 'other-chat', target: { kind: 'channel_task', channel_id: 'channel', task_id: 'other-task', bot_id: 'other' } } : durable; shared.pendingMessages = [saved]; options.onSaved?.(saved); return true },
     }
     shared.bots.push({ ...parityBot, bot_id: 'other', conversation_id: 'other-chat', name: '另一个 Bot' })
     // A cached recipient without its task is ignored: the Channel opens on its coordinator.
@@ -3061,10 +3159,12 @@ test('both channel composers retain the durable task target before the domain sn
     const storage = { getItem: (key: string) => saved.get(key) ?? null, setItem: (key: string, value: string) => { saved.set(key, value) } }
     const dependencies = {
       '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared },
+      '@/data/context': { useWorkspace: () => ({ networkId: 'network', deviceId: 'phone', bots: shared.bots, conversations: {}, members: [], actions: {} }) },
       '@vibeface/client/chat/protocol.ts': { promptIntent, inputTargetKey },
-      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: { principal: { network_id: 'network' } } }) },
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: { principal: { network_id: 'network', device_id: 'phone' }, isCurrent: () => true } }) },
       '@/lib/platform': { webPlatform: { storage } }, '@/platform': { mobilePlatform: { storage } },
-      'expo-router': { Stack: { Screen: 'Screen' }, router: { push() {} } }, 'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 0 }) },
+      'react-native': { AppState: { currentState: 'active', addEventListener: () => ({ remove() {} }) } },
+      'expo-router': { Stack: { Screen: 'Screen' }, router: { push() {} }, useLocalSearchParams: () => ({}) }, 'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 0 }) },
       '@/lib/use-run': { useRun: () => ({ busy: null, error: '', run: async (_key: string, action: () => Promise<void>) => action() }) },
       '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
     }
@@ -3110,11 +3210,25 @@ test('both channel composers retain the durable task target before the domain sn
         const endReply = app.render('ScopedWorkspaceScreen', { channelId: 'channel' }).find(({ props }) => props.accessibilityLabel === '结束回复这个任务')?.props
         assert.ok(typeof endReply?.onPress === 'function'); endReply.onPress()
         composer()
+        domain.tasks.push({ task_id: 'stable-task', root_task_id: 'stable-task', channel_id: 'channel', owner_bot: 'bot', title: '稍后同步的任务', request: '交代', expected_result: '结果', source_events: [], dependencies: [], reply_only: false, revision: 1, action: 'continue', request_event: 'request', event_hash: 'task-event', created_at_ms: 1, updated_at_ms: 1, state: 'running' })
         sends[2].onSaved?.(durable)
         composer()?.onChange?.('交给协调 Bot')
         const sendCoordinator = composer()?.onSend
         assert.ok(typeof sendCoordinator === 'function'); sendCoordinator(); await settleComponent()
-        assert.deepEqual(JSON.parse(JSON.stringify(sends[3].target)), { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' }, 'a late save cannot redirect the next native input back to the old task')
+        assert.deepEqual(JSON.parse(JSON.stringify(sends[3].target)), { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' }, 'late metadata and an old save cannot redirect the next native input back to an explicitly ended task')
+        const endAgain = app.render('ScopedWorkspaceScreen', { channelId: 'channel' }).find(({ props }) => props.accessibilityLabel === '结束回复这个任务')?.props.onPress
+        assert.ok(typeof endAgain === 'function'); endAgain()
+        nativeSaveHold = pendingResult()
+        composer()?.onChange?.('还在保存的旧交代')
+        const oldSave = composer()?.onSend
+        assert.ok(typeof oldSave === 'function'); oldSave(); await settleComponent()
+        composer()?.onChange?.('当前正在编辑的新交代'); await settleComponent()
+        nativeSaveHold.resolve(undefined); nativeSaveHold = null; await settleComponent()
+        assert.equal(composer()?.value, '当前正在编辑的新交代', 'an accepted older draft keeps the current channel editor')
+        assert.equal(composer()?.attachmentScope, JSON.stringify(['network', 'phone', 'chat', inputTargetKey({ kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' })]), 'an older save cannot auto-select its new task over the newer channel draft')
+        const newSave = composer()?.onSend
+        assert.ok(typeof newSave === 'function'); newSave(); await settleComponent()
+        assert.deepEqual(JSON.parse(JSON.stringify(sends.at(-1)?.target)), { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' })
       }
     } finally { app.close() }
   }
@@ -4747,10 +4861,10 @@ test('native attachment results cannot cross a draft scope or survive its disabl
   for (const os of ['ios', 'android']) for (const source of ['photos', 'files']) for (const change of ['bot', 'bot-roundtrip', 'network', 'blocked', 'blocked-roundtrip', 'sending', 'unmounted', 'stale-menu', 'blocked-before-menu', 'sending-before-menu']) await t.test(`${os} ${source} ${change}`, async () => {
     const live = parityShared()
     const conversation: import('../../../../../apps/mobile/src/data/types.ts').Conversation = {
-      messages: [], before: new Map(), rest: [], answers: new Map(), hidden: new Set(), unread: null,
+      origin: { kind: 'network' }, messages: [], before: new Map(), rest: [], answers: new Map(), hidden: new Set(), unread: null,
       works: [parityWork()], replying: false, status: null, stoppable: false, blocked: null,
     }
-    const workspace = { bots: [parityBot, { ...parityBot, bot_id: 'other', conversation_id: 'other-chat' }], conversations: { chat: conversation, 'other-chat': { ...conversation } }, members: [], primary: null, actions: { open() {} }, connection: { entry: '工作设备' } }
+    const workspace = { get networkId() { return device.ready.principal.network_id }, deviceId: 'phone', bots: [parityBot, { ...parityBot, bot_id: 'other', conversation_id: 'other-chat' }], conversations: { chat: conversation, 'other-chat': { ...conversation } }, members: [], primary: null, actions: { open() {} }, connection: { entry: '工作设备' } }
     const device = { link: { kind: 'online' }, ready: { entry: { device_id: 'gateway' }, principal: { network_id: 'network', can_manage: true } } }
     let botId = 'bot', sending = false, calls = 0, selected: (() => void) | undefined
     const result = pendingResult()
@@ -4778,7 +4892,7 @@ test('native attachment results cannot cross a draft scope or survive its disabl
     try {
       props().onChange?.('A 草稿')
       const original = [{ uri: 'file:///a.txt', name: 'a.txt', size: 1, mimeType: 'text/plain' }]
-      const onFiles = props().onFiles; assert.ok(typeof onFiles === 'function'); onFiles(original)
+      const onFiles = props().onFiles; assert.ok(typeof onFiles === 'function'); await onFiles(original)
       const scope = props().attachmentScope
       assert.equal(typeof scope, 'string')
       if (change === 'blocked-before-menu') conversation.blocked = '当前设备仅可查看'
@@ -4791,7 +4905,7 @@ test('native attachment results cannot cross a draft scope or survive its disabl
         botId = 'other'; render()
         props().onChange?.('B 草稿')
         const setFiles = props().onFiles; assert.ok(typeof setFiles === 'function')
-        setFiles([{ uri: 'file:///b.txt', name: 'b.txt', size: 2, mimeType: 'text/plain' }]); render()
+        await setFiles([{ uri: 'file:///b.txt', name: 'b.txt', size: 2, mimeType: 'text/plain' }]); render()
         if (change === 'bot-roundtrip') { botId = 'bot'; render(); assert.equal(props().attachmentScope, scope) }
       }
       if (change === 'network') { device.ready.principal.network_id = 'other-network'; render() }
@@ -4810,7 +4924,7 @@ test('native attachment results cannot cross a draft scope or survive its disabl
       await settleComponent()
       assert.equal(JSON.stringify(props().files), before, 'late completion leaves the actual bound draft setter untouched')
       assert.equal(props().value, text)
-      botId = 'bot'
+      botId = 'bot'; device.ready.principal.network_id = 'network'
       assert.equal(props().value, 'A 草稿')
       assert.equal(JSON.stringify(props().files), JSON.stringify(original), 'the original draft also retains its attachments')
     } finally { composer.close(); screen.close() }
@@ -4822,10 +4936,10 @@ test('native composer preserves local input and visible blockers with compact ch
     let retried = 0
     const live = { ...parityShared(), nodes: parseNodes({ nodes: [{ ...parityNode, capabilities: { ...parityNode.capabilities, manager_state: 'unverified' } }] }) }
     const conversation: import('../../../../../apps/mobile/src/data/types.ts').Conversation = {
-      messages: [{ message_id: 'one', event_hash: 'one', role: 'user', text: 'hello', created_at_ms: 1 }], before: new Map(), rest: [], answers: new Map(), hidden: new Set(), unread: null,
+      origin: { kind: 'network' }, messages: [{ message_id: 'one', event_hash: 'one', role: 'user', text: 'hello', created_at_ms: 1 }], before: new Map(), rest: [], answers: new Map(), hidden: new Set(), unread: null,
       works: [], replying: false, status: null, stoppable: false, blocked: null,
     }
-    const workspace = { bots: [parityBot], conversations: { chat: conversation }, members: [], primary: null, actions: { open() {} }, connection: { entry: '工作设备' } }
+    const workspace = { networkId: 'network', deviceId: 'phone', bots: [parityBot], conversations: { chat: conversation }, members: [], primary: null, actions: { open() {} }, connection: { entry: '工作设备' } }
     const device = { link: { kind: 'online' }, ready: { entry: { device_id: 'gateway' }, principal: { can_manage: true } }, retryNow: () => { retried++ } }
     const screen = nativeChatHarness(os, {
       'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: 'bot' }) },
@@ -5583,13 +5697,13 @@ test('native system notification events keep typed destinations and clear naviga
   const destination: NotificationDestination = { network_id: 'network-fixture', device_id: 'device-fixture', notification_id: 'notification-fixture', conversation_id: 'conversation-fixture' }
   const opened: NotificationDestination[] = []
   const unwatch = mobilePlatform.notifier.watchOpen?.(async value => { opened.push(value); return true })
-  mobilePlatform.notifier.show({ title: 'fixture', body: 'fixture', tag: 'same', destination }, () => {})
+  await mobilePlatform.notifier.show({ title: 'fixture', body: 'fixture', tag: 'same', destination }, () => {})
   await privateFiles.run(async () => {})
   const event: Response = { notification: { date: 1, request: { identifier: 'same', content: { data: { destination } } } }, actionIdentifier: 'open' }
   response?.(event); response?.(event)
   await new Promise<void>(resolve => setImmediate(resolve))
   assert.deepEqual(opened, [destination])
-  assert.deepEqual(JSON.parse(JSON.stringify(scheduled)), [{ identifier: 'same', content: { title: 'fixture', body: 'fixture', data: { destination } }, trigger: { channelId: 'vibeface' } }])
+  assert.deepEqual(JSON.parse(JSON.stringify(scheduled)), [{ identifier: 'same', content: { title: 'fixture', body: 'fixture', data: { destination } }, trigger: { channelId: 'vibeface-silent' } }])
   await mobilePlatform.erase?.()
   response?.({ ...event, notification: { ...event.notification, date: 2 } })
   await new Promise<void>(resolve => setImmediate(resolve))
