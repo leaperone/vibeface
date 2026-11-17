@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Run protected native acceptance and validate its public evidence."""
 
+import sys
+sys.dont_write_bytecode = True
+import release_context
+import release_format
+
 import argparse
 import hashlib
 import json
@@ -12,15 +17,11 @@ import signal
 import shutil
 import socket
 import subprocess
-import sys
 import tarfile
 import tempfile
 import time
 import uuid
 
-# Local helper imports must not dirty the checkout before provenance checks.
-sys.dont_write_bytecode = True
-from release import verify_build_info
 from unittest import TestCase
 
 
@@ -63,7 +64,7 @@ def source_commit(expected):
 
 def checked_package(package, expected):
     info = json.loads(regular(package / "BUILD-INFO.json"))
-    verify_build_info(info)
+    release_format.verify_build_info(info, release_context.contracts())
     if any(info[field] != expected for field in ("source_commit", "core_source_commit", "app_source_commit")) or info["target"] != "x86_64-unknown-linux-gnu":
         raise ValueError("Package provenance differs from this Linux source commit")
     for binary in (package / "vibeface", package / "vibeface-core"):
@@ -186,15 +187,19 @@ def self_test_source_cli(directory):
     repo = directory / "source-cli"
     scripts = repo / "scripts"
     scripts.mkdir(parents=True)
-    for name in ("run-delivery-live.py", "release.py"):
+    for name in ("run-delivery-live.py", "release_format.py", "release_context.py"):
         shutil.copy2(ROOT / "scripts" / name, scripts / name)
+
+    control = repo / "crates/control/src/lib.rs"
+    control.parent.mkdir(parents=True)
+    shutil.copy2(ROOT / "crates/control/src/lib.rs", control)
 
     def git(*args):
         return subprocess.run(["git", "-c", "core.hooksPath=/dev/null", *args],
                               cwd=repo, check=True, capture_output=True, text=True)
 
     git("init", "-q")
-    git("add", "scripts")
+    git("add", "scripts", "crates")
     git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture")
     expected = git("rev-parse", "HEAD").stdout.strip()
 
@@ -215,9 +220,14 @@ def self_test_source_cli(directory):
     extra.write_text("untracked source")
     verify(expected, False)
     extra.unlink()
-    with (scripts / "release.py").open("a") as stream:
+    with (scripts / "release_format.py").open("a") as stream:
         stream.write("\n# changed source\n")
     verify(expected, False)
+    git("checkout", "--", "scripts/release_format.py")
+    with (scripts / "release_context.py").open("a") as stream:
+        stream.write("\n# changed context\n")
+    verify(expected, False)
+    assert not list(repo.rglob("__pycache__"))
 
 
 def self_test():
@@ -745,7 +755,7 @@ def project_wrapper_summary(name, value):
         package = result["package"]
         result["package"] = {key:package[key] for key in ("buildInfo","binarySha256","coreSha256","cryptoSha256","wasmSha256") if key in package}
         if "buildInfo" in package:
-            verify_build_info(package["buildInfo"])
+            release_format.verify_build_info(package["buildInfo"], release_context.contracts())
             result["package"]["buildInfo"] = {key:package["buildInfo"][key] for key in ("version","target","source_commit","update_protocol",
                 "data_epoch","core_version","core_source_commit","app_version","app_source_commit") if key in package["buildInfo"]}
         if any(not isinstance(item,str) or not re.fullmatch(r"[0-9a-f]{64}",item) for key,item in result["package"].items() if key != "buildInfo"):

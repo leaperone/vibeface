@@ -1,0 +1,128 @@
+{
+  "complete_asset_counts": {
+    "app": 3,
+    "cli": 9,
+    "core": 9,
+    "desktop": 21,
+    "mobile_signed": 10,
+    "mobile_unsigned": 7,
+    "www": 3
+  },
+  "reader_rejections": [
+    "no-marker",
+    "huge-marker",
+    "marker-size",
+    "marker-digest",
+    "marker-bytes",
+    "duplicate",
+    "foreign",
+    "missing-payload",
+    "draft",
+    "prerelease",
+    "tag",
+    "manifest-app",
+    "manifest-version",
+    "manifest-channel",
+    "manifest-source",
+    "contracts",
+    "schema-bool",
+    "asset-size",
+    "asset-digest",
+    "manifest-extra",
+    "tag-source",
+    "ci-sha",
+    "ci-branch",
+    "ci-path",
+    "ci-event",
+    "ci-repo",
+    "ci-head-repo",
+    "ci-status",
+    "ci-conclusion"
+  ],
+  "unknown_writes": [
+    {
+      "applied": true,
+      "final_counts": [
+        1,
+        3,
+        1
+      ],
+      "first_counts": [
+        1,
+        0,
+        0
+      ],
+      "operation": "create"
+    },
+    {
+      "applied": true,
+      "final_counts": [
+        1,
+        3,
+        1
+      ],
+      "first_counts": [
+        1,
+        1,
+        0
+      ],
+      "operation": "upload:payload"
+    },
+    {
+      "applied": false,
+      "final_counts": [
+        1,
+        4,
+        1
+      ],
+      "first_counts": [
+        1,
+        1,
+        0
+      ],
+      "operation": "upload:payload"
+    },
+    {
+      "applied": true,
+      "final_counts": [
+        1,
+        3,
+        1
+      ],
+      "first_counts": [
+        1,
+        3,
+        0
+      ],
+      "operation": "upload:release.json"
+    },
+    {
+      "applied": true,
+      "final_counts": [
+        1,
+        3,
+        2
+      ],
+      "first_counts": [
+        1,
+        3,
+        1
+      ],
+      "operation": "edit"
+    },
+    {
+      "applied": false,
+      "final_counts": [
+        1,
+        3,
+        2
+      ],
+      "first_counts": [
+        1,
+        3,
+        1
+      ],
+      "operation": "edit"
+    }
+  ]
+}

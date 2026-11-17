@@ -7,7 +7,7 @@ description: 独立发布 Vibeface Core、App、CLI/npm、Desktop、Mobile 或 W
 
 只执行会话已授权的发布范围。合并、构建通过或修改本 skill 不构成新的发布授权；已有自动 Hourly 与服务自动上线授权继续适用。人工发布确定应用、渠道和精确版本，Stable 的 patch/minor/major 不自行猜测。Hourly 交给自动协调器，不手工改时间造版本。
 
-先读[发布说明](../../../packages/docs/releasing.md)、[发布工具](../../../scripts/release.py)和对应版本文件。首个正式版前基准保持 0.0.1，main 的开发版本固定；不保留旧 Product updater 的兼容路径。
+先读[发布说明](../../../packages/docs/releasing.md)、[发布工具](../../../scripts/release.py)、[模块边界](../../../packages/docs/design/release-modules.md)和对应版本文件。首个正式版前基准保持 0.0.1，main 的开发版本固定；不保留旧 Product updater 的兼容路径。
 
 | 应用 | Tag | 入口 | 依赖与结果 |
 | --- | --- | --- | --- |

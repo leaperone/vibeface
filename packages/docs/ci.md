@@ -141,7 +141,7 @@ python3 scripts/check-delivery.py --sandbox
 
 发布来源门要求精确 Tag、源码和成功 main push CI 对齐。脱离 main 的 Hourly 提交必须只有一个 main parent，且只能包含所选应用的机械版本与依赖变更。Stable、RC 的源码必须位于 main。每个应用的 `release.json` 最后写入，包含 contracts 和精确依赖 pin；CLI 包内九字段 `BUILD-INFO.json` 允许 CLI、Core、App 使用不同版本与源码。Core、App、www 的部署等待对应完整发布，`release-dispatch.py` 核对派发的运行并等待真实终态。
 
-quick-check 与 preflight 运行 `release.py self-test`、`hourly.py --self-test`、`release-dispatch.py --self-test` 和 `check-release-workflow.py --self-test`。检查器验证实际依赖图、artifact ID、权限传递和发布条件，并拒绝绕过完整收集或来源校验的负例。
+quick-check 与 preflight 运行 `tests/release/test_cli.py`、`test_publisher.py`、`test_source.py` 的标准库离线子进程夹具，以及 `release.py self-test`、`hourly.py --self-test`、`release-dispatch.py --self-test` 和 `check-release-workflow.py --self-test`。检查器验证实际依赖图、artifact ID、权限传递和发布条件，并拒绝绕过完整收集或来源校验的负例。
 
 | 扩展检查 | 执行范围 |
 | --- | --- |
