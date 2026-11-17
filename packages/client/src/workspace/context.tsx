@@ -917,13 +917,12 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const confirmInputEntry = (messageId: string, expectedEntry: string) => withPendingInput(messageId, async (item) => {
     requireInputEntry(expectedEntry)
     const pending = parsePendingMessage(item), lane = messageLane(pending)
-    const legacyAbsence = pending.delivery === 'saved' && pending.rejection_code === 'input_not_saved' && pending.receipt === undefined
-    if (item.entry_device_id !== undefined || pending.delivery !== 'unknown' && pending.delivery !== 'submitting' && !legacyAbsence || item.release_expected_event !== undefined || item.release_command_id !== undefined) throw new Error('这条输入不能重新指定原设备。')
+    if (item.entry_device_id !== undefined || pending.delivery !== 'unknown' && pending.delivery !== 'submitting' || item.release_expected_event !== undefined || item.release_command_id !== undefined) throw new Error('这条输入不能重新指定原设备。')
     if (messageTargets.current.has(lane)) throw new Error('正在查询这个目标的输入，请稍后再试。')
     messageTargets.current.add(lane)
     try {
       requireInputEntry(expectedEntry)
-      await outbox.put({ ...item, entry_device_id: expectedEntry, ...(legacyAbsence || pending.rejection_code === 'input_missing' ? { delivery: 'unknown', rejected: undefined, rejection_code: undefined } : {}) })
+      await outbox.put({ ...item, entry_device_id: expectedEntry, ...(pending.rejection_code === 'input_missing' ? { delivery: 'unknown', rejected: undefined, rejection_code: undefined } : {}) })
       await outboxChanged()
       requireInputEntry(expectedEntry)
       return await readInputReceipt(pending)
@@ -945,7 +944,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       for (;;) {
         if (!current()) return
         const item = (await outbox.all()).filter((item) => item.method === 'message' && item.delivery !== 'accepted' && messageLane(parsePendingMessage(item)) === lane).sort((a, b) => Number(a.params.sequence) - Number(b.params.sequence) || a.created_at_ms - b.created_at_ms)[0]
-        if (!item || item.rejected !== undefined) return
+        if (!item || item.rejected !== undefined || item.delivery === 'saved' && item.rejection_code === 'input_not_saved') return
         const pending = parsePendingMessage(item)
         if (item.delivery === 'unknown' || item.delivery === 'submitting' || item.delivery === undefined) {
           await readInputReceipt(pending)
