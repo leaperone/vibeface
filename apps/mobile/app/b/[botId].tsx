@@ -1,3 +1,4 @@
+import { useSelectionOwner } from '@/lib/use-selection-owner'
 import { historySections } from '@vibeface/client/workspace/model.ts'
 import { HistoryControls } from '@/features/chat/history-controls'
 import { Link, Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router'
@@ -118,18 +119,34 @@ export default function ChatScreen() {
   const [drafts, setDrafts] = useState<Record<string, { text: string; files: Attachment[] }>>(() => { const stored = draftStorage.readStorage<unknown>(draftKey, {}); return stored && typeof stored === 'object' && !Array.isArray(stored) ? Object.fromEntries(Object.entries(stored).filter((entry): entry is [string, string] => typeof entry[1] === 'string').map(([id, text]) => [id, { text, files: [] }])) : {} })
   const [selectedTarget, setSelectedTarget] = useState(routine ? `routine:${routine}` : 'main')
   const [sendError, setSendError] = useState('')
+  const [cleanupError, setCleanupError] = useState('')
   useEffect(() => { setSelectedTarget(routine ? `routine:${routine}` : 'main') }, [id, routine])
   const draft = (id && drafts[id]) || { text: '', files: [] }
   const draftRef = useRef({ value: draft, target: selectedTarget, conversationId: id })
   if (draftRef.current.value !== draft || draftRef.current.target !== selectedTarget || draftRef.current.conversationId !== id) draftRef.current = { value: draft, target: selectedTarget, conversationId: id }
   const savingDrafts = useRef(new Set<typeof draftRef.current>())
-  const setDraft = (next: Partial<typeof draft>) => { if (id) setDrafts((current) => {
-    const present = current[id] ?? { text: '', files: [] }, changed = { ...present, ...next }
-    if (changed.text === present.text && changed.files === present.files) return current
-    const updated = { ...current, [id]: changed }
+  const draftsRef = useRef(drafts)
+  const selection = useSelectionOwner<Attachment>(device.ready?.principal.network_id, () => {
+    const current = draftsRef.current
+    if (!Object.values(current).some(draft => draft.files.length)) return
+    const updated = Object.fromEntries(Object.entries(current).map(([key, value]) => [key, { ...value, files: [] }]))
+    draftsRef.current = updated
+    setDrafts(updated)
+  }, (cause) => setCleanupError(messageOf(cause)))
+  const commitDrafts = (updated: typeof drafts) => {
+    // Every resident conversation owns its files, including the conversations off screen.
+    if (!selection.current?.replace(Object.values(updated).flatMap(draft => draft.files))) return
+    draftsRef.current = updated
+    setDrafts(updated)
     draftStorage.writeStorage(draftKey, Object.fromEntries(Object.entries(updated).map(([key, value]) => [key, value.text])))
-    return updated
-  }) }
+  }
+  const setDraft = (next: Partial<typeof draft>) => {
+    if (!id) return
+    const present = draftsRef.current[id] ?? { text: '', files: [] }, changed = { ...present, ...next }
+    if (changed.text === present.text && changed.files === present.files) return
+    commitDrafts({ ...draftsRef.current, [id]: changed })
+    draftRef.current = { ...draftRef.current, value: changed }
+  }
   const routeActive = useRef(false)
   useFocusEffect(useCallback(() => { routeActive.current = true; const close = id ? latestWorkspace.current.actions.open(id) : undefined; return () => { routeActive.current = false; close?.() } }, [id, live?.generation]))
   const extras = useChatExtras(id ?? '', botId)
@@ -189,16 +206,17 @@ export default function ChatScreen() {
     const { text, files } = submittedDraft.value
     setSendError('')
     toLatest()
-    workspace.actions.send(id, text.trim(), files, { target: targetOption.target, intent: promptIntent(text), conversation_id: id, onSaved: (input) => {
+    const owner = selection.current!
+    const save = () => workspace.actions.send(id, text.trim(), files, { target: targetOption.target, intent: promptIntent(text), conversation_id: id, onSaved: (input) => {
       if (!live?.isCurrent()) return
-      setDrafts((current) => {
-        const present = current[id]
-        if (present !== submittedDraft.value || draftRef.current.conversationId === id && draftRef.current !== submittedDraft) return current
-        const updated = { ...current, [id]: { text: '', files: [] } }
-        draftStorage.writeStorage(draftKey, Object.fromEntries(Object.entries(updated).map(([key, value]) => [key, value.text])))
-        return updated
-      })
-      if (!routeActive.current || !live?.isCurrent() || latestLive.current?.conversationId !== id || draftRef.current !== submittedDraft) return; if (input.target.kind === "task" || input.target.kind === "channel_task") router.push(`/task/${input.target.task_id}`) } }).catch((cause) => { setSendError(messageOf(cause)) }).finally(() => { savingDrafts.current.delete(submittedDraft) })
+      const current = draftsRef.current, present = current[id]
+      const navigate = routeActive.current && live.isCurrent() && latestLive.current?.conversationId === id && draftRef.current === submittedDraft
+      if (present === submittedDraft.value && !(draftRef.current.conversationId === id && draftRef.current !== submittedDraft)) {
+        commitDrafts({ ...current, [id]: { text: '', files: [] } })
+      }
+      if (navigate && (input.target.kind === 'task' || input.target.kind === 'channel_task')) router.push(`/task/${input.target.task_id}`)
+    } })
+    void (files.length ? owner.use(save) : save()).catch((cause) => { setSendError(messageOf(cause)) }).finally(() => { savingDrafts.current.delete(submittedDraft) })
   }
   const rows = chat ? entries(chat, extras, bot, offline) : []
   const history = live?.conversationId === id ? live.data?.history : undefined
@@ -295,13 +313,13 @@ export default function ChatScreen() {
         <Composer value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })} attachmentScope={JSON.stringify([device.ready?.principal.network_id ?? '', id, inputTargetKey(inputTarget)])}
           blocked={blocked} sending={false} onSend={send} onStop={(inputTarget.kind === 'bot_main' ? chat?.stoppable : targetBusy) ? () => void live?.stopInputTarget({ target: targetOption.target }).catch((cause) => setSendError(messageOf(cause))) : undefined}
           sendLabel={targetBusy ? '补充当前工作' : '发送'}
-        >{offline || setupHint || sendError || inputTarget.kind !== 'bot_main' ? <>
+        >{offline || setupHint || sendError || cleanupError || inputTarget.kind !== 'bot_main' ? <>
           {offline ? <OfflineBar chat className="self-center" /> : setupHint ? <View role="status" className="flex-row flex-wrap items-center gap-x-2 px-2">
             <Text className="text-sm text-muted">{setupHint}</Text>
             {reach === 'offline' || canSetUp ? <Link href={setupHref} asChild><Button variant="ghost" size="sm"><Text>{reach === 'offline' ? '查看设备' : '去设置'}</Text></Button></Link>
               : <Text className="text-sm text-muted">{setUpOnManager(workspace.members.filter((member) => member.admin).map((member) => member.name))}</Text>}
           </View> : null}
-          {sendError ? <ErrorText error={sendError} /> : null}
+          {sendError || cleanupError ? <ErrorText error={sendError || cleanupError} /> : null}
           {inputTarget.kind !== "bot_main" ? <View className="flex-row items-center gap-2 px-2">
             <Text numberOfLines={1} className="min-w-0 flex-1 text-sm text-muted">{targetBusy ? '补充给' : '发送给'} · {targetOption.label}</Text>
             <Button variant="ghost" size="sm" onPress={() => setSelectedTarget('main')}><Text>改回主聊天</Text></Button>

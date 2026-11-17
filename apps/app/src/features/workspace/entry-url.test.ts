@@ -1,6 +1,7 @@
+import { selectionOwner } from '@vibeface/client/lib/selection.ts'
 import * as deliveryModel from '@vibeface/client/delivery/model.ts'
 import * as byteCodec from '@vibeface/client/lib/byte-codec.ts'
-import { transferSelection, type DeliveryBudget } from '@vibeface/client/delivery/types.ts'
+import { type DeliveryBudget } from '@vibeface/client/delivery/types.ts'
 import { parseChanged } from '@vibeface/client/lib/progress.ts'
 import * as workspaceHistory from '@vibeface/client/workspace/history.ts'
 import { completeHistory } from '@vibeface/client/workspace/history-fixture.ts'
@@ -1456,7 +1457,7 @@ test("workspace preserves bot and message requests while routing native decision
         const mainActions = mobile().actions, originalMainSend = mainActions.send
         mainActions.send = (...args) => { const saved = originalMainSend(...args); mainSaves.push(saved); return saved }
         const composer = () => chat.render('default').find(({ type }) => type === 'Composer')?.props
-        const attach = (uri: string) => { const input = composer()?.onFiles; assert.ok(typeof input === 'function'); const files = [{ uri, name: uri.split('/').at(-1), size: 3 }]; input(files); return files }
+        const attach = (uri: string) => { const input = composer()?.onFiles; assert.ok(typeof input === 'function'); const files = [{ uri, name: uri.split('/').at(-1), size: 3, mimeType: null, arrayBuffer: async () => { const held = fileReads.get(uri); assert.ok(held); return await held.promise as ArrayBuffer }, text: async () => '', dispose() {} }]; input(files); return files }
         const sendDraft = () => { const send = composer()?.onSend; assert.ok(typeof send === 'function'); send() }
         const storedDraft = () => JSON.parse(stored.get(`vibeface.${networkKey('bot-drafts', 'network')}`) ?? '{}').chat
         const preparing = deferred(); fileReads.set('file:///first.txt', preparing)
@@ -1926,6 +1927,8 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     if (path.includes('/mobile/') && specifier === '@/components/arc/chat') return { ComposerInput: 'TextInput', ComposerPanel: 'ComposerPanel', MessageBubble: 'View' }
     if (path.includes('/mobile/') && specifier === '@/components/arc/selection') return { SelectionItem: 'Pressable' }
     if (path.includes('/mobile/') && specifier === '@/lib/use-clipboard') return loadComponentModule(fileURLToPath(new URL('../../../../../apps/mobile/src/lib/use-clipboard.ts', import.meta.url)))
+    if (specifier === '@/lib/use-selection-owner') return loadComponentModule(fileURLToPath(new URL('../../../../../apps/mobile/src/lib/use-selection-owner.ts', import.meta.url)))
+    if (specifier === '@vibeface/client/lib/selection.ts') return { selectionOwner }
     if (specifier === '@/lib/use-clipboard') return loadComponentModule(fileURLToPath(new URL('../../lib/use-clipboard.ts', import.meta.url)))
     if (specifier === '@vibeface/client/workspace/model.ts') {
       const override = dependencies[specifier]
@@ -1947,7 +1950,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       const identity = dependencies[specifier] as { useDevice?: () => object } | undefined
       return { ...identity, useDevice: () => ({ connectionGeneration: () => 0, ...identity?.useDevice?.() }) }
     }
-    if (specifier === '@/platform/files') return dependencies[specifier] ?? { privateFiles: { run: async (operation: (current: () => boolean) => Promise<unknown>) => operation(() => true), retain: async (uri: string) => ({ uri }), release() {}, releasePicker() {} } }
+    if (specifier === '@/platform/files') return dependencies[specifier] ?? { privateFiles: { run: async (operation: (current: () => boolean) => Promise<unknown>) => operation(() => true), retain: async (uri: string) => ({ uri }), ownedFile: (file: { uri: string }) => ({ ...file, text: async () => '', arrayBuffer: async () => new ArrayBuffer(0), dispose() {} }), release() {}, releasePicker() {} } }
     if (specifier === '@/platform') return { mobilePlatform: { storage: platformStorage }, ...dependencies[specifier] as object }
     if (specifier === '@tanstack/react-router') return { Link: 'Link', useNavigate: () => () => {}, useRouterState: ({ select }: { select: (state: unknown) => unknown }) => select({ location: { search: {} } }), ...dependencies[specifier] as object }
     return specifier === 'react' ? react : specifier === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : specifier === 'expo-router' ? { Link: 'Link', useFocusEffect, useRouter: () => nativeRouter, ...dependencies[specifier] as object } : dependencies[specifier] ?? ui
@@ -2892,7 +2895,7 @@ test('the required paid transfer budget stays empty until a real budget is selec
   const app = componentHarness('../lab/transfers.tsx', {
     '@vibeface/client/delivery/client.ts': { useDelivery: () => delivery },
     '@vibeface/client/delivery/model.ts': deliveryModel,
-    '@vibeface/client/delivery/types.ts': { transferSelection },
+    '@vibeface/client/lib/selection.ts': { selectionOwner },
     '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
     '@/lib/glossary': { terms: new Proxy({}, { get: (_target, name) => ({ label: String(name), icon: String(name) }) }) },
     '@/components/arc/product-kit': { Segmented: 'Segmented', useAction: () => ({ busy: null }) },
@@ -2995,7 +2998,7 @@ test('composers save each pending draft once and let edited drafts save independ
     const submit = () => { const send = composer()[example.native ? 'onSend' : 'onSubmit']; assert.ok(typeof send === 'function'); send() }
     const attach = (name: string) => {
       const input = composer().onFiles; assert.ok(typeof input === 'function')
-      const files = example.native ? [{ uri: `file:///${name}`, name, size: 3, mimeType: 'text/plain' }] : [{ name, arrayBuffer: () => read(name) }]
+      const files = example.native ? [{ uri: `file:///${name}`, name, size: 3, mimeType: 'text/plain', arrayBuffer: () => read(name), text: async () => '', dispose() {} }] : [{ name, arrayBuffer: () => read(name) }]
       input(files)
       return files
     }
@@ -5042,8 +5045,9 @@ test('native composer adds photos and files without replacing current attachment
   type Attachment = import('../../../../../apps/mobile/src/data/types.ts').Attachment
   type NativeButton = { text: string; onPress?: () => void; style?: string }
   for (const os of ['ios', 'android']) await t.test(os, async () => {
-    const original = { uri: 'file:///report.pdf', name: 'report.pdf', size: 20, mimeType: 'application/pdf' }
-    const current = { uri: 'file:///current.txt', name: 'current.txt', size: null, mimeType: null }
+    const readers = { text: { value: async () => '' }, arrayBuffer: { value: async () => new ArrayBuffer(0) }, dispose: { value: () => {} } }
+    const original = Object.defineProperties({ uri: 'file:///report.pdf', name: 'report.pdf', size: 20, mimeType: 'application/pdf' }, readers) as Attachment
+    const current = Object.defineProperties({ uri: 'file:///current.txt', name: 'current.txt', size: null, mimeType: null }, readers) as Attachment
     const cache = new Map([
       ['file:///cache/original.heic', { name: 'original.heic', size: 30, type: 'image/heic' }],
       ['file:///cache/transparent.png', { name: 'transparent.png', size: 40, type: 'image/png' }],
@@ -5185,7 +5189,7 @@ test('native attachment results cannot cross a draft scope or survive its disabl
     const render = () => composer.render('Composer', { ...props(), sending })
     try {
       props().onChange?.('A 草稿')
-      const original = [{ uri: 'file:///a.txt', name: 'a.txt', size: 1, mimeType: 'text/plain' }]
+      const original = [{ uri: 'file:///a.txt', name: 'a.txt', size: 1, mimeType: 'text/plain', arrayBuffer: async () => new ArrayBuffer(1), text: async () => 'A', dispose() {} }]
       const onFiles = props().onFiles; assert.ok(typeof onFiles === 'function'); onFiles(original)
       const scope = props().attachmentScope
       assert.equal(typeof scope, 'string')
@@ -5199,7 +5203,7 @@ test('native attachment results cannot cross a draft scope or survive its disabl
         botId = 'other'; render()
         props().onChange?.('B 草稿')
         const setFiles = props().onFiles; assert.ok(typeof setFiles === 'function')
-        setFiles([{ uri: 'file:///b.txt', name: 'b.txt', size: 2, mimeType: 'text/plain' }]); render()
+        setFiles([{ uri: 'file:///b.txt', name: 'b.txt', size: 2, mimeType: 'text/plain', arrayBuffer: async () => new ArrayBuffer(2), text: async () => 'B', dispose() {} }]); render()
         if (change === 'bot-roundtrip') { botId = 'bot'; render(); assert.equal(props().attachmentScope, scope) }
       }
       if (change === 'network') { device.ready.principal.network_id = 'other-network'; render() }
@@ -5220,7 +5224,7 @@ test('native attachment results cannot cross a draft scope or survive its disabl
       assert.equal(props().value, text)
       botId = 'bot'
       assert.equal(props().value, 'A 草稿')
-      assert.equal(JSON.stringify(props().files), JSON.stringify(original), 'the original draft also retains its attachments')
+      assert.equal(JSON.stringify(props().files), JSON.stringify(change === 'network' ? [] : original), 'a different network abandons its selections; other draft changes retain the original attachments')
     } finally { composer.close(); screen.close() }
   })
 })

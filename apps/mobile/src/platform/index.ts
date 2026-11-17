@@ -143,19 +143,7 @@ export const mobilePlatform: Platform = {
             const file = await privateFiles.retain(asset.uri)
             candidate = file
             if (!current()) { privateFiles.release(file.uri); candidate = undefined; return null }
-            let disposed = false
-            let readers = 0
-            const cleanup = () => { if (disposed && readers === 0) privateFiles.release(file.uri) }
-            return {
-              name: asset.name, size: file.size,
-              async arrayBuffer() {
-                if (disposed) throw new Error('请重新选择文件。')
-                readers++
-                try { return await privateFiles.run(async () => file.arrayBuffer()) }
-                finally { readers--; cleanup() }
-              },
-              dispose() { disposed = true; cleanup() },
-            }
+            return { ...privateFiles.ownedFile(file), name: asset.name }
           } finally { privateFiles.releasePicker(asset.uri) }
         } catch (cause) {
           try { if (candidate) privateFiles.release(candidate.uri) }

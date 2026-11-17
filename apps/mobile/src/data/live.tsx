@@ -1,5 +1,4 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { File } from 'expo-file-system'
 import { chatTimeline, firstUnread, unreadCounts } from '@vibeface/client/chat/timeline.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
 import { DeviceProvider, useDevice } from '@vibeface/client/identity/context.tsx'
@@ -224,7 +223,7 @@ function Live({ children }: { children: ReactNode }) {
       },
       async send(id, text, attachments, options) {
         await select(id)
-        await latest.current.sendMessage(text, attachments.map((file) => ({ name: file.name, arrayBuffer: () => new File(file.uri).arrayBuffer() })), undefined, options)
+        await latest.current.sendMessage(text, attachments.map((file) => ({ name: file.name, arrayBuffer: file.arrayBuffer })), undefined, options)
       },
       answer: (question, text) => latest.current.answer(question, text),
       leave: device.leave,

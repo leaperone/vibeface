@@ -1,3 +1,4 @@
+import { selectionOwner } from '@vibeface/client/lib/selection.ts'
 import { useClipboard } from '@/lib/use-clipboard'
 import { FieldNote,FormField } from "@/components/arc/form-field"
 import { BusyIcon,Details,EmptyState,InlineError,Segmented,useAction } from '@/components/arc/product-kit'
@@ -5,7 +6,7 @@ import { terms } from '@/lib/glossary'
 import { webPlatform } from '@/lib/platform'
 import { useDelivery } from '@vibeface/client/delivery/client.ts'
 import { canRestart,deadlineRows,evidenceLabels,modeOptions,orderActions,orderHeading,orderStatus,orderSummary,orderTitle,providerChoices,publicationLabel,receiverChoices,receivingBatches,settlementAmountsLabel,sizeLabel,transferCopy,walletNotice } from '@vibeface/client/delivery/model.ts'
-import { transferSelection,type DeliveryDraft,type DeliveryOrder,type DeliverySettings,type TransferFile } from '@vibeface/client/delivery/types.ts'
+import { type DeliveryDraft,type DeliveryOrder,type DeliverySettings,type TransferFile } from '@vibeface/client/delivery/types.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { messageOf } from '@vibeface/client/lib/node.ts'
 import { Button } from '@vibeface/uiarc/button/button.tsx'
@@ -27,11 +28,13 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
   const { directory } = useDevice()
   const [draft, setDraft] = useState<DeliveryDraft>({ receiver_peer: '', provider_peer: '', mode: 'charity', acceptance: 'recoverable', max_service_amount: '0', max_gas_amount: '0', budget_id: null })
   const [file, setFile] = useState<TransferFile | null>(null)
-  const selection = useRef(transferSelection())
+  const [cleanupError, setCleanupError] = useState('')
+  const selection = useRef<ReturnType<typeof selectionOwner<TransferFile>> | null>(null)
   useEffect(() => {
-    const owner = transferSelection()
+    let active = true
+    const owner = selectionOwner<TransferFile>((error) => { if (active) setCleanupError(error.message); else console.error('选择副本清理失败，副本保留待清除。', error) })
     selection.current = owner
-    return () => owner.close()
+    return () => { active = false; owner.close() }
   }, [])
   // Feedback shows next to the control that caused it, not at the top of a long page.
   const [origin, setOrigin] = useState<'page' | 'form' | 'order'>('page')
@@ -58,8 +61,8 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
   const prepare = (restart?: string) => {
     if (!file || unusable) return
     setOrigin('form')
-    const owner = selection.current
-    void owner.use(selected => delivery.prepare(draft, selected, restart)).then(success => { if (success && owner.replace(null)) setFile(null) })
+    const owner = selection.current!
+    void owner.use(([selected]) => delivery.prepare(draft, selected, restart)).then(success => { if (success && owner.replace([])) setFile(null) }).catch((cause) => setCleanupError(String(cause)))
   }
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
     {feedback('page')}
@@ -113,10 +116,10 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
           <FormField><Input label={transferCopy.gasCap} id="transfer-gas-cap" value={draft.max_gas_amount} readOnly /></FormField>
         </> : <p className="flex items-center gap-1.5 text-sm text-secondary"><terms.encrypted.icon aria-hidden="true" className="size-4 shrink-0 text-success" />{transferCopy.free}</p>}
         <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-          <Button type="button" variant="secondary" disabled={working} onClick={() => void picker.run('pick', async () => { const owner = selection.current; const picked = await webPlatform.files?.pick(); if (picked && owner.replace(picked)) setFile(picked) })}><BusyIcon busy={picker.busy === 'pick'} icon={File} />选择文件</Button>
+          <Button type="button" variant="secondary" disabled={working} onClick={() => void picker.run('pick', async () => { const owner = selection.current!; const picked = await webPlatform.files?.pick(); if (picked && owner.replace([picked])) setFile(picked) })}><BusyIcon busy={picker.busy === 'pick'} icon={File} />选择文件</Button>
           <span className="min-w-0 break-all text-sm text-secondary">{file ? <><span className="text-foreground">{file.name}</span> · {sizeLabel(file.size)}</> : transferCopy.maxSize(status.max_file_bytes)}</span>
         </div>
-        {picker.error ? <p role="alert" className="text-sm text-danger">{messageOf(picker.error)}</p> : null}
+        {picker.error || cleanupError ? <p role="alert" className="text-sm text-danger">{messageOf(picker.error || cleanupError)}</p> : null}
         {file && file.size > status.max_file_bytes ? <p role="alert" className="text-sm text-danger">{transferCopy.tooLarge(status.max_file_bytes)}</p> : null}
         {feedback('form')}
         <div className="flex flex-wrap gap-2">

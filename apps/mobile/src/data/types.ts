@@ -1,3 +1,4 @@
+import type { OwnedPickedFile } from '../platform/files'
 import type { TranscriptMessage } from '@vibeface/client/chat/types.ts'
 import type { AnswerResult, BotReadiness, BotRecord, InputOptions, Question, WorkRecord } from '@vibeface/client/workspace/types.ts'
 
@@ -40,7 +41,7 @@ export type Conversation = {
 }
 
 /** A file picked for the next message. */
-export type Attachment = { uri: string; name: string; size: number | null; mimeType: string | null }
+export type Attachment = Omit<OwnedPickedFile, 'size'> & { name: string; size: number | null; mimeType: string | null }
 
 /** `bot`: how the device's bot stands right now, `null` with none; removing it stops that bot. `online`: known for computers only. */
 export type Member = { device_id: string; name: string; kind: 'node' | 'client'; admin: boolean; online: boolean | undefined; current: boolean; entry: boolean; bot: BotReadiness | null }
