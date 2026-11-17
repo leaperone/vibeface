@@ -919,7 +919,21 @@ def workflow_contract_self_test():
     for filename in ("_ci-crypto.yml", "_ci-web.yml"):
         selected = workflows[filename]
         assert selected.startswith("name: Reusable / ") and "workflow_call:" in selected
-        assert "workflow_dispatch:" not in selected
+        if filename == "_ci-web.yml":
+            assert "workflow_dispatch:" not in selected
+        else:
+            events = selected.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+            assert set(re.findall(r"(?m)^  ([\w-]+):$", events)) == {"workflow_call", "workflow_dispatch"}
+            manual = events.split("  workflow_dispatch:\n", 1)[1]
+            assert re.findall(r"(?m)^      ([\w-]+):$", manual) == ["source_sha"]
+            assert "        type: string\n        required: true" in manual
+            assert re.findall(r"(?m)^  ([\w-]+):$", selected.split("\njobs:\n", 1)[1]) == ["build"]
+            crypto_job = block(filename, "build")
+            assert 're.fullmatch(r"[0-9a-f]{40}", os.environ["SOURCE_SHA"])' in crypto_job
+            assert "SOURCE_SHA: ${{ inputs.source_sha }}" in crypto_job
+            assert "Expected a clean checkout of source_sha" in crypto_job
+            assert "Source changed during browser cryptography verification" in crypto_job
+            assert "crypto-web-provenance-${{ inputs.source_sha }}" in crypto_job
         assert "ref: ${{ inputs.source_sha }}" in selected or "ref: '${{ inputs.source_sha }}'" in selected
     for job, filename in (("crypto-web", "_ci-crypto.yml"), ("web", "_ci-web.yml")):
         assert f"uses: ./.github/workflows/{filename}" in block("ci.yml", job)
