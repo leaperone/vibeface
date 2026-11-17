@@ -1,5 +1,6 @@
 import type { ConnectionEntry, MembershipView } from './node.ts'
 import { lanAddrs, validEndpoint } from './transport.ts'
+import { parseHttpOrigin, parseHttpsOrigin } from './origin.ts'
 import publicBootstrap from '../../../../config/public-bootstrap.json' with { type: 'json' }
 
 /** The official page: static, with no Node behind it. */
@@ -16,9 +17,8 @@ export const PUBLIC_GATEWAY: string = publicBootstrap.gateway_url
  * page and for the apps, whose pages come from their own bundle (`vibeface-app://app` on the desktop).
  */
 export function defaultGateway(pageOrigin: string | undefined): string {
-  let served = false
-  try { served = !!pageOrigin && ['http:', 'https:'].includes(new URL(pageOrigin).protocol) } catch { /* not a URL */ }
-  return served && pageOrigin !== APP_ORIGIN ? pageOrigin! : PUBLIC_GATEWAY
+  const served = parseHttpOrigin(pageOrigin)
+  return served && served.origin !== APP_ORIGIN ? served.origin : PUBLIC_GATEWAY
 }
 
 /** A chosen access address as stored, or null when there is none or it no longer validates. */
@@ -29,6 +29,7 @@ export function storedGateway(value: unknown): string | null {
 /**
  * A member Node from its latest signed address record. `seq` is the highest record accepted, kept
  * even when that record withdrew the web address (`gateway_url` null), so an older record never comes back.
+ * `gateway_url` keeps the signed descriptor verbatim; openEntrances derives its dial origin.
  * `public` means reachable from other networks; `direct` is where the Node listens, for the app on its LAN.
  */
 export type Entrance = { device_id: string; seq: number; gateway_url: string | null; public: boolean; direct: string[]; last_ok_ms: number }
@@ -39,12 +40,15 @@ type Check = (deviceId: string, payload: string, signature: string) => boolean
 const devicePattern = /^[a-f0-9]{64}$/
 const privateHost = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|\[::1\]|\[f[cd]|\[fe80:)|\.local$|\.lan$|\.internal$|\.home\.arpa$/i
 
+const publicOrigin = (url: URL): boolean => {
+  const host = url.hostname.replace(/\.$/, '')
+  return url.protocol === 'https:' && !privateHost.test(host) && host.includes('.')
+}
+
 /** HTTPS on a name other networks can resolve; loopback, LAN and plain HTTP stay local. */
 export function isPublicUrl(value: string): boolean {
-  try {
-    const url = new URL(value)
-    return url.protocol === 'https:' && !privateHost.test(url.hostname) && url.hostname.includes('.')
-  } catch { return false }
+  const url = parseHttpsOrigin(value)
+  return url !== null && publicOrigin(url)
 }
 
 const members = (view: MembershipView) => {
@@ -73,9 +77,9 @@ export function verifiedEntrances(records: unknown, view: MembershipView, check:
       if ((found.get(deviceId)?.seq ?? -1) >= (seq as number)) continue
       const direct = directOf(record.endpoint)
       if (gateway === null) { found.set(deviceId, { device_id: deviceId, seq: seq as number, gateway_url: null, public: false, direct, last_ok_ms: 0 }); continue }
-      const url = new URL(gateway)
-      if (!['http:', 'https:'].includes(url.protocol) || url.pathname !== '/' || url.search || url.hash || url.username) continue
-      found.set(deviceId, { device_id: deviceId, seq: seq as number, gateway_url: url.origin, public: isPublicUrl(url.origin), direct, last_ok_ms: 0 })
+      const url = parseHttpOrigin(gateway)
+      if (!url) continue
+      found.set(deviceId, { device_id: deviceId, seq: seq as number, gateway_url: gateway, public: publicOrigin(url), direct, last_ok_ms: 0 })
     } catch { /* an unreadable record is someone else's problem, not a reason to drop the rest */ }
   }
   return [...found.values()]
@@ -85,9 +89,14 @@ export function verifiedEntrances(records: unknown, view: MembershipView, check:
 export function storedEntrances(value: unknown): Entrance[] {
   if (!Array.isArray(value)) return []
   return value.filter((item): item is Entrance => {
-    const v = item as Partial<Entrance> | null
-    return typeof v?.device_id === 'string' && devicePattern.test(v.device_id) && Number.isSafeInteger(v.seq) && (v.gateway_url === null || typeof v.gateway_url === 'string')
-      && typeof v.public === 'boolean' && Array.isArray(v.direct) && lanAddrs(v.direct).length === v.direct.length && typeof v.last_ok_ms === 'number'
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) return false
+    const v = item as Partial<Entrance>
+    if (typeof v.device_id !== 'string' || !devicePattern.test(v.device_id) || typeof v.seq !== 'number' || !Number.isSafeInteger(v.seq) || v.seq < 0
+      || typeof v.last_ok_ms !== 'number' || !Number.isSafeInteger(v.last_ok_ms) || v.last_ok_ms < 0 || typeof v.public !== 'boolean'
+      || !Array.isArray(v.direct) || lanAddrs(v.direct).length !== v.direct.length) return false
+    if (v.gateway_url === null) return v.public === false
+    const url = parseHttpOrigin(v.gateway_url)
+    return url !== null && v.public === publicOrigin(url)
   })
 }
 
@@ -101,10 +110,8 @@ export function gatewaysOf(value: unknown): Gateway[] {
   for (const item of value.slice(0, 16)) {
     const { device_id, url } = (item ?? {}) as Partial<Gateway>
     if (typeof device_id !== 'string' || !devicePattern.test(device_id) || typeof url !== 'string') continue
-    try {
-      const origin = new URL(url)
-      if (origin.protocol === 'https:' && origin.pathname === '/' && !origin.search && !origin.hash && !origin.username && !origin.password) found.set(origin.origin, { device_id, url: origin.origin })
-    } catch { /* not a URL */ }
+    const origin = parseHttpsOrigin(url)
+    if (origin) found.set(origin.origin, { device_id, url: origin.origin })
   }
   return [...found.values()]
 }
@@ -121,12 +128,16 @@ export function mergeEntrances(saved: Entrance[], fresh: Entrance[], view: Membe
   return [...merged.values()]
 }
 
-/** Entrances whose latest record still names a web address. */
-export const openEntrances = (list: Entrance[]): OpenEntrance[] => list.filter((item): item is OpenEntrance => item.gateway_url !== null)
+/** Dial origins derived from each latest descriptor; the signed/cache descriptor stays untouched. */
+export const openEntrances = (list: Entrance[]): OpenEntrance[] => list.flatMap(item => {
+  const url = parseHttpOrigin(item.gateway_url)
+  return url ? [{ ...item, gateway_url: url.origin }] : []
+})
 
 export function markReached(list: Entrance[], entry: ConnectionEntry, at = Date.now()): Entrance[] {
   if (entry.kind === 'lan') return list
-  return list.map(item => item.device_id === entry.device_id && item.gateway_url === entry.address ? { ...item, last_ok_ms: at } : item)
+  const origin = parseHttpOrigin(entry.address)?.origin
+  return list.map(item => item.device_id === entry.device_id && origin !== undefined && parseHttpOrigin(item.gateway_url)?.origin === origin ? { ...item, last_ok_ms: at } : item)
 }
 
 /**
