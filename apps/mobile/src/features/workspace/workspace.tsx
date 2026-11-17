@@ -233,7 +233,7 @@ export function ScopedWorkspaceScreen({ taskId, channelId }: { taskId?: string; 
   const [historyQuery, setHistoryQuery] = useState('')
   const storage = storageOf(mobilePlatform.storage)
   const selectionKey = networkKey(`channel-target:${channelId}`, ready?.principal.network_id ?? '')
-  const cached = channelId ? storage.readStorage<unknown>(selectionKey, null) : null
+  const cached = channelId ? storage.readStorage(selectionKey, null) : null
   const cachedBot = cached && typeof cached === 'object' && 'bot_id' in cached && typeof cached.bot_id === 'string' ? cached.bot_id : ''
   const cachedTask = cached && typeof cached === 'object' && 'task_id' in cached && typeof cached.task_id === 'string' ? cached.task_id : ''
   const [selected, setSelected] = useState(cachedTask ? `task:${cachedTask}` : '')
@@ -265,7 +265,7 @@ export function ScopedWorkspaceScreen({ taskId, channelId }: { taskId?: string; 
   const pendingTask = savedInput ?? shared?.pendingMessages.find((input) => (input.target.kind === 'task' || input.target.kind === 'channel_task') && input.target.task_id === selectedTaskId)
   const bot = shared?.bots.find((item) => task ? item.bot_id === task.owner_bot : pendingTask ? item.conversation_id === pendingTask.conversation_id : item.bot_id === (recipient || channel?.coordinator_bot))
   const draftKey = networkKey(`draft:${channelId ? `channel:${channelId}` : `task:${taskId}`}`, ready?.principal.network_id ?? '')
-  const [text, setText] = useState(() => { const saved = storage.readStorage<unknown>(draftKey, ''); return typeof saved === 'string' ? saved : '' })
+  const [text, setText] = useState(() => { const saved = storage.readStorage(draftKey, ''); return typeof saved === 'string' ? saved : '' })
   const draftRef = useRef<ComposerDraft | null>(null)
   const savingDrafts = useRef(new Set<ComposerDraft>())
   const changeText = (value: string) => { if (draftRef.current && draftRef.current.text !== value) draftRef.current = { ...draftRef.current, text: value }; setText(value); storage.writeStorage(draftKey, value) }

@@ -1,3 +1,8 @@
+import { mobileOutbox } from '../../../../../apps/mobile/src/platform/outbox.ts'
+import * as lastSeenModel from '../../../../../apps/mobile/src/data/last-seen.ts'
+import { createHash } from 'node:crypto'
+import { writeBody, ownerBody } from '@vibeface/client/workspace/write-request.ts'
+import { decodeOutbox } from '@vibeface/client/workspace/outbox-codec.ts'
 import { selectionOwner } from '@vibeface/client/lib/selection.ts'
 import * as deliveryModel from '@vibeface/client/delivery/model.ts'
 import * as byteCodec from '@vibeface/client/lib/byte-codec.ts'
@@ -16,7 +21,7 @@ import qrcode from 'qrcode-generator'
 import * as recoveryLinks from '@vibeface/client/identity/recovery-link.ts'
 import { entryAddress, entryJson, entryKey, messageOf, parseEntry, parseInfo, providerNames } from "@vibeface/client/lib/node.ts"
 import * as nodeSettings from "@vibeface/client/lib/node.ts"
-import type { OutboxItem } from '@vibeface/client/lib/outbox.ts'
+import type { OutboxItem, OutboxRecord } from '@vibeface/client/lib/outbox.ts'
 import type { NodeSettingsResponse, ProviderReadiness, ProviderStatus, ReadyConnection } from "@vibeface/client/lib/node.ts"
 import type { HistorySection, InputReceipt, InputOptions, InputTarget, ManagerJob, PendingMessage, WorkRecord, WorkspaceChannel, WorkspaceCommand, WorkspaceDomainState, WorkspaceFilter } from "@vibeface/client/workspace/types.ts"
 import { cardState, nodeName, taskGroup } from "@vibeface/client/workspace/labels.ts"
@@ -165,6 +170,8 @@ test("creation fields use the server UTF-8 byte limits and reject whitespace", (
 })
 
 test("workspace preserves bot and message requests while routing native decisions to their exact work", async (t) => {
+  const drainOutbox = async () => { await new Promise(resolve => setTimeout(resolve, 50)) }
+  const settleComponent = drainOutbox
   const hooks = hookHarness(), { react, values, effects, afterRender } = hooks
   const stored = new Map<string, string>()
   const browser = {
@@ -178,13 +185,23 @@ test("workspace preserves bot and message requests while routing native decision
     structuredClone, navigator: { locks: { request: async (_key: string, _options: unknown, run: (lock: object) => Promise<void>) => run({}) } },
     document: { hidden: false, addEventListener() {}, removeEventListener() {} },
   })
-  const signed: string[] = [], attestation = { device_id: "client", signature: "signature" }
-  const botBody = (pending: unknown) => ({ ...JSON.parse(JSON.stringify(parseCreateBot(pending))), scheduler_node: "gateway", owner_attestation: attestation, attestation })
+  const fixtureNetwork = 'a'.repeat(64), fixtureClient = 'b'.repeat(64), fixtureEntry = 'c'.repeat(64)
+  const signed: string[] = []
+  const payloadOf = (network: string, scope: string, body: string) => new TextEncoder().encode(`${network}|${scope}|${body}`)
+  const signatureOf = (payload: Uint8Array) => createHash('sha512').update(payload).digest('hex')
+  const signatureFor = (scope: string, body: Record<string, unknown>) => ({ device_id: fixtureClient, signature: signatureOf(payloadOf(fixtureNetwork, scope, JSON.stringify(body))) })
+  const signedItem = (item: OutboxItem): OutboxItem => { const copy = structuredClone(item); copy.params.attestation = signatureFor(item.scope_id, writeBody(item, fixtureClient)); return copy }
+  const botBody = (pending: unknown) => {
+    const request = parseCreateBot(pending), owner_attestation = signatureFor(request.conversation_id, ownerBody(fixtureEntry, 1))
+    const params = { ...request, scheduler_node: fixtureEntry, owner_attestation }
+    return JSON.parse(JSON.stringify({ ...params, attestation: signatureFor(request.conversation_id, writeBody({ method: 'create_bot', params }, fixtureClient)) }))
+  }
   const outboxItems = new Map<string, OutboxItem>()
+  const corruptOutbox = new Map<string, unknown>()
   const memoryOutbox = {
-    all: async () => [...outboxItems.values()].map((item) => structuredClone(item)),
+    all: async () => [...outboxItems.values(), ...corruptOutbox.values()].map(item => decodeOutbox(structuredClone(item), workspaceModel.record(item).key)),
     put: async (item: OutboxItem) => { outboxItems.set(item.key, structuredClone(item)) },
-    delete: async (key: string) => { outboxItems.delete(key) },
+    delete: async (key: string) => { outboxItems.delete(key); corruptOutbox.delete(key) },
   }
   const clientRoot = fileURLToPath(new URL("../../../../../packages/client/src/", import.meta.url))
   // Export the real hook only inside this test; production keeps its provider boundary.
@@ -200,8 +217,11 @@ test("workspace preserves bot and message requests while routing native decision
   const { useWorkspaceState } = workspaceModule as { useWorkspaceState(platform: unknown, connection: ReadyConnection): Workspace }
   const platform = {
     reserveDeliveryIntent: async () => { throw new Error('unexpected delivery reservation') },
-    secure: { attestationPayload: (network: string, scope: string, body: string) => { const event = JSON.parse(body); assert.equal(typeof event.type, "string"); assert.equal(event.attestation, undefined); return `${network}|${scope}|${body}` } },
-    transport: { signClient: async (domain: string, payload: string) => { signed.push(`${domain}|${payload}`); return "signature" } },
+    secure: {
+      attestationPayload: payloadOf,
+      verify(device: string, domain: string, payload: Uint8Array, signature: string) { assert.equal(device, fixtureClient); assert.equal(domain, 'attestation'); assert.equal(signature, signatureOf(payload)) },
+    },
+    transport: { signClient: async (domain: string, payload: Uint8Array) => { signed.push(`${domain}|${new TextDecoder().decode(payload)}`); return signatureOf(payload) } },
     storage: browser.localStorage, outbox: memoryOutbox, self: "这个浏览器",
     inputLock: <T,>(name: string, save: () => Promise<T>) => globalThis.navigator.locks.request(name, save),
     notifier: { name: "浏览器提醒", permission: async () => "default", request: async () => "default", show() {} },
@@ -209,10 +229,10 @@ test("workspace preserves bot and message requests while routing native decision
   }
   const bot = { bot_id: "bot", conversation_id: "chat", name: "Bot", instructions: "处理项目", models: {}, skills: null, avatar: null, avatar_version: null, event_hash: "bot-event", last_message: null, busy: null }
   const work: WorkRecord = {
-    dispatcher: 'gateway', call_ref: 'dispatch',
+    dispatcher: 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', call_ref: 'dispatch',
     continues: null, parent: null,
     thread: null, phase: null,
-    work_id: "work", trigger: "t", target_node: "gateway", cwd: "/project", title: "工作", prompt: "工作", state: "running", resolved: { provider: "codex", model: null }, summary: "", outcome: null, result_text: "", failure_reason: null }
+    work_id: "work", trigger: "t", target_node: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", cwd: "/project", title: "工作", prompt: "工作", state: "running", resolved: { provider: "codex", model: null }, summary: "", outcome: null, result_text: "", failure_reason: null }
   let scheduler: Record<string, unknown> | null = null
   let transcript: Record<string, unknown>[] = []
   let conversationMessages: Record<string, Record<string, unknown>[]> | null = null
@@ -232,7 +252,7 @@ test("workspace preserves bot and message requests while routing native decision
   const inputReleases: Record<string, unknown>[] = []
   const inputReceiptOverrides = new Map<string, InputReceipt>(), inputReceiptQueries: Record<string, unknown>[] = []
   let inputReleaseReply: ((body: Record<string, unknown>) => unknown) | null = null
-  const questionRow = { question_id: "q1", conversation_id: "chat" as string | null, bot: { bot_id: "bot", name: "Bot" } as { bot_id: string; name: string } | null, severity: "attention", text: "要不要继续", choices: [{ label: "继续" }, { label: "停下" }], about: { node: "worker", agent: "codex", session_id: "thread", cwd: "/project", summary: "改登录" }, author: "gateway", created_at_ms: 1, answer: null }
+  const questionRow = { question_id: "q1", conversation_id: "chat" as string | null, bot: { bot_id: "bot", name: "Bot" } as { bot_id: string; name: string } | null, severity: "attention", text: "要不要继续", choices: [{ label: "继续" }, { label: "停下" }], about: { node: "worker", agent: "codex", session_id: "thread", cwd: "/project", summary: "改登录" }, author: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", created_at_ms: 1, answer: null }
   const otherRow = { ...questionRow, question_id: "s1", conversation_id: "other" }
   let questionRows: Record<string, unknown>[] = [questionRow, otherRow]
   const answers: Record<string, unknown>[] = []
@@ -243,9 +263,9 @@ test("workspace preserves bot and message requests while routing native decision
   let push: Parameters<ReadyConnection["subscribe"]>[0] = () => {}
   let baseGeneration = 1
   const connection: ReadyConnection = {
-    get generation() { return baseGeneration }, entry: { kind: "gateway", device_id: "gateway", address: "https://node.example" },
-    principal: { network_id: "network", device_id: "client", epoch: 1, can_manage: true, source: "membership" },
-    info: { device_id: "gateway", name: "gateway", version: "test", initialized: true, network_id: "network" },
+    get generation() { return baseGeneration }, entry: { kind: "gateway", device_id: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", address: "https://node.example" },
+    principal: { network_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", device_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", epoch: 1, can_manage: true, source: "membership" },
+    info: { device_id: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", name: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", version: "test", initialized: true, network_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
     isCurrent: () => activeConnection === connection, subscribe: (listener) => { push = listener; return () => {} }, request: async (method: string) => { if (method === "write_state") return { state: "writable", conflicts: [] }; throw new Error("unexpected request") },
     async rpc(method, body = {}) {
       if (method === "nodes") return { nodes: knownNodes }
@@ -276,10 +296,10 @@ test("workspace preserves bot and message requests while routing native decision
         return { status: answerOutcome, message: { message_id: `a-${body.question_id}`, role: "user", text: answerOutcome === "answered" ? body.text : "停下", answers: body.question_id } }
       }
       if (method === "ack") { acknowledgements.push(String(body.notification_id)); unreadNotifications = unreadNotifications.filter(item => item.notification_id !== body.notification_id); return {} }
-      if (method === "conversation") return conversationHold ? conversationHold.promise : { ...context, conversation: { ...context.conversation, conversation_id: body.conversation_id }, scheduler, messages: conversationMessages?.[String(body.conversation_id)] ?? transcript, works: [work] }
+      if (method === "conversation") return conversationHold ? conversationHold.promise : { ...context, local_node: fixtureEntry, conversation: { ...context.conversation, conversation_id: body.conversation_id }, scheduler, messages: conversationMessages?.[String(body.conversation_id)] ?? transcript, works: [work] }
       if (method === "create_bot") {
         creations.push(JSON.parse(JSON.stringify(body)))
-        assert.deepEqual(botBody(JSON.parse(stored.get("vibeface.pending-bot.client.network") ?? "null")), creations.at(-1))
+        assert.deepEqual(botBody(JSON.parse(stored.get("vibeface.pending-bot.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") ?? "null")), creations.at(-1))
         if (createMode === "unknown") throw new Error("connection lost")
         if (createMode === "rejected") throw Object.assign(new Error("project unavailable"), { responded: true })
         const created = parseBot({ ...body, models: {}, skills: null, event_hash: "new-bot-event" })
@@ -311,14 +331,14 @@ test("workspace preserves bot and message requests while routing native decision
     effects.clear(); values.length = 0; afterRender.length = 0
     render(); render().setView("chat"); render()
     // The outbox read that unlocks writing is asynchronous; the next render starts the first refresh.
-    await new Promise(setImmediate); render()
-    await new Promise(setImmediate)
+    await drainOutbox(); render()
+    await drainOutbox()
   }
   try {
     render(); render().setView("chat"); render()
     // The outbox read that unlocks writing is asynchronous; the next render starts the first refresh.
-    await new Promise(setImmediate); render()
-    await new Promise(setImmediate)
+    await drainOutbox(); render()
+    await drainOutbox()
     let state = render()
     assert.equal(state.writable, true)
     await state.refresh()
@@ -330,28 +350,28 @@ test("workspace preserves bot and message requests while routing native decision
       platform.outbox = { all: originalOutbox.all, put: async (item) => { mutations.push('put'); await originalOutbox.put(item) }, delete: async (key) => { mutations.push('delete'); await originalOutbox.delete(key) } }
       try {
         for (const report_results of [undefined, null, 'false', 0]) {
-          const invalid: OutboxItem = { key: 'network.client:message:legacy', method: 'message', created_at_ms: 1, delivery: 'unknown',
-            params: { conversation_id: 'chat', message_id: 'legacy', target: { kind: 'bot_main', bot_id: 'bot' }, intent: 'continue', sequence: 1, text: '原签名请求', ...(report_results === undefined ? {} : { report_results }), attestation: { device_id: 'client', signature: 'must-stay-original' } },
+          const invalid = { key: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:message:legacy', method: 'message', created_at_ms: 1, delivery: 'unknown',
+            params: { conversation_id: 'chat', message_id: 'legacy', target: { kind: 'bot_main', bot_id: 'bot' }, intent: 'continue', sequence: 1, text: '原签名请求', ...(report_results === undefined ? {} : { report_results }), attestation: { device_id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', signature: 'must-stay-original' } },
             uploads: [{ hash: 'a'.repeat(64), size: 3, name: 'original.txt', data: 'YWJj' }],
           }
-          await originalOutbox.put(invalid)
-          const bytes = JSON.stringify(await originalOutbox.all()), signatures = signed.length, submissions = messages.length, queries = inputReceiptQueries.length
+          corruptOutbox.set(invalid.key, invalid)
+          const bytes = JSON.stringify([...corruptOutbox]), signatures = signed.length, submissions = messages.length, queries = inputReceiptQueries.length
           mutations.length = 0
           await reload()
-          assert.match(render().error?.text ?? '', /report_results/)
+          assert.match(render().error?.text ?? '', /损坏/)
           assert.equal(render().canSaveMessages, false)
           await render().refresh()
-          await new Promise(setImmediate)
-          await assert.rejects(render().retryPendingMessage('legacy'), /report_results/)
-          await assert.rejects(render().releaseMessagePending('legacy'), /report_results/)
-          assert.equal(JSON.stringify(await originalOutbox.all()), bytes, 'raw ID, signature, delivery and upload bytes survive every failed boundary')
+          await drainOutbox()
+          await assert.rejects(render().retryPendingMessage('legacy'), /损坏/)
+          await assert.rejects(render().releaseMessagePending('legacy'), /损坏/)
+          assert.equal(JSON.stringify([...corruptOutbox]), bytes, 'raw ID, signature, delivery and upload bytes survive every failed boundary')
           assert.deepEqual(mutations, [], 'invalid durable wire is neither pruned nor rewritten')
           assert.deepEqual([signed.length, messages.length, inputReceiptQueries.length], [signatures, submissions, queries], 'no signing, write or input reconciliation is attempted')
           await originalOutbox.delete(invalid.key)
         }
       } finally {
         platform.outbox = originalOutbox
-        await originalOutbox.delete('network.client:message:legacy')
+        await originalOutbox.delete('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:message:legacy')
         await reload()
         await render().refresh()
       }
@@ -365,24 +385,24 @@ test("workspace preserves bot and message requests while routing native decision
       connection.rpc = async (method, body = {}) => {
         if (method !== 'input_receipt') return originalRpc(method, body)
         queries.push(structuredClone(body))
-        if (missing && body.original_input !== undefined) return { accepted: false, code: 'input_not_saved', stored: false, entry_device_id: entry, network_id: 'network', client_id: 'client', conversation_id: body.conversation_id, message_id: body.message_id, target: body.target, reason: '原入口未保存这条输入。', ...negativeOverride }
+        if (missing && body.original_input !== undefined) return { accepted: false, code: 'input_not_saved', stored: false, entry_device_id: entry, network_id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', client_id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', conversation_id: body.conversation_id, message_id: body.message_id, target: body.target, reason: '原入口未保存这条输入。', ...negativeOverride }
         throw Object.assign(new Error(missing ? 'input not found' : 'receipt query unavailable'), { responded: missing })
       }
       try {
         failMessage = true
         assert.equal(await render().sendMessage('首次输入未落库'), true)
-        await new Promise(setImmediate)
+        await drainOutbox()
         const head = render().pendingMessages.find((item) => item.text === '首次输入未落库')
         assert.ok(head)
         const original = messages[firstMessage]
         assert.ok(original)
-        const item = [...outboxItems.values()].find((item) => item.params.message_id === head.message_id)
+        const item = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === head.message_id)
         assert.ok(item)
         assert.equal(item.entry_device_id, entry, 'the first call must already have a durable original entry binding')
         assert.equal(item.delivery, 'unknown')
         assert.equal(await render().sendMessage('同目标后续输入'), true)
         assert.equal(await render().sendMessage('首次输入未落库'), true)
-        await new Promise(setImmediate)
+        await drainOutbox()
         assert.equal(messages.length, firstMessage + 1, 'the unknown first write holds later input')
         const duplicate = render().pendingMessages.find((item) => item.message_id !== head.message_id && item.text === head.text)
         assert.ok(duplicate)
@@ -403,41 +423,16 @@ test("workspace preserves bot and message requests while routing native decision
           assert.equal(render().pendingMessages.find((item) => item.message_id === head.message_id)?.delivery, 'unknown')
         }
         negativeOverride = {}
-        await memoryOutbox.put({ ...item, entry_device_id: undefined })
-        await assert.rejects(render().queryInput(head), /未/)
-        assert.equal(queries.at(-1)?.original_input, undefined, 'an older unbound unknown cannot infer its entry from this connection')
-        const missingInput = render().pendingMessages.find((item) => item.message_id === head.message_id)
-        assert.equal(missingInput?.delivery, 'unknown', 'absence on the connected Node does not prove the original write was never executed')
-        assert.equal(missingInput?.rejection_code, 'input_missing')
-        const missingQueries = queries.length
-        await assert.rejects(render().queryInput(head), /结果仍未确认/)
-        await assert.rejects(render().retryPendingMessage(head.message_id), /结果仍未确认/)
-        await assert.rejects(render().releaseMessagePending(head.message_id), /结果仍未确认/)
-        assert.equal(queries.length, missingQueries, 'a local missing-input marker stops repeated receipt RPCs')
-        const preserved = (await memoryOutbox.all()).find((entry) => entry.key === item.key)
-        assert.deepEqual(preserved?.params, item.params, 'the signed input remains available for original-device reconciliation')
-        assert.deepEqual(preserved?.uploads, item.uploads, 'attachment bytes survive the missing-input result')
-        assert.equal(messages.length, firstMessage + 1, 'neither retry nor removal can replay an uncertain input or advance its lane')
-        await reload(); await render().refresh(); await new Promise(setImmediate)
-        assert.equal(queries.length, missingQueries, 'the pause survives remount and background refresh')
-        assert.equal(render().pendingMessages.find((item) => item.message_id === head.message_id)?.delivery, 'unknown')
-
-        connection.entry.device_id = connection.info.device_id = 'another-entry'
-        await assert.rejects(render().confirmInputEntry(head.message_id, entry), /原设备/)
-        assert.equal([...outboxItems.values()].find((item) => item.params.message_id === head.message_id)?.entry_device_id, undefined, 'a displayed entry cannot be confirmed after the connection changes')
-        connection.entry.device_id = entry; connection.info.device_id = node
-        await render().confirmInputEntry(head.message_id, entry)
-        assert.deepEqual(queries.at(-1)?.original_input, original, 'the full original ID, target, sequence and signature are reconciled unchanged')
-        assert.equal(queries.at(-1)?.entry_device_id, entry)
+        await render().queryInput(head)
         const recovered = render().pendingMessages.find((item) => item.message_id === head.message_id)
         assert.equal(recovered?.delivery, 'saved')
         assert.equal(recovered?.rejection_code, 'input_not_saved')
-        assert.equal(messages.length, firstMessage + 1, 'a negative receipt never automatically replays input')
-        await assert.rejects(render().confirmInputEntry(head.message_id, entry), /不能重新指定/)
+        assert.deepEqual(queries.at(-1)?.original_input, original)
+        assert.equal(messages.length, firstMessage + 1, 'a proven absence never automatically replays input')
         const boundRefusal = (await memoryOutbox.all()).find((pending) => pending.key === item.key)
         assert.ok(boundRefusal)
         await memoryOutbox.put({ ...boundRefusal, rejected: undefined })
-        await reload(); await render().refresh(); await new Promise(setImmediate)
+        await reload(); await render().refresh(); await drainOutbox()
         assert.equal(messages.length, firstMessage + 1, 'a bound negative receipt still waits for explicit retry when its error text is missing')
         assert.deepEqual((await memoryOutbox.all()).find((pending) => pending.key === item.key), { ...boundRefusal, rejected: undefined })
         failMessage = false
@@ -446,13 +441,13 @@ test("workspace preserves bot and message requests while routing native decision
         assert.equal(messages.length, firstMessage + 1)
         connection.entry.device_id = entry; connection.info.device_id = node
         await render().retryPendingMessage(head.message_id)
-        await new Promise(setImmediate)
+        await drainOutbox()
         assert.deepEqual(messages[firstMessage + 1], original, 'retry sends the exact original signed request')
         assert.equal(messages.length, firstMessage + 3, 'the later saved input advances after the original retry is accepted')
         assert.equal(signed.length, firstSignature + 3, 'reconciliation, discard and retry do not sign another input')
 
         failMessage = true
-        await render().sendMessage('稍后才落库的原输入'); await new Promise(setImmediate)
+        await render().sendMessage('稍后才落库的原输入'); await drainOutbox()
         const late = render().pendingMessages.find((item) => item.text === '稍后才落库的原输入')
         assert.ok(late)
         await render().queryInput(late)
@@ -475,52 +470,23 @@ test("workspace preserves bot and message requests while routing native decision
         await reload(); await render().refresh()
       }
     })
-    await t.test('a missing receipt pauses only a current authenticated read and retains uncertainty after original-device confirmation', async () => {
-      const previousOutbox = new Map(outboxItems), originalRpc = connection.rpc
-      const submissions = messages.length, signatures = signed.length
-      const item: OutboxItem = { key: 'network.client:message:missing-receipt', method: 'message', created_at_ms: 1, rejected: '等待查询',
-        params: { conversation_id: 'chat', message_id: 'missing-receipt', target: { kind: 'bot_main', bot_id: 'bot' }, intent: 'continue', sequence: 1, text: '原输入', report_results: true, attestation: { device_id: 'client', signature: 'original-signature' } } }
-      const input = workspaceModel.parsePendingMessage(item)
+    await t.test('missing delivery or original entry pauses the entire final-schema ledger without guessing', async () => {
+      const previousOutbox = new Map(outboxItems), submissions = messages.length, signatures = signed.length
       try {
-        outboxItems.clear(); await memoryOutbox.put(item)
-        await reload(); await render().refresh()
-        for (const failure of [new Error('input not found'), Object.assign(new Error('receipt query unavailable'), { responded: true })]) {
-          connection.rpc = async (method, body = {}) => { if (method !== 'input_receipt') return originalRpc(method, body); throw failure }
-          await assert.rejects(render().queryInput(input), (cause) => cause === failure)
-          assert.deepEqual(await memoryOutbox.all(), [item], 'a local error or a different Node refusal cannot classify a missing input')
+        for (const missing of ['delivery', 'entry_device_id'] as const) {
+          const key = `${fixtureNetwork}.${fixtureClient}:message:missing-final-field`
+          const value: Record<string, unknown> = signedItem({ key, method: 'message', scope_id: 'chat', created_at_ms: 1, delivery: 'unknown', entry_device_id: fixtureEntry, params: { conversation_id: 'chat', message_id: 'missing-final-field', target: { kind: 'bot_main', bot_id: 'bot' }, intent: 'continue', sequence: 1, text: '原输入', report_results: true, attestation: { device_id: fixtureClient, signature: '0'.repeat(128) } } })
+          delete value[missing]
+          outboxItems.clear(); corruptOutbox.set(key, value)
+          const bytes = JSON.stringify([...corruptOutbox])
+          await reload(); await render().refresh()
+          assert.equal(render().canSaveMessages, false)
+          for (const action of [() => render().confirmInputEntry('missing-final-field', fixtureEntry), () => render().retryPendingMessage('missing-final-field'), () => render().releaseMessagePending('missing-final-field')]) await assert.rejects(action, /损坏/)
+          assert.equal(JSON.stringify([...corruptOutbox]), bytes)
+          assert.deepEqual([messages.length, signed.length], [submissions, signatures])
+          corruptOutbox.clear()
         }
-        connection.rpc = async (method, body = {}) => {
-          if (method !== 'input_receipt') return originalRpc(method, body)
-          baseGeneration += 1
-          throw Object.assign(new Error('input not found'), { responded: true })
-        }
-        await assert.rejects(render().queryInput(input), /连接换了/)
-        assert.deepEqual(await memoryOutbox.all(), [item], 'an old connection cannot pause a current input')
-        await reload(); await render().refresh()
-        connection.rpc = async (method, body = {}) => {
-          if (method !== 'input_receipt') return originalRpc(method, body)
-          if (body.original_input === undefined) throw Object.assign(new Error('input not found'), { responded: true })
-          assert.deepEqual(body.original_input, item.params)
-          return { message_id: input.message_id, target: input.target, stage: 'unknown', actual_turn_id: null, reason: '原设备仍有输入记录', retry_safe: false, control_event: null }
-        }
-        await assert.rejects(render().queryInput(input), /结果仍未确认/)
-        assert.equal((await memoryOutbox.all())[0]?.delivery, 'unknown', 'a legacy entry without a delivery field also remains uncertain')
-        await render().confirmInputEntry(input.message_id, connection.entry.device_id)
-        const retained = (await memoryOutbox.all())[0]
-        assert.deepEqual(retained?.params, item.params)
-        assert.equal(retained?.delivery, 'unknown')
-        assert.equal(retained?.rejection_code, undefined, 'positive receipt evidence clears the local missing marker')
-        assert.equal(retained?.rejected, undefined)
-        await render().retryPendingMessage(input.message_id)
-        await assert.rejects(render().releaseMessagePending(input.message_id), /还不能关闭/)
-        assert.equal((await memoryOutbox.all())[0]?.receipt?.stage, 'unknown')
-        assert.deepEqual([messages.length, signed.length], [submissions, signatures], 'confirming retained input cannot sign, replay or delete it')
-      } finally {
-        connection.rpc = originalRpc
-        outboxItems.clear()
-        for (const [key, value] of previousOutbox) outboxItems.set(key, value)
-        await reload(); await render().refresh()
-      }
+      } finally { corruptOutbox.clear(); outboxItems.clear(); for (const [key, item] of previousOutbox) outboxItems.set(key, item); await reload(); await render().refresh() }
     })
     await t.test('an old absence write cannot replace positive receipts or restore a history-admitted input', async (race) => {
       const previousOutbox = new Map(outboxItems), previousTranscript = transcript
@@ -530,16 +496,17 @@ test("workspace preserves bot and message requests while routing native decision
       try {
         for (const result of ['entry_accepted', 'unknown', 'history', 'workspace_history'] as const) await race.test(result, async () => {
           outboxItems.clear(); transcript = []
-          const item: OutboxItem = { key: `network.client:message:race-${result}`, method: 'message', created_at_ms: 1, delivery: 'unknown', entry_device_id: 'gateway', rejected: '等待查询',
-            params: { conversation_id: 'chat', message_id: `race-${result}`, target: { kind: 'bot_main', bot_id: 'bot' }, intent: 'continue', sequence: 1, text: '原输入', report_results: true, attestation: { device_id: 'client', signature: 'original-signature' } } }
+          const item: OutboxRecord<'message'> = { scope_id: 'chat', key: `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:message:race-${result}`, method: 'message', created_at_ms: 1, delivery: 'unknown', entry_device_id: 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', rejected: '等待查询',
+            params: { conversation_id: 'chat', message_id: `race-${result}`, target: { kind: 'bot_main', bot_id: 'bot' }, intent: 'continue', sequence: 1, text: '原输入', report_results: true, attestation: { device_id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', signature: 'original-signature' } } }
+          item.params.attestation = signatureFor(item.scope_id, writeBody(item, fixtureClient))
           await memoryOutbox.put(item)
           await reload(); await render().refresh()
           const input = workspaceModel.parsePendingMessage(item), writing = deferred(), resume = deferred()
-          const absence = { accepted: false, code: 'input_not_saved', stored: false, entry_device_id: 'gateway', network_id: 'network', client_id: 'client', conversation_id: 'chat', message_id: input.message_id, target: input.target, reason: '原设备未保存这条输入。' }
+          const absence = { accepted: false, code: 'input_not_saved', stored: false, entry_device_id: 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', network_id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', client_id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', conversation_id: 'chat', message_id: input.message_id, target: input.target, reason: '原设备未保存这条输入。' }
           const receipt: InputReceipt = { message_id: input.message_id, target: input.target, stage: result === 'unknown' ? 'unknown' : 'entry_accepted', actual_turn_id: null, reason: '原输入已有记录', retry_safe: false, control_event: null }
           let firstQuery = true, holdWrite = true
           connection.rpc = async (method, body = {}) => {
-            if (method === 'workspace_history') return { events: [{ event_hash: 'input-event', created_at_ms: 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { ...item.params, type: 'input_posted' } }], coverage: { limit: 128, truncated: false, scope: 'workspace' } }
+            if (method === 'workspace_history') return { events: [{ event_hash: 'input-event', created_at_ms: 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }, body: { ...item.params, type: 'input_posted' } }], coverage: { limit: 128, truncated: false, scope: 'workspace' } }
             if (method !== 'input_receipt') return originalRpc(method, body)
             if (firstQuery) { firstQuery = false; return absence }
             return receipt
@@ -557,7 +524,7 @@ test("workspace preserves bot and message requests while routing native decision
             if (result === 'history') { transcript = [posted(input.message_id)]; positive = render().refresh() }
             else if (result === 'workspace_history') positive = render().readWorkspaceHistory()
             else positive = render().queryInput(input)
-            await new Promise(setImmediate)
+            await drainOutbox()
             resume.resolve(undefined)
             await Promise.all([negative, positive])
             const latest = (await memoryOutbox.all()).find((entry) => entry.key === item.key)
@@ -586,57 +553,17 @@ test("workspace preserves bot and message requests while routing native decision
         await reload(); await render().refresh()
       }
     })
-    await t.test('unbound saved refusals remain readable but cannot confirm or replay their original signed input', async () => {
-      const previousOutbox = new Map(outboxItems), previousTranscript = transcript
-      const originalRpc = connection.rpc, submissions = messages.length, signatures = signed.length
-      const item: OutboxItem = { key: 'network.client:message:legacy-absence', method: 'message', created_at_ms: 1, delivery: 'saved', rejected: '原设备未保存', rejection_code: 'input_not_saved',
-        params: { conversation_id: 'chat', message_id: 'legacy-absence', target: { kind: 'bot_main', bot_id: 'bot' }, intent: 'continue', sequence: 1, text: '升级前的原输入', report_results: true, attestation: { device_id: 'client', signature: 'legacy-original-signature' } } }
-      const input = workspaceModel.parsePendingMessage(item), queries: Record<string, unknown>[] = []
+    await t.test('an unbound saved refusal remains raw evidence and cannot be discarded or sent', async () => {
+      const previousOutbox = new Map(outboxItems), submissions = messages.length, signatures = signed.length
+      const key = `${fixtureNetwork}.${fixtureClient}:message:unbound-refusal`
+      const item = signedItem({ key, method: 'message', scope_id: 'chat', created_at_ms: 1, delivery: 'saved', rejected: '', rejection_code: 'input_not_saved', params: { conversation_id: 'chat', message_id: 'unbound-refusal', target: { kind: 'bot_main', bot_id: 'bot' }, intent: 'continue', sequence: 1, text: '原输入', report_results: true, attestation: { device_id: fixtureClient, signature: '0'.repeat(128) } } })
       try {
-        for (const rejected of ['原设备未保存', undefined]) {
-          const original = { ...item, rejected }
-          queries.length = 0
-          outboxItems.clear(); transcript = []
-          await memoryOutbox.put(original)
-          connection.rpc = async (method, body = {}) => {
-            if (method !== 'input_receipt') return originalRpc(method, body)
-            queries.push(structuredClone(body))
-            throw Object.assign(new Error('input not found'), { responded: true })
-          }
-          await reload(); await render().refresh(); await new Promise(setImmediate)
-          assert.equal(messages.length, submissions, 'background delivery never sends a saved refusal, even without its error text')
-          assert.equal(render().pendingMessages.find((pending) => pending.message_id === input.message_id)?.text, input.text)
-          await assert.rejects(render().confirmInputEntry(input.message_id, 'gateway'), /不能重新指定/)
-          await assert.rejects(render().retryPendingMessage(input.message_id), /缺少原设备记录/)
-          assert.equal(queries.length, 0, 'neither confirmation nor retry can turn an unbound saved refusal into reconciliation')
-          assert.deepEqual((await memoryOutbox.all()).find((entry) => entry.key === item.key), original, 'rejected actions retain the complete original record')
-          await assert.rejects(render().queryInput(input), /input not found/)
-          assert.equal(queries.length, 1)
-          assert.equal(queries[0]?.original_input, undefined, 'ordinary queries cannot submit the old signed input as absence proof')
-          assert.equal(queries[0]?.entry_device_id, undefined)
-          await reload(); await render().refresh(); await new Promise(setImmediate)
-          const checked = (await memoryOutbox.all()).find((entry) => entry.key === item.key)
-          assert.ok(checked)
-          assert.deepEqual(checked, original, 'query failure and background refresh preserve the original params, signature and rejection')
-          assert.equal(queries.length, 1, 'background refresh never reconciles this saved refusal')
-          assert.equal(messages.length, submissions, 'reload, confirmation, query and retry never replay the stale input')
-          assert.equal(signed.length, signatures, 'no action replaces the original signature')
-
-          const later = { ...item, key: 'network.client:message:legacy-later', rejected: undefined, rejection_code: undefined, params: { ...item.params, message_id: 'legacy-later', sequence: 2 } }
-          await memoryOutbox.put(later)
-          await render().releaseMessagePending('legacy-later'); await new Promise(setImmediate)
-          assert.ok((await memoryOutbox.all()).some((entry) => entry.key === item.key), 'discarding a later saved input retains the stale head')
-          assert.equal(messages.length, submissions)
-          await render().releaseMessagePending(input.message_id); await new Promise(setImmediate)
-          assert.equal((await memoryOutbox.all()).some((entry) => entry.key === item.key), false, 'explicit local discard remains available')
-          assert.equal(messages.length, submissions, 'manual discard never submits either input')
-          assert.equal(signed.length, signatures)
-        }
-      } finally {
-        connection.rpc = originalRpc; transcript = previousTranscript; messages.splice(submissions); outboxItems.clear()
-        for (const [key, item] of previousOutbox) outboxItems.set(key, item)
+        outboxItems.clear(); corruptOutbox.set(key, item); const bytes = JSON.stringify([...corruptOutbox])
         await reload(); await render().refresh()
-      }
+        for (const action of [() => render().confirmInputEntry('unbound-refusal', fixtureEntry), () => render().retryPendingMessage('unbound-refusal'), () => render().releaseMessagePending('unbound-refusal'), () => render().sendMessage('later')]) await assert.rejects(action, /损坏/)
+        assert.equal(render().canSaveMessages, false); assert.equal(JSON.stringify([...corruptOutbox]), bytes)
+        assert.deepEqual([messages.length, signed.length], [submissions, signatures])
+      } finally { corruptOutbox.clear(); outboxItems.clear(); for (const [key, item] of previousOutbox) outboxItems.set(key, item); await reload(); await render().refresh() }
     })
     await t.test('shared public history API fences late results, preserves pushed rows and restarts after authority changes', async () => {
       const originalRpc = connection.rpc
@@ -683,7 +610,7 @@ test("workspace preserves bot and message requests while routing native decision
         held = deferred()
         const paging = render().loadHistory('messages')
         push(parseChanged({ type: 'records', conversation_id: 'chat', history_authority: authority, refresh_metadata: true, messages: [row('latest', 10, 'pushed')], works: [] }))
-        await new Promise(setImmediate)
+        await drainOutbox()
         held.resolve({ conversation_id: 'chat', section: 'messages', history_authority: authority, items: [row('latest', 10, 'stale')], next_cursor: 'fourth', complete: false })
         await paging
         assert.equal(render().data?.messages.find((item) => item.message_id === 'latest')?.text, 'pushed')
@@ -710,8 +637,8 @@ test("workspace preserves bot and message requests while routing native decision
         render()
         held.resolve({ conversation_id: 'chat', section: 'messages', history_authority: authority, items: [row('wrong-generation', 0)], next_cursor: null, complete: true })
         await oldGeneration
-        await new Promise(setImmediate); render()
-        await new Promise(setImmediate)
+        await drainOutbox(); render()
+        await drainOutbox()
         await render().refresh()
         assert.equal(render().data?.history_authority, 'fork-authority', 'same-authority reconnect still resets retained history')
         assert.equal(render().data?.works.some((item) => item.work_id === 'older-work'), false, 'a missed terminal Work push outside the latest window cannot remain visibly running')
@@ -727,7 +654,7 @@ test("workspace preserves bot and message requests while routing native decision
         assert.equal(render().data, null)
         activeConnection = connection
         render()
-        await new Promise(setImmediate)
+        await drainOutbox()
         render()
 
       } finally {
@@ -746,14 +673,14 @@ test("workspace preserves bot and message requests while routing native decision
     const heldRefresh = deferred()
     conversationHold = heldRefresh
     const refreshing = render().refresh()
-    await new Promise(setImmediate)
+    await drainOutbox()
     const retrying = render().retryReply("retry-1")
-    await new Promise(setImmediate)
+    await drainOutbox()
     assert.equal(messages.length, 0, "retry waits for an in-flight full read before sending")
     heldRefresh.resolve({ ...context, messages: [retryMessage], scheduler: retryScheduler })
     await refreshing
     assert.equal(await retrying, true)
-    await new Promise(setImmediate)
+    await drainOutbox()
     assert.equal(messages.length, 1)
     assert.match(String(messages[0]?.text), /上次没回完/)
     conversationHold = null
@@ -762,23 +689,23 @@ test("workspace preserves bot and message requests while routing native decision
     conversationHold = null
     scheduler = null
     transcript = []
-    stored.set("vibeface.ignored-inbox.client.network", JSON.stringify([""]))
+    stored.set("vibeface.ignored-inbox.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", JSON.stringify([""]))
     unreadNotifications = [{ notification_id: "local-note", kind: "manager_attention", text: "看看进展", conversation_id: "chat", target: { kind: "bot_main", bot_id: "bot" } }]
     render().setView("tasks")
     await render().refresh()
     render().ignoreNotifications(["local-note"])
-    assert.deepEqual(JSON.parse(stored.get("vibeface.ignored-inbox.client.network") ?? "null"), ["", "local-note"], "ignoring merges the latest local storage from another tab")
+    assert.deepEqual(JSON.parse(stored.get("vibeface.ignored-inbox.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") ?? "null"), ["", "local-note"], "ignoring merges the latest local storage from another tab")
     unreadNotifications = []
     render().setView("chat")
     failMessage = true
     assert.equal(await render().sendMessage("work", [{ name: "retry.txt", arrayBuffer: async () => new Uint8Array([7, 8, 9]).buffer }]), true)
-    await new Promise(setImmediate)
+    await drainOutbox()
     state = render()
     const saved = state.pendingMessages.find((item) => item.text === "work")
     assert.ok(saved)
     const pending = JSON.parse(JSON.stringify(saved))
-    assert.deepEqual(messages[0], { conversation_id: "chat", message_id: pending.message_id, target: { kind: "bot_main", bot_id: "bot" }, intent: "continue", sequence: pending.sequence, text: "work", attachments: pending.attachments, report_results: true, attestation })
-    assert.equal(signed.at(-1), `attestation|network|chat|${JSON.stringify({ type: "input_posted", message_id: pending.message_id, target: pending.target, intent: pending.intent, sequence: pending.sequence, text: "work", attachments: pending.attachments, report_results: true })}`)
+    assert.deepEqual(messages[0], { conversation_id: "chat", message_id: pending.message_id, target: { kind: "bot_main", bot_id: "bot" }, intent: "continue", sequence: pending.sequence, text: "work", attachments: pending.attachments, report_results: true, attestation: signatureFor("chat", { type: "input_posted", message_id: pending.message_id, target: pending.target, intent: pending.intent, sequence: pending.sequence, text: "work", attachments: pending.attachments, report_results: true }) })
+    assert.equal(signed.at(-1), `attestation|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|chat|${JSON.stringify({ type: "input_posted", message_id: pending.message_id, target: pending.target, intent: pending.intent, sequence: pending.sequence, text: "work", attachments: pending.attachments, report_results: true })}`)
     assert.equal(render().canSaveMessages, true, "an unknown prior input leaves local saving available")
     failMessage = false
     connection.entry.device_id = "other-gateway"
@@ -823,7 +750,7 @@ test("workspace preserves bot and message requests while routing native decision
       assert.ok(!settled || settled.delivery === 'accepted')
       if (settled) assert.equal(inputButton('重试原输入'), undefined)
     } finally { inputUi.close(); inputQuerySafe = false; inputQueryStage = null }
-    connection.entry.device_id = "gateway"
+    connection.entry.device_id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
     await render().refresh()
     assert.equal(render().pendingMessages.length, 0)
     await render().interruptWork("work")
@@ -835,19 +762,19 @@ test("workspace preserves bot and message requests while routing native decision
     await assert.rejects(render().answer(question, "  "), /不能为空/)
     await assert.rejects(render().answer(question, " 继续 "), /connection lost/)
     assert.deepEqual(JSON.parse(JSON.stringify(render().pendingAnswers)), [{ question_id: "q1", text: "继续" }], "an unknown outcome waits in the outbox")
-    assert.equal(signed.at(-1), 'attestation|network|chat|{"type":"message_posted","message_id":"a-q1","role":"user","text":"继续","report_results":true,"answers":"q1"}', "the answer is signed as the chat message the Node writes")
+    assert.equal(signed.at(-1), 'attestation|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|chat|{"type":"message_posted","message_id":"a-q1","role":"user","text":"继续","report_results":true,"answers":"q1"}', "the answer is signed as the chat message the Node writes")
     const signatures = signed.length
     await assert.rejects(render().answer(question, "停下"), /还没确认送达/)
     assert.equal(answers.length, 1, "another answer waits until the first is settled")
     answerOutcome = "answered"
     assert.deepEqual(JSON.parse(JSON.stringify(await render().answer(question, "继续"))), { status: "answered", text: "继续" })
-    assert.deepEqual(answers, [{ question_id: "q1", text: "继续", attestation }, { question_id: "q1", text: "继续", attestation }], "trying again sends the stored request")
+    assert.deepEqual(answers, [{ question_id: "q1", text: "继续", attestation: signatureFor("chat", writeBody({ method: "answer", params: { question_id: "q1", text: "继续" } }, fixtureClient)) }, { question_id: "q1", text: "继续", attestation: signatureFor("chat", writeBody({ method: "answer", params: { question_id: "q1", text: "继续" } }, fixtureClient)) }], "trying again sends the stored request")
     assert.equal(signed.length, signatures, "nothing is signed anew")
     assert.deepEqual(render().pendingAnswers, [])
     assert.equal(render().answered.q1, "继续", "the answer shows before the next read")
     answerOutcome = "already_answered"
     assert.equal((await render().answer(other, "继续")).text, "停下", "the answer that stood first is the one shown")
-    assert.equal(signed.at(-1), 'attestation|network|other|{"type":"message_posted","message_id":"a-s1","role":"user","text":"继续","report_results":true,"answers":"s1"}', "an answer is signed for its question's chat")
+    assert.equal(signed.at(-1), 'attestation|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|other|{"type":"message_posted","message_id":"a-s1","role":"user","text":"继续","report_results":true,"answers":"s1"}', "an answer is signed for its question's chat")
     const memberPrincipal = connection.principal, beforeLocal = answers.length
     connection.principal = { ...memberPrincipal, source: "local_session", can_manage: false }
     assert.equal(render().writable, false)
@@ -866,12 +793,12 @@ test("workspace preserves bot and message requests while routing native decision
     answerOutcome = "answered"
     const beforeSettle = answers.length
     await reload()
-    for (let turn = 0; turn < 10; turn++) await new Promise(setImmediate)
+    for (let turn = 0; turn < 10; turn++) await drainOutbox()
     assert.deepEqual(answers.slice(beforeSettle).map((item) => item.question_id), ["q2"], "an answer whose question is still open is sent again; one already answered is not")
     assert.deepEqual(render().pendingAnswers, [])
     await render().resolveCheck({ check_id: "work:work", kind: "work", detail: "", work_id: "work", target_node: "worker", conversation_id: "chat", title: "", reason: "offline" }, "completed", " 设备上已看到结果 ")
-    assert.deepEqual(controls.pop(), { method: "resolve", conversation_id: "chat", check_id: "work:work", outcome: "completed", note: "设备上已看到结果", attestation })
-    assert.equal(signed.at(-1), 'attestation|network|chat|{"type":"work_finished","work_id":"work","outcome":"completed","result_text":"设备上已看到结果"}', "the choice is signed as the settlement the Node writes")
+    assert.deepEqual(controls.pop(), { method: "resolve", conversation_id: "chat", check_id: "work:work", outcome: "completed", note: "设备上已看到结果", attestation: signatureFor("chat", { type: "work_finished", work_id: "work", outcome: "completed", result_text: "设备上已看到结果" }) })
+    assert.equal(signed.at(-1), 'attestation|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|chat|{"type":"work_finished","work_id":"work","outcome":"completed","result_text":"设备上已看到结果"}', "the choice is signed as the settlement the Node writes")
     await assert.rejects(render().interruptWork("other-work"), /停不了/)
     const beforeUnknown = controls.length
     failControl = true
@@ -889,26 +816,26 @@ test("workspace preserves bot and message requests while routing native decision
     await render().refresh()
     await assert.rejects(render().createBot({ name: "large", instructions: "中".repeat(2731) }), /8192/)
     assert.equal(render().pendingBot, null)
-    await assert.rejects(render().createBot({ name: "n".repeat(512), instructions: "a".repeat(8192), project: { target_node: "executor", cwd: "/" + "p".repeat(4095) } }), /太长/)
+    await assert.rejects(render().createBot({ name: "n".repeat(512), instructions: "a".repeat(8192), project: { target_node: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", cwd: "/" + "p".repeat(4095) } }), /太长/)
     assert.equal(render().pendingBot, null)
-    await assert.rejects(render().createBot({ name: "项目 Bot", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } }), /connection lost/)
+    await assert.rejects(render().createBot({ name: "项目 Bot", instructions: "只处理当前项目", project: { target_node: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", cwd: "/project" } }), /connection lost/)
     const originalCreation = creations[0]
     assert.equal(typeof originalCreation.bot_id, "string")
     assert.notEqual(originalCreation.bot_id, originalCreation.conversation_id)
     assert.deepEqual(botBody(render().pendingBot), originalCreation)
     await reload()
     assert.deepEqual(botBody(render().pendingBot), originalCreation)
-    await assert.rejects(render().createBot({ name: "改名", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } }), /内容已保留/)
+    await assert.rejects(render().createBot({ name: "改名", instructions: "只处理当前项目", project: { target_node: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", cwd: "/project" } }), /内容已保留/)
     createMode = "rejected"
-    await assert.rejects(render().createBot({ name: "项目 Bot", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } }), /project unavailable/)
+    await assert.rejects(render().createBot({ name: "项目 Bot", instructions: "只处理当前项目", project: { target_node: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", cwd: "/project" } }), /project unavailable/)
     assert.deepEqual(botBody(render().pendingBot), originalCreation)
     assert.equal(render().pendingBot?.submission?.state, "unconfirmed")
     createMode = "success"
-    await render().createBot({ name: "项目 Bot", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } })
+    await render().createBot({ name: "项目 Bot", instructions: "只处理当前项目", project: { target_node: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", cwd: "/project" } })
     assert.deepEqual(creations.slice(1), [originalCreation, originalCreation, originalCreation], "the reload resubmits the unconfirmed creation from the outbox")
     assert.equal(render().pendingBot, null)
     createMode = "rejected"
-    await assert.rejects(render().createBot({ name: "invalid project", instructions: "", project: { target_node: "executor", cwd: "/unavailable" } }), /确认没建成/)
+    await assert.rejects(render().createBot({ name: "invalid project", instructions: "", project: { target_node: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", cwd: "/unavailable" } }), /确认没建成/)
     assert.equal(render().pendingBot, null)
     failBotCheck = true
     await assert.rejects(render().createBot({ name: "rejected with pending lookup", instructions: "" }), /lookup unavailable/)
@@ -933,7 +860,7 @@ test("workspace preserves bot and message requests while routing native decision
         const write = deferred(); messageHold = write
         const before = messages.length
         assert.equal(await render().sendMessage("reconnect payload"), true, "local acceptance does not wait for the entry RPC")
-        await new Promise(setImmediate)
+        await drainOutbox()
         assert.equal(render().messageBusy, false)
         const original = render().pendingMessages.find((item) => item.text === "reconnect payload")
         assert.ok(original)
@@ -944,13 +871,13 @@ test("workspace preserves bot and message requests while routing native decision
         const next: ReadyConnection = { ...connection, generation: activeConnection.generation + 1, isCurrent: () => activeConnection === next }
         activeConnection = next
         assert.equal(render().writable, false)
-        await new Promise(setImmediate)
+        await drainOutbox()
         assert.equal(render().canSaveMessages, false, "the new connection must finish its own authorized read")
         await assert.rejects(render().sendMessage("new unread connection"), /先读取|补读/)
         assert.equal(messages.length, before + 1)
         if (outcome === "success") reading.resolve({ ...context, scheduler: null, works: [work] })
         else reading.reject(new Error("new read unavailable"))
-        await new Promise(setImmediate)
+        await drainOutbox()
         assert.equal(render().writable, outcome === "success")
         assert.equal(render().canSaveMessages, outcome === "success")
         assert.equal(acknowledgements.length, ackBefore)
@@ -962,7 +889,7 @@ test("workspace preserves bot and message requests while routing native decision
         messageHold = null
         if (outcome === "success") write.resolve({ accepted: true, state: "queued", message_id: original.message_id })
         else write.reject(new Error("old response lost"))
-        await new Promise(setImmediate)
+        await drainOutbox()
         assert.equal(messages.length, before + 1, "reconnect queries the original input without replaying its write")
         transcript = [...transcript, posted(original.message_id)]
         await render().queryInput(original)
@@ -972,9 +899,9 @@ test("workspace preserves bot and message requests while routing native decision
       messageHold = null
       conversationHold = deferred()
       const next: ReadyConnection = { ...connection, generation: activeConnection.generation + 1, isCurrent: () => activeConnection === next }
-      activeConnection = next; render(); await new Promise(setImmediate)
+      activeConnection = next; render(); await drainOutbox()
       conversationHold.resolve({ ...context, scheduler: null, works: [work] })
-      await new Promise(setImmediate)
+      await drainOutbox()
       assert.equal(render().writable, true)
       conversationHold = null
       await render().createBot({ name: "unrelated new bot", instructions: "" })
@@ -983,9 +910,9 @@ test("workspace preserves bot and message requests while routing native decision
       unreadNotifications = [{ notification_id: "after-reconnect", kind: "result", text: "unread", conversation_id: currentId, target: { kind: "bot_main", bot_id: render().selectedBot!.bot_id } }]
       conversationHold = deferred()
       const restored: ReadyConnection = { ...connection, generation: activeConnection.generation + 1, isCurrent: () => activeConnection === restored }
-      activeConnection = restored; render(); await new Promise(setImmediate)
+      activeConnection = restored; render(); await drainOutbox()
       conversationHold.resolve({ ...context, conversation: { ...context.conversation, conversation_id: currentId }, scheduler: null })
-      await new Promise(setImmediate)
+      await drainOutbox()
       assert.equal(render().writable, true)
       assert.equal(acknowledgements.length, ackBefore)
       conversationHold = null
@@ -1019,18 +946,18 @@ test("workspace preserves bot and message requests while routing native decision
       const firstRpc = deferred()
       messageHold = firstRpc
       assert.deepEqual(await Promise.all([render().sendMessage('input one'), render().sendMessage('input two'), render().sendMessage('input three')]), [true, true, true])
-      await new Promise(setImmediate)
+      await drainOutbox()
       const saved = render().pendingMessages
       assert.deepEqual(saved.map((item) => item.text), ['input one', 'input two', 'input three'])
       assert.equal(new Set(saved.map((item) => item.message_id)).size, 3)
       assert.equal(messages.length, before + 1, 'only the first write is in flight for this target')
       const read = deferred(); conversationHold = read
       const refreshing = render().refresh()
-      await new Promise(setImmediate)
+      await drainOutbox()
       messageHold = null
       transcript = [...transcript, posted(saved[0].message_id)]
       firstRpc.resolve({ accepted: true, state: 'steering', message_id: saved[0].message_id })
-      await new Promise(setImmediate)
+      await drainOutbox()
       assert.deepEqual(messages.slice(before).map((message) => message.text), ['input one', 'input two', 'input three'])
       assert.deepEqual(messages.slice(before).map((message) => message.message_id), saved.map((item) => item.message_id))
       read.resolve({ ...context, messages: transcript, scheduler: null, works: [work] })
@@ -1061,7 +988,7 @@ test("workspace preserves bot and message requests while routing native decision
       const sign = platform.transport.signClient, gate = deferred()
       let signing = false
       platform.transport.signClient = async (domain, payload) => {
-        if (payload.includes('"text":"first tab input"')) { signing = true; await gate.promise }
+        if (new TextDecoder().decode(payload).includes('"text":"first tab input"')) { signing = true; await gate.promise }
         return sign(domain, payload)
       }
       const previousBots = knownBots, previousTranscript = transcript, previousMessages = messages.length
@@ -1072,23 +999,23 @@ test("workspace preserves bot and message requests while routing native decision
         knownBots = [bot, independentBot]
         await render().refresh()
         other(); other().setView('chat'); other()
-        await new Promise(setImmediate); other(); await new Promise(setImmediate)
+        await drainOutbox(); other(); await drainOutbox()
         assert.equal(other().writable, true)
         const before = messages.length
         first = other().sendMessage('first tab input')
-        await new Promise(setImmediate)
+        await drainOutbox()
         assert.equal(signing, true, 'the follower reserved its sequence and is waiting on signing')
         independent = render().sendMessage('independent tab input', [], [], { target: { kind: 'bot_main', bot_id: independentBot.bot_id }, conversation_id: independentBot.conversation_id })
-        await new Promise(setImmediate)
+        await drainOutbox()
         assert.deepEqual(messages.slice(before).map((message) => message.text), ['independent tab input'], 'a different target must remain independent of the held signature')
         sameTabSecond = other().sendMessage('earlier same tab second input')
-        await new Promise(setImmediate)
+        await drainOutbox()
         second = render().sendMessage('second tab input')
-        await new Promise(setImmediate)
+        await drainOutbox()
         assert.deepEqual(messages.slice(before).map((message) => message.text), ['independent tab input'], 'a later tab cannot submit ahead of the input still being signed')
         gate.resolve(null)
         assert.deepEqual(await Promise.all([first, sameTabSecond, second, independent]), [true, true, true, true])
-        await render().refresh(); await new Promise(setImmediate)
+        await render().refresh(); await drainOutbox()
         assert.deepEqual(messages.slice(before).map((message) => message.text), ['independent tab input', 'first tab input', 'earlier same tab second input', 'second tab input'])
         assert.equal(Number(messages[before + 2].sequence), Number(messages[before + 1].sequence) + 1)
         assert.equal(Number(messages[before + 3].sequence), Number(messages[before + 2].sequence) + 1)
@@ -1098,7 +1025,7 @@ test("workspace preserves bot and message requests while routing native decision
         platform.transport.signClient = sign
         knownBots = previousBots
         for (const effect of otherHooks.effects.values()) effect.cleanup?.()
-        await render().refresh(); await new Promise(setImmediate)
+        await render().refresh(); await drainOutbox()
         outboxItems.clear()
         for (const [key, item] of previousOutbox) outboxItems.set(key, item)
         transcript = previousTranscript
@@ -1115,7 +1042,7 @@ test("workspace preserves bot and message requests while routing native decision
       assert.equal(await render().sendMessage('attachment first', [file]), true)
       assert.equal(await render().sendMessage('text second'), true)
       assert.equal(await render().sendMessage('text third'), true)
-      await new Promise(setImmediate)
+      await drainOutbox()
       const saved = render().pendingMessages
       assert.deepEqual(saved.map((item) => item.text), ['attachment first', 'text second', 'text third'])
       assert.equal(saved[0].attachments?.[0]?.name, 'notes.txt')
@@ -1123,7 +1050,7 @@ test("workspace preserves bot and message requests while routing native decision
       await reload()
       assert.deepEqual(render().pendingMessages.map((item) => item.message_id), saved.map((item) => item.message_id), 'reload retains each original input identity')
       uploadHold = null; uploading.resolve({ complete: true })
-      await new Promise(setImmediate)
+      await drainOutbox()
       assert.deepEqual(messages.slice(before).map((message) => message.text), ['attachment first', 'text second', 'text third'])
       await render().refresh()
       assert.equal(render().pendingMessages.length, 0)
@@ -1136,7 +1063,7 @@ test("workspace preserves bot and message requests while routing native decision
       const saved: PendingMessage[] = []
       const before = messages.length
       let domain: WorkspaceDomainState = {
-        channels: [{ channel_id: 'channel', title: '频道', purpose: '', members: ['bot'], coordinator_bot: 'bot', coordinator_node: 'gateway', owner_epoch: 1, revision: 1, event_hash: 'channel-event', created_at_ms: 1 }],
+        channels: [{ channel_id: 'channel', title: '频道', purpose: '', members: ['bot'], coordinator_bot: 'bot', coordinator_node: 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', owner_epoch: 1, revision: 1, event_hash: 'channel-event', created_at_ms: 1 }],
         tasks: [], assignments: [], inputs: [], coverage: { limit: 128, truncated: false },
       }
       current.rpc = async (method, body = {}) => {
@@ -1149,7 +1076,7 @@ test("workspace preserves bot and message requests while routing native decision
           commands.push(JSON.parse(JSON.stringify(body))); return creating.promise
         }
         if (method === 'workspace_history') return {
-          events: messages.slice(before).map((message, index) => ({ event_hash: String(message.message_id), created_at_ms: index + 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { ...message, type: 'input_posted' } })),
+          events: messages.slice(before).map((message, index) => ({ event_hash: String(message.message_id), created_at_ms: index + 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }, body: { ...message, type: 'input_posted' } })),
           coverage: { limit: 128, truncated: false, scope: 'task' },
         }
         return originalRpc(method, body)
@@ -1168,7 +1095,7 @@ test("workspace preserves bot and message requests while routing native decision
           render().sendMessage('channel two', [], undefined, { target }),
           render().sendMessage('channel three', [], undefined, { target, expected_revision: first.expected_revision, conversation_id: first.conversation_id }),
         ]), [true, true])
-        await new Promise(setImmediate)
+        await drainOutbox()
         assert.equal(commands.length, 1, 'only the original creation is submitted while its acknowledgement is held')
         assert.equal(messages.length, before, 'input delivery waits behind its real task creation')
         assert.deepEqual(JSON.parse(JSON.stringify(render().pendingMessages.map((input) => input.target))), [plainTarget, plainTarget, plainTarget])
@@ -1178,7 +1105,7 @@ test("workspace preserves bot and message requests while routing native decision
         const event = 'c'.repeat(64)
         domain = { ...domain, tasks: [{ ...command, root_task_id: command.task_id, revision: 1, action: 'continue', request_event: event, event_hash: event, created_at_ms: 1, updated_at_ms: 1, state: 'not_started' }] }
         creating.resolve({ ...domain, command_id: commands[0].command_id, event_hash: event, duplicate: false })
-        await new Promise(setImmediate)
+        await drainOutbox()
         assert.deepEqual(messages.slice(before).map((message) => message.text), ['channel one', 'channel two', 'channel three'])
         assert.deepEqual(messages.slice(before).map((message) => message.target), [plainTarget, plainTarget, plainTarget])
         await render().readWorkspaceHistory({ task_id: target.task_id })
@@ -1206,7 +1133,7 @@ test("workspace preserves bot and message requests while routing native decision
             domain = { ...domain, tasks: [{ ...command, root_task_id: command.task_id, revision: 1, action: 'continue', request_event: event, event_hash: event, created_at_ms: 1, updated_at_ms: 1, state: 'not_started' }] }
             return { ...domain, command_id: body.command_id, event_hash: event, duplicate: false }
           }
-          if (method === 'workspace_history') return { events: messages.slice(before).map((message, index) => ({ event_hash: String(message.message_id), created_at_ms: index + 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { ...message, type: 'input_posted' } })), coverage: { limit: 128, truncated: false, scope: 'task' } }
+          if (method === 'workspace_history') return { events: messages.slice(before).map((message, index) => ({ event_hash: String(message.message_id), created_at_ms: index + 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }, body: { ...message, type: 'input_posted' } })), coverage: { limit: 128, truncated: false, scope: 'task' } }
           return originalRpc(method, body)
         }
         try {
@@ -1254,7 +1181,7 @@ test("workspace preserves bot and message requests while routing native decision
       let delayedMainRead: ReturnType<typeof deferred> | null = null
       let target: InputTarget = { kind: 'task', task_id: 'attachment-task' }
       current.rpc = async (method, body = {}) => {
-        if (method === 'workspace_history') return { events: [{ event_hash: 'attachment-event', created_at_ms: 1, scope_id: otherBot.conversation_id, kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { type: 'input_posted', report_results: true, message_id: 'attachment-input', target, intent: 'continue', sequence: 1, expected_revision: 1, text: '任务附件', attachments: [{ hash, size: bytes.length, name: 'scope.txt' }] } }], coverage: { limit: 128, truncated: false, scope: target.kind === 'task' ? 'task' : 'channel' } }
+        if (method === 'workspace_history') return { events: [{ event_hash: 'attachment-event', created_at_ms: 1, scope_id: otherBot.conversation_id, kind: 'input_posted', speaker: { kind: 'human', device_id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }, body: { type: 'input_posted', report_results: true, message_id: 'attachment-input', target, intent: 'continue', sequence: 1, expected_revision: 1, text: '任务附件', attachments: [{ hash, size: bytes.length, name: 'scope.txt' }] } }], coverage: { limit: 128, truncated: false, scope: target.kind === 'task' ? 'task' : 'channel' } }
         if (method === 'read_artifact') {
           calls.push(JSON.parse(JSON.stringify(body)))
           if (delayedMainRead) return delayedMainRead.promise
@@ -1305,13 +1232,13 @@ test("workspace preserves bot and message requests while routing native decision
     await t.test('retained native chat focus restores its route through the real live bridge without acknowledging the previously selected Bot', async () => {
       const botA = { ...bot, name: 'Bot A' }, botB = { ...bot, bot_id: 'bot-b', conversation_id: 'chat-b', name: 'Bot B' }
       knownBots = [botA, botB]
-      knownNodes = [{ ...parityNode, device_id: 'gateway' }]
+      knownNodes = [{ ...parityNode, device_id: 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' }]
       questionRows = []
       conversationMessages = Object.fromEntries([botA, botB].map((item) => [item.conversation_id, [{ message_id: `${item.bot_id}-message`, event_hash: `${item.bot_id}-event`, role: 'user', text: `${item.name} 的消息`, created_at_ms: 1 }]]))
       render().setView('other')
       await render().selectBot(botA)
       let shared = render()
-      const device = { get ready() { return activeConnection }, phase: 'ready', link: { kind: 'online' }, entries: [], directory: null, identity: { deviceId: 'client' }, join() {}, cancelJoin() {}, leave() {} }
+      const device = { get ready() { return activeConnection }, phase: 'ready', link: { kind: 'online' }, entries: [], directory: null, identity: { deviceId: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }, join() {}, cancelJoin() {}, leave() {} }
       const fileReads = new Map<string, ReturnType<typeof deferred>>()
       class SelectedFile { readonly uri: string; constructor(uri: string) { this.uri = uri } arrayBuffer() { const read = fileReads.get(this.uri); assert.ok(read); return read.promise } }
       const bridge = componentHarness('../../../../../apps/mobile/src/data/live.tsx', {
@@ -1321,7 +1248,7 @@ test("workspace preserves bot and message requests while routing native decision
         '@vibeface/client/chat/protocol.ts': { promptIntent, botReach, composerHint }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, messageTimes, taskMessage, unreadCounts },
         '@vibeface/client/workspace/bot-settings.ts': { botCopy }, '@vibeface/client/workspace/inbox.ts': { inboxItems }, '@vibeface/client/workspace/labels.ts': taskLabels,
         '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers }, '@vibeface/client/workspace/storage.ts': { storageOf }, '@vibeface/client/workspace/types.ts': { isSessionNotification: () => false },
-        '@/platform': { mobilePlatform: { storage: browser.localStorage } }, './context': { WorkspaceProvider: 'NativeWorkspace' },
+        '@/platform': { mobilePlatform: { storage: browser.localStorage } }, './context': { WorkspaceProvider: 'NativeWorkspace' }, './last-seen': lastSeenModel,
       }, {}, 'Live')
       type NativeWorkspace = import('../../../../../apps/mobile/src/data/types.ts').Workspace
       const mainSaves: ReturnType<NativeWorkspace['actions']['send']>[] = []
@@ -1379,7 +1306,7 @@ test("workspace preserves bot and message requests while routing native decision
             await render().refresh()
             assert.equal(mobile().conversations.chat.replying, true, 'the host turn still runs after accepting a supplement')
             assert.equal(mobile().conversations.chat.stoppable, true)
-            const streaming = mobile([{ kind: 'manager', key: 'host-progress', conversation_id: 'chat', trigger: host.trigger, source_node: 'gateway', text: '部分回复', sequence: 1, items: [], needsRefresh: false }]).conversations.chat.messages.find((message) => message.state === 'streaming')
+            const streaming = mobile([{ kind: 'manager', key: 'host-progress', conversation_id: 'chat', trigger: host.trigger, source_node: 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', text: '部分回复', sequence: 1, items: [], needsRefresh: false }]).conversations.chat.messages.find((message) => message.state === 'streaming')
             assert.equal(streaming?.in_reply_to, input.message_id, 'the streamed reply retains its host input after a supplement')
             host.state = 'completed'
             await render().refresh()
@@ -1459,7 +1386,7 @@ test("workspace preserves bot and message requests while routing native decision
         const composer = () => chat.render('default').find(({ type }) => type === 'Composer')?.props
         const attach = (uri: string) => { const input = composer()?.onFiles; assert.ok(typeof input === 'function'); const files = [{ uri, name: uri.split('/').at(-1), size: 3, mimeType: null, arrayBuffer: async () => { const held = fileReads.get(uri); assert.ok(held); return await held.promise as ArrayBuffer }, text: async () => '', dispose() {} }]; input(files); return files }
         const sendDraft = () => { const send = composer()?.onSend; assert.ok(typeof send === 'function'); send() }
-        const storedDraft = () => JSON.parse(stored.get(`vibeface.${networkKey('bot-drafts', 'network')}`) ?? '{}').chat
+        const storedDraft = () => JSON.parse(stored.get(`vibeface.${networkKey('bot-drafts', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')}`) ?? '{}').chat
         const preparing = deferred(); fileReads.set('file:///first.txt', preparing)
         const sentBefore = messages.length
         composer()?.onChange?.('原草稿仍在准备附件')
@@ -1726,7 +1653,7 @@ test("workspace preserves bot and message requests while routing native decision
         await memoryOutbox.put(saved); await render().queryInput(head)
         const rpcConnection = activeConnection, originalRpc = rpcConnection.rpc
         const closeCalls: string[] = []
-        const history = { events: [{ event_hash: 'a'.repeat(64), created_at_ms: 1, scope_id: head.conversation_id, kind: 'input_posted', speaker: { kind: 'human', device_id: 'client' }, body: { ...messages[before], type: 'input_posted' } }], coverage: { limit: 128, truncated: false, scope: 'workspace' } }
+        const history = { events: [{ event_hash: 'a'.repeat(64), created_at_ms: 1, scope_id: head.conversation_id, kind: 'input_posted', speaker: { kind: 'human', device_id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }, body: { ...messages[before], type: 'input_posted' } }], coverage: { limit: 128, truncated: false, scope: 'workspace' } }
         rpcConnection.rpc = async (method, body = {}) => { closeCalls.push(method); return method === 'workspace_history' ? history : originalRpc(method, body) }
         let closeWork = Promise.resolve()
         const status = componentHarness('./workspace-chat.tsx', {
@@ -1831,46 +1758,22 @@ test("workspace preserves bot and message requests while routing native decision
         inputReleaseReply = null; inputReceiptOverrides.clear(); failMessage = false
       }
     })
-    await t.test('a restored new Release identity cannot consume an older unwritten proof for the same input and CAS', async () => {
-      const previous = [...outboxItems.values()].find((item) => item.method === 'workspace_command' && item.command_rejection !== undefined)
+    await t.test('a forged Release command identity is retained and pauses the whole ledger', async () => {
+      const previous = [...outboxItems.values()].find((item): item is OutboxRecord<'workspace_command'> => item.method === 'workspace_command' && item.command_rejection !== undefined)
       assert.ok(previous?.command_rejection)
-      const command = workspaceModel.parseWorkspaceCommand(previous.params.command)
-      assert.ok(command.kind === 'control_input' && command.action.kind === 'release')
-      const original = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === command.message_id)
-      assert.ok(original)
-      const oldProof = structuredClone(previous)
+      const original = structuredClone(previous), snapshot = new Map(outboxItems)
       const secondId = previous.params.command_id === 'a'.repeat(64) ? 'b'.repeat(64) : 'a'.repeat(64)
-      const second: OutboxItem = { ...previous, key: previous.key.replace(String(previous.params.command_id), secondId), params: { ...previous.params, command_id: secondId }, rejected: undefined, command_rejection: undefined }
-      const receipt: InputReceipt = { message_id: command.message_id, target: workspaceModel.parsePendingMessage(original).target, stage: 'refused', actual_turn_id: null, reason: '原输入已拒绝', retry_safe: false, control_event: command.expected_event }
-      // Restore the durable state of another command whose forward acknowledgement was lost; requestKey stays real.
-      await memoryOutbox.put(second)
-      await memoryOutbox.put({ ...original, receipt, delivery: 'unknown', release_expected_event: command.expected_event, release_command_id: secondId })
-      inputReceiptOverrides.set(command.message_id, receipt)
-      const before = messages.length, releases = inputReleases.length
+      const second: OutboxItem = { ...previous, key: previous.key.replace(previous.params.command_id, secondId), params: { ...previous.params, command_id: secondId }, rejected: undefined, command_rejection: undefined }
+      outboxItems.set(second.key, second)
+      const bytes = JSON.stringify([...outboxItems]), sends = messages.length, releases = inputReleases.length, signatures = signed.length
       try {
-        await render().queryInput(receipt)
-        const waiting = render().pendingMessages.find((item) => item.message_id === command.message_id)
-        assert.equal(waiting?.delivery, 'unknown', 'an old proof cannot settle a different current Release ID')
-        assert.equal(await render().sendMessage('following restored Release'), true)
-        await settleComponent()
-        const following = render().pendingMessages.find((item) => item.text === 'following restored Release')
-        assert.ok(following)
-        await render().retryPendingMessage(command.message_id); await settleComponent()
-        const retained = [...outboxItems.values()].find((item) => item.key === original.key)
-        assert.ok(retained); assert.equal(retained.delivery, 'unknown'); assert.equal(retained.release_expected_event, command.expected_event); assert.equal(retained.release_command_id, secondId)
-        assert.deepEqual(retained.params, original.params)
-        assert.deepEqual(outboxItems.get(previous.key), oldProof, 'the first command keeps its exact durable proof')
-        assert.deepEqual(outboxItems.get(second.key)?.params, second.params, 'the second command keeps its own request identity')
-        assert.equal(inputReleases.length, releases, 'restored unknown control requests are only queried')
-        assert.equal(messages.length, before, 'the same lane remains blocked until this command is reconciled')
-        inputReceiptOverrides.set(command.message_id, { ...receipt, control_event: 'f'.repeat(64) })
-        await render().queryInput(receipt); await settleComponent()
-        assert.deepEqual(messages.slice(before).map((message) => message.message_id), [following.message_id])
-      } finally {
-        inputReceiptOverrides.set(command.message_id, { ...receipt, control_event: 'f'.repeat(64) })
-        await render().queryInput(receipt); await settleComponent()
-        inputReceiptOverrides.clear()
-      }
+        await reload(); await render().refresh()
+        await assert.rejects(render().sendMessage('following forged Release'), /损坏/)
+        assert.equal(render().canSaveMessages, false)
+        assert.equal(JSON.stringify([...outboxItems]), bytes)
+        assert.deepEqual(outboxItems.get(previous.key), original)
+        assert.deepEqual([messages.length, inputReleases.length, signed.length], [sends, releases, signatures])
+      } finally { outboxItems.clear(); for (const [key, item] of snapshot) outboxItems.set(key, item); await reload(); await render().refresh() }
     })
   } finally {
     for (const effect of effects.values()) effect.cleanup?.()
@@ -5989,7 +5892,7 @@ test('native system notification events keep typed destinations and clear naviga
     '@vibeface/client/lib/transport.ts': { createTransport: () => ({ forgetClient: async () => { forgotten++ } }) },
     '@vibeface/client/identity/copy.ts': { lostKeyText: () => '' },
     './files': { privateFiles },
-    './notification-opens': { notificationOpenings },
+    './notification-opens': { notificationOpenings }, './outbox': { mobileOutbox },
   })
   const { mobilePlatform } = app.module as typeof import('../../../../../apps/mobile/src/platform/index.ts')
   const destination: NotificationDestination = { network_id: 'network-fixture', device_id: 'device-fixture', notification_id: 'notification-fixture', conversation_id: 'conversation-fixture' }

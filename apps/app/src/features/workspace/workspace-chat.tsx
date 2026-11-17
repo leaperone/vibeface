@@ -132,7 +132,7 @@ export function ChannelWorkspace({ channelId }: { channelId: string }) {
   const { ready } = useDevice()
   const storage = storageOf(webPlatform.storage)
   const selectionKey = networkKey(`channel-target:${channelId}`, ready?.principal.network_id ?? '')
-  const cached = storage.readStorage<unknown>(selectionKey, null)
+  const cached = storage.readStorage(selectionKey, null)
   const cachedBot = cached && typeof cached === 'object' && 'bot_id' in cached && typeof cached.bot_id === 'string' ? cached.bot_id : ''
   const cachedTask = cached && typeof cached === 'object' && 'task_id' in cached && typeof cached.task_id === 'string' ? cached.task_id : null
   const selectionRevision = useRef(0)
@@ -179,7 +179,7 @@ function ScopedConversation({ target, conversationId, label, task, channelId, ex
   const scopeTaskId = task?.task_id ?? (target.kind === 'task' || target.kind === 'channel_task' ? target.task_id : undefined)
   const storage = storageOf(webPlatform.storage)
   const draftKey = networkKey(`draft:${channelId ? `channel:${channelId}` : `task:${scopeTaskId}`}`, ready?.principal.network_id ?? '')
-  const [text, setText] = useState(() => { const saved = storage.readStorage<unknown>(draftKey, ''); return typeof saved === 'string' ? saved : '' })
+  const [text, setText] = useState(() => { const saved = storage.readStorage(draftKey, ''); return typeof saved === 'string' ? saved : '' })
   const targetKey = inputTargetKey(target)
   const draftRef = useRef<ComposerDraft>({ text, files, target: targetKey, conversationId })
   if (draftRef.current.text !== text || draftRef.current.files !== files || draftRef.current.target !== targetKey || draftRef.current.conversationId !== conversationId) draftRef.current = { text, files, target: targetKey, conversationId }

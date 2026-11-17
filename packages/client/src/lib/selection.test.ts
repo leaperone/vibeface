@@ -34,7 +34,7 @@ test('a queued operation borrows every file before its first read, through durab
     await queue.promise
     assert.deepEqual(f.released, [])
     const uploads = files.map(file => ({ hash: file.name, size: 1, name: file.name, data: 'YQ==' }))
-    await enqueue({ all: async () => [], put: async item => { await put.promise; stored.push(item) }, delete: async () => {} }, { key: 'message:A', method: 'message', params: {}, created_at_ms: 1, uploads })
+    await enqueue({ all: async () => [], put: async item => { await put.promise; stored.push(item) }, delete: async () => {} }, { key: 'message:A', method: 'message', scope_id: 'c', delivery: 'saved', params: { conversation_id: 'c', message_id: 'A', text: 'a', report_results: true, target: { kind: 'bot_main', bot_id: 'b' }, intent: 'continue', sequence: 1, attestation: { device_id: 'd', signature: 's' } }, created_at_ms: 1, uploads })
     return uploads
   })
   owner.replace([]); owner.close()

@@ -58,7 +58,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const { directory, ready, retryNow } = useDevice()
   const draftStorage = storageOf(webPlatform.storage)
   const draftKey = networkKey('bot-drafts', ready?.principal.network_id ?? '')
-  const [drafts, setDrafts] = useState<Map<string, string>>(() => { const stored = draftStorage.readStorage<unknown>(draftKey, {}); return stored && typeof stored === 'object' && !Array.isArray(stored) ? new Map(Object.entries(stored).filter((entry): entry is [string, string] => typeof entry[1] === 'string')) : new Map() })
+  const [drafts, setDrafts] = useState<Map<string, string>>(() => { const stored = draftStorage.readStorage(draftKey, {}); return stored && typeof stored === 'object' && !Array.isArray(stored) ? new Map(Object.entries(stored).filter((entry): entry is [string, string] => typeof entry[1] === 'string')) : new Map() })
   const [sendError, setSendError] = useState<unknown>(null)
   const [files, setFiles] = useState<File[]>([])
   const [selectedTarget, setSelectedTarget] = useState(routeRoutine ? `routine:${routeRoutine}` : 'main')

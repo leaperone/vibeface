@@ -116,7 +116,7 @@ export default function ChatScreen() {
   latestWorkspace.current = workspace
   const draftStorage = storageOf(mobilePlatform.storage)
   const draftKey = networkKey('bot-drafts', device.ready?.principal.network_id ?? '')
-  const [drafts, setDrafts] = useState<Record<string, { text: string; files: Attachment[] }>>(() => { const stored = draftStorage.readStorage<unknown>(draftKey, {}); return stored && typeof stored === 'object' && !Array.isArray(stored) ? Object.fromEntries(Object.entries(stored).filter((entry): entry is [string, string] => typeof entry[1] === 'string').map(([id, text]) => [id, { text, files: [] }])) : {} })
+  const [drafts, setDrafts] = useState<Record<string, { text: string; files: Attachment[] }>>(() => { const stored = draftStorage.readStorage(draftKey, {}); return stored && typeof stored === 'object' && !Array.isArray(stored) ? Object.fromEntries(Object.entries(stored).filter((entry): entry is [string, string] => typeof entry[1] === 'string').map(([id, text]) => [id, { text, files: [] }])) : {} })
   const [selectedTarget, setSelectedTarget] = useState(routine ? `routine:${routine}` : 'main')
   const [sendError, setSendError] = useState('')
   const [cleanupError, setCleanupError] = useState('')
