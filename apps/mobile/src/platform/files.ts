@@ -55,6 +55,62 @@ function release(uri: string) {
   if (file.exists) file.delete()
 }
 
+export type OwnedPickedFile = {
+  uri: string
+  readonly size: number
+  text(): Promise<string>
+  arrayBuffer(): Promise<ArrayBuffer>
+  /** Invalidates reads immediately; completion throws/rejects until physical cleanup succeeds. */
+  dispose(): void | Promise<void>
+}
+
+/** Wrap only a retained selection, never a picker/provider original. */
+function ownedFile(file: Pick<File, 'uri' | 'size' | 'text' | 'arrayBuffer'>): OwnedPickedFile {
+  available()
+  if (!file.uri.startsWith(selectionPrefix)) throw new Error('只能持有应用内选择副本。')
+  const version = epoch
+  let disposed = false, cleanupDone = false, readers = 0
+  let completion: { promise: Promise<void>; resolve(): void; reject(cause: unknown): void } | undefined
+  const cleanup = () => {
+    if (!disposed || readers || cleanupDone) return
+    release(file.uri)
+    cleanupDone = true
+  }
+  const read = async <Result,>(operation: () => Promise<Result>): Promise<Result> => {
+    if (disposed || version !== epoch) throw new Error('请重新选择文件。')
+    available()
+    readers++
+    try { return await run(async () => operation()) }
+    finally {
+      readers--
+      if (completion && !readers) {
+        const attempt = completion
+        completion = undefined
+        // Disposal owns its error, separately from a reader's original result/error.
+        try { cleanup(); attempt.resolve() } catch (cause) { attempt.reject(cause) }
+      }
+    }
+  }
+  return {
+    uri: file.uri,
+    get size() { return file.size },
+    text: () => read(() => file.text()),
+    arrayBuffer: () => read(() => file.arrayBuffer()),
+    dispose() {
+      disposed = true
+      if (readers) {
+        if (!completion) {
+          let resolve!: () => void, reject!: (cause: unknown) => void
+          const promise = new Promise<void>((yes, no) => { resolve = yes; reject = no })
+          completion = { promise, resolve, reject }
+        }
+        return completion.promise
+      }
+      cleanup()
+    },
+  }
+}
+
 const recoveryStorage = {
   read() {
     const uri = index.getString('pending')
@@ -115,4 +171,4 @@ async function erase(clear: () => Promise<void>) {
   } finally { erasing = false }
 }
 
-export const privateFiles = { run, retain, release, releasePicker, recoveryStorage, erase, recovery, transfers }
+export const privateFiles = { run, retain, ownedFile, release, releasePicker, recoveryStorage, erase, recovery, transfers }

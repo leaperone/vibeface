@@ -1,3 +1,4 @@
+import { selectionOwner } from '@vibeface/client/lib/selection.ts'
 import { Card } from '@/components/arc/surface'
 import { SelectionItem } from '@/components/arc/selection'
 import { ArrowDownLeft, ArrowDownToLine, ArrowRightLeft, ArrowUpRight, Check, CircleCheck, Copy, Crown, File, FlaskConical, Laptop, LoaderCircle, RefreshCw, ShieldCheck, type LucideIcon } from 'lucide-react-native'
@@ -7,7 +8,7 @@ import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useDelivery } from '@vibeface/client/delivery/client.ts'
 import { canRestart, deadlineRows, draftFor, evidenceLabels, modeOptions, orderActions, orderHeading, orderStatus, orderSummary, orderTitle, publicationLabel, receiverChoices, receivingBatches, settlementAmountsLabel, sizeLabel, transferCopy, walletNotice } from '@vibeface/client/delivery/model.ts'
-import { transferSelection, type DeliveryDraft, type DeliveryOrder, type DeliverySettings, type TransferFile } from '@vibeface/client/delivery/types.ts'
+import { type DeliveryDraft, type DeliveryOrder, type DeliverySettings, type TransferFile } from '@vibeface/client/delivery/types.ts'
 import { useExperiments } from '@vibeface/client/lib/experiments.ts'
 import { ErrorText } from '@/components/action'
 import { Details, EmptyState } from '@/components/kit'
@@ -36,11 +37,13 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
   const [experiments] = useExperiments(mobilePlatform.storage)
   const [draft, setDraft] = useState<DeliveryDraft>({ receiver_peer: '', provider_peer: '', mode: 'charity', acceptance: 'recoverable', max_service_amount: '0', max_gas_amount: '0', budget_id: null })
   const [file, setFile] = useState<TransferFile | null>(null)
-  const selection = useRef(transferSelection())
+  const [cleanupError, setCleanupError] = useState('')
+  const selection = useRef<ReturnType<typeof selectionOwner<TransferFile>> | null>(null)
   useEffect(() => {
-    const owner = transferSelection()
+    let active = true
+    const owner = selectionOwner<TransferFile>((error) => { if (active) setCleanupError(error.message); else console.error('选择副本清理失败，副本保留待清除。', error) })
     selection.current = owner
-    return () => owner.close()
+    return () => { active = false; owner.close() }
   }, [])
   // Feedback shows next to the control that caused it, not at the top of a long page.
   const [origin, setOrigin] = useState<'page' | 'form' | 'order'>('page')
@@ -65,8 +68,8 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
   const prepare = (restart?: string) => {
     if (!file || unusable) return
     setOrigin('form')
-    const owner = selection.current
-    void owner.use(selected => delivery.prepare(sending, selected, restart)).then(success => { if (success && owner.replace(null)) setFile(null) })
+    const owner = selection.current!
+    void owner.use(([selected]) => delivery.prepare(sending, selected, restart)).then(success => { if (success && owner.replace([])) setFile(null) }).catch((cause) => setCleanupError(String(cause)))
   }
   return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-6 pb-12">
     {feedback('page')}
@@ -117,10 +120,10 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
           <Info label={transferCopy.gasCap} value={draft.max_gas_amount} />
         </> : <IconLine icon={ShieldCheck} tone="text-success" text={transferCopy.free} />}
         <View className="flex-row flex-wrap items-center gap-x-3 gap-y-2">
-          <Button variant="secondary" disabled={working} onPress={() => void picker.run('pick', async () => { const owner = selection.current; const picked = await mobilePlatform.files?.pick(); if (picked && owner.replace(picked)) setFile(picked) })}><Icon as={picker.busy === 'pick' ? LoaderCircle : File} /><Text>选择文件</Text></Button>
+          <Button variant="secondary" disabled={working} onPress={() => void picker.run('pick', async () => { const owner = selection.current!; const picked = await mobilePlatform.files?.pick(); if (picked && owner.replace([picked])) setFile(picked) })}><Icon as={picker.busy === 'pick' ? LoaderCircle : File} /><Text>选择文件</Text></Button>
           <Text className="min-w-0 shrink text-sm text-muted">{file ? <><Text className="text-sm text-foreground">{file.name}</Text> · {sizeLabel(file.size)}</> : transferCopy.maxSize(status.max_file_bytes)}</Text>
         </View>
-        <ErrorText error={picker.error} />
+        <ErrorText error={picker.error || cleanupError} />
         {file && file.size > status.max_file_bytes ? <ErrorText error={transferCopy.tooLarge(status.max_file_bytes)} /> : null}
         {feedback('form')}
         <View className="flex-row flex-wrap gap-2">

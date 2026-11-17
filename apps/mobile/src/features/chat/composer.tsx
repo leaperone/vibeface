@@ -69,7 +69,7 @@ export function Composer({ value, onChange, files, onFiles, attachmentScope, blo
               owned.push(candidate)
               if (!current() || !fileCurrent()) return
               const file = new File(asset.uri)
-              added.push({ uri: candidate.uri, name: asset.fileName || file.name, size: asset.fileSize ?? file.size, mimeType: asset.mimeType || file.type || null })
+              added.push({ ...privateFiles.ownedFile(candidate), name: asset.fileName || file.name, size: asset.fileSize ?? file.size, mimeType: asset.mimeType || file.type || null })
             }
           } else {
             const picked = await DocumentPicker.getDocumentAsync({ multiple: true, copyToCacheDirectory: true })
@@ -80,7 +80,7 @@ export function Composer({ value, onChange, files, onFiles, attachmentScope, blo
               const candidate = await privateFiles.retain(asset.uri)
               owned.push(candidate)
               if (!current() || !fileCurrent()) return
-              added.push({ uri: candidate.uri, name: asset.name, size: asset.size ?? null, mimeType: asset.mimeType ?? null })
+              added.push({ ...privateFiles.ownedFile(candidate), name: asset.name, size: asset.size ?? null, mimeType: asset.mimeType ?? null })
             }
           }
           if (current() && fileCurrent()) {
@@ -132,7 +132,7 @@ export function Composer({ value, onChange, files, onFiles, attachmentScope, blo
   const attachments = files.length ? <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerClassName="gap-2 px-2 pt-2">
     {files.map((file, index) => <View key={`${file.uri}:${index}`} className="max-w-60 flex-row items-center gap-2 rounded-control bg-surface-muted ps-3">
       <Icon as={Paperclip} className="text-secondary" /><Text numberOfLines={1} className="shrink text-sm">{file.name}</Text>
-      <Button variant="ghost" iconOnly accessibilityLabel={`移除 ${file.name}`} onPress={() => { try { privateFiles.release(file.uri); onFiles(files.filter((_, at) => at !== index)) } catch (cause) { Alert.alert('未能移除附件', cause instanceof Error ? cause.message : '请重试。') } }}><Icon as={X} /></Button>
+      <Button variant="ghost" iconOnly accessibilityLabel={`移除 ${file.name}`} onPress={() => { try { onFiles(files.filter((_, at) => at !== index)) } catch (cause) { Alert.alert('未能移除附件', cause instanceof Error ? cause.message : '请重试。') } }}><Icon as={X} /></Button>
     </View>)}
   </ScrollView> : undefined
   return <View className="gap-2 bg-background px-4 pb-3">

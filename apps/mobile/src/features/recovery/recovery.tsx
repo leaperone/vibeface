@@ -1,7 +1,6 @@
 import * as Clipboard from 'expo-clipboard'
 import * as DocumentPicker from 'expo-document-picker'
 import * as Haptics from 'expo-haptics'
-import { File } from 'expo-file-system'
 import { ArchiveRestore, BellRing, CalendarClock, ChevronRight, CircleCheck, CircleMinus, CirclePlus, ClipboardPaste, Download, FileCheck, FileKey, FileWarning, Hand, Hourglass, KeyRound, Laptop, LifeBuoy, QrCode, Shield, ShieldAlert, ShieldCheck, ShieldX, X, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState } from 'react'
 import { Alert, Pressable, View } from 'react-native'
@@ -10,7 +9,7 @@ import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.ts
 import { passwordCopy, recoveryChanges, recoveryCopy, whenText } from '@vibeface/client/identity/copy.ts'
 import { entryAddress, messageOf, type ConnectionEntry } from '@vibeface/client/lib/node.ts'
 import { recoveryTarget } from '@vibeface/client/identity/recovery-link.ts'
-import { passphrase, passwordStrength, recoveryFileStem, type RecoveryFile } from '@vibeface/client/lib/secure.ts'
+import { passphrase, passwordStrength, recoveryFileStem } from '@vibeface/client/lib/secure.ts'
 import { ErrorText } from '@/components/action'
 import { ActionCard, Panel, toast } from '@/components/kit'
 import { Button } from '@/components/arc/button'
@@ -23,9 +22,10 @@ import { deviceIcon } from '@/features/devices/device-icon'
 import { Scanner } from '@/features/devices/scanner'
 import { useRun } from '@/lib/use-run'
 import { defaultName, self } from '@/platform'
-import { privateFiles } from '@/platform/files'
+import { privateFiles, type OwnedPickedFile } from '@/platform/files'
+import { useSelectionOwner } from '@/lib/use-selection-owner'
 
-type PickedFile = { name: string; file: RecoveryFile }
+type PickedFile = { name: string; file: OwnedPickedFile }
 
 /** Picks the recovery file from Files; the picked copy reads as the `RecoveryFile` the shared provider opens. */
 function FilePick({ picked, onPick, disabled }: { picked: PickedFile | null; onPick(file: PickedFile): void; disabled?: boolean }) {
@@ -50,21 +50,22 @@ function FilePick({ picked, onPick, disabled }: { picked: PickedFile | null; onP
       const result = await DocumentPicker.getDocumentAsync({ type: ['application/json', 'public.json', '*/*'], copyToCacheDirectory: true })
       const asset = result.assets?.[0]
       if (result.canceled || !asset) return
-      let candidate: File | undefined, handedOff = false
+      let candidate: OwnedPickedFile | undefined, handedOff = false
+      let retained: Awaited<ReturnType<typeof privateFiles.retain>> | undefined
       const errors: unknown[] = []
       try {
         if (!current() || !fileCurrent()) return
-        candidate = await privateFiles.retain(asset.uri)
+        retained = await privateFiles.retain(asset.uri)
         if (!current() || !fileCurrent()) return
+        candidate = privateFiles.ownedFile(retained)
         const replacement = { name: asset.name, file: candidate }
         if (!current() || !fileCurrent()) return
-        if (previous?.file instanceof File) privateFiles.release(previous.file.uri)
         latest.current.onPick(replacement)
         handedOff = true
       } catch (cause) { errors.push(cause) }
       finally {
-        if (candidate && !handedOff) {
-          try { privateFiles.release(candidate.uri) } catch (cause) { errors.push(cause) }
+        if (retained && !handedOff) {
+          try { if (candidate) await candidate.dispose(); else privateFiles.release(retained.uri) } catch (cause) { errors.push(cause) }
         }
         try { privateFiles.releasePicker(asset.uri) } catch (cause) { errors.push(cause) }
         if (errors.length) throw errors.length === 1 ? errors[0] : new AggregateError(errors, '未能读取恢复文件或清理选择副本。')
@@ -90,14 +91,26 @@ export function RecoveryRestore({ link }: { link?: string | null }) {
   // Every recovery link the camera opens again fills in its computer.
   useEffect(() => { const found = link ? recoveryTarget(link) : null; if (found) setTarget(found) }, [link])
   const [picked, setPicked] = useState<PickedFile | null>(null)
+  const pickedRef = useRef(picked)
+  const [cleanupError, setCleanupError] = useState('')
+  const selection = useSelectionOwner<OwnedPickedFile>('recovery-input', () => { pickedRef.current = null; setPicked(null) }, (cause) => setCleanupError(messageOf(cause)))
+  const pickFile = (next: PickedFile) => {
+    if (!selection.current?.replace([next.file])) return
+    pickedRef.current = next
+    setPicked(next)
+  }
   const [password, setPassword] = useState('')
   const [name, setName] = useState(defaultName)
   const submit = () => void run('restore', async () => {
-    if (!picked || !target) throw new Error('选一个恢复文件。')
+    const submitted = pickedRef.current, owner = selection.current
+    if (!submitted || !target || !owner) throw new Error('选一个恢复文件。')
     const typed = password
     // A failed try keeps the chosen file and name; only the typed password leaves the screen.
     setPassword('')
-    await device.beginRecovery({ file: picked.file, password: typed, name: name.trim(), entry: target })
+    await owner.use(async ([file]) => {
+      await device.beginRecovery({ file, password: typed, name: name.trim(), entry: target })
+      if (selection.current === owner && pickedRef.current === submitted && owner.replace([])) { pickedRef.current = null; setPicked(null) }
+    })
   })
   const locked = busy !== null || Boolean(device.review)
   if (!target) return <PickTarget onPicked={setTarget} />
@@ -111,10 +124,10 @@ export function RecoveryRestore({ link }: { link?: string | null }) {
       </View>
       <Button variant="ghost" iconOnly accessibilityLabel="换一个节点" disabled={locked} onPress={() => setTarget(null)}><Icon as={X} /></Button>
     </View>
-    <FilePick picked={picked} onPick={setPicked} disabled={locked} />
+    <FilePick picked={picked} onPick={pickFile} disabled={locked} />
     <Input {...passwordProps} accessibilityLabel="恢复密码" placeholder="恢复密码" value={password} onChangeText={setPassword} editable={!locked} />
     <Input accessibilityLabel={`${self}叫什么？`} placeholder={`${self}叫什么？`} value={name} onChangeText={setName} maxLength={128} editable={!locked} />
-    <ErrorText error={error} />
+    <ErrorText error={error || cleanupError} />
     <Button disabled={locked || !picked || !password || !name.trim()} onPress={submit}>
       <Text>{busy ? '打开中' : '下一步'}</Text>
     </Button>
@@ -350,28 +363,42 @@ export function ReplaceRecovery() {
   const device = useDevice()
   const { busy, error, status, run, clear } = useRun()
   const [picked, setPicked] = useState<PickedFile | null>(null)
+  const pickedRef = useRef(picked)
+  const [cleanupError, setCleanupError] = useState('')
+  const selection = useSelectionOwner<OwnedPickedFile>(device.ready?.principal.network_id, () => { pickedRef.current = null; setPicked(null) }, (cause) => setCleanupError(messageOf(cause)))
+  const pickFile = (next: PickedFile) => {
+    if (!selection.current?.replace([next.file])) return
+    pickedRef.current = next
+    setPicked(next)
+  }
   const [oldPassword, setOldPassword] = useState('')
   const [password, setPassword] = useState('')
   const [tried, setTried] = useState(false)
   // A failed try keeps what was typed; a change to any field takes the old error away.
   const change = <T,>(set: (value: T) => void) => (value: T) => { set(value); clear() }
   const submit = () => void run('replace', async () => {
-    if (!picked) throw new Error('选一个恢复文件。')
+    const submitted = pickedRef.current, owner = selection.current
+    if (!submitted || !owner) throw new Error('选一个恢复文件。')
     setTried(true)
-    await device.replaceRecoveryFile({ file: picked.file, oldPassword, password: passphrase(password) })
-    setOldPassword(''); setPassword(''); setTried(false)
+    await owner.use(async ([file]) => {
+      await device.replaceRecoveryFile({ file, oldPassword, password: passphrase(password) })
+      if (selection.current === owner && pickedRef.current === submitted && owner.replace([])) {
+        pickedRef.current = null; setPicked(null)
+        setOldPassword(''); setPassword(''); setTried(false)
+      }
+    })
   }, recoveryCopy.replaced)
   const locked = busy !== null || Boolean(device.review)
   return <View className="gap-4">
     <Text className="text-sm text-muted">{recoveryCopy.replaceHint}</Text>
-    <FilePick picked={picked} onPick={change(setPicked)} disabled={locked} />
+    <FilePick picked={picked} onPick={change(pickFile)} disabled={locked} />
     <Input {...passwordProps} accessibilityLabel="旧密码" placeholder="旧密码" value={oldPassword} onChangeText={change(setOldPassword)} editable={!locked} />
     <View className="gap-1.5">
       <Input {...passwordProps} accessibilityLabel="新密码" placeholder="新密码" value={password} onChangeText={change(setPassword)} editable={!locked} />
       <PasswordStrength password={password} tried={tried} />
     </View>
     {status ? <Text role="status" className="text-sm text-success">{status}</Text> : null}
-    <ErrorText error={error} />
+    <ErrorText error={error || cleanupError} />
     <Button disabled={locked || !picked || !oldPassword || !password} onPress={submit}>
       <Text>{busy ? '处理中' : '换密码并保存新文件'}</Text>
     </Button>
