@@ -76,6 +76,8 @@ body { margin: 0; min-width: 0; background: var(--site-bg); caret-color: var(--s
 ::selection { background: var(--site-accent); color: var(--site-accent-foreground); }
 a { color: inherit; text-decoration: none; }
 .site :is(a, button):focus-visible { outline: 2px solid var(--site-accent); outline-offset: 3px; }
+/* Arc's shared keyboard outline uses these public integration variables. */
+.site :is(a, button), .site-docs, .site-search-dialog { --focus-outline: var(--site-accent); --focus-outline-offset: 3px; }
 
 .site { background: var(--site-bg); color: var(--site-ink); display: flex; flex-direction: column; min-height: 100svh; }
 .site > main { flex: 1; }
@@ -384,6 +386,7 @@ a { color: inherit; text-decoration: none; }
 }
 @media (forced-colors: active) {
   .site :is(a, button):focus-visible { outline-color: Highlight; }
+  .site :is(a, button), .site-docs, .site-search-dialog { --focus-outline: Highlight; }
 }
 @keyframes landing-arrive { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes landing-fade { from { opacity: 0; } to { opacity: 1; } }

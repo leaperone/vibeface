@@ -38,6 +38,16 @@ export VIBEFACE_BIN_DIR="$HOME/.local/bin"
 
 Vibeface 的完整 Rust 包包含 CLI `vibeface`、后台 Core `vibeface-core` 和 `web/` 静态 App。支持 macOS Apple Silicon、Windows x64、Linux x64 和 Linux ARM64；Linux 包需要 glibc。macOS 发布包的两个程序使用 Developer ID 签名并通过 Apple notarization。系统设置保持默认的“自动允许下载的已签名软件接收传入连接”且未阻止所有传入连接时，应用防火墙直接放行，安装和更新后不再询问。
 
+### 检查 Linux 运行库
+
+glibc 是 Linux 程序使用的系统运行库。可在准备安装的电脑上执行只读检查：
+
+```sh
+getconf GNU_LIBC_VERSION
+```
+
+输出 `glibc` 和版本号表示使用了 glibc；最低版本仍以当前安装包的 `RUNTIME-REQUIREMENTS.md` 为准。命令不可用或没有该输出时，先按发行版文档确认运行库，不要把它当作安装条件已经满足。使用 musl 的系统不属于当前 Linux 包的支持范围。
+
 ## npm 安装
 
 Node.js 22+ 可通过 `latest`、`rc` 或 `hourly` 选择已公开的 CLI npm 渠道。例如安装 Hourly：

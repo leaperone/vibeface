@@ -154,3 +154,13 @@ A8 Docs32/40，B8文档定向15/20。新增通用data-state淡出规则错误命
 第九轮验证：独立代码复审无确认P0/P1/P2；真实SDK连续失败→恢复→remount用例通过，WWW14/14、typecheck/e2e类型、生产构建、静态22HTML/25输出均通过。浏览器2/2增加祖先effective opacity、初始focus、query保留、结果恢复及Escape还焦，不仅检查DOM可见。根实际看图/交叠探针：4组opacity=1，目录立即开搜索再关闭连续2次都focus当前文章，本页目录root opacity=1、animation=none且backdrop blur8px。根图片实际为light，已纠正原requested-dark文件名，不计为暗色验收。
 
 准备独立A9/B9仅复评变更Docs Read面；App与marketing未改，保留A7各36/40、31/32的当前源码有效评分。第九轮Docs分数与最终技术结论仍待实测，不自行补分。
+
+## 第九轮复评与第十轮澄清/焦点修复
+
+A9 Docs36/40，无P0/P1，但有2项P2：深色目录焦点框过暗、首次成果前的glibc/CLI/Core/App/data epoch未就地解释。B9文档定向20/20、issues=[]。目录/TOC不再透明、首焦、普通/减少动态及503保留query恢复均已实际通过，仍按A的两个UX问题继续处理。
+
+第十轮Prompt：clarify+audit+polish，使用现有品牌高对比色修键盘定位，保留系统forced-colors；不手改Arc来源。检查发现Arc foundation公开的--focus-outline接口才是其!important轮廓的正确集成点；第一版普通outline覆盖被新增对比度测试正确拦下。改用该变量并覆盖文档portal与首页导航，暗色邻接背景验证>=3:1。新用例还等待目录退出完成再断言唯一opener，保留原还焦要求。
+
+快速上手保留平台/完整包/格式编号/新旧目录安全限制，解释Hourly、CLI/Core/App和data epoch含义；把glibc连到安装文档新增的只读getconf检查。平台选择、包组成与格式约束均核对现有install.sh/安装文档，不新增支持承诺、不运行安装器。
+
+验证：WWW14项单测、typecheck/e2e类型、生产构建、静态22HTML/25输出通过；浏览器3/3包括暗色减少动态的真实焦点outline>=2px、对比>=3、初始聚焦与首页导航。首次测试失败按失败留证，后续保持阈值后通过（round10-www-e2e-stable）。根已查看当前暗色截图。准备A10/B10定向复评，App源码继续未改，当前App仍为A7的36/40；不伪造App新评分。

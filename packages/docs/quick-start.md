@@ -1,6 +1,6 @@
 ---
 title: 快速上手
-description: 准备匹配当前源码的程序，创建个人网络，让第一台电脑上的 Bot 回答一条消息。
+description: 安装 Vibeface，创建个人网络，让第一台电脑上的 Bot 回答一条消息。
 ---
 
 # 快速上手
@@ -9,7 +9,7 @@ description: 准备匹配当前源码的程序，创建个人网络，让第一�
 
 ## 准备一台电脑
 
-- 使用 Apple Silicon Mac，或运行 glibc 的 Linux x64、Linux ARM64。
+- 使用 Apple Silicon Mac，或 Linux x64、Linux ARM64。Linux 需要 glibc（系统运行库），可先按[运行库检查](install.md#检查-linux-运行库)确认。
 - 安装准备使用的 Agent，例如 Codex 或 Claude Code，并准备自己的模型服务和额度。
 - 准备一个已有的本机项目目录。首次尝试可以使用没有重要数据的练习项目。
 
@@ -17,7 +17,11 @@ Vibeface 不提供模型账号，也不安装 Agent。
 
 ## 1. 安装 Hourly
 
-本指南对应 CLI、Core 与 App 的完整包。先检查 [Releases](https://github.com/leaperone/vibeface/releases) 中的包同时包含 `vibeface`、`vibeface-core` 和 `web/`。首次正式版使用 data epoch 1，旧开发版数据和包不受支持。首次运行使用全新数据目录。
+Hourly 是持续更新的开发预览版。请使用 [Releases](https://github.com/leaperone/vibeface/releases) 中适合本机的完整安装包；下方安装器会自动选择平台并校验下载。
+
+完整包把启动入口 `vibeface`（CLI）、后台组件 `vibeface-core`（Core）和网页界面 `web/`（App）放在一起，不需要分别组装。
+
+当前数据格式编号（data epoch）是 1，它与软件版本号不同，用于判断数据目录能否使用。第一次运行使用新目录；已有安装先按[版本与数据检查](install.md#先核对安装包版本)核对，不要清空身份或修改格式编号来绕过检查。
 
 有匹配的完整包时，首次安装可执行以下命令。已经安装时，不重复运行安装器，按[更新说明](install.md#选择更新渠道)管理现有安装。
 

@@ -106,3 +106,45 @@ test('gives an actionable search-index failure without discarding navigation', a
   await expect(opener).toBeFocused()
   await expect(screen.getByRole('main')).toBeVisible()
 })
+
+test('keeps keyboard focus distinct in dark reduced-motion documentation', async ({ app, screen, browser }) => {
+  await browser.setViewport({ width: 390, height: 844 })
+  await browser.emulateMedia({ colorScheme: 'dark', reducedMotion: 'reduce' })
+  await app.open('/docs/quick-start/')
+  await expect(browser.locator('html')).toHaveAttribute('class', /dark/)
+  const indicator = () => browser.evaluate(() => {
+    const active = document.activeElement
+    if (!(active instanceof HTMLElement)) throw new Error('The keyboard control is missing')
+    const canvas = document.createElement('canvas'), paint = canvas.getContext('2d', { willReadFrequently: true })
+    if (!paint) throw new Error('Canvas color conversion is unavailable')
+    const rgba = (value: string) => { paint.clearRect(0, 0, 1, 1); paint.fillStyle = value; paint.fillRect(0, 0, 1, 1); return [...paint.getImageData(0, 0, 1, 1).data] }
+    const luminance = (rgb: number[]) => rgb.slice(0, 3).map(value => value / 255).map(value => value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4).reduce((sum, value, index) => sum + value * [.2126, .7152, .0722][index], 0)
+    const style = getComputedStyle(active)
+    let parent: HTMLElement | null = active, background = [0, 0, 0, 0]
+    while (parent && background[3] !== 255) { background = rgba(getComputedStyle(parent).backgroundColor); parent = parent.parentElement }
+    if (background[3] !== 255) throw new Error('The focus background is not observable')
+    const foreground = luminance(rgba(style.outlineColor)), backdrop = luminance(background)
+    return { width: parseFloat(style.outlineWidth), style: style.outlineStyle, contrast: (Math.max(foreground, backdrop) + .05) / (Math.min(foreground, backdrop) + .05), background: backdrop }
+  })
+  const opener = screen.getByRole('button', '打开文档目录', { visible: true })
+  await opener.focus()
+  await opener.press('Enter')
+  await expect(browser.locator('#nd-sidebar-mobile :focus')).toHaveCount(1)
+  for (let index = 0; index < 2; index++) {
+    const focus = await indicator()
+    assert(focus.background < .1, 'This check observes an actual dark surface')
+    assert(focus.width >= 2 && focus.style !== 'none', 'The focused control has a clear outline')
+    assert(focus.contrast >= 3, 'The focus indicator contrasts with its adjacent surface')
+    await browser.keyboard.press('Tab')
+  }
+  await app.screenshot('quality-docs-dark-focus')
+  await browser.keyboard.press('Escape')
+  await expect(browser.locator('#nd-sidebar-mobile')).toBeHidden()
+  await expect(opener).toBeFocused()
+  await browser.goto('/')
+  const docsLink = screen.getByRole('link', /^Docs/).first()
+  await docsLink.focus()
+  await expect(docsLink).toBeFocused()
+  const homeFocus = await indicator()
+  assert(homeFocus.width >= 2 && homeFocus.contrast >= 3, 'Marketing navigation uses the same visible keyboard focus')
+})
