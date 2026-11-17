@@ -268,7 +268,7 @@ impl RootCheckpoint {
         )
     }
 
-    fn create(
+    pub(super) fn create(
         network_id: &str,
         epoch: u64,
         root: &impl MembershipSigner,

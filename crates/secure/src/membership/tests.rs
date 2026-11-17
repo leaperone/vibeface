@@ -1,7 +1,6 @@
 use super::projection::Effect;
 use crate::Identity;
 use anyhow::{Context, Result};
-use std::collections::BTreeMap;
 
 use super::*;
 
