@@ -279,6 +279,24 @@ mod tests {
         fn append_dependent(&mut self, body: EventBody, deps: Vec<String>) -> Result<String> {
             let clock = serde_json::to_string(&self.clock()?)?;
             self.sequence += 1;
+            let scope = if matches!(&body, EventBody::WorkspaceCommanded { .. }) {
+                WORKSPACE_SCOPE
+            } else {
+                "scope"
+            };
+            let body = match &body {
+                EventBody::WorkspaceCommanded {
+                    command: WorkspaceCommand::AssignmentProgress { .. },
+                    ..
+                } => body,
+                EventBody::WorkspaceCommanded { cause: None, .. }
+                | EventBody::InputPosted { .. } => {
+                    self.identity
+                        .fixture_admin()
+                        .attest(&self.network, scope, body)?
+                }
+                _ => body,
+            };
             let event = Event {
                 version: WIRE_VERSION,
                 network_id: self.network.clone(),
@@ -289,11 +307,7 @@ mod tests {
                     .into_iter()
                     .filter(|hash| Some(hash) != self.previous.as_ref())
                     .collect(),
-                scope_id: if matches!(&body, EventBody::WorkspaceCommanded { .. }) {
-                    WORKSPACE_SCOPE.into()
-                } else {
-                    "scope".into()
-                },
+                scope_id: scope.into(),
                 created_at_ms: self.sequence as i64,
                 body,
                 blobs: vec![],

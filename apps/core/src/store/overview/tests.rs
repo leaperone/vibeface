@@ -159,3 +159,229 @@ fn default_open_prefix_and_counts_share_newest_ended_across_large_tails() -> Res
     assert_eq!(snapshot.relations.total, (population - 1) * 2);
     Ok(())
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn overview_snapshot_keeps_one_wal_view_when_projection_callback_commits() -> Result<()> {
+    use crate::scheduling::JobState;
+
+    let directory =
+        std::env::temp_dir().join(format!("vibeface-overview-wal-{}", uuid::Uuid::new_v4()));
+    crate::config::private_dir(&directory)?;
+    let path = directory.join("node.sqlite3");
+    let identity = LocalIdentity::generate();
+    let network = identity.fixture_network_id()?;
+    let local = identity.device_id()?;
+    let state = identity.sign_network_fixture(1, vec![local.clone()])?;
+    let expected_epoch = state.project()?.epoch;
+    let fixture_network = network.clone();
+    let fixture_local = local.clone();
+    let lock = Arc::new(crate::config::lock_data_dir(&directory)?);
+    let actor = StoreActor::open(path.clone(), lock, move |store| {
+        store.install_trust_bundle(&fixture_network, &state)?;
+        store.connection.execute(
+            "INSERT INTO conversations(network_id,conversation_id,title,owner,owner_epoch)
+             VALUES(?1,'a','A before',?2,7),(?1,'b','B before',?2,9)",
+            params![fixture_network, fixture_local],
+        )?;
+        store.connection.execute(
+            "INSERT INTO bots(network_id,conversation_id,bot_id,name,instructions,event_hash,rank)
+             VALUES(?1,'a','bot-a','Bot before','','hash-a','rank'),
+                   (?1,'b','bot-b','Bot B','','hash-b','rank')",
+            [&fixture_network],
+        )?;
+        store.connection.execute(
+            "INSERT INTO scheduler_jobs(conversation_id,trigger,kind,sequence,basis,reply_to,message_id,state,tool_calls)
+             VALUES('a','message:before','human',0,'{}','input','reply-before','queued',0)",
+            [],
+        )?;
+        store.connection.execute(
+            "INSERT INTO pending_checks(attempt_id,conversation_id,trigger,detail,created_at_ms)
+             VALUES('check-before','a','message:before','fixture',1)",
+            [],
+        )?;
+        store.connection.execute(
+            "INSERT INTO log_heads(network_id,author,max_seq,head_hash) VALUES(?1,?2,1,'head-before')",
+            params![fixture_network, fixture_local],
+        )?;
+        Ok(())
+    })
+    .await?;
+
+    let result = async {
+        let query_network = network.clone();
+        let query_local = local.clone();
+        let before = actor
+            .read("overview_wal_committing_projection", move |store| {
+                // Use the production actor's read transaction, not a transaction owned by
+                // overview_snapshot or the test. The callback runs after row/count selection
+                // and job hydration, but before the final head frontier is read.
+                assert!(!store.connection.is_autocommit());
+                let mut writer = Connection::open(path)?;
+                writer.busy_timeout(std::time::Duration::ZERO)?;
+                let mode: String =
+                    writer.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+                assert_eq!(mode, "wal");
+                let mut callbacks = 0;
+                let snapshot = store.overview_snapshot(
+                    OverviewQuery {
+                        network: &query_network,
+                        scope: None,
+                        local: &query_local,
+                        limit: 1,
+                        include_finished: false,
+                        include_sessions: false,
+                    },
+                    |store, job, owner_epoch, pending, _, _| {
+                        callbacks += 1;
+                        assert_eq!(callbacks, 1);
+                        assert_eq!(job.conversation_id, "a");
+                        assert_eq!(job.trigger, "message:before");
+                        assert_eq!(job.state, JobState::Queued);
+                        assert!(job.pending_check);
+                        assert!(pending);
+                        assert_eq!(owner_epoch, 7);
+
+                        let transaction = writer.transaction()?;
+                        assert_eq!(transaction.execute(
+                            "UPDATE conversations SET title='A after',owner_epoch=8
+                             WHERE network_id=?1 AND conversation_id='a'",
+                            [&query_network],
+                        )?, 1);
+                        assert_eq!(transaction.execute(
+                            "UPDATE bots SET name='Bot after' WHERE network_id=?1 AND conversation_id='a'",
+                            [&query_network],
+                        )?, 1);
+                        transaction.execute(
+                            "INSERT INTO conversations(network_id,conversation_id,title,owner)
+                             VALUES(?1,'c','C after',?2)",
+                            params![query_network, query_local],
+                        )?;
+                        transaction.execute(
+                            "INSERT INTO bots(network_id,conversation_id,bot_id,name,instructions,event_hash,rank)
+                             VALUES(?1,'c','bot-c','Bot C','','hash-c','rank')",
+                            [&query_network],
+                        )?;
+                        assert_eq!(transaction.execute(
+                            "UPDATE scheduler_jobs SET state='cancelled',detail='writer committed'
+                             WHERE conversation_id='a' AND trigger='message:before'",
+                            [],
+                        )?, 1);
+                        transaction.execute(
+                            "INSERT INTO scheduler_jobs(conversation_id,trigger,kind,sequence,basis,reply_to,message_id,state,tool_calls)
+                             VALUES('b','message:after','human',1,'{}','input','reply-after','queued',0)",
+                            [],
+                        )?;
+                        assert_eq!(transaction.execute("DELETE FROM pending_checks", [])?, 1);
+                        assert_eq!(transaction.execute(
+                            "UPDATE log_heads SET max_seq=2,head_hash='head-after'
+                             WHERE network_id=?1 AND author=?2",
+                            params![query_network, query_local],
+                        )?, 1);
+                        transaction
+                            .commit()
+                            .context("external WAL writer must commit while the overview read is open")?;
+                        assert!(writer.is_autocommit());
+                        let committed_title: String = writer.query_row(
+                            "SELECT title FROM conversations WHERE network_id=?1 AND conversation_id='a'",
+                            [&query_network],
+                            |row| row.get(0),
+                        )?;
+                        assert_eq!(committed_title, "A after");
+
+                        // Re-read through the production Store after the independent commit:
+                        // neither canonical job reads nor fresh SQL may cross the WAL view.
+                        let reread = store
+                            .scheduler_job("a", "message:before")?
+                            .context("original job remains in the read snapshot")?;
+                        assert_eq!(reread.state, JobState::Queued);
+                        assert!(reread.pending_check);
+                        assert!(store.scheduler_job("b", "message:after")?.is_none());
+                        assert!(!store.has_conversation(&query_network, "c")?);
+                        let facts: (String, u64, String, usize) = store.connection.query_row(
+                            "SELECT c.title,c.owner_epoch,b.name,
+                                (SELECT count(*) FROM conversations WHERE network_id=?1)
+                             FROM conversations c JOIN bots b ON b.network_id=c.network_id
+                                AND b.conversation_id=c.conversation_id
+                             WHERE c.network_id=?1 AND c.conversation_id='a'",
+                            [&query_network],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                        )?;
+                        assert_eq!(facts, ("A before".into(), 7, "Bot before".into(), 2));
+                        assert_eq!(
+                            store.heads(&query_network)?,
+                            std::collections::BTreeMap::from([(
+                                query_local.clone(),
+                                (1, "head-before".into()),
+                            )])
+                        );
+                        Ok(json!({"conversation_id":job.conversation_id,"trigger":job.trigger,
+                            "state":job.state.name(),"pending":pending,"owner_epoch":owner_epoch}))
+                    },
+                )?;
+                assert_eq!(callbacks, 1, "fixture must actually reach the commit callback");
+                Ok(snapshot)
+            })
+            .await?;
+        assert_eq!(before.network_epoch, expected_epoch);
+        assert_eq!(before.conversations.total, 2);
+        assert_eq!(before.conversations.omitted(), 1);
+        assert_eq!(before.conversations.rows[0]["title"], "A before");
+        assert_eq!(before.conversations.rows[0]["owner_epoch"], 7);
+        assert_eq!(before.bots.total, 2);
+        assert_eq!(before.bots.omitted(), 1);
+        assert_eq!(before.bots.rows[0]["name"], "Bot before");
+        assert_eq!(before.checks.total, 1);
+        assert_eq!(before.checks.rows.len(), 1);
+        assert_eq!(before.jobs.total, 1);
+        assert_eq!(before.jobs.rows, vec![json!({"conversation_id":"a","trigger":"message:before",
+            "state":"queued","pending":true,"owner_epoch":7})]);
+        assert_eq!(before.heads, std::collections::BTreeMap::from([(local.clone(), 1)]));
+
+        let expected_after_heads = std::collections::BTreeMap::from([(local.clone(), 2)]);
+        let after = actor
+            .read("overview_wal_after_commit", move |store| {
+                let cancelled = store.scheduler_job("a", "message:before")?.context("cancelled job")?;
+                assert!(matches!(cancelled.state, JobState::Cancelled { .. }));
+                assert!(!cancelled.pending_check);
+                assert!(store.has_conversation(&network, "c")?);
+                assert_eq!(store.heads(&network)?[&local], (2, "head-after".into()));
+                store.overview_snapshot(
+                    OverviewQuery {
+                        network: &network,
+                        scope: None,
+                        local: &local,
+                        limit: 1,
+                        include_finished: false,
+                        include_sessions: false,
+                    },
+                    |_, job, epoch, pending, _, _| {
+                        assert_eq!(job.state, JobState::Queued);
+                        assert!(!pending);
+                        Ok(json!({"conversation_id":job.conversation_id,"trigger":job.trigger,
+                            "owner_epoch":epoch}))
+                    },
+                )
+            })
+            .await?;
+        assert_eq!(after.network_epoch, expected_epoch);
+        assert_eq!(after.conversations.total, 3);
+        assert_eq!(after.conversations.omitted(), 2);
+        assert_eq!(after.conversations.rows[0]["title"], "A after");
+        assert_eq!(after.conversations.rows[0]["owner_epoch"], 8);
+        assert_eq!(after.bots.total, 3);
+        assert_eq!(after.bots.omitted(), 2);
+        assert_eq!(after.bots.rows[0]["name"], "Bot after");
+        assert_eq!(after.checks.total, 0);
+        assert!(after.checks.rows.is_empty());
+        assert_eq!(after.jobs.total, 1);
+        assert_eq!(after.jobs.rows, vec![json!({"conversation_id":"b","trigger":"message:after",
+            "owner_epoch":9})]);
+        assert_eq!(after.heads, expected_after_heads);
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    actor.shutdown().await?;
+    drop(actor);
+    std::fs::remove_dir_all(directory)?;
+    result
+}

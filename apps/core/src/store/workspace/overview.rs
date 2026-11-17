@@ -242,13 +242,17 @@ mod tests {
                 deps: vec![],
                 scope_id: WORKSPACE_SCOPE.into(),
                 created_at_ms: sequence as i64,
-                body: EventBody::WorkspaceCommanded {
-                    command_id: command_id.into(),
-                    command,
-                    acting_assignment: None,
-                    attestation: None,
-                    cause: None,
-                },
+                body: identity.fixture_admin().attest(
+                    &network,
+                    WORKSPACE_SCOPE,
+                    EventBody::WorkspaceCommanded {
+                        command_id: command_id.into(),
+                        command,
+                        acting_assignment: None,
+                        attestation: None,
+                        cause: None,
+                    },
+                )?,
                 blobs: vec![],
             };
             let envelope = identity.sign_event(event.clone())?;
