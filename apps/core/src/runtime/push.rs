@@ -255,21 +255,7 @@ impl Store {
         {
             return Ok(false);
         }
-        if let Some(event) = self.event(&subscription.network, &notification.notification_id)?
-            && let EventBody::QuestionAsked {
-                question_id, about, ..
-            } = serde_json::from_str::<Event>(&event.canonical_body)?.body
-        {
-            if let Some(question) = self.question(&subscription.network, &question_id)?
-                && (!question["answer"].is_null() || !question["closed"].is_null())
-            {
-                return Ok(false);
-            }
-            if self.session_muted(&subscription.network, &about.node, &about.session_id)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        self.notification_visible(&subscription.network, notification)
     }
 
     /// Recheck immediately before the HTTP boundary: unregistering, governance changes,
@@ -905,6 +891,19 @@ mod tests {
         };
         node.append(&network, "bot", question("muted-question", "session"))
             .await?;
+        let displayed = rpc(
+            &node,
+            access(&network),
+            json!({"method":"notifications","client_id":device}),
+        )
+        .await?;
+        assert!(
+            displayed["notifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|notification| notification["kind"] != "question")
+        );
         let transport = FixtureTransport::default();
         node.deliver_pushes(&transport, now_ms()).await?;
         assert!(transport.payloads.lock().unwrap().is_empty());
@@ -916,6 +915,21 @@ mod tests {
         .await?;
         node.deliver_pushes(&transport, now_ms()).await?;
         assert_eq!(transport.payloads.lock().unwrap().len(), 1);
+        let displayed = rpc(
+            &node,
+            access(&network),
+            json!({"method":"notifications","client_id":device}),
+        )
+        .await?;
+        assert_eq!(
+            displayed["notifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|notification| notification["kind"] == "question")
+                .count(),
+            1
+        );
         // Revoking an author with an effective event forces a real projection rebuild.
         let mut state = node.membership_state().await?;
         let other = LocalIdentity::generate();

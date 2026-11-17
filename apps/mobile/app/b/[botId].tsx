@@ -34,7 +34,7 @@ import { SendPreparation } from '@/features/chat/send-preparation'
 import { useChatDraft } from '@/features/chat/use-chat-draft'
 import { chatDrafts } from '@/platform/native-chat-drafts'
 import { readingPositions } from '@/platform/reading-position'
-import { chatMessageLocation } from '@/platform/chat-location'
+import { chatMessageLocation, visibleChatMessageIds, type VisibleChatMessage } from '@/platform/chat-location'
 import { QuestionCard } from '@/features/chat/question-card'
 import { useChatExtras, type Row } from '@/features/chat/work'
 import { RecoveryAlert } from '@/features/recovery/recovery'
@@ -165,7 +165,7 @@ export default function ChatScreen() {
   }
   const rows = chat && bot ? entries(chat, extras, bot, unreachable(device.link)) : []
   const history = live && live.conversationId === id ? live.data?.history : undefined
-  const [visible, setVisible] = useState<{ id: string; messages: string[] }>({ id: '', messages: [] })
+  const [visible, setVisible] = useState<{ id: string; messages: VisibleChatMessage[] }>({ id: '', messages: [] })
   const knownMessages = new Map(chat?.messages.map((message) => [message.message_id, message.event_hash]) ?? [])
   const reading = useRef({ id, positions, live, knownMessages })
   reading.current = { id, positions, live, knownMessages }
@@ -173,14 +173,14 @@ export default function ChatScreen() {
     const current = reading.current
     if (!current.id || !routeActive.current) return
     const messages = event.viewableItems.filter((token) => token.isViewable && 'message' in token.item).map((token) => token.item).filter((item): item is Extract<Entry, { message: ChatMessage }> => 'message' in item && current.knownMessages.get(item.message.message_id) === item.message.event_hash)
-    const ids = messages.filter((item) => !item.message.state).map((item) => item.message.message_id)
-    setVisible((previous) => previous.id === current.id && previous.messages.join('\0') === ids.join('\0') ? previous : { id: current.id ?? '', messages: ids })
+    const observed = messages.filter((item) => !item.message.state).map((item) => ({ message_id: item.message.message_id, event_hash: item.message.event_hash }))
+    setVisible((previous) => previous.id === current.id && JSON.stringify(previous.messages) === JSON.stringify(observed) ? previous : { id: current.id ?? '', messages: observed })
     if (!restoration.current.done) return
     const anchor = messages.at(-1)?.message.message_id
     current.positions.save(current.id, away.current && anchor ? { kind: 'message', messageId: anchor } : { kind: 'latest' })
   })
   useEffect(() => {
-    if (routeActive.current && visible.id === id && live?.view === 'chat' && live.conversationId === id && live.dataOrigin === 'network') void live.markMessagesRead(visible.messages).catch((cause) => { if (routeActive.current && reading.current.id === id) setSendError(messageOf(cause)) })
+    if (routeActive.current && visible.id === id && live?.view === 'chat' && live.conversationId === id && live.dataOrigin === 'network') void live.markMessagesRead(visibleChatMessageIds(visible.messages, live.data?.messages ?? [])).catch((cause) => { if (routeActive.current && reading.current.id === id) setSendError(messageOf(cause)) })
   }, [id, visible, live?.view, live?.conversationId, live?.data, live?.notifications, live?.generation])
   const loadOlder = () => {
     const current = reading.current

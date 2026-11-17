@@ -17,6 +17,15 @@ export function notificationBadgeCount(unread: Readonly<Record<string, number>>,
   return Object.entries(unread).reduce((sum, [id, count]) => sum + (muted.has(id) ? 0 : count), 0)
 }
 
+export function notificationUnreadCounts(notifications: readonly NotificationRecord[]): Record<string, number> {
+  const counts: Record<string, number> = {}
+  for (const notification of notifications) {
+    if (!['manager_response', 'manager_attention', 'bot_message', 'question'].includes(notification.kind)) continue
+    counts[notification.conversation_id] = (counts[notification.conversation_id] ?? 0) + 1
+  }
+  return counts
+}
+
 export function notificationPreferences(storage: KeyValue, networkId: string) {
   const { readStorage, writeStorage } = storageOf(storage)
   const key = networkKey('notification-preferences', networkId)

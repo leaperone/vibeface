@@ -2072,7 +2072,7 @@ impl Runtime {
                 let client = field(input, "client_id")?.to_owned();
                 let notifications = self
                     .read_display(&access, input, "notifications", move |store| {
-                        store.pending_notifications(&network, &client)
+                        store.display_notifications(&network, &client)
                     })
                     .await?;
                 Ok(json!({"notifications":notifications}))

@@ -11,7 +11,7 @@ import { inboxItems, waitingItems, type InboxItem } from '@vibeface/client/works
 import { addressName, deviceOnline, entryLabel } from '@vibeface/client/workspace/labels.ts'
 import { botReadiness, parseBots, parsePrimary, parsePendingMessage } from '@vibeface/client/workspace/model.ts'
 import type { PendingMessage } from '@vibeface/client/chat/types.ts'
-import { notificationBadgeCount, notificationPreferences, watchNotificationPreferences } from '@vibeface/client/workspace/system-notifications.ts'
+import { notificationBadgeCount, notificationPreferences, notificationUnreadCounts, watchNotificationPreferences } from '@vibeface/client/workspace/system-notifications.ts'
 import { storageOf } from '@vibeface/client/workspace/storage.ts'
 import { isSessionNotification, type BotRecord } from '@vibeface/client/workspace/types.ts'
 import { awaitsAnswer, foldAnswers } from '@vibeface/client/workspace/questions.ts'
@@ -272,12 +272,13 @@ function Live({ children }: { children: ReactNode }) {
     const tokens = Notifications.addPushTokenListener(sync)
     return () => { stopForeground(); tokens.remove() }
   }, [device.ready, shared.generation])
-  const unreadVersion = JSON.stringify(unread)
+  const badgeUnread = notificationUnreadCounts(notifications)
+  const unreadVersion = JSON.stringify(badgeUnread)
   useEffect(() => {
     if (!shared.synced) return
     const update = () => {
       const preferences = notificationPreferences(mobilePlatform.storage, networkId).read()
-      void Notifications.setBadgeCountAsync(notificationBadgeCount(unread, preferences)).catch(() => {})
+      void Notifications.setBadgeCountAsync(notificationBadgeCount(badgeUnread, preferences)).catch(() => {})
     }
     update()
     return watchNotificationPreferences(networkId, update)

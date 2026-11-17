@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { Notifier } from '../lib/platform.ts'
-import { notificationBadgeCount, notificationPreferences, systemNotifications, watchNotificationPreferences } from './system-notifications.ts'
+import type { NotificationRecord } from './types.ts'
+import { notificationBadgeCount, notificationPreferences, notificationUnreadCounts, systemNotifications, watchNotificationPreferences } from './system-notifications.ts'
 
 const fixture = () => {
   const values = new Map<string, string>()
@@ -52,4 +53,18 @@ test('enabling badges or muting a Bot immediately recomputes existing unread cou
   notificationPreferences(context.storage, 'other').write({ enabled: true, sound: true, badge: true, mutedConversations: [] })
   stop()
   assert.deepEqual(counts, [7, 2, 0])
+})
+
+test('app badge includes unread task and channel messages and excludes non-push notices', () => {
+  const records: NotificationRecord[] = [
+    { ...item, notification_id: 'task-reply', conversation_id: 'task-bot', kind: 'manager_response', target: { kind: 'task', task_id: 'task' } },
+    { ...item, notification_id: 'channel-reply', conversation_id: 'channel-bot', kind: 'bot_message' },
+    { ...item, notification_id: 'question', conversation_id: 'task-bot', kind: 'question' },
+    { ...item, notification_id: 'session', kind: 'session_attributed' },
+    { ...item, notification_id: 'work', kind: 'work_finished' },
+  ]
+  const counts = notificationUnreadCounts(records)
+  assert.deepEqual(counts, { 'task-bot': 2, 'channel-bot': 1 })
+  assert.equal(notificationBadgeCount(counts, { enabled: true, badge: true, sound: false, mutedConversations: [] }), 3)
+  assert.equal(notificationBadgeCount(counts, { enabled: true, badge: true, sound: false, mutedConversations: ['task-bot'] }), 1)
 })
