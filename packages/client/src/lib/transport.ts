@@ -1,5 +1,6 @@
 import type { SecureApi, SecureChannel, SecureHandshake } from '../secure-api.ts'
 import type { ConnectionEntry } from './node.ts'
+import { parseHttpOrigin } from './origin.ts'
 
 export type DeviceChannel = {
   deviceId: string
@@ -75,16 +76,26 @@ export function validTarget(value: unknown): string {
 }
 
 export function validEndpoint(value: string): string {
-  const url = new URL(value)
-  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || !['', '/'].includes(url.pathname)) throw new Error('填写 HTTP 或 HTTPS 地址，不包含路径、账号或密钥。')
+  const url = parseHttpOrigin(value)
+  if (!url) throw new Error('填写 HTTP 或 HTTPS 地址，不包含路径、账号或密钥。')
   const local = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
   if (page()?.protocol === 'https:' && url.protocol === 'http:' && !local) throw new Error('HTTPS 页面只能连接 HTTPS 地址。')
   return url.origin
 }
 
+/** Keep literal IP socket addresses; the URL parser supplies IP and port range checks. */
+function isLanAddr(value: unknown): value is string {
+  if (typeof value !== 'string' || !ipPort.test(value)) return false
+  const split = value.lastIndexOf(':'), host = value.slice(0, split), port = Number(value.slice(split + 1))
+  if (port < 1 || port > 65535) return false
+  // IPv4 leading zeroes have octal meaning to URL, rather than the literal IP shown.
+  if (!host.startsWith('[') && host.split('.').some(part => part.length > 1 && part.startsWith('0'))) return false
+  try { return new URL(`http://${value}`).hostname !== '' } catch { return false }
+}
+
 /** The distinct `ip:port` in `value`, at most 16. */
 export const lanAddrs = (value: unknown): string[] =>
-  Array.isArray(value) ? [...new Set(value.filter((item): item is string => typeof item === 'string' && ipPort.test(item)))].slice(0, 16) : []
+  Array.isArray(value) ? [...new Set(value.filter(isLanAddr))].slice(0, 16) : []
 
 const JOIN_LINK = 'vibeface://join/'
 const ticketPattern = /^vibeface1[0-9a-z]+$/
@@ -260,7 +271,9 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
   async function carry(entry: ConnectionEntry, target: string, signal: AbortSignal | undefined, onClose: (error: Error) => void, timeoutMs: number, onQueued?: (position: number) => void): Promise<Carrier> {
     if (entry.kind === 'lan') {
       if (!dialLan) throw new Error('这里不能在局域网里直连设备。')
-      return lanCarrier(dialLan, target, entry.addrs, signal, onClose, timeoutMs)
+      const addrs = lanAddrs(entry.addrs)
+      if (!addrs.length) throw new Error('访问地址缺失或格式无效。')
+      return lanCarrier(dialLan, target, addrs, signal, onClose, timeoutMs)
     }
     const endpoint = validEndpoint(entry.address)
     if (entry.kind === 'local' && nativeLocalCarrier) {

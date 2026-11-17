@@ -90,7 +90,7 @@ test('only entrance records signed by a current member Node of this network surv
     address('e', 'https://stranger.example.com/'), address('a', 'https://a.example.com/path'), 'junk',
   ]
   const found = verifiedEntrances(records, view, signedBySelf)
-  assert.deepEqual(found.map(item => [item.device_id[0], item.gateway_url, item.public]), [['a', 'https://a.example.com', true], ['b', 'http://192.168.1.4:4790', false]])
+  assert.deepEqual(found.map(item => [item.device_id[0], item.gateway_url, item.public]), [['a', 'https://a.example.com/', true], ['b', 'http://192.168.1.4:4790/', false]], 'signed descriptors retain their original URL bytes; connection candidates derive canonical dial origins')
 })
 
 test('a page a Node served reaches Nodes through that Node; the official page and the apps through the public node', () => {
@@ -118,10 +118,10 @@ test('after a reload an older address record never replaces a newer one, withdra
   const reloaded = JSON.parse(JSON.stringify(saved))
   const stale = verifiedEntrances([address('a', 'https://old.example.com/', view.network_id, 6), address('b', 'https://withdrawn.example.com/', view.network_id, 3)], view, signedBySelf)
   const merged = mergeEntrances(reloaded, stale, view)
-  assert.deepEqual(merged.map(item => [item.device_id[0], item.seq, item.gateway_url]), [['a', 7, 'https://new.example.com'], ['b', 4, null]])
+  assert.deepEqual(merged.map(item => [item.device_id[0], item.seq, item.gateway_url]), [['a', 7, 'https://new.example.com/'], ['b', 4, null]])
   assert.deepEqual(candidates(merged, { kind: 'gateway', address: 'http://127.0.0.1:5101', device_id: a }).map(entryAddress), ['http://127.0.0.1:5101', 'https://new.example.com'], 'a withdrawn address is not tried')
   const newer = mergeEntrances(merged, verifiedEntrances([address('b', 'https://back.example.com/', view.network_id, 5)], view, signedBySelf), view)
-  assert.equal(newer.find(item => item.device_id === b)?.gateway_url, 'https://back.example.com')
+  assert.equal(newer.find(item => item.device_id === b)?.gateway_url, 'https://back.example.com/')
 })
 
 test('the app dials only the Nodes it sees on its LAN, and an unseen one only when no web address is left', () => {
