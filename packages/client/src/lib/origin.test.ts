@@ -47,8 +47,8 @@ test('HTTP origin syntax consistently accepts root slash/default ports and deriv
 test('signed/cache/gateway/ConnectionEntry boundaries all reject credentials, nonroot paths, queries, fragments and URL repairs', () => {
   page(undefined, () => {
     for (const value of invalidOrigins) {
-      assert.throws(() => validEndpoint(value), undefined, value)
-      assert.throws(() => parseEntry({ device_id: a, address: value }), undefined, value)
+      assert.throws(() => validEndpoint(value), value)
+      assert.throws(() => parseEntry({ device_id: a, address: value }), value)
       assert.equal(storedGateway(value), null, value)
       assert.deepEqual(verifiedEntrances([signed(value)], view, () => true), [], value)
       assert.deepEqual(storedEntrances([cached({ gateway_url: value })]), [], value)
