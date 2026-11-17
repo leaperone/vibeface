@@ -32,8 +32,10 @@ test('server search validates exact scope and literal Unicode query echoes with 
 })
 
 test('history and search reject incomplete or contradictory continuation metadata', () => {
-  const history = { events: [], next_cursor: null, complete: true, coverage: { limit: 2, truncated: false, scope: 'task' } }
+  const history = { history_authority: 'workspace-authority', events: [], next_cursor: null, complete: true, coverage: { limit: 2, truncated: false, scope: 'task' } }
   assert.equal(parseWorkspaceHistory(history).complete, true)
+  assert.equal(parseWorkspaceHistory(history).history_authority, 'workspace-authority')
+  for (const history_authority of [undefined, null, '', ' ', 0, {}]) assert.throws(() => parseWorkspaceHistory({ ...history, history_authority }))
   for (const fields of [
     { next_cursor: undefined }, { next_cursor: '' }, { next_cursor: 'x', complete: true },
     { next_cursor: null, complete: false }, { complete: undefined },
@@ -64,9 +66,11 @@ test('workspace API keeps scope filters on every older page and rejects a differ
   const requests: { method: string; params?: Record<string, unknown> }[] = []
   const connection = { rpc: async (method: string, params?: Record<string, unknown>): Promise<unknown> => {
     requests.push({ method, params })
-    return { events: [], next_cursor: null, complete: true, coverage: { limit: 2, truncated: false, scope: 'task' } }
+    return { history_authority: 'workspace-authority', events: [], next_cursor: null, complete: true, coverage: { limit: 2, truncated: false, scope: 'task' } }
   } }
-  assert.equal((await readWorkspaceHistoryPage({ connection, filter: { task_id: 'task-one', limit: 2 }, cursor: 'older' })).complete, true)
+  const page = await readWorkspaceHistoryPage({ connection, filter: { task_id: 'task-one', limit: 2 }, cursor: 'older' })
+  assert.equal(page.complete, true)
+  assert.equal(page.history_authority, 'workspace-authority')
   assert.deepEqual(requests, [{ method: 'workspace_history', params: { task_id: 'task-one', limit: 2, cursor: 'older' } }])
   await assert.rejects(readWorkspaceHistoryPage({ connection, filter: { channel_id: 'channel', limit: 2 } }), /范围不一致/)
 })

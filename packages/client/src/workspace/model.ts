@@ -272,6 +272,8 @@ function boundedLimit(value: unknown, max: number): number {
 export function parseWorkspaceHistory(value: unknown): WorkspaceHistory {
   const data = record(value), coverage = record(data.coverage), scope = coverage.scope
   if (scope !== 'task' && scope !== 'channel' && scope !== 'workspace') throw new Error('历史记录的范围无法识别。')
+  const history_authority = text(data.history_authority)
+  if (!history_authority.trim()) throw new Error('历史记录缺少有效的 authority。')
   const continuation = historyContinuation(data), limit = boundedLimit(coverage.limit, 512), truncated = flag(coverage.truncated)
   if (truncated === continuation.complete) throw new Error('历史分页覆盖信息不一致。')
   const events = list(data.events).map((value) => {
@@ -280,7 +282,7 @@ export function parseWorkspaceHistory(value: unknown): WorkspaceHistory {
     return { event_hash: text(item.event_hash), created_at_ms: number(item.created_at_ms), scope_id: text(item.scope_id), kind: body.type, body, speaker: workspaceSpeaker(item.speaker) }
   })
   if (events.length > limit || new Set(events.map((item) => item.event_hash)).size !== events.length) throw new Error('历史记录重复或超过分页范围。')
-  return { events, ...continuation, coverage: { limit, truncated, scope } }
+  return { history_authority, events, ...continuation, coverage: { limit, truncated, scope } }
 }
 function searchScope(value: unknown): MessageSearchScope {
   const data = record(value)

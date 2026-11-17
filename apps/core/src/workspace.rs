@@ -111,6 +111,7 @@ pub struct WorkspaceHistoryItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceHistory {
+    pub history_authority: String,
     pub events: Vec<WorkspaceHistoryItem>,
     pub next_cursor: Option<String>,
     pub complete: bool,

@@ -115,6 +115,36 @@ fn page<T: Serialize>(
 }
 
 impl Store {
+    fn workspace_projection_authority(&self, network: &str) -> Result<String> {
+        let authority = self.conversation_history_authority(network, "")?;
+        // UI history spans messages in several Bot conversations. A competing
+        // winner/replacement can change one without changing the workspace graph.
+        // Ordinary new message IDs leave these projection revisions unchanged.
+        let mut statement = self.connection.prepare("SELECT conversation_id,revision FROM conversation_history_revisions WHERE network_id=? ORDER BY conversation_id")?;
+        let revisions = statement
+            .query_map([network], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(crate::crypto::digest(&serde_json::to_vec(&(
+            authority, revisions,
+        ))?))
+    }
+
+    fn workspace_history_item_visible(
+        &self,
+        network: &str,
+        event: &WorkspaceHistoryItem,
+    ) -> Result<bool> {
+        match &event.body {
+            EventBody::InputPosted { message_id, .. }
+            | EventBody::MessagePosted { message_id, .. } => Ok(self
+                .message(network, &event.scope_id, message_id)?
+                .is_some_and(|message| message.event_hash == event.event_hash)),
+            _ => Ok(true),
+        }
+    }
+
     pub fn workspace_history(
         &self,
         network: &str,
@@ -124,22 +154,24 @@ impl Store {
         limit: usize,
     ) -> Result<WorkspaceHistory> {
         ensure!((1..=512).contains(&limit), "workspace limit must be 1-512");
-        let authority = self.conversation_history_authority(network, "")?;
+        let authority = self.workspace_projection_authority(network)?;
         let binding = crate::crypto::digest(&serde_json::to_vec(&(
             "workspace_history",
             network,
             channel_id,
             task_id,
-            authority,
+            &authority,
         ))?);
-        let (events, next_cursor) = page(
-            self.workspace_history_events(network, channel_id, task_id)?,
-            &binding,
-            cursor,
-            limit,
-        )?;
+        let mut visible = Vec::new();
+        for (rank, event) in self.workspace_history_events(network, channel_id, task_id)? {
+            if self.workspace_history_item_visible(network, &event)? {
+                visible.push((rank, event));
+            }
+        }
+        let (events, next_cursor) = page(visible, &binding, cursor, limit)?;
         let complete = next_cursor.is_none();
         Ok(WorkspaceHistory {
+            history_authority: authority,
             events,
             next_cursor,
             complete,
@@ -215,23 +247,16 @@ impl Store {
                     MessageSearchScope::BotMain { .. } => unreachable!(),
                 };
                 for (rank, event) in self.workspace_history_events(network, channel, task)? {
+                    if !self.workspace_history_item_visible(network, &event)? {
+                        continue;
+                    }
                     let (message_id, text) = match event.body {
                         EventBody::InputPosted {
                             message_id, text, ..
                         }
                         | EventBody::MessagePosted {
                             message_id, text, ..
-                        } => {
-                            // Search the current committed message, not text superseded by
-                            // another event carrying the same stable message identity.
-                            if self
-                                .message(network, &event.scope_id, &message_id)?
-                                .is_none_or(|message| message.event_hash != event.event_hash)
-                            {
-                                continue;
-                            }
-                            (message_id, text)
-                        }
+                        } => (message_id, text),
                         EventBody::WorkspaceCommanded {
                             command:
                                 WorkspaceCommand::PostChannelMessage {
@@ -262,19 +287,11 @@ impl Store {
         let query = request.query.to_lowercase();
         candidates.retain(|(_, item)| item.text.to_lowercase().contains(&query));
         candidates.sort_by(|(a, _), (b, _)| a.cmp(b));
-        let mut authority = self.conversation_history_authority(network, &conversation)?;
-        if conversation.is_empty() {
-            // Task/channel messages may live in several Bot conversations. An
-            // edit/replacement in any of those projections must expire the search
-            // window just as it does for Main, rather than silently losing a hit.
-            let mut statement = self.connection.prepare("SELECT conversation_id,revision FROM conversation_history_revisions WHERE network_id=? ORDER BY conversation_id")?;
-            let revisions = statement
-                .query_map([network], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            authority = crate::crypto::digest(&serde_json::to_vec(&(authority, revisions))?);
-        }
+        let authority = if conversation.is_empty() {
+            self.workspace_projection_authority(network)?
+        } else {
+            self.conversation_history_authority(network, &conversation)?
+        };
         let binding = crate::crypto::digest(&serde_json::to_vec(&(
             "message_search",
             network,

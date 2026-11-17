@@ -18702,7 +18702,7 @@ fn workspace_history_pages_and_message_search_cover_committed_scoped_text() -> R
     if let EventBody::MessagePosted { text, .. } = &mut replacement {
         *text = "已替换的中文正文".into();
     }
-    origin.append_event(&net.a, &net.network, "c", replacement, vec![], 8)?;
+    let losing = origin.append_event(&net.a, &net.network, "c", replacement, vec![], 8)?;
     assert!(
         origin
             .message_search(
@@ -18720,7 +18720,7 @@ fn workspace_history_pages_and_message_search_cover_committed_scoped_text() -> R
     let superseded = origin.message_search(
         &net.network,
         &MessageSearchRequest {
-            scope,
+            scope: scope.clone(),
             query: "已替换".into(),
             cursor: None,
             limit: 100,
@@ -18729,6 +18729,142 @@ fn workspace_history_pages_and_message_search_cover_committed_scoped_text() -> R
     assert!(
         superseded.items.is_empty(),
         "losing competing reply text is not a visible search hit"
+    );
+    let projected = origin.workspace_history(&net.network, None, Some("task-one"), None, 100)?;
+    let winner = origin
+        .message(&net.network, "c", "reply-task")?
+        .context("visible reply")?;
+    assert!(
+        !projected
+            .events
+            .iter()
+            .any(|event| event.event_hash == losing.hash)
+    );
+    let visible_reply = projected
+        .events
+        .iter()
+        .find(|event| event.event_hash == winner.event_hash)
+        .context("winner in UI history")?;
+    assert!(
+        matches!(&visible_reply.body, EventBody::MessagePosted { text, .. } if text == &winner.text)
+    );
+    let search_winner = origin.message_search(
+        &net.network,
+        &MessageSearchRequest {
+            scope,
+            query: "回复".into(),
+            cursor: None,
+            limit: 100,
+        },
+    )?;
+    assert_eq!(search_winner.items.len(), 1);
+    assert_eq!(search_winner.items[0].event_hash, winner.event_hash);
+    assert_eq!(search_winner.items[0].text, winner.text);
+    assert!(
+        origin
+            .events_from(&net.network, &net.a.device_id()?, 1, 100)?
+            .iter()
+            .any(|event| event.hash == losing.hash),
+        "the raw DAG retains the competing event"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn workspace_history_authority_expires_overlapping_windows_after_fork_reprojection() -> Result<()> {
+    use crate::workspace::*;
+    let (net, mut origin) = workspace_fixture()?;
+    workspace_command_fixture(
+        &net,
+        &mut origin,
+        "create-task",
+        workspace_task_command("task", None),
+        3,
+    )?;
+    let base = workspace_input_fixture(
+        &net,
+        &mut origin,
+        "base",
+        Some("task"),
+        InputIntent::Continue,
+        4,
+    )?;
+    let mut fork = store(&net)?;
+    fork.ingest_events(
+        &net.network,
+        &origin.events_from(&net.network, &net.a.device_id()?, 1, 100)?,
+    )?;
+    let discarded = workspace_input_fixture(
+        &net,
+        &mut origin,
+        "branch-a",
+        Some("task"),
+        InputIntent::Continue,
+        5,
+    )?;
+    let first = origin.workspace_history(&net.network, None, Some("task"), None, 2)?;
+    let old_window = origin.workspace_history(&net.network, None, Some("task"), None, 512)?;
+    assert!(old_window.complete);
+    let cursor = first.next_cursor.context("older task history")?;
+    workspace_input_fixture(
+        &net,
+        &mut origin,
+        "tail",
+        Some("task"),
+        InputIntent::Continue,
+        6,
+    )?;
+    let appended = origin.workspace_history(&net.network, None, Some("task"), None, 2)?;
+    assert_eq!(first.history_authority, appended.history_authority);
+    let older = origin.workspace_history(&net.network, None, Some("task"), Some(&cursor), 2)?;
+    assert_eq!(older.history_authority, first.history_authority);
+    assert!(older.complete);
+    let conflicting = workspace_input_fixture(
+        &net,
+        &mut fork,
+        "branch-b",
+        Some("task"),
+        InputIntent::Continue,
+        5,
+    )?;
+    let envelope = fork
+        .events_from(&net.network, &net.a.device_id()?, 1, 100)?
+        .into_iter()
+        .find(|event| event.hash == conflicting.source_event)
+        .context("conflicting input event")?;
+    origin.ingest_events(&net.network, &[envelope])?;
+    let refreshed = origin.workspace_history(&net.network, None, Some("task"), None, 2)?;
+    assert_ne!(first.history_authority, refreshed.history_authority);
+    assert!(refreshed.complete);
+    assert!(
+        refreshed
+            .events
+            .iter()
+            .any(|event| event.event_hash == base.source_event)
+    );
+    assert!(
+        old_window
+            .events
+            .iter()
+            .any(|event| event.event_hash == base.source_event)
+    );
+    assert!(
+        old_window
+            .events
+            .iter()
+            .any(|event| event.event_hash == discarded.source_event)
+    );
+    assert!(
+        !refreshed
+            .events
+            .iter()
+            .any(|event| event.event_hash == discarded.source_event)
+    );
+    assert!(
+        origin
+            .workspace_history(&net.network, None, Some("task"), Some(&cursor), 2)
+            .is_err()
     );
     Ok(())
 }
