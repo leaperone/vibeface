@@ -21,6 +21,7 @@ import { ErrorText } from '@/components/action'
 import { useLive } from '@/data/live'
 import { useWorkspace } from '@/data/context'
 import { localWorkspaceHistory } from '@/platform/native-workspace-history-cache'
+import { createViewportRead, visibleWorkspaceNotifications, type MessageRowLayout } from '@/platform/viewport-read'
 import type { ChatMessage } from '@/data/types'
 import { Composer } from '@/features/chat/composer'
 import { MessageAttachments } from '@/features/chat/attachments'
@@ -292,6 +293,12 @@ function ScopedWorkspaceContent({ taskId, channelId }: { taskId?: string; channe
   const located = useRef('')
   const [history, setHistory] = useState<WorkspaceHistory | null>(null)
   const historyRef = useRef(history)
+  const historyConfirmed = useRef(false)
+  const viewportRows = useRef(new Map<string, MessageRowLayout>())
+  const viewport = useRef({ top: 0, height: 0, insetTop: 0, insetBottom: 0 })
+  const viewportRead = useRef(createViewportRead()).current
+  const reportViewport = useRef<() => void>(() => {})
+  const viewportReady = useRef(false)
   const lastCacheWrite = useRef('')
   const [historyQuery, setHistoryQuery] = useState('')
   const [historyError, setHistoryError] = useState('')
@@ -320,6 +327,22 @@ function ScopedWorkspaceContent({ taskId, channelId }: { taskId?: string; channe
   const task = selectedTaskId ? tasks.find((item) => item.task_id === selectedTaskId) : tasks.findLast((item) => item.owner_bot === (recipient || channel?.coordinator_bot) && !['completed', 'cancelled'].includes(item.state))
   const pendingTask = savedInput ?? shared?.pendingMessages.find((input) => (input.target.kind === 'task' || input.target.kind === 'channel_task') && input.target.task_id === selectedTaskId)
   const bot = shared?.bots.find((item) => task ? item.bot_id === task.owner_bot : pendingTask ? item.conversation_id === pendingTask.conversation_id : item.bot_id === (recipient || channel?.coordinator_bot))
+  viewportReady.current = Boolean(shared && bot && (!taskId || task || pendingTask) && (!channelId || channel))
+  const viewportScope = JSON.stringify([ready?.principal.network_id, ready?.principal.device_id, shared?.generation, taskId, channelId])
+  const currentViewportScope = useRef(viewportScope)
+  currentViewportScope.current = viewportScope
+  const viewportFilter = JSON.stringify([historyQuery, locatedMessage])
+  const currentViewportFilter = useRef(viewportFilter)
+  currentViewportFilter.current = viewportFilter
+  const renderedHistoryEvents = history?.events.filter(item => workspaceHistoryMatchesMessage(item, locatedMessage) || !historyQuery.trim() || JSON.stringify(item.body).toLocaleLowerCase().includes(historyQuery.trim().toLocaleLowerCase())) ?? []
+  reportViewport.current = () => {
+    const live = latest.current
+    const current = () => Boolean(live && ready && viewportReady.current && live.writable && latest.current?.writable && historyConfirmed.current && historyRef.current === history && routeActive.current && AppState.currentState === 'active' && currentViewportScope.current === viewportScope && currentViewportFilter.current === viewportFilter && latest.current?.generation === live.generation && ready.isCurrent() && live.isCurrent())
+    if (!live || !current()) { viewportRead.invalidate(); return }
+    viewportRead.observe({ scope: viewportScope, current, notifications: visibleWorkspaceNotifications({ events: renderedHistoryEvents, rows: viewportRows.current, viewport: viewport.current, notifications: live.notifications }), acknowledge: notification => live.ackNotification(notification) })
+  }
+  useEffect(() => { viewportRead.invalidate(); reportViewport.current() }, [history, historyQuery, locatedMessage])
+  useEffect(() => { reportViewport.current() }, [shared?.notifications, shared?.writable])
   const target: InputTarget = task ? task.channel_id ? { kind: 'channel_task', channel_id: task.channel_id, task_id: task.task_id, bot_id: task.owner_bot } : { kind: 'task', task_id: task.task_id } : taskId && pendingTask ? pendingTask.target : selectedTaskId && channelId ? { kind: 'channel_task', channel_id: channelId, task_id: selectedTaskId, bot_id: bot?.bot_id ?? '' } : { kind: 'channel_member', channel_id: channelId ?? '', bot_id: bot?.bot_id ?? '' }
   const targetKey = inputTargetKey(target), conversationId = bot?.conversation_id ?? ''
   const draftScope = { networkId: ready?.principal.network_id ?? '', deviceId: ready?.principal.device_id ?? '', conversationId, inputTarget: targetKey }
@@ -339,6 +362,7 @@ function ScopedWorkspaceContent({ taskId, channelId }: { taskId?: string; channe
     request.current = token
     const current = () => request.current === token && routeActive.current && AppState.currentState === 'active' && live.isCurrent()
     const filter = channelId ? { channel_id: channelId } : { task_id: taskId }
+    if (mode === 'reload') { historyConfirmed.current = false; viewportRead.invalidate() }
     setReading(mode)
     try {
       let result: WorkspaceHistory | null
@@ -356,6 +380,7 @@ function ScopedWorkspaceContent({ taskId, channelId }: { taskId?: string; channe
       }
       if (!result || !current()) return false
       historyRef.current = result
+      historyConfirmed.current = true
       setHistory(result); setHistoryError(''); setPageError('')
       const cachedChannel = metadata?.channels.find(item => item.channel_id === channelId)
       const cachedTask = metadata?.tasks.find(item => item.task_id === taskId)
@@ -370,6 +395,7 @@ function ScopedWorkspaceContent({ taskId, channelId }: { taskId?: string; channe
       return true
     } catch (cause) {
       if (current()) {
+        historyConfirmed.current = false; viewportRead.invalidate()
         const message = messageOf(cause)
         if (mode === 'older') setPageError(message)
         else setHistoryError(message)
@@ -384,13 +410,13 @@ function ScopedWorkspaceContent({ taskId, channelId }: { taskId?: string; channe
   useFocusEffect(useCallback(() => {
     routeActive.current = true
     const refresh = () => { if (AppState.currentState === 'active') void readRef.current() }
-    refresh()
+    refresh(); reportViewport.current()
     const timer = setInterval(refresh, 3000)
     const listener = AppState.addEventListener('change', state => {
-      if (state === 'active') refresh()
-      else { request.current = null; setReading(null) }
+      if (state === 'active') { refresh(); reportViewport.current() }
+      else { request.current = null; setReading(null); viewportRead.invalidate() }
     })
-    return () => { routeActive.current = false; request.current = null; clearInterval(timer); listener.remove() }
+    return () => { routeActive.current = false; request.current = null; viewportRead.invalidate(); clearInterval(timer); listener.remove() }
   }, []))
   const matchesLocation = (event: NonNullable<typeof history>['events'][number]) => workspaceHistoryMatchesMessage(event, locatedMessage)
   const foundLocation = Boolean(locatedMessage && history?.events.some(matchesLocation))
@@ -455,13 +481,13 @@ function ScopedWorkspaceContent({ taskId, channelId }: { taskId?: string; channe
   }
   return <View className="flex-1"><Stack.Screen options={{ title: channel?.title ?? task?.title ?? '正在创建任务', headerRight: () => <View className="flex-row items-center gap-1"><Link href={channelId ? `/search?channel=${encodeURIComponent(channelId)}` : `/search?task=${encodeURIComponent(taskId ?? '')}`} asChild><Button variant="ghost" iconOnly accessibilityLabel={channelId ? '搜索完整频道历史' : '搜索完整任务历史'}><Icon as={Search} /></Button></Link>{channel ? <Link href={`/channel/${channel.channel_id}/settings`} asChild><Button variant="ghost" iconOnly accessibilityLabel="频道设置"><Icon as={Settings} /></Button></Link> : task ? <Link href={`/task/${task.task_id}/context`} asChild><Button variant="ghost" iconOnly accessibilityLabel="任务上下文和历史"><Icon as={BrainCircuit} /></Button></Link> : null}</View> }} />
     {!task && pendingTask && taskId ? <Text role="status" className="px-4 pt-3 text-sm text-muted">任务已在本地保存，正在读取任务记录。后续补充保留在这个任务。</Text> : null}
-    <KeyboardAwareScrollView ref={scroll} bottomOffset={16} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-6 pb-6">
+    <KeyboardAwareScrollView ref={scroll} scrollEventThrottle={100} onLayout={layout => { viewport.current.height = Math.max(0, layout.nativeEvent.layout.height - viewport.current.insetTop - viewport.current.insetBottom); reportViewport.current() }} onScroll={({ nativeEvent }) => { const { contentOffset, contentInset, layoutMeasurement } = nativeEvent; viewport.current = { top: contentOffset.y + contentInset.top, height: Math.max(0, layoutMeasurement.height - contentInset.top - contentInset.bottom), insetTop: contentInset.top, insetBottom: contentInset.bottom }; reportViewport.current() }} onContentSizeChange={() => reportViewport.current()} bottomOffset={16} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-6 pb-6">
       {channel ? <View className="gap-2"><Text className="text-sm text-muted">{channel.purpose}</Text><Text className="text-sm text-muted">{channel.members.map((id) => shared.bots.find((item) => item.bot_id === id)?.name ?? id).join('、')} · 默认协调 {shared.bots.find((item) => item.bot_id === channel.coordinator_bot)?.name ?? 'Bot 未加载'}</Text><Details label={`频道任务 · ${tasks.length}`}><View className="gap-3">{tasks.map((item) => <WorkspaceTaskRow key={item.task_id} task={item} />)}</View></Details></View> : task ? <View className="gap-2"><Text className="text-sm text-muted">{bot.name} · 第 {task.revision} 版 · {taskLabels[task.state]}</Text>{task.waiting_reason ? <Text role="status" className="text-sm text-warning">{task.waiting_reason}</Text> : null}<View className="flex-row flex-wrap gap-2"><Button variant="secondary" disabled={Boolean(actionBusy)} onPress={() => void control('continue')}><Text>继续任务</Text></Button><Button variant="secondary" disabled={Boolean(actionBusy)} onPress={() => void control('defer')}><Text>稍后处理</Text></Button><Button variant="ghost" disabled={Boolean(actionBusy)} onPress={() => void control('cancel')}><Text>取消任务</Text></Button></View></View> : null}
       <View className="gap-2"><Text nativeID="scope-history-search" className="text-sm text-muted">{channelId ? '搜索当前频道已加载的记录' : '搜索当前任务已加载的记录'}</Text><Input accessibilityLabel={channelId ? '搜索当前频道已加载的记录' : '搜索当前任务已加载的记录'} accessibilityLabelledBy="scope-history-search" value={historyQuery} onChangeText={setHistoryQuery} placeholder="输入关键词" /></View>
       {history?.next_cursor ? <Button variant="secondary" disabled={Boolean(reading)} onPress={() => void read('older')}><Text>{reading === 'older' ? '正在读取更早记录' : '读取更早记录'}</Text></Button> : null}
       {pageError || historyError ? <View accessibilityLiveRegion="polite" className="gap-2"><ErrorText error={pageError || historyError} /><Text className="text-sm text-muted">连接或历史依据可能已改变。重新加载可重新读取历史，草稿会保留。</Text><Button variant="secondary" disabled={Boolean(reading)} onPress={() => void read('reload')}><Text>重新加载历史</Text></Button></View> : null}
       {locatedMessage ? <Text accessibilityLiveRegion="polite" className="text-sm text-muted">{foundLocation ? '已定位搜索结果。' : history?.complete ? '这条搜索结果已不在当前历史中，请重新搜索。' : '正在读取更早记录以定位搜索结果。'}</Text> : null}
-      {history?.events.filter(item => matchesLocation(item) || !historyQuery.trim() || JSON.stringify(item.body).toLocaleLowerCase().includes(historyQuery.trim().toLocaleLowerCase())).map(event => {
+      {renderedHistoryEvents.map(event => {
         const body = event.body
         const actor = event.speaker
         const speaker = actor.kind === 'bot' ? shared.bots.find(bot => bot.bot_id === actor.bot_id)?.name ?? 'Bot 未加载' : actor.kind === 'human' ? '你' : shared.nodes.find(node => node.device_id === actor.device_id)?.name ?? '执行设备'
@@ -481,7 +507,7 @@ function ScopedWorkspaceContent({ taskId, channelId }: { taskId?: string; channe
           if (command.kind === 'create_task') { const item = tasks.find(task => task.task_id === command.task_id); if (item) content = <WorkspaceTaskRow task={item} /> }
           if (command.kind === 'revise_task') content = <Text className="text-sm text-muted">任务交代已更新为第 {command.expected_revision + 1} 版。</Text>
         }
-        return content ? <View key={event.event_hash} className={highlighted ? 'gap-2 rounded-control border border-accent p-3' : undefined} onLayout={highlighted ? layout => { if (located.current !== locatedMessage) { located.current = locatedMessage; const y = Math.max(0, layout.nativeEvent.layout.y - 16); requestAnimationFrame(() => scroll.current?.scrollTo({ y, animated: false })) } } : undefined}>{highlighted ? <Text className="text-sm font-medium">搜索结果</Text> : null}{content}</View> : null
+        return content ? <View key={event.event_hash} className={highlighted ? 'gap-2 rounded-control border border-accent p-3' : undefined} onLayout={layout => { const row = layout.nativeEvent.layout; viewportRows.current.set(event.event_hash, { y: row.y, height: row.height }); reportViewport.current(); if (highlighted && located.current !== locatedMessage) { located.current = locatedMessage; const y = Math.max(0, row.y - 16); requestAnimationFrame(() => scroll.current?.scrollTo({ y, animated: false })) } }}>{highlighted ? <Text className="text-sm font-medium">搜索结果</Text> : null}{content}</View> : null
       })}
       {shared.questions.filter(question => question.target && (channelId ? (question.target.kind === 'channel_task' || question.target.kind === 'channel_member') && question.target.channel_id === channelId : sameTarget(question.target, target))).map(question => <QuestionCard key={question.question_id} question={question} inTask />)}
       {pending.map(item => <View key={item.message_id} className="gap-2">{!posted.has(item.message_id) ? <View className="max-w-[90%] self-end rounded-panel bg-surface-muted px-4 py-3">{item.text ? <Text selectable>{item.text}</Text> : null}{item.attachments?.length ? attachments(item.attachments, item.conversation_id) : null}<MessageActions message={{ message_id: item.message_id, event_hash: '', created_at_ms: item.created_at_ms, role: 'user', text: item.text, attachments: item.attachments }} onQuote={quote} /></View> : null}<InputStatus pending={item} /></View>)}
