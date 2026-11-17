@@ -371,6 +371,14 @@ a { color: inherit; text-decoration: none; }
   .site *, .site *::before, .site *::after { animation: none !important; transition: none !important; }
   .visual-signal, .visual-signal-glow { display: none; }
   .visual-node:hover { transform: none; }
+  /* Reading overlays change state without zooming or sliding; loading indicators keep their feedback. */
+  .site-docs *, .site-docs *::before, .site-docs *::after {
+    transition-property: color, background-color, border-color, opacity !important;
+    transition-duration: 100ms !important;
+    scroll-behavior: auto !important;
+  }
+  .site-search-dialog[data-state='open'], .site-docs [data-state='open']:not(button):not(a) { animation: reading-fade-in 100ms linear both !important; }
+  .site-search-dialog[data-state='closed'], .site-docs [data-state='closed']:not(button):not(a) { animation: reading-fade-out 100ms linear both !important; }
 }
 @media (forced-colors: active) {
   .site :is(a, button):focus-visible { outline-color: Highlight; }
@@ -380,3 +388,5 @@ a { color: inherit; text-decoration: none; }
 @keyframes orbit-arrive { from { opacity: 0; transform: rotate(calc(var(--orbit-angle) - 12deg)) scale(.94); } to { opacity: 1; transform: rotate(var(--orbit-angle)) scale(1); } }
 @keyframes reveal-rise { from { opacity: 0; transform: translateY(18px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes draw-line { from { transform: scaleY(0); } to { transform: scaleY(1); } }
+@keyframes reading-fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes reading-fade-out { from { opacity: 1; } to { opacity: 0; } }

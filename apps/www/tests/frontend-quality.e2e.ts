@@ -4,6 +4,7 @@ import { test } from '@e2e-dev/web'
 
 test('keeps the guide language, narrow layout and production search clear', async ({ app, screen, browser }) => {
   await browser.setViewport({ width: 320, height: 900 })
+  await browser.emulateMedia({ reducedMotion: 'reduce' })
   await app.open()
   await expect(screen.getByText('Guides are currently in Chinese.', { exact: true })).toBeVisible()
   const geometry = await browser.evaluate(() => ({ content: document.documentElement.scrollWidth, available: document.documentElement.clientWidth }))
@@ -34,6 +35,17 @@ test('keeps the guide language, narrow layout and production search clear', asyn
   const search = screen.getByRole('button', '打开文档搜索', { visible: true }).first()
   await search.focus()
   await search.press('Enter')
+  await expect(screen.getByRole('dialog')).toBeVisible()
+  const spatialAnimations = await browser.evaluate(() => {
+    const dialog = document.querySelector('.site-search-dialog')
+    if (!dialog) throw new Error('The document search dialog is missing')
+    return dialog.getAnimations().filter(animation => {
+      if (!(animation.effect instanceof KeyframeEffect)) return false
+      const positions = animation.effect.getKeyframes().map(frame => [frame.transform, frame.translate, frame.scale, frame.rotate].join('|'))
+      return new Set(positions).size > 1
+    }).map(animation => animation instanceof CSSAnimation ? animation.animationName : animation.id)
+  })
+  assert.deepEqual(spatialAnimations, [], 'Reduced-motion search opens without a spatial animation')
   await screen.getByPlaceholder('搜索文档').fill('恢复')
   await expect(screen.getByRole('option').first()).toBeVisible()
   const results = await browser.evaluate(() => [...document.querySelectorAll<HTMLElement>('[role="option"]')].map(element => ({
@@ -59,6 +71,7 @@ test('keeps the guide language, narrow layout and production search clear', asyn
 })
 
 test('gives an actionable search-index failure without discarding navigation', async ({ app, screen, browser }) => {
+  await browser.emulateMedia({ reducedMotion: 'no-preference' })
   await browser.route('**/search-index.json', route => route.fulfill({ status: 503, json: { error: 'temporary-fixture-failure' } }))
   await app.open('/docs/quick-start/')
   await screen.getByRole('button', '打开文档搜索', { visible: true }).first().click()
