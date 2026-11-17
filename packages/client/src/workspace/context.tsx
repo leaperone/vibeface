@@ -332,7 +332,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
         if (conversationCache) setDataOrigin('cache')
         else { dataRef.current = null; setData(null); setDataOrigin('none') }
         scheduleRefresh()
-        await readConversation(id)
+        await refreshRef.current()
         return
       }
       throw caught
