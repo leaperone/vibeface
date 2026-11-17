@@ -11951,7 +11951,7 @@ dependencies = [
 
 [[package]]
 name = "vibeface-desktop"
-version = "0.0.1-hourly.2026111300"
+version = "0.0.1-hourly.2026111711"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
