@@ -7,7 +7,6 @@ import { fileURLToPath } from 'node:url';
 import { crc32, deflateSync } from 'node:zlib';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
-const { chromium } = createRequire(fs.realpathSync(path.join(repo, 'node_modules/@e2e-dev/web')) + '/')('playwright-core');
 
 const GREEN = '#4ADE80';
 const glyph = color => `<g fill="none" stroke="${color}" stroke-width="64" stroke-linecap="round" stroke-linejoin="round"><path d="M336 476 L400 404 L464 476"/><path d="M560 476 L624 404 L688 476"/></g><rect x="442" y="580" width="140" height="72" rx="16" fill="${color}"/>`;
@@ -18,10 +17,12 @@ const svg = body => `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1
 const glowBackground = '<rect width="1024" height="1024" fill="url(#bg)"/>';
 const glowGlyph = `<g filter="url(#glow)">${glyph(GREEN)}</g>`;
 const appIcon = svg(`<defs>${gradient}${glow}</defs>${glowBackground}${glowGlyph}`);
+const logo = svg(`<rect width="1024" height="1024" rx="224" fill="#0B100D"/>${glyph(GREEN)}`);
 
 const icons = [
   { out: 'apps/mobile/assets/icon/app-icon.svg', svg: appIcon },
-  { out: 'apps/app/public/icon.svg', svg: svg(`<rect width="1024" height="1024" rx="224" fill="#0B100D"/>${glyph(GREEN)}`) },
+  { out: 'apps/app/public/icon.svg', svg: logo },
+  { out: 'apps/www/public/logo.svg', svg: logo },
   { out: 'apps/mobile/assets/icon/ios-light.png', size: 1024, opaque: true, svg: appIcon },
   { out: 'apps/mobile/assets/icon/ios-tinted.png', size: 1024, opaque: true, svg: svg(`<rect width="1024" height="1024" fill="#000"/>${glyph('#FFF')}`) },
   { out: 'apps/mobile/assets/icon/android-foreground.png', size: 1024, opaque: false, svg: svg(`<defs>${glow}</defs>${glowGlyph}`) },
@@ -58,6 +59,16 @@ function encodePng(rgba, size, opaque) {
   ]);
 }
 
+if (process.argv.includes('--check')) {
+  for (const icon of icons.filter(icon => !icon.size)) {
+    const out = path.join(repo, icon.out);
+    assert.equal(fs.readFileSync(out, 'utf8'), icon.svg, `${icon.out} is out of date; run scripts/render-app-icons.mjs`);
+  }
+  console.log('SVG icons are up to date');
+  process.exit(0);
+}
+
+const { chromium } = createRequire(fs.realpathSync(path.join(repo, 'node_modules/@e2e-dev/web')) + '/')('playwright-core');
 const browser = await chromium.launch();
 try {
   const page = await browser.newPage();
