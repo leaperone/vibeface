@@ -44,6 +44,7 @@
       "app/new-channel.tsx",
       "app/new-task.tsx",
       "app/recovery.tsx",
+      "app/search.tsx",
       "app/settings.tsx",
       "app/switch-network.tsx",
       "app/task/[taskId].tsx",
