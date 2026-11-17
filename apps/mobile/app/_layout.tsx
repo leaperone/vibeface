@@ -99,6 +99,7 @@ function Screens() {
             <Stack.Screen name="b/[botId]" options={{ title: '', ...root }} />
             <Stack.Screen name="b/[botId]/about" options={{ title: '' }} />
             <Stack.Screen name="b/[botId]/context" options={{ title: '上下文和协作' }} />
+            <Stack.Screen name="search" options={{ title: '搜索消息' }} />
             <Stack.Screen name="b/[botId]/work/[workId]" options={{ title: '任务' }} />
             <Stack.Screen name="tasks" options={(props) => ({ title: '任务', ...root, ...viaTab(props) })} />
             <Stack.Screen name="new-task" options={{ title: '新任务' }} />
