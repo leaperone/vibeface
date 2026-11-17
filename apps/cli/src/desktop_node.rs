@@ -89,8 +89,6 @@ pub(crate) struct Receipt {
     data_epoch: u32,
 }
 
-/// The identity and runtime fields this CLI needs from Core's full health report.
-
 fn running_core_version(inspected: &Inspection) -> Result<&str> {
     ensure!(
         inspected.status == NodeStatus::Running,
