@@ -20,7 +20,7 @@ COMMON = {".gitignore", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rust
 INPUTS = {
     "crypto": ("crates/secure/", "scripts/build-web-crypto.sh", "scripts/release-rustflags.py"),
     "web": ("apps/app/", "packages/client/", "packages/theme/", "packages/uiarc/", "scripts/generate-uiarc-theme.py", "scripts/check-uiarc.py", "scripts/check-uiarc-build.mjs", "scripts/check-uiarc-native.cjs", "config/uiarc.json", "config/public-bootstrap.json", "package.json",
-            "pnpm-lock.yaml", "pnpm-workspace.yaml", "scripts/build-web.sh"),
+            "pnpm-lock.yaml", "pnpm-workspace.yaml", "scripts/build-web.sh", "scripts/check-web.sh"),
 }
 CACHE_POLICIES = (
     ("/", "no-store"),
@@ -196,6 +196,9 @@ def self_test():
         defaults = repo / "config/public-bootstrap.json"
         defaults.parent.mkdir()
         defaults.write_text('{"issuer":"fixture-one"}')
+        web_checks = repo / "scripts/check-web.sh"
+        web_checks.parent.mkdir()
+        web_checks.write_text("web checks one\n")
         desktop_main = repo / "apps/desktop/src/main.rs"
         desktop_main.parent.mkdir(parents=True)
         desktop_main.write_text("fn main() {}\n")
@@ -253,6 +256,12 @@ def self_test():
         with TestCase().assertRaises(ValueError, msg='changed public bootstrap defaults reused stale web output'):
             check(repo, "web")
         defaults.write_text('{"issuer":"fixture-one"}')
+        check(repo, "web")
+        web_checks.write_text("web checks two\n")
+        check(repo, "crypto")
+        with TestCase().assertRaises(ValueError, msg='changed Web checks reused stale web output'):
+            check(repo, "web")
+        web_checks.write_text("web checks one\n")
         check(repo, "web")
         desktop_main.write_text("desktop main changed\n")
         check(repo, "crypto")

@@ -24,7 +24,7 @@ COORDINATOR_SCHEMA = 2
 REPO = release_format.GITHUB_REPO
 INPUTS = {
     'core': ('apps/core/*', 'crates/protocol/*', 'crates/control/*', 'crates/bridge/*', 'crates/secure/*', 'crates/client/*', 'crates/delivery/*', 'Cargo.toml', 'Cargo.lock', '.cargo/*', 'config/*', 'rust-toolchain*', 'scripts/sign-release.sh', 'scripts/windows-signing.mjs', 'scripts/private-control.mjs', 'scripts/release-rustflags.py', '.github/workflows/release-native.yml'),
-    'app': ('apps/app/*', 'packages/client/*', 'packages/theme/*', 'crates/secure/*', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain*', 'pnpm*', 'package.json', 'scripts/build-web*', 'scripts/build-inputs.py'),
+    'app': ('apps/app/*', 'packages/client/*', 'packages/theme/*', 'crates/secure/*', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain*', 'pnpm*', 'package.json', 'scripts/build-web*', 'scripts/check-web.sh', 'scripts/build-inputs.py'),
     'cli': ('apps/cli/*', 'crates/control/*', 'crates/client/*', 'crates/bridge/*', 'crates/secure/*', 'crates/protocol/*', 'Cargo.toml', 'Cargo.lock', '.cargo/*', 'rust-toolchain*', 'install.sh', 'scripts/install*', 'scripts/package-*', 'scripts/offline-docs*', 'packages/docs/*', 'scripts/release-contract.mjs', 'scripts/release-metadata.mjs', 'scripts/windows-signing.mjs', 'scripts/private-control.mjs'),
     'desktop': ('apps/desktop/*', 'crates/client/*', 'crates/secure/*', 'crates/bridge/*', 'crates/control/*', 'crates/protocol/*', 'Cargo.toml', 'Cargo.lock', '.cargo/*', 'scripts/build-desktop.mjs', 'scripts/verify-desktop.mjs', 'scripts/release-contract.mjs', 'scripts/release-metadata.mjs', 'scripts/sealed-runtime.mjs', 'scripts/private-control.mjs', 'scripts/zip-directory.py', 'scripts/windows-signing.mjs', 'scripts/import-mac-identity.sh', '.github/actions/native-desktop/*'),
     'mobile': ('apps/mobile/*', 'packages/client/*', 'packages/theme/*', 'packages/secure-native/*', 'crates/secure/*', 'crates/secure-ffi/*', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain*', 'pnpm*', 'package.json', 'scripts/build-mobile*', 'scripts/build-ios*', 'scripts/verify-ios*', '.github/workflows/release-apps.yml', '.github/workflows/release-ios.yml'),
@@ -262,6 +262,14 @@ def self_test():
             mobile = json.loads(changes[release_source.version_path(app)])['expo']
             assert mobile['android']['versionCode'] == 26111409 and mobile['ios']['buildNumber'] == '2611.14.9'
     assert input_digest('core', source) == input_digest('core', source)
+    with mock.patch.object(release_context, 'git', return_value='100644 blob ' + 'a' * 40 + '\tCargo.toml\n'):
+        unchanged = input_digest('app', source)
+    for content in ('a', 'b'):
+        listing = '100644 blob ' + 'a' * 40 + '\tCargo.toml\n100644 blob ' + content * 40 + '\tscripts/check-web.sh\n'
+        with mock.patch.object(release_context, 'git', return_value=listing):
+            selected = input_digest('app', source)
+        assert selected != unchanged, 'App build input digest must include Web checks'
+        unchanged = selected
     assert release_format.DEPENDENCIES == {'core': (), 'app': (), 'cli': ('core', 'app'), 'desktop': ('cli',), 'mobile': (), 'www': ()}
     print('Independent Hourly self-test passed: selected version only, exact pins and per-train build numbers')
 

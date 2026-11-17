@@ -59,7 +59,7 @@ PATH_RULES = (
     ("desktop", ("apps/desktop/src/*", "apps/desktop/tests/*")),
     ("mobile", ("apps/mobile/*", "packages/secure-native/*")),
     ("docs", ("tests/e2e/*",)),
-    ("web", ("apps/app/*", "packages/client/*", "packages/theme/*", "packages/uiarc/*", "config/uiarc.json", "scripts/generate-uiarc-theme.py", "scripts/check-uiarc.py", "scripts/check-uiarc-build.mjs", "scripts/check-uiarc-native.cjs", "scripts/vendor-uiarc.py", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
+    ("web", ("apps/app/*", "packages/client/*", "packages/theme/*", "packages/uiarc/*", "config/uiarc.json", "scripts/generate-uiarc-theme.py", "scripts/check-uiarc.py", "scripts/check-uiarc-build.mjs", "scripts/check-uiarc-native.cjs", "scripts/vendor-uiarc.py", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/check-web.sh", "scripts/build-web-crypto.sh")),
     ("protocol", ("crates/protocol/*",)),
     ("bridge", ("crates/bridge/*",)),
     ("client", ("crates/client/*",)),
@@ -950,7 +950,18 @@ def workflow_contract_self_test():
         assert "${{ inputs.source_sha }}" in workflows[filename]
     assert "node scripts/crypto-client.mjs --self-test --native-probe" in workflows["_ci-crypto.yml"]
     assert "bash scripts/build-web.sh\n          git diff --exit-code" in workflows["_ci-web.yml"]
-    for command in ("atlas migrate validate", "python3 scripts/check-source.py", "scripts/check-delivery.py --check-fixtures", "scripts/check-delivery.py", "cargo fmt --all", "pnpm --filter vibeface-web test", "pnpm --filter @vibeface/client test"):
+    web_build = (root / "scripts/build-web.sh").read_text()
+    web_checks = (root / "scripts/check-web.sh").read_text()
+    check_commands = [line for line in web_checks.splitlines() if line.startswith("pnpm ")]
+    assert check_commands == ["pnpm run generate-routes", "pnpm run test", "pnpm run typecheck",
+                              "pnpm --filter @vibeface/client run test", "pnpm --filter @vibeface/client run typecheck"]
+    assert web_build.count('bash "$repo/scripts/check-web.sh"') == 1
+    assert web_build.count("pnpm install ") == 1
+    for command in check_commands[1:]:
+        assert command not in web_build and command not in block("ci.yml", "web-tests"), "Web checks belong to check-web.sh"
+    assert "pnpm install " not in workflows["release-app.yml"], "build-web owns the release dependency install"
+    assert "          scripts/build-web-crypto.sh\n          scripts/build-web.sh\n" in workflows["release-app.yml"]
+    for command in ("atlas migrate validate", "python3 scripts/check-source.py", "scripts/check-delivery.py --check-fixtures", "scripts/check-delivery.py", "cargo fmt --all", "bash scripts/check-web.sh"):
         assert command in core, command
     package = block("ci.yml", "package")
     for command in ("--web-only", "--delivery-charity", "--phase1", "--artifacts .artifacts/ci-multi-node", "--chat-agent", "--phase4", "--public-node", "--mesh", "--phase5", "Verify Developer ID signature", "Verify checksum and unpacked source identity"):
@@ -976,6 +987,7 @@ def focused_self_test():
         assert make_plan([path])["full"], path
     assert make_plan(["apps/app/src/lib/markdown.test.ts", "apps/core/src/api.rs"])["rust_packages"] == ["vibeface-core"]
     assert "web-tests" not in make_plan(["apps/app/src/lib/markdown.test.ts", "apps/app/src/lib/markdown.ts"])["required_jobs"]
+    assert make_plan(["scripts/check-web.sh"])["web"], "The shared check entry must select the Web build"
     plan = make_plan(["apps/app/src/lib/markdown.test.ts"])
     needs = {job: {"result": "success" if job in unit_jobs else "skipped"} for job in JOBS}
     needs["plan"] = {"result": "success"}
@@ -991,7 +1003,7 @@ def focused_self_test():
     workflow = (root / ".github/workflows/ci.yml").read_text()
     block = re.search(r"(?ms)^  web-tests:\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow)[1]
     assert "needs: [plan, crypto-web]" in block and "needs.plan.outputs.web_tests == 'true'" in block
-    for required in ("name: crypto-web-${{ github.sha }}", "check crypto", "'vibeface-mobile...'", "vibeface-web test", "@vibeface/client test"):
+    for required in ("name: crypto-web-${{ github.sha }}", "check crypto", "'vibeface-mobile...'", "bash scripts/check-web.sh"):
         assert required in block, required
     assert "web-tests" in workflow.split("\n  ci-gate:\n", 1)[1].split("runs-on:", 1)[0]
     package = re.search(r"(?ms)^  package:\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow)[1]

@@ -28,7 +28,7 @@ jobs:
           node-version: '24'
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
-      - name: Build and typecheck the static web client
+      - name: Install, check and build the static web client
         run: |
           bash scripts/build-web.sh
           git diff --exit-code
