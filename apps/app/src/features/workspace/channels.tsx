@@ -36,17 +36,26 @@ export function ChannelForm({ open, onOpenChange, channel }: { open: boolean; on
   const [node, setNode] = useState(channel?.coordinator_node ?? ready?.entry.device_id ?? '')
   const channelId = useRef(channel?.channel_id ?? newId())
   const submission = useRef<Extract<WorkspaceCommand, { kind: 'create_channel' | 'configure_channel' }> | null>(null)
-  return <Drawer open={open} onOpenChange={onOpenChange}><DrawerContent title={channel ? '频道设置' : '新频道'} description="普通发言只交给选中的 Bot。没有指定目标时，由默认协调 Bot 承接。" className="overflow-y-auto">
-    <form className="grid gap-4" onSubmit={(event) => { event.preventDefault(); void action.run('save-channel', async () => {
+  const opener = useRef<HTMLElement | null>(null)
+  const leaving = useRef(false)
+  const [titleError, setTitleError] = useState('')
+  const titleInput = useRef<HTMLInputElement>(null)
+  return <Drawer open={open} onOpenChange={onOpenChange}><DrawerContent title={channel ? '频道设置' : '新频道'} description="普通发言只交给选中的 Bot。没有指定目标时，由默认协调 Bot 承接。" className="overflow-y-auto" onOpenAutoFocus={() => { opener.current = document.activeElement instanceof HTMLElement ? document.activeElement : null }} onCloseAutoFocus={(event) => { event.preventDefault(); if (!leaving.current && opener.current?.isConnected) opener.current.focus({ preventScroll: true }) }}>
+    <form className="grid gap-4" noValidate onSubmit={(event) => {
+      event.preventDefault()
+      if (!submission.current && !title.trim()) { setTitleError('还没填频道名称'); titleInput.current?.focus(); return }
+      setTitleError('')
+      void action.run('save-channel', async () => {
       if (!members.length || !members.includes(coordinator)) throw new Error('请选择频道成员，并将默认协调 Bot 加入成员。')
       const configuration = { channel_id: channelId.current, title: title.trim(), purpose: purpose.trim(), members, coordinator_bot: coordinator, coordinator_node: node }
       const command: Extract<WorkspaceCommand, { kind: 'create_channel' | 'configure_channel' }> = submission.current ?? (channel ? { kind: 'configure_channel', ...configuration, expected_revision: channel.revision, owner_epoch: channel.owner_epoch } : { kind: 'create_channel', ...configuration })
       submission.current = command
       await workspace.workspaceCommand(command)
+      leaving.current = true
       onOpenChange(false)
       await navigate({ to: '/channels/$channelId', params: { channelId: channelId.current } })
     }) }}>
-      <div className="grid gap-2 text-sm font-medium"><Input label="频道名称" required readOnly={Boolean(submission.current)} value={title} maxLength={512} onChange={(event) => setTitle(event.currentTarget.value)} placeholder="例如：官网改版" /></div>
+      <div className="grid gap-2 text-sm font-medium"><Input ref={titleInput} label="频道名称" error={titleError} required readOnly={Boolean(submission.current)} value={title} maxLength={512} onChange={(event) => { setTitle(event.currentTarget.value); setTitleError('') }} placeholder="例如：官网改版" /></div>
       <div className="grid gap-2 text-sm font-medium"><Textarea label="频道目标" readOnly={Boolean(submission.current)} value={purpose} maxLength={8192} onChange={(event) => setPurpose(event.currentTarget.value)} placeholder="说明这个频道要完成什么" /></div>
       <fieldset className="grid gap-2"><legend className="mb-2 text-sm font-medium">Bot 成员</legend>{workspace.bots.map((bot) => <label key={bot.bot_id} className="flex min-h-11 items-center gap-3 rounded-control border px-3 py-2 text-sm"><Checkbox aria-label={bot.name} disabled={Boolean(submission.current)} checked={members.includes(bot.bot_id)} onCheckedChange={next => { const checked = next === true;  setMembers((current) => checked ? [...current, bot.bot_id] : current.filter((id) => id !== bot.bot_id))  }} />{bot.name}</label>)}</fieldset>
       <div className="grid gap-2 text-sm font-medium"><Select label="默认协调 Bot" disabled={Boolean(submission.current)} value={"arc:" + coordinator} onValueChange={selected => { const value = selected.slice(4);  setCoordinator(value)  }} options={workspace.bots.filter((bot) => members.includes(bot.bot_id)).map((bot) => ({ value: "arc:" + bot.bot_id, label: bot.name }))} /></div>

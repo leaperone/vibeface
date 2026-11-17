@@ -8,7 +8,7 @@ import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { addDeviceCopy,deviceCopy,joinCopy } from "@vibeface/client/identity/copy.ts"
 import { messageOf } from "@vibeface/client/lib/node.ts"
 import { Button } from "@vibeface/uiarc/button/button.tsx"
-import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
+import { Drawer,DrawerContent,DrawerTrigger } from "@vibeface/uiarc/drawer/drawer.tsx"
 import { Textarea } from "@vibeface/uiarc/textarea/textarea.tsx"
 import { CircleAlert,CircleCheck,Clock,Copy,Download,Laptop,Link2,Plus,Smartphone,SquareTerminal } from "lucide-react"
 import { useEffect,useMemo,useRef,useState } from "react"
@@ -32,6 +32,7 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
   const { ready } = device
   const generation = device.connectionGeneration()
   const [open, setOpen] = useState(false)
+  const opener = useRef<HTMLElement | null>(null)
   // Kept for this opening only: the hint's search is cleared once the sheet is up.
   const [asManager, setAsManager] = useState(false)
   useEffect(() => onOpenChange?.(open), [open])
@@ -94,7 +95,12 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
   const copyButton = (what: "link" | "command", value: string, label: string, solid: boolean) => <Button type="button" variant={solid && !requests ? "primary" : "secondary"} className="w-fit" disabled={busy} onClick={() => copy(what, value)}>
     {copied === what ? <CircleCheck aria-hidden="true" /> : <Copy aria-hidden="true" />}{copied === what ? "已复制" : label}
   </Button>
-  const show = () => { setOpen(true); if (!result && !requests) generate() }
+  const show = () => {
+    // Capture before opening: programmatic search links need the same return path as the button.
+    if (!open) opener.current = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement : null
+    setOpen(true)
+    if (!result && !requests) generate()
+  }
   useEffect(() => {
     if (!opening || !ready?.principal.can_manage) return
     setKind(opening)
@@ -104,14 +110,17 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
   }, [opening, ready])
   if (!ready?.principal.can_manage) return null
 
-  return <>
+  return <Drawer open={open} onOpenChange={(next) => { setOpen(next); if (!next) { clipboard.reset(); setAdded(null); setAsManager(false) } }}>
     <PageActions>
-      <Button type="button" variant="ghost" size="md" className="md:hidden" aria-label="添加设备" title="添加设备" onClick={show}><Plus aria-hidden="true" /></Button>
-      <Button type="button" variant={requests ? "secondary" : "primary"} className="max-md:hidden" onClick={show}><Plus aria-hidden="true" />添加设备</Button>
+      <DrawerTrigger asChild><Button type="button" variant={requests ? "secondary" : "primary"} onClick={show}><Plus aria-hidden="true" />添加设备</Button></DrawerTrigger>
     </PageActions>
-    <Drawer open={open} onOpenChange={(next) => { setOpen(next); if (!next) { clipboard.reset(); setAdded(null); setAsManager(false) } }}>
       {/* A waiting request leads the sheet; its first control is 设为管理设备, which should not take focus on its own. */}
-      <DrawerContent title="添加设备" description="在新设备上打开链接，安全码一致后允许" className="!w-full max-sm:!border-l-0 overflow-y-auto sm:!max-w-md" onOpenAutoFocus={(event) => { if (requests) { event.preventDefault(); if (event.target instanceof HTMLElement) event.target.focus() } }}>
+      <DrawerContent title="添加设备" description="在新设备上打开链接，安全码一致后允许" className="!w-full max-sm:!border-l-0 overflow-y-auto sm:!max-w-md" onOpenAutoFocus={(event) => { if (requests) { event.preventDefault(); if (event.target instanceof HTMLElement) event.target.focus() } }} onCloseAutoFocus={(event) => {
+        if (!opener.current) return
+        event.preventDefault()
+        const target = opener.current.isConnected ? opener.current : document.querySelector<HTMLElement>('main')
+        target?.focus({ preventScroll: true })
+      }}>
         <div className="grid gap-6 pb-[env(safe-area-inset-bottom)]">
           {/* A device already asking is the next thing to act on, so it comes before a new link. */}
           <JoinRequests issuing={result !== null} manage={asManager} onAllowed={(device) => { setAdded(device); setAsManager(false); setResult(null); setError("") }} />
@@ -158,8 +167,7 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
           <InlineError error={error || null} />
         </div>
       </DrawerContent>
-    </Drawer>
-  </>
+  </Drawer>
 }
 
 function Step({ n }: { n: number }) {

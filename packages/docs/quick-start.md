@@ -13,13 +13,15 @@ description: 准备匹配当前源码的程序，创建个人网络，让第一�
 - 安装准备使用的 Agent，例如 Codex 或 Claude Code，并准备自己的模型服务和额度。
 - 准备一个已有的本机项目目录。首次尝试可以使用没有重要数据的练习项目。
 
-Vibeface 不提供模型账号，也不安装 Agent。自动接入可复用 Codex、Claude Code 和 Cursor 的本机 CLI 登录，Node 会话保持私有；缺认证时设备设置提供登录命令。访问镜像到期需要原 CLI 提供新访问令牌或为 Node 独立登录。Pi 沿用本机认证，OpenCode 使用私有目录；显式环境认证继续优先。
+Vibeface 不提供模型账号，也不安装 Agent。
 
 ## 1. 安装 Hourly
 
 本指南对应 CLI、Core 与 App 的完整包。先检查 [Releases](https://github.com/leaperone/vibeface/releases) 中的包同时包含 `vibeface`、`vibeface-core` 和 `web/`。首次正式版使用 data epoch 1，旧开发版数据和包不受支持。首次运行使用全新数据目录。
 
 有匹配的完整包时，首次安装可执行以下命令。已经安装时，不重复运行安装器，按[更新说明](install.md#选择更新渠道)管理现有安装。
+
+没有匹配的完整包时，使用[从源码准备当前版本](#从源码准备当前版本)，再从第 2 步继续。
 
 ```sh
 export VIBEFACE_INSTALL_ROOT="$HOME/.local/share/vibeface"
@@ -33,26 +35,6 @@ vibeface --version
 ```
 
 安装器校验下载包，安装 CLI、Core 和网页资源。看到版本号后，说明 CLI 可以启动。把命令目录加入自己的 shell 配置，才能在新终端继续使用 `vibeface`。平台选择、校验和其他安装方式见[安装与管理节点](install.md)。
-
-### 从源码准备当前版本
-
-匹配的安装包尚未发布时，需要先从源码构建。准备 Git、Python 3.12+、Core/CLI 对应的 Rust 工具链、Node.js 24 和 pnpm 11.9.0，再执行：
-
-```sh
-git clone https://github.com/leaperone/vibeface.git
-cd vibeface
-pnpm install --frozen-lockfile
-rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --version 0.2.129 --locked
-bash scripts/build-web-crypto.sh
-bash scripts/build-web.sh
-cargo build -p vibeface -p vibeface-core --locked
-export PATH="$PWD/target/debug:$PATH"
-export VIBEFACE_APP_DIR="$PWD/apps/app/dist/client"
-vibeface --version
-```
-
-后续步骤使用这个终端。这里启动的是本地源码构建，不是受管安装；先保持前台运行，不执行安装包专用的服务或自动更新步骤。源码构建工具的安装方式和平台条件以各工具文档为准。
 
 首次初始化会加入[全网](node.md#全网)，Node 在后台经官方公共节点入网，从全网表里取开放 Relay，局域网直连仍优先。只使用自己的服务或局域网时，可在首次初始化使用 `--no-mesh`。已有节点按配置说明修改，不要重新初始化；加入个人网络仍需邀请和批准。
 
@@ -78,7 +60,7 @@ vibeface
 
 在 **让这台电脑运行 Bot** 页面选择一个已安装的服务。按该服务显示的提示完成登录，再点 **检查可用性**。
 
-自动接入可复用 Codex、Claude Code 和 Cursor 的本机 CLI 登录。仍提示需要登录时，复制页面提供的命令，在这台电脑的终端运行。Codex、Claude Code 和 OpenCode 的命令选择 Vibeface 私有运行目录，个人会话不会导入。不要把登录凭证发到聊天里。
+自动接入可复用 Codex、Claude Code 和 Cursor 的本机 CLI 登录。仍提示需要登录时，复制页面提供的命令，在这台电脑的终端运行。Codex、Claude Code 和 OpenCode 的命令选择 Vibeface 私有运行目录，个人会话不会导入。Pi 沿用本机认证；显式环境认证继续优先。访问镜像到期需要原 CLI 提供新访问令牌或为 Node 独立登录。不要把登录凭证发到聊天里。
 
 开启该服务的 **运行 Bot**。需要它修改项目时，再开启 **执行任务**，并在 **可用文件夹** 中添加项目的绝对路径。模型未列出时可以手动填写账号实际支持的模型名。详细配置见[首次配置](onboarding.md#配置-agent-和项目目录)。
 
@@ -104,5 +86,25 @@ vibeface
 - [日常使用指南](user-guide.md)：管理 Bot、查看工作状态、取消任务和换设备继续。
 - [安装与管理节点](install.md#用-cli-管理后台服务)：把前台进程改成后台服务。
 - [排障](troubleshooting.md)：页面打不开、Agent 无法使用或任务结果待确认。
+
+### 从源码准备当前版本
+
+匹配的安装包尚未发布时，需要先从源码构建。准备 Git、Python 3.12+、Core/CLI 对应的 Rust 工具链、Node.js 24 和 pnpm 11.9.0，再执行：
+
+```sh
+git clone https://github.com/leaperone/vibeface.git
+cd vibeface
+pnpm install --frozen-lockfile
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.129 --locked
+bash scripts/build-web-crypto.sh
+bash scripts/build-web.sh
+cargo build -p vibeface -p vibeface-core --locked
+export PATH="$PWD/target/debug:$PATH"
+export VIBEFACE_APP_DIR="$PWD/apps/app/dist/client"
+vibeface --version
+```
+
+后续步骤使用这个终端。这里启动的是本地源码构建，不是受管安装；先保持前台运行，不执行安装包专用的服务或自动更新步骤。源码构建工具的安装方式和平台条件以各工具文档为准。
 
 Desktop 另外需要 GPUI 图形工具链与平台开发库，版本及 hosted runner 配置见 [原生 Desktop action](../../.github/actions/native-desktop/action.yml)。Core/CLI 的最低 Rust 版本不能作为 GPUI 已通过编译的证明。Windows 原生组包使用 `python3 -B scripts/package-node-windows.py`，不执行 POSIX shell 组包脚本。

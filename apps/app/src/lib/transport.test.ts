@@ -20,10 +20,12 @@ async function key() {
  * A fake Gateway, or with `lan` a Node on the LAN, that answers as `serving` (normally the target) or refuses with a text frame.
  * With `queue` it first holds the session in line, telling each place every `noticeMs`; a place below 0 is a full line.
  */
-async function harness({ local = false, lan = false, refuse = '', impostor = false, nativeLocal = false, nativeGateway = false, queue = [] as number[], noticeMs = 0 } = {}) {
+async function harness({ local = false, lan = false, refuse = '', impostor = false, nativeLocal = false, nativeGateway = false, queue = [] as number[], noticeMs = 0, holdRequests = false } = {}) {
   await initCrypto({ module_or_path: readFileSync(new URL('../../generated/vibeface_secure_bg.wasm', import.meta.url)) })
   const browser = await key(), target = await key(), serving = impostor ? await key() : target
   const urls: string[] = [], texts: string[] = []
+  const requests: { id: string; method: string; params: Record<string, unknown> }[] = []
+  const replies = new Map<string, (result: unknown, error?: string, code?: string) => void>()
   let open = 0
   class GatewaySocket extends EventTarget {
     static OPEN = 1
@@ -69,8 +71,14 @@ async function harness({ local = false, lan = false, refuse = '', impostor = fal
       } else if (this.channel) {
         const request = this.channel.openRecord(value)
         if (!request) return
-        const { id } = JSON.parse(new TextDecoder().decode(request))
-        for (const frame of this.channel.sealMessage(new TextEncoder().encode(JSON.stringify({ id, result: { device_id: serving.deviceId } })))) this.emit(new Uint8Array(frame).buffer)
+        const message = JSON.parse(new TextDecoder().decode(request))
+        requests.push(message)
+        const reply = (result: unknown, error?: string, code?: string) => {
+          replies.delete(message.id)
+          for (const frame of this.channel!.sealMessage(new TextEncoder().encode(JSON.stringify({ id: message.id, result, error, code })))) this.emit(new Uint8Array(frame).buffer)
+        }
+        if (holdRequests) replies.set(message.id, reply)
+        else reply({ device_id: serving.deviceId })
       }
     }
     close() {
@@ -114,7 +122,12 @@ async function harness({ local = false, lan = false, refuse = '', impostor = fal
   const address = 'https://gateway.example', device_id = target.deviceId
   const entry: ConnectionEntry = lan ? { kind: 'lan', addrs: ['192.168.1.4:7001'], device_id } : { kind: local ? 'local' : 'gateway', address, device_id }
   return {
-    target: target.deviceId, urls, texts, dials, nativeCalls, open: () => open,
+    target: target.deviceId, urls, texts, dials, nativeCalls, requests, open: () => open,
+    reply: (id: string, result: unknown, error?: string, code?: string) => {
+      const reply = replies.get(id)
+      assert.ok(reply, `request ${id} reached the Node`)
+      reply(result, error, code)
+    },
     connect: (to = entry, options: Parameters<typeof runtime.connectDevice>[1] = {}) => runtime.connectDevice(to, options),
     parseJoinLink: (value: string) => runtime.parseJoinLink(value),
   }
@@ -244,4 +257,139 @@ test('the device key cannot be exported', async () => {
   assert.equal(privateKey.extractable, false)
   await assert.rejects(crypto.subtle.exportKey('pkcs8', privateKey))
   await assert.rejects(crypto.subtle.exportKey('jwk', privateKey))
+})
+
+test('workspace reads share the Node read budget and retain correlation when responses arrive out of order', async () => {
+  const app = await harness({ holdRequests: true })
+  const channel = await app.connect()
+  const calls = [
+    ['directory', {}], ['write_state', {}],
+    ...['nodes', 'notifications', 'bots', 'questions', 'open_works', 'workspace_overview', 'workspace_state', 'work_detail', 'conversation_history', 'memory_state'].map(method => ['rpc', { method }] as const),
+  ] as const
+  const results = calls.map(([method, params]) => channel.request(method, params))
+  const completed = Promise.allSettled(results)
+  try {
+    assert.equal(app.requests.length, 8, 'a cold refresh must not exceed Core READ_CALLS')
+    assert.equal(channel.idle(), false)
+    app.reply('8', { request: 8 })
+    await settle()
+    assert.equal(app.requests.length, 9, 'only a completed read admits the next one')
+    app.reply('3', null, 'not available', 'fixture_refused')
+    await settle()
+    assert.equal(app.requests.length, 10, 'a refused read also releases its slot')
+    for (const id of ['1', '2', '4', '5', '6', '7']) app.reply(id, { request: Number(id) })
+    await settle()
+    for (const id of ['12', '10', '9', '11']) app.reply(id, { request: Number(id) })
+    const settled = await completed
+    settled.forEach((result, index) => {
+      if (index === 2) {
+        assert.equal(result.status, 'rejected')
+        if (result.status === 'rejected') assert.equal(result.reason.code, 'fixture_refused')
+      } else assert.deepEqual(result, { status: 'fulfilled', value: { request: index + 1 } })
+    })
+    assert.equal(channel.idle(), true)
+  } finally { channel.close(); await completed }
+})
+
+test('read backpressure leaves writes, observation, long calls and stop controls available without replay', async () => {
+  const app = await harness({ holdRequests: true })
+  const channel = await app.connect()
+  const calls = Array.from({ length: 9 }, () => channel.request('write_state'))
+  calls.push(channel.request('rpc', { method: 'send_message' }), channel.request('rpc', { method: 'conversation' }), channel.request('provider_models'), channel.request('rpc', { method: 'interrupt_work' }), channel.request('rpc', { method: 'cancel_manager' }))
+  const completed = Promise.allSettled(calls)
+  try {
+    assert.deepEqual(app.requests.slice(8).map(item => [item.method, item.params.method]), [
+      ['rpc', 'send_message'], ['rpc', 'conversation'], ['provider_models', undefined], ['rpc', 'interrupt_work'], ['rpc', 'cancel_manager'],
+    ])
+    assert.deepEqual(app.requests.map(item => item.id), ['1', '2', '3', '4', '5', '6', '7', '8', '10', '11', '12', '13', '14'])
+    channel.close()
+    const settled = await completed
+    assert.equal(settled.every(item => item.status === 'rejected'), true)
+    const write = settled[9]
+    assert.equal(write.status, 'rejected')
+    if (write.status === 'rejected') {
+      assert.match(write.reason.message, /操作结果还没确认/)
+      assert.equal(write.reason.responded, undefined)
+    }
+    assert.equal(app.requests.length, 13, 'no queued read or write is replayed on close')
+    assert.equal(channel.idle(), true)
+  } finally { channel.close(); await completed }
+})
+
+test('read waiting is bounded and closing rejects both sent and queued reads', async () => {
+  const app = await harness({ holdRequests: true })
+  const channel = await app.connect()
+  const calls = Array.from({ length: 72 }, () => channel.request('write_state'))
+  const completed = Promise.allSettled(calls)
+  try {
+    await assert.rejects(channel.request('directory'), (error: Error & { code?: string }) => error.code === 'client_overloaded')
+    assert.equal(app.requests.length, 8)
+    channel.close()
+    const settled = await completed
+    assert.equal(settled.length, 72)
+    assert.equal(settled.every(item => item.status === 'rejected'), true)
+    for (const result of settled.slice(8)) {
+      if (result.status === 'rejected') assert.match(result.reason.message, /尚未发出/)
+    }
+    assert.equal(channel.idle(), true)
+    assert.equal(app.open(), 0)
+  } finally { channel.close(); await completed }
+})
+
+test('a queued read receives its full response deadline when sent and a stalled read closes without releasing a live remote slot', async t => {
+  const app = await harness({ holdRequests: true })
+  const events: unknown[] = []
+  const channel = await app.connect(undefined, { onEvent: event => events.push(event) })
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const calls = Array.from({ length: 9 }, () => channel.request('write_state'))
+  const completed = Promise.allSettled(calls)
+  try {
+    t.mock.timers.tick(59000)
+    app.reply('1', { read: 1 })
+    await settle()
+    assert.equal(app.requests.length, 9)
+    for (let id = 2; id <= 8; id++) app.reply(String(id), { read: id })
+    await settle()
+    t.mock.timers.tick(1000)
+    assert.equal(app.open(), 1, 'the old queue deadline was cleared on dispatch')
+    assert.equal(channel.idle(), false)
+    calls.push(channel.request('directory'))
+    const finalRead = Promise.allSettled([calls[9]])
+    t.mock.timers.tick(59000)
+    const settled = await completed
+    assert.equal(settled.slice(0, 8).every(item => item.status === 'fulfilled'), true)
+    assert.equal(settled[8].status, 'rejected')
+    assert.equal((await finalRead)[0].status, 'rejected')
+    assert.equal(app.requests.length, 10, 'timed-out read is never replayed')
+    assert.equal(app.open(), 0)
+    assert.equal(channel.idle(), true)
+    assert.deepEqual(events, [])
+  } finally { channel.close(); await completed; t.mock.timers.reset() }
+})
+
+test('pending model and write calls do not hold the read budget', async () => {
+  const app = await harness({ holdRequests: true })
+  const channel = await app.connect()
+  const calls = [channel.request('provider_models'), channel.request('rpc', { method: 'send_message' }), ...Array.from({ length: 8 }, () => channel.request('write_state'))]
+  const completed = Promise.allSettled(calls)
+  try { assert.equal(app.requests.length, 10) }
+  finally { channel.close(); await completed }
+})
+
+test('a late timed-out response is not delivered as a workspace push', async t => {
+  const app = await harness({ holdRequests: true })
+  const events: unknown[] = []
+  const channel = await app.connect(undefined, { onEvent: event => events.push(event) })
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const call = channel.request('provider_models')
+  const rejected = assert.rejects(call, /还没确认结果/)
+  try {
+    t.mock.timers.tick(60000)
+    await rejected
+    assert.equal(app.open(), 1)
+    app.reply('1', { models: [] })
+    await settle()
+    assert.deepEqual(events, [])
+    assert.equal(channel.idle(), true)
+  } finally { channel.close(); await rejected; t.mock.timers.reset() }
 })

@@ -41,6 +41,10 @@ button.row:hover, .disclosure > summary:hover { background: var(--surface-muted)
 .safety { display: flex; flex-wrap: wrap; justify-content: center; gap: var(--space-4); padding: var(--space-4); border: 1px solid var(--border-strong); border-radius: var(--radius-control); background: var(--surface-muted); font-family: var(--font-mono); font-size: var(--text-2xl); font-weight: 500; font-variant-numeric: tabular-nums; }
 .password { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: var(--space-2); align-items: end; }
 .picker { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-3); min-width: 0; }
+.segmented { --text-muted: var(--text-secondary); min-width: 0; }
+@media(max-width: 48rem), (pointer: coarse) {
+  .segmented button { min-width: var(--control-height-md); min-height: var(--control-height-md); }
+}
 .toastStack { pointer-events: none; position: fixed; z-index: 70; inset-inline-end: var(--space-4); bottom: max(calc(var(--toast-space,0px) + var(--space-3)),calc(env(safe-area-inset-bottom) + var(--space-4))); display: grid; gap: var(--space-2); max-width: min(26rem,calc(100% - 2rem)); }
 .toast { pointer-events: auto; display: grid; gap: var(--space-2); padding: var(--space-4); border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--surface-raised); box-shadow: var(--shadow-floating); }
 .toastHeader { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-sm); }

@@ -376,18 +376,19 @@ function TaskHistory({ tasks, botId, name }: { tasks: TaskRow[]; botId: string; 
   const workspace = useWorkspace()
   const { directory } = useDevice()
   const [open, setOpen] = useState(false)
+  const trigger = useRef<HTMLButtonElement>(null)
   const leaving = useRef(false)
   useEffect(() => () => { leaving.current = true }, [])
   const working = tasks.filter((task) => workspace.connectionOnline && !task.attention && (taskActive(task.state) || task.state === 'awaiting_children')).length
   const attention = tasks.filter((task) => task.attention).length
   const count = [working ? `${working} 进行中` : '', attention ? `${attention} 待处理` : ''].filter(Boolean).join(' · ')
   return <>
-    <PageActions><Button type="button" variant="ghost" size="sm" aria-label={`任务${count ? ` · ${count}` : ''}`} onClick={() => { leaving.current = false; setOpen(true) }}><ListChecks aria-hidden="true" /><span>任务</span>{count ? <span className="text-sm text-secondary max-sm:sr-only">{count}</span> : null}{count ? <span className="text-sm sm:hidden">{working + attention}</span> : null}</Button></PageActions>
+    <PageActions><Button ref={trigger} type="button" variant="ghost" size="sm" aria-label={`执行记录${count ? ` · ${count}` : ''}`} onClick={() => { leaving.current = false; setOpen(true) }}><ListChecks aria-hidden="true" /><span>执行记录</span>{count ? <span className="text-sm text-secondary max-sm:sr-only">{count}</span> : null}{count ? <span className="text-sm sm:hidden">{working + attention}</span> : null}</Button></PageActions>
     <Drawer open={open} onOpenChange={setOpen}>
-      <DrawerContent title="任务记录" description={`${name}的任务`} className="!w-full min-w-0 gap-0 sm:!max-w-md" onCloseAutoFocus={(event) => { if (leaving.current) event.preventDefault() }}>
+      <DrawerContent title="执行记录" description={`${name}的执行工作记录。任务对话在任务页查看。`} className="!w-full min-w-0 gap-0 sm:!max-w-md" onCloseAutoFocus={(event) => { event.preventDefault(); if (!leaving.current) trigger.current?.focus({ preventScroll: true }) }}>
         <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-6">
-          {!workspace.connectionOnline || workspace.incomplete ? <p role="status" className="pb-3 text-sm text-secondary">{!workspace.connectionOnline ? '暂时收不到最新任务状态，显示最近记录。' : '任务记录正在同步，显示已读取的部分。'}</p> : null}
-          {!workspace.data ? <p role="status" className="py-6 text-sm text-secondary">正在读取任务记录</p> : tasks.length ? <ul className="divide-y">{tasks.map((task) => {
+          {!workspace.connectionOnline || workspace.incomplete ? <p role="status" className="pb-3 text-sm text-secondary">{!workspace.connectionOnline ? '暂时收不到最新执行状态，显示最近记录。' : '执行记录正在同步，显示已读取的部分。'}</p> : null}
+          {!workspace.data ? <p role="status" className="py-6 text-sm text-secondary">正在读取执行记录</p> : tasks.length ? <ul className="divide-y">{tasks.map((task) => {
             const stale = taskStale(task.state, workspace.connectionOnline) || !workspace.connectionOnline && task.state === 'awaiting_children'
             const away = task.state === 'dispatch_waiting' && workspace.nodes.some((node) => node.device_id === task.device && !node.online)
             return <li key={task.id}><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} onClick={() => { leaving.current = true; setOpen(false) }} className="-mx-2 flex min-h-11 min-w-0 items-start gap-2 rounded-control px-2 py-3 hover:bg-surface-muted/60 active:bg-surface-muted">
@@ -395,7 +396,8 @@ function TaskHistory({ tasks, botId, name }: { tasks: TaskRow[]; botId: string; 
               <span className="grid min-w-0 flex-1 gap-1"><span className="break-words font-medium">{task.work.title || '任务'}</span><span className="flex min-w-0 flex-wrap gap-x-1 text-sm text-secondary"><span>{stale ? staleTaskLabel : away ? taskCopy.away : taskLabel(task.state)}</span><span aria-hidden="true">·</span><span className="min-w-0 break-words">{nodeName(task.device, { nodes: workspace.nodes, directory })}</span></span></span>
               <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-secondary" />
             </Link></li>
-          })}</ul> : <p className="py-6 text-sm text-secondary">{!workspace.connectionOnline || workspace.incomplete ? '最近记录中还没有任务。' : '还没有任务'}</p>}
+          })}</ul> : <p className="py-6 text-sm text-secondary">{!workspace.connectionOnline || workspace.incomplete ? '最近记录中还没有执行工作。' : '还没有执行工作'}</p>}
+          <RoutedAction variant="secondary" to="/tasks" onClick={() => { leaving.current = true; setOpen(false) }}>查看任务对话</RoutedAction>
         </div>
       </DrawerContent>
     </Drawer>

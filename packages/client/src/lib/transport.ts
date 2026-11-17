@@ -62,6 +62,13 @@ const frame = (bytes: Uint8Array) => bytes as Uint8Array<ArrayBuffer>
 /** The page this code runs in, if any; a phone app has none. */
 const page = () => (globalThis as { location?: { origin: string; protocol: string } }).location
 
+// Keep aligned with Lane::Read in apps/core/src/command.rs. In particular,
+// `conversation` changes the observation lease and must retain the Node's ordered lane.
+const readMethods = new Set(['info', 'directory', 'write_state', 'node_settings', 'triage_settings', 'relay_settings', 'share_link', 'entrances'])
+const readRpcMethods = new Set(['nodes', 'conversations', 'conversation_history', 'open_works', 'work_detail', 'workspace_overview', 'workspace_state', 'workspace_history', 'workspace_command_receipt', 'signed_receipt', 'input_receipt', 'scope_context', 'read_artifact', 'bots', 'questions', 'memory_state', 'notifications'])
+const readCalls = 8, queuedReads = 64, requestTimeoutMs = 60000
+const isRead = (method: string, params: Record<string, unknown>) => readMethods.has(method) || (method === 'rpc' && typeof params.method === 'string' && readRpcMethods.has(params.method))
+
 export function validTarget(value: unknown): string {
   if (typeof value !== 'string' || !devicePattern.test(value)) throw new Error('这个设备地址无效。改用加入链接或本机页面给的地址。')
   return value
@@ -277,7 +284,10 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
     if (signal?.aborted) throw new Error('设备连接已取消。')
     const me = await initClient()
     const target = validTarget(entry.device_id)
-    const pending = new Map<string, { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>()
+    type Reply = { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }
+    const pending = new Map<string, Reply & { read: boolean }>()
+    const waitingReads: (Reply & { id: string; plaintext: Uint8Array })[] = []
+    let activeReads = 0
     let channel: SecureChannel | undefined, closed = false, nextId = 0
     const disconnected = () => new Error('连接已断开，操作结果还没确认。重新连接后先确认原操作的结果，不要重复提交。')
     const closing = (error: Error) => {
@@ -285,6 +295,11 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
       const reason = channel ? disconnected() : error
       for (const item of pending.values()) { clearTimeout(item.timer); item.reject(reason) }
       pending.clear()
+      for (const item of waitingReads.splice(0)) {
+        clearTimeout(item.timer)
+        item.reject(new Error('连接已断开，排队的读取尚未发出。重新连接后再读取。'))
+      }
+      activeReads = 0
       onClose?.(reason)
     }
     let carrier: Carrier | undefined, handshake: SecureHandshake | undefined
@@ -305,6 +320,27 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
       throw reason
     } finally { handshake?.free() }
     const open = channel, wire = carrier
+    function send(id: string, plaintext: Uint8Array, read: boolean, resolve: Reply['resolve'], reject: Reply['reject']) {
+      if (read) activeReads++
+      const timer = setTimeout(() => {
+        pending.delete(id)
+        const error = new Error('设备还没确认结果。先确认原操作的结果，别重复提交。')
+        reject(error)
+        // A local timeout does not cancel work on the Node. Close a stalled read
+        // connection instead of releasing its slot and exceeding the remote budget.
+        if (read) wire.close(error)
+      }, requestTimeoutMs)
+      pending.set(id, { resolve, reject, timer, read })
+      try { for (const record of open.sealMessage(plaintext)) wire.send(record) }
+      catch (error) { wire.close(error as Error) }
+    }
+    function drainReads() {
+      while (!closed && activeReads < readCalls && waitingReads.length) {
+        const item = waitingReads.shift()!
+        clearTimeout(item.timer)
+        send(item.id, item.plaintext, true, item.resolve, item.reject)
+      }
+    }
     void (async () => {
       try {
         while (!closed) {
@@ -317,9 +353,11 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
           const item = message.id === undefined ? undefined : pending.get(message.id)
           if (item) {
             pending.delete(message.id); clearTimeout(item.timer)
+            if (item.read) activeReads--
             if (message.error !== undefined && message.error !== null) item.reject(Object.assign(new Error(message.error), { responded: true, code: typeof message.code === 'string' ? message.code : undefined }))
             else item.resolve(message.result)
-          } else onEvent?.(message)
+            drainReads()
+          } else if (message.id === undefined) onEvent?.(message)
         }
       } catch (error) { wire.close(error as Error) }
       finally { open.free() }
@@ -328,15 +366,22 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
       deviceId: target,
       request(method, params = {}) {
         if (closed) return Promise.reject(disconnected())
+        const read = isRead(method, params)
+        if (read && activeReads >= readCalls && waitingReads.length >= queuedReads) return Promise.reject(Object.assign(new Error('等待读取的请求过多。稍后再读取。'), { code: 'client_overloaded' }))
         const id = String(++nextId)
         return new Promise((resolve, reject) => {
-          const timer = setTimeout(() => { pending.delete(id); reject(new Error('设备还没确认结果。先确认原操作的结果，别重复提交。')) }, 60000)
-          pending.set(id, { resolve, reject, timer })
-          try { for (const record of open.sealMessage(encoder.encode(JSON.stringify({ id, method, params })))) wire.send(record) }
-          catch (error) { wire.close(error as Error) }
+          // Snapshot params now; seal only when sent to preserve Noise frame order.
+          const plaintext = encoder.encode(JSON.stringify({ id, method, params }))
+          if (!read || activeReads < readCalls) { send(id, plaintext, read, resolve, reject); return }
+          const timer = setTimeout(() => {
+            const index = waitingReads.findIndex(item => item.id === id)
+            if (index !== -1) waitingReads.splice(index, 1)
+            reject(new Error('等待读取超时，这次读取尚未发出。稍后再读取。'))
+          }, requestTimeoutMs)
+          waitingReads.push({ id, plaintext, resolve, reject, timer })
         })
       },
-      idle: () => pending.size === 0,
+      idle: () => pending.size === 0 && waitingReads.length === 0,
       close() { wire.close(new Error('已断开设备连接。')) },
     }
   }

@@ -5,12 +5,13 @@ import { fileURLToPath } from 'node:url'
 const portalRoot = resolve(fileURLToPath(new URL('.', import.meta.url)))
 process.env.PLAYWRIGHT_BROWSERS_PATH ??= resolve(portalRoot, '.artifacts/review-www/browsers')
 const { web } = await import('@e2e-dev/web')
+const browserEndpoint = process.env.VIBEFACE_E2E_BROWSER_ENDPOINT
 
 export default {
   tests: ['./tests/**/*.e2e.ts'],
   targets: [{
     name: 'www',
-    engine: web(),
+    engine: web(browserEndpoint ? { connect: { cdpEndpoint: () => browserEndpoint } } : {}),
     app: {
       url: 'http://127.0.0.1:0',
       command: {

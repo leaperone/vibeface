@@ -18,7 +18,8 @@
 * { box-sizing: border-box; border-color: var(--border); }
 html { font-family: var(--font-body); color: var(--foreground); background: var(--background); overflow-x: clip; }
 body { margin: 0; font-size: var(--text-base); line-height: var(--leading-body); letter-spacing: var(--tracking-body); -webkit-font-smoothing: antialiased; position: fixed; inset-inline: 0; top: var(--app-top,0px); height: var(--app-height,100dvh); overflow: hidden; }
-:root { --page-width: 48rem; }
+/* Arc secondary text keeps supporting copy and placeholders readable in both themes. */
+:root { --page-width: 48rem; --text-muted: var(--text-secondary); }
 a { color: inherit; }
 button, input, textarea, select { font: inherit; }
 button { cursor: pointer; }
@@ -42,4 +43,7 @@ svg.lucide { stroke-width: 1.75; }
 @media(min-width: 40rem) { .workspace-screen { padding: var(--space-6); } .workspace-notices { padding-inline: var(--space-6); } }
 /* iOS keeps the viewport steady when a 16px form control receives focus. */
 @media(max-width: 48rem) { input,textarea,select { font-size: var(--text-base) !important; } }
+@media(max-width: 48rem), (pointer: coarse) {
+  main button, [role="dialog"][data-side] button { min-width: var(--control-height-md); min-height: var(--control-height-md); }
+}
 @media(prefers-reduced-motion: reduce) { *,*::before,*::after { animation-duration: 0s !important; transition-duration: 0s !important; scroll-behavior: auto !important; } }
