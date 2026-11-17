@@ -187,6 +187,7 @@ class ReleaseTrains(unittest.TestCase):
                 self.assertEqual(build['app_source_commit'], app_source)
                 self.assertEqual(subprocess.check_output([str(package / 'vibeface-core'), '--version'], text=True).strip(), 'vibeface-core 2.3.4')
                 self.assertEqual((package / 'web/index.html').read_text(), '<html>App 3.4.5-rc.2</html>')
+                self.assertEqual((package / 'RUNTIME-REQUIREMENTS.md').read_bytes(), release.RUNTIME_REQUIREMENTS.encode('utf-8'))
                 foreign = copy.deepcopy(manifest)
                 foreign['dependencies']['app']['source_commit'] = 'e' * 40
                 with self.assertRaisesRegex(ValueError, 'dependency differs'):
