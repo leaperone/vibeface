@@ -66,7 +66,7 @@ const page = () => (globalThis as { location?: { origin: string; protocol: strin
 // Keep aligned with Lane::Read in apps/core/src/command.rs. In particular,
 // `conversation` changes the observation lease and must retain the Node's ordered lane.
 const readMethods = new Set(['info', 'directory', 'write_state', 'node_settings', 'triage_settings', 'relay_settings', 'share_link', 'entrances'])
-const readRpcMethods = new Set(['nodes', 'conversations', 'conversation_history', 'open_works', 'work_detail', 'workspace_overview', 'workspace_state', 'workspace_history', 'workspace_command_receipt', 'signed_receipt', 'input_receipt', 'scope_context', 'read_artifact', 'bots', 'questions', 'memory_state', 'notifications'])
+const readRpcMethods = new Set(['nodes', 'conversations', 'conversation_history', 'message_search', 'open_works', 'work_detail', 'workspace_overview', 'workspace_state', 'workspace_history', 'workspace_command_receipt', 'signed_receipt', 'input_receipt', 'scope_context', 'read_artifact', 'bots', 'questions', 'memory_state', 'notifications'])
 const readCalls = 8, queuedReads = 64, requestTimeoutMs = 60000
 const isRead = (method: string, params: Record<string, unknown>) => readMethods.has(method) || (method === 'rpc' && typeof params.method === 'string' && readRpcMethods.has(params.method))
 

@@ -370,11 +370,14 @@ pub struct HistoryEvent {
 }
 #[derive(Clone, Debug)]
 pub struct WorkspaceHistory {
+    pub history_authority: String,
     pub network_id: String,
     pub channel_id: Option<String>,
     pub task_id: Option<String>,
     pub events: Vec<HistoryEvent>,
     pub coverage: HistoryCoverage,
+    pub next_cursor: Option<String>,
+    pub complete: bool,
 }
 
 pub fn parse_workspace_history(
@@ -396,8 +399,11 @@ pub fn parse_workspace_history(
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Wire {
+        history_authority: String,
         events: Vec<WireEvent>,
         coverage: HistoryCoverage,
+        next_cursor: Option<String>,
+        complete: bool,
     }
     valid_id(network)?;
     if let Some(id) = channel {
@@ -425,7 +431,21 @@ pub fn parse_workspace_history(
     } else {
         HistoryScope::Workspace
     };
+    ensure!(
+        !wire.history_authority.trim().is_empty(),
+        "历史缺少有效的 authority"
+    );
     ensure!(wire.coverage.scope == expected, "历史范围与请求不一致");
+    ensure!(
+        wire.complete == wire.next_cursor.is_none() && wire.coverage.truncated == !wire.complete,
+        "历史分页覆盖信息不一致"
+    );
+    ensure!(
+        wire.next_cursor
+            .as_ref()
+            .is_none_or(|cursor| !cursor.is_empty() && cursor.len() <= 8192),
+        "历史游标格式错误"
+    );
     ensure!(
         (1..=512).contains(&wire.coverage.limit) && wire.events.len() <= wire.coverage.limit,
         "历史条数超过读取范围"
@@ -569,11 +589,14 @@ pub fn parse_workspace_history(
         });
     }
     Ok(WorkspaceHistory {
+        history_authority: wire.history_authority,
         network_id: network.into(),
         channel_id: channel.map(str::to_owned),
         task_id: task.map(str::to_owned),
         events,
         coverage: wire.coverage,
+        next_cursor: wire.next_cursor,
+        complete: wire.complete,
     })
 }
 

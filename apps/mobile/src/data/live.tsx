@@ -1,19 +1,24 @@
 import type { DisplayScope } from '@vibeface/client/identity/context.tsx'
 import { decodeLastSeen, displayLastSeen, projectLastSeen } from './last-seen'
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import * as Notifications from 'expo-notifications'
 import { chatTimeline, firstUnread, unreadCounts } from '@vibeface/client/chat/timeline.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
 import { DeviceProvider, useDevice } from '@vibeface/client/identity/context.tsx'
-import { entryAddress } from '@vibeface/client/lib/node.ts'
+import { entryAddress, messageOf } from '@vibeface/client/lib/node.ts'
 import { WorkspaceProvider as SharedWorkspace, useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { botCopy } from '@vibeface/client/workspace/bot-settings.ts'
 import { inboxItems, waitingItems, type InboxItem } from '@vibeface/client/workspace/inbox.ts'
 import { addressName, deviceOnline, entryLabel } from '@vibeface/client/workspace/labels.ts'
-import { botReadiness } from '@vibeface/client/workspace/model.ts'
+import { botReadiness, parsePendingMessage } from '@vibeface/client/workspace/model.ts'
+import type { PendingMessage } from '@vibeface/client/chat/types.ts'
+import { notificationBadgeCount, notificationPreferences, notificationUnreadCounts, watchNotificationPreferences } from '@vibeface/client/workspace/system-notifications.ts'
 import { storageOf } from '@vibeface/client/workspace/storage.ts'
 import { isSessionNotification } from '@vibeface/client/workspace/types.ts'
 import { awaitsAnswer, foldAnswers } from '@vibeface/client/workspace/questions.ts'
 import { mobilePlatform } from '@/platform'
+import { remoteNotifications } from '@/platform/remote-notifications'
+import { cachedConversation, localConversations } from './cached'
 import { WorkspaceProvider } from './context'
 import type { ChatMessage, Connection, Conversation, Member, Session, Workspace, WorkspaceActions } from './types'
 import type { InputTarget } from '@vibeface/client/workspace/types.ts'
@@ -21,7 +26,7 @@ import { useRouter } from 'expo-router'
 
 const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'running', 'cancelling']
 const streamingStates = [...busyStates, 'publishing']
-const empty = { bots: [], primary: null, unread: {}, questions: [], members: [], conversations: {} }
+const empty = { networkId: null, deviceId: null, bots: [], primary: null, unread: {}, questions: [], members: [], conversations: {} }
 const noTabs = { leader: () => true, post() {}, listen: () => () => {} }
 
 const { readStorage, writeStorage } = storageOf(mobilePlatform.storage)
@@ -93,6 +98,24 @@ function Offline({ children }: { children: ReactNode }) {
   const { session, connection } = useConnection()
   const scope = device.displayScope
   const seen = useMemo(() => session.phase === 'ready' ? lastSeen(scope) : null, [session.phase, scope?.network_id, scope?.device_id, scope?.entry_device_id])
+  const scopeKey = JSON.stringify(scope)
+  const [pendingState, setPendingState] = useState<{ key: string; items: PendingMessage[]; error: string }>({ key: '', items: [], error: '' })
+  const pending = pendingState.key === scopeKey ? pendingState.items : []
+  const pendingError = pendingState.key === scopeKey ? pendingState.error : ''
+  useEffect(() => {
+    let active = true
+    if (!seen || !scope) { setPendingState({ key: scopeKey, items: [], error: '' }); return }
+    const prefix = `${scope.network_id}.${scope.device_id}:`
+    void mobilePlatform.outbox.all().then((items) => {
+      const messages = items.filter((item) => item.key.startsWith(prefix) && item.method === 'message').map(parsePendingMessage)
+      if (active) setPendingState({ key: scopeKey, items: messages, error: '' })
+    }).catch((cause) => { if (active) setPendingState({ key: scopeKey, items: [], error: messageOf(cause, '读取本地待发消息') }) })
+    return () => { active = false }
+  }, [seen, scopeKey])
+  const conversations = useMemo(() => Object.fromEntries(seen && scope ? localConversations.all({ networkId: scope.network_id, deviceId: scope.device_id }).map((record) => {
+    const conversation = cachedConversation(record, pending)
+    return [record.conversationId, pendingError ? { ...conversation, blocked: pendingError } : conversation]
+  }) : []), [seen, scopeKey, pending, pendingError])
   const gone = device.phase === 'removed' || session.phase === 'joining'
   const generation = device.connectionGeneration()
   useEffect(() => { if (gone && device.connectionGeneration() === generation) writeStorage('last-seen', null) }, [gone, generation])
@@ -106,7 +129,7 @@ function Offline({ children }: { children: ReactNode }) {
   }), [device])
   // The entry it last reached is the one that does not answer now, so it alone shows as offline.
   const kept = seen ? { bots: seen.bots, primary: seen.primary, members: seen.members.map((member) => member.entry ? { ...member, online: false } : member) } : {}
-  return <WorkspaceProvider value={{ ...empty, ...kept, session, connection: { ...connection, entry: connection.entry || seen?.entry || '' }, actions }}>{children}</WorkspaceProvider>
+  return <WorkspaceProvider value={{ ...empty, ...kept, networkId: scope?.network_id ?? null, deviceId: scope?.device_id ?? null, conversations, session, connection: { ...connection, entry: connection.entry || seen?.entry || '' }, actions }}>{children}</WorkspaceProvider>
 }
 
 function Live({ children }: { children: ReactNode }) {
@@ -116,13 +139,16 @@ function Live({ children }: { children: ReactNode }) {
   const latest = useRef(shared)
   latest.current = shared
   const me = device.identity?.deviceId
+  const networkId = device.ready?.principal.network_id ?? ''
   const { data, conversationId, nodes, questions, notifications, answered } = shared
   // Until the first read lands the list keeps what the phone last saw instead of going blank.
   const scope = device.displayScope
   const seen = useMemo(() => lastSeen(scope), [scope?.network_id, scope?.device_id, scope?.entry_device_id, device.phase])
 
-  const conversations: Record<string, Conversation> = {}
-  if (data && conversationId) {
+  const cached = useMemo(() => localConversations.all({ networkId, deviceId: me ?? '' }), [networkId, me, data, shared.generation])
+  const conversations: Record<string, Conversation> = Object.fromEntries(cached.map((record) => [record.conversationId, cachedConversation(record, shared.pendingMessages)]))
+  if (data && conversationId && shared.dataOrigin === 'cache') conversations[conversationId] = cachedConversation({ networkId, deviceId: me ?? '', conversationId, savedAt: cached.find((record) => record.conversationId === conversationId)?.savedAt ?? Date.now(), payload: data }, shared.pendingMessages)
+  if (data && conversationId && shared.dataOrigin === 'network') {
     const jobs = data.scheduler?.jobs ?? []
     // A streamed reply gives way once its job ends, or as soon as the history's newest message is the reply it was
     // streaming, which can land a frame or two before the job names it.
@@ -151,6 +177,7 @@ function Live({ children }: { children: ReactNode }) {
     if (live) messages.push({ message_id: `live:${live.key}`, event_hash: `live:${live.key}`, role: 'assistant', text: live.text, created_at_ms: Date.now(), state: 'streaming', in_reply_to: liveTrigger })
     const stopJob = jobs.find((job) => data.scheduler?.capabilities?.cancel === true && ['queued', 'steering', 'claimed', 'running'].includes(job.state))
     conversations[conversationId] = {
+      origin: { kind: 'network' },
       messages, before: timeline.before, rest: timeline.rest, answers: folded.answers, hidden: folded.hidden, works: data.works,
       unread: unread ? 'question_id' in unread ? `q:${unread.question_id}` : unread.message_id : null,
       // A finished job whose reply has not synced yet still counts, so the activity row hands over to the reply instead of
@@ -213,8 +240,10 @@ function Live({ children }: { children: ReactNode }) {
         }
       },
       async send(id, text, attachments, options) {
-        await select(id)
-        await latest.current.sendMessage(text, attachments.map((file) => ({ name: file.name, arrayBuffer: file.arrayBuffer })), undefined, options)
+        const workspace = latest.current
+        const bot = workspace.bots.find((item) => item.conversation_id === id)
+        if (!bot || !workspace.isCurrent()) throw new Error('原对话尚未读取，请重新连接后发送。')
+        await workspace.sendMessage(text, attachments.map((file) => ({ name: file.name, arrayBuffer: file.arrayBuffer })), undefined, { ...options, conversation_id: id, target: options?.target ?? { kind: 'bot_main', bot_id: bot.bot_id } })
       },
       answer: (question, text) => latest.current.answer(question, text),
       leave: device.leave,
@@ -232,9 +261,29 @@ function Live({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (snapshot && ready?.isCurrent() && ready.generation === generation && ready.principal.network_id === snapshot.network_id && ready.principal.device_id === snapshot.device_id && ready.entry.device_id === snapshot.entry_device_id) writeStorage('last-seen', snapshot)
   }, [record, ready, generation])
+  useEffect(() => {
+    const ready = device.ready
+    if (!ready) return
+    const sync = () => { if (ready.isCurrent()) void remoteNotifications.sync(ready, notificationPreferences(mobilePlatform.storage, ready.principal.network_id).read()) }
+    sync()
+    const stopForeground = mobilePlatform.onForeground(sync)
+    const tokens = Notifications.addPushTokenListener(sync)
+    return () => { stopForeground(); tokens.remove() }
+  }, [device.ready, shared.generation])
+  const badgeUnread = notificationUnreadCounts(notifications)
+  const unreadVersion = JSON.stringify(badgeUnread)
+  useEffect(() => {
+    if (!shared.synced) return
+    const update = () => {
+      const preferences = notificationPreferences(mobilePlatform.storage, networkId).read()
+      void Notifications.setBadgeCountAsync(notificationBadgeCount(badgeUnread, preferences)).catch(() => {})
+    }
+    update()
+    return watchNotificationPreferences(networkId, update)
+  }, [shared.synced, networkId, unreadVersion])
 
   const value: Workspace = {
-    session, connection: { ...connection, entry: connection.entry || seen?.entry || '' }, bots, primary, unread, questions, members, conversations, actions,
+    networkId, deviceId: me ?? null, session, connection: { ...connection, entry: connection.entry || seen?.entry || '' }, bots, primary, unread, questions, members, conversations, actions,
   }
   return <SharedContext.Provider value={shared}><WorkspaceProvider value={value}>{children}</WorkspaceProvider></SharedContext.Provider>
 }

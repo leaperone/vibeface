@@ -332,8 +332,9 @@ BRIDGES = {
         'ask()': (1, "local Node-join retry wrapper; concrete callSession producer scanned"),
     },
     W: {
-        'connection.rpc(item . method , item . params)': (2, "durable signed outbox dispatch; method producers scanned"),
-        'connection.rpc(method , params)': (2, "memory/history adapter forwarding; producer modules scanned"),
+        'rpc(item . method , item . params)': (2, "validated durable outbox dispatch; method producers scanned"),
+        'rpc(method , params)': (2, "guarded memory/history forwarding; producer modules scanned"),
+        'connection.rpc(method , params)': (1, "ledger-guarded transport forwarding; concrete producers scanned"),
     },
     M: {
         'options.rpc(item . method , item . params)': (1, "memory outbox dispatch; method producer scanned"),
@@ -357,6 +358,19 @@ LOCAL_CALLS = {
 
 def literal(tokens):
     return tokens[0].value if len(tokens) == 1 and tokens[0].kind == "string" else None
+
+
+def object_properties(tokens):
+    if not tokens or tokens[0].value != "{" or close(tokens, 0) != len(tokens) - 1:
+        return None
+    result = {}
+    for row in split(tokens[1:-1]):
+        if (len(row) < 3 or row[0].kind not in ("code", "string") or
+                not re.fullmatch(r"[\w$]+", row[0].value) or row[1].value != ":" or
+                row[0].value in result):
+            return None
+        result[row[0].value] = row[2:]
+    return result
 
 
 def web_inventory(root):
@@ -383,7 +397,7 @@ def web_inventory(root):
             if leaf in ("rpc", "request"):
                 index = 0
             elif call.callee == "signedWrite":
-                index = 2
+                index = 1
                 transport = "rpc"
             elif rel == I and call.callee in ("callSession", "ask"):
                 index = 1
@@ -416,7 +430,14 @@ def web_inventory(root):
             if index >= len(call.args):
                 errors.append(f"{rel}:{call.line}: unclassified call {call.signature}")
                 continue
+            payload = call.args[index + 1] if len(call.args) > index + 1 else []
             expression = call.args[index]
+            if call.callee == "signedWrite":
+                operation = object_properties(expression)
+                if operation is None or "method" not in operation or "params" not in operation:
+                    errors.append(f"{rel}:{call.line}: unclassified dynamic call {call.signature}")
+                    continue
+                expression, payload = operation["method"], operation["params"]
             method = literal(expression)
             methods = [method] if method else []
             # Template union is obtained from the actual parameter declaration.
@@ -451,7 +472,6 @@ def web_inventory(root):
             if not methods:
                 errors.append(f"{rel}:{call.line}: unclassified dynamic call {call.signature}")
                 continue
-            payload = call.args[index + 1] if len(call.args) > index + 1 else []
             for method in methods:
                 if rel == D and call.callee == "request":
                     method = "delivery." + method
@@ -687,6 +707,47 @@ export function webDeliveryReservations(locks: Pick<LockManager, 'request'> | un
         assert not changed["passed"] and any("synthetic.ts:6: unclassified dynamic call locks.request(" in error for error in changed["errors"])
         target.write_text(source)
         assert "attestation" in sites[0]["payload_fields"]
+        structured = 'signedWrite("chat", { method: "known", params: { nested: fn(1, {x: 2}), attestation } });'
+        target.write_text(source + '\n' + structured)
+        changed = check(root)
+        assert changed["passed"], changed["errors"]
+        projected, = [site for site in changed["web_calls"] if site["expression"].startswith('signedWrite(')]
+        assert projected["method"] == "known" and projected["transport"] == "rpc"
+        assert projected["payload_fields"] == ["attestation", "nested"]
+        target.write_text(source + '\n' + structured.replace('"known"', '"new_operation"'))
+        changed = check(root)
+        assert not changed["passed"] and any("synthetic.ts:6: Web new_operation" in error for error in changed["errors"])
+        for operation in ('{ method: computed(), params: {} }',
+                          '{ method: "known", method: "write", params: {} }',
+                          '{ method: "known", ...operation, params: {} }',
+                          '{ [key]: "known", method: "known", params: {} }',
+                          '{ method: "known" }'):
+            target.write_text(source + '\nsignedWrite("chat", ' + operation + ');')
+            changed = check(root)
+            assert not changed["passed"] and any("synthetic.ts:6: unclassified dynamic call signedWrite(" in error for error in changed["errors"])
+        target.write_text(source)
+        forwarding_file = root / W
+        forwarding_file.parent.mkdir(parents=True)
+        forwarding = '''rpc(item.method, item.params);
+rpc(item.method, item.params);
+rpc(method, params);
+rpc(method, params);
+connection.rpc(method, params);
+notifier.request();'''
+        forwarding_file.write_text(forwarding)
+        assert check(root)["passed"]
+        for changed_forwarding in (forwarding.replace('rpc(item.method', 'connection.rpc(item.method', 1),
+                                   forwarding + '\nrpc(method, params);',
+                                   forwarding.replace('connection.rpc(method, params);', '')):
+            forwarding_file.write_text(changed_forwarding)
+            changed = check(root)
+            assert not changed["passed"] and any("audited dynamic bridge count" in error for error in changed["errors"])
+        forwarding_file.write_text(forwarding)
+        target.write_text(source + '\nrpc(item.method, item.params);')
+        changed = check(root)
+        assert not changed["passed"] and any("synthetic.ts:6: unclassified dynamic call rpc(" in error for error in changed["errors"])
+        forwarding_file.unlink()
+        target.write_text(source)
         target.write_text(source + '\nconnection.rpc("new_operation", {});')
         changed = check(root)
         assert not changed["passed"] and any("synthetic.ts:6: Web new_operation" in error for error in changed["errors"])
@@ -703,7 +764,7 @@ export function webDeliveryReservations(locks: Pick<LockManager, 'request'> | un
         assert not changed["passed"] and any("InputTarget::NewTarget" in error for error in changed["errors"])
         protocol_file.write_text(protocol_source)
         assert check(root)["passed"]
-    print("CLI parity self-test passed: local Web Lock classified without a Core method; lock receiver/expression/path/count changes, new Web operation, dynamic call, native variant and nested variant fail with source locations")
+    print("CLI parity self-test passed: structured writes and guarded forwarding are inventoried; unknown/computed/ambiguous writes, bridge receiver/path/count changes, browser locks, new native and nested operations fail with source locations")
 
 
 def main():

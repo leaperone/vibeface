@@ -109,6 +109,28 @@ pub struct WorkspaceHistoryItem {
     pub body: crate::model::EventBody,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceHistory {
+    pub history_authority: String,
+    pub events: Vec<WorkspaceHistoryItem>,
+    pub next_cursor: Option<String>,
+    pub complete: bool,
+    pub coverage: WorkspaceHistoryCoverage,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceHistoryCoverage {
+    pub limit: usize,
+    pub truncated: bool,
+    pub scope: WorkspaceHistoryScope,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceHistoryScope {
+    Task,
+    Channel,
+    Workspace,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

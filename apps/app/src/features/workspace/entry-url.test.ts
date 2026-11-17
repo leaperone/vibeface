@@ -3,10 +3,10 @@ import * as lastSeenModel from '../../../../../apps/mobile/src/data/last-seen.ts
 import { createHash } from 'node:crypto'
 import { writeBody, ownerBody } from '@vibeface/client/workspace/write-request.ts'
 import { decodeOutbox } from '@vibeface/client/workspace/outbox-codec.ts'
-import { selectionOwner } from '@vibeface/client/lib/selection.ts'
 import * as deliveryModel from '@vibeface/client/delivery/model.ts'
 import * as byteCodec from '@vibeface/client/lib/byte-codec.ts'
 import { type DeliveryBudget } from '@vibeface/client/delivery/types.ts'
+import { selectionOwner } from '@vibeface/client/lib/selection.ts'
 import { parseChanged } from '@vibeface/client/lib/progress.ts'
 import * as workspaceHistory from '@vibeface/client/workspace/history.ts'
 import { completeHistory } from '@vibeface/client/workspace/history-fixture.ts'
@@ -47,6 +47,9 @@ import { notificationOpenings } from '../../../../../apps/mobile/src/platform/no
 import type { NotificationDestination } from '@vibeface/client/lib/platform.ts'
 import { hookHarness, moduleLoader } from '../../lib/test-harness.ts'
 import { cn } from '../../lib/utils.ts'
+import { createChatDrafts } from '../../../../../apps/mobile/src/platform/chat-drafts.ts'
+import * as conversationCache from '@vibeface/client/workspace/conversation-cache.ts'
+import * as systemNotifications from '@vibeface/client/workspace/system-notifications.ts'
 
 test("bulk inbox actions re-arm focus after an intervening list update", () => {
   const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "pending-section.tsx"), "utf8")
@@ -187,7 +190,12 @@ test("workspace preserves bot and message requests while routing native decision
   })
   const fixtureNetwork = 'a'.repeat(64), fixtureClient = 'b'.repeat(64), fixtureEntry = 'c'.repeat(64)
   const signed: string[] = []
-  const payloadOf = (network: string, scope: string, body: string) => new TextEncoder().encode(`${network}|${scope}|${body}`)
+  const payloadOf = (network: string, scope: string, body: string) => {
+    const event: unknown = JSON.parse(body)
+    const data = workspaceModel.record(event)
+    assert.equal(typeof data.type, 'string'); assert.equal(data.attestation, undefined)
+    return new TextEncoder().encode(`${network}|${scope}|${body}`)
+  }
   const signatureOf = (payload: Uint8Array) => createHash('sha512').update(payload).digest('hex')
   const signatureFor = (scope: string, body: Record<string, unknown>) => ({ device_id: fixtureClient, signature: signatureOf(payloadOf(fixtureNetwork, scope, JSON.stringify(body))) })
   const signedItem = (item: OutboxItem): OutboxItem => { const copy = structuredClone(item); copy.params.attestation = signatureFor(item.scope_id, writeBody(item, fixtureClient)); return copy }
@@ -216,6 +224,7 @@ test("workspace preserves bot and message requests while routing native decision
   assert.equal(typeof workspaceModule.useWorkspaceState, "function")
   const { useWorkspaceState } = workspaceModule as { useWorkspaceState(platform: unknown, connection: ReadyConnection): Workspace }
   const platform = {
+    conversationCache: false,
     reserveDeliveryIntent: async () => { throw new Error('unexpected delivery reservation') },
     secure: {
       attestationPayload: payloadOf,
@@ -224,7 +233,7 @@ test("workspace preserves bot and message requests while routing native decision
     transport: { signClient: async (domain: string, payload: Uint8Array) => { signed.push(`${domain}|${new TextDecoder().decode(payload)}`); return signatureOf(payload) } },
     storage: browser.localStorage, outbox: memoryOutbox, self: "这个浏览器",
     inputLock: <T,>(name: string, save: () => Promise<T>) => globalThis.navigator.locks.request(name, save),
-    notifier: { name: "浏览器提醒", permission: async () => "default", request: async () => "default", show() {} },
+    notifier: { name: "浏览器提醒", permission: async () => "default", request: async () => "default", async show() {} },
     onForeground: () => () => {}, foreground: () => true,
   }
   const bot = { bot_id: "bot", conversation_id: "chat", name: "Bot", instructions: "处理项目", models: {}, skills: null, avatar: null, avatar_version: null, event_hash: "bot-event", last_message: null, busy: null }
@@ -412,7 +421,7 @@ test("workspace preserves bot and message requests while routing native decision
         assert.equal(render().pendingMessages.find((item) => item.message_id === head.message_id)?.delivery, 'unknown')
 
         missing = true
-        connection.entry.device_id = connection.info.device_id = 'another-entry'
+        connection.entry.device_id = connection.info.device_id = 'd'.repeat(64)
         await assert.rejects(render().queryInput(head), /input not found/)
         assert.equal(queries.at(-1)?.original_input, undefined, 'another Node only provides positive reconciliation')
         assert.equal(render().pendingMessages.find((item) => item.message_id === head.message_id)?.delivery, 'unknown')
@@ -436,7 +445,7 @@ test("workspace preserves bot and message requests while routing native decision
         assert.equal(messages.length, firstMessage + 1, 'a bound negative receipt still waits for explicit retry when its error text is missing')
         assert.deepEqual((await memoryOutbox.all()).find((pending) => pending.key === item.key), { ...boundRefusal, rejected: undefined })
         failMessage = false
-        connection.entry.device_id = connection.info.device_id = 'another-entry'
+        connection.entry.device_id = connection.info.device_id = 'd'.repeat(64)
         await assert.rejects(render().retryPendingMessage(head.message_id), /原设备/)
         assert.equal(messages.length, firstMessage + 1)
         connection.entry.device_id = entry; connection.info.device_id = node
@@ -506,7 +515,7 @@ test("workspace preserves bot and message requests while routing native decision
           const receipt: InputReceipt = { message_id: input.message_id, target: input.target, stage: result === 'unknown' ? 'unknown' : 'entry_accepted', actual_turn_id: null, reason: '原输入已有记录', retry_safe: false, control_event: null }
           let firstQuery = true, holdWrite = true
           connection.rpc = async (method, body = {}) => {
-            if (method === 'workspace_history') return { events: [{ event_hash: 'input-event', created_at_ms: 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }, body: { ...item.params, type: 'input_posted' } }], coverage: { limit: 128, truncated: false, scope: 'workspace' } }
+            if (method === 'workspace_history') return { history_authority: 'authority', next_cursor: null, complete: true, events: [{ event_hash: 'input-event', created_at_ms: 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }, body: { ...item.params, type: 'input_posted' } }], coverage: { limit: 128, truncated: false, scope: 'workspace' } }
             if (method !== 'input_receipt') return originalRpc(method, body)
             if (firstQuery) { firstQuery = false; return absence }
             return receipt
@@ -629,6 +638,8 @@ test("workspace preserves bot and message requests while routing native decision
         await previousVisit
         assert.equal(render().data?.messages.some((item) => item.message_id === 'wrong-visit'), false)
         held = null
+        await render().selectBot(bot)
+        await render().refresh()
         await render().loadHistory('works')
         assert.equal(render().data?.works.find((item) => item.work_id === 'older-work')?.state, 'running')
         held = deferred()
@@ -646,7 +657,7 @@ test("workspace preserves bot and message requests while routing native decision
 
         held = deferred()
         const oldNetwork = render().loadHistory('messages')
-        const nextConnection: ReadyConnection = { ...connection, generation: 2, principal: { ...connection.principal, network_id: 'another-network' }, isCurrent: () => activeConnection === nextConnection }
+        const nextConnection: ReadyConnection = { ...connection, generation: 2, principal: { ...connection.principal, network_id: 'e'.repeat(64) }, isCurrent: () => activeConnection === nextConnection }
         activeConnection = nextConnection
         render()
         held.resolve({ conversation_id: 'chat', section: 'messages', history_authority: authority, items: [row('wrong-network', 0)], next_cursor: null, complete: true })
@@ -665,6 +676,83 @@ test("workspace preserves bot and message requests while routing native decision
         await render().selectBot(bot)
         await render().refresh()
       }
+    })
+    await t.test('history authority invalidation cancels an in-flight Alpha snapshot until a queued Beta workspace refresh confirms it', async (race) => {
+      for (const cacheEnabled of [false, true]) await race.test(cacheEnabled ? 'cached mobile view' : 'default Web view', async () => {
+        const originalRpc = connection.rpc, originalTimeout = sandbox.setTimeout, originalClearTimeout = sandbox.clearTimeout
+        const originalCache = platform.conversationCache
+        const timers = new Map<number, () => void>()
+        let timerId = 0, phase: 'confirmed' | 'alpha-refresh' | 'beta-refresh' = 'confirmed'
+        const alphaStarted = deferred(), oldAlpha = deferred(), betaStarted = deferred(), beta = deferred()
+        const row = (message_id: string, rank: string) => ({ message_id, event_hash: message_id, rank, role: 'user', text: message_id, created_at_ms: 1 })
+        const snapshot = (authority: string, message_id: string) => ({ ...context, history_authority: authority, messages: [row(message_id, '2')], history: { ...completeHistory(), messages: { next_cursor: `${authority}-cursor`, complete: false } } })
+        const confirmedAlpha = snapshot('alpha', 'confirmed-alpha'), lateAlpha = snapshot('alpha', 'late-alpha'), confirmedBeta = snapshot('beta', 'confirmed-beta')
+        const pages: Record<string, unknown>[] = []
+        let refreshing: Promise<void> | undefined, invalidated: Promise<void> | undefined
+        platform.conversationCache = cacheEnabled
+        sandbox.setTimeout = (run: () => void) => { const id = ++timerId; timers.set(id, run); return id }
+        sandbox.clearTimeout = (id: number) => { timers.delete(id) }
+        connection.rpc = async (method, params = {}) => {
+          if (method === 'conversation') {
+            if (phase === 'alpha-refresh') { alphaStarted.resolve(undefined); return oldAlpha.promise }
+            if (phase === 'beta-refresh') { betaStarted.resolve(undefined); return beta.promise }
+            return confirmedAlpha
+          }
+          if (method === 'conversation_history') {
+            pages.push(params)
+            if (phase === 'alpha-refresh') throw new Error('history changed; refresh the conversation')
+            return { conversation_id: 'chat', section: 'messages', history_authority: 'beta', items: [row('older-beta', '1')], next_cursor: null, complete: true }
+          }
+          return originalRpc(method, params)
+        }
+        try {
+          await reload(); await render().refresh()
+          const alpha = render()
+          assert.equal(alpha.dataOrigin, 'network')
+          assert.equal(alpha.data?.history_authority, 'alpha')
+          assert.equal(alpha.writable, true)
+          phase = 'alpha-refresh'
+          refreshing = alpha.refresh()
+          await alphaStarted.promise
+          invalidated = render().loadHistory('messages')
+          await settleComponent()
+          assert.equal(pages[0]?.cursor, 'alpha-cursor')
+          assert.equal(render().dataOrigin, cacheEnabled ? 'cache' : 'none')
+          assert.equal(render().writable, false, 'an invalidated cursor pauses writes even while older workspace metadata is being refreshed')
+          phase = 'beta-refresh'
+          oldAlpha.resolve(lateAlpha)
+          await Promise.all([refreshing, invalidated])
+          const stale = render()
+          assert.equal(stale.dataOrigin, cacheEnabled ? 'cache' : 'none', 'the late Alpha request cannot reapply a network origin after its read owner is invalidated')
+          assert.deepEqual(Array.from(stale.data?.messages ?? [], message => message.message_id), cacheEnabled ? ['confirmed-alpha'] : [])
+          assert.equal(stale.writable, false, 'the old full refresh cannot grant writes using its cancelled conversation read')
+          assert.equal(stale.synced, false)
+          await assert.rejects(stale.loadHistory('messages'), /先选择并读取对话/, 'an unconfirmed Alpha view cannot authorize another page')
+          assert.equal(timers.size, 1, 'the complete Beta refresh is queued separately from the stale Alpha request')
+          const queued = [...timers.values()]; timers.clear(); queued.forEach(run => run())
+          await betaStarted.promise
+          assert.equal(render().writable, false, 'queued metadata alone cannot authorize writes before Beta returns')
+          assert.equal(render().dataOrigin, cacheEnabled ? 'cache' : 'none')
+          beta.resolve(confirmedBeta)
+          await settleComponent()
+          const recovered = render()
+          assert.equal(recovered.dataOrigin, 'network')
+          assert.equal(recovered.data?.history_authority, 'beta')
+          assert.equal(recovered.writable, true)
+          assert.equal(recovered.synced, true)
+          await recovered.loadHistory('messages')
+          assert.equal(pages.at(-1)?.cursor, 'beta-cursor')
+          assert.deepEqual(Array.from(render().data?.messages ?? [], message => message.message_id), ['older-beta', 'confirmed-beta'])
+          assert.equal(render().data?.history.messages.complete, true)
+        } finally {
+          oldAlpha.resolve(lateAlpha); beta.resolve(confirmedBeta)
+          await Promise.allSettled([refreshing, invalidated])
+          timers.clear()
+          sandbox.setTimeout = originalTimeout; sandbox.clearTimeout = originalClearTimeout
+          connection.rpc = originalRpc; platform.conversationCache = originalCache
+          await reload(); await render().refresh()
+        }
+      })
     })
     const retryMessage = { message_id: "retry-1", event_hash: "retry-event", role: "user", text: "改 README", created_at_ms: 1 }
     const retryScheduler = { scope_jobs: [], jobs: [{ scope: { kind: 'main' as const }, trigger: "message:retry-1", state: "failed", message_id: "retry-1", failure: { kind: "rejected", detail: "没有执行" } }], unanswered: [] }
@@ -967,7 +1055,7 @@ test("workspace preserves bot and message requests while routing native decision
       assert.equal(render().pendingMessages.length, 0)
     })
 
-    await t.test('two tabs preserve target order while the earlier input is still signing', async () => {
+    await t.test('two tabs preserve target order while the earlier input is still signing', { timeout: 10_000 }, async () => {
       const otherHooks = hookHarness()
       const loadOther = moduleLoader(sandbox, (specifier, filename) => {
         if (specifier === 'react') return otherHooks.react
@@ -993,6 +1081,12 @@ test("workspace preserves bot and message requests while routing native decision
       }
       const previousBots = knownBots, previousTranscript = transcript, previousMessages = messages.length
       const previousOutbox = new Map(outboxItems)
+      const submitted = deferred(), sendingConnection = activeConnection, request = sendingConnection.rpc
+      sendingConnection.rpc = async (method, params) => {
+        const result = await request(method, params)
+        if (method === 'message' && params?.text === 'second tab input') submitted.resolve(result)
+        return result
+      }
       const independentBot = { ...bot, bot_id: 'other-tab-bot', conversation_id: 'other-tab-chat' }
       let first: Promise<boolean> | undefined, second: Promise<boolean> | undefined, sameTabSecond: Promise<boolean> | undefined, independent: Promise<boolean> | undefined
       try {
@@ -1015,6 +1109,7 @@ test("workspace preserves bot and message requests while routing native decision
         assert.deepEqual(messages.slice(before).map((message) => message.text), ['independent tab input'], 'a later tab cannot submit ahead of the input still being signed')
         gate.resolve(null)
         assert.deepEqual(await Promise.all([first, sameTabSecond, second, independent]), [true, true, true, true])
+        await submitted.promise
         await render().refresh(); await drainOutbox()
         assert.deepEqual(messages.slice(before).map((message) => message.text), ['independent tab input', 'first tab input', 'earlier same tab second input', 'second tab input'])
         assert.equal(Number(messages[before + 2].sequence), Number(messages[before + 1].sequence) + 1)
@@ -1022,6 +1117,7 @@ test("workspace preserves bot and message requests while routing native decision
       } finally {
         gate.resolve(null)
         await Promise.allSettled([first, sameTabSecond, second, independent])
+        sendingConnection.rpc = request
         platform.transport.signClient = sign
         knownBots = previousBots
         for (const effect of otherHooks.effects.values()) effect.cleanup?.()
@@ -1056,9 +1152,10 @@ test("workspace preserves bot and message requests while routing native decision
       assert.equal(render().pendingMessages.length, 0)
     })
 
-    await t.test('a locally created channel task receives follow-ups before its create command is acknowledged', async () => {
+    await t.test('a locally created channel task receives follow-ups before its create command is acknowledged', { timeout: 10_000 }, async () => {
       const current = activeConnection, originalRpc = current.rpc
-      const creating = deferred()
+      const originalAll = platform.outbox.all, checking = deferred(), continueCheck = deferred()
+      const creating = deferred(), creationStarted = deferred()
       const commands: Record<string, unknown>[] = []
       const saved: PendingMessage[] = []
       const before = messages.length
@@ -1073,10 +1170,10 @@ test("workspace preserves bot and message requests while routing native decision
           assert.ok(command.kind === 'create_task')
           assert.ok(command.expected_result.trim(), 'Node valid_text rejects an empty expected result')
           assert.ok(new TextEncoder().encode(command.expected_result).length <= 16384)
-          commands.push(JSON.parse(JSON.stringify(body))); return creating.promise
+          commands.push(JSON.parse(JSON.stringify(body))); creationStarted.resolve(null); return creating.promise
         }
         if (method === 'workspace_history') return {
-          events: messages.slice(before).map((message, index) => ({ event_hash: String(message.message_id), created_at_ms: index + 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }, body: { ...message, type: 'input_posted' } })),
+          history_authority: 'authority', next_cursor: null, complete: true, events: messages.slice(before).map((message, index) => ({ event_hash: String(message.message_id), created_at_ms: index + 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }, body: { ...message, type: 'input_posted' } })),
           coverage: { limit: 128, truncated: false, scope: 'task' },
         }
         return originalRpc(method, body)
@@ -1089,12 +1186,22 @@ test("workspace preserves bot and message requests while routing native decision
         assert.ok(first.target.kind === 'channel_task')
         assert.equal(first.expected_revision, 1)
         assert.equal(first.conversation_id, 'chat')
+        await creationStarted.promise
         const target = first.target
         const plainTarget = JSON.parse(JSON.stringify(target))
-        assert.deepEqual(await Promise.all([
-          render().sendMessage('channel two', [], undefined, { target }),
-          render().sendMessage('channel three', [], undefined, { target, expected_revision: first.expected_revision, conversation_id: first.conversation_id }),
-        ]), [true, true])
+        let holdNextCheck = true
+        platform.outbox.all = async () => {
+          const hold = holdNextCheck
+          holdNextCheck = false
+          if (hold) { checking.resolve(null); await continueCheck.promise }
+          return originalAll()
+        }
+        const second = render().sendMessage('channel two', [], undefined, { target })
+        await checking.promise
+        const third = render().sendMessage('channel three', [], undefined, { target, expected_revision: first.expected_revision, conversation_id: first.conversation_id })
+        await drainOutbox()
+        continueCheck.resolve(null)
+        assert.deepEqual(await Promise.all([second, third]), [true, true])
         await drainOutbox()
         assert.equal(commands.length, 1, 'only the original creation is submitted while its acknowledgement is held')
         assert.equal(messages.length, before, 'input delivery waits behind its real task creation')
@@ -1110,7 +1217,7 @@ test("workspace preserves bot and message requests while routing native decision
         assert.deepEqual(messages.slice(before).map((message) => message.target), [plainTarget, plainTarget, plainTarget])
         await render().readWorkspaceHistory({ task_id: target.task_id })
         assert.equal(render().pendingMessages.length, 0)
-      } finally { current.rpc = originalRpc }
+      } finally { continueCheck.resolve(null); platform.outbox.all = originalAll; current.rpc = originalRpc }
     })
 
     await t.test('Main and Work NewTask, explicit or from the prompt, use a real valid expected result and preserve Work sources', async () => {
@@ -1133,7 +1240,7 @@ test("workspace preserves bot and message requests while routing native decision
             domain = { ...domain, tasks: [{ ...command, root_task_id: command.task_id, revision: 1, action: 'continue', request_event: event, event_hash: event, created_at_ms: 1, updated_at_ms: 1, state: 'not_started' }] }
             return { ...domain, command_id: body.command_id, event_hash: event, duplicate: false }
           }
-          if (method === 'workspace_history') return { events: messages.slice(before).map((message, index) => ({ event_hash: String(message.message_id), created_at_ms: index + 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }, body: { ...message, type: 'input_posted' } })), coverage: { limit: 128, truncated: false, scope: 'task' } }
+          if (method === 'workspace_history') return { history_authority: 'authority', next_cursor: null, complete: true, events: messages.slice(before).map((message, index) => ({ event_hash: String(message.message_id), created_at_ms: index + 1, scope_id: 'chat', kind: 'input_posted', speaker: { kind: 'human', device_id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }, body: { ...message, type: 'input_posted' } })), coverage: { limit: 128, truncated: false, scope: 'task' } }
           return originalRpc(method, body)
         }
         try {
@@ -1181,7 +1288,7 @@ test("workspace preserves bot and message requests while routing native decision
       let delayedMainRead: ReturnType<typeof deferred> | null = null
       let target: InputTarget = { kind: 'task', task_id: 'attachment-task' }
       current.rpc = async (method, body = {}) => {
-        if (method === 'workspace_history') return { events: [{ event_hash: 'attachment-event', created_at_ms: 1, scope_id: otherBot.conversation_id, kind: 'input_posted', speaker: { kind: 'human', device_id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }, body: { type: 'input_posted', report_results: true, message_id: 'attachment-input', target, intent: 'continue', sequence: 1, expected_revision: 1, text: '任务附件', attachments: [{ hash, size: bytes.length, name: 'scope.txt' }] } }], coverage: { limit: 128, truncated: false, scope: target.kind === 'task' ? 'task' : 'channel' } }
+        if (method === 'workspace_history') return { history_authority: 'authority', next_cursor: null, complete: true, events: [{ event_hash: 'attachment-event', created_at_ms: 1, scope_id: otherBot.conversation_id, kind: 'input_posted', speaker: { kind: 'human', device_id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }, body: { type: 'input_posted', report_results: true, message_id: 'attachment-input', target, intent: 'continue', sequence: 1, expected_revision: 1, text: '任务附件', attachments: [{ hash, size: bytes.length, name: 'scope.txt' }] } }], coverage: { limit: 128, truncated: false, scope: target.kind === 'task' ? 'task' : 'channel' } }
         if (method === 'read_artifact') {
           calls.push(JSON.parse(JSON.stringify(body)))
           if (delayedMainRead) return delayedMainRead.promise
@@ -1248,7 +1355,9 @@ test("workspace preserves bot and message requests while routing native decision
         '@vibeface/client/chat/protocol.ts': { promptIntent, botReach, composerHint }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, messageTimes, taskMessage, unreadCounts },
         '@vibeface/client/workspace/bot-settings.ts': { botCopy }, '@vibeface/client/workspace/inbox.ts': { inboxItems }, '@vibeface/client/workspace/labels.ts': taskLabels,
         '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers }, '@vibeface/client/workspace/storage.ts': { storageOf }, '@vibeface/client/workspace/types.ts': { isSessionNotification: () => false },
-        '@/platform': { mobilePlatform: { storage: browser.localStorage } }, './context': { WorkspaceProvider: 'NativeWorkspace' }, './last-seen': lastSeenModel,
+        '@/platform/remote-notifications': { remoteNotifications: { sync: async () => {} } },
+        'expo-notifications': { setBadgeCountAsync: async () => {}, addPushTokenListener: () => ({ remove() {} }) },
+        '@/platform': { mobilePlatform: { storage: browser.localStorage, onForeground: () => () => {} } }, './context': { WorkspaceProvider: 'NativeWorkspace' }, './last-seen': lastSeenModel,
       }, {}, 'Live')
       type NativeWorkspace = import('../../../../../apps/mobile/src/data/types.ts').Workspace
       const mainSaves: ReturnType<NativeWorkspace['actions']['send']>[] = []
@@ -1268,6 +1377,7 @@ test("workspace preserves bot and message requests while routing native decision
       let glass = false, theme = 'light'
       let dockHeight: { value: number } | undefined, emptyPadding = () => ({ paddingBottom: 0 })
       const chat = componentHarness('../../../../../apps/mobile/app/b/[botId].tsx', {
+        'expo-file-system': { File: SelectedFile },
         'expo-router': { Stack: { Screen: 'Screen' }, router: { push: (target: string) => { nativeNavigations.push(target) } }, useLocalSearchParams: () => ({ botId: botA.bot_id, routine }) },
         '@vibeface/client/lib/node.ts': { messageOf },
         '@/platform': { mobilePlatform: { storage: browser.localStorage } },
@@ -1384,9 +1494,9 @@ test("workspace preserves bot and message requests while routing native decision
         const mainActions = mobile().actions, originalMainSend = mainActions.send
         mainActions.send = (...args) => { const saved = originalMainSend(...args); mainSaves.push(saved); return saved }
         const composer = () => chat.render('default').find(({ type }) => type === 'Composer')?.props
-        const attach = (uri: string) => { const input = composer()?.onFiles; assert.ok(typeof input === 'function'); const files = [{ uri, name: uri.split('/').at(-1), size: 3, mimeType: null, arrayBuffer: async () => { const held = fileReads.get(uri); assert.ok(held); return await held.promise as ArrayBuffer }, text: async () => '', dispose() {} }]; input(files); return files }
+        const attach = (uri: string) => { const remove = composer()?.onFiles; assert.ok(typeof remove === 'function'); remove([]); const input = composer()?.onPickFiles; assert.ok(typeof input === 'function'); const files = [{ uri, name: uri.split('/').at(-1) ?? 'file', size: 3, mimeType: null }]; input(files.map(file => ({ ...file, arrayBuffer: async () => { const held = fileReads.get(uri); assert.ok(held); return await held.promise }, text: async () => '', dispose() {} }))); return files }
         const sendDraft = () => { const send = composer()?.onSend; assert.ok(typeof send === 'function'); send() }
-        const storedDraft = () => JSON.parse(stored.get(`vibeface.${networkKey('bot-drafts', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')}`) ?? '{}').chat
+        const storedDraft = () => chat.drafts.read({ networkId: fixtureNetwork, deviceId: fixtureClient, conversationId: 'chat', inputTarget: routine ? `routine:${routine}` : 'main' }).text
         const preparing = deferred(); fileReads.set('file:///first.txt', preparing)
         const sentBefore = messages.length
         composer()?.onChange?.('原草稿仍在准备附件')
@@ -1400,12 +1510,14 @@ test("workspace preserves bot and message requests while routing native decision
         composer()?.onChange?.('后来输入的内容')
         const laterFiles = attach('file:///later.txt')
         sendDraft(); await settleComponent()
-        assert.equal(mainSaves.length, 2, 'editing creates a separate draft that can save while the first is preparing')
+        assert.equal(mainSaves.length, 1, 'the native scope retains edits while the first draft is still preparing')
         preparing.resolve(new Uint8Array([1, 2, 3]).buffer)
         await mainSaves[0]; await settleComponent(); mobile()
         assert.equal(composer()?.value, '后来输入的内容')
-        assert.equal(composer()?.files, laterFiles, 'local acceptance cannot remove attachments selected after submission')
+        assert.deepEqual(JSON.parse(JSON.stringify(composer()?.files)), laterFiles, 'local acceptance cannot remove attachments selected after submission')
         assert.equal(storedDraft(), '后来输入的内容')
+        sendDraft(); sendDraft(); await settleComponent()
+        assert.equal(mainSaves.length, 2, 'the newer draft submits exactly once after the earlier save finishes')
         preparingLater.resolve(new Uint8Array([4, 5, 6]).buffer)
         await mainSaves[1]; await settleComponent(); mobile()
         assert.equal(composer()?.value, '')
@@ -1443,27 +1555,31 @@ test("workspace preserves bot and message requests while routing native decision
         const pendingRoutine = 'schedule:pending-draft'
         routine = pendingRoutine
         chat.render('default'); chat.render('default')
+        assert.equal(composer()?.value, '', 'a routine opens its own durable draft')
+        assert.deepEqual(JSON.parse(JSON.stringify(composer()?.files)), [])
+        composer()?.onChange?.('切换目标仍是独立输入'); attach('file:///options.txt')
         sendDraft(); sendDraft(); await settleComponent()
-        assert.equal(mainSaves.length, optionStart + 2, 'changing only target saves a distinct input with the same text and attachment')
+        assert.equal(mainSaves.length, optionStart + 2, 'another target can prepare its own draft independently')
         routine = undefined
         chat.render('default'); chat.render('default')
         sendDraft(); sendDraft(); await settleComponent()
-        assert.equal(mainSaves.length, optionStart + 3, 'returning to Main preserves a separate input identity')
+        assert.equal(mainSaves.length, optionStart + 2, 'returning to Main cannot duplicate its still-pending input')
         routine = pendingRoutine
         chat.render('default'); chat.render('default')
+        composer()?.onChange?.('当前例行任务草稿'); await settleComponent()
         changingOptions.resolve(new Uint8Array([13, 14, 15]).buffer)
         await Promise.all(mainSaves.slice(optionStart)); await settleComponent(); mobile()
-        assert.equal(composer()?.value, '切换目标仍是独立输入')
-        assert.equal(composer()?.files, optionFiles, 'an earlier target cannot clear the current attachment')
-        assert.equal(storedDraft(), '切换目标仍是独立输入')
+        assert.equal(composer()?.value, '当前例行任务草稿')
+        assert.deepEqual(JSON.parse(JSON.stringify(composer()?.files)), optionFiles, 'an earlier revision cannot clear the current attachment')
+        assert.equal(storedDraft(), '当前例行任务草稿')
         const optionMainTarget = { kind: 'bot_main', bot_id: botA.bot_id }, optionRoutineTarget = { kind: 'routine', bot_id: botA.bot_id, trigger: pendingRoutine }
-        assert.deepEqual(messages.slice(optionMessages).map(message => JSON.stringify([message.target, message.intent])).sort(), [[optionMainTarget, 'continue'], [optionRoutineTarget, 'continue'], [optionMainTarget, 'continue']].map(value => JSON.stringify(value)).sort(), 'chat input steers by default')
-        sendDraft(); await mainSaves.at(-1); await settleComponent(); mobile()
-        assert.equal(mainSaves.length, optionStart + 4)
+        assert.deepEqual(messages.slice(optionMessages).map(message => JSON.stringify([message.target, message.intent])).sort(), [[optionMainTarget, 'continue'], [optionRoutineTarget, 'continue']].map(value => JSON.stringify(value)).sort(), 'chat input steers by default')
+        sendDraft(); await settleComponent(); await mainSaves.at(-1); await settleComponent(); mobile()
+        assert.equal(mainSaves.length, optionStart + 3)
         assert.equal(composer()?.value, '')
         assert.equal(storedDraft(), '', 'the matching target still clears after durable acceptance')
-        assert.deepEqual(messages.slice(optionMessages).map(message => JSON.stringify([message.target, message.intent])).sort(), [[optionMainTarget, 'continue'], [optionRoutineTarget, 'continue'], [optionMainTarget, 'continue'], [optionRoutineTarget, 'continue']].map(value => JSON.stringify(value)).sort())
-        assert.equal(new Set(messages.slice(optionMessages).map(message => message.message_id)).size, 4)
+        assert.deepEqual(messages.slice(optionMessages).map(message => JSON.stringify([message.target, message.intent])).sort(), [[optionMainTarget, 'continue'], [optionRoutineTarget, 'continue'], [optionRoutineTarget, 'continue']].map(value => JSON.stringify(value)).sort())
+        assert.equal(new Set(messages.slice(optionMessages).map(message => message.message_id)).size, 3)
         routine = undefined
         chat.render('default'); chat.render('default')
         mainActions.send = originalMainSend
@@ -1653,7 +1769,7 @@ test("workspace preserves bot and message requests while routing native decision
         await memoryOutbox.put(saved); await render().queryInput(head)
         const rpcConnection = activeConnection, originalRpc = rpcConnection.rpc
         const closeCalls: string[] = []
-        const history = { events: [{ event_hash: 'a'.repeat(64), created_at_ms: 1, scope_id: head.conversation_id, kind: 'input_posted', speaker: { kind: 'human', device_id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }, body: { ...messages[before], type: 'input_posted' } }], coverage: { limit: 128, truncated: false, scope: 'workspace' } }
+        const history = { history_authority: 'authority', next_cursor: null, complete: true, events: [{ event_hash: 'a'.repeat(64), created_at_ms: 1, scope_id: head.conversation_id, kind: 'input_posted', speaker: { kind: 'human', device_id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }, body: { ...messages[before], type: 'input_posted' } }], coverage: { limit: 128, truncated: false, scope: 'workspace' } }
         rpcConnection.rpc = async (method, body = {}) => { closeCalls.push(method); return method === 'workspace_history' ? history : originalRpc(method, body) }
         let closeWork = Promise.resolve()
         const status = componentHarness('./workspace-chat.tsx', {
@@ -1780,28 +1896,30 @@ test("workspace preserves bot and message requests while routing native decision
   }
 })
 
-function componentHarness(path: string, dependencies: Record<string, unknown>, globals: Record<string, unknown> = {}, privateExport = '', realModules: Record<string, string> = {}) {
-  const hooks = hookHarness(true), { values, effects, afterRender } = hooks
+type Props = Record<string, unknown> & { name?: string; type?: string; role?: string; disabled?: boolean; value?: unknown; onChange?: (event: unknown) => void; onSubmit?: (event?: unknown) => void; onClick?: () => void; action?: () => Promise<unknown> }
+type FixtureElement = { type: unknown; props: Props; key?: string }
+type ComponentFixture = {
+  render(name: string, props?: unknown): FixtureElement[]
+  focus(): void
+  blur(): void
+  close(): void
+  readonly output: unknown
+  module: Record<string, unknown>
+  readonly drafts: ReturnType<typeof createChatDrafts>
+  ownsDraftFile(uri: string): boolean
+}
+
+function componentHarness(path: string, dependencies: Record<string, unknown>, globals: Record<string, unknown> = {}, privateExport = '', realModules: Record<string, string> = {}): ComponentFixture {
+  const hooks = hookHarness(true), { effects, afterRender } = hooks
   const focusEffects = new Map<number, { run: () => (() => void) | void; cleanup?: () => void }>()
-  type Props = Record<string, unknown> & { name?: string; type?: string; role?: string; disabled?: boolean; value?: unknown; onChange?: (event: unknown) => void; onSubmit?: (event?: unknown) => void; onClick?: () => void; action?: () => Promise<unknown> }
   const elements: { type: unknown; props: Props; key?: string }[] = []
   let focused = true, output: unknown
+  let scopedChild: { key?: string; name: string; app: ComponentFixture } | undefined
   const react = {
     ...hooks.react,
     lazy: () => 'Lazy', Suspense: 'Suspense',
     useId: () => 'component',
     useSyncExternalStore: (_subscribe: unknown, snapshot: () => unknown) => snapshot(),
-    useCallback(callback: unknown, dependencies: unknown[]) {
-      const index = hooks.next()
-      const previous = values[index] as { callback: unknown; dependencies: unknown[] } | undefined
-      if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) values[index] = { callback, dependencies }
-      return (values[index] as { callback: unknown }).callback
-    },
-    useMemo(read: () => unknown, dependencies: unknown[]) {
-      const index = hooks.next(), previous = values[index] as { value: unknown; dependencies: unknown[] } | undefined
-      if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) values[index] = { value: read(), dependencies }
-      return (values[index] as { value: unknown }).value
-    },
     useLayoutEffect: hooks.react.useEffect,
   }
   const jsx = (type: unknown, props: Props, key?: string) => { const element = key === undefined ? { type, props } : { type, props, key }; elements.push(element); return element }
@@ -1809,6 +1927,36 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   const module: { exports: Record<string, unknown> } = { exports: {} }
   const draftStorage = new Map<string, string>()
   const platformStorage = { getItem: (key: string) => draftStorage.get(key) ?? null, setItem: (key: string, value: string) => { draftStorage.set(key, value) } }
+  // Keep the real draft repository and hook: only native storage and file ownership are controlled.
+  let draftRevision = 0
+  // Virtual files keep stable URIs, with counted references for independent durable owners.
+  const retainedDraftFiles = new Map<string, number>()
+  const draftRepository = createChatDrafts({
+    storage: { get: key => draftStorage.get(key), set: (key, value) => { draftStorage.set(key, value) }, remove: key => { draftStorage.delete(key) } },
+    revision: () => `revision-${++draftRevision}`,
+    files: {
+      exists: uri => uri.startsWith('file:') || retainedDraftFiles.has(uri),
+      owns: uri => retainedDraftFiles.has(uri),
+      retain: async file => { retainedDraftFiles.set(file.uri, (retainedDraftFiles.get(file.uri) ?? 0) + 1); return { ...file } },
+      release: uri => { const remaining = (retainedDraftFiles.get(uri) ?? 1) - 1; if (remaining) retainedDraftFiles.set(uri, remaining); else retainedDraftFiles.delete(uri) },
+    },
+  })
+  const chatDrafts = {
+    ...draftRepository,
+    lease(snapshot: Parameters<typeof draftRepository.lease>[0]) {
+      const lease = draftRepository.lease(snapshot)
+      return { ...lease, files: lease.files.map(file => ({ ...file, async arrayBuffer() {
+        const filesystem = dependencies['expo-file-system']
+        assert.ok(filesystem && typeof filesystem === 'object' && 'File' in filesystem && typeof filesystem.File === 'function')
+        const native: unknown = Reflect.construct(filesystem.File, [file.uri])
+        assert.ok(native && typeof native === 'object' && 'arrayBuffer' in native && typeof native.arrayBuffer === 'function')
+        const bytes: unknown = await Reflect.apply(native.arrayBuffer, native, [])
+        assert.ok(bytes instanceof ArrayBuffer)
+        return bytes
+      } })) }
+    },
+  }
+  const nativePureModules = new Set(['@/lib/use-selection-owner', '@/features/chat/use-chat-draft', '@/platform/reading-position', '@/platform/chat-location', '@/platform/workspace-history', '@/platform/viewport-read', '@/platform/native-workspace-history-cache'])
   const useFocusEffect = (run: () => (() => void) | void) => {
     const index = hooks.next(), previous = focusEffects.get(index)
     if (!previous || previous.run !== run) afterRender.push(() => {
@@ -1819,6 +1967,12 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   const nativeRouterModule = dependencies['expo-router']
   const nativeRouter = typeof nativeRouterModule === 'object' && nativeRouterModule !== null && 'router' in nativeRouterModule ? nativeRouterModule.router : {}
   const require = (specifier: string): unknown => {
+    if (nativePureModules.has(specifier)) return loadComponentModule(fileURLToPath(new URL(`../../../../../apps/mobile/src/${specifier.slice(2)}.ts`, import.meta.url)))
+    if (specifier === './cached') return loadComponentModule(fileURLToPath(new URL('../../../../../apps/mobile/src/data/cached.ts', import.meta.url)))
+    if (specifier === '@vibeface/client/lib/selection.ts') return { selectionOwner }
+    if (specifier === '@vibeface/client/workspace/conversation-cache.ts') return conversationCache
+    if (specifier === '@/platform/native-chat-drafts') return { chatDrafts }
+    if (specifier === '@vibeface/client/workspace/system-notifications.ts') return systemNotifications
     if (realModules[specifier]) return loadComponentModule(fileURLToPath(new URL(realModules[specifier], import.meta.url)))
     if (specifier === '@vibeface/client/lib/byte-codec.ts') return dependencies[specifier] ?? byteCodec
     if (specifier === '@/lib/qr-code') return loadQr(fileURLToPath(new URL('../../lib/qr-code.ts', import.meta.url)))
@@ -1830,8 +1984,6 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     if (path.includes('/mobile/') && specifier === '@/components/arc/chat') return { ComposerInput: 'TextInput', ComposerPanel: 'ComposerPanel', MessageBubble: 'View' }
     if (path.includes('/mobile/') && specifier === '@/components/arc/selection') return { SelectionItem: 'Pressable' }
     if (path.includes('/mobile/') && specifier === '@/lib/use-clipboard') return loadComponentModule(fileURLToPath(new URL('../../../../../apps/mobile/src/lib/use-clipboard.ts', import.meta.url)))
-    if (specifier === '@/lib/use-selection-owner') return loadComponentModule(fileURLToPath(new URL('../../../../../apps/mobile/src/lib/use-selection-owner.ts', import.meta.url)))
-    if (specifier === '@vibeface/client/lib/selection.ts') return { selectionOwner }
     if (specifier === '@/lib/use-clipboard') return loadComponentModule(fileURLToPath(new URL('../../lib/use-clipboard.ts', import.meta.url)))
     if (specifier === '@vibeface/client/workspace/model.ts') {
       const override = dependencies[specifier]
@@ -1858,7 +2010,10 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     if (specifier === '@tanstack/react-router') return { Link: 'Link', useNavigate: () => () => {}, useRouterState: ({ select }: { select: (state: unknown) => unknown }) => select({ location: { search: {} } }), ...dependencies[specifier] as object }
     return specifier === 'react' ? react : specifier === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : specifier === 'expo-router' ? { Link: 'Link', useFocusEffect, useRouter: () => nativeRouter, ...dependencies[specifier] as object } : dependencies[specifier] ?? ui
   }
-  const loadComponentModule = moduleLoader(createContext({ setTimeout, clearTimeout, ...globals }), specifier => require(specifier))
+  const loadComponentModule = moduleLoader(createContext({ setTimeout, clearTimeout, TextEncoder, TextDecoder, Uint8Array, Error, ...globals }), (specifier, filename) => {
+    if (specifier.startsWith('.') && !specifier.endsWith('.tsx')) return loadComponentModule(resolve(dirname(filename), specifier.endsWith('.ts') ? specifier : `${specifier}.ts`))
+    return require(specifier)
+  })
   const loadQr = moduleLoader(createContext({}), specifier => require(specifier))
   const filename = fileURLToPath(new URL(path, import.meta.url))
   const source = readFileSync(filename, 'utf8') + (privateExport ? `\nexport { ${privateExport} }\n` : '')
@@ -1871,15 +2026,99 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       assert.ok(typeof component === 'function')
       output = component(props)
       afterRender.splice(0).forEach(run => run())
+      if (name === 'ScopedWorkspaceScreen') {
+        const child = elements.find(element => typeof element.type === 'function' && ['ScopedWorkspaceContent', 'OfflineWorkspaceHistory'].includes(element.type.name))
+        if (child && typeof child.type === 'function') {
+          if (!scopedChild || scopedChild.key !== child.key || scopedChild.name !== child.type.name) {
+            scopedChild?.app.close()
+            scopedChild = { key: child.key, name: child.type.name, app: componentHarness(path, dependencies, globals, child.type.name, realModules) }
+          }
+          const nested = scopedChild.app.render(scopedChild.name, child.props)
+          output = scopedChild.app.output
+          return [...elements, ...nested]
+        }
+      }
       return elements
     },
-    focus() { if (!focused) { focused = true; for (const effect of focusEffects.values()) effect.cleanup = effect.run() ?? undefined } },
-    blur() { if (focused) { focused = false; for (const effect of focusEffects.values()) { effect.cleanup?.(); effect.cleanup = undefined } } },
-    close() { for (const effect of [...effects.values(), ...focusEffects.values()]) effect.cleanup?.() },
+    focus() { scopedChild?.app.focus(); if (!focused) { focused = true; for (const effect of focusEffects.values()) effect.cleanup = effect.run() ?? undefined } },
+    blur() { scopedChild?.app.blur(); if (focused) { focused = false; for (const effect of focusEffects.values()) { effect.cleanup?.(); effect.cleanup = undefined } } },
+    close() { scopedChild?.app.close(); for (const effect of [...effects.values(), ...focusEffects.values()]) effect.cleanup?.() },
     get output() { return output },
     module: module.exports,
+    get drafts() { return scopedChild?.app.drafts ?? chatDrafts },
+    ownsDraftFile: uri => scopedChild ? scopedChild.app.ownsDraftFile(uri) : retainedDraftFiles.has(uri),
   }
 }
+
+test('native Offline uses validated display scopes and fences late pending rows and errors while keeping corrupt-ledger cache readable', async () => {
+  const alpha = { network_id: 'a'.repeat(64), device_id: 'b'.repeat(64), entry_device_id: 'c'.repeat(64) }
+  const beta = { network_id: 'd'.repeat(64), device_id: 'e'.repeat(64), entry_device_id: 'f'.repeat(64) }
+  let scope: typeof alpha | null = alpha
+  const storage = new Map<string, string>()
+  const keyValue = { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => { storage.set(key, value) } }
+  const cache = conversationCache.createConversationCache({ storage: keyValue, now: () => 10 })
+  const seen = (owner: typeof alpha) => ({ ...owner, entry_label: '上次的工作设备', bots: [parityBot], primary: 'chat', members: [
+    { device_id: owner.device_id, name: '手机', kind: 'client', manage: true, bot: null },
+    { device_id: owner.entry_device_id, name: '工作设备', kind: 'node', manage: false, bot: 'ready' },
+  ] })
+  const select = (owner: typeof alpha) => { assert.ok(lastSeenModel.decodeLastSeen(seen(owner), owner)); scope = owner; storage.set('vibeface.last-seen', JSON.stringify(seen(owner))) }
+  for (const [owner, text] of [[alpha, 'Alpha 已同步正文'], [beta, 'Beta 已同步正文']] satisfies [typeof alpha, string][]) {
+    cache.save({ networkId: owner.network_id, deviceId: owner.device_id, conversationId: 'chat', payload: parseConversation({ ...context, messages: [{ message_id: text, event_hash: text, role: 'assistant', text, created_at_ms: 1 }] }) })
+  }
+  const pending = (owner: typeof alpha, text: string) => { const item = { key: `${owner.network_id}.${owner.device_id}:message:${text}`, scope_id: 'chat', method: 'message', created_at_ms: 2, delivery: 'saved', entry_device_id: owner.entry_device_id,
+    params: { conversation_id: 'chat', message_id: text, target: { kind: 'bot_main', bot_id: parityBot.bot_id }, intent: 'continue', sequence: 1, text, report_results: true, attestation: { device_id: owner.device_id, signature: '0'.repeat(128) } } }; return decodeOutbox(item, item.key) }
+  const reads: ReturnType<typeof pendingResult>[] = []
+  const device = { get displayScope() { return scope }, ready: null, phase: 'reconnecting', entries: [{ kind: 'gateway', device_id: alpha.entry_device_id, address: 'https://node.example' }],
+    link: { kind: 'offline' }, entry: { kind: 'gateway', device_id: alpha.entry_device_id, address: 'https://node.example' }, entryName: () => '工作设备', connectionGeneration: () => 1, join() {}, cancelJoin() {}, leave() {} }
+  select(alpha)
+  const app = componentHarness('../../../../../apps/mobile/src/data/live.tsx', {
+    '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/identity/access.ts': { accessOf },
+    '@vibeface/client/lib/node.ts': { entryAddress, messageOf }, '@vibeface/client/workspace/labels.ts': taskLabels,
+    '@vibeface/client/chat/timeline.ts': { chatTimeline }, '@vibeface/client/workspace/questions.ts': { foldAnswers },
+    '@/platform': { mobilePlatform: { storage: keyValue, outbox: { all: () => { const read = pendingResult(); reads.push(read); return read.promise } } } },
+    './last-seen': lastSeenModel, './context': { WorkspaceProvider: 'NativeWorkspace' },
+  }, {}, 'Offline')
+  const render = () => {
+    const value = app.render('Offline').find(({ type }) => type === 'NativeWorkspace')?.props.value
+    return workspaceModel.record(value)
+  }
+  const texts = (value: ReturnType<typeof render>) => {
+    const messages = workspaceModel.record(workspaceModel.record(value.conversations).chat).messages
+    assert.ok(Array.isArray(messages)); return Array.from(messages, message => workspaceModel.record(message).text)
+  }
+  try {
+    assert.deepEqual(texts(render()), ['Alpha 已同步正文']); assert.equal(reads.length, 1)
+    select(beta)
+    assert.deepEqual(texts(render()), ['Beta 已同步正文']); assert.equal(reads.length, 2)
+    reads[0].resolve([pending(alpha, 'Alpha 迟到待发')]); await settleComponent()
+    assert.deepEqual(texts(render()), ['Beta 已同步正文'], 'the previous scope cannot append a late pending input')
+    reads[1].resolve([pending(beta, 'Beta 待发')]); await settleComponent()
+    assert.deepEqual(texts(render()), ['Beta 已同步正文', 'Beta 待发'])
+    select(alpha)
+    assert.deepEqual(texts(render()), ['Alpha 已同步正文'], 'the first render after changing scope cannot flash the previous pending state')
+    assert.equal(reads.length, 3)
+    select(beta); render(); assert.equal(reads.length, 4)
+    reads[2].reject(new Error('Alpha 迟到账本错误')); await settleComponent()
+    assert.doesNotMatch(String(workspaceModel.record(workspaceModel.record(render().conversations).chat).blocked), /Alpha 迟到/)
+    reads[3].reject(new Error('本地待发账本损坏')); await settleComponent()
+    const blocked = render()
+    assert.deepEqual(texts(blocked), ['Beta 已同步正文'])
+    assert.equal(workspaceModel.record(workspaceModel.record(blocked.conversations).chat).blocked, '本地待发账本损坏', 'a damaged ledger is visible while the cached transcript remains readable')
+    select(alpha)
+    assert.doesNotMatch(String(workspaceModel.record(workspaceModel.record(render().conversations).chat).blocked), /损坏/, 'a previous scope error cannot flash before the next outbox effect completes')
+    reads[4].resolve([]); await settleComponent()
+    storage.set('vibeface.last-seen', JSON.stringify(seen(beta)))
+    scope = { ...alpha, entry_device_id: '1'.repeat(64) }
+    const mismatched = render()
+    assert.deepEqual(Object.keys(workspaceModel.record(mismatched.conversations)), [])
+    assert.ok(Array.isArray(mismatched.bots)); assert.deepEqual(Array.from(mismatched.bots), [], 'a stored snapshot cannot choose a different display identity or entry')
+    assert.equal(mismatched.networkId, alpha.network_id); assert.equal(reads.length, 5)
+    scope = null
+    const unsigned = render()
+    assert.equal(unsigned.networkId, null); assert.equal(unsigned.deviceId, null)
+    assert.deepEqual(Object.keys(workspaceModel.record(unsigned.conversations)), [])
+  } finally { app.close() }
+})
 
 test("anonymous workspace navigation preserves the requested page without redirecting twice", async (t) => {
   for (const [requested, resolved] of [
@@ -2868,13 +3107,13 @@ test('composers save each pending draft once and let edited drafts save independ
       ...parityShared(), data: parseConversation({ ...context, works: [parityWork()] }), workspaceState: domain,
       chatSlot: { conversationId: 'chat', missing: false }, fresh: new Set<string>(), interrupted: [], view: 'chat',
       readWork: async () => ({ work: { ...parityWork(), conversation_id: 'chat', target: null, source_events: [] }, coverage: { source: 'shared_history', complete: false } }),
-      readWorkspaceState: async () => domain, readWorkspaceHistory: async () => ({ events: [], coverage: { limit: 128, truncated: false, scope: 'channel' } }),
+      readWorkspaceState: async () => domain, readWorkspaceHistory: async (filter: WorkspaceFilter) => ({ history_authority: 'authority', next_cursor: null, complete: true, events: [], coverage: { limit: 128, truncated: false, scope: filter.task_id ? 'task' : 'channel' } }),
       sendMessage: (text: string, files: ReadableFile[], _sent: unknown, options: InputOptions) => {
         attempts.push({ text, files: files.map((file) => file.name), target: options.target, intent: options.intent })
         const taskId = `created-task-${attempts.length}`
         const save = Promise.all(files.map(async (file) => ({ name: file.name, bytes: Array.from(new Uint8Array(await file.arrayBuffer())) }))).then((attachments) => {
           saved.push({ text, attachments })
-          if (options.intent === 'new_task') options.onSaved?.({ report_results: true, message_id: `input-${taskId}`, conversation_id: 'chat', target: { kind: 'task', task_id: taskId }, intent: 'continue', expected_revision: 1, sequence: attempts.length, text, attachments: [], created_at_ms: 1, delivery: 'saved' })
+          options.onSaved?.({ report_results: true, message_id: `input-${taskId}`, conversation_id: 'chat', target: options.intent === 'new_task' ? { kind: 'task', task_id: taskId } : options.target, intent: 'continue', expected_revision: 1, sequence: attempts.length, text, attachments: [], created_at_ms: 1, delivery: 'saved' })
           return true
         })
         saves.push(save)
@@ -2883,7 +3122,8 @@ test('composers save each pending draft once and let edited drafts save independ
     }
     const app = componentHarness(example.path, {
       '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared },
-      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { network_id: 'network', can_manage: false, source: 'membership' } } }) },
+      '@/data/context': { useWorkspace: () => ({ networkId: 'network', deviceId: 'phone', bots: shared.bots, conversations: {}, members: [], actions: {} }) },
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { network_id: 'network', device_id: 'phone', can_manage: false, source: 'membership' }, isCurrent: () => true } }) },
       '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/lib/node.ts': { providerNames, messageOf }, '@vibeface/client/lib/errors.ts': errors,
       '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
       '@vibeface/client/workspace/bot-settings.ts': { botCopy, folderLabels, placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage },
@@ -2891,7 +3131,8 @@ test('composers save each pending draft once and let edited drafts save independ
       '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) },
       '@/components/kit': { providerIcons: { codex: 'CodexIcon' }, toneText: {} }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
       '@tanstack/react-router': { useNavigate: () => (target: unknown) => { navigations.push(target) } },
-      'expo-router': { Stack: { Screen: 'Screen' }, router: { push: (target: unknown) => { navigations.push(target) } }, useRouter: () => ({ push: (target: unknown) => { navigations.push(target) }, back() {} }) },
+      'react-native': { AppState: { currentState: 'active', addEventListener: () => ({ remove() {} }) } },
+      'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({}), router: { push: (target: unknown) => { navigations.push(target) } }, useRouter: () => ({ push: (target: unknown) => { navigations.push(target) }, back() {} }) },
       'expo-file-system': { File: class { uri: string; constructor(uri: string) { this.uri = uri } arrayBuffer() { return read(this.uri.split('/').at(-1) ?? '') } } },
       'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 0 }) },
       '@/lib/use-run': { useRun: () => ({ busy: null, error: '', run: async (_key: string, action: () => Promise<void>) => action() }) },
@@ -2900,13 +3141,57 @@ test('composers save each pending draft once and let edited drafts save independ
     const composer = () => { const props = render().find(({ type }) => type === (example.native ? 'Composer' : 'PromptInput'))?.props; assert.ok(props); return props }
     const submit = () => { const send = composer()[example.native ? 'onSend' : 'onSubmit']; assert.ok(typeof send === 'function'); send() }
     const attach = (name: string) => {
-      const input = composer().onFiles; assert.ok(typeof input === 'function')
-      const files = example.native ? [{ uri: `file:///${name}`, name, size: 3, mimeType: 'text/plain', arrayBuffer: () => read(name), text: async () => '', dispose() {} }] : [{ name, arrayBuffer: () => read(name) }]
-      input(files)
-      return files
+      if (example.native) { const remove = composer().onFiles; assert.ok(typeof remove === 'function'); remove([]) }
+      const input = composer()[example.native ? 'onPickFiles' : 'onFiles']; assert.ok(typeof input === 'function')
+      const files = example.native ? [{ uri: `file:///${name}`, name, size: 3, mimeType: 'text/plain' }] : [{ name, arrayBuffer: () => read(name) }]
+      input(example.native ? files.map(file => ({ ...file, arrayBuffer: () => read(name), text: async () => '', dispose() {} })) : files)
+      return example.native ? composer().files : files
     }
     try {
       render(); await settleComponent()
+      if (example.component === 'ScopedWorkspaceScreen') {
+        const target: InputTarget = example.name.endsWith('Task') ? { kind: 'task', task_id: 'task' } : { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' }
+        const first = pendingResult(); reads.set('first.txt', first)
+        composer().onChange?.('第一份草稿'); attach('first.txt'); await settleComponent()
+        const original = app.drafts.read({ networkId: 'network', deviceId: 'phone', conversationId: 'chat', inputTarget: inputTargetKey(target) })
+        submit(); submit(); await settleComponent()
+        assert.equal(attempts.length, 0, 'native preparation reads the complete attachment before local enqueue')
+        assert.equal(composer().sending, true)
+        const later = pendingResult(); reads.set('later.txt', later)
+        composer().onChange?.('第二份草稿'); attach('later.txt'); await settleComponent(); submit(); await settleComponent()
+        assert.equal(attempts.length, 0, 'one native scope keeps a single preparation while its newer draft remains editable')
+        assert.ok(app.ownsDraftFile(original.files[0].uri), 'the submitted attachment lease survives replacement by the new draft')
+        first.resolve(new Uint8Array([1, 2, 3]).buffer); await settleComponent(); await saves[0]; await settleComponent()
+        assert.equal(attempts.length, 1)
+        assert.equal(composer().value, '第二份草稿')
+        assert.deepEqual(JSON.parse(JSON.stringify(composer().files)), [{ uri: 'file:///later.txt', name: 'later.txt', size: 3, mimeType: 'text/plain' }], 'acceptance of the first draft preserves the newer attachments')
+        assert.equal(app.ownsDraftFile(original.files[0].uri), false, 'the retired submitted copy releases after byte preparation and acceptance')
+        submit(); submit(); await settleComponent()
+        assert.equal(attempts.length, 1, 'the next native draft still waits for its own attachment bytes')
+        later.resolve(new Uint8Array([4, 5, 6]).buffer); await settleComponent(); await saves[1]; await settleComponent()
+        assert.equal(attempts.length, 2)
+        assert.equal(composer().value, '')
+        assert.deepEqual(JSON.parse(JSON.stringify(composer().files)), [])
+        assert.deepEqual(saved, [
+          { text: '第一份草稿', attachments: [{ name: 'first.txt', bytes: [1, 2, 3] }] },
+          { text: '第二份草稿', attachments: [{ name: 'later.txt', bytes: [4, 5, 6] }] },
+        ])
+        assert.deepEqual(JSON.parse(JSON.stringify(attempts.map(item => item.target))), [target, target])
+        const failed = pendingResult(); reads.set('retry.txt', failed)
+        composer().onChange?.('原样重试'); attach('retry.txt'); await settleComponent(); submit(); await settleComponent()
+        failed.reject(new Error('file unavailable')); await settleComponent()
+        assert.equal(attempts.length, 2, 'a failed native read cannot enqueue an incomplete input')
+        assert.equal(composer().value, '原样重试')
+        const retryFiles = composer().files
+        assert.ok(Array.isArray(retryFiles)); assert.equal(workspaceModel.record(retryFiles[0]).name, 'retry.txt')
+        assert.equal(render().find(({ type }) => type === 'ErrorText')?.props.error, messageOf(new Error('file unavailable')))
+        const retry = pendingResult(); reads.set('retry.txt', retry); submit(); submit(); await settleComponent()
+        retry.resolve(new Uint8Array([7, 8, 9]).buffer); await settleComponent(); await saves[2]; await settleComponent()
+        assert.equal(attempts.length, 3, 'a failed preparation releases the scope for exactly one retry')
+        assert.equal(composer().value, '')
+        assert.deepEqual(saved.at(-1), { text: '原样重试', attachments: [{ name: 'retry.txt', bytes: [7, 8, 9] }] })
+        return
+      }
       const first = pendingResult(); reads.set('first.txt', first)
       composer().onChange?.('第一份草稿'); attach('first.txt'); submit(); submit()
       composer().onChange?.('第一份草稿'); submit(); await settleComponent()
@@ -2969,10 +3254,11 @@ test('both channel composers retain the durable task target before the domain sn
     const durable: PendingMessage = { report_results: true, message_id: 'locally-saved', conversation_id: 'chat', target: { kind: 'channel_task', channel_id: 'channel', task_id: 'stable-task', bot_id: 'bot' }, intent: 'continue', expected_revision: 1, sequence: 1, text: 'first', created_at_ms: 1, delivery: 'saved' }
     const pendingMessages: PendingMessage[] = []
     const sends: InputOptions[] = []
+    let nativeSaveHold: ReturnType<typeof pendingResult> | null = null
     const shared = { ...parityShared(), workspaceState: domain, pendingMessages,
       readWorkspaceState: async () => domain,
-      readWorkspaceHistory: async () => ({ events: [], coverage: { limit: 128, truncated: false, scope: 'channel' } }),
-      sendMessage: async (_text: string, _files: unknown[], _sent: unknown, options?: InputOptions) => { assert.ok(options); sends.push(options); const saved: PendingMessage = options.target.kind === 'channel_member' && options.target.bot_id === 'other' ? { ...durable, conversation_id: 'other-chat', target: { kind: 'channel_task', channel_id: 'channel', task_id: 'other-task', bot_id: 'other' } } : durable; shared.pendingMessages = [saved]; options.onSaved?.(saved); return true },
+      readWorkspaceHistory: async (filter: WorkspaceFilter) => ({ history_authority: 'authority', next_cursor: null, complete: true, events: [], coverage: { limit: 128, truncated: false, scope: filter.task_id ? 'task' : 'channel' } }),
+      sendMessage: async (_text: string, _files: unknown[], _sent: unknown, options?: InputOptions) => { assert.ok(options); sends.push(options); await nativeSaveHold?.promise; const saved: PendingMessage = options.target.kind === 'channel_member' && options.target.bot_id === 'other' ? { ...durable, conversation_id: 'other-chat', target: { kind: 'channel_task', channel_id: 'channel', task_id: 'other-task', bot_id: 'other' } } : durable; shared.pendingMessages = [saved]; options.onSaved?.(saved); return true },
     }
     shared.bots.push({ ...parityBot, bot_id: 'other', conversation_id: 'other-chat', name: '另一个 Bot' })
     // A cached recipient without its task is ignored: the Channel opens on its coordinator.
@@ -2980,10 +3266,12 @@ test('both channel composers retain the durable task target before the domain sn
     const storage = { getItem: (key: string) => saved.get(key) ?? null, setItem: (key: string, value: string) => { saved.set(key, value) } }
     const dependencies = {
       '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared },
+      '@/data/context': { useWorkspace: () => ({ networkId: 'network', deviceId: 'phone', bots: shared.bots, conversations: {}, members: [], actions: {} }) },
       '@vibeface/client/chat/protocol.ts': { promptIntent, inputTargetKey },
-      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: { principal: { network_id: 'network' } } }) },
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: { principal: { network_id: 'network', device_id: 'phone' }, isCurrent: () => true } }) },
       '@/lib/platform': { webPlatform: { storage } }, '@/platform': { mobilePlatform: { storage } },
-      'expo-router': { Stack: { Screen: 'Screen' }, router: { push() {} } }, 'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 0 }) },
+      'react-native': { AppState: { currentState: 'active', addEventListener: () => ({ remove() {} }) } },
+      'expo-router': { Stack: { Screen: 'Screen' }, router: { push() {} }, useLocalSearchParams: () => ({}) }, 'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 0 }) },
       '@/lib/use-run': { useRun: () => ({ busy: null, error: '', run: async (_key: string, action: () => Promise<void>) => action() }) },
       '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
     }
@@ -3029,11 +3317,25 @@ test('both channel composers retain the durable task target before the domain sn
         const endReply = app.render('ScopedWorkspaceScreen', { channelId: 'channel' }).find(({ props }) => props.accessibilityLabel === '结束回复这个任务')?.props
         assert.ok(typeof endReply?.onPress === 'function'); endReply.onPress()
         composer()
+        domain.tasks.push({ task_id: 'stable-task', root_task_id: 'stable-task', channel_id: 'channel', owner_bot: 'bot', title: '稍后同步的任务', request: '交代', expected_result: '结果', source_events: [], dependencies: [], reply_only: false, revision: 1, action: 'continue', request_event: 'request', event_hash: 'task-event', created_at_ms: 1, updated_at_ms: 1, state: 'running' })
         sends[2].onSaved?.(durable)
         composer()?.onChange?.('交给协调 Bot')
         const sendCoordinator = composer()?.onSend
         assert.ok(typeof sendCoordinator === 'function'); sendCoordinator(); await settleComponent()
-        assert.deepEqual(JSON.parse(JSON.stringify(sends[3].target)), { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' }, 'a late save cannot redirect the next native input back to the old task')
+        assert.deepEqual(JSON.parse(JSON.stringify(sends[3].target)), { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' }, 'late metadata and an old save cannot redirect the next native input back to an explicitly ended task')
+        const endAgain = app.render('ScopedWorkspaceScreen', { channelId: 'channel' }).find(({ props }) => props.accessibilityLabel === '结束回复这个任务')?.props.onPress
+        assert.ok(typeof endAgain === 'function'); endAgain()
+        nativeSaveHold = pendingResult()
+        composer()?.onChange?.('还在保存的旧交代')
+        const oldSave = composer()?.onSend
+        assert.ok(typeof oldSave === 'function'); oldSave(); await settleComponent()
+        composer()?.onChange?.('当前正在编辑的新交代'); await settleComponent()
+        nativeSaveHold.resolve(undefined); nativeSaveHold = null; await settleComponent()
+        assert.equal(composer()?.value, '当前正在编辑的新交代', 'an accepted older draft keeps the current channel editor')
+        assert.equal(composer()?.attachmentScope, JSON.stringify(['network', 'phone', 'chat', inputTargetKey({ kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' })]), 'an older save cannot auto-select its new task over the newer channel draft')
+        const newSave = composer()?.onSend
+        assert.ok(typeof newSave === 'function'); newSave(); await settleComponent()
+        assert.deepEqual(JSON.parse(JSON.stringify(sends.at(-1)?.target)), { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' })
       }
     } finally { app.close() }
   }
@@ -4948,9 +5250,8 @@ test('native composer adds photos and files without replacing current attachment
   type Attachment = import('../../../../../apps/mobile/src/data/types.ts').Attachment
   type NativeButton = { text: string; onPress?: () => void; style?: string }
   for (const os of ['ios', 'android']) await t.test(os, async () => {
-    const readers = { text: { value: async () => '' }, arrayBuffer: { value: async () => new ArrayBuffer(0) }, dispose: { value: () => {} } }
-    const original = Object.defineProperties({ uri: 'file:///report.pdf', name: 'report.pdf', size: 20, mimeType: 'application/pdf' }, readers) as Attachment
-    const current = Object.defineProperties({ uri: 'file:///current.txt', name: 'current.txt', size: null, mimeType: null }, readers) as Attachment
+    const original = { uri: 'file:///report.pdf', name: 'report.pdf', size: 20, mimeType: 'application/pdf' }
+    const current = { uri: 'file:///current.txt', name: 'current.txt', size: null, mimeType: null }
     const cache = new Map([
       ['file:///cache/original.heic', { name: 'original.heic', size: 30, type: 'image/heic' }],
       ['file:///cache/transparent.png', { name: 'transparent.png', size: 40, type: 'image/png' }],
@@ -4985,7 +5286,7 @@ test('native composer adds photos and files without replacing current attachment
       const callback = ++renders
       return app.render('Composer', {
         chrome: { kind: 'solid' }, value: '保留草稿', onChange() {}, files, attachmentScope: JSON.stringify(['network', 'chat', ['bot_main', 'bot'], 'continue']),
-        onFiles(next: Attachment[]) { usedCallback = callback; updates++; files = next }, blocked: null, sending: false, onSend() {},
+        onFiles(next: Attachment[]) { usedCallback = callback; updates++; files = next }, onPickFiles(added: import('../../../../../apps/mobile/src/data/types.ts').PickedAttachment[]) { usedCallback = callback; updates++; files = [...files, ...added] }, blocked: null, sending: false, onSend() {},
       })
     }
     const choose = (index: number) => {
@@ -5062,10 +5363,10 @@ test('native attachment results cannot cross a draft scope or survive its disabl
   for (const os of ['ios', 'android']) for (const source of ['photos', 'files']) for (const change of ['bot', 'bot-roundtrip', 'network', 'blocked', 'blocked-roundtrip', 'sending', 'unmounted', 'stale-menu', 'blocked-before-menu', 'sending-before-menu']) await t.test(`${os} ${source} ${change}`, async () => {
     const live = parityShared()
     const conversation: import('../../../../../apps/mobile/src/data/types.ts').Conversation = {
-      messages: [], before: new Map(), rest: [], answers: new Map(), hidden: new Set(), unread: null,
+      origin: { kind: 'network' }, messages: [], before: new Map(), rest: [], answers: new Map(), hidden: new Set(), unread: null,
       works: [parityWork()], replying: false, status: null, stoppable: false, blocked: null,
     }
-    const workspace = { bots: [parityBot, { ...parityBot, bot_id: 'other', conversation_id: 'other-chat' }], conversations: { chat: conversation, 'other-chat': { ...conversation } }, members: [], primary: null, actions: { open() {} }, connection: { entry: '工作设备' } }
+    const workspace = { get networkId() { return device.ready.principal.network_id }, deviceId: 'phone', bots: [parityBot, { ...parityBot, bot_id: 'other', conversation_id: 'other-chat' }], conversations: { chat: conversation, 'other-chat': { ...conversation } }, members: [], primary: null, actions: { open() {} }, connection: { entry: '工作设备' } }
     const device = { link: { kind: 'online' }, ready: { entry: { device_id: 'gateway' }, principal: { network_id: 'network', can_manage: true } } }
     let botId = 'bot', sending = false, calls = 0, selected: (() => void) | undefined
     const result = pendingResult()
@@ -5092,8 +5393,8 @@ test('native attachment results cannot cross a draft scope or survive its disabl
     const render = () => composer.render('Composer', { ...props(), sending })
     try {
       props().onChange?.('A 草稿')
-      const original = [{ uri: 'file:///a.txt', name: 'a.txt', size: 1, mimeType: 'text/plain', arrayBuffer: async () => new ArrayBuffer(1), text: async () => 'A', dispose() {} }]
-      const onFiles = props().onFiles; assert.ok(typeof onFiles === 'function'); onFiles(original)
+      const original = [{ uri: 'file:///a.txt', name: 'a.txt', size: 1, mimeType: 'text/plain' }]
+      const onFiles = props().onFiles; assert.ok(typeof onFiles === 'function'); await onFiles(original)
       const scope = props().attachmentScope
       assert.equal(typeof scope, 'string')
       if (change === 'blocked-before-menu') conversation.blocked = '当前设备仅可查看'
@@ -5106,7 +5407,7 @@ test('native attachment results cannot cross a draft scope or survive its disabl
         botId = 'other'; render()
         props().onChange?.('B 草稿')
         const setFiles = props().onFiles; assert.ok(typeof setFiles === 'function')
-        setFiles([{ uri: 'file:///b.txt', name: 'b.txt', size: 2, mimeType: 'text/plain', arrayBuffer: async () => new ArrayBuffer(2), text: async () => 'B', dispose() {} }]); render()
+        await setFiles([{ uri: 'file:///b.txt', name: 'b.txt', size: 2, mimeType: 'text/plain' }]); render()
         if (change === 'bot-roundtrip') { botId = 'bot'; render(); assert.equal(props().attachmentScope, scope) }
       }
       if (change === 'network') { device.ready.principal.network_id = 'other-network'; render() }
@@ -5125,9 +5426,9 @@ test('native attachment results cannot cross a draft scope or survive its disabl
       await settleComponent()
       assert.equal(JSON.stringify(props().files), before, 'late completion leaves the actual bound draft setter untouched')
       assert.equal(props().value, text)
-      botId = 'bot'
+      botId = 'bot'; device.ready.principal.network_id = 'network'
       assert.equal(props().value, 'A 草稿')
-      assert.equal(JSON.stringify(props().files), JSON.stringify(change === 'network' ? [] : original), 'a different network abandons its selections; other draft changes retain the original attachments')
+      assert.equal(JSON.stringify(props().files), JSON.stringify(original), 'the original draft also retains its attachments')
     } finally { composer.close(); screen.close() }
   })
 })
@@ -5137,10 +5438,10 @@ test('native composer preserves local input and visible blockers with compact ch
     let retried = 0
     const live = { ...parityShared(), nodes: parseNodes({ nodes: [{ ...parityNode, capabilities: { ...parityNode.capabilities, manager_state: 'unverified' } }] }) }
     const conversation: import('../../../../../apps/mobile/src/data/types.ts').Conversation = {
-      messages: [{ message_id: 'one', event_hash: 'one', role: 'user', text: 'hello', created_at_ms: 1 }], before: new Map(), rest: [], answers: new Map(), hidden: new Set(), unread: null,
+      origin: { kind: 'network' }, messages: [{ message_id: 'one', event_hash: 'one', role: 'user', text: 'hello', created_at_ms: 1 }], before: new Map(), rest: [], answers: new Map(), hidden: new Set(), unread: null,
       works: [], replying: false, status: null, stoppable: false, blocked: null,
     }
-    const workspace = { bots: [parityBot], conversations: { chat: conversation }, members: [], primary: null, actions: { open() {} }, connection: { entry: '工作设备' } }
+    const workspace = { networkId: 'network', deviceId: 'phone', bots: [parityBot], conversations: { chat: conversation }, members: [], primary: null, actions: { open() {} }, connection: { entry: '工作设备' } }
     const device = { link: { kind: 'online' }, ready: { entry: { device_id: 'gateway' }, principal: { can_manage: true } }, retryNow: () => { retried++ } }
     const screen = nativeChatHarness(os, {
       'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: 'bot' }) },
@@ -5776,6 +6077,7 @@ function nativeFileFixture() {
     textSync() { return new TextDecoder().decode(files.get(this.uri)) }
     async text() { return this.textSync() }
     async bytes() { return files.get(this.uri)?.slice() ?? new Uint8Array() }
+    async arrayBuffer() { return Uint8Array.from(await this.bytes()).buffer }
     async copy(destination: File): Promise<void> { const value = files.get(this.uri); assert.ok(value); destination.writeSync(value) }
     copySync(): never { assert.fail('attachment retain must use async copy') }
     moveSync(destination: File) { const value = files.get(this.uri); assert.ok(value); destination.writeSync(value); files.delete(this.uri); this.uri = destination.uri }
@@ -5898,13 +6200,13 @@ test('native system notification events keep typed destinations and clear naviga
   const destination: NotificationDestination = { network_id: 'network-fixture', device_id: 'device-fixture', notification_id: 'notification-fixture', conversation_id: 'conversation-fixture' }
   const opened: NotificationDestination[] = []
   const unwatch = mobilePlatform.notifier.watchOpen?.(async value => { opened.push(value); return true })
-  mobilePlatform.notifier.show({ title: 'fixture', body: 'fixture', tag: 'same', destination }, () => {})
+  await mobilePlatform.notifier.show({ title: 'fixture', body: 'fixture', tag: 'same', destination }, () => {})
   await privateFiles.run(async () => {})
   const event: Response = { notification: { date: 1, request: { identifier: 'same', content: { data: { destination } } } }, actionIdentifier: 'open' }
   response?.(event); response?.(event)
   await new Promise<void>(resolve => setImmediate(resolve))
   assert.deepEqual(opened, [destination])
-  assert.deepEqual(JSON.parse(JSON.stringify(scheduled)), [{ identifier: 'same', content: { title: 'fixture', body: 'fixture', data: { destination } }, trigger: { channelId: 'vibeface' } }])
+  assert.deepEqual(JSON.parse(JSON.stringify(scheduled)), [{ identifier: 'same', content: { title: 'fixture', body: 'fixture', data: { destination } }, trigger: { channelId: 'vibeface-silent' } }])
   await mobilePlatform.erase?.()
   response?.({ ...event, notification: { ...event.notification, date: 2 } })
   await new Promise<void>(resolve => setImmediate(resolve))

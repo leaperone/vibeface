@@ -1,12 +1,13 @@
 import * as Haptics from 'expo-haptics'
 import { Link } from 'expo-router'
-import { BellRing, Bot, ChevronUp, Crown, FileKey, FlaskConical, KeyRound, LogOut, MessageSquareShare, Monitor, Moon, Palette, Plus, RotateCcw, ShieldAlert, ShieldCheck, Sun, TriangleAlert, WifiOff, type LucideIcon } from 'lucide-react-native'
+import { Bot, ChevronUp, Crown, FileKey, FlaskConical, KeyRound, LogOut, MessageSquareShare, Monitor, Moon, Palette, Plus, RotateCcw, ShieldAlert, ShieldCheck, Sun, TriangleAlert, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState } from 'react'
 import { Appearance, Platform, ScrollView, useWindowDimensions, View, type ScrollViewInstance } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
 import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
 import { addOnManager, eraseSoleManagerText, exitCopy, onlyManagerText, recoveryCopy, securityCopy, soleManager, waitingCopy } from '@vibeface/client/identity/copy.ts'
-import { useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
+import { ChatStorage } from '@/features/settings/chat-storage'
+import { NotificationSettings } from '@/features/settings/notifications'
 import { ErrorText } from '@/components/action'
 import { OfflineBar } from '@/components/connection-pill'
 import { Online, SettingsGroup, SettingsRow } from '@/components/kit'
@@ -52,7 +53,7 @@ export default function Settings() {
     </SettingsGroup></View> : null}
     {/* As on the web: a computer's bots live in its detail above, and a session that waits for you reaches you here. */}
     {device.ready ? <SettingsGroup title={waitingCopy.title}>
-      <Notifications />
+      <NotificationSettings />
       {manager ? <SettingsRow href="/external-chat" icon={MessageSquareShare} label={waitingCopy.forward} /> : null}
     </SettingsGroup> : null}
     {manager ? <SecurityStatus toDevices={() => scroll.current?.scrollTo({ y: Math.max(0, devicesAt.current - 16), animated: true })} /> : null}
@@ -65,6 +66,7 @@ export default function Settings() {
         </View>
       </SettingsRow>
     </SettingsGroup>
+    <ChatStorage />
     <SettingsGroup title="高级">
       <SettingsRow href="/lab" icon={FlaskConical} label="实验室" />
     </SettingsGroup>
@@ -134,16 +136,6 @@ function SecurityStatus({ toDevices }: { toDevices(): void }) {
       {recoverySince ? <Text className="text-sm text-muted" style={tabular}>{securityCopy.changedOn(recoverySince)}</Text> : null}
     </SettingsRow>
   </SettingsGroup>
-}
-
-/** Rendered only while connected: the shared workspace exists exactly then. */
-function Notifications() {
-  const shared = useShared()
-  const { busy, error, run } = useRun()
-  const button = shared.notificationButton
-  return <SettingsRow icon={BellRing} label={button.label} disabled={button.disabled || busy !== null} onPress={() => void run('notify', shared.enableNotifications)}>
-    {error ? <View className="basis-full ps-11"><ErrorText error={error} /></View> : null}
-  </SettingsRow>
 }
 
 function MemberRow({ member }: { member: Member }) {

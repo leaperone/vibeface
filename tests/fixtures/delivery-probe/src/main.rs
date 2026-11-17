@@ -297,6 +297,7 @@ fn mesh_checks() -> Result<Value> {
         "crates/protocol/src/lib.rs":hex::encode(Sha256::digest(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../crates/protocol/src/lib.rs")))),
         "crates/protocol/src/amount.rs":hex::encode(Sha256::digest(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../crates/protocol/src/amount.rs")))),
         "crates/protocol/src/history.rs":hex::encode(Sha256::digest(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../crates/protocol/src/history.rs")))),
+        "crates/protocol/src/message_search.rs":hex::encode(Sha256::digest(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../crates/protocol/src/message_search.rs")))),
         "crates/protocol/src/workspace.rs":hex::encode(Sha256::digest(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../crates/protocol/src/workspace.rs"))))
         }}),
     )

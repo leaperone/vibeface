@@ -5,6 +5,8 @@ import { record } from '@vibeface/client/lib/node.ts'
 const recovery = new Directory(Paths.document, 'recovery')
 const selections = new Directory(Paths.cache, 'vibeface-selections')
 const transfers = new Directory(Paths.document, 'transfers')
+const drafts = new Directory(Paths.document, 'chat-drafts')
+const attachments = new Directory(Paths.document, 'chat-attachments')
 const index = createMMKV({ id: 'vibeface-private-files' })
 const cachePrefix = `${Paths.cache.uri.replace(/\/$/, '')}/`
 const selectionPrefix = `${selections.uri.replace(/\/$/, '')}/`
@@ -165,11 +167,18 @@ async function erase(clear: () => Promise<void>) {
       if (uri) releasePicker(uri)
     }
     for (const item of Paths.document.list()) if (item instanceof File && rootRecoveryCopy(item)) item.delete()
-    for (const directory of [recovery, transfers, selections]) if (directory.exists) directory.delete()
+    for (const directory of [recovery, transfers, selections, drafts, attachments]) if (directory.exists) directory.delete()
     index.clearAll()
     await clear()
   } finally { erasing = false }
 }
 
+const draftStorage = {
+  get: (key: string) => index.getString(`draft:${key}`),
+  set(key: string, value: string) { available(); index.set(`draft:${key}`, value) },
+  remove(key: string) { available(); index.remove(`draft:${key}`) },
+  all: () => index.getAllKeys().filter(key => key.startsWith('draft:')).map(key => index.getString(key) ?? ''),
+}
+
 function lease() { const version = epoch; return () => !erasing && version === epoch }
-export const privateFiles = { run, lease, retain, ownedFile, release, releasePicker, recoveryStorage, erase, recovery, transfers }
+export const privateFiles = { draftStorage, drafts, attachments, run, lease, retain, ownedFile, release, releasePicker, recoveryStorage, erase, recovery, transfers }

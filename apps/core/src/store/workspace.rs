@@ -11,6 +11,8 @@ use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod history_pages;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Graph {
     channels: BTreeMap<String, Channel>,
@@ -3574,13 +3576,12 @@ impl Store {
             coverage: WorkspaceCoverage { limit, truncated },
         })
     }
-    pub fn workspace_history(
+    fn workspace_history_events(
         &self,
         network: &str,
         channel_id: Option<&str>,
         task_id: Option<&str>,
-        limit: usize,
-    ) -> Result<(Vec<WorkspaceHistoryItem>, bool)> {
+    ) -> Result<Vec<(String, WorkspaceHistoryItem)>> {
         let graph = Graph::read(&self.connection, network)?;
         if let Some(channel_id) = channel_id {
             graph.channel(channel_id)?;
@@ -3598,20 +3599,28 @@ impl Store {
                     && channel_id.is_none_or(|wanted| task.channel_id.as_deref() == Some(wanted))
             })
         };
-        let mut statement=self.connection.prepare("SELECT hash,envelope FROM events WHERE network_id=? AND effective=1 AND kind IN ('workspace_commanded','input_posted','message_posted','work_dispatched','work_progress','work_finished') ORDER BY lamport,created_at_ms,hash")?;
+        let mut statement=self.connection.prepare("SELECT hash,envelope,lamport FROM events WHERE network_id=? AND effective=1 AND kind IN ('workspace_commanded','input_posted','message_posted','work_dispatched','work_progress','work_finished') ORDER BY lamport,created_at_ms,hash")?;
         let rows = statement.query_map([network], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u64>(2)?,
+            ))
         })?;
         let mut all = Vec::new();
         for row in rows {
-            let (hash, envelope) = row?;
+            let (hash, envelope, lamport) = row?;
             let envelope: SignedEvent = serde_json::from_str(&envelope)?;
             let event: Event = serde_json::from_str(&envelope.canonical_body)?;
-            all.push((hash, event));
+            all.push((
+                super::rank(lamport, event.created_at_ms, &hash),
+                hash,
+                event,
+            ));
         }
         let input_ids: BTreeSet<_> = all
             .iter()
-            .filter_map(|(_, event)| match &event.body {
+            .filter_map(|(_, _, event)| match &event.body {
                 EventBody::InputPosted {
                     message_id, target, ..
                 } if target_task(target).is_some_and(task_matches) => {
@@ -3634,7 +3643,7 @@ impl Store {
             .filter_map(|assignment| assignment.work_id.as_deref())
             .collect();
         let mut events = Vec::new();
-        for (hash, event) in all {
+        for (rank, hash, event) in all {
             let matches = match &event.body {
                 EventBody::InputPosted { target, .. } => {
                     target_task(target).is_some_and(task_matches)
@@ -3696,21 +3705,20 @@ impl Store {
             };
             if matches {
                 let speaker = history_speaker(&self.connection, network, &graph, &event)?;
-                events.push(WorkspaceHistoryItem {
-                    speaker,
-                    event_hash: hash,
-                    created_at_ms: event.created_at_ms,
-                    scope_id: event.scope_id,
-                    kind: event.body.kind().into(),
-                    body: event.body,
-                });
+                events.push((
+                    rank,
+                    WorkspaceHistoryItem {
+                        speaker,
+                        event_hash: hash,
+                        created_at_ms: event.created_at_ms,
+                        scope_id: event.scope_id,
+                        kind: event.body.kind().into(),
+                        body: event.body,
+                    },
+                ));
             }
         }
-        let truncated = events.len() > limit;
-        if truncated {
-            events.drain(..events.len() - limit);
-        }
-        Ok((events, truncated))
+        Ok(events)
     }
 }
 

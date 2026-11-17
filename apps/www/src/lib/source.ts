@@ -17,6 +17,7 @@ export const docs = defineDocs({
       'history-sync.md',
       'install.md',
       'ios.md',
+      'mobile-push.md',
       'privacy-security.md',
       'troubleshooting.md',
       'node.md',

@@ -43,6 +43,7 @@ mod permission_fences;
 pub mod pi;
 mod provider_adapter;
 mod provider_probe;
+mod push;
 mod relay;
 mod reply_directory;
 mod schedule_delivery;
@@ -1029,6 +1030,7 @@ impl Runtime {
                 }
             })?;
         }
+        self.start_push_worker()?;
         self.start_network().await?;
         tracing::info!(
             event = "node.started",
@@ -2016,6 +2018,7 @@ impl Runtime {
             Ok(BusinessCommand::WorkspaceHistory(_)) => {
                 self.workspace_history(&access, input).await
             }
+            Ok(BusinessCommand::MessageSearch(_)) => self.message_search(&access, input).await,
             Ok(BusinessCommand::Message(_)) => self.accept_chat_message(&access, input).await,
             Ok(BusinessCommand::InputReceipt(_)) => self.input_receipt(&access, input).await,
             Ok(BusinessCommand::ScopeContext(_)) => self.scope_context(&access, input).await,
@@ -2056,12 +2059,14 @@ impl Runtime {
                 self.settle_unanswered(&access, input, true).await
             }
             Ok(BusinessCommand::Resolve(_)) => self.resolve_check(&access, input).await,
+            Ok(BusinessCommand::RegisterPush(_)) => self.register_push(&access, input).await,
+            Ok(BusinessCommand::UnregisterPush(_)) => self.unregister_push(&access, input).await,
             Ok(BusinessCommand::Notifications(_)) => {
                 let network = network.to_owned();
                 let client = field(input, "client_id")?.to_owned();
                 let notifications = self
                     .read_display(&access, input, "notifications", move |store| {
-                        store.pending_notifications(&network, &client)
+                        store.display_notifications(&network, &client)
                     })
                     .await?;
                 Ok(json!({"notifications":notifications}))

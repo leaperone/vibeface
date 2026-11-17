@@ -15,7 +15,7 @@ export type Notifier = {
   name: string
   permission(): Promise<Permission>
   request(): Promise<Permission>
-  show(alert: { title: string; body: string; tag: string; destination: NotificationDestination }, open: () => void): void
+  show(alert: { title: string; body: string; tag: string; destination: NotificationDestination }, open: () => void): void | Promise<void>
   /** Retains an opening until the current workspace consumes it. False keeps it for a later connection. */
   watchOpen?(listener: (destination: NotificationDestination) => Promise<boolean>): () => void
   replayOpen?(): void
@@ -59,6 +59,10 @@ export type Platform = {
   notifier: Notifier
   /** Whether this surface has a route for session handoff alerts. */
   sessionNotifications?: boolean
+  /** Persist display-only conversation snapshots and read a selected chat independently of workspace metadata. */
+  conversationCache?: boolean
+  /** Acknowledge chat notifications only after the surface reports the visible message IDs. */
+  explicitMessageRead?: boolean
   /** Calls `listener` each time the app comes back to the foreground. */
   onForeground(listener: () => void): () => void
   foreground(): boolean

@@ -22,6 +22,7 @@ const WORK: &str = r###"{
   "coverage":{"source":"shared_history","complete":false}
 }"###;
 const HISTORY: &str = r###"{
+  "history_authority":"workspace-authority",
   "events":[
     {"event_hash":"event-input","created_at_ms":1,"scope_id":"chat-a","kind":"input_posted",
       "speaker":{"kind":"human","device_id":"client-a"},
@@ -46,6 +47,7 @@ const HISTORY: &str = r###"{
       "speaker":{"kind":"node","device_id":"node-a"},
       "body":{"type":"work_finished","work_id":"work-1","outcome":"completed","result_text":"受控结果。"}}
   ],
+  "next_cursor":"older-page","complete":false,
   "coverage":{"limit":100,"truncated":true,"scope":"channel"}
 }"###;
 
@@ -185,7 +187,7 @@ fn history_rejects_cross_channel_task_conversation_and_work_identity() {
 #[test]
 fn malformed_history_is_an_error_instead_of_a_synced_empty_page() {
     assert!(
-        history(serde_json::json!({"events":[],"coverage":{"limit":100,"scope":"channel"}}))
+        history(serde_json::json!({"history_authority":"workspace-authority","events":[],"next_cursor":null,"complete":true,"coverage":{"limit":100,"scope":"channel"}}))
             .is_err()
     );
     let value: Value = serde_json::from_str(HISTORY).unwrap();
@@ -260,7 +262,7 @@ fn unknown_work_outcomes_remain_unknown_and_never_become_a_completed_result() {
 fn empty_history_is_accepted_only_with_explicit_matching_coverage() {
     let data = history(
         serde_json::from_str(
-            r#"{"events":[],"coverage":{"limit":100,"truncated":false,"scope":"channel"}}"#,
+            r#"{"history_authority":"workspace-authority","events":[],"next_cursor":null,"complete":true,"coverage":{"limit":100,"truncated":false,"scope":"channel"}}"#,
         )
         .unwrap(),
     )
@@ -289,4 +291,26 @@ fn rendered_record_actions_reject_stale_connection_or_network_even_when_record_i
     assert!(!rendered.accepts(8, Some("network-a")));
     assert!(!rendered.accepts(7, Some("network-b")));
     assert!(!rendered.accepts(7, None));
+}
+
+#[test]
+fn workspace_history_requires_consistent_explicit_continuation() {
+    let value: Value = serde_json::from_str(HISTORY).unwrap();
+    let parsed = history(value.clone()).unwrap();
+    assert_eq!(parsed.history_authority, "workspace-authority");
+    assert_eq!(parsed.next_cursor.as_deref(), Some("older-page"));
+    assert!(!parsed.complete);
+    for field in ["history_authority", "complete", "next_cursor"] {
+        let mut invalid = value.clone();
+        invalid.as_object_mut().unwrap().remove(field);
+        assert!(history(invalid).is_err());
+    }
+    for authority in [Value::Null, "".into(), " ".into()] {
+        let mut invalid = value.clone();
+        invalid["history_authority"] = authority;
+        assert!(history(invalid).is_err());
+    }
+    let mut invalid = value;
+    invalid["complete"] = true.into();
+    assert!(history(invalid).is_err());
 }

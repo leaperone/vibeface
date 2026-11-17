@@ -8,7 +8,7 @@ import { PUBLIC_DOCS, PUBLIC_DOC_GROUPS } from './public-docs.ts'
 
 const expectedSlugs = [
   'overview', 'quick-start', 'onboarding', 'user-guide', 'cli', 'comparison',
-  'install', 'ios', 'bot-and-execution', 'history-sync', 'privacy-security',
+  'install', 'ios', 'mobile-push', 'bot-and-execution', 'history-sync', 'privacy-security',
   'node', 'deployment', 'troubleshooting', 'releasing', 'ci',
 ]
 
@@ -22,7 +22,7 @@ function sourceTree(): PageTree.Root {
   }
 }
 
-test('four native collapsible groups retain all 16 exact page URLs once and preserve source nodes', () => {
+test('four native collapsible groups retain all 17 exact page URLs once and preserve source nodes', () => {
   const source = sourceTree()
   const originalPages = [...source.children]
   Object.freeze(source.children)
@@ -31,9 +31,9 @@ test('four native collapsible groups retain all 16 exact page URLs once and pres
   assert.equal(tree.$id, source.$id)
   assert.deepEqual(tree.children.map(node => node.name), ['开始使用', 'Bot 与任务', '设备与安全', '部署与开发'])
   const pages = flattenTree(tree.children)
-  assert.equal(pages.length, 16)
+  assert.equal(pages.length, 17)
   assert.deepEqual(pages.map(page => page.url).sort(), expectedSlugs.map(slug => `/docs/${slug}`).sort())
-  assert.equal(new Set(pages.map(page => page.url)).size, 16)
+  assert.equal(new Set(pages.map(page => page.url)).size, 17)
   assert.deepEqual(source.children, originalPages)
   for (const page of pages) assert.equal(page, originalPages.find(node => node.type === 'page' && node.url === page.url))
   for (const node of tree.children) {

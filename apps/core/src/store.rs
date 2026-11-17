@@ -30,6 +30,7 @@ mod conversation_settings_projection;
 mod history_page_collector;
 mod log;
 pub(crate) mod mailbox;
+mod notification_visibility;
 pub(crate) mod questions;
 mod reduce;
 pub(crate) mod scheduler;

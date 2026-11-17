@@ -9,7 +9,7 @@ import type {
   BotChange, BotChangeRecord, Overwritten, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, OpenWorkCard, WorkCard, SkillSet, SteerOutcome, Busy,
   WorkPhase, WorkDetail, OverviewBot, OverviewNode, OverviewConsistency, OverviewTaskState, OverviewTask, OverviewQuestion, OverviewJob, OverviewCoverage, WorkspaceOverview, OverviewDeliveryState, OverviewRelation, OverviewConversation, OverviewSession,
   AgentLane, QueueHoldReason, ContextProjection, ManagerJob, ScopeJob, SentCoverage, MemoryConflict,
-  InputTarget, InputIntent, InputReceipt, InputNotSaved, InputControlAction, QueuedInput, ScopeContext, SessionScope, WorkspaceChannel, WorkspaceTask, WorkspaceAssignment, WorkspaceCommand, WorkspaceCommandResult, WorkspaceCommandNotSaved, WorkspaceDomainState, WorkspaceHistory, WorkspaceHistoryBody, WorkspaceInputBody, WorkspaceSpeaker,
+  InputTarget, InputIntent, InputReceipt, InputNotSaved, InputControlAction, QueuedInput, ScopeContext, SessionScope, WorkspaceChannel, WorkspaceTask, WorkspaceAssignment, WorkspaceCommand, WorkspaceCommandResult, WorkspaceCommandNotSaved, WorkspaceDomainState, WorkspaceHistory, WorkspaceHistoryBody, WorkspaceInputBody, WorkspaceSpeaker, MessageSearchScope, MessageSearchPage,
 } from "./types.ts"
 import { parseMemoryEntry, parseMemorySyncConflict, parseMemorySyncConflicts } from "./memory.ts"
 import { answerId, questionOpen } from "./questions.ts"
@@ -257,14 +257,62 @@ function workspaceHistoryBody(value: unknown): WorkspaceHistoryBody {
     default: throw new Error('历史记录的类型无法识别。')
   }
 }
+function historyContinuation(data: Record<string, unknown>): { next_cursor: string | null; complete: boolean } {
+  const complete = flag(data.complete)
+  const next = data.next_cursor
+  if (next !== null && (typeof next !== 'string' || !next.length || next.length > 8192)) throw new Error('历史游标格式错误。')
+  if (complete !== (next === null)) throw new Error('历史分页覆盖信息不一致。')
+  return { next_cursor: next, complete }
+}
+function boundedLimit(value: unknown, max: number): number {
+  const limit = number(value)
+  if (limit < 1 || limit > max) throw new Error('历史分页条数超出范围。')
+  return limit
+}
 export function parseWorkspaceHistory(value: unknown): WorkspaceHistory {
   const data = record(value), coverage = record(data.coverage), scope = coverage.scope
   if (scope !== 'task' && scope !== 'channel' && scope !== 'workspace') throw new Error('历史记录的范围无法识别。')
-  return { events: list(data.events).map((value) => {
+  const history_authority = text(data.history_authority)
+  if (!history_authority.trim()) throw new Error('历史记录缺少有效的 authority。')
+  const continuation = historyContinuation(data), limit = boundedLimit(coverage.limit, 512), truncated = flag(coverage.truncated)
+  if (truncated === continuation.complete) throw new Error('历史分页覆盖信息不一致。')
+  const events = list(data.events).map((value) => {
     const item = record(value), body = workspaceHistoryBody(item.body)
     if (item.kind !== body.type) throw new Error('历史记录的类型与内容不一致。')
     return { event_hash: text(item.event_hash), created_at_ms: number(item.created_at_ms), scope_id: text(item.scope_id), kind: body.type, body, speaker: workspaceSpeaker(item.speaker) }
-  }), coverage: { limit: number(coverage.limit), truncated: flag(coverage.truncated), scope } }
+  })
+  if (events.length > limit || new Set(events.map((item) => item.event_hash)).size !== events.length) throw new Error('历史记录重复或超过分页范围。')
+  return { history_authority, events, ...continuation, coverage: { limit, truncated, scope } }
+}
+function searchScope(value: unknown): MessageSearchScope {
+  const data = record(value)
+  const id = (field: string) => {
+    const value = text(data[field])
+    if (!/^[A-Za-z0-9_.-]{1,128}$/.test(value) || Object.keys(data).some((key) => key !== 'kind' && key !== field)) throw new Error('搜索范围格式错误。')
+    return value
+  }
+  switch (data.kind) {
+    case 'bot_main': return { kind: data.kind, bot_id: id('bot_id') }
+    case 'task': return { kind: data.kind, task_id: id('task_id') }
+    case 'channel': return { kind: data.kind, channel_id: id('channel_id') }
+    default: throw new Error('搜索范围无法识别。')
+  }
+}
+export function parseMessageSearch(value: unknown, expected?: { scope: MessageSearchScope; query: string }): MessageSearchPage {
+  const data = record(value), coverage = record(data.coverage), scope = searchScope(data.scope), query = text(data.query)
+  if (!query.trim() || new TextEncoder().encode(query).length > 1024) throw new Error('搜索文字格式错误。')
+  if (expected && (JSON.stringify(scope) !== JSON.stringify(searchScope(expected.scope)) || query !== expected.query)) throw new Error('搜索结果与请求范围不一致。')
+  if (coverage.source !== 'committed_server_history') throw new Error('搜索结果来源无法识别。')
+  const limit = boundedLimit(coverage.limit, 100), continuation = historyContinuation(data)
+  const items = list(data.items).map((value) => {
+    const item = record(value), event_hash = text(item.event_hash), rank = text(item.rank)
+    if (!/^[a-f0-9]{64}$/.test(event_hash) || !new RegExp('^[0-9]{20}:[0-9]{20}:' + event_hash + '$').test(rank)) throw new Error('搜索消息的稳定位置格式错误。')
+    const messageText = text(item.text), message_id = text(item.message_id), conversation_id = text(item.conversation_id)
+    if (!message_id || !conversation_id || !messageText.toLowerCase().includes(query.toLowerCase())) throw new Error('搜索消息与查询不一致。')
+    return { event_hash, rank, message_id, conversation_id, text: messageText, created_at_ms: number(item.created_at_ms), speaker: workspaceSpeaker(item.speaker) }
+  })
+  if (items.length > limit || items.some((item, index) => index > 0 && items[index - 1].rank >= item.rank) || new Set(items.map((item) => item.event_hash)).size !== items.length) throw new Error('搜索消息重复或顺序错误。')
+  return { scope, query, items, ...continuation, coverage: { source: coverage.source, limit } }
 }
 function workspaceSpeaker(value: unknown): WorkspaceSpeaker {
   const data = record(value)

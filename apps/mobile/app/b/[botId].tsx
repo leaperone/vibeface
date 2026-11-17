@@ -1,10 +1,9 @@
-import { useSelectionOwner } from '@/lib/use-selection-owner'
 import { historySections } from '@vibeface/client/workspace/model.ts'
 import { HistoryControls } from '@/features/chat/history-controls'
 import { Link, Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
-import { ArrowDown, Bot, Crown, LoaderCircle, MessageSquareOff, Settings, Star } from 'lucide-react-native'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { ArrowDown, Bot, Crown, LoaderCircle, MessageSquareOff, Search, Settings, Star } from 'lucide-react-native'
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from 'react'
 import { FlatList, Platform, Pressable, StyleSheet, View, type NativeScrollEvent } from 'react-native'
 import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller'
 import Animated, { useAnimatedStyle, useSharedValue } from 'react-native-reanimated'
@@ -27,16 +26,20 @@ import { Icon } from '@/components/arc/icon'
 import { Text } from '@/components/arc/text'
 import { useWorkspace } from '@/data/context'
 import { useLive } from '@/data/live'
-import type { Attachment, ChatMessage, Conversation } from '@/data/types'
+import type { ChatMessage, Conversation } from '@/data/types'
 import type { Question } from '@vibeface/client/workspace/types.ts'
 import { Composer } from '@/features/chat/composer'
 import { Message } from '@/features/chat/message'
+import { SendPreparation } from '@/features/chat/send-preparation'
+import { useChatDraft } from '@/features/chat/use-chat-draft'
+import { chatDrafts } from '@/platform/native-chat-drafts'
+import { readingPositions } from '@/platform/reading-position'
+import { chatMessageLocation, visibleChatMessageIds, type VisibleChatMessage } from '@/platform/chat-location'
 import { QuestionCard } from '@/features/chat/question-card'
 import { useChatExtras, type Row } from '@/features/chat/work'
 import { RecoveryAlert } from '@/features/recovery/recovery'
 import { useWide } from '@/lib/layout'
 import { fadeIn } from '@/lib/motion'
-import { networkKey, storageOf } from '@vibeface/client/workspace/storage.ts'
 import { mobilePlatform } from '@/platform'
 
 /** One row of the chat: a message, or a question or status line between them. */
@@ -92,7 +95,7 @@ function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>, b
 
 export default function ChatScreen() {
   const router = useRouter()
-  const { botId, routine } = useLocalSearchParams<{ botId: string; routine?: string }>()
+  const { botId, routine, message: targetMessage } = useLocalSearchParams<{ botId: string; routine?: string; message?: string }>()
   const workspace = useWorkspace()
   const device = useDevice()
   const insets = useSafeAreaInsets()
@@ -114,39 +117,16 @@ export default function ChatScreen() {
   const live = useLive()
   const latestWorkspace = useRef(workspace)
   latestWorkspace.current = workspace
-  const draftStorage = storageOf(mobilePlatform.storage)
-  const draftKey = networkKey('bot-drafts', device.ready?.principal.network_id ?? '')
-  const [drafts, setDrafts] = useState<Record<string, { text: string; files: Attachment[] }>>(() => { const stored = draftStorage.readStorage(draftKey, {}); return stored && typeof stored === 'object' && !Array.isArray(stored) ? Object.fromEntries(Object.entries(stored).filter((entry): entry is [string, string] => typeof entry[1] === 'string').map(([id, text]) => [id, { text, files: [] }])) : {} })
   const [selectedTarget, setSelectedTarget] = useState(routine ? `routine:${routine}` : 'main')
+  const draftScope = { networkId: workspace.networkId ?? '', deviceId: workspace.deviceId ?? '', conversationId: id ?? '', inputTarget: selectedTarget }
+  const draftScopeKey = JSON.stringify(draftScope)
+  const draft = useChatDraft(draftScope)
   const [sendError, setSendError] = useState('')
-  const [cleanupError, setCleanupError] = useState('')
+  const [sendingScope, setSendingScope] = useState<string | null>(null)
+  const savingDrafts = useRef(new Set<string>())
+  const currentScope = useRef(draftScopeKey)
+  currentScope.current = draftScopeKey
   useEffect(() => { setSelectedTarget(routine ? `routine:${routine}` : 'main') }, [id, routine])
-  const draft = (id && drafts[id]) || { text: '', files: [] }
-  const draftRef = useRef({ value: draft, target: selectedTarget, conversationId: id })
-  if (draftRef.current.value !== draft || draftRef.current.target !== selectedTarget || draftRef.current.conversationId !== id) draftRef.current = { value: draft, target: selectedTarget, conversationId: id }
-  const savingDrafts = useRef(new Set<typeof draftRef.current>())
-  const draftsRef = useRef(drafts)
-  const selection = useSelectionOwner<Attachment>(device.ready?.principal.network_id, () => {
-    const current = draftsRef.current
-    if (!Object.values(current).some(draft => draft.files.length)) return
-    const updated = Object.fromEntries(Object.entries(current).map(([key, value]) => [key, { ...value, files: [] }]))
-    draftsRef.current = updated
-    setDrafts(updated)
-  }, (cause) => setCleanupError(messageOf(cause)))
-  const commitDrafts = (updated: typeof drafts) => {
-    // Every resident conversation owns its files, including the conversations off screen.
-    if (!selection.current?.replace(Object.values(updated).flatMap(draft => draft.files))) return
-    draftsRef.current = updated
-    setDrafts(updated)
-    draftStorage.writeStorage(draftKey, Object.fromEntries(Object.entries(updated).map(([key, value]) => [key, value.text])))
-  }
-  const setDraft = (next: Partial<typeof draft>) => {
-    if (!id) return
-    const present = draftsRef.current[id] ?? { text: '', files: [] }, changed = { ...present, ...next }
-    if (changed.text === present.text && changed.files === present.files) return
-    commitDrafts({ ...draftsRef.current, [id]: changed })
-    draftRef.current = { ...draftRef.current, value: changed }
-  }
   const routeActive = useRef(false)
   useFocusEffect(useCallback(() => { routeActive.current = true; const close = id ? latestWorkspace.current.actions.open(id) : undefined; return () => { routeActive.current = false; close?.() } }, [id, live?.generation]))
   const extras = useChatExtras(id ?? '', botId)
@@ -175,8 +155,58 @@ export default function ChatScreen() {
   const scrollInset = useRef({ id, top: 0, bottom: 0 })
   if (scrollInset.current.id !== id) scrollInset.current = { id, top: 0, bottom: 0 }
   const [scrollButton, setScrollButton] = useState({ id, visible: false })
+  const away = useRef(false)
+  const positions = useMemo(() => readingPositions(mobilePlatform.storage, { networkId: workspace.networkId ?? '', deviceId: workspace.deviceId ?? '' }), [workspace.networkId, workspace.deviceId])
+  const positionKey = JSON.stringify([workspace.networkId, workspace.deviceId, id, targetMessage])
+  const restoration = useRef<{ key: string; messageId: string | null; done: boolean }>({ key: '', messageId: null, done: false })
+  if (restoration.current.key !== positionKey) {
+    const saved = id ? positions.get(id) : null
+    restoration.current = { key: positionKey, messageId: targetMessage ?? (saved?.kind === 'message' ? saved.messageId : null), done: false }
+  }
+  const rows = chat && bot ? entries(chat, extras, bot, unreachable(device.link)) : []
+  const history = live && live.conversationId === id ? live.data?.history : undefined
+  const [visible, setVisible] = useState<{ id: string; messages: VisibleChatMessage[] }>({ id: '', messages: [] })
+  const knownMessages = new Map(chat?.messages.map((message) => [message.message_id, message.event_hash]) ?? [])
+  const reading = useRef({ id, positions, live, knownMessages })
+  reading.current = { id, positions, live, knownMessages }
+  const viewability = useRef((event: Parameters<NonNullable<ComponentProps<typeof FlatList<Entry>>['onViewableItemsChanged']>>[0]) => {
+    const current = reading.current
+    if (!current.id || !routeActive.current) return
+    const messages = event.viewableItems.filter((token) => token.isViewable && 'message' in token.item).map((token) => token.item).filter((item): item is Extract<Entry, { message: ChatMessage }> => 'message' in item && current.knownMessages.get(item.message.message_id) === item.message.event_hash)
+    const observed = messages.filter((item) => !item.message.state).map((item) => ({ message_id: item.message.message_id, event_hash: item.message.event_hash }))
+    setVisible((previous) => previous.id === current.id && JSON.stringify(previous.messages) === JSON.stringify(observed) ? previous : { id: current.id ?? '', messages: observed })
+    if (!restoration.current.done) return
+    const anchor = messages.at(-1)?.message.message_id
+    current.positions.save(current.id, away.current && anchor ? { kind: 'message', messageId: anchor } : { kind: 'latest' })
+  })
+  useEffect(() => {
+    if (routeActive.current && visible.id === id && live?.view === 'chat' && live.conversationId === id && live.dataOrigin === 'network') void live.markMessagesRead(visibleChatMessageIds(visible.messages, live.data?.messages ?? [])).catch((cause) => { if (routeActive.current && reading.current.id === id) setSendError(messageOf(cause)) })
+  }, [id, visible, live?.view, live?.conversationId, live?.data, live?.notifications, live?.generation])
+  const loadOlder = () => {
+    const current = reading.current
+    if (!routeActive.current || !current.id || current.live?.conversationId !== current.id || current.live.dataOrigin !== 'network' || !current.live.connectionOnline || current.live.historyLoading.has('messages') || current.live.data?.history.messages.complete) return
+    void current.live.loadHistory('messages').catch((cause) => { if (reading.current.id === current.id) setSendError(messageOf(cause)) })
+  }
+  useEffect(() => {
+    if (!id || !rows.length || restoration.current.done) return
+    const target = restoration.current.messageId
+    if (target) {
+      const questionIds = [...chat?.before.values() ?? [], chat?.rest ?? []].flat().map((question) => question.question_id)
+      const location = chatMessageLocation({ messageId: target, messages: chat?.messages ?? [], questionIds })
+      const index = rows.findIndex((row) => location.kind === 'question' ? row.key === `q:${location.questionId}` : 'message' in row && row.message.message_id === location.messageId)
+      if (index >= 0) {
+        restoration.current.done = true
+        away.current = index > 1
+        requestAnimationFrame(() => list.current?.scrollToIndex({ index, viewPosition: 1, animated: false }))
+      } else if (history && !history.messages.complete && live?.dataOrigin === 'network') loadOlder()
+      else if (live?.dataOrigin === 'network' && !live.conversationLoading) restoration.current.done = true
+    } else restoration.current.done = true
+  }, [positionKey, rows.length, live?.data, live?.historyLoading, live?.dataOrigin])
   const toLatest = () => {
     if (scrollInset.current.id !== id) return
+    restoration.current.done = true
+    away.current = false
+    if (id) positions.save(id, { kind: 'latest' })
     setScrollButton({ id, visible: false })
     list.current?.scrollToOffset({ offset: ios ? -scrollInset.current.top : 0, animated: true })
   }
@@ -185,7 +215,7 @@ export default function ChatScreen() {
   const toUnread = (index: number) => { if (scrollInset.current.id === id) list.current?.scrollToIndex({ index, viewPosition: 1, animated: false }) }
   useEffect(() => {
     const index = unreadIndex.current
-    if (index >= 0) requestAnimationFrame(() => toUnread(index))
+    if (index >= 0 && !restoration.current.messageId) requestAnimationFrame(() => toUnread(index))
   }, [id, Boolean(chat?.unread)])
   // The empty state stays centred in the space above the composer instead of riding up with the list.
   const above = useAnimatedStyle(() => ({ paddingBottom: ios
@@ -200,27 +230,28 @@ export default function ChatScreen() {
   const inputTarget = targetOption.target
   const targetBusy = inputTarget.kind === 'routine' ? Boolean(live?.data?.scopeJobs.some((job) => job.trigger === inputTarget.trigger && ['queued', 'steering', 'claimed', 'running'].includes(job.state))) : chat?.replying
   const send = () => {
-    const submittedDraft = draftRef.current
-    if (savingDrafts.current.has(submittedDraft)) return
-    savingDrafts.current.add(submittedDraft)
-    const { text, files } = submittedDraft.value
+    const scope = draftScopeKey
+    if (savingDrafts.current.has(scope)) return
+    savingDrafts.current.add(scope)
+    setSendingScope(scope)
     setSendError('')
     toLatest()
-    const owner = selection.current!
-    const save = () => workspace.actions.send(id, text.trim(), files, { target: targetOption.target, intent: promptIntent(text), conversation_id: id, onSaved: (input) => {
-      if (!live?.isCurrent()) return
-      const current = draftsRef.current, present = current[id]
-      const navigate = routeActive.current && live.isCurrent() && latestLive.current?.conversationId === id && draftRef.current === submittedDraft
-      if (present === submittedDraft.value && !(draftRef.current.conversationId === id && draftRef.current !== submittedDraft)) {
-        commitDrafts({ ...current, [id]: { text: '', files: [] } })
-      }
-      if (navigate && (input.target.kind === 'task' || input.target.kind === 'channel_task')) router.push(`/task/${input.target.task_id}`)
-    } })
-    void (files.length ? owner.use(save) : save()).catch((cause) => { setSendError(messageOf(cause)) }).finally(() => { savingDrafts.current.delete(submittedDraft) })
+    void (async () => {
+      const snapshot = await draft.flush()
+      const lease = chatDrafts.lease(snapshot)
+      try {
+        await workspace.actions.send(id, snapshot.text.trim(), lease.files, { target: targetOption.target, intent: promptIntent(snapshot.text), conversation_id: id, onSaved: (input) => {
+          void draft.clear(snapshot).then((cleared) => {
+            if (cleared && routeActive.current && currentScope.current === scope && live?.isCurrent() && latestLive.current?.conversationId === id && (input.target.kind === 'task' || input.target.kind === 'channel_task')) router.push(`/task/${input.target.task_id}`)
+          }).catch((cause) => { if (currentScope.current === scope) setSendError(messageOf(cause)) })
+        } })
+      } finally { lease.release() }
+    })().catch((cause) => { if (currentScope.current === scope) setSendError(messageOf(cause)) }).finally(() => {
+      savingDrafts.current.delete(scope)
+      setSendingScope((current) => current === scope ? null : current)
+    })
   }
-  const rows = chat ? entries(chat, extras, bot, offline) : []
-  const history = live?.conversationId === id ? live.data?.history : undefined
-  if (history && live && historySections.some((section) => !history[section].complete)) rows.push({ key: 'history-controls', node: <HistoryControls key={`${live.generation}:${id}`} workspace={live} /> })
+  if (history && live && !history.messages.complete) rows.push({ key: 'history-controls', node: <HistoryControls key={`${live.generation}:${id}`} workspace={live} sections={['messages']} /> })
   const setupHint = !offline && rows.length && (reach === 'needs_setup' || reach === 'none' || reach === 'offline') ? composerHint({ hasConversation: true, loaded: Boolean(chat), bot: reach }) : ''
   // 重试 on the newest reply once it failed or was stopped, as on the web.
   const newest = chat?.messages.at(-1)
@@ -242,7 +273,7 @@ export default function ChatScreen() {
   return <View className="flex-1">
     <Stack.Screen options={{
       title: bot.name,
-      headerRight: () => <Link href={`/b/${bot.bot_id}/about`} asChild><Button variant="ghost" iconOnly accessibilityLabel={`${bot.name} 设置`}><Icon as={Settings} className="size-5" /></Button></Link>,
+      headerRight: () => <View className="flex-row"><Link href={{ pathname: '/search', params: { bot: bot.bot_id } }} asChild><Button variant="ghost" iconOnly accessibilityLabel="搜索聊天记录"><Icon as={Search} /></Button></Link><Link href={`/b/${bot.bot_id}/about`} asChild><Button variant="ghost" iconOnly accessibilityLabel={`${bot.name} 设置`}><Icon as={Settings} className="size-5" /></Button></Link></View>,
       // iOS 26 measures the edge blur on the un-inverted list and covers every message once the chat outgrows the screen.
       scrollEdgeEffects: { top: 'hidden', bottom: 'hidden', left: 'hidden', right: 'hidden' },
       headerTransparent: ios,
@@ -259,6 +290,11 @@ export default function ChatScreen() {
       ref={list}
       data={rows}
       inverted
+      onViewableItemsChanged={viewability.current}
+      viewabilityConfig={{ viewAreaCoveragePercentThreshold: 20, minimumViewTime: 600 }}
+      onEndReached={loadOlder}
+      onEndReachedThreshold={0.25}
+      onScrollBeginDrag={() => { restoration.current.done = true }}
       maintainVisibleContentPosition={scrollButton.id === id && scrollButton.visible ? { minIndexForVisible: 0 } : undefined}
       keyExtractor={(row) => row.key}
       onScrollToIndexFailed={({ index, averageItemLength }) => {
@@ -269,6 +305,7 @@ export default function ChatScreen() {
       onScroll={({ nativeEvent }) => {
         if (scrollInset.current.id !== id) return
         const visible = awayFromLatest(nativeEvent, scrollInset.current, ios)
+        away.current = visible
         setScrollButton((current) => current.id === id && current.visible === visible ? current : { id, visible })
       }}
       scrollEventThrottle={16}
@@ -282,7 +319,9 @@ export default function ChatScreen() {
       ListFooterComponent={<View style={{ height: header }} />}
       // Inverted, so the leading item is the lower one: a card caused by the message above it stays close to it.
       ItemSeparatorComponent={({ leadingItem }: { leadingItem: Entry }) => <View className={'grouped' in leadingItem && leadingItem.grouped ? 'h-2' : 'attached' in leadingItem && leadingItem.attached ? 'h-3' : 'h-6'} />}
-      renderItem={({ item }) => 'message' in item ? <Message message={item.message} bot={bot} time={item.time} offline={offline} retry={item.message === newest ? retry : undefined} /> : <>{item.node}</>}
+      renderItem={({ item }) => 'message' in item ? <Message message={item.message} bot={bot} time={item.time} offline={offline} retry={item.message === newest ? retry : undefined}
+        attachmentScope={JSON.stringify([workspace.networkId, workspace.deviceId, id])} readAttachment={live ? (attachment, offset) => live.readArtifactBytes(attachment.hash, offset, id) : undefined}
+        onQuote={(message) => draft.changeText(`${draft.text ? `${draft.text}\n\n` : ''}> ${message.text.replace(/\n/g, '\n> ')}\n\n`)} /> : <>{item.node}</>}
     />
     {rows.length ? null : <Animated.View pointerEvents="box-none" style={[StyleSheet.absoluteFill, { paddingTop: header }, above]}>
       <View pointerEvents="box-none" className="flex-1 items-center justify-center gap-4 px-4">
@@ -293,8 +332,8 @@ export default function ChatScreen() {
             <Icon as={Star} className="size-3.5 fill-muted text-muted" /><Text className="text-sm text-muted">主 Bot</Text>
           </View> : null}
         </View>
-        {botCanSend(reach) ? (!draft.text.trim() ? <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
-          {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} variant="secondary" className="rounded-pill" onPress={() => setDraft({ text: example })}><Text className="text-muted">{example}</Text></Button>)}
+        {!chat ? <View accessibilityLiveRegion="polite" className="items-center gap-2"><Text className="text-center text-muted">{live?.conversationLoading ? '正在读取聊天记录…' : live?.conversationError ? '聊天记录暂时没读到，可以重试。' : offline ? '这段聊天还没有本地副本，连上后即可读取。' : '正在连接聊天记录…'}</Text>{live && !live.conversationLoading ? <Button variant="secondary" onPress={() => void live.refreshConversation().catch((cause) => setSendError(messageOf(cause)))}><Text>重新读取</Text></Button> : null}</View> : botCanSend(reach) ? (!draft.text.trim() ? <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
+          {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} variant="secondary" className="rounded-pill" onPress={() => draft.changeText(example)}><Text className="text-muted">{example}</Text></Button>)}
         </View> : null) : starting ? <View role="status" className="flex-row items-center gap-1.5"><Icon as={LoaderCircle} className="text-muted" /><Text className="text-muted">Bot 正在启动</Text></View> : <>
           <View className="flex-row items-center gap-1.5"><Icon as={MessageSquareOff} className="text-muted" /><Text className="text-muted">Bot 还不能回复</Text></View>
           {reach === 'offline' || canSetUp ? <Link href={setupHref} asChild>
@@ -310,16 +349,21 @@ export default function ChatScreen() {
         {scrollButton.id === id && scrollButton.visible ? <View pointerEvents="box-none" className={ios ? 'absolute -top-13 w-full max-w-3xl self-center items-end px-4' : 'absolute -top-14 w-full max-w-3xl self-center items-end px-4'}>
           <Button variant="secondary" iconOnly className="rounded-pill bg-surface " accessibilityLabel="回到底部" onPress={toLatest}><Icon as={ArrowDown} /></Button>
         </View> : null}
-        <Composer value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })} attachmentScope={JSON.stringify([device.ready?.principal.network_id ?? '', id, inputTargetKey(inputTarget)])}
-          blocked={blocked} sending={false} onSend={send} onStop={(inputTarget.kind === 'bot_main' ? chat?.stoppable : targetBusy) ? () => void live?.stopInputTarget({ target: targetOption.target }).catch((cause) => setSendError(messageOf(cause))) : undefined}
+        <Composer value={draft.text} onChange={draft.changeText} files={draft.files} onFiles={draft.changeFiles} onPickFiles={draft.addFiles} attachmentScope={JSON.stringify([workspace.networkId, id, inputTargetKey(inputTarget)])}
+          blocked={blocked} sending={sendingScope === draftScopeKey} onSend={send} onStop={(inputTarget.kind === 'bot_main' ? chat?.stoppable : targetBusy) ? () => void live?.stopInputTarget({ target: targetOption.target }).catch((cause) => setSendError(messageOf(cause))) : undefined}
           sendLabel={targetBusy ? '补充当前工作' : '发送'}
-        >{offline || setupHint || sendError || cleanupError || inputTarget.kind !== 'bot_main' ? <>
+        >
+        <SendPreparation state={sendingScope === draftScopeKey ? { kind: draft.files.length ? 'preparing' : 'saving' } : null} />
+        {draft.error || draft.missingFiles.length ? <Text accessibilityRole="alert" className="text-sm text-danger">{draft.error || `附件 ${draft.missingFiles.join('、')} 已不可用，请重新选择。`}</Text> : null}
+        {chat?.origin.kind === 'cache' ? <Text className="text-sm text-muted">本地副本 · {new Date(chat.origin.savedAt).toLocaleString()} · {live?.conversationLoading ? '正在同步' : offline ? '离线可读' : '等待同步'}</Text> : null}
+        {live?.conversationError ? <View className="gap-1"><ErrorText error={live.conversationError} /><Button variant="ghost" size="sm" onPress={() => void live.refreshConversation().catch((cause) => setSendError(messageOf(cause)))}><Text>重新读取聊天</Text></Button></View> : null}
+        {offline || setupHint || sendError || inputTarget.kind !== 'bot_main' ? <>
           {offline ? <OfflineBar chat className="self-center" /> : setupHint ? <View role="status" className="flex-row flex-wrap items-center gap-x-2 px-2">
             <Text className="text-sm text-muted">{setupHint}</Text>
             {reach === 'offline' || canSetUp ? <Link href={setupHref} asChild><Button variant="ghost" size="sm"><Text>{reach === 'offline' ? '查看设备' : '去设置'}</Text></Button></Link>
               : <Text className="text-sm text-muted">{setUpOnManager(workspace.members.filter((member) => member.admin).map((member) => member.name))}</Text>}
           </View> : null}
-          {sendError || cleanupError ? <ErrorText error={sendError || cleanupError} /> : null}
+          {sendError ? <ErrorText error={sendError} /> : null}
           {inputTarget.kind !== "bot_main" ? <View className="flex-row items-center gap-2 px-2">
             <Text numberOfLines={1} className="min-w-0 flex-1 text-sm text-muted">{targetBusy ? '补充给' : '发送给'} · {targetOption.label}</Text>
             <Button variant="ghost" size="sm" onPress={() => setSelectedTarget('main')}><Text>改回主聊天</Text></Button>

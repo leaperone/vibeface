@@ -24,6 +24,7 @@ export type ChatMessage = TranscriptMessage & { state?: 'sending' | 'streaming' 
  * `stoppable`: the running reply can be cancelled. `blocked`: why sending is off right now, or null when it is allowed.
  */
 export type Conversation = {
+  origin: { kind: 'cache'; savedAt: number } | { kind: 'network' }
   messages: ChatMessage[]
   /** Questions before the message written after them, and those asked after the last. */
   before: ReadonlyMap<string, Question[]>
@@ -40,13 +41,16 @@ export type Conversation = {
   blocked: string | null
 }
 
-/** A file picked for the next message. */
-export type Attachment = Omit<OwnedPickedFile, 'size'> & { name: string; size: number | null; mimeType: string | null }
+export type Attachment = { uri: string; name: string; size: number | null; mimeType: string | null }
+export type PickedAttachment = Attachment & Omit<OwnedPickedFile, 'size'>
+export type OutgoingAttachment = Pick<PickedAttachment, 'name' | 'arrayBuffer'>
 
 /** `bot`: how the device's bot stands right now, `null` with none; removing it stops that bot. `online`: known for computers only. */
 export type Member = { device_id: string; name: string; kind: 'node' | 'client'; admin: boolean; online: boolean | undefined; current: boolean; entry: boolean; bot: BotReadiness | null }
 
 type WorkspaceSnapshot = {
+  networkId: string | null
+  deviceId: string | null
   session: Session
   connection: Connection
   bots: BotRecord[]
@@ -66,7 +70,7 @@ export type WorkspaceActions = {
   cancelJoin(): void
   /** Loads the chat and keeps it live while on screen; reading it acknowledges its notifications. */
   open(conversationId: string): () => void
-  send(conversationId: string, text: string, attachments: Attachment[], options?: InputOptions): Promise<void>
+  send(conversationId: string, text: string, attachments: readonly OutgoingAttachment[], options?: InputOptions): Promise<void>
   answer(question: Question, text: string): Promise<AnswerResult>
   /** Takes this phone out of the network; coming back takes a join link. */
   leave(): Promise<void>

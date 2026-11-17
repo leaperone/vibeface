@@ -31,7 +31,10 @@ export function moduleLoader(
 
 export function hookHarness(lazyInitialState = false) {
   const values: unknown[] = []
-  const effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
+  const effects = new Map<number, { dependencies?: readonly unknown[]; cleanup?: () => void }>()
+  const memos = new Map<number, { value: unknown; dependencies?: readonly unknown[] }>()
+  const sameDependencies = (previous: readonly unknown[] | undefined, next: readonly unknown[] | undefined) =>
+    previous !== undefined && next !== undefined && previous.length === next.length && next.every((value, index) => Object.is(value, previous[index]))
   const afterRender: (() => void)[] = []
   let cursor = 0
   const react = {
@@ -51,13 +54,26 @@ export function hookHarness(lazyInitialState = false) {
       if (!(index in values)) values[index] = { current: initial }
       return values[index]
     },
-    useEffect(run: () => (() => void) | void, dependencies: unknown[]) {
+    useMemo(read: () => unknown, dependencies?: readonly unknown[]) {
+      const index = cursor++
+      const previous = memos.get(index)
+      if (!previous || !sameDependencies(previous.dependencies, dependencies)) {
+        const value = read()
+        memos.set(index, { value, dependencies: dependencies?.slice() })
+        return value
+      }
+      return previous.value
+    },
+    useCallback(callback: unknown, dependencies?: readonly unknown[]) {
+      return react.useMemo(() => callback, dependencies)
+    },
+    useEffect(run: () => (() => void) | void, dependencies?: readonly unknown[]) {
       const index = cursor++
       const previous = effects.get(index)
-      if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) {
+      if (!previous || !sameDependencies(previous.dependencies, dependencies)) {
         afterRender.push(() => {
           previous?.cleanup?.()
-          effects.set(index, { dependencies, cleanup: run() ?? undefined })
+          effects.set(index, { dependencies: dependencies?.slice(), cleanup: run() ?? undefined })
         })
       }
     },

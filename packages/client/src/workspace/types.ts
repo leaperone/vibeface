@@ -80,7 +80,21 @@ export type WorkspaceHistoryBody =
   | { type: 'work_progress'; work_id: string; phase: WorkPhase; summary: string; thread_id?: string; turn_id?: string }
 export type WorkspaceSpeaker = { kind: 'human'; device_id: string } | { kind: 'bot'; bot_id: string } | { kind: 'node'; device_id: string }
 export type WorkspaceHistoryItem = { event_hash: string; created_at_ms: number; scope_id: string; kind: string; body: WorkspaceHistoryBody; speaker: WorkspaceSpeaker }
-export type WorkspaceHistory = { events: WorkspaceHistoryItem[]; coverage: { limit: number; truncated: boolean; scope: 'task' | 'channel' | 'workspace' } }
+export type WorkspaceHistory = { history_authority: string; events: WorkspaceHistoryItem[]; next_cursor: string | null; complete: boolean; coverage: { limit: number; truncated: boolean; scope: 'task' | 'channel' | 'workspace' } }
+
+export type MessageSearchScope =
+  | { kind: 'bot_main'; bot_id: string }
+  | { kind: 'task'; task_id: string }
+  | { kind: 'channel'; channel_id: string }
+export type MessageSearchItem = {
+  event_hash: string; message_id: string; conversation_id: string; rank: string
+  created_at_ms: number; text: string; speaker: WorkspaceSpeaker
+}
+export type MessageSearchPage = {
+  scope: MessageSearchScope; query: string; items: MessageSearchItem[]
+  next_cursor: string | null; complete: boolean
+  coverage: { source: 'committed_server_history'; limit: number }
+}
 
 export type NodeInfo = {
   device_id: string

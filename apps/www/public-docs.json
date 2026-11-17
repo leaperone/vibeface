@@ -10,7 +10,7 @@
     },
     {
       "title": "设备与安全",
-      "pages": ["install", "ios", "privacy-security", "troubleshooting"]
+      "pages": ["install", "ios", "mobile-push", "privacy-security", "troubleshooting"]
     },
     {
       "title": "部署与开发",

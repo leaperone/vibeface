@@ -699,139 +699,153 @@ impl Runtime {
         let conversation = conversation.to_owned();
         let args = args.clone();
         let identity = self.identity.clone();
-        let (value, written) = self.store.call("agent_tools.workspace", move |store| {
-            let network = access.network_id();
-            let conversation = conversation.as_str();
-            let args = &args;
-            let mut written = None;
-            let value = (|| -> Result<Value> {
-        let job = access.invocation()
-            .map(|manager| {
-                store
-                    .scheduler_job(conversation, manager.trigger())?
-                    .context("this turn is not running here")
-            })
-            .transpose()?;
-        if tool == Tool::WorkspaceCommand {
-            let manager = access.invocation()
-                .context("workspace commands need a current Bot turn")?;
-            let job = job.as_ref().context("this turn is not running here")?;
-            let command: crate::workspace::WorkspaceCommand =
-                serde_json::from_value(args["command"].clone())?;
-            let command_id = format!(
-                "workspace-{}",
-                crate::crypto::digest(&serde_json::to_vec(&(
-                    network,
-                    conversation,
-                    manager.trigger(),
-                    field(args, "call_ref")?
-                ))?)
-            );
-            let receipt = store.workspace_agent_command(
-                &identity,
-                network,
-                job,
-                &command_id,
-                command,
-                now_ms(),
-            )?;
-            written = Some(receipt.event_hash.clone());
-            return Ok(serde_json::to_value(receipt)?);
-        }
-        let own_task = job.as_ref().and_then(|job| match &job.scope {
-            crate::scheduling::SessionScope::WorkspaceTask { task_id } => Some(task_id.as_str()),
-            _ => None,
-        });
-        let task_id = args["task_id"].as_str().or(own_task);
-        let channel_id = args["channel_id"].as_str();
-        let bot = store
-            .bot_for_conversation(network, conversation)?
-            .context("Bot not found")?;
-        if let Some(task_id) = task_id {
-            let task = store
-                .workspace_task(network, task_id)?
-                .context("task not found")?;
-            let root = store
-                .workspace_task(network, &task.root_task_id)?
-                .context("root task not found")?;
-            if let Some(own_id) = own_task {
-                let own = store
-                    .workspace_task(network, own_id)?
-                    .context("task not found")?;
-                ensure!(
-                    own.root_task_id == task.root_task_id,
-                    "task is outside this root"
-                );
-            } else {
-                ensure!(
-                    task.owner_bot == bot.bot_id || root.owner_bot == bot.bot_id,
-                    "task is outside this Bot scope"
-                );
-            }
-            ensure!(
-                channel_id.is_none_or(|channel| task.channel_id.as_deref() == Some(channel)),
-                "channel is outside this task"
-            );
-        }
-        if let Some(channel_id) = channel_id {
-            let state = store.workspace_state(network, Some(channel_id), None, 512)?;
-            ensure!(
-                state
-                    .channels
-                    .iter()
-                    .any(|channel| channel.channel_id == channel_id
-                        && channel.members.contains(&bot.bot_id)),
-                "Bot is outside this channel"
-            );
-        }
-        let limit = args["limit"].as_u64().unwrap_or(100).clamp(1, 512) as usize;
-        if tool == Tool::WorkspaceState {
-            let mut state = store.workspace_state(network, channel_id, task_id, limit)?;
-            if task_id.is_none() && channel_id.is_none() {
-                let root_ids = state
-                    .tasks
-                    .iter()
-                    .filter(|task| task.owner_bot == bot.bot_id)
-                    .map(|task| task.root_task_id.clone())
-                    .collect::<BTreeSet<_>>();
-                state
-                    .tasks
-                    .retain(|task| root_ids.contains(&task.root_task_id));
-                let task_ids = state
-                    .tasks
-                    .iter()
-                    .map(|task| task.task_id.as_str())
-                    .collect::<BTreeSet<_>>();
-                state
-                    .assignments
-                    .retain(|assignment| task_ids.contains(assignment.task_id.as_str()));
-                state
-                    .channels
-                    .retain(|channel| channel.members.contains(&bot.bot_id));
-                state
-                    .inputs
-                    .retain(|input| match &input.input.route.target {
-                        crate::workspace::InputTarget::Task { task_id }
-                        | crate::workspace::InputTarget::ChannelTask { task_id, .. } => {
-                            task_ids.contains(task_id.as_str())
+        let (value, written) = self
+            .store
+            .call("agent_tools.workspace", move |store| {
+                let network = access.network_id();
+                let conversation = conversation.as_str();
+                let args = &args;
+                let mut written = None;
+                let value = (|| -> Result<Value> {
+                    let job = access
+                        .invocation()
+                        .map(|manager| {
+                            store
+                                .scheduler_job(conversation, manager.trigger())?
+                                .context("this turn is not running here")
+                        })
+                        .transpose()?;
+                    if tool == Tool::WorkspaceCommand {
+                        let manager = access
+                            .invocation()
+                            .context("workspace commands need a current Bot turn")?;
+                        let job = job.as_ref().context("this turn is not running here")?;
+                        let command: crate::workspace::WorkspaceCommand =
+                            serde_json::from_value(args["command"].clone())?;
+                        let command_id = format!(
+                            "workspace-{}",
+                            crate::crypto::digest(&serde_json::to_vec(&(
+                                network,
+                                conversation,
+                                manager.trigger(),
+                                field(args, "call_ref")?
+                            ))?)
+                        );
+                        let receipt = store.workspace_agent_command(
+                            &identity,
+                            network,
+                            job,
+                            &command_id,
+                            command,
+                            now_ms(),
+                        )?;
+                        written = Some(receipt.event_hash.clone());
+                        return Ok(serde_json::to_value(receipt)?);
+                    }
+                    let own_task = job.as_ref().and_then(|job| match &job.scope {
+                        crate::scheduling::SessionScope::WorkspaceTask { task_id } => {
+                            Some(task_id.as_str())
                         }
-                        crate::workspace::InputTarget::BotMain { bot_id } => bot_id == &bot.bot_id,
-                        _ => false,
+                        _ => None,
                     });
-            }
-            return Ok(serde_json::to_value(state)?);
-        }
-        ensure!(
-            task_id.is_some() || channel_id.is_some(),
-            "workspace history requires a task or channel"
-        );
-        let (events, truncated) = store.workspace_history(network, channel_id, task_id, limit)?;
-        Ok(
-            json!({"events":events,"coverage":{"limit":limit,"truncated":truncated,"scope":if task_id.is_some(){"task"}else{"channel"}}}),
-        )
+                    let task_id = args["task_id"].as_str().or(own_task);
+                    let channel_id = args["channel_id"].as_str();
+                    let bot = store
+                        .bot_for_conversation(network, conversation)?
+                        .context("Bot not found")?;
+                    if let Some(task_id) = task_id {
+                        let task = store
+                            .workspace_task(network, task_id)?
+                            .context("task not found")?;
+                        let root = store
+                            .workspace_task(network, &task.root_task_id)?
+                            .context("root task not found")?;
+                        if let Some(own_id) = own_task {
+                            let own = store
+                                .workspace_task(network, own_id)?
+                                .context("task not found")?;
+                            ensure!(
+                                own.root_task_id == task.root_task_id,
+                                "task is outside this root"
+                            );
+                        } else {
+                            ensure!(
+                                task.owner_bot == bot.bot_id || root.owner_bot == bot.bot_id,
+                                "task is outside this Bot scope"
+                            );
+                        }
+                        ensure!(
+                            channel_id
+                                .is_none_or(|channel| task.channel_id.as_deref() == Some(channel)),
+                            "channel is outside this task"
+                        );
+                    }
+                    if let Some(channel_id) = channel_id {
+                        let state = store.workspace_state(network, Some(channel_id), None, 512)?;
+                        ensure!(
+                            state
+                                .channels
+                                .iter()
+                                .any(|channel| channel.channel_id == channel_id
+                                    && channel.members.contains(&bot.bot_id)),
+                            "Bot is outside this channel"
+                        );
+                    }
+                    let limit = args["limit"].as_u64().unwrap_or(100).clamp(1, 512) as usize;
+                    if tool == Tool::WorkspaceState {
+                        let mut state =
+                            store.workspace_state(network, channel_id, task_id, limit)?;
+                        if task_id.is_none() && channel_id.is_none() {
+                            let root_ids = state
+                                .tasks
+                                .iter()
+                                .filter(|task| task.owner_bot == bot.bot_id)
+                                .map(|task| task.root_task_id.clone())
+                                .collect::<BTreeSet<_>>();
+                            state
+                                .tasks
+                                .retain(|task| root_ids.contains(&task.root_task_id));
+                            let task_ids = state
+                                .tasks
+                                .iter()
+                                .map(|task| task.task_id.as_str())
+                                .collect::<BTreeSet<_>>();
+                            state.assignments.retain(|assignment| {
+                                task_ids.contains(assignment.task_id.as_str())
+                            });
+                            state
+                                .channels
+                                .retain(|channel| channel.members.contains(&bot.bot_id));
+                            state
+                                .inputs
+                                .retain(|input| match &input.input.route.target {
+                                    crate::workspace::InputTarget::Task { task_id }
+                                    | crate::workspace::InputTarget::ChannelTask {
+                                        task_id, ..
+                                    } => task_ids.contains(task_id.as_str()),
+                                    crate::workspace::InputTarget::BotMain { bot_id } => {
+                                        bot_id == &bot.bot_id
+                                    }
+                                    _ => false,
+                                });
+                        }
+                        return Ok(serde_json::to_value(state)?);
+                    }
+                    ensure!(
+                        task_id.is_some() || channel_id.is_some(),
+                        "workspace history requires a task or channel"
+                    );
+                    Ok(serde_json::to_value(store.workspace_history(
+                        network,
+                        channel_id,
+                        task_id,
+                        args["cursor"].as_str(),
+                        limit,
+                    )?)?)
                 })()?;
-            Ok((value, written))
-        }).await?;
+                Ok((value, written))
+            })
+            .await?;
         if let Some(event_hash) = written {
             self.publish_changed(
                 network,

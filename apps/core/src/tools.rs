@@ -264,8 +264,13 @@ impl Tool {
         };
         let executors = || json!(Provider::executing(|_| true));
         Some(match self {
-            Tool::WorkspaceState | Tool::WorkspaceHistory => (
-                "Read the task graph or signed shared history within this turn's task and channel. A task turn may read its own root and descendants. Native transcripts stay private.",
+            Tool::WorkspaceHistory => (
+                "Read signed shared history within this turn's task or channel, in stable event order. Follow next_cursor with cursor until complete; cursors are bound to the network and exact scope. Native transcripts stay private.",
+                json!({"task_id":string(),"channel_id":string(),"cursor":{"type":"string","minLength":1,"maxLength":8192},"limit":{"type":"integer","minimum":1,"maximum":512}}),
+                &[],
+            ),
+            Tool::WorkspaceState => (
+                "Read the task graph within this turn's task and channel. A task turn may read its own root and descendants. Native transcripts stay private.",
                 json!({"task_id":string(),"channel_id":string(),"limit":{"type":"integer","minimum":1,"maximum":512}}),
                 &[],
             ),
@@ -748,6 +753,8 @@ mod tests {
             json!({"tool":"create_bot","arguments":{"name":"Docs"}}),
             json!({"tool":"create_bot","call_ref":"a","arguments":{"name":"Docs","call_ref":"b"}}),
             json!({"tool":"history_search","arguments":{"limit":0}}),
+            json!({"tool":"workspace_history","arguments":{"task_id":"task","cursor":3}}),
+            json!({"tool":"workspace_history","arguments":{"task_id":"task","cursor":""}}),
             json!({"tool":"history_read","arguments":{"at":{"author":"a","seq":"1"}}}),
             json!({"tool":"history_search","arguments":{"conversation_id":"another-chat"}}),
         ] {
@@ -775,6 +782,11 @@ mod tests {
                 "{error:#}"
             );
         }
+        let (_, args) = Tool::invocation(
+            "workspace_history",
+            json!({"task_id":"task","cursor":"opaque-continuation","limit":2}),
+        )?;
+        assert_eq!(args["cursor"], "opaque-continuation");
         assert!(!Tool::ConfigureBot.catalog_visible(Some(TriggerKind::AgentTask)));
         assert!(Tool::HistoryRead.catalog_visible(Some(TriggerKind::AgentTask)));
         assert!(!Tool::CreateBot.catalog_visible(None));

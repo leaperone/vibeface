@@ -264,7 +264,7 @@ test('workspace reads share the Node read budget and retain correlation when res
   const channel = await app.connect()
   const calls = [
     ['directory', {}], ['write_state', {}],
-    ...['nodes', 'notifications', 'bots', 'questions', 'open_works', 'workspace_overview', 'workspace_state', 'work_detail', 'conversation_history', 'memory_state'].map(method => ['rpc', { method }] as const),
+    ...['nodes', 'notifications', 'bots', 'questions', 'open_works', 'workspace_overview', 'workspace_state', 'work_detail', 'conversation_history', 'memory_state', 'message_search'].map(method => ['rpc', { method }] as const),
   ] as const
   const results = calls.map(([method, params]) => channel.request(method, params))
   const completed = Promise.allSettled(results)
@@ -279,7 +279,7 @@ test('workspace reads share the Node read budget and retain correlation when res
     assert.equal(app.requests.length, 10, 'a refused read also releases its slot')
     for (const id of ['1', '2', '4', '5', '6', '7']) app.reply(id, { request: Number(id) })
     await settle()
-    for (const id of ['12', '10', '9', '11']) app.reply(id, { request: Number(id) })
+    for (const id of ['13', '12', '10', '9', '11']) app.reply(id, { request: Number(id) })
     const settled = await completed
     settled.forEach((result, index) => {
       if (index === 2) {
