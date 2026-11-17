@@ -48,6 +48,30 @@ pub enum Provider {
     Opencode,
 }
 
+impl From<Provider> for vibeface_control::provider::Provider {
+    fn from(provider: Provider) -> Self {
+        match provider {
+            Provider::Codex => Self::Codex,
+            Provider::Cursor => Self::Cursor,
+            Provider::Claude => Self::Claude,
+            Provider::Pi => Self::Pi,
+            Provider::Opencode => Self::Opencode,
+        }
+    }
+}
+
+impl From<vibeface_control::provider::Provider> for Provider {
+    fn from(provider: vibeface_control::provider::Provider) -> Self {
+        match provider {
+            vibeface_control::provider::Provider::Codex => Self::Codex,
+            vibeface_control::provider::Provider::Cursor => Self::Cursor,
+            vibeface_control::provider::Provider::Claude => Self::Claude,
+            vibeface_control::provider::Provider::Pi => Self::Pi,
+            vibeface_control::provider::Provider::Opencode => Self::Opencode,
+        }
+    }
+}
+
 /// The coordination Agent (the bot) or the execution layer that runs dispatched work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]

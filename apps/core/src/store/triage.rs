@@ -2,7 +2,7 @@ use super::{Store, log, message_from, questions};
 use crate::{
     manager::{ManagerError, StartEvidence},
     model::{EventBody, Message, Role},
-    triage::{AgentEvent, AnswerAuthority, HeldAnswerControl, HeldAnswerRequest},
+    triage::{AnswerAuthority, HeldAnswerControl, HeldAnswerRequest, SealedAgentEvent},
 };
 use anyhow::{Context as _, Result, ensure};
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
@@ -25,7 +25,7 @@ struct TriageClaim {
 }
 
 struct StoredTriageEvent {
-    event: AgentEvent,
+    event: SealedAgentEvent,
     claim: Option<TriageClaim>,
     answer: Option<HeldAnswerControl>,
 }
@@ -44,7 +44,8 @@ impl StoredTriageEvent {
             .remove("_answer")
             .map(serde_json::from_value)
             .transpose()?;
-        let event = serde_json::from_value(value).context("invalid stored triage event")?;
+        let event =
+            SealedAgentEvent::restore_stored(value).context("invalid stored triage event")?;
         Ok(Self {
             event,
             claim,
@@ -88,7 +89,7 @@ pub(crate) struct TriageAttempt {
     budget_key: String,
     day: String,
     units: u64,
-    events: Vec<AgentEvent>,
+    events: Vec<SealedAgentEvent>,
     answer: Option<Box<HeldAnswerControl>>,
 }
 
@@ -96,7 +97,7 @@ impl TriageAttempt {
     pub(crate) fn id(&self) -> &str {
         &self.id
     }
-    pub(crate) fn events(&self) -> &[AgentEvent] {
+    pub(crate) fn events(&self) -> &[SealedAgentEvent] {
         &self.events
     }
     pub(crate) fn answer(&self) -> Option<&HeldAnswerControl> {
@@ -142,10 +143,10 @@ fn save(connection: &Connection, row: &StoredTriageEvent) -> Result<()> {
     connection.execute(
         "UPDATE triage_queue SET request_id=?,event=? WHERE ts_ms=? AND event_id=?",
         params![
-            row.event.request_id,
+            row.event.request_id(),
             row.encode()?,
-            row.event.ts_ms.max(0),
-            row.event.event_id
+            row.event.observation().ts_ms.max(0),
+            row.event.event_id()
         ],
     )?;
     Ok(())
@@ -275,35 +276,25 @@ pub(super) fn queue_answer_control_from(
         authority,
     };
     answer_input_from(connection, &control)?;
-    let event_id = format!("answer:{}:{}", control.question_hash, control.answer_hash);
+    let event = SealedAgentEvent::from_answer_control(&control, now);
     let first = connection.execute(
         "INSERT INTO triage_seen(event_id,ts_ms) VALUES(?,?) ON CONFLICT(event_id) DO NOTHING",
-        params![event_id, now],
+        params![event.event_id(), now],
     )?;
     if first == 0 {
         return Ok(false);
     }
     let row = StoredTriageEvent {
-        event: AgentEvent {
-            event_id,
-            node: request.node.clone(),
-            agent: request.provider,
-            event: crate::triage::Kind::NeedsInput,
-            session_id: request.session_id.clone(),
-            turn_id: request.turn_id.clone(),
-            request_id: Some(request.request_id.clone()),
-            ts_ms: now,
-            ..Default::default()
-        },
+        event,
         claim: None,
         answer: Some(control),
     };
     connection.execute(
         "INSERT INTO triage_queue(ts_ms,event_id,request_id,event) VALUES(?,?,?,?)",
         params![
-            row.event.ts_ms,
-            row.event.event_id,
-            row.event.request_id,
+            row.event.observation().ts_ms,
+            row.event.event_id(),
+            row.event.request_id(),
             row.encode()?
         ],
     )?;
@@ -325,7 +316,7 @@ pub(super) fn queue_answer_control_from(
     };
     connection.execute(
         "INSERT INTO triage_handled(event_id,ts_ms,result) VALUES(?,?,?) ON CONFLICT(event_id) DO NOTHING",
-        params![row.event.event_id, now, serde_json::to_string(&serde_json::json!({"control":row.answer,"receipt":receipt}))?],
+        params![row.event.event_id(), now, serde_json::to_string(&serde_json::json!({"control":row.answer,"receipt":receipt}))?],
     )?;
     Ok(true)
 }
@@ -446,7 +437,7 @@ impl Store {
             )?.iter().any(|row| {
                 row.eligible(Some((boot, attempt)))
                     && row.answer.as_ref() == Some(control)
-                    && row.event.request_id.as_deref() == Some(control.request.request_id.as_str())
+                    && row.event.request_id().as_deref() == Some(control.request.request_id.as_str())
             }),
             "answer control claim is no longer live"
         );
@@ -454,13 +445,13 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn queue_triage_event(&mut self, event: AgentEvent, now: i64) -> Result<bool> {
+    pub(crate) fn queue_triage_event(&mut self, event: SealedAgentEvent, now: i64) -> Result<bool> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let first = tx.execute(
             "INSERT INTO triage_seen(event_id,ts_ms) VALUES(?,?) ON CONFLICT(event_id) DO NOTHING",
-            params![event.event_id, now],
+            params![event.event_id(), now],
         )?;
         if first == 0 {
             return Ok(false);
@@ -473,9 +464,9 @@ impl Store {
         tx.execute(
             "INSERT INTO triage_queue(ts_ms,event_id,request_id,event) VALUES(?,?,?,?)",
             params![
-                row.event.ts_ms.max(0),
-                row.event.event_id,
-                row.event.request_id,
+                row.event.observation().ts_ms.max(0),
+                row.event.event_id(),
+                row.event.request_id(),
                 row.encode()?
             ],
         )?;
@@ -483,7 +474,10 @@ impl Store {
         Ok(true)
     }
 
-    pub(crate) fn triage_events(&self, context: Option<(&str, &str)>) -> Result<Vec<AgentEvent>> {
+    pub(crate) fn triage_events(
+        &self,
+        context: Option<(&str, &str)>,
+    ) -> Result<Vec<SealedAgentEvent>> {
         let rows = match context {
             None => queued(
                 &self.connection,
@@ -506,7 +500,7 @@ impl Store {
     pub(crate) fn unknown_triage_events(
         &self,
         active: Option<(&str, &str)>,
-    ) -> Result<Vec<AgentEvent>> {
+    ) -> Result<Vec<SealedAgentEvent>> {
         Ok(queued(
             &self.connection,
             "WHERE json_type(event,'$._triage') IS NOT NULL ORDER BY ts_ms,event_id",
@@ -532,8 +526,7 @@ impl Store {
                     state: ClaimState::Unknown,
                 });
             }
-            row.event.request_id = None;
-            row.event.hold = None;
+            row.event.clear_live_request();
             save(&tx, &row)?;
         }
         tx.commit()?;
@@ -548,12 +541,11 @@ impl Store {
             if reviewed && row.claim.is_none() {
                 tx.execute(
                     "DELETE FROM triage_queue WHERE ts_ms=? AND event_id=?",
-                    params![row.event.ts_ms.max(0), row.event.event_id],
+                    params![row.event.observation().ts_ms.max(0), row.event.event_id()],
                 )?;
                 continue;
             }
-            row.event.request_id = None;
-            row.event.hold = None;
+            row.event.clear_live_request();
             save(&tx, &row)?;
         }
         tx.commit()?;
@@ -567,13 +559,13 @@ impl Store {
         let Some(mut row) = queued(&tx, "WHERE event_id=?", [event])?.into_iter().next() else {
             return Ok(false);
         };
-        if row.event.request_id.as_deref() == Some(request) {
+        if row.event.request_id().as_deref() == Some(request) {
             return Ok(true);
         }
         if row.claim.is_some() {
             return Ok(false);
         }
-        row.event.request_id = Some(request.into());
+        row.event.bind_request(request.into());
         save(&tx, &row)?;
         tx.commit()?;
         Ok(true)
@@ -684,7 +676,7 @@ impl Store {
             if result.is_ok() {
                 tx.execute(
                     "DELETE FROM triage_queue WHERE ts_ms=? AND event_id=?",
-                    params![row.event.ts_ms.max(0), row.event.event_id],
+                    params![row.event.observation().ts_ms.max(0), row.event.event_id()],
                 )?;
             } else {
                 if not_started {
@@ -725,5 +717,126 @@ impl Store {
             inflight_events,
             unknown_events: total - pending_events - inflight_events,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::triage::{AnswerResponse, HookEvent, RequestKind};
+    use serde_json::json;
+
+    #[test]
+    fn stored_answer_identity_and_private_metadata_survive_recovery_without_replay() -> Result<()> {
+        let control = HeldAnswerControl {
+            network: "network".into(),
+            conversation_id: "conversation".into(),
+            question_id: "question".into(),
+            question_hash: "question-hash".into(),
+            answer_id: "answer".into(),
+            answer_hash: "answer-hash".into(),
+            request: HeldAnswerRequest {
+                node: "node".into(),
+                request_id: "captured-request".into(),
+                provider: crate::providers::Provider::Claude,
+                session_id: "session".into(),
+                turn_id: "native-turn".into(),
+                transport: "hook".into(),
+                generation: "generation".into(),
+                permission_epoch: 7,
+                owner_epoch: Some(8),
+                response: AnswerResponse::Unsupported,
+            },
+            authority: AnswerAuthority::Signed,
+        };
+        let event = SealedAgentEvent::from_answer_control(&control, 123);
+        let expected = json!({
+            "schema_version":0,"event_id":"answer:question-hash:answer-hash",
+            "node":"node","host":"","request_id":"captured-request",
+            "source":"hook","agent":"claude","event":"needs_input","status":null,
+            "session_id":"session","turn_id":"native-turn","cwd":"","repo":null,
+            "git_branch":null,"git_head":null,"last_message":"","detail":"",
+            "ts_ms":123,"test":false,"hold":null
+        });
+        assert_eq!(serde_json::to_value(&event)?, expected);
+        let row = StoredTriageEvent {
+            event,
+            claim: Some(TriageClaim {
+                attempt: "attempt".into(),
+                boot: "boot".into(),
+                state: ClaimState::InFlight,
+            }),
+            answer: Some(control.clone()),
+        };
+        let encoded = row.encode()?;
+        let restored = StoredTriageEvent::decode(&encoded)?;
+        assert_eq!(serde_json::to_value(&restored.event)?, expected);
+        assert_eq!(restored.answer.as_ref(), Some(&control));
+        assert!(restored.eligible(Some(("boot", "attempt"))));
+        assert!(serde_json::from_str::<HookEvent>(&encoded).is_err());
+        for field in ["_triage", "_answer"] {
+            let mut invalid: Value = serde_json::from_str(&encoded)?;
+            invalid[field]["unexpected"] = json!(true);
+            assert!(
+                StoredTriageEvent::decode(&invalid.to_string()).is_err(),
+                "{field}"
+            );
+            invalid[field] = Value::Null;
+            assert!(
+                StoredTriageEvent::decode(&invalid.to_string()).is_err(),
+                "null {field}"
+            );
+        }
+        let mut store = Store::open(":memory:")?;
+        store.connection.execute(
+            "INSERT INTO triage_queue(ts_ms,event_id,request_id,event) VALUES(?,?,?,?)",
+            params![123, row.event.event_id(), row.event.request_id(), encoded],
+        )?;
+        let mut ordinary = SealedAgentEvent::seal(
+            HookEvent {
+                session_id: "ordinary".into(),
+                hold: Some(RequestKind::Permission),
+                ..Default::default()
+            },
+            "node",
+            "host",
+            124,
+        )?;
+        ordinary.bind_request("ordinary-request".into());
+        let ordinary_id = ordinary.event_id().clone();
+        assert!(store.queue_triage_event(ordinary, 124)?);
+        for _ in 0..2 {
+            store.recover_triage()?;
+            let raw: String = store.connection.query_row(
+                "SELECT event FROM triage_queue WHERE event_id=?",
+                ["answer:question-hash:answer-hash"],
+                |row| row.get(0),
+            )?;
+            let recovered = StoredTriageEvent::decode(&raw)?;
+            let mut recovered_expected = expected.clone();
+            recovered_expected["request_id"] = Value::Null;
+            assert_eq!(serde_json::to_value(&recovered.event)?, recovered_expected);
+            assert_eq!(recovered.answer.as_ref(), Some(&control));
+            assert_eq!(
+                recovered.claim.as_ref().map(|claim| claim.state),
+                Some(ClaimState::Unknown)
+            );
+            assert!(!recovered.eligible(Some(("boot", "attempt"))));
+            let pending = store.triage_events(None)?;
+            assert_eq!(
+                pending.len(),
+                1,
+                "recovery never reoffers an answer control"
+            );
+            assert_eq!(pending[0].event_id(), &ordinary_id);
+            assert!(pending[0].request_id().is_none() && pending[0].observation().hold.is_none());
+            assert_eq!(store.unknown_triage_events(None)?.len(), 1);
+            let results: i64 =
+                store
+                    .connection
+                    .query_row("SELECT count(*) FROM triage_handled", [], |row| row.get(0))?;
+            assert_eq!(results, 0, "recovery does not claim to have sent an answer");
+        }
+        Ok(())
     }
 }

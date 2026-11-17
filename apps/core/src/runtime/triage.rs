@@ -14,8 +14,8 @@ use crate::{
         triage::{BudgetStatus, TriageAdmission},
     },
     triage::{
-        self, AgentEvent, AnswerAuthority, AnswerResponse, Delivery, HeldAnswerControl,
-        HeldAnswerRequest, HookRequest, OutboxEntry, RequestKind, Severity, TriageConfig,
+        self, AnswerAuthority, AnswerResponse, Delivery, HeldAnswerControl, HeldAnswerRequest,
+        HookEvent, HookRequest, OutboxEntry, RequestKind, SealedAgentEvent, Severity, TriageConfig,
     },
 };
 use anyhow::{Context as _, Result, bail, ensure};
@@ -319,10 +319,7 @@ fn codex_answer_response(method: &str, params: &Value) -> AnswerResponse {
     }
 }
 
-fn hook_answer_response(
-    event: &AgentEvent,
-    schema: Option<&HookRequest>,
-) -> Result<AnswerResponse> {
+fn hook_answer_response(event: &HookEvent, schema: Option<&HookRequest>) -> Result<AnswerResponse> {
     if let Some(schema) = schema {
         ensure!(
             schema.provider == event.agent
@@ -332,7 +329,7 @@ fn hook_answer_response(
             "hook request metadata does not belong to this event"
         );
     }
-    Ok(match (event.agent, event.hold) {
+    Ok(match (Provider::from(event.agent), event.hold) {
         (Provider::Claude, Some(RequestKind::Permission)) => AnswerResponse::Approval {
             allow_once: Some(json!({"behavior":"allow"})),
             deny: json!({"behavior":"deny"}),
@@ -524,13 +521,13 @@ struct DecisionInput {
 
 /// One line of what a session last said. A held request's `detail` tells the coordination Agent
 /// how to answer, so the person never sees it.
-fn summary(event: &AgentEvent) -> String {
-    let detail = if event.hold.is_some() {
+fn summary(event: &SealedAgentEvent) -> String {
+    let detail = if event.observation().hold.is_some() {
         ""
     } else {
-        event.detail.as_str()
+        event.observation().detail.as_str()
     };
-    [event.last_message.as_str(), detail]
+    [event.observation().last_message.as_str(), detail]
         .into_iter()
         .flat_map(|text| text.lines())
         .map(str::trim)
@@ -541,25 +538,27 @@ fn summary(event: &AgentEvent) -> String {
         .collect()
 }
 
-fn subject(event: &AgentEvent, request_id: Option<String>) -> Subject {
+fn subject(event: &SealedAgentEvent, request_id: Option<String>) -> Subject {
     Subject {
-        node: event.node.clone(),
-        agent: Some(event.agent),
-        session_id: event.session_id.clone(),
-        cwd: event.cwd.clone(),
+        node: event.node().clone(),
+        agent: Some(event.provider()),
+        session_id: event.observation().session_id.clone(),
+        cwd: event.observation().cwd.clone(),
         summary: summary(event),
         request_id,
     }
 }
 
-fn shared_event(event: &AgentEvent, roots: &[PathBuf]) -> AgentEvent {
-    crate::logging::add_private_path(Path::new(&event.cwd));
+fn shared_event(event: &SealedAgentEvent, roots: &[PathBuf]) -> SealedAgentEvent {
+    crate::logging::add_private_path(Path::new(&event.observation().cwd));
     let mut shared = event.clone();
-    shared.cwd = roots
+    let cwd = roots
         .iter()
         .enumerate()
         .filter_map(|(index, root)| {
-            let relative = Path::new(&event.cwd).strip_prefix(root).ok()?;
+            let relative = Path::new(&event.observation().cwd)
+                .strip_prefix(root)
+                .ok()?;
             if relative
                 .components()
                 .any(|part| matches!(part, std::path::Component::ParentDir))
@@ -573,12 +572,11 @@ fn shared_event(event: &AgentEvent, roots: &[PathBuf]) -> AgentEvent {
         })
         .max_by_key(|(depth, _)| *depth)
         .map_or_else(|| "workspace".into(), |(_, path)| path);
-    shared.host.clear();
-    shared.repo = None;
-    shared.git_branch = None;
-    shared.git_head = None;
-    shared.last_message = crate::logging::scrub(&event.last_message);
-    shared.detail = crate::logging::scrub(&event.detail);
+    shared.scrub_local_context(
+        cwd,
+        crate::logging::scrub(&event.observation().last_message),
+        crate::logging::scrub(&event.observation().detail),
+    );
     shared
 }
 
@@ -596,17 +594,23 @@ fn from_name<T: DeserializeOwned>(name: String) -> Result<T> {
 /// The bot that owns this device's session. A thread this device's work bound counts at
 /// once: the App Server can ask before the turn's start is recorded. A bot's own reply thread
 /// belongs to its conversation. A deleted bot owns neither, so they go to the primary bot.
-fn owner(store: &crate::store::Store, network: &str, event: &AgentEvent) -> Result<Option<String>> {
-    if let Some(owner) = store.session_owner(network, &event.node, &event.session_id)? {
+fn owner(
+    store: &crate::store::Store,
+    network: &str,
+    event: &SealedAgentEvent,
+) -> Result<Option<String>> {
+    if let Some(owner) =
+        store.session_owner(network, event.node(), &event.observation().session_id)?
+    {
         return Ok(Some(owner));
     }
-    let bound = match store.native_thread_conversation(&event.session_id)? {
+    let bound = match store.native_thread_conversation(&event.observation().session_id)? {
         Some(conversation) => Some(conversation),
         None => store
             .connection
             .query_row(
                 "SELECT conversation_id FROM work_runs WHERE thread_id=? ORDER BY work_id LIMIT 1",
-                [&event.session_id],
+                [&event.observation().session_id],
                 |r| r.get(0),
             )
             .optional()?,
@@ -620,20 +624,20 @@ fn owner(store: &crate::store::Store, network: &str, event: &AgentEvent) -> Resu
 /// A turn this device's coordination Agent or a bot's reply runs: it answers in its own chat,
 /// so its events are not news for the Agent. A request a bot's reply thread holds still goes
 /// to the Agent, the only one who can answer it.
-fn own_turn(store: &crate::store::Store, event: &AgentEvent) -> Result<bool> {
+fn own_turn(store: &crate::store::Store, event: &SealedAgentEvent) -> Result<bool> {
     let coordination = store
         .connection
         .query_row(
             "SELECT 1 FROM coordination_threads WHERE thread_id=?",
-            [&event.session_id],
+            [&event.observation().session_id],
             |_| Ok(()),
         )
         .optional()?
         .is_some();
     Ok(coordination
-        || (event.request_id.is_none()
+        || (event.request_id().is_none()
             && store
-                .native_thread_conversation(&event.session_id)?
+                .native_thread_conversation(&event.observation().session_id)?
                 .is_some()))
 }
 
@@ -658,10 +662,10 @@ fn bot_context(bot: &crate::model::Bot, notes: &[crate::model::MemoryEntry]) -> 
         "memory":kept,"memory_omitted":notes.len() - kept.len()})
 }
 
-fn dequeue(connection: &Connection, event: &AgentEvent) -> Result<()> {
+fn dequeue(connection: &Connection, event: &SealedAgentEvent) -> Result<()> {
     connection.execute(
         "DELETE FROM triage_queue WHERE ts_ms=? AND event_id=?",
-        params![event.ts_ms.max(0), event.event_id],
+        params![event.observation().ts_ms.max(0), event.event_id()],
     )?;
     Ok(())
 }
@@ -710,22 +714,18 @@ impl Runtime {
     /// everything of a session its bot stopped following. A session no bot owns, or whose bot
     /// was deleted, goes to the primary bot first; without a bot its events drop. An event ID
     /// seen before is a duplicate, whichever source sent it first.
-    pub(crate) async fn ingest_agent_event(&self, event: AgentEvent) -> Result<Value> {
+    pub(crate) async fn ingest_agent_event(&self, event: HookEvent) -> Result<Value> {
         self.ingest_hook_event(event, None).await
     }
 
     pub(crate) async fn ingest_hook_event(
         &self,
-        event: AgentEvent,
+        event: HookEvent,
         schema: Option<HookRequest>,
     ) -> Result<Value> {
-        let event = AgentEvent {
-            request_id: None,
-            ..event
-        };
         match event.hold {
             Some(kind) => self.hold_request(event, kind, schema).await,
-            None => self.queue_event(event).await,
+            None => self.queue_event(event, None).await,
         }
     }
 
@@ -735,12 +735,12 @@ impl Runtime {
     /// the decision to the session.
     async fn hold_request(
         &self,
-        event: AgentEvent,
+        event: HookEvent,
         kind: RequestKind,
         schema: Option<HookRequest>,
     ) -> Result<Value> {
         let response = hook_answer_response(&event, schema.as_ref())?;
-        let request_id = AgentEvent::id_for(
+        let request_id = SealedAgentEvent::id_for(
             &self.identity.device_id()?,
             event.agent,
             &event.session_id,
@@ -750,7 +750,7 @@ impl Runtime {
         let now = now_ms();
         let request = HeldRequest {
             request_id: request_id.clone(),
-            provider: event.agent,
+            provider: event.agent.into(),
             session_id: event.session_id.clone(),
             session_turn: event.turn_id.clone(),
             generation: uuid::Uuid::new_v4().simple().to_string(),
@@ -774,15 +774,11 @@ impl Runtime {
             Entry::Occupied(_) => return Ok(json!({"status":"duplicate","event_id":request_id})),
             Entry::Vacant(slot) => slot.insert(request),
         };
-        let queued = self
-            .queue_event(AgentEvent {
-                request_id: Some(request_id.clone()),
-                ..event
-            })
-            .await;
+        let provider = event.agent;
+        let queued = self.queue_event(event, Some(request_id.clone())).await;
         match queued {
             Ok(mut result) if result["status"] == "accepted" && result["test"] != true => {
-                tracing::info!(event = "request.held", request = %request_id, provider = event.agent.name(), ?kind,
+                tracing::info!(event = "request.held", request = %request_id, provider = provider.name(), ?kind,
                     "hook request held");
                 result["request_id"] = json!(request_id);
                 self.triage.wake.notify_one();
@@ -828,20 +824,28 @@ impl Runtime {
         answer.unwrap_or_else(undecided)
     }
 
-    async fn queue_event(&self, event: AgentEvent) -> Result<Value> {
+    async fn queue_event(&self, event: HookEvent, request_id: Option<String>) -> Result<Value> {
         crate::logging::add_private_path(Path::new(&event.cwd));
-        let event = event.seal(&self.identity.device_id()?, config::UNNAMED_NODE, now_ms())?;
-        if event.test {
+        let mut event = SealedAgentEvent::seal(
+            event,
+            &self.identity.device_id()?,
+            config::UNNAMED_NODE,
+            now_ms(),
+        )?;
+        if let Some(request_id) = request_id {
+            event.bind_request(request_id);
+        }
+        if event.observation().test {
             tracing::info!(
                 event = "triage.test_received",
-                event_id = event.event_id,
+                event_id = event.event_id(),
                 "triage test event received"
             );
-            return Ok(json!({"status":"accepted","event_id":event.event_id,"test":true}));
+            return Ok(json!({"status":"accepted","event_id":event.event_id(),"test":true}));
         }
         let network = self.network_id().await?;
         if self.manager().is_none() {
-            return Ok(json!({"status":"dropped","event_id":event.event_id}));
+            return Ok(json!({"status":"dropped","event_id":event.event_id()}));
         }
         let identity = self.identity.clone();
         let roots = self.settings_snapshot().roots;
@@ -852,10 +856,14 @@ impl Runtime {
             .store
             .call("triage.queue_event", move |store| {
                 if own_turn(store, &event)? {
-                    return Ok((json!({"status":"own","event_id":event.event_id}), None));
+                    return Ok((json!({"status":"own","event_id":event.event_id()}), None));
                 }
-                if store.session_muted(&actor_network, &event.node, &event.session_id)? {
-                    return Ok((json!({"status":"muted","event_id":event.event_id}), None));
+                if store.session_muted(
+                    &actor_network,
+                    event.node(),
+                    &event.observation().session_id,
+                )? {
+                    return Ok((json!({"status":"muted","event_id":event.event_id()}), None));
                 }
                 let (scope, claimed) = match owner(store, &actor_network, &event)? {
                     Some(scope) => (Some(scope), None),
@@ -869,9 +877,12 @@ impl Runtime {
                     )?,
                 };
                 let Some(scope) = scope else {
-                    return Ok((json!({"status":"foreign","event_id":event.event_id}), None));
+                    return Ok((
+                        json!({"status":"foreign","event_id":event.event_id()}),
+                        None,
+                    ));
                 };
-                if let Some(id) = &event.request_id {
+                if let Some(id) = event.request_id() {
                     let epoch = store
                         .conversation(&actor_network, &scope)?
                         .map(|conversation| conversation.owner_epoch);
@@ -879,9 +890,13 @@ impl Runtime {
                         request.owner_epoch = epoch;
                     }
                 }
-                let event_id = event.event_id.clone();
-                let (provider, kind, origin) = (event.agent.name(), event.event, event.source);
-                let session = event.session_id.clone();
+                let event_id = event.event_id().clone();
+                let (provider, kind, origin) = (
+                    event.provider().name(),
+                    event.observation().event,
+                    event.observation().source,
+                );
+                let session = event.observation().session_id.clone();
                 let status = if store.queue_triage_event(event, now_ms())? {
                     tracing::info!(
                         event = "triage.queued",
@@ -917,14 +932,14 @@ impl Runtime {
         roots: &[PathBuf],
         threads: &std::sync::Mutex<HashMap<String, ThreadMetadata>>,
         network: &str,
-        event: &AgentEvent,
+        event: &SealedAgentEvent,
     ) -> Result<(Option<String>, Option<String>)> {
         let background = lock(threads)
-            .get(&event.session_id)
+            .get(&event.observation().session_id)
             .and_then(|thread| thread.background);
-        if event.session_id == NO_THREAD
+        if event.observation().session_id == NO_THREAD
             || background == Some(true)
-            || (event.source == triage::Source::AppServer && background.is_none())
+            || (event.observation().source == triage::Source::AppServer && background.is_none())
         {
             return Ok((None, None));
         }
@@ -942,7 +957,7 @@ impl Runtime {
             tracing::info!(
                 event = "session.attributed",
                 conversation_id = primary,
-                thread_id = event.session_id,
+                thread_id = event.observation().session_id,
                 "a session no bot started went to the primary bot"
             );
         }
@@ -1043,18 +1058,17 @@ impl Runtime {
         if cwd.is_empty() {
             cwd = handed.params["cwd"].as_str().unwrap_or_default().to_owned();
         }
-        let event = AgentEvent {
+        let event = HookEvent {
             source: triage::Source::AppServer,
-            agent: Provider::Codex,
+            agent: Provider::Codex.into(),
             event: triage::Kind::NeedsInput,
             session_id,
             turn_id: format!("request:{request_id}"),
             cwd,
             detail: describe(&handed.method, &handed.params),
-            request_id: Some(request_id.clone()),
             ..Default::default()
         };
-        let queued = self.queue_event(event).await;
+        let queued = self.queue_event(event, Some(request_id.clone())).await;
         let waiting = match &queued {
             Ok(result) if result["status"] == "accepted" => true,
             // Its event still waits for the Agent from the earlier connection.
@@ -1761,9 +1775,9 @@ impl Runtime {
                     .as_ref()
                     .map_or("completed", |status| status.as_str());
                 let classification_unknown = entry.background.is_none();
-                let mut event = AgentEvent {
+                let mut event = HookEvent {
                     source: triage::Source::AppServer,
-                    agent: Provider::Codex,
+                    agent: Provider::Codex.into(),
                     event: triage::Kind::TurnEnd,
                     status: Some(status.into()),
                     session_id: thread.clone(),
@@ -1869,7 +1883,7 @@ impl Runtime {
         }
     }
 
-    async fn pending_events(&self) -> Result<Vec<AgentEvent>> {
+    async fn pending_events(&self) -> Result<Vec<SealedAgentEvent>> {
         self.store
             .call("triage.pending_events", |store| store.triage_events(None))
             .await
@@ -1996,7 +2010,7 @@ impl Runtime {
                 let pending = self.pending_events().await?;
                 let mut requests = lock(&self.triage.requests);
                 for event in &pending {
-                    if let Some(id) = &event.request_id
+                    if let Some(id) = event.request_id()
                         && let Some(request) = requests.get_mut(id)
                     {
                         request.fallback_reason = Some("budget_exhausted");
@@ -2035,7 +2049,7 @@ impl Runtime {
         }
         let fresh = attempt.events();
         for event in fresh {
-            if let Some(id) = &event.request_id
+            if let Some(id) = event.request_id()
                 && let Some(request) = lock(&self.triage.requests).get_mut(id)
             {
                 request.fallback_reason = None;
@@ -2160,9 +2174,9 @@ impl Runtime {
         Ok(())
     }
 
-    async fn settle_offered(&self, offered: &[AgentEvent]) -> Result<()> {
+    async fn settle_offered(&self, offered: &[SealedAgentEvent]) -> Result<()> {
         for event in offered {
-            if let Some(request_id) = &event.request_id {
+            if let Some(request_id) = event.request_id() {
                 let unattended = lock(&self.triage.requests)
                     .get(request_id)
                     .is_some_and(|request| request.question_id.is_none());
@@ -2206,7 +2220,7 @@ impl Runtime {
                 .call("triage.unclaimed_events", |store| store.triage_events(None))
                 .await?
                 .iter()
-                .any(|event| event.request_id.as_deref() == Some(request_id)),
+                .any(|event| event.request_id().as_deref() == Some(request_id)),
             "request is not available to this triage attempt"
         );
         self.answer_request(request_id, Some(Ok(result)), "agent")
@@ -2347,7 +2361,7 @@ impl Runtime {
                 requests.retain(|request| {
                     events
                         .iter()
-                        .any(|event| event.request_id.as_deref() == Some(&request.request_id))
+                        .any(|event| event.request_id().as_deref() == Some(&request.request_id))
                 });
             }
             return Ok(json!({"requests":requests}));
@@ -2379,7 +2393,7 @@ impl Runtime {
                         .await?
                 }
                 .iter()
-                .any(|event| event.request_id.as_deref() == Some(request_id)),
+                .any(|event| event.request_id().as_deref() == Some(request_id)),
                 "request is not available to this triage attempt"
             );
             return self
@@ -2401,7 +2415,7 @@ impl Runtime {
                                 .map(|(boot, id)| (boot.as_str(), id.as_str())),
                         )?
                         .into_iter()
-                        .filter(|event| event.ts_ms >= since)
+                        .filter(|event| event.observation().ts_ms >= since)
                         .collect();
                     let unknown = store
                         .unknown_triage_events(active.as_deref().map(|id| (boot.as_str(), id)))?;
@@ -2447,7 +2461,7 @@ impl Runtime {
                 .await?
         }
         .into_iter()
-        .find(|event| event.event_id == event_id)
+        .find(|event| event.event_id().as_str() == event_id.as_str())
         .context("no pending event with this ID")?;
         let result = match action {
             "dismiss" => json!({"event_id":event_id,"dismissed":true}),
@@ -2460,7 +2474,7 @@ impl Runtime {
                 let request_id = input["request_id"].as_str().map(str::to_owned);
                 if let Some(request_id) = &request_id {
                     ensure!(
-                        event.request_id.as_deref() == Some(request_id),
+                        event.request_id().as_deref() == Some(request_id),
                         "request does not belong to this event"
                     );
                     ensure!(
@@ -2501,7 +2515,7 @@ impl Runtime {
                         .collect(),
                 };
                 let question = EventBody::QuestionAsked {
-                    question_id: triage::question_id(&event.node, &event.event_id),
+                    question_id: triage::question_id(event.node(), event.event_id()),
                     target: None,
                     attention: AttentionRequest {
                         kind: match (approval, input["attention_kind"].as_str()) {
@@ -2510,12 +2524,14 @@ impl Runtime {
                             (_, Some("approval")) => AttentionKind::Approval,
                             (_, Some("question")) => AttentionKind::Question,
                             (_, Some(_)) => bail!("unknown attention kind"),
-                            (_, None) if event.hold == Some(RequestKind::Permission) => {
+                            (_, None)
+                                if event.observation().hold == Some(RequestKind::Permission) =>
+                            {
                                 AttentionKind::Approval
                             }
                             (_, None) => AttentionKind::Question,
                         },
-                        device_id: Some(event.node.clone()),
+                        device_id: Some(event.node().clone()),
                     },
                     severity,
                     text: crate::logging::scrub(super::field(&input, "question")?),
@@ -2529,7 +2545,10 @@ impl Runtime {
             }
             _ => bail!("unknown triage action"),
         };
-        let (provider, session) = (event.agent.name(), event.session_id.clone());
+        let (provider, session) = (
+            event.provider().name(),
+            event.observation().session_id.clone(),
+        );
         let handled = event_id.clone();
         let result = self
             .store
@@ -2563,7 +2582,7 @@ impl Runtime {
     async fn raise(
         &self,
         network: &str,
-        event: &AgentEvent,
+        event: &SealedAgentEvent,
         mut question: EventBody,
     ) -> Result<Value> {
         let identity = self.identity.clone();
@@ -2586,33 +2605,34 @@ impl Runtime {
                         (owner.context("no bot owns this session")?, claimed)
                     }
                 };
-                if event.node == identity.device_id()?
+                if event.node().as_str() == identity.device_id()?
                     && let EventBody::QuestionAsked { target, about, .. } = &mut question
                 {
-                    let native_turn = if matches!(&event.source, triage::Source::AppServer)
-                        && event.request_id.is_some()
-                    {
-                        event.request_id.as_deref().and_then(|id| {
-                            lock(&requests)
-                                .get(id)
-                                .filter(|request| {
-                                    request.request_id == id
-                                        && about.request_id.as_deref() == Some(id)
-                                        && request.provider == event.agent
-                                        && request.session_id == event.session_id
-                                        && !request.session_turn.is_empty()
-                                        && matches!(&request.reply, Reply::AppServer { .. })
-                                })
-                                .map(|request| request.session_turn.clone())
-                        })
-                    } else {
-                        Some(event.turn_id.clone())
-                    };
+                    let native_turn =
+                        if matches!(&event.observation().source, triage::Source::AppServer)
+                            && event.request_id().is_some()
+                        {
+                            event.request_id().as_deref().and_then(|id| {
+                                lock(&requests)
+                                    .get(id)
+                                    .filter(|request| {
+                                        request.request_id == id
+                                            && about.request_id.as_deref() == Some(id)
+                                            && request.provider == event.provider()
+                                            && request.session_id == event.observation().session_id
+                                            && !request.session_turn.is_empty()
+                                            && matches!(&request.reply, Reply::AppServer { .. })
+                                    })
+                                    .map(|request| request.session_turn.clone())
+                            })
+                        } else {
+                            Some(event.observation().turn_id.clone())
+                        };
                     *target = if let Some(native_turn) = native_turn {
                         match store.native_input_target(
                             network,
                             &owner,
-                            &event.session_id,
+                            &event.observation().session_id,
                             &native_turn,
                         )? {
                             Some(target) => Some(target),
@@ -2646,15 +2666,15 @@ impl Runtime {
             tracing::info!(
                 event = "question.asked",
                 conversation_id = owner,
-                thread_id = event.session_id,
+                thread_id = event.observation().session_id,
                 question_id,
                 "question asked in the bot chat"
             );
             self.publish_changed(network, &owner, Changed::Event(hash));
-            sent = self.send_question(&asked, &event.cwd).await?;
+            sent = self.send_question(&asked, &event.observation().cwd).await?;
         }
         Ok(
-            json!({"event_id":event.event_id,"question_id":question_id,"conversation_id":owner,
+            json!({"event_id":event.event_id(),"question_id":question_id,"conversation_id":owner,
             "asked":hash.is_some(),"queued_webhook":sent}),
         )
     }
@@ -2873,7 +2893,7 @@ impl Runtime {
                 let path = entry.path();
                 let parsed = std::fs::read(&path)
                     .ok()
-                    .and_then(|bytes| serde_json::from_slice::<AgentEvent>(&bytes).ok());
+                    .and_then(|bytes| serde_json::from_slice::<HookEvent>(&bytes).ok());
                 if let Some(event) = parsed
                     && let Err(error) = self.ingest_agent_event(event).await
                 {
@@ -3553,12 +3573,13 @@ pub(super) mod tests {
             },
         )
         .await?;
+        let event = SealedAgentEvent::seal(turn(thread, "t1", "/w"), &local, "fixture", now_ms())?;
         let thread = thread.to_owned();
         node.store
             .call("triage.test.external_work_target", move |store| {
                 let thread = thread.as_str();
                 ensure!(
-                    !own_turn(store, &turn(thread, "t1", "/w"))?,
+                    !own_turn(store, &event)?,
                     "an external work is not a coordination turn"
                 );
                 ensure!(
@@ -4376,7 +4397,7 @@ pub(super) mod tests {
         .await
     }
 
-    async fn hold_hook_request(node: &Runtime, event: AgentEvent) -> Result<String> {
+    async fn hold_hook_request(node: &Runtime, event: HookEvent) -> Result<String> {
         node.ingest_agent_event(event).await?["request_id"]
             .as_str()
             .context("a held request")
@@ -4404,7 +4425,7 @@ pub(super) mod tests {
 
     async fn hook_reply_or_expiry(
         node: &Arc<Runtime>,
-        event: impl Fn(&str) -> Result<AgentEvent>,
+        event: impl Fn(&str) -> Result<HookEvent>,
         ids: [&str; 2],
         source: (&str, &str),
         reply: Value,
@@ -4432,9 +4453,9 @@ pub(super) mod tests {
         Ok(())
     }
 
-    fn asks_permission(session: &str) -> AgentEvent {
-        AgentEvent {
-            agent: Provider::Claude,
+    fn asks_permission(session: &str) -> HookEvent {
+        HookEvent {
+            agent: Provider::Claude.into(),
             event: triage::Kind::NeedsInput,
             hold: Some(RequestKind::Permission),
             ..turn(session, "t1", "/w")
@@ -4833,23 +4854,23 @@ pub(super) mod tests {
                     json!({"threadId":"t-9","turnId":"u-1","itemId":"source","command":"fixture"}),
                 ))
                 .await;
-                let mut event: AgentEvent = serde_json::from_value(
-                    node.triage_command(json!({"action":"events"})).await?["events"][0].clone(),
-                )?;
-                let id = event.request_id.clone().context("held request")?;
+                let mut stored =
+                    node.triage_command(json!({"action":"events"})).await?["events"][0].clone();
+                let event = SealedAgentEvent::restore_stored(stored.clone())?;
+                let id = event.request_id().clone().context("held request")?;
                 let mut about = subject(&event, Some(id.clone()));
                 {
                     let mut requests = lock(&node.triage.requests);
                     let request = requests.get_mut(&id).context("saved request")?;
                     match case {
-                        "missing-event-request" => event.request_id = None,
+                        "missing-event-request" => stored["request_id"] = Value::Null,
                         "missing-about-request" => about.request_id = None,
                         "wrong-held-id" => request.request_id = "another-request".into(),
-                        "wrong-event-request" => event.request_id = Some("another-request".into()),
+                        "wrong-event-request" => stored["request_id"] = json!("another-request"),
                         "wrong-about-request" => about.request_id = Some("another-request".into()),
                         "provider" => request.provider = Provider::Claude,
                         "thread" => request.session_id = "another-thread".into(),
-                        "node" => event.node = LocalIdentity::generate().device_id()?,
+                        "node" => stored["node"] = json!(LocalIdentity::generate().device_id()?),
                         "missing-turn" => request.session_turn.clear(),
                         "unknown-turn" => request.session_turn = "unknown-turn".into(),
                         "transport" => {
@@ -4859,11 +4880,11 @@ pub(super) mod tests {
                             }
                         }
                         "hook" | "held-hook" => {
-                            event.source = triage::Source::Hook;
-                            event.turn_id = "u-1".into();
+                            stored["source"] = json!("hook");
+                            stored["turn_id"] = json!("u-1");
                             request.session_turn = "not-the-hook-turn".into();
                             if case == "hook" {
-                                event.request_id = None;
+                                stored["request_id"] = Value::Null;
                                 about.request_id = None;
                             } else {
                                 request.reply = Reply::Hook {
@@ -4878,6 +4899,7 @@ pub(super) mod tests {
                         requests.remove(&id);
                     }
                 }
+                let event = SealedAgentEvent::restore_stored(stored)?;
                 let question_id = format!("q-native-source-{case}");
                 let raised = node
                     .raise(
@@ -4888,7 +4910,7 @@ pub(super) mod tests {
                             target: None,
                             attention: AttentionRequest {
                                 kind: AttentionKind::Question,
-                                device_id: Some(event.node.clone()),
+                                device_id: Some(event.node().clone()),
                             },
                             severity: Severity::Attention,
                             text: "fixture source?".into(),
@@ -5898,8 +5920,8 @@ pub(super) mod tests {
         .await
     }
 
-    fn turn(session: &str, turn: &str, cwd: &str) -> AgentEvent {
-        AgentEvent {
+    fn turn(session: &str, turn: &str, cwd: &str) -> HookEvent {
+        HookEvent {
             source: triage::Source::Hook,
             session_id: session.into(),
             turn_id: turn.into(),
@@ -5916,23 +5938,32 @@ pub(super) mod tests {
             std::env::temp_dir().join(format!("vibeface-private-event-{}", uuid::Uuid::new_v4()));
         let private_project = private_root.join("project");
         let private_project_text = private_project.to_string_lossy();
-        let event = AgentEvent {
-            host: "private-host".into(),
-            repo: Some(private_project_text.to_string()),
-            last_message: format!("failed in {private_project_text}/src"),
-            ..turn("session", "turn", &private_project_text)
-        };
+        let event = SealedAgentEvent::seal(
+            HookEvent {
+                repo: Some(private_project_text.to_string()),
+                last_message: format!("failed in {private_project_text}/src"),
+                ..turn("session", "turn", &private_project_text)
+            },
+            "node",
+            "private-host",
+            1,
+        )
+        .unwrap();
         let shared = shared_event(&event, std::slice::from_ref(&private_root));
-        assert_eq!(shared.cwd, "workspace-1/project");
-        assert!(shared.host.is_empty() && shared.repo.is_none());
+        assert_eq!(shared.observation().cwd, "workspace-1/project");
+        assert!(
+            serde_json::to_value(&shared).unwrap()["host"] == ""
+                && shared.observation().repo.is_none()
+        );
         assert!(
             !shared
+                .observation()
                 .last_message
                 .contains(private_root.to_string_lossy().as_ref())
         );
-        assert_eq!(event.cwd, private_project_text);
-        assert_eq!(shared.event_id, event.event_id);
-        assert_eq!(shared_event(&event, &[]).cwd, "workspace");
+        assert_eq!(event.observation().cwd, private_project_text);
+        assert_eq!(shared.event_id(), event.event_id());
+        assert_eq!(shared_event(&event, &[]).observation().cwd, "workspace");
     }
 
     async fn attributions(node: &Runtime, scope: &str) -> Result<usize> {
@@ -6073,7 +6104,7 @@ pub(super) mod tests {
                 let quiet = node.ingest_agent_event(turn("s1", "t4", "/w")).await?;
                 assert_eq!(quiet["status"], "muted");
                 assert!(
-                    node.pending_events().await?.iter().all(|event| event.event_id != quiet["event_id"]),
+                    node.pending_events().await?.iter().all(|event| event.event_id().as_str() != quiet["event_id"]),
                     "a muted session's events drop"
                 );
                 assert_eq!(attributions(&node, "c").await?, 1, "a muted session is not claimed again");
@@ -6444,10 +6475,10 @@ pub(super) mod tests {
                 let queued = tokio::time::timeout(Duration::from_secs(5), async {
                     loop {
                         if unverified && lock(&node.triage.threads).get("metadata-thread").is_some_and(|thread| thread.pending == 0) {
-                            return Ok::<Option<AgentEvent>, anyhow::Error>(None);
+                            return Ok::<Option<SealedAgentEvent>, anyhow::Error>(None);
                         }
                         if case == "background" && lock(&node.triage.threads).get("metadata-thread").is_some_and(|thread| thread.background == Some(true)) {
-                            return Ok::<Option<AgentEvent>, anyhow::Error>(None);
+                            return Ok::<Option<SealedAgentEvent>, anyhow::Error>(None);
                         }
                         if let Some(event) = {
                             node.store.call("triage.test.triage_events", move |store| {
@@ -6469,12 +6500,12 @@ pub(super) mod tests {
                     assert_eq!(node.ingest_agent_event(turn("metadata-thread", "metadata-turn", "/native/project")).await?["status"], "foreign");
                 } else {
                     let queued = queued.context("queued native event")?;
-                    assert_eq!(queued.cwd, match case { "missing-start" => "/native/project", "known" | "pressure" => "/known/project", "unknown-source" => "/native/project", _ => "" });
-                    assert_eq!(queued.session_id, "metadata-thread");
-                    assert_eq!(queued.turn_id, "metadata-turn");
-                    assert_eq!(queued.source, triage::Source::AppServer);
+                    assert_eq!(queued.observation().cwd, match case { "missing-start" => "/native/project", "known" | "pressure" => "/known/project", "unknown-source" => "/native/project", _ => "" });
+                    assert_eq!(queued.observation().session_id, "metadata-thread");
+                    assert_eq!(queued.observation().turn_id, "metadata-turn");
+                    assert_eq!(queued.observation().source, triage::Source::AppServer);
                     if case == "pressure" {
-                        assert_eq!(queued.last_message, "answer awaiting its turn-end");
+                        assert_eq!(queued.observation().last_message, "answer awaiting its turn-end");
                         assert_eq!(lock(&node.triage.threads).get("background-0").and_then(|thread| thread.background), Some(true));
                     }
                     assert_eq!(node.ingest_agent_event(turn("metadata-thread", "metadata-turn", "/native/project")).await?["status"], "duplicate");
@@ -6704,11 +6735,11 @@ pub(super) mod tests {
                 node.pending_events().await?.is_empty(),
                 "a bot's own turn does not wake the Agent"
             );
-            let held = AgentEvent {
-                request_id: Some("r1".into()),
-                ..turn("bot-thread", "request:r1", "/w")
-            };
-            assert_eq!(node.queue_event(held).await?["status"], "accepted");
+            let held = turn("bot-thread", "request:r1", "/w");
+            assert_eq!(
+                node.queue_event(held, Some("r1".into())).await?["status"],
+                "accepted"
+            );
 
             let access = crate::runtime::AgentAccess::ReadOnly {
                 network_id: network.clone(),
@@ -7313,15 +7344,14 @@ pub(super) mod tests {
                 "the last turn of the day runs"
             );
 
-            let mut deferred = turn("s-deferred", "t-deferred", "/tmp");
-            deferred.event_id = AgentEvent::id_for(
+            let deferred = turn("s-deferred", "t-deferred", "/tmp");
+            let deferred_id = SealedAgentEvent::id_for(
                 &node.identity.device_id()?,
                 deferred.agent,
                 &deferred.session_id,
                 &deferred.turn_id,
                 deferred.event,
             );
-            let deferred_id = deferred.event_id.clone();
             node.ingest_agent_event(deferred).await?;
             let held = node.ingest_agent_event(asks_permission("s2")).await?;
             let request_id = held["request_id"]
@@ -7356,7 +7386,7 @@ pub(super) mod tests {
             }.context("seed the independent bot budget")?;
             let pending = node.pending_events().await?;
             assert_eq!(pending.len(), 2, "events were not offered to the model");
-            assert!(pending.iter().any(|event| event.event_id == deferred_id));
+            assert!(pending.iter().any(|event| event.event_id().as_str() == deferred_id));
             let deadline = lock(&node.triage.requests)[&request_id].answer_by_ms;
             node.wake_agent().await?;
             assert_eq!(
@@ -7387,7 +7417,7 @@ pub(super) mod tests {
             assert!(
                 retained
                     .iter()
-                    .all(|event| event.request_id.is_none() && event.hold.is_none())
+                    .all(|event| event.request_id().is_none() && event.observation().hold.is_none())
             );
             {
                 let actor_triage = triage.clone();
@@ -7475,7 +7505,7 @@ pub(super) mod tests {
                     1,
                     "release does not resurrect a removed event"
                 );
-                assert_ne!(pending[0].event_id, event.event_id);
+                assert_ne!(pending[0].event_id(), event.event_id());
                 let TriageAdmission::Claimed(attempt) =
                 store.admit_triage(&network, &boot, 1, 100, now_ms())?
                 else {
@@ -7711,8 +7741,8 @@ pub(super) mod tests {
                 }).await
             }?;
             assert_eq!(retained.len(), 1, "respond keeps its claimed event until the turn is settled");
-            assert_eq!(retained[0].event_id, held["event_id"].as_str().unwrap());
-            assert!(retained[0].request_id.is_none() && retained[0].hold.is_none());
+            assert_eq!(retained[0].event_id(), held["event_id"].as_str().unwrap());
+            assert!(retained[0].request_id().is_none() && retained[0].observation().hold.is_none());
             assert_eq!(unanswered(&node).await?.len(), 1, "the active claim can ask its question");
             *lock(&node.triage.active) = None;
             assert_eq!(node.triage_command(current).await?, raised, "a late repeated action only reads its original result");
@@ -7762,8 +7792,8 @@ pub(super) mod tests {
                 }).await
             }?;
             assert_eq!(unknown_response.len(), 1, "a failed turn retains the already-sent response's claim");
-            assert_eq!(unknown_response[0].event_id, failed_response["event_id"].as_str().unwrap());
-            assert!(unknown_response[0].request_id.is_none() && unknown_response[0].hold.is_none());
+            assert_eq!(unknown_response[0].event_id(), failed_response["event_id"].as_str().unwrap());
+            assert!(unknown_response[0].request_id().is_none() && unknown_response[0].observation().hold.is_none());
             assert_eq!(node.triage_command(response).await?, answered, "the same process only reads its first response result");
             assert_eq!(node.triage_status().await?["budget"]["used"], 2, "a model failure after responding keeps its charge");
 
@@ -7825,7 +7855,7 @@ pub(super) mod tests {
                 }).await
             }?;
             assert_eq!(retained.len(), 1, "a sent response keeps its durable claim before finish");
-            assert!(retained[0].request_id.is_none());
+            assert!(retained[0].request_id().is_none());
             drop(answered_attempt);
             *lock(&node.triage.active) = None;
             for session in ["before-send", "accepted", "action", "unreviewed", "pending"] {
@@ -7872,7 +7902,7 @@ pub(super) mod tests {
                 bail!("action claim");
             };
             *lock(&node.triage.active) = Some(after_action.id().into());
-            let event = after_action.events()[0].event_id.clone();
+            let event = after_action.events()[0].event_id().clone();
             let action = json!({"action":"dismiss","event_id":event,"_attempt":after_action.id()});
             let dismissed = node.triage_command(action.clone()).await?;
             drop(after_action);
@@ -7941,7 +7971,7 @@ pub(super) mod tests {
             with_agent(&reopened);
             let pending = reopened.pending_events().await?;
             assert_eq!(pending.len(), 2);
-            assert!(pending.iter().all(|event| event.request_id.is_none() && event.hold.is_none()));
+            assert!(pending.iter().all(|event| event.request_id().is_none() && event.observation().hold.is_none()));
             assert!(lock(&reopened.triage.requests).is_empty());
             assert!(lock(&reopened.triage.answered).is_empty());
             assert!(reopened.triage_command(json!({"action":"respond","request_id":request,"result":{"behavior":"allow"}})).await.is_err());
@@ -7967,7 +7997,7 @@ pub(super) mod tests {
             let mut forged = serde_json::to_value(&ingress)?;
             forged["_triage"] = json!({"attempt":"forged","boot":"forged","state":"in_flight"});
             assert!(
-                serde_json::from_value::<AgentEvent>(forged).is_err(),
+                serde_json::from_value::<HookEvent>(forged).is_err(),
                 "external ingress cannot supply an internal claim"
             );
             node.ingest_agent_event(ingress).await?;
@@ -7985,7 +8015,7 @@ pub(super) mod tests {
                         |row| row.get(0),
                     )?;
                     assert!(
-                        serde_json::from_str::<AgentEvent>(&raw).is_ok(),
+                        SealedAgentEvent::restore_stored(serde_json::from_str(&raw)?).is_ok(),
                         "Pending is the ordinary final-domain event shape"
                     );
                     let TriageAdmission::Claimed(attempt) =
@@ -8092,7 +8122,7 @@ pub(super) mod tests {
                         bail!("the new event must be admitted despite historical Unknown bodies")
                     };
                     assert_eq!(pending.events().len(), 1);
-                    assert_eq!(pending.events()[0].session_id, "new-pending");
+                    assert_eq!(pending.events()[0].observation().session_id, "new-pending");
                     store.finish_triage(pending, &Ok(()))?;
                     assert!(store.triage_events(None)?.is_empty());
                     Ok::<_, anyhow::Error>(())
@@ -8363,11 +8393,11 @@ pub(super) mod tests {
                 .ingest_agent_event(turn("coord-thread", "coord-turn", "/tmp"))
                 .await?;
             assert_eq!(ended["status"], "own");
-            let held = AgentEvent {
-                request_id: Some("r1".into()),
-                ..turn("coord-thread", "request:r1", "/tmp")
-            };
-            assert_eq!(node.queue_event(held).await?["status"], "own");
+            let held = turn("coord-thread", "request:r1", "/tmp");
+            assert_eq!(
+                node.queue_event(held, Some("r1".into())).await?["status"],
+                "own"
+            );
             assert!(unanswered(&node).await?.is_empty(), "no question about it");
             assert!(node.pending_events().await?.is_empty(), "nothing queued");
             assert_eq!(
@@ -8440,9 +8470,9 @@ pub(super) mod tests {
 
             let first = node.ingest_agent_event(turn("s1", "t1", &format!("{project_text}/app"))).await?;
             assert_eq!(first["status"], "accepted");
-            let scanned = AgentEvent { source: triage::Source::SessionScan, status: Some("completed".into()), ..turn("s1", "t1", &format!("{project_text}/app")) };
+            let scanned = HookEvent { source: triage::Source::SessionScan, status: Some("completed".into()), ..turn("s1", "t1", &format!("{project_text}/app")) };
             assert_eq!(node.ingest_agent_event(scanned).await?["status"], "duplicate");
-            let test = node.ingest_agent_event(AgentEvent { test: true, ..turn("s9", "t9", "/x") }).await?;
+            let test = node.ingest_agent_event(HookEvent { test: true, ..turn("s9", "t9", "/x") }).await?;
             assert_eq!(test["test"], true);
             node.ingest_agent_event(turn("s1", "t2", &format!("{project_text}/app"))).await?;
             node.ingest_agent_event(turn("s2", "t1", elsewhere.to_string_lossy().as_ref())).await?;

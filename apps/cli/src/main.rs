@@ -15,7 +15,7 @@ use std::{
 use vibeface_bridge::{platform::privatefs, transport};
 use vibeface_control::{
     ControlRequest,
-    init::{DEFAULT_LISTEN, DEFAULT_LOCAL_LISTEN, InitOptions, InitProvider},
+    init::{DEFAULT_LISTEN, DEFAULT_LOCAL_LISTEN, InitOptions},
     maintenance::{self, MaintenanceCommand, SecretString, WalletCommand},
     observation,
 };
@@ -273,7 +273,7 @@ impl From<Init> for InitOptions {
             bins: args
                 .bins
                 .into_iter()
-                .map(|(provider, path)| (init_provider(provider), path))
+                .map(|(provider, path)| (provider.into(), path))
                 .collect(),
             codex_socket: args.codex_socket,
             relays: args.relays,
@@ -294,20 +294,10 @@ impl From<Init> for InitOptions {
             no_mesh: args.no_mesh,
             mesh_network: args.mesh_network,
             bootstrap: args.bootstrap,
-            manager: args.manager.map(init_provider),
+            manager: args.manager.map(Into::into),
             workspace: args.workspace,
             model: args.model,
         }
-    }
-}
-
-fn init_provider(provider: triage::Provider) -> InitProvider {
-    match provider {
-        triage::Provider::Codex => InitProvider::Codex,
-        triage::Provider::Cursor => InitProvider::Cursor,
-        triage::Provider::Claude => InitProvider::Claude,
-        triage::Provider::Pi => InitProvider::Pi,
-        triage::Provider::Opencode => InitProvider::Opencode,
     }
 }
 
@@ -1891,7 +1881,7 @@ fn report_tool_failure(
     )
 }
 
-fn hook_event(agent: triage::Provider, input: &Value) -> Option<triage::AgentEvent> {
+fn hook_event(agent: triage::Provider, input: &Value) -> Option<triage::HookEvent> {
     match agent {
         triage::Provider::Codex => {
             let first = input["transcript_path"]
@@ -1931,9 +1921,9 @@ fn hook_event(agent: triage::Provider, input: &Value) -> Option<triage::AgentEve
 async fn hook(options: Hook) -> Result<()> {
     let (mut event, input) = if options.test {
         (
-            triage::AgentEvent {
+            triage::HookEvent {
                 source: triage::Source::Test,
-                agent: options.agent,
+                agent: options.agent.into(),
                 session_id: "test".into(),
                 turn_id: uuid::Uuid::new_v4().to_string(),
                 cwd: std::env::current_dir()?.to_string_lossy().into(),
@@ -1971,8 +1961,13 @@ async fn hook(options: Hook) -> Result<()> {
             triage::Provider::Opencode => input.get("questions"),
             _ => None,
         };
-        body["_request"] = json!({"provider":event.agent,"session_id":event.session_id,
-            "turn_id":event.turn_id,"kind":kind,"questions":questions});
+        body["_request"] = serde_json::to_value(observation::HookRequest {
+            provider: event.agent,
+            session_id: event.session_id.clone(),
+            turn_id: event.turn_id.clone(),
+            kind,
+            questions: questions.cloned(),
+        })?;
     }
     let sent = post_local(&options.local, "/api/hooks", &body, Duration::from_secs(5)).await;
     match sent {
