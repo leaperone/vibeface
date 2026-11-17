@@ -31,6 +31,7 @@ mod history_page_collector;
 mod log;
 pub(crate) mod mailbox;
 mod notification_visibility;
+pub(crate) mod overview;
 pub(crate) mod questions;
 mod reduce;
 pub(crate) mod scheduler;
