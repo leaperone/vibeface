@@ -3,6 +3,19 @@ import type { NotificationRecord } from './types.ts'
 import { networkKey, storageOf } from './storage.ts'
 
 export type NotificationPreferences = { enabled: boolean; sound: boolean; badge: boolean; mutedConversations: string[] }
+const preferenceListeners = new Set<(networkId: string) => void>()
+
+export function watchNotificationPreferences(networkId: string, listener: () => void) {
+  const changed = (updated: string) => { if (updated === networkId) listener() }
+  preferenceListeners.add(changed)
+  return () => { preferenceListeners.delete(changed) }
+}
+
+export function notificationBadgeCount(unread: Readonly<Record<string, number>>, preferences: NotificationPreferences): number {
+  if (!preferences.enabled || !preferences.badge) return 0
+  const muted = new Set(preferences.mutedConversations)
+  return Object.entries(unread).reduce((sum, [id, count]) => sum + (muted.has(id) ? 0 : count), 0)
+}
 
 export function notificationPreferences(storage: KeyValue, networkId: string) {
   const { readStorage, writeStorage } = storageOf(storage)
@@ -24,6 +37,7 @@ export function notificationPreferences(storage: KeyValue, networkId: string) {
       if (!networkId) throw new Error('先加入网络，再设置提醒。')
       writeStorage(key, { sound: value.sound, badge: value.badge, mutedConversations: [...new Set(value.mutedConversations)].slice(-200) }, true)
       writeStorage(networkKey('notify', networkId), value.enabled, true)
+      for (const listener of preferenceListeners) listener(networkId)
       return read()
     },
   }

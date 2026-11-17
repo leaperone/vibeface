@@ -25,7 +25,7 @@ import { mergeConversation, mergeWorkspaceState } from "./records.ts"
 import { HistoryRequests, mergeHistoryPage, readConversationHistory } from "./history.ts"
 import { createConversationCache } from "./conversation-cache.ts"
 import { ConversationReadOwner, markVisibleMessagesRead, readConversationSnapshot } from "./conversation-read.ts"
-import { systemNotifications } from "./system-notifications.ts"
+import { notificationPreferences, systemNotifications } from "./system-notifications.ts"
 import { answerBody, answerId } from "./questions.ts"
 import { memoryController, memoryResultLabel, memorySaved } from "./memory.ts"
 import { networkKey, newId, storageOf } from "./storage.ts"
@@ -786,9 +786,9 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (sequence === workspaceReadSequence.current) showWorkspace(next, filter.channel_id !== undefined || filter.task_id !== undefined)
     return next
   }
-  const readWorkspaceHistory = async (filter: WorkspaceFilter = {}) => {
+  const readWorkspaceHistory = async (filter: WorkspaceFilter = {}, cursor?: string) => {
     requireCurrent()
-    const next = parseWorkspaceHistory(await connection.rpc('workspace_history', filter))
+    const next = parseWorkspaceHistory(await connection.rpc('workspace_history', { ...filter, ...(cursor === undefined ? {} : { cursor }) }))
     requireCurrent()
     const admitted = (pending: PendingMessage) => next.events.some((event) => event.body.type === 'input_posted' && event.body.message_id === pending.message_id && event.scope_id === pending.conversation_id && inputTargetKey(event.body.target) === inputTargetKey(pending.target))
     let cleared = false
@@ -1571,7 +1571,8 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       if (granted === "unsupported") return
       const permission = granted === "granted" ? granted : await notifier.request()
       requireCurrent()
-      writeStorage(networkKey("notify", networkId), permission === "granted")
+      const preferences = notificationPreferences(platform.storage, networkId)
+      preferences.write({ ...preferences.read(), enabled: permission === "granted" })
       if (permission === "granted") { writeStorage(networkKey("seen", networkId), notificationsRef.current.map((item) => item.notification_id)); setNoticeText(`${notifier.name}已开启。已有未读提醒保留在对话列表中。`) }
       await refreshNotificationButton()
     },

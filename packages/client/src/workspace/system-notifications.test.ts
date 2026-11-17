@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { Notifier } from '../lib/platform.ts'
-import { notificationPreferences, systemNotifications } from './system-notifications.ts'
+import { notificationBadgeCount, notificationPreferences, systemNotifications, watchNotificationPreferences } from './system-notifications.ts'
 
 const fixture = () => {
   const values = new Map<string, string>()
@@ -40,4 +40,16 @@ test('an obsolete connection cannot schedule alerts after a permission read', as
   context.notifier.permission = async () => { active = false; return 'granted' }
   await systemNotifications({ ...context, networkId: 'network' }).deliver({ items: [item], current: () => active, visible: () => false, eligible: () => true, show: async () => { attempts++ } })
   assert.equal(attempts, 0)
+})
+
+test('enabling badges or muting a Bot immediately recomputes existing unread counts', () => {
+  const context = fixture(), preferences = notificationPreferences(context.storage, 'network')
+  const unread = { first: 2, second: 5 }, counts: number[] = []
+  const stop = watchNotificationPreferences('network', () => counts.push(notificationBadgeCount(unread, preferences.read())))
+  preferences.write({ enabled: true, sound: false, badge: true, mutedConversations: [] })
+  preferences.write({ ...preferences.read(), mutedConversations: ['second'] })
+  preferences.write({ ...preferences.read(), enabled: false })
+  notificationPreferences(context.storage, 'other').write({ enabled: true, sound: true, badge: true, mutedConversations: [] })
+  stop()
+  assert.deepEqual(counts, [7, 2, 0])
 })

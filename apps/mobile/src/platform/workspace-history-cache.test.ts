@@ -5,7 +5,7 @@ import { createWorkspaceHistoryCache, type WorkspaceHistoryCacheScope } from './
 
 const scope: WorkspaceHistoryCacheScope = { networkId: 'network', deviceId: 'device', target: { kind: 'task', id: 'task' } }
 function fixture(ids: string[], complete = true): WorkspaceHistory {
-  return { events: ids.map(id => ({ event_hash: id, created_at_ms: 1, scope_id: 'conversation', kind: 'message_posted', speaker: { kind: 'human', device_id: 'device' }, body: { type: 'message_posted', message_id: `message-${id}`, role: 'user', text: `你好 ${id}`, attachments: [{ hash: 'a'.repeat(64), name: 'notes.txt', size: 1 }] } })), next_cursor: complete ? null : 'server-cursor', complete, coverage: { limit: 256, truncated: !complete, scope: 'task' } }
+  return { history_authority: 'authority', events: ids.map(id => ({ event_hash: id, created_at_ms: 1, scope_id: 'conversation', kind: 'message_posted', speaker: { kind: 'human', device_id: 'device' }, body: { type: 'message_posted', message_id: `message-${id}`, role: 'user', text: `你好 ${id}`, attachments: [{ hash: 'a'.repeat(64), name: 'notes.txt', size: 1 }] } })), next_cursor: complete ? null : 'server-cursor', complete, coverage: { limit: 256, truncated: !complete, scope: 'task' } }
 }
 function setup(options: { maxBytes?: number; maxScopes?: number; maxEvents?: number } = {}) {
   const records = new Map<string, string>()
@@ -87,4 +87,18 @@ test('merged multi-page windows survive cold reading without losing complete cov
 
 test('invalid cache capacities fail immediately rather than admitting unbounded or non-terminating eviction', () => {
   for (const options of [{ maxScopes: 0 }, { maxEvents: -1 }, { maxBytes: 0 }]) assert.throws(() => setup(options), /容量无效/)
+})
+
+test('storage controls count and clear only the selected network and device', () => {
+  const { cache } = setup()
+  const otherNetwork = { ...scope, networkId: 'other-network' }
+  const otherDevice = { ...scope, deviceId: 'other-device' }
+  for (const current of [scope, otherNetwork, otherDevice]) cache.write(current, input())
+  assert.equal(cache.stats(scope).conversations, 1)
+  assert.ok(cache.stats(scope).bytes > 2)
+  cache.clear(scope)
+  assert.equal(cache.read(scope), null)
+  assert.equal(cache.stats(scope).conversations, 0)
+  assert.ok(cache.read(otherNetwork))
+  assert.ok(cache.read(otherDevice))
 })

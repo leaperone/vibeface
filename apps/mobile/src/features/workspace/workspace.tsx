@@ -30,7 +30,6 @@ import { useChatDraft } from '@/features/chat/use-chat-draft'
 import { chatDrafts } from '@/platform/native-chat-drafts'
 import { privateFiles } from '@/platform/files'
 import { createWorkspaceSendActivity, prependWorkspaceHistory, refreshWorkspaceHistory, workspaceHistoryMatchesMessage } from '@/platform/workspace-history'
-import { readWorkspaceHistoryPage } from '@vibeface/client/workspace/history-search.ts'
 import { Markdown } from '@/features/chat/markdown'
 import { QuestionCard } from '@/features/chat/question-card'
 import { mobilePlatform } from '@/platform'
@@ -347,13 +346,13 @@ function ScopedWorkspaceContent({ taskId, channelId }: { taskId?: string; channe
       if (mode === 'older') {
         const loaded = historyRef.current
         if (!loaded?.next_cursor) return false
-        const page = await readWorkspaceHistoryPage({ connection: ready, filter, cursor: loaded.next_cursor })
+        const page = await live.readWorkspaceHistory(filter, loaded.next_cursor)
         result = current() ? prependWorkspaceHistory(loaded, page) : null
       } else {
         metadata = await live.readWorkspaceState(filter)
         if (!current()) return false
         const first = await live.readWorkspaceHistory(filter)
-        result = await refreshWorkspaceHistory({ current: mode === 'reload' ? null : historyRef.current, first, readOlder: cursor => readWorkspaceHistoryPage({ connection: ready, filter, cursor }), isCurrent: current })
+        result = await refreshWorkspaceHistory({ current: mode === 'reload' ? null : historyRef.current, first, readOlder: cursor => live.readWorkspaceHistory(filter, cursor), isCurrent: current })
       }
       if (!result || !current()) return false
       historyRef.current = result

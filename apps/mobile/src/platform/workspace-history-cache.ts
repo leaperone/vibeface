@@ -27,7 +27,7 @@ export function createWorkspaceHistoryCache({ storage, now = Date.now, maxBytes 
     const botIds: string[] = []
     for (const id of value.botIds) { if (typeof id !== 'string' || !id) return null; botIds.push(id) }
     const pages: WorkspaceHistory[] = value.pages.map(parseWorkspaceHistory)
-    if (pages.some(page => page.coverage.scope !== scope.target.kind)) return null
+    if (pages.some(page => page.coverage.scope !== scope.target.kind || page.history_authority !== pages[0].history_authority)) return null
     const events = pages.flatMap(page => page.events)
     if (events.length > maxEvents || new Set(events.map(event => event.event_hash)).size !== events.length) return null
     return { ...scope, savedAt: value.savedAt, title: value.title, botIds, pages, retainedAll: value.retainedAll }
@@ -79,6 +79,16 @@ export function createWorkspaceHistoryCache({ storage, now = Date.now, maxBytes 
   }
   return {
     read, write,
+    clear(scope: Pick<WorkspaceHistoryCacheScope, 'networkId' | 'deviceId'>) {
+      const records = all().filter(record => record.networkId !== scope.networkId || record.deviceId !== scope.deviceId)
+      const encoded = JSON.stringify(records)
+      storage.setItem(storageKey, encoded)
+      if (storage.getItem(storageKey) !== encoded) throw new Error('本地历史缓存尚未清除，请重试。')
+    },
+    stats(scope: Pick<WorkspaceHistoryCacheScope, 'networkId' | 'deviceId'>) {
+      const records = all().filter(record => record.networkId === scope.networkId && record.deviceId === scope.deviceId)
+      return { conversations: records.length, bytes: bytes(JSON.stringify(records)), maxBytes }
+    },
     all(scope: Pick<WorkspaceHistoryCacheScope, 'networkId' | 'deviceId'>): CachedWorkspaceHistory[] {
       if (!scope.networkId || !scope.deviceId) return []
       return all().filter(record => record.networkId === scope.networkId && record.deviceId === scope.deviceId).map(display)

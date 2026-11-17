@@ -8,6 +8,7 @@ import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { messageOf } from '@vibeface/client/lib/node.ts'
 import { useWorkspace } from '@/data/context'
 import { localConversations } from '@/data/cached'
+import { localWorkspaceHistory } from '@/platform/native-workspace-history-cache'
 import { Button } from '@/components/arc/button'
 import { Icon } from '@/components/arc/icon'
 import { Input } from '@/components/arc/input'
@@ -37,7 +38,9 @@ export default function MessageSearch() {
     const snapshot = localConversations.read({ networkId: workspace.networkId, deviceId: workspace.deviceId, conversationId: bot.conversation_id })
     return (snapshot?.payload.messages ?? []).map((message): Hit => ({ event_hash: message.event_hash, message_id: message.message_id, conversation_id: bot.conversation_id, created_at_ms: message.created_at_ms, text: message.text, rank: message.rank ?? '', source: 'local' }))
   }, [scopeKey])
-  const localMatches = term ? local.filter((message) => message.text.toLocaleLowerCase().includes(term.toLocaleLowerCase())) : []
+  const localMatches: Hit[] = scope && scope.kind !== 'bot_main' && workspace.networkId && workspace.deviceId
+    ? localWorkspaceHistory.search({ networkId: workspace.networkId, deviceId: workspace.deviceId, target: { kind: scope.kind, id: scope.kind === 'task' ? scope.task_id : scope.channel_id } }, term).map((item) => ({ ...item, rank: '', source: 'local' }))
+    : term ? local.filter((message) => message.text.toLocaleLowerCase().includes(term.toLocaleLowerCase())) : []
   const visible = state.key === key ? state : { key, items: [], cursor: null, complete: false, kind: 'idle' as const }
 
   const read = async (cursor?: string) => {

@@ -34,6 +34,7 @@ import { SendPreparation } from '@/features/chat/send-preparation'
 import { useChatDraft } from '@/features/chat/use-chat-draft'
 import { chatDrafts } from '@/platform/native-chat-drafts'
 import { readingPositions } from '@/platform/reading-position'
+import { chatMessageLocation } from '@/platform/chat-location'
 import { QuestionCard } from '@/features/chat/question-card'
 import { useChatExtras, type Row } from '@/features/chat/work'
 import { RecoveryAlert } from '@/features/recovery/recovery'
@@ -165,12 +166,13 @@ export default function ChatScreen() {
   const rows = chat && bot ? entries(chat, extras, bot, unreachable(device.link)) : []
   const history = live && live.conversationId === id ? live.data?.history : undefined
   const [visible, setVisible] = useState<{ id: string; messages: string[] }>({ id: '', messages: [] })
-  const reading = useRef({ id, positions, live })
-  reading.current = { id, positions, live }
+  const knownMessages = new Map(chat?.messages.map((message) => [message.message_id, message.event_hash]) ?? [])
+  const reading = useRef({ id, positions, live, knownMessages })
+  reading.current = { id, positions, live, knownMessages }
   const viewability = useRef((event: Parameters<NonNullable<ComponentProps<typeof FlatList<Entry>>['onViewableItemsChanged']>>[0]) => {
     const current = reading.current
     if (!current.id || !routeActive.current) return
-    const messages = event.viewableItems.filter((token) => token.isViewable && 'message' in token.item).map((token) => token.item).filter((item): item is Extract<Entry, { message: ChatMessage }> => 'message' in item)
+    const messages = event.viewableItems.filter((token) => token.isViewable && 'message' in token.item).map((token) => token.item).filter((item): item is Extract<Entry, { message: ChatMessage }> => 'message' in item && current.knownMessages.get(item.message.message_id) === item.message.event_hash)
     const ids = messages.filter((item) => !item.message.state).map((item) => item.message.message_id)
     setVisible((previous) => previous.id === current.id && previous.messages.join('\0') === ids.join('\0') ? previous : { id: current.id ?? '', messages: ids })
     if (!restoration.current.done) return
@@ -178,8 +180,8 @@ export default function ChatScreen() {
     current.positions.save(current.id, away.current && anchor ? { kind: 'message', messageId: anchor } : { kind: 'latest' })
   })
   useEffect(() => {
-    if (visible.id === id && live?.view === 'chat' && live.dataOrigin === 'network') void live.markMessagesRead(visible.messages).catch((cause) => { if (reading.current.id === id) setSendError(messageOf(cause)) })
-  }, [id, visible, live?.view, live?.data, live?.notifications, live?.generation])
+    if (routeActive.current && visible.id === id && live?.view === 'chat' && live.conversationId === id && live.dataOrigin === 'network') void live.markMessagesRead(visible.messages).catch((cause) => { if (routeActive.current && reading.current.id === id) setSendError(messageOf(cause)) })
+  }, [id, visible, live?.view, live?.conversationId, live?.data, live?.notifications, live?.generation])
   const loadOlder = () => {
     const current = reading.current
     if (!routeActive.current || !current.id || current.live?.conversationId !== current.id || current.live.dataOrigin !== 'network' || !current.live.connectionOnline || current.live.historyLoading.has('messages') || current.live.data?.history.messages.complete) return
@@ -189,7 +191,9 @@ export default function ChatScreen() {
     if (!id || !rows.length || restoration.current.done) return
     const target = restoration.current.messageId
     if (target) {
-      const index = rows.findIndex((row) => 'message' in row && row.message.message_id === target)
+      const questionIds = [...chat?.before.values() ?? [], chat?.rest ?? []].flat().map((question) => question.question_id)
+      const location = chatMessageLocation({ messageId: target, messages: chat?.messages ?? [], questionIds })
+      const index = rows.findIndex((row) => location.kind === 'question' ? row.key === `q:${location.questionId}` : 'message' in row && row.message.message_id === location.messageId)
       if (index >= 0) {
         restoration.current.done = true
         away.current = index > 1

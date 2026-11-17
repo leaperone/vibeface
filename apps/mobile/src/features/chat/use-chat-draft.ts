@@ -12,7 +12,7 @@ export function useChatDraft(scope: DraftScope) {
       try { snapshot = chatDrafts.read(scope) }
       catch (cause) { failure = cause instanceof Error ? cause.message : '草稿无法读取，请重试。' }
     }
-    return { key, scope, snapshot, text: snapshot.text, files: snapshot.files, sequence: 0, tail: Promise.resolve(snapshot), failure, copies: new Map<string, Attachment>() }
+    return { key, scope, snapshot, text: snapshot.text, files: snapshot.files, sequence: 0, tail: Promise.resolve(snapshot), failure, copies: new Map<string, Attachment>(), flushed: new WeakMap<DraftSnapshot, number>() }
   }, [key])
   const current = useRef<typeof owner | null>(owner)
   current.current = owner
@@ -63,19 +63,30 @@ export function useChatDraft(scope: DraftScope) {
     },
     async changeFiles(files: Attachment[]) { owner.files = files; await persist() },
     async flush(): Promise<DraftSnapshot> {
-      await owner.tail
-      if (owner.failure) throw new Error(owner.failure)
-      return chatDrafts.read(owner.scope)
+      const sequence = owner.sequence
+      const snapshot = await owner.tail
+      if (owner.failure && owner.sequence === sequence) throw new Error(owner.failure)
+      owner.flushed.set(snapshot, sequence)
+      return snapshot
     },
     async clear(snapshot: DraftSnapshot) {
       const sequence = owner.sequence
-      if (!await privateFiles.run(async () => chatDrafts.clear(owner.scope, snapshot))) return false
-      if (current.current === owner && owner.sequence === sequence) {
-        const empty = chatDrafts.read(owner.scope)
-        owner.snapshot = empty; owner.text = empty.text; owner.files = empty.files
-        setView({ key, snapshot: empty, text: empty.text, files: empty.files, error: '' })
-      }
-      return true
+      if (owner.flushed.get(snapshot) !== sequence) return false
+      const previous = owner.tail
+      const work = privateFiles.run(async (valid) => {
+        await previous
+        if (!valid()) throw new Error('应用内数据正在清除，请重试。')
+        if (owner.sequence !== sequence || !await chatDrafts.clear(owner.scope, snapshot)) return false
+        if (owner.sequence === sequence) {
+          const empty = chatDrafts.read(owner.scope)
+          owner.snapshot = empty; owner.text = empty.text; owner.files = empty.files
+          if (current.current === owner) setView({ key, snapshot: empty, text: empty.text, files: empty.files, error: '' })
+        }
+        return true
+      })
+      owner.tail = work.then(() => owner.snapshot)
+      void owner.tail.catch(() => {})
+      return work
     },
   }
 }

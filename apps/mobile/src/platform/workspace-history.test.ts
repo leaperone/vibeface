@@ -5,6 +5,7 @@ import { createWorkspaceSendActivity, prependWorkspaceHistory, refreshWorkspaceH
 
 function page(ids: string[], cursor: string | null): WorkspaceHistory {
   return {
+    history_authority: 'authority',
     events: ids.map(id => ({ event_hash: id, created_at_ms: 0, scope_id: 'conversation', kind: 'message_posted', speaker: { kind: 'bot', bot_id: 'bot' }, body: { type: 'message_posted', message_id: id, role: 'assistant', text: id } })),
     next_cursor: cursor, complete: cursor === null, coverage: { limit: 2, truncated: cursor !== null, scope: 'task' },
   }
@@ -32,6 +33,16 @@ test('a fully loaded refresh replaces invalidated events and updates completion'
   const result = await refreshWorkspaceHistory({ current: page(['removed', 'a'], 'old'), first: page(['a', 'b'], null), readOlder: async () => { throw new Error('unexpected') }, isCurrent: () => true })
   assert.deepEqual(ids(result), ['a', 'b'])
   assert.equal(result?.complete, true)
+})
+
+test('a new authority discards a formerly complete overlapping window and cannot prepend an old page', async () => {
+  const current = { ...page(['revoked', 'anchor'], null), history_authority: 'old-authority' }
+  const first = { ...page(['anchor', 'new'], 'older'), history_authority: 'new-authority' }
+  const result = await refreshWorkspaceHistory({ current, first, readOlder: async () => { throw new Error('must not bridge an obsolete window') }, isCurrent: () => true })
+  assert.deepEqual(ids(result), ['anchor', 'new'])
+  assert.equal(result?.complete, false)
+  assert.equal(result?.history_authority, 'new-authority')
+  assert.throws(() => prependWorkspaceHistory(first, current), /历史已经变化/)
 })
 
 test('scope invalidation while awaiting a page never publishes an obsolete history', async () => {

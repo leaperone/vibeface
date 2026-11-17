@@ -7,6 +7,7 @@ function appendUnique(older: WorkspaceHistoryItem[], newer: WorkspaceHistoryItem
 }
 
 export function prependWorkspaceHistory(current: WorkspaceHistory, older: WorkspaceHistory): WorkspaceHistory {
+  if (current.history_authority !== older.history_authority) throw new Error('历史已经变化，请重新加载记录。')
   return { ...older, events: appendUnique(older.events, current.events) }
 }
 
@@ -17,6 +18,8 @@ export async function refreshWorkspaceHistory({ current, first, readOlder, isCur
   readOlder(cursor: string): Promise<WorkspaceHistory>
   isCurrent(): boolean
 }): Promise<WorkspaceHistory | null> {
+  if (!isCurrent()) return null
+  if (current && current.history_authority !== first.history_authority) return first
   let fresh = first
   const known = new Set(current?.events.map(event => event.event_hash) ?? [])
   const visited = new Set<string>()

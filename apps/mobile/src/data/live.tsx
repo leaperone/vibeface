@@ -11,7 +11,7 @@ import { inboxItems, waitingItems, type InboxItem } from '@vibeface/client/works
 import { addressName, deviceOnline, entryLabel } from '@vibeface/client/workspace/labels.ts'
 import { botReadiness, parseBots, parsePrimary, parsePendingMessage } from '@vibeface/client/workspace/model.ts'
 import type { PendingMessage } from '@vibeface/client/chat/types.ts'
-import { notificationPreferences } from '@vibeface/client/workspace/system-notifications.ts'
+import { notificationBadgeCount, notificationPreferences, watchNotificationPreferences } from '@vibeface/client/workspace/system-notifications.ts'
 import { storageOf } from '@vibeface/client/workspace/storage.ts'
 import { isSessionNotification, type BotRecord } from '@vibeface/client/workspace/types.ts'
 import { awaitsAnswer, foldAnswers } from '@vibeface/client/workspace/questions.ts'
@@ -152,6 +152,7 @@ function Live({ children }: { children: ReactNode }) {
 
   const cached = useMemo(() => localConversations.all({ networkId, deviceId: me ?? '' }), [networkId, me, data, shared.generation])
   const conversations: Record<string, Conversation> = Object.fromEntries(cached.map((record) => [record.conversationId, cachedConversation(record, shared.pendingMessages)]))
+  if (data && conversationId && shared.dataOrigin === 'cache') conversations[conversationId] = cachedConversation({ networkId, deviceId: me ?? '', conversationId, savedAt: cached.find((record) => record.conversationId === conversationId)?.savedAt ?? Date.now(), payload: data }, shared.pendingMessages)
   if (data && conversationId && shared.dataOrigin === 'network') {
     const jobs = data.scheduler?.jobs ?? []
     // A streamed reply gives way once its job ends, or as soon as the history's newest message is the reply it was
@@ -244,8 +245,10 @@ function Live({ children }: { children: ReactNode }) {
         }
       },
       async send(id, text, attachments, options) {
-        await select(id)
-        await latest.current.sendMessage(text, attachments.map((file) => ({ name: file.name, arrayBuffer: () => privateFiles.run(async () => new File(file.uri).arrayBuffer()) })), undefined, options)
+        const workspace = latest.current
+        const bot = workspace.bots.find((item) => item.conversation_id === id)
+        if (!bot || !workspace.isCurrent()) throw new Error('原对话尚未读取，请重新连接后发送。')
+        await workspace.sendMessage(text, attachments.map((file) => ({ name: file.name, arrayBuffer: () => privateFiles.run(async () => new File(file.uri).arrayBuffer()) })), undefined, { ...options, conversation_id: id, target: options?.target ?? { kind: 'bot_main', bot_id: bot.bot_id } })
       },
       answer: (question, text) => latest.current.answer(question, text),
       leave: device.leave,
@@ -269,12 +272,16 @@ function Live({ children }: { children: ReactNode }) {
     const tokens = Notifications.addPushTokenListener(sync)
     return () => { stopForeground(); tokens.remove() }
   }, [device.ready, shared.generation])
-  const unreadTotal = Object.values(unread).reduce((sum, value) => sum + value, 0)
+  const unreadVersion = JSON.stringify(unread)
   useEffect(() => {
     if (!shared.synced) return
-    const preferences = notificationPreferences(mobilePlatform.storage, networkId).read()
-    void Notifications.setBadgeCountAsync(preferences.enabled && preferences.badge ? unreadTotal : 0).catch(() => {})
-  }, [shared.synced, networkId, unreadTotal])
+    const update = () => {
+      const preferences = notificationPreferences(mobilePlatform.storage, networkId).read()
+      void Notifications.setBadgeCountAsync(notificationBadgeCount(unread, preferences)).catch(() => {})
+    }
+    update()
+    return watchNotificationPreferences(networkId, update)
+  }, [shared.synced, networkId, unreadVersion])
 
   const value: Workspace = {
     networkId, deviceId: me ?? null, session, connection: { ...connection, entry: connection.entry || seen?.entry || '' }, bots, primary, unread, questions, members, conversations, actions,
