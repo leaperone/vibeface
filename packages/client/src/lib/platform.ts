@@ -15,7 +15,7 @@ export type Notifier = {
   name: string
   permission(): Promise<Permission>
   request(): Promise<Permission>
-  show(alert: { title: string; body: string; tag: string; destination: NotificationDestination }, open: () => void): void
+  show(alert: { title: string; body: string; tag: string; destination: NotificationDestination }, open: () => void): void | Promise<void>
   /** Retains an opening until the current workspace consumes it. False keeps it for a later connection. */
   watchOpen?(listener: (destination: NotificationDestination) => Promise<boolean>): () => void
   replayOpen?(): void

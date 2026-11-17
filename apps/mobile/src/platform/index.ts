@@ -11,12 +11,14 @@ import type { Lan, Notifier, Permission, Platform } from '@vibeface/client/lib/p
 import { createTransport, type DeviceKeys } from '@vibeface/client/lib/transport.ts'
 import { sha256Hex } from '@vibeface/client/lib/byte-codec.ts'
 import { lostKeyText } from '@vibeface/client/identity/copy.ts'
+import { notificationPreferences } from '@vibeface/client/workspace/system-notifications.ts'
 import LanBrowser from '../../modules/lan-browser'
 import { privateFiles } from './files'
 import { notificationOpenings } from './notification-opens'
 import { nativeDeliveryReservations } from './delivery-reservations'
 
 const store = createMMKV({ id: 'vibeface' })
+const notificationStorage = { getItem: (key: string) => store.getString(key) ?? null, setItem: (key: string, value: string) => store.set(key, value) }
 const secretKey = 'vibeface.device-secret'
 const createdKey = 'vibeface.device-created'
 const outboxPrefix = 'outbox:'
@@ -53,7 +55,13 @@ const phoneKeys: DeviceKeys = {
 }
 
 Notifications.setNotificationHandler({
-  handleNotification: async () => ({ shouldShowBanner: true, shouldShowList: true, shouldPlaySound: false, shouldSetBadge: false }),
+  handleNotification: async (notification) => {
+    const destination: unknown = notification.request.content.data?.destination
+    const networkId = destination && typeof destination === 'object' && 'network_id' in destination && typeof destination.network_id === 'string' ? destination.network_id : ''
+    const settings = notificationPreferences(notificationStorage, networkId).read()
+    const muted = destination && typeof destination === 'object' && 'conversation_id' in destination && typeof destination.conversation_id === 'string' && settings.mutedConversations.includes(destination.conversation_id)
+    return { shouldShowBanner: settings.enabled && !muted, shouldShowList: settings.enabled && !muted, shouldPlaySound: settings.enabled && settings.sound && !muted, shouldSetBadge: settings.enabled && settings.badge }
+  },
 })
 // Its own Android channel, so system settings show Vibeface's name for these alerts; iOS ignores channels.
 const channelId = 'vibeface'
@@ -80,8 +88,12 @@ const notifier: Notifier = {
     return () => { active = false; response.remove(); foreground.remove(); stop() }
   },
   replayOpen() { void openings.flush() },
-  show({ title, body, tag, destination }) {
-    void privateFiles.run(async (current) => { if (current()) await Notifications.scheduleNotificationAsync({ identifier: tag, content: { title, body, data: { destination } }, trigger: { channelId } }) }).catch(() => {})
+  async show({ title, body, tag, destination }) {
+    const settings = notificationPreferences(notificationStorage, destination.network_id).read()
+    await privateFiles.run(async (current) => {
+      if (!current()) throw new Error('应用内数据正在清除。')
+      await Notifications.scheduleNotificationAsync({ identifier: tag, content: { title, body, data: { destination }, ...(settings.sound ? { sound: 'default' } : {}) }, trigger: { channelId } })
+    })
   },
 }
 
