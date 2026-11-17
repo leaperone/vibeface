@@ -1,5 +1,6 @@
 import { BusyIcon,Details,InlineError,Segmented,SettingsDisclosure,SettingsRow,Skeleton,toast } from "@/components/arc/product-kit"
 import { terms } from "@/lib/glossary"
+import { useClipboard } from "@/lib/use-clipboard"
 import { cn } from "@/lib/utils"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { waitingCopy } from "@vibeface/client/identity/copy.ts"
@@ -10,7 +11,7 @@ import { Button } from "@vibeface/uiarc/button/button.tsx"
 import { Input } from "@vibeface/uiarc/input/input.tsx"
 import { Select } from "@vibeface/uiarc/select/select.tsx"
 import { CircleCheck,CircleHelp,CircleX,Clock,Copy,FolderTree,Inbox,Layers,MessageCircleQuestionMark,Plus,Send,Trash2,X,Zap,type LucideIcon } from "lucide-react"
-import { useEffect,useRef,useState } from "react"
+import { useEffect,useMemo,useRef,useState } from "react"
 
 const chat = terms.externalChat.label
 const outlets: [Outlet, string, LucideIcon][] = [["record", waitingCopy.outlets.record, Inbox], ["both", waitingCopy.outlets.both, Layers]]
@@ -29,6 +30,8 @@ export function TriageSettings() {
   const [secret, setSecret] = useState("")
   const [label, setLabel] = useState("")
   const [token, setToken] = useState("")
+  const copyScope = useMemo(() => ({ ready, url: settings?.decision_url, token }), [ready, settings?.decision_url, token])
+  const clipboard = useClipboard(copyScope, { duration: null, isCurrent: () => ready?.isCurrent() === true, onCopied: () => toast("已复制", { tone: "success" }), onFailed: () => toast("复制失败，请重试。", { tone: "warning" }) })
   const [test, setTest] = useState<{ ok: boolean; text: string } | null>(null)
   const [open, setOpen] = useState(false)
   const [confirming, setConfirming] = useState("")
@@ -142,11 +145,11 @@ export function TriageSettings() {
         <span className={fieldLabel}>地址</span>
         <div className="flex min-w-0 items-center gap-1 rounded-control bg-surface-muted/60 ps-3">
           <code className="min-w-0 flex-1 truncate font-mono text-sm" title={settings.decision_url}>{settings.decision_url}</code>
-          <Button type="button" variant="ghost" size="md" aria-label="复制地址" title="复制地址" onClick={() => void navigator.clipboard?.writeText(settings.decision_url).then(() => toast("已复制", { tone: "success" }))}><Copy aria-hidden="true" /></Button>
+          <Button type="button" variant="ghost" size="md" aria-label="复制地址" title="复制地址" onClick={() => void clipboard.copy(settings.decision_url)}><Copy aria-hidden="true" /></Button>
         </div>
         {token ? <div role="status" className="flex min-w-0 items-center gap-2 rounded-control border border-warning-border bg-warning-subtle px-3 py-2">
           <code className="min-w-0 flex-1 break-all font-mono text-sm">{token}</code>
-          <Button type="button" variant="ghost" size="md" aria-label="复制授权码" title="只显示这一次" onClick={() => void navigator.clipboard?.writeText(token).then(() => toast("已复制", { tone: "success" }))}><Copy aria-hidden="true" /></Button>
+          <Button type="button" variant="ghost" size="md" aria-label="复制授权码" title="只显示这一次" onClick={() => void clipboard.copy(token)}><Copy aria-hidden="true" /></Button>
           <Button type="button" variant="ghost" size="md" aria-label="收起" title="收起" onClick={() => setToken("")}><X aria-hidden="true" /></Button>
         </div> : null}
         {settings.decision_tokens.length ? <ul className="grid gap-1">{settings.decision_tokens.map((item) => <li key={item.token_id} className="flex min-h-9 min-w-0 flex-wrap items-center gap-x-2 rounded-control bg-surface-muted/60 ps-3">

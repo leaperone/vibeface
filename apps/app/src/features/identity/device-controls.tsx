@@ -1,4 +1,5 @@
 import { Details,InlineError,SettingsDisclosure } from '@/components/arc/product-kit'
+import { useClipboard } from '@/lib/use-clipboard'
 import { terms } from '@/lib/glossary'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { entryAddress,entryKey,parseEntry,type ConnectionEntry } from '@vibeface/client/lib/node.ts'
@@ -7,20 +8,15 @@ import { addressName,hostOf } from '@vibeface/client/workspace/labels.ts'
 import { Button } from '@vibeface/uiarc/button/button.tsx'
 import { Input } from '@vibeface/uiarc/input/input.tsx'
 import { Check,Copy,RotateCcw,Wifi,WifiOff,X } from 'lucide-react'
-import { useEffect,useState,type ReactNode } from 'react'
+import { useState,type ReactNode } from 'react'
 
 /** The ids support asks for, copied as one block instead of shown. */
 export function CopyDiagnostics({ lines, label = '复制诊断信息' }: { lines: Array<[string, ReactNode]>; label?: string }) {
-  const [copied, setCopied] = useState(false)
-  useEffect(() => {
-    if (!copied) return
-    const timer = setTimeout(() => setCopied(false), 2000)
-    return () => clearTimeout(timer)
-  }, [copied])
   const text = lines.filter(([, value]) => value !== '' && value != null).map(([label, value]) => `${label}: ${value}`).join('\n')
-  return <Button type="button" variant="secondary" className="w-fit" onClick={() => { void navigator.clipboard?.writeText(text).then(() => setCopied(true)) }}>
+  const { copied, failed, copy } = useClipboard(text)
+  return <><Button type="button" variant="secondary" className="w-fit" onClick={() => { void copy(text) }}>
     {copied ? <Check aria-hidden="true" className="text-success" /> : <Copy aria-hidden="true" />}<span role={copied ? 'status' : undefined}>{copied ? '已复制' : label}</span>
-  </Button>
+  </Button>{failed ? <InlineError error="复制失败，请重试。" /> : null}</>
 }
 
 /**

@@ -1,4 +1,5 @@
 import { BusyIcon,InlineError,SettingsDisclosure,SettingsGroup,SettingsRow,Skeleton } from "@/components/arc/product-kit"
+import { useClipboard } from "@/lib/use-clipboard"
 import { cn } from "@/lib/utils"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { parseRelaySettings,parseShareLink,relayDefaults,type RelaySettings as Settings } from "@vibeface/client/lib/node.ts"
@@ -6,7 +7,7 @@ import { Button } from "@vibeface/uiarc/button/button.tsx"
 import { Input } from "@vibeface/uiarc/input/input.tsx"
 import { Switch } from "@vibeface/uiarc/switch/switch.tsx"
 import { Check,CircleCheck,Copy,LoaderCircle,RadioTower,Share2,SlidersHorizontal,TriangleAlert } from "lucide-react"
-import { useEffect,useRef,useState } from "react"
+import { useEffect,useMemo,useRef,useState } from "react"
 
 export const relayLabel = "公共转发"
 const shareLabel = "节点链接"
@@ -15,20 +16,20 @@ const shareLabel = "节点链接"
 export function ShareLink() {
   const { ready } = useDevice()
   const [link, setLink] = useState("")
-  const [copied, setCopied] = useState(false)
   const [error, setError] = useState<unknown>(null)
+  const scope = useMemo(() => ({ ready, link }), [ready, link])
+  const { copied, copy } = useClipboard(scope, { duration: null, isCurrent: () => ready?.isCurrent() === true })
   useEffect(() => {
     if (!ready?.isCurrent()) return
     const connection = ready
     let live = true
-    setLink(""); setError(null); setCopied(false)
+    setLink(""); setError(null)
     connection.request("share_link").then((raw) => { if (live && connection.isCurrent()) setLink(parseShareLink(raw)) }, (cause) => { if (live) setError(cause) })
     return () => { live = false }
   }, [ready])
-  const copy = () => void navigator.clipboard.writeText(link).then(() => setCopied(true), () => {})
   return <SettingsGroup>
     <SettingsRow icon={Share2} label={shareLabel}>
-      {link ? <Button type="button" variant="ghost" size="md" aria-label={copied ? "已复制" : "复制"} title={copied ? "已复制" : "复制"} onClick={copy}>
+      {link ? <Button type="button" variant="ghost" size="md" aria-label={copied ? "已复制" : "复制"} title={copied ? "已复制" : "复制"} onClick={() => { void copy(link) }}>
         {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
       </Button> : error ? null : <Skeleton className="h-6 w-11" />}
     </SettingsRow>

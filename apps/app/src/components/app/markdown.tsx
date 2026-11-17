@@ -1,11 +1,13 @@
 import { toast } from "@/components/arc/product-kit"
 import { renderMarkdown } from "@/lib/markdown"
 import { markdownScheduler,type MarkdownResult } from "@/lib/markdown-scheduler"
+import { useClipboard } from "@/lib/use-clipboard"
 import { cn } from "@/lib/utils"
 import { memo,useEffect,useMemo,useRef,useState } from "react"
 
 /** Bot replies. Raw HTML is never rendered. */
 export const Markdown = memo(function Markdown({ text, className, streaming = false }: { text: string; className?: string; streaming?: boolean }) {
+  const clipboard = useClipboard(text, { duration: null, onCopied: () => toast("已复制", { tone: "success" }), onFailed: () => toast("复制失败，请重试。", { tone: "warning" }) })
   const synchronous = !streaming && text.length <= 4096
   const html = useMemo(() => synchronous ? renderMarkdown(text) : null, [text, synchronous])
   const [rendered, setRendered] = useState<Extract<MarkdownResult, { kind: "rendered" }> | null>(null)
@@ -43,7 +45,7 @@ export const Markdown = memo(function Markdown({ text, className, streaming = fa
       if (fold) return fold.setAttribute("aria-expanded", String(fold.getAttribute("aria-expanded") !== "true"))
       const button = event.target.closest("button[data-copy]")
       const code = button?.closest(".md-code")?.querySelector("code")?.textContent
-      if (code != null) void navigator.clipboard?.writeText(code).then(() => toast("已复制", { tone: "success" }))
+      if (code != null) void clipboard.copy(code)
     }}
   >
     {parsed !== null ? <div className="md" dangerouslySetInnerHTML={{ __html: parsed }} /> : null}

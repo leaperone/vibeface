@@ -14,6 +14,7 @@ function render(props: { text: string; streaming?: boolean }) {
   let parses = 0
   const load = moduleLoader(createContext({}), (specifier) => {
     if (specifier === "react") return { ...React, memo: (component: unknown) => component }
+    if (specifier === "@/lib/use-clipboard") return load(fileURLToPath(new URL("./use-clipboard.ts", import.meta.url)))
     if (specifier === "@/lib/markdown") return { renderMarkdown: (text: string) => { parses++; return renderMarkdown(text) } }
     if (specifier === "@/lib/markdown-scheduler") return { markdownScheduler: { connect: () => { throw new Error("SSR must not connect a worker") } } }
     if (specifier === "@/lib/utils") return { cn: (...values: unknown[]) => values.filter(Boolean).join(" ") }

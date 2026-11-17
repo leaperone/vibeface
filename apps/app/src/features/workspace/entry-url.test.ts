@@ -27,7 +27,7 @@ import { joinDestination } from '@vibeface/client/identity/switch-network.ts'
 import { joinTicket } from '@vibeface/client/lib/transport.ts'
 import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
 import { messageKey, replyStatusLabel, inputTargetKey, promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from "@vibeface/client/chat/protocol.ts"
-import { deviceCopy, offlineCopy, setUpOnManager, waitingCopy } from "@vibeface/client/identity/copy.ts"
+import { addDeviceCopy, deviceCopy, joinCopy, offlineCopy, setUpOnManager, waitingCopy } from "@vibeface/client/identity/copy.ts"
 import { chatTimeline, firstUnread, messageTimes, taskMessage, unreadCounts } from "@vibeface/client/chat/timeline.ts"
 import { accessOf } from "@vibeface/client/identity/access.ts"
 import { networkKey, storageOf } from "@vibeface/client/workspace/storage.ts"
@@ -40,6 +40,7 @@ import { inboxItems } from "@vibeface/client/workspace/inbox.ts"
 import { notificationOpenings } from '../../../../../apps/mobile/src/platform/notification-opens.ts'
 import type { NotificationDestination } from '@vibeface/client/lib/platform.ts'
 import { hookHarness, moduleLoader } from '../../lib/test-harness.ts'
+import { cn } from '../../lib/utils.ts'
 
 test("bulk inbox actions re-arm focus after an intervening list update", () => {
   const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "pending-section.tsx"), "utf8")
@@ -1925,6 +1926,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     if (path.includes('/mobile/') && specifier === '@/components/arc/chat') return { ComposerInput: 'TextInput', ComposerPanel: 'ComposerPanel', MessageBubble: 'View' }
     if (path.includes('/mobile/') && specifier === '@/components/arc/selection') return { SelectionItem: 'Pressable' }
     if (path.includes('/mobile/') && specifier === '@/lib/use-clipboard') return loadComponentModule(fileURLToPath(new URL('../../../../../apps/mobile/src/lib/use-clipboard.ts', import.meta.url)))
+    if (specifier === '@/lib/use-clipboard') return loadComponentModule(fileURLToPath(new URL('../../lib/use-clipboard.ts', import.meta.url)))
     if (specifier === '@vibeface/client/workspace/model.ts') {
       const override = dependencies[specifier]
       return { ...workspaceModel, ...(typeof override === 'object' && override !== null ? override : {}) }
@@ -5131,6 +5133,102 @@ test('unknown task detail reads its exact work without starting a Main request a
   } finally { app.close() }
 })
 
+test("diagnostics and connection ID preserve their complete payload, labels and scoped two-second feedback", async () => {
+  for (const name of ['CopyDiagnostics', 'ConnectionId']) {
+    const writes: string[] = [], timers: { run(): void; duration: number }[] = []
+    let pending = pendingResult()
+    const app = componentHarness(name === 'CopyDiagnostics' ? '../identity/device-controls.tsx' : '../lab/transfers.tsx', {
+      '@vibeface/client/delivery/model.ts': deliveryModel,
+    }, { navigator: { clipboard: { writeText: (value: string) => { writes.push(value); return pending.promise } } }, setTimeout: (run: () => void, duration: number) => { timers.push({ run, duration }); return timers.length }, clearTimeout: () => {} }, name === 'ConnectionId' ? 'ConnectionId' : '')
+    const render = (next = false) => app.render(name, name === 'CopyDiagnostics' ? { lines: [['个人网络', next ? 'network-two' : 'network-one'], ['空值', ''], ['未提供', null], ['授权版本', 0]] } : { value: next ? 'b'.repeat(64) : 'a'.repeat(64) })
+    try {
+      const button = render().find(({ type }) => type === 'Button')?.props
+      assert.ok(button && typeof button.onClick === 'function')
+      assert.equal(componentText(button.children), name === 'CopyDiagnostics' ? '复制诊断信息' : '复制')
+      button.onClick()
+      assert.deepEqual(writes, [name === 'CopyDiagnostics' ? '个人网络: network-one\n授权版本: 0' : 'a'.repeat(64)])
+      pending.resolve(undefined); await settleComponent()
+      const copied = render()
+      assert.ok(copied.some(({ props }) => componentText(props.children) === '已复制'))
+      if (name === 'CopyDiagnostics') assert.ok(copied.some(({ props }) => props.role === 'status' && componentText(props.children) === '已复制'))
+      assert.equal(timers[0].duration, 2000)
+      assert.equal(render(true).some(({ props }) => componentText(props.children) === '已复制'), false)
+      pending = pendingResult()
+      const retry = render(true).find(({ type }) => type === 'Button')?.props.onClick
+      assert.ok(typeof retry === 'function'); retry()
+      pending.reject(new Error('refused')); await settleComponent()
+      const failed = render(true)
+      assert.equal(failed.some(({ props }) => props.error === '复制失败，请重试。'), name === 'CopyDiagnostics')
+      assert.equal(failed.some(({ props }) => componentText(props.children) === '已复制'), false)
+    } finally { app.close() }
+  }
+})
+
+test("relay copy remains persistent and old connections cannot publish success", async () => {
+  let generation = 1, pending = pendingResult()
+  const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, request: async () => ({ link: `vibeface://node-${owner}` }) } }
+  const device = { ready: ready() }
+  const app = componentHarness('../devices/relay-settings.tsx', {
+    '@vibeface/client/identity/context.tsx': { useDevice: () => device },
+    '@vibeface/client/lib/node.ts': { parseShareLink: (raw: { link: string }) => raw.link },
+  }, { navigator: { clipboard: { writeText: () => pending.promise } }, setTimeout: () => assert.fail('relay success must not expire'), clearTimeout: () => {} })
+  const render = () => app.render('ShareLink')
+  const copy = () => { const action = render().find(({ type }) => type === 'Button')?.props.onClick; assert.ok(typeof action === 'function'); action() }
+  try {
+    render(); await settleComponent(); copy()
+    pending.resolve(undefined); await settleComponent()
+    assert.ok(render().some(({ props }) => props['aria-label'] === '已复制'))
+    pending = pendingResult(); copy()
+    pending.reject(new Error('refused')); await settleComponent()
+    assert.ok(render().some(({ props }) => props['aria-label'] === '已复制'))
+    pending = pendingResult(); copy()
+    generation++; device.ready = ready(); render(); await settleComponent()
+    pending.resolve(undefined); await settleComponent()
+    assert.equal(render().some(({ props }) => props['aria-label'] === '已复制'), false)
+  } finally { app.close() }
+})
+
+test("single-record copying keeps toast-only feedback, handles refusal and ignores a replaced record", async () => {
+  let pending = pendingResult()
+  const writes: string[] = [], notices: unknown[][] = []
+  const record = { ts_ms: 0, source: 'web', level: 'info', event: 'test', message: 'complete record' }
+  const app = componentHarness('../../routes/_app/settings_.logs.tsx', {
+    '@tanstack/react-router': { createFileRoute: () => () => ({}) },
+    '@/lib/glossary': { terms: { thisComputer: { label: '本机', icon: 'Cpu' } } },
+    '@/lib/utils': { cn },
+    '@/components/arc/product-kit': { Details: 'Details', toast: (...args: unknown[]) => notices.push(args) },
+    '@vibeface/client/lib/errors.ts': { knownError: () => null },
+  }, { navigator: { clipboard: { writeText: (value: string) => { writes.push(value); return pending.promise } } }, setTimeout: () => assert.fail('record feedback must stay toast-only'), clearTimeout: () => {} }, 'LogRow')
+  const render = (next = record) => app.render('LogRow', { record: next, name: () => '', open: true, onToggle() {}, onCopyAll: async () => {} })
+  const click = () => { const action = render().find(({ type, props }) => type === 'Button' && componentText(props.children) === '复制这条')?.props.onClick; assert.ok(typeof action === 'function'); action() }
+  try {
+    click()
+    assert.deepEqual(writes, ['{"ts_ms":0,"source":"web","level":"info","event":"test","message":"complete record"}'])
+    assert.equal(notices.length, 0)
+    pending.resolve(undefined); await settleComponent()
+    assert.equal(notices.length, 1)
+    assert.equal(notices[0].length, 2)
+    assert.equal(notices[0][0], '已复制这条记录')
+    const successOptions = notices[0][1]
+    assert.ok(successOptions && typeof successOptions === 'object' && 'tone' in successOptions)
+    assert.equal(successOptions.tone, 'success')
+    assert.equal(Object.keys(successOptions).join(','), 'tone')
+    pending = pendingResult(); click()
+    pending.reject(new Error('private platform details')); await settleComponent()
+    assert.equal(notices.length, 2)
+    assert.equal(notices[1].length, 2)
+    assert.equal(notices[1][0], '复制失败，请重试。')
+    const failureOptions = notices[1][1]
+    assert.ok(failureOptions && typeof failureOptions === 'object' && 'tone' in failureOptions)
+    assert.equal(failureOptions.tone, 'warning')
+    assert.equal(Object.keys(failureOptions).join(','), 'tone')
+    pending = pendingResult(); click()
+    render({ ...record, message: 'replacement' })
+    pending.resolve(undefined); await settleComponent()
+    assert.equal(notices.length, 2)
+  } finally { app.close() }
+})
+
 test("an outstanding clipboard permission cannot keep the add-device sheet busy or release another action", async () => {
   let generation = 1, creation = pendingResult()
   const invitation = { link: 'vibeface://join/vibeface1test', expiresAt: Date.now() + 600_000 }
@@ -5156,6 +5254,82 @@ test("an outstanding clipboard permission cannot keep the add-device sheet busy 
     creation.resolve(invitation); await settleComponent()
     assert.equal(labelled('复制链接')?.disabled, false)
   } finally { app.close() }
+})
+
+test("add-device clipboard refusal selects the full attempted command and a busy click cannot change it", async () => {
+  let pending = pendingResult()
+  const copied: string[] = [], focus: string[] = []
+  const link = 'vibeface://join/full-invitation'
+  const command = "vibeface join 'vibeface://join/full-invitation' --name '我的电脑'"
+  const device = { connectionGeneration: () => 1, ready: { isCurrent: () => true, principal: { can_manage: true } }, createInvitation: async () => ({ link, expiresAt: 600_000 }), refreshDirectory: async () => {} }
+  const app = componentHarness('../devices/add-device.tsx', {
+    '@vibeface/client/identity/copy.ts': { addDeviceCopy, deviceCopy, joinCopy },
+    '@vibeface/client/identity/context.tsx': { useDevice: () => device }, './join': { JoinRequests: () => null, useOpenJoins: () => [] }, '@/lib/glossary': { terms: { safetyCode: { icon: 'ScanEye' } } },
+    '@vibeface/client/lib/node.ts': { messageOf },
+  }, { navigator: { clipboard: { writeText: (value: string) => { copied.push(value); return pending.promise } } }, setInterval: () => 0, clearInterval: () => {} })
+  const render = () => app.render('AddDevice')
+  const click = (label: string) => { const action = render().find(({ type, props }) => type === 'Button' && componentText(props.children) === label)?.props.onClick; assert.ok(typeof action === 'function'); action() }
+  try {
+    click('生成链接'); await settleComponent()
+    const kind = render().find(({ type }) => type === 'Segmented')?.props.onChange
+    assert.ok(typeof kind === 'function'); kind('computer')
+    const raw = render().find(({ props }) => props.readOnly)?.props.ref
+    assert.ok(raw && typeof raw === 'object')
+    Reflect.set(raw, 'current', { focus: () => focus.push('focus'), select: () => focus.push('select') })
+    click('复制命令')
+    assert.deepEqual(copied, [command], 'the write starts before the click handler returns')
+    click('复制链接')
+    assert.deepEqual(copied, [command], 'a busy action cannot start another write')
+    assert.equal(render().find(({ props }) => props.readOnly)?.props.value, command)
+    pending.reject(new Error('clipboard denied')); await settleComponent()
+    const tree = render()
+    assert.ok(tree.some(({ props }) => props.role === 'alert' && componentText(props.children) === '没能复制，手动选中下面的内容'))
+    assert.equal(tree.find(({ props }) => props.label === '链接原文' && 'open' in props)?.props.open, true)
+    assert.equal(tree.find(({ props }) => props.readOnly)?.props.value, command)
+    assert.deepEqual(focus, ['focus', 'select'])
+    assert.equal(tree.some(({ props }) => componentText(props.children) === '已复制'), false)
+    pending = pendingResult(); click('复制链接')
+    assert.equal(render().find(({ props }) => props.readOnly)?.props.value, link)
+    assert.equal(render().some(({ props }) => props.role === 'alert'), false)
+    pending.reject(new Error('refused again')); await settleComponent(); render()
+    assert.deepEqual(copied, [command, link])
+    assert.deepEqual(focus, ['focus', 'select', 'focus', 'select'])
+  } finally { app.close() }
+})
+
+test("add-device copy cannot publish or select after kind, invitation, drawer or connection changes", async () => {
+  for (const change of ['kind', 'invitation', 'drawer', 'connection']) for (const outcome of ['resolve', 'reject']) {
+    let generation = 1, calls = 0
+    const pending = pendingResult(), focus: string[] = []
+    const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, principal: { can_manage: true } } }
+    const device = { connectionGeneration: () => generation, ready: ready(), createInvitation: async () => ({ link: `vibeface://join/invitation-${++calls}`, expiresAt: 600_000 }), refreshDirectory: async () => {} }
+    const app = componentHarness('../devices/add-device.tsx', {
+      '@vibeface/client/identity/copy.ts': { addDeviceCopy, deviceCopy, joinCopy },
+      '@vibeface/client/identity/context.tsx': { useDevice: () => device }, './join': { JoinRequests: () => null, useOpenJoins: () => [] }, '@/lib/glossary': { terms: { safetyCode: { icon: 'ScanEye' } } }, '@vibeface/client/lib/node.ts': { messageOf },
+    }, { navigator: { clipboard: { writeText: () => pending.promise } }, setInterval: () => 0, clearInterval: () => {} })
+    const render = () => app.render('AddDevice')
+    const click = (label: string) => { const action = render().find(({ type, props }) => type === 'Button' && componentText(props.children) === label)?.props.onClick; assert.ok(typeof action === 'function'); action() }
+    try {
+      click('生成链接'); await settleComponent()
+      const raw = render().find(({ props }) => props.readOnly)?.props.ref
+      assert.ok(raw && typeof raw === 'object')
+      Reflect.set(raw, 'current', { focus: () => focus.push('focus'), select: () => focus.push('select') })
+      click('复制链接')
+      if (change === 'kind') { const action = render().find(({ type }) => type === 'Segmented')?.props.onChange; assert.ok(typeof action === 'function'); action('computer') }
+      if (change === 'drawer') { const action = render().find(({ type }) => type === 'Drawer')?.props.onOpenChange; assert.ok(typeof action === 'function'); action(false) }
+      if (change === 'connection' || change === 'invitation') { generation++; device.ready = ready(); render(); render() }
+      if (change === 'invitation') { click('生成链接'); await settleComponent() }
+      render()
+      if (outcome === 'resolve') pending.resolve(undefined)
+      else pending.reject(new Error('old refusal'))
+      await settleComponent()
+      const tree = render()
+      assert.equal(tree.some(({ props }) => props.role === 'alert' && componentText(props.children) === '没能复制，手动选中下面的内容'), false, `${change}/${outcome}`)
+      assert.equal(tree.some(({ props }) => componentText(props.children) === '已复制'), false, `${change}/${outcome}`)
+      assert.equal(focus.length, 0, `${change}/${outcome}`)
+      if (change === 'invitation') assert.equal(tree.find(({ props }) => props.readOnly)?.props.value, 'vibeface://join/invitation-2')
+    } finally { app.close() }
+  }
 })
 
 test("the invitation's QR code is its link, for the app", async () => {
