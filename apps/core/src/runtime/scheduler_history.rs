@@ -74,14 +74,14 @@ mod tests {
                 Ok(store.connection.query_row("SELECT total_changes()", [], |row| row.get::<_, u64>(0))?)
             }).await?;
             let principal = crate::runtime::Access::User { network_id: network.clone(), scope: crate::runtime::UserScope::Network };
-            let snapshot = runtime.rpc(principal.clone(), json!({"method":"conversation", "conversation_id":"history"})).await?;
+            let snapshot = runtime.rpc(principal.clone(), crate::command::business_fixture(json!({"method":"conversation", "conversation_id":"history"}))).await?;
             assert!(serde_json::to_vec(&snapshot)?.len() < HISTORY_RESPONSE_BYTES);
             for section in ["jobs", "scope_jobs", "checks", "deliveries", "unanswered", "owner_jobs", "owner_scope_jobs", "owner_memory_conflicts"] {
                 let mut cursor: Option<String> = None;
                 let mut items = Vec::new();
                 for _ in 0..100 {
-                    let page = runtime.rpc(principal.clone(), json!({"method":"conversation_history",
-                        "conversation_id":"history","section":section,"cursor":cursor,"limit":3})).await?;
+                    let page = runtime.rpc(principal.clone(), crate::command::business_fixture(json!({"method":"conversation_history",
+                        "conversation_id":"history","section":section,"cursor":cursor,"limit":3}))).await?;
                     assert!(serde_json::to_vec(&page)?.len() < HISTORY_RESPONSE_BYTES);
                     assert_eq!(page["section"], section);
                     items.splice(0..0, page["items"].as_array().context("typed history items")?.clone());
@@ -108,8 +108,8 @@ mod tests {
                 assert!(report["history"][section].is_object());
                 assert!(report["history_starts"][section].is_string());
             }
-            let first = runtime.rpc(principal.clone(), json!({"method":"conversation_history",
-                "conversation_id":"history","section":"owner_jobs","limit":1})).await?;
+            let first = runtime.rpc(principal.clone(), crate::command::business_fixture(json!({"method":"conversation_history",
+                "conversation_id":"history","section":"owner_jobs","limit":1}))).await?;
             let cursor = first["next_cursor"].as_str().context("owner cursor")?;
             let unavailable = unavailable_owner_observation(&network, "history", &runtime.identity.device_id()?, 1)?;
             assert_eq!(unavailable["jobs"], json!([]));
@@ -117,23 +117,23 @@ mod tests {
             assert_eq!(unavailable["memory_conflicts"], json!([]));
             assert_eq!(unavailable["history"]["owner_jobs"]["complete"], false);
             let resume = unavailable["history"]["owner_jobs"]["next_cursor"].as_str().context("retryable owner start")?;
-            let resumed = runtime.rpc(principal.clone(), json!({"method":"conversation_history",
-                "conversation_id":"history","section":"owner_jobs","cursor":resume,"limit":1})).await?;
+            let resumed = runtime.rpc(principal.clone(), crate::command::business_fixture(json!({"method":"conversation_history",
+                "conversation_id":"history","section":"owner_jobs","cursor":resume,"limit":1}))).await?;
             assert_eq!(resumed["items"], first["items"], "an unavailable owner exposes a complete first-page retry path");
-            assert!(runtime.rpc(principal.clone(), json!({"method":"conversation_history",
-                "conversation_id":"history","section":"owner_scope_jobs","cursor":cursor})).await.is_err());
+            assert!(runtime.rpc(principal.clone(), crate::command::business_fixture(json!({"method":"conversation_history",
+                "conversation_id":"history","section":"owner_scope_jobs","cursor":cursor}))).await.is_err());
             let mut wrapped: OwnerCursor = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(cursor)?)?;
             wrapped.owner_epoch += 1;
             let stale_epoch = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&wrapped)?);
-            assert!(runtime.rpc(principal.clone(), json!({"method":"conversation_history",
-                "conversation_id":"history","section":"owner_jobs","cursor":stale_epoch})).await.is_err());
+            assert!(runtime.rpc(principal.clone(), crate::command::business_fixture(json!({"method":"conversation_history",
+                "conversation_id":"history","section":"owner_jobs","cursor":stale_epoch}))).await.is_err());
             wrapped.owner_epoch -= 1;
             wrapped.owner = "former-owner".into();
             let cursor = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&wrapped)?);
-            assert!(runtime.rpc(principal.clone(), json!({"method":"conversation_history",
-                "conversation_id":"history","section":"owner_jobs","cursor":cursor})).await.is_err());
-            assert!(runtime.rpc(Access::Agent(AgentAccess::ReadOnly { network_id: network.clone(), conversation_id: "history".into() }), json!({"method":"conversation_history",
-                "conversation_id":"history","section":"owner_jobs"})).await.is_err());
+            assert!(runtime.rpc(principal.clone(), crate::command::business_fixture(json!({"method":"conversation_history",
+                "conversation_id":"history","section":"owner_jobs","cursor":cursor}))).await.is_err());
+            assert!(runtime.rpc(Access::Agent(AgentAccess::ReadOnly { network_id: network.clone(), conversation_id: "history".into() }), crate::command::business_fixture(json!({"method":"conversation_history",
+                "conversation_id":"history","section":"owner_jobs"}))).await.is_err());
             let after = runtime.store.read("scheduler_history_rpc.after", |store| {
                 Ok(store.connection.query_row("SELECT total_changes()", [], |row| row.get::<_, u64>(0))?)
             }).await?;

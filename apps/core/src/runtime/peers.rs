@@ -6477,7 +6477,13 @@ mod tests {
                     .context("the peer is listed")
             };
             first_sync(&a, &peer).await?;
-            let online = listed(a.rpc(access.clone(), json!({"method":"nodes"})).await?)?;
+            let online = listed(
+                a.rpc(
+                    access.clone(),
+                    crate::command::business_fixture(json!({"method":"nodes"})),
+                )
+                .await?,
+            )?;
             assert_eq!(online["online"], true);
             assert_eq!(online["capabilities"]["manager"], "cursor");
             let mut events = a.events.subscribe();
@@ -6494,7 +6500,13 @@ mod tests {
             .await
             .context("clients are told to reread once the peer stops answering")??;
 
-            let offline = listed(a.rpc(access, json!({"method":"nodes"})).await?)?;
+            let offline = listed(
+                a.rpc(
+                    access,
+                    crate::command::business_fixture(json!({"method":"nodes"})),
+                )
+                .await?,
+            )?;
             assert_eq!(offline["online"], false);
             assert_eq!(offline["capabilities"], online["capabilities"]);
             anyhow::Ok(())
@@ -6649,7 +6661,13 @@ mod tests {
             ));
             a.net()?.learn(&b.net()?.addr()).await;
             first_sync(&a, &peer).await?;
-            listed(a.rpc(access.clone(), json!({"method":"nodes"})).await?)
+            listed(
+                a.rpc(
+                    access.clone(),
+                    crate::command::business_fixture(json!({"method":"nodes"})),
+                )
+                .await?,
+            )
         }
         .await;
         let identity = std::fs::read(dir_a.join("identity.json"))?;
@@ -6667,7 +6685,12 @@ mod tests {
             assert_eq!(std::fs::read(copy.join("identity.json"))?, identity);
             let again = Arc::new(Runtime::open(&copy).await?);
             again.start_network().await?;
-            let nodes = again.rpc(access.clone(), json!({"method":"nodes"})).await;
+            let nodes = again
+                .rpc(
+                    access.clone(),
+                    crate::command::business_fixture(json!({"method":"nodes"})),
+                )
+                .await;
             again.shutdown().await;
             drop(again);
             let offline = listed(nodes?)?;

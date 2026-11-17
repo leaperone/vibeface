@@ -309,7 +309,7 @@ async fn send(client: &mut FrameClient, id: &str, method: &str, params: Value) -
     send_value(
         &mut client.socket,
         &mut client.channel,
-        &Request {
+        &WireRequest {
             id: id.into(),
             method: method.into(),
             params,
@@ -1073,11 +1073,12 @@ async fn a_completed_display_result_is_rechecked_even_before_membership_watch_is
         &fixture.node,
         &session,
         &authority,
-        Request {
+        WireRequest {
             id: "completed".into(),
             method: "rpc".into(),
             params: json!({"method":"conversations"}),
-        },
+        }
+        .decode()?,
     )?;
     let completed = tokio::time::timeout(DEADLINE, calls.next()).await??;
     let prepared = PreparedPush {
@@ -1140,11 +1141,12 @@ async fn a_completed_invite_does_not_release_its_result_after_the_manager_is_rev
         &fixture.node,
         &session,
         &authority,
-        Request {
+        WireRequest {
             id: "manager-invite".into(),
             method: "invite".into(),
             params: json!({"record":record}),
-        },
+        }
+        .decode()?,
     )?;
     calls.start_ordered(&fixture.node, &session, &authority);
     let completed = tokio::time::timeout(DEADLINE, calls.next()).await??;
@@ -1174,4 +1176,351 @@ async fn a_completed_invite_does_not_release_its_result_after_the_manager_is_rev
     drop(calls);
     writer.finish().await?;
     fixture.cleanup().await
+}
+
+#[tokio::test]
+async fn rejected_names_keep_order_and_consume_ids_even_when_overloaded() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let mut session = Snapshot {
+        device_id: fixture.admin.device_id()?,
+        cookie: None,
+        operator: false,
+    }
+    .session();
+    let authority = Authority::new(
+        &fixture.node,
+        &session,
+        fixture.node.local_access.subscribe(),
+    )?;
+    let request = |id: &str, method: &str, params: Value| {
+        WireRequest {
+            id: id.into(),
+            method: method.into(),
+            params,
+        }
+        .decode()
+    };
+    let save = fixture.node.config_save.lock().await;
+    let mut calls = Calls::default();
+    calls.accept(
+        &fixture.node,
+        &session,
+        &authority,
+        request("held", "configure_node", json!({"roots":[],"manager":null}))?,
+    )?;
+    calls.start_ordered(&fixture.node, &session, &authority);
+    calls.accept(
+        &fixture.node,
+        &session,
+        &authority,
+        request("unknown-outer", "unknown", json!({}))?,
+    )?;
+    calls.accept(
+        &fixture.node,
+        &session,
+        &authority,
+        request("unknown-business", "rpc", json!({"method":"unknown"}))?,
+    )?;
+    assert!(
+        calls
+            .accept(
+                &fixture.node,
+                &session,
+                &authority,
+                request("unknown-outer", "info", json!({}))?
+            )
+            .err()
+            .expect("queued ID is reserved")
+            .to_string()
+            .contains("duplicate request ID")
+    );
+    for index in 2..ORDERED_QUEUE {
+        assert!(
+            calls
+                .accept(
+                    &fixture.node,
+                    &session,
+                    &authority,
+                    request(&format!("queued-{index}"), "unknown", json!({}))?
+                )?
+                .is_none()
+        );
+    }
+    let overflow = calls
+        .accept(
+            &fixture.node,
+            &session,
+            &authority,
+            request("overflow", "unknown", json!({}))?,
+        )?
+        .expect("full ordered queue rejects before execution");
+    assert_eq!(overflow.code, Some("client_overloaded"));
+    assert!(
+        calls
+            .accept(
+                &fixture.node,
+                &session,
+                &authority,
+                request("overflow", "unknown", json!({}))?
+            )
+            .err()
+            .expect("duplicate ID is rejected")
+            .to_string()
+            .contains("duplicate request ID")
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), calls.next())
+            .await
+            .is_err(),
+        "unknown names cannot pass the held ordered request"
+    );
+    drop(save);
+    for (id, error) in [
+        ("held", None),
+        ("unknown-outer", Some("unknown client method")),
+        ("unknown-business", Some("unknown method")),
+    ] {
+        let completed = tokio::time::timeout(DEADLINE, calls.next()).await??;
+        let response = calls
+            .deliver(&fixture.node, &mut session, &authority, completed)?
+            .expect("ready result");
+        assert_eq!(response.id, id);
+        assert_eq!(response.error.as_deref(), error);
+        calls.start_ordered(&fixture.node, &session, &authority);
+    }
+    assert!(
+        calls
+            .accept(
+                &fixture.node,
+                &session,
+                &authority,
+                request("unknown-outer", "info", json!({}))?
+            )
+            .err()
+            .expect("duplicate ID is rejected")
+            .to_string()
+            .contains("duplicate request ID")
+    );
+    drop(calls);
+    fixture.cleanup().await
+}
+
+#[tokio::test]
+async fn business_rejections_keep_agent_writer_and_scope_error_positions() -> Result<()> {
+    use crate::command::business_fixture;
+    use crate::runtime::{AgentAccess, UserScope};
+    let fixture = Fixture::new().await?;
+    fixture.accepted_work().await?;
+    let network = fixture.state.genesis.network_id.clone();
+    let access = Access::User {
+        network_id: network.clone(),
+        scope: UserScope::Network,
+    };
+    let agent = Access::Agent(AgentAccess::ReadOnly {
+        network_id: network,
+        conversation_id: "scope".into(),
+    });
+    for (input, expected) in [
+        (json!({}), "method is required"),
+        (json!({"method":" "}), "invalid method"),
+        (
+            json!({"method":"unknown"}),
+            "method unavailable to Agent tokens",
+        ),
+    ] {
+        assert_eq!(
+            fixture
+                .node
+                .rpc(agent.clone(), business_fixture(input))
+                .await
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+    }
+    for scope in ["missing", ""] {
+        assert_eq!(
+            fixture
+                .node
+                .rpc(
+                    access.clone(),
+                    business_fixture(json!({"method":"unknown","conversation_id":scope}))
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+            "conversation not found"
+        );
+    }
+    assert_eq!(
+        fixture
+            .node
+            .rpc(
+                access.clone(),
+                business_fixture(json!({"method":"unknown","conversation_id":"scope"}))
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+        "unknown method"
+    );
+    let mut stranger = Snapshot {
+        device_id: LocalIdentity::generate().device_id()?,
+        cookie: None,
+        operator: false,
+    }
+    .session();
+    assert_eq!(
+        dispatch(
+            &fixture.node,
+            &mut stranger,
+            command::decode_client("unknown", Params::new(json!({}))?)
+        )
+        .await
+        .unwrap_err()
+        .to_string(),
+        "this device is not a member of the personal network"
+    );
+    let mut session = Snapshot {
+        device_id: fixture.admin.device_id()?,
+        cookie: None,
+        operator: false,
+    }
+    .session();
+    for (input, expected) in [
+        (
+            json!({"method":"unknown","client_id":"other"}),
+            "client_id differs from authenticated client",
+        ),
+        (
+            json!({"attestation":{"device_id":"other"}}),
+            "the write is signed by another device",
+        ),
+    ] {
+        assert_eq!(
+            dispatch(
+                &fixture.node,
+                &mut session,
+                command::decode_client("rpc", Params::new(input)?)
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            expected
+        );
+    }
+    let writer = HeldWriter::new(&fixture.node).await?;
+    assert_eq!(
+        tokio::time::timeout(
+            DEADLINE,
+            fixture
+                .node
+                .rpc(access.clone(), business_fixture(json!({})))
+        )
+        .await?
+        .unwrap_err()
+        .to_string(),
+        "method is required"
+    );
+    let mut unknown = Box::pin(fixture.node.rpc(
+        access.clone(),
+        business_fixture(json!({"method":"unknown"})),
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut unknown)
+            .await
+            .is_err(),
+        "a valid unknown name must wait for writer authorization"
+    );
+    writer.finish().await?;
+    assert_eq!(
+        tokio::time::timeout(DEADLINE, &mut unknown)
+            .await?
+            .unwrap_err()
+            .to_string(),
+        "unknown method"
+    );
+    drop(unknown);
+    let history_error = fixture.node.rpc(access, business_fixture(json!({"method":"conversation_history","conversation_id":"scope","section":"messages","unexpected":true})))
+        .await.unwrap_err();
+    assert!(
+        history_error
+            .to_string()
+            .contains("unknown field `unexpected`"),
+        "{history_error}"
+    );
+    fixture.cleanup().await
+}
+
+#[tokio::test]
+async fn maintenance_wire_policy_runs_before_object_validation_and_preserves_join_null()
+-> Result<()> {
+    let fixture = Fixture::new().await?;
+    for (method, params, expected) in [
+        (
+            "grant",
+            Value::Null,
+            "grant needs the signature of a management client; enroll one with `vibeface client enroll`",
+        ),
+        (
+            "subscribe",
+            Value::Null,
+            "subscribe is not available from the maintenance socket",
+        ),
+        ("info", Value::Null, "invalid client method or params"),
+        (
+            "join_status",
+            json!({}),
+            "join_status needs the signature of a management client; enroll one with `vibeface client enroll`",
+        ),
+        (
+            "join_status",
+            json!({"join_id":null}),
+            "join_id must be a string",
+        ),
+        (" ", json!({}), "unknown client method"),
+        ("unknown", Value::Null, "invalid client method or params"),
+    ] {
+        assert_eq!(
+            operator_wire_call(&fixture.node, method, params)
+                .await
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+    }
+    fixture.cleanup().await
+}
+
+#[tokio::test]
+async fn maintenance_busy_precedes_both_business_rejection_kinds() -> Result<()> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.artifacts")
+        .join(format!(
+            "command-policy-maintenance-{}",
+            uuid::Uuid::new_v4()
+        ));
+    let config = Config::local("127.0.0.1:0".parse()?, vec![], false);
+    initialize_node(&dir, &config, &LocalIdentity::generate())?;
+    let mut runtime = Runtime::open(&dir).await?;
+    runtime.maintenance = Arc::new(crate::maintenance::Gate::new(true));
+    let node = Arc::new(runtime);
+    for input in [json!({}), json!({"method":"unknown"})] {
+        let access = Access::User {
+            network_id: "absent".into(),
+            scope: crate::runtime::UserScope::Network,
+        };
+        let error = node
+            .rpc(access, crate::command::business_fixture(input))
+            .await
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<crate::maintenance::Busy>().is_some(),
+            "{error}"
+        );
+    }
+    node.shutdown().await;
+    drop(node);
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
 }

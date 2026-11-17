@@ -634,14 +634,25 @@ mod tests {
             conversation_id: "c".into(),
         });
         assert!(
-            node.rpc(agent, pick.clone()).await.is_err(),
+            node.rpc(agent, crate::command::business_fixture(pick.clone()))
+                .await
+                .is_err(),
             "agents never pick a face"
         );
-        let elsewhere = node.rpc(client(Some("d")), pick.clone()).await.unwrap_err();
+        let elsewhere = node
+            .rpc(
+                client(Some("d")),
+                crate::command::business_fixture(pick.clone()),
+            )
+            .await
+            .unwrap_err();
         assert!(elsewhere.to_string().contains("outside"), "{elsewhere}");
         let mut missing = pick.clone();
         missing.as_object_mut().unwrap().remove("version");
-        let missing = node.rpc(client(None), missing).await.unwrap_err();
+        let missing = node
+            .rpc(client(None), crate::command::business_fixture(missing))
+            .await
+            .unwrap_err();
         assert!(
             missing
                 .to_string()
@@ -649,7 +660,10 @@ mod tests {
             "{missing}"
         );
         let in_bots = node
-            .rpc(client(None), request("bots", None, Some(cloud))?)
+            .rpc(
+                client(None),
+                crate::command::business_fixture(request("bots", None, Some(cloud))?),
+            )
             .await;
         assert!(in_bots.is_err(), "the bots scope has no face");
         assert_eq!(
@@ -658,7 +672,12 @@ mod tests {
             "no version before any change"
         );
 
-        let written = node.rpc(client(Some("c")), pick.clone()).await?;
+        let written = node
+            .rpc(
+                client(Some("c")),
+                crate::command::business_fixture(pick.clone()),
+            )
+            .await?;
         let (_, picked) = shown(&node).await?;
         let picked = picked.context("a written face has a version")?;
         assert_eq!(picked.len(), 16);
@@ -672,13 +691,18 @@ mod tests {
         let count = events(&node).await?;
         let mut forged = request("c", None, Some(bean))?;
         forged["version"] = json!(picked);
-        let forged = node.rpc(client(None), forged).await.unwrap_err();
+        let forged = node
+            .rpc(client(None), crate::command::business_fixture(forged))
+            .await
+            .unwrap_err();
         assert!(
             format!("{forged:#}").contains("device signature does not match"),
             "the signature covers the version: {forged:#}"
         );
         assert_eq!(events(&node).await?, count);
-        let again = node.rpc(client(None), pick.clone()).await?;
+        let again = node
+            .rpc(client(None), crate::command::business_fixture(pick.clone()))
+            .await?;
         assert_eq!(again["bot"]["avatar_version"], json!(picked));
         assert_eq!(
             events(&node).await?,
@@ -686,13 +710,19 @@ mod tests {
             "a retry after the write landed writes nothing"
         );
 
-        node.rpc(client(None), request("c", Some(picked.clone()), None)?)
-            .await?;
+        node.rpc(
+            client(None),
+            crate::command::business_fixture(request("c", Some(picked.clone()), None)?),
+        )
+        .await?;
         let (face, back) = shown(&node).await?;
         assert_eq!(face, None, "back to the face the id gives");
         let back = back.context("going back is a change too")?;
         let count = events(&node).await?;
-        let stale = node.rpc(client(None), pick.clone()).await.unwrap_err();
+        let stale = node
+            .rpc(client(None), crate::command::business_fixture(pick.clone()))
+            .await
+            .unwrap_err();
         assert!(
             stale.to_string().contains("changed since you saw it"),
             "{stale}"
@@ -703,9 +733,15 @@ mod tests {
             "the face went back to what the request saw, yet its version moved on"
         );
 
-        node.rpc(client(None), request("c", Some(back), Some(bean))?)
-            .await?;
-        let stale = node.rpc(client(None), pick).await.unwrap_err();
+        node.rpc(
+            client(None),
+            crate::command::business_fixture(request("c", Some(back), Some(bean))?),
+        )
+        .await?;
+        let stale = node
+            .rpc(client(None), crate::command::business_fixture(pick))
+            .await
+            .unwrap_err();
         assert!(
             stale.to_string().contains("changed since you saw it"),
             "{stale}"

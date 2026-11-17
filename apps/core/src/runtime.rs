@@ -1,3 +1,6 @@
+use crate::command::{
+    BusinessCommand, BusinessInput, BusinessMethodError, BusinessRejection, ReadConsistency,
+};
 pub(crate) use crate::store::actor::{ClientAuthorityState, ClientMembership};
 use crate::{
     config::{self, Config},
@@ -597,20 +600,6 @@ pub fn now_ms() -> i64 {
         .as_millis()
         .min(i64::MAX as u128) as i64
 }
-/// These display requests may use committed WAL snapshots; mutation receipts and controls cannot.
-pub(crate) fn snapshot_rpc(method: &str) -> bool {
-    matches!(
-        method,
-        "conversations"
-            | "conversation_history"
-            | "open_works"
-            | "workspace_overview"
-            | "workspace_state"
-            | "workspace_history"
-            | "notifications"
-    )
-}
-
 fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
     let s = v[key]
         .as_str()
@@ -1792,7 +1781,11 @@ impl Runtime {
             "codex":codex})
     }
 
-    pub async fn rpc(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
+    pub(crate) async fn rpc(
+        self: &Arc<Self>,
+        access: Access,
+        input: BusinessInput,
+    ) -> Result<Value> {
         let _lease = match &access {
             Access::Agent(AgentAccess::Invocation(invocation)) => {
                 Some(self.manager_tool_lease(invocation).await?)
@@ -1801,13 +1794,31 @@ impl Runtime {
         };
         self.rpc_inner(access, input).await
     }
-    async fn rpc_inner(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
+    async fn rpc_inner(self: &Arc<Self>, access: Access, command: BusinessInput) -> Result<Value> {
         let _work = self.maintenance.enter()?;
-        let method = field(&input, "method")?;
-        if !access.is_user() {
-            ensure!(method == "nodes", "method unavailable to Agent tokens");
+        let command = match command {
+            Ok(command) => Ok(command),
+            Err(BusinessRejection::MethodField { error, .. }) => match error {
+                BusinessMethodError::Required => bail!("method is required"),
+                BusinessMethodError::Invalid => bail!("invalid method"),
+            },
+            Err(BusinessRejection::UnsupportedName { params }) => Err(params),
+        };
+        let input = match &command {
+            Ok(command) => command.params(),
+            Err(params) => params,
         }
-        let snapshot = access.is_user() && snapshot_rpc(method);
+        .value();
+        if !access.is_user() {
+            ensure!(
+                matches!(&command, Ok(BusinessCommand::Nodes(_))),
+                "method unavailable to Agent tokens"
+            );
+        }
+        let snapshot = access.is_user()
+            && command
+                .as_ref()
+                .is_ok_and(|command| command.consistency() == ReadConsistency::CommittedDisplay);
         let network = access.network_id();
         let node_id = self.identity.device_id()?;
         if snapshot {
@@ -1833,13 +1844,16 @@ impl Runtime {
         }
         let scope = input["conversation_id"].as_str().map(String::from);
         if let Some(scope) = &scope
-            && !matches!(method, "create_conversation" | "create_bot")
+            && !matches!(
+                &command,
+                Ok(BusinessCommand::CreateConversation(_) | BusinessCommand::CreateBot(_))
+            )
             && !snapshot
         {
             self.require_scope(&access, scope).await?;
         }
-        match method {
-            "nodes" => {
+        match &command {
+            Ok(BusinessCommand::Nodes(_)) => {
                 let query_network = network.to_owned();
                 let bundle = self
                     .store
@@ -1904,25 +1918,25 @@ impl Runtime {
                 }
                 Ok(json!({"nodes":nodes}))
             }
-            "conversations" => {
+            Ok(BusinessCommand::Conversations(_)) => {
                 let network = network.to_owned();
                 let conversations = self
-                    .read_display(&access, &input, "conversations", move |store| {
+                    .read_display(&access, input, "conversations", move |store| {
                         store.conversations(&network)
                     })
                     .await?;
                 Ok(json!({"conversations":conversations}))
             }
-            "create_conversation" => {
+            Ok(BusinessCommand::CreateConversation(_)) => {
                 ensure!(access.is_user(), "only the user creates conversations");
-                let scope = id(&input, "conversation_id")?;
-                let title = field(&input, "title")?;
+                let scope = id(input, "conversation_id")?;
+                let title = field(input, "title")?;
                 ensure!(title.len() <= 512, "title too long");
                 let identity = self.identity.clone();
                 let query_network = network.to_owned();
                 let query_scope = scope.clone();
                 let title = title.to_owned();
-                let owner = first_owner(&input)?;
+                let owner = first_owner(input)?;
                 let conversation = self
                     .store
                     .call("create_conversation", move |store| {
@@ -1939,38 +1953,46 @@ impl Runtime {
                 self.publish_changed(network, &scope, Changed::Reload);
                 Ok(json!(conversation))
             }
-            "conversation" => self.conversation_snapshot(&access, &input).await,
-            "conversation_history" => self.conversation_history(&access, &input).await,
-            "open_works" => {
+            Ok(BusinessCommand::Conversation(_)) => {
+                self.conversation_snapshot(&access, input).await
+            }
+            Ok(BusinessCommand::ConversationHistory(_)) => {
+                self.conversation_history(&access, input).await
+            }
+            Ok(BusinessCommand::OpenWorks(_)) => {
                 ensure!(access.is_user(), "only clients list open works");
                 let network = network.to_owned();
                 let works = self
-                    .read_display(&access, &input, "open_works", move |store| {
+                    .read_display(&access, input, "open_works", move |store| {
                         chat_controls::open_works(store, &network, None)
                     })
                     .await?;
                 Ok(json!({"works":works}))
             }
-            "work_detail" => self.work_detail(&access, &input).await,
-            "workspace_overview" => self.workspace_overview(&access, &input).await,
-            "workspace_command" => self.workspace_command(&access, &input).await,
-            "signed_receipt" => {
+            Ok(BusinessCommand::WorkDetail(_)) => self.work_detail(&access, input).await,
+            Ok(BusinessCommand::WorkspaceOverview(_)) => {
+                self.workspace_overview(&access, input).await
+            }
+            Ok(BusinessCommand::WorkspaceCommand(_)) => {
+                self.workspace_command(&access, input).await
+            }
+            Ok(BusinessCommand::SignedReceipt(_)) => {
                 ensure!(
                     access.is_user() && access.conversation_id().is_none(),
                     "signed receipt requires the authenticated user"
                 );
                 let network = network.to_owned();
-                let client = field(&input, "client_id")?.to_owned();
-                let scope = id(&input, "scope_id")?;
+                let client = field(input, "client_id")?.to_owned();
+                let scope = id(input, "scope_id")?;
                 let body = input["body"].clone();
-                let attestation = attestation(&input)?;
+                let attestation = attestation(input)?;
                 self.store
                     .call("signed_receipt", move |store| {
                         store.client_signed_receipt(&network, &client, &scope, body, &attestation)
                     })
                     .await
             }
-            "workspace_command_receipt" => {
+            Ok(BusinessCommand::WorkspaceCommandReceipt(_)) => {
                 ensure!(
                     access.is_user() && access.conversation_id().is_none(),
                     "workspace receipt requires the authenticated user"
@@ -1980,10 +2002,10 @@ impl Runtime {
                     "receipt must identify the original user command"
                 );
                 let network = network.to_owned();
-                let client = field(&input, "client_id")?.to_owned();
-                let command_id = id(&input, "command_id")?;
+                let client = field(input, "client_id")?.to_owned();
+                let command_id = id(input, "command_id")?;
                 let command = serde_json::from_value(input["command"].clone())?;
-                let attestation = attestation(&input)?;
+                let attestation = attestation(input)?;
                 self.store
                     .call("workspace_command_receipt", move |store| {
                         store.client_workspace_receipt(
@@ -1996,56 +2018,64 @@ impl Runtime {
                     })
                     .await
             }
-            "workspace_state" => self.workspace_state(&access, &input).await,
-            "workspace_history" => self.workspace_history(&access, &input).await,
-            "message" => self.accept_chat_message(&access, &input).await,
-            "input_receipt" => self.input_receipt(&access, &input).await,
-            "scope_context" => self.scope_context(&access, &input).await,
-            "set_owner" => {
-                let scope = scope.context("conversation_id is required")?;
-                self.set_owner(&access, &scope, &input).await
+            Ok(BusinessCommand::WorkspaceState(_)) => self.workspace_state(&access, input).await,
+            Ok(BusinessCommand::WorkspaceHistory(_)) => {
+                self.workspace_history(&access, input).await
             }
-            "read_artifact" => self.read_artifact(&access, &input).await,
-            "upload_attachment" => self.upload_attachment(&access, &input).await,
-            "interrupt_work" => {
+            Ok(BusinessCommand::Message(_)) => self.accept_chat_message(&access, input).await,
+            Ok(BusinessCommand::InputReceipt(_)) => self.input_receipt(&access, input).await,
+            Ok(BusinessCommand::ScopeContext(_)) => self.scope_context(&access, input).await,
+            Ok(BusinessCommand::SetOwner(_)) => {
+                let scope = scope.context("conversation_id is required")?;
+                self.set_owner(&access, &scope, input).await
+            }
+            Ok(BusinessCommand::ReadArtifact(_)) => self.read_artifact(&access, input).await,
+            Ok(BusinessCommand::UploadAttachment(_)) => {
+                self.upload_attachment(&access, input).await
+            }
+            Ok(BusinessCommand::InterruptWork(_)) => {
                 ensure!(access.is_user(), "only the user stops work");
                 let scope = scope.context("conversation_id is required")?;
-                self.stop_work(network, &scope, &id(&input, "work_id")?)
+                self.stop_work(network, &scope, &id(input, "work_id")?)
                     .await
             }
-            "codex_state" => {
+            Ok(BusinessCommand::CodexState(_)) => {
                 ensure!(access.is_user(), "only the user reaches the App Server");
-                self.codex_state(network, &input).await
+                self.codex_state(network, input).await
             }
-            "bots" => self.bots(&access).await,
-            "questions" => self.questions(&access).await,
-            "answer" => self.answer_question(&access, &input).await,
-            "create_bot" => self.create_bot(&access, &input).await,
-            "delete_bot" => self.delete_bot(&access, &input).await,
-            "set_primary_bot" => self.set_primary_bot(&access, &input).await,
-            "set_bot_project" => self.set_bot_project(&access, &input).await,
-            "set_bot_avatar" => self.set_bot_avatar(&access, &input).await,
-            "control_schedule" => self.control_schedule(&access, &input).await,
-            "control_memory" => self.control_memory(&access, &input).await,
-            "memory_state" => self.memory_state(&access, &input).await,
-            "cancel_manager" => self.cancel_manager(&access, &input).await,
-            "reply_unanswered" => self.settle_unanswered(&access, &input, false).await,
-            "dismiss_unanswered" => self.settle_unanswered(&access, &input, true).await,
-            "resolve" => self.resolve_check(&access, &input).await,
-            "notifications" => {
+            Ok(BusinessCommand::Bots(_)) => self.bots(&access).await,
+            Ok(BusinessCommand::Questions(_)) => self.questions(&access).await,
+            Ok(BusinessCommand::Answer(_)) => self.answer_question(&access, input).await,
+            Ok(BusinessCommand::CreateBot(_)) => self.create_bot(&access, input).await,
+            Ok(BusinessCommand::DeleteBot(_)) => self.delete_bot(&access, input).await,
+            Ok(BusinessCommand::SetPrimaryBot(_)) => self.set_primary_bot(&access, input).await,
+            Ok(BusinessCommand::SetBotProject(_)) => self.set_bot_project(&access, input).await,
+            Ok(BusinessCommand::SetBotAvatar(_)) => self.set_bot_avatar(&access, input).await,
+            Ok(BusinessCommand::ControlSchedule(_)) => self.control_schedule(&access, input).await,
+            Ok(BusinessCommand::ControlMemory(_)) => self.control_memory(&access, input).await,
+            Ok(BusinessCommand::MemoryState(_)) => self.memory_state(&access, input).await,
+            Ok(BusinessCommand::CancelManager(_)) => self.cancel_manager(&access, input).await,
+            Ok(BusinessCommand::ReplyUnanswered(_)) => {
+                self.settle_unanswered(&access, input, false).await
+            }
+            Ok(BusinessCommand::DismissUnanswered(_)) => {
+                self.settle_unanswered(&access, input, true).await
+            }
+            Ok(BusinessCommand::Resolve(_)) => self.resolve_check(&access, input).await,
+            Ok(BusinessCommand::Notifications(_)) => {
                 let network = network.to_owned();
-                let client = field(&input, "client_id")?.to_owned();
+                let client = field(input, "client_id")?.to_owned();
                 let notifications = self
-                    .read_display(&access, &input, "notifications", move |store| {
+                    .read_display(&access, input, "notifications", move |store| {
                         store.pending_notifications(&network, &client)
                     })
                     .await?;
                 Ok(json!({"notifications":notifications}))
             }
-            "dismiss_work" => {
+            Ok(BusinessCommand::DismissWork(_)) => {
                 ensure!(access.is_user(), "only clients close failed works");
                 let scope = scope.context("conversation_id is required")?;
-                let work_id = id(&input, "work_id")?;
+                let work_id = id(input, "work_id")?;
                 let query_network = network.to_owned();
                 let query_scope = scope.clone();
                 let query_work = work_id.clone();
@@ -2070,16 +2100,16 @@ impl Runtime {
                     EventBody::NotificationAcked {
                         notification_id: work_id,
                         client_id: INBOX_CLIENT.into(),
-                        attestation: Some(attestation(&input)?),
+                        attestation: Some(attestation(input)?),
                     },
                 )
                 .await?;
                 Ok(json!({"dismissed":true}))
             }
-            "ack" => {
+            Ok(BusinessCommand::Ack(_)) => {
                 ensure!(access.is_user(), "only clients acknowledge notifications");
-                let notification = id(&input, "notification_id")?;
-                let client = id(&input, "client_id")?;
+                let notification = id(input, "notification_id")?;
+                let client = id(input, "client_id")?;
                 let query_network = network.to_owned();
                 let query_client = client.clone();
                 let pending = self
@@ -2098,14 +2128,14 @@ impl Runtime {
                         EventBody::NotificationAcked {
                             notification_id: notification,
                             client_id: client,
-                            attestation: Some(attestation(&input)?),
+                            attestation: Some(attestation(input)?),
                         },
                     )
                     .await?;
                 }
                 Ok(json!({"acknowledged":true}))
             }
-            _ => bail!("unknown method"),
+            Err(_params) => bail!("unknown method"),
         }
     }
     fn allowed_path(&self, path: &str) -> Result<PathBuf> {
