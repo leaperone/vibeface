@@ -23,9 +23,10 @@ function HomePage() {
             <h1 id="hero-title">Your computers.<br />One conversation.</h1>
             <p className="hero-lede">Ask a bot to work on your Mac or Linux machine. Choose where it runs and read the result in the same chat.</p>
             <div className="hero-actions">
-              <Link className="button button-primary" to="/docs/$" params={{ _splat: 'quick-start' }}>Start with one computer <ArrowRight size={16} aria-hidden="true" /></Link>
-              <Link className="button button-quiet" to="/docs/$" params={{ _splat: 'overview' }}>Read the overview <ArrowRight size={16} aria-hidden="true" /></Link>
+              <Link className="button button-primary" to="/docs/$" params={{ _splat: 'quick-start' }} hrefLang="zh-CN" aria-describedby="guide-language">Start with one computer <ArrowRight size={16} aria-hidden="true" /></Link>
+              <Link className="button button-quiet" to="/docs/$" params={{ _splat: 'overview' }} hrefLang="zh-CN" aria-describedby="guide-language">Read the overview <ArrowRight size={16} aria-hidden="true" /></Link>
             </div>
+            <p id="guide-language" className="guide-language">Guides are currently in Chinese.</p>
           </div>
 
           <figure className="hero-figure" aria-label="A visual map of a conversation, the selected computer, and shared history">

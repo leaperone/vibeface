@@ -1,0 +1,34 @@
+/* Product layout only: shared Arc fields and controls retain their foundation. */
+.conversation {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  overflow-y: hidden;
+}
+.history { display: flex; min-width: 0; min-height: 0; flex-direction: column; }
+.targetControls { display: flex; min-width: 0; flex: 1; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.conversation > form > div:has(> .targetControls:empty) { display: none; }
+.receiptHelp { flex-basis: 100%; }
+.receiptHelp > summary { width: 100%; }
+.taskHeader .desktopContextTrigger, .taskHeader .desktopTaskActions { display: none; }
+.mobileContextTrigger, .mobileTaskActions { flex: none; }
+.contextDrawer[data-side] { width: 100%; max-width: none; }
+.contextDrawer .contextReading { max-height: none; overflow: visible; }
+
+@media (min-width: 40rem) {
+  .taskHeader .mobileContextTrigger, .taskHeader .mobileTaskActions { display: none; }
+  .taskHeader .desktopContextTrigger { display: inline-flex; }
+  .taskHeader .desktopTaskActions { display: block; }
+}
+
+@media (width < 40rem) {
+  .taskHeader { gap: var(--space-2); padding-block: var(--space-2); }
+  .channelHeader { gap: 0; padding-block: var(--space-2); }
+  .conversation > .search { padding-top: var(--space-2); }
+  .conversation[data-composer-idle] > form:not(:focus-within) textarea {
+    min-height: calc(1lh + 2 * var(--space-3) + 2px);
+    height: calc(1lh + 2 * var(--space-3) + 2px);
+  }
+  .empty { padding-block: var(--space-3); }
+  .empty > [aria-hidden="true"] { display: none; }
+  .empty h3 { margin-top: var(--space-3); }
+}

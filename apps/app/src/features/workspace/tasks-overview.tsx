@@ -4,7 +4,7 @@ import { TaskRunSummary } from "@/components/arc/task-run-summary"
 import { Select } from "@vibeface/uiarc/select/select.tsx"
 "use client"
 
-import { CountBadge,EmptyState,Segmented,Skeleton,StatusPill,type Tone } from "@/components/arc/product-kit"
+import { CountBadge,Details,EmptyState,InlineError,Segmented,Skeleton,StatusPill,type Tone } from "@/components/arc/product-kit"
 import { RecordBody,RecordPanel } from "@/components/arc/record-panel"
 import { cn } from "@/lib/utils"
 import { Link } from "@tanstack/react-router"
@@ -12,14 +12,14 @@ import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { workFailure } from "@vibeface/client/lib/errors.ts"
 import type { MembershipView } from "@vibeface/client/lib/node.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
-import { cardState,needsLook,nodeName,overviewScope,staleTaskLabel,taskActive,taskGroups,taskLabel,taskProgress,taskStale,workspaceActivities,type TaskGroup } from "@vibeface/client/workspace/labels.ts"
+import { cardState,needsLook,nodeName,overviewScope,schedulerStatus,staleTaskLabel,taskActive,taskGroups,taskLabel,taskProgress,taskStale,workspaceActivities,type TaskGroup } from "@vibeface/client/workspace/labels.ts"
 import { openWorksFromOverview,overviewFromWorkspace } from "@vibeface/client/workspace/model.ts"
 import { projectName } from "@vibeface/client/workspace/questions.ts"
 import type { NodeInfo,OpenWorkCard,OverviewTask,WorkspaceActivity } from "@vibeface/client/workspace/types.ts"
 import { Button } from "@vibeface/uiarc/button/button.tsx"
 import { Bot,ChevronRight,CircleQuestionMark,CircleX,FolderOpen,Laptop,ListChecks,LoaderCircle,MessageCircle,Plus } from "lucide-react"
 import type { ReactNode } from "react"
-import { useState } from "react"
+import { useCallback,useState } from "react"
 import { useInbox } from "./inbox"
 import { PendingSection } from "./pending-section"
 import { useCreateBot } from "./workspace-shell"
@@ -36,6 +36,8 @@ export function TasksOverview() {
   const { directory } = useDevice()
   const [filter, setFilter] = useState<TaskGroup | "all">("all")
   const [botFilter, setBotFilter] = useState("all")
+  const [readFailure, setReadFailure] = useState<{ generation: number; cause: unknown; kind: "workspace" | "tasks" } | null>(null)
+  const handleReadError = useCallback((cause: unknown) => setReadFailure({ generation: workspace.generation, cause, kind: "tasks" }), [workspace.generation])
   const inbox = useInbox()
   const failedIds = new Set(inbox.flatMap((item) => item.kind === "failed" ? [item.work.work_id] : []))
   type InboxItem = (typeof inbox)[number]
@@ -43,7 +45,8 @@ export function TasksOverview() {
   const localOverview = overviewFromWorkspace({ openWorks: workspace.openWorks, bots: workspace.bots, questions: workspace.questions, nodes: workspace.nodes })
   const overview = workspace.overview ?? localOverview
   const overviewWorks = openWorksFromOverview(overview, workspace.openWorks)
-  const read = workspace.synced
+  // The task snapshot does not wait for conversation reads or write alignment.
+  const read = Boolean(workspace.synced || workspace.nodesRead)
   const projected = new Map([...localOverview.tasks, ...overview.tasks].filter((task): task is ProjectedWork => (task.kind === "work" || task.kind === "dispatch") && Boolean(task.work_id)).map((task) => [JSON.stringify([task.conversation_id, task.work_id]), task]))
   const projection = (work: OpenWorkCard) => projected.get(JSON.stringify([work.conversation_id, work.work_id]))
   const needsConfirmation = (check: { conversation_id: string; work_id: string; target_node: string }) => {
@@ -84,30 +87,59 @@ export function TasksOverview() {
   const visible = (group: TaskGroup) => filter === "all" || filter === group
   const visibleCount = (visible("attention") ? visibleGroups.attention.length + heldGroups.attention : 0) + (visible("working") ? visibleGroups.working.length + heldGroups.working : 0) + (visible("waiting") ? visibleGroups.waiting.length + heldGroups.waiting : 0) + businessTasks.filter((task) => filter === "all" || taskStates[filter].includes(task.state)).length
   const hasContent = visibleCount > 0
-  const emptyLabel = !read ? workspace.connectionOnline ? "正在读取当前连接的任务" : "尚未读取任务，连接后再确认" : filter === "all" && botFilter === "all" ? "当前记录没有未完成的任务" : "没有符合筛选的任务"
+  const tasksRead = read && Boolean(workspace.workspaceState)
+  // Test all loaded records before filters, including history and work held in 待处理.
+  const hasTaskRecords = Boolean(workspace.workspaceState?.tasks.length || overviewWorks.length || overview.tasks.length || activityView.activities.length
+    || inbox.some((item) => ["question", "confirm", "failed", "undelivered", "attention", "session"].includes(item.kind)))
+  const globallyEmpty = tasksRead && !hasTaskRecords
+  const localReadError = readFailure && readFailure.generation === workspace.generation && (readFailure.kind === "workspace" ? !read : !workspace.workspaceState) ? readFailure.cause : null
+  // A successful refresh leaves the global toast object in place; it is no longer a first-read failure once synced.
+  const readError = localReadError ?? (!read ? workspace.error?.text ?? null : null)
+  // Stage the entire first read, including saved records. Errors/offline release known work immediately.
+  const loading = !tasksRead && (!hasTaskRecords || workspace.connectionOnline && !readError)
+  const pendingVisible = !loading || !workspace.connectionOnline || Boolean(readError)
+  const scope = [...overviewScope(overview.coverage), ...(!read ? ["当前连接尚未完成首读"] : !workspace.connectionOnline ? ["连接已断开，显示最近记录"] : [])].join(" · ")
+  const emptyLabel = !tasksRead ? workspace.connectionOnline ? "正在读取当前连接的任务" : "尚未读取任务，连接后再确认" : filter === "all" && botFilter === "all" ? "当前记录没有未完成的任务" : "没有符合筛选的任务"
   const card = (activity: WorkspaceActivity) => {
     if (activity.kind === "work" && activity.work) return <div key={activity.id} className="grid gap-2"><TaskOverviewCard work={activity.work} projected={activity.projection} bot={activityBot(activity)} waiting={activity.facts.questions.length > 0} lookup={lookup} connected={workspace.connectionOnline && read} progress={taskProgress(activity.work, workspace.liveProgress)} />{activity.facts.overviewChecks.map((check) => <OverviewCheckCard key={`overview-check:${check.check_id}`} check={check} />)}</div>
-    if (activity.kind === "turn" && activity.job) return <TurnActivity key={activity.id} activity={activity} />
+    if (activity.kind === "turn" && activity.job) return <TurnActivity key={activity.id} activity={activity} lookup={lookup} />
     if (activity.kind === "attention" && activity.attention) return <AttentionActivity key={activity.id} activity={activity} bot={activityBot(activity)} read={read} />
     return null
   }
   const bot = workspace.bots.find((item) => item.bot_id === botFilter) ?? workspace.selectedBot ?? workspace.bots[0]
 
+  function retryRead() {
+    if (!workspace.isCurrent()) return
+    setReadFailure(null)
+    const generation = workspace.generation, kind = read ? "tasks" : "workspace"
+    const attempt = read ? workspace.readWorkspaceState() : workspace.refresh()
+    void attempt.catch((cause) => { if (workspace.isCurrent()) setReadFailure({ generation, kind, cause }) })
+  }
+
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
-    <PendingSection />
-    <p className="sr-only" role="status" aria-live="polite">{hasContent ? `${visibleCount} 项任务` : emptyLabel}</p>
-    <TaskRunSummary attention={read ? visibleGroups.attention.length + heldGroups.attention + taskCounts.attention : null} working={read ? visibleGroups.working.length + heldGroups.working + taskCounts.working : null} waiting={read ? visibleGroups.waiting.length + heldGroups.waiting + taskCounts.waiting : null} online={workspace.connectionOnline} />
-    <p className="text-sm text-secondary">{[...overviewScope(overview.coverage), ...(!read ? ["当前连接尚未完成首读"] : !workspace.connectionOnline ? ["连接已断开，显示最近记录"] : [])].join(" · ")}</p>
-    <TaskFilters filter={filter} botFilter={botFilter} bots={workspace.bots} onFilter={setFilter} onBotFilter={setBotFilter} />
-    <WorkspaceTasks botFilter={botFilter} filter={filter} />
-    {taskGroups.map(({ group, title }) => {
-      if (!visible(group)) return null
-      const count = visibleGroups[group].length
-      return count ? <OverviewSection key={group} title={title} count={count}>
-        {visibleGroups[group].map(card)}
-      </OverviewSection> : null
-    })}
-    {!hasContent && !read && workspace.connectionOnline ? <div aria-busy="true" className="grid gap-3"><Skeleton className="h-20" /><Skeleton className="h-20" /></div> : !hasContent ? <WorkspaceEmpty title={emptyLabel} bot={bot} onCreate={createBot} /> : null}
+    <div className={pendingVisible ? "contents" : "hidden"}><PendingSection /></div>
+    {loading || !read && readError ? <div aria-busy={loading && workspace.connectionOnline && !readError || undefined} className="grid gap-3">
+      <p role="status" className="text-sm text-secondary">{readError ? hasTaskRecords ? "任务记录还没读全" : "任务还没读到" : emptyLabel}</p>
+      <p className="text-sm text-secondary">{scope}</p>
+      <InlineError error={readError} action={{ label: "重新读取", onClick: retryRead }} />
+      {loading && workspace.connectionOnline && !readError ? <><Skeleton className="h-20" /><Skeleton className="h-20" /></> : null}
+    </div> : null}
+    <div className={loading ? "hidden" : "contents"}>
+      <p className="sr-only" role="status" aria-live="polite">{hasContent ? `${visibleCount} 项任务` : emptyLabel}</p>
+      {globallyEmpty ? null : <TaskRunSummary attention={read ? visibleGroups.attention.length + heldGroups.attention + taskCounts.attention : null} working={read ? visibleGroups.working.length + heldGroups.working + taskCounts.working : null} waiting={read ? visibleGroups.waiting.length + heldGroups.waiting + taskCounts.waiting : null} online={workspace.connectionOnline} />}
+      <p className="text-sm text-secondary">{scope}</p>
+      {globallyEmpty ? null : <TaskFilters filter={filter} botFilter={botFilter} bots={workspace.bots} onFilter={setFilter} onBotFilter={setBotFilter} />}
+      <WorkspaceTasks botFilter={botFilter} filter={filter} onReadError={handleReadError} showEmpty={globallyEmpty} />
+      {taskGroups.map(({ group, title }) => {
+        if (!visible(group)) return null
+        const count = visibleGroups[group].length
+        return count ? <OverviewSection key={group} title={title} count={count}>
+          {visibleGroups[group].map(card)}
+        </OverviewSection> : null
+      })}
+      {globallyEmpty && !workspace.bots.length ? <div><Button type="button" onClick={createBot}><Plus aria-hidden="true" />新 Bot</Button></div> : null}
+      {!globallyEmpty && !loading && !hasContent ? <WorkspaceEmpty title={emptyLabel} bot={bot} onCreate={createBot} onClear={filter !== "all" || botFilter !== "all" ? () => { setFilter("all"); setBotFilter("all") } : undefined} /> : null}
+    </div>
   </div>
 }
 
@@ -115,10 +147,16 @@ function OverviewCheckCard({ check, read = true }: { check: Extract<OverviewTask
   return <RecordPanel><RecordBody className="grid gap-2"><p className="font-medium">{check.work_id ? "任务状态待确认" : "程序状态待确认"}</p><p className="text-sm text-secondary">{check.bot?.name ?? (read ? "未找到所属 Bot" : "Bot 身份未加载")}{check.bot ? " · 请到所属 Bot 查看" : ""}</p>{check.bot ? <RoutedAction variant="secondary" to="/b/$botId" params={{ botId: check.bot.bot_id }}>打开 {check.bot.name}</RoutedAction> : null}</RecordBody></RecordPanel>
 }
 
-function TurnActivity({ activity }: { activity: Extract<WorkspaceActivity, { kind: "turn" }> }) {
+function TurnActivity({ activity, lookup }: { activity: Extract<WorkspaceActivity, { kind: "turn" }>; lookup: { nodes: NodeInfo[]; directory: MembershipView | null } }) {
   const job = activity.job
   if (!job) return null
-  return <RecordPanel><RecordBody className="grid gap-1"><p className="font-medium">后台工作</p><p className="text-sm text-secondary">{job.state} · {job.trigger || "未提供触发信息"}</p>{"source_node" in job && job.source_node ? <p className="text-sm text-secondary">来源设备 · {job.source_node}</p> : null}</RecordBody></RecordPanel>
+  const purpose = job.trigger.startsWith("message:") ? "处理消息" : job.trigger.startsWith("task:") ? "推进任务" : job.trigger.startsWith("schedule:") ? "定时工作" : "后台工作"
+  return <RecordPanel className="min-w-0"><RecordBody className="grid min-w-0 gap-2 [overflow-wrap:anywhere]">
+    <p className="font-medium">{purpose}</p>
+    <p className="text-sm text-secondary">{schedulerStatus(job.state).label}</p>
+    {job.source_node ? <p className="text-sm text-secondary">来源设备 · {nodeName(job.source_node, lookup, "未知设备")}</p> : null}
+    <Details label="技术详情" className="min-w-0 [overflow-wrap:anywhere]"><dl className="grid min-w-0 gap-1 text-sm"><dt>状态标识</dt><dd>{job.state}</dd><dt>触发记录</dt><dd>{job.trigger || "未提供"}</dd>{job.source_node ? <><dt>来源设备标识</dt><dd>{job.source_node}</dd></> : null}</dl></Details>
+  </RecordBody></RecordPanel>
 }
 
 function AttentionActivity({ activity, bot, read }: { activity: Extract<WorkspaceActivity, { kind: "attention" }>; bot?: { bot_id: string; name: string }; read: boolean }) {
@@ -137,8 +175,8 @@ function TaskFilters({ filter, botFilter, bots, onFilter, onBotFilter }: { filte
   </section>
 }
 
-function WorkspaceEmpty({ title, bot, onCreate }: { title: string; bot?: { bot_id: string; name: string }; onCreate: () => void }) {
-  return <EmptyState icon={ListChecks} title={title} action={bot ? <RoutedAction variant="secondary" to="/b/$botId" params={{ botId: bot.bot_id }}><MessageCircle aria-hidden="true" />打开 {bot.name}</RoutedAction> : <Button type="button" onClick={onCreate}><Plus aria-hidden="true" />新 Bot</Button>} />
+function WorkspaceEmpty({ title, bot, onCreate, onClear }: { title: string; bot?: { bot_id: string; name: string }; onCreate: () => void; onClear?: () => void }) {
+  return <EmptyState icon={ListChecks} title={title} action={onClear ? <Button type="button" variant="secondary" onClick={onClear}>清除筛选</Button> : bot ? <RoutedAction variant="secondary" to="/b/$botId" params={{ botId: bot.bot_id }}><MessageCircle aria-hidden="true" />打开 {bot.name}</RoutedAction> : <Button type="button" onClick={onCreate}><Plus aria-hidden="true" />新 Bot</Button>} />
 }
 
 function OverviewSection({ title, count, children }: { title: string; count: number; children: ReactNode }) {

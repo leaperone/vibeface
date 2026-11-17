@@ -1,19 +1,20 @@
-[
-  "overview",
-  "quick-start",
-  "onboarding",
-  "user-guide",
-  "cli",
-  "comparison",
-  "install",
-  "ios",
-  "mobile-push",
-  "bot-and-execution",
-  "history-sync",
-  "privacy-security",
-  "node",
-  "deployment",
-  "troubleshooting",
-  "releasing",
-  "ci"
-]
+{
+  "groups": [
+    {
+      "title": "开始使用",
+      "pages": ["overview", "quick-start", "onboarding", "user-guide"]
+    },
+    {
+      "title": "Bot 与任务",
+      "pages": ["bot-and-execution", "cli", "comparison", "history-sync"]
+    },
+    {
+      "title": "设备与安全",
+      "pages": ["install", "ios", "mobile-push", "privacy-security", "troubleshooting"]
+    },
+    {
+      "title": "部署与开发",
+      "pages": ["node", "deployment", "releasing", "ci"]
+    }
+  ]
+}

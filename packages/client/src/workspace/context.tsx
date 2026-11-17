@@ -92,6 +92,8 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   // Read synchronously: the chat route selects its conversation in the same commit that sets the view.
   const viewRef = useRef<WorkspaceView>("other")
   const [nodes, setNodes] = useState<NodeInfo[]>([])
+  // A node snapshot is usable before conversation history finishes, including while writes align.
+  const nodesRead = useRef<{ connection: ReadyConnection; generation: number } | null>(null)
   const nodesRef = useRef(nodes)
   nodesRef.current = nodes
   const [writeState, setWriteState] = useState<WriteStatus>({ state: "writable", conflicts: [] })
@@ -486,6 +488,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       openWorksRef.current = parseOpenWorks(rawWorks)
       if (rawOverview !== null) setOverview(parseWorkspaceOverview(rawOverview))
       botsRef.current = nextBots
+      nodesRead.current = { connection, generation: connectionGeneration }
       setNodes(nextNodes); setNotifications(nextNotifications); setBots(nextBots); setPrimary(parsePrimary(rawBots)); setWriteState(parseWriteStatus(rawWrite)); setQuestions(nextQuestions); setOpenWorks(openWorksRef.current)
       if (botCreationRef.current && nextBots.some((item) => item.bot_id === botCreationRef.current?.bot_id)) clearPendingBot()
       notificationsRef.current = nextNotifications
@@ -704,7 +707,12 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const timer = setInterval(() => {
       ticks += 1
       if (ticks % 20 === 0) scheduleRefresh()
-      else if (openWorksRef.current.length || nodesRef.current.some((node) => !node.revoked && !node.online)) connection.rpc("nodes").then((raw) => { if (current()) setNodes(parseNodes(raw)) }, () => {})
+      else if (openWorksRef.current.length || nodesRef.current.some((node) => !node.revoked && !node.online)) connection.rpc("nodes").then((raw) => {
+        if (!current()) return
+        const nextNodes = parseNodes(raw)
+        nodesRead.current = { connection, generation: connectionGeneration }
+        setNodes(nextNodes)
+      }, () => {})
     }, 15000)
     const stopForeground = platform.onForeground(scheduleRefresh)
     return () => {
@@ -1344,7 +1352,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       viewRef.current = next; setView(next); clearMessages()
       if (next === "chat" || next === "tasks") scheduleRefresh()
       else { onScreen.current = null; setFresh(new Set<string>()) }
-    }, nodes, conversationId, data: visibleData, dataOrigin: visibleOrigin, conversationLoading, conversationError, refreshConversation, markMessagesRead, fresh, notifications, ignoredNotifications, questions, openWorks, overview, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
+    }, nodes, nodesRead: nodesRead.current?.connection === connection && nodesRead.current.generation === connectionGeneration, conversationId, data: visibleData, dataOrigin: visibleOrigin, conversationLoading, conversationError, refreshConversation, markMessagesRead, fresh, notifications, ignoredNotifications, questions, openWorks, overview, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
     historyLoading, loadHistory, cancelHistory, refreshing, incomplete, chatSlot, pendingMessages, messageBusy, canSaveMessages, liveProgress, interrupted,
     workspaceState, readWorkspaceState, readWorkspaceHistory, workspaceCommand, queryInput, confirmInputEntry, readScopeContext, readWork, stopInputTarget, retryPendingMessage, releaseMessagePending,
     controlInput: (input: { message_id: string; expected_event: string; action: InputControlAction }) => workspaceCommand({ kind: 'control_input', ...input }),

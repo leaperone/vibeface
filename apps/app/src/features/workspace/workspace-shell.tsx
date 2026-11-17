@@ -24,7 +24,7 @@ import { Button } from "@vibeface/uiarc/button/button.tsx"
 import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
 import { Popover,PopoverContent,PopoverTrigger } from "@vibeface/uiarc/popover/popover.tsx"
 import { Progress } from "@vibeface/uiarc/progress/progress.tsx"
-import { ArrowRightLeft,ChevronLeft,CircleAlert,Hand,LoaderCircle,MessageSquare,MessagesSquare,PanelLeft,Plus,RefreshCw,RotateCw,ShieldAlert,Wifi,WifiOff,type LucideIcon } from "lucide-react"
+import { ArrowRightLeft,ChevronLeft,CircleAlert,CircleHelp,Hand,LoaderCircle,MessageSquare,MessagesSquare,PanelLeft,Plus,RefreshCw,RotateCw,ShieldAlert,Wifi,WifiOff,type LucideIcon } from "lucide-react"
 import { createContext,useContext,useEffect,useRef,useState,useSyncExternalStore,type ReactNode } from "react"
 import { BotForm } from "./bot-form"
 import { BotPanelButton } from "./bot-panel"
@@ -73,6 +73,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   const { open: sidebarOpen, setOpen: setSidebarOpen } = useContext(ShellNavigation)
   const isMobile = useSyncExternalStore(subscribeWidth, () => typeof window !== "undefined" && window.matchMedia("(max-width: 48rem)").matches, () => false)
   const [openMobile,setOpenMobile] = useState(false)
+  const menuTrigger = useRef<HTMLButtonElement>(null)
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const chatRoute = pathname.startsWith("/b/")
   const scopedChat = pathname.startsWith('/channels/') || /^\/tasks\/[^/]+/.test(pathname)
@@ -139,15 +140,15 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
         </ul>
       </section>
     </div>
-    <div className={layout.footer}><AiOffHint /><SecondDeviceHint /><ConnectionCapsule /><ul className={layout.list}><NavItem to="/settings" icon={terms.settings.icon} label={terms.settings.label} active={pathname.startsWith("/settings") || pathname.startsWith("/devices")} dot={devicesAttention} /></ul></div>
+    <div className={layout.footer}><AiOffHint /><SecondDeviceHint /><ConnectionCapsule /><ul className={layout.list}><NavItem to="/settings" icon={terms.settings.icon} label={terms.settings.label} active={pathname.startsWith("/settings") || pathname.startsWith("/devices")} dot={devicesAttention} /><li><a href="https://www.vibeface.dev/docs/user-guide" target="_blank" rel="noopener noreferrer" className={layout.item}><CircleHelp aria-hidden="true" /><span>使用指南</span><span className="sr-only">，在新标签页打开</span></a></li></ul></div>
   </nav>
 
   return <CreateBot.Provider value={openCreator}><PageActionsSlot.Provider value={actionsSlot}>
     <a className="skip-link" href="#main">跳到主要内容</a>
-    {isMobile ? <Drawer open={openMobile} onOpenChange={setOpenMobile}><DrawerContent side="left" title="导航和会话" description="切换工作区视图或选择会话。" className={layout.mobileDrawer}>{navigation}</DrawerContent></Drawer> : sidebarOpen ? navigation : null}
+    {isMobile ? <Drawer open={openMobile} onOpenChange={setOpenMobile}><DrawerContent side="left" title="导航和会话" description="切换工作区视图或选择会话。" className={layout.mobileDrawer} onCloseAutoFocus={(event) => { event.preventDefault(); menuTrigger.current?.focus({ preventScroll: true }) }}>{navigation}</DrawerContent></Drawer> : sidebarOpen ? navigation : null}
     <main id="main" tabIndex={-1} className={layout.main}>
       <header className={layout.header}>
-        <Button type="button" variant="ghost" aria-label="菜单" title="菜单" onClick={() => isMobile ? setOpenMobile(true) : setSidebarOpen(!sidebarOpen)}><PanelLeft aria-hidden="true" /></Button>
+        <Button ref={menuTrigger} type="button" variant="ghost" aria-label="菜单" title="菜单" onClick={() => isMobile ? setOpenMobile(true) : setSidebarOpen(!sidebarOpen)}><PanelLeft aria-hidden="true" /></Button>
         {back ? <Button type="button" variant="ghost" aria-label="返回" title="返回" onClick={() => void navigate({ to: back })}><ChevronLeft aria-hidden="true" /></Button> : null}
         <h1 ref={landing ? claimFocus : undefined} tabIndex={-1} title={botTitle ? undefined : title}>{botTitle ? <BotPanelButton /> : title}</h1>
         <div ref={setActionsSlot} className={layout.headerActions} />
@@ -172,7 +173,7 @@ const tabItems = [
 
 /** The phone's bottom tabs; the count on 任务 and the mark on 设置 stand in for what a wide screen shows in the sidebar. */
 function TabBar({ pathname,waiting,recovering,attention }: { pathname: string; waiting: number; recovering: boolean; attention: boolean }) {
-  return <nav aria-label="标签栏" className={layout.tabs}>{tabItems.map(({ to,icon: Icon,label }) => <Link key={to} to={to} replace aria-current={pathname === to ? "page" : undefined} className={layout.tab}><Icon aria-hidden="true" className="size-5 shrink-0" /><span>{label}</span>{to === "/tasks" ? recovering ? <ShieldAlert aria-label="有人在找回" className="size-4 text-danger" /> : waiting ? <CountBadge count={waiting} /> : null : to === "/settings" && attention ? <CircleAlert aria-label="需要留意" className="size-4 text-warning" /> : null}</Link>)}</nav>
+  return <nav aria-label="标签栏" data-toast-anchor="" className={layout.tabs}>{tabItems.map(({ to,icon: Icon,label }) => <Link key={to} to={to} replace aria-current={pathname === to ? "page" : undefined} className={layout.tab}><Icon aria-hidden="true" className="size-5 shrink-0" /><span>{label}</span>{to === "/tasks" ? recovering ? <ShieldAlert aria-label="有人在找回" className="size-4 text-danger" /> : waiting ? <CountBadge count={waiting} /> : null : to === "/settings" && attention ? <CircleAlert aria-label="需要留意" className="size-4 text-warning" /> : null}</Link>)}</nav>
 }
 function NavItem({ to,icon: Icon,label,active,badge,dot,alert }: { to: string; icon: LucideIcon; label: string; active: boolean; badge?: number; dot?: boolean; alert?: boolean }) {
   return <li><Link to={to} aria-current={active ? "page" : undefined} className={layout.item}><Icon aria-hidden="true" /><span>{label}</span>{alert ? <span className="inline-flex items-center gap-1 text-danger"><ShieldAlert aria-hidden="true" className="size-4" />找回</span> : badge ? <CountBadge count={badge} /> : null}{dot ? <CircleAlert role="img" aria-label="需要留意" className="size-4 text-warning" /> : null}</Link></li>
@@ -261,9 +262,9 @@ export function ShellSkeleton({ retry = null, onRetry, onLeave, home = false, qu
         </p>
         {onLeave ? <Button type="button" variant="ghost" onClick={onLeave}>换个方式连接</Button> : null}
       </div>} /></div> : <>
-        {onLeave ? <div className="flex justify-center px-4 pt-6"><Button type="button" variant="ghost" onClick={onLeave}>换个方式连接</Button></div> : null}
         {home ? <div className="grid gap-2 p-4 md:hidden" aria-hidden="true">{[0, 1, 2, 3].map((item) => <Skeleton key={item} className="h-16 rounded-panel" />)}</div> : null}
         <div className={cn("contents", home && "max-md:hidden")}><ChatSkeleton /></div>
+        {onLeave ? <div className="mt-auto flex justify-center px-4 py-6"><Button type="button" variant="ghost" onClick={onLeave}>换个方式连接</Button></div> : null}
       </>}
     </div>
   </div>

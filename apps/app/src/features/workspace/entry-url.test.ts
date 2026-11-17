@@ -2553,7 +2553,7 @@ test("compact system provider cards use external service evidence without local 
     const item: ProviderStatus = {
       provider: 'codex', authentication_source: 'private_login', roles: ['execution'], supports: ['agent', 'execution'], bin: '/fixture/codex',
       app_server: { mode, socket: '/fixture/codex.sock', link: { state: 'connected', socket: '/fixture/codex.sock', user_agent: 'fixture' } },
-      endpoint: null, execution_model: '', execution_readiness: { state: 'ready' }, setup: null, installed, home: null, sessions: null,
+      endpoint: null, execution_model: '', execution_readiness: { state: 'ready' }, setup: { directory: null, command: 'codex login' }, installed, home: null, sessions: null,
       env: [{ name: 'FIXTURE_KEY', set: false, inherited: false, required: true }], state: 'ready', issues: [], readiness: { state: 'ready' },
       probe: { provider: 'codex', config_id: 'fixture', checked_at_ms: null, launch: { state: 'launchable' }, authentication, catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null },
       observed: { installed: { status: 'rejected', evidence: 'binary_discovery' }, launchable: { status: 'confirmed', evidence: 'app_server_handshake' }, authenticated: { status: 'confirmed', evidence: 'provider_probe' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } },
@@ -2569,7 +2569,20 @@ test("compact system provider cards use external service evidence without local 
       const elements = app.render('ProviderCard', { item, response, onboarding: false, compact: true, busy: '', models: null, error: '' })
       const summary = elements.find(({ type, props }) => type === 'span' && props.className === 'truncate')
       assert.equal(elementText(summary), mode === 'system' || installed ? '可用' : '未安装', 'the main state follows readiness for system services')
-      const evidence = elements.filter(({ type }) => type === 'dl').map(elementText).join('')
+      const diagnostics = elements.find(({ type, props }) => type === 'Details' && props.label === '程序、认证与模型详情')
+      assert.ok(diagnostics, 'diagnostic evidence remains available behind a named disclosure')
+      assert.equal(diagnostics.props.open, undefined, 'secondary diagnostics start collapsed')
+      const evidence = elementText(diagnostics)
+      const login = elements.find(({ type, props }) => type === 'Details' && props.label === '登录方式')
+      assert.equal(Boolean(login), authentication === 'sign_in_required', 'login instructions only appear when login is required')
+      if (login) {
+        assert.equal(login.props.open, true, 'a required login next step remains expanded')
+        assert.match(elementText(login), /在运行 AI 的电脑上执行以下命令/)
+        const command = elements.find(({ type, props }) => type === 'Input' && props.label === 'Codex 登录命令')
+        assert.equal(command?.props.value, 'codex login')
+        assert.equal(command?.props.readOnly, true)
+      }
+      assert.ok(elements.some(({ type, props }) => type === 'Button' && props['aria-label'] === 'Codex 检查可用性' && !props.disabled), 'the check action stays available outside diagnostic disclosure')
       if (mode === 'system') {
         assert.match(evidence, /程序外部服务/)
         assert.ok(evidence.includes(`认证${{ authenticated: '已认证', unverified: '未验证', sign_in_required: '需登录' }[authentication]}`))
@@ -2851,7 +2864,7 @@ const parityShared = () => ({
   ...historyActions, generation: 1, isCurrent: () => true, synced: true, connectionOnline: true, conversationId: 'chat', data: paritySnapshot(context),
   bots: [parityBot], selectedBot: parityBot, nodes: [parityNode], openWorks: [{ ...parityWork(), conversation_id: 'chat' }],
   overview: workspaceModel.parseWorkspaceOverview({}), questions: [] as ReturnType<typeof parseConversation>['questions'], answered: {} as Record<string, string>, liveProgress: [], writable: true,
-  writeState: { state: 'writable' as const, conflicts: [] }, notifications: [], ignoredNotifications: new Set<string>(), pendingMessages: [], canSaveMessages: true, workspaceState: null,
+  writeState: { state: 'writable' as const, conflicts: [] }, notifications: [], ignoredNotifications: new Set<string>(), pendingMessages: [], canSaveMessages: true, workspaceState: null as WorkspaceDomainState | null,
   setView(_view: string) {}, selectBot: async (_bot: typeof parityBot) => {}, interruptWork: async (_work: string) => {}, sendMessage: async () => true,
   async readWork(input: { conversation_id: string; work_id: string }) {
     const work = this.data?.conversation?.conversation_id === input.conversation_id ? this.data.works.find((item) => item.work_id === input.work_id) : undefined
@@ -3401,16 +3414,20 @@ test('chat task history keeps completed and unknown records while counting only 
   }
   const label = () => render().find(({ type }) => type === 'Button')?.props['aria-label']
   try {
-    assert.equal(label(), '任务 · 3 待处理')
-    assert.equal(render().filter(({ type }) => type === 'Link').length, 4, 'history includes completed, missing-origin and uncertain tasks')
+    assert.equal(label(), '执行记录 · 3 待处理')
+    assert.equal(render().filter(({ type, props }) => type === 'Link' && props.to === '/b/$botId/work/$workId').length, 4, 'history includes completed, missing-origin and uncertain execution records')
+    assert.equal(render().filter(({ type, props }) => type === 'Link' && props.to === '/tasks').length, 1, 'task conversations have a separate navigation entry')
     assert.match(componentText(render()), /已完成/)
     assert.match(componentText(render()), /待确认/)
     assert.equal(app.render('TaskIcon', { state: 'unknown', stale: false }).some(({ type }) => type === 'CircleQuestionMark'), true)
     assert.equal(app.render('TaskIcon', { state: 'completed', stale: false }).some(({ type }) => type === 'CircleCheck'), true)
     shared.answered = { approval: '继续' }
     shared.openWorks = shared.openWorks.filter((work) => work.work_id !== 'failed')
-    assert.equal(label(), '任务 · 1 进行中 · 1 待处理', 'answered approvals and closed historical failures stop counting')
+    assert.equal(label(), '执行记录 · 1 进行中 · 1 待处理', 'answered approvals and closed historical failures stop counting')
     const trigger = render().find(({ type }) => type === 'Button')
+    let restoredFocus = 0
+    const triggerRef = trigger?.props.ref as { current: { focus(options?: { preventScroll?: boolean }): void } | null }
+    triggerRef.current = { focus(options) { assert.equal(options?.preventScroll, true); restoredFocus++ } }
     trigger?.props.onClick?.()
     assert.equal(render().find(({ type }) => type === 'Drawer')?.props.open, true)
     const onCloseAutoFocus = render().find(({ type }) => type === 'DrawerContent')?.props.onCloseAutoFocus as (event: { preventDefault(): void }) => void
@@ -3420,12 +3437,14 @@ test('chat task history keeps completed and unknown records while counting only 
     const closeFocus = () => onCloseAutoFocus({ preventDefault() { prevented = true } })
     closeFocus()
     assert.equal(prevented, true, 'detail navigation owns focus after the sheet closes')
+    assert.equal(restoredFocus, 0, 'detail navigation does not focus a stale chat action')
     render().find(({ type }) => type === 'Button')?.props.onClick?.()
     prevented = false
     closeFocus()
-    assert.equal(prevented, false, 'ordinary dismissal still restores the opening button')
+    assert.equal(prevented, true, 'ordinary dismissal explicitly handles the portalled opener')
+    assert.equal(restoredFocus, 1, 'ordinary dismissal restores the actual opening button')
     shared.connectionOnline = false
-    assert.equal(label(), '任务 · 2 待处理', 'offline active tasks are uncertain instead of counted as running')
+    assert.equal(label(), '执行记录 · 2 待处理', 'offline active tasks are uncertain instead of counted as running')
   } finally { app.close(); harness.app.close() }
 })
 
@@ -3499,6 +3518,220 @@ function taskOverviewHarness(
   }
 }
 
+test('task overview waits for its first task read and simplifies only globally empty loaded records', async () => {
+  let reads = 0, creates = 0
+  const shared = { ...parityShared(), openWorks: [], data: null, synced: false, readWorkspaceState: async () => { reads++; return { channels: [], tasks: [], assignments: [], inputs: [], coverage: { limit: 128, truncated: false } } } }
+  let inbox: unknown[] = [{ kind: 'setup', key: 'setup', title: '设置运行 Bot 的设备' }]
+  shared.overview = workspaceModel.parseWorkspaceOverview({ consistency: 'partial', coverage: { source: 'workspace_overview', truncated: true, omitted_tasks: 1 } })
+  const { app, render } = taskOverviewHarness('web', shared, { ...taskOverviewUi, './workspace-shell': { useCreateBot: () => () => { creates++ } } }, () => inbox)
+  const named = (name: string) => render().find(({ type }) => typeof type === 'function' && type.name === name)
+  const content = () => render().find(({ type, props }) => type === 'div' && Array.isArray(props.children) && props.children.some((child: { type?: unknown }) => child?.type === 'WorkspaceTasks'))!
+  const pending = () => render().find(({ type, props }) => type === 'div' && (props.children as { type?: unknown })?.type === 'PendingSection')!
+  try {
+    assert.equal(content().props.className, 'hidden', 'an initial skeleton replaces the still-mounted task content')
+    assert.equal(render().some(({ type }) => type === 'WorkspaceTasks'), true, 'the hidden task component still owns the first read and its draft')
+    assert.equal(render().some(({ type }) => type === 'PendingSection'), true)
+    assert.equal(pending().props.className, 'hidden', 'ordinary setup feedback appears with the completed first read, without pushing the loading region down')
+    assert.equal(named('WorkspaceEmpty'), undefined)
+    assert.match(componentText(render()), /正在读取当前连接的任务/)
+    assert.match(componentText(render()), /当前连接尚未完成首读/)
+    shared.synced = true
+    assert.equal(content().props.className, 'hidden', 'overview sync alone does not prove the task conversations are empty')
+    const failure = new Error('任务首读失败')
+    ;(render().find(({ type }) => type === 'WorkspaceTasks')!.props.onReadError as (cause: unknown) => void)(failure)
+    const error = render().find(({ type }) => type === 'InlineError')!.props
+    assert.equal(error.error, failure, 'first-read failure is actionable outside the hidden task body')
+    assert.equal(pending().props.className, 'contents', 'a failed first read immediately releases known reminders and recovery actions')
+    assert.match(componentText(render()), /任务还没读到/)
+    ;(error.action as unknown as { onClick: () => void }).onClick()
+    await settleComponent()
+    assert.equal(reads, 1)
+    shared.workspaceState = { channels: [], tasks: [], assignments: [], inputs: [], coverage: { limit: 128, truncated: false } }
+    assert.equal(content().props.className, 'contents')
+    assert.equal(pending().props.className, 'contents')
+    assert.equal(named('TaskRunSummary'), undefined, 'a setup reminder does not require three all-zero task metrics')
+    assert.equal(named('TaskFilters'), undefined)
+    assert.equal(named('WorkspaceEmpty'), undefined, 'WorkspaceTasks owns the single empty message and new-task entry')
+    assert.equal(render().filter(({ type }) => type === 'WorkspaceTasks').length, 1)
+    assert.equal(render().some(({ type }) => type === 'PendingSection'), true, 'the setup reminder stays mounted')
+    assert.match(componentText(render()), /部分记录，不代表全部任务/)
+    assert.match(componentText(render()), /总览已截断/)
+    assert.match(componentText(render()), /本次总览未返回 1 项任务/)
+    shared.connectionOnline = false
+    assert.match(componentText(render()), /连接已断开，显示最近记录/)
+    inbox = [{ kind: 'undelivered', message: { message_id: 'unknown', delivery: 'unknown' } }]
+    assert.ok(named('TaskRunSummary'), 'an unknown input keeps the full task surface and PendingSection')
+    assert.ok(named('TaskFilters'))
+    inbox = []
+    shared.bots = []
+    const newBot = render().find(({ type, props }) => type === 'Button' && elementText(props.children) === '新 Bot')
+    assert.ok(newBot)
+    newBot.props.onClick!()
+    assert.equal(creates, 1, 'the first Bot remains creatable when no Bot can receive a task')
+  } finally { app.close() }
+})
+
+test('task overview recovers workspace first-read failure even after the task projection read succeeded', async () => {
+  let refreshes = 0, taskReads = 0
+  const state: WorkspaceDomainState = { channels: [], tasks: [], assignments: [], inputs: [], coverage: { limit: 128, truncated: false } }
+  const failure = { text: '读取最新内容：nodes 首读失败' }
+  const shared = {
+    ...parityShared(), openWorks: [] as ReturnType<typeof parityShared>['openWorks'], data: null, synced: false, nodesRead: false, workspaceState: state,
+    error: failure as typeof failure | null,
+    refresh: async (): Promise<void> => { refreshes++; shared.synced = true },
+    readWorkspaceState: async () => { taskReads++; return state },
+  }
+  const inbox = () => [{ kind: 'setup', key: 'setup', title: '设置运行 Bot 的设备' }]
+  const { app, render } = taskOverviewHarness('web', shared, taskOverviewUi, inbox)
+  const content = () => render().find(({ type, props }) => type === 'div' && Array.isArray(props.children) && props.children.some((child: { type?: unknown }) => child?.type === 'WorkspaceTasks'))!
+  const pending = () => render().find(({ type, props }) => type === 'div' && (props.children as { type?: unknown })?.type === 'PendingSection')!
+  try {
+    const error = render().find(({ type }) => type === 'InlineError')!.props
+    assert.equal(error.error, failure.text)
+    assert.equal(render().some(({ props }) => props['aria-busy'] === true), false, 'a failed prerequisite is not an indefinitely busy first read')
+    assert.equal(render().some(({ type }) => type === 'Skeleton'), false)
+    assert.equal(pending().props.className, 'contents', 'known reminders remain available when the workspace first read failed')
+    assert.equal(content().props.className, 'hidden', 'an empty task projection cannot establish global readiness by itself')
+    ;(error.action as unknown as { onClick: () => void }).onClick()
+    await settleComponent()
+    assert.equal(refreshes, 1, 'retry rereads the nodes, bots, overview and conversation prerequisites')
+    assert.equal(taskReads, 0, 'retry does not merely reread the already successful task projection')
+    assert.equal(shared.error, failure, 'the real workspace retains its global toast object after a successful refresh')
+    assert.equal(content().props.className, 'contents')
+    assert.equal(render().some(({ type }) => type === 'InlineError'), false, 'successful sync suppresses the stale prerequisite failure')
+    shared.synced = false
+    shared.openWorks = [{ ...parityWork({ state: 'unverified', outcome: 'unverified' }), conversation_id: 'chat' }]
+    assert.equal(content().props.className, 'contents', 'known unknown work remains visible while the first read needs recovery')
+    assert.equal(pending().props.className, 'contents')
+    assert.equal(render().some(({ type }) => typeof type === 'function' && type.name === 'TaskOverviewCard'), true)
+    assert.equal(render().find(({ type }) => type === 'InlineError')?.props.error, failure.text, 'prerequisite recovery remains persistent beside the known work')
+  } finally { app.close() }
+})
+
+test('task overview ignores a failed refresh completion from a replaced generation', async () => {
+  const held = pendingResult()
+  const state: WorkspaceDomainState = { channels: [], tasks: [], assignments: [], inputs: [], coverage: { limit: 128, truncated: false } }
+  const shared = { ...parityShared(), openWorks: [], data: null, synced: false, workspaceState: state,
+    error: { text: '旧连接首读失败' } as { text: string } | null, refresh: () => held.promise,
+  }
+  const { app, render } = taskOverviewHarness('web', shared, taskOverviewUi)
+  try {
+    const error = render().find(({ type }) => type === 'InlineError')!.props
+    ;(error.action as unknown as { onClick: () => void }).onClick()
+    shared.generation++
+    shared.error = null
+    render()
+    held.reject(new Error('旧连接重读失败'))
+    await settleComponent()
+    assert.equal(render().find(({ type }) => type === 'InlineError')?.props.error, null)
+    assert.equal(render().some(({ type }) => type === 'Skeleton'), true, 'the new connection keeps its own first-read state')
+  } finally { app.close() }
+})
+
+test('task overview keeps filters for completed business history and empty filter results', () => {
+  const state = workspaceModel.parseWorkspaceState({ channels: [], tasks: [{ task_id: 'completed-task', root_task_id: 'completed-task', owner_bot: parityBot.bot_id, title: '已完成的业务任务', state: 'completed', revision: 1, request: '检查项目', expected_result: '交付结果', source_events: [], dependencies: [], reply_only: false, action: 'continue', request_event: 'request', event_hash: 'event', created_at_ms: 1, updated_at_ms: 2 }], assignments: [], inputs: [], coverage: { limit: 128, truncated: false } })
+  const other = { ...parityBot, bot_id: 'other', conversation_id: 'other-chat', name: '另一个 Bot' }
+  const shared = { ...parityShared(), openWorks: [] as ReturnType<typeof parityShared>['openWorks'], data: null, bots: [parityBot, other], workspaceState: state, nodesRead: false, error: null as { text: string } | null }
+  let inbox: unknown[] = []
+  const { app, render } = taskOverviewHarness('web', shared, taskOverviewUi, () => inbox)
+  const named = (name: string) => render().find(({ type }) => typeof type === 'function' && type.name === name)
+  const content = () => render().find(({ type, props }) => type === 'div' && Array.isArray(props.children) && props.children.some((child: { type?: unknown }) => child?.type === 'WorkspaceTasks'))!
+  const pending = () => render().find(({ type, props }) => type === 'div' && (props.children as { type?: unknown })?.type === 'PendingSection')!
+  try {
+    shared.synced = false
+    assert.equal(content().props.className, 'hidden', 'saved nonempty tasks do not bypass first-read staging and paint count placeholders')
+    inbox = [{ kind: 'setup', key: 'setup', title: '设置运行 Bot 的设备' }]
+    assert.equal(pending().props.className, 'hidden', 'a late setup reminder stays in the same first-read reveal as the saved task body')
+    shared.nodesRead = true
+    assert.equal(content().props.className, 'contents', 'the completed task snapshot remains readable while unrelated conversation reads or write alignment keep synced false')
+    assert.equal(pending().props.className, 'contents')
+    shared.nodesRead = false
+    shared.error = { text: '首读失败' }
+    assert.equal(content().props.className, 'contents', 'a failed first read releases known history instead of hiding it indefinitely')
+    assert.equal(pending().props.className, 'contents')
+    shared.error = null
+    shared.connectionOnline = false
+    assert.equal(content().props.className, 'contents', 'offline readers keep their known records')
+    shared.connectionOnline = true
+    shared.synced = true
+    assert.equal(content().props.className, 'contents')
+    assert.ok(named('TaskRunSummary'), 'completed task history prevents the global-empty shortcut')
+    assert.ok(named('TaskFilters'))
+    assert.equal(named('WorkspaceEmpty'), undefined, 'completed business tasks count as real content under all tasks')
+    const filters = named('TaskFilters')!.props
+    ;(filters.onFilter as (value: string) => void)('attention')
+    ;(filters.onBotFilter as (value: string) => void)(other.bot_id)
+    assert.ok(named('TaskRunSummary'))
+    assert.ok(named('TaskFilters'), 'a no-match state retains controls for recovery')
+    assert.equal(named('WorkspaceEmpty')?.props.title, '没有符合筛选的任务')
+    assert.equal(render().find(({ type }) => type === 'WorkspaceTasks')?.props.botFilter, other.bot_id)
+    assert.equal(render().find(({ type }) => type === 'WorkspaceTasks')?.props.filter, 'attention')
+    assert.equal(render().find(({ type }) => type === 'WorkspaceTasks')?.props.showEmpty, false, 'the parent owns the only no-match empty message')
+    const noMatch = named('WorkspaceEmpty')!
+    assert.equal(typeof noMatch.type, 'function')
+    const emptyState = (noMatch.type as (props: unknown) => { props: { action: { props: { children: string; onClick: () => void } } } })(noMatch.props)
+    assert.equal(emptyState.props.action.props.children, '清除筛选')
+    emptyState.props.action.props.onClick()
+    assert.equal(named('TaskFilters')?.props.filter, 'all')
+    assert.equal(named('TaskFilters')?.props.botFilter, 'all')
+    assert.equal(named('WorkspaceEmpty'), undefined, 'clearing filters restores the retained completed task')
+    ;(filters.onFilter as (value: string) => void)('attention')
+    ;(filters.onBotFilter as (value: string) => void)(other.bot_id)
+    shared.workspaceState = { ...state, tasks: [] }
+    shared.openWorks = [{ ...parityWork({ state: 'finished', outcome: 'completed' }), conversation_id: 'chat' }]
+    assert.ok(named('TaskFilters'), 'history retained outside the current Bot and state filters still prevents global emptiness')
+    assert.equal(named('WorkspaceEmpty')?.props.title, '没有符合筛选的任务')
+  } finally { app.close() }
+})
+
+test('task conversations distinguish first use from filter no-match and can defer empty feedback to the overview', () => {
+  const state: WorkspaceDomainState = { channels: [], tasks: [], assignments: [], inputs: [], coverage: { limit: 128, truncated: false } }
+  const workspace = { ...parityShared(), workspaceState: state, readWorkspaceState: async () => state }
+  const app = componentHarness('./workspace-tasks.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace } })
+  try {
+    assert.match(componentText(app.render('WorkspaceTasks')), /还没有任务对话/)
+    const filtered = app.render('WorkspaceTasks', { filter: 'working' })
+    assert.match(componentText(filtered), /没有符合筛选的任务对话/)
+    assert.doesNotMatch(componentText(filtered), /还没有任务对话/)
+    const delegatedEmpty = app.render('WorkspaceTasks', { filter: 'working', showEmpty: false })
+    assert.doesNotMatch(componentText(delegatedEmpty), /没有符合筛选|还没有任务对话/)
+    assert.match(componentText(delegatedEmpty), /新任务/, 'the task creator stays mounted and usable while its result message is composed by the parent')
+    assert.equal(delegatedEmpty.some(({ type }) => typeof type === 'function' && type.name === 'CreateWorkspaceTask'), true)
+  } finally { app.close() }
+})
+
+test('background task activity uses readable purpose, status and device names with raw IDs only in optional details', () => {
+  const trigger = 'message:' + 'f'.repeat(80), source = 'd'.repeat(80)
+  const activity = { kind: 'turn', job: { state: 'queued', trigger, source_node: source } }
+  const app = componentHarness('./tasks-overview.tsx', { '@vibeface/client/workspace/labels.ts': taskLabels }, {}, 'TurnActivity')
+  const lookup = { nodes: [{ ...parityNode, device_id: source, name: '工作电脑' }], directory: null }
+  const render = () => app.render('TurnActivity', { activity, lookup })
+  const primary = () => {
+    const body = render().find(({ type }) => type === 'RecordBody')!.props.children as { type: unknown; props: unknown }[]
+    return elementText(body.filter((child) => child?.type !== 'Details'))
+  }
+  try {
+    assert.match(primary(), /处理消息.*排队中.*工作电脑/)
+    assert.doesNotMatch(primary(), /queued|message:|ffff|dddd|等待名额|机器繁忙/)
+    const elements = render()
+    const details = elements.find(({ type }) => type === 'Details')!
+    assert.equal(details.props.label, '技术详情')
+    assert.equal(details.props.open, undefined)
+    assert.match(elementText(details.props.children), new RegExp(trigger))
+    assert.match(elementText(details.props.children), new RegExp(source))
+    assert.match(String(details.props.className), /overflow-wrap:anywhere/)
+    assert.match(String(elements.find(({ type }) => type === 'RecordBody')?.props.className), /min-w-0.*overflow-wrap:anywhere/)
+    lookup.nodes = []
+    assert.match(primary(), /来源设备 · 未知设备/)
+    assert.doesNotMatch(primary(), new RegExp(source))
+    for (const [prefix, purpose] of [['task:', '推进任务'], ['schedule:', '定时工作'], ['unknown:', '后台工作']]) {
+      activity.job.trigger = prefix + 'f'.repeat(80)
+      activity.job.state = 'unknown'
+      assert.match(primary(), new RegExp(purpose + '.*状态未知'))
+    }
+  } finally { app.close() }
+})
+
 test('both task overviews preserve known records, show their coverage and only navigate cross-Bot program checks', () => {
   for (const platform of ['web', 'native']) {
     const shared = parityShared()
@@ -3544,8 +3777,8 @@ test('both task overviews preserve known records, show their coverage and only n
       elements = render()
       assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === mastheadName)?.props.working, 0)
       const empty = elements.find(({ type }) => typeof type === 'function' && type.name === (platform === 'web' ? 'WorkspaceEmpty' : 'MobileEmpty'))
-      assert.ok(empty && typeof empty.type === 'function')
-      assert.match(platform === 'web' ? String(empty.props.title) : componentText(empty.type(empty.props)), /当前记录没有未完成的任务/)
+      if (platform === 'web') assert.equal(empty, undefined, 'Web waits for WorkspaceTasks first read before claiming no tasks')
+      else { assert.ok(empty && typeof empty.type === 'function'); assert.match(componentText(empty.type(empty.props)), /当前记录没有未完成的任务/) }
       assert.equal(elements.some(({ type }) => type === 'PendingSection'), true, `${platform} keeps 待处理 atop the task page`)
     } finally { app.close() }
   }
@@ -4085,7 +4318,7 @@ test("task filters leave live confirmations and questions to 待处理 and keep 
     assert.equal(named(elements, "WorkspaceEmpty"), undefined, "the task list does not claim emptiness under waiting items")
     inbox = []
     elements = app.render("TasksOverview")
-    assert.equal(named(elements, "WorkspaceEmpty")?.props.title, "没有符合筛选的任务")
+    assert.equal(named(elements, "WorkspaceEmpty"), undefined, "without task-conversation first read, removing the last pending item returns to loading")
   } finally { app.close() }
 })
 
@@ -4514,6 +4747,181 @@ test("bot projects use online manager capabilities and preserve device names", (
     assert.equal(named.length, 1)
     assert.equal(named[0].label, '工作电脑 · project', 'the folder name stays readable in a narrow select')
   } finally { app.close() }
+})
+
+test("unsent bot fields survive drawer dismissal and project setup until cancel or confirmed creation", async () => {
+  let open = true, fail = true
+  const ready = { principal: { can_manage: true, source: 'membership' }, entry: { device_id: 'worker' } }
+  const node = { device_id: 'worker', name: '工作电脑', local: false, online: true, revoked: false, capabilities: { manager: 'codex', roots: ['/project'] } }
+  const payloads: unknown[] = []
+  const workspace = { generation: 1, nodes: [] as typeof node[], pendingBot: null, writable: true, isCurrent: () => true,
+    createBot: async (payload: unknown) => { payloads.push(payload); if (fail) throw new Error('暂时没建成'); return { bot_id: 'created' } },
+  }
+  const app = componentHarness('./bot-form.tsx', {
+    '@tanstack/react-router': { useNavigate: () => () => {} },
+    '@vibeface/client/workspace/bot-settings.ts': { folderLabels, folderSetup, projectChoices, projectKey },
+    '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace },
+    '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready }) },
+    '@vibeface/client/workspace/labels.ts': { nodeName },
+    '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message },
+  })
+  const render = () => app.render('BotForm', { open, onOpenChange: (next: boolean) => { open = next }, restoreFocus() {} })
+  const field = (name: string) => render().find(({ props }) => props.name === name)!.props
+  const submit = () => render().find(({ type }) => type === 'form')!.props.onSubmit!({ preventDefault() {} })
+  const reopen = () => { render(); open = true; render(); return render() }
+  const expectDraft = () => {
+    assert.equal(field('bot-name').value, '项目 Bot')
+    assert.equal(field('bot-instructions').value, '维护这个项目，保留未发送说明。')
+  }
+  try {
+    render()
+    field('bot-name').onChange!({ target: { value: '项目 Bot' } })
+    field('bot-instructions').onChange!({ target: { value: '维护这个项目，保留未发送说明。' } })
+    const setupLink = render().find(({ type }) => type === 'Link')!
+    assert.equal(setupLink.props.to, '/devices/$deviceId')
+    setupLink.props.onClick!()
+    assert.equal(open, false)
+    workspace.nodes = [node]
+    reopen(); expectDraft()
+    const project = render().find(({ type }) => type === 'Select')!.props
+    ;(project.onValueChange as (value: string) => void)('arc:' + projectKey({ target_node: 'worker', cwd: '/project' }))
+    ;(render().find(({ type }) => type === 'Drawer')!.props.onOpenChange as (next: boolean) => void)(false)
+    reopen(); expectDraft()
+    assert.equal(render().find(({ type }) => type === 'Select')!.props.value, 'arc:' + projectKey({ target_node: 'worker', cwd: '/project' }))
+    submit(); await settleComponent(); expectDraft()
+    assert.equal(open, true, 'a failed creation leaves the draft available')
+    fail = false
+    submit(); await settleComponent()
+    assert.equal(open, false)
+    assert.deepEqual(JSON.parse(JSON.stringify(payloads)), Array(2).fill({ name: '项目 Bot', instructions: '维护这个项目，保留未发送说明。', project: { target_node: 'worker', cwd: '/project' } }))
+    reopen()
+    assert.equal(field('bot-name').value, '')
+    assert.equal(field('bot-instructions').value, '')
+    assert.equal(render().find(({ type }) => type === 'Select')!.props.value, 'arc:')
+    field('bot-name').onChange!({ target: { value: '明确放弃的草稿' } })
+    render().find(({ type, props }) => type === 'Button' && props.children === '取消')!.props.onClick!()
+    reopen()
+    assert.equal(field('bot-name').value, '', 'explicit cancel discards the unsent draft')
+  } finally { app.close() }
+})
+
+test("bot name validation focuses its field and clears only when the name changes", async () => {
+  let focused = 0, creates = 0
+  const workspace = { generation: 1, nodes: [], pendingBot: null, writable: true, isCurrent: () => true, createBot: async () => { creates++; throw new Error('创建暂时失败') } }
+  const app = componentHarness('./bot-form.tsx', {
+    '@tanstack/react-router': { useNavigate: () => () => {} },
+    '@vibeface/client/workspace/bot-settings.ts': { folderLabels, folderSetup, projectChoices, projectKey },
+    '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace },
+    '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
+    '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message },
+  })
+  const render = () => app.render('BotForm', { open: true, onOpenChange() {}, restoreFocus() {} })
+  const field = (name: string) => render().find(({ props }) => props.name === name)!.props
+  const submit = () => render().find(({ type }) => type === 'form')!.props.onSubmit!({ preventDefault() {} })
+  try {
+    render()
+    const name = field('bot-name')
+    ;(name.ref as { current: unknown }).current = { focus: () => { focused++ } }
+    submit()
+    assert.equal(focused, 1)
+    assert.equal(creates, 0, 'an empty name does not submit a create operation')
+    assert.equal(field('bot-name').error, '还没填名称', 'Arc Input associates this error with the name field')
+    assert.equal(render().find(({ type }) => type === 'InlineError')?.props.error, '', 'the field error is not duplicated at the bottom')
+    field('bot-instructions').onChange!({ target: { value: '可选说明' } })
+    assert.equal(field('bot-name').error, '还没填名称', 'editing an unrelated optional field keeps the name error')
+    field('bot-name').onChange!({ target: { value: '项目 Bot' } })
+    assert.equal(field('bot-name').error, '')
+    submit(); await settleComponent()
+    assert.equal(creates, 1)
+    assert.equal(render().find(({ type }) => type === 'InlineError')?.props.error, '创建暂时失败')
+    field('bot-name').onChange!({ target: { value: '另一个 Bot' } })
+    assert.equal(render().find(({ type }) => type === 'InlineError')?.props.error, '创建暂时失败', 'editing a name does not discard an operation failure')
+  } finally { app.close() }
+})
+
+test("bot unknown submissions retain their read-only saved payload for reconciliation", async () => {
+  let open = true
+  const pending = { bot_id: 'pending-bot', name: '已提交名称', instructions: '已提交说明', project: null, submission: { state: 'unknown' } }
+  const payloads: unknown[] = [], closed: boolean[] = []
+  const app = componentHarness('./bot-form.tsx', {
+    '@tanstack/react-router': { useNavigate: () => () => {} },
+    '@vibeface/client/workspace/bot-settings.ts': { folderLabels, folderSetup, projectChoices, projectKey },
+    '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({ generation: 1, nodes: [], pendingBot: pending, writable: true, isCurrent: () => true, createBot: async (payload: unknown) => { payloads.push(payload); throw new Error('结果仍未知') } }) },
+    '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
+    '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message },
+  })
+  const render = () => app.render('BotForm', { open, onOpenChange: (next: boolean) => { open = next; closed.push(next) }, restoreFocus() {} })
+  try {
+    render(); const elements = render()
+    const name = elements.find(({ props }) => props.name === 'bot-name')!
+    assert.equal(name.props.readOnly, true)
+    assert.equal(name.props.value, pending.name)
+    assert.equal(name.props.error, '')
+    assert.equal(elements.find(({ props }) => props.name === 'bot-instructions')?.props.readOnly, true)
+    assert.equal(elements.find(({ props }) => props.id === 'bot-project')?.props.readOnly, true)
+    assert.match(elementText(elements.find(({ type }) => type === 'DrawerContent')?.props.description), /上次没确认是否建好/)
+    elements.find(({ type }) => type === 'form')!.props.onSubmit!({ preventDefault() {} })
+    await settleComponent()
+    assert.deepEqual(JSON.parse(JSON.stringify(payloads)), [{ name: pending.name, instructions: pending.instructions, project: pending.project }])
+    assert.deepEqual(closed, [], 'an unknown outcome leaves the reconciliation form open')
+    assert.equal(render().find(({ type }) => type === 'InlineError')?.props.error, '结果仍未知')
+    render().find(({ type, props }) => type === 'Button' && props.children === '取消')!.props.onClick!()
+    render(); open = true; render()
+    const reopened = render()
+    assert.equal(reopened.find(({ props }) => props.name === 'bot-name')?.props.value, pending.name)
+    assert.equal(reopened.find(({ props }) => props.name === 'bot-name')?.props.readOnly, true, 'cancel cannot turn an unknown submission into an editable draft')
+    reopened.find(({ type }) => type === 'form')!.props.onSubmit!({ preventDefault() {} })
+    await settleComponent()
+    assert.deepEqual(JSON.parse(JSON.stringify(payloads[1])), { name: pending.name, instructions: pending.instructions, project: pending.project })
+  } finally { app.close() }
+})
+
+test("bot reconciliation clears confirmed drafts and preserves proven rejected drafts even while closed", async (t) => {
+  for (const hidden of [false, true]) for (const confirmed of [false, true]) await t.test(`${hidden ? 'closed' : 'open'} / ${confirmed ? 'confirmed' : 'rejected with no matching Bot'}`, async () => {
+    let open = true
+    const pending = { bot_id: 'submitted-bot', name: '待确认 Bot', instructions: '只创建一次', project: { target_node: 'worker', cwd: '/project' }, submission: { state: confirmed ? 'unconfirmed' : 'rejected' } }
+    const node = { device_id: 'worker', name: '工作电脑', local: false, online: true, revoked: false, capabilities: { manager: 'codex', roots: ['/project'] } }
+    const payloads: unknown[] = []
+    const workspace = { generation: 1, nodes: [node], bots: [] as { bot_id: string; name: string }[], pendingBot: null as typeof pending | null, writable: true, isCurrent: () => true,
+      createBot: async (payload: unknown) => { payloads.push(payload); throw new Error('停止在提交边界') },
+    }
+    const app = componentHarness('./bot-form.tsx', {
+      '@tanstack/react-router': { useNavigate: () => () => {} },
+      '@vibeface/client/workspace/bot-settings.ts': { folderLabels, folderSetup, projectChoices, projectKey },
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace },
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
+      '@vibeface/client/workspace/labels.ts': { nodeName },
+      '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message },
+    })
+    const render = () => app.render('BotForm', { open, onOpenChange: (next: boolean) => { open = next }, restoreFocus() {} })
+    const field = (name: string) => render().find(({ props }) => props.name === name)!.props
+    try {
+      render()
+      field('bot-name').onChange!({ target: { value: pending.name } })
+      field('bot-instructions').onChange!({ target: { value: pending.instructions } })
+      ;(render().find(({ type }) => type === 'Select')!.props.onValueChange as (value: string) => void)('arc:' + projectKey(pending.project))
+      if (hidden) { open = false; render() }
+      workspace.pendingBot = pending
+      render(); render()
+      // The real refresh updates bots and clears pending in the same batch. A rejected check clears pending without a match.
+      workspace.bots = [{ bot_id: confirmed ? pending.bot_id : 'different-bot', name: pending.name }]
+      workspace.pendingBot = null
+      render(); render()
+      assert.equal(open, !hidden, 'background reconciliation only resets fields and never changes drawer focus')
+      if (hidden) { open = true; render() }
+      assert.equal(field('bot-name').value, confirmed ? '' : pending.name)
+      assert.equal(field('bot-instructions').value, confirmed ? '' : pending.instructions)
+      assert.equal(field('bot-name').readOnly, false)
+      assert.equal(render().find(({ type }) => type === 'Select')!.props.value, confirmed ? 'arc:' : 'arc:' + projectKey(pending.project))
+      render().find(({ type }) => type === 'form')!.props.onSubmit!({ preventDefault() {} })
+      await settleComponent()
+      assert.equal(payloads.length, confirmed ? 0 : 1, 'a confirmed Bot cannot be resubmitted under a fresh ID; proven rejected content remains reusable')
+      field('bot-name').onChange!({ target: { value: '新草稿' } })
+      workspace.bots = [...workspace.bots]
+      render()
+      assert.equal(field('bot-name').value, '新草稿', 'later list refreshes preserve the next unsent draft')
+    } finally { app.close() }
+  })
 })
 
 test("bot drafts survive a new connection while old create completion cannot close or unlock its form", async () => {

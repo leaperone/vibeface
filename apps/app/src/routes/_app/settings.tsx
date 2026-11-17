@@ -14,8 +14,8 @@ import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { Button } from '@vibeface/uiarc/button/button.tsx'
 import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
 import { Select } from "@vibeface/uiarc/select/select.tsx"
-import { Bell,BellOff,Check,ChevronRight,CircleAlert,CircleCheck,Download,FlaskConical,LogOut,Monitor,Moon,Palette,Plus,ScrollText,ShieldAlert,ShieldCheck,Sun,TriangleAlert,type LucideIcon } from 'lucide-react'
-import { useEffect,useState,type ReactNode } from 'react'
+import { ArrowUpRight,Bell,BellOff,BookOpen,Check,ChevronRight,CircleAlert,CircleCheck,Download,FlaskConical,LifeBuoy,LogOut,Monitor,Moon,Palette,Plus,ScrollText,ShieldAlert,ShieldCheck,Sun,TriangleAlert,type LucideIcon } from 'lucide-react'
+import { useEffect,useRef,useState,type ReactNode } from 'react'
 
 export const Route = createFileRoute('/_app/settings')({ component: SettingsPage })
 
@@ -28,6 +28,7 @@ function SettingsPage() {
   const device = useDevice()
   const [theme, setThemeState] = useState(readTheme)
   const [leaving, setLeaving] = useState(false)
+  const leaveTrigger = useRef<HTMLButtonElement>(null)
   const [range, setRange] = useState(86_400_000)
   const [exported, setExported] = useState<'idle' | 'busy' | 'done'>('idle')
   useEffect(() => {
@@ -66,6 +67,14 @@ function SettingsPage() {
       {device.review?.kind === 'recovery' || device.recovered ? null : <><CurrentRecoveryFile /><PhoneRecovery /><RecoveryControls /></>}
     </SecurityStatus> : null}
     {principal?.can_manage ? device.review?.kind === 'recovery' ? <RecoveryReview /> : device.recovered ? <RecoveredStep /> : null : null}
+    <SettingsGroup title="帮助" footer={<a href="https://github.com/leaperone/vibeface/tree/main/packages/docs" target="_blank" rel="noopener noreferrer" className="inline-flex min-h-11 items-center underline underline-offset-4">也可在 GitHub 查看源文档<span className="sr-only">，在新标签页打开</span></a>}>
+      <a href="https://www.vibeface.dev/docs/user-guide" target="_blank" rel="noopener noreferrer" className="interactive-row block">
+        <SettingsRow icon={BookOpen} label="使用指南" description="查看 Bot、任务和设备的操作步骤"><ArrowUpRight aria-hidden="true" className="size-4" /><span className="sr-only">在新标签页打开</span></SettingsRow>
+      </a>
+      <a href="https://www.vibeface.dev/docs/troubleshooting" target="_blank" rel="noopener noreferrer" className="interactive-row block">
+        <SettingsRow icon={LifeBuoy} label="连接与恢复排查" description="连不上设备或结果未确认时，按当前状态排查"><ArrowUpRight aria-hidden="true" className="size-4" /><span className="sr-only">在新标签页打开</span></SettingsRow>
+      </a>
+    </SettingsGroup>
     <SettingsGroup title="高级">
       <ConnectionSettings />
       <Link to="/settings/lab" className="interactive-row block">
@@ -88,10 +97,10 @@ function SettingsPage() {
       </SettingsRow>
     </SettingsGroup> : null}
     <SettingsGroup>
-      <SettingsRow icon={LogOut} tone="danger" label="断开这个浏览器" onClick={() => setLeaving(true)} />
+      <SettingsRow ref={leaveTrigger} icon={LogOut} tone="danger" label="断开这个浏览器" onClick={() => setLeaving(true)} />
     </SettingsGroup>
     <Drawer open={leaving} onOpenChange={setLeaving}>
-      <DrawerContent title={sole ? onlyManagerText("这个浏览器") : "断开这个浏览器？"} description={sole ? "不能断开" : "要回来，得重新打开本机页面或用加入链接"} side="bottom" className="gap-0 pb-[env(safe-area-inset-bottom)] sm:mx-auto sm:max-w-md sm:rounded-t-2xl sm:border-x">
+      <DrawerContent title={sole ? onlyManagerText("这个浏览器") : "断开这个浏览器？"} description={sole ? "不能断开" : "要回来，得重新打开本机页面或用加入链接"} side="bottom" className="gap-0 pb-[env(safe-area-inset-bottom)] sm:mx-auto sm:max-w-md sm:rounded-t-2xl sm:border-x" onCloseAutoFocus={(event) => { event.preventDefault(); leaveTrigger.current?.focus({ preventScroll: true }) }}>
         {sole ? <>
           <div className="px-4 pt-4">
 

@@ -2,7 +2,7 @@ import { Link, useRouterState } from '@tanstack/react-router'
 import { ThemeToggle } from '@/components/theme-toggle'
 
 const NAV = [
-  { label: 'Docs', kind: 'route' as const, to: '/docs/$' as const, splat: 'overview' },
+  { label: 'Docs · 中文', kind: 'route' as const, to: '/docs/$' as const, splat: 'overview' },
   { label: 'Download', kind: 'href' as const, href: '/download' },
   { label: 'Community', kind: 'href' as const, href: '/community' },
   { label: 'Security', kind: 'href' as const, href: '/security' },

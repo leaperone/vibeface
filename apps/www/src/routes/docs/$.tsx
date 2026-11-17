@@ -4,7 +4,9 @@ import { DocsLayout } from 'fumadocs-ui/layouts/docs'
 import { useFumadocsLoader } from 'fumadocs-core/source/client'
 import { Suspense, use } from 'react'
 import { docs, source } from '@/lib/source'
+import { groupDocsNavigation } from '@/lib/docs-navigation'
 import { useMDXComponents } from '@/components/mdx'
+import { DocsNavigationKeyboard } from '@/components/docs-navigation-keyboard'
 
 export const Route = createFileRoute('/docs/$')({
   component: DocsRoute,
@@ -18,7 +20,7 @@ export const Route = createFileRoute('/docs/$')({
       url: page.url,
       title: page.data.title ?? page.path,
       description: page.data.description ?? 'Vibeface 文档',
-      pageTree: await source.serializePageTree(source.getPageTree()),
+      pageTree: await source.serializePageTree(groupDocsNavigation(source.getPageTree())),
     }
   },
   head: ({ loaderData }) => loaderData
@@ -77,6 +79,7 @@ function DocsRoute() {
         }}
         themeSwitch={{ mode: 'light-dark' }}
       >
+        <DocsNavigationKeyboard />
         <Suspense>
           <Content path={data.path} />
         </Suspense>
