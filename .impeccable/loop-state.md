@@ -144,3 +144,13 @@ A7：App36/40、官网31/32、Docs37/40；P0/P1/P2均0，P3两项为任务自身
 第八轮Prompt：harden+animate+polish仅修文档motion。Read场景不新增焦点动画；开关采用100ms opacity反馈，移除空间缩放/平移，保留原始可见状态、focus、loader及普通偏好动画；不改App或服务协议。增加真实浏览器测试在打开弹窗时检查变化的transform/scale/translate/rotate帧，而不是只按CSS源码判断。普通偏好仍走搜索503恢复用例。
 
 定向验证：WWW生产构建、typecheck、13项单测、22HTML/25输出静态检查与浏览器2/2通过；App源码、Core及已验收交互未修改，A7的App36/40继续对应当前相同输入。当前唯一PR为671，初始提交8ae97b9d；接下来独立A8只复评变更的文档阅读面，B8复查减少动态、焦点/搜索与邻近浮层回归，避免重复未改动的全App扫描。不将旧评分称作新执行结果。
+
+## 第八轮回归发现与第九轮修复
+
+A8 Docs32/40，B8文档定向15/20。新增通用data-state淡出规则错误命中持久Collapsible.Root与Toc结构容器：三个关闭分类和本页目录透明，P1；Toc背景层受影响P2。A还实测目录初焦停在被覆盖header以及503 reload丢query，均P2。既有toBeVisible与aria-expanded会让opacity0祖先漏检，不能将第八轮测试通过当作设计通过。未合并PR。
+
+第九轮Prompt：收窄动画到明确search dialog和mobile sidebar浮层；真正collapsible/Toc content按reduce即时切换，结构容器不改opacity。目录初焦等Presence实际可见/焦点成功，并取消observer/rAF；搜索改原地显式retry，保留query/open/focus。public SDK按from URL缓存失败Promise，因此用仅显式操作递增的module source generation更新client.deps，不修改vendor、不自动重试或更改协议兼容逻辑。
+
+第九轮验证：独立代码复审无确认P0/P1/P2；真实SDK连续失败→恢复→remount用例通过，WWW14/14、typecheck/e2e类型、生产构建、静态22HTML/25输出均通过。浏览器2/2增加祖先effective opacity、初始focus、query保留、结果恢复及Escape还焦，不仅检查DOM可见。根实际看图/交叠探针：4组opacity=1，目录立即开搜索再关闭连续2次都focus当前文章，本页目录root opacity=1、animation=none且backdrop blur8px。根图片实际为light，已纠正原requested-dark文件名，不计为暗色验收。
+
+准备独立A9/B9仅复评变更Docs Read面；App与marketing未改，保留A7各36/40、31/32的当前源码有效评分。第九轮Docs分数与最终技术结论仍待实测，不自行补分。

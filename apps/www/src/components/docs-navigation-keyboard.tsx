@@ -40,9 +40,32 @@ export function DocsNavigationKeyboard() {
         .filter(element => element.tabIndex >= 0 && !element.matches(':disabled, [aria-disabled="true"]') && visible(element))
     }
     function focusDirectory() {
+      if (drawer.dataset.state !== 'open' || !visible(drawer)) return false
       const current = drawer.querySelector<HTMLElement>('a[data-active="true"]')
       const target = current && visible(current) ? current : focusable()[0] ?? drawer
       target.focus({ preventScroll: true })
+      return document.activeElement === target
+    }
+
+    // Presence can keep the aside invisible for the first render after open changes.
+    let initialFocusPending = true
+    let focusFrame: number | undefined
+    const presenceObserver = new MutationObserver(scheduleInitialFocus)
+    function stopInitialFocus() {
+      initialFocusPending = false
+      if (focusFrame !== undefined) cancelAnimationFrame(focusFrame)
+      presenceObserver.disconnect()
+      drawer.removeEventListener('animationend', scheduleInitialFocus)
+      drawer.removeEventListener('transitionend', scheduleInitialFocus)
+    }
+    function scheduleInitialFocus() {
+      if (!initialFocusPending || focusFrame !== undefined) return
+      focusFrame = requestAnimationFrame(() => {
+        focusFrame = undefined
+        if (!initialFocusPending) return
+        if (!drawer.isConnected || drawer.dataset.state !== 'open' || window.location.href !== openedAt) { stopInitialFocus(); return }
+        if (!otherOverlay() && focusDirectory()) stopInitialFocus()
+      })
     }
     function onKeyDown(event: KeyboardEvent) {
       if (event.defaultPrevented || otherOverlay()) return
@@ -63,13 +86,18 @@ export function DocsNavigationKeyboard() {
       }
     }
     function onFocusIn(event: FocusEvent) {
-      if (!drawer.contains(event.target instanceof Node ? event.target : null) && !otherOverlay()) focusDirectory()
+      if (drawer.contains(event.target instanceof Node ? event.target : null)) stopInitialFocus()
+      else if (!otherOverlay() && !focusDirectory()) scheduleInitialFocus()
     }
 
-    if (!otherOverlay()) focusDirectory()
+    presenceObserver.observe(drawer, { attributes: true, attributeFilter: ['class', 'style', 'hidden', 'inert', 'aria-hidden', 'data-state'], childList: true, subtree: true })
+    drawer.addEventListener('animationend', scheduleInitialFocus)
+    drawer.addEventListener('transitionend', scheduleInitialFocus)
+    scheduleInitialFocus()
     document.addEventListener('keydown', onKeyDown)
     document.addEventListener('focusin', onFocusIn)
     return () => {
+      stopInitialFocus()
       document.removeEventListener('keydown', onKeyDown)
       document.removeEventListener('focusin', onFocusIn)
       for (const [name, value] of previous) {

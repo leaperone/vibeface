@@ -15,6 +15,19 @@ test('keeps the guide language, narrow layout and production search clear', asyn
   await screen.getByRole('button', '打开文档目录', { visible: true }).click()
   const mobileDirectory = browser.locator('#nd-sidebar-mobile')
   await expect(mobileDirectory).toBeVisible()
+  await expect(browser.locator('#nd-sidebar-mobile :focus')).toHaveCount(1)
+  const groupOpacity = await browser.evaluate(async () => {
+    const sidebar = document.getElementById('nd-sidebar-mobile')
+    if (!sidebar) throw new Error('The document directory is missing')
+    await Promise.all(sidebar.getAnimations({ subtree: true }).filter(animation => animation.effect?.getComputedTiming().iterations !== Infinity).map(animation => animation.finished.catch(() => {})))
+    return [...sidebar.querySelectorAll<HTMLElement>('button')].filter(button => ['开始使用', 'Bot 与任务', '设备与安全', '部署与开发'].includes(button.textContent?.trim() ?? '')).map(button => {
+      let element: HTMLElement | null = button, opacity = 1
+      while (element) { opacity *= Number(getComputedStyle(element).opacity); element = element.parentElement }
+      return { label: button.textContent, opacity }
+    })
+  })
+  assert.equal(groupOpacity.length, 4)
+  assert(groupOpacity.every(group => group.opacity >= .99), 'Collapsed directory categories remain visibly opaque with reduced motion')
   const startGroup = mobileDirectory.getByRole('button', '开始使用', { exact: true })
   await expect(startGroup).toHaveAttribute('aria-expanded', 'true')
   const developerGroup = mobileDirectory.getByRole('button', '部署与开发', { exact: true })
@@ -72,14 +85,24 @@ test('keeps the guide language, narrow layout and production search clear', asyn
 
 test('gives an actionable search-index failure without discarding navigation', async ({ app, screen, browser }) => {
   await browser.emulateMedia({ reducedMotion: 'no-preference' })
-  await browser.route('**/search-index.json', route => route.fulfill({ status: 503, json: { error: 'temporary-fixture-failure' } }))
+  const indexRoute = /\/search-index\.json(?:\?|$)/
+  await browser.route(indexRoute, route => route.fulfill({ status: 503, json: { error: 'temporary-fixture-failure' } }))
   await app.open('/docs/quick-start/')
-  await screen.getByRole('button', '打开文档搜索', { visible: true }).first().click()
+  const opener = screen.getByRole('button', '打开文档搜索', { visible: true }).first()
+  await opener.click()
   await screen.getByPlaceholder('搜索文档').fill('恢复')
   await expect(screen.getByRole('alert').filter({ hasText: '暂时无法搜索文档' })).toBeVisible()
-  await expect(screen.getByRole('button', '重新载入文档', { exact: true })).toBeVisible()
+  await expect(screen.getByRole('button', '重试搜索', { exact: true })).toBeVisible()
   await app.screenshot('quality-docs-search-failure')
+  await browser.unroute(indexRoute)
+  await screen.getByRole('button', '重试搜索', { exact: true }).click()
+  await expect(screen.getByPlaceholder('搜索文档')).toHaveValue('恢复')
+  await expect(screen.getByPlaceholder('搜索文档')).toBeFocused()
+  await expect(screen.getByRole('option').first()).toBeVisible()
+  await expect(screen.getByRole('alert')).toHaveCount(0)
+  await app.screenshot('quality-docs-search-retry-preserves-query')
   await browser.keyboard.press('Escape')
   await expect(screen.getByRole('dialog')).toHaveCount(0)
+  await expect(opener).toBeFocused()
   await expect(screen.getByRole('main')).toBeVisible()
 })

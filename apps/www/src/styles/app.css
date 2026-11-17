@@ -377,8 +377,10 @@ a { color: inherit; text-decoration: none; }
     transition-duration: 100ms !important;
     scroll-behavior: auto !important;
   }
-  .site-search-dialog[data-state='open'], .site-docs [data-state='open']:not(button):not(a) { animation: reading-fade-in 100ms linear both !important; }
-  .site-search-dialog[data-state='closed'], .site-docs [data-state='closed']:not(button):not(a) { animation: reading-fade-out 100ms linear both !important; }
+  .site-search-dialog[data-state='open'], #nd-sidebar-mobile[data-state='open'] { animation: reading-fade-in 100ms linear both !important; }
+  .site-search-dialog[data-state='closed'], #nd-sidebar-mobile[data-state='closed'] { animation: reading-fade-out 100ms linear both !important; }
+  /* These are content panels, not the persistent roots that also contain their triggers/backdrops. */
+  .site-docs [data-toc-popover-content], .site-docs [class*='animate-fd-collapsible-'] { animation: none !important; }
 }
 @media (forced-colors: active) {
   .site :is(a, button):focus-visible { outline-color: Highlight; }
