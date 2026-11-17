@@ -213,6 +213,16 @@ fn main() {
             }
             _ => panic!("unexpected CLI action"),
         }
+        if action == "update" && profile.join("fixture.timeout-after-mutation").exists() {
+            // Publish the PID only after the real mutation above has committed. Keep both
+            // output pipes open so the production deadline, kill and wait paths must run.
+            let pending = profile.join("fixture.mutation-written.pending");
+            write(&pending, std::process::id().to_string());
+            fs::rename(&pending, profile.join("fixture.mutation-written")).unwrap();
+            loop {
+                thread::park();
+            }
+        }
         if action != "status" && profile.join("fixture.nonzero-mutation").exists() {
             std::process::exit(1);
         }

@@ -376,6 +376,141 @@ async fn failed_mutations_are_reconciled_by_status_without_repeating_the_write()
     Ok(())
 }
 
+// /proc disappearance proves this particular child was reaped as well as killed.
+// Other platforms retain the malformed/nonzero cases but do not run this Linux proof.
+#[cfg(target_os = "linux")]
+#[tokio::test(start_paused = true)]
+async fn timed_out_update_after_write_is_reaped_and_reconciled_without_retry() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.initialize()?;
+    for (name, value) in [
+        ("service.installed", b"".as_slice()),
+        ("fixture.availability", b"newer_available".as_slice()),
+        ("fixture.timeout-after-mutation", b"".as_slice()),
+    ] {
+        privatefs::write_atomic(&fixture.profile.join(name), value)?;
+    }
+    privatefs::write_atomic(&fixture.node().join("running"), b"")?;
+    let mut host = fixture.open(false)?;
+    let marker = fixture.profile.join("fixture.mutation-written");
+    let frozen_at = tokio::time::Instant::now();
+    let real_started = std::time::Instant::now();
+    let (result, process_path) = {
+        let mutation = host.background(BackgroundAction::Update);
+        tokio::pin!(mutation);
+        loop {
+            // A ready yield prevents paused Tokio from automatically advancing to the
+            // deadline while the real OS process is starting or writing its marker.
+            tokio::select! {
+                biased;
+                result = &mut mutation => bail!("Update completed before its committed marker: {result:?}"),
+                _ = tokio::task::yield_now() => {}
+            }
+            if marker.try_exists()? {
+                break;
+            }
+            assert!(
+                real_started.elapsed() < Duration::from_secs(10),
+                "child did not commit its mutation"
+            );
+        }
+        assert_eq!(tokio::time::Instant::now(), frozen_at);
+        let pid: u32 = std::fs::read_to_string(&marker)?.parse()?;
+        let process_path = PathBuf::from(format!("/proc/{pid}"));
+        assert!(pid > 0);
+        assert!(
+            process_path.exists(),
+            "mutation child must still be alive after writing"
+        );
+        assert_eq!(
+            privatefs::read_private_bounded(&marker, 32, "committed mutation PID")?,
+            pid.to_string().as_bytes()
+        );
+        assert_eq!(
+            privatefs::read_private_bounded(
+                &fixture.profile.join("fixture.availability"),
+                64,
+                "committed runtime availability"
+            )?,
+            b"current"
+        );
+
+        // Exercise the unchanged 120-second Update deadline, rather than installing a
+        // production timeout seam or waiting 120 seconds of wall-clock time.
+        tokio::time::advance(Duration::from_secs(119)).await;
+        tokio::select! {
+            biased;
+            result = &mut mutation => bail!("Update completed before its production deadline: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        let process_status = std::fs::read_to_string(process_path.join("status"))?;
+        let state = process_status
+            .lines()
+            .find(|line| line.starts_with("State:"))
+            .unwrap();
+        assert!(
+            !state.contains("Z (zombie)"),
+            "child must remain live before the deadline"
+        );
+        assert_eq!(
+            tokio::time::Instant::now() - frozen_at,
+            Duration::from_secs(119)
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let result = loop {
+            // Keep time frozen at the expired deadline while production kill/wait and
+            // the subsequent read-only Status use real OS process/pipe readiness.
+            tokio::select! {
+                biased;
+                result = &mut mutation => break result,
+                _ = tokio::task::yield_now() => {}
+            }
+            assert!(
+                real_started.elapsed() < Duration::from_secs(10),
+                "timeout cleanup or Status did not complete"
+            );
+        };
+        (result, process_path)
+    };
+    assert_eq!(
+        tokio::time::Instant::now() - frozen_at,
+        Duration::from_secs(120)
+    );
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "后台节点操作超时，结果未知。请刷新状态核对，勿重复操作。"
+    );
+    assert!(
+        !process_path.exists(),
+        "production timeout must kill and reap its child"
+    );
+    let calls = std::fs::read_to_string(fixture.profile.join("fixture.calls"))?;
+    let prefix = format!("desktop-node\t--profile-dir\t{}", fixture.profile.display());
+    assert_eq!(
+        calls.lines().collect::<Vec<_>>(),
+        vec![
+            format!("{prefix}\tstatus"),
+            format!("{prefix}\t--expected-device-id\t{}\tupdate", "a".repeat(64)),
+            format!("{prefix}\tstatus"),
+        ],
+        "unknown mutation gets exactly one read-only reconciliation and is never repeated"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.profile.join("fixture.last-action"))?,
+        "update"
+    );
+    let reconciled = host.snapshot().background.unwrap();
+    assert_eq!(
+        reconciled.runtime_update.availability,
+        UpdateAvailability::Current
+    );
+    assert_eq!(reconciled.identity(), Some(fixture.identity()));
+    assert_eq!(reconciled.state, ServiceState::Installed);
+    assert_eq!(reconciled.service_running, Some(true));
+    assert_eq!(reconciled.core_status, Some(NodeStatus::Running));
+    Ok(())
+}
+
 #[tokio::test]
 async fn legal_status_does_not_confirm_an_unfinished_background_action() -> Result<()> {
     for (action, argument, state, service_running, core_status) in [
