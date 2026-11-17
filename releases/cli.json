@@ -1,0 +1,14 @@
+{
+  "app": {
+    "manifest_sha256": "e8d7808483ac5453b088145f5fec5e12fc442d5a485ad47d14138d4287dd5873",
+    "source_commit": "d2082ecaee64fddefe89056a0bd0cfbb8ae906e9",
+    "tag": "app-v0.0.1-hourly.2026111700",
+    "version": "0.0.1-hourly.2026111700"
+  },
+  "core": {
+    "manifest_sha256": "49d02fac7e2e26f195ae69cad277a3fcd74d6950c3c8903d94644f879670317f",
+    "source_commit": "2dd2e6d595f079fd8f78c91b84f2d3e450c0f7d9",
+    "tag": "core-v0.0.1-hourly.2026111700",
+    "version": "0.0.1-hourly.2026111700"
+  }
+}
