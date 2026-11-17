@@ -23,6 +23,7 @@ export type ChatMessage = TranscriptMessage & { state?: 'sending' | 'streaming' 
  * `stoppable`: the running reply can be cancelled. `blocked`: why sending is off right now, or null when it is allowed.
  */
 export type Conversation = {
+  origin: { kind: 'cache'; savedAt: number } | { kind: 'network' }
   messages: ChatMessage[]
   /** Questions before the message written after them, and those asked after the last. */
   before: ReadonlyMap<string, Question[]>
@@ -46,6 +47,8 @@ export type Attachment = { uri: string; name: string; size: number | null; mimeT
 export type Member = { device_id: string; name: string; kind: 'node' | 'client'; admin: boolean; online: boolean | undefined; current: boolean; entry: boolean; bot: BotReadiness | null }
 
 type WorkspaceSnapshot = {
+  networkId: string | null
+  deviceId: string | null
   session: Session
   connection: Connection
   bots: BotRecord[]

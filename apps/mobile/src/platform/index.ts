@@ -65,7 +65,9 @@ Notifications.setNotificationHandler({
 })
 // Its own Android channel, so system settings show Vibeface's name for these alerts; iOS ignores channels.
 const channelId = 'vibeface'
-void Notifications.setNotificationChannelAsync(channelId, { name: '回答与进展', importance: Notifications.AndroidImportance.HIGH }).catch(() => {})
+const silentChannelId = 'vibeface-silent'
+void Notifications.setNotificationChannelAsync(channelId, { name: '回答与进展', importance: Notifications.AndroidImportance.HIGH, sound: 'default' }).catch(() => {})
+void Notifications.setNotificationChannelAsync(silentChannelId, { name: '回答与进展（静音）', importance: Notifications.AndroidImportance.HIGH, sound: null, enableVibrate: false }).catch(() => {})
 const openings = notificationOpenings({ getItem: key => store.getString(key) ?? null, setItem: (key, value) => store.set(key, value) })
 const receiveOpening = (response: Notifications.NotificationResponse) => {
   const { request } = response.notification
@@ -92,7 +94,7 @@ const notifier: Notifier = {
     const settings = notificationPreferences(notificationStorage, destination.network_id).read()
     await privateFiles.run(async (current) => {
       if (!current()) throw new Error('应用内数据正在清除。')
-      await Notifications.scheduleNotificationAsync({ identifier: tag, content: { title, body, data: { destination }, ...(settings.sound ? { sound: 'default' } : {}) }, trigger: { channelId } })
+      await Notifications.scheduleNotificationAsync({ identifier: tag, content: { title, body, data: { destination }, ...(settings.sound ? { sound: 'default' } : {}) }, trigger: { channelId: settings.sound ? channelId : silentChannelId } })
     })
   },
 }
@@ -115,6 +117,8 @@ const lan: Lan = {
 const transport = createTransport(secure, phoneKeys, nativeLan.dial)
 
 export const mobilePlatform: Platform = {
+  conversationCache: true,
+  explicitMessageRead: true,
   secure,
   transport,
   storage: { getItem: (key) => store.getString(key) ?? null, setItem: (key, value) => store.set(key, value) },

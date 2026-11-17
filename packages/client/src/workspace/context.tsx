@@ -25,6 +25,7 @@ import { mergeConversation, mergeWorkspaceState } from "./records.ts"
 import { HistoryRequests, mergeHistoryPage, readConversationHistory } from "./history.ts"
 import { createConversationCache } from "./conversation-cache.ts"
 import { ConversationReadOwner, markVisibleMessagesRead, readConversationSnapshot } from "./conversation-read.ts"
+import { systemNotifications } from "./system-notifications.ts"
 import { answerBody, answerId } from "./questions.ts"
 import { memoryController, memoryResultLabel, memorySaved } from "./memory.ts"
 import { networkKey, newId, storageOf } from "./storage.ts"
@@ -63,6 +64,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const connectionGeneration = connection.generation
   const networkId = connection.principal.network_id
   const clientId = connection.principal.device_id
+  const systemAlerts = useMemo(() => systemNotifications({ storage: platform.storage, networkId, notifier }), [platform.storage, networkId, notifier])
   /** A local session reads this computer's records, but the network takes only a member's signature. */
   const joined = connection.principal.source === "membership"
   const prefix = `${networkId}.${clientId}:`
@@ -409,25 +411,19 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       : { label: `开启${notifier.name}`, disabled: false, state: "off" })
   }
   const notify = async (items: NotificationRecord[]) => {
-    if (!items.length || !readStorage(networkKey("notify", networkId), false) || await notifier.permission() !== "granted") return
-    const seen = new Set(readStorage<string[]>(networkKey("seen", networkId), []))
-    for (const item of items) {
-      if (seen.has(item.notification_id)) continue
-      if (isSessionNotification(item) && platform.sessionNotifications === false) continue
-      seen.add(item.notification_id)
-      if (viewRef.current === "chat" && notificationForMain(item, activeId.current) && platform.foreground()) continue
-      try {
-        notifier.show({ title: item.kind === "question" ? "Vibeface · 需要你回答" : isSessionNotification(item) ? "Vibeface · 接手会话" : "Vibeface · 进展", body: item.text, tag: item.notification_id, destination: { network_id: networkId, device_id: clientId, notification_id: item.notification_id, conversation_id: item.conversation_id } }, () => {
+    await systemAlerts.deliver({
+      items, current,
+      eligible: (item) => !isSessionNotification(item) || platform.sessionNotifications !== false,
+      visible: (item) => viewRef.current === "chat" && notificationForMain(item, activeId.current) && platform.foreground(),
+      show: (item) => notifier.show({ title: item.kind === "question" ? "Vibeface · 需要你回答" : isSessionNotification(item) ? "Vibeface · 接手会话" : "Vibeface · 进展", body: item.text, tag: item.notification_id, destination: { network_id: networkId, device_id: clientId, notification_id: item.notification_id, conversation_id: item.conversation_id } }, () => {
           if (!current()) return
           if (isSessionNotification(item)) {
             void ackNotificationRef.current(item).then(() => { if (current()) openConversation(item.conversation_id, item.target) }, () => {})
           } else {
             openConversation(item.conversation_id, item.target)
           }
-        })
-      } catch { /* The persisted inbox remains available when system alerts fail. */ }
-    }
-    writeStorage(networkKey("seen", networkId), [...seen].slice(-1000))
+      }),
+    })
   }
   useEffect(() => notifier.watchOpen?.(async (destination) => {
     try {
@@ -509,7 +505,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       loadedMessageConnection.current = connection
       flushMessagesRef.current()
       void readWorkspaceState().catch(showRefreshError)
-      void notify(nextNotifications.filter((item) => !ignoredNotificationsRef.current.has(item.notification_id)))
+      void notify(nextNotifications.filter((item) => !ignoredNotificationsRef.current.has(item.notification_id))).catch((caught) => showError(caught, '显示系统提醒'))
       void refreshNotificationButton()
       resolveRefresh()
     } catch (caught) {
