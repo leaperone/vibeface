@@ -1,5 +1,5 @@
 name: Deploy / Node
-run-name: Deploy Node from ${{ inputs.tag }} (${{ inputs.apply && 'apply' || 'dry run' }}, ${{ github.ref_name }})
+run-name: Deploy Node from ${{ inputs.tag }} (${{ inputs.apply && 'apply' || 'dry run' }}, ${{ github.ref_name }})${{ inputs.request_id && format(' [request {0}]', inputs.request_id) || '' }}
 
 on:
   workflow_dispatch:
@@ -12,6 +12,10 @@ on:
         description: Activate the verified containers on the configured hosts
         type: boolean
         default: false
+      request_id:
+        description: Correlate this dispatch with its release request
+        type: string
+        required: false
 
 permissions:
   contents: read
