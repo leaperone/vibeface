@@ -4,7 +4,7 @@ base_branch = "main"
 prefix = ""
 name = "CI policy and Python syntax"
 check = "python3 scripts/check-source.py && actionlint"
-build = "python3 -c 'import ast,pathlib; [ast.parse(pathlib.Path(p).read_text()) for p in (\"scripts/check-source.py\", \"scripts/ci.py\", \"scripts/verify-node.py\", \"scripts/build-inputs.py\", \"scripts/check-delivery.py\", \"scripts/install-delivery-toolchain.py\", \"scripts/run-delivery-live.py\", \"scripts/verify-delivery-protected.py\", \"scripts/verify-delivery-restart-observer.py\", \"scripts/release.py\", \"scripts/hourly.py\", \"scripts/release-dispatch.py\", \"scripts/check-release-workflow.py\", \"scripts/test_release_trains.py\")]'"
+build = "python3 -c 'import ast,pathlib; [ast.parse(pathlib.Path(p).read_text()) for p in (\"scripts/check-source.py\", \"scripts/ci.py\", \"scripts/verify-node.py\", \"scripts/build-inputs.py\", \"scripts/check-delivery.py\", \"scripts/install-delivery-toolchain.py\", \"scripts/run-delivery-live.py\", \"scripts/verify-delivery-protected.py\", \"scripts/verify-delivery-restart-observer.py\", \"scripts/release.py\", \"scripts/release_format.py\", \"scripts/release_context.py\", \"scripts/release_source.py\", \"scripts/release_archive.py\", \"scripts/release_inventory.py\", \"scripts/release_github.py\", \"scripts/release_publisher.py\", \"scripts/release_assembly.py\", \"scripts/tests/__init__.py\", \"scripts/tests/release/__init__.py\", \"scripts/tests/release/runner.py\", \"scripts/tests/release/test_format_archive.py\", \"scripts/tests/release/test_cli.py\", \"scripts/tests/release/test_publisher.py\", \"scripts/tests/release/test_source.py\", \"scripts/tests/release/support.py\", \"scripts/tests/release/fake_external.py\", \"scripts/hourly.py\", \"scripts/release-dispatch.py\", \"scripts/check-release-workflow.py\", \"scripts/test_release_trains.py\")]'"
 ci_check = "Workflow and source checks"
 
 [[domain_check]]
@@ -78,7 +78,7 @@ ci_check = "Workflow and source checks"
 
 [[domain_check]]
 name = "Delivery scripts and workflow"
-trigger_paths = ["install.sh", "scripts/*.sh", "scripts/release.py", "scripts/hourly.py", "scripts/release-dispatch.py", "scripts/check-release-workflow.py", ".github/workflows/**"]
+trigger_paths = ["install.sh", "scripts/*.sh", "scripts/release.py", "scripts/release_*.py", "scripts/tests/release/**", "scripts/tests/__init__.py", "scripts/hourly.py", "scripts/release-dispatch.py", "scripts/check-release-workflow.py", ".github/workflows/**"]
 command = "bash -n install.sh && bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh && shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh && bash install.sh --self-test"
 ci_check = "Workflow and source checks"
 

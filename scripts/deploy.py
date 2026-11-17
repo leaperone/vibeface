@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 """Select and stage one independently published Vibeface service."""
+
+import sys
+sys.dont_write_bytecode = True
+import release_archive
+import release_format
+import release_github
+import release_publisher
 import argparse
 import datetime
 import json
@@ -12,7 +19,6 @@ import tempfile
 from unittest import TestCase
 from unittest.mock import patch
 
-import release
 
 SERVICES = ('node', 'app', 'www')
 DEPLOY_WORKFLOWS = {'node': 'deploy-node.yml', 'app': 'deploy-app.yml', 'www': 'deploy-www.yml'}
@@ -25,21 +31,21 @@ def gh(*args):
     message = ('Deployment dispatch result is unknown; inspect workflow runs for the selected tag before retrying'
                if args[:2] == ('workflow', 'run') else
                'GitHub request failed; inspect authenticated CLI access and retry the read-only plan')
-    release.require(result.returncode == 0, message)
+    release_format.require(result.returncode == 0, message)
     return result.stdout
 
 
 def service_for_app(app):
-    release.require(app in ('core', 'app', 'www'), 'invalid release application')
+    release_format.require(app in ('core', 'app', 'www'), 'invalid release application')
     return 'node' if app == 'core' else app
 
 
 def plan(tag):
     """Verify the selected app release and return the deploy contract."""
-    kind, _, _ = release.parse_tag(tag)
+    kind, _, _ = release_format.parse_tag(tag)
     service = service_for_app(kind)
-    info, _, manifest_sha256 = release.published(tag)
-    release.require(info['app'] == kind and info['tag'] == tag,
+    info, _, manifest_sha256 = release_publisher.published(tag)
+    release_format.require(info['app'] == kind and info['tag'] == tag,
                     'published release application differs from selected tag')
     return {'tag': tag, 'source_sha': info['source_commit'], 'version': info['version'],
             'channel': info['channel'], 'app': kind, 'service': service,
@@ -48,23 +54,23 @@ def plan(tag):
 
 def previous(tag):
     """Return the previous complete Core release for Node rehearsal, if one exists."""
-    kind, _, _ = release.parse_tag(tag)
-    release.require(kind == 'core', 'only Core releases have a Node rehearsal predecessor')
+    kind, _, _ = release_format.parse_tag(tag)
+    release_format.require(kind == 'core', 'only Core releases have a Node rehearsal predecessor')
     selected = json.loads(gh('api', f'repos/{REPOSITORY}/releases/tags/{tag}'))
-    release.require(selected.get('tag_name') == tag and not selected.get('draft'),
+    release_format.require(selected.get('tag_name') == tag and not selected.get('draft'),
                     'candidate Core release is not published')
     published_at = selected.get('published_at')
-    release.require(isinstance(published_at, str), 'candidate Core release has no publication time')
+    release_format.require(isinstance(published_at, str), 'candidate Core release has no publication time')
     cutoff = datetime.datetime.fromisoformat(published_at.replace('Z', '+00:00'))
     pages = json.loads(gh('api', '--paginate', '--slurp',
                           f'repos/{REPOSITORY}/releases?per_page=100'))
-    release.require(isinstance(pages, list) and all(isinstance(page, list) for page in pages),
+    release_format.require(isinstance(pages, list) and all(isinstance(page, list) for page in pages),
                     'invalid release listing')
     candidates = []
     for item in (entry for page in pages for entry in page):
         name = item.get('tag_name')
         if (item.get('draft') or name == tag or not isinstance(name, str)
-                or not re.fullmatch('core-v' + release.VERSION, name)):
+                or not re.fullmatch('core-v' + release_format.VERSION, name)):
             continue
         date = item.get('published_at')
         if not isinstance(date, str):
@@ -78,18 +84,18 @@ def previous(tag):
 
 
 def selection(service, tag):
-    release.require(service in SERVICES, 'invalid deployment service')
-    kind, _, _ = release.parse_tag(tag)
-    release.require(service_for_app(kind) == service,
+    release_format.require(service in SERVICES, 'invalid deployment service')
+    kind, _, _ = release_format.parse_tag(tag)
+    release_format.require(service_for_app(kind) == service,
                     'release tag does not belong to the selected service')
     return [service]
 
 
 def execute(action, service, tag):
-    release.require(action in ('plan', 'release'), 'invalid deployment action')
+    release_format.require(action in ('plan', 'release'), 'invalid deployment action')
     targets = selection(service, tag)
     info = plan(tag)
-    release.require(info['service'] == service and info['targets'] == targets,
+    release_format.require(info['service'] == service and info['targets'] == targets,
                     'deployment plan service mismatch')
     if action == 'release':
         gh('workflow', 'run', DEPLOY_WORKFLOWS[service], '--repo', REPOSITORY, '--ref', 'main',
@@ -107,26 +113,26 @@ def prepare(service, tag, output):
     """Download and verify exactly the component owned by ``service``."""
     info = execute('plan', service, tag)
     output = Path(output)
-    release.require(not output.exists(), 'deployment output already exists')
+    release_format.require(not output.exists(), 'deployment output already exists')
     output.mkdir(parents=True)
     downloads = output / 'downloads'
     downloads.mkdir()
-    published_info, _, manifest_sha256 = release.published(tag)
-    release.require(published_info['app'] == info['app'] and published_info['tag'] == info['tag']
+    published_info, _, manifest_sha256 = release_publisher.published(tag)
+    release_format.require(published_info['app'] == info['app'] and published_info['tag'] == info['tag']
                     and published_info['source_commit'] == info['source_sha']
                     and manifest_sha256 == info['manifest_sha256'], 'published release changed during preparation')
     names = _selected_assets(info)
     assets = {asset['name']: asset for asset in published_info['assets']}
     selected = [assets[name] for name in names if name in assets]
-    release.require(len(selected) == len(names), 'published release is missing the selected component')
-    release.download_assets(tag, selected, downloads)
+    release_format.require(len(selected) == len(names), 'published release is missing the selected component')
+    release_github.download_assets(tag, selected, downloads)
     archive_name = names[0]
-    release.verify_checksum_file(downloads, archive_name)
-    unpacked = release.unpack(downloads / archive_name, output / 'unpacked')
+    release_archive.verify_checksum_file(downloads, archive_name)
+    unpacked = release_archive.unpack(downloads / archive_name, output / 'unpacked')
     expected = {'app': info['app'], 'tag': tag, 'version': info['version'],
                 'source_commit': info['source_sha'], 'channel': info['channel'],
                 'target': CORE_TARGET if info['app'] == 'core' else None}
-    component = release.verify_component(unpacked, info['app'], expected)
+    component = release_archive.verify_component(unpacked, info['app'], expected)
     context = output / info['app']
     context.mkdir()
     destination = context / 'component'
@@ -139,12 +145,12 @@ def prepare(service, tag, output):
 
 def self_test():
     source = 'a' * 40
-    fake_info = {'schema': release.SCHEMA_VERSION, 'source_commit': source,
+    fake_info = {'schema': release_format.SCHEMA_VERSION, 'source_commit': source,
                  'channel': 'hourly', 'app': 'app',
                  'tag': 'app-v0.0.1-hourly.2026111300', 'version': '0.0.1-hourly.2026111300'}
     fake_remote = {'tag_name': fake_info['tag'], 'draft': False, 'prerelease': True, 'assets': []}
     with patch(__name__ + '.gh') as mocked_gh, \
-            patch('release.published', return_value=(fake_info, fake_remote, 'c' * 64)):
+            patch('release_publisher.published', return_value=(fake_info, fake_remote, 'c' * 64)):
         assert selection('app', fake_info['tag']) == ['app']
         assert plan(fake_info['tag'])['service'] == 'app'
         mocked_gh.assert_not_called()
@@ -161,26 +167,26 @@ def self_test():
         component = root / 'vibeface-app-0.0.1-hourly.2026111300'
         (component / 'web').mkdir(parents=True)
         (component / 'web/_shell.html').write_text('fixture')
-        component_info = {'app': 'app', 'schema': release.SCHEMA_VERSION, 'tag': tag,
+        component_info = {'app': 'app', 'schema': release_format.SCHEMA_VERSION, 'tag': tag,
                           'version': '0.0.1-hourly.2026111300', 'source_commit': source,
                           'channel': 'hourly', 'target': None,
-                          'files': release.files(component)}
+                          'files': release_archive.files(component)}
         (component / 'COMPONENT-INFO.json').write_text(json.dumps(component_info))
         archive = root / 'vibeface-app-0.0.1-hourly.2026111300.tar.gz'
         with tarfile.open(archive, 'w:gz') as output:
             output.add(component, arcname=component.name)
         checksum = archive.with_name(archive.name + '.sha256')
-        checksum.write_text(f'{release.digest(archive)}  {archive.name}\n')
+        checksum.write_text(f'{release_archive.digest(archive)}  {archive.name}\n')
         info = {'tag': tag, 'source_sha': source, 'version': component_info['version'],
                 'channel': 'hourly', 'app': 'app', 'service': 'app', 'targets': ['app'],
                 'manifest_sha256': 'd' * 64}
         remote = {'assets': [{'name': name, 'size': path.stat().st_size,
-                              'digest': 'sha256:' + release.digest(path)}
+                              'digest': 'sha256:' + release_archive.digest(path)}
                              for name, path in ((archive.name, archive), (checksum.name, checksum))]}
 
         published_info = {'app': 'app', 'tag': tag, 'version': info['version'], 'source_commit': source,
                           'channel': 'hourly', 'assets': [
-                              {'name': path.name, 'size': path.stat().st_size, 'sha256': release.digest(path)}
+                              {'name': path.name, 'size': path.stat().st_size, 'sha256': release_archive.digest(path)}
                               for path in (archive, checksum)]}
 
         def download(args, **kwargs):
@@ -191,7 +197,7 @@ def self_test():
             return subprocess.CompletedProcess(args, 0)
 
         with patch(__name__ + '.execute', return_value=info), \
-                patch('release.published', return_value=(published_info, remote, 'd' * 64)), \
+                patch('release_publisher.published', return_value=(published_info, remote, 'd' * 64)), \
                 patch('subprocess.run', side_effect=download):
             prepared = prepare('app', tag, root / 'prepared')
         assert prepared['manifest_sha256'] == 'd' * 64
@@ -204,12 +210,12 @@ def self_test():
             return subprocess.CompletedProcess(args, 0)
 
         with patch(__name__ + '.execute', return_value=info), \
-                patch('release.published', return_value=(published_info, remote, 'd' * 64)), \
+                patch('release_publisher.published', return_value=(published_info, remote, 'd' * 64)), \
                 patch('subprocess.run', side_effect=download_corrupt), \
                 TestCase().assertRaises(ValueError, msg='accepted a changed component archive'):
             prepare('app', tag, root / 'corrupt')
         with patch(__name__ + '.execute', return_value=info), \
-                patch('release.published', return_value=(published_info, remote, 'e' * 64)), \
+                patch('release_publisher.published', return_value=(published_info, remote, 'e' * 64)), \
                 TestCase().assertRaisesRegex(ValueError, 'changed during preparation'):
             prepare('app', tag, root / 'changed-manifest')
     import contextlib
@@ -219,11 +225,11 @@ def self_test():
         published = {'app': app, 'tag': selected_tag, 'version': '0.0.1',
                      'source_commit': 'a' * 40, 'channel': 'stable'}
         output = io.StringIO()
-        with patch('release.published', return_value=(published, {}, 'b' * 64)), contextlib.redirect_stdout(output):
+        with patch('release_publisher.published', return_value=(published, {}, 'b' * 64)), contextlib.redirect_stdout(output):
             main(['plan', '--service', service, '--tag', selected_tag])
         value = json.loads(output.getvalue())
         assert value['service'] == service and value['targets'] == [service] and value['tag'] == selected_tag
-    with patch('release.published') as request, TestCase().assertRaisesRegex(ValueError, 'selected service'):
+    with patch('release_publisher.published') as request, TestCase().assertRaisesRegex(ValueError, 'selected service'):
         main(['plan', '--service', 'app', '--tag', 'core-v0.0.1'])
     request.assert_not_called()
     with contextlib.redirect_stderr(io.StringIO()), TestCase().assertRaises(SystemExit) as missing:

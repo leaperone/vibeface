@@ -10,7 +10,7 @@ Each public release writes `release.json` last, after validating all required as
 
 A dependency pin contains exactly `tag`, `version`, `source_commit`, and `manifest_sha256`. `releases/cli.json` in a release source contains `core` and `app` pins; `releases/desktop.json` contains a `cli` pin. The coordinator adds these files only to the generated release commit. An installed bundle's nine-field `BUILD-INFO.json` records the actual CLI, Core, and App versions and source commits. Those identities may differ and must match the enclosing release's pins.
 
-A consumer downloads an exact release manifest, verifies its hash and immutable tag, then verifies the selected archive against that manifest. It never selects a dependency by an unpinned `latest` URL. Release identity and byte verification belong to `scripts/release.py`; Hourly source selection and change detection belong to `scripts/hourly.py`; host activation remains in the deployment scripts.
+A consumer downloads an exact release manifest, verifies its hash and immutable tag, then verifies the selected archive against that manifest. It never selects a dependency by an unpinned `latest` URL. The CLI remains `scripts/release.py`; its eight production owners and offline tests are documented in [release module boundaries](../packages/docs/design/release-modules.md). Exact source generation belongs to `release_source.py`, while `hourly.py` selects changed applications and coordinates dispatch. Host activation remains in the deployment scripts.
 
 ## Automated publication
 

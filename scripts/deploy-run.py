@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """Build verified deployment images and activate them through a pinned SSH host."""
+
+import sys
+sys.dont_write_bytecode = True
+import release_archive
+import release_format
 import argparse
 import gzip
 import json
@@ -11,7 +16,6 @@ import shlex
 import shutil
 import sqlite3
 import subprocess
-import sys
 import tempfile
 import time
 import urllib.error
@@ -19,7 +23,7 @@ import urllib.request
 import uuid
 
 import deploy
-import release
+
 from unittest import TestCase
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -31,7 +35,7 @@ def checked(args, **kwargs):
 
 def image_id(image):
     value = subprocess.check_output(['docker', 'image', 'inspect', '--format', '{{.Id}}', image], text=True).strip()
-    release.require(re.fullmatch(r'sha256:[0-9a-f]{64}', value), 'invalid Docker image identity')
+    release_format.require(re.fullmatch(r'sha256:[0-9a-f]{64}', value), 'invalid Docker image identity')
     return value
 
 
@@ -64,10 +68,10 @@ def build(service, tag, output):
             version = subprocess.check_output(['docker', 'run', '--rm', '--platform', 'linux/amd64',
                                               '--entrypoint', '/opt/vibeface/vibeface-core', identity,
                                               '--version'], text=True).strip()
-            release.require(version == 'vibeface-core ' + info['version'], 'container Core version mismatch')
+            release_format.require(version == 'vibeface-core ' + info['version'], 'container Core version mismatch')
             refused = subprocess.run(['docker', 'run', '--rm', '--platform', 'linux/amd64', identity],
                                      capture_output=True, timeout=60)
-            release.require(refused.returncode != 0, 'Core container initialized missing deployment data')
+            release_format.require(refused.returncode != 0, 'Core container initialized missing deployment data')
             core_smoke(identity, info, output)
         else:
             checked(['docker', 'run', '--rm', '--platform', 'linux/amd64', '--entrypoint', 'nginx', identity, '-t'])
@@ -77,7 +81,7 @@ def build(service, tag, output):
             process = subprocess.Popen(['docker', 'save', identity], stdout=subprocess.PIPE)
             shutil.copyfileobj(process.stdout, compressed)
             process.stdout.close()
-            release.require(process.wait() == 0, 'cannot export container image')
+            release_format.require(process.wait() == 0, 'cannot export container image')
         # The host proves the archive the same way before `docker load`; fail here, not on the host.
         runpy.run_path(str(ROOT / 'scripts/deploy-activate.py'))['archive_images'](archive, identity)
     info['images'] = images
@@ -106,7 +110,7 @@ def core_smoke(identity, info, output):
         result = json.loads(docker('run', '--rm', '-i', *base, '--entrypoint',
                                   '/opt/vibeface/vibeface-core', identity, '--control',
                                   input=json.dumps({'command': 'init', 'options': options})))
-        release.require(result.get('ok') is True, 'isolated Core fixture initialization failed')
+        release_format.require(result.get('ok') is True, 'isolated Core fixture initialization failed')
         # Like the host's root-owned TLS directory: root writes the pair, the Node only reads it.
         docker('run', '--rm', *base, '-v', tls + ':/tls', '--entrypoint', 'python3', identity, '-c',
                "from pathlib import Path; import os, shutil; p=Path('/data'); os.chmod(p,0o700); (p/'node.lock').touch(); "
@@ -126,7 +130,7 @@ def core_smoke(identity, info, output):
         # The image pins the official issuer, so the fixture Node runs only under its own anchor.
         refused = subprocess.run(['docker', 'run', '--rm', *base, '--user', '1001:1001', *environment,
                                   identity, 'guard'], capture_output=True, timeout=60)
-        release.require(refused.returncode != 0, 'the guard accepted a Node other than the pinned issuer')
+        release_format.require(refused.returncode != 0, 'the guard accepted a Node other than the pinned issuer')
         anchor = output / 'fixture-bootstrap.json'
         anchor.write_text(json.dumps({'issuer': device, 'udp_host': '127.0.0.1', 'udp_port': 4793,
                                       'gateway_url': gateway}))
@@ -140,11 +144,11 @@ def core_smoke(identity, info, output):
             if health.returncode == 0:
                 break
             time.sleep(1)
-        release.require(health.returncode == 0 and json.loads(health.stdout)['device_id'] == device,
+        release_format.require(health.returncode == 0 and json.loads(health.stdout)['device_id'] == device,
                         'Core fixture health or identity mismatch')
         docker('stop', '--time', '30', container)
         state = json.loads(docker('inspect', container))[0]['State']
-        release.require(state['ExitCode'] == 0 and not state['OOMKilled'], 'Core did not stop gracefully')
+        release_format.require(state['ExitCode'] == 0 and not state['OOMKilled'], 'Core did not stop gracefully')
         docker('start', container)
         for _ in range(30):
             health = subprocess.run(['docker', 'exec', container, 'python3', '/opt/vibeface/runtime.py', 'health'],
@@ -152,7 +156,7 @@ def core_smoke(identity, info, output):
             if health.returncode == 0:
                 break
             time.sleep(1)
-        release.require(health.returncode == 0 and json.loads(health.stdout)['device_id'] == device,
+        release_format.require(health.returncode == 0 and json.loads(health.stdout)['device_id'] == device,
                         'Core identity changed after restart')
     finally:
         if container:
@@ -166,29 +170,29 @@ def static_smoke(identity, component, role, sha):
                                          '--tmpfs', '/tmp:rw,nosuid,noexec,size=64m,mode=1777', '-p', '127.0.0.1::8080', identity], text=True).strip()
     try:
         binding = subprocess.check_output(['docker', 'port', container, '8080/tcp'], text=True).strip()
-        release.require(re.fullmatch(r'127\.0\.0\.1:[0-9]+', binding), 'invalid smoke binding')
+        release_format.require(re.fullmatch(r'127\.0\.0\.1:[0-9]+', binding), 'invalid smoke binding')
         origin = 'http://' + binding
         directory = component / ('web' if role == 'app' else 'site')
         for _ in range(30):
             try:
                 with urllib.request.urlopen(origin + '/', timeout=2) as response:
                     html = response.read()
-                    release.require(response.headers.get('X-Vibeface-Source') == sha, 'static image source mismatch')
+                    release_format.require(response.headers.get('X-Vibeface-Source') == sha, 'static image source mismatch')
                 break
             except (OSError, urllib.error.URLError):
                 time.sleep(1)
         else:
             raise ValueError('static image did not become ready')
         expected = directory / ('_shell.html' if role == 'app' else 'index.html')
-        release.require(html == expected.read_bytes(), 'static image entry differs from released bytes')
+        release_format.require(html == expected.read_bytes(), 'static image entry differs from released bytes')
         if role == 'app':
             with urllib.request.urlopen(origin + '/connect', timeout=5) as response:
-                release.require(response.read() == expected.read_bytes(), 'App SPA fallback changed')
+                release_format.require(response.read() == expected.read_bytes(), 'App SPA fallback changed')
         for path in ('/api/missing', '/assets/not-a-release-asset.js'):
             try:
                 urllib.request.urlopen(origin + path, timeout=5)
             except urllib.error.HTTPError as error:
-                release.require(error.code == 404, 'unexpected static error response')
+                release_format.require(error.code == 404, 'unexpected static error response')
             else:
                 raise ValueError('static image serves a missing API or asset')
     finally:
@@ -198,26 +202,26 @@ def static_smoke(identity, component, role, sha):
 def transport(environment):
     host, user = environment['DEPLOY_HOST'], environment['DEPLOY_USER']
     port = environment.get('DEPLOY_PORT') or '22'
-    release.require(re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9.-]*', host)
+    release_format.require(re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9.-]*', host)
                     and re.fullmatch(r'[a-z_][a-z0-9_-]*', user)
                     and port.isdecimal() and 1 <= int(port) <= 65535, 'invalid SSH destination')
     for key in ('DEPLOY_SSH_KEY', 'DEPLOY_KNOWN_HOSTS', 'DEPLOY_CONFIG'):
-        release.require(environment.get(key), 'missing deployment configuration: ' + key)
+        release_format.require(environment.get(key), 'missing deployment configuration: ' + key)
     return host, user, port
 
 
 def activate(service, output):
     output = Path(output).resolve()
     info = json.loads((output / 'deployment.json').read_text())
-    release.require(service in info['targets'], 'image was not prepared for this service')
+    release_format.require(service in info['targets'], 'image was not prepared for this service')
     component = 'www' if service == 'www' else 'app' if service == 'app' else 'core'
     identity = info['images'][component]
-    release.require(re.fullmatch(r'sha256:[0-9a-f]{64}', identity), 'invalid prepared image ID')
+    release_format.require(re.fullmatch(r'sha256:[0-9a-f]{64}', identity), 'invalid prepared image ID')
     archive = output / f'{component}.image.tar.gz'
     accepted_images = runpy.run_path(str(ROOT / 'scripts/deploy-activate.py'))['archive_images'](archive, identity)
     host, user, port = transport(os.environ)
     config = json.loads(os.environ['DEPLOY_CONFIG'])
-    release.require(config['role'] == service, 'environment role does not match selected service')
+    release_format.require(config['role'] == service, 'environment role does not match selected service')
     with tempfile.TemporaryDirectory(dir=output, prefix='ssh-') as temporary:
         temporary = Path(temporary)
         os.chmod(temporary, 0o700)
@@ -234,14 +238,14 @@ def activate(service, output):
         remote = f'{user}@{host}'
         ssh = ['ssh', *options, '-p', port, remote]
         stage = subprocess.check_output([*ssh, 'umask 077; mktemp -d /tmp/vibeface-deploy.XXXXXXXX'], text=True).strip()
-        release.require(re.fullmatch(r'/tmp/vibeface-deploy\.[a-zA-Z0-9]+', stage), 'invalid remote staging directory')
+        release_format.require(re.fullmatch(r'/tmp/vibeface-deploy\.[a-zA-Z0-9]+', stage), 'invalid remote staging directory')
         cleanup_stage = True
         try:
             checked(['scp', *options, '-P', port, str(settings), str(ROOT / 'scripts/deploy-activate.py'),
                      str(output / f'{component}.image.tar.gz'), f'{remote}:{stage}/'], stdout=subprocess.DEVNULL)
             checked(['scp', *options, '-P', port, '-r', str(ROOT / 'deploy'), f'{remote}:{stage}/'],
                     stdout=subprocess.DEVNULL)
-            archive_digest = release.digest(archive)
+            archive_digest = release_archive.digest(archive)
             command = ['python3', stage + '/deploy-activate.py', '--config', stage + '/config.json',
                        '--image', identity, '--tag', info['tag'], '--source-sha', info['source_sha'],
                        '--version', info['version'], '--archive', stage + f'/{component}.image.tar.gz',
@@ -250,7 +254,7 @@ def activate(service, output):
             shell = ('set -eu; if [ "$(id -u)" != 0 ]; then sudo -n true; fi; ' +
                      ('exec ' if user == 'root' else 'exec sudo -n ') + shlex.join(command))
             receipt = json.loads(subprocess.check_output([*ssh, shell], text=True))
-            release.require(receipt.get('status') in ('activated', 'already_active')
+            release_format.require(receipt.get('status') in ('activated', 'already_active')
                             and receipt.get('image') in accepted_images
                             and receipt.get('source_sha') == info['source_sha']
                             and receipt.get('version') == info['version'], 'invalid remote activation receipt')
@@ -269,7 +273,7 @@ def activate(service, output):
 
 def rehearse(output):
     """Start the previous published Core, stage the candidate config, then upgrade and repeat."""
-    release.require(os.geteuid() == 0 and sys.platform == 'linux',
+    release_format.require(os.geteuid() == 0 and sys.platform == 'linux',
                     'the activation rehearsal requires root on a disposable Linux runner')
     output = Path(output).resolve()
     info = json.loads((output / 'deployment.json').read_text())
@@ -295,17 +299,17 @@ def rehearse(output):
             ['docker', 'run', '--rm', '-i', '--network', 'none', '-v', f'{directory}:/data', '--entrypoint',
              '/opt/vibeface/vibeface-core', identity, '--control'],
             input=json.dumps({'command': 'init', 'options': options}), text=True))
-        release.require(result.get('ok') is True, 'fixture Node initialization failed')
+        release_format.require(result.get('ok') is True, 'fixture Node initialization failed')
         return result['result']['device_id']
 
     def state():
         connection = sqlite3.connect((data / 'node.sqlite3').as_uri() + '?mode=ro', uri=True)
         try:
             bootstrap = connection.execute("SELECT value FROM identity_meta WHERE key='bootstrap_capability_hash'").fetchone()
-            release.require(bootstrap is not None, 'fixture bootstrap database record is missing')
+            release_format.require(bootstrap is not None, 'fixture bootstrap database record is missing')
         finally:
             connection.close()
-        return ([release.digest(data / name) for name in ('identity.json', 'bootstrap.json', 'data-epoch.json')], bootstrap)
+        return ([release_archive.digest(data / name) for name in ('identity.json', 'bootstrap.json', 'data-epoch.json')], bootstrap)
 
     def activate_fixture(released, expected):
         identity = released['images']['core']
@@ -321,12 +325,12 @@ def rehearse(output):
                                  '--image', fixture, '--tag', released['tag'], '--source-sha', released['source_sha'],
                                  '--version', released['version']],
                                 input=json.dumps(config), capture_output=True, text=True)
-        release.require(result.returncode == 0, 'rehearsal ' + (result.stderr.strip() or 'activation failed'))
+        release_format.require(result.returncode == 0, 'rehearsal ' + (result.stderr.strip() or 'activation failed'))
         receipt = json.loads(result.stdout)
-        release.require(receipt['status'] == expected and receipt['image'] == fixture
+        release_format.require(receipt['status'] == expected and receipt['image'] == fixture
                         and receipt['source_sha'] == released['source_sha'] and receipt['version'] == released['version'],
                         'rehearsal receipt differs')
-        release.require(state() == preserved, 'rehearsal changed the existing Node identity or data')
+        release_format.require(state() == preserved, 'rehearsal changed the existing Node identity or data')
         receipts.append(receipt['status'])
 
     try:

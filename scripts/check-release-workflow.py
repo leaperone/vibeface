@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """Validate independent release DAGs and exercise their publication guards."""
+
+import sys
+sys.dont_write_bytecode = True
 import argparse
 import ast
 from pathlib import Path

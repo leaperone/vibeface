@@ -20,6 +20,16 @@ only on fresh GitHub-hosted POSIX runners, never a developer's user services.
 through another member Gateway.
 """
 
+import sys
+sys.dont_write_bytecode = True
+import release_archive
+import release_context
+import release_format
+import release_github
+import release_inventory
+import release_publisher
+import release_source
+
 import argparse
 import base64
 import contextlib
@@ -46,7 +56,6 @@ import struct
 import stat
 import sqlite3
 import subprocess
-import sys
 import time
 import traceback
 import threading
@@ -4695,14 +4704,14 @@ def memory_sync_acceptance(options):
 
 def _npm_cli_candidate(registry, pages):
     """Return the newest complete cli-v tag that also has a registry version."""
-    import release
+
 
     versions = registry.get("versions")
     require(isinstance(versions, dict), "npm registry has no bounded version map")
     registry_versions = set()
     for value in versions:
         try:
-            channel = release.version(value)
+            channel = release_format.version(value)
         except ValueError:
             continue
         if channel == "hourly":
@@ -4716,7 +4725,7 @@ def _npm_cli_candidate(registry, pages):
         if not tag.startswith("cli-v"):
             continue
         try:
-            app, value, channel = release.parse_tag(tag)
+            app, value, channel = release_format.parse_tag(tag)
         except ValueError:
             continue
         require(app == "cli", "independent CLI tag parsed as another application")
@@ -4747,13 +4756,13 @@ def pin_npm_baseline(options):
     immutable pin records an explicit first-release baseline and the service
     acceptance runs only the candidate lifecycle checks.
     """
-    import release
+
 
     source = Path(__file__).resolve().parents[1]
     output = options.artifacts.resolve()
     require(output.is_relative_to(source / ".artifacts") and not output.exists(),
             "npm baseline pinning requires a fresh checkout artifact directory")
-    candidate = release.run("git", "rev-parse", "HEAD", cwd=source)
+    candidate = release_context.run("git", "rev-parse", "HEAD", cwd=source)
     require(os.environ.get("GITHUB_SHA", candidate) == candidate, "npm baseline pins this exact candidate source")
     with urllib.request.urlopen("https://registry.npmjs.org/@leaperone%2fvibeface", timeout=30) as response:
         encoded = response.read(4 * 1024 * 1024 + 1)
@@ -4762,8 +4771,8 @@ def pin_npm_baseline(options):
 
     # Product-era v<version> releases are deliberately ignored.  Discover the
     # independent CLI tag first; a malformed matching release is an error.
-    pages = json.loads(release.run("gh", "api", "--paginate", "--slurp",
-                                  f"repos/{release.GITHUB_REPO}/releases?per_page=100", cwd=source))
+    pages = json.loads(release_context.run("gh", "api", "--paginate", "--slurp",
+                                  f"repos/{release_format.GITHUB_REPO}/releases?per_page=100", cwd=source))
     require(isinstance(pages, list) and all(isinstance(page, list) for page in pages),
             "invalid GitHub release listing")
     selected = _npm_cli_candidate(registry, pages)
@@ -4785,10 +4794,10 @@ def pin_npm_baseline(options):
             "the baseline has an immutable registry tarball and SHA-512 integrity")
     matches = [item for page in pages for item in page if item.get("tag_name") == cli_tag]
     require(len(matches) == 1, "multiple independent CLI releases have the same tag")
-    baseline_source_info, remote, manifest_sha256 = release.published(cli_tag)
+    baseline_source_info, remote, manifest_sha256 = release_publisher.published(cli_tag)
     baseline_source = baseline_source_info["source_commit"]
     require(baseline_source != candidate, "baseline and candidate must have different real source commits")
-    context = release.validate_source(baseline_source, "cli", root=source)
+    context = release_source.validate_source(baseline_source, "cli", root=source)
     require(subprocess.run(["git", "merge-base", "--is-ancestor", context["ci_source_commit"], candidate],
                            cwd=source, capture_output=True).returncode == 0,
             "the baseline business source must be an ancestor of the candidate; future baselines are refused")
@@ -4799,8 +4808,8 @@ def pin_npm_baseline(options):
                 "CLI completion manifest digest metadata is missing")
         selected_assets = list(baseline_source_info["assets"])
         selected_assets.append({"name": "release.json", "size": marker["size"], "sha256": manifest_sha256})
-        release.download_assets(cli_tag, selected_assets, scratch)
-        release.verify_release("cli", scratch,
+        release_github.download_assets(cli_tag, selected_assets, scratch)
+        release_inventory.verify_release("cli", scratch,
                                {"app": "cli", "tag": cli_tag, "version": version,
                                 "source_commit": baseline_source, "channel": baseline_source_info["channel"]})
         shutil.copyfile(scratch / "release.json", output / "release.json")
@@ -4814,7 +4823,7 @@ def pin_npm_baseline(options):
                     size = 0
                     for chunk in iter(lambda: response.read(1024 * 1024), b""):
                         size += len(chunk)
-                        require(size <= release.MAX_ARCHIVE, "the npm baseline archive is bounded")
+                        require(size <= release_archive.MAX_ARCHIVE, "the npm baseline archive is bounded")
                         stream.write(chunk)
                         digest.update(chunk)
                 break
@@ -4822,23 +4831,23 @@ def pin_npm_baseline(options):
                 require(attempt < 2, "cannot download the pinned public npm baseline")
         require("sha512-" + base64.b64encode(digest.digest()).decode() == integrity,
                 "the baseline tarball matches registry integrity")
-        unpacked = release.unpack(archive, scratch / "npm")
+        unpacked = release_archive.unpack(archive, scratch / "npm")
         npm = json.loads((unpacked / "package.json").read_text())
         require(npm["name"] == "@leaperone/vibeface" and npm["version"] == version
                 and npm["bin"] == {"vibeface": "bin/vibeface.mjs"}
                 and not any(npm.get(key) for key in ("scripts", "dependencies", "optionalDependencies"))
-                and {path.name for path in (unpacked / "vendor").iterdir()} == set(release.TARGETS),
+                and {path.name for path in (unpacked / "vendor").iterdir()} == set(release_format.TARGETS),
                 "the published npm baseline is a complete package without install hooks or downloaded dependencies")
         builds = {}
-        for target in release.TARGETS:
+        for target in release_format.TARGETS:
             vendor = unpacked / "vendor" / target
             build = json.loads((vendor / "BUILD-INFO.json").read_text())
-            release.verify_build_info(build)
+            release_format.verify_build_info(build, release_context.contracts())
             require(build["source_commit"] == baseline_source and build["version"] == version and build["target"] == target,
                     "every baseline vendor belongs to the complete CLI source and current data epoch")
             name = f"vibeface-{version}-{target}.tar.gz"
-            native = release.unpack(scratch / name, scratch / target)
-            require(release.files(native) == release.files(vendor),
+            native = release_archive.unpack(scratch / name, scratch / target)
+            require(release_archive.files(native) == release_archive.files(vendor),
                     "npm vendor bytes equal the published native CLI bundle")
             builds[target] = build
         pin = {"first_release": False, "version": version, "source_commit": baseline_source,
@@ -5128,11 +5137,11 @@ def npm_service_acceptance(options):
             require(json.loads((root / "package.json").read_text())["version"] == pin["version"]
                     and json.loads((vendor / "BUILD-INFO.json").read_text()) == pin["builds"][target],
                     "the first installed service package is the verified public baseline")
-            import release
+
             with tarfile.open(baseline / "baseline.tgz", "r:gz") as reference:
                 checksums = reference.extractfile(f"package/vendor/{target}/FILES.sha256").read().decode().splitlines()
             expected_files = {name: digest for digest, name in (line.split("  ", 1) for line in checksums)}
-            require(release.files(vendor, ("FILES.sha256",)) == expected_files,
+            require(release_archive.files(vendor, ("FILES.sha256",)) == expected_files,
                     "every installed baseline vendor byte matches the immutable published package")
             shutil.copy2(vendor / "scripts/install-node-service.sh", cleanup_script)
             conversation, attachment, digest, messages, invocation_count = create_history("NPM")
@@ -7337,7 +7346,6 @@ def delivery_charity_acceptance(options):
         private_json(run / "report.json", delivery_public_report(report))
         print("Delivery report: " + str(run / "summary.json"), flush=True)
     return report
-
 
 
 def delivery_protected_selfcheck():

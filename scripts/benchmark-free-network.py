@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Compare two pinned release packages on the same private relay and resume workload."""
 
+import sys
+sys.dont_write_bytecode = True
+import release_context
+import release_format
+
 import argparse
 import base64
 from dataclasses import dataclass
@@ -16,11 +21,10 @@ import resource
 import sqlite3
 import statistics
 import subprocess
-import sys
 import threading
 import time
 import uuid
-from release import verify_build_info
+
 from unittest import TestCase
 
 
@@ -86,7 +90,7 @@ class Artifact:
         require(os.access(binary, os.X_OK) and wasm.read_bytes().startswith(b"\x00asm"),
                 "The release binary is executable and its matching WASM is present")
         info = read_json(checked_path(value["build_info"]))
-        verify_build_info(info)
+        release_format.verify_build_info(info, release_context.contracts())
         require(info["source_commit"] == value["source_commit"],
                 "BUILD-INFO must identify the pinned release package source")
         return cls(side, value["source_commit"], binary, module, hashes, info)
