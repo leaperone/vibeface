@@ -505,16 +505,6 @@ def run_check(packages, msrv=None):
 def self_test():
     from unittest.mock import patch
     focused_self_test()
-    subprocess.run(["python3", str(Path(__file__).resolve().parent / "check-release-workflow.py"), "--self-test"], check=True)
-    subprocess.run(["python3", str(Path(__file__).resolve().parent / "deploy.py"), "self-test"], check=True)
-    subprocess.run(["python3", str(Path(__file__).resolve().parent / "release.py"), "self-test"], check=True)
-    subprocess.run(["python3", str(Path(__file__).resolve().parent / "hourly.py"), "--self-test"], check=True)
-    subprocess.run(["python3", str(Path(__file__).resolve().parent / "release-dispatch.py"), "--self-test"], check=True)
-    subprocess.run(["python3", "-B", str(Path(__file__).resolve().parent / "test_release_trains.py")], check=True)
-    subprocess.run(["python3", str(Path(__file__).resolve().parent / "deploy-run.py"), "self-test"], check=True)
-    subprocess.run(["python3", str(Path(__file__).resolve().parent / "deploy-activate.py"), "--self-test"], check=True)
-    subprocess.run(["python3", str(Path(__file__).resolve().parent.parent / "deploy/runtime.py"), "self-test"], check=True)
-    subprocess.run(["python3", str(Path(__file__).resolve().parent.parent / "deploy/static-config.py"), "--self-test"], check=True)
     web = make_plan(["apps/app/src/routes/index.tsx"])
     assert web["rust_packages"] == [] and web["test_tiers"] == []
     assert web["required_jobs"] == ["quick-check", "crypto-web", "web", "package"]
@@ -811,9 +801,8 @@ def self_test():
     assert "name: crypto-web-${{ github.sha }}" in package and "name: web-${{ github.sha }}" in package
     workflow_contract_self_test()
     quick = re.search(r"(?ms)^  quick-check:\n(.*?)(?=^  \w|\Z)", workflow)[1]
-    assert "python3 scripts/run-delivery-live.py --self-test" in quick
+    assert quick.count("python3 scripts/check-source.py") == 1
     assert all(name in quick for name in ("scripts/verify-delivery-protected.py", "scripts/verify-delivery-restart-observer.py"))
-    subprocess.run(["python3", str(root / "scripts/build-inputs.py"), "self-test"], check=True)
     config = (root / "crates/control/src/lib.rs").read_text()
     protocol, epoch = (re.search(rf"^pub const {name}: u32 = (\d+);$", config, re.M)[1] for name in ("UPDATE_PROTOCOL", "DATA_EPOCH"))
     assert f'info["update_protocol"]=="{protocol}" && info["data_epoch"]=="{epoch}"' in (root / "install.sh").read_text(), "install.sh accepts the build's update protocol and data epoch"
@@ -909,7 +898,7 @@ def workflow_contract_self_test():
         assert "${{ inputs.source_sha }}" in workflows[filename]
     assert "node scripts/crypto-client.mjs --self-test --native-probe" in workflows["_ci-crypto.yml"]
     assert "bash scripts/build-web.sh\n          git diff --exit-code" in workflows["_ci-web.yml"]
-    for command in ("atlas migrate validate", "scripts/check-delivery.py --self-test", "scripts/check-delivery.py --check-fixtures", "scripts/check-delivery.py", "cargo fmt --all", "pnpm --filter vibeface-web test", "pnpm --filter @vibeface/client test"):
+    for command in ("atlas migrate validate", "python3 scripts/check-source.py", "scripts/check-delivery.py --check-fixtures", "scripts/check-delivery.py", "cargo fmt --all", "pnpm --filter vibeface-web test", "pnpm --filter @vibeface/client test"):
         assert command in core, command
     package = block("ci.yml", "package")
     for command in ("--web-only", "--delivery-charity", "--phase1", "--artifacts .artifacts/ci-multi-node", "--chat-agent", "--phase4", "--public-node", "--mesh", "--phase5", "Verify Developer ID signature", "Verify checksum and unpacked source identity"):
