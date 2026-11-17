@@ -277,54 +277,7 @@ impl Pushes {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Lane {
-    Long,
-    Read,
-    Control,
-    Ordered,
-}
-
 impl Lane {
-    fn for_request(request: &Request) -> Self {
-        match request.method.as_str() {
-            "provider_probe"
-            | "provider_models"
-            | "test_codex_app_server"
-            | "test_webhook"
-            | "logs"
-            | "diagnostics" => Self::Long,
-            "info" | "directory" | "write_state" | "node_settings" | "triage_settings"
-            | "relay_settings" | "share_link" | "entrances" => Self::Read,
-            "rpc" => match request.params["method"].as_str() {
-                Some("interrupt_work" | "cancel_manager") => Self::Control,
-                Some(
-                    "nodes"
-                    | "conversations"
-                    | "conversation_history"
-                    | "open_works"
-                    | "work_detail"
-                    | "workspace_overview"
-                    | "workspace_state"
-                    | "workspace_history"
-                    | "workspace_command_receipt"
-                    | "signed_receipt"
-                    | "input_receipt"
-                    | "scope_context"
-                    | "read_artifact"
-                    | "bots"
-                    | "questions"
-                    | "memory_state"
-                    | "notifications",
-                ) => Self::Read,
-                // Conversation reads replace the observation lease. Unrecognized operations
-                // and writes retain arrival order; they are never retried by this scheduler.
-                _ => Self::Ordered,
-            },
-            _ => Self::Ordered,
-        }
-    }
-
     fn capacity(self) -> usize {
         match self {
             Self::Long => LONG_CALLS,
@@ -377,7 +330,7 @@ pub(super) struct Completed {
     result: Result<Value>,
     effect: Option<Effect>,
     authority: Option<Principal>,
-    method: String,
+    delivery: DeliveryCheck,
 }
 
 struct Active {
@@ -430,7 +383,7 @@ impl Calls {
             "client request ID capacity reached; reconnect before sending more requests"
         );
         self.seen.insert(request.id.clone());
-        let lane = Lane::for_request(&request);
+        let lane = command::client_policy(&request.input).lane;
         if lane == Lane::Ordered {
             if self.waiting.len() < ORDERED_QUEUE {
                 self.waiting.push_back(request);
@@ -471,13 +424,10 @@ impl Calls {
     ) {
         // Only governance responses that can change their own caller retain the explicit
         // transition path. Invite and join approval keep the manager's original authority.
-        let guest_method = GUEST_METHODS.contains(&request.method.as_str());
-        let authority_transition = matches!(
-            request.method.as_str(),
-            "grant" | "revoke" | "veto" | "approve_recovery"
-        );
-        let fenced = lane != Lane::Ordered || (!guest_method && !authority_transition);
-        let display = snapshot_request(&request.method, &request.params);
+        let policy = command::client_policy(&request.input);
+        let guest_method = policy.guest;
+        let fenced = lane != Lane::Ordered || (!guest_method && !policy.transition);
+        let display = policy.consistency == ReadConsistency::CommittedDisplay;
         self.active.insert(
             request.id.clone(),
             Active {
@@ -508,33 +458,32 @@ impl Calls {
             } else {
                 (None, None)
             };
-            let observing = request.method == "rpc" && request.params["method"] == "conversation";
+
             let result = match denied {
                 Some(error) => Err(error),
                 None => {
                     dispatch_inner(
                         &node,
                         &mut request_session,
-                        &request.method,
-                        request.params,
+                        request.input,
                         if display { authority.clone() } else { None },
                     )
                     .await
                 }
             };
-            let effect = match request.method.as_str() {
-                "subscribe" => Some(Effect::Subscribe(request_session.subscribed)),
-                "rpc" if observing && result.is_ok() => {
+            let effect = match policy.effect {
+                SessionEffect::Subscribe => Some(Effect::Subscribe(request_session.subscribed)),
+                SessionEffect::Observe if result.is_ok() => {
                     Some(Effect::Observe(request_session.observation.take()))
                 }
-                _ => None,
+                SessionEffect::Observe | SessionEffect::None => None,
             };
             Completed {
                 id: request.id,
                 result,
                 effect,
                 authority,
-                method: request.method,
+                delivery: policy.delivery,
             }
         });
     }
@@ -596,16 +545,15 @@ impl Calls {
             authority.check(node, session, was)?;
         }
         if let Ok(result) = &completed.result {
-            if completed.method == "info" && result["network_id"].is_string() {
+            if completed.delivery == DeliveryCheck::InfoNetwork && result["network_id"].is_string()
+            {
                 ensure!(
                     result["network_id"] == authority.principal(node, session)?.network_id,
                     "this device's permission changed before client information was delivered"
                 );
             }
-            if matches!(
-                completed.method.as_str(),
-                "authenticate" | "recover" | "revoke" | "grant" | "veto"
-            ) && result["principal"].is_object()
+            if completed.delivery == DeliveryCheck::ReturnedPrincipal
+                && result["principal"].is_object()
             {
                 ensure!(
                     result["principal"]

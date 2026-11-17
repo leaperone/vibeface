@@ -618,7 +618,7 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
             write_packet(&mut stream, &response).await?;
         }
         Command::Client { method, params } => {
-            match crate::client::operator_call(&runtime, &method, params).await {
+            match crate::client::operator_wire_call(&runtime, &method, params).await {
                 Ok(result) => response.result = Some(result),
                 Err(error) => {
                     response.status = if error.downcast_ref::<Busy>().is_some() {

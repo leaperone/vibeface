@@ -535,12 +535,7 @@ impl Runtime {
         input: &Value,
     ) -> Result<Value> {
         use vibeface_protocol::history::{HistoryRequest, HistorySection};
-        let mut parameters = input.clone();
-        parameters
-            .as_object_mut()
-            .context("history request must be an object")?
-            .remove("method");
-        let request: HistoryRequest = serde_json::from_value(parameters)?;
+        let request: HistoryRequest = serde_json::from_value(input.clone())?;
         if matches!(
             request.section,
             HistorySection::OwnerJobs
@@ -956,7 +951,7 @@ mod conversation_history_tests {
                 store.main_messages(&stored_network, "history")
             }).await?;
             assert!(serde_json::to_vec(&oracle)?.len() > 4 * 1024 * 1024);
-            let snapshot = node.rpc(access.clone(), json!({"method":"conversation","conversation_id":"history"})).await?;
+            let snapshot = node.rpc(access.clone(), crate::command::business_fixture(json!({"method":"conversation","conversation_id":"history"}))).await?;
             assert!(serde_json::to_vec(&snapshot)?.len() < HISTORY_RESPONSE_BYTES);
             assert!(snapshot["messages"].as_array().context("messages")?.len() < oracle.len());
             let cursor_network = network.clone();
@@ -972,8 +967,8 @@ mod conversation_history_tests {
             let mut all = Vec::new();
             let mut cursor = aggregate["history"]["messages"]["next_cursor"].as_str().map(str::to_owned);
             while let Some(before) = cursor {
-                let page = node.rpc(access.clone(), json!({"method":"conversation_history","conversation_id":"history",
-                    "section":"messages","cursor":before,"limit":100})).await?;
+                let page = node.rpc(access.clone(), crate::command::business_fixture(json!({"method":"conversation_history","conversation_id":"history",
+                    "section":"messages","cursor":before,"limit":100}))).await?;
                 assert!(serde_json::to_vec(&page)?.len() < HISTORY_RESPONSE_BYTES);
                 all.splice(0..0, page["items"].as_array().context("items")?.clone());
                 cursor = page["next_cursor"].as_str().map(str::to_owned);
@@ -982,7 +977,7 @@ mod conversation_history_tests {
             for denied in [crate::runtime::Access::User { network_id: "wrong-network".into(), scope: crate::runtime::UserScope::Network },
                 Access::Agent(AgentAccess::ReadOnly { network_id: network.clone(), conversation_id: "history".into() }),
                 crate::runtime::Access::User { network_id: network.clone(), scope: crate::runtime::UserScope::Conversation("other".into()) }] {
-                assert!(node.rpc(denied, json!({"method":"conversation_history","conversation_id":"history","section":"messages"})).await.is_err());
+                assert!(node.rpc(denied, crate::command::business_fixture(json!({"method":"conversation_history","conversation_id":"history","section":"messages"}))).await.is_err());
             }
             let delete = admin.attest(&network, "history", EventBody::BotDeleted {attestation:None,cause:None})?;
             let identity = node.identity.clone();
@@ -990,7 +985,7 @@ mod conversation_history_tests {
                 store.append_event(&identity, &network, "history", delete, vec![], 2000)?;
                 Ok(())
             }).await?;
-            let after_delete = node.rpc(access, json!({"method":"conversation_history","conversation_id":"history","section":"messages"})).await?;
+            let after_delete = node.rpc(access, crate::command::business_fixture(json!({"method":"conversation_history","conversation_id":"history","section":"messages"}))).await?;
             assert!(after_delete["items"].as_array().is_some_and(|items| !items.is_empty()),
                 "deleting a Bot preserves its authorized conversation history");
             Ok::<_, anyhow::Error>(())

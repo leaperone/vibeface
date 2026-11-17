@@ -52,11 +52,11 @@ async fn the_cli_client_governs_a_node_that_checks_every_signature() -> Result<(
         let view = || async { node.membership_state().await?.project() };
 
         // The local operator reads and configures, but governance needs a client signature.
-        let refused = crate::client::operator_call(&node, "invite", json!({}))
+        let refused = crate::client::operator_wire_call(&node, "invite", json!({}))
             .await
             .expect_err("the Node never signs governance");
         assert!(refused.to_string().contains("vibeface client enroll"));
-        assert!(crate::client::operator_call(&node, "subscribe", json!({})).await.is_err());
+        assert!(crate::client::operator_wire_call(&node, "subscribe", json!({})).await.is_err());
 
         let mut admin = key(&dir, "admin")?;
         let admin_id = admin.device_id().to_owned();
@@ -101,15 +101,15 @@ async fn the_cli_client_governs_a_node_that_checks_every_signature() -> Result<(
         assert_eq!(configured.state,client::OperationState::Accepted);
         assert_eq!(local_client.read(client::ReadRequest::NodeSettings).await?["settings"]["roots"],json!([local_root]));
         local_client.close();drop(local_client);
-        let settings = crate::client::operator_call(&node, "node_settings", json!({})).await?;
+        let settings = crate::client::operator_wire_call(&node, "node_settings", json!({})).await?;
         let root = std::fs::canonicalize(&dir)?;
-        crate::client::operator_call(
+        crate::client::operator_wire_call(
             &node,
             "configure_node",
             json!({"roots":[root],"manager":settings["settings"]["manager"]}),
         )
         .await?;
-        let settings = crate::client::operator_call(&node, "node_settings", json!({})).await?;
+        let settings = crate::client::operator_wire_call(&node, "node_settings", json!({})).await?;
         assert_eq!(settings["settings"]["roots"], json!([root]));
 
         // A second CLI enrolls through an invite; both sides see the same short code.
@@ -118,7 +118,7 @@ async fn the_cli_client_governs_a_node_that_checks_every_signature() -> Result<(
         let mut session = admin.connect(None).await?;
         let link = session.invite().await?;
         // The invite carries the Node's own node link, the one it shares.
-        let shared = crate::client::operator_call(&node, "share_link", json!({})).await?;
+        let shared = crate::client::operator_wire_call(&node, "share_link", json!({})).await?;
         let shared = shared["link"].as_str().context("share link")?;
         assert_eq!(
             vibeface_secure::link::NodeLink::parse(shared)?.device_id(),
@@ -174,7 +174,7 @@ async fn the_cli_client_governs_a_node_that_checks_every_signature() -> Result<(
                 json!({"conversation_id":scope,"attestation":session.attest("bots", &primary)?}),
             )
             .await?;
-        let bots = crate::client::operator_call(&node, "rpc", json!({"method":"bots"})).await?;
+        let bots = crate::client::operator_wire_call(&node, "rpc", json!({"method":"bots"})).await?;
         assert_eq!(bots["bots"][0]["bot_id"], "b1");
         assert!(!bots["primary"].is_null());
         // The actual native producer crosses Noise and Core's signature/shape boundary.

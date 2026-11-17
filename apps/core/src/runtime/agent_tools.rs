@@ -184,8 +184,13 @@ impl Runtime {
                 self.agent_history(&access, &scope, tool, &args).await
             }
             Tool::Nodes => {
-                self.rpc_inner(Access::Agent(access.clone()), json!({"method":"nodes"}))
-                    .await
+                self.rpc_inner(
+                    Access::Agent(access.clone()),
+                    Ok(crate::command::BusinessCommand::Nodes(
+                        crate::command::BusinessParams::empty(),
+                    )),
+                )
+                .await
             }
             Tool::Context => self.agent_context(&access, &scope, &args).await,
             // Dispatches the DAG does not name yet are listed too, so none is sent twice.
