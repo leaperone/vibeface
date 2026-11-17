@@ -1,5 +1,6 @@
 //! Shared final request for initializing a Node. No CLI or Core dependencies live here.
 
+use crate::provider::Provider;
 use serde::{Deserialize, Serialize};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -61,11 +62,11 @@ pub struct InitOptions {
     pub forward_per_ip: Option<NonZeroUsize>,
     #[serde(default)]
     pub trusted_proxies: Vec<IpAddr>,
-    pub manager: Option<InitProvider>,
+    pub manager: Option<Provider>,
     pub workspace: Option<PathBuf>,
     pub model: Option<String>,
     #[serde(default)]
-    pub bins: Vec<(InitProvider, PathBuf)>,
+    pub bins: Vec<(Provider, PathBuf)>,
     pub codex_socket: Option<PathBuf>,
     #[serde(default)]
     pub no_mesh: bool,
@@ -113,16 +114,6 @@ impl InitOptions {
             bootstrap: Vec::new(),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InitProvider {
-    Codex,
-    Cursor,
-    Claude,
-    Pi,
-    Opencode,
 }
 
 #[cfg(test)]

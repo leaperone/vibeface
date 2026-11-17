@@ -25,7 +25,9 @@ use std::{
 };
 use vibeface_bridge::platform::{clock, privatefs, program};
 
-use vibeface_control::init::{DEFAULT_LISTEN, InitOptions, InitProvider};
+use vibeface_control::init::{DEFAULT_LISTEN, InitOptions};
+#[cfg(test)]
+use vibeface_control::provider::Provider as WireProvider;
 
 /// The mesh a fresh Node joins. The default bootstrap node is on the default network only.
 fn init_mesh(no_mesh: bool, network: Option<String>, bootstrap: Vec<String>) -> Result<MeshConfig> {
@@ -485,16 +487,6 @@ pub fn prepare_start(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn init_provider(provider: InitProvider) -> Provider {
-    match provider {
-        InitProvider::Codex => Provider::Codex,
-        InitProvider::Cursor => Provider::Cursor,
-        InitProvider::Claude => Provider::Claude,
-        InitProvider::Pi => Provider::Pi,
-        InitProvider::Opencode => Provider::Opencode,
-    }
-}
-
 fn initialize_from_options(options: InitOptions) -> Result<Value> {
     validate_data_dir(&options.data_dir)?;
     let roots: Vec<_> = options
@@ -511,7 +503,7 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
     configuration.bins = options
         .bins
         .into_iter()
-        .map(|(provider, path)| (init_provider(provider), path))
+        .map(|(provider, path)| (Provider::from(provider), path))
         .collect();
     if let Some(socket) = options.codex_socket {
         configuration.providers.codex_app_server = AppServer {
@@ -520,7 +512,7 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
         };
     }
     if let Some(provider) = options.manager {
-        let provider = init_provider(provider);
+        let provider = Provider::from(provider);
         let workspace = options
             .workspace
             .context("--manager requires --workspace")?;
@@ -740,13 +732,14 @@ mod tests {
     #[test]
     fn init_provider_adapter_preserves_every_wire_provider() {
         for (wire, internal) in [
-            (InitProvider::Codex, Provider::Codex),
-            (InitProvider::Cursor, Provider::Cursor),
-            (InitProvider::Claude, Provider::Claude),
-            (InitProvider::Pi, Provider::Pi),
-            (InitProvider::Opencode, Provider::Opencode),
+            (WireProvider::Codex, Provider::Codex),
+            (WireProvider::Cursor, Provider::Cursor),
+            (WireProvider::Claude, Provider::Claude),
+            (WireProvider::Pi, Provider::Pi),
+            (WireProvider::Opencode, Provider::Opencode),
         ] {
-            assert_eq!(init_provider(wire), internal);
+            assert_eq!(Provider::from(wire), internal);
+            assert_eq!(WireProvider::from(internal), wire);
         }
     }
 

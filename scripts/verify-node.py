@@ -3123,6 +3123,8 @@ def no_agent_checks(run, a, passed):
     a.client.authenticate()
     event = {"source": "hook", "agent": "codex", "event": "turn_end", "session_id": "no-agent", "turn_id": "t", "cwd": "/tmp"}
     local_post(a, "/api/hooks", event, status=401, owner=False)
+    for field, placeholder in (("schema_version", 0), ("event_id", ""), ("node", ""), ("host", ""), ("request_id", None)):
+        local_post(a, "/api/hooks", {**event, field: placeholder}, status=400)
     dropped = local_post(a, "/api/hooks", event)
     require(dropped["status"] == "dropped", "without an Agent an event is dropped, not queued")
     marker = run / "fixture-codex-global-request"

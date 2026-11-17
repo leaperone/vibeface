@@ -3572,11 +3572,16 @@ mod tests {
             let mut store = crate::store::Store::open(":memory:")?;
             let now = now_ms();
             store.queue_triage_event(
-                crate::triage::AgentEvent {
-                    event_id: "event-1".into(),
-                    ts_ms: now,
-                    ..Default::default()
-                },
+                crate::triage::SealedAgentEvent::seal(
+                    crate::triage::HookEvent {
+                        session_id: "event-1".into(),
+                        ts_ms: now,
+                        ..Default::default()
+                    },
+                    "node",
+                    "host",
+                    now,
+                )?,
                 now,
             )?;
             let TriageAdmission::Claimed(attempt) =

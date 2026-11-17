@@ -306,6 +306,7 @@ pub mod agent;
 pub mod init;
 pub mod maintenance;
 pub mod observation;
+pub mod provider;
 
 #[cfg(test)]
 mod tests {
