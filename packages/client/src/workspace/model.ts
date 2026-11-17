@@ -1,6 +1,5 @@
 import { base64ToBytes } from "../lib/byte-codec.ts"
 import type { Attachment, MessageRequest, PendingMessage, TranscriptMessage } from "../chat/types.ts"
-import type { OutboxItem } from "../lib/outbox.ts"
 import { array, boolean, isRecord, isSafeInteger, isText, parseProviderReadiness } from "../lib/node.ts"
 import { isJobState, providerStages, steerOutcomes, type ProviderStage, type TurnRuntime } from "./types.ts"
 import type { ReplyStatus } from "../chat/types.ts"
@@ -164,11 +163,12 @@ export function parseScopeContext(value: unknown): ScopeContext {
   if (!matches) throw new Error('上下文范围和输入目标不一致。')
   return { ...base, available: true, context, reason: null }
 }
-export function parsePendingMessage(item: OutboxItem): PendingMessage {
-  const request = parseMessageRequest(item.params), delivery = item.delivery ?? 'unknown'
-  if (!['saved', 'uploading', 'submitting', 'accepted', 'unknown'].includes(delivery)) throw new Error('本地输入状态无法识别。')
+export function parsePendingMessage(value: unknown): PendingMessage {
+  const item = record(value)
+  const request = parseMessageRequest(item.params), delivery = item.delivery
+  if (delivery !== 'saved' && delivery !== 'uploading' && delivery !== 'submitting' && delivery !== 'accepted' && delivery !== 'unknown') throw new Error('本地输入状态无法识别。')
   if (item.rejection_code !== undefined && item.rejection_code !== 'input_not_saved' && item.rejection_code !== 'input_conflict' && item.rejection_code !== 'input_missing') throw new Error('本地输入拒绝原因无法识别。')
-  return { ...request, created_at_ms: number(item.created_at_ms), delivery, ...(item.entry_device_id === undefined ? {} : { entry_device_id: text(item.entry_device_id) }), ...(item.rejected === undefined ? {} : { rejected: item.rejected }), ...(item.rejection_code === undefined ? {} : { rejection_code: item.rejection_code }), ...(item.receipt === undefined ? {} : { receipt: parseInputReceipt(item.receipt) }), ...(item.release_expected_event === undefined ? {} : { release_expected_event: text(item.release_expected_event) }), ...(item.release_command_id === undefined ? {} : { release_command_id: text(item.release_command_id) }) }
+  return { ...request, created_at_ms: number(item.created_at_ms), delivery, ...(item.entry_device_id === undefined ? {} : { entry_device_id: text(item.entry_device_id) }), ...(item.rejected === undefined ? {} : { rejected: text(item.rejected) }), ...(item.rejection_code === undefined ? {} : { rejection_code: item.rejection_code }), ...(item.receipt === undefined ? {} : { receipt: parseInputReceipt(item.receipt) }), ...(item.release_expected_event === undefined ? {} : { release_expected_event: text(item.release_expected_event) }), ...(item.release_command_id === undefined ? {} : { release_command_id: text(item.release_command_id) }) }
 }
 export function parseMessageRequest(value: unknown): MessageRequest {
   const data = record(value)
@@ -948,7 +948,7 @@ function modelEdit(value: unknown): ModelEdit | undefined {
 function botModels(value: unknown): BotModels {
   return Object.fromEntries(Object.entries(record(value)).map(([key, model]) => [provider(key), text(model)]))
 }
-function avatar(value: unknown): Avatar | null {
+export function avatar(value: unknown): Avatar | null {
   if (value == null) return null
   const data = record(value)
   const outline = OUTLINES.find((item) => item === data.outline), eyes = EYES.find((item) => item === data.eyes), hue = HUES.find((item) => item === data.hue)

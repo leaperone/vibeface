@@ -1,6 +1,7 @@
 import { completeHistory } from '@vibeface/client/workspace/history-fixture.ts'
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, extname, resolve } from 'node:path'
@@ -47,7 +48,7 @@ function loader(globals: Record<string, unknown>, stubs: (specifier: string) => 
 /** The workspace state of one connected browser; React hooks are replayed by hand, one render per call. */
 function workspace(source: 'membership' | 'local_session', readBefore: string[] | null) {
   const hooks = hookHarness(), { effects, afterRender } = hooks
-  const rpcs: string[] = [], stored = new Map<string, string>(), failing = new Set<string>(), ticks: (() => void)[] = []
+  const rpcs: string[] = [], stored = new Map<string, string>(), failing = new Set<string>(), ticks = new Set<() => void>()
   let notificationReads = [
     { notification_id: 'n-1', conversation_id: conversationId, target, kind: 'progress', text: '有新进展' },
     { notification_id: 'n-session', conversation_id: conversationId, target, kind: 'session_attributed', text: 'tests fail' },
@@ -84,7 +85,7 @@ function workspace(source: 'membership' | 'local_session', readBefore: string[] 
       return {}
     },
   }
-  const timers = { setTimeout: () => 0, clearTimeout() {}, setInterval: (tick: () => void) => { ticks.push(tick); return 0 }, clearInterval() {} }
+  const timers = { setTimeout: () => 0, clearTimeout() {}, setInterval: (tick: () => void) => { ticks.add(tick); return tick }, clearInterval(tick: () => void) { ticks.delete(tick) } }
   const load = loader({
     location: { pathname: `/b/${bot.bot_id}`, search: '' },
     ...timers,
@@ -95,7 +96,15 @@ function workspace(source: 'membership' | 'local_session', readBefore: string[] 
   })
   const platform = {
     reserveDeliveryIntent: async () => { throw new Error('unexpected delivery reservation') },
-    secure: { attestationPayload: () => new Uint8Array() }, transport: { signClient: async () => 'signature' },
+    secure: {
+      attestationPayload: (network: string, scope: string, body: string) => new TextEncoder().encode(JSON.stringify({ network, scope, body })),
+      verify(device: string, domain: string, payload: Uint8Array, signature: string) {
+        assert.equal(device, browser)
+        assert.equal(domain, 'attestation')
+        assert.equal(signature, createHash('sha512').update(payload).digest('hex'))
+      },
+    },
+    transport: { signClient: async (domain: string, payload: Uint8Array) => { assert.equal(domain, 'attestation'); return createHash('sha512').update(payload).digest('hex') } },
     storage: { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => stored.set(key, value) }, outbox, self: '这个浏览器',
     notifier: { name: '浏览器提醒', permission: async () => 'default', request: async () => 'default', async show() {} },
     onForeground: () => () => {}, foreground: () => true,

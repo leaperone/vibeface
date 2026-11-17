@@ -27,6 +27,7 @@ pub(crate) mod conversation_history;
 pub(crate) mod conversation_sections;
 pub(crate) mod conversation_settings_history;
 mod conversation_settings_projection;
+mod history_page_collector;
 mod log;
 pub(crate) mod mailbox;
 mod notification_visibility;

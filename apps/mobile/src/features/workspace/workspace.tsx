@@ -307,7 +307,7 @@ function ScopedWorkspaceContent({ taskId, channelId }: { taskId?: string; channe
   const request = useRef<object | null>(null)
   const storage = storageOf(mobilePlatform.storage)
   const selectionKey = networkKey(`channel-target:${channelId}`, ready?.principal.network_id ?? '')
-  const cached = channelId ? storage.readStorage<unknown>(selectionKey, null) : null
+  const cached = channelId ? storage.readStorage(selectionKey, null) : null
   const cachedBot = cached && typeof cached === 'object' && 'bot_id' in cached && typeof cached.bot_id === 'string' ? cached.bot_id : ''
   const cachedTask = cached && typeof cached === 'object' && 'task_id' in cached && typeof cached.task_id === 'string' ? cached.task_id : ''
   const [selected, setSelected] = useState(cachedTask ? `task:${cachedTask}` : '')

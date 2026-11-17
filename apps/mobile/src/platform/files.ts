@@ -180,4 +180,5 @@ const draftStorage = {
   all: () => index.getAllKeys().filter(key => key.startsWith('draft:')).map(key => index.getString(key) ?? ''),
 }
 
-export const privateFiles = { draftStorage, drafts, attachments, run, retain, ownedFile, release, releasePicker, recoveryStorage, erase, recovery, transfers }
+function lease() { const version = epoch; return () => !erasing && version === epoch }
+export const privateFiles = { draftStorage, drafts, attachments, run, lease, retain, ownedFile, release, releasePicker, recoveryStorage, erase, recovery, transfers }

@@ -158,7 +158,7 @@ export function parseInfo(value: unknown): EntryInfo {
     ...(v.connection_entry === undefined ? {} : { connection_entry: parseEntry(v.connection_entry) }),
   }
 }
-function parseMember(value: unknown): Member {
+export function parseMember(value: unknown): Member {
   const v = record(value)
   if (v.kind !== 'node' && v.kind !== 'client') throw new Error('设备类型无效。')
   const member: Member = { device_id: validTarget(v.device_id), kind: v.kind, name: text(v.name), manage: boolean(v.manage) }

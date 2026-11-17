@@ -30,10 +30,10 @@ export function notificationPreferences(storage: KeyValue, networkId: string) {
   const { readStorage, writeStorage } = storageOf(storage)
   const key = networkKey('notification-preferences', networkId)
   const read = (): NotificationPreferences => {
-    const value = readStorage<unknown>(key, null)
+    const value = readStorage(key, null)
     const settings = value && typeof value === 'object' ? value : {}
     return {
-      enabled: readStorage<unknown>(networkKey('notify', networkId), false) === true,
+      enabled: readStorage(networkKey('notify', networkId), false) === true,
       sound: 'sound' in settings && settings.sound === true,
       badge: 'badge' in settings && settings.badge === true,
       mutedConversations: 'mutedConversations' in settings && Array.isArray(settings.mutedConversations)
@@ -56,7 +56,7 @@ export function systemNotifications(input: { storage: KeyValue; networkId: strin
   const { readStorage, writeStorage } = storageOf(input.storage)
   const seenKey = networkKey('seen', input.networkId)
   const seen = () => {
-    const stored = readStorage<unknown>(seenKey, [])
+    const stored = readStorage(seenKey, [])
     return new Set(Array.isArray(stored) ? stored.filter((id): id is string => typeof id === 'string') : [])
   }
   let tail: Promise<void> = Promise.resolve()

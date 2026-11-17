@@ -56,7 +56,10 @@ export type Invitation = { link: string; expiresAt: number }
 /** What tabs of this origin tell each other: the leader's new entrance, an outbox change, or local inbox state. */
 type TabMessage = { type: 'entrance'; networkId: string; entry: ConnectionEntry } | { type: 'outbox'; networkId: string } | { type: 'ignored-inbox'; networkId: string }
 export type Tabs = { leader(): boolean; post(message: TabMessage): void; listen(listener: (message: TabMessage) => void): () => void }
+export type DisplayScope = { network_id: string; device_id: string; entry_device_id: string }
 type DeviceContextValue = {
+  /** Display isolation only; never an authorization source. */
+  displayScope: DisplayScope | null
   connectionGeneration(): number
   link: Link; entrances: OpenEntrance[]; tabs: Tabs
   identity: PublicIdentity | null; ready: ReadyConnection | null; entries: ConnectionEntry[]; phase: Phase; error: string
@@ -139,7 +142,7 @@ const randomHex = () => bytesToHex(crypto.getRandomValues(new Uint8Array(32)))
 /** Saved connections, pins and pending joins in this device's storage. */
 function deviceStore(storage: KeyValue, self: string) {
   const { readStorage, writeStorage } = storageOf(storage)
-  const load = (key: string) => readStorage<unknown>(key, null)
+  const load = (key: string) => readStorage(key, null)
   function store(key: string, value: unknown) { try { writeStorage(key, value, true) } catch { throw new Error(`${self}无法保存设备记录。允许保存本地数据后重试。`) } }
   function savedEntries(): ConnectionEntry[] {
     const value = load('connections')
@@ -220,6 +223,8 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     return { ...request, code: shortCode(networkId, pin.invite_id, pin.device_id, me, pin.nonce, request.joiner_nonce) }
   }
   const [identity, setIdentity] = useState<PublicIdentity | null>(null)
+  const [displayScope, setDisplayScope] = useState<DisplayScope | null>(null)
+  const showResume = (target: Reconnect | null) => setDisplayScope(target && identityRef.current ? { network_id: target.networkId, device_id: identityRef.current.deviceId, entry_device_id: target.entry.device_id } : null)
   const [ready, setReady] = useState<ReadyConnection | null>(null)
   const [entries, setEntries] = useState<ConnectionEntry[]>([])
   const [phase, setPhase] = useState<Phase>('initializing')
@@ -301,6 +306,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   }, [])
   const resetConnection = useCallback(() => {
     reconnect.current = null
+    setDisplayScope(null)
     pendingEntrance.current = null
     resumeQueue.current = []
     if (reconnectTimer.current !== null) clearTimeout(reconnectTimer.current)
@@ -383,6 +389,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     active.networkId = principal.network_id
     pendingEntrance.current = null
     reconnect.current = { entry: active.entry, networkId: principal.network_id, attempt: 0 }
+    showResume(reconnect.current)
     const connection: ReadyConnection = {
       generation: active.generation, entry: active.entry, principal, info: active.info,
       request: (method, params) => { if (session.current !== active) return Promise.reject(changed()); return request(method, params) },
@@ -522,7 +529,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
             // A saved target this browser can no longer use, such as an old device at the same address, is dropped.
             if (active && session.current === active) { generation.current += 1; session.current = null; active.channel.close() }
             removeEntry(target.entry)
-            reconnect.current = { ...next, attempt: 0 }
+            reconnect.current = { ...next, attempt: 0 }; showResume(reconnect.current)
             return 'next'
           }
           resetConnection(); setPhase('unpaired')
@@ -1379,7 +1386,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
         const [first, ...rest] = resumeTargets()
         if (first) {
           // Resume this browser's network through its entrances, starting with the last one used.
-          reconnect.current = first; resumeQueue.current = rest
+          reconnect.current = first; showResume(first); resumeQueue.current = rest
           step({ type: 'ready', joined: true }); setPhase('reconnecting'); scheduleReconnect(true)
           return
         }
@@ -1402,7 +1409,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
         const target = reconnect.current
         if (message.type !== 'entrance' || !target || session.current?.networkId || target.networkId !== message.networkId) return
         if (reconnectTimer.current !== null) { clearTimeout(reconnectTimer.current); reconnectTimer.current = null }
-        reconnect.current = { ...target, entry: message.entry }
+        reconnect.current = { ...target, entry: message.entry }; showResume(reconnect.current)
         pendingEntrance.current = switching.current ? reconnect.current : null
         scheduleReconnect(true)
       },
@@ -1454,6 +1461,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   const pendingRecovery = ready?.principal.can_manage && directory?.pending && !recoveryHidden(ready.principal.network_id, directory.pending.checkpoint) ? directory.pending : null
   const value: DeviceContextValue = {
     connectionGeneration: () => generation.current, link, entrances, tabs,
+    displayScope: identity && !joining && ['ready', 'reconnecting', 'connecting'].includes(phase) && displayScope?.device_id === identity.deviceId ? displayScope : null,
     identity, ready, entries, phase, error, entry, info, directory, recoverySince, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
     removedLocally: phase === 'removed' && removedFrom?.kind === 'local', rejoined, nodeJoining, rejoin, joinThisComputer, cancelNodeJoin,
     connect: async (item) => { await connect(item) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, leave, factoryReset, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, checkInvite, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,

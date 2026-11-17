@@ -6,7 +6,7 @@ import * as SecureStore from 'expo-secure-store'
 import * as Sharing from 'expo-sharing'
 import { createMMKV } from 'react-native-mmkv'
 import { lan as nativeLan, secure, type NativeIdentity } from '@vibeface/secure-native'
-import type { OutboxItem } from '@vibeface/client/lib/outbox.ts'
+import { mobileOutbox } from './outbox'
 import type { Lan, Notifier, Permission, Platform } from '@vibeface/client/lib/platform.ts'
 import { createTransport, type DeviceKeys } from '@vibeface/client/lib/transport.ts'
 import { sha256Hex } from '@vibeface/client/lib/byte-codec.ts'
@@ -21,7 +21,7 @@ const store = createMMKV({ id: 'vibeface' })
 const notificationStorage = { getItem: (key: string) => store.getString(key) ?? null, setItem: (key: string, value: string) => store.set(key, value) }
 const secretKey = 'vibeface.device-secret'
 const createdKey = 'vibeface.device-created'
-const outboxPrefix = 'outbox:'
+const outbox = mobileOutbox(store, secure, privateFiles)
 /** The same app runs on iPad, which calls itself a tablet, as the shared device forms do. */
 export const tablet = Native.OS === 'ios' && Native.isPad
 export const self = tablet ? '这台平板' : '这台手机'
@@ -123,11 +123,7 @@ export const mobilePlatform: Platform = {
   transport,
   storage: { getItem: (key) => store.getString(key) ?? null, setItem: (key, value) => store.set(key, value) },
   reserveDeliveryIntent: nativeDeliveryReservations,
-  outbox: {
-    all: async () => store.getAllKeys().filter((key) => key.startsWith(outboxPrefix)).map((key) => JSON.parse(store.getString(key)!) as OutboxItem),
-    put: async (item) => store.set(outboxPrefix + item.key, JSON.stringify(item)),
-    delete: async (key) => { store.remove(outboxPrefix + key) },
-  },
+  outbox,
   notifier,
   sessionNotifications: false,
   onForeground(listener) {
@@ -192,5 +188,6 @@ export const mobilePlatform: Platform = {
       openings.clear()
       store.clearAll()
     })
+    outbox.reset()
   },
 }

@@ -1,3 +1,4 @@
+import { writeBody } from './write-request.ts'
 import { array, boolean, record, text } from '../lib/node.ts'
 import { enqueue, type OutboxItem, type OutboxStore } from '../lib/outbox.ts'
 import type { MemoryBase, MemoryControlResult, MemoryEntry, MemoryMetadata, MemoryState, MemoryStateResult, MemorySyncConflicts } from './types.ts'
@@ -77,7 +78,7 @@ export const memorySyncConflictLabel = (reason: MemorySyncConflicts['items'][num
 export const memorySaved = (result: MemoryControlResult) => result.state === 'applied' || result.state === 'already_recorded'
 export const memoryResultLabel = (result: MemoryControlResult) => memorySaved(result) ? result.current?.text === null ? '记忆已删除。' : '记忆已保存。' : result.state === 'superseded' ? '这次修改已记录，但已被其他修改替代。草稿已保留。' : '当前版本与草稿基准不同，草稿已保留。未确认的原操作需等待设备同步确认。'
 
-function afterText(value: unknown): string | null {
+export function afterText(value: unknown): string | null {
   if (value === null) return null
   const after = text(value, '记忆内容')
   if (!after.trim() || [...after].length > 500) throw new Error('记忆须为 1 至 500 个字符。')
@@ -86,13 +87,18 @@ function afterText(value: unknown): string | null {
 function sameBase(base: MemoryBase, current: MemoryState | null): boolean {
   return base.epoch === DATA_EPOCH && (base.version === null ? current === null : current !== null && base.version.revision === current.metadata.revision && base.version.control_revision === current.metadata.control_revision)
 }
-function request(item: OutboxItem) {
-  if (item.method !== 'control_memory') throw new Error('待确认操作不是记忆修改。')
-  const data = item.params, attestation = record(data.attestation)
+export function parseMemoryRequest(value: unknown) {
+  const data = record(value), attestation = record(data.attestation)
+  const base = parseMemoryBase(data.base), after = afterText(data.after)
+  if (after === null && base.version === null) throw new Error('删除记忆需要当前版本。')
   return {
-    conversation_id: text(data.conversation_id), memory_id: text(data.memory_id), base: parseMemoryBase(data.base), after: afterText(data.after),
+    conversation_id: text(data.conversation_id), memory_id: text(data.memory_id), base, after,
     operation_id: hash(data.operation_id), attestation: { device_id: text(attestation.device_id), signature: text(attestation.signature) },
   }
+}
+function request(item: OutboxItem) {
+  if (item.method !== 'control_memory') throw new Error('待确认操作不是记忆修改。')
+  return parseMemoryRequest(item.params)
 }
 
 export function memoryController(options: {
@@ -101,34 +107,43 @@ export function memoryController(options: {
   rpc(method: string, params: Record<string, unknown>): Promise<unknown>
   sign(conversationId: string, body: Record<string, unknown>): Promise<{ operation_id: string; attestation: { device_id: string; signature: string } }>
 }) {
-  const submit = async (item: OutboxItem, unknown: boolean): Promise<MemoryControlResult> => {
+  const submit = async (item: OutboxItem, unknown: boolean, check: () => void): Promise<MemoryControlResult> => {
+    check()
     const original = request(item)
     let response: unknown
     try { response = await options.rpc(item.method, item.params) }
     catch (caught) {
+      check()
       if (!unknown && caught instanceof Error && 'responded' in caught && caught.responded === true) await options.outbox.delete(item.key)
       throw caught
     }
+    check()
     const result = parseMemoryControlResult(response, original.memory_id, original.operation_id)
     if (!unknown || result.state !== 'conflict') await options.outbox.delete(item.key)
     return result
   }
   const reconcile = async (item: OutboxItem): Promise<MemoryControlResult> => {
+    const check = options.outbox.lease?.() ?? (() => options.outbox.guard?.())
+    check()
     const original = request(item)
     const state = parseMemoryStateResult(await options.rpc('memory_state', { conversation_id: original.conversation_id, memory_id: original.memory_id, operation_id: original.operation_id }), original.memory_id, original.operation_id)
+    check()
     if (state.receipt === 'recorded' || state.receipt === 'superseded') {
       await options.outbox.delete(item.key)
       return { state: state.receipt === 'recorded' ? 'already_recorded' : 'superseded', operation_id: original.operation_id, current: state.current }
     }
     if (!sameBase(original.base, state.current)) return { state: 'conflict', operation_id: original.operation_id, current: state.current }
-    return submit(item, true)
+    return submit(item, true, check)
   }
   const controlMemory = async (conversationId: string, memoryId: string, base: MemoryBase, after: string | null): Promise<MemoryControlResult> => {
+    const check = options.outbox.lease?.() ?? (() => options.outbox.guard?.())
+    check()
     text(conversationId, '对话'); text(memoryId, '记忆')
     const parsedBase = parseMemoryBase(base), parsedAfter = afterText(after)
     if (parsedAfter === null && parsedBase.version === null) throw new Error('删除记忆需要当前版本。')
     const key = options.key(conversationId, memoryId)
     const pending = (await options.outbox.all()).find(item => item.key === key)
+    check()
     if (pending) {
       const original = request(pending)
       if (original.conversation_id !== conversationId || original.memory_id !== memoryId) throw new Error('待确认操作属于另一条记忆，未发送。')
@@ -136,9 +151,10 @@ export function memoryController(options: {
       if (JSON.stringify(original.base) !== JSON.stringify(parsedBase) || original.after !== parsedAfter) throw new Error(result.state === 'conflict' ? '原操作的结果仍未确认。草稿已保留，等待设备同步后再试。' : '之前的操作已有结果，当前草稿尚未提交。草稿已保留，请查看最新版本后再保存。')
       return result
     }
-    const signed = await options.sign(conversationId, { type: 'memory_controlled', memory_id: memoryId, base: parsedBase, after: parsedAfter })
-    const item = await enqueue(options.outbox, { key, method: 'control_memory', params: { conversation_id: conversationId, memory_id: memoryId, base: parsedBase, after: parsedAfter, ...signed }, created_at_ms: Date.now() })
-    return submit(item, false)
+    const signed = await options.sign(conversationId, writeBody({ method: 'control_memory', params: { conversation_id: conversationId, memory_id: memoryId, base: parsedBase, after: parsedAfter, operation_id: '' } }, ''))
+    check()
+    const item = await enqueue(options.outbox, { key, method: 'control_memory', scope_id: conversationId, params: { conversation_id: conversationId, memory_id: memoryId, base: parsedBase, after: parsedAfter, ...signed }, created_at_ms: Date.now() })
+    return submit(item, false, check)
   }
   return { controlMemory, reconcile }
 }

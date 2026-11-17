@@ -109,7 +109,7 @@ test('a persisted unknown input retains the original signature, attachment bytes
   assert.equal(prepared.ok, true)
   if (!prepared.ok) return
   const attachment = { hash: 'a'.repeat(64), size: 3, name: 'note.txt' }
-  const item: OutboxItem = { key: prepared.pending.message_id, method: 'message', params: { ...prepared.body, attachments: [attachment], attestation: { device_id: 'client', signature: 'original-signature' } }, created_at_ms: 1, delivery: 'unknown', uploads: [{ ...attachment, data: 'YWJj' }] }
+  const item: OutboxItem = { key: prepared.pending.message_id, method: 'message', scope_id: 'c', params: { ...prepared.body, attachments: [attachment], attestation: { device_id: 'client', signature: 'original-signature' } }, created_at_ms: 1, delivery: 'unknown', uploads: [{ ...attachment, data: 'YWJj' }] }
   const entries = new Map<string, OutboxItem>()
   const store = { all: async () => [...entries.values()], put: async (item: OutboxItem) => { entries.set(item.key, structuredClone(item)) }, delete: async (key: string) => { entries.delete(key) } }
   await enqueue(store, item)
@@ -225,7 +225,7 @@ test('new draft defaults become explicit signed booleans, and false survives dur
     assert.equal(prepared.pending.report_results, expected)
     assert.equal(prepared.body.report_results, expected)
     assert.equal(record(JSON.parse(JSON.stringify(inputEventBody(prepared.body)))).report_results, expected)
-    const item: OutboxItem = { key: prepared.pending.message_id, method: 'message', created_at_ms: 1, delivery: 'unknown', params: { ...prepared.body, attestation: { device_id: 'client', signature: 'original-signature' } } }
+    const item: OutboxItem = { key: prepared.pending.message_id, method: 'message', scope_id: 'c', created_at_ms: 1, delivery: 'unknown', params: { ...prepared.body, attestation: { device_id: 'client', signature: 'original-signature' } } }
     const entries = new Map<string, OutboxItem>()
     const store = { all: async () => [...entries.values()], put: async (value: OutboxItem) => { entries.set(value.key, structuredClone(value)) }, delete: async (key: string) => { entries.delete(key) } }
     await enqueue(store, item)
@@ -246,7 +246,7 @@ test('untyped message, queued input and history boundaries require explicit repo
   for (const report_results of [undefined, null, 0, 1, 'true', 'false', {}, []]) {
     const input = { ...body, ...(report_results === undefined ? {} : { report_results }) }
     assert.throws(() => parseMessageRequest({ conversation_id: 'chat', ...input }), /report_results/)
-    assert.throws(() => parsePendingMessage({ key: 'input', method: 'message', params: { conversation_id: 'chat', ...input, attestation: { device_id: 'client', signature: 'original' } }, created_at_ms: 1, delivery: 'unknown' }), /report_results/)
+    assert.throws(() => parsePendingMessage({ key: 'input', method: 'message', scope_id: 'c', params: { conversation_id: 'chat', ...input, attestation: { device_id: 'client', signature: 'original' } }, created_at_ms: 1, delivery: 'unknown' }), /report_results/)
     assert.throws(() => parseWorkspaceState(queue(input)), /report_results/)
     assert.throws(() => parseWorkspaceHistory(history(input)), /report_results/)
   }

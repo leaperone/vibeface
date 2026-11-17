@@ -1,9 +1,16 @@
 name: Reusable / Browser cryptography
+run-name: Browser cryptography / source ${{ inputs.source_sha }}
 
 on:
   workflow_call:
     inputs:
       source_sha: {type: string, required: true}
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Same-repository source commit, exactly 40 lowercase hexadecimal characters
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -11,11 +18,45 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
     steps:
+      - name: Validate immutable source input
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+
+          if re.fullmatch(r"[0-9a-f]{40}", os.environ["SOURCE_SHA"]) is None:
+              raise SystemExit("source_sha must be exactly 40 lowercase hexadecimal characters")
+          PY
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.source_sha }}
           persist-credentials: false
+      - name: Record checked-out source provenance
+        env:
+          CONTROLLER_HEAD_SHA: ${{ github.sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          if source != os.environ["SOURCE_SHA"] or subprocess.check_output(["git", "status", "--porcelain"]):
+              raise SystemExit("Expected a clean checkout of source_sha")
+          output = Path(".artifacts/browser-crypto/source.json")
+          output.parent.mkdir(parents=True, exist_ok=True)
+          output.write_text(json.dumps({"repository": os.environ["GITHUB_REPOSITORY"],
+              "sourceSha": source, "controllerHeadSha": os.environ["CONTROLLER_HEAD_SHA"],
+              "workflowSha": os.environ["WORKFLOW_SHA"], "workflowRef": os.environ["WORKFLOW_REF"],
+              "runId": os.environ["GITHUB_RUN_ID"], "runAttempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "complete": False}, indent=2) + "\n")
+          PY
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: wasm32-unknown-unknown
@@ -33,6 +74,32 @@ jobs:
           bash scripts/build-web-crypto.sh
           cargo build -p vibeface-secure --example secure-probe --locked
           node scripts/crypto-client.mjs --self-test --native-probe target/debug/examples/secure-probe
+      - name: Bind completed browser outputs to the unchanged source
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          if subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() != os.environ["SOURCE_SHA"] or subprocess.check_output(["git", "status", "--porcelain"]):
+              raise SystemExit("Source changed during browser cryptography verification")
+          subprocess.run(["python3", "scripts/build-inputs.py", "check", "crypto"], check=True)
+          directory = Path("apps/app/generated")
+          expected = {"vibeface_secure.js", "vibeface_secure_bg.wasm", "vibeface_secure.d.ts",
+              "vibeface_secure_bg.wasm.d.ts", ".vibeface-build.json"}
+          paths = list(directory.rglob("*"))
+          if directory.is_symlink() or any(path.is_symlink() or not path.is_file() for path in paths) or {path.relative_to(directory).as_posix() for path in paths} != expected:
+              raise SystemExit("Unexpected browser cryptography output set")
+          output = Path(".artifacts/browser-crypto/source.json")
+          provenance = json.loads(output.read_text())
+          if provenance["sourceSha"] != os.environ["SOURCE_SHA"] or provenance["complete"]:
+              raise SystemExit("Browser cryptography provenance differs from this build")
+          provenance.update({"sourceUnchanged": True, "complete": True,
+              "files": {path.name: {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "size": path.stat().st_size} for path in sorted(paths)}})
+          output.write_text(json.dumps(provenance, indent=2) + "\n")
+          PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: crypto-web-${{ inputs.source_sha }}
@@ -42,5 +109,11 @@ jobs:
             apps/app/generated/*.d.ts
             apps/app/generated/.vibeface-build.json
           include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: crypto-web-provenance-${{ inputs.source_sha }}
+          path: .artifacts/browser-crypto/source.json
           if-no-files-found: error
           retention-days: 14
