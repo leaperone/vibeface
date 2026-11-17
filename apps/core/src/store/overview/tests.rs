@@ -237,7 +237,8 @@ async fn overview_snapshot_keeps_one_wal_view_when_projection_callback_commits()
                         assert_eq!(job.conversation_id, "a");
                         assert_eq!(job.trigger, "message:before");
                         assert_eq!(job.state, JobState::Queued);
-                        assert!(job.pending_check);
+                        // Queued jobs have no attempt; the scope still has a pending check.
+                        assert!(!job.pending_check);
                         assert!(pending);
                         assert_eq!(owner_epoch, 7);
 
@@ -294,7 +295,14 @@ async fn overview_snapshot_keeps_one_wal_view_when_projection_callback_commits()
                             .scheduler_job("a", "message:before")?
                             .context("original job remains in the read snapshot")?;
                         assert_eq!(reread.state, JobState::Queued);
-                        assert!(reread.pending_check);
+                        assert!(!reread.pending_check);
+                        let old_check_count: u64 = store.connection.query_row(
+                            "SELECT count(*) FROM pending_checks
+                             WHERE conversation_id='a' AND trigger='message:before'",
+                            [],
+                            |row| row.get(0),
+                        )?;
+                        assert_eq!(old_check_count, 1);
                         assert!(store.scheduler_job("b", "message:after")?.is_none());
                         assert!(!store.has_conversation(&query_network, "c")?);
                         let facts: (String, u64, String, usize) = store.connection.query_row(
