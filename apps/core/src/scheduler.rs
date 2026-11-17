@@ -843,7 +843,7 @@ pub(crate) fn turn_recorder(
                                 &identity,
                                 &network,
                                 &started,
-                                crate::runtime::now_ms(),
+                                crate::clock::now_ms(),
                             )?;
                             Ok(matches!(started.scope, SessionScope::WorkspaceTask { .. }))
                         })

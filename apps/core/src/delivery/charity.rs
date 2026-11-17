@@ -1463,7 +1463,7 @@ async fn charity_request(node: &Runtime, peer: &str, request: Request) -> Result
 }
 
 fn save_record(store: &mut ServiceStore, stored: &mut StoredCharity) -> Result<()> {
-    stored.view.updated_at_ms = crate::runtime::now_ms();
+    stored.view.updated_at_ms = crate::clock::now_ms();
     let intent = if stored.view.role == Role::Sender {
         stored.view.intent_id.clone()
     } else {
@@ -1522,7 +1522,7 @@ fn new_record(
     network: Option<String>,
     request_hash: String,
 ) -> StoredCharity {
-    let at = crate::runtime::now_ms();
+    let at = crate::clock::now_ms();
     let view = DeliveryOrder {
         order_id: order.terms.order_id.clone(),
         intent_id: order.terms.intent_id.clone(),

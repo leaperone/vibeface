@@ -2251,7 +2251,7 @@ impl Store {
                 )?,
             "work no longer permits its first native submission"
         );
-        let value = json!({"network_id":network,"work_id":work.work_id,"conversation_id":work.conversation,"spec_digest":crate::crypto::digest(&serde_json::to_vec(work)?),"native_cwd":actual_cwd,"reserved_at_ms":crate::runtime::now_ms()});
+        let value = json!({"network_id":network,"work_id":work.work_id,"conversation_id":work.conversation,"spec_digest":crate::crypto::digest(&serde_json::to_vec(work)?),"native_cwd":actual_cwd,"reserved_at_ms":crate::clock::now_ms()});
         let mut value = value;
         if let Some(execution) = execution {
             value["native_execution"] = serde_json::to_value(execution)?;
@@ -2325,7 +2325,7 @@ impl Store {
             )
             .into());
         }
-        reservation["first_input_started_at_ms"] = json!(crate::runtime::now_ms());
+        reservation["first_input_started_at_ms"] = json!(crate::clock::now_ms());
         reservation["native_thread"] = json!(thread);
         tx.execute(
             "UPDATE identity_meta SET value=? WHERE key=?",
@@ -3329,7 +3329,7 @@ pub(crate) fn queue_delivery_from(
         network,
         conversation,
         trigger,
-        crate::runtime::now_ms(),
+        crate::clock::now_ms(),
     )?;
     Ok(OutboxEntry {
         conversation_id: conversation.into(),
@@ -3975,7 +3975,7 @@ fn recover_session(
                     process_unconfirmed: true,
                 },
                 "",
-                crate::runtime::now_ms(),
+                crate::clock::now_ms(),
             )?;
         }
         JobState::Reconciling { .. } => {}
@@ -4508,7 +4508,7 @@ impl Store {
                         network,
                         work_id,
                         signal,
-                        crate::runtime::now_ms(),
+                        crate::clock::now_ms(),
                     )?;
                 }
             }
@@ -4582,7 +4582,7 @@ impl Store {
                         &job,
                         (ReplyStatus::Stopped, None),
                         evidence.to_owned(),
-                        crate::runtime::now_ms(),
+                        crate::clock::now_ms(),
                     )?;
                 }
                 job.state = JobState::Cancelled {
@@ -5054,7 +5054,7 @@ impl Store {
                 outcome: &outcome,
                 text: "",
             };
-            let at = crate::runtime::now_ms();
+            let at = crate::clock::now_ms();
             if let Some((work_id, signal)) = task_work_signal(&job.trigger, change) {
                 super::work::apply_signal_from(
                     &tx,
@@ -5545,7 +5545,7 @@ impl Store {
             match accepted {
                 Some(turn_id) => {
                     let receipt = receipt.get_or_insert(SteerReceipt {
-                        accepted_at_ms: crate::runtime::now_ms(),
+                        accepted_at_ms: crate::clock::now_ms(),
                         actual_turn_id: None,
                     });
                     if receipt.actual_turn_id.is_none() {
@@ -5653,7 +5653,7 @@ impl Store {
                         reply: host.message_id,
                     },
                     vec![],
-                    crate::runtime::now_ms(),
+                    crate::clock::now_ms(),
                 )?;
             }
         }

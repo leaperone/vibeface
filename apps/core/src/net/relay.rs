@@ -2,6 +2,7 @@
 //! announces, metering what each endpoint moves through this Node's relay, and the grants a
 //! relay operator signs for paid access.
 use super::{Net, RelayUrl, mesh};
+use crate::clock::now_ms_u64 as now_ms;
 use anyhow::{Context as _, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
@@ -35,10 +36,6 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 /// A relay's history counts its passed checks up to this; a failed check halves it.
 const MAX_HISTORY: i64 = 288;
 const PROBE_NEIGHBORS: usize = 3;
-
-fn now_ms() -> u64 {
-    crate::runtime::now_ms() as u64
-}
 
 /// The relay tables of `mesh.sqlite3`, on a connection of their own.
 pub struct RelayDb(Mutex<rusqlite::Connection>);

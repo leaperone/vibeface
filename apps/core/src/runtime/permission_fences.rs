@@ -1,4 +1,5 @@
-use super::{Changed, NodeSettings, Runtime, manager_control::ActiveManager, now_ms};
+use super::{Changed, NodeSettings, Runtime, manager_control::ActiveManager};
+use crate::clock::now_ms;
 use crate::{
     model::WorkKind,
     providers::{Local, Provider},

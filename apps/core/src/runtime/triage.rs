@@ -2,7 +2,8 @@
 //! ask the user in the chat of the bot that owns each session, deliver webhooks from a
 //! local outbox, hold the requests sessions wait on for the Agent, and give sessions no bot
 //! started to the primary bot until it hands them to another or stops following them.
-use super::{Access, Changed, Runtime, now_ms};
+use super::{Access, Changed, Runtime};
+use crate::clock::now_ms;
 use crate::{
     config,
     manager::{self, CursorInstance, ManagerConfig},

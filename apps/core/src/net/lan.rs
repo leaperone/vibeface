@@ -6,8 +6,9 @@ use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
+use vibeface_protocol::now_ms;
 use vibeface_secure::lan::{SERVICE, TXT_KEY, hour, lan_tag, lan_tag_matches};
 
 /// Anyone on the LAN can advertise; these bound what each dial checks and tries.
@@ -284,13 +285,6 @@ fn matching_member(members: &[String], network: &str, tag: &str, now_ms: u64) ->
         .cloned()
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +344,9 @@ mod tests {
             state.hints("c", now),
             [SocketAddr::from(([192, 168, 1, 20], 4))]
         );
+        assert_eq!(state.hints("b", now - HOUR_MS), state.hints("b", now));
+        assert_eq!(state.hints("b", now + HOUR_MS), state.hints("b", now));
+        assert!(state.hints("b", now + 2 * HOUR_MS).is_empty());
         assert!(state.hints("c", now + 2 * HOUR_MS).is_empty());
         state.seen.remove("c");
         assert!(state.hints("c", now).is_empty());
@@ -365,6 +362,16 @@ mod tests {
         assert!(
             state.seen.contains_key("c"),
             "strangers filling the table do not keep a member out"
+        );
+        assert_eq!(
+            state.learn("c".into(), advert("net", "c", 100, 6), now - 1),
+            None,
+            "a wall-clock backstep does not wake a member again"
+        );
+        assert_eq!(
+            state.learn("c".into(), advert("net", "c", 100, 6), now + 9_999),
+            None,
+            "the wake interval has not yet elapsed"
         );
         assert_eq!(
             state.learn("c".into(), advert("net", "c", 100, 6), now + WAKE_EVERY_MS),

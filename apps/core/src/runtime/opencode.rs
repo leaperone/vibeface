@@ -6,6 +6,7 @@
 use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
 use super::provider_adapter::bounded;
 use super::*;
+use crate::clock::now_ms;
 use crate::manager::{self, ManagerConfig, ManagerError, ManagerFailure, Sdk};
 use crate::scheduling::{SteerOutcome, SteerTarget};
 use crate::work::{Probe, Signal, WorkRecord, WorkSpec, WorkState};

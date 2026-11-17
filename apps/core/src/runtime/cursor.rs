@@ -1,4 +1,5 @@
 use super::*;
+use crate::clock::now_ms;
 use crate::manager::CursorInstance;
 use crate::runtime::executor::{Executor, SteerAck, SteerInput, SteerTrace};
 use crate::work::{Probe, Signal, WorkRecord, WorkSpec, WorkState};

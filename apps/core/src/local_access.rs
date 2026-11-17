@@ -1,3 +1,4 @@
+use crate::clock::now_ms;
 use crate::{config, crypto};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -284,10 +285,6 @@ impl LocalAccess {
             &serde_json::to_vec(&state.sessions)?,
         )
     }
-}
-
-fn now_ms() -> i64 {
-    crate::runtime::now_ms()
 }
 
 #[cfg(test)]

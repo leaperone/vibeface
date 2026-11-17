@@ -5,6 +5,7 @@
 use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
 use super::provider_adapter::safe_model_text;
 use super::*;
+use crate::clock::now_ms;
 use crate::providers::{
     Authentication, CatalogCoverage, CodexLaunch, CodexTarget, EffortOptions, ModelCatalog,
     ModelChoice,

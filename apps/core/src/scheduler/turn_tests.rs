@@ -98,7 +98,7 @@ impl Fixture {
         );
         node.store
             .call("turn_test.admit", move |store| {
-                let now = crate::runtime::now_ms();
+                let now = crate::clock::now_ms();
                 store.append_event(
                     &identity,
                     &network,

@@ -236,7 +236,7 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT invite_hash FROM invites WHERE expires_at_ms>? AND (status IS NULL OR status IN ('pending','confirming'))",
         )?;
-        let hashes = statement.query_map([crate::runtime::now_ms()], |r| r.get::<_, String>(0))?;
+        let hashes = statement.query_map([crate::clock::now_ms()], |r| r.get::<_, String>(0))?;
         for hash in hashes {
             if crate::net::relay_token(&hash?) == token {
                 return Ok(true);
