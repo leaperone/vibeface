@@ -13,14 +13,11 @@ if ! command -v pnpm >/dev/null; then
   echo 'pnpm 11.9.0 is required to build the web client.' >&2
   exit 1
 fi
+# This build entry owns dependency installation for local and workflow callers.
 pnpm install --frozen-lockfile --filter "vibeface-web..." --filter "vibeface-mobile..."
 node "$repo/scripts/check-uiarc-build.mjs"
 node "$repo/scripts/check-uiarc-native.cjs"
-pnpm run generate-routes
-pnpm run test
-pnpm run typecheck
-pnpm --filter @vibeface/client run test
-pnpm --filter @vibeface/client run typecheck
+bash "$repo/scripts/check-web.sh"
 pnpm run build
 # TanStack Start appends build-only types; keep the tracked tree in tsr format.
 pnpm run generate-routes

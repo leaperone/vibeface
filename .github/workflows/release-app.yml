@@ -54,7 +54,6 @@ jobs:
         with: {version: 11.9.0}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with: {node-version: '24', cache: pnpm, cache-dependency-path: pnpm-lock.yaml}
-      - run: pnpm install --frozen-lockfile
       - name: Build and verify the static application
         run: |
           cargo install wasm-bindgen-cli --version 0.2.129 --locked
