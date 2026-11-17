@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
     future::Future,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     time::Duration,
 };

@@ -1,6 +1,6 @@
 //! Account-owned Node settings. Personal-network business and governance never use this route.
 use super::{DesktopHost, NodeIdentity, NodeStatus};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::{
     fmt,

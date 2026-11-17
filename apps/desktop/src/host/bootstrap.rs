@@ -1,5 +1,5 @@
 use super::{DesktopHost, NodeIdentity, NodeStatus, model};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::Value;
 use std::fmt;

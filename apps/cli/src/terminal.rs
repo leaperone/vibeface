@@ -1,4 +1,3 @@
-use anyhow::Result;
 use clap::builder::styling::Styles;
 use crossterm::style::Stylize;
 use ratatui::{style::Style, text::Span};
