@@ -8,7 +8,7 @@ const listen = (listener: () => void) => { listeners.add(listener); return () =>
 /** 实验功能 in settings: features still being tried, such as paid delivery on a test chain. Off unless turned on here. */
 export const experimentsCopy = { group: '高级', label: '实验功能', hint: '付费传输等还在测试的功能', on: '文件传输里多了付费传输', open: '去看看' } as const
 
-export const experimentsOn = (storage: KeyValue): boolean => storageOf(storage).readStorage<unknown>('experiments', false) === true
+export const experimentsOn = (storage: KeyValue): boolean => storageOf(storage).readStorage('experiments', false) === true
 
 export function setExperiments(storage: KeyValue, on: boolean) {
   storageOf(storage).writeStorage('experiments', on)

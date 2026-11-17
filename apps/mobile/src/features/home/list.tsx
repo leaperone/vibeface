@@ -119,7 +119,7 @@ const tipClosed = 'notify-tip-closed'
 function NotifyTip() {
   const shared = useLive()
   const { readStorage, writeStorage } = storageOf(mobilePlatform.storage)
-  const [closed, setClosed] = useState(() => readStorage(tipClosed, false))
+  const [closed, setClosed] = useState(() => readStorage(tipClosed, false) === true)
   const { busy, error, run } = useRun()
   if (closed || !shared?.synced || shared.notificationButton.state !== 'off' || shared.notificationButton.disabled) return null
   return <Item key="notify" layout={move} entering={fadeIn} exiting={fadeOut} className="mb-2 mt-1 gap-1">

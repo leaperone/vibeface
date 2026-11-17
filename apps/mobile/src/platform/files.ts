@@ -171,4 +171,5 @@ async function erase(clear: () => Promise<void>) {
   } finally { erasing = false }
 }
 
-export const privateFiles = { run, retain, ownedFile, release, releasePicker, recoveryStorage, erase, recovery, transfers }
+function lease() { const version = epoch; return () => !erasing && version === epoch }
+export const privateFiles = { run, lease, retain, ownedFile, release, releasePicker, recoveryStorage, erase, recovery, transfers }

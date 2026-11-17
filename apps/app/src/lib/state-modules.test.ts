@@ -34,7 +34,7 @@ function memory(): OutboxStore & { items: Map<string, OutboxItem> } {
   const items = new Map<string, OutboxItem>()
   return { items, all: async () => [...items.values()], put: async item => { items.set(item.key, structuredClone(item)) }, delete: async key => { items.delete(key) } }
 }
-const write = (key: string, at: number, text = key): OutboxItem => ({ key, method: 'message', params: { message_id: key, text, attestation: { device_id: 'd', signature: `sig-${text}` } }, created_at_ms: at })
+const write = (key: string, at: number, text = key): OutboxItem => ({ key, method: 'message', scope_id: 'chat', delivery: 'saved', params: { conversation_id: 'chat', target: { kind: 'bot_main', bot_id: 'bot' }, intent: 'continue', sequence: 1, report_results: true, message_id: key, text, attestation: { device_id: 'd', signature: `sig-${text}` } }, created_at_ms: at })
 
 test('the outbox confirms recorded writes, resubmits the rest unchanged, and stops at an unknown result', async () => {
   const store = memory()

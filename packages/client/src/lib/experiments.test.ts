@@ -21,14 +21,14 @@ test('shared JSON storage preserves device keys and optional read fallbacks', ()
   const { readStorage, writeStorage } = storageOf(storage)
   writeStorage('connections', [{ device_id: 'node' }], true)
   assert.equal(storage.getItem('vibeface.connections'), '[{"device_id":"node"}]')
-  assert.deepEqual(readStorage<unknown>('connections', null), [{ device_id: 'node' }])
+  assert.deepEqual(readStorage('connections', null), [{ device_id: 'node' }])
   storage.setItem('vibeface.broken', '{')
   assert.equal(readStorage('broken', null), null)
   assert.throws(() => readStorage('broken', null, true), { message: '读不了本地需要确认的记录，已暂停发送。先别清除这台设备上的应用数据。' })
   assert.equal(readStorage('missing', null, true), null)
   for (const value of [false, 0, '']) {
     writeStorage('value', value, true)
-    assert.equal(readStorage<unknown>('value', null), value)
+    assert.equal(readStorage('value', null), value)
   }
 })
 

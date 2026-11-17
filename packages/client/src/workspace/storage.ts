@@ -2,9 +2,10 @@ import type { KeyValue } from '../lib/platform.ts'
 
 /** JSON values under `vibeface.` keys; `required` turns a failed read or write into an error instead of the fallback. */
 export function storageOf(storage: KeyValue) {
-  function readStorage<T>(key: string, fallback: T, required = false): T {
+  function readStorage(key: string, fallback: unknown, required = false): unknown {
     try {
-      return JSON.parse(storage.getItem(`vibeface.${key}`) ?? "null") ?? fallback
+      const raw = storage.getItem(`vibeface.${key}`)
+      return raw === null ? fallback : JSON.parse(raw)
     } catch {
       if (required) throw new Error("读不了本地需要确认的记录，已暂停发送。先别清除这台设备上的应用数据。")
       return fallback
