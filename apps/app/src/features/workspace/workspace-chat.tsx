@@ -11,14 +11,16 @@ import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { networkKey,storageOf } from '@vibeface/client/workspace/storage.ts'
 import type { ContextProjection,InputControlAction,InputReceipt,InputTarget,PendingMessage,QueuedInput,ScopeContext,WorkspaceHistory,WorkspaceTask } from '@vibeface/client/workspace/types.ts'
 import { Button } from '@vibeface/uiarc/button/button.tsx'
+import { Drawer,DrawerContent,DrawerTrigger } from '@vibeface/uiarc/drawer/drawer.tsx'
 import { Checkbox } from "@vibeface/uiarc/checkbox/checkbox.tsx"
 import { Input } from '@vibeface/uiarc/input/input.tsx'
 import { Textarea } from '@vibeface/uiarc/textarea/textarea.tsx'
 import { BrainCircuit,ChevronLeft,CircleQuestionMark,ListChecks,MessagesSquare,Reply,Settings,X } from 'lucide-react'
-import { useEffect,useRef,useState,type ReactNode } from 'react'
+import { useEffect,useRef,useState,useSyncExternalStore,type ReactNode } from 'react'
 import { ChannelForm } from './channels'
 import { QuestionCard } from './question-card'
 import { WorkspaceTaskLink,WorkspaceTaskPill } from './workspace-tasks'
+import styles from './workspace-chat.module.css'
 
 const deliveryLabels: Record<PendingMessage['delivery'], string> = {
   saved: '本地已保存', uploading: '本地已保存，附件准备中', submitting: '正在发送给连接的设备',
@@ -29,6 +31,13 @@ const receiptLabels: Record<InputReceipt['stage'], string> = {
   provider_accepted: '执行服务已接受输入', associated: '已确认回合归属', refused: '已拒绝', unknown: '补充是否进入当前工作尚未确认',
 }
 type ComposerDraft = { text: string; files: File[]; target: string; conversationId: string }
+
+const narrowContextQuery = '(width < 40rem)'
+function subscribeContextWidth(change: () => void) {
+  const query = window.matchMedia(narrowContextQuery)
+  query.addEventListener('change', change)
+  return () => query.removeEventListener('change', change)
+}
 
 function sameTarget(left: InputTarget, right: InputTarget) {
   if ((left.kind === 'task' || left.kind === 'channel_task') && (right.kind === 'task' || right.kind === 'channel_task')) return left.task_id === right.task_id
@@ -77,6 +86,11 @@ export function WorkspaceTaskDetail({ taskId }: { taskId: string }) {
   const workspace = useWorkspace()
   const action = useAction()
   const [contextOpen, setContextOpen] = useState(false)
+  const [contextDrawerOpen, setContextDrawerOpen] = useState(false)
+  const mobileContextTrigger = useRef<HTMLButtonElement>(null)
+  const desktopContextTrigger = useRef<HTMLButtonElement>(null)
+  const narrowContext = useSyncExternalStore(subscribeContextWidth, () => typeof window !== 'undefined' && window.matchMedia(narrowContextQuery).matches, () => false)
+  useEffect(() => { setContextDrawerOpen(false) }, [narrowContext])
   const [revising, setRevising] = useState(false)
   const [correction, setCorrection] = useState('')
   const task = workspace.workspaceState?.tasks.find((item) => item.task_id === taskId)
@@ -89,11 +103,12 @@ export function WorkspaceTaskDetail({ taskId }: { taskId: string }) {
   if (!task || !bot) return <EmptyState icon={ListChecks} title={workspace.workspaceState ? '尚未读到这个任务或所属 Bot' : '正在读取任务'} action={<Button type="button" variant="secondary" onClick={() => void action.run('read', () => workspace.readWorkspaceState({ task_id: taskId }))}>重新读取</Button>} />
   const target: InputTarget = task.channel_id ? { kind: 'channel_task', channel_id: task.channel_id, task_id: task.task_id, bot_id: task.owner_bot } : { kind: 'task', task_id: task.task_id }
   const control = (choice: 'continue' | 'stop' | 'cancel' | 'defer') => action.run(choice, () => workspace.workspaceCommand({ kind: 'control_task', task_id: task.task_id, expected_revision: task.revision, action: choice }))
-  return <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-    <header className="grid max-h-[40%] min-h-0 shrink-0 gap-3 overflow-y-auto border-b px-4 py-3 [overflow-wrap:anywhere] sm:px-6">
+  const taskActions = <div className="flex flex-wrap gap-2"><Button type="button" size="sm" variant="secondary" onClick={() => { setCorrection(task.request); setRevising((value) => !value) }}>纠正任务</Button>{task.channel_id ? <RoutedAction size="sm" variant="ghost" to="/channels/$channelId" params={{ channelId: task.channel_id }}>打开频道</RoutedAction> : null}<Button type="button" size="sm" variant="ghost" disabled={!workspace.writable || Boolean(action.busy)} onClick={() => void control('defer')}>稍后处理</Button><Button type="button" size="sm" variant="ghost" disabled={!workspace.writable || Boolean(action.busy)} onClick={() => void control('continue')}>继续任务</Button><Button type="button" size="sm" variant="ghost" disabled={!workspace.writable || Boolean(action.busy)} onClick={() => void control('cancel')}>取消任务</Button></div>
+  return <Drawer open={narrowContext && contextDrawerOpen} onOpenChange={setContextDrawerOpen}><div className="flex min-h-0 min-w-0 flex-1 flex-col">
+    <header className={`${styles.taskHeader} grid max-h-[40%] min-h-0 shrink-0 gap-3 overflow-y-auto border-b px-4 py-3 [overflow-wrap:anywhere] sm:px-6`}>
       <div className="flex min-w-0 flex-wrap items-start gap-2"><RoutedAction variant="ghost" size="md" className="-ms-2 shrink-0" to="/tasks" aria-label="返回任务"><ChevronLeft aria-hidden="true" /></RoutedAction><div className="min-w-0 flex-1"><h2 className="[overflow-wrap:anywhere] text-lg font-medium">{task.title}</h2><p className="mt-1 text-sm text-secondary">{bot.name} · 第 {task.revision} 版</p></div><WorkspaceTaskPill task={task} /></div>
       {task.waiting_reason ? <p role="status" className="text-sm text-warning">{task.waiting_reason}</p> : null}
-      <div className="flex flex-wrap gap-2"><Button type="button" size="sm" variant="secondary" onClick={() => setContextOpen((value) => !value)}><BrainCircuit aria-hidden="true" />{contextOpen ? '收起上下文' : '上下文和历史'}</Button><Button type="button" size="sm" variant="secondary" onClick={() => { setCorrection(task.request); setRevising((value) => !value) }}>纠正任务</Button>{task.channel_id ? <RoutedAction size="sm" variant="ghost" to="/channels/$channelId" params={{ channelId: task.channel_id }}>打开频道</RoutedAction> : null}<Button type="button" size="sm" variant="ghost" disabled={!workspace.writable || Boolean(action.busy)} onClick={() => void control('defer')}>稍后处理</Button><Button type="button" size="sm" variant="ghost" disabled={!workspace.writable || Boolean(action.busy)} onClick={() => void control('continue')}>继续任务</Button><Button type="button" size="sm" variant="ghost" disabled={!workspace.writable || Boolean(action.busy)} onClick={() => void control('cancel')}>取消任务</Button></div>
+      <div className="flex flex-wrap items-start gap-2"><DrawerTrigger asChild><Button ref={mobileContextTrigger} type="button" size="sm" variant="secondary" className={styles.mobileContextTrigger}><BrainCircuit aria-hidden="true" />上下文和历史</Button></DrawerTrigger><Button ref={desktopContextTrigger} type="button" size="sm" variant="secondary" className={styles.desktopContextTrigger} aria-expanded={contextOpen} onClick={() => setContextOpen((value) => !value)}><BrainCircuit aria-hidden="true" />{contextOpen ? '收起上下文' : '上下文和历史'}</Button><Details label="任务操作" className={styles.mobileTaskActions}>{taskActions}</Details><div className={styles.desktopTaskActions}>{taskActions}</div></div>
       <InlineError error={action.error} />
       {revising ? <form className="grid gap-2" onSubmit={(event) => { event.preventDefault(); void action.run('revise', async () => {
         const result = await workspace.workspaceCommand({ kind: 'revise_task', task_id: task.task_id, expected_revision: task.revision, request: correction.trim(), expected_result: task.expected_result, dependencies: task.dependencies })
@@ -102,10 +117,14 @@ export function WorkspaceTaskDetail({ taskId }: { taskId: string }) {
         await workspace.sendMessage(correction.trim(), [], undefined, { target, expected_revision: revised.revision, conversation_id: bot.conversation_id })
         setRevising(false)
       }) }}><div className="grid gap-2 text-sm"><Textarea label="更新任务交代" required value={correction} maxLength={100000} onChange={(event) => setCorrection(event.currentTarget.value)} /></div><p className="text-sm text-secondary">保留任务身份并新增版本。旧版本结果不能完成这次更新。</p><Button type="submit" className="justify-self-start" disabled={!workspace.writable || Boolean(action.busy)}>保存修订并补充</Button></form> : null}
-      {contextOpen ? <WorkspaceTaskContext task={task} /> : null}
+      {contextOpen && !narrowContext ? <WorkspaceTaskContext task={task} /> : null}
     </header>
     <ScopedConversation key={task.task_id} target={target} conversationId={bot.conversation_id} task={task} label={`${bot.name} · ${task.title}`} onStop={() => control('stop')} />
-  </div>
+  </div><DrawerContent title="任务上下文和历史" description="查看原始交代、版本和本轮实际上下文来源。" className={styles.contextDrawer} onCloseAutoFocus={(event) => {
+    event.preventDefault()
+    const opener = window.matchMedia(narrowContextQuery).matches ? mobileContextTrigger.current : desktopContextTrigger.current
+    if (opener?.isConnected) opener.focus({ preventScroll: true })
+  }}><WorkspaceTaskContext task={task} reading /></DrawerContent></Drawer>
 }
 
 export function ChannelWorkspace({ channelId }: { channelId: string }) {
@@ -136,8 +155,9 @@ export function ChannelWorkspace({ channelId }: { channelId: string }) {
   if (!channel || !bot) return <div className="grid gap-3"><InlineError error={readError} /><EmptyState icon={MessagesSquare} title={workspace.workspaceState ? '尚未读到这个频道或协调 Bot' : '正在读取频道'} action={<Button type="button" variant="secondary" onClick={() => void workspace.readWorkspaceState({ channel_id: channelId }).catch(setReadError)}>重新读取</Button>} /></div>
   const target: InputTarget = selectedTask ? { kind: 'channel_task', channel_id: channelId, task_id: selectedTask.task_id, bot_id: selectedTask.owner_bot } : replyTask ? { kind: 'channel_task', channel_id: channelId, task_id: replyTask, bot_id: bot.bot_id } : { kind: 'channel_member', channel_id: channelId, bot_id: bot.bot_id }
   return <div className="flex min-h-0 min-w-0 flex-1">
-    <div className="flex min-h-0 min-w-0 flex-1 flex-col"><header className="grid max-h-[40%] min-h-0 shrink-0 gap-2 overflow-y-auto border-b px-4 py-3 [overflow-wrap:anywhere] sm:px-6"><div className="flex min-w-0 items-start gap-3"><div className="min-w-0 flex-1"><h2 className="[overflow-wrap:anywhere] text-lg font-medium">{channel.title}</h2>{channel.purpose ? <p className="mt-1 text-sm text-secondary">{channel.purpose}</p> : null}</div><Button type="button" variant="ghost" size="md" aria-label="频道设置" onClick={() => setSettings(true)}><Settings aria-hidden="true" /></Button></div><p className="text-sm text-secondary">{channel.members.map((id) => workspace.bots.find((item) => item.bot_id === id)?.name ?? id).join('、')} · 默认协调 {workspace.bots.find((item) => item.bot_id === channel.coordinator_bot)?.name ?? 'Bot 未加载'}</p>
-      <Details label={`频道任务 · ${tasks.length}`} className="lg:hidden"><div className="grid gap-2">{tasks.map((task) => <WorkspaceTaskLink key={task.task_id} task={task} />)}</div></Details></header>
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col"><header className={`${styles.channelHeader} grid max-h-[40%] min-h-0 shrink-0 gap-2 overflow-y-auto border-b px-4 py-3 [overflow-wrap:anywhere] sm:px-6`}><div className="flex min-w-0 items-start gap-3"><div className="min-w-0 flex-1"><h2 className="[overflow-wrap:anywhere] text-lg font-medium">{channel.title}</h2>{channel.purpose ? <p className="mt-1 hidden text-sm text-secondary sm:block">{channel.purpose}</p> : null}</div><Button type="button" variant="ghost" size="md" aria-label="频道设置" onClick={() => setSettings(true)}><Settings aria-hidden="true" /></Button></div><p className="hidden text-sm text-secondary sm:block">{channel.members.map((id) => workspace.bots.find((item) => item.bot_id === id)?.name ?? id).join('、')} · 默认协调 {workspace.bots.find((item) => item.bot_id === channel.coordinator_bot)?.name ?? 'Bot 未加载'}</p>
+      <Details label={`频道说明与任务 · ${tasks.length}`} className="sm:hidden">{channel.purpose ? <p>{channel.purpose}</p> : null}<p>{channel.members.map((id) => workspace.bots.find((item) => item.bot_id === id)?.name ?? id).join('、')} · 默认协调 {workspace.bots.find((item) => item.bot_id === channel.coordinator_bot)?.name ?? 'Bot 未加载'}</p><div className="grid gap-2">{tasks.map((task) => <WorkspaceTaskLink key={task.task_id} task={task} />)}{!tasks.length ? <p>发送第一条交代，创建频道任务。</p> : null}</div></Details>
+      <Details label={`频道任务 · ${tasks.length}`} className="hidden sm:block lg:hidden"><div className="grid gap-2">{tasks.map((task) => <WorkspaceTaskLink key={task.task_id} task={task} />)}</div></Details></header>
       <ScopedConversation key={channelId} target={target} conversationId={(workspace.bots.find((item) => item.bot_id === selectedTask?.owner_bot) ?? bot).conversation_id} task={selectedTask} expectedRevision={selectedTask?.revision ?? pending?.expected_revision} channelId={channelId} onSaved={(input) => { if (savedSelection !== selectionRevision.current || !workspace.isCurrent()) return; if (input.target.kind !== "channel_task" || input.target.channel_id !== channelId) return; setSavedInput(input); setRecipient(input.target.bot_id); setReplyTask(input.target.task_id); storage.writeStorage(selectionKey, { bot_id: input.target.bot_id, task_id: input.target.task_id }) }} label={`${workspace.bots.find((item) => item.bot_id === selectedTask?.owner_bot)?.name ?? bot.name}${selectedTask ? ` · ${selectedTask.title}` : replyTask ? ' · 已保存的频道任务' : ' · 新频道任务'}`} onReply={(taskId, recipientBot) => { selectionRevision.current++; setSavedInput(null); setReplyTask(taskId); setRecipient(recipientBot); storage.writeStorage(selectionKey, { bot_id: recipientBot, task_id: taskId }) }} targetControl={<>{replyTask ? <Button type="button" variant="ghost" size="sm" onClick={() => { selectionRevision.current++; setReplyTask(null); setSavedInput(null); setRecipient(''); storage.writeStorage(selectionKey, null) }}><X aria-hidden="true" />结束回复选择</Button> : null}</>} />
     </div>
     <aside className="hidden w-[22rem] shrink-0 overflow-y-auto border-s p-4 lg:block" aria-label="频道任务"><h3 className="mb-3 font-medium">频道任务</h3><div className="grid gap-3">{tasks.map((task) => <WorkspaceTaskLink key={task.task_id} task={task} />)}{!tasks.length ? <p className="text-sm text-secondary">发送第一条交代，创建频道任务。</p> : null}</div></aside>
@@ -152,6 +172,7 @@ function ScopedConversation({ target, conversationId, label, task, channelId, ex
   const routeActive = useRef(true)
   useEffect(() => { routeActive.current = true; return () => { routeActive.current = false } }, [])
   const [history, setHistory] = useState<WorkspaceHistory | null>(null)
+  const [historyError, setHistoryError] = useState<unknown>(null)
   const [query, setQuery] = useState('')
   const [error, setError] = useState<unknown>(null)
   const [files, setFiles] = useState<File[]>([])
@@ -170,8 +191,13 @@ function ScopedConversation({ target, conversationId, label, task, channelId, ex
   const refresh = async () => {
     const current = latest.current
     if (!channelId && !scopeTaskId) throw new Error('输入范围尚未确认。')
-    const result = await current.readWorkspaceHistory(filter)
-    if (current.isCurrent()) { setHistory(result); setError(null) }
+    try {
+      const result = await current.readWorkspaceHistory(filter)
+      if (current.isCurrent()) { setHistory(result); setHistoryError(null); setError(null) }
+    } catch (cause) {
+      if (current.isCurrent()) setHistoryError(cause)
+      throw cause
+    }
   }
   useEffect(() => {
     let active = true
@@ -204,15 +230,18 @@ function ScopedConversation({ target, conversationId, label, task, channelId, ex
   for (const item of pending) if (!postedIds.has(item.message_id)) entries.push({ key: item.message_id, conversationId: item.conversation_id, anchor: true, message: { message_id: item.message_id, event_hash: item.message_id, role: 'user', text: item.text, created_at_ms: item.created_at_ms, state: 'sending' } })
   for (const item of pending) entries.push({ key: `delivery:${item.message_id}`, node: <WorkspaceInputStatus pending={item} refresh={refresh} /> })
   const busy = task && ['running', 'update_pending'].includes(task.state)
-  return <section className="conversation-screen" aria-label={channelId ? '频道对话' : '任务对话'}>
-    <div className="mx-auto grid w-full max-w-(--page-width) shrink-0 gap-1 px-4 pt-3 text-sm text-secondary sm:px-6"><Input label={channelId ? '搜索当前频道已加载的记录' : '搜索当前任务已加载的记录'} type="search" value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder="输入关键词" /></div>
-    <Chat key={channelId ?? scopeTaskId} entries={entries} empty={<EmptyState icon={MessagesSquare} title={history ? '发送一条交代开始对话' : '正在读取任务历史'} />} />
-    <PromptInput value={text} onChange={setDraft} files={files} onFiles={setFiles} hint="" reason={workspace.readOnlyNotice || workspace.writeNotice} disabled={!workspace.canSaveMessages} label={`发给 ${label}`} sendLabel={busy ? '补充当前工作' : '发送'} target={<div className="grid w-full min-w-0 gap-2">
-      <span className="truncate" title={label}>{busy ? '补充给' : '发送给'} · {label}</span>
-      <div className="flex min-w-0 flex-wrap items-center gap-2">
+  const historySummary = history ? `已加载最近 ${history.events.length} 条${history.coverage.truncated ? '，更早的记录未加载' : ''}` : historyError ? '历史读取失败' : '正在读取历史'
+  const empty = !history || historyError && !history.events.length
+    ? <EmptyState className={styles.empty} icon={MessagesSquare} title={historyError ? '暂时无法读取对话记录' : `正在读取${channelId ? '频道' : '任务'}历史`} description={historyError ? '重新读取历史后再搜索；这不代表没有记录。' : ''} action={historyError ? <Button type="button" variant="secondary" onClick={() => void refresh().catch(setError)}>重新读取历史</Button> : undefined} />
+    : query.trim()
+      ? <EmptyState className={styles.empty} icon={MessagesSquare} title="没有符合关键词的记录" description={history.coverage.truncated ? '仅搜索最近已加载的记录，更早的记录尚未加载。' : '试试其他关键词，或清除搜索查看已加载的记录。'} action={<Button type="button" variant="secondary" onClick={() => setQuery('')}>清除搜索</Button>} />
+      : <EmptyState className={styles.empty} icon={MessagesSquare} title={!history.events.length && !history.coverage.truncated ? '发送一条交代开始对话' : '已加载范围内暂无可显示的对话'} description={history.coverage.truncated ? '更早的记录尚未加载，当前范围不代表完整历史。' : history.events.length ? '已读取的记录尚未包含消息或工作结果。' : ''} />
+  return <section className={`conversation-screen ${styles.conversation}`} data-composer-idle={!text && !files.length || undefined} aria-label={channelId ? '频道对话' : '任务对话'}>
+    <div className={`${styles.search} mx-auto grid w-full max-w-(--page-width) shrink-0 gap-1 px-4 pt-3 text-sm text-secondary sm:px-6`}><Input label={channelId ? '搜索当前频道已加载的记录' : '搜索当前任务已加载的记录'} type="search" value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder="输入关键词" /></div>
+    <div className={styles.history} data-conversation-history=""><Chat key={channelId ?? scopeTaskId} entries={entries} empty={empty} /></div>
+    <PromptInput value={text} onChange={setDraft} files={files} onFiles={setFiles} hint="" reason={workspace.readOnlyNotice || workspace.writeNotice} disabled={!workspace.canSaveMessages} label={`${busy ? '补充给' : '发给'} ${label}`} sendLabel={busy ? '补充当前工作' : '发送'} target={<div className={styles.targetControls}>
         {targetControl}
         <InputQueue target={target} channelId={channelId} />
-      </div>
     </div>} onStop={workspace.writable && task && !['completed', 'cancelled', 'deferred'].includes(task.state) ? () => { void (onStop ? onStop() : workspace.stopInputTarget({ target, expected_revision: task.revision })).catch(setError) } : undefined} onSubmit={() => {
       if (!text.trim() && !files.length) return
       const submittedDraft = draft
@@ -224,7 +253,7 @@ function ScopedConversation({ target, conversationId, label, task, channelId, ex
       void workspace.sendMessage(submitted, selectedFiles, undefined, { target, intent: promptIntent(submitted), conversation_id: conversationId, ...((expectedRevision ?? task?.revision) !== undefined ? { expected_revision: expectedRevision ?? task?.revision } : {}), onSaved: (input) => { if (!routeActive.current || !workspace.isCurrent()) return; onSaved?.(input); if (draftRef.current === submittedDraft && !channelId && (input.target.kind === 'task' || input.target.kind === 'channel_task') && input.target.task_id !== scopeTaskId) void navigate({ to: '/tasks/$taskId', params: { taskId: input.target.task_id } }) } }).then((saved) => {
         if (saved && latest.current.isCurrent()) { if (draftRef.current === submittedDraft) { setText((current) => { if (current !== submitted) return current; storage.writeStorage(draftKey, ''); return '' }); setFiles((current) => current === selectedFiles ? [] : current) } void refresh().catch(setError) }
       }).catch(setError).finally(() => { savingDrafts.current.delete(submittedDraft) })
-    }}><InlineError error={error} action={{ label: '重新读取', onClick: () => void refresh().catch(setError) }} /><p className="text-sm text-secondary">{history ? `已加载最近 ${history.events.length} 条${history.coverage.truncated ? '，更早的记录未加载' : ''}。` : '尚未读取历史。'}执行服务是否接收、输入归入哪个回合，请查看每条输入的状态。</p></PromptInput>
+    }}><InlineError error={error} action={{ label: '重新读取', onClick: () => void refresh().catch(setError) }} /><Details label={`${historySummary} · 接收说明`} className={styles.receiptHelp}><p>执行服务是否接收、输入归入哪个回合，请查看每条输入的状态。</p>{historyError && history ? <p>刷新历史失败，当前保留上次读取的记录。</p> : null}</Details></PromptInput>
   </section>
 }
 
@@ -253,7 +282,7 @@ export function WorkspaceInputStatus({ pending, refresh }: { pending: PendingMes
   </div>
 }
 
-function WorkspaceTaskContext({ task }: { task: WorkspaceTask }) {
+function WorkspaceTaskContext({ task, reading = false }: { task: WorkspaceTask; reading?: boolean }) {
   const workspace = useWorkspace()
   const [context, setContext] = useState<ScopeContext | null>(null)
   const [error, setError] = useState<unknown>(null)
@@ -267,7 +296,7 @@ function WorkspaceTaskContext({ task }: { task: WorkspaceTask }) {
     return () => { active = false }
   }, [task.task_id, task.revision, workspace.generation])
   const assignment = workspace.workspaceState?.assignments.find((item) => item.assignment_id === task.current_assignment)
-  return <div className="grid max-h-[40dvh] gap-3 overflow-y-auto rounded-panel bg-surface-muted/50 p-3 text-sm" aria-label="任务上下文和来源">
+  return <div className={`${reading ? styles.contextReading : ''} grid max-h-[40dvh] gap-3 overflow-y-auto rounded-panel bg-surface-muted/50 p-3 text-sm`} aria-label="任务上下文和来源">
     <div className="flex flex-wrap items-center gap-2"><BrainCircuit aria-hidden="true" className="size-4" /><h3 className="font-medium">本轮来源</h3><StatusPill>任务独立对话</StatusPill></div>
     <p className="whitespace-pre-wrap [overflow-wrap:anywhere]">原始交代 · {task.request}</p><p>期望结果 · {task.expected_result}</p>{assignment?.work_id ? <RoutedAction variant="secondary" size="sm" className="justify-self-start" to="/b/$botId/work/$workId" params={{ botId: task.owner_bot, workId: assignment.work_id }}>查看执行工作</RoutedAction> : null}
     <p>任务第 {task.revision} 版{assignment ? ` · 当前执行从第 ${assignment.started_revision} 版开始` : ' · 尚未读到执行尝试'}</p>
@@ -276,7 +305,7 @@ function WorkspaceTaskContext({ task }: { task: WorkspaceTask }) {
     <p className="text-secondary">任务历史和 Bot 的长期记忆分别保存。执行服务的会话缓存由执行设备管理。本轮采用的内容以来源记录为准，补充的接收与回合归属以输入状态为准。</p>
     <Button type="button" variant="ghost" size="sm" className="justify-self-start" onClick={() => { setError(null); void workspace.readScopeContext({ target }).then(setContext, setError) }}>重新读取上下文</Button>
     <InlineError error={error} />
-    {context?.available ? <ScopeContextDetails context={context.context} /> : <p className="text-secondary">{context ? context.reason || '这个任务尚无已编译的上下文。' : error ? '本次未读到任务上下文。' : '正在查询这个任务的上下文。'}</p>}
+    {context?.available ? <ScopeContextDetails context={context.context} /> : <><p className="text-secondary">{context ? context.reason === 'scope_has_not_run' ? '这个任务尚未运行；实际执行后才会提供本轮上下文。' : context.reason ? '暂时无法提供这个任务的上下文。可以重新读取。' : '这个任务尚无可用的上下文。' : error ? '本次未读到任务上下文。' : '正在查询这个任务的上下文。'}</p>{context?.reason ? <Details label="上下文状态详情"><p className="[overflow-wrap:anywhere]">状态标识 · {context.reason}</p></Details> : null}</>}
     <RoutedAction variant="ghost" size="sm" className="justify-self-start" to="/b/$botId" params={{ botId: task.owner_bot }}>打开 Bot 上下文</RoutedAction>
   </div>
 }

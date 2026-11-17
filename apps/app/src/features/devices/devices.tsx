@@ -73,16 +73,35 @@ function useEntryLabel() {
 
 export function DevicesPage({ joins = true }: { joins?: boolean }) {
   const device = useDevice()
+  const workspace = useWorkspace()
   const rows = useDeviceRows()
   const entryLabel = useEntryLabel()
   const connected = rows.find((row) => row.entry && row.kind === "node")
   const local = device.ready && isLoopback(entryAddress(device.ready.entry))
   const canEdit = device.ready?.principal.can_manage || device.ready?.principal.source === "local_session"
   const [error, setError] = useState<unknown>(null)
-  useEffect(() => { if (device.ready) device.refreshDirectory().catch(setError) }, [device.ready])
-  return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
+  const [directoryRead, setDirectoryRead] = useState<typeof device.ready>(null)
+  const [settingsRead, setSettingsRead] = useState<{ connection: typeof device.ready; deviceId: string } | null>(null)
+  const [shownConnection, setShownConnection] = useState<typeof device.ready>(null)
+  useEffect(() => {
+    if (!device.ready) return
+    let active = true
+    setError(null)
+    void device.refreshDirectory().catch((cause) => { if (active) setError(cause) }).finally(() => { if (active) setDirectoryRead(device.ready) })
+    return () => { active = false }
+  }, [device.ready])
+  // The signed directory arrives during authentication; an empty `nodes` list before the
+  // workspace's first read does not yet describe the computers available to this browser.
+  const readUnavailable = Boolean(workspace.error) || !workspace.connectionOnline
+  const nodesRead = workspace.nodesRead || readUnavailable
+  const initialRead = directoryRead === device.ready && nodesRead && (readUnavailable || !connected || !canEdit || settingsRead?.connection === device.ready && settingsRead.deviceId === connected.id)
+  const contentReady = Boolean(device.ready && (shownConnection === device.ready || initialRead))
+  useEffect(() => { if (initialRead) setShownConnection(device.ready) }, [device.ready, initialRead])
+  return <div className="mx-auto grid w-full max-w-(--page-width) gap-6" aria-busy={!contentReady}>
     {joins ? <JoinRequests /> : null}
     <InlineError error={error} action={{ label: "重试", onClick: () => { setError(null); device.refreshDirectory().catch(setError) } }} />
+    {!contentReady ? <p role="status" className="flex items-center gap-2 px-1 text-sm text-secondary"><BusyIcon busy />正在读取设备与 AI 服务…</p> : null}
+    <div hidden={!contentReady} className={contentReady ? "grid gap-6" : undefined}>
     {connected ? <section className="grid min-w-0 gap-6" aria-label="当前连接的电脑">
       <header className={deviceStyles.deviceTitle}>
         <terms.thisComputer.icon aria-hidden="true" className="size-6 text-secondary" />
@@ -93,7 +112,7 @@ export function DevicesPage({ joins = true }: { joins?: boolean }) {
         </div>
         <RoutedAction variant="ghost" to="/devices/$deviceId" params={{ deviceId: connected.id }} title="详细设置"><span className="max-sm:sr-only">详细设置</span><ChevronRight aria-hidden="true" /></RoutedAction>
       </header>
-      {canEdit ? <AiSettings key={connected.id} compact targetName={local ? undefined : connected.name} /> : <p className="px-1 text-sm text-secondary">{editOnManager(rows.filter((row) => row.admin).map((row) => row.name))}</p>}
+      {canEdit ? <AiSettings key={connected.id} compact targetName={local ? undefined : connected.name} onInitialRead={() => setSettingsRead({ connection: device.ready, deviceId: connected.id })} /> : <p className="px-1 text-sm text-secondary">{editOnManager(rows.filter((row) => row.admin).map((row) => row.name))}</p>}
     </section> : null}
     {!rows.length ? device.directory ? <EmptyState icon={terms.myDevices.icon} title="还没有设备" /> : <div className="grid gap-2" aria-busy="true"><Skeleton className="h-14" /><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
       : [{ title: "电脑", items: rows.filter((row) => row.kind === "node") }, { title: "手机与浏览器", items: rows.filter((row) => row.kind === "client") }].filter((group) => group.items.length).map((group) => <section key={group.title} className="grid gap-2">
@@ -118,6 +137,7 @@ export function DevicesPage({ joins = true }: { joins?: boolean }) {
     {device.ready && !device.ready.principal.can_manage && rows.length ? <p className="flex min-w-0 items-center gap-1.5 px-1 text-sm text-secondary">
       <terms.admin.icon aria-hidden="true" className="size-4 shrink-0" /><span className="min-w-0 truncate">{addOnManager(rows.filter((row) => row.admin).map((row) => row.name))}</span>
     </p> : null}
+    </div>
   </div>
 }
 

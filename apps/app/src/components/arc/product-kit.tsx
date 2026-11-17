@@ -69,7 +69,7 @@ export function SettingsDisclosure({ icon, label, value, open, children }: { ico
 export function Segmented<T extends string>({ label, value, options, onChange, disabled }: {
   label: string; value: T; options: Array<{ value: T; label: string; icon?: LucideIcon }>; onChange(value: T): void; disabled?: boolean; labels?: boolean; fill?: boolean
 }) {
-  return <div aria-disabled={disabled || undefined}><SegmentedControl label={label} value={value} options={options} onValueChange={next => { const option = options.find(option => option.value === next); if (!disabled && option) onChange(option.value) }} /></div>
+  return <div className={styles.segmented} aria-disabled={disabled || undefined}><SegmentedControl label={label} value={value} options={options} onValueChange={next => { const option = options.find(option => option.value === next); if (!disabled && option) onChange(option.value) }} /></div>
 }
 export function SegmentedValue<T extends string>({ value, options }: { value: T; options: Array<{ value: T; label: string }> }) { return <span className="sr-only">{options.find(option => option.value === value)?.label}</span> }
 export function Skeleton({ className }: { className?: string }) { return <ArcSkeleton label="正在读取" lines={1} className={className} /> }
@@ -147,7 +147,7 @@ export function Toaster() {
       const next = tops.length ? Math.max(0,window.innerHeight - Math.min(...tops)) : 0
       setSpace(next)
       const above = anchor ? next - (window.innerHeight - anchor.getBoundingClientRect().top) : 0
-      root.style.setProperty("--toast-cover",anchor && stack.current ? `${stack.current.offsetHeight + 12 + above}px` : "0px")
+      root.style.setProperty("--toast-cover",stack.current ? `${stack.current.offsetHeight + 12 + above}px` : "0px")
     }
     function measure() {
       const dialog = [...document.querySelectorAll<HTMLElement>("[role=dialog][data-state=open]")].at(-1)

@@ -180,7 +180,7 @@ type Failure = { at: ProviderId | "roots" | null; cause: unknown }
  * Codex executes tasks, each provider's program and variables, and the folders it may use. Every
  * change saves right away. Variable values are write-only; the device only says which are set.
  */
-export function AiSettings({ onboarding = false, compact = false, targetName, onBot }: { onboarding?: boolean; compact?: boolean; targetName?: string; onBot?(on: boolean): void }) {
+export function AiSettings({ onboarding = false, compact = false, targetName, onBot, onInitialRead }: { onboarding?: boolean; compact?: boolean; targetName?: string; onBot?(on: boolean): void; onInitialRead?(): void }) {
   const { ready } = useDevice()
   const workspace = useWorkspace()
   const [response, setResponse] = useState<NodeSettingsResponse | null>(null)
@@ -224,7 +224,14 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
     } catch { /* the shown error already says what failed */ }
     return false
   }
-  useEffect(() => { pendingFocus.current = null; setResponse(null); setLocalResult(""); setNeedsRead(false); void load(); return () => { sequence.current += 1 } }, [ready])
+  useEffect(() => {
+    let active = true
+    pendingFocus.current = null; setResponse(null); setLocalResult(""); setNeedsRead(false)
+    // Only the basic settings read gates the page. Errors must also reveal their retry action;
+    // provider discovery and checks continue independently after this read.
+    void load().finally(() => { if (active && ready?.isCurrent()) onInitialRead?.() })
+    return () => { active = false; sequence.current += 1 }
+  }, [ready])
   useEffect(() => {
     if (!ready || busy || needsRead || !response?.providers.some((item) => item.provider === "cursor") || automaticallyConnected.current === ready) return
     automaticallyConnected.current = ready
@@ -336,6 +343,7 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
       {(["bot", "execution"] as const).map((role) => { const { label, note, icon: RoleIcon } = roles[role]; return <li key={role} className="flex items-center gap-1.5 whitespace-nowrap">
         <RoleIcon aria-hidden="true" className="size-4 shrink-0" /><span className="font-medium text-foreground">{label}</span><span aria-hidden="true">·</span>{note}
       </li> })}
+      <li><a className="hit-area relative inline-flex items-center underline underline-offset-4" href={docs + "node.md#配置管理-agent"} target="_blank" rel="noopener noreferrer">Bot 和执行任务的用途说明</a></li>
     </ul>
     <ul className={cn("divide-y overflow-hidden rounded-panel border", !onboarding && "bg-surface ")}>
       {shown.map(card)}
@@ -429,6 +437,7 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
   const checkButton = <Button type="button" variant="ghost" size="sm" aria-label={compact ? `${name} 检查可用性` : undefined} disabled={busy !== ""} onClick={() => void probe()}>
     <BusyIcon busy={busy === `${item.provider}:probe`} icon={RotateCw} />{compact ? "检查" : "检查可用性"}
   </Button>
+  const compactNote = item.state === "starting" ? "等待当前任务结束或服务启动" : item.app_server?.mode === "system" ? "沿用已选的连接方式" : !item.roles.length ? "尚未启用用途" : null
 
   // `friendly`: a key the provider needs, named after its service in the default view; any other variable shows as it is named.
   const envRow = (row: (typeof env)[number], friendly: boolean) => {
@@ -472,14 +481,10 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
         {executable ? <RoleToggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ""}
           onClick={() => execution ? void change("execution", { execution: false }) : turnOn("execution")} /> : null}
       </div>
-    {compact ? <div className="flex basis-full items-center gap-3 ps-8"><div className="grid min-w-0 flex-1 gap-1">
-      <dl className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-secondary">
-        <div className="flex gap-1"><dt>程序</dt><dd>{!launches ? "外部服务" : item.installed ? "已找到" : "未找到"}</dd></div>
-        <div className="flex gap-1"><dt>认证</dt><dd>{missingKey ? "需填写密钥" : { authenticated: "已认证", not_required: "无需登录", sign_in_required: "需登录", unverified: "未验证" }[item.probe.authentication]}</dd></div>
-        <div className="flex gap-1"><dt>模型</dt><dd>{providerObservationStates[item.observed.model_known.status]}</dd></div>
-      </dl>
-      <p className="text-sm text-secondary">{item.state === "starting" ? "等待当前任务结束或服务启动" : item.app_server?.mode === "system" ? "沿用已选的连接方式" : !item.roles.length ? "尚未启用用途" : item.roles.map((role) => role === "agent" ? "运行 Bot" : "执行任务").join("、")}</p>
-    </div>{checkButton}</div> : null}
+    {compact ? <div className="flex basis-full items-center justify-end gap-3 ps-8">
+      {compactNote ? <p className="me-auto text-sm text-secondary">{compactNote}</p> : null}
+      {checkButton}
+    </div> : null}
     </div>
     {notFound ? <div className="grid gap-2 px-4 sm:ps-12 pb-2 text-sm">
       <span role="status" className="flex min-w-0 items-center gap-1.5 text-warning"><Unplug aria-hidden="true" className="size-4 shrink-0" />没找到这台电脑上的 Codex</span>
@@ -498,15 +503,24 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
         : <Button variant="ghost" type="button" className="hit-area relative underline underline-offset-4" onClick={() => openProvider(item.provider)}>去设置</Button>}
     </p> : null}
     <div className="grid gap-1 px-4 pb-3 empty:hidden sm:ps-12">
-      <p className="text-sm text-secondary">{authenticationSourceLabels[item.authentication_source]}</p>
-      {!compact && 'issue' in readiness ? <p role="status" className="text-sm text-secondary">{probeIssueText(item.provider, readiness.issue)}</p> : null}
-      {item.setup && (compact || item.provider === "cursor" ? item.probe.authentication === "sign_in_required" : (bot || execution) && ["needs_setup", "unverified"].includes(readiness.state)) ? <Details label="登录方式" open={!compact || undefined}>
+      {!compact ? <p className="text-sm text-secondary">{authenticationSourceLabels[item.authentication_source]}</p> : null}
+      {'issue' in readiness ? <p role="status" className="text-sm text-secondary">{probeIssueText(item.provider, readiness.issue)}</p> : null}
+      {item.setup && (compact || item.provider === "cursor" ? item.probe.authentication === "sign_in_required" : (bot || execution) && ["needs_setup", "unverified"].includes(readiness.state)) ? <Details label="登录方式" open={!compact || item.probe.authentication === "sign_in_required" || undefined}>
         <p>{item.provider === "cursor" ? "在运行 AI 的电脑上执行以下命令，登录 Cursor 订阅账户，再点“检查可用性”。" : "需要登录时，在运行 AI 的电脑上执行以下命令，再点“检查可用性”。已配置的环境认证仍优先。"}</p>
         {item.setup.directory ? <FolderPath path={item.setup.directory} shown={display[item.setup.directory]} /> : null}
         <div className="flex min-w-0 gap-2">
           <Input label={`${name} 登录命令`} readOnly aria-label={`${name} 登录命令`} className="min-w-0 font-mono" value={item.setup.command} onFocus={(event) => event.target.select()} />
           <Button type="button" variant="secondary" onClick={() => { if (item.setup) void clipboard.copy(item.setup.command) }}><Copy aria-hidden="true" />复制命令</Button>
         </div>
+      </Details> : null}
+      {compact ? <Details label="程序、认证与模型详情">
+        <dl className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-secondary">
+          <div className="flex gap-1"><dt>程序</dt><dd>{!launches ? "外部服务" : item.installed ? "已找到" : "未找到"}</dd></div>
+          <div className="flex gap-1"><dt>认证</dt><dd>{missingKey ? "需填写密钥" : { authenticated: "已认证", not_required: "无需登录", sign_in_required: "需登录", unverified: "未验证" }[item.probe.authentication]}</dd></div>
+          <div className="flex gap-1"><dt>模型</dt><dd>{providerObservationStates[item.observed.model_known.status]}</dd></div>
+        </dl>
+        <p>{authenticationSourceLabels[item.authentication_source]}</p>
+        {checkRecord}
       </Details> : null}
       {!compact ? <div className="flex flex-wrap items-center gap-2 text-sm text-secondary">{checkButton}</div> : null}
       {!compact ? checkRecord : null}
@@ -516,7 +530,6 @@ function ProviderCard({ item, response, onboarding, compact = false, busy, model
         <ChevronRight aria-hidden="true" className="size-4 transition-transform duration-200" />设置
       </summary>
       <div className="grid gap-4 px-4 sm:ps-12 pt-1 pb-4">
-        {compact ? checkRecord : null}
         <Details label="能力验证">
           <p>{item.provider === "cursor" ? "已找到程序，不代表订阅登录或模型已经验证。" : "程序和密钥已配置，不代表登录或模型已经验证。"}未验证时可以尝试运行。</p>
           {item.observed ? <ul className="grid gap-1">{Object.entries(item.observed).map(([key, observation]) => <li key={key}>{providerObservationLabels[key]} · {providerObservationStates[observation.status]}</li>)}</ul> : <p>验证记录未提供。</p>}
