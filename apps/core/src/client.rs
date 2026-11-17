@@ -1855,6 +1855,8 @@ fn bind_client_identity(command: &mut BusinessInput, subject: &str) -> Result<()
         command,
         Ok(BusinessCommand::Message(_)
             | BusinessCommand::Notifications(_)
+            | BusinessCommand::RegisterPush(_)
+            | BusinessCommand::UnregisterPush(_)
             | BusinessCommand::Ack(_)
             | BusinessCommand::WorkspaceCommandReceipt(_)
             | BusinessCommand::SignedReceipt(_)
@@ -5508,6 +5510,21 @@ mod tests {
             business_params(&input).value(),
             &json!({"client_id":"actual-client"})
         );
+        for method in ["register_push", "unregister_push"] {
+            let mut input = business_fixture(json!({"method":method}));
+            bind_client_identity(&mut input, "actual-client").unwrap();
+            assert_eq!(
+                business_params(&input).value()["client_id"],
+                "actual-client"
+            );
+            assert!(
+                bind_client_identity(
+                    &mut business_fixture(json!({"method":method,"client_id":"other"})),
+                    "actual-client",
+                )
+                .is_err()
+            );
+        }
         let original = json!({"method":"message","attestation":{"device_id":"actual-client"},"request":{"client_id":"business-data"}});
         let mut receipt =
             business_fixture(json!({"method":"input_receipt","original_input":original}));

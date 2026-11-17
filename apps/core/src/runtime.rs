@@ -42,6 +42,7 @@ mod permission_fences;
 pub mod pi;
 mod provider_adapter;
 mod provider_probe;
+mod push;
 mod relay;
 mod reply_directory;
 mod schedule_delivery;
@@ -1035,6 +1036,7 @@ impl Runtime {
                 }
             })?;
         }
+        self.start_push_worker()?;
         self.start_network().await?;
         tracing::info!(
             event = "node.started",
@@ -2063,6 +2065,8 @@ impl Runtime {
                 self.settle_unanswered(&access, input, true).await
             }
             Ok(BusinessCommand::Resolve(_)) => self.resolve_check(&access, input).await,
+            Ok(BusinessCommand::RegisterPush(_)) => self.register_push(&access, input).await,
+            Ok(BusinessCommand::UnregisterPush(_)) => self.unregister_push(&access, input).await,
             Ok(BusinessCommand::Notifications(_)) => {
                 let network = network.to_owned();
                 let client = field(input, "client_id")?.to_owned();

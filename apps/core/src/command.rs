@@ -280,6 +280,8 @@ business_commands! {
     DismissUnanswered("dismiss_unanswered") => (Ordered, AuthoritativeWriter, None);
     Resolve("resolve") => (Ordered, AuthoritativeWriter, None);
     Notifications("notifications") => (Read, CommittedDisplay, None);
+    RegisterPush("register_push") => (Ordered, AuthoritativeWriter, None);
+    UnregisterPush("unregister_push") => (Ordered, AuthoritativeWriter, None);
     DismissWork("dismiss_work") => (Ordered, AuthoritativeWriter, None);
     Ack("ack") => (Ordered, AuthoritativeWriter, None);
 }
