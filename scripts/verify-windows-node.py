@@ -25,7 +25,6 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
