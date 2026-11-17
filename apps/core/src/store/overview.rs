@@ -49,6 +49,12 @@ const SCOPES: &str = "WITH scopes AS (
     LEFT JOIN bot_profiles n ON n.network_id=b.network_id AND n.conversation_id=b.conversation_id AND n.field='name'
     WHERE c.network_id=?1 AND c.title IS NOT NULL AND (?2 IS NULL OR c.conversation_id=?2)
         AND NOT EXISTS(SELECT 1 FROM bot_deletions d WHERE d.network_id=c.network_id AND d.conversation_id=c.conversation_id)
+), newest_ended AS MATERIALIZED (
+    SELECT e.conversation_id,max(e.dispatch_rank) AS newest
+    FROM scopes s JOIN works e ON e.network_id=?1 AND e.conversation_id=s.conversation_id
+    WHERE e.dispatch IS NOT NULL AND e.finish IS NOT NULL
+        AND json_extract(e.finish,'$.outcome')<>'unverified'
+    GROUP BY e.conversation_id
 )";
 
 // Historical payloads are examined inside SQLite; Rust only decodes the selected summaries.
@@ -56,10 +62,7 @@ const SCOPES: &str = "WITH scopes AS (
 // work foreign keys. It must not be approximated by an unrelated later assistant message.
 const OPEN_WORK: &str = "(w.finish IS NULL OR json_extract(w.finish,'$.outcome')='unverified'
     OR json_extract(w.finish,'$.outcome') IN ('failed','rejected')
-    AND w.dispatch_rank=(SELECT max(e.dispatch_rank) FROM works e
-        WHERE e.network_id=w.network_id AND e.conversation_id=w.conversation_id
-            AND e.dispatch IS NOT NULL AND e.finish IS NOT NULL
-            AND json_extract(e.finish,'$.outcome')<>'unverified')
+    AND w.dispatch_rank=ended.newest
     AND NOT EXISTS(SELECT 1 FROM notification_acks a WHERE a.network_id=w.network_id
         AND a.notification_id=w.work_id AND a.client_id='inbox')
     AND NOT EXISTS(SELECT 1 FROM messages r JOIN messages u ON u.network_id=r.network_id
@@ -144,6 +147,7 @@ impl Reader<'_> {
         let mut statement = self.store.connection.prepare(&format!(
             "{SCOPES} SELECT w.work_id,w.conversation_id,s.owner_epoch FROM works w
              JOIN scopes s ON s.conversation_id=w.conversation_id
+             LEFT JOIN newest_ended ended ON ended.conversation_id=w.conversation_id
              WHERE w.network_id=?1 AND w.dispatch IS NOT NULL AND {OPEN_WORK}
                 AND json_extract(w.finish,'$.outcome') IN ('failed','rejected')"
         ))?;
@@ -240,8 +244,13 @@ impl Store {
         } else {
             format!("{OPEN_WORK} AND w.work_id NOT IN (SELECT value FROM json_each(?3))")
         };
+        let ended_join = if query.include_finished {
+            ""
+        } else {
+            "LEFT JOIN newest_ended ended ON ended.conversation_id=w.conversation_id"
+        };
         let work_from = format!(
-            "FROM works w JOIN scopes s ON s.conversation_id=w.conversation_id
+            "FROM works w JOIN scopes s ON s.conversation_id=w.conversation_id {ended_join}
             WHERE w.network_id=?1 AND w.dispatch IS NOT NULL AND {work_filter}"
         );
         let mut tasks = reader.collection(
@@ -272,8 +281,11 @@ impl Store {
         } else {
             "open"
         };
-        let dispatches =
+        let mut dispatches =
             reader.collection(DISPATCH_SUMMARY, &dispatch_from, "d.work_id", dispatch_mode)?;
+        for value in &mut dispatches.rows {
+            finish_dispatch_summary(value)?;
+        }
         tasks.total += dispatches.total;
         let remaining = query.limit.saturating_sub(tasks.rows.len());
         for value in dispatches.rows.iter().take(remaining) {
@@ -289,7 +301,7 @@ impl Store {
             }
             task["unknown_reason"] = match task["state"].as_str() {
                 Some("accepted_waiting_sync") => json!("accepted_waiting_sync"),
-                Some("unverified") => json!("dispatch_unverified"),
+                Some("dispatch_unverified") => json!("dispatch_unverified"),
                 _ => Value::Null,
             };
             if value["reason"].is_string() {
@@ -507,9 +519,27 @@ fn finish_work_summary(value: &mut Value) -> Result<()> {
     Ok(())
 }
 
+fn finish_dispatch_summary(value: &mut Value) -> Result<()> {
+    use crate::work::DispatchState;
+    let state = match value["state"].as_str().context("missing dispatch state")? {
+        "pending" => DispatchState::Pending,
+        "accepted" => DispatchState::Accepted,
+        "rejected" => DispatchState::Rejected {
+            reason: value["reason"].as_str().unwrap_or_default().into(),
+            failure: serde_json::from_value(value["failure"].clone())?,
+        },
+        "unverified" => DispatchState::Unverified {
+            reason: value["reason"].as_str().unwrap_or_default().into(),
+        },
+        other => bail!("unknown dispatch state {other}"),
+    };
+    value["state"] = json!(state.name());
+    Ok(())
+}
+
 const DISPATCH_SUMMARY: &str = "json_object('work_id',d.work_id,'conversation_id',json_extract(d.spec,'$.conversation'),
     'trigger',json_extract(d.spec,'$.trigger'),'target_node',json_extract(d.spec,'$.target'),
-    'state',CASE WHEN d.state='accepted' THEN 'dispatch_accepted' ELSE d.state END,
+    'state',d.state,
     'kind',json_extract(d.spec,'$.kind'),'title',json_extract(d.spec,'$.title'),'cwd',json_extract(d.spec,'$.cwd'),
     'dispatcher',json_extract(d.spec,'$.dispatcher'),'parent',json_extract(d.spec,'$.parent'),
     'continues',json_extract(d.spec,'$.continues'),'thread',json_extract(d.spec,'$.thread'),

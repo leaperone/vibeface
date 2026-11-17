@@ -274,6 +274,9 @@ mod tests {
             )?)
         }
         fn append(&mut self, body: EventBody) -> Result<String> {
+            self.append_dependent(body, vec![])
+        }
+        fn append_dependent(&mut self, body: EventBody, deps: Vec<String>) -> Result<String> {
             let clock = serde_json::to_string(&self.clock()?)?;
             self.sequence += 1;
             let event = Event {
@@ -282,17 +285,24 @@ mod tests {
                 author: self.author.clone(),
                 seq: self.sequence,
                 prev: self.previous.clone(),
-                deps: vec![],
-                scope_id: "scope".into(),
+                deps: deps
+                    .into_iter()
+                    .filter(|hash| Some(hash) != self.previous.as_ref())
+                    .collect(),
+                scope_id: if matches!(&body, EventBody::WorkspaceCommanded { .. }) {
+                    WORKSPACE_SCOPE.into()
+                } else {
+                    "scope".into()
+                },
                 created_at_ms: self.sequence as i64,
                 body,
                 blobs: vec![],
             };
             let envelope = self.identity.sign_event(event.clone())?;
             self.db.execute("INSERT INTO events(network_id,author,seq,hash,scope_id,lamport,created_at_ms,seen_at_ms,envelope,main,effective,kind,causal_chain,causal_clock)
-                VALUES(?1,?2,?3,?4,'scope',?3,?3,?3,?5,1,1,?6,?2,?7)",
+                VALUES(?1,?2,?3,?4,?8,?3,?3,?3,?5,1,1,?6,?2,?7)",
                 params![self.network,self.author,self.sequence,envelope.hash,serde_json::to_string(&envelope)?,
-                    if matches!(event.body,EventBody::InputPosted {..}) {"input_posted"} else {"workspace_commanded"},clock])?;
+                    match &event.body {EventBody::InputPosted {..}=>"input_posted",EventBody::MessagePosted {..}=>"message_posted",_=>"workspace_commanded"},clock,event.scope_id])?;
             self.previous = Some(envelope.hash.clone());
             Ok(envelope.hash)
         }
@@ -352,6 +362,43 @@ mod tests {
                 serde_json::to_value(full.tasks.get(task))?,
                 serde_json::to_value(bounded.tasks.get(task))?
             );
+            if let Some(task) = full.tasks.get(task) {
+                if let Some(id) = &task.current_assignment {
+                    assert_eq!(
+                        serde_json::to_value(bounded.assignments.get(id))?,
+                        serde_json::to_value(full.assignments.get(id))?,
+                        "current assignment must be present"
+                    );
+                }
+                if let Some(id) = &task.channel_id {
+                    assert_eq!(
+                        serde_json::to_value(bounded.channels.get(id))?,
+                        serde_json::to_value(full.channels.get(id))?,
+                        "current channel must be present"
+                    );
+                }
+                for id in &task.dependencies {
+                    assert_eq!(
+                        serde_json::to_value(bounded.tasks.get(id))?,
+                        serde_json::to_value(full.tasks.get(id))?,
+                        "dependency must be present"
+                    );
+                }
+            }
+            for (id, actual) in &bounded.inputs {
+                assert_eq!(
+                    serde_json::to_value(actual)?,
+                    serde_json::to_value(full.inputs.get(id).context("extra input")?)?
+                );
+            }
+            assert_eq!(
+                bounded.queue_order,
+                full.queue_order
+                    .iter()
+                    .filter(|id| bounded.inputs.contains_key(*id))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
             for (id, actual) in &bounded.assignments {
                 assert_eq!(
                     serde_json::to_value(actual)?,
@@ -403,7 +450,7 @@ mod tests {
             expected_revision: Some(1),
             text: "input".into(),
             attachments: vec![],
-            report_results: None,
+            report_results: Some(true),
             attestation: None,
         })?;
         history.command(
@@ -448,6 +495,214 @@ mod tests {
             before,
             "disjoint historical events must not be decoded as domain payloads"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn historical_closure_preserves_family_automatic_and_member_reply_budgets() -> Result<()> {
+        let mut history = History::new()?;
+        history.create("root", None, vec![])?;
+        for index in 0..MAX_AUTOMATIC_ASSIGNMENTS {
+            let id = format!("child-{index}");
+            history.create(&id, Some("root"), vec![])?;
+            history.assign(
+                &format!("execution-{index}"),
+                &id,
+                &format!("/root/{index}"),
+            )?;
+        }
+        history.create("wanted", Some("root"), vec![])?;
+        history.assign("over-budget", "wanted", "/wanted")?;
+        let full = graph_at(&history.db, &history.network, Some(&history.clock()?))?;
+        assert!(
+            full.commands["assign-over-budget"]
+                .error
+                .as_ref()
+                .is_some_and(|error| error.contains("automatic dispatch budget"))
+        );
+        assert_eq!(
+            full.tasks["wanted"].waiting_reason.as_deref(),
+            Some("dispatch_budget")
+        );
+        history.compare("wanted")?;
+        for index in 0..=MAX_MEMBER_REPLIES {
+            let id = format!("reply-{index}");
+            history.command(
+                &format!("create-{id}"),
+                WorkspaceCommand::CreateTask {
+                    task_id: id.clone(),
+                    channel_id: None,
+                    parent_task_id: Some("root".into()),
+                    owner_bot: "bot".into(),
+                    title: id,
+                    request: "reply request".into(),
+                    expected_result: "reply result".into(),
+                    source_events: vec![],
+                    dependencies: vec![],
+                    reply_only: true,
+                },
+            )?;
+        }
+        let full = graph_at(&history.db, &history.network, Some(&history.clock()?))?;
+        assert_eq!(full.tasks["root"].dependencies, vec!["reply-0", "reply-1"]);
+        assert!(
+            full.commands["create-reply-2"]
+                .error
+                .as_ref()
+                .is_some_and(|error| error.contains("member reply budget"))
+        );
+        history.compare("root")?;
+        Ok(())
+    }
+
+    #[test]
+    fn historical_closure_preserves_stopped_release_move_and_channel_epochs() -> Result<()> {
+        use crate::scheduling::TurnExecution;
+        use vibeface_bridge::failure::FailureKind;
+        let mut history = History::new()?;
+        history.command(
+            "channel",
+            WorkspaceCommand::CreateChannel {
+                channel_id: "channel".into(),
+                title: "Channel".into(),
+                purpose: "Purpose".into(),
+                members: vec!["bot".into()],
+                coordinator_bot: "bot".into(),
+                coordinator_node: history.author.clone(),
+            },
+        )?;
+        history.command(
+            "wanted",
+            WorkspaceCommand::CreateTask {
+                task_id: "wanted".into(),
+                channel_id: Some("channel".into()),
+                parent_task_id: None,
+                owner_bot: "bot".into(),
+                title: "Wanted".into(),
+                request: "request".into(),
+                expected_result: "result".into(),
+                source_events: vec![],
+                dependencies: vec![],
+                reply_only: false,
+            },
+        )?;
+        let mut input_hash = String::new();
+        for id in ["before", "input"] {
+            let hash = history.append(EventBody::InputPosted {
+                message_id: id.into(),
+                target: InputTarget::Task {
+                    task_id: "wanted".into(),
+                },
+                intent: InputIntent::Defer,
+                sequence: 1,
+                expected_revision: Some(1),
+                text: id.into(),
+                attachments: vec![],
+                report_results: Some(true),
+                attestation: None,
+            })?;
+            if id == "input" {
+                input_hash = hash;
+            }
+        }
+        history.append(EventBody::WorkspaceCommanded {
+            command_id: "assign".into(),
+            command: WorkspaceCommand::AssignTask {
+                task_id: "wanted".into(),
+                expected_revision: 1,
+                assignment_id: "assignment".into(),
+                bot_id: "bot".into(),
+                execution_node: history.author.clone(),
+                bot_owner_epoch: 1,
+                channel_owner_epoch: Some(1),
+                work_id: None,
+                resource_roots: vec!["/project".into()],
+                automatic: false,
+            },
+            acting_assignment: None,
+            attestation: None,
+            cause: Some(Cause {
+                conversation_id: "scope".into(),
+                message_id: "input".into(),
+            }),
+        })?;
+        let evidence = history.append(EventBody::MessagePosted {
+            message_id: "failed-reply".into(),
+            role: Role::Assistant,
+            text: "not started".into(),
+            attachments: vec![],
+            report_results: None,
+            in_reply_to: Some("input".into()),
+            status: Some(ReplyStatus::Failed),
+            failure: Some(FailureKind::MissingBinary),
+            answers: None,
+            attestation: None,
+        })?;
+        let stopped = history.command(
+            "stopped",
+            WorkspaceCommand::AssignmentProgress {
+                assignment_id: "assignment".into(),
+                revision: 1,
+                state: AssignmentState::Stopped,
+                result: None,
+                evidence_event: Some(evidence.clone()),
+                execution: Some(TurnExecution::NotStarted),
+                input_event: None,
+            },
+        )?;
+        history.compare("wanted")?;
+        let released = history.append_dependent(
+            EventBody::WorkspaceCommanded {
+                command_id: "release".into(),
+                command: WorkspaceCommand::ControlInput {
+                    message_id: "input".into(),
+                    expected_event: input_hash,
+                    action: InputControl::Release,
+                },
+                acting_assignment: None,
+                attestation: None,
+                cause: None,
+            },
+            vec![stopped, evidence],
+        )?;
+        history.command(
+            "move",
+            WorkspaceCommand::ControlInput {
+                message_id: "input".into(),
+                expected_event: released,
+                action: InputControl::Move {
+                    before_message_id: Some("before".into()),
+                },
+            },
+        )?;
+        let full = graph_at(&history.db, &history.network, Some(&history.clock()?))?;
+        assert_eq!(
+            full.assignments["assignment"].state,
+            AssignmentState::Proposed
+        );
+        assert!(!full.inputs["input"].deferred);
+        assert_eq!(full.queue_order, vec!["input", "before"]);
+        assert!(full.commands["release"].error.is_none());
+        assert!(full.commands["move"].error.is_none());
+        history.compare("wanted")?;
+        let coordinator = LocalIdentity::generate().device_id()?;
+        history.command(
+            "channel-new-epoch",
+            WorkspaceCommand::ConfigureChannel {
+                channel_id: "channel".into(),
+                expected_revision: 1,
+                title: "Moved".into(),
+                purpose: "Purpose".into(),
+                members: vec!["bot".into()],
+                coordinator_bot: "bot".into(),
+                coordinator_node: coordinator,
+                owner_epoch: 2,
+            },
+        )?;
+        let full = graph_at(&history.db, &history.network, Some(&history.clock()?))?;
+        assert_eq!(full.channels["channel"].owner_epoch, 2);
+        assert_eq!(full.assignments["assignment"].channel_owner_epoch, Some(1));
+        history.compare("wanted")?;
         Ok(())
     }
 }
