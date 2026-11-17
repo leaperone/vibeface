@@ -130,7 +130,7 @@ impl Authority {
                 .context("this device is not a member of the personal network")?;
             ensure!(
                 *self.local_changes.borrow() == local.generation
-                    && local.session.expires_at_ms() > crate::runtime::now_ms()
+                    && local.session.expires_at_ms() > crate::clock::now_ms()
                     && local.session.device_id == session.device_id
                     && local.session.network_id == view.network_id,
                 "local browser access was revoked"

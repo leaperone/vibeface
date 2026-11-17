@@ -513,7 +513,7 @@ pub fn write(record: &Record) {
 /// Writes every repeat count still held; the Node calls this as it stops, so none is lost.
 pub fn flush() {
     if let Some(sink) = SINK.get() {
-        sink.settle(crate::runtime::now_ms(), true);
+        sink.settle(crate::clock::now_ms(), true);
     }
 }
 
@@ -549,7 +549,7 @@ pub fn init(data_dir: Option<&Path>, quiet_libraries: bool) {
             .spawn(move || {
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(5));
-                    sink.settle(crate::runtime::now_ms(), false);
+                    sink.settle(crate::clock::now_ms(), false);
                 }
             });
     }
@@ -711,7 +711,7 @@ where
             tracing::Level::TRACE => Level::Trace,
         };
         self.sink.write(&Record {
-            ts_ms: crate::runtime::now_ms(),
+            ts_ms: crate::clock::now_ms(),
             level,
             source: tags.source.unwrap_or(Source::Node),
             event: tags.event.unwrap_or_else(|| metadata.target().to_owned()),

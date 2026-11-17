@@ -471,7 +471,7 @@ impl ServiceStore {
         bodies.extend(
             query
                 .query_map(
-                    params![network, crate::runtime::now_ms().saturating_sub(60_000)],
+                    params![network, crate::clock::now_ms().saturating_sub(60_000)],
                     |row| row.get::<_, String>(0),
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?,
@@ -1132,7 +1132,7 @@ impl ServiceStore {
         );
         self.db.execute(
             "UPDATE transactions SET phase=?2,block_number=?3,block_hash=?4,error=?5,checked_at=?6 WHERE id=?1",
-            params![id, phase, block_number, block_hash, error,crate::runtime::now_ms()],
+            params![id, phase, block_number, block_hash, error,crate::clock::now_ms()],
         )?;
         Ok(())
     }
@@ -1162,7 +1162,7 @@ impl ServiceStore {
         }
     }
     pub fn next_transaction_for_reconcile(&self) -> Result<Option<SignedTransaction>> {
-        let id:Option<String>=self.db.query_row("SELECT id FROM transactions WHERE id NOT LIKE 'budget-%/reveal-%' AND phase NOT IN ('failed','reverted','conflicted') AND (phase!='confirmed' OR checked_at<?1) ORDER BY phase='confirmed',checked_at,nonce LIMIT 1",[crate::runtime::now_ms().saturating_sub(60_000)],|r|r.get(0)).optional()?;
+        let id:Option<String>=self.db.query_row("SELECT id FROM transactions WHERE id NOT LIKE 'budget-%/reveal-%' AND phase NOT IN ('failed','reverted','conflicted') AND (phase!='confirmed' OR checked_at<?1) ORDER BY phase='confirmed',checked_at,nonce LIMIT 1",[crate::clock::now_ms().saturating_sub(60_000)],|r|r.get(0)).optional()?;
         id.map(|id| self.transaction(&id)).transpose()
     }
     pub(super) fn next_nonce_is_contiguous(

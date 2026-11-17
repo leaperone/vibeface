@@ -1001,7 +1001,7 @@ impl Delivery {
                     .and_then(|tx| tx.tx_hash.clone())
                     .or_else(|| pending.view.payment.tx_hash.clone());
                 pending.view.error = None;
-                pending.view.updated_at_ms = crate::runtime::now_ms();
+                pending.view.updated_at_ms = crate::clock::now_ms();
             }
             chain.verify_position(&position).await?;
             self.with_store(|store| store.save_authorized_batch(&batch))?;
@@ -1211,8 +1211,8 @@ pub(super) fn view(
                 decryption_proven: false,
             })
             .collect(),
-        created_at_ms: crate::runtime::now_ms(),
-        updated_at_ms: crate::runtime::now_ms(),
+        created_at_ms: crate::clock::now_ms(),
+        updated_at_ms: crate::clock::now_ms(),
         error: None,
     })
 }

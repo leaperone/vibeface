@@ -801,7 +801,7 @@ impl Delivery {
             .iter()
             .filter(|order| {
                 order.historical()
-                    && crate::runtime::now_ms().saturating_sub(order.chain_observed_at_ms) >= 60_000
+                    && crate::clock::now_ms().saturating_sub(order.chain_observed_at_ms) >= 60_000
             })
             .min_by_key(|order| order.chain_observed_at_ms)
             .cloned()
@@ -820,7 +820,7 @@ impl Delivery {
             .filter(|order| {
                 !order.accepted
                     && now() > order.order.unsigned.terms.retain_until
-                    && crate::runtime::now_ms().saturating_sub(order.chain_observed_at_ms) >= 60_000
+                    && crate::clock::now_ms().saturating_sub(order.chain_observed_at_ms) >= 60_000
             })
             .min_by_key(|order| order.chain_observed_at_ms)
         {
@@ -833,11 +833,11 @@ impl Delivery {
             {
                 Ok(true) => self.with_store(|store| store.reclaim_unfunded_quote(&order))?,
                 Ok(false) => {
-                    order.chain_observed_at_ms = crate::runtime::now_ms();
+                    order.chain_observed_at_ms = crate::clock::now_ms();
                     self.save(&mut order)?;
                 }
                 Err(error) => {
-                    order.chain_observed_at_ms = crate::runtime::now_ms();
+                    order.chain_observed_at_ms = crate::clock::now_ms();
                     order.view.error = Some(format!(
                         "expired quotation funding remains unknown: {error}"
                     ));
@@ -871,7 +871,7 @@ impl Delivery {
             refunded: budget.refunded,
             publication,
         });
-        stored.chain_observed_at_ms = crate::runtime::now_ms();
+        stored.chain_observed_at_ms = crate::clock::now_ms();
         stored.settlement_complete = budget::order_is_settled(&state, &stored.order)?
             && stored
                 .view

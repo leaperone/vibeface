@@ -4,6 +4,7 @@
 //! Sync only stores events. It never creates scheduler jobs or work, so pulling history again
 //! after a restart or from another Node replays no side effect.
 use super::*;
+use crate::clock::now_ms;
 use crate::net::{self, AddressRecord, Net, SignedAddress, relay::RelayGrant};
 use crate::store::admission::{
     AdmissionRejected, PeerAdmission, PeerAdmissionState, PeerCommand, PeerEnvelope,
@@ -7082,7 +7083,7 @@ mod tests {
                 network_id: network.clone(),
                 invite_hash: invite_hash(&secret),
                 issuer: manager.clone(),
-                expires_at_ms: crate::runtime::now_ms() + 60_000,
+                expires_at_ms: crate::clock::now_ms() + 60_000,
                 signature: String::new(),
             };
             record.signature = admin.sign_payload(INVITE_DOMAIN, &record.signing_payload()?)?;

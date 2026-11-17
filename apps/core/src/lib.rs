@@ -5,6 +5,7 @@ pub mod api;
 #[cfg(test)]
 mod cli_round_trip;
 pub mod client;
+pub mod clock;
 mod command;
 pub mod config;
 mod config_edit;

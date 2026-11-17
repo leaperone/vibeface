@@ -120,7 +120,7 @@ async fn mesh_control(data_dir: &Path, operation: Value) -> Result<Value> {
         .context("initialized data directory is required; run vibeface init first")?;
     let config = Config::load(&data_dir)?.network.mesh;
     let entries = || mesh::table::read(&data_dir.join("mesh.sqlite3"), &config.network);
-    let now = crate::runtime::now_ms() as u64;
+    let now = crate::clock::now_ms_u64();
     match operation["op"].as_str() {
         Some("status") => {
             let own = config::identity(&data_dir)?.device_id()?;
