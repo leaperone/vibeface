@@ -45,16 +45,48 @@ pub struct ServiceStore {
     max_orders: u32,
     admissions: (std::time::Instant, u32),
 }
-type TxRow = (
-    String,
-    u64,
-    Option<String>,
-    Option<String>,
-    String,
-    Option<u64>,
-    Option<String>,
-    Option<String>,
-);
+struct DbTransactionRow {
+    intent: String,
+    nonce: u64,
+    raw: Option<String>,
+    hash: Option<String>,
+    phase: String,
+    block_number: Option<u64>,
+    block_hash: Option<String>,
+    error: Option<String>,
+}
+
+impl DbTransactionRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            intent: row.get("intent")?,
+            nonce: row.get("nonce")?,
+            raw: row.get("raw")?,
+            hash: row.get("hash")?,
+            phase: row.get("phase")?,
+            block_number: row.get("block_number")?,
+            block_hash: row.get("block_hash")?,
+            error: row.get("error")?,
+        })
+    }
+}
+
+impl TryFrom<DbTransactionRow> for SignedTransaction {
+    type Error = anyhow::Error;
+
+    fn try_from(row: DbTransactionRow) -> Result<Self> {
+        Ok(Self {
+            intent: serde_json::from_str(&row.intent)?,
+            nonce: row.nonce,
+            raw_tx: row.raw,
+            tx_hash: row.hash,
+            phase: row.phase,
+            block_number: row.block_number,
+            block_hash: row.block_hash,
+            error: row.error,
+        })
+    }
+}
 
 fn private_directory(path: &Path) -> Result<()> {
     if let Ok(metadata) = std::fs::symlink_metadata(path) {
@@ -958,20 +990,19 @@ impl ServiceStore {
         } else {
             self.capacity / 4
         };
-        let prior:Option<TxRow>=tx.query_row("SELECT intent,nonce,raw,hash,phase,block_number,block_hash,error FROM transactions WHERE id=?1",[&intent.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional()?;
+        let prior = tx.query_row(
+            "SELECT intent,nonce,raw,hash,phase,block_number,block_hash,error FROM transactions WHERE id=?1",
+            [&intent.id],
+            DbTransactionRow::from_row,
+        ).optional()?;
         let hole: Option<String> = tx.query_row("SELECT id FROM transactions WHERE chain=?1 AND wallet=?2 AND raw IS NULL ORDER BY nonce LIMIT 1",params![intent.chain_id,intent.wallet],|row|row.get(0)).optional()?;
-        if let Some((old, nonce, raw_tx, tx_hash, phase, block_number, block_hash, error)) = prior {
-            ensure!(old == encoded, "transaction intent changed across retry");
-            let mut transaction = SignedTransaction {
-                intent: intent.clone(),
-                nonce,
-                raw_tx,
-                tx_hash,
-                phase,
-                block_number,
-                block_hash,
-                error,
-            };
+        if let Some(row) = prior {
+            ensure!(
+                row.intent == encoded,
+                "transaction intent changed across retry"
+            );
+            let mut transaction = SignedTransaction::try_from(row)?;
+            let nonce = transaction.nonce;
             if transaction.raw_tx.is_none() {
                 ensure!(
                     hole.as_deref() == Some(intent.id.as_str()),
@@ -1137,18 +1168,14 @@ impl ServiceStore {
         Ok(())
     }
     pub fn transaction(&self, id: &str) -> Result<SignedTransaction> {
-        let (encoded,nonce,raw_tx,tx_hash,phase,block_number,block_hash,error):TxRow=self.db.query_row("SELECT intent,nonce,raw,hash,phase,block_number,block_hash,error FROM transactions WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)))?;
-        Ok(SignedTransaction {
-            intent: serde_json::from_str(&encoded)?,
-            nonce,
-            raw_tx,
-            tx_hash,
-            phase,
-            block_number,
-            block_hash,
-            error,
-        })
+        let row = self.db.query_row(
+            "SELECT intent,nonce,raw,hash,phase,block_number,block_hash,error FROM transactions WHERE id=?1",
+            [id],
+            DbTransactionRow::from_row,
+        )?;
+        SignedTransaction::try_from(row)
     }
+
     pub fn find_transaction(&self, id: &str) -> Result<Option<SignedTransaction>> {
         let exists: bool = self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM transactions WHERE id=?1)",
@@ -1525,6 +1552,95 @@ pub(super) mod tests {
         crate::config::private_dir(&dir).unwrap();
         (ServiceStore::open(&dir, 200_000, 4).unwrap(), dir)
     }
+    #[test]
+    fn transaction_phases_reopen_and_decode_reordered_columns() -> Result<()> {
+        let (mut store, dir) = store();
+        let intent =
+            super::super::chain::tests::approval_intent(alloy_primitives::Address::from([7; 20]))?;
+        let reserved = SignedTransaction {
+            intent: intent.clone(),
+            nonce: 7,
+            raw_tx: None,
+            tx_hash: None,
+            phase: "reserved".into(),
+            block_number: None,
+            block_hash: None,
+            error: None,
+        };
+        assert_eq!(store.reserve_transaction(&intent, 7)?, reserved);
+        drop(store);
+        let mut store = ServiceStore::open(&dir, 200_000, 4)?;
+        assert_eq!(store.transaction(&intent.id)?, reserved);
+        assert_eq!(store.reserve_transaction(&intent, 99)?, reserved);
+        let raw = "0x0201";
+        let hash = format!("0x{}", "aa".repeat(32));
+        store.sign_transaction(&intent.id, raw, &hash)?;
+        for (phase, block_number, block_hash, error) in [
+            ("signed", None, None, None),
+            ("submitted", None, None, None),
+            ("included", Some(31), Some("included-block"), None),
+            ("confirming", Some(31), Some("included-block"), None),
+            ("confirmed", Some(31), Some("included-block"), None),
+            ("reorged", None, None, Some("block replaced")),
+            (
+                "reverted",
+                Some(32),
+                Some("reverted-block"),
+                Some("reverted"),
+            ),
+            ("unknown", None, None, Some("broadcast unknown")),
+            ("failed", None, None, Some("failed")),
+            ("conflicted", None, None, Some("nonce advanced")),
+        ] {
+            store.observe_transaction(&intent.id, phase, block_number, block_hash, error)?;
+            let expected = SignedTransaction {
+                intent: intent.clone(),
+                nonce: 7,
+                raw_tx: Some(raw.into()),
+                tx_hash: Some(hash.clone()),
+                phase: phase.into(),
+                block_number,
+                block_hash: block_hash.map(str::to_owned),
+                error: error.map(str::to_owned),
+            };
+            assert_eq!(store.transaction(&intent.id)?, expected);
+            let row = store.db.query_row("SELECT error,block_hash,block_number,phase,hash,raw,nonce,intent FROM transactions WHERE id=?", [&intent.id], DbTransactionRow::from_row)?;
+            assert_eq!(SignedTransaction::try_from(row)?, expected);
+            drop(store);
+            store = ServiceStore::open(&dir, 200_000, 4)?;
+            assert_eq!(store.transaction(&intent.id)?, expected);
+            assert_eq!(store.reserve_transaction(&intent, 99)?, expected);
+        }
+        drop(store);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_codec_keeps_invalid_json_and_invalid_observation_rejections() -> Result<()> {
+        let (mut store, dir) = store();
+        let intent =
+            super::super::chain::tests::approval_intent(alloy_primitives::Address::from([7; 20]))?;
+        let expected = store.reserve_transaction(&intent, 7)?;
+        assert!(
+            store
+                .observe_transaction(&intent.id, "invalid", None, None, None)
+                .is_err()
+        );
+        assert_eq!(store.transaction(&intent.id)?, expected);
+        for encoded in ["{", "{}"] {
+            store.db.execute(
+                "UPDATE transactions SET intent=? WHERE id=?",
+                params![encoded, intent.id],
+            )?;
+            assert!(store.transaction(&intent.id).is_err());
+            assert!(store.reserve_transaction(&intent, 7).is_err());
+        }
+        drop(store);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     #[test]
     fn signed_nonce_and_gas_commit_together_and_a_failed_signer_leaves_no_reservation() {
         let (mut store, dir) = store();

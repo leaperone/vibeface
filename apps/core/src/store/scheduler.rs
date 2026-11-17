@@ -20,119 +20,147 @@ pub(crate) struct SchedulerBudgetReservation {
     units: u64,
 }
 
-type JobRow = (
-    String,
-    String,
-    String,
-    u64,
-    String,
-    String,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<u64>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    bool,
-    String,
-    bool,
-);
+struct DbJobRow {
+    conversation_id: String,
+    trigger: String,
+    kind: String,
+    sequence: u64,
+    basis: String,
+    reply_to: String,
+    message_id: String,
+    state: String,
+    attempt_id: Option<String>,
+    attempt_boot: Option<String>,
+    attempt_permission: Option<u64>,
+    detail: Option<String>,
+    failure: Option<String>,
+    runtime: Option<String>,
+    tool_calls: bool,
+    scope: String,
+    pending_check: bool,
+}
 
-fn job_from_row(row: JobRow) -> Result<SchedulerJob> {
-    let (
-        conversation_id,
-        trigger,
-        kind,
-        sequence,
-        basis,
-        reply_to,
-        message_id,
-        state,
-        id,
-        boot,
-        permission,
-        detail,
-        failure,
-        runtime,
-        tool_calls,
-        scope,
-        pending_check,
-    ) = row;
-    let attempt = match (id, boot, permission) {
-        (Some(id), Some(boot), Some(permission_version)) => Some(ManagerAttempt {
-            id,
-            boot,
-            permission_version,
-        }),
-        _ => None,
-    };
-    let attempt_or = || attempt.clone().context("scheduler job attempt missing");
-    let detail = detail.unwrap_or_default();
-    let failure = || -> Result<ExecFailure> {
-        Ok(ExecFailure {
-            kind: super::enum_from(
-                failure
-                    .as_deref()
-                    .context("scheduler job failure missing")?,
-            )?,
-            detail: detail.clone(),
+impl DbJobRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            conversation_id: row.get("conversation_id")?,
+            trigger: row.get("trigger")?,
+            kind: row.get("kind")?,
+            sequence: row.get("sequence")?,
+            basis: row.get("basis")?,
+            reply_to: row.get("reply_to")?,
+            message_id: row.get("message_id")?,
+            state: row.get("state")?,
+            attempt_id: row.get("attempt_id")?,
+            attempt_boot: row.get("attempt_boot")?,
+            attempt_permission: row.get("attempt_permission")?,
+            detail: row.get("detail")?,
+            failure: row.get("failure")?,
+            runtime: row.get("runtime")?,
+            tool_calls: row.get("tool_calls")?,
+            scope: row.get("scope")?,
+            pending_check: row.get("pending_check")?,
         })
-    };
-    let state = match state.as_str() {
-        "queued" => JobState::Queued,
-        "claimed" => JobState::Claimed {
-            attempt: attempt_or()?,
-        },
-        "running" => JobState::Running {
-            attempt: attempt_or()?,
-        },
-        "cancelling" => JobState::Cancelling {
-            attempt: attempt_or()?,
-        },
-        "reconciling" => JobState::Reconciling {
-            attempt: attempt_or()?,
-            failure: failure()?,
-        },
-        "completed" => JobState::Completed {
-            attempt: attempt_or()?,
-        },
-        "failed" => JobState::Failed {
-            attempt: attempt_or()?,
-            failure: failure()?,
-        },
-        "cancelled" => JobState::Cancelled {
-            attempt,
-            evidence: detail,
-        },
-        "interrupted" => JobState::Interrupted {
-            attempt: attempt_or()?,
-            failure: failure()?,
-        },
-        "steering" | "steered" => {
-            let steer: JobState = serde_json::from_str(&detail)?;
-            ensure!(steer.name() == state, "scheduler job steer state mismatch");
-            steer
-        }
-        other => bail!("unknown scheduler job state {other}"),
-    };
-    Ok(SchedulerJob {
-        conversation_id,
-        scope: SessionScope::from_storage_key(&scope)?,
-        trigger,
-        kind: super::enum_from(&kind)?,
-        sequence,
-        basis: serde_json::from_str(&basis)?,
-        reply_to,
-        message_id,
-        runtime: runtime
-            .map(|value| serde_json::from_str(&value))
-            .transpose()?,
-        tool_calls,
-        pending_check,
-        state,
-    })
+    }
+}
+
+impl TryFrom<DbJobRow> for SchedulerJob {
+    type Error = anyhow::Error;
+
+    fn try_from(row: DbJobRow) -> Result<Self> {
+        let DbJobRow {
+            conversation_id,
+            trigger,
+            kind,
+            sequence,
+            basis,
+            reply_to,
+            message_id,
+            state,
+            attempt_id: id,
+            attempt_boot: boot,
+            attempt_permission: permission,
+            detail,
+            failure,
+            runtime,
+            tool_calls,
+            scope,
+            pending_check,
+        } = row;
+        let attempt = match (id, boot, permission) {
+            (Some(id), Some(boot), Some(permission_version)) => Some(ManagerAttempt {
+                id,
+                boot,
+                permission_version,
+            }),
+            _ => None,
+        };
+        let attempt_or = || attempt.clone().context("scheduler job attempt missing");
+        let detail = detail.unwrap_or_default();
+        let failure = || -> Result<ExecFailure> {
+            Ok(ExecFailure {
+                kind: super::enum_from(
+                    failure
+                        .as_deref()
+                        .context("scheduler job failure missing")?,
+                )?,
+                detail: detail.clone(),
+            })
+        };
+        let state = match state.as_str() {
+            "queued" => JobState::Queued,
+            "claimed" => JobState::Claimed {
+                attempt: attempt_or()?,
+            },
+            "running" => JobState::Running {
+                attempt: attempt_or()?,
+            },
+            "cancelling" => JobState::Cancelling {
+                attempt: attempt_or()?,
+            },
+            "reconciling" => JobState::Reconciling {
+                attempt: attempt_or()?,
+                failure: failure()?,
+            },
+            "completed" => JobState::Completed {
+                attempt: attempt_or()?,
+            },
+            "failed" => JobState::Failed {
+                attempt: attempt_or()?,
+                failure: failure()?,
+            },
+            "cancelled" => JobState::Cancelled {
+                attempt,
+                evidence: detail,
+            },
+            "interrupted" => JobState::Interrupted {
+                attempt: attempt_or()?,
+                failure: failure()?,
+            },
+            "steering" | "steered" => {
+                let steer: JobState = serde_json::from_str(&detail)?;
+                ensure!(steer.name() == state, "scheduler job steer state mismatch");
+                steer
+            }
+            other => bail!("unknown scheduler job state {other}"),
+        };
+        Ok(SchedulerJob {
+            conversation_id,
+            scope: SessionScope::from_storage_key(&scope)?,
+            trigger,
+            kind: super::enum_from(&kind)?,
+            sequence,
+            basis: serde_json::from_str(&basis)?,
+            reply_to,
+            message_id,
+            runtime: runtime
+                .map(|value| serde_json::from_str(&value))
+                .transpose()?,
+            tool_calls,
+            pending_check,
+            state,
+        })
+    }
 }
 
 fn query_jobs(
@@ -149,32 +177,12 @@ fn query_jobs_ordered(
     order: &str,
 ) -> Result<Vec<SchedulerJob>> {
     let mut statement = connection.prepare(&format!(
-        "SELECT {JOB_COLUMNS},EXISTS(SELECT 1 FROM pending_checks p WHERE p.attempt_id=scheduler_jobs.attempt_id) FROM scheduler_jobs WHERE {filter} ORDER BY {order}"
+        "SELECT {JOB_COLUMNS},EXISTS(SELECT 1 FROM pending_checks p WHERE p.attempt_id=scheduler_jobs.attempt_id) AS pending_check FROM scheduler_jobs WHERE {filter} ORDER BY {order}"
     ))?;
     let rows = statement
-        .query_map(params, |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-                r.get(7)?,
-                r.get(8)?,
-                r.get(9)?,
-                r.get(10)?,
-                r.get(11)?,
-                r.get(12)?,
-                r.get(13)?,
-                r.get(14)?,
-                r.get(15)?,
-                r.get(16)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<JobRow>>>()?;
-    rows.into_iter().map(job_from_row).collect()
+        .query_map(params, DbJobRow::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(SchedulerJob::try_from).collect()
 }
 
 fn accepted_steering_jobs(
@@ -6414,3 +6422,256 @@ mod hold_query_tests {
 #[cfg(test)]
 #[path = "scheduler_context_tests.rs"]
 mod context_tests;
+
+#[cfg(test)]
+mod db_row_codec_tests {
+    use super::*;
+    use vibeface_bridge::failure::FailureKind;
+
+    fn job(state: JobState) -> SchedulerJob {
+        SchedulerJob {
+            conversation_id: "conversation".into(),
+            scope: SessionScope::Task {
+                work_id: "task".into(),
+            },
+            trigger: "message:input".into(),
+            kind: TriggerKind::Human,
+            sequence: 23,
+            basis: [("device".into(), 19)].into(),
+            reply_to: "input".into(),
+            message_id: "reply".into(),
+            runtime: Some(TurnRuntime {
+                provider: Provider::Codex,
+                model: Some("fixture-model".into()),
+                reasoning_effort: None,
+                generation: "generation".into(),
+                session_generation: 7,
+                delivery_id: "delivery".into(),
+                stage: ProviderStage::ReadBack,
+                execution: TurnExecution::Unknown,
+                attempted_at_ms: 31,
+                switched_from: None,
+                switch_reason: Some(FailureKind::Unknown),
+            }),
+            tool_calls: true,
+            pending_check: false,
+            state,
+        }
+    }
+
+    #[test]
+    fn job_states_reopen_and_decode_reordered_columns() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("vibeface-job-codec-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let path = dir.join("node.sqlite3");
+        let store = Store::open(&path)?;
+        let attempt = ManagerAttempt {
+            id: "attempt".into(),
+            boot: "boot".into(),
+            permission_version: 11,
+        };
+        let failure = ExecFailure {
+            kind: FailureKind::Unknown,
+            detail: "unproven result".into(),
+        };
+        let into = SteerTarget {
+            provider: Provider::Codex,
+            attempt_id: "host-attempt".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+        };
+        let states = vec![
+            JobState::Queued,
+            JobState::Claimed {
+                attempt: attempt.clone(),
+            },
+            JobState::Running {
+                attempt: attempt.clone(),
+            },
+            JobState::Cancelling {
+                attempt: attempt.clone(),
+            },
+            JobState::Reconciling {
+                attempt: attempt.clone(),
+                failure: failure.clone(),
+            },
+            JobState::Completed {
+                attempt: attempt.clone(),
+            },
+            JobState::Failed {
+                attempt: attempt.clone(),
+                failure: failure.clone(),
+            },
+            JobState::Cancelled {
+                attempt: None,
+                evidence: String::new(),
+            },
+            JobState::Cancelled {
+                attempt: Some(attempt.clone()),
+                evidence: "cancelled".into(),
+            },
+            JobState::Interrupted { attempt, failure },
+            JobState::Steering {
+                into: into.clone(),
+                receipt: None,
+                uncertain: true,
+                unread_since_ms: Some(17),
+                running_since_ms: None,
+            },
+            JobState::Steered {
+                into,
+                outcome: SteerOutcome::Unknown,
+                receipt: Some(SteerReceipt {
+                    accepted_at_ms: 29,
+                    actual_turn_id: Some("actual-turn".into()),
+                }),
+            },
+        ];
+        let mut expected = Vec::new();
+        for (index, state) in states.into_iter().enumerate() {
+            let mut value = job(state);
+            value.trigger = format!("message:input-{index}");
+            value.sequence = index as u64;
+            value.pending_check = value.state.attempt().is_some();
+            if index % 2 == 0 {
+                value.runtime = None;
+                value.tool_calls = false;
+                value.scope = SessionScope::Main;
+            }
+            save_job(&store.connection, &value)?;
+            expected.push(value);
+        }
+        store.connection.execute("INSERT INTO pending_checks(attempt_id,conversation_id,trigger,detail,created_at_ms) VALUES('attempt','conversation','message:input-1','check',0)", [])?;
+        assert_eq!(query_jobs(&store.connection, "1", [])?, expected);
+        drop(store);
+        let store = Store::open(&path)?;
+        assert_eq!(query_jobs(&store.connection, "1", [])?, expected);
+        let mut query = store.connection.prepare("SELECT EXISTS(SELECT 1 FROM pending_checks p WHERE p.attempt_id=scheduler_jobs.attempt_id) AS pending_check,scope,tool_calls,runtime,failure,detail,attempt_permission,attempt_boot,attempt_id,state,message_id,reply_to,basis,sequence,kind,trigger,conversation_id FROM scheduler_jobs ORDER BY sequence")?;
+        let rows = query
+            .query_map([], DbJobRow::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(
+            rows.into_iter()
+                .map(SchedulerJob::try_from)
+                .collect::<Result<Vec<_>>>()?,
+            expected
+        );
+        drop(query);
+        drop(store);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn job_codec_rejects_missing_attempts_and_corrupt_state_data() -> Result<()> {
+        let store = Store::open(":memory:")?;
+        let attempt = ManagerAttempt {
+            id: "attempt".into(),
+            boot: "boot".into(),
+            permission_version: 11,
+        };
+        let failure = ExecFailure {
+            kind: FailureKind::Unknown,
+            detail: "unproven".into(),
+        };
+        for state in [
+            JobState::Claimed {
+                attempt: attempt.clone(),
+            },
+            JobState::Running {
+                attempt: attempt.clone(),
+            },
+            JobState::Cancelling {
+                attempt: attempt.clone(),
+            },
+            JobState::Reconciling {
+                attempt: attempt.clone(),
+                failure: failure.clone(),
+            },
+            JobState::Completed {
+                attempt: attempt.clone(),
+            },
+            JobState::Failed {
+                attempt: attempt.clone(),
+                failure: failure.clone(),
+            },
+            JobState::Interrupted { attempt, failure },
+        ] {
+            for column in ["attempt_id", "attempt_boot", "attempt_permission"] {
+                save_job(&store.connection, &job(state.clone()))?;
+                store
+                    .connection
+                    .execute(&format!("UPDATE scheduler_jobs SET {column}=NULL"), [])?;
+                let error = query_jobs(&store.connection, "1", []).unwrap_err();
+                assert!(
+                    error.to_string().contains("scheduler job attempt missing"),
+                    "{state:?}/{column}: {error}"
+                );
+            }
+        }
+        let failed = job(JobState::Failed {
+            attempt: ManagerAttempt {
+                id: "attempt".into(),
+                boot: "boot".into(),
+                permission_version: 11,
+            },
+            failure: ExecFailure {
+                kind: FailureKind::Unknown,
+                detail: "unproven".into(),
+            },
+        });
+        for encoded in [None, Some("{"), Some("\"unknown\"")] {
+            save_job(&store.connection, &failed)?;
+            store
+                .connection
+                .execute("UPDATE scheduler_jobs SET failure=?", [encoded])?;
+            assert!(query_jobs(&store.connection, "1", []).is_err());
+        }
+        save_job(&store.connection, &failed)?;
+        // Failure detail is plain evidence and must not be parsed as JSON.
+        store
+            .connection
+            .execute("UPDATE scheduler_jobs SET detail='{'", [])?;
+        let loaded = query_jobs(&store.connection, "1", [])?;
+        assert!(
+            matches!(&loaded[0].state, JobState::Failed { failure, .. } if failure.detail == "{")
+        );
+        let cancelled = job(JobState::Cancelled {
+            attempt: None,
+            evidence: String::new(),
+        });
+        save_job(&store.connection, &cancelled)?;
+        store
+            .connection
+            .execute("UPDATE scheduler_jobs SET detail=NULL", [])?;
+        assert_eq!(
+            load_job(&store.connection, "conversation", "message:input")?,
+            Some(cancelled)
+        );
+        for (column, value) in [
+            ("state", "unknown"),
+            ("basis", "{"),
+            ("runtime", "{"),
+            ("kind", "\"unknown\""),
+            ("scope", "unknown"),
+        ] {
+            save_job(&store.connection, &job(JobState::Queued))?;
+            store
+                .connection
+                .execute(&format!("UPDATE scheduler_jobs SET {column}=?"), [value])?;
+            assert!(query_jobs(&store.connection, "1", []).is_err(), "{column}");
+        }
+        save_job(&store.connection, &job(JobState::Queued))?;
+        // Valid JSON with a different state must not pass the persisted steer-state check.
+        store.connection.execute(
+            r#"UPDATE scheduler_jobs SET state='steering',detail='{"state":"queued"}'"#,
+            [],
+        )?;
+        assert!(query_jobs(&store.connection, "1", []).is_err());
+        store
+            .connection
+            .execute("UPDATE scheduler_jobs SET detail='{}'", [])?;
+        assert!(query_jobs(&store.connection, "1", []).is_err());
+        Ok(())
+    }
+}
