@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
+import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import type { ReadyConnection } from "../lib/node.ts"
 import { messageOf } from "../lib/node.ts"
 import { parseLogs, reportLog, type LogFilter } from "../lib/web-log.ts"
@@ -22,7 +22,9 @@ import type { Attachment } from "../chat/types.ts"
 import type { Avatar } from "../avatar/face.ts"
 import { avatarWrite } from "../avatar/pick.ts"
 import { mergeConversation, mergeWorkspaceState } from "./records.ts"
-import { HistoryRequests, mergeConversationSnapshot, mergeHistoryPage, readConversationHistory } from "./history.ts"
+import { HistoryRequests, mergeHistoryPage, readConversationHistory } from "./history.ts"
+import { createConversationCache } from "./conversation-cache.ts"
+import { ConversationReadOwner, markVisibleMessagesRead, readConversationSnapshot } from "./conversation-read.ts"
 import { answerBody, answerId } from "./questions.ts"
 import { memoryController, memoryResultLabel, memorySaved } from "./memory.ts"
 import { networkKey, newId, storageOf } from "./storage.ts"
@@ -93,6 +95,10 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const [writeState, setWriteState] = useState<WriteStatus>({ state: "writable", conflicts: [] })
   const [conversationId, setConversationId] = useState("")
   const [data, setData] = useState<ConversationPayload | null>(null)
+  const [dataOrigin, setDataOrigin] = useState<'none' | 'cache' | 'network'>('none')
+  const [conversationLoading, setConversationLoading] = useState(false)
+  const [conversationError, setConversationError] = useState<string | null>(null)
+  const conversationCache = useMemo(() => platform.conversationCache ? createConversationCache({ storage: platform.storage }) : null, [platform.storage, platform.conversationCache])
   const [notifications, setNotifications] = useState<NotificationRecord[]>([])
   const [ignoredNotifications, setIgnoredNotifications] = useState<ReadonlySet<string>>(new Set())
   const [questions, setQuestions] = useState<Question[]>([])
@@ -130,9 +136,10 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const alive = useRef(true)
   const activeId = useRef("")
   const dataRef = useRef<ConversationPayload | null>(null)
+  const dataScope = useRef({ networkId, clientId })
   const readConnection = useRef<ReadyConnection | null>(null)
   const readGeneration = useRef<number | null>(null)
-  const readSequence = useRef(0)
+  const conversationReads = useRef(new ConversationReadOwner())
   const historyRequests = useRef(new HistoryRequests())
   const [historyLoading, setHistoryLoading] = useState<ReadonlySet<HistorySection>>(new Set())
   const messagesRef = useRef<PendingMessage[]>([])
@@ -160,7 +167,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const refreshRef = useRef<() => Promise<void>>(async () => {})
   const current = () => alive.current && connection.isCurrent() && connection.generation === connectionGeneration && connection.principal.network_id === networkId && connection.principal.device_id === clientId && renderedConnection.current === connection && renderedGeneration.current === connectionGeneration
-  const sameRead = () => readConnection.current === connection && readGeneration.current === connectionGeneration
+  const sameRead = () => readConnection.current === connection && readGeneration.current === connectionGeneration && (!(platform.conversationCache || platform.explicitMessageRead) || !activeId.current || conversationReads.current.confirmed())
   const requireCurrent = () => { if (!current()) throw new Error("连接换了。再查一次。") }
   const requireContext = (id = activeId.current) => {
     requireCurrent()
@@ -237,35 +244,59 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       return { attestation: { device_id: clientId, signature }, operation_id: await requestKey(payload, clientId) }
     },
   })
+  const persistConversation = (id: string, payload: ConversationPayload) => {
+    if (!conversationCache) return
+    try { conversationCache.save({ networkId, deviceId: clientId, conversationId: id, payload }) }
+    catch (caught) { reportLog({ level: 'warn', event: 'conversation.cache_save_failed', message: messageOf(caught), fields: { conversationId: id } }) }
+  }
+  const cachedConversation = (id: string) => {
+    if (!conversationCache || !id) return null
+    try { return conversationCache.read({ networkId, deviceId: clientId, conversationId: id })?.payload ?? null }
+    catch (caught) { reportLog({ level: 'warn', event: 'conversation.cache_read_failed', message: messageOf(caught), fields: { conversationId: id } }); return null }
+  }
   const selectConversation = (id: string) => {
     requireCurrent()
     activeId.current = id
-    readSequence.current += 1
+    if (conversationCache && id) {
+      writeStorage(scoped('selected-conversation'), id)
+      const bot = botsRef.current.find((item) => item.conversation_id === id)
+      if (bot) writeStorage(scoped(`conversation-for-bot.${bot.bot_id}`), id)
+    }
+    conversationReads.current.invalidate()
     historyRequests.current.reset()
     setHistoryLoading(new Set())
-    dataRef.current = null
+    const cached = cachedConversation(id)
+    dataScope.current = { networkId, clientId }
+    dataRef.current = cached
     onScreen.current = null
     setFresh(new Set<string>())
     setConversationId(id)
-    setData(null)
+    setData(cached)
+    setDataOrigin(cached ? 'cache' : 'none')
+    setConversationLoading(false)
+    setConversationError(null)
     setLiveProgress([])
     setInterrupted([])
   }
   const readConversation = async (id: string) => {
-    const sequence = ++readSequence.current
-    const baseline = dataRef.current
-    const generation = connection.generation
-    const next = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
     requireCurrent()
-    if (renderedConnection.current !== connection || connection.generation !== generation || activeId.current !== id) throw new Error("对话有更新。再查一次。")
-    // A newer read of this conversation shows its own result; this one is still a fresh read for the caller.
-    if (sequence !== readSequence.current) return next
-    if (dataRef.current && dataRef.current.history_authority !== next.history_authority) {
-      historyRequests.current.reset()
-      setHistoryLoading(new Set())
-    }
-    return showConversation(id, mergeConversationSnapshot(dataRef.current, next, baseline))
+    if (!id || activeId.current !== id) return null
+    setConversationError(null)
+    return readConversationSnapshot({
+      conversationId: id, owner: conversationReads.current,
+      current: () => current() && activeId.current === id,
+      read: () => connection.rpc('conversation', { conversation_id: id }),
+      shown: () => dataRef.current,
+      loading: setConversationLoading,
+      failed: (caught) => setConversationError(messageOf(caught, '读取对话')),
+      authorityChanged: () => {
+        historyRequests.current.reset()
+        setHistoryLoading(new Set())
+      },
+      apply: (next) => showConversation(id, next),
+    })
   }
+  const refreshConversation = async () => { requireCurrent(); if (activeId.current) await readConversation(activeId.current) }
   const cancelHistory = (section: HistorySection) => {
     historyRequests.current.cancel(section)
     setHistoryLoading((previous) => new Set([...previous].filter((item) => item !== section)))
@@ -284,16 +315,21 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
         if (!latest) return
         const next = mergeHistoryPage(latest, page)
         expectedCursor = page.next_cursor
+        if (page.section === 'messages') conversationReads.current.confirm(page.items)
         dataRef.current = next
         setData(next)
+        persistConversation(id, next)
       } })
     } catch (caught) {
       if (!valid()) return
       if (messageOf(caught).includes('refresh the conversation')) {
         historyRequests.current.reset()
         setHistoryLoading(new Set())
-        dataRef.current = null
-        setData(null)
+        conversationReads.current.clearConfirmation()
+        readConnection.current = null
+        if (conversationCache) setDataOrigin('cache')
+        else { dataRef.current = null; setData(null); setDataOrigin('none') }
+        scheduleRefresh()
         await readConversation(id)
         return
       }
@@ -313,20 +349,22 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const showConversation = async (id: string, next: ConversationPayload) => {
     // While the entry catches up, what the page already showed stays on screen.
     const shown = dataRef.current
-    if (connection.catchingUp?.() && shown?.conversation?.conversation_id === id) {
+    if (connection.catchingUp?.() && shown?.conversation?.conversation_id === id && shown.history_authority === next.history_authority) {
       const missing = shown.messages.filter((message) => !next.messages.some((item) => item.message_id === message.message_id))
-      if (missing.length) next.messages = byRank([...next.messages, ...missing])
+      if (missing.length) next = { ...next, messages: byRank([...next.messages, ...missing]) }
     }
     dataRef.current = next
     setData(next)
+    setDataOrigin('network')
+    persistConversation(id, next)
     if (viewRef.current !== "chat" || !platform.foreground()) onScreen.current = null
     else if (onScreen.current?.id !== id || onScreen.current.connection !== connection) {
       onScreen.current = { id, connection }
       setFresh(new Set([...notificationsRef.current.filter((item) => notificationForMain(item, id) && unreadReply(item)).map((item) => item.notification_id), ...next.questions.map((question) => `question:${question.question_id}`)]))
     }
     // A message or an answer settles once the Node's own history holds it.
-    const admitted = (item: PendingMessage) => item.rejection_code !== 'input_conflict' && item.receipt?.stage !== 'refused' && item.receipt?.stage !== 'unknown' && item.conversation_id === id && next.messages.some((message) => message.message_id === item.message_id)
-    const landed = answersRef.current.filter((item) => next.messages.some((message) => message.message_id === answerId(item.question_id)))
+    const admitted = (item: PendingMessage) => item.rejection_code !== 'input_conflict' && item.receipt?.stage !== 'refused' && item.receipt?.stage !== 'unknown' && item.conversation_id === id && next.messages.some((message) => message.message_id === item.message_id && conversationReads.current.observedMessage(message))
+    const landed = answersRef.current.filter((item) => next.messages.some((message) => message.message_id === answerId(item.question_id) && conversationReads.current.observedMessage(message)))
     if (current() && (messagesRef.current.some(admitted) || landed.length)) {
       for (const item of messagesRef.current.filter(admitted)) await withInputDelivery(messageLane(item), async () => {
         if (!current()) return
@@ -336,6 +374,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       for (const item of landed) await outbox.delete(outboxKey("answer", item.question_id))
       await outboxChanged()
     }
+    if (!current() || activeId.current !== id || dataRef.current !== next) return next
     // Streamed text of a reply that ended without a final message is kept locally and shown as interrupted.
     const ended = (job: { state: string; reply_message_id?: string } | undefined) => job && isReplyEnded(job.state) && !(job.reply_message_id && next.messages.some((message) => message.message_id === job.reply_message_id))
     const kept = readStorage<InterruptedReply[]>(scoped("interrupted"), []).filter((item) => item.conversation_id !== id || next.scheduler?.jobs.some((job) => job.trigger === item.trigger && ended(job)))
@@ -351,9 +390,10 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       const job = next.scheduler?.jobs.find((item) => item.trigger === progress.trigger)
       return Boolean(job && (!job.reply_message_id || !next.messages.some((message) => message.message_id === job.reply_message_id)) && !isReplyEnded(job.state))
     }))
-    if (joined && current() && sameRead() && viewRef.current === "chat" && platform.foreground()) {
+    if (!platform.explicitMessageRead && joined && current() && sameRead() && viewRef.current === "chat" && platform.foreground()) {
       const seen = notificationsRef.current.filter((item) => notificationForMain(item, id) && !isSessionNotification(item))
       for (const notification of seen) {
+        if (!current() || activeId.current !== id || !sameRead() || viewRef.current !== 'chat' || !platform.foreground()) break
         try { await acknowledgeNotification(notification) } catch (caught) { showError(caught, "标记已读"); break }
       }
     }
@@ -435,12 +475,17 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     refreshingGeneration.current = connectionGeneration
     setRefreshing(true)
     try {
+      const readingId = activeId.current
+      const conversationRead = conversationCache && readingId ? readConversation(readingId) : null
+      // The metadata read may take longer; retain the read error until this refresh awaits it.
+      conversationRead?.catch(() => {})
       const [rawNodes, rawNotifications, rawBots, rawWrite, rawQuestions, rawWorks, rawOverview] = await Promise.all([
         connection.rpc("nodes"), connection.rpc("notifications"), connection.rpc("bots"), connection.request("write_state"), connection.rpc("questions"), connection.rpc("open_works"),
         viewRef.current === "tasks" ? connection.rpc("workspace_overview") : null,
       ])
       requireCurrent()
-      const nextNodes = parseNodes(rawNodes), nextNotifications = unreadSince(parseNotifications(rawNotifications), true)
+      const nextNodes = parseNodes(rawNodes), parsedNotifications = parseNotifications(rawNotifications)
+      const nextNotifications = platform.explicitMessageRead ? parsedNotifications : unreadSince(parsedNotifications, true)
       const nextBots = parseBots(rawBots), nextQuestions = parseQuestions(rawQuestions)
       openWorksRef.current = parseOpenWorks(rawWorks)
       if (rawOverview !== null) setOverview(parseWorkspaceOverview(rawOverview))
@@ -448,10 +493,16 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       setNodes(nextNodes); setNotifications(nextNotifications); setBots(nextBots); setPrimary(parsePrimary(rawBots)); setWriteState(parseWriteStatus(rawWrite)); setQuestions(nextQuestions); setOpenWorks(openWorksRef.current)
       if (botCreationRef.current && nextBots.some((item) => item.bot_id === botCreationRef.current?.bot_id)) clearPendingBot()
       notificationsRef.current = nextNotifications
+      if (platform.explicitMessageRead && viewRef.current === 'chat' && platform.foreground()) {
+        setFresh((previous) => new Set([...previous, ...nextNotifications.filter((item) => notificationForMain(item, activeId.current) && unreadReply(item)).map((item) => item.notification_id)]))
+      }
       const selected = readStorage<string | null>(scoped("selected-bot"), null)
       const bot = nextBots.find((item) => item.conversation_id === activeId.current) ?? nextBots.find((item) => item.bot_id === selected) ?? nextBots[0]
-      if (activeId.current !== (bot?.conversation_id ?? "")) selectConversation(bot?.conversation_id ?? "")
-      if (activeId.current) await readConversation(activeId.current)
+      if (activeId.current !== (bot?.conversation_id ?? "") && !(conversationCache && !bot && activeId.current && connection.catchingUp?.())) selectConversation(bot?.conversation_id ?? "")
+      if (activeId.current) {
+        if (conversationRead && activeId.current === readingId) await conversationRead
+        else await readConversation(activeId.current)
+      }
       requireCurrent()
       readConnection.current = connection
       readGeneration.current = connectionGeneration
@@ -481,11 +532,26 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const records = parseRecords(value), id = records.conversation_id
     if (records.refresh_metadata) scheduleRefresh()
     if (id === activeId.current && dataRef.current && records.history_authority !== dataRef.current.history_authority) {
-      readSequence.current += 1; historyRequests.current.reset(); setHistoryLoading(new Set()); dataRef.current = null; setData(null); scheduleRefresh(); return
+      conversationReads.current.invalidate(); historyRequests.current.reset(); setHistoryLoading(new Set())
+      readConnection.current = null
+      if (conversationCache) {
+        setDataOrigin('cache')
+        void refreshConversation().catch(showRefreshError)
+      } else { dataRef.current = null; setData(null); setDataOrigin('none') }
+      scheduleRefresh(); return
     }
     if (refreshingRef.current || viewRef.current === "tasks") scheduleRefresh()
     const shown = dataRef.current
-    if (id === activeId.current && sameRead() && shown?.conversation?.conversation_id === id) await showConversation(id, mergeConversation(shown, records))
+    if (id === activeId.current && sameRead() && shown?.conversation?.conversation_id === id) {
+      conversationReads.current.confirm(records.messages)
+      await showConversation(id, mergeConversation(shown, records))
+    } else if (conversationCache) {
+      const retained = id === activeId.current ? shown : cachedConversation(id)
+      if (retained?.history_authority !== records.history_authority) return
+      const next = mergeConversation(retained, records)
+      persistConversation(id, next)
+      if (id === activeId.current) { dataRef.current = next; setData(next) }
+    }
   }
   /** A change the Node pushed without its records: the bot list, and the conversation if it is open. */
   const reloadScope = async (id: string) => {
@@ -573,14 +639,15 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   useEffect(() => {
     alive.current = true
     readConnection.current = null
+    readGeneration.current = null
     loadedMessageConnection.current = null
     onScreen.current = null
     setFresh(new Set())
     historyRequests.current.reset()
     setHistoryLoading(new Set())
-    dataRef.current = null
-    setData(null)
-    readSequence.current += 1
+    conversationReads.current.invalidate()
+    setConversationLoading(false)
+    setConversationError(null)
     inFlight.current = new Set()
     messageTargets.current = new Set()
     messageSaves.current = new Map()
@@ -592,8 +659,8 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       ignoredNotificationsRef.current = nextIgnored
       setIgnoredNotifications(nextIgnored)
       if (initialBot) writeStorage(scoped("selected-bot"), initialBot)
-      activeId.current = ""
-      setConversationId(activeId.current)
+      const storedConversation = conversationCache ? readStorage<unknown>(scoped(initialBot ? `conversation-for-bot.${initialBot}` : 'selected-conversation'), null) : null
+      selectConversation(typeof storedConversation === 'string' ? storedConversation : '')
       void loadPending().then(() => { if (alive.current) setBooted(true) }, (caught) => showError(caught, "读取待发消息"))
     } catch (caught) { showError(caught) }
     const stop = tabs.listen((message) => {
@@ -605,7 +672,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       ignoredNotificationsRef.current = merged
       setIgnoredNotifications(merged)
     })
-    return () => { alive.current = false; historyRequests.current.reset(); stop() }
+    return () => { alive.current = false; conversationReads.current.invalidate(); historyRequests.current.reset(); stop() }
   }, [connection, connectionGeneration])
 
   useEffect(() => {
@@ -694,6 +761,21 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (!joined) throw new Error("本机管理不能标记网络提醒。用加入链接加入后再操作。")
     const selected = notificationsRef.current.filter((item) => ids.includes(item.notification_id))
     for (const notification of selected) await acknowledgeNotification(notification)
+  }
+  const markMessagesRead = async (messageIds: readonly string[]) => {
+    const id = activeId.current
+    const visible = () => current() && joined && viewRef.current === 'chat' && platform.foreground() && activeId.current === id && conversationReads.current.confirmed()
+    await markVisibleMessagesRead({
+      owner: conversationReads.current, messageIds, messages: dataRef.current?.messages ?? [],
+      notifications: notificationsRef.current.filter((item) => notificationForMain(item, id)), conversationId: id, current: visible,
+      acknowledge: async (notification) => {
+        const key = `ack:${notification.notification_id}`
+        if (inFlight.current.has(key) || !notificationsRef.current.some((item) => item.notification_id === notification.notification_id)) return
+        inFlight.current.add(key)
+        try { await acknowledgeNotification(notification) }
+        finally { inFlight.current.delete(key) }
+      },
+    })
   }
   const showWorkspace = (next: WorkspaceDomainState | WorkspaceCommandResult, scoped = false) => {
     if (!current()) return
@@ -784,7 +866,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (!current()) return
     if (!responded(caught)) {
       readConnection.current = null
-      readSequence.current += 1
+      conversationReads.current.invalidate()
       setNoticeText("还没确认结果，正在重新查。")
     }
     scheduleRefresh()
@@ -1225,7 +1307,10 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     requireCurrent()
     writeStorage(scoped("selected-bot"), bot.bot_id)
     selectConversation(bot.conversation_id)
-    await refreshRef.current()
+    if (conversationCache) {
+      scheduleRefresh()
+      await readConversation(bot.conversation_id)
+    } else await refreshRef.current()
   }
   /**
    * 重试 for the newest reply, which failed or was stopped. The conversation is read again first, so a reply that went on since
@@ -1246,7 +1331,9 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const traces = (shown?.works ?? []).some((work) => work.trigger === job.trigger) || (shown?.changes ?? []).some((change) => change.cause?.message_id === messageId)
     return sendMessage(retryText(asked.text, job.failure?.kind, traces), [], asked.attachments ?? [])
   }
-  const incomplete = !data
+  const visibleData = dataScope.current.networkId === networkId && dataScope.current.clientId === clientId ? data : null
+  const visibleOrigin: typeof dataOrigin = visibleData ? dataOrigin : 'none'
+  const incomplete = !visibleData
   // The lists hold this connection's first full read and the Node is not aligning with other devices; until then an empty list means not yet known.
   const synced = sameRead() && writeState.state !== "aligning"
   const chatSlot = { conversationId: conversationId || null }
@@ -1257,7 +1344,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       viewRef.current = next; setView(next); clearMessages()
       if (next === "chat" || next === "tasks") scheduleRefresh()
       else { onScreen.current = null; setFresh(new Set<string>()) }
-    }, nodes, conversationId, data, fresh, notifications, ignoredNotifications, questions, openWorks, overview, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
+    }, nodes, conversationId, data: visibleData, dataOrigin: visibleOrigin, conversationLoading, conversationError, refreshConversation, markMessagesRead, fresh, notifications, ignoredNotifications, questions, openWorks, overview, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
     historyLoading, loadHistory, cancelHistory, refreshing, incomplete, chatSlot, pendingMessages, messageBusy, canSaveMessages, liveProgress, interrupted,
     workspaceState, readWorkspaceState, readWorkspaceHistory, workspaceCommand, queryInput, confirmInputEntry, readScopeContext, readWork, stopInputTarget, retryPendingMessage, releaseMessagePending,
     controlInput: (input: { message_id: string; expected_event: string; action: InputControlAction }) => workspaceCommand({ kind: 'control_input', ...input }),
@@ -1268,7 +1355,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     diagnostics: (sinceMs: number) => { requireCurrent(); return connection.request("diagnostics", { since_ms: sinceMs }) },
     logs: async (filter: LogFilter) => { requireCurrent(); return parseLogs(await connection.request("logs", filter)) },
     confirmWritable: async () => { requireCurrent(); setWriteState(parseWriteStatus(await connection.request("confirm_writable"))); scheduleRefresh() },
-    syncText: !data ? "发一条消息开始对话。" : "已加载这个节点上的记录。",
+    syncText: visibleOrigin === 'cache' ? '已显示本机保存的聊天记录，等待补读。' : !visibleData ? "发一条消息开始对话。" : "已加载这个节点上的记录。",
     refresh, run, announce: (notice: string) => { if (current()) setNoticeText(notice) }, notificationButton, ignoreNotifications, markNotificationsRead,
     ackNotification,
     selectBot,
