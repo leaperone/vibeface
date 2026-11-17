@@ -21,14 +21,6 @@ import importlib.util
 spec = importlib.util.spec_from_file_location('offline_docs', ROOT / 'scripts/offline-docs.py')
 offline_docs = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(offline_docs)
-REQUIREMENTS = """# Runtime requirements
-
-The archive contains the CLI, Core and static browser application for Windows. Install the provider
-tools separately before enabling the bot. No credentials or provider runtimes are included.
-
-Run `scripts/install-node-service.ps1` from Windows PowerShell to register the per-user service. The
-installer needs neither administrator rights, nor WSL, nor Developer Mode.
-"""
 
 
 def helper(*args):
@@ -62,7 +54,7 @@ def stage(package, binaries, web):
     offline_docs.assemble(package)
     if (ROOT / 'LICENSE').is_file():
         shutil.copy2(ROOT / 'LICENSE', package / 'LICENSE')
-    (package / 'RUNTIME-REQUIREMENTS.md').write_text(REQUIREMENTS)
+    release.write_runtime_requirements(package, TARGET)
     return package
 
 
@@ -90,7 +82,8 @@ def self_test():
     from unittest.mock import patch
     scratch = ROOT / '.artifacts/windows-package-tests'
     scratch.mkdir(parents=True, exist_ok=True)
-    version = release.read_version('cli')
+    versions = {'cli': '0.0.1-hourly.2026111409', 'core': '2.3.4', 'app': '3.4.5-rc.2'}
+    version = versions['cli']
     source = 'a' * 40
     installers = scratch / 'service-installers'
     installers.mkdir(exist_ok=True)
@@ -103,6 +96,7 @@ def self_test():
 
     with tempfile.TemporaryDirectory(dir=scratch) as tmp, \
             patch('release.run', side_effect=boundary), \
+            patch('release.read_version', side_effect=versions.__getitem__), \
             patch(f'{__name__}.release.service_installer', return_value=installers / 'install-node-service.ps1'):
         tmp = Path(tmp)
         web = tmp / 'web'
@@ -112,26 +106,47 @@ def self_test():
         binaries = []
         for name in release.program_names(TARGET):
             binary = tmp / name
-            binary.write_text(f'#!/bin/sh\necho "{name.removesuffix(".exe")} {version}"\n')
+            value = versions['core' if name == 'vibeface-core.exe' else 'cli']
+            binary.write_text(f'#!/bin/sh\necho "{name.removesuffix(".exe")} {value}"\n')
             binary.chmod(0o755)
             binaries.append(binary)
         package = stage(tmp / f'vibeface-{version}-{TARGET}', binaries, web)
+        requirements = (package / 'RUNTIME-REQUIREMENTS.md').read_bytes()
+        assert requirements == (release.RUNTIME_REQUIREMENTS + release.WINDOWS_RUNTIME_REQUIREMENTS).encode('utf-8')
+        assert b'\r' not in requirements and requirements.endswith(b'\n')
+        assert b'official local Agent CLI' in requirements and b'nor WSL, nor Developer Mode' in requirements
         names = {path.relative_to(package).as_posix() for path in package.rglob('*') if path.is_file()}
         assert names == {'vibeface.exe', 'vibeface-core.exe', 'README.md', 'RUNTIME-REQUIREMENTS.md',
                          'scripts/install-node-service.ps1', *offline_docs.sources().values(),
                          *(f'web/{name}' for name in WEB_FILES),
                          *(['LICENSE'] if (ROOT / 'LICENSE').is_file() else [])}, sorted(names)
         os.environ['PACKAGE_TARGET'] = TARGET
-        info = release.seal_bundle(package)
+        core = {'version': '2.3.4', 'source_commit': 'b' * 40}
+        app = {'version': '3.4.5-rc.2', 'source_commit': 'c' * 40}
+        info = release.seal_bundle(package, core, app)
         release.verify_build_info(info)
         assert len(info) == 9 and info['target'] == TARGET and info['source_commit'] == source
+        identity = {'version': version, 'source_commit': source, 'dependencies': {'core': core, 'app': app}}
+        assert release.verify_bundle(package, TARGET, identity) == info
         sealed = (package / 'FILES.sha256').read_text(encoding='utf-8').splitlines()
         assert {line.split('  ')[1] for line in sealed} == names | {'BUILD-INFO.json'}, sorted(sealed)
         assert (package / 'FILES.sha256').read_bytes() == ('\n'.join(sealed) + '\n').encode('utf-8'), \
             'the sealed manifest must use canonical UTF-8/LF bytes on every build host'
-        archive = tmp / f'vibeface-{version}-{TARGET}.tar.gz'
+        archive = tmp / 'first' / f'vibeface-{version}-{TARGET}.tar.gz'
         release.public_archive(package, archive)
         assert archive.with_name(archive.name + '.sha256').read_text(encoding='utf-8') == f'{release.digest(archive)}  {archive.name}\n'
+        for path in (package, *package.rglob('*')):
+            os.utime(path, (1800000000, 1800000000))
+            path.chmod(0o751 if path.is_dir() or path.stat().st_mode & 0o111 else 0o664)
+        second = tmp / 'second' / archive.name
+        release.public_archive(package, second)
+        assert archive.read_bytes() == second.read_bytes()
+        assert archive.with_name(archive.name + '.sha256').read_bytes() == second.with_name(second.name + '.sha256').read_bytes()
+        for number, output in enumerate((archive, second)):
+            helper('checksum.py', str(output.with_name(output.name + '.sha256')))
+            unpacked = release.unpack(output, tmp / f'unpacked-{number}')
+            assert release.verify_bundle(unpacked, TARGET, identity) == info
+            assert (unpacked / 'RUNTIME-REQUIREMENTS.md').read_bytes() == requirements
         missing = tmp / 'missing-installer'
         with patch(f'{__name__}.release.service_installer', return_value=installers / 'absent.ps1'):
             try:

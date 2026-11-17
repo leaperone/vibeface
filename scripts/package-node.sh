@@ -108,38 +108,16 @@ cp -a "$web/." "$package/web/"
 cp "$repo/scripts/install-node-service.sh" "$package/scripts/"
 python3 "$repo/scripts/offline-docs.py" "$package"
 if [[ -f "$repo/LICENSE" ]]; then cp "$repo/LICENSE" "$package/"; fi
-cat > "$package/RUNTIME-REQUIREMENTS.md" <<'REQUIREMENTS'
-# Runtime requirements
-
-The archive contains the CLI, Core, and static browser application. Install the provider tools separately before enabling the bot.
-
-- Codex bots and native App Server access need the `codex` CLI and its authenticated account.
-- Cursor uses only the official local Agent CLI (`agent` or `cursor-agent`) and its CLI subscription login. API keys and auth tokens are not required or used, and the official credential store is never overridden.
-
-The device page's automatic connection finds common program installations and completes missing declared authentication variables from the Node environment or a bounded interactive login shell. Existing private settings and enabled uses are preserved. You can still choose an absolute program path in advanced settings.
-
-Codex and Claude keep private session roots and can reuse official CLI access-token snapshots without consuming the source refresh token. Private logins take priority; expired snapshots need a fresh source login or the private login command in settings. Cursor uses private ACP roots with the official CLI authentication store. GUI tokens are not extracted. No credentials or provider runtimes are included.
-REQUIREMENTS
-PACKAGE_TARGET="$target" python3 "$repo/scripts/release.py" seal-bundle "$package"
-python3 - "$output/$name.tar.gz" "$package" "$name" <<'PY'
+PACKAGE_TARGET="$target" PYTHONPATH="$repo/scripts" python3 - "$package" "$output/$name.tar.gz" <<'PY'
+import os
+from pathlib import Path
 import sys
-import tarfile
 
+import release
 
-def public_metadata(info):
-    info.uid = info.gid = 0
-    info.uname = info.gname = ""
-    info.pax_headers = {}
-    return info
-
-
-with tarfile.open(sys.argv[1], "w:gz") as archive:
-    archive.add(sys.argv[2], arcname=sys.argv[3], filter=public_metadata)
+package, archive = map(Path, sys.argv[1:])
+release.write_runtime_requirements(package, os.environ['PACKAGE_TARGET'])
+release.seal_bundle(package)
+release.public_archive(package, archive)
 PY
-cd "$output"
-if command -v sha256sum >/dev/null; then
-  sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
-else
-  shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
-fi
 printf 'Package: %s\nChecksum: %s\n' "$output/$name.tar.gz" "$output/$name.tar.gz.sha256"

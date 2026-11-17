@@ -1943,7 +1943,11 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     if (specifier === '@/features/chat/chrome' || specifier === './chrome') return { ChatMaterial: 'ChatMaterial', useChatChrome: () => ({ kind: 'solid' }), ...dependencies[specifier] as object }
     if (specifier === '@vibeface/client/workspace/storage.ts') return { storageOf, networkKey, ...dependencies[specifier] as object }
     if (specifier === '@/lib/platform') return { webPlatform: { storage: platformStorage }, ...dependencies[specifier] as object }
-    if (specifier === '@/platform/files') return dependencies[specifier] ?? { privateFiles: { run: async (operation: (current: () => boolean) => Promise<unknown>) => operation(() => true), retain: (uri: string) => ({ uri }), release() {}, releasePicker() {} } }
+    if (specifier === '@vibeface/client/identity/context.tsx' && path.endsWith('/features/chat/composer.tsx')) {
+      const identity = dependencies[specifier] as { useDevice?: () => object } | undefined
+      return { ...identity, useDevice: () => ({ connectionGeneration: () => 0, ...identity?.useDevice?.() }) }
+    }
+    if (specifier === '@/platform/files') return dependencies[specifier] ?? { privateFiles: { run: async (operation: (current: () => boolean) => Promise<unknown>) => operation(() => true), retain: async (uri: string) => ({ uri }), release() {}, releasePicker() {} } }
     if (specifier === '@/platform') return { mobilePlatform: { storage: platformStorage }, ...dependencies[specifier] as object }
     if (specifier === '@tanstack/react-router') return { Link: 'Link', useNavigate: () => () => {}, useRouterState: ({ select }: { select: (state: unknown) => unknown }) => select({ location: { search: {} } }), ...dependencies[specifier] as object }
     return specifier === 'react' ? react : specifier === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : specifier === 'expo-router' ? { Link: 'Link', useFocusEffect, useRouter: () => nativeRouter, ...dependencies[specifier] as object } : dependencies[specifier] ?? ui
@@ -5457,8 +5461,9 @@ function nativeFileFixture() {
     textSync() { return new TextDecoder().decode(files.get(this.uri)) }
     async text() { return this.textSync() }
     async bytes() { return files.get(this.uri)?.slice() ?? new Uint8Array() }
-    copySync(destination: File) { const value = files.get(this.uri); assert.ok(value); destination.writeSync(value) }
-    moveSync(destination: File) { this.copySync(destination); files.delete(this.uri); this.uri = destination.uri }
+    async copy(destination: File): Promise<void> { const value = files.get(this.uri); assert.ok(value); destination.writeSync(value) }
+    copySync(): never { assert.fail('attachment retain must use async copy') }
+    moveSync(destination: File) { const value = files.get(this.uri); assert.ok(value); destination.writeSync(value); files.delete(this.uri); this.uri = destination.uri }
     delete() { if (failure === this.uri) throw new Error('controlled delete failure'); files.delete(this.uri) }
   }
   const native = { Directory, File, Paths: { document: new Directory('file:///documents'), cache: new Directory('file:///cache') } }
@@ -5488,7 +5493,7 @@ test('native private files preserve sealed records and external originals while 
   assert.throws(() => privateFiles.recoveryStorage.write('not indexed'), /controlled index failure/)
   assert.equal(privateFiles.recoveryStorage.read(), 'sealed copy with index')
   fixture.fail('')
-  const picked = privateFiles.retain(source.uri)
+  const picked = await privateFiles.run(() => privateFiles.retain(source.uri))
   assert.notEqual(picked.uri, source.uri)
   const nativeCopy = new fixture.native.File('file:///cache/DocumentPicker/copied.json')
   nativeCopy.writeSync('picker cache')
@@ -5502,7 +5507,7 @@ test('native private files preserve sealed records and external originals while 
   const work = privateFiles.run(async current => {
     await delayed.promise
     nativeCopy.writeSync('late picker cache')
-    try { if (current()) { privateFiles.retain(nativeCopy.uri); returned = true } }
+    try { if (current()) { const file = await privateFiles.retain(nativeCopy.uri); if (current()) returned = true; else privateFiles.release(file.uri) } }
     finally { privateFiles.releasePicker(nativeCopy.uri) }
   })
   const rejected = assert.rejects(work, /正在清除/)

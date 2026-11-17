@@ -42,6 +42,22 @@ GITHUB_REPO = 'leaperone/vibeface'
 DEPENDENCIES = {'core': (), 'app': (), 'cli': ('core', 'app'), 'desktop': ('cli',), 'mobile': (), 'www': ()}
 WORKFLOWS = {app: f'release-{app}.yml' for app in APPS} | {'cli': 'release.yml', 'desktop': 'release-desktop-app.yml', 'mobile': 'release-mobile.yml'}
 
+RUNTIME_REQUIREMENTS = """# Runtime requirements
+
+The archive contains the CLI, Core, and static browser application. Install the provider tools separately before enabling the bot.
+
+- Codex bots and native App Server access need the `codex` CLI and its authenticated account.
+- Cursor uses only the official local Agent CLI (`agent` or `cursor-agent`) and its CLI subscription login. API keys and auth tokens are not required or used, and the official credential store is never overridden.
+
+The device page's automatic connection finds common program installations and completes missing declared authentication variables from the Node environment or a bounded interactive login shell. Existing private settings and enabled uses are preserved. You can still choose an absolute program path in advanced settings.
+
+Codex and Claude keep private session roots and can reuse official CLI access-token snapshots without consuming the source refresh token. Private logins take priority; expired snapshots need a fresh source login or the private login command in settings. Cursor uses private ACP roots with the official CLI authentication store. GUI tokens are not extracted. No credentials or provider runtimes are included.
+"""
+WINDOWS_RUNTIME_REQUIREMENTS = """
+Run `scripts/install-node-service.ps1` from Windows PowerShell to register the per-user service. The
+installer needs neither administrator rights, nor WSL, nor Developer Mode.
+"""
+
 
 def require(condition, message):
     if not condition:
@@ -182,6 +198,13 @@ def files(directory, exclude=()):
 
 def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n', encoding='utf-8', newline='\n')
+
+
+def write_runtime_requirements(directory, target):
+    text = RUNTIME_REQUIREMENTS
+    if target in WINDOWS_TARGETS:
+        text += WINDOWS_RUNTIME_REQUIREMENTS
+    (Path(directory) / 'RUNTIME-REQUIREMENTS.md').write_text(text, encoding='utf-8', newline='\n')
 
 
 def public_archive(directory, output):
@@ -514,7 +537,7 @@ def compose_offline(target, native_dir, app_archive, output, core_archive):
         docs = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(docs)
         docs.assemble(directory)
-        (directory / 'RUNTIME-REQUIREMENTS.md').write_text('Install and configure AI provider programs separately.\n')
+        write_runtime_requirements(directory, target)
         os.environ['PACKAGE_TARGET'] = target
         seal_bundle(directory, core_info, app_info)
         public_archive(directory, output / (name + '.tar.gz'))

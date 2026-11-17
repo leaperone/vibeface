@@ -29,23 +29,47 @@ type PickedFile = { name: string; file: RecoveryFile }
 
 /** Picks the recovery file from Files; the picked copy reads as the `RecoveryFile` the shared provider opens. */
 function FilePick({ picked, onPick, disabled }: { picked: PickedFile | null; onPick(file: PickedFile): void; disabled?: boolean }) {
-  const live = useRef(true)
+  const device = useDevice()
+  const connectionGeneration = device.connectionGeneration()
+  const latest = useRef({ picked, onPick, disabled, device, connectionGeneration, generation: 0, mounted: true })
+  if (latest.current.picked !== picked || latest.current.disabled !== disabled || latest.current.connectionGeneration !== connectionGeneration) latest.current.generation++
+  latest.current = { ...latest.current, picked, onPick, disabled, device, connectionGeneration }
   const picking = useRef(false)
-  useEffect(() => { live.current = true; return () => { live.current = false } }, [])
+  useEffect(() => {
+    latest.current.mounted = true
+    return () => { latest.current.mounted = false; latest.current.generation++ }
+  }, [])
   const choose = async () => {
-    if (picking.current || disabled) return
+    if (picking.current || !latest.current.mounted || latest.current.disabled) return
     picking.current = true
-    try { await privateFiles.run(async (current) => {
+    const previous = latest.current.picked, request = ++latest.current.generation, connection = latest.current.device.connectionGeneration()
+    const current = () => latest.current.mounted && !latest.current.disabled && latest.current.picked === previous && latest.current.generation === request && latest.current.device.connectionGeneration() === connection
+    let fileCurrent = () => false
+    try { await privateFiles.run(async (active) => {
+      fileCurrent = active
       const result = await DocumentPicker.getDocumentAsync({ type: ['application/json', 'public.json', '*/*'], copyToCacheDirectory: true })
       const asset = result.assets?.[0]
       if (result.canceled || !asset) return
+      let candidate: File | undefined, handedOff = false
+      const errors: unknown[] = []
       try {
-        if (!live.current || !current()) return
-        const file = privateFiles.retain(asset.uri)
-        if (picked?.file instanceof File) privateFiles.release(picked.file.uri)
-        onPick({ name: asset.name, file })
-      } finally { privateFiles.releasePicker(asset.uri) }
-    }) } catch (cause) { if (live.current) Alert.alert('未能读取恢复文件', messageOf(cause)) }
+        if (!current() || !fileCurrent()) return
+        candidate = await privateFiles.retain(asset.uri)
+        if (!current() || !fileCurrent()) return
+        const replacement = { name: asset.name, file: candidate }
+        if (!current() || !fileCurrent()) return
+        if (previous?.file instanceof File) privateFiles.release(previous.file.uri)
+        latest.current.onPick(replacement)
+        handedOff = true
+      } catch (cause) { errors.push(cause) }
+      finally {
+        if (candidate && !handedOff) {
+          try { privateFiles.release(candidate.uri) } catch (cause) { errors.push(cause) }
+        }
+        try { privateFiles.releasePicker(asset.uri) } catch (cause) { errors.push(cause) }
+        if (errors.length) throw errors.length === 1 ? errors[0] : new AggregateError(errors, '未能读取恢复文件或清理选择副本。')
+      }
+    }) } catch (cause) { if (current() && fileCurrent()) Alert.alert('未能读取恢复文件', messageOf(cause)) }
     finally { picking.current = false }
   }
   return <Button variant="secondary" className="self-start" disabled={disabled} onPress={() => void choose()}>
