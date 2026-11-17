@@ -23,3 +23,4 @@ __pycache__/
 .e2e/logs/
 .e2e/videos/
 .DS_Store
+.impeccable/loop-state.md
