@@ -1266,10 +1266,13 @@ def release_privacy_test(root, scratch):
         subprocess.run(["bash", str(repo / "scripts/package-node.sh"), "--target", "x86_64-unknown-linux-gnu"], env=environment, check=True, stdout=subprocess.PIPE)
         assert marker.exists(), "packaging must always rebuild the native binary"
         archive_path, = (repo / ".artifacts/packages").glob("*.tar.gz")
+        assert archive_path.read_bytes()[:8] == b"\x1f\x8b\x08\x00\x00\x00\x00\x00"
         with tarfile.open(archive_path) as archive:
             for entry in archive.getmembers():
                 assert entry.uid == entry.gid == 0 and entry.uname == entry.gname == ""
-                assert not set(entry.pax_headers) - {"mtime"}
+                assert entry.mtime == 0 and not entry.pax_headers
+                assert entry.isfile() or entry.isdir()
+                assert entry.mode == (0o755 if entry.isdir() or entry.mode & 0o111 else 0o644)
                 assert not any(part.startswith("._") for part in Path(entry.name).parts)
             package = archive.getmembers()[0].name
             assert archive.extractfile(f"{package}/docs/guide.md").read() == b"public guide"
@@ -1278,8 +1281,14 @@ def release_privacy_test(root, scratch):
             assert archive.getmember(f"{package}/vibeface-core").mode & 0o111
             info = json.load(archive.extractfile(f"{package}/BUILD-INFO.json"))
             assert [info[key] for key in ("version", "core_version", "app_version")] == ["1.2.3-hourly.2026111400", "2.3.4", "3.4.5-rc.2"]
+            assert archive.extractfile(f"{package}/RUNTIME-REQUIREMENTS.md").read() == release.RUNTIME_REQUIREMENTS.encode("utf-8")
             unpacked = repo / ".artifacts/sealed-fixture"
             archive.extractall(unpacked, filter="data")
+        assert release.verify_bundle(unpacked / package, "x86_64-unknown-linux-gnu", {
+            "version": "1.2.3-hourly.2026111400", "source_commit": info["source_commit"],
+            "dependencies": {"core": {"version": "2.3.4", "source_commit": info["source_commit"]},
+                             "app": {"version": "3.4.5-rc.2", "source_commit": info["source_commit"]}},
+        }) == info
         from unittest.mock import patch
         with patch.object(release, "ROOT", repo), patch.dict(os.environ, {"PACKAGE_TARGET": "x86_64-unknown-linux-gnu"}):
             sealed = release.seal_bundle(unpacked / package,
