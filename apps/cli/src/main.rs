@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::{
     fs,
     io::{BufRead, IsTerminal, Read, Seek, SeekFrom, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     num::{NonZeroU32, NonZeroUsize},
     path::{Path, PathBuf},
     process::Command,
@@ -15,6 +15,7 @@ use std::{
 use vibeface_bridge::{platform::privatefs, transport};
 use vibeface_control::{
     ControlRequest,
+    init::{DEFAULT_LISTEN, DEFAULT_LOCAL_LISTEN, InitOptions, InitProvider},
     maintenance::{self, MaintenanceCommand, SecretString, WalletCommand},
     observation,
 };
@@ -30,8 +31,6 @@ mod triage;
 mod tui;
 mod update;
 
-const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4790);
-const DEFAULT_LOCAL_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4791);
 const NO_HOME: &str =
     "no data directory: HOME is unset or not absolute; pass --data-dir or set VIBEFACE_DATA_DIR";
 const LOG_FILE: &str = "node.log";
@@ -150,7 +149,7 @@ enum Action {
     Logs(Logs),
 }
 
-#[derive(Args, Serialize)]
+#[derive(Args)]
 struct Init {
     /// Node data directory.
     #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = data_dir, default_value_os_t = default_data_dir())]
@@ -256,6 +255,60 @@ struct Init {
     /// the default bootstrap node.
     #[arg(long = "bootstrap", value_name = "LINK")]
     bootstrap: Vec<String>,
+}
+
+impl From<Init> for InitOptions {
+    fn from(args: Init) -> Self {
+        Self {
+            data_dir: args.data_dir,
+            listen: args.listen,
+            local_listen: args.local_listen,
+            public_url: args.public_url,
+            tls: args.tls,
+            no_web: args.no_web,
+            allowed_origins: args.allowed_origins,
+            roots: args.roots,
+            no_local_auto_access: args.no_local_auto_access,
+            allow_insecure_lan: args.allow_insecure_lan,
+            bins: args
+                .bins
+                .into_iter()
+                .map(|(provider, path)| (init_provider(provider), path))
+                .collect(),
+            codex_socket: args.codex_socket,
+            relays: args.relays,
+            relay_tokens: args.relay_tokens,
+            relay_listen: args.relay_listen,
+            relay_url: args.relay_url,
+            relay_operator_token: args.relay_operator_token,
+            relay_open: args.relay_open,
+            relay_rate: args.relay_rate,
+            relay_max_clients: args.relay_max_clients,
+            relay_max_clients_per_ip: args.relay_max_clients_per_ip,
+            forward_any: args.forward_any,
+            forward_sessions: args.forward_sessions,
+            forward_queue: args.forward_queue,
+            forward_rate: args.forward_rate,
+            forward_per_ip: args.forward_per_ip,
+            trusted_proxies: args.trusted_proxies,
+            no_mesh: args.no_mesh,
+            mesh_network: args.mesh_network,
+            bootstrap: args.bootstrap,
+            manager: args.manager.map(init_provider),
+            workspace: args.workspace,
+            model: args.model,
+        }
+    }
+}
+
+fn init_provider(provider: triage::Provider) -> InitProvider {
+    match provider {
+        triage::Provider::Codex => InitProvider::Codex,
+        triage::Provider::Cursor => InitProvider::Cursor,
+        triage::Provider::Claude => InitProvider::Claude,
+        triage::Provider::Pi => InitProvider::Pi,
+        triage::Provider::Opencode => InitProvider::Opencode,
+    }
 }
 
 #[derive(Args)]
@@ -801,7 +854,7 @@ async fn main() -> Result<()> {
         }
         Some(Action::Init(options)) => {
             let result = control(ControlRequest::Init {
-                options: serde_json::to_value(&*options)?,
+                options: (*options).into(),
             })
             .await?;
             println!("Vibeface 已就绪");
@@ -2491,6 +2544,160 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parsed_init(arguments: &[&str]) -> InitOptions {
+        let cli = Cli::try_parse_from(arguments).unwrap();
+        let Some(Action::Init(args)) = cli.command else {
+            panic!("expected init")
+        };
+        (*args).into()
+    }
+
+    #[test]
+    fn init_cli_defaults_match_the_shared_request_and_help() {
+        use clap::CommandFactory;
+        let options = parsed_init(&["vibeface", "init", "--data-dir", TEST_DATA_NODE]);
+        assert_eq!(options, InitOptions::new(PathBuf::from(TEST_DATA_NODE)));
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("init")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("[default: 127.0.0.1:4790]"));
+        assert!(help.contains("[default: 127.0.0.1:4791]"));
+    }
+
+    #[test]
+    fn every_init_cli_option_reaches_the_typed_request() {
+        let bin = format!("claude={TEST_BIN_PATH}");
+        let token = format!("https://relay.example={TEST_ONE_DIR}");
+        let options = parsed_init(&[
+            "vibeface",
+            "init",
+            "--data-dir",
+            TEST_DATA_NODE,
+            "--listen",
+            "127.0.0.1:4800",
+            "--local-listen",
+            "127.0.0.1:4801",
+            "--public-url",
+            "https://app.example",
+            "--tls",
+            "--no-web",
+            "--allowed-origin",
+            "https://one.example",
+            "--allowed-origin",
+            "https://two.example",
+            "--root",
+            TEST_ONE_DIR,
+            "--root",
+            TEST_TWO_DIR,
+            "--no-local-auto-access",
+            "--allow-insecure-lan",
+            "--manager",
+            "cursor",
+            "--workspace",
+            TEST_APP_DIR,
+            "--model",
+            "custom-model",
+            "--bin",
+            &bin,
+            "--codex-socket",
+            TEST_PRIVATE_NODE,
+            "--relay",
+            "https://relay.example",
+            "--relay-token",
+            &token,
+            "--relay-listen",
+            "127.0.0.1:4802",
+            "--relay-url",
+            "https://relay.local",
+            "--relay-operator-token",
+            TEST_TWO_DIR,
+            "--relay-open",
+            "--relay-rate",
+            "65536",
+            "--relay-max-clients",
+            "512",
+            "--relay-max-clients-per-ip",
+            "16",
+            "--forward-any",
+            "--forward-sessions",
+            "32",
+            "--forward-queue",
+            "192",
+            "--forward-rate",
+            "262144",
+            "--forward-per-ip",
+            "8",
+            "--trusted-proxy",
+            "203.0.113.1",
+            "--no-mesh",
+            "--mesh-network",
+            "lab",
+            "--bootstrap",
+            "controlled-node-link",
+        ]);
+        assert_eq!(
+            serde_json::to_value(ControlRequest::Init { options }).unwrap(),
+            json!({
+                "command": "init", "options": {
+                    "data_dir": TEST_DATA_NODE,
+                    "listen": "127.0.0.1:4800", "local_listen": "127.0.0.1:4801",
+                    "public_url": "https://app.example", "tls": true, "no_web": true,
+                    "allowed_origins": ["https://one.example", "https://two.example"],
+                    "roots": [TEST_ONE_DIR, TEST_TWO_DIR], "no_local_auto_access": true,
+                    "allow_insecure_lan": true,
+                    "manager": "cursor", "workspace": TEST_APP_DIR, "model": "custom-model",
+                    "bins": [["claude", TEST_BIN_PATH]], "codex_socket": TEST_PRIVATE_NODE,
+                    "relays": ["https://relay.example"], "relay_tokens": [["https://relay.example", TEST_ONE_DIR]],
+                    "relay_listen": "127.0.0.1:4802", "relay_url": "https://relay.local",
+                    "relay_operator_token": TEST_TWO_DIR, "relay_open": true, "relay_rate": 65536,
+                    "relay_max_clients": 512, "relay_max_clients_per_ip": 16,
+                    "forward_any": true, "forward_sessions": 32, "forward_queue": 192,
+                    "forward_rate": 262144, "forward_per_ip": 8, "trusted_proxies": ["203.0.113.1"],
+                    "no_mesh": true, "mesh_network": "lab", "bootstrap": ["controlled-node-link"]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn init_cli_maps_every_provider_and_rejects_partial_manager_or_zero_limits() {
+        for provider in ["codex", "cursor", "claude", "pi", "opencode"] {
+            let bin = format!("{provider}={TEST_BIN_PATH}");
+            let options = parsed_init(&[
+                "vibeface",
+                "init",
+                "--data-dir",
+                TEST_DATA_NODE,
+                "--manager",
+                provider,
+                "--workspace",
+                TEST_APP_DIR,
+                "--bin",
+                &bin,
+            ]);
+            let wire = serde_json::to_value(options).unwrap();
+            assert_eq!(wire["manager"], json!(provider));
+            assert_eq!(wire["workspace"], json!(TEST_APP_DIR));
+            assert_eq!(wire["model"], json!(null));
+            assert_eq!(wire["bins"], json!([[provider, TEST_BIN_PATH]]));
+        }
+        for tail in [
+            vec!["--manager", "codex"],
+            vec!["--workspace", TEST_APP_DIR],
+            vec!["--model", "custom-model"],
+            vec!["--manager", "unknown", "--workspace", TEST_APP_DIR],
+            vec!["--relay-listen", "127.0.0.1:4802", "--relay-rate", "0"],
+            vec!["--forward-per-ip", "0"],
+        ] {
+            let mut args = vec!["vibeface", "init", "--data-dir", TEST_DATA_NODE];
+            args.extend(tail);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
 
     #[test]
     fn plain_sync_description_clamps_future_timestamp() {

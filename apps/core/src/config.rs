@@ -7,6 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use vibeface_bridge::platform::privatefs;
+use vibeface_control::init::DEFAULT_LOCAL_LISTEN;
 use zeroize::Zeroizing;
 
 /// Fixed at 1 before the first stable release; schema changes update the fingerprint below.
@@ -17,9 +18,6 @@ pub const DATA_EPOCH_SCHEMA_SHA256: &str =
 pub fn data_epoch_marker() -> Vec<u8> {
     format!(r#"{{"data_epoch":{DATA_EPOCH}}}"#).into_bytes()
 }
-
-pub const DEFAULT_LOCAL_LISTEN: SocketAddr =
-    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 4791);
 
 pub const UNNAMED_NODE: &str = "Node";
 

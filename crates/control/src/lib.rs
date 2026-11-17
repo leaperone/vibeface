@@ -30,7 +30,7 @@ const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControlRequest {
     Init {
-        options: Value,
+        options: init::InitOptions,
     },
     Inspect {
         data_dir: PathBuf,
@@ -303,6 +303,7 @@ pub fn sibling_core(cli: &Path) -> Result<PathBuf> {
 }
 
 pub mod agent;
+pub mod init;
 pub mod maintenance;
 pub mod observation;
 
@@ -456,8 +457,8 @@ mod tests {
         let fixture = fixture(FixtureKind::Status)?;
         let error = request(
             &fixture.executable,
-            &ControlRequest::Inspect {
-                data_dir: std::env::temp_dir().join("vibeface-control-test"),
+            &ControlRequest::Init {
+                options: init::InitOptions::new(std::env::temp_dir().join("vibeface-control-test")),
             },
         )
         .await
