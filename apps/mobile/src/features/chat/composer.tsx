@@ -9,6 +9,7 @@ import { Button } from '@/components/arc/button'
 import { Icon } from '@/components/arc/icon'
 import { Text } from '@/components/arc/text'
 import type { Attachment } from '@/data/types'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { privateFiles } from '@/platform/files'
 import { ComposerInput, ComposerPanel } from '@/components/arc/chat'
 
@@ -32,11 +33,13 @@ type Props = {
 }
 
 export function Composer({ value, onChange, files, onFiles, attachmentScope, blocked, sending, onSend, onStop, children, target, sendLabel = '发送', label = '给 Bot 发消息' }: Props) {
+  const device = useDevice()
+  const connectionGeneration = device.connectionGeneration()
   const ios = Platform.OS === 'ios'
   const enabled = !blocked && !sending
-  const latest = useRef({ files, onFiles, attachmentScope, enabled, generation: 0, mounted: true })
-  if (latest.current.attachmentScope !== attachmentScope || latest.current.enabled !== enabled) latest.current.generation++
-  latest.current = { ...latest.current, files, onFiles, attachmentScope, enabled }
+  const latest = useRef({ files, onFiles, attachmentScope, enabled, device, connectionGeneration, generation: 0, mounted: true })
+  if (latest.current.attachmentScope !== attachmentScope || latest.current.enabled !== enabled || latest.current.connectionGeneration !== connectionGeneration) latest.current.generation++
+  latest.current = { ...latest.current, files, onFiles, attachmentScope, enabled, device, connectionGeneration }
   useEffect(() => {
     latest.current.mounted = true
     return () => { latest.current.mounted = false; latest.current.generation++ }
@@ -44,14 +47,17 @@ export function Composer({ value, onChange, files, onFiles, attachmentScope, blo
   const picking = useRef(false)
   const drafting = value.trim().length > 0 || files.length > 0
   const canSend = !blocked && !sending && drafting
-  const pick = async (source: 'photos' | 'files', generation: number) => {
-    if (picking.current || !latest.current.mounted || !latest.current.enabled || latest.current.generation !== generation) return
+  const pick = async (source: 'photos' | 'files', generation: number, connection: number) => {
+    if (picking.current || !latest.current.mounted || !latest.current.enabled || latest.current.generation !== generation || latest.current.device.connectionGeneration() !== connection) return
     picking.current = true
     const scope = latest.current.attachmentScope, request = ++latest.current.generation
-    const current = () => latest.current.mounted && latest.current.enabled && latest.current.attachmentScope === scope && latest.current.generation === request
+    const current = () => latest.current.mounted && latest.current.enabled && latest.current.attachmentScope === scope && latest.current.generation === request && latest.current.device.connectionGeneration() === connection
+    let fileCurrent = () => false
     try {
-      await privateFiles.run(async (fileCurrent) => {
-        const sources: string[] = [], added: Attachment[] = []
+      await privateFiles.run(async (active) => {
+        fileCurrent = active
+        const sources: string[] = [], owned: File[] = [], added: Attachment[] = [], errors: unknown[] = []
+        let handedOff = false
         try {
           if (source === 'photos') {
             const picked = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], allowsMultipleSelection: true, quality: 1, preferredAssetRepresentationMode: ImagePicker.UIImagePickerPreferredAssetRepresentationMode.Current })
@@ -59,37 +65,55 @@ export function Composer({ value, onChange, files, onFiles, attachmentScope, blo
             sources.push(...picked.assets.map(asset => asset.uri))
             if (!current() || !fileCurrent()) return
             for (const asset of picked.assets) {
+              const candidate = await privateFiles.retain(asset.uri)
+              owned.push(candidate)
+              if (!current() || !fileCurrent()) return
               const file = new File(asset.uri)
-              added.push({ uri: privateFiles.retain(asset.uri).uri, name: asset.fileName || file.name, size: asset.fileSize ?? file.size, mimeType: asset.mimeType || file.type || null })
+              added.push({ uri: candidate.uri, name: asset.fileName || file.name, size: asset.fileSize ?? file.size, mimeType: asset.mimeType || file.type || null })
             }
           } else {
             const picked = await DocumentPicker.getDocumentAsync({ multiple: true, copyToCacheDirectory: true })
             if (picked.canceled) return
             sources.push(...picked.assets.map(asset => asset.uri))
             if (!current() || !fileCurrent()) return
-            for (const asset of picked.assets) added.push({ uri: privateFiles.retain(asset.uri).uri, name: asset.name, size: asset.size ?? null, mimeType: asset.mimeType ?? null })
+            for (const asset of picked.assets) {
+              const candidate = await privateFiles.retain(asset.uri)
+              owned.push(candidate)
+              if (!current() || !fileCurrent()) return
+              added.push({ uri: candidate.uri, name: asset.name, size: asset.size ?? null, mimeType: asset.mimeType ?? null })
+            }
           }
-          if (current()) latest.current.onFiles([...latest.current.files, ...added])
-          else for (const file of added) privateFiles.release(file.uri)
-        } catch (cause) { for (const file of added) privateFiles.release(file.uri); throw cause }
-        finally { for (const uri of sources) privateFiles.releasePicker(uri) }
+          if (current() && fileCurrent()) {
+            latest.current.onFiles([...latest.current.files, ...added])
+            handedOff = true
+          }
+        } catch (cause) { errors.push(cause) }
+        finally {
+          if (!handedOff) for (const file of owned) {
+            try { privateFiles.release(file.uri) } catch (cause) { errors.push(cause) }
+          }
+          for (const uri of sources) {
+            try { privateFiles.releasePicker(uri) } catch (cause) { errors.push(cause) }
+          }
+          if (errors.length) throw errors.length === 1 ? errors[0] : new AggregateError(errors, '未能添加附件或清理选择副本。')
+        }
       })
     } catch (error) {
-      if (current()) Alert.alert('未能添加附件', error instanceof Error ? error.message : '请重试，或选择其他文件。')
+      if (current() && fileCurrent()) Alert.alert('未能添加附件', error instanceof Error ? error.message : '请重试，或选择其他文件。')
     } finally {
       picking.current = false
     }
   }
   const choose = () => {
     if (picking.current || !latest.current.mounted || !latest.current.enabled) return
-    const generation = latest.current.generation
+    const generation = latest.current.generation, connection = latest.current.device.connectionGeneration()
     if (ios) ActionSheetIOS.showActionSheetWithOptions({ options: ['照片图库', '文件', '取消'], cancelButtonIndex: 2 }, (index) => {
-      if (index === 0) void pick('photos', generation)
-      if (index === 1) void pick('files', generation)
+      if (index === 0) void pick('photos', generation, connection)
+      if (index === 1) void pick('files', generation, connection)
     })
     else Alert.alert('添加附件', undefined, [
-      { text: '照片图库', onPress: () => void pick('photos', generation) },
-      { text: '文件', onPress: () => void pick('files', generation) },
+      { text: '照片图库', onPress: () => void pick('photos', generation, connection) },
+      { text: '文件', onPress: () => void pick('files', generation, connection) },
       { text: '取消', style: 'cancel' },
     ])
   }
