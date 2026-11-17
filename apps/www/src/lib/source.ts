@@ -15,6 +15,7 @@ export const docs = defineDocs({
       'comparison.md',
       'install.md',
       'ios.md',
+      'mobile-push.md',
       'bot-and-execution.md',
       'history-sync.md',
       'privacy-security.md',

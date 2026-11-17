@@ -771,10 +771,11 @@ mod tests {
         )
         .await?;
         node.deliver_pushes(&transport, now + 180_000).await?;
-        let payloads = transport.payloads.lock().unwrap();
-        assert_eq!(payloads.last().unwrap()["sound"], "default");
-        assert_eq!(payloads.last().unwrap()["badge"], 4);
-        drop(payloads);
+        {
+            let payloads = transport.payloads.lock().unwrap();
+            assert_eq!(payloads.last().unwrap()["sound"], "default");
+            assert_eq!(payloads.last().unwrap()["badge"], 4);
+        }
         finish(node, dir).await
     }
 
