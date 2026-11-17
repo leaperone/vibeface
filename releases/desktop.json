@@ -1,0 +1,8 @@
+{
+  "cli": {
+    "manifest_sha256": "9fd4ea01f2161f891493c1726f1ac9b6cf5328e5c38362118d357f9c9c1cf041",
+    "source_commit": "8c130c769f839802626e05cbdf753a10e68abd7c",
+    "tag": "cli-v0.0.1-hourly.2026111703",
+    "version": "0.0.1-hourly.2026111703"
+  }
+}
