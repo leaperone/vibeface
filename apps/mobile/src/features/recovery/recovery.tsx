@@ -313,7 +313,7 @@ export function RotateHintCard() {
 
 /** This phone's recovery while it waits on the device it went through, or once one of the devices it would replace stopped it. */
 export function RecoveryWaiting() {
-  const { recovery, dismissRecovery, forgetUnsavedRecovery } = useDevice()
+  const { recovery, pauseRecovery, dismissRecovery, forgetUnsavedRecovery } = useDevice()
   if (recovery?.status === 'stopped') return <Panel icon={ShieldX} title={recoveryCopy.stopped}>
     <Text className="text-muted">{recoveryCopy.stoppedNote}</Text>
     <Button className="self-end" onPress={() => { forgetUnsavedRecovery(); dismissRecovery() }}><Text>知道了</Text></Button>
@@ -328,6 +328,7 @@ export function RecoveryWaiting() {
     {hint(Laptop, recoveryCopy.closeOk)}
     {/* Saving the new file is a separate thing to do now, not part of the wait. */}
     <UnsavedRecoveryFile />
+    {at === null ? <Button variant="ghost" className="self-start" onPress={pauseRecovery}><Text>返回</Text></Button> : null}
   </Panel>
 }
 

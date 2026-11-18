@@ -3,12 +3,14 @@ import type { ReactNode } from 'react'
 import { base64ToBytes, bytesToBase64, bytesToHex, sha256Hex } from '../lib/byte-codec.ts'
 import { joinLink, joinTicket, unreachableText, validEndpoint, validTarget } from '../lib/transport.ts'
 import type { DeviceChannel, JoinLink } from '../lib/transport.ts'
-import { array, boolean, deviceName, entryJson, entryKey, messageOf, nodeNow, parseEntry, parseInfo, parseJoinRequest, parseView, record, same, text } from '../lib/node.ts'
+import { array, boolean, deviceName, entryJson, entryKey, isRecord, messageOf, nodeNow, parseEntry, parseInfo, parseJoinRequest, parseView, record, same, text } from '../lib/node.ts'
 import type { ConnectionEntry, EntryInfo, JoinRequest, LocalSetup, Member, MembershipView, PendingRecovery, PublicIdentity, ReadyConnection } from '../lib/node.ts'
 import { shouldAutoConnect } from './connection-lane.ts'
 import { joinCopy, nodeJoinCopy, nodeJoinFailure, onlyManagerText } from './copy.ts'
 import { linkTarget } from './switch-network.ts'
 import { hideRecovery, recoveryHidden } from './recovery-notice.ts'
+import { approvalMatches, joinMatches, parseApprovalPins, parsePendingJoin, parseWaitRecord, pendingJoinJson, readIdentityRecord, recoveryCheckpointHash, waitRecordJson } from './persistence.ts'
+import type { Joining, PendingJoin, WaitRecord } from './persistence.ts'
 import { spentInviteText } from '../lib/errors.ts'
 import { parseChanged } from '../lib/progress.ts'
 import type { ChangedEvent } from '../lib/progress.ts'
@@ -30,21 +32,9 @@ type Reconnect = { entry: ConnectionEntry; networkId: string; attempt: number }
 type AuthenticatedEntry = Pick<Reconnect, 'entry' | 'networkId'>
 /** This browser's own recovery as its Node last told: waiting until `effectiveAt` on this browser's clock, or stopped. */
 type RecoveryWait = { status: 'waiting'; effectiveAt: number | null } | { status: 'stopped' }
-/**
- * What this browser keeps of a recovery it sent, to ask the Node how it stands and to trust the directory once it took
- * effect: `rootKey` is the key of the file it was sent with; `checkpoint`, when known, is the recovery itself.
- */
-type WaitRecord = { entry: ConnectionEntry; networkId: string; genesis: unknown; rootKey: string; checkpoint?: unknown }
-/**
- * This device's own join request; `nonce` stays here until the manager has committed its nonce. `pinned` holds the
- * network, manager and manager nonce seen before the reveal; the short code uses only these.
- */
-type Joining = { entry: ConnectionEntry; join_id: string; invite_id: string; nonce: string; name: string; status: JoinRequest['status']; pinned?: JoinPin; code?: string; admin?: string; reason?: string | null }
-type JoinPin = { network_id: string; admin_id: string; admin_nonce: string }
+type RecoveryCompletion = { active: Session; clientId: string; wait: WaitRecord; recovered: boolean }
 /** This computer's own join, as the Node reports it while the manager approves. */
 type NodeJoining = { status: 'waiting' | 'confirming' | 'joined'; code?: string; admin?: string }
-/** What a manager fixed when it sent its nonce: the request it saw, so a later answer of the entry cannot change it. */
-type ApprovalPin = { nonce: string; device_id: string; invite_id: string; commit: string }
 /** `open`: 加入 may go ahead; `used` or `expired`: the link's computer would refuse it. */
 export type InviteState = 'open' | 'used' | 'expired'
 const inviteState = (value: unknown): InviteState | null => {
@@ -78,7 +68,7 @@ type DeviceContextValue = {
   /** The Node's clock minus this browser's, as of the last directory: times in the directory are on the Node's clock. */
   nodeClockOffset: number
   /** This browser's own recovery while it waits, or once a device stopped it. */
-  recovery: RecoveryWait | null; dismissRecovery(): void
+  recovery: RecoveryWait | null; pauseRecovery(): void; dismissRecovery(): void
   /** This browser's recovery took effect; its new file still waits to be confirmed as saved. */
   recovered: boolean; finishRecovered(): void
   /** A new recovery file not yet confirmed as saved; `attempted` once a download was handed to the platform. */
@@ -139,6 +129,9 @@ const NODE_JOIN_TRIES = 5
 const changed = () => new Error('设备连接已切换。原操作结果需要确认，不会自动重发。')
 const superseded = () => new Error('这个恢复文件已作废。改用最近一次下载的那份。')
 const randomHex = () => bytesToHex(crypto.getRandomValues(new Uint8Array(32)))
+const joinRecordError = () => new Error('无法确认本地加入记录。核对原来的加入请求，或取消后再使用新链接。')
+const approvalRecordError = () => new Error('无法确认本地审批记录。请核对原来的加入请求。')
+const waitRecordError = () => new Error('无法确认本地找回记录。请保留恢复文件，到原节点核对找回结果。')
 /** Saved connections, pins and pending joins in this device's storage. */
 function deviceStore(storage: KeyValue, self: string) {
   const { readStorage, writeStorage } = storageOf(storage)
@@ -171,24 +164,11 @@ function deviceStore(storage: KeyValue, self: string) {
     }
     return targets
   }
-  function loadJoining(): Joining | null {
-    try {
-      const v = record(load('pending-join'))
-      const pin = v.pinned ? record(v.pinned) : null
-      const pinned = pin ? { network_id: validTarget(pin.network_id), admin_id: validTarget(pin.admin_id), admin_nonce: validTarget(pin.admin_nonce) } : undefined
-      return { entry: parseEntry(v.entry), join_id: String(v.join_id), invite_id: String(v.invite_id), nonce: validTarget(v.nonce), name: deviceName(String(v.name)), status: 'pending', pinned }
-    } catch { return null }
-  }
-  function approvalPins(): Record<string, ApprovalPin> { const value = load('approval-pins'); return value && typeof value === 'object' ? value as Record<string, ApprovalPin> : {} }
+  const loadJoining = () => readIdentityRecord(storage, 'pending-join', parsePendingJoin)
+  const loadApprovalPins = () => readIdentityRecord(storage, 'approval-pins', parseApprovalPins)
   const loadEntrances = (networkId: string): Entrance[] => storedEntrances(load(`entrances.${networkId}`))
   const loadGateways = (networkId: string): Gateway[] => gatewaysOf(load(`gateways.${networkId}`))
-  function loadWait(): WaitRecord | null {
-    try {
-      const v = record(load('recovery-wait'))
-      return { entry: parseEntry(v.entry), networkId: validTarget(v.networkId), genesis: record(v.genesis), rootKey: validTarget(v.rootKey), checkpoint: v.checkpoint === undefined ? undefined : record(v.checkpoint) }
-    } catch { return null }
-  }
-  return { load, store, savedEntries, loadAuthenticated, resumeTargets, loadJoining, approvalPins, loadEntrances, loadGateways, loadWait }
+  return { load, store, savedEntries, loadAuthenticated, resumeTargets, loadJoining, loadApprovalPins, loadEntrances, loadGateways }
 }
 function publicIdentity({ deviceId }: { deviceId: string }): PublicIdentity { return { deviceId } }
 function isResponseError(error: unknown) { return error instanceof Error && 'responded' in error && error.responded === true }
@@ -207,7 +187,7 @@ function absorb(seen: Vector, vector: unknown) {
 /** `restart` mounts a fresh provider after a factory reset, so the app starts over as on first launch. */
 export function DeviceProvider({ platform, children, restart }: { platform: Platform; children: ReactNode; restart?(): void }) {
   const { self, page } = platform
-  const { load, store, savedEntries, loadAuthenticated, resumeTargets, loadJoining, approvalPins, loadEntrances, loadGateways, loadWait } = deviceStore(platform.storage, self)
+  const { load, store, savedEntries, loadAuthenticated, resumeTargets, loadJoining, loadApprovalPins, loadEntrances, loadGateways } = deviceStore(platform.storage, self)
   const { Identity, createGenesis, governancePayload, inviteSigningPayload, joinCommit, openPackage, sealPackage, shortCode, ticketEncode, verifiedView, verifyAddress, verifyAuthentication, verifyRemoval, verifyState } = secureKit(platform.secure)
   const { connectDevice, initClient, parseJoinLink, replaceClient, signClient } = platform.transport
   const discoverLocalSetup = async (signal: AbortSignal) => page ? page.discoverLocalSetup(signal) : null
@@ -217,9 +197,9 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
    * sending that nonce, and only once the revealed nonce opens the commitment it saw. A lying entry gets no code.
    */
   function managerCode(request: JoinRequest, networkId: string, me: string): JoinRequest {
-    const pin = approvalPins()[request.join_id]
-    if (!pin || !request.joiner_nonce || request.admin_id !== me || request.admin_nonce !== pin.nonce || request.device_id !== pin.device_id || request.invite_id !== pin.invite_id || request.commit !== pin.commit) return request
-    if (joinCommit(pin.device_id, request.joiner_nonce) !== pin.commit) return request
+    const stored = loadApprovalPins()
+    const pin = stored.kind === 'valid' ? stored.value.pins.get(request.join_id) : undefined
+    if (!pin || !request.joiner_nonce || request.admin_id !== me || request.admin_nonce !== pin.nonce || !approvalMatches(request, networkId, pin) || joinCommit(pin.device_id, request.joiner_nonce) !== pin.commit) return { ...request, code: undefined }
     return { ...request, code: shortCode(networkId, pin.invite_id, pin.device_id, me, pin.nonce, request.joiner_nonce) }
   }
   const [identity, setIdentity] = useState<PublicIdentity | null>(null)
@@ -236,7 +216,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   const [nodeClockOffset, setNodeClockOffset] = useState(0)
   const [recovery, setRecovery] = useState<RecoveryWait | null>(null)
   // Kept so a reload before the new file is confirmed still lands on it; the wait record goes, so a reload resumes as usual.
-  const [recovered, setRecovered] = useState(load('recovered') === true)
+  const [recovered, setRecovered] = useState(() => load('recovered') === true && readIdentityRecord(platform.storage, 'recovery-wait', record).kind === 'empty')
   const kept = useRef<KeptRecovery | null>(null)
   const [unsavedRecovery, setUnsavedRecovery] = useState<UnsavedRecovery | null>(() => {
     kept.current = loadKept(platform)
@@ -263,6 +243,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   const generation = useRef(0)
   const session = useRef<Session | null>(null)
   const connecting = useRef<AbortController | null>(null)
+  const openingConnection = useRef<AbortController | null>(null)
   const sensitive = useRef<Sensitive | null>(null)
   const listeners = useRef(new Set<(event: ChangedEvent) => void>())
   const reconnect = useRef<Reconnect | null>(null)
@@ -271,6 +252,12 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const identityRef = useRef<PublicIdentity | null>(null)
   const joiningRef = useRef<Joining | null>(null)
+  const joinSending = useRef<Joining | null>(null)
+  const joinOpening = useRef<Promise<Session> | null>(null)
+  const recoveryCheck = useRef<Promise<boolean> | null>(null)
+  const recoveryAuthenticating = useRef<Session | null>(null)
+  const recoveryPaused = useRef(false)
+  const recoveryCompletion = useRef<RecoveryCompletion | null>(null)
   const [link, setLinkState] = useState<Link>({ kind: 'booting' })
   const linkRef = useRef<Link>({ kind: 'booting' })
   const [entrances, setEntrances] = useState<OpenEntrance[]>([])
@@ -301,10 +288,33 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   }
   const releaseSensitive = useCallback(() => { sensitive.current?.cancel(); sensitive.current = null; setReview(null) }, [])
   const setJoin = useCallback((next: Joining | null) => {
+    store('pending-join', next && pendingJoinJson(next))
+    if (next) requirePendingJoin(next)
     joiningRef.current = next; setJoining(next)
-    store('pending-join', next && { entry: entryJson(next.entry), join_id: next.join_id, invite_id: next.invite_id, nonce: next.nonce, name: next.name, pinned: next.pinned })
   }, [])
-  const resetConnection = useCallback(() => {
+  function stopJoinCheck(error: Error): never {
+    const joining = joiningRef.current
+    if (joining?.code) { const next = { ...joining, code: undefined }; joiningRef.current = next; setJoining(next) }
+    setError(error.message)
+    throw error
+  }
+  function requirePendingJoin(pending: PendingJoin) {
+    const stored = loadJoining()
+    if (stored.kind !== 'valid' || !same(pendingJoinJson(stored.value), pendingJoinJson(pending))) stopJoinCheck(joinRecordError())
+  }
+  function parseWait(value: unknown) {
+    return parseWaitRecord(value, {
+      deviceId: own().deviceId,
+      verifyGenesis: (genesis, networkId) => verifyState({ genesis, checkpoints: [], events: [] }, networkId).free(),
+      verify: platform.secure.verify,
+    })
+  }
+  const loadWait = () => readIdentityRecord(platform.storage, 'recovery-wait', parseWait)
+  function requireWait(wait: WaitRecord) {
+    const stored = loadWait()
+    if (stored.kind !== 'valid' || !same(waitRecordJson(stored.value), waitRecordJson(wait))) throw waitRecordError()
+  }
+  const resetConnection = useCallback((pending: Joining | null = null) => {
     reconnect.current = null
     setDisplayScope(null)
     pendingEntrance.current = null
@@ -314,14 +324,16 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     generation.current += 1
     releaseSensitive()
     connecting.current?.abort(); connecting.current = null
+    openingConnection.current = null
     probing.current?.abort(); probing.current = null
     const previous = session.current; session.current = null
     previous?.channel.close()
     listeners.current.clear(); setReady(null); setDirectory(null); setJoins([]); setInfo(null); setEntry(null); setLocalAutoAccessState(null)
-    joiningRef.current = null; setJoining(null); setPhase('disconnected'); setError('')
+    joiningRef.current = pending; setJoining(pending); setPhase('disconnected'); setError('')
     step({ type: 'left' })
   }, [releaseSensitive])
   const disconnect = useCallback(() => {
+    recoveryPaused.current = true; setRecovery(null)
     resetConnection()
     try { store('last-authenticated', null); store('pending-join', null); store('stay-disconnected', true) } catch (cause) { setError(messageOf(cause)) }
   }, [resetConnection])
@@ -361,7 +373,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const request = scoped(active)
     let verified: ReturnType<typeof verifyAuthentication>
     try {
-      const trust: AuthenticationTrust | null = active.entry.kind === 'local'
+      const trust: AuthenticationTrust | null = active.entry.kind === 'local' && expected?.kind !== 'root'
         ? { kind: 'local', networkId: expected?.networkId ?? validTarget(record(record(authValue).principal).network_id), nodeId: active.entry.device_id }
         : expected
       verified = verifyAuthentication(authValue, own(), trust)
@@ -385,7 +397,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     resumeQueue.current = []
     saveEntry(active.entry)
     store('last-authenticated', { entry: entryJson(active.entry), networkId: principal.network_id })
-    store('pending-join', null); store('stay-disconnected', null)
+    store('stay-disconnected', null)
     active.networkId = principal.network_id
     pendingEntrance.current = null
     reconnect.current = { entry: active.entry, networkId: principal.network_id, attempt: 0 }
@@ -402,7 +414,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     setLocalSetup(local => local && entryKey(local.entry) === entryKey(active.entry) ? { kind: 'initialized', entry: local.entry, removed: false } : local)
     step({ type: 'ready', joined: true }, { type: 'connect' }, { type: 'connected', behind: lagging })
     if (principal.source === 'membership') void refreshEntrances(active, view)
-    return view
+    return verified
   }
   /**
    * Signed entrance records, checked against the verified directory, merged into this origin's list; the public
@@ -516,7 +528,8 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
         if (own && removed(auth, active, target.networkId)) return true
         if (auth.principal === null && (auth.revoked === true || own)) throw new AuthenticationError(auth.revoked === true ? removedText(self) : `${self}已不在我的设备里。`)
         if (auth.principal === null) throw new Error(`这个访问地址还没同步到${self}。`)
-        await authenticate(auth, active, { kind: 'network', networkId: target.networkId })
+        const verified = await authenticate(auth, active, { kind: 'network', networkId: target.networkId })
+        resumeRecoveryCompletion(active, verified)
         if (candidate !== target.entry) tabs.post({ type: 'entrance', networkId: target.networkId, entry: candidate })
         return true
       } catch (cause) {
@@ -544,10 +557,11 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     }
     return false
   }
-  async function open(parsed: ConnectionEntry, resuming = false, timeoutMs = 10000) {
-    if (!resuming) { resetConnection(); setPhase('connecting'); setEntry(parsed) }
+  async function open(parsed: ConnectionEntry, resuming = false, timeoutMs = 10000, pendingJoin?: Joining) {
+    if (!resuming) { resetConnection(pendingJoin); setPhase('connecting'); setEntry(parsed) }
     const version = generation.current
     const controller = new AbortController(); connecting.current = controller
+    openingConnection.current = controller
     let opened: DeviceChannel | null = null
     setQueued(null)
     try {
@@ -591,11 +605,11 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
           generation.current += 1
           const previous = session.current; session.current = null; controller.abort(); previous?.channel.close()
           setPhase('reconnecting'); scheduleReconnect()
-        } else { resetConnection(); setError(messageOf(cause)) }
+        } else { resetConnection(pendingJoin); setError(messageOf(cause)) }
       }
       opened?.close()
       throw cause
-    }
+    } finally { if (openingConnection.current === controller) openingConnection.current = null }
   }
   /** Resolves true when the device turned out to be removed. */
   async function connect(candidate: ConnectionEntry) {
@@ -722,30 +736,38 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     return { link: joinLink(ticket), expiresAt }
   }
   async function startApproval(joinId: string) {
-    managing()
-    const pins = approvalPins()
+    const connection = managing(), networkId = connection.principal.network_id, me = own().deviceId
+    const stored = loadApprovalPins()
     const seen = joins.find(item => item.join_id === joinId)
-    if (!pins[joinId]) {
-      if (seen?.status !== 'pending') throw new Error('这个加入请求已失效。重新生成加入链接。')
-      // Kept across reloads and retries, so a repeated start sends the same nonce.
-      pins[joinId] = { nonce: randomHex(), device_id: seen.device_id, invite_id: seen.invite_id, commit: seen.commit }
-      store('approval-pins', Object.fromEntries(Object.entries(pins).slice(-16)))
+    if (!seen || (seen.status !== 'pending' && seen.status !== 'confirming') || seen.join_id !== seen.invite_id || seen.network_id !== networkId) throw new Error('这个加入请求已失效。重新生成加入链接。')
+    let pin = stored.kind === 'valid' ? stored.value.pins.get(joinId) : undefined
+    if (pin) {
+      if (!approvalMatches(seen, networkId, pin) || (seen.status === 'confirming' && (seen.admin_id !== me || seen.admin_nonce !== pin.nonce))) throw approvalRecordError()
+    } else {
+      if (seen.status !== 'pending' || (stored.kind !== 'empty' && (stored.kind !== 'valid' || stored.value.damaged))) throw approvalRecordError()
+      pin = { nonce: randomHex(), device_id: seen.device_id, invite_id: seen.invite_id, commit: seen.commit }
+      // Persist before sending, and keep earlier nonces while their requests may still be unresolved.
+      const pins = stored.kind === 'valid' ? stored.value.pins : new Map()
+      pins.set(joinId, pin)
+      store('approval-pins', Object.fromEntries(pins))
     }
-    const request = parseJoinRequest(await scoped()('approve', { join_id: joinId, admin_nonce: pins[joinId].nonce }))
-    if (request.status !== 'confirming') throw new Error('这个加入请求已失效。重新生成加入链接。')
+    const request = parseJoinRequest(await scoped()('approve', { join_id: joinId, admin_nonce: pin.nonce }))
+    if (request.join_id !== joinId || request.status !== 'confirming' || request.admin_id !== me || request.admin_nonce !== pin.nonce || !approvalMatches(request, networkId, pin)) throw new Error('节点返回的审批和原请求不一致。请刷新后核对。')
     await refreshDirectory()
   }
   async function approveJoin(joinId: string, manage: boolean) {
-    managing()
+    const connection = managing(), send = scoped()
     const request = joins.find(item => item.join_id === joinId)
     if (!request?.code || request.status !== 'confirming') throw new Error('新设备还没显示安全码。等它显示后再允许。')
-    const response = record(await scoped()('directory'))
+    if (managerCode(request, connection.principal.network_id, own().deviceId).code !== request.code) throw approvalRecordError()
+    const response = record(await send('directory'))
+    if (managerCode(request, connection.principal.network_id, own().deviceId).code !== request.code) throw approvalRecordError()
     const verified = verifyState(response.state, request.network_id, nodeNow(response))
     let event: Record<string, unknown>
     try { event = JSON.parse(verified.governanceTemplate(own().deviceId, JSON.stringify({ type: 'grant', member: { device_id: request.device_id, kind: request.kind, name: request.name, manage: manage && request.kind === 'client' } }))) }
     finally { verified.free() }
     event.signature = await signClient('identity-governance', governancePayload(JSON.stringify(event)))
-    const result = parseJoinRequest(await scoped()('approve', { join_id: joinId, event }))
+    const result = parseJoinRequest(await send('approve', { join_id: joinId, event }))
     if (result.status !== 'joined') throw new Error('加入还没完成。刷新后再看。')
     await refreshDirectory()
   }
@@ -973,12 +995,13 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   }
   /** Joins through a ticket link: commit, wait for the manager's nonce, reveal, show the short code. */
   async function join(linkText: string, nameValue: string) {
+    if (loadJoining().kind !== 'empty') throw joinRecordError()
     const name = deviceName(nameValue)
     const link: JoinLink = await parseJoinLink(linkText)
+    let active: Session | null = null
     // Joining opens a new connection, so the screen drops this failure as stale; keep it here.
     try {
       const ways = joinWays(link)
-      let active: Session | null = null
       for (const [index, way] of ways.entries()) {
         const last = index === ways.length - 1
         try { active = await open(way, false, way.kind === 'lan' && !last ? LAN_MS : 10000) }
@@ -989,29 +1012,80 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       }
       if (!active) throw new Error('连不上这个节点。')
       // A browser removed from this network joins again as a new device; its old key stays revoked.
-      if (record(await scoped(active)('authenticate')).revoked === true) {
+      const revoked = record(await scoped(active)('authenticate')).revoked === true
+      if (loadJoining().kind !== 'empty') throw joinRecordError()
+      if (revoked) {
         const fresh = publicIdentity(await replaceClient())
         identityRef.current = fresh; setIdentity(fresh)
         active = await open(active.entry)
       }
       const me = own().deviceId
+      if (loadJoining().kind !== 'empty') throw joinRecordError()
       const nonce = randomHex()
-      let response: ReturnType<typeof parseJoinRequest>
-      try { response = parseJoinRequest(await scoped(active)('join', { secret: link.secret, public_key: me, kind: 'client', name, commit: joinCommit(me, nonce) })) }
-      finally { link.secret = '' }
-      spend(linkText)
-      if (response.invite_id !== link.inviteId || response.device_id !== me) throw new Error('加入结果和这条链接对不上，已停止。重新生成加入链接。')
-      if (response.status === 'rejected' || response.status === 'expired') throw new Error(response.status === 'rejected' ? joinCopy.rejected : spentInviteText)
-      setJoin({ entry: active.entry, join_id: response.join_id, invite_id: response.invite_id, nonce, name, status: response.status })
+      const commit = joinCommit(me, nonce)
+      const pending: Joining = { ...parsePendingJoin({ entry: entryJson(active.entry), join_id: link.inviteId, invite_id: link.inviteId, nonce, name }), status: 'pending' }
+      setJoin(pending)
+      joinSending.current = pending
+      try {
+        const submitted = scoped(active)('join', { secret: link.secret, public_key: me, kind: 'client', name, commit })
+        spend(linkText)
+        const response = parseJoinRequest(await submitted)
+        requirePendingJoin(pending)
+        if (!joinMatches(response, pending, me, commit)) stopJoinCheck(new Error('加入结果和这条链接对不上，请核对原来的加入请求。'))
+        finishJoinFailure(response)
+      } finally {
+        if (joinSending.current === pending) joinSending.current = null
+        link.secret = ''
+      }
       await checkJoin()
-    } catch (cause) { link.secret = ''; setError(messageOf(cause)); throw cause }
+    } catch (cause) {
+      link.secret = ''
+      if (active && (session.current === active || (!session.current && !openingConnection.current && generation.current === active.generation + 1 && joiningRef.current))) setError(messageOf(cause))
+      throw cause
+    }
+  }
+  function finishJoinFailure(status: JoinRequest) {
+    if (status.status !== 'rejected' && status.status !== 'expired' && status.status !== 'withdrawn') return
+    const message = status.reason === 'commitment_mismatch' ? '加入请求校验失败，已作废。重新生成加入链接。'
+      : status.status === 'expired' ? spentInviteText
+      : status.status === 'withdrawn' ? '这次加入已取消。重新生成加入链接。' : joinCopy.rejected
+    setJoin(null); setError(message)
+    throw new Error(message)
+  }
+  async function resumePendingJoin(pending: PendingJoin) {
+    const joining: Joining = { ...pending, status: 'pending' }
+    if (openingConnection.current || session.current) resetConnection(joining)
+    else { joiningRef.current = joining; setJoining(joining) }
+    const checking = checkJoin(), version = generation.current
+    try { await checking }
+    catch (cause) { if (version === generation.current) setError(messageOf(cause)) }
   }
   async function checkJoin() {
     const pending = joiningRef.current
-    if (!pending) return
-    const active = current(), request = scoped(active)
+    if (!pending || joinSending.current === pending || joinOpening.current) return
+    requirePendingJoin(pending)
+    let active = session.current
+    if (!active) {
+      if (openingConnection.current) return
+      const opening = open(pending.entry, false, 10000, pending)
+      joinOpening.current = opening
+      try { active = await opening }
+      finally { if (joinOpening.current === opening) joinOpening.current = null }
+    }
+    const request = scoped(active)
+    if (entryKey(active.entry) !== entryKey(pending.entry)) throw changed()
+    const me = own().deviceId, commit = joinCommit(me, pending.nonce)
+    const checkBinding = (status: JoinRequest, mine: PendingJoin) => {
+      if (!joinMatches(status, mine, me, commit)) stopJoinCheck(new Error(`加入状态与${self}不一致。`))
+      const pin = mine.pinned
+      if (pin && (status.network_id !== pin.network_id || status.admin_id !== pin.admin_id || status.admin_nonce !== pin.admin_nonce)) {
+        stopJoinCheck(new Error('连接的设备改动了加入请求，已停止。请核对原来的加入请求。'))
+      }
+    }
     let status = parseJoinRequest(await request('join_status', { join_id: pending.join_id }))
     if (joiningRef.current !== pending) return
+    requirePendingJoin(pending)
+    checkBinding(status, pending)
     let mine = pending
     if (status.status === 'confirming' && !status.joiner_nonce && status.admin_id && status.admin_nonce) {
       // Fix the manager's nonce before revealing ours, so the entry cannot pick it after seeing our nonce.
@@ -1019,26 +1093,19 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       status = parseJoinRequest(await request('join_status', { join_id: pending.join_id, reveal: pending.nonce }))
     }
     if (joiningRef.current !== mine) return
-    if (status.device_id !== own().deviceId || status.invite_id !== pending.invite_id) throw new Error(`加入状态与${self}不一致。`)
+    requirePendingJoin(mine)
+    checkBinding(status, mine)
     const pin = mine.pinned
-    if (pin && status.admin_id && (status.network_id !== pin.network_id || status.admin_id !== pin.admin_id || status.admin_nonce !== pin.admin_nonce)) {
-      const failure = new Error('连接的设备改动了加入请求，已停止。重新生成加入链接。')
-      setJoin(null); setError(failure.message)
-      throw failure
-    }
     if (status.status === 'joined') {
       if (pin?.network_id !== status.network_id) throw new Error('加入结果和显示安全码时的不一样，已停止。重新生成加入链接。')
       const state = record(await request('join_status', { join_id: pending.join_id })).state
       verifiedView(state, status.network_id).members.find(member => member.device_id === own().deviceId) ?? (() => { throw new Error(`加入结果没有包含${self}。`) })()
       await authenticate(await request('authenticate', { network_id: status.network_id }), active, { kind: 'network', networkId: status.network_id })
+      requirePendingJoin(mine)
+      setJoin(null)
       return
     }
-    if (status.status === 'rejected' || status.status === 'expired') {
-      // The join is gone, so the poller can no longer tell it apart from a stale one; say why here.
-      const failure = new Error(status.reason === 'commitment_mismatch' ? '加入请求校验失败，已作废。重新生成加入链接。' : status.status === 'expired' ? '加入链接已过期。重新生成一条。' : joinCopy.rejected)
-      setJoin(null); setError(failure.message)
-      throw failure
-    }
+    finishJoinFailure(status)
     const code = pin && status.joiner_nonce ? shortCode(pin.network_id, pending.invite_id, own().deviceId, pin.admin_id, pin.admin_nonce, pending.nonce) : undefined
     const next = { ...mine, status: status.status, code, admin: status.admin_name }
     joiningRef.current = next; setJoining(next)
@@ -1123,6 +1190,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const file: KeptRecovery = { name: recoveryFileName(code), code, attempted: false, bytes: bytes.slice() }
     try { setKept(file) } catch (cause) { file.bytes.fill(0); throw cause }
     try { await platform.saveRecovery(file.bytes, file.name); if (kept.current === file) setKept({ ...file, attempted: true }) } catch {}
+    return file.bytes
   }
   async function downloadUnsavedRecovery() {
     const file = kept.current
@@ -1133,11 +1201,31 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   /**
    * Root recovery keeps every current member by default, adds this device as a manager and hands recovery to a new
    * file. It takes effect two days later unless a manager it would replace stops it; this browser keeps a record of it
-   * to ask the Node how it stands. The new file is saved before the Node hears of it; a retry after an unknown result
-   * sends the same checkpoint again.
+   * to ask the Node how it stands. The new file is saved before the Node hears of it. After dispatch only reads the
+   * original Node's answer for this checkpoint.
    */
   async function beginRecovery(input: { file: RecoveryFile; password: string; name: string; entry: ConnectionEntry }) {
+    const existing = loadWait()
+    if (existing.kind === 'invalid' || existing.kind === 'unreadable'
+      || existing.kind === 'valid' && existing.value.entry.device_id !== input.entry.device_id) throw waitRecordError()
     const name = deviceName(input.name)
+    if (existing.kind === 'valid') {
+      const version = generation.current, password = input.password
+      input.password = ''
+      const opened = await openPackage(input.file, password)
+      try {
+        if (version !== generation.current) throw changed()
+        const wait = existing.value
+        if (opened.networkId !== wait.networkId || opened.root.deviceId() !== wait.rootKey) throw waitRecordError()
+        requireWait(wait)
+        recoveryPaused.current = false
+        if (!recoveryCheck.current) resetConnection()
+        setRecovery({ status: 'waiting', effectiveAt: null })
+        await checkRecovery(wait)
+        return
+      } finally { opened.release() }
+    }
+    recoveryPaused.current = false
     const active = await open(input.entry)
     const request = scoped(active)
     let password = input.password
@@ -1169,6 +1257,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
         state = read.state; heads = read.heads; offset = (nodeNow(read) ?? Date.now()) - Date.now()
       }
       if (session.current !== active || active.generation !== generation.current) throw changed()
+      if (loadWait().kind !== 'empty') throw waitRecordError()
       const view = verifiedView(state, opened.networkId, Date.now() + offset)
       if (view.recovery_key !== opened.root.deviceId()) throw superseded()
       const chain = array(record(state).checkpoints), events = array(record(state).events)
@@ -1181,47 +1270,82 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       }
       const newManager: Member = { device_id: me, kind: 'client', name, manage: true }
       const allowed = new Map(members.map(member => [member.device_id, member]))
-      let prepared: { checkpoints: unknown[]; checkpoint: unknown } | null = null
+      let prepared: { checkpoints: unknown[]; wait: WaitRecord; code: string; backup: Uint8Array | null; retained?: Uint8Array } | null = null
+      let confirming: Promise<void> | null = null
+      const ownsFlow = () => !released && !recoveryPaused.current && sensitive.current === flow && session.current === active && generation.current === active.generation
+      const releaseFlow = () => { prepared?.backup?.fill(0); release() }
       const flow: Sensitive = {
-        cancel: release,
-        async recover(selectedInput) {
-          if (released || session.current !== active) throw new Error('恢复文件已关闭。重新选一次。')
-          if (!prepared) {
-            const selected = selectedInput.map(member => {
-              const original = allowed.get(member.device_id)
-              if (!original || original.kind !== member.kind || original.name !== member.name || member.kind === 'node' && member.manage) throw new Error('设备列表变了。重新打开恢复文件。')
-              return member
-            })
-            if (!selected.some(member => member.device_id === active.entry.device_id) || new Set(selected.map(member => member.device_id)).size !== selected.length) throw new Error('要保留正在连接的这个节点。')
-            selected.push(newManager)
-            const next = Identity.generate()
-            let verified: ReturnType<typeof verifyState> | null = null
-            try {
-              const code = await recoveryCode(next.deviceId())
-              if (released || session.current !== active) throw new Error('恢复文件已关闭。重新选一次。')
-              verified = verifyState(state, opened.networkId, Date.now() + offset)
-              const checkpoint: unknown = JSON.parse(verified.createRecoveryCheckpoint(opened.root, next.deviceId(), JSON.stringify(selected), JSON.stringify(heads)))
-              const checkpoints = [...chain, checkpoint]
-              const bytes = sealPackage({ networkId: opened.networkId, genesis, checkpoints, events }, next, password)
-              try { await keepRecoveryFile(bytes, code) } finally { bytes.fill(0) }
-              if (released || session.current !== active || active.generation !== generation.current) throw changed()
-              prepared = { checkpoints, checkpoint }
-            } finally { next.free(); verified?.free() }
-            password = ''
-          }
-          if (released || session.current !== active || active.generation !== generation.current) throw changed()
-          const wait: WaitRecord = { entry: active.entry, networkId: opened.networkId, genesis, rootKey: view.recovery_key, checkpoint: prepared.checkpoint }
-          store('recovery-wait', { ...wait, entry: entryJson(wait.entry) })
-          let auth: Record<string, unknown>
-          try { auth = record(await request('recover', { genesis, checkpoints: prepared.checkpoints, events, ...(fresh ? { capability } : {}) })) }
-          catch (cause) { throw new Error(`${messageOf(cause)} 再点一次“找回”会重试同一次找回，不会再下载文件。`) }
-          if (released) throw new Error('找回已提交，但这里已取消。重新连接看看结果，之后用刚下载的恢复文件。')
-          try {
-            if (auth.principal !== null) await recoveredAs(auth, active, wait)
-            // A waiting browser is a guest, whose channel times out; the wait is checked over fresh ones.
-            else { resetConnection(); noteRecovery(auth) }
-          } finally { if (sensitive.current === flow) releaseSensitive(); else release() }
+        cancel: releaseFlow,
+        recover(selectedInput) {
+          confirming ??= Promise.resolve().then(() => confirm(selectedInput)).finally(() => { confirming = null })
+          return confirming
         },
+      }
+      async function confirm(selectedInput: Member[]) {
+        if (!ownsFlow()) throw changed()
+        if (!prepared) {
+          if (loadWait().kind !== 'empty') throw waitRecordError()
+          const selected = selectedInput.map(member => {
+            const original = allowed.get(member.device_id)
+            if (!original || original.kind !== member.kind || original.name !== member.name || member.kind === 'node' && member.manage) throw new Error('设备列表变了。重新打开恢复文件。')
+            return member
+          })
+          if (!selected.some(member => member.device_id === active.entry.device_id) || new Set(selected.map(member => member.device_id)).size !== selected.length) throw new Error('要保留正在连接的这个节点。')
+          selected.push(newManager)
+          const next = Identity.generate()
+          let verified: ReturnType<typeof verifyState> | null = null
+          try {
+            const code = await recoveryCode(next.deviceId())
+            if (!ownsFlow()) throw changed()
+            if (loadWait().kind !== 'empty') throw waitRecordError()
+            verified = verifyState(state, opened.networkId, Date.now() + offset)
+            const checkpoint: unknown = JSON.parse(verified.createRecoveryCheckpoint(opened.root, next.deviceId(), JSON.stringify(selected), JSON.stringify(heads)))
+            const checkpoints = [...chain, checkpoint]
+            const wait = parseWait({ entry: entryJson(active.entry), networkId: opened.networkId, genesis, rootKey: view.recovery_key, checkpoint })
+            const backup = sealPackage({ networkId: opened.networkId, genesis, checkpoints, events }, next, password)
+            prepared = { checkpoints, wait, code, backup }
+            password = ''
+          } finally { next.free(); verified?.free() }
+        }
+        const plan = prepared
+        if (plan.backup) {
+          plan.retained = await keepRecoveryFile(plan.backup, plan.code)
+          plan.backup.fill(0); plan.backup = null
+        }
+        if (!ownsFlow()) throw changed()
+        if (plan.retained !== kept.current?.bytes) throw new Error('找回文件已清除，无法提交这次找回。')
+        const { wait } = plan
+        if (loadWait().kind === 'empty') store('recovery-wait', waitRecordJson(wait))
+        requireWait(wait)
+        const controller = connecting.current
+        try {
+          let auth: Record<string, unknown>
+          try { auth = record(await request('recover', { genesis, checkpoints: plan.checkpoints, events, ...(fresh ? { capability } : {}) })) }
+          catch (cause) {
+            const dropped = !session.current && connecting.current === controller && generation.current === active.generation + 1
+            if (recoveryPaused.current || (!ownsFlow() && !dropped)) throw cause
+            if (session.current === active) resetConnection()
+            setRecovery({ status: 'waiting', effectiveAt: null })
+            const confirmed = await checkRecovery(wait).catch(() => false)
+            if (confirmed) return
+            const message = `${messageOf(cause)} 找回结果尚未确认，正在向原节点核对。`
+            if (!recoveryPaused.current && !session.current) setError(message)
+            throw new Error(message)
+          }
+          if (!ownsFlow()) throw changed()
+          if (auth.principal === null) {
+            // A guest channel cannot monitor the wait. Hand it off to fresh read-only probes, even without a receipt.
+            resetConnection(); setRecovery({ status: 'waiting', effectiveAt: null })
+            await noteRecovery(auth, wait)
+          } else {
+            try { await recoveredAs(auth, active, wait) }
+            catch (cause) {
+              closeRecoveryGuest(active, cause)
+              if (!recoveryPaused.current && !session.current && connecting.current === controller && generation.current === active.generation + 1) setRecovery({ status: 'waiting', effectiveAt: null })
+              throw cause
+            }
+          }
+        } finally { if (sensitive.current === flow) releaseSensitive(); else releaseFlow() }
       }
       sensitive.current = flow
       setReview({ kind: 'recovery', networkId: opened.networkId, members, newManager, requiredNode: active.entry.device_id })
@@ -1235,52 +1359,148 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   async function resumeWait(active: Session, opened: Awaited<ReturnType<typeof openPackage>>, password: string) {
     const auth = record(await scoped(active)('authenticate', { network_id: opened.networkId }))
     if (session.current !== active || auth.principal !== null || !auth.recovery || record(auth.recovery).status !== 'waiting') return false
-    let checkpoint: unknown
+    if (auth.network_id !== opened.networkId) throw waitRecordError()
+    const hash = validTarget(record(auth.recovery).checkpoint_hash)
+    const stored = loadWait()
+    if (stored.kind === 'invalid' || stored.kind === 'unreadable') throw waitRecordError()
+    let wait = stored.kind === 'valid' ? stored.value : parseWait({ entry: entryJson(active.entry), networkId: opened.networkId, genesis: opened.material.genesis, rootKey: opened.root.deviceId() })
+    if (wait.networkId !== opened.networkId || wait.rootKey !== opened.root.deviceId() || wait.entry.device_id !== active.entry.device_id) throw waitRecordError()
     const file = kept.current
-    if (file) {
+    if (stored.kind === 'empty' && file) {
       try {
         const next = await openPackage({ size: file.bytes.length, text: async () => new TextDecoder().decode(file.bytes) }, password)
         try {
           const last = array(next.material.checkpoints).at(-1)
-          if (next.networkId === opened.networkId && last && record(last).recovery_key === next.root.deviceId()) checkpoint = last
+          if (next.networkId === opened.networkId && last && record(last).recovery_key === next.root.deviceId()) {
+            const candidate = parseWait({ ...waitRecordJson(wait), checkpoint: last })
+            if (candidate.checkpoint && await recoveryCheckpointHash(candidate.checkpoint) === hash) wait = candidate
+          }
         } finally { next.release() }
       } catch {}
     }
     if (session.current !== active) throw changed()
-    store('recovery-wait', { entry: entryJson(active.entry), networkId: opened.networkId, genesis: opened.material.genesis, rootKey: opened.root.deviceId(), checkpoint })
-    resetConnection(); noteRecovery(auth)
+    if (stored.kind === 'empty') {
+      if (loadWait().kind !== 'empty') throw waitRecordError()
+      store('recovery-wait', waitRecordJson(wait))
+    }
+    resetConnection(); setRecovery({ status: 'waiting', effectiveAt: null })
+    await noteRecovery(auth, wait)
     return true
   }
   /** Where this browser's recovery stands, as a Node that does not count it a member yet answered. */
-  function noteRecovery(auth: Record<string, unknown>) {
-    const status = auth.recovery ? record(auth.recovery) : null
-    if (status?.status === 'waiting' && typeof status.effective_at_ms === 'number') setRecovery({ status: 'waiting', effectiveAt: Date.now() + status.effective_at_ms - (nodeNow(auth) ?? Date.now()) })
-    else if (status?.status === 'stopped') setRecovery({ status: 'stopped' })
-    else dismissRecovery()
+  async function noteRecovery(auth: Record<string, unknown>, wait: WaitRecord) {
+    const version = generation.current
+    if (recoveryPaused.current) throw changed()
+    if (auth.recovery === null || auth.recovery === undefined) {
+      // A missing answer does not resolve a submitted checkpoint. Keep it for reconciliation.
+      requireWait(wait)
+      setError(waitRecordError().message)
+      return false
+    }
+    const status = record(auth.recovery)
+    const hash = validTarget(status.checkpoint_hash)
+    if (auth.network_id !== wait.networkId || wait.checkpoint && hash !== await recoveryCheckpointHash(wait.checkpoint)) throw waitRecordError()
+    if (version !== generation.current || recoveryPaused.current) throw changed()
+    requireWait(wait)
+    if (status.status === 'waiting' && typeof status.effective_at_ms === 'number' && Number.isSafeInteger(status.effective_at_ms)) setRecovery({ status: 'waiting', effectiveAt: Date.now() + status.effective_at_ms - (nodeNow(auth) ?? Date.now()) })
+    else if (status.status === 'stopped') setRecovery({ status: 'stopped' })
+    else throw waitRecordError()
+    setError('')
+    return true
   }
   async function recoveredAs(auth: unknown, active: Session, wait: WaitRecord) {
-    const view = await authenticate(auth, active, { kind: 'root', networkId: wait.networkId, genesis: wait.genesis, checkpoint: wait.checkpoint })
-    dismissRecovery()
-    // Still a member of the directory in effect, it follows the wait on the card every manager sees.
-    if (wait.checkpoint === undefined ? view.recovery_key === wait.rootKey : view.recovery_key !== record(wait.checkpoint).recovery_key) return
-    try { store('recovered', true) } catch {}
-    setRecovered(true)
+    if (recoveryPaused.current) throw changed()
+    requireWait(wait)
+    recoveryAuthenticating.current = active
+    try {
+      const { view, principal } = await authenticate(auth, active, { kind: 'root', networkId: wait.networkId, genesis: wait.genesis, checkpoint: wait.checkpoint })
+      if (recoveryPaused.current || session.current !== active || active.generation !== generation.current) throw changed()
+      // Still a member of the directory in effect, it follows the wait on the card every manager sees.
+      const recovered = wait.checkpoint === undefined ? view.recovery_key !== wait.rootKey : view.recovery_key === wait.checkpoint.recovery_key
+      if (!finishRecovery({ active, clientId: principal.device_id, wait, recovered })) setRecovery(current => current ?? { status: 'waiting', effectiveAt: null })
+    } finally { if (recoveryAuthenticating.current === active) recoveryAuthenticating.current = null }
+  }
+  function resumeRecoveryCompletion(active: Session, { auth, principal }: ReturnType<typeof verifyAuthentication>) {
+    const completion = recoveryCompletion.current
+    if (!completion || recoveryPaused.current || principal.source !== 'membership' || principal.device_id !== completion.clientId
+      || active.entry.device_id !== completion.wait.entry.device_id || principal.network_id !== completion.wait.networkId) return
+    // The reconnect has verified this signed state. Only the original recovery proof can take over its local cleanup.
+    const state = auth.state
+    const { genesis, checkpoint } = completion.wait
+    if (!isRecord(state) || !isRecord(state.genesis) || !same(state.genesis, genesis)
+      || checkpoint !== undefined && (!Array.isArray(state.checkpoints) || !state.checkpoints.some(item => same(item, checkpoint)))) return
+    finishRecovery({ ...completion, active })
+  }
+  function finishRecovery(completion: RecoveryCompletion): boolean {
+    if (session.current !== completion.active || completion.active.generation !== generation.current || recoveryPaused.current) return false
+    recoveryCompletion.current = completion
+    try {
+      const stored = loadWait()
+      if (stored.kind !== 'empty') requireWait(completion.wait)
+      if (completion.recovered && load('recovered') !== true) {
+        store('recovered', true)
+        if (load('recovered') !== true) throw waitRecordError()
+      }
+      if (stored.kind !== 'empty') {
+        store('recovery-wait', null)
+        if (loadWait().kind !== 'empty') throw waitRecordError()
+      }
+    } catch (cause) { setError(messageOf(cause)); return false }
+    recoveryCompletion.current = null; setRecovery(null); setError('')
+    if (completion.recovered) setRecovered(true)
+    return true
+  }
+  function closeRecoveryGuest(active: Session, cause: unknown) {
+    if (session.current !== active || active.networkId) return
+    resetConnection()
+    if (!recoveryPaused.current) {
+      setRecovery({ status: 'waiting', effectiveAt: null }); setError(messageOf(cause))
+    }
   }
   /** Asks the Node holding this browser's recovery how it stands; once it took effect, connects as the manager it made. */
-  async function checkRecovery(wait: WaitRecord) {
+  function checkRecovery(wait: WaitRecord): Promise<boolean> {
+    if (recoveryPaused.current) return Promise.resolve(false)
+    if (recoveryCheck.current) return recoveryCheck.current
+    if (session.current || openingConnection.current) return Promise.resolve(false)
+    recoveryCheck.current = reconcileRecovery(wait).finally(() => { recoveryCheck.current = null })
+    return recoveryCheck.current
+  }
+  async function reconcileRecovery(wait: WaitRecord) {
+    requireWait(wait)
+    const version = generation.current
     const channel = await connectDevice(wait.entry, { timeoutMs: 10000 })
     let auth: Record<string, unknown>
-    try { auth = record(await channel.request('authenticate', { network_id: wait.networkId })) } finally { channel.close() }
-    if (auth.principal === null) return noteRecovery(auth)
+    try {
+      if (channel.deviceId !== wait.entry.device_id) throw waitRecordError()
+      auth = record(await channel.request('authenticate', { network_id: wait.networkId }))
+    } finally { channel.close() }
+    if (version !== generation.current || recoveryPaused.current || session.current || openingConnection.current) throw changed()
+    if (auth.principal === null) return noteRecovery(auth, wait)
+    requireWait(wait)
     const active = await open(wait.entry)
-    await recoveredAs(await callSession(active, 'authenticate', { network_id: wait.networkId }), active, wait)
+    recoveryAuthenticating.current = active
+    try {
+      if (recoveryPaused.current) throw changed()
+      await recoveredAs(await callSession(active, 'authenticate', { network_id: wait.networkId }), active, wait)
+      return true
+    } catch (cause) { closeRecoveryGuest(active, cause); throw cause }
+    finally { if (recoveryAuthenticating.current === active) recoveryAuthenticating.current = null }
+  }
+  /** Leaves the waiting card without losing the submitted checkpoint or its saved file. */
+  function pauseRecovery() {
+    recoveryPaused.current = true
+    if (session.current && session.current === recoveryAuthenticating.current && !session.current.networkId) resetConnection()
+    if (!session.current && !openingConnection.current) setPhase('disconnected')
+    setRecovery(null); setError('')
+    const pending = loadJoining()
+    if (pending.kind === 'valid' && !joiningRef.current) void resumePendingJoin(pending.value)
   }
   /** Forgets this browser's recovery; with no connection open, the Node it went through stays the one to try again on. */
   function dismissRecovery() {
     const wait = loadWait()
+    pauseRecovery(); recoveryCompletion.current = null
     try { store('recovery-wait', null) } catch {}
-    setRecovery(null)
-    if (wait && !session.current) setEntry(wait.entry)
+    if (wait.kind === 'valid' && !session.current && !joiningRef.current) setEntry(wait.value.entry)
   }
   /** A new recovery file under a new password. Recovery moves to its key, so every older file stops working. */
   async function replaceRecoveryFile(input: { file: RecoveryFile; oldPassword: string; password: string }) {
@@ -1325,6 +1545,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     let mounted = true
     let version = generation.current
     const setupController = new AbortController()
+    recoveryPaused.current = false
     if (load('erase-pending') === true) { setPhase('erase_failed'); setError('应用内数据尚未清除完成，请继续清除。'); return }
     setEntries(savedEntries())
     const { invitation, localLaunch } = page?.takeLaunch() ?? { invitation: '', localLaunch: null }
@@ -1333,22 +1554,24 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       if (!mounted) return
       identityRef.current = me; setIdentity(me)
       if (version !== generation.current) return
-      // A recovery sent from here comes first; one its Node no longer knows is forgotten.
+      // The original join stays reachable even when an earlier recovery still needs a receipt.
+      const pending = loadJoining()
+      if (pending.kind === 'valid') { await resumePendingJoin(pending.value); return }
       const wait = invitation ? null : loadWait()
       // A launch link opens the localhost page; a browser already joined there keeps that identity instead.
       const launch = invitation || resumeTargets().length ? null : localLaunch
       // Only the local launcher's origin serves /api/local/info; a browser learns it is on one from a launch link.
       // After 断开 only a click (a launch link) opens it again, not the remembered local session.
       const stay = load('stay-disconnected') === true
-      const localFirst = !invitation && !wait && (launch !== null || !stay && load('local-origin') === true)
+      const localFirst = !invitation && wait?.kind !== 'valid' && (launch !== null || !stay && load('local-origin') === true)
       // A browser that was in its network resumes it, and the local page stays loading while it opens;
       // the join page must not flash in between.
       if (!localFirst) setPhase(!invitation && resumeTargets().length ? 'reconnecting' : 'disconnected')
-      if (wait) {
+      if (wait?.kind === 'valid') {
         setRecovery({ status: 'waiting', effectiveAt: null })
-        await checkRecovery(wait).catch(() => {})
-        if (!mounted || loadWait() || session.current) return
-      }
+        await checkRecovery(wait.value).catch(cause => { if (mounted && generation.current === version) setError(messageOf(cause)) })
+        if (!mounted || loadWait().kind !== 'empty' || session.current) return
+      } else if (wait?.kind === 'invalid' || wait?.kind === 'unreadable') setError(waitRecordError().message)
       if (!invitation && (launch || !stay && load('local-origin') === true)) {
         const local = await localEntry(me, launch).catch((cause: unknown) => { if (launch) throw cause; return null })
         if (!mounted || version !== generation.current) return
@@ -1361,14 +1584,8 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
         }
         setPhase(resumeTargets().length ? 'reconnecting' : 'disconnected')
       }
-      const pending = invitation ? null : loadJoining()
-      if (pending) {
-        const opening = open(pending.entry); version = generation.current
-        const active = await opening
-        if (!mounted || session.current !== active) return
-        joiningRef.current = pending; setJoining(pending)
-        await checkJoin()
-      } else if (!invitation) {
+      if (!invitation) {
+        if (pending.kind !== 'empty') setError(joinRecordError().message)
         let local: LocalSetup | null = null
         try { local = await discoverLocalSetup(setupController.signal) }
         catch (cause) { if (mounted && version === generation.current) setError(messageOf(cause)) }
@@ -1395,7 +1612,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
         if (only) { const opening = connect(only); version = generation.current; void opening.catch(cause => { if (mounted && version === generation.current) setError(messageOf(cause)) }) }
       }
     }).catch(cause => { if (mounted && version === generation.current) { setPhase(cause instanceof Error && 'code' in cause && cause.code === 'key_lost' ? 'key_lost' : 'blocked'); setError(messageOf(cause)) } })
-    return () => { mounted = false; setupController.abort(); generation.current += 1; reconnect.current = null; if (reconnectTimer.current !== null) clearTimeout(reconnectTimer.current); reconnectTimer.current = null; sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); const previous = session.current; session.current = null; previous?.channel.close(); listeners.current.clear() }
+    return () => { mounted = false; recoveryPaused.current = true; setupController.abort(); generation.current += 1; reconnect.current = null; if (reconnectTimer.current !== null) clearTimeout(reconnectTimer.current); reconnectTimer.current = null; sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); const previous = session.current; session.current = null; previous?.channel.close(); listeners.current.clear() }
   }, [])
   useEffect(() => {
     // One tab per origin settles the outbox; a follower takes the leader's new entrance right away.
@@ -1433,7 +1650,15 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   useEffect(() => {
     if (recovery?.status !== 'waiting') return
     // A stop on another device shows here within seconds, without a reload.
-    const timer = setInterval(() => { const wait = loadWait(); if (wait && !session.current) void checkRecovery(wait).catch(() => {}) }, 10_000)
+    const timer = setInterval(() => {
+      if (recoveryPaused.current) return
+      const completion = recoveryCompletion.current
+      if (completion && session.current === completion.active) { finishRecovery(completion); return }
+      if (reconnect.current || session.current) return
+      const wait = loadWait()
+      if (wait.kind === 'valid') void checkRecovery(wait.value).catch(() => {})
+      else if (wait.kind === 'invalid' || wait.kind === 'unreadable') { setRecovery(null); setError(waitRecordError().message) }
+    }, 10_000)
     return () => clearInterval(timer)
   }, [recovery?.status])
   useEffect(() => {
@@ -1484,7 +1709,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     pendingRecovery, vetoRecovery, approveRecovery, nodeClockOffset, rotateHint,
     dismissRotateHint() { if (ready) setRotateHint(ready.principal.network_id, null) },
     dismissPendingRecovery() { if (!ready || !pendingRecovery) return; hideRecovery(ready.principal.network_id, pendingRecovery.checkpoint); setDismissals(count => count + 1) },
-    recovery, dismissRecovery, recovered, unsavedRecovery, downloadUnsavedRecovery,
+    recovery, pauseRecovery, dismissRecovery, recovered, unsavedRecovery, downloadUnsavedRecovery,
     forgetUnsavedRecovery() { setKept(null) },
     finishRecovered() { try { store('recovered', null) } catch {} setRecovered(false) },
   }

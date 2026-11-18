@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { dirname, extname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createContext } from 'node:vm'
 import type { ConnectionEntry, MembershipView } from '@vibeface/client/lib/node.ts'
+import { canonical } from '@vibeface/client/lib/node.ts'
 import type { Platform } from '@vibeface/client/lib/platform.ts'
 import { primaryLane, shouldAutoConnect } from '@vibeface/client/identity/connection-lane.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
@@ -33,10 +35,15 @@ const localEntry = { kind: 'gateway', address: 'http://localhost:4790', device_i
 const localCapability = 'f'.repeat(64)
 const localInvitation = { url: localEntry.address, device_id: target, capability: localCapability }
 const localLaunch = { url: 'http://127.0.0.1:49781', device_id: target, token: 'e'.repeat(64) }
-const genesis = { version: 1, network_id: network, first_client: { device_id: subject, kind: 'client', name: 'browser', manage: true }, first_node: { device_id: target, kind: 'node', name: 'node', manage: false }, signature: 's' }
+const genesis = { version: 1, network_id: network, first_client: { device_id: subject, kind: 'client', name: 'browser', manage: true }, first_node: { device_id: target, kind: 'node', name: 'node', manage: false }, signature: '5'.repeat(128) } as const
 const membership = { network_id: network, recovery_key: network, members: [], revoked: [], heads: [], epoch: 1, attesters: [], pending: null, stopped: [] }
 const inviteId = '1'.repeat(32), joinNonce = '9'.repeat(64)
-const joinRequest = (status: string, extra: Record<string, unknown> = {}) => ({ join_id: 'join', status, network_id: network, invite_id: inviteId, device_id: subject, kind: 'client', name: 'browser', commit: 'd'.repeat(64), admin_id: null, admin_nonce: null, joiner_nonce: null, reason: null, expires_at_ms: Date.now() + 60000, ...extra })
+const joinRequest = (status: string, extra: Record<string, unknown> = {}) => ({ join_id: inviteId, status, network_id: network, invite_id: inviteId, device_id: subject, kind: 'client', name: 'browser', commit: 'd'.repeat(64), admin_id: status === 'confirming' || status === 'joined' ? target : null, admin_nonce: status === 'confirming' || status === 'joined' ? '2'.repeat(64) : null, joiner_nonce: null, reason: null, expires_at_ms: Date.now() + 60000, ...extra })
+const nextRecoveryKey = '4'.repeat(64)
+function recoveryCheckpointFixture(members: MembershipView['members']) {
+  return { version: 1, network_id: network, epoch: 2, recovery_key: nextRecoveryKey, directory: { members: [...members].sort((a, b) => a.device_id.localeCompare(b.device_id)), retired: [] }, heads: [], issued_at_ms: 1000, signature: '3'.repeat(128) }
+}
+const checkpointHash = (checkpoint: unknown) => createHash('sha256').update(canonical(checkpoint)).digest('hex')
 const deferred = () => {
   let resolve: (value: unknown) => void = () => {}, reject: (reason: Error) => void = () => {}
   const promise = new Promise<unknown>((yes, no) => { resolve = yes; reject = no })
@@ -85,7 +92,7 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
     ...hooks.react, useCallback: (fn: unknown) => fn,
     useMemo(read: () => unknown) { hooks.next(); return read() },
   }
-  if (joining) stored.set('vibeface.pending-join', JSON.stringify({ entry, join_id: 'join', invite_id: inviteId, nonce: joinNonce, name: 'browser', pinned: { network_id: network, admin_id: target, admin_nonce: '2'.repeat(64) } }))
+  if (joining) stored.set('vibeface.pending-join', JSON.stringify({ entry: { address: entry.address, device_id: entry.device_id }, join_id: inviteId, invite_id: inviteId, nonce: joinNonce, name: 'browser', ...(joining === 'pending' ? {} : { pinned: { network_id: network, admin_id: target, admin_nonce: '2'.repeat(64) } }) }))
   if (saved) stored.set('vibeface.connections', JSON.stringify([entry]))
   // A cookie-bound local session only exists after a launch on this origin, which the browser remembers.
   if (localSession) stored.set('vibeface.local-origin', 'true')
@@ -138,11 +145,11 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
     verifyRemoval: () => false,
     verifiedView: (state?: unknown) => views.get(state) ?? directory.view,
     openPackage: async () => ({ networkId: network, material: { genesis, checkpoints: [], events: [] }, root: { deviceId: () => network, sign: () => 'signature' }, release() { released++ } }),
-    Identity: { generate: () => ({ deviceId: () => network, secretHex: () => 'private-test-key', sign: () => 'signature', free() { released++ } }) },
+    Identity: { generate: () => ({ deviceId: () => nextRecoveryKey, secretHex: () => 'private-test-key', sign: () => 'signature', free() { released++ } }) },
     createGenesis: () => JSON.stringify(genesis), joinCommit: () => 'd'.repeat(64), shortCode: () => '123456', ticketEncode: () => 'vibeface1test',
     governancePayload: () => new Uint8Array(), inviteSigningPayload: () => new Uint8Array(),
     sealPackage: () => new Uint8Array([1, 2, 3]),
-    verifyState: (state: unknown = directory.state) => ({ free() {}, viewJson: () => JSON.stringify(views.get(state) ?? directory.view), governanceTemplate: (issuer: string, action: string) => JSON.stringify({ issuer, action: JSON.parse(action) }), createRecoveryCheckpoint: () => JSON.stringify({ epoch: 2 }), createKeyRotation: () => JSON.stringify({ epoch: 2 }) }),
+    verifyState: (state: unknown = directory.state) => ({ free() {}, viewJson: () => JSON.stringify(views.get(state) ?? directory.view), governanceTemplate: (issuer: string, action: string) => JSON.stringify({ issuer, action: JSON.parse(action) }), createRecoveryCheckpoint: (_root: unknown, _next: string, members: string) => JSON.stringify(recoveryCheckpointFixture(JSON.parse(members))), createKeyRotation: () => JSON.stringify({ epoch: 2 }) }),
   }
   const timer = (run: () => void) => { const id = ++nextTimer; timers.set(id, run); return id }
   const sandbox = createContext({
@@ -183,7 +190,7 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
   const Provider = load(resolve(clientRoot, 'identity/context.tsx')).DeviceProvider
   const platform = {
     reserveDeliveryIntent: async () => { throw new Error('unexpected delivery reservation') },
-    secure: {}, transport, storage: sandbox.localStorage, page: load(resolve(sourceRoot, 'lib/local-page.ts')).localPage, self: '这个浏览器', saveRecovery(_bytes: Uint8Array, _name: string) {}, recoveryStorage: undefined as Platform['recoveryStorage'], joinTabs: undefined as Platform['joinTabs'], erase: undefined as Platform['erase'] }
+    secure: { verify(rootKey: string, domain: string, _payload: Uint8Array, signature: string) { assert.equal(rootKey, network); assert.equal(domain, 'identity-recovery'); assert.equal(signature, '3'.repeat(128)) } }, transport, storage: sandbox.localStorage, page: load(resolve(sourceRoot, 'lib/local-page.ts')).localPage, self: '这个浏览器', saveRecovery(_bytes: Uint8Array, _name: string) {}, recoveryStorage: undefined as Platform['recoveryStorage'], joinTabs: undefined as Platform['joinTabs'], erase: undefined as Platform['erase'] }
   let tabReceive: ((serialized: string) => void) | undefined
   const enableTabs = () => { platform.joinTabs = (_name, handlers) => { tabReceive = value => handlers.message(JSON.parse(value)); const stop = handlers.lead(); return { post() {}, close() { tabReceive = undefined; stop?.() } } } }
   let restarts = 0
@@ -811,7 +818,113 @@ test('a pending join survives reload without resubmitting', async () => {
   try {
     app.render(); await settle()
     assert.deepEqual(app.calls, [`open:${target}`, 'info', 'join_status'])
-    assert.equal(app.render().joining?.join_id, 'join')
+    assert.equal(app.render().joining?.join_id, inviteId)
+  } finally { app.close() }
+})
+
+test('a pending join reaches its original Node before remembered localhost access', async () => {
+  const app = deviceHarness({ joining: 'pending', localSession: true })
+  const saved = app.stored.get('vibeface.pending-join')
+  try {
+    app.render(); await settle()
+    assert.equal(app.render().joining?.nonce, joinNonce)
+    assert.equal(app.render().ready, null)
+    assert.deepEqual(app.calls, [`open:${target}`, 'info', 'join_status'])
+    assert.deepEqual(plain(app.sockets[0]?.entry), entry)
+    assert.equal(app.stored.get('vibeface.pending-join'), saved)
+    app.render().cancelJoin()
+    assert.equal(app.stored.get('vibeface.pending-join'), 'null')
+    assert.equal(app.calls.filter(call => call === 'join_withdraw').length, 1)
+  } finally { app.close() }
+})
+
+test('a new invitation cannot replace the nonce of a saved pending join', async () => {
+  const app = deviceHarness({ joining: 'pending', invitation: 'vibeface1newticket' })
+  try {
+    app.render(); await settle()
+    const original = app.stored.get('vibeface.pending-join')
+    assert.equal(app.render().joining?.nonce, joinNonce)
+    await assert.rejects(app.render().join('vibeface://join/vibeface1newticket', 'browser'), /本地加入记录/)
+    assert.equal(app.requests.some(request => request.method === 'join'), false)
+    assert.equal(app.stored.get('vibeface.pending-join'), original)
+  } finally { app.close() }
+})
+
+test('damaged pending join storage is preserved until explicit cancellation', async () => {
+  const original = '{', storage = new Map([['vibeface.pending-join', original]])
+  const app = deviceHarness({ storage })
+  try {
+    app.render(); await settle()
+    assert.equal(app.render().joining, null)
+    assert.equal(app.calls.includes('join_status'), false)
+    await assert.rejects(app.render().join('vibeface://join/vibeface1ticket', 'browser'), /本地加入记录/)
+    assert.equal(app.stored.get('vibeface.pending-join'), original)
+    assert.equal(app.calls.includes('join'), false)
+    app.render().cancelJoin()
+    assert.equal(app.stored.get('vibeface.pending-join'), 'null')
+    await app.render().join('vibeface://join/vibeface1ticket', 'browser')
+    assert.equal(app.calls.filter(call => call === 'join').length, 1)
+  } finally { app.close() }
+})
+
+test('first join requires the exact local write to succeed and be readable before it sends', async () => {
+  for (const fail of ['throw', 'lose']) {
+    const app = deviceHarness()
+    try {
+      app.render(); await settle()
+      const write = app.platform.storage.setItem
+      app.platform.storage.setItem = (key: string, value: string) => {
+        if (key !== 'vibeface.pending-join') return write(key, value)
+        if (fail === 'throw') throw new Error('local write refused')
+      }
+      await assert.rejects(app.render().join('vibeface://join/vibeface1ticket', 'browser'), /无法保存设备记录|本地加入记录/)
+      assert.equal(app.calls.includes('join'), false)
+      assert.equal(app.render().joining, null)
+    } finally { app.close() }
+  }
+})
+
+test('a lost first join receipt reopens the original Node only to check the durably saved intent', async () => {
+  const app = deviceHarness(), send = deferred()
+  app.holds.set('join', send)
+  try {
+    app.render(); await settle()
+    const joining = app.render().join('vibeface://join/vibeface1ticket', 'browser')
+    const lost = assert.rejects(joining, /connection lost/)
+    await until(() => app.calls.includes('join'))
+    const original = app.stored.get('vibeface.pending-join')
+    assert.ok(original)
+    assert.equal(original.includes('one-time-secret'), false)
+    const nonce = JSON.parse(original).nonce
+    await app.render().checkJoin()
+    assert.equal(app.calls.includes('join_status'), false)
+    app.sockets.at(-1)?.drop(); send.reject(new Error('connection lost'))
+    await lost
+    const missing = deferred(); app.holds.set('join_status', missing)
+    const checking = assert.rejects(app.render().checkJoin(), /join request not found/)
+    await until(() => app.calls.includes('join_status'))
+    missing.reject(new Error('join request not found'))
+    await checking
+    assert.equal(app.stored.get('vibeface.pending-join'), original)
+    app.holds.delete('join_status')
+    await app.render().checkJoin()
+    assert.equal(app.render().joining?.nonce, nonce)
+    assert.deepEqual(app.sockets.map(socket => socket.entry.device_id), [target, target])
+    assert.equal(app.requests.filter(request => request.method === 'join').length, 1)
+    assert.ok(app.requests.filter(request => request.method === 'join_status').every(request => request.params.join_id === inviteId && !('reveal' in request.params)))
+  } finally { app.close() }
+})
+
+test('a mismatched Node request is refused before pinning or revealing a saved join nonce', async () => {
+  const app = deviceHarness({ joining: 'pending' })
+  try {
+    app.render(); await settle()
+    const original = app.stored.get('vibeface.pending-join')
+    const changed = joinRequest('confirming', { commit: 'e'.repeat(64) })
+    app.joinStatus.value = changed
+    await assert.rejects(app.render().checkJoin(), /加入状态.*不一致/)
+    assert.equal(app.requests.some(request => request.params.reveal), false)
+    assert.equal(app.stored.get('vibeface.pending-join'), original)
   } finally { app.close() }
 })
 
@@ -827,7 +940,9 @@ test('a joiner keeps the manager nonce it saw before revealing and stops when th
     assert.equal(JSON.parse(app.stored.get('vibeface.pending-join') ?? 'null').pinned.admin_nonce, '2'.repeat(64))
     app.joinStatus.value = joinRequest('confirming', { admin_id: target, admin_nonce: '3'.repeat(64), joiner_nonce: nonce })
     await assert.rejects(app.render().checkJoin(), /改动了加入请求/)
-    assert.equal(app.render().joining, null)
+    assert.equal(app.render().joining?.nonce, nonce)
+    assert.equal(app.render().joining?.code, undefined)
+    assert.equal(JSON.parse(app.stored.get('vibeface.pending-join') ?? 'null').pinned.admin_nonce, '2'.repeat(64))
   } finally { app.close() }
 })
 
@@ -837,7 +952,7 @@ test('a manager shows the short code only for its own nonce and the commitment i
     app.render(); await settle(); app.render()
     app.managed.value = [joinRequest('pending', { device_id: remote })]
     await app.render().refreshDirectory(); app.render()
-    await app.render().startApproval('join')
+    await app.render().startApproval(inviteId)
     const sent = app.requests.filter(request => request.method === 'approve').map(request => request.params.admin_nonce)
     const revealed = { device_id: remote, admin_id: subject, admin_nonce: sent[0], joiner_nonce: joinNonce }
     for (const [change, code] of [[{}, '123456'], [{ commit: 'e'.repeat(64) }, undefined], [{ admin_nonce: '3'.repeat(64) }, undefined], [{ device_id: '7'.repeat(64) }, undefined]] as const) {
@@ -845,8 +960,27 @@ test('a manager shows the short code only for its own nonce and the commitment i
       await app.render().refreshDirectory()
       assert.equal(app.render().joins[0]?.code, code)
     }
-    await app.render().startApproval('join')
+    await assert.rejects(app.render().startApproval(inviteId), /审批记录/)
+    app.managed.value = [joinRequest('confirming', revealed)]
+    await app.render().refreshDirectory(); app.render()
+    await app.render().startApproval(inviteId)
     assert.deepEqual(app.requests.filter(request => request.method === 'approve').map(request => request.params.admin_nonce), [sent[0], sent[0]])
+  } finally { app.close() }
+})
+
+test('a damaged approval map keeps an existing bound nonce usable without rewriting the map', async () => {
+  const newJoinId = '2'.repeat(32), damagedJoinId = '3'.repeat(32)
+  const savedPin = { invite_id: inviteId, device_id: remote, nonce: '4'.repeat(64), commit: 'd'.repeat(64) }
+  const original = JSON.stringify({ [inviteId]: savedPin, [damagedJoinId]: { nonce: false } })
+  const app = deviceHarness({ management: true, saved: true, storage: new Map([['vibeface.approval-pins', original]]) })
+  try {
+    app.render(); await settle(); app.render()
+    app.managed.value = [joinRequest('pending', { device_id: remote }), joinRequest('pending', { join_id: newJoinId, invite_id: newJoinId })]
+    await app.render().refreshDirectory()
+    await app.render().startApproval(inviteId)
+    await assert.rejects(app.render().startApproval(newJoinId), /本地审批记录/)
+    assert.deepEqual(app.requests.filter(request => request.method === 'approve').map(request => request.params.admin_nonce), [savedPin.nonce])
+    assert.equal(app.stored.get('vibeface.approval-pins'), original)
   } finally { app.close() }
 })
 
@@ -857,7 +991,9 @@ test('a join receipt for another invite or device is refused', async () => {
       app.render(); await settle()
       app.holds.set('join', { promise: Promise.resolve(joinRequest('pending', mismatch)), resolve() {}, reject() {} })
       await assert.rejects(app.render().join('vibeface://join/vibeface1ticket', 'browser'), /对不上/)
-      assert.equal(app.render().joining, null)
+      const pending = JSON.parse(app.stored.get('vibeface.pending-join') ?? 'null')
+      assert.equal(pending.join_id, inviteId)
+      assert.equal(app.render().joining?.nonce, pending.nonce)
     } finally { app.close() }
   }
 })
@@ -873,7 +1009,7 @@ test('recovering onto a fresh localhost Node uses its local capability and keeps
     await app.render().confirmRecovery(review?.kind === 'recovery' ? review.members : [])
     const recover = app.requests.find(request => request.method === 'recover')
     assert.equal(recover?.params.capability, localCapability)
-    assert.deepEqual(plain(recover?.params.checkpoints), [{ epoch: 2 }])
+    assert.deepEqual(plain(recover?.params.checkpoints), review?.kind === 'recovery' ? plain([recoveryCheckpointFixture([...review.members, review.newManager])]) : [])
     assert.equal(app.released(), 2, 'the recovery key and the one-time next key are both freed')
   } finally { app.close() }
 })
@@ -916,19 +1052,23 @@ test('recovering an initialized network reads its state with a short-lived root 
 
 test('a recovery that has to wait is remembered across a reload until a device stops it', async () => {
   const storage = new Map<string, string>(), app = deviceHarness({ storage })
+  let checkpoint_hash = ''
   try {
     app.render(); await settle()
     await app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry })
     const review = app.render().review, answer = deferred()
     app.holds.set('recover', answer)
-    answer.resolve({ ...notMember, recovery: { status: 'waiting', effective_at_ms: 1000 + 48 * 3_600_000 }, now_ms: 1000 })
-    await app.render().confirmRecovery(review?.kind === 'recovery' ? review.members : [])
+    const confirming = app.render().confirmRecovery(review?.kind === 'recovery' ? review.members : [])
+    await until(() => app.calls.includes('recover'))
+    checkpoint_hash = checkpointHash((app.requests.find(request => request.method === 'recover')?.params.checkpoints as unknown[])[0])
+    answer.resolve({ ...notMember, recovery: { status: 'waiting', checkpoint_hash, effective_at_ms: 1000 + 48 * 3_600_000 }, now_ms: 1000 })
+    await confirming
     const waiting = app.render().recovery
     assert.ok(waiting?.status === 'waiting' && waiting.effectiveAt !== null && waiting.effectiveAt > Date.now() + 47 * 3_600_000, 'the wait is counted on the Node\'s clock')
     assert.equal(app.render().ready, null)
   } finally { app.close() }
   const reloaded = deviceHarness({ storage }), stopped = deferred()
-  stopped.resolve({ ...notMember, recovery: { status: 'stopped' }, now_ms: Date.now() })
+  stopped.resolve({ ...notMember, recovery: { status: 'stopped', checkpoint_hash }, now_ms: Date.now() })
   reloaded.holds.set('authenticate', stopped)
   try {
     reloaded.render()
@@ -942,7 +1082,7 @@ test('a recovery that has to wait is remembered across a reload until a device s
 test('the same file brings a browser that lost its wait record back to the wait', async () => {
   const storage = new Map<string, string>(), app = deviceHarness({ storage }), refused = deferred(), waiting = deferred()
   refused.promise.catch(() => {}); refused.reject(new Error('another recovery is waiting to take effect'))
-  waiting.resolve({ ...notMember, recovery: { status: 'waiting', effective_at_ms: 1000 + 48 * 3_600_000 }, now_ms: 1000 })
+  waiting.resolve({ ...notMember, recovery: { status: 'waiting', checkpoint_hash: '8'.repeat(64), effective_at_ms: 1000 + 48 * 3_600_000 }, now_ms: 1000 })
   app.holds.set('recovery_state', refused); app.holds.set('authenticate', waiting)
   try {
     app.render(); await settle()
@@ -965,6 +1105,346 @@ test('a file whose waiting recovery does not name this browser still reports the
     app.render(); await settle()
     await assert.rejects(app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry }), /another recovery is waiting/)
     assert.equal(app.render().recovery, null)
+  } finally { app.close() }
+})
+
+test('a damaged recovery wait does not reconnect or sign and remains stored until explicit dismissal', async () => {
+  const original = JSON.stringify({ entry: { address: entry.address, device_id: target }, networkId: network, rootKey: network, genesis, checkpoint: [] })
+  const app = deviceHarness({ storage: new Map([['vibeface.recovery-wait', original]]) })
+  try {
+    app.render(); await settle()
+    assert.equal(app.render().recovery, null)
+    assert.equal(app.calls.some(call => call.startsWith('open:')), false)
+    await assert.rejects(app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry }), /本地找回记录/)
+    assert.equal(app.calls.includes('recover'), false)
+    assert.equal(app.stored.get('vibeface.recovery-wait'), original)
+    app.render().dismissRecovery()
+    assert.equal(app.stored.get('vibeface.recovery-wait'), 'null')
+  } finally { app.close() }
+})
+
+test('a missing or unrelated recovery receipt keeps the exact submitted checkpoint', async () => {
+  const checkpoint = recoveryCheckpointFixture([genesis.first_node, genesis.first_client])
+  const original = JSON.stringify({ entry: { address: entry.address, device_id: target }, networkId: network, rootKey: network, genesis, checkpoint })
+  for (const recovery of [null, { status: 'stopped', checkpoint_hash: '1'.repeat(64) }]) {
+    const app = deviceHarness({ storage: new Map([['vibeface.recovery-wait', original]]) })
+    const guest = deferred()
+    guest.resolve({ ...notMember, recovery })
+    app.holds.set('authenticate', guest)
+    try {
+      app.render()
+      await until(() => /本地找回记录/.test(app.render().error))
+      assert.notEqual(app.render().recovery?.status, 'stopped')
+      assert.equal(app.stored.get('vibeface.recovery-wait'), original)
+      const stopped = deferred(); stopped.resolve({ ...notMember, recovery: { status: 'stopped', checkpoint_hash: checkpointHash(checkpoint) } })
+      app.holds.set('authenticate', stopped)
+      for (const tick of app.timers.values()) tick()
+      await until(() => app.render().recovery?.status === 'stopped')
+      assert.equal(app.stored.get('vibeface.recovery-wait'), original)
+      assert.equal(app.calls.includes('recover'), false)
+    } finally { app.close() }
+  }
+})
+
+test('two confirmations share one recovery plan and a dropped submission only reads its original receipt', async () => {
+  const app = deviceHarness(), saving = deferred(), submitting = deferred(), guest = deferred()
+  const input = () => ({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry })
+  const copies: Uint8Array[] = []
+  app.platform.saveRecovery = async bytes => { copies.push(bytes.slice()); await saving.promise }
+  app.holds.set('recover', submitting)
+  guest.resolve({ ...notMember, recovery: null }); app.holds.set('authenticate', guest)
+  try {
+    app.render(); await settle()
+    await app.render().beginRecovery(input())
+    const review = app.render().review
+    assert.ok(review?.kind === 'recovery')
+    const first = assert.rejects(app.render().confirmRecovery(review.members), /正在向原节点核对/)
+    await until(() => copies.length === 1)
+    const second = assert.rejects(app.render().confirmRecovery([]), /正在向原节点核对/)
+    await settle()
+    assert.equal(copies.length, 1)
+    assert.equal(app.calls.includes('recover'), false)
+    saving.resolve(null)
+    await until(() => app.calls.includes('recover'))
+    const original = app.stored.get('vibeface.recovery-wait')
+    const backup = app.render().unsavedRecovery?.code
+    assert.ok(original && backup)
+    app.sockets.at(-1)?.drop(); submitting.reject(new Error('connection lost'))
+    await Promise.all([first, second])
+    assert.equal(app.calls.filter(call => call === 'authenticate').length, 1)
+    assert.equal(app.render().recovery?.status, 'waiting')
+    const stopped = deferred(); stopped.resolve({ ...notMember, recovery: { status: 'stopped', checkpoint_hash: checkpointHash(JSON.parse(original).checkpoint) } })
+    app.holds.set('authenticate', stopped)
+    await app.render().beginRecovery(input())
+    assert.equal(app.render().recovery?.status, 'stopped')
+    assert.equal(app.calls.filter(call => call === 'recover').length, 1)
+    assert.equal(app.calls.filter(call => call === 'recovery_state').length, 1)
+    assert.equal(app.stored.get('vibeface.recovery-wait'), original)
+    assert.equal(app.render().unsavedRecovery?.code, backup)
+    assert.equal(copies.length, 1)
+  } finally { app.close() }
+})
+
+test('a failed authentication on the re-opened recovery channel leaves polling re-entrant', async () => {
+  const checkpoint = recoveryCheckpointFixture([genesis.first_node, genesis.first_client])
+  const original = JSON.stringify({ entry: { address: entry.address, device_id: target }, networkId: network, rootKey: network, genesis, checkpoint })
+  const app = deviceHarness({ storage: new Map([['vibeface.recovery-wait', original]]) })
+  const probe = deferred(), retry = deferred()
+  app.holds.set('authenticate', probe)
+  try {
+    app.render(); await until(() => app.calls.includes('authenticate'))
+    app.holds.set('authenticate', retry)
+    probe.resolve({ ...notMember, principal: { device_id: subject } })
+    await until(() => app.calls.filter(call => call === 'authenticate').length === 2)
+    retry.reject(new Error('入口暂时无法认证。'))
+    await until(() => /入口暂时无法认证/.test(app.render().error))
+    assert.equal(app.render().ready, null)
+    assert.equal(app.stored.get('vibeface.recovery-wait'), original)
+    const stopped = deferred(); stopped.resolve({ ...notMember, recovery: { status: 'stopped', checkpoint_hash: checkpointHash(checkpoint) } })
+    app.holds.set('authenticate', stopped)
+    for (const tick of app.timers.values()) tick()
+    await until(() => app.render().recovery?.status === 'stopped')
+    assert.equal(app.calls.includes('recover'), false)
+  } finally { app.close() }
+})
+
+test('changing Node while preparing the recovery copy prevents submission on either connection', async () => {
+  const app = deviceHarness(), saving = deferred()
+  let savedCopy = false
+  app.platform.saveRecovery = async () => { savedCopy = true; await saving.promise }
+  try {
+    app.render(); await settle()
+    await app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry })
+    const review = app.render().review
+    assert.ok(review?.kind === 'recovery')
+    const cancelled = assert.rejects(app.render().confirmRecovery(review.members), /连接已切换/)
+    await until(() => savedCopy)
+    await app.render().connect({ ...entry, device_id: remote })
+    saving.resolve(null)
+    await cancelled
+    assert.equal(app.render().ready?.entry.device_id, remote)
+    assert.equal(app.calls.includes('recover'), false)
+    assert.equal(app.stored.has('vibeface.recovery-wait'), false)
+  } finally { app.close() }
+})
+
+test('a direct recovery response without a receipt closes the guest channel and waits for a fresh read', async () => {
+  const app = deviceHarness(), submitted = deferred(), poll = deferred()
+  submitted.resolve({ ...notMember, recovery: null }); app.holds.set('recover', submitted)
+  app.holds.set('authenticate', poll)
+  try {
+    app.render(); await settle()
+    await app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry })
+    const review = app.render().review
+    assert.ok(review?.kind === 'recovery')
+    await app.render().confirmRecovery(review.members)
+    assert.equal(app.render().recovery?.status, 'waiting')
+    const original = app.stored.get('vibeface.recovery-wait')
+    assert.ok(original)
+    for (const tick of app.timers.values()) tick()
+    await until(() => app.calls.includes('authenticate'))
+    app.render().disconnect()
+    poll.resolve({ ...notMember, recovery: { status: 'stopped', checkpoint_hash: checkpointHash(JSON.parse(original).checkpoint) } })
+    await settle(); await settle()
+    assert.equal(app.render().recovery, null)
+    assert.equal(app.stored.get('vibeface.recovery-wait'), original)
+    assert.equal(app.calls.filter(call => call === 'recover').length, 1)
+  } finally { app.close() }
+})
+
+test('an authenticated recovery retries a transient wait-clear failure without another Node request', async () => {
+  const checkpoint = recoveryCheckpointFixture([genesis.first_node, genesis.first_client])
+  const wait = JSON.stringify({ entry: { address: entry.address, device_id: target }, networkId: network, rootKey: network, genesis, checkpoint })
+  const app = deviceHarness({ storage: new Map([['vibeface.recovery-wait', wait]]) })
+  const accepted = deferred(); accepted.resolve({ principal: { device_id: subject } }); app.holds.set('authenticate', accepted)
+  const verifyAuthentication = app.secure.verifyAuthentication
+  app.secure.verifyAuthentication = () => {
+    const verified = verifyAuthentication()
+    return { ...verified, view: { ...verified.view, recovery_key: nextRecoveryKey } }
+  }
+  let clears = 0
+  const write = app.platform.storage.setItem
+  app.platform.storage.setItem = (key: string, value: string) => {
+    if (key === 'vibeface.recovery-wait' && value === 'null' && ++clears === 1) throw new Error('local store temporarily unavailable')
+    write(key, value)
+  }
+  try {
+    app.render(); await until(() => clears === 1 && app.render().ready !== null)
+    const ready = app.render().ready
+    assert.equal(app.render().recovered, false)
+    assert.equal(app.render().recovery?.status, 'waiting')
+    assert.equal(app.stored.get('vibeface.recovery-wait'), wait)
+    assert.equal(app.stored.get('vibeface.recovered'), 'true')
+    for (const tick of app.timers.values()) tick()
+    assert.equal(clears, 2)
+    assert.equal(app.stored.get('vibeface.recovery-wait'), 'null')
+    assert.equal(app.render().ready, ready)
+    assert.equal(app.render().recovery, null)
+    assert.equal(app.render().recovered, true)
+    assert.equal(app.calls.filter(call => call === 'authenticate').length, 2)
+    assert.equal(app.calls.includes('recover'), false)
+  } finally { app.close() }
+})
+
+for (const reconnect of ['original checkpoint', 'different checkpoint', 'different Node'] as const) test(`recovery cleanup after automatic reconnect with ${reconnect}`, async () => {
+  const checkpoint = recoveryCheckpointFixture([genesis.first_node, genesis.first_client])
+  const wait = JSON.stringify({ entry: { address: entry.address, device_id: target }, networkId: network, rootKey: network, genesis, checkpoint })
+  const savedCopy = JSON.stringify({ name: 'vibeface-recovery-ABCDEF12.json', code: 'ABCDEF12', attempted: true, data: 'AQID' })
+  const tabStorage = new Map([['vibeface.unsaved-recovery', savedCopy]])
+  const app = deviceHarness({ storage: new Map([['vibeface.recovery-wait', wait]]), tabStorage })
+  const accepted = deferred(); accepted.resolve({ principal: { device_id: subject } }); app.holds.set('authenticate', accepted)
+  const verifyAuthentication = app.secure.verifyAuthentication
+  let checkpoints = [checkpoint], recoveryKey = nextRecoveryKey
+  app.secure.verifyAuthentication = () => {
+    const verified = verifyAuthentication()
+    const auth = { ...verified.auth, state: { genesis, checkpoints, events: [] } }
+    return { ...verified, auth, view: { ...verified.view, recovery_key: recoveryKey } }
+  }
+  let clears = 0
+  const write = app.platform.storage.setItem
+  app.platform.storage.setItem = (key: string, value: string) => {
+    if (key === 'vibeface.recovery-wait' && value === 'null' && ++clears === 1) throw new Error('local store temporarily unavailable')
+    write(key, value)
+  }
+  try {
+    app.render(); await until(() => clears === 1 && app.render().ready !== null)
+    const first = app.render().ready
+    const timers = new Set(app.timers.keys())
+    if (reconnect === 'different checkpoint') checkpoints = [{ ...checkpoint, signature: '8'.repeat(128) }]
+    if (reconnect === 'original checkpoint') recoveryKey = freshKey // A later key rotation does not replace the already verified recovery result.
+    if (reconnect === 'different Node') {
+      app.stored.set(`vibeface.entrances.${network}`, JSON.stringify([{ device_id: remote, gateway_url: 'https://other.example', public: true, seq: 1, direct: [], last_ok_ms: 0 }]))
+      const down = deferred(); down.promise.catch(() => {}); down.reject(new Error('connection refused'))
+      app.holds.set(`open:${entry.address}`, down)
+    }
+    app.sockets.at(-1)?.drop()
+    for (const [id, retry] of app.timers) if (!timers.has(id)) { app.timers.delete(id); retry(); break }
+    await until(() => app.render().ready?.isCurrent() === true && app.render().ready !== first)
+    for (const tick of app.timers.values()) tick()
+    const complete = reconnect === 'original checkpoint'
+    assert.equal(app.render().ready?.entry.device_id, reconnect === 'different Node' ? remote : target)
+    assert.equal(app.render().recovered, complete)
+    assert.equal(app.stored.get('vibeface.recovery-wait'), complete ? 'null' : wait)
+    assert.equal(clears, complete ? 2 : 1)
+    assert.equal(tabStorage.get('vibeface.unsaved-recovery'), savedCopy)
+    assert.equal(app.calls.filter(call => call === 'authenticate').length, 3)
+    assert.equal(app.calls.includes('recover'), false)
+    if (reconnect === 'different Node') {
+      assert.equal(app.stored.get('vibeface.recovered'), 'true', 'the failed local clear left a staged marker')
+      const reopened = deviceHarness({ storage: app.stored, invitation: 'vibeface1other' })
+      try {
+        reopened.render(); await settle()
+        await reopened.render().connect({ ...entry, device_id: remote })
+        assert.equal(reopened.render().recovered, false)
+        assert.equal(app.stored.get('vibeface.recovery-wait'), wait)
+      } finally { reopened.close() }
+    }
+  } finally { app.close() }
+})
+
+test('boot restores a join started after pausing recovery without replacing either durable intent', async () => {
+  const node = { address: entry.address, device_id: target }
+  const checkpoint = recoveryCheckpointFixture([genesis.first_node, genesis.first_client])
+  const wait = JSON.stringify({ entry: node, networkId: network, rootKey: network, genesis, checkpoint })
+  const storage = new Map([['vibeface.recovery-wait', wait]])
+  const app = deviceHarness({ storage })
+  const guest = deferred(); guest.resolve({ ...notMember, recovery: null }); app.holds.set('authenticate', guest)
+  let pending: string | undefined
+  try {
+    app.render(); await until(() => /本地找回记录/.test(app.render().error))
+    app.render().pauseRecovery()
+    await app.render().join('vibeface://join/vibeface1ticket', 'browser')
+    pending = storage.get('vibeface.pending-join')
+    assert.equal(storage.get('vibeface.recovery-wait'), wait)
+  } finally { app.close() }
+  assert.ok(pending)
+  const reloaded = deviceHarness({ storage })
+  try {
+    reloaded.render(); await until(() => reloaded.calls.includes('join_status'))
+    assert.equal(reloaded.render().joining?.nonce, JSON.parse(pending).nonce)
+    assert.deepEqual(reloaded.calls, [`open:${target}`, 'info', 'join_status'])
+    assert.deepEqual(plain(reloaded.sockets[0]?.entry), entry)
+    assert.equal(storage.get('vibeface.pending-join'), pending)
+    assert.equal(storage.get('vibeface.recovery-wait'), wait)
+    reloaded.render().cancelJoin()
+    assert.equal(reloaded.calls.filter(call => call === 'join_withdraw').length, 1)
+    assert.equal(storage.get('vibeface.pending-join'), 'null')
+    assert.equal(storage.get('vibeface.recovery-wait'), wait)
+  } finally { reloaded.close() }
+})
+
+test('pausing an authenticated recovery lets a saved join own the connection screen', async () => {
+  const node = { address: entry.address, device_id: target }
+  const checkpoint = recoveryCheckpointFixture([genesis.first_node, genesis.first_client])
+  const wait = JSON.stringify({ entry: node, networkId: network, rootKey: network, genesis, checkpoint })
+  const app = deviceHarness({ storage: new Map([['vibeface.recovery-wait', wait]]) })
+  const accepted = deferred(); accepted.resolve({ principal: { device_id: subject } }); app.holds.set('authenticate', accepted)
+  const write = app.platform.storage.setItem
+  app.platform.storage.setItem = (key: string, value: string) => {
+    if (key === 'vibeface.recovery-wait' && value === 'null') throw new Error('local store temporarily unavailable')
+    write(key, value)
+  }
+  try {
+    app.render(); await until(() => app.render().ready !== null)
+    const pending = JSON.stringify({ entry: node, join_id: inviteId, invite_id: inviteId, nonce: joinNonce, name: 'browser' })
+    app.stored.set('vibeface.pending-join', pending)
+    app.render().pauseRecovery()
+    await until(() => app.calls.includes('join_status'))
+    assert.equal(app.render().ready, null)
+    assert.equal(app.render().joining?.nonce, joinNonce)
+    assert.equal(app.render().recovery, null)
+    assert.equal(app.stored.get('vibeface.pending-join'), pending)
+    assert.equal(app.stored.get('vibeface.recovery-wait'), wait)
+    assert.equal(app.calls.includes('recover') || app.calls.includes('join'), false)
+  } finally { app.close() }
+})
+
+for (const { panel, control, event } of [
+  { panel: './recovery-controls.tsx', control: '@vibeface/uiarc/button/button.tsx', event: 'onClick' },
+  { panel: '../../../../../apps/mobile/src/features/recovery/recovery.tsx', control: '@/components/arc/button', event: 'onPress' },
+] as const) test(`the ${event === 'onClick' ? 'Web' : 'Mobile'} recovery panel lets the user pause a missing receipt and keep its files`, async () => {
+  const node = { address: entry.address, device_id: target }
+  const checkpoint = recoveryCheckpointFixture([genesis.first_node, genesis.first_client])
+  const wait = JSON.stringify({ entry: node, networkId: network, rootKey: network, genesis, checkpoint })
+  const savedFile = JSON.stringify({ name: 'vibeface-recovery-ABCDEF12.json', code: 'ABCDEF12', attempted: true, data: 'AQID' })
+  const storage = new Map([['vibeface.recovery-wait', wait], ['vibeface.last-authenticated', JSON.stringify({ entry: node, networkId: network })]])
+  const tabStorage = new Map([['vibeface.unsaved-recovery', savedFile]])
+  const app = deviceHarness({ storage, tabStorage })
+  const guest = deferred(); guest.resolve({ ...notMember, recovery: null }); app.holds.set('authenticate', guest)
+  try {
+    app.render(); await until(() => /本地找回记录/.test(app.render().error))
+    assert.equal(app.render().phase, 'reconnecting')
+    const pending = JSON.stringify({ entry: node, join_id: inviteId, invite_id: inviteId, nonce: joinNonce, name: 'browser' })
+    storage.set('vibeface.pending-join', pending) // Another tab saved a join while this one was waiting for a recovery receipt.
+    const actions: (() => unknown)[] = []
+    const jsx = (component: unknown, props: Record<string, unknown>) => {
+      const callback = props[event]
+      if (component === 'arc-button' && props.children === '返回' && typeof callback === 'function') actions.push(() => callback())
+      return props.children
+    }
+    const loadPanel = moduleLoader(createContext({}), specifier => {
+      if (specifier === 'react/jsx-runtime') return { jsx, jsxs: jsx }
+      if (specifier === 'react') return { useRef: () => ({ current: null }) }
+      if (specifier === '@vibeface/client/identity/context.tsx') return { useDevice: app.render }
+      if (specifier === '@vibeface/client/identity/copy.ts') return { recoveryCopy: {} }
+      if (specifier === control) return { Button: 'arc-button' }
+      return {}
+    })
+    const renderWaiting = loadPanel(fileURLToPath(new URL(panel, import.meta.url))).RecoveryWaiting
+    assert.ok(typeof renderWaiting === 'function')
+    renderWaiting()
+    const back = actions[0]
+    assert.ok(back, 'an Arc button is available in the waiting card')
+    back()
+    await until(() => app.calls.includes('join_status'))
+    assert.equal(app.render().recovery, null)
+    assert.equal(app.render().phase, 'unpaired')
+    assert.equal(app.render().joining?.nonce, joinNonce)
+    assert.equal(app.stored.get('vibeface.recovery-wait'), wait)
+    assert.equal(tabStorage.get('vibeface.unsaved-recovery'), savedFile)
+    assert.equal(app.stored.get('vibeface.pending-join'), pending)
+    assert.equal(app.calls.includes('join'), false)
+    assert.equal(app.calls.includes('recover'), false)
   } finally { app.close() }
 })
 
@@ -1151,14 +1631,14 @@ for (const reply of ['withdrawn', 'lost']) test(`cancelling a waiting join withd
   const hold = deferred(); app.holds.set('join_withdraw', hold)
   try {
     app.render(); await settle(); app.render()
-    assert.equal(app.render().joining?.join_id, 'join')
+    assert.equal(app.render().joining?.join_id, inviteId)
     app.render().cancelJoin()
     assert.equal(app.render().joining, null)
     assert.equal(app.render().phase, 'disconnected')
     assert.equal(app.stored.get('vibeface.pending-join') ?? 'null', 'null')
     if (reply === 'withdrawn') hold.resolve(joinRequest('withdrawn')); else hold.reject(new Error('connection lost'))
     await settle(); await settle()
-    assert.deepEqual(app.requests.filter(request => request.method === 'join_withdraw').map(request => request.params.join_id), ['join'])
+    assert.deepEqual(app.requests.filter(request => request.method === 'join_withdraw').map(request => request.params.join_id), [inviteId])
     assert.equal(app.render().error, '')
     assert.equal(app.timers.size, 0)
   } finally { app.close() }
