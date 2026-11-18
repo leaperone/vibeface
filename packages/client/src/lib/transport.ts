@@ -1,5 +1,5 @@
 import type { SecureApi, SecureChannel, SecureHandshake } from '../secure-api.ts'
-import type { ConnectionEntry } from './node.ts'
+import type { ConnectionEntry, PublicIdentity } from './node.ts'
 import { parseHttpOrigin } from './origin.ts'
 
 export type DeviceChannel = {
@@ -13,8 +13,8 @@ export type DeviceChannel = {
 export type JoinLink = { entryId: string; entryAddrs: string[]; inviteId: string; inviteHash: string; secret: string }
 /** This device's Ed25519 key as its platform keeps it: made once, it only ever signs. */
 export type DeviceKeys = {
-  /** The key, made on first use. Throws an error with `code: 'key_lost'` when a key this device made is gone, unless replacing it. */
-  load(options: { replaceLostKey: boolean }): Promise<{ deviceId: string }>
+  /** Load the key, creating it on first use unless reading back a replacement with `existingOnly`. */
+  load(options: { replaceLostKey: boolean; existingOnly?: boolean }): Promise<{ deviceId: string }>
   /** Drops the key; the next load makes a new one. */
   remove(): Promise<void>
   sign(message: Uint8Array): Promise<string>
@@ -219,41 +219,80 @@ async function lanCarrier(dial: LanDial, deviceId: string, addrs: string[], sign
 
 /** `dialLan`: the app's direct path to Nodes on its LAN; a browser has none. */
 export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: LanDial, nativeLocalCarrier?: NativeLocalCarrier, nativeLocalGateway?: NativeLocalGatewayCarrier) {
-  let device: { deviceId: string } | undefined
-  let initializing: Promise<{ deviceId: string }> | null = null
+  let device: PublicIdentity | undefined
+  let initializing: Promise<PublicIdentity> | null = null
+  let changingKeys: Promise<unknown> | null = null
+  let pendingReplacement: { previousId: string; publish?: (identity: PublicIdentity) => void } | null = null
+  const cancelled = () => new Error('设备连接已取消。')
 
-  function initClient({ replaceLostKey = false } = {}): Promise<{ deviceId: string }> {
-    initializing ??= keys.load({ replaceLostKey }).then(loaded => {
+  function loadClient({ replaceLostKey = false } = {}): Promise<PublicIdentity> {
+    initializing ??= keys.load({ replaceLostKey, existingOnly: pendingReplacement !== null && !replaceLostKey }).then(loaded => {
       if (!devicePattern.test(loaded.deviceId)) throw new Error('这台设备保存的登录信息坏了。需要重新加入。')
-      device = { deviceId: loaded.deviceId }
-      return { deviceId: loaded.deviceId }
+      const identity = { deviceId: loaded.deviceId }
+      if (pendingReplacement) {
+        if (identity.deviceId === pendingReplacement.previousId) throw new Error('还无法确认新的设备登录信息。重新连接后再试。')
+        pendingReplacement.publish?.(identity)
+        pendingReplacement = null
+      }
+      device = identity
+      return device
     }).catch(error => { initializing = null; throw error })
     return initializing
   }
 
-  /** A new device key for a device removed from its network; the old key stays revoked there and is dropped here. */
-  async function replaceClient() {
-    await initClient()
+  function initClient(options?: { replaceLostKey?: boolean }): Promise<PublicIdentity> {
+    if (changingKeys) {
+      const load = () => initClient(options)
+      return changingKeys.then(load, load)
+    }
+    return loadClient(options)
+  }
+  function blockKeyUse<Result>(operation: Promise<Result>): Promise<Result> {
+    const work = operation.finally(() => { if (changingKeys === work) changingKeys = null })
+    changingKeys = work
+    return work
+  }
+  async function dropKey() {
     await keys.remove()
-    device = undefined; initializing = null
-    return initClient({ replaceLostKey: true })
+    device = undefined; initializing = null; pendingReplacement = null
+  }
+
+  /** Publish the persisted replacement before a new connection can use it. */
+  function replaceClient({ beforeRemove, onReplaced }: {
+    beforeRemove?: () => void; onReplaced?: (identity: PublicIdentity) => void
+  } = {}): Promise<PublicIdentity> {
+    if (changingKeys) return Promise.reject(cancelled())
+    if (pendingReplacement) return loadClient({ replaceLostKey: true })
+    return blockKeyUse(loadClient().then(async previous => {
+      beforeRemove?.()
+      // A failed removal leaves the initialized key available. Once removal succeeds, reload only the new key.
+      await dropKey()
+      // Persistence can finish before load reports an error. Keep the publisher for the first successful readback.
+      pendingReplacement = { previousId: previous.deviceId, publish: onReplaced }
+      return loadClient({ replaceLostKey: true })
+    }))
   }
 
   /** Deletes this device's key here and drops it from memory; the next initClient makes a new one. */
-  async function forgetClient() {
-    await keys.remove()
-    device = undefined; initializing = null
+  function forgetClient() {
+    return blockKeyUse(Promise.resolve(changingKeys ?? initializing).then(dropKey, dropKey))
   }
 
-  async function sign(bytes: Uint8Array) {
-    if (!device) await initClient()
-    return keys.sign(bytes)
+  function requireSigningIdentity(identity: PublicIdentity) {
+    if (changingKeys || device !== identity) throw cancelled()
+  }
+  async function sign(identity: PublicIdentity, bytes: Uint8Array) {
+    requireSigningIdentity(identity)
+    const signature = await keys.sign(bytes)
+    requireSigningIdentity(identity)
+    return signature
   }
 
   /** Signs `vibeface:message:v1:{domain}:{sha256(payload)}`, the format every Node verifies. */
   async function signClient(domain: string, payload: string | Uint8Array) {
-    await initClient()
-    return sign(secure.signingMessage(domain, typeof payload === 'string' ? encoder.encode(payload) : payload))
+    if (changingKeys || pendingReplacement) throw cancelled()
+    const identity = await initClient()
+    return sign(identity, secure.signingMessage(domain, typeof payload === 'string' ? encoder.encode(payload) : payload))
   }
 
   /** Trust comes from the ticket's device key. */
@@ -294,8 +333,10 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
    * The Node must prove that device key; any other key closes the connection.
    */
   async function connectDevice(entry: ConnectionEntry, { onEvent, onClose, signal, timeoutMs = 10000, onQueued }: ConnectOptions = {}): Promise<DeviceChannel> {
-    if (signal?.aborted) throw new Error('设备连接已取消。')
+    if (signal?.aborted) throw cancelled()
     const me = await initClient()
+    if (signal?.aborted) throw cancelled()
+    requireSigningIdentity(me)
     const target = validTarget(entry.device_id)
     type Reply = { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }
     const pending = new Map<string, Reply & { read: boolean }>()
@@ -318,11 +359,14 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
     let carrier: Carrier | undefined, handshake: SecureHandshake | undefined
     try {
       carrier = await carry(entry, target, signal, closing, timeoutMs, onQueued)
-      if (signal?.aborted) throw new Error('设备连接已取消。')
+      if (signal?.aborted) throw cancelled()
       handshake = new secure.Handshake(true, target, prologue)
-      handshake.setProof(me.deviceId, await sign(handshake.signingBytes()))
+      const proof = await sign(me, handshake.signingBytes())
+      requireSigningIdentity(me)
+      handshake.setProof(me.deviceId, proof)
       carrier.send(handshake.write(new Uint8Array()))
       if (handshake.read(await carrier.receive()).length) throw new Error('连接设备时收到了意外数据，已断开。')
+      requireSigningIdentity(me)
       carrier.send(handshake.write(new Uint8Array()))
       if (!handshake.isFinished() || handshake.remoteId() !== target) throw new Error('设备身份与目标编号不符，已拒绝连接。')
       channel = handshake.finish()

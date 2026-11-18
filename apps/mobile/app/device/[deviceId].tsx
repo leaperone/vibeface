@@ -53,7 +53,7 @@ export default function DeviceDetail() {
     {member.kind === 'node' ? <SettingsGroup>
       {member.entry && device.ready?.principal.can_manage ? <SettingsRow href="/ai" icon={Sparkles} label="Bot 与任务" />
         : <SettingsRow icon={Bot} label={deviceCopy.botStatus[deviceCopy.botState(member.bot, member.online)]} />}
-      {!member.entry && device.ready?.principal.can_manage && target ? <SettingsRow icon={ArrowRightLeft} label="切换到它" disabled={switching.busy !== null} onPress={() => void switching.run('switch', () => device.connect(target))}>
+      {!member.entry && device.ready?.principal.can_manage && target ? <SettingsRow icon={ArrowRightLeft} label="切换到它" disabled={switching.busy !== null} onPress={() => void switching.run('switch', ({ rebind }) => device.connect(target, rebind))}>
         {switching.error ? <View className="basis-full ps-11"><ErrorText error={switching.error} /></View> : null}
       </SettingsRow> : null}
     </SettingsGroup> : null}
