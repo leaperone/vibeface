@@ -1,5 +1,13 @@
 schema_version = 1
 
+[paths.js_workspace]
+exact = ["package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
+[paths.www_local_inputs]
+patterns = ["apps/www/**", "packages/docs/**", "packages/theme/**"]
+include = ["js_workspace"]
+[paths.web_tools]
+exact = ["scripts/build-web.sh", "scripts/check-web.sh", "scripts/build-web-crypto.sh", "scripts/wasm-bindgen-version.py"]
+
 [paths.rust_local_inputs]
 patterns = ["crates/delivery/**", "apps/core/src/**", "apps/cli/src/**", "crates/control/src/**", "crates/client/src/**", "crates/bridge/src/**", "crates/protocol/src/**", "crates/secure/src/**", "crates/secure-ffi/**", "crates/*/tests/**", "apps/core/tests/**", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/core/build.rs", "apps/core/migrations/**", "apps/core/schema.hcl", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".cargo/**"]
 [paths.delivery]
@@ -17,7 +25,8 @@ patterns = ["apps/desktop/src/*", "apps/desktop/tests/*"]
 [paths.mobile]
 patterns = ["apps/mobile/*", "packages/secure-native/*"]
 [paths.web]
-patterns = ["apps/app/*", "packages/client/*", "packages/theme/*", "packages/uiarc/*", "config/uiarc.json", "scripts/generate-uiarc-theme.py", "scripts/check-uiarc.py", "scripts/check-uiarc-build.mjs", "scripts/check-uiarc-native.cjs", "scripts/vendor-uiarc.py", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/check-web.sh", "scripts/build-web-crypto.sh", "scripts/wasm-bindgen-version.py"]
+patterns = ["apps/app/*", "packages/client/*", "packages/theme/*", "packages/uiarc/*", "config/uiarc.json", "scripts/generate-uiarc-theme.py", "scripts/check-uiarc.py", "scripts/check-uiarc-build.mjs", "scripts/check-uiarc-native.cjs", "scripts/vendor-uiarc.py"]
+include = ["js_workspace", "web_tools"]
 [paths.protocol]
 trees = ["crates/protocol"]
 [paths.bridge]
@@ -35,13 +44,13 @@ patterns = ["apps/cli/*"]
 [paths.release_tools]
 patterns = ["scripts/release-contract.mjs", "scripts/release-metadata.mjs", "scripts/test-release-contract.mjs", "scripts/fixtures/release-contract.json", "scripts/build-desktop.mjs", "scripts/verify-desktop.mjs", "scripts/package-npm.mjs", "scripts/publish-npm.mjs", "scripts/sealed-runtime.mjs"]
 [paths.www_overlay]
-patterns = ["apps/www/*", "packages/docs/*", "packages/theme/*", "packages/uiarc/src/foundation.css", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
+exact = ["packages/uiarc/src/foundation.css"]
+include = ["www_local_inputs"]
 [paths.mobile_overlay]
-patterns = ["packages/client/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
-[paths.desktop_overlay]
-patterns = ["package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
+patterns = ["packages/client/*", "packages/theme/*"]
+include = ["js_workspace"]
 [paths.delivery_probe_protocol]
-patterns = ["crates/protocol/src/*.rs"]
+trees = ["crates/protocol/src"]
 
 [[primary]]
 id = "release-tools"
@@ -131,7 +140,7 @@ paths = ["mobile_overlay"]
 scopes = ["mobile"]
 [[overlay]]
 id = "desktop"
-paths = ["desktop_overlay"]
+paths = ["js_workspace"]
 scopes = ["desktop"]
 [[overlay]]
 id = "delivery-acceptance"
@@ -250,41 +259,46 @@ comment = "CI runs the host checks, not the Docker sandbox, so this stays local"
 [[preflight]]
 id = "delivery-probe"
 name = "Delivery service probe"
-paths = ["tests/fixtures/delivery-probe/**", "apps/core/src/delivery/**", "apps/core/src/net.rs", "apps/core/src/net/mesh/record.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/verify-node.py", "crates/protocol/src/*.rs", "crates/protocol/Cargo.toml"]
+paths = ["tests/fixtures/delivery-probe/**", "apps/core/src/delivery/**", "apps/core/src/net.rs", "apps/core/src/net/mesh/record.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/verify-node.py", "crates/protocol/Cargo.toml"]
+groups = ["delivery_probe_protocol"]
 command = "cargo fmt --manifest-path tests/fixtures/delivery-probe/Cargo.toml -- --check && VIBEFACE_PROBE_SOURCE_ROOT=\"$PWD\" CARGO_TARGET_DIR=\"$PWD/.artifacts/delivery-probe/target\" cargo build --manifest-path tests/fixtures/delivery-probe/Cargo.toml --locked"
 [[preflight]]
 id = "web-build"
 name = "Web build and packaged resources"
-paths = ["apps/app/**", "packages/client/**", "apps/mobile/**", "packages/secure-native/**", "packages/theme/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/check-web.sh", "scripts/build-web-crypto.sh", "scripts/wasm-bindgen-version.py"]
+paths = ["apps/app/**", "packages/client/**", "apps/mobile/**", "packages/secure-native/**", "packages/theme/**"]
+groups = ["js_workspace", "web_tools"]
 command = "bash scripts/build-web-crypto.sh && bash scripts/build-web.sh && cargo build -p vibeface -p vibeface-core --locked && python3 scripts/verify-node.py --binary target/debug/vibeface --core-binary target/debug/vibeface-core --app-dir apps/app/dist/client --crypto-module apps/app/dist/client/vibeface_secure.js --artifacts .artifacts/preflight-web --web-only"
 ci_check = "Native package and acceptance (x86_64-unknown-linux-gnu)"
 [[preflight]]
 id = "mobile-types"
 name = "Mobile types"
-paths = ["apps/mobile/**", "packages/secure-native/**", "packages/client/**", "packages/theme/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
+paths = ["apps/mobile/**", "packages/secure-native/**", "packages/client/**", "packages/theme/**"]
+groups = ["js_workspace"]
 command = "pnpm --filter @vibeface/client run typecheck && pnpm --filter @vibeface/secure-native run typecheck && pnpm --filter vibeface-mobile run typecheck"
 ci_check = "Mobile types"
 [[preflight]]
 id = "desktop-source"
 name = "Desktop source"
-paths = ["apps/desktop/**", "scripts/native-desktop/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
+paths = ["apps/desktop/**", "scripts/native-desktop/**"]
+groups = ["js_workspace"]
 command = "cargo test -p vibeface-desktop --features native-ui-tests --locked && cargo clippy -p vibeface-desktop --all-targets --features native-ui-tests --locked -- -D warnings"
 ci_check = "Native desktop host checks"
 [[preflight]]
 id = "desktop-scripts"
 name = "Desktop scripts"
-paths = ["apps/desktop/**", "scripts/native-desktop/**", "scripts/build-desktop.mjs", "scripts/verify-desktop.mjs", "scripts/release-contract.mjs", "scripts/release-metadata.mjs", "scripts/sealed-runtime.mjs", "scripts/windows-signing.mjs", "scripts/private-control.mjs", "scripts/test-release-contract.mjs", "scripts/fixtures/release-contract.json", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
+paths = ["apps/desktop/**", "scripts/native-desktop/**", "scripts/build-desktop.mjs", "scripts/verify-desktop.mjs", "scripts/release-contract.mjs", "scripts/release-metadata.mjs", "scripts/sealed-runtime.mjs", "scripts/windows-signing.mjs", "scripts/private-control.mjs", "scripts/test-release-contract.mjs", "scripts/fixtures/release-contract.json"]
+groups = ["js_workspace"]
 command = "node --check scripts/build-desktop.mjs && node --check scripts/verify-desktop.mjs && node scripts/build-desktop.mjs --self-test && node scripts/verify-desktop.mjs --self-test"
 [[preflight]]
 id = "www-portal"
 name = "Static www portal"
-paths = ["apps/www/**", "packages/docs/**", "packages/theme/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
+groups = ["www_local_inputs"]
 command = "pnpm --filter vibeface-www run typecheck && pnpm --filter vibeface-www run build && pnpm --filter vibeface-www run check:static"
 ci_check = "Static portal"
 [[preflight]]
 id = "www-tests"
 name = "Static www tests"
-paths = ["apps/www/**", "packages/docs/**", "packages/theme/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
+groups = ["www_local_inputs"]
 command = "pnpm --filter vibeface-www run test"
 [[preflight]]
 id = "javascript"

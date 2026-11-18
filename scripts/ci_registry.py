@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import json
 from pathlib import Path
 import re
 import sys
+import tempfile
 import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -15,36 +15,43 @@ REGISTRY_PATH = ROOT / "scripts" / "ci-registry.toml"
 PREFLIGHT_PATH = ROOT / ".preflight.toml"
 BEGIN = "# BEGIN CI REGISTRY GENERATED DOMAINS\n"
 END = "# END CI REGISTRY GENERATED DOMAINS\n"
+JOB_SCOPES = frozenset({
+    "full", "docs", "release-tools", "web", "web-tests", "www", "mobile",
+    "desktop", "delivery-acceptance",
+})
 
 
 def _as_strings(value, label):
     if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
-        raise ValueError(f"{label} must be a non-empty string list")
+        raise ValueError(f"{label} must be a list of nonempty strings")
     return tuple(value)
 
 
 def load_registry(path: Path = REGISTRY_PATH):
     try:
-        data = tomllib.loads(path.read_text())
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ValueError(f"Unable to load CI registry {path}: {exc}") from exc
-    if data.get("schema_version") != 1:
+    if type(data.get("schema_version")) is not int or data["schema_version"] != 1:
         raise ValueError("Unsupported CI registry schema")
     paths = data.get("paths")
     if not isinstance(paths, dict):
         raise ValueError("Registry paths table is required")
     groups = {}
     for group_id, spec in paths.items():
-        if not isinstance(spec, dict):
-            raise ValueError(f"Path group {group_id} must be a table")
-        direct = list(_as_strings(spec.get("patterns", []), f"Path group {group_id}.patterns")) if "patterns" in spec else []
-        exact = _as_strings(spec.get("exact", []), f"Path group {group_id}.exact") if "exact" in spec else ()
-        trees = _as_strings(spec.get("trees", []), f"Path group {group_id}.trees") if "trees" in spec else ()
+        if not isinstance(spec, dict) or spec.keys() - {"patterns", "exact", "trees", "include"}:
+            raise ValueError(f"Invalid path group {group_id}")
+        fields = f"Path group {group_id}"
+        direct = list(_as_strings(spec.get("patterns", []), f"{fields}.patterns"))
+        exact = _as_strings(spec.get("exact", []), f"{fields}.exact")
+        trees = _as_strings(spec.get("trees", []), f"{fields}.trees")
         direct.extend(exact)
-        direct.extend(tree.rstrip("/") + "/*" for tree in trees)
-        include = tuple(spec.get("include", ()))
-        if any(not isinstance(item, str) or item not in paths for item in include):
+        direct.extend(tree.rstrip("/") + "/**" for tree in trees)
+        include = _as_strings(spec.get("include", []), f"{fields}.include")
+        if any(item not in paths for item in include):
             raise ValueError(f"Path group {group_id} has an unknown include")
+        if not direct and not include:
+            raise ValueError(f"Path group {group_id} is empty")
         groups[group_id] = (tuple(direct), include)
     resolved = {}
     visiting = set()
@@ -67,8 +74,8 @@ def load_registry(path: Path = REGISTRY_PATH):
 
     def entries(name):
         raw = data.get(name, [])
-        if not isinstance(raw, list):
-            raise ValueError(f"Registry {name} must be an array")
+        if not isinstance(raw, list) or not raw:
+            raise ValueError(f"Registry {name} must be a nonempty array")
         seen = set()
         result = []
         for item in raw:
@@ -82,12 +89,11 @@ def load_registry(path: Path = REGISTRY_PATH):
 
     def expand(item, label):
         values = []
-        for group_id in item.get("paths", []):
+        for group_id in _as_strings(item.get("paths", []), f"{label}.paths"):
             if group_id in resolved:
                 values.extend(resolved[group_id])
             else:
                 raise ValueError(f"{label} references unknown path group {group_id}")
-        values.extend(_as_strings(item.get("exact", []), f"{label}.exact") if "exact" in item else ())
         return tuple(dict.fromkeys(values))
 
     primary = entries("primary")
@@ -95,8 +101,40 @@ def load_registry(path: Path = REGISTRY_PATH):
     process = entries("process")
     rust = entries("rust_target")
     preflight = entries("preflight")
+    rust_ids = {item["id"] for item in rust}
+    scopes = JOB_SCOPES | rust_ids
+    if rust_ids & JOB_SCOPES:
+        raise ValueError("Rust target IDs may not shadow job scopes")
+    if any(item.keys() & {"exact", "regex", "prefix", "suffix"} for item in overlay):
+        raise ValueError("Overlays must select path groups")
     for item in primary + overlay:
-        item["patterns"] = expand(item, item["id"])
+        label = f"Route {item['id']}"
+        route_scopes = _as_strings(item.get("scopes", []), f"{label}.scopes")
+        if not route_scopes or set(route_scopes) - scopes:
+            raise ValueError(f"{label} has no scopes or an unknown scope")
+        item["scopes"] = route_scopes
+        selectors = item.keys() & {"paths", "exact", "regex", "prefix"}
+        if len(selectors) != 1 or "suffix" in item and "prefix" not in selectors:
+            raise ValueError(f"{label} must define one selector")
+        if "paths" in selectors:
+            item["patterns"] = expand(item, label)
+            if not item["patterns"]:
+                raise ValueError(f"{label} has no path patterns")
+        elif "exact" in selectors:
+            item["exact"] = _as_strings(item["exact"], f"{label}.exact")
+            if not item["exact"]:
+                raise ValueError(f"{label} has no exact paths")
+        elif "regex" in selectors:
+            if not isinstance(item["regex"], str) or not item["regex"]:
+                raise ValueError(f"{label} requires a regex")
+            try:
+                item["regex"] = re.compile(item["regex"])
+            except re.error as exc:
+                raise ValueError(f"{label} has an invalid regex: {exc}") from exc
+        else:
+            if not isinstance(item["prefix"], str) or not item["prefix"]:
+                raise ValueError(f"{label} requires a path prefix")
+            item["suffix"] = _as_strings(item.get("suffix", []), f"{label}.suffix")
     for item in process:
         if "patterns" in item:
             if "paths" in item:
@@ -104,30 +142,34 @@ def load_registry(path: Path = REGISTRY_PATH):
             item["patterns"] = _as_strings(item["patterns"], f"process {item['id']}.patterns")
         else:
             item["patterns"] = expand(item, item["id"])
+        if not item["patterns"]:
+            raise ValueError(f"Process {item['id']} has no path patterns")
     for item in rust:
-        if not isinstance(item.get("package"), str) or not isinstance(item.get("dependents"), list):
+        if not isinstance(item.get("package"), str) or not item["package"]:
             raise ValueError(f"Invalid Rust target {item['id']}")
-        if any(not isinstance(dep, str) for dep in item["dependents"]):
-            raise ValueError(f"Invalid Rust dependents for {item['id']}")
-    rust_ids = {item["id"] for item in rust}
-    if len(rust_ids) != len(rust) or any(dep not in rust_ids for item in rust for dep in item["dependents"]):
+        item["dependents"] = _as_strings(item.get("dependents"), f"Rust target {item['id']}.dependents")
+    if len({item["package"] for item in rust}) != len(rust) or any(
+        dep not in rust_ids for item in rust for dep in item["dependents"]
+    ):
         raise ValueError("Rust target dependency references are invalid")
     for item in preflight:
-        trigger = list(_as_strings(item.get("paths", []), f"preflight {item['id']}.paths") if "paths" in item else ())
-        for group_id in item.get("groups", []):
+        trigger = list(_as_strings(item.get("paths", []), f"preflight {item['id']}.paths"))
+        for group_id in _as_strings(item.get("groups", []), f"preflight {item['id']}.groups"):
             if group_id not in resolved:
                 raise ValueError(f"preflight {item['id']} references unknown path group {group_id}")
             trigger.extend(resolved[group_id])
         if not trigger:
             raise ValueError(f"preflight {item['id']} has no trigger paths")
         item["trigger_paths"] = tuple(dict.fromkeys(trigger))
-        if not isinstance(item.get("name"), str) or not isinstance(item.get("command"), str):
+        if any(not isinstance(item.get(field), str) or not item[field] for field in ("name", "command")):
             raise ValueError(f"Invalid preflight entry {item['id']}")
+        if "ci_check" in item and (not isinstance(item["ci_check"], str) or not item["ci_check"]):
+            raise ValueError(f"Invalid preflight CI check {item['id']}")
         if "heavy" in item and not isinstance(item["heavy"], bool):
             raise ValueError(f"Invalid preflight heavy flag {item['id']}")
     # Exact rules at one priority must be unique. Prefix and regex rules may overlap by design.
     exact_seen = set()
-    for item in primary + overlay:
+    for item in primary:
         for value in item.get("exact", []):
             if value in exact_seen:
                 raise ValueError(f"Duplicate same-priority exact route {value}")
@@ -135,12 +177,8 @@ def load_registry(path: Path = REGISTRY_PATH):
     for item in process:
         if "ordinary" in item and not isinstance(item["ordinary"], bool):
             raise ValueError(f"Invalid ordinary flag for process {item['id']}")
-    return {"data": data, "paths": resolved, "primary": primary, "overlay": overlay,
+    return {"scopes": scopes, "paths": resolved, "primary": primary, "overlay": overlay,
             "process": process, "rust": rust, "preflight": preflight}
-
-
-def fnmatch_patterns(registry, group):
-    return registry["paths"].get(group, ())
 
 
 def render_preflight(registry):
@@ -161,49 +199,67 @@ def render_preflight(registry):
     return "".join(lines)
 
 
-def check_preflight(registry):
-    try:
-        current = PREFLIGHT_PATH.read_text()
-    except OSError as exc:
-        raise ValueError(f"Unable to read {PREFLIGHT_PATH}: {exc}") from exc
-    if BEGIN in current and END in current:
-        start = current.index(BEGIN)
-        end = current.index(END, start) + len(END)
-        expected = current[:start] + render_preflight(registry) + current[end:]
-    else:
-        # First migration accepts the existing domain block only when it is byte-equivalent
-        # after replacing the first through last domain entry.
-        marker_start = current.find("[[domain_check]]")
-        suffix_start = current.find("[review]", marker_start)
-        if marker_start < 0 or suffix_start < 0:
-            raise ValueError(".preflight.toml has no domain_check block")
-        expected = current[:marker_start] + render_preflight(registry) + current[suffix_start:]
-    if current != expected:
+def update_domains(current, registry):
+    if current.count(BEGIN) != 1 or current.count(END) != 1:
+        raise ValueError(".preflight.toml requires one generated domain block")
+    start = current.index(BEGIN)
+    end = current.index(END)
+    if end < start:
+        raise ValueError(".preflight.toml domain block markers are out of order")
+    generated = render_preflight(registry)
+    updated = current[:start] + generated + current[end + len(END):]
+    if tomllib.loads(updated).get("domain_check") != tomllib.loads(generated)["domain_check"]:
+        raise ValueError(".preflight.toml has domain checks outside the registry block")
+    return updated
+
+
+def check_preflight(registry, path=PREFLIGHT_PATH):
+    current = path.read_bytes().decode("utf-8")
+    if current != update_domains(current, registry):
         raise ValueError(".preflight.toml CI registry domain block drifted")
 
 
 def write_preflight(registry):
-    current = PREFLIGHT_PATH.read_text()
-    generated = render_preflight(registry)
-    if BEGIN in current and END in current:
-        start = current.index(BEGIN)
-        end = current.index(END, start) + len(END)
-        updated = current[:start] + generated + current[end:]
-    else:
-        marker_start = current.find("[[domain_check]]")
-        suffix_start = current.find("[review]", marker_start)
-        if marker_start < 0 or suffix_start < 0:
-            raise ValueError(".preflight.toml has no domain_check block")
-        updated = current[:marker_start] + generated + current[suffix_start:]
-    PREFLIGHT_PATH.write_text(updated)
+    current = PREFLIGHT_PATH.read_bytes().decode("utf-8")
+    PREFLIGHT_PATH.write_bytes(update_domains(current, registry).encode("utf-8"))
 
 
 def self_test(registry):
     assert registry["primary"] and registry["overlay"] and registry["process"]
-    assert registry["paths"]["delivery_probe_protocol"] == ("crates/protocol/src/*.rs",)
+    assert registry["paths"]["delivery_probe_protocol"] == ("crates/protocol/src/**",)
     assert any(item["id"] == "delivery-acceptance" for item in registry["overlay"])
     assert [item["id"] for item in registry["rust"]] == ["protocol", "bridge", "secure", "client", "node", "control", "cli", "secure-ffi", "delivery"]
     check_preflight(registry)
+    with tempfile.TemporaryDirectory(prefix="ci-registry-") as directory:
+        bad_registry = Path(directory) / "registry.toml"
+        actual = REGISTRY_PATH.read_text()
+        for original, invalid in (
+            ('scopes = ["delivery"]', 'scopes = ["delivrey"]'),
+            ('paths = ["delivery", "delivery_probe_protocol"]', 'paths = ["not_a_group"]'),
+        ):
+            assert original in actual
+            bad_registry.write_text(actual.replace(original, invalid, 1))
+            try:
+                load_registry(bad_registry)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"Invalid registry accepted {invalid}")
+        bad_preflight = Path(directory) / ".preflight.toml"
+        config = PREFLIGHT_PATH.read_text()
+        for bad in (
+            config + "\n[",
+            config + '\n[[domain_check]]\nname = "unregistered"\n',
+            config.replace(BEGIN, ""),
+            config.replace("[[domain_check]]", "# [[domain_check]]", 1),
+        ):
+            bad_preflight.write_text(bad)
+            try:
+                check_preflight(registry, bad_preflight)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("Malformed or unregistered preflight accepted")
 
 
 def main(argv=None):

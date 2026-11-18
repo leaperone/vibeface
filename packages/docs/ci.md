@@ -11,7 +11,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 ## CI 与 preflight 路径登记
 
-`scripts/ci-registry.toml` 是 CI 选择器和 preflight 域的共同登记源。`scripts/ci.py` 保留事件范围、累计 main 基线、任务依赖、平台矩阵和 gate 语义，登记源提供按优先级首匹配的主路由、WWW/Mobile/Desktop 与交付验收叠加、Rust 目标反向覆盖以及九个普通本地进程模式。新增协议 `src/` Rust 文件会同时触发 `protocol`、`delivery`、Linux package probe、`delivery-charity` 和本地普通模式。
+`scripts/ci-registry.toml` 集中维护 CI 和 preflight 的路径规则。主路由按顺序取第一个匹配结果，附加规则可为相同路径选择更多检查。登记表也定义 Rust 测试的受影响包和本地进程模式。修改 `crates/protocol/src/` 下的文件会选中协议相关 Rust 测试、Delivery 检查和 Linux 制品的公益交付验证。本地计划会列出 `delivery-charity`，preflight 会构建交付 probe。
 
 登记源的域区段由标准库生成器写入 `.preflight.toml` 的有界区段。使用 `python3 -B scripts/ci_registry.py --check-preflight` 检查字节是否漂移，使用 `python3 -B scripts/ci_registry.py --write-preflight` 按登记源重写该区段。未知路径仍选择完整 CI 计划，混合范围按原有并集规则处理，`scripts/*.sh` 等 preflight 通配符继续使用原 TOML 方言。
 

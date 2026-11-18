@@ -38,13 +38,13 @@ CRATES = {item["id"]: item["package"] for item in RUST_TARGETS}
 DEPENDENTS = {item["id"]: tuple(item["dependents"]) for item in RUST_TARGETS}
 PACKAGES = tuple(item["package"] for item in RUST_TARGETS)
 
-WEB_UNIT_TEST = re.compile(r"apps/app/src/(?:lib/[^/]+|features/[^/]+/[^/]+)\.test\.ts")
 RELEASE_TOOL_PATHS = REGISTRY["paths"]["release_tools"]
-PATH_RULES = tuple((scope, tuple(pattern)) for item in REGISTRY["primary"] if item["id"] not in {"release-tools", "provider-generated", "web-unit-tests", "web-test-fallback"} for scope in item["scopes"] for pattern in (item["patterns"],))
-WWW_PATHS = REGISTRY["paths"]["www_overlay"]
-MOBILE_PATHS = REGISTRY["paths"]["mobile_overlay"]
-DESKTOP_PATHS = REGISTRY["paths"]["desktop_overlay"]
-DELIVERY_PROBE_PROTOCOL_PATHS = REGISTRY["paths"]["delivery_probe_protocol"]
+NODE_PROCESS_PATTERNS = tuple(
+    pattern
+    for rule in REGISTRY["primary"]
+    if "node" in rule["scopes"] and "paths" in rule
+    for pattern in rule["patterns"]
+)
 SLOW_TESTS = (
     "runtime::peers::tests::a_round_left_behind_pulls_again_without_waiting_for_hello",
 )
@@ -56,7 +56,6 @@ PLATFORMS = (
 )
 JOBS = ("quick-check", "crypto-web", "web", "web-tests", "mobile-check", "desktop-check", "rust-check", "rust-fast", "rust-slow", "delivery", "package", "npm-package", "npm-smoke", "www")
 LOCAL_PROCESS_RULES = tuple((item["id"], item["patterns"]) for item in REGISTRY["process"])
-REGISTERED_SCOPES = {scope for item in REGISTRY["primary"] + REGISTRY["overlay"] for scope in item["scopes"]}
 ORDINARY_PROCESS_MODES = {item["id"] for item in REGISTRY["process"] if item.get("ordinary", True)}
 
 
@@ -66,7 +65,7 @@ def primary_scopes(path):
         if "exact" in rule:
             matched = path in rule["exact"]
         elif "regex" in rule:
-            matched = re.fullmatch(rule["regex"], path) is not None
+            matched = rule["regex"].fullmatch(path) is not None
         elif "prefix" in rule:
             suffixes = tuple(rule.get("suffix", ()))
             matched = path.startswith(rule["prefix"]) and (not suffixes or path.endswith(suffixes))
@@ -83,7 +82,7 @@ def local_process_modes(paths, full):
     for path in paths:
         matched = {mode for mode, patterns in LOCAL_PROCESS_RULES if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)}
         selected.update(matched)
-        if not matched & ordinary and (path.startswith(("apps/core/", "apps/cli/", "crates/")) or any(fnmatch.fnmatchcase(path, pattern) for scope, patterns in PATH_RULES if scope == "node" for pattern in patterns)):
+        if not matched & ordinary and (path.startswith(("apps/core/", "apps/cli/", "crates/")) or any(fnmatch.fnmatchcase(path, pattern) for pattern in NODE_PROCESS_PATTERNS)):
             selected.update(ordinary)
     return [mode for mode, _ in LOCAL_PROCESS_RULES if mode in selected]
 
@@ -92,21 +91,16 @@ def make_plan(paths, event="pull_request", ref_type="branch", channel="hourly", 
     scopes = set()
     for path in paths:
         scopes.update(primary_scopes(path))
-        if any(fnmatch.fnmatchcase(path, pattern) for pattern in WWW_PATHS):
-            scopes.add("www")
-        if any(fnmatch.fnmatchcase(path, pattern) for pattern in MOBILE_PATHS):
-            scopes.add("mobile")
-        if any(fnmatch.fnmatchcase(path, pattern) for pattern in DESKTOP_PATHS):
-            scopes.add("desktop")
-        if any(fnmatch.fnmatchcase(path, pattern) for pattern in DELIVERY_PROBE_PROTOCOL_PATHS):
-            scopes.add("delivery-acceptance")
+        for rule in REGISTRY["overlay"]:
+            if any(fnmatch.fnmatchcase(path, pattern) for pattern in rule["patterns"]):
+                scopes.update(rule["scopes"])
     plan = scope_plan(scopes, event, ref_type, channel, package_policy=package_policy)
     return dict(plan, changed_files=len(paths), local_process_modes=local_process_modes(paths, plan["full"]))
 
 
 def scope_plan(scopes, event, ref_type, channel, *, package_policy="standard"):
     if (
-        scopes - (REGISTERED_SCOPES | set(DEPENDENTS))
+        scopes - REGISTRY["scopes"]
         or event not in {"pull_request", "push", "schedule", "workflow_dispatch", "merge_group"}
         or ref_type not in {"branch", "tag"}
         or channel not in {"stable", "rc", "hourly"}
@@ -489,6 +483,8 @@ def run_check(packages, msrv=None):
 def self_test():
     from unittest.mock import patch
     focused_self_test()
+    with patch.dict(REGISTRY, {"overlay": [{"patterns": ("README.md",), "scopes": ("desktop",)}]}):
+        assert make_plan(["README.md"])["scopes"] == ["desktop", "docs"]
     web = make_plan(["apps/app/src/routes/index.tsx"])
     assert web["rust_packages"] == [] and web["test_tiers"] == []
     assert web["required_jobs"] == ["quick-check", "crypto-web", "web", "package"]
@@ -499,7 +495,10 @@ def self_test():
         selected = make_plan([path])
         assert "delivery" in selected["scopes"] and {"quick-check","delivery"}.issubset(selected["required_jobs"])
         assert "delivery-charity" in selected["local_process_modes"]
-    for path in ("crates/protocol/src/lib.rs", "crates/protocol/src/delivery.rs", "crates/protocol/src/delivery/request.rs"):
+    for path in (
+        "crates/protocol/src/lib.rs", "crates/protocol/src/delivery.rs",
+        "crates/protocol/src/delivery/request.rs", "crates/protocol/src/delivery/schema.json",
+    ):
         selected = make_plan([path])
         assert selected["scopes"] == ["delivery-acceptance", "protocol"]
         assert selected["delivery"] and "delivery" in selected["required_jobs"]
