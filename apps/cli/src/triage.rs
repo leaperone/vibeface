@@ -68,11 +68,11 @@ impl Provider {
             }),
             Self::Pi => Some(Watch::Extension {
                 file: ".pi/agent/extensions/vibeface.ts",
-                source: include_str!("../../core/extensions/pi.ts"),
+                source: include_str!("../../core/extensions/generated/pi.ts"),
             }),
             Self::Opencode => Some(Watch::Extension {
                 file: ".config/opencode/plugins/vibeface.ts",
-                source: include_str!("../../core/extensions/opencode.ts"),
+                source: include_str!("../../core/extensions/generated/opencode.ts"),
             }),
             Self::Cursor => None,
         }

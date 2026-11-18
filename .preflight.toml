@@ -8,6 +8,11 @@ build = "python3 -c 'import ast,pathlib; [ast.parse(pathlib.Path(p).read_text())
 ci_check = "Workflow and source checks"
 
 [[domain_check]]
+name = "Provider hook templates"
+trigger_paths = ["apps/core/extensions/**", "package.json", "pnpm-lock.yaml"]
+command = "node apps/core/extensions/generate.mjs --check && node node_modules/typescript/bin/tsc -p apps/core/extensions/tsconfig.json && node --test --test-timeout=10000 apps/core/extensions/test/hooks.test.mjs"
+
+[[domain_check]]
 name = "Rust lint"
 trigger_paths = ["crates/delivery/**", "apps/core/src/**", "apps/cli/src/**", "crates/control/src/**", "crates/client/src/**", "crates/bridge/src/**", "crates/protocol/src/**", "crates/secure/src/**", "crates/secure-ffi/**", "crates/*/tests/**", "apps/core/tests/**", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/core/build.rs", "apps/core/migrations/**", "apps/core/schema.hcl", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".cargo/**"]
 command = "cargo clippy --workspace --all-targets --locked -- -D warnings"
