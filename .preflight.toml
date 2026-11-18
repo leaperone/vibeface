@@ -4,9 +4,10 @@ base_branch = "main"
 prefix = ""
 name = "CI policy and Python syntax"
 check = "python3 scripts/check-source.py && python3 scripts/check-cli-parity.py && actionlint"
-build = "python3 -c 'import ast,pathlib; [ast.parse(pathlib.Path(p).read_text()) for p in (\"scripts/check-source.py\", \"scripts/ci.py\", \"scripts/verify-node.py\", \"scripts/build-inputs.py\", \"scripts/check-delivery.py\", \"scripts/install-delivery-toolchain.py\", \"scripts/run-delivery-live.py\", \"scripts/verify-delivery-protected.py\", \"scripts/verify-delivery-restart-observer.py\", \"scripts/release.py\", \"scripts/release_component_identity.py\", \"scripts/release_format.py\", \"scripts/release_context.py\", \"scripts/release_source.py\", \"scripts/release_archive.py\", \"scripts/release_inventory.py\", \"scripts/release_github.py\", \"scripts/release_publisher.py\", \"scripts/release_assembly.py\", \"scripts/tests/__init__.py\", \"scripts/tests/release/__init__.py\", \"scripts/tests/release/runner.py\", \"scripts/tests/release/test_format_archive.py\", \"scripts/tests/release/test_component_identity.py\", \"scripts/tests/release/test_cli.py\", \"scripts/tests/release/test_publisher.py\", \"scripts/tests/release/test_source.py\", \"scripts/tests/release/support.py\", \"scripts/tests/release/fake_external.py\", \"scripts/hourly.py\", \"scripts/release-dispatch.py\", \"scripts/check-release-workflow.py\", \"scripts/test_release_trains.py\")]'"
+build = "python3 -c 'import ast,pathlib; [ast.parse(pathlib.Path(p).read_text()) for p in (\"scripts/check-source.py\", \"scripts/ci.py\", \"scripts/ci_registry.py\", \"scripts/verify-node.py\", \"scripts/build-inputs.py\", \"scripts/check-delivery.py\", \"scripts/install-delivery-toolchain.py\", \"scripts/run-delivery-live.py\", \"scripts/verify-delivery-protected.py\", \"scripts/verify-delivery-restart-observer.py\", \"scripts/release.py\", \"scripts/release_component_identity.py\", \"scripts/release_format.py\", \"scripts/release_context.py\", \"scripts/release_source.py\", \"scripts/release_archive.py\", \"scripts/release_inventory.py\", \"scripts/release_github.py\", \"scripts/release_publisher.py\", \"scripts/release_assembly.py\", \"scripts/tests/__init__.py\", \"scripts/tests/release/__init__.py\", \"scripts/tests/release/runner.py\", \"scripts/tests/release/test_format_archive.py\", \"scripts/tests/release/test_component_identity.py\", \"scripts/tests/release/test_cli.py\", \"scripts/tests/release/test_publisher.py\", \"scripts/tests/release/test_source.py\", \"scripts/tests/release/support.py\", \"scripts/tests/release/fake_external.py\", \"scripts/hourly.py\", \"scripts/release-dispatch.py\", \"scripts/check-release-workflow.py\", \"scripts/test_release_trains.py\")]'"
 ci_check = "Workflow and source checks"
 
+# BEGIN CI REGISTRY GENERATED DOMAINS
 [[domain_check]]
 name = "Provider hook templates"
 trigger_paths = ["apps/core/extensions/**", "package.json", "pnpm-lock.yaml"]
@@ -38,7 +39,7 @@ heavy = true # CI runs the host checks, not the Docker sandbox, so this stays lo
 
 [[domain_check]]
 name = "Delivery service probe"
-trigger_paths = ["tests/fixtures/delivery-probe/**", "apps/core/src/delivery/**", "apps/core/src/net.rs", "apps/core/src/net/mesh/record.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/verify-node.py"]
+trigger_paths = ["tests/fixtures/delivery-probe/**", "apps/core/src/delivery/**", "apps/core/src/net.rs", "apps/core/src/net/mesh/record.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/verify-node.py", "crates/protocol/Cargo.toml", "crates/protocol/src/**"]
 command = "cargo fmt --manifest-path tests/fixtures/delivery-probe/Cargo.toml -- --check && VIBEFACE_PROBE_SOURCE_ROOT=\"$PWD\" CARGO_TARGET_DIR=\"$PWD/.artifacts/delivery-probe/target\" cargo build --manifest-path tests/fixtures/delivery-probe/Cargo.toml --locked"
 
 [[domain_check]]
@@ -97,6 +98,7 @@ name = "Migration integrity"
 trigger_paths = ["apps/core/migrations/**", "apps/core/schema.hcl"]
 command = "atlas migrate validate --dir file://apps/core/migrations"
 
+# END CI REGISTRY GENERATED DOMAINS
 [review]
 extra_checklist = "Check command deduplication, uncertain write results, device connection ownership, local socket permissions, and manager token budgets. A public Node may also schedule or execute; no permanent coordinator or task owner. Verify network and conversation scoping, complete DAG context and no side effects from replay. For paid delivery, require complete membership management authority, bound source/receiver/provider/wallet identities, canonical profile/image/schema, current key serial, independent service authorization, exact ERC20 balance accounting, nonce reservation before signing, durable signed bytes before broadcast, reconciliation of unknown transactions and reorgs, and distinct charity/recoverable/decrypted evidence."
 
