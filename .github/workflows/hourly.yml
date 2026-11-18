@@ -1,5 +1,5 @@
-name: Release / Hourly
-run-name: Independent releases / ${{ github.event_name }} / ${{ github.ref_name }}
+name: Release / Core Hourly
+run-name: Core hourly release / ${{ github.event_name }} / ${{ github.ref_name }}
 on:
   schedule:
     - cron: '17 * * * *'
@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with: {ref: main, fetch-depth: 0, persist-credentials: false}
-      - name: Release changed applications from green main
+      - name: Release Core changes from green main
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

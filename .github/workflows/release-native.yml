@@ -35,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with: {ref: '${{ inputs.source_sha }}', persist-credentials: false}
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           key: ${{ runner.os == 'Windows' && 'windows-static-crt' || '' }}
@@ -80,9 +80,8 @@ jobs:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
         run: bash scripts/sign-release.sh "$APP" "target/$TARGET/release"
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: ./.github/actions/setup-js
         if: runner.os == 'Windows'
-        with: {node-version: '24'}
       - name: Sign and verify Windows programs before sealing
         if: runner.os == 'Windows'
         env:

@@ -18,9 +18,10 @@ RECEIPT = ".vibeface-build.json"
 OUTPUTS = {"crypto": "apps/app/generated", "web": "apps/app/dist/client"}
 COMMON = {".gitignore", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rust-toolchain", "scripts/build-inputs.py"}
 INPUTS = {
-    "crypto": ("crates/secure/", "scripts/build-web-crypto.sh", "scripts/release-rustflags.py"),
+    "crypto": ("crates/secure/", "scripts/build-web-crypto.sh", "scripts/release-rustflags.py", "scripts/wasm-bindgen-version.py",
+               ".github/actions/setup-js/action.yml", ".github/actions/setup-rust/action.yml", ".github/actions/setup-web-crypto/action.yml"),
     "web": ("apps/app/", "packages/client/", "packages/theme/", "packages/uiarc/", "scripts/generate-uiarc-theme.py", "scripts/check-uiarc.py", "scripts/check-uiarc-build.mjs", "scripts/check-uiarc-native.cjs", "config/uiarc.json", "config/public-bootstrap.json", "package.json",
-            "pnpm-lock.yaml", "pnpm-workspace.yaml", "scripts/build-web.sh", "scripts/check-web.sh"),
+            "pnpm-lock.yaml", "pnpm-workspace.yaml", "scripts/build-web.sh", "scripts/check-web.sh", ".github/actions/setup-js/action.yml"),
 }
 CACHE_POLICIES = (
     ("/", "no-store"),
@@ -199,6 +200,9 @@ def self_test():
         web_checks = repo / "scripts/check-web.sh"
         web_checks.parent.mkdir()
         web_checks.write_text("web checks one\n")
+        crypto_tools = repo / ".github/actions/setup-web-crypto/action.yml"
+        crypto_tools.parent.mkdir(parents=True)
+        crypto_tools.write_text("browser tools one\n")
         desktop_main = repo / "apps/desktop/src/main.rs"
         desktop_main.parent.mkdir(parents=True)
         desktop_main.write_text("fn main() {}\n")
@@ -263,6 +267,11 @@ def self_test():
             check(repo, "web")
         web_checks.write_text("web checks one\n")
         check(repo, "web")
+        crypto_tools.write_text("browser tools two\n")
+        for component in OUTPUTS:
+            with TestCase().assertRaises(ValueError, msg='changed browser tools reused stale output'):
+                check(repo, component)
+        crypto_tools.write_text("browser tools one\n")
         desktop_main.write_text("desktop main changed\n")
         check(repo, "crypto")
         check(repo, "web")

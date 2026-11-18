@@ -1,8 +1,6 @@
 name: Release / Website
-run-name: Release / Website / ${{ inputs.tag || github.ref_name }} / ${{ (github.event_name == 'push' || inputs.publish) && 'publish' || 'build only' }}
+run-name: Release / Website / ${{ inputs.tag || github.ref_name }} / ${{ inputs.publish && 'publish' || 'build only' }}
 on:
-  push:
-    tags: ['www-v*']
   workflow_dispatch:
     inputs:
       tag: {description: Exact application tag, type: string, default: ''}
@@ -11,7 +9,7 @@ permissions:
   contents: read
   actions: read
 concurrency:
-  group: release-www-${{ inputs.tag || github.ref_name }}-${{ github.event_name == 'workflow_dispatch' && !inputs.publish && github.run_id || 'publish' }}
+  group: release-www-${{ inputs.tag || github.ref_name }}-${{ !inputs.publish && github.run_id || 'publish' }}
   cancel-in-progress: false
 jobs:
   identity:
@@ -31,8 +29,8 @@ jobs:
       - name: Validate exact tag and source
         id: plan
         env:
-          RELEASE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name || '') }}
-          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          PUBLISH: ${{ inputs.publish }}
           GH_TOKEN: ${{ github.token }}
           WINDOWS_SIGNING_CONFIGURED: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 != '' }}
           IOS_SIGNING_CONFIGURED: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 != '' && secrets.IOS_CERTIFICATE_PASSWORD != '' && secrets.IOS_PROVISIONING_PROFILE_BASE64 != '' }}
@@ -46,10 +44,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with: {ref: '${{ needs.identity.outputs.source_sha }}', persist-credentials: false}
-      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
-        with: {version: 11.9.0}
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with: {node-version: '24', cache: pnpm, cache-dependency-path: pnpm-lock.yaml}
+      - uses: ./.github/actions/setup-js
+        with: {pnpm: 'true'}
       - run: pnpm install --frozen-lockfile
       - name: Build and verify website assets
         run: |
@@ -80,15 +76,6 @@ jobs:
       tag: ${{ needs.identity.outputs.tag }}
       artifact_id: ${{ needs.collect.outputs.artifact_id }}
     permissions: {contents: write, actions: read}
-  wake-consumers:
-    needs: [publish-www]
-    runs-on: ubuntu-24.04
-    permissions: {actions: write, contents: read}
-    steps:
-      - name: Reconcile independent release consumers
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow run hourly.yml --repo "$GITHUB_REPOSITORY" --ref main
   deploy:
     needs: [identity, publish-www]
     uses: ./.github/workflows/release-deploy.yml
