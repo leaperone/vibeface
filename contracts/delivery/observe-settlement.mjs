@@ -98,6 +98,15 @@ export function parseArguments(args) {
 function readRegular(file) { const stat = fs.lstatSync(file); assert(stat.isFile() && stat.size > 0 && stat.size <= 1048576); return fs.readFileSync(file); }
 function same(a, b) { assert.equal(a.toLowerCase(), b.toLowerCase()); }
 function address(a, b) { assert.equal(getAddress(a), getAddress(b)); }
+
+export function recordedPreviews(escrow, { statementObject }, at) {
+  // Contract calls resolve ABI parameters in place, so use plain values from the decoded transaction.
+  return {
+    binding: input => escrow.previewBinding(statementObject(input), at),
+    reservation: ({ input, specs }) => escrow.preview(statementObject(input), specs.toArray(true), at),
+  };
+}
+
 export async function observe({ bundleFile, rpcUrl }) {
   const report = { schemaVersion: 2, status: 'UNVERIFIED', case: 'protected', scope: 'genuine protected budget on the original local chain; binary receipts require independent host verification', checks: [], transactions: [], proofs: [] };
   let provider;
@@ -169,8 +178,9 @@ export async function observe({ bundleFile, rpcUrl }) {
       return record;
     };
     const events = (record, name) => record.receipt.logs.filter(log => log.address.toLowerCase() === bundle.escrow.toLowerCase()).map(log => escrow.interface.parseLog(log)).filter(log => log?.name === name);
+    const previews = recordedPreviews(escrow, model, at);
     const registered = await transaction(bundle.transactions.registerKey, escrow, 'registerKey'); same(registered.parsed.args[1], key.seal);
-    assert.equal(statementBytes(await escrow.previewBinding(registered.parsed.args[0], at)), key.journal);
+    assert.equal(statementBytes(await previews.binding(registered.parsed.args[0])), key.journal);
     const approval = await transaction(bundle.transactions.approve, token, 'approve'); address(approval.tx.from, budget.payer); address(approval.parsed.args[0], bundle.escrow); assert.equal(approval.parsed.args[1], budget.deposit);
     const opened = await transaction(bundle.transactions.openBudget, escrow, 'openBudget'); address(opened.tx.from, budget.payer); address(opened.parsed.args[1], budget.payee); same(opened.parsed.args[2], budget.providerPeer); address(opened.parsed.args[3], bundle.asset); assert.equal(opened.parsed.args[4], budget.deposit);
     assert.equal(events(opened, 'BudgetOpened').length, 1); same(events(opened, 'BudgetOpened')[0].args[0], bundle.budgetId);
@@ -184,7 +194,7 @@ export async function observe({ bundleFile, rpcUrl }) {
         if (method === 'reserveBatch') {
           address(record.tx.from, budget.payer);
           for (const r of record.parsed.args[1]) {
-            const statements = await escrow.preview(r.input, r.specs, at), orderId = statements[0].orderId.toLowerCase(), order = orders.get(orderId); assert(order);
+            const statements = await previews.reservation(r), orderId = statements[0].orderId.toLowerCase(), order = orders.get(orderId); assert(order);
             assert.equal(r.seals.length, statements.length); count += statements.length;
             for (let index = 0; index < statements.length; index++) { const slot = `${orderId}:${index}`; assert(slots.has(slot) && !covered.get(method).has(slot)); covered.get(method).add(slot);
               const source = proofs.get(`2:${slot}`); assert.equal(statementBytes(statements[index]), source.journal); same(r.seals[index], source.seal); }

@@ -3,8 +3,9 @@ import fs from 'node:fs';
 import { test } from 'node:test';
 import { deliveryAbi } from './abi-model.mjs';
 import { artifact, compile, requireDependency } from './compile.mjs';
+import { recordedPreviews } from './observe-settlement.mjs';
 
-const { AbiCoder } = requireDependency('ethers');
+const { AbiCoder, Contract, Interface, ZeroHash } = requireDependency('ethers');
 const readJson = relative => JSON.parse(fs.readFileSync(new URL(relative, import.meta.url)));
 const profile = readJson('../../crates/delivery/proof/profile.json');
 compile({ checkTrust: true });
@@ -58,6 +59,46 @@ test('all four receipt journals roundtrip and alternate encodings are rejected',
     const paddedRelation = `${journal.slice(0, relationPadding)}01${journal.slice(relationPadding + 2)}`;
     assert.throws(() => model.decodeJournal(paddedRelation), /canonical delivery journal ABI/);
   }
+});
+
+test('observer replays decoded historical calls with unchanged calldata and block tag', async () => {
+  const bindingProof = readJson('../../crates/delivery/proof/fixtures/relation-1.json');
+  const sourceProof = readJson('../../crates/delivery/proof/fixtures/relation-2.json');
+  const binding = model.decodeJournal(`0x${bindingProof.journal}`);
+  const source = model.decodeJournal(`0x${sourceProof.journal}`);
+  const spec = {
+    index: source.windowIndex, offset: source.windowOffset, plaintextBytes: source.windowPlaintextBytes,
+    ciphertextBytes: source.windowCiphertextBytes, ciphertextHash: source.ciphertextHash,
+    capsuleHash: source.capsuleHash, plaintextCommitment: source.plaintextCommitment,
+    deliveryFee: source.windowDeliveryFee, reservationFee: source.windowReservationFee,
+  };
+  const abi = new Interface(escrow.abi);
+  const registerData = abi.encodeFunctionData('registerKey', [binding, `0x${bindingProof.seal}`]);
+  const reserveData = abi.encodeFunctionData('reserveBatch', [ZeroHash, [{
+    input: source, specs: [spec], seals: [`0x${sourceProof.seal}`], walletSignature: '0x1234',
+  }]]);
+  const registered = abi.parseTransaction({ data: registerData });
+  const reserved = abi.parseTransaction({ data: reserveData });
+  const calls = [];
+  const runner = {
+    async call(request) {
+      calls.push(request);
+      const { name } = abi.parseTransaction(request);
+      return abi.encodeFunctionResult(name, name === 'previewBinding' ? [binding] : [[source]]);
+    },
+  };
+  const at = { blockTag: 24 };
+  const previews = recordedPreviews(new Contract(source.escrow, escrow.abi, runner), model, at);
+  assert.equal(model.encodeJournal(await previews.binding(registered.args[0])), `0x${bindingProof.journal}`);
+  const statements = await previews.reservation(reserved.args[1][0]);
+  assert.equal(statements.length, 1);
+  assert.equal(model.encodeJournal(statements[0]), `0x${sourceProof.journal}`);
+  assert.deepEqual(calls, [
+    { to: source.escrow, ...at, data: abi.encodeFunctionData('previewBinding', [binding]) },
+    { to: source.escrow, ...at, data: abi.encodeFunctionData('preview', [source, [spec]]) },
+  ]);
+  assert.equal(abi.encodeFunctionData('registerKey', registered.args), registerData);
+  assert.equal(abi.encodeFunctionData('reserveBatch', reserved.args), reserveData);
 });
 
 test('incompatible tuple artifacts fail during model construction', () => {
