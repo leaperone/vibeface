@@ -2,6 +2,7 @@ use super::{Store, event_about_from};
 use crate::{
     crypto::digest,
     model::{Role, Subject},
+    scheduling::{Trigger, TriggerError},
     work::{StopRequest, WorkRequest, WorkSpec},
     workspace::InputTarget,
 };
@@ -117,7 +118,12 @@ impl PeerEnvelope {
             "invalid command target"
         );
         let max_refs = match &self.payload {
-            PeerCommand::Dispatch { spec } if spec.trigger.starts_with("assignment:") => 1024,
+            PeerCommand::Dispatch { spec }
+                if Trigger::tag_of(&spec.trigger)
+                    == Some(crate::scheduling::TriggerTag::Assignment) =>
+            {
+                1024
+            }
             _ => 32,
         };
         ensure!(
@@ -129,18 +135,16 @@ impl PeerEnvelope {
             "invalid command causal references"
         );
         match &self.payload {
-            PeerCommand::Deliver { trigger, .. } => {
-                let (kind, subject) = trigger
-                    .split_once(':')
-                    .context("invalid delivery trigger")?;
-                ensure!(
-                    matches!(kind, "message" | "bot_message" | "work" | "assignment"),
-                    "invalid delivery trigger"
-                );
-                vibeface_protocol::validate_id(subject).map_err(anyhow::Error::msg)?;
-            }
+            PeerCommand::Deliver { trigger, .. } => match Trigger::decode(trigger) {
+                Ok(trigger) if trigger.tag().allows_peer_delivery() => {}
+                Err(TriggerError::InvalidId(tag, error)) if tag.allows_peer_delivery() => {
+                    return Err(anyhow::Error::msg(error));
+                }
+                _ => anyhow::bail!("invalid delivery trigger"),
+            },
             PeerCommand::Dispatch { spec } => {
-                if spec.trigger.starts_with("assignment:") {
+                if Trigger::tag_of(&spec.trigger) == Some(crate::scheduling::TriggerTag::Assignment)
+                {
                     ensure!(
                         self.revision.is_some_and(|revision| revision > 0)
                             && self.sequence == 0
@@ -362,7 +366,7 @@ fn held_delivery_subject_from(
     else {
         return Ok(None);
     };
-    let Some(("message", message_id)) = trigger.split_once(':') else {
+    let Some(Trigger::Message(message_id)) = Trigger::decode(trigger).ok() else {
         return Ok(None);
     };
     held_answer_subject_from(connection, network, conversation_id, message_id)
@@ -508,8 +512,8 @@ impl Store {
     ) -> Result<String> {
         let mut trigger = trigger.to_owned();
         for _ in 0..64 {
-            match trigger.split_once(':') {
-                Some(("message", message)) => {
+            match Trigger::decode(&trigger) {
+                Ok(Trigger::Message(message)) => {
                     if let Some(subject) =
                         held_answer_subject_from(&self.connection, network, conversation, message)?
                     {
@@ -519,7 +523,7 @@ impl Store {
                         .input_route(network, conversation, message)?
                         .map_or_else(|| "main".into(), |route| input_target_key(&route.target)));
                 }
-                Some(("work", work_id)) => {
+                Ok(Trigger::Work(work_id)) => {
                     if let Some(work) =
                         super::reduce::work_from(&self.connection, network, work_id)?
                     {
@@ -538,14 +542,18 @@ impl Store {
                         anyhow::bail!("delivery work source not found");
                     }
                 }
-                Some(("task", work_id)) => return Ok(format!("work:{work_id}")),
-                Some(("assignment", assignment_id)) => {
+                Ok(Trigger::Task(work_id)) => return Ok(format!("work:{work_id}")),
+                Ok(Trigger::Assignment(assignment_id)) => {
                     let assignment =
                         self.delivery_assignment(network, conversation, assignment_id)?;
                     return Ok(format!("workspace_task:{}", assignment.task_id));
                 }
-                Some(("schedule", _)) => return Ok(format!("routine:{trigger}")),
-                _ => return Ok("main".into()),
+                Ok(Trigger::Schedule { .. }) => return Ok(format!("routine:{trigger}")),
+                Err(TriggerError::InvalidSchedule) => anyhow::bail!("invalid schedule trigger"),
+                Err(TriggerError::InvalidId(..)) => anyhow::bail!("invalid delivery trigger"),
+                Ok(Trigger::BotMessage(_)) | Err(TriggerError::UnknownTag) => {
+                    return Ok("main".into());
+                }
             }
         }
         anyhow::bail!("delivery causal chain is too deep")
@@ -557,8 +565,8 @@ impl Store {
         conversation: &str,
         trigger: &str,
     ) -> Result<(Option<u64>, u64, Vec<String>)> {
-        match trigger.split_once(':') {
-            Some(("assignment", assignment_id)) => {
+        match Trigger::decode(trigger) {
+            Ok(Trigger::Assignment(assignment_id)) => {
                 let assignment = self.delivery_assignment(network, conversation, assignment_id)?;
                 let mut refs = vec![assignment.event_hash];
                 if let Some(source) = assignment.source_event
@@ -568,7 +576,7 @@ impl Store {
                 }
                 Ok((Some(assignment.started_revision), 0, refs))
             }
-            Some(("message" | "bot_message", message_id)) => {
+            Ok(Trigger::Message(message_id) | Trigger::BotMessage(message_id)) => {
                 let message = self
                     .message(network, conversation, message_id)?
                     .context("message not found")?;
@@ -597,7 +605,7 @@ impl Store {
                     vec![message.event_hash],
                 ))
             }
-            Some(("work", work_id)) => {
+            Ok(Trigger::Work(work_id) | Trigger::Task(work_id)) => {
                 let event = event_about_from(
                     &self.connection,
                     network,
@@ -612,7 +620,7 @@ impl Store {
                     vec![event.hash],
                 ))
             }
-            Some(("schedule", _)) => Ok((None, 0, vec![])),
+            Ok(Trigger::Schedule { .. }) => Ok((None, 0, vec![])),
             _ => anyhow::bail!("invalid command source"),
         }
     }
@@ -655,7 +663,7 @@ impl Store {
         if trigger == received {
             return Ok(true);
         }
-        let Some(("assignment", assignment_id)) = trigger.split_once(':') else {
+        let Ok(Trigger::Assignment(assignment_id)) = Trigger::decode(trigger) else {
             return Ok(false);
         };
         let assignment = self.delivery_assignment(network, conversation, assignment_id)?;
@@ -689,21 +697,16 @@ impl Store {
                 PeerCommand::Deliver {
                     conversation_id,
                     trigger,
-                } if trigger.starts_with("assignment:") => {
-                    let assignment_id =
-                        trigger.strip_prefix("assignment:").expect("matched prefix");
+                } if let Ok(Trigger::Assignment(assignment_id)) = Trigger::decode(trigger) => {
                     self.delivery_assignment(network, conversation_id, assignment_id)?
                         .bot_owner_epoch
                 }
-                PeerCommand::Dispatch { spec } if spec.trigger.starts_with("assignment:") => {
-                    self.delivery_assignment(
-                        network,
-                        &spec.conversation,
-                        spec.trigger
-                            .strip_prefix("assignment:")
-                            .expect("matched prefix"),
-                    )?
-                    .bot_owner_epoch
+                PeerCommand::Dispatch { spec }
+                    if let Ok(Trigger::Assignment(assignment_id)) =
+                        Trigger::decode(&spec.trigger) =>
+                {
+                    self.delivery_assignment(network, &spec.conversation, assignment_id)?
+                        .bot_owner_epoch
                 }
                 _ => {
                     self.conversation(network, payload.conversation())?
@@ -747,12 +750,12 @@ impl Store {
         if let Some(bound) = self.bound_peer_command(network, &payload)? {
             return Ok(bound);
         }
-        let owner = match trigger.split_once(':') {
-            Some(("assignment", assignment_id)) => {
+        let owner = match Trigger::decode(trigger) {
+            Ok(Trigger::Assignment(assignment_id)) => {
                 self.delivery_assignment(network, conversation, assignment_id)?
                     .execution_node
             }
-            Some(("message", message_id)) => {
+            Ok(Trigger::Message(message_id)) => {
                 if let Some(subject) =
                     held_answer_subject_from(&self.connection, network, conversation, message_id)?
                 {
@@ -822,8 +825,8 @@ impl Store {
             );
             return Ok(bound);
         }
-        let source = match spec.trigger.split_once(':') {
-            Some(("assignment", assignment_id)) => {
+        let source = match Trigger::decode(&spec.trigger) {
+            Ok(Trigger::Assignment(assignment_id)) => {
                 let (revision, refs) = super::workspace::assignment_work_source_from(
                     &self.connection,
                     network,
@@ -894,7 +897,7 @@ impl Store {
                 Some(self.peer_source(network, conversation_id, trigger)?)
             }
             PeerCommand::Dispatch { spec } => {
-                if let Some(("assignment", assignment_id)) = spec.trigger.split_once(':') {
+                if let Ok(Trigger::Assignment(assignment_id)) = Trigger::decode(&spec.trigger) {
                     let assignment =
                         self.delivery_assignment(network, &spec.conversation, assignment_id)?;
                     ensure!(
@@ -966,7 +969,7 @@ impl Store {
                 conversation_id,
                 trigger,
             } => {
-                if let Some(("message", message_id)) = trigger.split_once(':')
+                if let Ok(Trigger::Message(message_id)) = Trigger::decode(trigger)
                     && held_answer_subject_from(
                         &self.connection,
                         network,
@@ -987,7 +990,7 @@ impl Store {
                 }
                 let mut job = self.scheduler_job(conversation_id, trigger)?;
                 if job.is_none()
-                    && let Some(("assignment", assignment_id)) = trigger.split_once(':')
+                    && let Ok(Trigger::Assignment(assignment_id)) = Trigger::decode(trigger)
                 {
                     let assignment = self.workspace_assignment(network, assignment_id)?;
                     if let Some(source) =
@@ -1119,7 +1122,7 @@ impl Store {
             return Ok(false);
         }
         if let PeerCommand::Dispatch { spec } = &envelope.payload
-            && let Some(("assignment", assignment_id)) = spec.trigger.split_once(':')
+            && let Ok(Trigger::Assignment(assignment_id)) = Trigger::decode(&spec.trigger)
         {
             let assignment =
                 self.delivery_assignment(network, &spec.conversation, assignment_id)?;
@@ -1139,5 +1142,61 @@ impl Store {
             );
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod trigger_boundary_tests {
+    use super::*;
+    use crate::work::RequestedWorkKind;
+
+    #[test]
+    fn malformed_assignment_still_requires_an_assignment_source_frame() {
+        let trigger = "assignment:a:b";
+        let work_id = WorkSpec::id("conversation", trigger, "call");
+        let target = format!("work:{work_id}");
+        let payload = PeerCommand::Dispatch {
+            spec: Box::new(WorkRequest {
+                work_id,
+                conversation: "conversation".into(),
+                trigger: trigger.into(),
+                target: "target".into(),
+                dispatcher: "dispatcher".into(),
+                call_ref: "call".into(),
+                kind: RequestedWorkKind::Task,
+                model: None,
+                cwd: String::new(),
+                title: String::new(),
+                prompt: String::new(),
+                continues: None,
+                parent: None,
+                thread: None,
+            }),
+        };
+        let envelope = PeerEnvelope {
+            command_id: payload.id("network"),
+            target,
+            owner_epoch: 1,
+            revision: None,
+            sequence: 0,
+            causal_refs: Vec::new(),
+            payload,
+        };
+        let error = envelope
+            .validate("network", "dispatcher", "target")
+            .unwrap_err();
+        assert_eq!(error.to_string(), "invalid assignment Work source frame");
+    }
+
+    #[test]
+    fn malformed_recognized_delivery_keys_do_not_become_main() -> Result<()> {
+        let store = Store::open(":memory:")?;
+        let target = |key| store.peer_delivery_target("network", "conversation", key);
+        assert_eq!(target("schedule:s:1")?, "routine:schedule:s:1");
+        assert_eq!(target("bot_message:m")?, "main");
+        for key in ["assignment:a:b", "task:", "schedule:s:-1", "message:"] {
+            assert!(target(key).is_err(), "{key}");
+        }
+        Ok(())
     }
 }

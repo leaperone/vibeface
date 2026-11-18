@@ -110,7 +110,7 @@ impl SessionScope {
             });
         }
         if let Some(trigger) = key.strip_prefix("routine:")
-            && parse_schedule_trigger(trigger).is_some()
+            && matches!(Trigger::decode(trigger), Ok(Trigger::Schedule { .. }))
         {
             return Ok(Self::Routine {
                 trigger: trigger.into(),
@@ -134,16 +134,140 @@ pub struct SessionConfig {
     pub provider: Provider,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TriggerTag {
+    Message,
+    Work,
+    Task,
+    Assignment,
+    BotMessage,
+    Schedule,
+}
+
+impl TriggerTag {
+    const ALL: [Self; 6] = [
+        Self::Message,
+        Self::Work,
+        Self::Task,
+        Self::Assignment,
+        Self::BotMessage,
+        Self::Schedule,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::Work => "work",
+            Self::Task => "task",
+            Self::Assignment => "assignment",
+            Self::BotMessage => "bot_message",
+            Self::Schedule => "schedule",
+        }
+    }
+
+    fn from_prefix(prefix: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|tag| tag.name() == prefix)
+    }
+
+    pub(crate) fn allows_peer_delivery(self) -> bool {
+        matches!(
+            self,
+            Self::Message | Self::Work | Self::Assignment | Self::BotMessage
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Trigger<'a> {
+    Message(&'a str),
+    Work(&'a str),
+    Task(&'a str),
+    Assignment(&'a str),
+    BotMessage(&'a str),
+    Schedule { id: &'a str, slot_ms: i64 },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TriggerError {
+    UnknownTag,
+    InvalidId(TriggerTag, String),
+    InvalidSchedule,
+}
+
+impl<'a> Trigger<'a> {
+    pub(crate) fn tag_of(key: &str) -> Option<TriggerTag> {
+        let prefix = key.split_once(':')?.0;
+        TriggerTag::from_prefix(prefix)
+    }
+
+    pub(crate) fn decode(key: &'a str) -> Result<Self, TriggerError> {
+        let (prefix, value) = key.split_once(':').ok_or(TriggerError::UnknownTag)?;
+        let tag = TriggerTag::from_prefix(prefix).ok_or(TriggerError::UnknownTag)?;
+        let id = || -> Result<&str, TriggerError> {
+            vibeface_protocol::validate_id(value)
+                .map_err(|error| TriggerError::InvalidId(tag, error))?;
+            Ok(value)
+        };
+        Ok(match tag {
+            TriggerTag::Message => Self::Message(id()?),
+            TriggerTag::Work => Self::Work(id()?),
+            TriggerTag::Task => Self::Task(id()?),
+            TriggerTag::Assignment => Self::Assignment(id()?),
+            TriggerTag::BotMessage => Self::BotMessage(id()?),
+            TriggerTag::Schedule => {
+                let (id, slot) = value.split_once(':').ok_or(TriggerError::InvalidSchedule)?;
+                vibeface_protocol::validate_id(id).map_err(|_| TriggerError::InvalidSchedule)?;
+                let slot_ms: i64 = slot.parse().map_err(|_| TriggerError::InvalidSchedule)?;
+                if slot_ms < 0 || slot_ms.to_string() != slot {
+                    return Err(TriggerError::InvalidSchedule);
+                }
+                Self::Schedule { id, slot_ms }
+            }
+        })
+    }
+
+    fn subject(self) -> (TriggerTag, &'a str) {
+        match self {
+            Self::Message(id) => (TriggerTag::Message, id),
+            Self::Work(id) => (TriggerTag::Work, id),
+            Self::Task(id) => (TriggerTag::Task, id),
+            Self::Assignment(id) => (TriggerTag::Assignment, id),
+            Self::BotMessage(id) => (TriggerTag::BotMessage, id),
+            Self::Schedule { id, .. } => (TriggerTag::Schedule, id),
+        }
+    }
+
+    pub(crate) fn tag(self) -> TriggerTag {
+        self.subject().0
+    }
+}
+
+impl std::fmt::Display for Trigger<'_> {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (tag, id) = self.subject();
+        write!(output, "{}:{id}", tag.name())?;
+        if let Self::Schedule { slot_ms, .. } = self {
+            write!(output, ":{slot_ms}")?;
+        }
+        Ok(())
+    }
+}
+
 pub fn message_trigger(message_id: &str) -> String {
-    format!("message:{message_id}")
+    Trigger::Message(message_id).to_string()
 }
 
 pub fn work_trigger(work_id: &str) -> String {
-    format!("work:{work_id}")
+    Trigger::Work(work_id).to_string()
 }
 
 pub fn task_trigger(work_id: &str) -> String {
-    format!("task:{work_id}")
+    Trigger::Task(work_id).to_string()
+}
+
+/// The trigger for a workspace assignment.
+pub fn assignment_trigger(assignment_id: &str) -> String {
+    Trigger::Assignment(assignment_id).to_string()
 }
 
 /// What an agent task's coordination job did that its work must follow.
@@ -161,7 +285,9 @@ pub(crate) fn task_work_signal<'a>(
     trigger: &'a str,
     change: TaskJobChange,
 ) -> Option<(&'a str, Signal)> {
-    let work_id = trigger.strip_prefix("task:")?;
+    let Trigger::Task(work_id) = Trigger::decode(trigger).ok()? else {
+        return None;
+    };
     let signal = match change {
         TaskJobChange::Ended { outcome, text } => {
             let (outcome, reason, failure) = match outcome {
@@ -200,20 +326,24 @@ pub(crate) fn task_work_signal<'a>(
 
 /// A message another bot wrote to this conversation.
 pub fn bot_message_trigger(message_id: &str) -> String {
-    format!("bot_message:{message_id}")
+    Trigger::BotMessage(message_id).to_string()
 }
 
 /// One due time of a schedule. It also keys the job and is the reply's `in_reply_to`.
 pub fn schedule_trigger(schedule_id: &str, slot_ms: i64) -> String {
-    format!("schedule:{schedule_id}:{slot_ms}")
+    Trigger::Schedule {
+        id: schedule_id,
+        slot_ms,
+    }
+    .to_string()
 }
 
 /// `(schedule_id, slot_ms)` of a schedule trigger in its single canonical spelling.
 pub fn parse_schedule_trigger(trigger: &str) -> Option<(&str, i64)> {
-    let (schedule_id, slot) = trigger.strip_prefix("schedule:")?.split_once(':')?;
-    vibeface_protocol::validate_id(schedule_id).ok()?;
-    let slot_ms: i64 = slot.parse().ok().filter(|slot| *slot >= 0)?;
-    (slot_ms.to_string() == slot).then_some((schedule_id, slot_ms))
+    match Trigger::decode(trigger).ok()? {
+        Trigger::Schedule { id, slot_ms } => Some((id, slot_ms)),
+        _ => None,
+    }
 }
 
 /// The newest due time at or before `now`; earlier missed times are never run. A one-shot
@@ -774,6 +904,64 @@ impl PendingCheck {
 #[cfg(test)]
 mod lane_tests {
     use super::*;
+
+    #[test]
+    fn trigger_keys_round_trip_in_their_canonical_spelling() {
+        for (key, value) in [
+            ("message:ID_1.foo", Trigger::Message("ID_1.foo")),
+            ("work:ID_1.foo", Trigger::Work("ID_1.foo")),
+            ("task:ID_1.foo", Trigger::Task("ID_1.foo")),
+            ("assignment:ID_1.foo", Trigger::Assignment("ID_1.foo")),
+            ("bot_message:ID_1.foo", Trigger::BotMessage("ID_1.foo")),
+            (
+                "schedule:ID_1.foo:0",
+                Trigger::Schedule {
+                    id: "ID_1.foo",
+                    slot_ms: 0,
+                },
+            ),
+            (
+                "schedule:s:9223372036854775807",
+                Trigger::Schedule {
+                    id: "s",
+                    slot_ms: i64::MAX,
+                },
+            ),
+        ] {
+            assert_eq!(Trigger::decode(key), Ok(value));
+            assert_eq!(value.to_string(), key);
+        }
+        for invalid in [
+            "message",
+            "other:m",
+            "message:",
+            "message:a:b",
+            "message:中文",
+            "schedule:s",
+            "schedule::1",
+            "schedule:s:01",
+            "schedule:s:-1",
+            "schedule:s:-0",
+            "schedule:s:+1",
+            "schedule:s:9223372036854775808",
+            "schedule:s:1:2",
+        ] {
+            assert!(Trigger::decode(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn recognized_tags_survive_malformed_subjects() {
+        assert_eq!(Trigger::tag_of("assignment:"), Some(TriggerTag::Assignment));
+        assert_eq!(
+            Trigger::tag_of("assignment:a:b"),
+            Some(TriggerTag::Assignment)
+        );
+        assert_eq!(Trigger::tag_of("schedule:s:-1"), Some(TriggerTag::Schedule));
+        assert!(Trigger::decode("assignment:").is_err());
+        assert!(Trigger::decode("assignment:a:b").is_err());
+        assert!(Trigger::decode("schedule:s:-1").is_err());
+    }
 
     #[test]
     fn workspace_tasks_round_trip_without_aliasing_raw_work_or_other_scopes() -> anyhow::Result<()>

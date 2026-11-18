@@ -1,4 +1,5 @@
 use crate::model::*;
+use crate::scheduling::{Trigger, TriggerError};
 use anyhow::{Context as _, Result, ensure};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::{RngCore, rngs::OsRng};
@@ -676,15 +677,11 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             ..
         } => {
             id(work_id)?;
-            match trigger.split_once(':').unwrap_or_default() {
-                ("message" | "work" | "task" | "assignment" | "bot_message", trigger_id) => {
-                    id(trigger_id)?
-                }
-                ("schedule", _) => ensure!(
-                    crate::scheduling::parse_schedule_trigger(trigger).is_some(),
-                    "invalid schedule trigger"
-                ),
-                _ => anyhow::bail!("invalid work trigger"),
+            match Trigger::decode(trigger) {
+                Ok(_) => {}
+                Err(TriggerError::InvalidId(_, error)) => return Err(anyhow::Error::msg(error)),
+                Err(TriggerError::InvalidSchedule) => anyhow::bail!("invalid schedule trigger"),
+                Err(TriggerError::UnknownTag) => anyhow::bail!("invalid work trigger"),
             }
             id(call_ref)?;
             vibeface_secure::validate_device_id(dispatcher)?;

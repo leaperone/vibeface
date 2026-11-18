@@ -90,7 +90,7 @@ pub(super) fn resource_conflicts_from(
             && except_assignment
                 .and_then(|id| graph.assignments.get(id))
                 .is_some_and(|assignment| {
-                    work.trigger == format!("assignment:{}", assignment.assignment_id)
+                    work.trigger == crate::scheduling::assignment_trigger(&assignment.assignment_id)
                         && work.dispatcher == assignment.execution_node
                         && bot_scope(connection, network, &assignment.bot_id)
                             .is_ok_and(|scope| scope == work.conversation_id)
@@ -294,15 +294,15 @@ pub(crate) fn work_resources_available_from(
         return Ok(false);
     }
     let graph = read_graph(connection, network)?;
-    let assignment = work
-        .trigger
-        .strip_prefix("assignment:")
-        .and_then(|id| graph.assignments.get(id))
-        .filter(|assignment| {
-            work.dispatcher == assignment.execution_node
-                && bot_scope(connection, network, &assignment.bot_id)
-                    .is_ok_and(|scope| scope == work.conversation_id)
-        });
+    let assignment = match crate::scheduling::Trigger::decode(&work.trigger) {
+        Ok(crate::scheduling::Trigger::Assignment(id)) => graph.assignments.get(id),
+        _ => None,
+    }
+    .filter(|assignment| {
+        work.dispatcher == assignment.execution_node
+            && bot_scope(connection, network, &assignment.bot_id)
+                .is_ok_and(|scope| scope == work.conversation_id)
+    });
     Ok(resource_conflicts_from(
         connection,
         network,

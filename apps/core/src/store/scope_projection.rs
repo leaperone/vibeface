@@ -2,7 +2,7 @@
 use super::{Store, bots::bot_for_conversation_from, log, reduce, work, workspace};
 use crate::{
     model::{Event, EventBody, Role, Subject},
-    scheduling::{SessionScope, parse_schedule_trigger},
+    scheduling::{SessionScope, Trigger, parse_schedule_trigger},
     workspace::InputTarget,
 };
 use anyhow::{Context as _, Result, bail, ensure};
@@ -257,10 +257,12 @@ fn target_from(
                 conversation = scope;
                 Source::Trigger(trigger)
             }
-            Source::Trigger(trigger) => match trigger.split_once(':') {
-                Some(("message" | "bot_message", message)) => Source::Message(message.into()),
-                Some(("work", work_id)) => Source::Work(work_id.into()),
-                Some(("assignment", assignment_id)) => {
+            Source::Trigger(trigger) => match Trigger::decode(&trigger) {
+                Ok(Trigger::Message(message) | Trigger::BotMessage(message)) => {
+                    Source::Message(message.into())
+                }
+                Ok(Trigger::Work(work_id)) => Source::Work(work_id.into()),
+                Ok(Trigger::Assignment(assignment_id)) => {
                     let Some(assignment) =
                         workspace::workspace_assignment_from(connection, network, assignment_id)?
                     else {
@@ -279,7 +281,7 @@ fn target_from(
                     )?
                     .map_or(Destination::Unknown, Destination::from_target));
                 }
-                Some(("task", work_id)) => {
+                Ok(Trigger::Task(work_id)) => {
                     return Ok(session_target_from(
                         connection,
                         network,
@@ -290,7 +292,7 @@ fn target_from(
                     )?
                     .map_or(Destination::Unknown, Destination::from_target));
                 }
-                Some(("schedule", _)) if parse_schedule_trigger(&trigger).is_some() => {
+                Ok(Trigger::Schedule { .. }) => {
                     return Ok(session_target_from(
                         connection,
                         network,

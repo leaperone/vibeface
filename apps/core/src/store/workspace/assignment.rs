@@ -68,7 +68,7 @@ impl Store {
                 let (trigger, reply_to) = existing.trigger_message_id.as_ref().map_or_else(
                     || {
                         (
-                            format!("assignment:{}", existing.assignment_id),
+                            crate::scheduling::assignment_trigger(&existing.assignment_id),
                             existing.assignment_id.clone(),
                         )
                     },
@@ -1236,7 +1236,9 @@ pub(super) fn workspace_assignment_for_job_with_graph<'a>(
         return Ok(None);
     };
     if job.kind == TriggerKind::WorkResult {
-        let Some(work_id) = job.trigger.strip_prefix("work:") else {
+        let Ok(crate::scheduling::Trigger::Work(work_id)) =
+            crate::scheduling::Trigger::decode(&job.trigger)
+        else {
             return Ok(None);
         };
         let (conversation, dispatcher, trigger) =
@@ -1256,9 +1258,9 @@ pub(super) fn workspace_assignment_for_job_with_graph<'a>(
         if conversation != job.conversation_id || dispatcher != local {
             return Ok(None);
         }
-        let (reply_to, kind) = match trigger.split_once(':') {
-            Some(("assignment", id)) => (id.to_owned(), TriggerKind::Human),
-            Some(("message", id)) => {
+        let (reply_to, kind) = match crate::scheduling::Trigger::decode(&trigger) {
+            Ok(crate::scheduling::Trigger::Assignment(id)) => (id.to_owned(), TriggerKind::Human),
+            Ok(crate::scheduling::Trigger::Message(id)) => {
                 let Some(message) =
                     crate::store::message_from(connection, network, &conversation, id)?
                         .filter(|message| message.role == Role::User)
@@ -1288,7 +1290,9 @@ pub(super) fn workspace_assignment_for_job_with_graph<'a>(
         );
     }
     let graph = graph()?;
-    if let Some(id) = job.trigger.strip_prefix("assignment:") {
+    if let Ok(crate::scheduling::Trigger::Assignment(id)) =
+        crate::scheduling::Trigger::decode(&job.trigger)
+    {
         let Some(assignment) = graph.assignments.get(id) else {
             return Ok(None);
         };
@@ -1373,7 +1377,7 @@ pub(super) fn workspace_assignment_for_job_with_graph<'a>(
             return Ok(None);
         }
         let trigger = original.trigger_message_id.as_ref().map_or_else(
-            || format!("assignment:{}", original.assignment_id),
+            || crate::scheduling::assignment_trigger(&original.assignment_id),
             |input| crate::scheduling::message_trigger(input),
         );
         let native: Option<String> = connection.query_row("SELECT t.thread_id FROM manager_turns t JOIN scheduler_jobs j ON j.attempt_id=t.attempt_id WHERE j.conversation_id=? AND j.trigger=?", params![job.conversation_id,trigger], |row| row.get(0)).optional()?;

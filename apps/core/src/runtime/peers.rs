@@ -2571,7 +2571,7 @@ impl Runtime {
 
             match &envelope.payload {
                 PeerCommand::Deliver { conversation_id, trigger } => {
-                    if let Some(("message", message_id)) = trigger.split_once(':')
+                    if let Ok(crate::scheduling::Trigger::Message(message_id)) = crate::scheduling::Trigger::decode(trigger)
                         && let Some(receipt) = self.accept_held_answer_delivery(network, conversation_id, message_id).await? {
                             return Ok(Some(json!({"receipt":receipt})));
                         }

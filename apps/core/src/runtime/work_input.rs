@@ -23,7 +23,15 @@ impl Runtime {
         network: &str,
         trigger: &str,
     ) -> Result<()> {
-        if let Some(id) = trigger.strip_prefix("assignment:") {
+        if crate::scheduling::Trigger::tag_of(trigger)
+            == Some(crate::scheduling::TriggerTag::Assignment)
+        {
+            let crate::scheduling::Trigger::Assignment(id) =
+                crate::scheduling::Trigger::decode(trigger)
+                    .map_err(|_| anyhow::anyhow!("invalid assignment trigger"))?
+            else {
+                unreachable!()
+            };
             let assignment = store
                 .workspace_assignment(network, id)?
                 .context("work assignment missing")?;
