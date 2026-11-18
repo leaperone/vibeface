@@ -535,7 +535,7 @@ pub fn path_is_private(path: &Path) -> io::Result<bool> {
 
 pub(super) fn path_owned_by_current_account(path: &Path) -> io::Result<bool> {
     let owner = owner_of_path(path)?;
-    Ok(owner == current_user()? || (token_holds(&owner)? && path_is_private(path)?))
+    Ok(owner == current_user()? || (token_holds(&owner)? && path_is_trusted_install(path, false)?))
 }
 
 pub(super) fn path_is_trusted_install(path: &Path, ancestor: bool) -> io::Result<bool> {
