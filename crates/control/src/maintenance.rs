@@ -777,8 +777,7 @@ mod tests {
         ));
         let error = request(&socket, MaintenanceCommand::Acquire)
             .await
-            .err()
-            .expect("Acquire must use the lease-returning API");
+            .expect_err("Acquire must use the lease-returning API");
         assert!(error.to_string().contains("lease stream is retained"));
     }
 
