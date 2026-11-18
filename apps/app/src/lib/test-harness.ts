@@ -84,5 +84,13 @@ export function hookHarness(lazyInitialState = false) {
     reset() {
       cursor = 0
     },
+    remount() {
+      for (const effect of effects.values()) effect.cleanup?.()
+      effects.clear()
+      memos.clear()
+      values.length = 0
+      afterRender.length = 0
+      cursor = 0
+    },
   }
 }

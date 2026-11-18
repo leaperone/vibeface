@@ -11,7 +11,9 @@ import { entryAddress,throughEntry,type Member } from "@vibeface/client/lib/node
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { deviceForm,deviceOnline,isLoopback } from "@vibeface/client/workspace/labels.ts"
 import { botReadiness } from "@vibeface/client/workspace/model.ts"
+import { describeNode } from "@vibeface/client/workspace/node-diagnostics.ts"
 import type { NodeInfo } from "@vibeface/client/workspace/types.ts"
+import { useNodeChecks } from "@vibeface/client/workspace/use-node-checks.ts"
 import { Button } from "@vibeface/uiarc/button/button.tsx"
 import { Input } from "@vibeface/uiarc/input/input.tsx"
 import { Switch } from "@vibeface/uiarc/switch/switch.tsx"
@@ -19,6 +21,7 @@ import { ArrowRightLeft,Check,ChevronRight,Copy,Info,Pencil,RadioTower,ShieldAle
 import { useEffect,useState,type ReactNode } from "react"
 import { AiSettings } from "./ai-settings"
 import { JoinRequests } from "./join"
+import { NodeConnection,NodeStatus } from "./node-connection"
 import { RelaySettings,ShareLink,relayLabel } from "./relay-settings"
 
 type DeviceRow = {
@@ -71,6 +74,31 @@ function useEntryLabel() {
   return connectionOnline ? "当前连接" : "重连中"
 }
 
+const inForeground = () => typeof document !== "undefined" && document.visibilityState === "visible"
+
+function useNodeDiagnostics(rows: DeviceRow[], visible: boolean) {
+  const { ready } = useDevice()
+  const { connectionOnline, nodeReport, refreshNodes } = useWorkspace()
+  const active = visible && connectionOnline && ready?.isCurrent() === true
+  const checks = useNodeChecks({ report: nodeReport, refreshNodes, active, foreground: inForeground })
+  useEffect(() => {
+    if (!active || !refreshNodes || typeof document === "undefined") return
+    document.addEventListener("visibilitychange", checks.refresh)
+    return () => document.removeEventListener("visibilitychange", checks.refresh)
+  }, [active, refreshNodes, checks.refresh])
+  const describe = (row: DeviceRow) => describeNode({
+    target: { deviceId: row.id, name: row.name, entry: row.entry },
+    ready,
+    connected: connectionOnline,
+    report: nodeReport,
+    fresh: checks.fresh,
+    checking: checks.checking,
+    clientLabel: "这个浏览器",
+    nameFor: (id) => rows.find((item) => item.id === id)?.name,
+  })
+  return { describe, checks, canRefresh: active && Boolean(refreshNodes) }
+}
+
 export function DevicesPage({ joins = true }: { joins?: boolean }) {
   const device = useDevice()
   const workspace = useWorkspace()
@@ -97,6 +125,8 @@ export function DevicesPage({ joins = true }: { joins?: boolean }) {
   const initialRead = directoryRead === device.ready && nodesRead && (readUnavailable || !connected || !canEdit || settingsRead?.connection === device.ready && settingsRead.deviceId === connected.id)
   const contentReady = Boolean(device.ready && (shownConnection === device.ready || initialRead))
   useEffect(() => { if (initialRead) setShownConnection(device.ready) }, [device.ready, initialRead])
+  const { describe } = useNodeDiagnostics(rows, contentReady && rows.some((row) => row.kind === "node"))
+  const entryDiagnostics = connected ? describe(connected) : null
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6" aria-busy={!contentReady}>
     {joins ? <JoinRequests /> : null}
     <InlineError error={error} action={{ label: "重试", onClick: () => { setError(null); device.refreshDirectory().catch(setError) } }} />
@@ -108,7 +138,7 @@ export function DevicesPage({ joins = true }: { joins?: boolean }) {
         <div className="grid min-w-0 flex-1 basis-32 gap-1">
           <p className="text-sm text-secondary">当前连接的电脑</p>
           <h2 className="text-lg font-medium [overflow-wrap:anywhere]">{connected.name}</h2>
-          <div className="flex flex-wrap items-center gap-2"><Tag>{entryLabel}</Tag>{connected.online !== undefined ? <Online online={connected.online} /> : null}</div>
+          <div className="flex flex-wrap items-center gap-2"><Tag>{entryLabel}</Tag>{entryDiagnostics ? <NodeStatus status={entryDiagnostics.status} /> : null}</div>
         </div>
         <RoutedAction variant="ghost" to="/devices/$deviceId" params={{ deviceId: connected.id }} title="详细设置"><span className="max-sm:sr-only">详细设置</span><ChevronRight aria-hidden="true" /></RoutedAction>
       </header>
@@ -119,17 +149,25 @@ export function DevicesPage({ joins = true }: { joins?: boolean }) {
         <h2 className="px-1 text-sm font-medium text-secondary">{group.title}</h2>
         <ul className={deviceStyles.deviceGroup}>{group.items.map((row) => {
         const Icon = deviceIcon(row)
+        const diagnostics = row.kind === "node" ? describe(row) : null
+        const path = diagnostics?.pathLabel ?? (diagnostics?.status === "online" ? "路径未知" : null)
         return <li key={row.id}><Link to="/devices/$deviceId" params={{ deviceId: row.id }} className={deviceStyles.deviceRow}>
           <Icon aria-hidden="true" className="size-5 shrink-0 text-secondary" />
-          {/* On a phone the tag drops under the name, so the name keeps the width. */}
-          <span className="flex min-w-0 flex-1 flex-col items-start gap-x-2 gap-y-0.5 sm:flex-row sm:items-center"><span className="line-clamp-2 min-w-0 font-medium [overflow-wrap:anywhere]">{row.name}</span>
-            <span className="flex flex-wrap gap-1 empty:hidden">
-              {row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}
-              {row.bot ? <Tag><terms.canRunBot.icon aria-hidden="true" className={cn("size-3.5", row.bot === "needs_setup" && "text-warning")} />{row.bot === "ready" ? "Bot" : row.bot === "unverified" ? "Bot 未验证，可尝试" : row.bot === "starting" ? "Bot 启动中" : "Bot 需设置"}</Tag> : null}
-              {row.admin ? <Tag title={terms.admin.label}><terms.admin.icon aria-hidden="true" className="size-3.5" />{terms.admin.tag}</Tag> : null}
+          <span className="grid min-w-0 flex-1 gap-1">
+            <span className="flex min-w-0 flex-col items-start gap-x-2 gap-y-0.5 sm:flex-row sm:flex-wrap sm:items-center">
+              <span className="line-clamp-2 min-w-0 font-medium [overflow-wrap:anywhere]">{row.name}</span>
+              <span className="flex flex-wrap gap-1 empty:hidden">
+                {row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}
+                {row.bot ? <Tag><terms.canRunBot.icon aria-hidden="true" className={cn("size-3.5", row.bot === "needs_setup" && "text-warning")} />{row.bot === "ready" ? "Bot" : row.bot === "unverified" ? "Bot 未验证，可尝试" : row.bot === "starting" ? "Bot 启动中" : "Bot 需设置"}</Tag> : null}
+                {row.admin ? <Tag title={terms.admin.label}><terms.admin.icon aria-hidden="true" className="size-3.5" />{terms.admin.tag}</Tag> : null}
+              </span>
             </span>
+            {diagnostics ? <span className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-0.5">
+              <NodeStatus status={diagnostics.status} />
+              {path ? <span className="min-w-0 text-sm text-secondary [overflow-wrap:anywhere]">{path}</span> : null}
+            </span> : null}
           </span>
-          {row.online !== undefined ? <Online online={row.online} compact /> : null}
+          {!diagnostics && row.online !== undefined ? <Online online={row.online} compact /> : null}
           <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-secondary" />
         </Link></li>
       })}</ul></section>)}
@@ -211,6 +249,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
   // Taking management away asks first; giving it does not.
   const [unmanaging, setUnmanaging] = useState(false)
   const row = rows.find((item) => item.id === deviceId)
+  const { describe, checks, canRefresh } = useNodeDiagnostics(rows, row?.kind === "node")
   const entryName = rows.find((item) => item.entry)?.name
   const copied = writeState.conflicts.some((item) => item.author === deviceId) || Boolean(row?.entry && writeState.state === "forked")
   const RemoveIcon = terms.remove.icon
@@ -218,6 +257,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
   const localSession = ready?.principal.source === "local_session"
   if (!row) return device.directory ? <EmptyState icon={terms.myDevices.icon} title="找不到这个设备" action={<RoutedAction variant="secondary" to="/devices">回到设备列表</RoutedAction>} /> : <div className="mx-auto grid w-full max-w-(--page-width) gap-4"><Skeleton className="h-16" /><Skeleton className="h-40" /></div>
   const Icon = deviceIcon(row)
+  const diagnostics = row.kind === "node" ? describe(row) : null
   const address = row.entry && ready ? entryAddress(ready.entry) : ""
   const target = device.entries.find((item) => item.device_id === row.id) ?? (ready && row.member ? throughEntry(ready.entry, row.id) : undefined)
 
@@ -227,12 +267,12 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
       <div className="grid min-w-0 gap-1">
         <DeviceTitle row={row} editable={canManage && Boolean(row.member)} />
         <div className="flex flex-wrap items-center gap-2">
-          {row.online !== undefined ? <Online online={row.online} /> : null}
+          {!diagnostics && row.online !== undefined ? <Online online={row.online} /> : null}
           {row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}
           {row.browser && entryName ? <Tag title={`连在「${entryName}」上`}><terms.thisComputer.icon aria-hidden="true" className="size-3.5" />{entryName}</Tag> : null}
           {row.admin ? <Tag title={terms.admin.label}><terms.admin.icon aria-hidden="true" className="size-3.5" />{terms.admin.tag}</Tag> : null}
         </div>
-        {row.online === false ? <p className="text-sm text-secondary">{entryName && !row.entry ? `确认它开着，并且能连到「${entryName}」` : deviceCopy.offline}</p> : null}
+        {!diagnostics && row.online === false ? <p className="text-sm text-secondary">{entryName && !row.entry ? `确认它开着，并且能连到「${entryName}」` : deviceCopy.offline}</p> : null}
       </div>
     </header>
 
@@ -240,6 +280,10 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
       <Copy aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
       <span>{row.entry ? "它的数据被复制过，已暂停。在另一台设备上移除它，再重新加入。" : canManage ? "它的数据被复制过。移除它，再在那台电脑上重新加入。" : "它的数据被复制过。用管理设备移除它，再重新加入。"}</span>
     </p> : null}
+
+    {diagnostics ?
+      <NodeConnection key={`${ready?.generation ?? "offline"}:${row.id}`} name={row.name} diagnostics={diagnostics} checks={checks} canRefresh={canRefresh} />
+      : null}
 
     {row.kind === "node" && !copied ? row.entry && (canManage || localSession) ? <Section title={terms.ai.label} bare><AiSettings /></Section> : <Section title={terms.ai.label}>
       <div className="grid gap-1">

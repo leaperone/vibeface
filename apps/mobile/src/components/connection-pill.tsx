@@ -1,5 +1,6 @@
 import { PopoverPanel } from '@/components/arc/popover'
-import { ArrowRightLeft, RefreshCw, RotateCw, ShieldCheck, WifiOff, type LucideIcon } from 'lucide-react-native'
+import { useRouter } from 'expo-router'
+import { ArrowRightLeft, RefreshCw, Route, RotateCw, ShieldCheck, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState } from 'react'
 import { useReducedMotion } from 'react-native-reanimated'
 import { Modal, Pressable, useWindowDimensions, View, type HostInstance } from 'react-native'
@@ -37,6 +38,9 @@ export function ConnectionPill({ connection }: { connection: Connection }) {
 
 /** The connection as a header icon tinted by state; tapping drops the full pill below it. */
 export function ConnectionMenu({ connection }: { connection: Connection }) {
+  const router = useRouter()
+  const { members } = useWorkspace()
+  const entry = members.find(member => member.entry && member.kind === 'node')
   const look = looks[connection.state]
   const button = useRef<HostInstance>(null)
   const window = useWindowDimensions()
@@ -57,6 +61,9 @@ export function ConnectionMenu({ connection }: { connection: Connection }) {
       <Pressable className="absolute inset-0" onPress={() => setOpen(false)} accessibilityRole="button" accessibilityLabel="关闭" />
       {at ? <PopoverPanel style={{ position: 'absolute', left, top: at.y + 4, width: Math.min(320, window.width - left - 8) }} className="py-2">
         <ConnectionPill connection={connection} />
+        {entry ? <Button variant="ghost" onPress={() => { setOpen(false); router.push(`/device/${entry.device_id}`) }}>
+          <Icon as={Route} /><Text>查看连接路径</Text>
+        </Button> : null}
       </PopoverPanel> : null}
     </Modal>
   </>

@@ -176,7 +176,7 @@ test("creation fields use the server UTF-8 byte limits and reject whitespace", (
 test("workspace preserves bot and message requests while routing native decisions to their exact work", async (t) => {
   const drainOutbox = async () => { await new Promise(resolve => setTimeout(resolve, 50)) }
   const settleComponent = drainOutbox
-  const hooks = hookHarness(), { react, values, effects, afterRender } = hooks
+  const hooks = hookHarness(), { react, afterRender } = hooks
   const stored = new Map<string, string>()
   const browser = {
     location: { href: "https://node.example/app?conversation=chat" },
@@ -337,8 +337,7 @@ test("workspace preserves bot and message requests while routing native decision
     return state
   }
   const reload = async () => {
-    for (const effect of effects.values()) effect.cleanup?.()
-    effects.clear(); values.length = 0; afterRender.length = 0
+    hooks.remount()
     render(); render().setView("chat"); render()
     // The outbox read that unlocks writing is asynchronous; the next render starts the first refresh.
     await drainOutbox(); render()

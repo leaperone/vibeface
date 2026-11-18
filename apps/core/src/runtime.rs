@@ -66,6 +66,13 @@ pub use triage::{
 #[cfg(test)]
 pub(crate) mod test_support;
 
+#[derive(serde::Serialize)]
+struct NodeObservation {
+    checked_at_ms: i64,
+    last_synced_at_ms: Option<i64>,
+    path: Option<crate::net::SelectedPath>,
+}
+
 fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {
     let mut names = BTreeMap::new();
     for member in bundle.genesis.members().iter().chain(
@@ -1163,6 +1170,7 @@ impl Runtime {
                 .contains(&Provider::Codex)
         );
         json!({"roots":settings.roots,"relay":self.relay_config().relay_listen.is_some(),
+            "version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,
             "manager":manager,
             "manager_state":self.manager_state().await,
             "manager_readiness":self.manager_readiness().await,
@@ -1265,9 +1273,19 @@ impl Runtime {
                     .into_iter()
                     .filter(|member| member.kind == IdentityKind::Node)
                     .collect();
+                let include_observation = access.is_user();
                 let probes = members.iter().map(|member| async {
                     if member.device_id == local {
-                        return (true, self.capabilities().await);
+                        let capabilities = self.capabilities().await;
+                        return (
+                            true,
+                            capabilities,
+                            NodeObservation {
+                                checked_at_ms: now_ms(),
+                                last_synced_at_ms: None,
+                                path: None,
+                            },
+                        );
                     }
                     // A Node the sync loop cannot reach would hold this answer for the timeout.
                     let answer = if self.sync_failing(&member.device_id) {
@@ -1275,10 +1293,11 @@ impl Runtime {
                     } else {
                         tokio::time::timeout(
                             Duration::from_secs(3),
-                            self.peer_request(
+                            self.peer_request_with_connection(
                                 network,
                                 &member.device_id,
                                 json!({"type":"capabilities"}),
+                                std::convert::identity,
                             ),
                         )
                         .await
@@ -1286,19 +1305,38 @@ impl Runtime {
                         .and_then(Result::ok)
                     };
                     let live = answer.is_some();
+                    let path = if include_observation {
+                        answer
+                            .as_ref()
+                            .and_then(|(_, connection)| crate::net::selected_path(connection))
+                    } else {
+                        None
+                    };
+                    let (_, last_synced_at_ms) = self.peer_sync_status(&member.device_id);
+                    let observation = NodeObservation {
+                        checked_at_ms: now_ms(),
+                        last_synced_at_ms,
+                        path,
+                    };
                     (
                         live,
-                        self.peer_capabilities(&member.device_id, answer).await,
+                        self.peer_capabilities(&member.device_id, answer.map(|(answer, _)| answer))
+                            .await,
+                        observation,
                     )
                 });
                 let probes = futures_util::future::join_all(probes).await;
-                for (member, (live, capabilities)) in members.into_iter().zip(probes) {
+                for (member, (live, capabilities, observation)) in members.into_iter().zip(probes) {
                     let here = member.device_id == local;
                     let (seq, hash) = match heads.get(&member.device_id) {
                         Some((seq, hash)) => (*seq, Some(hash)),
                         None => (0, None),
                     };
-                    nodes.push(json!({"device_id":member.device_id,"name":member.name,"revoked":false,"local":here,"online":live,"max_seq":seq,"head_hash":hash,"capabilities":capabilities}));
+                    let mut row = json!({"device_id":member.device_id,"name":member.name,"revoked":false,"local":here,"online":live,"max_seq":seq,"head_hash":hash,"capabilities":capabilities});
+                    if include_observation {
+                        row["observation"] = json!(observation);
+                    }
+                    nodes.push(row);
                 }
                 for revoked in view.revoked {
                     if let Some(name) = display_names.get(&revoked.device_id) {

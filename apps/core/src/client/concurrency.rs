@@ -294,6 +294,7 @@ impl Lane {
 #[derive(Clone)]
 struct Snapshot {
     device_id: String,
+    transport: Option<SessionTransport>,
     cookie: Option<String>,
     operator: bool,
 }
@@ -302,6 +303,7 @@ impl From<&Session> for Snapshot {
     fn from(session: &Session) -> Self {
         Self {
             device_id: session.device_id.clone(),
+            transport: session.transport.clone(),
             cookie: session.cookie.clone(),
             operator: session.operator,
         }
@@ -312,6 +314,7 @@ impl Snapshot {
     fn session(self) -> Session {
         Session {
             device_id: self.device_id,
+            transport: self.transport,
             cookie: self.cookie,
             operator: self.operator,
             subscribed: None,

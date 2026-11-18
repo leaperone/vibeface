@@ -18,6 +18,8 @@ function component(file: string, dependencies: Record<string, unknown>) {
   const load = moduleLoader(createContext({ window: { addEventListener() {}, removeEventListener() {} }, setTimeout, clearTimeout }), (specifier) => {
     if (specifier === 'react') return hooks.react
     if (specifier === 'react/jsx-runtime') return { jsx, jsxs: jsx }
+    if (specifier === '@vibeface/client/workspace/use-node-checks.ts') return { useNodeChecks: () => ({ fresh: false, checking: false }) }
+    if (specifier === '@vibeface/client/workspace/node-diagnostics.ts') return { describeNode: () => ({ status: 'unknown', pathLabel: null }) }
     return dependencies[specifier] ?? ui
   })
   const module = load(fileURLToPath(new URL(file, import.meta.url))) as Record<string, (props: Record<string, unknown>) => Element>
