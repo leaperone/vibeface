@@ -1,4 +1,11 @@
-use super::*;
+use super::{fresh_main_inputs, reset_fresh_main_inputs};
+use crate::{
+    crypto::LocalIdentity,
+    model::{Event, EventBody, IngestStatus, SignedEvent, WIRE_VERSION},
+    store::{Store, membership_from},
+    workspace::{InputControl, InputIntent, InputTarget, WORKSPACE_SCOPE, WorkspaceCommand},
+};
+use anyhow::{Context as _, Result, ensure};
 
 struct Fixture {
     store: Store,
