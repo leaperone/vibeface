@@ -243,11 +243,7 @@ fn registered_cli(service: &UserService, inspected_dir: &Path) -> Result<PathBuf
         let path = package.join(relative);
         let metadata = fs::symlink_metadata(&path)?;
         ensure!(privatefs::is_plain_file(&metadata));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            ensure!(metadata.permissions().mode() & 0o022 == 0);
-        }
+        check_install_path(&path, package)?;
         Ok(path)
     };
     ensure!(privatefs::is_executable(&file(CLI_BINARY)?));
@@ -255,19 +251,22 @@ fn registered_cli(service: &UserService, inspected_dir: &Path) -> Result<PathBuf
     file(SERVICE_SCRIPT)?;
     let metadata: PackageBuild = read_metadata(&file("BUILD-INFO.json")?)?;
 
-    if let Some(vendor) = package
+    let install_root = if let Some(vendor) = package
         .parent()
         .filter(|p| p.file_name().is_some_and(|name| name == "vendor"))
     {
         let root = vendor
             .parent()
             .context("npm package directory is missing")?;
+        check_install_path(&root.join("package.json"), root)?;
+        check_install_path(&root.join("bin/vibeface.mjs"), root)?;
         let npm: NpmPackage = read_metadata(&root.join("package.json"))?;
         ensure!(npm.name == "@leaperone/vibeface" && npm.version == metadata.version);
         ensure!(root.join("bin/vibeface.mjs").is_file());
         ensure!(
             fs::canonicalize(service.cli.parent().context("CLI directory is missing")?)? == package
         );
+        root.to_owned()
     } else {
         let policy: InstallPolicy = serde_json::from_slice(&privatefs::read_private_bounded(
             &inspected_dir.join("update.json"),
@@ -278,8 +277,23 @@ fn registered_cli(service: &UserService, inspected_dir: &Path) -> Result<PathBuf
         let root = fs::canonicalize(policy.install_root)?;
         ensure!(package.starts_with(&root) && package != root);
         ensure!(fs::canonicalize(root.join("current").join(CLI_BINARY))? == canonical_binary);
-    }
+        check_install_path(&root.join("current"), &root)?;
+        check_install_path(&canonical_binary, &root)?;
+        root
+    };
+    check_install_path(&service.cli, &install_root)?;
     Ok(service.cli.clone())
+}
+
+fn check_install_path(path: &Path, full_protection_from: &Path) -> Result<()> {
+    for entry in path.ancestors() {
+        let ancestor = entry != path && !entry.starts_with(full_protection_from);
+        ensure!(
+            vibeface_bridge::platform::privatefs::is_trusted_install_path(entry, ancestor)?,
+            "registered CLI package is writable by another account"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -621,6 +635,10 @@ mod tests {
             &serde_json::to_vec(&json!({"install_root": install}))?,
         )?;
         assert_eq!(registered_cli(&service, &observed)?, cli);
+        let release_dir = package.parent().unwrap();
+        fs::set_permissions(release_dir, fs::Permissions::from_mode(0o777))?;
+        assert!(registered_cli(&service, &observed).is_err());
+        fs::set_permissions(release_dir, fs::Permissions::from_mode(0o755))?;
         assert!(registered_cli(&service, &fs::canonicalize(&root)?).is_err());
         let unrelated = root.join(CLI_BINARY);
         fs::copy(package.join(CLI_BINARY), &unrelated)?;

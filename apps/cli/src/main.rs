@@ -31,8 +31,7 @@ mod triage;
 mod tui;
 mod update;
 
-const NO_HOME: &str =
-    "no data directory: HOME is unset or not absolute; pass --data-dir or set VIBEFACE_DATA_DIR";
+const NO_HOME: &str = "no absolute home directory: pass --data-dir or set VIBEFACE_DATA_DIR";
 const LOG_FILE: &str = "node.log";
 const MAX_LOG_RECORD: usize = 8 * 1024;
 

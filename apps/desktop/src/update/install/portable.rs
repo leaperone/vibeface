@@ -13,6 +13,7 @@ const SEAL: &str = "resources/runtime/FILES.sha256";
 const PLATFORM_FILES: &[&str] = &[".vibeface-installed-files.json"];
 #[cfg(target_os = "linux")]
 const PLATFORM_FILES: &[&str] = &[
+    ".DirIcon",
     "AppRun",
     "vibeface.desktop",
     "vibeface.png",
@@ -49,7 +50,7 @@ pub(super) fn safe_relative(name: &str) -> bool {
         })
 }
 
-/// The original archive has four fixed Linux integration files (one manifest on Windows),
+/// The original archive has five fixed Linux integration files (one manifest on Windows),
 /// known Desktop resources, and a checksum-sealed CLI payload. Unknown siblings are user data.
 pub(super) fn owned_files(root: &Path) -> Result<BTreeSet<PathBuf>> {
     check_layout(root)?;

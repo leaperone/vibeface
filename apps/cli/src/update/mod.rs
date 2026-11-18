@@ -211,6 +211,16 @@ pub fn npm_install_root(executable: &Path) -> Result<Option<PathBuf>> {
 }
 
 pub async fn run(options: Update) -> Result<()> {
+    ensure!(
+        !matches!(
+            options.action,
+            Action::Configure {
+                automatic: false,
+                ..
+            }
+        ),
+        "automatic updates are required for managed Node services"
+    );
     let data = match &options.action {
         Action::Configure { data, .. }
         | Action::Status(data)
@@ -291,14 +301,9 @@ async fn act(options: Update, data: PathBuf) -> Result<()> {
         }
         Action::Configure {
             channel,
-            automatic,
             install_root,
             ..
         } => {
-            ensure!(
-                automatic,
-                "automatic updates are required for managed Node services"
-            );
             ensure!(
                 !data.join("update-pending.json").exists(),
                 "interrupted update: run update apply with the existing policy first"
@@ -363,13 +368,8 @@ async fn act(options: Update, data: PathBuf) -> Result<()> {
         Action::Apply { automatic, .. } => {
             let policy = policy(&data)?;
             let native = managed_registration(&policy, &data).await?;
-            if automatic && (!native.installed || !native.running) {
-                if native.installed && data.join("update-pending.json").exists() {
-                    let service = Service::load(&data).await?;
-                    recover_with_service(&policy, &data, &service, RecoveryMode::KeepStopped)
-                        .await?;
-                }
-                println!("Update deferred until the managed Node service is running.");
+            if automatic && !native.installed {
+                println!("Update deferred until a managed Node service is installed.");
                 return Ok(());
             }
             ensure!(
@@ -377,6 +377,12 @@ async fn act(options: Update, data: PathBuf) -> Result<()> {
                 "installed managed Node service is required"
             );
             recover(&policy, &data).await?;
+            if automatic && !native.running {
+                println!(
+                    "The scheduled update will check for releases when the managed Node is running again."
+                );
+                return Ok(());
+            }
             let previous = installed(&policy.install_root)?;
             let current = manifest(&previous)?.version;
             let Some(latest) = release::check(policy.channel)
@@ -833,6 +839,34 @@ async fn recover(policy: &Policy, data: &Path) -> Result<()> {
     recover_with_service(policy, data, &service, RecoveryMode::ResumeJournal).await
 }
 
+fn read_pending_journal(path: &Path) -> Result<Option<Journal>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        metadata.is_file() && metadata.len() <= 64 * 1024,
+        "invalid pending update journal"
+    );
+    Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+}
+
+pub(crate) fn record_stop_requested(data: &Path, expected_device_id: &str) -> Result<()> {
+    let path = data.join("update-pending.json");
+    if let Some(mut journal) = read_pending_journal(&path)? {
+        ensure!(
+            journal.device_id == expected_device_id,
+            "update journal belongs to another node"
+        );
+        if journal.resume_service {
+            journal.resume_service = false;
+            persist(&path, &journal)?;
+        }
+    }
+    Ok(())
+}
+
 async fn recover_with_service(
     policy: &Policy,
     data: &Path,
@@ -840,15 +874,9 @@ async fn recover_with_service(
     mode: RecoveryMode,
 ) -> Result<()> {
     let pending = data.join("update-pending.json");
-    if !pending.exists() {
+    let Some(mut journal) = read_pending_journal(&pending)? else {
         return Ok(());
-    }
-    let metadata = fs::symlink_metadata(&pending)?;
-    ensure!(
-        metadata.is_file() && metadata.len() <= 64 * 1024,
-        "invalid pending update journal"
-    );
-    let mut journal: Journal = serde_json::from_slice(&fs::read(&pending)?)?;
+    };
     let root = fs::canonicalize(&policy.install_root)?;
     ensure!(
         journal.backup.parent() == Some(root.join("backups").as_path())
@@ -2234,7 +2262,10 @@ mod tests {
         })
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("automatic updates are required"));
+        assert!(
+            error.to_string().contains("automatic updates are required"),
+            "{error:#}"
+        );
         assert!(!data.join("update.json").exists());
         run(Update {
             action: Action::Configure {
@@ -3283,10 +3314,10 @@ mod tests {
 
     #[tokio::test]
     async fn stopped_journal_recovery_does_not_start_the_service() {
-        let (policy, data, mut journal) = activation_fixture();
-        journal.resume_service = false;
+        let (policy, data, journal) = activation_fixture();
         switch(&policy.install_root, &journal.candidate).unwrap();
-        persist(&data.join("update-pending.json"), &journal).unwrap();
+        assert!(record_stop_requested(&data, "another-node").is_err());
+        record_stop_requested(&data, &journal.device_id).unwrap();
         let service = FakeService {
             candidate: journal.candidate.clone(),
             failure: "none",

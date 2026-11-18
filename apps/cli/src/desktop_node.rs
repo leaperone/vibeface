@@ -1309,6 +1309,7 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                     );
                     let package = managed_current(&receipt.managed_root)?;
                     run_service(&package, &data, &receipt.service_id, "stop").await?;
+                    crate::update::record_stop_requested(&data, expected)?;
                     wait_data_unlocked(&data)
                         .await
                         .context(OperationFailure::Lock)?;

@@ -279,11 +279,17 @@ impl DesktopHost {
         !self.attach_only
             && self.discovery_state == DiscoveryState::Ready
             && !self.discovery.user_service_registered
-            && !self
-                .discovery
-                .warnings
-                .iter()
-                .any(|warning| warning == "user_service_metadata_unavailable")
+            && !self.discovery.warnings.iter().any(|warning| {
+                matches!(
+                    warning.as_str(),
+                    "user_service_metadata_unavailable"
+                        | "running_process_metadata_unavailable"
+                        | "candidate_unavailable_or_identity_mismatch"
+                        | "candidate_ownership_unavailable"
+                        | "candidate_limit_reached"
+                        | "current_user_home_unavailable"
+                )
+            })
             && self
                 .discovery
                 .nodes
@@ -412,11 +418,13 @@ impl DesktopHost {
             .context("节点候选已过期，请重新扫描。")?;
         let identity = candidate.identity();
         self.verify(&identity, Some(NodeStatus::Stopped)).await?;
-        if candidate.sources.contains(&NodeSource::UserService) {
-            ensure!(
-                node.user_service_cli == candidate.user_service_cli,
-                "原 CLI 注册已变化，请重新核对后启动。"
-            );
+        let registered = candidate.sources.contains(&NodeSource::UserService);
+        ensure!(
+            registered == node.sources.contains(&NodeSource::UserService)
+                && node.user_service_cli == candidate.user_service_cli,
+            "原 CLI 注册已变化，请重新核对后启动。"
+        );
+        if registered {
             let cli = candidate
                 .user_service_cli
                 .as_deref()

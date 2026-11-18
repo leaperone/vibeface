@@ -71,8 +71,11 @@ fn verify_registration(root: &Path, version: &str) -> Result<()> {
         "invalid installer ownership marker"
     );
     let words: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|v| u16::from_le_bytes([v[0], v[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .copied()
+        .map(u16::from_le_bytes)
         .collect();
     let marker = String::from_utf16(words.strip_prefix(&[0xfeff]).unwrap_or(&words))?;
     let expected = format!("vibeface-native-install-v2\r\n{dir}\r\n");

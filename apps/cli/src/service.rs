@@ -349,7 +349,11 @@ pub async fn run(options: Service) -> Result<()> {
     } else {
         command(&root, &data, &executable, action)?
     };
-    run_command(&mut operation).await
+    run_command(&mut operation).await?;
+    if matches!(action, Action::Stop) {
+        update::record_stop_requested(&data, &inspected.device_id)?;
+    }
+    Ok(())
 }
 
 async fn run_command(operation: &mut Command) -> Result<()> {

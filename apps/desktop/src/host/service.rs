@@ -200,6 +200,7 @@ mod contract_tests {
             let root =
                 std::env::temp_dir().join(format!("vf-managed-contract-{}", uuid::Uuid::new_v4()));
             fs::create_dir(&root)?;
+            let root = fs::canonicalize(root)?;
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
             let cli = root.join("cli");
             fs::write(
@@ -226,7 +227,9 @@ exit "$(cat "$fixture_dir/exit-code")"
             fs::write(self.root.join("exit-code"), code.to_string())?;
             let result = invoke(&self.cli, &self.root, BackgroundAction::Status, None).await;
             assert_eq!(
-                fs::read_to_string(self.root.join("calls"))?,
+                fs::read_to_string(self.root.join("calls")).with_context(|| format!(
+                    "fixture CLI did not record its arguments: {result:?}"
+                ))?,
                 format!(
                     "desktop-node\n--profile-dir\n{}\nstatus\n",
                     self.root.display()

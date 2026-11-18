@@ -59,6 +59,26 @@ pub fn same_owner(left: &Path, right: &Path) -> Result<bool> {
     Ok(owner_of(left)? == owner_of(right)?)
 }
 
+/// Whether writes and replacement of this installation path are limited to the current
+/// account and system administrators.
+pub fn is_trusted_install_path(path: &Path, ancestor: bool) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let metadata = std::fs::symlink_metadata(path)?;
+        let owner = metadata.uid();
+        let file_type = metadata.file_type();
+        let mode = metadata.permissions().mode();
+        let trusted_owner = owner == 0 || Account(owner) == current_account()?;
+        let sticky_ancestor = ancestor && metadata.is_dir() && owner == 0 && mode & 0o1000 != 0;
+        Ok(trusted_owner && (file_type.is_symlink() || mode & 0o022 == 0 || sticky_ancestor))
+    }
+    #[cfg(windows)]
+    {
+        super::winsec::path_is_trusted_install(path, ancestor).map_err(Into::into)
+    }
+}
+
 /// Whether no account other than this one can read or write `path`, which may be a file or a
 /// directory.
 pub fn is_private(path: &Path) -> Result<bool> {
