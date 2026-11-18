@@ -7,7 +7,7 @@ usage() {
 Usage: install-node-service.sh install --binary /absolute/vibeface --data-dir /absolute/data
        install-node-service.sh install-updater --binary /install-root/current/vibeface --data-dir /absolute/data
        install-node-service.sh start|stop|restart|status [--data-dir /absolute/data]
-       install-node-service.sh uninstall-updater|uninstall-node|uninstall [--data-dir /absolute/data]
+       install-node-service.sh uninstall [--data-dir /absolute/data]
 
 Installs user-level launchd agents on macOS or systemd user services on Linux.
 Initialize the node before installing. Uninstall keeps all node data.
@@ -34,7 +34,8 @@ while (($#)); do
   esac
 done
 [[ "$service_id" =~ ^[a-z0-9][a-z0-9-]{0,40}$ ]] || { echo 'Invalid service identity.' >&2; exit 2; }
-case "$action" in install|install-updater|start|stop|restart|status|verify|uninstall-updater|uninstall-node|uninstall) ;; *) usage >&2; exit 2 ;; esac
+[[ "$action" != uninstall-node ]] || action=uninstall
+case "$action" in install|install-updater|start|stop|restart|status|verify|verify-schedule|uninstall-updater|uninstall) ;; *) usage >&2; exit 2 ;; esac
 
 if [[ -n "$data_dir" ]]; then
   [[ "$data_dir" == /* && -f "$data_dir/config.json" && -f "$data_dir/identity.json" ]] || { echo 'An initialized absolute --data-dir is required.' >&2; exit 2; }
@@ -150,10 +151,9 @@ case "$(uname -s)" in
       fi
     }
     case "$action" in
-      start|stop|restart) check_service_data "$service" 3 ;;
+      start|stop|restart|verify|verify-schedule) check_service_data "$service" 3 ;;
       uninstall-updater) check_service_data "$update_service" 5 ;;
-      install|install-updater|status|verify|uninstall) check_service_data "$service" 3; check_service_data "$update_service" 5 ;;
-      uninstall-node) check_service_data "$service" 3 ;;
+      install|install-updater|status|uninstall) check_service_data "$service" 3; check_service_data "$update_service" 5 ;;
     esac
     case "$action" in
       install|install-updater)
@@ -183,7 +183,6 @@ PLIST
         cat >> "$temp" <<PLIST
 <string>--data-dir</string><string>$(xml_escape "$data_dir")</string></array>
 <key>WorkingDirectory</key><string>$(xml_escape "$(dirname "$binary")")</string>
-<key>RunAtLoad</key><true/>
 PLIST
         if [[ "$action" == install-updater ]]; then
           cat >> "$temp" <<PLIST
@@ -191,6 +190,7 @@ PLIST
 PLIST
         else
           cat >> "$temp" <<PLIST
+<key>RunAtLoad</key><true/>
 <key>KeepAlive</key><true/>
 PLIST
         fi
@@ -223,20 +223,23 @@ PLIST
         fi
         exit "$status_code"
         ;;
-      verify)
-        installed=false; running=false
+      verify|verify-schedule)
+        installed=false; running=false; scheduled=false
         if [[ -f "$service" ]]; then installed=true; launchctl print "$domain/$label" >/dev/null 2>&1 && running=true; fi
-        printf '{"installed":%s,"running":%s}\n' "$installed" "$running"
-        ;;
-      uninstall|uninstall-updater|uninstall-node)
-        if [[ "$action" != uninstall-node ]]; then
-          launchctl bootout "$domain/$update_label" >/dev/null 2>&1 || true
-          rm -f "$update_service"
+        if [[ "$action" == verify ]]; then
+          printf '{"installed":%s,"running":%s}\n' "$installed" "$running"
+        else
+          if [[ -f "$update_service" ]] && (check_service_data "$update_service" 5) 2>/dev/null && launchctl print "$domain/$update_label" >/dev/null 2>&1; then scheduled=true; fi
+          printf '{"installed":%s,"running":%s,"automatic_update_scheduled":%s}\n' "$installed" "$running" "$scheduled"
         fi
-        if [[ "$action" == uninstall || "$action" == uninstall-node ]]; then
-          launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
+        ;;
+      uninstall|uninstall-updater)
+        if [[ "$action" == uninstall ]]; then
+          if launchctl print "$domain/$label" >/dev/null 2>&1; then launchctl bootout "$domain/$label"; fi
           rm -f "$service"
         fi
+        if launchctl print "$domain/$update_label" >/dev/null 2>&1; then launchctl bootout "$domain/$update_label"; fi
+        rm -f "$update_service"
         printf 'Removed requested services; node data was kept.\n'
         ;;
     esac
@@ -259,13 +262,12 @@ PLIST
       done <<< "$contents"
       [[ "$count" == 1 && "$start" == ExecStart=*" $expected --data-dir \"$(systemd_exec_escape "$data_dir")\"" ]] || different_data
       if [[ -n "$binary" ]]; then
-        [[ "$start" == "ExecStart=\"$(systemd_exec_escape "$binary")\" "* ]] || different_data
+        [[ "$start" == "ExecStart=\"$(systemd_exec_escape "$binary")\" $expected --data-dir \"$(systemd_exec_escape "$data_dir")\"" ]] || different_data
       fi
     }
     case "$action" in
-      start|stop|restart|verify) check_service_data "$service" "$unit.service" serve ;;
+      start|stop|restart|verify|verify-schedule) check_service_data "$service" "$unit.service" serve ;;
       uninstall-updater) check_service_data "$update_service" "$unit-update.service" 'update apply --automatic' ;;
-      uninstall-node) check_service_data "$service" "$unit.service" serve ;;
       install|install-updater|status|uninstall)
         check_service_data "$service" "$unit.service" serve
         check_service_data "$update_service" "$unit-update.service" 'update apply --automatic'
@@ -354,21 +356,24 @@ UNIT
         systemctl --user --no-pager status "$unit-update.service" || true
         exit "$status_code"
         ;;
-      verify)
-        installed=false; running=false
+      verify|verify-schedule)
+        installed=false; running=false; scheduled=false
         if [[ -f "$service" ]]; then installed=true; systemctl --user is-active --quiet "$unit.service" && running=true; fi
-        printf '{"installed":%s,"running":%s}\n' "$installed" "$running"
-        ;;
-      uninstall|uninstall-updater|uninstall-node)
-        if [[ "$action" != uninstall-node ]]; then
-          systemctl --user disable --now "$unit-update.timer" >/dev/null 2>&1 || true
-          systemctl --user stop "$unit-update.service" >/dev/null 2>&1 || true
-          rm -f "$update_service" "$update_timer"
+        if [[ "$action" == verify ]]; then
+          printf '{"installed":%s,"running":%s}\n' "$installed" "$running"
+        else
+          if [[ -f "$update_service" && -f "$update_timer" ]] && (check_service_data "$update_service" "$unit-update.service" 'update apply --automatic') 2>/dev/null && systemctl --user is-enabled --quiet "$unit-update.timer" && systemctl --user is-active --quiet "$unit-update.timer"; then scheduled=true; fi
+          printf '{"installed":%s,"running":%s,"automatic_update_scheduled":%s}\n' "$installed" "$running" "$scheduled"
         fi
-        if [[ "$action" == uninstall || "$action" == uninstall-node ]]; then
-          systemctl --user disable --now "$unit.service" >/dev/null 2>&1 || true
+        ;;
+      uninstall|uninstall-updater)
+        if [[ "$action" == uninstall ]]; then
+          if [[ -f "$service" ]]; then systemctl --user disable --now "$unit.service"; fi
           rm -f "$service"
         fi
+        if [[ -f "$update_timer" ]]; then systemctl --user disable --now "$unit-update.timer"; fi
+        if [[ -f "$update_service" ]]; then systemctl --user stop "$unit-update.service"; fi
+        rm -f "$update_service" "$update_timer"
         systemctl --user daemon-reload
         printf 'Removed requested services; node data was kept.\n'
         ;;

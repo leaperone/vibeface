@@ -483,22 +483,71 @@ impl Backend {
                 };
                 Ok(())
             }),
-            Command::Host(action) => Box::pin(async move {
+            Command::ConnectRememberedLocal {
+                profile_id,
+                generation,
+                identity,
+                passphrase,
+            } => Box::pin(async move {
+                if self.state.generation == generation
+                    && self.current_profile_id().ok().as_deref() == Some(profile_id.as_str())
+                    && self.client.is_none()
+                    && self.host.snapshot().selected.as_ref() == Some(&identity)
                 {
+                    match self
+                        .reconnect_remembered_local(&identity, &passphrase)
+                        .await
+                    {
+                        Ok(true) => {
+                            let _ = self.emit(Event::LocalAutoConnected).await;
+                        }
+                        Ok(false) => {}
+                        Err(_) => {
+                            let _ = self
+                                .emit(Event::Notice(
+                                    "未能自动连接本机 Node，请解锁档案后重试。".into(),
+                                ))
+                                .await;
+                        }
+                    }
+                }
+                Ok(())
+            }),
+            Command::Host(action) => Box::pin(async move {
+                let result: Result<()> = async {
                     match action {
                         HostAction::Refresh => {
                             self.host.discover().await?;
                         }
                         HostAction::Controller => self.host.choose_mode(NodeMode::Controller)?,
-                        HostAction::Select(identity) => {
+                        HostAction::Connect(identity) => {
                             self.host.select_node(&identity).await?;
+                            let _ = self
+                                .emit(Event::EditForm {
+                                    editor: Editor::ConnectLocal,
+                                    values: BTreeMap::from([
+                                        ("_local_node_id", identity.device_id),
+                                        (
+                                            "_local_data_dir",
+                                            identity.data_dir.to_string_lossy().into_owned(),
+                                        ),
+                                    ]),
+                                })
+                                .await;
                         }
                         HostAction::Start => {
                             self.host.start_owned().await?;
+                            let _ = self.host.discover().await;
                         }
-                        HostAction::Stop => self.host.stop_owned().await?,
+                        HostAction::Stop => {
+                            self.host.stop_owned().await?;
+                            let _ = self.host.discover().await;
+                        }
                         HostAction::Background(action) => {
                             self.host.background(action).await?;
+                            if action != BackgroundAction::Status {
+                                let _ = self.host.discover().await;
+                            }
                         }
                         HostAction::Remember(path) => {
                             self.host.remember_directory(path).await?;
@@ -512,9 +561,11 @@ impl Backend {
                             self.host.save_preferences(preferences)?
                         }
                     }
-                    self.publish_host().await;
-                };
-                Ok(())
+                    Ok(())
+                }
+                .await;
+                self.publish_host().await;
+                result
             }),
             Command::WorkDetail {
                 conversation_id,

@@ -16,6 +16,7 @@ markdown = "=1.0.0"
 png = "=0.18.1"
 hex.workspace = true
 reqwest.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -28,6 +29,9 @@ vibeface-control.workspace = true
 vibeface-protocol.workspace = true
 vibeface-secure = { path = "../../crates/secure" }
 zeroize = { version = "1", features = ["derive"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

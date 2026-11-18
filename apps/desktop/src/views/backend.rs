@@ -35,7 +35,7 @@ use vibeface_protocol::workspace::{
 pub enum HostAction {
     Refresh,
     Controller,
-    Select(NodeIdentity),
+    Connect(NodeIdentity),
     Start,
     Stop,
     Background(BackgroundAction),
@@ -97,6 +97,12 @@ pub enum Command {
         command: Box<Command>,
     },
     Refresh,
+    ConnectRememberedLocal {
+        profile_id: String,
+        generation: u64,
+        identity: NodeIdentity,
+        passphrase: zeroize::Zeroizing<String>,
+    },
     Disconnect,
     Conversation(String),
     Save {
@@ -222,6 +228,7 @@ pub enum Event {
     },
     Snapshot(Arc<Snapshot>),
     Host(HostSnapshot),
+    LocalAutoConnected,
     Notice(String),
     Error(String),
     Detail(Vec<(String, String)>),
@@ -404,12 +411,22 @@ impl Backend {
             }
             #[cfg(test)]
             Self::test_phase("actor-ready");
+            let startup_scan = backend.host.scan();
+            tokio::pin!(startup_scan);
+            let mut startup_scanning = true;
             let mut timer = tokio::time::interval(Duration::from_secs(2));
             'commands: loop {
                 if let Err(error) = backend.cancel_stale_reads().await {
                     let _ = backend.emit(Event::Error(error.to_string())).await;
                 }
                 tokio::select! {biased;_=stopping.changed()=>break,
+                result = &mut startup_scan, if startup_scanning => {
+                    startup_scanning = false;
+                    backend.host.complete_startup_discovery(result);
+                    backend.publish_host().await;
+                    #[cfg(test)]
+                    Self::test_phase("actor-discovery-published");
+                },
                 recovered=backend.recovery.recv()=>{if let Some(recovered)=recovered{if recovered.attempt==backend.state.generation&&backend.current_profile_id().ok().as_deref()==Some(recovered.profile_id.as_str()){backend.reconnect_task=None;backend.reconnect_lease=None;backend.reconnect_joined=false;match recovered.result{Ok(client)=>{if let Err(error)=backend.cancel_reads().await{client.close();let _=backend.emit(Event::Error(error.to_string())).await;continue}backend.pushes=Some(client.subscribe());backend.client=Some(client);backend.retry_attempt=0;if let Err(error)=backend.refresh().await{backend.state.online=false;backend.state.writable=false;backend.state.can_control=false;backend.state.status=format!("重新连接后读取尚未完成：{error}");backend.publish();}else{let _=backend.flush_prepared().await;}},Err(error)=>{backend.state.online=false;backend.state.writable=false;backend.state.can_control=false;backend.state.can_save_locally=backend.client.as_ref().is_some_and(|client|client.can_save_locally())&&(backend.state.synced||backend.state.cached||backend.state.projection_valid);backend.state.status=format!("当前尚未重新验证连接：{error}");backend.publish();}}}else if let Ok(client)=recovered.result{client.close();}}},
                 read=backend.read_completions.recv()=>{if let Some(read)=read{let result=tokio::select!{biased;_=stopping.changed()=>break 'commands,result=backend.finish_read(read)=>result};if let Err(error)=result{let _=backend.emit(Event::Error(format!("读取未完成：{error}"))).await;}}},
                 result = completed.recv() => { if let Some(completed) = result { backend.finish_operation(completed).await; } },
@@ -753,6 +770,7 @@ impl Command {
                 | Self::ReconcileIdentity
                 | Self::DiscardIdentity
                 | Self::Host(_)
+                | Self::ConnectRememberedLocal { .. }
                 | Self::Disconnect
                 | Self::Refresh
                 | Self::Save {
