@@ -17,12 +17,10 @@ import os
 import re
 import shlex
 import shutil
-import socket
 import stat
 import subprocess
 import sys
 import tempfile
-import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
