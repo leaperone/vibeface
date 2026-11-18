@@ -1158,9 +1158,9 @@ test('two confirmations share one recovery plan and a dropped submission only re
     await app.render().beginRecovery(input())
     const review = app.render().review
     assert.ok(review?.kind === 'recovery')
-    const first = assert.rejects(app.render().confirmRecovery(review.members), /正在向原节点核对/)
+    const first = assert.rejects(app.render().confirmRecovery(review.members), /正在向原设备查询进度/)
     await until(() => copies.length === 1)
-    const second = assert.rejects(app.render().confirmRecovery([]), /正在向原节点核对/)
+    const second = assert.rejects(app.render().confirmRecovery([]), /正在向原设备查询进度/)
     await settle()
     assert.equal(copies.length, 1)
     assert.equal(app.calls.includes('recover'), false)

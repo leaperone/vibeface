@@ -129,9 +129,9 @@ const NODE_JOIN_TRIES = 5
 const changed = () => new Error('设备连接已切换。原操作结果需要确认，不会自动重发。')
 const superseded = () => new Error('这个恢复文件已作废。改用最近一次下载的那份。')
 const randomHex = () => bytesToHex(crypto.getRandomValues(new Uint8Array(32)))
-const joinRecordError = () => new Error('无法确认本地加入记录。核对原来的加入请求，或取消后再使用新链接。')
-const approvalRecordError = () => new Error('无法确认本地审批记录。请核对原来的加入请求。')
-const waitRecordError = () => new Error('无法确认本地找回记录。请保留恢复文件，到原节点核对找回结果。')
+const joinRecordError = () => new Error('无法确认本地加入记录。请查看原来的加入请求，或取消后再使用新链接。')
+const approvalRecordError = () => new Error('无法确认本地审批记录。请打开原来的加入请求查看进度。')
+const waitRecordError = () => new Error('无法确认本地找回记录。请保留恢复文件，并连接原来接收找回请求的设备查看进度。')
 /** Saved connections, pins and pending joins in this device's storage. */
 function deviceStore(storage: KeyValue, self: string) {
   const { readStorage, writeStorage } = storageOf(storage)
@@ -752,7 +752,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       store('approval-pins', Object.fromEntries(pins))
     }
     const request = parseJoinRequest(await scoped()('approve', { join_id: joinId, admin_nonce: pin.nonce }))
-    if (request.join_id !== joinId || request.status !== 'confirming' || request.admin_id !== me || request.admin_nonce !== pin.nonce || !approvalMatches(request, networkId, pin)) throw new Error('节点返回的审批和原请求不一致。请刷新后核对。')
+    if (request.join_id !== joinId || request.status !== 'confirming' || request.admin_id !== me || request.admin_nonce !== pin.nonce || !approvalMatches(request, networkId, pin)) throw new Error('设备返回的审批和原请求不一致。请刷新后查看原来的加入请求。')
     await refreshDirectory()
   }
   async function approveJoin(joinId: string, manage: boolean) {
@@ -1031,7 +1031,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
         spend(linkText)
         const response = parseJoinRequest(await submitted)
         requirePendingJoin(pending)
-        if (!joinMatches(response, pending, me, commit)) stopJoinCheck(new Error('加入结果和这条链接对不上，请核对原来的加入请求。'))
+        if (!joinMatches(response, pending, me, commit)) stopJoinCheck(new Error('加入结果和这条链接对不上。请查看原来的加入请求。'))
         finishJoinFailure(response)
       } finally {
         if (joinSending.current === pending) joinSending.current = null
@@ -1079,7 +1079,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       if (!joinMatches(status, mine, me, commit)) stopJoinCheck(new Error(`加入状态与${self}不一致。`))
       const pin = mine.pinned
       if (pin && (status.network_id !== pin.network_id || status.admin_id !== pin.admin_id || status.admin_nonce !== pin.admin_nonce)) {
-        stopJoinCheck(new Error('连接的设备改动了加入请求，已停止。请核对原来的加入请求。'))
+        stopJoinCheck(new Error('连接的设备改动了加入请求，已停止。请查看原来的加入请求。'))
       }
     }
     let status = parseJoinRequest(await request('join_status', { join_id: pending.join_id }))
@@ -1328,7 +1328,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
             setRecovery({ status: 'waiting', effectiveAt: null })
             const confirmed = await checkRecovery(wait).catch(() => false)
             if (confirmed) return
-            const message = `${messageOf(cause)} 找回结果尚未确认，正在向原节点核对。`
+            const message = `${messageOf(cause)} 找回结果尚未确认，正在向原设备查询进度。`
             if (!recoveryPaused.current && !session.current) setError(message)
             throw new Error(message)
           }
