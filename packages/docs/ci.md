@@ -194,9 +194,9 @@ Web 开发使用 `pnpm --filter vibeface-web dev` 或 `pnpm --filter vibeface-ww
 
 `python3 scripts/local-rust.py run cargo check --locked -p vibeface-core` 从当前 checkout 根目录运行 Cargo。它固定本次命令的中间目录和最终输出目录为该 checkout 的 `target`。各 worktree 仍共用 Cargo 下载缓存。按路径编译的 crate 可能把源目录嵌入产物，所以哪怕最终输出目录各自独立，也需要隔离中间目录。
 
-开发与测试默认用 `line-tables-only` 保留回溯行号，linked worktree 默认关闭增量编译。调试时可为本次命令设置 `CARGO_PROFILE_DEV_DEBUG=2` 或 `CARGO_PROFILE_TEST_DEBUG=2`。已安装 `sccache` 的环境可设置 `VIBEFACE_SCCACHE=1` 复用可缓存的编译结果，默认 `SCCACHE_CACHE_SIZE=20G`，最终可执行文件仍写在本地。Web 预检从 Cargo 本次构建的 JSON 消息定位 CLI 和 Core。
+开发与测试默认用 `line-tables-only` 保留回溯行号，linked worktree 默认关闭增量编译。调试时可为本次命令设置 `CARGO_PROFILE_DEV_DEBUG=2` 或 `CARGO_PROFILE_TEST_DEBUG=2`。已安装 `sccache` 的环境可设置 `VIBEFACE_SCCACHE=1` 复用可缓存的编译结果，新服务的默认磁盘上限为 `20G`。已运行的服务沿用启动配置，启用前确认其容量和路径设置，并确保 `basedirs` 为空，保留编译缓存键中的 checkout 路径。Web 预检从 Cargo 本次构建的 JSON 消息定位 CLI 和 Core。每次验收有独立的临时输出目录，并复用当前 checkout 的中间文件。
 
-进行中和待复验的任务将二进制与测试夹具留在 worktree 的 `.artifacts`，planning 保存报告、源码提交、命令及制品哈希。`verify-node.py` 的 `--phase1` 和 `--memory-sync` 可加 `--discard-run-binaries-on-success`。当 CLI/Core 输入已独立留存时，脚本在成功报告落盘后核对这两份源文件的哈希并回收运行副本。报告、日志和数据仍可用于审查。需要保留确切字节的制品可以归档到独立存储，并验证可按哈希恢复。任务完成后可通过本地入口运行 `cargo clean --dry-run`，确认该 checkout 的 `target` 无活跃使用后再执行 `cargo clean`。
+进行中和待复验的任务将二进制与测试夹具留在 worktree 的 `.artifacts`，planning 保存报告、源码提交、命令及制品哈希。`verify-node.py` 的 `--phase1` 和 `--memory-sync` 可加 `--discard-run-binaries-on-success`。传入独立留存且位于构建缓存外的 CLI/Core，脚本在成功报告落盘后核对两份源文件的哈希并回收运行副本。报告、日志和数据仍可用于审查。需要保留确切字节的制品可以归档到独立存储，并验证可按哈希恢复。任务完成后可通过本地入口运行 `cargo clean --dry-run`，确认该 checkout 的 `target` 无活跃使用后再执行 `cargo clean`。
 
 无需编译项目即可验证 CI 规则和发布隐私检查：
 

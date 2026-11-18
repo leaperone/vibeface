@@ -111,6 +111,11 @@ def file_sha256(path):
 
 def discard_run_binaries(run, sources):
     copies = [run / name for name in sources]
+
+    def identity(path):
+        entry = path.stat()
+        return entry.st_dev, entry.st_ino, entry.st_size, entry.st_mtime_ns, entry.st_ctime_ns
+
     try:
         # Persist the report and run directory entry before removing evidence.
         with (run / "report.json").open("rb") as report_file:
@@ -122,13 +127,21 @@ def discard_run_binaries(run, sources):
             finally:
                 os.close(descriptor)
 
+        retained = {}
         for name, (source, digest) in sources.items():
             source = source.resolve(strict=True)
+            before = identity(source)
             if (not source.is_file() or source.is_relative_to(run)
+                    or any((directory / "CACHEDIR.TAG").is_file() for directory in source.parents)
                     or any(source.samefile(copy) for copy in copies) or file_sha256(source) != digest):
                 print(f"WARNING Run binaries kept because the retained {name} source could not be verified",
                       file=sys.stderr)
                 return
+            retained[source] = before
+
+        if any(identity(source) != before for source, before in retained.items()):
+            print("WARNING Run binaries kept because a retained source changed during verification", file=sys.stderr)
+            return
 
         for copy in copies:
             copy.unlink()

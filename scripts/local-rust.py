@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,12 +34,14 @@ def local_environment():
             raise ValueError("VIBEFACE_SCCACHE=1 requires sccache on PATH")
         env["RUSTC_WRAPPER"] = wrapper
         env["CARGO_INCREMENTAL"] = "0"
+        env["CARGO_BUILD_INCREMENTAL"] = "0"
         env.setdefault("SCCACHE_CACHE_SIZE", "20G")
-        env.pop("SCCACHE_BASEDIRS", None)
+        # Keep checkout paths in the compiler cache keys for path-dependent crates.
+        env["SCCACHE_BASEDIRS"] = ""
     return env
 
 
-def verify_web(env):
+def build_node_binaries(env, output):
     manifests = {"vibeface": ROOT / "apps/cli/Cargo.toml", "vibeface-core": ROOT / "apps/core/Cargo.toml"}
     build = ["cargo", "build", "--locked", "--message-format=json-render-diagnostics"]
     for name in manifests:
@@ -53,17 +56,30 @@ def verify_web(env):
         name = target["name"]
         manifest = Path(event["manifest_path"]).resolve()
         if target["kind"] == ["bin"] and manifest == manifests.get(name):
-            binaries[name] = Path(event["executable"]).resolve(strict=True)
+            executable = Path(event["executable"]).resolve(strict=True)
+            if not executable.is_relative_to(output):
+                raise ValueError(f"Cargo reported {name} outside the acceptance output directory")
+            binaries[name] = executable
     if binaries.keys() != manifests.keys():
         raise ValueError("Cargo did not report the CLI and Core executables for this checkout")
+    return binaries
 
+
+def verify_web(env):
+    artifacts = ROOT / ".artifacts/preflight-web"
+    artifacts.mkdir(parents=True, exist_ok=True)
     app = ROOT / "apps/app/dist/client"
-    return subprocess.run([
-        sys.executable, "scripts/verify-node.py", "--web-only",
-        "--binary", str(binaries["vibeface"]), "--core-binary", str(binaries["vibeface-core"]),
-        "--app-dir", str(app), "--crypto-module", str(app / "vibeface_secure.js"),
-        "--artifacts", ".artifacts/preflight-web",
-    ], cwd=ROOT, env=env).returncode
+    # Give each verifier its own final binaries while Cargo reuses checkout-local intermediate files.
+    with tempfile.TemporaryDirectory(prefix="binaries-", dir=artifacts) as directory:
+        output = Path(directory).resolve()
+        build_env = {**env, "CARGO_TARGET_DIR": str(output), "CARGO_BUILD_TARGET_DIR": str(output)}
+        binaries = build_node_binaries(build_env, output)
+        return subprocess.run([
+            sys.executable, "scripts/verify-node.py", "--web-only",
+            "--binary", str(binaries["vibeface"]), "--core-binary", str(binaries["vibeface-core"]),
+            "--app-dir", str(app), "--crypto-module", str(app / "vibeface_secure.js"),
+            "--artifacts", str(artifacts),
+        ], cwd=ROOT, env=build_env).returncode
 
 
 def main():
