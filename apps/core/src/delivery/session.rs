@@ -5,6 +5,7 @@
 
 use crate::model::EventBody;
 use anyhow::{Result, bail};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{
     fs::symlink_metadata,
     path::{Path, PathBuf},
@@ -43,6 +44,95 @@ pub struct InboundSessionReceipt {
 const RECEIPT_FILE: &str = "session-receipts.json";
 const MAX_RECEIPTS: usize = 4096;
 const RECEIPT_FILE_LIMIT: u64 = 16 * 1024 * 1024;
+
+const OBJECT_FILE_LIMIT: u64 = (MAX_SESSION_OBJECT_BYTES as u64 * 2) + 1024 * 1024;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredSessionObject {
+    header: vibeface_delivery::SessionObjectHeader,
+    signature: Option<vibeface_delivery::PeerSignature>,
+    chunk_bytes: usize,
+    ciphertext_base64: String,
+}
+
+/// Private storage for verified opaque ciphertext and its envelope metadata.
+pub struct SessionObjectStore {
+    root: PathBuf,
+}
+
+impl SessionObjectStore {
+    pub fn open(data_dir: &Path) -> Result<Self> {
+        let root = data_dir.join("delivery").join("session-objects");
+        crate::config::private_dir(&root)?;
+        Ok(Self { root })
+    }
+
+    fn path(&self, object_id: &Word) -> PathBuf {
+        self.root.join(format!("{}.bin", hex::encode(object_id)))
+    }
+
+    pub fn put_verified(
+        &self,
+        object: &EncryptedSessionObject,
+        sender_peer: &Word,
+        domain: &str,
+        chunk_bytes: usize,
+    ) -> Result<SessionIdempotency> {
+        object.validate(chunk_bytes)?;
+        object.verify_signature(sender_peer, domain, chunk_bytes)?;
+        let stored = StoredSessionObject {
+            header: object.header.clone(),
+            signature: object.signature,
+            chunk_bytes,
+            ciphertext_base64: STANDARD.encode(&object.ciphertext),
+        };
+        let bytes = serde_json::to_vec(&stored)?;
+        let path = self.path(&object.header.object_id);
+        if path.exists() {
+            let existing = self.read(&path)?;
+            anyhow::ensure!(
+                existing.header == object.header
+                    && existing.ciphertext == object.ciphertext
+                    && existing.signature == object.signature,
+                "session object id conflicts with stored ciphertext"
+            );
+            return Ok(SessionIdempotency::AlreadySeen);
+        }
+        vibeface_bridge::platform::privatefs::write_atomic(&path, &bytes)?;
+        Ok(SessionIdempotency::New)
+    }
+
+    pub fn get(&self, object_id: &Word) -> Result<Option<EncryptedSessionObject>> {
+        let path = self.path(object_id);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => Ok(Some(self.read(&path)?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn read(&self, path: &Path) -> Result<EncryptedSessionObject> {
+        let bytes = vibeface_bridge::platform::privatefs::read_private_bounded(
+            path,
+            OBJECT_FILE_LIMIT,
+            "session object",
+        )?;
+        let stored: StoredSessionObject = serde_json::from_slice(&bytes)?;
+        let ciphertext = STANDARD.decode(stored.ciphertext_base64)?;
+        let object = EncryptedSessionObject {
+            header: stored.header,
+            ciphertext,
+            signature: stored.signature,
+        };
+        object.validate(stored.chunk_bytes)?;
+        anyhow::ensure!(
+            self.path(&object.header.object_id) == path,
+            "session object path does not match its object id"
+        );
+        Ok(object)
+    }
+}
 
 /// Durable, private idempotency state for verified inbound objects.
 ///
@@ -481,6 +571,58 @@ mod tests {
         std::fs::create_dir(&delivery).unwrap();
         std::fs::write(delivery.join(RECEIPT_FILE), b"not-json").unwrap();
         assert!(SessionReceiptLedger::open(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn object_store_persists_opaque_ciphertext_and_is_idempotent() {
+        let dir = test_dir("objects");
+        let (object, _event, sender) = signed_message_object();
+        let store = SessionObjectStore::open(&dir).unwrap();
+        assert_eq!(
+            store
+                .put_verified(&object, &sender, "session-object", 32)
+                .unwrap(),
+            SessionIdempotency::New
+        );
+        assert_eq!(
+            store
+                .put_verified(&object, &sender, "session-object", 32)
+                .unwrap(),
+            SessionIdempotency::AlreadySeen
+        );
+        let restored = store.get(&object.header.object_id).unwrap().unwrap();
+        assert_eq!(restored.ciphertext, object.ciphertext);
+        assert_eq!(restored.header, object.header);
+        drop(store);
+        let reopened = SessionObjectStore::open(&dir).unwrap();
+        assert!(reopened.get(&object.header.object_id).unwrap().is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn object_store_rejects_tampered_or_symlinked_files() {
+        let dir = test_dir("object-errors");
+        let (object, _event, sender) = signed_message_object();
+        let store = SessionObjectStore::open(&dir).unwrap();
+        store
+            .put_verified(&object, &sender, "session-object", 32)
+            .unwrap();
+        let path = store.path(&object.header.object_id);
+        let bytes = std::fs::read(&path).unwrap();
+        let mut tampered = bytes.clone();
+        tampered[0] = b'!';
+        std::fs::write(&path, tampered).unwrap();
+        assert!(store.get(&object.header.object_id).is_err());
+        std::fs::write(&path, bytes).unwrap();
+        #[cfg(unix)]
+        {
+            let target = dir.join("outside.bin");
+            std::fs::write(&target, std::fs::read(&path).unwrap()).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            assert!(store.get(&object.header.object_id).is_err());
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
