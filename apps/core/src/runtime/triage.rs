@@ -7,7 +7,7 @@ use crate::clock::now_ms;
 use crate::{
     config,
     manager::{self, CursorInstance, ManagerConfig},
-    model::{AttentionKind, AttentionRequest, Choice, EventBody, Subject},
+    model::{EventBody, Subject},
     net,
     providers::Provider,
     store::{
@@ -16,7 +16,7 @@ use crate::{
     },
     triage::{
         self, AnswerAuthority, AnswerResponse, Delivery, HeldAnswerControl, HeldAnswerRequest,
-        HookEvent, HookRequest, OutboxEntry, RequestKind, SealedAgentEvent, Severity, TriageConfig,
+        HookEvent, HookRequest, OutboxEntry, RequestKind, SealedAgentEvent, TriageConfig,
     },
 };
 use anyhow::{Context as _, Result, bail, ensure};
@@ -30,6 +30,8 @@ use std::{
     time::Duration,
 };
 use vibeface_bridge::codex::ServerRequest;
+
+mod commands;
 
 const WAKE_EVERY: Duration = Duration::from_secs(20);
 pub const TRIAGE_URL_ENV: &str = "VIBEFACE_TRIAGE_URL";
@@ -1385,42 +1387,6 @@ impl Runtime {
         Ok(receipt)
     }
 
-    async fn validate_live_answer_control(
-        &self,
-        attempt: &str,
-        control: &HeldAnswerControl,
-    ) -> Result<HeldRequest> {
-        ensure!(
-            lock(&self.triage.active).as_deref() == Some(attempt),
-            "answer control is no longer active"
-        );
-        let node = self.identity.device_id()?;
-        ensure!(
-            control.network == self.network_id().await? && control.request.node == node,
-            "answer control belongs to another Node or network"
-        );
-        {
-            let boot = self.boot.clone();
-            let attempt = attempt.to_owned();
-            let control = control.clone();
-            self.store
-                .call("triage.validate_answer_claim", move |store| {
-                    store.validate_answer_control_claim(&boot, &attempt, &control)
-                })
-                .await?;
-        }
-        let request = lock(&self.triage.requests)
-            .get(&control.request.request_id)
-            .cloned()
-            .context("the original request is no longer waiting")?;
-        ensure!(
-            request.question_id.as_deref() == Some(control.question_id.as_str())
-                && request.answer_binding(&node) == control.request,
-            "the held request or transport changed"
-        );
-        Ok(request)
-    }
-
     async fn answer_permission_lease(
         &self,
         control: &HeldAnswerControl,
@@ -2120,61 +2086,6 @@ impl Runtime {
             .await?
     }
 
-    async fn run_answer_control(&self, attempt: &str, control: &HeldAnswerControl) -> Result<()> {
-        let request = self.validate_live_answer_control(attempt, control).await?;
-        let (question, answer) = {
-            let control = control.clone();
-            self.store
-                .call("triage.answer_control_input", move |store| {
-                    store.answer_control_input(&control)
-                })
-                .await?
-        };
-        if let Some(result) = crate::store::triage::approval_answer_result(
-            &question,
-            &answer.text,
-            &control.request.response,
-        )? {
-            let sent = self
-                .triage_command(json!({"action":"respond","_attempt":attempt,
-                "request_id":control.request.request_id,"result":result}))
-                .await?;
-            ensure!(
-                sent["answered"] == true,
-                "the original request's response is unconfirmed"
-            );
-            return Ok(());
-        }
-        let mut config = request
-            .answer_manager
-            .context("the original request has no captured coordination backend")?;
-        ensure!(
-            self.manager().is_some(),
-            "coordination Agent permission was revoked"
-        );
-        drop(self.answer_permission_lease(control).await?);
-        self.prepare_manager_login(&mut config)
-            .await
-            .map_err(manager::ManagerError::not_started)?;
-        config.timeout_secs = config.timeout_secs.min(AGENT_ANSWER_WITHIN.as_secs());
-        self.run_coordination(config, Some(attempt), |cli| {
-            Ok(format!(
-                "Deliver this user's stored answer to its original live request. This is a fresh coordination session, not a Task or Main turn. The user's signed message is the sole answer fact. Preserve its text. Do not approve permissions, change tool input, add permissions, create work, or send chat messages. Only use `{cli} requests` and `{cli} respond REQUEST_ID 'RESULT_JSON'` for the bound request. The Node validates the claim, transport generation, original schema, and result. If the schema cannot express the answer, leave the request unanswered. Your final text is discarded.\n{}",
-                serde_json::to_string(&json!({"request_id":control.request.request_id,
-                    "question":question,"answer":{"message_id":answer.message_id,"text":answer.text},
-                    "response_schema":control.request.response}))?
-            ))
-        }).await?;
-        ensure!(
-            lock(&self.triage.answered)
-                .get(&control.request.request_id)
-                .is_some_and(|done| done["answered"] == true
-                    && done["by"] == format!("answer:{}", control.answer_hash)),
-            "the coordination turn did not confirm the stored answer's delivery"
-        );
-        Ok(())
-    }
-
     async fn settle_offered(&self, offered: &[SealedAgentEvent]) -> Result<()> {
         for event in offered {
             if let Some(request_id) = event.request_id() {
@@ -2226,355 +2137,6 @@ impl Runtime {
         );
         self.answer_request(request_id, Some(Ok(result)), "agent")
             .await
-    }
-
-    /// `/api/triage`, the Agents' side: `requests`, `respond`, `events`, `raise` and `dismiss`.
-    pub(crate) async fn triage_command(&self, input: Value) -> Result<Value> {
-        let network = self.network_id().await?;
-        let action = super::field(&input, "action")?;
-        let attempt = input
-            .get("_attempt")
-            .map(|value| value.as_str().context("invalid triage attempt context"))
-            .transpose()?;
-        if action == "respond" && attempt.is_none() {
-            let request_id = super::field(&input, "request_id")?;
-            let result = input.get("result").cloned().context("result is required")?;
-            if let Some(node) = input["node"].as_str()
-                && node != self.identity.device_id()?
-            {
-                return self
-                    .peer_request(
-                        &network,
-                        node,
-                        json!({"type":"respond","request_id":request_id,"result":result}),
-                    )
-                    .await;
-            }
-            return self.respond_unclaimed_request(request_id, result).await;
-        }
-        let _mutations = if matches!(action, "respond" | "raise" | "dismiss") {
-            Some(self.triage.mutations.lock().await)
-        } else {
-            None
-        };
-        let active = lock(&self.triage.active).clone();
-        let context = attempt.map(|id| (self.boot.as_str(), id));
-        let current = attempt.is_none() || attempt == active.as_deref();
-        let answer_control = match attempt {
-            Some(id) => {
-                let id = id.to_owned();
-                let boot = self.boot.clone();
-                self.store
-                    .call("triage.answer_control_attempt", move |store| {
-                        store.answer_control_attempt(&boot, &id)
-                    })
-                    .await?
-            }
-            None => None,
-        };
-        if let Some(control) = answer_control {
-            ensure!(
-                matches!(action, "requests" | "respond"),
-                "answer controls only read and respond to their original request"
-            );
-            ensure!(current, "answer control is no longer active");
-            if let Some(node) = input.get("node") {
-                ensure!(
-                    node.as_str() == Some(control.request.node.as_str()),
-                    "answer controls cannot target another Node"
-                );
-            }
-            if action == "requests" {
-                let request = self
-                    .validate_live_answer_control(
-                        attempt.context("answer control attempt missing")?,
-                        &control,
-                    )
-                    .await?;
-                return Ok(json!({"requests":[request]}));
-            }
-            let request_id = super::field(&input, "request_id")?;
-            ensure!(
-                request_id == control.request.request_id,
-                "answer control cannot respond to another request"
-            );
-            let result = input.get("result").context("result is required")?;
-            let (question, answer) = {
-                let control = control.clone();
-                self.store
-                    .call("triage.answer_control_input", move |store| {
-                        store.answer_control_input(&control)
-                    })
-                    .await?
-            };
-            validate_answer_result(&control.request.response, &question, &answer.text, result)?;
-            let by = format!("answer:{}", control.answer_hash);
-            if let Some(done) = lock(&self.triage.answered).get(request_id) {
-                ensure!(
-                    done["by"] == by,
-                    "the request was answered by another actor"
-                );
-                return Ok(done.clone());
-            }
-            self.validate_live_answer_control(
-                attempt.context("answer control attempt missing")?,
-                &control,
-            )
-            .await?;
-            let _permissions = self.config_save.lock().await;
-            let denying = matches!(&control.request.response, AnswerResponse::Approval { deny, .. } if deny == result);
-            let _leases = if denying {
-                Vec::new()
-            } else {
-                self.answer_permission_lease(&control).await?
-            };
-            self.validate_live_answer_control(
-                attempt.context("answer control attempt missing")?,
-                &control,
-            )
-            .await?;
-            return self
-                .send_request_answer(
-                    request_id,
-                    Some(Ok(result.clone())),
-                    &by,
-                    Some(&control.request),
-                )
-                .await;
-        }
-        if action == "requests" {
-            let mut requests: Vec<HeldRequest> =
-                lock(&self.triage.requests).values().cloned().collect();
-            if attempt.is_some() {
-                ensure!(current, "triage attempt is no longer active");
-                let events = {
-                    let context = context.map(|(boot, id)| (boot.to_owned(), id.to_owned()));
-                    self.store
-                        .call("triage.claim_events", move |store| {
-                            store.triage_events(
-                                context
-                                    .as_ref()
-                                    .map(|(boot, id)| (boot.as_str(), id.as_str())),
-                            )
-                        })
-                        .await?
-                };
-                requests.retain(|request| {
-                    events
-                        .iter()
-                        .any(|event| event.request_id().as_deref() == Some(&request.request_id))
-                });
-            }
-            return Ok(json!({"requests":requests}));
-        }
-        if action == "respond" {
-            let request_id = super::field(&input, "request_id")?;
-            let result = input.get("result").cloned().context("result is required")?;
-            if let Some(done) = lock(&self.triage.answered).get(request_id) {
-                return Ok(done.clone());
-            }
-            ensure!(current, "triage attempt is no longer active");
-            ensure!(
-                input["node"]
-                    .as_str()
-                    .is_none_or(|node| self.identity.device_id().is_ok_and(|local| node == local)),
-                "a triage attempt only answers its local requests"
-            );
-            ensure!(
-                {
-                    let context = context.map(|(boot, id)| (boot.to_owned(), id.to_owned()));
-                    self.store
-                        .call("triage.claim_events", move |store| {
-                            store.triage_events(
-                                context
-                                    .as_ref()
-                                    .map(|(boot, id)| (boot.as_str(), id.as_str())),
-                            )
-                        })
-                        .await?
-                }
-                .iter()
-                .any(|event| event.request_id().as_deref() == Some(request_id)),
-                "request is not available to this triage attempt"
-            );
-            return self
-                .answer_request(request_id, Some(Ok(result)), "agent")
-                .await;
-        }
-        if action == "events" {
-            let since = input["since"].as_i64().unwrap_or(0);
-            ensure!(current, "triage attempt is no longer active");
-            let boot = self.boot.clone();
-            let context = context.map(|(boot, id)| (boot.to_owned(), id.to_owned()));
-            return self
-                .store
-                .call("triage.events", move |store| {
-                    let events: Vec<_> = store
-                        .triage_events(
-                            context
-                                .as_ref()
-                                .map(|(boot, id)| (boot.as_str(), id.as_str())),
-                        )?
-                        .into_iter()
-                        .filter(|event| event.observation().ts_ms >= since)
-                        .collect();
-                    let unknown = store
-                        .unknown_triage_events(active.as_deref().map(|id| (boot.as_str(), id)))?;
-                    Ok(json!({"events":events,"unknown_events":unknown}))
-                })
-                .await;
-        }
-        let event_id = super::id(&input, "event_id")?;
-        ensure!(
-            !event_id.starts_with("answer:"),
-            "answer controls are private to their claimed request"
-        );
-        {
-            let event_id = event_id.clone();
-            let handled: Option<String> = self
-                .store
-                .call("triage.handled_result", move |store| {
-                    Ok(store
-                        .connection
-                        .query_row(
-                            "SELECT result FROM triage_handled WHERE event_id=?",
-                            [&event_id],
-                            |r| r.get(0),
-                        )
-                        .optional()?)
-                })
-                .await?;
-            if let Some(handled) = handled {
-                return Ok(serde_json::from_str(&handled)?);
-            }
-        }
-        ensure!(current, "triage attempt is no longer active");
-        let event = {
-            let context = context.map(|(boot, id)| (boot.to_owned(), id.to_owned()));
-            self.store
-                .call("triage.claim_events", move |store| {
-                    store.triage_events(
-                        context
-                            .as_ref()
-                            .map(|(boot, id)| (boot.as_str(), id.as_str())),
-                    )
-                })
-                .await?
-        }
-        .into_iter()
-        .find(|event| event.event_id().as_str() == event_id.as_str())
-        .context("no pending event with this ID")?;
-        let result = match action {
-            "dismiss" => json!({"event_id":event_id,"dismissed":true}),
-            "raise" => {
-                let severity: Severity = serde_json::from_value(input["severity"].clone())
-                    .context("severity must be info, attention or urgent")?;
-                let labels: Vec<String> =
-                    serde_json::from_value(input.get("choices").cloned().unwrap_or(json!([])))
-                        .context("choices must be labels")?;
-                let request_id = input["request_id"].as_str().map(str::to_owned);
-                if let Some(request_id) = &request_id {
-                    ensure!(
-                        event.request_id().as_deref() == Some(request_id),
-                        "request does not belong to this event"
-                    );
-                    ensure!(
-                        lock(&self.triage.requests).contains_key(request_id),
-                        "no request is waiting with this ID"
-                    );
-                }
-                let held_request = request_id
-                    .as_ref()
-                    .and_then(|id| lock(&self.triage.requests).get(id).cloned());
-                let approval = held_request
-                    .as_ref()
-                    .and_then(|request| match &request.response {
-                        AnswerResponse::Approval { allow_once, .. } => Some(allow_once.is_some()),
-                        _ => None,
-                    });
-                let choices = match approval {
-                    Some(allow_once) => {
-                        let mut choices = Vec::new();
-                        if allow_once {
-                            choices.push(Choice {
-                                label: "允许本次".into(),
-                                action: Some(crate::model::QuestionAction::AllowOnce),
-                            });
-                        }
-                        choices.push(Choice {
-                            label: "拒绝".into(),
-                            action: Some(crate::model::QuestionAction::Deny),
-                        });
-                        choices
-                    }
-                    None => labels
-                        .into_iter()
-                        .map(|label| Choice {
-                            label: crate::logging::scrub(&label),
-                            action: None,
-                        })
-                        .collect(),
-                };
-                let question = EventBody::QuestionAsked {
-                    question_id: triage::question_id(event.node(), event.event_id()),
-                    target: None,
-                    attention: AttentionRequest {
-                        kind: match (approval, input["attention_kind"].as_str()) {
-                            (Some(_), _) => AttentionKind::Approval,
-                            (_, Some("browser_takeover")) => AttentionKind::BrowserTakeover,
-                            (_, Some("approval")) => AttentionKind::Approval,
-                            (_, Some("question")) => AttentionKind::Question,
-                            (_, Some(_)) => bail!("unknown attention kind"),
-                            (_, None)
-                                if event.observation().hold == Some(RequestKind::Permission) =>
-                            {
-                                AttentionKind::Approval
-                            }
-                            (_, None) => AttentionKind::Question,
-                        },
-                        device_id: Some(event.node().clone()),
-                    },
-                    severity,
-                    text: crate::logging::scrub(super::field(&input, "question")?),
-                    choices,
-                    about: subject(
-                        &shared_event(&event, &self.settings_snapshot().roots),
-                        request_id,
-                    ),
-                };
-                self.raise(&network, &event, question).await?
-            }
-            _ => bail!("unknown triage action"),
-        };
-        let (provider, session) = (
-            event.provider().name(),
-            event.observation().session_id.clone(),
-        );
-        let handled = event_id.clone();
-        let result = self
-            .store
-            .call("triage.handle_event", move |store| {
-                store.connection.execute(
-                    "INSERT INTO triage_handled(event_id,ts_ms,result) VALUES(?,?,?)
-                 ON CONFLICT(event_id) DO UPDATE SET ts_ms=excluded.ts_ms,result=excluded.result",
-                    params![event_id, now_ms(), result.to_string()],
-                )?;
-                dequeue(&store.connection, &event)?;
-                Ok(result)
-            })
-            .await?;
-        // What was concluded, never the question or the session's words.
-        tracing::info!(
-            event = "triage.concluded",
-            conversation_id = result["conversation_id"].as_str(),
-            thread_id = session,
-            event_id = handled,
-            provider,
-            conclusion = action,
-            severity = input["severity"].as_str(),
-            "triage concluded"
-        );
-        Ok(result)
     }
 
     /// Asks in the chat of the bot that owns the event's session, the primary bot's when its
@@ -3404,7 +2966,7 @@ pub(super) mod tests {
         config::Config,
         crypto::LocalIdentity,
         identity::Member,
-        model::{ResolvedModel, VersionVector},
+        model::{AttentionKind, AttentionRequest, ResolvedModel, Severity, VersionVector},
     };
     use std::{collections::BTreeMap, sync::atomic::Ordering};
     use vibeface_bridge::failure::FailureKind;
@@ -5722,6 +5284,54 @@ pub(super) mod tests {
         }.await;
         cleanup(reopened, dir).await?;
         result
+    }
+
+    #[tokio::test]
+    async fn held_answer_retry_reads_its_first_response_after_the_transport_is_settled()
+    -> Result<()> {
+        with_node(async |node, admin, _| {
+            with_agent(&node);
+            bot(&node, &admin, "c", "Bot", &["t-1"]).await?;
+            let (mut server, handed) = app_server(&node).await?;
+            node.on_codex_request(&handed).await;
+            let (question, request_id) = raise_for(&node).await?;
+            signed_answer_fact(&node, &admin, &question, "允许本次").await?;
+            let network = node.network_id().await?;
+            let boot = node.boot.clone();
+            let attempt = node
+                .store
+                .call("triage.test.admit_answer_retry", move |store| {
+                    let TriageAdmission::Claimed(attempt) =
+                        store.admit_triage(&network, &boot, BATCH, 100, now_ms())?
+                    else {
+                        bail!("answer claim");
+                    };
+                    ensure!(attempt.answer().is_some(), "private answer binding");
+                    Ok(attempt)
+                })
+                .await?;
+            *lock(&node.triage.active) = Some(attempt.id().into());
+            let _active = ActiveTriage(&node.triage);
+            let response = json!({"_attempt":attempt.id(), "action":"respond",
+                "request_id":request_id,"result":{"decision":"accept"}});
+            let first = node.triage_command(response.clone()).await?;
+            assert_eq!(first["answered"], true);
+            assert!(!lock(&node.triage.requests).contains_key(&request_id));
+            assert_eq!(node.triage_command(response.clone()).await?, first);
+            let mut changed = response;
+            changed["result"] = json!({"decision":"decline"});
+            assert!(node.triage_command(changed).await.is_err());
+            assert_eq!(
+                answered_once(&mut server).await["result"],
+                json!({"decision":"accept"})
+            );
+            node.store
+                .call("triage.test.finish_answer_retry", move |store| {
+                    store.finish_triage(attempt, &Ok(()))
+                })
+                .await
+        })
+        .await
     }
 
     #[test]
