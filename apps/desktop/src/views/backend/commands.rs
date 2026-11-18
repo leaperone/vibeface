@@ -944,10 +944,12 @@ impl Backend {
             Command::DeliveryFlushBudget(review) => Box::pin(async move {
                 let batch_id = self.reviewed_flush_batch(&review).await?;
                 self.submit(Action::Delivery(
-                    vibeface_client::DeliveryAction::FlushBudget {
-                        budget_id: review.budget.budget_id,
-                        batch_id,
-                    },
+                    vibeface_client::DeliveryAction::FlushBudget(
+                        vibeface_client::DeliveryFlushIntent {
+                            budget_id: review.budget.budget_id,
+                            batch_id,
+                        },
+                    ),
                 ))
                 .await?;
                 Ok(())

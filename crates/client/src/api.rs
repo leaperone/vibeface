@@ -412,13 +412,13 @@ pub struct ProviderSettings {
     pub connect_local: bool,
     pub env: BTreeMap<String, Option<String>>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryMode {
     Charity,
     Paid,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryAcceptance {
     Recoverable,
@@ -467,8 +467,24 @@ pub fn delivery_flush_batch_id(batch: &DeliveryBudgetBatch) -> Result<String> {
     ))?)))
 }
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryFlushIntent {
+    pub budget_id: String,
+    pub batch_id: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryBudgetFlush {
+    pub budget_id: String,
+}
+
+// The batch ID belongs to the SDK's durable intent. The Node receives the budget ID.
+pub type DeliveryWireAction = DeliveryAction<DeliveryBudgetFlush>;
+
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-pub enum DeliveryAction {
+pub enum DeliveryAction<Flush = DeliveryFlushIntent> {
     Configure {
         enabled: bool,
         charity_enabled: bool,
@@ -490,10 +506,7 @@ pub enum DeliveryAction {
     AcceptBatch {
         order_ids: [String; 2],
     },
-    FlushBudget {
-        budget_id: String,
-        batch_id: String,
-    },
+    FlushBudget(Flush),
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2457,10 +2470,10 @@ impl Client {
                         )?;
                         params
                     }
-                    DeliveryAction::FlushBudget {
+                    DeliveryAction::FlushBudget(DeliveryFlushIntent {
                         budget_id,
                         batch_id,
-                    } => {
+                    }) => {
                         vibeface_secure::membership::validate_hash(&budget_id)?;
                         vibeface_secure::membership::validate_hash(&batch_id)?;
                         id = self.operation_id("delivery", &json!({"type":"delivery_flush_budget","target_node":self.target,"budget_id":budget_id,"batch_id":batch_id}))?;
@@ -2469,7 +2482,9 @@ impl Client {
                             batch_id,
                             binding: None,
                         };
-                        json!({"op":"flush_budget","budget_id":budget_id})
+                        serde_json::to_value(DeliveryWireAction::FlushBudget(
+                            DeliveryBudgetFlush { budget_id },
+                        ))?
                     }
                 };
                 if !matches!(
@@ -5362,10 +5377,10 @@ mod prepaid_tests {
                 json!({"op":"accept_batch","order_ids":orders}),
             ),
             (
-                DeliveryAction::FlushBudget {
+                DeliveryAction::FlushBudget(DeliveryFlushIntent {
                     budget_id: budget.budget_id.clone(),
                     batch_id: delivery_flush_batch_id(&budget)?,
-                },
+                }),
                 json!({"op":"flush_budget","budget_id":budget.budget_id}),
             ),
         ];
@@ -5377,7 +5392,7 @@ mod prepaid_tests {
             match &mut duplicate {
                 DeliveryAction::ConfirmBatch { intent_ids } => intent_ids.reverse(),
                 DeliveryAction::AcceptBatch { order_ids } => order_ids.reverse(),
-                DeliveryAction::FlushBudget { .. } => {}
+                DeliveryAction::FlushBudget(_) => {}
                 _ => unreachable!(),
             }
             let repeated = setup.client.prepare(Action::Delivery(duplicate))?;
@@ -5585,10 +5600,10 @@ mod prepaid_tests {
             let setup = setup_prepaid(false, true, drop_ack).await?;
             let batch = setup.evidence.lock().unwrap().budget.clone();
             let batch_id = delivery_flush_batch_id(&batch)?;
-            let action = DeliveryAction::FlushBudget {
+            let action = DeliveryAction::FlushBudget(DeliveryFlushIntent {
                 budget_id: batch.budget_id.clone(),
                 batch_id: batch_id.clone(),
-            };
+            });
             let result = setup
                 .client
                 .submit(Action::Delivery(action.clone()))
@@ -5635,10 +5650,12 @@ mod prepaid_tests {
                 let mut later = batch.clone();
                 later.ready_windows.remove(0);
                 let pending = client
-                    .submit(Action::Delivery(DeliveryAction::FlushBudget {
-                        budget_id: later.budget_id.clone(),
-                        batch_id: delivery_flush_batch_id(&later)?,
-                    }))
+                    .submit(Action::Delivery(DeliveryAction::FlushBudget(
+                        DeliveryFlushIntent {
+                            budget_id: later.budget_id.clone(),
+                            batch_id: delivery_flush_batch_id(&later)?,
+                        },
+                    )))
                     .await?;
                 assert_eq!(
                     pending.state,
@@ -5679,10 +5696,10 @@ mod prepaid_tests {
                 }
                 let action = if flush {
                     let batch = setup.evidence.lock().unwrap().budget.clone();
-                    DeliveryAction::FlushBudget {
+                    DeliveryAction::FlushBudget(DeliveryFlushIntent {
                         budget_id: batch.budget_id.clone(),
                         batch_id: delivery_flush_batch_id(&batch)?,
-                    }
+                    })
                 } else {
                     batch_action(false, &setup.evidence.lock().unwrap())
                 };
@@ -5770,10 +5787,12 @@ mod prepaid_tests {
         assert!(
             setup
                 .client
-                .submit(Action::Delivery(DeliveryAction::FlushBudget {
-                    budget_id: original.budget_id,
-                    batch_id
-                }))
+                .submit(Action::Delivery(DeliveryAction::FlushBudget(
+                    DeliveryFlushIntent {
+                        budget_id: original.budget_id,
+                        batch_id
+                    }
+                )))
                 .await
                 .is_err()
         );

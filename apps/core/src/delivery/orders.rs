@@ -649,7 +649,8 @@ impl Delivery {
             draft
         } else {
             let announcement: Announcement = serde_json::from_value(
-                service::request(node, &request.provider_peer, &ServiceRequest::Announce).await?,
+                service::request(node, &request.provider_peer, &ServiceRequest::Announce {})
+                    .await?,
             )?;
             ensure!(
                 announcement.peer_id == request.provider_peer,

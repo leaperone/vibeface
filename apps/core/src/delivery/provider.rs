@@ -23,7 +23,7 @@ impl Delivery {
             ServiceRequest::Charity { request } => {
                 self.charity_handle_service(node, remote, request).await
             }
-            ServiceRequest::Announce => {
+            ServiceRequest::Announce {} => {
                 self.ensure_mode(Mode::Paid)?;
                 let config = self.config();
                 config
@@ -1144,7 +1144,9 @@ mod tests {
                 &node,
                 "owner-network",
                 "owner",
-                json!({"op":"get","order_id":order.view.order_id}),
+                ClientRequest::Read(DeliveryRead::Get {
+                    order_id: order.view.order_id.clone(),
+                }),
             )
             .await?;
         assert_eq!(history["order_id"], order.view.order_id);

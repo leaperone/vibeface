@@ -844,6 +844,26 @@ async fn main() -> Result<()> {
             value.get("error").is_none() && value.get("result").is_some(),
             "positive service announcement failed"
         );
+        for request in [
+            json!({"op":"key","unexpected":true}),
+            json!({"op":"unknown"}),
+        ] {
+            let value = tokio::time::timeout(
+                Duration::from_secs(15),
+                service(
+                    &endpoint,
+                    &identity,
+                    target,
+                    json!({"op":"charity","request":request}),
+                ),
+            )
+            .await??;
+            ensure!(
+                value.get("result").is_none()
+                    && value["error"] == "invalid delivery service request",
+                "malformed charity service request reached an operation"
+            );
+        }
         for alpn in [
             b"vibeface/rpc/1".as_slice(),
             b"vibeface/sync/1",

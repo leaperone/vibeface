@@ -23,6 +23,7 @@ use std::{
 };
 use store::ServiceStore;
 use types::*;
+use vibeface_client::{DeliveryBudgetFlush, DeliveryRead, DeliveryWireAction};
 use vibeface_delivery::{
     Amount, BindingAction, KeyBinding, Order, ProofInput, ProofProfile, Relation, Secret32,
     SecretBytes, SignedKeyBinding, Statement, Terms, UnsignedOrder, WindowRandomness, Witness,
@@ -817,25 +818,24 @@ impl Delivery {
         node: &Runtime,
         network: &str,
         device: &str,
-        params: Value,
+        request: ClientRequest,
     ) -> Result<Value> {
-        let op = params["op"]
-            .as_str()
-            .context("delivery operation is required")?;
-        match op {
-            "status" => self.status(),
-            "budgets" => self.client_budgets(network).await,
-            "flush_budget" => {
+        match request {
+            ClientRequest::Read(DeliveryRead::Status) => self.status(),
+            ClientRequest::Read(DeliveryRead::Budgets) => self.client_budgets(network).await,
+            ClientRequest::Write(DeliveryWireAction::FlushBudget(DeliveryBudgetFlush {
+                budget_id,
+            })) => {
                 self.authorize_effect(network, device).await?;
-                self.local_budget(budget::BudgetCommand::Flush {
-                    budget_id: text(&params, "budget_id")?.into(),
-                })
-                .await
+                self.local_budget(budget::BudgetCommand::Flush { budget_id })
+                    .await
             }
-            "providers" => self.providers(node),
-            "receipt" => self.client_order_receipt(network, text(&params, "order_id")?),
-            "find_intent" => {
-                let intent = text(&params, "intent_id")?;
+            ClientRequest::Read(DeliveryRead::Providers) => self.providers(node),
+            ClientRequest::Receipt(ReceiptRequest::Receipt { order_id }) => {
+                self.client_order_receipt(network, &order_id)
+            }
+            ClientRequest::Read(DeliveryRead::FindIntent { intent_id }) => {
+                let intent = intent_id.as_str();
                 uuid::Uuid::parse_str(intent)?;
                 if !self.config().enabled
                     && !self.data_dir.join("delivery/service.sqlite3").exists()
@@ -851,21 +851,19 @@ impl Delivery {
                 };
                 Ok(json!({"order":order}))
             }
-            "configure" => {
+            ClientRequest::Write(DeliveryWireAction::Configure {
+                enabled,
+                charity_enabled,
+                paid_enabled,
+            }) => {
                 let mut config = self.config();
-                config.enabled = params["enabled"]
-                    .as_bool()
-                    .context("enabled must be a boolean")?;
-                config.charity_enabled = params["charity_enabled"]
-                    .as_bool()
-                    .context("charity_enabled must be a boolean")?;
-                config.paid_enabled = params["paid_enabled"]
-                    .as_bool()
-                    .context("paid_enabled must be a boolean")?;
+                config.enabled = enabled;
+                config.charity_enabled = charity_enabled;
+                config.paid_enabled = paid_enabled;
                 self.configure_local(config)?;
                 self.status()
             }
-            "list" => {
+            ClientRequest::Read(DeliveryRead::List) => {
                 if !self.config().enabled
                     && !self.data_dir.join("delivery/service.sqlite3").exists()
                 {
@@ -880,24 +878,18 @@ impl Delivery {
                 orders.sort_by_key(|order| std::cmp::Reverse(order.created_at_ms));
                 Ok(json!({"orders":orders}))
             }
-            "get" => {
-                let id = text(&params, "order_id")?;
+            ClientRequest::Read(DeliveryRead::Get { order_id }) => {
+                let id = order_id.as_str();
                 if self.with_store(|store| store.charity_order(id))?.is_some() {
                     return Ok(serde_json::to_value(self.charity_get(network, id)?)?);
                 }
                 Ok(serde_json::to_value(self.scoped_order(network, id)?.view)?)
             }
-            "prepare" => {
+            ClientRequest::Write(DeliveryWireAction::Prepare(request)) => {
                 let _operation = self
                     .operations
                     .try_lock()
                     .context("another delivery operation is in progress")?;
-                let mut value = params;
-                value
-                    .as_object_mut()
-                    .context("invalid delivery request")?
-                    .remove("op");
-                let request: Prepare = serde_json::from_value(value)?;
                 if request.mode == Mode::Charity {
                     return Ok(serde_json::to_value(
                         self.charity_prepare(node, network, request).await?,
@@ -910,16 +902,17 @@ impl Delivery {
                 }
                 Ok(serde_json::to_value(order.view)?)
             }
-            "confirm_batch" => {
+            ClientRequest::Write(DeliveryWireAction::ConfirmBatch {
+                intent_ids: intents,
+            }) => {
                 self.ensure_mode(Mode::Paid)?;
                 self.authorize_effect(network, device).await?;
                 let _operation = self
                     .operations
                     .try_lock()
                     .context("another delivery operation is in progress")?;
-                let intents: Vec<String> = serde_json::from_value(params["intent_ids"].clone())?;
                 ensure!(
-                    intents.len() == 2 && intents[0] != intents[1],
+                    intents[0] != intents[1],
                     "confirm_batch requires two distinct prepared intents"
                 );
                 let mut orders = Vec::new();
@@ -1000,8 +993,8 @@ impl Delivery {
                 self.wakeup.notify_one();
                 Ok(json!({"orders":orders.into_iter().map(|o| o.view).collect::<Vec<_>>()}))
             }
-            "confirm" => {
-                let intent = text(&params, "intent_id")?;
+            ClientRequest::Write(DeliveryWireAction::Confirm { intent_id }) => {
+                let intent = intent_id.as_str();
                 let operation = self.operations.try_lock();
                 if operation.is_err() {
                     if let Some(order) =
@@ -1065,18 +1058,14 @@ impl Delivery {
                 self.wakeup.notify_one();
                 Ok(serde_json::to_value(order.view)?)
             }
-            "accept_batch" => {
+            ClientRequest::Write(DeliveryWireAction::AcceptBatch { order_ids: ids }) => {
                 self.ensure_mode(Mode::Paid)?;
                 self.authorize_effect(network, device).await?;
                 let _operation = self
                     .operations
                     .try_lock()
                     .context("another delivery operation is in progress")?;
-                let ids: Vec<String> = serde_json::from_value(params["order_ids"].clone())?;
-                ensure!(
-                    ids.len() == 2 && ids[0] != ids[1],
-                    "accept_batch needs two distinct orders"
-                );
+                ensure!(ids[0] != ids[1], "accept_batch needs two distinct orders");
                 let mut orders = Vec::new();
                 for id in &ids {
                     let order = self.scoped_order(network, id)?;
@@ -1136,21 +1125,28 @@ impl Delivery {
                 self.wakeup.notify_one();
                 Ok(json!({"orders":orders.into_iter().map(|o| o.view).collect::<Vec<_>>()}))
             }
-            "accept" | "reconcile" => {
+            ClientRequest::Write(
+                DeliveryWireAction::Accept { ref order_id }
+                | DeliveryWireAction::Reconcile { ref order_id },
+            ) => {
+                let accept = matches!(
+                    request,
+                    ClientRequest::Write(DeliveryWireAction::Accept { .. })
+                );
+                let id = order_id.as_str();
                 let _operation = self
                     .operations
                     .try_lock()
                     .context("another delivery operation is in progress")?;
-                let id = text(&params, "order_id")?;
                 if self.with_store(|store| store.charity_order(id))?.is_some() {
                     return Ok(serde_json::to_value(
-                        self.charity_action(node, network, id, op == "accept", device)
+                        self.charity_action(node, network, id, accept, device)
                             .await?,
                     )?);
                 }
                 let mut order = self.scoped_order(network, id)?;
                 self.ensure_mode(Mode::Paid)?;
-                if op == "accept" {
+                if accept {
                     ensure!(
                         order.view.role == Role::Receiver,
                         "only the receiving Node can accept delivery"
@@ -1191,8 +1187,8 @@ impl Delivery {
                 self.wakeup.notify_one();
                 Ok(serde_json::to_value(order.view)?)
             }
-            "read" => {
-                let id = text(&params, "order_id")?;
+            ClientRequest::Read(DeliveryRead::Read { order_id }) => {
+                let id = order_id.as_str();
                 if self.with_store(|store| store.charity_order(id))?.is_some() {
                     return self.charity_read(network, id);
                 }
@@ -1213,7 +1209,6 @@ impl Delivery {
                     result => result,
                 }
             }
-            _ => bail!("unknown delivery operation"),
         }
     }
     fn save(&self, order: &mut StoredOrder) -> Result<()> {
@@ -1236,11 +1231,6 @@ fn now() -> u64 {
 }
 fn random_word() -> Word {
     rand::random()
-}
-fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
-    value[key]
-        .as_str()
-        .with_context(|| format!("{key} must be a string"))
 }
 fn deployment(config: &DeliveryConfig, mode: Mode) -> Result<(Word, [u8; 20])> {
     ensure!(mode == Mode::Paid, "charity has no chain deployment");
