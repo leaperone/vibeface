@@ -225,21 +225,21 @@ impl Fixture {
                                 None,
                             ),
                             "node_settings" => (
-                                MaintenanceStatus::Ready,
+                                MaintenanceStatus::Healthy,
                                 None,
                                 Some(
                                     json!({"roots":state.config["roots"], "manager":state.config["manager"]}),
                                 ),
                             ),
                             "create_decision_token" => (
-                                MaintenanceStatus::Ready,
+                                MaintenanceStatus::Healthy,
                                 None,
                                 Some(
                                     json!({"token_id":"fixture-token", "token":"synthetic-copy-only-secret"}),
                                 ),
                             ),
                             _ => (
-                                MaintenanceStatus::Ready,
+                                MaintenanceStatus::Healthy,
                                 None,
                                 Some(json!({"status":"saved"})),
                             ),

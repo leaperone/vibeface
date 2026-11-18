@@ -148,8 +148,30 @@ pub struct MaintenanceResponse {
     pub delivery: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "super::present_control_field",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub result: Option<Value>,
+}
+
+impl MaintenanceResponse {
+    fn client_result(self) -> Result<Value> {
+        ensure!(
+            self.status == MaintenanceStatus::Healthy,
+            "maintenance Client response is not healthy"
+        );
+        ensure!(
+            self.error.is_none()
+                && self.wallet.is_none()
+                && self.delivery.is_none()
+                && self.join.is_none(),
+            "maintenance Client response contains another command's payload"
+        );
+        self.result
+            .context("maintenance Client response has no result")
+    }
 }
 
 /// A successful Acquire response plus the still-open owner-only stream. Dropping it releases
@@ -266,7 +288,7 @@ pub async fn call(socket: &Path, method: &str, params: Value) -> Result<Value> {
         },
     )
     .await?;
-    Ok(response.result.unwrap_or(Value::Null))
+    response.client_result()
 }
 
 pub async fn acquire(socket: &Path) -> Result<Lease> {
@@ -291,6 +313,28 @@ mod tests {
         sync::oneshot,
     };
     use vibeface_bridge::platform::{ipc, ipc::Listener, privatefs};
+
+    #[test]
+    fn client_response_distinguishes_null_from_missing_or_unrelated_payloads() -> Result<()> {
+        let decode = |wire| serde_json::from_str::<MaintenanceResponse>(wire)?.client_result();
+        assert_eq!(
+            decode(r#"{"protocol":1,"status":"healthy","result":null}"#)?,
+            Value::Null
+        );
+        assert_eq!(
+            decode(r#"{"protocol":1,"status":"healthy","error":null,"result":{"saved":true}}"#)?,
+            serde_json::json!({"saved":true})
+        );
+        for wire in [
+            r#"{"protocol":1,"status":"healthy"}"#,
+            r#"{"protocol":1,"status":"ready","result":{}}"#,
+            r#"{"protocol":1,"status":"healthy","wallet":{},"result":{}}"#,
+            r#"{"protocol":1,"status":"healthy","error":"refused","result":{}}"#,
+        ] {
+            assert!(decode(wire).is_err(), "{wire}");
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn request_refuses_acquire_without_dropping_a_lease() {
