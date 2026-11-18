@@ -6,24 +6,18 @@ sys.dont_write_bytecode = True
 import argparse
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import release_archive
+import release_assembly
 import release_context
 import release_format
 
 
 TARGET = 'x86_64-pc-windows-msvc'
-WEB_FILES = ('_shell.html', 'index.html', '_redirects', '_headers', '.vibeface-build.json',
-             'vibeface_secure.js', 'vibeface_secure_bg.wasm')
-import importlib.util
-spec = importlib.util.spec_from_file_location('offline_docs', release_context.ROOT / 'scripts/offline-docs.py')
-offline_docs = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(offline_docs)
 
 
 def helper(*args):
@@ -31,8 +25,6 @@ def helper(*args):
 
 
 def build(target_dir):
-    helper('build-inputs.py', 'check', 'crypto')
-    helper('build-inputs.py', 'check', 'web')
     flags = subprocess.check_output([sys.executable, '-B', str(release_context.ROOT / 'scripts/release-rustflags.py')],
                                     cwd=release_context.ROOT, text=True).strip()
     flags += '\x1f-C\x1ftarget-feature=+crt-static'
@@ -44,45 +36,24 @@ def build(target_dir):
     return binaries
 
 
-def stage(package, binaries, web):
-    package.mkdir(parents=True)
-    for binary in binaries:
-        release_format.require(binary.is_file(), f'missing release binary: {binary.name}')
-        shutil.copy2(binary, package / binary.name)
-    shutil.copytree(web, package / 'web')
-    installer = release_context.service_installer(TARGET)
-    release_format.require(installer.is_file(), f'missing Windows service installer: scripts/{installer.name}')
-    (package / 'scripts').mkdir()
-    shutil.copy2(installer, package / 'scripts' / installer.name)
-    offline_docs.assemble(package)
-    if (release_context.ROOT / 'LICENSE').is_file():
-        shutil.copy2(release_context.ROOT / 'LICENSE', package / 'LICENSE')
-    release_archive.write_runtime_requirements(package, TARGET)
-    return package
-
-
 def package_windows(output):
     version = release_context.read_version('cli')
-    web = release_context.ROOT / 'apps/app/dist/client'
-    for name in WEB_FILES:
-        release_format.require((web / name).is_file() and (web / name).stat().st_size > 0,
-                        'Build the browser application and its cryptography before packaging')
+    web = release_assembly.prepare_node_web()
     binaries = build(Path(os.environ.get('CARGO_TARGET_DIR', release_context.ROOT / 'target')))
     output.mkdir(parents=True, exist_ok=True)
     name = f'vibeface-{version}-{TARGET}'
     with tempfile.TemporaryDirectory(dir=output, prefix='.package-') as tmp:
-        package = stage(Path(tmp) / name, binaries, web)
-        os.environ['PACKAGE_TARGET'] = TARGET
-        build_info = release_archive.seal_bundle(package)
-        release_format.verify_build_info(build_info, release_context.contracts())
         archive = output / f'{name}.tar.gz'
-        release_archive.public_archive(package, archive)
+        package = Path(tmp) / name
+        release_assembly.stage_node_binaries(package, TARGET, *binaries)
+        release_assembly.archive_local_node(package, TARGET, web, archive)
     print(f'Package: {archive}\nChecksum: {archive}.sha256')
     return archive
 
 
 def self_test():
     from unittest.mock import patch
+    web_files = release_assembly.node_web_files()
     scratch = release_context.ROOT / '.artifacts/windows-package-tests'
     scratch.mkdir(parents=True, exist_ok=True)
     versions = {'cli': '0.0.1-hourly.2026111409', 'core': '2.3.4', 'app': '3.4.5-rc.2'}
@@ -104,7 +75,7 @@ def self_test():
         tmp = Path(tmp)
         web = tmp / 'web'
         web.mkdir()
-        for name in WEB_FILES:
+        for name in web_files:
             (web / name).write_text('fixture\n')
         binaries = []
         for name in release_format.program_names(TARGET):
@@ -113,15 +84,17 @@ def self_test():
             binary.write_text(f'#!/bin/sh\necho "{name.removesuffix(".exe")} {value}"\n')
             binary.chmod(0o755)
             binaries.append(binary)
-        package = stage(tmp / f'vibeface-{version}-{TARGET}', binaries, web)
+        package = tmp / f'vibeface-{version}-{TARGET}'
+        release_assembly.stage_node_binaries(package, TARGET, *binaries)
+        release_assembly.stage_node_assets(package, TARGET, web, license=release_context.ROOT / 'LICENSE')
         requirements = (package / 'RUNTIME-REQUIREMENTS.md').read_bytes()
         assert requirements == (release_archive.RUNTIME_REQUIREMENTS + release_archive.WINDOWS_RUNTIME_REQUIREMENTS).encode('utf-8')
         assert b'\r' not in requirements and requirements.endswith(b'\n')
         assert b'official local Agent CLI' in requirements and b'nor WSL, nor Developer Mode' in requirements
         names = {path.relative_to(package).as_posix() for path in package.rglob('*') if path.is_file()}
         assert names == {'vibeface.exe', 'vibeface-core.exe', 'README.md', 'RUNTIME-REQUIREMENTS.md',
-                         'scripts/install-node-service.ps1', *offline_docs.sources().values(),
-                         *(f'web/{name}' for name in WEB_FILES),
+                         'scripts/install-node-service.ps1', *release_assembly.offline_docs().sources().values(),
+                         *(f'web/{name}' for name in web_files),
                          *(['LICENSE'] if (release_context.ROOT / 'LICENSE').is_file() else [])}, sorted(names)
         os.environ['PACKAGE_TARGET'] = TARGET
         core = {'version': '2.3.4', 'source_commit': 'b' * 40}
@@ -153,9 +126,10 @@ def self_test():
         missing = tmp / 'missing-installer'
         with patch('release_context.service_installer', return_value=installers / 'absent.ps1'):
             try:
-                stage(missing, binaries, web)
+                release_assembly.stage_node_binaries(missing, TARGET, *binaries)
+                release_assembly.stage_node_assets(missing, TARGET, web)
             except ValueError as error:
-                assert 'Windows service installer' in str(error), error
+                assert 'service installer' in str(error), error
             else:
                 raise AssertionError('accepted a package without its Windows service installer')
     print('Windows packaging self-test passed: .exe basenames, complete payload, nine sealed BUILD-INFO fields '

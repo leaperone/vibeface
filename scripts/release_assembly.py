@@ -1,12 +1,65 @@
 """Component staging and offline CLI composition before inventory creation."""
+import importlib.util
+import json
 import os
 from pathlib import Path
 import shutil
+import sys
 import tempfile
 import release_archive
 import release_context
 import release_format
 import release_inventory
+
+
+def node_web_files():
+    return json.loads((release_context.ROOT / 'scripts/package-node-web.json').read_text(encoding='utf-8'))
+
+
+def prepare_node_web():
+    root = release_context.ROOT
+    for component in ('crypto', 'web'):
+        release_context.run(sys.executable, '-B', str(root / 'scripts/build-inputs.py'), 'check', component)
+    web = root / 'apps/app/dist/client'
+    for name in node_web_files():
+        file = web / name
+        release_format.require(file.is_file() and file.stat().st_size > 0,
+                               f'Missing browser application file: {name}. Build the application and cryptography first.')
+    return web
+
+
+def offline_docs():
+    spec = importlib.util.spec_from_file_location('offline_docs', release_context.ROOT / 'scripts/offline-docs.py')
+    docs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(docs)
+    return docs
+
+
+def stage_node_binaries(directory, target, cli, core):
+    directory.mkdir(parents=True)
+    (directory / 'scripts').mkdir()
+    (directory / 'web').mkdir()
+    for source, name in zip((cli, core), release_format.program_names(target), strict=True):
+        release_format.require(source.is_file(), f'missing release binary: {source.name}')
+        shutil.copy2(source, directory / name)
+
+
+def stage_node_assets(directory, target, web, *, license=None):
+    shutil.copytree(web, directory / 'web', symlinks=True, dirs_exist_ok=True)
+    installer = release_context.service_installer(target)
+    release_format.require(installer.is_file(), f'missing {target} service installer: scripts/{installer.name}')
+    shutil.copy2(installer, directory / 'scripts' / installer.name)
+    offline_docs().assemble(directory)
+    if license is not None and license.is_file():
+        shutil.copy2(license, directory / 'LICENSE')
+    release_archive.write_runtime_requirements(directory, target)
+
+
+def archive_local_node(directory, target, web, output):
+    stage_node_assets(directory, target, web, license=release_context.ROOT / 'LICENSE')
+    os.environ['PACKAGE_TARGET'] = target
+    release_archive.seal_bundle(directory)
+    release_archive.public_archive(directory, output)
 
 
 def pack_component(app, source, output, target=None):
@@ -72,20 +125,9 @@ def compose_offline(target, native_dir, app_archive, output, core_archive):
                 release_format.require(component['tag'] == pins[app]['tag'] and component['source_commit'] == pins[app]['source_commit'], 'bundle dependency pin mismatch')
         name = f'vibeface-{info["version"]}-{target}'
         directory = tmp / name
-        directory.mkdir()
         cli, core = release_format.program_names(target)
-        shutil.copy2(native_dir / cli, directory / cli)
-        shutil.copy2(core_root / core, directory / core)
-        shutil.copytree(app_root / 'web', directory / 'web')
-        (directory / 'scripts').mkdir()
-        installer = release_context.service_installer(target)
-        shutil.copy2(installer, directory / 'scripts' / installer.name)
-        import importlib.util
-        spec = importlib.util.spec_from_file_location('offline_docs', release_context.ROOT / 'scripts/offline-docs.py')
-        docs = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(docs)
-        docs.assemble(directory)
-        release_archive.write_runtime_requirements(directory, target)
+        stage_node_binaries(directory, target, native_dir / cli, core_root / core)
+        stage_node_assets(directory, target, app_root / 'web')
         os.environ['PACKAGE_TARGET'] = target
         release_archive.seal_bundle(directory, core_info, app_info)
         release_archive.public_archive(directory, output / (name + '.tar.gz'))

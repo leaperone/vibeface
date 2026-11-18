@@ -13,11 +13,11 @@ import { readContracts, readOwnVersion, readNpmTemplate } from './release-metada
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
 const targets = Object.keys(PLATFORMS);
+const webFiles = JSON.parse(fs.readFileSync(new URL('./package-node-web.json', import.meta.url), 'utf8'));
 const requiredFiles = target => ['FILES.sha256', ...programNames(target), 'BUILD-INFO.json', 'README.md',
   'RUNTIME-REQUIREMENTS.md',
   `scripts/install-node-service.${platformFor(target).service}`, 'docs/node.md', 'docs/releasing.md',
-  'web/_shell.html', 'web/index.html', 'web/_redirects', 'web/_headers', 'web/.vibeface-build.json',
-  'web/vibeface_secure.js', 'web/vibeface_secure_bg.wasm'];
+  ...webFiles.map(name => `web/${name}`)];
 const run = (program, args, options = {}) => execFileSync(program, args, {
   encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, ...options,
 });
