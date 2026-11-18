@@ -7,7 +7,9 @@ use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
 use super::provider_adapter::bounded;
 use super::*;
 use crate::clock::now_ms;
-use crate::manager::{self, ManagerConfig, ManagerError, ManagerFailure, Sdk};
+use crate::manager::{self, ManagerFailure, Sdk, TurnExecutionContext};
+#[cfg(test)]
+use crate::manager::{ManagerConfig, ManagerError};
 use crate::scheduling::{SteerOutcome, SteerTarget};
 use crate::work::{Probe, Signal, WorkRecord, WorkSpec, WorkState};
 use futures_util::future::BoxFuture;
@@ -1003,9 +1005,7 @@ impl Opencode {
 
     pub(crate) async fn run_turn<F, P, PF>(
         &self,
-        config: &ManagerConfig,
-        prompt: &str,
-        previous: Option<&str>,
+        context: &TurnExecutionContext<'_>,
         persist_session: impl FnOnce(String) -> F,
         mut cancel: tokio::sync::watch::Receiver<bool>,
         mut progress: P,
@@ -1015,15 +1015,15 @@ impl Opencode {
         P: FnMut(Value) -> PF,
         PF: Future<Output = Result<()>>,
     {
-        let workspace = (config.workspace)
+        let config = context.config;
+        let previous = context.previous;
+        let workspace = config
+            .workspace
             .to_str()
-            .filter(|_| config.workspace.is_absolute() && config.workspace.is_dir())
             .context("manager workspace must be an existing absolute directory")?;
-        let secrets = manager::secret_values(config);
-        let start = std::sync::Mutex::new(manager::StartEvidence::NotStarted);
-        let stage =
-            vibeface_bridge::failure::ProviderTrace::new("opencode", ProviderStage::Validate);
-        let error = ManagerError::reporter(&stage, &start, &secrets);
+        let report = context.trace(ProviderStage::Validate);
+        let error =
+            |outcome, session: Option<&str>, failure| report.error(outcome, session, failure);
         let failed =
             |session: Option<&str>, failure| error(ManagerFailure::Failed, session, failure);
         // Faults of this Node's own bookkeeping, not of opencode.
@@ -1032,21 +1032,17 @@ impl Opencode {
             error(ManagerFailure::Unknown, session, own(detail))
         };
         let stopped = |session: Option<&str>| {
-            error(
-                ManagerFailure::Cancelled,
-                session,
-                own("stopped before the opencode run started"),
-            )
+            report.stopped(session, "stopped before the opencode run started")
         };
         if *cancel.borrow() {
             return Err(stopped(previous));
         }
         let model = parse_model(&config.model).map_err(|failure| failed(previous, failure))?;
-        stage.enter(ProviderStage::Launch);
+        report.enter(ProviderStage::Launch);
         let expected = match &config.sdk {
             Sdk::Opencode { bin, .. } => Launch {
                 bin: bin.clone(),
-                env: config.provider_env.clone(),
+                env: context.provider_env().clone(),
             },
             _ => {
                 return Err(failed(
@@ -1063,7 +1059,7 @@ impl Opencode {
                 ExecFailure::new(FailureKind::TimedOut, "opencode management timed out before the turn started"))),
             result = self.conn_for(Some(expected)) => result.map_err(|e| failed(previous, launch_failure(&e)))?,
         };
-        stage.enter(ProviderStage::SessionStart);
+        report.enter(ProviderStage::SessionStart);
         let resumed = match previous {
             Some(id) => self.session(&conn, id).await.map_err(|e| {
                 failed(
@@ -1102,20 +1098,16 @@ impl Opencode {
                         )
                     })?;
                 }
-                (id.to_owned(), prompt)
+                (id.to_owned(), context.prompt_for_session(true))
             }
             _ => {
                 let id = (self.create(&conn, workspace, model.as_ref()).await)
                     .map_err(|f| failed(previous, f))?;
-                // A session opencode no longer has is replaced by a new one, which needs it all.
-                let fresh = previous
-                    .and(config.turn_binding.as_ref())
-                    .and_then(|turn| turn.fresh_prompt.as_deref());
-                (id, fresh.unwrap_or(prompt))
+                (id, context.prompt_for_session(false))
             }
         };
         let native = Some(session.as_str());
-        stage.enter(ProviderStage::Record);
+        report.enter(ProviderStage::Record);
         if let Err(e) = persist_session(session.clone()).await {
             // A stop fences the attempt, so saving its session fails then.
             return Err(if *cancel.borrow() {
@@ -1126,18 +1118,16 @@ impl Opencode {
         }
         let message = match &config.turn_binding {
             Some(turn) => {
-                (turn.record)(session.clone(), None)
+                context
+                    .record_native_session(&session, None)
                     .await
                     .map_err(|e| failed(native, own(&format!("record the opencode turn: {e}"))))?;
                 reply_message(&turn.client_id)
             }
             None => format!("msg_{}", crate::crypto::random_hex(12)),
         };
-        let mut env = config.tool_env.clone();
-        if let Some(token) = &config.tool_token {
-            env.insert("VIBEFACE_TOOL_TOKEN".into(), token.clone());
-        }
-        stage.enter(ProviderStage::SessionStart);
+        let env = context.tool_env();
+        report.enter(ProviderStage::SessionStart);
         self.environment(&conn, &session, &env)
             .await
             .map_err(|e| failed(native, own(&format!("set the tool environment: {e}"))))?;
@@ -1156,16 +1146,12 @@ impl Opencode {
             session: session.clone(),
             events: tokio::spawn(follow),
             serving: Some(serving),
-            start: &start,
+            start: &report.start,
             terminal: false,
         };
         // Progress is best effort: the turn goes on without the stream after a while.
         let _ = tokio::time::timeout(Duration::from_secs(5), ready).await;
-        let instructions = manager::bot_instructions(
-            config.tool_cli.as_deref(),
-            &config.custom_tools,
-            &config.instructions,
-        );
+        let instructions = context.instructions();
         let first = json!({"id":message,"text":if instructions.is_empty() {
             prompt.to_owned()
         } else {
@@ -1185,12 +1171,12 @@ impl Opencode {
         if *cancel.borrow() {
             return Err(stopped(native));
         }
-        stage.enter(ProviderStage::TurnStart);
-        *start.lock().unwrap() = manager::StartEvidence::Unknown;
+        report.enter(ProviderStage::TurnStart);
+        report.set_start(manager::StartEvidence::Unknown);
         match self.send(&conn, &session, &first).await {
             Sent::Taken => {}
             Sent::Refused(failure) => {
-                *start.lock().unwrap() = manager::StartEvidence::NotStarted;
+                report.set_start(manager::StartEvidence::NotStarted);
                 return Err(failed(native, failure));
             }
             Sent::Unknown(detail) => match self.received(&conn, &session, &message).await {
@@ -1198,11 +1184,12 @@ impl Opencode {
                 Ok(false) | Err(_) => return Err(unknown(native, &detail)),
             },
         }
-        *start.lock().unwrap() = manager::StartEvidence::Started;
+        report.set_start(manager::StartEvidence::Started);
         self.touch(&session);
-        stage.enter(ProviderStage::Record);
-        if let Some(turn) = &config.turn_binding
-            && let Err(e) = (turn.record)(session.clone(), Some(message.clone())).await
+        report.enter(ProviderStage::Record);
+        if let Err(e) = context
+            .record_native_session(&session, Some(&message))
+            .await
         {
             let kind = if self.stop_run(&conn, &session, &message).await {
                 guard.terminal = true;
@@ -1216,7 +1203,7 @@ impl Opencode {
                 own(&format!("record the opencode turn: {e}")),
             ));
         }
-        stage.enter(ProviderStage::Run);
+        report.enter(ProviderStage::Run);
         let mut seen = Seen::default();
         let mut ticks = tokio::time::interval(TICK);
         let mut streaming = true;
@@ -1228,7 +1215,7 @@ impl Opencode {
             let check = tokio::select! {
                 biased;
                 _ = agent::wait_for_cancel(&mut cancel) => {
-                    stage.enter(ProviderStage::Interrupt);
+                    report.enter(ProviderStage::Interrupt);
                     let last = self.close(&session);
                     break if self.stop_run(&conn, &session, &last).await {
                         guard.terminal = true;
@@ -1249,7 +1236,7 @@ impl Opencode {
                 }
                 event = events.recv(), if streaming => match event {
                     Some(event) => {
-                        let event = manager::redact(event, &secrets);
+                        let event = report.redact_progress(event);
                         native_start_event = event["type"] == "session.step.started"
                             && event["data"]["assistantMessageID"].is_string();
                         if let Some(update) = seen.apply(&event)
@@ -1318,12 +1305,7 @@ impl Opencode {
                             .is_some_and(|messages| chain(&messages, &message).reply.is_some()),
                     };
                 if native_started {
-                    if let Some(started) = config
-                        .turn_binding
-                        .as_ref()
-                        .and_then(|turn| turn.started.as_ref())
-                        && let Err(error) = started(message.clone()).await
-                    {
+                    if let Err(error) = context.notify_started(&message).await {
                         let last = self.close(&session);
                         guard.terminal = self.stop_run(&conn, &session, &last).await;
                         break Err(unknown(
@@ -1366,8 +1348,7 @@ impl Opencode {
                 return Err(failed(native, failure));
             }
             Some(reply) if reply["error"]["type"] == "aborted" => {
-                let (outcome, failure) = manager::interrupted(&cancel, Provider::Opencode);
-                return Err(error(outcome, native, failure));
+                return Err(report.interrupted(&cancel, native));
             }
             Some(reply) if !reply["error"].is_null() => {
                 return Err(failed(native, failure_of(&reply["error"])));
@@ -1380,7 +1361,7 @@ impl Opencode {
             .filter(|text| !text.trim().is_empty())
             .collect::<Vec<_>>()
             .join("\n\n");
-        let output = manager::redact_string(text, &secrets);
+        let output = report.redact_text(text);
         let output = crate::scheduler::prefix(&output, MAX_OUTPUT).to_owned();
         // An empty model is opencode's choice, which the turn records.
         let model = format!(
@@ -2930,6 +2911,19 @@ mod tests {
         assert_eq!(error.start, manager::StartEvidence::NotStarted);
         assert!(server.running().await.is_none());
         assert!(place.prompts().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn opencode_manager_presubmit_fences_keep_the_prompt_unsent() -> Result<()> {
+        let place = Place::new().await?;
+        let server = place.opencode()?;
+        let turns = Turns::default();
+        let config = bot(&place, &server, "presubmit-fences", &turns);
+        manager::tests::assert_manager_presubmit_fences(&config).await?;
+        assert!(turns.lock().unwrap().is_empty());
+        assert!(place.prompts().is_empty());
+        server.stop().await;
         Ok(())
     }
 

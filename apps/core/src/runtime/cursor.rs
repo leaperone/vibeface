@@ -1242,6 +1242,14 @@ mod tests {
             .context("structured failure")?;
         assert_eq!(error.stage, vibeface_bridge::failure::ProviderStage::Record);
         assert_eq!(error.start, StartEvidence::NotStarted);
+        // A fresh attempt also stops before any prompt when its session cannot be persisted.
+        blocked_config
+            .turn_binding
+            .as_mut()
+            .context("turn recorder")?
+            .client_id = "presubmit-fences".into();
+        crate::manager::tests::assert_manager_presubmit_fences(&blocked_config).await?;
+        assert_eq!(calls.lock().unwrap().len(), 2);
         assert_eq!(
             std::fs::read_to_string(dir.join("sends.log"))?
                 .lines()
