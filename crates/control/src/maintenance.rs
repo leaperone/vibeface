@@ -710,6 +710,7 @@ mod tests {
 
     #[test]
     fn operation_null_payloads_are_not_treated_as_missing() -> Result<()> {
+        let health = r#"{"device_id":"device","version":"version","web_enabled":false,"http_enabled":false}"#;
         let cases = [
             (
                 MaintenanceCommand::DeliveryWallet(WalletCommand::Status),
@@ -734,7 +735,7 @@ mod tests {
         ];
         for (command, field) in cases {
             let wire =
-                format!(r#"{{"protocol":1,"status":"healthy","health":{{}},"{field}":null}}"#);
+                format!(r#"{{"protocol":1,"status":"healthy","health":{health},"{field}":null}}"#);
             let raw = serde_json::from_str::<RawResponse>(&wire)?;
             assert!(
                 MaintenanceResponse::parse(&command, raw).is_err(),
@@ -743,7 +744,7 @@ mod tests {
         }
         for field in ["wallet", "delivery", "join", "result"] {
             let wire = format!(
-                r#"{{"protocol":1,"status":"error","health":{{}},"error":"refused","{field}":null}}"#
+                r#"{{"protocol":1,"status":"error","health":{health},"error":"refused","{field}":null}}"#
             );
             let raw = serde_json::from_str::<RawResponse>(&wire)?;
             let command = MaintenanceCommand::Probe;
