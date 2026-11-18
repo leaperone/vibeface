@@ -1,0 +1,201 @@
+initialize	连接建立时由客户端发送，不对外暴露
+thread/start	`dispatch_work` 先登记再发；Bot 线程带 `developerInstructions`（工具说明、目录和固定规则），`thread/resume` 再带同一份，App Server 对已加载的线程忽略它；`vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合
+thread/resume	Node 订阅观察；`vibeface codex send`（带 `thread` 的工作）先 resume
+thread/fork	`vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合
+thread/archive	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+thread/delete	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+thread/unsubscribe	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+thread/name/set	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+thread/goal/set	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+thread/goal/get	协调 Agent 经 `vibeface codex call` 调用
+thread/goal/clear	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+thread/metadata/update	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+thread/attachment/add	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+thread/attachment/list	协调 Agent 经 `vibeface codex call` 调用
+thread/attachmentOwner/list	协调 Agent 经 `vibeface codex call` 调用
+thread/attachment/remove	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+thread/section/move	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+thread/unarchive	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+thread/compact/start	`vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合
+thread/shellCommand	不经 Node 暴露给网页；`vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合
+thread/approveGuardianDeniedAction	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+thread/revert	`vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合
+thread/list	协调 Agent 经 `vibeface codex call` 调用
+threadSection/list	协调 Agent 经 `vibeface codex call` 调用
+threadSection/create	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+threadSection/update	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+threadSection/delete	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+thread/loaded/list	协调 Agent 经 `vibeface codex call` 调用
+thread/read	协调 Agent 经 `vibeface codex call` 调用
+thread/turns/list	协调 Agent 经 `vibeface codex call` 调用
+thread/items/list	协调 Agent 经 `vibeface codex call` 调用
+thread/inject_items	`vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合
+skills/list	协调 Agent 经 `vibeface codex call` 调用
+skills/extraRoots/set	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+hooks/list	协调 Agent 经 `vibeface codex call` 调用
+marketplace/add	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+marketplace/remove	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+marketplace/upgrade	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+plugin/list	协调 Agent 经 `vibeface codex call` 调用
+plugin/installed	协调 Agent 经 `vibeface codex call` 调用
+plugin/reconcile	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+plugin/read	协调 Agent 经 `vibeface codex call` 调用
+plugin/skill/read	协调 Agent 经 `vibeface codex call` 调用
+plugin/share/save	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+plugin/share/updateTargets	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+plugin/share/list	协调 Agent 经 `vibeface codex call` 调用
+plugin/share/checkout	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+plugin/share/delete	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+app/read	协调 Agent 经 `vibeface codex call` 调用
+app/list	协调 Agent 经 `vibeface codex call` 调用
+app/installed	协调 Agent 经 `vibeface codex call` 调用
+fs/readFile	不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用
+fs/writeFile	不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用
+fs/createDirectory	不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用
+fs/getMetadata	不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用
+fs/readDirectory	不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用
+fs/remove	不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用
+fs/copy	不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用
+fs/watch	不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用
+fs/unwatch	不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用
+skills/config/write	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+plugin/install	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+plugin/uninstall	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+turn/start	`dispatch_work` 与 `vibeface codex send` 先向 Node 登记工作再发，`clientUserMessageId` 为 `work_id`；Codex Bot 的回合也用它开始，`clientUserMessageId` 为 attempt ID；`vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合
+turn/steer	`vibeface codex send` 在回合进行中时发送，同样是登记过的工作，`clientUserMessageId` 为 `work_id`；Bot 回复进行中收到的用户消息先记为 `steering` 再发，`clientUserMessageId` 为消息 ID；`vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合
+turn/interrupt	停止按钮与 `interrupt_work` 经 Node 发送；停止请求先存在本机，回合绑定后立即发送，失败或结果未知时先 `thread/read` 再重发，直到工作结束；`vibeface codex call` 拒绝
+review/start	`vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合
+model/list	协调 Agent 经 `vibeface codex call` 调用
+account/gatewayOAuth/read	协调 Agent 经 `vibeface codex call` 调用
+account/gatewayOAuth/login	不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用
+account/gatewayOAuth/cancel	不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用
+modelProvider/capabilities/read	协调 Agent 经 `vibeface codex call` 调用
+experimentalFeature/list	协调 Agent 经 `vibeface codex call` 调用
+permissionProfile/list	协调 Agent 经 `vibeface codex call` 调用
+experimentalFeature/enablement/set	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+mcpServer/oauth/login	不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用
+config/mcpServer/reload	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+mcpServerStatus/list	协调 Agent 经 `vibeface codex call` 调用
+mcpServer/resource/read	协调 Agent 经 `vibeface codex call` 调用
+mcpServer/tool/call	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+windowsSandbox/setupStart	不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用
+windowsSandbox/readiness	协调 Agent 经 `vibeface codex call` 调用
+account/login/start	不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用
+account/login/cancel	不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用
+account/logout	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+account/rateLimits/read	协调 Agent 经 `vibeface codex call` 调用
+account/rateLimitResetCredit/consume	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+account/usage/read	协调 Agent 经 `vibeface codex call` 调用
+account/workspaceMessages/read	协调 Agent 经 `vibeface codex call` 调用
+account/sendAddCreditsNudgeEmail	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+feedback/upload	不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用
+command/exec	不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用
+command/exec/write	不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用
+command/exec/terminate	不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用
+command/exec/resize	不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用
+config/read	协调 Agent 经 `vibeface codex call` 调用
+externalAgentConfig/detect	协调 Agent 经 `vibeface codex call` 调用
+externalAgentConfig/import	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+externalAgentConfig/import/recordHistory	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+externalAgentConfig/import/readHistories	协调 Agent 经 `vibeface codex call` 调用
+config/value/write	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+config/batchWrite	协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发
+configRequirements/read	协调 Agent 经 `vibeface codex call` 调用
+account/read	协调 Agent 经 `vibeface codex call` 调用
+fuzzyFileSearch	协调 Agent 经 `vibeface codex call` 调用
+initialized	`initialize` 成功后发送一次
+item/commandExecution/requestApproval	`{"decision":"decline"}`
+item/fileChange/requestApproval	`{"decision":"decline"}`
+item/tool/requestUserInput	`{"answers":{}}`
+mcpServer/elicitation/request	`{"action":"cancel"}`
+item/permissions/requestApproval	`{"permissions":{},"scope":"turn"}`，不授予权限
+item/tool/call	返回失败，Node 不提供动态工具
+account/chatgptAuthTokens/refresh	返回 JSON-RPC 错误，Node 不持有凭证
+attestation/generate	返回 JSON-RPC 错误，Node 不持有凭证
+applyPatchApproval	`{"decision":"denied"}`
+execCommandApproval	`{"decision":"denied"}`
+error	回合开始、结束、错误进入线程观察状态，驱动工作状态机
+thread/started	线程状态、名称、归档、设置、目标等进入线程观察状态
+thread/status/changed	线程状态、名称、归档、设置、目标等进入线程观察状态
+thread/readState/changed	线程状态、名称、归档、设置、目标等进入线程观察状态
+thread/archived	线程状态、名称、归档、设置、目标等进入线程观察状态
+thread/deleted	线程状态、名称、归档、设置、目标等进入线程观察状态
+thread/unarchived	线程状态、名称、归档、设置、目标等进入线程观察状态
+thread/closed	线程状态、名称、归档、设置、目标等进入线程观察状态
+thread/reverted	线程状态、名称、归档、设置、目标等进入线程观察状态
+skills/changed	记录技能变化时间
+thread/name/updated	线程状态、名称、归档、设置、目标等进入线程观察状态
+thread/attachment/updated	线程状态、名称、归档、设置、目标等进入线程观察状态
+thread/goal/updated	线程状态、名称、归档、设置、目标等进入线程观察状态
+thread/prediction/updated	线程状态、名称、归档、设置、目标等进入线程观察状态
+thread/goal/cleared	线程状态、名称、归档、设置、目标等进入线程观察状态
+thread/queue/changed	线程状态、名称、归档、设置、目标等进入线程观察状态
+project/changed	线程状态、名称、归档、设置、目标等进入线程观察状态
+thread/project/updated	线程状态、名称、归档、设置、目标等进入线程观察状态
+thread/environment/connected	线程状态、名称、归档、设置、目标等进入线程观察状态
+thread/environment/disconnected	线程状态、名称、归档、设置、目标等进入线程观察状态
+thread/settings/updated	线程状态、名称、归档、设置、目标等进入线程观察状态
+thread/tokenUsage/updated	token 用量进入线程观察状态
+turn/started	回合开始、结束、错误进入线程观察状态，驱动工作状态机
+hook/started	记录最近一次同名事件
+turn/completed	回合开始、结束、错误进入线程观察状态，驱动工作状态机
+hook/completed	记录最近一次同名事件
+turn/diff/updated	存入 `hidden`，sanitize 后不送网页
+turn/plan/updated	计划步骤与说明进入线程观察状态，并节流写入 WorkProgress
+item/started	条目按 id 存入当前回合；最终回答进入 last_assistant
+item/autoApprovalReview/started	记录最近一次同名事件
+item/autoApprovalReview/completed	记录最近一次同名事件
+autoApprovalReview/strictReviewRequired	记录最近一次同名事件
+item/completed	条目按 id 存入当前回合；最终回答进入 last_assistant
+item/agentMessage/delta	条目按 id 存入当前回合；最终回答进入 last_assistant
+item/plan/delta	追加到该条目的文本
+command/exec/outputDelta	存入 `hidden`，sanitize 后不送网页
+process/outputDelta	存入 `hidden`，sanitize 后不送网页
+process/exited	存入 `hidden`，sanitize 后不送网页
+item/commandExecution/outputDelta	存入 `hidden`，sanitize 后不送网页
+item/commandExecution/terminalInteraction	存入 `hidden`，sanitize 后不送网页
+item/fileChange/outputDelta	存入 `hidden`，sanitize 后不送网页
+item/fileChange/patchUpdated	存入 `hidden`，sanitize 后不送网页
+serverRequest/resolved	从待答请求中移除
+item/mcpToolCall/progress	条目按 id 存入当前回合；最终回答进入 last_assistant
+mcpServer/oauthLogin/completed	记录最近一次同名事件
+mcpServer/startupStatus/updated	MCP 启动状态按服务器名进入全局观察状态
+mcpServer/event/stream/notification	记录最近一次同名事件
+account/updated	账户类型与套餐进入全局观察状态，不含凭证
+account/gatewayOAuth/changed	记录最近一次同名事件
+account/rateLimits/updated	额度进入全局观察状态
+app/list/updated	应用列表进入全局观察状态
+remoteControl/status/changed	记录最近一次同名事件
+externalAgentConfig/import/progress	记录最近一次同名事件
+externalAgentConfig/import/completed	记录最近一次同名事件
+fs/changed	存入 `hidden`，sanitize 后不送网页
+item/reasoning/summaryTextDelta	推理摘要按段累积进入线程观察状态
+item/reasoning/summaryPartAdded	推理摘要按段累积进入线程观察状态
+item/reasoning/textDelta	记录最近一次同名事件
+thread/compacted	线程状态、名称、归档、设置、目标等进入线程观察状态
+model/rerouted	记录最近一次同名事件
+model/verification	记录最近一次同名事件
+modelProvider/authRecoveryStarted	记录最近一次同名事件
+modelProvider/authRecoveryCompleted	记录最近一次同名事件
+turn/moderationMetadata	回合开始、结束、错误进入线程观察状态，驱动工作状态机
+model/safetyBuffering/updated	记录最近一次同名事件
+warning	进入最近 20 条警告
+guardianWarning	进入最近 20 条警告
+deprecationNotice	进入最近 20 条警告
+configWarning	进入最近 20 条警告
+fuzzyFileSearch/sessionUpdated	记录最近一次同名事件
+fuzzyFileSearch/sessionCompleted	记录最近一次同名事件
+thread/realtime/started	记录最近一次同名事件
+thread/realtime/itemAdded	记录最近一次同名事件
+thread/realtime/item/started	记录最近一次同名事件
+thread/realtime/item/transcript/delta	记录最近一次同名事件
+thread/realtime/item/completed	记录最近一次同名事件
+thread/realtime/transcript/delta	记录最近一次同名事件
+thread/realtime/transcript/done	记录最近一次同名事件
+thread/realtime/outputAudio/delta	记录最近一次同名事件
+thread/realtime/sdp	记录最近一次同名事件
+thread/realtime/error	记录最近一次同名事件
+thread/realtime/closed	记录最近一次同名事件
+windows/worldWritableWarning	记录最近一次同名事件
+windowsSandbox/setupCompleted	记录最近一次同名事件
+account/login/completed	记录最近一次同名事件

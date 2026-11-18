@@ -1,7 +1,7 @@
 //! Every App Server method this client knows, from `schema/app-server-methods.json`. The table
 //! says how a request may be used, how a notification enters the observed state and how a server
-//! request is answered. A Codex upgrade that adds a method fails the coverage test until it is
-//! classified here and in `packages/docs/codex-app-server.md`.
+//! request is answered. A Codex upgrade that adds a method fails the reference test until it is
+//! classified here and has a description.
 use serde_json::{Value, json};
 
 /// How a client request may be used.
@@ -344,54 +344,11 @@ pub fn sanitize(value: &mut Value) {
 }
 
 #[cfg(test)]
+mod reference;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
-
-    const SCHEMA: &str = include_str!("../schema/app-server-methods.json");
-    const DOC: &str = include_str!("../../../packages/docs/codex-app-server.md");
-
-    fn names<T>(table: &[(&str, T)]) -> BTreeSet<String> {
-        table.iter().map(|(name, _)| (*name).to_owned()).collect()
-    }
-
-    #[test]
-    fn every_schema_method_is_classified_and_documented() {
-        let schema: Value = serde_json::from_str(SCHEMA).unwrap();
-        let listed = |key: &str| -> BTreeSet<String> {
-            schema[key]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|m| m.as_str().unwrap().to_owned())
-                .collect()
-        };
-        let tables = [
-            ("client_requests", names(CLIENT_REQUESTS)),
-            (
-                "client_notifications",
-                CLIENT_NOTIFICATIONS
-                    .iter()
-                    .map(|m| (*m).to_owned())
-                    .collect(),
-            ),
-            ("server_requests", names(SERVER_REQUESTS)),
-            ("server_notifications", names(SERVER_NOTIFICATIONS)),
-        ];
-        for (key, table) in tables {
-            let schema = listed(key);
-            let missing: Vec<_> = schema.difference(&table).collect();
-            let stale: Vec<_> = table.difference(&schema).collect();
-            assert!(missing.is_empty(), "{key} not classified: {missing:?}");
-            assert!(stale.is_empty(), "{key} no longer in the schema: {stale:?}");
-            for method in &schema {
-                assert!(
-                    DOC.contains(&format!("| `{method}` |")),
-                    "packages/docs/codex-app-server.md does not list {method}"
-                );
-            }
-        }
-    }
 
     #[test]
     fn unanswered_server_requests_fall_back_to_refusals() {
