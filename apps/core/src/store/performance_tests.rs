@@ -1,6 +1,12 @@
 //! Synthetic workloads only. Fixture signing is deliberately outside each timed sample.
-use super::*;
+use super::super::test_support::{
+    Net, Piece, assert_full_recompute_oracle, bot_reply, converges, created, effective, fleet, net,
+    revoke, seq_of, shared_state, signed_user, store, work_spec,
+};
+use super::super::*;
+use crate::providers::Provider;
 use crate::work::{RECONCILE_GRACE_MS, StopRequest, WorkRecord};
+use crate::work::{RequestedWorkKind, WorkRequest, WorkSpec};
 use std::time::Instant;
 
 fn plan(store: &Store, sql: &str) -> Result<String> {
@@ -10,43 +16,6 @@ fn plan(store: &Store, sql: &str) -> Result<String> {
         .query_map([], |row| row.get::<_, String>(3))?
         .collect::<rusqlite::Result<Vec<_>>>()?
         .join("\n"))
-}
-
-fn shared_state(store: &Store, network: &str) -> Result<Vec<String>> {
-    let mut result = dump(store, network)?;
-    for table in ["events", "log_heads", "pending_events"] {
-        let mut statement = store
-            .connection
-            .prepare(&format!("SELECT * FROM {table} WHERE network_id=?"))?;
-        let columns = statement.column_count();
-        let mut rows = statement
-            .query_map([network], |row| {
-                (0..columns)
-                    .map(|index| row.get::<_, rusqlite::types::Value>(index))
-                    .collect::<rusqlite::Result<Vec<_>>>()
-            })?
-            .map(|row| Ok(format!("{table}: {:?}", row?)))
-            .collect::<Result<Vec<_>>>()?;
-        rows.sort();
-        result.extend(rows);
-    }
-    Ok(result)
-}
-
-/// Rebuild every shared projection, even when the effective flags would not change.
-pub(super) fn assert_full_recompute_oracle(store: &Store, network: &str) -> Result<()> {
-    let before = shared_state(store, network)?;
-    store.connection.execute(
-        "UPDATE events SET effective=0 WHERE network_id=?",
-        [network],
-    )?;
-    reduce::clear(&store.connection, network)?;
-    log::recompute(
-        &store.connection,
-        &membership_from(&store.connection, network)?,
-    )?;
-    assert_eq!(shared_state(store, network)?, before);
-    Ok(())
 }
 
 fn sign_after(
