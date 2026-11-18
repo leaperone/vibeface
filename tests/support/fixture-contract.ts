@@ -1,267 +1,298 @@
-/** The fixture RPC wire contract. External JSON is parsed here before callers use it. */
+import assert from 'node:assert/strict';
+import { isDeepStrictEqual } from 'node:util';
+import { insideTaskArtifacts } from './artifact-paths.ts';
 
-export type FixtureKind = 'single' | 'cursor' | 'delivery' | 'workspace' | 'mesh';
-export type FixtureRole = 'source' | 'receiver' | 'provider' | 'public' | 'member';
-export type WorkspaceGate = 'taskA' | 'taskB' | 'main' | 'channel';
-export type ProviderStage = 'signed_out' | 'ready' | 'catalog_unknown';
-
-export type FixtureNode = { url: string; entry: string | null; peer: string; directory: string };
-export type FixtureReady = {
-  run: string;
-  nodes: Record<string, FixtureNode>;
-  gates?: Record<WorkspaceGate, string>;
-};
-export type FixtureRequest =
-  | { op: 'reset'; kind: FixtureKind }
-  | { op: 'stop' }
-  | { op: 'restart'; role: FixtureRole; crash?: boolean }
-  | { op: 'inspect' }
-  | { op: 'cursor_login' }
-  | { op: 'cursor_inspect' }
-  | { op: 'workspace_release'; gate: WorkspaceGate }
-  | { op: 'workspace_inspect' }
-  | { op: 'mesh_info' }
-  | { op: 'mesh_pairing' }
-  | { op: 'mesh_approve'; peer: string; code: string }
-  | { op: 'native_setup'; invitation_file: string }
-  | { op: 'workspace_native_setup'; invitation_file: string }
-  | { op: 'native_join' }
-  | { op: 'native_approve'; peer: string; code: string }
-  | { op: 'native_provider_setup' }
-  | { op: 'native_provider_clipboard' }
-  | { op: 'native_provider_login'; command: string }
-  | { op: 'native_provider_stage'; stage: ProviderStage }
-  | { op: 'native_provider_queue' }
-  | { op: 'native_provider_inspect' }
-  | { op: 'native_send'; name: string; content_base64: string };
-
-export type FixtureInspect = { wallet_files: number; mesh_records: number; chain_rpc_calls: number };
-export type CursorInspect = { selected_official: boolean; bot_enabled: boolean; execution: string[]; prompts: number };
-export type WorkspaceEvidence = {
-  invocations: { label: string; conversation_id: string; trigger: string; thread_id: string; messages: string[] }[];
-  steers: { message_id: string; thread_id: string; turn_id: string; text: string }[];
-  starts: { thread_id: string; turn_id: string }[];
-  interrupts: { thread_id: string; turn_id: string }[];
-  turns: { thread_id: string; turn_id: string; state: string }[];
-  inputs?: { message_id: string; conversation_id: string; target: Record<string, unknown>; text: string; deferred: boolean; cancelled: boolean }[];
-};
-export type MeshInfo = FixtureReady & { invitation: string; mesh: Record<string, unknown>; relays: unknown[]; announced_relays: unknown[] };
-export type ProviderInspection = {
-  manager: { provider: string; model: string; reasoning_effort: string | null } | null;
-  roles: string[];
-  execution_model: string;
-  setup: { directory: string; command: string };
-  login_count: number;
-  app_server_link_state: string;
-  readiness: string;
-  catalog: string;
-  authentication: string;
-  checked_at_ms: number | null;
-  jobs: { trigger: string; state: string }[];
-  deferred_input: { message_id: string; target: Record<string, unknown>; deferred: boolean; cancelled: boolean } | null;
-  total_invocations: number;
-  running_invocations: number;
-  deferred_invocations: number;
-};
-
-export type ResultByOp = {
-  reset: FixtureReady;
-  stop: { stopped: true };
-  restart: FixtureReady;
-  inspect: FixtureInspect;
-  cursor_login: { signed_in: true };
-  cursor_inspect: CursorInspect;
-  workspace_release: { released: WorkspaceGate };
-  workspace_inspect: WorkspaceEvidence;
-  mesh_info: MeshInfo;
-  mesh_pairing: { peer: string; code: string };
-  mesh_approve: { approved: true };
-  native_setup: FixtureReady;
-  workspace_native_setup: FixtureReady;
-  native_join: { peer: string; code: string };
-  native_approve: { approved: true };
-  native_provider_setup: { configured: true };
-  native_provider_clipboard: { pasted: true };
-  native_provider_login: { executed: true; private_root_verified: true; controlled_bin_verified: true; login_count: number };
-  native_provider_stage: { stage: ProviderStage };
-  native_provider_queue: { bot_id: string; conversation_id: string; running_trigger: string; deferred_message_id: string };
-  native_provider_inspect: ProviderInspection;
-  native_send: { order_id: string };
-};
-
-export type FixtureOperationError = { error: string; frames: string[] };
-export type FixtureResponse = { id: number; ok: true; result: unknown } | ({ id: number; ok: false } & FixtureOperationError);
-export type FixtureRequestEnvelope = { id: number; request: FixtureRequest };
-
-export function isFixtureRecord(value: unknown): value is Record<string, unknown> {
+type Decoder<T> = (value: unknown) => T;
+function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
-function fail(message: string): never { throw new Error(message); }
-function record(value: unknown, label = 'fixture object'): Record<string, unknown> {
-  if (!isFixtureRecord(value)) fail(`Expected ${label}`);
+
+/** Decode every own field and reject omissions or extensions. */
+function object<S extends Record<string, Decoder<unknown>>>(shape: S) {
+  return (value: unknown): { [K in keyof S]: ReturnType<S[K]> } => {
+    const keys = Object.keys(shape);
+    assert(isRecord(value) && Object.keys(value).length === keys.length &&
+      keys.every(key => Object.hasOwn(value, key)), 'Invalid fixture object fields');
+    return Object.fromEntries(keys.map(key => [key, shape[key](value[key])])) as { [K in keyof S]: ReturnType<S[K]> };
+  };
+}
+
+function list<T>(decode: Decoder<T>) {
+  return (value: unknown) => {
+    assert(Array.isArray(value), 'Expected a fixture array');
+    return value.map(decode);
+  };
+}
+function nullable<T>(decode: Decoder<T>) {
+  return (value: unknown) => value === null ? null : decode(value);
+}
+function literal<const T extends string | number | boolean>(expected: T) {
+  return (value: unknown) => { assert(value === expected, 'Unexpected fixture value'); return expected; };
+}
+function choice<const T extends string>(...values: T[]) {
+  return (value: unknown): T => {
+    const found = values.find(item => item === value);
+    assert(found !== undefined, 'Unknown fixture value');
+    return found;
+  };
+}
+function string(value: unknown) { assert(typeof value === 'string', 'Expected fixture string'); return value; }
+function text(value: unknown) { const result = string(value); assert(result.length > 0, 'Expected fixture text'); return result; }
+function boolean(value: unknown) { assert(typeof value === 'boolean', 'Expected fixture boolean'); return value; }
+function count(value: unknown) {
+  assert(typeof value === 'number' && Number.isSafeInteger(value) && value >= 0, 'Expected nonnegative fixture count');
   return value;
 }
-function exact(value: Record<string, unknown>, keys: readonly string[], label = 'fixture object'): void {
-  const actual = Object.keys(value);
-  if (actual.length !== keys.length || keys.some(key => !Object.hasOwn(value, key))) fail(`Invalid ${label} fields`);
+function matches(pattern: RegExp) {
+  return (value: unknown) => { const result = text(value); assert(pattern.test(result), 'Invalid fixture string format'); return result; };
 }
-function text(value: unknown, label = 'fixture text'): string {
-  if (typeof value !== 'string' || value.length === 0) fail(`Expected ${label}`);
-  return value;
+function base64(value: unknown) {
+  const encoded = string(value);
+  assert(Buffer.from(encoded, 'base64').toString('base64') === encoded, 'Invalid base64 content');
+  return encoded;
 }
-function stringValue(value: unknown, label = 'fixture string'): string {
-  if (typeof value !== 'string') fail(`Expected ${label}`);
-  return value;
+const peer = matches(/^[0-9a-f]{64}$/);
+const code = matches(/^[0-9]{6}$/);
+const gate = choice('taskA', 'taskB', 'main', 'channel');
+const stage = choice('signed_out', 'ready', 'catalog_unknown');
+const role = choice('source', 'receiver', 'provider', 'public', 'member');
+const all = ['single', 'cursor', 'delivery', 'workspace', 'mesh'] as const;
+export type FixtureKind = typeof all[number];
+export type WorkspaceGate = ReturnType<typeof gate>;
+type Surface = 'web' | 'native' | 'child';
+type KindList = readonly FixtureKind[];
+const empty = object({});
+const pairing = object({ peer, code });
+const invitationFile = object({ invitation_file: text });
+function restartFields(value: unknown): { role: ReturnType<typeof role>; crash?: boolean } {
+  return isRecord(value) && Object.hasOwn(value, 'crash')
+    ? object({ role, crash: boolean })(value) : object({ role })(value);
 }
-function optionalText(value: unknown, label: string): string | null {
-  if (value === null) return null;
-  return text(value, label);
+function operation<T, const W extends KindList, const N extends KindList>(fields: Decoder<T>, web: W, native: N) {
+  return { fields, web, native };
 }
-function bool(value: unknown, label = 'fixture boolean'): boolean {
-  if (typeof value !== 'boolean') fail(`Expected ${label}`);
-  return value;
+const requests = {
+  reset: operation(object({ kind: choice(...all) }), all, []),
+  stop: operation(empty, all, []),
+  restart: operation(restartFields, all, []),
+  inspect: operation(empty, all, ['delivery']),
+  cursor_login: operation(empty, ['cursor'], []),
+  cursor_inspect: operation(empty, ['cursor'], []),
+  workspace_release: operation(object({ gate }), ['workspace'], ['workspace']),
+  workspace_inspect: operation(empty, ['workspace'], ['workspace']),
+  mesh_info: operation(empty, ['mesh'], []),
+  mesh_pairing: operation(empty, ['mesh'], []),
+  mesh_approve: operation(pairing, ['mesh'], []),
+  native_setup: operation(invitationFile, [], ['delivery']),
+  workspace_native_setup: operation(invitationFile, [], ['workspace']),
+  native_join: operation(empty, [], ['delivery', 'workspace']),
+  native_approve: operation(pairing, [], ['delivery', 'workspace']),
+  native_provider_setup: operation(empty, [], ['delivery']),
+  native_provider_clipboard: operation(empty, [], ['delivery']),
+  native_provider_login: operation(object({ command: text }), [], ['delivery']),
+  native_provider_stage: operation(object({ stage }), [], ['delivery']),
+  native_provider_queue: operation(empty, [], ['delivery']),
+  native_provider_inspect: operation(empty, [], ['delivery']),
+  native_send: operation(object({ name: text, content_base64: base64 }), [], ['delivery']),
+};
+type Op = keyof typeof requests;
+type ByOp = { [O in Op]: { op: O } & ReturnType<typeof requests[O]['fields']> };
+export type FixtureRequest = ByOp[Op];
+type ScopedRequest<S extends 'web' | 'native', K extends FixtureKind> = {
+  [O in Op]: K extends typeof requests[O][S][number] ? ByOp[O] : never
+}[Op];
+const topology = {
+  single: ['source'], cursor: ['source'], workspace: ['source'],
+  delivery: ['source', 'receiver', 'provider'], mesh: ['public', 'member'],
+} as const;
+export type WebRequest<K extends FixtureKind> =
+  Exclude<ScopedRequest<'web', K>, ByOp['restart' | 'reset']> |
+  { op: 'reset'; kind: K } | { op: 'restart'; role: typeof topology[K][number]; crash?: boolean };
+export type NativeRequest<K extends FixtureKind> = ScopedRequest<'native', K>;
+
+function isOp(value: unknown): value is Op {
+  return typeof value === 'string' && Object.hasOwn(requests, value);
 }
-function integer(value: unknown, label = 'fixture integer'): number {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) fail(`Expected ${label}`);
-  return value;
-}
-function oneOf<T extends string>(value: unknown, values: readonly T[], label: string): T {
-  if (typeof value !== 'string' || !values.includes(value as T)) fail(`Invalid ${label}`);
-  return value as T;
-}
-function array<T>(value: unknown, parse: (value: unknown) => T, label: string): T[] {
-  if (!Array.isArray(value)) fail(`Expected ${label}`);
-  return value.map(parse);
-}
-function node(value: unknown): FixtureNode {
-  const fields = record(value, 'fixture Node');
-  exact(fields, ['url', 'entry', 'peer', 'directory'], 'fixture Node');
-  const url = text(fields.url, 'Node URL');
-  let parsed: URL;
-  try { parsed = new URL(url); } catch { fail('Invalid Node URL'); }
-  if (parsed.protocol !== 'http:' || parsed.hostname !== '127.0.0.1' || !parsed.port || parsed.pathname !== '/' || parsed.username || parsed.password || parsed.search || parsed.hash) fail('Fixture uses literal loopback URL');
-  const entry = optionalText(fields.entry, 'fixture entry');
-  if (entry !== null) {
-    let parsedEntry: URL;
-    try { parsedEntry = new URL(entry); } catch { fail('Invalid Node entry'); }
-    if (parsedEntry.origin !== parsed.origin || parsedEntry.pathname !== '/' || parsedEntry.search || !/^#bootstrap=[A-Za-z0-9_-]+$/.test(parsedEntry.hash)) fail('Invalid Node owner entry');
-  }
-  const peer = text(fields.peer, 'Node peer');
-  if (!/^[a-f0-9]{64}$/.test(peer)) fail('Invalid Node peer');
-  const directory = text(fields.directory, 'Node directory');
-  if (!directory.startsWith('/')) fail('Fixture directory must be absolute');
-  return { url: parsed.origin, entry: entry === null ? null : new URL(entry).href, peer, directory };
-}
-function ready(value: unknown, kind?: FixtureKind): FixtureReady {
-  const fields = record(value, 'fixture ready result');
-  const keys = kind === 'workspace' ? ['run', 'nodes', 'gates'] : ['run', 'nodes'];
-  if (kind === undefined) {
-    const allowed = ['run', 'nodes', 'gates'];
-    if (!Object.keys(fields).every(key => allowed.includes(key)) || !Object.hasOwn(fields, 'run') || !Object.hasOwn(fields, 'nodes')) fail('Invalid fixture ready result fields');
-  } else exact(fields, keys, 'fixture ready result');
-  const rawNodes = record(fields.nodes, 'fixture nodes');
-  const inferredRoles = Object.keys(rawNodes);
-  const roles = kind === 'delivery' ? ['source', 'receiver', 'provider'] : kind === 'mesh' ? ['public', 'member'] : kind === 'workspace' || kind === 'single' || kind === 'cursor' ? ['source'] : inferredRoles;
-  const nodes: Record<string, FixtureNode> = {};
-  if (kind !== undefined) exact(rawNodes, roles, 'fixture nodes');
-  if (roles.length === 0 || !roles.every(role => inferredRoles.includes(role))) fail('Invalid fixture nodes');
-  for (const role of roles) nodes[role] = node(rawNodes[role]);
-  const run = text(fields.run, 'fixture run');
-  if (!run.startsWith('/')) fail('Fixture run must be absolute');
-  const result: FixtureReady = { run, nodes };
-  if (kind === 'workspace' || (kind === undefined && Object.hasOwn(fields, 'gates'))) {
-    const gates = record(fields.gates, 'workspace gates');
-    exact(gates, ['taskA', 'taskB', 'main', 'channel'], 'workspace gates');
-    result.gates = { taskA: text(gates.taskA), taskB: text(gates.taskB), main: text(gates.main), channel: text(gates.channel) };
+export function parseFixtureRequest<R extends FixtureRequest>(value: R, surface: Surface, kind?: FixtureKind): R;
+export function parseFixtureRequest(value: unknown, surface: Surface, kind?: FixtureKind): FixtureRequest;
+export function parseFixtureRequest(value: unknown, surface: Surface, kind?: FixtureKind): FixtureRequest {
+  assert(isRecord(value) && Object.hasOwn(value, 'op') && isOp(value.op), 'Unknown fixture operation');
+  const { op, ...fields } = value;
+  const spec = requests[op];
+  if (surface === 'child') assert(op !== 'reset' && op !== 'stop', 'Controller-only operation');
+  const allowed: KindList = surface === 'child' ? [...spec.web, ...spec.native] : spec[surface];
+  assert(kind === undefined ? surface === 'web' && (op === 'reset' || op === 'stop') : allowed.includes(kind),
+    'Operation outside fixture scope');
+  const result = { op, ...spec.fields(fields) } as FixtureRequest;
+  if (result.op === 'restart') {
+    assert(kind && topology[kind].some(role => role === result.role), 'Unknown role for this fixture');
   }
   return result;
 }
 
-const kinds = ['single', 'cursor', 'delivery', 'workspace', 'mesh'] as const;
-const roles = ['source', 'receiver', 'provider', 'public', 'member'] as const;
-const gates = ['taskA', 'taskB', 'main', 'channel'] as const;
-const stages = ['signed_out', 'ready', 'catalog_unknown'] as const;
-/** Parse a caller request, rejecting unknown keys and malformed variants. */
-export function parseFixtureRequest(value: unknown): FixtureRequest {
-  const fields = record(value, 'fixture request');
-  if (typeof fields.op !== 'string') fail('Fixture request requires an operation');
-  switch (fields.op) {
-    case 'reset': exact(fields, ['op', 'kind'], 'reset request'); return { op: 'reset', kind: oneOf(fields.kind, kinds, 'fixture kind') };
-    case 'stop': case 'inspect': case 'cursor_login': case 'cursor_inspect': case 'workspace_inspect': case 'mesh_info': case 'mesh_pairing': case 'native_join': case 'native_provider_setup': case 'native_provider_clipboard': case 'native_provider_queue': case 'native_provider_inspect':
-      exact(fields, ['op'], `${fields.op} request`); return { op: fields.op } as FixtureRequest;
-    case 'restart':
-      if (!Object.hasOwn(fields, 'crash')) exact(fields, ['op', 'role'], 'restart request'); else exact(fields, ['op', 'role', 'crash'], 'restart request');
-      return { op: 'restart', role: oneOf(fields.role, roles, 'fixture role'), ...(Object.hasOwn(fields, 'crash') ? { crash: bool(fields.crash, 'restart crash') } : {}) };
-    case 'workspace_release': exact(fields, ['op', 'gate'], 'workspace release request'); return { op: 'workspace_release', gate: oneOf(fields.gate, gates, 'workspace gate') };
-    case 'mesh_approve': case 'native_approve':
-      exact(fields, ['op', 'peer', 'code'], `${fields.op} request`); return { op: fields.op, peer: text(fields.peer, 'peer'), code: text(fields.code, 'pairing code') } as FixtureRequest;
-    case 'native_setup': case 'workspace_native_setup':
-      exact(fields, ['op', 'invitation_file'], `${fields.op} request`); return { op: fields.op, invitation_file: text(fields.invitation_file, 'invitation file') } as FixtureRequest;
-    case 'native_provider_login': exact(fields, ['op', 'command'], 'native provider login request'); return { op: 'native_provider_login', command: text(fields.command, 'login command') };
-    case 'native_provider_stage': exact(fields, ['op', 'stage'], 'native provider stage request'); return { op: 'native_provider_stage', stage: oneOf(fields.stage, stages, 'provider stage') };
-    case 'native_send': { exact(fields, ['op', 'name', 'content_base64'], 'native send request'); const name = text(fields.name, 'file name'); const content_base64 = text(fields.content_base64, 'base64 content'); if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(content_base64)) fail('Invalid base64 content'); return { op: 'native_send', name, content_base64 }; }
-    default: fail('Unknown fixture operation');
+export function loopbackOrigin(value: unknown) {
+  const raw = text(value);
+  assert(/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/?$/.test(raw), 'Expected literal loopback listener');
+  const url = new URL(raw);
+  assert(url.port, 'Expected an explicit fixture port');
+  return url.origin;
+}
+function pathBelow(root: string) {
+  return (value: unknown) => {
+    const path = text(value);
+    assert(insideTaskArtifacts(root, path), 'Fixture path outside the task directory');
+    return path;
+  };
+}
+const nodeFields = { url: loopbackOrigin, entry: nullable(text), peer, directory: text };
+function fixtureNode(run: string) {
+  return (value: unknown) => {
+    const node = object({ ...nodeFields, directory: pathBelow(run) })(value);
+    if (node.entry !== null) {
+      const prefix = node.url + '/#bootstrap=';
+      assert(node.entry.startsWith(prefix) && /^[A-Za-z0-9_-]+$/.test(node.entry.slice(prefix.length)),
+        'Invalid owner link for this Node');
+    }
+    return node;
+  };
+}
+export type NodeInfo = ReturnType<ReturnType<typeof fixtureNode>>;
+export type OwnerNode = NodeInfo & { entry: string };
+function ownerNode(run: string) {
+  return (value: unknown): OwnerNode => {
+    const node = fixtureNode(run)(value);
+    assert(node.entry !== null, 'Expected owner link for this Node');
+    return { ...node, entry: node.entry };
+  };
+}
+function readyShapes(run: string) {
+  const node = fixtureNode(run), owner = ownerNode(run), path = pathBelow(run);
+  const source = object({ run: literal(run), nodes: object({ source: owner }) });
+  return {
+    single: source, cursor: source,
+    workspace: object({ run: literal(run), nodes: object({ source: owner }),
+      gates: object({ taskA: path, taskB: path, main: path, channel: path }) }),
+    delivery: object({ run: literal(run), nodes: object({ source: owner, receiver: owner, provider: node }) }),
+    mesh: object({ run: literal(run), nodes: object({ public: node, member: node }) }),
+  };
+}
+export type FixtureReady<K extends FixtureKind> = ReturnType<ReturnType<typeof readyShapes>[K]>;
+type Generation<K extends FixtureKind> = { kind: K; artifacts: string; origin: string };
+function parseReady<K extends FixtureKind>(value: unknown, context: Generation<K>): FixtureReady<K> {
+  assert(isRecord(value), 'Expected fixture readiness');
+  const run = pathBelow(context.artifacts)(value.run);
+  const ready = readyShapes(run)[context.kind](value);
+  const page = 'public' in ready.nodes ? ready.nodes.public : ready.nodes.source;
+  assert(page.url === context.origin, 'Fixture page origin changed');
+  const members = Object.values(ready.nodes);
+  assert(new Set(members.map(node => node.peer)).size === members.length, 'Fixture identities must be distinct');
+  return ready as FixtureReady<K>;
+}
+
+const turn = { thread_id: text, turn_id: text };
+const evidence = {
+  invocations: list(object({ label: text, conversation_id: text, trigger: text, thread_id: text, messages: list(string) })),
+  steers: list(object({ message_id: text, ...turn, text })),
+  starts: list(object(turn)), interrupts: list(object(turn)), turns: list(object({ ...turn, state: text })),
+};
+const botTarget = object({ kind: literal('bot_main'), bot_id: text });
+const targets = {
+  bot_main: botTarget, task: object({ kind: literal('task'), task_id: text }),
+  work: object({ kind: literal('work'), work_id: text }),
+  routine: object({ kind: literal('routine'), bot_id: text, trigger: text }),
+  channel_member: object({ kind: literal('channel_member'), channel_id: text, bot_id: text }),
+  channel_task: object({ kind: literal('channel_task'), channel_id: text, task_id: text, bot_id: text }),
+};
+function inputTarget(value: unknown) {
+  assert(isRecord(value), 'Expected workspace input target');
+  const kind = choice('bot_main', 'task', 'work', 'routine', 'channel_member', 'channel_task')(value.kind);
+  return targets[kind](value);
+}
+const inputs = list(object({ message_id: text, conversation_id: text, target: inputTarget, text: string, deferred: boolean, cancelled: boolean }));
+const providerInspection = object({
+  manager: nullable(object({ provider: literal('codex'), model: string, reasoning_effort: nullable(string) })),
+  roles: list(choice('agent', 'execution')), execution_model: string, setup: object({ directory: text, command: text }),
+  login_count: count, app_server_link_state: choice('connected', 'starting', 'off', 'not_found', 'handshake_failed', 'launch_failed'),
+  readiness: choice('starting', 'ready', 'unverified', 'needs_setup'), catalog: choice('unavailable', 'available'),
+  authentication: choice('unverified', 'authenticated', 'not_required', 'sign_in_required'), checked_at_ms: nullable(count),
+  jobs: list(object({ trigger: text, state: text })),
+  deferred_input: nullable(object({ message_id: text, target: botTarget, deferred: boolean, cancelled: boolean })),
+  total_invocations: count, running_invocations: count, deferred_invocations: count,
+});
+const inspect = object({ wallet_files: count, mesh_records: count, chain_rpc_calls: count });
+const approved = object({ approved: literal(true) });
+const meshConfig = object({
+  enabled: literal(true), network: matches(/^t-[0-9a-f]{12}$/), bootstrap: list(text), allow_private: literal(true), advertise: list(text),
+});
+
+function resultDecoders<K extends FixtureKind>(context: Generation<K>) {
+  let initial: FixtureReady<K> | undefined;
+  let workspaceInitialized = false;
+  function ready(value: unknown) {
+    const result = parseReady(value, context);
+    initial = structuredClone(result);
+    workspaceInitialized = false;
+    return result;
   }
-}
-
-export function parseFixtureReset(request: unknown): Extract<FixtureRequest, { op: 'reset' }> {
-  const parsed = parseFixtureRequest(request);
-  if (parsed.op !== 'reset') fail('Fixture reset requires an operation and kind');
-  return parsed;
-}
-
-function row(value: unknown, keys: readonly string[]): Record<string, unknown> {
-  const fields = record(value, 'fixture row'); exact(fields, keys, 'fixture row'); return fields;
-}
-function turn(value: unknown): { thread_id: string; turn_id: string } {
-  const fields = row(value, ['thread_id', 'turn_id']); return { thread_id: text(fields.thread_id), turn_id: text(fields.turn_id) };
-}
-function evidence(value: unknown): WorkspaceEvidence {
-  const fields = record(value, 'workspace inspection');
-  const keys = Object.keys(fields); const allowed = ['invocations', 'steers', 'starts', 'interrupts', 'turns', 'inputs'];
-  if (!keys.every(key => allowed.includes(key)) || !['invocations', 'steers', 'starts', 'interrupts', 'turns'].every(key => keys.includes(key))) fail('Invalid workspace inspection fields');
-  const invocations = array(fields.invocations, item => { const r = row(item, ['label', 'conversation_id', 'trigger', 'thread_id', 'messages']); return { label: text(r.label), conversation_id: text(r.conversation_id), trigger: text(r.trigger), thread_id: text(r.thread_id), messages: array(r.messages, x => text(x), 'invocation messages') }; }, 'invocations');
-  const steers = array(fields.steers, item => { const r = row(item, ['message_id', 'thread_id', 'turn_id', 'text']); return { message_id: text(r.message_id), thread_id: text(r.thread_id), turn_id: text(r.turn_id), text: text(r.text) }; }, 'steers');
-  const starts = array(fields.starts, turn, 'starts');
-  const interrupts = array(fields.interrupts, turn, 'interrupts');
-  const turns = array(fields.turns, item => { const r = row(item, ['thread_id', 'turn_id', 'state']); return { ...turn(r), state: text(r.state) }; }, 'turns');
-  let inputs: WorkspaceEvidence['inputs'];
-  if (Object.hasOwn(fields, 'inputs')) inputs = array(fields.inputs, item => { const r = row(item, ['message_id', 'conversation_id', 'target', 'text', 'deferred', 'cancelled']); return { message_id: text(r.message_id), conversation_id: text(r.conversation_id), target: record(r.target), text: text(r.text), deferred: bool(r.deferred), cancelled: bool(r.cancelled) }; }, 'inputs');
-  return { invocations, steers, starts, interrupts, turns, ...(inputs ? { inputs } : {}) };
-}
-function resultFor(request: FixtureRequest, value: unknown): ResultByOp[FixtureRequest['op']] {
-  const op = request.op;
-  switch (op) {
-    case 'reset': return ready(value, request.kind) as ResultByOp[typeof op];
-    case 'restart': return ready(value) as ResultByOp[typeof op];
-    case 'native_setup': return ready(value, 'delivery') as ResultByOp[typeof op];
-    case 'workspace_native_setup': return ready(value, 'workspace') as ResultByOp[typeof op];
-    case 'stop': { const r = row(value, ['stopped']); if (r.stopped !== true) fail('Invalid stop result'); return { stopped: true } as ResultByOp[typeof op]; }
-    case 'inspect': { const r = row(value, ['wallet_files', 'mesh_records', 'chain_rpc_calls']); return { wallet_files: integer(r.wallet_files), mesh_records: integer(r.mesh_records), chain_rpc_calls: integer(r.chain_rpc_calls) } as ResultByOp[typeof op]; }
-    case 'cursor_login': { const r = row(value, ['signed_in']); if (r.signed_in !== true) fail('Invalid cursor login result'); return { signed_in: true } as ResultByOp[typeof op]; }
-    case 'cursor_inspect': { const r = row(value, ['selected_official', 'bot_enabled', 'execution', 'prompts']); return { selected_official: bool(r.selected_official), bot_enabled: bool(r.bot_enabled), execution: array(r.execution, x => text(x), 'execution'), prompts: integer(r.prompts) } as ResultByOp[typeof op]; }
-    case 'workspace_release': { const r = row(value, ['released']); return { released: oneOf(r.released, gates, 'workspace gate') } as ResultByOp[typeof op]; }
-    case 'workspace_inspect': return evidence(value) as ResultByOp[typeof op];
-    case 'mesh_info': { const r = record(value, 'mesh info'); exact(r, ['run', 'nodes', 'invitation', 'mesh', 'relays', 'announced_relays'], 'mesh info'); const base = ready({ run: r.run, nodes: r.nodes }, 'mesh'); const mesh = row(r.mesh, ['enabled', 'network', 'bootstrap', 'allow_private', 'advertise']); if (mesh.enabled !== true || !/^t-[0-9a-f]{12}$/.test(text(mesh.network, 'mesh network')) || !Array.isArray(mesh.bootstrap) || mesh.bootstrap.length !== 1 || !mesh.bootstrap.every(item => typeof item === 'string') || !new RegExp(`^vibeface://node/${base.nodes.public.peer}\\?addr=127\\.0\\.0\\.1:[0-9]+$`).test(mesh.bootstrap[0]) || mesh.allow_private !== true || !Array.isArray(mesh.advertise) || !mesh.advertise.every(item => typeof item === 'string')) fail('Invalid mesh configuration'); const relays = array(r.relays, x => text(x), 'relays'); const announced = array(r.announced_relays, x => text(x), 'announced relays'); if (relays.length !== 0 || announced.length !== 1) fail('Invalid mesh relay configuration'); return { ...base, invitation: text(r.invitation), mesh, relays, announced_relays: announced } as ResultByOp[typeof op]; }
-    case 'mesh_pairing': case 'native_join': { const r = row(value, ['peer', 'code']); return { peer: text(r.peer), code: text(r.code) } as ResultByOp[typeof op]; }
-    case 'mesh_approve': case 'native_approve': { const r = row(value, ['approved']); if (r.approved !== true) fail('Invalid approval result'); return { approved: true } as ResultByOp[typeof op]; }
-    case 'native_provider_setup': { const r = row(value, ['configured']); if (r.configured !== true) fail('Invalid provider setup result'); return { configured: true } as ResultByOp[typeof op]; }
-    case 'native_provider_clipboard': { const r = row(value, ['pasted']); if (r.pasted !== true) fail('Invalid provider clipboard result'); return { pasted: true } as ResultByOp[typeof op]; }
-    case 'native_provider_login': { const r = row(value, ['executed', 'private_root_verified', 'controlled_bin_verified', 'login_count']); if (r.executed !== true || r.private_root_verified !== true || r.controlled_bin_verified !== true) fail('Invalid provider login result'); return { executed: true, private_root_verified: true, controlled_bin_verified: true, login_count: integer(r.login_count) } as ResultByOp[typeof op]; }
-    case 'native_provider_stage': { const r = row(value, ['stage']); return { stage: oneOf(r.stage, stages, 'provider stage') } as ResultByOp[typeof op]; }
-    case 'native_provider_queue': { const r = row(value, ['bot_id', 'conversation_id', 'running_trigger', 'deferred_message_id']); return { bot_id: text(r.bot_id), conversation_id: text(r.conversation_id), running_trigger: text(r.running_trigger), deferred_message_id: text(r.deferred_message_id) } as ResultByOp[typeof op]; }
-    case 'native_provider_inspect': { const r = row(value, ['manager', 'roles', 'execution_model', 'setup', 'login_count', 'app_server_link_state', 'readiness', 'catalog', 'authentication', 'checked_at_ms', 'jobs', 'deferred_input', 'total_invocations', 'running_invocations', 'deferred_invocations']); const manager = r.manager === null ? null : (() => { const m = row(r.manager, ['provider', 'model', 'reasoning_effort']); return { provider: text(m.provider), model: stringValue(m.model, 'model'), reasoning_effort: m.reasoning_effort === null ? null : stringValue(m.reasoning_effort, 'reasoning effort') }; })(); const setup = row(r.setup, ['directory', 'command']); const deferred = r.deferred_input === null ? null : (() => { const d = row(r.deferred_input, ['message_id', 'target', 'deferred', 'cancelled']); return { message_id: text(d.message_id), target: record(d.target), deferred: bool(d.deferred), cancelled: bool(d.cancelled) }; })(); return { manager, roles: array(r.roles, x => text(x), 'provider roles'), execution_model: stringValue(r.execution_model, 'execution model'), setup: { directory: text(setup.directory), command: text(setup.command) }, login_count: integer(r.login_count), app_server_link_state: text(r.app_server_link_state), readiness: text(r.readiness), catalog: text(r.catalog), authentication: text(r.authentication), checked_at_ms: r.checked_at_ms === null ? null : integer(r.checked_at_ms, 'checked_at_ms'), jobs: array(r.jobs, x => { const j = row(x, ['trigger', 'state']); return { trigger: text(j.trigger), state: text(j.state) }; }, 'jobs'), deferred_input: deferred, total_invocations: integer(r.total_invocations), running_invocations: integer(r.running_invocations), deferred_invocations: integer(r.deferred_invocations) } as ResultByOp[typeof op]; }
-    case 'native_send': { const r = row(value, ['order_id']); return { order_id: text(r.order_id) } as ResultByOp[typeof op]; }
-    default: { const exhaustive: never = op; return exhaustive; }
+  function sameGeneration(value: unknown): FixtureReady<K> {
+    const result = parseReady(value, context);
+    assert(initial && isDeepStrictEqual(initial, result), 'Fixture generation identity changed');
+    return result;
   }
-}
+  function meshInfo(value: unknown) {
+    const details = object({
+      run: text, nodes: (value: unknown) => value, invitation: text, mesh: meshConfig, relays: list(text), announced_relays: list(text),
+    })(value);
+    assert(initial && context.kind === 'mesh', 'Expected a ready mesh generation');
+    const mesh = parseReady({ run: details.run, nodes: details.nodes }, { ...context, kind: 'mesh' });
+    assert(isDeepStrictEqual(initial, mesh), 'Mesh identity changed');
+    const { bootstrap, advertise } = details.mesh;
+    assert(bootstrap.length === 1 && advertise.length === 0 && details.relays.length === 0 &&
+      details.announced_relays.length === 1, 'Invalid fixture mesh routes');
+    const prefix = 'vibeface://node/' + mesh.nodes.public.peer + '?addr=';
+    assert(bootstrap[0].startsWith(prefix), 'Mesh bootstrap must be the public Node');
+    const address = bootstrap[0].slice(prefix.length);
+    assert(!address.includes('/'), 'Invalid bootstrap socket address');
+    loopbackOrigin('http://' + address);
+    loopbackOrigin(details.announced_relays[0]);
+    return { ...details, ...mesh };
+  }
 
-export function parseFixtureResult<O extends FixtureRequest['op']>(request: Extract<FixtureRequest, { op: O }>, value: unknown): ResultByOp[O] {
-  return resultFor(request, value) as ResultByOp[O];
-}
+  const results = {
+    reset: ready, stop: object({ stopped: literal(true) }), restart: sameGeneration, inspect,
+    cursor_login: object({ signed_in: literal(true) }),
+    cursor_inspect: object({ selected_official: boolean, bot_enabled: boolean, execution: list(text), prompts: count }),
+    workspace_release: object({ released: gate }),
+    workspace_inspect: (value: unknown) => workspaceInitialized ? object({ ...evidence, inputs })(value) : object(evidence)(value),
+    mesh_info: meshInfo, mesh_pairing: pairing, mesh_approve: approved,
+    native_setup: sameGeneration, workspace_native_setup: (value: unknown): FixtureReady<K> => {
+      const initialized = sameGeneration(value);
+      workspaceInitialized = true;
+      return initialized;
+    }, native_join: pairing, native_approve: approved,
+    native_provider_setup: object({ configured: literal(true) }), native_provider_clipboard: object({ pasted: literal(true) }),
+    native_provider_login: object({ executed: literal(true), private_root_verified: literal(true), controlled_bin_verified: literal(true), login_count: literal(1) }),
+    native_provider_stage: object({ stage }), native_provider_inspect: providerInspection,
+    native_provider_queue: object({ bot_id: text, conversation_id: text, running_trigger: text, deferred_message_id: text }),
+    native_send: object({ order_id: peer }),
+  } satisfies Record<Op, Decoder<unknown>>;
 
-export function parseFixtureReady(value: unknown, kind: FixtureKind): FixtureReady { return ready(value, kind); }
-export function parseFixtureOperationError(value: unknown): FixtureOperationError {
-  const fields = row(value, ['error', 'frames']);
-  return { error: text(fields.error), frames: array(fields.frames, x => text(x), 'error frames') };
+  return { results, ready };
 }
+export type ResultByOp<K extends FixtureKind> = {
+  [O in Op]: ReturnType<ReturnType<typeof resultDecoders<K>>['results'][O]>
+};
+export function createFixtureContract<K extends FixtureKind>(context: Generation<K>) {
+  const { results, ready } = resultDecoders(context);
+  function result<R extends FixtureRequest>(request: R, value: unknown): ResultByOp<K>[R['op']];
+  function result(request: FixtureRequest, value: unknown) {
+    if (request.op === 'workspace_release') assert(isRecord(value) && value.released === request.gate, 'Wrong workspace gate');
+    if (request.op === 'native_provider_stage') assert(isRecord(value) && value.stage === request.stage, 'Wrong provider stage');
+    if (request.op === 'reset') assert(request.kind === context.kind, 'Wrong fixture reset kind');
+    return results[request.op](value);
+  }
+  return { ready, result };
+}
+export type ExactRequest<R extends FixtureRequest> = R & NoInfer<Record<Exclude<keyof R, keyof ByOp[R['op']]>, never>>;
+export type Caller<Allowed extends FixtureRequest, K extends FixtureKind> =
+  <const R extends Allowed>(request: ExactRequest<R>) => Promise<ResultByOp<K>[R['op']]>;

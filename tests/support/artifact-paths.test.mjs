@@ -8,6 +8,9 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { insideTaskArtifacts } from './artifact-paths.ts';
+import { createFixtureContract } from './fixture-contract.ts';
+import { readyDetails } from './fixture-samples.mjs';
+import { constants } from 'node:fs';
 
 const repo = fileURLToPath(new URL('../..', import.meta.url));
 const artifacts = path.join(repo, '.artifacts/e2e');
@@ -67,7 +70,7 @@ async function loadFixture(name, { fs = {}, env = {}, dependencies = {}, exports
   const registrations = [];
   const inertTest = (...args) => registrations.push(args);
   inertTest.extend = value => { definitions.push(value); return inertTest; };
-  const context = vm.createContext({ process: { env, execPath: '/synthetic/node' }, Buffer, URL, AbortSignal, setTimeout, clearTimeout, fetch });
+  const context = vm.createContext({ process: { env, execPath: '/synthetic/node' }, Buffer, URL, TextDecoder, structuredClone, AbortSignal, setTimeout, clearTimeout, fetch });
   const cache = new Map();
   const forbidden = () => { throw new Error('Unexpected offline I/O'); };
   const stub = (specifier, values) => new vm.SyntheticModule(Object.keys(values), function () {
@@ -84,16 +87,16 @@ async function loadFixture(name, { fs = {}, env = {}, dependencies = {}, exports
     await loaded.link(async specifier => {
       if (dependencies[specifier]) return stub(specifier, dependencies[specifier]);
       if (specifier === 'node:fs/promises') return stub(specifier, {
-        lstat: forbidden, readFile: forbidden, mkdir: async () => {}, unlink: async () => {},
+        lstat: forbidden, open: forbidden, readFile: forbidden, mkdir: async () => {}, unlink: async () => {},
         mkdtemp: forbidden, writeFile: forbidden, readdir: forbidden, readlink: forbidden, copyFile: forbidden, ...fs,
       });
-      if (specifier === 'node:fs') return stub(specifier, { createWriteStream: forbidden });
+      if (specifier === 'node:fs') return stub(specifier, { createWriteStream: forbidden, constants });
       if (specifier === 'node:child_process') return stub(specifier, { execFile: forbidden, spawn: forbidden });
       if (specifier === 'node:net') return stub(specifier, { createServer: forbidden });
       if (specifier === '@e2e-dev/web' || specifier === '@e2e-dev/mobile') return stub(specifier, { test: inertTest });
       if (specifier === 'e2e') return stub(specifier, { expect: forbidden, secrets: forbidden });
       if (specifier.startsWith('node:')) return stub(specifier, await import(specifier));
-      if (specifier.startsWith('.')) return module(path.resolve(path.dirname(file), specifier + '.ts'));
+      if (specifier.startsWith('.')) return module(path.resolve(path.dirname(file), specifier.endsWith('.ts') ? specifier : specifier + '.ts'));
       throw new Error(`Unexpected offline import: ${specifier}`);
     });
     return loaded;
@@ -104,62 +107,86 @@ async function loadFixture(name, { fs = {}, env = {}, dependencies = {}, exports
 }
 
 test('web node and gate consumers keep the e2e root and admit ..cache', async () => {
-  const gates = Object.fromEntries(['taskA', 'taskB', 'main', 'channel'].map(name => [name, path.join(artifacts, '..cache', name)]));
-  const source = directory => ({ url: 'http://127.0.0.1:8000/', entry: 'http://127.0.0.1:8000/#bootstrap=a', peer: 'a'.repeat(64), directory });
-  const { namespace } = await loadFixture('fixtures.ts', { exports: '\nexport { node };' });
-  assert.equal(namespace.node(source(path.join(artifacts, '..cache'))).directory, path.join(artifacts, '..cache'));
-  for (const directory of [artifacts, artifacts + '-sibling/file', nativeRoot]) {
-    assert.throws(() => namespace.node(source(directory)), /Fixture data remains in this task/);
-  }
-  // The workspace fixture receives the same inert control transport; no fetch is sent.
+  const origin = 'http://127.0.0.1:8000';
+  const ready = readyDetails('workspace', { artifacts, origin });
+  const { source } = ready.nodes;
+  source.directory = path.join(ready.run, '..cache');
+  ready.gates.main = path.join(ready.run, '..cache/main');
   const controlJson = JSON.stringify({ url: 'http://127.0.0.1:9000/', token: 'b'.repeat(64) });
-  const ready = { nodes: { source: source(path.join(artifacts, 'source')) }, gates };
   const web = await loadFixture('fixtures.ts', { fs: {
-    lstat: async () => ({ isFile: () => true, isSymbolicLink: () => false, mode: 0o600 }),
-    readFile: async () => controlJson,
-  }, fetch: async (_url, options) => ({ ok: true, json: async () => JSON.parse(options.body).op === 'reset' ? ready : {} }) });
+    open: async () => ({
+      stat: async () => ({ isFile: () => true, mode: 0o600, size: controlJson.length }),
+      readFile: async () => controlJson, close: async () => {},
+    }),
+  }, fetch: async (_url, options) => Response.json(JSON.parse(options.body).op === 'reset' ? ready : { stopped: true }) });
   const workspace = web.definitions.find(value => value.workspace).workspace;
   let used = 0;
-  const use = async value => { used++; assert.deepEqual({ ...value.gates }, gates); };
-  await workspace({ app: { baseUrl: 'http://127.0.0.1:8000/' } }, use);
-  assert.equal(used, 1);
-  for (const rejected of [artifacts, artifacts + '-sibling/gate', nativeRoot]) {
-    gates.main = rejected;
-    await assert.rejects(workspace({ app: { baseUrl: 'http://127.0.0.1:8000/' } }, use), /Controlled gates remain in this task/);
+  const use = async value => {
+    used++;
+    assert.equal(value.source.directory, source.directory);
+    assert.deepEqual({ ...value.gates }, ready.gates);
+  };
+  const run = () => workspace({ app: { baseUrl: origin } }, use);
+  await run();
+  for (const rejected of [artifacts, artifacts + '-sibling/file', nativeRoot]) {
+    const directory = source.directory;
+    source.directory = rejected;
+    await assert.rejects(run(), /outside the task directory/);
+    source.directory = directory;
+    ready.gates.main = rejected;
+    await assert.rejects(run(), /outside the task directory/);
+    ready.gates.main = path.join(ready.run, 'main');
   }
   assert.equal(used, 1);
 });
 
+test('Web fixture HTTP success and error bodies have the same byte bound and reject invalid UTF-8', async () => {
+  const { namespace } = await loadFixture('fixtures.ts', { exports: '\nexport { responseJSON };' });
+  const limit = 64 * 1024;
+  const data = '"' + 'é'.repeat((limit - 2) / 2) + '"';
+  assert.equal(Buffer.byteLength(data), limit);
+  assert.equal(await namespace.responseJSON(new Response(data)), JSON.parse(data));
+  await assert.rejects(namespace.responseJSON(new Response(data + ' ', { status: 500 })), /64 KiB/);
+  await assert.rejects(namespace.responseJSON(new Response(Buffer.from([34, 255, 34]))));
+});
+
 test('native workspace gates retain the narrower workspace root', async () => {
-  const gates = Object.fromEntries(['taskA', 'main', 'channel'].map(name => [name, path.join(workspaceRoot, '..cache', name)]));
-  const record = value => value;
+  const origin = 'http://127.0.0.1:8000';
+  const ready = readyDetails('workspace', { artifacts: workspaceRoot, origin });
+  ready.gates.main = path.join(ready.run, '..cache/main');
   const { definitions, registrations } = await loadFixture('workspace.native.ts', { dependencies: {
-    './native-fixture': { bundleManifest: () => assert.fail('No bundle reads'), record, text: value => value,
-      nativeFixture: async (kind, root, use) => {
-        assert.equal(kind, 'workspace'); assert.equal(root, workspaceRoot);
-        await use({ fixture: { nodes: { source: { url: 'http://127.0.0.1:8000/' } }, gates }, invitation: path.join(root, 'invitation'), call: async () => ({}) });
+    './native-fixture': { bundleManifest: () => assert.fail('No bundle reads'), record: value => value, text: value => value,
+      nativeFixture: async (kind, artifacts, use) => {
+        assert.equal(kind, 'workspace'); assert.equal(artifacts, workspaceRoot);
+        const contract = createFixtureContract({ kind, artifacts, origin });
+        const fixture = contract.ready(ready);
+        await use({ fixture, invitation: path.join(artifacts, 'invitation'), call: async request => contract.result(request, ready) });
       } },
   } });
   assert.equal(registrations.length, 1);
   const network = definitions[0].network;
   let used = 0;
-  const use = async value => { used++; assert.deepEqual({ ...value.gates }, gates); };
+  const use = async value => { used++; assert.deepEqual({ ...value.gates }, ready.gates); };
   await network({}, use);
   for (const rejected of [workspaceRoot, workspaceRoot + '-sibling/gate', path.join(nativeRoot, 'other/gate')]) {
-    gates.main = rejected;
-    await assert.rejects(network({}, use), /Native gates remain in this fixture/);
+    ready.gates.main = rejected;
+    await assert.rejects(network({}, use), /outside the task directory/);
   }
   assert.equal(used, 1);
 });
 
-test('private web control reader rejects symlinks, directories and non-private modes before reading', async () => {
+test('private web control reader refuses symlinks, directories and non-private modes before reading', async () => {
   for (const [isFile, symlink, mode] of [[true, true, 0o600], [false, false, 0o600], [true, false, 0o644]]) {
     let reads = 0;
     const { namespace } = await loadFixture('fixtures.ts', { exports: '\nexport { control };', fs: {
-      lstat: async () => ({ isFile: () => isFile, isSymbolicLink: () => symlink, mode }),
-      readFile: async () => { reads++; throw new Error('Must not read rejected control material'); },
+      open: async (_path, flags) => {
+        assert(flags & constants.O_NOFOLLOW);
+        if (symlink) throw new Error('ELOOP');
+        return { stat: async () => ({ isFile: () => isFile, mode, size: 100 }), close: async () => {},
+          readFile: async () => { reads++; throw new Error('Must not read rejected control material'); } };
+      },
     } });
-    await assert.rejects(namespace.control('http://127.0.0.1:8000'), /Fixture control material is private/);
+    await assert.rejects(namespace.control('http://127.0.0.1:8000', 'single'), /ELOOP|Fixture control material is private/);
     assert.equal(reads, 0);
   }
 });

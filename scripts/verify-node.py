@@ -32,7 +32,6 @@ import release_source
 
 import argparse
 import base64
-import binascii
 import contextlib
 import copy
 import hashlib
@@ -7360,89 +7359,82 @@ def delivery_protected_acceptance(options):
             "fresh protected delivery reaches its five genuine receipts and actual budget settlement")
 
 
-FIXTURE_KINDS = ("single", "cursor", "delivery", "workspace", "mesh")
-FIXTURE_STAGES = ("signed_out", "ready", "catalog_unknown")
-FIXTURE_GATES = ("taskA", "taskB", "main", "channel")
-FIXTURE_ROLES = ("source", "receiver", "provider", "public", "member")
+FIXTURE_ROLES = {
+    "single": ("source",), "cursor": ("source",), "workspace": ("source",),
+    "delivery": ("source", "receiver", "provider"), "mesh": ("public", "member"),
+}
+# The child supports both Web forwarding and native callers. Reset/stop belong to the parent.
+FIXTURE_OPERATIONS = {
+    "restart": (FIXTURE_ROLES, ("role",)),
+    "inspect": (FIXTURE_ROLES, ()),
+    "cursor_login": (("cursor",), ()), "cursor_inspect": (("cursor",), ()),
+    "workspace_release": (("workspace",), ("gate",)), "workspace_inspect": (("workspace",), ()),
+    "mesh_info": (("mesh",), ()), "mesh_pairing": (("mesh",), ()), "mesh_approve": (("mesh",), ("peer", "code")),
+    "native_setup": (("delivery",), ("invitation_file",)), "workspace_native_setup": (("workspace",), ("invitation_file",)),
+    "native_join": (("delivery", "workspace"), ()), "native_approve": (("delivery", "workspace"), ("peer", "code")),
+    "native_provider_setup": (("delivery",), ()), "native_provider_clipboard": (("delivery",), ()),
+    "native_provider_login": (("delivery",), ("command",)), "native_provider_stage": (("delivery",), ("stage",)),
+    "native_provider_queue": (("delivery",), ()), "native_provider_inspect": (("delivery",), ()),
+    "native_send": (("delivery",), ("name", "content_base64")),
+}
 
 
 def validate_fixture_request(request, fixture_kind):
-    """Validate the JSONL operation shape before any fixture side effect."""
-    require(isinstance(request, dict), "fixture operation is an object")
-    op = request.get("op")
-    require(type(op) is str, "fixture operation names an operation")
-
-    def exact(*keys):
-        require(set(request) == set(keys), "fixture operation has exactly its declared fields")
-
-    def text(name):
-        require(type(request.get(name)) is str and request[name], "fixture operation has non-empty " + name)
-
-    no_args = {
-        "stop", "inspect", "cursor_login", "cursor_inspect", "workspace_inspect", "mesh_info", "mesh_pairing",
-        "native_join", "native_provider_setup", "native_provider_clipboard", "native_provider_queue",
-        "native_provider_inspect",
-    }
-    require(op in no_args or op in {
-        "restart", "workspace_release", "mesh_approve", "native_setup", "workspace_native_setup",
-        "native_approve", "native_provider_login", "native_provider_stage", "native_send",
-    }, "unsupported fixture operation")
-    if op in no_args:
-        exact("op")
-    elif op == "restart":
-        require(set(request) in ({"op", "role"}, {"op", "role", "crash"}), "restart fields are fixed")
-        require(request.get("role") in FIXTURE_ROLES, "restart role is known")
-        allowed = {"delivery": ("source", "receiver", "provider"), "mesh": ("public", "member")}.get(fixture_kind, ("source",))
-        require(request["role"] in allowed, "restart role belongs to this fixture generation")
-        if "crash" in request:
-            require(type(request["crash"]) is bool, "restart crash is boolean")
+    require(isinstance(request, dict) and isinstance(request.get("op"), str)
+            and request["op"] in FIXTURE_OPERATIONS, "expected a child fixture operation")
+    op = request["op"]
+    kinds, fields = FIXTURE_OPERATIONS[op]
+    require(fixture_kind in kinds, "operation belongs to this fixture kind")
+    expected = {"op", *fields}
+    if op == "restart" and "crash" in request:
+        expected.add("crash")
+        require(isinstance(request["crash"], bool), "restart crash is boolean")
+    require(set(request) == expected, "fixture operation has exactly its declared fields")
+    for name in fields:
+        require(isinstance(request[name], str) and (request[name] or name == "content_base64"),
+                "fixture field has the expected string type and length")
+    if op == "restart":
+        require(request["role"] in FIXTURE_ROLES[fixture_kind], "restart names a Node in this generation")
     elif op == "workspace_release":
-        exact("op", "gate")
-        require(fixture_kind == "workspace" and request.get("gate") in FIXTURE_GATES, "workspace release is fixture scoped")
-    elif op == "mesh_approve":
-        exact("op", "peer", "code")
-        require(fixture_kind == "mesh", "mesh approval is fixture scoped")
-        text("peer"); text("code")
-    elif op == "native_setup":
-        exact("op", "invitation_file")
-        require(fixture_kind == "delivery", "native delivery setup is fixture scoped")
-        text("invitation_file")
-    elif op == "workspace_native_setup":
-        exact("op", "invitation_file")
-        require(fixture_kind == "workspace", "native workspace setup is fixture scoped")
-        text("invitation_file")
-    elif op == "native_approve":
-        exact("op", "peer", "code")
-        require(fixture_kind in ("delivery", "workspace"), "native approval is fixture scoped")
-        text("peer"); text("code")
-    elif op == "native_provider_login":
-        exact("op", "command")
-        require(fixture_kind == "delivery", "native provider login is fixture scoped")
-        text("command")
+        require(request["gate"] in ("taskA", "taskB", "main", "channel"), "unknown workspace gate")
     elif op == "native_provider_stage":
-        exact("op", "stage")
-        require(fixture_kind == "delivery" and request.get("stage") in FIXTURE_STAGES, "native provider stage is fixture scoped")
+        require(request["stage"] in ("signed_out", "ready", "catalog_unknown"), "unknown controlled provider stage")
+    elif op in ("native_approve", "mesh_approve"):
+        require(re.fullmatch(r"[0-9a-f]{64}", request["peer"]) and re.fullmatch(r"[0-9]{6}", request["code"]),
+                "pairing has a Node identity and six-digit code")
     elif op == "native_send":
-        exact("op", "name", "content_base64")
-        require(fixture_kind == "delivery", "native send is fixture scoped")
-        text("name"); text("content_base64")
-        try:
-            base64.b64decode(request["content_base64"], validate=True)
-        except (ValueError, binascii.Error):
-            raise AssertionError("native send content is base64") from None
-    if op == "inspect":
-        require(fixture_kind == "delivery", "delivery inspection is fixture scoped")
-    elif op in ("cursor_login", "cursor_inspect"):
-        require(fixture_kind == "cursor", "Cursor operation is fixture scoped")
-    elif op == "workspace_inspect":
-        require(fixture_kind == "workspace", "workspace inspection is fixture scoped")
-    elif op in ("native_provider_setup", "native_provider_clipboard", "native_provider_queue", "native_provider_inspect"):
-        require(fixture_kind == "delivery", "native provider operation is fixture scoped")
-    elif op in ("mesh_info", "mesh_pairing"):
-        require(fixture_kind == "mesh", "mesh operation is fixture scoped")
-    elif op == "native_join":
-        require(fixture_kind in ("delivery", "workspace"), "native pairing is fixture scoped")
-    return request
+        encoded = request["content_base64"]
+        require(base64.b64encode(base64.b64decode(encoded, validate=True)).decode("ascii") == encoded,
+                "native send content uses canonical base64")
+    return op
+
+
+def workspace_fixture_evidence(run, native_client):
+    inputs = fixture_records(run, "codex-inputs.jsonl")
+    state_path = run / "fixture-codex-state.json"
+    state = json.loads(state_path.read_text()) if state_path.exists() else {"threads": {}}
+    result = {
+        "invocations": [{"label": row["label"], "conversation_id": row["conversation_id"], "trigger": row["trigger"],
+                         "thread_id": row["native_session_id"], "messages": row["messages"]}
+                        for row in fixture_records(run)],
+        "steers": [{"message_id": row["message_id"], "thread_id": row["thread_id"], "turn_id": row["turn_id"],
+                    "text": "\n".join(part["text"] for part in row["input"] if part["type"] == "text")}
+                   for row in inputs if row["event"] == "input"],
+        "starts": [{"thread_id": row["thread_id"], "turn_id": row["turn_id"]}
+                   for row in inputs if row["event"] == "turn_started"],
+        "turns": [{"thread_id": thread["id"], "turn_id": turn["id"], "state": turn["status"]}
+                  for thread in state["threads"].values() for turn in thread["turns"]],
+        "interrupts": [{"thread_id": row["message"]["params"]["threadId"],
+                        "turn_id": row["message"]["params"]["turnId"]}
+                       for row in fixture_records(run, "codex-rpc.jsonl")
+                       if row["message"].get("method") == "turn/interrupt"],
+    }
+    if native_client is not None:
+        result["inputs"] = [{"message_id": row["input"]["message_id"], "conversation_id": row["conversation_id"],
+                             "target": row["input"]["target"], "text": row["input"]["text"],
+                             "deferred": row["deferred"], "cancelled": row["cancelled"]}
+                            for row in native_client.rpc("workspace_state")["inputs"]]
+    return result
 
 
 def e2e_fixture(options):
@@ -7581,13 +7573,12 @@ os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:
             require(type(request_id) is int and request_id == expected_id <= 2**53 - 1
                     and isinstance(request, dict), "fixture request IDs increase once per operation")
             try:
-                validate_fixture_request(request, options.fixture_kind)
-                op = request.get("op")
+                op = validate_fixture_request(request, options.fixture_kind)
                 if op == "restart":
                     role = request.get("role")
                     require(role in nodes, "fixture restart names its own Node")
                     node = nodes[role]
-                    node.stop(crash=bool(request.get("crash")))
+                    node.stop(crash=request.get("crash", False))
                     node.start()
                     result = details()
                 elif op == "cursor_login":
@@ -7620,30 +7611,7 @@ os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:
                     result = {"released": request["gate"]}
                 elif op == "workspace_inspect":
                     require(set(request) == {"op"} and workspace_gates, "workspace inspection reads only this controlled fixture")
-                    inputs = fixture_records(run, "codex-inputs.jsonl")
-                    state_path = run / "fixture-codex-state.json"
-                    state = json.loads(state_path.read_text()) if state_path.exists() else {"threads": {}}
-                    result = {
-                        "invocations": [{"label": row["label"], "conversation_id": row["conversation_id"], "trigger": row["trigger"],
-                                         "thread_id": row["native_session_id"], "messages": row["messages"]}
-                                        for row in fixture_records(run)],
-                        "steers": [{"message_id": row["message_id"], "thread_id": row["thread_id"], "turn_id": row["turn_id"],
-                                    "text": "\n".join(part["text"] for part in row["input"] if part["type"] == "text")}
-                                   for row in inputs if row["event"] == "input"],
-                        "starts": [{"thread_id": row["thread_id"], "turn_id": row["turn_id"]}
-                                   for row in inputs if row["event"] == "turn_started"],
-                        "turns": [{"thread_id": thread["id"], "turn_id": turn["id"], "state": turn["status"]}
-                                  for thread in state["threads"].values() for turn in thread["turns"]],
-                        "interrupts": [{"thread_id": row["message"]["params"]["threadId"],
-                                        "turn_id": row["message"]["params"]["turnId"]}
-                                       for row in fixture_records(run, "codex-rpc.jsonl")
-                                       if row["message"].get("method") == "turn/interrupt"],
-                    }
-                    if native_ready:
-                        result["inputs"] = [{"message_id": row["input"]["message_id"], "conversation_id": row["conversation_id"],
-                                             "target": row["input"]["target"], "text": row["input"]["text"],
-                                             "deferred": row["deferred"], "cancelled": row["cancelled"]}
-                                            for row in nodes["source"].client.rpc("workspace_state")["inputs"]]
+                    result = workspace_fixture_evidence(run, nodes["source"].client if native_ready else None)
                     require(len(json.dumps({"id": request_id, "ok": True, "result": result}).encode("utf-8")) <= 64 * 1024,
                             "workspace inspection returns one bounded public JSON event")
                 elif op == "workspace_native_setup":
@@ -7683,13 +7651,13 @@ os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:
                     result = {"approved": True}
                 elif op == "native_setup":
                     require(delivery_kind and not native_ready, "native setup initializes only its own fresh delivery fixture")
+                    path = Path(request["invitation_file"])
+                    require(path.is_absolute() and path.resolve().is_relative_to(options.artifacts.resolve())
+                            and not path.exists() and not path.is_symlink(), "native invitation stays in a new private task file")
                     for role in ("source", "receiver"):
                         node = nodes[role]
                         node.bootstrap()
                         delivery_call(node, "configure", enabled=True, charity_enabled=True, paid_enabled=False)
-                    path = Path(request["invitation_file"])
-                    require(path.is_absolute() and path.resolve().is_relative_to(options.artifacts.resolve())
-                            and not path.exists(), "native invitation stays in a new private task file")
                     invitation = nodes["receiver"].client.invite()
                     with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as output:
                         output.write(invitation)

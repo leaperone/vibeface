@@ -1,16 +1,16 @@
 import type { ChildProcess } from 'node:child_process';
 import type { Readable, Writable } from 'node:stream';
 import { TextDecoder } from 'node:util';
-import { parseFixtureRequest, parseFixtureResult, type FixtureRequest, type ResultByOp } from './fixture-contract.ts';
+import assert from 'node:assert/strict';
+import { createFixtureContract, parseFixtureRequest, type ExactRequest, type FixtureKind, type FixtureReady, type FixtureRequest, type ResultByOp } from './fixture-contract.ts';
 
 type FixtureObject = Record<string, unknown>;
 type FixtureChild = ChildProcess & { stdin: Writable; stdout: Readable };
 type ChildClose = { code: number | null; signal: NodeJS.Signals | null };
 type Waiter = {
-  resolve(value: FixtureObject): void;
+  accept(value: FixtureObject): void;
   reject(error: Error): void;
   timer: ReturnType<typeof setTimeout>;
-  decode?: (value: FixtureObject) => FixtureObject;
 };
 type State =
   | { kind: 'starting'; waiter: Waiter }
@@ -39,13 +39,21 @@ function describeFailure(category: unknown, frames: unknown): string | undefined
   return `${name}${validFrames.length ? ` at ${validFrames.join(', ')}` : ''}`;
 }
 
-export function createFixtureTransport(child: FixtureChild, {
+export type FixtureRejectionCase =
+  | { op: 'native_provider_stage'; stage: 'invalid' }
+  | { op: 'native_provider_stage'; stage: 'ready'; role: 'source' }
+  | { op: 'native_provider_login'; command: string; role: 'source' };
+
+export function createFixtureTransport<K extends FixtureKind>(child: FixtureChild, {
+  kind, artifacts, origin, surface,
   requestTimeoutMs,
   shutdownTimeoutsMs: [eofMs, termMs, killMs],
 }: {
+  kind: K; artifacts: string; origin: string; surface: 'web' | 'native';
   requestTimeoutMs: number;
   shutdownTimeoutsMs: [eof: number, term: number, kill: number];
 }) {
+  const contract = createFixtureContract({ kind, artifacts, origin });
   let state: State;
   let stopping: Promise<ChildClose> | undefined;
   let buffered: Buffer = Buffer.alloc(0);
@@ -64,9 +72,9 @@ export function createFixtureTransport(child: FixtureChild, {
     return error;
   }
 
-  const ready = new Promise<FixtureObject>((resolve, reject) => {
+  const ready = new Promise<FixtureReady<K>>((resolve, reject) => {
     const timer = setTimeout(() => fail('Fixture startup timed out'), requestTimeoutMs);
-    state = { kind: 'starting', waiter: { resolve, reject, timer } };
+    state = { kind: 'starting', waiter: { accept: value => resolve(contract.ready(value)), reject, timer } };
   });
   // Cleanup can start before a caller awaits startup.
   void ready.catch(() => {});
@@ -75,9 +83,14 @@ export function createFixtureTransport(child: FixtureChild, {
     const current = state;
     if (current.kind === 'starting' && isFixtureObject(value)) {
       if (hasKeys(value, ['ready']) && isFixtureObject(value.ready)) {
+        try {
+          current.waiter.accept(value.ready);
+        } catch {
+          fail('Fixture returned invalid startup details');
+          return;
+        }
         state = { kind: 'idle', nextId: 1 };
         clearTimeout(current.waiter.timer);
-        current.waiter.resolve(value.ready);
         return;
       }
       if (hasKeys(value, ['startup_error']) && isFixtureObject(value.startup_error) &&
@@ -97,10 +110,9 @@ export function createFixtureTransport(child: FixtureChild, {
       if (id === current.id) {
         if (ok === true && hasKeys(value, ['id', 'ok', 'result']) && isFixtureObject(value.result)) {
           try {
-            const result = current.waiter.decode ? current.waiter.decode(value.result) : value.result;
+            current.waiter.accept(value.result);
             state = { kind: 'idle', nextId: current.id + 1 };
             clearTimeout(current.waiter.timer);
-            current.waiter.resolve(result);
             return;
           } catch {
             fail('Fixture returned an invalid operation result');
@@ -159,7 +171,7 @@ export function createFixtureTransport(child: FixtureChild, {
     });
   });
 
-  async function call(request: FixtureObject, decode?: (value: FixtureObject) => FixtureObject): Promise<FixtureObject> {
+  async function send<T>(request: FixtureRequest | FixtureRejectionCase, decode: (value: FixtureObject) => T): Promise<T> {
     const current = state;
     if (current.kind === 'terminal') throw current.error;
     if (current.kind !== 'idle') throw new Error('Fixture is unavailable or busy');
@@ -170,9 +182,9 @@ export function createFixtureTransport(child: FixtureChild, {
       if (state.kind === 'terminal') throw state.error;
       throw new Error('Fixture is unavailable or busy');
     }
-    return new Promise<FixtureObject>((resolve, reject) => {
+    return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => fail('Fixture operation timed out'), requestTimeoutMs);
-      state = { kind: 'pending', id, waiter: { resolve, reject, timer, decode } };
+      state = { kind: 'pending', id, waiter: { accept: value => resolve(decode(value)), reject, timer } };
       try {
         child.stdin.write(line, error => { if (error) fail('Fixture stdin write failed'); });
       } catch {
@@ -204,10 +216,18 @@ export function createFixtureTransport(child: FixtureChild, {
     throw new Error('Fixture cleanup timed out waiting for child close');
   }
 
-  async function callTyped<O extends FixtureRequest['op']>(request: Extract<FixtureRequest, { op: O }>): Promise<ResultByOp[O]> {
-    const parsed = parseFixtureRequest(request);
-    return call(parsed, value => parseFixtureResult(parsed, value) as FixtureObject) as Promise<ResultByOp[O]>;
+  async function call<R extends FixtureRequest>(request: ExactRequest<R>): Promise<ResultByOp<K>[R['op']]> {
+    assert(request.op !== 'reset' && request.op !== 'stop', 'Controller-only operation');
+    const parsed = parseFixtureRequest<R>(request, surface, kind);
+    return send(parsed, value => contract.result<R>(parsed, value));
   }
 
-  return { ready, call, callTyped, fail, closed, stop: () => stopping ??= close() };
+  async function expectFixtureOperationRejection(request: FixtureRejectionCase) {
+    assert(kind === 'delivery' && surface === 'native', 'Only native delivery exercises malformed requests');
+    // A well-formed request must always take the normal typed path.
+    assert.throws(() => parseFixtureRequest(request, surface, kind));
+    await assert.rejects(send(request, () => { throw new Error('Malformed request was accepted'); }), FixtureOperationError);
+  }
+
+  return { ready, call, expectFixtureOperationRejection, fail, closed, stop: () => stopping ??= close() };
 }
