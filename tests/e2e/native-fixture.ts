@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { insideTaskArtifacts } from '../support/artifact-paths';
+import type { Caller, FixtureReady, NativeRequest } from '../support/fixture-contract';
 import { withControlledFixture } from '../support/fixture-lifecycle';
-import { createFixtureTransport } from '../support/fixture-transport';
+import { createFixtureTransport, type FixtureRejectionCase } from '../support/fixture-transport';
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
@@ -17,12 +18,14 @@ export function record(value: unknown): Record<string, unknown> {
   return value;
 }
 export function text(value: unknown): string { assert(typeof value === 'string' && value.length > 0); return value; }
-type NativeFixture = {
-  fixture: Record<string, unknown>;
+type NativeKind = 'delivery' | 'workspace';
+export type NativeFixture<K extends NativeKind> = {
+  fixture: FixtureReady<K>;
   invitation: string;
-  call(request: Record<string, unknown>): Promise<Record<string, unknown>>;
+  call: Caller<NativeRequest<K>, K>;
+  expectFixtureOperationRejection(request: K extends 'delivery' ? FixtureRejectionCase : never): Promise<void>;
 };
-export async function nativeFixture(kind: 'delivery' | 'workspace', artifacts: string, use: (network: NativeFixture) => Promise<void>): Promise<void> {
+export async function nativeFixture<K extends NativeKind>(kind: K, artifacts: string, use: (network: NativeFixture<K>) => Promise<void>): Promise<void> {
   const binary = process.env.VIBEFACE_E2E_BINARY, crypto = process.env.VIBEFACE_E2E_CRYPTO_MODULE;
   assert(binary && crypto, 'Native acceptance needs the actual Node and its matching WASM');
   await mkdir(artifacts, { recursive: true, mode: 0o700 });
@@ -44,6 +47,7 @@ export async function nativeFixture(kind: 'delivery' | 'workspace', artifacts: s
   if (kind === 'delivery' && process.env.VIBEFACE_E2E_PROFILE_FILE) args.push('--fixture-profile', process.env.VIBEFACE_E2E_PROFILE_FILE);
   const child = spawn('python3', args, { cwd: root, stdio: ['pipe', 'pipe', 'pipe'] });
   const transport = createFixtureTransport(child, {
+    kind, artifacts, origin: `http://127.0.0.1:${address.port}`, surface: 'native',
     requestTimeoutMs: 45000,
     shutdownTimeoutsMs: [30000, 30000, 5000],
   });
@@ -56,7 +60,7 @@ export async function nativeFixture(kind: 'delivery' | 'workspace', artifacts: s
         transport.fail(error.message);
         return error;
       });
-      await use({ fixture: await transport.ready, invitation, call: transport.call });
+      await use({ fixture: await transport.ready, invitation, call: transport.call, expectFixtureOperationRejection: transport.expectFixtureOperationRejection });
     },
     stop: async () => {
       const failures: unknown[] = [];

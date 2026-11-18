@@ -1,11 +1,12 @@
 {
-  "include": ["e2e.config.ts", "e2e.native.config.ts", "*.ts"],
+  "include": ["e2e.config.ts", "e2e.native.config.ts", "*.ts", "../support/fixture-contract.types.ts"],
   "compilerOptions": {
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
     "strict": true,
     "noEmit": true,
+    "allowImportingTsExtensions": true,
     "skipLibCheck": true,
     "types": ["node"]
   }

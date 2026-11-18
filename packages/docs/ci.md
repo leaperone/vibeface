@@ -9,6 +9,12 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 开发分支的 PR 不触发 GitHub Actions，也不要求 CI 状态；需要远端验证时手动运行 `CI / Core`。Actions 只保留核心 CI、发布和部署入口：桌面四平台、Windows native、移动端构建与验收、原生诊断和付费交付实验入口已移除，iOS 模拟器等界面验收不在 CI 中运行。`CI / Core` 由 `main` push、手动运行或 merge queue 触发，不含定时入口。Core、App、CLI、Desktop、Mobile 和 www 各自使用 `<app>-v<version>` Tag 与独立发布入口。Core、App、www 完整发布后自动派发各自服务部署。合并、CI 通过、发布和部署各有自己的验收结果。
 
+## CI 与 preflight 路径登记
+
+`scripts/ci-registry.toml` 集中维护 CI 和 preflight 的路径规则。主路由按顺序取第一个匹配结果，附加规则可为相同路径选择更多检查。登记表也定义 Rust 测试的受影响包和本地进程模式。修改 `crates/protocol/src/` 下的文件会选中协议相关 Rust 测试、Delivery 检查和 Linux 制品的公益交付验证。本地计划会列出 `delivery-charity`，preflight 会构建交付 probe。
+
+登记源的域区段由标准库生成器写入 `.preflight.toml` 的有界区段。使用 `python3 -B scripts/ci_registry.py --check-preflight` 检查字节是否漂移，使用 `python3 -B scripts/ci_registry.py --write-preflight` 按登记源重写该区段。未知路径仍选择完整 CI 计划，混合范围按原有并集规则处理，`scripts/*.sh` 等 preflight 通配符继续使用原 TOML 方言。
+
 ## 按用途选择 Actions 入口
 
 下表描述本分支的工作流定义。新增手动入口需合入默认分支后，才可在 Actions 页面或 CLI 中派发。

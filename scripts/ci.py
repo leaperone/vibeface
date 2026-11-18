@@ -3,6 +3,14 @@
 
 import sys
 sys.dont_write_bytecode = True
+try:
+    import ci_registry
+except ModuleNotFoundError:
+    # The release CLI contract runs a minimal copied `ci.py --help` fixture.
+    # It does not need the registry, and the normal repository entry point has it.
+    if "--help" in sys.argv:
+        raise SystemExit(0)
+    raise
 import release_archive
 import release_context
 import release_format
@@ -22,58 +30,21 @@ import time
 import urllib.request
 
 
-PACKAGES = ("vibeface-protocol", "vibeface-bridge", "vibeface-secure", "vibeface-client", "vibeface-core", "vibeface-control", "vibeface", "vibeface-secure-ffi", "vibeface-delivery")
-DEPENDENTS = {
-    "protocol": ("bridge", "control", "client"),
-    "bridge": ("control", "client"),
-    "secure": ("control", "node", "secure-ffi", "client"),
-    "node": (),
-    "control": ("node", "cli"),
-    "cli": (),
-    "secure-ffi": ("node", "client"),
-    "client": ("node", "cli"),
-    "delivery": ("node",),
-}
-CRATES = {
-    "protocol": "vibeface-protocol",
-    "bridge": "vibeface-bridge",
-    "secure": "vibeface-secure",
-    "client": "vibeface-client",
-    "node": "vibeface-core",
-    "control": "vibeface-control",
-    "cli": "vibeface",
-    "secure-ffi": "vibeface-secure-ffi",
-    "delivery": "vibeface-delivery",
-}
-WEB_UNIT_TEST = re.compile(r"apps/app/src/(?:lib/[^/]+|features/[^/]+/[^/]+)\.test\.ts")
-RELEASE_TOOL_PATHS = ("scripts/release-contract.mjs", "scripts/release-metadata.mjs", "scripts/test-release-contract.mjs",
-                      "scripts/fixtures/release-contract.json", "scripts/build-desktop.mjs", "scripts/verify-desktop.mjs",
-                      "scripts/package-npm.mjs", "scripts/publish-npm.mjs", "scripts/sealed-runtime.mjs")
-PATH_RULES = (
-    ("delivery", ("crates/delivery/*", "crates/delivery/proof/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "apps/core/src/delivery/*", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/net/mesh/record.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/verify-delivery-protected.py", "scripts/verify-delivery-restart-observer.py")),
-    ("full", ('scripts/release_component_identity.py', 'scripts/release_format.py', 'scripts/release_context.py', 'scripts/release_source.py', 'scripts/release_archive.py', 'scripts/release_inventory.py', 'scripts/release_github.py', 'scripts/release_publisher.py', 'scripts/release_assembly.py', "scripts/tests/release/*", "scripts/tests/__init__.py")),
-    ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "crates/control/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
-    ("www", ("apps/www/*",)),
-    ("docs", ("README.md", "README.zh-CN.md", "AGENTS.md", "CLAUDE.md", "packages/docs/*")),
-    ("node", ("config/public-bootstrap.json", "packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts")),
-    ("desktop", ("apps/desktop/src/*", "apps/desktop/tests/*")),
-    ("mobile", ("apps/mobile/*", "packages/secure-native/*")),
-    ("docs", ("tests/e2e/*",)),
-    ("web", ("apps/app/*", "packages/client/*", "packages/theme/*", "packages/uiarc/*", "config/uiarc.json", "scripts/generate-uiarc-theme.py", "scripts/check-uiarc.py", "scripts/check-uiarc-build.mjs", "scripts/check-uiarc-native.cjs", "scripts/vendor-uiarc.py", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/check-web.sh", "scripts/build-web-crypto.sh", "scripts/wasm-bindgen-version.py")),
-    ("protocol", ("crates/protocol/*",)),
-    ("bridge", ("crates/bridge/*",)),
-    ("client", ("crates/client/*",)),
-    ("secure", ("crates/secure/*", "scripts/crypto-client.mjs")),
-    ("secure-ffi", ("crates/secure-ffi/*", "scripts/build-mobile-secure.sh")),
-    ("node", ("apps/core/*", "install.sh", "scripts/package-node.sh", "scripts/package-node-windows.py",
-              "scripts/install-node-service.sh", "scripts/install-node-service.ps1", "scripts/verify-node.py",
-              "scripts/verify-windows-node.py")),
-    ("control", ("crates/control/*",)),
-    ("cli", ("apps/cli/*",)),
+REGISTRY = ci_registry.load_registry()
+
+# Keep the public ordering consumed by workflow outputs and timing summaries.
+RUST_TARGETS = REGISTRY["rust"]
+CRATES = {item["id"]: item["package"] for item in RUST_TARGETS}
+DEPENDENTS = {item["id"]: tuple(item["dependents"]) for item in RUST_TARGETS}
+PACKAGES = tuple(item["package"] for item in RUST_TARGETS)
+
+RELEASE_TOOL_PATHS = REGISTRY["paths"]["release_tools"]
+NODE_PROCESS_PATTERNS = tuple(
+    pattern
+    for rule in REGISTRY["primary"]
+    if "node" in rule["scopes"] and "paths" in rule
+    for pattern in rule["patterns"]
 )
-WWW_PATHS = ("apps/www/*", "packages/docs/*", "packages/theme/*", "packages/uiarc/src/foundation.css", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
-MOBILE_PATHS = ("packages/client/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
-DESKTOP_PATHS = ("package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
 SLOW_TESTS = (
     "runtime::peers::tests::a_round_left_behind_pulls_again_without_waiting_for_hello",
 )
@@ -84,27 +55,34 @@ PLATFORMS = (
     {"runner": "windows-2025", "target": "x86_64-pc-windows-msvc"},
 )
 JOBS = ("quick-check", "crypto-web", "web", "web-tests", "mobile-check", "desktop-check", "rust-check", "rust-fast", "rust-slow", "delivery", "package", "npm-package", "npm-smoke", "www")
-LOCAL_PROCESS_RULES = (
-    ("memory-sync", ("apps/core/src/store/bot_settings.rs", "apps/core/src/store/reduce.rs", "apps/core/src/store/log.rs", "apps/core/src/store/sync.rs", "apps/core/src/agent_context.rs", "apps/core/src/identity*", "crates/secure/*")),
-    ("auto-route", ("config/public-bootstrap.json", "apps/core/src/identity*", "apps/core/src/crypto.rs", "apps/core/src/local_access.rs", "apps/core/src/net*", "crates/secure/*", "crates/control/*")),
-    ("default", ("config/public-bootstrap.json", "apps/core/src/net*", "apps/core/src/runtime/peers.rs", "apps/core/src/store/sync.rs", "apps/core/src/store/log.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/fetch.rs", "apps/core/src/identity*", "crates/secure/*")),
-    ("phase1", ("apps/core/src/manager.rs", "apps/core/src/schedul*", "apps/core/src/work.rs", "apps/core/src/runtime/work.rs", "apps/core/src/runtime/followup.rs", "apps/core/src/runtime/schedule_delivery.rs", "apps/core/src/runtime/manager_control.rs", "apps/core/src/store/work.rs", "apps/core/src/store/scheduler.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/reduce.rs", "apps/core/src/store/log.rs")),
-    ("chat-agent", ("crates/bridge/*", "crates/control/*", "apps/cli/*", "apps/core/src/runtime/codex_server.rs", "apps/core/src/runtime/claude.rs", "apps/core/src/runtime/pi.rs", "apps/core/src/runtime/opencode.rs", "apps/core/src/runtime/provider_adapter.rs", "apps/core/src/runtime/provider_probe.rs", "apps/core/src/runtime/agent_tools.rs", "apps/core/src/runtime/chat_controls.rs", "apps/core/src/runtime/executor.rs", "apps/core/src/runtime/observation.rs", "apps/core/src/runtime/triage.rs", "apps/core/src/runtime/work.rs", "apps/core/src/runtime/followup.rs", "apps/core/src/runtime/bots.rs", "apps/core/src/runtime/manager_control.rs", "apps/core/src/agent_context.rs", "apps/core/src/providers.rs", "apps/core/src/triage.rs", "apps/core/src/tools.rs", "apps/core/src/work.rs", "apps/core/src/manager.rs", "apps/core/src/control.rs", "apps/core/src/store/triage.rs", "apps/core/src/store/questions.rs", "apps/core/src/store/work.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/bots.rs")),
-    ("phase4", ("crates/bridge/*", "crates/control/*", "apps/core/src/net*", "apps/core/src/runtime/peers.rs", "apps/core/src/runtime/work.rs", "apps/core/src/runtime/agent_tools.rs", "apps/core/src/runtime/manager_control.rs", "apps/core/src/work.rs", "apps/core/src/tools.rs", "apps/core/src/store/work.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/sync.rs", "apps/core/src/store/bots.rs", "apps/core/src/identity*", "apps/core/src/fetch.rs")),
-    ("public-node", ("config/public-bootstrap.json", "apps/core/src/net*", "apps/core/src/runtime/peers.rs", "apps/core/src/identity*", "apps/core/src/local_access.rs", "apps/core/src/crypto.rs", "crates/control/*")),
-    ("mesh", ("config/public-bootstrap.json", "apps/core/src/net*", "apps/core/src/runtime/peers.rs")),
-    ("phase5", ("apps/core/src/store/*", "apps/core/src/identity*", "apps/core/src/maintenance.rs", "apps/core/src/logging.rs", "crates/control/*", "crates/secure/src/recovery.rs")),
-    ("delivery-charity", PATH_RULES[0][1]),
-)
+LOCAL_PROCESS_RULES = tuple((item["id"], item["patterns"]) for item in REGISTRY["process"])
+ORDINARY_PROCESS_MODES = {item["id"] for item in REGISTRY["process"] if item.get("ordinary", True)}
+
+
+def primary_scopes(path):
+    for rule in REGISTRY["primary"]:
+        matched = False
+        if "exact" in rule:
+            matched = path in rule["exact"]
+        elif "regex" in rule:
+            matched = rule["regex"].fullmatch(path) is not None
+        elif "prefix" in rule:
+            suffixes = tuple(rule.get("suffix", ()))
+            matched = path.startswith(rule["prefix"]) and (not suffixes or path.endswith(suffixes))
+        else:
+            matched = any(fnmatch.fnmatchcase(path, pattern) for pattern in rule["patterns"])
+        if matched:
+            return tuple(rule["scopes"])
+    return ("full",)
 
 
 def local_process_modes(paths, full):
-    ordinary = {mode for mode, _ in LOCAL_PROCESS_RULES if mode != "delivery-charity"}
+    ordinary = ORDINARY_PROCESS_MODES
     selected = {mode for mode, _ in LOCAL_PROCESS_RULES} if full else set()
     for path in paths:
         matched = {mode for mode, patterns in LOCAL_PROCESS_RULES if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)}
         selected.update(matched)
-        if not matched & ordinary and (path.startswith(("apps/core/", "apps/cli/", "crates/")) or any(fnmatch.fnmatchcase(path, pattern) for scope, patterns in PATH_RULES if scope == "node" for pattern in patterns)):
+        if not matched & ordinary and (path.startswith(("apps/core/", "apps/cli/", "crates/")) or any(fnmatch.fnmatchcase(path, pattern) for pattern in NODE_PROCESS_PATTERNS)):
             selected.update(ordinary)
     return [mode for mode, _ in LOCAL_PROCESS_RULES if mode in selected]
 
@@ -112,29 +90,17 @@ def local_process_modes(paths, full):
 def make_plan(paths, event="pull_request", ref_type="branch", channel="hourly", *, package_policy="standard"):
     scopes = set()
     for path in paths:
-        if path in RELEASE_TOOL_PATHS:
-            scopes.add("release-tools")
-        elif path in ("apps/core/extensions/generated/pi.ts", "apps/core/extensions/generated/opencode.ts"):
-            scopes.update(("node", "cli"))
-        elif WEB_UNIT_TEST.fullmatch(path):
-            scopes.add("web-tests")
-        elif path.startswith("apps/app/") and path.endswith((".test.ts", ".test.tsx")):
-            scopes.add("full")
-        else:
-            scopes.add(next((scope for scope, patterns in PATH_RULES if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)), "full"))
-        if any(fnmatch.fnmatchcase(path, pattern) for pattern in WWW_PATHS):
-            scopes.add("www")
-        if any(fnmatch.fnmatchcase(path, pattern) for pattern in MOBILE_PATHS):
-            scopes.add("mobile")
-        if any(fnmatch.fnmatchcase(path, pattern) for pattern in DESKTOP_PATHS):
-            scopes.add("desktop")
+        scopes.update(primary_scopes(path))
+        for rule in REGISTRY["overlay"]:
+            if any(fnmatch.fnmatchcase(path, pattern) for pattern in rule["patterns"]):
+                scopes.update(rule["scopes"])
     plan = scope_plan(scopes, event, ref_type, channel, package_policy=package_policy)
     return dict(plan, changed_files=len(paths), local_process_modes=local_process_modes(paths, plan["full"]))
 
 
 def scope_plan(scopes, event, ref_type, channel, *, package_policy="standard"):
     if (
-        scopes - {"full", "docs", "release-tools", "web", "web-tests", "www", "mobile", "desktop", *DEPENDENTS}
+        scopes - REGISTRY["scopes"]
         or event not in {"pull_request", "push", "schedule", "workflow_dispatch", "merge_group"}
         or ref_type not in {"branch", "tag"}
         or channel not in {"stable", "rc", "hourly"}
@@ -161,7 +127,7 @@ def scope_plan(scopes, event, ref_type, channel, *, package_policy="standard"):
     mobile = full or "mobile" in scopes
     desktop = full or "desktop" in scopes or bool(affected & {"client"})
     slow = "node" in affected and extended
-    delivery = full or "delivery" in affected
+    delivery = full or "delivery" in affected or "delivery-acceptance" in scopes
     platforms = PLATFORMS if "node" in affected and extended and package_policy == "standard" else PLATFORMS[:1]
     plan = {
         "full": full,
@@ -517,6 +483,8 @@ def run_check(packages, msrv=None):
 def self_test():
     from unittest.mock import patch
     focused_self_test()
+    with patch.dict(REGISTRY, {"overlay": [{"patterns": ("README.md",), "scopes": ("desktop",)}]}):
+        assert make_plan(["README.md"])["scopes"] == ["desktop", "docs"]
     web = make_plan(["apps/app/src/routes/index.tsx"])
     assert web["rust_packages"] == [] and web["test_tiers"] == []
     assert web["required_jobs"] == ["quick-check", "crypto-web", "web", "package"]
@@ -527,6 +495,16 @@ def self_test():
         selected = make_plan([path])
         assert "delivery" in selected["scopes"] and {"quick-check","delivery"}.issubset(selected["required_jobs"])
         assert "delivery-charity" in selected["local_process_modes"]
+    for path in (
+        "crates/protocol/src/lib.rs", "crates/protocol/src/delivery.rs",
+        "crates/protocol/src/delivery/request.rs", "crates/protocol/src/delivery/schema.json",
+    ):
+        selected = make_plan([path])
+        assert selected["scopes"] == ["delivery-acceptance", "protocol"]
+        assert selected["delivery"] and "delivery" in selected["required_jobs"]
+        assert selected["local_process_modes"] == list(dict(LOCAL_PROCESS_RULES))
+        assert selected["rust_packages"] == ["vibeface-protocol", "vibeface-bridge", "vibeface-client",
+                                             "vibeface-core", "vibeface-control", "vibeface"]
     bootstrap = make_plan(["config/public-bootstrap.json"])
     assert bootstrap["rust_packages"] == ["vibeface-core"] and bootstrap["web"]
     assert bootstrap["local_process_modes"] == ["auto-route", "default", "public-node", "mesh"]
@@ -595,7 +573,7 @@ def self_test():
         assert make_plan([path])["local_process_modes"] == modes, path
     combined = make_plan(["apps/core/src/store/bot_settings.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/bot_settings.rs"])
     assert combined["local_process_modes"] == ["memory-sync", "default", "phase1", "chat-agent", "phase4", "phase5"]
-    for path in ("apps/core/src/store.rs", "apps/core/src/model.rs", "apps/core/new-module.rs", "apps/core/src/runtime/new-module.rs", "crates/protocol/src/lib.rs"):
+    for path in ("apps/core/src/store.rs", "apps/core/src/model.rs", "apps/core/new-module.rs", "apps/core/src/runtime/new-module.rs"):
         assert make_plan([path])["local_process_modes"] == ["memory-sync", "auto-route", "default", "phase1", "chat-agent", "phase4", "public-node", "mesh", "phase5"]
     assert make_plan(["Cargo.lock"])["local_process_modes"] == ["memory-sync", "auto-route", "default", "phase1", "chat-agent", "phase4", "public-node", "mesh", "phase5", "delivery-charity"]
     assert make_plan(["apps/core/src/delivery/charity.rs"])["local_process_modes"][-1] == "delivery-charity"
