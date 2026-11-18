@@ -92,6 +92,12 @@ Use `verify_peer()` for the separate Charity key certificate and `validate_recei
 
 Charity uses the same C and E byte layouts and zeroized random material as paid delivery. Its fee fields are always zero. Limits remain 64 KiB per window, 16 windows and 1 MiB total as protocol bounds, not measured service capacity. AEAD, HPKE info, HPKE AAD and plaintext-commitment labels are respectively `vibeface-delivery-charity-data-v1`, `vibeface-delivery-charity-hpke-info-v1`, `vibeface-delivery-charity-hpke-aad-v1`, and `vibeface-delivery-charity-plain-v1`. The canonical context tuple remains label hash, context digest, uint16 index, uint64 offset and uint32 plaintext length. This API has no chain calls or proof acceptance and must display signature receipt strength only.
 
+## Paid session receipt relation
+
+The paid session receipt is distinct from a charity storage receipt and from file recoverability. Its signature uses `bot-session-paid-stored-v1` and binds the charge, deadline, receiver, relay, sealed object and logical order. The payer must reserve the exact terms commitment before service. The order ID binds the deployment, budget and opaque delivery identifier without depending on the randomized ciphertext; retrying an order must reuse its delivery identifier.
+
+`verify_session_settlement` validates 1–16 receiver signatures for a single deployment, budget and relay. Claims must be sorted by their distinct order IDs. It returns a commitment to the ordered reservation commitments, the total amount and the earliest claim deadline. A settlement program still has to check the matching funded reservations, deadline against chain time and unused order IDs, then consume the orders and credit the fixed relay atomically. This relation currently runs in native Rust; no guest, contract or paid Node path invokes it.
+
 ## Commands
 
 Native checks from the task worktree.
