@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::{
     io::Write as _,
     path::{Path, PathBuf},
@@ -127,41 +127,79 @@ impl LocalHttpCredential {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ControlResponse {
-    pub ok: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+#[derive(Debug, Clone)]
+pub enum ControlResponse {
+    Success(Map<String, Value>),
+    Failure(String),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(
+    deny_unknown_fields,
+    bound(deserialize = "R: Deserialize<'de>, E: Deserialize<'de>")
+)]
+struct ControlWireResponse<R, E> {
+    ok: bool,
+    #[serde(
+        default,
+        deserialize_with = "present_control_field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    result: Option<R>,
+    #[serde(
+        default,
+        deserialize_with = "present_control_field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    error: Option<E>,
+}
+
+// The field's own type handles explicit null. An omitted field alone becomes None.
+fn present_control_field<'de, D, T>(decoder: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(decoder).map(Some)
+}
+
+impl Serialize for ControlResponse {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let wire = match self {
+            Self::Success(result) => ControlWireResponse {
+                ok: true,
+                result: Some(result),
+                error: None,
+            },
+            Self::Failure(error) => ControlWireResponse {
+                ok: false,
+                result: None,
+                error: Some(error.as_str()),
+            },
+        };
+        wire.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ControlResponse {
+    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        let wire = ControlWireResponse::<Map<String, Value>, String>::deserialize(decoder)?;
+        match (wire.ok, wire.result, wire.error) {
+            (true, Some(result), None) => Ok(Self::Success(result)),
+            (false, None, Some(error)) => Ok(Self::Failure(error)),
+            _ => Err(serde::de::Error::custom(
+                "core control response must carry exactly one matching payload",
+            )),
+        }
+    }
 }
 
 impl ControlResponse {
-    pub fn success(result: impl Into<Value>) -> Self {
-        Self {
-            ok: true,
-            result: Some(result.into()),
-            error: None,
-        }
-    }
-
-    pub fn failure(error: impl Into<String>) -> Self {
-        Self {
-            ok: false,
-            result: None,
-            error: Some(error.into()),
-        }
-    }
-
     pub fn into_result(self) -> Result<Value> {
-        if self.ok {
-            return Ok(self.result.unwrap_or(Value::Null));
+        match self {
+            Self::Success(result) => Ok(Value::Object(result)),
+            Self::Failure(error) => bail!(error),
         }
-        bail!(
-            self.error
-                .unwrap_or_else(|| "core control request failed".into())
-        )
     }
 }
 
@@ -314,6 +352,43 @@ pub mod tool_receipt;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_response_has_one_matching_wire_payload() -> Result<()> {
+        for text in [
+            r#"{"ok":true,"result":{}}"#,
+            r#"{"ok":true,"result":{"state":"running"}}"#,
+            r#"{"ok":false,"error":"not initialized"}"#,
+        ] {
+            let reply = serde_json::from_str::<ControlResponse>(text)?;
+            assert_eq!(serde_json::to_string(&reply)?, text);
+        }
+        for text in [
+            r#"{"result":{}}"#,
+            r#"{"ok":"true","result":{}}"#,
+            r#"{"ok":true}"#,
+            r#"{"ok":true,"result":null}"#,
+            r#"{"ok":true,"result":[]}"#,
+            r#"{"ok":true,"result":false}"#,
+            r#"{"ok":true,"result":{},"error":null}"#,
+            r#"{"ok":true,"result":{},"error":"contradiction"}"#,
+            r#"{"ok":false}"#,
+            r#"{"ok":false,"error":null}"#,
+            r#"{"ok":false,"error":5}"#,
+            r#"{"ok":false,"result":null,"error":"contradiction"}"#,
+            r#"{"ok":false,"result":{},"error":"contradiction"}"#,
+            r#"{"ok":true,"ok":true,"result":{}}"#,
+            r#"{"ok":true,"result":{},"result":{}}"#,
+            r#"{"ok":false,"error":"one","error":"two"}"#,
+            r#"{"ok":true,"result":{},"extra":1}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ControlResponse>(text).is_err(),
+                "{text}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn discover_local_nodes_control_request_has_a_strict_wire_shape() -> Result<()> {
