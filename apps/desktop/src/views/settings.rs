@@ -29,20 +29,12 @@ fn order_fee_authorization_label(order: &TransferOrder) -> String {
 
 impl Desktop {
     pub(crate) fn devices(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut page = self
-            .page()
-            .child(self.button(
-                "invite",
-                "生成邀请",
-                Command::Identity(IdentityAction::Invite),
-                cx,
-            ))
-            .child(self.button(
-                "join-requests",
-                "读取加入请求",
-                Command::Identity(IdentityAction::Requests),
-                cx,
-            ));
+        let mut page = self.page().child(self.button(
+            "invite",
+            "生成邀请",
+            Command::Identity(IdentityAction::Invite),
+            cx,
+        ));
         for member in &self.snapshot.members {
             let mut row = self.row(
                 member.name.clone(),
@@ -87,22 +79,34 @@ impl Desktop {
             }
             page = page.child(row);
         }
+        page = page.child(self.button(
+            "join-requests",
+            "刷新加入请求",
+            Command::Identity(IdentityAction::Requests),
+            cx,
+        ));
         for join in &self.snapshot.joins {
+            let comparison = join.comparison(self.snapshot.client_id.as_deref());
             let mut row = self.row(
                 join.name.clone(),
-                join.code
-                    .as_ref()
-                    .map(|code| format!("核对短码：{code}"))
-                    .unwrap_or_else(|| "先发送核对请求，再在两台设备比较短码。".into()),
+                match comparison {
+                    JoinComparison::Pending => "在两台设备上核对短码后，再允许加入。".into(),
+                    JoinComparison::Waiting => {
+                        "短码尚未显示。请在新设备打开加入页面，再点击「刷新加入请求」。".into()
+                    }
+                    JoinComparison::OtherManager => "正在另一台管理设备上核对短码。".into(),
+                    JoinComparison::Code(code) => format!("核对短码：{code}"),
+                    JoinComparison::Unavailable => "请刷新加入请求，确认当前核对状态。".into(),
+                },
             );
-            if join.code.is_none() {
+            if comparison == JoinComparison::Pending {
                 row = row.child(self.button(
                     SharedString::from(format!("join-confirm-{}", join.join_id)),
                     "开始短码核对",
                     Command::Identity(IdentityAction::ConfirmJoin(join.join_id.clone())),
                     cx,
                 ));
-            } else {
+            } else if matches!(comparison, JoinComparison::Code(_)) {
                 row = row
                     .child(self.ask(
                         SharedString::from(format!("join-grant-{}", join.join_id)),

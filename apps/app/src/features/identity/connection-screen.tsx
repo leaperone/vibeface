@@ -441,11 +441,17 @@ function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
 function BrowserJoin() {
   const device = useDevice()
   const joining = device.joining!
-  return <Panel icon={Hourglass} title="等待批准">
-    {device.info ? <Reached /> : null}
-    <JoinCode code={joining.code} admin={joining.admin} />
-    {device.phase === 'reconnecting' ? <p role="status" className="flex items-center gap-2 text-sm text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />正在重连，请求还在</p> : null}
-    <Button type="button" variant="ghost" className="-ms-3 w-fit" onClick={device.cancelJoin}>取消</Button>
+  const reconnecting = device.phase === 'reconnecting' || device.phase === 'disconnected'
+  const checking = joining.status === 'checking', awaitingAcceptance = joining.status === 'pending'
+  return <Panel icon={Hourglass} title={checking ? joinCopy.joining : awaitingAcceptance ? joinCopy.acceptOnManager : joinCopy.waiting}>
+    {checking || awaitingAcceptance
+      ? <p role="status" className="text-secondary">{checking ? joinCopy.checkingDelivery : joinCopy.acceptOnManagerHint}</p>
+      : <JoinCode code={joining.code} admin={joining.admin} />}
+    {reconnecting ? <>
+      <p role="status" className="flex items-center gap-2 text-sm text-info"><LoaderCircle aria-hidden="true" className="size-4 shrink-0 animate-spin" />{joinCopy.reconnecting}</p>
+      <p className="text-sm text-secondary">{joinCopy.offlineExit}</p>
+    </> : null}
+    <Button type="button" variant="ghost" className="-ms-3 w-fit" onClick={device.cancelJoin}>{joinCopy.stopWaiting}</Button>
     <Details><CopyDiagnostics lines={[['这个浏览器', device.identity?.deviceId], ['加入请求', joining.join_id]]} /></Details>
   </Panel>
 }

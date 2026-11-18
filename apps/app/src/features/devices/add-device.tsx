@@ -14,10 +14,10 @@ import { CircleAlert,CircleCheck,Clock,Copy,Download,Laptop,Link2,Plus,Smartphon
 import { useEffect,useMemo,useRef,useState } from "react"
 import { JoinRequests,useOpenJoins,type Added } from "./join"
 
-type Share = Invitation & { qr: QrCodeResult }
+type Share = Invitation & { qr: QrCodeResult; asManager: boolean }
 
-function share(invitation: Invitation): Share {
-  return { ...invitation, qr: encodeQrCode(invitation.link) }
+function share(invitation: Invitation, asManager: boolean): Share {
+  return { ...invitation, qr: encodeQrCode(invitation.link), asManager }
 }
 
 const kinds = [{ value: "phone", label: addDeviceCopy.client, icon: Smartphone }, { value: "computer", label: addDeviceCopy.node, icon: Laptop }] as const
@@ -41,7 +41,6 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
   const busy = busyGeneration === generation
   const pending = useRef<number | null>(null)
   const [error, setError] = useState("")
-  const [status, setStatus] = useState("")
   // This page allowed the device, so it says so where the link was rather than only in a toast.
   const [added, setAdded] = useState<Added | null>(null)
   // What 链接原文 shows: the last thing someone tried to copy.
@@ -50,69 +49,76 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
   // A join request is the next thing to act on, so it takes the only solid button.
   const joins = useOpenJoins()
   const requests = joins.length > 0
-  // A link is single-use: once a device has answered it, it is spent. Requests already open when it was made are not that answer.
-  const [used, setUsed] = useState(false)
-  const earlier = useRef<Set<string>>(new Set())
-  const answered = result !== null && joins.some((request) => !earlier.current.has(request.join_id))
-  useEffect(() => { if (answered) setUsed(true) }, [answered])
-  useEffect(() => { setResult(null); setError(""); setStatus(""); setAdded(null) }, [ready])
-  // A new request, an answer or a new link is a new state; an old failure would read as part of it.
-  const joinIds = joins.map((request) => request.join_id).join()
-  const copyScope = useMemo(() => ({ ready, generation, open, result, kind, joinIds, used }), [ready, generation, open, result, kind, joinIds, used])
-  const clipboard = useClipboard(copyScope, { isCurrent: () => ready?.isCurrent() === true && device.connectionGeneration() === generation })
+  const answered = result !== null && joins.some((request) => request.invite_id === result.inviteId)
+  const [usedInviteId, setUsedInviteId] = useState<string | null>(null)
+  const used = result !== null && (answered || usedInviteId === result.inviteId)
+  useEffect(() => { if (answered && result) setUsedInviteId(result.inviteId) }, [answered, result])
+  useEffect(() => { setResult(null); setError(""); setAdded(null) }, [ready])
+  // Rerender at the deadline. The displayed result owns the timer.
+  const [, refreshExpiry] = useState(0)
+  const expired = result !== null && Date.now() >= result.expiresAt
+  const available = result !== null && !used && !expired
+  useEffect(() => {
+    if (!open || !result || expired) return
+    const timer = setTimeout(() => refreshExpiry((tick) => tick + 1), result.expiresAt - Date.now())
+    return () => clearTimeout(timer)
+  }, [open, result, expired])
+  const copyScope = useMemo(() => ({ ready, generation, open, result, kind, available }), [ready, generation, open, result, kind, available])
+  const clipboard = useClipboard(copyScope, { isCurrent: () => available && Date.now() < result.expiresAt && ready?.isCurrent() === true && device.connectionGeneration() === generation })
+  const copyPending = useRef<typeof copyScope | null>(null)
   const copied = clipboard.state.status === "copied" ? clipboard.state.key : null
   const copyFailed = clipboard.failed
-  useEffect(() => { setError("") }, [joinIds])
   // While a link is out, look for the new device's request more often than the shell does.
   useEffect(() => {
-    if (!result) return
+    if (!open || !available) return
     const timer = setInterval(() => { device.refreshDirectory().catch(() => {}) }, 3000)
     return () => clearInterval(timer)
-  }, [result, ready])
+  }, [open, available, result, ready])
 
-  // Bound to the connection generation so a late clipboard or invite can't release a newer action.
-  async function run(action: () => Promise<void>, success: string) {
+  // Bound to the connection generation so a late invite can't release a newer action.
+  async function generate(manager = asManager) {
     if (pending.current === generation) return
     pending.current = generation
     const connection = ready
-    setBusyGeneration(generation); setError(""); setStatus("")
-    try { await action(); if (connection?.isCurrent()) setStatus(success) }
+    setResult(null); setAdded(null); setShown("link")
+    setBusyGeneration(generation); setError("")
+    try {
+      const invitation = await device.createInvitation()
+      if (connection?.isCurrent()) setResult(share(invitation, manager))
+    }
     catch (cause) { if (connection?.isCurrent()) setError(messageOf(cause)) }
     finally { if (pending.current === generation) pending.current = null; setBusyGeneration((owner) => owner === generation ? null : owner) }
   }
-  const generate = () => { earlier.current = new Set(joins.map((request) => request.join_id)); setResult(null); setUsed(false); setAdded(null); void run(async () => {
-    const connection = ready
-    const invitation = await device.createInvitation()
-    if (connection?.isCurrent()) setResult(share(invitation))
-  }, "") }
-  // A clipboard refusal is the browser's, not a file permission, so it skips the shared error wording.
-  const copy = (what: "link" | "command", value: string) => { void run(async () => {
+  const copy = async (what: "link" | "command", value: string) => {
+    if (!available || Date.now() >= result.expiresAt || copyPending.current === copyScope) return
+    copyPending.current = copyScope
     setShown(what)
-    await clipboard.copy(value, what)
-  }, "") }
+    try { await clipboard.copy(value, what) }
+    finally { if (copyPending.current === copyScope) copyPending.current = null }
+  }
   const raw = useRef<HTMLTextAreaElement>(null)
   useEffect(() => { if (copyFailed) { raw.current?.focus(); raw.current?.select() } }, [copyFailed, clipboard.state])
-  const copyButton = (what: "link" | "command", value: string, label: string, solid: boolean) => <Button type="button" variant={solid && !requests ? "primary" : "secondary"} className="w-fit" disabled={busy} onClick={() => copy(what, value)}>
+  const copyButton = (what: "link" | "command", value: string, label: string, solid: boolean) => <Button type="button" variant={solid && !requests ? "primary" : "secondary"} className="w-fit" disabled={busy || clipboard.state.status === "pending"} onClick={() => void copy(what, value)}>
     {copied === what ? <CircleCheck aria-hidden="true" /> : <Copy aria-hidden="true" />}{copied === what ? "已复制" : label}
   </Button>
-  const show = () => {
+  const show = (manager = asManager) => {
     // Capture before opening: programmatic search links need the same return path as the button.
     if (!open) opener.current = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement : null
     setOpen(true)
-    if (!result && !requests) generate()
+    if (!result && !requests) void generate(manager)
   }
   useEffect(() => {
     if (!opening || !ready?.principal.can_manage) return
     setKind(opening)
     setAsManager(Boolean(manage))
-    show()
+    show(Boolean(manage))
     onOpened?.()
   }, [opening, ready])
   if (!ready?.principal.can_manage) return null
 
   return <Drawer open={open} onOpenChange={(next) => { setOpen(next); if (!next) { clipboard.reset(); setAdded(null); setAsManager(false) } }}>
     <PageActions>
-      <DrawerTrigger asChild><Button type="button" variant={requests ? "secondary" : "primary"} onClick={show}><Plus aria-hidden="true" />添加设备</Button></DrawerTrigger>
+      <DrawerTrigger asChild><Button type="button" variant={requests ? "secondary" : "primary"} onClick={() => show()}><Plus aria-hidden="true" />添加设备</Button></DrawerTrigger>
     </PageActions>
       {/* A waiting request leads the sheet; its first control is 设为管理设备, which should not take focus on its own. */}
       <DrawerContent title="添加设备" description="在新设备上打开链接，安全码一致后允许" className="!w-full max-sm:!border-l-0 overflow-y-auto sm:!max-w-md" onOpenAutoFocus={(event) => { if (requests) { event.preventDefault(); if (event.target instanceof HTMLElement) event.target.focus() } }} onCloseAutoFocus={(event) => {
@@ -123,15 +129,23 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
       }}>
         <div className="grid gap-6 pb-[env(safe-area-inset-bottom)]">
           {/* A device already asking is the next thing to act on, so it comes before a new link. */}
-          <JoinRequests issuing={result !== null} manage={asManager} onAllowed={(device) => { setAdded(device); setAsManager(false); setResult(null); setError("") }} />
+          <JoinRequests inviteId={open ? result?.inviteId : undefined} manage={asManager && result?.asManager} onAllowed={(addedDevice, inviteId) => {
+            if (!ready.isCurrent()) return
+            setAdded(addedDevice)
+            setResult((current) => current?.inviteId === inviteId ? null : current)
+          }} />
           {added && !requests ? <div className="grid gap-3">
             <p role="status" className="flex min-w-0 items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" /><span className="truncate" title={added.name}>{added.manage ? deviceCopy.addedManager(added.name) : `已添加「${added.name}」`}</span></p>
             <div className="flex flex-wrap gap-2">
               {added.kind === "node" ? <RoutedAction to="/devices/$deviceId" params={{ deviceId: added.id }} onClick={() => setOpen(false)}><terms.ai.icon aria-hidden="true" />{addDeviceCopy.setUpAi}</RoutedAction> : null}
-              <Button type="button" variant={added.kind === "node" ? "secondary" : "primary"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Plus} />{addDeviceCopy.addAnother}</Button>
+              {!result || (used && !expired) ? <Button type="button" variant={added.kind === "node" ? "secondary" : "primary"} className="w-fit" disabled={busy} onClick={() => void generate(false)}><BusyIcon busy={busy} icon={Plus} />{addDeviceCopy.addAnother}</Button> : null}
             </div>
-          </div> : !result || (used && !requests) ? <Button type="button" variant={requests ? "secondary" : "primary"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Link2} />生成链接</Button> : null}
-          {result && !used ? <div className="grid gap-3">
+          </div> : !result || (used && !requests && !expired) ? <Button type="button" variant={requests ? "secondary" : "primary"} className="w-fit" disabled={busy} onClick={() => void generate()}><BusyIcon busy={busy} icon={Link2} />生成链接</Button> : null}
+          {expired ? <div className="grid gap-2">
+            <p role="status" className="text-sm text-secondary">链接已过期</p>
+            <Button type="button" variant={requests ? "secondary" : "primary"} className="w-fit" disabled={busy} onClick={() => void generate()}><BusyIcon busy={busy} icon={Link2} />重新生成链接</Button>
+          </div> : null}
+          {available ? <div className="grid gap-3">
             <Segmented label="新设备是" labels fill value={kind} options={[...kinds]} onChange={(next) => { setKind(next); clipboard.reset(); setError(""); setShown("link") }} />
             {kind === "phone" ? <>
               <p className="text-sm text-secondary">{addDeviceCopy.clientHint}</p>
@@ -163,7 +177,6 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
               <Textarea label="链接原文" ref={raw} readOnly aria-label="链接原文" className="font-mono" value={shown === "command" ? addDeviceCopy.command(result.link) : result.link} onFocus={(event) => event.target.select()} />
             </Details>
           </div> : null}
-          {status ? <p role="status" className="text-sm text-success">{status}</p> : null}
           <InlineError error={error || null} />
         </div>
       </DrawerContent>

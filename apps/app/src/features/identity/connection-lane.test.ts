@@ -10,6 +10,7 @@ import { canonical } from '@vibeface/client/lib/node.ts'
 import type { Platform } from '@vibeface/client/lib/platform.ts'
 import { primaryLane, shouldAutoConnect } from '@vibeface/client/identity/connection-lane.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
+import { spentInviteText } from '@vibeface/client/lib/errors.ts'
 import { joinLink, joinTicket } from '@vibeface/client/lib/transport.ts'
 import { hookHarness, moduleLoader } from '../../lib/test-harness.ts'
 
@@ -129,6 +130,7 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
         if (method === 'authenticate') { initialized = true; authorized = true }
         if (method === 'local_access') { localState.enabled = false; return { enabled: false } }
         if (method === 'join_check' || method === 'node_join_check') return { invite: inviteState.value }
+        if (method === 'invite') return { entry: 'fixture-entry' }
         if (method === 'join') return joinRequest('pending', { device_id: params.public_key })
         if (method === 'join_status' && !params.join_id) return { requests: managed.value }
         if (method === 'approve') return joinRequest('confirming', { device_id: remote, admin_id: subject, admin_nonce: params.admin_nonce })
@@ -190,7 +192,10 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
   const Provider = load(resolve(clientRoot, 'identity/context.tsx')).DeviceProvider
   const platform = {
     reserveDeliveryIntent: async () => { throw new Error('unexpected delivery reservation') },
-    secure: { verify(rootKey: string, domain: string, _payload: Uint8Array, signature: string) { assert.equal(rootKey, network); assert.equal(domain, 'identity-recovery'); assert.equal(signature, '3'.repeat(128)) } }, transport, storage: sandbox.localStorage, page: load(resolve(sourceRoot, 'lib/local-page.ts')).localPage, self: '这个浏览器', saveRecovery(_bytes: Uint8Array, _name: string) {}, recoveryStorage: undefined as Platform['recoveryStorage'], joinTabs: undefined as Platform['joinTabs'], erase: undefined as Platform['erase'] }
+    secure: {
+      ticketDecode: () => JSON.stringify({ entry_id: target, invite_id: inviteId }),
+      verify(rootKey: string, domain: string, _payload: Uint8Array, signature: string) { assert.equal(rootKey, network); assert.equal(domain, 'identity-recovery'); assert.equal(signature, '3'.repeat(128)) },
+    }, transport, storage: sandbox.localStorage, page: load(resolve(sourceRoot, 'lib/local-page.ts')).localPage, self: '这个浏览器', saveRecovery(_bytes: Uint8Array, _name: string) {}, recoveryStorage: undefined as Platform['recoveryStorage'], joinTabs: undefined as Platform['joinTabs'], erase: undefined as Platform['erase'] }
   let tabReceive: ((serialized: string) => void) | undefined
   const enableTabs = () => { platform.joinTabs = (_name, handlers) => { tabReceive = value => handlers.message(JSON.parse(value)); const stop = handlers.lead(); return { post() {}, close() { tabReceive = undefined; stop?.() } } } }
   let restarts = 0
@@ -916,10 +921,28 @@ test('a lost first join receipt reopens the original Node only to check the dura
     app.holds.delete('join_status')
     await app.render().checkJoin()
     assert.equal(app.render().joining?.status, 'pending')
+    assert.equal(app.render().error, '', 'a successful status check clears the connection error')
     assert.equal(app.render().joining?.nonce, nonce)
     assert.deepEqual(app.sockets.map(socket => socket.entry.device_id), [target, target])
     assert.equal(app.requests.filter(request => request.method === 'join').length, 1)
     assert.ok(app.requests.filter(request => request.method === 'join_status').every(request => request.params.join_id === inviteId && !('reveal' in request.params)))
+  } finally { app.close() }
+})
+
+for (const refusal of ['ticket has expired', 'ticket has already been used']) test(`a confirmed join refusal clears the saved intent when ${refusal}`, async () => {
+  const app = deviceHarness(), send = deferred()
+  app.holds.set('join', send)
+  try {
+    app.render(); await settle()
+    const joining = assert.rejects(app.render().join('vibeface://join/vibeface1ticket', 'browser'), { message: spentInviteText })
+    await until(() => app.calls.includes('join'))
+    assert.equal(app.render().joining?.status, 'checking')
+    send.reject(Object.assign(new Error(refusal), { responded: true }))
+    await joining
+    assert.equal(app.render().joining, null)
+    assert.equal(app.render().error, spentInviteText)
+    assert.equal(app.stored.get('vibeface.pending-join'), 'null')
+    assert.equal(app.calls.includes('join_status'), false)
   } finally { app.close() }
 })
 
@@ -972,7 +995,41 @@ test('a manager shows the short code only for its own nonce and the commitment i
     app.managed.value = [joinRequest('confirming', revealed)]
     await app.render().refreshDirectory(); app.render()
     await app.render().startApproval(inviteId)
-    assert.deepEqual(app.requests.filter(request => request.method === 'approve').map(request => request.params.admin_nonce), [sent[0], sent[0]])
+    assert.deepEqual(app.requests.filter(request => request.method === 'approve').map(request => request.params.admin_nonce), sent)
+  } finally { app.close() }
+})
+
+test('a generated link carries the decoded invitation ID so the UI can identify its request', async () => {
+  const app = deviceHarness({ management: true, saved: true })
+  try {
+    app.render(); await settle()
+    const invitation = await app.render().createInvitation()
+    assert.equal(invitation.inviteId, inviteId)
+    assert.equal(invitation.link, 'vibeface://join/vibeface1test')
+    assert.ok(invitation.expiresAt > Date.now())
+  } finally { app.close() }
+})
+
+for (const received of [false, true]) test(`a lost approval response is checked before restarting when the node ${received ? 'received' : 'missed'} the write`, async () => {
+  const app = deviceHarness({ management: true, saved: true }), response = deferred()
+  app.holds.set('approve', response)
+  try {
+    app.render(); await settle()
+    app.managed.value = [joinRequest('pending', { device_id: remote })]
+    await app.render().refreshDirectory()
+    const first = assert.rejects(app.render().startApproval(inviteId), /connection lost/)
+    await until(() => app.calls.includes('approve'))
+    await assert.rejects(app.render().startApproval(inviteId), /正在为这条申请/)
+    const nonce = app.requests.find(request => request.method === 'approve')?.params.admin_nonce
+    response.reject(new Error('connection lost'))
+    await first
+    app.holds.delete('approve')
+    if (received) app.managed.value = [joinRequest('confirming', { device_id: remote, admin_id: subject, admin_nonce: nonce, joiner_nonce: joinNonce })]
+    const before = app.calls.length
+    await app.render().startApproval(inviteId)
+    assert.equal(app.calls[before], 'join_status')
+    assert.deepEqual(app.requests.filter(request => request.method === 'approve').map(request => request.params.admin_nonce), received ? [nonce] : [nonce, nonce])
+    if (received) assert.equal(app.render().joins[0]?.code, '123456')
   } finally { app.close() }
 })
 

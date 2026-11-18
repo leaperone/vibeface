@@ -22,7 +22,7 @@ import * as recoveryLinks from '@vibeface/client/identity/recovery-link.ts'
 import { entryAddress, entryJson, entryKey, messageOf, parseEntry, parseInfo, providerNames } from "@vibeface/client/lib/node.ts"
 import * as nodeSettings from "@vibeface/client/lib/node.ts"
 import type { OutboxItem, OutboxRecord } from '@vibeface/client/lib/outbox.ts'
-import type { NodeSettingsResponse, ProviderReadiness, ProviderStatus, ReadyConnection } from "@vibeface/client/lib/node.ts"
+import type { JoinRequest, NodeSettingsResponse, ProviderReadiness, ProviderStatus, ReadyConnection } from "@vibeface/client/lib/node.ts"
 import type { HistorySection, InputReceipt, InputOptions, InputTarget, ManagerJob, PendingMessage, WorkRecord, WorkspaceChannel, WorkspaceCommand, WorkspaceDomainState, WorkspaceFilter } from "@vibeface/client/workspace/types.ts"
 import { cardState, nodeName, taskGroup } from "@vibeface/client/workspace/labels.ts"
 import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "@vibeface/client/workspace/model.ts"
@@ -42,7 +42,7 @@ import { primaryLane } from "@vibeface/client/identity/connection-lane.ts"
 import * as taskLabels from "@vibeface/client/workspace/labels.ts"
 import * as workspaceModel from "@vibeface/client/workspace/model.ts"
 import * as workspaceQuestions from "@vibeface/client/workspace/questions.ts"
-import { inboxItems } from "@vibeface/client/workspace/inbox.ts"
+import { inboxItems, openJoins } from "@vibeface/client/workspace/inbox.ts"
 import { notificationOpenings } from '../../../../../apps/mobile/src/platform/notification-opens.ts'
 import type { NotificationDestination } from '@vibeface/client/lib/platform.ts'
 import { hookHarness, moduleLoader } from '../../lib/test-harness.ts'
@@ -5851,7 +5851,7 @@ test("single-record copying keeps toast-only feedback, handles refusal and ignor
 
 test("an outstanding clipboard permission cannot keep the add-device sheet busy or release another action", async () => {
   let generation = 1, creation = pendingResult()
-  const invitation = { link: 'vibeface://join/vibeface1test', expiresAt: Date.now() + 600_000 }
+  const invitation = { link: 'vibeface://join/vibeface1test', inviteId: 'a'.repeat(32), expiresAt: Date.now() + 600_000 }
   const clipboard = pendingResult()
   const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, principal: { can_manage: true, network_id: 'network' }, entry: { kind: 'gateway', address: 'https://node.example', device_id: 'target' } } }
   const device = { connectionGeneration: () => generation, ready: ready(), joins: [], createInvitation: () => creation.promise, refreshDirectory: async () => {} }
@@ -5881,7 +5881,7 @@ test("add-device clipboard refusal selects the full attempted command and a busy
   const copied: string[] = [], focus: string[] = []
   const link = 'vibeface://join/full-invitation'
   const command = "vibeface join 'vibeface://join/full-invitation' --name '我的电脑'"
-  const device = { connectionGeneration: () => 1, ready: { isCurrent: () => true, principal: { can_manage: true } }, createInvitation: async () => ({ link, expiresAt: 600_000 }), refreshDirectory: async () => {} }
+  const device = { connectionGeneration: () => 1, ready: { isCurrent: () => true, principal: { can_manage: true } }, createInvitation: async () => ({ link, inviteId: 'a'.repeat(32), expiresAt: Date.now() + 600_000 }), refreshDirectory: async () => {} }
   const app = componentHarness('../devices/add-device.tsx', {
     '@vibeface/client/identity/copy.ts': { addDeviceCopy, deviceCopy, joinCopy },
     '@vibeface/client/identity/context.tsx': { useDevice: () => device }, './join': { JoinRequests: () => null, useOpenJoins: () => [] }, '@/lib/glossary': { terms: { safetyCode: { icon: 'ScanEye' } } },
@@ -5922,7 +5922,7 @@ test("add-device copy cannot publish or select after kind, invitation, drawer or
     let generation = 1, calls = 0
     const pending = pendingResult(), focus: string[] = []
     const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, principal: { can_manage: true } } }
-    const device = { connectionGeneration: () => generation, ready: ready(), createInvitation: async () => ({ link: `vibeface://join/invitation-${++calls}`, expiresAt: 600_000 }), refreshDirectory: async () => {} }
+    const device = { connectionGeneration: () => generation, ready: ready(), createInvitation: async () => ({ link: `vibeface://join/invitation-${++calls}`, inviteId: calls.toString(16).padStart(32, '0'), expiresAt: Date.now() + 600_000 }), refreshDirectory: async () => {} }
     const app = componentHarness('../devices/add-device.tsx', {
       '@vibeface/client/identity/copy.ts': { addDeviceCopy, deviceCopy, joinCopy },
       '@vibeface/client/identity/context.tsx': { useDevice: () => device }, './join': { JoinRequests: () => null, useOpenJoins: () => [] }, '@/lib/glossary': { terms: { safetyCode: { icon: 'ScanEye' } } }, '@vibeface/client/lib/node.ts': { messageOf },
@@ -5955,7 +5955,7 @@ test("add-device copy cannot publish or select after kind, invitation, drawer or
 test("the invitation's QR code is its link, for the app", async () => {
   const shown = async (link: string) => {
     const encoded: string[] = []
-    const device = { connectionGeneration: () => 1, ready: { isCurrent: () => true, principal: { can_manage: true, network_id: 'network' }, entry: { kind: 'gateway', address: 'http://127.0.0.1:4790', device_id: 'target' } }, joins: [], createInvitation: async () => ({ link, expiresAt: Date.now() + 600_000 }), refreshDirectory: async () => {} }
+    const device = { connectionGeneration: () => 1, ready: { isCurrent: () => true, principal: { can_manage: true, network_id: 'network' }, entry: { kind: 'gateway', address: 'http://127.0.0.1:4790', device_id: 'target' } }, joins: [], createInvitation: async () => ({ link, inviteId: 'a'.repeat(32), expiresAt: Date.now() + 600_000 }), refreshDirectory: async () => {} }
     const app = componentHarness('../devices/add-device.tsx', {
       '@vibeface/client/identity/context.tsx': { useDevice: () => device }, './join': { JoinRequests: () => null, useOpenJoins: () => [] }, '@/lib/glossary': { terms: { safetyCode: { label: '安全码', icon: 'ScanEye' } } },
       '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message }, 'qrcode-generator': () => ({ addData(value: string) { encoded.push(value) }, make() {}, createDataURL: () => 'data:qr' }),
@@ -5974,7 +5974,7 @@ test("the invitation's QR code is its link, for the app", async () => {
 test("an oversized invitation keeps its full link visible and copyable when QR encoding fails", async () => {
   const link = `vibeface://join/${'a'.repeat(5000)}`
   const copied: string[] = []
-  const device = { connectionGeneration: () => 1, ready: { isCurrent: () => true, principal: { can_manage: true } }, createInvitation: async () => ({ link, expiresAt: Date.now() + 600_000 }), refreshDirectory: async () => {} }
+  const device = { connectionGeneration: () => 1, ready: { isCurrent: () => true, principal: { can_manage: true } }, createInvitation: async () => ({ link, inviteId: 'a'.repeat(32), expiresAt: Date.now() + 600_000 }), refreshDirectory: async () => {} }
   const app = componentHarness('../devices/add-device.tsx', {
     '@vibeface/client/identity/context.tsx': { useDevice: () => device }, './join': { JoinRequests: () => null, useOpenJoins: () => [] }, '@/lib/glossary': { terms: { safetyCode: { icon: 'ScanEye' } } },
     '@vibeface/client/lib/node.ts': { messageOf },
@@ -5994,6 +5994,149 @@ test("an oversized invitation keeps its full link visible and copyable when QR e
     await settleComponent()
     assert.deepEqual(copied, [link])
   } finally { app.close() }
+})
+
+test('invitation expiry and consumption are scoped to the issued link on Web and Mobile', async () => {
+  for (const platform of ['web', 'native']) {
+    const web = platform === 'web'
+    let now = 1_000, creations = 0, timerId = 0
+    const timers = new Map<number, { run: () => void; delay: number }>()
+    const joins: { invite_id: string }[] = []
+    const writes: string[] = [], shares: string[] = []
+    const copy = pendingResult()
+    const copyText = (text: string) => { writes.push(text); return copy.promise }
+    const invite = (number: number) => ({ link: `vibeface://join/link-${number}`, inviteId: number.toString(16).padStart(32, '0') })
+    const device = {
+      connectionGeneration: () => 1, ready: { isCurrent: () => true, principal: { can_manage: true } },
+      createInvitation: async () => ({ ...invite(++creations), expiresAt: now + 600_000 }), refreshDirectory: async () => {},
+    }
+    const joinModule = { JoinRequests: 'JoinRequests', useOpenJoins: () => joins }
+    const app = componentHarness(web ? '../devices/add-device.tsx' : '../../../../../apps/mobile/app/add-device.tsx', {
+      '@vibeface/client/identity/context.tsx': { useDevice: () => device },
+      '@vibeface/client/identity/copy.ts': { addDeviceCopy, deviceCopy, joinCopy },
+      '@vibeface/client/lib/node.ts': { messageOf },
+      '@/lib/glossary': { terms: { safetyCode: { icon: 'ScanEye' } } },
+      './join': joinModule, '@/features/devices/join-requests': joinModule,
+      'react-native': { View: 'View', ScrollView: 'ScrollView', Share: { share: async ({ message }: { message: string }) => { shares.push(message) } }, AccessibilityInfo: { announceForAccessibility() {} } },
+      'expo-clipboard': { setStringAsync: copyText },
+    }, {
+      Date: { now: () => now }, navigator: { clipboard: { writeText: copyText } },
+      setTimeout: (run: () => void, delay: number) => { timers.set(++timerId, { run, delay }); return timerId },
+      clearTimeout: (id: number) => timers.delete(id),
+      setInterval: () => 0, clearInterval: () => {},
+    }, '', { '@/lib/use-run': '../../../../../apps/mobile/src/lib/use-run.ts' })
+    const render = () => app.render(web ? 'AddDevice' : 'default')
+    const button = (label: string) => render().find(({ type, props }) => type === 'Button' && componentText(props.children) === label)?.props
+    const press = (label: string) => {
+      const action = button(label)?.[web ? 'onClick' : 'onPress']
+      assert.ok(typeof action === 'function', `${platform}: ${label}`)
+      action()
+    }
+    const allow = (inviteId: string) => {
+      const callback = render().find(({ type }) => type === 'JoinRequests')?.props.onAllowed
+      assert.ok(typeof callback === 'function')
+      callback({ id: 'joined', kind: 'client', name: '手机', manage: false }, inviteId)
+    }
+    const showDrawer = (open: boolean) => {
+      const change = render().find(({ type }) => type === 'Drawer')?.props.onOpenChange
+      assert.ok(typeof change === 'function')
+      change(open)
+    }
+    try {
+      render()
+      if (web) { showDrawer(true); press('生成链接') }
+      await settleComponent()
+      assert.equal(render().find(({ type }) => type === 'JoinRequests')?.props.inviteId, invite(1).inviteId)
+      joins.push({ invite_id: invite(2).inviteId })
+      assert.ok(button('复制链接'), 'an unrelated request leaves the invitation visible')
+      joins.length = 0
+      allow(invite(2).inviteId)
+      assert.ok(button('复制链接'), 'approving a different invite leaves the invitation visible')
+      press('复制链接')
+      assert.deepEqual(writes, [invite(1).link])
+      const staleShare = button('分享')?.onPress
+      const firstTimer = timers.get(timerId)
+      assert.equal(firstTimer?.delay, 600_000)
+      if (web) {
+        showDrawer(false); render()
+        assert.equal(timers.size, 0)
+        showDrawer(true); render()
+      }
+      now = 601_000
+      timers.get(timerId)?.run()
+      assert.equal(button('复制链接'), undefined)
+      assert.equal(button('分享'), undefined)
+      if (typeof staleShare === 'function') staleShare()
+      assert.deepEqual(shares, [])
+      assert.equal(creations, 1, 'expiry itself does not create another link')
+      assert.equal(button('重新生成链接')?.disabled, false)
+      press('重新生成链接'); await settleComponent(); render()
+      firstTimer?.run()
+      copy.resolve(undefined); await settleComponent()
+      assert.ok(button('复制链接'), 'old timer and clipboard completion leave the refreshed link visible')
+      assert.equal(button('已复制'), undefined)
+      joins.push({ invite_id: invite(2).inviteId })
+      assert.equal(button('复制链接'), undefined)
+      joins.length = 0
+      assert.equal(button('复制链接'), undefined, 'the matching invite stays spent when its request leaves')
+    } finally { app.close() }
+    assert.equal(timers.size, 0)
+  }
+})
+
+test('only the matching invitation auto-starts and a failed comparison can be started manually on Web and Mobile', async () => {
+  for (const platform of ['web', 'native']) {
+    const web = platform === 'web'
+    const request = (digit: string): JoinRequest => ({
+      join_id: digit.repeat(32), invite_id: digit.repeat(32), status: 'pending', kind: 'client', name: '手机', network_id: 'a'.repeat(64),
+      device_id: digit.repeat(64), commit: 'd'.repeat(64), admin_id: null, admin_nonce: null, joiner_nonce: null, reason: null, expires_at_ms: Date.now() + 600_000,
+    })
+    const matching = request('1'), unrelated = request('2'), sent: string[] = []
+    const first = pendingResult()
+    const device = {
+      ready: { principal: { can_manage: true } }, joins: [unrelated, matching],
+      startApproval: async (id: string) => { sent.push(id); if (sent.length === 1) await first.promise },
+    }
+    let busy: string | null = null, error: unknown = null
+    const run = async (key: string, work: () => Promise<void>) => {
+      busy = key; error = null
+      try { await work() } catch (cause) { error = cause } finally { busy = null }
+    }
+    const source = web ? '../devices/join.tsx' : '../../../../../apps/mobile/src/features/devices/join-requests.tsx'
+    const dependencies = {
+      '@vibeface/client/identity/context.tsx': { useDevice: () => device },
+      '@vibeface/client/identity/copy.ts': { deviceCopy },
+      '@vibeface/client/workspace/inbox.ts': { openJoins }, '@vibeface/client/workspace/labels.ts': taskLabels,
+      '@/lib/glossary': { terms: { admin: { label: '管理设备' } } },
+      '@/lib/use-run': { useRun: () => ({ busy, error, run }) },
+      './devices': { deviceIcon: () => 'Icon' }, './device-icon': { deviceIcon: () => 'Icon' },
+      '@/components/arc/product-kit': new Proxy({ useAction: () => ({ busy, error, run }) }, { get: (target, name) => name === 'useAction' ? target.useAction : String(name) }),
+    }
+    const globals = { setInterval: () => 0, clearInterval: () => {} }
+    const list = componentHarness(source, dependencies, globals)
+    const card = componentHarness(source, dependencies, globals, web ? '' : 'JoinCard')
+    try {
+      const elements = list.render('JoinRequests', { inviteId: matching.invite_id, manage: true })
+      const own = elements.find(({ type, props }) => typeof type === 'function' && type.name === 'JoinCard' && props.request === matching)?.props
+      const other = elements.find(({ type, props }) => typeof type === 'function' && type.name === 'JoinCard' && props.request === unrelated)?.props
+      assert.equal(own?.auto, true)
+      assert.equal(other?.auto, false)
+      if (web) { assert.equal(own?.manage, true); assert.equal(other?.manage, false) }
+      const render = () => card.render('JoinCard', own)
+      const button = (label: string) => render().find(({ type, props }) => type === 'Button' && componentText(props.children) === label)?.props
+      render()
+      assert.equal(button('处理中')?.disabled, true)
+      assert.deepEqual(sent, [matching.join_id])
+      first.reject(new Error('response lost')); await settleComponent()
+      assert.equal(button('显示安全码')?.disabled, false)
+      assert.deepEqual(sent, [matching.join_id])
+      const retry = button('显示安全码')?.[web ? 'onClick' : 'onPress']
+      assert.ok(typeof retry === 'function')
+      retry()
+      assert.deepEqual(sent, [matching.join_id, matching.join_id])
+      await settleComponent()
+    } finally { list.close(); card.close() }
+  }
 })
 
 test("an oversized phone recovery link stays visible and copyable when QR encoding fails", async () => {

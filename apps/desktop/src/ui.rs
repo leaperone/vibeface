@@ -621,7 +621,81 @@ pub struct JoinRequest {
     pub name: String,
     pub device_id: String,
     #[serde(default)]
-    pub code: Option<String>,
+    status: JoinRequestStatus,
+    admin_id: Option<String>,
+    code: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum JoinRequestStatus {
+    Pending,
+    Confirming,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum JoinComparison<'a> {
+    Pending,
+    Waiting,
+    OtherManager,
+    Code(&'a str),
+    Unavailable,
+}
+
+impl JoinRequest {
+    pub(crate) fn comparison(&self, client_id: Option<&str>) -> JoinComparison<'_> {
+        match (self.status, self.admin_id.as_deref(), client_id) {
+            (JoinRequestStatus::Pending, None, _) => JoinComparison::Pending,
+            (JoinRequestStatus::Confirming, Some(owner), Some(client)) if owner == client => self
+                .code
+                .as_deref()
+                .map_or(JoinComparison::Waiting, JoinComparison::Code),
+            (JoinRequestStatus::Confirming, Some(_), Some(_)) => JoinComparison::OtherManager,
+            _ => JoinComparison::Unavailable,
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn join_request_comparison_follows_refreshed_status_and_owner() {
+    let mut response = serde_json::json!({
+        "join_id": "join", "name": "phone", "device_id": "phone-id",
+        "status": "pending", "admin_id": null,
+    });
+    let parse = |response| serde_json::from_value::<JoinRequest>(response).unwrap();
+    assert_eq!(
+        parse(response.clone()).comparison(Some("desktop-id")),
+        JoinComparison::Pending
+    );
+
+    response["status"] = "confirming".into();
+    response["admin_id"] = "desktop-id".into();
+    assert_eq!(
+        parse(response.clone()).comparison(Some("desktop-id")),
+        JoinComparison::Waiting
+    );
+    assert_eq!(
+        parse(response.clone()).comparison(Some("other-id")),
+        JoinComparison::OtherManager
+    );
+
+    response["code"] = "123456".into();
+    assert_eq!(
+        parse(response.clone()).comparison(Some("desktop-id")),
+        JoinComparison::Code("123456")
+    );
+    assert_eq!(
+        parse(response.clone()).comparison(Some("other-id")),
+        JoinComparison::OtherManager
+    );
+    assert_eq!(
+        parse(response).comparison(None),
+        JoinComparison::Unavailable
+    );
 }
 
 pub fn parse_conversation(
