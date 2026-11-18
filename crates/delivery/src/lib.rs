@@ -3,6 +3,7 @@
 extern crate alloc;
 
 mod crypto;
+mod session;
 mod statement;
 
 use alloc::{
@@ -17,6 +18,11 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 pub use crypto::{
     encrypt_charity_window, encrypt_window, receiving_public, recover_charity_window,
     recover_window, validate_receiving_public, verify_peer, verify_relation,
+};
+pub use session::{
+    EncryptedSessionObject, MAX_SESSION_CHUNK_BYTES, MAX_SESSION_ID_BYTES,
+    MAX_SESSION_OBJECT_BYTES, SESSION_OBJECT_VERSION, SessionObjectChunk, SessionObjectHeader,
+    SessionObjectKind,
 };
 pub use statement::{ProofProfile, Statement, hash, schema_hash, signing_message};
 
