@@ -1,13 +1,8 @@
 """Pure release formats, asset names and explicitly supplied identity contracts."""
-import datetime
 from pathlib import PurePosixPath
 import re
-
-
-APPS = ('core', 'app', 'cli', 'desktop', 'mobile', 'www')
-
-
-COMPONENTS = ('core', 'app', 'www')
+from release_component_identity import (APPS, COMPONENTS, VERSION, COMMIT, SHA256, SCHEMA_VERSION,
+                                        require, version, parse_tag, validate_component)
 
 
 TARGETS = ('aarch64-apple-darwin', 'aarch64-unknown-linux-gnu', 'x86_64-unknown-linux-gnu', 'x86_64-pc-windows-msvc')
@@ -29,18 +24,6 @@ DESKTOP_SCHEMA = 2
 SIGNING_STATES = ('developer-id-notarized', 'authenticode', 'unsigned-development-preview', 'platform-checksums')
 
 
-VERSION = r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(hourly)\.([0-9]{10})|-(rc)\.([1-9][0-9]*))?'
-
-
-COMMIT = r'[a-f0-9]{40}'
-
-
-SHA256 = r'[a-f0-9]{64}'
-
-
-SCHEMA_VERSION = 1
-
-
 GITHUB_REPO = 'leaperone/vibeface'
 
 
@@ -50,32 +33,12 @@ DEPENDENCIES = {'core': (), 'app': (), 'cli': ('core', 'app'), 'desktop': ('cli'
 WORKFLOWS = {app: f'release-{app}.yml' for app in APPS} | {'cli': 'release.yml', 'desktop': 'release-desktop-app.yml', 'mobile': 'release-mobile.yml'}
 
 
-def require(condition, message):
-    if not condition:
-        raise ValueError(message)
-
-
 def program_suffix(target):
     return '.exe' if target in WINDOWS_TARGETS else ''
 
 
 def program_names(target):
     return tuple(name + program_suffix(target) for name in ('vibeface', 'vibeface-core'))
-
-
-def version(value):
-    require(isinstance(value, str), 'invalid release version')
-    match = re.fullmatch(VERSION, value)
-    require(match, 'invalid release version')
-    if match[4]:
-        datetime.datetime.strptime(match[5], '%Y%m%d%H')
-    return 'hourly' if match[4] else 'rc' if match[6] else 'stable'
-
-
-def parse_tag(tag):
-    match = re.fullmatch(r'(' + '|'.join(APPS) + r')-v(' + VERSION + r')', tag)
-    require(match, 'tag must be <core|app|cli|desktop|mobile|www>-v<version>')
-    return match[1], match[2], version(match[2])
 
 
 def release_tag_for(app, value):

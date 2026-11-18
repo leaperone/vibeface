@@ -18,6 +18,7 @@ CHECKS = (
     ("scripts/run-delivery-live.py", "--self-test"),
     ("scripts/hourly.py", "--self-test"),
     ("scripts/release.py", "self-test"),
+    ("scripts/tests/release/test_component_identity.py",),
     ("scripts/tests/release/test_cli.py",),
     ("scripts/tests/release/test_publisher.py",),
     ("scripts/tests/release/test_source.py",),

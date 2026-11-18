@@ -3,7 +3,7 @@ RUN apk add --no-cache python3
 RUN rm -rf /usr/share/nginx/html && mkdir /usr/share/nginx/html
 ARG STATIC_ROOT=web
 COPY component/${STATIC_ROOT}/ /usr/share/nginx/html/
-COPY component/COMPONENT-INFO.json runtime.py /opt/vibeface/
+COPY component/COMPONENT-INFO.json runtime.py release_component_identity.py /opt/vibeface/
 COPY nginx.conf /etc/nginx/nginx.conf
 RUN python3 /opt/vibeface/runtime.py info > /dev/null
 USER 101:101

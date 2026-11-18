@@ -1,0 +1,342 @@
+{
+  "versions": [
+    {
+      "name": "stable",
+      "version": "0.0.1",
+      "channel": "stable",
+      "valid": true
+    },
+    {
+      "name": "stable-large",
+      "version": "12.34.567",
+      "channel": "stable",
+      "valid": true
+    },
+    {
+      "name": "rc",
+      "version": "0.0.1-rc.1",
+      "channel": "rc",
+      "valid": true
+    },
+    {
+      "name": "rc-large",
+      "version": "12.3.4-rc.123",
+      "channel": "rc",
+      "valid": true
+    },
+    {
+      "name": "hourly",
+      "version": "0.0.1-hourly.2026111700",
+      "channel": "hourly",
+      "valid": true
+    },
+    {
+      "name": "leap-day",
+      "version": "0.0.1-hourly.2024022923",
+      "channel": "hourly",
+      "valid": true
+    },
+    {
+      "name": "leading-major",
+      "version": "00.0.1",
+      "channel": "stable",
+      "valid": false
+    },
+    {
+      "name": "leading-minor",
+      "version": "0.00.1",
+      "channel": "stable",
+      "valid": false
+    },
+    {
+      "name": "leading-patch",
+      "version": "0.0.01",
+      "channel": "stable",
+      "valid": false
+    },
+    {
+      "name": "rc-zero",
+      "version": "0.0.1-rc.0",
+      "channel": "rc",
+      "valid": false
+    },
+    {
+      "name": "rc-leading-zero",
+      "version": "0.0.1-rc.01",
+      "channel": "rc",
+      "valid": false
+    },
+    {
+      "name": "hourly-bad-hour",
+      "version": "0.0.1-hourly.2026111724",
+      "channel": "hourly",
+      "valid": false
+    },
+    {
+      "name": "hourly-bad-date",
+      "version": "0.0.1-hourly.2026023000",
+      "channel": "hourly",
+      "valid": false
+    },
+    {
+      "name": "hourly-bad-leap",
+      "version": "0.0.1-hourly.2026022900",
+      "channel": "hourly",
+      "valid": false
+    },
+    {
+      "name": "hourly-bad-month",
+      "version": "0.0.1-hourly.2026131700",
+      "channel": "hourly",
+      "valid": false
+    },
+    {
+      "name": "hourly-year-zero",
+      "version": "0.0.1-hourly.0000010100",
+      "channel": "hourly",
+      "valid": false
+    },
+    {
+      "name": "unicode-digits",
+      "version": "０.0.1",
+      "channel": "stable",
+      "valid": false
+    },
+    {
+      "name": "unknown-prerelease",
+      "version": "0.0.1-nightly.1",
+      "channel": "hourly",
+      "valid": false
+    },
+    {
+      "name": "build-metadata",
+      "version": "0.0.1+build",
+      "channel": "stable",
+      "valid": false
+    },
+    {
+      "name": "version-number",
+      "version": 1,
+      "channel": "stable",
+      "valid": false
+    },
+    {
+      "name": "version-null",
+      "version": null,
+      "channel": "stable",
+      "valid": false
+    },
+    {
+      "name": "version-list",
+      "version": [],
+      "channel": "stable",
+      "valid": false
+    }
+  ],
+  "fields": [
+    {
+      "name": "wrong-channel",
+      "changes": {
+        "channel": "rc"
+      },
+      "valid": false
+    },
+    {
+      "name": "null-channel",
+      "changes": {
+        "channel": null
+      },
+      "valid": false
+    },
+    {
+      "name": "channel-type",
+      "changes": {
+        "channel": []
+      },
+      "valid": false
+    },
+    {
+      "name": "wrong-tag-app",
+      "changes": {
+        "tag": "cli-v0.0.1"
+      },
+      "valid": false
+    },
+    {
+      "name": "wrong-tag-version",
+      "changes": {
+        "tag": "core-v0.0.2"
+      },
+      "valid": false
+    },
+    {
+      "name": "null-tag",
+      "changes": {
+        "tag": null
+      },
+      "valid": false
+    },
+    {
+      "name": "tag-type",
+      "changes": {
+        "tag": 1
+      },
+      "valid": false
+    },
+    {
+      "name": "schema-bool",
+      "changes": {
+        "schema": true
+      },
+      "valid": false
+    },
+    {
+      "name": "schema-string",
+      "changes": {
+        "schema": "1"
+      },
+      "valid": false
+    },
+    {
+      "name": "schema-unknown",
+      "changes": {
+        "schema": 2
+      },
+      "valid": false
+    },
+    {
+      "name": "source-null",
+      "changes": {
+        "source_commit": null
+      },
+      "valid": false
+    },
+    {
+      "name": "source-number",
+      "changes": {
+        "source_commit": 1
+      },
+      "valid": false
+    },
+    {
+      "name": "source-upper",
+      "changes": {
+        "source_commit": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      },
+      "valid": false
+    },
+    {
+      "name": "source-short",
+      "changes": {
+        "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "valid": false
+    },
+    {
+      "name": "files-null",
+      "changes": {
+        "files": null
+      },
+      "valid": false
+    },
+    {
+      "name": "files-list",
+      "changes": {
+        "files": []
+      },
+      "valid": false
+    },
+    {
+      "name": "files-empty",
+      "changes": {
+        "files": {}
+      },
+      "valid": false
+    },
+    {
+      "name": "hash-number",
+      "changes": {
+        "files": {
+          "vibeface-core": 1
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "hash-malformed",
+      "changes": {
+        "files": {
+          "vibeface-core": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "unknown-field",
+      "changes": {
+        "unexpected": true
+      },
+      "valid": false
+    },
+    {
+      "name": "unknown-app",
+      "changes": {
+        "app": "cli"
+      },
+      "valid": false
+    },
+    {
+      "name": "app-type",
+      "changes": {
+        "app": []
+      },
+      "valid": false
+    },
+    {
+      "name": "target-type",
+      "changes": {
+        "target": []
+      },
+      "valid": false
+    }
+  ],
+  "missing_fields": [
+    "app",
+    "version",
+    "tag",
+    "source_commit",
+    "channel",
+    "schema",
+    "target",
+    "files"
+  ],
+  "core_fields": [
+    {
+      "name": "epoch-bool",
+      "changes": {
+        "data_epoch": true
+      },
+      "valid": false
+    },
+    {
+      "name": "epoch-null",
+      "changes": {
+        "data_epoch": null
+      },
+      "valid": false
+    },
+    {
+      "name": "epoch-string",
+      "changes": {
+        "data_epoch": "1"
+      },
+      "valid": false
+    }
+  ],
+  "invalid_documents": [
+    null,
+    [],
+    1,
+    "component"
+  ]
+}

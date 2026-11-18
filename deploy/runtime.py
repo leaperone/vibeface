@@ -3,10 +3,10 @@
 import argparse
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
-import re
 import socket
 import stat
 import subprocess
@@ -20,6 +20,23 @@ DATA = Path('/data')
 APP_ORIGIN = 'https://app.vibeface.dev'
 TLS_FILES = ('tls-cert.pem', 'tls-key.pem')
 TLS_OWNER = 0
+
+
+def load_component_identity():
+    # Images carry the pure module beside this script. Source tools use its
+    # explicit scripts/ location; neither path depends on cwd or sys.path.
+    source = Path(__file__).resolve()
+    path = source.with_name('release_component_identity.py')
+    if not path.is_file():
+        path = source.parent.parent / 'scripts/release_component_identity.py'
+    spec = importlib.util.spec_from_file_location('vibeface_component_identity', path)
+    module = importlib.util.module_from_spec(spec)
+    # Inspect the exact source without reading or creating bytecode in the payload.
+    exec(compile(path.read_bytes(), str(path), 'exec', dont_inherit=True), module.__dict__)
+    return module
+
+
+component_identity = load_component_identity()
 
 
 def require(condition, message):
@@ -40,17 +57,8 @@ def read_only(path):
 
 
 def component_info(directory=ROOT, content_root=None, verify=True, ignored=()):
-    info = json.loads(regular(directory / 'COMPONENT-INFO.json'))
-    app = info.get('app')
-    fields = {'app', 'version', 'tag', 'source_commit', 'channel', 'schema', 'target', 'files'}
-    require(app in ('core', 'app', 'www') and set(info) == fields | ({'data_epoch'} if app == 'core' else set()),
-            'invalid component fields')
-    require(type(info['schema']) is int and info['schema'] == 1
-            and re.fullmatch(r'[0-9a-f]{40}', info['source_commit'])
-            and re.fullmatch(r'\d+\.\d+\.\d+(?:-rc\.\d+|-hourly\.\d{10})?', info['version']),
-            'invalid component identity')
-    expected_tag = {'core': 'core-v', 'app': 'app-v', 'www': 'www-v'}[app] + info['version']
-    require(info['tag'] == expected_tag, 'component tag mismatch')
+    info = component_identity.validate_component(json.loads(regular(directory / 'COMPONENT-INFO.json')))
+    app = info['app']
     if app == 'core':
         require(info['target'] == 'x86_64-unknown-linux-gnu' and type(info['data_epoch']) is int,
                 'unsupported Core component')
@@ -58,7 +66,6 @@ def component_info(directory=ROOT, content_root=None, verify=True, ignored=()):
         require(info['target'] is None, 'static component has a native target')
     prefix = '' if app == 'core' else ('web/' if app == 'app' else 'site/')
     expected = info['files']
-    require(isinstance(expected, dict) and expected, 'component has no files')
     if app == 'core':
         require(set(expected) == {'vibeface-core'}, 'Core image must not contain the App')
     else:
@@ -82,7 +89,7 @@ def component_info(directory=ROOT, content_root=None, verify=True, ignored=()):
 def image_info(verify=True):
     app = json.loads(regular(ROOT / 'COMPONENT-INFO.json'))['app']
     return component_info(ROOT, None if app == 'core' else Path('/usr/share/nginx/html'),
-                          verify=verify, ignored=('runtime.py', 'public-bootstrap.json'))
+                          verify=verify, ignored=('runtime.py', 'release_component_identity.py', 'public-bootstrap.json'))
 
 
 def inspect():

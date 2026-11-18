@@ -30,7 +30,7 @@ INPUTS = {
     'mobile': ('apps/mobile/*', 'packages/client/*', 'packages/theme/*', 'packages/secure-native/*', 'crates/secure/*', 'crates/secure-ffi/*', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain*', 'pnpm*', 'package.json', 'scripts/build-mobile*', 'scripts/build-ios*', 'scripts/verify-ios*', '.github/workflows/release-apps.yml', '.github/workflows/release-ios.yml'),
     'www': ('apps/www/*', 'packages/docs/*', 'packages/theme/*', 'pnpm*', 'package.json'),
 }
-COMMON = ('scripts/release_format.py', 'scripts/release_context.py', 'scripts/release_source.py', 'scripts/release_archive.py', 'scripts/release_inventory.py', 'scripts/release_github.py', 'scripts/release_publisher.py', 'scripts/release_assembly.py', 'scripts/release.py', 'scripts/release-entry.py', '.github/workflows/release-collect.yml', '.github/workflows/release-publish.yml')
+COMMON = ('scripts/release_component_identity.py', 'scripts/release_format.py', 'scripts/release_context.py', 'scripts/release_source.py', 'scripts/release_archive.py', 'scripts/release_inventory.py', 'scripts/release_github.py', 'scripts/release_publisher.py', 'scripts/release_assembly.py', 'scripts/release.py', 'scripts/release-entry.py', '.github/workflows/release-collect.yml', '.github/workflows/release-publish.yml')
 
 
 

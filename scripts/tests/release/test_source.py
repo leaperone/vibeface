@@ -130,7 +130,8 @@ class SourceContracts(unittest.TestCase):
 
     def test_production_graph_and_owner_uniqueness(self):
         expected = {
-            'release_format': set(), 'release_context': {'release_format'},
+            'release_component_identity': set(), 'release_format': {'release_component_identity'},
+            'release_context': {'release_format'},
             'release_source': {'release_format', 'release_context'},
             'release_archive': {'release_format', 'release_context'},
             'release_inventory': {'release_format', 'release_context', 'release_archive'},
@@ -148,7 +149,10 @@ class SourceContracts(unittest.TestCase):
                             edges.add(alias.name)
                         self.assertNotIn(alias.name, ('release', 'hourly', 'tests'))
                 if isinstance(node, ast.ImportFrom):
-                    self.assertFalse((node.module or '').startswith(('release', 'hourly', 'tests')))
+                    if module == 'release_format' and node.module == 'release_component_identity':
+                        edges.add(node.module)
+                    else:
+                        self.assertFalse((node.module or '').startswith(('release', 'hourly', 'tests')))
                 if isinstance(node, ast.Attribute) and node.attr == 'dont_write_bytecode':
                     self.fail('library changes global bytecode policy')
             self.assertEqual(edges, expected[module])
@@ -171,11 +175,13 @@ class SourceContracts(unittest.TestCase):
         # Compile before installing the guards. No project helper or fixture-root
         # lookup is available to the format module during its execution.
         source = (SOURCE / 'release_format.py').read_text()
+        identity_source = (SOURCE / 'release_component_identity.py').read_text()
         code = textwrap.dedent("""
-            import builtins, datetime, pathlib, re, os, socket, subprocess, sys
+            import builtins, datetime, pathlib, re, os, socket, subprocess, sys, types
             from unittest.mock import patch
             source = SOURCE_TEXT
             compiled = compile(source, 'detached-release-format', 'exec')
+            identity_compiled = compile(IDENTITY_SOURCE_TEXT, 'detached-component-identity', 'exec')
             def forbidden(*a, **kw): raise AssertionError('format attempted external access')
             class NoEnvironment(dict):
                 def __getitem__(self, key): forbidden()
@@ -186,6 +192,11 @@ class SourceContracts(unittest.TestCase):
                  patch.object(subprocess, 'Popen', forbidden), patch.object(subprocess, 'run', forbidden), \
                  patch.object(subprocess, 'check_output', forbidden), patch.object(socket, 'socket', forbidden), \
                  patch.object(os, 'getenv', forbidden), patch.object(os, 'environ', NoEnvironment()):
+                # Supply the leaf from bytes in memory; its import cannot consult
+                # a checkout, cwd, environment, or a filesystem loader.
+                leaf = types.ModuleType('release_component_identity')
+                exec(identity_compiled, leaf.__dict__)
+                sys.modules['release_component_identity'] = leaf
                 namespace = {'__name__': 'detached_release_format'}
                 exec(compiled, namespace)
                 assert sys.dont_write_bytecode is False
@@ -195,7 +206,7 @@ class SourceContracts(unittest.TestCase):
                     data_epoch=1, update_protocol=1)
                 assert namespace['verify_build_info'](build, {'data_epoch':1,'update_protocol':1}) == build
             print('detached format has no external access')
-        """).replace('SOURCE_TEXT', repr(source))
+        """).replace('IDENTITY_SOURCE_TEXT', repr(identity_source)).replace('SOURCE_TEXT', repr(source))
         result = subprocess.run([sys.executable, '-B', '-c', code], cwd=self.root,
             env=self.environment, capture_output=True, text=True)
         self.assertEqual((result.returncode,result.stdout,result.stderr),

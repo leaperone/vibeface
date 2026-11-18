@@ -228,14 +228,8 @@ def verify_ios_assets(directory, pins):
 
 def verify_component(directory, app, expected=None):
     directory = Path(directory)
-    info = json.loads((directory / 'COMPONENT-INFO.json').read_text(encoding='utf-8'))
-    fields = {'app', 'version', 'tag', 'source_commit', 'channel', 'schema', 'target', 'files'}
-    if app == 'core':
-        fields.add('data_epoch')
-    release_format.require(set(info) == fields and info['app'] == app and type(info['schema']) is int
-            and info['schema'] == release_format.SCHEMA_VERSION, 'unsupported component identity')
-    release_format.require(release_format.parse_tag(info['tag']) == (app, info['version'], info['channel']), 'invalid component tag')
-    release_format.require(isinstance(info['source_commit'], str) and re.fullmatch(release_format.COMMIT, info['source_commit']), 'invalid component source')
+    info = release_format.validate_component(json.loads((directory / 'COMPONENT-INFO.json').read_text(encoding='utf-8')))
+    release_format.require(info['app'] == app, 'unsupported component identity')
     if app == 'core':
         release_format.require(type(info['data_epoch']) is int and info['data_epoch'] == release_context.control_constant('DATA_EPOCH')
                 and info['target'] in release_format.TARGETS, 'unsupported Core data epoch or target')

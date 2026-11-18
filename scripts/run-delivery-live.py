@@ -187,7 +187,7 @@ def self_test_source_cli(directory):
     repo = directory / "source-cli"
     scripts = repo / "scripts"
     scripts.mkdir(parents=True)
-    for name in ("run-delivery-live.py", "release_format.py", "release_context.py"):
+    for name in ("run-delivery-live.py", "release_component_identity.py", "release_format.py", "release_context.py"):
         shutil.copy2(ROOT / "scripts" / name, scripts / name)
 
     control = repo / "crates/control/src/lib.rs"
