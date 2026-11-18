@@ -265,7 +265,7 @@ pub async fn inspect(core: &Path, data_dir: &Path) -> Result<Inspection> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{fs, io, os::unix::fs::PermissionsExt};
 
     const STOPPED: &str = r#"{"ok":true,"result":{"status":"stopped","device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","data_dir":DATA,"maintenance_socket":SOCKET,"listen":"127.0.0.1:4790","local_listen":"127.0.0.1:4791","public_url":"http://127.0.0.1:4790","web_enabled":true,"http_enabled":false,"version":null,"write_state":null,"mesh":{"enabled":false,"network":"vibeface","records":null,"neighbors":null},"peers":null,"core_version":"0.0.1-fixture","error":"maintenance socket is missing"}}"#;
 
@@ -307,24 +307,34 @@ exit "$(cat "$fixture_dir/exit-code")"
                 .replace("DATA", &serde_json::to_string(&self.data)?)
                 .replace("SOCKET", &serde_json::to_string(endpoint.path())?))
         }
-        async fn run(&self, reply: &str, code: u8) -> Result<Inspection> {
+        // The outer result covers fixture setup and capture. The inner result is the inspection.
+        async fn run(&self, reply: &str, code: u8) -> Result<Result<Inspection>> {
             fs::write(self.root.join("reply"), reply)?;
             fs::write(self.root.join("exit-code"), code.to_string())?;
             let result = inspect(&self.core, &self.data).await;
+            match (self.check_capture(), result) {
+                (Ok(()), result) => Ok(result),
+                (Err(capture_error), Ok(_)) => Err(capture_error),
+                (Err(capture_error), Err(inspect_error)) => {
+                    Err(inspect_error.context(format!("{capture_error:#}")))
+                }
+            }
+        }
+        fn check_capture(&self) -> Result<()> {
             assert_eq!(
-                fs::read_to_string(self.root.join("calls"))?,
+                fs::read_to_string(self.root.join("calls")).context("read fixture calls")?,
                 "\n",
                 "one request only"
             );
             assert_eq!(
-                fs::read_to_string(self.root.join("requests"))?,
+                fs::read_to_string(self.root.join("requests")).context("read fixture requests")?,
                 format!(
                     "{{\"command\":\"inspect\",\"data_dir\":{}}}\n",
                     serde_json::to_string(&self.data)?
                 )
             );
             assert!(!self.root.join("mutation").exists());
-            result
+            Ok(())
         }
     }
     impl Drop for Fixture {
@@ -334,9 +344,38 @@ exit "$(cat "$fixture_dir/exit-code")"
     }
 
     #[tokio::test]
+    async fn fixture_retains_spawn_error_when_calls_are_missing() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fs::set_permissions(&fixture.core, fs::Permissions::from_mode(0o600))?;
+
+        let error = fixture.run(&fixture.literal()?, 0).await.unwrap_err();
+        let spawn_context = format!("start core control process: {}", fixture.core.display());
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string() == spawn_context),
+            "{error:#}"
+        );
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<io::Error>()
+                .map(io::Error::kind),
+            Some(io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("calls"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn child_inspection_is_strict_bound_and_never_retried() -> Result<()> {
         let fixture = Fixture::new()?;
-        let stopped = fixture.run(&fixture.literal()?, 0).await?;
+        let stopped = fixture.run(&fixture.literal()?, 0).await??;
         assert_eq!(stopped.status, NodeStatus::Stopped);
         assert_eq!(stopped.device_id, "a".repeat(64));
         assert_eq!(stopped.core_version, "0.0.1-fixture");
@@ -359,7 +398,7 @@ exit "$(cat "$fixture_dir/exit-code")"
                 )
         };
         let fixture = Fixture::new()?;
-        let observed = fixture.run(&running(fixture.literal()?), 0).await?;
+        let observed = fixture.run(&running(fixture.literal()?), 0).await??;
         assert_eq!(observed.status, NodeStatus::Running);
         assert_eq!(observed.version.as_deref(), Some("0.0.1-fixture"));
         assert!(observed.peers.as_ref().unwrap().is_empty());
@@ -426,22 +465,22 @@ exit "$(cat "$fixture_dir/exit-code")"
                 fixture.literal()?
             };
             assert!(
-                fixture.run(&wire.replace(from, to), 0).await.is_err(),
+                fixture.run(&wire.replace(from, to), 0).await?.is_err(),
                 "{from} -> {to}"
             );
         }
         for reply in ["{broken", r#"{"ok":true,"result":null}"#, r#"{"ok":true}"#] {
             let fixture = Fixture::new()?;
-            assert!(fixture.run(reply, 0).await.is_err());
+            assert!(fixture.run(reply, 0).await?.is_err());
         }
         let fixture = Fixture::new()?;
-        assert!(fixture.run(&fixture.literal()?, 7).await.is_err());
+        assert!(fixture.run(&fixture.literal()?, 7).await?.is_err());
         let fixture = Fixture::new()?;
         let wire = fixture.literal()?.replace(
             &serde_json::to_string(&fixture.data)?,
             &serde_json::to_string(&fixture.root)?,
         );
-        let error = fixture.run(&wire, 0).await.unwrap_err();
+        let error = fixture.run(&wire, 0).await?.unwrap_err();
         assert_eq!(
             error.downcast_ref::<BindingError>(),
             Some(&BindingError::DirectoryMismatch)
