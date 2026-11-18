@@ -30,7 +30,7 @@ pub mod relay;
 pub const SYNC: &[u8] = b"vibeface/sync/1";
 pub const BLOB: &[u8] = b"vibeface/blob/1";
 pub const RPC: &[u8] = b"vibeface/rpc/1";
-pub const CLIENT: &[u8] = b"vibeface/client/1";
+pub use vibeface_protocol::client_frame::ALPN as CLIENT;
 pub const JOIN: &[u8] = b"vibeface/join/1";
 /// A decision sent to a session through another device; the target checks its token.
 pub const DECISION: &[u8] = b"vibeface/decision/1";

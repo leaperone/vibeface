@@ -41,7 +41,10 @@ use std::{
 use tokio::{sync::mpsc, time::Instant};
 #[cfg(test)]
 use tokio_tungstenite::tungstenite::Message as NativeMessage;
-use vibeface_protocol::valid_business_id;
+use vibeface_protocol::{
+    client_frame::{FrameKind, HEADER_BYTES, decode_header, encode_header},
+    valid_business_id,
+};
 use vibeface_secure::{
     Channel,
     join::{InviteRecord, Ticket, invite_id, join_commit, short_code},
@@ -55,7 +58,6 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const HEARTBEAT: Duration = Duration::from_secs(20);
-const MAX_FORWARDED_FRAME: usize = 1024 * 1024;
 /// Under the browser's 10-second connect timeout, so the refusal reaches it first.
 const FORWARD_DIAL_TIMEOUT: Duration = Duration::from_secs(7);
 /// How often a waiting browser hears its place in line; each notice restarts its connect timeout.
@@ -156,20 +158,20 @@ impl ClientSocket {
                 .await
                 .map_err(Into::into),
             Self::Forwarded(forwarded) => {
-                let (tag, bytes) = match message {
-                    Message::Binary(bytes) => (0, bytes.to_vec()),
-                    Message::Text(text) => (1, text.as_str().as_bytes().to_vec()),
-                    Message::Ping(bytes) => (2, bytes.to_vec()),
-                    Message::Pong(bytes) => (3, bytes.to_vec()),
+                let (kind, bytes): (_, &[u8]) = match &message {
+                    Message::Binary(bytes) => (FrameKind::Binary, bytes),
+                    Message::Text(text) => (FrameKind::Text, text.as_str().as_bytes()),
+                    Message::Ping(bytes) => (FrameKind::Ping, bytes),
+                    Message::Pong(bytes) => (FrameKind::Pong, bytes),
                     Message::Close(_) => {
                         forwarded.send.finish().ok();
                         return Ok(());
                     }
                 };
-                ensure!(bytes.len() <= MAX_FORWARDED_FRAME, "client frame too large");
-                let mut frame = vec![tag];
-                frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-                frame.extend_from_slice(&bytes);
+                let header = encode_header(kind, bytes.len())?;
+                let mut frame = Vec::with_capacity(HEADER_BYTES + bytes.len());
+                frame.extend_from_slice(&header);
+                frame.extend_from_slice(bytes);
                 forwarded
                     .send
                     .write_all(&frame)
@@ -181,24 +183,25 @@ impl ClientSocket {
 }
 
 async fn read_forwarded(recv: &mut RecvStream) -> Result<Option<Message>> {
-    let mut header = [0u8; 5];
+    let mut header = [0; HEADER_BYTES];
     match recv.read_exact(&mut header).await {
         Ok(()) => {}
         Err(ReadExactError::FinishedEarly(0)) => return Ok(None),
         Err(error) => bail!("forwarded client stream failed: {error}"),
     }
-    let length = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
-    ensure!(length <= MAX_FORWARDED_FRAME, "client frame too large");
-    let mut bytes = vec![0; length];
+    let header = decode_header(header)?;
+    let mut bytes = vec![0; header.payload_len()];
     recv.read_exact(&mut bytes)
         .await
         .map_err(|error| anyhow!("forwarded client stream failed: {error}"))?;
-    Ok(Some(match header[0] {
-        0 => Message::Binary(bytes.into()),
-        1 => Message::Text(String::from_utf8(bytes)?.into()),
-        2 => Message::Ping(bytes.into()),
-        3 => Message::Pong(bytes.into()),
-        _ => bail!("unknown forwarded client frame"),
+    let kind = header
+        .kind()
+        .map_err(|_| anyhow!("unknown forwarded client frame"))?;
+    Ok(Some(match kind {
+        FrameKind::Binary => Message::Binary(bytes.into()),
+        FrameKind::Text => Message::Text(String::from_utf8(bytes)?.into()),
+        FrameKind::Ping => Message::Ping(bytes.into()),
+        FrameKind::Pong => Message::Pong(bytes.into()),
     }))
 }
 
@@ -2506,6 +2509,113 @@ mod tests {
     use super::*;
     use crate::identity::{Genesis, Member, Revocation};
     use crate::runtime::test_support::{initialize_node, manager_settings};
+
+    #[tokio::test]
+    async fn forwarded_client_frames_preserve_wire_and_read_boundaries() -> Result<()> {
+        use iroh::{Endpoint, RelayMode, endpoint::presets};
+        use std::net::Ipv4Addr;
+
+        async fn endpoint(alpns: Vec<Vec<u8>>) -> Result<Endpoint> {
+            Ok(Endpoint::builder(presets::Minimal)
+                .alpns(alpns)
+                .relay_mode(RelayMode::Disabled)
+                .clear_ip_transports()
+                .bind_addr((Ipv4Addr::LOCALHOST, 0))?
+                .bind()
+                .await?)
+        }
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dialer = endpoint(vec![]).await?;
+            let listener = endpoint(vec![net::CLIENT.to_vec()]).await?;
+            let addr = EndpointAddr::from_parts(
+                listener.id(),
+                [TransportAddr::Ip(listener.bound_sockets()[0])],
+            );
+            let (sender, receiver) = tokio::join!(dialer.connect(addr, net::CLIENT), async {
+                listener
+                    .accept()
+                    .await
+                    .context("no client connection")?
+                    .await
+                    .context("client connection failed")
+            });
+            let (sender, receiver) = (sender?, receiver?);
+            let (mut send, mut recv) = sender.open_bi().await?;
+            let wire = [
+                0, 0, 0, 0, 1, b'x', // Binary.
+                1, 0, 0, 0, 2, 0xc3, 0xa9, // Text.
+                2, 0, 0, 0, 0, // Empty Ping.
+                3, 0, 0, 0, 1, b'y', // Pong.
+                0, 0, 0, 0, 0, // Empty Binary.
+            ];
+            send.write_all(&wire[..2]).await?;
+            let (reply, incoming) = receiver.accept_bi().await?;
+            let mut socket = ClientSocket::forwarded(reply, incoming);
+            let poll_timeout = Duration::from_millis(10);
+            assert!(
+                tokio::time::timeout(poll_timeout, socket.next())
+                    .await
+                    .is_err()
+            );
+            send.write_all(&wire[2..HEADER_BYTES]).await?;
+            assert!(
+                tokio::time::timeout(poll_timeout, socket.next())
+                    .await
+                    .is_err()
+            );
+            send.write_all(&wire[HEADER_BYTES..]).await?;
+            send.finish()?;
+
+            for expected in [
+                Message::Binary(vec![b'x'].into()),
+                Message::Text("é".into()),
+                Message::Ping(Default::default()),
+                Message::Pong(vec![b'y'].into()),
+                Message::Binary(Default::default()),
+            ] {
+                let received = socket.next().await.context("client frame missing")??;
+                assert_eq!(received, expected);
+                socket.send(received).await?;
+            }
+            assert!(socket.next().await.is_none());
+            socket.send(Message::Close(None)).await?;
+            let mut raw_reply = vec![0; wire.len()];
+            recv.read_exact(&mut raw_reply).await?;
+            assert_eq!(raw_reply, wire);
+            assert!(matches!(
+                recv.read_exact(&mut [0]).await,
+                Err(ReadExactError::FinishedEarly(0))
+            ));
+
+            for (wire, expected) in [
+                (&[0, 0][..], "stream finished early (2 bytes read)"),
+                (
+                    &[4, 0, 0, 0, 2, 0xff],
+                    "stream finished early (1 bytes read)",
+                ),
+                (&[4, 0, 16, 0, 1], "client frame too large"),
+                (&[4, 0, 0, 0, 1, 0xff], "unknown forwarded client frame"),
+                (&[1, 0, 0, 0, 1, 0xff], "invalid utf-8 sequence"),
+            ] {
+                let (mut send, _recv) = sender.open_bi().await?;
+                send.write_all(wire).await?;
+                send.finish()?;
+                let (reply, incoming) = receiver.accept_bi().await?;
+                let mut socket = ClientSocket::forwarded(reply, incoming);
+                let error = socket
+                    .next()
+                    .await
+                    .context("client frame error missing")?
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains(expected), "{error}");
+                assert!(socket.next().await.is_none());
+            }
+            Ok(())
+        })
+        .await?
+    }
 
     fn test_session(device_id: String) -> Session {
         Session {
