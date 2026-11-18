@@ -2107,7 +2107,7 @@ mod tests {
                 while stream.read_u8().await? != b'\n' {}
                 let response = serde_json::json!({
                     "protocol":maintenance::PROTOCOL,"status":"healthy",
-                    "health":{"device_id":"a".repeat(64),"version":"9.0.0"}
+                    "health":{"device_id":"a".repeat(64),"version":"9.0.0","web_enabled":false,"http_enabled":false}
                 });
                 stream.write_all(&serde_json::to_vec(&response)?).await?;
                 stream.write_all(b"\n").await?;
