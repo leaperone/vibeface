@@ -16,6 +16,8 @@ mod appimage;
 mod mac;
 #[cfg(any(target_os = "linux", windows))]
 mod portable;
+#[cfg(any(windows, all(test, target_os = "linux")))]
+mod rollback;
 #[cfg(windows)]
 mod windows;
 

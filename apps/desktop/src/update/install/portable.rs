@@ -31,7 +31,7 @@ pub(super) fn check_layout(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn safe_relative(name: &str) -> bool {
+pub(super) fn safe_relative(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 768
         && name.split('/').all(|part| {

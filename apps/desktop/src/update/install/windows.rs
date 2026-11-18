@@ -166,7 +166,9 @@ pub(super) fn activate(
     portable::backup_files(root, &backup, &files)?;
     current.check_current(&root.join("resources"), &gui)?;
     verify_registration(root, &current.build.version)?;
+    dos_path(&stage.path.join(rollback::PLAN))?;
     let status = Command::new(asset)
+        .env("VIBEFACE_DESKTOP_UPDATE_STAGE", dos_path(&stage.path)?)
         .arg("/S")
         .raw_arg(format!("/D={}", dos_path(root)?))
         .current_dir(&stage.path)
@@ -182,7 +184,7 @@ pub(super) fn activate(
         Ok(())
     })();
     if let Err(error) = result {
-        let rollback = (|| -> Result<()> {
+        let rollback = (|| -> Result<bool> {
             for relative in &files {
                 let original = backup.join(relative);
                 let dest = root.join(relative);
@@ -202,8 +204,12 @@ Set-ItemProperty -LiteralPath $k -Name DisplayVersion -Value $env:VF_INSTALL_VER
             run(powershell(script)?
                 .env("VF_INSTALL_DIR", dos_path(root)?)
                 .env("VF_INSTALL_VERSION", &current.build.version))?;
-            verify_registration(root, &current.build.version)
+            verify_registration(root, &current.build.version)?;
+            rollback::remove_additions(root, &stage.path, &files)
         })();
+        if matches!(rollback, Ok(false)) {
+            return Err(error.context("previous files restored; setup did not report starting a recoverable copy (older installers cannot identify new paths)"));
+        }
         if let Err(rollback) = rollback {
             stage.keep = true;
             bail!(

@@ -27,6 +27,7 @@ Var PlanRelative
 Var PlanPath
 Var PlanSegment
 Var PlanCount
+Var RollbackStage
 
 !ifdef INSTALLER_DIAGNOSTICS
 Var InstallerDiagnosticStage
@@ -361,6 +362,58 @@ plan_finished:
   SetErrorLevel 0
 FunctionEnd
 
+; The automatic updater has a fresh private staging directory inside this owned root.
+; Only the installer's compiled plan and paths absent before cleanup authorize rollback.
+Function PrepareRollbackPaths
+  ReadEnvStr $RollbackStage "VIBEFACE_DESKTOP_UPDATE_STAGE"
+  StrCmp $RollbackStage "" rollback_prepare_done
+  !insertmacro NormalizePath "" "$RollbackStage" $RollbackStage
+  ${GetParent} "$RollbackStage" $0
+  StrCmp $0 $INSTDIR 0 rollback_prepare_failed
+  ${GetFileName} "$RollbackStage" $0
+  StrLen $1 ".vibeface-update-"
+  StrCpy $0 $0 $1
+  StrCmp $0 ".vibeface-update-" 0 rollback_prepare_failed
+  !insertmacro CheckPath "" "$RollbackStage" "dir"
+  ClearErrors
+  FileOpen $0 "$PLUGINSDIR\vibeface-next-paths.txt" r
+  IfErrors rollback_prepare_failed
+  FileOpen $1 "$PLUGINSDIR\vibeface-absent-paths.txt" w
+  IfErrors rollback_prepare_failed
+  FileSeek $0 0 END $3
+  FileSeek $0 0 SET
+  FileRead $0 $2
+  StrCmp $2 "vibeface-install-path-plan-v2$\r$\n" 0 rollback_prepare_failed
+  FileWrite $1 "vibeface-absent-update-paths-v1$\r$\n"
+rollback_read_path:
+  IfErrors rollback_prepare_failed
+  FileSeek $0 0 CUR $4
+  StrCmp $4 $3 rollback_prepared
+  FileRead $0 $2
+  IfErrors rollback_prepare_failed
+  StrCpy $5 $2 -2
+  StrCpy $5 $5 "" 2
+  StrCpy $5 "$INSTDIR\$5"
+  System::Call 'kernel32::GetFileAttributesW(w r5) i.r6 ?e'
+  Pop $7
+  IntCmp $6 -1 0 rollback_read_path rollback_read_path
+  IntCmp $7 2 rollback_record_path
+  IntCmp $7 3 0 rollback_prepare_failed rollback_prepare_failed
+rollback_record_path:
+  FileWrite $1 "$2"
+  Goto rollback_read_path
+rollback_prepared:
+  FileWrite $1 "end-vibeface-absent-paths$\r$\n"
+  IfErrors rollback_prepare_failed
+  FileClose $0
+  FileClose $1
+rollback_prepare_done:
+  Return
+rollback_prepare_failed:
+  Push "The updater could not record the original package paths. Setup was stopped."
+  Call Refuse
+FunctionEnd
+
 Function .onInit
   SetShellVarContext current
   SetRegView 64
@@ -409,6 +462,7 @@ Section "Vibeface"
   IfErrors upgrade_failed
   IntCmp $0 0 upgrade_preflight_done upgrade_failed upgrade_failed
 upgrade_preflight_done:
+  Call PrepareRollbackPaths
   ; The previous uninstaller carries its own exact build-generated deletion list,
   ; so obsolete hashed assets are removed without trusting an editable manifest.
   ClearErrors
@@ -425,6 +479,18 @@ install_payload:
   !insertmacro ValidateOwnedPaths ""
   !insertmacro DiagnosticStage "install-payload.new-path-vacancy"
   !insertmacro AssertNewPayloadVacant
+  ; Publish the rollback evidence only when the installer can start copying. The system
+  ; copy refuses an existing destination, including another attempt's recovery record.
+  StrCmp $RollbackStage "" rollback_copy_ready
+  StrCpy $0 "$RollbackStage\vibeface-absent-paths.txt"
+  !insertmacro CheckPath "" "$0" "file"
+  StrCpy $1 "$PLUGINSDIR\vibeface-absent-paths.txt"
+  System::Call 'kernel32::CopyFileW(w r1, w r0, i 1) i.r2'
+  StrCmp $2 0 rollback_copy_failed rollback_copy_ready
+rollback_copy_failed:
+  Push "The updater could not save the rollback paths. No new payload has been copied."
+  Call Refuse
+rollback_copy_ready:
   !insertmacro DiagnosticStage "install-payload.copy"
   SetOutPath "$INSTDIR"
   ClearErrors
