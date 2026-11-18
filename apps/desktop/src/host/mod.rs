@@ -108,6 +108,7 @@ pub struct DesktopHost {
     owned: Option<OwnedChild>,
     discovery: Discovery,
     discovery_state: DiscoveryState,
+    startup_selection_allowed: bool,
     background: Option<ManagedNodeStatus>,
     last_owned_exit: Option<i32>,
 }
@@ -126,6 +127,7 @@ impl DesktopHost {
             owned: None,
             discovery: Discovery::default(),
             discovery_state: DiscoveryState::Scanning,
+            startup_selection_allowed: true,
             background: None,
             last_owned_exit: None,
         })
@@ -207,6 +209,7 @@ impl DesktopHost {
         settings.save(&self.profile_dir)?;
         self.settings = settings;
         self.selected = None;
+        self.startup_selection_allowed = false;
         Ok(())
     }
     pub async fn inspect(&self, path: &Path) -> Result<Inspect> {
@@ -253,12 +256,18 @@ impl DesktopHost {
     }
     pub(crate) fn complete_startup_discovery(&mut self, result: Result<Discovery>) {
         if self.discovery_state == DiscoveryState::Scanning {
-            let _ = self.apply_discovery(result);
+            let _ = self.apply_discovery(result, self.startup_selection_allowed);
         }
     }
-    fn apply_discovery(&mut self, result: Result<Discovery>) -> Result<Discovery> {
+    fn apply_discovery(
+        &mut self,
+        result: Result<Discovery>,
+        select_from_scan: bool,
+    ) -> Result<Discovery> {
         self.poll_owned()?;
-        self.selected = None;
+        if select_from_scan {
+            self.selected = None;
+        }
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -267,18 +276,25 @@ impl DesktopHost {
             }
         };
         self.discovery_state = DiscoveryState::Ready;
-        self.selected = preferred_running_node(&result, self.settings.selected_node.as_ref());
+        if select_from_scan {
+            self.selected = preferred_running_node(&result, self.settings.selected_node.as_ref());
+        }
         self.discovery = result.clone();
         Ok(result)
     }
     pub async fn discover(&mut self) -> Result<Discovery> {
         let result = self.scan().await;
-        self.apply_discovery(result)
+        self.apply_discovery(result, true)
     }
     fn can_use_owned_dir(&self) -> bool {
+        let own_data_dir = self.profile_dir.join("node");
         !self.attach_only
             && self.discovery_state == DiscoveryState::Ready
             && !self.discovery.user_service_registered
+            && self
+                .selected
+                .as_ref()
+                .is_none_or(|node| node.data_dir == own_data_dir)
             && !self.discovery.warnings.iter().any(|warning| {
                 matches!(
                     warning.as_str(),
@@ -294,7 +310,7 @@ impl DesktopHost {
                 .discovery
                 .nodes
                 .iter()
-                .all(|node| node.data_dir == self.profile_dir.join("node"))
+                .all(|node| node.data_dir == own_data_dir)
     }
     fn can_start_owned(&self) -> bool {
         self.can_use_owned_dir()
@@ -329,6 +345,7 @@ impl DesktopHost {
             .identity();
         self.remember_selection(&identity)?;
         self.selected = Some(identity);
+        self.startup_selection_allowed = false;
         Ok(())
     }
     pub(crate) fn remember_selection(&mut self, identity: &NodeIdentity) -> Result<()> {
