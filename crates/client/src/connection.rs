@@ -5,8 +5,8 @@ use serde_json::{Value, json};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
+use vibeface_native_transport::{LanError, LanStream, lan_connect};
 use vibeface_secure::{Channel, Handshake, Identity};
-use vibeface_secure_ffi::lan::{LanStream, lan_connect};
 
 const LIMIT: usize = 64;
 const MAX_REQUEST: usize = 1024 * 1024;
@@ -224,7 +224,7 @@ impl Connection {
                 bail!("preferred route was not resolved before Noise handshake")
             }
             Endpoint::Lan { node_id, addresses } => {
-                Transport::Lan(lan_connect(node_id.clone(), addresses.clone(), 10_000).await?)
+                Transport::Lan(lan_connect(node_id, addresses, Duration::from_secs(10)).await?)
             }
         };
         let mut handshake =
@@ -478,21 +478,13 @@ async fn send_lan(stream: &Arc<LanStream>, bytes: Vec<u8>) -> Result<()> {
     loop {
         match stream.send(bytes.clone()) {
             Ok(()) => return Ok(()),
-            Err(vibeface_secure_ffi::SecureError::Failed { reason })
-                if reason == "stream backpressure limit reached" =>
-            {
-                tokio::time::sleep(Duration::from_millis(5)).await
-            }
+            Err(LanError::Backpressure) => tokio::time::sleep(Duration::from_millis(5)).await,
             Err(error) => return Err(error.into()),
         }
     }
 }
 async fn lan_frame(stream: &Arc<LanStream>) -> Result<Message> {
-    let frame = stream
-        .clone()
-        .recv()
-        .await?
-        .context("LAN connection closed")?;
+    let frame = stream.recv().await?.context("LAN connection closed")?;
     Ok(if frame.text {
         Message::Text(String::from_utf8(frame.data)?.into())
     } else {

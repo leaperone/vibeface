@@ -228,7 +228,7 @@ def self_test(registry):
     assert registry["primary"] and registry["overlay"] and registry["process"]
     assert registry["paths"]["delivery_probe_protocol"] == ("crates/protocol/src/**",)
     assert any(item["id"] == "delivery-acceptance" for item in registry["overlay"])
-    assert [item["id"] for item in registry["rust"]] == ["protocol", "bridge", "secure", "client", "node", "control", "cli", "secure-ffi", "delivery"]
+    assert [item["id"] for item in registry["rust"]] == ["protocol", "bridge", "secure", "client", "node", "control", "cli", "secure-ffi", "native-transport", "delivery"]
     check_preflight(registry)
     with tempfile.TemporaryDirectory(prefix="ci-registry-") as directory:
         bad_registry = Path(directory) / "registry.toml"

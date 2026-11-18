@@ -22,5 +22,5 @@ uuid.workspace = true
 vibeface-bridge.workspace = true
 vibeface-protocol.workspace = true
 vibeface-secure = { path = "../secure" }
-vibeface-secure-ffi = { path = "../secure-ffi" }
+vibeface-native-transport.workspace = true
 zeroize = { version = "1", features = ["derive", "serde"] }
