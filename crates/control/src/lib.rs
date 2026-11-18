@@ -359,9 +359,9 @@ pub async fn request(core: &Path, request: &ControlRequest) -> Result<Value> {
 #[serde(deny_unknown_fields)]
 struct RawControlResponse {
     ok: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_control_field")]
     result: Option<Box<RawValue>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_control_field")]
     error: Option<String>,
 }
 
@@ -674,6 +674,19 @@ mod tests {
         );
         std::fs::remove_dir_all(fixture.directory)?;
         Ok(())
+    }
+
+    #[test]
+    fn discovery_response_rejects_explicit_counterpart_nulls() {
+        for wire in [
+            r#"{"ok":true,"result":{"nodes":[],"warnings":[],"user_service_registered":false},"error":null}"#,
+            r#"{"ok":false,"result":null,"error":"discovery failed"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<RawControlResponse>(wire).is_err(),
+                "explicit counterpart null must be rejected: {wire}"
+            );
+        }
     }
 
     #[tokio::test]
