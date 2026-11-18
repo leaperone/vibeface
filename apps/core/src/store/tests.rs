@@ -1206,6 +1206,91 @@ fn bot_conversation(store: &mut Store, net: &Net) -> Result<()> {
 }
 
 #[test]
+fn inbound_session_event_is_local_and_object_idempotent() -> Result<()> {
+    let net = net()?;
+    let dir =
+        std::env::temp_dir().join(format!("vibeface-session-ingest-{}", uuid::Uuid::new_v4()));
+    crate::config::private_dir(&dir)?;
+    let path = dir.join("node.sqlite3");
+    let mut store = Store::open(&path)?;
+    store.install_trust_bundle(&net.network, &net.state)?;
+    conversation(&mut store, &net)?;
+    let source_owner = net
+        .a
+        .owner_fixture(&net.network, "source", &net.a.device_id()?)?;
+    store.create_conversation(&net.a, &net.network, "source", "source", source_owner, 1)?;
+    let body = EventBody::BotMessaged {
+        message_id: "relay-message-1".into(),
+        from: Sender {
+            conversation_id: "source".into(),
+            name: "Relay sender".into(),
+        },
+        text: "delivered through the session relay".into(),
+        hops: 1,
+    };
+    let receipt = crate::delivery::session::InboundSessionReceipt {
+        object_id: [9; 32],
+        kind: vibeface_delivery::SessionObjectKind::Message,
+        conversation_id: "c".into(),
+        sender_peer: [1; 32],
+        receiver_peer: [2; 32],
+        payload_hash: [3; 32],
+        signature_verification: crate::delivery::session::SessionSignatureVerification::Verified,
+        received_at_ms: 3,
+        idempotency: crate::delivery::session::SessionIdempotency::New,
+    };
+    let first =
+        store.append_inbound_session_event(&net.a, &net.network, "c", &receipt, body.clone(), 3)?;
+    assert!(first.is_some());
+    assert!(
+        store
+            .append_inbound_session_event(&net.a, &net.network, "c", &receipt, body.clone(), 4)?
+            .is_none()
+    );
+    let mut wrong_scope = receipt.clone();
+    wrong_scope.conversation_id = "other".into();
+    assert!(
+        store
+            .append_inbound_session_event(&net.a, &net.network, "c", &wrong_scope, body.clone(), 5)
+            .is_err()
+    );
+    let mut wrong_kind = receipt;
+    wrong_kind.kind = vibeface_delivery::SessionObjectKind::BotSettings;
+    assert!(
+        store
+            .append_inbound_session_event(&net.a, &net.network, "c", &wrong_kind, body, 6)
+            .is_err()
+    );
+    let no_subject = EventBody::BotCreated {
+        bot_id: "relay-bot".into(),
+        name: "Relay bot".into(),
+        instructions: "handoff".into(),
+        project: None,
+        attestation: None,
+        cause: None,
+    };
+    let mut no_subject_receipt = wrong_scope;
+    no_subject_receipt.object_id = [10; 32];
+    no_subject_receipt.kind = vibeface_delivery::SessionObjectKind::BotSettings;
+    no_subject_receipt.conversation_id = "c".into();
+    assert!(
+        store
+            .append_inbound_session_event(
+                &net.a,
+                &net.network,
+                "c",
+                &no_subject_receipt,
+                no_subject,
+                7,
+            )
+            .is_err()
+    );
+    drop(store);
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
 fn a_retried_signed_decision_never_changes_the_outcome() -> Result<()> {
     let owner = |node: &LocalIdentity| -> Result<EventBody> {
         Ok(EventBody::ConversationOwner {
