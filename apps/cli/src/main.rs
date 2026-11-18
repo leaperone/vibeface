@@ -16,7 +16,7 @@ use vibeface_bridge::{platform::privatefs, transport};
 use vibeface_control::{
     ControlRequest,
     init::{DEFAULT_LISTEN, DEFAULT_LOCAL_LISTEN, InitOptions},
-    maintenance::{self, MaintenanceCommand, SecretString, WalletCommand},
+    maintenance::{self, MaintenanceCommand, MaintenanceResponse, SecretString, WalletCommand},
     observation,
 };
 
@@ -1246,7 +1246,9 @@ async fn join_through_running_node(data_dir: &Path, link: &str, name: &str) -> R
             }
         };
         unreachable = 0;
-        let status = response.join.unwrap_or(Value::Null);
+        let MaintenanceResponse::Join { join: status, .. } = response else {
+            bail!("node returned an invalid join response");
+        };
         let state = status["status"].as_str().unwrap_or_default();
         if shown.as_ref() != Some(&status) {
             match state {
@@ -1352,11 +1354,11 @@ async fn wallet(options: WalletOptions) -> Result<()> {
             let socket = inspect_socket(&dir).await?;
             let result =
                 maintenance::request(&socket, MaintenanceCommand::DeliveryConfig(config)).await?;
-            if let Some(delivery) = result.delivery {
-                println!("{}", serde_json::to_string(&delivery)?);
-            } else {
-                println!("Delivery settings applied.");
-            }
+            ensure!(
+                matches!(result, MaintenanceResponse::Applied(_)),
+                "Node returned an invalid delivery configuration result"
+            );
+            println!("Delivery settings applied.");
             Ok(())
         }
         WalletAction::RegisterKey { intent_id, gas_cap } => {
@@ -1448,10 +1450,10 @@ async fn wallet_request(dir: &Path, command: WalletCommand) -> Result<()> {
     let socket = inspect_socket(dir).await?;
     let response =
         maintenance::request(&socket, MaintenanceCommand::DeliveryWallet(command)).await?;
-    println!(
-        "{}",
-        serde_json::to_string(&response.wallet.unwrap_or(Value::Null))?
-    );
+    let MaintenanceResponse::Wallet { wallet, .. } = response else {
+        bail!("Node returned an invalid wallet result");
+    };
+    println!("{}", serde_json::to_string(&wallet)?);
     Ok(())
 }
 
@@ -1466,10 +1468,10 @@ async fn key_operation(dir: &Path, action: &str, intent_id: String, gas_cap: Str
         },
     )
     .await?;
-    println!(
-        "{}",
-        serde_json::to_string(&response.delivery.unwrap_or(Value::Null))?
-    );
+    let MaintenanceResponse::Delivery { delivery, .. } = response else {
+        bail!("Node returned an invalid key-operation result");
+    };
+    println!("{}", serde_json::to_string(&delivery)?);
     Ok(())
 }
 

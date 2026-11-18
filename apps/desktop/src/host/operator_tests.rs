@@ -13,7 +13,7 @@ use vibeface_bridge::platform::{
 };
 use vibeface_client::Outlet;
 use vibeface_control::maintenance::{
-    MaintenanceCommand, MaintenanceRequest, MaintenanceResponse, MaintenanceStatus, PROTOCOL,
+    MaintenanceCommand, MaintenanceRequest, MaintenanceResponse, PROTOCOL,
 };
 
 fn provider_change() -> NodeOperatorChange {
@@ -218,41 +218,29 @@ impl Fixture {
                         state.drop_next_change = false;
                         None
                     } else {
-                        let (status, error, result) = match method.as_str() {
-                            "diagnostics" => (
-                                MaintenanceStatus::Error,
-                                Some("personal network principal required".into()),
-                                None,
-                            ),
-                            "node_settings" => (
-                                MaintenanceStatus::Healthy,
-                                None,
-                                Some(
-                                    json!({"roots":state.config["roots"], "manager":state.config["manager"]}),
-                                ),
-                            ),
-                            "create_decision_token" => (
-                                MaintenanceStatus::Healthy,
-                                None,
-                                Some(
-                                    json!({"token_id":"fixture-token", "token":"synthetic-copy-only-secret"}),
-                                ),
-                            ),
-                            _ => (
-                                MaintenanceStatus::Healthy,
-                                None,
-                                Some(json!({"status":"saved"})),
-                            ),
-                        };
-                        Some(MaintenanceResponse {
-                            protocol: PROTOCOL,
-                            status,
-                            health: None,
-                            error,
-                            wallet: None,
-                            delivery: None,
-                            join: None,
-                            result,
+                        let health = json!({
+                            "device_id": "fixture-device",
+                            "version": "fixture-version",
+                            "web_enabled": false,
+                            "http_enabled": false
+                        });
+                        Some(match method.as_str() {
+                            "diagnostics" => MaintenanceResponse::Refused {
+                                health,
+                                error: "personal network principal required".into(),
+                            },
+                            "node_settings" => MaintenanceResponse::ClientResult {
+                                health,
+                                result: json!({"roots":state.config["roots"], "manager":state.config["manager"]}),
+                            },
+                            "create_decision_token" => MaintenanceResponse::ClientResult {
+                                health,
+                                result: json!({"token_id":"fixture-token", "token":"synthetic-copy-only-secret"}),
+                            },
+                            _ => MaintenanceResponse::ClientResult {
+                                health,
+                                result: json!({"status":"saved"}),
+                            },
                         })
                     }
                 };

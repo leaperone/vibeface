@@ -123,7 +123,7 @@ pub struct MaintenanceRequest {
     pub command: MaintenanceCommand,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum MaintenanceStatus {
     Ready,
@@ -133,44 +133,340 @@ pub enum MaintenanceStatus {
     Error,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MaintenanceResponse {
-    pub protocol: u32,
-    pub status: MaintenanceStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub health: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wallet: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delivery: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub join: Option<Value>,
-    #[serde(
-        default,
-        deserialize_with = "super::present_control_field",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub result: Option<Value>,
+#[derive(Debug, Clone)]
+pub enum MaintenanceResponse {
+    LeaseGranted(Value),
+    Probed(Value),
+    Committed(Value),
+    Applied(Value),
+    Wallet { health: Value, wallet: Value },
+    Delivery { health: Value, delivery: Value },
+    Join { health: Value, join: Value },
+    ClientResult { health: Value, result: Value },
+    Busy { health: Value, error: String },
+    Refused { health: Value, error: String },
+}
+
+#[derive(Debug)]
+struct RawResponse {
+    protocol: u32,
+    status: MaintenanceStatus,
+    health: Option<Value>,
+    error: Option<String>,
+    wallet: Option<Value>,
+    delivery: Option<Value>,
+    join: Option<Value>,
+    result: Option<Value>,
+}
+
+impl<'de> Deserialize<'de> for RawResponse {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        use serde::de::{Error, MapAccess, Visitor};
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = RawResponse;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a maintenance response object")
+            }
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut m: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut p = None;
+                let mut st = None;
+                let mut h = None;
+                let mut e = None;
+                let mut w = None;
+                let mut d = None;
+                let mut j = None;
+                let mut r = None;
+                let mut seen = [false; 8];
+                while let Some(k) = m.next_key::<String>()? {
+                    let (idx, name) = match k.as_str() {
+                        "protocol" => (0, "protocol"),
+                        "status" => (1, "status"),
+                        "health" => (2, "health"),
+                        "error" => (3, "error"),
+                        "wallet" => (4, "wallet"),
+                        "delivery" => (5, "delivery"),
+                        "join" => (6, "join"),
+                        "result" => (7, "result"),
+                        _ => {
+                            return Err(A::Error::unknown_field(
+                                &k,
+                                &[
+                                    "protocol", "status", "health", "error", "wallet", "delivery",
+                                    "join", "result",
+                                ],
+                            ));
+                        }
+                    };
+                    if seen[idx] {
+                        return Err(A::Error::custom(format!(
+                            "duplicate maintenance response field: {name}"
+                        )));
+                    }
+                    seen[idx] = true;
+                    match idx {
+                        0 => p = Some(m.next_value()?),
+                        1 => st = Some(m.next_value()?),
+                        2 => h = Some(m.next_value()?),
+                        3 => e = m.next_value()?,
+                        4 => w = Some(m.next_value()?),
+                        5 => d = Some(m.next_value()?),
+                        6 => j = Some(m.next_value()?),
+                        7 => r = Some(m.next_value()?),
+                        _ => unreachable!(),
+                    }
+                }
+                Ok(RawResponse {
+                    protocol: p.ok_or_else(|| A::Error::missing_field("protocol"))?,
+                    status: st.ok_or_else(|| A::Error::missing_field("status"))?,
+                    health: h,
+                    error: e,
+                    wallet: w,
+                    delivery: d,
+                    join: j,
+                    result: r,
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+#[derive(Serialize)]
+struct WireResponse<'a> {
+    protocol: u32,
+    status: MaintenanceStatus,
+    health: &'a Value,
+    error: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wallet: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivery: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    join: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<&'a Value>,
+}
+
+impl Serialize for MaintenanceResponse {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let (status, health, wallet, delivery, join, result) = match self {
+            Self::LeaseGranted(health) => {
+                (MaintenanceStatus::Ready, health, None, None, None, None)
+            }
+            Self::Probed(health) => (MaintenanceStatus::Healthy, health, None, None, None, None),
+            Self::Committed(health) => {
+                (MaintenanceStatus::Committed, health, None, None, None, None)
+            }
+            Self::Applied(health) => (MaintenanceStatus::Healthy, health, None, None, None, None),
+            Self::Wallet { health, wallet } => (
+                MaintenanceStatus::Healthy,
+                health,
+                Some(wallet),
+                None,
+                None,
+                None,
+            ),
+            Self::Delivery { health, delivery } => (
+                MaintenanceStatus::Healthy,
+                health,
+                None,
+                Some(delivery),
+                None,
+                None,
+            ),
+            Self::Join { health, join } => (
+                MaintenanceStatus::Healthy,
+                health,
+                None,
+                None,
+                Some(join),
+                None,
+            ),
+            Self::ClientResult { health, result } => (
+                MaintenanceStatus::Healthy,
+                health,
+                None,
+                None,
+                None,
+                Some(result),
+            ),
+            Self::Busy { health, .. } => (MaintenanceStatus::Busy, health, None, None, None, None),
+            Self::Refused { health, .. } => {
+                (MaintenanceStatus::Error, health, None, None, None, None)
+            }
+        };
+        let error = match self {
+            Self::Busy { error, .. } | Self::Refused { error, .. } => Some(error.as_str()),
+            _ => None,
+        };
+        WireResponse {
+            protocol: PROTOCOL,
+            status,
+            health,
+            error,
+            wallet,
+            delivery,
+            join,
+            result,
+        }
+        .serialize(serializer)
+    }
 }
 
 impl MaintenanceResponse {
-    fn client_result(self) -> Result<Value> {
+    fn parse(command: &MaintenanceCommand, raw: RawResponse) -> Result<Self> {
+        ensure!(raw.protocol == PROTOCOL, "unsupported maintenance protocol");
+        let health = raw.health.context("maintenance response has no health")?;
         ensure!(
-            self.status == MaintenanceStatus::Healthy,
-            "maintenance Client response is not healthy"
+            health.is_object(),
+            "maintenance response has invalid health"
         );
+        let payload_count = [
+            raw.wallet.is_some(),
+            raw.delivery.is_some(),
+            raw.join.is_some(),
+            raw.result.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+        if matches!(
+            raw.status,
+            MaintenanceStatus::Busy | MaintenanceStatus::Error
+        ) {
+            ensure!(raw.error.is_some(), "maintenance failure has no error");
+            ensure!(
+                payload_count == 0,
+                "maintenance failure contains an operation payload"
+            );
+            return match raw.status {
+                MaintenanceStatus::Busy => Err(Busy(
+                    raw.error
+                        .unwrap()
+                        .trim_start_matches("node is busy: ")
+                        .to_owned(),
+                )
+                .into()),
+                MaintenanceStatus::Error => Err(Refused(raw.error.unwrap()).into()),
+                _ => unreachable!(),
+            };
+        }
         ensure!(
-            self.error.is_none()
-                && self.wallet.is_none()
-                && self.delivery.is_none()
-                && self.join.is_none(),
-            "maintenance Client response contains another command's payload"
+            raw.error.is_none(),
+            "successful maintenance response has a non-null error"
         );
-        self.result
-            .context("maintenance Client response has no result")
+        match command {
+            MaintenanceCommand::Acquire => {
+                ensure!(
+                    raw.status == MaintenanceStatus::Ready && payload_count == 0,
+                    "invalid maintenance Acquire response"
+                );
+                Ok(Self::LeaseGranted(health))
+            }
+            MaintenanceCommand::Probe => {
+                ensure!(
+                    raw.status == MaintenanceStatus::Healthy && payload_count == 0,
+                    "invalid maintenance Probe response"
+                );
+                Ok(Self::Probed(health))
+            }
+            MaintenanceCommand::Commit => {
+                ensure!(
+                    raw.status == MaintenanceStatus::Committed && payload_count == 0,
+                    "invalid maintenance Commit response"
+                );
+                Ok(Self::Committed(health))
+            }
+            MaintenanceCommand::DeliveryWallet(_) => {
+                ensure!(
+                    raw.status == MaintenanceStatus::Healthy
+                        && raw.wallet.is_some()
+                        && payload_count == 1,
+                    "invalid maintenance wallet response"
+                );
+                Ok(Self::Wallet {
+                    health,
+                    wallet: raw.wallet.unwrap(),
+                })
+            }
+            MaintenanceCommand::DeliveryBudget(_)
+            | MaintenanceCommand::DeliveryKeyOperation { .. } => {
+                ensure!(
+                    raw.status == MaintenanceStatus::Healthy
+                        && raw.delivery.is_some()
+                        && payload_count == 1,
+                    "invalid maintenance delivery response"
+                );
+                Ok(Self::Delivery {
+                    health,
+                    delivery: raw.delivery.unwrap(),
+                })
+            }
+            MaintenanceCommand::Join { .. } => {
+                ensure!(
+                    raw.status == MaintenanceStatus::Healthy
+                        && raw.join.is_some()
+                        && payload_count == 1,
+                    "invalid maintenance Join response"
+                );
+                Ok(Self::Join {
+                    health,
+                    join: raw.join.unwrap(),
+                })
+            }
+            MaintenanceCommand::Client { .. } => {
+                ensure!(
+                    raw.status == MaintenanceStatus::Healthy
+                        && raw.result.is_some()
+                        && payload_count == 1,
+                    "invalid maintenance Client response"
+                );
+                Ok(Self::ClientResult {
+                    health,
+                    result: raw.result.unwrap(),
+                })
+            }
+            MaintenanceCommand::LocalAccess(_)
+            | MaintenanceCommand::DeliveryConfig(_)
+            | MaintenanceCommand::MeshBootstrap { .. }
+            | MaintenanceCommand::ConfigSet { .. } => {
+                ensure!(
+                    raw.status == MaintenanceStatus::Healthy && payload_count == 0,
+                    "invalid applied maintenance response"
+                );
+                Ok(Self::Applied(health))
+            }
+        }
+    }
+
+    pub fn health(&self) -> &Value {
+        match self {
+            Self::LeaseGranted(h) | Self::Probed(h) | Self::Committed(h) | Self::Applied(h) => h,
+            Self::Wallet { health, .. }
+            | Self::Delivery { health, .. }
+            | Self::Join { health, .. }
+            | Self::ClientResult { health, .. }
+            | Self::Busy { health, .. }
+            | Self::Refused { health, .. } => health,
+        }
+    }
+
+    pub fn client_result(self) -> Result<Value> {
+        match self {
+            Self::ClientResult { result, .. } => Ok(result),
+            _ => Err(anyhow::anyhow!(
+                "maintenance response is not a Client result"
+            )),
+        }
     }
 }
 
@@ -182,7 +478,7 @@ pub struct Lease {
     _stream: Stream,
 }
 
-async fn read_response(stream: &mut Stream, timeout: Duration) -> Result<MaintenanceResponse> {
+async fn read_response(stream: &mut Stream, timeout: Duration) -> Result<RawResponse> {
     let mut packet = Zeroizing::new(Vec::new());
     tokio::time::timeout(timeout, async {
         let mut chunk = Zeroizing::new([0_u8; 8192]);
@@ -204,7 +500,7 @@ async fn read_response(stream: &mut Stream, timeout: Duration) -> Result<Mainten
                     end + 1 == packet.len(),
                     "unexpected maintenance packet data"
                 );
-                let response: MaintenanceResponse = serde_json::from_slice(&packet[..end])
+                let response: RawResponse = serde_json::from_slice(&packet[..end])
                     .context("invalid maintenance response")?;
                 ensure!(
                     response.protocol == PROTOCOL,
@@ -218,12 +514,16 @@ async fn read_response(stream: &mut Stream, timeout: Duration) -> Result<Mainten
     .context("maintenance socket timed out")?
 }
 
-async fn write_request(stream: &mut Stream, command: MaintenanceCommand) -> Result<()> {
-    let request = MaintenanceRequest {
+async fn write_request(stream: &mut Stream, command: &MaintenanceCommand) -> Result<()> {
+    #[derive(Serialize)]
+    struct Request<'a> {
+        protocol: u32,
+        command: &'a MaintenanceCommand,
+    }
+    let mut packet = Zeroizing::new(serde_json::to_vec(&Request {
         protocol: PROTOCOL,
         command,
-    };
-    let mut packet = Zeroizing::new(serde_json::to_vec(&request)?);
+    })?);
     packet.push(b'\n');
     ensure!(
         packet.len() <= MAX_PACKET,
@@ -250,21 +550,10 @@ async fn exchange(
         .await
         .context("maintenance connection timed out")??;
     stream.require_current_account(LABEL)?;
-    write_request(&mut stream, command).await?;
+    write_request(&mut stream, &command).await?;
     let response = read_response(&mut stream, timeout).await?;
-    match response.status {
-        MaintenanceStatus::Busy => {
-            let message = response.error.unwrap_or_else(|| "active work".into());
-            Err(Busy(message.trim_start_matches("node is busy: ").to_owned()).into())
-        }
-        MaintenanceStatus::Error => Err(Refused(
-            response
-                .error
-                .unwrap_or_else(|| "maintenance request failed".into()),
-        )
-        .into()),
-        _ => Ok((stream, response)),
-    }
+    let response = MaintenanceResponse::parse(&command, response)?;
+    Ok((stream, response))
 }
 
 /// Request a non-lease command. Acquire is rejected here so a successful lease cannot be
@@ -293,14 +582,11 @@ pub async fn call(socket: &Path, method: &str, params: Value) -> Result<Value> {
 
 pub async fn acquire(socket: &Path) -> Result<Lease> {
     let (stream, response) = exchange(socket, MaintenanceCommand::Acquire).await?;
-    ensure!(
-        matches!(response.status, MaintenanceStatus::Ready),
-        "maintenance lease was not granted"
-    );
+    let MaintenanceResponse::LeaseGranted(health) = response else {
+        unreachable!("Acquire parser guarantees LeaseGranted")
+    };
     Ok(Lease {
-        health: response
-            .health
-            .context("maintenance response has no health")?,
+        health,
         _stream: stream,
     })
 }
@@ -316,23 +602,51 @@ mod tests {
 
     #[test]
     fn client_response_distinguishes_null_from_missing_or_unrelated_payloads() -> Result<()> {
-        let decode = |wire| serde_json::from_str::<MaintenanceResponse>(wire)?.client_result();
+        let decode = |wire| {
+            let raw = serde_json::from_str::<RawResponse>(wire)?;
+            MaintenanceResponse::parse(
+                &MaintenanceCommand::Client {
+                    method: "test".into(),
+                    params: Value::Null,
+                },
+                raw,
+            )?
+            .client_result()
+        };
         assert_eq!(
-            decode(r#"{"protocol":1,"status":"healthy","result":null}"#)?,
+            decode(r#"{"protocol":1,"status":"healthy","health":{},"result":null}"#)?,
             Value::Null
         );
         assert_eq!(
-            decode(r#"{"protocol":1,"status":"healthy","error":null,"result":{"saved":true}}"#)?,
+            decode(
+                r#"{"protocol":1,"status":"healthy","health":{},"error":null,"result":{"saved":true}}"#
+            )?,
             serde_json::json!({"saved":true})
         );
         for wire in [
-            r#"{"protocol":1,"status":"healthy"}"#,
-            r#"{"protocol":1,"status":"ready","result":{}}"#,
-            r#"{"protocol":1,"status":"healthy","wallet":{},"result":{}}"#,
-            r#"{"protocol":1,"status":"healthy","error":"refused","result":{}}"#,
+            r#"{"protocol":1,"status":"healthy","health":{}}"#,
+            r#"{"protocol":1,"status":"ready","health":{},"result":{}}"#,
+            r#"{"protocol":1,"status":"healthy","health":{},"wallet":{},"result":{}}"#,
+            r#"{"protocol":1,"status":"healthy","health":{},"error":"refused","result":{}}"#,
         ] {
             assert!(decode(wire).is_err(), "{wire}");
         }
+        assert!(
+            serde_json::from_str::<RawResponse>(
+                r#"{"protocol":1,"protocol":1,"status":"healthy","health":{},"result":null}"#
+            )
+            .is_err()
+        );
+        assert!(
+            MaintenanceResponse::parse(
+                &MaintenanceCommand::Client {
+                    method: "test".into(),
+                    params: Value::Null
+                },
+                serde_json::from_str(r#"{"protocol":1,"status":"error","error":"refused"}"#)?
+            )
+            .is_err()
+        );
         Ok(())
     }
 

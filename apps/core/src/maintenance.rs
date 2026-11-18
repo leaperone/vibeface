@@ -16,7 +16,7 @@ use vibeface_bridge::platform::{
 use zeroize::Zeroizing;
 
 use vibeface_control::maintenance::{
-    MAX_PACKET, MaintenanceStatus as Status, PROTOCOL, REQUEST_TIMEOUT,
+    MAX_PACKET, MaintenanceResponse, MaintenanceStatus as Status, PROTOCOL, REQUEST_TIMEOUT,
 };
 const SOCKET_NAME: &str = "maintenance.sock";
 /// Names the maintenance endpoint in the message a person reads.
@@ -411,6 +411,10 @@ pub async fn join(data_dir: &Path, link: &str, name: &str) -> Result<crate::clie
         },
     )
     .await?;
+    ensure!(
+        response.status == Status::Healthy,
+        "node did not report healthy"
+    );
     response.join.context("node did not report its join")
 }
 
@@ -426,7 +430,7 @@ pub async fn mesh_bootstrap(data_dir: &Path, add: Vec<String>, remove: Vec<Strin
 
 /// Set one config.json value in the running Node; see `crate::config::Config::set`.
 pub async fn config_set(data_dir: &Path, key: &str, value: serde_json::Value) -> Result<()> {
-    request(
+    let (_, response) = request(
         data_dir,
         Command::ConfigSet {
             key: key.to_owned(),
@@ -434,6 +438,10 @@ pub async fn config_set(data_dir: &Path, key: &str, value: serde_json::Value) ->
         },
     )
     .await?;
+    ensure!(
+        response.status == Status::Healthy,
+        "node did not apply configuration"
+    );
     Ok(())
 }
 
@@ -450,6 +458,60 @@ pub async fn serve(runtime: Arc<Runtime>, data_dir: PathBuf) -> Result<()> {
         })?;
     }
 }
+
+async fn write_response(stream: &mut Stream, response: &Response) -> Result<()> {
+    let health = serde_json::to_value(
+        response
+            .health
+            .as_ref()
+            .context("maintenance response has no health")?,
+    )?;
+    let wire = match response.status {
+        Status::Ready => MaintenanceResponse::LeaseGranted(health),
+        Status::Committed => MaintenanceResponse::Committed(health),
+        Status::Busy => MaintenanceResponse::Busy {
+            health,
+            error: response
+                .error
+                .clone()
+                .unwrap_or_else(|| "active work".into()),
+        },
+        Status::Error => MaintenanceResponse::Refused {
+            health,
+            error: response
+                .error
+                .clone()
+                .unwrap_or_else(|| "maintenance request failed".into()),
+        },
+        Status::Healthy => {
+            if let Some(wallet) = response.wallet.as_ref() {
+                MaintenanceResponse::Wallet {
+                    health,
+                    wallet: serde_json::to_value(wallet)?,
+                }
+            } else if let Some(delivery) = response.delivery.as_ref() {
+                MaintenanceResponse::Delivery {
+                    health,
+                    delivery: delivery.clone(),
+                }
+            } else if let Some(join) = response.join.as_ref() {
+                MaintenanceResponse::Join {
+                    health,
+                    join: serde_json::to_value(join)?,
+                }
+            } else if let Some(result) = response.result.as_ref() {
+                MaintenanceResponse::ClientResult {
+                    health,
+                    result: result.clone(),
+                }
+            } else {
+                MaintenanceResponse::Applied(health)
+            }
+        }
+    };
+    write_packet(stream, &wire).await
+}
+
 async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream) -> Result<()> {
     stream.require_current_account(LABEL)?;
     ensure!(
@@ -485,7 +547,7 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
         result: None,
     };
     match request.command {
-        Command::Probe => write_packet(&mut stream, &response).await?,
+        Command::Probe => write_response(&mut stream, &response).await?,
         Command::DeliveryWallet(command) => {
             let result = match runtime.maintenance.enter() {
                 Ok(_guard) => runtime.delivery.local_wallet(command).await,
@@ -498,7 +560,7 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
                     response.error = Some(error.to_string());
                 }
             }
-            write_packet(&mut stream, &response).await?;
+            write_response(&mut stream, &response).await?;
         }
         Command::DeliveryBudget(command) => {
             let result = match runtime.maintenance.enter() {
@@ -512,7 +574,7 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
                     response.error = Some(error.to_string());
                 }
             }
-            write_packet(&mut stream, &response).await?;
+            write_response(&mut stream, &response).await?;
         }
         Command::DeliveryConfig(config) => {
             let result = match runtime.maintenance.enter() {
@@ -523,7 +585,7 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
                 response.status = Status::Error;
                 response.error = Some(error.to_string());
             }
-            write_packet(&mut stream, &response).await?;
+            write_response(&mut stream, &response).await?;
         }
         Command::DeliveryKeyOperation {
             action,
@@ -570,7 +632,7 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
                     response.error = Some(error.to_string());
                 }
             }
-            write_packet(&mut stream, &response).await?;
+            write_response(&mut stream, &response).await?;
         }
         Command::Join { link, name } => {
             let link = Zeroizing::new(link);
@@ -597,14 +659,14 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
                     response.error = Some(error.to_string());
                 }
             }
-            write_packet(&mut stream, &response).await?;
+            write_response(&mut stream, &response).await?;
         }
         Command::MeshBootstrap { add, remove } => {
             if let Err(error) = runtime.edit_mesh_bootstrap(&add, &remove).await {
                 response.status = Status::Error;
                 response.error = Some(error.to_string());
             }
-            write_packet(&mut stream, &response).await?;
+            write_response(&mut stream, &response).await?;
         }
         Command::ConfigSet { key, value } => {
             let result = {
@@ -615,7 +677,7 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
                 response.status = Status::Error;
                 response.error = Some(error.to_string());
             }
-            write_packet(&mut stream, &response).await?;
+            write_response(&mut stream, &response).await?;
         }
         Command::Client { method, params } => {
             match crate::client::operator_wire_call(&runtime, &method, params).await {
@@ -629,7 +691,7 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
                     response.error = Some(crate::logging::scrub(&error.to_string()));
                 }
             }
-            write_packet(&mut stream, &response).await?;
+            write_response(&mut stream, &response).await?;
         }
         Command::LocalAccess(enabled) => {
             let result = {
@@ -640,7 +702,7 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
                 response.status = Status::Error;
                 response.error = Some(error.to_string());
             }
-            write_packet(&mut stream, &response).await?;
+            write_response(&mut stream, &response).await?;
         }
         Command::Commit => {
             let result = runtime.maintenance.commit(&pending);
@@ -650,7 +712,7 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
                 Status::Error
             };
             response.error = result.err().map(|error| error.to_string());
-            write_packet(&mut stream, &response).await?;
+            write_response(&mut stream, &response).await?;
         }
         Command::Acquire => {
             let lease = match runtime.maintenance.acquire(Some(pending)) {
@@ -663,7 +725,7 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
                             Status::Error
                         };
                         response.error = Some(error.to_string());
-                        write_packet(&mut stream, &response).await?;
+                        write_response(&mut stream, &response).await?;
                         return Ok(());
                     }
                     lease
@@ -671,12 +733,12 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
                 Err(error) => {
                     response.status = Status::Busy;
                     response.error = Some(error.to_string());
-                    write_packet(&mut stream, &response).await?;
+                    write_response(&mut stream, &response).await?;
                     return Ok(());
                 }
             };
             response.status = Status::Ready;
-            write_packet(&mut stream, &response).await?;
+            write_response(&mut stream, &response).await?;
             let mut byte = [0];
             let _ = stream.read(&mut byte).await;
             drop(lease);

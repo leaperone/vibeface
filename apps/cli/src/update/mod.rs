@@ -497,8 +497,8 @@ async fn maintenance_commit(data: &Path) -> Result<()> {
     .await?;
     ensure!(
         matches!(
-            response.status,
-            vibeface_control::maintenance::MaintenanceStatus::Committed
+            response,
+            vibeface_control::maintenance::MaintenanceResponse::Committed(_)
         ),
         "node activation was not committed"
     );
@@ -1279,19 +1279,13 @@ async fn healthy(data: &Path, package: &Path, device_id: &str) -> Result<()> {
                     )
                     .await
                     .and_then(|response| {
-                        ensure!(
-                            matches!(
-                                response.status,
-                                vibeface_control::maintenance::MaintenanceStatus::Healthy
-                            ),
-                            "node did not report healthy"
-                        );
-                        let health: MaintenanceHealth = serde_json::from_value(
+                        let vibeface_control::maintenance::MaintenanceResponse::Probed(health) =
                             response
-                                .health
-                                .context("maintenance response has no health")?,
-                        )
-                        .context("maintenance response has invalid health")?;
+                        else {
+                            bail!("node did not report healthy");
+                        };
+                        let health: MaintenanceHealth = serde_json::from_value(health)
+                            .context("maintenance response has invalid health")?;
                         Ok(health)
                     });
                     match health {
