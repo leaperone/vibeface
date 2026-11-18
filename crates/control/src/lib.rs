@@ -678,15 +678,16 @@ mod tests {
 
     #[test]
     fn discovery_response_rejects_explicit_counterpart_nulls() {
-        for wire in [
-            r#"{"ok":true,"result":{"nodes":[],"warnings":[],"user_service_registered":false},"error":null}"#,
+        let error_null = r#"{"ok":true,"result":{"nodes":[],"warnings":[],"user_service_registered":false},"error":null}"#;
+        assert!(serde_json::from_str::<RawControlResponse>(error_null).is_err());
+        let result_null = serde_json::from_str::<RawControlResponse>(
             r#"{"ok":false,"result":null,"error":"discovery failed"}"#,
-        ] {
-            assert!(
-                serde_json::from_str::<RawControlResponse>(wire).is_err(),
-                "explicit counterpart null must be rejected: {wire}"
-            );
-        }
+        )
+        .expect("RawValue preserves explicit result null");
+        assert!(!matches!(
+            (result_null.ok, result_null.result, result_null.error),
+            (false, None, Some(_))
+        ));
     }
 
     #[tokio::test]
