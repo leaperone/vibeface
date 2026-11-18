@@ -1897,7 +1897,7 @@ test("workspace preserves bot and message requests while routing native decision
       } finally { outboxItems.clear(); for (const [key, item] of snapshot) outboxItems.set(key, item); await reload(); await render().refresh() }
     })
   } finally {
-    for (const effect of effects.values()) effect.cleanup?.()
+    hooks.remount()
   }
 })
 
