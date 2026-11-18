@@ -9,6 +9,12 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 开发分支的 PR 不触发 GitHub Actions，也不要求 CI 状态；需要远端验证时手动运行 `CI / Core`。Actions 只保留核心 CI、发布和部署入口：桌面四平台、Windows native、移动端构建与验收、原生诊断和付费交付实验入口已移除，iOS 模拟器等界面验收不在 CI 中运行。`CI / Core` 由 `main` push、手动运行或 merge queue 触发，不含定时入口。Core、App、CLI、Desktop、Mobile 和 www 各自使用 `<app>-v<version>` Tag 与独立发布入口。Core、App、www 完整发布后自动派发各自服务部署。合并、CI 通过、发布和部署各有自己的验收结果。
 
+## CI 与 preflight 路径登记
+
+`scripts/ci-registry.toml` 是 CI 选择器和 preflight 域的共同登记源。`scripts/ci.py` 保留事件范围、累计 main 基线、任务依赖、平台矩阵和 gate 语义，登记源提供按优先级首匹配的主路由、WWW/Mobile/Desktop 与交付验收叠加、Rust 目标反向覆盖以及九个普通本地进程模式。新增协议 `src/` Rust 文件会同时触发 `protocol`、`delivery`、Linux package probe、`delivery-charity` 和本地普通模式。
+
+登记源的域区段由标准库生成器写入 `.preflight.toml` 的有界区段。使用 `python3 -B scripts/ci_registry.py --check-preflight` 检查字节是否漂移，使用 `python3 -B scripts/ci_registry.py --write-preflight` 按登记源重写该区段。未知路径仍选择完整 CI 计划，混合范围按原有并集规则处理，`scripts/*.sh` 等 preflight 通配符继续使用原 TOML 方言。
+
 ## 按用途选择 Actions 入口
 
 下表描述本分支的工作流定义。新增手动入口需合入默认分支后，才可在 Actions 页面或 CLI 中派发。

@@ -3,6 +3,14 @@
 
 import sys
 sys.dont_write_bytecode = True
+try:
+    import ci_registry
+except ModuleNotFoundError:
+    # The release CLI contract runs a minimal copied `ci.py --help` fixture.
+    # It does not need the registry, and the normal repository entry point has it.
+    if "--help" in sys.argv:
+        raise SystemExit(0)
+    raise
 import release_archive
 import release_context
 import release_format
@@ -22,59 +30,21 @@ import time
 import urllib.request
 
 
-PACKAGES = ("vibeface-protocol", "vibeface-bridge", "vibeface-secure", "vibeface-client", "vibeface-core", "vibeface-control", "vibeface", "vibeface-secure-ffi", "vibeface-delivery")
-DEPENDENTS = {
-    "protocol": ("bridge", "control", "client"),
-    "bridge": ("control", "client"),
-    "secure": ("control", "node", "secure-ffi", "client"),
-    "node": (),
-    "control": ("node", "cli"),
-    "cli": (),
-    "secure-ffi": ("node", "client"),
-    "client": ("node", "cli"),
-    "delivery": ("node",),
-}
-CRATES = {
-    "protocol": "vibeface-protocol",
-    "bridge": "vibeface-bridge",
-    "secure": "vibeface-secure",
-    "client": "vibeface-client",
-    "node": "vibeface-core",
-    "control": "vibeface-control",
-    "cli": "vibeface",
-    "secure-ffi": "vibeface-secure-ffi",
-    "delivery": "vibeface-delivery",
-}
+REGISTRY = ci_registry.load_registry()
+
+# Keep the public ordering consumed by workflow outputs and timing summaries.
+RUST_TARGETS = REGISTRY["rust"]
+CRATES = {item["id"]: item["package"] for item in RUST_TARGETS}
+DEPENDENTS = {item["id"]: tuple(item["dependents"]) for item in RUST_TARGETS}
+PACKAGES = tuple(item["package"] for item in RUST_TARGETS)
+
 WEB_UNIT_TEST = re.compile(r"apps/app/src/(?:lib/[^/]+|features/[^/]+/[^/]+)\.test\.ts")
-RELEASE_TOOL_PATHS = ("scripts/release-contract.mjs", "scripts/release-metadata.mjs", "scripts/test-release-contract.mjs",
-                      "scripts/fixtures/release-contract.json", "scripts/build-desktop.mjs", "scripts/verify-desktop.mjs",
-                      "scripts/package-npm.mjs", "scripts/publish-npm.mjs", "scripts/sealed-runtime.mjs")
-PATH_RULES = (
-    ("delivery", ("crates/delivery/*", "crates/delivery/proof/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "apps/core/src/delivery/*", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/net/mesh/record.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/verify-delivery-protected.py", "scripts/verify-delivery-restart-observer.py")),
-    ("full", ('scripts/release_component_identity.py', 'scripts/release_format.py', 'scripts/release_context.py', 'scripts/release_source.py', 'scripts/release_archive.py', 'scripts/release_inventory.py', 'scripts/release_github.py', 'scripts/release_publisher.py', 'scripts/release_assembly.py', "scripts/tests/release/*", "scripts/tests/__init__.py")),
-    ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "crates/control/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
-    ("www", ("apps/www/*",)),
-    ("docs", ("README.md", "README.zh-CN.md", "AGENTS.md", "CLAUDE.md", "packages/docs/*")),
-    ("node", ("config/public-bootstrap.json", "packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts")),
-    ("desktop", ("apps/desktop/src/*", "apps/desktop/tests/*")),
-    ("mobile", ("apps/mobile/*", "packages/secure-native/*")),
-    ("docs", ("tests/e2e/*",)),
-    ("web", ("apps/app/*", "packages/client/*", "packages/theme/*", "packages/uiarc/*", "config/uiarc.json", "scripts/generate-uiarc-theme.py", "scripts/check-uiarc.py", "scripts/check-uiarc-build.mjs", "scripts/check-uiarc-native.cjs", "scripts/vendor-uiarc.py", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/check-web.sh", "scripts/build-web-crypto.sh", "scripts/wasm-bindgen-version.py")),
-    ("protocol", ("crates/protocol/*",)),
-    ("bridge", ("crates/bridge/*",)),
-    ("client", ("crates/client/*",)),
-    ("secure", ("crates/secure/*", "scripts/crypto-client.mjs")),
-    ("secure-ffi", ("crates/secure-ffi/*", "scripts/build-mobile-secure.sh")),
-    ("node", ("apps/core/*", "install.sh", "scripts/package-node.sh", "scripts/package-node-windows.py",
-              "scripts/install-node-service.sh", "scripts/install-node-service.ps1", "scripts/verify-node.py",
-              "scripts/verify-windows-node.py")),
-    ("control", ("crates/control/*",)),
-    ("cli", ("apps/cli/*",)),
-)
-WWW_PATHS = ("apps/www/*", "packages/docs/*", "packages/theme/*", "packages/uiarc/src/foundation.css", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
-MOBILE_PATHS = ("packages/client/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
-DESKTOP_PATHS = ("package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
-DELIVERY_PROBE_PROTOCOL_PATHS = ("crates/protocol/src/*.rs",)
+RELEASE_TOOL_PATHS = REGISTRY["paths"]["release_tools"]
+PATH_RULES = tuple((scope, tuple(pattern)) for item in REGISTRY["primary"] if item["id"] not in {"release-tools", "provider-generated", "web-unit-tests", "web-test-fallback"} for scope in item["scopes"] for pattern in (item["patterns"],))
+WWW_PATHS = REGISTRY["paths"]["www_overlay"]
+MOBILE_PATHS = REGISTRY["paths"]["mobile_overlay"]
+DESKTOP_PATHS = REGISTRY["paths"]["desktop_overlay"]
+DELIVERY_PROBE_PROTOCOL_PATHS = REGISTRY["paths"]["delivery_probe_protocol"]
 SLOW_TESTS = (
     "runtime::peers::tests::a_round_left_behind_pulls_again_without_waiting_for_hello",
 )
@@ -85,22 +55,30 @@ PLATFORMS = (
     {"runner": "windows-2025", "target": "x86_64-pc-windows-msvc"},
 )
 JOBS = ("quick-check", "crypto-web", "web", "web-tests", "mobile-check", "desktop-check", "rust-check", "rust-fast", "rust-slow", "delivery", "package", "npm-package", "npm-smoke", "www")
-LOCAL_PROCESS_RULES = (
-    ("memory-sync", ("apps/core/src/store/bot_settings.rs", "apps/core/src/store/reduce.rs", "apps/core/src/store/log.rs", "apps/core/src/store/sync.rs", "apps/core/src/agent_context.rs", "apps/core/src/identity*", "crates/secure/*")),
-    ("auto-route", ("config/public-bootstrap.json", "apps/core/src/identity*", "apps/core/src/crypto.rs", "apps/core/src/local_access.rs", "apps/core/src/net*", "crates/secure/*", "crates/control/*")),
-    ("default", ("config/public-bootstrap.json", "apps/core/src/net*", "apps/core/src/runtime/peers.rs", "apps/core/src/store/sync.rs", "apps/core/src/store/log.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/fetch.rs", "apps/core/src/identity*", "crates/secure/*")),
-    ("phase1", ("apps/core/src/manager.rs", "apps/core/src/schedul*", "apps/core/src/work.rs", "apps/core/src/runtime/work.rs", "apps/core/src/runtime/followup.rs", "apps/core/src/runtime/schedule_delivery.rs", "apps/core/src/runtime/manager_control.rs", "apps/core/src/store/work.rs", "apps/core/src/store/scheduler.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/reduce.rs", "apps/core/src/store/log.rs")),
-    ("chat-agent", ("crates/bridge/*", "crates/control/*", "apps/cli/*", "apps/core/src/runtime/codex_server.rs", "apps/core/src/runtime/claude.rs", "apps/core/src/runtime/pi.rs", "apps/core/src/runtime/opencode.rs", "apps/core/src/runtime/provider_adapter.rs", "apps/core/src/runtime/provider_probe.rs", "apps/core/src/runtime/agent_tools.rs", "apps/core/src/runtime/chat_controls.rs", "apps/core/src/runtime/executor.rs", "apps/core/src/runtime/observation.rs", "apps/core/src/runtime/triage.rs", "apps/core/src/runtime/work.rs", "apps/core/src/runtime/followup.rs", "apps/core/src/runtime/bots.rs", "apps/core/src/runtime/manager_control.rs", "apps/core/src/agent_context.rs", "apps/core/src/providers.rs", "apps/core/src/triage.rs", "apps/core/src/tools.rs", "apps/core/src/work.rs", "apps/core/src/manager.rs", "apps/core/src/control.rs", "apps/core/src/store/triage.rs", "apps/core/src/store/questions.rs", "apps/core/src/store/work.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/bots.rs")),
-    ("phase4", ("crates/bridge/*", "crates/control/*", "apps/core/src/net*", "apps/core/src/runtime/peers.rs", "apps/core/src/runtime/work.rs", "apps/core/src/runtime/agent_tools.rs", "apps/core/src/runtime/manager_control.rs", "apps/core/src/work.rs", "apps/core/src/tools.rs", "apps/core/src/store/work.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/sync.rs", "apps/core/src/store/bots.rs", "apps/core/src/identity*", "apps/core/src/fetch.rs")),
-    ("public-node", ("config/public-bootstrap.json", "apps/core/src/net*", "apps/core/src/runtime/peers.rs", "apps/core/src/identity*", "apps/core/src/local_access.rs", "apps/core/src/crypto.rs", "crates/control/*")),
-    ("mesh", ("config/public-bootstrap.json", "apps/core/src/net*", "apps/core/src/runtime/peers.rs")),
-    ("phase5", ("apps/core/src/store/*", "apps/core/src/identity*", "apps/core/src/maintenance.rs", "apps/core/src/logging.rs", "crates/control/*", "crates/secure/src/recovery.rs")),
-    ("delivery-charity", PATH_RULES[0][1] + DELIVERY_PROBE_PROTOCOL_PATHS),
-)
+LOCAL_PROCESS_RULES = tuple((item["id"], item["patterns"]) for item in REGISTRY["process"])
+REGISTERED_SCOPES = {scope for item in REGISTRY["primary"] + REGISTRY["overlay"] for scope in item["scopes"]}
+ORDINARY_PROCESS_MODES = {item["id"] for item in REGISTRY["process"] if item.get("ordinary", True)}
+
+
+def primary_scopes(path):
+    for rule in REGISTRY["primary"]:
+        matched = False
+        if "exact" in rule:
+            matched = path in rule["exact"]
+        elif "regex" in rule:
+            matched = re.fullmatch(rule["regex"], path) is not None
+        elif "prefix" in rule:
+            suffixes = tuple(rule.get("suffix", ()))
+            matched = path.startswith(rule["prefix"]) and (not suffixes or path.endswith(suffixes))
+        else:
+            matched = any(fnmatch.fnmatchcase(path, pattern) for pattern in rule["patterns"])
+        if matched:
+            return tuple(rule["scopes"])
+    return ("full",)
 
 
 def local_process_modes(paths, full):
-    ordinary = {mode for mode, _ in LOCAL_PROCESS_RULES if mode != "delivery-charity"}
+    ordinary = ORDINARY_PROCESS_MODES
     selected = {mode for mode, _ in LOCAL_PROCESS_RULES} if full else set()
     for path in paths:
         matched = {mode for mode, patterns in LOCAL_PROCESS_RULES if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)}
@@ -113,16 +91,7 @@ def local_process_modes(paths, full):
 def make_plan(paths, event="pull_request", ref_type="branch", channel="hourly", *, package_policy="standard"):
     scopes = set()
     for path in paths:
-        if path in RELEASE_TOOL_PATHS:
-            scopes.add("release-tools")
-        elif path in ("apps/core/extensions/generated/pi.ts", "apps/core/extensions/generated/opencode.ts"):
-            scopes.update(("node", "cli"))
-        elif WEB_UNIT_TEST.fullmatch(path):
-            scopes.add("web-tests")
-        elif path.startswith("apps/app/") and path.endswith((".test.ts", ".test.tsx")):
-            scopes.add("full")
-        else:
-            scopes.add(next((scope for scope, patterns in PATH_RULES if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)), "full"))
+        scopes.update(primary_scopes(path))
         if any(fnmatch.fnmatchcase(path, pattern) for pattern in WWW_PATHS):
             scopes.add("www")
         if any(fnmatch.fnmatchcase(path, pattern) for pattern in MOBILE_PATHS):
@@ -137,7 +106,7 @@ def make_plan(paths, event="pull_request", ref_type="branch", channel="hourly", 
 
 def scope_plan(scopes, event, ref_type, channel, *, package_policy="standard"):
     if (
-        scopes - {"full", "docs", "release-tools", "web", "web-tests", "www", "mobile", "desktop", "delivery-acceptance", *DEPENDENTS}
+        scopes - (REGISTERED_SCOPES | set(DEPENDENTS))
         or event not in {"pull_request", "push", "schedule", "workflow_dispatch", "merge_group"}
         or ref_type not in {"branch", "tag"}
         or channel not in {"stable", "rc", "hourly"}
