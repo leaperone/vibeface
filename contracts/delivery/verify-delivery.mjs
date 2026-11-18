@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { compile, artifact, artifacts, requireDependency, root, schema } from './compile.mjs';
+import { deployFixtureContract, withLocalEvm } from './local-evm-fixture.mjs';
 
 const canonicalProfile = JSON.parse(fs.readFileSync(path.resolve(root, '../../crates/delivery/proof/profile.json'), 'utf8'));
 const directory = process.argv[2] ? path.resolve(process.argv[2]) : path.resolve(root, '../../crates/delivery/proof/fixtures');
@@ -83,19 +84,12 @@ for (const proof of publicProofs) {
     ordinary = hexlify(journal);
   }
 }
-const rpc = ganache.provider({ logging: { quiet: true }, chain: { chainId: 31337, hardfork: 'shanghai' } });
-const provider = new BrowserProvider(rpc, undefined, { cacheTimeout: -1 });
-provider.pollingInterval = 10;
-try {
+await withLocalEvm({ ganache, BrowserProvider }, async ({ provider }) => {
   const signer = await provider.getSigner();
   const a = artifact('RiscZeroAdapter');
-  const deploy = async image => {
-    const adapter = await new ContractFactory(a.abi, a.bytecode, signer).deploy(image);
-    await adapter.waitForDeployment(); return adapter;
-  };
   const mutate = (value, index = 0) => { const bytes = getBytes(value); assert(bytes.length > index); bytes[index] ^= 1; return hexlify(bytes); };
-  const adapter = await deploy(profile.guestImageId);
-  const wrongImage = await deploy(mutate(profile.guestImageId));
+  const adapter = await deployFixtureContract(ContractFactory, a, signer, profile.guestImageId);
+  const wrongImage = await deployFixtureContract(ContractFactory, a, signer, mutate(profile.guestImageId));
   const cases = [];
   async function check(name, value) { assert.equal(value, true, name); cases.push({ name, passed: true }); console.log(`PASS ${name}`); }
   for (const proof of publicProofs) {
@@ -110,4 +104,4 @@ try {
     imageId: profile.guestImageId.slice(2), profileId: expectedProfileId, passed: cases.length, cases };
   fs.writeFileSync(path.join(artifacts, 'delivery-proof-results.json'), `${JSON.stringify(result, null, 2)}\n`);
   console.log(JSON.stringify({ passed: result.passed, imageId: result.imageId, kind: result.kind }));
-} finally { await provider.destroy(); await rpc.disconnect(); }
+});
