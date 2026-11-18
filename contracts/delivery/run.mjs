@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { deliveryAbi } from './abi-model.mjs';
 import { compile, artifact, artifacts, requireDependency, schema } from './compile.mjs';
 import { deployFixtureContract, withLocalEvm } from './local-evm-fixture.mjs';
 
 const ganache = requireDependency('ganache');
-const { BrowserProvider, ContractFactory, Wallet, AbiCoder, sha256, toUtf8Bytes, hexlify, ZeroAddress, ZeroHash, MaxUint256 } = requireDependency('ethers');
+const { BrowserProvider, ContractFactory, Wallet, AbiCoder, sha256, toUtf8Bytes, getBytes, hexlify, ZeroAddress, ZeroHash, MaxUint256 } = requireDependency('ethers');
 compile();
+const model = deliveryAbi(artifact('AccountingTestEscrow'), { accounting: true });
+const productionModel = deliveryAbi(artifact('DeliveryEscrow'));
 await withLocalEvm({
   ganache,
   BrowserProvider,
@@ -18,11 +21,12 @@ await withLocalEvm({
   const wallet = new Wallet(accounts[1].secretKey);
   const tag = value => sha256(toUtf8Bytes(value));
   const coder = AbiCoder.defaultAbiCoder();
-  const profile = {
-    domain: tag('vibeface-delivery-profile-v1'), guestImageId: tag('accounting-test-image-not-a-delivery-proof'),
-    statementSchemaHash: sha256(toUtf8Bytes(schema)), cryptoSuite: 1, maxWindows: 2, maxWindowBytes: 65536,
-    maxTotalBytes: 131072, maxGuestCycles: 64000000, maxProverMemoryBytes: 17179869184n,
+  const fixtureProfile = {
+    guest_image_id: [...getBytes(tag('accounting-test-image-not-a-delivery-proof'))],
+    statement_schema_hash: [...getBytes(sha256(toUtf8Bytes(schema)))], crypto_suite: 1, max_windows: 2,
+    max_window_bytes: 65536, max_total_bytes: 131072, max_guest_cycles: 64000000, max_prover_memory_bytes: 17179869184,
   };
+  const { value: profile } = model.configuredProfile(fixtureProfile);
   const tx = async promise => (await promise).wait();
   async function deploy(name, args = []) {
     return deployFixtureContract(ContractFactory, artifact(name), payer, ...args, { gasLimit: 29000000 });
@@ -32,13 +36,9 @@ await withLocalEvm({
   const token = await deploy('TestToken', [payerAddress]);
   const tokenAddress = await token.getAddress();
   await tx(token.approve(escrowAddress, MaxUint256));
-  const fields = artifact('DeliveryEscrow').abi.find(x => x.name === 'preview').inputs[0].components;
-  assert.equal(fields.length, 47);
-  assert.equal(fields[42].name, 'priorityDeadline');
-  const statementType = `tuple(${fields.map(x => `${x.type} ${x.name}`).join(',')})`;
+  const { statementType, statementObject, encodeJournal: encoded } = model;
+  const fields = statementType.components;
   const emptyStatement = () => Object.fromEntries(fields.map(x => [x.name, x.type === 'address' ? ZeroAddress : x.type === 'bytes32' ? ZeroHash : 0n]));
-  const object = value => Object.fromEntries(fields.map(x => [x.name, value[x.name]]));
-  const encoded = value => coder.encode([statementType], [object(value)]);
   const seal = value => sha256(encoded(value));
   const now = async () => BigInt((await provider.getBlock('latest')).timestamp);
   const time = async value => {
@@ -50,7 +50,7 @@ await withLocalEvm({
     receiverKeySerial: 1n, keyValidFrom: start - 10n, keyValidUntil: start + 1000000n, bindingAction: 1n };
   async function register(overrides = {}, proofOverride) {
     const input = { ...emptyStatement(), relation: 1n, ...baseKey, ...overrides };
-    const b = object(await escrow.previewBinding(input));
+    const b = statementObject(await escrow.previewBinding(input));
     await tx(escrow.registerKey(input, proofOverride ?? seal(b)));
     return b;
   }
@@ -74,7 +74,7 @@ await withLocalEvm({
       holdDeadline: timestamp + 20000n, keyDeadline: timestamp + 30000n, openDeadline: timestamp + 40000n,
       retainUntil: timestamp + 50000n, priorityDeadline: timestamp + 25000n, payerOrderNonce: ++nonce,
       providerQuoteNonce: tag(`quote-${nonce}`), ...overrides };
-    const statements = (await escrow.preview(input, specs)).map(object);
+    const statements = (await escrow.preview(input, specs)).map(statementObject);
     const signature = await wallet.signTypedData({ name: 'VibefaceDelivery', version: '1', chainId: 31337, verifyingContract: escrowAddress },
       { DeliveryQuote: [{ name: 'quoteDigest', type: 'bytes32' }, { name: 'providerPeer', type: 'bytes32' }] },
       { quoteDigest: statements[0].quoteDigest, providerPeer: input.providerPeer });
@@ -256,7 +256,7 @@ await withLocalEvm({
     await tx(escrow.connect(keeper).withdrawBudget(b.id)); assert.equal((await state(b)).withdrawn, 17n);
     await tx(token.configure(0));
   });
-  const production = await deploy('DeliveryEscrow', [profile]);
+  const production = await deploy('DeliveryEscrow', [productionModel.configuredProfile(fixtureProfile).value]);
   assert((await provider.getCode(await production.getAddress())).length > 2);
   const report = { verifier: 'synthetic accounting digest only; not a ZK proof', maxBatchWindows: 2,
     productionRuntimeBytes: artifact('DeliveryEscrow').deployedBytes, cases: results };

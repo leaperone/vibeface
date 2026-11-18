@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { deliveryAbi } from './abi-model.mjs';
 import { compile, artifact, artifacts, requireDependency, root, schema } from './compile.mjs';
-const { AbiCoder, Contract, JsonRpcProvider, getAddress, getBytes, hexlify, recoverAddress, sha256, toUtf8Bytes } = requireDependency('ethers');
-const coder = AbiCoder.defaultAbiCoder();
+const { Contract, JsonRpcProvider, getAddress, getBytes, hexlify, recoverAddress, sha256, toUtf8Bytes } = requireDependency('ethers');
 const HASH = /^0x[0-9a-fA-F]{64}$/, ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 class Unverified extends Error {}
 function keys(value, required, optional = []) {
@@ -98,24 +98,26 @@ export function parseArguments(args) {
 function readRegular(file) { const stat = fs.lstatSync(file); assert(stat.isFile() && stat.size > 0 && stat.size <= 1048576); return fs.readFileSync(file); }
 function same(a, b) { assert.equal(a.toLowerCase(), b.toLowerCase()); }
 function address(a, b) { assert.equal(getAddress(a), getAddress(b)); }
+
+export function recordedPreviews(escrow, { statementObject }, at) {
+  // Contract calls resolve ABI parameters in place, so use plain values from the decoded transaction.
+  return {
+    binding: input => escrow.previewBinding(statementObject(input), at),
+    reservation: ({ input, specs }) => escrow.preview(statementObject(input), specs.toArray(true), at),
+  };
+}
+
 export async function observe({ bundleFile, rpcUrl }) {
   const report = { schemaVersion: 2, status: 'UNVERIFIED', case: 'protected', scope: 'genuine protected budget on the original local chain; binary receipts require independent host verification', checks: [], transactions: [], proofs: [] };
   let provider;
   try {
     const bundle = validateBundle(JSON.parse(readRegular(bundleFile))); compile({ checkTrust: true });
-    const built = artifact('DeliveryEscrow'), fields = built.abi.find(item => item.name === 'preview').inputs[0].components;
-    assert.equal(fields.length, 47); assert.equal(fields[42].name, 'priorityDeadline');
-    const statementType = `tuple(${fields.map(field => `${field.type} ${field.name}`).join(',')})`;
-    const object = value => Object.fromEntries(fields.map(field => [field.name, value[field.name]]));
-    const statementBytes = value => coder.encode([statementType], [object(value)]);
+    const built = artifact('DeliveryEscrow');
+    const model = deliveryAbi(built);
+    const { encodeJournal: statementBytes } = model;
     const canonical = JSON.parse(readRegular(path.resolve(root, '../../crates/delivery/proof/profile.json')));
-    const word = value => { assert(Array.isArray(value) && value.length === 32 && value.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255)); return hexlify(Uint8Array.from(value)); };
-    const profile = { domain: sha256(toUtf8Bytes('vibeface-delivery-profile-v1')), guestImageId: word(canonical.guest_image_id), statementSchemaHash: word(canonical.statement_schema_hash), cryptoSuite: canonical.crypto_suite,
-      maxWindows: canonical.max_windows, maxWindowBytes: canonical.max_window_bytes, maxTotalBytes: canonical.max_total_bytes, maxGuestCycles: canonical.max_guest_cycles, maxProverMemoryBytes: canonical.max_prover_memory_bytes };
+    const { value: profile, bytes: profileBytes, id: profileId } = model.configuredProfile(canonical);
     assert.equal(profile.statementSchemaHash, sha256(toUtf8Bytes(schema)));
-    const profileFields = built.abi.find(item => item.type === 'constructor').inputs[0].components;
-    const profileType = `tuple(${profileFields.map(field => `${field.type} ${field.name}`).join(',')})`;
-    const profileBytes = coder.encode([profileType], [profile]), profileId = sha256(profileBytes);
     provider = new JsonRpcProvider(rpcUrl, undefined, { cacheTimeout: -1 }); assert.equal((await provider.getNetwork()).chainId, 31337n);
     const tip = await provider.getBlockNumber(), anchorNumber = tip - 1;
     if (anchorNumber < 0) throw new Unverified('two experimental confirmation blocks are required');
@@ -124,7 +126,7 @@ export async function observe({ bundleFile, rpcUrl }) {
     const escrow = new Contract(bundle.escrow, built.abi, provider), token = new Contract(bundle.asset, artifact('TestToken').abi, provider);
     const trusted = async (name, target) => checkRuntime(trust.contracts[name], await provider.getCode(target, anchorNumber));
     await trusted('DeliveryEscrow', bundle.escrow); await trusted('TestToken', bundle.asset);
-    assert.equal(await escrow.profileId(at), profileId); assert.equal(coder.encode([profileType], [await escrow.getProfile(at)]), profileBytes);
+    assert.equal(await escrow.profileId(at), profileId); assert.equal(model.encodeObservedProfile(await escrow.getProfile(at)), profileBytes);
     const adapterAddress = await escrow.adapter(at), adapter = new Contract(adapterAddress, artifact('RiscZeroAdapter').abi, provider);
     await trusted('RiscZeroAdapter', adapterAddress); assert.equal(await adapter.imageId(at), profile.guestImageId);
     const verifierAddress = await adapter.verifier(at); await trusted('RiscZeroGroth16Verifier', verifierAddress);
@@ -138,11 +140,11 @@ export async function observe({ bundleFile, rpcUrl }) {
       keys(metadata, ['mode', 'kind', 'imageId', 'profileId', 'relation', 'journal', 'journalHash', 'seal']);
       assert.equal(metadata.mode, 'prove'); assert.equal(metadata.kind, 'groth16'); assert.equal(metadata.relation, entry.relation);
       same(bareHex(metadata.imageId, 32, 'image'), profile.guestImageId); same(bareHex(metadata.profileId, 32, 'profile'), profileId);
-      const journal = bareHex(metadata.journal, 1504, 'journal'), seal = bareHex(metadata.seal, 260, 'seal'), digest = bareHex(metadata.journalHash, 32, 'journal hash');
-      assert.equal(sha256(journal), digest); const statement = coder.decode([statementType], journal)[0]; assert.equal(statementBytes(statement), journal);
+      const journal = bareHex(metadata.journal, model.journalBytes, 'journal'), seal = bareHex(metadata.seal, 260, 'seal'), digest = bareHex(metadata.journalHash, 32, 'journal hash');
+      assert.equal(sha256(journal), digest); const statement = model.decodeJournal(journal);
       assert.equal(statement.relation, BigInt(entry.relation)); assert.equal(statement.chainId, 31337n); address(statement.escrow, bundle.escrow);
       same(statement.domain, sha256(toUtf8Bytes('vibeface-delivery-statement-v1'))); same(statement.profileId, profileId); same(statement.guestImageId, profile.guestImageId);
-      if (entry.relation === 1) assert.equal(statementBytes(await escrow.previewBinding(object(statement), at)), journal);
+      if (entry.relation === 1) assert.equal(statementBytes(await escrow.previewBinding(statement, at)), journal);
       else { same(statement.orderId, entry.orderId); assert.equal(statement.windowIndex, BigInt(entry.windowIndex)); assert.equal(statement.acceptance, 0n);
         assert.equal(statementBytes(await escrow.publicValues(entry.orderId, entry.windowIndex, entry.relation, at)), journal); }
       assert.equal(await adapter.verify(seal, digest, at), true, 'genuine public seal rejected');
@@ -176,8 +178,9 @@ export async function observe({ bundleFile, rpcUrl }) {
       return record;
     };
     const events = (record, name) => record.receipt.logs.filter(log => log.address.toLowerCase() === bundle.escrow.toLowerCase()).map(log => escrow.interface.parseLog(log)).filter(log => log?.name === name);
+    const previews = recordedPreviews(escrow, model, at);
     const registered = await transaction(bundle.transactions.registerKey, escrow, 'registerKey'); same(registered.parsed.args[1], key.seal);
-    assert.equal(statementBytes(await escrow.previewBinding(registered.parsed.args[0], at)), key.journal);
+    assert.equal(statementBytes(await previews.binding(registered.parsed.args[0])), key.journal);
     const approval = await transaction(bundle.transactions.approve, token, 'approve'); address(approval.tx.from, budget.payer); address(approval.parsed.args[0], bundle.escrow); assert.equal(approval.parsed.args[1], budget.deposit);
     const opened = await transaction(bundle.transactions.openBudget, escrow, 'openBudget'); address(opened.tx.from, budget.payer); address(opened.parsed.args[1], budget.payee); same(opened.parsed.args[2], budget.providerPeer); address(opened.parsed.args[3], bundle.asset); assert.equal(opened.parsed.args[4], budget.deposit);
     assert.equal(events(opened, 'BudgetOpened').length, 1); same(events(opened, 'BudgetOpened')[0].args[0], bundle.budgetId);
@@ -191,7 +194,7 @@ export async function observe({ bundleFile, rpcUrl }) {
         if (method === 'reserveBatch') {
           address(record.tx.from, budget.payer);
           for (const r of record.parsed.args[1]) {
-            const statements = await escrow.preview(r.input, r.specs, at), orderId = statements[0].orderId.toLowerCase(), order = orders.get(orderId); assert(order);
+            const statements = await previews.reservation(r), orderId = statements[0].orderId.toLowerCase(), order = orders.get(orderId); assert(order);
             assert.equal(r.seals.length, statements.length); count += statements.length;
             for (let index = 0; index < statements.length; index++) { const slot = `${orderId}:${index}`; assert(slots.has(slot) && !covered.get(method).has(slot)); covered.get(method).add(slot);
               const source = proofs.get(`2:${slot}`); assert.equal(statementBytes(statements[index]), source.journal); same(r.seals[index], source.seal); }
