@@ -1270,6 +1270,7 @@ def release_privacy_test(root, scratch):
             target = repo / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(root / name, target)
+        shutil.copyfile(root / "scripts/package-node-web.json", repo / "scripts/package-node-web.json")
         source = repo / "private build.rs"
         source.write_text('#[cfg(not(privacy_flag))] compile_error!("caller flag lost"); fn main() { println!("{}", file!()); }')
         binary = repo / "target/x86_64-unknown-linux-gnu/release/vibeface"

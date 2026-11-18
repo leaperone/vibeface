@@ -39,8 +39,7 @@ if ((notary_vars == 3)) && [[ -z "${VIBEFACE_CODESIGN_IDENTITY:-}" ]]; then
 fi
 
 cd "$repo"
-python3 "$repo/scripts/build-inputs.py" check crypto
-python3 "$repo/scripts/build-inputs.py" check web
+web="$(PYTHONPATH="$repo/scripts" python3 -B -c 'import release_assembly; print(release_assembly.prepare_node_web())')"
 build_args=(build --release -p vibeface -p vibeface-core --locked)
 target_dir="${CARGO_TARGET_DIR:-$repo/target}"
 if [[ -n "$target" ]]; then
@@ -52,15 +51,6 @@ else
   cli_binary="$target_dir/release/vibeface"
   core_binary="$target_dir/release/vibeface-core"
 fi
-web="$repo/apps/app/dist/client"
-[[ -s "$web/vibeface_secure.js" && -s "$web/vibeface_secure_bg.wasm" ]] || {
-  echo 'Browser cryptography is missing from the static output. Run scripts/build-web-crypto.sh and scripts/build-web.sh before building a package.' >&2
-  exit 1
-}
-[[ -s "$web/_shell.html" && -s "$web/index.html" && -s "$web/_redirects" && -s "$web/_headers" && -s "$web/.vibeface-build.json" ]] || {
-  echo 'Web client is missing. Run scripts/build-web.sh before building a package.' >&2
-  exit 1
-}
 release_rustflags="$(python3 "$repo/scripts/release-rustflags.py")"
 CARGO_ENCODED_RUSTFLAGS="$release_rustflags" cargo "${build_args[@]}"
 [[ -x "$cli_binary" && -x "$core_binary" ]] || { printf 'Release binaries are missing: %s and %s\n' "$cli_binary" "$core_binary" >&2; exit 1; }
@@ -78,9 +68,14 @@ staging="$(mktemp -d "$output/.vibeface-package.XXXXXX")"
 trap 'rm -rf "$staging"' EXIT
 name="vibeface-$version-$target"
 package="$staging/$name"
-mkdir -p "$package/scripts" "$package/web"
-cp "$cli_binary" "$package/vibeface"
-cp "$core_binary" "$package/vibeface-core"
+PYTHONPATH="$repo/scripts" python3 -B - "$package" "$target" "$cli_binary" "$core_binary" <<'PY'
+from pathlib import Path
+import sys
+import release_assembly
+
+package, target, cli, core = sys.argv[1:]
+release_assembly.stage_node_binaries(Path(package), target, Path(cli), Path(core))
+PY
 if [[ "$target" == *-apple-darwin && -n "${VIBEFACE_CODESIGN_IDENTITY:-}" ]]; then
   for binary in "$package/vibeface" "$package/vibeface-core"; do
     codesign --force --options runtime --timestamp --identifier cn.leaperone.vibeface --sign "$VIBEFACE_CODESIGN_IDENTITY" "$binary"
@@ -104,20 +99,12 @@ if [[ "$target" == *-apple-darwin && -n "${VIBEFACE_CODESIGN_IDENTITY:-}" ]]; th
     xcrun notarytool log "$submission" --key "$VIBEFACE_NOTARY_KEY" --key-id "$VIBEFACE_NOTARY_KEY_ID" --issuer "$VIBEFACE_NOTARY_ISSUER"
   fi
 fi
-cp -a "$web/." "$package/web/"
-cp "$repo/scripts/install-node-service.sh" "$package/scripts/"
-python3 "$repo/scripts/offline-docs.py" "$package"
-if [[ -f "$repo/LICENSE" ]]; then cp "$repo/LICENSE" "$package/"; fi
-PACKAGE_TARGET="$target" PYTHONPATH="$repo/scripts" python3 -B - "$package" "$output/$name.tar.gz" <<'PY'
-import os
+PYTHONPATH="$repo/scripts" python3 -B - "$package" "$target" "$web" "$output/$name.tar.gz" <<'PY'
 from pathlib import Path
 import sys
+import release_assembly
 
-import release_archive
-
-package, archive = map(Path, sys.argv[1:])
-release_archive.write_runtime_requirements(package, os.environ['PACKAGE_TARGET'])
-release_archive.seal_bundle(package)
-release_archive.public_archive(package, archive)
+package, target, web, archive = sys.argv[1:]
+release_assembly.archive_local_node(Path(package), target, Path(web), Path(archive))
 PY
 printf 'Package: %s\nChecksum: %s\n' "$output/$name.tar.gz" "$output/$name.tar.gz.sha256"
