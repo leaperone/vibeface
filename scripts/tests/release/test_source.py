@@ -8,7 +8,6 @@ import base64
 import ast
 import runpy
 import textwrap
-import copy
 import json
 import os
 import subprocess
@@ -19,7 +18,7 @@ import release_format
 import release_source
 import release_publisher
 import hourly
-from tests.release.support import Fixture, fixture_repository, pin, MODULES, SOURCE, CONTRACTS
+from tests.release.support import Fixture, fixture_repository, pin, MODULES, SOURCE
 
 
 class SourceContracts(unittest.TestCase):

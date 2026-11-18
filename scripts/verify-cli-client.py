@@ -26,7 +26,6 @@ import socket
 import struct
 import subprocess
 import threading
-import time
 import urllib.request
 import uuid
 from verification_harness import (

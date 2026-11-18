@@ -4,7 +4,6 @@ sys.dont_write_bytecode = True
 from pathlib import Path
 import tempfile
 import release_archive
-import release_context
 import release_format
 import release_inventory
 
