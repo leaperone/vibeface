@@ -150,7 +150,7 @@ scopes = ["delivery-acceptance"]
 [[rust_target]]
 id = "protocol"
 package = "vibeface-protocol"
-dependents = ["bridge", "control", "client"]
+dependents = ["bridge", "control", "client", "secure-ffi"]
 [[rust_target]]
 id = "bridge"
 package = "vibeface-bridge"

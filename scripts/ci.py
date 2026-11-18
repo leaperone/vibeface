@@ -504,7 +504,7 @@ def self_test():
         assert selected["delivery"] and "delivery" in selected["required_jobs"]
         assert selected["local_process_modes"] == list(dict(LOCAL_PROCESS_RULES))
         assert selected["rust_packages"] == ["vibeface-protocol", "vibeface-bridge", "vibeface-client",
-                                             "vibeface-core", "vibeface-control", "vibeface"]
+                                             "vibeface-core", "vibeface-control", "vibeface", "vibeface-secure-ffi"]
     bootstrap = make_plan(["config/public-bootstrap.json"])
     assert bootstrap["rust_packages"] == ["vibeface-core"] and bootstrap["web"]
     assert bootstrap["local_process_modes"] == ["auto-route", "default", "public-node", "mesh"]
@@ -580,7 +580,7 @@ def self_test():
     expected = {
         "node": ["vibeface-core"],
         "bridge": ["vibeface-bridge", "vibeface-client", "vibeface-core", "vibeface-control", "vibeface"],
-        "protocol": ["vibeface-protocol", "vibeface-bridge", "vibeface-client", "vibeface-core", "vibeface-control", "vibeface"],
+        "protocol": ["vibeface-protocol", "vibeface-bridge", "vibeface-client", "vibeface-core", "vibeface-control", "vibeface", "vibeface-secure-ffi"],
         "secure": ["vibeface-secure", "vibeface-client", "vibeface-core", "vibeface-control", "vibeface", "vibeface-secure-ffi"],
         "client": ["vibeface-client", "vibeface-core", "vibeface"],
         "control": ["vibeface-core", "vibeface-control", "vibeface"],

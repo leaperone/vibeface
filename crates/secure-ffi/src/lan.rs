@@ -17,11 +17,11 @@ use tokio::{
     runtime::Runtime,
     sync::{Mutex, OnceCell, OwnedSemaphorePermit, Semaphore, mpsc},
 };
+use vibeface_protocol::client_frame::ALPN;
 use vibeface_secure as secure;
 
 use crate::{Result, SecureError};
 
-const ALPN: &[u8] = b"vibeface/client/1";
 /// What a Node accepts in one frame.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_MESSAGE_RECORDS: usize =
