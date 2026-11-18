@@ -61,8 +61,13 @@ fn main() {
             "journalDigest": hex(hash(&batch.journal())),
         })
     };
-    println!(
-        "{}",
-        json!({"paid": vector(&claims(&[2,3])), "expire": vector(&claims(&[4]))})
-    );
+    let paid = claims(&[2, 3]);
+    let mut output = json!({"paid": vector(&paid), "expire": vector(&claims(&[4]))});
+    if args
+        .get(4)
+        .is_some_and(|arg| arg == "--include-test-claims")
+    {
+        output["testClaims"] = json!(paid);
+    }
+    println!("{output}");
 }

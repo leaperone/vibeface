@@ -1,3 +1,5 @@
+mod session;
+
 use anyhow::{Context, Result, bail, ensure};
 use bincode::Options;
 use risc0_zkvm::{
@@ -225,6 +227,10 @@ fn image_id() -> Vec<u8> {
 }
 
 fn checked_receipt(receipt: &Receipt, journal: &[u8]) -> Result<()> {
+    checked_receipt_for(receipt, journal, VIBEFACE_DELIVERY_GUEST_ID)
+}
+
+fn checked_receipt_for(receipt: &Receipt, journal: &[u8], image: [u32; 8]) -> Result<()> {
     ensure!(
         matches!(
             receipt.inner,
@@ -232,7 +238,7 @@ fn checked_receipt(receipt: &Receipt, journal: &[u8]) -> Result<()> {
         ),
         "genuine succinct or Groth16 receipt required"
     );
-    receipt.verify(VIBEFACE_DELIVERY_GUEST_ID)?;
+    receipt.verify(image)?;
     ensure!(receipt.journal.bytes == journal, "receipt journal mismatch");
     Ok(())
 }
@@ -366,6 +372,9 @@ fn main() -> Result<()> {
     );
     let args: Vec<_> = std::env::args().skip(1).collect();
     let command = args.first().map(String::as_str).unwrap_or("info");
+    if command.starts_with("session-") {
+        return session::run(command, &args);
+    }
     if command == "info" {
         println!(
             "{}",

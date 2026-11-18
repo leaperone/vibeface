@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { compile, artifact, requireDependency } from './compile.mjs';
 import { deployFixtureContract, withLocalEvm } from './local-evm-fixture.mjs';
@@ -9,6 +11,15 @@ const { BrowserProvider, ContractFactory, MaxUint256, ZeroHash, sha256, toUtf8By
 const repo = fileURLToPath(new URL('../../', import.meta.url));
 const tag = s => sha256(toUtf8Bytes(s));
 const tx = async promise => (await promise).wait();
+const prover = process.env.VIBEFACE_SESSION_PROVER;
+const proofDir = process.env.VIBEFACE_SESSION_PROOF_DIR;
+if (prover || proofDir) {
+  assert.ok(prover && isAbsolute(prover) && proofDir && isAbsolute(proofDir));
+}
+const runProver = (args, input) => JSON.parse(execFileSync(prover, args, {
+  cwd: repo, input, encoding: 'utf8', stdio: ['pipe', 'pipe', 'inherit'],
+}));
+const info = prover ? runProver(['session-info']) : null;
 
 compile({ checkTrust: true });
 await withLocalEvm({ ganache, BrowserProvider }, async ({ rpc, provider }) => {
@@ -16,9 +27,11 @@ await withLocalEvm({ ganache, BrowserProvider }, async ({ rpc, provider }) => {
   const deploy = (name, ...args) => deployFixtureContract(ContractFactory, artifact(name), payer, ...args);
   const token = await deploy('TestToken', payer.address);
   const relayPeer = tag('session-test-relay');
-  const deadline = ((await provider.getBlock('latest')).timestamp + 300) * 1000;
+  const startTime = (await provider.getBlock('latest')).timestamp;
+  const deadline = (startTime + (prover ? 24 * 60 * 60 : 300)) * 1000;
   async function budgetFor(name) {
-    const escrow = await deploy(name, await token.getAddress(), tag('accounting-fixture-not-a-proof'));
+    const image = name === 'SessionEscrow' && info ? `0x${info.imageId}` : tag('accounting-fixture-not-a-proof');
+    const escrow = await deploy(name, await token.getAddress(), image);
     const salt = tag('session-budget-test');
     await tx(token.approve(await escrow.getAddress(), MaxUint256));
     const budget = await escrow.openBudget.staticCall(salt, relay.address, relayPeer, 100);
@@ -26,6 +39,7 @@ await withLocalEvm({ ganache, BrowserProvider }, async ({ rpc, provider }) => {
     const vector = JSON.parse(execFileSync('cargo', [
       'run', '--locked', '--quiet', '-p', 'vibeface-delivery', '--example', 'session-settlement-vector', '--',
       await escrow.deployment(), budget, relayPeer, String(deadline),
+      ...(info && name === 'SessionEscrow' ? ['--include-test-claims'] : []),
     ], { cwd: repo, encoding: 'utf8' }));
     const terms = order => [order.delivery, order.context, order.amount, order.deadline];
     return { escrow, budget, vector, terms };
@@ -66,6 +80,28 @@ await withLocalEvm({ ganache, BrowserProvider }, async ({ rpc, provider }) => {
     production.budget, production.vector.paid.orders.map(order => order.id), production.vector.paid.journalDigest,
   ));
 
+  if (info) {
+    const witness = JSON.stringify(production.vector.testClaims);
+    const expected = production.vector.paid.journalDigest;
+    const execution = runProver(['session-execute'], witness);
+    assert.equal(`0x${execution.journalHash}`, expected);
+    assert.equal(execution.proved, false);
+    console.log(`Session guest execution matched the EVM journal (${execution.cycles} cycles); generating proof.`);
+    const path = join(proofDir, 'session-groth16.receipt');
+    const checkpoint = join(proofDir, 'session-succinct.receipt');
+    const proof = runProver(['session-prove', path, '--succinct-receipt', checkpoint], witness);
+    assert.equal(proof.imageId, info.imageId);
+    assert.equal(`0x${proof.journalHash}`, expected);
+    assert.equal(proof.kind, 'groth16');
+    assert.deepEqual(runProver(['session-verify', proof.journal], readFileSync(path)), proof);
+    const orderIds = production.vector.paid.orders.map(order => order.id);
+    await tx(production.escrow.connect(keeper).settleBatch(production.budget, orderIds, `0x${proof.seal}`));
+    await assert.rejects(production.escrow.settleBatch.staticCall(production.budget, orderIds, `0x${proof.seal}`));
+    await tx(production.escrow.connect(keeper).withdraw(production.budget));
+    assert.equal(await token.balanceOf(relay.address), 10n);
+    console.log('Production verifier accepted a genuine session proof and the relay received the TestToken batch payout.');
+  }
+
   await rpc.request({ method: 'evm_setTime', params: [expire.deadline + 1000] });
   await rpc.request({ method: 'evm_mine', params: [] });
   await assert.rejects(escrow.settleBatch.staticCall(budget, [expire.id], vector.expire.journalDigest));
@@ -74,4 +110,4 @@ await withLocalEvm({ ganache, BrowserProvider }, async ({ rpc, provider }) => {
   await assert.rejects(escrow.refundExpired.staticCall(budget, [expire.id]));
 });
 
-console.log('Rust journal and loopback session escrow agree; accounting passed with a test digest, not a ZK proof.');
+if (!info) console.log('Rust journal and loopback session escrow agree; accounting passed with a test digest, not a ZK proof.');
