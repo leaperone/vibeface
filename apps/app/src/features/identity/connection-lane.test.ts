@@ -10,8 +10,9 @@ import { canonical } from '@vibeface/client/lib/node.ts'
 import type { Platform } from '@vibeface/client/lib/platform.ts'
 import { primaryLane, shouldAutoConnect } from '@vibeface/client/identity/connection-lane.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
-import { joinLink, joinTicket } from '@vibeface/client/lib/transport.ts'
+import { createTransport, joinLink, joinTicket, type DeviceKeys, type LanStream } from '@vibeface/client/lib/transport.ts'
 import { hookHarness, moduleLoader } from '../../lib/test-harness.ts'
+import initCrypto, * as wasm from '../../../generated/vibeface_secure.js'
 
 test('one saved entry connects itself, and several entries stay listed', () => {
   assert.equal(shouldAutoConnect({ hasInvitation: false, savedCount: 1 }), true)
@@ -60,7 +61,10 @@ const until = async (ready: () => boolean) => {
 }
 
 const remote = '6'.repeat(64), freshKey = '7'.repeat(64)
-function deviceHarness({ joining = '', saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>(), tabStorage = new Map<string, string>(), removed = false, origin = '', entryAddrs = [] as string[] } = {}) {
+function deviceHarness({ joining = '', saved = false, local = '', invitation = '', localSession = false, management = false, fragment = '', storage = new Map<string, string>(), tabStorage = new Map<string, string>(), removed = false, origin = '', entryAddrs = [] as string[], realTransport }: {
+  joining?: string; saved?: boolean; local?: string; invitation?: string; localSession?: boolean; management?: boolean; fragment?: string
+  storage?: Map<string, string>; tabStorage?: Map<string, string>; removed?: boolean; origin?: string; entryAddrs?: string[]; realTransport?: Platform['transport']
+} = {}) {
   const hooks = hookHarness(true), { effects, afterRender } = hooks
   const timers = new Map<number, () => void>()
   const stored = storage, calls: string[] = [], navigations: string[] = []
@@ -101,12 +105,13 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
   const transport = {
     validTarget: (value: string) => value, validEndpoint: (value: string) => value, joinTicket, joinLink,
     initClient: async () => ({ deviceId: key }), signClient: async (purpose: string) => { signatures.push(purpose); return 'signature' },
-    replaceClient: async () => {
+    replaceClient: async ({ beforeRemove, onReplaced }: NonNullable<Parameters<Platform['transport']['replaceClient']>[0]> = {}) => {
       calls.push('replace-key')
-      const replacing = holds.get('replace-key')
-      if (replacing) await replacing.promise
+      beforeRemove?.()
       key = freshKey
-      return { deviceId: key }
+      const replacement = { deviceId: key }
+      onReplaced?.(replacement)
+      return replacement
     },
     parseJoinLink: async () => {
       const parsing = holds.get('parse-join-link')
@@ -200,7 +205,7 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
   const Provider = load(resolve(clientRoot, 'identity/context.tsx')).DeviceProvider
   const platform = {
     reserveDeliveryIntent: async () => { throw new Error('unexpected delivery reservation') },
-    secure: { verify(rootKey: string, domain: string, _payload: Uint8Array, signature: string) { assert.equal(rootKey, network); assert.equal(domain, 'identity-recovery'); assert.equal(signature, '3'.repeat(128)) } }, transport, storage: sandbox.localStorage, page: load(resolve(sourceRoot, 'lib/local-page.ts')).localPage, self: '这个浏览器', saveRecovery(_bytes: Uint8Array, _name: string) {}, recoveryStorage: undefined as Platform['recoveryStorage'], joinTabs: undefined as Platform['joinTabs'], erase: undefined as Platform['erase'] }
+    secure: { verify(rootKey: string, domain: string, _payload: Uint8Array, signature: string) { assert.equal(rootKey, network); assert.equal(domain, 'identity-recovery'); assert.equal(signature, '3'.repeat(128)) } }, transport: realTransport ?? transport, storage: sandbox.localStorage, page: load(resolve(sourceRoot, 'lib/local-page.ts')).localPage, self: '这个浏览器', saveRecovery(_bytes: Uint8Array, _name: string) {}, recoveryStorage: undefined as Platform['recoveryStorage'], joinTabs: undefined as Platform['joinTabs'], erase: undefined as Platform['erase'] }
   let tabReceive: ((serialized: string) => void) | undefined
   const enableTabs = () => { platform.joinTabs = (_name, handlers) => { tabReceive = value => handlers.message(JSON.parse(value)); const stop = handlers.lead(); return { post() {}, close() { tabReceive = undefined; stop?.() } } } }
   let restarts = 0
@@ -807,16 +812,14 @@ for (const invalidatedBy of ['manual connection', 'disconnect', 'unmount']) test
   } finally { if (invalidatedBy !== 'unmount') app.close() }
 })
 
-for (const stage of ['parse-join-link', 'replace-key']) test(`join cannot take a newer connection after awaiting ${stage}`, async () => {
-  const app = deviceHarness({ removed: stage === 'replace-key' }), hold = deferred()
+test('join cannot take a newer connection after awaiting link parsing', async () => {
+  const app = deviceHarness(), hold = deferred()
   try {
     app.render(); await settle()
-    if (stage === 'parse-join-link') app.holds.set('parse-join-link', hold)
-    else app.holds.set('replace-key', hold)
+    app.holds.set('parse-join-link', hold)
     const join = app.render().join('vibeface://join/vibeface1ticket', 'browser')
     const rejected = assert.rejects(join, /连接已切换/)
-    if (stage === 'replace-key') await until(() => app.calls.includes('replace-key'))
-    else await settle()
+    await settle()
     const accepted = deferred(); accepted.resolve({ principal: { device_id: subject } })
     app.holds.set('authenticate', accepted)
     await app.render().connect({ ...entry, device_id: remote })
@@ -924,6 +927,153 @@ test('a removed browser joins again as a new device and never offers its revoked
     assert.equal(app.render().identity?.deviceId, freshKey)
     assert.equal(app.render().joining?.status, 'pending')
   } finally { app.close() }
+})
+
+for (const result of ['success', 'post-write failure', 'write failure', 'old key reload']) test(`revoked join key persistence keeps the provider and new connection consistent after ${result}`, async () => {
+  await initCrypto({ module_or_path: readFileSync(new URL('../../../generated/vibeface_secure_bg.wasm', import.meta.url)) })
+  const previous = wasm.Identity.generate(), replacement = wasm.Identity.generate(), node = wasm.Identity.generate()
+  const originalId = previous.deviceId(), replacementId = replacement.deviceId(), nodeId = node.deviceId()
+  const fresh = async (identity: typeof previous) => {
+    const data = Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), Buffer.from(identity.secretHex(), 'hex')])
+    return crypto.subtle.importKey('pkcs8', data, 'Ed25519', false, ['sign'])
+  }
+  const oldSigner = await fresh(previous), newSigner = await fresh(replacement), nodeSigner = await fresh(node)
+  let saved: { deviceId: string; signer: CryptoKey } | undefined = { deviceId: originalId, signer: oldSigner }
+  const removing = deferred(), removeStarted = deferred(), loading = deferred(), loadStarted = deferred()
+  const signing = deferred(), signStarted = deferred()
+  let holdSignature = false
+  const readbacks: (boolean | undefined)[] = []
+  let provisionAttempts = 0
+  const keys: DeviceKeys = {
+    async load({ replaceLostKey, existingOnly }) {
+      if (!replaceLostKey) readbacks.push(existingOnly)
+      if (!saved) {
+        if (existingOnly) throw Object.assign(new Error('恢复后的密钥尚未保存。'), { code: 'key_lost' })
+        assert.equal(replaceLostKey, true)
+        provisionAttempts++
+        loadStarted.resolve(null)
+        await loading.promise
+        if (result === 'write failure') throw new Error('密钥写入失败。')
+        saved = result === 'old key reload' ? { deviceId: originalId, signer: oldSigner } : { deviceId: replacementId, signer: newSigner }
+        if (result === 'post-write failure' || result === 'old key reload') throw new Error('密钥写入后读回失败。')
+      }
+      return { deviceId: saved.deviceId }
+    },
+    async remove() { removeStarted.resolve(null); await removing.promise; saved = undefined },
+    async sign(bytes) {
+      assert.ok(saved)
+      const signer = saved.signer
+      if (holdSignature) { holdSignature = false; signStarted.resolve(null); await signing.promise }
+      return Buffer.from(await crypto.subtle.sign('Ed25519', signer, new Uint8Array(bytes))).toString('hex')
+    },
+  }
+  const requests: { address: string; method: string; deviceId: string }[] = []
+  const opened: string[] = []
+  const dial = async ({ address }: { address: string }): Promise<LanStream> => {
+    opened.push(address)
+    const handshake = new wasm.Handshake(false, undefined, new TextEncoder().encode('vibeface:client:v1'))
+    handshake.setProof(nodeId, Buffer.from(await crypto.subtle.sign('Ed25519', nodeSigner, new Uint8Array(handshake.signingBytes()))).toString('hex'))
+    let channel: ReturnType<typeof handshake.finish> | undefined
+    let remoteId: string | undefined
+    type Frame = Awaited<ReturnType<LanStream['recv']>>
+    const frames: Frame[] = []
+    let wake: (frame: Frame) => void = frame => frames.push(frame)
+    function emit(data: Uint8Array) { wake({ text: false, data }) }
+    return {
+      send(frame) {
+        if (!channel) {
+          handshake.read(frame)
+          if (!handshake.isFinished()) { emit(handshake.write(new Uint8Array())); return }
+          remoteId = handshake.remoteId()
+          channel = handshake.finish(); handshake.free()
+          return
+        }
+        const bytes = channel.openRecord(frame)
+        if (!bytes) return
+        const { id, method } = JSON.parse(new TextDecoder().decode(bytes))
+        assert.ok(remoteId)
+        requests.push({ address, method, deviceId: remoteId })
+        const result = method === 'info' ? { device_id: nodeId, name: 'Node', version: 'test', initialized: true, network_id: network }
+          : method === 'authenticate' ? (address === entry.address ? { ...notMember, revoked: true } : { principal: { device_id: remoteId, network_id: network } })
+          : method === 'entrances' ? { entrances: [] } : {}
+        for (const reply of channel.sealMessage(new TextEncoder().encode(JSON.stringify({ id, result })))) emit(reply)
+      },
+      recv() {
+        if (frames.length) return Promise.resolve(frames.shift() ?? null)
+        return new Promise(resolve => { wake = frame => { wake = next => frames.push(next); resolve(frame) } })
+      },
+      close() { if (channel) channel.free(); else handshake.free(); wake(null) },
+    }
+  }
+  const runtime = createTransport(wasm, keys, undefined, undefined, dial)
+  const app = deviceHarness({ realTransport: runtime })
+  const verify = app.secure.verifyAuthentication
+  app.secure.verifyAuthentication = (auth?: { principal: { device_id: string } }, identity?: { deviceId: string }) => {
+    assert.equal(auth?.principal.device_id, identity?.deviceId)
+    assert.equal(identity?.deviceId, saved?.deviceId)
+    const verified = verify()
+    return { ...verified, principal: { ...verified.principal, device_id: auth?.principal.device_id ?? '' } }
+  }
+  const other = { ...entry, address: 'https://replacement.example', device_id: nodeId }
+  let connected: Promise<void> | undefined, stale: Promise<void> | undefined, obsoleteSignature: Promise<void> | undefined
+  try {
+    app.render(); await until(() => app.render().identity?.deviceId === originalId)
+    holdSignature = true
+    obsoleteSignature = assert.rejects(runtime.signClient('identity-governance', 'old signed operation'), /设备连接已取消/)
+    void obsoleteSignature.catch(() => {})
+    await signStarted.promise
+    const invite = joinLink(wasm.ticketEncode(`vibeface://node/${nodeId}`, '1'.repeat(64)))
+    const join = app.render().join(invite, 'browser')
+    stale = assert.rejects(join, result === 'success' ? /连接已切换/ : /密钥写入/)
+    void stale.catch(() => {})
+    await removeStarted.promise
+    connected = app.render().connect(other)
+    void connected.catch(() => {})
+    await settle()
+    assert.deepEqual(opened, [entry.address])
+    await assert.rejects(runtime.signClient('identity-governance', 'signing while keys change'), /设备连接已取消/)
+    removing.resolve(null)
+    await loadStarted.promise
+    await settle()
+    assert.deepEqual(opened, [entry.address])
+    assert.equal(app.render().identity?.deviceId, originalId)
+    loading.resolve(null)
+    if (result === 'write failure' || result === 'old key reload') {
+      const error = result === 'write failure' ? /密钥尚未保存/ : /还无法确认新的设备登录信息/
+      await Promise.all([stale, assert.rejects(connected, error)])
+      assert.deepEqual(opened, [entry.address])
+      assert.equal(app.render().identity?.deviceId, originalId)
+      assert.equal(app.render().ready, null)
+      assert.equal(provisionAttempts, 1, 'readback never provisions a second key')
+      assert.deepEqual(readbacks, [false, true])
+      assert.equal(saved?.deviceId, result === 'write failure' ? undefined : originalId)
+      await assert.rejects(runtime.signClient('identity-governance', 'unpublished identity'), /设备连接已取消/)
+      assert.equal(app.stored.get('vibeface.pending-join') ?? 'null', 'null')
+      assert.equal(requests.some(request => request.method === 'join'), false)
+      signing.resolve(null); await obsoleteSignature
+      return
+    }
+    await Promise.all([stale, connected])
+    assert.deepEqual(opened, [entry.address, other.address])
+    assert.deepEqual(requests.filter(request => request.method === 'authenticate').map(request => request.deviceId), [originalId, replacementId])
+    assert.equal(app.render().ready?.principal.device_id, replacementId)
+    assert.equal(app.render().identity?.deviceId, saved?.deviceId)
+    assert.equal(provisionAttempts, 1)
+    assert.deepEqual(readbacks, result === 'post-write failure' ? [false, true] : [false])
+    assert.equal(app.stored.get('vibeface.pending-join') ?? 'null', 'null')
+    assert.equal(requests.some(request => request.method === 'join'), false)
+    signing.resolve(null); await obsoleteSignature
+    const payload = new TextEncoder().encode('deterministic signer check')
+    const signature = await runtime.signClient('identity-governance', payload)
+    wasm.verify(replacementId, 'identity-governance', payload, signature)
+    assert.throws(() => wasm.verify(originalId, 'identity-governance', payload, signature))
+  } finally {
+    removing.resolve(null); loading.resolve(null); signing.resolve(null)
+    await connected?.catch(() => {})
+    await stale?.catch(() => {})
+    await obsoleteSignature?.catch(() => {})
+    app.close(); previous.free(); replacement.free(); node.free()
+  }
 })
 
 for (const [status, reason, message] of [['rejected', 'commitment_mismatch', /校验失败/], ['rejected', 'rejected', /拒绝/], ['expired', null, /过期/]] as const) test(`a ${reason ?? status} join is cleared and explained`, async () => {
@@ -1326,6 +1476,45 @@ test('two confirmations share one recovery plan and a dropped submission only re
     assert.equal(app.render().unsavedRecovery?.code, backup)
     assert.equal(copies.length, 1)
   } finally { app.close() }
+})
+
+test('an obsolete recovery probe keeps its original wait but cannot write error feedback during a new handshake', async () => {
+  const app = deviceHarness(), submission = deferred(), readback = deferred(), handshake = deferred()
+  const from = { file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry }
+  const next = { ...entry, address: 'https://new-connection.example', device_id: remote }
+  let opening: Promise<void> | undefined
+  try {
+    app.render(); await settle()
+    await app.render().beginRecovery(from)
+    const review = app.render().review
+    assert.ok(review?.kind === 'recovery')
+    app.holds.set('recover', submission)
+    app.holds.set('authenticate', readback)
+    const original = app.render().confirmRecovery(review.members)
+    const reportsUnknown = assert.rejects(original, /正在向原设备查询进度/)
+    await until(() => app.calls.includes('recover'))
+    const stored = app.stored.get('vibeface.recovery-wait')
+    assert.ok(stored)
+    submission.reject(new Error('connection lost'))
+    await until(() => app.calls.includes('authenticate'))
+    app.holds.delete('authenticate')
+    app.holds.set(`open:${next.address}`, handshake)
+    opening = app.render().connect(next)
+    await until(() => app.sockets.at(-1)?.entry.device_id === remote)
+    assert.equal(app.render().phase, 'connecting')
+    assert.equal(app.render().ready, null)
+    readback.resolve({ principal: { device_id: subject } })
+    await reportsUnknown
+    assert.equal(app.render().error, '')
+    assert.equal(app.stored.get('vibeface.recovery-wait'), stored)
+    assert.deepEqual(app.sockets.map(socket => socket.entry.device_id), [target, target, remote])
+    handshake.resolve(null); await opening
+    assert.equal(app.render().ready?.entry.device_id, remote)
+    assert.equal(app.calls.filter(call => call === 'recover').length, 1)
+  } finally {
+    app.close(); handshake.resolve(null)
+    await opening?.catch(() => {})
+  }
 })
 
 test('a failed authentication on the re-opened recovery channel leaves polling re-entrant', async () => {

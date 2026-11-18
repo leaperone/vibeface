@@ -1054,10 +1054,23 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       if (!owner.current() || session.current !== active) throw changed()
       if (loadJoining().kind !== 'empty') throw joinRecordError()
       if (revoked) {
-        const fresh = publicIdentity(await replaceClient())
-        if (!owner.current() || session.current !== active) throw changed()
-        identityRef.current = fresh; setIdentity(fresh)
-        active = await open(active.entry, { onGenerationChanged: owner.rebind })
+        const entry = active.entry
+        resetForAction(owner.rebind); setPhase('connecting'); setEntry(entry)
+        try {
+          await replaceClient({
+            beforeRemove() { if (!owner.current()) throw changed() },
+            onReplaced(replacement) {
+              // After deleting the old key, the replacement belongs to this device even if this join was cancelled.
+              const fresh = publicIdentity(replacement)
+              identityRef.current = fresh; setIdentity(fresh)
+            },
+          })
+        } catch (cause) {
+          if (owner.current()) { setPhase('disconnected'); setError(messageOf(cause)) }
+          throw cause
+        }
+        if (!owner.current()) throw changed()
+        active = await open(entry, { onGenerationChanged: owner.rebind })
       }
       if (!owner.current() || session.current !== active) throw changed()
       const me = own().deviceId
@@ -1368,10 +1381,11 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
             if (recoveryPaused.current || (!ownsFlow() && !dropped)) throw cause
             if (session.current === active) resetForAction(onGenerationChanged)
             setRecovery({ status: 'waiting', effectiveAt: null })
-            const confirmed = await checkRecovery(wait, onGenerationChanged).catch(() => false)
+            const readback = trackConnection(onGenerationChanged)
+            const confirmed = await checkRecovery(wait, readback.rebind).catch(() => false)
             if (confirmed) return
             const message = `${messageOf(cause)} 找回结果尚未确认，正在向原设备查询进度。`
-            if (!recoveryPaused.current && !session.current) setError(message)
+            if (readback.current() && !recoveryPaused.current && !session.current && !openingConnection.current) setError(message)
             throw new Error(message)
           }
           if (!ownsFlow()) throw changed()

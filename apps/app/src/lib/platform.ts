@@ -45,14 +45,14 @@ async function keys<T>(mode: IDBTransactionMode, operation: (store: IDBObjectSto
 let device: StoredKey | undefined
 /** The device key is a non-extractable Ed25519 CryptoKey; page scripts can only ask it to sign. */
 const browserKeys: DeviceKeys = {
-  async load({ replaceLostKey }) {
+  async load({ replaceLostKey, existingOnly }) {
     if (!globalThis.isSecureContext || !globalThis.crypto?.subtle || !globalThis.indexedDB) throw new Error('这个地址不能安全保存登录信息。在这台电脑上直接打开，或换成 HTTPS 地址。')
     await init()
     let record = await keys<StoredKey | undefined>('readonly', store => store.get('device'))
     if (!record) {
       let created = false
       try { created = localStorage.getItem('vibeface.device-created') === 'true' } catch {}
-      if (created && !replaceLostKey) throw Object.assign(new Error(lostKeyMessage), { code: 'key_lost' })
+      if (existingOnly || created && !replaceLostKey) throw Object.assign(new Error(lostKeyMessage), { code: 'key_lost' })
       let pair: CryptoKeyPair
       try { pair = await crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']) as CryptoKeyPair }
       catch { throw new Error('这个浏览器版本太旧。更新浏览器后重试。') }
