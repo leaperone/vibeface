@@ -1,4 +1,6 @@
 //! Management SDKs receive visible context and explicit Node capabilities.
+mod turn_context;
+
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -10,8 +12,9 @@ use std::{
     time::Duration,
 };
 use tokio::sync::watch;
+pub(crate) use turn_context::TurnExecutionContext;
+pub(crate) use vibeface_bridge::agent::redact_text as redact_string;
 pub use vibeface_bridge::agent::{AgentFailure as ManagerFailure, StartEvidence};
-pub(crate) use vibeface_bridge::agent::{redact_progress as redact, redact_text as redact_string};
 use vibeface_bridge::{
     agent::{self, AgentResult, CursorAgent, CursorTurn, CustomToolConfig},
     codex::DirectSession,
@@ -272,28 +275,6 @@ impl ManagerError {
         }
         .into()
     }
-    /// Snapshots the current attempt evidence and redacts the failure when it is reported.
-    pub(crate) fn reporter<'a>(
-        stage: &'a vibeface_bridge::failure::ProviderTrace,
-        start: &'a std::sync::Mutex<StartEvidence>,
-        secrets: &'a [String],
-    ) -> impl Fn(ManagerFailure, Option<&str>, ExecFailure) -> anyhow::Error + 'a {
-        move |outcome, session_id: Option<&str>, failure: ExecFailure| {
-            Self {
-                stage: stage.current(),
-                outcome,
-                start: *start
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-                session_id: session_id.map(str::to_owned),
-                failure: ExecFailure {
-                    detail: redact_string(failure.detail, secrets),
-                    ..failure
-                },
-            }
-            .into()
-        }
-    }
     pub fn uncertain(&self) -> bool {
         self.outcome == ManagerFailure::Unknown
     }
@@ -321,39 +302,7 @@ where
     P: FnMut(Value) -> PF,
     PF: Future<Output = Result<()>>,
 {
-    (|| -> Result<()> {
-        ensure!(config.timeout_secs > 0, "manager timeout must be positive");
-        ensure!(
-            config.workspace.is_absolute() && config.workspace.is_dir(),
-            "manager workspace must be an existing absolute directory"
-        );
-        ensure!(
-            !prompt.trim().is_empty() && prompt.len() <= MAX_PROMPT,
-            "management prompt must be nonempty and at most 65536 bytes"
-        );
-        if let Some(id) = previous_session_id {
-            vibeface_protocol::validate_id(id).map_err(anyhow::Error::msg)?;
-        }
-        config
-            .sdk
-            .provider()
-            .validate_reasoning_effort(config.reasoning_effort.as_deref())?;
-        Ok(())
-    })()
-    .map_err(ManagerError::not_started)?;
-    if *cancel.borrow() {
-        return Err(ManagerError {
-            stage: ProviderStage::Validate,
-            outcome: ManagerFailure::Cancelled,
-            start: StartEvidence::NotStarted,
-            session_id: previous_session_id.map(str::to_owned),
-            failure: ExecFailure::new(
-                FailureKind::Unknown,
-                "management cancelled before SDK launch",
-            ),
-        }
-        .into());
-    }
+    let context = TurnExecutionContext::new(config, prompt, previous_session_id, &cancel)?;
     match &config.sdk {
         Sdk::Cursor {
             bridge,
@@ -361,71 +310,53 @@ where
             owner,
             local_store_root,
         } => {
-            let not_started = |stage, kind, detail: &str| ManagerError {
-                stage,
-                outcome: ManagerFailure::Failed,
-                start: StartEvidence::NotStarted,
-                session_id: previous_session_id.map(str::to_owned),
-                failure: ExecFailure::new(kind, detail),
-            };
             let bridge = bridge.as_ref().ok_or_else(|| {
-                not_started(
+                context.preflight_failure(
                     ProviderStage::Launch,
                     FailureKind::MissingBinary,
                     "this Node has no Cursor ACP bridge yet",
                 )
             })?;
-            let env = config.provider_env.clone();
             let owner = owner.as_deref().ok_or_else(|| {
-                not_started(
+                context.preflight_failure(
                     ProviderStage::Validate,
                     FailureKind::Unknown,
                     "Cursor ACP manager has no stable process owner",
                 )
             })?;
             let local_store_root = local_store_root.as_ref().ok_or_else(|| {
-                not_started(
+                context.preflight_failure(
                     ProviderStage::Validate,
                     FailureKind::Unknown,
                     "Cursor ACP manager has no private native store",
                 )
             })?;
             let native_agent = Arc::new(std::sync::Mutex::new(None::<String>));
-            let record = config.turn_binding.as_ref().map(|turn| turn.record.clone());
-            let started = config
-                .turn_binding
-                .as_ref()
-                .and_then(|turn| turn.started.clone());
-            let record_for_start = record.clone();
-            let started_for_start = started.clone();
-            let run_started =
-                (record_for_start.is_some() || started_for_start.is_some()).then(|| {
-                    let native_agent = native_agent.clone();
-                    let record = record_for_start;
-                    let started = started_for_start;
-                    let callback: agent::RunStarted = Arc::new(move |run| {
-                        let native_agent = native_agent
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .clone();
-                        let record = record.clone();
-                        let started = started.clone();
-                        Box::pin(async move {
-                            if let Some(record) = record {
-                                record(
-                                    native_agent.context("Cursor run has no persisted agent ID")?,
-                                    Some(run.clone()),
-                                )
-                                .await?;
-                            }
-                            if let Some(started) = started {
-                                started(run).await?;
-                            }
-                            Ok(())
-                        })
-                    });
-                    callback
+            let run_started = config.turn_binding.as_ref().map(|binding| {
+                let native_agent = native_agent.clone();
+                let record = binding.record.clone();
+                let started = binding.started.clone();
+                let callback: agent::RunStarted = Arc::new(move |run| {
+                    let native_agent = native_agent
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    let record = record.clone();
+                    let started = started.clone();
+                    Box::pin(async move {
+                        record(
+                            native_agent.context("Cursor run has no persisted agent ID")?,
+                            Some(run.clone()),
+                        )
+                        .await?;
+                        if let Some(started) = started {
+                            started(run).await?;
+                        }
+                        Ok(())
+                    })
                 });
+                callback
+            });
             let turn = CursorTurn {
                 owner: owner.into(),
                 client_id: config.turn_binding.as_ref().map_or_else(
@@ -435,7 +366,7 @@ where
                 executable: sdk_bin.clone(),
                 workspace: config.workspace.clone(),
                 local_store_root: local_store_root.clone(),
-                env,
+                env: context.provider_env().clone(),
                 model: config.model.clone(),
                 timeout_secs: config.timeout_secs,
                 custom_tools: config.custom_tools.clone(),
@@ -446,28 +377,25 @@ where
             let result = bridge
                 .run(
                     &turn,
-                    prompt,
-                    previous_session_id,
+                    context.prompt,
+                    context.previous,
                     |id| {
                         *native_agent
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id.clone());
                         let locator_turn = turn.clone();
-                        let record = record.clone();
+                        let context = &context;
                         async move {
                             persist_session(id.clone()).await?;
                             if let Some(native) = &config.turn_binding {
                                 crate::runtime::record_cursor_reply(
                                     &locator_turn,
-                                    &config.provider_env,
+                                    context.provider_env(),
                                     &native.client_id,
                                     &id,
                                 )?;
                             }
-                            if let Some(record) = record {
-                                record(id, None).await?;
-                            }
-                            Ok(())
+                            context.record_native_session(&id, None).await
                         }
                     },
                     cancel,
@@ -494,16 +422,7 @@ where
                     .bind_turn(&turn.client_id)
                     .map_err(ManagerError::not_started)?;
             }
-            let result = run_codex(
-                config,
-                socket,
-                prompt,
-                previous_session_id,
-                persist_session,
-                cancel,
-                progress,
-            )
-            .await;
+            let result = run_codex(&context, socket, persist_session, cancel, progress).await;
             if result
                 .as_ref()
                 .err()
@@ -517,11 +436,9 @@ where
         }
         Sdk::Claude { bin, processes } => {
             crate::runtime::claude::run_bot(
-                config,
+                &context,
                 bin,
                 processes,
-                prompt,
-                previous_session_id,
                 persist_session,
                 cancel,
                 progress,
@@ -529,27 +446,12 @@ where
             .await
         }
         Sdk::Pi { bin, pi } => {
-            pi.run_bot(
-                config,
-                bin,
-                prompt,
-                previous_session_id,
-                persist_session,
-                cancel,
-                progress,
-            )
-            .await
+            pi.run_bot(&context, bin, persist_session, cancel, progress)
+                .await
         }
         Sdk::Opencode { server, .. } => {
             server
-                .run_turn(
-                    config,
-                    prompt,
-                    previous_session_id,
-                    persist_session,
-                    cancel,
-                    progress,
-                )
+                .run_turn(&context, persist_session, cancel, progress)
                 .await
         }
     }
@@ -713,10 +615,8 @@ async fn stop_turn(session: &mut DirectSession, thread: &str, turn: &str) -> boo
 /// its tools; the turn's user message carries `client_id`, so an unknown `turn/start` is found
 /// again by it and never sent twice.
 async fn run_codex<F, P, PF>(
-    config: &ManagerConfig,
+    context: &TurnExecutionContext<'_>,
     socket: &Path,
-    prompt: &str,
-    previous: Option<&str>,
     persist_session: impl FnOnce(String) -> F,
     mut cancel: watch::Receiver<bool>,
     mut progress: P,
@@ -726,27 +626,18 @@ where
     P: FnMut(Value) -> PF,
     PF: Future<Output = Result<()>>,
 {
-    ensure!(
-        config.workspace.is_absolute() && config.workspace.is_dir(),
-        "manager workspace must be an existing absolute directory"
-    );
-    let secrets = secret_values(config);
-    let start = std::sync::Mutex::new(StartEvidence::NotStarted);
-    let stage = vibeface_bridge::failure::ProviderTrace::new("codex", ProviderStage::Launch);
-    let error = ManagerError::reporter(&stage, &start, &secrets);
+    let config = context.config;
+    let previous = context.previous;
+    let report = context.trace(ProviderStage::Launch);
+    let error = |outcome, session: Option<&str>, failure| report.error(outcome, session, failure);
     let failed = |session_id: Option<&str>, failure: ExecFailure| {
         error(ManagerFailure::Failed, session_id, failure)
     };
     // Faults of this Node's own bookkeeping, not of Codex.
     let own = |detail: String| ExecFailure::new(FailureKind::Unknown, detail);
     // A stop before the turn started ends the reply as stopped; nothing ran.
-    let stopped = |session_id: Option<&str>| {
-        error(
-            ManagerFailure::Cancelled,
-            session_id,
-            own("stopped before the Codex turn started".into()),
-        )
-    };
+    let stopped =
+        |session: Option<&str>| report.stopped(session, "stopped before the Codex turn started");
     if *cancel.borrow() {
         return Err(stopped(previous));
     }
@@ -760,22 +651,14 @@ where
             },
         )
     })?;
-    stage.enter(ProviderStage::SessionStart);
-    let mut env = config.tool_env.clone();
-    if let Some(token) = &config.tool_token {
-        env.insert("VIBEFACE_TOOL_TOKEN".into(), token.clone());
-    }
+    report.enter(ProviderStage::SessionStart);
     let mut thread_params = json!({"cwd":config.workspace,"approvalPolicy":"never",
-        "sandbox":"danger-full-access","config":{"shell_environment_policy.set":env,"web_search":"live"}});
+        "sandbox":"danger-full-access","config":{"shell_environment_policy.set":context.tool_env(),"web_search":"live"}});
     if !config.model.is_empty() {
         thread_params["model"] = json!(config.model);
     }
     // Resuming sends them again: a thread Codex reloads rebuilds its context from them.
-    let instructions = bot_instructions(
-        config.tool_cli.as_deref(),
-        &config.custom_tools,
-        &config.instructions,
-    );
+    let instructions = context.instructions();
     if !instructions.is_empty() {
         thread_params["developerInstructions"] = json!(instructions);
     }
@@ -792,17 +675,7 @@ where
         }
         None => None,
     };
-    let prompt = match (&resumed, previous, &config.turn_binding) {
-        (
-            None,
-            Some(_),
-            Some(TurnBinding {
-                fresh_prompt: Some(fresh),
-                ..
-            }),
-        ) => fresh.as_str(),
-        _ => prompt,
-    };
+    let prompt = context.prompt_for_session(resumed.is_some());
     let thread = match resumed {
         Some(id) => id,
         None => {
@@ -820,7 +693,7 @@ where
         }
     };
     let native = Some(thread.as_str());
-    stage.enter(ProviderStage::Record);
+    report.enter(ProviderStage::Record);
     if let Err(e) = persist_session(thread.clone()).await {
         // A stop fences the attempt, so saving its thread fails then.
         return Err(if *cancel.borrow() {
@@ -831,7 +704,8 @@ where
     }
     let client_id = match &config.turn_binding {
         Some(turn) => {
-            (turn.record)(thread.clone(), None)
+            context
+                .record_native_session(&thread, None)
                 .await
                 .map_err(|e| failed(native, own(format!("record the Codex turn: {e}"))))?;
             turn.client_id.clone()
@@ -855,12 +729,12 @@ where
     if *cancel.borrow() {
         return Err(stopped(native));
     }
-    stage.enter(ProviderStage::TurnStart);
-    *start.lock().unwrap() = StartEvidence::Unknown;
+    report.enter(ProviderStage::TurnStart);
+    report.set_start(StartEvidence::Unknown);
     let turn = match session.request("turn/start", turn_params).await {
         Ok(reply) => reply["turn"]["id"].as_str().map(str::to_owned),
         Err(e) if !e.uncertain => {
-            *start.lock().unwrap() = StartEvidence::NotStarted;
+            report.set_start(StartEvidence::NotStarted);
             return Err(failed(native, e.failure()));
         }
         Err(e) => match session.read_back(&thread, &client_id).await {
@@ -870,39 +744,29 @@ where
     }
     .context("Codex started a turn without an ID")
     .map_err(|e| error(ManagerFailure::Unknown, native, own(e.to_string())))?;
-    *start.lock().unwrap() = StartEvidence::Started;
-    stage.enter(ProviderStage::Record);
-    if let Some(record) = &config.turn_binding {
-        let recorded: Result<()> = async {
-            (record.record)(thread.clone(), Some(turn.clone())).await?;
-            if let Some(started) = &record.started {
-                started(turn.clone()).await?;
-            }
-            Ok(())
-        }
-        .await;
-        if let Err(e) = recorded {
-            let stopped = stop_turn(&mut session, &thread, &turn).await;
-            let kind = if stopped {
-                ManagerFailure::Failed
-            } else {
-                ManagerFailure::Unknown
-            };
-            return Err(error(
-                kind,
-                native,
-                own(format!("record the Codex turn: {e}")),
-            ));
-        }
+    report.set_start(StartEvidence::Started);
+    report.enter(ProviderStage::Record);
+    if let Err(e) = context.record_started(&thread, &turn).await {
+        let stopped = stop_turn(&mut session, &thread, &turn).await;
+        let kind = if stopped {
+            ManagerFailure::Failed
+        } else {
+            ManagerFailure::Unknown
+        };
+        return Err(error(
+            kind,
+            native,
+            own(format!("record the Codex turn: {e}")),
+        ));
     }
-    stage.enter(ProviderStage::Run);
+    report.enter(ProviderStage::Run);
     let mut answer = Answer::default();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
     let outcome = loop {
         let message = tokio::select! {
             biased;
             _ = agent::wait_for_cancel(&mut cancel) => {
-                stage.enter(ProviderStage::Interrupt);
+                report.enter(ProviderStage::Interrupt);
                 break if stop_turn(&mut session, &thread, &turn).await {
                     Err(error(ManagerFailure::Cancelled, native, own("Codex turn interrupted".into())))
                 } else {
@@ -926,7 +790,7 @@ where
         if !of_turn(&message, &thread, &turn) {
             continue;
         }
-        let message = redact(message, &secrets);
+        let message = report.redact_progress(message);
         answer.apply(&message);
         if let Some(update) = codex_progress(&message) {
             progress(update)
@@ -937,11 +801,7 @@ where
             let ended = turn_snapshot(&message["params"]["turn"]);
             break match ended.status {
                 Some(TurnStatus::Completed) => Ok(()),
-                Some(TurnStatus::Interrupted) => {
-                    let (outcome, failure) =
-                        interrupted(&cancel, crate::providers::Provider::Codex);
-                    Err(error(outcome, native, failure))
-                }
+                Some(TurnStatus::Interrupted) => Err(report.interrupted(&cancel, native)),
                 Some(TurnStatus::Failed) => Err(failed(
                     native,
                     ended
@@ -971,56 +831,6 @@ where
         output,
         usage: None,
     })
-}
-/// How a bot turn its provider reports interrupted ends: stopped when the Node asked it to stop,
-/// else failed, as when the owner interrupted it in their own program on a shared App Server.
-pub(crate) fn interrupted(
-    cancel: &watch::Receiver<bool>,
-    provider: crate::providers::Provider,
-) -> (ManagerFailure, ExecFailure) {
-    match *cancel.borrow() {
-        true => (
-            ManagerFailure::Cancelled,
-            ExecFailure::new(
-                FailureKind::Unknown,
-                format!("{} turn was interrupted", provider.label()),
-            ),
-        ),
-        false => (
-            ManagerFailure::Failed,
-            ExecFailure::new(
-                FailureKind::Unknown,
-                format!(
-                    "{} interrupted the turn without being asked to stop",
-                    provider.label()
-                ),
-            ),
-        ),
-    }
-}
-
-pub(crate) fn secret_values(config: &ManagerConfig) -> Vec<String> {
-    let mut values: Vec<_> = config
-        .tool_env
-        .values()
-        .chain(&config.tool_token)
-        .chain(config.provider_env.values())
-        .filter(|value| value.len() >= 8)
-        .cloned()
-        .collect();
-    values.extend(
-        std::env::vars()
-            .filter(|(key, value)| value.len() >= 8 && crate::logging::credential_name(key))
-            .map(|(_, value)| value),
-    );
-    if let Ok(keys) = config.sdk.provider().key_variables(&config.provider_env) {
-        values.extend(
-            keys.iter()
-                .filter_map(|key| std::env::var(key).ok())
-                .filter(|value| !value.is_empty()),
-        );
-    }
-    values
 }
 /// The variables the active model provider of Codex's configuration reads; `env` is what this
 /// Node sets for Codex, including its Node-owned `CODEX_HOME`.
@@ -1214,7 +1024,7 @@ fn codex_metadata_text(value: &toml::Value) -> Result<&str> {
     Ok(text)
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
@@ -1802,6 +1612,86 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Every management adapter fences a cancelled attempt and one whose session cannot be saved.
+    pub(crate) async fn assert_manager_presubmit_fences(
+        config: &ManagerConfig,
+        native_calls: impl Fn() -> Result<usize>,
+    ) -> Result<()> {
+        const FIXTURE_TOKEN: &str = "pretend-tool-bearer-used-by-controlled-manager-tests";
+        let config = ManagerConfig {
+            tool_token: Some(FIXTURE_TOKEN.into()),
+            ..config.clone()
+        };
+        let before_cancelled_call = native_calls()?;
+        let result = run_manager(
+            &config,
+            "must not send",
+            Some("previous-session"),
+            |_| async { panic!("a cancelled attempt must not persist a session") },
+            watch::channel(true).1,
+            |_| async { panic!("a cancelled attempt must not report progress") },
+        )
+        .await;
+        let error = result.err().context("expected cancellation")?;
+        let error = error
+            .downcast_ref::<ManagerError>()
+            .context("structured error")?;
+        assert_eq!(error.stage, ProviderStage::Validate);
+        assert_eq!(error.outcome, ManagerFailure::Cancelled);
+        assert_eq!(error.start, StartEvidence::NotStarted);
+        assert_eq!(error.session_id.as_deref(), Some("previous-session"));
+        assert_eq!(
+            native_calls()?,
+            before_cancelled_call,
+            "an already-cancelled attempt must not launch or dispatch native work"
+        );
+
+        let seen_session = std::sync::Mutex::new(None);
+        let result = run_manager(
+            &config,
+            "must not send",
+            None,
+            |session| {
+                *seen_session.lock().unwrap() = Some(session);
+                async { anyhow::bail!("fixture refused to persist {FIXTURE_TOKEN}") }
+            },
+            watch::channel(false).1,
+            |_| async { panic!("an unrecorded attempt must not report progress") },
+        )
+        .await;
+        let error = result.err().context("expected persistence failure")?;
+        let error = error
+            .downcast_ref::<ManagerError>()
+            .context("structured error")?;
+        let seen_session = seen_session
+            .into_inner()
+            .unwrap()
+            .context("session reached persistence")?;
+        assert_eq!(error.stage, ProviderStage::Record);
+        assert_eq!(error.outcome, ManagerFailure::Failed);
+        assert_eq!(error.start, StartEvidence::NotStarted);
+        assert_eq!(error.session_id.as_deref(), Some(seen_session.as_str()));
+        assert!(
+            error
+                .failure
+                .detail
+                .contains("fixture refused to persist [redacted]")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn codex_manager_presubmit_fences_keep_the_prompt_unsent() -> Result<()> {
+        let fake = fake_app_server(Turn::Answers).await;
+        let config = codex(workspace(&fake.directory), fake.socket.clone());
+        assert_manager_presubmit_fences(&config, || Ok(fake.requests.lock().unwrap().len()))
+            .await?;
+        assert!(fake.calls("thread/resume").is_empty());
+        assert_eq!(fake.calls("thread/start").len(), 1);
+        assert!(fake.calls("turn/start").is_empty());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_turn_runs_on_the_app_server_and_is_recorded_before_it_starts() {
         let fake = fake_app_server(Turn::Answers).await;
@@ -2165,19 +2055,45 @@ mod tests {
     }
 
     #[test]
-    fn tool_credentials_are_redacted() {
+    fn tool_credentials_are_redacted() -> Result<()> {
         let config = ManagerConfig {
-            tool_env: BTreeMap::from([("TOKEN".into(), "other-secret".into())]),
+            tool_env: BTreeMap::from([
+                ("TOKEN".into(), "other-secret".into()),
+                ("VIBEFACE_TOOL_TOKEN".into(), "overwritten-token".into()),
+            ]),
             tool_token: Some("turn-token-secret".into()),
-            provider_env: BTreeMap::from([("API_KEY".into(), "other-secret-provider".into())]),
-            ..codex(".".into(), "app-server.sock".into())
+            provider_env: BTreeMap::from([
+                ("API_KEY".into(), "other-secret-provider".into()),
+                ("TOKEN".into(), "provider-token".into()),
+            ]),
+            turn_binding: Some(TurnBinding {
+                client_id: "attempt".into(),
+                started: None,
+                record: Arc::new(|_, _| Box::pin(async { Ok(()) })),
+                fresh_prompt: Some("whole prompt".into()),
+            }),
+            ..codex(std::env::current_dir()?, "app-server.sock".into())
         };
+        let never = watch::channel(false).1;
+        let context = TurnExecutionContext::new(&config, "delta", Some("previous"), &never)?;
+        let report = context.trace(ProviderStage::Validate);
         assert_eq!(
-            redact(
-                json!({"other-secret":["other-secret","turn-token-secret",{"provider":"other-secret-provider"}],"number":1}),
-                &secret_values(&config)
+            report.redact_progress(
+                json!({"other-secret":["other-secret","turn-token-secret",{"provider":"other-secret-provider"}],"number":1})
             ),
             json!({"other-secret":["[redacted]","[redacted]",{"provider":"[redacted]"}],"number":1})
         );
+        assert_eq!(
+            context.tool_env()["VIBEFACE_TOOL_TOKEN"],
+            "turn-token-secret"
+        );
+        assert!(!context.tool_env().contains_key("API_KEY"));
+        assert_eq!(context.child_env()["TOKEN"], "other-secret");
+        assert_eq!(context.child_env()["API_KEY"], "other-secret-provider");
+        assert_eq!(context.prompt_for_session(true), "delta");
+        assert_eq!(context.prompt_for_session(false), "whole prompt");
+        let context = TurnExecutionContext::new(&config, "delta", None, &never)?;
+        assert_eq!(context.prompt_for_session(false), "delta");
+        Ok(())
     }
 }

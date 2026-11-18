@@ -9,7 +9,9 @@ use super::provider_adapter::bounded;
 use super::*;
 #[cfg(test)]
 use crate::clock::now_ms;
-use crate::manager::{self, ManagerConfig, ManagerError, ManagerFailure, TurnBinding};
+use crate::manager::{self, ManagerFailure, TurnExecutionContext};
+#[cfg(test)]
+use crate::manager::{ManagerConfig, ManagerError, TurnBinding};
 use crate::scheduling::{SteerOutcome, SteerTarget};
 use crate::work::{Probe, Signal, WorkRecord, WorkSpec};
 use futures_util::future::BoxFuture;
@@ -1123,16 +1125,10 @@ impl Process {
 /// One bot turn. The session is saved before the process starts and the prompt is sent as a
 /// user message that carries the turn's ID. A session Claude Code no longer has goes on in a
 /// new one with the full prompt.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "run_manager's arguments and the SDK"
-)]
 pub(crate) async fn run_bot<F, P, PF>(
-    config: &ManagerConfig,
+    context: &TurnExecutionContext<'_>,
     bin: &Path,
     processes: &Arc<Processes>,
-    prompt: &str,
-    previous: Option<&str>,
     persist_session: impl FnOnce(String) -> F,
     mut cancel: tokio::sync::watch::Receiver<bool>,
     mut progress: P,
@@ -1142,42 +1138,24 @@ where
     P: FnMut(Value) -> PF,
     PF: Future<Output = Result<()>>,
 {
-    ensure!(
-        config.workspace.is_absolute() && config.workspace.is_dir(),
-        "manager workspace must be an existing absolute directory"
-    );
-    let secrets = manager::secret_values(config);
-    let start = std::sync::Mutex::new(manager::StartEvidence::NotStarted);
-    let stage = vibeface_bridge::failure::ProviderTrace::new("claude", ProviderStage::SessionStart);
-    let error = ManagerError::reporter(&stage, &start, &secrets);
+    let config = context.config;
+    let previous = context.previous;
+    let report = context.trace(ProviderStage::SessionStart);
+    let error = |outcome, session: Option<&str>, failure| report.error(outcome, session, failure);
     // Faults of this Node's own bookkeeping, not of Claude Code.
     let own = |detail: &str| ExecFailure::new(FailureKind::Unknown, detail);
     let stopped = |session: Option<&str>| {
-        error(
-            ManagerFailure::Cancelled,
-            session,
-            own("stopped before the Claude Code turn started"),
-        )
+        report.stopped(session, "stopped before the Claude Code turn started")
     };
     if *cancel.borrow() {
         return Err(stopped(previous));
     }
-    let projects = projects_dir(&config.provider_env);
+    let projects = projects_dir(context.provider_env());
     let resumed = previous.filter(|session| transcript(projects.as_deref(), session).is_some());
-    let prompt = match (resumed, previous, &config.turn_binding) {
-        (
-            None,
-            Some(_),
-            Some(TurnBinding {
-                fresh_prompt: Some(fresh),
-                ..
-            }),
-        ) => fresh.as_str(),
-        _ => prompt,
-    };
+    let prompt = context.prompt_for_session(resumed.is_some());
     let session = resumed.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
     let native = Some(session.as_str());
-    stage.enter(ProviderStage::Record);
+    report.enter(ProviderStage::Record);
     if let Err(e) = persist_session(session.clone()).await {
         // A stop fences the attempt, so saving its session fails then.
         return Err(if *cancel.borrow() {
@@ -1197,24 +1175,19 @@ where
                     own(&format!("persist the Claude reply locator: {e}")),
                 )
             })?;
-        (turn.record)(session.clone(), None).await.map_err(|e| {
-            error(
-                ManagerFailure::Failed,
-                native,
-                own(&format!("record the Claude reply locator: {e}")),
-            )
-        })?;
+        context
+            .record_native_session(&session, None)
+            .await
+            .map_err(|e| {
+                error(
+                    ManagerFailure::Failed,
+                    native,
+                    own(&format!("record the Claude reply locator: {e}")),
+                )
+            })?;
     }
-    let mut env = config.provider_env.clone();
-    env.extend(config.tool_env.clone());
-    if let Some(token) = &config.tool_token {
-        env.insert("VIBEFACE_TOOL_TOKEN".into(), token.clone());
-    }
-    let instructions = manager::bot_instructions(
-        config.tool_cli.as_deref(),
-        &config.custom_tools,
-        &config.instructions,
-    );
+    let env = context.child_env();
+    let instructions = context.instructions();
     let guide = if instructions.is_empty() {
         None
     } else {
@@ -1248,20 +1221,20 @@ where
         guide,
         env: &env,
     };
-    stage.enter(ProviderStage::Launch);
+    report.enter(ProviderStage::Launch);
     let mut process = launch
         .spawn()
         .map_err(|failure| error(ManagerFailure::Failed, native, failure))?;
     let sent = async {
-        stage.enter(ProviderStage::Record);
+        report.enter(ProviderStage::Record);
         processes.track(process.child.token(), bin)?;
         if let Some(started) = &config.process_started {
             started(process.child.root()).await?;
         }
         process.input =
             Some(processes.register_input(&session, &message, &process, projects.clone())?);
-        stage.enter(ProviderStage::TurnStart);
-        *start.lock().unwrap() = manager::StartEvidence::Unknown;
+        report.enter(ProviderStage::TurnStart);
+        report.set_start(manager::StartEvidence::Unknown);
         send(&process.stdin, &user_frame(prompt, &message)).await
     }
     .await;
@@ -1280,7 +1253,7 @@ where
         let line = tokio::select! {
             biased;
             _ = agent::wait_for_cancel(&mut cancel) => {
-                stage.enter(ProviderStage::Interrupt);
+                report.enter(ProviderStage::Interrupt);
                 break if process.stop(&mut turn).await {
                     Err(error(ManagerFailure::Cancelled, native, own("Claude Code turn interrupted")))
                 } else {
@@ -1353,14 +1326,9 @@ where
                 ));
             }
             if !reported_start && !matches!(&frame, Frame::Ended(_)) {
-                stage.enter(ProviderStage::Run);
-                *start.lock().unwrap() = manager::StartEvidence::Started;
-                if let Some(started) = config
-                    .turn_binding
-                    .as_ref()
-                    .and_then(|turn| turn.started.as_ref())
-                    && let Err(callback_error) = started(message.clone()).await
-                {
+                report.enter(ProviderStage::Run);
+                report.set_start(manager::StartEvidence::Started);
+                if let Err(callback_error) = context.notify_started(&message).await {
                     break 'turn Err(error(
                         ManagerFailure::Unknown,
                         native,
@@ -1371,7 +1339,7 @@ where
             }
             if let Some(update) = turn.apply(frame)
                 && let Err(e) = transport::deliver(
-                    progress(manager::redact(update, &secrets)),
+                    progress(report.redact_progress(update)),
                     &mut cancel,
                     deadline,
                 )
@@ -1393,8 +1361,7 @@ where
     match ending.status {
         TurnStatus::Completed => {}
         TurnStatus::Interrupted => {
-            let (outcome, failure) = manager::interrupted(&cancel, Provider::Claude);
-            return Err(error(outcome, native, failure));
+            return Err(report.interrupted(&cancel, native));
         }
         _ => {
             let failure = ending
@@ -1403,14 +1370,15 @@ where
             return Err(error(ManagerFailure::Failed, native, failure));
         }
     }
-    if let Some(turn) = &config.turn_binding
-        && let Err(e) = (turn.record)(session.clone(), Some(message)).await
+    if let Err(e) = context
+        .record_native_session(&session, Some(&message))
+        .await
     {
         tracing::warn!(event = "claude.turn_unrecorded", error = %e, "the next Claude Code turn repeats what this one was shown");
     }
     Ok(AgentResult {
         session_id: Some(session),
-        output: manager::redact_string(ending.text, &secrets),
+        output: report.redact_text(ending.text),
         usage: None,
     })
 }
@@ -2981,6 +2949,17 @@ pub(super) mod tests {
         let locator = reopened.processes.reply_locator_path("attempt-1")?;
         assert!(vibeface_bridge::platform::privatefs::is_private(&locator)?);
         assert_eq!(place.user_frames(), 1, "readback does not send again");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claude_manager_presubmit_fences_keep_the_prompt_unsent() -> Result<()> {
+        let place = Place::new()?;
+        let (record, calls) = recorder();
+        let config = bot_config(&place, record);
+        manager::tests::assert_manager_presubmit_fences(&config, || Ok(place.log().len())).await?;
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(place.log().is_empty());
         Ok(())
     }
 

@@ -8,7 +8,9 @@ use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
 use super::provider_adapter::bounded;
 use super::*;
 use crate::clock::now_ms;
-use crate::manager::{ManagerConfig, ManagerError, ManagerFailure, TurnBinding};
+#[cfg(test)]
+use crate::manager::ManagerConfig;
+use crate::manager::{ManagerError, ManagerFailure, StartEvidence, TurnExecutionContext};
 use crate::scheduling::{SteerOutcome, SteerTarget};
 use crate::work::{Probe, Signal, WorkRecord, WorkSpec};
 use base64::Engine as _;
@@ -1071,16 +1073,10 @@ impl Pi {
 
     /// One bot turn. A session pi still has goes on; one whose file is gone is replaced by a new
     /// one, which gets the whole prompt.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "run_manager's turn, with the pi program"
-    )]
     pub(crate) async fn run_bot<F, P, PF>(
         &self,
-        config: &ManagerConfig,
+        context: &TurnExecutionContext<'_>,
         bin: &Path,
-        prompt: &str,
-        previous: Option<&str>,
         persist_session: impl FnOnce(String) -> F,
         mut cancel: watch::Receiver<bool>,
         mut progress: P,
@@ -1090,22 +1086,14 @@ impl Pi {
         P: FnMut(Value) -> PF,
         PF: Future<Output = Result<()>>,
     {
-        ensure!(
-            config.workspace.is_absolute() && config.workspace.is_dir(),
-            "manager workspace must be an existing absolute directory"
-        );
-        let secrets = crate::manager::secret_values(config);
-        let start = std::sync::Mutex::new(crate::manager::StartEvidence::NotStarted);
-        let stage = vibeface_bridge::failure::ProviderTrace::new("pi", ProviderStage::SessionStart);
-        let error = ManagerError::reporter(&stage, &start, &secrets);
+        let config = context.config;
+        let previous = context.previous;
+        let report = context.trace(ProviderStage::SessionStart);
+        let error =
+            |outcome, session: Option<&str>, failure| report.error(outcome, session, failure);
         let own = |detail: String| ExecFailure::new(FailureKind::Unknown, detail);
-        let stopped = |session: Option<&str>| {
-            error(
-                ManagerFailure::Cancelled,
-                session,
-                own("stopped before the pi turn started".into()),
-            )
-        };
+        let stopped =
+            |session: Option<&str>| report.stopped(session, "stopped before the pi turn started");
         let resumed = match previous {
             Some(id) => self
                 .pointer(id)
@@ -1117,27 +1105,13 @@ impl Pi {
             (Some(_), Some(id)) => id.to_owned(),
             _ => uuid::Uuid::new_v4().to_string(),
         };
-        let prompt = match (&resumed, previous, &config.turn_binding) {
-            (
-                None,
-                Some(_),
-                Some(TurnBinding {
-                    fresh_prompt: Some(fresh),
-                    ..
-                }),
-            ) => fresh.as_str(),
-            _ => prompt,
-        };
+        let prompt = context.prompt_for_session(resumed.is_some());
         let mut args = match &resumed {
             Some(pointer) => vec!["--session".into(), pointer.file.display().to_string()],
             None => vec!["--session-id".into(), session.clone()],
         };
         // The instructions go in a file: with the tool catalog they can outgrow one argument.
-        let guide = crate::manager::bot_instructions(
-            config.tool_cli.as_deref(),
-            &config.custom_tools,
-            &config.instructions,
-        );
+        let guide = context.instructions();
         let guide = if guide.is_empty() {
             None
         } else {
@@ -1155,15 +1129,10 @@ impl Pi {
         if let Some(effort) = &config.reasoning_effort {
             args.extend(["--thinking".into(), effort.clone()]);
         }
-        let mut env = config.provider_env.clone();
-        env.extend(config.tool_env.clone());
-        if let Some(token) = &config.tool_token {
-            env.insert("VIBEFACE_TOOL_TOKEN".into(), token.clone());
-        }
         let launch = Launch {
             bin: bin.to_owned(),
             cwd: config.workspace.clone(),
-            env,
+            env: context.child_env(),
             args,
             guide,
         };
@@ -1174,11 +1143,11 @@ impl Pi {
             self.open(&launch, &session, &mut cancel)
                 .await
                 .map_err(|failure| {
-                    stage.enter(failure.stage);
+                    report.enter(failure.stage);
                     error(failure.outcome, previous, failure.failure)
                 })?;
         let native = Some(session.as_str());
-        stage.enter(ProviderStage::Record);
+        report.enter(ProviderStage::Record);
         if let Some(turn) = &config.turn_binding
             && let Err(e) = self.record_reply(&session, &turn.client_id, prompt)
         {
@@ -1212,9 +1181,7 @@ impl Pi {
                 )
             });
         }
-        if let Some(turn) = &config.turn_binding
-            && let Err(e) = (turn.record)(session.clone(), None).await
-        {
+        if let Err(e) = context.record_native_session(&session, None).await {
             process.end().await;
             return Err(error(
                 ManagerFailure::Failed,
@@ -1229,15 +1196,15 @@ impl Pi {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
         let within = PREFLIGHT.min(Duration::from_secs(config.timeout_secs));
         let prompt = json!({"type":"prompt","message":prompt});
-        stage.enter(ProviderStage::TurnStart);
-        *start.lock().unwrap() = crate::manager::StartEvidence::Unknown;
+        report.enter(ProviderStage::TurnStart);
+        report.set_start(StartEvidence::Unknown);
         let turn = match process
             .begin(after.as_deref(), prompt, within, &mut cancel, None)
             .await
         {
             Begin::Started(turn) => turn,
             Begin::Refused(failure) => {
-                *start.lock().unwrap() = crate::manager::StartEvidence::NotStarted;
+                report.set_start(StartEvidence::NotStarted);
                 let tail = process.end().await;
                 return Err(if *cancel.borrow() {
                     stopped(native)
@@ -1254,7 +1221,7 @@ impl Pi {
                 ));
             }
         };
-        *start.lock().unwrap() = crate::manager::StartEvidence::Started;
+        report.set_start(StartEvidence::Started);
         let mut seen = Seen::default();
         lock(&self.live).insert(
             session.clone(),
@@ -1269,20 +1236,8 @@ impl Pi {
             session: session.clone(),
             turn: turn.clone(),
         };
-        stage.enter(ProviderStage::Record);
-        let recorded = match &config.turn_binding {
-            Some(record) => {
-                async {
-                    (record.record)(session.clone(), Some(turn.clone())).await?;
-                    if let Some(started) = &record.started {
-                        started(turn.clone()).await?;
-                    }
-                    anyhow::Ok(())
-                }
-                .await
-            }
-            None => Ok(()),
-        };
+        report.enter(ProviderStage::Record);
+        let recorded = context.record_started(&session, &turn).await;
         let outcome = match recorded {
             Err(e) => {
                 let kind = match process.stop(&mut seen).await {
@@ -1292,12 +1247,12 @@ impl Pi {
                 Err(error(kind, native, own(format!("record the pi turn: {e}"))))
             }
             Ok(()) => {
-                stage.enter(ProviderStage::Run);
+                report.enter(ProviderStage::Run);
                 loop {
                     let event = tokio::select! {
                         biased;
                         _ = agent::wait_for_cancel(&mut cancel) => {
-                            stage.enter(ProviderStage::Interrupt);
+                            report.enter(ProviderStage::Interrupt);
                             break match process.stop(&mut seen).await {
                                 true => Err(error(ManagerFailure::Cancelled, native, own("pi turn stopped".into()))),
                                 false => Err(error(ManagerFailure::Unknown, native, own("pi did not confirm the stop".into()))),
@@ -1328,7 +1283,7 @@ impl Pi {
                     let mut shown = Ok(());
                     for update in seen.apply(&event) {
                         shown = transport::deliver(
-                            progress(crate::manager::redact(update, &secrets)),
+                            progress(report.redact_progress(update)),
                             &mut cancel,
                             deadline,
                         )
@@ -1347,9 +1302,7 @@ impl Pi {
                         break match seen.ending(false) {
                             (TurnStatus::Completed, _) => Ok(seen.text()),
                             (TurnStatus::Interrupted, _) => {
-                                let (outcome, failure) =
-                                    crate::manager::interrupted(&cancel, Provider::Pi);
-                                Err(error(outcome, native, failure))
+                                Err(report.interrupted(&cancel, native))
                             }
                             (_, failure) => Err(error(
                                 ManagerFailure::Failed,
@@ -1365,7 +1318,7 @@ impl Pi {
         process.end().await;
         Ok(AgentResult {
             session_id: Some(session),
-            output: crate::manager::redact_string(outcome?, &secrets),
+            output: report.redact_text(outcome?),
             usage: None,
         })
     }
@@ -2643,6 +2596,70 @@ mod tests {
             Probe::Missing
         );
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pi_manager_presubmit_fences_keep_the_prompt_unsent() -> Result<()> {
+        let dir = scratch("presubmit-fences");
+        let pi = Arc::new(Pi::new(&dir).await);
+        let turns = Turns::default();
+        let config = bot(&dir, &pi, "reply", Some(&turns));
+        crate::manager::tests::assert_manager_presubmit_fences(&config, || {
+            Ok(log(&dir)
+                .iter()
+                .filter(|line| line["argv"].is_array())
+                .count())
+        })
+        .await?;
+        assert!(turns.lock().unwrap().is_empty());
+        assert!(prompts(&dir).is_empty());
+        assert!(lock(&pi.live).is_empty());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_bot_with_a_missing_pi_session_sends_the_full_prompt_once() -> Result<()> {
+        let dir = scratch("missing-bot-session");
+        let pi = Arc::new(Pi::new(&dir).await);
+        let previous = "lost-pi-session";
+        let transcript = dir.join("lost-session.jsonl");
+        std::fs::write(&transcript, "")?;
+        pi.keep(previous, &transcript, &dir, "")?;
+        std::fs::remove_file(transcript)?;
+
+        let turns = Turns::default();
+        let mut config = bot(&dir, &pi, "reply", Some(&turns));
+        let full = "full management context";
+        config
+            .turn_binding
+            .as_mut()
+            .context("turn binding")?
+            .fresh_prompt = Some(full.into());
+        let result = run_manager(
+            &config,
+            "incremental management update",
+            Some(previous),
+            |_| async { Ok(()) },
+            watch::channel(false).1,
+            |_| async { Ok(()) },
+        )
+        .await?;
+
+        let replacement = result.session_id.context("replacement session")?;
+        assert_ne!(replacement, previous);
+        let starts: Vec<_> = log(&dir)
+            .into_iter()
+            .filter(|line| line["argv"].is_array())
+            .collect();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(
+            &starts[0]["argv"].as_array().context("launch arguments")?[3..5],
+            [json!("--session-id"), json!(replacement)]
+        );
+        assert_eq!(prompts(&dir), [full]);
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 
