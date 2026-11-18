@@ -36,13 +36,13 @@ CLI 包中的 `BUILD-INFO.json` 记录包的来源。发行包中，CLI 的身�
 
 `verify_build_info` 定义完整的字段名和取值校验。`seal_bundle` 写入 `BUILD-INFO.json`，并用 `FILES.sha256` 封存包内文件。[字段校验](../../scripts/release_format.py)和[组包实现](../../scripts/release_archive.py)
 
-## 每小时 Hourly 发布
+## 自动发布
 
-`hourly.yml` 的协调器在 main push CI 成功后运行，也有 UTC 每小时 `17` 分的定时兜底。发布完成后再次唤醒协调器，让下游消费者继续。它只选择已通过 `ci.yml` main push CI 的源码，按应用构建输入和精确依赖 pin 判断变化；无变化的应用直接复用上一份完成的 Release。
+`hourly.yml` 在 UTC 每小时 17 分、main push CI 成功后或手动运行时对账 Core。`daily.yml` 仅在 `America/Los_Angeles` 每日 18:00 定时启动客户端发布，并跟随夏令时。构建和发布可能稍后完成。
 
-Core、App、Mobile 和 WWW 不相互等待。CLI 等待所需 Core/App 完整发布，Desktop 等待所需 CLI 完整发布。依赖失败只阻止相关消费者，移动端或桌面失败不阻止 Core/App 上线。每个应用每 UTC 小时最多创建一个不可变 Tag，协调器不改 main。
+每日客户端批次固定一个通过 main push CI 的源码和 UTC 小时版本后缀，继续使用 Hourly 分发渠道。Web App、CLI/npm、Desktop 和 Mobile（Android APK 与 iOS）按构建输入或依赖 pin 的变化发布，无变化时复用完整 Release。CLI 锁定批次截止时最新完整发布且验证通过的 Hourly Core，以及本批次选定的 Web App。Desktop 锁定选定的 CLI。协调器跟踪各个组件的发布运行，可跨小时继续依赖构建。官网仅手动发布。
 
-生成提交只改所选应用版本、相应 Cargo.lock 本地包版本或 Mobile build number，以及该应用的依赖 pin。Android versionCode 使用 `YYMMDDHH`，iOS buildNumber 使用 `YYMM.DD.HH`。发布来源校验重建这棵 Git tree，并验证唯一 main parent 的 CI。调度是 GitHub best effort；定时运行可能延迟或跳过。
+生成提交只改所选应用版本、相应 Cargo.lock 本地包版本或 Mobile build number，以及该应用的依赖 pin。Android versionCode 使用 `YYMMDDHH`，iOS buildNumber 使用 `YYMM.DD.HH`。发布来源校验重建这棵 Git tree，并验证唯一 main parent 的 CI。Tag 不移动。GitHub 的定时运行可能延迟或跳过。
 
 ## 人工发布与构建验证
 
@@ -56,6 +56,12 @@ python3 scripts/release.py plan --app cli --tag 'cli-v<version>' --require-main
 
 ```sh
 gh workflow run release.yml --ref 'cli-v<version>' -f tag='cli-v<version>' -F publish=true
+```
+
+官网通过以下命令手动发布。完整发布后部署官网。
+
+```sh
+gh workflow run release-www.yml --ref 'www-v<version>' -f tag='www-v<version>' -F publish=true
 ```
 
 各入口的手动构建默认 `publish=false`，不写公开 Release、不发布 npm、不部署。CLI/Desktop 构建需要其源码中已有完整的依赖 pin；缺少 pin 时明确拒绝，不从其他产品猜测依赖。分支 CI 的源码运行包检查仍可从同一 checkout 构建 CLI/Core/App，用于开发验证。

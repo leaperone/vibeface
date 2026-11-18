@@ -81,15 +81,6 @@ jobs:
       tag: ${{ needs.identity.outputs.tag }}
       artifact_id: ${{ needs.collect.outputs.artifact_id }}
     permissions: {contents: write, actions: read}
-  wake-consumers:
-    needs: [publish-app]
-    runs-on: ubuntu-24.04
-    permissions: {actions: write, contents: read}
-    steps:
-      - name: Reconcile independent release consumers
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow run hourly.yml --repo "$GITHUB_REPOSITORY" --ref main
   deploy:
     needs: [identity, publish-app]
     uses: ./.github/workflows/release-deploy.yml

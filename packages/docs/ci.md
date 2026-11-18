@@ -16,13 +16,14 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | 文件 | Actions 名称 | 触发方式 | 用途 |
 | --- | --- | --- | --- |
 | `ci.yml` | CI / Core | main push、merge queue、手动、复用调用 | 自动按累计差异选核心检查；手动与复用调用执行扩展检查 |
-| `hourly.yml` | Release / Hourly | 每小时、成功的 main push CI 完成后、发布完成后唤醒、手动 | 按应用输入变化分配 Hourly Tag，记录精确依赖 pin，分别派发六条发布流程 |
+| `hourly.yml` | Release / Core Hourly | UTC 每小时 17 分、成功的 main push CI 完成后、手动 | 仅对账 Core，按输入变化发布 Hourly Tag |
+| `daily.yml` | Release / Clients Daily | 洛杉矶时间每日 18:00（含夏令时） | 启动客户端批次，构建完成时间可能更晚 |
 | `release-core.yml` | Release / Core | `core-v*` push、手动 | 四平台 Core；完整发布后自动部署公共 Node |
 | `release-app.yml` | Release / Web App | `app-v*` push、手动 | 静态 Web App；完整发布后自动部署 App |
 | `release.yml` | Release / CLI | `cli-v*` push、手动 | 四平台 CLI 运行包，消费精确 Core、App 依赖；完整发布后分发同版本 npm 包 |
 | `release-desktop-app.yml` | Release / Desktop | `desktop-v*` push、手动 | 四平台 Desktop 安装包，内置精确 CLI 运行包 |
 | `release-mobile.yml` | Release / Mobile | `mobile-v*` push、手动 | Android 与 iOS 制品 |
-| `release-www.yml` | Release / Website | `www-v*` push、手动 | 官网与文档；完整发布后自动部署官网 |
+| `release-www.yml` | Release / Website | 手动 | 官网与文档，完整发布后自动部署官网 |
 | `npm-publish.yml` | Release / npm | CLI 发布调用、手动 | 核对原始 CLI npm artifact；stable、rc、hourly 分别使用 latest、rc、hourly；手动默认只验证 |
 | `deploy-node.yml`、`deploy-app.yml`、`deploy-www.yml` | Deploy / Node、Web App、Website | 自动派发或手动 | 分别消费 Core、App、www 的精确已发布 Tag；手动 `apply=false` 默认构建验证与排练 |
 
@@ -133,9 +134,9 @@ python3 scripts/check-delivery.py --sandbox
 
 ## 定期、手动和发布检查
 
-`hourly.yml` 运行统一协调器 `scripts/hourly.py`。定时或手动运行会核对最新成功的 main push CI；`workflow_run` 触发还要求来源事件为 main push 且结果为 success。已完成发布也会唤醒协调器，让等待依赖的消费者继续发布。
+`hourly.yml` 在 UTC 每小时 17 分、main push CI 成功后或手动运行时对账 Core。`daily.yml` 仅在洛杉矶时间每日 18:00 定时启动客户端批次。批次固定通过 main push CI 的源码和 UTC 小时版本后缀，继续使用 Hourly 渠道。
 
-协调器分别比较 Core、App、CLI、Desktop、Mobile、www 的输入摘要与依赖 pin。应用输入及依赖未变时跳过。CLI 等待完整 Core、App 发布，Desktop 等待完整 CLI 发布，其他应用独立构建。每次生成只改所选应用的版本、对应 Cargo.lock 包、依赖清单及必要的 Mobile 构建号；Tag 为 `<app>-vX.Y.Z-hourly.YYYYMMDDHH`。同一小时的 Tag 不移动，缺少发布运行时先对账再派发。协调器不等待构建结果，不将已派发视为已完成。详情见[构建与发布](releasing.md)。
+客户端协调器按构建输入和依赖 pin 决定是否创建新 Tag，并跟踪各个组件的发布运行。已有同批次 Tag 时沿用其中记录的 main parent。官网只通过精确 Tag 和 `publish=true` 手动发布。[构建与发布](releasing.md)
 
 手动 `CI / Core` 执行完整扩展检查，不受路径影响，只验证和生成制品。merge queue 执行整个工作区核心检查，不启用慢测试、MSRV 或四平台打包。开发分支 PR 不触发 Core。六条应用发布流程只等待本应用的生产者。本应用的平台失败会阻止完整发布，其他应用失败不会阻塞本应用。
 
@@ -272,7 +273,7 @@ Rust 快、慢组在计划生成后直接开始，Clippy 另等待静态快检�
 
 Core 的 concurrency group 包含调用方 workflow、事件、Git ref 和 package policy。标准 Core 的首次 main push 或手动验证会取消同组旧运行，main 累计覆盖选择仍保留未验证的改动；重跑仅在 `run_attempt > 1` 时追加 `run_id`，不取消新提交的运行。Core 的 schedule 和 merge queue 不取消同组正在执行的检查。
 
-Hourly 协调器、各应用发布与部署分别遵守自己的并发规则。协调器使用 `independent-hourly-releases` 串行组；每个应用的同一 Tag 发布单独串行，构建验证与真实发布分组。
+Core 和每日客户端协调器、各应用发布与部署分别遵守自己的并发规则。每个应用的同一 Tag 发布单独串行，构建验证与真实发布分组。
 
 Linux x64 制品任务使用 pnpm 缓存。
 

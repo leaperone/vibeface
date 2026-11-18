@@ -1,8 +1,6 @@
 name: Release / Website
-run-name: Release / Website / ${{ inputs.tag || github.ref_name }} / ${{ (github.event_name == 'push' || inputs.publish) && 'publish' || 'build only' }}
+run-name: Release / Website / ${{ inputs.tag || github.ref_name }} / ${{ inputs.publish && 'publish' || 'build only' }}
 on:
-  push:
-    tags: ['www-v*']
   workflow_dispatch:
     inputs:
       tag: {description: Exact application tag, type: string, default: ''}
@@ -11,7 +9,7 @@ permissions:
   contents: read
   actions: read
 concurrency:
-  group: release-www-${{ inputs.tag || github.ref_name }}-${{ github.event_name == 'workflow_dispatch' && !inputs.publish && github.run_id || 'publish' }}
+  group: release-www-${{ inputs.tag || github.ref_name }}-${{ !inputs.publish && github.run_id || 'publish' }}
   cancel-in-progress: false
 jobs:
   identity:
@@ -31,8 +29,8 @@ jobs:
       - name: Validate exact tag and source
         id: plan
         env:
-          RELEASE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name || '') }}
-          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          PUBLISH: ${{ inputs.publish }}
           GH_TOKEN: ${{ github.token }}
           WINDOWS_SIGNING_CONFIGURED: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 != '' }}
           IOS_SIGNING_CONFIGURED: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 != '' && secrets.IOS_CERTIFICATE_PASSWORD != '' && secrets.IOS_PROVISIONING_PROFILE_BASE64 != '' }}
@@ -78,15 +76,6 @@ jobs:
       tag: ${{ needs.identity.outputs.tag }}
       artifact_id: ${{ needs.collect.outputs.artifact_id }}
     permissions: {contents: write, actions: read}
-  wake-consumers:
-    needs: [publish-www]
-    runs-on: ubuntu-24.04
-    permissions: {actions: write, contents: read}
-    steps:
-      - name: Reconcile independent release consumers
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow run hourly.yml --repo "$GITHUB_REPOSITORY" --ref main
   deploy:
     needs: [identity, publish-www]
     uses: ./.github/workflows/release-deploy.yml
