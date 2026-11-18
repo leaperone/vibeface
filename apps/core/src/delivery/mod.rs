@@ -3,6 +3,7 @@ pub mod chain;
 mod charity;
 mod keys;
 mod orders;
+pub mod session;
 pub use keys::KeyAction;
 pub mod proof;
 mod provider;
