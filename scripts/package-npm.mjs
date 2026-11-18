@@ -8,16 +8,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync, gzipSync } from 'node:zlib';
 
-import { PLATFORMS, platformFor, programNames, parseReleaseVersion, npmDistTag, validateBuildInfoShape } from './release-contract.mjs';
+import { PLATFORMS, programNames, parseReleaseVersion, npmDistTag, requiredRuntimeFiles, validateBuildInfoShape } from './release-contract.mjs';
 import { readContracts, readOwnVersion, readNpmTemplate } from './release-metadata.mjs';
+import { readSealedRuntime } from './sealed-runtime.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
 const targets = Object.keys(PLATFORMS);
 const webFiles = JSON.parse(fs.readFileSync(new URL('./package-node-web.json', import.meta.url), 'utf8'));
-const requiredFiles = target => ['FILES.sha256', ...programNames(target), 'BUILD-INFO.json', 'README.md',
-  'RUNTIME-REQUIREMENTS.md',
-  `scripts/install-node-service.${platformFor(target).service}`, 'docs/node.md', 'docs/releasing.md',
-  ...webFiles.map(name => `web/${name}`)];
+const requiredFiles = target => requiredRuntimeFiles(target, { web: webFiles, checksum: true });
 const run = (program, args, options = {}) => execFileSync(program, args, {
   encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, ...options,
 });
@@ -76,16 +74,10 @@ function nativePackage(directory, version, target, sourceCommit, dependencies) {
     [version, target, sourceCommit], 'native package identity mismatch');
   const pins = Object.fromEntries(['core_version', 'core_source_commit', 'app_version', 'app_source_commit'].map(field => [field, info[field]]));
   if (dependencies) assert.deepEqual(pins, dependencies, 'dependency pins mismatch across native targets');
-  const checked = new Set();
-  for (const line of fs.readFileSync(path.join(directory, 'FILES.sha256'), 'utf8').trim().split('\n')) {
-    const match = /^([a-f0-9]{64})  ([a-zA-Z0-9._/-]+)$/.exec(line);
-    assert(match && match[2].split('/').every(part => part && part !== '.' && part !== '..'), 'invalid file checksum entry');
-    assert(!checked.has(match[2]) && match[2] !== 'FILES.sha256', 'duplicate or recursive file checksum');
-    checked.add(match[2]);
-    assert.equal(hash(path.join(directory, match[2])), match[1], 'component content checksum mismatch');
+  const sealed = readSealedRuntime(directory);
+  for (const entry of requiredFiles(target).filter(name => name !== 'FILES.sha256')) {
+    assert(sealed.has(entry), `missing package file: ${entry}`);
   }
-  const actual = fs.readdirSync(directory, { recursive: true }).filter(name => name !== 'FILES.sha256' && fs.lstatSync(path.join(directory, name)).isFile()).sort();
-  assert.deepEqual([...checked].sort(), actual, 'file checksum coverage mismatch');
   for (const binary of programNames(target)) {
     const executable = path.join(directory, binary);
     assert(fs.statSync(executable).mode & 0o111, `${binary} must be executable`);
@@ -174,13 +166,15 @@ async function selfTest() {
     const input = path.join(scratch, 'input');
     fs.mkdirSync(input);
     const sources = new Map();
-    const repack = target => {
+    const repack = (target, { rewriteChecksums = true } = {}) => {
       const name = `vibeface-${version}-${target}`;
       const archive = path.join(input, `${name}.tar.gz`);
       const directory = path.join(scratch, 'source', name);
       const entries = fs.readdirSync(directory, { recursive: true })
         .filter(entry => entry !== 'FILES.sha256' && fs.lstatSync(path.join(directory, entry)).isFile()).sort();
-      fs.writeFileSync(path.join(directory, 'FILES.sha256'), entries.map(entry => `${hash(path.join(directory, entry))}  ${entry}\n`).join(''));
+      if (rewriteChecksums) {
+        fs.writeFileSync(path.join(directory, 'FILES.sha256'), entries.map(entry => `${hash(path.join(directory, entry))}  ${entry}\n`).join(''));
+      }
       run('tar', ['-czf', archive, '-C', path.join(scratch, 'source'), name], { env: { ...process.env, COPYFILE_DISABLE: '1' } });
       fs.writeFileSync(`${archive}.sha256`, `${hash(archive)}  ${name}.tar.gz\n`);
     };
@@ -323,6 +317,14 @@ async function selfTest() {
       fs.renameSync(path.join(windowsSource, to), path.join(windowsSource, from));
       repack(windows);
     }
+    const sealedDirectory = sources.get(target);
+    const checksums = path.join(sealedDirectory, 'FILES.sha256');
+    const validChecksums = fs.readFileSync(checksums, 'utf8');
+    fs.writeFileSync(checksums, `${validChecksums}${validChecksums.split('\n', 1)[0]}\n`);
+    repack(target, { rewriteChecksums: false });
+    assert.throws(() => pack(input, path.join(scratch, 'duplicate-sealed-checksum'), version, commit), /invalid or duplicate runtime checksum entry/);
+    fs.writeFileSync(checksums, validChecksums);
+    repack(target);
     fs.symlinkSync('/tmp/vibeface-outside-package', path.join(sources.get(target), 'link'));
     repack(target);
     assert.throws(() => pack(input, path.join(scratch, 'unsafe-archive'), version, commit), /links or special files/);
