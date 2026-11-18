@@ -1,5 +1,6 @@
 use super::*;
 use std::collections::BTreeSet;
+use std::io;
 
 #[cfg(windows)]
 pub(super) const GUI: &str = "Vibeface.exe";
@@ -208,14 +209,15 @@ fn apply_files(
         {
             let dest = live.join(rel);
             fs::create_dir_all(parent(&dest)?)?;
-            if old.contains(rel) {
+            if !old.contains(rel) {
+                // Reserve a fresh name on filesystems with or without hard-link support.
+                drop(fs::File::create_new(&dest)?);
+                changed.push(rel);
                 fs::rename(next.join(rel), &dest)?;
             } else {
-                // A hard link creates a fresh name without clobbering an unowned file if it
-                // appeared after the vacancy check. Both paths are on the same volume.
-                fs::hard_link(next.join(rel), &dest)?;
+                fs::rename(next.join(rel), &dest)?;
+                changed.push(rel);
             }
-            changed.push(rel);
         }
         privatefs::sync_dir(live)
     })();

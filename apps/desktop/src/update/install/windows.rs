@@ -1,5 +1,6 @@
 use super::*;
 use base64::{Engine, engine::general_purpose::STANDARD};
+use std::io;
 use std::os::windows::process::CommandExt;
 
 const MARKER: &str = ".vibeface-install-owned";

@@ -2,10 +2,9 @@
 //! the GUI shuts down, with the verified release asset and the per-installation lock held.
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{self, Read},
+    io::Read,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -212,11 +211,13 @@ fn read_small(path: &Path, limit: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(any(target_os = "linux", windows))]
 fn hash(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
     check_path(path)?;
     let mut file = privatefs::open_no_follow(path)?;
     let mut sha = Sha256::new();
-    io::copy(&mut file, &mut sha)?;
+    std::io::copy(&mut file, &mut sha)?;
     Ok(hex::encode(sha.finalize()))
 }
 
