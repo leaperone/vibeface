@@ -5,6 +5,7 @@ use super::{
 use crate::{net, runtime::Runtime};
 use anyhow::{Context, Result, ensure};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 use vibeface_secure::Channel;
@@ -26,7 +27,11 @@ async fn read_packet(recv: &mut RecvStream, limit: usize) -> Result<Vec<u8>> {
     recv.read_exact(&mut body).await?;
     Ok(body)
 }
-async fn write_value(send: &mut SendStream, channel: &mut Channel, value: &Value) -> Result<()> {
+async fn write_control(
+    send: &mut SendStream,
+    channel: &mut Channel,
+    value: &impl Serialize,
+) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
     ensure!(
         bytes.len() <= MAX_CONTROL_BYTES,
@@ -37,7 +42,7 @@ async fn write_value(send: &mut SendStream, channel: &mut Channel, value: &Value
     }
     Ok(())
 }
-async fn read_value(recv: &mut RecvStream, channel: &mut Channel) -> Result<Value> {
+async fn read_control(recv: &mut RecvStream, channel: &mut Channel) -> Result<Vec<u8>> {
     let record = read_packet(recv, MAX_CONTROL_BYTES + 1024).await?;
     let value = channel
         .open_record(&record)?
@@ -46,9 +51,9 @@ async fn read_value(recv: &mut RecvStream, channel: &mut Channel) -> Result<Valu
         value.len() <= MAX_CONTROL_BYTES,
         "service control message exceeds limit"
     );
-    Ok(serde_json::from_slice(&value)?)
+    Ok(value)
 }
-pub async fn request(node: &Runtime, peer: &str, request: &ServiceRequest) -> Result<Value> {
+pub(super) async fn request(node: &Runtime, peer: &str, request: &ServiceRequest) -> Result<Value> {
     let connection = node.net()?.connect(peer, net::SERVICE).await?;
     let result = tokio::time::timeout(Duration::from_secs(120), async {
         let (mut send, mut recv) = connection.open_bi().await?;
@@ -64,9 +69,10 @@ pub async fn request(node: &Runtime, peer: &str, request: &ServiceRequest) -> Re
         );
         write_packet(&mut send, &handshake.write(&[])?, 4096).await?;
         let mut channel = handshake.finish()?;
-        write_value(&mut send, &mut channel, &serde_json::to_value(request)?).await?;
+        write_control(&mut send, &mut channel, request).await?;
         send.finish()?;
-        let response = read_value(&mut recv, &mut channel).await?;
+        let response: Value =
+            serde_json::from_slice(&read_control(&mut recv, &mut channel).await?)?;
         if let Some(error) = response.get("error").and_then(Value::as_str) {
             anyhow::bail!("{error}");
         }
@@ -130,23 +136,27 @@ impl Delivery {
             })
             .await
             .context("service handshake deadline exceeded")??;
-            let value =
-                tokio::time::timeout(Duration::from_secs(5), read_value(&mut recv, &mut channel))
-                    .await
-                    .context("service request deadline exceeded")??;
-            let request: ServiceRequest = serde_json::from_value(value)?;
-            let response = match tokio::time::timeout(
-                Duration::from_secs(120),
-                self.handle_service(&node, &remote, request),
+            let value = tokio::time::timeout(
+                Duration::from_secs(5),
+                read_control(&mut recv, &mut channel),
             )
             .await
-            .context("service operation outcome requires reconciliation")?
-            {
-                Ok(result) => json!({"result":result}),
-                Err(error) => json!({"error":error.to_string()}),
+            .context("service request deadline exceeded")??;
+            let response = match serde_json::from_slice::<ServiceRequest>(&value) {
+                Ok(request) => match tokio::time::timeout(
+                    Duration::from_secs(120),
+                    self.handle_service(&node, &remote, request),
+                )
+                .await
+                .context("service operation outcome requires reconciliation")?
+                {
+                    Ok(result) => json!({"result":result}),
+                    Err(error) => json!({"error":error.to_string()}),
+                },
+                Err(_) => json!({"error":"invalid delivery service request"}),
             };
             tokio::time::timeout(Duration::from_secs(5), async {
-                write_value(&mut send, &mut channel, &response).await?;
+                write_control(&mut send, &mut channel, &response).await?;
                 send.finish()?;
                 let _ = send.stopped().await;
                 Ok::<_, anyhow::Error>(())

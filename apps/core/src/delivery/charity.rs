@@ -164,7 +164,7 @@ impl CharityTerms {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CharityOrder {
+pub(super) struct CharityOrder {
     terms: CharityTerms,
     windows: Vec<WindowSpec>,
     signature: String,
@@ -251,7 +251,7 @@ impl CharityOrder {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CharityReceipt {
+pub(super) struct CharityReceipt {
     order_id: String,
     manifest_hash: String,
     receiver_peer: String,
@@ -343,9 +343,9 @@ struct Snapshot {
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-enum Request {
-    Announce,
-    Key,
+pub(super) enum CharityRequest {
+    Announce {},
+    Key {},
     Reserve {
         order: CharityOrder,
     },
@@ -602,7 +602,7 @@ impl Delivery {
             }
             None => {
                 let key: CharityKey = serde_json::from_value(
-                    charity_request(node, &request.receiver_peer, Request::Key).await?,
+                    charity_request(node, &request.receiver_peer, CharityRequest::Key {}).await?,
                 )?;
                 key.verify()?;
                 ensure!(
@@ -610,7 +610,8 @@ impl Delivery {
                     "charity key response changed the receiver"
                 );
                 let announcement: Announcement = serde_json::from_value(
-                    charity_request(node, &request.provider_peer, Request::Announce).await?,
+                    charity_request(node, &request.provider_peer, CharityRequest::Announce {})
+                        .await?,
                 )?;
                 ensure!(
                     announcement.peer_id == request.provider_peer
@@ -874,7 +875,7 @@ impl Delivery {
                 let prior = charity_request(
                     node,
                     &provider,
-                    Request::Order {
+                    CharityRequest::Order {
                         order_id: stored.view.order_id.clone(),
                     },
                 )
@@ -902,7 +903,7 @@ impl Delivery {
                     charity_request(
                         node,
                         &provider,
-                        Request::Reserve {
+                        CharityRequest::Reserve {
                             order: stored.order.clone(),
                         },
                     )
@@ -923,7 +924,7 @@ impl Delivery {
                     charity_request(
                         node,
                         &stored.view.receiver_peer,
-                        Request::Offer {
+                        CharityRequest::Offer {
                             order: stored.order.clone(),
                         },
                     )
@@ -943,7 +944,7 @@ impl Delivery {
                     charity_request(
                         node,
                         &stored.view.provider_peer,
-                        Request::Accept {
+                        CharityRequest::Accept {
                             order_id: stored.view.order_id.clone(),
                             signature: consent,
                         },
@@ -1019,7 +1020,7 @@ impl Delivery {
                 charity_request(
                     node,
                     &stored.view.provider_peer,
-                    Request::Receipt {
+                    CharityRequest::Receipt {
                         receipt: stored
                             .receipt
                             .clone()
@@ -1096,7 +1097,7 @@ impl Delivery {
             charity_request(
                 node,
                 provider,
-                Request::Offset {
+                CharityRequest::Offset {
                     order_id: stored.view.order_id.clone(),
                     index,
                     operation: operation.clone(),
@@ -1113,7 +1114,7 @@ impl Delivery {
                 charity_request(
                     node,
                     provider,
-                    Request::Put {
+                    CharityRequest::Put {
                         order_id: stored.view.order_id.clone(),
                         index,
                         operation: operation.clone(),
@@ -1165,7 +1166,7 @@ impl Delivery {
             let value = charity_request(
                 node,
                 &provider,
-                Request::Get {
+                CharityRequest::Get {
                     order_id: stored.view.order_id.clone(),
                     index,
                     operation: operation.clone(),
@@ -1212,17 +1213,16 @@ impl Delivery {
         &self,
         node: &Runtime,
         remote: &str,
-        request: Value,
+        request: CharityRequest,
     ) -> Result<Value> {
         self.ensure_mode(Mode::Charity)?;
-        let request: Request = serde_json::from_value(request)?;
         match request {
-            Request::Announce => Ok(serde_json::to_value(Announcement {
+            CharityRequest::Announce {} => Ok(serde_json::to_value(Announcement {
                 peer_id: self.identity.device_id()?,
                 max_file_bytes: MAX_FILE_BYTES,
             })?),
-            Request::Key => Ok(serde_json::to_value(self.charity_key()?)?),
-            Request::Reserve { order } => {
+            CharityRequest::Key {} => Ok(serde_json::to_value(self.charity_key()?)?),
+            CharityRequest::Reserve { order } => {
                 order.verify()?;
                 order.terms.active_offer(now())?;
                 let peer = self.identity.device_id()?;
@@ -1249,7 +1249,7 @@ impl Delivery {
                     snapshot(&stored)
                 })
             }
-            Request::Offer { order } => {
+            CharityRequest::Offer { order } => {
                 order.verify()?;
                 order.terms.active_offer(now())?;
                 ensure!(
@@ -1286,7 +1286,7 @@ impl Delivery {
                     Ok(json!({"order_id":stored.view.order_id}))
                 })
             }
-            Request::Offset {
+            CharityRequest::Offset {
                 order_id,
                 index,
                 operation,
@@ -1318,7 +1318,7 @@ impl Delivery {
                 })?;
                 Ok(json!({"offset":offset}))
             }
-            Request::Put {
+            CharityRequest::Put {
                 order_id,
                 index,
                 operation,
@@ -1355,7 +1355,7 @@ impl Delivery {
                 })?;
                 Ok(json!({"offset":next}))
             }
-            Request::Get {
+            CharityRequest::Get {
                 order_id,
                 index,
                 operation,
@@ -1385,7 +1385,7 @@ impl Delivery {
                 let end = (offset as usize + CHUNK_BYTES).min(bytes.len());
                 Ok(json!({"bytes":STANDARD.encode(&bytes[offset as usize..end]),"offset":end}))
             }
-            Request::Accept {
+            CharityRequest::Accept {
                 order_id,
                 signature,
             } => {
@@ -1410,7 +1410,7 @@ impl Delivery {
                     snapshot(&stored)
                 })
             }
-            Request::Receipt { receipt } => {
+            CharityRequest::Receipt { receipt } => {
                 let peer = self.identity.device_id()?;
                 self.with_store(|store| {
                     let mut stored = provider_record(store, &receipt.order_id, &peer)?;
@@ -1432,7 +1432,7 @@ impl Delivery {
                     snapshot(&stored)
                 })
             }
-            Request::Order { order_id } => {
+            CharityRequest::Order { order_id } => {
                 if self
                     .with_store(|store| store.charity_order(&order_id))?
                     .is_none()
@@ -1451,15 +1451,8 @@ impl Delivery {
     }
 }
 
-async fn charity_request(node: &Runtime, peer: &str, request: Request) -> Result<Value> {
-    service::request(
-        node,
-        peer,
-        &ServiceRequest::Charity {
-            request: serde_json::to_value(request)?,
-        },
-    )
-    .await
+async fn charity_request(node: &Runtime, peer: &str, request: CharityRequest) -> Result<Value> {
+    service::request(node, peer, &ServiceRequest::Charity { request }).await
 }
 
 fn save_record(store: &mut ServiceStore, stored: &mut StoredCharity) -> Result<()> {
@@ -1784,6 +1777,61 @@ mod tests {
             .sign_payload("delivery-charity-source", &order.manifest().unwrap())
             .unwrap();
         (order, secret, objects, content, receiver, source)
+    }
+
+    #[test]
+    fn charity_service_request_round_trips_the_original_wire_envelope() -> Result<()> {
+        let (order, _, _, _, receiver, _) = fixture();
+        let order_id = &order.terms.order_id;
+        let mut receipt = CharityReceipt {
+            order_id: order_id.clone(),
+            manifest_hash: hex::encode(order.digest()?),
+            receiver_peer: receiver.device_id()?,
+            key_id: order.terms.receiving_key.key_id.clone(),
+            received_at: 2000,
+            signature: String::new(),
+        };
+        receipt.signature =
+            receiver.sign_payload("delivery-charity-received", &receipt.payload()?)?;
+        let cases = [
+            json!({"op":"announce"}),
+            json!({"op":"key"}),
+            json!({"op":"reserve","order":order}),
+            json!({"op":"offer","order":order}),
+            json!({"op":"offset","order_id":order_id,"index":0,"operation":"put_ciphertext"}),
+            json!({"op":"put","order_id":order_id,"index":0,"operation":"put_capsule","offset":0,"bytes":"YQ=="}),
+            json!({"op":"get","order_id":order_id,"index":0,"operation":"get_ciphertext","offset":0}),
+            json!({"op":"accept","order_id":order_id,"signature":receiver.sign_payload("delivery-charity-accept", &order.consent()?)?}),
+            json!({"op":"receipt","receipt":receipt}),
+            json!({"op":"order","order_id":order_id}),
+        ];
+        for request in cases {
+            let wire = json!({"op":"charity","request":request});
+            let decoded: ServiceRequest = serde_json::from_slice(&serde_json::to_vec(&wire)?)?;
+            assert_eq!(serde_json::to_value(&decoded)?, wire);
+            let mut extra = wire;
+            extra["request"]["unexpected"] = json!(true);
+            assert!(
+                serde_json::from_slice::<ServiceRequest>(&serde_json::to_vec(&extra)?).is_err()
+            );
+        }
+        for payload in [
+            json!({"op":"charity","request":{"op":"unknown"}}),
+            json!({"op":"charity","request":{"op":"key"},"unexpected":true}),
+            json!({"op":"charity","request":{"op":"reserve","order":{}}}),
+            json!({"op":"charity","request":{"op":"offset","order_id":order_id,"index":0,"operation":"unknown"}}),
+        ] {
+            assert!(
+                serde_json::from_slice::<ServiceRequest>(&serde_json::to_vec(&payload)?).is_err()
+            );
+        }
+        assert!(
+            serde_json::from_slice::<ServiceRequest>(
+                br#"{"op":"charity","request":{"op":"announce","op":"key"}}"#,
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]

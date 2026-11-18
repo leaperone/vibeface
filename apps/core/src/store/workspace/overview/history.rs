@@ -1,6 +1,13 @@
 //! Historical task reads retain the complete influence component, then use Graph::record.
 //! The prepass reads identities and resource roots only, never event text/prompts/results.
-use super::super::*;
+use super::super::{graph::Graph, query::projection_basis, validation::overlap};
+use crate::{
+    model::{Event, SignedEvent},
+    store::log,
+};
+use anyhow::{Context as _, Result, bail, ensure};
+use rusqlite::{Connection, params};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
 struct Influence {
@@ -238,6 +245,15 @@ thread_local! { static DECODED_EVENTS: std::cell::Cell<usize> = const {std::cell
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        crypto::LocalIdentity,
+        model::{Cause, EventBody, ReplyStatus, Role, WIRE_VERSION},
+        store::workspace::query::graph_at,
+        workspace::{
+            AssignmentState, InputControl, InputIntent, InputTarget, MAX_AUTOMATIC_ASSIGNMENTS,
+            MAX_MEMBER_REPLIES, TaskAction, WORKSPACE_SCOPE, WorkspaceCommand,
+        },
+    };
     use serde_json::json;
 
     struct History {

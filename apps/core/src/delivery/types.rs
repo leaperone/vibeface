@@ -1,23 +1,16 @@
+use super::charity::CharityRequest;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use vibeface_delivery::{Order, PeerSignature, SignedKeyBinding, Word};
+pub use vibeface_protocol::delivery::{
+    DeliveryAcceptance as Acceptance, DeliveryMode as Mode, DeliveryPrepare as Prepare,
+};
+use vibeface_protocol::delivery::{DeliveryRead, DeliveryWireAction};
 
 pub const MAX_FILE_BYTES: usize = 130_816;
 pub const MAX_CONTROL_BYTES: usize = 16_384;
 pub const CHUNK_BYTES: usize = 8192;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Mode {
-    Charity,
-    Paid,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Acceptance {
-    Recoverable,
-    Strict,
-}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -244,21 +237,6 @@ impl StoredOrder {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Prepare {
-    pub intent_id: String,
-    pub receiver_peer: String,
-    pub provider_peer: String,
-    pub mode: Mode,
-    pub acceptance: Acceptance,
-    pub name: String,
-    pub content_base64: String,
-    pub max_service_amount: String,
-    pub max_gas_amount: String,
-    pub budget_id: Option<String>,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GrantOperation {
@@ -304,13 +282,44 @@ impl ServiceGrant {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(crate) enum ClientRequest {
+    Read(DeliveryRead),
+    Receipt(ReceiptRequest),
+    Write(DeliveryWireAction),
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ReceiptRequest {
+    Receipt { order_id: String },
+}
+
+pub(crate) enum ClientAccess {
+    Read,
+    Manage,
+    Writable,
+}
+
+impl ClientRequest {
+    pub(crate) fn access(&self) -> ClientAccess {
+        match self {
+            Self::Read(DeliveryRead::Budgets) => ClientAccess::Writable,
+            Self::Read(_) | Self::Receipt(_) => ClientAccess::Read,
+            Self::Write(DeliveryWireAction::Configure { .. }) => ClientAccess::Manage,
+            Self::Write(_) => ClientAccess::Writable,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ServiceRequest {
+pub(super) enum ServiceRequest {
     Charity {
-        request: serde_json::Value,
+        request: CharityRequest,
     },
-    Announce,
+    Announce {},
     KeyBinding {
         mode: Mode,
     },

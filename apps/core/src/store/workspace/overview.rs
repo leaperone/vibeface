@@ -1,8 +1,23 @@
 //! The dependency closure needed by overview hold evaluation. This is deliberately private:
 //! its graph is not a complete workspace and must never be passed to reducers or replay.
-use super::*;
+use super::{
+    assignment::{
+        task_execution_allowed_with_graph, workspace_assignment_for_job_with_graph,
+        workspace_input_resources_blocked_with_graph,
+    },
+    graph::Graph,
+    input::{queued_workspace_input_with_graph, resolve_input_target_with_graph},
+    resources::assignment_resources_available_with_graph,
+    validation::overlap,
+};
+use crate::{
+    scheduling::{SchedulerJob, SessionScope},
+    workspace::{Assignment, InputTarget, QueuedInput, ResolvedInputTarget},
+};
+use anyhow::Result;
+use rusqlite::{Connection, OptionalExtension as _, params};
+
 mod history;
-use crate::scheduling::SchedulerJob;
 pub(super) use history::graph_at_task;
 
 pub(crate) struct OverviewFacts {
@@ -130,43 +145,6 @@ impl OverviewFacts {
     }
 }
 
-/// Resource checks need active overlapping reservations, never historical payloads. The
-/// portable overlap predicate is the same one used below by resource_conflicts_from; this
-/// prepass reads identity/directory facts before invoking the canonical work codec in bulk.
-pub(super) fn resource_work_candidates(
-    connection: &Connection,
-    network: &str,
-    node: &str,
-    roots: &[String],
-) -> Result<Vec<WorkProjection>> {
-    let mut statement=connection.prepare(
-        "SELECT w.work_id,json_extract(w.dispatch,'$.cwd'),r.value IS NOT NULL,json_extract(r.value,'$.native_cwd')
-         FROM works w LEFT JOIN identity_meta r ON r.key='work-native-submission:'||w.work_id
-         WHERE w.network_id=?1 AND w.target_node=?2 AND w.dispatch IS NOT NULL
-            AND (w.finish IS NULL OR json_extract(w.finish,'$.outcome')='unverified')")?;
-    let mut rows = statement.query(params![network, node])?;
-    let mut candidates = Vec::new();
-    while let Some(row) = rows.next()? {
-        let reserved: bool = row.get(2)?;
-        let occupied = if reserved {
-            let cwd: Option<String> = row.get(3)?;
-            let cwd = cwd.context("native work reservation has no directory")?;
-            valid_roots(std::slice::from_ref(&cwd))?;
-            cwd
-        } else {
-            row.get::<_, String>(1)?
-        };
-        if roots.iter().any(|root| overlap(root, &occupied)) {
-            candidates.push(row.get::<_, String>(0)?);
-        }
-    }
-    super::super::reduce::works_query(
-        connection,
-        "FROM works w WHERE w.network_id=?1 AND w.work_id IN (SELECT value FROM json_each(?2))",
-        params![network, serde_json::to_string(&candidates)?],
-    )
-}
-
 fn overlapping_assignments(
     connection: &Connection,
     network: &str,
@@ -208,8 +186,16 @@ fn overlapping_assignments(
 
 #[cfg(test)]
 mod tests {
+    use super::super::query::save_graph;
     use super::*;
     use crate::{config::SchedulingLimits, providers::Provider, scheduling::QueueHoldReason};
+    use crate::{
+        crypto::LocalIdentity,
+        model::{Event, EventBody, VersionVector, WIRE_VERSION},
+        store::Store,
+        workspace::{WORKSPACE_SCOPE, WorkspaceCommand},
+    };
+    use anyhow::ensure;
     use serde_json::json;
 
     #[test]
@@ -319,7 +305,7 @@ mod tests {
                 automatic: false,
             },
         )?;
-        graph.save(&store.connection, &network)?;
+        save_graph(&graph, &store.connection, &network)?;
         store.connection.execute("INSERT INTO scheduler_jobs(conversation_id,scope,trigger,kind,sequence,basis,reply_to,message_id,state,tool_calls)
             VALUES('c','workspace_task:wanted','assignment:assignment','human',1,'{}','assignment','reply','queued',0)",[])?;
         let limits = SchedulingLimits {
@@ -345,10 +331,10 @@ mod tests {
         };
         compare(None)?;
         graph.tasks.get_mut("wanted").unwrap().dependencies = vec!["dependency".into()];
-        graph.save(&store.connection, &network)?;
+        save_graph(&graph, &store.connection, &network)?;
         compare(Some(QueueHoldReason::PendingCheck))?;
         graph.tasks.get_mut("wanted").unwrap().dependencies.clear();
-        graph.save(&store.connection, &network)?;
+        save_graph(&graph, &store.connection, &network)?;
         let mut dispatch = json!({"type":"work_dispatched","work_id":"foreign","trigger":"message:foreign","dispatcher":local,
             "call_ref":"foreign","kind":"task","resolved":{"provider":"codex","model":null},"cwd":"/project/subdir","title":"foreign","prompt":"private"});
         store.connection.execute("INSERT INTO works(network_id,work_id,conversation_id,target_node,dispatch,dispatch_rank) VALUES(?1,'foreign','elsewhere',?2,?3,'rank')",params![network,local,dispatch.to_string()])?;
@@ -360,10 +346,10 @@ mod tests {
         )?;
         compare(None)?;
         graph.channels.get_mut("channel").unwrap().owner_epoch = 2;
-        graph.save(&store.connection, &network)?;
+        save_graph(&graph, &store.connection, &network)?;
         compare(Some(QueueHoldReason::PendingCheck))?;
         graph.channels.get_mut("channel").unwrap().owner_epoch = 1;
-        graph.save(&store.connection, &network)?;
+        save_graph(&graph, &store.connection, &network)?;
         store.connection.execute(
             "UPDATE events SET effective=0 WHERE hash=?",
             [assignment_hash],

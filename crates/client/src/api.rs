@@ -16,6 +16,10 @@ use std::sync::{
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tokio::sync::{Semaphore, broadcast, watch};
 use vibeface_protocol::amount::Amount;
+pub use vibeface_protocol::delivery::{
+    DeliveryAcceptance, DeliveryAction, DeliveryBudgetFlush, DeliveryFlushIntent, DeliveryMode,
+    DeliveryPrepare, DeliveryRead, DeliveryWireAction,
+};
 
 // Serde's internally tagged unit decoder ignores map entries even with deny_unknown_fields.
 fn empty_operation<'de, D: serde::Deserializer<'de>>(
@@ -151,27 +155,6 @@ pub enum OfflineBlockReason {
     NotEnrolled,
     NotMember,
     NodeRemoved,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-pub enum DeliveryRead {
-    #[serde(deserialize_with = "empty_operation")]
-    Status,
-    #[serde(deserialize_with = "empty_operation")]
-    List,
-    #[serde(deserialize_with = "empty_operation")]
-    Providers,
-    #[serde(deserialize_with = "empty_operation")]
-    Budgets,
-    Get {
-        order_id: String,
-    },
-    FindIntent {
-        intent_id: String,
-    },
-    Read {
-        order_id: String,
-    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -412,32 +395,6 @@ pub struct ProviderSettings {
     pub connect_local: bool,
     pub env: BTreeMap<String, Option<String>>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DeliveryMode {
-    Charity,
-    Paid,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DeliveryAcceptance {
-    Recoverable,
-    Strict,
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeliveryPrepare {
-    pub intent_id: String,
-    pub receiver_peer: String,
-    pub provider_peer: String,
-    pub mode: DeliveryMode,
-    pub acceptance: DeliveryAcceptance,
-    pub name: String,
-    pub content_base64: String,
-    pub max_service_amount: String,
-    pub max_gas_amount: String,
-    pub budget_id: Option<String>,
-}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
 pub struct DeliveryReadyWindow {
@@ -465,35 +422,6 @@ pub fn delivery_flush_batch_id(batch: &DeliveryBudgetBatch) -> Result<String> {
         "vibeface:delivery-flush:v1",
         batch,
     ))?)))
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-pub enum DeliveryAction {
-    Configure {
-        enabled: bool,
-        charity_enabled: bool,
-        paid_enabled: bool,
-    },
-    Prepare(DeliveryPrepare),
-    Confirm {
-        intent_id: String,
-    },
-    Accept {
-        order_id: String,
-    },
-    Reconcile {
-        order_id: String,
-    },
-    ConfirmBatch {
-        intent_ids: [String; 2],
-    },
-    AcceptBatch {
-        order_ids: [String; 2],
-    },
-    FlushBudget {
-        budget_id: String,
-        batch_id: String,
-    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1704,12 +1632,55 @@ impl Client {
                 let mut params=request["params"].take();params["method"]=json!("workspace_command_receipt");
                 self.connection.call("rpc",params).await?
             }
-            Reconciliation::Delivery {intent_id,order_id,..} => {
-                let order_id=if let Some(id)=order_id {Some(id.clone())} else if let Some(intent)=intent_id {
-                    let found=self.connection.call("delivery",json!({"op":"find_intent","intent_id":intent})).await?;
-                    if found["order"].is_null() {None} else {Some(found["order"]["order_id"].as_str().context("delivery order ID missing")?.to_owned())}
-                } else {None};
-                if let Some(id)=order_id {self.connection.call("delivery",json!({"op":"receipt","order_id":id})).await?} else {Value::Null}
+            Reconciliation::Delivery { intent_id, order_id, operation } => {
+                let order_id = if let Some(id) = order_id {
+                    Some(id.clone())
+                } else if let Some(intent) = intent_id {
+                    let found = self.connection
+                        .call("delivery", json!({"op":"find_intent","intent_id":intent}))
+                        .await?;
+                    let order = &found["order"];
+                    if order.is_null() {
+                        None
+                    } else {
+                        if operation == "prepare" {
+                            ensure!(
+                                order["intent_id"] == *intent,
+                                "delivery intent lookup mismatch"
+                            );
+                            ensure!(
+                                valid_hash(&order["order_id"]),
+                                "delivery intent lookup order ID is missing or invalid"
+                            );
+                        }
+                        Some(
+                            order["order_id"]
+                                .as_str()
+                                .context("delivery order ID missing")?
+                                .to_owned(),
+                        )
+                    }
+                } else {
+                    None
+                };
+                if let Some(id) = order_id {
+                    let result = self.connection
+                        .call("delivery", json!({"op":"receipt","order_id":id}))
+                        .await?;
+                    if operation == "prepare" && !result["receipt"].is_null() {
+                        ensure!(
+                            result["receipt"]["order_id"] == id,
+                            "delivery prepare receipt order ID mismatch"
+                        );
+                        ensure!(
+                            result["order"]["order_id"] == id,
+                            "delivery prepare readback order ID mismatch"
+                        );
+                    }
+                    result
+                } else {
+                    Value::Null
+                }
             }
             Reconciliation::Settings {kind}=>self.connection.call(crate::settings::read_method(*kind),json!({})).await?,
             Reconciliation::Unanswered {conversation_id,..}=>self.connection.call("rpc",json!({"method":"conversation","conversation_id":conversation_id})).await?,
@@ -2414,9 +2385,7 @@ impl Client {
                     DeliveryAction::Prepare(prepare) => {
                         validate_new_delivery_prepare(&prepare)?;
                         id = format!("prepare-{}", prepare.intent_id);
-                        let mut value = serde_json::to_value(prepare)?;
-                        value["op"] = json!("prepare");
-                        value
+                        serde_json::to_value(DeliveryWireAction::Prepare(prepare))?
                     }
                     DeliveryAction::Confirm { intent_id } => {
                         id = format!("confirm-{intent_id}");
@@ -2457,10 +2426,10 @@ impl Client {
                         )?;
                         params
                     }
-                    DeliveryAction::FlushBudget {
+                    DeliveryAction::FlushBudget(DeliveryFlushIntent {
                         budget_id,
                         batch_id,
-                    } => {
+                    }) => {
                         vibeface_secure::membership::validate_hash(&budget_id)?;
                         vibeface_secure::membership::validate_hash(&batch_id)?;
                         id = self.operation_id("delivery", &json!({"type":"delivery_flush_budget","target_node":self.target,"budget_id":budget_id,"batch_id":batch_id}))?;
@@ -2469,7 +2438,9 @@ impl Client {
                             batch_id,
                             binding: None,
                         };
-                        json!({"op":"flush_budget","budget_id":budget_id})
+                        serde_json::to_value(DeliveryWireAction::FlushBudget(
+                            DeliveryBudgetFlush { budget_id },
+                        ))?
                     }
                 };
                 if !matches!(
@@ -3115,6 +3086,15 @@ fn canonical_budget_batch(mut batch: DeliveryBudgetBatch) -> Result<DeliveryBudg
     );
     Ok(batch)
 }
+fn decode_delivery_prepare(params: &Value) -> Result<DeliveryPrepare> {
+    let DeliveryWireAction::Prepare(prepare) =
+        DeliveryWireAction::deserialize(params).context("invalid delivery prepare request")?
+    else {
+        anyhow::bail!("expected a delivery prepare request");
+    };
+    Ok(prepare)
+}
+
 fn validate_new_delivery_prepare(prepare: &DeliveryPrepare) -> Result<()> {
     uuid::Uuid::parse_str(&prepare.intent_id)?;
     Amount::from_decimal_str(&prepare.max_service_amount)
@@ -3348,7 +3328,7 @@ impl Client {
         }
         let request: Value = serde_json::from_slice(&operation.bytes)?;
         if request["method"] == "delivery" && request["params"]["op"] == "prepare" {
-            let prepare: DeliveryPrepare = serde_json::from_value(request["params"].clone())?;
+            let prepare = decode_delivery_prepare(&request["params"])?;
             validate_new_delivery_prepare(&prepare)?;
         }
         let reconciliation = match &operation.reconciliation {
@@ -3533,45 +3513,49 @@ impl Client {
     }
 }
 
-fn validate_delivery_prepare(request: &Value, order: &Value) -> Result<()> {
+fn validate_delivery_prepare(params: &Value, order: &Value) -> Result<()> {
     use base64::Engine;
-    for field in [
-        "intent_id",
-        "receiver_peer",
-        "provider_peer",
-        "mode",
-        "acceptance",
-        "name",
+    let prepare = decode_delivery_prepare(params)?;
+    ensure!(
+        valid_hash(&order["order_id"]),
+        "prepared delivery order ID is missing or invalid"
+    );
+    for (field, requested) in [
+        ("intent_id", &prepare.intent_id),
+        ("receiver_peer", &prepare.receiver_peer),
+        ("provider_peer", &prepare.provider_peer),
+        ("name", &prepare.name),
     ] {
         ensure!(
-            order[field] == request[field],
+            order[field].as_str() == Some(requested.as_str()),
             "delivery preparation changed {field}"
         );
     }
     ensure!(
-        order["payment"]["budget_id"] == request["budget_id"],
+        order["mode"] == serde_json::to_value(prepare.mode)?,
+        "delivery preparation changed mode"
+    );
+    ensure!(
+        order["acceptance"] == serde_json::to_value(prepare.acceptance)?,
+        "delivery preparation changed acceptance"
+    );
+    ensure!(
+        order["payment"]["budget_id"] == serde_json::to_value(prepare.budget_id)?,
         "delivery preparation changed protected budget"
     );
-    let data = base64::engine::general_purpose::STANDARD.decode(
-        request["content_base64"]
-            .as_str()
-            .context("delivery content missing")?,
-    )?;
+    let data = base64::engine::general_purpose::STANDARD.decode(&prepare.content_base64)?;
     ensure!(
         order["bytes"].as_u64() == Some(data.len() as u64)
             && order["sha256"] == hex::encode(Sha256::digest(&data)),
         "delivery content mismatch"
     );
     for (actual, maximum) in [
-        ("total", "max_service_amount"),
-        ("gas_cap", "max_gas_amount"),
+        ("total", &prepare.max_service_amount),
+        ("gas_cap", &prepare.max_gas_amount),
     ] {
         let actual = order["payment"][actual]
             .as_str()
             .context("delivery amount missing")?;
-        let maximum = request[maximum]
-            .as_str()
-            .context("delivery maximum missing")?;
         let actual = Amount::from_decimal_str(actual).context("invalid delivery amount")?;
         let maximum = Amount::from_decimal_str(maximum).context("invalid delivery maximum")?;
         ensure!(actual <= maximum, "delivery exceeds authorized budget");
@@ -4955,6 +4939,7 @@ mod prepaid_tests {
     const ASSET: &str = "0x3333333333333333333333333333333333333333";
     struct Evidence {
         orders: [Value; 2],
+        prepared: Vec<Value>,
         budget: DeliveryBudgetBatch,
         receipts: [bool; 2],
         receipt_client: String,
@@ -4964,6 +4949,9 @@ mod prepaid_tests {
         packets: Vec<Value>,
         reads: Vec<String>,
         drop_ack: bool,
+        prepare_reply: Option<Value>,
+        find_intent_reply: Option<Value>,
+        receipt_reply: Option<Value>,
         absent_first: bool,
         corrupt_budget: bool,
     }
@@ -4978,6 +4966,28 @@ mod prepaid_tests {
                 "delivery_fee":"1","reservation_fee":"1","priority_fee":"0","total":"2","gas_cap":"3","budget_id":"d".repeat(64)},
             "deadlines":{"quote_expires_at":10,"hold_deadline":20,"key_deadline":30,"open_deadline":40,"retain_until":50,"priority_deadline":25},
             "windows":[{"index":0,"bytes":1,"committed_bytes":69,"state":"pending","decryption_proven":false}]
+        }))
+    }
+    fn prepared_order(node: &str, prepare: &DeliveryPrepare) -> Result<Value> {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(&prepare.content_base64)?;
+        Ok(json!({
+            "order_id": hex::encode(Sha256::digest(prepare.intent_id.as_bytes())),
+            "intent_id": prepare.intent_id,
+            "role": "sender",
+            "mode": prepare.mode,
+            "acceptance": prepare.acceptance,
+            "source_peer": node,
+            "receiver_peer": prepare.receiver_peer,
+            "provider_peer": prepare.provider_peer,
+            "name": prepare.name,
+            "bytes": bytes.len(),
+            "sha256": hex::encode(Sha256::digest(&bytes)),
+            "phase": "prepared",
+            "payment": match prepare.mode {
+                DeliveryMode::Paid => json!({"state":"prepared","total":"2","gas_cap":"3","budget_id":prepare.budget_id}),
+                DeliveryMode::Charity => json!({"state":"free","total":"0","gas_cap":"0","budget_id":null}),
+            },
         }))
     }
     fn budget(target: &str, orders: &[Value; 2]) -> DeliveryBudgetBatch {
@@ -5036,7 +5046,25 @@ mod prepaid_tests {
                                 json!({"node_peer":node.device_id(),"wallet":{"state":"unlocked","address":PAYEE}})
                             }
                             "find_intent" => {
-                                json!({"order":saved.orders.iter().enumerate().find(|(index,order)|order["intent_id"]==params["intent_id"]&&!(saved.absent_first&&*index==0)).map(|(_,order)|order)})
+                                let order = saved
+                                    .prepared
+                                    .iter()
+                                    .find(|order| order["intent_id"] == params["intent_id"])
+                                    .or_else(|| {
+                                        saved
+                                            .orders
+                                            .iter()
+                                            .enumerate()
+                                            .find(|(index, order)| {
+                                                order["intent_id"] == params["intent_id"]
+                                                    && !(saved.absent_first && *index == 0)
+                                            })
+                                            .map(|(_, order)| order)
+                                    });
+                                saved
+                                    .find_intent_reply
+                                    .clone()
+                                    .unwrap_or_else(|| json!({"order":order}))
                             }
                             "get" => saved
                                 .orders
@@ -5045,16 +5073,31 @@ mod prepaid_tests {
                                 .context("original order")?
                                 .clone(),
                             "receipt" => {
-                                let index = saved
+                                let (order, authorized) = saved
                                     .orders
                                     .iter()
-                                    .position(|order| order["order_id"] == params["order_id"])
+                                    .zip(saved.receipts)
+                                    .chain(saved.prepared.iter().map(|order| (order, false)))
+                                    .find(|(order, _)| order["order_id"] == params["order_id"])
                                     .context("original receipt")?;
-                                let mut order = saved.orders[index].clone();
+                                let mut order = order.clone();
                                 if saved.corrupt_budget {
                                     order["payment"]["budget_id"] = json!("e".repeat(64));
                                 }
-                                json!({"order":order,"receipt":{"network_id":saved.receipt_network,"node_id":saved.receipt_node,"order_id":saved.orders[index]["order_id"],"intent_id":saved.orders[index]["intent_id"],"authorized_by":saved.receipt_client,"confirmed":saved.receipts[index],"accepted":saved.receipts[index]}})
+                                saved.receipt_reply.clone().unwrap_or_else(|| {
+                                    json!({"order":order,"receipt":{"network_id":saved.receipt_network,"node_id":saved.receipt_node,"order_id":order["order_id"],"intent_id":order["intent_id"],"authorized_by":saved.receipt_client,"confirmed":authorized,"accepted":authorized}})
+                                })
+                            }
+                            "prepare" => {
+                                let prepare = decode_delivery_prepare(params)?;
+                                validate_new_delivery_prepare(&prepare)?;
+                                let order = prepared_order(&node.device_id(), &prepare)?;
+                                saved.mutation_count += 1;
+                                saved.packets.push(request.clone());
+                                saved.prepared.push(order.clone());
+                                drop_ack = saved.drop_ack;
+                                saved.drop_ack = false;
+                                saved.prepare_reply.clone().unwrap_or(order)
                             }
                             "confirm_batch" | "accept_batch" | "flush_budget" => {
                                 saved.mutation_count += 1;
@@ -5118,6 +5161,7 @@ mod prepaid_tests {
         let evidence = Arc::new(Mutex::new(Evidence {
             budget: budget(rows[0]["provider_peer"].as_str().unwrap(), &rows),
             orders: rows,
+            prepared: vec![],
             receipts: [false, false],
             receipt_client: key.device_id().into(),
             receipt_node: node.device_id(),
@@ -5126,6 +5170,9 @@ mod prepaid_tests {
             packets: vec![],
             reads: vec![],
             drop_ack,
+            prepare_reply: None,
+            find_intent_reply: None,
+            receipt_reply: None,
             absent_first: false,
             corrupt_budget: false,
         }));
@@ -5151,6 +5198,22 @@ mod prepaid_tests {
             evidence,
             server,
         })
+    }
+    async fn reopen_prepaid(mut setup: Setup) -> Result<Setup> {
+        setup.client.close();
+        setup.server.await??;
+        setup.client.wait_for_read_storage().await;
+        drop(setup.client);
+        let (endpoint, server) = fixture(
+            &setup.node_secret,
+            setup.state.clone(),
+            setup.key.device_id().into(),
+            setup.evidence.clone(),
+        )
+        .await?;
+        setup.client = Client::open(setup.key.clone(), endpoint, setup.dir.join("outbox")).await?;
+        setup.server = server;
+        Ok(setup)
     }
     fn batch_action(receiver: bool, evidence: &Evidence) -> DeliveryAction {
         if receiver {
@@ -5216,9 +5279,38 @@ mod prepaid_tests {
             budget_id: Some("d".repeat(64)),
         }
     }
+    fn prepare_for_mode(mode: DeliveryMode) -> DeliveryPrepare {
+        let mut prepare = prepare_request();
+        prepare.mode = mode;
+        if mode == DeliveryMode::Charity {
+            prepare.max_service_amount = "0".into();
+            prepare.max_gas_amount = "0".into();
+            prepare.budget_id = None;
+        }
+        prepare
+    }
+    fn prepare_packet(prepare: &DeliveryPrepare) -> Value {
+        json!({
+            "id":format!("prepare-{}", prepare.intent_id),
+            "method":"delivery",
+            "params":{
+                "op":"prepare",
+                "intent_id":prepare.intent_id,
+                "receiver_peer":prepare.receiver_peer,
+                "provider_peer":prepare.provider_peer,
+                "mode":prepare.mode,
+                "acceptance":prepare.acceptance,
+                "name":prepare.name,
+                "content_base64":prepare.content_base64,
+                "max_service_amount":prepare.max_service_amount,
+                "max_gas_amount":prepare.max_gas_amount,
+                "budget_id":prepare.budget_id,
+            },
+        })
+    }
     #[test]
     fn prepare_and_authorization_reject_noncanonical_amounts_on_either_side() -> Result<()> {
-        let request = serde_json::to_value(prepare_request())?;
+        let request = prepare_packet(&prepare_request())["params"].clone();
         let order = orders(&"a".repeat(64), false)[0].clone();
         validate_delivery_prepare(&request, &order)?;
         let authorization = delivery_authorization(&order)?;
@@ -5250,7 +5342,7 @@ mod prepaid_tests {
                 let mut changed = request.clone();
                 changed[maximum] = json!(invalid);
                 assert!(validate_delivery_prepare(&changed, &order).is_err());
-                let prepare: DeliveryPrepare = serde_json::from_value(changed)?;
+                let prepare = decode_delivery_prepare(&changed)?;
                 assert!(validate_new_delivery_prepare(&prepare).is_err());
             }
             for field in [
@@ -5268,62 +5360,326 @@ mod prepaid_tests {
         Ok(())
     }
     #[tokio::test]
-    async fn malformed_new_and_restored_caps_never_reach_write_admission() -> Result<()> {
-        let setup = setup_prepaid(false, false, false).await?;
-        for field in ["max_service_amount", "max_gas_amount"] {
-            let mut request = serde_json::to_value(prepare_request())?;
-            request[field] = json!("00");
-            let malformed: DeliveryPrepare = serde_json::from_value(request)?;
-            assert!(
-                setup
+    async fn prepare_submits_and_restores_original_intent_in_both_modes() -> Result<()> {
+        for mode in [DeliveryMode::Paid, DeliveryMode::Charity] {
+            let setup = setup_prepaid(false, false, false).await?;
+            let prepare = prepare_for_mode(mode);
+            let direct_packet = prepare_packet(&prepare);
+            let direct_action = Action::Delivery(DeliveryAction::Prepare(prepare.clone()));
+            let direct = setup.client.submit(direct_action.clone()).await?;
+            assert_eq!(direct.state, OperationState::Accepted);
+            assert_eq!(direct.id, direct_packet["id"].as_str().unwrap());
+
+            let mut prepare = prepare;
+            prepare.intent_id = "00000000-0000-4000-8000-000000000003".into();
+            prepare.name = "restored.bin".into();
+            prepare.content_base64 = "AgM=".into();
+            let restored_packet = prepare_packet(&prepare);
+            let restored_action = Action::Delivery(DeliveryAction::Prepare(prepare));
+            let staged = setup.client.stage(restored_action.clone()).await?;
+            assert_eq!(staged.id, restored_packet["id"].as_str().unwrap());
+            assert_eq!(staged.state, OperationState::Prepared);
+            assert_eq!(setup.evidence.lock().unwrap().mutation_count, 1);
+
+            let setup = reopen_prepaid(setup).await?;
+            let result = setup.client.send_staged(&staged.id).await?;
+            assert_eq!(result.id, staged.id);
+            assert_eq!(result.state, OperationState::Accepted);
+            let lookup = staged.id.clone();
+            let restored = setup.client.stored(move |db| db.get(&lookup)).await?;
+            assert_eq!(restored.bytes, serde_json::to_vec(&restored_packet)?);
+            for (original, action) in [(direct, direct_action), (result, restored_action)] {
+                let resent = setup.client.send_staged(&original.id).await?;
+                assert_eq!(resent.state, OperationState::Accepted);
+                assert_eq!(resent.result, original.result);
+                let submitted = setup.client.submit(action).await?;
+                assert_eq!(submitted.id, original.id);
+                assert_eq!(submitted.result, original.result);
+            }
+            {
+                let evidence = setup.evidence.lock().unwrap();
+                assert_eq!(evidence.mutation_count, 2);
+                assert_eq!(
+                    evidence.packets.as_slice(),
+                    &[direct_packet, restored_packet]
+                );
+            }
+            setup.client.close();
+            setup.server.await??;
+            drop(setup.client);
+            std::fs::remove_dir_all(setup.dir)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_direct_prepare_order_id_leaves_outcome_unknown_without_resend() -> Result<()> {
+        for (mode, order_id) in [
+            (DeliveryMode::Paid, None),
+            (DeliveryMode::Charity, Some("AB".repeat(32))),
+        ] {
+            let setup = setup_prepaid(false, false, false).await?;
+            let prepare = prepare_for_mode(mode);
+            let original_packet = prepare_packet(&prepare);
+            let mut reply = prepared_order(setup.client.target_node(), &prepare)?;
+            if let Some(order_id) = order_id {
+                reply["order_id"] = json!(order_id);
+            } else {
+                reply.as_object_mut().unwrap().remove("order_id");
+            }
+            setup.evidence.lock().unwrap().prepare_reply = Some(reply);
+            let action = Action::Delivery(DeliveryAction::Prepare(prepare));
+            let error = setup
+                .client
+                .submit(action.clone())
+                .await
+                .err()
+                .context("invalid direct prepare response was accepted")?;
+            assert_eq!(
+                error.to_string(),
+                "prepared delivery order ID is missing or invalid"
+            );
+            let id = original_packet["id"].as_str().unwrap();
+            assert_eq!(
+                setup.client.submit(action).await?.state,
+                OperationState::Unknown
+            );
+            assert_eq!(
+                setup.client.send_staged(id).await?.state,
+                OperationState::Unknown
+            );
+            let lookup = id.to_owned();
+            let restored = setup.client.stored(move |db| db.get(&lookup)).await?;
+            assert_eq!(restored.snapshot.state, OperationState::Unknown);
+            assert_eq!(restored.snapshot.id, id);
+            assert_eq!(restored.bytes, serde_json::to_vec(&original_packet)?);
+            {
+                let evidence = setup.evidence.lock().unwrap();
+                assert_eq!(evidence.mutation_count, 1);
+                assert_eq!(evidence.packets.as_slice(), &[original_packet]);
+            }
+            setup.client.close();
+            setup.server.await??;
+            drop(setup.client);
+            std::fs::remove_dir_all(setup.dir)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lost_prepare_ack_reconciles_original_request_in_both_modes_without_resend()
+    -> Result<()> {
+        for mode in [DeliveryMode::Paid, DeliveryMode::Charity] {
+            let setup = setup_prepaid(false, false, true).await?;
+            let prepare = prepare_for_mode(mode);
+            let original_packet = prepare_packet(&prepare);
+            let unknown = setup
+                .client
+                .submit(Action::Delivery(DeliveryAction::Prepare(prepare)))
+                .await?;
+            assert_eq!(unknown.state, OperationState::Unknown);
+            let setup = reopen_prepaid(setup).await?;
+            assert_eq!(
+                setup.client.send_staged(&unknown.id).await?.state,
+                OperationState::Unknown
+            );
+            let (original_order, original_receipt) = {
+                let evidence = setup.evidence.lock().unwrap();
+                let order = evidence.prepared[0].clone();
+                let receipt = json!({
+                    "order":order,
+                    "receipt":{
+                        "network_id":evidence.receipt_network,
+                        "node_id":evidence.receipt_node,
+                        "order_id":order["order_id"],
+                        "intent_id":order["intent_id"],
+                        "authorized_by":evidence.receipt_client,
+                        "confirmed":false,
+                        "accepted":false,
+                    },
+                });
+                (order, receipt)
+            };
+            let mut wrong_intent = original_order.clone();
+            wrong_intent["intent_id"] = json!("00000000-0000-4000-8000-000000000009");
+            let mut invalid_lookup_id = original_order.clone();
+            invalid_lookup_id["order_id"] = json!("not-an-order-id");
+            let mut missing_lookup_id = original_order.clone();
+            missing_lookup_id
+                .as_object_mut()
+                .unwrap()
+                .remove("order_id");
+            for (order, diagnostic) in [
+                (Value::Null, None),
+                (wrong_intent, Some("delivery intent lookup mismatch")),
+                (
+                    invalid_lookup_id,
+                    Some("delivery intent lookup order ID is missing or invalid"),
+                ),
+                (
+                    missing_lookup_id,
+                    Some("delivery intent lookup order ID is missing or invalid"),
+                ),
+            ] {
+                {
+                    let mut evidence = setup.evidence.lock().unwrap();
+                    evidence.find_intent_reply = Some(json!({"order":order}));
+                    evidence.reads.clear();
+                }
+                let result = setup.client.reconcile(&unknown.id).await;
+                if let Some(diagnostic) = diagnostic {
+                    assert_eq!(
+                        result
+                            .err()
+                            .context("incorrect intent lookup was accepted")?
+                            .to_string(),
+                        diagnostic
+                    );
+                } else {
+                    assert_eq!(result?.state, OperationState::Unknown);
+                }
+                assert_eq!(setup.evidence.lock().unwrap().reads, ["find_intent"]);
+            }
+            setup.evidence.lock().unwrap().find_intent_reply = None;
+            for (field, diagnostic) in [
+                ("receipt", "delivery prepare receipt order ID mismatch"),
+                ("order", "delivery prepare readback order ID mismatch"),
+            ] {
+                for order_id in [Some("ef".repeat(32)), None] {
+                    let mut reply = original_receipt.clone();
+                    if let Some(order_id) = order_id {
+                        reply[field]["order_id"] = json!(order_id);
+                    } else {
+                        reply[field].as_object_mut().unwrap().remove("order_id");
+                    }
+                    setup.evidence.lock().unwrap().receipt_reply = Some(reply);
+                    let result = setup.client.reconcile(&unknown.id).await;
+                    assert_eq!(
+                        result
+                            .err()
+                            .context("incorrect receipt order was accepted")?
+                            .to_string(),
+                        diagnostic
+                    );
+                }
+            }
+            setup.evidence.lock().unwrap().receipt_reply =
+                Some(json!({"order":null,"receipt":null}));
+            assert_eq!(
+                setup.client.reconcile(&unknown.id).await?.state,
+                OperationState::Unknown
+            );
+            let lookup = unknown.id.clone();
+            let still_unknown = setup.client.stored(move |db| db.get(&lookup)).await?;
+            assert_eq!(still_unknown.snapshot.state, OperationState::Unknown);
+            assert_eq!(still_unknown.snapshot.id, unknown.id);
+            assert_eq!(still_unknown.bytes, serde_json::to_vec(&original_packet)?);
+            assert_eq!(
+                setup.client.send_staged(&unknown.id).await?.state,
+                OperationState::Unknown
+            );
+            {
+                let mut evidence = setup.evidence.lock().unwrap();
+                assert_eq!(evidence.mutation_count, 1);
+                evidence.receipt_reply = None;
+                evidence.reads.clear();
+            }
+            let result = setup.client.reconcile(&unknown.id).await?;
+            assert_eq!(result.id, unknown.id);
+            assert_eq!(result.state, OperationState::Accepted);
+            assert_eq!(result.result, Some(original_receipt));
+            let lookup = unknown.id.clone();
+            let restored = setup.client.stored(move |db| db.get(&lookup)).await?;
+            assert_eq!(restored.bytes, serde_json::to_vec(&original_packet)?);
+            {
+                let evidence = setup.evidence.lock().unwrap();
+                assert_eq!(evidence.mutation_count, 1);
+                assert_eq!(evidence.packets.as_slice(), &[original_packet]);
+                assert_eq!(evidence.reads, ["find_intent", "receipt"]);
+            }
+            setup.client.close();
+            setup.server.await??;
+            drop(setup.client);
+            std::fs::remove_dir_all(setup.dir)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_new_and_restored_prepares_never_reach_write_admission() -> Result<()> {
+        for (mode, field, diagnostic) in [
+            (
+                DeliveryMode::Paid,
+                "max_service_amount",
+                "invalid delivery service cap",
+            ),
+            (
+                DeliveryMode::Charity,
+                "max_gas_amount",
+                "invalid delivery gas cap",
+            ),
+            (
+                DeliveryMode::Paid,
+                "unexpected",
+                "invalid delivery prepare request",
+            ),
+        ] {
+            let setup = setup_prepaid(false, false, false).await?;
+            let prepare = prepare_for_mode(mode);
+            let mut request = prepare_packet(&prepare);
+            request["params"][field] = json!("00");
+            if field != "unexpected" {
+                let malformed = decode_delivery_prepare(&request["params"])?;
+                let error = setup
                     .client
                     .stage(Action::Delivery(DeliveryAction::Prepare(malformed)))
                     .await
-                    .is_err()
-            );
-        }
-        assert!(setup.client.pending().await?.is_empty());
-        let mut operation = setup
-            .client
-            .prepare(Action::Delivery(DeliveryAction::Prepare(prepare_request())))?;
-        let mut request: Value = serde_json::from_slice(&operation.bytes)?;
-        request["params"]["max_service_amount"] = json!("00");
-        operation.bytes = serde_json::to_vec(&request)?;
-        let original_bytes = operation.bytes.clone();
-        let id = operation.snapshot.id.clone();
-        let staged = setup
-            .client
-            .stored(move |db| db.prepare(&operation))
-            .await?;
-        assert_eq!(staged.state, OperationState::Prepared);
-        assert_eq!(staged.id, "prepare-00000000-0000-4000-8000-000000000001");
-        assert!(setup.client.send_staged(&id).await.is_err());
-        let lookup = id.clone();
-        let restored = setup.client.stored(move |db| db.get(&lookup)).await?;
-        assert_eq!(restored.snapshot.state, OperationState::Prepared);
-        assert_eq!(restored.bytes, original_bytes);
-        let lookup = id.clone();
-        setup.client.stored(move |db| db.begin(&lookup)).await?;
-        let unknown = setup.client.send_staged(&id).await?;
-        assert_eq!(unknown.state, OperationState::Unknown);
-        assert_eq!(unknown.id, "prepare-00000000-0000-4000-8000-000000000001");
-        let lookup = id.clone();
-        assert_eq!(
-            setup
+                    .err()
+                    .context("new invalid delivery was staged")?;
+                assert_eq!(error.to_string(), diagnostic);
+            }
+            assert!(setup.client.pending().await?.is_empty());
+
+            // Install a durable row that bypassed the current SDK's typed staging guard.
+            let mut operation = setup
                 .client
-                .stored(move |db| Ok(db.get(&lookup)?.bytes))
-                .await?,
-            original_bytes
-        );
-        {
-            let evidence = setup.evidence.lock().unwrap();
-            assert_eq!(evidence.mutation_count, 0);
-            assert!(!evidence.reads.iter().any(|op| op == "prepare"));
+                .prepare(Action::Delivery(DeliveryAction::Prepare(prepare)))?;
+            operation.bytes = serde_json::to_vec(&request)?;
+            let original_bytes = operation.bytes.clone();
+            let staged = setup
+                .client
+                .stored(move |db| db.prepare(&operation))
+                .await?;
+            assert_eq!(staged.state, OperationState::Prepared);
+            assert_eq!(staged.id, request["id"].as_str().unwrap());
+
+            let setup = reopen_prepaid(setup).await?;
+            let error = setup
+                .client
+                .send_staged(&staged.id)
+                .await
+                .err()
+                .context("restored invalid delivery reached write admission")?;
+            assert_eq!(error.to_string(), diagnostic);
+            if field == "unexpected" {
+                assert!(format!("{error:#}").contains("unknown field `unexpected`"));
+            }
+            let lookup = staged.id.clone();
+            let restored = setup.client.stored(move |db| db.get(&lookup)).await?;
+            assert_eq!(restored.snapshot.id, staged.id);
+            assert_eq!(restored.snapshot.state, OperationState::Prepared);
+            assert_eq!(restored.bytes, original_bytes);
+            {
+                let evidence = setup.evidence.lock().unwrap();
+                assert_eq!(evidence.mutation_count, 0);
+                assert!(evidence.packets.is_empty());
+                assert!(!evidence.reads.iter().any(|op| op == "prepare"));
+            }
+            setup.client.close();
+            setup.server.await??;
+            drop(setup.client);
+            std::fs::remove_dir_all(setup.dir)?;
         }
-        setup.client.close();
-        setup.server.await??;
-        drop(setup.client);
-        std::fs::remove_dir_all(setup.dir)?;
         Ok(())
     }
     #[tokio::test]
@@ -5362,10 +5718,10 @@ mod prepaid_tests {
                 json!({"op":"accept_batch","order_ids":orders}),
             ),
             (
-                DeliveryAction::FlushBudget {
+                DeliveryAction::FlushBudget(DeliveryFlushIntent {
                     budget_id: budget.budget_id.clone(),
                     batch_id: delivery_flush_batch_id(&budget)?,
-                },
+                }),
                 json!({"op":"flush_budget","budget_id":budget.budget_id}),
             ),
         ];
@@ -5377,7 +5733,7 @@ mod prepaid_tests {
             match &mut duplicate {
                 DeliveryAction::ConfirmBatch { intent_ids } => intent_ids.reverse(),
                 DeliveryAction::AcceptBatch { order_ids } => order_ids.reverse(),
-                DeliveryAction::FlushBudget { .. } => {}
+                DeliveryAction::FlushBudget(_) => {}
                 _ => unreachable!(),
             }
             let repeated = setup.client.prepare(Action::Delivery(duplicate))?;
@@ -5585,10 +5941,10 @@ mod prepaid_tests {
             let setup = setup_prepaid(false, true, drop_ack).await?;
             let batch = setup.evidence.lock().unwrap().budget.clone();
             let batch_id = delivery_flush_batch_id(&batch)?;
-            let action = DeliveryAction::FlushBudget {
+            let action = DeliveryAction::FlushBudget(DeliveryFlushIntent {
                 budget_id: batch.budget_id.clone(),
                 batch_id: batch_id.clone(),
-            };
+            });
             let result = setup
                 .client
                 .submit(Action::Delivery(action.clone()))
@@ -5635,10 +5991,12 @@ mod prepaid_tests {
                 let mut later = batch.clone();
                 later.ready_windows.remove(0);
                 let pending = client
-                    .submit(Action::Delivery(DeliveryAction::FlushBudget {
-                        budget_id: later.budget_id.clone(),
-                        batch_id: delivery_flush_batch_id(&later)?,
-                    }))
+                    .submit(Action::Delivery(DeliveryAction::FlushBudget(
+                        DeliveryFlushIntent {
+                            budget_id: later.budget_id.clone(),
+                            batch_id: delivery_flush_batch_id(&later)?,
+                        },
+                    )))
                     .await?;
                 assert_eq!(
                     pending.state,
@@ -5679,10 +6037,10 @@ mod prepaid_tests {
                 }
                 let action = if flush {
                     let batch = setup.evidence.lock().unwrap().budget.clone();
-                    DeliveryAction::FlushBudget {
+                    DeliveryAction::FlushBudget(DeliveryFlushIntent {
                         budget_id: batch.budget_id.clone(),
                         batch_id: delivery_flush_batch_id(&batch)?,
-                    }
+                    })
                 } else {
                     batch_action(false, &setup.evidence.lock().unwrap())
                 };
@@ -5770,10 +6128,12 @@ mod prepaid_tests {
         assert!(
             setup
                 .client
-                .submit(Action::Delivery(DeliveryAction::FlushBudget {
-                    budget_id: original.budget_id,
-                    batch_id
-                }))
+                .submit(Action::Delivery(DeliveryAction::FlushBudget(
+                    DeliveryFlushIntent {
+                        budget_id: original.budget_id,
+                        batch_id
+                    }
+                )))
                 .await
                 .is_err()
         );
