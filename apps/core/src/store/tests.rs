@@ -1206,91 +1206,6 @@ fn bot_conversation(store: &mut Store, net: &Net) -> Result<()> {
 }
 
 #[test]
-fn inbound_session_event_is_local_and_object_idempotent() -> Result<()> {
-    let net = net()?;
-    let dir =
-        std::env::temp_dir().join(format!("vibeface-session-ingest-{}", uuid::Uuid::new_v4()));
-    crate::config::private_dir(&dir)?;
-    let path = dir.join("node.sqlite3");
-    let mut store = Store::open(&path)?;
-    store.install_trust_bundle(&net.network, &net.state)?;
-    conversation(&mut store, &net)?;
-    let source_owner = net
-        .a
-        .owner_fixture(&net.network, "source", &net.a.device_id()?)?;
-    store.create_conversation(&net.a, &net.network, "source", "source", source_owner, 1)?;
-    let body = EventBody::BotMessaged {
-        message_id: "relay-message-1".into(),
-        from: Sender {
-            conversation_id: "source".into(),
-            name: "Relay sender".into(),
-        },
-        text: "delivered through the session relay".into(),
-        hops: 1,
-    };
-    let receipt = crate::delivery::session::InboundSessionReceipt {
-        object_id: [9; 32],
-        kind: vibeface_delivery::SessionObjectKind::Message,
-        conversation_id: "c".into(),
-        sender_peer: [1; 32],
-        receiver_peer: [2; 32],
-        payload_hash: [3; 32],
-        signature_verification: crate::delivery::session::SessionSignatureVerification::Verified,
-        received_at_ms: 3,
-        idempotency: crate::delivery::session::SessionIdempotency::New,
-    };
-    let first =
-        store.append_inbound_session_event(&net.a, &net.network, "c", &receipt, body.clone(), 3)?;
-    assert!(first.is_some());
-    assert!(
-        store
-            .append_inbound_session_event(&net.a, &net.network, "c", &receipt, body.clone(), 4)?
-            .is_none()
-    );
-    let mut wrong_scope = receipt.clone();
-    wrong_scope.conversation_id = "other".into();
-    assert!(
-        store
-            .append_inbound_session_event(&net.a, &net.network, "c", &wrong_scope, body.clone(), 5)
-            .is_err()
-    );
-    let mut wrong_kind = receipt;
-    wrong_kind.kind = vibeface_delivery::SessionObjectKind::BotSettings;
-    assert!(
-        store
-            .append_inbound_session_event(&net.a, &net.network, "c", &wrong_kind, body, 6)
-            .is_err()
-    );
-    let no_subject = EventBody::BotCreated {
-        bot_id: "relay-bot".into(),
-        name: "Relay bot".into(),
-        instructions: "handoff".into(),
-        project: None,
-        attestation: None,
-        cause: None,
-    };
-    let mut no_subject_receipt = wrong_scope;
-    no_subject_receipt.object_id = [10; 32];
-    no_subject_receipt.kind = vibeface_delivery::SessionObjectKind::BotSettings;
-    no_subject_receipt.conversation_id = "c".into();
-    assert!(
-        store
-            .append_inbound_session_event(
-                &net.a,
-                &net.network,
-                "c",
-                &no_subject_receipt,
-                no_subject,
-                7,
-            )
-            .is_err()
-    );
-    drop(store);
-    std::fs::remove_dir_all(dir)?;
-    Ok(())
-}
-
-#[test]
 fn a_retried_signed_decision_never_changes_the_outcome() -> Result<()> {
     let owner = |node: &LocalIdentity| -> Result<EventBody> {
         Ok(EventBody::ConversationOwner {
@@ -4552,6 +4467,118 @@ fn a_paused_schedule_is_not_run_and_a_deleted_one_stays_deleted() -> Result<()> 
     let mut other = store(&net)?;
     all_accepted(&mut other, &net, &origin)?;
     assert!(other.schedule(&net.network, &schedule_id)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn encrypted_session_ingest_keeps_the_source_signature_across_owners_and_retries() -> Result<()> {
+    use crate::delivery::session::{SessionObjectStore, ingest_event, seal_event};
+    use vibeface_delivery::Secret32;
+
+    let net = net()?;
+    let a = net.a.device_id()?;
+    let b = net.b.device_id()?;
+    let mut source = store(&net)?;
+    bot_conversation(&mut source, &net)?;
+    let owner = net.a.owner_fixture(&net.network, "d", &b)?;
+    source.create_conversation(&net.b, &net.network, "d", "Destination", owner, 3)?;
+    let directory = std::env::temp_dir().join(format!("vibeface-session-{}", uuid::Uuid::new_v4()));
+    crate::config::private_dir(&directory)?;
+    let path = directory.join("target.sqlite3");
+    let mut target = Store::open(&path)?;
+    target.install_trust_bundle(&net.network, &net.state)?;
+    all_accepted(&mut target, &net, &source)?;
+
+    let signed = source.append_event(
+        &net.a,
+        &net.network,
+        "d",
+        EventBody::BotMessaged {
+            message_id: "relay-message-1".into(),
+            from: Sender {
+                conversation_id: "c".into(),
+                name: "Helper".into(),
+            },
+            text: "private session message".into(),
+            hops: 1,
+        },
+        vec![],
+        4,
+    )?;
+    let key = Secret32::new([7; 32])?;
+    let object = seal_event(
+        &net.a,
+        &net.network,
+        &signed,
+        hex::decode(&b)?.try_into().unwrap(),
+        [8; 32],
+        &key,
+        4..10,
+    )?;
+    assert!(
+        !object
+            .ciphertext
+            .windows(b"private session message".len())
+            .any(|p| p == b"private session message")
+    );
+    let relay = SessionObjectStore::open(&directory)?;
+    relay.put_verified(&object)?;
+    let object = relay
+        .get(&object.header.object_id)?
+        .context("missing relay object")?;
+    assert!(ingest_event(&mut target, &net.a, &net.network, &object, &key, 5).is_err());
+    assert!(ingest_event(&mut target, &net.b, &net.network, &object, &key, 10).is_err());
+    assert!(
+        ingest_event(
+            &mut target,
+            &net.b,
+            &net.network,
+            &object,
+            &Secret32::new([9; 32])?,
+            5
+        )
+        .is_err()
+    );
+    let mut tampered = object.clone();
+    tampered.ciphertext[0] ^= 1;
+    assert!(ingest_event(&mut target, &net.b, &net.network, &tampered, &key, 5).is_err());
+    assert_eq!(target.event(&net.network, &signed.hash)?, None);
+    assert_eq!(
+        ingest_event(&mut target, &net.b, &net.network, &object, &key, 5)?.statuses,
+        [IngestStatus::Accepted]
+    );
+    let trigger = bot_message_trigger("relay-message-1");
+    let first = target
+        .admit_delivery(&b, &net.network, "d", &trigger)?
+        .context("missing Bot admission")?;
+    drop(target);
+
+    let mut target = Store::open(&path)?;
+    assert_eq!(target.event(&net.network, &signed.hash)?, Some(signed));
+    assert_eq!(
+        target
+            .conversation(&net.network, "c")?
+            .and_then(|c| c.owner),
+        Some(a)
+    );
+    assert_eq!(
+        target
+            .conversation(&net.network, "d")?
+            .and_then(|c| c.owner),
+        Some(b.clone())
+    );
+    assert_eq!(
+        ingest_event(&mut target, &net.b, &net.network, &object, &key, 6)?.statuses,
+        [IngestStatus::Duplicate]
+    );
+    assert_eq!(target.messages(&net.network, "d")?.len(), 1);
+    let second = target
+        .admit_delivery(&b, &net.network, "d", &trigger)?
+        .context("missing retried Bot admission")?;
+    assert_eq!(first, second);
+    assert_eq!(target.scheduler_jobs("d")?.len(), 1);
+    drop(target);
+    std::fs::remove_dir_all(directory)?;
     Ok(())
 }
 
