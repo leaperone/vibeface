@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-use crate::{app, host, ui, views};
+use crate::{app, host, ui, update, views};
 use anyhow::{Context, Result, ensure};
 use gpui_kit::*;
 use host::{
@@ -98,6 +98,11 @@ fn default_profile() -> Result<PathBuf> {
     Ok(base.join("Vibeface/native-desktop"))
 }
 pub fn run() -> Result<()> {
+    let update_cache = default_profile().ok().map(|profile| profile.join("app-updates"));
+    #[cfg(windows)]
+    if update::apply_requested(update_cache.as_deref())? {
+        return Ok(());
+    }
     let options = Options::parse()?;
     let runtime = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
@@ -109,6 +114,8 @@ pub fn run() -> Result<()> {
     let InstanceClaim::Primary(mut instance) = instance else {
         return Ok(());
     };
+    let updater = update::Updater::start(update_cache.as_deref(), options.fixture, runtime.handle())?;
+    let update_status = updater.status();
     let desktop_host =
         host::DesktopHost::open(options.profile.clone(), options.runtime, options.fixture)?;
     let credential_base = format!(
@@ -227,7 +234,11 @@ pub fn run() -> Result<()> {
                         view.update(cx, |app, cx| match action {
                             NativeAction::NodeSettings => app.navigate(ui::Route::Node, cx),
                             NativeAction::Reload => app.send(views::backend::Command::Refresh, cx),
-                            NativeAction::About => { app.notice = Some(format!("Vibeface {} · GPUI 原生桌面", env!("CARGO_PKG_VERSION"))); cx.notify(); }
+                            NativeAction::About => {
+                                app.notice = Some(format!("Vibeface {} · {}", env!("CARGO_PKG_VERSION"), update_status.label()));
+                                app.notice_is_error = false;
+                                cx.notify();
+                            }
                             NativeAction::Focus | NativeAction::FrontAll => window.activate_window(),
                             NativeAction::Fullscreen => window.toggle_fullscreen(),
                             NativeAction::Minimize => window.minimize_window(),
@@ -270,5 +281,8 @@ pub fn run() -> Result<()> {
     finish_runtime
         .block_on(backend_task)
         .context("原生客户端后台退出失败")?;
+    if let Err(error) = finish_runtime.block_on(updater.finish()) {
+        eprintln!("Vibeface Desktop update: {error:#}");
+    }
     Ok(())
 }
