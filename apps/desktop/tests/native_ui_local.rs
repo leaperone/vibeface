@@ -244,6 +244,7 @@ struct Fixture {
     a: String,
     b: String,
     b_profile: String,
+    identity: host::NodeIdentity,
     node: Arc<LocalNode>,
     server: tokio::task::JoinHandle<()>,
 }
@@ -300,6 +301,26 @@ impl Fixture {
                 &json!({"ok":true,"result":{"data_dir":node_dir,"device_id":entry.node_id,"status":"running","local_listen":entry.origin.trim_start_matches("http://"),"listen":"127.0.0.1:1","web_enabled":true,"core_version":"controlled","error":null,"maintenance_socket":vibeface_bridge::platform::ipc::Endpoint::in_private_dir(&node_dir,"fixture.sock")?.path(),"public_url":entry.origin,"http_enabled":true,"version":"controlled","write_state":null,"mesh":{"enabled":false,"network":"vibeface","records":null,"neighbors":null},"peers":[]}}),
             )?,
         )?;
+        privatefs::write_atomic(
+            &profile.join("fixture-discovery.json"),
+            &serde_json::to_vec(&json!({
+                "ok": true,
+                "result": {
+                    "nodes": [{
+                        "data_dir": node_dir,
+                        "device_id": entry.node_id,
+                        "sources": ["app_profile"],
+                        "status": "running",
+                        "local_listen": entry.origin.trim_start_matches("http://"),
+                        "listen": "127.0.0.1:1",
+                        "web_enabled": true,
+                        "core_version": "controlled"
+                    }],
+                    "warnings": [],
+                    "user_service_registered": false
+                }
+            }))?,
+        )?;
         let source = root.join("inspector.rs");
         std::fs::write(&source, INSPECTOR)?;
         let executable = runtime.join(if cfg!(windows) {
@@ -317,11 +338,11 @@ impl Fixture {
             status.success(),
             "compile the existing-toolchain controlled inspector"
         );
-        host.select_node(&host::NodeIdentity {
+        let identity = host::NodeIdentity {
             data_dir: node_dir,
             device_id: entry.node_id.clone(),
-        })
-        .await?;
+        };
+        host.select_node(&identity).await?;
         let node = Arc::new(LocalNode {
             entry,
             state,
@@ -347,6 +368,7 @@ impl Fixture {
                 a,
                 b,
                 b_profile: b_profile.as_str().into(),
+                identity,
                 node,
                 server,
             },
@@ -354,13 +376,64 @@ impl Fixture {
         ))
     }
 }
-const INSPECTOR: &str = r#"use std::{env,fs,io::{self,Read}};fn main(){assert_eq!(env::args().nth(1).as_deref(),Some("--control"));let mut request=String::new();io::stdin().read_to_string(&mut request).unwrap();assert!(request.contains("\"command\":\"inspect\""));let profile=env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("profile");println!("{}",fs::read_to_string(profile.join("fixture-inspect.json")).unwrap());}"#;
+const INSPECTOR: &str = r##"
+use std::{env, fs, io::{self, Read}};
+
+fn main() {
+    assert_eq!(env::args().nth(1).as_deref(), Some("--control"));
+    let mut request = String::new();
+    io::stdin().read_to_string(&mut request).unwrap();
+    let response = if request.contains(r#""command":"inspect""#) {
+        "fixture-inspect.json"
+    } else if request.contains(r#""command":"discover_local_nodes""#) {
+        "fixture-discovery.json"
+    } else {
+        panic!("Unexpected fixture control operation");
+    };
+    let executable = env::current_exe().unwrap();
+    let profile = executable.parent().unwrap().parent().unwrap().join("profile");
+    println!("{}", fs::read_to_string(profile.join(response)).unwrap());
+}
+"##;
 fn local() -> Command {
     Command::Save {
         editor: Editor::ConnectLocal,
         values: BTreeMap::from([("passphrase".into(), PASSWORD.into())]),
         conversation_id: None,
     }
+}
+async fn wait_for_local_node(
+    events: &mut mpsc::Receiver<Event>,
+    identity: &host::NodeIdentity,
+) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = events.recv().await.context("local events ended")?;
+            let event = match event {
+                Event::Scoped { event, .. } => *event,
+                event => event,
+            };
+            match event {
+                Event::Host(host) => match host.discovery_state {
+                    host::DiscoveryState::Scanning => {}
+                    host::DiscoveryState::Ready => {
+                        ensure!(
+                            host.selected.as_ref() == Some(identity),
+                            "startup selected a different controlled Node"
+                        );
+                        return Ok(());
+                    }
+                    host::DiscoveryState::Unavailable => {
+                        anyhow::bail!("controlled startup discovery failed");
+                    }
+                },
+                Event::Error(error) => anyhow::bail!("controlled startup failed: {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .context("controlled startup discovery timed out")?
 }
 async fn observed(
     receiver: &mut watch::Receiver<Arc<ui::Snapshot>>,
@@ -417,11 +490,12 @@ fn assert_outbox_locked(error: anyhow::Error) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_grant_reconnect_allows_profile_switch_before_http_response() -> Result<()> {
     let (fixture, host) = Fixture::new().await?;
-    let (tx, _events, mut snapshots, stop, task) = Backend::spawn(
+    let (tx, mut events, mut snapshots, stop, task) = Backend::spawn(
         host,
         &tokio::runtime::Handle::current(),
         "controlled-local-grant-cancellation".into(),
     );
+    wait_for_local_node(&mut events, &fixture.identity).await?;
     tx.send(local()).await?;
     let a = observed(&mut snapshots, |s| {
         s.online && s.client_id.as_deref() == Some(&fixture.a)
@@ -510,6 +584,7 @@ async fn local_profile_round_trip_reuses_its_lease_and_cancels_old_reconnect_wit
         &tokio::runtime::Handle::current(),
         "controlled-local-profiles".into(),
     );
+    wait_for_local_node(&mut events, &fixture.identity).await?;
     tx.send(local()).await?;
     let a = observed(&mut snapshots, |s| {
         s.online && s.client_id.as_deref() == Some(&fixture.a)
