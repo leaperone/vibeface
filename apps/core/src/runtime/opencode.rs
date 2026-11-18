@@ -28,7 +28,7 @@ pub(crate) fn reply_message(attempt_id: &str) -> String {
 }
 
 /// The user's opencode hook plugin.
-pub(crate) const PLUGIN: &str = include_str!("../../extensions/opencode.ts");
+pub(crate) const PLUGIN: &str = include_str!("../../extensions/generated/opencode.ts");
 const PIDFILE: &str = "serve.pid";
 /// Names the serve's process tree in this account's job object namespace.
 const SERVE_TREE_KEY: &str = "opencode-serve";

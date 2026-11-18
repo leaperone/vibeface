@@ -114,6 +114,8 @@ def make_plan(paths, event="pull_request", ref_type="branch", channel="hourly", 
     for path in paths:
         if path in RELEASE_TOOL_PATHS:
             scopes.add("release-tools")
+        elif path in ("apps/core/extensions/generated/pi.ts", "apps/core/extensions/generated/opencode.ts"):
+            scopes.update(("node", "cli"))
         elif WEB_UNIT_TEST.fullmatch(path):
             scopes.add("web-tests")
         elif path.startswith("apps/app/") and path.endswith((".test.ts", ".test.tsx")):
@@ -625,6 +627,9 @@ def self_test():
         assert make_plan([path])["rust_packages"] == list(PACKAGES)
     assert make_plan(["apps/app/src/a.tsx", "apps/core/src/api.rs"])["rust_packages"] == ["vibeface-core"]
     assert make_plan(["apps/cli/src/main.rs"])["rust_packages"] == ["vibeface"]
+    for provider in ("pi", "opencode"):
+        path = f"apps/core/extensions/generated/{provider}.ts"
+        assert make_plan([path])["rust_packages"] == ["vibeface-core", "vibeface"]
     assert make_plan(["apps/core/schema.hcl"])["node"]
     assert make_plan(["install.sh"])["node"]
     for path in ("packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts"):

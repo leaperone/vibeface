@@ -829,7 +829,7 @@ impl Provider {
             }),
             Provider::Pi => Some(Watch::Extension {
                 file: ".pi/agent/extensions/vibeface.ts",
-                source: include_str!("../extensions/pi.ts"),
+                source: include_str!("../extensions/generated/pi.ts"),
             }),
             Provider::Opencode => Some(Watch::Extension {
                 file: ".config/opencode/plugins/vibeface.ts",

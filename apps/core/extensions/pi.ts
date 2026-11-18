@@ -1,15 +1,33 @@
-// vibeface: `vibeface hooks install` writes this file and `vibeface hooks uninstall` removes it.
-// @ts-nocheck
-// When a run of a pi session the user drives settles, this hands it to the Node with
-// `vibeface hook pi`. The Node may answer with the session's next user message; an answer
-// that comes after the user went on is dropped. Runs the Node starts set VIBEFACE_PI_RUN.
-import { spawn } from "node:child_process";
+import { runHook } from "./transport.mts";
 
+// Only a settled, user-driven TUI run can receive a follow-up.
 const HOOK = __VIBEFACE_HOOK__;
 
-export default function (pi) {
+interface PiMessage {
+  role: string;
+  content?: unknown;
+  stopReason?: string;
+  errorMessage?: string;
+}
+
+interface PiContext {
+  mode: string;
+  cwd: string;
+  sessionManager: {
+    getSessionId(): string;
+    getLeafId(): string | null;
+    getBranch(): readonly { type: string; message?: PiMessage }[];
+  };
+}
+
+interface Pi {
+  on(event: "agent_settled", handler: (event: unknown, ctx: PiContext) => void): void;
+  sendUserMessage(text: string, options: { deliverAs: "followUp" }): void;
+}
+
+export default function (pi: Pi) {
   if (process.env.VIBEFACE_PI_RUN) return;
-  // pi waits for its handlers; this one only starts the hook.
+  // Pi waits for its handlers. Start the observation and return immediately.
   pi.on("agent_settled", (_event, ctx) => {
     try {
       if (ctx.mode === "tui") report(pi, ctx);
@@ -17,40 +35,32 @@ export default function (pi) {
   });
 }
 
-function report(pi, ctx) {
+function report(pi: Pi, ctx: PiContext) {
   const session = ctx.sessionManager.getSessionId();
   const turn = ctx.sessionManager.getLeafId();
-  const message = ctx.sessionManager
-    .getBranch()
+  const message = ctx.sessionManager.getBranch()
     .findLast((entry) => entry.type === "message")?.message;
   if (message?.role !== "assistant") return;
-  const text = (Array.isArray(message.content) ? message.content : [])
-    .filter((block) => block.type === "text")
-    .map((block) => block.text)
-    .join("\n\n");
-  const hook = spawn(HOOK[0], HOOK.slice(1), { stdio: ["pipe", "pipe", "ignore"] });
-  let answer = "";
-  hook.stdout.setEncoding("utf8");
-  hook.stdout.on("data", (chunk) => (answer += chunk));
-  hook.on("error", () => {});
-  hook.stdin.on("error", () => {});
-  hook.on("close", () => {
-    try {
-      const next = JSON.parse(answer).text;
-      if (typeof next !== "string" || !next.trim()) return;
-      if (ctx.sessionManager.getSessionId() !== session) return;
-      if (ctx.sessionManager.getLeafId() !== turn) return;
-      pi.sendUserMessage(next, { deliverAs: "followUp" });
-    } catch {}
+  const blocks: unknown[] = Array.isArray(message.content) ? message.content : [];
+  const text = blocks.filter(isTextBlock).map((block) => block.text).join("\n\n");
+  runHook(HOOK, {
+    session_id: session,
+    turn_id: turn,
+    cwd: ctx.cwd,
+    stop_reason: message.stopReason,
+    error: message.errorMessage,
+    last_message: text.slice(0, 8000),
+  }, (answer) => {
+    if (!answer || typeof answer !== "object" || !("text" in answer)) return;
+    const next = answer.text;
+    if (typeof next !== "string" || !next.trim()) return;
+    if (ctx.sessionManager.getSessionId() !== session || ctx.sessionManager.getLeafId() !== turn) return;
+    pi.sendUserMessage(next, { deliverAs: "followUp" });
   });
-  hook.stdin.end(
-    JSON.stringify({
-      session_id: session,
-      turn_id: turn,
-      cwd: ctx.cwd,
-      stop_reason: message.stopReason,
-      error: message.errorMessage,
-      last_message: text.slice(0, 8000),
-    }),
-  );
+}
+
+function isTextBlock(block: unknown): block is { type: "text"; text: string } {
+  return typeof block === "object" && block !== null
+    && "type" in block && block.type === "text"
+    && "text" in block && typeof block.text === "string";
 }
