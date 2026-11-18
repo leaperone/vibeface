@@ -2,6 +2,7 @@ use super::{Store, event_about_from};
 use crate::{
     crypto::digest,
     model::{Role, Subject},
+    scheduling::{Trigger, TriggerError},
     work::{StopRequest, WorkRequest, WorkSpec},
     workspace::InputTarget,
 };
@@ -129,16 +130,13 @@ impl PeerEnvelope {
             "invalid command causal references"
         );
         match &self.payload {
-            PeerCommand::Deliver { trigger, .. } => {
-                let (kind, subject) = trigger
-                    .split_once(':')
-                    .context("invalid delivery trigger")?;
-                ensure!(
-                    matches!(kind, "message" | "bot_message" | "work" | "assignment"),
-                    "invalid delivery trigger"
-                );
-                vibeface_protocol::validate_id(subject).map_err(anyhow::Error::msg)?;
-            }
+            PeerCommand::Deliver { trigger, .. } => match Trigger::decode(trigger) {
+                Ok(trigger) if trigger.tag().allows_peer_delivery() => {}
+                Err(TriggerError::InvalidId(tag, error)) if tag.allows_peer_delivery() => {
+                    return Err(anyhow::Error::msg(error));
+                }
+                _ => anyhow::bail!("invalid delivery trigger"),
+            },
             PeerCommand::Dispatch { spec } => {
                 if spec.trigger.starts_with("assignment:") {
                     ensure!(
