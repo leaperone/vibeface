@@ -10,6 +10,8 @@ import release_format
 import release_inventory
 import release_source
 import copy
+from datetime import datetime
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -82,6 +84,167 @@ class ReleaseTrains(unittest.TestCase):
     def test_coordinator_changes_do_not_rebuild_applications(self):
         self.assert_changed_inputs('scripts/hourly.py', set())
 
+    def test_core_coordinator_never_schedules_clients_or_website(self):
+        with (patch.object(hourly, 'require_coordinator_context'),
+              patch.object(release_context, 'git'),
+              patch.object(hourly, 'green_main', return_value='a' * 40),
+              patch.object(hourly, 'latest_release_tags', return_value={}) as latest,
+              patch.object(hourly, 'reconcile_app', return_value={'status': 'unchanged'}) as reconcile,
+              patch('sys.stdout', new_callable=StringIO)):
+            result = hourly.run_hourly(datetime.fromisoformat('2026-11-18T02:17:00Z'))
+        self.assertEqual(result, {'core': {'status': 'unchanged'}})
+        latest.assert_called_once_with(('core',))
+        reconcile.assert_called_once_with('core', 'a' * 40, '2026111802', {}, None)
+        with self.assertRaisesRegex(ValueError, 'no scheduled release'):
+            hourly.reconcile_app('www', 'a' * 40, '2026111802', {}, None)
+
+    def test_client_cutoff_follows_los_angeles_and_uses_the_scheduled_hour(self):
+        for created, expected in (
+            ('2026-11-18T02:00:00Z', '2026-11-18T02:00:00+00:00'),
+            ('2026-11-18T03:19:00Z', '2026-11-18T02:00:00+00:00'),
+            ('2026-07-18T01:06:00Z', '2026-07-18T01:00:00+00:00'),
+        ):
+            with self.subTest(created=created):
+                self.assertEqual(hourly.client_cutoff(datetime.fromisoformat(created)).isoformat(), expected)
+
+    def test_client_snapshot_uses_only_core_manifests_completed_by_the_cutoff(self):
+        cutoff = datetime.fromisoformat('2026-11-18T02:00:00Z')
+        def record(app, batch, created_at, draft=False):
+            return {'tag_name': f'{app}-v0.0.1-hourly.{batch}', 'draft': draft,
+                    'assets': [{'name': 'release.json', 'created_at': created_at}]}
+
+        records = [
+            record('core', '2026111802', '2026-11-18T02:18:00Z'),
+            record('core', '2026111801', '2026-11-18T01:42:00Z', draft=True),
+            record('core', '2026111800', '2026-11-18T01:20:00Z'),
+            record('app', '2026111802', '2026-11-18T02:12:00Z'),
+            record('www', '2026111801', '2026-11-18T01:42:00Z'),
+        ]
+        with patch.object(hourly, 'gitless_gh', return_value=json.dumps([records])):
+            self.assertEqual(hourly.latest_release_tags(('core', *hourly.CLIENT_APPS), core_cutoff=cutoff),
+                             {'core': records[2]['tag_name'], 'app': records[3]['tag_name']})
+
+    def test_daily_rerun_recovers_source_from_generated_tags_and_rejects_stale_batches(self):
+        cutoff = datetime.fromisoformat('2026-11-18T02:00:00Z')
+        base = release_context.git('rev-parse', 'HEAD')
+        release_context.git('update-ref', 'refs/remotes/origin/main', base)
+        with patch.object(hourly, 'green_main') as green:
+            for batch in ('2026111802', '2026111902'):
+                tree = release_source.expected_tree('mobile', base, batch)
+                identity = dict(os.environ, GIT_AUTHOR_EMAIL=release_source.BOT, GIT_COMMITTER_EMAIL=release_source.BOT)
+                source = release_context.git('commit-tree', tree, '-p', base, '-m',
+                                             f'chore(release): mobile hourly {batch}', env=identity)
+                version = release_source.hourly_version('mobile', base, batch)
+                tag = f'mobile-v{version}'
+                release_context.git('tag', tag, source)
+                self.addCleanup(release_context.git, 'tag', '-d', tag)
+                if batch == '2026111802':
+                    self.assertEqual(hourly.client_source(cutoff, batch), base)
+            with self.assertRaisesRegex(ValueError, 'newer client batch'):
+                hourly.client_source(cutoff, '2026111802')
+        green.assert_not_called()
+
+    def test_older_client_run_cannot_publish_after_a_newer_schedule_without_tags(self):
+        original = {'created_at': '2026-11-18T02:07:00Z', 'workflow_id': 99}
+        latest = {'workflow_runs': [{'created_at': '2026-11-19T02:04:00Z'}]}
+        with (patch.dict(os.environ, {'GITHUB_EVENT_NAME': 'schedule', 'GITHUB_RUN_ID': '7'}),
+              patch.object(hourly, 'require_coordinator_context'),
+              patch.object(hourly, 'api', side_effect=[original, latest]),
+              patch.object(release_context, 'git') as git):
+            with self.assertRaisesRegex(ValueError, 'newer scheduled client batch'):
+                hourly.run_clients()
+        git.assert_not_called()
+
+    def test_client_batch_waits_for_exact_manifests_and_preserves_unrelated_releases(self):
+        from tests.release.support import pin
+
+        base = 'a' * 40
+        cutoff = datetime.fromisoformat('2026-11-18T02:00:00Z')
+        version = '0.0.1-hourly.2026111802'
+        core = pin('core', value='0.0.1-hourly.2026111801')
+        app_pin = pin('app', value=version)
+        for failed_app in (None, 'app', 'cli'):
+            with self.subTest(failed_app=failed_app):
+                cli_pin = pin('cli', value='0.0.1-hourly.2026111702' if failed_app == 'cli' else version)
+                newest = {'core': core['tag']}
+                if failed_app == 'cli':
+                    newest['cli'] = cli_pin['tag']
+                # A queued release may already have a public GitHub Release without its final manifest.
+                attempts = {}
+                started = []
+
+                def observe(app, tag, source):
+                    self.assertEqual(tag, newest.get(app, f'{app}-v{version}'))
+                    self.assertEqual(source, base)
+                    attempts[app] = attempts.get(app, 0) + 1
+                    return [{'status': 'completed' if attempts[app] > 1 else 'in_progress',
+                             'conclusion': 'failure' if app == failed_app else 'success',
+                             'html_url': 'https://example.invalid/' + app}]
+
+                def api(path, *, missing=False):
+                    if path == 'actions/runs/7':
+                        return {'created_at': '2026-11-18T02:07:00Z', 'workflow_id': 99}
+                    if path == 'actions/workflows/99/runs?branch=main&event=schedule&per_page=1':
+                        return {'workflow_runs': [{'created_at': '2026-11-18T02:07:00Z'}]}
+                    tag = path.removeprefix('releases/tags/')
+                    app = release_format.parse_tag(tag)[0]
+                    self.assertTrue(missing)
+                    complete = attempts[app] > 1 and not (failed_app == 'app' and app == 'app')
+                    return {'draft': False, 'assets': [{'name': 'release.json'}] if complete else []}
+
+                def reconcile(app, source, batch, pins, previous):
+                    self.assertEqual((source, batch, previous), (base, '2026111802', newest.get(app)))
+                    expected = {'core': core, 'app': app_pin} if app == 'cli' else {'cli': cli_pin} if app == 'desktop' else {}
+                    self.assertEqual(pins, expected)
+                    if previous:
+                        return {'status': 'unchanged', 'tag': previous}
+                    started.append(app)
+                    return {'status': 'dispatched', 'tag': f'{app}-v{version}'}
+
+                publications = {item['tag']: item for item in (core, app_pin, cli_pin)}
+                with (patch.dict(os.environ, {'GH_TOKEN': 'offline', 'GITHUB_REPOSITORY': hourly.REPO,
+                                             'GITHUB_REF': 'refs/heads/main', 'GITHUB_EVENT_NAME': 'schedule',
+                                             'GITHUB_RUN_ID': '7'}),
+                      patch.object(hourly, 'api', side_effect=api),
+                      patch.object(release_context, 'git'),
+                      patch.object(hourly, 'green_main', return_value=base) as green,
+                      patch.object(hourly, 'latest_release_tags', return_value=newest) as latest,
+                      patch.object(hourly, 'published_pin', side_effect=lambda tag: publications.get(tag, {})),
+                      patch.object(hourly, 'reconcile_app', side_effect=reconcile),
+                      patch.object(hourly, 'tag_commit', return_value=base),
+                      patch.object(hourly, 'release_runs', side_effect=observe),
+                      patch.object(hourly.time, 'sleep'),
+                      patch('sys.stdout', new_callable=StringIO) as logs):
+                    if failed_app:
+                        with self.assertRaisesRegex(ValueError, 'did not complete'):
+                            hourly.run_clients()
+                        self.assertIn('"mobile": {"status": "released"', logs.getvalue())
+                        self.assertIn(f'"{failed_app}": {{"status": "failed"', logs.getvalue())
+                    else:
+                        result = hourly.run_clients()
+                        self.assertEqual({app: outcome['status'] for app, outcome in result.items()},
+                                         {app: 'released' for app in ('app', 'cli', 'desktop', 'mobile')})
+                green.assert_called_once_with(cutoff)
+                latest.assert_called_once_with(('core', 'app', 'cli', 'desktop', 'mobile'), core_cutoff=cutoff)
+                consumers = {None: ['cli', 'desktop'], 'app': [], 'cli': ['desktop']}
+                self.assertEqual(started, ['app', 'mobile', *consumers[failed_app]])
+
+    def test_client_retry_observes_the_existing_daily_tag_and_never_replaces_it(self):
+        base = release_context.git('rev-parse', 'HEAD')
+        batch = '2026111802'
+        version = release_source.hourly_version('app', base, batch)
+        tag = f'app-v{version}'
+        source = 'b' * 40
+        with (patch.object(hourly, 'tag_commit', return_value=source),
+              patch.object(release_source, 'verify', return_value=(base, batch)),
+              patch.object(hourly, 'reconcile') as write,
+              patch.object(hourly, 'release_runs',
+                           return_value=[{'html_url': 'https://example.invalid/app'}]) as runs):
+            result = hourly.reconcile_app('app', base, batch, {}, None)
+        self.assertEqual(result, {'status': 'dispatched', 'tag': tag, 'runs': ['https://example.invalid/app']})
+        runs.assert_called_once_with('app', tag, source)
+        write.assert_not_called()
+
     def assert_changed_inputs(self, path, affected):
         base = release_context.git('rev-parse', 'HEAD')
         with tempfile.TemporaryDirectory() as temporary:
@@ -119,9 +282,10 @@ class ReleaseTrains(unittest.TestCase):
         def git(*args, **kwargs):
             return 'core-v0.0.1-hourly.2026111408' if args[:2] == ('tag', '--list') else 'a' * 40
         with patch.object(release_context, 'git', side_effect=git), patch.object(release_source, 'verify', return_value=('b' * 40, '2026111408')), \
+                patch.object(hourly, 'is_ancestor', return_value=True), \
                 patch.object(hourly, 'input_digest', return_value='same-inputs'), \
                 patch.object(hourly, 'release_runs', return_value=[{'status': 'in_progress', 'conclusion': None}]):
-            self.assertEqual(hourly.pending_attempt('core', 'c' * 40, {}),
+            self.assertEqual(hourly.pending_attempt('core', 'c' * 40, '2026111409', {}),
                              {'status': 'in_progress', 'tag': 'core-v0.0.1-hourly.2026111408'})
 
     def test_repeated_failed_source_stops_rebuilding(self):
@@ -130,9 +294,10 @@ class ReleaseTrains(unittest.TestCase):
             def git(*args, **kwargs):
                 return tags if args[:2] == ('tag', '--list') else 'a' * 40
             with patch.object(release_context, 'git', side_effect=git), patch.object(release_source, 'verify', return_value=('b' * 40, '2026111408')), \
+                    patch.object(hourly, 'is_ancestor', return_value=True), \
                     patch.object(hourly, 'input_digest', return_value='same-inputs'), \
                     patch.object(hourly, 'release_runs', return_value=[{'status': 'completed', 'conclusion': 'failure'}]):
-                state = hourly.pending_attempt('core', 'c' * 40, {})
+                state = hourly.pending_attempt('core', 'c' * 40, '2026111409', {})
                 self.assertEqual(state['status'] if state else None, expected)
 
     def test_website_change_releases_only_website(self):

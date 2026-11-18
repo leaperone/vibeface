@@ -102,7 +102,7 @@ bash install.sh --help
 bash install.sh --channel hourly --install-root "$VIBEFACE_INSTALL_ROOT" --bin-dir "$VIBEFACE_BIN_DIR"
 ```
 
-安装器下载完整包和准确同名的 checksum，经 SHA256、包路径、版本、target、tag 源码提交、协议及 data epoch 检查后，建立：
+安装器下载完整包和同名的 checksum 文件。通过 SHA256、包路径与构建信息检查后，安装器创建以下布局。包字段见 [CLI 包的构建信息](releasing.md#cli-包的构建信息)。
 
 ```text
 <安装根目录>/releases/<version>/

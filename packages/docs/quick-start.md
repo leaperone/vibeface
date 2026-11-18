@@ -93,14 +93,17 @@ vibeface
 
 ### 从源码准备当前版本
 
-匹配的安装包尚未发布时，需要先从源码构建。准备 Git、Python 3.12+、Core/CLI 对应的 Rust 工具链、Node.js 24 和 pnpm 11.9.0，再执行：
+匹配的安装包尚未发布时，先用 Git 获取源码。
 
 ```sh
 git clone https://github.com/leaperone/vibeface.git
 cd vibeface
+```
+
+按[源码构建工具](releasing.md#源码构建工具)准备环境，再构建并运行当前版本。
+
+```sh
 pnpm install --frozen-lockfile
-rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --version 0.2.129 --locked
 bash scripts/build-web-crypto.sh
 bash scripts/build-web.sh
 cargo build -p vibeface -p vibeface-core --locked
@@ -109,6 +112,6 @@ export VIBEFACE_APP_DIR="$PWD/apps/app/dist/client"
 vibeface --version
 ```
 
-后续步骤使用这个终端。这里启动的是本地源码构建，不是受管安装；先保持前台运行，不执行安装包专用的服务或自动更新步骤。源码构建工具的安装方式和平台条件以各工具文档为准。
+后续步骤使用这个终端。这里启动的是本地源码构建，不是受管安装；先保持前台运行，不执行安装包专用的服务或自动更新步骤。
 
 Desktop 另外需要 GPUI 图形工具链与平台开发库，版本及 hosted runner 配置见 [原生 Desktop action](../../.github/actions/native-desktop/action.yml)。Core/CLI 的最低 Rust 版本不能作为 GPUI 已通过编译的证明。Windows 原生组包使用 `python3 -B scripts/package-node-windows.py`，不执行 POSIX shell 组包脚本。
