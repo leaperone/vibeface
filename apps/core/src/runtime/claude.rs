@@ -3,6 +3,7 @@
 //! The Node names the session and the user message before anything is sent, so a turn it lost
 //! sight of is read back from Claude Code's own transcript and never sent again. Hooks of the
 //! owner's own sessions hold permission requests and questions for the bot.
+use super::child_pipes::PipedChild;
 use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
 use super::provider_adapter::bounded;
 use super::*;
@@ -18,8 +19,8 @@ use std::sync::{
     PoisonError, Weak,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::io::{AsyncWriteExt as _, BufReader};
+use tokio::process::{ChildStdin, ChildStdout};
 use vibeface_bridge::failure::ProviderStage;
 use vibeface_bridge::platform::tree;
 use vibeface_bridge::transport;
@@ -72,6 +73,14 @@ impl Guide {
 
     pub(super) fn started(&self, token: &str) {
         *self.tree.lock().unwrap_or_else(PoisonError::into_inner) = Some(token.into());
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn started_token(&self) -> Option<String> {
+        self.tree
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -279,7 +288,7 @@ impl Processes {
             session.into(),
             InputChannel {
                 turn: turn.into(),
-                tree: process.tree.token().to_owned(),
+                tree: process.child.token().to_owned(),
                 stdin: process.stdin.clone(),
                 open: Arc::new(AtomicBool::new(true)),
                 pending: Default::default(),
@@ -976,25 +985,10 @@ struct Launch<'a> {
 
 /// A running `claude -p`: its pipes and process tree.
 struct Process {
-    child: Child,
-    tree: tree::Tree,
-    reaped: bool,
+    child: PipedChild,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     lines: transport::Lines<BufReader<ChildStdout>>,
-    /// The end of what it wrote to stderr, once it closed it.
-    stderr: Option<tokio::task::JoinHandle<String>>,
     _guide: Option<Arc<Guide>>,
-}
-
-impl Drop for Process {
-    fn drop(&mut self) {
-        if !self.reaped && (cfg!(windows) || self.child.id() == Some(self.tree.root())) {
-            self.tree.kill();
-        }
-        if let Some(stderr) = self.stderr.take() {
-            stderr.abort();
-        }
-    }
 }
 
 impl Launch<'_> {
@@ -1034,50 +1028,18 @@ impl Launch<'_> {
                 command.env_remove(&name);
             }
         }
-        command
-            .envs(self.env)
-            .current_dir(self.cwd)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let (tree, mut child) = tree::Tree::spawn(command, TREE_KEY, true).map_err(|error| {
-            let kind = match error
-                .downcast_ref::<std::io::Error>()
-                .map(std::io::Error::kind)
-            {
-                Some(std::io::ErrorKind::NotFound) => FailureKind::MissingBinary,
-                _ => FailureKind::Unknown,
-            };
-            ExecFailure::new(kind, format!("could not start Claude Code: {error:#}"))
-        })?;
+        command.envs(self.env).current_dir(self.cwd);
+        let mut child = PipedChild::spawn(command, TREE_KEY, "Claude Code")?;
         if let Some(guide) = &self.guide {
-            guide.started(tree.token());
+            guide.started(child.token());
         }
-        let (Some(stdin), Some(stdout), Some(stderr)) =
-            (child.stdin.take(), child.stdout.take(), child.stderr.take())
-        else {
-            return Err(ExecFailure::new(
-                FailureKind::Lost,
-                "Claude Code exited as it started",
-            ));
-        };
-        let stderr = tokio::spawn(async move {
-            let mut stderr = stderr;
-            let (mut tail, mut buffer) = (Vec::new(), [0; 4096]);
-            while let Ok(read @ 1..) = stderr.read(&mut buffer).await {
-                tail.extend_from_slice(&buffer[..read]);
-                let over = tail.len().saturating_sub(2000);
-                tail.drain(..over);
-            }
-            String::from_utf8_lossy(&tail).trim().to_owned()
-        });
+        let (stdin, stdout) = child.take_pipes().ok_or_else(|| {
+            ExecFailure::new(FailureKind::Lost, "Claude Code exited as it started")
+        })?;
         Ok(Process {
             child,
-            tree,
-            reaped: false,
             stdin: Arc::new(Mutex::new(Some(stdin))),
             lines: transport::Lines::new(BufReader::new(stdout), transport::FRAME_BYTES),
-            stderr: Some(stderr),
             _guide: self.guide.clone(),
         })
     }
@@ -1112,34 +1074,21 @@ impl Process {
         })
         .await
         .unwrap_or(false);
-        self.reaped = agent::terminate_process_tree(&mut self.child, &mut self.tree).await;
-        self.reaped || ended
+        self.child.terminate().await || ended
     }
 
     /// Closes its input, so it exits once its turn is done, and ends its tree.
     async fn end(&mut self, processes: &Processes) {
-        processes.remove_input(self.tree.token());
+        processes.remove_input(self.child.token());
         self.stdin.lock().await.take();
-        let _ =
-            tokio::time::timeout(Duration::from_secs(5), tree::observe_exit(&mut self.child)).await;
-        if !self.reaped {
-            self.reaped = agent::terminate_process_tree(&mut self.child, &mut self.tree).await;
-        }
-        if self.reaped {
-            processes.forget(self.tree.token());
+        if self.child.finish(Duration::from_secs(5)).await {
+            processes.forget(self.child.token());
         }
     }
 
     /// What it wrote to stderr before it exited.
     async fn stderr(&mut self) -> String {
-        match self.stderr.take() {
-            Some(tail) => tokio::time::timeout(Duration::from_secs(2), tail)
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or_default(),
-            None => String::new(),
-        }
+        self.child.stderr(Duration::from_secs(2)).await
     }
 }
 
@@ -1277,9 +1226,9 @@ where
         .map_err(|failure| error(ManagerFailure::Failed, native, failure))?;
     let sent = async {
         stage.enter(ProviderStage::Record);
-        processes.track(process.tree.token(), bin)?;
+        processes.track(process.child.token(), bin)?;
         if let Some(started) = &config.process_started {
-            started(process.tree.root()).await?;
+            started(process.child.root()).await?;
         }
         processes.register_input(&session, &message, &process, projects.clone())?;
         stage.enter(ProviderStage::TurnStart);
@@ -1317,7 +1266,7 @@ where
                 break Err(error(kind, native, ExecFailure::new(FailureKind::TimedOut, "Claude Code management timed out")));
             }
             _ = drain.tick(), if ending.is_some() => {
-                if processes.drained(process.tree.token(), results) { break Ok(ending.take().expect("result")); }
+                if processes.drained(process.child.token(), results) { break Ok(ending.take().expect("result")); }
                 continue;
             }
             line = process.lines.next_line() => line,
@@ -1331,7 +1280,7 @@ where
         }
         let Ok(Some(line)) = line else {
             if let Some(ending) = ending.take() {
-                break if processes.drained(process.tree.token(), results) {
+                break if processes.drained(process.child.token(), results) {
                     Ok(ending)
                 } else {
                     Err(error(
@@ -1403,9 +1352,9 @@ where
             }
         }
         if let Some(next) = turn.ending.take() {
-            processes.close_input(process.tree.token());
+            processes.close_input(process.child.token());
             Ending::append(&mut ending, next);
-            if processes.drained(process.tree.token(), results) {
+            if processes.drained(process.child.token(), results) {
                 break Ok(ending.take().expect("result"));
             }
         }
@@ -1601,7 +1550,7 @@ async fn follow(
         let line = tokio::select! {
             _ = drain.tick(), if ending.is_some() => {
                 let Some(node) = node.upgrade() else { return; };
-                if node.claude.processes.drained(process.tree.token(), results) { break; }
+                if node.claude.processes.drained(process.child.token(), results) { break; }
                 continue;
             }
             line = process.lines.next_line() => line,
@@ -1612,7 +1561,10 @@ async fn follow(
         let Ok(Some(line)) = line else {
             missing_input_results = line.is_err()
                 || (ending.is_some()
-                    && !node.claude.processes.drained(process.tree.token(), results));
+                    && !node
+                        .claude
+                        .processes
+                        .drained(process.child.token(), results));
             if let Err(error) = &line {
                 tracing::warn!(%error, "Claude Code output transport stopped; reconcile native session");
             }
@@ -1648,31 +1600,29 @@ async fn follow(
             }
         }
         if let Some(next) = turn.ending.take() {
-            node.claude.processes.close_input(process.tree.token());
+            node.claude.processes.close_input(process.child.token());
             Ending::append(&mut ending, next);
-            if node.claude.processes.drained(process.tree.token(), results) {
+            if node
+                .claude
+                .processes
+                .drained(process.child.token(), results)
+            {
                 break;
             }
         }
     }
     if let Some(node) = node.upgrade() {
-        node.claude.processes.remove_input(process.tree.token());
+        node.claude.processes.remove_input(process.child.token());
     }
     process.stdin.lock().await.take();
-    let _ = tokio::time::timeout(
-        Duration::from_secs(5),
-        tree::observe_exit(&mut process.child),
-    )
-    .await;
-    let stopped = agent::terminate_process_tree(&mut process.child, &mut process.tree).await;
-    process.reaped = stopped;
+    let stopped = process.child.finish(Duration::from_secs(5)).await;
     let Some(node) = node.upgrade() else {
         return;
     };
     // From here a probe reads the finished transcript.
     node.claude.live().remove(&work_id);
     if stopped {
-        node.claude.processes.forget(process.tree.token());
+        node.claude.processes.forget(process.child.token());
     }
     if missing_input_results {
         if let Err(error) = node
@@ -1815,7 +1765,7 @@ impl Executor for Claude {
                 Err(failure) => return reject(failure),
             };
             let sent = async {
-                self.processes.track(process.tree.token(), &bin)?;
+                self.processes.track(process.child.token(), &bin)?;
                 self.processes
                     .register_input(&session, &message, &process, projects.clone())?;
                 send(&process.stdin, &user_frame(&work.prompt, &message)).await
@@ -1834,7 +1784,7 @@ impl Executor for Claude {
                 Live {
                     session: session.clone(),
                     stdin: process.stdin.clone(),
-                    tree: process.tree.token().to_owned(),
+                    tree: process.child.token().to_owned(),
                     interrupted: interrupted.clone(),
                 },
             );
@@ -3164,6 +3114,28 @@ pub(super) mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn a_missing_claude_binary_keeps_its_launch_error() -> Result<()> {
+        let place = Place::new()?;
+        let result = Launch {
+            bin: &place.dir.join("missing-claude"),
+            cwd: &place.dir,
+            session: "fixture",
+            resume: false,
+            model: "fixture",
+            effort: None,
+            guide: None,
+            env: &BTreeMap::new(),
+        }
+        .spawn();
+        let Err(failure) = result else {
+            panic!("the missing executable started");
+        };
+        assert_eq!(failure.kind, FailureKind::MissingBinary);
+        assert!(failure.detail.starts_with("could not start Claude Code: "));
+        Ok(())
+    }
+
     #[cfg(unix)]
     pub(crate) fn cooperative_cli(directory: &Path) -> Result<PathBuf> {
         use std::os::unix::fs::PermissionsExt as _;
@@ -3211,7 +3183,7 @@ time.sleep(0.05)
         }
         .spawn()?;
         let processes = Processes::new(place.dir.join(PIDFILE));
-        processes.track(process.tree.token(), &bin)?;
+        processes.track(process.child.token(), &bin)?;
         tokio::time::timeout(Duration::from_secs(5), async {
             while !place.dir.join("member-ready").exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;

@@ -2,6 +2,7 @@
 //! process idles between turns, and each turn starts with its own environment and instructions.
 //! Before a prompt is sent the Node keeps where pi writes the session, so after a restart it
 //! reads the turn back from that file and never sends it again.
+use super::child_pipes::PipedChild;
 use super::claude::{Guide, Processes};
 use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
 use super::provider_adapter::bounded;
@@ -12,15 +13,13 @@ use crate::scheduling::{SteerOutcome, SteerTarget};
 use crate::work::{Probe, Signal, WorkRecord, WorkSpec};
 use base64::Engine as _;
 use futures_util::future::BoxFuture;
-use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::process::{Child, ChildStdin};
+use tokio::io::AsyncWriteExt as _;
+use tokio::process::ChildStdin;
 use tokio::sync::{oneshot, watch};
 use vibeface_bridge::agent::{self, AgentResult};
 use vibeface_bridge::failure::ProviderStage;
 use vibeface_bridge::failure::{ExecFailure, FailureKind};
-use vibeface_bridge::platform::tree;
 use vibeface_bridge::transport;
 use vibeface_bridge::turn::TurnStatus;
 
@@ -179,28 +178,18 @@ struct Launch {
 }
 
 struct Process {
-    child: Child,
-    tree: tree::Tree,
-    reaped: bool,
+    child: PipedChild,
     processes: Arc<Processes>,
     rpc: Arc<Rpc>,
     /// Everything pi writes but the responses.
     events: transport::JsonReceiver,
     output: tokio::task::JoinHandle<()>,
-    /// The end of what pi wrote to stderr, once it closed it.
-    stderr: Option<tokio::task::JoinHandle<String>>,
     _guide: Option<Arc<Guide>>,
 }
 
 impl Drop for Process {
     fn drop(&mut self) {
         self.output.abort();
-        if !self.reaped && (cfg!(windows) || self.child.id() == Some(self.tree.root())) {
-            self.tree.kill();
-        }
-        if let Some(stderr) = self.stderr.take() {
-            stderr.abort();
-        }
     }
 }
 
@@ -670,34 +659,21 @@ impl Process {
             .current_dir(&launch.cwd)
             .envs(&launch.env)
             .env("PI_CODING_AGENT_SESSION_DIR", sessions)
-            .env(RUN_ENV, "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let (tree, mut child) = tree::Tree::spawn(command, TREE_KEY, true).map_err(|error| {
-            let kind = match error
-                .downcast_ref::<std::io::Error>()
-                .map(std::io::Error::kind)
-            {
-                Some(std::io::ErrorKind::NotFound) => FailureKind::MissingBinary,
-                _ => FailureKind::Unknown,
-            };
-            ExecFailure::new(
-                kind,
-                format!("could not start pi at {}: {error:#}", launch.bin.display()),
-            )
-        })?;
+            .env(RUN_ENV, "1");
+        let mut child = PipedChild::spawn(
+            command,
+            TREE_KEY,
+            format_args!("pi at {}", launch.bin.display()),
+        )?;
         if let Some(guide) = &launch.guide {
-            guide.started(tree.token());
+            guide.started(child.token());
         }
         processes
-            .track(tree.token(), &launch.bin)
+            .track(child.token(), &launch.bin)
             .map_err(|error| ExecFailure::new(FailureKind::Unknown, format!("{error:#}")))?;
-        let (Some(stdin), Some(stdout), Some(mut stderr)) =
-            (child.stdin.take(), child.stdout.take(), child.stderr.take())
-        else {
-            return Err(ExecFailure::new(FailureKind::Unknown, "pi has no pipes"));
-        };
+        let (stdin, stdout) = child
+            .take_pipes()
+            .ok_or_else(|| ExecFailure::new(FailureKind::Unknown, "pi has no pipes"))?;
         let rpc = Arc::new(Rpc {
             stdin: Mutex::new(Some(stdin)),
             waiting: std::sync::Mutex::new(Some(HashMap::new())),
@@ -708,24 +684,12 @@ impl Process {
         let (sender, events) =
             transport::json_channel(transport::QUEUE_ITEMS, transport::QUEUE_BYTES);
         let output = tokio::spawn(read_output(stdout, rpc.clone(), sender));
-        let stderr = tokio::spawn(async move {
-            let (mut tail, mut buffer) = (Vec::new(), [0; 4096]);
-            while let Ok(read @ 1..) = stderr.read(&mut buffer).await {
-                tail.extend_from_slice(&buffer[..read]);
-                let over = tail.len().saturating_sub(2000);
-                tail.drain(..over);
-            }
-            String::from_utf8_lossy(&tail).trim().to_owned()
-        });
         Ok(Self {
             child,
-            tree,
-            reaped: false,
             processes: processes.clone(),
             rpc,
             events,
             output,
-            stderr: Some(stderr),
             _guide: launch.guide.clone(),
         })
     }
@@ -734,19 +698,10 @@ impl Process {
     /// ended with its tree. Returns the end of its stderr.
     async fn end(mut self) -> String {
         self.rpc.stdin.lock().await.take();
-        let _ =
-            tokio::time::timeout(Duration::from_secs(5), tree::observe_exit(&mut self.child)).await;
-        self.reaped = agent::terminate_process_tree(&mut self.child, &mut self.tree).await;
-        if self.reaped {
-            self.processes.forget(self.tree.token());
+        if self.child.finish(Duration::from_secs(5)).await {
+            self.processes.forget(self.child.token());
         }
-        let Some(stderr) = self.stderr.take() else {
-            return String::new();
-        };
-        match tokio::time::timeout(Duration::from_secs(1), stderr).await {
-            Ok(Ok(tail)) => tail,
-            _ => String::new(),
-        }
+        self.child.stderr(Duration::from_secs(1)).await
     }
 
     /// Asks pi to abort the turn and waits for it to settle; true once it did.
@@ -1089,7 +1044,7 @@ impl Pi {
                 return Err(own("pi reported no session file".into()));
             };
             let file = PathBuf::from(file);
-            self.keep(session, &file, &launch.cwd, process.tree.token())
+            self.keep(session, &file, &launch.cwd, process.child.token())
                 .map_err(|error| own(format!("keep where pi writes the session: {error:#}")))
         };
         let opened = tokio::select! {
@@ -1235,7 +1190,7 @@ impl Pi {
             ));
         }
         if let Some(started) = &config.process_started
-            && let Err(e) = started(process.tree.root()).await
+            && let Err(e) = started(process.child.root()).await
         {
             process.end().await;
             return Err(error(
@@ -1958,6 +1913,7 @@ impl Executor for Pi {
 #[cfg(test)]
 mod transport_tests {
     use super::*;
+    use tokio::io::AsyncReadExt as _;
 
     fn rpc() -> Arc<Rpc> {
         Arc::new(Rpc {
@@ -2240,6 +2196,8 @@ mod tests {
         assert_work_outcome, join_network, open_node, provider_work,
     };
     use crate::work::WorkState;
+
+    use vibeface_bridge::platform::tree;
 
     type Turns = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
 
@@ -3074,6 +3032,109 @@ mod tests {
                 .is_empty()
         );
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_missing_pi_binary_keeps_its_launch_error() -> Result<()> {
+        let dir = scratch("missing-pi");
+        let processes = Arc::new(Processes::new(dir.join(PIDFILE)));
+        let bin = dir.join("missing-pi");
+        let result = Process::spawn(
+            &Launch {
+                bin: bin.clone(),
+                cwd: dir.clone(),
+                env: BTreeMap::new(),
+                args: Vec::new(),
+                guide: None,
+            },
+            &processes,
+            &dir.join("sessions"),
+        );
+        let Err(failure) = result else {
+            panic!("the missing executable started");
+        };
+        assert_eq!(failure.kind, FailureKind::MissingBinary);
+        assert!(
+            failure
+                .detail
+                .starts_with(&format!("could not start pi at {}: ", bin.display()))
+        );
+        assert!(!dir.join(PIDFILE).exists());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_pi_journal_leaves_no_running_child() -> Result<()> {
+        let dir = scratch("failed-pi-journal");
+        let pidfile = dir.join(PIDFILE);
+        std::fs::create_dir(&pidfile)?;
+        let processes = Arc::new(Processes::new(pidfile));
+        let guide = Guide::write(&dir.join("guides"), "fixture instructions")?;
+        let result = Process::spawn(
+            &Launch {
+                bin: fake(),
+                cwd: dir.clone(),
+                env: env(&dir, "wait"),
+                args: Vec::new(),
+                guide: Some(guide.clone()),
+            },
+            &processes,
+            &dir.join("sessions"),
+        );
+        let Err(failure) = result else {
+            panic!("the process journal unexpectedly succeeded");
+        };
+        assert_eq!(failure.kind, FailureKind::Unknown);
+        assert!(failure.detail.contains("record the agent process tree"));
+        let token = guide.started_token().context("pi process was started")?;
+        assert!(ended(&token).await, "pi still runs after a failed journal");
+        assert!(prompts(&dir).is_empty());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelling_pi_end_releases_its_stdout_reader_and_tree() -> Result<()> {
+        let dir = scratch("cancel-pi-end");
+        let processes = Arc::new(Processes::new(dir.join(PIDFILE)));
+        let process = Process::spawn(
+            &Launch {
+                bin: fake(),
+                cwd: dir.clone(),
+                env: env(&dir, "wait"),
+                args: Vec::new(),
+                guide: None,
+            },
+            &processes,
+            &dir.join("sessions"),
+        )?;
+        let rpc = process.rpc.clone();
+        assert!(matches!(
+            rpc.call(json!({"type": "get_state"}), Duration::from_secs(5))
+                .await,
+            Reply::Done(_)
+        ));
+        let stdin = rpc.stdin.lock().await;
+        let token = process.child.token().to_owned();
+        let output = process.output.abort_handle();
+        // The owned end stays pending on this guard until it is cancelled.
+        assert!(
+            tokio::time::timeout(Duration::ZERO, process.end())
+                .await
+                .is_err()
+        );
+        assert!(ended(&token).await, "pi still runs after cancellation");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !output.is_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("the stdout reader outlived pi")?;
+        drop(stdin);
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 

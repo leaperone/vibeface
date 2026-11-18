@@ -28,6 +28,7 @@ use vibeface_protocol::valid_business_id;
 pub(crate) mod agent_tools;
 mod bots;
 mod chat_controls;
+mod child_pipes;
 pub mod claude;
 pub(crate) mod codex_server;
 mod cursor;
