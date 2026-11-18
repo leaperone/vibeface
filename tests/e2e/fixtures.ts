@@ -40,7 +40,7 @@ async function control<K extends FixtureKind>(baseUrl: string | undefined, kind:
   const page = new URL(baseUrl);
   assert(/^[0-9]+$/.test(page.port));
   const path = resolve(artifacts, `control/${page.port}.json`);
-  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   let credentials: unknown;
   try {
     const stat = await file.stat();

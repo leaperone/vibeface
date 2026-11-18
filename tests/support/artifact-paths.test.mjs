@@ -175,12 +175,13 @@ test('native workspace gates retain the narrower workspace root', async () => {
   assert.equal(used, 1);
 });
 
-test('private web control reader refuses symlinks, directories and non-private modes before reading', async () => {
+test('private web control reader refuses symlinks, nonregular files and non-private modes before reading', async () => {
   for (const [isFile, symlink, mode] of [[true, true, 0o600], [false, false, 0o600], [true, false, 0o644]]) {
     let reads = 0;
     const { namespace } = await loadFixture('fixtures.ts', { exports: '\nexport { control };', fs: {
       open: async (_path, flags) => {
         assert(flags & constants.O_NOFOLLOW);
+        assert(flags & constants.O_NONBLOCK);
         if (symlink) throw new Error('ELOOP');
         return { stat: async () => ({ isFile: () => isFile, mode, size: 100 }), close: async () => {},
           readFile: async () => { reads++; throw new Error('Must not read rejected control material'); } };
