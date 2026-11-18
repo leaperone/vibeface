@@ -157,7 +157,8 @@ impl Delivery {
             IngestStatus::Pending => return Ok(()),
             _ => anyhow::bail!("session inbox event did not pass normal admission"),
         }
-        if received.stored_receipt.is_none() {
+        let mut attachment_ids = Vec::new();
+        if !received.attachments.is_empty() {
             let mut total = 0u64;
             ensure!(
                 received.attachments.len() <= MAX_BUNDLE_ATTACHMENTS,
@@ -183,6 +184,7 @@ impl Delivery {
                         )
                         .await?,
                     );
+                    attachment_ids.push(id);
                 }
                 let (network, event_hash, worker) = (
                     network.to_owned(),
@@ -204,7 +206,7 @@ impl Delivery {
                     })
                     .await?;
                 for ((part, _), receipt) in parts.iter().zip(receipts) {
-                    self.acknowledge_session_object(node, part, receipt).await?;
+                    self.send_session_receipt(node, part, receipt).await?;
                 }
             }
             received = open_event().await?;
@@ -212,6 +214,8 @@ impl Delivery {
         if let Some(receipt) = received.stored_receipt {
             self.acknowledge_session_object(node, &object, receipt)
                 .await?;
+            // Retain attachment caches until the parent receipt succeeds so retries need no new chunks.
+            self.clear_session_downloads(&object.header.receiver_peer, attachment_ids);
         }
         Ok(())
     }

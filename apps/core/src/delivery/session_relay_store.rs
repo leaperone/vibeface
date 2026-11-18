@@ -6,10 +6,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use vibeface_delivery::{
-    CAPSULE_BYTES, MAX_SESSION_OBJECT_BYTES, PeerSignature, SessionObjectHeader, Word, hash,
+    CAPSULE_BYTES, EncryptedSessionObject, MAX_SESSION_OBJECT_BYTES, PeerSignature,
+    SessionObjectHeader, Word, hash,
 };
 
 pub(super) const RELAY_CHUNK_BYTES: usize = 8192;
+pub(super) const SESSION_DOWNLOAD_DB: &str = "delivery/session-downloads.sqlite3";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,13 +30,20 @@ pub(super) struct RelayProgress {
 
 pub(super) struct SessionRelayStore {
     db: Connection,
+    downloads: bool,
 }
 
 impl SessionRelayStore {
     pub(super) fn open(data_dir: &Path) -> Result<Self> {
-        let mut db = crate::store::private_file_connection(
-            &data_dir.join("delivery/session-relay.sqlite3"),
-        )?;
+        Self::open_at(data_dir, "delivery/session-relay.sqlite3", false)
+    }
+
+    pub(super) fn open_downloads(data_dir: &Path) -> Result<Self> {
+        Self::open_at(data_dir, SESSION_DOWNLOAD_DB, true)
+    }
+
+    fn open_at(data_dir: &Path, relative_path: &str, downloads: bool) -> Result<Self> {
+        let mut db = crate::store::private_file_connection(&data_dir.join(relative_path))?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         db.execute_batch(
             "PRAGMA foreign_keys=ON; PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
@@ -82,7 +91,7 @@ impl SessionRelayStore {
             ),
         }
         tx.commit()?;
-        Ok(Self { db })
+        Ok(Self { db, downloads })
     }
 
     pub(super) fn begin(
@@ -282,6 +291,100 @@ impl SessionRelayStore {
         )?)
     }
 
+    pub(super) fn complete_object(
+        &self,
+        id: &Word,
+        receiver: &Word,
+        now_ms: u64,
+    ) -> Result<EncryptedSessionObject> {
+        self.ensure_download_store()?;
+        self.prune(now_ms)?;
+        let (manifest_json, size, committed): (String, u64, u64) = self
+            .db
+            .query_row(
+                "SELECT manifest,size,committed FROM objects
+                 WHERE id=?1 AND receiver=?2 AND complete=1 AND expires>?3",
+                params![id, receiver, now_ms],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .context("complete session download is unavailable for this receiver")?;
+        let manifest: RelayManifest = serde_json::from_str(&manifest_json)?;
+        let header = &manifest.header;
+        ensure!(
+            header.object_id == *id,
+            "session download object id mismatch"
+        );
+        ensure!(
+            header.receiver_peer == *receiver,
+            "session download is unavailable for this receiver"
+        );
+        header.canonical_bytes()?;
+        ensure!(
+            (64..=MAX_SESSION_OBJECT_BYTES as u64).contains(&header.payload_bytes)
+                && u64::from(header.chunk_count)
+                    == header.payload_bytes.div_ceil(RELAY_CHUNK_BYTES as u64),
+            "invalid session download payload size or chunk count"
+        );
+        ensure!(
+            size == header.payload_bytes && committed == size,
+            "session download extent does not match its manifest"
+        );
+        let expected_chunks = usize::try_from(header.chunk_count)?;
+        let mut ciphertext = Vec::with_capacity(usize::try_from(header.payload_bytes)?);
+        let mut stored = 0u64;
+        let mut chunks = 0usize;
+        let mut statement = self
+            .db
+            .prepare("SELECT offset,bytes FROM chunks WHERE id=?1 ORDER BY offset LIMIT ?2")?;
+        let mut rows = statement.query(params![id, expected_chunks.saturating_add(1)])?;
+        while let Some(row) = rows.next()? {
+            let offset: u64 = row.get(0)?;
+            let bytes: Vec<u8> = row.get(1)?;
+            ensure!(
+                chunks < expected_chunks
+                    && offset == stored
+                    && offset.is_multiple_of(RELAY_CHUNK_BYTES as u64)
+                    && !bytes.is_empty()
+                    && bytes.len()
+                        == (header.payload_bytes - offset).min(RELAY_CHUNK_BYTES as u64) as usize,
+                "session download chunks are not a bounded contiguous sequence"
+            );
+            let next = stored
+                .checked_add(bytes.len() as u64)
+                .context("session download chunk extent overflow")?;
+            ensure!(
+                next <= header.payload_bytes,
+                "session download chunk exceeds object"
+            );
+            ciphertext.extend_from_slice(&bytes);
+            stored = next;
+            chunks += 1;
+        }
+        ensure!(
+            chunks == expected_chunks && stored == header.payload_bytes,
+            "session download is missing chunks"
+        );
+        Ok(EncryptedSessionObject {
+            header: manifest.header,
+            ciphertext,
+            signature: Some(manifest.signature),
+        })
+    }
+
+    pub(super) fn discard_download(&mut self, id: &Word, receiver: &Word) -> Result<()> {
+        self.ensure_download_store()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM objects WHERE id=?1 AND receiver=?2",
+            params![id, receiver],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub(super) fn put_receipt(
         &mut self,
         id: &Word,
@@ -336,6 +439,14 @@ impl SessionRelayStore {
     fn prune(&self, now_ms: u64) -> Result<()> {
         self.db
             .execute("DELETE FROM objects WHERE expires<=?1", [now_ms])?;
+        Ok(())
+    }
+
+    fn ensure_download_store(&self) -> Result<()> {
+        ensure!(
+            self.downloads,
+            "session download operation requires the receiver store"
+        );
         Ok(())
     }
 }
@@ -477,6 +588,67 @@ mod tests {
         changed.capsule = STANDARD.encode([9; CAPSULE_BYTES]);
         assert!(store.begin(&changed, 100, u64::MAX, 10).is_err());
         drop(store);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn downloads_resume_assemble_and_discard_in_a_separate_scoped_store() -> Result<()> {
+        let directory = directory();
+        let (manifest, bytes) = fixture(RELAY_CHUNK_BYTES + 100);
+        let id = &manifest.header.object_id;
+        let sender = &manifest.header.sender_peer;
+        let receiver = &manifest.header.receiver_peer;
+        let first = &bytes[..RELAY_CHUNK_BYTES];
+
+        let mut relay = SessionRelayStore::open(&directory)?;
+        upload(&mut relay, &manifest, &bytes);
+        let mut downloads = SessionRelayStore::open_downloads(&directory)?;
+        assert_eq!(
+            downloads.begin(&manifest, 100, bytes.len() as u64, 1)?,
+            RelayProgress {
+                committed: 0,
+                complete: false
+            }
+        );
+        downloads.put(id, sender, 0, first, 100)?;
+        drop(downloads);
+
+        let mut downloads = SessionRelayStore::open_downloads(&directory)?;
+        assert_eq!(
+            downloads.begin(&manifest, 100, 0, 0)?,
+            RelayProgress {
+                committed: RELAY_CHUNK_BYTES as u64,
+                complete: false
+            }
+        );
+        assert!(downloads.complete_object(id, receiver, 100).is_err());
+        downloads.put(
+            id,
+            sender,
+            RELAY_CHUNK_BYTES as u64,
+            &bytes[RELAY_CHUNK_BYTES..],
+            100,
+        )?;
+        let object = downloads.complete_object(id, receiver, 100)?;
+        assert_eq!(object.header, manifest.header);
+        assert_eq!(object.signature, Some(manifest.signature));
+        assert_eq!(object.ciphertext, bytes);
+        assert!(downloads.complete_object(id, &[8; 32], 100).is_err());
+
+        assert!(
+            SessionRelayStore::open(&directory)?
+                .complete_object(id, receiver, 100)
+                .is_err()
+        );
+        assert!(directory.join("delivery/session-relay.sqlite3").exists());
+        assert!(directory.join(SESSION_DOWNLOAD_DB).exists());
+        downloads.discard_download(id, &[8; 32])?;
+        assert!(downloads.complete_object(id, receiver, 100).is_ok());
+        downloads.discard_download(id, receiver)?;
+        downloads.discard_download(id, receiver)?;
+        assert!(downloads.complete_object(id, receiver, 100).is_err());
+        drop(relay);
         std::fs::remove_dir_all(directory)?;
         Ok(())
     }

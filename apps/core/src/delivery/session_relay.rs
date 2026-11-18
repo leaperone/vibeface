@@ -3,7 +3,9 @@
 use super::{
     Delivery, service,
     session::{SIGNING_DOMAIN, SessionStoredReceipt, verify_object},
-    session_relay_store::{RELAY_CHUNK_BYTES, RelayManifest, RelayProgress, SessionRelayStore},
+    session_relay_store::{
+        RELAY_CHUNK_BYTES, RelayManifest, RelayProgress, SESSION_DOWNLOAD_DB, SessionRelayStore,
+    },
     types::{Mode, ServiceRequest, parse_word},
 };
 use crate::runtime::Runtime;
@@ -17,6 +19,8 @@ use vibeface_delivery::{
 };
 
 const MAX_RETAIN_MS: u64 = 24 * 60 * 60 * 1000;
+const DOWNLOAD_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+const DOWNLOAD_CACHE_OBJECTS: u32 = 128;
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -296,39 +300,73 @@ impl Delivery {
         );
         let size = manifest.header.payload_bytes as usize;
         ensure!(size <= limit, "session object exceeds its expected extent");
-        let mut ciphertext = Vec::with_capacity(size);
-        while ciphertext.len() < size {
-            let offset = ciphertext.len();
-            let encoded: String = request(
-                node,
-                &relay,
-                SessionRelayRequest::Get {
-                    object_id,
-                    offset: offset as u64,
-                },
-            )
-            .await?;
+        let receiver = manifest.header.receiver_peer;
+        let sender = manifest.header.sender_peer;
+        let mut cache = SessionRelayStore::open_downloads(&self.data_dir)?;
+        let mut progress = cache.begin(
+            &manifest,
+            now_ms()?,
+            DOWNLOAD_CACHE_BYTES,
+            DOWNLOAD_CACHE_OBJECTS,
+        )?;
+        let total = manifest.header.payload_bytes;
+        if progress.committed > total
+            || progress.complete != (progress.committed == total)
+            || (!progress.complete && !progress.committed.is_multiple_of(RELAY_CHUNK_BYTES as u64))
+        {
+            cache.discard_download(&object_id, &receiver)?;
+            anyhow::bail!("invalid session download cache progress");
+        }
+        while !progress.complete {
+            let offset = progress.committed;
+            let encoded: String =
+                request(node, &relay, SessionRelayRequest::Get { object_id, offset }).await?;
             let bytes = STANDARD.decode(encoded)?;
             ensure!(
-                bytes.len() == (size - offset).min(RELAY_CHUNK_BYTES),
+                bytes.len() == (size - offset as usize).min(RELAY_CHUNK_BYTES),
                 "invalid session relay chunk"
             );
-            ciphertext.extend_from_slice(&bytes);
+            if offset == 0 && bytes.get(32..64) != Some(hash(&capsule).as_slice()) {
+                cache.discard_download(&object_id, &receiver)?;
+                anyhow::bail!("wrong session capsule");
+            }
+            progress = cache.put(&object_id, &sender, offset, &bytes, now_ms()?)?;
+            ensure!(
+                progress.committed > offset,
+                "session download did not advance"
+            );
         }
-        let object = EncryptedSessionObject {
-            header: manifest.header,
-            ciphertext,
-            signature: Some(manifest.signature),
+        let verified = (|| -> Result<EncryptedSessionObject> {
+            let object = cache.complete_object(&object_id, &receiver, now_ms()?)?;
+            verify_object(&object)?;
+            ensure!(
+                object.ciphertext.get(32..64) == Some(hash(&capsule).as_slice()),
+                "wrong session capsule"
+            );
+            Ok(object)
+        })();
+        let object = match verified {
+            Ok(object) => object,
+            Err(error) => {
+                cache.discard_download(&object_id, &receiver)?;
+                return Err(error);
+            }
         };
-        verify_object(&object)?;
-        ensure!(
-            object.ciphertext.get(32..64) == Some(hash(&capsule).as_slice()),
-            "wrong session capsule"
-        );
         Ok((object, capsule))
     }
 
     pub async fn acknowledge_session_object(
+        &self,
+        node: &Runtime,
+        object: &EncryptedSessionObject,
+        receipt: SessionStoredReceipt,
+    ) -> Result<()> {
+        self.send_session_receipt(node, object, receipt).await?;
+        self.clear_session_downloads(&object.header.receiver_peer, [object.header.object_id]);
+        Ok(())
+    }
+
+    pub(super) async fn send_session_receipt(
         &self,
         node: &Runtime,
         object: &EncryptedSessionObject,
@@ -345,6 +383,25 @@ impl Delivery {
             },
         )
         .await
+    }
+
+    pub(super) fn clear_session_downloads(
+        &self,
+        receiver: &Word,
+        ids: impl IntoIterator<Item = Word>,
+    ) {
+        if self.data_dir.join(SESSION_DOWNLOAD_DB).exists() {
+            let result = (|| -> Result<()> {
+                let mut cache = SessionRelayStore::open_downloads(&self.data_dir)?;
+                for id in ids {
+                    cache.discard_download(&id, receiver)?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                tracing::debug!(%error, "acknowledged session download cache cleanup is pending");
+            }
+        }
     }
 
     pub async fn session_object_receipt(
@@ -368,15 +425,18 @@ impl Delivery {
     }
 
     pub(super) async fn purge_session_relay(&self) -> Result<()> {
-        if !self
+        if self.data_dir.join(SESSION_DOWNLOAD_DB).exists() {
+            SessionRelayStore::open_downloads(&self.data_dir)?.purge(now_ms()?)?;
+        }
+        if self
             .data_dir
             .join("delivery/session-relay.sqlite3")
             .exists()
         {
-            return Ok(());
+            let _relay = self.session_relay_operations.lock().await;
+            SessionRelayStore::open(&self.data_dir)?.purge(now_ms()?)?;
         }
-        let _relay = self.session_relay_operations.lock().await;
-        SessionRelayStore::open(&self.data_dir)?.purge(now_ms()?)
+        Ok(())
     }
 }
 
@@ -571,10 +631,70 @@ mod tests {
                 .is_err()
         );
 
+        let receiver_dir = dir.join("receiver");
+        let received_manifest: RelayManifest = request(
+            &target,
+            &relay_peer,
+            SessionRelayRequest::Manifest { object_id },
+        )
+        .await?;
+        verify_manifest(&received_manifest, &relay_peer, now_ms()?)?;
+        let encoded: String = request(
+            &target,
+            &relay_peer,
+            SessionRelayRequest::Get {
+                object_id,
+                offset: 0,
+            },
+        )
+        .await?;
+        let prefix = STANDARD.decode(encoded)?;
+        {
+            let mut cache = SessionRelayStore::open_downloads(&receiver_dir)?;
+            cache.begin(
+                &received_manifest,
+                now_ms()?,
+                DOWNLOAD_CACHE_BYTES,
+                DOWNLOAD_CACHE_OBJECTS,
+            )?;
+            let progress = cache.put(
+                &object_id,
+                &object.header.sender_peer,
+                0,
+                &prefix,
+                now_ms()?,
+            )?;
+            assert_eq!(progress.committed, RELAY_CHUNK_BYTES as u64);
+            assert!(!progress.complete);
+        }
+        target.shutdown().await;
+        drop(target);
+        let target = node(&receiver_dir, &receiver, false).await?;
+        target.net()?.learn(&relay.net()?.addr()).await;
+        source.net()?.learn(&target.net()?.addr()).await;
+        source.net()?.peer_restarted(&receiver.device_id()?);
+
+        // Remove the already saved chunk from this fixture so an accidental refetch fails.
+        let relay_db = relay_dir.join("delivery/session-relay.sqlite3");
+        {
+            let db = rusqlite::Connection::open(&relay_db)?;
+            assert_eq!(
+                db.execute("DELETE FROM chunks WHERE id=?1 AND offset=0", [&object_id])?,
+                1
+            );
+        }
         let (downloaded, received_capsule) = target
             .delivery
             .download_session_object(&target, relay_peer, object_id)
-            .await?;
+            .await
+            .context("resume session download after receiver restart")?;
+        {
+            let db = rusqlite::Connection::open(&relay_db)?;
+            db.execute(
+                "INSERT INTO chunks(id,offset,bytes) VALUES(?1,0,?2)",
+                rusqlite::params![object_id, prefix],
+            )?;
+        }
         assert_eq!(downloaded, object);
         let ingested = target.delivery.ingest_session_event(
             &mut received_events,
@@ -592,6 +712,11 @@ mod tests {
                 .acknowledge_session_object(&target, &object, receipt.clone())
                 .await?;
         }
+        assert!(
+            SessionRelayStore::open_downloads(&receiver_dir)?
+                .complete_object(&object_id, &receiver_peer, now_ms()?)
+                .is_err()
+        );
         assert_eq!(
             source
                 .delivery
@@ -914,7 +1039,7 @@ mod tests {
                     0
                 };
                 if present
-                    && acknowledged >= 2
+                    && acknowledged >= 3
                     && target
                         .delivery
                         .session_inbox(&target, &incoming)
