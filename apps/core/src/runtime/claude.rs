@@ -2957,7 +2957,7 @@ pub(super) mod tests {
         let place = Place::new()?;
         let (record, calls) = recorder();
         let config = bot_config(&place, record);
-        manager::tests::assert_manager_presubmit_fences(&config).await?;
+        manager::tests::assert_manager_presubmit_fences(&config, || Ok(place.log().len())).await?;
         assert!(calls.lock().unwrap().is_empty());
         assert!(place.log().is_empty());
         Ok(())

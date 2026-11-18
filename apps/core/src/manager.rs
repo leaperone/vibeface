@@ -1613,12 +1613,16 @@ pub(crate) mod tests {
     }
 
     /// Every management adapter fences a cancelled attempt and one whose session cannot be saved.
-    pub(crate) async fn assert_manager_presubmit_fences(config: &ManagerConfig) -> Result<()> {
+    pub(crate) async fn assert_manager_presubmit_fences(
+        config: &ManagerConfig,
+        native_calls: impl Fn() -> Result<usize>,
+    ) -> Result<()> {
         const FIXTURE_TOKEN: &str = "pretend-tool-bearer-used-by-controlled-manager-tests";
         let config = ManagerConfig {
             tool_token: Some(FIXTURE_TOKEN.into()),
             ..config.clone()
         };
+        let before_cancelled_call = native_calls()?;
         let result = run_manager(
             &config,
             "must not send",
@@ -1636,6 +1640,11 @@ pub(crate) mod tests {
         assert_eq!(error.outcome, ManagerFailure::Cancelled);
         assert_eq!(error.start, StartEvidence::NotStarted);
         assert_eq!(error.session_id.as_deref(), Some("previous-session"));
+        assert_eq!(
+            native_calls()?,
+            before_cancelled_call,
+            "an already-cancelled attempt must not launch or dispatch native work"
+        );
 
         let seen_session = std::sync::Mutex::new(None);
         let result = run_manager(
@@ -1675,7 +1684,8 @@ pub(crate) mod tests {
     async fn codex_manager_presubmit_fences_keep_the_prompt_unsent() -> Result<()> {
         let fake = fake_app_server(Turn::Answers).await;
         let config = codex(workspace(&fake.directory), fake.socket.clone());
-        assert_manager_presubmit_fences(&config).await?;
+        assert_manager_presubmit_fences(&config, || Ok(fake.requests.lock().unwrap().len()))
+            .await?;
         assert!(fake.calls("thread/resume").is_empty());
         assert_eq!(fake.calls("thread/start").len(), 1);
         assert!(fake.calls("turn/start").is_empty());

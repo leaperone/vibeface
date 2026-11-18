@@ -2920,10 +2920,49 @@ mod tests {
         let server = place.opencode()?;
         let turns = Turns::default();
         let config = bot(&place, &server, "presubmit-fences", &turns);
-        manager::tests::assert_manager_presubmit_fences(&config).await?;
+        manager::tests::assert_manager_presubmit_fences(&config, || {
+            Ok(place.recorded("argv").lines().count())
+        })
+        .await?;
         assert!(turns.lock().unwrap().is_empty());
         assert!(place.prompts().is_empty());
         server.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_bot_with_a_missing_opencode_session_sends_the_full_prompt_once() -> Result<()> {
+        let place = Place::new().await?;
+        let server = place.opencode()?;
+        let turns = Turns::default();
+        let mut config = bot(&place, &server, "missing-bot-session", &turns);
+        let full = "full management context";
+        config
+            .turn_binding
+            .as_mut()
+            .context("turn binding")?
+            .fresh_prompt = Some(full.into());
+        let previous = "ses_missing";
+        let (result, saved, _) = turn(
+            &place,
+            &config,
+            "incremental management update",
+            Some(previous),
+            watch::channel(false).1,
+        )
+        .await;
+        server.stop().await;
+
+        let replacement = result?.session_id.context("replacement session")?;
+        assert_ne!(replacement, previous);
+        assert_eq!(saved, Some((replacement.clone(), 0)));
+        let prompts = place.prompts();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0]["session"], replacement.as_str());
+        assert_eq!(
+            prompts[0]["body"]["text"],
+            format!("Answer briefly.\n\n{full}")
+        );
         Ok(())
     }
 

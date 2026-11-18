@@ -1248,7 +1248,12 @@ mod tests {
             .as_mut()
             .context("turn recorder")?
             .client_id = "presubmit-fences".into();
-        crate::manager::tests::assert_manager_presubmit_fences(&blocked_config).await?;
+        crate::manager::tests::assert_manager_presubmit_fences(&blocked_config, || {
+            Ok(std::fs::read_to_string(dir.join("bridge-starts.log"))?
+                .lines()
+                .count())
+        })
+        .await?;
         assert_eq!(calls.lock().unwrap().len(), 2);
         assert_eq!(
             std::fs::read_to_string(dir.join("sends.log"))?

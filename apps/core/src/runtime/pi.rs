@@ -2605,10 +2605,60 @@ mod tests {
         let pi = Arc::new(Pi::new(&dir).await);
         let turns = Turns::default();
         let config = bot(&dir, &pi, "reply", Some(&turns));
-        crate::manager::tests::assert_manager_presubmit_fences(&config).await?;
+        crate::manager::tests::assert_manager_presubmit_fences(&config, || {
+            Ok(log(&dir)
+                .iter()
+                .filter(|line| line["argv"].is_array())
+                .count())
+        })
+        .await?;
         assert!(turns.lock().unwrap().is_empty());
         assert!(prompts(&dir).is_empty());
         assert!(lock(&pi.live).is_empty());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_bot_with_a_missing_pi_session_sends_the_full_prompt_once() -> Result<()> {
+        let dir = scratch("missing-bot-session");
+        let pi = Arc::new(Pi::new(&dir).await);
+        let previous = "lost-pi-session";
+        let transcript = dir.join("lost-session.jsonl");
+        std::fs::write(&transcript, "")?;
+        pi.keep(previous, &transcript, &dir, "")?;
+        std::fs::remove_file(transcript)?;
+
+        let turns = Turns::default();
+        let mut config = bot(&dir, &pi, "reply", Some(&turns));
+        let full = "full management context";
+        config
+            .turn_binding
+            .as_mut()
+            .context("turn binding")?
+            .fresh_prompt = Some(full.into());
+        let result = run_manager(
+            &config,
+            "incremental management update",
+            Some(previous),
+            |_| async { Ok(()) },
+            watch::channel(false).1,
+            |_| async { Ok(()) },
+        )
+        .await?;
+
+        let replacement = result.session_id.context("replacement session")?;
+        assert_ne!(replacement, previous);
+        let starts: Vec<_> = log(&dir)
+            .into_iter()
+            .filter(|line| line["argv"].is_array())
+            .collect();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(
+            &starts[0]["argv"].as_array().context("launch arguments")?[3..5],
+            [json!("--session-id"), json!(replacement)]
+        );
+        assert_eq!(prompts(&dir), [full]);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
