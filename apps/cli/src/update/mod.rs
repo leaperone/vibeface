@@ -1365,7 +1365,7 @@ fn owned_directory(path: &Path) -> Result<()> {
         metadata.is_dir()
             && !metadata.is_symlink()
             && fs::canonicalize(path)? == path
-            && privatefs::owner_of(path)? == privatefs::current_account()?,
+            && privatefs::owned_by_current_account(path)?,
         "{} is not a directory owned by this account without links",
         path.display()
     );
@@ -2034,7 +2034,7 @@ mod tests {
         #[cfg(windows)]
         let parent = std::env::temp_dir();
         let directory = parent.join(format!("vibeface-updater-{}", uuid::Uuid::new_v4()));
-        private_dir(&directory).unwrap();
+        privatefs::create_dir_new(&directory).unwrap();
         fs::canonicalize(directory).unwrap()
     }
 

@@ -59,6 +59,14 @@ pub fn same_owner(left: &Path, right: &Path) -> Result<bool> {
     Ok(owner_of(left)? == owner_of(right)?)
 }
 
+pub fn owned_by_current_account(path: &Path) -> Result<bool> {
+    #[cfg(unix)]
+    let owned = owner_of(path)? == current_account()?;
+    #[cfg(windows)]
+    let owned = super::winsec::path_owned_by_current_account(path)?;
+    Ok(owned)
+}
+
 /// Whether writes and replacement of this installation path are limited to the current
 /// account and system administrators.
 pub fn is_trusted_install_path(path: &Path, ancestor: bool) -> Result<bool> {
@@ -75,9 +83,10 @@ pub fn is_trusted_install_path(path: &Path, ancestor: bool) -> Result<bool> {
             return Ok(false);
         }
         #[cfg(target_os = "macos")]
-        return macos_install_acl_is_safe(path).map_err(Into::into);
+        let safe = macos_install_acl_is_safe(path)?;
         #[cfg(not(target_os = "macos"))]
-        Ok(true)
+        let safe = true;
+        Ok(safe)
     }
     #[cfg(windows)]
     {
@@ -117,9 +126,9 @@ fn macos_install_acl_is_safe(path: &Path) -> io::Result<bool> {
     let acl = unsafe { acl_get_link_np(path.as_ptr(), EXTENDED) };
     if acl.is_null() {
         let error = io::Error::last_os_error();
-        return if [libc::ENOENT, libc::ENOTSUP, libc::EOPNOTSUPP]
-            .iter()
-            .any(|code| Some(*code) == error.raw_os_error())
+        return if error
+            .raw_os_error()
+            .is_some_and(|code| [libc::ENOENT, libc::ENOTSUP, libc::EOPNOTSUPP].contains(&code))
         {
             let after = std::fs::symlink_metadata(original_path)?;
             Ok((after.dev(), after.ino()) == (before.dev(), before.ino()))

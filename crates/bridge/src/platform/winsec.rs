@@ -533,6 +533,11 @@ pub fn path_is_private(path: &Path) -> io::Result<bool> {
     ReadDescriptor::of_path(path)?.private_to(&user)
 }
 
+pub(super) fn path_owned_by_current_account(path: &Path) -> io::Result<bool> {
+    let owner = owner_of_path(path)?;
+    Ok(owner == current_user()? || (token_holds(&owner)? && path_is_private(path)?))
+}
+
 pub(super) fn path_is_trusted_install(path: &Path, ancestor: bool) -> io::Result<bool> {
     use windows_sys::Win32::Security::{WinBuiltinAdministratorsSid, WinLocalSystemSid};
 
