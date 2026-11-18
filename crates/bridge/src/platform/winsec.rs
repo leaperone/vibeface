@@ -477,8 +477,7 @@ impl ReadDescriptor {
             // SAFETY: a recognized allow ACE has an ACE_HEADER, mask and SID.
             let flags = unsafe { *ace.cast::<u8>().add(1) };
             let allowed = unsafe { *ace.cast::<u32>().add(1) };
-            if (mask != u32::MAX && u32::from(flags) & (INHERIT_ONLY_ACE as u32) != 0)
-                || allowed & mask == 0
+            if (mask != u32::MAX && u32::from(flags) & INHERIT_ONLY_ACE != 0) || allowed & mask == 0
             {
                 continue;
             }

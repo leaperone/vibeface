@@ -197,6 +197,7 @@ fn apply_files(
     let backup = stage.path.join("previous");
     backup_files(live, &backup, old)?;
     let mut changed = Vec::new();
+    let mut created_dirs = Vec::new();
     let result = (|| -> Result<()> {
         for rel in old.difference(new) {
             fs::remove_file(live.join(rel))?;
@@ -209,7 +210,18 @@ fn apply_files(
             .chain(new.get(Path::new(STAMP)))
         {
             let dest = live.join(rel);
-            fs::create_dir_all(parent(&dest)?)?;
+            let mut directory = live.to_owned();
+            for component in parent(rel)?.components() {
+                directory.push(component);
+                match fs::create_dir(&directory) {
+                    Ok(()) => created_dirs.push(directory.clone()),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        check_path(&directory)?;
+                        ensure!(directory.is_dir(), "cannot create Desktop update directory");
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
             if !old.contains(rel) {
                 // Reserve a fresh name on filesystems with or without hard-link support.
                 drop(fs::File::create_new(&dest)?);
@@ -236,6 +248,19 @@ fn apply_files(
                     "{error:#}; rollback failed ({rollback}); previous release files at {}",
                     backup.display()
                 );
+            }
+        }
+        for directory in created_dirs.into_iter().rev() {
+            match fs::remove_dir(directory) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::NotFound
+                    ) => {}
+                Err(error) => {
+                    return Err(error).context("could not clear an empty Desktop update directory");
+                }
             }
         }
         return Err(error);

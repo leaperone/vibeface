@@ -86,6 +86,28 @@ impl Installation {
         &self.path
     }
 
+    pub(super) fn lock_path(&self) -> Result<PathBuf> {
+        let path = match self.format {
+            #[cfg(any(target_os = "linux", windows))]
+            Format::Portable => self.path.join(".vibeface-update.lock"),
+            #[cfg(windows)]
+            Format::Installer => self.path.join(".vibeface-update.lock"),
+            #[cfg(unix)]
+            _ => {
+                let mut name = std::ffi::OsString::from(".");
+                name.push(
+                    self.path
+                        .file_name()
+                        .context("Desktop install name is missing")?,
+                );
+                name.push(".update.lock");
+                self.path.with_file_name(name)
+            }
+        };
+        check_path(parent(&path)?)?;
+        Ok(path)
+    }
+
     pub(super) fn activate(
         &self,
         asset: &Path,

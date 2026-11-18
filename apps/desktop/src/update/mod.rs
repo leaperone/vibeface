@@ -94,7 +94,7 @@ impl Target {
     }
 
     fn apply(&self, candidate: &Candidate) -> Result<()> {
-        let installation_lock = private_lock(&self.cache.join("installation.lock"))?;
+        let installation_lock = private_lock(&self.installation.lock_path()?)?;
         installation_lock
             .try_lock()
             .context("another Desktop instance is using this installation")?;
@@ -126,6 +126,13 @@ impl Target {
 }
 
 fn private_lock(path: &Path) -> Result<File> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        ensure!(
+            privatefs::is_plain_file(&metadata),
+            "Desktop update lock is not a regular file"
+        );
+        privatefs::ensure_private(path, "Desktop update lock")?;
+    }
     let file = privatefs::open_or_create(path)?;
     ensure!(
         privatefs::is_plain_file(&file.metadata()?),
@@ -173,7 +180,16 @@ impl Updater {
                 running: None,
             });
         };
-        let install_lock = private_lock(&target.cache.join("installation.lock"))?;
+        let install_lock = match private_lock(&target.installation.lock_path()?) {
+            Ok(lock) => lock,
+            Err(error) => {
+                eprintln!("Vibeface Desktop update lock: {error:#}");
+                return Ok(Self {
+                    status,
+                    running: None,
+                });
+            }
+        };
         install_lock
             .try_lock_shared()
             .context("正在安装桌面更新，请稍后打开 Vibeface")?;
