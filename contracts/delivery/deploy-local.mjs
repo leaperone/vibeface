@@ -89,21 +89,19 @@ try {
   statisticsReserved = true;
   const root = path.dirname(fileURLToPath(import.meta.url));
   const profile = JSON.parse(fs.readFileSync(path.resolve(root, '../../crates/delivery/proof/profile.json'), 'utf8'));
-  assert.deepEqual(Object.keys(profile).sort(), ['crypto_suite', 'guest_image_id', 'max_guest_cycles', 'max_prover_memory_bytes',
-    'max_total_bytes', 'max_window_bytes', 'max_windows', 'statement_schema_hash'].sort(), 'invalid product proof profile');
-  for (const field of ['guest_image_id', 'statement_schema_hash']) {
-    assert(Array.isArray(profile[field]) && profile[field].length === 32 && profile[field].every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255), 'invalid product profile digest');
-  }
+  const { compile, artifact, requireDependency, schema } = await import('./compile.mjs');
+  const { deliveryAbi } = await import('./abi-model.mjs');
+  compile({ checkTrust: true });
+  const model = deliveryAbi(artifact('DeliveryEscrow'));
+  const { value: publicProfile, id: profileId } = model.configuredProfile(profile);
   assert(profile.guest_image_id.some(byte => byte !== 0), 'zero product guest image');
   assert(profile.crypto_suite === 1 && profile.max_windows === 2 && profile.max_window_bytes === 65536
     && profile.max_total_bytes === 131072 && profile.max_guest_cycles === 64000000
     && profile.max_prover_memory_bytes === 17179869184, 'unsupported local delivery profile');
 
-  const { compile, artifact, requireDependency, schema } = await import('./compile.mjs');
-  assert.equal(Buffer.from(profile.statement_schema_hash).toString('hex'), createHash('sha256').update(schema).digest('hex'), 'product profile and statement schema differ');
-  compile({ checkTrust: true });
+  assert.equal(publicProfile.statementSchemaHash.slice(2), createHash('sha256').update(schema).digest('hex'), 'product profile and statement schema differ');
   const ganache = requireDependency('ganache');
-  const { AbiCoder, BrowserProvider, Contract, ContractFactory, ParamType, hexlify, keccak256, sha256, toUtf8Bytes } = requireDependency('ethers');
+  const { BrowserProvider, Contract, ContractFactory, keccak256 } = requireDependency('ethers');
   const fixture = values['experiment-fixture'];
   const recipe = 'delivery-small-public-test-v1';
   const genesisTimestamp = 1700000000;
@@ -143,14 +141,6 @@ try {
       accounts, timestamp_increment: 1, block_time: 0, gas_price_wei: gasPrice.toString(), coinbase,
       deployment_nonces: { asset: 0, escrow: 1 } };
   }
-  const publicProfile = {
-    domain: sha256(toUtf8Bytes('vibeface-delivery-profile-v1')),
-    guestImageId: hexlify(Uint8Array.from(profile.guest_image_id)),
-    statementSchemaHash: hexlify(Uint8Array.from(profile.statement_schema_hash)),
-    cryptoSuite: profile.crypto_suite, maxWindows: profile.max_windows,
-    maxWindowBytes: profile.max_window_bytes, maxTotalBytes: profile.max_total_bytes,
-    maxGuestCycles: profile.max_guest_cycles, maxProverMemoryBytes: profile.max_prover_memory_bytes,
-  };
   let deployNonce = 0;
   async function deploy(name, args) {
     const built = artifact(name);
@@ -175,8 +165,6 @@ try {
   const adapterAbi = artifact('RiscZeroAdapter').abi;
   const adapter = new Contract(adapterAddress, adapterAbi, provider);
   const verifierAddress = (await adapter.verifier()).toLowerCase();
-  const tuple = ParamType.from(artifact('DeliveryEscrow').abi.find(item => item.type === 'constructor').inputs[0]);
-  const profileId = sha256(AbiCoder.defaultAbiCoder().encode([tuple], [publicProfile]));
   assert.equal(await escrow.contract.profileId(), profileId);
   assert.equal(await adapter.imageId(), publicProfile.guestImageId);
   assert.equal(await asset.contract.decimals(), 6n);

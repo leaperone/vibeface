@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { deliveryAbi } from './abi-model.mjs';
 import { compile, artifact, artifacts, requireDependency, root, schema } from './compile.mjs';
 import { deployFixtureContract, withLocalEvm } from './local-evm-fixture.mjs';
 
@@ -27,39 +28,17 @@ const publicProofs = manifest.proofs.map((entry, index) => {
   for (const name of ['imageId', 'profileId', 'journal', 'journalHash', 'seal']) hex(proof[name]);
   return proof;
 });
-const ganache = requireDependency('ganache');
-const { BrowserProvider, ContractFactory, AbiCoder, sha256, toUtf8Bytes, getBytes, hexlify, ZeroAddress } = requireDependency('ethers');
-const profileKeys = ['guest_image_id', 'statement_schema_hash', 'crypto_suite', 'max_windows', 'max_window_bytes',
-  'max_total_bytes', 'max_guest_cycles', 'max_prover_memory_bytes'];
-assert.deepEqual(Object.keys(canonicalProfile).sort(), profileKeys.toSorted(), 'exact product profile fields');
-const word = value => {
-  assert(Array.isArray(value) && value.length === 32 && value.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255), 'profile Word must contain exactly 32 bytes');
-  return hexlify(Uint8Array.from(value));
-};
-for (const name of profileKeys.slice(2)) assert(Number.isSafeInteger(canonicalProfile[name]) && canonicalProfile[name] > 0, `profile ${name}`);
-const profile = {
-  domain: sha256(toUtf8Bytes('vibeface-delivery-profile-v1')), guestImageId: word(canonicalProfile.guest_image_id),
-  statementSchemaHash: word(canonicalProfile.statement_schema_hash), cryptoSuite: canonicalProfile.crypto_suite,
-  maxWindows: canonicalProfile.max_windows, maxWindowBytes: canonicalProfile.max_window_bytes,
-  maxTotalBytes: canonicalProfile.max_total_bytes, maxGuestCycles: canonicalProfile.max_guest_cycles,
-  maxProverMemoryBytes: canonicalProfile.max_prover_memory_bytes,
-};
+const { BrowserProvider, ContractFactory, sha256, toUtf8Bytes, getBytes, hexlify, ZeroAddress } = requireDependency('ethers');
+compile();
+const model = deliveryAbi(artifact('DeliveryEscrow'));
+const { value: profile, id: expectedProfileId } = model.configuredProfile(canonicalProfile);
 assert.equal(hex(manifest.imageId), profile.guestImageId, 'fixture image must match fixed product profile');
 assert.equal(hex(manifest.schemaHash), profile.statementSchemaHash, 'fixture schema must match fixed product profile');
 assert.equal(sha256(toUtf8Bytes(schema)), profile.statementSchemaHash, 'product profile must match exact canonical ABI source');
-compile();
-const fields = artifact('DeliveryEscrow').abi.find(x => x.name === 'preview').inputs[0].components;
-const statementType = `tuple(${fields.map(x => `${x.type} ${x.name}`).join(',')})`;
-const coder = AbiCoder.defaultAbiCoder();
-const profileFields = artifact('DeliveryEscrow').abi.find(x => x.type === 'constructor').inputs[0].components;
-const profileType = `tuple(${profileFields.map(x => `${x.type} ${x.name}`).join(',')})`;
-const expectedProfileId = sha256(coder.encode([profileType], [profile]));
 let common;
 let ordinary;
 for (const proof of publicProofs) {
-  assert.equal(getBytes(hex(proof.journal)).length, 1504, 'exact 47-word journal');
-  const statement = coder.decode([statementType], hex(proof.journal))[0];
-  assert.equal(coder.encode([statementType], [statement]), hex(proof.journal), 'canonical ABI roundtrip');
+  const statement = model.decodeJournal(hex(proof.journal));
   assert.equal(statement.domain, sha256(toUtf8Bytes('vibeface-delivery-statement-v1')));
   assert.equal(statement.relation, BigInt(proof.relation));
   assert.equal(statement.chainId, 31337n, 'local fixture chain');
@@ -84,6 +63,7 @@ for (const proof of publicProofs) {
     ordinary = hexlify(journal);
   }
 }
+const ganache = requireDependency('ganache');
 await withLocalEvm({ ganache, BrowserProvider }, async ({ provider }) => {
   const signer = await provider.getSigner();
   const a = artifact('RiscZeroAdapter');
