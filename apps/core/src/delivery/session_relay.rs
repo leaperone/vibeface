@@ -205,7 +205,8 @@ impl Delivery {
             ensure!(
                 progress.committed <= total
                     && progress.complete == (progress.committed == total)
-                    && (progress.complete || progress.committed % RELAY_CHUNK_BYTES as u64 == 0),
+                    && (progress.complete
+                        || progress.committed.is_multiple_of(RELAY_CHUNK_BYTES as u64)),
                 "invalid session relay progress"
             );
             if progress.complete {
@@ -337,7 +338,8 @@ mod tests {
     use crate::{
         config::{self, Config},
         crypto::LocalIdentity,
-        model::{EventBody, IngestStatus, Sender},
+        delivery::session::SessionRoute,
+        model::{Attachment, EventBody, IngestStatus, Sender},
         store::Store,
     };
     use std::{path::Path, sync::Arc};
@@ -383,8 +385,9 @@ mod tests {
 
         let network = sender.fixture_network_id()?;
         let state = sender.sign_network_fixture(1, vec![sender_id.clone(), receiver_id.clone()])?;
-        let mut sent_events = Store::open(":memory:")?;
-        let mut received_events = Store::open(":memory:")?;
+        let mut sent_events = Store::open(dir.join("sender/session-test.sqlite3"))?;
+        let receiver_events = dir.join("receiver/session-test.sqlite3");
+        let mut received_events = Store::open(&receiver_events)?;
         for store in [&mut sent_events, &mut received_events] {
             store.install_trust_bundle(&network, &state)?;
         }
@@ -404,6 +407,19 @@ mod tests {
             sender.owner_fixture(&network, "target", &receiver_id)?,
             2,
         )?;
+        let bot = sender.fixture_admin().attest(
+            &network,
+            "source",
+            EventBody::BotCreated {
+                bot_id: "bot".into(),
+                name: "File reader".into(),
+                instructions: "Read instructions from the attachment".into(),
+                project: None,
+                attestation: None,
+                cause: None,
+            },
+        )?;
+        sent_events.append_event(&sender, &network, "source", bot, vec![], 2)?;
         for peer in [sender_id, receiver_id] {
             received_events
                 .ingest_events(&network, &sent_events.events_from(&network, &peer, 1, 16)?)?;
@@ -535,12 +551,152 @@ mod tests {
                 .await?,
             Some(receipt)
         );
+        let content = b"private session attachment".repeat(1300);
+        let attachment = Attachment {
+            hash: crate::crypto::digest(&content),
+            size: content.len() as u64,
+            name: "private-file.txt".into(),
+        };
+        let blob = attachment.blob();
+        sent_events.put_blob(&blob, &content)?;
+        let input = sender.fixture_admin().attest(
+            &network,
+            "source",
+            EventBody::InputPosted {
+                message_id: "relay-file".into(),
+                target: crate::workspace::InputTarget::BotMain {
+                    bot_id: "bot".into(),
+                },
+                intent: crate::workspace::InputIntent::Continue,
+                sequence: 1,
+                expected_revision: None,
+                text: "Read the attached file".into(),
+                attachments: vec![attachment],
+                report_results: Some(false),
+                attestation: None,
+            },
+        )?;
+        let file_event =
+            sent_events.append_event(&sender, &network, "source", input, vec![blob.clone()], 4)?;
+        let (file_message, file_message_capsule) = source
+            .delivery
+            .seal_session_event(
+                &source,
+                &network,
+                &file_event,
+                receiver_peer,
+                relay_peer,
+                at..(at + 60_000),
+            )
+            .await?;
+        source
+            .delivery
+            .upload_session_object(&source, &file_message, &file_message_capsule)
+            .await?;
+        let (file_message, file_message_capsule) = target
+            .delivery
+            .download_session_object(&target, relay_peer, file_message.header.object_id)
+            .await?;
+        let missing = target.delivery.ingest_session_event(
+            &mut received_events,
+            &network,
+            &file_message,
+            &file_message_capsule,
+            now_ms()?,
+        )?;
+        assert_eq!(missing.sync.statuses, [IngestStatus::Accepted]);
+        assert!(missing.stored_receipt.is_none());
+        assert!(!received_events.has_blob(&blob)?);
+        let route = SessionRoute {
+            network: network.clone(),
+            recipient: receiver_peer,
+            relay: relay_peer,
+            validity: at..(at + 60_000),
+        };
+        let parts = source
+            .delivery
+            .seal_session_attachment(&source, &route, &file_event, &blob, &content)
+            .await?;
+        let mut downloaded_parts = Vec::new();
+        for (object, capsule) in &parts {
+            assert!(object.header.chunk_count > 1);
+            assert!(
+                !object
+                    .ciphertext
+                    .windows(b"private session attachment".len())
+                    .any(|window| window == b"private session attachment")
+            );
+            source
+                .delivery
+                .upload_session_object(&source, object, capsule)
+                .await?;
+            downloaded_parts.push(
+                target
+                    .delivery
+                    .download_session_object(&target, relay_peer, object.header.object_id)
+                    .await?,
+            );
+        }
+        assert!(
+            target
+                .delivery
+                .ingest_session_attachment(
+                    &mut received_events,
+                    &network,
+                    &file_event.hash,
+                    &blob,
+                    &[],
+                    now_ms()?,
+                )
+                .is_err()
+        );
+        assert!(!received_events.has_blob(&blob)?);
+        let acknowledgments = target.delivery.ingest_session_attachment(
+            &mut received_events,
+            &network,
+            &file_event.hash,
+            &blob,
+            &downloaded_parts,
+            now_ms()?,
+        )?;
+        drop(received_events);
+        let mut received_events = Store::open(&receiver_events)?;
+        assert_eq!(
+            received_events.read_blob(&network, "source", &blob.hash)?.1,
+            content
+        );
+        for ((object, _), receipt) in downloaded_parts.iter().zip(acknowledgments) {
+            target
+                .delivery
+                .acknowledge_session_object(&target, object, receipt.clone())
+                .await?;
+            assert_eq!(
+                source
+                    .delivery
+                    .session_object_receipt(&source, object)
+                    .await?,
+                Some(receipt)
+            );
+        }
+        assert!(
+            target
+                .delivery
+                .ingest_session_event(
+                    &mut received_events,
+                    &network,
+                    &file_message,
+                    &file_message_capsule,
+                    now_ms()?,
+                )?
+                .stored_receipt
+                .is_some()
+        );
         assert!(!relay_dir.join("delivery-wallet.json").exists());
         assert!(!relay_dir.join("delivery/service.sqlite3").exists());
         source.shutdown().await;
         target.shutdown().await;
         relay.shutdown().await;
-        drop((source, target, relay));
+        drop((source, target, relay, sent_events, received_events));
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

@@ -4,6 +4,7 @@ mod charity;
 mod keys;
 mod orders;
 pub mod session;
+mod session_attachment;
 mod session_relay;
 mod session_relay_store;
 pub use keys::KeyAction;

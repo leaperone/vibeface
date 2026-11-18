@@ -220,6 +220,10 @@ impl SessionObjectHeader {
 }
 
 impl EncryptedSessionObject {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "binds every signed manifest field at construction"
+    )]
     pub fn new(
         kind: SessionObjectKind,
         session_id: String,

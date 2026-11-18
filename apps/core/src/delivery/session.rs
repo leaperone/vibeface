@@ -4,7 +4,7 @@ pub(crate) use super::charity::CharityKey;
 use super::{Delivery, session_relay_store::RELAY_CHUNK_BYTES, types::Mode};
 use crate::{
     crypto::{LocalIdentity, check_event, verify_event_signature},
-    model::{Event, EventBody, IngestStatus, SignedEvent},
+    model::{BlobRef, Event, EventBody, IngestStatus, SignedEvent},
     runtime::Runtime,
     store::{Ingested, Store},
 };
@@ -191,6 +191,19 @@ impl Delivery {
         now_ms: u64,
     ) -> Result<SessionIngested> {
         self.ensure_mode(Mode::Charity)?;
+        let secret = self.object_receiving_secret(object)?;
+        ingest_event(
+            store,
+            &self.identity,
+            network,
+            object,
+            &secret,
+            capsule,
+            now_ms,
+        )
+    }
+
+    fn object_receiving_secret(&self, object: &EncryptedSessionObject) -> Result<Secret32> {
         let header = &object.header;
         verify_object(object)?;
         ensure!(
@@ -201,20 +214,115 @@ impl Delivery {
             .ciphertext
             .first_chunk()
             .context("session key identifier is missing")?;
-        let secret = self.session_receiving_secret(
+        self.session_receiving_secret(
             &header.receiver_peer,
             key_id,
             header.created_at_ms..header.expires_at_ms,
-        )?;
-        ingest_event(
-            store,
-            &self.identity,
-            network,
-            object,
-            &secret,
-            capsule,
-            now_ms,
         )
+    }
+
+    /// Seal all parts of one file named by the original signed event.
+    pub async fn seal_session_attachment(
+        &self,
+        node: &Runtime,
+        route: &SessionRoute,
+        event: &SignedEvent,
+        blob: &BlobRef,
+        bytes: &[u8],
+    ) -> Result<Vec<SealedSessionObject>> {
+        self.ensure_mode(Mode::Charity)?;
+        let checked = checked_event(&route.network, event)?;
+        ensure!(
+            checked.author == self.identity.device_id()?,
+            "session sender is not the event author"
+        );
+        verify_event_signature(event, &checked.author)?;
+        ensure!(
+            checked.blobs.contains(blob),
+            "file is not referenced by the signed event"
+        );
+        let key = Self::session_receiving_key(node, &hex::encode(route.recipient)).await?;
+        let parts = super::session_attachment::encode_parts(
+            &super::types::parse_word(&event.hash)?,
+            blob,
+            bytes,
+        )?;
+        parts
+            .iter()
+            .map(|part| {
+                seal_payload(
+                    &self.identity,
+                    route,
+                    SessionObjectKind::Attachment,
+                    &checked.scope_id,
+                    &key,
+                    part,
+                )
+            })
+            .collect()
+    }
+
+    /// Apply a complete file to an already admitted event. Attachment transfer does not run the Bot.
+    pub fn ingest_session_attachment(
+        &self,
+        store: &mut Store,
+        network: &str,
+        event_hash: &str,
+        blob: &BlobRef,
+        parts: &[SealedSessionObject],
+        now_ms: u64,
+    ) -> Result<Vec<SessionStoredReceipt>> {
+        self.ensure_mode(Mode::Charity)?;
+        super::session_attachment::check_count(blob, parts.len())?;
+        let signed = store
+            .event(network, event_hash)?
+            .context("session attachment event is missing")?;
+        let event = checked_event(network, &signed)?;
+        let effective: bool = store.connection.query_row(
+            "SELECT effective FROM events WHERE network_id=? AND hash=?",
+            params![network, event_hash],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            effective && event.blobs.contains(blob),
+            "file is not referenced by an effective event"
+        );
+        let author = super::types::parse_word(&event.author)?;
+        let mut opened = Vec::with_capacity(parts.len());
+        for (index, (object, capsule)) in parts.iter().enumerate() {
+            ensure!(
+                object.header.kind == SessionObjectKind::Attachment
+                    && object.header.conversation_id == event.scope_id
+                    && object.header.sender_peer == author,
+                "attachment object does not match its signed event"
+            );
+            let size = super::session_attachment::part_size(blob, index)?;
+            ensure!(
+                object.ciphertext.len()
+                    == size + 64 + 12 + vibeface_delivery::SESSION_AEAD_TAG_BYTES,
+                "incorrect encrypted attachment extent"
+            );
+            let secret = self.object_receiving_secret(object)?;
+            opened.push(open_payload(
+                store,
+                &self.identity,
+                network,
+                object,
+                &secret,
+                capsule,
+                now_ms,
+            )?);
+        }
+        let file = super::session_attachment::assemble(
+            &super::types::parse_word(event_hash)?,
+            blob,
+            &opened,
+        )?;
+        store.put_blob(blob, &file)?;
+        parts
+            .iter()
+            .map(|(object, _)| sign_storage_receipt(&self.identity, object.header.object_id))
+            .collect()
     }
 }
 
@@ -234,18 +342,56 @@ pub(crate) fn seal_event(
         "session sender is not the event author"
     );
     verify_event_signature(signed, &event.author)?;
-    let (key_id, public_key) = receiving_key.session_material(&recipient, validity.clone())?;
+    let payload = Zeroizing::new(serde_json::to_vec(signed)?);
+    seal_payload(
+        sender,
+        &SessionRoute {
+            network: network.into(),
+            recipient,
+            relay,
+            validity,
+        },
+        kind_for_event(&event.body)?,
+        &event.scope_id,
+        receiving_key,
+        &payload,
+    )
+}
+
+pub struct SessionRoute {
+    pub network: String,
+    pub recipient: Word,
+    pub relay: Word,
+    pub validity: std::ops::Range<u64>,
+}
+
+pub type SealedSessionObject = (EncryptedSessionObject, [u8; CAPSULE_BYTES]);
+
+fn seal_payload(
+    sender: &LocalIdentity,
+    route: &SessionRoute,
+    kind: SessionObjectKind,
+    scope: &str,
+    receiving_key: &CharityKey,
+    payload: &[u8],
+) -> Result<SealedSessionObject> {
+    let SessionRoute {
+        network,
+        recipient,
+        relay,
+        validity,
+    } = route;
+    let (key_id, public_key) = receiving_key.session_material(recipient, validity.clone())?;
     let key = Secret32::new(super::random_word())?;
     let seed = Secret32::new(super::random_word())?;
     let capsule = seal_session_key(
         &public_key,
-        &capsule_context(&recipient, &key_id),
+        &capsule_context(recipient, &key_id),
         &key,
         &seed,
     )?;
     let mut nonce = [0; 12];
     OsRng.fill_bytes(&mut nonce);
-    let plaintext = Zeroizing::new(serde_json::to_vec(signed)?);
     let mut ciphertext = key_id.to_vec();
     ciphertext.extend_from_slice(&hash(&capsule));
     ciphertext.extend_from_slice(&nonce);
@@ -253,20 +399,20 @@ pub(crate) fn seal_event(
         key.as_bytes(),
         nonce,
         AEAD_DOMAIN,
-        &plaintext,
+        payload,
     )?);
     let object = EncryptedSessionObject::new(
-        kind_for_event(&event.body)?,
-        network.into(),
-        event.scope_id,
+        kind,
+        network.clone(),
+        scope.into(),
         0,
         [0; 32],
-        hex::decode(event.author)?
+        hex::decode(sender.device_id()?)?
             .try_into()
             .ok()
             .context("invalid sender peer")?,
-        recipient,
-        relay,
+        *recipient,
+        *relay,
         validity.start,
         validity.end,
         ciphertext,
@@ -314,21 +460,27 @@ impl SessionStoredReceipt {
     }
 }
 
+fn sign_storage_receipt(receiver: &LocalIdentity, object_id: Word) -> Result<SessionStoredReceipt> {
+    Ok(SessionStoredReceipt {
+        object_id,
+        signature: receiver.sign_payload(RECEIPT_DOMAIN, &object_id)?,
+    })
+}
+
 pub struct SessionIngested {
     pub sync: Ingested,
     pub stored_receipt: Option<SessionStoredReceipt>,
 }
 
-/// Pass the decrypted, original signed event to the ordinary sync authorization and DAG.
-pub fn ingest_event(
-    store: &mut Store,
+fn open_payload(
+    store: &Store,
     receiver: &LocalIdentity,
     network: &str,
     object: &EncryptedSessionObject,
     secret: &Secret32,
     capsule: &[u8; CAPSULE_BYTES],
     now_ms: u64,
-) -> Result<SessionIngested> {
+) -> Result<Zeroizing<Vec<u8>>> {
     let header = &object.header;
     let recipient = receiver.device_id()?;
     ensure!(
@@ -364,12 +516,27 @@ pub fn ingest_event(
     let (nonce, ciphertext) = ciphertext
         .split_at_checked(12)
         .context("session nonce is missing")?;
-    let plaintext = Zeroizing::new(decrypt_session_payload(
+    Ok(Zeroizing::new(decrypt_session_payload(
         key.as_bytes(),
         nonce.try_into()?,
         AEAD_DOMAIN,
         ciphertext,
-    )?);
+    )?))
+}
+
+/// Pass the decrypted, original signed event to the ordinary sync authorization and DAG.
+pub fn ingest_event(
+    store: &mut Store,
+    receiver: &LocalIdentity,
+    network: &str,
+    object: &EncryptedSessionObject,
+    secret: &Secret32,
+    capsule: &[u8; CAPSULE_BYTES],
+    now_ms: u64,
+) -> Result<SessionIngested> {
+    let plaintext = open_payload(store, receiver, network, object, secret, capsule, now_ms)?;
+    let header = &object.header;
+    let sender = hex::encode(header.sender_peer);
     let signed: SignedEvent = serde_json::from_slice(&plaintext)?;
     let event = checked_event(network, &signed)?;
     ensure!(
@@ -408,10 +575,7 @@ pub fn ingest_event(
                     // Sync can use size as a readiness hint. Receipts require content integrity.
                     store.read_blob(network, &event.scope_id, &blob.hash)?;
                 }
-                stored_receipt = Some(SessionStoredReceipt {
-                    object_id: header.object_id,
-                    signature: receiver.sign_payload(RECEIPT_DOMAIN, &header.object_id)?,
-                });
+                stored_receipt = Some(sign_storage_receipt(receiver, header.object_id)?);
             }
         }
     }
