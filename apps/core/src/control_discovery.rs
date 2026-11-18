@@ -5,7 +5,9 @@
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use std::{
     collections::BTreeMap,
     fs,
