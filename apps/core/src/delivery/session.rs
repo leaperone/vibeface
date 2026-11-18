@@ -5,7 +5,36 @@
 
 use crate::model::EventBody;
 use anyhow::{Result, bail};
-use vibeface_delivery::{MAX_SESSION_OBJECT_BYTES, SessionObjectKind};
+use vibeface_delivery::{
+    EncryptedSessionObject, MAX_SESSION_OBJECT_BYTES, SessionObjectKind, Word,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSignatureVerification {
+    Verified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionIdempotency {
+    New,
+    AlreadySeen,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboundSessionReceipt {
+    pub object_id: Word,
+    pub kind: SessionObjectKind,
+    pub conversation_id: String,
+    pub sender_peer: Word,
+    pub receiver_peer: Word,
+    pub payload_hash: Word,
+    pub signature_verification: SessionSignatureVerification,
+    pub received_at_ms: u64,
+    pub idempotency: SessionIdempotency,
+}
 
 /// Classify the event kinds that may cross an encrypted session relay.
 pub fn kind_for_event(event: &EventBody) -> Result<SessionObjectKind> {
@@ -60,10 +89,50 @@ pub fn decode_event_payload(expected_kind: SessionObjectKind, payload: &[u8]) ->
     Ok(event)
 }
 
+/// Verify and classify one decrypted inbound object without writing it anywhere.
+pub fn accept_inbound_session_object(
+    object: &EncryptedSessionObject,
+    expected_kind: SessionObjectKind,
+    decrypted_payload: &[u8],
+    sender_peer: &Word,
+    domain: &str,
+    chunk_bytes: usize,
+    received_at_ms: u64,
+    seen_object_ids: &[Word],
+) -> Result<InboundSessionReceipt> {
+    anyhow::ensure!(
+        object.header.sender_peer == *sender_peer,
+        "session object sender does not match the verifying peer"
+    );
+    object.validate(chunk_bytes)?;
+    object.verify_signature(sender_peer, domain, chunk_bytes)?;
+    decode_event_payload(expected_kind, decrypted_payload)?;
+    let idempotency = if seen_object_ids
+        .iter()
+        .any(|seen| *seen == object.header.object_id)
+    {
+        SessionIdempotency::AlreadySeen
+    } else {
+        SessionIdempotency::New
+    };
+    Ok(InboundSessionReceipt {
+        object_id: object.header.object_id,
+        kind: object.header.kind,
+        conversation_id: object.header.conversation_id.clone(),
+        sender_peer: object.header.sender_peer,
+        receiver_peer: object.header.receiver_peer,
+        payload_hash: object.header.payload_hash,
+        signature_verification: SessionSignatureVerification::Verified,
+        received_at_ms,
+        idempotency,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{EventBody, Role};
+    use ed25519_dalek::{Signer, SigningKey};
 
     fn message() -> EventBody {
         EventBody::MessagePosted {
@@ -168,5 +237,109 @@ mod tests {
         .unwrap();
         assert!(decode_event_payload(SessionObjectKind::ConversationState, &unsupported).is_err());
         assert!(decode_event_payload(SessionObjectKind::Message, &[]).is_err());
+    }
+
+    fn signed_message_object() -> (EncryptedSessionObject, EventBody, Word) {
+        let event = message();
+        let payload = event_payload(&event).unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let sender = key.verifying_key().to_bytes();
+        let object = EncryptedSessionObject::new(
+            SessionObjectKind::Message,
+            "network-1".into(),
+            "conversation-1".into(),
+            0,
+            [0; 32],
+            sender,
+            [2; 32],
+            [3; 32],
+            100,
+            200,
+            payload,
+            32,
+        )
+        .unwrap();
+        let signature = key.sign(
+            &vibeface_delivery::signing_message(
+                "session-object",
+                &object.signing_bytes(32).unwrap(),
+            )
+            .unwrap(),
+        );
+        (
+            object.with_signature(vibeface_delivery::PeerSignature::from_bytes(
+                signature.to_bytes(),
+            )),
+            event,
+            sender,
+        )
+    }
+
+    #[test]
+    fn accepts_new_and_repeated_inbound_objects_idempotently() {
+        let (object, event, sender) = signed_message_object();
+        let payload = event_payload(&event).unwrap();
+        let first = accept_inbound_session_object(
+            &object,
+            SessionObjectKind::Message,
+            &payload,
+            &sender,
+            "session-object",
+            32,
+            300,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            first.signature_verification,
+            SessionSignatureVerification::Verified
+        );
+        assert_eq!(first.idempotency, SessionIdempotency::New);
+        let retry = accept_inbound_session_object(
+            &object,
+            SessionObjectKind::Message,
+            &payload,
+            &sender,
+            "session-object",
+            32,
+            301,
+            &[object.header.object_id],
+        )
+        .unwrap();
+        assert_eq!(retry.idempotency, SessionIdempotency::AlreadySeen);
+        assert_eq!(retry.object_id, first.object_id);
+    }
+
+    #[test]
+    fn rejects_inbound_objects_with_bad_signature_or_payload_kind() {
+        let (object, event, sender) = signed_message_object();
+        let payload = event_payload(&event).unwrap();
+        let wrong_sender = [9; 32];
+        assert!(
+            accept_inbound_session_object(
+                &object,
+                SessionObjectKind::Message,
+                &payload,
+                &wrong_sender,
+                "session-object",
+                32,
+                300,
+                &[],
+            )
+            .is_err()
+        );
+        assert!(
+            accept_inbound_session_object(
+                &object,
+                SessionObjectKind::BotSettings,
+                &payload,
+                &sender,
+                "session-object",
+                32,
+                300,
+                &[],
+            )
+            .is_err()
+        );
     }
 }
