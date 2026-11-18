@@ -5,7 +5,7 @@
 
 use crate::model::EventBody;
 use anyhow::{Result, bail};
-use vibeface_delivery::SessionObjectKind;
+use vibeface_delivery::{MAX_SESSION_OBJECT_BYTES, SessionObjectKind};
 
 /// Classify the event kinds that may cross an encrypted session relay.
 pub fn kind_for_event(event: &EventBody) -> Result<SessionObjectKind> {
@@ -42,6 +42,22 @@ pub fn event_payload(event: &EventBody) -> Result<Vec<u8>> {
 /// Return the payload kind and canonical JSON bytes for a relay object.
 pub fn event_object_payload(event: &EventBody) -> Result<(SessionObjectKind, Vec<u8>)> {
     Ok((kind_for_event(event)?, event_payload(event)?))
+}
+
+/// Decode a previously decrypted relay payload and enforce its declared class.
+///
+/// This is still a pure boundary check. It does not persist the event or run
+/// the Bot scheduler.
+pub fn decode_event_payload(expected_kind: SessionObjectKind, payload: &[u8]) -> Result<EventBody> {
+    if payload.is_empty() || payload.len() > MAX_SESSION_OBJECT_BYTES {
+        bail!("encrypted session event payload size is invalid");
+    }
+    let event: EventBody = serde_json::from_slice(payload)?;
+    let actual_kind = kind_for_event(&event)?;
+    if actual_kind != expected_kind {
+        bail!("encrypted session event kind does not match its envelope");
+    }
+    Ok(event)
 }
 
 #[cfg(test)]
@@ -114,5 +130,43 @@ mod tests {
         };
         assert_eq!(kind_for_event(&event).unwrap(), SessionObjectKind::Message);
         assert!(!event_payload(&event).unwrap().is_empty());
+    }
+
+    #[test]
+    fn decodes_message_and_bot_message_payloads_at_the_boundary() {
+        let message = message();
+        let decoded = decode_event_payload(
+            SessionObjectKind::Message,
+            &event_payload(&message).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded, message);
+
+        let bot = EventBody::BotMessaged {
+            message_id: "bot-message-1".into(),
+            from: crate::model::Sender {
+                conversation_id: "source".into(),
+                name: "Helper".into(),
+            },
+            text: "handoff".into(),
+            hops: 0,
+        };
+        let decoded =
+            decode_event_payload(SessionObjectKind::Message, &event_payload(&bot).unwrap())
+                .unwrap();
+        assert_eq!(decoded, bot);
+    }
+
+    #[test]
+    fn decode_rejects_mismatch_malformed_and_unsupported_payloads() {
+        let bytes = event_payload(&message()).unwrap();
+        assert!(decode_event_payload(SessionObjectKind::BotSettings, &bytes).is_err());
+        assert!(decode_event_payload(SessionObjectKind::Message, b"not json").is_err());
+        let unsupported = serde_json::to_vec(&EventBody::ConversationCreated {
+            title: "chat".into(),
+        })
+        .unwrap();
+        assert!(decode_event_payload(SessionObjectKind::ConversationState, &unsupported).is_err());
+        assert!(decode_event_payload(SessionObjectKind::Message, &[]).is_err());
     }
 }
