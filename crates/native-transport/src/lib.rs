@@ -66,7 +66,7 @@ impl LanEndpoint {
         })
     }
 
-    pub fn from_endpoint(endpoint: Endpoint) -> Self {
+    fn from_endpoint(endpoint: Endpoint) -> Self {
         Self { endpoint }
     }
 
@@ -106,10 +106,6 @@ impl LanEndpoint {
             .await
             .map_err(|_| LanError::TimedOut)?
     }
-}
-
-pub async fn bind_lan_endpoint() -> Result<Endpoint, BindError> {
-    Ok(LanEndpoint::bind().await?.endpoint)
 }
 
 pub async fn lan_connect(
@@ -202,12 +198,7 @@ impl FrameReader {
     }
     async fn read_frame(&mut self) -> Result<Option<ParsedFrame>, LanError> {
         while self.header_read < HEADER_BYTES {
-            let end = self.header_read + 1;
-            match self
-                .recv
-                .read(&mut self.header[self.header_read..end])
-                .await
-            {
+            match self.recv.read(&mut self.header[self.header_read..]).await {
                 Ok(Some(0)) | Ok(None) => {
                     return if self.header_read == 0 {
                         Ok(None)
@@ -228,12 +219,7 @@ impl FrameReader {
             self.payload_len = Some(header.payload_len());
         }
         while self.payload_read < self.payload.len() {
-            let end = self.payload_read + 1;
-            match self
-                .recv
-                .read(&mut self.payload[self.payload_read..end])
-                .await
-            {
+            match self.recv.read(&mut self.payload[self.payload_read..]).await {
                 Ok(Some(0)) | Ok(None) => {
                     return Err(LanError::Transport(format!(
                         "stream finished early ({} bytes read)",
@@ -337,6 +323,13 @@ impl LanStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh::{
+        SecretKey,
+        endpoint::{RecvStream, SendStream},
+    };
+    use std::net::Ipv4Addr;
+
+    const CONTEXT: &[u8] = b"vibeface:client:v1";
     #[test]
     fn outgoing_queue_holds_a_maximum_message_without_a_writer() {
         let (outgoing, mut queue) = Outgoing::new();
@@ -390,6 +383,7 @@ mod tests {
 
     async fn loopback_endpoints() -> (Endpoint, Endpoint) {
         let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![ALPN.to_vec()])
             .relay_mode(RelayMode::Disabled)
             .clear_ip_transports()
             .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -406,6 +400,123 @@ mod tests {
             .await
             .unwrap();
         (server, client)
+    }
+
+    async fn loopback_node(secret_key: SecretKey) -> Endpoint {
+        Endpoint::builder(presets::Minimal)
+            .secret_key(secret_key)
+            .alpns(vec![ALPN.to_vec()])
+            .relay_mode(RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap()
+    }
+
+    async fn write_binary(send: &mut SendStream, data: &[u8]) {
+        let header = encode_header(FrameKind::Binary, data.len()).unwrap();
+        send.write_all(&frame(header, data)).await.unwrap();
+    }
+
+    async fn read_wire_frame(recv: &mut RecvStream) -> (FrameKind, Vec<u8>) {
+        let mut raw = [0; HEADER_BYTES];
+        recv.read_exact(&mut raw).await.unwrap();
+        let header = decode_header(raw).unwrap();
+        let mut data = vec![0; header.payload_len()];
+        recv.read_exact(&mut data).await.unwrap();
+        (header.kind().unwrap(), data)
+    }
+
+    fn node_id(seed: &[u8; 32]) -> String {
+        hex::encode(SecretKey::from_bytes(seed).public().as_bytes())
+    }
+
+    #[tokio::test]
+    async fn a_noise_session_runs_over_a_direct_stream() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let node = secure::Identity::generate().unwrap();
+            let seed: [u8; 32] = hex::decode(node.secret_hex()).unwrap().try_into().unwrap();
+            let server = loopback_node(SecretKey::from_bytes(&seed)).await;
+            let address = server.bound_sockets()[0].to_string();
+            let serving = tokio::spawn(async move {
+                let connection = loop {
+                    let incoming = server.accept().await.unwrap();
+                    if let Ok(connection) = incoming.await {
+                        break connection;
+                    }
+                };
+                let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+                let mut handshake = secure::Handshake::signed(false, &node, None, CONTEXT).unwrap();
+                let (kind, first) = read_wire_frame(&mut recv).await;
+                assert_eq!(kind, FrameKind::Binary);
+                handshake.read(&first).unwrap();
+                write_binary(&mut send, &handshake.write(&[]).unwrap()).await;
+                let (kind, last) = read_wire_frame(&mut recv).await;
+                assert_eq!(kind, FrameKind::Binary);
+                handshake.read(&last).unwrap();
+                let mut channel = handshake.finish().unwrap();
+                send.write_all(&[2, 0, 0, 0, 0]).await.unwrap();
+                let (kind, pong) = read_wire_frame(&mut recv).await;
+                assert_eq!(kind, FrameKind::Pong);
+                assert!(pong.is_empty());
+                for record in channel.seal_message(b"reply").unwrap() {
+                    write_binary(&mut send, &record).await;
+                }
+                send.write_all(&[
+                    3, 0, 0, 0, 1, 0xff, 1, 0, 0, 0, 1, 0xff, 4, 0, 0, 0, 1, 0xff, 0, 0, 0, 0, 0,
+                ])
+                .await
+                .unwrap();
+                send.finish().unwrap();
+                connection.closed().await;
+            });
+
+            let phone = secure::Identity::generate().unwrap();
+            let unreachable = lan_connect(
+                phone.device_id().as_str(),
+                &[address.clone()],
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(unreachable.is_err(), "another device key must not answer");
+            let target = node_id(&seed);
+            let stream = lan_connect(&target, &[address], Duration::from_secs(5))
+                .await
+                .unwrap();
+            let mut client =
+                secure::Handshake::signed(true, &phone, Some(target.clone()), CONTEXT).unwrap();
+            client
+                .set_proof(
+                    phone.device_id().as_str(),
+                    &phone.sign_message(&client.signing_bytes()),
+                )
+                .unwrap();
+            stream.send(client.write(&[]).unwrap()).unwrap();
+            let reply = stream.recv().await.unwrap().unwrap();
+            assert!(!reply.text);
+            client.read(&reply.data).unwrap();
+            stream.send(client.write(&[]).unwrap()).unwrap();
+            let mut channel = client.finish().unwrap();
+            let record = stream.recv().await.unwrap().unwrap();
+            assert_eq!(
+                channel.open_record(&record.data).unwrap(),
+                Some(b"reply".to_vec())
+            );
+            let text = stream.recv().await.unwrap().unwrap();
+            assert!(text.text);
+            assert_eq!(text.data, [0xff]);
+            assert!(matches!(stream.recv().await, Err(LanError::UnknownFrame)));
+            let empty = stream.recv().await.unwrap().unwrap();
+            assert!(!empty.text);
+            assert!(empty.data.is_empty());
+            assert!(stream.recv().await.unwrap().is_none());
+            stream.close();
+            serving.await.unwrap();
+        })
+        .await
+        .expect("direct stream fixture timed out");
     }
 
     #[tokio::test]
@@ -450,20 +561,29 @@ mod tests {
         },);
         let dialed = dialed.unwrap();
         let accepted = accepted.unwrap();
-        let (client_send, client_recv) = dialed.open_bi().await.unwrap();
+        let (mut client_send, client_recv) = dialed.open_bi().await.unwrap();
+        client_send.write_all(&[0, 0, 0, 0, 0]).await.unwrap();
+        let (mut server_send, _) = accepted.accept_bi().await.unwrap();
         let stream = LanStream::new(
             LanEndpoint::from_endpoint(client),
             dialed,
             client_send,
             client_recv,
         );
-        let (mut server_send, _) = accepted.accept_bi().await.unwrap();
         server_send.write_all(&[0, 0, 0, 0, 2, 0xaa]).await.unwrap();
         let pending = tokio::spawn({
             let stream = stream.clone();
             async move { stream.recv().await }
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                !pending.is_finished(),
+                "partial frame unexpectedly completed"
+            );
+        })
+        .await
+        .expect("partial frame guard timed out");
         pending.abort();
         server_send.write_all(&[0xbb, 0, 0, 0, 0, 0]).await.unwrap();
         server_send.finish().unwrap();

@@ -12,6 +12,9 @@ tokio.workspace = true
 vibeface-protocol.workspace = true
 vibeface-secure = { path = "../secure" }
 
+[dev-dependencies]
+hex.workspace = true
+
 # netdev under iroh reads libc::in6_ifreq on iOS. Keep the known-good App Store pin.
 [target.'cfg(target_os = "ios")'.dependencies]
 libc = "=0.2.189"
