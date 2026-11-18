@@ -101,8 +101,18 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
   const transport = {
     validTarget: (value: string) => value, validEndpoint: (value: string) => value, joinTicket, joinLink,
     initClient: async () => ({ deviceId: key }), signClient: async (purpose: string) => { signatures.push(purpose); return 'signature' },
-    replaceClient: async () => { calls.push('replace-key'); key = freshKey; return { deviceId: key } },
-    parseJoinLink: async () => ({ entryId: target, entryAddrs, inviteId, inviteHash: 'h'.repeat(64), secret: 'one-time-secret' }),
+    replaceClient: async () => {
+      calls.push('replace-key')
+      const replacing = holds.get('replace-key')
+      if (replacing) await replacing.promise
+      key = freshKey
+      return { deviceId: key }
+    },
+    parseJoinLink: async () => {
+      const parsing = holds.get('parse-join-link')
+      if (parsing) await parsing.promise
+      return { entryId: target, entryAddrs, inviteId, inviteHash: 'h'.repeat(64), secret: 'one-time-secret' }
+    },
     async connectDevice(candidate: ConnectionEntry, options: { onClose?(cause: Error): void; signal?: AbortSignal }) {
       calls.push(`open:${candidate.device_id}`)
       let closed = false
@@ -535,6 +545,39 @@ test('a removed computer shows removed on its local page, and rejoining opens it
   } finally { app.close() }
 })
 
+for (const stage of ['open', 'rejoin']) for (const replace of [true, false]) test(`local rejoin ${stage} failure ${replace ? 'leaves a newer connection alone' : 'retains its own generation'}`, async () => {
+  const app = deviceHarness({ local: 'initialized' }), hold = deferred()
+  try {
+    app.render(); await settle()
+    const verifyRemoval = app.secure.verifyRemoval
+    app.secure.verifyRemoval = () => true
+    await app.render().connect({ ...localEntry, kind: 'local' })
+    app.secure.verifyRemoval = verifyRemoval
+    assert.equal(app.render().phase, 'removed')
+    const start = app.render().connectionGeneration()
+    const changes: { from: number; to: number }[] = []
+    const attempts = app.sockets.length
+    app.holds.set(stage, hold)
+    const work = app.render().rejoin(change => changes.push(plain(change)))
+    const rejected = assert.rejects(work, replace ? /连接已切换/ : /rejoin fixture failed/)
+    if (stage === 'open') await until(() => app.sockets.length > attempts)
+    else await until(() => app.calls.includes('rejoin'))
+    app.holds.delete(stage)
+    if (replace) await app.render().connect({ ...entry, device_id: remote })
+    hold.reject(new Error('rejoin fixture failed'))
+    await rejected
+    if (replace) {
+      assert.deepEqual(changes, [])
+      assert.equal(app.render().ready?.entry.device_id, remote)
+      assert.equal(app.render().phase, 'ready')
+    } else {
+      const expected = stage === 'open' ? [{ from: start, to: start + 1 }, { from: start + 1, to: start + 2 }] : [{ from: start, to: start + 1 }]
+      assert.deepEqual(changes, expected)
+      assert.equal(app.render().phase, 'removed')
+    }
+  } finally { app.close() }
+})
+
 test('local launch metadata rejects an unrelated node, unsafe address, or malformed token', async () => {
   const invalid = [
     { ...localLaunch, device_id: '0'.repeat(64) },
@@ -718,6 +761,75 @@ test('a link whose entry Node listens at addresses is checked and joined straigh
   } finally { app.close() }
 })
 
+test('a foreground join keeps ownership when its LAN transport closes, then only submits through Gateway', async () => {
+  const app = deviceHarness({ entryAddrs: ['192.168.1.4:7001'] }), lan = deferred()
+  try {
+    app.render(); await settle()
+    app.holds.set('open', lan)
+    const changes: { from: number; to: number }[] = []
+    const start = app.render().connectionGeneration()
+    const join = app.render().join('vibeface://join/vibeface1ticket', 'browser', change => changes.push(plain(change)))
+    await until(() => app.sockets.length === 1)
+    app.sockets[0].drop()
+    app.holds.delete('open')
+    lan.reject(new Error('LAN unavailable'))
+    await join
+    assert.deepEqual(app.sockets.map(socket => socket.entry.kind), ['lan', 'gateway'])
+    assert.deepEqual(changes, [
+      { from: start, to: start + 1 },
+      { from: start + 1, to: start + 2 },
+      { from: start + 2, to: start + 3 },
+    ])
+    assert.equal(app.render().joining?.status, 'pending')
+    assert.equal(app.calls.filter(call => call === 'join').length, 1)
+  } finally { app.close() }
+})
+
+for (const invalidatedBy of ['manual connection', 'disconnect', 'unmount']) test(`a stale LAN join cannot open its Gateway after ${invalidatedBy}`, async () => {
+  const app = deviceHarness({ entryAddrs: ['192.168.1.4:7001'] }), lan = deferred()
+  try {
+    app.render(); await settle()
+    app.holds.set('open', lan)
+    const join = app.render().join('vibeface://join/vibeface1ticket', 'browser')
+    const rejected = assert.rejects(join, /连接已切换/)
+    await until(() => app.sockets.length === 1)
+    app.holds.delete('open')
+    if (invalidatedBy === 'manual connection') await app.render().connect({ ...entry, device_id: remote })
+    else if (invalidatedBy === 'disconnect') app.render().disconnect()
+    else app.close()
+    const attempts = app.sockets.length
+    lan.reject(new Error('LAN unavailable'))
+    await rejected
+    assert.equal(app.sockets.length, attempts)
+    assert.equal(app.calls.includes('join'), false)
+    if (invalidatedBy === 'manual connection') assert.equal(app.render().ready?.entry.device_id, remote)
+    if (invalidatedBy === 'disconnect') assert.equal(app.render().phase, 'disconnected')
+  } finally { if (invalidatedBy !== 'unmount') app.close() }
+})
+
+for (const stage of ['parse-join-link', 'replace-key']) test(`join cannot take a newer connection after awaiting ${stage}`, async () => {
+  const app = deviceHarness({ removed: stage === 'replace-key' }), hold = deferred()
+  try {
+    app.render(); await settle()
+    if (stage === 'parse-join-link') app.holds.set('parse-join-link', hold)
+    else app.holds.set('replace-key', hold)
+    const join = app.render().join('vibeface://join/vibeface1ticket', 'browser')
+    const rejected = assert.rejects(join, /连接已切换/)
+    if (stage === 'replace-key') await until(() => app.calls.includes('replace-key'))
+    else await settle()
+    const accepted = deferred(); accepted.resolve({ principal: { device_id: subject } })
+    app.holds.set('authenticate', accepted)
+    await app.render().connect({ ...entry, device_id: remote })
+    const attempts = app.sockets.length
+    hold.resolve(null)
+    await rejected
+    assert.equal(app.sockets.length, attempts)
+    assert.equal(app.render().ready?.entry.device_id, remote)
+    assert.equal(app.render().identity?.deviceId, subject)
+    assert.equal(app.calls.includes('join'), false)
+  } finally { app.close() }
+})
+
 test('this computer asks its own Node about a link, with the page capability, and never joins to find out', async () => {
   const app = deviceHarness({ local: 'fresh' })
   try {
@@ -746,6 +858,34 @@ test('this computer\'s join asks again after a lost answer and explains a failur
     const asked = app.requests.filter(request => request.method === 'node_join').map(request => plain(request.params))
     assert.equal(asked.length, 2)
     assert.deepEqual(asked[1], asked[0], 'the same link again only reads how far the join got')
+  } finally { app.close() }
+})
+
+for (const stage of ['node_join', 'local_setup']) test(`a stale local Node join cannot clear the next code or launch after ${stage}`, async () => {
+  const app = deviceHarness({ local: 'fresh' }), hold = deferred()
+  try {
+    app.render(); await until(() => app.render().localSetup?.kind === 'uninitialized')
+    if (stage === 'node_join') app.holds.set('node_join', hold)
+    else {
+      const joined = deferred(); joined.resolve({ status: 'joined' }); app.holds.set('node_join', joined)
+      app.holds.set('local_setup', hold)
+    }
+    const earlier = app.render().joinThisComputer('vibeface://join/vibeface1ticket', 'earlier')
+    const obsolete = assert.rejects(earlier, /连接已切换/)
+    if (stage === 'node_join') await until(() => app.calls.includes('node_join'))
+    else await until(() => app.calls.filter(call => call === 'local_setup').length === 2)
+
+    const waiting = deferred(); waiting.resolve({ status: 'confirming', code: '123456' }); app.holds.set('node_join', waiting)
+    const newer = app.render().joinThisComputer('vibeface://join/vibeface1replacement', 'newer')
+    await until(() => app.render().nodeJoining?.code === '123456')
+    if (stage === 'node_join') hold.reject(new Error('connection lost'))
+    else hold.resolve({ kind: 'initialized', removed: false, entry: localEntry, local_launch: localLaunch })
+    await obsolete
+    assert.equal(app.render().nodeJoining?.code, '123456')
+    assert.equal(app.navigations.length, 0)
+    const cancelled = deferred(); cancelled.resolve({ status: 'cancelled' }); app.holds.set('node_join', cancelled)
+    for (const [id, tick] of app.timers) { app.timers.delete(id); tick() }
+    assert.equal(await newer, 'cancelled')
   } finally { app.close() }
 })
 
@@ -1086,7 +1226,10 @@ test('the same file brings a browser that lost its wait record back to the wait'
   app.holds.set('recovery_state', refused); app.holds.set('authenticate', waiting)
   try {
     app.render(); await settle()
-    await app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry })
+    const start = app.render().connectionGeneration()
+    const changes: { from: number; to: number }[] = []
+    await app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry }, change => changes.push(plain(change)))
+    assert.deepEqual(changes, [{ from: start, to: start + 1 }, { from: start + 1, to: start + 2 }])
     assert.equal(app.render().review, null)
     assert.equal(app.render().recovery?.status, 'waiting')
     assert.equal(app.released(), 1, 'the file is closed again')
@@ -1204,6 +1347,63 @@ test('a failed authentication on the re-opened recovery channel leaves polling r
     app.holds.set('authenticate', stopped)
     for (const tick of app.timers.values()) tick()
     await until(() => app.render().recovery?.status === 'stopped')
+    assert.equal(app.calls.includes('recover'), false)
+  } finally { app.close() }
+})
+
+test('a confirmed recovery owns its own waiting handoff and never adopts a second confirmation callback', async () => {
+  const app = deviceHarness(), submitting = deferred()
+  const changes: { from: number; to: number }[] = []
+  try {
+    app.render(); await settle()
+    await app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry })
+    const review = app.render().review
+    assert.ok(review?.kind === 'recovery')
+    const from = app.render().connectionGeneration()
+    app.holds.set('recover', submitting)
+    const first = app.render().confirmRecovery(review.members, change => changes.push(plain(change)))
+    await until(() => app.calls.includes('recover'))
+    const second = app.render().confirmRecovery([], () => assert.fail('the existing submission owns the handoff'))
+    const saved = app.stored.get('vibeface.recovery-wait') ?? ''
+    submitting.resolve({ ...notMember, recovery: { status: 'waiting', checkpoint_hash: checkpointHash(JSON.parse(saved).checkpoint), effective_at_ms: Date.now() + 60_000 } })
+    await Promise.all([first, second])
+    assert.deepEqual(changes, [{ from, to: from + 1 }])
+    assert.equal(app.render().recovery?.status, 'waiting')
+    assert.equal(app.stored.get('vibeface.recovery-wait'), saved)
+    assert.equal(app.calls.filter(call => call === 'recover').length, 1)
+  } finally { app.close() }
+})
+
+for (const background of [false, true]) for (const invalidated of [false, true]) test(`saved recovery ${background ? 'never adopts a background probe' : 'keeps its foreground probe'} ${invalidated ? 'after disconnect' : 'until completion'}`, async () => {
+  const app = deviceHarness(), probe = deferred()
+  const checkpoint = recoveryCheckpointFixture([genesis.first_node, genesis.first_client])
+  const wait = JSON.stringify({ entry: { address: entry.address, device_id: target }, networkId: network, rootKey: network, genesis, checkpoint })
+  const changes: { from: number; to: number }[] = []
+  const auth = { principal: { device_id: subject } }
+  const verifyAuthentication = app.secure.verifyAuthentication
+  app.secure.verifyAuthentication = () => {
+    const verified = verifyAuthentication()
+    return { ...verified, view: { ...verified.view, recovery_key: nextRecoveryKey } }
+  }
+  try {
+    if (background) app.stored.set('vibeface.recovery-wait', wait)
+    app.holds.set('authenticate', probe)
+    app.render(); await settle()
+    const start = app.render().connectionGeneration()
+    if (background) await until(() => app.calls.includes('authenticate'))
+    else app.stored.set('vibeface.recovery-wait', wait)
+    const started = app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry }, change => changes.push(plain(change)))
+    const done = invalidated ? assert.rejects(started, /连接已切换/) : started
+    await settle()
+    if (invalidated) app.render().disconnect()
+    const accepted = deferred(); accepted.resolve(auth); app.holds.set('authenticate', accepted)
+    probe.resolve(auth)
+    await done
+    const expected = background ? [] : invalidated ? [{ from: start, to: start + 1 }] : [{ from: start, to: start + 1 }, { from: start + 1, to: start + 2 }]
+    assert.deepEqual(changes, expected)
+    assert.equal(app.render().recovered, !invalidated)
+    assert.equal(app.stored.get('vibeface.recovery-wait'), invalidated ? wait : 'null')
+    assert.equal(app.calls.filter(call => call === 'authenticate').length, invalidated ? 1 : 2)
     assert.equal(app.calls.includes('recover'), false)
   } finally { app.close() }
 })

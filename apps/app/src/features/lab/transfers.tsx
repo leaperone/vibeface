@@ -62,7 +62,9 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
     if (!file || unusable) return
     setOrigin('form')
     const owner = selection.current!
-    void owner.use(([selected]) => delivery.prepare(draft, selected, restart)).then(success => { if (success && owner.replace([])) setFile(null) }).catch((cause) => setCleanupError(String(cause)))
+    void owner.use(([selected]) => delivery.prepare(draft, selected, restart)).then(success => {
+      if (success && connection.isCurrent() && owner.clearSingle(file)) setFile(null)
+    }).catch(cause => { if (connection.isCurrent()) setCleanupError(String(cause)) })
   }
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
     {feedback('page')}

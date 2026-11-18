@@ -1,5 +1,6 @@
 import type { OwnedPickedFile } from '../platform/files'
 import type { TranscriptMessage } from '@vibeface/client/chat/types.ts'
+import type { useDevice } from '@vibeface/client/identity/context.tsx'
 import type { AnswerResult, BotReadiness, BotRecord, InputOptions, Question, WorkRecord } from '@vibeface/client/workspace/types.ts'
 
 export type { Question }
@@ -66,7 +67,7 @@ type WorkspaceSnapshot = {
 }
 
 export type WorkspaceActions = {
-  join(invitation: string, deviceName: string): Promise<void>
+  join: ReturnType<typeof useDevice>['join']
   cancelJoin(): void
   /** Loads the chat and keeps it live while on screen; reading it acknowledges its notifications. */
   open(conversationId: string): () => void

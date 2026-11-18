@@ -169,7 +169,7 @@ export function RecoveryReview() {
   const [lost, setLost] = useState<string[]>([])
   if (review?.kind !== 'recovery') return null
   // As on the web: the kept devices go as the file listed them, with no choice of who manages.
-  const recover = () => void run('recover', () => device.confirmRecovery(review.members.filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id))))
+  const recover = () => void run('recover', ({ rebind }) => device.confirmRecovery(review.members.filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id)), rebind))
   return <Panel icon={ArchiveRestore} title={recoveryCopy.whichLost}>
     <View className="gap-2">
       {[...review.members].sort((a, b) => Number(b.device_id === review.requiredNode) - Number(a.device_id === review.requiredNode)).map((member) => {

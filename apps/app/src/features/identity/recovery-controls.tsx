@@ -257,7 +257,7 @@ export function RecoveryReview() {
     <InlineError error={error || null} />
     <div className="flex flex-wrap justify-between gap-2">
       <Button type="button" variant="ghost" className="-ms-3" onClick={() => { cancel(); device.cancelSensitive() }}>取消</Button>
-      <Button type="button" disabled={busy} onClick={() => void run('recover', () => device.confirmRecovery(review.members.filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id))))}><BusyIcon busy={busy} />找回</Button>
+      <Button type="button" disabled={busy} onClick={() => void run('recover', ({ rebind }) => device.confirmRecovery(review.members.filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id)), rebind))}><BusyIcon busy={busy} />找回</Button>
     </div>
     {busy ? <p className="text-sm text-secondary">{recoveryCopy.cancelLate}</p> : null}
   </Panel>

@@ -1346,7 +1346,8 @@ test("workspace preserves bot and message requests while routing native decision
       render().setView('other')
       await render().selectBot(botA)
       let shared = render()
-      const device = { get ready() { return activeConnection }, phase: 'ready', link: { kind: 'online' }, entries: [], directory: null, identity: { deviceId: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }, join() {}, cancelJoin() {}, leave() {} }
+      let joinArguments: unknown[] = []
+      const device = { get ready() { return activeConnection }, phase: 'ready', link: { kind: 'online' }, entries: [], directory: null, identity: { deviceId: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }, async join(...args: unknown[]) { joinArguments = args }, cancelJoin() {}, leave() {} }
       const fileReads = new Map<string, ReturnType<typeof deferred>>()
       class SelectedFile { readonly uri: string; constructor(uri: string) { this.uri = uri } arrayBuffer() { const read = fileReads.get(this.uri); assert.ok(read); return read.promise } }
       const bridge = componentHarness('../../../../../apps/mobile/src/data/live.tsx', {
@@ -1371,7 +1372,10 @@ test("workspace preserves bot and message requests while routing native decision
         native = value as NativeWorkspace
         return native
       }
-      mobile()
+      const online = mobile()
+      const bind = () => {}
+      await online.actions.join('vibeface://join/fixture', '手机', bind)
+      assert.deepEqual(joinArguments, ['vibeface://join/fixture', '手机', bind])
       let routine: string | undefined
       const nativeNavigations: string[] = []
       const platform = { OS: 'android' }, insets = { bottom: 0 }, keyboard = { height: { value: 0 }, progress: { value: 0 } }
@@ -2070,8 +2074,10 @@ test('native Offline uses validated display scopes and fences late pending rows 
   const pending = (owner: typeof alpha, text: string) => { const item = { key: `${owner.network_id}.${owner.device_id}:message:${text}`, scope_id: 'chat', method: 'message', created_at_ms: 2, delivery: 'saved', entry_device_id: owner.entry_device_id,
     params: { conversation_id: 'chat', message_id: text, target: { kind: 'bot_main', bot_id: parityBot.bot_id }, intent: 'continue', sequence: 1, text, report_results: true, attestation: { device_id: owner.device_id, signature: '0'.repeat(128) } } }; return decodeOutbox(item, item.key) }
   const reads: ReturnType<typeof pendingResult>[] = []
+  const bind = () => {}
+  let joinArguments: unknown[] = []
   const device = { get displayScope() { return scope }, ready: null, phase: 'reconnecting', entries: [{ kind: 'gateway', device_id: alpha.entry_device_id, address: 'https://node.example' }],
-    link: { kind: 'offline' }, entry: { kind: 'gateway', device_id: alpha.entry_device_id, address: 'https://node.example' }, entryName: () => '工作设备', connectionGeneration: () => 1, join() {}, cancelJoin() {}, leave() {} }
+    link: { kind: 'offline' }, entry: { kind: 'gateway', device_id: alpha.entry_device_id, address: 'https://node.example' }, entryName: () => '工作设备', connectionGeneration: () => 1, join(...args: unknown[]) { joinArguments = args }, cancelJoin() {}, leave() {} }
   select(alpha)
   const app = componentHarness('../../../../../apps/mobile/src/data/live.tsx', {
     '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/identity/access.ts': { accessOf },
@@ -2090,6 +2096,10 @@ test('native Offline uses validated display scopes and fences late pending rows 
   }
   try {
     assert.deepEqual(texts(render()), ['Alpha 已同步正文']); assert.equal(reads.length, 1)
+    const join = workspaceModel.record(render().actions).join
+    assert.ok(typeof join === 'function')
+    await join('vibeface://join/fixture', '手机', bind)
+    assert.deepEqual(joinArguments, ['vibeface://join/fixture', '手机', bind])
     select(beta)
     assert.deepEqual(texts(render()), ['Beta 已同步正文']); assert.equal(reads.length, 2)
     reads[0].resolve([pending(alpha, 'Alpha 迟到待发')]); await settleComponent()
@@ -3113,6 +3123,67 @@ test('delivery reconnect fences old action feedback and releases only the new ac
       assert.equal(toggle()?.disabled, false)
       assert.equal(toggle()?.checked, false)
     }
+  } finally { app.close() }
+})
+
+for (const mobile of [false, true]) for (const settlement of ['current', 'new-file', 'reconnect']) test(`${mobile ? 'Mobile' : 'Web'} transfer prepare settlement honors ${settlement}`, async () => {
+  const path = mobile ? '../../../../../apps/mobile/app/transfers.tsx' : '../lab/transfers.tsx'
+  const page = mobile ? 'Transfers' : 'TransferPage'
+  const files = ['submitted-fixture.txt', 'newer-fixture.txt'].map(name => ({ name, size: 1, dispose() { disposed.push(name) } }))
+  const disposed: string[] = []
+  let fileIndex = 0, current = true
+  const prepared = pendingResult()
+  const calls: string[] = []
+  const delivery = {
+    status: { enabled: true, charity_enabled: true, paid_enabled: false, node_peer: 'sender', wallet: { state: 'absent', address: null }, max_file_bytes: 1024, receiver_key: null },
+    orders: [], budgets: [], providers: [], selected: null, busy: null, canManage: true,
+    prepare(_draft: unknown, file: { name: string }) { calls.push(file.name); return prepared.promise },
+  }
+  const picker = () => ({ busy: null, error: '', run: (_key: string, action: () => Promise<void>) => action() })
+  const platform = { files: { pick: async () => files[fileIndex++] } }
+  const app = componentHarness(path, {
+    '@vibeface/client/delivery/client.ts': { useDelivery: () => delivery },
+    '@vibeface/client/delivery/model.ts': deliveryModel,
+    '@vibeface/client/lib/experiments.ts': { useExperiments: () => [false] },
+    '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
+    '@/platform': { mobilePlatform: platform }, '@/lib/platform': { webPlatform: platform },
+    '@/lib/use-run': { useRun: picker },
+    '@/lib/glossary': { terms: new Proxy({}, { get: (_target, name) => ({ label: String(name), icon: String(name) }) }) },
+    '@/components/arc/product-kit': { Segmented: 'Segmented', useAction: picker, Details: 'Details', BusyIcon: 'BusyIcon' },
+  }, {}, page)
+  const render = () => app.render(page, { connection: { isCurrent: () => current } })
+  const choose = () => {
+    const handler = render().find(({ type, props }) => type === 'Button' && componentText(props.children).includes('选择文件'))?.props[mobile ? 'onPress' : 'onClick']
+    assert.ok(typeof handler === 'function')
+    handler()
+  }
+  try {
+    if (mobile) {
+      const receiver = render().find(({ type, props }) => typeof type === 'function' && type.name === 'InputField' && props.label === deliveryModel.transferCopy.receiver)
+      assert.ok(typeof receiver?.props.onChange === 'function')
+      Reflect.apply(receiver.props.onChange, undefined, ['22'.repeat(32)])
+    } else {
+      const receiver = render().find(({ props }) => props.id === 'transfer-receiver')?.props
+      assert.ok(receiver?.onChange)
+      receiver.onChange({ target: { value: '22'.repeat(32) } })
+    }
+    choose(); await settleComponent()
+    if (mobile) {
+      const submit = render().find(({ type, props }) => type === 'Button' && componentText(props.children).includes(deliveryModel.transferCopy.prepare('charity')))?.props.onPress
+      assert.ok(typeof submit === 'function'); submit()
+    } else {
+      const submit = render().find(({ type }) => type === 'form')?.props.onSubmit
+      assert.ok(submit); submit({ preventDefault() {} })
+    }
+    assert.deepEqual(calls, ['submitted-fixture.txt'])
+    if (settlement === 'new-file') { choose(); await settleComponent() }
+    prepared.resolve(true)
+    if (settlement === 'reconnect') queueMicrotask(() => { current = false })
+    await settleComponent()
+    assert.deepEqual(disposed, settlement === 'reconnect' ? [] : ['submitted-fixture.txt'])
+    const output = componentText(render().map(({ props }) => props.children))
+    assert.equal(output.includes('submitted-fixture.txt'), settlement === 'reconnect')
+    assert.equal(output.includes('newer-fixture.txt'), settlement === 'new-file')
   } finally { app.close() }
 })
 
@@ -5151,6 +5222,71 @@ test('Mobile useRun shares synchronous errors, explicit generation changes, and 
     await runNew
     assert.equal(render().busy, null)
   } finally { app.close() }
+})
+
+test('the Mobile join screen keeps the claimed invite through handoff and cancels only the preceding attempt', async () => {
+  const path = '../../../../../apps/mobile/app/join.tsx'
+  const firstLink = 'vibeface://join/first', nextLink = 'vibeface://join/next'
+  let generation = 1, url = firstLink, session: { phase: string; code?: string } = { phase: 'unjoined' }
+  const device = { connectionGeneration: () => generation, phase: 'disconnected', error: '', linkTarget: (value: string) => value.startsWith('vibeface://join/') ? 'current' : null, checkInvite: async () => 'open' }
+  const attempts: { invitation: string; name: string; rebind: GenerationAction['rebind']; result: ReturnType<typeof pendingResult> }[] = []
+  let cancelled = 0
+  const actions = {
+    join(invitation: string, name: string, rebind: GenerationAction['rebind']) {
+      const result = pendingResult()
+      attempts.push({ invitation, name, rebind, result })
+      return result.promise
+    },
+    cancelJoin() { cancelled++; session = { phase: 'unjoined' }; generation++ },
+  }
+  const dependencies = {
+    '@vibeface/client/identity/context.tsx': { useDevice: () => device },
+    '@vibeface/client/identity/copy.ts': { joinCopy },
+    '@vibeface/client/identity/recovery-link.ts': recoveryLinks,
+    '@vibeface/client/lib/errors.ts': errors,
+    'expo-linking': { useLinkingURL: () => url },
+    '@/lib/join-link': { openedLink: (link: string) => link, switchedLink: () => null, keepSwitchedLink() {} },
+    '@/data/context': { useWorkspace: () => ({ session, actions }) },
+    '@/platform': { defaultName: () => '我的手机' },
+    'react-native-reanimated': { default: { View: 'AnimatedView' }, __esModule: true },
+  }
+  const screen = componentHarness(path, dependencies, {}, 'spent', { '@/lib/use-run': '../../../../../apps/mobile/src/lib/use-run.ts' })
+  const forms = { invite: componentHarness(path, dependencies, {}, 'JoinForm'), waiting: componentHarness(path, dependencies, {}, 'Waiting') }
+  const render = () => {
+    const tree = screen.render('default')
+    const child = tree.find(({ type }) => typeof type === 'function' && type.name === 'JoinForm')
+    return child ? forms.invite.render('JoinForm', child.props) : []
+  }
+  const button = () => render().find(({ type, props }) => type === 'Button' && [joinCopy.join, joinCopy.joining].includes(componentText(props.children)))?.props
+  const press = () => { const handler = button()?.onPress; assert.ok(typeof handler === 'function'); handler() }
+  try {
+    render(); press(); press()
+    assert.equal(attempts.length, 1)
+    assert.equal(attempts[0].invitation, firstLink)
+    assert.equal(attempts[0].name, '我的手机')
+    attempts[0].rebind({ from: generation, to: ++generation })
+    attempts[0].rebind({ from: generation, to: ++generation })
+    assert.equal(button()?.disabled, true)
+    session = { phase: 'joining', code: '123456' }
+    render()
+    assert.equal(screen.module.spent, firstLink)
+    const child = screen.render('default').find(({ type }) => typeof type === 'function' && type.name === 'Waiting')
+    assert.ok(child)
+    const cancel = forms.waiting.render('Waiting', child.props).find(({ type, props }) => type === 'Button' && componentText(props.children) === '取消')?.props.onPress
+    assert.ok(typeof cancel === 'function'); cancel()
+    assert.equal(cancelled, 1)
+
+    forms.invite.close()
+    forms.invite = componentHarness(path, dependencies, {}, 'JoinForm')
+    url = nextLink; render(); press()
+    assert.equal(attempts.length, 2)
+    attempts[0].result.reject(new Error('旧邀请迟到失败。')); await settleComponent()
+    assert.equal(button()?.disabled, true)
+    assert.equal(render().some(({ props }) => props.error === '旧邀请迟到失败。'), false)
+    attempts[1].result.reject(new Error('unexpected synthetic failure')); await settleComponent()
+    assert.equal(button()?.disabled, false)
+    assert.equal(screen.render('default').find(({ type }) => typeof type === 'function' && type.name === 'JoinForm')?.props.actionError, '这次加入没有成功。再试一次。')
+  } finally { forms.invite.close(); forms.waiting.close(); screen.close() }
 })
 
 test("artifact reads retain their offset while old responses cannot append or unlock newer reads", async () => {

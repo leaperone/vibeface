@@ -9,7 +9,7 @@ export type GenerationAction = {
 }
 
 /** A keyed action and its feedback follow the connection that owns them. */
-export function useGenerationAction(getGeneration: () => number) {
+export function useGenerationAction(getGeneration: () => number, formatError: (cause: unknown) => string = messageOf) {
   const generation = getGeneration()
   const [owner] = useState(() => createActionOwner<number>())
   const [active, setActive] = useState<{ generation: number; key: string; claim: ActionClaim<number> } | null>(null)
@@ -47,7 +47,7 @@ export function useGenerationAction(getGeneration: () => number) {
       })
       if (claim.current()) setFeedback(previous => ({ generation, error: previous.generation === generation ? previous.error : '', status: success }))
     } catch (cause) {
-      if (claim.current()) setError(messageOf(cause))
+      if (claim.current()) setError(formatError(cause))
     } finally {
       if (claim.finish()) setActive(current => current?.claim === claim ? null : current)
     }
