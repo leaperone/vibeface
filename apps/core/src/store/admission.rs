@@ -118,7 +118,8 @@ impl PeerEnvelope {
             "invalid command target"
         );
         let max_refs = match &self.payload {
-            PeerCommand::Dispatch { spec } if spec.trigger.starts_with("assignment:") => 1024,
+            PeerCommand::Dispatch { spec }
+                if matches!(Trigger::decode(&spec.trigger), Ok(Trigger::Assignment(_))) => 1024,
             _ => 32,
         };
         ensure!(
@@ -138,7 +139,7 @@ impl PeerEnvelope {
                 _ => anyhow::bail!("invalid delivery trigger"),
             },
             PeerCommand::Dispatch { spec } => {
-                if spec.trigger.starts_with("assignment:") {
+                if matches!(Trigger::decode(&spec.trigger), Ok(Trigger::Assignment(_))) {
                     ensure!(
                         self.revision.is_some_and(|revision| revision > 0)
                             && self.sequence == 0
@@ -360,7 +361,7 @@ fn held_delivery_subject_from(
     else {
         return Ok(None);
     };
-    let Some(("message", message_id)) = trigger.split_once(':') else {
+    let Some(Trigger::Message(message_id)) = Trigger::decode(trigger).ok() else {
         return Ok(None);
     };
     held_answer_subject_from(connection, network, conversation_id, message_id)
@@ -506,8 +507,8 @@ impl Store {
     ) -> Result<String> {
         let mut trigger = trigger.to_owned();
         for _ in 0..64 {
-            match trigger.split_once(':') {
-                Some(("message", message)) => {
+            match Trigger::decode(&trigger) {
+                Ok(Trigger::Message(message)) => {
                     if let Some(subject) =
                         held_answer_subject_from(&self.connection, network, conversation, message)?
                     {
@@ -517,7 +518,7 @@ impl Store {
                         .input_route(network, conversation, message)?
                         .map_or_else(|| "main".into(), |route| input_target_key(&route.target)));
                 }
-                Some(("work", work_id)) => {
+                Ok(Trigger::Work(work_id)) => {
                     if let Some(work) =
                         super::reduce::work_from(&self.connection, network, work_id)?
                     {
@@ -536,13 +537,13 @@ impl Store {
                         anyhow::bail!("delivery work source not found");
                     }
                 }
-                Some(("task", work_id)) => return Ok(format!("work:{work_id}")),
-                Some(("assignment", assignment_id)) => {
+                Ok(Trigger::Task(work_id)) => return Ok(format!("work:{work_id}")),
+                Ok(Trigger::Assignment(assignment_id)) => {
                     let assignment =
                         self.delivery_assignment(network, conversation, assignment_id)?;
                     return Ok(format!("workspace_task:{}", assignment.task_id));
                 }
-                Some(("schedule", _)) => return Ok(format!("routine:{trigger}")),
+                Ok(Trigger::Schedule { .. }) => return Ok(format!("routine:{trigger}")),
                 _ => return Ok("main".into()),
             }
         }
@@ -555,8 +556,8 @@ impl Store {
         conversation: &str,
         trigger: &str,
     ) -> Result<(Option<u64>, u64, Vec<String>)> {
-        match trigger.split_once(':') {
-            Some(("assignment", assignment_id)) => {
+        match Trigger::decode(trigger) {
+            Ok(Trigger::Assignment(assignment_id)) => {
                 let assignment = self.delivery_assignment(network, conversation, assignment_id)?;
                 let mut refs = vec![assignment.event_hash];
                 if let Some(source) = assignment.source_event
@@ -566,7 +567,7 @@ impl Store {
                 }
                 Ok((Some(assignment.started_revision), 0, refs))
             }
-            Some(("message" | "bot_message", message_id)) => {
+            Ok(Trigger::Message(message_id) | Trigger::BotMessage(message_id)) => {
                 let message = self
                     .message(network, conversation, message_id)?
                     .context("message not found")?;
@@ -595,7 +596,7 @@ impl Store {
                     vec![message.event_hash],
                 ))
             }
-            Some(("work", work_id)) => {
+            Ok(Trigger::Work(work_id) | Trigger::Task(work_id)) => {
                 let event = event_about_from(
                     &self.connection,
                     network,
@@ -610,7 +611,7 @@ impl Store {
                     vec![event.hash],
                 ))
             }
-            Some(("schedule", _)) => Ok((None, 0, vec![])),
+            Ok(Trigger::Schedule { .. }) => Ok((None, 0, vec![])),
             _ => anyhow::bail!("invalid command source"),
         }
     }
@@ -687,19 +688,16 @@ impl Store {
                 PeerCommand::Deliver {
                     conversation_id,
                     trigger,
-                } if trigger.starts_with("assignment:") => {
-                    let assignment_id =
-                        trigger.strip_prefix("assignment:").expect("matched prefix");
+                } if let Ok(Trigger::Assignment(assignment_id)) = Trigger::decode(trigger) => {
                     self.delivery_assignment(network, conversation_id, assignment_id)?
                         .bot_owner_epoch
                 }
-                PeerCommand::Dispatch { spec } if spec.trigger.starts_with("assignment:") => {
+                PeerCommand::Dispatch { spec }
+                    if let Ok(Trigger::Assignment(assignment_id)) = Trigger::decode(&spec.trigger) => {
                     self.delivery_assignment(
                         network,
                         &spec.conversation,
-                        spec.trigger
-                            .strip_prefix("assignment:")
-                            .expect("matched prefix"),
+                        assignment_id,
                     )?
                     .bot_owner_epoch
                 }
@@ -745,12 +743,12 @@ impl Store {
         if let Some(bound) = self.bound_peer_command(network, &payload)? {
             return Ok(bound);
         }
-        let owner = match trigger.split_once(':') {
-            Some(("assignment", assignment_id)) => {
+        let owner = match Trigger::decode(trigger) {
+            Ok(Trigger::Assignment(assignment_id)) => {
                 self.delivery_assignment(network, conversation, assignment_id)?
                     .execution_node
             }
-            Some(("message", message_id)) => {
+            Ok(Trigger::Message(message_id)) => {
                 if let Some(subject) =
                     held_answer_subject_from(&self.connection, network, conversation, message_id)?
                 {
@@ -820,8 +818,8 @@ impl Store {
             );
             return Ok(bound);
         }
-        let source = match spec.trigger.split_once(':') {
-            Some(("assignment", assignment_id)) => {
+        let source = match Trigger::decode(&spec.trigger) {
+            Ok(Trigger::Assignment(assignment_id)) => {
                 let (revision, refs) = super::workspace::assignment_work_source_from(
                     &self.connection,
                     network,
@@ -892,7 +890,7 @@ impl Store {
                 Some(self.peer_source(network, conversation_id, trigger)?)
             }
             PeerCommand::Dispatch { spec } => {
-                if let Some(("assignment", assignment_id)) = spec.trigger.split_once(':') {
+                if let Ok(Trigger::Assignment(assignment_id)) = Trigger::decode(&spec.trigger) {
                     let assignment =
                         self.delivery_assignment(network, &spec.conversation, assignment_id)?;
                     ensure!(
@@ -964,7 +962,7 @@ impl Store {
                 conversation_id,
                 trigger,
             } => {
-                if let Some(("message", message_id)) = trigger.split_once(':')
+                if let Ok(Trigger::Message(message_id)) = Trigger::decode(trigger)
                     && held_answer_subject_from(
                         &self.connection,
                         network,
@@ -985,7 +983,7 @@ impl Store {
                 }
                 let mut job = self.scheduler_job(conversation_id, trigger)?;
                 if job.is_none()
-                    && let Some(("assignment", assignment_id)) = trigger.split_once(':')
+                    && let Ok(Trigger::Assignment(assignment_id)) = Trigger::decode(trigger)
                 {
                     let assignment = self.workspace_assignment(network, assignment_id)?;
                     if let Some(source) =
@@ -1117,7 +1115,7 @@ impl Store {
             return Ok(false);
         }
         if let PeerCommand::Dispatch { spec } = &envelope.payload
-            && let Some(("assignment", assignment_id)) = spec.trigger.split_once(':')
+            && let Ok(Trigger::Assignment(assignment_id)) = Trigger::decode(&spec.trigger)
         {
             let assignment =
                 self.delivery_assignment(network, &spec.conversation, assignment_id)?;

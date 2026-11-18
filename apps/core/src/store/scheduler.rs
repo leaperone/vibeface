@@ -1307,7 +1307,9 @@ pub(super) fn work_shares_native_execution_from(
     {
         return Ok(false);
     }
-    if left.trigger.starts_with("assignment:") || right.trigger.starts_with("assignment:") {
+    if matches!(Trigger::decode(&left.trigger), Ok(Trigger::Assignment(_)))
+        || matches!(Trigger::decode(&right.trigger), Ok(Trigger::Assignment(_)))
+    {
         if left.trigger != right.trigger {
             return Ok(false);
         }
@@ -1398,7 +1400,7 @@ fn work_native_authority_allowed_from(
     network: &str,
     work: &WorkProjection,
 ) -> Result<bool> {
-    if let Some(assignment) = work.trigger.strip_prefix("assignment:") {
+    if let Ok(Trigger::Assignment(assignment)) = Trigger::decode(&work.trigger) {
         return super::workspace::assignment_work_allowed_from(
             connection,
             network,
@@ -1413,7 +1415,7 @@ fn work_native_authority_allowed_from(
     ) {
         return Ok(false);
     }
-    if let Some(parent) = work.trigger.strip_prefix("task:") {
+    if let Ok(Trigger::Task(parent)) = Trigger::decode(&work.trigger) {
         let active: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM work_runs WHERE work_id=?1 AND conversation_id=?2 AND kind='task' AND state IN ('accepted','starting','running') AND NOT EXISTS(SELECT 1 FROM work_stops WHERE work_id=?1))",
             params![parent, work.conversation_id],
@@ -1872,7 +1874,7 @@ pub(crate) fn admit_assignment_from(
     );
     let bot = super::bot_settings::find_bot(connection, network, &assignment.bot_id)?;
     let conversation = &bot.conversation_id;
-    let trigger = format!("assignment:{}", assignment.assignment_id);
+    let trigger = assignment_trigger(&assignment.assignment_id);
     if assignment.execution_node != local {
         return queue_delivery_from(connection, network, conversation, &trigger);
     }
@@ -2413,7 +2415,7 @@ impl Store {
                 job,
             )?
             .context("task turn has no fixed assignment")?;
-            Ok(format!("assignment:{}", assignment.assignment_id))
+            Ok(assignment_trigger(&assignment.assignment_id))
         } else {
             Ok(job.trigger.clone())
         }
@@ -3177,17 +3179,15 @@ pub(crate) fn chain_depth(
 ) -> Result<u8> {
     let (mut conversation, mut trigger) = (conversation.to_owned(), trigger.to_owned());
     for _ in 0..64 {
-        match trigger.split_once(':') {
-            Some(("message", _)) => return Ok(0),
-            Some(("schedule", _)) => {
-                let (schedule_id, _) =
-                    parse_schedule_trigger(&trigger).context("invalid schedule trigger")?;
+        match Trigger::decode(&trigger) {
+            Ok(Trigger::Message(_)) => return Ok(0),
+            Ok(Trigger::Schedule { id: schedule_id, .. }) => {
                 return Ok(
                     super::bot_settings::schedule_from(connection, network, schedule_id)?
                         .map_or(MAX_CHAIN_DEPTH, |entry| entry.schedule.depth),
                 );
             }
-            Some(("bot_message", message_id)) => {
+            Ok(Trigger::BotMessage(message_id)) => {
                 let message = message_from(connection, network, &conversation, message_id)?
                     .context("the bot message is not stored here")?;
                 let event = log::event_from(connection, network, &message.event_hash)?
@@ -3197,7 +3197,7 @@ pub(crate) fn chain_depth(
                 };
                 return Ok(hops);
             }
-            Some(("work" | "task", work_id)) => {
+            Ok(Trigger::Work(work_id) | Trigger::Task(work_id)) => {
                 (conversation, trigger) = cause_from(connection, network, work_id)?
                     .context("the work is not stored here")?;
             }
@@ -3428,8 +3428,8 @@ fn report_origin_from(
 ) -> Result<Option<ReportOrigin>> {
     let mut trigger = trigger.to_owned();
     for _ in 0..64 {
-        match trigger.split_once(':') {
-            Some(("message" | "bot_message", message)) => {
+        match Trigger::decode(&trigger) {
+            Ok(Trigger::Message(message) | Trigger::BotMessage(message)) => {
                 return Ok(Some(ReportOrigin {
                     reply_to: message.into(),
                     report_results: message_from(connection, network, conversation, message)?
@@ -3437,11 +3437,11 @@ fn report_origin_from(
                         .unwrap_or(true),
                 }));
             }
-            Some(("work" | "task", work_id)) => match cause_from(connection, network, work_id)? {
+            Ok(Trigger::Work(work_id) | Trigger::Task(work_id)) => match cause_from(connection, network, work_id)? {
                 Some((_, cause)) => trigger = cause,
                 None => return Ok(None),
             },
-            Some(("assignment", id)) => {
+            Ok(Trigger::Assignment(id)) => {
                 let Some(assignment) =
                     super::workspace::workspace_assignment_from(connection, network, id)?
                 else {
@@ -3511,7 +3511,7 @@ fn report_origin_from(
                     },
                 );
             }
-            Some(("schedule", _)) => {
+            Ok(Trigger::Schedule { .. }) => {
                 return Ok(Some(ReportOrigin {
                     reply_to: trigger,
                     report_results: true,
@@ -3582,7 +3582,7 @@ pub(crate) fn workspace_assignment_followups_pending_from(
         };
         jobs.push((other, event.seq));
     }
-    let initial = job.trigger == format!("assignment:{}", assignment.assignment_id)
+    let initial = job.trigger == assignment_trigger(&assignment.assignment_id)
         || assignment
             .trigger_message_id
             .as_deref()
@@ -3601,9 +3601,9 @@ pub(crate) fn workspace_assignment_followups_pending_from(
         if conversation != job.conversation_id || dispatcher != local {
             return Ok(false);
         }
-        let (reply_to, kind) = match trigger.split_once(':') {
-            Some(("assignment", id)) => (id.to_owned(), TriggerKind::WorkspaceTask),
-            Some(("message", id)) => {
+        let (reply_to, kind) = match Trigger::decode(trigger) {
+            Ok(Trigger::Assignment(id)) => (id.to_owned(), TriggerKind::WorkspaceTask),
+            Ok(Trigger::Message(id)) => {
                 let Some(message) = message_from(connection, network, conversation, id)?
                     .filter(|message| message.role == Role::User)
                 else {
@@ -4586,7 +4586,7 @@ impl Store {
                         super::workspace::resolve_input_target_from(&tx, network, &route.target)?;
                     (route.expected_revision != resolved.task_revision)
                         .then_some("task_input_revision_changed_before_start")
-                } else if let Some(id) = job.trigger.strip_prefix("assignment:") {
+                } else if let Ok(Trigger::Assignment(id)) = Trigger::decode(&job.trigger) {
                     match super::workspace::workspace_assignment_from(&tx, network, id)? {
                         Some(assignment)
                             if super::workspace::assignment_admission_allowed_from(

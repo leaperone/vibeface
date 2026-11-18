@@ -1447,15 +1447,13 @@ impl TurnHistory {
 
 /// The kind and subject of the event a trigger names.
 pub(crate) fn trigger_event_key(trigger: &str) -> Option<(&'static str, &str)> {
-    let (prefix, subject) = trigger.split_once(':')?;
-    let kind = match prefix {
-        "message" => "message_posted",
-        "work" => "work_finished",
-        "task" => "work_dispatched",
-        "bot_message" => "bot_messaged",
-        _ => return None,
-    };
-    Some((kind, subject))
+    match crate::scheduling::Trigger::decode(trigger).ok()? {
+        crate::scheduling::Trigger::Message(subject) => Some(("message_posted", subject)),
+        crate::scheduling::Trigger::Work(subject) => Some(("work_finished", subject)),
+        crate::scheduling::Trigger::Task(subject) => Some(("work_dispatched", subject)),
+        crate::scheduling::Trigger::BotMessage(subject) => Some(("bot_messaged", subject)),
+        crate::scheduling::Trigger::Assignment(_) | crate::scheduling::Trigger::Schedule { .. } => None,
+    }
 }
 
 /// A checkpoint as the prompt shows it within `budget` bytes. The rolling summary gives way

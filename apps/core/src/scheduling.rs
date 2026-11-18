@@ -105,16 +105,12 @@ impl SessionScope {
         }
         if let Some(work_id) = key.strip_prefix("task:") {
             vibeface_protocol::validate_id(work_id).map_err(anyhow::Error::msg)?;
-            return Ok(Self::Task {
-                work_id: work_id.into(),
-            });
+            return Ok(Self::Task { work_id: work_id.into() });
         }
         if let Some(trigger) = key.strip_prefix("routine:")
-            && parse_schedule_trigger(trigger).is_some()
+            && matches!(Trigger::decode(trigger), Ok(Trigger::Schedule { .. }))
         {
-            return Ok(Self::Routine {
-                trigger: trigger.into(),
-            });
+            return Ok(Self::Routine { trigger: trigger.into() });
         }
         anyhow::bail!("invalid scheduler session scope")
     }
@@ -259,6 +255,11 @@ pub fn task_trigger(work_id: &str) -> String {
     Trigger::Task(work_id).to_string()
 }
 
+/// The trigger for a workspace assignment.
+pub fn assignment_trigger(assignment_id: &str) -> String {
+    Trigger::Assignment(assignment_id).to_string()
+}
+
 /// What an agent task's coordination job did that its work must follow.
 pub(crate) enum TaskJobChange<'a> {
     /// The turn ended, or was cancelled before it started; the reply is the result.
@@ -274,7 +275,9 @@ pub(crate) fn task_work_signal<'a>(
     trigger: &'a str,
     change: TaskJobChange,
 ) -> Option<(&'a str, Signal)> {
-    let work_id = trigger.strip_prefix("task:")?;
+    let Trigger::Task(work_id) = Trigger::decode(trigger).ok()? else {
+        return None;
+    };
     let signal = match change {
         TaskJobChange::Ended { outcome, text } => {
             let (outcome, reason, failure) = match outcome {
