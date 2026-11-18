@@ -44,6 +44,8 @@ mod schema_guard;
 #[cfg(test)]
 mod test_metrics;
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod tests;
 pub(crate) mod work;
 pub(crate) mod workspace;

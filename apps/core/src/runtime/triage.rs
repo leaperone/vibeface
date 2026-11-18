@@ -3008,4 +3008,6 @@ fn rollouts(root: &Path, since_ms: i64) -> Vec<PathBuf> {
 }
 
 #[cfg(test)]
-pub(super) mod tests;
+mod test_support;
+#[cfg(test)]
+mod tests;
