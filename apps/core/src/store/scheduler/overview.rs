@@ -185,14 +185,16 @@ impl JobFacts {
         limits: &crate::config::SchedulingLimits,
     ) -> Result<Option<QueueHoldReason>> {
         job_hold_with(
-            &store.connection,
-            &store.blob_dir,
+            JobHoldStorage {
+                connection: &store.connection,
+                blob_dir: &store.blob_dir,
+                overview: Some(&self.workspace),
+            },
             network,
             local,
             job,
             provider,
             limits,
-            Some(&self.workspace),
         )
     }
 }

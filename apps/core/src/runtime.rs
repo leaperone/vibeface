@@ -1065,18 +1065,7 @@ impl Runtime {
                         include_finished,
                         include_sessions,
                     },
-                    |store, job, epoch, pending, context, facts| {
-                        overview::job_summary(
-                            store,
-                            &projection,
-                            &query_network,
-                            job,
-                            epoch,
-                            pending,
-                            context,
-                            facts,
-                        )
-                    },
+                    overview::job_projector(&projection, &query_network),
                 )
             })
             .await?;

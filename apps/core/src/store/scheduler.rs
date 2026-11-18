@@ -737,20 +737,38 @@ fn job_hold_from(
     limits: &crate::config::SchedulingLimits,
 ) -> Result<Option<QueueHoldReason>> {
     job_hold_with(
-        connection, blob_dir, network, local, job, provider, limits, None,
+        JobHoldStorage {
+            connection,
+            blob_dir,
+            overview: None,
+        },
+        network,
+        local,
+        job,
+        provider,
+        limits,
     )
 }
 
+struct JobHoldStorage<'a> {
+    connection: &'a Connection,
+    blob_dir: &'a Path,
+    overview: Option<&'a super::workspace::overview::OverviewFacts>,
+}
+
 fn job_hold_with(
-    connection: &Connection,
-    blob_dir: &Path,
+    storage: JobHoldStorage<'_>,
     network: &str,
     local: &str,
     job: &SchedulerJob,
     provider: Provider,
     limits: &crate::config::SchedulingLimits,
-    overview: Option<&super::workspace::overview::OverviewFacts>,
 ) -> Result<Option<QueueHoldReason>> {
+    let JobHoldStorage {
+        connection,
+        blob_dir,
+        overview,
+    } = storage;
     if !matches!(job.state, JobState::Queued) {
         return Ok(None);
     }

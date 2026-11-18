@@ -226,29 +226,33 @@ mod workspace_overview_tests {
     }
 }
 
-pub(super) fn job_summary(
-    store: &Store,
-    projection: &super::schedule_delivery::SchedulerProjection,
-    network: &str,
-    job: &crate::scheduling::SchedulerJob,
-    epoch: u64,
-    pending: bool,
-    context: Option<crate::scheduling::ContextProjection>,
-    facts: &crate::store::scheduler::overview::JobFacts,
-) -> Result<Value> {
-    let checks = if pending {
-        BTreeSet::from([format!("{}\n{}", job.conversation_id, job.trigger)])
-    } else {
-        BTreeSet::new()
-    };
-    let mut value = workspace_job_summary(job, &projection.local, epoch, &checks);
-    value["hold_reason"] = json!(projection.hold_reason_with(
-        job,
-        |work| Ok(facts.task_provider(work)),
-        |provider, local, limits| facts.hold(store, network, local, job, provider, limits)
-    )?);
-    value["context"] = json!(context);
-    Ok(value)
+pub(super) fn job_projector<'a>(
+    projection: &'a super::schedule_delivery::SchedulerProjection,
+    network: &'a str,
+) -> impl Fn(
+    &Store,
+    &crate::scheduling::SchedulerJob,
+    u64,
+    bool,
+    Option<crate::scheduling::ContextProjection>,
+    &crate::store::scheduler::overview::JobFacts,
+) -> Result<Value>
++ 'a {
+    move |store, job, epoch, pending, context, facts| {
+        let checks = if pending {
+            BTreeSet::from([format!("{}\n{}", job.conversation_id, job.trigger)])
+        } else {
+            BTreeSet::new()
+        };
+        let mut value = workspace_job_summary(job, &projection.local, epoch, &checks);
+        value["hold_reason"] = json!(projection.hold_reason_with(
+            job,
+            |work| Ok(facts.task_provider(work)),
+            |provider, local, limits| facts.hold(store, network, local, job, provider, limits)
+        )?);
+        value["context"] = json!(context);
+        Ok(value)
+    }
 }
 
 pub(super) fn summary(mut snapshot: crate::store::overview::OverviewSnapshot) -> Value {
