@@ -2063,8 +2063,9 @@ fn stage_memory_from(
     trigger: &str,
     call_ref: &str,
     request: super::bot_settings::ChangeRequest,
-) -> Result<Value> {
+) -> Result<crate::tools::ToolOutcome> {
     use super::bot_settings::ChangeRequest;
+    use crate::tools::Execution;
     vibeface_protocol::validate_id(call_ref).map_err(anyhow::Error::msg)?;
     let conversation = &session.conversation_id;
     let change_id = super::bot_settings::change_id(conversation, trigger, call_ref);
@@ -2074,7 +2075,7 @@ fn stage_memory_from(
                 if request.matches_memory(memory_id, after.as_deref())),
             "call_ref {call_ref} already made a different memory mutation"
         );
-        return Ok(json!({"state":"committed","record":record}));
+        return Ok(Execution::Applied.result(json!({"state":"committed","record":record})));
     }
     ensure!(
         session.active.as_deref() == Some(trigger),
@@ -2090,7 +2091,7 @@ fn stage_memory_from(
             request.matches_memory(&previous.memory_id, previous.after.as_deref()),
             "call_ref {call_ref} already staged a different memory mutation"
         );
-        return Ok(staged_memory_result(previous));
+        return Ok(Execution::Pending.result(staged_memory_result(previous)));
     }
     let committed = super::bot_settings::memory_records_from(connection, network, conversation)?;
     let (memory_id, before, after, base, essential) = match request {
@@ -2182,7 +2183,7 @@ fn stage_memory_from(
         .shown
         .staged_memories
         .insert(call_ref.to_owned(), mutation);
-    Ok(result)
+    Ok(Execution::Pending.result(result))
 }
 
 impl Store {
@@ -2979,8 +2980,35 @@ impl Store {
         attempt_id: &str,
         call_ref: &str,
         request: super::bot_settings::ChangeRequest,
-        _at: i64,
+        at: i64,
     ) -> Result<Value> {
+        Ok(self
+            .stage_memory_outcome(
+                network,
+                conversation,
+                trigger,
+                attempt_id,
+                call_ref,
+                request,
+                at,
+            )?
+            .value)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the active turn and its tool call"
+    )]
+    pub(crate) fn stage_memory_outcome(
+        &mut self,
+        network: &str,
+        conversation: &str,
+        trigger: &str,
+        attempt_id: &str,
+        call_ref: &str,
+        request: super::bot_settings::ChangeRequest,
+        _at: i64,
+    ) -> Result<crate::tools::ToolOutcome> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;

@@ -32,20 +32,24 @@ export function selectionOwner<File extends DisposableSelection>(onCleanupError:
     }
     if (errors.length) report(errors)
   }
-  return {
-    replace(files: readonly File[]) {
-      const next = new Set(files)
-      if (closed) {
-        for (const file of next) if (!released.has(file)) retired.add(file)
-        cleanup()
-        return false
-      }
-      if ([...next].some(file => disposing.has(file))) throw new Error('请重新选择文件。')
-      for (const file of selected) if (!next.has(file)) retired.add(file)
-      for (const file of next) retired.delete(file)
-      selected = next
+  function replace(files: readonly File[]) {
+    const next = new Set(files)
+    if (closed) {
+      for (const file of next) if (!released.has(file)) retired.add(file)
       cleanup()
-      return true
+      return false
+    }
+    if ([...next].some(file => disposing.has(file))) throw new Error('请重新选择文件。')
+    for (const file of selected) if (!next.has(file)) retired.add(file)
+    for (const file of next) retired.delete(file)
+    selected = next
+    cleanup()
+    return true
+  }
+  return {
+    replace,
+    clearSingle(file: File) {
+      return selected.size === 1 && selected.has(file) && replace([])
     },
     async use<Result>(operation: (files: readonly File[]) => Promise<Result>): Promise<Result> {
       const snapshot = [...selected]

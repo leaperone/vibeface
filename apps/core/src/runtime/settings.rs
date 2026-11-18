@@ -8,6 +8,7 @@ use crate::providers::{
     self, AppServer, AppServerMode, ObservationStatus, Provider, ProviderObservation,
     ProviderReadiness, ProviderRoots, ReadinessEvidence, Role,
 };
+use crate::tools::{Approval, Execution, ToolOutcome};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1042,7 +1043,52 @@ pub(crate) struct Proposal {
     paths: Paths,
     /// Folders to add to the ones work may run in.
     roots: Vec<PathBuf>,
-    outcome: Option<Value>,
+}
+
+/// Reserved before changing private settings. A restart or an interrupted apply
+/// can observe the reservation but cannot replay the user's previous approval.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "state", content = "result", rename_all = "snake_case")]
+enum ProviderApplication {
+    Declined(Value),
+    Unconfirmed(String),
+    Applied(Value),
+}
+
+impl ProviderApplication {
+    fn result(self) -> Result<ToolOutcome> {
+        match self {
+            Self::Declined(value) => Ok(Execution::NotStarted.with(Approval::Denied).result(value)),
+            Self::Unconfirmed(reason) => Err(Execution::Unknown
+                .with(Approval::Allowed)
+                .failure(anyhow::anyhow!(reason))),
+            Self::Applied(value) => Ok(Execution::Applied.with(Approval::Allowed).result(value)),
+        }
+    }
+
+    fn existing(store: &crate::store::Store, key: &str) -> Result<Option<Self>> {
+        use rusqlite::OptionalExtension;
+        let value: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT value FROM identity_meta WHERE key=?",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(Into::into)
+    }
+}
+
+fn provider_approval(question: &Value) -> Approval {
+    match question["answer"]["text"].as_str().map(str::trim) {
+        Some(ALLOW) => Approval::Allowed,
+        Some(_) => Approval::Denied,
+        None => Approval::Pending,
+    }
 }
 
 /// What a bot proposes: paths it found itself, each optional.
@@ -1135,7 +1181,7 @@ impl Runtime {
         scope: &str,
         trigger: &str,
         input: Value,
-    ) -> Result<Value> {
+    ) -> Result<ToolOutcome> {
         let mut input =
             serde_json::from_value::<ProposalInput>(input).context("invalid provider proposal")?;
         let current = self.settings_snapshot().roots;
@@ -1183,7 +1229,7 @@ impl Runtime {
             triage: &mut triage,
         });
         if paths.is_empty() && roots.is_empty() {
-            return Ok(json!({"status":"unchanged"}));
+            return Ok(Execution::NotStarted.result(json!({"status":"unchanged"})));
         }
         let device = self.identity.device_id()?;
         let question_id = format!(
@@ -1233,12 +1279,12 @@ impl Runtime {
             },
         };
         let mut proposals = self.provider_proposals.lock().await;
-        let (_, written) = {
+        let (standing, written) = {
             let identity = self.identity.to_owned();
             let network = network.to_owned();
             let scope = scope.to_owned();
             self.store
-                .call("settings.ask", move |store| {
+                .tool_transaction("settings.ask", move |store| {
                     store.ask(&identity, &network, &scope, body, now_ms())
                 })
                 .await
@@ -1256,10 +1302,13 @@ impl Runtime {
                 conversation: scope.into(),
                 paths: paths.clone(),
                 roots: roots.clone(),
-                outcome: None,
             });
         let shown: Vec<String> = roots.iter().map(|root| self.host.display(root)).collect();
-        Ok(json!({"status":"asked","question_id":question_id,"proposed":paths,"roots":shown}))
+        Ok(Execution::NotStarted
+            .with(provider_approval(&standing))
+            .result(
+                json!({"status":"asked","question_id":question_id,"proposed":paths,"roots":shown}),
+            ))
     }
 
     /// One line per setting the card asks about. Paths are shortened so the full ones stay on
@@ -1309,6 +1358,31 @@ impl Runtime {
         text
     }
 
+    async fn reserve_provider_application(
+        &self,
+        key: &str,
+        first: &ProviderApplication,
+    ) -> Result<Option<ProviderApplication>> {
+        let encoded = serde_json::to_string(first)?;
+        let reserve_key = key.to_owned();
+        self.store
+            .tool_transaction("settings.reserve_provider_application", move |store| {
+                let created = store.connection.execute(
+                    "INSERT OR IGNORE INTO identity_meta(key,value) VALUES(?1,?2)",
+                    rusqlite::params![reserve_key, encoded],
+                )?;
+                if created == 1 {
+                    Ok(None)
+                } else {
+                    Ok(Some(
+                        ProviderApplication::existing(store, &reserve_key)?
+                            .context("provider application reservation disappeared")?,
+                    ))
+                }
+            })
+            .await
+    }
+
     /// Writes a proposal once the user's answer to its card allows it, through the same path
     /// as Settings. A second call returns the first outcome.
     pub(crate) async fn apply_provider_config(
@@ -1316,18 +1390,30 @@ impl Runtime {
         network: &str,
         scope: &str,
         question_id: &str,
-    ) -> Result<Value> {
-        let mut proposals = self.provider_proposals.lock().await;
-        let proposal = proposals.get_mut(question_id).context(
+    ) -> Result<ToolOutcome> {
+        let proposals = self.provider_proposals.lock().await;
+        let key = format!(
+            "provider-apply:{}",
+            serde_json::to_string(&(network, scope, question_id))?
+        );
+        let read_key = key.clone();
+        if let Some(saved) = self
+            .store
+            .call("settings.provider_application", move |store| {
+                ProviderApplication::existing(store, &read_key)
+            })
+            .await
+            .map_err(crate::tools::uncertain)?
+        {
+            return saved.result();
+        }
+        let proposal = proposals.get(question_id).context(
             "this device holds no proposal with that question_id; after a restart, propose it again",
         )?;
         ensure!(
             proposal.conversation == scope,
             "the proposal was made in another conversation"
         );
-        if let Some(outcome) = &proposal.outcome {
-            return Ok(outcome.clone());
-        }
         let question = {
             let network = network.to_owned();
             let question_id = question_id.to_owned();
@@ -1338,14 +1424,34 @@ impl Runtime {
                 .await
         }?
         .context("the proposal's question is missing")?;
-        let answer = question["answer"]["text"]
-            .as_str()
-            .context("the user has not answered yet; apply it in the turn their answer starts")?
-            .trim()
-            .to_owned();
-        let outcome = if answer == ALLOW {
-            let _save = self.config_save.lock().await;
-            let _work = self.maintenance.enter()?;
+        match provider_approval(&question) {
+            Approval::Allowed => {}
+            Approval::Denied => {
+                let denied = ProviderApplication::Declined(
+                    json!({"status":"declined","question_id":question_id,
+                    "answer":question["answer"]["text"].as_str().map(str::trim)}),
+                );
+                return self
+                    .reserve_provider_application(&key, &denied)
+                    .await?
+                    .unwrap_or(denied)
+                    .result();
+            }
+            _ => {
+                return Err(Execution::NotStarted.with(Approval::Pending).failure(
+                    anyhow::anyhow!(
+                        "the user has not answered yet; apply it in the turn their answer starts"
+                    ),
+                ));
+            }
+        }
+        let _save = self.config_save.lock().await;
+        let _work = self.maintenance.enter()?;
+        let pending = ProviderApplication::Unconfirmed("the approved settings may already have changed; check local Settings before making a new proposal".into());
+        if let Some(saved) = self.reserve_provider_application(&key, &pending).await? {
+            return saved.result();
+        }
+        let apply = async {
             let paths = proposal.paths.clone();
             let filled = if paths.is_empty() {
                 Paths::default()
@@ -1357,12 +1463,27 @@ impl Runtime {
                 self.add_roots(&proposal.roots)?;
             }
             tracing::info!(event = "providers.applied", question_id, applied = ?paths.names(), roots = proposal.roots.len(), "provider paths the user allowed were written");
-            json!({"status":"applied","question_id":question_id,"applied":paths.names(),"roots_added":proposal.roots.len(),"also_filled":filled.names()})
-        } else {
-            json!({"status":"declined","question_id":question_id,"answer":answer})
+            Ok::<_,anyhow::Error>(json!({"status":"applied","question_id":question_id,"applied":paths.names(),"roots_added":proposal.roots.len(),"also_filled":filled.names()}))
+        }.await;
+        let saved = match apply {
+            Ok(value) => ProviderApplication::Applied(value),
+            Err(error) => {
+                ProviderApplication::Unconfirmed(crate::logging::scrub(&format!("{error:#}")))
+            }
         };
-        proposal.outcome = Some(outcome.clone());
-        Ok(outcome)
+        let encoded = serde_json::to_string(&saved)?;
+        self.store
+            .call("settings.finish_provider_application", move |store| {
+                let updated = store.connection.execute(
+                    "UPDATE identity_meta SET value=?1 WHERE key=?2",
+                    rusqlite::params![encoded, key],
+                )?;
+                ensure!(updated == 1, "provider application reservation disappeared");
+                Ok(())
+            })
+            .await
+            .map_err(|error| Execution::Unknown.with(Approval::Allowed).failure(error))?;
+        saved.result()
     }
 }
 

@@ -31,11 +31,11 @@ const lostKeyMessage = lostKeyText(self)
 let identity: NativeIdentity | undefined
 /** The device secret lives in the Keychain / Keystore, readable only by this app on this device. */
 const phoneKeys: DeviceKeys = {
-  async load({ replaceLostKey }) {
+  async load({ replaceLostKey, existingOnly }) {
     const saved = await SecureStore.getItemAsync(secretKey)
     if (saved) identity = secure.Identity.fromSecretHex(saved)
     else {
-      if (store.getString(createdKey) === 'true' && !replaceLostKey) throw Object.assign(new Error(lostKeyMessage), { code: 'key_lost' })
+      if (existingOnly || store.getString(createdKey) === 'true' && !replaceLostKey) throw Object.assign(new Error(lostKeyMessage), { code: 'key_lost' })
       const created = secure.Identity.generate()
       await SecureStore.setItemAsync(secretKey, created.secretHex(), { keychainAccessible: SecureStore.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY })
       store.set(createdKey, 'true')

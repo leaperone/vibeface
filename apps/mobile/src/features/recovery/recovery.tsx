@@ -101,15 +101,15 @@ export function RecoveryRestore({ link }: { link?: string | null }) {
   }
   const [password, setPassword] = useState('')
   const [name, setName] = useState(defaultName)
-  const submit = () => void run('restore', async () => {
+  const submit = () => void run('restore', async ({ current, rebind }) => {
     const submitted = pickedRef.current, owner = selection.current
     if (!submitted || !target || !owner) throw new Error('选一个恢复文件。')
     const typed = password
     // A failed try keeps the chosen file and name; only the typed password leaves the screen.
     setPassword('')
     await owner.use(async ([file]) => {
-      await device.beginRecovery({ file, password: typed, name: name.trim(), entry: target })
-      if (selection.current === owner && pickedRef.current === submitted && owner.replace([])) { pickedRef.current = null; setPicked(null) }
+      await device.beginRecovery({ file, password: typed, name: name.trim(), entry: target }, rebind)
+      if (current() && selection.current === owner && pickedRef.current === submitted && owner.replace([])) { pickedRef.current = null; setPicked(null) }
     })
   })
   const locked = busy !== null || Boolean(device.review)
@@ -165,11 +165,11 @@ function PickTarget({ onPicked }: { onPicked(entry: ConnectionEntry): void }) {
 export function RecoveryReview() {
   const device = useDevice()
   const review = device.review
-  const { busy, error, run } = useRun()
+  const { busy, error, run, cancel } = useRun()
   const [lost, setLost] = useState<string[]>([])
   if (review?.kind !== 'recovery') return null
   // As on the web: the kept devices go as the file listed them, with no choice of who manages.
-  const recover = () => void run('recover', () => device.confirmRecovery(review.members.filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id))))
+  const recover = () => void run('recover', ({ rebind }) => device.confirmRecovery(review.members.filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id)), rebind))
   return <Panel icon={ArchiveRestore} title={recoveryCopy.whichLost}>
     <View className="gap-2">
       {[...review.members].sort((a, b) => Number(b.device_id === review.requiredNode) - Number(a.device_id === review.requiredNode)).map((member) => {
@@ -192,7 +192,7 @@ export function RecoveryReview() {
     {hint(FileKey, '会保存新的恢复文件，生效后旧文件作废')}
     <ErrorText error={error} />
     <View className="flex-row justify-between gap-2">
-      <Button variant="ghost" className="-ms-3" onPress={device.cancelSensitive}><Text>取消</Text></Button>
+      <Button variant="ghost" className="-ms-3" onPress={() => { cancel(); device.cancelSensitive() }}><Text>取消</Text></Button>
       <Button disabled={busy !== null} onPress={recover}><Text>{busy ? '找回中' : '找回'}</Text></Button>
     </View>
     {busy ? <Text className="text-sm text-muted">{recoveryCopy.cancelLate}</Text> : null}
@@ -252,11 +252,11 @@ export function RecoveryPendingCard() {
   const changes = recoveryChanges(pending, device.directory?.members ?? [])
   const confirm = () => Alert.alert(recoveryCopy.confirmAsk, recoveryCopy.confirmNote, [
     { text: '取消', style: 'cancel' },
-    { text: recoveryCopy.confirm, onPress: () => void run('confirm', async () => { await device.approveRecovery(pending.checkpoint); toast(recoveryCopy.confirmDone, 'success') }) },
+    { text: recoveryCopy.confirm, onPress: () => void run('confirm', async ({ current }) => { await device.approveRecovery(pending.checkpoint); if (current()) toast(recoveryCopy.confirmDone, 'success') }) },
   ])
   const stop = () => Alert.alert(recoveryCopy.stopAsk, recoveryCopy.stopNote, [
     { text: '取消', style: 'cancel' },
-    { text: recoveryCopy.stop, style: 'destructive', onPress: () => void run('stop', async () => { await device.vetoRecovery(pending.checkpoint); void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success) }) },
+    { text: recoveryCopy.stop, style: 'destructive', onPress: () => void run('stop', async ({ current }) => { await device.vetoRecovery(pending.checkpoint); if (current()) void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success) }) },
   ])
   // Stopping is the safe answer, so it leads at full weight; letting it take effect early comes last and quietest.
   return <ActionCard icon={ShieldAlert} tone="danger" title={recoveryCopy.pending} actions={<View className="w-full gap-2">
@@ -377,13 +377,13 @@ export function ReplaceRecovery() {
   const [tried, setTried] = useState(false)
   // A failed try keeps what was typed; a change to any field takes the old error away.
   const change = <T,>(set: (value: T) => void) => (value: T) => { set(value); clear() }
-  const submit = () => void run('replace', async () => {
+  const submit = () => void run('replace', async ({ current }) => {
     const submitted = pickedRef.current, owner = selection.current
     if (!submitted || !owner) throw new Error('选一个恢复文件。')
     setTried(true)
     await owner.use(async ([file]) => {
       await device.replaceRecoveryFile({ file, oldPassword, password: passphrase(password) })
-      if (selection.current === owner && pickedRef.current === submitted && owner.replace([])) {
+      if (current() && selection.current === owner && pickedRef.current === submitted && owner.replace([])) {
         pickedRef.current = null; setPicked(null)
         setOldPassword(''); setPassword(''); setTried(false)
       }

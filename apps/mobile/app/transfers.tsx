@@ -69,7 +69,9 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
     if (!file || unusable) return
     setOrigin('form')
     const owner = selection.current!
-    void owner.use(([selected]) => delivery.prepare(sending, selected, restart)).then(success => { if (success && owner.replace([])) setFile(null) }).catch((cause) => setCleanupError(String(cause)))
+    void owner.use(([selected]) => delivery.prepare(sending, selected, restart)).then(success => {
+      if (success && connection.isCurrent() && owner.clearSingle(file)) setFile(null)
+    }).catch(cause => { if (connection.isCurrent()) setCleanupError(String(cause)) })
   }
   return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-6 pb-12">
     {feedback('page')}

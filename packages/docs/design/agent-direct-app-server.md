@@ -56,17 +56,13 @@ Node 保留 `runtime/executor.rs` 定义的多 Provider 执行器。`WorkKind::A
 
 ### 2.1a 用哪个 App Server
 
-App Server 由部署配置显式选择。执行默认关闭；整个 `codex_app_server` 对象省略时默认 `spawn`，提供对象时 `mode` 必填。Node 使用自己的 `<data-dir>/providers/codex` 根。只有明确选择 `system` 并提供绝对 socket 才连接外部服务，`init --codex-socket` 同时选择该模式。配置步骤见[部署配置](../deployment.md#配置-sdk-与-app-server)。
+独立的 App Server 让 Node 能管理自己的运行环境和重启对账，同时保留本人 Codex 会话的归属。需要联系本人已有的线程时，Node 把消息发到持有该线程的 App Server。两个进程不能同时写同一个线程，因此复用会话需要连到原进程。
 
-- `system`：Node 只连接明确配置的 socket，不搜索用户 home 或其他运行中的会话。它不启动或结束外部 App Server，只重连同一个配置入口。该模式共享外部服务的会话，不属于默认私有目录隔离保证。
-- `spawn`：Node 注入 Node-owned `CODEX_HOME`，覆盖普通 Provider 环境里的同名值；用户凭证不会被复制。此时配置的 `socket` 是本人自己的 Codex App Server：只用来送入和跟踪本人已有的线程，从不在上面开线程。Node 先读自己的 App Server，回答没有这个线程时再读它，记住在那里找到的线程和当时的 socket，对它们的复查、`turn/steer` 和中断都走那个 socket（每次单独连接，每个请求最多等 10 秒），不订阅其事件；之后改、清空 socket 或切到 `system` 只影响新的查找。这些工作不占用 Node 自己 App Server 的启动，启动配置变更不等它们结束。这份记忆只在内存里，重启后由第一次复查重新得出，工作记录不存；在那之前 Node 自己的连接断开仍会把这些工作记为可复查的 `unverified`。发送沿用会话自己的审批策略，Node 收不到这些线程的审批请求，审批要在本人自己的 Codex 里处理，等审批的工作可能长时间不结束。`system` 下 Bot 和本人共用一个 App Server，送入本人线程时仍带 Bot 的审批、沙箱和模型覆盖。两个进程不能同时写一个线程，所以不能另起 App Server 打开本人的 Codex 目录。
-- Agent 的 `VIBEFACE_CODEX_SOCKET` 固定是 `/tmp/vibeface-<identity>/app-server.sock`，Node 把它软链到正在用的 socket，切换模式或 App Server 换位置时 Agent 的环境不用变。本人 Codex 的 socket 不进 Agent 环境：`wait_work` 当场给出线程在哪个 App Server（`thread_at`：`node`、`user`（带 socket）、`missing`（`user` 表示是否问过本人的 Codex）或 `unknown`（带原因）），所以改配置不用重启 Bot。
-- 线程被另一个进程写着时（Codex 报 `already has an active writer`），写请求按“没有发出”报错，不自动重发；观察改为读取 turn，不再反复 `thread/resume`。
-- 网页的 `test_codex_app_server` 做一次独立握手，返回与状态相同的 `{state, socket, user_agent | reason | candidates}`。
+协调 Agent 通过稳定的本机入口找到 Node 正在使用的 App Server，切换配置时无需更新 Agent 的环境。向已有会话发消息前，Agent 另向 Node 查询线程归属，避免在无法确认目标时登记或发送工作。模式、socket 和连接语义见 [Codex App Server 配置](../node-protocol.md#codex-app-server-配置)。
 
 ### 2.2 薄 CLI
 
-`vibeface codex` 直接连 `VIBEFACE_CODEX_SOCKET`（Node 把 App Server socket 放进协调 Agent 的工具环境），不经 Node：
+`vibeface codex` 直接发送 App Server 请求。CLI 命令如下。
 
 | 命令 | 作用 |
 |---|---|
@@ -74,7 +70,7 @@ App Server 由部署配置显式选择。执行默认关闭；整个 `codex_app_
 | `vibeface codex send <thread> <text> --id ID [--model M] [--effort E] [--image PATH]...` | 带 `thread` 的 `dispatch_work`：登记工作后 `thread/resume`，回合进行中时 `turn/steer`，否则 `turn/start`；输出与 `dispatch_work` 相同 |
 | `vibeface codex watch <thread>` | `thread/resume` 后逐行打印通知 |
 
-`send` 是一项工作，`--id` 即 `call_ref`。登记前先问 Node 线程在哪个 App Server，再在那里 `thread/read`；在本人自己的 Codex 上时登记后发到那里，不带审批、沙箱和模型覆盖（Codex 会把一个回合的这些设置沿用到之后的回合），`--model`、`--effort` 只在明确给出时带上。两边都没有、读不到本人的 Codex 或 Node 说不清时不登记也不发送，见 [Node 协议参考](../node-protocol.md)。同一轮同一 `--id` 再次执行只拿回原工作，不会发第二次；结果不明时由 Node 按 `clientUserMessageId` 对账。Bot 转达本人的回答时以回答消息的 `message_id` 作 `--id`。
+`send` 和其他派发共用工作登记，以 `--id` 作为 `call_ref`。同一轮重试同一 ID 时，Node 回读已有工作。发送结果不明时，Node 按 `clientUserMessageId` 对账。Bot 转达本人的回答时，以回答消息的 `message_id` 作为 `--id`。入口与覆盖规则见[线程定位与回合行为](../node-protocol.md#codex-app-server-配置)。
 
 ### 2.3 派发流程
 
