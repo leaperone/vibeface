@@ -1,37 +1,31 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { deliveryAbi } from './abi-model.mjs';
 import { compile, artifact, artifacts, requireDependency, schema } from './compile.mjs';
 import { deployFixtureContract, withLocalEvm } from './local-evm-fixture.mjs';
 
 if (!process.argv[2]) throw Error('Usage: node compare-vectors.mjs <public-vectors.json>');
 const vectors = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-const ganache = requireDependency('ganache');
 const { BrowserProvider, ContractFactory, Contract, AbiCoder, sha256, toUtf8Bytes, hexlify, toBeHex, zeroPadValue } = requireDependency('ethers');
 compile();
+const a = artifact('AccountingTestEscrow');
+const model = deliveryAbi(a, { accounting: true });
+const configured = model.configuredProfile(vectors.profile);
+const bytes = value => `0x${value}`;
+assert.equal(configured.bytes, bytes(vectors.profileAbi).toLowerCase(), 'configured profile ABI bytes must match the Rust vector');
+assert.equal(configured.id, bytes(vectors.profileId).toLowerCase(), 'configured profile ID must match the Rust vector');
+const ganache = requireDependency('ganache');
 await withLocalEvm({ ganache, BrowserProvider }, async ({ rpc, provider }) => {
   const coder = AbiCoder.defaultAbiCoder();
   const tag = value => sha256(toUtf8Bytes(value));
-  const bytes = value => `0x${value}`;
   const hex = value => hexlify(Uint8Array.from(value));
   const cases = [];
   function compare(name, actual, expected) {
     assert.equal(actual.toLowerCase(), expected.toLowerCase(), name);
     cases.push({ name, passed: true }); console.log(`PASS ${name}`);
   }
-  const p = vectors.profile;
-  const profile = { domain: tag('vibeface-delivery-profile-v1'), guestImageId: hex(p.guest_image_id),
-    statementSchemaHash: hex(p.statement_schema_hash), cryptoSuite: p.crypto_suite, maxWindows: p.max_windows,
-    maxWindowBytes: p.max_window_bytes, maxTotalBytes: p.max_total_bytes, maxGuestCycles: p.max_guest_cycles,
-    maxProverMemoryBytes: BigInt(p.max_prover_memory_bytes) };
-  const a = artifact('AccountingTestEscrow');
-  const fields = artifact('DeliveryEscrow').abi.find(x => x.name === 'preview').inputs[0].components;
-  const statementType = `tuple(${fields.map(x => `${x.type} ${x.name}`).join(',')})`;
-  const object = value => Object.fromEntries(fields.map(x => [x.name, value[x.name]]));
-  const encode = value => coder.encode([statementType], [object(value)]);
-  const profileFields = a.abi.find(x => x.type === 'constructor').inputs[0].components;
-  const profileType = `tuple(${profileFields.map(x => `${x.type} ${x.name}`).join(',')})`;
-  const deployed = await deployFixtureContract(ContractFactory, a, await provider.getSigner(), profile, { gasLimit: 29000000 });
+  const deployed = await deployFixtureContract(ContractFactory, a, await provider.getSigner(), configured.value, { gasLimit: 29000000 });
   const deployment = await deployed.getAddress();
   const fixedEscrow = hex(vectors.order.unsigned.terms.binding.escrow);
   // Only this disposable EVM transplants code/storage to reproduce Rust's fixed address vector.
@@ -43,16 +37,16 @@ await withLocalEvm({ ganache, BrowserProvider }, async ({ rpc, provider }) => {
   const escrow = new Contract(fixedEscrow, a.abi, provider);
   const onChainProfile = await escrow.getProfile();
   compare('schema exact source bytes', sha256(toUtf8Bytes(schema)), bytes(vectors.schemaHash));
-  compare('profile canonical ABI bytes', coder.encode([profileType], [onChainProfile]), bytes(vectors.profileAbi));
+  compare('profile canonical ABI bytes', model.encodeObservedProfile(onChainProfile), bytes(vectors.profileAbi));
   compare('profile ID', await escrow.profileId(), bytes(vectors.profileId));
-  const source = object(coder.decode([statementType], bytes(vectors.windows[0].statements[0].journal))[0]);
+  const source = model.decodeJournal(bytes(vectors.windows[0].statements[0].journal));
   await rpc.request({ method: 'evm_setAccountCode', params: [source.asset, '0x00'] });
   const specs = vectors.order.unsigned.windows.map(s => ({ index: s.index, offset: s.offset, plaintextBytes: s.plaintext_bytes,
     ciphertextBytes: s.ciphertext_bytes, ciphertextHash: hex(s.ciphertext_hash), capsuleHash: hex(s.capsule_hash),
     plaintextCommitment: hex(s.plaintext_commitment), deliveryFee: BigInt(s.delivery_fee), reservationFee: BigInt(s.reservation_fee) }));
-  const keyInput = object(coder.decode([statementType], bytes(vectors.keyJournal))[0]);
+  const keyInput = model.decodeJournal(bytes(vectors.keyJournal));
   const binding = await escrow.previewBinding(keyInput);
-  compare('key_binding journal', encode(binding), bytes(vectors.keyJournal));
+  compare('key_binding journal', model.encodeJournal(binding), bytes(vectors.keyJournal));
   compare('key binding payload hash', binding.keyBindingHash, sha256(bytes(vectors.keyBindingPayload)));
   const statements = await escrow.preview(source, specs);
   compare('order ID', statements[0].orderId, bytes(vectors.orderId));
@@ -69,8 +63,9 @@ await withLocalEvm({ ganache, BrowserProvider }, async ({ rpc, provider }) => {
       const relation = expected.relation;
       assert([2, 3, 4].includes(relation), `unknown vector relation: ${relation}`);
       const actual = await escrow.previewRelation(source, specs, i, relation);
-      compare(`window ${i} ${expected.relation} journal`, encode(actual), bytes(expected.journal));
-      compare(`window ${i} ${expected.relation} digest`, sha256(encode(actual)), bytes(expected.journalHash));
+      const journal = model.encodeJournal(actual);
+      compare(`window ${i} ${expected.relation} journal`, journal, bytes(expected.journal));
+      compare(`window ${i} ${expected.relation} digest`, sha256(journal), bytes(expected.journalHash));
     }
     compare(`window ${i} leaf hash`, sha256(coder.encode(
       ['bytes32', 'uint16', 'uint64', 'uint32', 'uint32', 'bytes32', 'bytes32', 'bytes32', 'uint256', 'uint256'],

@@ -4,6 +4,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
+import { deliveryAbi } from './abi-model.mjs';
 import { artifact, requireDependency, root } from './compile.mjs';
 
 const [workItem, directory, inputDirectory] = process.argv.slice(2);
@@ -45,7 +46,7 @@ function progress(stage) {
   fs.writeFileSync(path.join(publicDir, 'summary.json'), encode(result), { mode: 0o600 });
   console.log(`delivery-small ${workItem} ${stage}`);
 }
-let compiled, profile, profileSha256, cgroup;
+let compiled, profile, profileSha256, configuredProfileId, model, cgroup;
 let active, deploymentProcess, deploymentExit, provider, interruption;
 function remaining() {
   if (interruption) throw interruption;
@@ -108,6 +109,7 @@ async function invoke(label, program, args, input, output, expected = 'success')
   return stdout;
 }
 const { JsonRpcProvider, Contract, AbiCoder, TypedDataEncoder, getBytes, sha256 } = requireDependency('ethers');
+const coder = AbiCoder.defaultAbiCoder();
 const rpc = async (method, params = []) => { remaining(); const value = await provider.send(method, params); remaining(); return value; };
 const latest = () => rpc('eth_getBlockByNumber', ['latest', false]);
 async function stopDeployment() {
@@ -153,6 +155,7 @@ async function startDeployment(label) {
   provider = new JsonRpcProvider(deployment.rpc_url, undefined, { cacheTimeout: -1 });
   assert.equal((await provider.getNetwork()).chainId, 31337n);
   assert.deepEqual(deployment.profile, profile);
+  assert.equal(deployment.profile_id, configuredProfileId);
   assert.equal(deployment.experiment_fixture?.recipe, recipe);
   const pool = await rpc('txpool_content');
   assert.deepEqual(pool.pending, {}); assert.deepEqual(pool.queued, {});
@@ -193,10 +196,9 @@ async function projectDeployment(deployment) {
 }
 const original = Buffer.from(Array.from({ length: 4096 }, (_, i) => (i * 37 + 19) % 251));
 const originalFile = path.join(privateDir, 'original.bin');
-let fields, coder, statementType;
 function changedJournal(journal, field) {
-  const bytes = Buffer.from(journal, 'hex'), wordIndex = fields.findIndex(item => item.name === field);
-  assert(wordIndex >= 0 && bytes.length === compiled.statementBytes && bytes.length === fields.length * 32);
+  const bytes = Buffer.from(journal, 'hex'), wordIndex = model.statementType.components.findIndex(item => item.name === field);
+  assert(wordIndex >= 0 && bytes.length === model.journalBytes);
   bytes[wordIndex * 32] ^= 1;
   const changed = bytes.toString('hex'); assert.notEqual(changed, journal);
   return changed;
@@ -208,6 +210,7 @@ async function rebuild(projection, destination, label) {
   await invoke(label, fixture, ['experiment', contextFile, originalFile, destination, profilePath]);
   const vectors = readJson(path.join(destination, 'vectors.json'));
   assert.deepEqual(vectors.profile, profile); assert.equal(vectors.schemaHash, compiled.schemaHash);
+  assert.equal(`0x${vectors.profileId}`, configuredProfileId);
   assert.equal(vectors.windows.length, 1);
   const expectedJournals = [{ relation: 1, journal: vectors.keyJournal, journalHash: digest(Buffer.from(vectors.keyJournal, 'hex')) },
     ...vectors.windows[0].statements.map(value => ({ relation: value.relation, journal: value.journal, journalHash: value.journalHash }))];
@@ -215,7 +218,7 @@ async function rebuild(projection, destination, label) {
   for (const value of expectedJournals) {
     assert.match(value.journal, /^[0-9a-f]+$/); assert.equal(value.journal.length, compiled.statementBytes * 2);
     assert.equal(value.journalHash, digest(Buffer.from(value.journal, 'hex')));
-    const decoded = coder.decode([statementType], `0x${value.journal}`)[0];
+    const decoded = model.decodeJournal(`0x${value.journal}`);
     assert.equal(decoded.relation, BigInt(value.relation));
     assert.equal(decoded.profileId, `0x${vectors.profileId}`); assert.equal(decoded.guestImageId, `0x${compiled.imageId}`);
   }
@@ -273,12 +276,15 @@ async function run() {
   compiled = readJson(path.resolve(root, '../../.artifacts/vdp/host-info.json'));
   assert.deepEqual(Object.keys(compiled).sort(), ['imageId', 'schemaHash', 'elfSha256', 'statementBytes'].sort());
   for (const field of ['imageId', 'schemaHash', 'elfSha256']) assert.match(compiled[field], /^[0-9a-f]{64}$/);
-  assert.equal(compiled.statementBytes, 1504); result.guest = compiled;
+  result.guest = compiled;
   const profileBytes = read(profilePath, 16384); profile = JSON.parse(profileBytes); profileSha256 = digest(profileBytes);
-  for (const [field, profileKey] of [['imageId', 'guest_image_id'], ['schemaHash', 'statement_schema_hash']])
-    assert.equal(Buffer.from(profile[profileKey]).toString('hex'), compiled[field]);
-  fields = artifact('DeliveryEscrow').abi.find(item => item.name === 'preview').inputs[0].components;
-  statementType = `tuple(${fields.map(item => `${item.type} ${item.name}`).join(',')})`; coder = AbiCoder.defaultAbiCoder();
+  model = deliveryAbi(artifact('DeliveryEscrow'));
+  const configured = model.configuredProfile(profile);
+  const publicProfile = configured.value;
+  configuredProfileId = configured.id;
+  assert.equal(publicProfile.guestImageId, `0x${compiled.imageId}`);
+  assert.equal(publicProfile.statementSchemaHash, `0x${compiled.schemaHash}`);
+  assert.equal(model.journalBytes, compiled.statementBytes);
   result.file = { bytes: original.length, sha256: digest(original) };
   fs.writeFileSync(originalFile, original, { flag: 'wx', mode: 0o600 });
   let inputBytes, expectedContext;
@@ -343,17 +349,14 @@ async function run() {
   const escrow = new Contract(deployment.escrow, artifact('DeliveryEscrow').abi, provider);
   const token = new Contract(deployment.asset, artifact('TestToken').abi, provider);
   progress('fund-and-hold');
-  const decode = proof => {
-    const decoded = coder.decode([statementType], `0x${proof.journal}`)[0];
-    return Object.fromEntries(fields.map(item => [item.name, decoded[item.name]]));
-  };
+  const decode = proof => model.decodeJournal(`0x${proof.journal}`);
   const key = decode(proofs[0]), source = decode(proofs[1]);
   const spec = { index: source.windowIndex, offset: source.windowOffset, plaintextBytes: source.windowPlaintextBytes,
     ciphertextBytes: source.windowCiphertextBytes, ciphertextHash: source.ciphertextHash, capsuleHash: source.capsuleHash,
     plaintextCommitment: source.plaintextCommitment, deliveryFee: source.windowDeliveryFee, reservationFee: source.windowReservationFee };
   assert.equal(source.totalPlaintextBytes, 4096n); assert.equal(source.windowCount, 1n); assert.equal(source.acceptance, 0n);
   assert.equal(source.windowCiphertextBytes, 4164n); assert.equal(source.escrow.toLowerCase(), deployment.escrow);
-  const canonical = value => coder.encode([statementType], [value]);
+  const { encodeJournal: canonical } = model;
   assert.equal(canonical(await escrow.previewBinding(key)), `0x${proofs[0].journal}`);
   assert.equal(canonical((await escrow.preview(source, [spec]))[0]), `0x${proofs[1].journal}`);
   const id = source.orderId, capsule = `0x${vectors.windows[0].capsule}`;

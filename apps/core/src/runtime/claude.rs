@@ -3,6 +3,7 @@
 //! The Node names the session and the user message before anything is sent, so a turn it lost
 //! sight of is read back from Claude Code's own transcript and never sent again. Hooks of the
 //! owner's own sessions hold permission requests and questions for the bot.
+use super::child_pipes::PipedChild;
 use super::executor::{Executor, SteerAck, SteerInput, SteerTrace};
 use super::provider_adapter::bounded;
 use super::*;
@@ -18,8 +19,8 @@ use std::sync::{
     PoisonError, Weak,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::io::{AsyncWriteExt as _, BufReader};
+use tokio::process::{ChildStdin, ChildStdout};
 use vibeface_bridge::failure::ProviderStage;
 use vibeface_bridge::platform::tree;
 use vibeface_bridge::transport;
@@ -73,6 +74,14 @@ impl Guide {
     pub(super) fn started(&self, token: &str) {
         *self.tree.lock().unwrap_or_else(PoisonError::into_inner) = Some(token.into());
     }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn started_token(&self) -> Option<String> {
+        self.tree
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
 }
 
 impl Drop for Guide {
@@ -95,6 +104,37 @@ struct InputChannel {
     open: Arc<AtomicBool>,
     pending: Arc<std::sync::Mutex<BTreeSet<String>>>,
     projects: Option<PathBuf>,
+}
+
+impl InputChannel {
+    fn close(&self) {
+        let _pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        self.open.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Releases the input registration when its process ends or its future is dropped.
+struct InputRegistration {
+    registry: Arc<Processes>,
+    session: String,
+    channel: InputChannel,
+}
+
+impl Drop for InputRegistration {
+    fn drop(&mut self) {
+        self.channel.close();
+        let mut inputs = self
+            .registry
+            .inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if inputs
+            .get(&self.session)
+            .is_some_and(|input| Arc::ptr_eq(&input.open, &self.channel.open))
+        {
+            inputs.remove(&self.session);
+        }
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -190,19 +230,27 @@ impl Processes {
 
     pub(super) fn track(&self, token: &str, bin: &Path) -> Result<()> {
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
-        running.insert(token.to_owned(), bin.to_owned());
-        self.save(&running, None)
-            .context("record the agent process tree")
+        let previous = running.insert(token.to_owned(), bin.to_owned());
+        if let Err(error) = self.save(&running, None) {
+            if let Some(previous) = previous {
+                running.insert(token.to_owned(), previous);
+            } else {
+                running.remove(token);
+            }
+            // The atomic write may have renamed the file before reporting an error. Leave
+            // anything already on disk available for recovery.
+            return Err(error).context("record the agent process tree");
+        }
+        Ok(())
     }
 
     /// Drops `token` from the journal once its tree is confirmed gone; a tree that may still
     /// run stays recorded for the next check.
     pub(super) fn forget(&self, token: &str) {
-        self.remove_input(token);
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
         if !matches!(tree::Leftover::find(token), Ok(None)) {
             return;
         }
-        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
         running.remove(token);
         let _ = self.save(&running, Some(token));
     }
@@ -264,51 +312,31 @@ impl Processes {
     }
 
     fn register_input(
-        &self,
+        self: &Arc<Self>,
         session: &str,
         turn: &str,
         process: &Process,
         projects: Option<PathBuf>,
-    ) -> Result<()> {
+    ) -> Result<InputRegistration> {
         let mut inputs = self.inputs.lock().unwrap_or_else(PoisonError::into_inner);
         ensure!(
             !inputs.contains_key(session),
             "Claude Code already runs this session"
         );
-        inputs.insert(
-            session.into(),
-            InputChannel {
-                turn: turn.into(),
-                tree: process.tree.token().to_owned(),
-                stdin: process.stdin.clone(),
-                open: Arc::new(AtomicBool::new(true)),
-                pending: Default::default(),
-                projects,
-            },
-        );
-        Ok(())
-    }
-
-    fn close_input(&self, tree: &str) {
-        for input in self
-            .inputs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .values()
-        {
-            if input.tree == tree {
-                let _pending = input.pending.lock().unwrap_or_else(PoisonError::into_inner);
-                input.open.store(false, Ordering::SeqCst);
-            }
-        }
-    }
-
-    fn remove_input(&self, tree: &str) {
-        self.close_input(tree);
-        self.inputs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|_, input| input.tree != tree);
+        let channel = InputChannel {
+            turn: turn.into(),
+            tree: process.child.token().to_owned(),
+            stdin: process.stdin.clone(),
+            open: Arc::new(AtomicBool::new(true)),
+            pending: Default::default(),
+            projects,
+        };
+        inputs.insert(session.into(), channel.clone());
+        Ok(InputRegistration {
+            registry: self.clone(),
+            session: session.into(),
+            channel,
+        })
     }
 
     fn drained(&self, tree: &str, results: usize) -> bool {
@@ -976,25 +1004,12 @@ struct Launch<'a> {
 
 /// A running `claude -p`: its pipes and process tree.
 struct Process {
-    child: Child,
-    tree: tree::Tree,
-    reaped: bool,
+    // On drop the child is stopped before its input registration is released.
+    child: PipedChild,
+    input: Option<InputRegistration>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     lines: transport::Lines<BufReader<ChildStdout>>,
-    /// The end of what it wrote to stderr, once it closed it.
-    stderr: Option<tokio::task::JoinHandle<String>>,
     _guide: Option<Arc<Guide>>,
-}
-
-impl Drop for Process {
-    fn drop(&mut self) {
-        if !self.reaped && (cfg!(windows) || self.child.id() == Some(self.tree.root())) {
-            self.tree.kill();
-        }
-        if let Some(stderr) = self.stderr.take() {
-            stderr.abort();
-        }
-    }
 }
 
 impl Launch<'_> {
@@ -1034,50 +1049,19 @@ impl Launch<'_> {
                 command.env_remove(&name);
             }
         }
-        command
-            .envs(self.env)
-            .current_dir(self.cwd)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let (tree, mut child) = tree::Tree::spawn(command, TREE_KEY, true).map_err(|error| {
-            let kind = match error
-                .downcast_ref::<std::io::Error>()
-                .map(std::io::Error::kind)
-            {
-                Some(std::io::ErrorKind::NotFound) => FailureKind::MissingBinary,
-                _ => FailureKind::Unknown,
-            };
-            ExecFailure::new(kind, format!("could not start Claude Code: {error:#}"))
-        })?;
+        command.envs(self.env).current_dir(self.cwd);
+        let mut child = PipedChild::spawn(command, TREE_KEY, "Claude Code")?;
         if let Some(guide) = &self.guide {
-            guide.started(tree.token());
+            guide.started(child.token());
         }
-        let (Some(stdin), Some(stdout), Some(stderr)) =
-            (child.stdin.take(), child.stdout.take(), child.stderr.take())
-        else {
-            return Err(ExecFailure::new(
-                FailureKind::Lost,
-                "Claude Code exited as it started",
-            ));
-        };
-        let stderr = tokio::spawn(async move {
-            let mut stderr = stderr;
-            let (mut tail, mut buffer) = (Vec::new(), [0; 4096]);
-            while let Ok(read @ 1..) = stderr.read(&mut buffer).await {
-                tail.extend_from_slice(&buffer[..read]);
-                let over = tail.len().saturating_sub(2000);
-                tail.drain(..over);
-            }
-            String::from_utf8_lossy(&tail).trim().to_owned()
-        });
+        let (stdin, stdout) = child.take_pipes().ok_or_else(|| {
+            ExecFailure::new(FailureKind::Lost, "Claude Code exited as it started")
+        })?;
         Ok(Process {
             child,
-            tree,
-            reaped: false,
+            input: None,
             stdin: Arc::new(Mutex::new(Some(stdin))),
             lines: transport::Lines::new(BufReader::new(stdout), transport::FRAME_BYTES),
-            stderr: Some(stderr),
             _guide: self.guide.clone(),
         })
     }
@@ -1096,6 +1080,12 @@ async fn send(stdin: &Mutex<Option<ChildStdin>>, frame: &Value) -> Result<()> {
 }
 
 impl Process {
+    fn close_input(&self) {
+        if let Some(input) = &self.input {
+            input.channel.close();
+        }
+    }
+
     /// Interrupts the turn and waits for its end; true once it ended or its tree is gone.
     async fn stop(&mut self, turn: &mut Turn) -> bool {
         let _ = send(&self.stdin, &interrupt_frame()).await;
@@ -1112,34 +1102,21 @@ impl Process {
         })
         .await
         .unwrap_or(false);
-        self.reaped = agent::terminate_process_tree(&mut self.child, &mut self.tree).await;
-        self.reaped || ended
+        self.child.terminate().await || ended
     }
 
     /// Closes its input, so it exits once its turn is done, and ends its tree.
     async fn end(&mut self, processes: &Processes) {
-        processes.remove_input(self.tree.token());
+        self.input.take();
         self.stdin.lock().await.take();
-        let _ =
-            tokio::time::timeout(Duration::from_secs(5), tree::observe_exit(&mut self.child)).await;
-        if !self.reaped {
-            self.reaped = agent::terminate_process_tree(&mut self.child, &mut self.tree).await;
-        }
-        if self.reaped {
-            processes.forget(self.tree.token());
+        if self.child.finish(Duration::from_secs(5)).await {
+            processes.forget(self.child.token());
         }
     }
 
     /// What it wrote to stderr before it exited.
     async fn stderr(&mut self) -> String {
-        match self.stderr.take() {
-            Some(tail) => tokio::time::timeout(Duration::from_secs(2), tail)
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or_default(),
-            None => String::new(),
-        }
+        self.child.stderr(Duration::from_secs(2)).await
     }
 }
 
@@ -1153,7 +1130,7 @@ impl Process {
 pub(crate) async fn run_bot<F, P, PF>(
     config: &ManagerConfig,
     bin: &Path,
-    processes: &Processes,
+    processes: &Arc<Processes>,
     prompt: &str,
     previous: Option<&str>,
     persist_session: impl FnOnce(String) -> F,
@@ -1277,11 +1254,12 @@ where
         .map_err(|failure| error(ManagerFailure::Failed, native, failure))?;
     let sent = async {
         stage.enter(ProviderStage::Record);
-        processes.track(process.tree.token(), bin)?;
+        processes.track(process.child.token(), bin)?;
         if let Some(started) = &config.process_started {
-            started(process.tree.root()).await?;
+            started(process.child.root()).await?;
         }
-        processes.register_input(&session, &message, &process, projects.clone())?;
+        process.input =
+            Some(processes.register_input(&session, &message, &process, projects.clone())?);
         stage.enter(ProviderStage::TurnStart);
         *start.lock().unwrap() = manager::StartEvidence::Unknown;
         send(&process.stdin, &user_frame(prompt, &message)).await
@@ -1317,7 +1295,7 @@ where
                 break Err(error(kind, native, ExecFailure::new(FailureKind::TimedOut, "Claude Code management timed out")));
             }
             _ = drain.tick(), if ending.is_some() => {
-                if processes.drained(process.tree.token(), results) { break Ok(ending.take().expect("result")); }
+                if processes.drained(process.child.token(), results) { break Ok(ending.take().expect("result")); }
                 continue;
             }
             line = process.lines.next_line() => line,
@@ -1331,7 +1309,7 @@ where
         }
         let Ok(Some(line)) = line else {
             if let Some(ending) = ending.take() {
-                break if processes.drained(process.tree.token(), results) {
+                break if processes.drained(process.child.token(), results) {
                     Ok(ending)
                 } else {
                     Err(error(
@@ -1403,9 +1381,9 @@ where
             }
         }
         if let Some(next) = turn.ending.take() {
-            processes.close_input(process.tree.token());
+            process.close_input();
             Ending::append(&mut ending, next);
-            if processes.drained(process.tree.token(), results) {
+            if processes.drained(process.child.token(), results) {
                 break Ok(ending.take().expect("result"));
             }
         }
@@ -1601,7 +1579,7 @@ async fn follow(
         let line = tokio::select! {
             _ = drain.tick(), if ending.is_some() => {
                 let Some(node) = node.upgrade() else { return; };
-                if node.claude.processes.drained(process.tree.token(), results) { break; }
+                if node.claude.processes.drained(process.child.token(), results) { break; }
                 continue;
             }
             line = process.lines.next_line() => line,
@@ -1612,7 +1590,10 @@ async fn follow(
         let Ok(Some(line)) = line else {
             missing_input_results = line.is_err()
                 || (ending.is_some()
-                    && !node.claude.processes.drained(process.tree.token(), results));
+                    && !node
+                        .claude
+                        .processes
+                        .drained(process.child.token(), results));
             if let Err(error) = &line {
                 tracing::warn!(%error, "Claude Code output transport stopped; reconcile native session");
             }
@@ -1648,31 +1629,27 @@ async fn follow(
             }
         }
         if let Some(next) = turn.ending.take() {
-            node.claude.processes.close_input(process.tree.token());
+            process.close_input();
             Ending::append(&mut ending, next);
-            if node.claude.processes.drained(process.tree.token(), results) {
+            if node
+                .claude
+                .processes
+                .drained(process.child.token(), results)
+            {
                 break;
             }
         }
     }
-    if let Some(node) = node.upgrade() {
-        node.claude.processes.remove_input(process.tree.token());
-    }
+    process.input.take();
     process.stdin.lock().await.take();
-    let _ = tokio::time::timeout(
-        Duration::from_secs(5),
-        tree::observe_exit(&mut process.child),
-    )
-    .await;
-    let stopped = agent::terminate_process_tree(&mut process.child, &mut process.tree).await;
-    process.reaped = stopped;
+    let stopped = process.child.finish(Duration::from_secs(5)).await;
     let Some(node) = node.upgrade() else {
         return;
     };
     // From here a probe reads the finished transcript.
     node.claude.live().remove(&work_id);
     if stopped {
-        node.claude.processes.forget(process.tree.token());
+        node.claude.processes.forget(process.child.token());
     }
     if missing_input_results {
         if let Err(error) = node
@@ -1815,9 +1792,13 @@ impl Executor for Claude {
                 Err(failure) => return reject(failure),
             };
             let sent = async {
-                self.processes.track(process.tree.token(), &bin)?;
-                self.processes
-                    .register_input(&session, &message, &process, projects.clone())?;
+                self.processes.track(process.child.token(), &bin)?;
+                process.input = Some(self.processes.register_input(
+                    &session,
+                    &message,
+                    &process,
+                    projects.clone(),
+                )?);
                 send(&process.stdin, &user_frame(&work.prompt, &message)).await
             }
             .await;
@@ -1834,7 +1815,7 @@ impl Executor for Claude {
                 Live {
                     session: session.clone(),
                     stdin: process.stdin.clone(),
-                    tree: process.tree.token().to_owned(),
+                    tree: process.child.token().to_owned(),
                     interrupted: interrupted.clone(),
                 },
             );
@@ -3164,6 +3145,28 @@ pub(super) mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn a_missing_claude_binary_keeps_its_launch_error() -> Result<()> {
+        let place = Place::new()?;
+        let result = Launch {
+            bin: &place.dir.join("missing-claude"),
+            cwd: &place.dir,
+            session: "fixture",
+            resume: false,
+            model: "fixture",
+            effort: None,
+            guide: None,
+            env: &BTreeMap::new(),
+        }
+        .spawn();
+        let Err(failure) = result else {
+            panic!("the missing executable started");
+        };
+        assert_eq!(failure.kind, FailureKind::MissingBinary);
+        assert!(failure.detail.starts_with("could not start Claude Code: "));
+        Ok(())
+    }
+
     #[cfg(unix)]
     pub(crate) fn cooperative_cli(directory: &Path) -> Result<PathBuf> {
         use std::os::unix::fs::PermissionsExt as _;
@@ -3211,7 +3214,7 @@ time.sleep(0.05)
         }
         .spawn()?;
         let processes = Processes::new(place.dir.join(PIDFILE));
-        processes.track(process.tree.token(), &bin)?;
+        processes.track(process.child.token(), &bin)?;
         tokio::time::timeout(Duration::from_secs(5), async {
             while !place.dir.join("member-ready").exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3276,6 +3279,113 @@ time.sleep(0.05)
             "an interrupted turn keeps its locator without advancing coverage"
         );
         assert!(!place.dir.join(PIDFILE).exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_a_claude_bot_future_releases_only_its_input_registration() -> Result<()> {
+        let place = Place::new()?;
+        let config = gated_config(&place, "dropped");
+        let manager::Sdk::Claude { bin, processes } = &config.sdk else {
+            unreachable!();
+        };
+        let unrelated_session = uuid::Uuid::new_v4().to_string();
+        let env = place.env();
+        let mut unrelated = Launch {
+            bin,
+            cwd: &config.workspace,
+            session: &unrelated_session,
+            resume: false,
+            model: "fixture",
+            effort: None,
+            guide: None,
+            env: &env,
+        }
+        .spawn()?;
+        processes.track(unrelated.child.token(), bin)?;
+        let unrelated_token = unrelated.child.token().to_owned();
+        unrelated.input = Some(processes.register_input(
+            &unrelated_session,
+            "unrelated-turn",
+            &unrelated,
+            projects_dir(&env),
+        )?);
+
+        let mut turn = Box::pin(manager::run_manager(
+            &config,
+            "cancel this turn",
+            None,
+            |_| async { Ok(()) },
+            tokio::sync::watch::channel(false).1,
+            |_| async { Ok(()) },
+        ));
+        let gate = place.dir.join("concurrent-gate");
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if std::fs::read_dir(&gate)?.next().is_some() {
+                    return anyhow::Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        tokio::select! {
+            result = ready => result??,
+            _ = &mut turn => bail!("the Claude fixture finished before cancellation"),
+        }
+        let (session, channel) = {
+            let inputs = processes.inputs.lock().unwrap();
+            let (session, channel) = inputs
+                .iter()
+                .find(|(_, input)| input.turn == derived(MESSAGE_SEED, "dropped"))
+                .context("the dropped turn registered its input")?;
+            (session.clone(), channel.clone())
+        };
+        drop(turn);
+
+        {
+            let inputs = processes.inputs.lock().unwrap();
+            assert!(!inputs.contains_key(&session));
+            assert!(!channel.open.load(Ordering::SeqCst));
+            let unrelated = inputs.get(&unrelated_session).context("the other input")?;
+            assert_eq!(unrelated.tree, unrelated_token);
+            assert!(unrelated.open.load(Ordering::SeqCst));
+        }
+        let journal = processes.journal()?;
+        assert_eq!(
+            recorded_program(&journal, &channel.tree).as_deref(),
+            Some(bin.as_path())
+        );
+        assert_eq!(
+            recorded_program(&journal, &unrelated_token).as_deref(),
+            Some(bin.as_path())
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while tree::token_is_running(&channel.tree) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("the dropped turn's process tree ended")?;
+        assert!(tree::token_is_running(&unrelated_token));
+
+        let mut replacement = bot_config(&place, Arc::new(|_, _| Box::pin(async { Ok(()) })));
+        replacement.sdk = config.sdk.clone();
+        replacement.turn_binding.as_mut().unwrap().client_id = "replacement".into();
+        let result = manager::run_manager(
+            &replacement,
+            "replacement prompt",
+            Some(&session),
+            |_| async { Ok(()) },
+            tokio::sync::watch::channel(false).1,
+            |_| async { Ok(()) },
+        )
+        .await?;
+        assert_eq!(result.session_id.as_deref(), Some(session.as_str()));
+        assert_eq!(result.output, "done: replacement prompt");
+        assert_eq!(place.user_frames(), 2);
+        unrelated.end(processes).await;
+        processes.forget(&channel.tree);
         Ok(())
     }
 

@@ -8,6 +8,7 @@ mod application;
 pub mod host;
 mod theme;
 pub mod ui;
+mod update;
 pub mod views;
 pub mod widgets;
 

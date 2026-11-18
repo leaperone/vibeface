@@ -59,6 +59,108 @@ pub fn same_owner(left: &Path, right: &Path) -> Result<bool> {
     Ok(owner_of(left)? == owner_of(right)?)
 }
 
+pub fn owned_by_current_account(path: &Path) -> Result<bool> {
+    #[cfg(unix)]
+    let owned = owner_of(path)? == current_account()?;
+    #[cfg(windows)]
+    let owned = super::winsec::path_owned_by_current_account(path)?;
+    Ok(owned)
+}
+
+/// Whether writes and replacement of this installation path are limited to the current
+/// account and system administrators.
+pub fn is_trusted_install_path(path: &Path, ancestor: bool) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let metadata = std::fs::symlink_metadata(path)?;
+        let owner = metadata.uid();
+        let file_type = metadata.file_type();
+        let mode = metadata.permissions().mode();
+        let trusted_owner = owner == 0 || Account(owner) == current_account()?;
+        let sticky_ancestor = ancestor && metadata.is_dir() && owner == 0 && mode & 0o1000 != 0;
+        if !trusted_owner || !(file_type.is_symlink() || mode & 0o022 == 0 || sticky_ancestor) {
+            return Ok(false);
+        }
+        #[cfg(target_os = "macos")]
+        let safe = macos_install_acl_is_safe(path)?;
+        #[cfg(not(target_os = "macos"))]
+        let safe = true;
+        Ok(safe)
+    }
+    #[cfg(windows)]
+    {
+        super::winsec::path_is_trusted_install(path, ancestor).map_err(Into::into)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_install_acl_is_safe(path: &Path) -> io::Result<bool> {
+    use std::ffi::{CString, c_char, c_int, c_void};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    // Apple's <sys/acl.h> defines these types and values for extended ACLs.
+    const EXTENDED: c_int = 0x100;
+    const FIRST: c_int = 0;
+    const NEXT: c_int = -1;
+    const DENY: c_int = 2;
+    unsafe extern "C" {
+        fn acl_get_link_np(path: *const c_char, kind: c_int) -> *mut c_void;
+        fn acl_get_entry(acl: *mut c_void, which: c_int, entry: *mut *mut c_void) -> c_int;
+        fn acl_get_tag_type(entry: *mut c_void, tag: *mut c_int) -> c_int;
+        fn acl_free(acl: *mut c_void) -> c_int;
+    }
+    struct Acl(*mut c_void);
+    impl Drop for Acl {
+        fn drop(&mut self) {
+            // SAFETY: this wrapper owns a non-null ACL returned from acl_get_link_np.
+            unsafe { acl_free(self.0) };
+        }
+    }
+
+    let original_path = path;
+    let before = std::fs::symlink_metadata(original_path)?;
+    let path = CString::new(original_path.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    // SAFETY: the path is NUL terminated. This lookup does not follow the final symlink.
+    let acl = unsafe { acl_get_link_np(path.as_ptr(), EXTENDED) };
+    if acl.is_null() {
+        let error = io::Error::last_os_error();
+        return if error
+            .raw_os_error()
+            .is_some_and(|code| [libc::ENOENT, libc::ENOTSUP, libc::EOPNOTSUPP].contains(&code))
+        {
+            let after = std::fs::symlink_metadata(original_path)?;
+            Ok((after.dev(), after.ino()) == (before.dev(), before.ino()))
+        } else {
+            Err(error)
+        };
+    }
+    let acl = Acl(acl);
+    let mut which = FIRST;
+    loop {
+        let mut entry = std::ptr::null_mut();
+        // SAFETY: the ACL owns all returned entries and the out pointer is writable.
+        if unsafe { acl_get_entry(acl.0, which, &mut entry) } != 0 {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::EINVAL) {
+                Ok(true)
+            } else {
+                Err(error)
+            };
+        }
+        let mut tag = 0;
+        // SAFETY: the previous call returned an entry inside the live ACL.
+        if unsafe { acl_get_tag_type(entry, &mut tag) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if tag != DENY {
+            return Ok(false);
+        }
+        which = NEXT;
+    }
+}
+
 /// Whether no account other than this one can read or write `path`, which may be a file or a
 /// directory.
 pub fn is_private(path: &Path) -> Result<bool> {

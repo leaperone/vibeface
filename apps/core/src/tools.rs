@@ -48,46 +48,7 @@ macro_rules! tools {
     };
 }
 
-tools! {
-    WorkspaceState => ("workspace_state", Read),
-    WorkspaceHistory => ("workspace_history", Read),
-    WorkspaceCommand => ("workspace_command", Work),
-    Search => ("tool_search", Read),
-    Describe => ("tool_describe", Read),
-    Call => ("tool_call", Read),
-    Nodes => ("nodes", Read),
-    Context => ("context", Read),
-    DispatchWork => ("dispatch_work", Work),
-    WorkStatus => ("work_status", Read),
-    InterruptWork => ("interrupt_work", Work),
-    CallLookup => ("call_lookup", Read),
-    UpdateProfile => ("update_profile", Settings),
-    SaveSkill => ("save_skill", Settings),
-    RemoveSkill => ("remove_skill", Settings),
-    SaveSchedule => ("save_schedule", Settings),
-    RemoveSchedule => ("remove_schedule", Settings),
-    ReadSkill => ("read_skill", Read),
-    Remember => ("remember", Settings),
-    Forget => ("forget", Settings),
-    Recall => ("recall", Read),
-    Remind => ("remind", Wake),
-    MessageBot => ("message_bot", Wake),
-    FetchUrl => ("fetch_url", Read),
-    ListBots => ("list_bots", Read),
-    ReadBot => ("read_bot", Read),
-    CreateBot => ("create_bot", Settings),
-    ConfigureBot => ("configure_bot", Settings),
-    DeleteBot => ("delete_bot", Settings),
-    HandOverSession => ("hand_over_session", Work),
-    ListSessions => ("list_sessions", Read),
-    ProposeProviderConfig => ("propose_provider_config", Work),
-    ApplyProviderConfig => ("apply_provider_config", Work),
-    TrackWork => ("track_work", Work),
-    BindWork => ("bind_work", Work),
-    WaitWork => ("wait_work", Read),
-    HistorySearch => ("history_search", Read),
-    HistoryRead => ("history_read", Read),
-}
+vibeface_control::coordination_tools!(tools);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -505,87 +466,38 @@ impl Tool {
         }
         Ok((tool, args))
     }
+}
 
-    pub fn annotate(self, args: &Value, mut value: Value) -> Value {
-        let state = value["state"]
-            .as_str()
-            .or_else(|| value["state"]["state"].as_str());
-        let outcome = value["outcome"]
-            .as_str()
-            .or_else(|| value["state"]["outcome"].as_str());
-        let (execution, confirmation) = if value["found"] == false
-            || state.is_some_and(|state| state.contains("unverified"))
-            || outcome == Some("unverified")
-        {
-            ("unknown", "unknown")
-        } else if value.get("work_id").is_some() {
-            match (state, outcome) {
-                (Some("dispatch_rejected"), _) | (_, Some("rejected")) => {
-                    ("not_started", "confirmed")
-                }
-                (_, Some("completed" | "failed" | "interrupted")) => ("completed", "confirmed"),
-                (Some("running" | "interrupting"), _) => ("started", "confirmed"),
-                _ => ("unknown", "pending"),
-            }
-        } else if self.effect() == Effect::Read && self != Self::CallLookup {
-            ("read", "confirmed")
-        } else if value.get("event_hash").is_some()
-            || value.get("bot_id").is_some()
-            || value.get("message").is_some()
-            || value["deleted"] == true
-            || value["status"] == "applied"
-        {
-            ("applied", "confirmed")
-        } else if matches!(
-            value["status"].as_str(),
-            Some("asked" | "declined" | "unchanged")
-        ) {
-            ("not_started", "confirmed")
-        } else {
-            ("unknown", "unknown")
-        };
-        let approval = match value["status"].as_str() {
-            Some("asked") => "pending",
-            Some("applied") => "allowed",
-            Some("declined") => "denied",
-            _ if confirmation == "unknown" || value.get("work_id").is_some() => "unknown",
-            _ => "not_required",
-        };
-        let record = json!({"tool":self.name(),"call_ref":args.get("call_ref").or_else(|| value.get("call_ref")),
-            "stage":if self == Self::CallLookup { "lookup" } else { "result" },
-            "execution":execution,"confirmation":confirmation,"approval":approval,
-            "retry":if matches!(confirmation, "unknown" | "pending") { "lookup_same_ref" } else { "none" }});
-        if !value.is_object() {
-            value = json!({"value":value});
-        }
-        value["call_record"] = record;
-        value
-    }
+pub(crate) use vibeface_control::tool_receipt::{Approval, Execution, ToolOutcome, uncertain};
+#[derive(Clone, Copy)]
+pub(crate) enum FailureStage {
+    Validation,
+    Authorization,
+    Execution,
 }
 
 #[derive(Debug)]
 pub struct ToolFailure {
     pub response: Value,
 }
-
 impl ToolFailure {
-    pub fn new(
+    pub(crate) fn new(
         name: &str,
         args: &Value,
-        stage: &str,
-        unknown: bool,
+        stage: FailureStage,
         error: &anyhow::Error,
     ) -> Self {
+        let (stage, code) = match stage {
+            FailureStage::Validation => ("validation", "invalid_tool_arguments"),
+            FailureStage::Authorization => ("authorization", "tool_not_authorized"),
+            FailureStage::Execution => ("execution", "tool_execution_failed"),
+        };
+        let receipt = vibeface_control::tool_receipt::EffectReceipt::from_error(error)
+            .unwrap_or(Execution::NotStarted.with(Approval::Unknown));
         let message = crate::logging::scrub(&format!("{error:#}"));
         Self {
-            response: json!({"error":message,"code":match stage {
-            "validation" => "invalid_tool_arguments",
-            "authorization" => "tool_not_authorized",
-            _ => "tool_execution_failed",
-        },"call_record":{"tool":name,"call_ref":args.get("call_ref").or_else(|| args["arguments"].get("call_ref")),"stage":stage,
-            "execution":if unknown { "unknown" } else { "not_started" },
-            "confirmation":if unknown { "unknown" } else { "confirmed" },
-            "approval":"unknown","retry":if unknown { "lookup_same_ref" } else { "none" }}}),
+            response: json!({"error":message,"code":code,
+            "call_record":receipt.record(name, ToolOutcome::reference(args), stage)}),
         }
     }
 }
@@ -794,36 +706,27 @@ mod tests {
     }
 
     #[test]
-    fn unknown_outcomes_never_claim_a_safe_retry() {
+    fn call_records_only_format_the_supplied_effect_receipt() {
         let args = json!({"call_ref":"same-reference"});
-        for value in [
-            json!({"found":false}),
-            json!({"work_id":"w","state":"unverified"}),
-            json!({"work_id":"w","state":{"state":"unverified","probe":true}}),
-            json!({"work_id":"w","state":"dispatch_waiting"}),
+        let misleading = json!({"work_id":"w","event_hash":"e","bot_id":"b","message":"sent",
+            "state":"unverified","found":false,"status":"applied","deleted":true});
+        for (fact, execution, confirmation, retry) in [
+            (Execution::Read, "read", "confirmed", "none"),
+            (Execution::Applied, "applied", "confirmed", "none"),
+            (Execution::NotStarted, "not_started", "confirmed", "none"),
+            (Execution::Started, "started", "confirmed", "none"),
+            (Execution::Completed, "completed", "confirmed", "none"),
+            (Execution::Pending, "unknown", "pending", "lookup_same_ref"),
+            (Execution::Unknown, "unknown", "unknown", "lookup_same_ref"),
         ] {
-            let record = Tool::CallLookup.annotate(&args, value)["call_record"].clone();
-            assert_eq!(record["call_ref"], "same-reference");
-            assert_eq!(record["execution"], "unknown");
-            assert_ne!(record["confirmation"], "confirmed");
-            assert_eq!(record["retry"], "lookup_same_ref");
+            let response = fact
+                .result(misleading.clone())
+                .into_response(Tool::CallLookup.name(), &args);
+            assert_eq!(
+                response["call_record"],
+                json!({"tool":"call_lookup","call_ref":"same-reference",
+                "stage":"lookup","execution":execution,"confirmation":confirmation,"approval":"not_required","retry":retry})
+            );
         }
-        let rejected = Tool::DispatchWork.annotate(
-            &args,
-            json!({"work_id":"w","state":{"state":"finished","outcome":"rejected"}}),
-        );
-        assert_eq!(rejected["call_record"]["execution"], "not_started");
-        let approval = Tool::ProposeProviderConfig
-            .annotate(&json!({}), json!({"status":"asked","question_id":"q"}));
-        assert_eq!(approval["call_record"]["approval"], "pending");
-        let failure = ToolFailure::new(
-            "dispatch_work",
-            &args,
-            "transport",
-            true,
-            &anyhow::anyhow!("connection lost"),
-        );
-        assert_eq!(failure.response["call_record"]["execution"], "unknown");
-        assert_eq!(failure.response["call_record"]["retry"], "lookup_same_ref");
     }
 }

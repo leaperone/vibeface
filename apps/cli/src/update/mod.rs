@@ -24,13 +24,12 @@ pub struct Update {
 
 #[derive(Subcommand)]
 enum Action {
-    /// Select a release channel and install or remove the automatic update timer.
+    /// Select the release channel for a managed installation.
     Configure {
         /// Release channel to follow.
         #[arg(long, value_enum)]
         channel: Channel,
-        /// Enable or disable automatic updates.
-        #[arg(long, action = clap::ArgAction::Set)]
+        #[arg(long, hide = true, default_value_t = true, action = clap::ArgAction::Set)]
         automatic: bool,
         /// Root of the managed Vibeface installation.
         #[arg(long)]
@@ -38,14 +37,14 @@ enum Action {
         #[command(flatten)]
         data: Data,
     },
-    /// Show the local policy and any interrupted activation.
+    /// Show the saved policy, native schedule, and any interrupted activation.
     Status(Data),
     /// Check the selected channel without stopping the node.
     Check(Data),
     /// Install a newer compatible release when this node is idle.
     Apply {
-        /// Used by the user-service timer; disabled policies do nothing.
-        #[arg(long)]
+        /// Run as a scheduled user-service update.
+        #[arg(long, hide = true)]
         automatic: bool,
         #[command(flatten)]
         data: Data,
@@ -55,7 +54,7 @@ enum Action {
 #[derive(Args)]
 struct Data {
     /// Node data directory.
-    #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = absolute_path, default_value_os_t = default_data_dir())]
+    #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = absolute_path, default_value_os_t = crate::default_data_dir())]
     data_dir: PathBuf,
 }
 
@@ -117,13 +116,6 @@ fn absolute_path(value: &str) -> Result<PathBuf, String> {
     }
 }
 
-fn default_data_dir() -> PathBuf {
-    std::env::var_os("HOME").map_or_else(
-        || PathBuf::from(".vibeface"),
-        |home| PathBuf::from(home).join(".vibeface"),
-    )
-}
-
 fn core_binary() -> Result<PathBuf> {
     vibeface_control::sibling_core(&std::env::current_exe()?)
 }
@@ -150,19 +142,40 @@ pub(crate) fn lock_data_dir(data: &Path) -> Result<File> {
 }
 
 fn policy(data: &Path) -> Result<Policy> {
-    let path = data.join("update.json");
-    Ok(serde_json::from_slice(&fs::read(path).context(
-        "configure updates with an explicit --install-root before using the updater",
-    )?)?)
+    saved_policy(data)?.context("configure updates or install the managed Node service first")
 }
 
-/// Resolve the same managed installation used by this node's update policy.
-pub fn managed_install_root(data: &Path) -> Result<PathBuf> {
-    let root = policy(data)?.install_root;
-    ensure!(root.is_absolute(), "install-root must be absolute");
-    let root = fs::canonicalize(root)
-        .context("managed installation is required; install a published Vibeface package first")?;
-    installed(&root)?;
+/// Use the saved installation binding, or discover a current GitHub package for a new service.
+pub(crate) fn service_install_root(data: &Path, executable: &Path) -> Result<PathBuf> {
+    let executable = fs::canonicalize(executable)?;
+    let saved = saved_policy(data)?;
+    let root = if let Some(policy) = &saved {
+        policy.install_root.clone()
+    } else {
+        executable
+            .parent()
+            .and_then(Path::parent)
+            .filter(|parent| parent.file_name().is_some_and(|name| name == "releases"))
+            .and_then(Path::parent)
+            .context("install a published Vibeface package before installing its Node service")?
+            .to_path_buf()
+    };
+    let package = installed(&root)?;
+    let binary = root.join("current").join(PROGRAMS[0]);
+    ensure!(
+        package.join(PROGRAMS[0]) == executable,
+        "service management requires the current managed binary; run {}",
+        binary.display()
+    );
+    let root = fs::canonicalize(root)?;
+    ensure!(
+        !root.starts_with(data),
+        "install-root must not be inside the node data directory"
+    );
+    if saved.is_none() {
+        release::verify_sealed_contents(&package, &crate::desktop_node::target()?)
+            .context("verify the published managed package")?;
+    }
     Ok(root)
 }
 
@@ -198,6 +211,16 @@ pub fn npm_install_root(executable: &Path) -> Result<Option<PathBuf>> {
 }
 
 pub async fn run(options: Update) -> Result<()> {
+    ensure!(
+        !matches!(
+            options.action,
+            Action::Configure {
+                automatic: false,
+                ..
+            }
+        ),
+        "automatic updates are required for managed Node services"
+    );
     let data = match &options.action {
         Action::Configure { data, .. }
         | Action::Status(data)
@@ -214,6 +237,7 @@ pub async fn run(options: Update) -> Result<()> {
                     "{}",
                     serde_json::json!({"distribution":"npm", "install_root":root,
                     "current_version":env!("CARGO_PKG_VERSION"), "automatic":false,
+                    "automatic_update_scheduled":false,
                     "recovery_required":data.join("update-pending.json").exists()})
                 );
                 return Ok(());
@@ -266,16 +290,17 @@ async fn act(options: Update, data: PathBuf) -> Result<()> {
             let current = installed(&policy.install_root)
                 .and_then(|path| manifest(&path).map(|m| m.version))
                 .ok();
+            let scheduled = service_update_schedule(&policy, &data).await.ok().flatten();
             println!(
                 "{}",
                 serde_json::json!({"policy":policy,"current_version":current,
+                    "automatic_update_scheduled":scheduled,
                     "recovery_required":data.join("update-pending.json").exists()})
             );
             Ok(())
         }
         Action::Configure {
             channel,
-            automatic,
             install_root,
             ..
         } => {
@@ -288,15 +313,32 @@ async fn act(options: Update, data: PathBuf) -> Result<()> {
                 "--install-root must be absolute"
             );
             let install_root = fs::canonicalize(install_root)?;
-            let package = installed(&install_root)?;
-            manifest(&package)?;
+            installed(&install_root)?;
+            ensure!(
+                !install_root.starts_with(&data),
+                "install-root must not be inside the node data directory"
+            );
+            ensure!(
+                saved_policy(&data)?.is_none_or(|existing| existing.install_root == install_root),
+                "Node updater is already bound to a different installation"
+            );
+            let desktop = crate::desktop_node::managed_service_for_data(&data)?;
+            let service_id = desktop.as_ref().map(|service| service.service_id.as_str());
+            let native = crate::service::native_registration(
+                &install_root.join("current"),
+                &data,
+                service_id,
+            )
+            .await?;
             let new = Policy {
                 channel,
-                automatic,
+                automatic: true,
                 install_root,
             };
-            // Keep the old policy if the platform cannot install the requested timer.
-            configure_timer(&new, &data).await?;
+            // The update lock prevents the timer from reading the old policy while we configure it.
+            if native.installed {
+                ensure_timer(&new, &data, service_id, &native).await?;
+            }
             persist(&data.join("update.json"), &new)?;
             println!("{}", serde_json::to_string(&new)?);
             Ok(())
@@ -325,9 +367,20 @@ async fn act(options: Update, data: PathBuf) -> Result<()> {
         }
         Action::Apply { automatic, .. } => {
             let policy = policy(&data)?;
+            let native = managed_registration(&policy, &data).await?;
+            if automatic && !native.installed {
+                println!("Update deferred until a managed Node service is installed.");
+                return Ok(());
+            }
+            ensure!(
+                native.installed,
+                "installed managed Node service is required"
+            );
             recover(&policy, &data).await?;
-            if automatic && !policy.automatic {
-                println!("Automatic updates are disabled.");
+            if automatic && !native.running {
+                println!(
+                    "The scheduled update will check for releases when the managed Node is running again."
+                );
                 return Ok(());
             }
             let previous = installed(&policy.install_root)?;
@@ -514,29 +567,55 @@ fn installed(root: &Path) -> Result<PathBuf> {
     Ok(package)
 }
 
-async fn configure_timer(policy: &Policy, data: &Path) -> Result<()> {
+async fn managed_registration(
+    policy: &Policy,
+    data: &Path,
+) -> Result<crate::service::NativeService> {
+    let root = fs::canonicalize(&policy.install_root)?;
+    ensure!(
+        !root.starts_with(data),
+        "install-root must not be inside the node data directory"
+    );
+    installed(&root)?;
     let desktop = crate::desktop_node::managed_service_for_data(data)?;
-    let service_id = desktop.as_ref().map(|service| service.service_id.as_str());
-    let mut command = timer_command(policy, data, service_id)?;
-    checked(&mut command, "configure automatic update service").await
+    crate::service::native_registration(
+        &root.join("current"),
+        data,
+        desktop.as_ref().map(|service| service.service_id.as_str()),
+    )
+    .await
+}
+
+async fn service_update_schedule(policy: &Policy, data: &Path) -> Result<Option<bool>> {
+    Ok(managed_registration(policy, data)
+        .await?
+        .automatic_update_scheduled)
 }
 
 fn timer_command(policy: &Policy, data: &Path, service_id: Option<&str>) -> Result<Command> {
-    let current = policy.install_root.join("current");
-    let mut command = crate::service::service_script(&current.join(SERVICE_SCRIPT))?;
-    if policy.automatic {
-        command
-            .arg("install-updater")
-            .arg("--binary")
-            .arg(current.join(PROGRAMS[0]));
-    } else {
-        command.arg("uninstall-updater");
+    crate::service::native_command(
+        &policy.install_root.join("current"),
+        data,
+        service_id,
+        "install-updater",
+        true,
+    )
+}
+
+async fn ensure_timer(
+    policy: &Policy,
+    data: &Path,
+    service_id: Option<&str>,
+    native: &crate::service::NativeService,
+) -> Result<()> {
+    if native.automatic_update_scheduled != Some(true) {
+        checked(
+            &mut timer_command(policy, data, service_id)?,
+            "configure automatic update service",
+        )
+        .await?;
     }
-    command.arg("--data-dir").arg(data);
-    if let Some(service_id) = service_id {
-        command.arg("--service-id").arg(service_id);
-    }
-    Ok(command)
+    Ok(())
 }
 
 fn persist(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -544,36 +623,96 @@ fn persist(path: &Path, value: &impl Serialize) -> Result<()> {
     privatefs::sync_dir(path.parent().context("missing parent directory")?)
 }
 
-/// Bind an App-managed Node to the existing updater policy without installing an updater task.
-/// A policy already bound to another root is never rewritten or taken over.
-pub(crate) fn bind_desktop_install_root(data: &Path, root: &Path) -> Result<()> {
+/// Bind the update policy to this installation, preserving its release channel.
+fn bind_install_root(data: &Path, root: &Path) -> Result<Policy> {
     let root = fs::canonicalize(root)?;
-    installed(&root)?;
-    let policy_path = data.join("update.json");
-    match desktop_saved_policy(data)? {
+    ensure!(
+        !root.starts_with(data),
+        "install-root must not be inside the node data directory"
+    );
+    let package = installed(&root)?;
+    let policy = match saved_policy(data)? {
         Some(existing) => {
             ensure!(
                 existing.install_root == root,
                 "node updater is already bound to a different installation"
             );
+            if existing.automatic {
+                return Ok(existing);
+            }
+            Policy {
+                automatic: true,
+                ..existing
+            }
         }
         None => {
-            persist(
-                &policy_path,
-                &Policy {
-                    channel: Channel::Hourly,
-                    automatic: false,
-                    install_root: root,
+            let version = manifest(&package)?.version;
+            Policy {
+                channel: if version.pre.is_empty() {
+                    Channel::Stable
+                } else {
+                    Channel::Hourly
                 },
-            )?;
+                automatic: true,
+                install_root: root,
+            }
         }
+    };
+    persist(&data.join("update.json"), &policy)?;
+    Ok(policy)
+}
+
+pub(crate) fn bind_desktop_install_root(data: &Path, root: &Path) -> Result<()> {
+    bind_install_root(data, root).map(|_| ())
+}
+
+pub(crate) async fn ensure_service_updates(
+    data: &Path,
+    root: &Path,
+    service_id: Option<&str>,
+    native: &crate::service::NativeService,
+) -> Result<()> {
+    let policy = bind_install_root(data, root)?;
+    ensure_timer(&policy, data, service_id, native).await
+}
+
+pub(crate) async fn install_managed_service(
+    package: &Path,
+    data: &Path,
+    service_id: Option<&str>,
+    native: &crate::service::NativeService,
+) -> Result<()> {
+    let result = checked(
+        &mut crate::service::native_command(package, data, service_id, "install", true)?,
+        "install managed Node service",
+    )
+    .await;
+    if let Err(error) = result {
+        if !native.installed
+            && native.automatic_update_scheduled != Some(true)
+            && let Ok(current) =
+                crate::service::native_registration(package, data, service_id).await
+            && !current.installed
+        {
+            let mut cleanup = crate::service::native_command(
+                package,
+                data,
+                service_id,
+                "uninstall-updater",
+                false,
+            )?;
+            if let Err(cleanup_error) = checked(&mut cleanup, "remove the updater").await {
+                return Err(error.context(format!("could not remove the updater after service installation failed: {cleanup_error:#}")));
+            }
+        }
+        return Err(error);
     }
     Ok(())
 }
 
 pub(crate) fn desktop_policy_matches(data: &Path, root: &Path) -> Result<bool> {
     let root = fs::canonicalize(root)?;
-    let Some(saved) = desktop_saved_policy(data)? else {
+    let Some(saved) = saved_policy(data)? else {
         return Ok(false);
     };
     if saved.install_root != root {
@@ -584,18 +723,18 @@ pub(crate) fn desktop_policy_matches(data: &Path, root: &Path) -> Result<bool> {
 }
 
 pub(crate) fn desktop_policy_compatible(data: &Path, root: &Path) -> Result<bool> {
-    Ok(desktop_saved_policy(data)?.is_none_or(|saved| saved.install_root == root))
+    Ok(saved_policy(data)?.is_none_or(|saved| saved.install_root == root))
 }
 
 pub(crate) fn desktop_policy_uses_root(data: &Path, root: &Path) -> Result<bool> {
-    Ok(desktop_saved_policy(data)?.is_some_and(|saved| saved.install_root == root))
+    Ok(saved_policy(data)?.is_some_and(|saved| saved.install_root == root))
 }
 
 pub(crate) fn desktop_policy_root(data: &Path) -> Result<Option<PathBuf>> {
-    Ok(desktop_saved_policy(data)?.map(|saved| saved.install_root))
+    Ok(saved_policy(data)?.map(|saved| saved.install_root))
 }
 
-fn desktop_saved_policy(data: &Path) -> Result<Option<Policy>> {
+fn saved_policy(data: &Path) -> Result<Option<Policy>> {
     let path = data.join("update.json");
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -619,6 +758,10 @@ pub(crate) fn validate_desktop_package(package: &Path) -> Result<()> {
 
 pub(crate) fn package_release_version(package: &Path) -> Result<String> {
     Ok(manifest(package)?.version.to_string())
+}
+
+pub(crate) fn package_core_version(package: &Path) -> Result<String> {
+    Ok(manifest(package)?.core_version.to_string())
 }
 
 pub(crate) fn switch_managed_current(managed_root: &Path, release: &Path) -> Result<()> {
@@ -696,6 +839,34 @@ async fn recover(policy: &Policy, data: &Path) -> Result<()> {
     recover_with_service(policy, data, &service, RecoveryMode::ResumeJournal).await
 }
 
+fn read_pending_journal(path: &Path) -> Result<Option<Journal>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        metadata.is_file() && metadata.len() <= 64 * 1024,
+        "invalid pending update journal"
+    );
+    Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+}
+
+pub(crate) fn record_stop_requested(data: &Path, expected_device_id: &str) -> Result<()> {
+    let path = data.join("update-pending.json");
+    if let Some(mut journal) = read_pending_journal(&path)? {
+        ensure!(
+            journal.device_id == expected_device_id,
+            "update journal belongs to another node"
+        );
+        if journal.resume_service {
+            journal.resume_service = false;
+            persist(&path, &journal)?;
+        }
+    }
+    Ok(())
+}
+
 async fn recover_with_service(
     policy: &Policy,
     data: &Path,
@@ -703,15 +874,9 @@ async fn recover_with_service(
     mode: RecoveryMode,
 ) -> Result<()> {
     let pending = data.join("update-pending.json");
-    if !pending.exists() {
+    let Some(mut journal) = read_pending_journal(&pending)? else {
         return Ok(());
-    }
-    let metadata = fs::symlink_metadata(&pending)?;
-    ensure!(
-        metadata.is_file() && metadata.len() <= 64 * 1024,
-        "invalid pending update journal"
-    );
-    let mut journal: Journal = serde_json::from_slice(&fs::read(&pending)?)?;
+    };
     let root = fs::canonicalize(&policy.install_root)?;
     ensure!(
         journal.backup.parent() == Some(root.join("backups").as_path())
@@ -1200,7 +1365,7 @@ fn owned_directory(path: &Path) -> Result<()> {
         metadata.is_dir()
             && !metadata.is_symlink()
             && fs::canonicalize(path)? == path
-            && privatefs::owner_of(path)? == privatefs::current_account()?,
+            && privatefs::owned_by_current_account(path)?,
         "{} is not a directory owned by this account without links",
         path.display()
     );
@@ -1789,18 +1954,19 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     /// Writes a fixture service script that records the arguments it was handed.
-    fn recording_service_script(package: &Path) -> PathBuf {
+    fn recording_service_script(package: &Path, installed: bool) -> PathBuf {
         let script = package.join(SERVICE_SCRIPT);
         fs::create_dir_all(script.parent().unwrap()).unwrap();
+        let native = serde_json::json!({"installed":installed,"running":false,"automatic_update_scheduled":false});
         #[cfg(unix)]
         {
-            fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n").unwrap();
+            fs::write(&script, format!("#!/bin/sh\nif [ \"$1\" = verify-schedule ]; then echo '{native}'; else printf '%s\\n' \"$@\" > \"$0.args\"; fi\n")).unwrap();
             mark_runnable(&script);
         }
         #[cfg(windows)]
         fs::write(
             &script,
-            "$args | Set-Content -LiteralPath \"$PSCommandPath.args\"\r\n",
+            format!("if ($args[0] -eq 'verify-schedule') {{ '{native}' }} else {{ $args | Set-Content -LiteralPath \"$PSCommandPath.args\" }}\r\n"),
         )
         .unwrap();
         script
@@ -1837,10 +2003,14 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair == ["--service-id", "desktop-a1b2"])
         );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--data-dir", data.to_string_lossy().as_ref()])
-        );
+        assert!(args.windows(2).any(|pair| {
+            pair == [
+                "--data-dir",
+                crate::service::script_os_argument(&data)
+                    .to_string_lossy()
+                    .as_ref(),
+            ]
+        }));
         let legacy = timer_command(&policy, &data, None).unwrap();
         assert!(!legacy.as_std().get_args().any(|arg| arg == "--service-id"));
         fs::remove_dir_all(root).unwrap();
@@ -1864,7 +2034,7 @@ mod tests {
         #[cfg(windows)]
         let parent = std::env::temp_dir();
         let directory = parent.join(format!("vibeface-updater-{}", uuid::Uuid::new_v4()));
-        private_dir(&directory).unwrap();
+        privatefs::create_dir_new(&directory).unwrap();
         fs::canonicalize(directory).unwrap()
     }
 
@@ -2061,14 +2231,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_update_configuration_creates_an_explicit_policy() -> Result<()> {
+    async fn configuration_requires_updates_and_does_not_install_a_timer_for_an_uninstalled_node()
+    -> Result<()> {
         let root = sandbox();
         let data = root.join("data");
         private_dir(&data)?;
         fs::write(data.join("identity.json"), b"opaque identity fixture")?;
         let package = package(&root, "1.0.0");
         privatefs::link_dir(&package, &root.join("current"))?;
-        let installer = recording_service_script(&package);
+        let installer = recording_service_script(&package, false);
 
         assert!(
             run(Update {
@@ -2079,7 +2250,7 @@ mod tests {
             .await
             .is_err()
         );
-        run(Update {
+        let error = run(Update {
             action: Action::Configure {
                 channel: Channel::Hourly,
                 automatic: false,
@@ -2089,17 +2260,13 @@ mod tests {
                 },
             },
         })
-        .await?;
-        let saved: serde_json::Value =
-            serde_json::from_slice(&fs::read(data.join("update.json"))?)?;
-        assert_eq!(
-            saved,
-            serde_json::json!({"channel":"hourly","automatic":false,"install_root":root})
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("automatic updates are required"),
+            "{error:#}"
         );
-        assert_eq!(
-            recorded_arguments(&installer),
-            format!("uninstall-updater\n--data-dir\n{}\n", data.display())
-        );
+        assert!(!data.join("update.json").exists());
         run(Update {
             action: Action::Configure {
                 channel: Channel::Hourly,
@@ -2111,18 +2278,117 @@ mod tests {
             },
         })
         .await?;
+        let saved = policy(&data)?;
+        assert!(saved.automatic);
+        assert_eq!(saved.channel, Channel::Hourly);
+        assert_eq!(service_update_schedule(&saved, &data).await?, Some(false));
+        assert!(
+            !installer
+                .with_file_name(format!(
+                    "{}.args",
+                    installer.file_name().unwrap().to_string_lossy()
+                ))
+                .exists()
+        );
+
+        recording_service_script(&package, true);
+        run(Update {
+            action: Action::Configure {
+                channel: Channel::Stable,
+                automatic: true,
+                install_root: root.clone(),
+                data: Data {
+                    data_dir: data.clone(),
+                },
+            },
+        })
+        .await?;
+        assert_eq!(policy(&data)?.channel, Channel::Stable);
         assert_eq!(
             recorded_arguments(&installer),
             format!(
-                "install-updater\n--binary\n{}\n--data-dir\n{}\n",
-                root.join("current").join(PROGRAMS[0]).display(),
-                data.display()
+                "install-updater\n--data-dir\n{}\n--binary\n{}\n",
+                crate::service::script_os_argument(&data).display(),
+                crate::service::script_os_argument(&root.join("current").join(PROGRAMS[0]))
+                    .display(),
             )
         );
         run(Update {
             action: Action::Status(Data { data_dir: data }),
         })
         .await?;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn installing_managed_service_uses_its_release_channel_and_upgrades_legacy_policy()
+    -> Result<()> {
+        let root = sandbox();
+        let data = root.join("data");
+        private_dir(&data)?;
+        let package = sealed_package(&root, "1.0.0-hourly.2026111701");
+        privatefs::link_dir(&package, &root.join("current"))?;
+        assert_eq!(
+            service_install_root(&data, &package.join(PROGRAMS[0]))?,
+            root
+        );
+        assert_eq!(bind_install_root(&data, &root)?.channel, Channel::Hourly);
+
+        let mut legacy = policy(&data)?;
+        legacy.channel = Channel::Stable;
+        legacy.automatic = false;
+        persist(&data.join("update.json"), &legacy)?;
+        let script = recording_service_script(&package, true);
+        let service_id = Some("desktop-abcd");
+        let registration =
+            crate::service::native_registration(&root.join("current"), &data, service_id).await?;
+        ensure_service_updates(&data, &root, service_id, &registration).await?;
+        let updated = policy(&data)?;
+        assert!(updated.automatic);
+        assert_eq!(updated.channel, Channel::Stable);
+        assert_eq!(updated.install_root, root);
+        let args = recorded_arguments(&script);
+        assert!(args.starts_with("install-updater\n"));
+        assert!(args.contains("\n--service-id\ndesktop-abcd\n"));
+        assert!(!args.contains("\nstart\n"));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduled_apply_leaves_stopped_and_uninstalled_nodes_stopped() -> Result<()> {
+        let root = sandbox();
+        let data = root.join("data");
+        private_dir(&data)?;
+        let package = package(&root, "1.0.0");
+        privatefs::link_dir(&package, &root.join("current"))?;
+        assert_eq!(bind_install_root(&data, &root)?.channel, Channel::Stable);
+        let identity = data.join("identity.json");
+        private_write(&identity, b"identity fixture")?;
+
+        for installed in [true, false] {
+            let installer = recording_service_script(&package, installed);
+            run(Update {
+                action: Action::Apply {
+                    automatic: true,
+                    data: Data {
+                        data_dir: data.clone(),
+                    },
+                },
+            })
+            .await?;
+            assert!(
+                !installer
+                    .with_file_name(format!(
+                        "{}.args",
+                        installer.file_name().unwrap().to_string_lossy()
+                    ))
+                    .exists()
+            );
+            assert_eq!(fs::read(&identity)?, b"identity fixture");
+            assert!(!data.join("update-pending.json").exists());
+        }
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -2181,7 +2447,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(managed_install_root(&data).unwrap(), root);
+        assert_eq!(
+            service_install_root(&data, &old.join(PROGRAMS[0])).unwrap(),
+            root
+        );
         switch(&root, &new).unwrap();
         assert_eq!(installed(&root).unwrap(), new);
         assert!(old.join(PROGRAMS[0]).is_file());
@@ -3045,10 +3314,10 @@ mod tests {
 
     #[tokio::test]
     async fn stopped_journal_recovery_does_not_start_the_service() {
-        let (policy, data, mut journal) = activation_fixture();
-        journal.resume_service = false;
+        let (policy, data, journal) = activation_fixture();
         switch(&policy.install_root, &journal.candidate).unwrap();
-        persist(&data.join("update-pending.json"), &journal).unwrap();
+        assert!(record_stop_requested(&data, "another-node").is_err());
+        record_stop_requested(&data, &journal.device_id).unwrap();
         let service = FakeService {
             candidate: journal.candidate.clone(),
             failure: "none",

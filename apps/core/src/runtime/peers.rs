@@ -631,7 +631,18 @@ impl Runtime {
         &self,
         network: &str,
         target: &str,
+        payload: Value,
+    ) -> Result<Value> {
+        self.peer_request_with_send_boundary(network, target, payload, std::convert::identity)
+            .await
+    }
+
+    pub(super) async fn peer_request_with_send_boundary(
+        &self,
+        network: &str,
+        target: &str,
         mut payload: Value,
+        after_send: fn(anyhow::Error) -> anyhow::Error,
     ) -> Result<Value> {
         let local = self.identity.device_id()?;
         ensure!(
@@ -653,7 +664,7 @@ impl Runtime {
         }
         payload["network_id"] = json!(network);
         self.net()?
-            .request(target, net::RPC, &payload, PEER_TIMEOUT)
+            .request_with_send_boundary(target, net::RPC, &payload, PEER_TIMEOUT, after_send)
             .await
     }
 
@@ -733,8 +744,8 @@ impl Runtime {
                 self.respond_unclaimed_request(field(input, "request_id")?, result)
                     .await
             }
-            "hand_over_session" => {
-                self.hand_over_session(
+            "hand_over_session" => self
+                .hand_over_session(
                     network,
                     field(input, "from")?,
                     &self.identity.device_id()?,
@@ -743,7 +754,7 @@ impl Runtime {
                     input["conversation_id"].as_str(),
                 )
                 .await
-            }
+                .map(|outcome| outcome.value),
             "cancel_manager" | "resolve" => {
                 ensure!(
                     input["human"] == true,
@@ -3284,6 +3295,82 @@ mod tests {
         }
         .await;
         finish_nodes(result, vec![(a, dir_a), (b, dir_b), (outsider, dir_out)]).await
+    }
+
+    #[tokio::test]
+    async fn remote_handover_distinguishes_unsent_lost_and_versioned_replies() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Clone, Debug)]
+        struct Replies {
+            count: Arc<AtomicUsize>,
+            body: Arc<std::sync::Mutex<Option<Value>>>,
+        }
+        impl ProtocolHandler for Replies {
+            async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+                while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                    let Ok(Some(request)) = net::read_frame(&mut recv).await else {
+                        break;
+                    };
+                    assert_eq!(request["type"], "hand_over_session");
+                    self.count.fetch_add(1, Ordering::SeqCst);
+                    let frame = self.body.lock().unwrap().clone();
+                    if let Some(frame) = frame {
+                        net::write_frame(&mut send, &frame)
+                            .await
+                            .expect("fixture writes receipt");
+                    }
+                    let _ = send.finish();
+                }
+                Ok(())
+            }
+        }
+        let local = LocalIdentity::generate();
+        let remote = LocalIdentity::generate();
+        let target = remote.device_id()?;
+        let network = local.fixture_network_id()?;
+        let state = local.sign_network_fixture(1, vec![local.device_id()?, target.clone()])?;
+        let (a, dir) = node(&local).await?;
+        let result = async {
+            a.install_membership(state).await?;
+            let client = Arc::new(Net::bind(&local.secret_key_hex, &a.config.network, 0, vec![]).await?);
+            ensure!(a.net.set(client.clone()).is_ok(), "fixture network starts once");
+            let peer = Net::bind(&remote.secret_key_hex, &a.config.network, 0, vec![]).await?;
+            let replies = Replies { count: Default::default(), body: Default::default() };
+            let router = Router::builder(peer.endpoint.clone()).accept(net::RPC, replies.clone()).spawn();
+            client.learn(&peer.addr()).await;
+            let seen = "0123456789abcdef";
+            let hand = async |node: &str| a.hand_over_session(&network, "c", node, "thread", seen, Some("d")).await;
+            let record = |error: &anyhow::Error| crate::tools::ToolFailure::new("hand_over_session",
+                &json!({}), crate::tools::FailureStage::Execution, error).response["call_record"].clone();
+            let refused = hand(&LocalIdentity::generate().device_id()?).await.unwrap_err();
+            assert_eq!(record(&refused)["execution"], "not_started");
+            assert_eq!(replies.count.load(Ordering::SeqCst), 0);
+            let good = json!({"node":target,"session_id":"thread","conversation_id":"d","muted":false,
+                "changed":true,"version":"abcdef0123456789"});
+            let mut missing = good.clone();
+            missing.as_object_mut().unwrap().remove("version");
+            let mut incorrect = good.clone();
+            incorrect["version"] = json!(21);
+            let mut same = good.clone();
+            same["version"] = json!(seen);
+            for (i, frame) in [None, Some(missing), Some(incorrect), Some(same)].into_iter().enumerate() {
+                *replies.body.lock().unwrap() = frame;
+                let failure = hand(&target).await.unwrap_err();
+                assert_eq!(record(&failure)["execution"], "unknown");
+                assert_eq!(record(&failure)["retry"], "none");
+                assert_eq!(replies.count.load(Ordering::SeqCst), i + 1);
+            }
+            *replies.body.lock().unwrap() = Some(good.clone());
+            assert_eq!(hand(&target).await?.receipt.execution, crate::tools::Execution::Applied);
+            let mut unchanged = good;
+            unchanged["changed"] = json!(false);
+            unchanged["version"] = json!(seen);
+            *replies.body.lock().unwrap() = Some(unchanged);
+            assert_eq!(hand(&target).await?.receipt.execution, crate::tools::Execution::NotStarted);
+            router.shutdown().await?;
+            Ok(())
+        }.await;
+        finish_nodes(result, vec![(a, dir)]).await
     }
 
     #[tokio::test]

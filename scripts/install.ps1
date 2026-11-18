@@ -442,8 +442,8 @@ function Install-Release {
     "Installed $tag at $shim"
     'No node data or services were created. Start your local node:'
     "  $shim"
-    'After initialization, select its update channel:'
-    "  $shim update configure --install-root `"$InstallRoot`" --channel $Channel --automatic false"
+    "After initialization, stop the foreground Node and install the user service with automatic updates on the $Channel channel:"
+    "  $shim service install"
     $path = [Environment]::GetEnvironmentVariable('Path', 'User')
     if (-not $path -or ($path -split ';' | Where-Object { $_.TrimEnd('\') -eq $BinDir.TrimEnd('\') }).Count -eq 0) {
         'Add your bin directory to this account''s search path, or use the full path above:'
