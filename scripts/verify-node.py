@@ -22,6 +22,10 @@ through another member Gateway.
 
 import sys
 sys.dont_write_bytecode = True
+from pathlib import Path
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
 import release_archive
 import release_context
 import release_format
@@ -45,7 +49,6 @@ import plistlib
 import re
 import runpy
 from html.parser import HTMLParser
-from pathlib import Path
 import shutil
 import signal
 import select
@@ -65,6 +68,13 @@ import urllib.parse
 import urllib.request
 import uuid
 from unittest import TestCase
+from verification_harness import (
+    private_json,
+    reserve_loopback_port,
+    stop_owned_process,
+    stream_sha256,
+    wait_for_deadline,
+)
 
 
 def definitions_of(bots):
@@ -78,35 +88,19 @@ def require(condition, description):
 
 
 def wait_for(description, predicate, timeout=35):
-    deadline = time.monotonic() + timeout
-    last_error = None
-    while time.monotonic() < deadline:
-        try:
-            value = predicate()
-            if value:
-                return value
-        except (OSError, ValueError, AssertionError, http.client.HTTPException) as error:
-            last_error = error
-        time.sleep(0.15)
-    suffix = (f" ({last_error})" if isinstance(last_error, TimeoutError)
-              else f" ({type(last_error).__name__})" if last_error else "")
-    raise AssertionError(f"timed out waiting for {description}{suffix}")
+    return wait_for_deadline(
+        description,
+        predicate,
+        timeout,
+        transient_exceptions=(OSError, ValueError, AssertionError, http.client.HTTPException),
+        timeout_suffix=lambda error: (
+            f" ({error})" if isinstance(error, TimeoutError)
+            else f" ({type(error).__name__})" if error else ""
+        ),
+    )
 
 
-def private_json(path, value):
-    """Replaces the file whole, so a reader in another thread or process never sees it half written."""
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}")
-    with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as output:
-        output.write(json.dumps(value, indent=2) + "\n")
-    os.replace(temporary, path)
-
-
-def file_sha256(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for block in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+file_sha256 = stream_sha256
 
 
 def maintenance(node, command):
@@ -136,21 +130,11 @@ _assigned_ports = set()
 
 def available_port():
     """A free TCP/UDP loopback port; VIBEFACE_PORT_BASE pins a known range."""
-    while True:
-        port = _port_base[0]
-        if port:
-            _port_base[0] += 1
-        with socket.socket() as stream, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:
-            try:
-                stream.bind(("127.0.0.1", port))
-                port = stream.getsockname()[1]
-                if port in _assigned_ports:
-                    continue
-                datagram.bind(("127.0.0.1", port))
-                _assigned_ports.add(port)
-                return port
-            except OSError:
-                continue
+    requested = _port_base[0]
+    port = reserve_loopback_port(protocols=("tcp", "udp"), requested=requested, assigned=_assigned_ports)
+    if requested:
+        _port_base[0] = port + 1
+    return port
 
 
 CLIENT_SOURCE = r"""
@@ -857,15 +841,11 @@ class Node:
     def stop(self, *, crash=False):
         if self.process is not None:
             # Stop only this script's process group, including its private app-server.
-            try:
-                if self.process.poll() is None:
-                    os.killpg(self.process.pid, signal.SIGKILL if crash else signal.SIGTERM)
-                self.process.wait(timeout=5)
-            except ProcessLookupError:
-                pass
-            except subprocess.TimeoutExpired:
-                os.killpg(self.process.pid, signal.SIGKILL)
-                self.process.wait(timeout=5)
+            stop_owned_process(
+                self.process,
+                terminate=lambda: os.killpg(self.process.pid, signal.SIGKILL if crash else signal.SIGTERM),
+                kill=lambda: os.killpg(self.process.pid, signal.SIGKILL),
+            )
             returncode = self.process.returncode
             self.process = None
             self.log.close()

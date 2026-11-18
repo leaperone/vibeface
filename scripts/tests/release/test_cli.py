@@ -408,7 +408,7 @@ class CliContracts(unittest.TestCase):
 
     def test_every_importing_entrypoint_bare_python_has_no_pycache(self):
         names = ('hourly.py', 'deploy.py', 'deploy-run.py', 'release-entry.py', 'release-dispatch.py',
-                 'ci.py', 'benchmark-free-network.py', 'verify-node.py', 'package-node-windows.py', 'run-delivery-live.py')
+                 'ci.py', 'benchmark-free-network.py', 'verification_harness.py', 'verify-node.py', 'package-node-windows.py', 'run-delivery-live.py')
         with Fixture() as f:
             for name in names:
                 shutil.copy2(SOURCE / name, f.scripts / name)

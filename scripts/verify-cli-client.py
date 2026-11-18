@@ -15,17 +15,27 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import sys
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
 import secrets
 import shutil
 import signal
 import socket
 import struct
 import subprocess
-import sys
 import threading
 import time
 import urllib.request
 import uuid
+from verification_harness import (
+    private_json,
+    reserve_loopback_port,
+    stop_owned_process,
+    stream_sha256,
+    wait_for_deadline,
+)
 
 
 def require(condition, message):
@@ -38,63 +48,32 @@ def private_write(path, contents):
         output.write(contents if isinstance(contents, bytes) else contents.encode())
 
 
-def write_json(path, value):
-    temporary = path.with_name(path.name + ".next")
-    with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as output:
-        json.dump(value, output, indent=2)
-        output.write("\n")
-    os.replace(temporary, path)
+write_json = private_json
 
 
-def sha256(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for block in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+sha256 = stream_sha256
 
 
 PORTS = set()
 
 
 def port():
-    while True:
-        with socket.socket() as tcp, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
-            tcp.bind(("127.0.0.1", 0))
-            value = tcp.getsockname()[1]
-            if value in PORTS:
-                continue
-            try:
-                udp.bind(("127.0.0.1", value))
-            except OSError:
-                continue
-            PORTS.add(value)
-            return value
+    return reserve_loopback_port(protocols=("tcp", "udp"), assigned=PORTS)
 
 
 def wait_for(description, predicate, timeout=45):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        value = predicate()
-        if value:
-            return value
-        time.sleep(0.15)
-    raise AssertionError("timed out waiting for " + description)
+    return wait_for_deadline(description, predicate, timeout)
 
 
 def stop(process):
     if process is None:
         return
     # Every child owns a new session. Never use a name-based/global process kill.
-    if process.poll() is None:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGTERM)
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        process.wait(timeout=5)
+    stop_owned_process(
+        process,
+        terminate=lambda: os.killpg(process.pid, signal.SIGTERM),
+        kill=lambda: os.killpg(process.pid, signal.SIGKILL),
+    )
 
 
 class LostReplyProxy:

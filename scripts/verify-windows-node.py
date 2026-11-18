@@ -27,6 +27,10 @@ import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+from verification_harness import reserve_loopback_port, wait_for_deadline
 
 DATA_EPOCH = 1
 MAINTENANCE_PROTOCOL = 1
@@ -226,18 +230,14 @@ def require(condition, description):
 
 
 def wait_for(description, predicate, timeout=45):
-    deadline = time.monotonic() + timeout
-    last = None
-    while time.monotonic() < deadline:
-        try:
-            value = predicate()
-            if value:
-                return value
-        except (OSError, ValueError, AssertionError, urllib.error.URLError) as error:
-            last = error
-        time.sleep(0.2)
-    suffix = f" ({type(last).__name__}: {last})" if last else ""
-    raise AssertionError(f"timed out waiting for {description}{suffix}")
+    return wait_for_deadline(
+        description,
+        predicate,
+        timeout,
+        transient_exceptions=(OSError, ValueError, AssertionError, urllib.error.URLError),
+        interval=0.2,
+        timeout_suffix=lambda error: f" ({type(error).__name__}: {error})" if error else "",
+    )
 
 
 def run(arguments, timeout=60, check=True, cwd=None, env=None):
@@ -254,9 +254,7 @@ def run(arguments, timeout=60, check=True, cwd=None, env=None):
 
 
 def free_port():
-    with socket.socket() as stream:
-        stream.bind(("127.0.0.1", 0))
-        return stream.getsockname()[1]
+    return reserve_loopback_port(protocols=("tcp",))
 
 
 def process_is_running(pid):
