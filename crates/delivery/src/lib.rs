@@ -16,8 +16,9 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub use crypto::{
-    encrypt_charity_window, encrypt_window, receiving_public, recover_charity_window,
-    recover_window, validate_receiving_public, verify_peer, verify_relation,
+    encrypt_charity_window, encrypt_window, open_session_key, receiving_public,
+    recover_charity_window, recover_window, seal_session_key, validate_receiving_public,
+    verify_peer, verify_relation,
 };
 pub use session::{
     EncryptedSessionObject, MAX_SESSION_CHUNK_BYTES, MAX_SESSION_ID_BYTES,

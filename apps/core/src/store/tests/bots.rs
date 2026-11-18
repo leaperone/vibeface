@@ -513,7 +513,7 @@ fn bot_changes_converge_and_retries_write_once() -> Result<()> {
 
 #[test]
 fn encrypted_session_ingest_keeps_the_source_signature_across_owners_and_retries() -> Result<()> {
-    use crate::delivery::session::{SessionObjectStore, ingest_event, seal_event};
+    use crate::delivery::session::{CharityKey, SessionObjectStore, ingest_event, seal_event};
     use vibeface_delivery::Secret32;
 
     let net = net()?;
@@ -549,13 +549,14 @@ fn encrypted_session_ingest_keeps_the_source_signature_across_owners_and_retries
         4,
     )?;
     let key = Secret32::new([7; 32])?;
-    let object = seal_event(
+    let receiving_key = CharityKey::issue(&net.b, &key, 1, 0, 1)?;
+    let (object, capsule) = seal_event(
         &net.a,
         &net.network,
         &signed,
         hex::decode(&b)?.try_into().unwrap(),
         [8; 32],
-        &key,
+        &receiving_key,
         4..10,
     )?;
     assert!(
@@ -569,8 +570,30 @@ fn encrypted_session_ingest_keeps_the_source_signature_across_owners_and_retries
     let object = relay
         .get(&object.header.object_id)?
         .context("missing relay object")?;
-    assert!(ingest_event(&mut target, &net.a, &net.network, &object, &key, 5).is_err());
-    assert!(ingest_event(&mut target, &net.b, &net.network, &object, &key, 10).is_err());
+    assert!(
+        ingest_event(
+            &mut target,
+            &net.a,
+            &net.network,
+            &object,
+            &key,
+            &capsule,
+            5
+        )
+        .is_err()
+    );
+    assert!(
+        ingest_event(
+            &mut target,
+            &net.b,
+            &net.network,
+            &object,
+            &key,
+            &capsule,
+            10
+        )
+        .is_err()
+    );
     assert!(
         ingest_event(
             &mut target,
@@ -578,23 +601,65 @@ fn encrypted_session_ingest_keeps_the_source_signature_across_owners_and_retries
             &net.network,
             &object,
             &Secret32::new([9; 32])?,
+            &capsule,
+            5
+        )
+        .is_err()
+    );
+    let mut wrong_capsule = capsule;
+    wrong_capsule[0] ^= 1;
+    assert!(
+        ingest_event(
+            &mut target,
+            &net.b,
+            &net.network,
+            &object,
+            &key,
+            &wrong_capsule,
             5
         )
         .is_err()
     );
     let mut tampered = object.clone();
     tampered.ciphertext[0] ^= 1;
-    assert!(ingest_event(&mut target, &net.b, &net.network, &tampered, &key, 5).is_err());
+    assert!(
+        ingest_event(
+            &mut target,
+            &net.b,
+            &net.network,
+            &tampered,
+            &key,
+            &capsule,
+            5
+        )
+        .is_err()
+    );
     assert_eq!(target.event(&net.network, &signed.hash)?, None);
     for _ in 0..2 {
-        let pending = ingest_event(&mut target, &net.b, &net.network, &object, &key, 5)?;
+        let pending = ingest_event(
+            &mut target,
+            &net.b,
+            &net.network,
+            &object,
+            &key,
+            &capsule,
+            5,
+        )?;
         assert_eq!(pending.sync.statuses, [IngestStatus::Pending]);
         assert!(pending.stored_receipt.is_none());
         assert_eq!(target.event(&net.network, &signed.hash)?, None);
     }
     let placed = target.ingest_events(&net.network, &dependencies)?;
     assert!(placed.stored.iter().any(|event| event.hash == signed.hash));
-    let applied = ingest_event(&mut target, &net.b, &net.network, &object, &key, 5)?;
+    let applied = ingest_event(
+        &mut target,
+        &net.b,
+        &net.network,
+        &object,
+        &key,
+        &capsule,
+        5,
+    )?;
     assert_eq!(applied.sync.statuses, [IngestStatus::Duplicate]);
     let receipt = applied
         .stored_receipt
@@ -623,7 +688,15 @@ fn encrypted_session_ingest_keeps_the_source_signature_across_owners_and_retries
             .and_then(|c| c.owner),
         Some(b.clone())
     );
-    let retry = ingest_event(&mut target, &net.b, &net.network, &object, &key, 6)?;
+    let retry = ingest_event(
+        &mut target,
+        &net.b,
+        &net.network,
+        &object,
+        &key,
+        &capsule,
+        6,
+    )?;
     assert_eq!(retry.sync.statuses, [IngestStatus::Duplicate]);
     assert_eq!(retry.stored_receipt, Some(receipt));
     assert_eq!(target.messages(&net.network, "d")?.len(), 1);
@@ -639,7 +712,7 @@ fn encrypted_session_ingest_keeps_the_source_signature_across_owners_and_retries
 
 #[test]
 fn encrypted_session_storage_receipt_waits_for_verified_attachments() -> Result<()> {
-    use crate::delivery::session::{ingest_event, seal_event};
+    use crate::delivery::session::{CharityKey, ingest_event, seal_event};
     use vibeface_delivery::Secret32;
 
     let net = net()?;
@@ -675,28 +748,56 @@ fn encrypted_session_storage_receipt_waits_for_verified_attachments() -> Result<
     )?;
     let signed = source.append_event(&net.a, &net.network, "c", body, vec![blob.clone()], 3)?;
     let key = Secret32::new([7; 32])?;
-    let object = seal_event(
+    let receiving_key = CharityKey::issue(&net.b, &key, 1, 0, 1)?;
+    let (object, capsule) = seal_event(
         &net.a,
         &net.network,
         &signed,
         hex::decode(net.b.device_id()?)?.try_into().unwrap(),
         [8; 32],
-        &key,
+        &receiving_key,
         4..10,
     )?;
 
-    let received = ingest_event(&mut target, &net.b, &net.network, &object, &key, 5)?;
+    let received = ingest_event(
+        &mut target,
+        &net.b,
+        &net.network,
+        &object,
+        &key,
+        &capsule,
+        5,
+    )?;
     assert_eq!(received.sync.statuses, [IngestStatus::Accepted]);
     assert!(received.stored_receipt.is_none());
     target.put_blob(&blob, content)?;
     let path = target.blob_file(&blob.hash)?;
     std::fs::write(&path, vec![0; content.len()])?;
-    assert!(ingest_event(&mut target, &net.b, &net.network, &object, &key, 5).is_err());
+    assert!(
+        ingest_event(
+            &mut target,
+            &net.b,
+            &net.network,
+            &object,
+            &key,
+            &capsule,
+            5
+        )
+        .is_err()
+    );
     std::fs::write(path, content)?;
-    ingest_event(&mut target, &net.b, &net.network, &object, &key, 5)?
-        .stored_receipt
-        .context("missing storage receipt")?
-        .verify(&object)?;
+    ingest_event(
+        &mut target,
+        &net.b,
+        &net.network,
+        &object,
+        &key,
+        &capsule,
+        5,
+    )?
+    .stored_receipt
+    .context("missing storage receipt")?
+    .verify(&object)?;
     Ok(())
 }
 

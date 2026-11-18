@@ -1,8 +1,11 @@
 //! Node-side boundary for relaying original signed Bot session events.
 
+pub(crate) use super::charity::CharityKey;
+use super::{Delivery, types::Mode};
 use crate::{
     crypto::{LocalIdentity, check_event, verify_event_signature},
     model::{Event, EventBody, IngestStatus, SignedEvent},
+    runtime::Runtime,
     store::{Ingested, Store},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -11,8 +14,9 @@ use rand::{RngCore, rngs::OsRng};
 use rusqlite::{OptionalExtension, params};
 use std::path::{Path, PathBuf};
 use vibeface_delivery::{
-    EncryptedSessionObject, MAX_SESSION_CHUNK_BYTES, MAX_SESSION_OBJECT_BYTES, PeerSignature,
-    Secret32, SessionObjectKind, Word, decrypt_session_payload, encrypt_session_payload,
+    CAPSULE_BYTES, EncryptedSessionObject, MAX_SESSION_CHUNK_BYTES, MAX_SESSION_OBJECT_BYTES,
+    PeerSignature, Secret32, SessionObjectKind, Word, decrypt_session_payload,
+    encrypt_session_payload, hash, open_session_key, seal_session_key,
 };
 use zeroize::Zeroizing;
 
@@ -138,6 +142,10 @@ fn checked_event(network: &str, signed: &SignedEvent) -> Result<Event> {
 }
 
 fn verify_object(object: &EncryptedSessionObject) -> Result<()> {
+    ensure!(
+        object.ciphertext.len() > 64 + 12 + vibeface_delivery::SESSION_AEAD_TAG_BYTES,
+        "session ciphertext is missing its key commitment or sealed body"
+    );
     Ok(object.verify_signature(
         &object.header.sender_peer,
         SIGNING_DOMAIN,
@@ -145,26 +153,102 @@ fn verify_object(object: &EncryptedSessionObject) -> Result<()> {
     )?)
 }
 
-/// Encrypt the exact signed event. Key exchange is separate and the object has no key field.
-pub fn seal_event(
+fn capsule_context(receiver: &Word, key_id: &Word) -> Word {
+    hash(&[receiver.as_slice(), key_id.as_slice()].concat())
+}
+
+impl Delivery {
+    /// Obtain the signed receiving key over the authenticated service channel.
+    pub async fn seal_session_event(
+        &self,
+        node: &Runtime,
+        network: &str,
+        signed: &SignedEvent,
+        recipient: Word,
+        relay: Word,
+        validity: std::ops::Range<u64>,
+    ) -> Result<(EncryptedSessionObject, [u8; CAPSULE_BYTES])> {
+        self.ensure_mode(Mode::Charity)?;
+        let key = Self::session_receiving_key(node, &hex::encode(recipient)).await?;
+        seal_event(
+            &self.identity,
+            network,
+            signed,
+            recipient,
+            relay,
+            &key,
+            validity,
+        )
+    }
+
+    /// Open a released capsule using the recipient's local key history.
+    pub fn ingest_session_event(
+        &self,
+        store: &mut Store,
+        network: &str,
+        object: &EncryptedSessionObject,
+        capsule: &[u8; CAPSULE_BYTES],
+        now_ms: u64,
+    ) -> Result<SessionIngested> {
+        self.ensure_mode(Mode::Charity)?;
+        let header = &object.header;
+        verify_object(object)?;
+        ensure!(
+            hex::encode(header.receiver_peer) == self.identity.device_id()?,
+            "session recipient mismatch"
+        );
+        let key_id = object
+            .ciphertext
+            .first_chunk()
+            .context("session key identifier is missing")?;
+        let secret = self.session_receiving_secret(
+            &header.receiver_peer,
+            key_id,
+            header.created_at_ms..header.expires_at_ms,
+        )?;
+        ingest_event(
+            store,
+            &self.identity,
+            network,
+            object,
+            &secret,
+            capsule,
+            now_ms,
+        )
+    }
+}
+
+/// Returns the signed ciphertext and a separate HPKE capsule for the recipient.
+pub(crate) fn seal_event(
     sender: &LocalIdentity,
     network: &str,
     signed: &SignedEvent,
     recipient: Word,
     relay: Word,
-    key: &Secret32,
+    receiving_key: &CharityKey,
     validity: std::ops::Range<u64>,
-) -> Result<EncryptedSessionObject> {
+) -> Result<(EncryptedSessionObject, [u8; CAPSULE_BYTES])> {
     let event = checked_event(network, signed)?;
     ensure!(
         event.author == sender.device_id()?,
         "session sender is not the event author"
     );
     verify_event_signature(signed, &event.author)?;
+    let (key_id, public_key) = receiving_key.session_material(&recipient, validity.clone())?;
+    let key = Secret32::new(super::random_word())?;
+    let seed = Secret32::new(super::random_word())?;
+    let capsule = seal_session_key(
+        &public_key,
+        &capsule_context(&recipient, &key_id),
+        &key,
+        &seed,
+    )?;
     let mut nonce = [0; 12];
     OsRng.fill_bytes(&mut nonce);
     let plaintext = Zeroizing::new(serde_json::to_vec(signed)?);
-    let mut ciphertext = nonce.to_vec();
+    let mut ciphertext = key_id.to_vec();
+    ciphertext.extend_from_slice(&hash(&capsule));
+    ciphertext.extend_from_slice(&nonce);
     ciphertext.extend(encrypt_session_payload(
         key.as_bytes(),
         nonce,
@@ -196,7 +280,10 @@ pub fn seal_event(
         )?,
         &mut signature,
     )?;
-    Ok(object.with_signature(PeerSignature::from_bytes(signature)))
+    Ok((
+        object.with_signature(PeerSignature::from_bytes(signature)),
+        capsule,
+    ))
 }
 
 /// The recipient attests durable event storage. This says nothing about Bot execution or payment.
@@ -234,7 +321,8 @@ pub fn ingest_event(
     receiver: &LocalIdentity,
     network: &str,
     object: &EncryptedSessionObject,
-    key: &Secret32,
+    secret: &Secret32,
+    capsule: &[u8; CAPSULE_BYTES],
     now_ms: u64,
 ) -> Result<SessionIngested> {
     let header = &object.header;
@@ -255,8 +343,21 @@ pub fn ingest_event(
     let sender = hex::encode(header.sender_peer);
     store.authorize_node(network, &recipient)?;
     store.authorize_node(network, &sender)?;
-    let (nonce, ciphertext) = object
+    let (key_header, ciphertext) = object
         .ciphertext
+        .split_at_checked(64)
+        .context("session key commitment is missing")?;
+    let (key_id, capsule_hash) = key_header.split_at(32);
+    ensure!(
+        capsule_hash == hash(capsule),
+        "session key capsule commitment mismatch"
+    );
+    let key = open_session_key(
+        secret,
+        &capsule_context(&header.receiver_peer, key_id.try_into()?),
+        capsule,
+    )?;
+    let (nonce, ciphertext) = ciphertext
         .split_at_checked(12)
         .context("session nonce is missing")?;
     let plaintext = Zeroizing::new(decrypt_session_payload(
@@ -346,16 +447,24 @@ mod tests {
                 blobs: vec![],
             })
             .unwrap();
+        let receiver = LocalIdentity::generate();
+        let recipient = hex::decode(receiver.device_id().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let secret = Secret32::new([4; 32]).unwrap();
+        let receiving_key = CharityKey::issue(&receiver, &secret, 1, 0, 1).unwrap();
         seal_event(
             &sender,
             &network,
             &signed,
-            [2; 32],
+            recipient,
             [3; 32],
-            &Secret32::new([4; 32]).unwrap(),
+            &receiving_key,
             100..200,
         )
         .unwrap()
+        .0
     }
 
     fn test_dir(label: &str) -> std::path::PathBuf {
@@ -369,6 +478,51 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn session_key_history_survives_restart_without_enabling_wallets() -> Result<()> {
+        let directory = test_dir("key-restart");
+        let identity = LocalIdentity::generate();
+        let recipient: Word = hex::decode(identity.device_id()?)?
+            .try_into()
+            .ok()
+            .context("bad recipient fixture")?;
+        let now = super::super::now();
+        let interval = now * 1000..(now + 60) * 1000;
+        let delivery = Delivery::open(&directory, identity.clone())?;
+        assert!(delivery.charity_key().is_err());
+        drop(delivery);
+        let config = super::super::DeliveryConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        vibeface_bridge::platform::privatefs::write_atomic(
+            &directory.join("delivery-settings.json"),
+            &serde_json::to_vec(&config)?,
+        )?;
+        let delivery = Delivery::open(&directory, identity.clone())?;
+        let key = delivery.charity_key()?;
+        let (key_id, public_key) = key.session_material(&recipient, interval.clone())?;
+        let context = capsule_context(&recipient, &key_id);
+        let object_key = Secret32::new([9; 32])?;
+        let capsule =
+            seal_session_key(&public_key, &context, &object_key, &Secret32::new([8; 32])?)?;
+        drop(delivery);
+
+        let restarted = Delivery::open(&directory, identity)?;
+        let secret = restarted.session_receiving_secret(&recipient, &key_id, interval.clone())?;
+        let opened = open_session_key(&secret, &context, &capsule)?;
+        assert_eq!(opened.as_bytes(), object_key.as_bytes());
+        assert!(key.session_material(&[2; 32], interval.clone()).is_err());
+        assert!(
+            key.session_material(&recipient, interval.start..u64::MAX)
+                .is_err()
+        );
+        assert!(!directory.join("delivery-wallet.json").exists());
+        drop(restarted);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
     }
 
     #[test]
