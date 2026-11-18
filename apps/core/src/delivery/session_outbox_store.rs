@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::Path;
 use vibeface_session_delivery::{
     CAPSULE_BYTES, EncryptedSessionObject, MAX_SESSION_OBJECT_BYTES, PeerSignature,
-    SessionObjectHeader,
+    SessionObjectHeader, SessionSettlementClaim,
 };
 
 const MAX_ROUTES: i64 = 64;
@@ -94,7 +94,13 @@ impl SessionOutboxStore {
             ),
         }
         tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS route_keys (
+            "CREATE TABLE IF NOT EXISTS session_claims (
+                route TEXT NOT NULL REFERENCES routes(route) ON DELETE CASCADE,
+                sequence INTEGER NOT NULL,
+                claim TEXT NOT NULL,
+                PRIMARY KEY (route,sequence)
+             ) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS route_keys (
                 route TEXT PRIMARY KEY NOT NULL REFERENCES routes(route) ON DELETE CASCADE,
                 key TEXT NOT NULL
              ) WITHOUT ROWID;
@@ -317,6 +323,49 @@ impl SessionOutboxStore {
             params![route, serde_json::to_string(key)?],
         )?;
         Ok(())
+    }
+
+    pub(super) fn enqueue_claim(
+        &self,
+        route: &str,
+        sequence: u64,
+        claim: &SessionSettlementClaim,
+    ) -> Result<()> {
+        validate_route(route)?;
+        let claim = serde_json::to_string(claim)?;
+        self.db.execute(
+            "INSERT INTO session_claims(route,sequence,claim) VALUES(?1,?2,?3)
+             ON CONFLICT(route,sequence) DO UPDATE SET claim=excluded.claim",
+            params![route, sqlite_u64(sequence)?, claim],
+        )?;
+        Ok(())
+    }
+
+    pub(super) fn pending_claims(
+        &self,
+        route: &str,
+        limit: u32,
+    ) -> Result<Vec<SessionSettlementClaim>> {
+        validate_route(route)?;
+        ensure!(
+            (1..=16).contains(&limit),
+            "invalid session claim batch size"
+        );
+        let mut statement = self.db.prepare(
+            "SELECT claim FROM session_claims WHERE route=?1 ORDER BY sequence LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![route, i64::from(limit)], |row| {
+            let value: String = row.get(0)?;
+            serde_json::from_str(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub(super) fn next_receipt(
@@ -588,7 +637,9 @@ fn read_objects_as_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vibeface_session_delivery::{PeerSignature, SessionObjectKind};
+    use vibeface_session_delivery::{
+        Amount, PeerSignature, SessionObjectKind, SessionSettlementClaim, SessionSettlementOrder,
+    };
 
     fn temp_dir() -> std::path::PathBuf {
         let path =
@@ -659,6 +710,35 @@ mod tests {
         assert_eq!(store.batch(route)?.expect("staged batch").objects, objects);
         assert!(store.stage(route, 0, 2, &objects).is_err());
         let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn paid_claim_queue_survives_restart_and_is_idempotent() -> Result<()> {
+        let dir = temp_dir();
+        let claim = SessionSettlementClaim {
+            order: SessionSettlementOrder {
+                deployment: [1; 32],
+                budget: [2; 32],
+                delivery: [3; 32],
+                receiver: [4; 32],
+                relay: [5; 32],
+                object: [6; 32],
+                amount: Amount::from_u64(7),
+                claim_until_ms: 8,
+            },
+            receipt: PeerSignature::from_bytes([9; 64]),
+        };
+        {
+            let mut store = SessionOutboxStore::open(&dir)?;
+            store.initialize("route", 0)?;
+            store.enqueue_claim("route", 1, &claim)?;
+            store.enqueue_claim("route", 1, &claim)?;
+            assert_eq!(store.pending_claims("route", 16)?, vec![claim.clone()]);
+        }
+        let store = SessionOutboxStore::open(&dir)?;
+        assert_eq!(store.pending_claims("route", 16)?, vec![claim]);
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 

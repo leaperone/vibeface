@@ -10,11 +10,33 @@ use crate::{clock, model::IngestStatus, runtime::Runtime};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use vibeface_session_delivery::hash;
+use vibeface_session_delivery::{Amount, SessionSettlementClaim, SessionSettlementOrder, hash};
 
 const BUNDLE_LIFETIME_MS: u64 = 12 * 60 * 60 * 1000;
 const MAX_BUNDLE_ATTACHMENT_BYTES: u64 = 120 * 1024 * 1024;
 const MAX_BUNDLE_ATTACHMENTS: usize = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionPaymentConfig {
+    pub deployment: String,
+    pub budget: String,
+    pub amount: String,
+    pub claim_until_ms: u64,
+}
+
+impl SessionPaymentConfig {
+    pub(super) fn validate(&self) -> Result<()> {
+        parse_word(&self.deployment)?;
+        parse_word(&self.budget)?;
+        ensure!(
+            self.claim_until_ms > 0,
+            "session payment claim deadline is empty"
+        );
+        Amount::from_decimal_str(&self.amount).map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,6 +58,36 @@ impl SessionEndpointRoute {
 }
 
 impl Delivery {
+    fn paid_session_claim(
+        route_id: &str,
+        sequence: u64,
+        payment: &SessionPaymentConfig,
+        header: &vibeface_session_delivery::SessionObjectHeader,
+        receipt: &super::session::SessionStoredReceipt,
+    ) -> Result<SessionSettlementClaim> {
+        let deployment = parse_word(&payment.deployment)?;
+        let budget = parse_word(&payment.budget)?;
+        let amount = Amount::from_decimal_str(&payment.amount).map_err(anyhow::Error::msg)?;
+        let delivery = hash(&serde_json::to_vec(&(route_id, sequence))?);
+        let order = SessionSettlementOrder {
+            deployment,
+            budget,
+            delivery,
+            receiver: header.receiver_peer,
+            relay: header.provider_peer,
+            object: header.object_id,
+            amount,
+            claim_until_ms: payment.claim_until_ms,
+        };
+        let receipt = receipt.signature_bytes()?;
+        order.commitment().map_err(anyhow::Error::msg)?;
+        Ok(SessionSettlementClaim { order, receipt })
+    }
+
+    pub fn paid_session_claims(&self, route_id: &str) -> Result<Vec<SessionSettlementClaim>> {
+        SessionOutboxStore::open(&self.data_dir)?.pending_claims(route_id, 16)
+    }
+
     pub(super) fn attach_session_outbox(&self, runtime: std::sync::Weak<Runtime>) -> Result<()> {
         let Some(node) = runtime.upgrade() else {
             return Ok(());
@@ -287,8 +339,16 @@ impl Delivery {
             .next_receipt(&route_id, clock::now_ms_u64())?;
         if let Some((sequence, header)) = pending {
             match self.fetch_session_receipt(node, &header).await {
-                Ok(Some(receipt)) => SessionOutboxStore::open(&self.data_dir)?
-                    .record_receipt(&route_id, sequence, &receipt)?,
+                Ok(Some(receipt)) => {
+                    let outbox = SessionOutboxStore::open(&self.data_dir)?;
+                    outbox.record_receipt(&route_id, sequence, &receipt)?;
+                    if let Some(payment) = self.config().session_payment.clone() {
+                        let claim = Self::paid_session_claim(
+                            &route_id, sequence, &payment, &header, &receipt,
+                        )?;
+                        outbox.enqueue_claim(&route_id, sequence, &claim)?;
+                    }
+                }
                 Ok(None) => {}
                 Err(error) => tracing::debug!(%error, "session relay receipt is pending"),
             }

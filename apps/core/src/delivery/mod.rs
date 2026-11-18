@@ -7,7 +7,7 @@ pub mod session;
 mod session_attachment;
 mod session_outbox;
 mod session_outbox_store;
-pub use session_outbox::SessionEndpointRoute;
+pub use session_outbox::{SessionEndpointRoute, SessionPaymentConfig};
 mod session_relay;
 mod session_relay_store;
 pub use keys::KeyAction;
@@ -45,6 +45,7 @@ pub struct DeliveryConfig {
     pub charity_enabled: bool,
     pub session_relay_enabled: bool,
     pub session_route: Option<SessionEndpointRoute>,
+    pub session_payment: Option<SessionPaymentConfig>,
     pub paid_enabled: bool,
     pub storage_limit_bytes: u64,
     pub max_orders: u32,
@@ -63,6 +64,7 @@ impl Default for DeliveryConfig {
             charity_enabled: true,
             session_relay_enabled: false,
             session_route: None,
+            session_payment: None,
             paid_enabled: false,
             storage_limit_bytes: 64 * 1024 * 1024,
             max_orders: 128,
@@ -93,6 +95,10 @@ impl DeliveryConfig {
         }
         if let Some(route) = &self.session_route {
             route.validate()?;
+        }
+        if let Some(payment) = &self.session_payment {
+            ensure!(self.paid_enabled, "session payment requires paid delivery");
+            payment.validate()?;
         }
         if let Some(chain) = &self.chain {
             chain.validate()?;

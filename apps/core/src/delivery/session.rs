@@ -502,6 +502,13 @@ impl SessionStoredReceipt {
         self.verify_header(&object.header)
     }
 
+    pub(super) fn signature_bytes(&self) -> Result<PeerSignature> {
+        let bytes: [u8; 64] = hex::decode(&self.signature)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("session receipt signature length"))?;
+        Ok(PeerSignature::from_bytes(bytes))
+    }
+
     pub(super) fn verify_header(
         &self,
         header: &vibeface_session_delivery::SessionObjectHeader,
