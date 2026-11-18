@@ -45,13 +45,15 @@ impl FrameHeader {
 
     /// Call this after reading the payload so a truncated frame reports a read error first.
     pub fn kind(self) -> Result<FrameKind, FrameError> {
-        match self.tag {
-            0 => Ok(FrameKind::Binary),
-            1 => Ok(FrameKind::Text),
-            2 => Ok(FrameKind::Ping),
-            3 => Ok(FrameKind::Pong),
-            tag => Err(FrameError::UnknownTag(tag)),
-        }
+        [
+            FrameKind::Binary,
+            FrameKind::Text,
+            FrameKind::Ping,
+            FrameKind::Pong,
+        ]
+        .into_iter()
+        .find(|kind| *kind as u8 == self.tag)
+        .ok_or(FrameError::UnknownTag(self.tag))
     }
 }
 
@@ -83,6 +85,7 @@ mod tests {
 
     #[test]
     fn headers_match_fixed_wire_vectors() {
+        assert_eq!(ALPN, b"vibeface/client/1");
         for (kind, len, wire) in [
             (FrameKind::Binary, 0, [0, 0, 0, 0, 0]),
             (FrameKind::Text, "é".len(), [1, 0, 0, 0, 2]),
