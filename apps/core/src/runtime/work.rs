@@ -369,7 +369,7 @@ impl Runtime {
         let args = args.clone();
         let admitted = self
             .store
-            .call("work.accept_dispatch", move |store| {
+            .tool_transaction("work.accept_dispatch", move |store| {
                 let network = call_network.as_str();
                 if let Some(existing) = store.accepted_work(network, &request)? {
                     Ok(existing)
@@ -429,7 +429,7 @@ impl Runtime {
             Changed::Work(&record.work_id),
         );
         if admitted.created && record.kind == WorkKind::Task {
-            self.wake_scheduler()?;
+            self.wake_scheduler().map_err(crate::tools::uncertain)?;
         }
         Ok(admitted)
     }
@@ -550,7 +550,7 @@ impl Runtime {
     ) -> Result<Dispatch> {
         let dispatch = self
             .store
-            .call("work.save_dispatch", move |store| {
+            .tool_transaction("work.save_dispatch", move |store| {
                 store.save_dispatch(&Dispatch {
                     spec,
                     state: DispatchState::Pending,
@@ -560,7 +560,11 @@ impl Runtime {
         if dispatch.state != DispatchState::Pending {
             return Ok(dispatch);
         }
-        match self.offer_dispatch(network, &dispatch, notify).await? {
+        match self
+            .offer_dispatch(network, &dispatch, notify)
+            .await
+            .map_err(crate::tools::uncertain)?
+        {
             Ok(answered) => Ok(answered),
             Err(error) => {
                 tracing::debug!(%error, "dispatch waits for its target");
@@ -666,7 +670,8 @@ impl Runtime {
         scope: &str,
         work_id: &str,
         report: StartReport,
-    ) -> Result<Value> {
+    ) -> Result<crate::tools::ToolOutcome> {
+        use crate::tools::{Approval, uncertain};
         let record = {
             let call_work = work_id.to_owned();
             self.store
@@ -704,11 +709,15 @@ impl Runtime {
                         "native send report differs from its reserved turn".into(),
                     ),
                 )
-                .await?;
-                bail!("native send report differs from its reserved turn; delivery is unknown");
+                .await
+                .map_err(uncertain)?;
+                return Err(uncertain(anyhow::anyhow!(
+                    "native send report differs from its reserved turn; delivery is unknown"
+                )));
             }
         }
         let mut record = record;
+        let uncertain_send = matches!(report, StartReport::Unknown { .. });
         match report {
             StartReport::Thread { thread_id } => {
                 tracing::info!(
@@ -726,7 +735,8 @@ impl Runtime {
                     );
                     record = self
                         .signal_work(network, work_id, Signal::ThreadCreated(thread_id.clone()))
-                        .await?;
+                        .await
+                        .map_err(uncertain)?;
                 }
                 ensure!(
                     matches!(&record.state, WorkState::Starting { thread: Some(known) } if *known == thread_id),
@@ -745,7 +755,10 @@ impl Runtime {
                     turn_id: turn_id.clone(),
                     epoch: self.codex.epoch(),
                 };
-                record = self.signal_work(network, work_id, signal).await?;
+                record = self
+                    .signal_work(network, work_id, signal)
+                    .await
+                    .map_err(uncertain)?;
                 if record
                     .state
                     .handle()
@@ -762,12 +775,16 @@ impl Runtime {
                 }
                 // The turn may have ended before it was bound.
                 if record.state.handle().is_some()
-                    && let Ok(probe @ Probe::Terminal { .. }) =
-                        self.work_executor(&record)?.probe(&record).await
+                    && let Ok(probe @ Probe::Terminal { .. }) = self
+                        .work_executor(&record)
+                        .map_err(uncertain)?
+                        .probe(&record)
+                        .await
                 {
                     record = self
                         .signal_work(network, work_id, Signal::Probed(probe))
-                        .await?;
+                        .await
+                        .map_err(uncertain)?;
                 }
             }
             StartReport::Rejected(mut failure) => {
@@ -782,7 +799,8 @@ impl Runtime {
                 failure.detail = failure.detail.chars().take(2_000).collect();
                 record = self
                     .signal_work(network, work_id, Signal::StartRejected(failure))
-                    .await?;
+                    .await
+                    .map_err(uncertain)?;
             }
             StartReport::Unknown { reason } => {
                 tracing::warn!(
@@ -800,11 +818,21 @@ impl Runtime {
                     self.store
                         .call("work.record", move |store| store.work_record(&call_work))
                         .await
-                }?
-                .context("work not found on this device")?;
+                }
+                .map_err(uncertain)?
+                .context("work not found on this device")
+                .map_err(uncertain)?;
             }
         }
-        Ok(json!({"work_id":work_id,"state":record.state}))
+        let execution = match (&record.state, uncertain_send) {
+            (WorkState::Accepted | WorkState::Starting { .. }, true) => {
+                crate::tools::Execution::Unknown
+            }
+            _ => super::agent_tools::work_execution(&record.state),
+        };
+        Ok(execution
+            .with(Approval::Unknown)
+            .result(json!({"work_id":work_id,"state":record.state})))
     }
 
     /// Reads the turn back to settle a work's state; it never starts or resends anything. Before
@@ -970,7 +998,7 @@ impl Runtime {
             .await;
         let request = request.clone();
         self.store
-            .call("work.hold_stop", move |store| {
+            .tool_transaction("work.hold_stop", move |store| {
                 store.hold_stop_request(&request)
             })
             .await
@@ -1103,6 +1131,15 @@ impl Runtime {
         network: &str,
         work_id: &str,
     ) -> Result<Value> {
+        Ok(self.interrupt_work_outcome(network, work_id).await?.value)
+    }
+
+    pub(super) async fn interrupt_work_outcome(
+        self: &Arc<Self>,
+        network: &str,
+        work_id: &str,
+    ) -> Result<crate::tools::ToolOutcome> {
+        use crate::tools::{Approval, Execution};
         let record = {
             let call_work = work_id.to_owned();
             self.store
@@ -1110,6 +1147,8 @@ impl Runtime {
                 .await
         }?
         .context("work not found")?;
+        let mut recorded = false;
+        let mut cancelled = false;
         let mut waiting_for_start = false;
         let mut retrying = false;
         match &record.state {
@@ -1120,7 +1159,7 @@ impl Runtime {
                 let trigger = task_trigger(work_id);
                 let job = self
                     .store
-                    .call("work.cancel_task", move |store| {
+                    .tool_transaction("work.cancel_task", move |store| {
                         store.request_manager_cancel(
                             &identity,
                             &call_network,
@@ -1129,10 +1168,13 @@ impl Runtime {
                         )
                     })
                     .await?;
-                if let Some(crate::scheduling::JobState::Cancelling { attempt }) =
-                    job.map(|job| job.state)
-                {
-                    self.fence_manager_attempt(&attempt.id).await?;
+                recorded = true;
+                let state = job.map(|job| job.state);
+                cancelled = matches!(state, Some(crate::scheduling::JobState::Cancelled { .. }));
+                if let Some(crate::scheduling::JobState::Cancelling { attempt }) = state {
+                    self.fence_manager_attempt(&attempt.id)
+                        .await
+                        .map_err(crate::tools::uncertain)?;
                 }
                 self.publish_changed(network, &record.conversation, Changed::Work(work_id));
             }
@@ -1155,6 +1197,7 @@ impl Runtime {
                         timed_out: false,
                     })
                     .await?;
+                recorded = true;
                 match &record.state {
                     WorkState::Running { .. } => {
                         retrying = !(held
@@ -1195,13 +1238,32 @@ impl Runtime {
                 }
                 Ok(children)
             })
-            .await?;
+            .await
+            .map_err(|error| {
+                if recorded {
+                    crate::tools::uncertain(error)
+                } else {
+                    error
+                }
+            })?;
+        let execution = if children.is_empty() {
+            match &record.state {
+                _ if cancelled => Execution::Applied,
+                WorkState::Finished { .. } => Execution::NotStarted,
+                WorkState::Unverified { .. } => Execution::Unknown,
+                _ => Execution::Pending,
+            }
+        } else {
+            Execution::Pending
+        };
         for child in children {
-            Box::pin(self.interrupt_work(network, &child)).await?;
+            Box::pin(self.interrupt_work(network, &child))
+                .await
+                .map_err(crate::tools::uncertain)?;
         }
-        Ok(
+        Ok(execution.with(Approval::Unknown).result(
             json!({"work_id":work_id,"interrupt_requested":true,"confirmed":false,"waiting_for_start":waiting_for_start,"retrying":retrying}),
-        )
+        ))
     }
 
     /// Stops a work wherever it runs. A stop for another device is stored first and delivered
@@ -1212,6 +1274,16 @@ impl Runtime {
         scope: &str,
         work_id: &str,
     ) -> Result<Value> {
+        Ok(self.stop_work_outcome(network, scope, work_id).await?.value)
+    }
+
+    pub(super) async fn stop_work_outcome(
+        self: &Arc<Self>,
+        network: &str,
+        scope: &str,
+        work_id: &str,
+    ) -> Result<crate::tools::ToolOutcome> {
+        use crate::tools::{Approval, Execution};
         let call_network = network.to_owned();
         let call_scope = scope.to_owned();
         let call_work = work_id.to_owned();
@@ -1234,7 +1306,7 @@ impl Runtime {
             })
             .await?;
         if target == self.identity.device_id()? {
-            return self.interrupt_work(network, work_id).await;
+            return self.interrupt_work_outcome(network, work_id).await;
         }
         let at = now_ms();
         let request = StopRequest {
@@ -1252,18 +1324,20 @@ impl Runtime {
             {
                 Ok(Ok(reply)) => {
                     if reply["admission"]["state"] == "owner_accepted" {
-                        self.drop_stop(work_id).await?;
+                        self.drop_stop(work_id)
+                            .await
+                            .map_err(crate::tools::uncertain)?;
                     }
                     self.publish_changed(network, scope, Changed::Work(work_id));
-                    return Ok(reply);
+                    return Ok(Execution::Pending.with(Approval::Unknown).result(reply));
                 }
                 failed => tracing::debug!(?failed, "stop request waits for its device"),
             }
         }
         self.publish_changed(network, scope, Changed::Work(work_id));
-        Ok(
+        Ok(Execution::Pending.with(Approval::Unknown).result(
             json!({"work_id":work_id,"interrupt_requested":true,"confirmed":false,"waiting_for_device":true}),
-        )
+        ))
     }
 
     async fn deliver_stop(&self, network: &str, request: &StopRequest) -> Result<Value> {

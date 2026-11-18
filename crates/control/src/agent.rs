@@ -4,6 +4,7 @@ use anyhow::{Context as _, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    borrow::Borrow,
     future::Future,
     path::{Path, PathBuf},
 };
@@ -90,22 +91,62 @@ fn thread_arguments(args: &Value, cwd: &str) -> Value {
     args
 }
 
-async fn readback<L, LF, T, TF>(args: &Value, lookup: &L, track: &T) -> Result<Option<Value>>
+/// Local handlers know whether admission failed before registration. Remote CLI
+/// calls can lose a response after commit and must preserve that uncertainty.
+pub trait DispatchOutput: Borrow<Value> {
+    fn missing_after_track(error: anyhow::Error) -> anyhow::Error;
+}
+impl DispatchOutput for Value {
+    fn missing_after_track(error: anyhow::Error) -> anyhow::Error {
+        error.context(
+            "dispatch result is unknown; preserve call_ref and query call_lookup before retrying",
+        )
+    }
+}
+
+/// A registered dispatch or a prior call could not be reconciled. The caller
+/// must keep its reference across this error, including failures reporting a send.
+#[derive(Debug)]
+pub struct UnconfirmedDispatch(anyhow::Error);
+
+impl std::fmt::Display for UnconfirmedDispatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for UnconfirmedDispatch {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+fn unconfirmed(error: anyhow::Error) -> anyhow::Error {
+    UnconfirmedDispatch(error).into()
+}
+
+async fn readback<V: Borrow<Value>, L, LF, T, TF>(
+    args: &Value,
+    lookup: &L,
+    track: &T,
+) -> Result<Option<V>>
 where
     L: Fn(String) -> LF,
-    LF: Future<Output = Result<Value>>,
+    LF: Future<Output = Result<V>>,
     T: Fn(Value) -> TF,
-    TF: Future<Output = Result<Value>>,
+    TF: Future<Output = Result<V>>,
 {
-    let found = lookup(args["call_ref"].as_str().unwrap_or_default().to_owned()).await?;
+    let found = lookup(args["call_ref"].as_str().unwrap_or_default().to_owned())
+        .await
+        .map_err(unconfirmed)?;
+    let found = found.borrow();
     if found["found"] == false {
         return Ok(None);
     }
-    ensure!(
-        found.get("conversation_id").is_some() && found.get("work_id").is_some(),
-        "call_ref has no confirmed work projection; preserve it and query call_lookup before retrying"
-    );
-    outgoing_model(&found)?;
+    if found.get("conversation_id").is_none() || found.get("work_id").is_none() {
+        return Err(unconfirmed(anyhow::anyhow!(
+            "call_ref has no confirmed work projection; preserve it and query call_lookup before retrying"
+        )));
+    }
+    outgoing_model(found).map_err(unconfirmed)?;
     let kind = found["kind"].as_str().unwrap_or_default();
     let thread = found["thread"].as_str();
     let cwd = found["cwd"].as_str().unwrap_or_default();
@@ -114,12 +155,13 @@ where
     } else {
         args.clone()
     };
-    let tracked = track(args).await?;
-    outgoing_model(&tracked)?;
-    ensure!(
-        tracked["may_send"] == false,
-        "durable work readback must not grant another send"
-    );
+    let tracked = track(args).await.map_err(unconfirmed)?;
+    outgoing_model(tracked.borrow()).map_err(unconfirmed)?;
+    if tracked.borrow()["may_send"] != false {
+        return Err(unconfirmed(anyhow::anyhow!(
+            "durable work readback must not grant another send"
+        )));
+    }
     Ok(Some(tracked))
 }
 
@@ -137,21 +179,21 @@ where
 /// `ready` also says which App Server has it: `socket`, the Node's, or the user's own Codex,
 /// where the send keeps the session's own approval, sandbox and model. A new thread is always
 /// started on `socket`.
-pub async fn dispatch<L, LF, T, TF, B, BF, R, RF>(
+pub async fn dispatch<V: DispatchOutput, L, LF, T, TF, B, BF, R, RF>(
     args: &Value,
     lookup: L,
     track: T,
     bind: B,
     ready: R,
     socket: Option<&Path>,
-) -> Result<Value>
+) -> Result<V>
 where
     L: Fn(String) -> LF,
-    LF: Future<Output = Result<Value>>,
+    LF: Future<Output = Result<V>>,
     T: Fn(Value) -> TF,
-    TF: Future<Output = Result<Value>>,
+    TF: Future<Output = Result<V>>,
     B: Fn(String, StartReport) -> BF,
-    BF: Future<Output = Result<Value>>,
+    BF: Future<Output = Result<V>>,
     R: Fn(Value) -> RF,
     RF: Future<Output = Result<Ready>>,
 {
@@ -232,7 +274,9 @@ where
         Err(error) => {
             return match readback(original, &lookup, &track).await? {
                 Some(tracked) => Ok(tracked),
-                None => Err(error),
+                None => Err(crate::tool_receipt::Execution::NotStarted
+                    .with(crate::tool_receipt::Approval::Unknown)
+                    .failure(error)),
             };
         }
     };
@@ -240,17 +284,19 @@ where
         Ok(tracked) => tracked,
         Err(error) => return match readback(original, &lookup, &track).await {
             Ok(Some(tracked)) => Ok(tracked),
-            Ok(None) => Err(error.context("dispatch result is unknown; preserve call_ref and query call_lookup before retrying")),
-            Err(readback) => Err(error.context(format!("dispatch result is unknown; durable readback failed: {readback:#}; preserve call_ref"))),
+            Ok(None) => Err(V::missing_after_track(error)),
+            Err(readback) => Err(unconfirmed(error.context(format!("dispatch result is unknown; durable readback failed: {readback:#}; preserve call_ref")))),
         },
     };
-    if tracked["may_send"] != true {
+    if tracked.borrow()["may_send"] != true {
         return Ok(tracked);
     }
-    let model = outgoing_model(&tracked)?;
+    let tracked = tracked.borrow();
+    let model = outgoing_model(tracked).map_err(unconfirmed)?;
     let work_id = tracked["work_id"]
         .as_str()
-        .context("the Node returned no work ID")?
+        .context("the Node returned no work ID")
+        .map_err(unconfirmed)?
         .to_owned();
     let report = |report| bind(work_id.clone(), report);
     let fail = |failure: ExecFailure| report(StartReport::Rejected(failure));
@@ -264,11 +310,12 @@ where
             FailureKind::Transport,
             "--socket or VIBEFACE_CODEX_SOCKET is required",
         ))
-        .await;
+        .await
+        .map_err(unconfirmed);
     };
     let mut session = match DirectSession::connect(socket).await {
         Ok(session) => session,
-        Err(error) => return fail(error.failure()).await,
+        Err(error) => return fail(error.failure()).await.map_err(unconfirmed),
     };
     let thread = match tracked["thread_id"].as_str() {
         Some(thread) => thread.to_owned(),
@@ -284,22 +331,23 @@ where
                 Ok(None) => {
                     let failure =
                         ExecFailure::new(FailureKind::Unknown, "thread/start returned no thread");
-                    return fail(failure).await;
+                    return fail(failure).await.map_err(unconfirmed);
                 }
-                Err(error) => return fail(error.failure()).await,
+                Err(error) => return fail(error.failure()).await.map_err(unconfirmed),
             }
         }
     };
     report(StartReport::Thread {
         thread_id: thread.clone(),
     })
-    .await?;
+    .await
+    .map_err(unconfirmed)?;
     if now_ms() >= tracked["send_by_ms"].as_u64().unwrap_or(0) {
         let failure = ExecFailure::new(
             FailureKind::TimedOut,
             "the send window passed before the turn was sent",
         );
-        return fail(failure).await;
+        return fail(failure).await.map_err(unconfirmed);
     }
     let outgoing = Outgoing {
         thread_id: thread,
@@ -318,7 +366,7 @@ where
     };
     let sent = session.send(&outgoing).await;
     session.close().await;
-    report(sent).await
+    report(sent).await.map_err(unconfirmed)
 }
 
 /// App Server methods that start, steer or stop a turn. A turn the Node did not register is

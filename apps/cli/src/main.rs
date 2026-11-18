@@ -812,7 +812,21 @@ struct Logs {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run_cli().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            if let Some(failure) = error.downcast_ref::<CliToolFailure>() {
+                eprintln!("{}", failure.0);
+            } else {
+                eprintln!("Error: {error:?}");
+            }
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         None => {
@@ -1634,17 +1648,25 @@ async fn codex(socket: Option<PathBuf>, command: CodexCommand) -> Result<()> {
             let tools = ToolContext::from_env().map_err(|error| {
                 report_tool_failure("dispatch_work", &args, "authorization", false, &error)
             })?;
-            let result = dispatch_work(&tools, &args, &id, socket.as_deref()).await?;
+            let result = dispatch_work(&tools, &args, socket.as_deref())
+                .await
+                .map_err(|error| {
+                    report_tool_failure(
+                        "dispatch_work",
+                        &args,
+                        "execution",
+                        error.is::<vibeface_control::agent::UnconfirmedDispatch>(),
+                        &error,
+                    )
+                })?;
             println!("{}", serde_json::to_string(&result)?);
             Ok(())
         }
     }
 }
 
-async fn call_tool(name: String, arguments: String, call_ref: Option<String>) -> Result<()> {
+fn prepare_tool_arguments(name: &str, arguments: &mut Value, call_ref: Option<&str>) -> Result<()> {
     ensure!(!name.is_empty() && name.len() <= 128, "invalid tool name");
-    let mut arguments: Value =
-        serde_json::from_str(&arguments).context("invalid tool arguments JSON")?;
     ensure!(
         arguments.is_object(),
         "tool arguments must be a JSON object"
@@ -1652,30 +1674,15 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
     let argument_ref = arguments["call_ref"].as_str();
     ensure!(
         call_ref
-            .as_deref()
             .zip(argument_ref)
             .is_none_or(|(flag, argument)| flag == argument),
         "--call-ref must match arguments.call_ref"
     );
-    let call_ref = call_ref.or_else(|| argument_ref.map(String::from));
+    let call_ref = call_ref.or(argument_ref).map(str::to_owned);
     if let Some(call_ref) = &call_ref {
         arguments["call_ref"] = json!(call_ref);
     }
-    let tools = ToolContext::from_env()
-        .map_err(|error| report_tool_failure(&name, &arguments, "authorization", false, &error))?;
     if name != "dispatch_work" {
-        let result = post_tool(
-            &tools,
-            &name,
-            arguments.clone(),
-            call_ref.as_deref().unwrap_or_default(),
-        )
-        .await
-        .map_err(|error| {
-            report_tool_failure(&name, &arguments, "execution", call_ref.is_some(), &error)
-        })?;
-        // Core performs schema validation and annotation at the authenticated HTTP boundary.
-        println!("{}", serde_json::to_string(&result)?);
         return Ok(());
     }
     let call_id = call_ref
@@ -1699,19 +1706,56 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
                 && arguments["cwd"].as_str().is_some_and(|cwd| !cwd.is_empty())),
         "dispatch_work requires thread or title and cwd"
     );
+    Ok(())
+}
+
+async fn call_tool(name: String, raw: String, call_ref: Option<String>) -> Result<()> {
+    let mut arguments: Value = serde_json::from_str(&raw)
+        .context("invalid tool arguments JSON")
+        .map_err(|error| {
+            report_tool_failure(
+                &name,
+                &json!({"call_ref":call_ref}),
+                "validation",
+                false,
+                &error,
+            )
+        })?;
+    prepare_tool_arguments(&name, &mut arguments, call_ref.as_deref()).map_err(|error| {
+        let reference = call_ref.as_deref().map(|id| json!(id)).or_else(|| {
+            vibeface_control::tool_receipt::ToolOutcome::reference(&arguments).cloned()
+        });
+        report_tool_failure(
+            &name,
+            &json!({"call_ref":reference}),
+            "validation",
+            false,
+            &error,
+        )
+    })?;
+    let tools = ToolContext::from_env()
+        .map_err(|error| report_tool_failure(&name, &arguments, "authorization", false, &error))?;
+    if name != "dispatch_work" {
+        let result = post_tool(&tools, &name, arguments.clone())
+            .await
+            .map_err(|error| report_tool_failure(&name, &arguments, "execution", true, &error))?;
+        // Core performs schema validation and annotation at the authenticated HTTP boundary.
+        println!("{}", serde_json::to_string(&result)?);
+        return Ok(());
+    }
     let result = {
         let socket = std::env::var_os("VIBEFACE_CODEX_SOCKET").map(PathBuf::from);
-        dispatch_work(&tools, &arguments, call_id, socket.as_deref()).await
+        dispatch_work(&tools, &arguments, socket.as_deref()).await
     };
-    let mut result = result
-        .map_err(|error| report_tool_failure(&name, &arguments, "execution", true, &error))?;
-    let record = result
-        .get_mut("call_record")
-        .and_then(Value::as_object_mut)
-        .context("dispatch response has no valid result record")
-        .map_err(|error| report_tool_failure(&name, &arguments, "execution", true, &error))?;
-    record.insert("tool".into(), json!(name));
-    record.insert("call_ref".into(), json!(call_id));
+    let result = result.map_err(|error| {
+        report_tool_failure(
+            &name,
+            &arguments,
+            "execution",
+            error.is::<vibeface_control::agent::UnconfirmedDispatch>(),
+            &error,
+        )
+    })?;
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
@@ -1719,21 +1763,43 @@ async fn call_tool(name: String, arguments: String, call_ref: Option<String>) ->
 async fn dispatch_work(
     tools: &ToolContext,
     arguments: &Value,
-    call_id: &str,
     socket: Option<&Path>,
 ) -> Result<Value> {
-    vibeface_control::agent::dispatch(
+    let mut reply = vibeface_control::agent::dispatch(
         arguments,
-        |ref_id| post_tool(tools, "call_lookup", json!({"call_ref":ref_id}), call_id),
-        |args| post_tool(tools, "track_work", args, call_id),
-        |work_id, report| post_tool(tools, "bind_work", json!({"work_id":work_id,"report":report}), call_id),
+        |ref_id| post_tool(tools, "call_lookup", json!({"call_ref":ref_id})),
+        |args| post_tool(tools, "track_work", args),
+        |work_id, report| post_tool(tools, "bind_work", json!({"work_id":work_id,"report":report})),
         |args| async move {
             let asked = json!({"agent":args["agent"],"thread":args["thread"],"continues":args["continues"]});
-            let ready = post_tool(tools, "wait_work", asked, call_id).await?;
+            let ready = post_tool(tools, "wait_work", asked).await?;
             serde_json::from_value(ready).context("the Node's wait_work answer is malformed")
         },
         socket,
-    ).await
+    ).await?;
+    let reference = arguments["call_ref"]
+        .as_str()
+        .context("dispatch requires call_ref")?;
+    let record = reply
+        .get_mut("call_record")
+        .and_then(Value::as_object_mut)
+        .context("dispatch response has no valid result record")
+        .map_err(|error| {
+            report_tool_failure("dispatch_work", arguments, "execution", true, &error)
+        })?;
+    dispatch_record(record, reference);
+    Ok(reply)
+}
+
+fn dispatch_record(record: &mut serde_json::Map<String, Value>, reference: &str) {
+    record.insert("tool".into(), json!("dispatch_work"));
+    record.insert("call_ref".into(), json!(reference));
+    if matches!(
+        record.get("confirmation").and_then(Value::as_str),
+        Some("unknown" | "pending")
+    ) {
+        record.insert("retry".into(), json!("lookup_same_ref"));
+    }
 }
 
 fn origin(value: &str) -> Result<Url> {
@@ -1805,29 +1871,73 @@ impl ToolContext {
     }
 }
 
-async fn post_tool(
-    tools: &ToolContext,
-    name: &str,
-    arguments: Value,
-    call_id: &str,
-) -> Result<Value> {
-    let response = tools.client.post(tools.url.join("sdk.v1.SdkCustomToolCallbackService/CallCustomTool")?).bearer_auth(&tools.token).json(&json!({"toolName":name,"args":arguments,"agentId":"cli"})).send().await.map_err(|error| anyhow::anyhow!("reach local node tool API; preserve call_ref {call_id} and query call_lookup before retrying: {error}"))?;
-    let status = response.status();
-    let body = bounded_body(response).await?;
-    if !status.is_success() {
-        if let Ok(error) = serde_json::from_slice::<Value>(&body)
-            && error.get("call_record").is_some()
-        {
-            eprintln!("{}", serde_json::to_string(&error)?);
-        }
-        let reason = serde_json::from_slice::<Value>(&body)
-            .ok()
-            .and_then(|error| error["error"].as_str().map(str::to_owned))
-            .unwrap_or_default();
-        bail!("node tool rejected with HTTP {status}: {reason}; preserve call_ref {call_id}");
+#[derive(Debug)]
+struct CliToolFailure(Value);
+impl std::fmt::Display for CliToolFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0["error"].as_str().unwrap_or("tool call failed"))
     }
-    let reply: Value = serde_json::from_slice(&body).context("invalid node tool response")?;
-    Ok(reply["result"].clone())
+}
+impl std::error::Error for CliToolFailure {}
+
+async fn post_tool(tools: &ToolContext, name: &str, arguments: Value) -> Result<Value> {
+    let request = tools
+        .client
+        .post(
+            tools
+                .url
+                .join("sdk.v1.SdkCustomToolCallbackService/CallCustomTool")?,
+        )
+        .bearer_auth(&tools.token)
+        .json(&json!({"toolName":name,"args":arguments,"agentId":"cli"}))
+        .build()
+        .map_err(|error| {
+            report_tool_failure(name, &arguments, "execution", false, &error.into())
+        })?;
+    let response = tools.client.execute(request).await.map_err(|error| {
+        let unknown = !error.is_connect();
+        report_tool_failure(
+            name,
+            &arguments,
+            "execution",
+            unknown,
+            &anyhow::Error::from(error).context("reach local node tool API"),
+        )
+    })?;
+    let status = response.status();
+    let after_send = |error| report_tool_failure(name, &arguments, "execution", true, &error);
+    let body = bounded_body(response).await.map_err(after_send)?;
+    if !status.is_success() {
+        let failure = serde_json::from_slice::<Value>(&body).ok();
+        if let Some(response) = failure
+            .as_ref()
+            .filter(|response| response.get("call_record").is_some())
+        {
+            vibeface_control::tool_receipt::validate_response(name, &arguments, response, false)
+                .map_err(after_send)?;
+            return Err(CliToolFailure(response.clone()).into());
+        }
+        let reason = failure
+            .as_ref()
+            .and_then(|value| value["error"].as_str())
+            .unwrap_or_default();
+        let error = anyhow::anyhow!("node tool rejected with HTTP {status}: {reason}");
+        return Err(if status == reqwest::StatusCode::UNAUTHORIZED {
+            report_tool_failure(name, &arguments, "authorization", false, &error)
+        } else {
+            after_send(error)
+        });
+    }
+    let mut reply: Value = serde_json::from_slice(&body)
+        .context("invalid node tool response")
+        .map_err(after_send)?;
+    let result = reply
+        .get_mut("result")
+        .context("node tool response has no result")
+        .map_err(after_send)?;
+    vibeface_control::tool_receipt::validate_response(name, &arguments, result, true)
+        .map_err(after_send)?;
+    Ok(result.take())
 }
 
 async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>> {
@@ -1848,11 +1958,35 @@ fn tool_failure(
     unknown: bool,
     error: &anyhow::Error,
 ) -> Value {
+    let reference = args
+        .get("call_ref")
+        .or_else(|| args["arguments"].get("call_ref"));
+    use vibeface_control::tool_receipt::{Approval, EffectReceipt, Execution};
+    let evidence = EffectReceipt::from_error(error);
+    if evidence.is_none()
+        && let Some(failure) = error.downcast_ref::<CliToolFailure>()
+    {
+        let mut response = failure.0.clone();
+        // Direct calls retain the authenticated server's complete record. A local
+        // composite dispatch reports the sub-operation's evidence under its own reference.
+        if name == "dispatch_work"
+            && let Some(reference) = reference.and_then(Value::as_str)
+            && let Some(record) = response["call_record"].as_object_mut()
+        {
+            dispatch_record(record, reference);
+        }
+        return response;
+    }
+    let execution = if unknown {
+        Execution::Unknown
+    } else {
+        Execution::NotStarted
+    };
     json!({"error":format!("{error:#}"),"code":match stage {
         "validation" => "invalid_tool_arguments",
         "authorization" => "tool_not_authorized",
         _ => "tool_execution_failed",
-    },"call_record":{"tool":name,"call_ref":args.get("call_ref"),"stage":stage,"execution":if unknown { "unknown" } else { "not_started" },"confirmation":if unknown { "unknown" } else { "confirmed" },"approval":"unknown","retry":if unknown { "lookup_same_ref" } else { "none" }}})
+    }, "call_record":evidence.unwrap_or(execution.with(Approval::Unknown)).record(name,reference,stage)})
 }
 
 fn report_tool_failure(
@@ -1862,18 +1996,7 @@ fn report_tool_failure(
     unknown: bool,
     error: &anyhow::Error,
 ) -> anyhow::Error {
-    let response = tool_failure(name, args, stage, unknown, error);
-    eprintln!(
-        "{}",
-        serde_json::to_string(&response)
-            .unwrap_or_else(|_| "{\"error\":\"tool call failed\"}".into())
-    );
-    anyhow::anyhow!(
-        response["error"]
-            .as_str()
-            .unwrap_or("tool call failed")
-            .to_owned()
-    )
+    CliToolFailure(tool_failure(name, args, stage, unknown, error)).into()
 }
 
 fn hook_event(agent: triage::Provider, input: &Value) -> Option<triage::HookEvent> {

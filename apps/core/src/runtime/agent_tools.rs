@@ -6,7 +6,7 @@ use crate::{
         bot_settings::{ChangeRequest, bot_message_id, change_id},
         bots::created_bot_id,
     },
-    tools::{Effect, Tool, ToolFailure},
+    tools::{Approval, Effect, Execution, FailureStage, Tool, ToolFailure, ToolOutcome, uncertain},
     work::{RequestedWorkKind, WorkRequest, WorkSpec},
 };
 
@@ -15,6 +15,95 @@ pub(super) struct ExecutionProviderRequest<'a> {
     pub(super) agent: Option<Provider>,
     pub(super) thread: Option<&'a str>,
     pub(super) continues: Option<&'a str>,
+}
+
+/// The store transaction rolls back on business rejection. A lost writer reply,
+/// publication failure, or database failure cannot certify the commit to the caller.
+impl crate::store::StoreActor {
+    pub(super) async fn tool_transaction<T: Send + 'static>(
+        &self,
+        operation: &'static str,
+        f: impl FnOnce(&mut Store) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.call(operation, move |store| Ok(f(store)))
+            .await
+            .map_err(|error| {
+                if matches!(
+                    error.downcast_ref::<crate::store::actor::StoreCallError>(),
+                    Some(crate::store::actor::StoreCallError::NotAdmitted)
+                ) {
+                    error
+                } else {
+                    uncertain(error)
+                }
+            })?
+            .map_err(|error| {
+                if error.is::<rusqlite::Error>() {
+                    uncertain(error)
+                } else {
+                    error
+                }
+            })
+    }
+}
+
+fn workspace_call_id(
+    network: &str,
+    conversation: &str,
+    trigger: &str,
+    call_ref: &str,
+) -> Result<String> {
+    Ok(format!(
+        "workspace-{}",
+        crate::crypto::digest(&serde_json::to_vec(&(
+            network,
+            conversation,
+            trigger,
+            call_ref
+        ))?)
+    ))
+}
+
+fn terminal_execution(outcome: crate::model::WorkOutcome) -> Execution {
+    use crate::model::WorkOutcome::*;
+    match outcome {
+        Completed | Failed | Interrupted => Execution::Completed,
+        Rejected => Execution::NotStarted,
+        Unverified => Execution::Unknown,
+    }
+}
+
+pub(super) fn work_execution(state: &crate::work::WorkState) -> Execution {
+    use crate::work::WorkState::*;
+    match state {
+        Accepted | Starting { .. } => Execution::Pending,
+        Running { .. } | Interrupting { .. } => Execution::Started,
+        Finished { outcome } => terminal_execution(*outcome),
+        Unverified { .. } => Execution::Unknown,
+    }
+}
+
+fn projection_execution(work: &crate::model::WorkProjection) -> Execution {
+    use crate::model::WorkStatus::*;
+    match (work.outcome, work.state) {
+        (Some(outcome), _) => terminal_execution(outcome),
+        (None, Accepted) => Execution::Pending,
+        (None, Running) if work.phase.is_none() => Execution::Pending,
+        (None, Running | Interrupting) => Execution::Started,
+        (None, Unverified | Finished) => Execution::Unknown,
+    }
+}
+
+fn dispatch_outcome(dispatch: &crate::work::Dispatch) -> ToolOutcome {
+    use crate::work::DispatchState::*;
+    let execution = match dispatch.state {
+        Pending | Accepted => Execution::Pending,
+        Rejected { .. } => Execution::NotStarted,
+        Unverified { .. } => Execution::Unknown,
+    };
+    execution
+        .with(Approval::Unknown)
+        .result(dispatch_row(dispatch))
 }
 
 impl Runtime {
@@ -27,23 +116,16 @@ impl Runtime {
     ) -> Result<Value> {
         let conversation_id = access.conversation_id().to_owned();
         let asked_work = args["work_id"].as_str().map(str::to_owned);
-        let mut stage = "validation";
+        let mut stage = FailureStage::Authorization;
         let result = match Tool::invocation(name, args.clone()) {
             Ok((tool, args)) => self
                 .run_tool(access, tool, args.clone(), &mut stage)
                 .await
-                .map(|value| tool.annotate(&args, value))
-                .map_err(|error| {
-                    ToolFailure::new(
-                        tool.name(),
-                        &args,
-                        stage,
-                        stage == "execution" && tool.effect() != Effect::Read,
-                        &error,
-                    )
-                    .into()
-                }),
-            Err(error) => Err(ToolFailure::new(name, &args, stage, false, &error).into()),
+                .map(|outcome| outcome.into_response(tool.name(), &args))
+                .map_err(|error| ToolFailure::new(tool.name(), &args, stage, &error).into()),
+            Err(error) => {
+                Err(ToolFailure::new(name, &args, FailureStage::Validation, &error).into())
+            }
         };
         let conversation_id = Some(conversation_id.as_str());
         match &result {
@@ -69,9 +151,8 @@ impl Runtime {
         access: AgentAccess,
         tool: Tool,
         args: Value,
-        stage: &mut &'static str,
-    ) -> Result<Value> {
-        *stage = "authorization";
+        stage: &mut FailureStage,
+    ) -> Result<ToolOutcome> {
         let _work = self.maintenance.enter()?;
         let scope = access.conversation_id().to_owned();
         self.require_conversation(access.network_id(), &scope)
@@ -79,7 +160,11 @@ impl Runtime {
         let name = tool.name();
         ensure!(
             tool.effect() == Effect::Read || access.invocation().is_some(),
-            "work changes require a live agent invocation"
+            Execution::NotStarted
+                .with(Approval::Denied)
+                .failure(anyhow::anyhow!(
+                    "work changes require a live agent invocation"
+                ))
         );
         let mut kind = if let Some(manager) = access.invocation() {
             Some(
@@ -101,7 +186,9 @@ impl Runtime {
         if let Some(kind) = kind {
             ensure!(
                 tool.effect().offered(kind),
-                "{name} is not offered in a {kind:?} turn"
+                Execution::NotStarted
+                    .with(Approval::Denied)
+                    .failure(anyhow::anyhow!("{name} is not offered in a {kind:?} turn"))
             );
         }
         let _lease = match access.invocation() {
@@ -112,7 +199,7 @@ impl Runtime {
             ),
             None => None,
         };
-        *stage = "execution";
+        *stage = FailureStage::Execution;
         let network = access.network_id();
         if let Some(manager) = access.invocation() {
             let network = network.to_owned();
@@ -131,7 +218,11 @@ impl Runtime {
                             .context("task not found")?;
                         ensure!(
                             !task.reply_only || tool.effect() == Effect::Read,
-                            "reply-only tasks cannot dispatch or control other work"
+                            Execution::NotStarted
+                                .with(Approval::Denied)
+                                .failure(anyhow::anyhow!(
+                                    "reply-only tasks cannot dispatch or control other work"
+                                ))
                         );
                         if task.reply_only {
                             kind = None;
@@ -142,7 +233,9 @@ impl Runtime {
                     {
                         ensure!(
                             store.scheduler_work_in_scope(&network, &job, work_id)?,
-                            "work is outside this task scope"
+                            Execution::NotStarted
+                                .with(Approval::Denied)
+                                .failure(anyhow::anyhow!("work is outside this task scope"))
                         );
                     }
                     if matches!(tool, Tool::DispatchWork | Tool::TrackWork) {
@@ -150,7 +243,9 @@ impl Runtime {
                             if let Some(work_id) = args[key].as_str() {
                                 ensure!(
                                     store.scheduler_work_in_scope(&network, &job, work_id)?,
-                                    "work is outside this task scope"
+                                    Execution::NotStarted.with(Approval::Denied).failure(
+                                        anyhow::anyhow!("work is outside this task scope")
+                                    )
                                 );
                             }
                         }
@@ -167,16 +262,20 @@ impl Runtime {
                     {
                         ensure!(
                             store.scheduler_native_in_scope(&network, &job, thread)?,
-                            "native session is outside this task scope"
+                            Execution::NotStarted
+                                .with(Approval::Denied)
+                                .failure(anyhow::anyhow!(
+                                    "native session is outside this task scope"
+                                ))
                         );
                     }
                     Ok(kind)
                 })
                 .await?;
         }
-        match tool {
+        let read = match tool {
             Tool::WorkspaceState | Tool::WorkspaceHistory | Tool::WorkspaceCommand => {
-                self.agent_workspace(&access, &scope, tool, &args).await
+                return self.agent_workspace(&access, &scope, tool, &args).await;
             }
             Tool::Search => Tool::search(args, kind),
             Tool::Describe => Tool::describe(args, kind),
@@ -257,11 +356,12 @@ impl Runtime {
                         })
                         .await?
                 };
-                work_status(&works, &dispatches, &args)
+                return work_status(&works, &dispatches, &args);
             }
             Tool::CallLookup => {
-                self.call_lookup(&access, &scope, field(&args, "call_ref")?)
-                    .await
+                return self
+                    .call_lookup(&access, &scope, field(&args, "call_ref")?)
+                    .await;
             }
             Tool::Recall => {
                 let query = args["query"].as_str().map(str::to_lowercase);
@@ -406,7 +506,7 @@ impl Runtime {
                     let arg3 = (manager.trigger()).to_owned();
                     let arg4 = (field(&args, "bot")?).to_owned();
                     self.store
-                        .call("agent_tools.delete_bot_in_turn", move |store| {
+                        .tool_transaction("agent_tools.delete_bot_in_turn", move |store| {
                             store.delete_bot_in_turn(&arg0, &arg1, &arg2, &arg3, &arg4, now_ms())
                         })
                         .await
@@ -414,13 +514,18 @@ impl Runtime {
                 if let Some(event) = &event {
                     self.bot_deleted(network, &deleted, &event.hash);
                 }
-                Ok(
+                let effect = if event.is_some() {
+                    Execution::Applied
+                } else {
+                    Execution::NotStarted
+                };
+                return Ok(effect.result(
                     json!({"conversation_id":deleted,"deleted":true,"written":event.is_some(),
                     "primary":({
                         let arg0 = (network).to_owned();
                         self.store.call("agent_tools.primary_bot", move |store| store.primary_bot(&arg0)).await
-                    }?)}),
-                )
+                    }.map_err(|error| effect.with(Approval::NotRequired).failure(error))?)}),
+                ));
             }
             Tool::CreateBot => {
                 let manager = access
@@ -457,7 +562,7 @@ impl Runtime {
                     let name = field(&args, "name")?.to_owned();
                     let instructions = optional("instructions").unwrap_or("").to_owned();
                     self.store
-                        .call("agent_tools.create_bot", move |store| {
+                        .tool_transaction("agent_tools.create_bot", move |store| {
                             store.create_bot_in_turn(
                                 &identity,
                                 &network,
@@ -477,7 +582,7 @@ impl Runtime {
                         Changed::Event(&bot.event_hash),
                     );
                 }
-                Ok(tool_bot(&bot))
+                return Ok(Execution::Applied.result(tool_bot(&bot)));
             }
             Tool::MessageBot => {
                 let manager = access
@@ -492,7 +597,7 @@ impl Runtime {
                     let arg5 = (field(&args, "bot")?).to_owned();
                     let arg6 = (field(&args, "text")?).to_owned();
                     self.store
-                        .call("agent_tools.message_bot", move |store| {
+                        .tool_transaction("agent_tools.message_bot", move |store| {
                             store.message_bot(
                                 &arg0,
                                 &arg1,
@@ -515,7 +620,7 @@ impl Runtime {
                     self.schedule_wakeup.notify_one();
                     self.outbox_wakeup.notify_one();
                 }
-                Ok(json!({"message":message,"delivery":receipt}))
+                return Ok(Execution::Applied.result(json!({"message":message,"delivery":receipt})));
             }
             Tool::ReadSkill => {
                 let id = field(&args, "skill_id")?;
@@ -565,7 +670,7 @@ impl Runtime {
                     let arg5 = request;
                     let arg6 = provider;
                     self.store
-                        .call("agent_tools.change_bot", move |store| {
+                        .tool_transaction("agent_tools.change_bot", move |store| {
                             store.change_bot(
                                 &arg0,
                                 &arg1,
@@ -586,7 +691,7 @@ impl Runtime {
                         Changed::Event(&record.event_hash),
                     );
                 }
-                Ok(json!(record))
+                return Ok(Execution::Applied.result(json!(record)));
             }
             Tool::Remember | Tool::Forget => {
                 let manager = access
@@ -608,19 +713,29 @@ impl Runtime {
                     let arg3 = (manager.attempt_id()).to_owned();
                     let arg4 = (call_ref).to_owned();
                     let arg5 = request;
-                    self.store
-                        .call("agent_tools.stage_memory", move |store| {
-                            store.stage_memory(&arg0, &arg1, &arg2, &arg3, &arg4, arg5, now_ms())
+                    return self
+                        .store
+                        .tool_transaction("agent_tools.stage_memory", move |store| {
+                            store.stage_memory_outcome(
+                                &arg0,
+                                &arg1,
+                                &arg2,
+                                &arg3,
+                                &arg4,
+                                arg5,
+                                now_ms(),
+                            )
                         })
-                        .await
+                        .await;
                 }
             }
-            Tool::TrackWork => self.track_work(&access, &scope, &args).await,
+            Tool::TrackWork => return self.track_work(&access, &scope, &args).await,
             Tool::BindWork => {
                 let report = serde_json::from_value(args["report"].clone())
                     .context("report must be a start report")?;
-                self.bind_work(network, &scope, field(&args, "work_id")?, report)
-                    .await
+                return self
+                    .bind_work(network, &scope, field(&args, "work_id")?, report)
+                    .await;
             }
             Tool::WaitWork => {
                 drop((_lease, _work));
@@ -630,7 +745,7 @@ impl Runtime {
             Tool::DispatchWork => {
                 let socket = self.codex.socket();
                 let (access, scope) = (&access, scope.as_str());
-                vibeface_control::agent::dispatch(
+                return vibeface_control::agent::dispatch(
                     &args,
                     |call_ref| async move { self.call_lookup(access, scope, &call_ref).await },
                     |args| async move { self.track_work(access, scope, &args).await },
@@ -641,21 +756,30 @@ impl Runtime {
                     Some(&socket),
                 )
                 .await
+                .map_err(|error| {
+                    if error.is::<vibeface_control::agent::UnconfirmedDispatch>() {
+                        uncertain(error)
+                    } else {
+                        error
+                    }
+                });
             }
             Tool::InterruptWork => {
                 let id = field(&args, "work_id")?;
-                self.stop_work(network, &scope, id).await
+                return self.stop_work_outcome(network, &scope, id).await;
             }
             Tool::ProposeProviderConfig => {
                 let manager = access
                     .invocation()
                     .context("a proposal requires an agent invocation")?;
-                self.propose_provider_config(network, &scope, manager.trigger(), args)
-                    .await
+                return self
+                    .propose_provider_config(network, &scope, manager.trigger(), args)
+                    .await;
             }
             Tool::ApplyProviderConfig => {
-                self.apply_provider_config(network, &scope, field(&args, "question_id")?)
-                    .await
+                return self
+                    .apply_provider_config(network, &scope, field(&args, "question_id")?)
+                    .await;
             }
             Tool::HandOverSession => {
                 let target = match (args["to"].as_str(), args["stop_following"] == true) {
@@ -674,17 +798,19 @@ impl Runtime {
                     (None, true) => None,
                     _ => bail!("give either to or stop_following=true"),
                 };
-                self.hand_over_session(
-                    network,
-                    &scope,
-                    field(&args, "node")?,
-                    field(&args, "session_id")?,
-                    field(&args, "version")?,
-                    target.as_deref(),
-                )
-                .await
+                return self
+                    .hand_over_session(
+                        network,
+                        &scope,
+                        field(&args, "node")?,
+                        field(&args, "session_id")?,
+                        field(&args, "version")?,
+                        target.as_deref(),
+                    )
+                    .await;
             }
-        }
+        }?;
+        Ok(Execution::Read.result(read))
     }
 
     async fn agent_workspace(
@@ -693,159 +819,161 @@ impl Runtime {
         conversation: &str,
         tool: Tool,
         args: &Value,
-    ) -> Result<Value> {
+    ) -> Result<ToolOutcome> {
         let network = access.network_id();
         let access = access.clone();
         let conversation = conversation.to_owned();
         let args = args.clone();
         let identity = self.identity.clone();
-        let (value, written) = self
-            .store
-            .call("agent_tools.workspace", move |store| {
-                let network = access.network_id();
-                let conversation = conversation.as_str();
-                let args = &args;
-                let mut written = None;
-                let value = (|| -> Result<Value> {
-                    let job = access
+        let query = move |store: &mut Store| {
+            let network = access.network_id();
+            let conversation = conversation.as_str();
+            let args = &args;
+            let mut written = None;
+            let outcome = (|| -> Result<ToolOutcome> {
+                let job = access
+                    .invocation()
+                    .map(|manager| {
+                        store
+                            .scheduler_job(conversation, manager.trigger())?
+                            .context("this turn is not running here")
+                    })
+                    .transpose()?;
+                if tool == Tool::WorkspaceCommand {
+                    let manager = access
                         .invocation()
-                        .map(|manager| {
-                            store
-                                .scheduler_job(conversation, manager.trigger())?
-                                .context("this turn is not running here")
-                        })
-                        .transpose()?;
-                    if tool == Tool::WorkspaceCommand {
-                        let manager = access
-                            .invocation()
-                            .context("workspace commands need a current Bot turn")?;
-                        let job = job.as_ref().context("this turn is not running here")?;
-                        let command: crate::workspace::WorkspaceCommand =
-                            serde_json::from_value(args["command"].clone())?;
-                        let command_id = format!(
-                            "workspace-{}",
-                            crate::crypto::digest(&serde_json::to_vec(&(
-                                network,
-                                conversation,
-                                manager.trigger(),
-                                field(args, "call_ref")?
-                            ))?)
-                        );
-                        let receipt = store.workspace_agent_command(
-                            &identity,
-                            network,
-                            job,
-                            &command_id,
-                            command,
-                            now_ms(),
-                        )?;
-                        written = Some(receipt.event_hash.clone());
-                        return Ok(serde_json::to_value(receipt)?);
+                        .context("workspace commands need a current Bot turn")?;
+                    let job = job.as_ref().context("this turn is not running here")?;
+                    let command: crate::workspace::WorkspaceCommand =
+                        serde_json::from_value(args["command"].clone())?;
+                    let command_id = workspace_call_id(
+                        network,
+                        conversation,
+                        manager.trigger(),
+                        field(args, "call_ref")?,
+                    )?;
+                    let receipt = store.workspace_agent_command(
+                        &identity,
+                        network,
+                        job,
+                        &command_id,
+                        command,
+                        now_ms(),
+                    )?;
+                    written = Some(receipt.event_hash.clone());
+                    return Ok(Execution::Applied.result(json!(receipt)));
+                }
+                let own_task = job.as_ref().and_then(|job| match &job.scope {
+                    crate::scheduling::SessionScope::WorkspaceTask { task_id } => {
+                        Some(task_id.as_str())
                     }
-                    let own_task = job.as_ref().and_then(|job| match &job.scope {
-                        crate::scheduling::SessionScope::WorkspaceTask { task_id } => {
-                            Some(task_id.as_str())
-                        }
-                        _ => None,
-                    });
-                    let task_id = args["task_id"].as_str().or(own_task);
-                    let channel_id = args["channel_id"].as_str();
-                    let bot = store
-                        .bot_for_conversation(network, conversation)?
-                        .context("Bot not found")?;
-                    if let Some(task_id) = task_id {
-                        let task = store
-                            .workspace_task(network, task_id)?
+                    _ => None,
+                });
+                let task_id = args["task_id"].as_str().or(own_task);
+                let channel_id = args["channel_id"].as_str();
+                let bot = store
+                    .bot_for_conversation(network, conversation)?
+                    .context("Bot not found")?;
+                if let Some(task_id) = task_id {
+                    let task = store
+                        .workspace_task(network, task_id)?
+                        .context("task not found")?;
+                    let root = store
+                        .workspace_task(network, &task.root_task_id)?
+                        .context("root task not found")?;
+                    if let Some(own_id) = own_task {
+                        let own = store
+                            .workspace_task(network, own_id)?
                             .context("task not found")?;
-                        let root = store
-                            .workspace_task(network, &task.root_task_id)?
-                            .context("root task not found")?;
-                        if let Some(own_id) = own_task {
-                            let own = store
-                                .workspace_task(network, own_id)?
-                                .context("task not found")?;
-                            ensure!(
-                                own.root_task_id == task.root_task_id,
-                                "task is outside this root"
-                            );
-                        } else {
-                            ensure!(
-                                task.owner_bot == bot.bot_id || root.owner_bot == bot.bot_id,
-                                "task is outside this Bot scope"
-                            );
-                        }
                         ensure!(
-                            channel_id
-                                .is_none_or(|channel| task.channel_id.as_deref() == Some(channel)),
-                            "channel is outside this task"
+                            own.root_task_id == task.root_task_id,
+                            "task is outside this root"
                         );
-                    }
-                    if let Some(channel_id) = channel_id {
-                        let state = store.workspace_state(network, Some(channel_id), None, 512)?;
+                    } else {
                         ensure!(
-                            state
-                                .channels
-                                .iter()
-                                .any(|channel| channel.channel_id == channel_id
-                                    && channel.members.contains(&bot.bot_id)),
-                            "Bot is outside this channel"
+                            task.owner_bot == bot.bot_id || root.owner_bot == bot.bot_id,
+                            "task is outside this Bot scope"
                         );
-                    }
-                    let limit = args["limit"].as_u64().unwrap_or(100).clamp(1, 512) as usize;
-                    if tool == Tool::WorkspaceState {
-                        let mut state =
-                            store.workspace_state(network, channel_id, task_id, limit)?;
-                        if task_id.is_none() && channel_id.is_none() {
-                            let root_ids = state
-                                .tasks
-                                .iter()
-                                .filter(|task| task.owner_bot == bot.bot_id)
-                                .map(|task| task.root_task_id.clone())
-                                .collect::<BTreeSet<_>>();
-                            state
-                                .tasks
-                                .retain(|task| root_ids.contains(&task.root_task_id));
-                            let task_ids = state
-                                .tasks
-                                .iter()
-                                .map(|task| task.task_id.as_str())
-                                .collect::<BTreeSet<_>>();
-                            state.assignments.retain(|assignment| {
-                                task_ids.contains(assignment.task_id.as_str())
-                            });
-                            state
-                                .channels
-                                .retain(|channel| channel.members.contains(&bot.bot_id));
-                            state
-                                .inputs
-                                .retain(|input| match &input.input.route.target {
-                                    crate::workspace::InputTarget::Task { task_id }
-                                    | crate::workspace::InputTarget::ChannelTask {
-                                        task_id, ..
-                                    } => task_ids.contains(task_id.as_str()),
-                                    crate::workspace::InputTarget::BotMain { bot_id } => {
-                                        bot_id == &bot.bot_id
-                                    }
-                                    _ => false,
-                                });
-                        }
-                        return Ok(serde_json::to_value(state)?);
                     }
                     ensure!(
-                        task_id.is_some() || channel_id.is_some(),
-                        "workspace history requires a task or channel"
+                        channel_id
+                            .is_none_or(|channel| task.channel_id.as_deref() == Some(channel)),
+                        "channel is outside this task"
                     );
-                    Ok(serde_json::to_value(store.workspace_history(
+                }
+                if let Some(channel_id) = channel_id {
+                    let state = store.workspace_state(network, Some(channel_id), None, 512)?;
+                    ensure!(
+                        state
+                            .channels
+                            .iter()
+                            .any(|channel| channel.channel_id == channel_id
+                                && channel.members.contains(&bot.bot_id)),
+                        "Bot is outside this channel"
+                    );
+                }
+                let limit = args["limit"].as_u64().unwrap_or(100).clamp(1, 512) as usize;
+                if tool == Tool::WorkspaceState {
+                    let mut state = store.workspace_state(network, channel_id, task_id, limit)?;
+                    if task_id.is_none() && channel_id.is_none() {
+                        let root_ids = state
+                            .tasks
+                            .iter()
+                            .filter(|task| task.owner_bot == bot.bot_id)
+                            .map(|task| task.root_task_id.clone())
+                            .collect::<BTreeSet<_>>();
+                        state
+                            .tasks
+                            .retain(|task| root_ids.contains(&task.root_task_id));
+                        let task_ids = state
+                            .tasks
+                            .iter()
+                            .map(|task| task.task_id.as_str())
+                            .collect::<BTreeSet<_>>();
+                        state
+                            .assignments
+                            .retain(|assignment| task_ids.contains(assignment.task_id.as_str()));
+                        state
+                            .channels
+                            .retain(|channel| channel.members.contains(&bot.bot_id));
+                        state
+                            .inputs
+                            .retain(|input| match &input.input.route.target {
+                                crate::workspace::InputTarget::Task { task_id }
+                                | crate::workspace::InputTarget::ChannelTask { task_id, .. } => {
+                                    task_ids.contains(task_id.as_str())
+                                }
+                                crate::workspace::InputTarget::BotMain { bot_id } => {
+                                    bot_id == &bot.bot_id
+                                }
+                                _ => false,
+                            });
+                    }
+                    return Ok(Execution::Read.result(serde_json::to_value(state)?));
+                }
+                ensure!(
+                    task_id.is_some() || channel_id.is_some(),
+                    "workspace history requires a task or channel"
+                );
+                Ok(
+                    Execution::Read.result(serde_json::to_value(store.workspace_history(
                         network,
                         channel_id,
                         task_id,
                         args["cursor"].as_str(),
                         limit,
-                    )?)?)
-                })()?;
-                Ok((value, written))
-            })
-            .await?;
+                    )?)?),
+                )
+            })()?;
+            Ok((outcome, written))
+        };
+        let (outcome, written) = if tool == Tool::WorkspaceCommand {
+            self.store
+                .tool_transaction("agent_tools.workspace", query)
+                .await?
+        } else {
+            self.store.call("agent_tools.workspace", query).await?
+        };
         if let Some(event_hash) = written {
             self.publish_changed(
                 network,
@@ -855,7 +983,7 @@ impl Runtime {
             self.schedule_wakeup.notify_one();
             self.outbox_wakeup.notify_one();
         }
-        Ok(value)
+        Ok(outcome)
     }
 
     async fn agent_history(
@@ -1146,7 +1274,7 @@ impl Runtime {
         access: &AgentAccess,
         scope: &str,
         call_ref: &str,
-    ) -> Result<Value> {
+    ) -> Result<ToolOutcome> {
         let network = access.network_id();
         let manager = access
             .invocation()
@@ -1169,25 +1297,33 @@ impl Runtime {
             .into_iter()
             .find(|work| work.work_id == id)
         {
-            return Ok(json!(work));
+            let execution = if work.target_node == local {
+                store.work_record(&id)?.filter(|record| record.conversation == scope)
+                    .map(|record| work_execution(&record.state))
+            } else { None }.unwrap_or_else(|| projection_execution(&work));
+            return Ok(execution.with(Approval::Unknown).result(json!(work)));
         }
         if let Some(dispatch) = store.dispatch(&id)? {
-            return Ok(dispatch_row(&dispatch));
+            return Ok(dispatch_outcome(&dispatch));
         }
         if let Some(change) =
             store.bot_change(&network, &change_id(&scope, manager.trigger(), &call_ref))?
         {
-            return Ok(json!(change));
+            return Ok(Execution::Applied.result(json!(change)));
         }
         if let Some(staged) =
             store.staged_memory_call(&scope, manager.trigger(), manager.attempt_id(), &call_ref)?
         {
-            return Ok(staged);
+            return Ok(Execution::Pending.result(staged));
         }
         if let Some(message) =
             store.bot_message(&network, &bot_message_id(&scope, manager.trigger(), &call_ref))?
         {
-            return Ok(json!(message));
+            return Ok(Execution::Applied.result(json!(message)));
+        }
+        let command_id = workspace_call_id(&network, &scope, manager.trigger(), &call_ref)?;
+        if store.workspace_command_recorded(&network, &command_id)? {
+            return Ok(Execution::Applied.result(json!({"command_id":command_id,"call_ref":call_ref})));
         }
         let (bot_id, _) = created_bot_id(&scope, manager.trigger(), &call_ref);
         let bot = store
@@ -1195,11 +1331,11 @@ impl Runtime {
             .into_iter()
             .find(|bot| bot.bot_id == bot_id);
         Ok(match bot {
-            Some(bot) => tool_bot(&bot),
-            None => json!({"found":false,"call_ref":call_ref,
-                "reason":"no confirmed record for this call_ref; an absent record does not authorize a new reference or prove no effect"}),
+            Some(bot) => Execution::Applied.result(tool_bot(&bot)),
+            None => Execution::Unknown.with(Approval::Unknown).result(json!({"found":false,"call_ref":call_ref,
+                "reason":"no confirmed record for this call_ref; an absent record does not authorize a new reference or prove no effect"})),
         })
-    }).await
+    }).await.map_err(uncertain)
     }
 
     /// Registers a dispatch before anything is sent, then has its provider start it. Only the
@@ -1210,7 +1346,7 @@ impl Runtime {
         access: &AgentAccess,
         scope: &str,
         args: &Value,
-    ) -> Result<Value> {
+    ) -> Result<ToolOutcome> {
         let network = access.network_id();
         let manager = access
             .invocation()
@@ -1295,65 +1431,71 @@ impl Runtime {
         };
         if target != local {
             let dispatch = self.send_dispatch(network, request, false).await?;
-            return Ok(dispatch_row(&dispatch));
+            return Ok(dispatch_outcome(&dispatch));
         }
         let admitted = self.accept_dispatch(network, request, args).await?;
-        let (spec, record, created) = (admitted.spec, admitted.record, admitted.created);
-        let thread = match &spec.continues {
-            None => thread,
-            Some(original) => {
-                let arg0 = (network).to_owned();
-                let arg1 = (scope).to_owned();
-                self.store
-                    .call("agent_tools.works", move |store| store.works(&arg0, &arg1))
-                    .await
-            }?
-            .into_iter()
-            .find(|work| &work.work_id == original)
-            .and_then(|work| work.thread_id),
-        };
-        let may_send = created
-            && self
-                .start_work(
-                    self.work_executor(&record)?,
-                    network,
-                    &spec,
-                    thread.as_deref(),
-                    args,
-                )
-                .await?;
-        let record = match created {
-            true => ({
-                let arg0 = (record.work_id).to_owned();
-                self.store
-                    .call("agent_tools.work_record", move |store| {
-                        store.work_record(&arg0)
-                    })
-                    .await
-            }?)
-            .context("work not found on this device")?,
-            false => record,
-        };
-        let expected_turn_id = if may_send {
-            {
-                let arg0 = (network).to_owned();
-                let arg1 = (record.work_id).to_owned();
-                self.store
-                    .call("agent_tools.work_native_execution", move |store| {
-                        store.work_native_execution(&arg0, &arg1)
-                    })
-                    .await
-            }?
-            .map(|execution| execution.turn_id)
-        } else {
-            None
-        };
-        Ok(
-            json!({"work_id":record.work_id,"call_ref":call_ref,"state":record.state,
+        async {
+            let (spec, record, created) = (admitted.spec, admitted.record, admitted.created);
+            let thread = match &spec.continues {
+                None => thread,
+                Some(original) => {
+                    let arg0 = (network).to_owned();
+                    let arg1 = (scope).to_owned();
+                    self.store
+                        .call("agent_tools.works", move |store| store.works(&arg0, &arg1))
+                        .await
+                }?
+                .into_iter()
+                .find(|work| &work.work_id == original)
+                .and_then(|work| work.thread_id),
+            };
+            let may_send = created
+                && self
+                    .start_work(
+                        self.work_executor(&record)?,
+                        network,
+                        &spec,
+                        thread.as_deref(),
+                        args,
+                    )
+                    .await?;
+            let record = match created {
+                true => ({
+                    let arg0 = (record.work_id).to_owned();
+                    self.store
+                        .call("agent_tools.work_record", move |store| {
+                            store.work_record(&arg0)
+                        })
+                        .await
+                }?)
+                .context("work not found on this device")?,
+                false => record,
+            };
+            let expected_turn_id = if may_send {
+                {
+                    let arg0 = (network).to_owned();
+                    let arg1 = (record.work_id).to_owned();
+                    self.store
+                        .call("agent_tools.work_native_execution", move |store| {
+                            store.work_native_execution(&arg0, &arg1)
+                        })
+                        .await
+                }?
+                .map(|execution| execution.turn_id)
+            } else {
+                None
+            };
+            Ok(work_execution(&record.state)
+                .with(Approval::Unknown)
+                .result(
+                    json!({"work_id":record.work_id,"call_ref":call_ref,"state":record.state,
             "expected_turn_id":expected_turn_id,
             "may_send":may_send,"send_by_ms":record.send_by_ms,"cwd":spec.cwd,"thread_id":thread,
             "model":spec.model,"resolved":spec.resolved}),
-        )
+                ))
+        }
+        .await
+        .map_err(uncertain)
     }
 
     /// The `wait_work` answer: the agent, and for a Codex thread the App Server that has it.
@@ -1660,7 +1802,7 @@ pub(crate) fn work_status(
     works: &[crate::model::WorkProjection],
     dispatches: &[crate::work::Dispatch],
     args: &Value,
-) -> Result<Value> {
+) -> Result<ToolOutcome> {
     if let Some(id) = args["work_id"].as_str() {
         if let Some(work) = works.iter().find(|work| work.work_id == id) {
             let mut row = json!(work);
@@ -1668,14 +1810,15 @@ pub(crate) fn work_status(
                 row["result_text"] = json!(crate::scheduler::prefix(&work.result_text, PAGE_BYTES));
                 row["result_truncated"] = json!(true);
             }
-            return Ok(row);
+            return Ok(Execution::Read.result(row).for_reference(&work.call_ref));
         }
-        return Ok(dispatch_row(
-            dispatches
-                .iter()
-                .find(|dispatch| dispatch.spec.work_id == id)
-                .context("work not found in this conversation")?,
-        ));
+        let dispatch = dispatches
+            .iter()
+            .find(|dispatch| dispatch.spec.work_id == id)
+            .context("work not found in this conversation")?;
+        return Ok(Execution::Read
+            .result(dispatch_row(dispatch))
+            .for_reference(&dispatch.spec.call_ref));
     }
     let rows: Vec<Value> = dispatches
         .iter()
@@ -1693,7 +1836,7 @@ pub(crate) fn work_status(
         None => 0,
     };
     let (page, more) = page(&rows, start, args);
-    Ok(json!({"works":page,"more":more}))
+    Ok(Execution::Read.result(json!({"works":page,"more":more})))
 }
 
 #[cfg(test)]
@@ -1950,6 +2093,257 @@ mod tests {
                 })
                 .await
         }?);
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_handlers_report_their_durable_or_staged_effects() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        bot(&node, &admin, "c", "Ops", &[]).await?;
+        bot(&node, &admin, "d", "Docs", &[]).await?;
+        node.settings.lock().unwrap().manager =
+            Some(crate::runtime::test_support::manager_settings(
+                Provider::Codex,
+                dir.clone(),
+                "fixture".into(),
+            ));
+        let network = node.network_id().await?;
+        let (trigger, attempt) = start_reply(&node, &admin, "source").await?;
+        let idle = AgentAccess::ReadOnly {
+            network_id: network.clone(),
+            conversation_id: "c".into(),
+        };
+        let access = node
+            .manager_access_fixture(
+                "receipts",
+                idle.clone(),
+                &attempt,
+                &trigger,
+                Provider::Codex,
+            )
+            .await?;
+        let call = async |tool: Tool,
+                          mut args: Value,
+                          execution: &str,
+                          confirmation: &str|
+               -> Result<Value> {
+            if tool.needs_call_ref() {
+                args["call_ref"] = json!(tool.name());
+            }
+            let value = node.tool(access.clone(), tool.name(), args.clone()).await?;
+            let record = &value["call_record"];
+            assert_eq!(record["execution"], execution, "{tool:?}: {value}");
+            assert_eq!(record["confirmation"], confirmation, "{tool:?}: {value}");
+            assert_eq!(record["approval"], "not_required", "{tool:?}");
+            let retry = if confirmation == "pending" {
+                "lookup_same_ref"
+            } else {
+                "none"
+            };
+            assert_eq!(record["retry"], retry, "{tool:?}");
+            if tool.needs_call_ref() {
+                let lookup = node
+                    .tool(
+                        access.clone(),
+                        "call_lookup",
+                        json!({"call_ref":tool.name()}),
+                    )
+                    .await?;
+                assert_eq!(
+                    lookup["call_record"]["execution"], execution,
+                    "{tool:?}: {lookup}"
+                );
+                assert_eq!(
+                    lookup["call_record"]["confirmation"], confirmation,
+                    "{tool:?}: {lookup}"
+                );
+                assert_eq!(lookup["call_record"]["retry"], retry, "{tool:?}");
+            }
+            Ok(value)
+        };
+        call(
+            Tool::UpdateProfile,
+            json!({"instructions":"Handle reports"}),
+            "applied",
+            "confirmed",
+        )
+        .await?;
+        call(
+            Tool::ConfigureBot,
+            json!({"bot":"d","instructions":"Edit reports"}),
+            "applied",
+            "confirmed",
+        )
+        .await?;
+        let skill = call(
+            Tool::SaveSkill,
+            json!({"name":"Reports","description":"Short reports","body":"Read the notes."}),
+            "applied",
+            "confirmed",
+        )
+        .await?;
+        call(
+            Tool::RemoveSkill,
+            json!({"skill_id":skill["change"]["skill_id"]}),
+            "applied",
+            "confirmed",
+        )
+        .await?;
+        let schedule = call(Tool::SaveSchedule, json!({"name":"Read notes","prompt":"Read the notes.","first_run_at_ms":now_ms()+3_600_000}), "applied", "confirmed").await?;
+        call(
+            Tool::RemoveSchedule,
+            json!({"schedule_id":schedule["change"]["schedule_id"]}),
+            "applied",
+            "confirmed",
+        )
+        .await?;
+        call(
+            Tool::Remind,
+            json!({"note":"Read notes","in_minutes":10}),
+            "applied",
+            "confirmed",
+        )
+        .await?;
+        call(
+            Tool::MessageBot,
+            json!({"bot":"d","text":"Read the report."}),
+            "applied",
+            "confirmed",
+        )
+        .await?;
+        call(
+            Tool::Remember,
+            json!({"text":"Uses concise reports"}),
+            "unknown",
+            "pending",
+        )
+        .await?;
+        let seeded = {
+            let identity = node.identity.clone();
+            let network = network.clone();
+            let trigger = trigger.clone();
+            node.store
+                .call("agent_tools.fixture_memory", move |store| {
+                    store.change_bot(
+                        &identity,
+                        &network,
+                        "c",
+                        &trigger,
+                        "seed",
+                        ChangeRequest::Remember {
+                            memory_id: Some("old-note".into()),
+                            text: "Old preference".into(),
+                        },
+                        Provider::Codex,
+                        now_ms(),
+                    )
+                })
+                .await?
+        };
+        assert!(seeded.1);
+        let committed = node
+            .tool(
+                access.clone(),
+                "remember",
+                json!({"call_ref":"seed",
+            "memory_id":"old-note","text":"Old preference"}),
+            )
+            .await?;
+        assert_eq!(committed["state"], "committed");
+        assert_eq!(committed["call_record"]["execution"], "applied");
+        call(
+            Tool::Forget,
+            json!({"memory_id":"old-note"}),
+            "unknown",
+            "pending",
+        )
+        .await?;
+        call(Tool::WorkspaceCommand, json!({"command":{"kind":"create_task","task_id":"receipt-task",
+            "owner_bot":"c","title":"Collect notes","request":"Collect the notes.","expected_result":"A list",
+            "source_events":[],"dependencies":[],"reply_only":false}}), "applied", "confirmed").await?;
+        call(
+            Tool::CreateBot,
+            json!({"name":"Archive"}),
+            "applied",
+            "confirmed",
+        )
+        .await?;
+        call(
+            Tool::DeleteBot,
+            json!({"bot":"Archive"}),
+            "applied",
+            "confirmed",
+        )
+        .await?;
+        call(
+            Tool::DeleteBot,
+            json!({"bot":"Archive"}),
+            "not_started",
+            "confirmed",
+        )
+        .await?;
+        let denied = node
+            .tool(idle, "delete_bot", json!({"bot":"c"}))
+            .await
+            .unwrap_err();
+        let record = &denied
+            .downcast_ref::<ToolFailure>()
+            .context("tool failure")?
+            .response["call_record"];
+        assert_eq!(record["approval"], "denied");
+        assert_eq!(record["execution"], "not_started");
+        let rejected = node
+            .tool(access, "delete_bot", json!({"bot":"c"}))
+            .await
+            .unwrap_err();
+        let record = &rejected
+            .downcast_ref::<ToolFailure>()
+            .context("tool failure")?
+            .response["call_record"];
+        assert_eq!(record["execution"], "not_started");
+        assert_eq!(record["retry"], "none");
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_lost_writer_reply_requires_lookup_after_a_committed_mutation() -> Result<()> {
+        let (node, _admin, dir) = node().await?;
+        let error = node
+            .store
+            .tool_transaction::<()>("agent_tools.lost_commit_fixture", |store| {
+                store.connection.execute(
+                    "INSERT INTO identity_meta(key,value) VALUES('lost-tool-fixture','one')",
+                    [],
+                )?;
+                panic!("fixture lost the response after commit");
+            })
+            .await
+            .unwrap_err();
+        let failure = ToolFailure::new(
+            "create_bot",
+            &json!({"call_ref":"same-reference"}),
+            FailureStage::Execution,
+            &error,
+        );
+        let record = &failure.response["call_record"];
+        assert_eq!(record["execution"], "unknown");
+        assert_eq!(record["retry"], "lookup_same_ref");
+        assert_eq!(record["call_ref"], "same-reference");
+        let count = node
+            .store
+            .read("agent_tools.read_committed_fixture", |store| {
+                Ok(store.connection.query_row(
+                    "SELECT COUNT(*) FROM identity_meta WHERE key='lost-tool-fixture'",
+                    [],
+                    |r| r.get::<_, u64>(0),
+                )?)
+            })
+            .await?;
+        assert_eq!(count, 1);
         drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())

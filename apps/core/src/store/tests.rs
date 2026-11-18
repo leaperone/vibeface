@@ -101,6 +101,39 @@ fn one_personal_network_is_enforced_before_writes_and_on_reads() -> Result<()> {
 }
 
 impl Store {
+    /// Feed an earlier-ranked answer through the message projector, as on sync.
+    pub(crate) fn project_earlier_answer_fixture(
+        &self,
+        network: &str,
+        scope: &str,
+        question: &str,
+        replacement: &str,
+    ) -> Result<()> {
+        let message = self
+            .message(network, scope, &questions::answer_id(question))?
+            .context("prior answer")?;
+        let mut event = log::event_from(&self.connection, network, &message.event_hash)?
+            .context("prior answer event")?;
+        let EventBody::MessagePosted { text, .. } = &mut event.body else {
+            bail!("expected answer")
+        };
+        *text = replacement.to_owned();
+        let writer = LocalIdentity::generate();
+        event.author = writer.device_id()?;
+        event.seq = 1;
+        event.prev = None;
+        let hash = writer.sign_event(event.clone())?.hash;
+        reduce::apply(
+            &self.connection,
+            network,
+            &hash,
+            &event,
+            event.created_at_ms,
+            &rank(1, event.created_at_ms, &hash),
+            false,
+        )
+    }
+
     pub(crate) fn post_input_fixture(
         &mut self,
         identity: &LocalIdentity,
@@ -10020,7 +10053,8 @@ fn work_status_pages_newest_first_within_a_byte_cap() -> Result<()> {
             &works,
             &[],
             &json!({"before":before,"limit":50}),
-        )?;
+        )?
+        .value;
         assert!(
             page.to_string().len() <= 33_000,
             "a page stays within the cap"

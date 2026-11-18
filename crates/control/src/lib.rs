@@ -309,6 +309,7 @@ pub mod maintenance;
 pub mod managed_node;
 pub mod observation;
 pub mod provider;
+pub mod tool_receipt;
 
 #[cfg(test)]
 mod tests {
