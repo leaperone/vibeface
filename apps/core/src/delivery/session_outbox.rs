@@ -2,6 +2,7 @@
 
 use super::{
     Delivery,
+    chain::{Call, Chain, TxObservation},
     session::{CharityKey, SessionRoute, checked_event, kind_for_event},
     session_outbox_store::SessionOutboxStore,
     types::parse_word,
@@ -86,6 +87,41 @@ impl Delivery {
 
     pub fn paid_session_claims(&self, route_id: &str) -> Result<Vec<SessionSettlementClaim>> {
         SessionOutboxStore::open(&self.data_dir)?.pending_claims(route_id, 16)
+    }
+
+    /// Submit one already-verified claim batch through the existing durable chain transaction path.
+    /// The caller supplies the genuine Groth16 seal; this method never treats a queued claim as paid.
+    pub async fn settle_paid_session_batch(
+        &self,
+        chain: &Chain,
+        route_id: &str,
+        seal: Vec<u8>,
+        gas_cap: &str,
+    ) -> Result<TxObservation> {
+        let claims = self.paid_session_claims(route_id)?;
+        ensure!(!claims.is_empty(), "session payment claim queue is empty");
+        let batch = vibeface_session_delivery::verify_session_settlement(&claims)
+            .map_err(anyhow::Error::msg)?;
+        let ids = claims
+            .iter()
+            .map(|claim| claim.order.order_id().map_err(anyhow::Error::msg))
+            .collect::<Result<Vec<_>>>()?;
+        let intent_id = format!(
+            "session-settlement/{route_id}/{}",
+            hex::encode(hash(&batch.journal()))
+        );
+        chain
+            .execute(
+                self,
+                &intent_id,
+                Call::SessionSettle {
+                    budget: batch.budget,
+                    order_ids: ids,
+                    seal,
+                },
+                gas_cap,
+            )
+            .await
     }
 
     pub(super) fn attach_session_outbox(&self, runtime: std::sync::Weak<Runtime>) -> Result<()> {

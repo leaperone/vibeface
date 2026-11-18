@@ -72,3 +72,4 @@ function revealBatch(bytes32 budgetId, RevealItem[] items) external;
 function withdrawBudget(bytes32 id) external;
 function closeBudget(bytes32 id) external;
 function refundBudget(bytes32 id, WindowRef[] items) external;
+function settleBatch(bytes32 budgetId, bytes32[] ids, bytes seal) external;

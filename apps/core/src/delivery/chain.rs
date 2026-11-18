@@ -101,6 +101,11 @@ pub enum Call {
         index: u16,
         seal: Vec<u8>,
     },
+    SessionSettle {
+        budget: Word,
+        order_ids: Vec<Word>,
+        seal: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1168,6 +1173,23 @@ fn encode_call(config: &ChainConfig, call: Call, wallet: Address) -> Result<(Add
             }
             .abi_encode()
         }
+        Call::SessionSettle {
+            budget,
+            order_ids,
+            seal,
+        } => {
+            ensure!(
+                !order_ids.is_empty() && order_ids.len() <= 16,
+                "invalid session settlement batch"
+            );
+            ensure!(seal.len() == 260, "invalid session Groth16 seal");
+            abi::settleBatchCall {
+                budgetId: budget.into(),
+                ids: order_ids.into_iter().map(Into::into).collect(),
+                seal: seal.into(),
+            }
+            .abi_encode()
+        }
     };
     ensure!(
         calldata.len() <= MAX_CALLDATA_BYTES,
@@ -1329,6 +1351,24 @@ fn validate_calldata(
         value if value == abi::openCall::SELECTOR => {
             let call = exact!(openCall);
             validate_order_index(call.id.into(), call.index)?;
+            validate_seal(&call.seal)?;
+        }
+        value if value == abi::settleBatchCall::SELECTOR => {
+            let call = exact!(settleBatchCall);
+            ensure!(
+                call.budgetId != alloy_primitives::B256::ZERO
+                    && !call.ids.is_empty()
+                    && call.ids.len() <= 16,
+                "invalid session settlement batch"
+            );
+            let mut previous = alloy_primitives::B256::ZERO;
+            for id in call.ids.iter().copied() {
+                ensure!(
+                    id != alloy_primitives::B256::ZERO && id > previous,
+                    "session order IDs are not sorted"
+                );
+                previous = id;
+            }
             validate_seal(&call.seal)?;
         }
         _ => return super::budget::validate_calldata(config, input, wallet),
@@ -1825,6 +1865,41 @@ pub(super) mod tests {
         config.profile.max_total_bytes = 65536;
         assert!(config.profile.validate().is_ok());
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn session_settlement_call_is_canonical_and_bounded() -> Result<()> {
+        let config = config();
+        let wallet = Address::repeat_byte(7);
+        let ids = vec![[2; 32], [3; 32]];
+        let (target, calldata) = encode_call(
+            &config,
+            Call::SessionSettle {
+                budget: [1; 32],
+                order_ids: ids.clone(),
+                seal: vec![0x73, 0xc4, 0x57, 0xba]
+                    .into_iter()
+                    .chain(std::iter::repeat_n(0, 256))
+                    .collect(),
+            },
+            wallet,
+        )?;
+        assert_eq!(target, address(&config.escrow)?);
+        validate_calldata(&config, target, &calldata, wallet)?;
+        let (_, reversed) = encode_call(
+            &config,
+            Call::SessionSettle {
+                budget: [1; 32],
+                order_ids: vec![[3; 32], [2; 32]],
+                seal: vec![0x73, 0xc4, 0x57, 0xba]
+                    .into_iter()
+                    .chain(std::iter::repeat_n(0, 256))
+                    .collect(),
+            },
+            wallet,
+        )?;
+        assert!(validate_calldata(&config, target, &reversed, wallet).is_err());
+        Ok(())
     }
 
     pub fn approval_intent(wallet: Address) -> Result<SpendIntent> {
