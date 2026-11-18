@@ -1,6 +1,8 @@
 //! The receipt relation for paid session delivery. Funding, time and spent orders are chain state.
 
 use alloc::vec::Vec;
+use alloy_primitives::B256;
+use alloy_sol_types::SolValue;
 use serde::{Deserialize, Serialize};
 
 use crate::{Amount, Error, PeerSignature, Result, Word, hash, verify_peer};
@@ -40,6 +42,18 @@ impl SessionSettlementOrder {
         ))
     }
 
+    /// Keeps the receiving peer and exact sealed object out of reservation calldata.
+    pub fn receipt_context(&self) -> Word {
+        hash(
+            &[
+                b"vibeface-session-receipt-context-v1".as_slice(),
+                &self.receiver,
+                &self.object,
+            ]
+            .concat(),
+        )
+    }
+
     /// The recipient signs this payload only after verifying and durably storing the object.
     /// The payer must have authorized this same commitment in the budget reservation.
     pub fn commitment(&self) -> Result<Word> {
@@ -54,9 +68,8 @@ impl SessionSettlementOrder {
             &[
                 b"vibeface-session-settlement-terms-v1".as_slice(),
                 &self.order_id()?,
-                &self.receiver,
+                &self.receipt_context(),
                 &self.relay,
-                &self.object,
                 &self.amount.to_be_bytes(),
                 &self.claim_until_ms.to_be_bytes(),
             ]
@@ -83,6 +96,22 @@ pub struct SessionSettlementBatch {
     pub order_count: u8,
     pub amount: Amount,
     pub claim_until_ms: u64,
+}
+
+impl SessionSettlementBatch {
+    pub fn journal(&self) -> Vec<u8> {
+        (
+            B256::from(hash(b"vibeface-session-settlement-journal-v1")),
+            B256::from(self.deployment),
+            B256::from(self.budget),
+            B256::from(self.relay),
+            B256::from(self.reservations_hash),
+            u64::from(self.order_count),
+            self.amount.0,
+            self.claim_until_ms,
+        )
+            .abi_encode_params()
+    }
 }
 
 /// Validates one batch for a single budget and relay. Orders must be strictly sorted by ID.
