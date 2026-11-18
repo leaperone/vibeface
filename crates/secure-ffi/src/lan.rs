@@ -17,23 +17,23 @@ use tokio::{
     runtime::Runtime,
     sync::{Mutex, OnceCell, OwnedSemaphorePermit, Semaphore, mpsc},
 };
-use vibeface_protocol::client_frame::ALPN;
+pub use vibeface_protocol::client_frame::MAX_PAYLOAD_BYTES as MAX_FRAME_BYTES;
+use vibeface_protocol::client_frame::{
+    ALPN, FrameKind, HEADER_BYTES, decode_header, encode_header,
+};
 use vibeface_secure as secure;
 
 use crate::{Result, SecureError};
 
-/// What a Node accepts in one frame.
-pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_MESSAGE_RECORDS: usize =
     (secure::MAX_APPLICATION_MESSAGE + 4).div_ceil(secure::RECORD_PLAINTEXT);
 const MAX_QUEUED_FRAMES: usize = MAX_MESSAGE_RECORDS + 1;
 // One complete application message, including Noise tags and frame headers, plus one control frame.
-const MAX_QUEUED_BYTES: usize =
-    secure::MAX_APPLICATION_MESSAGE + 4 + MAX_MESSAGE_RECORDS * (16 + 5) + MAX_FRAME_BYTES + 5;
-const BINARY: u8 = 0;
-const TEXT: u8 = 1;
-const PING: u8 = 2;
-const PONG: u8 = 3;
+const MAX_QUEUED_BYTES: usize = secure::MAX_APPLICATION_MESSAGE
+    + 4
+    + MAX_MESSAGE_RECORDS * (16 + HEADER_BYTES)
+    + MAX_FRAME_BYTES
+    + HEADER_BYTES;
 
 /// iroh runs on tokio, while uniffi polls exported futures from the app's thread; each call runs here.
 static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
@@ -72,29 +72,26 @@ async fn endpoint() -> Result<&'static Endpoint> {
         .await
 }
 
-fn frame(tag: u8, data: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(5 + data.len());
-    frame.push(tag);
-    frame.extend_from_slice(&(data.len() as u32).to_be_bytes());
+fn frame(header: [u8; HEADER_BYTES], data: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(HEADER_BYTES + data.len());
+    frame.extend_from_slice(&header);
     frame.extend_from_slice(data);
     frame
 }
 
 /// `None` once the Node finished the stream between frames.
-async fn read_frame(recv: &mut RecvStream) -> Result<Option<(u8, Vec<u8>)>> {
-    let mut header = [0u8; 5];
+async fn read_frame(recv: &mut RecvStream) -> Result<Option<(FrameKind, Vec<u8>)>> {
+    let mut header = [0; HEADER_BYTES];
     match recv.read_exact(&mut header).await {
         Ok(()) => {}
         Err(ReadExactError::FinishedEarly(0)) => return Ok(None),
         Err(error) => return Err(failed(error)),
     }
-    let length = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
-    if length > MAX_FRAME_BYTES {
-        return Err(failed("frame too large"));
-    }
-    let mut data = vec![0; length];
+    let header = decode_header(header).map_err(|_| failed("frame too large"))?;
+    let mut data = vec![0; header.payload_len()];
     recv.read_exact(&mut data).await.map_err(failed)?;
-    Ok(Some((header[0], data)))
+    let kind = header.kind().map_err(|_| failed("unknown frame"))?;
+    Ok(Some((kind, data)))
 }
 
 /// A frame from the Node: binary frames carry Noise, a text frame is a refusal.
@@ -105,7 +102,7 @@ pub struct LanFrame {
 }
 
 struct QueuedFrame {
-    tag: u8,
+    header: [u8; HEADER_BYTES],
     data: Vec<u8>,
     _bytes: OwnedSemaphorePermit,
 }
@@ -127,18 +124,16 @@ impl Outgoing {
         )
     }
 
-    fn send(&self, tag: u8, data: Vec<u8>) -> Result<()> {
-        if data.len() > MAX_FRAME_BYTES {
-            return Err(failed("frame too large"));
-        }
+    fn send(&self, kind: FrameKind, data: Vec<u8>) -> Result<()> {
+        let header = encode_header(kind, data.len()).map_err(|_| failed("frame too large"))?;
         let bytes = self
             .bytes
             .clone()
-            .try_acquire_many_owned((data.len() + 5) as u32)
+            .try_acquire_many_owned((data.len() + HEADER_BYTES) as u32)
             .map_err(|_| failed("stream backpressure limit reached"))?;
         self.queue
             .try_send(QueuedFrame {
-                tag,
+                header,
                 data,
                 _bytes: bytes,
             })
@@ -169,7 +164,11 @@ impl LanStream {
                     _ = writer.closed() => return,
                 };
                 let Some(next) = next else { break };
-                if send.write_all(&frame(next.tag, &next.data)).await.is_err() {
+                if send
+                    .write_all(&frame(next.header, &next.data))
+                    .await
+                    .is_err()
+                {
                     writer.close(1u32.into(), b"write failed");
                     return;
                 }
@@ -188,7 +187,7 @@ impl LanStream {
 impl LanStream {
     /// Queues one binary frame. A failed write closes the stream, which `recv` then reports.
     pub fn send(&self, data: Vec<u8>) -> Result<()> {
-        self.outgoing.send(BINARY, data)
+        self.outgoing.send(FrameKind::Binary, data)
     }
 
     /// The next binary or text frame, `None` once the Node ended the stream.
@@ -196,21 +195,20 @@ impl LanStream {
         on_runtime(async move {
             let mut incoming = self.incoming.lock().await;
             loop {
-                let Some((tag, data)) = read_frame(&mut incoming).await? else {
+                let Some((kind, data)) = read_frame(&mut incoming).await? else {
                     return Ok(None);
                 };
-                match tag {
-                    BINARY | TEXT => {
+                match kind {
+                    FrameKind::Binary | FrameKind::Text => {
                         return Ok(Some(LanFrame {
-                            text: tag == TEXT,
+                            text: kind == FrameKind::Text,
                             data,
                         }));
                     }
-                    PING => {
-                        let _ = self.outgoing.send(PONG, data);
+                    FrameKind::Ping => {
+                        let _ = self.outgoing.send(FrameKind::Pong, data);
                     }
-                    PONG => {}
-                    _ => return Err(failed("unknown frame")),
+                    FrameKind::Pong => {}
                 }
             }
         })
@@ -277,13 +275,26 @@ mod tests {
     use super::*;
     use crate::{Handshake, Identity};
     use iroh::SecretKey;
+    use std::net::Ipv4Addr;
 
     const CONTEXT: &[u8] = b"vibeface:client:v1";
 
-    #[test]
-    fn frames_carry_tag_and_big_endian_length() {
-        assert_eq!(frame(TEXT, b"no"), [1, 0, 0, 0, 2, b'n', b'o']);
-        assert_eq!(frame(BINARY, &[]), [0, 0, 0, 0, 0]);
+    async fn loopback_node(secret_key: SecretKey) -> Endpoint {
+        Endpoint::builder(presets::Minimal)
+            .secret_key(secret_key)
+            .alpns(vec![ALPN.to_vec()])
+            .relay_mode(RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap()
+    }
+
+    async fn write_binary(send: &mut SendStream, data: &[u8]) {
+        let header = encode_header(FrameKind::Binary, data.len()).unwrap();
+        send.write_all(&frame(header, data)).await.unwrap();
     }
 
     #[test]
@@ -301,20 +312,30 @@ mod tests {
         let records = a.seal_message(&payload).unwrap();
         assert_eq!(records.len(), MAX_MESSAGE_RECORDS);
         assert_eq!(
-            records.iter().map(|record| record.len() + 5).sum::<usize>() + MAX_FRAME_BYTES + 5,
+            records
+                .iter()
+                .map(|record| record.len() + HEADER_BYTES)
+                .sum::<usize>()
+                + MAX_FRAME_BYTES
+                + HEADER_BYTES,
             MAX_QUEUED_BYTES
         );
         let (outgoing, mut queued) = Outgoing::new();
-        outgoing.send(PONG, vec![0; MAX_FRAME_BYTES]).unwrap();
+        outgoing
+            .send(FrameKind::Pong, vec![0; MAX_FRAME_BYTES])
+            .unwrap();
         for record in records {
-            outgoing.send(BINARY, record).unwrap();
+            outgoing.send(FrameKind::Binary, record).unwrap();
         }
         assert_eq!(outgoing.bytes.available_permits(), 0);
-        assert!(outgoing.send(BINARY, vec![]).is_err());
-        assert_eq!(queued.try_recv().unwrap().tag, PONG);
+        assert!(outgoing.send(FrameKind::Binary, vec![]).is_err());
+        assert_eq!(queued.try_recv().unwrap().header, [3, 0, 16, 0, 0]);
         let mut received = None;
         while let Ok(next) = queued.try_recv() {
-            assert_eq!(next.tag, BINARY);
+            assert_eq!(
+                decode_header(next.header).unwrap().kind(),
+                Ok(FrameKind::Binary)
+            );
             let message = b.open_record(&next.data).unwrap();
             if message.is_some() {
                 assert!(received.is_none());
@@ -328,16 +349,28 @@ mod tests {
     #[test]
     fn outgoing_queue_bounds_bytes_and_releases_dropped_frames() {
         let (outgoing, mut queued) = Outgoing::new();
-        assert!(outgoing.send(BINARY, vec![0; MAX_FRAME_BYTES + 1]).is_err());
-        for _ in 0..MAX_QUEUED_BYTES / (MAX_FRAME_BYTES + 5) {
-            outgoing.send(BINARY, vec![0; MAX_FRAME_BYTES]).unwrap();
+        assert!(
+            outgoing
+                .send(FrameKind::Binary, vec![0; MAX_FRAME_BYTES + 1])
+                .is_err()
+        );
+        for _ in 0..MAX_QUEUED_BYTES / (MAX_FRAME_BYTES + HEADER_BYTES) {
+            outgoing
+                .send(FrameKind::Binary, vec![0; MAX_FRAME_BYTES])
+                .unwrap();
         }
-        assert!(outgoing.send(BINARY, vec![0; MAX_FRAME_BYTES]).is_err());
+        assert!(
+            outgoing
+                .send(FrameKind::Binary, vec![0; MAX_FRAME_BYTES])
+                .is_err()
+        );
         drop(queued.try_recv().unwrap());
-        outgoing.send(BINARY, vec![0; MAX_FRAME_BYTES]).unwrap();
+        outgoing
+            .send(FrameKind::Binary, vec![0; MAX_FRAME_BYTES])
+            .unwrap();
         drop(queued);
         assert_eq!(outgoing.bytes.available_permits(), MAX_QUEUED_BYTES);
-        assert!(outgoing.send(BINARY, vec![0]).is_err());
+        assert!(outgoing.send(FrameKind::Binary, vec![0]).is_err());
         assert_eq!(outgoing.bytes.available_permits(), MAX_QUEUED_BYTES);
     }
 
@@ -348,16 +381,7 @@ mod tests {
         RUNTIME.block_on(async {
             let node = secure::Identity::generate().unwrap();
             let seed: [u8; 32] = hex::decode(node.secret_hex()).unwrap().try_into().unwrap();
-            let server = Endpoint::builder(presets::Minimal)
-                .secret_key(SecretKey::from_bytes(&seed))
-                .alpns(vec![ALPN.to_vec()])
-                .relay_mode(RelayMode::Disabled)
-                .clear_ip_transports()
-                .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0))
-                .unwrap()
-                .bind()
-                .await
-                .unwrap();
+            let server = loopback_node(SecretKey::from_bytes(&seed)).await;
             let address = server.bound_sockets()[0].to_string();
             let serving = tokio::spawn(async move {
                 // The first dial expects another key and gives up during the QUIC handshake.
@@ -368,19 +392,29 @@ mod tests {
                 };
                 let (mut send, mut recv) = connection.accept_bi().await.unwrap();
                 let mut handshake = secure::Handshake::signed(false, &node, None, CONTEXT).unwrap();
-                let (_, first) = read_frame(&mut recv).await.unwrap().unwrap();
+                let (kind, first) = read_frame(&mut recv).await.unwrap().unwrap();
+                assert_eq!(kind, FrameKind::Binary);
                 handshake.read(&first).unwrap();
-                send.write_all(&frame(BINARY, &handshake.write(&[]).unwrap()))
-                    .await
-                    .unwrap();
-                let (_, last) = read_frame(&mut recv).await.unwrap().unwrap();
+                write_binary(&mut send, &handshake.write(&[]).unwrap()).await;
+                let (kind, last) = read_frame(&mut recv).await.unwrap().unwrap();
+                assert_eq!(kind, FrameKind::Binary);
                 handshake.read(&last).unwrap();
                 let mut channel = handshake.finish().unwrap();
-                send.write_all(&frame(PING, &[])).await.unwrap();
-                assert_eq!(read_frame(&mut recv).await.unwrap(), Some((PONG, vec![])));
+                send.write_all(&[2, 0, 0, 0, 0]).await.unwrap(); // Empty Ping.
+                let mut pong = [0; HEADER_BYTES];
+                recv.read_exact(&mut pong).await.unwrap();
+                assert_eq!(pong, [3, 0, 0, 0, 0]);
                 for record in channel.seal_message(b"reply").unwrap() {
-                    send.write_all(&frame(BINARY, &record)).await.unwrap();
+                    write_binary(&mut send, &record).await;
                 }
+                send.write_all(&[
+                    3, 0, 0, 0, 1, 0xff, // Ignored Pong.
+                    1, 0, 0, 0, 1, 0xff, // Text exposed as bytes.
+                    4, 0, 0, 0, 1, 0xff, // Unknown frame with a complete payload.
+                    0, 0, 0, 0, 0, // Empty Binary.
+                ])
+                .await
+                .unwrap();
                 send.finish().unwrap();
                 connection.closed().await;
             });
@@ -409,9 +443,57 @@ mod tests {
                 channel.open_record(record.data).unwrap(),
                 Some(b"reply".to_vec())
             );
+            let text = stream.clone().recv().await.unwrap().unwrap();
+            assert!(text.text);
+            assert_eq!(text.data, [0xff]);
+            assert!(matches!(
+                stream.clone().recv().await,
+                Err(SecureError::Failed { reason }) if reason == "unknown frame"
+            ));
+            let empty = stream.clone().recv().await.unwrap().unwrap();
+            assert!(!empty.text);
+            assert!(empty.data.is_empty());
             assert!(stream.clone().recv().await.unwrap().is_none());
             stream.close();
             serving.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn read_frame_rejects_partial_and_overlarge_frames() {
+        RUNTIME.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let server = loopback_node(SecretKey::generate()).await;
+                let address = EndpointAddr::from_parts(
+                    server.id(),
+                    [TransportAddr::Ip(server.bound_sockets()[0])],
+                );
+                let (dialed, accepted) =
+                    tokio::join!(endpoint().await.unwrap().connect(address, ALPN), async {
+                        server.accept().await.unwrap().await
+                    });
+                let sender = dialed.unwrap();
+                let receiver = accepted.unwrap();
+                for (wire, expected) in [
+                    (&[0, 0][..], "stream finished early (2 bytes read)"),
+                    (
+                        &[4, 0, 0, 0, 2, 0xff],
+                        "stream finished early (1 bytes read)",
+                    ),
+                    (&[4, 0, 16, 0, 1], "frame too large"),
+                ] {
+                    let (mut send, _) = sender.open_bi().await.unwrap();
+                    send.write_all(wire).await.unwrap();
+                    send.finish().unwrap();
+                    let (_, mut recv) = receiver.accept_bi().await.unwrap();
+                    assert!(matches!(
+                        read_frame(&mut recv).await,
+                        Err(SecureError::Failed { reason }) if reason == expected
+                    ));
+                }
+            })
+            .await
+            .unwrap();
         });
     }
 
