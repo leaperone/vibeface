@@ -389,7 +389,7 @@ impl MaintenanceResponse {
             MaintenanceCommand::DeliveryWallet(_) => {
                 ensure!(
                     raw.status == MaintenanceStatus::Healthy
-                        && raw.wallet.is_some()
+                        && raw.wallet.as_ref().is_some_and(|value| !value.is_null())
                         && payload_count == 1,
                     "invalid maintenance wallet response"
                 );
@@ -402,7 +402,7 @@ impl MaintenanceResponse {
             | MaintenanceCommand::DeliveryKeyOperation { .. } => {
                 ensure!(
                     raw.status == MaintenanceStatus::Healthy
-                        && raw.delivery.is_some()
+                        && raw.delivery.as_ref().is_some_and(|value| !value.is_null())
                         && payload_count == 1,
                     "invalid maintenance delivery response"
                 );
@@ -414,7 +414,7 @@ impl MaintenanceResponse {
             MaintenanceCommand::Join { .. } => {
                 ensure!(
                     raw.status == MaintenanceStatus::Healthy
-                        && raw.join.is_some()
+                        && raw.join.as_ref().is_some_and(|value| !value.is_null())
                         && payload_count == 1,
                     "invalid maintenance Join response"
                 );
@@ -647,6 +647,53 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn operation_null_payloads_are_not_treated_as_missing() -> Result<()> {
+        let cases = [
+            (
+                MaintenanceCommand::DeliveryWallet(WalletCommand::Status),
+                "wallet",
+            ),
+            (MaintenanceCommand::DeliveryBudget(Value::Null), "delivery"),
+            (
+                MaintenanceCommand::DeliveryKeyOperation {
+                    action: Value::Null,
+                    intent_id: "intent".into(),
+                    gas_cap: "1".into(),
+                },
+                "delivery",
+            ),
+            (
+                MaintenanceCommand::Join {
+                    link: "link".into(),
+                    name: "name".into(),
+                },
+                "join",
+            ),
+        ];
+        for (command, field) in cases {
+            let wire =
+                format!(r#"{{"protocol":1,"status":"healthy","health":{{}},"{field}":null}}"#);
+            let raw = serde_json::from_str::<RawResponse>(&wire)?;
+            assert!(
+                MaintenanceResponse::parse(&command, raw).is_err(),
+                "explicit null {field} must be rejected"
+            );
+        }
+        for field in ["wallet", "delivery", "join", "result"] {
+            let wire = format!(
+                r#"{{"protocol":1,"status":"error","health":{{}},"error":"refused","{field}":null}}"#
+            );
+            let raw = serde_json::from_str::<RawResponse>(&wire)?;
+            let command = MaintenanceCommand::Probe;
+            assert!(
+                MaintenanceResponse::parse(&command, raw).is_err(),
+                "failure with explicit null {field} must be rejected"
+            );
+        }
         Ok(())
     }
 
