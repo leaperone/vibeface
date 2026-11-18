@@ -78,7 +78,7 @@ command = "pnpm --filter vibeface-www run test"
 
 [[domain_check]]
 name = "JavaScript syntax"
-trigger_paths = ["scripts/crypto-client.mjs", "apps/cli/npm/**", "scripts/package-npm.mjs", "scripts/publish-npm.mjs", "scripts/release-contract.mjs", "scripts/release-metadata.mjs", "scripts/test-release-contract.mjs", "scripts/fixtures/release-contract.json", "scripts/sealed-runtime.mjs", "scripts/windows-signing.mjs", "scripts/private-control.mjs", ".github/workflows/npm-publish.yml", ".github/workflows/release.yml", ".github/workflows/release-*.yml"]
+trigger_paths = ["scripts/crypto-client.mjs", "apps/cli/npm/**", "scripts/package-npm.mjs", "scripts/package-node-web.json", "scripts/publish-npm.mjs", "scripts/release-contract.mjs", "scripts/release-metadata.mjs", "scripts/test-release-contract.mjs", "scripts/fixtures/release-contract.json", "scripts/sealed-runtime.mjs", "scripts/windows-signing.mjs", "scripts/private-control.mjs", ".github/workflows/npm-publish.yml", ".github/workflows/release.yml", ".github/workflows/release-*.yml"]
 command = "node --check scripts/crypto-client.mjs && node --check apps/cli/npm/bin/vibeface.mjs && node --check scripts/release-contract.mjs && node --check scripts/release-metadata.mjs && node --check scripts/test-release-contract.mjs && node --check scripts/package-npm.mjs && node --check scripts/publish-npm.mjs && node scripts/test-release-contract.mjs --cli-fixtures && node scripts/package-npm.mjs --self-test && node scripts/publish-npm.mjs --self-test"
 ci_check = "Workflow and source checks"
 
