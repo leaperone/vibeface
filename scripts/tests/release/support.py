@@ -1,7 +1,6 @@
 """Isolated, credential-free subprocess fixtures for release contracts."""
 import base64
 import json
-import os
 from pathlib import Path
 import shutil
 import subprocess

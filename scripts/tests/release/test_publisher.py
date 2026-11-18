@@ -14,7 +14,7 @@ from unittest.mock import patch
 import release_context
 import release_publisher
 import release_format
-from tests.release.support import Fixture, SOURCE, VERSIONS, write_json, pin, CONTRACTS
+from tests.release.support import Fixture, SOURCE, write_json, pin, CONTRACTS
 
 CORPUS = json.loads(Path(__file__).with_name('fixtures').joinpath('publication-cases.json').read_text())
 
