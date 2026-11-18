@@ -15,7 +15,7 @@ command = "node apps/core/extensions/generate.mjs --check && node node_modules/t
 [[domain_check]]
 name = "Rust lint"
 trigger_paths = ["crates/delivery/**", "apps/core/src/**", "apps/cli/src/**", "crates/control/src/**", "crates/client/src/**", "crates/bridge/src/**", "crates/protocol/src/**", "crates/secure/src/**", "crates/secure-ffi/**", "crates/*/tests/**", "apps/core/tests/**", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/core/build.rs", "apps/core/migrations/**", "apps/core/schema.hcl", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".cargo/**"]
-command = "cargo clippy --workspace --all-targets --locked -- -D warnings"
+command = "python3 scripts/local-rust.py run cargo clippy --workspace --all-targets --locked -- -D warnings"
 ci_check = "Rust lint and minimum version"
 
 [[domain_check]]
@@ -27,7 +27,7 @@ ci_check = "Workflow and source checks"
 [[domain_check]]
 name = "Rust fast tests"
 trigger_paths = ["crates/delivery/**", "apps/core/src/**", "apps/cli/src/**", "crates/control/src/**", "crates/client/src/**", "crates/bridge/src/**", "crates/protocol/src/**", "crates/secure/src/**", "crates/secure-ffi/**", "crates/*/tests/**", "apps/core/tests/**", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/core/build.rs", "apps/core/migrations/**", "apps/core/schema.hcl", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".cargo/**"]
-command = "python3 scripts/ci.py test --tier fast --packages vibeface-protocol vibeface-bridge vibeface-secure vibeface-client vibeface-core vibeface-control vibeface vibeface-delivery vibeface-secure-ffi"
+command = "python3 scripts/local-rust.py run python3 scripts/ci.py test --tier fast --packages vibeface-protocol vibeface-bridge vibeface-secure vibeface-client vibeface-core vibeface-control vibeface vibeface-delivery vibeface-secure-ffi"
 ci_check = "Rust fast tests"
 
 [[domain_check]]
@@ -44,7 +44,7 @@ command = "cargo fmt --manifest-path tests/fixtures/delivery-probe/Cargo.toml --
 [[domain_check]]
 name = "Web build and packaged resources"
 trigger_paths = ["apps/app/**", "packages/client/**", "apps/mobile/**", "packages/secure-native/**", "packages/theme/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/check-web.sh", "scripts/build-web-crypto.sh"]
-command = "bash scripts/build-web-crypto.sh && bash scripts/build-web.sh && cargo build -p vibeface -p vibeface-core --locked && python3 scripts/verify-node.py --binary target/debug/vibeface --core-binary target/debug/vibeface-core --app-dir apps/app/dist/client --crypto-module apps/app/dist/client/vibeface_secure.js --artifacts .artifacts/preflight-web --web-only"
+command = "python3 scripts/local-rust.py run bash scripts/build-web-crypto.sh && bash scripts/build-web.sh && python3 scripts/local-rust.py verify-web"
 ci_check = "Native package and acceptance (x86_64-unknown-linux-gnu)"
 
 [[domain_check]]
@@ -56,7 +56,7 @@ ci_check = "Mobile types"
 [[domain_check]]
 name = "Desktop source"
 trigger_paths = ["apps/desktop/**", "scripts/native-desktop/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
-command = "cargo test -p vibeface-desktop --features native-ui-tests --locked && cargo clippy -p vibeface-desktop --all-targets --features native-ui-tests --locked -- -D warnings"
+command = "python3 scripts/local-rust.py run cargo test -p vibeface-desktop --features native-ui-tests --locked && python3 scripts/local-rust.py run cargo clippy -p vibeface-desktop --all-targets --features native-ui-tests --locked -- -D warnings"
 ci_check = "Native desktop host checks"
 
 [[domain_check]]

@@ -188,7 +188,15 @@ CLI 进程验收仅使用所属 Node、合成身份与受控 Provider，验证�
 
 开发者修改同步、恢复、调度或工具执行时，除 PR 核心检查外，必须执行对应专项并记录命令及结果；不能只依赖下次定期运行。每次只跑相关模式。安装器或平台交付改动应额外手动触发完整 Core 或对应平台入口，确认目标平台制品。
 
-Web 开发使用 `pnpm --filter vibeface-web dev` 或 `pnpm --filter vibeface-www dev`，Vite HMR 只更新开发页面。Rust 可按需复用 Cargo 增量缓存，依赖与编译结果仍以 Cargo 为准，不引入另一套构建调度或 Core 热重载。最终验收使用当前提交的真实制品并重启进程，核对 Node、scheduler、Provider、DAG 和持久化状态的恢复、去重与未知结果对账。
+Web 开发使用 `pnpm --filter vibeface-web dev` 或 `pnpm --filter vibeface-www dev`，Vite HMR 只更新开发页面。最终验收使用当前提交的真实制品并重启进程，核对 Node、scheduler、Provider、DAG 和持久化状态的恢复、去重与未知结果对账。
+
+### 本地 Rust 构建与制品留存
+
+`python3 scripts/local-rust.py run cargo check --locked -p vibeface-core` 从当前 checkout 根目录运行 Cargo。它固定本次命令的中间目录和最终输出目录为该 checkout 的 `target`。各 worktree 仍共用 Cargo 下载缓存。按路径编译的 crate 可能把源目录嵌入产物，所以哪怕最终输出目录各自独立，也需要隔离中间目录。
+
+开发与测试默认用 `line-tables-only` 保留回溯行号，linked worktree 默认关闭增量编译。调试时可为本次命令设置 `CARGO_PROFILE_DEV_DEBUG=2` 或 `CARGO_PROFILE_TEST_DEBUG=2`。已安装 `sccache` 的环境可设置 `VIBEFACE_SCCACHE=1` 复用可缓存的编译结果，默认 `SCCACHE_CACHE_SIZE=20G`，最终可执行文件仍写在本地。Web 预检从 Cargo 本次构建的 JSON 消息定位 CLI 和 Core。
+
+进行中和待复验的任务将二进制与测试夹具留在 worktree 的 `.artifacts`，planning 保存报告、源码提交、命令及制品哈希。`verify-node.py` 的 `--phase1` 和 `--memory-sync` 可加 `--discard-run-binaries-on-success`。当 CLI/Core 输入已独立留存时，脚本在成功报告落盘后核对这两份源文件的哈希并回收运行副本。报告、日志和数据仍可用于审查。需要保留确切字节的制品可以归档到独立存储，并验证可按哈希恢复。任务完成后可通过本地入口运行 `cargo clean --dry-run`，确认该 checkout 的 `target` 无活跃使用后再执行 `cargo clean`。
 
 无需编译项目即可验证 CI 规则和发布隐私检查：
 
@@ -207,8 +215,8 @@ set -e
 CI_PLAN="$(python3 scripts/ci.py plan --base origin/main --head HEAD --event pull_request)"
 export CI_PLAN
 if python3 -c 'import json, os, sys; sys.exit(not json.loads(os.environ["CI_PLAN"])["rust_packages"])'; then
-  python3 scripts/ci.py check --plan-env CI_PLAN
-  python3 scripts/ci.py test --tier fast --plan-env CI_PLAN
+  python3 scripts/local-rust.py run python3 scripts/ci.py check --plan-env CI_PLAN
+  python3 scripts/local-rust.py run python3 scripts/ci.py test --tier fast --plan-env CI_PLAN
 fi
 ```
 
@@ -217,10 +225,10 @@ fi
 Rust 快、慢组可独立运行。Clippy 默认不安装 MSRV，需要时显式提供：
 
 ```sh
-python3 scripts/ci.py test --tier fast --packages vibeface-bridge vibeface-core vibeface-control vibeface
-python3 scripts/ci.py test --tier slow --packages vibeface-core
-python3 scripts/ci.py check --packages vibeface-core vibeface-control vibeface
-python3 scripts/ci.py check --packages vibeface-core vibeface-control vibeface --msrv 1.91
+python3 scripts/local-rust.py run python3 scripts/ci.py test --tier fast --packages vibeface-bridge vibeface-core vibeface-control vibeface
+python3 scripts/local-rust.py run python3 scripts/ci.py test --tier slow --packages vibeface-core
+python3 scripts/local-rust.py run python3 scripts/ci.py check --packages vibeface-core vibeface-control vibeface
+python3 scripts/local-rust.py run python3 scripts/ci.py check --packages vibeface-core vibeface-control vibeface --msrv 1.91
 ```
 
 MSRV 参数应使用当前 `Cargo.toml` 的 `rust-version`。进程专项需要 Python 3、Node.js、当前提交构建的 CLI/Core 程序和真实 JS/WASM 密码学资源。先按 [源码构建步骤](releasing.md#源码构建) 生成资源和制品，然后设置以下路径：
