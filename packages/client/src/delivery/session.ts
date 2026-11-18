@@ -6,6 +6,7 @@ export const SESSION_MAX_CHUNKS = 1_024
 export const SESSION_MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
 
 const hashPattern = /^[a-f0-9]{64}$/
+const signaturePattern = /^[a-f0-9]{128}$/
 const peerPattern = hashPattern
 const idPattern = /^[^\u0000-\u001f\u007f]{1,128}$/u
 const encoder = new TextEncoder()
@@ -30,6 +31,10 @@ function hash(value: unknown, label: string, nullable = false): string | null {
   if (typeof value !== 'string' || !hashPattern.test(value)) fail(`${label} 无效。`)
   return value
 }
+function signature(value: unknown): string {
+  if (typeof value !== 'string' || !signaturePattern.test(value)) fail('签名格式无效。')
+  return value
+}
 function integer(value: unknown, label: string, max: number): number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0 || value > max) fail(`${label} 无效。`)
   return value
@@ -40,7 +45,7 @@ function kind(value: unknown): SessionObjectKind {
 }
 
 export function validateSessionObject(value: SessionObjectEnvelope): SessionObjectEnvelope {
-  const allowed = new Set(['version', 'kind', 'object_id', 'conversation_id', 'sequence', 'previous_object_hash', 'sender_peer', 'receiver_peer', 'provider_peer', 'created_at_ms', 'expires_at_ms', 'payload_bytes', 'payload_hash', 'chunk_count', 'signature_digest'])
+  const allowed = new Set(['version', 'kind', 'object_id', 'conversation_id', 'sequence', 'previous_object_hash', 'sender_peer', 'receiver_peer', 'provider_peer', 'created_at_ms', 'expires_at_ms', 'payload_bytes', 'payload_hash', 'chunk_count', 'signature_digest', 'signature'])
   if (Object.keys(value as object).some(key => !allowed.has(key))) fail('会话对象包含未声明字段。')
   if (value.version !== 1) fail('会话对象版本不受支持。')
   const result: SessionObjectEnvelope = {
@@ -59,6 +64,7 @@ export function validateSessionObject(value: SessionObjectEnvelope): SessionObje
     payload_hash: hash(value.payload_hash, '载荷摘要')!,
     chunk_count: integer(value.chunk_count, '分片数量', SESSION_MAX_CHUNKS),
     signature_digest: hash(value.signature_digest, '签名摘要')!,
+    signature: signature(value.signature),
   }
   if (result.expires_at_ms <= result.created_at_ms) fail('会话对象过期时间必须晚于创建时间。')
   if (result.payload_bytes === 0 || result.chunk_count === 0) fail('会话对象不能没有载荷。')

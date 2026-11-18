@@ -125,6 +125,8 @@ export type SessionObjectEnvelope = {
   payload_hash: string
   chunk_count: number
   signature_digest: string
+  /** Ed25519 signature bytes encoded as lowercase hex. The relay never verifies this here. */
+  signature: string
 }
 
 export type SessionObjectChunk = {

@@ -9,7 +9,7 @@ const payload = new TextEncoder().encode('encrypted bot session payload')
 const base = async (patch: Partial<SessionObjectEnvelope> = {}): Promise<SessionObjectEnvelope> => ({
   version: 1, kind: 'message', object_id: 'object-1', conversation_id: 'conversation-1', sequence: 0, previous_object_hash: null,
   sender_peer: peer, receiver_peer: '22'.repeat(32), provider_peer: '33'.repeat(32), created_at_ms: 100, expires_at_ms: 200,
-  payload_bytes: payload.byteLength, payload_hash: await sha256Hex(payload), chunk_count: 1, signature_digest: '44'.repeat(32), ...patch,
+  payload_bytes: payload.byteLength, payload_hash: await sha256Hex(payload), chunk_count: 1, signature_digest: '44'.repeat(32), signature: '55'.repeat(64), ...patch,
 })
 
 test('all supported object kinds share the same validated envelope', async () => {
@@ -22,8 +22,8 @@ test('all supported object kinds share the same validated envelope', async () =>
 
 test('canonical bytes and digest do not depend on object key insertion order', async () => {
   const object = await base()
-  const { signature_digest, ...rest } = object
-  const reordered = JSON.parse(JSON.stringify({ signature_digest, ...rest })) as SessionObjectEnvelope
+  const { signature_digest, signature, ...rest } = object
+  const reordered = JSON.parse(JSON.stringify({ signature, signature_digest, ...rest })) as SessionObjectEnvelope
   assert.deepEqual(canonicalSessionObjectBytes(object), canonicalSessionObjectBytes(reordered))
   assert.equal(await envelopeDigest(object), await envelopeDigest(reordered))
 })
@@ -45,9 +45,17 @@ test('chunk validation rejects missing, duplicate, out of order, and tampered ch
 
 test('object identity is stable across retries and structural validation rejects malformed metadata', async () => {
   const object = await base()
-  assert.equal(isSameSessionObject(object, { ...object, signature_digest: '55'.repeat(32) }), true)
+  assert.equal(isSameSessionObject(object, { ...object, signature: '66'.repeat(64) }), true)
   assert.throws(() => validateSessionObject({ ...object, object_id: '' }))
   assert.throws(() => validateSessionObject({ ...object, sequence: 1 }))
   assert.throws(() => validateSessionObject({ ...object, provider_peer: 'not-a-peer' }))
   assert.throws(() => validateSessionObject({ ...object, payload_bytes: 0 }))
+})
+
+test('signature is required, fixed-width hex, and excluded from canonical identity', async () => {
+  const object = await base()
+  assert.throws(() => validateSessionObject({ ...object, signature: '' }))
+  assert.throws(() => validateSessionObject({ ...object, signature: 'aa'.repeat(63) }))
+  assert.throws(() => validateSessionObject({ ...object, signature: 'GG'.repeat(64) }))
+  assert.deepEqual(canonicalSessionObjectBytes(object), canonicalSessionObjectBytes({ ...object, signature: '66'.repeat(64) }))
 })
