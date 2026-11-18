@@ -3,35 +3,36 @@ import type { NodeReportSnapshot } from "./types.ts"
 
 const checkInterval = 30_000
 const maxReportAge = 60_000
+type ReadNodes = (checkConnections?: boolean) => Promise<void>
 
-type Check = {
-  read: () => Promise<void>
-  startedAt: number
-  state: "checking" | "failed" | "done"
-}
+type Check = { read: ReadNodes } & ({ state: "checking" | "done" } | { state: "failed"; failedAt: number })
 
 export function useNodeChecks({ report, refreshNodes, active, foreground }: {
   report: NodeReportSnapshot | null
-  refreshNodes: (() => Promise<void>) | undefined
+  refreshNodes: ReadNodes | undefined
   active: boolean
   foreground: () => boolean
 }) {
   const [check, setCheck] = useState<Check | null>(null)
   const [expiredAt, setExpiredAt] = useState<number | null>(null)
-  const refresh = useCallback(() => {
+  const checkNodes = useCallback((checkConnections: boolean) => {
     if (!active || !refreshNodes || !foreground()) return
-    const next: Check = { read: refreshNodes, startedAt: Date.now(), state: "checking" }
+    const next: Check = { read: refreshNodes, state: "checking" }
     setCheck(next)
-    const finish = (state: "failed" | "done") => setCheck(prior => prior === next ? { ...next, state } : prior)
-    void refreshNodes().then(() => finish("done"), () => finish("failed"))
+    const finish = (completed: Check) => setCheck(prior => prior === next ? completed : prior)
+    void refreshNodes(checkConnections).then(
+      () => finish({ read: refreshNodes, state: "done" }),
+      () => finish({ read: refreshNodes, state: "failed", failedAt: Date.now() }),
+    )
   }, [active, refreshNodes, foreground])
+  const refresh = useCallback(() => checkNodes(true), [checkNodes])
 
   useEffect(() => {
     if (!active || !refreshNodes) return
-    refresh()
-    const timer = setInterval(refresh, checkInterval)
+    checkNodes(false)
+    const timer = setInterval(() => checkNodes(false), checkInterval)
     return () => clearInterval(timer)
-  }, [active, refreshNodes, refresh])
+  }, [active, refreshNodes, checkNodes])
   useEffect(() => {
     if (!active || !report) return
     const remaining = report.receivedAt + maxReportAge - Date.now()
@@ -44,7 +45,7 @@ export function useNodeChecks({ report, refreshNodes, active, foreground }: {
   return {
     fresh: report !== null && expiredAt !== report.receivedAt && Date.now() - report.receivedAt < maxReportAge,
     checking: current?.state === "checking",
-    failed: current?.state === "failed" && (report?.receivedAt ?? 0) <= current.startedAt,
+    failed: current?.state === "failed" && (report?.receivedAt ?? 0) <= current.failedAt,
     refresh,
   }
 }

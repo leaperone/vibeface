@@ -44,7 +44,7 @@ export function useNodeScreen(active: boolean) {
 
 export function NodeStatus({ status }: { status: NodeDiagnostics['status'] }) {
   const online = status === 'online'
-  const unavailable = status === 'unreachable' || status === 'disconnected'
+  const unavailable = status === 'unreachable' || status === 'syncFailed' || status === 'disconnected'
   const color = online ? 'text-success' : unavailable ? 'text-warning' : 'text-muted'
   return <View className="min-w-0 flex-row items-center gap-1.5">
     <Icon as={unavailable ? WifiOff : Signal} className={cn('size-4', color)} />
@@ -61,7 +61,7 @@ export function NodeConnection({ member, diagnostics, checks, connected, reconne
   connected: boolean
   reconnect?: () => void
 }) {
-  const { hops, pathLabel, routeNotice, checkedAt, lastSyncedAt, version, system, relay, capabilitiesStale } = diagnostics
+  const { hops, pathLabel, routeNotice, returnPath, checkedAt, lastSyncedAt, version, system, relay, capabilitiesStale } = diagnostics
   const copy = useClipboardAction(diagnostics.deviceId)
   return <>
     <Card>
@@ -80,8 +80,14 @@ export function NodeConnection({ member, diagnostics, checks, connected, reconne
           </View>
         </View>)}
         {routeNotice ? <Text className="text-sm text-secondary">{routeNotice}</Text> : null}
+        {returnPath ? <View className="gap-1 border-t border-subtle pt-3">
+          <Text className="text-sm font-medium">回程路径</Text>
+          <Text className="text-sm">{returnPath.from} → {returnPath.to} · {returnPath.path.kind === 'relay' ? '经中继' : '直连'}</Text>
+          {returnPath.path.kind === 'relay' ? <Text selectable className="font-mono text-sm text-secondary">{returnPath.path.url}</Text> : null}
+          {!member.entry ? <Text className="text-sm text-muted">回程检查 {nodeDiagnosticTime(returnPath.checkedAt)}</Text> : null}
+        </View> : null}
         {checkedAt !== null ? <Text className="text-sm text-muted">最近检查 {nodeDiagnosticTime(checkedAt)}</Text> : null}
-        {!member.entry && checkedAt !== null ? <Text className="text-sm text-muted">
+        {!member.entry && (checkedAt !== null || lastSyncedAt !== null) ? <Text className="text-sm text-muted">
           {lastSyncedAt === null ? '暂无成功同步记录' : `最近成功同步 ${nodeDiagnosticTime(lastSyncedAt)}`}
         </Text> : null}
       </Details>
@@ -99,7 +105,8 @@ export function NodeConnection({ member, diagnostics, checks, connected, reconne
     <SettingsGroup title="节点信息">
       <NodeFact label="Core 版本" value={version ?? '待节点上报'} />
       <NodeFact label="系统" value={system ?? '待节点上报'} />
-      <NodeFact label="转发服务" value={relay === null ? '状态未知' : `${relay ? '已启用' : '未启用'}${capabilitiesStale ? '（上次读取）' : ''}`} />
+      <NodeFact label="转发服务" value={relay === null ? '状态未知' : relay ? '已启用' : '未启用'} />
+      {capabilitiesStale ? <Text className="py-2 text-sm text-muted">设备信息来自上次报告。</Text> : null}
       <View className="gap-2 pt-3">
         <Text className="text-sm text-secondary">节点编号</Text>
         <CopyableId value={member.device_id} label="节点编号" />

@@ -353,6 +353,30 @@ test("workspace preserves bot and message requests while routing native decision
     await state.refresh()
     state = render()
     assert.equal(state.selectedBot?.bot_id, "bot")
+    await t.test("manual node checks wait for a polling read and then run one live probe", async () => {
+      const rpc = connection.rpc
+      const polling = deferred()
+      const paramsSeen: unknown[] = []
+      connection.rpc = (method, params) => {
+        if (method !== "nodes") return rpc(method, params)
+        paramsSeen.push(params)
+        return paramsSeen.length === 1 ? polling.promise : Promise.resolve({ nodes: [] })
+      }
+      try {
+        const first = state.refreshNodes()
+        const manual = state.refreshNodes(true)
+        const repeated = state.refreshNodes(true)
+        assert.deepEqual(paramsSeen, [undefined])
+        polling.resolve({ nodes: [] })
+        await Promise.all([first, manual, repeated])
+        assert.equal(paramsSeen.length, 2)
+        assert.equal(workspaceModel.record(paramsSeen[1]).check_connections, true)
+      } finally {
+        connection.rpc = rpc
+        polling.resolve({ nodes: [] })
+        await state.refreshNodes()
+      }
+    })
     await t.test('malformed signed Unknown inputs survive reload and recovery attempts without rewriting or resubmission', async () => {
       const originalOutbox = platform.outbox
       const mutations: string[] = []

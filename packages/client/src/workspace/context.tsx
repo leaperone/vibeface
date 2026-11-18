@@ -138,7 +138,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const [nodeState, setNodeState] = useState<{ connection: ReadyConnection; generation: number; report: NodeReportSnapshot } | null>(null)
   const nodes = nodeState?.report.nodes ?? emptyNodes
   const nodeReport = nodeState?.connection === connection && nodeState.generation === connectionGeneration ? nodeState.report : null
-  const nodeRequest = useRef<{ connection: ReadyConnection; generation: number; read: Promise<void> } | null>(null)
+  const nodeRequest = useRef<{ connection: ReadyConnection; generation: number; checkingConnections: boolean; read: Promise<void> } | null>(null)
   const nodesRef = useRef(nodes)
   nodesRef.current = nodes
   const [writeState, setWriteState] = useState<WriteStatus>({ state: "writable", conflicts: [] })
@@ -218,18 +218,22 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const refreshRef = useRef<() => Promise<void>>(async () => {})
   const current = useCallback(() => alive.current && connection.isCurrent() && connection.generation === connectionGeneration && connection.principal.network_id === networkId && connection.principal.device_id === clientId && renderedConnection.current === connection && renderedGeneration.current === connectionGeneration, [connection, connectionGeneration, networkId, clientId])
   // Settings and workspace refreshes share one read for this connection. Never publish a prior connection's path.
-  const refreshNodes = useCallback(async () => {
+  const refreshNodes = useCallback(async (checkConnections = false) => {
     if (!current()) throw new Error("连接换了。再查一次。")
     const pending = nodeRequest.current
-    if (pending?.connection === connection && pending.generation === connectionGeneration) return pending.read
-    const read = connection.rpc("nodes").then((raw) => {
+    const previous = pending?.connection === connection && pending.generation === connectionGeneration ? pending : null
+    if (previous && (!checkConnections || previous.checkingConnections)) return previous.read
+    const read = (async () => {
+      if (previous) await previous.read.catch(() => {})
+      if (!current()) throw new Error("连接换了。再查一次。")
+      const raw = await connection.rpc("nodes", checkConnections ? { check_connections: true } : undefined)
       if (!current()) throw new Error("连接换了。再查一次。")
       const report = { ...parseNodeReport(raw), receivedAt: Date.now() }
       setNodeState({ connection, generation: connectionGeneration, report })
-    }).finally(() => {
+    })().finally(() => {
       if (nodeRequest.current?.read === read) nodeRequest.current = null
     })
-    nodeRequest.current = { connection, generation: connectionGeneration, read }
+    nodeRequest.current = { connection, generation: connectionGeneration, checkingConnections: checkConnections, read }
     return read
   }, [connection, connectionGeneration, current])
   const readMethods = new Set(['message_search', 'conversation_history', 'conversation', 'bots', 'nodes', 'notifications', 'questions', 'open_works', 'write_status', 'workspace_state', 'workspace_history', 'work_detail', 'scope_context', 'read_artifact', 'logs', 'history', 'workspace_overview'])

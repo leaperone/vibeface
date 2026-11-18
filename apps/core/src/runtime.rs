@@ -68,7 +68,7 @@ pub(crate) mod test_support;
 
 #[derive(serde::Serialize)]
 struct NodeObservation {
-    checked_at_ms: i64,
+    checked_at_ms: Option<i64>,
     last_synced_at_ms: Option<i64>,
     path: Option<crate::net::SelectedPath>,
 }
@@ -1251,6 +1251,16 @@ impl Runtime {
         }
         match &command {
             Ok(BusinessCommand::Nodes(_)) => {
+                let include_observation = access.is_user();
+                let check_connections = match input.get("check_connections") {
+                    Some(check) => {
+                        ensure!(include_observation, "connection checks require user access");
+                        check
+                            .as_bool()
+                            .context("check_connections must be a boolean")?
+                    }
+                    None => false,
+                };
                 let query_network = network.to_owned();
                 let bundle = self
                     .store
@@ -1273,7 +1283,6 @@ impl Runtime {
                     .into_iter()
                     .filter(|member| member.kind == IdentityKind::Node)
                     .collect();
-                let include_observation = access.is_user();
                 let probes = members.iter().map(|member| async {
                     if member.device_id == local {
                         let capabilities = self.capabilities().await;
@@ -1281,16 +1290,16 @@ impl Runtime {
                             true,
                             capabilities,
                             NodeObservation {
-                                checked_at_ms: now_ms(),
+                                checked_at_ms: Some(now_ms()),
                                 last_synced_at_ms: None,
                                 path: None,
                             },
                         );
                     }
-                    // A Node the sync loop cannot reach would hold this answer for the timeout.
-                    let answer = if self.sync_failing(&member.device_id) {
-                        None
-                    } else {
+                    // A routine refresh skips peers whose last sync failed. An explicit check
+                    // gives the user a fresh probe even when the sync loop has backed off.
+                    let attempted = check_connections || !self.sync_failing(&member.device_id);
+                    let answer = if attempted {
                         tokio::time::timeout(
                             Duration::from_secs(3),
                             self.peer_request_with_connection(
@@ -1303,6 +1312,8 @@ impl Runtime {
                         .await
                         .ok()
                         .and_then(Result::ok)
+                    } else {
+                        None
                     };
                     let live = answer.is_some();
                     let path = if include_observation {
@@ -1314,7 +1325,7 @@ impl Runtime {
                     };
                     let (_, last_synced_at_ms) = self.peer_sync_status(&member.device_id);
                     let observation = NodeObservation {
-                        checked_at_ms: now_ms(),
+                        checked_at_ms: attempted.then(now_ms),
                         last_synced_at_ms,
                         path,
                     };

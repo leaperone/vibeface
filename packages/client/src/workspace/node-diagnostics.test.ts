@@ -32,9 +32,9 @@ function inspect({ response, connection = entry, focus = target, connected = tru
   })
 }
 
-test("a forwarded client and a peer probe keep their relays on their respective segments", () => {
+test("a forwarding connection reports its return relay separately from the peer probe route", () => {
   const diagnostics = inspect({ response: {
-    session_path: { kind: "quic", upstream_device_id: gatewayId, checked_at_ms: checkedAt + 100, path: { kind: "relay", url: "https://inbound.example/" } },
+    session_path: { kind: "quic", upstream_device_id: gatewayId, checked_at_ms: checkedAt + 100, return_path: { kind: "relay", url: "https://return.example/" } },
     nodes: [{ ...peer, observation: { checked_at_ms: checkedAt, last_synced_at_ms: lastSyncedAt, path: { kind: "relay", url: "https://sync.example:443/" } } }],
   } })
   assert.equal(diagnostics.status, "online")
@@ -44,22 +44,24 @@ test("a forwarded client and a peer probe keep their relays on their respective 
   assert.deepEqual(diagnostics.hops.map(({ kind, name, address }) => [kind, name, address]), [
     ["client", "这台手机", undefined],
     ["gateway", "远程接入机", "https://access.example"],
-    ["relay", "转发服务", "https://inbound.example"],
     ["node", info.name, undefined],
     ["relay", "转发服务", "https://sync.example"],
     ["node", target.name, undefined],
   ])
+  assert.deepEqual(diagnostics.returnPath, {
+    from: info.name, to: "远程接入机", path: { kind: "relay", url: "https://return.example" }, checkedAt: checkedAt + 100,
+  })
   const copied = nodeDiagnosticText(target.name, diagnostics)
   assert.ok(copied.includes(gatewayId))
-  assert.ok(copied.indexOf("inbound.example") < copied.indexOf(info.name))
-  assert.ok(copied.indexOf(info.name) < copied.indexOf("sync.example"))
+  assert.equal(diagnostics.hops[2]?.via, "去程传输方式未知")
+  assert.match(copied, /回程 工作电脑 → https:\/\/return\.example → 远程接入机/)
 })
 
 test("LAN does not identify the native client's ephemeral QUIC ID as a forwarding node", () => {
   const diagnostics = inspect({
     connection: { kind: "lan", device_id: entryId, addrs: ["192.0.2.1:3340"] },
     focus: { deviceId: entryId, name: info.name, entry: true },
-    response: { nodes: [], session_path: { kind: "quic", checked_at_ms: checkedAt, upstream_device_id: gatewayId, path: { kind: "direct" } } },
+    response: { nodes: [], session_path: { kind: "quic", checked_at_ms: checkedAt, upstream_device_id: gatewayId, return_path: { kind: "direct" } } },
   })
   assert.equal(diagnostics.pathLabel, "局域网直连")
   assert.equal(diagnostics.version, info.version)
@@ -94,7 +96,16 @@ test("offline and expired status never pass for a current path", () => {
   assert.equal(unreachable.status, "unreachable")
   assert.equal(unreachable.hops.at(-1)?.via, "未收到响应")
   assert.equal(unreachable.lastSyncedAt, lastSyncedAt)
+  const skipped = inspect({ response: {
+    ...response,
+    nodes: [{ ...peer, online: false, observation: { checked_at_ms: null, last_synced_at_ms: lastSyncedAt, path: null } }],
+  } })
+  assert.equal(skipped.status, "syncFailed")
+  assert.equal(skipped.checkedAt, null)
+  assert.equal(skipped.lastSyncedAt, lastSyncedAt)
+  assert.equal(skipped.hops.at(-1)?.via, "上次同步失败")
   const disconnected = inspect({ response, connected: false })
   assert.equal(disconnected.status, "unknown")
+  assert.equal(disconnected.capabilitiesStale, true)
   assert.deepEqual(disconnected.hops, [])
 })

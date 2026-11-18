@@ -261,7 +261,8 @@ impl SessionTransport {
                 "kind":"quic",
                 "checked_at_ms":checked_at_ms,
                 "upstream_device_id":net::device_id(&connection.remote_id()),
-                "path":net::selected_path(connection),
+                // Iroh selects this endpoint's transmit path. The forwarder's selection can differ.
+                "return_path":net::selected_path(connection),
             }),
         }
     }
@@ -5637,7 +5638,7 @@ mod tests {
             let observed = &via_gateway["session_path"];
             assert_eq!(observed["kind"], "quic");
             assert_eq!(observed["upstream_device_id"], gateway_device);
-            assert_eq!(observed["path"], json!({"kind":"direct"}));
+            assert_eq!(observed["return_path"], json!({"kind":"direct"}));
             assert!(observed["checked_at_ms"].is_i64());
 
             let mut guest = open(target_device, LocalIdentity::generate()).await?;

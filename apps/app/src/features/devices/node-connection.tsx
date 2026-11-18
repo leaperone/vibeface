@@ -12,6 +12,7 @@ export function NodeStatus({ status }: { status: NodeDiagnostics["status"] }) {
     <span aria-hidden="true" className={cn("size-2 rounded-pill", {
       online: "bg-success",
       unreachable: "bg-warning",
+      syncFailed: "bg-warning",
       checking: "bg-info",
       stale: "border border-warning",
       unknown: "border border-strong",
@@ -29,7 +30,7 @@ export function NodeConnection({ name, diagnostics, checks, canRefresh }: {
   checks: ReturnType<typeof useNodeChecks>
   canRefresh: boolean
 }) {
-  const { status, hops, pathLabel, routeNotice, checkedAt, lastSyncedAt, version, system, relay, capabilitiesStale } = diagnostics
+  const { status, hops, pathLabel, routeNotice, returnPath, checkedAt, lastSyncedAt, version, system, relay, capabilitiesStale } = diagnostics
   const hasDeviceInfo = Boolean(version || system || relay !== null)
   const canCopy = hops.length > 0 || checkedAt !== null || lastSyncedAt !== null || hasDeviceInfo
   const clipboard = useClipboard(diagnostics.deviceId, {
@@ -72,6 +73,13 @@ export function NodeConnection({ name, diagnostics, checks, canRefresh }: {
           </li>
         })}
       </ol>
+    </div> : null}
+
+    {returnPath ? <div className="grid min-w-0 gap-1 border-t border-subtle pt-3 [overflow-wrap:anywhere]">
+      <h3 className="text-sm font-medium">回程路径</h3>
+      <p className="text-sm">{returnPath.from} → {returnPath.to} · {returnPath.path.kind === "relay" ? "经中继" : "直连"}</p>
+      {returnPath.path.kind === "relay" ? <p className="font-mono text-sm text-secondary">{returnPath.path.url}</p> : null}
+      {returnPath.checkedAt !== checkedAt ? <p className="text-sm text-secondary">回程检查 <time dateTime={new Date(returnPath.checkedAt).toISOString()}>{nodeDiagnosticTime(returnPath.checkedAt)}</time></p> : null}
     </div> : null}
 
     {checkedAt !== null || lastSyncedAt !== null || hasDeviceInfo ? <div className="grid gap-2 border-t border-subtle pt-3">

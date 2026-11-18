@@ -91,8 +91,12 @@ function parseSelectedPath(value: unknown): SelectedNodePath | null {
 function parseNodeObservation(value: unknown): NodeObservation | null {
   if (!isRecord(value)) return null
   const checkedAt = diagnosticTime(value.checked_at_ms)
-  if (checkedAt === null) return null
-  return { checkedAt, lastSyncedAt: diagnosticTime(value.last_synced_at_ms), path: parseSelectedPath(value.path) }
+  if (checkedAt === null && value.checked_at_ms !== null) return null
+  return {
+    checkedAt,
+    lastSyncedAt: diagnosticTime(value.last_synced_at_ms),
+    path: checkedAt === null ? null : parseSelectedPath(value.path),
+  }
 }
 
 function parseNodeSessionPath(value: unknown): NodeSessionPath | null {
@@ -102,7 +106,7 @@ function parseNodeSessionPath(value: unknown): NodeSessionPath | null {
   if (value.kind === "local" || value.kind === "websocket") return { kind: value.kind, checkedAt }
   if (value.kind !== "quic") return null
   try {
-    return { kind: "quic", checkedAt, upstreamDeviceId: validTarget(value.upstream_device_id), path: parseSelectedPath(value.path) }
+    return { kind: "quic", checkedAt, upstreamDeviceId: validTarget(value.upstream_device_id), returnPath: parseSelectedPath(value.return_path) }
   } catch { return null }
 }
 
