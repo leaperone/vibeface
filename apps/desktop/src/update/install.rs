@@ -86,6 +86,10 @@ impl Installation {
         &self.path
     }
 
+    pub(super) fn source_commit(&self) -> &str {
+        &self.build.source_commit
+    }
+
     pub(super) fn lock_path(&self) -> Result<PathBuf> {
         let path = match self.format {
             #[cfg(any(target_os = "linux", windows))]

@@ -77,7 +77,7 @@ struct TagRef {
     object: GitObject,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct GitObject {
     #[serde(rename = "type")]
     kind: String,
@@ -468,16 +468,28 @@ async fn current_appimage_digest(
 pub(super) async fn check(
     client: &Client,
     current: &Version,
+    installed_source: &str,
     suffix: &str,
 ) -> Result<Option<Candidate>> {
     let channel = Channel::of(current).context("unrecognized Desktop update channel")?;
-    let refs = json(
+    let refs: Vec<TagRef> = json(
         client,
         &format!("{GITHUB}/git/matching-refs/tags/desktop-v"),
         MAX_REFS,
     )
     .await?;
     let target = target()?;
+    let installed_tag = format!("refs/tags/desktop-v{current}");
+    let installed_object = refs
+        .iter()
+        .find(|reference| reference.name == installed_tag)
+        .context("current Desktop build has no official tag")?
+        .object
+        .clone();
+    ensure!(
+        commit(client, installed_object).await? == installed_source,
+        "current Desktop build differs from the official tag"
+    );
     let candidates = candidate_refs(refs, current, channel);
     let exceeds_limit = candidates.len() > MAX_CANDIDATES;
     for (version, object) in candidates.into_iter().take(MAX_CANDIDATES) {

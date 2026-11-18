@@ -397,15 +397,16 @@ impl Desktop {
                                     .primary(),
                                 );
                         } else if host.discovery.nodes.is_empty() {
-                            page = page.child("没有发现本机 Node。");
-                            if host.can_start_owned {
-                                page = page.child(self.button(
+                            page = if host.can_start_owned {
+                                page.child("没有发现本机 Node。").child(self.button(
                                     "create-local-node",
                                     "创建并启动本机 Node",
                                     Command::Host(HostAction::Start),
                                     cx,
-                                ));
-                            }
+                                ))
+                            } else {
+                                page.child("暂时无法确认本机 Node。可在「管理本机 Node」重新扫描或选择数据目录。")
+                            };
                         } else {
                             page = page.child("已发现本机 Node，请选择要连接或启动的实例。");
                         }

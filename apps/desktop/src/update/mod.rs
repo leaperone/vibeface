@@ -284,7 +284,14 @@ async fn check_periodically(
 
 async fn check_once(target: &Target, client: &reqwest::Client) -> Result<Option<Candidate>> {
     let suffix = target.installation.asset_suffix();
-    let Some(candidate) = release::check(client, &target.current, suffix).await? else {
+    let Some(candidate) = release::check(
+        client,
+        &target.current,
+        target.installation.source_commit(),
+        suffix,
+    )
+    .await?
+    else {
         return Ok(None);
     };
     let lock = private_lock(&target.cache.join("download.lock"))?;
