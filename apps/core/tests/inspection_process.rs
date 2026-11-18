@@ -50,16 +50,21 @@ async fn control(request: &str) -> Result<Value> {
         output.status.success(),
         "controlled Core exited unsuccessfully"
     );
-    let envelope: Value = serde_json::from_slice(&output.stdout)?;
-    ensure!(envelope["ok"] == true, "controlled Core request failed");
-    Ok(envelope["result"].clone())
+    assert!(output.stdout.ends_with(b"\n"));
+    Ok(serde_json::from_slice(&output.stdout)?)
 }
 async fn inspect(data: &Path) -> Result<Inspection> {
     let request = format!(
         "{{\"command\":\"inspect\",\"data_dir\":{}}}\n",
         serde_json::to_string(data)?
     );
-    let wire = control(&request).await?;
+    let mut envelope = control(&request).await?;
+    let envelope = envelope
+        .as_object_mut()
+        .context("control response object")?;
+    assert_eq!(envelope.len(), 2);
+    assert_eq!(envelope.remove("ok"), Some(Value::Bool(true)));
+    let wire = envelope.remove("result").context("inspection result")?;
     // Check the literal shape separately from the shared consumer's serde implementation.
     let expected = [
         "status",
@@ -82,6 +87,16 @@ async fn inspect(data: &Path) -> Result<Inspection> {
     assert_eq!(object.len(), expected.len());
     assert!(expected.iter().all(|key| object.contains_key(*key)));
     Inspection::from_value(wire)
+}
+
+#[tokio::test]
+async fn real_core_emits_a_failure_envelope_for_a_refused_inspection() -> Result<()> {
+    let envelope = control(r#"{"command":"inspect","data_dir":"relative-node"}"#).await?;
+    assert_eq!(
+        envelope,
+        serde_json::json!({"ok": false, "error": "specify an absolute data directory"})
+    );
+    Ok(())
 }
 
 #[tokio::test]

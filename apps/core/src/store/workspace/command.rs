@@ -205,7 +205,7 @@ impl Store {
                     &tx,
                     network,
                     &scope,
-                    &format!("assignment:{id}"),
+                    &crate::scheduling::assignment_trigger(&id),
                     created_at_ms,
                 )?;
             }

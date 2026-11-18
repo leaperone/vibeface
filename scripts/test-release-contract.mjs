@@ -204,7 +204,7 @@ function sourceTests(root) {
 
 function cliFixtures(root) {
   const copy = ['scripts/release-contract.mjs', 'scripts/release-metadata.mjs', 'scripts/sealed-runtime.mjs', 'scripts/windows-signing.mjs', 'scripts/private-control.mjs',
-    'scripts/build-desktop.mjs', 'scripts/verify-desktop.mjs', 'scripts/package-npm.mjs', 'scripts/publish-npm.mjs',
+    'scripts/build-desktop.mjs', 'scripts/verify-desktop.mjs', 'scripts/package-npm.mjs', 'scripts/package-node-web.json', 'scripts/publish-npm.mjs',
     'apps/cli/npm/bin/vibeface.mjs', 'apps/cli/npm/package.json', 'apps/cli/npm/README.md'];
   for (const name of copy) write(root, name, fs.readFileSync(path.join(repo, name)));
   const cliManifest = value => `[package]\nname = "vibeface"\nversion = "${value}"\n`;

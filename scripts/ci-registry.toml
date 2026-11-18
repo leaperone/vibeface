@@ -1,0 +1,334 @@
+schema_version = 1
+
+[paths.js_workspace]
+exact = ["package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
+[paths.www_local_inputs]
+patterns = ["apps/www/**", "packages/docs/**", "packages/theme/**"]
+include = ["js_workspace"]
+[paths.web_tools]
+exact = ["scripts/build-web.sh", "scripts/check-web.sh", "scripts/build-web-crypto.sh", "scripts/wasm-bindgen-version.py"]
+
+[paths.rust_local_inputs]
+patterns = ["crates/delivery/**", "apps/core/src/**", "apps/cli/src/**", "crates/control/src/**", "crates/client/src/**", "crates/bridge/src/**", "crates/protocol/src/**", "crates/secure/src/**", "crates/secure-ffi/**", "crates/native-transport/**", "crates/*/tests/**", "apps/core/tests/**", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/core/build.rs", "apps/core/migrations/**", "apps/core/schema.hcl", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".cargo/**"]
+[paths.delivery]
+patterns = ["crates/delivery/*", "crates/delivery/proof/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "apps/core/src/delivery/*", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/net/mesh/record.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/verify-delivery-protected.py", "scripts/verify-delivery-restart-observer.py"]
+[paths.full]
+patterns = ["scripts/release_component_identity.py", "scripts/release_format.py", "scripts/release_context.py", "scripts/release_source.py", "scripts/release_archive.py", "scripts/release_inventory.py", "scripts/release_github.py", "scripts/release_publisher.py", "scripts/release_assembly.py", "scripts/tests/release/*", "scripts/tests/__init__.py", "Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "crates/control/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py", "scripts/ci-registry.toml", "scripts/ci_registry.py"]
+[paths.www]
+patterns = ["apps/www/*"]
+[paths.docs]
+patterns = ["README.md", "README.zh-CN.md", "AGENTS.md", "CLAUDE.md", "packages/docs/*", "tests/e2e/*"]
+[paths.node]
+patterns = ["config/public-bootstrap.json", "packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts", "apps/core/*", "install.sh", "scripts/package-node.sh", "scripts/package-node-windows.py", "scripts/package-node-web.json", "scripts/install-node-service.sh", "scripts/install-node-service.ps1", "scripts/verify-node.py", "scripts/verify-windows-node.py", "scripts/verification_harness.py"]
+[paths.desktop]
+patterns = ["apps/desktop/src/*", "apps/desktop/tests/*"]
+[paths.mobile]
+patterns = ["apps/mobile/*", "packages/secure-native/*"]
+[paths.web]
+patterns = ["apps/app/*", "packages/client/*", "packages/theme/*", "packages/uiarc/*", "config/uiarc.json", "scripts/generate-uiarc-theme.py", "scripts/check-uiarc.py", "scripts/check-uiarc-build.mjs", "scripts/check-uiarc-native.cjs", "scripts/vendor-uiarc.py"]
+include = ["js_workspace", "web_tools"]
+[paths.protocol]
+trees = ["crates/protocol"]
+[paths.bridge]
+patterns = ["crates/bridge/*"]
+[paths.client]
+patterns = ["crates/client/*"]
+[paths.secure]
+patterns = ["crates/secure/*", "scripts/crypto-client.mjs"]
+[paths.secure_ffi]
+patterns = ["crates/secure-ffi/*", "scripts/build-mobile-secure.sh"]
+[paths.native_transport]
+patterns = ["crates/native-transport/*"]
+[paths.control]
+patterns = ["crates/control/*"]
+[paths.cli]
+patterns = ["apps/cli/*"]
+[paths.release_tools]
+patterns = ["scripts/release-contract.mjs", "scripts/release-metadata.mjs", "scripts/test-release-contract.mjs", "scripts/fixtures/release-contract.json", "scripts/build-desktop.mjs", "scripts/verify-desktop.mjs", "scripts/package-npm.mjs", "scripts/publish-npm.mjs", "scripts/sealed-runtime.mjs"]
+[paths.www_overlay]
+exact = ["packages/uiarc/src/foundation.css"]
+include = ["www_local_inputs"]
+[paths.mobile_overlay]
+patterns = ["packages/client/*", "packages/theme/*"]
+include = ["js_workspace"]
+[paths.delivery_probe_protocol]
+trees = ["crates/protocol/src"]
+
+[[primary]]
+id = "release-tools"
+paths = ["release_tools"]
+scopes = ["release-tools"]
+[[primary]]
+id = "provider-generated"
+exact = ["apps/core/extensions/generated/pi.ts", "apps/core/extensions/generated/opencode.ts"]
+scopes = ["node", "cli"]
+[[primary]]
+id = "web-unit-tests"
+regex = "^apps/app/src/(?:lib/[^/]+|features/[^/]+/[^/]+)\\.test\\.ts$"
+scopes = ["web-tests"]
+[[primary]]
+id = "web-test-fallback"
+prefix = "apps/app/"
+suffix = [".test.ts", ".test.tsx"]
+scopes = ["full"]
+[[primary]]
+id = "delivery"
+paths = ["delivery"]
+scopes = ["delivery"]
+[[primary]]
+id = "full"
+paths = ["full"]
+scopes = ["full"]
+[[primary]]
+id = "www"
+paths = ["www"]
+scopes = ["www"]
+[[primary]]
+id = "docs"
+paths = ["docs"]
+scopes = ["docs"]
+[[primary]]
+id = "node"
+paths = ["node"]
+scopes = ["node"]
+[[primary]]
+id = "desktop"
+paths = ["desktop"]
+scopes = ["desktop"]
+[[primary]]
+id = "mobile"
+paths = ["mobile"]
+scopes = ["mobile"]
+[[primary]]
+id = "web"
+paths = ["web"]
+scopes = ["web"]
+[[primary]]
+id = "protocol"
+paths = ["protocol"]
+scopes = ["protocol"]
+[[primary]]
+id = "bridge"
+paths = ["bridge"]
+scopes = ["bridge"]
+[[primary]]
+id = "client"
+paths = ["client"]
+scopes = ["client"]
+[[primary]]
+id = "secure"
+paths = ["secure"]
+scopes = ["secure"]
+[[primary]]
+id = "secure-ffi"
+paths = ["secure_ffi"]
+scopes = ["secure-ffi"]
+[[primary]]
+id = "native-transport"
+paths = ["native_transport"]
+scopes = ["native-transport"]
+[[primary]]
+id = "control"
+paths = ["control"]
+scopes = ["control"]
+[[primary]]
+id = "cli"
+paths = ["cli"]
+scopes = ["cli"]
+
+[[overlay]]
+id = "www"
+paths = ["www_overlay"]
+scopes = ["www"]
+[[overlay]]
+id = "mobile"
+paths = ["mobile_overlay"]
+scopes = ["mobile"]
+[[overlay]]
+id = "desktop"
+paths = ["js_workspace"]
+scopes = ["desktop"]
+[[overlay]]
+id = "delivery-acceptance"
+paths = ["delivery_probe_protocol"]
+scopes = ["delivery-acceptance"]
+
+[[rust_target]]
+id = "protocol"
+package = "vibeface-protocol"
+dependents = ["bridge", "control", "client", "secure-ffi", "native-transport"]
+[[rust_target]]
+id = "bridge"
+package = "vibeface-bridge"
+dependents = ["control", "client"]
+[[rust_target]]
+id = "secure"
+package = "vibeface-secure"
+dependents = ["control", "node", "secure-ffi", "client", "native-transport"]
+[[rust_target]]
+id = "client"
+package = "vibeface-client"
+dependents = ["node", "cli"]
+[[rust_target]]
+id = "node"
+package = "vibeface-core"
+dependents = []
+[[rust_target]]
+id = "control"
+package = "vibeface-control"
+dependents = ["node", "cli"]
+[[rust_target]]
+id = "cli"
+package = "vibeface"
+dependents = []
+[[rust_target]]
+id = "secure-ffi"
+package = "vibeface-secure-ffi"
+dependents = []
+[[rust_target]]
+id = "native-transport"
+package = "vibeface-native-transport"
+dependents = ["client", "secure-ffi"]
+[[rust_target]]
+id = "delivery"
+package = "vibeface-delivery"
+dependents = ["node"]
+
+
+[[process]]
+id = "memory-sync"
+patterns = ["apps/core/src/store/bot_settings.rs", "apps/core/src/store/reduce.rs", "apps/core/src/store/log.rs", "apps/core/src/store/sync.rs", "apps/core/src/agent_context.rs", "apps/core/src/identity*", "crates/secure/*"]
+ordinary = true
+[[process]]
+id = "auto-route"
+patterns = ["config/public-bootstrap.json", "apps/core/src/identity*", "apps/core/src/crypto.rs", "apps/core/src/local_access.rs", "apps/core/src/net*", "crates/secure/*", "crates/control/*"]
+ordinary = true
+[[process]]
+id = "default"
+patterns = ["config/public-bootstrap.json", "apps/core/src/net*", "apps/core/src/runtime/peers.rs", "apps/core/src/store/sync.rs", "apps/core/src/store/log.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/fetch.rs", "apps/core/src/identity*", "crates/secure/*"]
+ordinary = true
+[[process]]
+id = "phase1"
+patterns = ["apps/core/src/manager.rs", "apps/core/src/schedul*", "apps/core/src/work.rs", "apps/core/src/runtime/work.rs", "apps/core/src/runtime/followup.rs", "apps/core/src/runtime/schedule_delivery.rs", "apps/core/src/runtime/manager_control.rs", "apps/core/src/store/work.rs", "apps/core/src/store/scheduler.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/reduce.rs", "apps/core/src/store/log.rs"]
+ordinary = true
+[[process]]
+id = "chat-agent"
+patterns = ["crates/bridge/*", "crates/control/*", "apps/cli/*", "apps/core/src/runtime/codex_server.rs", "apps/core/src/runtime/claude.rs", "apps/core/src/runtime/pi.rs", "apps/core/src/runtime/opencode.rs", "apps/core/src/runtime/provider_adapter.rs", "apps/core/src/runtime/provider_probe.rs", "apps/core/src/runtime/agent_tools.rs", "apps/core/src/runtime/chat_controls.rs", "apps/core/src/runtime/executor.rs", "apps/core/src/runtime/observation.rs", "apps/core/src/runtime/triage.rs", "apps/core/src/runtime/work.rs", "apps/core/src/runtime/followup.rs", "apps/core/src/runtime/bots.rs", "apps/core/src/runtime/manager_control.rs", "apps/core/src/agent_context.rs", "apps/core/src/providers.rs", "apps/core/src/triage.rs", "apps/core/src/tools.rs", "apps/core/src/work.rs", "apps/core/src/manager.rs", "apps/core/src/control.rs", "apps/core/src/store/triage.rs", "apps/core/src/store/questions.rs", "apps/core/src/store/work.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/bots.rs"]
+ordinary = true
+[[process]]
+id = "phase4"
+patterns = ["crates/bridge/*", "crates/control/*", "apps/core/src/net*", "apps/core/src/runtime/peers.rs", "apps/core/src/runtime/work.rs", "apps/core/src/runtime/agent_tools.rs", "apps/core/src/runtime/manager_control.rs", "apps/core/src/work.rs", "apps/core/src/tools.rs", "apps/core/src/store/work.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/sync.rs", "apps/core/src/store/bots.rs", "apps/core/src/identity*", "apps/core/src/fetch.rs"]
+ordinary = true
+[[process]]
+id = "public-node"
+patterns = ["config/public-bootstrap.json", "apps/core/src/net*", "apps/core/src/runtime/peers.rs", "apps/core/src/identity*", "apps/core/src/local_access.rs", "apps/core/src/crypto.rs", "crates/control/*"]
+ordinary = true
+[[process]]
+id = "mesh"
+patterns = ["config/public-bootstrap.json", "apps/core/src/net*", "apps/core/src/runtime/peers.rs"]
+ordinary = true
+[[process]]
+id = "phase5"
+patterns = ["apps/core/src/store/*", "apps/core/src/identity*", "apps/core/src/maintenance.rs", "apps/core/src/logging.rs", "crates/control/*", "crates/secure/src/recovery.rs"]
+ordinary = true
+[[process]]
+id = "delivery-charity"
+paths = ["delivery", "delivery_probe_protocol"]
+ordinary = false
+
+[[preflight]]
+id = "provider-hooks"
+name = "Provider hook templates"
+paths = ["apps/core/extensions/**", "package.json", "pnpm-lock.yaml"]
+command = "node apps/core/extensions/generate.mjs --check && node node_modules/typescript/bin/tsc -p apps/core/extensions/tsconfig.json && node --test --test-timeout=10000 apps/core/extensions/test/hooks.test.mjs"
+[[preflight]]
+id = "rust-lint"
+name = "Rust lint"
+groups = ["rust_local_inputs"]
+command = "cargo clippy --workspace --all-targets --locked -- -D warnings"
+ci_check = "Rust lint and minimum version"
+[[preflight]]
+id = "rust-format"
+name = "Rust format"
+groups = ["rust_local_inputs"]
+command = "cargo fmt --all -- --check"
+ci_check = "Workflow and source checks"
+[[preflight]]
+id = "rust-fast"
+name = "Rust fast tests"
+groups = ["rust_local_inputs"]
+command = "python3 scripts/ci.py test --tier fast --packages vibeface-protocol vibeface-bridge vibeface-secure vibeface-client vibeface-core vibeface-control vibeface vibeface-delivery vibeface-secure-ffi vibeface-native-transport"
+ci_check = "Rust fast tests"
+[[preflight]]
+id = "delivery-proof"
+name = "Delivery proof and settlement"
+paths = ["crates/delivery/**", "crates/delivery/proof/**", "contracts/delivery/**", "apps/core/src/delivery/**", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py"]
+command = "python3 scripts/check-delivery.py --check-fixtures && python3 scripts/check-delivery.py --sandbox"
+heavy = true
+comment = "CI runs the host checks, not the Docker sandbox, so this stays local"
+[[preflight]]
+id = "delivery-probe"
+name = "Delivery service probe"
+paths = ["tests/fixtures/delivery-probe/**", "apps/core/src/delivery/**", "apps/core/src/net.rs", "apps/core/src/net/mesh/record.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/verify-node.py", "crates/protocol/Cargo.toml"]
+groups = ["delivery_probe_protocol"]
+command = "cargo fmt --manifest-path tests/fixtures/delivery-probe/Cargo.toml -- --check && VIBEFACE_PROBE_SOURCE_ROOT=\"$PWD\" CARGO_TARGET_DIR=\"$PWD/.artifacts/delivery-probe/target\" cargo build --manifest-path tests/fixtures/delivery-probe/Cargo.toml --locked"
+[[preflight]]
+id = "web-build"
+name = "Web build and packaged resources"
+paths = ["apps/app/**", "packages/client/**", "apps/mobile/**", "packages/secure-native/**", "packages/theme/**"]
+groups = ["js_workspace", "web_tools"]
+command = "bash scripts/build-web-crypto.sh && bash scripts/build-web.sh && cargo build -p vibeface -p vibeface-core --locked && python3 scripts/verify-node.py --binary target/debug/vibeface --core-binary target/debug/vibeface-core --app-dir apps/app/dist/client --crypto-module apps/app/dist/client/vibeface_secure.js --artifacts .artifacts/preflight-web --web-only"
+ci_check = "Native package and acceptance (x86_64-unknown-linux-gnu)"
+[[preflight]]
+id = "mobile-types"
+name = "Mobile types"
+paths = ["apps/mobile/**", "packages/secure-native/**", "packages/client/**", "packages/theme/**"]
+groups = ["js_workspace"]
+command = "pnpm --filter @vibeface/client run typecheck && pnpm --filter @vibeface/secure-native run typecheck && pnpm --filter vibeface-mobile run typecheck"
+ci_check = "Mobile types"
+[[preflight]]
+id = "desktop-source"
+name = "Desktop source"
+paths = ["apps/desktop/**", "scripts/native-desktop/**"]
+groups = ["js_workspace"]
+command = "cargo test -p vibeface-desktop --features native-ui-tests --locked && cargo clippy -p vibeface-desktop --all-targets --features native-ui-tests --locked -- -D warnings"
+ci_check = "Native desktop host checks"
+[[preflight]]
+id = "desktop-scripts"
+name = "Desktop scripts"
+paths = ["apps/desktop/**", "scripts/native-desktop/**", "scripts/build-desktop.mjs", "scripts/verify-desktop.mjs", "scripts/release-contract.mjs", "scripts/release-metadata.mjs", "scripts/sealed-runtime.mjs", "scripts/windows-signing.mjs", "scripts/private-control.mjs", "scripts/test-release-contract.mjs", "scripts/fixtures/release-contract.json"]
+groups = ["js_workspace"]
+command = "node --check scripts/build-desktop.mjs && node --check scripts/verify-desktop.mjs && node scripts/build-desktop.mjs --self-test && node scripts/verify-desktop.mjs --self-test"
+[[preflight]]
+id = "www-portal"
+name = "Static www portal"
+groups = ["www_local_inputs"]
+command = "pnpm --filter vibeface-www run typecheck && pnpm --filter vibeface-www run build && pnpm --filter vibeface-www run check:static"
+ci_check = "Static portal"
+[[preflight]]
+id = "www-tests"
+name = "Static www tests"
+groups = ["www_local_inputs"]
+command = "pnpm --filter vibeface-www run test"
+[[preflight]]
+id = "javascript"
+name = "JavaScript syntax"
+paths = ["scripts/crypto-client.mjs", "apps/cli/npm/**", "scripts/package-npm.mjs", "scripts/package-node-web.json", "scripts/publish-npm.mjs", "scripts/release-contract.mjs", "scripts/release-metadata.mjs", "scripts/test-release-contract.mjs", "scripts/fixtures/release-contract.json", "scripts/sealed-runtime.mjs", "scripts/windows-signing.mjs", "scripts/private-control.mjs", ".github/workflows/npm-publish.yml", ".github/workflows/release.yml", ".github/workflows/release-*.yml"]
+command = "node --check scripts/crypto-client.mjs && node --check apps/cli/npm/bin/vibeface.mjs && node --check scripts/release-contract.mjs && node --check scripts/release-metadata.mjs && node --check scripts/test-release-contract.mjs && node --check scripts/package-npm.mjs && node --check scripts/publish-npm.mjs && node scripts/test-release-contract.mjs --cli-fixtures && node scripts/package-npm.mjs --self-test && node scripts/publish-npm.mjs --self-test"
+ci_check = "Workflow and source checks"
+[[preflight]]
+id = "delivery-scripts"
+name = "Delivery scripts and workflow"
+paths = ["install.sh", "scripts/*.sh", "scripts/release.py", "scripts/release_*.py", "scripts/tests/release/**", "scripts/tests/__init__.py", "scripts/hourly.py", "scripts/release-dispatch.py", "scripts/check-release-workflow.py", ".github/workflows/**"]
+command = "bash -n install.sh && bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/check-web.sh && shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/check-web.sh && bash install.sh --self-test"
+ci_check = "Workflow and source checks"
+[[preflight]]
+id = "release-signing"
+name = "Release signing script syntax"
+paths = ["scripts/*.sh"]
+command = "bash -n scripts/sign-release.sh"
+[[preflight]]
+id = "migration"
+name = "Migration integrity"
+paths = ["apps/core/migrations/**", "apps/core/schema.hcl"]
+command = "atlas migrate validate --dir file://apps/core/migrations"

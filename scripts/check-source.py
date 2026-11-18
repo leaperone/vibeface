@@ -10,6 +10,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 CHECKS = (
+    ("scripts/verification_harness.py", "--self-test"),
+    ("scripts/ci_registry.py", "--self-test"),
     ("scripts/ci.py", "--self-test"),
     ("scripts/build-inputs.py", "self-test"),
     ("scripts/check-cli-parity.py", "--self-test"),

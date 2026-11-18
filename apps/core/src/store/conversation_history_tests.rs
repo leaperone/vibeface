@@ -1,23 +1,14 @@
-use super::*;
+use super::super::test_support::{
+    assert_full_recompute_oracle, bot_conversation, bot_reply, isolated_task, net, paged,
+    scheduled_on_both, store, user, workspace_command_fixture, workspace_fixture,
+    workspace_input_fixture, workspace_task_command,
+};
+use super::super::*;
+use crate::providers::Provider;
+use crate::scheduling::TriggerKind;
 use crate::store::scheduler_history::SchedulerHistoryQuery;
+use serde_json::json;
 use vibeface_protocol::history::{HISTORY_PAGE_BYTES, HISTORY_RESPONSE_BYTES};
-
-pub(super) fn paged(store: &Store, network: &str, limit: usize) -> Result<Vec<Message>> {
-    let mut cursor = None;
-    let mut all = Vec::new();
-    for _ in 0..10_000 {
-        let page = store.conversation_messages_page(network, "c", cursor.as_deref(), limit)?;
-        assert!(serde_json::to_vec(&page)?.len() < HISTORY_RESPONSE_BYTES);
-        assert!(page.items.len() <= limit);
-        assert_eq!(page.complete, page.next_cursor.is_none());
-        all.splice(0..0, page.items);
-        cursor = page.next_cursor;
-        if cursor.is_none() {
-            return Ok(all);
-        }
-    }
-    bail!("history cursor did not terminate")
-}
 
 #[test]
 fn signed_long_message_pages_preserve_content_and_new_arrivals() -> Result<()> {
@@ -501,7 +492,7 @@ fn rebuilding_identical_business_rows_never_reuses_a_history_authority() -> Resu
         "c",
         vibeface_protocol::history::HistorySection::Messages,
     )?;
-    performance_tests::assert_full_recompute_oracle(&origin, &net.network)?;
+    assert_full_recompute_oracle(&origin, &net.network)?;
     let rebuilt = origin.conversation_messages_page(&net.network, "c", None, 50)?;
     assert_eq!(rebuilt.items, page.items);
     assert_ne!(rebuilt.history_authority, page.history_authority);

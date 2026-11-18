@@ -192,8 +192,8 @@ impl Runtime {
             .conversation(network, &spec.conversation)?
             .context("conversation not found")?;
         let from_owner = conversation.owner.as_deref() == Some(spec.dispatcher.as_str());
-        match spec.trigger.split_once(':') {
-            Some(("message", message_id)) => {
+        match crate::scheduling::Trigger::decode(&spec.trigger) {
+            Ok(crate::scheduling::Trigger::Message(message_id)) => {
                 ensure!(
                     from_owner,
                     AdmissionRejected::new(
@@ -208,7 +208,7 @@ impl Runtime {
                     AdmissionRejected::new("work must follow the user's own message")
                 );
             }
-            Some(("work", previous)) => {
+            Ok(crate::scheduling::Trigger::Work(previous)) => {
                 ensure!(
                     from_owner,
                     AdmissionRejected::new(
@@ -231,15 +231,15 @@ impl Runtime {
                     "the result this work follows has not reached this device"
                 );
             }
-            Some(("schedule", _)) => {
+            Ok(crate::scheduling::Trigger::Schedule {
+                id: schedule_id, ..
+            }) => {
                 ensure!(
                     from_owner,
                     AdmissionRejected::new(
                         "only the conversation's scheduling device dispatches its work"
                     )
                 );
-                let (schedule_id, _) = crate::scheduling::parse_schedule_trigger(&spec.trigger)
-                    .context(AdmissionRejected::new("invalid work trigger"))?;
                 ensure!(
                     store.schedule(network, schedule_id)?.is_some_and(|entry| {
                         entry.conversation_id == spec.conversation && entry.schedule.enabled
@@ -247,7 +247,7 @@ impl Runtime {
                     "the schedule this work runs for is paused, deleted or has not reached this device"
                 );
             }
-            Some(("bot_message", message_id)) => {
+            Ok(crate::scheduling::Trigger::BotMessage(message_id)) => {
                 ensure!(
                     from_owner,
                     AdmissionRejected::new(
@@ -262,7 +262,7 @@ impl Runtime {
                     AdmissionRejected::new("work must follow a message in this conversation")
                 );
             }
-            Some(("task", task)) => {
+            Ok(crate::scheduling::Trigger::Task(task)) => {
                 let task = store
                     .work_record(task)?
                     .context("agent task not found on this device")?;
@@ -276,7 +276,7 @@ impl Runtime {
                     AdmissionRejected::new("an agent task only starts work on its own device")
                 );
             }
-            Some(("assignment", assignment_id)) => {
+            Ok(crate::scheduling::Trigger::Assignment(assignment_id)) => {
                 ensure!(
                     crate::store::workspace::assignment_work_allowed_from(
                         &store.connection,
@@ -290,7 +290,7 @@ impl Runtime {
                     )
                 );
             }
-            _ => bail!(AdmissionRejected::new("invalid work trigger")),
+            Err(_) => bail!(AdmissionRejected::new("invalid work trigger")),
         }
         if let Some(original) = &spec.continues {
             let original = store

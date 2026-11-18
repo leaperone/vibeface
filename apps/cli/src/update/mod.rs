@@ -426,8 +426,10 @@ async fn act(options: Update, data: PathBuf) -> Result<()> {
                 }
                 Err(error) => return Err(error.context("request node maintenance")),
             };
-            let health: MaintenanceHealth = serde_json::from_value(lease.health.clone())
-                .context("maintenance response has invalid health")?;
+            let health = MaintenanceHealth {
+                device_id: lease.health.device_id.clone(),
+                version: lease.health.version.clone(),
+            };
             ensure!(
                 health.version == manifest(&previous)?.core_version.to_string(),
                 "running node does not match current package"
@@ -497,8 +499,8 @@ async fn maintenance_commit(data: &Path) -> Result<()> {
     .await?;
     ensure!(
         matches!(
-            response.status,
-            vibeface_control::maintenance::MaintenanceStatus::Committed
+            response,
+            vibeface_control::maintenance::MaintenanceResponse::Committed(_)
         ),
         "node activation was not committed"
     );
@@ -1172,8 +1174,10 @@ where
             }
             Err(error) => return Err(error.context("request node maintenance")),
         };
-        let health: MaintenanceHealth = serde_json::from_value(lease.health.clone())
-            .context("maintenance response has invalid health")?;
+        let health = MaintenanceHealth {
+            device_id: lease.health.device_id.clone(),
+            version: lease.health.version.clone(),
+        };
         ensure!(
             health.version == manifest(&release.previous)?.core_version.to_string(),
             "running node does not match current package"
@@ -1279,19 +1283,15 @@ async fn healthy(data: &Path, package: &Path, device_id: &str) -> Result<()> {
                     )
                     .await
                     .and_then(|response| {
-                        ensure!(
-                            matches!(
-                                response.status,
-                                vibeface_control::maintenance::MaintenanceStatus::Healthy
-                            ),
-                            "node did not report healthy"
-                        );
-                        let health: MaintenanceHealth = serde_json::from_value(
+                        let vibeface_control::maintenance::MaintenanceResponse::Probed(health) =
                             response
-                                .health
-                                .context("maintenance response has no health")?,
-                        )
-                        .context("maintenance response has invalid health")?;
+                        else {
+                            bail!("node did not report healthy");
+                        };
+                        let health = MaintenanceHealth {
+                            device_id: health.device_id,
+                            version: health.version,
+                        };
                         Ok(health)
                     });
                     match health {
@@ -2107,7 +2107,7 @@ mod tests {
                 while stream.read_u8().await? != b'\n' {}
                 let response = serde_json::json!({
                     "protocol":maintenance::PROTOCOL,"status":"healthy",
-                    "health":{"device_id":"a".repeat(64),"version":"9.0.0"}
+                    "health":{"device_id":"a".repeat(64),"version":"9.0.0","web_enabled":false,"http_enabled":false}
                 });
                 stream.write_all(&serde_json::to_vec(&response)?).await?;
                 stream.write_all(b"\n").await?;

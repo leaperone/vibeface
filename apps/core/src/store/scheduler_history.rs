@@ -108,7 +108,7 @@ impl Store {
                         .and_then(|c| c.owner);
                     Some(
                         json!({"trigger":candidate.id,"owner":owner,"conversation_id":conversation,
-                        "state":"pending_delivery","message_id":candidate.id.strip_prefix("message:")}),
+                        "state":"pending_delivery","message_id":match crate::scheduling::Trigger::decode(&candidate.id) { Ok(crate::scheduling::Trigger::Message(id)) => Some(id), _ => None }}),
                     )
                 }
                 HistorySection::Jobs | HistorySection::ScopeJobs => self
@@ -358,7 +358,8 @@ impl Store {
         )? {
             return Ok(None);
         }
-        if let Some(work_id) = check.trigger.strip_prefix("task:")
+        if let Ok(crate::scheduling::Trigger::Task(work_id)) =
+            crate::scheduling::Trigger::decode(&check.trigger)
             && self.work(network, work_id)?.is_some_and(|work| {
                 work.conversation_id == conversation && work.state == WorkStatus::Unverified
             })

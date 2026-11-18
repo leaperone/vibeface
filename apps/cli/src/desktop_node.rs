@@ -1970,8 +1970,7 @@ printf '{"installed":true,"running":false,"automatic_update_scheduled":%s}\n' "$
             "mesh":{"enabled":true,"network":"vibeface","records":null,"neighbors":null},
             "peers":null, "core_version":env!("CARGO_PKG_VERSION"), "error":"stopped fixture"
         });
-        let response =
-            serde_json::to_string(&vibeface_control::ControlResponse::success(inspection))?;
+        let response = serde_json::json!({"ok":true, "result":inspection}).to_string();
         let core = bundled.join(crate::update::release::PROGRAMS[1]);
         fs::write(
             &core,

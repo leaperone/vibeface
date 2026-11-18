@@ -12,7 +12,10 @@ fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
     let mut value = serde_json::to_value(job)?;
     value["lane"] = json!(job.kind.lane());
     value["reply_message_id"] = json!(job.message_id);
-    value["message_id"] = json!(job.trigger.strip_prefix("message:"));
+    value["message_id"] = json!(match crate::scheduling::Trigger::decode(&job.trigger) {
+        Ok(crate::scheduling::Trigger::Message(id)) => Some(id),
+        _ => None,
+    });
     value["pending_check"] = json!(
         job.pending_check
             || checks
@@ -102,7 +105,7 @@ impl SchedulerProjection {
         Ok(
             json!({"conversation_id":job.conversation_id,"trigger":job.trigger,"kind":job.kind,
             "scope":job.scope,"state":job.state.name(),"lane":job.kind.lane(),"sequence":job.sequence,
-            "source_node":self.local.clone(),"owner":owner,"message_id":job.trigger.strip_prefix("message:"),
+            "source_node":self.local.clone(),"owner":owner,"message_id":match crate::scheduling::Trigger::decode(&job.trigger) { Ok(crate::scheduling::Trigger::Message(id)) => Some(id), _ => None },
             "reply_message_id":job.message_id,"hold_reason":self.hold_reason(store,network,job)?}),
         )
     }

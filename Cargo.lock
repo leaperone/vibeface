@@ -11850,9 +11850,9 @@ dependencies = [
  "tokio-tungstenite 0.28.0",
  "uuid",
  "vibeface-bridge",
+ "vibeface-native-transport",
  "vibeface-protocol",
  "vibeface-secure",
- "vibeface-secure-ffi",
  "zeroize",
 ]
 
@@ -11979,6 +11979,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeface-native-transport"
+version = "0.0.1"
+dependencies = [
+ "hex",
+ "iroh",
+ "libc",
+ "tokio",
+ "vibeface-protocol",
+ "vibeface-secure",
+]
+
+[[package]]
 name = "vibeface-protocol"
 version = "0.0.1"
 dependencies = [
@@ -12013,12 +12025,12 @@ name = "vibeface-secure-ffi"
 version = "0.0.1"
 dependencies = [
  "hex",
- "iroh",
- "libc",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "uniffi",
+ "vibeface-native-transport",
+ "vibeface-protocol",
  "vibeface-secure",
 ]
 

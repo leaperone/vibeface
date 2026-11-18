@@ -9,7 +9,7 @@ use super::{
 use crate::{
     model::*,
     net::{AddressRecord, SignedAddress},
-    scheduling::{AdmissionReceipt, TriggerKind},
+    scheduling::{AdmissionReceipt, Trigger, TriggerKind},
 };
 use anyhow::{Context as _, Result, ensure};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -261,7 +261,7 @@ impl Store {
         let conversation_owner = super::conversation_from(&tx, network, conversation)?
             .context("conversation not found")?
             .owner;
-        let assignment = if let Some(("assignment", assignment_id)) = trigger.split_once(':') {
+        let assignment = if let Ok(Trigger::Assignment(assignment_id)) = Trigger::decode(trigger) {
             let Some(assignment) =
                 super::workspace::workspace_assignment_from(&tx, network, assignment_id)?
             else {
@@ -276,7 +276,7 @@ impl Store {
         } else {
             None
         };
-        let typed_input = if let Some(("message", message_id)) = trigger.split_once(':') {
+        let typed_input = if let Ok(Trigger::Message(message_id)) = Trigger::decode(trigger) {
             if message_from(&tx, network, conversation, message_id)?.is_none() {
                 return Ok(None);
             }
@@ -284,7 +284,7 @@ impl Store {
         } else {
             None
         };
-        let held_input = if let Some(("message", message_id)) = trigger.split_once(':') {
+        let held_input = if let Ok(Trigger::Message(message_id)) = Trigger::decode(trigger) {
             super::admission::held_answer_subject_from(&tx, network, conversation, message_id)?
         } else {
             None
@@ -309,8 +309,8 @@ impl Store {
             owner.as_deref() == Some(local),
             AdmissionRejected::new("this Node does not schedule the conversation")
         );
-        let receipt = match trigger.split_once(':') {
-            Some(("assignment", _)) => {
+        let receipt = match Trigger::decode(trigger) {
+            Ok(Trigger::Assignment(_)) => {
                 let assignment = assignment.as_ref().expect("assignment trigger parsed");
                 ensure!(
                     super::workspace::assignment_admission_allowed_from(&tx, network, assignment)?,
@@ -318,7 +318,7 @@ impl Store {
                 );
                 super::scheduler::admit_assignment_from(&tx, network, local, assignment)?
             }
-            Some(("message", message_id)) => {
+            Ok(Trigger::Message(message_id)) => {
                 let Some(message) = message_from(&tx, network, conversation, message_id)? else {
                     return Ok(None);
                 };
@@ -360,7 +360,7 @@ impl Store {
                     )?
                 }
             }
-            Some(("work", work_id)) => {
+            Ok(Trigger::Work(work_id)) => {
                 let outcome = super::reduce::work_from(&tx, network, work_id)?
                     .filter(|work| work.conversation_id == conversation)
                     .and_then(|work| work.outcome);
@@ -376,7 +376,7 @@ impl Store {
                         state: "not_reported".into(),
                     })
             }
-            Some(("bot_message", message_id)) => {
+            Ok(Trigger::BotMessage(message_id)) => {
                 let Some(message) = message_from(&tx, network, conversation, message_id)? else {
                     return Ok(None);
                 };

@@ -44,6 +44,8 @@ mod schema_guard;
 #[cfg(test)]
 mod test_metrics;
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod tests;
 pub(crate) mod work;
 pub(crate) mod workspace;
@@ -517,17 +519,26 @@ impl Store {
                 }
             })
             .collect::<Result<_>>()?;
-        let trigger = if let Some(assignment_id) = job.trigger.strip_prefix("assignment:") {
-            self.workspace_assignment(network_id, assignment_id)?
-                .map(|assignment| {
-                    Ok::<HashedEvent, anyhow::Error>(HashedEvent {
-                        hash: assignment.event_hash.clone(),
-                        event: log::event_from(connection, network_id, &assignment.event_hash)?
-                            .context("assignment event missing")?,
-                    })
+        let trigger = if crate::scheduling::Trigger::tag_of(&job.trigger)
+            == Some(crate::scheduling::TriggerTag::Assignment)
+        {
+            match crate::scheduling::Trigger::decode(&job.trigger) {
+                Ok(crate::scheduling::Trigger::Assignment(assignment_id)) => {
+                    self.workspace_assignment(network_id, assignment_id)?
+                }
+                _ => None,
+            }
+            .map(|assignment| {
+                Ok::<HashedEvent, anyhow::Error>(HashedEvent {
+                    hash: assignment.event_hash.clone(),
+                    event: log::event_from(connection, network_id, &assignment.event_hash)?
+                        .context("assignment event missing")?,
                 })
-                .transpose()?
-        } else if let Some(message_id) = job.trigger.strip_prefix("message:") {
+            })
+            .transpose()?
+        } else if let Ok(crate::scheduling::Trigger::Message(message_id)) =
+            crate::scheduling::Trigger::decode(&job.trigger)
+        {
             message_from(connection, network_id, scope_id, message_id)?
                 .map(|message| {
                     Ok::<HashedEvent, anyhow::Error>(HashedEvent {
@@ -567,8 +578,15 @@ impl Store {
                 let task = self
                     .workspace_task(network_id, task_id)?
                     .context("task not found")?;
-                let assignment = if let Some(id) = job.trigger.strip_prefix("assignment:") {
-                    self.workspace_assignment(network_id, id)?
+                let assignment = if crate::scheduling::Trigger::tag_of(&job.trigger)
+                    == Some(crate::scheduling::TriggerTag::Assignment)
+                {
+                    match crate::scheduling::Trigger::decode(&job.trigger) {
+                        Ok(crate::scheduling::Trigger::Assignment(id)) => {
+                            self.workspace_assignment(network_id, id)?
+                        }
+                        _ => None,
+                    }
                 } else {
                     task.current_assignment
                         .as_ref()

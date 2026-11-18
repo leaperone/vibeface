@@ -1,4 +1,5 @@
 pub mod amount;
+pub mod client_frame;
 pub mod delivery;
 
 use serde::{Deserialize, Serialize};
