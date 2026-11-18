@@ -657,7 +657,7 @@ fn reported_from(
 }
 
 /// The works the `FROM … WHERE …` clause selects from `works w`, in dispatch order.
-fn works_query(
+pub(super) fn works_query(
     connection: &Connection,
     from: &str,
     params: impl rusqlite::Params,

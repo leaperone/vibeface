@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 use std::path::Path;
 use vibeface_bridge::failure::{ExecFailure, ProviderStage};
 
+pub(crate) mod overview;
+
 const JOB_COLUMNS: &str = "conversation_id,trigger,kind,sequence,basis,reply_to,message_id,state,attempt_id,attempt_boot,attempt_permission,detail,failure,runtime,tool_calls,scope";
 
 /// Kept only by the live consumer; a restarted process cannot refund an old attempt.
@@ -653,54 +655,9 @@ fn context_projection_from(
     )?;
     for row in rows {
         let (message_id, stored_state, detail, source) = row?;
-        let state: JobState = serde_json::from_str(&detail)?;
-        ensure!(
-            state.name() == stored_state,
-            "scheduler job steer state mismatch"
-        );
-        let (into, receipt, stage) = match &state {
-            JobState::Steering {
-                into,
-                receipt,
-                uncertain,
-                ..
-            } => (
-                into,
-                receipt,
-                if receipt.is_some() {
-                    "provider_accepted"
-                } else if *uncertain {
-                    "unknown"
-                } else {
-                    "submitting"
-                },
-            ),
-            JobState::Steered {
-                into,
-                receipt,
-                outcome,
-            } => (
-                into,
-                receipt,
-                if *outcome == SteerOutcome::Unknown
-                    || receipt
-                        .as_ref()
-                        .and_then(|receipt| receipt.actual_turn_id.as_ref())
-                        .is_none()
-                {
-                    "unknown"
-                } else {
-                    "associated"
-                },
-            ),
-            _ => continue,
-        };
-        let mut value = json!({"message_id":message_id,"source_event":source,"stage":stage,
-            "expected_turn_id":into.turn_id,"actual_turn_id":receipt.as_ref().and_then(|receipt| receipt.actual_turn_id.clone())});
-        if let Some(receipt) = receipt {
-            value["accepted_at_ms"] = json!(receipt.accepted_at_ms);
+        if let Some(value) = overview::context_input(message_id, stored_state, detail, source)? {
+            context.inputs.push(value);
         }
-        context.inputs.push(value);
     }
     context.inputs_omitted = total.saturating_sub(context.inputs.len());
     Ok(Some(context))
@@ -736,6 +693,7 @@ fn earlier_input_holds(
     local: &str,
     job: &SchedulerJob,
     fixed_assignment: Option<&crate::workspace::Assignment>,
+    overview: Option<&super::workspace::overview::OverviewFacts>,
 ) -> Result<bool> {
     let scope = job.scope.storage_key();
     let parameters = params![network, job.conversation_id, scope, job.sequence];
@@ -753,9 +711,12 @@ fn earlier_input_holds(
         let trigger: String = row.get(0)?;
         let earlier = load_job(connection, &job.conversation_id, &trigger)?
             .context("earlier scheduler input missing")?;
-        if super::workspace::workspace_assignment_for_job_from(
-            connection, network, local, &earlier,
-        )?
+        if match overview {
+            Some(facts) => facts.assignment_for_job(connection, network, local, &earlier)?,
+            None => super::workspace::workspace_assignment_for_job_from(
+                connection, network, local, &earlier,
+            )?,
+        }
         .as_ref()
         .map(|assignment| assignment.assignment_id.as_str())
             == fixed_assignment.map(|assignment| assignment.assignment_id.as_str())
@@ -775,24 +736,76 @@ fn job_hold_from(
     provider: Provider,
     limits: &crate::config::SchedulingLimits,
 ) -> Result<Option<QueueHoldReason>> {
+    job_hold_with(
+        JobHoldStorage {
+            connection,
+            blob_dir,
+            overview: None,
+        },
+        network,
+        local,
+        job,
+        provider,
+        limits,
+    )
+}
+
+struct JobHoldStorage<'a> {
+    connection: &'a Connection,
+    blob_dir: &'a Path,
+    overview: Option<&'a super::workspace::overview::OverviewFacts>,
+}
+
+fn job_hold_with(
+    storage: JobHoldStorage<'_>,
+    network: &str,
+    local: &str,
+    job: &SchedulerJob,
+    provider: Provider,
+    limits: &crate::config::SchedulingLimits,
+) -> Result<Option<QueueHoldReason>> {
+    let JobHoldStorage {
+        connection,
+        blob_dir,
+        overview,
+    } = storage;
     if !matches!(job.state, JobState::Queued) {
         return Ok(None);
     }
     let key = job.session_key();
-    let fixed_assignment =
-        super::workspace::workspace_assignment_for_job_from(connection, network, local, job)?;
-    if earlier_input_holds(connection, network, local, job, fixed_assignment.as_ref())? {
+    let fixed_assignment = match overview {
+        Some(facts) => facts.assignment_for_job(connection, network, local, job)?,
+        None => {
+            super::workspace::workspace_assignment_for_job_from(connection, network, local, job)?
+        }
+    };
+    if earlier_input_holds(
+        connection,
+        network,
+        local,
+        job,
+        fixed_assignment.as_ref(),
+        overview,
+    )? {
         return Ok(Some(QueueHoldReason::EarlierInput));
     }
     if let SessionScope::WorkspaceTask { task_id } = &job.scope {
-        if !super::workspace::task_execution_allowed_from(connection, network, task_id)? {
+        if !match overview {
+            Some(facts) => facts.task_execution_allowed(connection, network, task_id)?,
+            None => super::workspace::task_execution_allowed_from(connection, network, task_id)?,
+        } {
             return Ok(Some(QueueHoldReason::PendingCheck));
         }
         let Some(assignment) = fixed_assignment else {
             return Ok(Some(
-                if super::workspace::workspace_input_resources_blocked_from(
-                    connection, network, local, job,
-                )? {
+                if match overview {
+                    Some(facts) => {
+                        facts.input_resources_blocked(connection, network, local, job)?
+                    }
+                    None => super::workspace::workspace_input_resources_blocked_from(
+                        connection, network, local, job,
+                    )?,
+                } {
                     QueueHoldReason::ResourceConflict
                 } else {
                     QueueHoldReason::PendingCheck
@@ -806,14 +819,23 @@ fn job_hold_from(
         {
             return Ok(Some(QueueHoldReason::PendingCheck));
         }
-        if !super::workspace::assignment_resources_available_from(connection, network, &assignment)?
-        {
+        if !match overview {
+            Some(facts) => {
+                facts.assignment_resources_available(connection, network, &assignment)?
+            }
+            None => super::workspace::assignment_resources_available_from(
+                connection,
+                network,
+                &assignment,
+            )?,
+        } {
             return Ok(Some(QueueHoldReason::ResourceConflict));
         }
     }
-    if let Some(input) =
-        super::workspace::queued_workspace_input_from(connection, network, &job.reply_to)?
-    {
+    if let Some(input) = match overview {
+        Some(facts) => facts.queued_input(connection, network, &job.reply_to)?,
+        None => super::workspace::queued_workspace_input_from(connection, network, &job.reply_to)?,
+    } {
         if input.deferred || input.cancelled {
             return Ok(Some(QueueHoldReason::SteeringSettlement));
         }
@@ -833,11 +855,16 @@ fn job_hold_from(
             }
         }
         if let SessionScope::WorkspaceTask { .. } = &job.scope {
-            let resolved = super::workspace::resolve_input_target_from(
-                connection,
-                network,
-                &input.input.route.target,
-            )?;
+            let resolved = match overview {
+                Some(facts) => {
+                    facts.resolve_target(connection, network, &input.input.route.target)?
+                }
+                None => super::workspace::resolve_input_target_from(
+                    connection,
+                    network,
+                    &input.input.route.target,
+                )?,
+            };
             if let Some(id) = resolved.assignment_id
                 && let Some(assignment) =
                     super::workspace::workspace_assignment_from(connection, network, &id)?

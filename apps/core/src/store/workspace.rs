@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod history_pages;
+pub(crate) mod overview;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Graph {
@@ -2651,7 +2652,18 @@ pub(crate) fn resolve_input_target_from(
     network: &str,
     target: &InputTarget,
 ) -> Result<ResolvedInputTarget> {
-    let graph = Graph::read(connection, network)?;
+    resolve_input_target_with_graph(connection, network, target, || {
+        Graph::read(connection, network).map(std::borrow::Cow::Owned)
+    })
+}
+
+fn resolve_input_target_with_graph<'a>(
+    connection: &Connection,
+    network: &str,
+    target: &InputTarget,
+    graph: impl FnOnce() -> Result<std::borrow::Cow<'a, Graph>>,
+) -> Result<ResolvedInputTarget> {
+    let graph = graph()?;
     let resolved = resolve_with_graph(connection, network, target, &graph)?;
     ensure!(
         !super::bots::bot_deleted_from(connection, network, &resolved.conversation_id)?,
@@ -2818,7 +2830,7 @@ fn resource_conflicts_from(
             conflicts.insert(assignment.assignment_id.clone());
         }
     }
-    for work in super::reduce::open_works_from(connection, network, None)? {
+    for work in overview::resource_work_candidates(connection, network, node, roots)? {
         let accepted_without_reservation: bool = if work.state == WorkStatus::Accepted
             && matches!(work.kind, WorkKind::Agent(_))
             && work.thread_id.is_none()
@@ -3869,7 +3881,18 @@ pub(crate) fn queued_workspace_input_from(
     network: &str,
     message_id: &str,
 ) -> Result<Option<QueuedInput>> {
-    let graph = Graph::read(connection, network)?;
+    queued_workspace_input_with_graph(connection, network, message_id, || {
+        Graph::read(connection, network).map(std::borrow::Cow::Owned)
+    })
+}
+
+fn queued_workspace_input_with_graph<'a>(
+    connection: &Connection,
+    network: &str,
+    message_id: &str,
+    graph: impl FnOnce() -> Result<std::borrow::Cow<'a, Graph>>,
+) -> Result<Option<QueuedInput>> {
+    let graph = graph()?;
     let Some(index) = graph.queue_order.iter().position(|id| id == message_id) else {
         return Ok(None);
     };
@@ -4635,7 +4658,18 @@ pub(crate) fn task_execution_allowed_from(
     network: &str,
     task_id: &str,
 ) -> Result<bool> {
-    let graph = Graph::read(connection, network)?;
+    task_execution_allowed_with_graph(connection, network, task_id, || {
+        Graph::read(connection, network).map(std::borrow::Cow::Owned)
+    })
+}
+
+fn task_execution_allowed_with_graph<'a>(
+    connection: &Connection,
+    network: &str,
+    task_id: &str,
+    graph: impl FnOnce() -> Result<std::borrow::Cow<'a, Graph>>,
+) -> Result<bool> {
+    let graph = graph()?;
     let task = graph.tasks.get(task_id).context("task not found")?;
     if task.action != TaskAction::Continue
         || task.dependencies.iter().any(|id| {
@@ -5470,6 +5504,16 @@ fn assignment_for_input_from(
     input: &WorkspaceInput,
     graph: &Graph,
 ) -> Result<Option<Assignment>> {
+    assignment_for_input_with_history(connection, network, input, graph, false)
+}
+
+fn assignment_for_input_with_history(
+    connection: &Connection,
+    network: &str,
+    input: &WorkspaceInput,
+    graph: &Graph,
+    bounded_history: bool,
+) -> Result<Option<Assignment>> {
     let Some(task_id) = target_task(&input.input.route.target) else {
         return Ok(None);
     };
@@ -5510,7 +5554,11 @@ fn assignment_for_input_from(
     let source = log::event_from(connection, network, &input.source_event)?
         .context("task input source is missing")?;
     let known = log::CausalClock::before(connection, network, &source)?;
-    let at_input = graph_at(connection, network, Some(&known))?;
+    let at_input = if bounded_history {
+        overview::graph_at_task(connection, network, &known, task_id)?
+    } else {
+        graph_at(connection, network, Some(&known))?
+    };
     if let Some(task) = at_input.tasks.get(task_id) {
         if input.input.route.expected_revision != Some(task.revision) {
             return Ok(None);
@@ -5734,6 +5782,18 @@ pub(crate) fn workspace_input_resources_blocked_from(
     local: &str,
     job: &crate::scheduling::SchedulerJob,
 ) -> Result<bool> {
+    workspace_input_resources_blocked_with_graph(connection, network, local, job, || {
+        Graph::read(connection, network).map(std::borrow::Cow::Owned)
+    })
+}
+
+fn workspace_input_resources_blocked_with_graph<'a>(
+    connection: &Connection,
+    network: &str,
+    local: &str,
+    job: &crate::scheduling::SchedulerJob,
+    graph: impl FnOnce() -> Result<std::borrow::Cow<'a, Graph>>,
+) -> Result<bool> {
     let Some(input) = workspace_input_from(connection, network, &job.reply_to)? else {
         return Ok(false);
     };
@@ -5749,7 +5809,7 @@ pub(crate) fn workspace_input_resources_blocked_from(
     else {
         return Ok(false);
     };
-    let graph = Graph::read(connection, network)?;
+    let graph = graph()?;
     let resolved = resolve_with_graph(connection, network, &input.input.route.target, &graph)?;
     if input.conversation_id != job.conversation_id
         || resolved.task_revision != Some(revision)
@@ -5778,6 +5838,24 @@ pub(crate) fn workspace_assignment_for_job_from(
     network: &str,
     local: &str,
     job: &crate::scheduling::SchedulerJob,
+) -> Result<Option<Assignment>> {
+    workspace_assignment_for_job_with_graph(
+        connection,
+        network,
+        local,
+        job,
+        || Graph::read(connection, network).map(std::borrow::Cow::Owned),
+        false,
+    )
+}
+
+fn workspace_assignment_for_job_with_graph<'a>(
+    connection: &Connection,
+    network: &str,
+    local: &str,
+    job: &crate::scheduling::SchedulerJob,
+    graph: impl FnOnce() -> Result<std::borrow::Cow<'a, Graph>>,
+    bounded_history: bool,
 ) -> Result<Option<Assignment>> {
     let SessionScope::WorkspaceTask { task_id } = job.session_scope() else {
         return Ok(None);
@@ -5824,9 +5902,16 @@ pub(crate) fn workspace_assignment_for_job_from(
         origin.trigger = trigger;
         origin.reply_to = reply_to;
         origin.kind = kind;
-        return workspace_assignment_for_job_from(connection, network, local, &origin);
+        return workspace_assignment_for_job_with_graph(
+            connection,
+            network,
+            local,
+            &origin,
+            graph,
+            bounded_history,
+        );
     }
-    let graph = Graph::read(connection, network)?;
+    let graph = graph()?;
     if let Some(id) = job.trigger.strip_prefix("assignment:") {
         let Some(assignment) = graph.assignments.get(id) else {
             return Ok(None);
@@ -5879,7 +5964,11 @@ pub(crate) fn workspace_assignment_for_job_from(
             return Ok(None);
         }
         let known = log::CausalClock::before(connection, network, &asked.event)?;
-        let at_question = graph_at(connection, network, Some(&known))?;
+        let at_question = if bounded_history {
+            overview::graph_at_task(connection, network, &known, &task_id)?
+        } else {
+            graph_at(connection, network, Some(&known))?
+        };
         let Some(task) = at_question.tasks.get(&task_id) else {
             return Ok(None);
         };
@@ -5938,7 +6027,8 @@ pub(crate) fn workspace_assignment_for_job_from(
     if job.basis.get(&source.author).copied().unwrap_or(0) < source.seq {
         return Ok(None);
     }
-    let assignment = assignment_for_input_from(connection, network, &input, &graph)?;
+    let assignment =
+        assignment_for_input_with_history(connection, network, &input, &graph, bounded_history)?;
     Ok(assignment.filter(|assignment| {
         assignment.execution_node == local
             && bot_scope(connection, network, &assignment.bot_id)
@@ -5951,7 +6041,18 @@ pub(crate) fn assignment_resources_available_from(
     network: &str,
     assignment: &Assignment,
 ) -> Result<bool> {
-    let graph = Graph::read(connection, network)?;
+    assignment_resources_available_with_graph(connection, network, assignment, || {
+        Graph::read(connection, network).map(std::borrow::Cow::Owned)
+    })
+}
+
+fn assignment_resources_available_with_graph<'a>(
+    connection: &Connection,
+    network: &str,
+    assignment: &Assignment,
+    graph: impl FnOnce() -> Result<std::borrow::Cow<'a, Graph>>,
+) -> Result<bool> {
+    let graph = graph()?;
     let Some(stored) = graph.assignments.get(&assignment.assignment_id) else {
         return Ok(false);
     };

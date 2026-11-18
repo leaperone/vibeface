@@ -43,6 +43,29 @@ impl SchedulerProjection {
         network: &str,
         job: &SchedulerJob,
     ) -> Result<Option<crate::scheduling::QueueHoldReason>> {
+        self.hold_reason_with(
+            job,
+            |work_id| {
+                Ok(store
+                    .work(network, work_id)?
+                    .map(|work| work.resolved.provider))
+            },
+            |provider, local, limits| {
+                store.scheduler_job_hold(network, local, job, provider, limits)
+            },
+        )
+    }
+
+    pub(super) fn hold_reason_with(
+        &self,
+        job: &SchedulerJob,
+        task_provider: impl FnOnce(&str) -> Result<Option<Provider>>,
+        hold: impl FnOnce(
+            Provider,
+            &str,
+            &crate::config::SchedulingLimits,
+        ) -> Result<Option<crate::scheduling::QueueHoldReason>>,
+    ) -> Result<Option<crate::scheduling::QueueHoldReason>> {
         if job.state != JobState::Queued {
             return Ok(None);
         }
@@ -52,16 +75,14 @@ impl SchedulerProjection {
         if provider.is_none()
             && let crate::scheduling::SessionScope::Task { work_id } = &job.scope
         {
-            provider = store
-                .work(network, work_id)?
-                .map(|work| work.resolved.provider);
+            provider = task_provider(work_id)?;
         }
         let Some(provider) = provider else {
             return Ok(Some(
                 crate::scheduling::QueueHoldReason::BackendConfigPending,
             ));
         };
-        let hold = store.scheduler_job_hold(network, &self.local, job, provider, &self.limits)?;
+        let hold = hold(provider, &self.local, &self.limits)?;
         Ok(hold.or_else(|| {
             self.pending
                 .contains(&provider)
