@@ -21,8 +21,8 @@ pub use crypto::{
 };
 pub use session::{
     EncryptedSessionObject, MAX_SESSION_CHUNK_BYTES, MAX_SESSION_ID_BYTES,
-    MAX_SESSION_OBJECT_BYTES, SESSION_OBJECT_VERSION, SessionObjectChunk, SessionObjectHeader,
-    SessionObjectKind,
+    MAX_SESSION_OBJECT_BYTES, SESSION_AEAD_TAG_BYTES, SESSION_OBJECT_VERSION, SessionObjectChunk,
+    SessionObjectHeader, SessionObjectKind, decrypt_session_payload, encrypt_session_payload,
 };
 pub use statement::{ProofProfile, Statement, hash, schema_hash, signing_message};
 

@@ -1,5 +1,9 @@
 use alloc::{string::String, vec::Vec};
 
+use chacha20poly1305::{
+    ChaCha20Poly1305, Nonce,
+    aead::{Aead, KeyInit, Payload},
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result, Word, hash};
@@ -33,6 +37,67 @@ pub const SESSION_OBJECT_VERSION: u8 = 1;
 pub const MAX_SESSION_ID_BYTES: usize = 256;
 pub const MAX_SESSION_OBJECT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_SESSION_CHUNK_BYTES: usize = 64 * 1024;
+pub const SESSION_AEAD_TAG_BYTES: usize = 16;
+
+/// Encrypts one opaque session payload with ChaCha20-Poly1305.
+///
+/// The caller owns nonce uniqueness. This helper rejects an all-zero key or nonce as an
+/// accidental empty value, but it does not generate, persist, or negotiate either value.
+pub fn encrypt_session_payload(
+    key: &Word,
+    nonce: [u8; 12],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
+    validate_aead_inputs(key, &nonce, plaintext.len())?;
+    let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| Error("session AEAD key"))?;
+    cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|_| Error("session AEAD encryption"))
+}
+
+/// Decrypts one opaque session payload. The caller must supply the same AAD and a unique nonce
+/// that belongs to this object; this function does not perform key exchange or nonce allocation.
+pub fn decrypt_session_payload(
+    key: &Word,
+    nonce: [u8; 12],
+    aad: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>> {
+    if ciphertext.len() < SESSION_AEAD_TAG_BYTES {
+        return Err(Error("session AEAD ciphertext too short"));
+    }
+    validate_aead_inputs(key, &nonce, ciphertext.len() - SESSION_AEAD_TAG_BYTES)?;
+    let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| Error("session AEAD key"))?;
+    cipher
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|_| Error("session AEAD authentication"))
+}
+
+fn validate_aead_inputs(key: &Word, nonce: &[u8; 12], payload_bytes: usize) -> Result<()> {
+    if key.iter().all(|byte| *byte == 0) {
+        return Err(Error("session AEAD key is empty"));
+    }
+    if nonce.iter().all(|byte| *byte == 0) {
+        return Err(Error("session AEAD nonce is empty"));
+    }
+    if payload_bytes == 0 || payload_bytes > MAX_SESSION_OBJECT_BYTES {
+        return Err(Error("session AEAD payload size"));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -400,5 +465,43 @@ mod tests {
         let mut next = object(SessionObjectKind::Message).header;
         next.sequence = 1;
         assert!(next.canonical_bytes().is_err());
+    }
+
+    #[test]
+    fn session_payload_aead_round_trip_binds_aad() {
+        let key = [7; 32];
+        let nonce = [9; 12];
+        let aad = b"object-header";
+        let plaintext = b"opaque message and settings payload";
+        let ciphertext = encrypt_session_payload(&key, nonce, aad, plaintext).unwrap();
+        assert_eq!(ciphertext.len(), plaintext.len() + SESSION_AEAD_TAG_BYTES);
+        assert_eq!(
+            decrypt_session_payload(&key, nonce, aad, &ciphertext).unwrap(),
+            plaintext
+        );
+    }
+
+    #[test]
+    fn session_payload_aead_rejects_wrong_key_aad_nonce_and_empty_values() {
+        let key = [7; 32];
+        let nonce = [9; 12];
+        let ciphertext = encrypt_session_payload(&key, nonce, b"aad", b"payload").unwrap();
+        assert!(decrypt_session_payload(&[8; 32], nonce, b"aad", &ciphertext).is_err());
+        assert!(decrypt_session_payload(&key, nonce, b"other", &ciphertext).is_err());
+        assert!(decrypt_session_payload(&key, [10; 12], b"aad", &ciphertext).is_err());
+        assert!(encrypt_session_payload(&[0; 32], nonce, b"aad", b"payload").is_err());
+        assert!(encrypt_session_payload(&key, [0; 12], b"aad", b"payload").is_err());
+        assert!(encrypt_session_payload(&key, nonce, b"aad", b"").is_err());
+    }
+
+    #[test]
+    fn session_payload_aead_rejects_oversized_input_and_short_ciphertext() {
+        let key = [7; 32];
+        let nonce = [9; 12];
+        let oversized = alloc::vec![0u8; MAX_SESSION_OBJECT_BYTES + 1];
+        assert!(encrypt_session_payload(&key, nonce, b"aad", &oversized).is_err());
+        assert!(
+            decrypt_session_payload(&key, nonce, b"aad", &[0; SESSION_AEAD_TAG_BYTES - 1]).is_err()
+        );
     }
 }
