@@ -53,6 +53,8 @@ pub struct LocalNode {
     pub web_enabled: Option<bool>,
     #[serde(default)]
     pub core_version: Option<String>,
+    #[serde(default)]
+    pub user_service_cli: Option<PathBuf>,
 }
 impl LocalNode {
     pub fn identity(&self) -> NodeIdentity {
@@ -70,6 +72,13 @@ impl LocalNode {
     }
     fn validate(&self) -> Result<()> {
         self.identity().validate()?;
+        if let Some(cli) = &self.user_service_cli {
+            safe_path(cli)?;
+            ensure!(
+                self.sources.contains(&NodeSource::UserService),
+                "用户服务缺少注册来源。"
+            );
+        }
         ensure!(
             !self.sources.is_empty() && self.sources.len() <= 5,
             "节点发现来源无效。"
@@ -108,6 +117,8 @@ impl LocalNode {
 pub struct Discovery {
     pub nodes: Vec<LocalNode>,
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub user_service_registered: bool,
 }
 impl Discovery {
     pub(crate) fn validate(&self) -> Result<()> {
@@ -133,6 +144,15 @@ impl Discovery {
         Ok(())
     }
 }
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryState {
+    #[default]
+    Scanning,
+    Ready,
+    Unavailable,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RuntimeState {

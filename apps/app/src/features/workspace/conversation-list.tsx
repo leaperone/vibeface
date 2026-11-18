@@ -6,10 +6,8 @@ import { AiOffHint } from "@/features/devices/ai-off-hint"
 import { SecondDeviceHint } from "@/features/devices/second-device"
 import { cn } from "@/lib/utils"
 import { Link } from "@tanstack/react-router"
-import { unreadCounts } from "@vibeface/client/chat/timeline.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
-import { byRecent,listTime } from "@vibeface/client/workspace/home.ts"
-import { awaitsAnswer } from "@vibeface/client/workspace/questions.ts"
+import { byRecent,listTime,mainConversationAttention } from "@vibeface/client/workspace/home.ts"
 import { Button } from "@vibeface/uiarc/button/button.tsx"
 import { Bot,MessagesSquare,Plus,WifiOff } from "lucide-react"
 import type { ReactNode } from "react"
@@ -19,15 +17,16 @@ import { ConnectionCapsule,MoodTag,useCreateBot } from "./workspace-shell"
 export function ConversationList() {
   const workspace = useWorkspace()
   const create = useCreateBot()
-  const notifications = workspace.notifications.filter((item) => { const target = item.target; return target?.kind === 'bot_main' && workspace.bots.some((bot) => bot.bot_id === target.bot_id && bot.conversation_id === item.conversation_id) && !workspace.ignoredNotifications.has(item.notification_id) })
-  const unread = unreadCounts(notifications, workspace.questions.filter((item) => item.target?.kind === 'bot_main' && workspace.bots.some((bot) => item.target?.kind === 'bot_main' && bot.bot_id === item.target.bot_id && bot.conversation_id === item.conversation_id) && awaitsAnswer(item, workspace.answered)))
+  const { latestNotification, unread } = mainConversationAttention({
+    bots: workspace.bots, notifications: workspace.notifications, questions: workspace.questions,
+    ignoredNotifications: workspace.ignoredNotifications, answered: workspace.answered, includeSessionNotifications: true,
+  })
   const now = Date.now()
   const bots = byRecent(workspace.bots)
   let list: ReactNode
   if (bots.length) list = <ul className="grid gap-0.5">{bots.map((bot) => {
-    const notes = notifications.filter((item) => item.conversation_id === bot.conversation_id)
     const last = bot.last_message, mood = botMood(bot, workspace)
-    const preview = notes.at(-1)?.text.trim() || (last ? `${last.role === "user" ? "你：" : ""}${last.text}` : "还没有消息")
+    const preview = latestNotification.get(bot.conversation_id)?.text.trim() || (last ? `${last.role === "user" ? "你：" : ""}${last.text}` : "还没有消息")
     return <li key={bot.bot_id}>
       <Row botId={bot.bot_id} avatar={<BotFace bot={bot} mood={mood} size={44} />} unread={unread[bot.conversation_id] ?? 0} time={last ? listTime(last.created_at_ms, now) : undefined} preview={preview}
         name={bot.name} mark={<>{workspace.primary === bot.conversation_id ? <PrimaryMark /> : null}<MoodTag mood={mood} /></>} />

@@ -49,50 +49,96 @@ pub(crate) async fn invoke(
     action: BackgroundAction,
     expected: Option<&str>,
 ) -> Result<ManagedNodeStatus> {
+    let expected = match action {
+        BackgroundAction::Status => None,
+        _ => Some(expected.context("更改后台节点需要已验证身份。")?),
+    };
+    let command = managed_command(cli, profile, action.argument(), expected)?;
+    let timeout = Duration::from_secs(if action == BackgroundAction::Update {
+        120
+    } else {
+        30
+    });
+    let output = run(command, timeout, "无法运行随包 CLI。").await?;
+    let status: ManagedNodeStatus =
+        serde_json::from_slice(&output).context("后台节点返回无效结果。")?;
+    status.validate()?;
+    Ok(status)
+}
+
+fn managed_command(
+    cli: &Path,
+    profile: &Path,
+    operation: &str,
+    expected: Option<&str>,
+) -> Result<Command> {
     let mut command = Command::new(cli);
     command
         .arg("desktop-node")
         .arg("--profile-dir")
         .arg(profile);
-    if action != BackgroundAction::Status {
-        let id = expected
-            .context("更改后台节点需要已验证身份。")
-            .and_then(|id| {
-                device_id(id)?;
-                Ok(id)
-            })?;
+    if let Some(id) = expected {
+        device_id(id)?;
         command.arg("--expected-device-id").arg(id);
     }
+    command.arg(operation);
+    Ok(command)
+}
+
+pub(crate) async fn ensure_updater(cli: &Path, profile: &Path) -> Result<()> {
+    let managed = invoke(cli, profile, BackgroundAction::Status, None).await?;
+    let Some(identity) = managed.identity() else {
+        return Ok(());
+    };
+    if !matches!(
+        managed.state,
+        ServiceState::Installed | ServiceState::InstalledStopped
+    ) || managed.runtime_update.recovery_required
+    {
+        return Ok(());
+    }
+    let command = managed_command(cli, profile, "ensure-updater", Some(&identity.device_id))?;
+    run(
+        command,
+        Duration::from_secs(30),
+        "无法核对后台 Node 的自动更新。",
+    )
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn start_registered(cli: &Path, data_dir: &Path) -> Result<()> {
+    let mut command = Command::new(cli);
     command
-        .arg(action.argument())
+        .args(["service", "--data-dir"])
+        .arg(data_dir)
+        .arg("start");
+    run(command, Duration::from_secs(30), "无法运行已注册的 CLI。").await?;
+    Ok(())
+}
+
+async fn run(mut command: Command, timeout: Duration, spawn_error: &str) -> Result<Vec<u8>> {
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(windows)]
     command.creation_flags(0x08000000);
-    let mut child = command.spawn().context("无法运行随包 CLI。")?;
+    let mut child = command.spawn().with_context(|| spawn_error.to_owned())?;
     let stdout = child.stdout.take().context("CLI 输出管道缺失。")?;
     let stderr = child.stderr.take().context("CLI 错误管道缺失。")?;
-    let timeout = Duration::from_secs(if action == BackgroundAction::Update {
-        120
-    } else {
-        30
-    });
     let result = tokio::time::timeout(timeout, async {
         let (output, _, status) =
             tokio::try_join!(read_bounded(stdout), read_bounded(stderr), async {
                 Ok::<_, anyhow::Error>(child.wait().await?)
             })?;
         ensure!(status.success(), "后台节点操作未成功，请刷新状态核对。");
-        let status: ManagedNodeStatus =
-            serde_json::from_slice(&output).context("后台节点返回无效结果。")?;
-        status.validate()?;
-        Ok::<_, anyhow::Error>(status)
+        Ok::<_, anyhow::Error>(output)
     })
     .await;
     match result {
-        Ok(Ok(status)) => Ok(status),
+        Ok(Ok(output)) => Ok(output),
         failure => {
             let _ = child.start_kill();
             let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
@@ -154,6 +200,7 @@ mod contract_tests {
             let root =
                 std::env::temp_dir().join(format!("vf-managed-contract-{}", uuid::Uuid::new_v4()));
             fs::create_dir(&root)?;
+            let root = fs::canonicalize(root)?;
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
             let cli = root.join("cli");
             fs::write(
@@ -180,7 +227,9 @@ exit "$(cat "$fixture_dir/exit-code")"
             fs::write(self.root.join("exit-code"), code.to_string())?;
             let result = invoke(&self.cli, &self.root, BackgroundAction::Status, None).await;
             assert_eq!(
-                fs::read_to_string(self.root.join("calls"))?,
+                fs::read_to_string(self.root.join("calls")).with_context(|| format!(
+                    "fixture CLI did not record its arguments: {result:?}"
+                ))?,
                 format!(
                     "desktop-node\n--profile-dir\n{}\nstatus\n",
                     self.root.display()
@@ -193,6 +242,23 @@ exit "$(cat "$fixture_dir/exit-code")"
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[tokio::test]
+    async fn registered_start_runs_only_the_given_installation_and_data_directory() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let cli = fixture.root.join("registered-vibeface");
+        fs::write(&cli, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$3/observed\"\n")?;
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700))?;
+        let data_dir = fixture.root.join("Node 数据");
+        fs::create_dir(&data_dir)?;
+        start_registered(&cli, &data_dir).await?;
+        assert_eq!(
+            fs::read_to_string(data_dir.join("observed"))?,
+            format!("service\n--data-dir\n{}\nstart\n", data_dir.display())
+        );
+        assert!(!fixture.root.join("calls").exists());
+        Ok(())
     }
 
     #[tokio::test]

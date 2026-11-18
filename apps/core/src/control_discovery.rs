@@ -4,7 +4,7 @@
 //! for the fixed Core executable. It never creates a directory or starts, stops, or changes a Node.
 
 use anyhow::{Context, Result, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -47,6 +47,8 @@ struct NodeSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     unavailable_reason: Option<UnavailableReason>,
     sources: Vec<Source>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_service_cli: Option<PathBuf>,
 }
 
 /// Response schema: `{ "nodes": [{status, device_id, data_dir, local_listen, listen,
@@ -81,15 +83,19 @@ pub async fn discover(app_profile_dir: &Path, remembered: &[PathBuf]) -> Result<
     } else {
         warnings.push("current_user_home_unavailable");
     }
-    match user_service_data_dir() {
-        Ok(Some(path)) => {
-            if !add_candidate(&mut paths, &path, Source::UserService)? {
+    let user_service = match user_service_registration() {
+        Ok(Some(service)) => {
+            if !add_candidate(&mut paths, &service.data_dir, Source::UserService)? {
                 warnings.push("candidate_limit_reached");
             }
+            Some(service)
         }
-        Ok(None) => {}
-        Err(()) => warnings.push("user_service_metadata_unavailable"),
-    }
+        Ok(None) => None,
+        Err(()) => {
+            warnings.push("user_service_metadata_unavailable");
+            None
+        }
+    };
     match vibeface_bridge::platform::discovery::running_core_data_dirs() {
         Ok(found) => {
             for path in found {
@@ -102,12 +108,13 @@ pub async fn discover(app_profile_dir: &Path, remembered: &[PathBuf]) -> Result<
         Err(_) => warnings.push("running_process_metadata_unavailable"),
     }
     ensure!(paths.len() <= MAX_PATHS, "too many local Node candidates");
-    inspect_candidates(paths, warnings).await
+    inspect_candidates(paths, warnings, user_service).await
 }
 
 async fn inspect_candidates(
     paths: BTreeMap<PathBuf, Vec<Source>>,
     mut warnings: Vec<&'static str>,
+    user_service: Option<UserService>,
 ) -> Result<Value> {
     let mut nodes = Vec::new();
     for (path, sources) in paths {
@@ -128,7 +135,14 @@ async fn inspect_candidates(
         }
         match super::control::inspect(&path).await {
             Ok(info) => match summarize(sources, &info) {
-                Ok(node) => nodes.push(node),
+                Ok(mut node) => {
+                    if node.sources.contains(&Source::UserService) {
+                        node.user_service_cli = user_service
+                            .as_ref()
+                            .and_then(|service| registered_cli(service, &node.data_dir).ok());
+                    }
+                    nodes.push(node);
+                }
                 Err(code) => warnings.push(code),
             },
             Err(_) => warnings.push("candidate_unavailable_or_identity_mismatch"),
@@ -136,7 +150,9 @@ async fn inspect_candidates(
     }
     warnings.sort_unstable();
     warnings.dedup();
-    Ok(json!({"nodes": nodes, "warnings": warnings}))
+    Ok(
+        json!({"nodes": nodes, "warnings": warnings, "user_service_registered": user_service.is_some()}),
+    )
 }
 
 fn summarize(
@@ -172,196 +188,281 @@ fn summarize(
         core_version,
         unavailable_reason,
         sources,
+        user_service_cli: None,
     })
 }
 
-#[cfg(target_os = "macos")]
-fn user_service_data_dir() -> std::result::Result<Option<PathBuf>, ()> {
-    use plist::Value;
-    let home = current_home().ok_or(())?;
-    let plist = home.join("Library/LaunchAgents/com.leaperone.vibeface.node.plist");
-    let metadata = match fs::symlink_metadata(&plist) {
+#[derive(Debug, PartialEq, Eq)]
+struct UserService {
+    cli: PathBuf,
+    data_dir: PathBuf,
+}
+
+const CLI_BINARY: &str = if cfg!(windows) {
+    "vibeface.exe"
+} else {
+    "vibeface"
+};
+const CORE_BINARY: &str = if cfg!(windows) {
+    "vibeface-core.exe"
+} else {
+    "vibeface-core"
+};
+const SERVICE_SCRIPT: &str = if cfg!(windows) {
+    "scripts/install-node-service.ps1"
+} else {
+    "scripts/install-node-service.sh"
+};
+
+fn parse_service_args(args: &[impl AsRef<std::ffi::OsStr>]) -> Option<UserService> {
+    let [cli, verb, flag, data_dir] = args else {
+        return None;
+    };
+    let cli = PathBuf::from(cli.as_ref());
+    let data_dir = PathBuf::from(data_dir.as_ref());
+    (verb.as_ref() == "serve"
+        && flag.as_ref() == "--data-dir"
+        && cli.is_absolute()
+        && cli.file_name()?.to_str()?.eq_ignore_ascii_case(CLI_BINARY)
+        && data_dir.is_absolute())
+    .then_some(UserService { cli, data_dir })
+}
+
+fn registered_cli(service: &UserService, inspected_dir: &Path) -> Result<PathBuf> {
+    use vibeface_bridge::platform::privatefs;
+
+    ensure!(fs::canonicalize(&service.data_dir)? == inspected_dir);
+    ensure!(privatefs::is_plain_file(&fs::symlink_metadata(
+        &service.cli
+    )?));
+    let canonical_binary = fs::canonicalize(&service.cli)?;
+    let package = canonical_binary
+        .parent()
+        .context("CLI package directory is missing")?;
+    let file = |relative: &str| -> Result<PathBuf> {
+        let path = package.join(relative);
+        let metadata = fs::symlink_metadata(&path)?;
+        ensure!(privatefs::is_plain_file(&metadata));
+        check_install_path(&path, package)?;
+        Ok(path)
+    };
+    ensure!(privatefs::is_executable(&file(CLI_BINARY)?));
+    ensure!(privatefs::is_executable(&file(CORE_BINARY)?));
+    file(SERVICE_SCRIPT)?;
+    let metadata: PackageBuild = read_metadata(&file("BUILD-INFO.json")?)?;
+
+    let install_root = if let Some(vendor) = package
+        .parent()
+        .filter(|p| p.file_name().is_some_and(|name| name == "vendor"))
+    {
+        let root = vendor
+            .parent()
+            .context("npm package directory is missing")?;
+        check_install_path(&root.join("package.json"), root)?;
+        check_install_path(&root.join("bin/vibeface.mjs"), root)?;
+        let npm: NpmPackage = read_metadata(&root.join("package.json"))?;
+        ensure!(npm.name == "@leaperone/vibeface" && npm.version == metadata.version);
+        ensure!(root.join("bin/vibeface.mjs").is_file());
+        ensure!(
+            fs::canonicalize(service.cli.parent().context("CLI directory is missing")?)? == package
+        );
+        root.to_owned()
+    } else {
+        let policy: InstallPolicy = serde_json::from_slice(&privatefs::read_private_bounded(
+            &inspected_dir.join("update.json"),
+            64 * 1024,
+            "Node update policy",
+        )?)?;
+        ensure!(policy.install_root.is_absolute());
+        let root = fs::canonicalize(policy.install_root)?;
+        ensure!(package.starts_with(&root) && package != root);
+        ensure!(fs::canonicalize(root.join("current").join(CLI_BINARY))? == canonical_binary);
+        check_install_path(&root.join("current"), &root)?;
+        check_install_path(&canonical_binary, &root)?;
+        root
+    };
+    check_install_path(&service.cli, &install_root)?;
+    Ok(service.cli.clone())
+}
+
+fn check_install_path(path: &Path, full_protection_from: &Path) -> Result<()> {
+    for entry in path.ancestors() {
+        let ancestor = entry != path && !entry.starts_with(full_protection_from);
+        ensure!(
+            vibeface_bridge::platform::privatefs::is_trusted_install_path(entry, ancestor)?,
+            "registered CLI package is writable by another account"
+        );
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct PackageBuild {
+    version: String,
+}
+
+#[derive(Deserialize)]
+struct NpmPackage {
+    name: String,
+    version: String,
+}
+
+#[derive(Deserialize)]
+struct InstallPolicy {
+    install_root: PathBuf,
+}
+
+fn read_metadata<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    use std::io::Read;
+    ensure!(vibeface_bridge::platform::privatefs::is_plain_file(
+        &fs::symlink_metadata(path)?
+    ));
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(64 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= 64 * 1024);
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[cfg(unix)]
+fn user_service_file(path: &Path, home: &Path) -> std::result::Result<bool, ()> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(_) => return Err(()),
     };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
+    if !vibeface_bridge::platform::privatefs::is_plain_file(&metadata)
+        || metadata.permissions().mode() & 0o022 != 0
         || metadata.len() > 64 * 1024
-        || !vibeface_bridge::platform::privatefs::same_owner(&plist, &home).map_err(|_| ())?
+        || !vibeface_bridge::platform::privatefs::same_owner(path, home).map_err(|_| ())?
     {
         return Err(());
     }
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn user_service_registration() -> std::result::Result<Option<UserService>, ()> {
+    use plist::Value;
+    let home = current_home().ok_or(())?;
+    let plist = home.join("Library/LaunchAgents/com.leaperone.vibeface.node.plist");
+    if !user_service_file(&plist, &home)? {
+        return Ok(None);
+    }
     let value = Value::from_file(plist).map_err(|_| ())?;
-    let args = value
-        .as_dictionary()
-        .and_then(|d| d.get("ProgramArguments"))
+    let service = value.as_dictionary().ok_or(())?;
+    if service.get("Label").and_then(Value::as_string) != Some("com.leaperone.vibeface.node")
+        || service.contains_key("Program")
+    {
+        return Err(());
+    }
+    let args = service
+        .get("ProgramArguments")
         .and_then(Value::as_array)
         .ok_or(())?;
     let args = args
         .iter()
-        .map(|v| v.as_string().map(str::to_owned).ok_or(()))
+        .map(|value| value.as_string().ok_or(()))
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    if !known_server_args(&args) {
-        return Err(());
-    }
-    Ok(data_dir_arg(&args).map(PathBuf::from))
+    parse_service_args(&args).map(Some).ok_or(())
 }
 
 #[cfg(target_os = "linux")]
-fn user_service_data_dir() -> std::result::Result<Option<PathBuf>, ()> {
+fn user_service_registration() -> std::result::Result<Option<UserService>, ()> {
     let home = current_home().ok_or(())?;
-    let unit = home.join(".config/systemd/user/vibeface.service");
-    let metadata = match fs::symlink_metadata(&unit) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(()),
-    };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() > 64 * 1024
-        || !vibeface_bridge::platform::privatefs::same_owner(&unit, &home).map_err(|_| ())?
-    {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    if !config.is_absolute() {
         return Err(());
+    }
+    let unit = config.join("systemd/user/vibeface.service");
+    if !user_service_file(&unit, &home)? {
+        return Ok(None);
     }
     let bytes = fs::read(unit).map_err(|_| ())?;
     if bytes.len() > 64 * 1024 {
         return Err(());
     }
     let text = std::str::from_utf8(&bytes).map_err(|_| ())?;
-    parse_linux_service_unit(text)
+    parse_linux_service_unit(text).map(Some).ok_or(())
 }
 
 #[cfg(any(target_os = "linux", all(test, unix)))]
-fn parse_linux_service_unit(text: &str) -> std::result::Result<Option<PathBuf>, ()> {
-    let starts = text
+fn parse_linux_service_unit(text: &str) -> Option<UserService> {
+    let mut starts = text
         .lines()
-        .filter_map(|line| line.strip_prefix("ExecStart="))
-        .collect::<Vec<_>>();
-    if starts.len() != 1 {
-        return Err(());
+        .filter_map(|line| line.strip_prefix("ExecStart="));
+    let (cli, tail) = systemd_argument(starts.next()?)?;
+    if starts.next().is_some() {
+        return None;
     }
-    // Match systemd's known generated service form and its quoted --data-dir value. No shell is
-    // involved, and escape decoding is limited to the escaping used by the service installer.
-    let line = starts[0];
-    let program = first_systemd_argument(line).ok_or(())?;
-    if Path::new(program).file_name().and_then(|v| v.to_str()) != Some("vibeface")
-        || !line.split_whitespace().any(|arg| arg == "serve")
-        || line.matches("--data-dir ").count() != 1
-    {
-        return Err(());
-    }
-    let tail = line.rsplit_once("--data-dir \"").ok_or(())?.1;
-    let encoded = tail.strip_suffix('"').ok_or(())?;
-    let path = encoded
-        .replace("\\\\", "\\")
-        .replace("\\\"", "\"")
-        .replace("%%", "%")
-        .replace("$$", "$");
-    let path = PathBuf::from(path);
-    Ok(path.is_absolute().then_some(path))
+    let (data_dir, end) = systemd_argument(tail.strip_prefix(" serve --data-dir ")?)?;
+    end.is_empty().then_some(())?;
+    parse_service_args(&[cli.as_str(), "serve", "--data-dir", data_dir.as_str()])
 }
 
+// Decode only the quoted syntax emitted by scripts/install-node-service.sh.
 #[cfg(any(target_os = "linux", all(test, unix)))]
-fn first_systemd_argument(line: &str) -> Option<&str> {
-    let line = line.trim_start();
-    if let Some(quoted) = line.strip_prefix('"') {
-        return quoted.split_once('"').map(|(value, _)| value);
+fn systemd_argument(value: &str) -> Option<(String, &str)> {
+    let mut chars = value.strip_prefix('"')?.chars();
+    let mut output = String::new();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => return Some((output, chars.as_str())),
+            '\\' => {
+                let escaped = chars.next()?;
+                matches!(escaped, '\\' | '"').then_some(())?;
+                output.push(escaped);
+            }
+            '%' | '$' => {
+                (chars.next()? == ch).then_some(())?;
+                output.push(ch);
+            }
+            ch if !ch.is_control() => output.push(ch),
+            _ => return None,
+        }
     }
-    line.split_whitespace().next()
+    None
 }
 
 #[cfg(windows)]
-fn user_service_data_dir() -> std::result::Result<Option<PathBuf>, ()> {
-    let script = "$id=[Security.Principal.WindowsIdentity]::GetCurrent().User; $task=Get-ScheduledTask -TaskPath '\\Vibeface\\' -TaskName 'Node' -ErrorAction Stop; $owner=$task.Principal.UserId; if ($owner -notmatch '^S-1-') { $owner=([Security.Principal.NTAccount]$owner).Translate([Security.Principal.SecurityIdentifier]).Value }; $actions=@(); if ($owner -eq $id.Value) { foreach ($a in ($task.Actions | Select-Object -First 8)) { $actions+=@{sid=$owner;command=$a.Execute;arguments=$a.Arguments} } }; [pscustomobject]@{current_sid=$id.Value;actions=$actions} | ConvertTo-Json -Compress -Depth 3";
+fn user_service_registration() -> std::result::Result<Option<UserService>, ()> {
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$id = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+try { $task = Get-ScheduledTask -TaskPath '\Vibeface\' -TaskName 'Node' }
+catch {
+    if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { Write-Output 'null'; exit }
+    throw
+}
+$owner = $task.Principal.UserId
+if ($owner -notmatch '^S-1-') { $owner = ([Security.Principal.NTAccount]$owner).Translate([Security.Principal.SecurityIdentifier]).Value }
+if ($owner -ne $id -or $task.Actions.Count -ne 1) { exit 1 }
+$action = $task.Actions[0]
+@{command=$action.Execute;arguments=$action.Arguments} | ConvertTo-Json -Compress
+"#;
     let output = vibeface_bridge::platform::discovery::read_only_powershell(script, 16 * 1024)
         .map_err(|_| ())?;
-    #[derive(serde::Deserialize)]
+    #[derive(Deserialize)]
     struct Action {
-        sid: String,
         command: String,
-        arguments: Option<String>,
+        arguments: String,
     }
-    #[derive(serde::Deserialize)]
-    struct Task {
-        current_sid: String,
-        actions: Vec<Action>,
-    }
-    let task: Task = serde_json::from_slice(&output).map_err(|_| ())?;
-    for action in task.actions.into_iter().take(8) {
-        if action.sid != task.current_sid
-            || !Path::new(&action.command)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.eq_ignore_ascii_case("vibeface.exe"))
-        {
-            continue;
-        }
-        let combined = format!(
-            "\"{}\" {}",
-            action.command,
-            action.arguments.unwrap_or_default()
-        );
-        if let Some(args) = vibeface_bridge::platform::discovery::command_line_args(&combined)
-            && args.iter().any(|arg| arg == "serve")
-            && let Some(path) = data_dir_arg_os(&args)
-        {
-            return Ok(Some(path));
-        }
-    }
-    Ok(None)
+    let Some(action): Option<Action> = serde_json::from_slice(&output).map_err(|_| ())? else {
+        return Ok(None);
+    };
+    let combined = format!("\"{}\" {}", action.command, action.arguments);
+    let args = vibeface_bridge::platform::discovery::command_line_args(&combined).ok_or(())?;
+    parse_service_args(&args).map(Some).ok_or(())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn user_service_data_dir() -> std::result::Result<Option<PathBuf>, ()> {
+fn user_service_registration() -> std::result::Result<Option<UserService>, ()> {
     Err(())
-}
-
-#[cfg(target_os = "macos")]
-fn data_dir_arg(args: &[String]) -> Option<&str> {
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--data-dir" {
-            return args
-                .get(i + 1)
-                .filter(|p| Path::new(p).is_absolute())
-                .map(String::as_str);
-        }
-        if let Some(path) = args[i]
-            .strip_prefix("--data-dir=")
-            .filter(|p| Path::new(p).is_absolute())
-        {
-            return Some(path);
-        }
-        i += 1;
-    }
-    None
-}
-
-#[cfg(target_os = "macos")]
-fn known_server_args(args: &[String]) -> bool {
-    args.first()
-        .and_then(|p| Path::new(p).file_name())
-        .and_then(|n| n.to_str())
-        == Some("vibeface")
-        && args.iter().any(|a| a == "serve")
-}
-
-#[cfg(windows)]
-fn data_dir_arg_os(args: &[std::ffi::OsString]) -> Option<PathBuf> {
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--data-dir" {
-            let path = PathBuf::from(args.get(i + 1)?);
-            return path.is_absolute().then_some(path);
-        }
-        if let Some(value) = args[i].to_str().and_then(|s| s.strip_prefix("--data-dir=")) {
-            let path = PathBuf::from(value);
-            return path.is_absolute().then_some(path);
-        }
-        i += 1;
-    }
-    None
 }
 
 fn current_home() -> Option<PathBuf> {
@@ -435,7 +536,7 @@ mod tests {
         let epoch = fs::read(dir.join("data-epoch.json")).unwrap();
         let mut paths = BTreeMap::new();
         paths.insert(canonical.clone(), vec![Source::Remembered]);
-        let observed = inspect_candidates(paths, Vec::new()).await.unwrap();
+        let observed = inspect_candidates(paths, Vec::new(), None).await.unwrap();
         assert_eq!(observed["nodes"].as_array().unwrap().len(), 1);
         assert_eq!(observed["nodes"][0]["status"], "stopped");
         assert_eq!(observed["nodes"][0]["data_dir"], json!(canonical));
@@ -459,7 +560,7 @@ mod tests {
         assert!(owned_by_current_user(&dir).unwrap());
         let mut paths = BTreeMap::new();
         paths.insert(fs::canonicalize(&dir).unwrap(), vec![Source::Remembered]);
-        let result = inspect_candidates(paths, Vec::new()).await.unwrap();
+        let result = inspect_candidates(paths, Vec::new(), None).await.unwrap();
         assert_eq!(result["nodes"].as_array().unwrap().len(), 1);
         assert_eq!(result["nodes"][0]["status"], "stopped");
         fs::remove_dir_all(root).unwrap();
@@ -488,15 +589,66 @@ mod tests {
     fn systemd_fixture_extracts_only_known_node_and_spaced_path() {
         let fixture = "[Service]\nExecStart=\"/opt/Vibeface/vibeface\" serve --data-dir \"/home/user/Node 数据 2\"\n";
         assert_eq!(
-            parse_linux_service_unit(fixture).unwrap().unwrap(),
-            PathBuf::from("/home/user/Node 数据 2")
+            parse_linux_service_unit(fixture).unwrap(),
+            UserService {
+                cli: PathBuf::from("/opt/Vibeface/vibeface"),
+                data_dir: PathBuf::from("/home/user/Node 数据 2"),
+            }
         );
         assert!(
             parse_linux_service_unit(
                 "[Service]\nExecStart=/tmp/unrelated serve --data-dir /tmp/node\n"
             )
-            .is_err()
+            .is_none()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registered_cli_must_be_the_managed_installation_bound_to_the_data_directory() -> Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use vibeface_bridge::platform::privatefs;
+
+        let root =
+            std::env::temp_dir().join(format!("vibeface-registered-cli-{}", uuid::Uuid::new_v4()));
+        let data = root.join("node");
+        let install = root.join("install");
+        let package = install.join("packages/version");
+        privatefs::create_dir(&data)?;
+        fs::create_dir_all(package.join("scripts"))?;
+        let observed = fs::canonicalize(&data)?;
+        for path in [CLI_BINARY, CORE_BINARY, SERVICE_SCRIPT] {
+            let path = package.join(path);
+            fs::write(&path, "fixture")?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+        }
+        fs::write(package.join("BUILD-INFO.json"), br#"{"version":"1.0.0"}"#)?;
+        symlink(&package, install.join("current"))?;
+        let cli = install.join("current").join(CLI_BINARY);
+        let service = UserService {
+            cli: cli.clone(),
+            data_dir: data.clone(),
+        };
+        assert!(registered_cli(&service, &observed).is_err());
+        privatefs::write_atomic(
+            &data.join("update.json"),
+            &serde_json::to_vec(&json!({"install_root": install}))?,
+        )?;
+        assert_eq!(registered_cli(&service, &observed)?, cli);
+        let release_dir = package.parent().unwrap();
+        fs::set_permissions(release_dir, fs::Permissions::from_mode(0o777))?;
+        assert!(registered_cli(&service, &observed).is_err());
+        fs::set_permissions(release_dir, fs::Permissions::from_mode(0o755))?;
+        assert!(registered_cli(&service, &fs::canonicalize(&root)?).is_err());
+        let unrelated = root.join(CLI_BINARY);
+        fs::copy(package.join(CLI_BINARY), &unrelated)?;
+        let service = UserService {
+            cli: unrelated,
+            data_dir: data,
+        };
+        assert!(registered_cli(&service, &observed).is_err());
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]

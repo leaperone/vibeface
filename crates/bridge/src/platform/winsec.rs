@@ -101,6 +101,40 @@ fn checked(code: u32) -> io::Result<()> {
 pub struct Sid(Vec<u32>);
 
 impl Sid {
+    fn from_string(value: &str) -> io::Result<Self> {
+        use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+        let value = wide(OsStr::new(value));
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: the SID string is terminated and the out pointer is writable.
+        if unsafe { ConvertStringSidToSidW(value.as_ptr(), &mut raw) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the returned SID remains live until it is copied and released with LocalFree.
+        let result = unsafe { Sid::copy_from(raw) };
+        unsafe { LocalFree(raw) };
+        result
+    }
+
+    fn well_known(kind: windows_sys::Win32::Security::WELL_KNOWN_SID_TYPE) -> io::Result<Self> {
+        use windows_sys::Win32::Security::CreateWellKnownSid;
+        let mut words = vec![0_u32; 17];
+        let mut size = (words.len() * 4) as u32;
+        // SAFETY: the buffer is suitably aligned and the API receives its available size.
+        if unsafe {
+            CreateWellKnownSid(
+                kind,
+                std::ptr::null_mut(),
+                words.as_mut_ptr().cast(),
+                &mut size,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        words.truncate((size as usize).div_ceil(4));
+        Ok(Self(words))
+    }
+
     /// Copies the SID at `raw`, which must point at a valid SID owned by the caller.
     unsafe fn copy_from(raw: PSID) -> io::Result<Self> {
         if raw.is_null() {
@@ -413,6 +447,13 @@ impl ReadDescriptor {
         if owner != *user && !token_holds(&owner)? {
             return Ok(false);
         }
+        self.allows_only(&[user], u32::MAX)
+    }
+
+    fn allows_only(&self, trusted: &[&Sid], mask: u32) -> io::Result<bool> {
+        if self.dacl.is_null() {
+            return Ok(false);
+        }
         let mut size = ACL_SIZE_INFORMATION {
             AceCount: 0,
             AclBytesInUse: 0,
@@ -446,10 +487,21 @@ impl ReadDescriptor {
                 // An entry shape this build cannot read may grant another account access.
                 return Ok(false);
             }
+            use windows_sys::Win32::Security::INHERIT_ONLY_ACE;
+            // SAFETY: a recognized allow ACE has an ACE_HEADER, mask and SID.
+            let flags = unsafe { *ace.cast::<u8>().add(1) };
+            let allowed = unsafe { *ace.cast::<u32>().add(1) };
+            if (mask != u32::MAX && u32::from(flags) & INHERIT_ONLY_ACE != 0) || allowed & mask == 0
+            {
+                continue;
+            }
             // SAFETY: an allow entry stores its trustee at the `SidStart` offset.
             let sid = unsafe { ace.cast::<u8>().add(ALLOWED_ACE_SID_OFFSET) };
             // SAFETY: `sid` points inside the entry at a valid SID.
-            if unsafe { EqualSid(sid.cast(), user.as_psid()) } == 0 {
+            if !trusted
+                .iter()
+                .any(|user| unsafe { EqualSid(sid.cast(), user.as_psid()) } != 0)
+            {
                 return Ok(false);
             }
         }
@@ -479,6 +531,60 @@ fn is_deny_or_audit(kind: u32) -> bool {
 pub fn path_is_private(path: &Path) -> io::Result<bool> {
     let user = current_user()?;
     ReadDescriptor::of_path(path)?.private_to(&user)
+}
+
+pub(super) fn path_owned_by_current_account(path: &Path) -> io::Result<bool> {
+    let owner = owner_of_path(path)?;
+    Ok(owner == current_user()? || (token_holds(&owner)? && path_is_trusted_install(path, false)?))
+}
+
+pub(super) fn path_is_trusted_install(path: &Path, ancestor: bool) -> io::Result<bool> {
+    use windows_sys::Win32::Security::{WinBuiltinAdministratorsSid, WinLocalSystemSid};
+
+    let user = current_user()?;
+    let system = Sid::well_known(WinLocalSystemSid)?;
+    let administrators = Sid::well_known(WinBuiltinAdministratorsSid)?;
+    let installer =
+        Sid::from_string("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464")?;
+    let trusted = [&user, &system, &administrators, &installer];
+    let descriptor = ReadDescriptor::of_path(path)?;
+    // SAFETY: the owner pointer belongs to the live descriptor.
+    let owner = unsafe { Sid::copy_from(descriptor.owner) }?;
+    if !trusted.contains(&&owner) {
+        return Ok(false);
+    }
+    descriptor.allows_only(&trusted, install_write_mask(ancestor))
+}
+
+fn install_write_mask(ancestor: bool) -> u32 {
+    use windows_sys::Win32::{
+        Foundation::{GENERIC_ALL, GENERIC_WRITE},
+        Storage::FileSystem::{
+            DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+            FILE_WRITE_EA, WRITE_DAC, WRITE_OWNER,
+        },
+    };
+    let replacement =
+        DELETE | WRITE_DAC | WRITE_OWNER | FILE_DELETE_CHILD | GENERIC_WRITE | GENERIC_ALL;
+    if ancestor {
+        replacement
+    } else {
+        replacement | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_DATA | FILE_WRITE_EA
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn install_write_mask_covers_generic_all_but_permits_generic_read() {
+    use windows_sys::Win32::Foundation::{GENERIC_ALL, GENERIC_READ, GENERIC_WRITE};
+    for ancestor in [false, true] {
+        let mask = install_write_mask(ancestor);
+        assert_eq!(mask & GENERIC_READ, 0);
+        assert_eq!(
+            mask & (GENERIC_ALL | GENERIC_WRITE),
+            GENERIC_ALL | GENERIC_WRITE
+        );
+    }
 }
 
 /// Whether only this account can reach the kernel object behind `handle`, used to prove the

@@ -17,7 +17,7 @@ Usage: install-node-service.ps1 install --binary C:\absolute\vibeface.exe --data
        install-node-service.ps1 install-updater --binary C:\install-root\current\vibeface.exe --data-dir C:\absolute\data
        install-node-service.ps1 start|stop|restart [--data-dir C:\absolute\data]
        install-node-service.ps1 status
-       install-node-service.ps1 uninstall-updater|uninstall-node|uninstall --data-dir C:\absolute\data
+       install-node-service.ps1 uninstall --data-dir C:\absolute\data
 
 Installs scheduled tasks for the account that runs this script. Initialize the node first.
 '@
@@ -85,6 +85,20 @@ function Get-TaskCommandLine {
     return $line
 }
 
+function Get-UpdaterArguments {
+    param([string] $Binary, [string] $DataDir)
+    return '/c ""' + $Binary + '" update apply --automatic --data-dir "' + $DataDir +
+        '" >> "' + (Join-Path $DataDir 'update.stdout.log') + '" 2>> "' +
+        (Join-Path $DataDir 'update.stderr.log') + '""'
+}
+
+function Test-UpdaterCommandLine {
+    param([string] $Line, [string] $Binary, [string] $DataDir)
+    $shell = Join-Path $env:SystemRoot 'System32\cmd.exe'
+    $expected = $shell + ' ' + (Get-UpdaterArguments -Binary $Binary -DataDir $DataDir)
+    return $Line.Equals($expected, [StringComparison]::OrdinalIgnoreCase)
+}
+
 function Confirm-TaskData {
     param([string] $Name, [string] $DataDir, [string] $Verb, [bool] $Anchored, [string] $Binary = '')
     if (-not $DataDir) { return }
@@ -99,8 +113,13 @@ function Confirm-TaskData {
     if (-not $matched) {
         Fail 'installed service uses a different data directory or unsupported arguments; no service was changed.'
     }
-    if ($Binary -and -not $line.StartsWith("$Binary ", [StringComparison]::OrdinalIgnoreCase)) {
-        Fail 'installed service uses a different executable; no service was changed.'
+    if ($Binary) {
+        $matchesBinary = if ($Verb -eq 'apply') {
+            Test-UpdaterCommandLine -Line $line -Binary $Binary -DataDir $DataDir
+        } else { $line.Equals("$Binary $Verb --data-dir `"$DataDir`"", [StringComparison]::OrdinalIgnoreCase) }
+        if (-not $matchesBinary) {
+            Fail 'installed service uses a different executable; no service was changed.'
+        }
     }
 }
 
@@ -282,7 +301,8 @@ $arguments = @($args)
 if ($arguments.Count -eq 0) { Show-Usage; exit 0 }
 $action = $arguments[0]
 if ($action -eq '--help' -or $action -eq '-h') { Show-Usage; exit 0 }
-if (@('install', 'install-updater', 'start', 'stop', 'restart', 'status', 'verify', 'uninstall-updater', 'uninstall-node', 'uninstall') -notcontains $action) {
+if ($action -eq 'uninstall-node') { $action = 'uninstall' }
+if (@('install', 'install-updater', 'start', 'stop', 'restart', 'status', 'verify', 'verify-schedule', 'uninstall-updater', 'uninstall') -notcontains $action) {
     Fail-Usage "unknown action: $action"
 }
 $binary = ''
@@ -326,11 +346,11 @@ switch ($action) {
     'stop' { Confirm-TaskData -Name $NodeTask -DataDir $dataDir -Verb 'serve' -Anchored $true -Binary $binary }
     'restart' { Confirm-TaskData -Name $NodeTask -DataDir $dataDir -Verb 'serve' -Anchored $true -Binary $binary }
     'uninstall-updater' { Confirm-TaskData -Name $UpdateTask -DataDir $dataDir -Verb 'apply' -Anchored $false -Binary $binary }
-    'uninstall-node' { Confirm-TaskData -Name $NodeTask -DataDir $dataDir -Verb 'serve' -Anchored $true -Binary $binary }
     'verify' { Confirm-TaskData -Name $NodeTask -DataDir $dataDir -Verb 'serve' -Anchored $true -Binary $binary }
+    'verify-schedule' { Confirm-TaskData -Name $NodeTask -DataDir $dataDir -Verb 'serve' -Anchored $true -Binary $binary }
     default {
         Confirm-TaskData -Name $NodeTask -DataDir $dataDir -Verb 'serve' -Anchored $true -Binary $binary
-        Confirm-TaskData -Name $UpdateTask -DataDir $dataDir -Verb 'apply' -Anchored $false
+        Confirm-TaskData -Name $UpdateTask -DataDir $dataDir -Verb 'apply' -Anchored $false -Binary $binary
     }
 }
 
@@ -360,9 +380,7 @@ switch ($action) {
         New-PrivateLog -Path (Join-Path $dataDir 'update.stderr.log')
         # The scheduler cannot redirect a task's output, so the updater's own output is
         # appended to the same private logs the other families write.
-        $redirected = '/c ""' + $binary + '" update apply --automatic --data-dir "' + $dataDir +
-            '" >> "' + (Join-Path $dataDir 'update.stdout.log') + '" 2>> "' +
-            (Join-Path $dataDir 'update.stderr.log') + '""'
+        $redirected = Get-UpdaterArguments -Binary $binary -DataDir $dataDir
         $trigger = @'
     <TimeTrigger>
       <Repetition>
@@ -402,19 +420,22 @@ switch ($action) {
         if ($updater.Code -eq 0) { $updater.Output } else { 'Updater is not installed.' }
         exit $node.Code
     }
-    'verify' {
+    { $_ -in @('verify', 'verify-schedule') } {
         $installed = $null -ne (Get-RegisteredTask -Name $NodeTask)
         $running = $installed -and (Test-TaskRunning -Name $NodeTask)
-        '{"installed":' + ([string] $installed).ToLowerInvariant() + ',"running":' + ([string] $running).ToLowerInvariant() + '}'
+        $status = '{"installed":' + ([string] $installed).ToLowerInvariant() + ',"running":' + ([string] $running).ToLowerInvariant()
+        if ($action -eq 'verify-schedule') {
+            $updater = Get-RegisteredTask -Name $UpdateTask
+            $scheduled = $null -ne $updater -and $updater.Enabled -and
+                (-not $binary -or (Test-UpdaterCommandLine -Line (Get-TaskCommandLine -Name $UpdateTask) -Binary $binary -DataDir $dataDir))
+            $status += ',"automatic_update_scheduled":' + ([string] $scheduled).ToLowerInvariant()
+        }
+        $status + '}'
     }
     'uninstall' {
+        Remove-Task -Name $NodeTask
         Remove-Task -Name $UpdateTask
-        Remove-Task -Name $NodeTask
         'Removed requested services; node data was kept.'
-    }
-    'uninstall-node' {
-        Remove-Task -Name $NodeTask
-        'Removed requested node service; node data was kept.'
     }
     'uninstall-updater' {
         Remove-Task -Name $UpdateTask

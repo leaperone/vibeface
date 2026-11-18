@@ -62,6 +62,7 @@ pub struct Desktop {
     _composer_events: Subscription,
     pending_input: Option<InputAck>,
     pending_business_open: Option<(u64, Option<String>)>,
+    startup_local_attempted: bool,
     pub history_query: Entity<InputState>,
     _history_query_events: Subscription,
     pub form: Option<Form>,
@@ -176,7 +177,7 @@ impl Desktop {
         Self {
             route: Route::Connect,
             snapshot: Arc::new(Snapshot {
-                status: "尚未连接。纯控制端不会启动本机 Node。".into(),
+                status: "尚未连接。".into(),
                 ..Default::default()
             }),
             timeline,
@@ -186,6 +187,7 @@ impl Desktop {
             _composer_events: composer_events,
             pending_input: None,
             pending_business_open: None,
+            startup_local_attempted: false,
             history_query,
             _history_query_events: history_events,
             form: None,
@@ -375,7 +377,22 @@ impl Desktop {
                     ),
                 };
                 crate::theme::apply(self.dark, window, cx);
-                self.host = Some(host)
+                self.host = Some(host);
+            }
+            Event::LocalAutoConnected => {
+                if self.route == Route::Connect && self.form.is_none() {
+                    if self.snapshot.online
+                        && self
+                            .host
+                            .as_ref()
+                            .is_none_or(|host| host.preferences.open_business_on_connect)
+                    {
+                        self.navigate(Route::Home, cx);
+                    } else {
+                        self.pending_business_open =
+                            Some((self.snapshot.generation, self.snapshot.profile_id.clone()));
+                    }
+                }
             }
             Event::Notice(notice) => {
                 self.notice = Some(notice);
@@ -446,6 +463,7 @@ impl Desktop {
             Event::ShutdownComplete => cx.quit(),
             Event::Scoped { .. } => {}
         }
+        self.try_startup_local_connection(window, cx);
         cx.notify();
     }
     pub fn accept_join_activation(
@@ -719,7 +737,13 @@ impl Desktop {
                     self.send(Command::ReadTriage, cx);
                 }
             }
-            Route::Node => self.send(Command::Host(HostAction::Refresh), cx),
+            Route::Node
+                if self.host.as_ref().is_some_and(|host| {
+                    host.discovery_state != crate::host::DiscoveryState::Scanning
+                }) =>
+            {
+                self.send(Command::Host(HostAction::Refresh), cx);
+            }
             Route::Logs => self.send(
                 Command::ReadLogs {
                     search: String::new(),
@@ -1052,6 +1076,68 @@ impl Desktop {
         }
         true
     }
+    fn try_startup_local_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.startup_local_attempted {
+            return;
+        }
+        let Some(host) = self.host.as_ref() else {
+            return;
+        };
+        if host.discovery_state == crate::host::DiscoveryState::Scanning {
+            return;
+        }
+        let Some(profile_id) = self.snapshot.profile_id.clone() else {
+            return;
+        };
+        self.startup_local_attempted = true;
+        let Some(identity) = host.selected.clone() else {
+            return;
+        };
+        if self.credential_scope.is_empty()
+            || self.route != Route::Connect
+            || self.form.is_some()
+            || self.snapshot.client_id.is_some()
+        {
+            return;
+        }
+        let generation = self.snapshot.generation;
+        let scope = self.credential_scope.clone();
+        let read = cx.read_credentials(&scope);
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Some((user, bytes))) = read.await else {
+                return;
+            };
+            if user != "client-key" {
+                return;
+            }
+            let Ok(passphrase) = String::from_utf8(bytes) else {
+                return;
+            };
+            let passphrase = zeroize::Zeroizing::new(passphrase);
+            let _ = cx.update(|_, cx| {
+                this.update(cx, |this, cx| {
+                    if this.route == Route::Connect
+                        && this.form.is_none()
+                        && this.credential_scope == scope
+                        && this.snapshot.generation == generation
+                        && this.snapshot.profile_id.as_deref() == Some(profile_id.as_str())
+                    {
+                        this.send(
+                            Command::ConnectRememberedLocal {
+                                profile_id,
+                                generation,
+                                identity,
+                                passphrase,
+                            },
+                            cx,
+                        );
+                    }
+                })
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn finish_credential_save(
         &mut self,
         command: Command,
@@ -1111,6 +1197,11 @@ impl Desktop {
         }
         let mut values = form.values(cx);
         let editor = form.editor.clone();
+        if matches!(editor, Editor::ConnectLocal)
+            && let Some(profile_id) = &self.snapshot.profile_id
+        {
+            values.insert("_local_profile_id".into(), profile_id.clone());
+        }
         let conversation_id = self.conversation_id();
         self.form_pending = true;
         if !matches!(
@@ -1573,20 +1664,7 @@ impl Render for Desktop {
                 Route::Settings => self.settings(cx),
                 Route::Node => self.node(cx),
                 Route::Transfers => self.transfers(cx),
-                Route::Connect => self
-                    .page()
-                    .child(self.profile_picker(cx))
-                    .child("首次使用，请由本人管理设备邀请加入。原有成员与数据会保留。")
-                    .child(self.nav("onboard-join", "加入或恢复个人网络", Route::Join, cx))
-                    .child(self.nav("onboard-node", "发现与管理本机Node", Route::Node, cx))
-                    .child(self.open_editor(
-                        "connect-editor",
-                        "连接网络",
-                        Editor::Connect,
-                        BTreeMap::new(),
-                        cx,
-                    ))
-                    .into_any_element(),
+                Route::Connect => self.connection(cx),
                 Route::Join => self
                     .page()
                     .child(self.open_editor(
