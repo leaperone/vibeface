@@ -210,7 +210,7 @@ function UnsavedRecoveryFile({ landing }: { landing(): HTMLElement | null | unde
 
 /** This browser's recovery while it waits on the Node, or once one of the devices it would replace stopped it. */
 export function RecoveryWaiting() {
-  const { recovery, dismissRecovery, unsavedRecovery, forgetUnsavedRecovery } = useDevice()
+  const { recovery, pauseRecovery, dismissRecovery, unsavedRecovery, forgetUnsavedRecovery } = useDevice()
   const saving = useRef<HTMLElement>(null)
   if (recovery?.status === 'stopped') return <Panel icon={ShieldX} title={recoveryCopy.stopped}>
     <p className="text-secondary">{recoveryCopy.stoppedNote}</p>
@@ -230,6 +230,7 @@ export function RecoveryWaiting() {
       <p className="flex items-center gap-2 text-sm text-secondary"><KeyRound aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.samePassword}</p>
       <UnsavedRecoveryFile landing={() => saving.current?.parentElement?.querySelector('h2')} />
     </section> : null}
+    {at === null ? <Button type="button" variant="ghost" className="w-fit justify-self-start" onClick={pauseRecovery}>返回</Button> : null}
   </Panel>
 }
 

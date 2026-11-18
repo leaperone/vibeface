@@ -30,7 +30,7 @@ INPUTS = {
     'mobile': ('apps/mobile/*', 'packages/client/*', 'packages/theme/*', 'packages/secure-native/*', 'crates/secure/*', 'crates/secure-ffi/*', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain*', 'pnpm*', 'package.json', 'scripts/build-mobile*', 'scripts/build-ios*', 'scripts/verify-ios*', '.github/workflows/release-apps.yml', '.github/workflows/release-ios.yml'),
     'www': ('apps/www/*', 'packages/docs/*', 'packages/theme/*', 'pnpm*', 'package.json'),
 }
-COMMON = ('scripts/release_component_identity.py', 'scripts/release_format.py', 'scripts/release_context.py', 'scripts/release_source.py', 'scripts/release_archive.py', 'scripts/release_inventory.py', 'scripts/release_github.py', 'scripts/release_publisher.py', 'scripts/release_assembly.py', 'scripts/release.py', 'scripts/release-entry.py', '.github/workflows/release-collect.yml', '.github/workflows/release-publish.yml')
+COMMON = ('scripts/release_component_identity.py', 'scripts/release_format.py', 'scripts/release_context.py', 'scripts/release_source.py', 'scripts/release_archive.py', 'scripts/release_inventory.py', 'scripts/release_github.py', 'scripts/release_publisher.py', 'scripts/release_assembly.py', 'scripts/release.py', 'scripts/release-entry.py', '.github/workflows/release-collect.yml', '.github/workflows/release-publish.yml', '.github/actions/setup-js/action.yml')
 
 
 
@@ -50,6 +50,10 @@ COMMON = ('scripts/release_component_identity.py', 'scripts/release_format.py', 
 
 def input_digest(app, source, root=None):
     patterns = (*INPUTS[app], *COMMON, '.github/workflows/' + release_format.WORKFLOWS[app])
+    if app != 'www':
+        patterns += ('.github/actions/setup-rust/action.yml',)
+    if app == 'app':
+        patterns += ('.github/actions/setup-web-crypto/action.yml', 'scripts/wasm-bindgen-version.py')
     if app in ('core', 'app', 'www'):
         patterns += ('scripts/release-dispatch.py', '.github/workflows/release-deploy.yml')
     if app == 'cli':
@@ -279,6 +283,18 @@ def self_test():
                 before = input_digest('cli', source)
             with mock.patch.object(release_context, 'git', return_value=listing.replace('blob before', 'blob after')):
                 assert (input_digest('cli', source) != before) == embedded, path
+    for path, consumers in (
+        ('.github/actions/setup-js/action.yml', set(release_format.APPS)),
+        ('.github/actions/setup-rust/action.yml', set(release_format.APPS) - {'www'}),
+        ('.github/actions/setup-web-crypto/action.yml', {'app'}),
+        ('scripts/wasm-bindgen-version.py', {'app'}),
+    ):
+        listing = f'100644 blob base\tpackage.json\n100644 blob base\tCargo.toml\n100644 blob before\t{path}\n'
+        with mock.patch.object(release_context, 'git', return_value=listing):
+            before = {app: input_digest(app, source) for app in release_format.APPS}
+        with mock.patch.object(release_context, 'git', return_value=listing.replace('blob before', 'blob after')):
+            changed = {app for app, digest in before.items() if input_digest(app, source) != digest}
+        assert changed == consumers, (path, changed)
     assert release_format.DEPENDENCIES == {'core': (), 'app': (), 'cli': ('core', 'app'), 'desktop': ('cli',), 'mobile': (), 'www': ()}
     print('Independent Hourly self-test passed: selected version only, exact pins and per-train build numbers')
 

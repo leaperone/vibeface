@@ -1,4 +1,4 @@
-use super::store::{SignedTransaction, SpendIntent};
+use super::store::{SpendIntent, StoredTransaction};
 use crate::net::mesh::record::Settlement;
 use alloy_consensus::TxEip1559;
 use alloy_primitives::{Address, B256, TxKind, U256, keccak256};
@@ -120,10 +120,42 @@ pub struct KeyRecord {
     pub active: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
+#[repr(u8)]
+pub enum ChainWindowPhase {
+    Funded = 0,
+    Held = 1,
+    KeyPublished = 2,
+    Earned = 3,
+    Refunded = 4,
+}
+
+impl TryFrom<u8> for ChainWindowPhase {
+    type Error = anyhow::Error;
+
+    fn try_from(phase: u8) -> Result<Self> {
+        match phase {
+            0 => Ok(Self::Funded),
+            1 => Ok(Self::Held),
+            2 => Ok(Self::KeyPublished),
+            3 => Ok(Self::Earned),
+            4 => Ok(Self::Refunded),
+            _ => anyhow::bail!("invalid delivery window state"),
+        }
+    }
+}
+
+impl From<ChainWindowPhase> for u8 {
+    fn from(phase: ChainWindowPhase) -> Self {
+        phase as u8
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindowState {
-    pub phase: u8,
+    pub phase: ChainWindowPhase,
     pub decryption_proven: bool,
     pub capsule: Vec<u8>,
     pub ciphertext_hash: Word,
@@ -143,14 +175,114 @@ pub struct OrderState {
     pub windows: Vec<WindowState>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockRef {
+    pub number: u64,
+    pub hash: B256,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxStatus {
+    Unbroadcast,
+    Submitted,
+    Included(BlockRef),
+    Confirming(BlockRef),
+    Confirmed(BlockRef),
+    Reverted(BlockRef),
+    Reorged,
+    Unknown { last_block: Option<BlockRef> },
+    Failed,
+    Conflicted,
+}
+
+impl TxStatus {
+    pub fn block(&self) -> Option<&BlockRef> {
+        match self {
+            Self::Included(block)
+            | Self::Confirming(block)
+            | Self::Confirmed(block)
+            | Self::Reverted(block) => Some(block),
+            Self::Unknown { last_block } => last_block.as_ref(),
+            Self::Unbroadcast
+            | Self::Submitted
+            | Self::Reorged
+            | Self::Failed
+            | Self::Conflicted => None,
+        }
+    }
+
+    pub fn final_receipt(&self) -> Option<&BlockRef> {
+        match self {
+            Self::Confirmed(block) | Self::Reverted(block) => Some(block),
+            Self::Unbroadcast
+            | Self::Submitted
+            | Self::Included(_)
+            | Self::Confirming(_)
+            | Self::Reorged
+            | Self::Unknown { .. }
+            | Self::Failed
+            | Self::Conflicted => None,
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            Self::Confirmed(_) | Self::Reverted(_) | Self::Failed | Self::Conflicted => true,
+            Self::Unbroadcast
+            | Self::Submitted
+            | Self::Included(_)
+            | Self::Confirming(_)
+            | Self::Reorged
+            | Self::Unknown { .. } => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxState<T> {
+    Reserved,
+    Signed { signed: T, status: TxStatus },
+}
+
+impl<T> TxState<T> {
+    pub fn signed(&self) -> Option<&T> {
+        match self {
+            Self::Reserved => None,
+            Self::Signed { signed, .. } => Some(signed),
+        }
+    }
+
+    pub fn status(&self) -> Option<&TxStatus> {
+        match self {
+            Self::Reserved => None,
+            Self::Signed { status, .. } => Some(status),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxObservation {
-    pub phase: String,
-    pub tx_hash: Option<String>,
-    pub block_number: Option<u64>,
-    pub block_hash: Option<String>,
+    pub nonce: u64,
+    pub state: TxState<String>,
     pub error: Option<String>,
+}
+
+impl TxObservation {
+    pub fn tx_hash(&self) -> Option<&str> {
+        self.state.signed().map(String::as_str)
+    }
+
+    pub fn status(&self) -> Option<&TxStatus> {
+        self.state.status()
+    }
+
+    pub fn block(&self) -> Option<&BlockRef> {
+        self.status().and_then(TxStatus::block)
+    }
+
+    pub fn final_receipt(&self) -> Option<&BlockRef> {
+        self.status().and_then(TxStatus::final_receipt)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -670,7 +802,7 @@ impl Chain {
                     && transaction.intent.gas_cap == gas_cap,
                 "delivery spend intent changed; reconcile the original authorization"
             );
-            if transaction.raw_tx.is_some() {
+            if transaction.signed().is_some() {
                 return self.reconcile_transaction(delivery, id).await;
             }
             (transaction.intent, transaction.nonce)
@@ -707,10 +839,7 @@ impl Chain {
                 pending_nonce,
                 group,
                 &intent.gas_cap,
-                |intent, nonce| {
-                    let signed = wallet.sign_transaction(&self.config, intent, nonce)?;
-                    Ok((signed.raw_tx, signed.tx_hash))
-                },
+                |intent, nonce| wallet.sign_transaction(&self.config, intent, nonce),
             )
         })?;
         Ok(())
@@ -754,39 +883,41 @@ impl Chain {
         );
         let wallet = address(&transaction.intent.wallet)?;
         checked_transaction(&self.config, &transaction.intent, wallet, transaction.nonce)?;
-        if transaction.raw_tx.is_none() {
+        if transaction.signed().is_none() {
             if let Err(error) = self
                 .sign_original(delivery, &transaction.intent, transaction.nonce)
                 .await
             {
-                let result = observation(
-                    "reserved",
-                    None,
-                    None,
-                    Some(&format!(
+                let result = TxObservation {
+                    nonce: transaction.nonce,
+                    state: TxState::Reserved,
+                    error: Some(format!(
                         "recover the original unsigned delivery intent: {error}"
                     )),
-                );
-                delivery.with_store(|store| {
-                    store.observe_transaction(id, "reserved", None, None, result.error.as_deref())
-                })?;
+                };
+                delivery.with_store(|store| store.observe_transaction(id, &result))?;
                 return Ok(result);
             }
             transaction = delivery.with_store(|store| store.transaction(id))?;
         }
-        let mut result = self.observe(&transaction).await.unwrap_or_else(|_| {
-            observation(
-                "unknown",
-                transaction.block_number,
-                transaction.block_hash.clone(),
+        let mut result = match self.observe(&transaction).await {
+            Ok(observed) => observed,
+            Err(_) => transaction.observation(
+                TxStatus::Unknown {
+                    last_block: transaction.block().cloned(),
+                },
                 Some(
                     "delivery chain observation failed; the original transaction remains reserved",
                 ),
-            )
-        });
-        if matches!(result.phase.as_str(), "unknown" | "reorged")
-            && !matches!(transaction.phase.as_str(), "conflicted" | "reverted")
-        {
+            )?,
+        };
+        if matches!(
+            result.status(),
+            Some(TxStatus::Unknown { .. } | TxStatus::Reorged)
+        ) && !matches!(
+            transaction.status(),
+            Some(TxStatus::Conflicted | TxStatus::Reverted(_))
+        ) {
             let pending_nonce = self.pending_nonce(wallet).await;
             let nonce_available =
                 matches!(&pending_nonce, Ok(nonce) if *nonce <= transaction.nonce);
@@ -796,183 +927,123 @@ impl Chain {
                 .is_ok();
             let unlocked = matches!(delivery.wallet.lock().map_err(|_| anyhow::anyhow!("delivery wallet lock failed"))?.status(), super::wallet::WalletStatus::Unlocked { address } if address == transaction.intent.wallet);
             if !authorized || !unlocked || !nonce_available {
-                result.phase = "unknown".into();
-                result.tx_hash = transaction.tx_hash;
-                result.error = Some(if !authorized || !unlocked {
-                    "delivery wallet is locked or authorization changed; signed transaction was preserved for reconciliation"
-                } else if pending_nonce.is_err() {
-                    "delivery nonce observation failed; signed transaction was preserved for reconciliation"
-                } else {
-                    "wallet nonce advanced but the original transaction outcome remains unproven; reconcile its original hash"
-                }.into());
-                delivery.with_store(|store| {
-                    store.observe_transaction(
-                        id,
-                        &result.phase,
-                        result.block_number,
-                        result.block_hash.as_deref(),
-                        result.error.as_deref(),
-                    )
-                })?;
+                result = transaction.observation(
+                    TxStatus::Unknown {
+                        last_block: result.block().cloned(),
+                    },
+                    Some(if !authorized || !unlocked {
+                        "delivery wallet is locked or authorization changed; signed transaction was preserved for reconciliation"
+                    } else if pending_nonce.is_err() {
+                        "delivery nonce observation failed; signed transaction was preserved for reconciliation"
+                    } else {
+                        "wallet nonce advanced but the original transaction outcome remains unproven; reconcile its original hash"
+                    }),
+                )?;
+                delivery.with_store(|store| store.observe_transaction(id, &result))?;
                 return Ok(result);
             }
-            let signed = SignedBytes {
-                raw_tx: transaction
-                    .raw_tx
-                    .clone()
-                    .context("delivery raw transaction is missing")?,
-                tx_hash: transaction
-                    .tx_hash
-                    .clone()
-                    .context("delivery transaction hash is missing")?,
-            };
-            result = match self.broadcast(&signed).await {
-                Ok(_) => self.observe(&transaction).await.unwrap_or_else(|_| {
-                    observation(
-                        "unknown",
-                        None,
-                        None,
+            let signed = transaction
+                .signed()
+                .context("delivery raw transaction is missing")?;
+            result = match self.broadcast(signed).await {
+                Ok(_) => match self.observe(&transaction).await {
+                    Ok(observed) => observed,
+                    Err(_) => transaction.observation(
+                        TxStatus::Unknown { last_block: None },
                         Some("delivery broadcast outcome requires reconciliation"),
-                    )
-                }),
-                Err(_) => observation(
-                    "unknown",
-                    result.block_number,
-                    result.block_hash,
+                    )?,
+                },
+                Err(_) => transaction.observation(
+                    TxStatus::Unknown {
+                        last_block: result.block().cloned(),
+                    },
                     Some("delivery broadcast outcome requires reconciliation"),
-                ),
+                )?,
             };
         }
-        result.tx_hash = transaction.tx_hash;
-        delivery.with_store(|store| {
-            store.observe_transaction(
-                id,
-                &result.phase,
-                result.block_number,
-                result.block_hash.as_deref(),
-                result.error.as_deref(),
-            )
-        })?;
+        delivery.with_store(|store| store.observe_transaction(id, &result))?;
         Ok(result)
     }
 
-    pub async fn observe(&self, transaction: &SignedTransaction) -> Result<TxObservation> {
-        let mut result = self.observe_inner(transaction).await?;
-        result.tx_hash = transaction.tx_hash.clone();
-        Ok(result)
-    }
-
-    async fn observe_inner(&self, transaction: &SignedTransaction) -> Result<TxObservation> {
+    pub async fn observe(&self, transaction: &StoredTransaction) -> Result<TxObservation> {
         let expected = transaction
-            .tx_hash
-            .as_deref()
+            .tx_hash()
             .context("delivery transaction has not been signed")?;
         word(expected)?;
         let receipt = self
             .rpc("eth_getTransactionReceipt", json!([expected]))
             .await?;
         if !receipt.is_null() {
-            ensure!(
-                receipt["transactionHash"].as_str() == Some(expected),
-                "delivery receipt returned another transaction"
-            );
-            ensure!(
-                address(receipt["from"].as_str().context("receipt has no sender")?)?
-                    == address(&transaction.intent.wallet)?,
-                "delivery receipt sender mismatch"
-            );
-            ensure!(
-                address(receipt["to"].as_str().context("receipt has no recipient")?)?
-                    == address(&transaction.intent.to)?,
-                "delivery receipt recipient mismatch"
-            );
-            let block_number = quantity_u64(&receipt["blockNumber"])?;
-            let block_hash = receipt["blockHash"]
-                .as_str()
-                .context("receipt has no block hash")?
-                .to_owned();
-            word(&block_hash)?;
-            let status = quantity_u64(&receipt["status"])?;
-            ensure!(status <= 1, "invalid delivery transaction receipt status");
-            let canonical = self
-                .rpc(
-                    "eth_getBlockByNumber",
-                    json!([format!("0x{block_number:x}"), false]),
-                )
-                .await?;
-            if canonical["hash"].as_str() != Some(block_hash.as_str()) {
-                return Ok(observation(
-                    "reorged",
-                    None,
-                    None,
+            let receipt = decode_receipt(&receipt, transaction, expected)?;
+            if !self.is_canonical_block(&receipt.block).await? {
+                return transaction.observation(
+                    TxStatus::Reorged,
                     Some("delivery receipt is no longer canonical"),
-                ));
+                );
             }
             let latest = quantity_u64(&self.rpc("eth_blockNumber", json!([])).await?)?;
-            return receipt_observation(
-                block_number,
-                block_hash,
-                status == 1,
-                latest,
-                self.config.confirmations,
+            return transaction.observation(
+                receipt_status(
+                    receipt.block,
+                    receipt.succeeded,
+                    latest,
+                    self.config.confirmations,
+                )?,
+                (!receipt.succeeded).then_some("delivery chain transaction reverted"),
             );
         }
-        if let (Some(number), Some(hash)) = (transaction.block_number, &transaction.block_hash) {
-            let block = self
-                .rpc(
-                    "eth_getBlockByNumber",
-                    json!([format!("0x{number:x}"), false]),
-                )
-                .await?;
-            if block["hash"].as_str() == Some(hash.as_str()) {
-                return Ok(observation(
-                    "unknown",
-                    Some(number),
-                    Some(hash.clone()),
+        if let Some(block) = transaction.block() {
+            if self.is_canonical_block(block).await? {
+                return transaction.observation(
+                    TxStatus::Unknown {
+                        last_block: Some(block.clone()),
+                    },
                     Some("delivery receipt is temporarily unavailable at its observed block"),
-                ));
+                );
             }
-            return Ok(observation(
-                "reorged",
-                None,
-                None,
+            return transaction.observation(
+                TxStatus::Reorged,
                 Some("delivery transaction left its observed block"),
-            ));
+            );
         }
-        if transaction.phase == "reorged" {
-            return Ok(observation(
-                "reorged",
-                None,
-                None,
+        if matches!(transaction.status(), Some(TxStatus::Reorged)) {
+            return transaction.observation(
+                TxStatus::Reorged,
                 Some("delivery transaction requires confirmation on the current chain"),
-            ));
+            );
         }
         let known = self
             .rpc("eth_getTransactionByHash", json!([expected]))
             .await?;
         if !known.is_null() {
-            ensure!(
-                known["hash"].as_str() == Some(expected)
-                    && quantity_u64(&known["nonce"])? == transaction.nonce
-                    && address(
-                        known["from"]
-                            .as_str()
-                            .context("transaction has no sender")?
-                    )? == address(&transaction.intent.wallet)?
-                    && address(
-                        known["to"]
-                            .as_str()
-                            .context("transaction has no recipient")?
-                    )? == address(&transaction.intent.to)?
-                    && known["input"].as_str() == Some(transaction.intent.calldata.as_str()),
-                "delivery RPC returned a conflicting transaction"
-            );
-            return Ok(observation("submitted", None, None, None));
+            check_known_transaction(&known, transaction, expected)?;
+            return transaction.observation(TxStatus::Submitted, None);
         }
         let nonce = self
             .pending_nonce(address(&transaction.intent.wallet)?)
             .await?;
-        Ok(missing_receipt_observation(transaction.nonce, nonce))
+        missing_receipt_observation(transaction, nonce)
+    }
+
+    async fn is_canonical_block(&self, expected: &BlockRef) -> Result<bool> {
+        let block = self
+            .rpc(
+                "eth_getBlockByNumber",
+                json!([format!("0x{:x}", expected.number), false]),
+            )
+            .await?;
+        if block.is_null() {
+            return Ok(false);
+        }
+        ensure!(
+            quantity_u64(&block["number"])? == expected.number,
+            "delivery RPC returned another block"
+        );
+        Ok(word(
+            block["hash"]
+                .as_str()
+                .context("delivery block has no hash")?,
+        )? == expected.hash)
     }
 
     async fn call<C: SolCall>(&self, target: Address, call: C) -> Result<C::Return> {
@@ -1138,15 +1209,14 @@ pub(super) fn checked_transaction(
 
 pub(super) fn checked_publication_recovery(
     config: &ChainConfig,
-    original: &SignedTransaction,
+    original: &StoredTransaction,
     intent: &SpendIntent,
     wallet: Address,
 ) -> Result<TxEip1559> {
     let reveal = checked_transaction(config, &original.intent, wallet, original.nonce)?;
     ensure!(
         is_disclosure_calldata(&reveal.input)
-            && original.raw_tx.is_some()
-            && original.tx_hash.is_some()
+            && original.signed().is_some()
             && intent
                 .id
                 .starts_with(&format!("{}/nonce-", original.intent.id))
@@ -1299,8 +1369,9 @@ fn is_disclosure_calldata(input: &[u8]) -> bool {
     input.starts_with(&abi::revealBatchCall::SELECTOR)
 }
 fn window_state(window: abi::ChainWindow) -> Result<WindowState> {
+    let phase = ChainWindowPhase::try_from(window.phase)?;
     ensure!(
-        window.phase <= 4 && (window.capsule.is_empty() || window.capsule.len() == 80),
+        window.capsule.is_empty() || window.capsule.len() == 80,
         "invalid delivery window state"
     );
     if !window.capsule.is_empty() {
@@ -1311,56 +1382,103 @@ fn window_state(window: abi::ChainWindow) -> Result<WindowState> {
         );
     }
     Ok(WindowState {
-        phase: window.phase,
+        phase,
         decryption_proven: window.decryptionProven,
         capsule: window.capsule.to_vec(),
         ciphertext_hash: window.spec.ciphertextHash.into(),
         capsule_hash: window.spec.capsuleHash.into(),
     })
 }
-fn observation(
-    phase: &str,
-    block_number: Option<u64>,
-    block_hash: Option<String>,
-    error: Option<&str>,
-) -> TxObservation {
-    TxObservation {
-        phase: phase.into(),
-        tx_hash: None,
-        block_number,
-        block_hash,
-        error: error.map(str::to_owned),
-    }
+struct DecodedReceipt {
+    block: BlockRef,
+    succeeded: bool,
 }
-fn receipt_observation(
-    block_number: u64,
-    block_hash: String,
+
+fn decode_receipt(
+    receipt: &Value,
+    transaction: &StoredTransaction,
+    expected: &str,
+) -> Result<DecodedReceipt> {
+    ensure!(
+        receipt["transactionHash"].as_str() == Some(expected),
+        "delivery receipt returned another transaction"
+    );
+    ensure!(
+        address(receipt["from"].as_str().context("receipt has no sender")?)?
+            == address(&transaction.intent.wallet)?,
+        "delivery receipt sender mismatch"
+    );
+    ensure!(
+        address(receipt["to"].as_str().context("receipt has no recipient")?)?
+            == address(&transaction.intent.to)?,
+        "delivery receipt recipient mismatch"
+    );
+    let block = BlockRef {
+        number: quantity_u64(&receipt["blockNumber"])?,
+        hash: word(
+            receipt["blockHash"]
+                .as_str()
+                .context("receipt has no block hash")?,
+        )?,
+    };
+    let status = quantity_u64(&receipt["status"])?;
+    ensure!(status <= 1, "invalid delivery transaction receipt status");
+    Ok(DecodedReceipt {
+        block,
+        succeeded: status == 1,
+    })
+}
+
+fn check_known_transaction(
+    known: &Value,
+    transaction: &StoredTransaction,
+    expected: &str,
+) -> Result<()> {
+    ensure!(
+        known["hash"].as_str() == Some(expected)
+            && quantity_u64(&known["nonce"])? == transaction.nonce
+            && address(
+                known["from"]
+                    .as_str()
+                    .context("transaction has no sender")?
+            )? == address(&transaction.intent.wallet)?
+            && address(
+                known["to"]
+                    .as_str()
+                    .context("transaction has no recipient")?
+            )? == address(&transaction.intent.to)?
+            && known["input"].as_str() == Some(transaction.intent.calldata.as_str()),
+        "delivery RPC returned a conflicting transaction"
+    );
+    Ok(())
+}
+
+fn receipt_status(
+    block: BlockRef,
     succeeded: bool,
     latest: u64,
     confirmations: u64,
-) -> Result<TxObservation> {
+) -> Result<TxStatus> {
     ensure!(
-        confirmations > 0 && latest >= block_number,
+        confirmations > 0 && latest >= block.number,
         "delivery chain head precedes its receipt"
     );
-    let confirmed = latest - block_number >= confirmations - 1;
-    Ok(observation(
-        if confirmed {
-            if succeeded { "confirmed" } else { "reverted" }
-        } else {
-            "confirming"
-        },
-        Some(block_number),
-        Some(block_hash),
-        (!succeeded).then_some("delivery chain transaction reverted"),
-    ))
+    if latest - block.number < confirmations - 1 {
+        Ok(TxStatus::Confirming(block))
+    } else if succeeded {
+        Ok(TxStatus::Confirmed(block))
+    } else {
+        Ok(TxStatus::Reverted(block))
+    }
 }
-fn missing_receipt_observation(original_nonce: u64, pending_nonce: u64) -> TxObservation {
-    observation(
-        "unknown",
-        None,
-        None,
-        Some(if pending_nonce > original_nonce {
+
+fn missing_receipt_observation(
+    transaction: &StoredTransaction,
+    pending_nonce: u64,
+) -> Result<TxObservation> {
+    transaction.observation(
+        TxStatus::Unknown { last_block: None },
+        Some(if pending_nonce > transaction.nonce {
             "wallet nonce advanced but the original transaction outcome remains unproven; reconcile its original hash"
         } else {
             "delivery transaction has no canonical receipt; reconcile the same signed transaction"
@@ -1382,7 +1500,7 @@ pub fn address(value: &str) -> Result<Address> {
 pub fn address_hex(value: Address) -> String {
     format!("0x{}", hex::encode(value))
 }
-fn word(value: &str) -> Result<B256> {
+pub(super) fn word(value: &str) -> Result<B256> {
     ensure!(
         value.len() == 66 && value.starts_with("0x"),
         "invalid delivery bytes32"
@@ -1666,13 +1784,34 @@ pub(super) mod tests {
         Ok(())
     }
     #[test]
-    fn a_missing_receipt_and_advanced_pending_nonce_never_prove_payment_failure() {
+    fn a_missing_receipt_and_advanced_pending_nonce_never_prove_payment_failure() -> Result<()> {
+        let signed = SignedBytes {
+            raw_tx: "0x02".into(),
+            tx_hash: data_hex(&[0x55; 32]),
+        };
+        let transaction = StoredTransaction {
+            intent: approval_intent(Address::repeat_byte(7))?,
+            nonce: 7,
+            state: TxState::Signed {
+                signed: signed.clone(),
+                status: TxStatus::Unbroadcast,
+            },
+            error: None,
+        };
         for pending in [6, 7, 8, 100] {
-            let observation = missing_receipt_observation(7, pending);
-            assert_eq!(observation.phase, "unknown");
-            assert!(observation.block_number.is_none());
-            assert!(observation.block_hash.is_none());
+            let observed = missing_receipt_observation(&transaction, pending)?;
+            assert_eq!(
+                observed.status(),
+                Some(&TxStatus::Unknown { last_block: None })
+            );
+            assert_eq!(observed.tx_hash(), Some(signed.tx_hash.as_str()));
+            assert_eq!(observed.nonce, 7);
+            assert_eq!(
+                observed.error.as_ref().unwrap().contains("nonce advanced"),
+                pending > 7
+            );
         }
+        Ok(())
     }
     #[test]
     fn configuration_rejects_another_valid_image_or_proof_budget() {
@@ -1844,14 +1983,13 @@ pub(super) mod tests {
             rpc.chain
                 .reconcile_transaction(&delivery, &resume_id)
                 .await?
-                .phase,
-            "unknown"
+                .status(),
+            Some(&TxStatus::Unknown { last_block: None })
         );
         let after = delivery.with_store(|s| s.transaction(&resume_id))?;
         assert_eq!(after.intent, before.intent);
         assert_eq!(after.nonce, before.nonce);
-        assert_eq!(after.raw_tx, before.raw_tx);
-        assert_eq!(after.tx_hash, before.tx_hash);
+        assert_eq!(after.signed(), before.signed());
         assert!(
             !rpc.requests
                 .lock()
@@ -1908,25 +2046,66 @@ pub(super) mod tests {
 
     #[test]
     fn receipt_requires_its_canonical_block_and_confirmation_depth() -> Result<()> {
-        let hash = "0x0123".into();
+        let block = BlockRef {
+            number: 10,
+            hash: B256::repeat_byte(0x55),
+        };
         assert_eq!(
-            receipt_observation(10, hash, true, 10, 2)?.phase,
-            "confirming"
+            receipt_status(block.clone(), true, 10, 2)?,
+            TxStatus::Confirming(block.clone())
         );
         assert_eq!(
-            receipt_observation(10, "hash".into(), true, 11, 2)?.phase,
-            "confirmed"
+            receipt_status(block.clone(), true, 11, 2)?,
+            TxStatus::Confirmed(block.clone())
         );
         assert_eq!(
-            receipt_observation(10, "hash".into(), false, 11, 2)?.phase,
-            "reverted"
+            receipt_status(block.clone(), false, 11, 2)?,
+            TxStatus::Reverted(block.clone())
         );
         assert_eq!(
-            receipt_observation(10, "hash".into(), false, 10, 2)?.phase,
-            "confirming"
+            receipt_status(block.clone(), false, 10, 2)?,
+            TxStatus::Confirming(block.clone())
         );
-        assert!(receipt_observation(10, "hash".into(), true, 9, 2).is_err());
-        assert_eq!(observation("unknown", None, None, None).block_hash, None);
+        assert!(receipt_status(block.clone(), true, 9, 2).is_err());
+        assert!(receipt_status(block, true, 11, 0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn window_state_decodes_every_abi_phase_and_rejects_every_other_value() -> Result<()> {
+        let expected = [
+            ChainWindowPhase::Funded,
+            ChainWindowPhase::Held,
+            ChainWindowPhase::KeyPublished,
+            ChainWindowPhase::Earned,
+            ChainWindowPhase::Refunded,
+        ];
+        for phase in 0..=u8::MAX {
+            let window = abi::ChainWindow {
+                spec: abi::WindowSpec {
+                    index: 0,
+                    offset: 0,
+                    plaintextBytes: 0,
+                    ciphertextBytes: 0,
+                    ciphertextHash: B256::ZERO,
+                    capsuleHash: B256::ZERO,
+                    plaintextCommitment: B256::ZERO,
+                    deliveryFee: U256::ZERO,
+                    reservationFee: U256::ZERO,
+                },
+                phase,
+                decryptionProven: false,
+                capsule: alloy_primitives::Bytes::new(),
+            };
+            let decoded = window_state(window);
+            if let Some(expected) = expected.get(usize::from(phase)) {
+                let decoded = decoded?;
+                assert_eq!(decoded.phase, *expected);
+                assert_eq!(serde_json::to_value(&decoded)?["phase"], json!(phase));
+            } else {
+                assert!(decoded.is_err(), "decoded invalid ABI phase {phase}");
+            }
+        }
         Ok(())
     }
 
@@ -2056,7 +2235,10 @@ pub(super) mod tests {
         disguised.id = "ordinary/disguised".into();
         delivery.with_store(|store| {
             store.signed_budget_transaction(&disguised, 0, "ordinary", cap, |_, _| {
-                Ok(("0x02".into(), format!("0x{}", "aa".repeat(32))))
+                Ok(SignedBytes {
+                    raw_tx: "0x02".into(),
+                    tx_hash: format!("0x{}", "aa".repeat(32)),
+                })
             })
         })?;
         let error = chain

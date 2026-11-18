@@ -56,9 +56,7 @@ jobs:
           ref: refs/tags/${{ inputs.tag }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: '24'
+      - uses: ./.github/actions/setup-js
       - name: Install npm with Trusted Publishing support
         run: npm install --global npm@12.2.2
       - name: Resolve and validate the immutable npm artifact

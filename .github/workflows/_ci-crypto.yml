@@ -20,6 +20,13 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       SOURCE_SHA: ${{ inputs.source_sha }}
+      WORKFLOW_SHA: ${{ github.workflow_sha }}
+      CONTROLLER_TOOLCHAIN: .artifacts/browser-crypto/workflow
+      TOOLCHAIN_FILES: |
+        /.github/actions/setup-js/action.yml
+        /.github/actions/setup-rust/action.yml
+        /.github/actions/setup-web-crypto/action.yml
+        /scripts/wasm-bindgen-version.py
     steps:
       - name: Validate immutable source input
         run: |
@@ -35,9 +42,9 @@ jobs:
           ref: ${{ inputs.source_sha }}
           persist-credentials: false
       - name: Record checked-out source provenance
+        id: source
         env:
           CONTROLLER_HEAD_SHA: ${{ github.sha }}
-          WORKFLOW_SHA: ${{ github.workflow_sha }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
           python3 - <<'PY'
@@ -49,32 +56,64 @@ jobs:
           source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
           if source != os.environ["SOURCE_SHA"] or subprocess.check_output(["git", "status", "--porcelain"]):
               raise SystemExit("Expected a clean checkout of source_sha")
+          files = [name.removeprefix("/") for name in os.environ["TOOLCHAIN_FILES"].splitlines()]
+          tracked = set(subprocess.check_output(
+              ["git", "ls-tree", "-r", "--name-only", "HEAD", "--", *files], text=True).splitlines())
+          if tracked and (tracked != set(files) or
+                          any(Path(name).is_symlink() or not Path(name).is_file() for name in tracked)):
+              raise SystemExit("Source has an incomplete browser cryptography toolchain")
+          origin = "source" if tracked else "controller"
+          setup_commit = source if tracked else os.environ["WORKFLOW_SHA"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as step_outputs:
+              print(f"toolchain_origin={origin}", file=step_outputs)
           output = Path(".artifacts/browser-crypto/source.json")
           output.parent.mkdir(parents=True, exist_ok=True)
           output.write_text(json.dumps({"repository": os.environ["GITHUB_REPOSITORY"],
               "sourceSha": source, "controllerHeadSha": os.environ["CONTROLLER_HEAD_SHA"],
               "workflowSha": os.environ["WORKFLOW_SHA"], "workflowRef": os.environ["WORKFLOW_REF"],
               "runId": os.environ["GITHUB_RUN_ID"], "runAttempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "toolchain": {"origin": origin, "commit": setup_commit},
               "complete": False}, indent=2) + "\n")
           PY
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # Sources that predate the toolchain actions use the immutable workflow's toolchain.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: steps.source.outputs.toolchain_origin == 'controller'
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: ${{ env.CONTROLLER_TOOLCHAIN }}
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: ${{ env.TOOLCHAIN_FILES }}
+      - uses: ./.github/actions/setup-rust
+        if: steps.source.outputs.toolchain_origin == 'source'
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: ./.artifacts/browser-crypto/workflow/.github/actions/setup-rust
+        if: steps.source.outputs.toolchain_origin == 'controller'
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: crypto-web
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: '22'
+      - uses: ./.github/actions/setup-js
+        if: steps.source.outputs.toolchain_origin == 'source'
+        with: {node-version: '22'}
+      - uses: ./.artifacts/browser-crypto/workflow/.github/actions/setup-js
+        if: steps.source.outputs.toolchain_origin == 'controller'
+        with: {node-version: '22'}
+      - uses: ./.github/actions/setup-web-crypto
+        if: steps.source.outputs.toolchain_origin == 'source'
+      - uses: ./.artifacts/browser-crypto/workflow/.github/actions/setup-web-crypto
+        if: steps.source.outputs.toolchain_origin == 'controller'
       - name: Build shared browser cryptography
         run: |
-          cargo install wasm-bindgen-cli --version 0.2.129 --locked
-          npm install -g binaryen@132.0.0
           bash scripts/build-web-crypto.sh
           cargo build -p vibeface-secure --example secure-probe --locked
           node scripts/crypto-client.mjs --self-test --native-probe target/debug/examples/secure-probe
       - name: Bind completed browser outputs to the unchanged source
+        env:
+          TOOLCHAIN_ORIGIN: ${{ steps.source.outputs.toolchain_origin }}
         run: |
           python3 - <<'PY'
           import hashlib
@@ -85,18 +124,55 @@ jobs:
 
           if subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() != os.environ["SOURCE_SHA"] or subprocess.check_output(["git", "status", "--porcelain"]):
               raise SystemExit("Source changed during browser cryptography verification")
-          subprocess.run(["python3", "scripts/build-inputs.py", "check", "crypto"], check=True)
           directory = Path("apps/app/generated")
           expected = {"vibeface_secure.js", "vibeface_secure_bg.wasm", "vibeface_secure.d.ts",
               "vibeface_secure_bg.wasm.d.ts", ".vibeface-build.json"}
           paths = list(directory.rglob("*"))
           if directory.is_symlink() or any(path.is_symlink() or not path.is_file() for path in paths) or {path.relative_to(directory).as_posix() for path in paths} != expected:
               raise SystemExit("Unexpected browser cryptography output set")
+
+          origin = os.environ["TOOLCHAIN_ORIGIN"]
+          toolchain_root, commit = {
+              "source": (Path("."), os.environ["SOURCE_SHA"]),
+              "controller": (Path(os.environ["CONTROLLER_TOOLCHAIN"]), os.environ["WORKFLOW_SHA"]),
+          }[origin]
           output = Path(".artifacts/browser-crypto/source.json")
           provenance = json.loads(output.read_text())
-          if provenance["sourceSha"] != os.environ["SOURCE_SHA"] or provenance["complete"]:
+          toolchain = {"origin": origin, "commit": commit}
+          if (provenance["sourceSha"] != os.environ["SOURCE_SHA"] or provenance["complete"]
+                  or provenance["workflowSha"] != os.environ["WORKFLOW_SHA"]
+                  or provenance["toolchain"] != toolchain):
               raise SystemExit("Browser cryptography provenance differs from this build")
+          git = ["git", "-C", str(toolchain_root)]
+          if subprocess.check_output([*git, "rev-parse", "HEAD"], text=True).strip() != commit:
+              raise SystemExit("Browser cryptography toolchain checkout differs from its pinned commit")
+          hashes = {}
+          for entry in os.environ["TOOLCHAIN_FILES"].splitlines():
+              name = entry.removeprefix("/")
+              path = toolchain_root / name
+              if path.is_symlink() or not path.is_file():
+                  raise SystemExit(f"Missing regular toolchain file: {name}")
+              data = path.read_bytes()
+              if data != subprocess.check_output([*git, "show", f"HEAD:{name}"]):
+                  raise SystemExit(f"Toolchain file changed during browser cryptography verification: {name}")
+              hashes[name] = hashlib.sha256(data).hexdigest()
+          toolchain["files"] = hashes
+
+          receipt_path = directory / ".vibeface-build.json"
+          receipt = json.loads(receipt_path.read_text())
+          inputs = receipt["inputs"]["source"]
+          recorded = {name: inputs[name] for name in hashes if name in inputs}
+          if origin == "source" and (recorded != hashes or "toolchain" in receipt):
+              raise SystemExit("Browser cryptography receipt differs from the source toolchain")
+          if origin == "controller":
+              if recorded or "toolchain" in receipt:
+                  raise SystemExit("Historical browser cryptography receipt declares unexpected toolchain inputs")
+              receipt["toolchain"] = toolchain
+              receipt_path.write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n")
+          subprocess.run(["python3", "scripts/build-inputs.py", "check", "crypto"], check=True)
+
           provenance.update({"sourceUnchanged": True, "complete": True,
+              "toolchain": toolchain,
               "files": {path.name: {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "size": path.stat().st_size} for path in sorted(paths)}})
           output.write_text(json.dumps(provenance, indent=2) + "\n")
           PY

@@ -430,7 +430,7 @@ function parseObservation(value: unknown): ProviderObservation {
   const observation = record(value)
   return { status: oneOf(observation.status, ['confirmed', 'rejected', 'unknown']), evidence: oneOf(observation.evidence, observationEvidence) }
 }
-function canonical(value: unknown): string {
+export function canonical(value: unknown): string {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value)
   if (typeof value === 'number' && Number.isFinite(value)) return JSON.stringify(value)
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`

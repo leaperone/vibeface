@@ -1,4 +1,5 @@
 use super::*;
+use chain::{ChainWindowPhase, TxStatus};
 
 #[derive(Serialize, Deserialize)]
 struct SourceDraft {
@@ -133,7 +134,7 @@ impl Delivery {
                         .windows
                         .get(index as usize)
                         .context("chain window is missing")?;
-                    if fact.phase == 4 && fact.capsule.is_empty() {
+                    if fact.phase == ChainWindowPhase::Refunded && fact.capsule.is_empty() {
                         self.update_paid_view(&mut stored).await?;
                         self.save(&mut stored)?;
                         return Ok(stored);
@@ -998,7 +999,7 @@ impl Delivery {
                 provider::apply_paid_snapshot(&mut pending.view, &state)?;
                 pending.view.payment.tx_hash = transaction
                     .as_ref()
-                    .and_then(|tx| tx.tx_hash.clone())
+                    .and_then(|tx| tx.tx_hash().map(str::to_owned))
                     .or_else(|| pending.view.payment.tx_hash.clone());
                 pending.view.error = None;
                 pending.view.updated_at_ms = crate::clock::now_ms();
@@ -1012,12 +1013,15 @@ impl Delivery {
             return Ok(AllocationRecovery::Allocated);
         }
         chain.verify_position(&position).await?;
-        if let Some(transaction) = transaction.filter(|tx| tx.raw_tx.is_some()) {
+        if let Some(transaction) = transaction.filter(|tx| tx.signed().is_some()) {
             let observed = chain.observe(&transaction).await;
             if !observed.as_ref().is_ok_and(|value| {
-                matches!(value.phase.as_str(), "reverted" | "conflicted" | "failed")
+                matches!(
+                    value.status(),
+                    Some(TxStatus::Reverted(_) | TxStatus::Conflicted | TxStatus::Failed)
+                )
             }) {
-                order.view.payment.tx_hash = transaction.tx_hash;
+                order.view.payment.tx_hash = transaction.tx_hash().map(str::to_owned);
                 order.view.chain_unknown();
                 self.save(order)?;
                 return Ok(AllocationRecovery::Pending);
@@ -1105,15 +1109,15 @@ impl Delivery {
             }
             let intent = hex::encode(hash(&serde_json::to_vec(&ids)?));
             let allocation = self.reserve_orders(&budget_id, &batch, &intent).await?;
-            order.view.payment.tx_hash = allocation.tx_hash.clone();
-            if allocation.phase != "confirmed" {
+            order.view.payment.tx_hash = allocation.tx_hash().map(str::to_owned);
+            if !matches!(allocation.status(), Some(TxStatus::Confirmed(_))) {
                 order.view.chain_unknown();
                 self.save(&mut order)?;
                 return Ok(order);
             }
             for mut allocated in batch {
                 allocated.view.payment.state = PaymentState::Confirmed;
-                allocated.view.payment.tx_hash = allocation.tx_hash.clone();
+                allocated.view.payment.tx_hash = allocation.tx_hash().map(str::to_owned);
                 allocated.view.phase = Phase::Funded;
                 self.save(&mut allocated)?;
                 if allocated.view.order_id == order.view.order_id {
@@ -1543,13 +1547,11 @@ mod tests {
                 &intent.gas_cap,
             )?;
             store.sign_transaction(&transaction_id, "0x02", &format!("0x{}", "99".repeat(32)))?;
-            store.observe_transaction(
-                &transaction_id,
-                "unknown",
-                None,
-                None,
+            let observation = store.transaction(&transaction_id)?.observation(
+                TxStatus::Unknown { last_block: None },
                 Some("synthetic lost allocation response"),
-            )
+            )?;
+            store.observe_transaction(&transaction_id, &observation)
         })?;
         let before = delivery.with_store(|store| store.transaction(&transaction_id))?;
         let mut recovering = orders[0].clone();
@@ -1563,7 +1565,10 @@ mod tests {
             let restored = delivery.with_store(|store| store.order(id))?;
             assert_eq!(restored.view.phase, Phase::Funded);
             assert_eq!(restored.allocation_batch, ids);
-            assert_eq!(restored.view.payment.tx_hash, before.tx_hash);
+            assert_eq!(
+                restored.view.payment.tx_hash,
+                before.tx_hash().map(str::to_owned)
+            );
             assert_eq!(restored.source_seals, orders[0].source_seals);
             assert_eq!(restored.order.unsigned.terms.quote_expires_at, 200);
         }

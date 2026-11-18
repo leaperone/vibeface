@@ -6,7 +6,7 @@ cd "$root"
 (( $# == 0 )) || { echo 'This script writes the project browser cryptography output; no arguments are accepted.' >&2; exit 2; }
 out="$root/apps/app/generated"
 bindgen="${WASM_BINDGEN:-wasm-bindgen}"
-version=0.2.129
+version="$(python3 "$root/scripts/wasm-bindgen-version.py")"
 if ! command -v "$bindgen" >/dev/null 2>&1; then
   printf 'Install wasm-bindgen-cli %s or set WASM_BINDGEN.\n' "$version" >&2
   exit 1

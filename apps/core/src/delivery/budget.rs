@@ -1,6 +1,7 @@
 use super::{
     Delivery,
-    chain::{self, ChainConfig, ChainPosition, abi},
+    chain::{self, ChainConfig, ChainPosition, ChainWindowPhase, TxStatus, abi},
+    store::transaction_phase_name,
     types::{Mode, Role, StoredOrder, parse_word},
     wallet::WalletStatus,
 };
@@ -15,6 +16,17 @@ pub const MAX_BATCH_WINDOWS: usize = 2;
 pub(super) const REVEAL_GAS_LIMIT: u64 = 800_000;
 pub(super) const PUBLICATION_STEP_SECONDS: u64 = 10;
 const MAX_ACTIVE_CLAIMS: usize = 2;
+
+fn transaction_response(observed: &chain::TxObservation) -> Value {
+    let block = observed.block();
+    json!({
+        "phase": transaction_phase_name(&observed.state),
+        "tx_hash": observed.tx_hash(),
+        "block_number": block.map(|block| block.number),
+        "block_hash": block.map(|block| format!("{:#x}", block.hash)),
+        "error": observed.error.as_deref(),
+    })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -609,11 +621,12 @@ impl ClaimState {
 }
 
 pub(super) fn order_is_settled(state: &chain::OrderState, order: &Order) -> Result<bool> {
-    if state
-        .windows
-        .iter()
-        .any(|window| !matches!(window.phase, 3 | 4))
-    {
+    if state.windows.iter().any(|window| {
+        !matches!(
+            window.phase,
+            ChainWindowPhase::Earned | ChainWindowPhase::Refunded
+        )
+    }) {
         return Ok(false);
     }
     ensure!(
@@ -647,7 +660,7 @@ pub(super) fn order_is_settled(state: &chain::OrderState, order: &Order) -> Resu
         let amount = U256::from_be_bytes(spec.delivery_fee.to_be_bytes())
             .checked_add(U256::from_be_bytes(spec.reservation_fee.to_be_bytes()))
             .context("settled window amount overflow")?;
-        if window.phase == 3 {
+        if window.phase == ChainWindowPhase::Earned {
             earned = earned
                 .checked_add(amount)
                 .context("settled earned amount overflow")?;
@@ -746,13 +759,10 @@ pub(super) fn publication_retains_objects(
             return Ok(true);
         }
         for id in claim.attempts {
-            if !store.find_transaction(&id)?.is_some_and(|tx| {
-                tx.raw_tx.is_some()
-                    && matches!(
-                        tx.phase.as_str(),
-                        "confirmed" | "failed" | "reverted" | "conflicted"
-                    )
-            }) {
+            if !store
+                .find_transaction(&id)?
+                .is_some_and(|tx| tx.status().is_some_and(TxStatus::is_terminal))
+            {
                 return Ok(true);
             }
         }
@@ -1055,8 +1065,10 @@ impl Delivery {
                         &gas_cap,
                     )
                     .await?;
-                if approve.phase != "confirmed" {
-                    return Ok(json!({"budget_id":budget_id,"transaction":approve}));
+                if !matches!(approve.status(), Some(TxStatus::Confirmed(_))) {
+                    return Ok(
+                        json!({"budget_id":budget_id,"transaction":transaction_response(&approve)}),
+                    );
                 }
                 let result = chain
                     .execute(
@@ -1071,7 +1083,7 @@ impl Delivery {
                         &gas_cap,
                     )
                     .await?;
-                Ok(json!({"budget_id":budget_id,"transaction":result}))
+                Ok(json!({"budget_id":budget_id,"transaction":transaction_response(&result)}))
             }
             BudgetCommand::Reserve {
                 budget_id,
@@ -1083,9 +1095,8 @@ impl Delivery {
                 for id in order_ids {
                     orders.push(self.with_store(|s| s.order(&id))?);
                 }
-                Ok(serde_json::to_value(
-                    self.reserve_orders(&budget_id, &orders, &intent_id).await?,
-                )?)
+                let result = self.reserve_orders(&budget_id, &orders, &intent_id).await?;
+                Ok(transaction_response(&result))
             }
             BudgetCommand::Flush { budget_id } => {
                 let _provider = self.provider_operations.lock().await;
@@ -1188,8 +1199,10 @@ impl Delivery {
                     order_id: order.view.order_id.clone(),
                     index: index as u16,
                 };
-                if matches!(fact.phase, 0 | 1)
-                    && self.with_store(|s| s.value(&hold_key(&window)))?.is_some()
+                if matches!(
+                    fact.phase,
+                    ChainWindowPhase::Funded | ChainWindowPhase::Held
+                ) && self.with_store(|s| s.value(&hold_key(&window)))?.is_some()
                     && self
                         .with_store(|s| s.value(&claim_window_key(&window)))?
                         .is_none()
@@ -1224,17 +1237,17 @@ impl Delivery {
         self.with_store(|store| {
             store.put_value(&format!("local-spend:{transaction_id}"), b"owner")
         })?;
-        Ok(serde_json::to_value(
-            self.chain()
-                .await?
-                .execute(
-                    self,
-                    &transaction_id,
-                    chain::Call::Budget(Box::new(action)),
-                    cap,
-                )
-                .await?,
-        )?)
+        let result = self
+            .chain()
+            .await?
+            .execute(
+                self,
+                &transaction_id,
+                chain::Call::Budget(Box::new(action)),
+                cap,
+            )
+            .await?;
+        Ok(transaction_response(&result))
     }
     pub(super) async fn reserve_orders(
         &self,
@@ -1328,7 +1341,7 @@ impl Delivery {
                 if candidates.len() == MAX_BATCH_WINDOWS {
                     break;
                 }
-                if fact.phase == 0 {
+                if fact.phase == ChainWindowPhase::Funded {
                     let w = WindowRef {
                         order_id: order.view.order_id.clone(),
                         index: index as u16,
@@ -1355,7 +1368,7 @@ impl Delivery {
                     &record.provider_gas_cap,
                 )
                 .await?;
-            if result.phase != "confirmed" {
+            if !matches!(result.status(), Some(TxStatus::Confirmed(_))) {
                 return Ok(());
             }
         }
@@ -1385,7 +1398,7 @@ impl Delivery {
             let state = self.paid_state(&order.order).await?;
             let mut ready = Vec::new();
             for (index, fact) in state.windows.iter().enumerate() {
-                if fact.phase == 3 {
+                if fact.phase == ChainWindowPhase::Earned {
                     continue;
                 }
                 let w = WindowRef {
@@ -1396,7 +1409,10 @@ impl Delivery {
                     .with_store(|s| s.value(&claim_window_key(&w)))?
                     .is_some()
                     || self.with_store(|s| s.value(&hold_key(&w)))?.is_none()
-                    || !matches!(fact.phase, 0 | 1)
+                    || !matches!(
+                        fact.phase,
+                        ChainWindowPhase::Funded | ChainWindowPhase::Held
+                    )
                 {
                     ready.clear();
                     break;
@@ -1453,10 +1469,12 @@ impl Delivery {
                 .windows
                 .iter()
                 .enumerate()
-                .filter(|(_, w)| w.phase != 3)
+                .filter(|(_, w)| w.phase != ChainWindowPhase::Earned)
                 .collect();
             if needed.is_empty()
-                || needed.iter().any(|(_, w)| w.phase != 1)
+                || needed
+                    .iter()
+                    .any(|(_, w)| w.phase != ChainWindowPhase::Held)
                 || items.len() + needed.len() > MAX_BATCH_WINDOWS
             {
                 continue;
@@ -1602,7 +1620,7 @@ impl Delivery {
         &self,
         chain: &chain::Chain,
         claim: &PublicationClaim,
-        original: &super::store::SignedTransaction,
+        original: &super::store::StoredTransaction,
         observed: &chain::TxObservation,
         execute: bool,
     ) -> Result<(Option<chain::TxObservation>, Option<String>)> {
@@ -1610,25 +1628,12 @@ impl Delivery {
         let recoveries = self.with_store(|s| s.publication_recoveries(&original.intent.id))?;
         for recovery in &recoveries {
             let observed = chain.observe(recovery).await?;
-            self.with_store(|s| {
-                s.observe_publication_recovery(
-                    &original.intent.id,
-                    recovery
-                        .tx_hash
-                        .as_deref()
-                        .context("nonce recovery has no hash")?,
-                    &observed,
-                )
-            })?;
+            self.with_store(|s| s.observe_publication_recovery(&original.intent.id, &observed))?;
             observations.push(observed);
         }
         let terminal: Vec<_> = observations
             .iter()
-            .filter(|observation| {
-                matches!(observation.phase.as_str(), "confirmed" | "reverted")
-                    && observation.block_number.is_some()
-                    && observation.block_hash.is_some()
-            })
+            .filter(|observation| observation.final_receipt().is_some())
             .collect();
         ensure!(
             terminal.len() <= 1,
@@ -1666,8 +1671,11 @@ impl Delivery {
         let pending = chain.pending_nonce(wallet).await?;
         if latest != original.nonce
             || pending < original.nonce
-            || pending > original.nonce && !observations.iter().any(|o| o.phase == "submitted")
-            || observations.iter().any(|o| o.block_number.is_some())
+            || pending > original.nonce
+                && !observations
+                    .iter()
+                    .any(|o| matches!(o.status(), Some(TxStatus::Submitted)))
+            || observations.iter().any(|o| o.block().is_some())
         {
             return paused("nonce cleanup awaits the original hashes and canonical nonce outcome");
         }
@@ -1733,9 +1741,7 @@ impl Delivery {
                 .map_err(|_| anyhow::anyhow!("delivery wallet lock failed"))?;
             self.with_store(|s| {
                 s.signed_publication_recovery(original, &intent, |original, intent| {
-                    let signed =
-                        wallet.sign_publication_recovery(chain.config(), original, intent)?;
-                    Ok((signed.raw_tx, signed.tx_hash))
+                    wallet.sign_publication_recovery(chain.config(), original, intent)
                 })
             })?
         };
@@ -1766,13 +1772,10 @@ impl Delivery {
                 && matches!(self.wallet.lock().map_err(|_| anyhow::anyhow!("delivery wallet lock failed"))?.status(), WalletStatus::Unlocked { address } if address == claim.terms.payee),
             "nonce cleanup authorization or unlocked wallet changed before broadcast"
         );
-        let signed = chain::SignedBytes {
-            raw_tx: recovery
-                .raw_tx
-                .context("nonce recovery has no signed bytes")?,
-            tx_hash: recovery.tx_hash.context("nonce recovery has no hash")?,
-        };
-        let _ = chain.broadcast(&signed).await;
+        let signed = recovery
+            .signed()
+            .context("nonce recovery has no signed bytes")?;
+        let _ = chain.broadcast(signed).await;
         paused(
             "nonce cleanup submitted; original reveal and cleanup hashes still require canonical reconciliation",
         )
@@ -1807,27 +1810,26 @@ impl Delivery {
         for id in &claim.attempts {
             let transaction = self.with_store(|s| s.transaction(id))?;
             let observed = chain.observe(&transaction).await?;
-            self.with_store(|s| {
-                s.observe_transaction(
-                    id,
-                    &observed.phase,
-                    observed.block_number,
-                    observed.block_hash.as_deref(),
-                    observed.error.as_deref(),
-                )
-            })?;
+            self.with_store(|s| s.observe_transaction(id, &observed))?;
             let (terminal, risk) = self
                 .reconcile_publication_nonce(chain, claim, &transaction, &observed, execute)
                 .await?;
             nonce_risk = risk.or(nonce_risk);
-            if let Some(number) = terminal.as_ref().and_then(|observed| observed.block_number) {
-                terminal_blocks.push(number);
-                if !matches!(observed.phase.as_str(), "confirmed" | "reverted") {
-                    self.with_store(|s| s.observe_transaction(id, "conflicted", None, None,
-                        Some("original publication nonce was canonically consumed by its recorded cleanup transaction")))?;
+            if let Some(block) = terminal
+                .as_ref()
+                .and_then(chain::TxObservation::final_receipt)
+            {
+                terminal_blocks.push(block.number);
+                if observed.final_receipt().is_none() {
+                    let conflict = transaction.observation(
+                        TxStatus::Conflicted,
+                        Some("original publication nonce was canonically consumed by its recorded cleanup transaction"),
+                    )?;
+                    self.with_store(|s| s.observe_transaction(id, &conflict))?;
                 }
             }
-            if observed.phase != "reverted" && (terminal.is_none() || observed.phase == "confirmed")
+            if !matches!(observed.status(), Some(TxStatus::Reverted(_)))
+                && (terminal.is_none() || matches!(observed.status(), Some(TxStatus::Confirmed(_))))
             {
                 last = Some((transaction, observed));
             }
@@ -1872,12 +1874,12 @@ impl Delivery {
                 hash(&item.capsule) == fact.capsule_hash,
                 "durable capsule differs from its reserved window"
             );
-            if fact.phase == 3 {
+            if fact.phase == ChainWindowPhase::Earned {
                 ensure!(fact.capsule == item.capsule, "earned capsule changed");
             } else {
                 earned = false;
                 all_windows_earned = false;
-                live_held &= fact.phase == 1;
+                live_held &= fact.phase == ChainWindowPhase::Held;
             }
             let expected = claim
                 .terms
@@ -1994,7 +1996,10 @@ impl Delivery {
         }
         let wallet = chain::address(&claim.terms.payee)?;
         let transaction = if let Some((transaction, observed)) = last {
-            if !matches!(observed.phase.as_str(), "unknown" | "reorged") {
+            if !matches!(
+                observed.status(),
+                Some(TxStatus::Unknown { .. } | TxStatus::Reorged)
+            ) {
                 return Ok(());
             }
             let pending = chain.pending_nonce(wallet).await?;
@@ -2074,8 +2079,7 @@ impl Delivery {
                     (&claim.key(), &serde_json::to_vec(&attempted)?),
                     |intent, nonce| {
                         ensure!(nonce == pending, "publication nonce is not contiguous");
-                        let signed = wallet.sign_transaction(chain.config(), intent, nonce)?;
-                        Ok((signed.raw_tx, signed.tx_hash))
+                        wallet.sign_transaction(chain.config(), intent, nonce)
                     },
                 )
             })?;
@@ -2142,19 +2146,53 @@ impl Delivery {
         }
         claim.risk = Some("publication may be disclosed; awaiting canonical earned state".into());
         self.save_claim(claim)?;
-        let signed = chain::SignedBytes {
-            raw_tx: transaction
-                .raw_tx
-                .context("publication raw bytes are missing")?,
-            tx_hash: transaction.tx_hash.context("publication hash is missing")?,
-        };
-        let _ = chain.broadcast(&signed).await;
+        let signed = transaction
+            .signed()
+            .context("publication raw bytes are missing")?;
+        let _ = chain.broadcast(signed).await;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn budget_transaction_response_preserves_the_flat_wire_shape() {
+        use super::{B256, TxStatus, chain, json, transaction_response};
+
+        let block = chain::BlockRef {
+            number: 20,
+            hash: B256::from([0x42; 32]),
+        };
+        let signed = format!("0x{}", "ba".repeat(32));
+        let observed = chain::TxObservation {
+            nonce: 17,
+            error: None,
+            state: chain::TxState::Signed {
+                signed: signed.clone(),
+                status: TxStatus::Confirmed(block),
+            },
+        };
+        assert_eq!(
+            transaction_response(&observed),
+            json!({
+                "phase": "confirmed", "tx_hash": signed,
+                "block_number": 20, "block_hash": format!("0x{}", "42".repeat(32)), "error": null,
+            })
+        );
+        let reserved = chain::TxObservation {
+            nonce: 17,
+            error: Some("awaiting signature".into()),
+            state: chain::TxState::Reserved,
+        };
+        assert_eq!(
+            transaction_response(&reserved),
+            json!({
+                "phase": "reserved", "tx_hash": null,
+                "block_number": null, "block_hash": null, "error": "awaiting signature",
+            })
+        );
+    }
     use super::*;
     use std::sync::{Arc, Mutex};
 
@@ -2243,18 +2281,19 @@ mod tests {
 
     struct NonceObservation {
         receipts: std::collections::BTreeMap<String, (bool, u64)>,
-        known: Vec<super::super::store::SignedTransaction>,
+        known: Vec<super::super::store::StoredTransaction>,
         latest: u64,
         pending: u64,
         base_fee: u64,
         balance: u64,
         broken: bool,
+        wrong_block_number: bool,
     }
     struct NonceFixture {
         delivery: Delivery,
         rpc: chain::tests::RpcFixture,
         observation: Arc<Mutex<NonceObservation>>,
-        original: super::super::store::SignedTransaction,
+        original: super::super::store::StoredTransaction,
         claim: PublicationClaim,
         dir: std::path::PathBuf,
     }
@@ -2292,6 +2331,7 @@ mod tests {
                 base_fee: 1,
                 balance: u64::MAX,
                 broken: false,
+                wrong_block_number: false,
             }));
             let observed = observation.clone();
             let rpc = chain::tests::rpc_fixture(config, move |request| {
@@ -2301,9 +2341,16 @@ mod tests {
                     "timestamp":format!("0x{:x}",super::super::now()),
                     "baseFeePerGas":format!("0x{:x}",state.base_fee)});
                 match request["method"].as_str().unwrap() {
-                    "eth_getBlockByNumber" => block(if request["params"][0] == "latest" {20} else {
-                        u64::from_str_radix(request["params"][0].as_str().unwrap().trim_start_matches("0x"),16).unwrap()
-                    }),
+                    "eth_getBlockByNumber" => {
+                        let tag = request["params"][0].as_str().unwrap();
+                        let number = if tag == "latest" {
+                            20
+                        } else {
+                            let requested = u64::from_str_radix(tag.trim_start_matches("0x"), 16).unwrap();
+                            requested + u64::from(state.wrong_block_number)
+                        };
+                        block(number)
+                    }
                     "eth_blockNumber" => json!("0x14"),
                     "eth_getTransactionCount" => json!(format!("0x{:x}",if request["params"][1]=="latest" {state.latest} else {state.pending})),
                     "eth_getBalance" => json!(format!("0x{:x}",state.balance)),
@@ -2314,8 +2361,8 @@ mod tests {
                             "to":chain::address_hex(escrow),"blockNumber":format!("0x{number:x}"),
                             "blockHash":block(*number)["hash"],"status":if *success {"0x1"}else{"0x0"}})
                     }
-                    "eth_getTransactionByHash" => state.known.iter().find(|tx| tx.tx_hash.as_deref()==request["params"][0].as_str())
-                        .map(|tx| json!({"hash":tx.tx_hash,"nonce":format!("0x{:x}",tx.nonce),"from":tx.intent.wallet,
+                    "eth_getTransactionByHash" => state.known.iter().find(|tx| tx.tx_hash()==request["params"][0].as_str())
+                        .map(|tx| json!({"hash":tx.tx_hash(),"nonce":format!("0x{:x}",tx.nonce),"from":tx.intent.wallet,
                             "to":tx.intent.to,"input":tx.intent.calldata})).unwrap_or(Value::Null),
                     "eth_sendRawTransaction" => {
                         let raw = hex::decode(request["params"][0].as_str().unwrap().trim_start_matches("0x")).unwrap();
@@ -2420,12 +2467,11 @@ mod tests {
                     cap,
                     (&claim.key(), &serde_json::to_vec(&claim)?),
                     |intent, nonce| {
-                        let signed = delivery.wallet.lock().unwrap().sign_transaction(
+                        delivery.wallet.lock().unwrap().sign_transaction(
                             rpc.chain.config(),
                             intent,
                             nonce,
-                        )?;
-                        Ok((signed.raw_tx, signed.tx_hash))
+                        )
                     },
                 )
             })?;
@@ -2446,15 +2492,8 @@ mod tests {
                 .delivery
                 .with_store(|store| store.transaction(&self.original.intent.id))?;
             let observed = self.rpc.chain.observe(&original).await?;
-            self.delivery.with_store(|store| {
-                store.observe_transaction(
-                    &original.intent.id,
-                    &observed.phase,
-                    observed.block_number,
-                    observed.block_hash.as_deref(),
-                    observed.error.as_deref(),
-                )
-            })?;
+            self.delivery
+                .with_store(|store| store.observe_transaction(&original.intent.id, &observed))?;
             self.delivery
                 .reconcile_publication_nonce(
                     &self.rpc.chain,
@@ -2465,7 +2504,7 @@ mod tests {
                 )
                 .await
         }
-        fn recoveries(&self) -> Result<Vec<super::super::store::SignedTransaction>> {
+        fn recoveries(&self) -> Result<Vec<super::super::store::StoredTransaction>> {
             self.delivery
                 .with_store(|store| store.publication_recoveries(&self.original.intent.id))
         }
@@ -2481,6 +2520,69 @@ mod tests {
         }
     }
 
+    fn nonce_receipt_status(succeeded: bool) -> TxStatus {
+        let block = chain::BlockRef {
+            number: 10,
+            hash: B256::repeat_byte(0x55),
+        };
+        if succeeded {
+            TxStatus::Confirmed(block)
+        } else {
+            TxStatus::Reverted(block)
+        }
+    }
+
+    #[tokio::test]
+    async fn publication_observation_keeps_its_block_and_rejects_wrong_height_without_signing()
+    -> Result<()> {
+        let fixture = NonceFixture::new(true, true).await?;
+        {
+            let mut state = fixture.observation.lock().unwrap();
+            state.wrong_block_number = true;
+            state
+                .receipts
+                .insert(fixture.original.tx_hash().unwrap().to_owned(), (true, 10));
+        }
+        assert!(
+            fixture
+                .step(true)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("another block")
+        );
+        assert!(fixture.recoveries()?.is_empty());
+        assert!(fixture.sent().is_empty());
+        let original = fixture
+            .delivery
+            .with_store(|store| store.transaction(&fixture.original.intent.id))?;
+        assert_eq!(original, fixture.original);
+        fixture.observation.lock().unwrap().wrong_block_number = false;
+        let (terminal, _) = fixture.step(true).await?;
+        assert_eq!(
+            terminal.unwrap().status(),
+            Some(&nonce_receipt_status(true))
+        );
+        fixture.observation.lock().unwrap().receipts.clear();
+        let (terminal, risk) = fixture.step(true).await?;
+        assert!(terminal.is_none());
+        assert!(risk.unwrap().contains("canonical nonce outcome"));
+        let original = fixture
+            .delivery
+            .with_store(|store| store.transaction(&fixture.original.intent.id))?;
+        assert_eq!(
+            original.status(),
+            Some(&TxStatus::Unknown {
+                last_block: nonce_receipt_status(true).block().cloned()
+            })
+        );
+        assert_eq!(original.signed(), fixture.original.signed());
+        assert_eq!(original.nonce, fixture.original.nonce);
+        assert!(fixture.recoveries()?.is_empty());
+        assert!(fixture.sent().is_empty());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn expired_private_and_disclosed_nonces_recover_without_disclosing_reveal_bytes()
     -> Result<()> {
@@ -2491,8 +2593,11 @@ mod tests {
             let recoveries = fixture.recoveries()?;
             assert_eq!(recoveries.len(), 1);
             assert_eq!(recoveries[0].nonce, fixture.original.nonce);
-            assert_ne!(recoveries[0].raw_tx, fixture.original.raw_tx);
-            assert_eq!(fixture.sent(), vec![recoveries[0].raw_tx.clone().unwrap()]);
+            assert_ne!(recoveries[0].signed(), fixture.original.signed());
+            assert_eq!(
+                fixture.sent(),
+                vec![recoveries[0].signed().unwrap().raw_tx.clone()]
+            );
             assert_eq!(
                 fixture
                     .delivery
@@ -2504,13 +2609,13 @@ mod tests {
                 let mut state = fixture.observation.lock().unwrap();
                 state
                     .receipts
-                    .insert(recoveries[0].tx_hash.clone().unwrap(), (disclosed, 10));
+                    .insert(recoveries[0].tx_hash().unwrap().to_owned(), (disclosed, 10));
                 state.latest = 8;
                 state.pending = 8;
             }
             assert_eq!(
-                fixture.step(true).await?.0.unwrap().phase,
-                if disclosed { "confirmed" } else { "reverted" }
+                fixture.step(true).await?.0.unwrap().status(),
+                Some(&nonce_receipt_status(disclosed))
             );
             assert_eq!(fixture.sent().len(), 1);
             let persisted = fixture.delivery.claims()?.remove(0);
@@ -2604,21 +2709,27 @@ mod tests {
         )?;
         fixture.step(true).await?;
         assert_eq!(fixture.recoveries()?.len(), 1);
-        assert_eq!(fixture.sent(), vec![first.raw_tx.clone().unwrap(); 2]);
+        assert_eq!(
+            fixture.sent(),
+            vec![first.signed().unwrap().raw_tx.clone(); 2]
+        );
         {
             let mut state = fixture.observation.lock().unwrap();
             state
                 .receipts
-                .insert(first.tx_hash.clone().unwrap(), (false, 10));
+                .insert(first.tx_hash().unwrap().to_owned(), (false, 10));
             state.latest = 8;
             state.pending = 8;
         }
-        assert_eq!(fixture.step(true).await?.0.unwrap().phase, "reverted");
+        assert_eq!(
+            fixture.step(true).await?.0.unwrap().status(),
+            Some(&nonce_receipt_status(false))
+        );
         let original = fixture
             .delivery
             .with_store(|store| store.transaction(&fixture.original.intent.id))?;
-        assert_eq!(original.raw_tx, fixture.original.raw_tx);
-        assert_ne!(original.phase, "confirmed");
+        assert_eq!(original.signed(), fixture.original.signed());
+        assert!(!matches!(original.status(), Some(TxStatus::Confirmed(_))));
         let mut next = fixture.original.intent.clone();
         next.id = format!(
             "{}/withdraw-after-cleanup",
@@ -2641,12 +2752,11 @@ mod tests {
                 &group(&fixture.claim.terms.budget_id),
                 &fixture.claim.terms.gas_cap,
                 |intent, nonce| {
-                    let signed = fixture.delivery.wallet.lock().unwrap().sign_transaction(
+                    fixture.delivery.wallet.lock().unwrap().sign_transaction(
                         fixture.rpc.chain.config(),
                         intent,
                         nonce,
-                    )?;
-                    Ok((signed.raw_tx, signed.tx_hash))
+                    )
                 },
             )
         })?;
@@ -2656,15 +2766,16 @@ mod tests {
             fixture.step(true).await?;
             {
                 let mut state = fixture.observation.lock().unwrap();
-                state
-                    .receipts
-                    .insert(fixture.original.tx_hash.clone().unwrap(), (success, 10));
+                state.receipts.insert(
+                    fixture.original.tx_hash().unwrap().to_owned(),
+                    (success, 10),
+                );
                 state.latest = 8;
                 state.pending = 8;
             }
             assert_eq!(
-                fixture.step(true).await?.0.unwrap().phase,
-                if success { "confirmed" } else { "reverted" }
+                fixture.step(true).await?.0.unwrap().status(),
+                Some(&nonce_receipt_status(success))
             );
             assert_eq!(fixture.recoveries()?.len(), 1);
             assert_eq!(fixture.sent().len(), 1);
@@ -3081,10 +3192,13 @@ mod tests {
                         &claim.terms.gas_cap,
                         (&claim.key(), &serde_json::to_vec(&claim)?),
                         |_, _| {
-                            Ok((
-                                "0x02".into(),
-                                format!("0x{}", format!("{:02x}", 0x99 + index).repeat(32)),
-                            ))
+                            Ok(chain::SignedBytes {
+                                raw_tx: "0x02".into(),
+                                tx_hash: format!(
+                                    "0x{}",
+                                    format!("{:02x}", 0x99 + index).repeat(32)
+                                ),
+                            })
                         },
                     )?;
                     Ok(())
@@ -3141,7 +3255,7 @@ mod tests {
             }
             Ok(())
         }
-        fn original_transactions(&self) -> Result<Vec<super::super::store::SignedTransaction>> {
+        fn original_transactions(&self) -> Result<Vec<super::super::store::StoredTransaction>> {
             self.claims
                 .iter()
                 .map(|claim| {
@@ -3152,13 +3266,12 @@ mod tests {
         }
         fn assert_read_only(
             &self,
-            before: &[super::super::store::SignedTransaction],
+            before: &[super::super::store::StoredTransaction],
         ) -> Result<()> {
             for (old, new) in before.iter().zip(self.original_transactions()?) {
                 assert_eq!(old.intent, new.intent);
                 assert_eq!(old.nonce, new.nonce);
-                assert_eq!(old.raw_tx, new.raw_tx);
-                assert_eq!(old.tx_hash, new.tx_hash);
+                assert_eq!(old.signed(), new.signed());
             }
             let requests = self.rpc.requests.lock().unwrap();
             assert!(requests.iter().all(|request| !matches!(
@@ -3658,7 +3771,9 @@ mod tests {
             let reopened =
                 super::super::store::ServiceStore::open(&fixture.dir, 64 * 1024 * 1024, 128)?;
             assert_eq!(
-                reopened.transaction(&fixture.claims[0].attempts[0])?.phase,
+                super::super::store::transaction_phase_name(
+                    &reopened.transaction(&fixture.claims[0].attempts[0])?.state
+                ),
                 outcome
             );
             assert!(
@@ -3881,7 +3996,7 @@ mod tests {
                 }
             }
             for transaction in fixture.original_transactions()? {
-                assert_eq!(transaction.phase, "confirmed");
+                assert!(matches!(transaction.status(), Some(TxStatus::Confirmed(_))));
             }
             fixture.assert_read_only(&before)?;
         }

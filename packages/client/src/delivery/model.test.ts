@@ -4,8 +4,9 @@ import test from 'node:test'
 import type { ReadyConnection } from '../lib/node.ts'
 import type { Platform } from '../lib/platform.ts'
 import { bytesToBase64, sha256Hex } from '../lib/byte-codec.ts'
+import { formatSize } from '../workspace/model.ts'
 import { createDeliveryClient } from './client.ts'
-import { amount, canRead, canRestart, checkedFile, draftFor, fromBase64, orderActions, orderSummary, orderTitle, parseBudgets, parseOrder, parseReceived, parseStatus, publicationLabel, providerChoices, receiverChoices, receivingBatches, settlementAmountsLabel, sizeLabel, walletNotice } from './model.ts'
+import { amount, canRead, canRestart, checkedFile, draftFor, fromBase64, orderActions, orderSummary, orderTitle, parseBudgets, parseOrder, parseReceived, parseStatus, publicationLabel, providerChoices, receiverChoices, receivingBatches, settlementAmountsLabel, sizeLabel, transferCopy, walletNotice } from './model.ts'
 import type { DeliveryDraft, DeliveryOrder, DeliveryStatus, ReserveDeliveryIntent } from './types.ts'
 
 const reserveDeliveryIntent: ReserveDeliveryIntent = async (_key, reserve) => reserve()
@@ -352,19 +353,29 @@ test('an unavailable wallet retains its distinct failure state and asks for its 
   assert.throws(() => parseStatus({ ...status, wallet: { state: 'unavailable', address: `0x${'66'.repeat(20)}`, reason: 'bad' } }))
 })
 
-test('sizes read as bytes, KB or MB and a limit never rounds up past what fits', () => {
-  assert.equal(sizeLabel(512), '512 字节')
-  assert.equal(sizeLabel(48 * 1024), '48 KB')
-  assert.equal(sizeLabel(1536), '1.5 KB')
-  assert.equal(sizeLabel(130_816, true), '127 KB')
-  assert.equal(sizeLabel(1024 * 1024 - 1, true), '1023 KB')
-  assert.equal(sizeLabel(5 * 1024 * 1024), '5.0 MB')
+test('attachments and transfers use the same decimal size labels', () => {
+  const examples: Array<[number, string]> = [
+    [0, '0 字节'], [999, '999 字节'], [1000, '1.0 KB'], [1023, '1.0 KB'], [1024, '1.0 KB'],
+    [1249, '1.2 KB'], [1250, '1.3 KB'], [1536, '1.5 KB'], [48 * 1024, '49 KB'],
+    [1_000_000, '1.0 MB'], [5 * 1024 * 1024, '5.2 MB'], [1_000_000_000, '1.0 GB'],
+  ]
+  for (const [bytes, expected] of examples) {
+    assert.equal(formatSize(bytes), expected)
+    assert.equal(sizeLabel(bytes), expected)
+  }
+})
+
+test('transfer limits round down in the size hint and the oversized file error', () => {
+  assert.equal(sizeLabel(1_099_999), '1.1 MB')
+  assert.equal(sizeLabel(1_099_999, { rounding: 'floor' }), '1.0 MB')
+  assert.equal(transferCopy.maxSize(130_816), '最大 130 KB')
+  assert.equal(transferCopy.tooLarge(130_816), '文件超过 130 KB，换一个小点的')
 })
 
 test('a record reads as file name and one plain line, and offers only what this side can do', () => {
   const sent = { ...order(), name: 'a.txt', bytes: 48 * 1024, phase: 'recoverable', evidence: 'charity_receipt' } as DeliveryOrder
   assert.equal(orderTitle(sent), 'a.txt')
-  assert.equal(orderSummary(sent), '免费 · 48 KB · 已送达')
+  assert.equal(orderSummary(sent), '免费 · 49 KB · 已送达')
   assert.deepEqual(orderActions({ ...sent, phase: 'prepared', evidence: 'none' }), { confirm: true, accept: false, save: false }, 'nothing is saved before the send is confirmed')
   const received = { ...sent, role: 'receiver', name: null, evidence: 'none', phase: 'transferring' } as DeliveryOrder
   assert.equal(orderTitle(received), '待接收的文件')

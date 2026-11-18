@@ -1033,13 +1033,7 @@ export function parseBinaryPage(value: unknown, hash: string, offset: number) {
   return { bytes, next_offset, size }
 }
 
-/** 1536 → "1.5 KB"; decimal units, as file managers show them. */
-export function formatSize(bytes: number) {
-  const units = ["字节", "KB", "MB", "GB"]
-  let value = bytes, unit = 0
-  while (value >= 1000 && unit < units.length - 1) { value /= 1000; unit += 1 }
-  return unit === 0 ? `${bytes} 字节` : `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`
-}
+export { formatByteSize as formatSize } from "../lib/byte-size.ts"
 
 /** The largest attachment the entry accepts; an empty file is refused too. */
 export const attachmentLimit = 64 * 1024 * 1024

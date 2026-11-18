@@ -35,8 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with: {ref: '${{ inputs.source_sha }}', fetch-depth: 0, persist-credentials: false}
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with: {node-version: '24'}
+      - uses: ./.github/actions/setup-js
       - name: Select this platform's Python
         run: printf 'PY=%s\n' "$(command -v python3 || command -v python)" >> "$GITHUB_ENV"
       - uses: ./.github/actions/native-desktop

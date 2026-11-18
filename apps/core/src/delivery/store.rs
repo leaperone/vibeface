@@ -1,3 +1,4 @@
+use super::chain::{BlockRef, SignedBytes, TxObservation, TxState, TxStatus, word};
 use super::types::{DeliveryOrder, Evidence, Mode, Role, StoredOrder, parse_word};
 use alloy_primitives::U256;
 use anyhow::{Context, Result, ensure};
@@ -25,17 +26,44 @@ pub struct SpendIntent {
     pub max_fee_per_gas: String,
     pub max_priority_fee_per_gas: String,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SignedTransaction {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredTransaction {
     pub intent: SpendIntent,
     pub nonce: u64,
-    pub raw_tx: Option<String>,
-    pub tx_hash: Option<String>,
-    pub phase: String,
-    pub block_number: Option<u64>,
-    pub block_hash: Option<String>,
+    pub state: TxState<SignedBytes>,
     pub error: Option<String>,
+}
+
+impl StoredTransaction {
+    pub fn signed(&self) -> Option<&SignedBytes> {
+        self.state.signed()
+    }
+
+    pub fn tx_hash(&self) -> Option<&str> {
+        self.signed().map(|signed| signed.tx_hash.as_str())
+    }
+
+    pub fn status(&self) -> Option<&TxStatus> {
+        self.state.status()
+    }
+
+    pub fn block(&self) -> Option<&BlockRef> {
+        self.status().and_then(TxStatus::block)
+    }
+
+    pub fn observation(&self, status: TxStatus, error: Option<&str>) -> Result<TxObservation> {
+        Ok(TxObservation {
+            nonce: self.nonce,
+            state: TxState::Signed {
+                signed: self
+                    .tx_hash()
+                    .context("delivery transaction has not been signed")?
+                    .to_owned(),
+                status,
+            },
+            error: error.map(str::to_owned),
+        })
+    }
 }
 
 pub struct ServiceStore {
@@ -45,10 +73,43 @@ pub struct ServiceStore {
     max_orders: u32,
     admissions: (std::time::Instant, u32),
 }
-struct DbTransactionRow {
-    intent: String,
+
+const RESERVED: &str = "reserved";
+const SIGNED: &str = "signed";
+const SUBMITTED: &str = "submitted";
+const INCLUDED: &str = "included";
+const CONFIRMING: &str = "confirming";
+const CONFIRMED: &str = "confirmed";
+const REORGED: &str = "reorged";
+const REVERTED: &str = "reverted";
+const UNKNOWN: &str = "unknown";
+const FAILED: &str = "failed";
+const CONFLICTED: &str = "conflicted";
+
+pub(super) fn transaction_phase_name<T>(state: &TxState<T>) -> &'static str {
+    match state.status() {
+        None => RESERVED,
+        Some(TxStatus::Unbroadcast) => SIGNED,
+        Some(TxStatus::Submitted) => SUBMITTED,
+        Some(TxStatus::Included(_)) => INCLUDED,
+        Some(TxStatus::Confirming(_)) => CONFIRMING,
+        Some(TxStatus::Confirmed(_)) => CONFIRMED,
+        Some(TxStatus::Reorged) => REORGED,
+        Some(TxStatus::Reverted(_)) => REVERTED,
+        Some(TxStatus::Unknown { .. }) => UNKNOWN,
+        Some(TxStatus::Failed) => FAILED,
+        Some(TxStatus::Conflicted) => CONFLICTED,
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DbTransactionRow<I> {
+    intent: I,
     nonce: u64,
+    #[serde(rename = "raw_tx")]
     raw: Option<String>,
+    #[serde(rename = "tx_hash")]
     hash: Option<String>,
     phase: String,
     block_number: Option<u64>,
@@ -56,7 +117,7 @@ struct DbTransactionRow {
     error: Option<String>,
 }
 
-impl DbTransactionRow {
+impl DbTransactionRow<String> {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             intent: row.get("intent")?,
@@ -71,21 +132,104 @@ impl DbTransactionRow {
     }
 }
 
-impl TryFrom<DbTransactionRow> for SignedTransaction {
-    type Error = anyhow::Error;
-
-    fn try_from(row: DbTransactionRow) -> Result<Self> {
-        Ok(Self {
-            intent: serde_json::from_str(&row.intent)?,
-            nonce: row.nonce,
-            raw_tx: row.raw,
-            tx_hash: row.hash,
-            phase: row.phase,
-            block_number: row.block_number,
-            block_hash: row.block_hash,
-            error: row.error,
+impl<I> DbTransactionRow<I> {
+    fn decode(
+        self,
+        parse_intent: impl FnOnce(I) -> Result<SpendIntent>,
+    ) -> Result<StoredTransaction> {
+        let block = match (self.block_number, self.block_hash) {
+            (Some(number), Some(hash)) => Some(BlockRef {
+                number,
+                hash: word(&hash)?,
+            }),
+            (None, None) => None,
+            _ => anyhow::bail!("delivery transaction has incomplete block evidence"),
+        };
+        let state = match (self.phase.as_str(), self.raw, self.hash, block) {
+            (RESERVED, None, None, None) => TxState::Reserved,
+            (phase, Some(raw_tx), Some(tx_hash), block) => {
+                check_signed_bytes(&raw_tx, &tx_hash)?;
+                let status = match (phase, block) {
+                    (SIGNED, None) => TxStatus::Unbroadcast,
+                    (SUBMITTED, None) => TxStatus::Submitted,
+                    (INCLUDED, Some(block)) => TxStatus::Included(block),
+                    (CONFIRMING, Some(block)) => TxStatus::Confirming(block),
+                    (CONFIRMED, Some(block)) => TxStatus::Confirmed(block),
+                    (REORGED, None) => TxStatus::Reorged,
+                    (REVERTED, Some(block)) => TxStatus::Reverted(block),
+                    (UNKNOWN, last_block) => TxStatus::Unknown { last_block },
+                    (FAILED, None) => TxStatus::Failed,
+                    (CONFLICTED, None) => TxStatus::Conflicted,
+                    _ => anyhow::bail!("invalid delivery transaction phase or block evidence"),
+                };
+                TxState::Signed {
+                    signed: SignedBytes { raw_tx, tx_hash },
+                    status,
+                }
+            }
+            _ => anyhow::bail!("invalid delivery transaction phase or signed bytes"),
+        };
+        Ok(StoredTransaction {
+            intent: parse_intent(self.intent)?,
+            nonce: self.nonce,
+            state,
+            error: self.error,
         })
     }
+}
+
+impl TryFrom<DbTransactionRow<String>> for StoredTransaction {
+    type Error = anyhow::Error;
+
+    fn try_from(row: DbTransactionRow<String>) -> Result<Self> {
+        row.decode(|intent| Ok(serde_json::from_str(&intent)?))
+    }
+}
+
+fn decode_recoveries(body: &[u8]) -> Result<Vec<StoredTransaction>> {
+    serde_json::from_slice::<Vec<DbTransactionRow<SpendIntent>>>(body)?
+        .into_iter()
+        .map(|row| {
+            let recovery = row.decode(Ok)?;
+            ensure!(
+                recovery.signed().is_some(),
+                "nonce recovery has no signed bytes"
+            );
+            Ok(recovery)
+        })
+        .collect()
+}
+
+fn block_columns(block: Option<&BlockRef>) -> (Option<u64>, Option<String>) {
+    match block {
+        Some(block) => (Some(block.number), Some(format!("{:#x}", block.hash))),
+        None => (None, None),
+    }
+}
+
+fn encode_recoveries(recoveries: Vec<StoredTransaction>) -> Result<Vec<u8>> {
+    let rows: Vec<_> = recoveries
+        .into_iter()
+        .map(|recovery| {
+            let phase = transaction_phase_name(&recovery.state).to_owned();
+            let (block_number, block_hash) = block_columns(recovery.block());
+            let (raw, hash) = match recovery.state {
+                TxState::Reserved => (None, None),
+                TxState::Signed { signed, .. } => (Some(signed.raw_tx), Some(signed.tx_hash)),
+            };
+            DbTransactionRow {
+                intent: recovery.intent,
+                nonce: recovery.nonce,
+                raw,
+                hash,
+                phase,
+                block_number,
+                block_hash,
+                error: recovery.error,
+            }
+        })
+        .collect();
+    Ok(serde_json::to_vec(&rows)?)
 }
 
 fn private_directory(path: &Path) -> Result<()> {
@@ -239,8 +383,8 @@ impl ServiceStore {
             return Ok(false);
         };
         Ok(self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM transactions WHERE substr(id,1,length(?1)+1)=?1||'/' AND (raw IS NULL OR phase NOT IN ('confirmed','failed','reverted','conflicted')))",
-            [format!("budget-{budget}")],
+            "SELECT EXISTS(SELECT 1 FROM transactions WHERE substr(id,1,length(?1)+1)=?1||'/' AND (raw IS NULL OR phase NOT IN (?2,?3,?4,?5)))",
+            params![format!("budget-{budget}"), CONFIRMED, FAILED, REVERTED, CONFLICTED],
             |row| row.get(0),
         )?)
     }
@@ -294,7 +438,7 @@ impl ServiceStore {
             .budget_id
             .as_ref()
             .map(|id| format!("budget-{id}"));
-        let pending: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM transactions WHERE (substr(id,1,length(?1)+1)=?1||'/' OR substr(id,1,length(?2)+1)=?2||'/') AND (raw IS NULL OR phase NOT IN ('confirmed','failed','reverted','conflicted')))", params![id,budget], |row| row.get(0))?;
+        let pending: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM transactions WHERE (substr(id,1,length(?1)+1)=?1||'/' OR substr(id,1,length(?2)+1)=?2||'/') AND (raw IS NULL OR phase NOT IN (?3,?4,?5,?6)))", params![id,budget,CONFIRMED,FAILED,REVERTED,CONFLICTED], |row| row.get(0))?;
         if !pending && !super::budget::publication_retains_objects(self, id)? {
             self.remove_objects(id, true)?;
         }
@@ -825,7 +969,7 @@ impl ServiceStore {
         &mut self,
         intent: &SpendIntent,
         pending_nonce: u64,
-    ) -> Result<SignedTransaction> {
+    ) -> Result<StoredTransaction> {
         self.reserve_transaction_inner(intent, pending_nonce, None, None, |_, _| Ok(None))
     }
     #[cfg(test)]
@@ -835,7 +979,7 @@ impl ServiceStore {
         pending_nonce: u64,
         budget_group: &str,
         total_gas_cap: &str,
-    ) -> Result<SignedTransaction> {
+    ) -> Result<StoredTransaction> {
         self.reserve_transaction_inner(
             intent,
             pending_nonce,
@@ -850,8 +994,8 @@ impl ServiceStore {
         pending_nonce: u64,
         budget_group: &str,
         total_gas_cap: &str,
-        sign: impl FnOnce(&SpendIntent, u64) -> Result<(String, String)>,
-    ) -> Result<SignedTransaction> {
+        sign: impl FnOnce(&SpendIntent, u64) -> Result<SignedBytes>,
+    ) -> Result<StoredTransaction> {
         self.reserve_transaction_inner(
             intent,
             pending_nonce,
@@ -867,8 +1011,8 @@ impl ServiceStore {
         budget_group: &str,
         total_gas_cap: &str,
         claim: (&str, &[u8]),
-        sign: impl FnOnce(&SpendIntent, u64) -> Result<(String, String)>,
-    ) -> Result<SignedTransaction> {
+        sign: impl FnOnce(&SpendIntent, u64) -> Result<SignedBytes>,
+    ) -> Result<StoredTransaction> {
         ensure!(
             budget_group.starts_with("budget-")
                 && intent.id.starts_with(&format!("{budget_group}/reveal-")),
@@ -882,23 +1026,22 @@ impl ServiceStore {
             |intent, nonce| sign(intent, nonce).map(Some),
         )
     }
-    pub(super) fn publication_recoveries(&self, id: &str) -> Result<Vec<SignedTransaction>> {
+    pub(super) fn publication_recoveries(&self, id: &str) -> Result<Vec<StoredTransaction>> {
         self.value(&format!("protected-nonce:{id}"))?
-            .map(|body| serde_json::from_slice(&body).map_err(Into::into))
+            .map(|body| decode_recoveries(&body))
             .unwrap_or_else(|| Ok(Vec::new()))
     }
     pub(super) fn signed_publication_recovery(
         &mut self,
-        original: &SignedTransaction,
+        original: &StoredTransaction,
         intent: &SpendIntent,
-        sign: impl FnOnce(&SignedTransaction, &SpendIntent) -> Result<(String, String)>,
-    ) -> Result<SignedTransaction> {
+        sign: impl FnOnce(&StoredTransaction, &SpendIntent) -> Result<SignedBytes>,
+    ) -> Result<StoredTransaction> {
         let current = self.transaction(&original.intent.id)?;
         ensure!(
             current.intent == original.intent
                 && current.nonce == original.nonce
-                && current.raw_tx == original.raw_tx
-                && current.tx_hash == original.tx_hash,
+                && current.signed() == original.signed(),
             "original publication changed before nonce recovery"
         );
         let key = format!("protected-nonce:{}", original.intent.id);
@@ -913,8 +1056,8 @@ impl ServiceStore {
                 |row| row.get(0),
             )
             .optional()?;
-        let mut recoveries: Vec<SignedTransaction> = body
-            .map(|body| serde_json::from_slice(&body))
+        let mut recoveries = body
+            .map(|body| decode_recoveries(&body))
             .transpose()?
             .unwrap_or_default();
         ensure!(
@@ -923,20 +1066,19 @@ impl ServiceStore {
                 && intent.wallet == original.intent.wallet,
             "nonce recovery must append to the original publication ledger"
         );
-        let (raw, hash) = sign(original, intent)?;
-        check_signed_bytes(&raw, &hash)?;
-        let recovery = SignedTransaction {
+        let signed = sign(original, intent)?;
+        check_signed_bytes(&signed.raw_tx, &signed.tx_hash)?;
+        let recovery = StoredTransaction {
             intent: intent.clone(),
             nonce: original.nonce,
-            raw_tx: Some(raw),
-            tx_hash: Some(hash),
-            phase: "signed".into(),
-            block_number: None,
-            block_hash: None,
+            state: TxState::Signed {
+                signed,
+                status: TxStatus::Unbroadcast,
+            },
             error: None,
         };
         recoveries.push(recovery.clone());
-        let body = serde_json::to_vec(&recoveries)?;
+        let body = encode_recoveries(recoveries)?;
         ensure!(body.len() <= 1024 * 1024, "nonce recovery ledger is full");
         tx.execute("INSERT INTO private_values(id,body) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body", params![key,body])?;
         check_capacity_limits(&tx, self.capacity, self.max_orders)?;
@@ -946,21 +1088,34 @@ impl ServiceStore {
     pub(super) fn observe_publication_recovery(
         &self,
         id: &str,
-        hash: &str,
-        observed: &super::chain::TxObservation,
+        observed: &TxObservation,
     ) -> Result<()> {
+        let TxState::Signed {
+            signed: hash,
+            status,
+        } = &observed.state
+        else {
+            anyhow::bail!("nonce recovery observation has no signed hash");
+        };
         let mut recoveries = self.publication_recoveries(id)?;
-        let recovery = recoveries
+        let (state, error) = recoveries
             .iter_mut()
-            .find(|recovery| recovery.tx_hash.as_deref() == Some(hash))
+            .find_map(|recovery| {
+                if recovery.nonce == observed.nonce
+                    && let TxState::Signed { signed, status } = &mut recovery.state
+                    && signed.tx_hash == *hash
+                {
+                    Some((status, &mut recovery.error))
+                } else {
+                    None
+                }
+            })
             .context("nonce recovery hash is not in its original ledger")?;
-        recovery.phase = observed.phase.clone();
-        recovery.block_number = observed.block_number;
-        recovery.block_hash = observed.block_hash.clone();
-        recovery.error = observed.error.clone();
+        *state = status.clone();
+        *error = observed.error.clone();
         self.put_value(
             &format!("protected-nonce:{id}"),
-            &serde_json::to_vec(&recoveries)?,
+            &encode_recoveries(recoveries)?,
         )
     }
     fn reserve_transaction_inner(
@@ -969,8 +1124,8 @@ impl ServiceStore {
         pending_nonce: u64,
         budget: Option<(&str, &str)>,
         claim: Option<(&str, &[u8])>,
-        sign: impl FnOnce(&SpendIntent, u64) -> Result<Option<(String, String)>>,
-    ) -> Result<SignedTransaction> {
+        sign: impl FnOnce(&SpendIntent, u64) -> Result<Option<SignedBytes>>,
+    ) -> Result<StoredTransaction> {
         ensure!(
             !intent.id.is_empty()
                 && intent.id.len() <= 160
@@ -1001,24 +1156,28 @@ impl ServiceStore {
                 row.intent == encoded,
                 "transaction intent changed across retry"
             );
-            let mut transaction = SignedTransaction::try_from(row)?;
+            let mut transaction = StoredTransaction::try_from(row)?;
             let nonce = transaction.nonce;
-            if transaction.raw_tx.is_none() {
+            if transaction.signed().is_none() {
                 ensure!(
                     hole.as_deref() == Some(intent.id.as_str()),
                     "recover the earliest unsigned delivery intent before another spend"
                 );
-                if let Some((raw, hash)) = sign(intent, nonce)? {
-                    check_signed_bytes(&raw, &hash)?;
+                if let Some(signed) = sign(intent, nonce)? {
+                    check_signed_bytes(&signed.raw_tx, &signed.tx_hash)?;
                     ensure!(
-                        used + raw.len() as u64 <= self.capacity
-                            && usage[class].1 + raw.len() as u64 <= class_room,
+                        used + signed.raw_tx.len() as u64 <= self.capacity
+                            && usage[class].1 + signed.raw_tx.len() as u64 <= class_room,
                         "signed delivery transaction storage quota exceeded"
                     );
-                    tx.execute("UPDATE transactions SET raw=?2,hash=?3,phase='signed',error=NULL WHERE id=?1",params![intent.id,raw,hash])?;
-                    transaction.raw_tx = Some(raw);
-                    transaction.tx_hash = Some(hash);
-                    transaction.phase = "signed".into();
+                    tx.execute(
+                        "UPDATE transactions SET raw=?2,hash=?3,phase=?4,error=NULL WHERE id=?1",
+                        params![intent.id, signed.raw_tx, signed.tx_hash, SIGNED],
+                    )?;
+                    transaction.state = TxState::Signed {
+                        signed,
+                        status: TxStatus::Unbroadcast,
+                    };
                     transaction.error = None;
                 }
             }
@@ -1086,24 +1245,26 @@ impl ServiceStore {
         )?;
         let nonce = pending_nonce.max(last.map(|n| n + 1).unwrap_or(0));
         ensure!(nonce < i64::MAX as u64, "transaction nonce exhausted");
-        let signed = sign(intent, nonce)?;
-        if let Some((raw, hash)) = &signed {
-            check_signed_bytes(raw, hash)?;
-        }
-        let (raw_tx, tx_hash, phase) = match signed {
-            Some((raw, hash)) => (Some(raw), Some(hash), "signed"),
-            None => (None, None, "reserved"),
+        let state = match sign(intent, nonce)? {
+            Some(signed) => {
+                check_signed_bytes(&signed.raw_tx, &signed.tx_hash)?;
+                TxState::Signed {
+                    signed,
+                    status: TxStatus::Unbroadcast,
+                }
+            }
+            None => TxState::Reserved,
         };
+        let raw_tx = state.signed().map(|signed| signed.raw_tx.as_str());
+        let tx_hash = state.signed().map(|signed| signed.tx_hash.as_str());
+        let phase = transaction_phase_name(&state);
         ensure!(
-            used + encoded.len() as u64 + raw_tx.as_ref().map_or(0, |raw| raw.len() as u64) + 1024
+            used + encoded.len() as u64 + raw_tx.map_or(0, |raw| raw.len() as u64) + 1024
                 <= self.capacity,
             "signed delivery transaction storage quota exceeded"
         );
         ensure!(
-            usage[class].1
-                + encoded.len() as u64
-                + raw_tx.as_ref().map_or(0, |raw| raw.len() as u64)
-                + 1024
+            usage[class].1 + encoded.len() as u64 + raw_tx.map_or(0, |raw| raw.len() as u64) + 1024
                 <= class_room,
             "public transaction storage quota exceeded"
         );
@@ -1113,14 +1274,10 @@ impl ServiceStore {
         }
         check_capacity_limits(&tx, self.capacity, self.max_orders)?;
         tx.commit()?;
-        Ok(SignedTransaction {
+        Ok(StoredTransaction {
             intent: intent.clone(),
             nonce,
-            raw_tx,
-            tx_hash,
-            phase: phase.into(),
-            block_number: None,
-            block_hash: None,
+            state,
             error: None,
         })
     }
@@ -1132,51 +1289,48 @@ impl ServiceStore {
             transaction.nonce,
             None,
             None,
-            |_, _| Ok(Some((raw.to_owned(), hash.to_owned()))),
+            |_, _| {
+                Ok(Some(SignedBytes {
+                    raw_tx: raw.to_owned(),
+                    tx_hash: hash.to_owned(),
+                }))
+            },
         )?;
         Ok(())
     }
-    pub fn observe_transaction(
-        &self,
-        id: &str,
-        phase: &str,
-        block_number: Option<u64>,
-        block_hash: Option<&str>,
-        error: Option<&str>,
-    ) -> Result<()> {
-        ensure!(
-            matches!(
+    pub fn observe_transaction(&self, id: &str, observed: &TxObservation) -> Result<()> {
+        let phase = transaction_phase_name(&observed.state);
+        let (block_number, block_hash) = block_columns(observed.block());
+        let changed = self.db.execute(
+            "UPDATE transactions SET phase=?2,block_number=?3,block_hash=?4,error=?5,checked_at=?6
+             WHERE id=?1 AND nonce=?7 AND hash IS ?8 AND (raw IS NULL) = (?8 IS NULL)",
+            params![
+                id,
                 phase,
-                "reserved"
-                    | "signed"
-                    | "submitted"
-                    | "included"
-                    | "confirming"
-                    | "confirmed"
-                    | "reorged"
-                    | "reverted"
-                    | "unknown"
-                    | "failed"
-                    | "conflicted"
-            ),
-            "invalid transaction phase"
-        );
-        self.db.execute(
-            "UPDATE transactions SET phase=?2,block_number=?3,block_hash=?4,error=?5,checked_at=?6 WHERE id=?1",
-            params![id, phase, block_number, block_hash, error,crate::clock::now_ms()],
+                block_number,
+                block_hash,
+                observed.error,
+                crate::clock::now_ms(),
+                observed.nonce,
+                observed.tx_hash()
+            ],
         )?;
+        ensure!(
+            changed == 1,
+            "delivery transaction changed before observation"
+        );
         Ok(())
     }
-    pub fn transaction(&self, id: &str) -> Result<SignedTransaction> {
+    pub fn transaction(&self, id: &str) -> Result<StoredTransaction> {
         let row = self.db.query_row(
             "SELECT intent,nonce,raw,hash,phase,block_number,block_hash,error FROM transactions WHERE id=?1",
             [id],
             DbTransactionRow::from_row,
         )?;
-        SignedTransaction::try_from(row)
+        StoredTransaction::try_from(row)
     }
 
-    pub fn find_transaction(&self, id: &str) -> Result<Option<SignedTransaction>> {
+    pub fn find_transaction(&self, id: &str) -> Result<Option<StoredTransaction>> {
         let exists: bool = self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM transactions WHERE id=?1)",
             [id],
@@ -1188,8 +1342,8 @@ impl ServiceStore {
             Ok(None)
         }
     }
-    pub fn next_transaction_for_reconcile(&self) -> Result<Option<SignedTransaction>> {
-        let id:Option<String>=self.db.query_row("SELECT id FROM transactions WHERE id NOT LIKE 'budget-%/reveal-%' AND phase NOT IN ('failed','reverted','conflicted') AND (phase!='confirmed' OR checked_at<?1) ORDER BY phase='confirmed',checked_at,nonce LIMIT 1",[crate::clock::now_ms().saturating_sub(60_000)],|r|r.get(0)).optional()?;
+    pub fn next_transaction_for_reconcile(&self) -> Result<Option<StoredTransaction>> {
+        let id:Option<String>=self.db.query_row("SELECT id FROM transactions WHERE id NOT LIKE 'budget-%/reveal-%' AND phase NOT IN (?2,?3,?4) AND (phase!=?5 OR checked_at<?1) ORDER BY phase=?5,checked_at,nonce LIMIT 1",params![crate::clock::now_ms().saturating_sub(60_000),FAILED,REVERTED,CONFLICTED,CONFIRMED],|r|r.get(0)).optional()?;
         id.map(|id| self.transaction(&id)).transpose()
     }
     pub(super) fn next_nonce_is_contiguous(
@@ -1206,7 +1360,7 @@ impl ServiceStore {
         Ok(last.is_none_or(|last| last < nonce))
     }
     #[cfg(test)]
-    pub(super) fn recent_transactions(&self) -> Result<Vec<SignedTransaction>> {
+    pub(super) fn recent_transactions(&self) -> Result<Vec<StoredTransaction>> {
         let mut query = self
             .db
             .prepare("SELECT id FROM transactions ORDER BY rowid DESC LIMIT 128")?;
@@ -1484,8 +1638,15 @@ impl CapacityOwner {
     }
 }
 fn check_signed_bytes(raw: &str, hash: &str) -> Result<()> {
+    let digits = raw.strip_prefix("0x").unwrap_or_default();
     ensure!(
-        raw.starts_with("0x") && raw.len() <= 512 * 1024 && hash.len() == 66,
+        raw.len() <= 512 * 1024
+            && !digits.is_empty()
+            && digits.len().is_multiple_of(2)
+            && digits
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            && word(hash).is_ok(),
         "invalid signed transaction encoding"
     );
     Ok(())
@@ -1552,60 +1713,94 @@ pub(super) mod tests {
         crate::config::private_dir(&dir).unwrap();
         (ServiceStore::open(&dir, 200_000, 4).unwrap(), dir)
     }
+    fn test_observe(
+        store: &ServiceStore,
+        id: &str,
+        status: TxStatus,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let observation = store.transaction(id)?.observation(status, error)?;
+        store.observe_transaction(id, &observation)
+    }
+
+    fn block(number: u64) -> BlockRef {
+        BlockRef {
+            number,
+            hash: alloy_primitives::B256::repeat_byte(0x55),
+        }
+    }
+
     #[test]
     fn transaction_phases_reopen_and_decode_reordered_columns() -> Result<()> {
         let (mut store, dir) = store();
         let intent =
             super::super::chain::tests::approval_intent(alloy_primitives::Address::from([7; 20]))?;
-        let reserved = SignedTransaction {
+        let mut reserved = StoredTransaction {
             intent: intent.clone(),
             nonce: 7,
-            raw_tx: None,
-            tx_hash: None,
-            phase: "reserved".into(),
-            block_number: None,
-            block_hash: None,
+            state: TxState::Reserved,
             error: None,
         };
         assert_eq!(store.reserve_transaction(&intent, 7)?, reserved);
+        reserved.error = Some("wallet is locked".into());
+        store.observe_transaction(
+            &intent.id,
+            &TxObservation {
+                nonce: 7,
+                state: TxState::Reserved,
+                error: reserved.error.clone(),
+            },
+        )?;
         drop(store);
         let mut store = ServiceStore::open(&dir, 200_000, 4)?;
         assert_eq!(store.transaction(&intent.id)?, reserved);
         assert_eq!(store.reserve_transaction(&intent, 99)?, reserved);
-        let raw = "0x0201";
-        let hash = format!("0x{}", "aa".repeat(32));
-        store.sign_transaction(&intent.id, raw, &hash)?;
-        for (phase, block_number, block_hash, error) in [
-            ("signed", None, None, None),
-            ("submitted", None, None, None),
-            ("included", Some(31), Some("included-block"), None),
-            ("confirming", Some(31), Some("included-block"), None),
-            ("confirmed", Some(31), Some("included-block"), None),
-            ("reorged", None, None, Some("block replaced")),
+        let signed = SignedBytes {
+            raw_tx: "0x0201".into(),
+            tx_hash: format!("0x{}", "aa".repeat(32)),
+        };
+        store.sign_transaction(&intent.id, &signed.raw_tx, &signed.tx_hash)?;
+        for (phase, status, error) in [
+            ("signed", TxStatus::Unbroadcast, None),
+            ("submitted", TxStatus::Submitted, None),
+            ("included", TxStatus::Included(block(31)), None),
+            ("confirming", TxStatus::Confirming(block(31)), None),
+            ("confirmed", TxStatus::Confirmed(block(31)), None),
+            ("reorged", TxStatus::Reorged, Some("block replaced")),
+            ("reverted", TxStatus::Reverted(block(32)), Some("reverted")),
             (
-                "reverted",
-                Some(32),
-                Some("reverted-block"),
-                Some("reverted"),
+                "unknown",
+                TxStatus::Unknown { last_block: None },
+                Some("broadcast unknown"),
             ),
-            ("unknown", None, None, Some("broadcast unknown")),
-            ("failed", None, None, Some("failed")),
-            ("conflicted", None, None, Some("nonce advanced")),
+            (
+                "unknown",
+                TxStatus::Unknown {
+                    last_block: Some(block(31)),
+                },
+                Some("receipt unavailable"),
+            ),
+            ("failed", TxStatus::Failed, Some("failed")),
+            (
+                "conflicted",
+                TxStatus::Conflicted,
+                Some("nonce canonically consumed by a cleanup"),
+            ),
         ] {
-            store.observe_transaction(&intent.id, phase, block_number, block_hash, error)?;
-            let expected = SignedTransaction {
+            test_observe(&store, &intent.id, status.clone(), error)?;
+            let expected = StoredTransaction {
                 intent: intent.clone(),
                 nonce: 7,
-                raw_tx: Some(raw.into()),
-                tx_hash: Some(hash.clone()),
-                phase: phase.into(),
-                block_number,
-                block_hash: block_hash.map(str::to_owned),
+                state: TxState::Signed {
+                    signed: signed.clone(),
+                    status,
+                },
                 error: error.map(str::to_owned),
             };
             assert_eq!(store.transaction(&intent.id)?, expected);
             let row = store.db.query_row("SELECT error,block_hash,block_number,phase,hash,raw,nonce,intent FROM transactions WHERE id=?", [&intent.id], DbTransactionRow::from_row)?;
-            assert_eq!(SignedTransaction::try_from(row)?, expected);
+            assert_eq!(row.phase, phase);
+            assert_eq!(StoredTransaction::try_from(row)?, expected);
             drop(store);
             store = ServiceStore::open(&dir, 200_000, 4)?;
             assert_eq!(store.transaction(&intent.id)?, expected);
@@ -1617,27 +1812,114 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn transaction_codec_keeps_invalid_json_and_invalid_observation_rejections() -> Result<()> {
+    fn transaction_codec_rejects_invalid_rows_and_unmatched_observations() -> Result<()> {
         let (mut store, dir) = store();
         let intent =
             super::super::chain::tests::approval_intent(alloy_primitives::Address::from([7; 20]))?;
-        let expected = store.reserve_transaction(&intent, 7)?;
-        assert!(
-            store
-                .observe_transaction(&intent.id, "invalid", None, None, None)
-                .is_err()
-        );
+        store.reserve_transaction(&intent, 7)?;
+        let raw = "0x02";
+        let hash = format!("0x{}", "aa".repeat(32));
+        store.sign_transaction(&intent.id, raw, &hash)?;
+        let expected = store.transaction(&intent.id)?;
+        let mut observed = expected.observation(TxStatus::Submitted, None)?;
+        observed.nonce = 8;
+        assert!(store.observe_transaction(&intent.id, &observed).is_err());
+        observed.nonce = 7;
+        observed.state = TxState::Signed {
+            signed: format!("0x{}", "bb".repeat(32)),
+            status: TxStatus::Submitted,
+        };
+        assert!(store.observe_transaction(&intent.id, &observed).is_err());
+        observed.state = TxState::Reserved;
+        assert!(store.observe_transaction(&intent.id, &observed).is_err());
         assert_eq!(store.transaction(&intent.id)?, expected);
+
+        let block_hash = format!("{:#x}", block(31).hash);
+        let bad_hash = format!("0x{}", "zz".repeat(32));
+        for (phase, raw, hash, number, block_hash) in [
+            ("signed", Some("0x"), Some(hash.as_str()), None, None),
+            ("signed", Some("0x0"), Some(hash.as_str()), None, None),
+            ("signed", Some("0x02AA"), Some(hash.as_str()), None, None),
+            ("signed", Some(raw), Some(bad_hash.as_str()), None, None),
+            ("garbage", Some(raw), Some(hash.as_str()), None, None),
+            ("reserved", Some(raw), Some(hash.as_str()), None, None),
+            ("signed", None, None, None, None),
+            ("signed", Some(raw), None, None, None),
+            ("signed", None, Some(hash.as_str()), None, None),
+            ("confirmed", None, None, Some(31), Some(block_hash.as_str())),
+            ("confirmed", Some(raw), Some(hash.as_str()), None, None),
+            ("reverted", Some(raw), Some(hash.as_str()), Some(31), None),
+            (
+                "unknown",
+                Some(raw),
+                Some(hash.as_str()),
+                None,
+                Some(block_hash.as_str()),
+            ),
+            (
+                "unknown",
+                Some(raw),
+                Some(hash.as_str()),
+                Some(31),
+                Some("invalid block hash"),
+            ),
+            (
+                "reorged",
+                Some(raw),
+                Some(hash.as_str()),
+                Some(31),
+                Some(block_hash.as_str()),
+            ),
+        ] {
+            store.db.execute(
+                "UPDATE transactions SET phase=?2,raw=?3,hash=?4,block_number=?5,block_hash=?6 WHERE id=?1",
+                params![intent.id, phase, raw, hash, number, block_hash],
+            )?;
+            assert!(
+                store.transaction(&intent.id).is_err(),
+                "decoded invalid {phase} row"
+            );
+            assert!(store.reserve_transaction(&intent, 7).is_err());
+        }
         for encoded in ["{", "{}"] {
             store.db.execute(
-                "UPDATE transactions SET intent=? WHERE id=?",
-                params![encoded, intent.id],
+                "UPDATE transactions SET intent=?2,phase=?3,raw=?4,hash=?5,block_number=NULL,block_hash=NULL WHERE id=?1",
+                params![intent.id, encoded, SIGNED, raw, hash],
             )?;
             assert!(store.transaction(&intent.id).is_err());
             assert!(store.reserve_transaction(&intent, 7).is_err());
         }
         drop(store);
         std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn nonce_recovery_ledger_preserves_its_flat_json_and_rejects_invalid_combinations() -> Result<()>
+    {
+        let intent =
+            super::super::chain::tests::approval_intent(alloy_primitives::Address::from([7; 20]))?;
+        let canonical = block(31);
+        let body = serde_json::json!([{
+            "intent": intent,
+            "nonce": 7,
+            "raw_tx": "0x02",
+            "tx_hash": format!("0x{}", "aa".repeat(32)),
+            "phase": "unknown",
+            "block_number": 31,
+            "block_hash": format!("{:#x}", canonical.hash),
+            "error": "receipt unavailable",
+        }]);
+        let recovered = decode_recoveries(&serde_json::to_vec(&body)?)?;
+        assert_eq!(recovered[0].block(), Some(&canonical));
+        assert_eq!(recovered[0].nonce, 7);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&encode_recoveries(recovered)?)?,
+            body
+        );
+        let mut invalid = body;
+        invalid[0]["block_number"] = serde_json::Value::Null;
+        assert!(decode_recoveries(&serde_json::to_vec(&invalid)?).is_err());
         Ok(())
     }
 
@@ -1667,11 +1949,17 @@ pub(super) mod tests {
         let first = store
             .signed_budget_transaction(&intent, 7, "provider", &intent.gas_cap, |_, nonce| {
                 assert_eq!(nonce, 7);
-                Ok((raw.clone(), hash.clone()))
+                Ok(SignedBytes {
+                    raw_tx: raw.clone(),
+                    tx_hash: hash.clone(),
+                })
             })
             .unwrap();
-        assert_eq!(first.phase, "signed");
-        assert_eq!(first.raw_tx.as_deref(), Some(raw.as_str()));
+        assert_eq!(first.status(), Some(&TxStatus::Unbroadcast));
+        assert_eq!(
+            first.signed().map(|signed| signed.raw_tx.as_str()),
+            Some(raw.as_str())
+        );
         drop(store);
         let mut store = ServiceStore::open(&dir, 200_000, 4).unwrap();
         assert_eq!(
@@ -1729,7 +2017,10 @@ pub(super) mod tests {
             .signed_budget_transaction(&intent, 100, "provider", &intent.gas_cap, |same, nonce| {
                 assert_eq!(same, &original.intent);
                 assert_eq!(nonce, original.nonce);
-                Ok(("0x0201".into(), format!("0x{}", "aa".repeat(32))))
+                Ok(SignedBytes {
+                    raw_tx: "0x0201".into(),
+                    tx_hash: format!("0x{}", "aa".repeat(32)),
+                })
             })
             .unwrap();
         assert_eq!(recovered.nonce, 7);
@@ -1737,7 +2028,10 @@ pub(super) mod tests {
         key.id = "key-original/register".into();
         let key = store
             .signed_budget_transaction(&key, 7, "key-original", &key.gas_cap, |_, _| {
-                Ok(("0x0202".into(), format!("0x{}", "bb".repeat(32))))
+                Ok(SignedBytes {
+                    raw_tx: "0x0202".into(),
+                    tx_hash: format!("0x{}", "bb".repeat(32)),
+                })
             })
             .unwrap();
         assert_eq!(key.nonce, 8);
@@ -1835,7 +2129,7 @@ pub(super) mod tests {
         for order in [&authorized, &referenced, &unsigned] {
             assert!(store.find_order(&order.view.order_id).unwrap().is_some());
         }
-        assert!(store.transaction(&intent.id).unwrap().raw_tx.is_none());
+        assert!(store.transaction(&intent.id).unwrap().signed().is_none());
         drop(store);
         let store = ServiceStore::open(&dir, 2_000_000, 16).unwrap();
         assert!(store.find_order(&expired.view.order_id).unwrap().is_none());
@@ -1878,7 +2172,7 @@ pub(super) mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert!(store.transaction(&intent.id).unwrap().raw_tx.is_none());
+        assert!(store.transaction(&intent.id).unwrap().signed().is_none());
         drop(store);
         let store = ServiceStore::open(&dir, 2_000_000, 4).unwrap();
         assert!(
@@ -1993,7 +2287,7 @@ pub(super) mod tests {
         };
         let first = store.reserve_transaction(&intent, 7).unwrap();
         assert_eq!(first.nonce, 7);
-        assert!(first.raw_tx.is_none());
+        assert!(first.signed().is_none());
         assert_eq!(store.reserve_transaction(&intent, 9).unwrap().nonce, 7);
         let mut changed = intent.clone();
         changed.calldata = "0x5678".into();
@@ -2049,9 +2343,7 @@ pub(super) mod tests {
                 .id,
             first
         );
-        store
-            .observe_transaction(&first, "confirmed", Some(8), Some("block-8"), None)
-            .unwrap();
+        test_observe(&store, &first, TxStatus::Confirmed(block(8)), None).unwrap();
         assert_eq!(
             store
                 .next_transaction_for_reconcile()
@@ -2061,9 +2353,7 @@ pub(super) mod tests {
                 .id,
             intent.id
         );
-        store
-            .observe_transaction(&intent.id, "confirmed", Some(9), Some("block-9"), None)
-            .unwrap();
+        test_observe(&store, &intent.id, TxStatus::Confirmed(block(9)), None).unwrap();
         assert!(store.next_transaction_for_reconcile().unwrap().is_none());
         store
             .db
@@ -2205,7 +2495,10 @@ pub(super) mod tests {
             };
             store
                 .signed_budget_transaction(&intent, 0, &group, "600000", |_, _| {
-                    Ok(("0x0201".into(), format!("0x{}", "aa".repeat(32))))
+                    Ok(SignedBytes {
+                        raw_tx: "0x0201".into(),
+                        tx_hash: format!("0x{}", "aa".repeat(32)),
+                    })
                 })
                 .unwrap();
             store
@@ -2227,10 +2520,12 @@ pub(super) mod tests {
             intent.id = format!("{group}/hold-1");
             assert!(
                 store
-                    .signed_budget_transaction(&intent, 1, &group, "600000", |_, _| Ok((
-                        format!("0x{}", "01".repeat(30_000)),
-                        format!("0x{}", "bb".repeat(32))
-                    )))
+                    .signed_budget_transaction(&intent, 1, &group, "600000", |_, _| Ok(
+                        SignedBytes {
+                            raw_tx: format!("0x{}", "01".repeat(30_000)),
+                            tx_hash: format!("0x{}", "bb".repeat(32)),
+                        }
+                    ))
                     .is_err(),
                 "budget signing uses its public quarter cap"
             );
@@ -2292,20 +2587,25 @@ pub(super) mod tests {
         };
         store
             .signed_budget_transaction(&intent, 0, &group, "600000", |_, _| {
-                Ok(("0x0201".into(), format!("0x{}", "aa".repeat(32))))
+                Ok(SignedBytes {
+                    raw_tx: "0x0201".into(),
+                    tx_hash: format!("0x{}", "aa".repeat(32)),
+                })
             })
             .unwrap();
-        store
-            .observe_transaction(&intent.id, "unknown", None, None, None)
-            .unwrap();
+        test_observe(
+            &store,
+            &intent.id,
+            TxStatus::Unknown { last_block: None },
+            None,
+        )
+        .unwrap();
         store.reclaim_unfunded_quote(&quote).unwrap();
         assert!(
             store.find_order(&quote.view.order_id).unwrap().is_some(),
             "uncertain budget effects retain the quote"
         );
-        store
-            .observe_transaction(&intent.id, "confirmed", Some(1), Some("canonical"), None)
-            .unwrap();
+        test_observe(&store, &intent.id, TxStatus::Confirmed(block(1)), None).unwrap();
         // Only the production caller's canonical unfunded_after evidence permits this operation.
         store.reclaim_unfunded_quote(&quote).unwrap();
         assert!(
@@ -2313,7 +2613,11 @@ pub(super) mod tests {
             "other orders' terminal budget transactions do not pin an unfunded quote forever"
         );
         assert_eq!(
-            store.transaction(&intent.id).unwrap().raw_tx.as_deref(),
+            store
+                .transaction(&intent.id)
+                .unwrap()
+                .signed()
+                .map(|signed| signed.raw_tx.as_str()),
             Some("0x0201")
         );
         assert!(
@@ -2371,12 +2675,19 @@ pub(super) mod tests {
         };
         store
             .signed_budget_transaction(&intent, 0, &group, "600000", |_, _| {
-                Ok(("0x0201".into(), format!("0x{}", "aa".repeat(32))))
+                Ok(SignedBytes {
+                    raw_tx: "0x0201".into(),
+                    tx_hash: format!("0x{}", "aa".repeat(32)),
+                })
             })
             .unwrap();
-        store
-            .observe_transaction(&intent.id, "unknown", None, None, None)
-            .unwrap();
+        test_observe(
+            &store,
+            &intent.id,
+            TxStatus::Unknown { last_block: None },
+            None,
+        )
+        .unwrap();
         let remaining = |store: &ServiceStore| {
             store
                 .db
@@ -2395,9 +2706,7 @@ pub(super) mod tests {
             2,
             "unknown budget raw protects its orders"
         );
-        store
-            .observe_transaction(&intent.id, "confirmed", Some(1), Some("canonical"), None)
-            .unwrap();
+        test_observe(&store, &intent.id, TxStatus::Confirmed(block(1)), None).unwrap();
         let claim_id = "cd".repeat(32);
         let key = format!("protected-claim:{claim_id}");
         let mut claim = logical_claim(&order, &budget_id, &claim_id);
@@ -2440,7 +2749,11 @@ pub(super) mod tests {
             "confirmed terminal references permit retention cleanup"
         );
         assert_eq!(
-            store.transaction(&intent.id).unwrap().raw_tx.as_deref(),
+            store
+                .transaction(&intent.id)
+                .unwrap()
+                .signed()
+                .map(|signed| signed.raw_tx.as_str()),
             Some("0x0201")
         );
         assert!(store.value(&key).unwrap().is_some());
@@ -2511,10 +2824,10 @@ pub(super) mod tests {
                     &group,
                     "600000",
                     (&key, &body),
-                    |_, _| Ok((
-                        format!("0x{}", "01".repeat(30_000)),
-                        format!("0x{}", "aa".repeat(32))
-                    ))
+                    |_, _| Ok(SignedBytes {
+                        raw_tx: format!("0x{}", "01".repeat(30_000)),
+                        tx_hash: format!("0x{}", "aa".repeat(32)),
+                    })
                 )
                 .is_err()
         );
@@ -2537,14 +2850,21 @@ pub(super) mod tests {
                 (&key, &body),
                 |_, nonce| {
                     assert_eq!(nonce, 0);
-                    Ok(("0x0201".into(), format!("0x{}", "aa".repeat(32))))
+                    Ok(SignedBytes {
+                        raw_tx: "0x0201".into(),
+                        tx_hash: format!("0x{}", "aa".repeat(32)),
+                    })
                 },
             )
             .unwrap();
         let first = store.transaction(&intent.id).unwrap();
-        store
-            .observe_transaction(&intent.id, "unknown", None, None, Some("broadcast unknown"))
-            .unwrap();
+        test_observe(
+            &store,
+            &intent.id,
+            TxStatus::Unknown { last_block: None },
+            Some("broadcast unknown"),
+        )
+        .unwrap();
         intent.id = format!("{group}/reveal-claim-1");
         attempted["attempts"] = serde_json::json!([first.intent.id, intent.id]);
         body = serde_json::to_vec(&attempted).unwrap();
@@ -2562,22 +2882,14 @@ pub(super) mod tests {
         );
         assert!(store.find_transaction(&intent.id).unwrap().is_none());
         assert_eq!(
-            store.transaction(&first.intent.id).unwrap().raw_tx,
-            first.raw_tx
+            store.transaction(&first.intent.id).unwrap().signed(),
+            first.signed()
         );
         assert_eq!(
-            store.transaction(&first.intent.id).unwrap().phase,
-            "unknown"
+            store.transaction(&first.intent.id).unwrap().status(),
+            Some(&TxStatus::Unknown { last_block: None })
         );
-        store
-            .observe_transaction(
-                &first.intent.id,
-                "reverted",
-                Some(1),
-                Some("canonical-block"),
-                None,
-            )
-            .unwrap();
+        test_observe(&store, &first.intent.id, TxStatus::Reverted(block(1)), None).unwrap();
         assert_eq!(
             store
                 .signed_publication_transaction(
@@ -2586,7 +2898,10 @@ pub(super) mod tests {
                     &group,
                     "600000",
                     (&key, &body),
-                    |_, _| Ok(("0x0202".into(), format!("0x{}", "bb".repeat(32))))
+                    |_, _| Ok(SignedBytes {
+                        raw_tx: "0x0202".into(),
+                        tx_hash: format!("0x{}", "bb".repeat(32))
+                    })
                 )
                 .unwrap()
                 .nonce,
@@ -2619,8 +2934,8 @@ pub(super) mod tests {
             store
                 .transaction(&first.intent.id)
                 .unwrap()
-                .raw_tx
-                .as_deref(),
+                .signed()
+                .map(|signed| signed.raw_tx.as_str()),
             Some("0x0201")
         );
         assert!(

@@ -43,19 +43,13 @@ fn long_lived() -> Command {
     }
 }
 
-/// Writes a program of this account at `directory` that prints each argument on its own line.
+/// Creates the entry point used by the argument fixture.
 fn echoing_program(directory: &Path, name: &str) -> PathBuf {
     #[cfg(unix)]
     {
         let path = directory.join(name);
-        std::fs::write(
-            &path,
-            "#!/bin/sh\nfor part in \"$@\"; do printf '%s\\n' \"$part\"; done\n",
-        )
-        .expect("write the fixture program");
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("mark the fixture program runnable");
+        // Use an existing executable so another test's fork cannot retain a writer for it.
+        std::os::unix::fs::symlink("/bin/sh", &path).expect("link the fixture program");
         path
     }
     #[cfg(windows)]
@@ -485,10 +479,14 @@ fn a_program_of_this_account_is_found_and_its_arguments_are_passed_whole() -> Re
     );
 
     let awkward = "two words --and-a-flag \"quoted\"";
-    let output = program::command(&program)
-        .arg(awkward)
-        .arg("second")
-        .output()?;
+    let mut command = program::command(&program);
+    #[cfg(unix)]
+    command.args([
+        "-c",
+        r#"for part in "$@"; do printf '%s\n' "$part"; done"#,
+        "echoing",
+    ]);
+    let output = command.arg(awkward).arg("second").output()?;
     assert!(output.status.success());
     let lines: Vec<_> = String::from_utf8_lossy(&output.stdout)
         .lines()

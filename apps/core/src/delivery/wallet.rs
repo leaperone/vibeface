@@ -233,7 +233,7 @@ impl Wallet {
     pub(super) fn sign_publication_recovery(
         &self,
         config: &ChainConfig,
-        original: &super::store::SignedTransaction,
+        original: &super::store::StoredTransaction,
         intent: &SpendIntent,
     ) -> Result<SignedBytes> {
         let transaction =
@@ -479,13 +479,9 @@ mod tests {
             7,
             "provider",
             &original.gas_cap,
-            |intent, nonce| {
-                let signed = wallet.sign_transaction(&config, intent, nonce)?;
-                Ok((signed.raw_tx, signed.tx_hash))
-            },
+            |intent, nonce| wallet.sign_transaction(&config, intent, nonce),
         )?;
-        assert_eq!(signed.raw_tx.as_deref(), Some(first.raw_tx.as_str()));
-        assert_eq!(signed.tx_hash.as_deref(), Some(first.tx_hash.as_str()));
+        assert_eq!(signed.signed(), Some(&first));
         wallet.lock();
         let mut next = original.clone();
         next.id = "key-original/register".into();
@@ -496,10 +492,7 @@ mod tests {
                     8,
                     "key-original",
                     &next.gas_cap,
-                    |intent, nonce| {
-                        let signed = wallet.sign_transaction(&config, intent, nonce)?;
-                        Ok((signed.raw_tx, signed.tx_hash))
-                    }
+                    |intent, nonce| wallet.sign_transaction(&config, intent, nonce)
                 )
                 .is_err()
         );
@@ -543,14 +536,13 @@ mod tests {
         intent.gas_limit = super::super::budget::REVEAL_GAS_LIMIT;
         intent.gas_cap = "100000000000000000".into();
         let signed = wallet.sign_transaction(&config, &intent, 7)?;
-        let original = super::super::store::SignedTransaction {
+        let original = super::super::store::StoredTransaction {
             intent,
             nonce: 7,
-            raw_tx: Some(signed.raw_tx),
-            tx_hash: Some(signed.tx_hash),
-            phase: "signed".into(),
-            block_number: None,
-            block_hash: None,
+            state: chain::TxState::Signed {
+                signed,
+                status: chain::TxStatus::Unbroadcast,
+            },
             error: None,
         };
         let mut intent = original.intent.clone();

@@ -38,9 +38,8 @@ jobs:
           name: ${{ inputs.app }}-release-${{ inputs.source_sha }}-${{ github.run_attempt }}
           path: .artifacts/release/*
           if-no-files-found: error
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: ./.github/actions/setup-js
         if: inputs.app == 'cli'
-        with: {node-version: '24'}
       - name: Package the same verified CLI runtime for npm
         if: inputs.app == 'cli'
         env:

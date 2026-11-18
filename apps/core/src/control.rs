@@ -870,11 +870,10 @@ mod tests {
         Ok(())
     }
 
-    fn free_addr() -> SocketAddr {
-        std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
+    fn distinct_loopback_addresses() -> (SocketAddr, SocketAddr) {
+        let public = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let local = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        (public.local_addr().unwrap(), local.local_addr().unwrap())
     }
 
     #[test]
@@ -929,11 +928,12 @@ mod tests {
         assert!(init_mesh(false, Some("Lab".into()), vec![]).is_err());
         assert!(init_mesh(false, None, vec!["https://not-a-node".into()]).is_err());
         let dir = temp_dir("mesh-default");
+        let (listen, local_listen) = distinct_loopback_addresses();
         let options: InitOptions = serde_json::from_value(json!({
             "data_dir": dir,
             "no_web": true,
-            "listen": free_addr(),
-            "local_listen": free_addr(),
+            "listen": listen,
+            "local_listen": local_listen,
         }))
         .unwrap();
         let result = initialize_from_options(options).unwrap();
@@ -947,11 +947,12 @@ mod tests {
     #[tokio::test]
     async fn mesh_bootstrap_edits_reach_the_config_of_a_stopped_node() -> Result<()> {
         let dir = temp_dir("mesh-control");
+        let (listen, local_listen) = distinct_loopback_addresses();
         let options: InitOptions = serde_json::from_value(json!({
             "data_dir": dir,
             "no_web": true,
-            "listen": free_addr(),
-            "local_listen": free_addr(),
+            "listen": listen,
+            "local_listen": local_listen,
         }))?;
         initialize_from_options(options)?;
         let device = "82169062e48d543dc9af8e02340c5248d6fcbe43fceb7d593ab069e7e483c235";
@@ -990,10 +991,11 @@ mod tests {
     #[test]
     fn a_public_node_runs_an_open_paced_relay_and_forwards_to_anyone() {
         let dir = temp_dir("public-node");
+        let (listen, local_listen) = distinct_loopback_addresses();
         let options: InitOptions = serde_json::from_value(json!({
             "data_dir": dir,
-            "listen": free_addr(),
-            "local_listen": free_addr(),
+            "listen": listen,
+            "local_listen": local_listen,
             "public_url": "https://app.example",
             "tls": true,
             "relay_listen": "127.0.0.1:0",
@@ -1037,22 +1039,24 @@ mod tests {
         assert!(certificate.starts_with("-----BEGIN CERTIFICATE-----"));
         assert!(dir.join(config::TLS_KEY).is_file());
         fs::remove_dir_all(dir).unwrap();
+        let (listen, local_listen) = distinct_loopback_addresses();
         let open: InitOptions = serde_json::from_value(json!({
             "data_dir": temp_dir("open-relay"),
             "no_web": true,
-            "listen": free_addr(),
-            "local_listen": free_addr(),
+            "listen": listen,
+            "local_listen": local_listen,
             "relay_listen": "127.0.0.1:0",
             "relay_open": true,
         }))
         .unwrap();
         let error = initialize_from_options(open).unwrap_err().to_string();
         assert!(error.contains("open relay"), "{error}");
+        let (listen, local_listen) = distinct_loopback_addresses();
         let crowded: InitOptions = serde_json::from_value(json!({
             "data_dir": temp_dir("crowded"),
             "no_web": true,
-            "listen": free_addr(),
-            "local_listen": free_addr(),
+            "listen": listen,
+            "local_listen": local_listen,
             "forward_sessions": 32,
             "forward_queue": 256,
         }))
@@ -1067,11 +1071,12 @@ mod tests {
         let token = dir.with_extension("token");
         fs::write(&token, "ab".repeat(32)).unwrap();
         let options = |relay_tokens: Value| -> InitOptions {
+            let (listen, local_listen) = distinct_loopback_addresses();
             serde_json::from_value(json!({
                 "data_dir": dir,
                 "no_web": true,
-                "listen": free_addr(),
-                "local_listen": free_addr(),
+                "listen": listen,
+                "local_listen": local_listen,
                 "no_mesh": true,
                 "relays": ["https://relay.example", "https://other.example"],
                 "relay_tokens": relay_tokens,
@@ -1098,13 +1103,7 @@ mod tests {
             Some(std::env::temp_dir().join("vibeface-fixture-codex.sock")),
         ] {
             let dir = temp_dir("mode");
-            let listen = free_addr();
-            let local_listen = loop {
-                let candidate = free_addr();
-                if candidate != listen {
-                    break candidate;
-                }
-            };
+            let (listen, local_listen) = distinct_loopback_addresses();
             let options: InitOptions = serde_json::from_value(json!({
                 "data_dir": dir,
                 "listen": listen,
