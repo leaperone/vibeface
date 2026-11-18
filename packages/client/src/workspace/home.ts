@@ -1,5 +1,7 @@
+import { unreadCounts } from "../chat/timeline.ts"
 import type { Link } from "../lib/link.ts"
-import type { BotRecord } from "./types.ts"
+import { awaitsAnswer } from "./questions.ts"
+import { isSessionNotification, type BotRecord, type NotificationRecord, type Question } from "./types.ts"
 
 type Home = { narrow: boolean; conversation?: string; bots: readonly BotRecord[]; current: string }
 
@@ -28,6 +30,40 @@ export function emptyHome({ synced, link }: { synced: boolean; link: Link }): "l
 /** Bots by their newest message, newest first; ones without messages keep their order at the end. */
 export function byRecent(bots: readonly BotRecord[]): BotRecord[] {
   return [...bots].sort((a, b) => (b.last_message?.created_at_ms ?? -1) - (a.last_message?.created_at_ms ?? -1))
+}
+
+type MainConversationAttentionInput = {
+  bots: readonly Pick<BotRecord, "bot_id" | "conversation_id">[]
+  notifications: readonly NotificationRecord[]
+  questions: readonly Question[]
+  ignoredNotifications: ReadonlySet<string>
+  answered: Readonly<Record<string, string>>
+  includeSessionNotifications: boolean
+}
+
+/** Main Bot list previews and unread counts, keyed by conversation. */
+export function mainConversationAttention({
+  bots, notifications, questions, ignoredNotifications, answered, includeSessionNotifications,
+}: MainConversationAttentionInput) {
+  const botsByConversation = new Map<string, Set<string>>()
+  for (const bot of bots) {
+    const ids = botsByConversation.get(bot.conversation_id) ?? new Set<string>()
+    ids.add(bot.bot_id)
+    botsByConversation.set(bot.conversation_id, ids)
+  }
+  const matchesMain = ({ conversation_id, target }: Pick<NotificationRecord, "conversation_id" | "target">) =>
+    target?.kind === "bot_main" && botsByConversation.get(conversation_id)?.has(target.bot_id) === true
+
+  const latestNotification = new Map<string, NotificationRecord>()
+  const mainNotifications: NotificationRecord[] = []
+  for (const item of notifications) {
+    if (!matchesMain(item) || ignoredNotifications.has(item.notification_id)) continue
+    if (!includeSessionNotifications && isSessionNotification(item)) continue
+    mainNotifications.push(item)
+    latestNotification.set(item.conversation_id, item)
+  }
+  const waiting = questions.filter((item) => matchesMain(item) && awaitsAnswer(item, answered))
+  return { latestNotification, unread: unreadCounts(mainNotifications, waiting) }
 }
 
 /** Today shows the time, this year the date, older ones the year too. */

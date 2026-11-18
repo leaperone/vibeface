@@ -35,10 +35,10 @@ import { joinTicket } from '@vibeface/client/lib/transport.ts'
 import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
 import { messageKey, replyStatusLabel, inputTargetKey, promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from "@vibeface/client/chat/protocol.ts"
 import { addDeviceCopy, deviceCopy, joinCopy, offlineCopy, setUpOnManager, waitingCopy } from "@vibeface/client/identity/copy.ts"
-import { chatTimeline, firstUnread, messageTimes, taskMessage, unreadCounts } from "@vibeface/client/chat/timeline.ts"
+import { chatTimeline, firstUnread, messageTimes, taskMessage } from "@vibeface/client/chat/timeline.ts"
 import { accessOf } from "@vibeface/client/identity/access.ts"
 import { networkKey, storageOf } from "@vibeface/client/workspace/storage.ts"
-import { unreachable } from "@vibeface/client/workspace/home.ts"
+import { byRecent, listTime, mainConversationAttention, unreachable } from "@vibeface/client/workspace/home.ts"
 import { primaryLane } from "@vibeface/client/identity/connection-lane.ts"
 import * as taskLabels from "@vibeface/client/workspace/labels.ts"
 import * as workspaceModel from "@vibeface/client/workspace/model.ts"
@@ -1354,9 +1354,10 @@ test("workspace preserves bot and message requests while routing native decision
         'expo-file-system': { File: SelectedFile },
         '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/identity/access.ts': { accessOf },
         '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/lib/node.ts': { entryAddress },
-        '@vibeface/client/chat/protocol.ts': { promptIntent, botReach, composerHint }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, messageTimes, taskMessage, unreadCounts },
+        '@vibeface/client/chat/protocol.ts': { promptIntent, botReach, composerHint }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, messageTimes, taskMessage },
+        '@vibeface/client/workspace/home.ts': { mainConversationAttention },
         '@vibeface/client/workspace/bot-settings.ts': { botCopy }, '@vibeface/client/workspace/inbox.ts': { inboxItems }, '@vibeface/client/workspace/labels.ts': taskLabels,
-        '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers }, '@vibeface/client/workspace/storage.ts': { storageOf }, '@vibeface/client/workspace/types.ts': { isSessionNotification: () => false },
+        '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers }, '@vibeface/client/workspace/storage.ts': { storageOf },
         '@/platform/remote-notifications': { remoteNotifications: { sync: async () => {} } },
         'expo-notifications': { setBadgeCountAsync: async () => {}, addPushTokenListener: () => ({ remove() {} }) },
         '@/platform': { mobilePlatform: { storage: browser.localStorage, onForeground: () => () => {} } }, './context': { WorkspaceProvider: 'NativeWorkspace' }, './last-seen': lastSeenModel,
@@ -2898,6 +2899,50 @@ const parityShared = () => ({
     if (!work) throw new Error('共享历史中找不到这个工作')
     return { work: { ...work, target: work.target ?? null, source_events: ['a'.repeat(64)], conversation_id: input.conversation_id }, coverage: { source: 'shared_history' as const, complete: false as const } }
   },
+})
+
+test('Web and Mobile main Bot callers agree on unread while Web shows the session preview and Mobile counts task push badges separately', () => {
+  const target = { kind: 'bot_main', bot_id: parityBot.bot_id }
+  const notifications = workspaceModel.parseNotifications({ notifications: [
+    { notification_id: 'main', conversation_id: 'chat', kind: 'manager_response', target, text: '主聊天回复' },
+    { notification_id: 'session', conversation_id: 'chat', kind: 'session_attributed', target, text: '会话提醒' },
+    { notification_id: 'task', conversation_id: 'chat', kind: 'manager_response', target: { kind: 'task', task_id: 'task' }, text: '任务回复' },
+  ] })
+  const shared = { ...parityShared(), data: null, notifications }
+  const web = componentHarness('./conversation-list.tsx', {
+    '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared },
+    '@vibeface/client/workspace/home.ts': { byRecent, listTime, mainConversationAttention },
+    '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle' },
+    './workspace-shell': { useCreateBot: () => () => {} },
+  })
+  const storage = new Map<string, string>()
+  const keyValue = { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => { storage.set(key, value) } }
+  systemNotifications.notificationPreferences(keyValue, 'network').write({ enabled: true, badge: true, sound: false, mutedConversations: [] })
+  const device = { ready: { principal: { network_id: 'network' }, entry: { kind: 'gateway', address: 'https://node.example', device_id: 'gateway' }, info: { name: '工作设备' }, isCurrent: () => true }, phase: 'ready', link: { kind: 'online' }, entries: [], directory: null }
+  const appBadges: number[] = []
+  const mobile = componentHarness('../../../../../apps/mobile/src/data/live.tsx', {
+    '@vibeface/client/identity/context.tsx': { useDevice: () => device },
+    '@vibeface/client/identity/access.ts': { accessOf },
+    '@vibeface/client/lib/node.ts': { entryAddress },
+    '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared },
+    '@vibeface/client/workspace/home.ts': { mainConversationAttention },
+    '@vibeface/client/workspace/labels.ts': taskLabels,
+    '@/platform': { mobilePlatform: { storage: keyValue, onForeground: () => () => {} } },
+    '@/platform/remote-notifications': { remoteNotifications: { sync: async () => {} } },
+    'expo-notifications': { setBadgeCountAsync: async (count: number) => { appBadges.push(count) }, addPushTokenListener: () => ({ remove() {} }) },
+    './context': { WorkspaceProvider: 'NativeWorkspace' }, './last-seen': lastSeenModel,
+  }, {}, 'Live')
+  try {
+    const webRow = web.render('ConversationList').find(({ type }) => typeof type === 'function' && type.name === 'Row')
+    assert.equal(webRow?.props.preview, '会话提醒')
+    assert.equal(webRow?.props.unread, 1)
+    const mobileWorkspace = workspaceModel.record(mobile.render('Live').find(({ type }) => type === 'NativeWorkspace')?.props.value)
+    assert.equal(workspaceModel.record(mobileWorkspace.unread).chat, webRow?.props.unread)
+    assert.deepEqual(appBadges, [2])
+  } finally {
+    web.close()
+    mobile.close()
+  }
 })
 
 test('both pending input controls retry only a matching safe refusal and keep all scope targets', async () => {

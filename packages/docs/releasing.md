@@ -76,6 +76,8 @@ Unix 与 Windows 安装器、Rust 更新器只跟踪 `cli-v` 发布线。Stable 
 
 更新器保留已有的维护租约、空闲检查、数据快照、激活 journal、原子入口切换与健康检查。存在活动任务或结果未知操作时推迟更新，不强行结束任务。数据 epoch 不匹配时拒绝安装；不隐式转换、清空身份或覆盖数据。失败时按 journal 恢复程序入口，数据恢复需使用匹配的备份，不能用旧程序读取不同 epoch 的数据。
 
+安装 CLI 或 Desktop 受管 Node 的后台服务时会同时注册定时更新。Desktop App 本体跟踪独立的 `desktop-v` 发布及自己的渠道。下载的 App 包通过 Release 清单、制品摘要和适用的系统签名校验后，在正常退出时切换。更换桌面 App 不替换仍在运行的后台服务。
+
 npm 安装仍由 npm 更新，不由 Rust updater 更新。npm 的 Stable、RC、Hourly 分别使用 `latest`、`rc`、`hourly` dist-tag。CLI Release 完成后，`npm-publish.yml` 通过 OIDC 发布原不可变 `.tgz`；registry 对账确认 integrity 和渠道后才报告成功，不重复发布未知结果，也不把 dist-tag 回拨到较旧版本。
 
 npm Trusted Publishing 的自动调用方保持 `release.yml`，手动入口为 `npm-publish.yml`，两者使用 `npm-release` environment。权限配置由 npm/GitHub 控制，代码改动不能证明远端 trust 已生效。

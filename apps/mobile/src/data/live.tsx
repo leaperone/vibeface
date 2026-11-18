@@ -2,19 +2,19 @@ import type { DisplayScope } from '@vibeface/client/identity/context.tsx'
 import { decodeLastSeen, displayLastSeen, projectLastSeen } from './last-seen'
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import * as Notifications from 'expo-notifications'
-import { chatTimeline, firstUnread, unreadCounts } from '@vibeface/client/chat/timeline.ts'
+import { chatTimeline, firstUnread } from '@vibeface/client/chat/timeline.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
 import { DeviceProvider, useDevice } from '@vibeface/client/identity/context.tsx'
 import { entryAddress, messageOf } from '@vibeface/client/lib/node.ts'
 import { WorkspaceProvider as SharedWorkspace, useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { botCopy } from '@vibeface/client/workspace/bot-settings.ts'
+import { mainConversationAttention } from '@vibeface/client/workspace/home.ts'
 import { inboxItems, waitingItems, type InboxItem } from '@vibeface/client/workspace/inbox.ts'
 import { addressName, deviceOnline, entryLabel } from '@vibeface/client/workspace/labels.ts'
 import { botReadiness, parsePendingMessage } from '@vibeface/client/workspace/model.ts'
 import type { PendingMessage } from '@vibeface/client/chat/types.ts'
 import { notificationBadgeCount, notificationPreferences, notificationUnreadCounts, watchNotificationPreferences } from '@vibeface/client/workspace/system-notifications.ts'
 import { storageOf } from '@vibeface/client/workspace/storage.ts'
-import { isSessionNotification } from '@vibeface/client/workspace/types.ts'
 import { awaitsAnswer, foldAnswers } from '@vibeface/client/workspace/questions.ts'
 import { mobilePlatform } from '@/platform'
 import { remoteNotifications } from '@/platform/remote-notifications'
@@ -191,7 +191,10 @@ function Live({ children }: { children: ReactNode }) {
     }
   }
 
-  const unread = unreadCounts(notifications.filter((item) => { const target = item.target; return target?.kind === 'bot_main' && shared.bots.some((bot) => bot.bot_id === target.bot_id && bot.conversation_id === item.conversation_id) && !isSessionNotification(item) && !shared.ignoredNotifications.has(item.notification_id) }), questions.filter((question) => question.target?.kind === 'bot_main' && shared.bots.some((bot) => question.target?.kind === 'bot_main' && bot.bot_id === question.target.bot_id && bot.conversation_id === question.conversation_id) && awaitsAnswer(question, answered)))
+  const { unread } = mainConversationAttention({
+    bots: shared.bots, notifications, questions, ignoredNotifications: shared.ignoredNotifications, answered,
+    includeSessionNotifications: false,
+  })
 
   const directory: Member[] = (device.directory?.members ?? []).map((member) => {
     const node = nodes.find((item) => item.device_id === member.device_id), entry = member.device_id === device.ready?.entry.device_id

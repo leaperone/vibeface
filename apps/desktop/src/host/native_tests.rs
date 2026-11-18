@@ -177,6 +177,86 @@ async fn client_only_discovery_settings_and_forget_never_initialize_node() -> Re
     assert!(!fixture.node().exists());
     Ok(())
 }
+#[test]
+fn discovery_prefers_only_a_matching_running_identity_or_a_sole_running_node() {
+    use host::{Discovery, LocalNode, NodeSource, preferred_running_node};
+
+    let node = |name: &str, id: &str, status| LocalNode {
+        data_dir: std::env::temp_dir().join(name),
+        device_id: id.repeat(64),
+        sources: vec![NodeSource::Remembered],
+        status,
+        unavailable_reason: None,
+        local_listen: None,
+        listen: None,
+        web_enabled: None,
+        core_version: None,
+        user_service_cli: None,
+    };
+    let remembered = node("remembered", "a", NodeStatus::Running);
+    let other = node("other", "b", NodeStatus::Running);
+    let mut discovery = Discovery {
+        nodes: vec![remembered.clone(), other.clone()],
+        ..Default::default()
+    };
+    assert_eq!(preferred_running_node(&discovery, None), None);
+    assert_eq!(
+        preferred_running_node(&discovery, Some(&remembered.identity())),
+        Some(remembered.identity())
+    );
+    discovery.nodes[0].device_id = "c".repeat(64);
+    assert_eq!(
+        preferred_running_node(&discovery, Some(&remembered.identity())),
+        None
+    );
+    discovery.nodes[0].status = NodeStatus::Stopped;
+    assert_eq!(
+        preferred_running_node(&discovery, Some(&remembered.identity())),
+        Some(other.identity())
+    );
+}
+
+#[tokio::test]
+async fn backend_startup_discovers_an_existing_node_without_a_host_command() -> Result<()> {
+    use crate::views::backend::{Backend, Event};
+    use host::DiscoveryState;
+
+    let fixture = Fixture::new()?;
+    fixture.initialize()?;
+    privatefs::write_atomic(&fixture.node().join("running"), b"fixture")?;
+    let (commands, mut events, _snapshots, stop, actor) = Backend::spawn(
+        fixture.open(false)?,
+        &tokio::runtime::Handle::current(),
+        "fixture-startup".into(),
+    );
+    let selected = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(Event::Scoped { event, .. }) = events.recv().await {
+            if let Event::Host(host) = *event
+                && host.discovery_state == DiscoveryState::Ready
+            {
+                assert!(host.owned.is_none());
+                assert!(!host.can_start_owned);
+                return host.selected;
+            }
+        }
+        None
+    })
+    .await?;
+    assert_eq!(selected, Some(fixture.identity()));
+    assert!(!fixture.profile.join("fixture.calls").exists());
+    assert!(
+        !fixture
+            .profile
+            .join("native-desktop-settings.json")
+            .exists()
+    );
+    stop.send(true)?;
+    drop(commands);
+    tokio::time::timeout(Duration::from_secs(5), actor).await??;
+    assert!(fixture.node().join("running").exists());
+    Ok(())
+}
+
 #[tokio::test]
 async fn owned_start_stop_and_drop_close_only_the_held_child_stdin() -> Result<()> {
     let fixture = Fixture::new()?;
