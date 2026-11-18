@@ -1222,6 +1222,12 @@ pub(super) fn view(
     })
 }
 
+fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
+    value[key]
+        .as_str()
+        .with_context(|| format!("{key} must be a string"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

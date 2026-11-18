@@ -23,12 +23,12 @@ use std::{
 };
 use store::ServiceStore;
 use types::*;
-use vibeface_client::{DeliveryBudgetFlush, DeliveryRead, DeliveryWireAction};
 use vibeface_delivery::{
     Amount, BindingAction, KeyBinding, Order, ProofInput, ProofProfile, Relation, Secret32,
     SecretBytes, SignedKeyBinding, Statement, Terms, UnsignedOrder, WindowRandomness, Witness,
     Word, encrypt_window, hash, receiving_public, recover_window,
 };
+use vibeface_protocol::delivery::{DeliveryBudgetFlush, DeliveryRead, DeliveryWireAction};
 use zeroize::Zeroizing;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

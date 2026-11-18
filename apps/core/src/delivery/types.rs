@@ -1,11 +1,11 @@
 use super::charity::CharityRequest;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-pub use vibeface_client::{
+use vibeface_delivery::{Order, PeerSignature, SignedKeyBinding, Word};
+pub use vibeface_protocol::delivery::{
     DeliveryAcceptance as Acceptance, DeliveryMode as Mode, DeliveryPrepare as Prepare,
 };
-use vibeface_client::{DeliveryRead, DeliveryWireAction};
-use vibeface_delivery::{Order, PeerSignature, SignedKeyBinding, Word};
+use vibeface_protocol::delivery::{DeliveryRead, DeliveryWireAction};
 
 pub const MAX_FILE_BYTES: usize = 130_816;
 pub const MAX_CONTROL_BYTES: usize = 16_384;
