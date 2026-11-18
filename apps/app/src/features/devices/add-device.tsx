@@ -34,9 +34,8 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
   const [open, setOpen] = useState(false)
   const opener = useRef<HTMLElement | null>(null)
   // Kept for this opening only: the hint's search is cleared once the sheet is up.
-  const [asManager, setAsManager] = useState(false)
+  const [{ asManager, result }, setSharing] = useState<{ asManager: boolean; result: Share | null }>({ asManager: false, result: null })
   useEffect(() => onOpenChange?.(open), [open])
-  const [result, setResult] = useState<Share | null>(null)
   const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
   const busy = busyGeneration === generation
   const pending = useRef<number | null>(null)
@@ -53,7 +52,7 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
   const [usedInviteId, setUsedInviteId] = useState<string | null>(null)
   const used = result !== null && (answered || usedInviteId === result.inviteId)
   useEffect(() => { if (answered && result) setUsedInviteId(result.inviteId) }, [answered, result])
-  useEffect(() => { setResult(null); setError(""); setAdded(null) }, [ready])
+  useEffect(() => { setSharing({ asManager: false, result: null }); setError(""); setAdded(null) }, [ready])
   // Rerender at the deadline. The displayed result owns the timer.
   const [, refreshExpiry] = useState(0)
   const expired = result !== null && Date.now() >= result.expiresAt
@@ -80,11 +79,14 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
     if (pending.current === generation) return
     pending.current = generation
     const connection = ready
-    setResult(null); setAdded(null); setShown("link")
+    setSharing(current => ({ ...current, result: null })); setAdded(null); setShown("link")
     setBusyGeneration(generation); setError("")
     try {
       const invitation = await device.createInvitation()
-      if (connection?.isCurrent()) setResult(share(invitation, manager))
+      if (connection?.isCurrent()) {
+        const result = share(invitation, manager)
+        setSharing(current => ({ ...current, result }))
+      }
     }
     catch (cause) { if (connection?.isCurrent()) setError(messageOf(cause)) }
     finally { if (pending.current === generation) pending.current = null; setBusyGeneration((owner) => owner === generation ? null : owner) }
@@ -110,13 +112,13 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
   useEffect(() => {
     if (!opening || !ready?.principal.can_manage) return
     setKind(opening)
-    setAsManager(Boolean(manage))
+    setSharing(current => ({ ...current, asManager: Boolean(manage) }))
     show(Boolean(manage))
     onOpened?.()
   }, [opening, ready])
   if (!ready?.principal.can_manage) return null
 
-  return <Drawer open={open} onOpenChange={(next) => { setOpen(next); if (!next) { clipboard.reset(); setAdded(null); setAsManager(false) } }}>
+  return <Drawer open={open} onOpenChange={(next) => { setOpen(next); if (!next) { clipboard.reset(); setAdded(null); setSharing(current => ({ ...current, asManager: false })) } }}>
     <PageActions>
       <DrawerTrigger asChild><Button type="button" variant={requests ? "secondary" : "primary"} onClick={() => show()}><Plus aria-hidden="true" />添加设备</Button></DrawerTrigger>
     </PageActions>
@@ -132,7 +134,7 @@ export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening
           <JoinRequests inviteId={open ? result?.inviteId : undefined} manage={asManager && result?.asManager} onAllowed={(addedDevice, inviteId) => {
             if (!ready.isCurrent()) return
             setAdded(addedDevice)
-            setResult((current) => current?.inviteId === inviteId ? null : current)
+            setSharing(current => current.result?.inviteId === inviteId ? { asManager: false, result: null } : current)
           }} />
           {added && !requests ? <div className="grid gap-3">
             <p role="status" className="flex min-w-0 items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" /><span className="truncate" title={added.name}>{added.manage ? deviceCopy.addedManager(added.name) : `已添加「${added.name}」`}</span></p>

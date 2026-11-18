@@ -5272,7 +5272,7 @@ test('the Mobile join screen keeps the claimed invite through handoff and cancel
     assert.equal(screen.module.spent, firstLink)
     const child = screen.render('default').find(({ type }) => typeof type === 'function' && type.name === 'Waiting')
     assert.ok(child)
-    const cancel = forms.waiting.render('Waiting', child.props).find(({ type, props }) => type === 'Button' && componentText(props.children) === '取消')?.props.onPress
+    const cancel = forms.waiting.render('Waiting', child.props).find(({ type, props }) => type === 'Button' && componentText(props.children) === joinCopy.stopWaiting)?.props.onPress
     assert.ok(typeof cancel === 'function'); cancel()
     assert.equal(cancelled, 1)
 
@@ -6390,6 +6390,38 @@ test('only the matching invitation auto-starts and a failed comparison can be st
       await settleComponent()
     } finally { list.close(); card.close() }
   }
+})
+
+test('a Web manager invitation cannot carry its management preset into the next link', async () => {
+  let issued = 0
+  const joins: { invite_id: string }[] = []
+  const device = {
+    connectionGeneration: () => 1, ready: { isCurrent: () => true, principal: { can_manage: true } },
+    createInvitation: async () => ({ link: `vibeface://join/link-${++issued}`, inviteId: String(issued).repeat(32), expiresAt: Date.now() + 600_000 }),
+    refreshDirectory: async () => {},
+  }
+  const app = componentHarness('../devices/add-device.tsx', {
+    '@vibeface/client/identity/context.tsx': { useDevice: () => device },
+    '@vibeface/client/identity/copy.ts': { addDeviceCopy, deviceCopy, joinCopy },
+    '@/lib/glossary': { terms: { safetyCode: { icon: 'ScanEye' } } },
+    './join': { JoinRequests: 'JoinRequests', useOpenJoins: () => joins },
+  }, { HTMLElement: class {}, document: { activeElement: null }, setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {} })
+  const render = () => app.render('AddDevice')
+  try {
+    app.render('AddDevice', { opening: 'phone', manage: true }); await settleComponent()
+    joins.push({ invite_id: '1'.repeat(32) }, { invite_id: 'a'.repeat(32) })
+    const own = render().find(({ type }) => type === 'JoinRequests')?.props
+    assert.ok(own && typeof own.onAllowed === 'function')
+    assert.equal(own.manage, true)
+    joins.shift()
+    own.onAllowed({ id: 'joined', kind: 'client', name: '手机', manage: true }, '1'.repeat(32))
+    const generate = render().find(({ type, props }) => type === 'Button' && componentText(props.children) === '生成链接')?.props.onClick
+    assert.ok(generate)
+    generate(); await settleComponent()
+    const next = render().find(({ type }) => type === 'JoinRequests')?.props
+    assert.equal(next?.inviteId, '2'.repeat(32))
+    assert.equal(next?.manage, false)
+  } finally { app.close() }
 })
 
 test("an oversized phone recovery link stays visible and copyable when QR encoding fails", async () => {
