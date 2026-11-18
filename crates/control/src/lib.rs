@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, value::RawValue};
 use std::{
     io::Write as _,
     path::{Path, PathBuf},
@@ -23,6 +23,8 @@ pub const DATA_EPOCH: u32 = 1;
 pub const MAX_CONTROL_PACKET: usize = 1024 * 1024;
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub mod discovery;
 
 /// A bounded request handled by a standalone core process.  The core owns all data access and
 /// turns these DTOs into its internal Config, identity and Store values.
@@ -257,7 +259,7 @@ async fn wait_for_exit(child: &mut Child, timeout: Option<Duration>) -> Result<E
 }
 
 /// Execute one bounded request in the sibling core binary and decode its single JSON response.
-pub async fn request(core: &Path, request: &ControlRequest) -> Result<Value> {
+async fn request_output(core: &Path, request: &ControlRequest) -> Result<Vec<u8>> {
     ensure!(core.is_absolute(), "core executable path must be absolute");
     let mut child = Command::new(core)
         .arg("--control")
@@ -342,9 +344,46 @@ pub async fn request(core: &Path, request: &ControlRequest) -> Result<Value> {
             String::from_utf8_lossy(&error_output)
         );
     }
+    Ok(output)
+}
+
+/// Execute one request and decode the generic response envelope.
+pub async fn request(core: &Path, request: &ControlRequest) -> Result<Value> {
+    let output = request_output(core, request).await?;
     let response: ControlResponse =
         serde_json::from_slice(&output).context("invalid core control response")?;
     response.into_result()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawControlResponse {
+    ok: bool,
+    #[serde(default, deserialize_with = "present_control_field")]
+    result: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "present_control_field")]
+    error: Option<String>,
+}
+
+/// Discovery-specific response path. The result stays a `RawValue` until the shared Discovery
+/// decoder sees it, preserving duplicate nested keys that generic `Value` decoding would erase.
+pub async fn request_discovery(
+    core: &Path,
+    request: &ControlRequest,
+) -> Result<discovery::Discovery> {
+    ensure!(
+        matches!(request, ControlRequest::DiscoverLocalNodes { .. }),
+        "discovery request required"
+    );
+    let output = request_output(core, request).await?;
+    let response: RawControlResponse =
+        serde_json::from_slice(&output).context("invalid core control response")?;
+    let result = match (response.ok, response.result, response.error) {
+        (true, Some(result), None) if result.get().trim() != "null" => result,
+        (false, None, Some(error)) => bail!(error),
+        _ => bail!("core control response must carry exactly one matching payload"),
+    };
+    serde_json::from_str(result.get()).context("invalid Core discovery response")
 }
 
 /// Resolve the core executable installed next to the CLI.  Development builds use Cargo's
@@ -477,6 +516,7 @@ mod tests {
         Output,
         Status,
         Contradictory,
+        DiscoveryDuplicate,
     }
 
     struct ChildFixture {
@@ -492,7 +532,9 @@ mod tests {
         #[cfg(unix)]
         {
             let script = match kind {
-                FixtureKind::Output | FixtureKind::Contradictory => "output.sh",
+                FixtureKind::Output
+                | FixtureKind::Contradictory
+                | FixtureKind::DiscoveryDuplicate => "output.sh",
                 FixtureKind::Status => "status.sh",
             };
             std::os::unix::fs::symlink(
@@ -506,7 +548,9 @@ mod tests {
         std::fs::write(
             &executable,
             match kind {
-                FixtureKind::Output | FixtureKind::Contradictory => {
+                FixtureKind::Output
+                | FixtureKind::Contradictory
+                | FixtureKind::DiscoveryDuplicate => {
                     "@echo off\r\nmore > nul\r\ntype \"%~dp0stdout\"\r\n"
                 }
                 FixtureKind::Status => {
@@ -520,6 +564,11 @@ mod tests {
             FixtureKind::Contradictory => std::fs::write(
                 stdout,
                 b"{\"ok\":true,\"result\":{},\"error\":\"contradiction\"}\n",
+            )?,
+            FixtureKind::DiscoveryDuplicate => std::fs::write(
+                stdout,
+                br#"{"ok":true,"result":{"nodes":[{"status":"stopped","status":"stopped","device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","data_dir":"/tmp/node","sources":["remembered"],"local_listen":"127.0.0.1:1","listen":"127.0.0.1:2","web_enabled":true,"core_version":"0.0.1"}],"warnings":[],"user_service_registered":false}}
+"#,
             )?,
             FixtureKind::Status => {}
         }
@@ -604,6 +653,41 @@ mod tests {
             "{error:#}"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn discovery_client_preserves_and_rejects_nested_duplicate_fields() -> Result<()> {
+        let fixture = fixture(FixtureKind::DiscoveryDuplicate)?;
+        let request = ControlRequest::DiscoverLocalNodes {
+            app_profile_dir: PathBuf::from("/tmp/profile"),
+            remembered_data_dirs: Vec::new(),
+        };
+        let error = request_discovery(&fixture.executable, &request)
+            .await
+            .expect_err("duplicate nested discovery fields must be rejected");
+        assert!(
+            error
+                .root_cause()
+                .to_string()
+                .contains("duplicate discovery field"),
+            "{error:#}"
+        );
+        std::fs::remove_dir_all(fixture.directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_response_rejects_explicit_counterpart_nulls() {
+        let error_null = r#"{"ok":true,"result":{"nodes":[],"warnings":[],"user_service_registered":false},"error":null}"#;
+        assert!(serde_json::from_str::<RawControlResponse>(error_null).is_err());
+        let result_null = serde_json::from_str::<RawControlResponse>(
+            r#"{"ok":false,"result":null,"error":"discovery failed"}"#,
+        )
+        .expect("RawValue preserves explicit result null");
+        assert!(!matches!(
+            (result_null.ok, result_null.result, result_null.error),
+            (false, None, Some(_))
+        ));
     }
 
     #[tokio::test]

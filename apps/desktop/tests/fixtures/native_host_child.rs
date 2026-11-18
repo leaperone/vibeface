@@ -158,13 +158,15 @@ fn main() {
                 let profile = PathBuf::from(field(&input, "app_profile_dir").unwrap());
                 let node = profile.join("node");
                 if node.join("identity.json").exists() {
-                    let value = inspect(&node);
-                    let value = value.strip_suffix('}').unwrap();
+                    let running = node.join("running").exists();
+                    let status = if running { "running" } else { "stopped" };
+                    let id = fs::read_to_string(node.join("fixture.identity")).unwrap_or_else(|_| ID.into());
                     format!(
-                        "{{\"nodes\":[{value},\"sources\":[\"app_profile\"]}}],\"warnings\":[]}}"
+                        "{{\"nodes\":[{{\"status\":{},\"device_id\":{},\"data_dir\":{},\"sources\":[\"app_profile\"],\"local_listen\":\"127.0.0.1:4791\",\"listen\":\"127.0.0.1:4790\",\"web_enabled\":true,\"core_version\":\"2.0.0\"}}],\"warnings\":[],\"user_service_registered\":false}}",
+                        string(status), string(&id), string(&node.to_string_lossy())
                     )
                 } else {
-                    "{\"nodes\":[],\"warnings\":[]}".into()
+                    "{\"nodes\":[],\"warnings\":[],\"user_service_registered\":false}".into()
                 }
             }
             _ => panic!("unexpected control command"),

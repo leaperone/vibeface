@@ -258,6 +258,32 @@ async fn backend_startup_discovers_an_existing_node_without_a_host_command() -> 
 }
 
 #[tokio::test]
+async fn late_startup_discovery_preserves_an_explicit_choice() -> Result<()> {
+    use host::DiscoveryState;
+
+    let fixture = Fixture::new()?;
+    fixture.initialize()?;
+    privatefs::write_atomic(&fixture.node().join("running"), b"fixture")?;
+    let identity = fixture.identity();
+    let mut host = fixture.open(true)?;
+    host.select_node(&identity).await?;
+    host.complete_startup_discovery(Err(anyhow::anyhow!("discovery unavailable")));
+    assert_eq!(host.snapshot().discovery_state, DiscoveryState::Unavailable);
+    assert_eq!(host.snapshot().selected, Some(identity.clone()));
+
+    let mut host = fixture.open(true)?;
+    host.select_node(&identity).await?;
+    let result = host.scan().await?;
+    host.clear_selection()?;
+    host.complete_startup_discovery(Ok(result));
+    let snapshot = host.snapshot();
+    assert_eq!(snapshot.discovery_state, DiscoveryState::Ready);
+    assert_eq!(snapshot.discovery.nodes[0].identity(), identity);
+    assert!(snapshot.selected.is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn owned_start_stop_and_drop_close_only_the_held_child_stdin() -> Result<()> {
     let fixture = Fixture::new()?;
     fixture.initialize()?;
