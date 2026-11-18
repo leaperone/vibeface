@@ -1,4 +1,5 @@
 use super::*;
+use chain::{ChainWindowPhase, TxStatus};
 use orders::{Quotation, address_bytes, view};
 
 impl Delivery {
@@ -497,7 +498,7 @@ impl Delivery {
                         &record.provider_gas_cap,
                     )
                     .await?;
-                if observed.phase == "confirmed" {
+                if matches!(observed.status(), Some(TxStatus::Confirmed(_))) {
                     self.update_paid_view(&mut stored).await?;
                 } else {
                     stored.view.chain_unknown();
@@ -632,10 +633,16 @@ impl Delivery {
                 .windows
                 .get(index as usize)
                 .context("chain window is missing")?;
-            ensure!(state.phase != 4, "refunded service window is terminal");
+            ensure!(
+                state.phase != ChainWindowPhase::Refunded,
+                "refunded service window is terminal"
+            );
             if matches!(operation, GrantOperation::GetCapsule) {
                 ensure!(
-                    state.phase == 2 || state.phase == 3,
+                    matches!(
+                        state.phase,
+                        ChainWindowPhase::KeyPublished | ChainWindowPhase::Earned
+                    ),
                     "key capsule is unavailable until its publication is confirmed"
                 );
             }
@@ -727,20 +734,16 @@ impl Delivery {
         }
         let chain = self.chain().await?;
         if let Some(transaction) = transaction {
-            let observed = if transaction.phase == "confirmed" {
-                let observed = chain.observe(&transaction).await.unwrap_or_else(|_| chain::TxObservation {
-                    phase: "unknown".into(), tx_hash: transaction.tx_hash.clone(),
-                    block_number: transaction.block_number, block_hash: transaction.block_hash.clone(),
-                    error: Some("historical transaction observation is unknown; original bytes were preserved".into()),
-                });
+            let observed = if matches!(transaction.status(), Some(TxStatus::Confirmed(_))) {
+                let observed = match chain.observe(&transaction).await {
+                    Ok(observed) => observed,
+                    Err(_) => transaction.observation(
+                        TxStatus::Unknown { last_block: transaction.block().cloned() },
+                        Some("historical transaction observation is unknown; original bytes were preserved"),
+                    )?,
+                };
                 self.with_store(|store| {
-                    store.observe_transaction(
-                        &transaction.intent.id,
-                        &observed.phase,
-                        observed.block_number,
-                        observed.block_hash.as_deref(),
-                        observed.error.as_deref(),
-                    )
+                    store.observe_transaction(&transaction.intent.id, &observed)
                 })?;
                 observed
             } else {
@@ -748,7 +751,7 @@ impl Delivery {
                     .reconcile_transaction(self, &transaction.intent.id)
                     .await?
             };
-            self.finish_key_operation(&chain, &transaction.intent.id, &observed.phase)
+            self.finish_key_operation(&chain, &transaction.intent.id, observed.status())
                 .await?;
         }
         if let Some(budget_id) = budget_id {
@@ -856,7 +859,10 @@ impl Delivery {
         );
         if stored.view.role == Role::Receiver
             && stored.accepted
-            && state.windows.iter().any(|window| window.phase != 4)
+            && state
+                .windows
+                .iter()
+                .any(|window| window.phase != ChainWindowPhase::Refunded)
         {
             self.receiver_secret(stored.order.unsigned.terms.binding.key_id)?;
         }
@@ -899,28 +905,43 @@ pub(super) fn apply_paid_snapshot(
     view.evidence = Evidence::None;
     for (window, fact) in view.windows.iter_mut().zip(&state.windows) {
         window.state = match fact.phase {
-            0 => WindowState::Pending,
-            1 => WindowState::Held,
-            2 => WindowState::KeyPublished,
-            3 => WindowState::Earned,
-            4 => WindowState::Refunded,
-            _ => bail!("unknown chain delivery phase"),
+            ChainWindowPhase::Funded => WindowState::Pending,
+            ChainWindowPhase::Held => WindowState::Held,
+            ChainWindowPhase::KeyPublished => WindowState::KeyPublished,
+            ChainWindowPhase::Earned => WindowState::Earned,
+            ChainWindowPhase::Refunded => WindowState::Refunded,
         };
         window.decryption_proven = fact.decryption_proven;
     }
-    let all_earned = state.windows.iter().all(|window| window.phase == 3);
-    let all_refunded = state.windows.iter().all(|window| window.phase == 4);
-    let any_refunded = state.windows.iter().any(|window| window.phase == 4);
-    let all_recoverable = state.windows.iter().all(|window| {
-        matches!(window.phase, 2..=4)
-            && window.capsule.len() == 80
-            && hash(&window.capsule) == window.capsule_hash
-    });
-    let all_held = state
+    let all_earned = state
         .windows
         .iter()
-        .all(|window| matches!(window.phase, 1..=3));
-    let any_progress = state.windows.iter().any(|window| window.phase != 0);
+        .all(|window| window.phase == ChainWindowPhase::Earned);
+    let all_refunded = state
+        .windows
+        .iter()
+        .all(|window| window.phase == ChainWindowPhase::Refunded);
+    let any_refunded = state
+        .windows
+        .iter()
+        .any(|window| window.phase == ChainWindowPhase::Refunded);
+    let all_recoverable = state.windows.iter().all(|window| {
+        matches!(
+            window.phase,
+            ChainWindowPhase::KeyPublished | ChainWindowPhase::Earned | ChainWindowPhase::Refunded
+        ) && window.capsule.len() == 80
+            && hash(&window.capsule) == window.capsule_hash
+    });
+    let all_held = state.windows.iter().all(|window| {
+        matches!(
+            window.phase,
+            ChainWindowPhase::Held | ChainWindowPhase::KeyPublished | ChainWindowPhase::Earned
+        )
+    });
+    let any_progress = state
+        .windows
+        .iter()
+        .any(|window| window.phase != ChainWindowPhase::Funded);
     if all_earned {
         view.phase = Phase::Paid;
     } else if all_refunded {
@@ -947,7 +968,7 @@ pub(super) fn apply_paid_snapshot(
         && state
             .windows
             .iter()
-            .all(|window| window.phase == 3 && window.decryption_proven)
+            .all(|window| window.phase == ChainWindowPhase::Earned && window.decryption_proven)
     {
         Evidence::DecryptionProven
     } else if all_recoverable {
@@ -1011,8 +1032,11 @@ mod tests {
             error: None,
         }
     }
-    fn fact(phase: u8, open: bool) -> chain::WindowState {
-        let capsule = if matches!(phase, 2 | 3) {
+    fn fact(phase: ChainWindowPhase, open: bool) -> chain::WindowState {
+        let capsule = if matches!(
+            phase,
+            ChainWindowPhase::KeyPublished | ChainWindowPhase::Earned
+        ) {
             vec![0x42; 80]
         } else {
             Vec::new()
@@ -1187,7 +1211,15 @@ mod tests {
         let mut view = view();
         apply_paid_snapshot(
             &mut view,
-            &snapshot(vec![fact(0, false), fact(0, false)], "0", "0", "0"),
+            &snapshot(
+                vec![
+                    fact(ChainWindowPhase::Funded, false),
+                    fact(ChainWindowPhase::Funded, false),
+                ],
+                "0",
+                "0",
+                "0",
+            ),
         )
         .unwrap();
         assert_eq!(view.phase, Phase::Funded);
@@ -1207,7 +1239,15 @@ mod tests {
         let mut view = view();
         apply_paid_snapshot(
             &mut view,
-            &snapshot(vec![fact(2, false), fact(0, false)], "0", "0", "0"),
+            &snapshot(
+                vec![
+                    fact(ChainWindowPhase::KeyPublished, false),
+                    fact(ChainWindowPhase::Funded, false),
+                ],
+                "0",
+                "0",
+                "0",
+            ),
         )
         .unwrap();
         assert_eq!(view.phase, Phase::Partial);
@@ -1215,14 +1255,30 @@ mod tests {
         assert_eq!(view.windows[0].state, WindowState::KeyPublished);
         apply_paid_snapshot(
             &mut view,
-            &snapshot(vec![fact(3, true), fact(1, false)], "12", "0", "0"),
+            &snapshot(
+                vec![
+                    fact(ChainWindowPhase::Earned, true),
+                    fact(ChainWindowPhase::Held, false),
+                ],
+                "12",
+                "0",
+                "0",
+            ),
         )
         .unwrap();
         assert_eq!(view.evidence, Evidence::CiphertextHeld);
         assert_eq!(view.payment.state, PaymentState::Earned);
         apply_paid_snapshot(
             &mut view,
-            &snapshot(vec![fact(3, true), fact(4, false)], "12", "12", "17"),
+            &snapshot(
+                vec![
+                    fact(ChainWindowPhase::Earned, true),
+                    fact(ChainWindowPhase::Refunded, false),
+                ],
+                "12",
+                "12",
+                "17",
+            ),
         )
         .unwrap();
         assert_eq!(view.phase, Phase::Partial);
@@ -1234,21 +1290,45 @@ mod tests {
         let mut view = view();
         apply_paid_snapshot(
             &mut view,
-            &snapshot(vec![fact(2, false), fact(2, false)], "0", "0", "0"),
+            &snapshot(
+                vec![
+                    fact(ChainWindowPhase::KeyPublished, false),
+                    fact(ChainWindowPhase::KeyPublished, false),
+                ],
+                "0",
+                "0",
+                "0",
+            ),
         )
         .unwrap();
         assert_eq!(view.phase, Phase::KeyPublished);
         assert_eq!(view.evidence, Evidence::Recoverable);
         apply_paid_snapshot(
             &mut view,
-            &snapshot(vec![fact(3, true), fact(3, true)], "29", "29", "0"),
+            &snapshot(
+                vec![
+                    fact(ChainWindowPhase::Earned, true),
+                    fact(ChainWindowPhase::Earned, true),
+                ],
+                "29",
+                "29",
+                "0",
+            ),
         )
         .unwrap();
         assert_eq!(view.phase, Phase::Paid);
         assert_eq!(view.evidence, Evidence::DecryptionProven);
         apply_paid_snapshot(
             &mut view,
-            &snapshot(vec![fact(4, false), fact(4, false)], "0", "0", "29"),
+            &snapshot(
+                vec![
+                    fact(ChainWindowPhase::Refunded, false),
+                    fact(ChainWindowPhase::Refunded, false),
+                ],
+                "0",
+                "0",
+                "29",
+            ),
         )
         .unwrap();
         assert_eq!(view.phase, Phase::Refunded);
