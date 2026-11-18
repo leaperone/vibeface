@@ -215,12 +215,12 @@ export function useDelivery(connection: ReadyConnection, platform: Platform) {
     catch (cause) { if (claim.current()) setError(messageOf(cause)); return false }
     finally { if (claim.finish()) setActive(previous => previous === activity ? null : previous) }
   }
-  function runOrder(key: string, request: () => Promise<DeliveryOrder>) {
-    return run(key, async current => { const order = await request(); if (current()) remember(order) })
+  function runOrder(key: string, perform: () => Promise<DeliveryOrder>) {
+    return run(key, async current => { const order = await perform(); if (current()) remember(order) })
   }
-  function runBatch(key: string, request: () => Promise<DeliveryOrder[]>) {
+  function runBatch(key: string, perform: () => Promise<DeliveryOrder[]>) {
     return run(key, async current => {
-      const orders = await request()
+      const orders = await perform()
       if (current()) for (const order of orders) remember(order)
     })
   }
