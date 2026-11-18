@@ -6,7 +6,7 @@ use chacha20poly1305::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result, Word, hash};
+use crate::{Error, PeerSignature, Result, Word, hash, verify_peer};
 
 /// Payload classes supported by the session relay. Secret credentials are
 /// intentionally absent from this enum and cannot enter an envelope.
@@ -125,6 +125,8 @@ pub struct EncryptedSessionObject {
     /// The relay treats this as opaque ciphertext. It never parses this byte
     /// vector or interprets it according to `kind`.
     pub ciphertext: Vec<u8>,
+    /// Signature over the unsigned signing bytes. It is excluded from object identity.
+    pub signature: Option<PeerSignature>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -258,7 +260,11 @@ impl EncryptedSessionObject {
             chunk_count,
         };
         header.object_id = hash(&header.identity_bytes()?);
-        let object = Self { header, ciphertext };
+        let object = Self {
+            header,
+            ciphertext,
+            signature: None,
+        };
         object.validate(chunk_bytes)?;
         Ok(object)
     }
@@ -329,7 +335,11 @@ impl EncryptedSessionObject {
             }
             ciphertext.extend_from_slice(&chunk.bytes);
         }
-        let object = Self { header, ciphertext };
+        let object = Self {
+            header,
+            ciphertext,
+            signature: None,
+        };
         object.validate(chunk_bytes)?;
         Ok(object)
     }
@@ -343,6 +353,29 @@ impl EncryptedSessionObject {
 
     pub fn signing_digest(&self, chunk_bytes: usize) -> Result<Word> {
         Ok(hash(&self.signing_bytes(chunk_bytes)?))
+    }
+
+    pub fn with_signature(mut self, signature: PeerSignature) -> Self {
+        self.signature = Some(signature);
+        self
+    }
+
+    pub fn verify_signature(
+        &self,
+        sender_peer: &Word,
+        domain: &str,
+        chunk_bytes: usize,
+    ) -> Result<()> {
+        let signature = self
+            .signature
+            .as_ref()
+            .ok_or(Error("session object signature missing"))?;
+        verify_peer(
+            sender_peer,
+            domain,
+            &self.signing_bytes(chunk_bytes)?,
+            signature,
+        )
     }
 
     pub fn same_object(&self, other: &Self) -> bool {
@@ -362,6 +395,7 @@ fn put_string(output: &mut Vec<u8>, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
 
     fn object(kind: SessionObjectKind) -> EncryptedSessionObject {
         EncryptedSessionObject::new(
@@ -465,6 +499,26 @@ mod tests {
         let mut next = object(SessionObjectKind::Message).header;
         next.sequence = 1;
         assert!(next.canonical_bytes().is_err());
+    }
+
+    #[test]
+    fn signature_is_required_and_does_not_change_object_identity() {
+        let unsigned = object(SessionObjectKind::Message);
+        let key = SigningKey::from_bytes(&[42; 32]);
+        let peer = key.verifying_key().to_bytes();
+        assert!(
+            unsigned
+                .verify_signature(&peer, "session-object", 8)
+                .is_err()
+        );
+        let signature = key.sign(
+            &crate::signing_message("session-object", &unsigned.signing_bytes(8).unwrap()).unwrap(),
+        );
+        let object_id = unsigned.header.object_id;
+        let signed = unsigned.with_signature(PeerSignature::from_bytes(signature.to_bytes()));
+        assert_eq!(signed.header.object_id, object_id);
+        signed.verify_signature(&peer, "session-object", 8).unwrap();
+        assert!(signed.verify_signature(&peer, "wrong-domain", 8).is_err());
     }
 
     #[test]
