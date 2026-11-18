@@ -41,7 +41,7 @@ git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}"
 
 ## 对账与验收
 
-每个应用有自己的九字段 `release.json`，只有本应用全部资产验证成功才最后发布。组件的 `COMPONENT-INFO.json`、CLI 的九字段 `BUILD-INFO.json`、Desktop/Mobile 来源收据和全部文件摘要必须匹配。CLI/Core/App 版本和源码允许不同，但必须与所选精确 pin 相同。
+每个应用有自己的九字段 `release.json`，只有本应用全部资产验证成功才最后发布。组件的 `COMPONENT-INFO.json`、CLI 的 `BUILD-INFO.json`、Desktop/Mobile 来源收据和全部文件摘要必须匹配。CLI 包的字段和身份匹配规则见 [CLI 包的构建信息](../../../packages/docs/releasing.md#cli-包的构建信息)。
 
 已公开字节不覆盖。失败优先重跑原 run 的失败任务，复用原 artifact ID；新源码使用新版本。写入响应未知时查询 Tag、Release、资产摘要、Actions 或 npm registry 后再决定，不能直接重复写入。公开附件不等于完成，缺少清单时任何自动消费者都必须拒绝。
 

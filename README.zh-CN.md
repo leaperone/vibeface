@@ -118,10 +118,9 @@ vibeface://node/<issuer>?addr=84.54.3.78:4792&relay=http://node.vibeface.dev:334
 
 ## 从源码构建
 
-Core/CLI 构建需要 Python 3.12+、Rust 1.91+、Node.js 24、pnpm 11.9.0 和 `wasm-bindgen-cli` 0.2.129。
+先按[源码构建工具](packages/docs/releasing.md#源码构建工具)准备环境，再构建和打包 Core 与 CLI。
 
 ```sh
-rustup target add wasm32-unknown-unknown
 bash scripts/build-web-crypto.sh
 bash scripts/build-web.sh
 bash scripts/package-node.sh

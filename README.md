@@ -118,10 +118,9 @@ Detailed guides are currently in Chinese.
 
 ## Build from source
 
-Core/CLI builds need Python 3.12+, Rust 1.91+, Node.js 24, pnpm 11.9.0, and `wasm-bindgen-cli` 0.2.129.
+Set up the [source build tools](packages/docs/releasing.md#源码构建工具) before building and packaging Core and CLI.
 
 ```sh
-rustup target add wasm32-unknown-unknown
 bash scripts/build-web-crypto.sh
 bash scripts/build-web.sh
 bash scripts/package-node.sh

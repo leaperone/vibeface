@@ -24,11 +24,17 @@ description: 独立发布 Core、Web App、CLI、Desktop、Mobile 与官网，�
 
 CLI 的生成源码中，`releases/cli.json` 锁定 Core 和 App；Desktop 的 `releases/desktop.json` 锁定 CLI。每个 pin 包含依赖的精确 Tag、版本、源码 SHA 和 `release.json` 的 SHA256。发布器先验证依赖清单和 Tag，再下载其中对应平台的归档并校验摘要。组包消费已发布的字节，不重新编译或签名依赖。
 
-CLI 的九字段 `BUILD-INFO.json` 记录 CLI 自身版本、target、源码、协议和 epoch，以及 Core、App 各自的版本和源码。三者可以不同，必须与 Release 中的精确 pin 一致。`FILES.sha256` 封存包内全部文件。Desktop 的来源收据记录自身身份、GPUI 版本和内置 CLI 归档的真实版本、源码与摘要。
+Desktop 的来源收据记录自身身份、GPUI 版本和内置 CLI 归档的真实版本、源码与摘要。CLI 包的来源记录见 [CLI 包的构建信息](#cli-包的构建信息)。
 
 每个应用只汇总自身的构建目标。生产者通过本次运行的不可变 artifact ID 传递制品；完整校验后才追加公开 `release.json`。缺少清单的 Release 不供安装器、更新器、下游组包或部署消费。已公开 Tag 和资产字节不覆盖；同一 Tag 重跑时先对账，字节冲突时停止并使用新版本。
 
 信任边界是官方 GitHub 仓库、不可变 Tag、HTTPS 和 GitHub 提供的资产摘要。SHA256 清单不等同于独立发布签名。macOS 程序另有 Developer ID 签名与 notarization；Windows Stable 需要 Authenticode，Hourly/RC 可交付明确标注的未签名预览。
+
+### CLI 包的构建信息
+
+CLI 包中的 `BUILD-INFO.json` 记录包的来源。发行包中，CLI 的身份与当前 Release 一致，Core 与 App 的身份分别与对应的精确 pin 一致。CLI、Core 和 App 可以使用不同的版本和源码提交。源码包中的三项版本取自各自的清单，源码提交取自当前 checkout。
+
+`verify_build_info` 定义完整的字段名和取值校验。`seal_bundle` 写入 `BUILD-INFO.json`，并用 `FILES.sha256` 封存包内文件。[字段校验](../../scripts/release_format.py)和[组包实现](../../scripts/release_archive.py)
 
 ## 每小时 Hourly 发布
 
@@ -83,7 +89,7 @@ iOS 设备归档与实际可分发的 App 区分记录。缺少分发证书与�
 
 ## 源码构建
 
-使用已有的 Node.js 24、pnpm 11.9.0、Rust，以及 `wasm32-unknown-unknown` target 和 `wasm-bindgen-cli 0.2.129`。先生成浏览器密码学资源，再构建网页和源码运行包：
+先按[源码构建工具](#源码构建工具)准备环境，再依次生成浏览器密码学资源、网页和源码运行包。
 
 ```sh
 bash scripts/build-web-crypto.sh
@@ -91,9 +97,23 @@ bash scripts/build-web.sh
 bash scripts/package-node.sh
 ```
 
-Windows 使用 `python3 scripts/package-node-windows.py`。源码运行包从当前 checkout 构建 CLI/Core/App，用各自版本记录九字段 BUILD-INFO；公开 CLI Release 则消费精确锁定的已发布 Core/App。打包要求干净提交，不能把旧生成物或不明源码混入发行包。
+Windows 使用 `python3 scripts/package-node-windows.py`。从干净的 checkout 构建源码运行包。包的来源记录见 [CLI 包的构建信息](#cli-包的构建信息)。
 
 Web 资源在 `apps/app/dist/client`，Core 只读取静态输出，不运行 SSR 服务。打包器包含用户级服务脚本和离线文档，不包含身份、配置、数据库、Provider 程序或模型凭据。
+
+### 源码构建工具
+
+- Python 和 Node.js 采用 CI 的 `package` 作业所用的版本。[CI 配置](../../.github/workflows/ci.yml)
+- Rust 的最低版本由 workspace 的 `rust-version` 声明。[Rust 清单](../../Cargo.toml)
+- pnpm 的版本由根清单的 `packageManager` 指定。[JavaScript 清单](../../package.json)
+- `wasm-bindgen-cli` 的版本需与 `vibeface-secure` 的 wasm32 依赖 `wasm-bindgen` 精确匹配。[浏览器密码学模块清单](../../crates/secure/Cargo.toml)
+
+在仓库根目录安装浏览器密码学构建所需的 Rust target 和 CLI。把命令中的占位符替换为清单中 `wasm-bindgen` 的数字版本号，去掉前导的 `=`。
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version '<wasm-bindgen 版本号>' --locked
+```
 
 ## 本地检查
 

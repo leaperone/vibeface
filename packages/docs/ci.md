@@ -139,7 +139,7 @@ python3 scripts/check-delivery.py --sandbox
 
 手动 `CI / Core` 执行完整扩展检查，不受路径影响，只验证和生成制品。merge queue 执行整个工作区核心检查，不启用慢测试、MSRV 或四平台打包。开发分支 PR 不触发 Core。六条应用发布流程只等待本应用的生产者。本应用的平台失败会阻止完整发布，其他应用失败不会阻塞本应用。
 
-发布来源门要求精确 Tag、源码和成功 main push CI 对齐。脱离 main 的 Hourly 提交必须只有一个 main parent，且只能包含所选应用的机械版本与依赖变更。Stable、RC 的源码必须位于 main。每个应用的 `release.json` 最后写入，包含 contracts 和精确依赖 pin；CLI 包内九字段 `BUILD-INFO.json` 允许 CLI、Core、App 使用不同版本与源码。Core、App、www 的部署等待对应完整发布，`release-dispatch.py` 核对派发的运行并等待真实终态。
+发布来源门要求精确 Tag、源码和成功 main push CI 对齐。脱离 main 的 Hourly 提交必须只有一个 main parent，且只能包含所选应用的机械版本与依赖变更。Stable、RC 的源码必须位于 main。每个应用的 `release.json` 最后写入，包含 contracts 和精确依赖 pin；CLI 包的字段与校验见 [CLI 包的构建信息](releasing.md#cli-包的构建信息)。Core、App、www 的部署等待对应完整发布，`release-dispatch.py` 核对派发的运行并等待真实终态。
 
 quick-check 与 preflight 运行 `tests/release/test_cli.py`、`test_publisher.py`、`test_source.py` 的标准库离线子进程夹具，以及 `release.py self-test`、`hourly.py --self-test`、`release-dispatch.py --self-test` 和 `check-release-workflow.py --self-test`。检查器验证实际依赖图、artifact ID、权限传递和发布条件，并拒绝绕过完整收集或来源校验的负例。
 

@@ -18,7 +18,7 @@ description: 配置数据目录、网络边界与公共节点。
 | Core `apps/core` | `vibeface-core` 后台，拥有本机身份、数据与运行中的任务。 |
 | CLI `apps/cli` | `vibeface` 管理命令，启动 Core、安装服务及管理更新。 |
 
-源码构建的工具链要求见 [README](../../README.zh-CN.md#从源码构建)。`apps/mobile` 是单独构建的原生客户端，不是网页 App 的构建产物。
+工具链见[源码构建工具](releasing.md#源码构建工具)。`apps/mobile` 是单独构建的原生客户端，不是网页 App 的构建产物。
 
 ## 独立托管网页 App
 
@@ -60,14 +60,12 @@ vibeface join '<加入链接>' --name '<设备显示名称>'
 
 先安装所选 Provider，再配置程序路径、工作目录和认证环境。修改已有 `config.json` 时保留未列出的字段。
 
-用到 Codex、Claude Code 或 Cursor 而程序路径缺失时，Node 在 `init`、启动和网页打开用途开关时从本机找出并写进配置。设备页的**自动接入**也能为尚未启用的服务准备设置，不开启 Bot 或任务执行。之后照写下的路径使用。Codex 的运行数据由 Node 隔离管理：
+用到 Codex、Claude Code 或 Cursor 而程序路径缺失时，Node 在 `init`、启动和网页打开用途开关时从本机找出并写进配置。设备页的**自动接入**也能为尚未启用的服务准备设置，不开启 Bot 或任务执行。Node 按写入的路径启动程序。
 
-- 默认 App Server 模式是 `spawn`，Node 使用 `<data-dir>/providers/codex` 作为 `CODEX_HOME`，并在 `<data-dir>/providers/codex/sessions` 保存自己的会话。
-- Node 不扫描用户的会话或 control socket。只有明确选择 `system` 并填写绝对 socket 才连接外部 App Server。`spawn` 时填写的 socket 是本人自己的 Codex App Server，只用来把消息送进本人已有的会话，见下文。
 - 程序先查 PATH，再查用户安装、Homebrew、npm、Bun、Volta 和 NVM 目录。Cursor 使用官方 `agent` 或 `cursor-agent`。Codex 另查 `/Applications/Codex.app/Contents/Resources`，Claude Code 另查 `~/.claude/local`，opencode 另查 `~/.opencode/bin`。NVM 根取 `NVM_DIR`，默认 `~/.nvm`；Windows 使用 PATHEXT。
 - npm wrapper 使用同一 `bin` 目录下的 Node。无保存程序或 PATH 且常见目录仍找不到时，仅查询登记登录 shell 的 PATH。
 
-已写下的程序路径、模型和用途不被替换。Node-owned Codex 运行目录由 Node 创建和维护，不从用户目录查找，也不在普通 Provider 环境变量中修改。
+已写下的程序路径、模型和用途不被替换。
 
 启用 Node 独立 App Server 或自动接入 Codex，且私有 `config.toml` 尚不存在时，Node 从用户的 Codex 配置中初始化当前选中的模型、Provider 地址和认证环境变量名称。已有私有配置保持不变。配置投影不复制登录文件、密钥、固定认证请求头、会话、hooks、MCP 或项目信任设置。
 
@@ -75,7 +73,7 @@ vibeface join '<加入链接>' --name '<设备显示名称>'
 
 登录 shell 有执行用户启动脚本的副作用，只在存在变量缺口时运行，并限制输出和时限、回收子进程。无可复用变量时显示缺失；读取异常时按钮报告失败，启动只记录固定告警并继续上线。新配置或变量等待活跃任务结束后切换并重新检查，不中断任务或重放历史。
 
-使用已经运行的 Codex App Server 时，也可以直接给出它的 socket：
+要让 Node 使用已经运行的 Codex App Server，在 `config.json` 中选择 `system` 并填入实际的绝对 socket 路径。
 
 ```json
 {
@@ -92,11 +90,9 @@ vibeface join '<加入链接>' --name '<设备显示名称>'
 }
 ```
 
-Node 只连接这个 socket，不搜索其他正在运行的会话，也不启动或停止其所属进程。
+要让 Node 托管 App Server 并把 Bot 消息送回本人已有的 Codex 会话，把示例中的 `mode` 改为 `spawn`，并填入本人 Codex 的 App Server socket。也可以让 Bot 用 `propose_provider_config app_server_socket` 提议该路径，再在聊天中批准。两种模式的连接范围与 socket 行为见 [Codex App Server 配置](node-protocol.md#codex-app-server-配置)。
 
-由 Node 启动自己的 App Server 时只需保持 `spawn`。本人自己的 Codex（桌面 App 或终端）把会话存在另一个 Codex 目录，Node 自己的 App Server 读不到。要让 Bot 把回答送回这些会话，在 `spawn` 下同样填写 `socket`，指向本人 Codex 的 App Server（默认 `~/.codex/app-server-control/app-server-control.sock`）：Node 和 `vibeface codex send` 先问自己的 App Server，没有这个线程时再问它，只在那里有的线程才送过去，并沿用会话自己的审批、沙箱和模型；新线程永远开在 Node 自己的 App Server。不填时这些会话照旧拒绝送达。Bot 也可以用 `propose_provider_config app_server_socket` 提议，本人同意后写入，`mode` 不变。
-
-Node 会在启动边界注入 Node-owned `CODEX_HOME`，覆盖普通 Provider 环境里的同名值。Provider 的其他认证环境通过设备设置或服务配置填写。不要把密钥写入源码、URL、共享记录或命令历史。Cursor 的 CLI 程序和协调 Agent 工作目录也由本机配置指定。
+在设备设置或服务配置中填写 Provider 的认证环境。不要把密钥写入源码、URL、共享记录或命令历史。Cursor 的 CLI 程序和协调 Agent 工作目录也由本机配置指定。
 
 ## 为 Node 私有目录登录
 
@@ -104,7 +100,7 @@ Codex spawn、Claude Code 和 OpenCode 的本机 CLI 已登录，不代表 Node 
 
 Codex 命令设置 `<data-dir>/providers/codex` 的 `CODEX_HOME` 后执行 `codex login`。Claude Code 设置 `<data-dir>/providers/claude` 的 `CLAUDE_CONFIG_DIR` 后执行 `claude auth login`。OpenCode 命令固定 `<data-dir>/providers/opencode` 内的 XDG 与数据库路径，清除外部 config override，再执行 `opencode --standalone auth login`，防止登录到用户已有后台服务。Codex 和 Claude Code 自动接入可从官方 CLI store 准备访问令牌镜像，已有私有登录优先；不复制个人会话，不消费源刷新令牌。Codex 仅有 Keychain 的登录、Claude 自定义目录的 Keychain 登录需独立登录。镜像不会替原 CLI 刷新，源无新访问令牌且过期时需重新检查或独立登录。详见[接入边界](design/local-provider-onboarding.md)。
 
-pi 的认证目录不变，只有 session 目录固定为 `<data-dir>/providers/pi/sessions`。OpenCode 的数据、配置、状态和缓存分别位于私有根的 `data`、`config`、`state` 和 `cache`，项目配置不会覆盖此运行配置。Codex system 模式共享明确指定的外部服务会话，使用该服务自身的登录入口。
+pi 的认证目录不变，只有 session 目录固定为 `<data-dir>/providers/pi/sessions`。OpenCode 的数据、配置、状态和缓存分别位于私有根的 `data`、`config`、`state` 和 `cache`，项目配置不会覆盖此运行配置。使用 Codex `system` 模式时，按外部服务的登录步骤操作。
 
 Cursor 只使用官方 Agent CLI 的已有订阅登录，缺认证时提供所选 CLI 的 `login` 命令，不自动打开浏览器。网页进入 AI 设置或返回页面时自动接入并重新检查 Cursor，不开启用途。Node 忽略已有私有文件中的 Cursor API key/token 和 credential-store 覆盖，拒绝新设置，并在子进程边界清除这些覆盖。检查先读官方 status JSON，再按需初始化私有空 ACP 会话取得模型目录，不发送模型提示。Node 设置私有 CURSOR_CONFIG_DIR 和 CURSOR_DATA_DIR，保持真实 HOME 供 CLI 读取认证。CLI 自身用户和项目资源仍按官方规则加载；Node 工具只取得当前 attempt 的作用域认证。
 
