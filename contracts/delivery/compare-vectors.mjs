@@ -2,25 +2,23 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { compile, artifact, artifacts, requireDependency, schema } from './compile.mjs';
+import { deployFixtureContract, withLocalEvm } from './local-evm-fixture.mjs';
 
 if (!process.argv[2]) throw Error('Usage: node compare-vectors.mjs <public-vectors.json>');
 const vectors = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const ganache = requireDependency('ganache');
 const { BrowserProvider, ContractFactory, Contract, AbiCoder, sha256, toUtf8Bytes, hexlify, toBeHex, zeroPadValue } = requireDependency('ethers');
 compile();
-const rpc = ganache.provider({ logging: { quiet: true }, chain: { chainId: 31337, hardfork: 'shanghai' } });
-const provider = new BrowserProvider(rpc, undefined, { cacheTimeout: -1 });
-provider.pollingInterval = 10;
-const coder = AbiCoder.defaultAbiCoder();
-const tag = value => sha256(toUtf8Bytes(value));
-const bytes = value => `0x${value}`;
-const hex = value => hexlify(Uint8Array.from(value));
-const cases = [];
-function compare(name, actual, expected) {
-  assert.equal(actual.toLowerCase(), expected.toLowerCase(), name);
-  cases.push({ name, passed: true }); console.log(`PASS ${name}`);
-}
-try {
+await withLocalEvm({ ganache, BrowserProvider }, async ({ rpc, provider }) => {
+  const coder = AbiCoder.defaultAbiCoder();
+  const tag = value => sha256(toUtf8Bytes(value));
+  const bytes = value => `0x${value}`;
+  const hex = value => hexlify(Uint8Array.from(value));
+  const cases = [];
+  function compare(name, actual, expected) {
+    assert.equal(actual.toLowerCase(), expected.toLowerCase(), name);
+    cases.push({ name, passed: true }); console.log(`PASS ${name}`);
+  }
   const p = vectors.profile;
   const profile = { domain: tag('vibeface-delivery-profile-v1'), guestImageId: hex(p.guest_image_id),
     statementSchemaHash: hex(p.statement_schema_hash), cryptoSuite: p.crypto_suite, maxWindows: p.max_windows,
@@ -33,8 +31,7 @@ try {
   const encode = value => coder.encode([statementType], [object(value)]);
   const profileFields = a.abi.find(x => x.type === 'constructor').inputs[0].components;
   const profileType = `tuple(${profileFields.map(x => `${x.type} ${x.name}`).join(',')})`;
-  const deployed = await new ContractFactory(a.abi, a.bytecode, await provider.getSigner()).deploy(profile, { gasLimit: 29000000 });
-  await deployed.waitForDeployment();
+  const deployed = await deployFixtureContract(ContractFactory, a, await provider.getSigner(), profile, { gasLimit: 29000000 });
   const deployment = await deployed.getAddress();
   const fixedEscrow = hex(vectors.order.unsigned.terms.binding.escrow);
   // Only this disposable EVM transplants code/storage to reproduce Rust's fixed address vector.
@@ -85,4 +82,4 @@ try {
     passed: cases.length, vectorFile: process.argv[2], cases,
   }, null, 2)}\n`);
   console.log(JSON.stringify({ passed: cases.length }));
-} finally { await provider.destroy(); await rpc.disconnect(); }
+});

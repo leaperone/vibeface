@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the independent Python source self-tests shared by CI and preflight."""
+"""Run the independent source self-tests shared by CI and preflight."""
 
 import argparse
 from pathlib import Path
@@ -34,6 +34,7 @@ CHECKS = (
     ("scripts/checksum.py", "--self-test"),
     ("scripts/ios_device.py", "--self-test"),
     ("scripts/offline-docs.py", "--self-test"),
+    ("node", "--test", "contracts/delivery/local-evm-fixture.test.mjs"),
 )
 
 
@@ -47,7 +48,8 @@ def main():
             continue
         print(f"Source self-test: {check[0]}", flush=True)
         try:
-            subprocess.run([sys.executable, "-B", *check], cwd=ROOT, check=True)
+            command = list(check) if check[0] == "node" else [sys.executable, "-B", *check]
+            subprocess.run(command, cwd=ROOT, check=True)
         except subprocess.CalledProcessError as error:
             print(f"Source self-test failed: {check[0]} (exit {error.returncode})", file=sys.stderr)
             return error.returncode
