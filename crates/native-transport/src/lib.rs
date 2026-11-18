@@ -8,7 +8,7 @@ use iroh::{
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use vibeface_protocol::client_frame::{
-    ALPN, FrameKind, HEADER_BYTES, MAX_PAYLOAD_BYTES, decode_header, encode_header,
+    ALPN, FrameKind, HEADER_BYTES, decode_header, encode_header,
 };
 use vibeface_secure as secure;
 
@@ -78,8 +78,8 @@ impl LanEndpoint {
     ) -> Result<Arc<LanStream>, LanError> {
         secure::validate_device_id(device_id)
             .map_err(|error| LanError::InvalidDeviceId(error.to_string()))?;
-        let id: EndpointId = device_id
-            .parse()
+        let id = device_id
+            .parse::<EndpointId>()
             .map_err(|error| LanError::InvalidDeviceId(error.to_string()))?;
         let addrs: Vec<TransportAddr> = addrs
             .iter()

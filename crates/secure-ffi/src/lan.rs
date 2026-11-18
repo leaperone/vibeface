@@ -3,11 +3,11 @@
 
 use std::{
     future::Future,
-    sync::{Arc, LazyLock, OnceCell},
+    sync::{Arc, LazyLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use tokio::runtime::{JoinHandle, Runtime};
+use tokio::{runtime::Runtime, sync::OnceCell, task::JoinHandle};
 use vibeface_native_transport::{LanEndpoint, LanError};
 use vibeface_secure as secure;
 
@@ -21,7 +21,7 @@ static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
         .build()
         .expect("LAN runtime")
 });
-static ENDPOINT: OnceCell<LanEndpoint> = OnceCell::new();
+static ENDPOINT: OnceCell<LanEndpoint> = OnceCell::const_new();
 
 fn failed(reason: impl std::fmt::Display) -> SecureError {
     SecureError::Failed {
