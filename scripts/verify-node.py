@@ -32,6 +32,7 @@ import release_source
 
 import argparse
 import base64
+import binascii
 import contextlib
 import copy
 import hashlib
@@ -7359,6 +7360,91 @@ def delivery_protected_acceptance(options):
             "fresh protected delivery reaches its five genuine receipts and actual budget settlement")
 
 
+FIXTURE_KINDS = ("single", "cursor", "delivery", "workspace", "mesh")
+FIXTURE_STAGES = ("signed_out", "ready", "catalog_unknown")
+FIXTURE_GATES = ("taskA", "taskB", "main", "channel")
+FIXTURE_ROLES = ("source", "receiver", "provider", "public", "member")
+
+
+def validate_fixture_request(request, fixture_kind):
+    """Validate the JSONL operation shape before any fixture side effect."""
+    require(isinstance(request, dict), "fixture operation is an object")
+    op = request.get("op")
+    require(type(op) is str, "fixture operation names an operation")
+
+    def exact(*keys):
+        require(set(request) == set(keys), "fixture operation has exactly its declared fields")
+
+    def text(name):
+        require(type(request.get(name)) is str and request[name], "fixture operation has non-empty " + name)
+
+    no_args = {
+        "stop", "inspect", "cursor_login", "cursor_inspect", "workspace_inspect", "mesh_info", "mesh_pairing",
+        "native_join", "native_provider_setup", "native_provider_clipboard", "native_provider_queue",
+        "native_provider_inspect",
+    }
+    require(op in no_args or op in {
+        "restart", "workspace_release", "mesh_approve", "native_setup", "workspace_native_setup",
+        "native_approve", "native_provider_login", "native_provider_stage", "native_send",
+    }, "unsupported fixture operation")
+    if op in no_args:
+        exact("op")
+    elif op == "restart":
+        require(set(request) in ({"op", "role"}, {"op", "role", "crash"}), "restart fields are fixed")
+        require(request.get("role") in FIXTURE_ROLES, "restart role is known")
+        allowed = {"delivery": ("source", "receiver", "provider"), "mesh": ("public", "member")}.get(fixture_kind, ("source",))
+        require(request["role"] in allowed, "restart role belongs to this fixture generation")
+        if "crash" in request:
+            require(type(request["crash"]) is bool, "restart crash is boolean")
+    elif op == "workspace_release":
+        exact("op", "gate")
+        require(fixture_kind == "workspace" and request.get("gate") in FIXTURE_GATES, "workspace release is fixture scoped")
+    elif op == "mesh_approve":
+        exact("op", "peer", "code")
+        require(fixture_kind == "mesh", "mesh approval is fixture scoped")
+        text("peer"); text("code")
+    elif op == "native_setup":
+        exact("op", "invitation_file")
+        require(fixture_kind == "delivery", "native delivery setup is fixture scoped")
+        text("invitation_file")
+    elif op == "workspace_native_setup":
+        exact("op", "invitation_file")
+        require(fixture_kind == "workspace", "native workspace setup is fixture scoped")
+        text("invitation_file")
+    elif op == "native_approve":
+        exact("op", "peer", "code")
+        require(fixture_kind in ("delivery", "workspace"), "native approval is fixture scoped")
+        text("peer"); text("code")
+    elif op == "native_provider_login":
+        exact("op", "command")
+        require(fixture_kind == "delivery", "native provider login is fixture scoped")
+        text("command")
+    elif op == "native_provider_stage":
+        exact("op", "stage")
+        require(fixture_kind == "delivery" and request.get("stage") in FIXTURE_STAGES, "native provider stage is fixture scoped")
+    elif op == "native_send":
+        exact("op", "name", "content_base64")
+        require(fixture_kind == "delivery", "native send is fixture scoped")
+        text("name"); text("content_base64")
+        try:
+            base64.b64decode(request["content_base64"], validate=True)
+        except (ValueError, binascii.Error):
+            raise AssertionError("native send content is base64") from None
+    if op == "inspect":
+        require(fixture_kind == "delivery", "delivery inspection is fixture scoped")
+    elif op in ("cursor_login", "cursor_inspect"):
+        require(fixture_kind == "cursor", "Cursor operation is fixture scoped")
+    elif op == "workspace_inspect":
+        require(fixture_kind == "workspace", "workspace inspection is fixture scoped")
+    elif op in ("native_provider_setup", "native_provider_clipboard", "native_provider_queue", "native_provider_inspect"):
+        require(fixture_kind == "delivery", "native provider operation is fixture scoped")
+    elif op in ("mesh_info", "mesh_pairing"):
+        require(fixture_kind == "mesh", "mesh operation is fixture scoped")
+    elif op == "native_join":
+        require(fixture_kind in ("delivery", "workspace"), "native pairing is fixture scoped")
+    return request
+
+
 def e2e_fixture(options):
     program = shutil.which(str(options.binary)) if len(options.binary.parts) == 1 else str(options.binary)
     require(program is not None, "the isolated e2e Node binary exists on PATH or at its explicit path")
@@ -7495,6 +7581,7 @@ os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:
             require(type(request_id) is int and request_id == expected_id <= 2**53 - 1
                     and isinstance(request, dict), "fixture request IDs increase once per operation")
             try:
+                validate_fixture_request(request, options.fixture_kind)
                 op = request.get("op")
                 if op == "restart":
                     role = request.get("role")

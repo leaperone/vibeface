@@ -1,6 +1,7 @@
 import type { ChildProcess } from 'node:child_process';
 import type { Readable, Writable } from 'node:stream';
 import { TextDecoder } from 'node:util';
+import { parseFixtureRequest, parseFixtureResult, type FixtureRequest, type ResultByOp } from './fixture-contract.ts';
 
 type FixtureObject = Record<string, unknown>;
 type FixtureChild = ChildProcess & { stdin: Writable; stdout: Readable };
@@ -9,6 +10,7 @@ type Waiter = {
   resolve(value: FixtureObject): void;
   reject(error: Error): void;
   timer: ReturnType<typeof setTimeout>;
+  decode?: (value: FixtureObject) => FixtureObject;
 };
 type State =
   | { kind: 'starting'; waiter: Waiter }
@@ -94,10 +96,16 @@ export function createFixtureTransport(child: FixtureChild, {
       }
       if (id === current.id) {
         if (ok === true && hasKeys(value, ['id', 'ok', 'result']) && isFixtureObject(value.result)) {
-          state = { kind: 'idle', nextId: current.id + 1 };
-          clearTimeout(current.waiter.timer);
-          current.waiter.resolve(value.result);
-          return;
+          try {
+            const result = current.waiter.decode ? current.waiter.decode(value.result) : value.result;
+            state = { kind: 'idle', nextId: current.id + 1 };
+            clearTimeout(current.waiter.timer);
+            current.waiter.resolve(result);
+            return;
+          } catch {
+            fail('Fixture returned an invalid operation result');
+            return;
+          }
         }
         if (ok === false && hasKeys(value, ['id', 'ok', 'error', 'frames'])) {
           const details = describeFailure(value.error, value.frames);
@@ -151,7 +159,7 @@ export function createFixtureTransport(child: FixtureChild, {
     });
   });
 
-  async function call(request: FixtureObject): Promise<FixtureObject> {
+  async function call(request: FixtureObject, decode?: (value: FixtureObject) => FixtureObject): Promise<FixtureObject> {
     const current = state;
     if (current.kind === 'terminal') throw current.error;
     if (current.kind !== 'idle') throw new Error('Fixture is unavailable or busy');
@@ -164,7 +172,7 @@ export function createFixtureTransport(child: FixtureChild, {
     }
     return new Promise<FixtureObject>((resolve, reject) => {
       const timer = setTimeout(() => fail('Fixture operation timed out'), requestTimeoutMs);
-      state = { kind: 'pending', id, waiter: { resolve, reject, timer } };
+      state = { kind: 'pending', id, waiter: { resolve, reject, timer, decode } };
       try {
         child.stdin.write(line, error => { if (error) fail('Fixture stdin write failed'); });
       } catch {
@@ -196,5 +204,10 @@ export function createFixtureTransport(child: FixtureChild, {
     throw new Error('Fixture cleanup timed out waiting for child close');
   }
 
-  return { ready, call, fail, closed, stop: () => stopping ??= close() };
+  async function callTyped<O extends FixtureRequest['op']>(request: Extract<FixtureRequest, { op: O }>): Promise<ResultByOp[O]> {
+    const parsed = parseFixtureRequest(request);
+    return call(parsed, value => parseFixtureResult(parsed, value) as FixtureObject) as Promise<ResultByOp[O]>;
+  }
+
+  return { ready, call, callTyped, fail, closed, stop: () => stopping ??= close() };
 }

@@ -4,7 +4,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { mkdir, rename, unlink, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { parseFixtureReset } from '../tests/support/fixture-contract.ts';
+import { parseFixtureReady, parseFixtureRequest, parseFixtureResult } from '../tests/support/fixture-contract.ts';
 import { withControlledFixture } from '../tests/support/fixture-lifecycle.ts';
 import { createFixtureTransport, FixtureOperationError } from '../tests/support/fixture-transport.ts';
 
@@ -67,11 +67,12 @@ async function startFixture(kind) {
   void transport.closed.then(() => {
     if (fixture === transport) fixture = undefined;
   });
-  return transport.ready;
+  return parseFixtureReady(await transport.ready, kind);
 }
 function command(value) {
   assert(fixture, 'Fixture is unavailable');
-  return fixture.call(value);
+  const request = parseFixtureRequest(value);
+  return fixture.callTyped(request).then(result => parseFixtureResult(request, result));
 }
 const control = createServer(async (request, response) => {
   if (request.method !== 'POST' || request.url !== '/' || !authorized(request.headers.authorization, token)) {
@@ -83,10 +84,11 @@ const control = createServer(async (request, response) => {
     const chunks = [];
     let length = 0;
     for await (const chunk of request) { length += chunk.length; assert(length <= 4096, 'Fixture request too large'); chunks.push(chunk); }
-    const value = object(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    assert(length > 0, 'Fixture request is required');
+    const value = parseFixtureRequest(JSON.parse(Buffer.concat(chunks).toString('utf8')));
     let result;
-    if (value.op === 'reset') result = await startFixture(parseFixtureReset(value).kind);
-    else if (value.op === 'stop') { await stopFixture(); result = { stopped: true }; }
+    if (value.op === 'reset') result = await startFixture(value.kind);
+    else if (value.op === 'stop') { await stopFixture(); result = parseFixtureResult(value, { stopped: true }); }
     else if (['restart', 'inspect', 'cursor_login', 'cursor_inspect', 'workspace_release', 'workspace_inspect', 'mesh_info', 'mesh_pairing', 'mesh_approve'].includes(value.op)) result = await command(value);
     else throw new Error('Unknown fixture operation');
     response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(result));

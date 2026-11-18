@@ -79,6 +79,19 @@ test('startup has its own envelope and matched operation errors keep the connect
   assert.deepEqual(await transport.stop(), { code: 0, signal: null });
 });
 
+test('typed result validation fences a malformed response before rearming the waiter', async t => {
+  const { transport, child } = fixture(t);
+  await transport.ready;
+  const first = nextMessage(child);
+  const rejected = transport.callTyped({ op: 'inspect' }).then(() => assert.fail('Expected malformed result'), error => error);
+  assert.deepEqual(await first, { id: 1, request: inspect });
+  child.send({ op: 'reply', value: { id: 1, ok: true, result: { wallet_files: 0 } } });
+  const reason = await rejected;
+  assert.match(reason.message, /invalid operation result/);
+  await assert.rejects(transport.callTyped({ op: 'inspect' }), error => error === reason);
+  await transport.stop();
+});
+
 test('timeout fences late responses and all later operations before writing', async t => {
   const { transport, child } = fixture(t, undefined, { requestTimeoutMs: 500 });
   await transport.ready;

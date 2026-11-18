@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { insideTaskArtifacts } from '../support/artifact-paths';
+import { parseFixtureRequest, parseFixtureResult, type FixtureRequest, type ResultByOp } from '../support/fixture-contract';
 import { withControlledFixture } from '../support/fixture-lifecycle';
 import { lstat, readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
@@ -11,7 +12,7 @@ export type NodeInfo = { url: string; entry: string | null; peer: string; direct
 /** A Node whose owner access link a browser opens; `url` is that link's origin. */
 export type OwnerNode = NodeInfo & { entry: string };
 type Role = 'source' | 'receiver' | 'provider';
-type Control = (request: Record<string, unknown>) => Promise<unknown>;
+type Control = <O extends FixtureRequest['op']>(request: Extract<FixtureRequest, { op: O }>) => Promise<ResultByOp[O]>;
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -48,12 +49,13 @@ async function control(baseUrl: string | undefined): Promise<Control> {
   assert(url.protocol === 'http:' && url.hostname === '127.0.0.1' && url.port && url.pathname === '/' && !url.search && !url.hash, 'Control stays on literal loopback');
   assert(/^[a-f0-9]{64}$/.test(token));
   return async request => {
+    const parsed = parseFixtureRequest(request);
     const response = await fetch(url, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(request), signal: AbortSignal.timeout(90000) });
     if (!response.ok) {
       const failure = record(await response.json());
       assert.fail(`Fixture ${text(request.op)} returned ${response.status}: ${text(failure.error)}`);
     }
-    return response.json();
+    return parseFixtureResult(request, await response.json());
   };
 }
 export const test = base.extend<{ node: OwnerNode }>({

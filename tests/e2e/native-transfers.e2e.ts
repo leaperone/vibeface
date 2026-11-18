@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 import { execFile } from 'node:child_process';
 import { test as base } from '@e2e-dev/mobile';
 import { expect, secrets } from 'e2e';
-import { bundleManifest, nativeFixture, record, text } from './native-fixture';
+import { bundleManifest, expectFixtureOperationRejection, nativeFixture, record, text } from './native-fixture';
 
 const root = resolve(import.meta.dirname, '../..');
 const execute = promisify(execFile);
@@ -134,8 +134,8 @@ test('provider settings and stopping beside a queued input work in the installed
   const native = Object.keys(built).filter(name => name === executable || name.endsWith('.dylib') || name.split('/').at(-2) === `${name.split('/').at(-1)}.framework`);
   await network.call({ op: 'native_provider_setup' });
   await assert.rejects(network.call({ op: 'native_provider_setup' }));
-  await assert.rejects(network.call({ op: 'native_provider_stage', stage: 'invalid' }));
-  await assert.rejects(network.call({ op: 'native_provider_stage', stage: 'ready', role: 'source' }));
+  await expectFixtureOperationRejection(network.rawCall, { op: 'native_provider_stage', stage: 'invalid' });
+  await expectFixtureOperationRejection(network.rawCall, { op: 'native_provider_stage', stage: 'ready', role: 'source' });
   await device.installApp(undefined, { reinstall: true });
   const installedPath = (await execute('xcrun', ['simctl', 'get_app_container', simulator, 'one.leaper.vibeface', 'app'])).stdout.trim();
   assert(installedPath.startsWith('/') && installedPath.toLowerCase().includes(simulator.toLowerCase()), 'Inspect only the assigned simulator installed bundle');
@@ -310,8 +310,8 @@ test('provider settings and stopping beside a queued input work in the installed
   await expect.poll(() => device.clipboard()).toBe(setup.command);
   const copied = await device.clipboard();
   assert.equal(copied, setup.command);
-  await assert.rejects(network.call({ op: 'native_provider_login', command: copied + '; false' }));
-  await assert.rejects(network.call({ op: 'native_provider_login', command: copied, role: 'source' }));
+  await expectFixtureOperationRejection(network.rawCall, { op: 'native_provider_login', command: copied + '; false' });
+  await expectFixtureOperationRejection(network.rawCall, { op: 'native_provider_login', command: copied, role: 'source' });
   expect((await inspect()).login_count).toBe(0);
   expect((await inspect()).authentication).toBe('sign_in_required');
   const login = await network.call({ op: 'native_provider_login', command: copied });

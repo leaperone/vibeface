@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { insideTaskArtifacts } from '../support/artifact-paths';
+import { parseFixtureReady, type FixtureRequest, type ResultByOp } from '../support/fixture-contract';
 import { withControlledFixture } from '../support/fixture-lifecycle';
-import { createFixtureTransport } from '../support/fixture-transport';
+import { createFixtureTransport, FixtureOperationError } from '../support/fixture-transport';
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
@@ -20,8 +21,12 @@ export function text(value: unknown): string { assert(typeof value === 'string' 
 type NativeFixture = {
   fixture: Record<string, unknown>;
   invitation: string;
-  call(request: Record<string, unknown>): Promise<Record<string, unknown>>;
+  call<O extends FixtureRequest['op']>(request: Extract<FixtureRequest, { op: O }>): Promise<ResultByOp[O]>;
+  rawCall(request: Record<string, unknown>): Promise<Record<string, unknown>>;
 };
+export async function expectFixtureOperationRejection(call: (request: Record<string, unknown>) => Promise<Record<string, unknown>>, request: Record<string, unknown>): Promise<void> {
+  await assert.rejects(call(request), error => error instanceof FixtureOperationError);
+}
 export async function nativeFixture(kind: 'delivery' | 'workspace', artifacts: string, use: (network: NativeFixture) => Promise<void>): Promise<void> {
   const binary = process.env.VIBEFACE_E2E_BINARY, crypto = process.env.VIBEFACE_E2E_CRYPTO_MODULE;
   assert(binary && crypto, 'Native acceptance needs the actual Node and its matching WASM');
@@ -56,7 +61,7 @@ export async function nativeFixture(kind: 'delivery' | 'workspace', artifacts: s
         transport.fail(error.message);
         return error;
       });
-      await use({ fixture: await transport.ready, invitation, call: transport.call });
+      await use({ fixture: parseFixtureReady(await transport.ready, kind), invitation, call: transport.callTyped, rawCall: transport.call });
     },
     stop: async () => {
       const failures: unknown[] = [];
