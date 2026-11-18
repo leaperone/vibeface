@@ -350,8 +350,7 @@ pub fn http_origin(value: &str) -> Result<reqwest::Url> {
     Ok(url)
 }
 pub fn private_dir(path: &Path) -> Result<()> {
-    std::fs::create_dir_all(path)?;
-    privatefs::restrict_dir(path)
+    privatefs::create_dir(path)
 }
 pub fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
     privatefs::write_atomic(path, bytes)

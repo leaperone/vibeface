@@ -2583,15 +2583,7 @@ fn git(cwd: &str, args: &[&str]) -> Option<String> {
 }
 
 fn private_dir(path: &Path) -> Result<()> {
-    if let Ok(metadata) = fs::symlink_metadata(path) {
-        ensure!(
-            metadata.is_dir() && !metadata.file_type().is_symlink(),
-            "private path is not a private directory"
-        );
-        return Ok(());
-    }
-    fs::create_dir_all(path)?;
-    privatefs::restrict_dir(path)
+    privatefs::create_dir(path)
 }
 
 fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {

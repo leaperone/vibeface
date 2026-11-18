@@ -125,8 +125,7 @@ async fn inspect(data: &Path, core: &Path) -> Result<Inspection> {
 }
 
 fn private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)?;
-    privatefs::restrict_dir(path)
+    privatefs::create_dir(path)
 }
 
 fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
