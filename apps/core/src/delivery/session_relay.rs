@@ -953,7 +953,7 @@ mod tests {
                 if path.join("delivery/session-outbox.sqlite3").exists() {
                     let outbox =
                         super::super::session_outbox_store::SessionOutboxStore::open(&path)?;
-                    if outbox.cursor(&route_id)?.is_some() {
+                    if outbox.receiving_key(&route_id)?.is_some() {
                         return Ok::<(), anyhow::Error>(());
                     }
                 }
@@ -961,8 +961,10 @@ mod tests {
             }
         })
         .await
-        .context("automatic sender did not initialize")??;
+        .context("automatic sender did not cache the signed receiving key")??;
 
+        target.shutdown().await;
+        drop(target);
         let content = b"only the recipient opens this file".repeat(300);
         let message_content = content.clone();
         let event_network = network.clone();
@@ -1020,6 +1022,32 @@ mod tests {
             .await?;
         let relay_database = dir.join("relay/delivery/session-relay.sqlite3");
         let sender_database = dir.join("sender/delivery/session-outbox.sqlite3");
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let db = rusqlite::Connection::open_with_flags(
+                &sender_database,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            db.busy_timeout(std::time::Duration::from_secs(2))?;
+            loop {
+                let awaiting: u32 = db.query_row(
+                    "SELECT count(*) FROM receipt_queue WHERE route=?1 AND receipt IS NULL",
+                    [&route_id],
+                    |row| row.get(0),
+                )?;
+                if awaiting == 2 {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .context("sender did not upload both bundles while the receiver was offline")??;
+
+        let target = node(&dir.join("receiver"), &receiver, false).await?;
+        target.net()?.learn(&relay.net()?.addr()).await;
+        target.net()?.learn(&source.net()?.addr()).await;
+        source.net()?.learn(&target.net()?.addr()).await;
+        source.net()?.peer_restarted(&receiver.device_id()?);
         let mut target_settings = target.delivery.config();
         target_settings.session_route = Some(incoming.clone());
         target.delivery.configure_local(target_settings)?;

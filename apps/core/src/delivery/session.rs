@@ -222,10 +222,10 @@ impl Delivery {
     }
 
     /// The final object is the event; its encrypted payload names the preceding attachment objects.
-    pub(super) async fn seal_session_bundle(
+    pub(super) fn seal_session_bundle(
         &self,
-        node: &Runtime,
         route: &SessionRoute,
+        key: &CharityKey,
         signed: &SignedEvent,
         files: &[(BlobRef, Vec<u8>)],
     ) -> Result<Vec<SealedSessionObject>> {
@@ -240,7 +240,6 @@ impl Delivery {
             event.blobs.iter().eq(files.iter().map(|(blob, _)| blob)),
             "attachment plan does not match the signed event"
         );
-        let key = Self::session_receiving_key(node, &hex::encode(route.recipient)).await?;
         let event_hash = super::types::parse_word(&signed.hash)?;
         let mut objects = Vec::new();
         let mut attachments = Vec::new();
@@ -252,7 +251,7 @@ impl Delivery {
                     route,
                     SessionObjectKind::Attachment,
                     &event.scope_id,
-                    &key,
+                    key,
                     &part,
                 )?;
                 ids.push(sealed.0.header.object_id);
@@ -272,7 +271,7 @@ impl Delivery {
             route,
             kind_for_event(&event.body)?,
             &event.scope_id,
-            &key,
+            key,
             &payload,
         )?);
         Ok(objects)

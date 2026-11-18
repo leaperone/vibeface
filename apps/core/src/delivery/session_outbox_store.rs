@@ -3,7 +3,7 @@
 //! This store deliberately keeps the session payload opaque.  Endpoint delivery code remains
 //! responsible for checking the object header, signature, ciphertext commitment, and capsule.
 
-use super::session::{SealedSessionObject, SessionStoredReceipt};
+use super::session::{CharityKey, SealedSessionObject, SessionStoredReceipt};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::Path;
@@ -94,7 +94,11 @@ impl SessionOutboxStore {
             ),
         }
         tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS receipt_queue (
+            "CREATE TABLE IF NOT EXISTS route_keys (
+                route TEXT PRIMARY KEY NOT NULL REFERENCES routes(route) ON DELETE CASCADE,
+                key TEXT NOT NULL
+             ) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS receipt_queue (
                 route TEXT NOT NULL REFERENCES routes(route) ON DELETE CASCADE,
                 sequence INTEGER NOT NULL,
                 header TEXT NOT NULL,
@@ -291,6 +295,27 @@ impl SessionOutboxStore {
             )?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    pub(super) fn receiving_key(&self, route: &str) -> Result<Option<CharityKey>> {
+        let key: Option<String> = self
+            .db
+            .query_row(
+                "SELECT key FROM route_keys WHERE route=?1",
+                [route],
+                |row| row.get(0),
+            )
+            .optional()?;
+        key.map(|key| Ok(serde_json::from_str(&key)?)).transpose()
+    }
+
+    pub(super) fn save_receiving_key(&self, route: &str, key: &CharityKey) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO route_keys(route,key) VALUES(?1,?2)
+             ON CONFLICT(route) DO UPDATE SET key=excluded.key",
+            params![route, serde_json::to_string(key)?],
+        )?;
         Ok(())
     }
 

@@ -2,7 +2,7 @@
 
 use super::{
     Delivery,
-    session::{SessionRoute, checked_event, kind_for_event},
+    session::{CharityKey, SessionRoute, checked_event, kind_for_event},
     session_outbox_store::SessionOutboxStore,
     types::parse_word,
 };
@@ -220,6 +220,33 @@ impl Delivery {
         Ok(())
     }
 
+    async fn outbox_receiving_key(
+        &self,
+        node: &Runtime,
+        route_id: &str,
+        peer: &str,
+        binding: &SessionRoute,
+    ) -> Result<CharityKey> {
+        let cached = SessionOutboxStore::open(&self.data_dir)?.receiving_key(route_id)?;
+        if let Some(key) = cached
+            && key
+                .session_material(&binding.recipient, binding.validity.clone())
+                .is_ok()
+        {
+            return Ok(key);
+        }
+        // Key unavailability must not hold the independent inbox behind a network timeout.
+        let key = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Self::session_receiving_key(node, peer),
+        )
+        .await
+        .context("waiting for the recipient's signed session key")??;
+        key.session_material(&binding.recipient, binding.validity.clone())?;
+        SessionOutboxStore::open(&self.data_dir)?.save_receiving_key(route_id, &key)?;
+        Ok(key)
+    }
+
     async fn run_session_outbox(&self, node: &Runtime, network: &str) -> Result<()> {
         let config = self.config();
         let Some(route) = config
@@ -270,6 +297,17 @@ impl Delivery {
         let (sequence, objects) = if let Some(batch) = existing {
             (batch.sequence, batch.objects)
         } else {
+            let at = clock::now_ms_u64();
+            let binding = SessionRoute {
+                network: network.into(),
+                recipient: parse_word(&route.peer)?,
+                relay: parse_word(&route.relay)?,
+                validity: at.saturating_sub(5_000)..at.saturating_add(BUNDLE_LIFETIME_MS),
+            };
+            // Warm the signed public key even before the first event, while the peer is reachable.
+            let key = self
+                .outbox_receiving_key(node, &route_id, &route.peer, &binding)
+                .await;
             let network_id = network.to_owned();
             let conversation = route.conversation_id.clone();
             let next = node
@@ -320,22 +358,13 @@ impl Delivery {
                 })
                 .await?;
             let Some((sequence, source)) = next else {
-                return Ok(());
+                return key.map(|_| ());
             };
             let Some((signed, files)) = source else {
                 SessionOutboxStore::open(&self.data_dir)?.advance(&route_id, cursor, sequence)?;
                 return Ok(());
             };
-            let at = clock::now_ms_u64();
-            let binding = SessionRoute {
-                network: network.into(),
-                recipient: parse_word(&route.peer)?,
-                relay: parse_word(&route.relay)?,
-                validity: at.saturating_sub(5_000)..at.saturating_add(BUNDLE_LIFETIME_MS),
-            };
-            let objects = self
-                .seal_session_bundle(node, &binding, &signed, &files)
-                .await?;
+            let objects = self.seal_session_bundle(&binding, &key?, &signed, &files)?;
             SessionOutboxStore::open(&self.data_dir)?
                 .stage(&route_id, cursor, sequence, &objects)?;
             (sequence, objects)
