@@ -34,7 +34,7 @@ def local_environment():
             raise ValueError("VIBEFACE_SCCACHE=1 requires sccache on PATH")
         env["RUSTC_WRAPPER"] = wrapper
         env["CARGO_INCREMENTAL"] = "0"
-        env["CARGO_BUILD_INCREMENTAL"] = "0"
+        env["CARGO_BUILD_INCREMENTAL"] = "false"
         env.setdefault("SCCACHE_CACHE_SIZE", "20G")
         # Keep checkout paths in the compiler cache keys for path-dependent crates.
         env["SCCACHE_BASEDIRS"] = ""
