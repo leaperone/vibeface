@@ -551,7 +551,9 @@ impl Store {
                 Ok(Trigger::Schedule { .. }) => return Ok(format!("routine:{trigger}")),
                 Err(TriggerError::InvalidSchedule) => anyhow::bail!("invalid schedule trigger"),
                 Err(TriggerError::InvalidId(..)) => anyhow::bail!("invalid delivery trigger"),
-                Err(TriggerError::UnknownTag) => return Ok("main".into()),
+                Ok(Trigger::BotMessage(_)) | Err(TriggerError::UnknownTag) => {
+                    return Ok("main".into());
+                }
             }
         }
         anyhow::bail!("delivery causal chain is too deep")
@@ -1191,6 +1193,7 @@ mod trigger_boundary_tests {
         let store = Store::open(":memory:")?;
         let target = |key| store.peer_delivery_target("network", "conversation", key);
         assert_eq!(target("schedule:s:1")?, "routine:schedule:s:1");
+        assert_eq!(target("bot_message:m")?, "main");
         for key in ["assignment:a:b", "task:", "schedule:s:-1", "message:"] {
             assert!(target(key).is_err(), "{key}");
         }
