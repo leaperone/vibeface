@@ -11,7 +11,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { PLATFORMS, NATIVE_UI, parseReleaseVersion, parseReleaseTag, npmDistTag, compareWithinChannel,
-  platformFor, programNames, desktopPayloadNames, validateBuildInfoShape } from './release-contract.mjs';
+  platformFor, programNames, requiredRuntimeFiles, desktopPayloadNames, validateBuildInfoShape } from './release-contract.mjs';
 import { readContracts, readOwnVersion, readNativeUi, readNpmTemplate, parseSourceJson } from './release-metadata.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
@@ -47,6 +47,9 @@ function pureTests() {
     assert(Object.isFrozen(actual));
     assert.throws(() => { actual.exe = 'bad'; });
     validateBuildInfoShape(info(expected.target), contracts);
+    assert.deepEqual(requiredRuntimeFiles(expected.target, { web: ['index.html'], checksum: true }), [
+      'FILES.sha256', ...expected.programs, 'BUILD-INFO.json', 'README.md', 'RUNTIME-REQUIREMENTS.md',
+      `scripts/install-node-service.${expected.service}`, 'docs/node.md', 'docs/releasing.md', 'web/index.html']);
   }
   assert(Object.isFrozen(PLATFORMS) && Object.isFrozen(NATIVE_UI));
   for (const target of corpus.unsupportedTargets) { assert.throws(() => platformFor(target)); assert.throws(() => programNames(target)); }

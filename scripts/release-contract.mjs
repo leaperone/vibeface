@@ -60,6 +60,28 @@ export function programNames(target) {
   return [`vibeface${exe}`, `vibeface-core${exe}`];
 }
 
+/**
+ * Files that every native Node runtime archive must carry before it is sealed.
+ *
+ * The Web payload is supplied by the caller because the Web manifest is owned
+ * by the Node staging path. Keeping the platform and support-file facts here
+ * prevents npm verification from drifting from the native packagers while
+ * leaving desktop's smaller runtime minimum independent.
+ */
+export function requiredRuntimeFiles(target, { web = [], checksum = false } = {}) {
+  const files = [
+    ...programNames(target),
+    'BUILD-INFO.json',
+    'README.md',
+    'RUNTIME-REQUIREMENTS.md',
+    `scripts/install-node-service.${platformFor(target).service}`,
+    'docs/node.md',
+    'docs/releasing.md',
+    ...web.map(name => `web/${name}`),
+  ];
+  return checksum ? ['FILES.sha256', ...files] : files;
+}
+
 export function desktopPayloadNames(version, target) {
   parseReleaseVersion(version);
   const { installer } = platformFor(target);
