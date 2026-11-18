@@ -705,6 +705,51 @@ fn read_private(path: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
+fn handover_outcome(
+    node: &str,
+    from: &str,
+    session: &str,
+    seen: &str,
+    target: Option<&str>,
+    reply: Value,
+) -> Result<crate::tools::ToolOutcome> {
+    use crate::tools::{Execution, uncertain};
+    #[derive(serde::Deserialize)]
+    struct HandoverReceipt {
+        node: String,
+        session_id: String,
+        conversation_id: String,
+        muted: bool,
+        changed: bool,
+        version: String,
+    }
+    let receipt: HandoverReceipt = serde_json::from_value(reply.clone())
+        .context("invalid session handover receipt")
+        .map_err(uncertain)?;
+    let valid_version = receipt.version.len() == 16
+        && receipt
+            .version
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+    if !valid_version
+        || (receipt.changed && receipt.version == seen)
+        || receipt.node != node
+        || receipt.session_id != session
+        || receipt.conversation_id != target.unwrap_or(from)
+        || receipt.muted != target.is_none()
+    {
+        return Err(uncertain(anyhow::anyhow!(
+            "session handover receipt does not match the requested handover"
+        )));
+    }
+    let effect = if receipt.changed {
+        Execution::Applied
+    } else {
+        Execution::NotStarted
+    };
+    Ok(effect.result(reply))
+}
+
 impl Runtime {
     pub(crate) async fn network_id(&self) -> Result<String> {
         Ok(self.membership_state().await?.genesis.network_id)
@@ -2787,15 +2832,18 @@ impl Runtime {
         session: &str,
         seen: &str,
         target: Option<&str>,
-    ) -> Result<Value> {
+    ) -> Result<crate::tools::ToolOutcome> {
+        use crate::tools::{Execution, uncertain};
         if node != self.identity.device_id()? {
-            return self
-                .peer_request(
+            let reply = self
+                .peer_request_with_send_boundary(
                     network,
                     node,
                     json!({"type":"hand_over_session","session_id":session,"version":seen,"from":from,"conversation_id":target}),
+                    uncertain,
                 )
-                .await;
+                .await?;
+            return handover_outcome(node, from, session, seen, target, reply);
         }
         let (before, version, event) = {
             let identity = self.identity.clone();
@@ -2805,7 +2853,7 @@ impl Runtime {
             let seen = seen.to_owned();
             let target = target.map(str::to_owned);
             self.store
-                .call("triage.hand_over_session", move |store| {
+                .tool_transaction("triage.hand_over_session", move |store| {
                     store.hand_over_session(
                         &identity,
                         &network,
@@ -2835,10 +2883,15 @@ impl Runtime {
                 self.publish_changed(network, &before, Changed::Reload);
             }
         }
-        Ok(
+        let effect = if event.is_some() {
+            Execution::Applied
+        } else {
+            Execution::NotStarted
+        };
+        Ok(effect.result(
             json!({"node":node,"session_id":session,"conversation_id":owner,"muted":target.is_none(),
             "version":version,"changed":event.is_some()}),
-        )
+        ))
     }
 
     fn webhook_secret(&self) -> Result<Option<Vec<u8>>> {
@@ -3779,8 +3832,9 @@ pub(super) mod tests {
                     })
                     .await
             }?;
-            let stopped = node.interrupt_work(&network, "w-stop").await?;
-            assert_eq!(stopped["waiting_for_start"], true);
+            let stopped = node.interrupt_work_outcome(&network, "w-stop").await?;
+            assert_eq!(stopped.receipt.execution, crate::tools::Execution::Pending);
+            assert_eq!(stopped.value["waiting_for_start"], true);
             let waiting = {
                 node.store
                     .call("triage.test.stop_requests", move |store| {
@@ -6100,6 +6154,7 @@ pub(super) mod tests {
 
                 let mute = json!({"stop_following":true});
                 let muted = hand(&live, "s1", mute.clone()).await?;
+                assert_eq!(muted["call_record"]["execution"], "applied");
                 assert_eq!((muted["muted"].clone(), muted["changed"].clone()), (json!(true), json!(true)));
                 assert_eq!(hand(&live, "s1", mute).await?["changed"], false, "a retried mute writes nothing");
                 let quiet = node.ingest_agent_event(turn("s1", "t4", "/w")).await?;
@@ -6117,6 +6172,7 @@ pub(super) mod tests {
                     (json!("d"), json!(false), json!(true))
                 );
                 let retried = hand(&live, "s1", to_d).await?;
+                assert_eq!(retried["call_record"]["execution"], "not_started");
                 assert_eq!(retried["changed"], false, "a retried hand-over reads back what stands");
                 assert_eq!(owner_of(&node, "s1").await?.as_deref(), Some("d"));
                 assert_eq!(attributions(&node, "d").await?, 2, "each hand-over is written once");
@@ -6696,6 +6752,8 @@ pub(super) mod tests {
                 .tool(access, "work_status", json!({"work_id": spec.work_id}))
                 .await?;
             assert_eq!(one["state"], "dispatch_waiting");
+            assert_eq!(one["call_record"]["execution"], "read");
+            assert_eq!(one["call_record"]["call_ref"], spec.call_ref);
             Ok::<_, anyhow::Error>(())
         })
         .await
@@ -8775,11 +8833,55 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn first_provider_decline_survives_earlier_ranked_answer_and_cache_loss() -> Result<()> {
+        with_node(async |node, admin, dir| {
+            bot(&node, &admin, "c", "Bot", &[]).await?;
+            let network = node.network_id().await?;
+            let trigger = main_input_fact(&node, &admin, "c", "source").await?;
+            let before = Config::load(&dir)?.roots;
+            let folder = dir.join("proposed");
+            std::fs::create_dir(&folder)?;
+            let asked = node
+                .propose_provider_config(&network, "c", &trigger, json!({"roots":[folder]}))
+                .await?;
+            let question = asked.value["question_id"].as_str().context("question")?;
+            answer(&node, question, "不允许").await?;
+            let first = node.apply_provider_config(&network, "c", question).await?;
+            assert_eq!(first.value["status"], "declined");
+            assert_eq!(first.receipt.approval, crate::tools::Approval::Denied);
+            let key = question.to_owned();
+            let net = network.clone();
+            node.store
+                .call("test.earlier_answer", move |store| {
+                    store.project_earlier_answer_fixture(&net, "c", &key, "允许")?;
+                    assert_eq!(
+                        store.question(&net, &key)?.context("standing question")?["answer"]["text"],
+                        "允许"
+                    );
+                    Ok(())
+                })
+                .await?;
+            assert_eq!(
+                node.apply_provider_config(&network, "c", question).await?,
+                first
+            );
+            node.provider_proposals.lock().await.clear();
+            assert_eq!(
+                node.apply_provider_config(&network, "c", question).await?,
+                first
+            );
+            assert_eq!(Config::load(&dir)?.roots, before);
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
     async fn provider_paths_a_bot_proposes_are_written_only_after_the_user_allows() -> Result<()> {
         with_node(async |node, admin, dir| {
             bot(&node, &admin, "c", "前端", &[]).await?;
             let network = node.network_id().await?;
-            for id in ["m-1", "m-2", "m-3", "m-4", "m-5", "m-6"] {
+            for id in ["m-1", "m-2", "m-3", "m-4", "m-5", "m-6", "partial", "later"] {
                 main_input_fact(&node, &admin, "c", id).await?;
             }
             let codex = dir.join("fixture-codex");
@@ -8795,8 +8897,9 @@ pub(super) mod tests {
                     json!({"codex_sessions": codex.join("sessions")}),
                 )
                 .await?;
-            assert_eq!(asked["status"], "asked");
-            let question = asked["question_id"].as_str().unwrap().to_owned();
+            assert_eq!(asked.value["status"], "asked");
+            assert_eq!(asked.receipt.approval, crate::tools::Approval::Pending);
+            let question = asked.value["question_id"].as_str().unwrap().to_owned();
             let card = unanswered(&node).await?;
             assert_eq!(card.len(), 1);
             assert!(
@@ -8812,9 +8915,21 @@ pub(super) mod tests {
             assert_eq!(saved()?, None);
 
             answer(&node, &question, "不允许").await?;
+            let again = node
+                .propose_provider_config(
+                    &network,
+                    "c",
+                    "message:m-1",
+                    json!({"codex_sessions":codex.join("sessions")}),
+                )
+                .await?;
+            assert_eq!(again.value["question_id"], question.as_str());
+            assert_eq!(again.receipt.approval, crate::tools::Approval::Denied);
+            let denied = node.apply_provider_config(&network, "c", &question).await?;
+            assert_eq!(denied.value["status"], "declined");
             assert_eq!(
-                node.apply_provider_config(&network, "c", &question).await?["status"],
-                "declined"
+                denied.receipt,
+                crate::tools::Execution::NotStarted.with(crate::tools::Approval::Denied)
             );
             assert_eq!(saved()?, None, "a declined proposal writes nothing");
             assert_eq!(
@@ -8830,7 +8945,8 @@ pub(super) mod tests {
                     json!({"codex_sessions": codex.join("archived")}),
                 )
                 .await?;
-            let question = asked["question_id"].as_str().unwrap().to_owned();
+            assert_eq!(asked.receipt.approval, crate::tools::Approval::Pending);
+            let question = asked.value["question_id"].as_str().unwrap().to_owned();
             assert!(
                 node.apply_provider_config(&network, "other", &question)
                     .await
@@ -8838,8 +8954,22 @@ pub(super) mod tests {
                 "another chat cannot apply it"
             );
             answer(&node, &question, "允许").await?;
+            let again = node
+                .propose_provider_config(
+                    &network,
+                    "c",
+                    "message:m-2",
+                    json!({"codex_sessions":codex.join("archived")}),
+                )
+                .await?;
+            assert_eq!(again.value["question_id"], question.as_str());
+            assert_eq!(again.receipt.approval, crate::tools::Approval::Allowed);
             let applied = node.apply_provider_config(&network, "c", &question).await?;
-            assert_eq!(applied["status"], "applied");
+            assert_eq!(
+                applied.receipt,
+                crate::tools::Execution::Applied.with(crate::tools::Approval::Allowed)
+            );
+            assert_eq!(applied.value["status"], "applied");
             assert_eq!(saved()?, Some(codex.join("archived")));
             assert_eq!(
                 node.triage.config().codex_sessions,
@@ -8857,7 +8987,8 @@ pub(super) mod tests {
                     "message:m-3",
                     json!({"codex_sessions": codex.join("archived")})
                 )
-                .await?["status"],
+                .await?
+                .value["status"],
                 "unchanged"
             );
             assert!(
@@ -8878,11 +9009,14 @@ pub(super) mod tests {
             let asked = node
                 .propose_provider_config(&network, "c", "message:m-5", json!({"roots": [projects]}))
                 .await?;
-            let question = asked["question_id"].as_str().unwrap().to_owned();
+            assert_eq!(asked.receipt.approval, crate::tools::Approval::Pending);
+            let question = asked.value["question_id"].as_str().unwrap().to_owned();
             assert!(!node.settings_snapshot().roots.contains(&projects));
             answer(&node, &question, "允许").await?;
             assert_eq!(
-                node.apply_provider_config(&network, "c", &question).await?["roots_added"],
+                node.apply_provider_config(&network, "c", &question)
+                    .await?
+                    .value["roots_added"],
                 1
             );
             assert!(node.settings_snapshot().roots.contains(&projects));
@@ -8897,9 +9031,63 @@ pub(super) mod tests {
                     "message:m-6",
                     json!({"roots": [projects]})
                 )
-                .await?["status"],
+                .await?
+                .value["status"],
                 "unchanged"
             );
+            let gone = dir.join("temporary-project");
+            std::fs::create_dir(&gone)?;
+            let partial = node
+                .propose_provider_config(
+                    &network,
+                    "c",
+                    "message:partial",
+                    json!({"codex_sessions":codex.join("sessions"),"roots":[gone]}),
+                )
+                .await?;
+            let partial_id = partial.value["question_id"]
+                .as_str()
+                .context("partial proposal")?;
+            answer(&node, partial_id, "允许").await?;
+            std::fs::remove_dir(&gone)?;
+            let first = node
+                .apply_provider_config(&network, "c", partial_id)
+                .await
+                .unwrap_err();
+            let failure = |error: &anyhow::Error| {
+                crate::tools::ToolFailure::new(
+                    "apply_provider_config",
+                    &json!({"question_id":partial_id}),
+                    crate::tools::FailureStage::Execution,
+                    error,
+                )
+                .response
+            };
+            let first = failure(&first);
+            assert_eq!(first["call_record"]["approval"], "allowed");
+            assert_eq!(first["call_record"]["execution"], "unknown");
+            assert_eq!(first["call_record"]["retry"], "none");
+            assert_eq!(saved()?, Some(codex.join("sessions")));
+            let later = node
+                .propose_provider_config(
+                    &network,
+                    "c",
+                    "message:later",
+                    json!({"codex_sessions":codex.join("archived")}),
+                )
+                .await?;
+            let later_id = later.value["question_id"]
+                .as_str()
+                .context("later proposal")?;
+            answer(&node, later_id, "允许").await?;
+            node.apply_provider_config(&network, "c", later_id).await?;
+            node.provider_proposals.lock().await.clear();
+            let repeated = node
+                .apply_provider_config(&network, "c", partial_id)
+                .await
+                .unwrap_err();
+            assert_eq!(failure(&repeated), first);
+            assert_eq!(saved()?, Some(codex.join("archived")));
             Ok::<_, anyhow::Error>(())
         })
         .await
@@ -9062,6 +9250,33 @@ pub(super) mod tests {
         Ok(request)
     }
 
+    #[tokio::test]
+    async fn queued_task_cancellation_reports_the_committed_interrupt() -> Result<()> {
+        with_node(async |node, admin, _dir| {
+            bot(&node, &admin, "c", "Ops", &[]).await?;
+            let request =
+                queued_task(&node, &admin, "c", "cancel-queued", Provider::Pi, None).await?;
+            let network = node.network_id().await?;
+            let outcome = node
+                .stop_work_outcome(&network, "c", &request.work_id)
+                .await?;
+            assert_eq!(outcome.receipt.execution, crate::tools::Execution::Applied);
+            let work_id = request.work_id;
+            node.store
+                .call("triage.test.queued_cancel_receipt", move |store| {
+                    assert!(matches!(
+                        store.work_record(&work_id)?.context("work")?.state,
+                        crate::work::WorkState::Finished {
+                            outcome: crate::model::WorkOutcome::Interrupted
+                        }
+                    ));
+                    Ok(())
+                })
+                .await
+        })
+        .await
+    }
+
     async fn assert_refused_task(
         node: &Runtime,
         network: &str,
@@ -9209,6 +9424,13 @@ pub(super) mod tests {
                         store.works(&network, "c")
                     }).await
                 }?.into_iter().find(|work| first["work_id"].as_str() == Some(work.work_id.as_str())).context("accepted work")?;
+                assert_eq!(first["call_record"]["execution"], "started");
+                let mut tracked_args = args.clone();
+                tracked_args["title"] = json!(work.title);
+                tracked_args["cwd"] = json!(work.cwd);
+                let tracked = node.tool(access.clone(), "track_work", tracked_args).await?;
+                assert_eq!(tracked["may_send"], false);
+                assert_eq!(tracked["call_record"]["execution"], "started");
                 assert_eq!(work.cwd, native_dirs[&format!("t-{call}")]);
                 assert_eq!(work.title, "follow up");
                 assert_eq!(json!(work.resolved), expected);
@@ -9231,7 +9453,12 @@ pub(super) mod tests {
                     store.work_record(&work_id)
                 }).await
                 }?.context("supplement")?.state.handle().context("supplement handle")?.turn_id, "turn-t-explicit");
-            node.bind_work(&network, "c", second_id, vibeface_bridge::codex::StartReport::Turn { turn_id:"another-turn".into() }).await.expect_err("a mismatched report must remain unknown");
+            let invalid = node.tool(access.clone(), "bind_work", json!({"work_id":second_id,
+                "report":vibeface_bridge::codex::StartReport::Turn { turn_id:"another-turn".into() }}))
+                .await.expect_err("a mismatched report must remain unknown");
+            let record = &invalid.downcast_ref::<crate::tools::ToolFailure>().context("tool failure")?.response["call_record"];
+            assert_eq!(record["execution"], "unknown");
+            assert_eq!(record["retry"], "none");
             assert!(matches!({
                 let work_id = (second_id).to_owned();
                 node.store.call("triage.test.work_record", move |store| {
@@ -9242,6 +9469,9 @@ pub(super) mod tests {
             for (thread, reason) in [("missing", "was not returned"), ("sub", "parent thread lead")] {
                 let failure = node.tool(access.clone(), "dispatch_work", json!({"thread":thread,"prompt":"p","call_ref":thread})).await.expect_err("invalid native thread must not create work");
                 assert!(failure.to_string().contains(reason), "{failure:#}");
+                let record = &failure.downcast_ref::<crate::tools::ToolFailure>().context("tool failure")?.response["call_record"];
+                assert_eq!(record["execution"], "not_started");
+                assert_eq!(record["retry"], "none");
                 assert_eq!({
                     node.store.call("triage.test.work_records", move |store| {
                         store.work_records()
@@ -9262,6 +9492,16 @@ pub(super) mod tests {
                     store.work_record(&work_id)
                 }).await
                     }?.context("unknown")?.state, crate::work::WorkState::Unverified { .. }));
+            for (index, execution, retry) in [(0, "completed", "none"), (1, "unknown", "lookup_same_ref")] {
+                let lookup = node.tool(access.clone(), "call_lookup", json!({"call_ref":original[index].0["call_ref"]})).await?;
+                assert_eq!(lookup["call_record"]["execution"], execution);
+                assert_eq!(lookup["call_record"]["retry"], retry);
+            }
+            let status = node.tool(access.clone(), "work_status", json!({"work_id": original[0].1})).await?;
+            assert_eq!(status["call_record"]["execution"], "read");
+            assert_eq!(status["call_record"]["call_ref"], original[0].0["call_ref"]);
+            let stopped = node.tool(access.clone(), "interrupt_work", json!({"work_id":original[0].1})).await?;
+            assert_eq!(stopped["call_record"]["execution"], "not_started");
             {
                 let _controls = node.manager_controls.lock().await;
                 node.providers.lock().unwrap().switches.execution.clear();
@@ -9306,6 +9546,19 @@ pub(super) mod tests {
                 assert_eq!(crate::store::context_after(&store.connection, &network, "c", None, &VersionVector::new())?.events.iter().filter(|event| matches!(event.event.body, EventBody::WorkDispatched { .. })).count(), 5);
                 Ok(())
             }).await?;
+            let (args, id, _) = &original[0];
+            let missing = id.as_str().context("work id")?.to_owned();
+            node.store.call("triage.test.projected_without_admission", move |store| {
+                assert_eq!(store.connection.execute("DELETE FROM work_runs WHERE work_id=?", [missing])?, 1);
+                Ok(())
+            }).await?;
+            let failure = node.tool(access, "dispatch_work", args.clone()).await.unwrap_err();
+            let record = &failure.downcast_ref::<crate::tools::ToolFailure>().context("tool failure")?.response["call_record"];
+            assert_eq!(record["execution"], "unknown");
+            assert_eq!(record["call_ref"], args["call_ref"]);
+            assert_eq!(record["retry"], "lookup_same_ref");
+            assert_eq!(*requests.lock().unwrap(), before);
+            assert_eq!(node.store.call("triage.test.no_second_admission", |store| Ok(store.work_records()?.len())).await?, 4);
             node.finish_manager_attempt(&attempt).await;
             Ok::<_, anyhow::Error>(())
         }.await;

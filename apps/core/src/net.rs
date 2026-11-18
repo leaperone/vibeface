@@ -709,13 +709,27 @@ impl Net {
         request: &Value,
         timeout: Duration,
     ) -> Result<Value> {
-        let connection = self.connect(device_id, alpn).await?;
-        let result = tokio::time::timeout(timeout, call(&connection, request))
+        self.request_with_send_boundary(device_id, alpn, request, timeout, std::convert::identity)
             .await
-            .map_err(|_| {
-                Unanswered::error("peer response timed out; outcome may be unknown".into())
-            })
-            .flatten();
+    }
+
+    pub(crate) async fn request_with_send_boundary(
+        &self,
+        device_id: &str,
+        alpn: &'static [u8],
+        request: &Value,
+        timeout: Duration,
+        after_send: fn(anyhow::Error) -> anyhow::Error,
+    ) -> Result<Value> {
+        let connection = self.connect(device_id, alpn).await?;
+        let mut sending = false;
+        let result = tokio::time::timeout(
+            timeout,
+            call_with_send_boundary(&connection, request, &mut sending),
+        )
+        .await
+        .map_err(|_| Unanswered::error("peer response timed out; outcome may be unknown".into()))
+        .flatten();
         if result.is_err() && connection.close_reason().is_none() {
             // The peer may have restarted behind a connection QUIC still thinks is open.
             let id = connection.remote_id();
@@ -727,7 +741,11 @@ impl Net {
                 connections.remove(&(id, alpn));
             }
         }
-        result
+        if sending {
+            result.map_err(after_send)
+        } else {
+            result
+        }
     }
 
     pub async fn close(&self) {
@@ -747,11 +765,21 @@ fn relay_config(url: RelayUrl, token: Option<String>) -> iroh::RelayConfig {
 }
 
 pub async fn call(connection: &Connection, request: &Value) -> Result<Value> {
+    call_with_send_boundary(connection, request, &mut false).await
+}
+
+async fn call_with_send_boundary(
+    connection: &Connection,
+    request: &Value,
+    sending: &mut bool,
+) -> Result<Value> {
     let (mut send, mut recv) = connection
         .open_bi()
         .await
         .map_err(|error| anyhow!("peer connection closed: {error}"))?;
-    write_frame(&mut send, request).await?;
+    let frame = encode_frame(request)?;
+    *sending = true;
+    send_frame(&mut send, &frame).await?;
     send.finish().ok();
     let response = read_frame(&mut recv)
         .await?
@@ -763,11 +791,19 @@ pub async fn call(connection: &Connection, request: &Value) -> Result<Value> {
 }
 
 pub async fn write_frame(send: &mut SendStream, value: &Value) -> Result<()> {
+    send_frame(send, &encode_frame(value)?).await
+}
+
+fn encode_frame(value: &Value) -> Result<Vec<u8>> {
     let bytes = serde_json::to_vec(value)?;
     ensure!(bytes.len() <= MAX_FRAME, "frame too large");
     let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
     frame.extend_from_slice(&bytes);
-    send.write_all(&frame)
+    Ok(frame)
+}
+
+async fn send_frame(send: &mut SendStream, frame: &[u8]) -> Result<()> {
+    send.write_all(frame)
         .await
         .map_err(|error| anyhow!("peer stream failed: {error}"))
 }
