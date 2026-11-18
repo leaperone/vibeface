@@ -286,6 +286,10 @@ def run_clients():
     release_format.require(os.environ.get('GITHUB_EVENT_NAME') == 'schedule', 'clients require the daily schedule')
     run = api('actions/runs/' + os.environ['GITHUB_RUN_ID'])
     cutoff = client_cutoff(datetime.datetime.fromisoformat(run['created_at']))
+    recent = api(f"actions/workflows/{run['workflow_id']}/runs?branch=main&event=schedule&per_page=1")['workflow_runs']
+    if recent:
+        latest_cutoff = client_cutoff(datetime.datetime.fromisoformat(recent[0]['created_at']))
+        release_format.require(latest_cutoff <= cutoff, 'a newer scheduled client batch exists')
     batch = cutoff.strftime('%Y%m%d%H')
     release_context.git('fetch', '--quiet', 'origin', 'main', '--tags')
     base = client_source(cutoff, batch)

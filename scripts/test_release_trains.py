@@ -144,6 +144,17 @@ class ReleaseTrains(unittest.TestCase):
                 hourly.client_source(cutoff, '2026111802')
         green.assert_not_called()
 
+    def test_older_client_run_cannot_publish_after_a_newer_schedule_without_tags(self):
+        original = {'created_at': '2026-11-18T02:07:00Z', 'workflow_id': 99}
+        latest = {'workflow_runs': [{'created_at': '2026-11-19T02:04:00Z'}]}
+        with (patch.dict(os.environ, {'GITHUB_EVENT_NAME': 'schedule', 'GITHUB_RUN_ID': '7'}),
+              patch.object(hourly, 'require_coordinator_context'),
+              patch.object(hourly, 'api', side_effect=[original, latest]),
+              patch.object(release_context, 'git') as git):
+            with self.assertRaisesRegex(ValueError, 'newer scheduled client batch'):
+                hourly.run_clients()
+        git.assert_not_called()
+
     def test_client_batch_waits_for_exact_manifests_and_preserves_unrelated_releases(self):
         from tests.release.support import pin
 
@@ -172,7 +183,9 @@ class ReleaseTrains(unittest.TestCase):
 
                 def api(path, *, missing=False):
                     if path == 'actions/runs/7':
-                        return {'created_at': '2026-11-18T02:07:00Z'}
+                        return {'created_at': '2026-11-18T02:07:00Z', 'workflow_id': 99}
+                    if path == 'actions/workflows/99/runs?branch=main&event=schedule&per_page=1':
+                        return {'workflow_runs': [{'created_at': '2026-11-18T02:07:00Z'}]}
                     tag = path.removeprefix('releases/tags/')
                     app = release_format.parse_tag(tag)[0]
                     self.assertTrue(missing)
