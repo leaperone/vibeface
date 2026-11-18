@@ -4,7 +4,7 @@
 //! for the fixed Core executable. It never creates a directory or starts, stops, or changes a Node.
 
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -15,44 +15,13 @@ use std::{
 const MAX_PATHS: usize = 64;
 const MAX_PATH_BYTES: usize = 4096;
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum Source {
-    Remembered,
-    AppProfile,
-    DefaultHome,
-    UserService,
-    RunningProcess,
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum UnavailableReason {
-    IdentityMismatch,
-    MaintenanceUnavailable,
-    InspectionUnavailable,
-}
-
+use vibeface_control::discovery::{
+    Discovery, NodeSource as Source, NodeSummary, UnavailableReason,
+};
 use vibeface_control::inspection::{Inspection, NodeStatus};
 
-#[derive(Debug, Serialize)]
-struct NodeSummary {
-    status: NodeStatus,
-    device_id: String,
-    data_dir: PathBuf,
-    local_listen: String,
-    listen: String,
-    web_enabled: bool,
-    core_version: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    unavailable_reason: Option<UnavailableReason>,
-    sources: Vec<Source>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    user_service_cli: Option<PathBuf>,
-}
-
-/// Response schema: `{ "nodes": [{status, device_id, data_dir, local_listen, listen,
-/// web_enabled, core_version, sources}], "warnings": [fixed_code] }`.
+/// Response schema: `{ "nodes": [{status, device_id, data_dir, sources, ...}],
+/// "warnings": [fixed_code], "user_service_registered": bool }`.
 pub async fn discover(app_profile_dir: &Path, remembered: &[PathBuf]) -> Result<Value> {
     ensure!(
         app_profile_dir.is_absolute(),
@@ -150,9 +119,13 @@ async fn inspect_candidates(
     }
     warnings.sort_unstable();
     warnings.dedup();
-    Ok(
-        json!({"nodes": nodes, "warnings": warnings, "user_service_registered": user_service.is_some()}),
-    )
+    let result = Discovery {
+        nodes,
+        warnings: warnings.into_iter().map(str::to_owned).collect(),
+        user_service_registered: user_service.is_some(),
+    };
+    result.validate()?;
+    Ok(serde_json::to_value(result)?)
 }
 
 fn summarize(
@@ -164,20 +137,32 @@ fn summarize(
     let status = info.status;
     let device_id = &info.device_id;
     let data_dir = info.data_dir.clone();
-    let local_listen = info.local_listen.to_string();
-    let listen = info.listen.to_string();
-    let web_enabled = info.web_enabled;
-    let core_version = info.core_version.clone();
-    let unavailable_reason =
-        (status == NodeStatus::Unavailable).then(|| match info.error.as_deref().unwrap_or("") {
-            error if error.contains("identity does not match") => {
-                UnavailableReason::IdentityMismatch
-            }
-            error if error.contains("maintenance") || error.contains("socket") => {
-                UnavailableReason::MaintenanceUnavailable
-            }
-            _ => UnavailableReason::InspectionUnavailable,
-        });
+    let (local_listen, listen, web_enabled, core_version, unavailable_reason) =
+        if status == NodeStatus::Unavailable {
+            (
+                None,
+                None,
+                None,
+                None,
+                Some(match info.error.as_deref().unwrap_or("") {
+                    error if error.contains("identity does not match") => {
+                        UnavailableReason::IdentityMismatch
+                    }
+                    error if error.contains("maintenance") || error.contains("socket") => {
+                        UnavailableReason::MaintenanceUnavailable
+                    }
+                    _ => UnavailableReason::InspectionUnavailable,
+                }),
+            )
+        } else {
+            (
+                Some(info.local_listen),
+                Some(info.listen),
+                Some(info.web_enabled),
+                Some(info.core_version.clone()),
+                None,
+            )
+        };
     Ok(NodeSummary {
         status,
         device_id: device_id.to_owned(),
