@@ -457,7 +457,7 @@ impl MaintenanceResponse {
             | MaintenanceCommand::DeliveryKeyOperation { .. } => {
                 ensure!(
                     raw.status == MaintenanceStatus::Healthy
-                        && raw.delivery.as_ref().is_some_and(|value| !value.is_null())
+                        && raw.delivery.as_ref().is_some_and(|value| value.is_object())
                         && payload_count == 1,
                     "invalid maintenance delivery response"
                 );
@@ -751,6 +751,19 @@ mod tests {
                 MaintenanceResponse::parse(&command, raw).is_err(),
                 "failure with explicit null {field} must be rejected"
             );
+        }
+        for command in [
+            MaintenanceCommand::DeliveryBudget(Value::Null),
+            MaintenanceCommand::DeliveryKeyOperation {
+                action: Value::Null,
+                intent_id: "intent".into(),
+                gas_cap: "1".into(),
+            },
+        ] {
+            let raw = serde_json::from_str::<RawResponse>(
+                r#"{"protocol":1,"status":"healthy","health":{"device_id":"device","version":"version","web_enabled":false,"http_enabled":false},"delivery":[]}"#,
+            )?;
+            assert!(MaintenanceResponse::parse(&command, raw).is_err());
         }
         Ok(())
     }
