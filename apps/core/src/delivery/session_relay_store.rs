@@ -219,6 +219,34 @@ impl SessionRelayStore {
         })
     }
 
+    pub(super) fn inbox(
+        &self,
+        receiver: &Word,
+        sender: &Word,
+        conversation: &str,
+        now_ms: u64,
+    ) -> Result<Vec<Word>> {
+        self.prune(now_ms)?;
+        let mut statement = self.db.prepare(
+            "SELECT manifest FROM objects WHERE receiver=?1 AND sender=?2 AND complete=1
+                AND receipt IS NULL AND expires>?3 ORDER BY rowid",
+        )?;
+        let mut rows = statement.query(params![receiver, sender, now_ms])?;
+        let mut objects = Vec::new();
+        while let Some(row) = rows.next()? {
+            let manifest: RelayManifest = serde_json::from_str(&row.get::<_, String>(0)?)?;
+            if manifest.header.kind != vibeface_delivery::SessionObjectKind::Attachment
+                && manifest.header.conversation_id == conversation
+            {
+                objects.push(manifest.header.object_id);
+                if objects.len() == 16 {
+                    break;
+                }
+            }
+        }
+        Ok(objects)
+    }
+
     pub(super) fn manifest(
         &self,
         id: &Word,

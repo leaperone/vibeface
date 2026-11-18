@@ -132,7 +132,7 @@ pub fn kind_for_event(event: &EventBody) -> Result<SessionObjectKind> {
     }
 }
 
-fn checked_event(network: &str, signed: &SignedEvent) -> Result<Event> {
+pub(super) fn checked_event(network: &str, signed: &SignedEvent) -> Result<Event> {
     let event = check_event(network, signed)?;
     ensure!(
         !crate::logging::blank_credentials_in(&mut serde_json::to_value(&event.body)?),
@@ -219,6 +219,63 @@ impl Delivery {
             key_id,
             header.created_at_ms..header.expires_at_ms,
         )
+    }
+
+    /// The final object is the event; its encrypted payload names the preceding attachment objects.
+    pub(super) async fn seal_session_bundle(
+        &self,
+        node: &Runtime,
+        route: &SessionRoute,
+        signed: &SignedEvent,
+        files: &[(BlobRef, Vec<u8>)],
+    ) -> Result<Vec<SealedSessionObject>> {
+        self.ensure_mode(Mode::Charity)?;
+        let event = checked_event(&route.network, signed)?;
+        ensure!(
+            event.author == self.identity.device_id()?,
+            "session sender is not the event author"
+        );
+        verify_event_signature(signed, &event.author)?;
+        ensure!(
+            event.blobs.iter().eq(files.iter().map(|(blob, _)| blob)),
+            "attachment plan does not match the signed event"
+        );
+        let key = Self::session_receiving_key(node, &hex::encode(route.recipient)).await?;
+        let event_hash = super::types::parse_word(&signed.hash)?;
+        let mut objects = Vec::new();
+        let mut attachments = Vec::new();
+        for (blob, bytes) in files {
+            let mut ids = Vec::new();
+            for part in super::session_attachment::encode_parts(&event_hash, blob, bytes)? {
+                let sealed = seal_payload(
+                    &self.identity,
+                    route,
+                    SessionObjectKind::Attachment,
+                    &event.scope_id,
+                    &key,
+                    &part,
+                )?;
+                ids.push(sealed.0.header.object_id);
+                objects.push(sealed);
+            }
+            attachments.push(SessionAttachmentOffer {
+                blob: blob.clone(),
+                objects: ids,
+            });
+        }
+        let payload = Zeroizing::new(serde_json::to_vec(&SessionEventPayload {
+            event: signed,
+            attachments: &attachments,
+        })?);
+        objects.push(seal_payload(
+            &self.identity,
+            route,
+            kind_for_event(&event.body)?,
+            &event.scope_id,
+            &key,
+            &payload,
+        )?);
+        Ok(objects)
     }
 
     /// Seal all parts of one file named by the original signed event.
@@ -342,7 +399,10 @@ pub(crate) fn seal_event(
         "session sender is not the event author"
     );
     verify_event_signature(signed, &event.author)?;
-    let payload = Zeroizing::new(serde_json::to_vec(signed)?);
+    let payload = Zeroizing::new(serde_json::to_vec(&SessionEventPayload {
+        event: signed,
+        attachments: &[],
+    })?);
     seal_payload(
         sender,
         &SessionRoute {
@@ -467,7 +527,29 @@ fn sign_storage_receipt(receiver: &LocalIdentity, object_id: Word) -> Result<Ses
     })
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionAttachmentOffer {
+    pub blob: BlobRef,
+    pub objects: Vec<Word>,
+}
+
+#[derive(serde::Serialize)]
+struct SessionEventPayload<'a> {
+    event: &'a SignedEvent,
+    attachments: &'a [SessionAttachmentOffer],
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceivedSessionEvent {
+    event: SignedEvent,
+    attachments: Vec<SessionAttachmentOffer>,
+}
+
 pub struct SessionIngested {
+    pub event_hash: String,
+    pub attachments: Vec<SessionAttachmentOffer>,
     pub sync: Ingested,
     pub stored_receipt: Option<SessionStoredReceipt>,
 }
@@ -537,7 +619,10 @@ pub fn ingest_event(
     let plaintext = open_payload(store, receiver, network, object, secret, capsule, now_ms)?;
     let header = &object.header;
     let sender = hex::encode(header.sender_peer);
-    let signed: SignedEvent = serde_json::from_slice(&plaintext)?;
+    let ReceivedSessionEvent {
+        event: signed,
+        attachments,
+    } = serde_json::from_slice(&plaintext)?;
     let event = checked_event(network, &signed)?;
     ensure!(
         event.author == sender
@@ -545,6 +630,26 @@ pub fn ingest_event(
             && kind_for_event(&event.body)? == header.kind,
         "signed event does not match the session object"
     );
+    if !attachments.is_empty() {
+        ensure!(
+            event
+                .blobs
+                .iter()
+                .eq(attachments.iter().map(|offer| &offer.blob)),
+            "attachment list does not match the signed event"
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for offer in &attachments {
+            super::session_attachment::check_count(&offer.blob, offer.objects.len())?;
+            ensure!(
+                offer
+                    .objects
+                    .iter()
+                    .all(|id| *id != [0; 32] && seen.insert(*id)),
+                "attachment objects are not unique"
+            );
+        }
+    }
     verify_event_signature(&signed, &sender)?;
     let mut ingested = store.ingest_events(network, std::slice::from_ref(&signed))?;
     let mut stored_receipt = None;
@@ -568,6 +673,8 @@ pub fn ingest_event(
                 for blob in &event.blobs {
                     if !store.has_blob(blob)? {
                         return Ok(SessionIngested {
+                            event_hash: signed.hash,
+                            attachments,
                             sync: ingested,
                             stored_receipt,
                         });
@@ -580,6 +687,8 @@ pub fn ingest_event(
         }
     }
     Ok(SessionIngested {
+        event_hash: signed.hash,
+        attachments,
         sync: ingested,
         stored_receipt,
     })

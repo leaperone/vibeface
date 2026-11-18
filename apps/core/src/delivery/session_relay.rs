@@ -12,7 +12,8 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use vibeface_delivery::{
-    CAPSULE_BYTES, EncryptedSessionObject, SESSION_AEAD_TAG_BYTES, Word, hash, verify_peer,
+    CAPSULE_BYTES, EncryptedSessionObject, MAX_SESSION_OBJECT_BYTES, SESSION_AEAD_TAG_BYTES, Word,
+    hash, verify_peer,
 };
 
 const MAX_RETAIN_MS: u64 = 24 * 60 * 60 * 1000;
@@ -27,6 +28,10 @@ pub(super) enum SessionRelayRequest {
         object_id: Word,
         offset: u64,
         bytes: String,
+    },
+    Inbox {
+        sender: Word,
+        conversation: String,
     },
     Manifest {
         object_id: Word,
@@ -146,6 +151,18 @@ impl Delivery {
                     store.put(&object_id, &remote, offset, &bytes, at)?,
                 )?)
             }
+            SessionRelayRequest::Inbox {
+                sender,
+                conversation,
+            } => {
+                vibeface_protocol::validate_id(&conversation).map_err(anyhow::Error::msg)?;
+                Ok(serde_json::to_value(store.inbox(
+                    &remote,
+                    &sender,
+                    &conversation,
+                    at,
+                )?)?)
+            }
             SessionRelayRequest::Manifest { object_id } => {
                 let manifest = store.manifest(&object_id, &remote, at)?;
                 verify_manifest(&manifest, &provider, at)?;
@@ -166,6 +183,25 @@ impl Delivery {
                 store.receipt(&object_id, &remote, at)?,
             )?),
         }
+    }
+
+    pub(super) async fn session_inbox(
+        &self,
+        node: &Runtime,
+        route: &super::SessionEndpointRoute,
+    ) -> Result<Vec<Word>> {
+        self.ensure_mode(Mode::Charity)?;
+        let ids: Vec<Word> = request(
+            node,
+            &parse_word(&route.relay)?,
+            SessionRelayRequest::Inbox {
+                sender: parse_word(&route.peer)?,
+                conversation: route.conversation_id.clone(),
+            },
+        )
+        .await?;
+        ensure!(ids.len() <= 16, "session relay returned an oversized inbox");
+        Ok(ids)
     }
 
     /// Upload an already sealed object, reusing its committed offset on retry.
@@ -238,6 +274,17 @@ impl Delivery {
         relay: Word,
         object_id: Word,
     ) -> Result<(EncryptedSessionObject, [u8; CAPSULE_BYTES])> {
+        self.download_session_object_limited(node, relay, object_id, MAX_SESSION_OBJECT_BYTES)
+            .await
+    }
+
+    pub(super) async fn download_session_object_limited(
+        &self,
+        node: &Runtime,
+        relay: Word,
+        object_id: Word,
+        limit: usize,
+    ) -> Result<(EncryptedSessionObject, [u8; CAPSULE_BYTES])> {
         self.ensure_mode(Mode::Charity)?;
         let manifest: RelayManifest =
             request(node, &relay, SessionRelayRequest::Manifest { object_id }).await?;
@@ -248,6 +295,7 @@ impl Delivery {
             "session relay returned another object's manifest"
         );
         let size = manifest.header.payload_bytes as usize;
+        ensure!(size <= limit, "session object exceeds its expected extent");
         let mut ciphertext = Vec::with_capacity(size);
         while ciphertext.len() < size {
             let offset = ciphertext.len();
@@ -697,6 +745,210 @@ mod tests {
         target.shutdown().await;
         relay.shutdown().await;
         drop((source, target, relay, sent_events, received_events));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn configured_endpoints_automatically_relay_new_events_from_the_local_log() -> Result<()>
+    {
+        let dir = std::env::temp_dir().join(format!("session-auto-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let sender = LocalIdentity::generate();
+        let receiver = LocalIdentity::generate();
+        let provider = LocalIdentity::generate();
+        let source = node(&dir.join("sender"), &sender, false).await?;
+        let target = node(&dir.join("receiver"), &receiver, false).await?;
+        let relay = node(&dir.join("relay"), &provider, true).await?;
+        source.net()?.learn(&target.net()?.addr()).await;
+        source.net()?.learn(&relay.net()?.addr()).await;
+        target.net()?.learn(&relay.net()?.addr()).await;
+
+        let sender_id = sender.device_id()?;
+        let receiver_id = receiver.device_id()?;
+        let provider_id = provider.device_id()?;
+        let network = sender.fixture_network_id()?;
+        let state = sender.sign_network_fixture(1, vec![sender_id.clone(), receiver_id.clone()])?;
+        let source_seed = (sender.clone(), network.clone(), state.clone());
+        let prelude = source
+            .store
+            .call("session_test.prelude", move |store| {
+                let (identity, network, state) = source_seed;
+                let peer = identity.device_id()?;
+                store.install_trust_bundle(&network, &state)?;
+                store.create_conversation(
+                    &identity,
+                    &network,
+                    "auto",
+                    "Automatic",
+                    identity.owner_fixture(&network, "auto", &peer)?,
+                    1,
+                )?;
+                store.events_from(&network, &peer, 1, 16)
+            })
+            .await?;
+        let seeded = network.clone();
+        target
+            .store
+            .call("session_test.recipient_prelude", move |store| {
+                store.install_trust_bundle(&seeded, &state)?;
+                store.ingest_events(&seeded, &prelude)?;
+                Ok(())
+            })
+            .await?;
+
+        let outgoing = super::super::SessionEndpointRoute {
+            conversation_id: "auto".into(),
+            peer: receiver_id,
+            relay: provider_id.clone(),
+        };
+        let incoming = super::super::SessionEndpointRoute {
+            conversation_id: "auto".into(),
+            peer: sender_id.clone(),
+            relay: provider_id,
+        };
+        assert!(!dir.join("sender/delivery/session-outbox.sqlite3").exists());
+        let mut source_settings = source.delivery.config();
+        source_settings.session_route = Some(outgoing.clone());
+        source.delivery.configure_local(source_settings)?;
+        let route_id = hex::encode(hash(&serde_json::to_vec(&(
+            &network, &sender_id, outgoing,
+        ))?));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let path = dir.join("sender");
+                if path.join("delivery/session-outbox.sqlite3").exists() {
+                    let outbox =
+                        super::super::session_outbox_store::SessionOutboxStore::open(&path)?;
+                    if outbox.cursor(&route_id)?.is_some() {
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .context("automatic sender did not initialize")??;
+
+        let content = b"only the recipient opens this file".repeat(300);
+        let message_content = content.clone();
+        let event_network = network.clone();
+        let signed = source
+            .store
+            .call("session_test.write", move |store| {
+                let bot = sender.fixture_admin().attest(
+                    &event_network,
+                    "auto",
+                    EventBody::BotCreated {
+                        bot_id: "auto-bot".into(),
+                        name: "Automatic".into(),
+                        instructions: "Handle files".into(),
+                        project: None,
+                        attestation: None,
+                        cause: None,
+                    },
+                )?;
+                let settings =
+                    store.append_event(&sender, &event_network, "auto", bot, vec![], 2)?;
+                let attachment = Attachment {
+                    hash: crate::crypto::digest(&message_content),
+                    size: message_content.len() as u64,
+                    name: "read.txt".into(),
+                };
+                let blob = attachment.blob();
+                store.put_blob(&blob, &message_content)?;
+                let input = sender.fixture_admin().attest(
+                    &event_network,
+                    "auto",
+                    EventBody::InputPosted {
+                        message_id: "auto-message".into(),
+                        target: crate::workspace::InputTarget::BotMain {
+                            bot_id: "auto-bot".into(),
+                        },
+                        intent: crate::workspace::InputIntent::Continue,
+                        sequence: 1,
+                        expected_revision: None,
+                        text: "Read my file".into(),
+                        attachments: vec![attachment],
+                        report_results: Some(false),
+                        attestation: None,
+                    },
+                )?;
+                let message = store.append_event(
+                    &sender,
+                    &event_network,
+                    "auto",
+                    input,
+                    vec![blob.clone()],
+                    3,
+                )?;
+                Ok((settings, message, blob))
+            })
+            .await?;
+        let relay_database = dir.join("relay/delivery/session-relay.sqlite3");
+        let mut target_settings = target.delivery.config();
+        target_settings.session_route = Some(incoming.clone());
+        target.delivery.configure_local(target_settings)?;
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let (network, (settings, message, blob)) = (network.clone(), signed.clone());
+                let present = target
+                    .store
+                    .read("session_test.verify", move |store| {
+                        Ok(store.event(&network, &settings.hash)? == Some(settings)
+                            && store.event(&network, &message.hash)? == Some(message)
+                            && store.has_blob(&blob)?)
+                    })
+                    .await?;
+                let acknowledged = if relay_database.exists() {
+                    let db = rusqlite::Connection::open_with_flags(
+                        &relay_database,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )?;
+                    db.busy_timeout(std::time::Duration::from_secs(2))?;
+                    db.query_row(
+                        "SELECT count(*) FROM objects WHERE receipt IS NOT NULL",
+                        [],
+                        |row| row.get::<_, u32>(0),
+                    )?
+                } else {
+                    0
+                };
+                if present
+                    && acknowledged >= 2
+                    && target
+                        .delivery
+                        .session_inbox(&target, &incoming)
+                        .await?
+                        .is_empty()
+                {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .context("automatic receiver did not ingest and acknowledge the configured session")??;
+        let read_network = network.clone();
+        let blob = signed.2.hash;
+        let (_, bytes) = target
+            .store
+            .read("session_test.file", move |store| {
+                store.read_blob(&read_network, "auto", &blob)
+            })
+            .await?;
+        assert_eq!(bytes, content);
+        assert!(
+            target
+                .store
+                .read("session_test.no_implicit_scheduler", |store| {
+                    Ok(store.scheduler_jobs("auto")?.is_empty())
+                })
+                .await?
+        );
+        source.shutdown().await;
+        target.shutdown().await;
+        relay.shutdown().await;
+        drop((source, target, relay));
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

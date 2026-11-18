@@ -5,6 +5,9 @@ mod keys;
 mod orders;
 pub mod session;
 mod session_attachment;
+mod session_outbox;
+mod session_outbox_store;
+pub use session_outbox::SessionEndpointRoute;
 mod session_relay;
 mod session_relay_store;
 pub use keys::KeyAction;
@@ -41,6 +44,7 @@ pub struct DeliveryConfig {
     pub enabled: bool,
     pub charity_enabled: bool,
     pub session_relay_enabled: bool,
+    pub session_route: Option<SessionEndpointRoute>,
     pub paid_enabled: bool,
     pub storage_limit_bytes: u64,
     pub max_orders: u32,
@@ -58,6 +62,7 @@ impl Default for DeliveryConfig {
             enabled: false,
             charity_enabled: true,
             session_relay_enabled: false,
+            session_route: None,
             paid_enabled: false,
             storage_limit_bytes: 64 * 1024 * 1024,
             max_orders: 128,
@@ -85,6 +90,9 @@ impl DeliveryConfig {
             &self.provider_gas_cap,
         ] {
             Amount::from_decimal_str(value)?;
+        }
+        if let Some(route) = &self.session_route {
+            route.validate()?;
         }
         if let Some(chain) = &self.chain {
             chain.validate()?;
@@ -269,9 +277,10 @@ impl Delivery {
     }
     pub(crate) fn attach(&self, runtime: Weak<Runtime>) -> Result<()> {
         ensure!(
-            self.runtime.set(runtime).is_ok(),
+            self.runtime.set(runtime.clone()).is_ok(),
             "delivery runtime already attached"
         );
+        self.attach_session_outbox(runtime)?;
         self.start_executor();
         Ok(())
     }
