@@ -1,5 +1,6 @@
 //! App-private durable Node provisioning. This command is intentionally hidden from the public
 //! CLI surface; the native desktop host is its only caller.
+use crate::service::NativeService;
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Subcommand};
 use semver::Version;
@@ -71,6 +72,8 @@ enum Action {
     Start,
     Stop,
     Uninstall,
+    #[command(hide = true)]
+    EnsureUpdater,
 }
 
 use vibeface_control::managed_node::{
@@ -97,13 +100,6 @@ fn running_core_version(inspected: &Inspection) -> Result<&str> {
     Ok(inspected.core_version.as_str())
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NativeService {
-    installed: bool,
-    running: bool,
-}
-
 pub(crate) struct ManagedService {
     pub(crate) package: PathBuf,
     pub(crate) data_dir: PathBuf,
@@ -128,7 +124,7 @@ fn nonempty(value: &str) -> Result<String, String> {
     }
 }
 
-fn target() -> Result<String> {
+pub(crate) fn target() -> Result<String> {
     let arch = std::env::consts::ARCH;
     let suffix = match std::env::consts::OS {
         "macos" => "apple-darwin",
@@ -497,17 +493,14 @@ pub(crate) fn managed_service_for_data(data: &Path) -> Result<Option<ManagedServ
         data.parent()
             .context("Node data directory has no profile")?,
     )?;
-    ensure!(
-        data == profile.join("node") && privatefs::is_private(&profile)?,
-        "Desktop Node profile is not private"
-    );
     let root = profile.join("node-runtime");
     if let Some(saved_root) = crate::update::desktop_policy_root(&data)?
         && saved_root != root
-        && (read_receipt(&saved_root)?.is_some()
-            || saved_root
-                .file_name()
-                .is_some_and(|name| name == "node-runtime"))
+        && (saved_root
+            .file_name()
+            .is_some_and(|name| name == "node-runtime")
+            || (fs::symlink_metadata(receipt_path(&saved_root)).is_ok()
+                && read_receipt(&saved_root)?.is_some()))
     {
         anyhow::bail!("Desktop updater policy points to another profile-owned runtime");
     }
@@ -518,6 +511,10 @@ pub(crate) fn managed_service_for_data(data: &Path) -> Result<Option<ManagedServ
         );
         return Ok(None);
     };
+    ensure!(
+        data == profile.join("node") && privatefs::is_private(&profile)?,
+        "Desktop Node profile is not private"
+    );
     ensure!(
         receipt.data_dir == data
             && receipt.managed_root == root
@@ -545,17 +542,7 @@ pub(crate) fn service_command(
 ) -> Result<tokio::process::Command> {
     crate::update::release::verify_sealed_contents(package, &target()?)?;
     crate::update::validate_desktop_package(package)?;
-    let mut command =
-        crate::service::service_script(&package.join(crate::update::release::SERVICE_SCRIPT))?;
-    command
-        .arg(action)
-        .arg("--data-dir")
-        .arg(data)
-        .arg("--service-id")
-        .arg(id)
-        .arg("--binary")
-        .arg(package.join(crate::update::release::PROGRAMS[0]));
-    Ok(command)
+    crate::service::native_command(package, data, Some(id), action, true)
 }
 
 async fn native_service(package: &Path, data: &Path, id: &str) -> Result<NativeService> {
@@ -592,6 +579,16 @@ pub(crate) async fn managed_service_registered(service: &ManagedService) -> Resu
             .await?
             .installed,
     )
+}
+
+async fn native_service_with_schedule(
+    package: &Path,
+    data: &Path,
+    id: &str,
+) -> Result<NativeService> {
+    crate::service::native_registration(package, data, Some(id))
+        .await
+        .context(OperationFailure::Registration)
 }
 
 async fn run_service(package: &Path, data: &Path, id: &str, action: &str) -> Result<()> {
@@ -898,6 +895,9 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
             }
         }
         action => {
+            if matches!(action, Action::EnsureUpdater) && existing.is_none() {
+                return Ok(());
+            }
             let expected = options
                 .expected_device_id
                 .as_deref()
@@ -909,7 +909,8 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                 Action::Install | Action::Start | Action::Uninstall => {
                     refuse_pending_journal(&data)?;
                 }
-                Action::Status | Action::Update | Action::Stop => {}
+                Action::EnsureUpdater if recovery_required(&data) => return Ok(()),
+                Action::Status | Action::Update | Action::Stop | Action::EnsureUpdater => {}
             }
             let inspected = inspect(&data, bundled).await?;
             inspected
@@ -919,6 +920,42 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                 })
                 .context("Node identity changed; refusing service operation")?;
             match action {
+                Action::EnsureUpdater => {
+                    let receipt = existing.as_ref().context(OperationFailure::Registration)?;
+                    ensure!(
+                        receipt.device_id == expected
+                            && receipt.data_dir == data
+                            && receipt.service_id == service_id(&profile)
+                            && crate::update::desktop_policy_matches(&data, &receipt.managed_root)?,
+                        OperationFailure::Registration
+                    );
+                    let package = managed_current(&receipt.managed_root)?;
+                    // The bundled script reports the actual schedule even when the installed
+                    // runtime's script predates that field. Keep the registered program bound
+                    // to the installed runtime's current link.
+                    let mut verify = crate::service::native_command_for_script(
+                        &bundled.join(crate::update::release::SERVICE_SCRIPT),
+                        &data,
+                        Some(&receipt.service_id),
+                        "verify-schedule",
+                        Some(&package.join(crate::update::release::PROGRAMS[0])),
+                    )
+                    .context(OperationFailure::Package)?;
+                    let native = crate::service::read_registration(&mut verify)
+                        .await
+                        .context(OperationFailure::Registration)?;
+                    if native.installed {
+                        crate::update::ensure_service_updates(
+                            &data,
+                            &receipt.managed_root,
+                            Some(&receipt.service_id),
+                            &native,
+                        )
+                        .await
+                        .context(OperationFailure::Service)?;
+                    }
+                    Ok(())
+                }
                 Action::Install => {
                     if let Some(receipt) = existing.as_ref() {
                         ensure!(
@@ -932,12 +969,22 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                             "Desktop Node updater policy changed"
                         );
                         let package = managed_current(&receipt.managed_root)?;
-                        let native = native_service(&package, &data, &receipt.service_id).await?;
+                        let native =
+                            native_service_with_schedule(&package, &data, &receipt.service_id)
+                                .await?;
                         if native.installed && native.running {
                             ensure!(
                                 inspected.status == NodeStatus::Running,
                                 "registered service and Core health disagree"
                             );
+                            crate::update::ensure_service_updates(
+                                &data,
+                                &receipt.managed_root,
+                                Some(&receipt.service_id),
+                                &native,
+                            )
+                            .await
+                            .context(OperationFailure::Service)?;
                             emit(
                                 ServiceState::Installed,
                                 Some(receipt),
@@ -964,6 +1011,8 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                     );
                     let root = ensure_root(&profile)?;
                     let package = ensure_runtime(&root, &source)?;
+                    let service_id = service_id(&profile);
+                    let native = native_service_with_schedule(&package, &data, &service_id).await?;
                     if existing.is_none() {
                         crate::update::bind_desktop_install_root(&data, &root)?;
                     }
@@ -972,12 +1021,27 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                         device_id: expected.into(),
                         data_dir: data.clone(),
                         managed_root: root.clone(),
-                        service_id: service_id(&profile),
+                        service_id,
                         update_protocol: UPDATE_PROTOCOL,
                         data_epoch: DATA_EPOCH,
                     };
                     privatefs::write_atomic(&receipt_path(&root), &serde_json::to_vec(&receipt)?)?;
-                    run_service(&package, &data, &receipt.service_id, "install").await?;
+                    crate::update::ensure_service_updates(
+                        &data,
+                        &root,
+                        Some(&receipt.service_id),
+                        &native,
+                    )
+                    .await
+                    .context(OperationFailure::Service)?;
+                    crate::update::install_managed_service(
+                        &package,
+                        &data,
+                        Some(&receipt.service_id),
+                        &native,
+                    )
+                    .await
+                    .context(OperationFailure::Service)?;
                     wait_health(&data, bundled, expected).await?;
                     let native = native_service(&package, &data, &receipt.service_id).await?;
                     ensure!(
@@ -1186,7 +1250,9 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                     );
                     let receipt = existing.as_ref().context("Desktop Node is not installed")?;
                     ensure!(
-                        receipt.device_id == expected && receipt.data_dir == data,
+                        receipt.device_id == expected
+                            && receipt.data_dir == data
+                            && receipt.service_id == service_id(&profile),
                         "managed Node identity or data directory changed"
                     );
                     require_data_unlocked(&data)?;
@@ -1195,6 +1261,17 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                         "updater policy points outside Desktop managed runtime"
                     );
                     let package = managed_current(&receipt.managed_root)?;
+                    let native =
+                        native_service_with_schedule(&package, &data, &receipt.service_id).await?;
+                    ensure!(native.installed, OperationFailure::Registration);
+                    crate::update::ensure_service_updates(
+                        &data,
+                        &receipt.managed_root,
+                        Some(&receipt.service_id),
+                        &native,
+                    )
+                    .await
+                    .context(OperationFailure::Service)?;
                     run_service(&package, &data, &receipt.service_id, "start").await?;
                     wait_health(&data, bundled, expected).await?;
                     let native = native_service(&package, &data, &receipt.service_id).await?;
@@ -1261,7 +1338,9 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                 Action::Uninstall => {
                     let receipt = existing.as_ref().context("Desktop Node is not installed")?;
                     ensure!(
-                        receipt.device_id == expected && receipt.data_dir == data,
+                        receipt.device_id == expected
+                            && receipt.data_dir == data
+                            && receipt.service_id == service_id(&profile),
                         "managed Node identity or data directory changed"
                     );
                     ensure!(
@@ -1269,13 +1348,14 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                         "Desktop Node updater policy changed"
                     );
                     let package = managed_current(&receipt.managed_root)?;
-                    run_service(&package, &data, &receipt.service_id, "uninstall-node").await?;
+                    run_service(&package, &data, &receipt.service_id, "uninstall").await?;
                     wait_data_unlocked(&data)
                         .await
                         .context(OperationFailure::Lock)?;
-                    let native = native_service(&package, &data, &receipt.service_id).await?;
+                    let native =
+                        native_service_with_schedule(&package, &data, &receipt.service_id).await?;
                     ensure!(
-                        !native.installed,
+                        !native.installed && native.automatic_update_scheduled != Some(true),
                         "background service registration remains after removal"
                     );
                     fs::remove_file(receipt_path(&receipt.managed_root))?;
@@ -1659,18 +1739,22 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair == ["--service-id", managed.service_id.as_str()])
         );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--data-dir", data.to_string_lossy().as_ref()])
-        );
+        assert!(args.windows(2).any(|pair| {
+            pair == [
+                "--data-dir",
+                crate::service::script_os_argument(&data)
+                    .to_string_lossy()
+                    .as_ref(),
+            ]
+        }));
         assert!(args.windows(2).any(|pair| {
             pair == [
                 "--binary",
-                managed
-                    .package
-                    .join(crate::update::release::PROGRAMS[0])
-                    .to_string_lossy()
-                    .as_ref(),
+                crate::service::script_os_argument(
+                    &managed.package.join(crate::update::release::PROGRAMS[0]),
+                )
+                .to_string_lossy()
+                .as_ref(),
             ]
         }));
         fs::remove_dir_all(root).unwrap();
@@ -1802,6 +1886,16 @@ mod tests {
                 &serde_json::to_vec(&serde_json::json!({ "phase": phase })).unwrap(),
             )
             .unwrap();
+            dispatch(
+                DesktopNode {
+                    profile_dir: profile.clone(),
+                    expected_device_id: Some("a".repeat(64)),
+                    action: Action::EnsureUpdater,
+                },
+                &bundled,
+            )
+            .await
+            .unwrap();
             for action in [Action::Start, Action::Install, Action::Uninstall] {
                 let error = dispatch(
                     DesktopNode {
@@ -1821,6 +1915,89 @@ mod tests {
         }
         assert!(!calls.exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn desktop_startup_repairs_legacy_updater_once_without_starting_the_node() -> Result<()> {
+        use crate::tests::mark_runnable;
+
+        let root = temp("ensure-updater");
+        let profile_dir = root.join("profile");
+        privatefs::create_dir(&profile_dir)?;
+        let profile = canonical_profile(&profile_dir)?;
+        let data = profile.join("node");
+        privatefs::create_dir(&data)?;
+        fs::write(data.join("config.json"), b"config fixture")?;
+        fs::write(data.join("identity.json"), b"identity fixture")?;
+        let managed_root = ensure_root(&profile)?;
+        let bundled = sealed_fixture(&root.join("bundle"));
+        let current = ensure_runtime(&managed_root, &bundled)?;
+        let receipt = install_test_receipt(&profile, &data, &managed_root);
+        privatefs::write_atomic(&receipt_path(&managed_root), &serde_json::to_vec(&receipt)?)?;
+        let policy_path = data.join("update.json");
+        let policy =
+            serde_json::json!({"channel":"stable","automatic":false,"install_root":managed_root});
+        privatefs::write_atomic(&policy_path, &serde_json::to_vec(&policy)?)?;
+
+        let managed_script = current.join(crate::update::release::SERVICE_SCRIPT);
+        fs::write(
+            &managed_script,
+            "#!/bin/sh\n[ \"$1\" = install-updater ] || exit 1\nprintf '%s\\n' \"$5\" >> \"$3/updater-fixture\"\n",
+        )?;
+        mark_runnable(&managed_script);
+        reseal(&current);
+
+        let bundled_script = bundled.join(crate::update::release::SERVICE_SCRIPT);
+        fs::write(
+            &bundled_script,
+            r#"#!/bin/sh
+[ "$1" = verify-schedule ] || exit 1
+scheduled=false
+[ -f "$3/updater-fixture" ] && scheduled=true
+printf '{"installed":true,"running":false,"automatic_update_scheduled":%s}\n' "$scheduled"
+"#,
+        )?;
+        mark_runnable(&bundled_script);
+        let inspection = serde_json::json!({
+            "status":"stopped", "device_id":receipt.device_id, "data_dir":data,
+            "maintenance_socket":data.join("maintenance.sock"), "listen":"127.0.0.1:4790",
+            "local_listen":"127.0.0.1:4791", "public_url":"http://127.0.0.1:4790",
+            "http_enabled":false, "web_enabled":true, "version":null, "write_state":null,
+            "mesh":{"enabled":true,"network":"vibeface","records":null,"neighbors":null},
+            "peers":null, "core_version":env!("CARGO_PKG_VERSION"), "error":"stopped fixture"
+        });
+        let response =
+            serde_json::to_string(&vibeface_control::ControlResponse::success(inspection))?;
+        let core = bundled.join(crate::update::release::PROGRAMS[1]);
+        fs::write(
+            &core,
+            format!("#!/bin/sh\nIFS= read -r request\ncat <<'RESPONSE'\n{response}\nRESPONSE\n"),
+        )?;
+
+        for _ in 0..2 {
+            dispatch(
+                DesktopNode {
+                    profile_dir: profile.clone(),
+                    expected_device_id: Some(receipt.device_id.clone()),
+                    action: Action::EnsureUpdater,
+                },
+                &bundled,
+            )
+            .await?;
+        }
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(policy_path)?)?;
+        assert_eq!(
+            saved,
+            serde_json::json!({"channel":"stable","automatic":true,"install_root":managed_root})
+        );
+        assert_eq!(
+            fs::read_to_string(data.join("updater-fixture"))?,
+            format!("{}\n", receipt.service_id)
+        );
+        assert_eq!(fs::read(data.join("identity.json"))?, b"identity fixture");
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[tokio::test]

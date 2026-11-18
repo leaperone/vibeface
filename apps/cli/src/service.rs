@@ -1,11 +1,12 @@
 use crate::update;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Subcommand};
+use serde::Deserialize;
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use update::release::{PROGRAMS, SERVICE_SCRIPT};
-use vibeface_control::inspection::Inspection;
+use vibeface_control::inspection::{Inspection, NodeIdentity};
 
 #[derive(Args)]
 pub struct Service {
@@ -31,9 +32,9 @@ enum Action {
     Status,
     /// Remove the node service and updater, keeping all node data.
     Uninstall,
-    /// Install the update timer; update configure selects its policy.
+    /// Repair scheduling for an installed managed Node.
     InstallUpdater,
-    /// Remove the update timer without changing its saved policy.
+    #[command(hide = true)]
     UninstallUpdater,
 }
 
@@ -111,16 +112,94 @@ fn command(root: &Path, data: &Path, executable: &Path, action: Action) -> Resul
         );
         root.join("current")
     };
-    let binary = package.join(PROGRAMS[0]);
-    let mut command = service_script(&package.join(SERVICE_SCRIPT))?;
+    native_command(
+        &package,
+        data,
+        None,
+        action.argument(),
+        !matches!(action, Action::UninstallUpdater),
+    )
+}
+
+pub(crate) fn native_command(
+    package: &Path,
+    data: &Path,
+    service_id: Option<&str>,
+    action: &str,
+    match_binary: bool,
+) -> Result<Command> {
+    native_command_for_script(
+        &package.join(SERVICE_SCRIPT),
+        data,
+        service_id,
+        action,
+        match_binary.then(|| package.join(PROGRAMS[0])).as_deref(),
+    )
+}
+
+pub(crate) fn native_command_for_script(
+    script: &Path,
+    data: &Path,
+    service_id: Option<&str>,
+    action: &str,
+    binary: Option<&Path>,
+) -> Result<Command> {
+    let mut command = service_script(script)?;
     command
-        .arg(action.argument())
+        .arg(action)
         .arg("--data-dir")
         .arg(script_os_argument(data));
-    if matches!(action, Action::Install | Action::InstallUpdater) {
-        command.arg("--binary").arg(script_os_argument(&binary));
+    if let Some(service_id) = service_id {
+        command.arg("--service-id").arg(service_id);
+    }
+    if let Some(binary) = binary {
+        command.arg("--binary").arg(script_os_argument(binary));
     }
     Ok(command)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeService {
+    pub installed: bool,
+    pub running: bool,
+    pub automatic_update_scheduled: Option<bool>,
+}
+
+pub(crate) async fn read_registration(command: &mut Command) -> Result<NativeService> {
+    let output = command
+        .output()
+        .await
+        .context("inspect user service registration")?;
+    parse_registration(output)
+}
+
+fn parse_registration(output: std::process::Output) -> Result<NativeService> {
+    ensure!(
+        output.status.success() && output.stdout.len() <= 4096,
+        "could not verify user service registration: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    serde_json::from_slice(&output.stdout).context("invalid user service registration")
+}
+
+pub(crate) async fn native_registration(
+    package: &Path,
+    data: &Path,
+    service_id: Option<&str>,
+) -> Result<NativeService> {
+    let output = native_command(package, data, service_id, "verify-schedule", true)?
+        .output()
+        .await
+        .context("inspect user service registration and update schedule")?;
+    // Older managed runtime scripts reject unknown commands with a usage exit status.
+    if output.status.code() == Some(2) {
+        return read_registration(&mut native_command(
+            package, data, service_id, "verify", true,
+        )?)
+        .await;
+    }
+    parse_registration(output)
 }
 
 /// Windows canonical paths can carry a verbatim `\\?\` prefix that PowerShell 5 `-File` and Task
@@ -138,7 +217,7 @@ fn strip_verbatim_windows_path(path: &str) -> Cow<'_, str> {
     }
 }
 
-fn script_os_argument(path: &Path) -> PathBuf {
+pub(crate) fn script_os_argument(path: &Path) -> PathBuf {
     if cfg!(windows) {
         match path.to_str() {
             Some(path) => PathBuf::from(strip_verbatim_windows_path(path).as_ref()),
@@ -189,35 +268,102 @@ pub(crate) fn service_script(script: &Path) -> Result<Command> {
 }
 
 pub async fn run(options: Service) -> Result<()> {
+    let action = options.action;
+    if matches!(action, Action::UninstallUpdater) {
+        bail!(
+            "automatic updates are required for managed Node services; use vibeface service uninstall to remove the Node and its timer"
+        );
+    }
     let data_dir = data_dir_or_home(options.data_dir)?;
     let data = std::fs::canonicalize(data_dir)
         .context("initialized data directory is required; run vibeface init first")?;
-    inspect(&data).await?;
     let executable = std::env::current_exe()?;
     let npm_root = update::npm_install_root(&executable)?;
-    let root = match &npm_root {
-        Some(root) => root.clone(),
-        None => update::managed_install_root(&data)?,
-    };
-    let _update_lock = if npm_root.is_some() && matches!(options.action, Action::Install) {
-        Some(
-            update::update_lock(&data)
-                .context("wait for the updater before installing the npm service")?,
-        )
-    } else {
+    let _update_lock = if matches!(action, Action::Status) {
         None
+    } else {
+        Some(update::update_lock(&data).with_context(|| {
+            if npm_root.is_some() && matches!(action, Action::Install) {
+                "wait for the updater before installing the npm service"
+            } else {
+                "wait for the updater before changing the Node service"
+            }
+        })?)
     };
-    let mut operation = command(&root, &data, &executable, options.action)?;
-    if npm_root.is_some() && matches!(options.action, Action::Install) {
-        let status = command(&root, &data, &executable, Action::UninstallUpdater)?
-            .status()
+    let inspected = inspect(&data).await?;
+    if let Some(root) = npm_root {
+        let mut operation = command(&root, &data, &executable, action)?;
+        if matches!(action, Action::Install) {
+            let package = executable
+                .parent()
+                .context("npm native package is missing")?;
+            native_registration(package, &data, None).await?;
+            run_command(&mut command(
+                &root,
+                &data,
+                &executable,
+                Action::UninstallUpdater,
+            )?)
             .await
-            .context("disable the managed updater for the npm installation")?;
+            .context("remove the previous managed updater before installing the npm service")?;
+        }
+        return run_command(&mut operation).await;
+    }
+
+    let desktop = crate::desktop_node::managed_service_for_data(&data)?;
+    let root = update::service_install_root(&data, &executable)?;
+    let service_id = desktop.as_ref().map(|service| service.service_id.as_str());
+    if let Some(desktop) = &desktop {
+        inspected.require_identity(&NodeIdentity {
+            data_dir: data.clone(),
+            device_id: desktop.device_id.clone(),
+        })?;
         ensure!(
-            status.success(),
-            "could not disable the previous updater: {status}"
+            !matches!(action, Action::Install | Action::Uninstall),
+            "use Desktop to install or uninstall this Desktop-managed Node"
         );
     }
+    let package = root.join("current");
+    if matches!(action, Action::Uninstall) {
+        ensure!(
+            !data.join("update-pending.json").exists(),
+            "interrupted update: run update apply before uninstalling the Node service"
+        );
+    }
+    if matches!(
+        action,
+        Action::Install | Action::Start | Action::Restart | Action::InstallUpdater
+    ) {
+        ensure!(
+            !data.join("update-pending.json").exists(),
+            "interrupted update: run update apply before starting the Node service"
+        );
+        let native = native_registration(&package, &data, service_id).await?;
+        ensure!(
+            native.installed || matches!(action, Action::Install),
+            "installed node service is required"
+        );
+        if matches!(action, Action::Install) && !native.running {
+            let _idle = update::lock_data_dir(&data)
+                .context("stop the node before installing its service")?;
+        }
+        update::ensure_service_updates(&data, &root, service_id, &native).await?;
+        if matches!(action, Action::InstallUpdater) {
+            return Ok(());
+        }
+        if matches!(action, Action::Install) {
+            return update::install_managed_service(&package, &data, service_id, &native).await;
+        }
+    }
+    let mut operation = if let Some(service_id) = service_id {
+        native_command(&package, &data, Some(service_id), action.argument(), true)?
+    } else {
+        command(&root, &data, &executable, action)?
+    };
+    run_command(&mut operation).await
+}
+
+async fn run_command(operation: &mut Command) -> Result<()> {
     let status = operation
         .status()
         .await
@@ -348,7 +494,7 @@ mod tests {
         let stop = command(&root, &data, &executable, Action::Stop).unwrap();
         assert_eq!(
             whole_call(&stop).len(),
-            expected_script_call(Path::new("script")).len() + 3
+            expected_script_call(Path::new("script")).len() + 5
         );
         let unrelated = root.join("local-build");
         std::fs::write(&unrelated, b"another binary").unwrap();
