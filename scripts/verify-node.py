@@ -7374,7 +7374,7 @@ def e2e_fixture(options):
     helper.chmod(0o600)
     nodes = {}
     delivery_kind = options.fixture_kind == "delivery"
-    rpc = DeliveryRpcSpy() if delivery_kind else None
+    rpc = None
     mesh = mesh_network()
     native_ready = False
     native_invitation = None
@@ -7418,12 +7418,25 @@ os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:
             for role, node in nodes.items()
         }, **({"gates": {name: str(path) for name, path in workspace_gates.items()}} if workspace_gates else {})}
 
+    def send(envelope):
+        line = json.dumps(envelope, allow_nan=False)
+        require(len(line.encode("utf-8")) <= 64 * 1024, "the complete fixture response is bounded")
+        print(line, flush=True)
+
+    def error_details(error):
+        return {"error": type(error).__name__, "frames": [
+            f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+            for frame in traceback.extract_tb(error.__traceback__)[-4:]]}
+
     def stop(*_):
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    sent_ready = False
     try:
+        if delivery_kind:
+            rpc = DeliveryRpcSpy()
         if mesh_kind:
             # The page's own Node is the bootstrap node of a fresh mesh, volunteers a relay and forwards
             # browsers to any device; the member configures nothing but it as its bootstrap node.
@@ -7471,9 +7484,16 @@ os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:
             if options.fixture_kind == "cursor":
                 environment["PATH"] = str(cursor_bin) + os.pathsep + os.defpath
             node.start(env=environment)
-        print(json.dumps({"ready": details()}), flush=True)
-        for line in sys.stdin:
-            request = json.loads(line)
+        send({"ready": details()})
+        sent_ready = True
+        for expected_id, line in enumerate(sys.stdin, start=1):
+            require(line.endswith("\n"), "a fixture request is a complete JSON line")
+            envelope = json.loads(line)
+            require(isinstance(envelope, dict) and set(envelope) == {"id", "request"},
+                    "a fixture request specifies its ID and operation")
+            request_id, request = envelope["id"], envelope["request"]
+            require(type(request_id) is int and request_id == expected_id <= 2**53 - 1
+                    and isinstance(request, dict), "fixture request IDs increase once per operation")
             try:
                 op = request.get("op")
                 if op == "restart":
@@ -7537,7 +7557,7 @@ os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:
                                              "target": row["input"]["target"], "text": row["input"]["text"],
                                              "deferred": row["deferred"], "cancelled": row["cancelled"]}
                                             for row in nodes["source"].client.rpc("workspace_state")["inputs"]]
-                    require(len(json.dumps({"ok": True, "result": result}).encode()) <= 65536,
+                    require(len(json.dumps({"id": request_id, "ok": True, "result": result}).encode("utf-8")) <= 64 * 1024,
                             "workspace inspection returns one bounded public JSON event")
                 elif op == "workspace_native_setup":
                     require(set(request) == {"op", "invitation_file"} and workspace_gates and not native_ready,
@@ -7707,15 +7727,13 @@ os.execv(sys.executable, [sys.executable, {str(cursor_protocol)!r}, *sys.argv[1:
                     result = {"order_id": prepared["order_id"]}
                 else:
                     raise ValueError("unsupported fixture operation")
-                print(json.dumps({"ok": True, "result": result}), flush=True)
+                reply = {"id": request_id, "ok": True, "result": result}
             except Exception as error:
-                print(json.dumps({"ok": False, "error": type(error).__name__, "frames": [
-                    f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
-                    for frame in traceback.extract_tb(error.__traceback__)[-4:]]}), flush=True)
+                reply = {"id": request_id, "ok": False, **error_details(error)}
+            send(reply)
     except Exception as error:
-        print(json.dumps({"ok": False, "error": type(error).__name__, "frames": [
-            f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
-            for frame in traceback.extract_tb(error.__traceback__)[-4:]]}), flush=True)
+        if not sent_ready:
+            send({"startup_error": error_details(error)})
         raise SystemExit(1) from None
     finally:
         cleanup_failed = False

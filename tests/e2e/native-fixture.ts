@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { insideTaskArtifacts } from '../support/artifact-paths';
+import { withControlledFixture } from '../support/fixture-lifecycle';
+import { createFixtureTransport } from '../support/fixture-transport';
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { mkdir, readFile, readdir, readlink, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { join, relative, resolve } from 'node:path';
-import { createInterface } from 'node:readline';
+import { pipeline } from 'node:stream/promises';
 
 const root = resolve(import.meta.dirname, '../..');
 export function record(value: unknown): Record<string, unknown> {
@@ -41,62 +43,45 @@ export async function nativeFixture(kind: 'delivery' | 'workspace', artifacts: s
   if (process.env.VIBEFACE_E2E_APP_DIR) args.push('--app-dir', process.env.VIBEFACE_E2E_APP_DIR);
   if (kind === 'delivery' && process.env.VIBEFACE_E2E_PROFILE_FILE) args.push('--fixture-profile', process.env.VIBEFACE_E2E_PROFILE_FILE);
   const child = spawn('python3', args, { cwd: root, stdio: ['pipe', 'pipe', 'pipe'] });
-  let pending: { resolve(value: Record<string, unknown>): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> } | null = null;
-  const wait = () => new Promise<Record<string, unknown>>((resolveValue, reject) => {
-    const timer = setTimeout(() => { pending = null; reject(new Error('Native fixture operation timed out')); }, 45000);
-    pending = { resolve: resolveValue, reject, timer };
+  const transport = createFixtureTransport(child, {
+    requestTimeoutMs: 45000,
+    shutdownTimeoutsMs: [30000, 30000, 5000],
   });
-  const log = createWriteStream(resolve(artifacts, `fixture-${randomUUID()}.log`), { flags: 'wx', mode: 0o600 });
-  child.stderr.pipe(log);
-  const fail = (error: Error) => { if (pending) { clearTimeout(pending.timer); pending.reject(error); pending = null; } };
-  child.once('error', fail);
-  child.once('exit', () => fail(new Error('Native fixture stopped before completing its request')));
-  const ready = wait();
-  createInterface({ input: child.stdout }).on('line', line => {
-    const current = pending;
-    if (!current) return;
-    pending = null; clearTimeout(current.timer);
-    try {
-      assert(line.length <= 65536, 'Native fixture response is bounded');
-      const value = record(JSON.parse(line));
-      if (value.ok === false) {
-        const kind = typeof value.error === 'string' && /^[A-Za-z_]{1,50}$/.test(value.error) ? value.error : 'Error';
-        const frames = Array.isArray(value.frames) ? value.frames.filter((frame: unknown): frame is string =>
-          typeof frame === 'string' && /^verify-node\.py:[1-9][0-9]{0,4}:[A-Za-z_][A-Za-z0-9_]{0,70}$/.test(frame)).slice(0, 4) : [];
-        current.reject(new Error(`Native fixture failure ${kind} [${frames.join(';')}]`));
-        return;
+  let logResult: Promise<Error | undefined> | undefined;
+  await withControlledFixture({
+    run: async () => {
+      const log = createWriteStream(resolve(artifacts, `fixture-${randomUUID()}.log`), { flags: 'wx', mode: 0o600 });
+      logResult = pipeline(child.stderr, log).then(() => undefined, () => {
+        const error = new Error('Native fixture stderr log failed');
+        transport.fail(error.message);
+        return error;
+      });
+      await use({ fixture: await transport.ready, invitation, call: transport.call });
+    },
+    stop: async () => {
+      const failures: unknown[] = [];
+      if (!logResult) child.stderr.resume();
+      try {
+        const { code, signal } = await transport.stop();
+        if (code !== 0 || signal !== null) {
+          failures.push(new Error('The task fixture and its own Node processes failed cleanup'));
+        }
+      } catch (error) {
+        failures.push(error);
+        child.stderr.destroy();
       }
-      assert('ready' in value || value.ok === true, 'Native fixture operation succeeds');
-      current.resolve(record(value.ready ?? value.result));
-    } catch { current.reject(new Error('Native fixture returned an invalid response')); }
+      try {
+        await unlink(invitation).catch(error => { if (error.code !== 'ENOENT') throw error; });
+      } catch (error) {
+        failures.push(error);
+      }
+      const logFailure = await logResult;
+      if (logFailure) failures.push(logFailure);
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) throw new AggregateError(failures, 'Native fixture cleanup failed');
+      await writeFile(resolve(artifacts, 'cleanup.json'), `${JSON.stringify({ fixture_stopped: true })}\n`, { mode: 0o600 });
+    },
   });
-  const call = async (request: Record<string, unknown>) => {
-    assert(!pending, 'Native fixture accepts one operation at a time');
-    const result = wait();
-    child.stdin.write(`${JSON.stringify(request)}\n`);
-    return result;
-  };
-  const cancelPending = () => { if (pending) { clearTimeout(pending.timer); pending = null; } };
-  try {
-    await use({ fixture: await ready, invitation, call });
-  } finally {
-    cancelPending();
-    child.stdin.end();
-    const exited = (timeout: number) => new Promise<boolean>(done => {
-      if (child.exitCode !== null || child.signalCode !== null) return done(true);
-      const ended = () => { clearTimeout(timer); done(true); };
-      const timer = setTimeout(() => { child.removeListener('exit', ended); done(false); }, timeout);
-      child.once('exit', ended);
-    });
-    if (!await exited(30000)) {
-      child.kill('SIGTERM');
-      if (!await exited(30000)) { child.kill('SIGKILL'); await exited(5000); }
-    }
-    log.end();
-    await unlink(invitation).catch(error => { if (error.code !== 'ENOENT') throw error; });
-    assert.equal(child.exitCode, 0, 'The task fixture and its own Node processes finish cleanup');
-    await writeFile(resolve(artifacts, 'cleanup.json'), `${JSON.stringify({ fixture_stopped: true })}\n`, { mode: 0o600 });
-  }
 }
 
 export async function bundleManifest(directory: string): Promise<Record<string, string>> {
