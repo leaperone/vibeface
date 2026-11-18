@@ -3,6 +3,7 @@ use crate::{
     ClientKey, Connection, Endpoint,
     outbox::{Operation, Outbox, Reconciliation},
     wire::*,
+    write_gate::{AtomicWriteGate, WriteGate, WriteGateGeneration, WriteGates},
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -10,7 +11,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::{
     Mutex,
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tokio::sync::{Semaphore, broadcast, watch};
@@ -711,24 +712,32 @@ impl ReadStorageJob {
         store.invalidate_profile(target)
     }
 
-    fn cache_profile(&self, proof: &crate::profile::CachedProfile) -> Result<()> {
+    fn cache_profile(
+        &self,
+        proof: &crate::profile::CachedProfile,
+        gate: &AtomicWriteGate,
+    ) -> Result<()> {
         let store = self
             .outbox
             .as_ref()
             .expect("read storage job owns its outbox until drop")
             .lock()
             .map_err(|_| anyhow::anyhow!("outbox lock poisoned"))?;
-        store.cache_profile(proof)
+        let mut proof = proof.clone();
+        gate.persist(|observed| {
+            proof.write_gate = observed;
+            store.cache_profile(&proof)
+        })
     }
 
-    fn cache_write_gate(&self, target: &str, gate: u8) -> Result<()> {
+    fn cache_write_gate(&self, target: &str, gate: &AtomicWriteGate) -> Result<()> {
         let store = self
             .outbox
             .as_ref()
             .expect("read storage job owns its outbox until drop")
             .lock()
             .map_err(|_| anyhow::anyhow!("outbox lock poisoned"))?;
-        store.cache_write_gate(target, gate)
+        gate.persist(|observed| store.cache_write_gate(target, observed))
     }
 }
 
@@ -740,6 +749,20 @@ impl Drop for ReadStorageJob {
     }
 }
 
+/// Lives exactly as long as the shared outbox generations, never across identities.
+struct ClientGenerations {
+    read_storage: watch::Sender<usize>,
+    write_gates: WriteGates,
+}
+impl Default for ClientGenerations {
+    fn default() -> Self {
+        Self {
+            read_storage: watch::channel(0).0,
+            write_gates: WriteGates::default(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Client {
     key: Arc<ClientKey>,
@@ -747,16 +770,18 @@ pub struct Client {
     target: String,
     network: String,
     authority: ClientAuthority,
+    offline: bool,
     endpoint: Endpoint,
     outbox: Arc<Mutex<Outbox>>,
-    read_storage: watch::Sender<usize>,
+    generations: Arc<ClientGenerations>,
     events: broadcast::Sender<ClientEvent>,
     generation: String,
     writes: Arc<Semaphore>,
     decision_tokens: Arc<Mutex<BTreeMap<String, DecisionToken>>>,
     active: Arc<AtomicBool>,
     revoked: Arc<AtomicBool>,
-    write_gate: Arc<AtomicU8>,
+    write_gate: Arc<AtomicWriteGate>,
+    write_generation: Option<WriteGateGeneration>,
 }
 
 impl Client {
@@ -787,7 +812,7 @@ impl Client {
             Arc::new(Mutex::new(outbox)),
             Arc::new(Semaphore::new(8)),
             Arc::new(Mutex::new(BTreeMap::new())),
-            watch::channel(0).0,
+            Arc::new(ClientGenerations::default()),
         )
         .await
     }
@@ -851,7 +876,7 @@ impl Client {
             Arc::new(Mutex::new(outbox)),
             Arc::new(Semaphore::new(8)),
             Arc::new(Mutex::new(BTreeMap::new())),
-            watch::channel(0).0,
+            Arc::new(ClientGenerations::default()),
         )
     }
     fn offline_generation(
@@ -861,7 +886,7 @@ impl Client {
         outbox: Arc<Mutex<Outbox>>,
         writes: Arc<Semaphore>,
         decision_tokens: Arc<Mutex<BTreeMap<String, DecisionToken>>>,
-        read_storage: watch::Sender<usize>,
+        generations: Arc<ClientGenerations>,
     ) -> Result<Self> {
         let target = endpoint.node_id().to_owned();
         if let Endpoint::Local(grant) = &endpoint {
@@ -872,6 +897,17 @@ impl Client {
         }
         let authority = proof.verify_offline(&key, &target)?;
         let network = proof.network_id.clone();
+        let write_gate = generations.write_gates.for_target(&target)?;
+        if proof.write_gate == WriteGate::Forked {
+            write_gate.confirm_fork();
+        }
+        let authority = if write_gate.load() == WriteGate::Forked && !proof.revoked {
+            ClientAuthority::PrivateDataOnly {
+                reason: OfflineBlockReason::Forked,
+            }
+        } else {
+            authority
+        };
         let (events, _) = broadcast::channel(128);
         Ok(Self {
             key,
@@ -879,16 +915,18 @@ impl Client {
             target,
             network,
             authority,
+            offline: true,
             endpoint,
             outbox,
-            read_storage,
+            generations,
             events,
             generation: uuid::Uuid::new_v4().to_string(),
             writes,
             decision_tokens,
             active: Arc::new(AtomicBool::new(false)),
             revoked: Arc::new(AtomicBool::new(false)),
-            write_gate: Arc::new(AtomicU8::new(proof.write_gate)),
+            write_gate,
+            write_generation: None,
         })
     }
     pub async fn reopen_offline(&self, endpoint: Endpoint) -> Result<Self> {
@@ -901,7 +939,7 @@ impl Client {
             self.outbox.clone(),
             self.writes.clone(),
             self.decision_tokens.clone(),
-            self.read_storage.clone(),
+            self.generations.clone(),
         )?;
         self.close();
         Ok(next)
@@ -1004,7 +1042,7 @@ impl Client {
             target_node: endpoint.node_id().into(),
             state,
             observed_at_ms: now,
-            write_gate: 0,
+            write_gate: WriteGate::Unknown,
             revoked: false,
         };
         Ok(AuthenticatedSession {
@@ -1020,7 +1058,7 @@ impl Client {
         outbox: Arc<Mutex<Outbox>>,
         writes: Arc<Semaphore>,
         decision_tokens: Arc<Mutex<BTreeMap<String, DecisionToken>>>,
-        read_storage: watch::Sender<usize>,
+        generations: Arc<ClientGenerations>,
     ) -> Result<Self> {
         let AuthenticatedSession {
             connection,
@@ -1030,26 +1068,31 @@ impl Client {
         let network = proof.network_id.clone();
         let (events, generation) = subscribe_connection(&connection, &network).await?;
         let write_state = connection.call("write_state", json!({})).await?;
-        let gate = write_gate_value(&write_state)?;
+        let gate = WriteGate::from_response(&write_state)?;
+        let write_gate = generations.write_gates.for_target(&proof.target_node)?;
+        let write_generation = write_gate.begin_generation(gate)?;
         proof.write_gate = gate;
-        let job = ReadStorageJob::register(read_storage.clone(), outbox.clone());
-        tokio::task::spawn_blocking(move || job.cache_profile(&proof)).await??;
+        let cache_gate = write_gate.clone();
+        let job = ReadStorageJob::register(generations.read_storage.clone(), outbox.clone());
+        tokio::task::spawn_blocking(move || job.cache_profile(&proof, &cache_gate)).await??;
         Ok(Self {
             key,
             connection,
             target: endpoint.node_id().into(),
             network,
             authority,
+            offline: false,
             endpoint,
             outbox,
-            read_storage,
+            generations,
             events,
             generation,
             writes,
             decision_tokens,
             active: Arc::new(AtomicBool::new(true)),
             revoked: Arc::new(AtomicBool::new(false)),
-            write_gate: Arc::new(AtomicU8::new(gate)),
+            write_gate,
+            write_generation: Some(write_generation),
         })
     }
     /// A new Noise generation shares the original durable outbox. Existing requests retain their original target.
@@ -1063,8 +1106,10 @@ impl Client {
                         self.revoked.store(true, Ordering::Release);
                         self.connection.close();
                     }
-                    let job =
-                        ReadStorageJob::register(self.read_storage.clone(), self.outbox.clone());
+                    let job = ReadStorageJob::register(
+                        self.generations.read_storage.clone(),
+                        self.outbox.clone(),
+                    );
                     tokio::task::spawn_blocking(move || job.invalidate_profile(&target)).await??;
                 }
                 return Err(error);
@@ -1081,7 +1126,7 @@ impl Client {
             self.outbox.clone(),
             self.writes.clone(),
             self.decision_tokens.clone(),
-            self.read_storage.clone(),
+            self.generations.clone(),
         )
         .await?;
         self.close();
@@ -1117,16 +1162,28 @@ impl Client {
             ClientAuthority::PrivateDataOnly {
                 reason: OfflineBlockReason::Revoked,
             }
+        } else if self.offline
+            && self.write_gate.load() == WriteGate::Forked
+            && !matches!(
+                self.authority,
+                ClientAuthority::PrivateDataOnly {
+                    reason: OfflineBlockReason::Revoked
+                }
+            )
+        {
+            ClientAuthority::PrivateDataOnly {
+                reason: OfflineBlockReason::Forked,
+            }
         } else {
             self.authority
         }
     }
     pub fn can_write(&self) -> bool {
-        matches!(self.authority, ClientAuthority::Membership { .. })
+        matches!(self.authority(), ClientAuthority::Membership { .. })
             && !self.revoked.load(Ordering::Acquire)
     }
     pub fn can_save_locally(&self) -> bool {
-        self.can_write() && self.write_gate.load(Ordering::Acquire) != 2
+        self.can_write() && self.write_gate.load() != WriteGate::Forked
     }
     pub fn can_control(&self) -> bool {
         self.is_online() && self.can_write()
@@ -1134,13 +1191,15 @@ impl Client {
     pub fn can_send_online(&self) -> bool {
         self.active.load(Ordering::Acquire)
             && self.connection.is_open()
-            && self.write_gate.load(Ordering::Acquire) == 1
+            && self
+                .write_generation
+                .is_some_and(|generation| self.write_gate.is_writable(generation))
             && self.can_write()
     }
     pub fn can_configure_node(&self) -> bool {
         !self.revoked.load(Ordering::Acquire)
             && matches!(
-                self.authority,
+                self.authority(),
                 ClientAuthority::LocalSession | ClientAuthority::Membership { can_manage: true }
             )
     }
@@ -1285,7 +1344,7 @@ impl Client {
     /// this outbox. Generations sharing the outbox share this tracker. This does not wait
     /// for network requests or mutation jobs.
     pub async fn wait_for_read_storage(&self) {
-        let mut pending = self.read_storage.subscribe();
+        let mut pending = self.generations.read_storage.subscribe();
         loop {
             let count = *pending.borrow_and_update();
             if count == 0 {
@@ -1301,21 +1360,40 @@ impl Client {
     pub async fn read(&self, request: ReadRequest) -> Result<Value> {
         self.require_active()?;
         let update_gate = matches!(&request, ReadRequest::WriteState);
-        if update_gate && self.write_gate.load(Ordering::Acquire) != 2 {
-            self.write_gate.store(0, Ordering::Release);
-        }
-        let value = read_connection(&self.connection, request).await?;
         if update_gate {
-            let mut gate = write_gate_value(&value)?;
-            if self.write_gate.load(Ordering::Acquire) == 2 {
-                gate = 2;
-            }
-            self.write_gate.store(gate, Ordering::Release);
-            let target = self.target.clone();
-            let job = ReadStorageJob::register(self.read_storage.clone(), self.outbox.clone());
-            tokio::task::spawn_blocking(move || job.cache_write_gate(&target, gate)).await??;
+            self.write_gate.observe(
+                self.write_generation
+                    .context("offline profile has no write generation")?,
+                WriteGate::Unknown,
+            );
         }
-        Ok(value)
+        let value = read_connection(&self.connection, request).await;
+        if update_gate {
+            let observed = match &value {
+                Ok(value) => WriteGate::from_response(value),
+                Err(_) => Ok(WriteGate::Unknown),
+            };
+            if let Ok(gate) = &observed
+                && value.is_ok()
+            {
+                // The owner check and observation share one CAS, including before
+                // reconnect closes this generation's still-active connection.
+                self.write_gate.observe(
+                    self.write_generation
+                        .context("offline profile has no write generation")?,
+                    *gate,
+                );
+            }
+            let target = self.target.clone();
+            let gate = self.write_gate.clone();
+            let job = ReadStorageJob::register(
+                self.generations.read_storage.clone(),
+                self.outbox.clone(),
+            );
+            tokio::task::spawn_blocking(move || job.cache_write_gate(&target, &gate)).await??;
+            observed?;
+        }
+        value
     }
     pub async fn stage(&self, action: Action) -> Result<OperationSnapshot> {
         self.stage_after(action, vec![]).await
@@ -1371,7 +1449,8 @@ impl Client {
         };
         ensure!(
             !self.revoked.load(Ordering::Acquire)
-                && (self.write_gate.load(Ordering::Acquire) != 2 || permits_fork),
+                && (!self.offline || self.can_write())
+                && (self.write_gate.load() != WriteGate::Forked || permits_fork),
             "known revoked or forked profile cannot stage new network work"
         );
         let known=match &action {
@@ -1536,13 +1615,16 @@ impl Client {
                     before.require_active()?;
                     let active = before.active.clone();
                     let gate = before.write_gate.clone();
+                    let write_generation = before.write_generation;
                     let revoked = before.revoked.clone();
                     before
                         .stored(move |db| {
+                            let writable = write_generation
+                                .is_some_and(|generation| gate.is_writable(generation));
                             ensure!(
                                 active.load(Ordering::Acquire)
                                     && !revoked.load(Ordering::Acquire)
-                                    && (!network_write || gate.load(Ordering::Acquire) == 1),
+                                    && (!network_write || writable),
                                 "operation was not admitted under current authority"
                             );
                             db.begin(&begin_id).map(|_| ())
@@ -3530,15 +3612,6 @@ fn validate_memory_state(state: &Value, memory_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn write_gate_value(value: &Value) -> Result<u8> {
-    Ok(match value["state"].as_str() {
-        Some("writable") => 1,
-        Some("forked") => 2,
-        Some("read_only" | "aligning") => 3,
-        _ => anyhow::bail!("invalid Node write state"),
-    })
-}
-
 #[cfg(test)]
 mod offline_tests {
     use super::*;
@@ -3626,7 +3699,7 @@ mod offline_tests {
                     Ok(())
                 });
                 lock_acquired.await?;
-                let mut registered = client.read_storage.subscribe();
+                let mut registered = client.generations.read_storage.subscribe();
                 let reader = client.clone();
                 let (read_task, replacement_server) = match replacement {
                     Some((endpoint, server)) => (
@@ -3692,9 +3765,9 @@ mod offline_tests {
                 assert_eq!(
                     proof.write_gate,
                     if poison || matches!(read, CacheRead::Revoked) {
-                        1
+                        WriteGate::Writable
                     } else {
-                        3
+                        WriteGate::Restricted
                     }
                 );
                 assert_eq!(proof.revoked, !poison && matches!(read, CacheRead::Revoked));
@@ -3886,6 +3959,464 @@ mod offline_tests {
         });
         Ok((Endpoint::Gateway(entry), task))
     }
+    struct GateSetup {
+        dir: PathBuf,
+        client: Client,
+        evidence: Arc<Mutex<Evidence>>,
+        node_secret: String,
+        state: NetworkState,
+        server: tokio::task::JoinHandle<Result<()>>,
+    }
+    impl GateSetup {
+        async fn open() -> Result<Self> {
+            Self::open_with_drop(None).await
+        }
+        async fn open_with_drop(drop_message: Option<String>) -> Result<Self> {
+            let dir = std::env::temp_dir().join(format!("native-gate-{}", uuid::Uuid::new_v4()));
+            let mut key = ClientKey::create(&dir.join("key"), "fixture password")?;
+            let node = Identity::generate()?;
+            let state = NetworkState::new(Genesis::create(
+                &Identity::generate()?,
+                Member::client(&key.identity, "client", true)?,
+                Member::node(&node, "node")?,
+            )?)?;
+            let evidence = Arc::new(Mutex::new(Evidence {
+                counts: BTreeMap::new(),
+                inputs: BTreeMap::new(),
+                write_state: "writable".into(),
+                revoked: false,
+                controls: vec![],
+                settings: json!({"roots":[],"manager":null}),
+            }));
+            let (endpoint, server) = fixture(
+                &node.secret_hex(),
+                state.clone(),
+                key.device_id().into(),
+                evidence.clone(),
+                drop_message,
+            )
+            .await?;
+            let Endpoint::Gateway(entry) = &endpoint else {
+                unreachable!()
+            };
+            key.remember(&state.genesis.network_id, entry.clone())?;
+            let client = Client::open(Arc::new(key), endpoint, dir.join("outbox")).await?;
+            Ok(Self {
+                dir,
+                client,
+                evidence,
+                node_secret: node.secret_hex(),
+                state,
+                server,
+            })
+        }
+        async fn finish(self) -> Result<()> {
+            self.client.close();
+            self.client.wait_for_read_storage().await;
+            drop(self.client);
+            self.server.await??;
+            std::fs::remove_dir_all(self.dir)?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_refresh_revokes_write_admission_and_never_clears_a_fork() -> Result<()> {
+        let setup = GateSetup::open().await?;
+        assert!(setup.client.can_send_online());
+        setup.evidence.lock().unwrap().write_state = "invalid".into();
+        assert!(setup.client.read(ReadRequest::WriteState).await.is_err());
+        assert!(!setup.client.can_send_online());
+        assert_eq!(setup.client.write_gate.load(), WriteGate::Unknown);
+        let target = setup.client.target.clone();
+        assert_eq!(
+            setup
+                .client
+                .stored(move |db| Ok(db.cached_profile(&target)?.write_gate))
+                .await?,
+            WriteGate::Unknown
+        );
+        for state in [
+            "aligning",
+            "read_only",
+            "writable",
+            "forked",
+            "writable",
+            "invalid",
+        ] {
+            setup.evidence.lock().unwrap().write_state = state.into();
+            let response = setup.client.read(ReadRequest::WriteState).await;
+            if state == "invalid" {
+                assert!(response.is_err());
+            } else {
+                assert_eq!(response?["state"], state);
+            }
+            if state == "aligning" || state == "read_only" {
+                assert_eq!(setup.client.write_gate.load(), WriteGate::Restricted);
+            }
+        }
+        assert_eq!(setup.client.write_gate.load(), WriteGate::Forked);
+        let target = setup.client.target.clone();
+        assert_eq!(
+            setup
+                .client
+                .stored(move |db| Ok(db.cached_profile(&target)?.write_gate))
+                .await?,
+            WriteGate::Forked
+        );
+        assert!(!setup.client.can_save_locally());
+        assert!(!setup.client.can_send_online());
+        setup.finish().await
+    }
+
+    #[tokio::test]
+    async fn a_forked_reconnect_reconciles_an_unknown_input_without_replaying_its_bytes()
+    -> Result<()> {
+        let setup = GateSetup::open_with_drop(Some("fork-unknown".into())).await?;
+        let sent = setup
+            .client
+            .submit(input(
+                "fork-unknown",
+                InputTarget::BotMain {
+                    bot_id: "bot".into(),
+                },
+            ))
+            .await?;
+        assert_eq!(sent.state, OperationState::Unknown);
+        let original = setup
+            .client
+            .stored(|db| Ok(db.get("fork-unknown")?.bytes))
+            .await?;
+        setup.evidence.lock().unwrap().write_state = "forked".into();
+        let (endpoint, replacement_server) = fixture(
+            &setup.node_secret,
+            setup.state.clone(),
+            setup.client.client_id().into(),
+            setup.evidence.clone(),
+            None,
+        )
+        .await?;
+        let next = setup.client.reconnect(endpoint).await?;
+        assert_eq!(next.write_gate.load(), WriteGate::Forked);
+        assert_eq!(
+            next.send_staged("fork-unknown").await?.state,
+            OperationState::Unknown
+        );
+        assert_eq!(
+            next.reconcile("fork-unknown").await?.state,
+            OperationState::Accepted
+        );
+        assert_eq!(
+            next.send_staged("fork-unknown").await?.state,
+            OperationState::Accepted
+        );
+        assert_eq!(
+            next.stored(|db| Ok(db.get("fork-unknown")?.bytes)).await?,
+            original
+        );
+        assert_eq!(
+            setup.evidence.lock().unwrap().counts.get("fork-unknown"),
+            Some(&1)
+        );
+        next.close();
+        drop(next);
+        replacement_server.await??;
+        setup.finish().await
+    }
+
+    #[tokio::test]
+    async fn an_offline_generation_also_loses_stop_permission_when_a_late_fork_is_confirmed()
+    -> Result<()> {
+        let setup = GateSetup::open().await?;
+        let old_observation = setup.client.write_gate.clone();
+        let offline = setup
+            .client
+            .reopen_offline(setup.client.endpoint.clone())
+            .await?;
+        assert!(offline.can_write());
+        // A response already read by the old online generation can finish after close.
+        old_observation.confirm_fork();
+        assert_eq!(
+            offline.offline_block_reason(),
+            Some(OfflineBlockReason::Forked)
+        );
+        assert!(!offline.can_write());
+        assert!(!offline.can_save_locally());
+        assert!(!offline.can_configure_node());
+        assert!(
+            offline
+                .stage(Action::StopWork {
+                    conversation_id: "chat".into(),
+                    work_id: "late".into()
+                })
+                .await
+                .is_err()
+        );
+        assert!(offline.pending().await?.is_empty());
+        let target = offline.target.clone();
+        let job = ReadStorageJob::register(
+            offline.generations.read_storage.clone(),
+            offline.outbox.clone(),
+        );
+        tokio::task::spawn_blocking(move || job.cache_write_gate(&target, &old_observation))
+            .await??;
+        let target = offline.target.clone();
+        assert_eq!(
+            offline
+                .stored(move |db| Ok(db.cached_profile(&target)?.write_gate))
+                .await?,
+            WriteGate::Forked
+        );
+        let cached = offline.reopen_offline(offline.endpoint.clone()).await?;
+        assert_eq!(offline.authority(), cached.authority());
+        assert_eq!(offline.can_write(), cached.can_write());
+        assert_eq!(offline.can_configure_node(), cached.can_configure_node());
+        assert!(
+            cached
+                .stage(Action::StopWork {
+                    conversation_id: "chat".into(),
+                    work_id: "cached".into()
+                })
+                .await
+                .is_err()
+        );
+        drop(cached);
+        drop(offline);
+        setup.finish().await
+    }
+
+    #[tokio::test]
+    async fn an_old_writable_refresh_cannot_override_a_replacement_before_the_old_connection_closes()
+    -> Result<()> {
+        let setup = GateSetup::open().await?;
+        let outbox = setup.client.outbox.clone();
+        let (locked, acquired) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let holder = tokio::task::spawn_blocking(move || {
+            let _guard = outbox.lock().unwrap();
+            locked.send(()).unwrap();
+            released.recv().unwrap();
+        });
+        acquired.await?;
+        let mut registered = setup.client.generations.read_storage.subscribe();
+        setup.evidence.lock().unwrap().write_state = "read_only".into();
+        let (endpoint, replacement_server) = fixture(
+            &setup.node_secret,
+            setup.state.clone(),
+            setup.client.client_id().into(),
+            setup.evidence.clone(),
+            None,
+        )
+        .await?;
+        let replacing = setup.client.clone();
+        let reconnect = tokio::spawn(async move { replacing.reconnect(endpoint).await });
+        while *registered.borrow_and_update() < 1 {
+            registered.changed().await?;
+        }
+        assert!(
+            setup.client.is_online(),
+            "attach is waiting for cache before closing its predecessor"
+        );
+        assert_eq!(setup.client.write_gate.load(), WriteGate::Restricted);
+        setup.evidence.lock().unwrap().write_state = "writable".into();
+        let old = setup.client.clone();
+        let stale = tokio::spawn(async move { old.read(ReadRequest::WriteState).await });
+        while *registered.borrow_and_update() < 2 {
+            registered.changed().await?;
+        }
+        assert!(
+            setup.client.is_online(),
+            "the stale response crosses the pre-close window"
+        );
+        assert_eq!(setup.client.write_gate.load(), WriteGate::Restricted);
+        release.send(())?;
+        holder.await?;
+        assert_eq!(stale.await??["state"], "writable");
+        let next = reconnect.await??;
+        assert_eq!(next.write_gate.load(), WriteGate::Restricted);
+        assert!(!next.can_send_online());
+        let target = next.target.clone();
+        assert_eq!(
+            next.stored(move |db| Ok(db.cached_profile(&target)?.write_gate))
+                .await?,
+            WriteGate::Restricted
+        );
+        next.close();
+        drop(next);
+        replacement_server.await??;
+        setup.finish().await
+    }
+
+    #[tokio::test]
+    async fn queued_offline_stop_and_control_recheck_forked_authority_at_the_storage_boundary()
+    -> Result<()> {
+        for action in [
+            Action::StopWork {
+                conversation_id: "chat".into(),
+                work_id: "queued-offline".into(),
+            },
+            Action::TestWebhook,
+            Action::LocalAccess { enabled: true },
+        ] {
+            let setup = GateSetup::open().await?;
+            let offline = setup
+                .client
+                .reopen_offline(setup.client.endpoint.clone())
+                .await?;
+            let outbox = offline.outbox.clone();
+            let (locked, acquired) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let holder = tokio::task::spawn_blocking(move || {
+                let _guard = outbox.lock().unwrap();
+                locked.send(()).unwrap();
+                released.recv().unwrap();
+            });
+            acquired.await?;
+            let mut staged = Box::pin(offline.stage(action.clone()));
+            assert!(
+                futures_util::poll!(staged.as_mut()).is_pending(),
+                "entry admission passed before the storage queue"
+            );
+            setup.evidence.lock().unwrap().write_state = "forked".into();
+            let (endpoint, replacement_server) = fixture(
+                &setup.node_secret,
+                setup.state.clone(),
+                offline.client_id().into(),
+                setup.evidence.clone(),
+                None,
+            )
+            .await?;
+            let mut registered = offline.generations.read_storage.subscribe();
+            let connecting = offline.clone();
+            let reconnect = tokio::spawn(async move { connecting.reconnect(endpoint).await });
+            while *registered.borrow_and_update() < 1 {
+                registered.changed().await?;
+            }
+            assert_eq!(
+                offline.offline_block_reason(),
+                Some(OfflineBlockReason::Forked)
+            );
+            release.send(())?;
+            holder.await?;
+            assert!(staged.await.is_err());
+            assert!(
+                offline.pending().await?.is_empty(),
+                "no queued offline operation was inserted"
+            );
+            let online = reconnect.await??;
+            assert!(
+                online.can_write(),
+                "online Forked membership keeps its safety/control permission"
+            );
+            assert_eq!(online.submit(action).await?.state, OperationState::Accepted);
+            online.close();
+            drop(online);
+            drop(offline);
+            replacement_server.await??;
+            setup.finish().await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_refresh_jobs_and_a_b_a_reconnect_keep_memory_and_disk_forked() -> Result<()>
+    {
+        let setup = GateSetup::open().await?;
+        let outbox = setup.client.outbox.clone();
+        let (locked, acquired) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let holder = tokio::task::spawn_blocking(move || {
+            let _guard = outbox.lock().unwrap();
+            locked.send(()).unwrap();
+            released.recv().unwrap();
+        });
+        acquired.await?;
+        let mut registered = setup.client.generations.read_storage.subscribe();
+        let first = setup.client.clone();
+        let stale = tokio::spawn(async move { first.read(ReadRequest::WriteState).await });
+        while *registered.borrow_and_update() < 1 {
+            registered.changed().await?;
+        }
+        setup.evidence.lock().unwrap().write_state = "forked".into();
+        let second = setup.client.clone();
+        let fork = tokio::spawn(async move { second.read(ReadRequest::WriteState).await });
+        while *registered.borrow_and_update() < 2 {
+            registered.changed().await?;
+        }
+        assert_eq!(setup.client.write_gate.load(), WriteGate::Forked);
+        // Switch to another authenticated target while both A cache jobs wait.
+        // B's writable observation must neither inherit nor clear A's confirmed fork.
+        setup.evidence.lock().unwrap().write_state = "writable".into();
+        let node_b = Identity::generate()?;
+        let mut state = setup.state.clone();
+        state.append(vibeface_secure::membership::GovernanceEvent::grant(
+            &setup.client.key.identity,
+            &state.project()?,
+            Member::node(&node_b, "node B")?,
+        )?)?;
+        let (endpoint, replacement_server) = fixture(
+            &node_b.secret_hex(),
+            state.clone(),
+            setup.client.client_id().into(),
+            setup.evidence.clone(),
+            None,
+        )
+        .await?;
+        let third = setup.client.clone();
+        let reconnect = tokio::spawn(async move { third.reconnect(endpoint).await });
+        while *registered.borrow_and_update() < 3 {
+            registered.changed().await?;
+        }
+        release.send(())?;
+        holder.await?;
+        assert_eq!(stale.await??["state"], "writable");
+        assert_eq!(fork.await??["state"], "forked");
+        let next = reconnect.await??;
+        assert_ne!(next.generation(), setup.client.generation());
+        assert!(!Arc::ptr_eq(&next.write_gate, &setup.client.write_gate));
+        assert_eq!(next.write_gate.load(), WriteGate::Writable);
+        assert!(next.can_send_online());
+        let (endpoint_a, returning_server) = fixture(
+            &setup.node_secret,
+            state,
+            next.client_id().into(),
+            setup.evidence.clone(),
+            None,
+        )
+        .await?;
+        let returning = next.reconnect(endpoint_a).await?;
+        assert!(Arc::ptr_eq(&returning.write_gate, &setup.client.write_gate));
+        assert_eq!(returning.write_gate.load(), WriteGate::Forked);
+        assert!(!returning.can_send_online());
+        assert!(!returning.can_save_locally());
+        let target = returning.target.clone();
+        assert_eq!(
+            returning
+                .stored(move |db| Ok(db.cached_profile(&target)?.write_gate))
+                .await?,
+            WriteGate::Forked
+        );
+        let target_b = next.target.clone();
+        assert_eq!(
+            returning
+                .stored(move |db| Ok(db.cached_profile(&target_b)?.write_gate))
+                .await?,
+            WriteGate::Writable
+        );
+        let offline = returning.reopen_offline(returning.endpoint.clone()).await?;
+        assert_eq!(
+            offline.offline_block_reason(),
+            Some(OfflineBlockReason::Forked)
+        );
+        drop(offline);
+        returning.close();
+        drop(returning);
+        drop(next);
+        returning_server.await??;
+        replacement_server.await??;
+        setup.finish().await
+    }
+
     pub(super) fn input(id: &str, target: InputTarget) -> Action {
         Action::Input {
             conversation_id: "chat".into(),

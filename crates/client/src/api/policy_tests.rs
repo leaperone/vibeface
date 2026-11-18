@@ -328,43 +328,43 @@ async fn stage_and_submit_keep_their_distinct_role_and_gate_admission() -> Resul
     let rows = [
         (
             Membership { can_manage: true },
-            1,
+            WriteGate::Writable,
             [true, true, true, true, true],
             [true, true, true, true, true],
         ),
         (
             Membership { can_manage: false },
-            1,
+            WriteGate::Writable,
             [true, false, false, false, true],
             [true, false, false, false, true],
         ),
         (
             LocalSession,
-            1,
+            WriteGate::Writable,
             [false, false, false, false, false],
             [false, false, true, false, false],
         ),
         (
             Membership { can_manage: true },
-            0,
+            WriteGate::Unknown,
             [true, true, true, true, true],
             [true, true, true, true, true],
         ),
         (
             Membership { can_manage: false },
-            3,
+            WriteGate::Restricted,
             [true, false, false, false, true],
             [true, false, false, false, true],
         ),
         (
             Membership { can_manage: true },
-            2,
+            WriteGate::Forked,
             [false, false, false, false, true],
             [false, false, true, true, true],
         ),
         (
             Membership { can_manage: false },
-            2,
+            WriteGate::Forked,
             [false, false, false, false, true],
             [false, false, false, false, true],
         ),
@@ -372,7 +372,7 @@ async fn stage_and_submit_keep_their_distinct_role_and_gate_admission() -> Resul
             PrivateDataOnly {
                 reason: OfflineBlockReason::Forked,
             },
-            2,
+            WriteGate::Forked,
             [false; 5],
             [false; 5],
         ),
@@ -380,7 +380,7 @@ async fn stage_and_submit_keep_their_distinct_role_and_gate_admission() -> Resul
             PrivateDataOnly {
                 reason: OfflineBlockReason::Revoked,
             },
-            1,
+            WriteGate::Writable,
             [false; 5],
             [false; 5],
         ),
@@ -388,7 +388,8 @@ async fn stage_and_submit_keep_their_distinct_role_and_gate_admission() -> Resul
     for (row, (authority, gate, stage_allowed, submit_allowed)) in rows.into_iter().enumerate() {
         let mut client = setup.client.clone();
         client.authority = authority;
-        client.write_gate.store(gate, Ordering::Release);
+        client.write_gate = Arc::new(AtomicWriteGate::new(gate));
+        client.write_generation = Some(client.write_gate.begin_generation(gate)?);
         for (index, action) in representative_actions(&format!("stage-{row}"))
             .into_iter()
             .enumerate()
@@ -419,7 +420,7 @@ async fn stage_and_submit_keep_their_distinct_role_and_gate_admission() -> Resul
             );
             if submit_allowed[index] {
                 let snapshot = result?;
-                if index == 0 && gate != 1 {
+                if index == 0 && gate != WriteGate::Writable {
                     assert_eq!(snapshot.state, OperationState::Prepared);
                 }
             } else {
@@ -462,6 +463,11 @@ async fn sending_saved_intents_rechecks_roles_without_changing_original_requests
         let bytes = client.stored(move |db| Ok(db.get(&id)?.bytes)).await?;
         originals.push((staged.id, bytes));
     }
+    // The managing-member authorization case has its own gate fixture. The
+    // member/local cases below share one gate and retain its confirmed fork.
+    let mut managing = client.clone();
+    managing.write_gate = Arc::new(AtomicWriteGate::new(WriteGate::Writable));
+    managing.write_generation = Some(managing.write_gate.begin_generation(WriteGate::Writable)?);
     let mut member = client.clone();
     member.authority = ClientAuthority::Membership { can_manage: false };
     assert_eq!(
@@ -471,7 +477,7 @@ async fn sending_saved_intents_rechecks_roles_without_changing_original_requests
     for index in [1, 2, 3] {
         assert!(member.send_staged(&originals[index].0).await.is_err());
     }
-    member.write_gate.store(2, Ordering::Release);
+    member.write_gate.confirm_fork();
     assert_eq!(
         member.send_staged(&originals[4].0).await?.state,
         OperationState::Accepted
@@ -506,9 +512,8 @@ async fn sending_saved_intents_rechecks_roles_without_changing_original_requests
         OperationState::Accepted
     );
 
-    client.write_gate.store(1, Ordering::Release);
     assert_eq!(
-        client.send_staged(&originals[1].0).await?.state,
+        managing.send_staged(&originals[1].0).await?.state,
         OperationState::Accepted
     );
     for (id, bytes) in originals {
@@ -535,6 +540,7 @@ async fn sending_saved_intents_rechecks_roles_without_changing_original_requests
     }
     drop(member);
     drop(local);
+    drop(managing);
     setup.finish().await
 }
 
@@ -720,21 +726,23 @@ async fn staging_rechecks_revocation_and_fork_after_waiting_for_storage() -> Res
         (
             representative_actions("revoked-while-queued")[0].clone(),
             true,
-            1,
+            WriteGate::Writable,
             false,
         ),
         (
             representative_actions("forked-while-queued")[0].clone(),
             false,
-            2,
+            WriteGate::Forked,
             false,
         ),
-        (Action::TestWebhook, false, 2, true),
+        (Action::TestWebhook, false, WriteGate::Forked, true),
     ];
     for (action, revoke, gate, admitted) in rows {
-        setup.client.revoked.store(false, Ordering::Release);
-        setup.client.write_gate.store(1, Ordering::Release);
-        let outbox = setup.client.outbox.clone();
+        let mut client = setup.client.clone();
+        client.revoked = Arc::new(AtomicBool::new(false));
+        client.write_gate = Arc::new(AtomicWriteGate::new(WriteGate::Writable));
+        client.write_generation = Some(client.write_gate.begin_generation(WriteGate::Writable)?);
+        let outbox = client.outbox.clone();
         let (locked, entered) = tokio::sync::oneshot::channel();
         let (release, released) = std::sync::mpsc::channel();
         let holder = tokio::task::spawn_blocking(move || {
@@ -743,15 +751,17 @@ async fn staging_rechecks_revocation_and_fork_after_waiting_for_storage() -> Res
             released.recv().unwrap();
         });
         entered.await?;
-        let staged = setup.client.stage(action);
+        let staged = client.stage(action);
         tokio::pin!(staged);
         assert!(
             std::future::poll_fn(|cx| std::task::Poll::Ready(staged.as_mut().poll(cx)))
                 .await
                 .is_pending()
         );
-        setup.client.revoked.store(revoke, Ordering::Release);
-        setup.client.write_gate.store(gate, Ordering::Release);
+        client.revoked.store(revoke, Ordering::Release);
+        if gate == WriteGate::Forked {
+            client.write_gate.confirm_fork();
+        }
         release.send(())?;
         holder.await?;
         let result = staged.await;
