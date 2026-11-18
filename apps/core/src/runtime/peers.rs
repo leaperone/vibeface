@@ -2492,10 +2492,7 @@ pub(super) fn staging_room(dir: &Path, size: u64) -> Result<()> {
     );
     Ok(())
 }
-
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
 mod tests;
-
-

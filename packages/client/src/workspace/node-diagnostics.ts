@@ -104,7 +104,7 @@ function peerTrace(entry: ConnectionTrace, target: NodeTarget, node: NodeInfo | 
     returnPath: entry.returnPath,
     routeNotice: [
       entry.routeNotice,
-      skipped ? `上次同步时「${entryName}」未能联系到「${target.name}」。`
+      skipped ? `「${entryName}」与「${target.name}」上次同步失败，本次未探测该节点。`
         : unavailable ? `「${entryName}」暂时联系不到「${target.name}」。`
         : `最后一段由「${entryName}」探测${path ? "。" : "，路径尚未确认。"}`,
     ].filter(Boolean).join(" "),

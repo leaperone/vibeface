@@ -81,11 +81,6 @@ function useNodeDiagnostics(rows: DeviceRow[], visible: boolean) {
   const { connectionOnline, nodeReport, refreshNodes } = useWorkspace()
   const active = visible && connectionOnline && ready?.isCurrent() === true
   const checks = useNodeChecks({ report: nodeReport, refreshNodes, active, foreground: inForeground })
-  useEffect(() => {
-    if (!active || !refreshNodes || typeof document === "undefined") return
-    document.addEventListener("visibilitychange", checks.refresh)
-    return () => document.removeEventListener("visibilitychange", checks.refresh)
-  }, [active, refreshNodes, checks.refresh])
   const describe = (row: DeviceRow) => describeNode({
     target: { deviceId: row.id, name: row.name, entry: row.entry },
     ready,
