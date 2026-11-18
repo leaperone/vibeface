@@ -74,6 +74,7 @@ PATH_RULES = (
 WWW_PATHS = ("apps/www/*", "packages/docs/*", "packages/theme/*", "packages/uiarc/src/foundation.css", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
 MOBILE_PATHS = ("packages/client/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
 DESKTOP_PATHS = ("package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
+DELIVERY_PROBE_PROTOCOL_PATHS = ("crates/protocol/src/*.rs",)
 SLOW_TESTS = (
     "runtime::peers::tests::a_round_left_behind_pulls_again_without_waiting_for_hello",
 )
@@ -94,7 +95,7 @@ LOCAL_PROCESS_RULES = (
     ("public-node", ("config/public-bootstrap.json", "apps/core/src/net*", "apps/core/src/runtime/peers.rs", "apps/core/src/identity*", "apps/core/src/local_access.rs", "apps/core/src/crypto.rs", "crates/control/*")),
     ("mesh", ("config/public-bootstrap.json", "apps/core/src/net*", "apps/core/src/runtime/peers.rs")),
     ("phase5", ("apps/core/src/store/*", "apps/core/src/identity*", "apps/core/src/maintenance.rs", "apps/core/src/logging.rs", "crates/control/*", "crates/secure/src/recovery.rs")),
-    ("delivery-charity", PATH_RULES[0][1]),
+    ("delivery-charity", PATH_RULES[0][1] + DELIVERY_PROBE_PROTOCOL_PATHS),
 )
 
 
@@ -128,13 +129,15 @@ def make_plan(paths, event="pull_request", ref_type="branch", channel="hourly", 
             scopes.add("mobile")
         if any(fnmatch.fnmatchcase(path, pattern) for pattern in DESKTOP_PATHS):
             scopes.add("desktop")
+        if any(fnmatch.fnmatchcase(path, pattern) for pattern in DELIVERY_PROBE_PROTOCOL_PATHS):
+            scopes.add("delivery-acceptance")
     plan = scope_plan(scopes, event, ref_type, channel, package_policy=package_policy)
     return dict(plan, changed_files=len(paths), local_process_modes=local_process_modes(paths, plan["full"]))
 
 
 def scope_plan(scopes, event, ref_type, channel, *, package_policy="standard"):
     if (
-        scopes - {"full", "docs", "release-tools", "web", "web-tests", "www", "mobile", "desktop", *DEPENDENTS}
+        scopes - {"full", "docs", "release-tools", "web", "web-tests", "www", "mobile", "desktop", "delivery-acceptance", *DEPENDENTS}
         or event not in {"pull_request", "push", "schedule", "workflow_dispatch", "merge_group"}
         or ref_type not in {"branch", "tag"}
         or channel not in {"stable", "rc", "hourly"}
@@ -161,7 +164,7 @@ def scope_plan(scopes, event, ref_type, channel, *, package_policy="standard"):
     mobile = full or "mobile" in scopes
     desktop = full or "desktop" in scopes or bool(affected & {"client"})
     slow = "node" in affected and extended
-    delivery = full or "delivery" in affected
+    delivery = full or "delivery" in affected or "delivery-acceptance" in scopes
     platforms = PLATFORMS if "node" in affected and extended and package_policy == "standard" else PLATFORMS[:1]
     plan = {
         "full": full,
@@ -527,6 +530,13 @@ def self_test():
         selected = make_plan([path])
         assert "delivery" in selected["scopes"] and {"quick-check","delivery"}.issubset(selected["required_jobs"])
         assert "delivery-charity" in selected["local_process_modes"]
+    for path in ("crates/protocol/src/lib.rs", "crates/protocol/src/delivery.rs", "crates/protocol/src/delivery/request.rs"):
+        selected = make_plan([path])
+        assert selected["scopes"] == ["delivery-acceptance", "protocol"]
+        assert selected["delivery"] and "delivery" in selected["required_jobs"]
+        assert selected["local_process_modes"] == list(dict(LOCAL_PROCESS_RULES))
+        assert selected["rust_packages"] == ["vibeface-protocol", "vibeface-bridge", "vibeface-client",
+                                             "vibeface-core", "vibeface-control", "vibeface"]
     bootstrap = make_plan(["config/public-bootstrap.json"])
     assert bootstrap["rust_packages"] == ["vibeface-core"] and bootstrap["web"]
     assert bootstrap["local_process_modes"] == ["auto-route", "default", "public-node", "mesh"]
@@ -595,7 +605,7 @@ def self_test():
         assert make_plan([path])["local_process_modes"] == modes, path
     combined = make_plan(["apps/core/src/store/bot_settings.rs", "apps/core/src/store/mailbox.rs", "apps/core/src/store/bot_settings.rs"])
     assert combined["local_process_modes"] == ["memory-sync", "default", "phase1", "chat-agent", "phase4", "phase5"]
-    for path in ("apps/core/src/store.rs", "apps/core/src/model.rs", "apps/core/new-module.rs", "apps/core/src/runtime/new-module.rs", "crates/protocol/src/lib.rs"):
+    for path in ("apps/core/src/store.rs", "apps/core/src/model.rs", "apps/core/new-module.rs", "apps/core/src/runtime/new-module.rs"):
         assert make_plan([path])["local_process_modes"] == ["memory-sync", "auto-route", "default", "phase1", "chat-agent", "phase4", "public-node", "mesh", "phase5"]
     assert make_plan(["Cargo.lock"])["local_process_modes"] == ["memory-sync", "auto-route", "default", "phase1", "chat-agent", "phase4", "public-node", "mesh", "phase5", "delivery-charity"]
     assert make_plan(["apps/core/src/delivery/charity.rs"])["local_process_modes"][-1] == "delivery-charity"
