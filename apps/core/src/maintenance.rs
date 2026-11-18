@@ -756,9 +756,7 @@ mod tests {
     };
     use anyhow::bail;
     use std::time::Duration;
-    use vibeface_control::maintenance::{
-        self as maintenance_client, MaintenanceCommand, MaintenanceStatus,
-    };
+    use vibeface_control::maintenance::{self as maintenance_client, MaintenanceCommand};
 
     #[tokio::test]
     async fn inspecting_a_stopped_node_does_not_create_or_restrict_its_endpoint_directory()
@@ -1012,9 +1010,8 @@ mod tests {
             )?;
             assert!(matches!(
                 maintenance_client::request(&socket_path(&dir)?, MaintenanceCommand::Commit)
-                    .await?
-                    .status,
-                MaintenanceStatus::Committed
+                    .await?,
+                maintenance_client::MaintenanceResponse::Committed(_)
             ));
             assert!(!dir.join("update-pending.json").exists());
             let work = node.maintenance.enter()?;
@@ -1065,9 +1062,8 @@ mod tests {
             )?;
             assert!(matches!(
                 maintenance_client::request(&socket_path(&dir)?, MaintenanceCommand::Commit)
-                    .await?
-                    .status,
-                MaintenanceStatus::Committed
+                    .await?,
+                maintenance_client::MaintenanceResponse::Committed(_)
             ));
             assert!(!dir.join("update-pending.json").exists());
             assert!(node.maintenance.enter().is_ok());

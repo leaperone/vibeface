@@ -1439,9 +1439,12 @@ async fn wallet_budget(dir: &Path, command: WalletBudgetAction) -> Result<()> {
     let socket = inspect_socket(dir).await?;
     let response =
         maintenance::request(&socket, MaintenanceCommand::DeliveryBudget(command)).await?;
-    let value = response
-        .delivery
-        .context("Node returned no protected budget result")?;
+    let MaintenanceResponse::Delivery {
+        delivery: value, ..
+    } = response
+    else {
+        bail!("Node returned no protected budget result");
+    };
     println!("{}", serde_json::to_string(&value)?);
     Ok(())
 }
