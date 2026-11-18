@@ -1,4 +1,6 @@
 use super::*;
+use chain::TxStatus;
+use store::transaction_phase_name;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -243,32 +245,30 @@ impl Delivery {
                 self.with_store(|store| store.find_transaction(&prior.transaction_id()))?
         {
             let observed = chain.observe(&transaction).await?;
-            self.with_store(|store| {
-                store.observe_transaction(
-                    &transaction.intent.id,
-                    &observed.phase,
-                    observed.block_number,
-                    observed.block_hash.as_deref(),
-                    observed.error.as_deref(),
-                )
-            })?;
-            self.finish_key_operation(&chain, &transaction.intent.id, &observed.phase)
+            self.with_store(|store| store.observe_transaction(&transaction.intent.id, &observed))?;
+            self.finish_key_operation(&chain, &transaction.intent.id, observed.status())
                 .await?;
         }
         let peer = parse_word(&self.identity.device_id()?)?;
         let registry = chain.current_key(peer).await?;
         let operation = self.reserve_key_operation(intent, action, gas_cap, &registry)?;
         if registry_matches(&operation.binding.binding, &registry)? {
-            self.apply_key_confirmation(operation.clone(), "confirmed", &registry)?;
+            self.apply_key_confirmation(operation.clone(), true, &registry)?;
             let transaction =
                 self.with_store(|store| store.find_transaction(&operation.transaction_id()))?;
             let mut result = key_result(
                 &operation,
                 "confirmed",
-                transaction.as_ref().and_then(|tx| tx.tx_hash.clone()),
+                transaction
+                    .as_ref()
+                    .and_then(|tx| tx.tx_hash().map(str::to_owned)),
                 true,
             );
-            result["transaction_phase"] = json!(transaction.map(|tx| tx.phase));
+            result["transaction_phase"] = json!(
+                transaction
+                    .as_ref()
+                    .map(|tx| transaction_phase_name(&tx.state))
+            );
             preproof.ok();
             return Ok(result);
         }
@@ -337,7 +337,7 @@ impl Delivery {
         transaction.ok();
         drop(transaction);
         let mut registry_after = proof::DiagnosticStage::new(diagnostics, "registry_after", "key");
-        self.finish_key_operation(&chain, &id, &observed.phase)
+        self.finish_key_operation(&chain, &id, observed.status())
             .await?;
         let registry = chain.current_key(peer).await?;
         let registered = registry_matches(&operation.binding.binding, &registry)?;
@@ -346,12 +346,12 @@ impl Delivery {
             if registered {
                 "confirmed"
             } else {
-                &observed.phase
+                transaction_phase_name(&observed.state)
             },
-            observed.tx_hash,
+            observed.tx_hash().map(str::to_owned),
             registered,
         );
-        result["transaction_phase"] = json!(observed.phase);
+        result["transaction_phase"] = json!(transaction_phase_name(&observed.state));
         registry_after.ok();
         Ok(result)
     }
@@ -359,7 +359,7 @@ impl Delivery {
         &self,
         chain: &chain::Chain,
         transaction: &str,
-        phase: &str,
+        status: Option<&TxStatus>,
     ) -> Result<()> {
         let Some(intent) = transaction
             .strip_prefix("key-")
@@ -375,7 +375,7 @@ impl Delivery {
             return Ok(());
         };
         let mut operation: KeyOperation = serde_json::from_slice(&bytes)?;
-        if !matches!(phase, "confirmed" | "reverted" | "conflicted" | "failed") {
+        if !status.is_some_and(TxStatus::is_terminal) {
             operation.completed = None;
             self.with_store(|store| store.put_value(&id, &serde_json::to_vec(&operation)?))?;
             return Ok(());
@@ -383,12 +383,16 @@ impl Delivery {
         let current = chain
             .current_key(operation.binding.binding.receiver_peer)
             .await?;
-        self.apply_key_confirmation(operation, phase, &current)
+        self.apply_key_confirmation(
+            operation,
+            matches!(status, Some(TxStatus::Confirmed(_))),
+            &current,
+        )
     }
     fn apply_key_confirmation(
         &self,
         mut operation: KeyOperation,
-        phase: &str,
+        transaction_confirmed: bool,
         current: &chain::KeyRecord,
     ) -> Result<()> {
         ensure!(
@@ -399,7 +403,7 @@ impl Delivery {
         let confirmed = registry_matches(&operation.binding.binding, current)?;
         operation.completed = Some(if confirmed {
             KeyCompletion::Confirmed
-        } else if phase == "confirmed" {
+        } else if transaction_confirmed {
             KeyCompletion::Superseded
         } else {
             KeyCompletion::Failed
@@ -607,12 +611,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(node.key_binding(Mode::Paid).unwrap(), old);
-        node.apply_key_confirmation(
-            rotate.clone(),
-            "confirmed",
-            &record(&rotate.binding.binding),
-        )
-        .unwrap();
+        node.apply_key_confirmation(rotate.clone(), true, &record(&rotate.binding.binding))
+            .unwrap();
         assert_eq!(node.key_binding(Mode::Paid).unwrap(), rotate.binding);
         let revoke = node
             .reserve_key_operation(
@@ -630,12 +630,8 @@ mod tests {
         assert_eq!(revoke.binding.binding.receiver_public, [0; 32]);
         revoke.binding.verify().unwrap();
         assert_eq!(node.key_binding(Mode::Paid).unwrap(), rotate.binding);
-        node.apply_key_confirmation(
-            revoke.clone(),
-            "confirmed",
-            &record(&revoke.binding.binding),
-        )
-        .unwrap();
+        node.apply_key_confirmation(revoke.clone(), true, &record(&revoke.binding.binding))
+            .unwrap();
         assert_eq!(
             node.key_binding(Mode::Paid).unwrap().binding.action,
             BindingAction::Revoked
@@ -702,7 +698,7 @@ mod tests {
             .unwrap();
         node.apply_key_confirmation(
             operation.clone(),
-            "reverted",
+            false,
             &record(&operation.binding.binding),
         )
         .unwrap();
@@ -731,14 +727,14 @@ mod tests {
                 &record(&old.binding),
             )
             .unwrap();
-        node.apply_key_confirmation(operation.clone(), "reverted", &record(&old.binding))
+        node.apply_key_confirmation(operation.clone(), false, &record(&old.binding))
             .unwrap();
         assert_eq!(node.key_binding(Mode::Paid).unwrap(), old);
         let pending = node.pending_key_operation().unwrap().unwrap();
         assert_eq!(pending.completed.unwrap().phase(), "failed");
         let mut foreign = record(&operation.binding.binding);
         foreign.serial += 1;
-        node.apply_key_confirmation(operation, "confirmed", &foreign)
+        node.apply_key_confirmation(operation, true, &foreign)
             .unwrap();
         assert_eq!(node.key_binding(Mode::Paid).unwrap(), old);
         assert_eq!(
