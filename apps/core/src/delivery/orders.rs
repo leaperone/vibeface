@@ -649,7 +649,8 @@ impl Delivery {
             draft
         } else {
             let announcement: Announcement = serde_json::from_value(
-                service::request(node, &request.provider_peer, &ServiceRequest::Announce).await?,
+                service::request(node, &request.provider_peer, &ServiceRequest::Announce {})
+                    .await?,
             )?;
             ensure!(
                 announcement.peer_id == request.provider_peer,
@@ -1219,6 +1220,12 @@ pub(super) fn view(
         updated_at_ms: crate::clock::now_ms(),
         error: None,
     })
+}
+
+fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
+    value[key]
+        .as_str()
+        .with_context(|| format!("{key} must be a string"))
 }
 
 #[cfg(test)]

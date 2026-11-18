@@ -900,24 +900,25 @@ async fn dispatch_inner(
             node.node_settings().await
         }
         ClientCommand::Delivery(params) => {
-            let params = params.into_value();
+            use crate::delivery::types::{ClientAccess, ClientRequest};
+
             let principal = principal(node, session).await?;
-            let read_only = matches!(
-                params["op"].as_str(),
-                Some("receipt" | "status" | "list" | "get" | "find_intent" | "read" | "providers")
-            );
+            let request: ClientRequest =
+                serde_json::from_value(params.into_value()).context("invalid delivery request")?;
+            let access = request.access();
             ensure!(
-                read_only || (principal.source == "membership" && principal.can_manage),
+                matches!(access, ClientAccess::Read)
+                    || (principal.source == "membership" && principal.can_manage),
                 "delivery writes and spending require a managing member of your personal network"
             );
-            if !read_only && params["op"] != "configure" {
+            if matches!(access, ClientAccess::Writable) {
                 ensure!(
                     node.write_status(&principal.network_id).await?["state"] == "writable",
                     "delivery writes wait until this Node is writable"
                 );
             }
             node.delivery
-                .client_request(node, &principal.network_id, &principal.device_id, params)
+                .client_request(node, &principal.network_id, &principal.device_id, request)
                 .await
         }
         ClientCommand::ConfigureNode(params) => {
@@ -3180,6 +3181,15 @@ mod tests {
         );
         assert!(!dir.join("delivery").exists());
         assert!(!dir.join("delivery-wallet.json").exists());
+        let budgets =
+            dispatch_wire_fixture(&node, &mut browser, "delivery", json!({"op":"budgets"})).await;
+        assert!(
+            budgets
+                .err()
+                .context("non-manager budget lookup succeeded")?
+                .to_string()
+                .contains("require a managing member")
+        );
         let change =
             json!({"op":"configure","enabled":true,"charity_enabled":true,"paid_enabled":false});
         assert!(
@@ -3221,6 +3231,28 @@ mod tests {
                 .is_err()
         );
         let mut manager = test_session(admin.device_id()?);
+        let mut malformed = change.clone();
+        malformed["unexpected"] = json!(true);
+        for request in [
+            malformed,
+            json!({"op":"status","unexpected":true}),
+            json!({"op":"confirm_batch","intent_ids":["one"]}),
+            json!({"op":"flush_budget","budget_id":"ab".repeat(32),"batch_id":"cd".repeat(32)}),
+        ] {
+            let result = dispatch_wire_fixture(&node, &mut manager, "delivery", request).await;
+            assert_eq!(
+                result
+                    .err()
+                    .context("invalid delivery command succeeded")?
+                    .to_string(),
+                "invalid delivery request"
+            );
+        }
+        assert_eq!(
+            dispatch_wire_fixture(&node, &mut manager, "delivery", json!({"op":"status"})).await?["enabled"],
+            false
+        );
+        assert!(!dir.join("delivery/service.sqlite3").exists());
         assert_eq!(
             dispatch_wire_fixture(&node, &mut manager, "delivery", change).await?["enabled"],
             true
