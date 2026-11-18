@@ -172,25 +172,38 @@ def enum_attribute(tokens, enum_index, key):
 
 def enum(tokens, name):
     for i in range(len(tokens) - 2):
-        if [t.value for t in tokens[i:i + 3]] == ["enum", name, "{"]:
-            rename = enum_attribute(tokens, i, "rename_all")
-            if rename != "snake_case":
-                raise ValueError(f"{name}: expected native snake_case enum serialization, found {rename!r}")
-            result = {}
-            for row in split(tokens[i + 3:close(tokens, i + 2)]):
-                j, tag = 0, None
-                while j < len(row) and row[j].value == "#":
-                    end = close(row, j + 1)
-                    attr = row[j:end + 1]
-                    for k in range(len(attr) - 2):
-                        if attr[k].value == "rename" and attr[k + 1].value == "=":
-                            tag = attr[k + 2].value
-                    j = end + 1
-                if j < len(row):
-                    variant = row[j].value
-                    result[variant] = {"tag": tag or snake(variant), "line": row[j].line,
-                                       "fields": fields(row[j + 1:])}
-            return result
+        if [t.value for t in tokens[i:i + 2]] != ["enum", name]:
+            continue
+        body = i + 2
+        if tokens[body].value == "<":
+            depth = 1
+            body += 1
+            while body < len(tokens) and depth:
+                token = tokens[body]
+                if token.kind == "code":
+                    depth += token.value == "<"
+                    depth -= token.value == ">"
+                body += 1
+        if body >= len(tokens) or tokens[body].value != "{":
+            raise ValueError(f"{name}: missing native enum body")
+        rename = enum_attribute(tokens, i, "rename_all")
+        if rename != "snake_case":
+            raise ValueError(f"{name}: expected native snake_case enum serialization, found {rename!r}")
+        result = {}
+        for row in split(tokens[body + 1:close(tokens, body)]):
+            j, tag = 0, None
+            while j < len(row) and row[j].value == "#":
+                end = close(row, j + 1)
+                attr = row[j:end + 1]
+                for k in range(len(attr) - 2):
+                    if attr[k].value == "rename" and attr[k + 1].value == "=":
+                        tag = attr[k + 2].value
+                j = end + 1
+            if j < len(row):
+                variant = row[j].value
+                result[variant] = {"tag": tag or snake(variant), "line": row[j].line,
+                                   "fields": fields(row[j + 1:])}
+        return result
     raise ValueError(f"missing native enum {name}")
 
 
@@ -517,12 +530,15 @@ def web_inventory(root):
 
 
 def check(root, binary=None):
-    api_path = "crates/client/src/api.rs"
-    protocol_path = "crates/protocol/src/workspace.rs"
-    api = lex((root / api_path).read_text())
-    protocol = lex((root / protocol_path).read_text())
-    native = {name: enum(api if name in ("ReadRequest", "Action", "DeliveryRead", "DeliveryAction") else protocol, name)
-              for name in ("ReadRequest", "Action", "DeliveryRead", "DeliveryAction", "WorkspaceCommand", "InputTarget", "InputControl")}
+    enum_sources = {}
+    for path, names in (
+        ("crates/client/src/api.rs", ("ReadRequest", "Action")),
+        ("crates/protocol/src/delivery.rs", ("DeliveryRead", "DeliveryAction")),
+        ("crates/protocol/src/workspace.rs", ("WorkspaceCommand", "InputTarget", "InputControl")),
+    ):
+        tokens = lex((root / path).read_text())
+        enum_sources.update({name: (path, tokens) for name in names})
+    native = {name: enum(tokens, name) for name, (_, tokens) in enum_sources.items()}
     source_catalog = source_capabilities(lex((root / "apps/cli/src/client_commands/catalog.rs").read_text()))
     source_catalog["local_lifecycle"] = lifecycle(lex((root / "apps/cli/src/client_commands.rs").read_text()))
     catalog = source_catalog
@@ -536,7 +552,7 @@ def check(root, binary=None):
     for name, kind in (("ReadRequest", "read"), ("Action", "write")):
         actual = {op["native_variant"]: op for op in operations if op.get("kind") == kind}
         for variant, description in native[name].items():
-            source = f"{api_path}:{description['line']}"
+            source = f"{enum_sources[name][0]}:{description['line']}"
             if variant not in actual:
                 errors.append(f"{source}: {name}::{variant} has no named CLI operation")
             elif actual[variant].get("tag") != description["tag"]:
@@ -544,15 +560,15 @@ def check(root, binary=None):
         for variant in actual.keys() - native[name].keys():
             errors.append(f"capabilities: unknown {name}::{variant}")
     for name in ("DeliveryRead", "DeliveryAction", "WorkspaceCommand", "InputTarget", "InputControl"):
-        expected_discriminator = discriminator(api if name.startswith("Delivery") else protocol, name)
+        path, tokens = enum_sources[name]
+        expected_discriminator = discriminator(tokens, name)
         if catalog.get("nested", {}).get(name, {}).get("tag") != expected_discriminator:
             errors.append(f"capabilities: {name} discriminator differs from native serde tag {expected_discriminator}")
         entries = catalog.get("nested", {}).get(name, {}).get("variants", [])
         actual = {entry["native_variant"]: entry for entry in entries}
         for variant, description in native[name].items():
-            source = api_path if name.startswith("Delivery") else protocol_path
             if variant not in actual or actual[variant].get("tag") != description["tag"]:
-                errors.append(f"{source}:{description['line']}: missing/mismatched CLI nested {name}::{variant}")
+                errors.append(f"{path}:{description['line']}: missing/mismatched CLI nested {name}::{variant}")
         for variant in actual.keys() - native[name].keys():
             errors.append(f"capabilities: unknown nested {name}::{variant}")
     for op in operations:
@@ -637,11 +653,11 @@ def self_test():
         api_source = '''#[serde(tag = "type", rename_all = "snake_case")]
           pub enum ReadRequest { Existing, }
           #[serde(tag = "type", rename_all = "snake_case")]
-          pub enum Action { Write, }
-          #[serde(tag = "op", rename_all = "snake_case")]
+          pub enum Action { Write, }'''
+        delivery_source = '''#[serde(tag = "op", rename_all = "snake_case")]
           pub enum DeliveryRead { Status, }
           #[serde(tag = "op", rename_all = "snake_case")]
-          pub enum DeliveryAction { Configure, }'''
+          pub enum DeliveryAction<Flush = DeliveryFlushIntent> { Configure, }'''
         protocol_source = '''#[serde(tag = "kind", rename_all = "snake_case")]
           pub enum WorkspaceCommand { CreateTask, }
           #[serde(tag = "kind", rename_all = "snake_case")]
@@ -660,6 +676,8 @@ def self_test():
             catalog_source += f'\nnested_catalog!(check, metadata, {native}, "{key}"; {native}::{variant} => "{variant}", "{tag}", "{{}}";);'
         api_file = root / "crates/client/src/api.rs"
         api_file.write_text(api_source)
+        delivery_file = root / "crates/protocol/src/delivery.rs"
+        delivery_file.write_text(delivery_source)
         protocol_file = root / "crates/protocol/src/workspace.rs"
         protocol_file.write_text(protocol_source)
         (root / "apps/cli/src/client_commands/catalog.rs").write_text(catalog_source)
@@ -759,6 +777,13 @@ notifier.request();'''
         changed = check(root)
         assert not changed["passed"] and any("ReadRequest::Added has no named CLI" in error for error in changed["errors"])
         api_file.write_text(api_source)
+        delivery_file.write_text(delivery_source.replace("Configure,", "Configure, Added,"))
+        changed = check(root)
+        assert not changed["passed"] and any(
+            error.startswith("crates/protocol/src/delivery.rs:4:")
+            and "DeliveryAction::Added" in error for error in changed["errors"]
+        )
+        delivery_file.write_text(delivery_source)
         protocol_file.write_text(protocol_source.replace("Task,", "Task, NewTarget,"))
         changed = check(root)
         assert not changed["passed"] and any("InputTarget::NewTarget" in error for error in changed["errors"])
