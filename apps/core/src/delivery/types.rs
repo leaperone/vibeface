@@ -307,7 +307,10 @@ impl ClientRequest {
         match self {
             Self::Read(DeliveryRead::Budgets) => ClientAccess::Writable,
             Self::Read(_) | Self::Receipt(_) => ClientAccess::Read,
-            Self::Write(DeliveryWireAction::Configure { .. }) => ClientAccess::Manage,
+            Self::Write(
+                DeliveryWireAction::Configure { .. }
+                | DeliveryWireAction::ConfigureSessionRelay { .. },
+            ) => ClientAccess::Manage,
             Self::Write(_) => ClientAccess::Writable,
         }
     }

@@ -673,6 +673,7 @@ impl Delivery {
         Ok(
             json!({"availability":self.availability(),"settings_path":self.data_dir.join("delivery-settings.json"),
             "enabled":config.enabled,"charity_enabled":config.charity_enabled,"paid_enabled":config.paid_enabled,
+            "session_relay_enabled":config.session_relay_enabled,"session_route":config.session_route,
             "node_peer":self.identity.device_id()?,"wallet":wallet,
             "max_file_bytes":MAX_FILE_BYTES,"receiver_key":key}),
         )
@@ -831,6 +832,34 @@ impl Delivery {
             "order": order.view,
         }))
     }
+
+    async fn authorize_session_route(
+        &self,
+        node: &Runtime,
+        network: &str,
+        route: &SessionEndpointRoute,
+    ) -> Result<()> {
+        route.validate()?;
+        let local = self.identity.device_id()?;
+        ensure!(
+            route.peer != local && route.relay != local,
+            "session route peers must be different from this Node"
+        );
+        let network = network.to_owned();
+        let peer = route.peer.clone();
+        let conversation = route.conversation_id.clone();
+        node.store
+            .call("delivery.session_route.authorize", move |store| {
+                store.authorize_node(&network, &peer)?;
+                ensure!(
+                    store.conversation(&network, &conversation)?.is_some(),
+                    "session route conversation does not exist in this personal network"
+                );
+                Ok(())
+            })
+            .await
+    }
+
     pub(crate) async fn client_request(
         &self,
         node: &Runtime,
@@ -878,6 +907,40 @@ impl Delivery {
                 config.enabled = enabled;
                 config.charity_enabled = charity_enabled;
                 config.paid_enabled = paid_enabled;
+                self.configure_local(config)?;
+                self.status()
+            }
+            ClientRequest::Write(DeliveryWireAction::ConfigureSessionRelay {
+                relay_enabled,
+                route,
+            }) => {
+                let mut config = self.config();
+                let route = route.map(|route| SessionEndpointRoute {
+                    conversation_id: route.conversation_id,
+                    peer: route.peer,
+                    relay: route.relay,
+                });
+                let route_changed =
+                    route.is_some() && config.session_route.as_ref() != route.as_ref();
+                ensure!(
+                    !(route_changed || relay_enabled && !config.session_relay_enabled)
+                        || (config.enabled && config.charity_enabled),
+                    "session relay requires delivery and charity to be enabled"
+                );
+                if route_changed {
+                    let route = route.as_ref().context("session route disappeared")?;
+                    self.authorize_session_route(node, network, route).await?;
+                    // Keep unrelated file settings from a concurrent delivery update.
+                    config = self.config();
+                    let route_changed = config.session_route.as_ref() != Some(route);
+                    ensure!(
+                        !(route_changed || relay_enabled && !config.session_relay_enabled)
+                            || (config.enabled && config.charity_enabled),
+                        "session relay requires delivery and charity to be enabled"
+                    );
+                }
+                config.session_relay_enabled = relay_enabled;
+                config.session_route = route;
                 self.configure_local(config)?;
                 self.status()
             }

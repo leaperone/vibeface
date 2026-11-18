@@ -3090,7 +3090,7 @@ test('new task creation uses the displayed default Bot after the catalog loads a
 
 test('the required paid transfer budget stays empty until a real budget is selected', () => {
   const budget = { budget_id: 'budget-1', payer: 'wallet', payee: 'payee', provider_peer: 'provider', asset: 'asset', deposit: '10', free: '10', locked: '0', earned: '0', withdrawn: '0', refunded: '0', state: 'open', gas_cap: '1', ready_windows: [] } satisfies DeliveryBudget
-  const delivery = { status: { enabled: true, charity_enabled: true, paid_enabled: true, node_peer: 'sender', wallet: { state: 'unlocked', address: 'wallet' }, max_file_bytes: 1024, receiver_key: null }, budgets: [budget], orders: [], providers: [], selected: null, busy: null, canManage: true }
+  const delivery = { status: { enabled: true, charity_enabled: true, paid_enabled: true, node_peer: 'sender', wallet: { state: 'unlocked', address: 'wallet' }, max_file_bytes: 1024, receiver_key: null, session_relay_enabled: false, session_route: null }, budgets: [budget], orders: [], providers: [], selected: null, busy: null, canManage: true }
   const app = componentHarness('../lab/transfers.tsx', {
     '@vibeface/client/delivery/client.ts': { useDelivery: () => delivery },
     '@vibeface/client/delivery/model.ts': deliveryModel,
@@ -3114,9 +3114,62 @@ test('the required paid transfer budget stays empty until a real budget is selec
   } finally { app.close() }
 })
 
+test('session relay requires an explicit route and can turn it off without changing the relay role', async () => {
+  const local = '11'.repeat(32), peer = '22'.repeat(32), relay = '33'.repeat(32)
+  const route = { conversation_id: 'bot-chat', peer, relay }
+  let status: { enabled: boolean; charity_enabled: boolean; node_peer: string; session_relay_enabled: boolean; session_route: typeof route | null }
+    = { enabled: true, charity_enabled: true, node_peer: local, session_relay_enabled: false, session_route: null }
+  const changes: { route: typeof route | null; relay_enabled: boolean }[] = []
+  const delivery = {
+    busy: null, canManage: true,
+    async configureSessionRelay(settings: typeof changes[number]) {
+      changes.push(settings)
+      status = { ...status, session_route: settings.route, session_relay_enabled: settings.relay_enabled }
+      return true
+    },
+  }
+  const app = componentHarness('../lab/lab.tsx', {
+    '@vibeface/client/delivery/model.ts': deliveryModel,
+    '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({ bots: [{ conversation_id: 'bot-chat', name: '测试 Bot' }] }) },
+    '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: { members: [
+      { kind: 'node', device_id: local, name: '本机' }, { kind: 'node', device_id: peer, name: '对端' },
+    ] } }) },
+  }, {}, 'SessionRelaySettings')
+  const render = () => app.render('SessionRelaySettings', { status, delivery, showError: false, onAction: () => {} })
+  const button = (label: string) => render().find(({ type, props }) => type === 'Button' && componentText(props.children) === label)?.props
+  const field = (id: string) => render().find(({ props }) => props.id === id)?.props
+  try {
+    assert.equal(render().some(({ type }) => type === 'form'), false)
+    assert.deepEqual(changes, [])
+    button('配置线路')?.onClick?.()
+    assert.equal(button('启用线路')?.disabled, true)
+    const chooseConversation = field('session-relay-conversation')?.onValueChange
+    const choosePeer = field('session-relay-peer')?.onValueChange
+    assert.equal(typeof chooseConversation, 'function')
+    assert.equal(typeof choosePeer, 'function')
+    if (typeof chooseConversation !== 'function' || typeof choosePeer !== 'function') assert.fail('missing route selectors')
+    chooseConversation('arc:bot-chat')
+    choosePeer('arc:' + peer)
+    field('session-relay-provider')?.onChange?.({ target: { value: peer } })
+    assert.equal(button('启用线路')?.disabled, true)
+    field('session-relay-provider')?.onChange?.({ target: { value: relay } })
+    assert.equal(button('启用线路')?.disabled, false)
+    render().find(({ type }) => type === 'form')?.props.onSubmit?.({ preventDefault() {} })
+    await settleComponent()
+    assert.deepEqual(JSON.parse(JSON.stringify(changes)), [{ route, relay_enabled: false }])
+    assert.equal(render().some(({ type }) => type === 'form'), false)
+
+    status = { ...status, enabled: false, session_relay_enabled: true }
+    assert.equal(button('关闭线路')?.disabled, false)
+    button('关闭线路')?.onClick?.()
+    await settleComponent()
+    assert.deepEqual(JSON.parse(JSON.stringify(changes[1])), { route: null, relay_enabled: true })
+  } finally { app.close() }
+})
+
 test('delivery reconnect fences old action feedback and releases only the new action when it finishes', async () => {
   const peer = '11'.repeat(32)
-  const status = { enabled: true, charity_enabled: true, paid_enabled: false, node_peer: peer, wallet: { state: 'absent', address: null }, max_file_bytes: 130816, receiver_key: null }
+  const status = { enabled: true, charity_enabled: true, paid_enabled: false, node_peer: peer, wallet: { state: 'absent', address: null }, max_file_bytes: 130816, receiver_key: null, session_relay_enabled: false, session_route: null }
   const app = componentHarness('../lab/lab.tsx', {
     '@/lib/platform': { webPlatform: { storage: { getItem: () => null, setItem() {} }, onForeground: () => () => {}, foreground: () => false } },
   }, { setInterval: () => 1, clearInterval() {} }, 'ConnectedLab', { '@vibeface/client/delivery/client.ts': '../../../../../packages/client/src/delivery/client.ts' })
@@ -3180,7 +3233,7 @@ for (const mobile of [false, true]) for (const settlement of ['current', 'new-fi
   const prepared = pendingResult()
   const calls: string[] = []
   const delivery = {
-    status: { enabled: true, charity_enabled: true, paid_enabled: false, node_peer: 'sender', wallet: { state: 'absent', address: null }, max_file_bytes: 1024, receiver_key: null },
+    status: { enabled: true, charity_enabled: true, paid_enabled: false, node_peer: 'sender', wallet: { state: 'absent', address: null }, max_file_bytes: 1024, receiver_key: null, session_relay_enabled: false, session_route: null },
     orders: [], budgets: [], providers: [], selected: null, busy: null, canManage: true,
     prepare(_draft: unknown, file: { name: string }) { calls.push(file.name); return prepared.promise },
   }

@@ -3282,8 +3282,48 @@ mod tests {
             &state.project()?,
             Member::client(&member, "member", false)?,
         )?)?;
+        let peer = LocalIdentity::generate();
+        let relay = LocalIdentity::generate();
+        state.append(GovernanceEvent::grant(
+            &admin,
+            &state.project()?,
+            Member::node(&peer, "peer")?,
+        )?)?;
         let network = state.genesis.network_id.clone();
         node.install_membership(state.clone()).await?;
+        let route_network = network.clone();
+        let identity = node.identity.clone();
+        let scheduler = identity.device_id()?;
+        let owner_body = admin.attest(
+            &network,
+            "relay-conversation",
+            crate::model::EventBody::ConversationOwner {
+                scheduler_node: scheduler.clone(),
+                epoch: 1,
+                attestation: None,
+                cause: None,
+            },
+        )?;
+        let owner = crate::model::FirstOwner {
+            scheduler_node: scheduler,
+            attestation: owner_body
+                .attestation()
+                .cloned()
+                .context("missing signed owner")?,
+        };
+        node.store
+            .call("session_relay.config_fixture", move |store| {
+                store.create_conversation(
+                    &identity,
+                    &route_network,
+                    "relay-conversation",
+                    "Relay",
+                    owner,
+                    1,
+                )?;
+                Ok(())
+            })
+            .await?;
         let mut browser = test_session(member.device_id()?);
         assert_eq!(
             dispatch_wire_fixture(&node, &mut browser, "delivery", json!({"op":"status"})).await?["enabled"],
@@ -3367,6 +3407,53 @@ mod tests {
             dispatch_wire_fixture(&node, &mut manager, "delivery", change).await?["enabled"],
             true
         );
+        let settings = json!({
+            "op":"configure_session_relay",
+            "relay_enabled":true,
+            "route":{"conversation_id":"relay-conversation","peer":peer.device_id()?,"relay":relay.device_id()?}
+        });
+        assert!(
+            dispatch_wire_fixture(&node, &mut browser, "delivery", settings.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            dispatch_wire_fixture(&node, &mut local_session, "delivery", settings.clone())
+                .await
+                .is_err()
+        );
+        let mut unauthorized = settings.clone();
+        unauthorized["route"]["peer"] = json!(LocalIdentity::generate().device_id()?);
+        assert!(
+            dispatch_wire_fixture(&node, &mut manager, "delivery", unauthorized)
+                .await
+                .is_err()
+        );
+        let result =
+            dispatch_wire_fixture(&node, &mut manager, "delivery", settings.clone()).await?;
+        assert_eq!(result["session_route"], settings["route"]);
+        assert_eq!(result["session_relay_enabled"], true);
+        assert_eq!(result["paid_enabled"], false);
+
+        let result = dispatch_wire_fixture(
+            &node,
+            &mut manager,
+            "delivery",
+            json!({"op":"configure","enabled":false,"charity_enabled":true,"paid_enabled":false}),
+        )
+        .await?;
+        assert_eq!(result["session_route"], settings["route"]);
+        assert_eq!(result["session_relay_enabled"], true);
+        let cleared = dispatch_wire_fixture(
+            &node,
+            &mut manager,
+            "delivery",
+            json!({"op":"configure_session_relay","relay_enabled":true,"route":null}),
+        )
+        .await?;
+        assert!(cleared["session_route"].is_null());
+        assert_eq!(cleared["session_relay_enabled"], true);
+        assert_eq!(cleared["enabled"], false);
         assert!(!dir.join("delivery-wallet.json").exists());
         assert!(
             dispatch_wire_fixture(

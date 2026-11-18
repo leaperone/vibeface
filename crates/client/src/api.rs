@@ -18,7 +18,7 @@ use tokio::sync::{Semaphore, broadcast, watch};
 use vibeface_protocol::amount::Amount;
 pub use vibeface_protocol::delivery::{
     DeliveryAcceptance, DeliveryAction, DeliveryBudgetFlush, DeliveryFlushIntent, DeliveryMode,
-    DeliveryPrepare, DeliveryRead, DeliveryWireAction,
+    DeliveryPrepare, DeliveryRead, DeliveryWireAction, SessionEndpointRoute,
 };
 
 // Serde's internally tagged unit decoder ignores map entries even with deny_unknown_fields.
@@ -2382,6 +2382,14 @@ impl Client {
                     } => {
                         json!({"op":"configure","enabled":enabled,"charity_enabled":charity_enabled,"paid_enabled":paid_enabled})
                     }
+                    DeliveryAction::ConfigureSessionRelay {
+                        relay_enabled,
+                        route,
+                    } => json!({
+                        "op":"configure_session_relay",
+                        "relay_enabled":relay_enabled,
+                        "route":route,
+                    }),
                     DeliveryAction::Prepare(prepare) => {
                         validate_new_delivery_prepare(&prepare)?;
                         id = format!("prepare-{}", prepare.intent_id);
@@ -2445,7 +2453,13 @@ impl Client {
                 };
                 if !matches!(
                     params["op"].as_str(),
-                    Some("configure" | "confirm_batch" | "accept_batch" | "flush_budget")
+                    Some(
+                        "configure"
+                            | "configure_session_relay"
+                            | "confirm_batch"
+                            | "accept_batch"
+                            | "flush_budget"
+                    )
                 ) {
                     reconciliation = Reconciliation::Delivery {
                         intent_id: params["intent_id"].as_str().map(str::to_owned),

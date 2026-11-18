@@ -10,7 +10,7 @@ export const fingerprint = '378d14d7b0568e3cfd0ef72df668721feb7e49e383852086bdc8
 export const intentKey = `vibeface.delivery.network.client.${source}.intent.${fingerprint}`
 export const file = { name: 'client18.txt', size: content.length, arrayBuffer: async () => content.slice().buffer }
 export const draft: DeliveryDraft = { receiver_peer: receiver, provider_peer: provider, mode: 'charity', acceptance: 'recoverable', max_service_amount: '0', max_gas_amount: '0', budget_id: null }
-export const status: DeliveryStatus = { enabled: true, charity_enabled: true, paid_enabled: false, node_peer: source, wallet: { state: 'absent', address: null }, max_file_bytes: 130816, receiver_key: null }
+export const status: DeliveryStatus = { enabled: true, charity_enabled: true, paid_enabled: false, node_peer: source, wallet: { state: 'absent', address: null }, max_file_bytes: 130816, receiver_key: null, session_relay_enabled: false, session_route: null }
 export const responseLost = 'controlled response lost; no Core or network invoked'
 export function connection(request: ReadyConnection['request'], network = 'network'): ReadyConnection {
   return { generation: 1, entry: { kind: 'gateway', address: 'http://127.0.0.1:4790', device_id: source }, principal: { source: 'membership', can_manage: true, network_id: network, device_id: 'client', epoch: 1 }, info: { device_id: source, name: 'own Node', version: 'test', initialized: true, network_id: network }, request, rpc: async () => { throw new Error('private RPC forbidden') }, subscribe: () => () => {}, isCurrent: () => true }

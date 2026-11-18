@@ -1,7 +1,7 @@
 import { base64ToBytes, bytesToBase64, sha256Hex } from '../lib/byte-codec.ts'
 import { formatByteSize as sizeLabel } from '../lib/byte-size.ts'
 import { array, boolean, record, text, type Member } from '../lib/node.ts'
-import type { DeliveryBudget, DeliveryDeadlines, DeliveryDraft, DeliveryEvidence, DeliveryMode, DeliveryOrder, DeliveryPayment, DeliveryPhase, DeliveryProvider, DeliveryStatus, PendingIntent, PaymentState, ReceivedFile } from './types.ts'
+import type { DeliveryBudget, DeliveryDeadlines, DeliveryDraft, DeliveryEvidence, DeliveryMode, DeliveryOrder, DeliveryPayment, DeliveryPhase, DeliveryProvider, DeliveryStatus, PendingIntent, PaymentState, ReceivedFile, SessionRelayRoute } from './types.ts'
 
 const maxAmount = (1n << 256n) - 1n
 const protocolMaxBytes = 16 * 65_536
@@ -36,6 +36,14 @@ export function intentId(value: unknown): string {
   if (typeof value !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value)) throw new Error('付款编号无效。')
   return value
 }
+export function parseSessionRoute(value: unknown): SessionRelayRoute {
+  const route = record(value)
+  const conversation_id = text(route.conversation_id)
+  if (!/^[A-Za-z0-9_.-]{1,128}$/.test(conversation_id)) throw new Error('会话标识无效。')
+  const other = peer(route.peer), relay = peer(route.relay)
+  if (other === relay) throw new Error('对端电脑和转发电脑必须不同。')
+  return { conversation_id, peer: other, relay }
+}
 export function parseStatus(value: unknown): DeliveryStatus {
   const v = record(value), wallet = record(v.wallet)
   const state = member(wallet.state, ['absent', 'locked', 'unlocked', 'unavailable'])
@@ -43,6 +51,8 @@ export function parseStatus(value: unknown): DeliveryStatus {
   if ((state === 'absent' || state === 'unavailable') && wallet.address !== null) throw new Error('未创建或不可用的钱包不能带地址。')
   return {
     enabled: boolean(v.enabled), charity_enabled: boolean(v.charity_enabled), paid_enabled: boolean(v.paid_enabled),
+    session_relay_enabled: boolean(v.session_relay_enabled),
+    session_route: nullable(v.session_route, parseSessionRoute),
     node_peer: peer(v.node_peer), wallet: state === 'absent' ? { state, address: null } : state === 'unavailable' ? { state, address: null, reason: text(wallet.reason) } : { state, address: address(wallet.address) },
     max_file_bytes: integer(v.max_file_bytes, protocolMaxBytes),
     receiver_key: receiving ? { key_id: peer(receiving.key_id), serial: integer(receiving.serial), public_key: peer(receiving.public_key) } : null,

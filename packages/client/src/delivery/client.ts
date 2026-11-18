@@ -4,8 +4,8 @@ import { messageOf, record, same } from '../lib/node.ts'
 import type { KeyValue, Platform } from '../lib/platform.ts'
 import { bytesToBase64, sha256Hex } from '../lib/byte-codec.ts'
 import { createActionOwner } from '../lib/action-owner.ts'
-import { amount, canRead, canRestart, checkedFile, fileName, intentId, needsRefresh, orderActions, parseBudgets, parseOrder, parseOrders, parsePending, parseProviders, parseReceived, parseStatus, peer } from './model.ts'
-import type { DeliveryBudget, DeliveryDraft, DeliveryOrder, DeliveryProvider, DeliverySettings, DeliveryStatus, PendingIntent, ReserveDeliveryIntent, TransferFile } from './types.ts'
+import { amount, canRead, canRestart, checkedFile, fileName, intentId, needsRefresh, orderActions, parseBudgets, parseOrder, parseOrders, parsePending, parseProviders, parseReceived, parseSessionRoute, parseStatus, peer } from './model.ts'
+import type { DeliveryBudget, DeliveryDraft, DeliveryOrder, DeliveryProvider, DeliverySettings, DeliveryStatus, PendingIntent, ReserveDeliveryIntent, SessionRelaySettings, TransferFile } from './types.ts'
 
 function authorization(order: DeliveryOrder) {
   const p = order.payment
@@ -65,6 +65,13 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
     async flushBudget(budgetId: string) { manage(); const result = record(await request('flush_budget', { budget_id: peer(budgetId) })); if (result.queued !== true) throw new Error('批次尚未获确认，请刷新预算状态。') },
     providers: async () => parseProviders(await request('providers')),
     async configure(settings: DeliverySettings) { manage(); return parseStatus(await request('configure', settings)) },
+    async configureSessionRelay(settings: SessionRelaySettings) {
+      manage()
+      const route = settings.route === null ? null : parseSessionRoute(settings.route)
+      const result = parseStatus(await request('configure_session_relay', { relay_enabled: settings.relay_enabled, route }))
+      if (result.node_peer !== connection.entry.device_id) throw new Error('会话转发设置不属于当前连接的设备。')
+      return result
+    },
     async prepare(draft: DeliveryDraft, file: TransferFile, status: DeliveryStatus, restartIntentId?: string) {
       manage()
       const terms = { ...draft }, size = file.size, selectedName = file.name, nodePeer = status.node_peer
@@ -232,6 +239,10 @@ export function useDelivery(connection: ReadyConnection, platform: Platform) {
     select: setSelectedId,
     refresh: () => run('refresh', refresh),
     configure: (settings: DeliverySettings) => run('configure', async current => { const result = await client.configure(settings); if (current()) { sequence.current += 1; setStatus(result) } }),
+    configureSessionRelay: (settings: SessionRelaySettings) => run('configureSessionRelay', async current => {
+      const result = await client.configureSessionRelay(settings)
+      if (current()) { sequence.current += 1; setStatus(result) }
+    }),
     prepare: (draft: DeliveryDraft, file: TransferFile, restartIntentId?: string) => runOrder('prepare', () => {
       if (!status) throw new Error('请先读取设备状态。')
       return client.prepare(draft, file, status, restartIntentId)

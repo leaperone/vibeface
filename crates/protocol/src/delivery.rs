@@ -61,6 +61,36 @@ pub struct DeliveryPrepare {
     pub budget_id: Option<String>,
 }
 
+/// A personal encrypted-session endpoint route.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEndpointRoute {
+    pub conversation_id: String,
+    pub peer: String,
+    pub relay: String,
+}
+
+impl SessionEndpointRoute {
+    pub fn validate(&self) -> Result<(), String> {
+        super::validate_id(&self.conversation_id)?;
+        for (label, value) in [("peer", &self.peer), ("relay", &self.relay)] {
+            if value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(format!(
+                    "session {label} must be a lowercase 64-character hexadecimal Node ID"
+                ));
+            }
+        }
+        if self.peer == self.relay {
+            return Err("session recipient and relay must be different Nodes".into());
+        }
+        Ok(())
+    }
+}
+
 /// The SDK records this intent to reconcile the original batch across retries.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,6 +116,10 @@ pub enum DeliveryAction<Flush = DeliveryFlushIntent> {
         charity_enabled: bool,
         paid_enabled: bool,
     },
+    ConfigureSessionRelay {
+        relay_enabled: bool,
+        route: Option<SessionEndpointRoute>,
+    },
     Prepare(DeliveryPrepare),
     Confirm {
         intent_id: String,
@@ -103,4 +137,44 @@ pub enum DeliveryAction<Flush = DeliveryFlushIntent> {
         order_ids: [String; 2],
     },
     FlushBudget(Flush),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn session_relay_configuration_has_a_strict_wire_shape() {
+        let route = SessionEndpointRoute {
+            conversation_id: "conversation".into(),
+            peer: "a".repeat(64),
+            relay: "b".repeat(64),
+        };
+        let action: DeliveryAction = DeliveryAction::ConfigureSessionRelay {
+            relay_enabled: true,
+            route: Some(route.clone()),
+        };
+        assert_eq!(
+            serde_json::to_value(action).unwrap(),
+            json!({
+                "op": "configure_session_relay",
+                "relay_enabled": true,
+                "route": {
+                    "conversation_id": "conversation",
+                    "peer": "a".repeat(64),
+                    "relay": "b".repeat(64)
+                }
+            })
+        );
+        assert!(route.validate().is_ok());
+        assert!(
+            SessionEndpointRoute {
+                peer: "A".repeat(64),
+                ..route
+            }
+            .validate()
+            .is_err()
+        );
+    }
 }
