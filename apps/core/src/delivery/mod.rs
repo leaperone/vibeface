@@ -4,6 +4,8 @@ mod charity;
 mod keys;
 mod orders;
 pub mod session;
+mod session_relay;
+mod session_relay_store;
 pub use keys::KeyAction;
 pub mod proof;
 mod provider;
@@ -37,6 +39,7 @@ use zeroize::Zeroizing;
 pub struct DeliveryConfig {
     pub enabled: bool,
     pub charity_enabled: bool,
+    pub session_relay_enabled: bool,
     pub paid_enabled: bool,
     pub storage_limit_bytes: u64,
     pub max_orders: u32,
@@ -53,6 +56,7 @@ impl Default for DeliveryConfig {
         Self {
             enabled: false,
             charity_enabled: true,
+            session_relay_enabled: false,
             paid_enabled: false,
             storage_limit_bytes: 64 * 1024 * 1024,
             max_orders: 128,
@@ -193,6 +197,7 @@ pub struct Delivery {
     peer_slots: Mutex<HashMap<String, Weak<tokio::sync::Semaphore>>>,
     operations: tokio::sync::Mutex<()>,
     provider_operations: tokio::sync::Mutex<()>,
+    session_relay_operations: tokio::sync::Mutex<()>,
     publication_operations: tokio::sync::Mutex<()>,
     runtime: std::sync::OnceLock<Weak<Runtime>>,
     wakeup: Arc<tokio::sync::Notify>,
@@ -227,6 +232,7 @@ impl Delivery {
             peer_slots: Mutex::new(HashMap::new()),
             operations: tokio::sync::Mutex::new(()),
             provider_operations: tokio::sync::Mutex::new(()),
+            session_relay_operations: tokio::sync::Mutex::new(()),
             publication_operations: tokio::sync::Mutex::new(()),
             runtime: std::sync::OnceLock::new(),
             wakeup: Arc::new(tokio::sync::Notify::new()),
@@ -361,6 +367,7 @@ impl Delivery {
             return Ok(());
         };
         let _maintenance = node.maintenance.enter()?;
+        self.purge_session_relay().await?;
         if self.data_dir.join("delivery/service.sqlite3").exists() {
             let config = self.config();
             self.with_store(|store| {

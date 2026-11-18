@@ -1,7 +1,7 @@
 //! Node-side boundary for relaying original signed Bot session events.
 
 pub(crate) use super::charity::CharityKey;
-use super::{Delivery, types::Mode};
+use super::{Delivery, session_relay_store::RELAY_CHUNK_BYTES, types::Mode};
 use crate::{
     crypto::{LocalIdentity, check_event, verify_event_signature},
     model::{Event, EventBody, IngestStatus, SignedEvent},
@@ -14,13 +14,13 @@ use rand::{RngCore, rngs::OsRng};
 use rusqlite::{OptionalExtension, params};
 use std::path::{Path, PathBuf};
 use vibeface_delivery::{
-    CAPSULE_BYTES, EncryptedSessionObject, MAX_SESSION_CHUNK_BYTES, MAX_SESSION_OBJECT_BYTES,
-    PeerSignature, Secret32, SessionObjectKind, Word, decrypt_session_payload,
-    encrypt_session_payload, hash, open_session_key, seal_session_key,
+    CAPSULE_BYTES, EncryptedSessionObject, MAX_SESSION_OBJECT_BYTES, PeerSignature, Secret32,
+    SessionObjectKind, Word, decrypt_session_payload, encrypt_session_payload, hash,
+    open_session_key, seal_session_key,
 };
 use zeroize::Zeroizing;
 
-const SIGNING_DOMAIN: &str = "bot-session-object";
+pub(super) const SIGNING_DOMAIN: &str = "bot-session-object";
 const RECEIPT_DOMAIN: &str = "bot-session-event-stored";
 const AEAD_DOMAIN: &[u8] = b"vibeface:bot-session-event:v1";
 
@@ -141,7 +141,7 @@ fn checked_event(network: &str, signed: &SignedEvent) -> Result<Event> {
     Ok(event)
 }
 
-fn verify_object(object: &EncryptedSessionObject) -> Result<()> {
+pub(super) fn verify_object(object: &EncryptedSessionObject) -> Result<()> {
     ensure!(
         object.ciphertext.len() > 64 + 12 + vibeface_delivery::SESSION_AEAD_TAG_BYTES,
         "session ciphertext is missing its key commitment or sealed body"
@@ -149,7 +149,7 @@ fn verify_object(object: &EncryptedSessionObject) -> Result<()> {
     Ok(object.verify_signature(
         &object.header.sender_peer,
         SIGNING_DOMAIN,
-        MAX_SESSION_CHUNK_BYTES,
+        RELAY_CHUNK_BYTES,
     )?)
 }
 
@@ -270,14 +270,11 @@ pub(crate) fn seal_event(
         validity.start,
         validity.end,
         ciphertext,
-        MAX_SESSION_CHUNK_BYTES,
+        RELAY_CHUNK_BYTES,
     )?;
     let mut signature = [0; 64];
     hex::decode_to_slice(
-        sender.sign_payload(
-            SIGNING_DOMAIN,
-            &object.signing_bytes(MAX_SESSION_CHUNK_BYTES)?,
-        )?,
+        sender.sign_payload(SIGNING_DOMAIN, &object.signing_bytes(RELAY_CHUNK_BYTES)?)?,
         &mut signature,
     )?;
     Ok((
@@ -297,12 +294,19 @@ pub struct SessionStoredReceipt {
 impl SessionStoredReceipt {
     pub fn verify(&self, object: &EncryptedSessionObject) -> Result<()> {
         verify_object(object)?;
+        self.verify_header(&object.header)
+    }
+
+    pub(super) fn verify_header(
+        &self,
+        header: &vibeface_delivery::SessionObjectHeader,
+    ) -> Result<()> {
         ensure!(
-            object.header.object_id == self.object_id,
+            header.object_id == self.object_id,
             "receipt identifies another session object"
         );
         crate::crypto::verify_payload(
-            &hex::encode(object.header.receiver_peer),
+            &hex::encode(header.receiver_peer),
             RECEIPT_DOMAIN,
             &self.object_id,
             &self.signature,

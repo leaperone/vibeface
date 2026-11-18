@@ -319,6 +319,9 @@ pub(super) enum ServiceRequest {
     Charity {
         request: CharityRequest,
     },
+    SessionRelay {
+        request: super::session_relay::SessionRelayRequest,
+    },
     Announce {},
     KeyBinding {
         mode: Mode,

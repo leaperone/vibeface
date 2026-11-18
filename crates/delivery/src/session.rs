@@ -346,9 +346,8 @@ impl EncryptedSessionObject {
 
     pub fn signing_bytes(&self, chunk_bytes: usize) -> Result<Vec<u8>> {
         self.validate(chunk_bytes)?;
-        let mut bytes = self.header.signing_bytes()?;
-        bytes.extend_from_slice(&self.ciphertext);
-        Ok(bytes)
+        // The signed payload hash authenticates ciphertext before the relay receives any chunks.
+        self.header.signing_bytes()
     }
 
     pub fn signing_digest(&self, chunk_bytes: usize) -> Result<Word> {
