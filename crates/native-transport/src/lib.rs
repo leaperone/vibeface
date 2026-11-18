@@ -477,7 +477,7 @@ mod tests {
             let phone = secure::Identity::generate().unwrap();
             let unreachable = lan_connect(
                 phone.device_id().as_str(),
-                &[address.clone()],
+                std::slice::from_ref(&address),
                 Duration::from_secs(2),
             )
             .await;
