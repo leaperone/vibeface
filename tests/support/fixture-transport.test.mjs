@@ -4,6 +4,11 @@ import { once } from 'node:events';
 import { test } from 'node:test';
 import { createFixtureTransport, FixtureOperationError } from './fixture-transport.ts';
 
+import { context, inspection, readyDetails } from './fixture-samples.mjs';
+
+const details = readyDetails('delivery');
+const options = { ...context, kind: 'delivery', surface: 'native' };
+
 // IPC keeps tests in control of response order independently of fixture stdin/stdout.
 const fakeFixture = String.raw`
 const fs = require('node:fs');
@@ -25,12 +30,12 @@ process.on('message', ({ op, value }) => {
 });
 `;
 
-function fixture(t, setup = 'reply({ ready: { fixture: true } });', options = {}) {
-  const child = spawn(process.execPath, ['--eval', fakeFixture + setup], { stdio: ['pipe', 'pipe', 'inherit', 'ipc'] });
+function fixture(t, setup = 'reply({ ready: details });', overrides = {}) {
+  const child = spawn(process.execPath, ['--eval', fakeFixture + 'const details = ' + JSON.stringify(details) + '; const inspection = ' + JSON.stringify(inspection) + ';' + setup], { stdio: ['pipe', 'pipe', 'inherit', 'ipc'] });
   const transport = createFixtureTransport(child, {
     requestTimeoutMs: 4000,
     shutdownTimeoutsMs: [1000, 1000, 1000],
-    ...options,
+    ...options, ...overrides,
   });
   let status;
   const closed = new Promise(resolve => child.once('close', (code, signal) => {
@@ -56,10 +61,10 @@ const nextMessage = child => once(child, 'message').then(([message]) => message)
 
 test('startup has its own envelope and matched operation errors keep the connection usable', async t => {
   const { transport, child } = fixture(t);
-  assert.deepEqual(await transport.ready, { fixture: true });
+  assert.deepEqual(await transport.ready, details);
   const circular = {};
   circular.loop = circular;
-  await assert.rejects(transport.call(circular), /circular/);
+  await assert.rejects(transport.call(circular), /Unknown fixture operation/);
 
   const first = nextMessage(child);
   const rejected = assert.rejects(transport.call(inspect), error =>
@@ -74,9 +79,22 @@ test('startup has its own envelope and matched operation errors keep the connect
   const second = nextMessage(child);
   const result = transport.call(inspect);
   assert.deepEqual(await second, { id: 2, request: inspect });
-  child.send({ op: 'reply', value: { id: 2, ok: true, result: { completed: true } } });
-  assert.deepEqual(await result, { completed: true });
+  child.send({ op: 'reply', value: { id: 2, ok: true, result: inspection } });
+  assert.deepEqual(await result, inspection);
   assert.deepEqual(await transport.stop(), { code: 0, signal: null });
+});
+
+test('typed result validation fences a malformed response before rearming the waiter', async t => {
+  const { transport, child } = fixture(t);
+  await transport.ready;
+  const first = nextMessage(child);
+  const rejected = transport.call({ op: 'inspect' }).then(() => assert.fail('Expected malformed result'), error => error);
+  assert.deepEqual(await first, { id: 1, request: inspect });
+  child.send({ op: 'reply', value: { id: 1, ok: true, result: { wallet_files: 0 } } });
+  const reason = await rejected;
+  assert.match(reason.message, /invalid operation result/);
+  await assert.rejects(transport.call({ op: 'inspect' }), error => error === reason);
+  await transport.stop();
 });
 
 test('timeout fences late responses and all later operations before writing', async t => {
@@ -104,9 +122,9 @@ for (const [name, wrongId] of [['unknown', 19], ['duplicate', 1]]) {
     const first = nextMessage(child);
     const finished = transport.call(inspect);
     await first;
-    const result = { id: 1, ok: true, result: {} };
+    const result = { id: 1, ok: true, result: inspection };
     child.send({ op: 'reply', value: result });
-    assert.deepEqual(await finished, {});
+    assert.deepEqual(await finished, inspection);
 
     const second = nextMessage(child);
     const rejected = failure(transport.call(inspect), /ID does not match.*outcome is unknown/);
@@ -144,7 +162,7 @@ test('startup failure has sanitized diagnostics and an ordinary response cannot 
 test('spawn failure settles readiness and cleanup waits for close', async () => {
   const child = spawn(process.execPath + '-missing-fixture', [], { stdio: ['pipe', 'pipe', 'ignore'] });
   const close = new Promise(resolve => child.once('close', resolve));
-  const transport = createFixtureTransport(child, { requestTimeoutMs: 4000, shutdownTimeoutsMs: [1000, 1000, 1000] });
+  const transport = createFixtureTransport(child, { ...options, requestTimeoutMs: 4000, shutdownTimeoutsMs: [1000, 1000, 1000] });
   const reason = await failure(transport.ready, /child process failed/);
   await assert.rejects(transport.call(inspect), error => error === reason);
   const { code } = await transport.stop();
@@ -194,13 +212,13 @@ test('a complete final response settles its operation before child close', async
   const { transport, closed } = fixture(t, String.raw`
     input.once('line', line => {
       const { id } = JSON.parse(line);
-      const message = JSON.stringify({ id, ok: true, result: { final: true } });
+      const message = JSON.stringify({ id, ok: true, result: inspection });
       process.stdout.write(message + '\n', () => process.exit(0));
     });
-    reply({ ready: {} });
+    reply({ ready: details });
   `);
   await transport.ready;
-  assert.deepEqual(await transport.call(inspect), { final: true });
+  assert.deepEqual(await transport.call(inspect), inspection);
   assert.deepEqual(await closed, { code: 0, signal: null });
   await assert.rejects(transport.call(inspect), /stdout closed/);
   assert.deepEqual(await transport.stop(), { code: 0, signal: null });
@@ -210,15 +228,15 @@ test('the close promise marks an exited generation before a later controller res
   const { transport, child } = fixture(t, String.raw`
     input.once('line', line => {
       const { id } = JSON.parse(line);
-      process.stdout.write(JSON.stringify({ id, ok: true, result: { final: true } }) + '\n', () => process.exit(23));
+      process.stdout.write(JSON.stringify({ id, ok: true, result: inspection }) + '\n', () => process.exit(23));
     });
-    reply({ ready: {} });
+    reply({ ready: details });
   `);
   await transport.ready;
   const response = transport.call(inspect);
   await nextMessage(child);
-  child.send({ op: 'reply', value: { id: 1, ok: true, result: { final: true } } });
-  assert.deepEqual(await response, { final: true });
+  child.send({ op: 'reply', value: { id: 1, ok: true, result: inspection } });
+  assert.deepEqual(await response, inspection);
   assert.deepEqual(await transport.closed, { code: 23, signal: null });
   await assert.rejects(transport.call(inspect), error => /stdout closed|child process closed/.test(error.message));
 });
@@ -227,7 +245,7 @@ test('stop settles pending work and waits for real close after SIGTERM', { skip:
   const { transport, child, closed } = fixture(t, `
     waitForSignal = true;
     process.on('SIGTERM', () => process.disconnect());
-    reply({ ready: {} });
+    reply({ ready: details });
   `, { shutdownTimeoutsMs: [10, 1000, 1000] });
   await transport.ready;
   const first = nextMessage(child);
@@ -239,4 +257,49 @@ test('stop settles pending work and waits for real close after SIGTERM', { skip:
   await assert.rejects(transport.call(inspect), error => error === reason);
   assert.deepEqual(await stopped, { code: 0, signal: null });
   assert.deepEqual(await closed, { code: 0, signal: null });
+});
+
+test('malformed readiness blocks every subsequent write to that generation', async t => {
+  const { transport, child } = fixture(t, 'reply({ ready: { ...details, run: "/unrelated" } });');
+  const reason = await failure(transport.ready, /invalid startup details/);
+  await assert.rejects(transport.call(inspect), error => error === reason);
+  const written = nextMessage(child);
+  child.send({ op: 'requests' });
+  assert.deepEqual(await written, []);
+  await transport.stop();
+});
+
+test('each intentional malformed native request reaches the child and only a matching operation error permits the next call', async t => {
+  const { transport, child } = fixture(t);
+  await transport.ready;
+  let id = 0;
+  for (const request of [
+    { op: 'native_provider_stage', stage: 'invalid' },
+    { op: 'native_provider_stage', stage: 'ready', role: 'source' },
+    { op: 'native_provider_login', command: 'controlled login', role: 'source' },
+  ]) {
+    const written = nextMessage(child);
+    const rejection = transport.expectFixtureOperationRejection(request);
+    assert.deepEqual(await written, { id: ++id, request });
+    child.send({ op: 'reply', value: { id, ok: false, error: 'AssertionError', frames: [] } });
+    await rejection;
+  }
+  const written = nextMessage(child);
+  const next = transport.call(inspect);
+  assert.deepEqual(await written, { id: ++id, request: inspect });
+  child.send({ op: 'reply', value: { id, ok: true, result: inspection } });
+  assert.deepEqual(await next, inspection);
+  await transport.stop();
+});
+
+test('an unexpected success for a malformed request poisons the generation', async t => {
+  const { transport, child } = fixture(t);
+  await transport.ready;
+  const written = nextMessage(child);
+  const rejection = assert.rejects(transport.expectFixtureOperationRejection({ op: 'native_provider_stage', stage: 'invalid' }));
+  await written;
+  child.send({ op: 'reply', value: { id: 1, ok: true, result: { stage: 'ready' } } });
+  await rejection;
+  await assert.rejects(transport.call(inspect), /outcome is unknown/);
+  await transport.stop();
 });

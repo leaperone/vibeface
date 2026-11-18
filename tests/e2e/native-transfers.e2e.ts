@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { FixtureOperationError } from '../support/fixture-transport';
 import { insideTaskArtifacts } from '../support/artifact-paths';
 import { createHash, randomBytes } from 'node:crypto';
 import { copyFile, mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
@@ -7,7 +8,7 @@ import { promisify } from 'node:util';
 import { execFile } from 'node:child_process';
 import { test as base } from '@e2e-dev/mobile';
 import { expect, secrets } from 'e2e';
-import { bundleManifest, nativeFixture, record, text } from './native-fixture';
+import { bundleManifest, nativeFixture, record, type NativeFixture } from './native-fixture';
 
 const root = resolve(import.meta.dirname, '../..');
 const execute = promisify(execFile);
@@ -60,52 +61,15 @@ async function recordInitialActorCensus(simulator: string): Promise<void> {
     // Preserve the accessibility failure even if bounded actor diagnostics are unavailable.
   }
 }
-type NativeNetwork = { invitation: string; receiver: string; call(request: Record<string, unknown>): Promise<Record<string, unknown>> };
+type NativeNetwork = Pick<NativeFixture<'delivery'>, 'call' | 'expectFixtureOperationRejection'> & { invitation: string; receiver: string };
 const test = base.extend<{ network: NativeNetwork }>({
   network: async ({}, use) => {
-    await nativeFixture('delivery', resolve(root, '.artifacts/native/network'), async ({ invitation, call }) => {
+    await nativeFixture('delivery', resolve(root, '.artifacts/native/network'), async ({ invitation, call, expectFixtureOperationRejection }) => {
       const setup = await call({ op: 'native_setup', invitation_file: invitation });
-      await use({ invitation: (await readFile(invitation, 'utf8')).trim(), receiver: text(record(record(setup.nodes).receiver).peer), call });
+      await use({ invitation: (await readFile(invitation, 'utf8')).trim(), receiver: setup.nodes.receiver.peer, call, expectFixtureOperationRejection });
     });
   },
 });
-
-function providerInspection(value: Record<string, unknown>) {
-  let manager: { provider: string; model: string; reasoning_effort: string | null } | null = null;
-  if (value.manager !== null) {
-    const saved = record(value.manager);
-    assert(typeof saved.model === 'string');
-    assert(saved.reasoning_effort === null || typeof saved.reasoning_effort === 'string');
-    manager = { provider: text(saved.provider), model: saved.model, reasoning_effort: saved.reasoning_effort };
-  }
-  assert(value.checked_at_ms === null || typeof value.checked_at_ms === 'number' && Number.isSafeInteger(value.checked_at_ms) && value.checked_at_ms >= 0);
-  assert(Array.isArray(value.jobs));
-  assert(value.deferred_input === null || isRecord(value.deferred_input));
-  const deferredInput = value.deferred_input === null ? null : (() => {
-    const input = record(value.deferred_input);
-    assert(typeof input.deferred === 'boolean' && typeof input.cancelled === 'boolean');
-    const target = record(input.target);
-    assert(target.kind === 'bot_main');
-    return { message_id: text(input.message_id), target: { kind: 'bot_main' as const, bot_id: text(target.bot_id) },
-      deferred: input.deferred, cancelled: input.cancelled };
-  })();
-  assert(typeof value.total_invocations === 'number' && Number.isSafeInteger(value.total_invocations) && value.total_invocations >= 0);
-  assert(typeof value.running_invocations === 'number' && Number.isSafeInteger(value.running_invocations) && value.running_invocations >= 0);
-  assert(typeof value.deferred_invocations === 'number' && Number.isSafeInteger(value.deferred_invocations) && value.deferred_invocations >= 0);
-  assert(Array.isArray(value.roles) && value.roles.every(role => role === 'agent' || role === 'execution'));
-  assert(typeof value.execution_model === 'string');
-  assert(typeof value.login_count === 'number' && Number.isSafeInteger(value.login_count) && value.login_count >= 0);
-  const link = text(value.app_server_link_state);
-  assert(['connected', 'starting', 'off', 'not_found', 'handshake_failed', 'launch_failed'].includes(link));
-  const setup = record(value.setup);
-  return { manager, roles: value.roles, execution_model: value.execution_model, login_count: value.login_count,
-    setup: { directory: text(setup.directory), command: text(setup.command) },
-    app_server_link_state: link, readiness: text(value.readiness), authentication: text(value.authentication), catalog: text(value.catalog),
-    checked_at_ms: value.checked_at_ms, checked: value.checked_at_ms !== null,
-    jobs: value.jobs.map((item: unknown) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state) }; }),
-    deferred_input: deferredInput, total_invocations: value.total_invocations,
-    running_invocations: value.running_invocations, deferred_invocations: value.deferred_invocations };
-}
 
 test('provider settings and stopping beside a queued input work in the installed native app', { platforms: ['ios'], timeout: 600000 }, async ({ app, device, network, screen }) => {
   const simulator = process.env.VIBEFACE_E2E_SIMULATOR, appPath = process.env.VIBEFACE_E2E_IOS_APP;
@@ -133,9 +97,9 @@ test('provider settings and stopping beside a queued input work in the installed
   assert(javascript.length > 0, 'The release app contains its packaged JavaScript');
   const native = Object.keys(built).filter(name => name === executable || name.endsWith('.dylib') || name.split('/').at(-2) === `${name.split('/').at(-1)}.framework`);
   await network.call({ op: 'native_provider_setup' });
-  await assert.rejects(network.call({ op: 'native_provider_setup' }));
-  await assert.rejects(network.call({ op: 'native_provider_stage', stage: 'invalid' }));
-  await assert.rejects(network.call({ op: 'native_provider_stage', stage: 'ready', role: 'source' }));
+  await assert.rejects(network.call({ op: 'native_provider_setup' }), FixtureOperationError);
+  await network.expectFixtureOperationRejection({ op: 'native_provider_stage', stage: 'invalid' });
+  await network.expectFixtureOperationRejection({ op: 'native_provider_stage', stage: 'ready', role: 'source' });
   await device.installApp(undefined, { reinstall: true });
   const installedPath = (await execute('xcrun', ['simctl', 'get_app_container', simulator, 'one.leaper.vibeface', 'app'])).stdout.trim();
   assert(installedPath.startsWith('/') && installedPath.toLowerCase().includes(simulator.toLowerCase()), 'Inspect only the assigned simulator installed bundle');
@@ -172,10 +136,10 @@ test('provider settings and stopping beside a queued input work in the installed
   await expect(deviceName).toHaveValue('VDP native receiver');
   await device.dismissKeyboard();
   await screen.getByRole('button', '加入', { exact: true }).click();
-  const pairing = await network.call({ op: 'native_join' }), code = text(pairing.code);
+  const pairing = await network.call({ op: 'native_join' }), code = pairing.code;
   assert(/^[0-9]{6}$/.test(code));
   await expect(screen.getByLabel(`安全码 ${code.split('').join(' ')}`)).toBeVisible();
-  await network.call({ op: 'native_approve', peer: text(pairing.peer), code });
+  await network.call({ op: 'native_approve', peer: pairing.peer, code });
   await expect(screen.getByLabel('设置', { exact: true })).toBeVisible({ timeout: 30000 });
   const openLink = async (url: string) => {
     await device.openLink(url);
@@ -231,7 +195,7 @@ test('provider settings and stopping beside a queued input work in the installed
     await screen.scrollUntilVisible(link, { direction: 'down', timeout: 30000 });
     await link.click();
   };
-  const inspect = async () => providerInspection(await network.call({ op: 'native_provider_inspect' }));
+  const inspect = () => network.call({ op: 'native_provider_inspect' });
   const probeButton = screen.getByRole('button', 'Codex 检查可用性', { exact: true });
   const codexRow = () => screen.getByRole('button', /^Codex，/);
   const probe = async () => {
@@ -282,9 +246,9 @@ test('provider settings and stopping beside a queued input work in the installed
   const initialProvider = screen.getByRole('button', 'Codex，未验证，可尝试', { exact: true });
   await expect(initialProvider).toBeVisible();
   await expect(screen.getByText('尚未主动检查', { exact: true }).first()).toBeVisible();
-  expect((await inspect()).checked).toBe(false);
+  expect((await inspect()).checked_at_ms).toBeNull();
   expect((await inspect()).manager).toBeNull();
-  await assert.rejects(network.call({ op: 'native_provider_queue' }));
+  await assert.rejects(network.call({ op: 'native_provider_queue' }), FixtureOperationError);
   await initialProvider.click();
   await expect(screen.getByLabel('Codex 执行任务', { exact: true })).toBeEnabled();
   await screen.getByLabel('Codex 执行任务', { exact: true }).click();
@@ -300,7 +264,7 @@ test('provider settings and stopping beside a queued input work in the installed
     readiness: ['ready', 'starting', 'needs_setup', 'unverified'].includes(firstProbe.readiness) ? firstProbe.readiness : 'unknown',
     authentication: ['unverified', 'authenticated', 'not_required', 'sign_in_required'].includes(firstProbe.authentication) ? firstProbe.authentication : 'unknown',
     catalog: ['available', 'unavailable'].includes(firstProbe.catalog) ? firstProbe.catalog : 'unknown',
-    checked: firstProbe.checked,
+    checked: firstProbe.checked_at_ms !== null,
   })}\n`, { mode: 0o600 });
   await expect(codexRow()).toHaveAccessibleName('Codex，执行任务，需设置');
   expect(firstProbe.authentication).toBe('sign_in_required');
@@ -310,8 +274,8 @@ test('provider settings and stopping beside a queued input work in the installed
   await expect.poll(() => device.clipboard()).toBe(setup.command);
   const copied = await device.clipboard();
   assert.equal(copied, setup.command);
-  await assert.rejects(network.call({ op: 'native_provider_login', command: copied + '; false' }));
-  await assert.rejects(network.call({ op: 'native_provider_login', command: copied, role: 'source' }));
+  await assert.rejects(network.call({ op: 'native_provider_login', command: copied + '; false' }), FixtureOperationError);
+  await network.expectFixtureOperationRejection({ op: 'native_provider_login', command: copied, role: 'source' });
   expect((await inspect()).login_count).toBe(0);
   expect((await inspect()).authentication).toBe('sign_in_required');
   const login = await network.call({ op: 'native_provider_login', command: copied });
@@ -429,9 +393,9 @@ test('provider settings and stopping beside a queued input work in the installed
   await screen.getByRole('button', 'high', { exact: true }).click();
   await save('native-selectable', 'high');
   const queue = await network.call({ op: 'native_provider_queue' });
-  await assert.rejects(network.call({ op: 'native_provider_queue' }));
-  const botId = text(queue.bot_id), runningTrigger = text(queue.running_trigger);
-  const deferredMessageId = text(queue.deferred_message_id);
+  await assert.rejects(network.call({ op: 'native_provider_queue' }), FixtureOperationError);
+  const botId = queue.bot_id, runningTrigger = queue.running_trigger;
+  const deferredMessageId = queue.deferred_message_id;
   await openLink(`vibeface://b/${botId}`);
   await expect(screen.getByRole('textbox', /^给 Bot 发消息(?:$|[\s,，])/)).toBeVisible();
   await expect.poll(async () => (await inspect()).deferred_input).toEqual({
@@ -506,10 +470,10 @@ test('receives a charity file through a real native pairing and verifies the sav
   await device.dismissKeyboard();
   await screen.getByRole('button', '加入', { exact: true }).click();
   const pairing = await network.call({ op: 'native_join' });
-  const code = text(pairing.code);
+  const code = pairing.code;
   assert(/^[0-9]{6}$/.test(code), 'Real pairing has a six digit safety code');
   await expect(screen.getByLabel(`安全码 ${code.split('').join(' ')}`)).toBeVisible();
-  await network.call({ op: 'native_approve', peer: text(pairing.peer), code });
+  await network.call({ op: 'native_approve', peer: pairing.peer, code });
   await expect(screen.getByLabel('设置', { exact: true })).toBeVisible({ timeout: 30000 });
   await screen.getByLabel('设置', { exact: true }).click();
   await screen.scrollUntilVisible(screen.getByRole('link', '实验室', { exact: true }), { direction: 'down' });
@@ -519,8 +483,7 @@ test('receives a charity file through a real native pairing and verifies the sav
   await expect(screen.getByText('启用文件传输', { exact: true }).first()).toBeVisible();
   const bytes = randomBytes(96 * 1024), name = 'native-charity-original.bin';
   const digest = createHash('sha256').update(bytes).digest('hex');
-  const offered = await network.call({ op: 'native_send', name, content_base64: bytes.toString('base64') });
-  assert(/^[a-f0-9]{64}$/.test(text(offered.order_id)));
+  await network.call({ op: 'native_send', name, content_base64: bytes.toString('base64') });
   const incoming = screen.getByRole('button', /^待接收的文件/);
   await screen.scrollUntilVisible(incoming, { direction: 'down', timeout: 30000 });
   await incoming.click();

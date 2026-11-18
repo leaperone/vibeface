@@ -1,33 +1,22 @@
 import assert from 'node:assert/strict';
-import { insideTaskArtifacts } from '../support/artifact-paths';
 import { execFile } from 'node:child_process';
 import { readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { test as base } from '@e2e-dev/mobile';
 import { expect, secrets } from 'e2e';
-import { bundleManifest as nativeBundleManifest, nativeFixture, record, text } from './native-fixture';
+import { bundleManifest as nativeBundleManifest, nativeFixture, record, text, type NativeFixture } from './native-fixture';
 
 const root = resolve(import.meta.dirname, '../..');
 const artifacts = resolve(root, '.artifacts/native/workspace');
 const execute = promisify(execFile);
 function rows(value: unknown) { assert(Array.isArray(value)); return value.map(record); }
-type NativeWorkspace = {
-  gates: { main: string; taskA: string; channel: string };
-  call(request: Record<string, unknown>): Promise<Record<string, unknown>>;
-};
+type NativeWorkspace = Pick<NativeFixture<'workspace'>, 'call'> & { gates: NativeFixture<'workspace'>['fixture']['gates'] };
 const test = base.extend<{ network: NativeWorkspace }>({
   network: async ({}, use) => {
-    await nativeFixture('workspace', artifacts, async ({ fixture, invitation, call }) => {
-      const source = record(record(fixture.nodes).source), url = new URL(text(source.url));
-      assert(url.protocol === 'http:' && url.hostname === '127.0.0.1', 'The native app connects only to this isolated Node');
-      const gate = (name: string) => {
-        const value = text(record(fixture.gates)[name]);
-        assert(insideTaskArtifacts(artifacts, resolve(value), { allowRoot: false }), 'Native gates remain in this fixture');
-        return value;
-      };
-      await call({ op: 'workspace_native_setup', invitation_file: invitation });
-      await use({ gates: { main: gate('main'), taskA: gate('taskA'), channel: gate('channel') }, call });
+    await nativeFixture('workspace', artifacts, async ({ invitation, call }) => {
+      const { gates } = await call({ op: 'workspace_native_setup', invitation_file: invitation });
+      await use({ gates, call });
     });
   },
 });
@@ -79,10 +68,10 @@ test('native workspace routes preserve Task input and directed Channel results',
   await expect(textbox('这台设备的名字')).toHaveValue('VDP native receiver');
   await expect(keyboard).toHaveCount(0);
   await screen.getByRole('button', '加入', { exact: true }).click();
-  const pairing = await network.call({ op: 'native_join' }), code = text(pairing.code);
+  const pairing = await network.call({ op: 'native_join' }), code = pairing.code;
   assert(/^[0-9]{6}$/.test(code));
   await expect(screen.getByLabel(`安全码 ${code.split('').join(' ')}`)).toBeVisible();
-  await network.call({ op: 'native_approve', peer: text(pairing.peer), code });
+  await network.call({ op: 'native_approve', peer: pairing.peer, code });
   await expect(screen.getByLabel('设置', { exact: true })).toBeVisible({ timeout: 30000 });
   await screen.getByLabel('设置', { exact: true }).click();
   const externalChat = screen.getByRole('link', '转发到外部聊天', { exact: true });
@@ -150,10 +139,10 @@ test('native workspace routes preserve Task input and directed Channel results',
   const inspect = async () => {
     const value = await network.call({ op: 'workspace_inspect' });
     return {
-      invocations: rows(value.invocations).map(row => ({ label: text(row.label), conversation: text(row.conversation_id), thread: text(row.thread_id) })),
-      steers: rows(value.steers).map(row => ({ id: text(row.message_id), thread: text(row.thread_id), turn: text(row.turn_id), text: text(row.text) })),
-      turns: rows(value.turns).map(row => ({ thread: text(row.thread_id), turn: text(row.turn_id), state: text(row.state) })),
-      interrupts: rows(value.interrupts).map(row => ({ thread: text(row.thread_id), turn: text(row.turn_id) })),
+      invocations: value.invocations.map(row => ({ label: row.label, conversation: row.conversation_id, thread: row.thread_id })),
+      steers: value.steers.map(row => ({ id: row.message_id, thread: row.thread_id, turn: row.turn_id, text: row.text })),
+      turns: value.turns.map(row => ({ thread: row.thread_id, turn: row.turn_id, state: row.state })),
+      interrupts: value.interrupts.map(row => ({ thread: row.thread_id, turn: row.turn_id })),
     };
   };
   const invocation = async (label: string) => {
