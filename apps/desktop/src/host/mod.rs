@@ -248,8 +248,7 @@ impl DesktopHost {
         };
         async move {
             ensure!(executable(&core), "安装包缺少可运行的 Core。");
-            let result = vibeface_control::request(&core, &request).await?;
-            let result: Discovery = serde_json::from_value(result)?;
+            let result = vibeface_control::request_discovery(&core, &request).await?;
             result.validate()?;
             Ok(result)
         }
