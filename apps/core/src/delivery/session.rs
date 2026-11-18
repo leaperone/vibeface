@@ -2,12 +2,13 @@
 
 use crate::{
     crypto::{LocalIdentity, check_event, verify_event_signature},
-    model::{Event, EventBody, SignedEvent},
+    model::{Event, EventBody, IngestStatus, SignedEvent},
     store::{Ingested, Store},
 };
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rand::{RngCore, rngs::OsRng};
+use rusqlite::{OptionalExtension, params};
 use std::path::{Path, PathBuf};
 use vibeface_delivery::{
     EncryptedSessionObject, MAX_SESSION_CHUNK_BYTES, MAX_SESSION_OBJECT_BYTES, PeerSignature,
@@ -16,6 +17,7 @@ use vibeface_delivery::{
 use zeroize::Zeroizing;
 
 const SIGNING_DOMAIN: &str = "bot-session-object";
+const RECEIPT_DOMAIN: &str = "bot-session-event-stored";
 const AEAD_DOMAIN: &[u8] = b"vibeface:bot-session-event:v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +199,35 @@ pub fn seal_event(
     Ok(object.with_signature(PeerSignature::from_bytes(signature)))
 }
 
+/// The recipient attests durable event storage. This says nothing about Bot execution or payment.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionStoredReceipt {
+    object_id: Word,
+    signature: String,
+}
+
+impl SessionStoredReceipt {
+    pub fn verify(&self, object: &EncryptedSessionObject) -> Result<()> {
+        verify_object(object)?;
+        ensure!(
+            object.header.object_id == self.object_id,
+            "receipt identifies another session object"
+        );
+        crate::crypto::verify_payload(
+            &hex::encode(object.header.receiver_peer),
+            RECEIPT_DOMAIN,
+            &self.object_id,
+            &self.signature,
+        )
+    }
+}
+
+pub struct SessionIngested {
+    pub sync: Ingested,
+    pub stored_receipt: Option<SessionStoredReceipt>,
+}
+
 /// Pass the decrypted, original signed event to the ordinary sync authorization and DAG.
 pub fn ingest_event(
     store: &mut Store,
@@ -205,7 +236,7 @@ pub fn ingest_event(
     object: &EncryptedSessionObject,
     key: &Secret32,
     now_ms: u64,
-) -> Result<Ingested> {
+) -> Result<SessionIngested> {
     let header = &object.header;
     let recipient = receiver.device_id()?;
     ensure!(
@@ -242,7 +273,47 @@ pub fn ingest_event(
             && kind_for_event(&event.body)? == header.kind,
         "signed event does not match the session object"
     );
-    store.ingest_events(network, &[signed])
+    verify_event_signature(&signed, &sender)?;
+    let mut ingested = store.ingest_events(network, std::slice::from_ref(&signed))?;
+    let mut stored_receipt = None;
+    if matches!(
+        ingested.statuses[0],
+        IngestStatus::Accepted | IngestStatus::Duplicate
+    ) {
+        // Normal sync also reports Duplicate for pending events and retained fork evidence.
+        let effective: Option<bool> = store
+            .connection
+            .query_row(
+                "SELECT effective FROM events WHERE network_id=? AND hash=?",
+                params![network, signed.hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match effective {
+            None => ingested.statuses[0] = IngestStatus::Pending,
+            Some(false) => ingested.statuses[0] = IngestStatus::Conflict,
+            Some(true) => {
+                for blob in &event.blobs {
+                    if !store.has_blob(blob)? {
+                        return Ok(SessionIngested {
+                            sync: ingested,
+                            stored_receipt,
+                        });
+                    }
+                    // Sync can use size as a readiness hint. Receipts require content integrity.
+                    store.read_blob(network, &event.scope_id, &blob.hash)?;
+                }
+                stored_receipt = Some(SessionStoredReceipt {
+                    object_id: header.object_id,
+                    signature: receiver.sign_payload(RECEIPT_DOMAIN, &header.object_id)?,
+                });
+            }
+        }
+    }
+    Ok(SessionIngested {
+        sync: ingested,
+        stored_receipt,
+    })
 }
 
 #[cfg(test)]

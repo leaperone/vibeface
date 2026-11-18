@@ -528,7 +528,9 @@ fn encrypted_session_ingest_keeps_the_source_signature_across_owners_and_retries
     let path = directory.join("target.sqlite3");
     let mut target = Store::open(&path)?;
     target.install_trust_bundle(&net.network, &net.state)?;
-    all_accepted(&mut target, &net, &source)?;
+    // Hold back the destination dependency while delivering the encrypted event twice.
+    target.ingest_events(&net.network, &source.events_from(&net.network, &a, 1, 10)?)?;
+    let dependencies = source.events_from(&net.network, &b, 1, 10)?;
 
     let signed = source.append_event(
         &net.a,
@@ -584,10 +586,23 @@ fn encrypted_session_ingest_keeps_the_source_signature_across_owners_and_retries
     tampered.ciphertext[0] ^= 1;
     assert!(ingest_event(&mut target, &net.b, &net.network, &tampered, &key, 5).is_err());
     assert_eq!(target.event(&net.network, &signed.hash)?, None);
-    assert_eq!(
-        ingest_event(&mut target, &net.b, &net.network, &object, &key, 5)?.statuses,
-        [IngestStatus::Accepted]
-    );
+    for _ in 0..2 {
+        let pending = ingest_event(&mut target, &net.b, &net.network, &object, &key, 5)?;
+        assert_eq!(pending.sync.statuses, [IngestStatus::Pending]);
+        assert!(pending.stored_receipt.is_none());
+        assert_eq!(target.event(&net.network, &signed.hash)?, None);
+    }
+    let placed = target.ingest_events(&net.network, &dependencies)?;
+    assert!(placed.stored.iter().any(|event| event.hash == signed.hash));
+    let applied = ingest_event(&mut target, &net.b, &net.network, &object, &key, 5)?;
+    assert_eq!(applied.sync.statuses, [IngestStatus::Duplicate]);
+    let receipt = applied
+        .stored_receipt
+        .context("recipient did not attest storage")?;
+    receipt.verify(&object)?;
+    let mut wrong_object = object.clone();
+    wrong_object.header.object_id[0] ^= 1;
+    assert!(receipt.verify(&wrong_object).is_err());
     let trigger = bot_message_trigger("relay-message-1");
     let first = target
         .admit_delivery(&b, &net.network, "d", &trigger)?
@@ -608,10 +623,9 @@ fn encrypted_session_ingest_keeps_the_source_signature_across_owners_and_retries
             .and_then(|c| c.owner),
         Some(b.clone())
     );
-    assert_eq!(
-        ingest_event(&mut target, &net.b, &net.network, &object, &key, 6)?.statuses,
-        [IngestStatus::Duplicate]
-    );
+    let retry = ingest_event(&mut target, &net.b, &net.network, &object, &key, 6)?;
+    assert_eq!(retry.sync.statuses, [IngestStatus::Duplicate]);
+    assert_eq!(retry.stored_receipt, Some(receipt));
     assert_eq!(target.messages(&net.network, "d")?.len(), 1);
     let second = target
         .admit_delivery(&b, &net.network, "d", &trigger)?
@@ -620,6 +634,69 @@ fn encrypted_session_ingest_keeps_the_source_signature_across_owners_and_retries
     assert_eq!(target.scheduler_jobs("d")?.len(), 1);
     drop(target);
     std::fs::remove_dir_all(directory)?;
+    Ok(())
+}
+
+#[test]
+fn encrypted_session_storage_receipt_waits_for_verified_attachments() -> Result<()> {
+    use crate::delivery::session::{ingest_event, seal_event};
+    use vibeface_delivery::Secret32;
+
+    let net = net()?;
+    let mut source = store(&net)?;
+    bot_conversation(&mut source, &net)?;
+    let mut target = store(&net)?;
+    all_accepted(&mut target, &net, &source)?;
+
+    let content = b"private input attachment";
+    let attachment = Attachment {
+        hash: crate::crypto::digest(content),
+        size: content.len() as u64,
+        name: "attachment.txt".into(),
+    };
+    let blob = attachment.blob();
+    source.put_blob(&blob, content)?;
+    let body = net.a.fixture_admin().attest(
+        &net.network,
+        "c",
+        EventBody::InputPosted {
+            message_id: "attachment-input".into(),
+            target: crate::workspace::InputTarget::BotMain {
+                bot_id: "bot".into(),
+            },
+            intent: crate::workspace::InputIntent::Continue,
+            sequence: 1,
+            expected_revision: None,
+            text: "read the file".into(),
+            attachments: vec![attachment],
+            report_results: Some(false),
+            attestation: None,
+        },
+    )?;
+    let signed = source.append_event(&net.a, &net.network, "c", body, vec![blob.clone()], 3)?;
+    let key = Secret32::new([7; 32])?;
+    let object = seal_event(
+        &net.a,
+        &net.network,
+        &signed,
+        hex::decode(net.b.device_id()?)?.try_into().unwrap(),
+        [8; 32],
+        &key,
+        4..10,
+    )?;
+
+    let received = ingest_event(&mut target, &net.b, &net.network, &object, &key, 5)?;
+    assert_eq!(received.sync.statuses, [IngestStatus::Accepted]);
+    assert!(received.stored_receipt.is_none());
+    target.put_blob(&blob, content)?;
+    let path = target.blob_file(&blob.hash)?;
+    std::fs::write(&path, vec![0; content.len()])?;
+    assert!(ingest_event(&mut target, &net.b, &net.network, &object, &key, 5).is_err());
+    std::fs::write(path, content)?;
+    ingest_event(&mut target, &net.b, &net.network, &object, &key, 5)?
+        .stored_receipt
+        .context("missing storage receipt")?
+        .verify(&object)?;
     Ok(())
 }
 
