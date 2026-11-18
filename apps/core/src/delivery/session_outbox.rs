@@ -110,18 +110,26 @@ impl Delivery {
             "session-settlement/{route_id}/{}",
             hex::encode(hash(&batch.journal()))
         );
-        chain
+        let observation = chain
             .execute(
                 self,
                 &intent_id,
                 Call::SessionSettle {
                     budget: batch.budget,
-                    order_ids: ids,
+                    order_ids: ids.clone(),
                     seal,
                 },
                 gas_cap,
             )
-            .await
+            .await?;
+        if matches!(
+            observation.status(),
+            Some(super::chain::TxStatus::Confirmed(_))
+        ) {
+            let mut outbox = SessionOutboxStore::open(&self.data_dir)?;
+            outbox.consume_claims(route_id, &ids)?;
+        }
+        Ok(observation)
     }
 
     pub(super) fn attach_session_outbox(&self, runtime: std::sync::Weak<Runtime>) -> Result<()> {

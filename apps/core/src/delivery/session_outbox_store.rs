@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::Path;
 use vibeface_session_delivery::{
     CAPSULE_BYTES, EncryptedSessionObject, MAX_SESSION_OBJECT_BYTES, PeerSignature,
-    SessionObjectHeader, SessionSettlementClaim,
+    SessionObjectHeader, SessionSettlementClaim, Word,
 };
 
 const MAX_ROUTES: i64 = 64;
@@ -366,6 +366,46 @@ impl SessionOutboxStore {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    pub(super) fn consume_claims(&mut self, route: &str, order_ids: &[Word]) -> Result<()> {
+        validate_route(route)?;
+        ensure!(
+            !order_ids.is_empty() && order_ids.len() <= 16,
+            "invalid consumed claim batch"
+        );
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut statement =
+            tx.prepare("SELECT sequence,claim FROM session_claims WHERE route=?1")?;
+        let rows = statement.query_map([route], |row| {
+            let sequence: i64 = row.get(0)?;
+            let claim: String = row.get(1)?;
+            Ok((sequence, claim))
+        })?;
+        let mut matches = Vec::new();
+        for row in rows {
+            let (sequence, value) = row?;
+            let claim: SessionSettlementClaim = serde_json::from_str(&value)?;
+            if order_ids.contains(&claim.order.order_id().map_err(anyhow::Error::msg)?) {
+                ensure!(sequence >= 0, "session claim sequence is negative");
+                matches.push(sequence);
+            }
+        }
+        drop(statement);
+        ensure!(
+            matches.len() == order_ids.len(),
+            "settled session claim is missing"
+        );
+        for sequence in matches {
+            tx.execute(
+                "DELETE FROM session_claims WHERE route=?1 AND sequence=?2",
+                params![route, sequence],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub(super) fn next_receipt(
@@ -737,7 +777,12 @@ mod tests {
             assert_eq!(store.pending_claims("route", 16)?, vec![claim.clone()]);
         }
         let store = SessionOutboxStore::open(&dir)?;
-        assert_eq!(store.pending_claims("route", 16)?, vec![claim]);
+        assert_eq!(store.pending_claims("route", 16)?, vec![claim.clone()]);
+        drop(store);
+        let mut store = SessionOutboxStore::open(&dir)?;
+        let order_id = claim.order.order_id().map_err(anyhow::Error::msg)?;
+        assert!(store.consume_claims("route", &[order_id]).is_ok());
+        assert!(store.pending_claims("route", 16)?.is_empty());
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
