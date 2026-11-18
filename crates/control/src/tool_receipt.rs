@@ -139,11 +139,12 @@ impl EffectReceipt {
             "confirmation":confirmation,"approval":self.approval,"retry":retry})
     }
     pub fn failure(self, error: anyhow::Error) -> anyhow::Error {
-        EffectFailure {
+        let message = error.to_string();
+        // An anyhow context keeps the existing error type available to callers.
+        error.context(EffectFailure {
             receipt: self,
-            error,
-        }
-        .into()
+            message,
+        })
     }
 }
 
@@ -196,16 +197,11 @@ impl ToolOutcome {
 #[derive(Debug)]
 struct EffectFailure {
     receipt: EffectReceipt,
-    error: anyhow::Error,
+    message: String,
 }
 impl std::fmt::Display for EffectFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.error.fmt(f)
-    }
-}
-impl std::error::Error for EffectFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.error.source()
+        f.write_str(&self.message)
     }
 }
 pub fn uncertain(error: anyhow::Error) -> anyhow::Error {
