@@ -183,14 +183,33 @@ impl Serialize for ControlResponse {
 
 impl<'de> Deserialize<'de> for ControlResponse {
     fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
-        let wire = ControlWireResponse::<Map<String, Value>, String>::deserialize(decoder)?;
-        match (wire.ok, wire.result, wire.error) {
-            (true, Some(result), None) => Ok(Self::Success(result)),
-            (false, None, Some(error)) => Ok(Self::Failure(error)),
-            _ => Err(serde::de::Error::custom(
-                "core control response must carry exactly one matching payload",
-            )),
+        struct ResponseVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ResponseVisitor {
+            type Value = ControlResponse;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a core control response object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let wire = ControlWireResponse::<Map<String, Value>, String>::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                match (wire.ok, wire.result, wire.error) {
+                    (true, Some(result), None) => Ok(ControlResponse::Success(result)),
+                    (false, None, Some(error)) => Ok(ControlResponse::Failure(error)),
+                    _ => Err(serde::de::Error::custom(
+                        "core control response must carry exactly one matching payload",
+                    )),
+                }
+            }
         }
+
+        decoder.deserialize_map(ResponseVisitor)
     }
 }
 
@@ -357,13 +376,16 @@ mod tests {
     fn control_response_has_one_matching_wire_payload() -> Result<()> {
         for text in [
             r#"{"ok":true,"result":{}}"#,
-            r#"{"ok":true,"result":{"state":"running"}}"#,
+            r#"{"ok":true,"result":{"status":"running"}}"#,
             r#"{"ok":false,"error":"not initialized"}"#,
+            r#"{"ok":false,"error":"core control response is too large"}"#,
         ] {
             let reply = serde_json::from_str::<ControlResponse>(text)?;
             assert_eq!(serde_json::to_string(&reply)?, text);
         }
         for text in [
+            r#"[true,{}]"#,
+            r#"null"#,
             r#"{"result":{}}"#,
             r#"{"ok":"true","result":{}}"#,
             r#"{"ok":true}"#,
@@ -454,6 +476,7 @@ mod tests {
     enum FixtureKind {
         Output,
         Status,
+        Contradictory,
     }
 
     struct ChildFixture {
@@ -469,7 +492,7 @@ mod tests {
         #[cfg(unix)]
         {
             let script = match kind {
-                FixtureKind::Output => "output.sh",
+                FixtureKind::Output | FixtureKind::Contradictory => "output.sh",
                 FixtureKind::Status => "status.sh",
             };
             std::os::unix::fs::symlink(
@@ -483,14 +506,22 @@ mod tests {
         std::fs::write(
             &executable,
             match kind {
-                FixtureKind::Output => "@echo off\r\ntype \"%~dp0stdout\"\r\n",
+                FixtureKind::Output | FixtureKind::Contradictory => {
+                    "@echo off\r\nmore > nul\r\ntype \"%~dp0stdout\"\r\n"
+                }
                 FixtureKind::Status => {
                     "@echo off\r\nmore > nul\r\necho {\"ok\":true,\"result\":{}}\r\nexit /b 7\r\n"
                 }
             },
         )?;
-        if matches!(kind, FixtureKind::Output) {
-            std::fs::write(directory.join("stdout"), vec![b'.'; MAX_CONTROL_PACKET + 1])?;
+        let stdout = directory.join("stdout");
+        match kind {
+            FixtureKind::Output => std::fs::write(stdout, vec![b'.'; MAX_CONTROL_PACKET + 1])?,
+            FixtureKind::Contradictory => std::fs::write(
+                stdout,
+                b"{\"ok\":true,\"result\":{},\"error\":\"contradiction\"}\n",
+            )?,
+            FixtureKind::Status => {}
         }
         Ok(ChildFixture {
             directory,
@@ -549,6 +580,29 @@ mod tests {
             "{error:#}"
         );
         std::fs::remove_dir_all(fixture.directory)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn control_client_rejects_contradictory_response_from_zero_exit_child() -> Result<()> {
+        let fixture = fixture(FixtureKind::Contradictory)?;
+        let result = request(
+            &fixture.executable,
+            &ControlRequest::Inspect {
+                data_dir: std::env::temp_dir().join("vibeface-control-test"),
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(fixture.directory)?;
+        let error = result.expect_err("a zero exit status must not validate a contradictory reply");
+        assert_eq!(error.to_string(), "invalid core control response");
+        assert!(
+            error
+                .root_cause()
+                .to_string()
+                .contains("exactly one matching payload"),
+            "{error:#}"
+        );
         Ok(())
     }
 

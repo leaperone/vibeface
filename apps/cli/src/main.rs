@@ -1374,11 +1374,7 @@ async fn wallet(options: WalletOptions) -> Result<()> {
                 operation: json!({"op":"backup","output":output}),
             })
             .await?;
-            if result.is_null() {
-                println!("Encrypted delivery wallet backup saved.");
-            } else {
-                println!("{}", serde_json::to_string(&result)?);
-            }
+            println!("{}", serde_json::to_string(&result)?);
             Ok(())
         }
     }
