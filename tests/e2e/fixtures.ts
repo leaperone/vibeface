@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { insideTaskArtifacts } from '../support/artifact-paths';
+import { withControlledFixture } from '../support/fixture-lifecycle';
 import { lstat, readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { test as base } from '@e2e-dev/web';
@@ -58,13 +59,16 @@ async function control(baseUrl: string | undefined): Promise<Control> {
 export const test = base.extend<{ node: OwnerNode }>({
   node: async ({ app }, use) => {
     const call = await control(app.baseUrl);
-    try {
-      const value = nodes(await call({ op: 'reset', kind: 'single' }));
-      const source = owner(node(value.source));
-      assert(app.baseUrl);
-      assert.equal(source.url, new URL(app.baseUrl).origin);
-      await use(source);
-    } finally { await call({ op: 'stop' }); }
+    await withControlledFixture({
+      run: async () => {
+        const value = nodes(await call({ op: 'reset', kind: 'single' }));
+        const source = owner(node(value.source));
+        assert(app.baseUrl);
+        assert.equal(source.url, new URL(app.baseUrl).origin);
+        await use(source);
+      },
+      stop: () => call({ op: 'stop' }),
+    });
   },
 });
 export const cursorTest = base.extend<{ cursor: {
@@ -74,19 +78,22 @@ export const cursorTest = base.extend<{ cursor: {
 } }>({
   cursor: async ({ app }, use) => {
     const call = await control(app.baseUrl);
-    try {
-      const value = nodes(await call({ op: 'reset', kind: 'cursor' }));
-      await use({ node: owner(node(value.source)),
-        async login() { assert.equal(record(await call({ op: 'cursor_login' })).signed_in, true); },
-        async inspect() {
-          const value = record(await call({ op: 'cursor_inspect' }));
-          assert(typeof value.selected_official === 'boolean' && typeof value.bot_enabled === 'boolean');
-          assert(Array.isArray(value.execution) && value.execution.every((item): item is string => typeof item === 'string'));
-          assert(typeof value.prompts === 'number' && Number.isSafeInteger(value.prompts) && value.prompts >= 0);
-          return { selected_official: value.selected_official, bot_enabled: value.bot_enabled, execution: value.execution, prompts: value.prompts };
-        },
-      });
-    } finally { await call({ op: 'stop' }); }
+    await withControlledFixture({
+      run: async () => {
+        const value = nodes(await call({ op: 'reset', kind: 'cursor' }));
+        await use({ node: owner(node(value.source)),
+          async login() { assert.equal(record(await call({ op: 'cursor_login' })).signed_in, true); },
+          async inspect() {
+            const value = record(await call({ op: 'cursor_inspect' }));
+            assert(typeof value.selected_official === 'boolean' && typeof value.bot_enabled === 'boolean');
+            assert(Array.isArray(value.execution) && value.execution.every((item): item is string => typeof item === 'string'));
+            assert(typeof value.prompts === 'number' && Number.isSafeInteger(value.prompts) && value.prompts >= 0);
+            return { selected_official: value.selected_official, bot_enabled: value.bot_enabled, execution: value.execution, prompts: value.prompts };
+          },
+        });
+      },
+      stop: () => call({ op: 'stop' }),
+    });
   },
 });
 export type DeliveryFixture = {
@@ -97,24 +104,27 @@ export type DeliveryFixture = {
 export const deliveryTest = base.extend<{ network: DeliveryFixture }>({
   network: async ({ app }, use) => {
     const call = await control(app.baseUrl);
-    try {
-      const value = nodes(await call({ op: 'reset', kind: 'delivery' }));
-      const source = owner(node(value.source)), receiver = owner(node(value.receiver)), provider = node(value.provider);
-      assert(app.baseUrl);
-      assert.equal(source.url, new URL(app.baseUrl).origin);
-      assert(new Set([source.peer, receiver.peer, provider.peer]).size === 3, 'Each Node has its own identity');
-      await use({ source, receiver, provider,
-        async restart(role, crash = false) {
-          const restarted = nodes(await call({ op: 'restart', role, crash }));
-          assert.deepEqual(node(restarted[role]), { source, receiver, provider }[role], 'Restart preserves the exact Node');
-        },
-        async inspect() {
-          const result = record(await call({ op: 'inspect' }));
-          const integer = (value: unknown) => { assert(typeof value === 'number' && Number.isSafeInteger(value) && value >= 0); return value; };
-          return { wallet_files: integer(result.wallet_files), mesh_records: integer(result.mesh_records), chain_rpc_calls: integer(result.chain_rpc_calls) };
-        },
-      });
-    } finally { await call({ op: 'stop' }); }
+    await withControlledFixture({
+      run: async () => {
+        const value = nodes(await call({ op: 'reset', kind: 'delivery' }));
+        const source = owner(node(value.source)), receiver = owner(node(value.receiver)), provider = node(value.provider);
+        assert(app.baseUrl);
+        assert.equal(source.url, new URL(app.baseUrl).origin);
+        assert(new Set([source.peer, receiver.peer, provider.peer]).size === 3, 'Each Node has its own identity');
+        await use({ source, receiver, provider,
+          async restart(role, crash = false) {
+            const restarted = nodes(await call({ op: 'restart', role, crash }));
+            assert.deepEqual(node(restarted[role]), { source, receiver, provider }[role], 'Restart preserves the exact Node');
+          },
+          async inspect() {
+            const result = record(await call({ op: 'inspect' }));
+            const integer = (value: unknown) => { assert(typeof value === 'number' && Number.isSafeInteger(value) && value >= 0); return value; };
+            return { wallet_files: integer(result.wallet_files), mesh_records: integer(result.mesh_records), chain_rpc_calls: integer(result.chain_rpc_calls) };
+          },
+        });
+      },
+      stop: () => call({ op: 'stop' }),
+    });
   },
 });
 
@@ -153,24 +163,27 @@ function workspaceEvidence(value: unknown): WorkspaceEvidence {
 export const workspaceTest = base.extend<{ workspace: WorkspaceFixture }>({
   workspace: async ({ app }, use) => {
     const call = await control(app.baseUrl);
-    try {
-      const ready = record(await call({ op: 'reset', kind: 'workspace' }));
-      const source = owner(node(nodes(ready).source));
-      assert(app.baseUrl);
-      assert.equal(source.url, new URL(app.baseUrl).origin);
-      const paths = record(ready.gates);
-      const gate = (name: WorkspaceGate) => {
-        const path = text(paths[name]);
-        assert(insideTaskArtifacts(artifacts, resolve(path), { allowRoot: false }), 'Controlled gates remain in this task');
-        return path;
-      };
-      await use({ source, gates: { taskA: gate('taskA'), taskB: gate('taskB'), main: gate('main'), channel: gate('channel') },
-        async release(gate) {
-          assert.deepEqual(await call({ op: 'workspace_release', gate }), { released: gate });
-        },
-        async inspect() { return workspaceEvidence(await call({ op: 'workspace_inspect' })); },
-      });
-    } finally { await call({ op: 'stop' }); }
+    await withControlledFixture({
+      run: async () => {
+        const ready = record(await call({ op: 'reset', kind: 'workspace' }));
+        const source = owner(node(nodes(ready).source));
+        assert(app.baseUrl);
+        assert.equal(source.url, new URL(app.baseUrl).origin);
+        const paths = record(ready.gates);
+        const gate = (name: WorkspaceGate) => {
+          const path = text(paths[name]);
+          assert(insideTaskArtifacts(artifacts, resolve(path), { allowRoot: false }), 'Controlled gates remain in this task');
+          return path;
+        };
+        await use({ source, gates: { taskA: gate('taskA'), taskB: gate('taskB'), main: gate('main'), channel: gate('channel') },
+          async release(gate) {
+            assert.deepEqual(await call({ op: 'workspace_release', gate }), { released: gate });
+          },
+          async inspect() { return workspaceEvidence(await call({ op: 'workspace_inspect' })); },
+        });
+      },
+      stop: () => call({ op: 'stop' }),
+    });
   },
 });
 
@@ -195,33 +208,26 @@ function meshInfo(value: unknown): MeshInfo {
 export const meshTest = base.extend<{ mesh: MeshFixture }>({
   mesh: async ({ app }, use) => {
     const call = await control(app.baseUrl);
-    let primary: unknown;
-    try {
-      await call({ op: 'reset', kind: 'mesh' });
-      const info = meshInfo(await call({ op: 'mesh_info' }));
-      assert(app.baseUrl);
-      assert.equal(info.gateway.url, new URL(app.baseUrl).origin, 'The page is served by the public node');
-      await use({ ...info,
-        async pairing() {
-          const result = record(await call({ op: 'mesh_pairing' }));
-          const peer = text(result.peer), code = text(result.code);
-          assert(/^[a-f0-9]{64}$/.test(peer) && /^[0-9]{6}$/.test(code));
-          return { peer, code };
-        },
-        async approve(pairing) {
-          const result = record(await call({ op: 'mesh_approve', ...pairing }));
-          assert.equal(result.approved, true);
-        },
-      });
-    } catch (error) {
-      primary = error;
-      throw error;
-    } finally {
-      try { await call({ op: 'stop' }); }
-      catch (cleanup) {
-        if (primary !== undefined) throw new AggregateError([primary, cleanup], `${String(primary)}; cleanup also failed: ${String(cleanup)}`);
-        throw cleanup;
-      }
-    }
+    await withControlledFixture({
+      run: async () => {
+        await call({ op: 'reset', kind: 'mesh' });
+        const info = meshInfo(await call({ op: 'mesh_info' }));
+        assert(app.baseUrl);
+        assert.equal(info.gateway.url, new URL(app.baseUrl).origin, 'The page is served by the public node');
+        await use({ ...info,
+          async pairing() {
+            const result = record(await call({ op: 'mesh_pairing' }));
+            const peer = text(result.peer), code = text(result.code);
+            assert(/^[a-f0-9]{64}$/.test(peer) && /^[0-9]{6}$/.test(code));
+            return { peer, code };
+          },
+          async approve(pairing) {
+            const result = record(await call({ op: 'mesh_approve', ...pairing }));
+            assert.equal(result.approved, true);
+          },
+        });
+      },
+      stop: () => call({ op: 'stop' }),
+    });
   },
 });
