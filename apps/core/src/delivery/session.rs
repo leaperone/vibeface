@@ -5,6 +5,10 @@
 
 use crate::model::EventBody;
 use anyhow::{Result, bail};
+use std::{
+    fs::symlink_metadata,
+    path::{Path, PathBuf},
+};
 use vibeface_delivery::{
     EncryptedSessionObject, MAX_SESSION_OBJECT_BYTES, SessionObjectKind, Word,
 };
@@ -34,6 +38,72 @@ pub struct InboundSessionReceipt {
     pub signature_verification: SessionSignatureVerification,
     pub received_at_ms: u64,
     pub idempotency: SessionIdempotency,
+}
+
+const RECEIPT_FILE: &str = "session-receipts.json";
+const MAX_RECEIPTS: usize = 4096;
+const RECEIPT_FILE_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// Durable, private idempotency state for verified inbound objects.
+///
+/// This ledger records receipt admission only. It does not append a shared event or run a
+/// scheduler, because those operations need a separate sender-authenticated event contract.
+pub struct SessionReceiptLedger {
+    path: PathBuf,
+    receipts: Vec<InboundSessionReceipt>,
+}
+
+impl SessionReceiptLedger {
+    pub fn open(data_dir: &Path) -> Result<Self> {
+        let delivery_dir = data_dir.join("delivery");
+        crate::config::private_dir(&delivery_dir)?;
+        let path = delivery_dir.join(RECEIPT_FILE);
+        let receipts = match symlink_metadata(&path) {
+            Ok(_) => {
+                let bytes = vibeface_bridge::platform::privatefs::read_private_bounded(
+                    &path,
+                    RECEIPT_FILE_LIMIT,
+                    "session receipt ledger",
+                )?;
+                let receipts: Vec<InboundSessionReceipt> = serde_json::from_slice(&bytes)?;
+                anyhow::ensure!(
+                    receipts.len() <= MAX_RECEIPTS,
+                    "session receipt ledger is full"
+                );
+                receipts
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Self { path, receipts })
+    }
+
+    pub fn receipts(&self) -> &[InboundSessionReceipt] {
+        &self.receipts
+    }
+
+    pub fn accept(&mut self, mut receipt: InboundSessionReceipt) -> Result<SessionIdempotency> {
+        if let Some(existing) = self
+            .receipts
+            .iter()
+            .find(|existing| existing.object_id == receipt.object_id)
+        {
+            anyhow::ensure!(
+                existing == &receipt,
+                "session receipt conflicts with an existing object"
+            );
+            return Ok(SessionIdempotency::AlreadySeen);
+        }
+        anyhow::ensure!(
+            self.receipts.len() < MAX_RECEIPTS,
+            "session receipt ledger is full"
+        );
+        receipt.idempotency = SessionIdempotency::New;
+        self.receipts.push(receipt);
+        let bytes = serde_json::to_vec(&self.receipts)?;
+        vibeface_bridge::platform::privatefs::write_atomic(&self.path, &bytes)?;
+        Ok(SessionIdempotency::New)
+    }
 }
 
 /// Classify the event kinds that may cross an encrypted session relay.
@@ -345,5 +415,72 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn receipt(id: u8) -> InboundSessionReceipt {
+        InboundSessionReceipt {
+            object_id: [id; 32],
+            kind: SessionObjectKind::Message,
+            conversation_id: "conversation-1".into(),
+            sender_peer: [1; 32],
+            receiver_peer: [2; 32],
+            payload_hash: [3; 32],
+            signature_verification: SessionSignatureVerification::Verified,
+            received_at_ms: 10,
+            idempotency: SessionIdempotency::New,
+        }
+    }
+
+    fn test_dir(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "vibeface-session-receipt-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn receipt_ledger_recovers_and_deduplicates() {
+        let dir = test_dir("recover");
+        let mut ledger = SessionReceiptLedger::open(&dir).unwrap();
+        assert_eq!(ledger.accept(receipt(7)).unwrap(), SessionIdempotency::New);
+        assert_eq!(
+            ledger.accept(receipt(7)).unwrap(),
+            SessionIdempotency::AlreadySeen
+        );
+        assert_eq!(ledger.receipts().len(), 1);
+        drop(ledger);
+        let reopened = SessionReceiptLedger::open(&dir).unwrap();
+        assert_eq!(reopened.receipts().len(), 1);
+        assert_eq!(reopened.receipts()[0].object_id, [7; 32]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_ledger_rejects_symlinked_file() {
+        let dir = test_dir("symlink");
+        let delivery = dir.join("delivery");
+        std::fs::create_dir(&delivery).unwrap();
+        let target = dir.join("target.json");
+        std::fs::write(&target, b"[]").unwrap();
+        std::os::unix::fs::symlink(&target, delivery.join(RECEIPT_FILE)).unwrap();
+        assert!(SessionReceiptLedger::open(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn receipt_ledger_rejects_invalid_json() {
+        let dir = test_dir("invalid");
+        let delivery = dir.join("delivery");
+        std::fs::create_dir(&delivery).unwrap();
+        std::fs::write(delivery.join(RECEIPT_FILE), b"not-json").unwrap();
+        assert!(SessionReceiptLedger::open(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
