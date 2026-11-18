@@ -66,6 +66,7 @@ impl LanEndpoint {
         })
     }
 
+    #[cfg(test)]
     fn from_endpoint(endpoint: Endpoint) -> Self {
         Self { endpoint }
     }
