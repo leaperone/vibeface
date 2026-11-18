@@ -621,6 +621,10 @@ pub(crate) fn package_release_version(package: &Path) -> Result<String> {
     Ok(manifest(package)?.version.to_string())
 }
 
+pub(crate) fn package_core_version(package: &Path) -> Result<String> {
+    Ok(manifest(package)?.core_version.to_string())
+}
+
 pub(crate) fn switch_managed_current(managed_root: &Path, release: &Path) -> Result<()> {
     switch(managed_root, release)
 }

@@ -423,8 +423,8 @@ fn runtime_update_for_packages(
                 UpdateAvailability::DowngradeRefused
             } else if bundled_parsed == current_parsed {
                 if crate::update::release::same_package_bytes(bundled, current)? {
-                    if running_version
-                        .is_some_and(|running| installed_version.as_deref() != Some(running))
+                    if let Some(running) = running_version
+                        && running != crate::update::package_core_version(current)?
                     {
                         UpdateAvailability::NewerAvailable
                     } else {
@@ -751,15 +751,16 @@ async fn prove_switched_release(
         if !(native.installed && native.running) {
             return Err(OperationFailure::Service.into());
         }
+        let core_version = crate::update::package_core_version(&package)?;
         if inspected.status != NodeStatus::Running
-            || running_core_version(&inspected)? != bundled_version
+            || running_core_version(&inspected)? != core_version
         {
             return Err(OperationFailure::Health.into());
         }
         Ok(VerifiedRelease {
             service_running: true,
             core_status: NodeStatus::Running,
-            running_version: Some(bundled_version.to_owned()),
+            running_version: Some(core_version),
         })
     } else {
         if !(native.installed && !native.running) {
@@ -1064,7 +1065,7 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                             if native.running
                                 && (fresh.status != NodeStatus::Running
                                     || running_core_version(&fresh)?
-                                        != bundled_package_version(&source)?)
+                                        != crate::update::package_core_version(&installed)?)
                             {
                                 anyhow::bail!(OperationFailure::UpdateRefused);
                             }
@@ -1545,7 +1546,18 @@ mod tests {
         let newer = runtime_update_for_packages(&bundled, Some(&installed), None).unwrap();
         assert_eq!(newer.availability, UpdateAvailability::NewerAvailable);
         let matching = sealed_fixture_version(&root.join("matching"), env!("CARGO_PKG_VERSION"));
-        let current = runtime_update_for_packages(&matching, Some(&matching), None).unwrap();
+        let build_path = matching.join("BUILD-INFO.json");
+        let mut build: serde_json::Value =
+            serde_json::from_slice(&fs::read(&build_path).unwrap()).unwrap();
+        build["core_version"] = "0.0.1-hourly.2026110711".into();
+        fs::write(build_path, serde_json::to_vec(&build).unwrap()).unwrap();
+        reseal(&matching);
+        let current = runtime_update_for_packages(
+            &matching,
+            Some(&matching),
+            Some("0.0.1-hourly.2026110711"),
+        )
+        .unwrap();
         assert_eq!(current.availability, UpdateAvailability::Current);
         let downgraded =
             sealed_fixture_version(&root.join("downgraded"), "0.0.1-hourly.2026110612");
