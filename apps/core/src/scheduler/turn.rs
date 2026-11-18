@@ -290,7 +290,9 @@ impl TurnAttempt {
             .context("claimed scheduler attempt missing")?
             .clone();
         if let Some(work_id) = match crate::scheduling::Trigger::decode(trigger).ok() {
-            Some(crate::scheduling::Trigger::Work(id) | crate::scheduling::Trigger::Task(id)) => Some(id),
+            Some(crate::scheduling::Trigger::Work(id) | crate::scheduling::Trigger::Task(id)) => {
+                Some(id)
+            }
             _ => None,
         } {
             tracing::Span::current().record("work_id", work_id);

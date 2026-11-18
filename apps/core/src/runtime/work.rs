@@ -231,7 +231,9 @@ impl Runtime {
                     "the result this work follows has not reached this device"
                 );
             }
-            Ok(crate::scheduling::Trigger::Schedule { id: schedule_id, .. }) => {
+            Ok(crate::scheduling::Trigger::Schedule {
+                id: schedule_id, ..
+            }) => {
                 ensure!(
                     from_owner,
                     AdmissionRejected::new(

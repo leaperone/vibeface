@@ -258,7 +258,9 @@ fn target_from(
                 Source::Trigger(trigger)
             }
             Source::Trigger(trigger) => match Trigger::decode(&trigger) {
-                Ok(Trigger::Message(message) | Trigger::BotMessage(message)) => Source::Message(message.into()),
+                Ok(Trigger::Message(message) | Trigger::BotMessage(message)) => {
+                    Source::Message(message.into())
+                }
                 Ok(Trigger::Work(work_id)) => Source::Work(work_id.into()),
                 Ok(Trigger::Assignment(assignment_id)) => {
                     let Some(assignment) =

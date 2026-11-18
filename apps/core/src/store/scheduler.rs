@@ -1307,8 +1307,8 @@ pub(super) fn work_shares_native_execution_from(
     {
         return Ok(false);
     }
-    if matches!(Trigger::decode(&left.trigger), Ok(Trigger::Assignment(_)))
-        || matches!(Trigger::decode(&right.trigger), Ok(Trigger::Assignment(_)))
+    if Trigger::tag_of(&left.trigger) == Some(TriggerTag::Assignment)
+        || Trigger::tag_of(&right.trigger) == Some(TriggerTag::Assignment)
     {
         if left.trigger != right.trigger {
             return Ok(false);
@@ -1400,7 +1400,10 @@ fn work_native_authority_allowed_from(
     network: &str,
     work: &WorkProjection,
 ) -> Result<bool> {
-    if let Ok(Trigger::Assignment(assignment)) = Trigger::decode(&work.trigger) {
+    if Trigger::tag_of(&work.trigger) == Some(TriggerTag::Assignment) {
+        let Ok(Trigger::Assignment(assignment)) = Trigger::decode(&work.trigger) else {
+            return Ok(false);
+        };
         return super::workspace::assignment_work_allowed_from(
             connection,
             network,
@@ -3181,7 +3184,9 @@ pub(crate) fn chain_depth(
     for _ in 0..64 {
         match Trigger::decode(&trigger) {
             Ok(Trigger::Message(_)) => return Ok(0),
-            Ok(Trigger::Schedule { id: schedule_id, .. }) => {
+            Ok(Trigger::Schedule {
+                id: schedule_id, ..
+            }) => {
                 return Ok(
                     super::bot_settings::schedule_from(connection, network, schedule_id)?
                         .map_or(MAX_CHAIN_DEPTH, |entry| entry.schedule.depth),
@@ -3437,10 +3442,12 @@ fn report_origin_from(
                         .unwrap_or(true),
                 }));
             }
-            Ok(Trigger::Work(work_id) | Trigger::Task(work_id)) => match cause_from(connection, network, work_id)? {
-                Some((_, cause)) => trigger = cause,
-                None => return Ok(None),
-            },
+            Ok(Trigger::Work(work_id) | Trigger::Task(work_id)) => {
+                match cause_from(connection, network, work_id)? {
+                    Some((_, cause)) => trigger = cause,
+                    None => return Ok(None),
+                }
+            }
             Ok(Trigger::Assignment(id)) => {
                 let Some(assignment) =
                     super::workspace::workspace_assignment_from(connection, network, id)?

@@ -56,7 +56,7 @@ fn input_requires_new_assignment_from(
         task_id: assignment.task_id.clone(),
     }
     .storage_key();
-    let direct = format!("assignment:{}", assignment.assignment_id);
+    let direct = crate::scheduling::assignment_trigger(&assignment.assignment_id);
     let source = assignment
         .trigger_message_id
         .as_ref()

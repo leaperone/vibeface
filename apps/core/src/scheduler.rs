@@ -1452,7 +1452,9 @@ pub(crate) fn trigger_event_key(trigger: &str) -> Option<(&'static str, &str)> {
         crate::scheduling::Trigger::Work(subject) => Some(("work_finished", subject)),
         crate::scheduling::Trigger::Task(subject) => Some(("work_dispatched", subject)),
         crate::scheduling::Trigger::BotMessage(subject) => Some(("bot_messaged", subject)),
-        crate::scheduling::Trigger::Assignment(_) | crate::scheduling::Trigger::Schedule { .. } => None,
+        crate::scheduling::Trigger::Assignment(_) | crate::scheduling::Trigger::Schedule { .. } => {
+            None
+        }
     }
 }
 

@@ -787,7 +787,9 @@ pub(crate) fn user_cause(
     scope: &str,
     trigger: &str,
 ) -> Result<Option<Cause>> {
-    let Some(message) = trigger.strip_prefix("message:") else {
+    let Ok(crate::scheduling::Trigger::Message(message)) =
+        crate::scheduling::Trigger::decode(trigger)
+    else {
         return Ok(None);
     };
     let message = message_from(connection, network, scope, message)?

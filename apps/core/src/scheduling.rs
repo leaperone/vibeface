@@ -105,12 +105,16 @@ impl SessionScope {
         }
         if let Some(work_id) = key.strip_prefix("task:") {
             vibeface_protocol::validate_id(work_id).map_err(anyhow::Error::msg)?;
-            return Ok(Self::Task { work_id: work_id.into() });
+            return Ok(Self::Task {
+                work_id: work_id.into(),
+            });
         }
         if let Some(trigger) = key.strip_prefix("routine:")
             && matches!(Trigger::decode(trigger), Ok(Trigger::Schedule { .. }))
         {
-            return Ok(Self::Routine { trigger: trigger.into() });
+            return Ok(Self::Routine {
+                trigger: trigger.into(),
+            });
         }
         anyhow::bail!("invalid scheduler session scope")
     }
@@ -187,12 +191,14 @@ pub(crate) enum TriggerError {
 }
 
 impl<'a> Trigger<'a> {
+    pub(crate) fn tag_of(key: &str) -> Option<TriggerTag> {
+        let prefix = key.split_once(':')?.0;
+        TriggerTag::ALL.into_iter().find(|tag| tag.name() == prefix)
+    }
+
     pub(crate) fn decode(key: &'a str) -> Result<Self, TriggerError> {
-        let (prefix, value) = key.split_once(':').ok_or(TriggerError::UnknownTag)?;
-        let tag = TriggerTag::ALL
-            .into_iter()
-            .find(|tag| tag.name() == prefix)
-            .ok_or(TriggerError::UnknownTag)?;
+        let (_, value) = key.split_once(':').ok_or(TriggerError::UnknownTag)?;
+        let tag = Self::tag_of(key).ok_or(TriggerError::UnknownTag)?;
         let id = || -> Result<&str, TriggerError> {
             vibeface_protocol::validate_id(value)
                 .map_err(|error| TriggerError::InvalidId(tag, error))?;
@@ -938,6 +944,19 @@ mod lane_tests {
         ] {
             assert!(Trigger::decode(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn recognized_tags_survive_malformed_subjects() {
+        assert_eq!(Trigger::tag_of("assignment:"), Some(TriggerTag::Assignment));
+        assert_eq!(
+            Trigger::tag_of("assignment:a:b"),
+            Some(TriggerTag::Assignment)
+        );
+        assert_eq!(Trigger::tag_of("schedule:s:-1"), Some(TriggerTag::Schedule));
+        assert!(Trigger::decode("assignment:").is_err());
+        assert!(Trigger::decode("assignment:a:b").is_err());
+        assert!(Trigger::decode("schedule:s:-1").is_err());
     }
 
     #[test]

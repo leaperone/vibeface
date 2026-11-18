@@ -119,7 +119,11 @@ impl PeerEnvelope {
         );
         let max_refs = match &self.payload {
             PeerCommand::Dispatch { spec }
-                if matches!(Trigger::decode(&spec.trigger), Ok(Trigger::Assignment(_))) => 1024,
+                if Trigger::tag_of(&spec.trigger)
+                    == Some(crate::scheduling::TriggerTag::Assignment) =>
+            {
+                1024
+            }
             _ => 32,
         };
         ensure!(
@@ -139,7 +143,8 @@ impl PeerEnvelope {
                 _ => anyhow::bail!("invalid delivery trigger"),
             },
             PeerCommand::Dispatch { spec } => {
-                if matches!(Trigger::decode(&spec.trigger), Ok(Trigger::Assignment(_))) {
+                if Trigger::tag_of(&spec.trigger) == Some(crate::scheduling::TriggerTag::Assignment)
+                {
                     ensure!(
                         self.revision.is_some_and(|revision| revision > 0)
                             && self.sequence == 0
@@ -544,6 +549,15 @@ impl Store {
                     return Ok(format!("workspace_task:{}", assignment.task_id));
                 }
                 Ok(Trigger::Schedule { .. }) => return Ok(format!("routine:{trigger}")),
+                Err(_)
+                    if Trigger::tag_of(&trigger)
+                        == Some(crate::scheduling::TriggerTag::Schedule) =>
+                {
+                    anyhow::bail!("invalid schedule trigger")
+                }
+                Err(_) if Trigger::tag_of(&trigger).is_some() => {
+                    anyhow::bail!("invalid delivery trigger")
+                }
                 _ => return Ok("main".into()),
             }
         }
@@ -654,7 +668,7 @@ impl Store {
         if trigger == received {
             return Ok(true);
         }
-        let Some(("assignment", assignment_id)) = trigger.split_once(':') else {
+        let Ok(Trigger::Assignment(assignment_id)) = Trigger::decode(trigger) else {
             return Ok(false);
         };
         let assignment = self.delivery_assignment(network, conversation, assignment_id)?;
@@ -693,13 +707,11 @@ impl Store {
                         .bot_owner_epoch
                 }
                 PeerCommand::Dispatch { spec }
-                    if let Ok(Trigger::Assignment(assignment_id)) = Trigger::decode(&spec.trigger) => {
-                    self.delivery_assignment(
-                        network,
-                        &spec.conversation,
-                        assignment_id,
-                    )?
-                    .bot_owner_epoch
+                    if let Ok(Trigger::Assignment(assignment_id)) =
+                        Trigger::decode(&spec.trigger) =>
+                {
+                    self.delivery_assignment(network, &spec.conversation, assignment_id)?
+                        .bot_owner_epoch
                 }
                 _ => {
                     self.conversation(network, payload.conversation())?
