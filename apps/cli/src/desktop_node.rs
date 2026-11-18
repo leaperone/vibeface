@@ -1308,8 +1308,10 @@ async fn dispatch(options: DesktopNode, bundled: &Path) -> Result<()> {
                         "Desktop Node updater policy changed"
                     );
                     let package = managed_current(&receipt.managed_root)?;
-                    run_service(&package, &data, &receipt.service_id, "stop").await?;
+                    let native = native_service(&package, &data, &receipt.service_id).await?;
+                    ensure!(native.installed, OperationFailure::Service);
                     crate::update::record_stop_requested(&data, expected)?;
+                    run_service(&package, &data, &receipt.service_id, "stop").await?;
                     wait_data_unlocked(&data)
                         .await
                         .context(OperationFailure::Lock)?;

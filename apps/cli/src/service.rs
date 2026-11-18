@@ -349,11 +349,12 @@ pub async fn run(options: Service) -> Result<()> {
     } else {
         command(&root, &data, &executable, action)?
     };
-    run_command(&mut operation).await?;
     if matches!(action, Action::Stop) {
+        let registered = native_registration(&package, &data, service_id).await?;
+        ensure!(registered.installed, "installed node service is required");
         update::record_stop_requested(&data, &inspected.device_id)?;
     }
-    Ok(())
+    run_command(&mut operation).await
 }
 
 async fn run_command(operation: &mut Command) -> Result<()> {

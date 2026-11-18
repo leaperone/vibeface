@@ -101,6 +101,20 @@ fn checked(code: u32) -> io::Result<()> {
 pub struct Sid(Vec<u32>);
 
 impl Sid {
+    fn from_string(value: &str) -> io::Result<Self> {
+        use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+        let value = wide(OsStr::new(value));
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: the SID string is terminated and the out pointer is writable.
+        if unsafe { ConvertStringSidToSidW(value.as_ptr(), &mut raw) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the returned SID remains live until it is copied and released with LocalFree.
+        let result = unsafe { Sid::copy_from(raw) };
+        unsafe { LocalFree(raw) };
+        result
+    }
+
     fn well_known(kind: windows_sys::Win32::Security::WELL_KNOWN_SID_TYPE) -> io::Result<Self> {
         use windows_sys::Win32::Security::CreateWellKnownSid;
         let mut words = vec![0_u32; 17];
@@ -525,24 +539,47 @@ pub(super) fn path_is_trusted_install(path: &Path, ancestor: bool) -> io::Result
     let user = current_user()?;
     let system = Sid::well_known(WinLocalSystemSid)?;
     let administrators = Sid::well_known(WinBuiltinAdministratorsSid)?;
-    let trusted = [&user, &system, &administrators];
+    let installer =
+        Sid::from_string("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464")?;
+    let trusted = [&user, &system, &administrators, &installer];
     let descriptor = ReadDescriptor::of_path(path)?;
     // SAFETY: the owner pointer belongs to the live descriptor.
     let owner = unsafe { Sid::copy_from(descriptor.owner) }?;
     if !trusted.contains(&&owner) {
         return Ok(false);
     }
-    // DELETE, WRITE_DAC, WRITE_OWNER, FILE_DELETE_CHILD, GENERIC_WRITE and GENERIC_ALL
-    // can let an untrusted principal replace a package or loosen its access control.
-    let replacement = 0xc00d_0040_u32;
-    // FILE_WRITE_DATA, FILE_APPEND_DATA, FILE_WRITE_EA and FILE_WRITE_ATTRIBUTES.
-    let file_writes = 0x116_u32;
-    let mask = if ancestor {
+    descriptor.allows_only(&trusted, install_write_mask(ancestor))
+}
+
+fn install_write_mask(ancestor: bool) -> u32 {
+    use windows_sys::Win32::{
+        Foundation::{GENERIC_ALL, GENERIC_WRITE},
+        Storage::FileSystem::{
+            DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+            FILE_WRITE_EA, WRITE_DAC, WRITE_OWNER,
+        },
+    };
+    let replacement =
+        DELETE | WRITE_DAC | WRITE_OWNER | FILE_DELETE_CHILD | GENERIC_WRITE | GENERIC_ALL;
+    if ancestor {
         replacement
     } else {
-        replacement | file_writes
-    };
-    descriptor.allows_only(&trusted, mask)
+        replacement | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_DATA | FILE_WRITE_EA
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn install_write_mask_covers_generic_all_but_permits_generic_read() {
+    use windows_sys::Win32::Foundation::{GENERIC_ALL, GENERIC_READ, GENERIC_WRITE};
+    for ancestor in [false, true] {
+        let mask = install_write_mask(ancestor);
+        assert_eq!(mask & GENERIC_READ, 0);
+        assert_eq!(
+            mask & (GENERIC_ALL | GENERIC_WRITE),
+            GENERIC_ALL | GENERIC_WRITE
+        );
+    }
 }
 
 /// Whether only this account can reach the kernel object behind `handle`, used to prove the
