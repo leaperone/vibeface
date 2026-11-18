@@ -210,7 +210,7 @@ function Waiting({ joinStatus, code, admin, reached, error, reconnecting, onCanc
   const checking = joinStatus === 'checking'
   const title = awaitingAcceptance ? '请在电脑上接受申请' : checking ? joinCopy.joining : joinCopy.waiting
   const status = awaitingAcceptance
-    ? '在 Vibeface 设备页点「读取加入请求」，再点这条申请的「开始短码核对」。网页版点「显示安全码」。'
+    ? '在电脑端的「设备」页点「读取加入请求」，找到这条申请并开始比对安全码。网页版点「显示安全码」。'
     : code ? joinCopy.compareCode(admin) : checking ? '正在确认申请是否送达…' : joinCopy.showCode
   return <Panel icon={Hourglass} title={title}>
     {reached ? <View className="flex-row items-center gap-2"><Icon as={ShieldCheck} className="size-4 text-success" /><Text className="text-sm text-muted">{joinCopy.reached}</Text></View> : null}
