@@ -409,17 +409,26 @@ impl Delivery {
         node: &Runtime,
         object: &EncryptedSessionObject,
     ) -> Result<Option<SessionStoredReceipt>> {
+        verify_object(object)?;
+        self.fetch_session_receipt(node, &object.header).await
+    }
+
+    pub(super) async fn fetch_session_receipt(
+        &self,
+        node: &Runtime,
+        header: &vibeface_delivery::SessionObjectHeader,
+    ) -> Result<Option<SessionStoredReceipt>> {
         self.ensure_mode(Mode::Charity)?;
         let receipt: Option<SessionStoredReceipt> = request(
             node,
-            &object.header.provider_peer,
+            &header.provider_peer,
             SessionRelayRequest::Receipt {
-                object_id: object.header.object_id,
+                object_id: header.object_id,
             },
         )
         .await?;
         if let Some(receipt) = &receipt {
-            receipt.verify(object)?;
+            receipt.verify_header(header)?;
         }
         Ok(receipt)
     }
@@ -1010,6 +1019,7 @@ mod tests {
             })
             .await?;
         let relay_database = dir.join("relay/delivery/session-relay.sqlite3");
+        let sender_database = dir.join("sender/delivery/session-outbox.sqlite3");
         let mut target_settings = target.delivery.config();
         target_settings.session_route = Some(incoming.clone());
         target.delivery.configure_local(target_settings)?;
@@ -1038,8 +1048,18 @@ mod tests {
                 } else {
                     0
                 };
+                let confirmed: u32 = rusqlite::Connection::open_with_flags(
+                    &sender_database,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )?
+                .query_row(
+                    "SELECT count(*) FROM receipt_queue WHERE route=?1 AND receipt IS NOT NULL",
+                    [&route_id],
+                    |row| row.get(0),
+                )?;
                 if present
-                    && acknowledged >= 3
+                    && acknowledged == 3
+                    && confirmed == 2
                     && target
                         .delivery
                         .session_inbox(&target, &incoming)

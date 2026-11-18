@@ -3,12 +3,13 @@
 //! This store deliberately keeps the session payload opaque.  Endpoint delivery code remains
 //! responsible for checking the object header, signature, ciphertext commitment, and capsule.
 
-use super::session::SealedSessionObject;
+use super::session::{SealedSessionObject, SessionStoredReceipt};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::Path;
 use vibeface_delivery::{
     CAPSULE_BYTES, EncryptedSessionObject, MAX_SESSION_OBJECT_BYTES, PeerSignature,
+    SessionObjectHeader,
 };
 
 const MAX_ROUTES: i64 = 64;
@@ -17,6 +18,7 @@ const MAX_BATCH_BYTES: usize = 128 * 1024 * 1024;
 const MAX_STAGED_BYTES: usize = 2 * MAX_BATCH_BYTES;
 const MAX_ROUTE_BYTES: usize = 256;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
+const CHARITY_RECEIPT_HISTORY_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 /// One sender batch, kept until the endpoint has accepted every object in it.
 pub(super) struct StagedBatch {
@@ -91,6 +93,17 @@ impl SessionOutboxStore {
                 "unsupported session outbox database schema version {version}; initialize a fresh Node data directory"
             ),
         }
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS receipt_queue (
+                route TEXT NOT NULL REFERENCES routes(route) ON DELETE CASCADE,
+                sequence INTEGER NOT NULL,
+                header TEXT NOT NULL,
+                expires INTEGER NOT NULL,
+                checked INTEGER NOT NULL DEFAULT 0,
+                receipt TEXT,
+                PRIMARY KEY (route,sequence)
+             ) WITHOUT ROWID;",
+        )?;
         tx.commit()?;
         Ok(Self { db })
     }
@@ -281,6 +294,66 @@ impl SessionOutboxStore {
         Ok(())
     }
 
+    pub(super) fn next_receipt(
+        &mut self,
+        route: &str,
+        now: u64,
+    ) -> Result<Option<(u64, SessionObjectHeader)>> {
+        validate_route(route)?;
+        let now = sqlite_u64(now)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM receipt_queue WHERE expires <= ?1",
+            [now.saturating_sub(CHARITY_RECEIPT_HISTORY_MS)],
+        )?;
+        let row: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT sequence,header FROM receipt_queue
+             WHERE route=?1 AND receipt IS NULL AND expires>?2 ORDER BY checked,sequence LIMIT 1",
+                params![route, now],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((sequence, _)) = row.as_ref() {
+            tx.execute(
+                "UPDATE receipt_queue SET checked=?3 WHERE route=?1 AND sequence=?2",
+                params![route, sequence, now],
+            )?;
+        }
+        tx.commit()?;
+        row.map(|(sequence, header)| {
+            Ok((parse_sqlite_u64(sequence)?, serde_json::from_str(&header)?))
+        })
+        .transpose()
+    }
+
+    pub(super) fn record_receipt(
+        &self,
+        route: &str,
+        sequence: u64,
+        receipt: &SessionStoredReceipt,
+    ) -> Result<()> {
+        let sequence = sqlite_u64(sequence)?;
+        let header: String = self.db.query_row(
+            "SELECT header FROM receipt_queue WHERE route=?1 AND sequence=?2",
+            params![route, sequence],
+            |row| row.get(0),
+        )?;
+        receipt.verify_header(&serde_json::from_str(&header)?)?;
+        let receipt = serde_json::to_string(receipt)?;
+        ensure!(
+            self.db.execute(
+                "UPDATE receipt_queue SET receipt=?3
+                 WHERE route=?1 AND sequence=?2 AND (receipt IS NULL OR receipt=?3)",
+                params![route, sequence, receipt],
+            )? == 1,
+            "session receipt changed across retries"
+        );
+        Ok(())
+    }
+
     pub(super) fn advance(
         &mut self,
         route: &str,
@@ -323,7 +396,19 @@ impl SessionOutboxStore {
                 usize::try_from(object_count).context("invalid staged object count")?;
             let total_bytes = usize::try_from(total_bytes).context("invalid staged byte count")?;
             // Refuse to discard a torn or manually modified batch.
-            let _ = read_objects(&tx, route, object_count, total_bytes)?;
+            let objects = read_objects(&tx, route, object_count, total_bytes)?;
+            // The event receipt covers the whole bundle, including all referenced files.
+            let event_header = &objects.last().context("staged batch has no event")?.header;
+            let header: SessionObjectHeader = serde_json::from_slice(event_header)?;
+            tx.execute(
+                "INSERT INTO receipt_queue(route,sequence,header,expires) VALUES(?1,?2,?3,?4)",
+                params![
+                    route,
+                    sequence,
+                    std::str::from_utf8(event_header)?,
+                    sqlite_u64(header.expires_at_ms)?
+                ],
+            )?;
             tx.execute("DELETE FROM staged_batches WHERE route=?1", [route])?;
         }
         tx.execute(

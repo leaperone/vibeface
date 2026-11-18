@@ -256,6 +256,17 @@ impl Delivery {
             (cursor, outbox.batch(&route_id)?)
         };
 
+        let pending = SessionOutboxStore::open(&self.data_dir)?
+            .next_receipt(&route_id, clock::now_ms_u64())?;
+        if let Some((sequence, header)) = pending {
+            match self.fetch_session_receipt(node, &header).await {
+                Ok(Some(receipt)) => SessionOutboxStore::open(&self.data_dir)?
+                    .record_receipt(&route_id, sequence, &receipt)?,
+                Ok(None) => {}
+                Err(error) => tracing::debug!(%error, "session relay receipt is pending"),
+            }
+        }
+
         let (sequence, objects) = if let Some(batch) = existing {
             (batch.sequence, batch.objects)
         } else {
