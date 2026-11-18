@@ -3,8 +3,6 @@
 extern crate alloc;
 
 mod crypto;
-mod session;
-mod session_settlement;
 mod statement;
 
 use alloc::{
@@ -17,18 +15,8 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub use crypto::{
-    encrypt_charity_window, encrypt_window, open_session_key, receiving_public,
-    recover_charity_window, recover_window, seal_session_key, validate_receiving_public,
-    verify_peer, verify_relation,
-};
-pub use session::{
-    EncryptedSessionObject, MAX_SESSION_CHUNK_BYTES, MAX_SESSION_ID_BYTES,
-    MAX_SESSION_OBJECT_BYTES, SESSION_AEAD_TAG_BYTES, SESSION_OBJECT_VERSION, SessionObjectChunk,
-    SessionObjectHeader, SessionObjectKind, decrypt_session_payload, encrypt_session_payload,
-};
-pub use session_settlement::{
-    MAX_SESSION_SETTLEMENT_ORDERS, SESSION_SETTLEMENT_RECEIPT_DOMAIN, SessionSettlementBatch,
-    SessionSettlementClaim, SessionSettlementOrder, verify_session_settlement,
+    encrypt_charity_window, encrypt_window, receiving_public, recover_charity_window,
+    recover_window, validate_receiving_public, verify_peer, verify_relation,
 };
 pub use statement::{ProofProfile, Statement, hash, schema_hash, signing_message};
 

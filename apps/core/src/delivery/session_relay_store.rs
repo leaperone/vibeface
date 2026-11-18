@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use vibeface_delivery::{
+use vibeface_session_delivery::{
     CAPSULE_BYTES, EncryptedSessionObject, MAX_SESSION_OBJECT_BYTES, PeerSignature,
     SessionObjectHeader, Word, hash,
 };
@@ -244,7 +244,7 @@ impl SessionRelayStore {
         let mut objects = Vec::new();
         while let Some(row) = rows.next()? {
             let manifest: RelayManifest = serde_json::from_str(&row.get::<_, String>(0)?)?;
-            if manifest.header.kind != vibeface_delivery::SessionObjectKind::Attachment
+            if manifest.header.kind != vibeface_session_delivery::SessionObjectKind::Attachment
                 && manifest.header.conversation_id == conversation
             {
                 objects.push(manifest.header.object_id);
@@ -484,7 +484,7 @@ fn complete_payload_matches(db: &Connection, id: &Word, manifest: &RelayManifest
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vibeface_delivery::{EncryptedSessionObject, SessionObjectKind};
+    use vibeface_session_delivery::{EncryptedSessionObject, SessionObjectKind};
 
     fn fixture(size: usize) -> (RelayManifest, Vec<u8>) {
         let capsule = [7; CAPSULE_BYTES];

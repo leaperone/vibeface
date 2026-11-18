@@ -385,7 +385,8 @@ def prepare_canonical(fixtures=None):
     environment = {**os.environ, "RISC0_BUILD_LOCKED": "1"}
     target = Path("/artifacts/proof-target")
     run(["cargo", "fmt", "--manifest-path", "crates/delivery/proof/Cargo.toml", "--all", "--", "--check"], env=environment)
-    run(["cargo", "fmt", "--manifest-path", "crates/delivery/proof/guest/Cargo.toml", "--", "--check"], env=environment)
+    for guest in ("guest", "session-guest"):
+        run(["cargo", "fmt", "--manifest-path", f"crates/delivery/proof/{guest}/Cargo.toml", "--", "--check"], env=environment)
     run(["bash", "crates/delivery/proof/build.sh"], env=environment)
     prover = target / "release/vibeface-delivery-prover"
     compiled = json.loads(run([str(prover), "info"], capture_output=True, text=True, env=environment).stdout)

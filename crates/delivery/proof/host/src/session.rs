@@ -6,10 +6,10 @@ use anyhow::{Context, Result, bail, ensure};
 use risc0_zkvm::{Executor, ExecutorEnv, InnerReceipt, Prover, ProverOpts, Receipt, sha::Digest};
 use serde_json::json;
 use std::path::Path;
-use vibeface_delivery::{SessionSettlementClaim, hash, verify_session_settlement};
 use vibeface_delivery_methods::{
     VIBEFACE_SESSION_SETTLEMENT_ELF as ELF, VIBEFACE_SESSION_SETTLEMENT_ID as IMAGE,
 };
+use vibeface_session_delivery::{SessionSettlementClaim, hash, verify_session_settlement};
 
 const JOURNAL_BYTES: usize = 8 * 32;
 const MAX_INPUT: u64 = 64 * 1024;

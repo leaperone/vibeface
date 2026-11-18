@@ -7,7 +7,7 @@ use super::session::{CharityKey, SealedSessionObject, SessionStoredReceipt};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::Path;
-use vibeface_delivery::{
+use vibeface_session_delivery::{
     CAPSULE_BYTES, EncryptedSessionObject, MAX_SESSION_OBJECT_BYTES, PeerSignature,
     SessionObjectHeader,
 };
@@ -588,7 +588,7 @@ fn read_objects_as_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vibeface_delivery::{PeerSignature, SessionObjectKind};
+    use vibeface_session_delivery::{PeerSignature, SessionObjectKind};
 
     fn temp_dir() -> std::path::PathBuf {
         let path =

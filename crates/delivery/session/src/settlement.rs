@@ -1,7 +1,7 @@
 //! The receipt relation for paid session delivery. Funding, time and spent orders are chain state.
 
 use alloc::vec::Vec;
-use alloy_primitives::B256;
+use alloy_primitives::{B256, U256};
 use alloy_sol_types::SolValue;
 use serde::{Deserialize, Serialize};
 
@@ -107,7 +107,7 @@ impl SessionSettlementBatch {
             B256::from(self.relay),
             B256::from(self.reservations_hash),
             u64::from(self.order_count),
-            self.amount.0,
+            U256::from_be_bytes(self.amount.to_be_bytes()),
             self.claim_until_ms,
         )
             .abi_encode_params()

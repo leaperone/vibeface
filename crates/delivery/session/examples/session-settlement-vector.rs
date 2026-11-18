@@ -2,7 +2,7 @@
 
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::json;
-use vibeface_delivery::{
+use vibeface_session_delivery::{
     Amount, PeerSignature, SESSION_SETTLEMENT_RECEIPT_DOMAIN, SessionSettlementClaim,
     SessionSettlementOrder, Word, hash, signing_message, verify_session_settlement,
 };

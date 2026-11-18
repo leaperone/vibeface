@@ -13,7 +13,7 @@ use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use vibeface_delivery::{
+use vibeface_session_delivery::{
     CAPSULE_BYTES, EncryptedSessionObject, MAX_SESSION_OBJECT_BYTES, SESSION_AEAD_TAG_BYTES, Word,
     hash, verify_peer,
 };
@@ -416,7 +416,7 @@ impl Delivery {
     pub(super) async fn fetch_session_receipt(
         &self,
         node: &Runtime,
-        header: &vibeface_delivery::SessionObjectHeader,
+        header: &vibeface_session_delivery::SessionObjectHeader,
     ) -> Result<Option<SessionStoredReceipt>> {
         self.ensure_mode(Mode::Charity)?;
         let receipt: Option<SessionStoredReceipt> = request(

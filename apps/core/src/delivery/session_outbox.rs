@@ -10,7 +10,7 @@ use crate::{clock, model::IngestStatus, runtime::Runtime};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use vibeface_delivery::hash;
+use vibeface_session_delivery::hash;
 
 const BUNDLE_LIFETIME_MS: u64 = 12 * 60 * 60 * 1000;
 const MAX_BUNDLE_ATTACHMENT_BYTES: u64 = 120 * 1024 * 1024;
@@ -113,7 +113,7 @@ impl Delivery {
         node: &Arc<Runtime>,
         network: &str,
         route: &SessionEndpointRoute,
-        id: vibeface_delivery::Word,
+        id: vibeface_session_delivery::Word,
     ) -> Result<()> {
         let relay = parse_word(&route.relay)?;
         let (object, capsule) = self
@@ -180,7 +180,7 @@ impl Delivery {
                             node,
                             relay,
                             id,
-                            size + 64 + 12 + vibeface_delivery::SESSION_AEAD_TAG_BYTES,
+                            size + 64 + 12 + vibeface_session_delivery::SESSION_AEAD_TAG_BYTES,
                         )
                         .await?,
                     );

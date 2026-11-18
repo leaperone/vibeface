@@ -8,4 +8,4 @@ rust-version.workspace = true
 risc0-build = "=3.0.6"
 
 [package.metadata.risc0]
-methods = ["../guest"]
+methods = ["../guest", "../session-guest"]

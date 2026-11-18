@@ -13,7 +13,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use rand::{RngCore, rngs::OsRng};
 use rusqlite::{OptionalExtension, params};
 use std::path::{Path, PathBuf};
-use vibeface_delivery::{
+use vibeface_session_delivery::{
     CAPSULE_BYTES, EncryptedSessionObject, MAX_SESSION_OBJECT_BYTES, PeerSignature, Secret32,
     SessionObjectKind, Word, decrypt_session_payload, encrypt_session_payload, hash,
     open_session_key, seal_session_key,
@@ -35,8 +35,8 @@ const OBJECT_FILE_LIMIT: u64 = (MAX_SESSION_OBJECT_BYTES as u64 * 2) + 1024 * 10
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredSessionObject {
-    header: vibeface_delivery::SessionObjectHeader,
-    signature: Option<vibeface_delivery::PeerSignature>,
+    header: vibeface_session_delivery::SessionObjectHeader,
+    signature: Option<vibeface_session_delivery::PeerSignature>,
     ciphertext_base64: String,
 }
 
@@ -143,7 +143,7 @@ pub(super) fn checked_event(network: &str, signed: &SignedEvent) -> Result<Event
 
 pub(super) fn verify_object(object: &EncryptedSessionObject) -> Result<()> {
     ensure!(
-        object.ciphertext.len() > 64 + 12 + vibeface_delivery::SESSION_AEAD_TAG_BYTES,
+        object.ciphertext.len() > 64 + 12 + vibeface_session_delivery::SESSION_AEAD_TAG_BYTES,
         "session ciphertext is missing its key commitment or sealed body"
     );
     Ok(object.verify_signature(
@@ -355,7 +355,7 @@ impl Delivery {
             let size = super::session_attachment::part_size(blob, index)?;
             ensure!(
                 object.ciphertext.len()
-                    == size + 64 + 12 + vibeface_delivery::SESSION_AEAD_TAG_BYTES,
+                    == size + 64 + 12 + vibeface_session_delivery::SESSION_AEAD_TAG_BYTES,
                 "incorrect encrypted attachment extent"
             );
             let secret = self.object_receiving_secret(object)?;
@@ -504,7 +504,7 @@ impl SessionStoredReceipt {
 
     pub(super) fn verify_header(
         &self,
-        header: &vibeface_delivery::SessionObjectHeader,
+        header: &vibeface_session_delivery::SessionObjectHeader,
     ) -> Result<()> {
         ensure!(
             header.object_id == self.object_id,

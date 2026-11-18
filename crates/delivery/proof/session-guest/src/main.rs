@@ -1,7 +1,7 @@
 #![no_main]
 
 use risc0_zkvm::guest::env;
-use vibeface_delivery::{SessionSettlementClaim, verify_session_settlement};
+use vibeface_session_delivery::{SessionSettlementClaim, verify_session_settlement};
 
 risc0_zkvm::guest::entry!(main);
 

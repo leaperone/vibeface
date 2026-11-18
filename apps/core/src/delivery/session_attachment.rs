@@ -1,7 +1,7 @@
 use crate::model::{BlobRef, MAX_BLOB_BYTES};
 use anyhow::{Result, ensure};
 use sha2::{Digest, Sha256};
-use vibeface_delivery::Word;
+use vibeface_session_delivery::Word;
 use zeroize::Zeroizing;
 
 const EXTENT_BYTES: usize = 8 * 1024 * 1024;

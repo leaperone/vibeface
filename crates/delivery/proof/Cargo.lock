@@ -2986,6 +2986,22 @@ dependencies = [
  "serde_json",
  "vibeface-delivery",
  "vibeface-delivery-methods",
+ "vibeface-session-delivery",
+ "zeroize",
+]
+
+[[package]]
+name = "vibeface-session-delivery"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-sol-types",
+ "chacha20poly1305",
+ "hpke",
+ "rand_chacha",
+ "rand_core 0.6.4",
+ "serde",
+ "vibeface-delivery",
  "zeroize",
 ]
 

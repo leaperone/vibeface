@@ -37,7 +37,7 @@ await withLocalEvm({ ganache, BrowserProvider }, async ({ rpc, provider }) => {
     const budget = await escrow.openBudget.staticCall(salt, relay.address, relayPeer, 100);
     await tx(escrow.openBudget(salt, relay.address, relayPeer, 100));
     const vector = JSON.parse(execFileSync('cargo', [
-      'run', '--locked', '--quiet', '-p', 'vibeface-delivery', '--example', 'session-settlement-vector', '--',
+      'run', '--locked', '--quiet', '-p', 'vibeface-session-delivery', '--example', 'session-settlement-vector', '--',
       await escrow.deployment(), budget, relayPeer, String(deadline),
       ...(info && name === 'SessionEscrow' ? ['--include-test-claims'] : []),
     ], { cwd: repo, encoding: 'utf8' }));
