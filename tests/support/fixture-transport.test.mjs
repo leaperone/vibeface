@@ -206,6 +206,23 @@ test('a complete final response settles its operation before child close', async
   assert.deepEqual(await transport.stop(), { code: 0, signal: null });
 });
 
+test('the close promise marks an exited generation before a later controller reset', async t => {
+  const { transport, child } = fixture(t, String.raw`
+    input.once('line', line => {
+      const { id } = JSON.parse(line);
+      process.stdout.write(JSON.stringify({ id, ok: true, result: { final: true } }) + '\n', () => process.exit(23));
+    });
+    reply({ ready: {} });
+  `);
+  await transport.ready;
+  const response = transport.call(inspect);
+  await nextMessage(child);
+  child.send({ op: 'reply', value: { id: 1, ok: true, result: { final: true } } });
+  assert.deepEqual(await response, { final: true });
+  assert.deepEqual(await transport.closed, { code: 23, signal: null });
+  await assert.rejects(transport.call(inspect), error => /stdout closed|child process closed/.test(error.message));
+});
+
 test('stop settles pending work and waits for real close after SIGTERM', { skip: process.platform === 'win32' }, async t => {
   const { transport, child, closed } = fixture(t, `
     waitForSignal = true;

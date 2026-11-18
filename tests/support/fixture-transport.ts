@@ -196,5 +196,5 @@ export function createFixtureTransport(child: FixtureChild, {
     throw new Error('Fixture cleanup timed out waiting for child close');
   }
 
-  return { ready, call, fail, stop: () => stopping ??= close() };
+  return { ready, call, fail, closed, stop: () => stopping ??= close() };
 }

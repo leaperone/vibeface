@@ -59,11 +59,15 @@ async function startFixture(kind) {
   if (appDir) args.push('--app-dir', appDir);
   if (process.env.VIBEFACE_E2E_PROFILE_FILE) args.push('--fixture-profile', process.env.VIBEFACE_E2E_PROFILE_FILE);
   const child = spawn('python3', args, { cwd: repository, stdio: ['pipe', 'pipe', 'inherit'] });
-  fixture = createFixtureTransport(child, {
+  const transport = createFixtureTransport(child, {
     requestTimeoutMs: 85000,
     shutdownTimeoutsMs: [15000, 5000, 5000],
   });
-  return fixture.ready;
+  fixture = transport;
+  void transport.closed.then(() => {
+    if (fixture === transport) fixture = undefined;
+  });
+  return transport.ready;
 }
 function command(value) {
   assert(fixture, 'Fixture is unavailable');
