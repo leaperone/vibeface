@@ -4,6 +4,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { mkdir, rename, unlink, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { parseFixtureReset } from '../tests/support/fixture-contract.ts';
 import { withControlledFixture } from '../tests/support/fixture-lifecycle.ts';
 import { createFixtureTransport, FixtureOperationError } from '../tests/support/fixture-transport.ts';
 
@@ -50,7 +51,6 @@ async function stopFixture() {
   assert(code === 0 && signal === null, 'Fixture cleanup failed');
 }
 async function startFixture(kind) {
-  assert(['single', 'delivery', 'workspace', 'mesh', 'cursor'].includes(kind), 'Unknown fixture kind');
   await stopFixture();
   assert(!stopping, 'Fixture controller is shutting down');
   const args = [resolve(repository, 'scripts/verify-node.py'), '--e2e-fixture', '--binary', binary,
@@ -85,7 +85,7 @@ const control = createServer(async (request, response) => {
     for await (const chunk of request) { length += chunk.length; assert(length <= 4096, 'Fixture request too large'); chunks.push(chunk); }
     const value = object(JSON.parse(Buffer.concat(chunks).toString('utf8')));
     let result;
-    if (value.op === 'reset') result = await startFixture(value.kind);
+    if (value.op === 'reset') result = await startFixture(parseFixtureReset(value).kind);
     else if (value.op === 'stop') { await stopFixture(); result = { stopped: true }; }
     else if (['restart', 'inspect', 'cursor_login', 'cursor_inspect', 'workspace_release', 'workspace_inspect', 'mesh_info', 'mesh_pairing', 'mesh_approve'].includes(value.op)) result = await command(value);
     else throw new Error('Unknown fixture operation');
