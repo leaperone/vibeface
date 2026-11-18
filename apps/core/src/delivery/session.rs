@@ -104,6 +104,10 @@ pub fn accept_inbound_session_object(
         object.header.sender_peer == *sender_peer,
         "session object sender does not match the verifying peer"
     );
+    anyhow::ensure!(
+        object.header.kind == expected_kind,
+        "session object kind does not match the expected payload kind"
+    );
     object.validate(chunk_bytes)?;
     object.verify_signature(sender_peer, domain, chunk_bytes)?;
     decode_event_payload(expected_kind, decrypted_payload)?;
