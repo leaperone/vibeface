@@ -1,4 +1,18 @@
-use super::*;
+use super::{
+    graph::Graph,
+    query::{read_graph, save_graph},
+    rebuild_lookup_projection, workspace_assignment_for_work_from, workspace_assignment_from,
+    workspace_task_from,
+};
+use crate::{
+    crypto::LocalIdentity,
+    model::{Event, EventBody, SignedEvent, VersionVector, WIRE_VERSION},
+    scheduling::SessionScope,
+    store::{Store, membership_from},
+    workspace::*,
+};
+use anyhow::{Context as _, Result};
+use rusqlite::Connection;
 
 fn task(id: &str) -> WorkspaceTask {
     WorkspaceTask {
@@ -50,7 +64,7 @@ fn assignment(id: &str, task: &str, work: Option<&str>, at: i64) -> Assignment {
     }
 }
 fn oracle(store: &Store, network: &str) -> Result<()> {
-    let graph = Graph::read(&store.connection, network)?;
+    let graph = read_graph(&store.connection, network)?;
     for (id, task) in &graph.tasks {
         assert_eq!(
             workspace_task_from(&store.connection, network, id)?,
@@ -109,7 +123,7 @@ fn lookup_winners_and_isolation_match_the_complete_graph() -> Result<()> {
             .assignments
             .insert(id.into(), assignment(id, task, work, at));
     }
-    graph.save(&store.connection, "n")?;
+    save_graph(&graph, &store.connection, "n")?;
     oracle(&store, "n")?;
     assert_eq!(
         workspace_assignment_for_work_from(&store.connection, "n", "work")?
@@ -155,8 +169,8 @@ fn ordinary_graph_saves_write_only_changed_lookup_rows_and_rollback_together() -
         let id = format!("task-{index}");
         graph.tasks.insert(id.clone(), task(&id));
     }
-    graph.save(&store.connection, &network)?;
-    let mut graph = Graph::read(&store.connection, &network)?;
+    save_graph(&graph, &store.connection, &network)?;
+    let mut graph = read_graph(&store.connection, &network)?;
     let mut event = Event {
         version: WIRE_VERSION,
         network_id: network.clone(),
@@ -183,13 +197,13 @@ fn ordinary_graph_saves_write_only_changed_lookup_rows_and_rollback_together() -
     };
     graph.record("input-event", &event, "rank-1", VersionVector::new())?;
     let before = changes(&store.connection)?;
-    graph.save(&store.connection, &network)?;
+    save_graph(&graph, &store.connection, &network)?;
     assert_eq!(
         changes(&store.connection)? - before,
         1,
         "an input writes only the canonical graph"
     );
-    let mut graph = Graph::read(&store.connection, &network)?;
+    let mut graph = read_graph(&store.connection, &network)?;
     event.scope_id = WORKSPACE_SCOPE.into();
     event.body = EventBody::WorkspaceCommanded {
         command_id: "defer".into(),
@@ -212,7 +226,7 @@ fn ordinary_graph_saves_write_only_changed_lookup_rows_and_rollback_together() -
         vec!["task-0"]
     );
     let before = changes(&store.connection)?;
-    graph.save(&store.connection, &network)?;
+    save_graph(&graph, &store.connection, &network)?;
     assert_eq!(
         changes(&store.connection)? - before,
         2,
@@ -225,7 +239,7 @@ fn ordinary_graph_saves_write_only_changed_lookup_rows_and_rollback_together() -
         |row| row.get(0),
     )?;
     store.connection.execute_batch("CREATE TEMP TRIGGER reject_task_lookup BEFORE UPDATE ON workspace_tasks_lookup BEGIN SELECT RAISE(FAIL,'lookup fixture failure'); END;")?;
-    let mut graph = Graph::read(&store.connection, &network)?;
+    let mut graph = read_graph(&store.connection, &network)?;
     event.body = EventBody::WorkspaceCommanded {
         command_id: "resume".into(),
         command: WorkspaceCommand::ControlTask {
@@ -238,7 +252,7 @@ fn ordinary_graph_saves_write_only_changed_lookup_rows_and_rollback_together() -
         acting_assignment: None,
     };
     graph.record("resume-event", &event, "rank-3", VersionVector::new())?;
-    assert!(graph.save(&store.connection, &network).is_err());
+    assert!(save_graph(&graph, &store.connection, &network).is_err());
     assert_eq!(
         store.connection.query_row(
             "SELECT state FROM workspace_projection WHERE network_id=?",
@@ -427,7 +441,7 @@ fn lookup_read_plans_are_indexed_and_missing_tables_fail_closed() -> Result<()> 
 fn indexed_scope_resolution_preserves_assignment_id_before_work_and_never_invents_main()
 -> Result<()> {
     let (store, _, network, _) = fixture()?;
-    let mut graph = Graph::read(&store.connection, &network)?;
+    let mut graph = read_graph(&store.connection, &network)?;
     graph.replace_lookups = true;
     graph.tasks.insert("by-id".into(), task("by-id"));
     graph.tasks.insert("by-work".into(), task("by-work"));
@@ -438,7 +452,7 @@ fn indexed_scope_resolution_preserves_assignment_id_before_work_and_never_invent
         "latest".into(),
         assignment("latest", "by-work", Some("work"), 2),
     );
-    graph.save(&store.connection, &network)?;
+    save_graph(&graph, &store.connection, &network)?;
     assert_eq!(
         crate::store::scope_projection::session_target_from(
             &store.connection,
@@ -493,7 +507,7 @@ fn lookup_read_scale_preserves_graph_oracle_without_full_graph_reads() -> Result
                 assignment(&id, &task_id, Some(&work), index as i64),
             );
         }
-        graph.save(&store.connection, "n")?;
+        save_graph(&graph, &store.connection, "n")?;
         for baseline in [true, false] {
             for repeat in 0..3 {
                 let start = Instant::now();
@@ -501,7 +515,7 @@ fn lookup_read_scale_preserves_graph_oracle_without_full_graph_reads() -> Result
                 for index in size - 100..size {
                     let work = format!("work-{index}");
                     let bound = if baseline {
-                        Graph::read(&store.connection, "n")?
+                        read_graph(&store.connection, "n")?
                             .assignments
                             .into_values()
                             .filter(|item| item.work_id.as_ref() == Some(&work))
@@ -515,7 +529,7 @@ fn lookup_read_scale_preserves_graph_oracle_without_full_graph_reads() -> Result
                     };
                     let bound = bound.context("bound work")?;
                     let owner = if baseline {
-                        Graph::read(&store.connection, "n")?
+                        read_graph(&store.connection, "n")?
                             .tasks
                             .remove(&bound.task_id)
                     } else {
