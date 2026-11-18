@@ -8,7 +8,8 @@ import type { SecureApi } from '../secure-api.ts'
 type JoinPin = { network_id: string; admin_id: string; admin_nonce: string }
 /** The joiner's own nonce and, once fixed, the manager's commitment before the joiner reveals. */
 export type PendingJoin = { entry: ConnectionEntry; join_id: string; invite_id: string; nonce: string; name: string; pinned?: JoinPin }
-export type Joining = PendingJoin & { status: JoinRequest['status']; code?: string; admin?: string }
+/** A saved intent is checking until the first matching status arrives from the Node. */
+export type Joining = PendingJoin & { status: 'checking' | JoinRequest['status']; code?: string; admin?: string }
 export type ApprovalPin = { nonce: string; device_id: string; invite_id: string; commit: string }
 type ApprovalPins = { pins: Map<string, ApprovalPin>; damaged: boolean }
 

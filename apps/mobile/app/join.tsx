@@ -11,6 +11,7 @@ import Svg, { Path, Rect } from 'react-native-svg'
 import { useCSSVariable } from 'uniwind'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { joinCopy } from '@vibeface/client/identity/copy.ts'
+import type { Joining } from '@vibeface/client/identity/persistence.ts'
 import { recoveryTarget } from '@vibeface/client/identity/recovery-link.ts'
 import { ErrorText } from '@/components/action'
 import { Panel, SafetyCode, Skeleton } from '@/components/kit'
@@ -36,7 +37,6 @@ export default function JoinScreen() {
   // A recovery link the camera opened goes straight to finding devices again, with its computer filled in.
   useEffect(() => { if (url && recoveryTarget(url)) setLane('recovery') }, [url])
   const recovering = Boolean(device.recovery || device.ready && device.recovered)
-  const awaitingAcceptance = device.joining?.status === 'pending' && !device.joining.pinned
   // The request is out, so the Node has spent the link.
   useEffect(() => { if (session.phase === 'joining') spent = submitted }, [session.phase])
   const choosing = device.phase !== 'key_lost' && !device.review && !recovering && session.phase !== 'joining'
@@ -52,7 +52,7 @@ export default function JoinScreen() {
         : device.recovery ? <RecoveryWaiting />
         : device.review?.kind === 'recovery' ? <RecoveryReview />
         : session.phase === 'joining' ? <Waiting
-          awaitingAcceptance={awaitingAcceptance}
+          joinStatus={device.joining?.status ?? 'checking'}
           code={session.code}
           admin={session.admin}
           reached={Boolean(device.info)}
@@ -197,8 +197,8 @@ function Paste({ onText }: { onText: (text: string) => void }) {
   </Button>
 }
 
-function Waiting({ awaitingAcceptance, code, admin, reached, error, reconnecting, onCancel }: {
-  awaitingAcceptance: boolean
+function Waiting({ joinStatus, code, admin, reached, error, reconnecting, onCancel }: {
+  joinStatus: Joining['status']
   code: string | null
   admin?: string
   reached: boolean
@@ -206,13 +206,16 @@ function Waiting({ awaitingAcceptance, code, admin, reached, error, reconnecting
   reconnecting: boolean
   onCancel: () => void
 }) {
+  const awaitingAcceptance = joinStatus === 'pending'
+  const checking = joinStatus === 'checking'
+  const title = awaitingAcceptance ? '请在电脑上接受申请' : checking ? joinCopy.joining : joinCopy.waiting
   const status = awaitingAcceptance
-    ? '在 Vibeface 的设备页找到这条加入申请，点「开始短码核对」或「显示安全码」。手机会自动显示安全码。'
-    : code ? joinCopy.compareCode(admin) : joinCopy.showCode
-  return <Panel icon={Hourglass} title={awaitingAcceptance ? '请在电脑上接受申请' : joinCopy.waiting}>
+    ? '在 Vibeface 设备页点「读取加入请求」，再点这条申请的「开始短码核对」。网页版点「显示安全码」。'
+    : code ? joinCopy.compareCode(admin) : checking ? '正在确认申请是否送达…' : joinCopy.showCode
+  return <Panel icon={Hourglass} title={title}>
     {reached ? <View className="flex-row items-center gap-2"><Icon as={ShieldCheck} className="size-4 text-success" /><Text className="text-sm text-muted">{joinCopy.reached}</Text></View> : null}
     <Text role="status" accessibilityLiveRegion="polite" className="text-muted">{status}</Text>
-    {code ? <SafetyCode code={code} /> : !awaitingAcceptance ? <Skeleton className="h-8 w-40" /> : null}
+    {code ? <SafetyCode code={code} /> : joinStatus === 'confirming' ? <Skeleton className="h-8 w-40" /> : null}
     {reconnecting ? <Text className="text-sm text-muted">连接已断开，正在重连；批准后仍会继续完成加入。</Text> : null}
     <ErrorText error={error} />
     <Button variant="ghost" className="-ms-3 self-start" onPress={onCancel}><Text>取消</Text></Button>

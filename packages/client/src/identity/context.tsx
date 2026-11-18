@@ -1023,7 +1023,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       if (loadJoining().kind !== 'empty') throw joinRecordError()
       const nonce = randomHex()
       const commit = joinCommit(me, nonce)
-      const pending: Joining = { ...parsePendingJoin({ entry: entryJson(active.entry), join_id: link.inviteId, invite_id: link.inviteId, nonce, name }), status: 'pending' }
+      const pending: Joining = { ...parsePendingJoin({ entry: entryJson(active.entry), join_id: link.inviteId, invite_id: link.inviteId, nonce, name }), status: 'checking' }
       setJoin(pending)
       joinSending.current = pending
       try {
@@ -1053,7 +1053,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     throw new Error(message)
   }
   async function resumePendingJoin(pending: PendingJoin) {
-    const joining: Joining = { ...pending, status: 'pending' }
+    const joining: Joining = { ...pending, status: 'checking' }
     if (openingConnection.current || session.current) resetConnection(joining)
     else { joiningRef.current = joining; setJoining(joining) }
     const checking = checkJoin(), version = generation.current
@@ -1089,7 +1089,10 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     let mine = pending
     if (status.status === 'confirming' && !status.joiner_nonce && status.admin_id && status.admin_nonce) {
       // Fix the manager's nonce before revealing ours, so the entry cannot pick it after seeing our nonce.
-      if (!mine.pinned) { mine = { ...mine, pinned: { network_id: status.network_id, admin_id: status.admin_id, admin_nonce: status.admin_nonce } }; setJoin(mine) }
+      if (!mine.pinned) {
+        mine = { ...mine, status: 'confirming', pinned: { network_id: status.network_id, admin_id: status.admin_id, admin_nonce: status.admin_nonce } }
+        setJoin(mine)
+      }
       status = parseJoinRequest(await request('join_status', { join_id: pending.join_id, reveal: pending.nonce }))
     }
     if (joiningRef.current !== mine) return

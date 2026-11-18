@@ -814,11 +814,16 @@ test('a join link opened in the same tab after a rejection replaces the spent on
 })
 
 test('a pending join survives reload without resubmitting', async () => {
-  const app = deviceHarness({ joining: 'pending' })
+  const app = deviceHarness({ joining: 'pending' }), status = deferred()
+  app.holds.set('join_status', status)
   try {
+    app.render(); await until(() => app.calls.includes('join_status'))
+    assert.equal(app.render().joining?.status, 'checking')
+    status.resolve(joinRequest('pending'))
     app.render(); await settle()
     assert.deepEqual(app.calls, [`open:${target}`, 'info', 'join_status'])
     assert.equal(app.render().joining?.join_id, inviteId)
+    assert.equal(app.render().joining?.status, 'pending')
   } finally { app.close() }
 })
 
@@ -892,6 +897,7 @@ test('a lost first join receipt reopens the original Node only to check the dura
     const joining = app.render().join('vibeface://join/vibeface1ticket', 'browser')
     const lost = assert.rejects(joining, /connection lost/)
     await until(() => app.calls.includes('join'))
+    assert.equal(app.render().joining?.status, 'checking')
     const original = app.stored.get('vibeface.pending-join')
     assert.ok(original)
     assert.equal(original.includes('one-time-secret'), false)
@@ -905,9 +911,11 @@ test('a lost first join receipt reopens the original Node only to check the dura
     await until(() => app.calls.includes('join_status'))
     missing.reject(new Error('join request not found'))
     await checking
+    assert.equal(app.render().joining?.status, 'checking')
     assert.equal(app.stored.get('vibeface.pending-join'), original)
     app.holds.delete('join_status')
     await app.render().checkJoin()
+    assert.equal(app.render().joining?.status, 'pending')
     assert.equal(app.render().joining?.nonce, nonce)
     assert.deepEqual(app.sockets.map(socket => socket.entry.device_id), [target, target])
     assert.equal(app.requests.filter(request => request.method === 'join').length, 1)
