@@ -10,6 +10,7 @@ import { spentInvite,spentInviteText } from '@vibeface/client/lib/errors.ts'
 import { entryAddress,entryKey,messageOf,parseEntry } from '@vibeface/client/lib/node.ts'
 import { passphrase,passwordStrength,recoveryCode } from '@vibeface/client/lib/secure.ts'
 import { joinTicket } from '@vibeface/client/lib/transport.ts'
+import { useGenerationAction } from '@vibeface/client/lib/use-generation-action.ts'
 import { addressName,hostOf } from '@vibeface/client/workspace/labels.ts'
 import { Button } from '@vibeface/uiarc/button/button.tsx'
 import { Input } from '@vibeface/uiarc/input/input.tsx'
@@ -83,7 +84,7 @@ function Removed({ busy, run }: { busy: boolean; run: Run }) {
     {canRejoin ? <>
       <p className="text-secondary">点重新加入，再用已有设备的加入链接把它加回来</p>
       <p className="flex items-center gap-2 text-sm text-secondary"><Archive aria-hidden="true" className="size-4 shrink-0" />旧数据改名保留，不会删除</p>
-      <Button type="button" className="w-fit justify-self-end" disabled={busy} onClick={() => void run(device.rejoin)}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <RotateCcw aria-hidden="true" />}重新加入</Button>
+      <Button type="button" className="w-fit justify-self-end" disabled={busy} onClick={() => void run('rejoin', ({ rebind }) => device.rejoin(rebind))}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <RotateCcw aria-hidden="true" />}重新加入</Button>
       {commands}
     </> : <>
       {here ? null : <p className="text-secondary">在它的本机页面点“重新加入”。</p>}
@@ -147,11 +148,8 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const gatewayNode = useGatewayNode(device.gateway)
   // The official page has no Node of its own, and the public node it reaches is nobody's device, so it only opens join links.
   const official = globalThis.location?.origin === APP_ORIGIN
-  const generation = device.connectionGeneration()
-  const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
-  const busy = busyGeneration === generation
-  const pending = useRef<number | null>(null)
-  const [error, setError] = useState('')
+  const { busy: action, error, run, setError } = useGenerationAction(device.connectionGeneration)
+  const busy = Boolean(action)
   const [notice, setNotice] = useState('')
   const [invitation, setInvitation] = useState(device.initialInvitation)
   const [lane, setLane] = useState<Lane | null>(firstLane ?? null)
@@ -179,7 +177,6 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const linking = busy || ['connecting', 'reconnecting'].includes(device.phase)
   // A newly opened link replaces whatever is here, including a spent one, and the failure that came with it.
   useEffect(() => { if (device.initialInvitation) { setInvitation(device.initialInvitation); setError(''); setNotice('') } }, [device.initialInvitation])
-  useEffect(() => { setError('') }, [generation])
   // A link is single-use: once its request ends without joining, offering 继续 again only leads to "已用过".
   const wasJoining = useRef(false)
   useEffect(() => {
@@ -192,9 +189,10 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   useEffect(() => {
     if (!checkable) return
     let live = true
+    const generation = device.connectionGeneration()
     void device.checkInvite(invitation).then((state) => {
       // A join that just ended spent the link too; its own reason (say, 拒绝) stays, not 已用过.
-      if (live && (state === 'used' || state === 'expired')) { setInvitation(''); setError((current) => current || spentInviteText) }
+      if (live && generation === device.connectionGeneration() && (state === 'used' || state === 'expired')) { setInvitation(''); setError((current) => current || spentInviteText) }
     })
     return () => { live = false }
   }, [invitation, checkable, thisComputer])
@@ -203,29 +201,18 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     if (!device.entry || next !== 'recovery') device.disconnect()
     setLane(next)
   }
-  async function run(action: () => Promise<void>) {
-    if (pending.current === device.connectionGeneration()) return
-    let owner = device.connectionGeneration()
-    setError('')
-    try {
-      const work = action()
-      owner = device.connectionGeneration(); pending.current = owner; setBusyGeneration(owner)
-      await work
-    } catch (cause) { if (owner === device.connectionGeneration()) setError(messageOf(cause)) }
-    finally { if (pending.current === owner) pending.current = null; setBusyGeneration((current) => current === owner ? null : current) }
-  }
   function submitInvitation(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const form = event.currentTarget
-    setNotice('')
-    void run(async () => {
+    void run('join', async ({ current, rebind }) => {
+      setNotice('')
       try {
-        if (!thisComputer) { rememberBrowserName(value(form, 'name')); return await device.join(invitation, value(form, 'name')) }
+        if (!thisComputer) { rememberBrowserName(value(form, 'name')); return await device.join(invitation, value(form, 'name'), rebind) }
         // The entry spent the invite on the cancelled request, so it cannot be used again.
-        if (await device.joinThisComputer(invitation, value(form, 'name')) === 'cancelled') { setInvitation(''); setNotice('已取消。这条链接已用过，要加入就在已有设备上重新添加。') }
+        if (await device.joinThisComputer(invitation, value(form, 'name'), rebind) === 'cancelled' && current()) { setInvitation(''); setNotice('已取消。这条链接已用过，要加入就在已有设备上重新添加。') }
       } catch (cause) {
         // A spent link only fails again, so the field opens for a new one.
-        if (cause instanceof Error && spentInvite.test(cause.message)) setInvitation('')
+        if (current() && cause instanceof Error && spentInvite.test(cause.message)) setInvitation('')
         throw cause
       }
     })
@@ -257,7 +244,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   if (device.phase === 'blocked') body = <EmptyState icon={ShieldAlert} title="在节点本机打开，或用加入链接" />
   else if (device.phase === 'key_lost') body = <Panel icon={ShieldAlert} title="需要重新加入">
     <p className="text-secondary">这个浏览器保存的登录信息不见了。</p>
-    <Button type="button" className="w-fit justify-self-end" disabled={busy} onClick={() => void run(device.replaceLostKey)}>重新开始</Button>
+    <Button type="button" className="w-fit justify-self-end" disabled={busy} onClick={() => void run('replace-key', device.replaceLostKey)}>重新开始</Button>
   </Panel>
   else if (device.phase === 'removed') body = <Removed busy={busy} run={run} />
   else if (device.phase === 'restarting') body = <Panel icon={LoaderCircle} busy title="正在重新开始">
@@ -273,17 +260,17 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   else if (active === 'local' && setup && names) body = <PasswordStep busy={busy || linking} disabled={!usable} names={names} onBack={() => { setDraftNames(names); setNames(null) }} run={run} />
   else if (active === 'local' && device.localSetup) body = <Panel icon={Laptop} title={device.localSetup.kind === 'initialized' ? computerName : '这个节点'}>
     {device.localSetup.kind !== 'initialized' ? <p className="text-secondary">用已有设备的加入链接，或恢复文件</p>
-      : local === 'open' ? <Button type="button" className="w-full sm:w-fit sm:justify-self-end" disabled={linking || !usable} onClick={() => void run(device.openLocalAccess)}><LogIn aria-hidden="true" />打开</Button>
+      : local === 'open' ? <Button type="button" className="w-full sm:w-fit sm:justify-self-end" disabled={linking || !usable} onClick={() => void run('open-local', ({ rebind }) => device.openLocalAccess(rebind))}><LogIn aria-hidden="true" />打开</Button>
       : <>
         <p className="flex items-center gap-2 text-secondary"><MessageSquareLock aria-hidden="true" className="size-4 shrink-0" />{localCopy.note}</p>
-        {device.localSetup.local_launch ? <Button type="button" variant="secondary" className="w-full sm:w-fit sm:justify-self-end" disabled={linking || !usable} onClick={() => void run(device.openLocalAccess)}><Settings2 aria-hidden="true" />{localCopy.manage}</Button> : null}
+        {device.localSetup.local_launch ? <Button type="button" variant="secondary" className="w-full sm:w-fit sm:justify-self-end" disabled={linking || !usable} onClick={() => void run('open-local', ({ rebind }) => device.openLocalAccess(rebind))}><Settings2 aria-hidden="true" />{localCopy.manage}</Button> : null}
       </>}
   </Panel>
   else if (active === 'saved') body = <Panel icon={MonitorSmartphone} title="用过的地址">
     <ul className="grid gap-1">{device.entries.map((entry) => {
       const name = device.entryName(entry) || addressName(entryAddress(entry)), host = hostOf(entryAddress(entry))
       return <li key={entryKey(entry)} className="flex min-h-11 items-center rounded-control bg-surface-muted/60">
-        <Button type="button" variant="ghost" className="h-auto min-w-0 flex-1 justify-start" title={entryAddress(entry)} disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}>
+        <Button type="button" variant="ghost" className="h-auto min-w-0 flex-1 justify-start" title={entryAddress(entry)} disabled={linking || !usable} onClick={() => void run('connect', ({ rebind }) => device.connect(entry, rebind))}>
           <span className="truncate">{name}{host && host !== name ? <span className="ms-2 text-sm text-secondary">{host}</span> : null}</span>
         </Button>
         <Button type="button" variant="ghost" size="md" className="shrink-0" aria-label={`移除 ${name}`} title="移除" disabled={linking} onClick={() => {
@@ -336,7 +323,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
           event.preventDefault()
           const form = event.currentTarget, address = value(form, 'address')
           const deviceId = value(form, 'device_id').trim() || (sameOrigin(address, device.gateway) ? gatewayNode : '')
-          void run(() => device.connect(parseEntry({ address, device_id: deviceId })))
+          void run('connect', ({ rebind }) => device.connect(parseEntry({ address, device_id: deviceId }), rebind))
         }}>
           <fieldset disabled={linking} className="grid gap-3">
             <div ><Input label="访问地址" key={device.gateway} type="url" name="address" defaultValue={device.gateway} /></div>
@@ -381,7 +368,7 @@ function NamesStep({ initial, onNext, onBack }: { initial: Names | null; onNext(
   </Panel>
 }
 
-type Run = (action: () => Promise<void>) => Promise<void>
+type Run = ReturnType<typeof useGenerationAction>['run']
 
 /** Step 2: the recovery password; the file is sealed with it right away. */
 function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; disabled: boolean; names: Names; onBack(): void; run: Run }) {
@@ -396,9 +383,11 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
       const form = event.currentTarget
       const input = form.elements.namedItem('password') as HTMLInputElement
       if (passwordStrength(input.value).level === 'weak') { setTried(true); input.focus(); return }
-      void run(async () => {
-        try { await device.createLocalNetwork(names.browser, passphrase(value(form, 'password')), names.computer) }
+      void run('create', async ({ rebind }) => {
+        let work: Promise<void>
+        try { work = device.createLocalNetwork(names.browser, passphrase(value(form, 'password')), names.computer, rebind) }
         finally { form.reset(); setPassword('') }
+        await work
       })
     }}>
       <fieldset disabled={busy || disabled} className="grid gap-4">
@@ -429,10 +418,10 @@ function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
     return () => { live = false }
   }, [networkId])
   return <Panel icon={FileKey} title="保存恢复文件">
-    <SaveRecoveryFile code={code} saved={saved} onSaved={setSaved} busy={busy} download={{ done: downloaded, run: () => void run(async () => { await device.downloadBackup(); setDownloaded(true) }) }} />
+    <SaveRecoveryFile code={code} saved={saved} onSaved={setSaved} busy={busy} download={{ done: downloaded, run: () => void run('download', async ({ current }) => { await device.downloadBackup(); if (current()) setDownloaded(true) }) }} />
     <div className="flex justify-between gap-2">
       <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={device.cancelSensitive}>上一步</Button>
-      <Button type="button" disabled={!saved || busy} aria-busy={busy || undefined} onClick={() => void run(async () => { startOnboarding(); await device.confirmBootstrap(true) })}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}完成创建</Button>
+      <Button type="button" disabled={!saved || busy} aria-busy={busy || undefined} onClick={() => void run('bootstrap', async () => { startOnboarding(); await device.confirmBootstrap(true) })}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}完成创建</Button>
     </div>
   </Panel>
 }

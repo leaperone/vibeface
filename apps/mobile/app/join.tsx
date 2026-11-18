@@ -27,12 +27,20 @@ import { move } from '@/lib/motion'
 import { useRun } from '@/lib/use-run'
 import { defaultName, self } from '@/platform'
 
+const joinError = (cause: unknown) => humanError(cause instanceof Error ? cause.message : '', undefined, '这次加入')
+
 export default function JoinScreen() {
   const workspace = useWorkspace()
   const device = useDevice()
   const session = workspace.session
   const url = useLinkingURL()
   const [lane, setLane] = useState<'invite' | 'recovery'>('invite')
+  const { busy, error, run, cancel, clear } = useRun({ formatError: joinError })
+  const submit = (invitation: string, name: string) => void run('join', ({ rebind }) => {
+    submitted = invitation
+    return workspace.actions.join(invitation, name, rebind)
+  })
+  const cancelJoin = () => { cancel(); workspace.actions.cancelJoin() }
   // A recovery link the camera opened goes straight to finding devices again, with its computer filled in.
   useEffect(() => { if (url && recoveryTarget(url)) setLane('recovery') }, [url])
   const recovering = Boolean(device.recovery || device.ready && device.recovered)
@@ -50,9 +58,9 @@ export default function JoinScreen() {
         : device.ready && device.recovered ? <RecoveredStep />
         : device.recovery ? <RecoveryWaiting />
         : device.review?.kind === 'recovery' ? <RecoveryReview />
-        : session.phase === 'joining' ? <Waiting code={session.code} admin={session.admin} reached={Boolean(device.info)} error={device.error} reconnecting={device.phase === 'reconnecting'} onCancel={workspace.actions.cancelJoin} />
+        : session.phase === 'joining' ? <Waiting code={session.code} admin={session.admin} reached={Boolean(device.info)} error={device.error || error} reconnecting={device.phase === 'reconnecting'} onCancel={cancelJoin} />
         : lane === 'recovery' ? <Panel icon={ArchiveRestore} title="用恢复文件找回"><RecoveryRestore link={url} /></Panel>
-        : <JoinForm />}
+        : <JoinForm busy={busy === 'join'} actionError={error} clearActionError={clear} onSubmit={submit} />}
       {choosing ? <View className="gap-1 border-t border-border pt-4">
         {lane === 'recovery'
           ? <Button variant="ghost" className="-ms-3 self-start" onPress={() => setLane('invite')}><Icon as={Link2} /><Text>{joinCopy.byLink}</Text></Button>
@@ -104,8 +112,9 @@ function LostKey() {
 // A link is single-use: once a join request went out with it, coming back here after 取消 or 断开 must not offer it again.
 let submitted = '', spent = ''
 
-function JoinForm() {
-  const workspace = useWorkspace()
+function JoinForm({ busy, actionError, clearActionError, onSubmit }: {
+  busy: boolean; actionError: string; clearActionError(): void; onSubmit(invitation: string, name: string): void
+}) {
   const device = useDevice()
   const url = useLinkingURL()
   const [switched] = useState(switchedLink)
@@ -114,7 +123,7 @@ function JoinForm() {
   const [openingUrl] = useState(url)
   // An error belongs to the link it was about: a new one, typed, pasted, scanned or opened, starts clean.
   const [edited, setEdited] = useState(false)
-  const edit = (text: string) => { setInvitation(text); setError(''); setEdited(true) }
+  const edit = (text: string) => { setInvitation(text); setError(''); clearActionError(); setEdited(true) }
   // Every new `vibeface://join/<ticket>` refills the field, also the one a network switch erased the phone for.
   useEffect(() => {
     if (switched && url === openingUrl) return
@@ -124,15 +133,6 @@ function JoinForm() {
   const [name, setName] = useState(defaultName)
   const [scanning, setScanning] = useState(false)
   const [error, setError] = useState('')
-  const [busy, setBusy] = useState(false)
-  const submit = async () => {
-    setError('')
-    setBusy(true)
-    submitted = invitation.trim()
-    try { await workspace.actions.join(invitation.trim(), name.trim()) }
-    catch (caught) { setError(humanError(caught instanceof Error ? caught.message : '', undefined, '这次加入')) }
-    finally { setBusy(false) }
-  }
   // Checked as it changes, as on the web, down to a ticket that decodes: only a real join link counts as filled, so typing
   // or any other text keeps the field.
   const ready = device.linkTarget(invitation) !== null
@@ -140,15 +140,15 @@ function JoinForm() {
   useEffect(() => {
     if (!ready) return
     let live = true
+    const generation = device.connectionGeneration()
     void device.checkInvite(invitation.trim()).then((state) => {
-      if (live && (state === 'used' || state === 'expired')) { setInvitation(''); setError(spentInviteText) }
+      if (live && generation === device.connectionGeneration() && (state === 'used' || state === 'expired')) { setInvitation(''); setError(spentInviteText) }
     })
     return () => { live = false }
   }, [invitation, ready])
   if (scanning) return <Scanner title={joinCopy.scan} onCancel={() => setScanning(false)} onScanned={(link) => { edit(link); setScanning(false) }} />
   const invalid = !ready && invitation.trim() !== ''
-  // A join that fails after it started remounts this form, so its own error is gone; the shared one says why, as on the web.
-  const failure = error || (edited ? '' : device.error)
+  const failure = error || (submitted === invitation.trim() ? actionError : '') || (edited ? '' : device.error)
   // Scanning leads; once there is a link it shrinks to one line, and the name and 加入 take over.
   if (ready) return <View className="gap-4">
     <View className="min-h-11 flex-row items-center gap-2 rounded-control bg-surface-muted/60 ps-3">
@@ -161,7 +161,7 @@ function JoinForm() {
       <Input accessibilityLabel={joinCopy.deviceName} value={name} onChangeText={setName} maxLength={64} />
     </View>
     <ErrorText error={failure} />
-    <Button disabled={busy || !name.trim()} onPress={submit}><Text>{busy ? joinCopy.joining : joinCopy.join}</Text></Button>
+    <Button disabled={busy || !name.trim()} onPress={() => { setError(''); onSubmit(invitation.trim(), name.trim()) }}><Text>{busy ? joinCopy.joining : joinCopy.join}</Text></Button>
   </View>
   return <View className="gap-4">
     <Text role="heading" className="text-lg font-medium">连接你的网络</Text>

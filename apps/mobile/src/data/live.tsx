@@ -120,7 +120,7 @@ function Offline({ children }: { children: ReactNode }) {
   const generation = device.connectionGeneration()
   useEffect(() => { if (gone && device.connectionGeneration() === generation) writeStorage('last-seen', null) }, [gone, generation])
   const actions = useMemo<WorkspaceActions>(() => ({
-    join: (invitation, name) => device.join(invitation, name),
+    join: device.join,
     cancelJoin: device.cancelJoin,
     open: () => () => {},
     send: async () => { throw new Error('还没连上') },
@@ -224,7 +224,7 @@ function Live({ children }: { children: ReactNode }) {
   }, [shared.bots, shared.generation])
   const actions = useMemo<WorkspaceActions>(() => {
     return {
-      join: (invitation, name) => device.join(invitation, name),
+      join: device.join,
       cancelJoin: device.cancelJoin,
       open(id) {
         const workspace = latest.current
