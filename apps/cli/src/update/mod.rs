@@ -426,8 +426,10 @@ async fn act(options: Update, data: PathBuf) -> Result<()> {
                 }
                 Err(error) => return Err(error.context("request node maintenance")),
             };
-            let health: MaintenanceHealth = serde_json::from_value(lease.health.clone())
-                .context("maintenance response has invalid health")?;
+            let health = MaintenanceHealth {
+                device_id: lease.health.device_id.clone(),
+                version: lease.health.version.clone(),
+            };
             ensure!(
                 health.version == manifest(&previous)?.core_version.to_string(),
                 "running node does not match current package"
@@ -1172,8 +1174,10 @@ where
             }
             Err(error) => return Err(error.context("request node maintenance")),
         };
-        let health: MaintenanceHealth = serde_json::from_value(lease.health.clone())
-            .context("maintenance response has invalid health")?;
+        let health = MaintenanceHealth {
+            device_id: lease.health.device_id.clone(),
+            version: lease.health.version.clone(),
+        };
         ensure!(
             health.version == manifest(&release.previous)?.core_version.to_string(),
             "running node does not match current package"
@@ -1284,8 +1288,10 @@ async fn healthy(data: &Path, package: &Path, device_id: &str) -> Result<()> {
                         else {
                             bail!("node did not report healthy");
                         };
-                        let health: MaintenanceHealth = serde_json::from_value(health)
-                            .context("maintenance response has invalid health")?;
+                        let health = MaintenanceHealth {
+                            device_id: health.device_id,
+                            version: health.version,
+                        };
                         Ok(health)
                     });
                     match health {

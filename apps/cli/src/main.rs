@@ -1249,6 +1249,7 @@ async fn join_through_running_node(data_dir: &Path, link: &str, name: &str) -> R
         let MaintenanceResponse::Join { join: status, .. } = response else {
             bail!("node returned an invalid join response");
         };
+        let status = serde_json::to_value(status)?;
         let state = status["status"].as_str().unwrap_or_default();
         if shown.as_ref() != Some(&status) {
             match state {

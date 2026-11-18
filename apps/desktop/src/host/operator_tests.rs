@@ -13,7 +13,7 @@ use vibeface_bridge::platform::{
 };
 use vibeface_client::Outlet;
 use vibeface_control::maintenance::{
-    MaintenanceCommand, MaintenanceRequest, MaintenanceResponse, PROTOCOL,
+    Health, MaintenanceCommand, MaintenanceRequest, MaintenanceResponse, PROTOCOL,
 };
 
 fn provider_change() -> NodeOperatorChange {
@@ -218,12 +218,15 @@ impl Fixture {
                         state.drop_next_change = false;
                         None
                     } else {
-                        let health = json!({
-                            "device_id": "fixture-device",
-                            "version": "fixture-version",
-                            "web_enabled": false,
-                            "http_enabled": false
-                        });
+                        let health = Health {
+                            device_id: "fixture-device".into(),
+                            version: "fixture-version".into(),
+                            web_enabled: false,
+                            http_enabled: false,
+                            write_state: None,
+                            peers: Vec::new(),
+                            mesh: None,
+                        };
                         Some(match method.as_str() {
                             "diagnostics" => MaintenanceResponse::Refused {
                                 health,

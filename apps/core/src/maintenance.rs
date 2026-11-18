@@ -460,12 +460,13 @@ pub async fn serve(runtime: Arc<Runtime>, data_dir: PathBuf) -> Result<()> {
 }
 
 async fn write_response(stream: &mut Stream, response: &Response) -> Result<()> {
-    let health = serde_json::to_value(
+    let health = serde_json::from_value(serde_json::to_value(
         response
             .health
             .as_ref()
             .context("maintenance response has no health")?,
-    )?;
+    )?)
+    .context("maintenance response has malformed health")?;
     let wire = match response.status {
         Status::Ready => MaintenanceResponse::LeaseGranted(health),
         Status::Committed => MaintenanceResponse::Committed(health),
@@ -487,7 +488,8 @@ async fn write_response(stream: &mut Stream, response: &Response) -> Result<()> 
             if let Some(wallet) = response.wallet.as_ref() {
                 MaintenanceResponse::Wallet {
                     health,
-                    wallet: serde_json::to_value(wallet)?,
+                    wallet: serde_json::from_value(serde_json::to_value(wallet)?)
+                        .context("maintenance response has malformed wallet")?,
                 }
             } else if let Some(delivery) = response.delivery.as_ref() {
                 MaintenanceResponse::Delivery {
@@ -497,7 +499,8 @@ async fn write_response(stream: &mut Stream, response: &Response) -> Result<()> 
             } else if let Some(join) = response.join.as_ref() {
                 MaintenanceResponse::Join {
                     health,
-                    join: serde_json::to_value(join)?,
+                    join: serde_json::from_value(serde_json::to_value(join)?)
+                        .context("maintenance response has malformed join")?,
                 }
             } else if let Some(result) = response.result.as_ref() {
                 MaintenanceResponse::ClientResult {
@@ -1025,7 +1028,7 @@ mod tests {
             );
             drop(work);
             let lease = maintenance_client::acquire(&socket_path(&dir)?).await?;
-            assert_eq!(lease.health["device_id"], health.device_id);
+            assert_eq!(lease.health.device_id, health.device_id);
             assert!(node.maintenance.enter().is_err());
             let refused = crate::scheduler::run(
                 node.clone(),

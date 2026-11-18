@@ -6,7 +6,8 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{path::Path, time::Duration};
+use std::path::Path;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use vibeface_bridge::platform::ipc::{Endpoint, Stream};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -133,18 +134,70 @@ pub enum MaintenanceStatus {
     Error,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Health {
+    pub device_id: String,
+    pub version: String,
+    pub web_enabled: bool,
+    pub http_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_state: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WalletStatus {
+    Absent,
+    Unavailable { reason: String },
+    Locked { address: String },
+    Unlocked { address: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NodeJoin {
+    Waiting,
+    Confirming { code: String, admin: String },
+    Joined,
+    Failed { reason: String },
+    Cancelled,
+}
+
 #[derive(Debug, Clone)]
 pub enum MaintenanceResponse {
-    LeaseGranted(Value),
-    Probed(Value),
-    Committed(Value),
-    Applied(Value),
-    Wallet { health: Value, wallet: Value },
-    Delivery { health: Value, delivery: Value },
-    Join { health: Value, join: Value },
-    ClientResult { health: Value, result: Value },
-    Busy { health: Value, error: String },
-    Refused { health: Value, error: String },
+    LeaseGranted(Health),
+    Probed(Health),
+    Committed(Health),
+    Applied(Health),
+    Wallet {
+        health: Health,
+        wallet: WalletStatus,
+    },
+    Delivery {
+        health: Health,
+        delivery: Value,
+    },
+    Join {
+        health: Health,
+        join: NodeJoin,
+    },
+    ClientResult {
+        health: Health,
+        result: Value,
+    },
+    Busy {
+        health: Health,
+        error: String,
+    },
+    Refused {
+        health: Health,
+        error: String,
+    },
 }
 
 #[derive(Debug)]
@@ -241,14 +294,14 @@ impl<'de> Deserialize<'de> for RawResponse {
 struct WireResponse<'a> {
     protocol: u32,
     status: MaintenanceStatus,
-    health: &'a Value,
+    health: &'a Health,
     error: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    wallet: Option<&'a Value>,
+    wallet: Option<WalletStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     delivery: Option<&'a Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    join: Option<&'a Value>,
+    join: Option<&'a NodeJoin>,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<&'a Value>,
 }
@@ -270,7 +323,7 @@ impl Serialize for MaintenanceResponse {
             Self::Wallet { health, wallet } => (
                 MaintenanceStatus::Healthy,
                 health,
-                Some(wallet),
+                Some(wallet.clone()),
                 None,
                 None,
                 None,
@@ -323,13 +376,14 @@ impl Serialize for MaintenanceResponse {
 }
 
 impl MaintenanceResponse {
+    fn validate_health(health: Value) -> Result<Health> {
+        serde_json::from_value(health).context("maintenance response has malformed health")
+    }
+
     fn parse(command: &MaintenanceCommand, raw: RawResponse) -> Result<Self> {
         ensure!(raw.protocol == PROTOCOL, "unsupported maintenance protocol");
-        let health = raw.health.context("maintenance response has no health")?;
-        ensure!(
-            health.is_object(),
-            "maintenance response has invalid health"
-        );
+        let health =
+            Self::validate_health(raw.health.context("maintenance response has no health")?)?;
         let payload_count = [
             raw.wallet.is_some(),
             raw.delivery.is_some(),
@@ -395,7 +449,8 @@ impl MaintenanceResponse {
                 );
                 Ok(Self::Wallet {
                     health,
-                    wallet: raw.wallet.unwrap(),
+                    wallet: serde_json::from_value(raw.wallet.unwrap())
+                        .context("maintenance response has malformed wallet")?,
                 })
             }
             MaintenanceCommand::DeliveryBudget(_)
@@ -420,7 +475,8 @@ impl MaintenanceResponse {
                 );
                 Ok(Self::Join {
                     health,
-                    join: raw.join.unwrap(),
+                    join: serde_json::from_value(raw.join.unwrap())
+                        .context("maintenance response has malformed join")?,
                 })
             }
             MaintenanceCommand::Client { .. } => {
@@ -448,7 +504,7 @@ impl MaintenanceResponse {
         }
     }
 
-    pub fn health(&self) -> &Value {
+    pub fn health(&self) -> &Health {
         match self {
             Self::LeaseGranted(h) | Self::Probed(h) | Self::Committed(h) | Self::Applied(h) => h,
             Self::Wallet { health, .. }
@@ -474,7 +530,7 @@ impl MaintenanceResponse {
 /// the server-side maintenance gate.
 #[must_use]
 pub struct Lease {
-    pub health: Value,
+    pub health: Health,
     _stream: Stream,
 }
 
@@ -614,26 +670,28 @@ mod tests {
             .client_result()
         };
         assert_eq!(
-            decode(r#"{"protocol":1,"status":"healthy","health":{},"result":null}"#)?,
+            decode(
+                r#"{"protocol":1,"status":"healthy","health":{"device_id":"device","version":"version","web_enabled":false,"http_enabled":false},"result":null}"#
+            )?,
             Value::Null
         );
         assert_eq!(
             decode(
-                r#"{"protocol":1,"status":"healthy","health":{},"error":null,"result":{"saved":true}}"#
+                r#"{"protocol":1,"status":"healthy","health":{"device_id":"device","version":"version","web_enabled":false,"http_enabled":false},"error":null,"result":{"saved":true}}"#
             )?,
             serde_json::json!({"saved":true})
         );
         for wire in [
-            r#"{"protocol":1,"status":"healthy","health":{}}"#,
-            r#"{"protocol":1,"status":"ready","health":{},"result":{}}"#,
-            r#"{"protocol":1,"status":"healthy","health":{},"wallet":{},"result":{}}"#,
-            r#"{"protocol":1,"status":"healthy","health":{},"error":"refused","result":{}}"#,
+            r#"{"protocol":1,"status":"healthy","health":{"device_id":"device","version":"version","web_enabled":false,"http_enabled":false}}"#,
+            r#"{"protocol":1,"status":"ready","health":{"device_id":"device","version":"version","web_enabled":false,"http_enabled":false},"result":{}}"#,
+            r#"{"protocol":1,"status":"healthy","health":{"device_id":"device","version":"version","web_enabled":false,"http_enabled":false},"wallet":{},"result":{}}"#,
+            r#"{"protocol":1,"status":"healthy","health":{"device_id":"device","version":"version","web_enabled":false,"http_enabled":false},"error":"refused","result":{}}"#,
         ] {
             assert!(decode(wire).is_err(), "{wire}");
         }
         assert!(
             serde_json::from_str::<RawResponse>(
-                r#"{"protocol":1,"protocol":1,"status":"healthy","health":{},"result":null}"#
+                r#"{"protocol":1,"protocol":1,"status":"healthy","health":{"device_id":"device","version":"version","web_enabled":false,"http_enabled":false},"result":null}"#
             )
             .is_err()
         );
@@ -735,7 +793,7 @@ mod tests {
             let response = serde_json::json!({
                 "protocol": PROTOCOL,
                 "status": "ready",
-                "health": {"device_id":"device","version":"version"}
+                "health":{"device_id":"device","version":"version","web_enabled":false,"http_enabled":false}
             });
             stream.write_all(&serde_json::to_vec(&response)?).await?;
             stream.write_all(b"\n").await?;
@@ -746,7 +804,7 @@ mod tests {
             Ok::<_, anyhow::Error>(request)
         });
         let lease = acquire(endpoint.path()).await?;
-        assert_eq!(lease.health["device_id"], "device");
+        assert_eq!(lease.health.device_id, "device");
         ready_rx.await?;
         assert!(
             tokio::time::timeout(Duration::from_millis(50), &mut closed_rx)
