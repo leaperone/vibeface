@@ -46,14 +46,16 @@ async fn main() -> Result<()> {
         }
         let request: vibeface_control::ControlRequest =
             serde_json::from_slice(&input).context("invalid core control request")?;
+        use vibeface_control::ControlResponse;
         let response = match vibeface_core::control::handle(request).await {
-            Ok(result) => vibeface_control::ControlResponse::success(result),
-            Err(error) => vibeface_control::ControlResponse::failure(format!("{error:#}")),
+            Ok(serde_json::Value::Object(result)) => ControlResponse::Success(result),
+            Ok(_) => ControlResponse::Failure("core control result must be an object".into()),
+            Err(error) => ControlResponse::Failure(format!("{error:#}")),
         };
         let mut output = serde_json::to_vec(&response)?;
         if output.len().saturating_add(1) > vibeface_control::MAX_CONTROL_PACKET {
-            output = serde_json::to_vec(&vibeface_control::ControlResponse::failure(
-                "core control response is too large",
+            output = serde_json::to_vec(&ControlResponse::Failure(
+                "core control response is too large".into(),
             ))?;
         }
         output.push(b'\n');
