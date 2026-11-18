@@ -17,7 +17,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | --- | --- | --- | --- |
 | `ci.yml` | CI / Core | main push、merge queue、手动、复用调用 | 自动按累计差异选核心检查；手动与复用调用执行扩展检查 |
 | `hourly.yml` | Release / Core Hourly | UTC 每小时 17 分、成功的 main push CI 完成后、手动 | 仅对账 Core，按输入变化发布 Hourly Tag |
-| `daily.yml` | Release / Clients Daily | 洛杉矶时间每日 18:00（含夏令时） | 启动客户端批次，构建完成时间可能更晚 |
+| `daily.yml` | Release / Clients Daily | 洛杉矶时间每日 09:00 和 18:00（含夏令时） | 启动客户端批次，构建完成时间可能更晚 |
 | `release-core.yml` | Release / Core | `core-v*` push、手动 | 四平台 Core；完整发布后自动部署公共 Node |
 | `release-app.yml` | Release / Web App | `app-v*` push、手动 | 静态 Web App；完整发布后自动部署 App |
 | `release.yml` | Release / CLI | `cli-v*` push、手动 | 四平台 CLI 运行包，消费精确 Core、App 依赖；完整发布后分发同版本 npm 包 |
@@ -134,7 +134,7 @@ python3 scripts/check-delivery.py --sandbox
 
 ## 定期、手动和发布检查
 
-`hourly.yml` 在 UTC 每小时 17 分、main push CI 成功后或手动运行时对账 Core。`daily.yml` 仅在洛杉矶时间每日 18:00 定时启动客户端批次。批次固定通过 main push CI 的源码和 UTC 小时版本后缀，继续使用 Hourly 渠道。
+`hourly.yml` 在 UTC 每小时 17 分、main push CI 成功后或手动运行时对账 Core。`daily.yml` 仅在洛杉矶时间每日 09:00 和 18:00 定时启动客户端批次。批次固定通过 main push CI 的源码和 UTC 小时版本后缀，继续使用 Hourly 渠道。
 
 客户端协调器按构建输入和依赖 pin 决定是否创建新 Tag，并跟踪各个组件的发布运行。已有同批次 Tag 时沿用其中记录的 main parent。官网只通过精确 Tag 和 `publish=true` 手动发布。[构建与发布](releasing.md)
 

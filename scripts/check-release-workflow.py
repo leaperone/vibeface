@@ -309,9 +309,9 @@ def check_hourly(source):
 def check_daily(source):
     require(events(source) == {'schedule'}
             and re.findall(r"^    - cron: '([^']+)'\n      timezone: ([^\n]+)$", source, re.M)
-            == [('0 18 * * *', 'America/Los_Angeles')]
+            == [('0 9,18 * * *', 'America/Los_Angeles')]
             and source.count('cron:') == 1,
-            'client coordinator must run only at 18:00 America/Los_Angeles')
+            'client coordinator must run only at 09:00 and 18:00 America/Los_Angeles')
     block = coordinator_job(source, 'clients', 'independent-daily-client-releases', 'python3 -B scripts/hourly.py --clients')
     for ref in ('refs/heads/main', 'refs/heads/other'):
         for event in ('schedule', 'workflow_run', 'workflow_dispatch'):
@@ -479,7 +479,8 @@ def self_test(entries, helpers, hourly, daily, deployment, deployment_entries):
         require(candidate != hourly, 'coordinator mutation did not reach its guard')
         rejects(lambda: check_hourly(candidate))
     for before, after in (
-        ("cron: '0 18 * * *'", "cron: '0 * * * *'"),
+        ("cron: '0 9,18 * * *'", "cron: '0 18 * * *'"),
+        ("cron: '0 9,18 * * *'", "cron: '0 * * * *'"),
         ('America/Los_Angeles', 'UTC'),
         ('on:\n', 'on:\n  workflow_dispatch:\n'),
         ("github.event_name == 'schedule'", 'true'),

@@ -22,7 +22,7 @@ COORDINATOR_SCHEMA = 2
 REPO = release_format.GITHUB_REPO
 CLIENT_APPS = ('app', 'cli', 'desktop', 'mobile')
 CLIENT_TIME_ZONE = 'America/Los_Angeles'
-CLIENT_RELEASE_HOUR = 18
+CLIENT_RELEASE_HOURS = (9, 18)
 PENDING = {'dispatched', 'dispatched_existing_tag', 'in_progress', 'waiting_for_manifest'}
 INPUTS = {
     'core': ('apps/core/*', 'crates/protocol/*', 'crates/control/*', 'crates/bridge/*', 'crates/secure/*', 'crates/client/*', 'crates/delivery/*', 'Cargo.toml', 'Cargo.lock', '.cargo/*', 'config/*', 'rust-toolchain*', 'scripts/sign-release.sh', 'scripts/windows-signing.mjs', 'scripts/private-control.mjs', 'scripts/release-rustflags.py', '.github/workflows/release-native.yml'),
@@ -252,9 +252,13 @@ def run_hourly(now):
 
 def client_cutoff(created_at):
     local = created_at.astimezone(ZoneInfo(CLIENT_TIME_ZONE))
-    slot = local.replace(hour=CLIENT_RELEASE_HOUR, minute=0, second=0, microsecond=0)
-    if local < slot:
-        slot -= datetime.timedelta(days=1)
+    for hour in reversed(CLIENT_RELEASE_HOURS):
+        if local.hour >= hour:
+            break
+    else:
+        local -= datetime.timedelta(days=1)
+        hour = CLIENT_RELEASE_HOURS[-1]
+    slot = local.replace(hour=hour, minute=0, second=0, microsecond=0)
     return slot.astimezone(datetime.timezone.utc)
 
 

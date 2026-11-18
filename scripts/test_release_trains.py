@@ -101,8 +101,12 @@ class ReleaseTrains(unittest.TestCase):
     def test_client_cutoff_follows_los_angeles_and_uses_the_scheduled_hour(self):
         for created, expected in (
             ('2026-11-18T02:00:00Z', '2026-11-18T02:00:00+00:00'),
-            ('2026-11-18T03:19:00Z', '2026-11-18T02:00:00+00:00'),
+            ('2026-11-18T16:59:59Z', '2026-11-18T02:00:00+00:00'),
+            ('2026-11-18T17:00:00Z', '2026-11-18T17:00:00+00:00'),
+            ('2026-11-18T19:19:00Z', '2026-11-18T17:00:00+00:00'),
             ('2026-07-18T01:06:00Z', '2026-07-18T01:00:00+00:00'),
+            ('2026-07-18T16:06:00Z', '2026-07-18T16:00:00+00:00'),
+            ('2026-11-01T16:59:59Z', '2026-11-01T01:00:00+00:00'),
         ):
             with self.subTest(created=created):
                 self.assertEqual(hourly.client_cutoff(datetime.fromisoformat(created)).isoformat(), expected)
@@ -125,11 +129,12 @@ class ReleaseTrains(unittest.TestCase):
                              {'core': records[2]['tag_name'], 'app': records[3]['tag_name']})
 
     def test_daily_rerun_recovers_source_from_generated_tags_and_rejects_stale_batches(self):
-        cutoff = datetime.fromisoformat('2026-11-18T02:00:00Z')
+        cutoff = datetime.fromisoformat('2026-11-18T17:00:00Z')
+        morning_batch = cutoff.strftime('%Y%m%d%H')
         base = release_context.git('rev-parse', 'HEAD')
         release_context.git('update-ref', 'refs/remotes/origin/main', base)
         with patch.object(hourly, 'green_main') as green:
-            for batch in ('2026111802', '2026111902'):
+            for batch in (morning_batch, '2026111902'):
                 tree = release_source.expected_tree('mobile', base, batch)
                 identity = dict(os.environ, GIT_AUTHOR_EMAIL=release_source.BOT, GIT_COMMITTER_EMAIL=release_source.BOT)
                 source = release_context.git('commit-tree', tree, '-p', base, '-m',
@@ -138,14 +143,14 @@ class ReleaseTrains(unittest.TestCase):
                 tag = f'mobile-v{version}'
                 release_context.git('tag', tag, source)
                 self.addCleanup(release_context.git, 'tag', '-d', tag)
-                if batch == '2026111802':
+                if batch == morning_batch:
                     self.assertEqual(hourly.client_source(cutoff, batch), base)
             with self.assertRaisesRegex(ValueError, 'newer client batch'):
-                hourly.client_source(cutoff, '2026111802')
+                hourly.client_source(cutoff, morning_batch)
         green.assert_not_called()
 
     def test_older_client_run_cannot_publish_after_a_newer_schedule_without_tags(self):
-        original = {'created_at': '2026-11-18T02:07:00Z', 'workflow_id': 99}
+        original = {'created_at': '2026-11-18T17:07:00Z', 'workflow_id': 99}
         latest = {'workflow_runs': [{'created_at': '2026-11-19T02:04:00Z'}]}
         with (patch.dict(os.environ, {'GITHUB_EVENT_NAME': 'schedule', 'GITHUB_RUN_ID': '7'}),
               patch.object(hourly, 'require_coordinator_context'),
