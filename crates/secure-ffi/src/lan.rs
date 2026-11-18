@@ -110,7 +110,8 @@ pub async fn lan_connect(
     timeout_ms: u32,
 ) -> Result<Arc<LanStream>> {
     on_runtime(async move {
-        let stream = endpoint()?
+        let stream = endpoint()
+            .await?
             .connect(&device_id, &addrs, Duration::from_millis(timeout_ms.into()))
             .await
             .map_err(transport)?;
