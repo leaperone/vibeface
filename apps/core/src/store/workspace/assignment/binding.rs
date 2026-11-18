@@ -7,7 +7,6 @@ use super::super::{
     validation::valid_roots,
 };
 use crate::{
-    model::EventBody,
     scheduling::SessionScope,
     store::log,
     workspace::{Assignment, AssignmentState, InputTarget, WorkspaceInput},

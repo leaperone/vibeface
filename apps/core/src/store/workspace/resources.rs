@@ -14,6 +14,7 @@ use anyhow::{Context as _, Result};
 use rusqlite::{Connection, OptionalExtension as _, params};
 use std::collections::BTreeSet;
 
+#[derive(Clone, Copy)]
 pub(super) enum ResourceQuery<'a> {
     Assignment(Option<&'a str>),
     Work(&'a str),

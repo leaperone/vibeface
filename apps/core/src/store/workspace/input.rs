@@ -274,7 +274,6 @@ pub(super) fn workspace_input_from(
     }
     Ok(found)
 }
-#[derive(Clone, Copy)]
 
 fn queued_input_from_control(
     connection: &Connection,

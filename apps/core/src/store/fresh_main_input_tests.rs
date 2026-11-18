@@ -2,7 +2,10 @@ use super::{fresh_main_inputs, reset_fresh_main_inputs};
 use crate::{
     crypto::LocalIdentity,
     model::{Event, EventBody, IngestStatus, SignedEvent, WIRE_VERSION},
-    store::{Store, membership_from},
+    store::{
+        Store, membership_from,
+        workspace::{authorization_ancestor_walks, reset_projection_ancestor_walks},
+    },
     workspace::{InputControl, InputIntent, InputTarget, WORKSPACE_SCOPE, WorkspaceCommand},
 };
 use anyhow::{Context as _, Result, ensure};

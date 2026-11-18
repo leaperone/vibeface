@@ -5,7 +5,7 @@ use super::{
     graph::Graph,
     input::{resolve_with_graph, target_task, workspace_input_from},
     overview,
-    query::{bot_scope, graph_at, read_graph},
+    query::{bot_scope, graph_at, owner_at, read_graph},
     resources::{ResourceQuery, resource_conflicts_from},
     validation::valid_roots,
 };
