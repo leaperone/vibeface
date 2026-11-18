@@ -72,6 +72,8 @@ gh workflow run release-www.yml --ref 'www-v<version>' -f tag='www-v<version>' -
 
 Unix 与 Windows 安装器、Rust 更新器只跟踪 `cli-v` 发布线。Stable 选择 `cli-vX.Y.Z`，Hourly 选择 `cli-vX.Y.Z-hourly.YYYYMMDDHH`，均不选择 RC、其他应用或缺少完整清单的 Release。按数值版本比较，不自动降级，不在 Stable 缺失时退回 Hourly。
 
+三个消费者通过 GitHub `GET /git/matching-refs/tags/cli-v` 读取 Tag refs，筛选所选渠道的规范 `refs/tags/cli-v...`，按数值版本从新到旧查询 `GET /releases/tags/{tag}`，不遍历全仓库 Release 列表。更新器只查询比当前版本新的候选。查询返回的 Tag 必须与请求一致；404、草稿、prerelease 标记与渠道不符或缺少完整清单的候选会跳过。最多查询 16 个候选；若仍有未查候选且未找到完整 Release，则明确报错，不报告“没有更新”。
+
 安装器下载整份运行包并核对 CLI 身份、Core/App 精确 pin、平台、文件摘要、协议与 epoch，随后创建受管的 `releases/<cli-version>` 和 `current`。完整命令见[安装说明](install.md)。不兼容的旧开发安装按新格式重新安装；不提供旧产品 manifest、旧 Tag 别名或更新协议回退。
 
 更新器保留已有的维护租约、空闲检查、数据快照、激活 journal、原子入口切换与健康检查。存在活动任务或结果未知操作时推迟更新，不强行结束任务。数据 epoch 不匹配时拒绝安装；不隐式转换、清空身份或覆盖数据。失败时按 journal 恢复程序入口，数据恢复需使用匹配的备份，不能用旧程序读取不同 epoch 的数据。

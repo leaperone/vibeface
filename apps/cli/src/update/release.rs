@@ -18,7 +18,7 @@ use vibeface_bridge::{platform::privatefs, transport};
 use vibeface_control::{DATA_EPOCH, UPDATE_PROTOCOL};
 
 const API: &str = "https://api.github.com/repos/leaperone/vibeface";
-const MAX_PAGES: usize = 20;
+const MAX_CANDIDATES: usize = 16;
 const MAX_JSON: usize = 4 * 1024 * 1024;
 const MAX_ARCHIVE: u64 = 128 * 1024 * 1024;
 const MAX_UNPACKED: u64 = 512 * 1024 * 1024;
@@ -85,39 +85,54 @@ struct ObjectResponse {
     object: GitObject,
 }
 
+#[derive(Deserialize)]
+struct TagRef {
+    #[serde(rename = "ref")]
+    name: String,
+}
+
 /// Find a newer official release in the selected channel without running providers.
 pub async fn check(channel: Channel) -> Result<Option<Release>> {
     let client = client()?;
     let current = Version::parse(env!("CARGO_PKG_VERSION"))?;
-    let mut candidates: Vec<(Version, GithubRelease)> = Vec::new();
-    for page in 1..=MAX_PAGES {
-        let releases: Vec<GithubRelease> =
-            get_json(&client, &format!("{API}/releases?per_page=100&page={page}")).await?;
-        let complete = releases.len() < 100;
-        for release in releases {
-            let Some(version) = channel_version(&release.tag_name, channel) else {
-                continue;
-            };
-            if release.draft
-                || release.prerelease != (channel == Channel::Hourly)
-                || version <= current
-            {
-                continue;
-            }
-            candidates.push((version, release));
+    let refs: Vec<TagRef> =
+        get_json(&client, &format!("{API}/git/matching-refs/tags/cli-v")).await?;
+    let candidates = candidate_tags(&refs, channel, &current);
+    let bounded = candidates.len() > MAX_CANDIDATES;
+    for (version, tag) in candidates.into_iter().take(MAX_CANDIDATES) {
+        let Some(release) =
+            get_optional_json::<GithubRelease>(&client, &format!("{API}/releases/tags/{tag}"))
+                .await?
+        else {
+            continue;
+        };
+        ensure!(
+            release.tag_name == tag,
+            "release lookup returned a different tag"
+        );
+        if release.draft || release.prerelease != (channel == Channel::Hourly) {
+            continue;
         }
-        if complete {
-            candidates.sort_by(|a, b| b.0.cmp(&a.0));
-            for (version, release) in candidates {
-                match resolve_release(&client, release, version).await? {
-                    Some(release) => return Ok(Some(release)),
-                    None => continue,
-                }
-            }
-            return Ok(None);
+        if let Some(release) = resolve_release(&client, release, version).await? {
+            return Ok(Some(release));
         }
     }
-    bail!("release listing reached {MAX_PAGES} pages; cannot confirm a complete listing")
+    ensure!(
+        !bounded,
+        "none of the {MAX_CANDIDATES} newest candidate releases is complete; cannot confirm the latest release"
+    );
+    Ok(None)
+}
+
+fn candidate_tags(refs: &[TagRef], channel: Channel, current: &Version) -> Vec<(Version, String)> {
+    let mut candidates: Vec<_> = refs
+        .iter()
+        .filter_map(|item| item.name.strip_prefix("refs/tags/"))
+        .filter_map(|tag| Some((channel_version(tag, channel)?, tag.to_owned())))
+        .filter(|(version, _)| version > current)
+        .collect();
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates
 }
 
 fn channel_version(tag: &str, channel: Channel) -> Option<Version> {
@@ -199,7 +214,10 @@ async fn resolve_release(
         marker_asset.browser_download_url == manifest_url,
         "unexpected completion manifest URL"
     );
-    let Some(body) = get_optional_bytes(client, &manifest_url, 1024 * 1024).await? else {
+    let Some(body) = get_optional_bytes(client, &manifest_url, 1024 * 1024)
+        .await
+        .context("fetch release completion manifest")?
+    else {
         return Ok(None);
     };
     let manifest = parse_completion_manifest(&body, &release.tag_name, &version)?;
@@ -473,6 +491,16 @@ async fn get_json<T: serde::de::DeserializeOwned>(client: &Client, url: &str) ->
         .context("decode GitHub release response")
 }
 
+async fn get_optional_json<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    url: &str,
+) -> Result<Option<T>> {
+    get_optional_bytes(client, url, MAX_JSON)
+        .await?
+        .map(|body| serde_json::from_slice(&body).context("decode GitHub release response"))
+        .transpose()
+}
+
 async fn response(client: &Client, url: &str) -> Result<reqwest::Response> {
     let url = Url::parse(url)?;
     ensure!(trusted_url(&url), "update URL is not approved");
@@ -519,14 +547,14 @@ async fn get_optional_bytes(client: &Client, url: &str, limit: usize) -> Result<
         .send()
         .await
         .map_err(reqwest::Error::without_url)
-        .context("fetch release completion manifest")?;
+        .context("fetch official release")?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
     let response = response
         .error_for_status()
         .map_err(reqwest::Error::without_url)
-        .context("fetch release completion manifest")?;
+        .context("fetch official release")?;
     release_body(response, limit).await.map(Some)
 }
 
@@ -1203,24 +1231,27 @@ mod tests {
             "app-v1.2.3",
             "mobile-v1.2.3",
             "www-v1.2.3",
-            "v01.2.3",
-            "v1.2.3+build",
-            "v1.2.3-rc.1",
-            "v1.2.3-nightly.20260101.1",
-            "v1.2.3-hourly.2026022900",
-            "v1.2.3-hourly.2026130100",
-            "v1.2.3-hourly.2026010000",
-            "v1.2.3-hourly.2026010124",
-            "v1.2.3-hourly.20260101",
-            "v1.2.3-hourly.202601010",
-            "v1.2.3-hourly.2026010100.1",
-            "v1.2.3-hourly.2026010100.extra",
+            "v1.2.3",
+            "v1.2.3-hourly.2026010100",
+            "cli-v01.2.3",
+            "cli-v1.2.3+build",
+            "cli-v1.2.3-rc.1",
+            "cli-v1.2.3-nightly.20260101.1",
+            "cli-v1.2.3-hourly.2026022900",
+            "cli-v1.2.3-hourly.2026130100",
+            "cli-v1.2.3-hourly.2026010000",
+            "cli-v1.2.3-hourly.2026010124",
+            "cli-v1.2.3-hourly.20260101",
+            "cli-v1.2.3-hourly.202601010",
+            "cli-v1.2.3-hourly.2026010100.1",
+            "cli-v1.2.3-hourly.2026010100.extra",
+            "cli-v18446744073709551616.0.0",
         ] {
             assert!(channel_version(tag, Channel::Stable).is_none(), "{tag}");
             assert!(channel_version(tag, Channel::Hourly).is_none(), "{tag}");
         }
-        assert!(channel_version("v1.2.3", Channel::Hourly).is_none());
-        assert!(channel_version("v1.2.3-hourly.2026010100", Channel::Stable).is_none());
+        assert!(channel_version("cli-v1.2.3", Channel::Hourly).is_none());
+        assert!(channel_version("cli-v1.2.3-hourly.2026010100", Channel::Stable).is_none());
         assert!(
             Version::parse("1.2.3-hourly.2026010200").unwrap()
                 > Version::parse("1.2.3-hourly.2026010123").unwrap()
@@ -1228,6 +1259,55 @@ mod tests {
         assert!(
             Version::parse("1.2.3").unwrap() > Version::parse("1.2.3-hourly.2026010223").unwrap()
         );
+    }
+
+    #[test]
+    fn candidate_tags_keep_newer_cli_channel_tags_in_version_order() {
+        let refs: Vec<TagRef> = serde_json::from_value(serde_json::json!([
+            {"ref": "refs/tags/cli-v0.0.1-hourly.2026111310", "object": {"type": "commit"}},
+            {"ref": "refs/tags/cli-v0.0.1-hourly.2026111302"},
+            {"ref": "refs/tags/cli-v0.0.1-hourly.2026111401"},
+            {"ref": "refs/tags/cli-v0.0.1-hourly.2026111200"},
+            {"ref": "refs/tags/cli-v1.9.0"},
+            {"ref": "refs/tags/cli-v1.10.0"},
+            {"ref": "refs/tags/cli-v0.0.1"},
+            {"ref": "refs/tags/cli-v999.0.0-rc.1"},
+            {"ref": "refs/tags/cli-v999.0.0-nightly.20261113.1"},
+            {"ref": "refs/tags/cli-v999.0.0-hourly.2026022900"},
+            {"ref": "refs/tags/cli-v01.2.3"},
+            {"ref": "refs/tags/cli-v999.0.0+build"},
+            {"ref": "refs/tags/cli-v999.0.0/extra"},
+            {"ref": "refs/tags/cli-v999.0.0$(id)"},
+            {"ref": "refs/tags/core-v999.0.0"},
+            {"ref": "refs/tags/v999.0.0"},
+            {"ref": "refs/heads/cli-v999.0.0"},
+            {"ref": "cli-v999.0.0"}
+        ]))
+        .unwrap();
+        let current = Version::parse("0.0.1-hourly.2026111300").unwrap();
+        let tags = |channel| {
+            candidate_tags(&refs, channel, &current)
+                .into_iter()
+                .map(|(version, tag)| {
+                    assert_eq!(format!("cli-v{version}"), tag);
+                    tag
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            tags(Channel::Hourly),
+            [
+                "cli-v0.0.1-hourly.2026111401",
+                "cli-v0.0.1-hourly.2026111310",
+                "cli-v0.0.1-hourly.2026111302"
+            ]
+        );
+        assert_eq!(
+            tags(Channel::Stable),
+            ["cli-v1.10.0", "cli-v1.9.0", "cli-v0.0.1"]
+        );
+        let latest = Version::parse("1.10.0").unwrap();
+        assert!(candidate_tags(&refs, Channel::Stable, &latest).is_empty());
     }
 
     #[test]
