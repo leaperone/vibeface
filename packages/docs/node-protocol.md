@@ -101,7 +101,9 @@ Node 执行 `codex app-server --listen unix://<socket>`。在 Unix 上，专用 
 
 对本人 App Server 上已定位的线程，Node 通过找到线程时的 socket 读取、复查、插话或中断。Node 每次单独连接，每个请求最多等 10 秒。聊天插话最多等 5 秒，超时后按结果未知对账。Node 不订阅这个 socket 的事件，工作由复查结清。修改或清空 socket 或切换到 `system` 后，新发送按新配置定位，已有工作仍在原 socket 上复查。Node 切换启动配置时不用等这些工作结束。线程与 socket 的关联只保存在内存中。重启后第一次复查重新确定关联之前，Node 自身的 App Server 断开仍可能将这些工作标为可复查的 `unverified`。
 
-发送到 `thread_at.server=user` 时，CLI 沿用该线程的审批、沙箱和默认模型。显式的 `--model` 或 `--effort` 仍随请求发送。审批由本人在原 Codex 客户端处理。使用 `system` 共用 App Server 时，本人的线程也定位为 `node`。发送仍应用 Bot 的审批、沙箱和模型覆盖，Codex 将这些设置沿用到后续回合。
+启动新回合（`turn/start`）时，`thread_at.server=user` 沿用原线程的审批、沙箱和默认模型。显式的 `--model` 或 `--effort` 随新回合请求发送。审批由本人在原 Codex 客户端处理。`system` 模式也将本人线程定位为 `node`。该入口的新回合应用 Bot 的审批、沙箱和模型设置。
+
+向正在运行的回合插话时，`turn/steer` 指定原回合并发送新输入。现有回合继续沿用自己的模型、推理力度、审批和沙箱设置。
 
 `test_codex_app_server` 对 Bot 使用的入口发起一次独立握手。结果包含 `state`，其余字段按状态提供 `socket`、`user_agent`、`reason` 或 `candidates`。配置示例见[配置 SDK 与 App Server](deployment.md#配置-sdk-与-app-server)。实现见 [Provider 配置](../../apps/core/src/providers.rs)、[Codex 运行时](../../apps/core/src/runtime/codex_server.rs)和 [本机 IPC](../../crates/bridge/src/platform/ipc.rs)。
 
