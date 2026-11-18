@@ -150,10 +150,9 @@ export VIBEFACE_BIN_DIR='<命令目录的绝对路径>'
 bash install.sh --channel hourly --install-root "$VIBEFACE_INSTALL_ROOT" --bin-dir "$VIBEFACE_BIN_DIR"
 ```
 
-使用受管更新或原生后台服务前，登记安装目录：
+初始化后安装原生后台服务和自动更新：
 
 ```sh
-vibeface update configure --channel hourly --automatic false --install-root "$VIBEFACE_INSTALL_ROOT"
 vibeface service install
 ```
 

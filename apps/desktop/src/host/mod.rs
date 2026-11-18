@@ -164,6 +164,23 @@ impl DesktopHost {
     fn cli(&self) -> PathBuf {
         bundle_binary(&self.runtime_dir, "vibeface")
     }
+
+    pub(crate) fn ensure_own_update_schedule(&self) -> impl Future<Output = Result<()>> + use<> {
+        let cli = self.cli();
+        let profile = self.profile_dir.clone();
+        let attach_only = self.attach_only;
+        async move {
+            if attach_only
+                || !profile
+                    .join("node-runtime/desktop-node.json")
+                    .try_exists()?
+            {
+                return Ok(());
+            }
+            service::ensure_updater(&cli, &profile).await
+        }
+    }
+
     async fn request(&self, request: &ControlRequest) -> Result<serde_json::Value> {
         let core = self.core();
         ensure!(executable(&core), "安装包缺少可运行的 Core。");

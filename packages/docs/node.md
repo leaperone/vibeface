@@ -625,7 +625,7 @@ vibeface status
 vibeface service status
 ```
 
-GitHub 受管安装通过安装根目录下固定的 `current/vibeface` 启动，npm 安装通过 npm 包中固定的原生程序路径启动。通过 `$VIBEFACE_BIN_DIR/vibeface` 链接调用也保留该路径，升级后不会固定在旧 release。直接运行 `cargo build` 的程序不安装服务。先使用 `update configure --install-root "$VIBEFACE_INSTALL_ROOT"` 保存部署时选择的安装根。
+GitHub 受管安装通过安装根目录下固定的 `current/vibeface` 启动，并注册每小时自动更新。npm 安装通过包内固定的原生程序路径启动，更新由 npm 管理。受管服务会使用已保存的安装根和渠道，首次安装时可从正在执行的受管包确定。
 
 每个系统用户管理一个 Node 服务。各服务命令核对 `--data-dir` 与已安装服务一致，再操作该服务。省略参数时使用 `VIBEFACE_DATA_DIR`，未设置时使用 `~/.vibeface`。管理其他数据目录时显式传入绝对路径。
 
@@ -652,16 +652,15 @@ vibeface service uninstall
 
 自动更新需要完整发布包与受管安装目录。固定的 `current` 符号链接指向当前包，Node 用户服务也通过该路径启动。首次安装方式见 [构建与发布](install.md#github-完整包安装)。
 
-选择 Stable 并开启自动更新：
+选择 Stable 渠道：
 
 ```sh
 "$VIBEFACE_INSTALL_ROOT/current/vibeface" update configure \
     --install-root "$VIBEFACE_INSTALL_ROOT" \
-    --channel stable \
-    --automatic true
+    --channel stable
 ```
 
-将 `stable` 改为 `hourly` 可跟随开发预发布。Stable 不会安装 Hourly；尚无正式版时不会自动更换版本。切换渠道不触发降级。更新渠道和安装目录必须先配置；已有 Hourly 安装应显式选择 `hourly`。
+将 `stable` 改为 `hourly` 可跟随开发预发布。Stable 尚无正式版时会等待。切换渠道只考虑新于当前安装的版本。
 
 查看策略和最近结果、主动检查或立即尝试升级：
 
@@ -673,18 +672,7 @@ vibeface service uninstall
 
 `check` 只查询与校验版本信息。`apply` 仅安装声明与当前数据格式兼容的包，需要安全的空闲窗口。待投递消息、排队与活动管理轮、活动任务和待核对记录都会阻止安装，先完成或核对原任务，不需要关闭网页。升级不会调用模型或修改 Provider 密钥。
 
-开启自动更新会安装独立的用户定时服务。macOS 的 `com.leaperone.vibeface.update` 在载入时和每小时尝试更新；Linux 的 `vibeface-update.timer` 每小时启动一次独立 oneshot 服务。Linux 关机期间不能更新，用户服务能否在退出登录后运行取决于 lingering。更新日志位于数据目录的 `update.stdout.log` 与 `update.stderr.log`，文件权限为 600。`vibeface service status` 同时展示 Node 与更新服务的真实状态。
-
-关闭自动更新时，保留所选渠道与受管路径，重新执行 `configure`：
-
-```sh
-"$VIBEFACE_INSTALL_ROOT/current/vibeface" update configure \
-    --install-root "$VIBEFACE_INSTALL_ROOT" \
-    --channel stable \
-    --automatic false
-```
-
-这会移除更新定时服务，手动 `check` 和 `apply` 仍可使用。`vibeface service install-updater` 和 `uninstall-updater` 可单独安装或移除定时服务，不改变已保存的更新策略。策略的 `automatic` 为 `false` 时，即使手动安装定时服务也不会自动更新。重新配置自动更新会重新安装或移除定时服务。
+自动更新使用当前账户的定时服务。macOS 在载入时及每小时检查。Linux systemd 用户定时器和 Windows 计划任务每小时检查。Linux 退出登录后能否继续运行取决于 lingering。节点停止、忙碌或有待核对结果时会推迟更新。更新日志位于数据目录的 `update.stdout.log` 与 `update.stderr.log`，`vibeface service status` 可查看定时任务状态。
 
 更新器先核对包和存储兼容声明，再停止 Node 并切换 `current`。新进程健康检查失败时只恢复上一份程序入口，不自动还原数据库；会话、身份、配置和凭证仍保存在原数据目录。校验、网络和安装失败可通过 `update status` 与更新日志查看。
 

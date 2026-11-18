@@ -54,7 +54,7 @@ enum Action {
 #[derive(Args)]
 struct Data {
     /// Node data directory.
-    #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = absolute_path, default_value_os_t = default_data_dir())]
+    #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = absolute_path, default_value_os_t = crate::default_data_dir())]
     data_dir: PathBuf,
 }
 
@@ -114,13 +114,6 @@ fn absolute_path(value: &str) -> Result<PathBuf, String> {
     } else {
         Err("path must be absolute".into())
     }
-}
-
-fn default_data_dir() -> PathBuf {
-    std::env::var_os("HOME").map_or_else(
-        || PathBuf::from(".vibeface"),
-        |home| PathBuf::from(home).join(".vibeface"),
-    )
 }
 
 fn core_binary() -> Result<PathBuf> {

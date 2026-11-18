@@ -13,7 +13,7 @@ description: 安装桌面 App，连接已有节点，或在自己的电脑上启
 
 当前源码的桌面界面使用 GPUI。公开安装包以对应 Release 的源码提交和来源收据为准；源码改动、开发预览和已发布版本分别核对，不能把本分支构建等同于已经更新安装。
 
-打开 App 后会检查当前用户已有的本机节点。只有一个可用节点时会自动选择；多个节点会列出位置与状态，选择后打开客户端。记住的节点每次启动都重新核对身份。节点停止时，点击“启动并连接”后才会启动它。首次注册设备仍需要确认身份、下载恢复文件并确认已保存。
+打开 App 时会扫描当前用户已有的本机 Node，优先选择上次连接且身份仍匹配的 Node，否则选择唯一运行中的可用 Node。已授权且能从系统安全存储解锁的桌面身份会尝试恢复连接。需要选择节点或解锁时，按「连接」页提示操作。已有 CLI 后台服务继续使用其原安装路径和数据目录，可从「本机 Node」启动已验证的服务。
 
 没有已有节点时，可以选择“仅作控制端”，用邀请链接访问个人网络；也可以选择在这台电脑启用节点。点击“安装后台节点”后，App 会安装自己的当前用户服务，退出 App 后仍继续运行。“移除后台运行”会卸载服务并保留节点数据。
 
@@ -110,7 +110,7 @@ bash install.sh --channel hourly --install-root "$VIBEFACE_INSTALL_ROOT" --bin-d
 <命令目录>/vibeface -> <安装根目录>/current/vibeface
 ```
 
-它不创建节点数据、不创建个人网络、不启动后台服务、不安装 Provider，也不开启自动更新。安装后把明确指定的 `--bin-dir` 加入 PATH，或直接使用该目录下的 CLI。SHA256 与包同由 GitHub 提供，不能替代独立发布签名。
+下载完成后，把明确指定的 `--bin-dir` 加入 PATH，或直接使用该目录下的 CLI。第一次运行 CLI 初始化节点，再用 `vibeface service install` 注册用户服务和定时更新。SHA256 与包同由 GitHub 提供，不能替代独立发布签名。
 
 已有 `current` 或同名 bin 文件时，安装器保留原文件并拒绝安装。安装器和更新器只跟踪 `cli-v` 发布线，不消费全局 `v<version>`、其他应用 Tag 或缺少完整清单的 Release。从旧统一产品 Tag 或旧安装布局切换时，先确认旧任务与更新已结束，关闭旧自动更新并停止旧服务，再安装到新的安装目录与命令目录，由新入口注册服务。保留原数据目录；Tag 调整不改变 data epoch。受管安装通过 `update apply` 升级，不能绕过正在运行节点的维护检查。更新和服务管理需要完整包。
 
@@ -196,25 +196,24 @@ vibeface service uninstall
 
 本节只适用于 GitHub 受管安装。npm 安装按上面的 npm 命令更新。
 
-首次下载渠道与运行时更新策略分别配置。更新器没有默认策略，必须明确指定渠道、是否自动更新及安装根目录。Hourly 安装初始化后配置：
+安装受管后台服务时会根据现有策略或安装包选定渠道，并注册每小时自动更新。新版 CLI 启动或重新启动受管后台服务时也会检查定时任务。用以下命令查看策略、查询可用版本或主动申请升级：
 
 ```sh
-vibeface update configure --channel hourly --automatic false --install-root "$VIBEFACE_INSTALL_ROOT"
 vibeface update status
 vibeface update check
 vibeface update apply
 ```
 
-手动应用更新需已安装并运行用户服务，更新器才可取得维护租约并确认重启健康状态。希望在空闲时自动更新：
+手动应用更新需已安装并运行用户服务，更新器才可取得维护租约并确认重启健康状态。需要选择渠道时，传入实际安装根目录：
 
 ```sh
-vibeface update configure --channel hourly --automatic true --install-root "$VIBEFACE_INSTALL_ROOT"
+vibeface update configure --channel hourly --install-root "$VIBEFACE_INSTALL_ROOT"
 ```
 
 将来改用正式版：
 
 ```sh
-vibeface update configure --channel stable --automatic true --install-root "$VIBEFACE_INSTALL_ROOT"
+vibeface update configure --channel stable --install-root "$VIBEFACE_INSTALL_ROOT"
 ```
 
 Stable 不存在时不会切换 Hourly，更新器也不自动降级。每次 `update configure` 都必须传入实际安装根目录的绝对路径。更新行为、维护检查和备份边界见 [构建与发布](releasing.md#安装与更新)。
@@ -224,18 +223,20 @@ Stable 不存在时不会切换 Hourly，更新器也不自动降级。每次 `u
 
 从同一个产品 Release 下载适合本机的 `vibeface-desktop-<version>-<target>`。macOS Apple Silicon 使用 `.dmg`，Windows x64 使用 `.exe` 安装器，Linux x64 和 ARM64 使用对应架构的 `.AppImage`。各平台也提供 `.zip`，以及校验摘要和来源收据。
 
-桌面界面使用 GPUI，随包带有同版本、同源码的 CLI、Core 和独立 Web 资源。纯控制端打开窗口、扫描和选择节点不会初始化或启动 Node。只有明确启动本机节点或安装后台服务时，才创建 App 自有节点数据。退出只停止 App 自己启动的 Core；连接既有服务时保留该服务。
+桌面界面使用 GPUI，随附的 CLI、Core 和 Web 资源按各自的 Release 固定版本。扫描时优先复用已有节点，只有明确启动或安装新的本机节点时才初始化 Desktop 自有节点数据。正常退出时，后台服务继续运行。
+
+支持自更新的桌面安装会在启动后及每小时检查本渠道的 `desktop-v` Release，在后台校验并下载更新。退出 Vibeface 后应用已准备的版本，下次打开即生效。可在「关于 Vibeface」查看状态。请将应用放在当前用户可更新的位置。
 
 原生客户端有自己的身份。旧桌面页面的浏览器私钥不可导出，需要通过本人管理设备邀请或显式恢复加入；不静默导出身份、删除旧 profile 或改签未确认写入。已有 Node 数据保留。
 
 Linux 需要 glibc、X11 或 Wayland 桌面会话与可用的 Vulkan 驱动。包内 `native-dependencies.json` 记录实际链接库和最低 glibc 符号要求；AppImage 不安装系统库或显卡驱动。`vibeface.desktop` 包含深链声明，实际注册由桌面集成或明确的用户安装完成。
 
-Windows 安装器只安装到当前账户，不需要管理员、WSL、Git Bash 或开发者模式。未配置签名证书的 Hourly 明确标记为未签名开发预览。正式版必须通过签名验证。已有独立 CLI 服务可以继续运行；桌面应用只连接它，不接管启停。
+Windows 安装器只安装到当前账户，不需要管理员、WSL、Git Bash 或开发者模式。未配置签名证书的 Hourly 明确标记为未签名开发预览。正式版必须通过签名验证。Desktop 通过已核对的 CLI 安装入口启动已有后台服务，更新仍由该安装渠道负责。
 
 ## 安装 Windows CLI 和 Core
 
 Windows 完整包使用 `x86_64-pc-windows-msvc` 目标，包含 `vibeface.exe`、`vibeface-core.exe`、`web/` 和 `scripts/install-node-service.ps1`。保持整个目录完整。Windows 数据目录使用当前账户的 SID 权限，本机维护接口使用仅当前账户可访问的命名管道。
 
-源码中的 `scripts/install.ps1 -Channel hourly` 安装最新包含 Windows 制品的产品 Hourly，使用目录 junction 和 `.cmd` 启动入口。该脚本不创建节点、安装后台服务或开启自动更新。初始化后，按 `vibeface service --help` 配置当前账户的后台任务。
+源码中的 `scripts/install.ps1 -Channel hourly` 安装最新包含 Windows 制品的 CLI Hourly，使用目录 junction 和 `.cmd` 启动入口。初始化后，运行 `vibeface service install` 注册当前账户的后台 Node 和定时更新任务。
 
-CLI 更新器只管理独立安装。更新桌面应用时安装新的桌面包，不能使用 CLI 更新器改写签名应用内的程序。
+CLI 更新器更新受管 Node 的 CLI 包。桌面 App 通过自己的发行包更新。

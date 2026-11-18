@@ -116,7 +116,7 @@ impl Backend {
                         &identity.device_id == expected
                             && values
                                 .get("_local_data_dir")
-                                .is_some_and(|path| identity.data_dir == PathBuf::from(path)),
+                                .is_some_and(|path| identity.data_dir == std::path::Path::new(path)),
                         "本机 Node 已切换，请重新打开连接表单。"
                     );
                 }

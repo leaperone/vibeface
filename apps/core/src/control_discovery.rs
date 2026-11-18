@@ -417,7 +417,20 @@ fn systemd_argument(value: &str) -> Option<(String, &str)> {
 
 #[cfg(windows)]
 fn user_service_registration() -> std::result::Result<Option<UserService>, ()> {
-    let script = r#"$id=[Security.Principal.WindowsIdentity]::GetCurrent().User; $task=Get-ScheduledTask -TaskPath '\Vibeface' -TaskName 'Node' -ErrorAction SilentlyContinue; if (!$task) { Write-Output 'null'; exit }; $owner=$task.Principal.UserId; if ($owner -notmatch '^S-1-') { $owner=([Security.Principal.NTAccount]$owner).Translate([Security.Principal.SecurityIdentifier]).Value }; if ($owner -ne $id.Value -or $task.Actions.Count -ne 1) { exit 1 }; $a=$task.Actions[0]; @{command=$a.Execute;arguments=$a.Arguments} | ConvertTo-Json -Compress"#;
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$id = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+try { $task = Get-ScheduledTask -TaskPath '\Vibeface\' -TaskName 'Node' }
+catch {
+    if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { Write-Output 'null'; exit }
+    throw
+}
+$owner = $task.Principal.UserId
+if ($owner -notmatch '^S-1-') { $owner = ([Security.Principal.NTAccount]$owner).Translate([Security.Principal.SecurityIdentifier]).Value }
+if ($owner -ne $id -or $task.Actions.Count -ne 1) { exit 1 }
+$action = $task.Actions[0]
+@{command=$action.Execute;arguments=$action.Arguments} | ConvertTo-Json -Compress
+"#;
     let output = vibeface_bridge::platform::discovery::read_only_powershell(script, 16 * 1024)
         .map_err(|_| ())?;
     #[derive(Deserialize)]

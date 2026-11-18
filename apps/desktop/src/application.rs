@@ -98,7 +98,9 @@ fn default_profile() -> Result<PathBuf> {
     Ok(base.join("Vibeface/native-desktop"))
 }
 pub fn run() -> Result<()> {
-    let update_cache = default_profile().ok().map(|profile| profile.join("app-updates"));
+    let update_cache = default_profile()
+        .ok()
+        .map(|profile| profile.join("app-updates"));
     #[cfg(windows)]
     if update::apply_requested(update_cache.as_deref())? {
         return Ok(());
@@ -114,10 +116,17 @@ pub fn run() -> Result<()> {
     let InstanceClaim::Primary(mut instance) = instance else {
         return Ok(());
     };
-    let updater = update::Updater::start(update_cache.as_deref(), options.fixture, runtime.handle())?;
+    let updater =
+        update::Updater::start(update_cache.as_deref(), options.fixture, runtime.handle())?;
     let update_status = updater.status();
     let desktop_host =
         host::DesktopHost::open(options.profile.clone(), options.runtime, options.fixture)?;
+    let update_schedule = desktop_host.ensure_own_update_schedule();
+    runtime.spawn(async move {
+        if let Err(error) = update_schedule.await {
+            eprintln!("Vibeface Node update schedule: {error:#}");
+        }
+    });
     let credential_base = format!(
         "vibeface-native://{}",
         hex::encode(sha2::Sha256::digest(

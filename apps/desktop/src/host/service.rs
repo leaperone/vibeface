@@ -49,21 +49,11 @@ pub(crate) async fn invoke(
     action: BackgroundAction,
     expected: Option<&str>,
 ) -> Result<ManagedNodeStatus> {
-    let mut command = Command::new(cli);
-    command
-        .arg("desktop-node")
-        .arg("--profile-dir")
-        .arg(profile);
-    if action != BackgroundAction::Status {
-        let id = expected
-            .context("更改后台节点需要已验证身份。")
-            .and_then(|id| {
-                device_id(id)?;
-                Ok(id)
-            })?;
-        command.arg("--expected-device-id").arg(id);
-    }
-    command.arg(action.argument());
+    let expected = match action {
+        BackgroundAction::Status => None,
+        _ => Some(expected.context("更改后台节点需要已验证身份。")?),
+    };
+    let command = managed_command(cli, profile, action.argument(), expected)?;
     let timeout = Duration::from_secs(if action == BackgroundAction::Update {
         120
     } else {
@@ -74,6 +64,47 @@ pub(crate) async fn invoke(
         serde_json::from_slice(&output).context("后台节点返回无效结果。")?;
     status.validate()?;
     Ok(status)
+}
+
+fn managed_command(
+    cli: &Path,
+    profile: &Path,
+    operation: &str,
+    expected: Option<&str>,
+) -> Result<Command> {
+    let mut command = Command::new(cli);
+    command
+        .arg("desktop-node")
+        .arg("--profile-dir")
+        .arg(profile);
+    if let Some(id) = expected {
+        device_id(id)?;
+        command.arg("--expected-device-id").arg(id);
+    }
+    command.arg(operation);
+    Ok(command)
+}
+
+pub(crate) async fn ensure_updater(cli: &Path, profile: &Path) -> Result<()> {
+    let managed = invoke(cli, profile, BackgroundAction::Status, None).await?;
+    let Some(identity) = managed.identity() else {
+        return Ok(());
+    };
+    if !matches!(
+        managed.state,
+        ServiceState::Installed | ServiceState::InstalledStopped
+    ) || managed.runtime_update.recovery_required
+    {
+        return Ok(());
+    }
+    let command = managed_command(cli, profile, "ensure-updater", Some(&identity.device_id))?;
+    run(
+        command,
+        Duration::from_secs(30),
+        "无法核对后台 Node 的自动更新。",
+    )
+    .await?;
+    Ok(())
 }
 
 pub(crate) async fn start_registered(cli: &Path, data_dir: &Path) -> Result<()> {

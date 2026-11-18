@@ -62,17 +62,6 @@ fn absolute_path(value: &str) -> Result<PathBuf, String> {
     }
 }
 
-fn data_dir_or_home(dir: Option<PathBuf>) -> Result<PathBuf> {
-    let dir = dir
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".vibeface")))
-        .unwrap_or_else(|| PathBuf::from(".vibeface"));
-    ensure!(
-        !dir.as_os_str().is_empty() && dir.is_absolute(),
-        "specify an absolute data directory"
-    );
-    Ok(dir)
-}
-
 fn core_binary() -> Result<PathBuf> {
     vibeface_control::sibling_core(&std::env::current_exe()?)
 }
@@ -274,7 +263,7 @@ pub async fn run(options: Service) -> Result<()> {
             "automatic updates are required for managed Node services; use vibeface service uninstall to remove the Node and its timer"
         );
     }
-    let data_dir = data_dir_or_home(options.data_dir)?;
+    let data_dir = crate::data_dir_or_home(options.data_dir)?;
     let data = std::fs::canonicalize(data_dir)
         .context("initialized data directory is required; run vibeface init first")?;
     let executable = std::env::current_exe()?;
