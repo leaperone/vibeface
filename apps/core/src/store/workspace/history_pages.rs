@@ -1,7 +1,18 @@
 //! Scope-bound, authenticated cursors. Reads never mutate projections or replay events.
-use super::*;
+use super::{
+    query::{history_speaker, read_graph},
+    validation::valid_id,
+};
+use crate::{
+    model::EventBody,
+    store::{Store, log},
+    workspace::*,
+};
+use anyhow::{Context as _, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::{RngCore as _, rngs::OsRng};
+use rusqlite::{OptionalExtension as _, params};
+use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use vibeface_protocol::{
     history::{HISTORY_PAGE_BYTES, HISTORY_RESPONSE_BYTES},
@@ -202,7 +213,7 @@ impl Store {
             !request.query.trim().is_empty() && request.query.len() <= 1024,
             "search query must contain 1-1024 bytes of text"
         );
-        let graph = Graph::read(&self.connection, network)?;
+        let graph = read_graph(&self.connection, network)?;
         let mut candidates = Vec::new();
         let conversation = match &request.scope {
             MessageSearchScope::BotMain { bot_id } => {
