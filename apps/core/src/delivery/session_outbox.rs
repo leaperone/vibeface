@@ -445,3 +445,49 @@ impl Delivery {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vibeface_session_delivery::{SessionObjectHeader, SessionObjectKind};
+
+    #[test]
+    fn paid_claim_binds_the_verified_object_and_has_a_stable_retry_id() -> Result<()> {
+        let payment = SessionPaymentConfig {
+            deployment: "01".repeat(32),
+            budget: "02".repeat(32),
+            amount: "17".into(),
+            claim_until_ms: 99,
+        };
+        let header = SessionObjectHeader {
+            version: 1,
+            kind: SessionObjectKind::Message,
+            object_id: [7; 32],
+            session_id: "network".into(),
+            conversation_id: "conversation".into(),
+            sequence: 1,
+            previous_object_id: [6; 32],
+            sender_peer: [3; 32],
+            receiver_peer: [4; 32],
+            provider_peer: [5; 32],
+            payload_hash: [8; 32],
+            payload_bytes: 100,
+            created_at_ms: 1,
+            expires_at_ms: 1000,
+            chunk_count: 1,
+        };
+        let receipt =
+            super::super::session::SessionStoredReceipt::for_test([7; 32], hex::encode([9; 64]));
+        let first = Delivery::paid_session_claim("route", 3, &payment, &header, &receipt)?;
+        let retry = Delivery::paid_session_claim("route", 3, &payment, &header, &receipt)?;
+        assert_eq!(first, retry);
+        assert_eq!(first.order.amount, Amount::from_u64(17));
+        assert_eq!(first.order.object, header.object_id);
+        assert!(
+            Delivery::paid_session_claim("route", 4, &payment, &header, &receipt)
+                .map(|claim| claim.order.delivery != first.order.delivery)
+                .unwrap_or(false)
+        );
+        Ok(())
+    }
+}

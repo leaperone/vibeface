@@ -497,6 +497,14 @@ pub struct SessionStoredReceipt {
 }
 
 impl SessionStoredReceipt {
+    #[cfg(test)]
+    pub(super) fn for_test(object_id: Word, signature: String) -> Self {
+        Self {
+            object_id,
+            signature,
+        }
+    }
+
     pub fn verify(&self, object: &EncryptedSessionObject) -> Result<()> {
         verify_object(object)?;
         self.verify_header(&object.header)
