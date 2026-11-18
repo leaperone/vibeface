@@ -10,6 +10,7 @@ import { passwordCopy,recoveryChanges,recoveryCopy,securityCopy,whenText } from 
 import { recoveryEntry,recoveryLink } from '@vibeface/client/identity/recovery-link.ts'
 import { entryAddress,messageOf,parseEntry } from '@vibeface/client/lib/node.ts'
 import { passphrase,passwordStrength,recoveryFileStem } from '@vibeface/client/lib/secure.ts'
+import { useGenerationAction } from '@vibeface/client/lib/use-generation-action.ts'
 import { Button } from '@vibeface/uiarc/button/button.tsx'
 import { Checkbox } from "@vibeface/uiarc/checkbox/checkbox.tsx"
 import { Input } from '@vibeface/uiarc/input/input.tsx'
@@ -25,30 +26,6 @@ function field(form: HTMLFormElement, name: string) { const element = form.eleme
 /** A failed try keeps the chosen file and name; only typed passwords leave the page. */
 function clearPasswords(form: HTMLFormElement) { for (const input of form.querySelectorAll<HTMLInputElement>('input[name$=password]')) input.value = '' }
 function fileOf(form: HTMLFormElement) { const element = form.elements.namedItem('bundle'); const file = element instanceof HTMLInputElement ? element.files?.[0] : null; if (!file) throw new Error('选一个恢复文件。'); return file }
-
-/** Busy and error state bound to the connection generation, so a stale result never unlocks a newer action. */
-function useGenerationRun() {
-  const device = useDevice()
-  const generation = device.connectionGeneration()
-  const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
-  const pending = useRef<number | null>(null)
-  const [error, setError] = useState('')
-  const [status, setStatus] = useState('')
-  useEffect(() => { setError(''); setStatus('') }, [generation])
-  async function run(action: () => Promise<void>, success = '') {
-    if (pending.current === device.connectionGeneration()) return
-    let owner = device.connectionGeneration()
-    setError(''); setStatus('')
-    try {
-      const work = action()
-      owner = device.connectionGeneration(); pending.current = owner; setBusyGeneration(owner)
-      await work
-      if (owner === device.connectionGeneration()) setStatus(success)
-    } catch (cause) { if (owner === device.connectionGeneration()) setError(messageOf(cause)) }
-    finally { if (pending.current === owner) pending.current = null; setBusyGeneration((active) => active === owner ? null : active) }
-  }
-  return { busy: busyGeneration === generation, error, status, run, clear: () => setError('') }
-}
 
 /** The file that still works: the code its name carries; the day it was set shows under 安全. */
 export function CurrentRecoveryFile() {
@@ -97,7 +74,8 @@ export function PhoneRecovery() {
 /** Someone is recovering the network with a recovery file; a manager here can stop it before it takes effect. */
 export function RecoveryPendingCard() {
   const device = useDevice()
-  const { busy, error, run } = useGenerationRun()
+  const { busy: action, error, run } = useGenerationAction(device.connectionGeneration)
+  const busy = Boolean(action)
   // Either decision changes access, so both require confirmation, as on the phone.
   const [confirming, setConfirming] = useState<'confirm' | 'stop' | null>(null)
   const pending = device.pendingRecovery
@@ -106,14 +84,12 @@ export function RecoveryPendingCard() {
   return <ActionCard icon={ShieldAlert} tone="danger" title={recoveryCopy.pending} meta={recoveryCopy.effectiveIn(pending.effective_at_ms - device.nodeClockOffset)} actions={confirming || busy ? <>
     {/* Remount the confirmation row so focus lands on 取消 and a second press cannot confirm. */}
     <Button key={`cancel-${confirming ?? 'busy'}`} type="button" variant="ghost" autoFocus disabled={busy} onClick={() => setConfirming(null)}>取消</Button>
-    <Button key={confirming ?? 'busy'} type="button" variant={confirming === 'stop' ? "danger" : "primary"} className={confirming === "stop" ? "" : undefined} disabled={busy} aria-busy={busy || undefined} onClick={() => void run(async () => {
-      if (confirming === 'confirm') {
-        await device.approveRecovery(pending.checkpoint)
-        toast(recoveryCopy.confirmDone, { tone: 'success' })
-      } else {
-        await device.vetoRecovery(pending.checkpoint)
-        toast(recoveryCopy.stopDone, { tone: 'success' })
-      }
+    <Button key={confirming ?? 'busy'} type="button" variant={confirming === 'stop' ? "danger" : "primary"} className={confirming === "stop" ? "" : undefined} disabled={busy} aria-busy={busy || undefined} onClick={() => void run(confirming === 'confirm' ? 'confirm' : 'stop', async ({ current }) => {
+      const confirm = confirming === 'confirm'
+      if (confirm) await device.approveRecovery(pending.checkpoint)
+      else await device.vetoRecovery(pending.checkpoint)
+      if (!current()) return
+      toast(confirm ? recoveryCopy.confirmDone : recoveryCopy.stopDone, { tone: 'success' })
       setConfirming(null)
     })}><BusyIcon busy={busy} icon={confirming === 'stop' ? Hand : ShieldCheck} />{confirming === 'stop' ? recoveryCopy.stop : recoveryCopy.confirm}</Button>
   </> : <>
@@ -255,7 +231,8 @@ export function RecoveredStep() {
 export function RecoveryReview() {
   const device = useDevice()
   const review = device.review
-  const { busy, error, run } = useGenerationRun()
+  const { busy: action, error, run, cancel } = useGenerationAction(device.connectionGeneration)
+  const busy = Boolean(action)
   const [lost, setLost] = useState<string[]>([])
   if (review?.kind !== 'recovery') return null
   return <Panel icon={ArchiveRestore} title={recoveryCopy.whichLost}>
@@ -279,8 +256,8 @@ export function RecoveryReview() {
     <p className="flex items-center gap-2 text-sm text-secondary"><Download aria-hidden="true" className="size-4 shrink-0" />会下载新的恢复文件，生效后旧文件作废</p>
     <InlineError error={error || null} />
     <div className="flex flex-wrap justify-between gap-2">
-      <Button type="button" variant="ghost" className="-ms-3" onClick={device.cancelSensitive}>取消</Button>
-      <Button type="button" disabled={busy} onClick={() => void run(() => device.confirmRecovery(review.members.filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id))))}><BusyIcon busy={busy} />找回</Button>
+      <Button type="button" variant="ghost" className="-ms-3" onClick={() => { cancel(); device.cancelSensitive() }}>取消</Button>
+      <Button type="button" disabled={busy} onClick={() => void run('recover', () => device.confirmRecovery(review.members.filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id))))}><BusyIcon busy={busy} />找回</Button>
     </div>
     {busy ? <p className="text-sm text-secondary">{recoveryCopy.cancelLate}</p> : null}
   </Panel>
@@ -291,7 +268,8 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
   const device = useDevice()
   const localEntry = device.localSetup?.entry
   const target = device.ready?.entry || device.entry || localEntry
-  const { busy, error, status, run, clear } = useGenerationRun()
+  const { busy: action, error, status, run, clear } = useGenerationAction(device.connectionGeneration)
+  const busy = Boolean(action)
   const [password, setPassword] = useState('')
   const [tried, setTried] = useState(false)
   const [open, setOpen] = useState(only ?? (typeof location !== 'undefined' && location.hash === `#${PASSWORD_HASH}` ? 'passphrase' : undefined))
@@ -312,11 +290,11 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
       <p className="text-sm text-secondary">{recoveryCopy.scope}</p>
       <form className="grid gap-4" noValidate onChange={clear} onSubmit={(event) => {
         event.preventDefault(); const form = event.currentTarget
-        void run(async () => {
+        void run('restore', async ({ rebind }) => {
           let work: Promise<void>
           try {
             if (!field(form, 'address').trim() || !field(form, 'device_id').trim()) throw new Error(`还没填要连的节点。在“${target ? recoveryCopy.connectTo : recoveryCopy.manual}”里填好。`)
-            work = device.beginRecovery({ file: fileOf(form), password: field(form, 'password'), name: field(form, 'name'), entry: parseEntry({ address: field(form, 'address'), device_id: field(form, 'device_id') }) })
+            work = device.beginRecovery({ file: fileOf(form), password: field(form, 'password'), name: field(form, 'name'), entry: parseEntry({ address: field(form, 'address'), device_id: field(form, 'device_id') }) }, rebind)
           }
           finally { clearPasswords(form) }
           await work
@@ -340,11 +318,12 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
       {/* A failed try keeps what was typed; a change to any field takes the old error away. */}
       <form className="grid gap-4" noValidate onChange={clear} onSubmit={(event) => {
         event.preventDefault(); const form = event.currentTarget
-        void run(async () => {
+        void run('replace', async ({ current }) => {
           const file = fileOf(form)
           if (!field(form, 'old_password')) throw new Error('还没输入旧密码。')
           setTried(true)
           await device.replaceRecoveryFile({ file, oldPassword: field(form, 'old_password'), password: passphrase(field(form, 'password')) })
+          if (!current()) return
           clearPasswords(form); setPassword(''); setTried(false)
           if (!only) close()
         }, recoveryCopy.replaced)

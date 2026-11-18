@@ -1760,6 +1760,29 @@ test('unexpected closure reconnects the same target with fresh authentication an
   } finally { app.close() }
 })
 
+test('a manual connection reports its own generation change but does not adopt an automatic reconnect', async () => {
+  const app = deviceHarness()
+  try {
+    app.render(); await settle()
+    const from = app.render().connectionGeneration()
+    const changes: { from: number; to: number }[] = []
+    const work = app.render().connect(entry, change => changes.push(plain(change)))
+    assert.deepEqual(changes, [{ from, to: from + 1 }])
+    await work
+    const connection = app.render().ready
+    assert.ok(connection)
+    assert.equal(connection.isCurrent(), true)
+    assert.equal(connection.generation, from + 1)
+    app.sockets.at(-1)?.drop()
+    assert.equal(connection.isCurrent(), false)
+    const [id, retry] = [...app.timers.entries()][0]
+    app.timers.delete(id); retry(); await settle()
+    assert.equal(app.render().ready?.isCurrent(), true)
+    assert.equal(app.render().ready?.generation, from + 2)
+    assert.deepEqual(changes, [{ from, to: from + 1 }])
+  } finally { app.close() }
+})
+
 test('when its address stops answering, the Node is reached by its device ID through a public gateway it named', async () => {
   const gateway = 'https://gateway.example'
   const app = deviceHarness({ saved: true })

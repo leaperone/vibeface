@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { base64ToBytes, bytesToBase64, bytesToHex, sha256Hex } from '../lib/byte-codec.ts'
+import type { ActionTransition } from '../lib/action-owner.ts'
 import { joinLink, joinTicket, unreachableText, validEndpoint, validTarget } from '../lib/transport.ts'
 import type { DeviceChannel, JoinLink } from '../lib/transport.ts'
 import { array, boolean, deviceName, entryJson, entryKey, isRecord, messageOf, nodeNow, parseEntry, parseInfo, parseJoinRequest, parseView, record, same, text } from '../lib/node.ts'
@@ -30,6 +31,7 @@ type Sensitive = { cancel(): void; download?: () => Promise<void>; bootstrap?: (
 type Session = { channel: DeviceChannel; entry: ConnectionEntry; info: EntryInfo; generation: number; networkId?: string }
 type Reconnect = { entry: ConnectionEntry; networkId: string; attempt: number }
 type AuthenticatedEntry = Pick<Reconnect, 'entry' | 'networkId'>
+type GenerationChanged = (transition: ActionTransition<number>) => void
 /** This browser's own recovery as its Node last told: waiting until `effectiveAt` on this browser's clock, or stopped. */
 type RecoveryWait = { status: 'waiting'; effectiveAt: number | null } | { status: 'stopped' }
 type RecoveryCompletion = { active: Session; clientId: string; wait: WaitRecord; recovered: boolean }
@@ -80,19 +82,19 @@ type DeviceContextValue = {
   joins: JoinRequest[]; joining: Joining | null; review: Review | null; initialInvitation: string; localSetup: LocalSetup | null
   /** Set on the local page of a removed Node, which alone may start it over. */
   removedLocally: boolean; rejoined: boolean; nodeJoining: NodeJoining | null
-  rejoin(): Promise<void>; joinThisComputer(link: string, name: string): Promise<'joined' | 'cancelled'>; cancelNodeJoin(): Promise<void>
-  connect(entry: ConnectionEntry): Promise<void>
+  rejoin(onGenerationChanged?: GenerationChanged): Promise<void>; joinThisComputer(link: string, name: string, onGenerationChanged?: GenerationChanged): Promise<'joined' | 'cancelled'>; cancelNodeJoin(): Promise<void>
+  connect(entry: ConnectionEntry, onGenerationChanged?: GenerationChanged): Promise<void>
   /** The name this browser last saw a device listed under, kept past its removal. */
   entryName(entry: ConnectionEntry): string; disconnect(): void; leave(): Promise<void>; factoryReset(): Promise<void>; retryNow(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
-  replaceLostKey(): Promise<void>; join(link: string, name: string): Promise<void>; checkJoin(): Promise<void>; cancelJoin(): void
+  replaceLostKey(): Promise<void>; join(link: string, name: string, onGenerationChanged?: GenerationChanged): Promise<void>; checkJoin(): Promise<void>; cancelJoin(): void
   /** Whether the link's computer would still take it, asked before the person names this device; null: no answer, so the form stays. */
   checkInvite(link: string): Promise<InviteState | null>
   /** Whether a join link leads into this device's own network, reachable or not, or another one; null: no join link. */
   linkTarget(link: string): 'current' | 'other' | null
-  createLocalNetwork(name: string, password: string, nodeName?: string): Promise<void>; openLocalAccess(): Promise<void>
+  createLocalNetwork(name: string, password: string, nodeName?: string, onGenerationChanged?: GenerationChanged): Promise<void>; openLocalAccess(onGenerationChanged?: GenerationChanged): Promise<void>
   refreshDirectory(): Promise<void>; createInvitation(): Promise<Invitation>
   startApproval(joinId: string): Promise<void>; approveJoin(joinId: string, manage: boolean): Promise<void>; rejectJoin(joinId: string): Promise<void>; revoke(deviceId: string): Promise<void>; setManage(deviceId: string, manage: boolean): Promise<void>; renameDevice(deviceId: string, name: string): Promise<void>
-  beginRecovery(input: { file: RecoveryFile; password: string; name: string; entry: ConnectionEntry }): Promise<void>
+  beginRecovery(input: { file: RecoveryFile; password: string; name: string; entry: ConnectionEntry }, onGenerationChanged?: GenerationChanged): Promise<void>
   replaceRecoveryFile(input: { file: RecoveryFile; oldPassword: string; password: string }): Promise<void>
   downloadBackup(): Promise<void>; confirmBootstrap(saved: boolean): Promise<void>; confirmRecovery(members: Member[]): Promise<void>; cancelSensitive(): void
   /** This connection's place in line at a busy Gateway, 1 next; null when it is not waiting. */
@@ -522,7 +524,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       // The Node it was on answers for this device whichever way it is reached; another may not have synced yet.
       const own = candidate.device_id === target.entry.device_id
       try {
-        active = await open(candidate, true, ways <= 1 ? 10000 : candidate.kind === 'lan' ? LAN_MS : 5000)
+        active = await open(candidate, { resuming: true, timeoutMs: ways <= 1 ? 10000 : candidate.kind === 'lan' ? LAN_MS : 5000 })
         if (own && active.info.network_id && active.info.network_id !== target.networkId) throw new AuthenticationError('这个节点已属于另一组设备。')
         const auth = record(await callSession(active, 'authenticate', { network_id: target.networkId }))
         if (own && removed(auth, active, target.networkId)) return true
@@ -557,8 +559,15 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     }
     return false
   }
-  async function open(parsed: ConnectionEntry, resuming = false, timeoutMs = 10000, pendingJoin?: Joining) {
-    if (!resuming) { resetConnection(pendingJoin); setPhase('connecting'); setEntry(parsed) }
+  function resetForAction(onGenerationChanged?: GenerationChanged, pendingJoin?: Joining) {
+    const from = generation.current
+    resetConnection(pendingJoin)
+    onGenerationChanged?.({ from, to: generation.current })
+  }
+  async function open(parsed: ConnectionEntry, { resuming = false, timeoutMs = 10000, pendingJoin, onGenerationChanged }: {
+    resuming?: boolean; timeoutMs?: number; pendingJoin?: Joining; onGenerationChanged?: GenerationChanged
+  } = {}) {
+    if (!resuming) { resetForAction(onGenerationChanged, pendingJoin); setPhase('connecting'); setEntry(parsed) }
     const version = generation.current
     const controller = new AbortController(); connecting.current = controller
     openingConnection.current = controller
@@ -605,15 +614,15 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
           generation.current += 1
           const previous = session.current; session.current = null; controller.abort(); previous?.channel.close()
           setPhase('reconnecting'); scheduleReconnect()
-        } else { resetConnection(pendingJoin); setError(messageOf(cause)) }
+        } else { resetForAction(onGenerationChanged, pendingJoin); setError(messageOf(cause)) }
       }
       opened?.close()
       throw cause
     } finally { if (openingConnection.current === controller) openingConnection.current = null }
   }
   /** Resolves true when the device turned out to be removed. */
-  async function connect(candidate: ConnectionEntry) {
-    const active = await open(candidate)
+  async function connect(candidate: ConnectionEntry, onGenerationChanged?: GenerationChanged) {
+    const active = await open(candidate, { onGenerationChanged })
     const pinned = load(`network-for.${active.entry.device_id}`)
     const auth = record(await scoped(active)('authenticate', { network_id: pinned ?? '' }))
     if (removed(auth, active, typeof pinned === 'string' ? pinned : '')) return true
@@ -631,13 +640,13 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     return true
   }
   /** Sets this removed computer's data aside and waits for it to come back fresh, then offers the join. */
-  async function rejoin(entry = removedFrom) {
+  async function rejoin(entry = removedFrom, onGenerationChanged?: GenerationChanged) {
     // Without a local session yet, open one first; the launched page carries on with the rejoin.
     if (entry?.kind !== 'local' && localSetup?.kind === 'initialized' && localSetup.removed) return openLocalAccess(true)
     if (entry?.kind !== 'local') throw new Error('这里不是本机页面。在运行这个节点的电脑或服务器上打开它，再重新加入。')
-    try { await callSession(await open(entry, true), 'rejoin') }
-    catch (cause) { resetConnection(); setPhase('removed'); throw cause }
-    resetConnection(); setPhase('restarting')
+    try { await callSession(await open(entry, { resuming: true }), 'rejoin') }
+    catch (cause) { resetForAction(onGenerationChanged); setPhase('removed'); throw cause }
+    resetForAction(onGenerationChanged); setPhase('restarting')
     const version = generation.current
     removeEntry(entry)
     const deadline = Date.now() + 60_000
@@ -652,14 +661,14 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     setLocalSetup(setup); setRejoined(true); setPhase('disconnected')
   }
   /** Joins this computer, not this browser, with an invite; the Node runs the join and shows the short code. */
-  async function joinThisComputer(linkText: string, nameValue: string): Promise<'joined' | 'cancelled'> {
+  async function joinThisComputer(linkText: string, nameValue: string, onGenerationChanged?: GenerationChanged): Promise<'joined' | 'cancelled'> {
     if (localSetup?.kind !== 'uninitialized') throw new Error('这个节点已经设置过。')
     const name = deviceName(nameValue)
     const ticket = joinTicket(linkText)
     if (!ticket) throw new Error('这不是有效的加入链接。')
     const link = joinLink(ticket)
     const { capability, entry } = localSetup
-    const active = await open(entry)
+    const active = await open(entry, { onGenerationChanged })
     setNodeJoining({ status: 'waiting' })
     // The same link again only reads how far the join got, so an answer lost on the way is asked for again, never resent as a new request.
     const ask = async () => {
@@ -994,17 +1003,17 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     return null
   }
   /** Joins through a ticket link: commit, wait for the manager's nonce, reveal, show the short code. */
-  async function join(linkText: string, nameValue: string) {
+  async function join(linkText: string, nameValue: string, onGenerationChanged?: GenerationChanged) {
     if (loadJoining().kind !== 'empty') throw joinRecordError()
     const name = deviceName(nameValue)
     const link: JoinLink = await parseJoinLink(linkText)
     let active: Session | null = null
-    // Joining opens a new connection, so the screen drops this failure as stale; keep it here.
+    // The device still reports join errors when the form remounts.
     try {
       const ways = joinWays(link)
       for (const [index, way] of ways.entries()) {
         const last = index === ways.length - 1
-        try { active = await open(way, false, way.kind === 'lan' && !last ? LAN_MS : 10000) }
+        try { active = await open(way, { timeoutMs: way.kind === 'lan' && !last ? LAN_MS : 10000, onGenerationChanged }) }
         catch (cause) {
           if (cause instanceof AuthenticationError || last) { link.secret = ''; throw cause }
         }
@@ -1017,7 +1026,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       if (revoked) {
         const fresh = publicIdentity(await replaceClient())
         identityRef.current = fresh; setIdentity(fresh)
-        active = await open(active.entry)
+        active = await open(active.entry, { onGenerationChanged })
       }
       const me = own().deviceId
       if (loadJoining().kind !== 'empty') throw joinRecordError()
@@ -1067,7 +1076,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     let active = session.current
     if (!active) {
       if (openingConnection.current) return
-      const opening = open(pending.entry, false, 10000, pending)
+      const opening = open(pending.entry, { pendingJoin: pending })
       joinOpening.current = opening
       try { active = await opening }
       finally { if (joinOpening.current === opening) joinOpening.current = null }
@@ -1122,11 +1131,11 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     }
     disconnect()
   }, [disconnect])
-  async function createLocalNetwork(nameValue: string, password: string, nodeName?: string) {
+  async function createLocalNetwork(nameValue: string, password: string, nodeName?: string, onGenerationChanged?: GenerationChanged) {
     if (localSetup?.kind !== 'uninitialized') throw new Error('这个节点已经设置过。改用加入链接或恢复文件。')
     const name = deviceName(nameValue)
     const { capability } = localSetup
-    const active = await open(localSetup.entry)
+    const active = await open(localSetup.entry, { onGenerationChanged })
     if (active.info.initialized) throw new Error('这个节点已经设置过。改用加入链接或恢复文件。')
     if (!password) throw new Error('还没设置恢复密码。')
     const root = Identity.generate()
@@ -1154,12 +1163,12 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     }
     sensitive.current = flow; setReview({ kind: 'bootstrap', networkId })
   }
-  async function openLocalAccess(thenRejoin = false) {
+  async function openLocalAccess(thenRejoin = false, onGenerationChanged?: GenerationChanged) {
     if (localSetup?.kind !== 'initialized') throw new Error('本机页面还没准备好。在运行这个节点的电脑或服务器上打开它再试。')
     // A member browser reconnects as itself; the launcher would start a separate local session on another origin.
     // A removed browser would only be refused again, so it takes the local session.
     const computer = localSetup.entry
-    if (!thenRejoin && error !== removedText(self) && savedEntries().some(item => entryKey(item) === entryKey(computer))) { await connect(computer); return }
+    if (!thenRejoin && error !== removedText(self) && savedEntries().some(item => entryKey(item) === entryKey(computer))) { await connect(computer, onGenerationChanged); return }
     const version = generation.current, controller = new AbortController(); connecting.current = controller
     const setup = await discoverLocalSetup(controller.signal)
     if (version !== generation.current) throw changed()
@@ -1204,7 +1213,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
    * to ask the Node how it stands. The new file is saved before the Node hears of it. After dispatch only reads the
    * original Node's answer for this checkpoint.
    */
-  async function beginRecovery(input: { file: RecoveryFile; password: string; name: string; entry: ConnectionEntry }) {
+  async function beginRecovery(input: { file: RecoveryFile; password: string; name: string; entry: ConnectionEntry }, onGenerationChanged?: GenerationChanged) {
     const existing = loadWait()
     if (existing.kind === 'invalid' || existing.kind === 'unreadable'
       || existing.kind === 'valid' && existing.value.entry.device_id !== input.entry.device_id) throw waitRecordError()
@@ -1219,14 +1228,14 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
         if (opened.networkId !== wait.networkId || opened.root.deviceId() !== wait.rootKey) throw waitRecordError()
         requireWait(wait)
         recoveryPaused.current = false
-        if (!recoveryCheck.current) resetConnection()
+        if (!recoveryCheck.current) resetForAction(onGenerationChanged)
         setRecovery({ status: 'waiting', effectiveAt: null })
         await checkRecovery(wait)
         return
       } finally { opened.release() }
     }
     recoveryPaused.current = false
-    const active = await open(input.entry)
+    const active = await open(input.entry, { onGenerationChanged })
     const request = scoped(active)
     let password = input.password
     input.password = ''
@@ -1688,8 +1697,8 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     connectionGeneration: () => generation.current, link, entrances, tabs,
     displayScope: identity && !joining && ['ready', 'reconnecting', 'connecting'].includes(phase) && displayScope?.device_id === identity.deviceId ? displayScope : null,
     identity, ready, entries, phase, error, entry, info, directory, recoverySince, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
-    removedLocally: phase === 'removed' && removedFrom?.kind === 'local', rejoined, nodeJoining, rejoin, joinThisComputer, cancelNodeJoin,
-    connect: async (item) => { await connect(item) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, leave, factoryReset, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, checkInvite, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
+    removedLocally: phase === 'removed' && removedFrom?.kind === 'local', rejoined, nodeJoining, rejoin: onGenerationChanged => rejoin(removedFrom, onGenerationChanged), joinThisComputer, cancelNodeJoin,
+    connect: async (item, onGenerationChanged) => { await connect(item, onGenerationChanged) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, leave, factoryReset, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, checkInvite, createLocalNetwork, openLocalAccess: onGenerationChanged => openLocalAccess(false, onGenerationChanged), refreshDirectory, createInvitation,
     startApproval, approveJoin, rejectJoin, revoke, setManage, renameDevice, beginRecovery, replaceRecoveryFile,
     linkTarget(link) {
       const networkId = ready?.principal.network_id ?? loadAuthenticated()?.networkId

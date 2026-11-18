@@ -3,6 +3,7 @@ import type { ReadyConnection } from '../lib/node.ts'
 import { messageOf, record, same } from '../lib/node.ts'
 import type { KeyValue, Platform } from '../lib/platform.ts'
 import { bytesToBase64, sha256Hex } from '../lib/byte-codec.ts'
+import { createActionOwner } from '../lib/action-owner.ts'
 import { amount, canRead, canRestart, checkedFile, fileName, intentId, needsRefresh, orderActions, parseBudgets, parseOrder, parseOrders, parsePending, parseProviders, parseReceived, parseStatus, peer } from './model.ts'
 import type { DeliveryBudget, DeliveryDraft, DeliveryOrder, DeliveryProvider, DeliverySettings, DeliveryStatus, PendingIntent, ReserveDeliveryIntent, TransferFile } from './types.ts'
 
@@ -155,24 +156,25 @@ export function useDelivery(connection: ReadyConnection, platform: Platform) {
   const [budgets, setBudgets] = useState<DeliveryBudget[]>([])
   const [providers, setProviders] = useState<DeliveryProvider[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
-  const [busy, setBusy] = useState<string | null>(null)
+  const [active, setActive] = useState<{ client: typeof client; key: string } | null>(null)
   const [error, setError] = useState('')
   // A failed read clears itself on the next good read; a failed action stays until the next action.
   const [readError, setReadError] = useState('')
   const [notice, setNotice] = useState('')
-  const alive = useRef(false), running = useRef<string | null>(null), sequence = useRef(0)
-  const reading = useRef<typeof client | null>(null)
-  const current = () => alive.current && connection.isCurrent()
+  const mounted = useRef<{ client: typeof client } | null>(null)
+  const actions = useRef(createActionOwner<typeof client>()).current
+  const reads = useRef(createActionOwner<typeof client>()).current
+  const sequence = useRef(0)
+  const current = (owner: typeof client) => mounted.current?.client === owner && connection.isCurrent()
   const remember = (order: DeliveryOrder) => {
-    if (!current()) return
     sequence.current += 1
     setOrders(previous => [order, ...previous.filter(item => item.order_id !== order.order_id)])
     setSelectedId(order.order_id)
   }
   async function refresh() {
-    if (reading.current === client) return
-    reading.current = client
-    const owner = ++sequence.current
+    const claim = reads.claim(client, current)
+    if (!claim) return
+    const revision = ++sequence.current
     try {
       const [statusResult, ordersResult] = await Promise.allSettled([client.status(), client.list()])
       if (statusResult.status === 'rejected') throw statusResult.reason
@@ -181,54 +183,66 @@ export function useDelivery(connection: ReadyConnection, platform: Platform) {
       let nextBudgets: DeliveryBudget[] = [], budgetError = ''
       try { if (canManage && (nextStatus.paid_enabled || nextOrders.some(order => order.mode === 'paid'))) nextBudgets = await client.budgets() }
       catch (cause) { budgetError = messageOf(cause) }
-      if (!current() || owner !== sequence.current) return
+      if (!claim.current() || revision !== sequence.current) return
       setStatus(nextStatus); setOrders(nextOrders); setBudgets(nextBudgets); setReadError(budgetError)
       const recent = client.recent()
       if (recent) setSelectedId(previous => previous ?? nextOrders.find(order => order.intent_id === recent)?.order_id ?? null)
-    } catch (cause) { if (current() && owner === sequence.current) setReadError(messageOf(cause)) }
-    finally { if (reading.current === client) reading.current = null }
+    } catch (cause) { if (claim.current() && revision === sequence.current) setReadError(messageOf(cause)) }
+    finally { claim.finish() }
   }
   useEffect(() => {
-    alive.current = true; running.current = null
-    setStatus(null); setOrders([]); setBudgets([]); setProviders([]); setSelectedId(null); setBusy(null); setError(''); setReadError(''); setNotice('')
+    const scope = { client }
+    mounted.current = scope
+    setStatus(null); setOrders([]); setBudgets([]); setProviders([]); setSelectedId(null); setActive(null); setError(''); setReadError(''); setNotice('')
     void refresh()
     // Only a hint for the provider field, read once per connection; without it the ID is still typed in.
-    let live = true
-    void client.providers().then(list => { if (live && current()) setProviders(list) }, () => {})
+    void client.providers().then(list => { if (mounted.current === scope && current(client)) setProviders(list) }, () => {})
     const foreground = platform.onForeground(() => { void refresh() })
-    return () => { live = false; alive.current = false; sequence.current += 1; foreground() }
+    return () => { mounted.current = null; actions.cancel(); reads.cancel(); foreground() }
   }, [client])
   const polling = shouldPollDelivery(status?.enabled === true, orders)
   useEffect(() => {
     if (!polling) return
-    const timer = setInterval(() => { if (platform.foreground() && running.current === null) void refresh() }, 3000)
+    const timer = setInterval(() => { if (platform.foreground() && !actions.busy()) void refresh() }, 3000)
     return () => clearInterval(timer)
   }, [client, polling])
-  async function run(key: string, action: () => Promise<void>) {
-    if (running.current !== null || !current()) return false
-    running.current = key; setBusy(key); setError(''); setNotice('')
-    try { await action(); return true }
-    catch (cause) { if (current()) setError(messageOf(cause)); return false }
-    finally { if (current()) { running.current = null; setBusy(null) } }
+  async function run(key: string, action: (current: () => boolean) => Promise<void>) {
+    const claim = actions.claim(client, current)
+    if (!claim) return false
+    const activity = { client, key }
+    setActive(activity); setError(''); setNotice('')
+    try { await action(claim.current); return claim.current() }
+    catch (cause) { if (claim.current()) setError(messageOf(cause)); return false }
+    finally { if (claim.finish()) setActive(previous => previous === activity ? null : previous) }
   }
+  function runOrder(key: string, request: () => Promise<DeliveryOrder>) {
+    return run(key, async current => { const order = await request(); if (current()) remember(order) })
+  }
+  function runBatch(key: string, request: () => Promise<DeliveryOrder[]>) {
+    return run(key, async current => {
+      const orders = await request()
+      if (current()) for (const order of orders) remember(order)
+    })
+  }
+  const busy = active?.client === client && current(client) ? active.key : null
   const selected = orders.find(order => order.order_id === selectedId) ?? null
   return {
     status, orders, budgets, providers, selected, busy, error: error || readError, notice,
     canManage,
     select: setSelectedId,
     refresh: () => run('refresh', refresh),
-    configure: (settings: DeliverySettings) => run('configure', async () => { const result = await client.configure(settings); if (current()) { sequence.current += 1; setStatus(result) } }),
-    prepare: (draft: DeliveryDraft, file: TransferFile, restartIntentId?: string) => run('prepare', async () => {
+    configure: (settings: DeliverySettings) => run('configure', async current => { const result = await client.configure(settings); if (current()) { sequence.current += 1; setStatus(result) } }),
+    prepare: (draft: DeliveryDraft, file: TransferFile, restartIntentId?: string) => runOrder('prepare', () => {
       if (!status) throw new Error('请先读取设备状态。')
-      remember(await client.prepare(draft, file, status, restartIntentId))
+      return client.prepare(draft, file, status, restartIntentId)
     }),
-    confirm: (order: DeliveryOrder) => run('confirm', async () => { remember(await client.confirm(order)) }),
-    confirmBatch: (orders: DeliveryOrder[]) => run('confirm_batch', async () => { for (const order of await client.confirmBatch(orders)) remember(order) }),
-    accept: (order: DeliveryOrder) => run('accept', async () => { remember(await client.accept(order)) }),
-    acceptBatch: (orders: DeliveryOrder[]) => run('accept_batch', async () => { for (const order of await client.acceptBatch(orders)) remember(order) }),
-    reconcile: (order: DeliveryOrder) => run('reconcile', async () => { remember(await client.reconcile(order)) }),
-    flushBudget: (budgetId: string) => run('flush_budget', async () => { await client.flushBudget(budgetId); await refresh() }),
-    save: (order: DeliveryOrder) => run('save', async () => {
+    confirm: (order: DeliveryOrder) => runOrder('confirm', () => client.confirm(order)),
+    confirmBatch: (orders: DeliveryOrder[]) => runBatch('confirm_batch', () => client.confirmBatch(orders)),
+    accept: (order: DeliveryOrder) => runOrder('accept', () => client.accept(order)),
+    acceptBatch: (orders: DeliveryOrder[]) => runBatch('accept_batch', () => client.acceptBatch(orders)),
+    reconcile: (order: DeliveryOrder) => runOrder('reconcile', () => client.reconcile(order)),
+    flushBudget: (budgetId: string) => run('flush_budget', async current => { await client.flushBudget(budgetId); if (current()) await refresh() }),
+    save: (order: DeliveryOrder) => run('save', async current => {
       const saved = await client.save(order, platform)
       if (current()) setNotice(saved === 'saved' ? '文件校验通过，并已保存到此应用。分享面板可导出副本。' : '文件校验通过，已交给浏览器保存。请确认下载文件。')
     }),

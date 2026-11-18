@@ -7,6 +7,7 @@ import * as deliveryModel from '@vibeface/client/delivery/model.ts'
 import * as byteCodec from '@vibeface/client/lib/byte-codec.ts'
 import { type DeliveryBudget } from '@vibeface/client/delivery/types.ts'
 import { selectionOwner } from '@vibeface/client/lib/selection.ts'
+import type { GenerationAction } from '@vibeface/client/lib/use-generation-action.ts'
 import { parseChanged } from '@vibeface/client/lib/progress.ts'
 import * as workspaceHistory from '@vibeface/client/workspace/history.ts'
 import { completeHistory } from '@vibeface/client/workspace/history-fixture.ts'
@@ -1969,6 +1970,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   const require = (specifier: string): unknown => {
     if (nativePureModules.has(specifier)) return loadComponentModule(fileURLToPath(new URL(`../../../../../apps/mobile/src/${specifier.slice(2)}.ts`, import.meta.url)))
     if (specifier === './cached') return loadComponentModule(fileURLToPath(new URL('../../../../../apps/mobile/src/data/cached.ts', import.meta.url)))
+    if (specifier === '@vibeface/client/lib/use-generation-action.ts') return loadComponentModule(fileURLToPath(new URL('../../../../../packages/client/src/lib/use-generation-action.ts', import.meta.url)))
     if (specifier === '@vibeface/client/lib/selection.ts') return { selectionOwner }
     if (specifier === '@vibeface/client/workspace/conversation-cache.ts') return conversationCache
     if (specifier === '@/platform/native-chat-drafts') return { chatDrafts }
@@ -3054,6 +3056,63 @@ test('the required paid transfer budget stays empty until a real budget is selec
     assert.deepEqual(JSON.parse(JSON.stringify(empty.props.options)), [{ value: 'arc:budget-1', label: 'budget-1 · 可分配 10' }])
     ;(empty.props.onValueChange as (value: string) => void)('arc:budget-1')
     assert.equal(render().find(({ type, props }) => type === 'Select' && props.id === 'transfer-budget')?.props.value, 'arc:budget-1')
+  } finally { app.close() }
+})
+
+test('delivery reconnect fences old action feedback and releases only the new action when it finishes', async () => {
+  const peer = '11'.repeat(32)
+  const status = { enabled: true, charity_enabled: true, paid_enabled: false, node_peer: peer, wallet: { state: 'absent', address: null }, max_file_bytes: 130816, receiver_key: null }
+  const app = componentHarness('../lab/lab.tsx', {
+    '@/lib/platform': { webPlatform: { storage: { getItem: () => null, setItem() {} }, onForeground: () => () => {}, foreground: () => false } },
+  }, { setInterval: () => 1, clearInterval() {} }, 'ConnectedLab', { '@vibeface/client/delivery/client.ts': '../../../../../packages/client/src/delivery/client.ts' })
+  let generation = 0, configureCalls = 0
+  const makeConnection = (result: ReturnType<typeof pendingResult>) => {
+    const owner = ++generation
+    return {
+      generation: owner, entry: { device_id: peer }, principal: { source: 'membership', can_manage: true },
+      isCurrent: () => generation === owner,
+      async request(method: string, params: { op: string }) {
+        assert.equal(method, 'delivery')
+        switch (params.op) {
+          case 'status': return status
+          case 'list': return { orders: [] }
+          case 'providers': return { providers: [] }
+          case 'configure': configureCalls++; return result.promise
+          default: assert.fail(`unexpected delivery request: ${params.op}`)
+        }
+      },
+    }
+  }
+  let connection = makeConnection(pendingResult())
+  const render = () => app.render('ConnectedLab', { connection })
+  const toggle = () => render().find(({ type }) => type === 'Switch')?.props
+  const change = (checked: boolean) => {
+    const handler = toggle()?.onCheckedChange
+    assert.ok(typeof handler === 'function')
+    handler(checked)
+  }
+  try {
+    for (const outcome of ['success', 'failure']) {
+      const old = pendingResult(), fresh = pendingResult()
+      connection = makeConnection(old); render(); await settleComponent()
+      const before = configureCalls
+      change(false)
+      change(true)
+      assert.equal(configureCalls, before + 1)
+      assert.equal(toggle()?.disabled, true)
+      connection = makeConnection(fresh); render(); await settleComponent()
+      assert.equal(toggle()?.disabled, false)
+      change(false)
+      if (outcome === 'success') old.resolve({ ...status, enabled: false })
+      else old.reject(new Error('旧订单结果未知。'))
+      await settleComponent()
+      assert.equal(toggle()?.disabled, true)
+      assert.equal(toggle()?.checked, true)
+      assert.equal(render().some(({ props }) => props.error), false)
+      fresh.resolve({ ...status, enabled: false }); await settleComponent()
+      assert.equal(toggle()?.disabled, false)
+      assert.equal(toggle()?.checked, false)
+    }
   } finally { app.close() }
 })
 
@@ -5015,7 +5074,11 @@ test("connection form keeps current errors and busy ownership when an earlier co
   const device = {
     connectionGeneration: () => generation, entries: [{ kind: 'gateway', address: 'https://node.example', device_id: 'target' }], initialInvitation: '',
     identity: { deviceId: 'browser' }, phase: 'disconnected', error: '', entryName: () => '',
-    connect() { if (synchronousFailure) throw new Error('current invalid input'); generation++; return work.promise },
+    connect(_entry: unknown, rebind: GenerationAction['rebind']) {
+      if (synchronousFailure) throw new Error('请填写有效的访问地址。')
+      rebind({ from: generation, to: ++generation })
+      return work.promise
+    },
   }
   const app = componentHarness('../identity/connection-screen.tsx', { '@vibeface/client/identity/context.tsx': { useDevice: () => device, notJoined: (self: string) => `${self}还没加入`, removedText: (self: string) => `${self}已被移除` }, '@/lib/platform': { webPlatform: { self: '这个浏览器', transport: { connectDevice: async () => { throw new Error('offline') } } } }, '@vibeface/client/identity/connection-lane.ts': { primaryLane }, '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message, entryAddress, entryKey }, '@vibeface/client/workspace/labels.ts': { addressName: (address: string) => address, hostOf: () => '' } })
   const render = () => app.render('ConnectionScreen')
@@ -5032,7 +5095,61 @@ test("connection form keeps current errors and busy ownership when an earlier co
     work.resolve(undefined); await settleComponent()
     assert.equal(connect()?.disabled, false)
     synchronousFailure = true; connect()?.onClick?.(); await settleComponent()
-    assert.equal(render().find(({ props }) => props.error)?.props.error, 'current invalid input')
+    assert.equal(render().find(({ props }) => props.error)?.props.error, '请填写有效的访问地址。')
+  } finally { app.close() }
+})
+
+test('Mobile useRun shares synchronous errors, explicit generation changes, and replacement action ownership', async () => {
+  let generation = 1
+  const app = componentHarness('../../../../../apps/mobile/src/lib/use-run.ts', {
+    '@vibeface/client/identity/context.tsx': { useDevice: () => ({ connectionGeneration: () => generation }) },
+  })
+  const render = () => {
+    app.render('useRun')
+    return app.output as ReturnType<typeof import('@vibeface/client/lib/use-generation-action.ts').useGenerationAction>
+  }
+  try {
+    await render().run('bad', () => { throw new Error('请填写设备编号。') })
+    assert.equal(render().error, '请填写设备编号。')
+    assert.equal(render().busy, null)
+
+    for (const outcome of ['success', 'failure']) {
+      const earlier = pendingResult(), newer = pendingResult()
+      const operation = render().run('old', async ({ rebind }) => {
+        await Promise.resolve()
+        rebind({ from: generation, to: ++generation })
+        await earlier.promise
+      }, '旧操作成功。')
+      await settleComponent()
+      assert.equal(render().busy, 'old')
+      await render().run('duplicate', () => assert.fail('the current claim must block a duplicate'))
+
+      generation++
+      assert.equal(render().busy, null)
+      const runNew = render().run('new', () => newer.promise, '新操作成功。')
+      if (outcome === 'success') earlier.resolve(undefined)
+      else earlier.reject(new Error('旧操作失败。'))
+      await operation
+      assert.equal(render().busy, 'new')
+      assert.equal(render().error, '')
+      assert.equal(render().status, '')
+      newer.resolve(undefined)
+      await runNew
+      assert.equal(render().busy, null)
+      assert.equal(render().status, '新操作成功。')
+    }
+
+    const earlier = pendingResult(), newer = pendingResult()
+    const operation = render().run('cancelled', () => earlier.promise, '已取消的操作成功。')
+    render().cancel()
+    const runNew = render().run('replacement', () => newer.promise)
+    earlier.reject(new Error('已取消的操作失败。'))
+    await operation
+    assert.equal(render().busy, 'replacement')
+    assert.equal(render().error, '')
+    newer.resolve(undefined)
+    await runNew
+    assert.equal(render().busy, null)
   } finally { app.close() }
 })
 
@@ -5125,7 +5242,7 @@ test('recovery restore clears submitted passwords before waiting and keeps the c
   const passwords = ['password', 'old_password', 'confirmation'].map(name => fields.get(name))
   const form = { elements: { namedItem: (name: string) => fields.get(name) }, querySelectorAll: () => passwords }
   const device = { connectionGeneration: () => generation, ready: null, review: null, entry: null,
-    beginRecovery: () => { generation++; return work.promise }, replaceRecoveryFile: () => work.promise }
+    beginRecovery: (_input: unknown, rebind: GenerationAction['rebind']) => { rebind({ from: generation, to: ++generation }); return work.promise }, replaceRecoveryFile: () => work.promise }
   const app = componentHarness('../identity/recovery-controls.tsx', {
     '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/lib/node.ts': { parseEntry: (value: unknown) => value, messageOf: (cause: Error) => cause.message },
     '@vibeface/client/lib/secure.ts': { passphrase: (value: string) => value }, '@/lib/device-name': { defaultBrowserName: () => 'browser' },
