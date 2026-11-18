@@ -1,4 +1,5 @@
 import { base64ToBytes, bytesToBase64, sha256Hex } from '../lib/byte-codec.ts'
+import { formatByteSize as sizeLabel } from '../lib/byte-size.ts'
 import { array, boolean, record, text, type Member } from '../lib/node.ts'
 import type { DeliveryBudget, DeliveryDeadlines, DeliveryDraft, DeliveryEvidence, DeliveryMode, DeliveryOrder, DeliveryPayment, DeliveryPhase, DeliveryProvider, DeliveryStatus, PendingIntent, PaymentState, ReceivedFile } from './types.ts'
 
@@ -236,14 +237,7 @@ export const providerChoices = (providers: readonly DeliveryProvider[], mode: De
 
 export const modeOptions: Array<{ value: DeliveryMode; label: string }> = [{ value: 'charity', label: '免费传输' }, { value: 'paid', label: '付费传输' }]
 
-/** Sizes for people: bytes below 1 KB, then KB or MB. `floor` keeps a limit from rounding up past what fits. */
-export function sizeLabel(bytes: number, floor = false): string {
-  if (bytes < 1024) return `${bytes} 字节`
-  const [value, unit] = bytes < 1024 * 1024 ? [bytes / 1024, 'KB'] : [bytes / 1024 / 1024, 'MB']
-  const digits = value < 10 ? 1 : 0
-  const scale = 10 ** digits
-  return `${(floor ? Math.floor(value * scale) / scale : value).toFixed(digits)} ${unit}`
-}
+export { sizeLabel }
 export function orderTitle(order: DeliveryOrder): string {
   if (order.name) return order.name
   return order.role === 'provider' ? '代为转发的文件' : '待接收的文件'
@@ -305,6 +299,6 @@ export const transferCopy = {
   prepareDetails: '下一步会把文件交给当前连接的可信设备加密，还不付款。同一文件和条款不会重复发送。原订单完成后，选择相同文件和条款，点“作为新订单再次发送”才会另建一笔。',
   prepare: (mode: DeliveryMode) => mode === 'paid' ? '查看费用' : '下一步',
   confirm: (mode: DeliveryMode) => mode === 'paid' ? '确认并分配预算' : '确认发送',
-  maxSize: (bytes: number) => `最大 ${sizeLabel(bytes, true)}`,
-  tooLarge: (bytes: number) => `文件超过 ${sizeLabel(bytes, true)}，换一个小点的`,
+  maxSize: (bytes: number) => `最大 ${sizeLabel(bytes, { rounding: 'floor' })}`,
+  tooLarge: (bytes: number) => `文件超过 ${sizeLabel(bytes, { rounding: 'floor' })}，换一个小点的`,
 } as const
