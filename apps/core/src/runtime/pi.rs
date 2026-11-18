@@ -3069,28 +3069,52 @@ mod tests {
     async fn a_failed_pi_journal_leaves_no_running_child() -> Result<()> {
         let dir = scratch("failed-pi-journal");
         let pidfile = dir.join(PIDFILE);
+        let saved_journal = dir.join("saved-journal");
+        let sessions = dir.join("sessions");
+        let processes = Arc::new(Processes::new(pidfile.clone()));
+        let mut launch = Launch {
+            bin: fake(),
+            cwd: dir.clone(),
+            env: env(&dir, "wait"),
+            args: Vec::new(),
+            guide: None,
+        };
+        let existing = Process::spawn(&launch, &processes, &sessions)?;
+        let existing_token = existing.child.token().to_owned();
+
+        std::fs::rename(&pidfile, &saved_journal)?;
         std::fs::create_dir(&pidfile)?;
-        let processes = Arc::new(Processes::new(pidfile));
         let guide = Guide::write(&dir.join("guides"), "fixture instructions")?;
-        let result = Process::spawn(
-            &Launch {
-                bin: fake(),
-                cwd: dir.clone(),
-                env: env(&dir, "wait"),
-                args: Vec::new(),
-                guide: Some(guide.clone()),
-            },
-            &processes,
-            &dir.join("sessions"),
-        );
+        launch.guide = Some(guide.clone());
+        let result = Process::spawn(&launch, &processes, &sessions);
         let Err(failure) = result else {
             panic!("the process journal unexpectedly succeeded");
         };
         assert_eq!(failure.kind, FailureKind::Unknown);
         assert!(failure.detail.contains("record the agent process tree"));
-        let token = guide.started_token().context("pi process was started")?;
-        assert!(ended(&token).await, "pi still runs after a failed journal");
+        let failed_token = guide.started_token().context("pi process was started")?;
+        assert!(
+            ended(&failed_token).await,
+            "pi still runs after a failed journal"
+        );
+
+        std::fs::remove_dir(&pidfile)?;
+        std::fs::rename(&saved_journal, &pidfile)?;
+        launch.guide = None;
+        let restarted = Process::spawn(&launch, &processes, &sessions)?;
+        let restarted_token = restarted.child.token().to_owned();
+        let journal = std::fs::read_to_string(&pidfile)?;
+        let tokens: BTreeSet<_> = journal
+            .lines()
+            .filter_map(|line| line.split_once(' ').map(|(token, _)| token))
+            .collect();
+        assert_eq!(
+            tokens,
+            BTreeSet::from([existing_token.as_str(), restarted_token.as_str()])
+        );
         assert!(prompts(&dir).is_empty());
+        restarted.end().await;
+        existing.end().await;
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
