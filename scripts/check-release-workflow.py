@@ -31,6 +31,12 @@ def jobs(source):
             for index, match in enumerate(matches)}
 
 
+def events(source):
+    match = re.search(r'^on:\n((?: +[^\n]*\n)+)', source, re.M)
+    require(match is not None, 'workflow has no event definitions')
+    return set(re.findall(r'^  ([a-z_]+):', match[1], re.M))
+
+
 def needs(block):
     match = re.search(r'^    needs: (.+)$', block, re.M)
     if not match:
@@ -98,8 +104,9 @@ def checked_source(block):
 
 def check_entry(app, source):
     header = source.split('\njobs:\n', 1)[0]
-    require(f"tags: ['{app}-v*']" in header and 'workflow_dispatch:' in header
-            and 'workflow_call:' not in header and 'default: false' in header,
+    expected_events = {'workflow_dispatch'} if app == 'www' else {'push', 'workflow_dispatch'}
+    require(events(header) == expected_events and 'default: false' in header
+            and (app == 'www' or f"tags: ['{app}-v*']" in header),
             app + ' must expose only its own tags and explicit publication intent')
     require(f'release-{app}-${{{{ inputs.tag || github.ref_name }}}}-' in header
             and 'cancel-in-progress: false' in header and not permission(header, 'contents', 'write'),
@@ -110,7 +117,7 @@ def check_entry(app, source):
                  else {('desktop-' if app == 'desktop' else 'native-') + target for target in TARGETS})
     composed = {'compose-' + target for target in TARGETS} if app == 'cli' else set()
     optional = ({'deploy'} if app in ('core', 'app', 'www') else set()) | ({'npm'} if app == 'cli' else set())
-    require(set(workflow) == {'identity', 'collect', publisher, 'wake-consumers'} | producers | composed | optional,
+    require(set(workflow) == {'identity', 'collect', publisher} | producers | composed | optional,
             app + ' release has foreign or missing producers/consumers')
     identity = workflow['identity']
     require(not needs(identity) and f'scripts/release-entry.py --app {app}' in identity
@@ -119,9 +126,13 @@ def check_entry(app, source):
             app + ' identity must verify exact tag/source and CI with read access')
     for name, output in (('app', 'app'), ('tag', 'tag'), ('publish', 'publish'), ('source_sha', 'source_commit')):
         require(scalar(identity, name) == '${{ steps.plan.outputs.' + output + ' }}', 'release identity output differs')
-    require('RELEASE_TAG: ${{ inputs.tag || (github.ref_type' in identity
-            and 'PUBLISH: ${{ github.event_name == \'push\' || inputs.publish }}' in identity,
-            'tag push and manual publication intent must reach the identity validator')
+    if app == 'www':
+        require('RELEASE_TAG: ${{ inputs.tag }}' in identity and 'PUBLISH: ${{ inputs.publish }}' in identity,
+                'WWW publication must use the explicit inputs of its manual run')
+    else:
+        require('RELEASE_TAG: ${{ inputs.tag || (github.ref_type' in identity
+                and 'PUBLISH: ${{ github.event_name == \'push\' || inputs.publish }}' in identity,
+                'tag push and manual publication intent must reach the identity validator')
     for producer in producers | composed:
         block = workflow[producer]
         expected = {'identity', producer.replace('compose-', 'native-')} if producer in composed else {'identity'}
@@ -176,14 +187,10 @@ def check_entry(app, source):
     for name, block in workflow.items():
         if name != publisher:
             require(not permission(block, 'contents', 'write'), 'only the complete publisher may write release assets')
-        if name not in {'deploy', 'wake-consumers'}:
+        if name != 'deploy':
             require(not permission(block, 'actions', 'write') and 'gh workflow run' not in block
                     and 'release-dispatch.py' not in block and 'scripts/deploy' not in block,
-                    'producer/collector must not deploy or wake another release')
-    wake = workflow['wake-consumers']
-    require(needs(wake) == {publisher} and not guard(wake) and permission(wake, 'actions', 'write')
-            and 'GH_TOKEN: ${{ github.token }}' in wake and 'gh workflow run hourly.yml' in wake,
-            'consumer reconciliation must follow this application publication')
+                    'release jobs outside deployment must not dispatch more workflows')
     for consumer in optional:
         block = workflow[consumer]
         required = {'identity', publisher} | ({'collect'} if consumer == 'npm' else set())
@@ -270,18 +277,24 @@ def check_helpers(helpers):
             'npm must preserve CLI provenance, original artifacts, OIDC and reconciliation')
 
 
-def check_hourly(source):
-    require('workflow_run:' in source and "workflows: ['CI / Core']" in source
-            and 'types: [completed]' in source and 'branches: [main]' in source,
-            'coordinator must observe completed main CI')
+def coordinator_job(source, name, group, command):
     workflow = jobs(source)
-    require(set(workflow) == {'hourly'} and 'cancel-in-progress: false' in source
-            and 'group: independent-hourly-releases' in source,
+    require(set(workflow) == {name} and 'cancel-in-progress: false' in source and f'group: {group}\n' in source,
             'independent coordinator must keep one serial non-cancelling writer')
-    block = workflow['hourly']
+    block = workflow[name]
     require(permission(block, 'contents', 'write') and permission(block, 'actions', 'write')
             and 'GH_TOKEN: ${{ github.token }}' in block and 'fetch-depth: 0' in block
-            and 'ref: main' in block and 'scripts/hourly.py' in block, 'coordinator source or permissions differ')
+            and 'ref: main' in block and command in (line.strip() for line in block.splitlines()),
+            'coordinator source, scope or permissions differ')
+    return block
+
+
+def check_hourly(source):
+    require(events(source) == {'schedule', 'workflow_run', 'workflow_dispatch'}
+            and re.findall(r"^    - cron: '([^']+)'$", source, re.M) == ['17 * * * *']
+            and "workflows: ['CI / Core']" in source and 'types: [completed]' in source and 'branches: [main]' in source,
+            'Core coordinator must preserve the hourly schedule and completed main CI trigger')
+    block = coordinator_job(source, 'hourly', 'independent-hourly-releases', 'python3 -B scripts/hourly.py')
     for ref in ('refs/heads/main', 'refs/heads/other'):
         for event in ('schedule', 'workflow_dispatch', 'workflow_run'):
             for origin in ('push', 'pull_request'):
@@ -291,6 +304,20 @@ def check_hourly(source):
                     expected = ref == 'refs/heads/main' and (event != 'workflow_run' or (origin == 'push' and conclusion == 'success'))
                     require(evaluate(guard(block), context=context) == expected,
                             'coordinator must reject failed/fork CI and non-main execution')
+
+
+def check_daily(source):
+    require(events(source) == {'schedule'}
+            and re.findall(r"^    - cron: '([^']+)'\n      timezone: ([^\n]+)$", source, re.M)
+            == [('0 18 * * *', 'America/Los_Angeles')]
+            and source.count('cron:') == 1,
+            'client coordinator must run only at 18:00 America/Los_Angeles')
+    block = coordinator_job(source, 'clients', 'independent-daily-client-releases', 'python3 -B scripts/hourly.py --clients')
+    for ref in ('refs/heads/main', 'refs/heads/other'):
+        for event in ('schedule', 'workflow_run', 'workflow_dispatch'):
+            context = {'github.ref': ref, 'github.event_name': event}
+            require(evaluate(guard(block), context=context) == (ref == 'refs/heads/main' and event == 'schedule'),
+                    'client coordinator must reject all but scheduled main runs')
 
 
 def check_deployment(source, entries):
@@ -361,17 +388,18 @@ def check_artifact_names(entries, helpers):
                 app + ' producer and collector artifact names must be distinct')
 
 
-def check_all(entries, helpers, hourly, deployment, deployment_entries):
+def check_all(entries, helpers, hourly, daily, deployment, deployment_entries):
     require(set(entries) == set(ENTRIES), 'missing independent release entry')
     for app, source in entries.items():
         check_entry(app, source)
     check_helpers(helpers)
     check_artifact_names(entries, helpers)
     check_hourly(hourly)
+    check_daily(daily)
     check_deployment(deployment, deployment_entries)
 
 
-def self_test(entries, helpers, hourly, deployment, deployment_entries):
+def self_test(entries, helpers, hourly, daily, deployment, deployment_entries):
     checked = 0
 
     def rejects(action):
@@ -385,16 +413,18 @@ def self_test(entries, helpers, hourly, deployment, deployment_entries):
 
     colliding = entries['app'].replace('name: app-static-', 'name: app-release-', 1)
     require(colliding != entries['app'], 'App artifact collision mutation did not reach its producer')
-    rejects(lambda: check_all(entries | {'app': colliding}, helpers, hourly, deployment, deployment_entries))
+    rejects(lambda: check_all(entries | {'app': colliding}, helpers, hourly, daily, deployment, deployment_entries))
     colliding = helpers['release-collect.yml'].replace('name: ${{ inputs.app }}-release-', 'name: app-static-', 1)
     require(colliding != helpers['release-collect.yml'], 'artifact collision mutation did not reach the collector')
-    rejects(lambda: check_all(entries, helpers | {'release-collect.yml': colliding}, hourly, deployment, deployment_entries))
+    rejects(lambda: check_all(entries, helpers | {'release-collect.yml': colliding}, hourly, daily, deployment, deployment_entries))
 
     for app, source in entries.items():
         first = ('compose-macos' if app == 'cli' else 'native-macos' if app == 'core'
                  else 'desktop-macos' if app == 'desktop' else 'android' if app == 'mobile' else 'static')
+        trigger_mutation = (('on:\n', "on:\n  push:\n    tags: ['www-v*']\n") if app == 'www'
+                            else (f"tags: ['{app}-v*']", "tags: ['foreign-v*']"))
         for before, after in (
-            (f"tags: ['{app}-v*']", "tags: ['foreign-v*']"),
+            trigger_mutation,
             (f'--app {app}', '--app unknown'),
             ('fetch-depth: 0', 'fetch-depth: 1'),
             ('if: needs.identity.outputs.publish == \'true\'', 'if: always()'),
@@ -438,6 +468,7 @@ def self_test(entries, helpers, hourly, deployment, deployment_entries):
         require(candidate != helpers[filename], 'helper mutation did not reach ' + filename)
         rejects(lambda: check_helpers(helpers | {filename: candidate}))
     for before, after in (
+        ("cron: '17 * * * *'", "cron: '17 5 * * *'"),
         ("github.event.workflow_run.conclusion == 'success'", "github.event.workflow_run.conclusion != 'failure'"),
         ("github.event.workflow_run.event == 'push'", "github.event.workflow_run.event == 'pull_request'"),
         ("github.ref == 'refs/heads/main'", 'true'),
@@ -447,6 +478,16 @@ def self_test(entries, helpers, hourly, deployment, deployment_entries):
         candidate = hourly.replace(before, after, 1)
         require(candidate != hourly, 'coordinator mutation did not reach its guard')
         rejects(lambda: check_hourly(candidate))
+    for before, after in (
+        ("cron: '0 18 * * *'", "cron: '0 * * * *'"),
+        ('America/Los_Angeles', 'UTC'),
+        ('on:\n', 'on:\n  workflow_dispatch:\n'),
+        ("github.event_name == 'schedule'", 'true'),
+        ('scripts/hourly.py --clients', 'scripts/hourly.py'),
+    ):
+        candidate = daily.replace(before, after, 1)
+        require(candidate != daily, 'client schedule mutation did not reach its guard')
+        rejects(lambda: check_daily(candidate))
     for candidate in (
         deployment.replace("github.ref == 'refs/heads/main' || !inputs.apply", 'true'),
         deployment.replace('fail-fast: true', 'fail-fast: false'),
@@ -471,11 +512,12 @@ def main():
     entries = {app: (directory / filename).read_text() for app, filename in ENTRIES.items()}
     helpers = {filename: (directory / filename).read_text() for filename in HELPERS}
     hourly = (directory / 'hourly.yml').read_text()
+    daily = (directory / 'daily.yml').read_text()
     deployment = (directory / 'deploy-services.yml').read_text()
     deployment_entries = {service: (directory / f'deploy-{service}.yml').read_text() for service in ('node', 'app', 'www')}
-    check_all(entries, helpers, hourly, deployment, deployment_entries)
+    check_all(entries, helpers, hourly, daily, deployment, deployment_entries)
     if args.self_test:
-        self_test(entries, helpers, hourly, deployment, deployment_entries)
+        self_test(entries, helpers, hourly, daily, deployment, deployment_entries)
         import runpy
         runpy.run_path(str(ROOT / 'scripts/release-entry.py'))['self_test']()
     print('Independent release DAG passed: six scopes, complete application manifests, exact artifact IDs, pinned dependencies and complete-only consumers')

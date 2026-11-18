@@ -1,0 +1,25 @@
+name: Release / Clients Daily
+on:
+  schedule:
+    - cron: '0 18 * * *'
+      timezone: America/Los_Angeles
+permissions:
+  contents: read
+concurrency:
+  group: independent-daily-client-releases
+  cancel-in-progress: false
+jobs:
+  clients:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions: {contents: write, actions: write}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: main, fetch-depth: 0, persist-credentials: false}
+      - name: Release client changes from green main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh auth setup-git
+          python3 -B scripts/hourly.py --clients

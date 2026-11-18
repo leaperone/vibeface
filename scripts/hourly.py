@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Release changed applications and wake exact dependency consumers independently."""
+"""Reconcile hourly Core and daily client releases from verified main sources."""
 
 import sys
 sys.dont_write_bytecode = True
@@ -13,15 +13,17 @@ import fnmatch
 import hashlib
 import json
 import os
-from pathlib import Path
-import re
 import subprocess
-import tempfile
 import time
+from zoneinfo import ZoneInfo
 
 
 COORDINATOR_SCHEMA = 2
 REPO = release_format.GITHUB_REPO
+CLIENT_APPS = ('app', 'cli', 'desktop', 'mobile')
+CLIENT_TIME_ZONE = 'America/Los_Angeles'
+CLIENT_RELEASE_HOUR = 18
+PENDING = {'dispatched', 'dispatched_existing_tag', 'in_progress', 'waiting_for_manifest'}
 INPUTS = {
     'core': ('apps/core/*', 'crates/protocol/*', 'crates/control/*', 'crates/bridge/*', 'crates/secure/*', 'crates/client/*', 'crates/delivery/*', 'Cargo.toml', 'Cargo.lock', '.cargo/*', 'config/*', 'rust-toolchain*', 'scripts/sign-release.sh', 'scripts/windows-signing.mjs', 'scripts/private-control.mjs', 'scripts/release-rustflags.py', '.github/workflows/release-native.yml'),
     'app': ('apps/app/*', 'packages/client/*', 'packages/theme/*', 'crates/secure/*', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain*', 'pnpm*', 'package.json', 'scripts/build-web*', 'scripts/check-web.sh', 'scripts/build-inputs.py'),
@@ -31,22 +33,6 @@ INPUTS = {
     'www': ('apps/www/*', 'packages/docs/*', 'packages/theme/*', 'pnpm*', 'package.json'),
 }
 COMMON = ('scripts/release_component_identity.py', 'scripts/release_format.py', 'scripts/release_context.py', 'scripts/release_source.py', 'scripts/release_archive.py', 'scripts/release_inventory.py', 'scripts/release_github.py', 'scripts/release_publisher.py', 'scripts/release_assembly.py', 'scripts/release.py', 'scripts/release-entry.py', '.github/workflows/release-collect.yml', '.github/workflows/release-publish.yml', '.github/actions/setup-js/action.yml')
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 def input_digest(app, source, root=None):
     patterns = (*INPUTS[app], *COMMON, '.github/workflows/' + release_format.WORKFLOWS[app])
@@ -81,10 +67,14 @@ def api(path, method='GET', data=None, missing=False):
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 
-def green_main():
-    runs = api('actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=100')['workflow_runs']
+def green_main(cutoff=None):
+    query = 'actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=100'
+    if cutoff is not None:
+        query += '&created=%3C%3D' + cutoff.strftime('%Y-%m-%dT%H:%M:%SZ')
+    runs = api(query)['workflow_runs']
     green = {r['head_sha'] for r in runs if r['head_branch'] == 'main' and r['path'] == '.github/workflows/ci.yml'
-             and r['repository']['full_name'] == REPO and r['head_repository']['full_name'] == REPO}
+             and r['repository']['full_name'] == REPO and r['head_repository']['full_name'] == REPO
+             and (cutoff is None or datetime.datetime.fromisoformat(r['updated_at']) <= cutoff)}
     required = {'.github/workflows/' + path for path in release_format.WORKFLOWS.values()}
     for source in release_context.git('rev-list', '--first-parent', '-n', '200', 'origin/main').splitlines():
         if source not in green:
@@ -142,16 +132,22 @@ def version_key(value):
     return (*map(int, base.split('.')), {'hourly': 0, 'rc': 1, 'stable': 2}[channel], int(pre.split('.')[-1]) if pre else 0)
 
 
-def pending_attempt(app, base, pins):
-    """Do not overlap unchanged builds or rebuild a repeatedly failing source every hour."""
+def is_ancestor(ancestor, source):
+    return subprocess.run(['git', 'merge-base', '--is-ancestor', ancestor, source], cwd=release_context.ROOT).returncode == 0
+
+
+def pending_attempt(app, base, batch, pins):
+    """Reuse pending builds and cap retries for the same release inputs."""
     tags = sorted(release_context.git('tag', '--list', app + '-v*-hourly.*').splitlines(),
                   key=lambda tag: version_key(release_format.parse_tag(tag)[1]), reverse=True)
     failures = 0
     for tag in tags:
         source = release_context.git('rev-parse', tag + '^{commit}')
         try:
-            parent, _ = release_source.verify(source, app)
+            parent, attempt_batch = release_source.verify(source, app)
         except ValueError:
+            continue
+        if attempt_batch > batch or not is_ancestor(parent, base):
             continue
         if input_digest(app, parent) != input_digest(app, base):
             break
@@ -172,70 +168,182 @@ def pending_attempt(app, base, pins):
     return None
 
 
-def run_hourly(now):
+def require_coordinator_context():
     release_format.require(os.environ.get('GH_TOKEN') and os.environ.get('GITHUB_REPOSITORY') == REPO
                     and os.environ.get('GITHUB_REF') == 'refs/heads/main', 'coordinator runs only from main in Actions')
+
+
+def complete_manifest(record):
+    if record and not record['draft']:
+        return next((asset for asset in record['assets'] if asset['name'] == 'release.json'), None)
+    return None
+
+
+def latest_release_tags(apps, core_cutoff=None):
+    pages = json.loads(gitless_gh('api', '--paginate', '--slurp', f'repos/{REPO}/releases?per_page=100'))
+    newest = {}
+    for record in (item for page in pages for item in page):
+        try:
+            app, value, channel = release_format.parse_tag(record['tag_name'])
+        except ValueError:
+            continue
+        if app not in apps or channel != 'hourly':
+            continue
+        manifest = complete_manifest(record)
+        if not manifest or (app == 'core' and core_cutoff is not None
+                            and datetime.datetime.fromisoformat(manifest['created_at']) > core_cutoff):
+            continue
+        candidate = (version_key(value), record['tag_name'])
+        if app not in newest or candidate > newest[app]:
+            newest[app] = candidate
+    return {app: tag for app, (_, tag) in newest.items()}
+
+
+def published_pin(tag):
+    info, _, sha = release_publisher.published(tag)
+    return {key: info[key] for key in ('tag', 'version', 'source_commit')} | {'manifest_sha256': sha}
+
+
+def reconcile_app(app, base, batch, pins, previous_tag):
+    release_format.require(app == 'core' or app in CLIENT_APPS, 'application has no scheduled release')
+    value = release_source.hourly_version(app, base, batch)
+    tag = release_format.release_tag_for(app, value)
+    if previous_tag:
+        previous, _, _ = release_publisher.published(previous_tag)
+        old_base = release_source.validate_source(previous['source_commit'], app)['ci_source_commit']
+        release_format.require(version_key(previous['version']) <= version_key(value) and is_ancestor(old_base, base),
+                               'coordinator will not publish an older main source or version')
+        if input_digest(app, old_base) == input_digest(app, base) and previous['dependencies'] == pins:
+            return {'status': 'unchanged', 'tag': previous_tag}
+    source = tag_commit(tag)
+    if source is None:
+        pending = pending_attempt(app, base, batch, pins)
+        if pending:
+            return pending
+        tree = release_source.expected_tree(app, base, batch, pins)
+        env = dict(os.environ, GIT_AUTHOR_NAME='github-actions[bot]', GIT_AUTHOR_EMAIL=release_source.BOT,
+                   GIT_COMMITTER_NAME='github-actions[bot]', GIT_COMMITTER_EMAIL=release_source.BOT)
+        source = release_context.git('commit-tree', tree, '-p', base, '-m', f'chore(release): {app} hourly {batch}', env=env)
+        release_format.require(release_source.verify(source, app) == (base, batch), 'generated source failed verification')
+        actual = reconcile(lambda: release_context.git('push', 'origin', source + ':refs/tags/' + tag),
+                           lambda: tag_commit(tag), 'tag creation')
+        release_format.require(actual == source, 'tag points to another source')
+    else:
+        try:
+            identity = release_source.verify(source, app)
+        except ValueError:
+            return {'status': 'hour_occupied', 'tag': tag}
+        if identity != (base, batch) or (pins and json.loads(release_context.blob(source, f'releases/{app}.json')) != pins):
+            return {'status': 'hour_occupied', 'tag': tag}
+    runs = ensure_release_run(app, tag, source)
+    return {'status': 'dispatched', 'tag': tag, 'runs': [r['html_url'] for r in runs]}
+
+
+def run_hourly(now):
+    require_coordinator_context()
     batch = now.astimezone(datetime.timezone.utc).strftime('%Y%m%d%H')
     release_context.git('fetch', '--quiet', 'origin', 'main', '--tags')
     base = green_main()
-    pages = json.loads(gitless_gh('api', '--paginate', '--slurp', f'repos/{REPO}/releases?per_page=100'))
-    records = [r for page in pages for r in page if not r['draft'] and 'release.json' in {a['name'] for a in r['assets']}]
-    completed = {}
-    for app in release_format.APPS:
-        candidates = []
-        for record in records:
-            try:
-                kind, value, channel = release_format.parse_tag(record['tag_name'])
-            except ValueError:
-                continue
-            if kind == app and channel == 'hourly':
-                candidates.append((version_key(value), record['tag_name']))
-        if candidates:
-            info, _, sha = release_publisher.published(max(candidates)[1])
-            completed[app] = (info, sha)
-    outcomes, ready = {}, {}
-    for app in release_format.APPS:
-        if any(name not in ready for name in release_format.DEPENDENCIES[app]):
-            outcomes[app] = {'status': 'waiting_for_dependencies'}
-            continue
-        pins = {name: {key: ready[name][0][key] for key in ('tag', 'version', 'source_commit')} | {'manifest_sha256': ready[name][1]}
-                for name in release_format.DEPENDENCIES[app]}
-        previous = completed.get(app)
-        if previous:
-            old_base = release_source.validate_source(previous[0]['source_commit'], app)['ci_source_commit']
-            release_format.require(subprocess.run(['git', 'merge-base', '--is-ancestor', old_base, base], cwd=release_context.ROOT).returncode == 0,
-                            'coordinator will not publish an older main source')
-            if input_digest(app, old_base) == input_digest(app, base) and previous[0]['dependencies'] == pins:
-                ready[app] = previous
-                outcomes[app] = {'status': 'unchanged', 'tag': previous[0]['tag']}
-                continue
-        value = release_source.hourly_version(app, base, batch)
-        tag = release_format.release_tag_for(app, value)
-        source = tag_commit(tag)
-        if source is None:
-            pending = pending_attempt(app, base, pins)
-            if pending:
-                outcomes[app] = pending
-                continue
-            tree = release_source.expected_tree(app, base, batch, pins)
-            env = dict(os.environ, GIT_AUTHOR_NAME='github-actions[bot]', GIT_AUTHOR_EMAIL=release_source.BOT,
-                       GIT_COMMITTER_NAME='github-actions[bot]', GIT_COMMITTER_EMAIL=release_source.BOT)
-            source = release_context.git('commit-tree', tree, '-p', base, '-m', f'chore(release): {app} hourly {batch}', env=env)
-            release_format.require(release_source.verify(source, app) == (base, batch), 'generated source failed verification')
-            reconcile(lambda: release_context.git('push', 'origin', source + ':refs/tags/' + tag), lambda: tag_commit(tag), 'tag creation')
-            release_format.require(tag_commit(tag) == source, 'tag points to another source')
-        else:
-            try:
-                existing_base, _ = release_source.verify(source, app)
-            except ValueError:
-                outcomes[app] = {'status': 'hour_occupied', 'tag': tag}
-                continue
-            if existing_base != base:
-                outcomes[app] = {'status': 'hour_occupied', 'tag': tag}
-                continue
-        runs = ensure_release_run(app, tag, source)
-        outcomes[app] = {'status': 'dispatched', 'tag': tag, 'runs': [r['html_url'] for r in runs]}
+    previous = latest_release_tags(('core',))
+    outcomes = {'core': reconcile_app('core', base, batch, {}, previous.get('core'))}
     print(json.dumps({'batch': batch, 'main_commit': base, 'applications': outcomes}, indent=2))
+    return outcomes
+
+
+def client_cutoff(created_at):
+    local = created_at.astimezone(ZoneInfo(CLIENT_TIME_ZONE))
+    slot = local.replace(hour=CLIENT_RELEASE_HOUR, minute=0, second=0, microsecond=0)
+    if local < slot:
+        slot -= datetime.timedelta(days=1)
+    return slot.astimezone(datetime.timezone.utc)
+
+
+def client_source(cutoff, batch):
+    # A forced CI rerun can change which runs the API reports as green at the cutoff.
+    # Each generated tag records the main parent selected when the batch began.
+    sources = set()
+    for app in CLIENT_APPS:
+        for tag in release_context.git('tag', '--list', f'{app}-v*-hourly.*').splitlines():
+            _, version, _ = release_format.parse_tag(tag)
+            tag_batch = version.rsplit('.', 1)[1]
+            if tag_batch < batch:
+                continue
+            source = release_context.git('rev-parse', tag + '^{commit}')
+            try:
+                parent, generated_batch = release_source.verify(source, app)
+            except ValueError:
+                continue
+            if generated_batch != tag_batch or not is_ancestor(parent, 'origin/main'):
+                continue
+            release_format.require(tag_batch == batch, 'a newer client batch already has a generated tag')
+            sources.add(parent)
+    release_format.require(len(sources) <= 1, 'daily client tags disagree on the selected main source')
+    return sources.pop() if sources else green_main(cutoff)
+
+
+def run_clients():
+    require_coordinator_context()
+    release_format.require(os.environ.get('GITHUB_EVENT_NAME') == 'schedule', 'clients require the daily schedule')
+    run = api('actions/runs/' + os.environ['GITHUB_RUN_ID'])
+    cutoff = client_cutoff(datetime.datetime.fromisoformat(run['created_at']))
+    batch = cutoff.strftime('%Y%m%d%H')
+    release_context.git('fetch', '--quiet', 'origin', 'main', '--tags')
+    base = client_source(cutoff, batch)
+    previous = latest_release_tags(('core', *CLIENT_APPS), core_cutoff=cutoff)
+    ready, outcomes, active = {}, {}, {}
+    try:
+        release_format.require('core' in previous, 'no complete Core release at the daily cutoff')
+        ready['core'] = published_pin(previous['core'])
+    except (ValueError, subprocess.SubprocessError) as error:
+        outcomes['core_dependency'] = {'status': 'failed', 'error': str(error)}
+
+    while True:
+        for app, (tag, source) in list(active.items()):
+            try:
+                runs = release_runs(app, tag, source)
+                if app not in ready and complete_manifest(api('releases/tags/' + tag, missing=True)):
+                    ready[app] = published_pin(tag)
+                if any(r['status'] != 'completed' for r in runs):
+                    continue
+                successful = app in ready and any(r['conclusion'] == 'success' for r in runs)
+                status = outcomes[app]['status'] if outcomes[app]['status'] == 'unchanged' else 'released'
+                outcomes[app] = {'status': status if successful else 'failed', 'tag': tag,
+                                 'runs': [r['html_url'] for r in runs]}
+            except (ValueError, subprocess.SubprocessError) as error:
+                outcomes[app] = {'status': 'failed', 'tag': tag, 'error': str(error)}
+            del active[app]
+            print(json.dumps({app: outcomes[app]}), flush=True)
+
+        for app in CLIENT_APPS:
+            dependencies = release_format.DEPENDENCIES[app]
+            if app in outcomes or any(dependency not in ready for dependency in dependencies):
+                continue
+            try:
+                pins = {dependency: ready[dependency] for dependency in dependencies}
+                outcome = reconcile_app(app, base, batch, pins, previous.get(app))
+                tag = outcome['tag']
+                if outcome['status'] in PENDING:
+                    source = tag_commit(tag)
+                    release_format.require(source, 'dispatched release tag could not be resolved')
+                    active[app] = (tag, source)
+                elif outcome['status'] == 'unchanged':
+                    ready[app] = published_pin(tag)
+                    active[app] = (tag, ready[app]['source_commit'])
+                outcomes[app] = outcome
+            except (ValueError, subprocess.SubprocessError) as error:
+                outcomes[app] = {'status': 'failed', 'error': str(error)}
+            print(json.dumps({app: outcomes[app]}), flush=True)
+        if not active:
+            break
+        time.sleep(60)
+
+    for app in CLIENT_APPS:
+        if app not in outcomes:
+            outcomes[app] = {'status': 'waiting_for_dependencies',
+                             'dependencies': [dep for dep in release_format.DEPENDENCIES[app] if dep not in ready]}
+    print(json.dumps({'batch': batch, 'main_commit': base, 'applications': outcomes}, indent=2))
+    release_format.require(all(outcome['status'] in ('unchanged', 'released') for outcome in outcomes.values()),
+                           'daily client release did not complete for every application')
     return outcomes
 
 
@@ -301,10 +409,14 @@ def self_test():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--self-test', action='store_true')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--self-test', action='store_true')
+    mode.add_argument('--clients', action='store_true')
     args = parser.parse_args()
     if args.self_test:
         self_test()
+    elif args.clients:
+        run_clients()
     else:
         run_hourly(datetime.datetime.now(datetime.timezone.utc))
 

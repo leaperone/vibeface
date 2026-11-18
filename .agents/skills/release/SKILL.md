@@ -20,9 +20,11 @@ description: 独立发布 Vibeface Core、App、CLI/npm、Desktop、Mobile 或 W
 
 CLI/npm 共用版本。版本语法为 `X.Y.Z`、`X.Y.Z-rc.N`、`X.Y.Z-hourly.YYYYMMDDHH`。没有全局 `v<version>` 标签，不创建可变标签、别名、build metadata 或重复版本。
 
-## 自动 Hourly
+## 自动发布
 
-用户已授权自动 Hourly 和官方服务上线。`hourly.yml` 在 main push CI 成功后、每小时 cron 与上游发布唤醒时运行。协调器选已通过同 SHA main push CI 的源码，仅为构建输入或依赖 pin 变化的应用生成 Tag。Core/App/Mobile/WWW 独立；CLI 等 Core/App，Desktop 等 CLI。一个应用失败只阻止自己的消费者。
+`hourly.yml` 在 UTC 每小时 17 分、main push CI 成功后或手动运行时对账 Core。`daily.yml` 仅在 `America/Los_Angeles` 每日 18:00 定时启动客户端发布，并跟随夏令时。构建和发布可能稍后完成。每个批次按通过 main push CI 的源码与 UTC 小时版本后缀发布，继续使用 Hourly 分发渠道。Web App、CLI/npm、Desktop 和 Mobile（APK 与 iOS）按构建输入或依赖 pin 的变化发布，无变化时复用完整 Release。
+
+CLI 锁定批次截止时最新完整发布且验证通过的 Hourly Core，以及本批次选定的 Web App。Desktop 锁定选定的 CLI。每日协调器观察这些精确组件 Release，可跨小时继续依赖构建。已有同批次 Tag 时以其中记录的 main parent 继续对账。官网仅手动发布。
 
 生成提交只有一个 main parent，只改所选版本、必要的 Cargo.lock 本地包或 Mobile build number，以及 `releases/cli.json`/`releases/desktop.json` 的精确依赖 pin。`scripts/hourly.py` 会重建 Git tree 校验来源，不改变 main。每个应用每 UTC 小时最多一个 Tag；已有 Tag 只能对账和补派发，不覆盖。
 
@@ -37,7 +39,7 @@ git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}"
 
 核对干净源码、版本、main CI 与远端同名 Tag。只在本地和远端都不存在该 Tag 时创建精确不可变 Tag，再只推送这一 Tag。已有同名 Tag 先解析到完整 SHA，不同源码立即停止，禁止移动、删除重建、强推或更改保护规则。
 
-真实发布从精确 Tag ref 派发所选入口，`tag` 相同、`publish=true`。`publish=false` 只构建；CLI/Desktop 构建源码仍须携带完整依赖 pin。入口的身份检查、签名门和 source/CI 门不能跳过。
+真实发布从精确 Tag ref 派发所选入口，`tag` 相同、`publish=true`。官网使用 `gh workflow run release-www.yml --ref 'www-v<version>' -f tag='www-v<version>' -F publish=true`，完整发布后部署对应服务。`publish=false` 只构建。CLI/Desktop 构建源码仍须携带完整依赖 pin。入口的身份检查、签名门和 source/CI 门不能跳过。
 
 ## 对账与验收
 
