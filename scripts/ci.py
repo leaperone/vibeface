@@ -59,7 +59,7 @@ PATH_RULES = (
     ("desktop", ("apps/desktop/src/*", "apps/desktop/tests/*")),
     ("mobile", ("apps/mobile/*", "packages/secure-native/*")),
     ("docs", ("tests/e2e/*",)),
-    ("web", ("apps/app/*", "packages/client/*", "packages/theme/*", "packages/uiarc/*", "config/uiarc.json", "scripts/generate-uiarc-theme.py", "scripts/check-uiarc.py", "scripts/check-uiarc-build.mjs", "scripts/check-uiarc-native.cjs", "scripts/vendor-uiarc.py", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/check-web.sh", "scripts/build-web-crypto.sh")),
+    ("web", ("apps/app/*", "packages/client/*", "packages/theme/*", "packages/uiarc/*", "config/uiarc.json", "scripts/generate-uiarc-theme.py", "scripts/check-uiarc.py", "scripts/check-uiarc-build.mjs", "scripts/check-uiarc-native.cjs", "scripts/vendor-uiarc.py", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/check-web.sh", "scripts/build-web-crypto.sh", "scripts/wasm-bindgen-version.py")),
     ("protocol", ("crates/protocol/*",)),
     ("bridge", ("crates/bridge/*",)),
     ("client", ("crates/client/*",)),
@@ -950,6 +950,20 @@ def workflow_contract_self_test():
             assert "Expected a clean checkout of source_sha" in crypto_job
             assert "Source changed during browser cryptography verification" in crypto_job
             assert "crypto-web-provenance-${{ inputs.source_sha }}" in crypto_job
+            assert "ref: ${{ github.workflow_sha }}" in crypto_job
+            assert "CONTROLLER_TOOLCHAIN: .artifacts/browser-crypto/workflow" in crypto_job
+            assert "sparse-checkout: ${{ env.TOOLCHAIN_FILES }}" in crypto_job
+            controller_guard = "if: steps.source.outputs.toolchain_origin == 'controller'"
+            source_guard = "if: steps.source.outputs.toolchain_origin == 'source'"
+            assert controller_guard + "\n        with:\n          ref: ${{ github.workflow_sha }}" in crypto_job
+            for action in ("setup-js", "setup-rust", "setup-web-crypto"):
+                assert f"/.github/actions/{action}/action.yml" in crypto_job
+                assert f"uses: ./.github/actions/{action}\n        {source_guard}" in crypto_job
+                assert (f"uses: ./.artifacts/browser-crypto/workflow/.github/actions/{action}\n"
+                        f"        {controller_guard}") in crypto_job
+            assert "/scripts/wasm-bindgen-version.py" in crypto_job
+            assert "Browser cryptography receipt differs from the source toolchain" in crypto_job
+            assert 'receipt["toolchain"] = toolchain' in crypto_job
         assert "ref: ${{ inputs.source_sha }}" in selected or "ref: '${{ inputs.source_sha }}'" in selected
     for job, filename in (("crypto-web", "_ci-crypto.yml"), ("web", "_ci-web.yml")):
         assert f"uses: ./.github/workflows/{filename}" in block("ci.yml", job)

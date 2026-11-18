@@ -1,0 +1,13 @@
+name: Set up browser cryptography build tools
+description: Install the wasm-bindgen CLI and Binaryen after the job has set up Rust and Node.js.
+runs:
+  using: composite
+  steps:
+    - name: Install wasm-bindgen and Binaryen
+      shell: bash
+      env:
+        BINARYEN_VERSION: '132.0.0'
+      run: |
+        version="$(python3 "$GITHUB_ACTION_PATH/../../../scripts/wasm-bindgen-version.py")"
+        cargo install wasm-bindgen-cli --version "$version" --locked
+        npm install --global "binaryen@$BINARYEN_VERSION"

@@ -43,7 +43,7 @@ command = "cargo fmt --manifest-path tests/fixtures/delivery-probe/Cargo.toml --
 
 [[domain_check]]
 name = "Web build and packaged resources"
-trigger_paths = ["apps/app/**", "packages/client/**", "apps/mobile/**", "packages/secure-native/**", "packages/theme/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/check-web.sh", "scripts/build-web-crypto.sh"]
+trigger_paths = ["apps/app/**", "packages/client/**", "apps/mobile/**", "packages/secure-native/**", "packages/theme/**", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/check-web.sh", "scripts/build-web-crypto.sh", "scripts/wasm-bindgen-version.py"]
 command = "bash scripts/build-web-crypto.sh && bash scripts/build-web.sh && cargo build -p vibeface -p vibeface-core --locked && python3 scripts/verify-node.py --binary target/debug/vibeface --core-binary target/debug/vibeface-core --app-dir apps/app/dist/client --crypto-module apps/app/dist/client/vibeface_secure.js --artifacts .artifacts/preflight-web --web-only"
 ci_check = "Native package and acceptance (x86_64-unknown-linux-gnu)"
 
