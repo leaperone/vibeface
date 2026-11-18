@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { insideTaskArtifacts } from '../support/artifact-paths';
+import { withControlledFixture } from '../support/fixture-lifecycle';
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
@@ -76,27 +77,27 @@ export async function nativeFixture(kind: 'delivery' | 'workspace', artifacts: s
     child.stdin.write(`${JSON.stringify(request)}\n`);
     return result;
   };
-  const cancelPending = () => { if (pending) { clearTimeout(pending.timer); pending = null; } };
-  try {
-    await use({ fixture: await ready, invitation, call });
-  } finally {
-    cancelPending();
-    child.stdin.end();
-    const exited = (timeout: number) => new Promise<boolean>(done => {
-      if (child.exitCode !== null || child.signalCode !== null) return done(true);
-      const ended = () => { clearTimeout(timer); done(true); };
-      const timer = setTimeout(() => { child.removeListener('exit', ended); done(false); }, timeout);
-      child.once('exit', ended);
-    });
-    if (!await exited(30000)) {
-      child.kill('SIGTERM');
-      if (!await exited(30000)) { child.kill('SIGKILL'); await exited(5000); }
-    }
-    log.end();
-    await unlink(invitation).catch(error => { if (error.code !== 'ENOENT') throw error; });
-    assert.equal(child.exitCode, 0, 'The task fixture and its own Node processes finish cleanup');
-    await writeFile(resolve(artifacts, 'cleanup.json'), `${JSON.stringify({ fixture_stopped: true })}\n`, { mode: 0o600 });
-  }
+  await withControlledFixture({
+    run: async () => use({ fixture: await ready, invitation, call }),
+    stop: async () => {
+      fail(new Error('Native fixture stopped before completing its request'));
+      child.stdin.end();
+      const exited = (timeout: number) => new Promise<boolean>(done => {
+        if (child.exitCode !== null || child.signalCode !== null) return done(true);
+        const ended = () => { clearTimeout(timer); done(true); };
+        const timer = setTimeout(() => { child.removeListener('exit', ended); done(false); }, timeout);
+        child.once('exit', ended);
+      });
+      if (!await exited(30000)) {
+        child.kill('SIGTERM');
+        if (!await exited(30000)) { child.kill('SIGKILL'); await exited(5000); }
+      }
+      log.end();
+      await unlink(invitation).catch(error => { if (error.code !== 'ENOENT') throw error; });
+      assert.equal(child.exitCode, 0, 'The task fixture and its own Node processes finish cleanup');
+      await writeFile(resolve(artifacts, 'cleanup.json'), `${JSON.stringify({ fixture_stopped: true })}\n`, { mode: 0o600 });
+    },
+  });
 }
 
 export async function bundleManifest(directory: string): Promise<Record<string, string>> {
