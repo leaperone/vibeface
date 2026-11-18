@@ -105,3 +105,32 @@ export type ReceivedFile = { name: string; content_base64: string; sha256: strin
 export type PendingIntent = { intent_id: string; fingerprint: string }
 /** Serializes the synchronous read/reuse/create and persistence of one full intent key. */
 export type ReserveDeliveryIntent = (key: string, reserve: () => PendingIntent) => Promise<PendingIntent>
+
+export const SESSION_OBJECT_KINDS = ['message', 'file', 'bot_config', 'session_state'] as const
+export type SessionObjectKind = typeof SESSION_OBJECT_KINDS[number]
+
+export type SessionObjectEnvelope = {
+  version: 1
+  kind: SessionObjectKind
+  object_id: string
+  conversation_id: string
+  sequence: number
+  previous_object_hash: string | null
+  sender_peer: string
+  receiver_peer: string
+  provider_peer: string
+  created_at_ms: number
+  expires_at_ms: number
+  payload_bytes: number
+  payload_hash: string
+  chunk_count: number
+  signature_digest: string
+}
+
+export type SessionObjectChunk = {
+  object_id: string
+  index: number
+  offset: number
+  bytes: number
+  payload: Uint8Array
+}
