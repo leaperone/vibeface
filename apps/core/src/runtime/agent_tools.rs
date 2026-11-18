@@ -2,6 +2,7 @@ use super::*;
 use crate::clock::now_ms;
 use crate::{
     scheduler::dispatch_row,
+    scheduling::{Trigger, TriggerError, TriggerTag},
     store::{
         bot_settings::{ChangeRequest, bot_message_id, change_id},
         bots::created_bot_id,
@@ -1354,7 +1355,13 @@ impl Runtime {
         let call_ref = field(args, "call_ref")?;
         let local = self.identity.device_id()?;
         let optional = |key: &str| args[key].as_str().map(String::from);
-        let task = manager.trigger().strip_prefix("task:");
+        let task = match Trigger::decode(manager.trigger()) {
+            Ok(Trigger::Task(id)) => Some(id),
+            Err(TriggerError::InvalidId(TriggerTag::Task, error)) => {
+                return Err(anyhow::Error::msg(error));
+            }
+            _ => None,
+        };
         let target = match task {
             Some(_) => local.clone(),
             None => optional("target_node").unwrap_or_else(|| local.clone()),
@@ -1389,7 +1396,7 @@ impl Runtime {
         };
         let work_id = WorkSpec::id(scope, &work_trigger, call_ref);
         ensure!(
-            !work_trigger.starts_with("assignment:") || target == local,
+            Trigger::tag_of(&work_trigger) != Some(TriggerTag::Assignment) || target == local,
             "task work stays on its assigned device"
         );
         let kind = if target == local {

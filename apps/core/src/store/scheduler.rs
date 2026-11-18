@@ -1400,10 +1400,12 @@ fn work_native_authority_allowed_from(
     network: &str,
     work: &WorkProjection,
 ) -> Result<bool> {
-    if Trigger::tag_of(&work.trigger) == Some(TriggerTag::Assignment) {
-        let Ok(Trigger::Assignment(assignment)) = Trigger::decode(&work.trigger) else {
-            return Ok(false);
-        };
+    let trigger = match Trigger::decode(&work.trigger) {
+        Ok(trigger) => Some(trigger),
+        Err(TriggerError::UnknownTag) => None,
+        Err(_) => return Ok(false),
+    };
+    if let Some(Trigger::Assignment(assignment)) = trigger {
         return super::workspace::assignment_work_allowed_from(
             connection,
             network,
@@ -1418,7 +1420,7 @@ fn work_native_authority_allowed_from(
     ) {
         return Ok(false);
     }
-    if let Ok(Trigger::Task(parent)) = Trigger::decode(&work.trigger) {
+    if let Some(Trigger::Task(parent)) = trigger {
         let active: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM work_runs WHERE work_id=?1 AND conversation_id=?2 AND kind='task' AND state IN ('accepted','starting','running') AND NOT EXISTS(SELECT 1 FROM work_stops WHERE work_id=?1))",
             params![parent, work.conversation_id],
@@ -1433,6 +1435,53 @@ fn work_native_authority_allowed_from(
             )?);
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod trigger_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_triggers_do_not_grant_native_work_authority() -> Result<()> {
+        let store = Store::open(":memory:")?;
+        let mut work = WorkProjection {
+            work_id: "work".into(),
+            conversation_id: "conversation".into(),
+            target_node: "target".into(),
+            trigger: String::new(),
+            dispatcher: "dispatcher".into(),
+            kind: WorkKind::Agent(Provider::Codex),
+            cwd: String::new(),
+            title: String::new(),
+            prompt: String::new(),
+            call_ref: "call".into(),
+            model: None,
+            resolved: ResolvedModel {
+                provider: Provider::Codex,
+                model: None,
+            },
+            continues: None,
+            parent: None,
+            thread: None,
+            phase: None,
+            summary: String::new(),
+            thread_id: None,
+            turn_id: None,
+            outcome: None,
+            result_text: String::new(),
+            failure_reason: None,
+            failure: None,
+            state: WorkStatus::Accepted,
+        };
+        for key in ["assignment:a:b", "task:", "schedule:s:-1", "work:"] {
+            work.trigger = key.into();
+            assert!(
+                !work_native_authority_allowed_from(&store.connection, "network", &work)?,
+                "{key}"
+            );
+        }
+        Ok(())
+    }
 }
 
 fn raw_work_steer_target_from(

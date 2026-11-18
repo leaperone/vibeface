@@ -165,6 +165,10 @@ impl TriggerTag {
         }
     }
 
+    fn from_prefix(prefix: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|tag| tag.name() == prefix)
+    }
+
     pub(crate) fn allows_peer_delivery(self) -> bool {
         matches!(
             self,
@@ -193,12 +197,12 @@ pub(crate) enum TriggerError {
 impl<'a> Trigger<'a> {
     pub(crate) fn tag_of(key: &str) -> Option<TriggerTag> {
         let prefix = key.split_once(':')?.0;
-        TriggerTag::ALL.into_iter().find(|tag| tag.name() == prefix)
+        TriggerTag::from_prefix(prefix)
     }
 
     pub(crate) fn decode(key: &'a str) -> Result<Self, TriggerError> {
-        let (_, value) = key.split_once(':').ok_or(TriggerError::UnknownTag)?;
-        let tag = Self::tag_of(key).ok_or(TriggerError::UnknownTag)?;
+        let (prefix, value) = key.split_once(':').ok_or(TriggerError::UnknownTag)?;
+        let tag = TriggerTag::from_prefix(prefix).ok_or(TriggerError::UnknownTag)?;
         let id = || -> Result<&str, TriggerError> {
             vibeface_protocol::validate_id(value)
                 .map_err(|error| TriggerError::InvalidId(tag, error))?;

@@ -549,16 +549,9 @@ impl Store {
                     return Ok(format!("workspace_task:{}", assignment.task_id));
                 }
                 Ok(Trigger::Schedule { .. }) => return Ok(format!("routine:{trigger}")),
-                Err(_)
-                    if Trigger::tag_of(&trigger)
-                        == Some(crate::scheduling::TriggerTag::Schedule) =>
-                {
-                    anyhow::bail!("invalid schedule trigger")
-                }
-                Err(_) if Trigger::tag_of(&trigger).is_some() => {
-                    anyhow::bail!("invalid delivery trigger")
-                }
-                _ => return Ok("main".into()),
+                Err(TriggerError::InvalidSchedule) => anyhow::bail!("invalid schedule trigger"),
+                Err(TriggerError::InvalidId(..)) => anyhow::bail!("invalid delivery trigger"),
+                Err(TriggerError::UnknownTag) => return Ok("main".into()),
             }
         }
         anyhow::bail!("delivery causal chain is too deep")
@@ -1147,5 +1140,60 @@ impl Store {
             );
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod trigger_boundary_tests {
+    use super::*;
+    use crate::work::RequestedWorkKind;
+
+    #[test]
+    fn malformed_assignment_still_requires_an_assignment_source_frame() {
+        let trigger = "assignment:a:b";
+        let work_id = WorkSpec::id("conversation", trigger, "call");
+        let target = format!("work:{work_id}");
+        let payload = PeerCommand::Dispatch {
+            spec: Box::new(WorkRequest {
+                work_id,
+                conversation: "conversation".into(),
+                trigger: trigger.into(),
+                target: "target".into(),
+                dispatcher: "dispatcher".into(),
+                call_ref: "call".into(),
+                kind: RequestedWorkKind::Task,
+                model: None,
+                cwd: String::new(),
+                title: String::new(),
+                prompt: String::new(),
+                continues: None,
+                parent: None,
+                thread: None,
+            }),
+        };
+        let envelope = PeerEnvelope {
+            command_id: payload.id("network"),
+            target,
+            owner_epoch: 1,
+            revision: None,
+            sequence: 0,
+            causal_refs: Vec::new(),
+            payload,
+        };
+        let error = envelope
+            .validate("network", "dispatcher", "target")
+            .unwrap_err();
+        assert_eq!(error.to_string(), "invalid assignment Work source frame");
+    }
+
+    #[test]
+    fn malformed_recognized_delivery_keys_do_not_become_main() -> Result<()> {
+        let store = Store::open(":memory:")?;
+        let target = |key| store.peer_delivery_target("network", "conversation", key);
+        assert_eq!(target("schedule:s:1")?, "routine:schedule:s:1");
+        for key in ["assignment:a:b", "task:", "schedule:s:-1", "message:"] {
+            assert!(target(key).is_err(), "{key}");
+        }
+        Ok(())
     }
 }
