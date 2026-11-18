@@ -191,7 +191,7 @@ nested_catalog!(delivery_action_tag, delivery_action_metadata, DeliveryAction, "
     DeliveryAction::Reconcile { .. } => "Reconcile", "reconcile", "{\"op\":\"reconcile\",\"order_id\":\"order-1\"}";
     DeliveryAction::ConfirmBatch { .. } => "ConfirmBatch", "confirm_batch", "{\"op\":\"confirm_batch\",\"intent_ids\":[\"intent-1\",\"intent-2\"]}";
     DeliveryAction::AcceptBatch { .. } => "AcceptBatch", "accept_batch", "{\"op\":\"accept_batch\",\"order_ids\":[\"order-1\",\"order-2\"]}";
-    DeliveryAction::FlushBudget { .. } => "FlushBudget", "flush_budget", "{\"op\":\"flush_budget\",\"budget_id\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"batch_id\":\"1111111111111111111111111111111111111111111111111111111111111111\"}";
+    DeliveryAction::FlushBudget(_) => "FlushBudget", "flush_budget", "{\"op\":\"flush_budget\",\"budget_id\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"batch_id\":\"1111111111111111111111111111111111111111111111111111111111111111\"}";
 );
 
 nested_catalog!(workspace_command_tag, workspace_command_metadata, WorkspaceCommand, "kind";
