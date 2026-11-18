@@ -10,8 +10,8 @@ use std::{
 };
 
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayMode, TransportAddr,
-    endpoint::{Connection, PortmapperConfig, ReadExactError, RecvStream, SendStream, presets},
+    Endpoint, EndpointAddr, EndpointId, TransportAddr,
+    endpoint::{Connection, ReadExactError, RecvStream, SendStream},
 };
 use tokio::{
     runtime::Runtime,
@@ -62,10 +62,7 @@ async fn on_runtime<T: Send + 'static>(
 async fn endpoint() -> Result<&'static Endpoint> {
     ENDPOINT
         .get_or_try_init(|| async {
-            Endpoint::builder(presets::Minimal)
-                .relay_mode(RelayMode::Disabled)
-                .portmapper_config(PortmapperConfig::Disabled)
-                .bind()
+            vibeface_native_transport::bind_lan_endpoint()
                 .await
                 .map_err(failed)
         })
@@ -275,6 +272,7 @@ mod tests {
     use super::*;
     use crate::{Handshake, Identity};
     use iroh::SecretKey;
+    use iroh::{RelayMode, endpoint::presets};
     use std::net::Ipv4Addr;
 
     const CONTEXT: &[u8] = b"vibeface:client:v1";

@@ -11979,6 +11979,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeface-native-transport"
+version = "0.0.1"
+dependencies = [
+ "iroh",
+]
+
+[[package]]
 name = "vibeface-protocol"
 version = "0.0.1"
 dependencies = [
@@ -12019,6 +12026,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "uniffi",
+ "vibeface-native-transport",
  "vibeface-protocol",
  "vibeface-secure",
 ]
