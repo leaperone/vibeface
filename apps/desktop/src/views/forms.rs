@@ -75,6 +75,8 @@ pub struct Form {
     pub editor: Editor,
     pub fields: Vec<Field>,
     task_metadata: Option<TaskMetadata>,
+    local_node_id: Option<String>,
+    local_data_dir: Option<String>,
     delivery_budget_id: Option<String>,
     delivery_restart_order_id: Option<String>,
     delivery_restart_intent_id: Option<String>,
@@ -332,6 +334,8 @@ impl Form {
             submission_id: uuid::Uuid::new_v4().to_string(),
             generation,
             owner_node_id: values.get("_owner_node_id").cloned(),
+            local_node_id: values.get("_local_node_id").cloned(),
+            local_data_dir: values.get("_local_data_dir").cloned(),
             task_metadata: matches!(&editor, Editor::EditTask(..)).then(|| TaskMetadata {
                 title: values.get("title").cloned().unwrap_or_default(),
                 owner_bot: values.get("owner_bot").cloned().unwrap_or_default(),
@@ -377,6 +381,12 @@ impl Form {
         values.insert("_submission_id".into(), self.submission_id.clone());
         if let Some(node) = &self.owner_node_id {
             values.insert("_owner_node_id".into(), node.clone());
+        }
+        if let Some(node) = &self.local_node_id {
+            values.insert("_local_node_id".into(), node.clone());
+        }
+        if let Some(path) = &self.local_data_dir {
+            values.insert("_local_data_dir".into(), path.clone());
         }
         if let Some(budget) = &self.delivery_budget_id {
             values.insert("budget_id".into(), budget.clone());

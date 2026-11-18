@@ -8,7 +8,10 @@ use crate::{
 };
 use gpui_kit::{
     base::TestTextExt as _,
-    component::{Disableable, button::Button},
+    component::{
+        Disableable,
+        button::{Button, ButtonVariants},
+    },
     *,
 };
 use std::collections::BTreeMap;
@@ -353,6 +356,100 @@ impl Desktop {
             .child(self.button("disconnect", "断开当前连接", Command::Disconnect, cx))
             .into_any_element()
     }
+    pub(crate) fn connection(&self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::host::{DiscoveryState, NodeSource, NodeStatus};
+
+        let mut page = self.page().child(self.profile_picker(cx));
+        if self.snapshot.online && !self.snapshot.local_session {
+            page = page.child(
+                self.nav("open-workspace", "打开工作区", Route::Home, cx)
+                    .primary(),
+            );
+        } else {
+            if let Some(selected) = self.host.as_ref().and_then(|host| host.selected.as_ref()) {
+                page = page
+                    .child(self.row(
+                        "本机 Node 正在运行",
+                        selected.data_dir.display().to_string(),
+                    ))
+                    .child(self.connect_local_button(selected, cx).primary());
+            } else {
+                match self.host.as_ref() {
+                    Some(host) if host.discovery_state == DiscoveryState::Ready => {
+                        let external_service = host.discovery.nodes.iter().find(|node| {
+                            node.sources.contains(&NodeSource::UserService)
+                                && node.status == NodeStatus::Stopped
+                                && node.user_service_cli.is_some()
+                        });
+                        if let Some(node) = external_service.filter(|_| !host.attach_only) {
+                            page = page
+                                .child(self.row(
+                                    "已有后台 Node 已停止",
+                                    node.data_dir.display().to_string(),
+                                ))
+                                .child(
+                                    self.button(
+                                        "start-registered-node",
+                                        "启动已有后台 Node",
+                                        Command::Host(HostAction::StartCandidate(node.clone())),
+                                        cx,
+                                    )
+                                    .primary(),
+                                );
+                        } else if host.discovery.nodes.is_empty() {
+                            page = page.child("没有发现本机 Node。");
+                            if host.can_start_owned {
+                                page = page.child(self.button(
+                                    "create-local-node",
+                                    "创建并启动本机 Node",
+                                    Command::Host(HostAction::Start),
+                                    cx,
+                                ));
+                            }
+                        } else {
+                            page = page.child("已发现本机 Node，请选择要连接或启动的实例。");
+                        }
+                    }
+                    Some(host) if host.discovery_state == DiscoveryState::Unavailable => {
+                        page = page.child("无法扫描本机 Node。仍可连接其它设备上的 Node。");
+                    }
+                    _ => page = page.child("正在查找本机 Node…"),
+                }
+            }
+        }
+        page.child(self.nav("onboard-node", "管理本机 Node", Route::Node, cx))
+            .child(self.open_editor(
+                "connect-editor",
+                "连接其它 Node 或读取离线档案",
+                Editor::Connect,
+                BTreeMap::new(),
+                cx,
+            ))
+            .child(self.nav("onboard-join", "加入或恢复个人网络", Route::Join, cx))
+            .into_any_element()
+    }
+
+    fn connect_local_button(
+        &self,
+        identity: &crate::host::NodeIdentity,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        self.open_editor(
+            "connect-local",
+            "连接本机 Node",
+            Editor::ConnectLocal,
+            BTreeMap::from([
+                ("_local_node_id", identity.device_id.clone()),
+                (
+                    "_local_data_dir",
+                    identity.data_dir.to_string_lossy().into_owned(),
+                ),
+            ]),
+            cx,
+        )
+        .disabled(self.snapshot.identity_busy)
+    }
+
     pub(crate) fn node(&self, cx: &mut Context<Self>) -> AnyElement {
         let runtime_ready = self
             .host
@@ -374,7 +471,6 @@ impl Desktop {
                 )),
                 cx,
             ))
-            .child("选中的 Node、应用启动的 Node 和后台服务分别管理。扫描和选择不会启动 Node。")
             .child(self.button(
                 "node-refresh",
                 "重新扫描",
@@ -390,13 +486,11 @@ impl Desktop {
             .child(
                 self.button(
                     "node-start",
-                    "启动本机 Node",
+                    "启动 Desktop 自有 Node",
                     Command::Host(HostAction::Start),
                     cx,
                 )
-                .disabled(
-                    !runtime_ready || self.host.as_ref().is_some_and(|host| host.owned.is_some()),
-                ),
+                .disabled(self.host.as_ref().is_none_or(|host| !host.can_start_owned)),
             )
             .child(
                 self.button(
@@ -407,13 +501,12 @@ impl Desktop {
                 )
                 .disabled(self.host.as_ref().is_none_or(|host| host.owned.is_none())),
             )
-            .child(self.open_editor(
-                "connect-local",
-                "连接已选择的本机 Node",
-                Editor::ConnectLocal,
-                BTreeMap::new(),
-                cx,
-            ))
+            .children(
+                self.host
+                    .as_ref()
+                    .and_then(|host| host.selected.as_ref())
+                    .map(|identity| self.connect_local_button(identity, cx)),
+            )
             .child(self.button(
                 "clear-node",
                 "忘记选择，保留数据",
@@ -533,28 +626,59 @@ impl Desktop {
                 page = page.child("后台服务状态尚未读取，不把未知状态当作已安装或已停止。");
             }
             for node in &host.discovery.nodes {
+                let selected = host.selected.as_ref() == Some(&node.identity());
+                let status = match (node.status, selected) {
+                    (crate::host::NodeStatus::Running, true) => "运行中，已选择",
+                    (crate::host::NodeStatus::Running, false) => "运行中",
+                    (crate::host::NodeStatus::Stopped, _) => "已停止",
+                    (crate::host::NodeStatus::Unavailable, _) => "无法确认",
+                };
+                let cli_managed = node.sources.contains(&crate::host::NodeSource::UserService);
                 page = page.child(
                     self.row(
                         node.data_dir.display().to_string(),
                         format!(
-                            "{:?} · {} · Core {}",
-                            node.status,
+                            "{} · {}{} · Core {}",
+                            status,
+                            if cli_managed {
+                                "CLI 后台服务 · "
+                            } else {
+                                ""
+                            },
                             node.device_id,
                             node.core_version.as_deref().unwrap_or("版本未确认")
                         ),
                     )
-                    .child(self.button(
-                        SharedString::from(format!("select-{}", node.device_id)),
-                        "选择此 Node",
-                        Command::Host(HostAction::Select(node.identity())),
-                        cx,
-                    ))
-                    .child(self.button(
-                        SharedString::from(format!("start-candidate-{}", node.device_id)),
-                        "启动此 Node",
-                        Command::Host(HostAction::StartCandidate(node.clone())),
-                        cx,
-                    )),
+                    .child(
+                        self.button(
+                            SharedString::from(format!("select-{}", node.device_id)),
+                            "连接此 Node",
+                            Command::Host(HostAction::Connect(node.identity())),
+                            cx,
+                        )
+                        .disabled(selected || node.status != crate::host::NodeStatus::Running),
+                    )
+                    .child(
+                        self.button(
+                            SharedString::from(format!("start-candidate-{}", node.device_id)),
+                            if cli_managed {
+                                "启动已有后台 Node"
+                            } else {
+                                "启动此 Node"
+                            },
+                            Command::Host(HostAction::StartCandidate(node.clone())),
+                            cx,
+                        )
+                        .disabled(
+                            host.attach_only
+                                || node.status != crate::host::NodeStatus::Stopped
+                                || if cli_managed {
+                                    node.user_service_cli.is_none()
+                                } else {
+                                    !runtime_ready
+                                },
+                        ),
+                    ),
                 );
             }
         }
@@ -600,6 +724,10 @@ impl Desktop {
                     .is_some_and(|service| match action {
                         crate::host::BackgroundAction::Install => {
                             service.state == crate::host::ServiceState::NotInstalled
+                                && self
+                                    .host
+                                    .as_ref()
+                                    .is_some_and(|host| host.can_install_background)
                         }
                         crate::host::BackgroundAction::Start => {
                             service.state == crate::host::ServiceState::InstalledStopped
@@ -625,7 +753,7 @@ impl Desktop {
                     Command::Host(HostAction::Background(action)),
                     cx,
                 )
-                .disabled(!enabled),
+                .disabled(!enabled || self.host.as_ref().is_some_and(|host| host.attach_only)),
             );
         }
         page.into_any_element()

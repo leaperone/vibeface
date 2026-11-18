@@ -63,36 +63,51 @@ pub(crate) async fn invoke(
             })?;
         command.arg("--expected-device-id").arg(id);
     }
+    command.arg(action.argument());
+    let timeout = Duration::from_secs(if action == BackgroundAction::Update {
+        120
+    } else {
+        30
+    });
+    let output = run(command, timeout, "无法运行随包 CLI。").await?;
+    let status: ManagedNodeStatus =
+        serde_json::from_slice(&output).context("后台节点返回无效结果。")?;
+    status.validate()?;
+    Ok(status)
+}
+
+pub(crate) async fn start_registered(cli: &Path, data_dir: &Path) -> Result<()> {
+    let mut command = Command::new(cli);
     command
-        .arg(action.argument())
+        .args(["service", "--data-dir"])
+        .arg(data_dir)
+        .arg("start");
+    run(command, Duration::from_secs(30), "无法运行已注册的 CLI。").await?;
+    Ok(())
+}
+
+async fn run(mut command: Command, timeout: Duration, spawn_error: &str) -> Result<Vec<u8>> {
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(windows)]
     command.creation_flags(0x08000000);
-    let mut child = command.spawn().context("无法运行随包 CLI。")?;
+    let mut child = command.spawn().with_context(|| spawn_error.to_owned())?;
     let stdout = child.stdout.take().context("CLI 输出管道缺失。")?;
     let stderr = child.stderr.take().context("CLI 错误管道缺失。")?;
-    let timeout = Duration::from_secs(if action == BackgroundAction::Update {
-        120
-    } else {
-        30
-    });
     let result = tokio::time::timeout(timeout, async {
         let (output, _, status) =
             tokio::try_join!(read_bounded(stdout), read_bounded(stderr), async {
                 Ok::<_, anyhow::Error>(child.wait().await?)
             })?;
         ensure!(status.success(), "后台节点操作未成功，请刷新状态核对。");
-        let status: ManagedNodeStatus =
-            serde_json::from_slice(&output).context("后台节点返回无效结果。")?;
-        status.validate()?;
-        Ok::<_, anyhow::Error>(status)
+        Ok::<_, anyhow::Error>(output)
     })
     .await;
     match result {
-        Ok(Ok(status)) => Ok(status),
+        Ok(Ok(output)) => Ok(output),
         failure => {
             let _ = child.start_kill();
             let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
@@ -193,6 +208,23 @@ exit "$(cat "$fixture_dir/exit-code")"
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[tokio::test]
+    async fn registered_start_runs_only_the_given_installation_and_data_directory() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let cli = fixture.root.join("registered-vibeface");
+        fs::write(&cli, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$3/observed\"\n")?;
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700))?;
+        let data_dir = fixture.root.join("Node 数据");
+        fs::create_dir(&data_dir)?;
+        start_registered(&cli, &data_dir).await?;
+        assert_eq!(
+            fs::read_to_string(data_dir.join("observed"))?,
+            format!("service\n--data-dir\n{}\nstart\n", data_dir.display())
+        );
+        assert!(!fixture.root.join("calls").exists());
+        Ok(())
     }
 
     #[tokio::test]

@@ -18,7 +18,8 @@ mod settings;
 pub mod tray;
 
 pub use model::{
-    Discovery, Inspect, LocalNode, NodeIdentity, NodeSource, NodeStatus, OwnedNode, RuntimeState,
+    Discovery, DiscoveryState, Inspect, LocalNode, NodeIdentity, NodeSource, NodeStatus, OwnedNode,
+    RuntimeState,
 };
 pub use operator::{NodeOperatorChange, NodeOperatorRead, OperatorOutcomeUnknown};
 pub use service::{BackgroundAction, ManagedNodeStatus, ServiceState, UpdateAvailability};
@@ -28,6 +29,7 @@ use anyhow::{Context, Result, bail, ensure};
 use lifecycle::OwnedChild;
 use serde::Serialize;
 use std::{
+    future::Future,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -84,6 +86,10 @@ pub struct HostSnapshot {
     pub selected: Option<NodeIdentity>,
     pub owned: Option<OwnedNode>,
     pub discovery: Discovery,
+    pub discovery_state: DiscoveryState,
+    pub can_start_owned: bool,
+    pub can_install_background: bool,
+    pub attach_only: bool,
     pub background: Option<ManagedNodeStatus>,
     pub runtime: RuntimeState,
     pub node_mode: NodeMode,
@@ -101,6 +107,7 @@ pub struct DesktopHost {
     selected: Option<NodeIdentity>,
     owned: Option<OwnedChild>,
     discovery: Discovery,
+    discovery_state: DiscoveryState,
     background: Option<ManagedNodeStatus>,
     last_owned_exit: Option<i32>,
 }
@@ -118,6 +125,7 @@ impl DesktopHost {
             selected: None,
             owned: None,
             discovery: Discovery::default(),
+            discovery_state: DiscoveryState::Scanning,
             background: None,
             last_owned_exit: None,
         })
@@ -132,6 +140,10 @@ impl DesktopHost {
             selected: self.selected.clone(),
             owned: self.owned.as_ref().map(OwnedChild::snapshot),
             discovery: self.discovery.clone(),
+            discovery_state: self.discovery_state,
+            can_start_owned: !core_missing && !cli_missing && self.can_start_owned(),
+            can_install_background: !core_missing && !cli_missing && self.can_use_owned_dir(),
+            attach_only: self.attach_only,
             background: self.background.clone(),
             runtime: if core_missing || cli_missing {
                 RuntimeState::Missing {
@@ -202,50 +214,73 @@ impl DesktopHost {
         }
         Ok(inspected)
     }
-    pub async fn discover(&mut self) -> Result<Discovery> {
+    pub(crate) fn scan(&self) -> impl Future<Output = Result<Discovery>> + use<> {
+        let core = self.core();
+        let mut remembered_data_dirs = self.settings.remembered_data_dirs.clone();
+        if let Some(node) = &self.settings.selected_node
+            && !remembered_data_dirs.contains(&node.data_dir)
+        {
+            remembered_data_dirs.push(node.data_dir.clone());
+        }
+        let request = ControlRequest::DiscoverLocalNodes {
+            app_profile_dir: self.profile_dir.clone(),
+            remembered_data_dirs,
+        };
+        async move {
+            ensure!(executable(&core), "安装包缺少可运行的 Core。");
+            let result = vibeface_control::request(&core, &request).await?;
+            let result: Discovery = serde_json::from_value(result)?;
+            result.validate()?;
+            Ok(result)
+        }
+    }
+    pub(crate) fn complete_startup_discovery(&mut self, result: Result<Discovery>) {
+        if self.discovery_state == DiscoveryState::Scanning {
+            let _ = self.apply_discovery(result);
+        }
+    }
+    fn apply_discovery(&mut self, result: Result<Discovery>) -> Result<Discovery> {
         self.poll_owned()?;
         self.selected = None;
-        let result: Discovery = serde_json::from_value(
-            self.request(&ControlRequest::DiscoverLocalNodes {
-                app_profile_dir: self.profile_dir.clone(),
-                remembered_data_dirs: self.settings.remembered_data_dirs.clone(),
-            })
-            .await?,
-        )?;
-        result.validate()?;
-        self.discovery = result.clone();
-        let remembered = self.settings.selected_node.clone();
-        self.selected = if let Some(expected) = remembered {
-            self.verify(&expected, Some(NodeStatus::Running))
-                .await
-                .ok()
-                .map(|node| node.identity())
-        } else {
-            None
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.discovery_state = DiscoveryState::Unavailable;
+                return Err(error);
+            }
         };
-        if self.selected.is_none() {
-            let mut running = result
+        self.discovery_state = DiscoveryState::Ready;
+        self.selected = preferred_running_node(&result, self.settings.selected_node.as_ref());
+        self.discovery = result.clone();
+        Ok(result)
+    }
+    pub async fn discover(&mut self) -> Result<Discovery> {
+        let result = self.scan().await;
+        self.apply_discovery(result)
+    }
+    fn can_use_owned_dir(&self) -> bool {
+        !self.attach_only
+            && self.discovery_state == DiscoveryState::Ready
+            && !self.discovery.user_service_registered
+            && !self
+                .discovery
+                .warnings
+                .iter()
+                .any(|warning| warning == "user_service_metadata_unavailable")
+            && self
+                .discovery
                 .nodes
                 .iter()
-                .filter(|node| node.status == NodeStatus::Running);
-            if let Some(candidate) = running.next()
-                && running.next().is_none()
-            {
-                self.selected = self
-                    .verify(&candidate.identity(), Some(NodeStatus::Running))
-                    .await
-                    .ok()
-                    .map(|node| node.identity());
-            }
-        }
-        let mut settings = self.settings.clone();
-        settings.selected_node = self.selected.clone();
-        if settings.node_mode == NodeMode::Undecided && !result.nodes.is_empty() {
-            settings.node_mode = NodeMode::Controller;
-        }
-        settings.save(&self.profile_dir)?;
-        self.settings = settings;
-        Ok(result)
+                .all(|node| node.data_dir == self.profile_dir.join("node"))
+    }
+    fn can_start_owned(&self) -> bool {
+        self.can_use_owned_dir()
+            && self.owned.is_none()
+            && self
+                .discovery
+                .nodes
+                .iter()
+                .all(|node| node.status == NodeStatus::Stopped)
     }
     pub async fn remember_directory(&mut self, path: PathBuf) -> Result<()> {
         let inspected = self.inspect(&path).await?;
@@ -265,13 +300,31 @@ impl DesktopHost {
         Ok(())
     }
     pub async fn select_node(&mut self, node: &NodeIdentity) -> Result<()> {
-        let inspected = self.verify(node, Some(NodeStatus::Running)).await?;
-        self.remember_directory(inspected.data_dir.clone()).await?;
+        let identity = self
+            .verify(node, Some(NodeStatus::Running))
+            .await?
+            .identity();
+        self.remember_selection(&identity)?;
+        self.selected = Some(identity);
+        Ok(())
+    }
+    pub(crate) fn remember_selection(&mut self, identity: &NodeIdentity) -> Result<()> {
         let mut settings = self.settings.clone();
-        settings.selected_node = Some(inspected.identity());
+        settings
+            .remembered_data_dirs
+            .retain(|path| path != &identity.data_dir);
+        settings
+            .remembered_data_dirs
+            .push(identity.data_dir.clone());
+        if settings.remembered_data_dirs.len() > 16 {
+            settings.remembered_data_dirs.remove(0);
+        }
+        settings.selected_node = Some(identity.clone());
+        if settings.node_mode == NodeMode::Undecided {
+            settings.node_mode = NodeMode::Controller;
+        }
         settings.save(&self.profile_dir)?;
         self.settings = settings;
-        self.selected = Some(inspected.identity());
         Ok(())
     }
     /// Private local credentials remain on the background actor and never enter snapshots.
@@ -299,6 +352,11 @@ impl DesktopHost {
     }
     pub async fn start_owned(&mut self) -> Result<Inspect> {
         ensure!(!self.attach_only, "这次会话只连接，不启动本机节点。");
+        self.discover().await?;
+        ensure!(
+            self.can_start_owned(),
+            "请先连接、启动或核对已经发现的本机 Node。"
+        );
         let service = self.background(BackgroundAction::Status).await?;
         ensure!(
             service.state == ServiceState::NotInstalled,
@@ -327,38 +385,83 @@ impl DesktopHost {
     }
     pub async fn start_candidate(&mut self, node: &LocalNode) -> Result<Inspect> {
         ensure!(!self.attach_only, "这次会话只连接，不启动本机节点。");
-        ensure!(
-            self.discovery
-                .nodes
-                .iter()
-                .any(|candidate| candidate.id() == node.id()
-                    && candidate.status == NodeStatus::Stopped),
-            "节点候选已过期，请重新扫描。"
-        );
-        self.verify(&node.identity(), Some(NodeStatus::Stopped))
-            .await?;
-        let service = self.background(BackgroundAction::Status).await?;
-        if node.sources.contains(&NodeSource::UserService)
-            || service.identity().as_ref() == Some(&node.identity())
-        {
+        let observed = self.discover().await?;
+        let candidate = observed
+            .nodes
+            .iter()
+            .find(|candidate| {
+                candidate.identity() == node.identity() && candidate.status == NodeStatus::Stopped
+            })
+            .context("节点候选已过期，请重新扫描。")?;
+        let identity = candidate.identity();
+        self.verify(&identity, Some(NodeStatus::Stopped)).await?;
+        if candidate.sources.contains(&NodeSource::UserService) {
             ensure!(
-                service.state == ServiceState::InstalledStopped
-                    && service.identity().as_ref() == Some(&node.identity()),
-                "用户服务不是当前已验证的后台节点。"
+                node.user_service_cli == candidate.user_service_cli,
+                "原 CLI 注册已变化，请重新核对后启动。"
+            );
+            let cli = candidate
+                .user_service_cli
+                .as_deref()
+                .context("无法核对原 CLI 安装，请使用原安装的服务命令启动。")?;
+            ensure!(executable(cli), "原 CLI 安装已变化，请重新扫描。");
+            ensure!(
+                !identity.data_dir.join("update-pending.json").try_exists()?,
+                "节点更新尚未完成，请使用原安装继续更新。"
+            );
+            service::start_registered(cli, &identity.data_dir).await?;
+            let inspected = self.wait_for_running(&identity).await?;
+            self.discover().await?;
+            self.select_node(&identity).await?;
+            return Ok(inspected);
+        }
+        let service = self.background(BackgroundAction::Status).await?;
+        if service.identity().as_ref() == Some(&identity) {
+            ensure!(
+                service.state == ServiceState::InstalledStopped,
+                "后台节点状态已变化，请重新扫描。"
             );
             let started = self.background(BackgroundAction::Start).await?;
             ensure!(
-                started.identity().as_ref() == Some(&node.identity())
+                started.identity().as_ref() == Some(&identity)
                     && started.core_status == Some(NodeStatus::Running),
                 "后台节点启动身份或健康未确认。"
             );
-            let inspected = self
-                .verify(&node.identity(), Some(NodeStatus::Running))
-                .await?;
-            self.select_node(&inspected.identity()).await?;
+            let inspected = self.verify(&identity, Some(NodeStatus::Running)).await?;
+            self.discover().await?;
+            self.select_node(&identity).await?;
             Ok(inspected)
         } else {
-            self.start_verified(node.identity()).await
+            if identity.data_dir != self.profile_dir.join("node") {
+                ensure!(
+                    !observed.user_service_registered
+                        && !observed
+                            .warnings
+                            .iter()
+                            .any(|warning| warning == "user_service_metadata_unavailable"),
+                    "原用户服务尚未核对，请使用原安装管理此 Node。"
+                );
+            }
+            self.start_verified(identity).await
+        }
+    }
+    async fn wait_for_running(&self, identity: &NodeIdentity) -> Result<Inspect> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if let Ok(Ok(inspected)) = tokio::time::timeout(
+                remaining.min(Duration::from_secs(3)),
+                self.verify(identity, Some(NodeStatus::Running)),
+            )
+            .await
+            {
+                return Ok(inspected);
+            }
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "用户服务已收到启动请求，运行状态尚未确认。请重新扫描核对。"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
     async fn start_verified(&mut self, identity: NodeIdentity) -> Result<Inspect> {
@@ -404,6 +507,13 @@ impl DesktopHost {
         ensure!(executable(&cli), "安装包缺少可运行的 CLI。");
         if action != BackgroundAction::Status {
             ensure!(!self.attach_only, "这次会话只连接，不更改后台服务。");
+        }
+        if action == BackgroundAction::Install {
+            self.discover().await?;
+            ensure!(
+                self.can_use_owned_dir(),
+                "请先连接或管理已经发现的本机 Node。"
+            );
         }
         let fresh =
             service::invoke(&cli, &self.profile_dir, BackgroundAction::Status, None).await?;
@@ -536,4 +646,21 @@ impl DesktopHost {
     pub async fn shutdown(&mut self) -> Result<()> {
         self.stop_owned().await
     }
+}
+
+fn preferred_running_node(
+    discovery: &Discovery,
+    remembered: Option<&NodeIdentity>,
+) -> Option<NodeIdentity> {
+    let mut running = discovery
+        .nodes
+        .iter()
+        .filter(|node| node.status == NodeStatus::Running);
+    if let Some(expected) = remembered
+        && let Some(node) = running.clone().find(|node| &node.identity() == expected)
+    {
+        return Some(node.identity());
+    }
+    let only = running.next()?;
+    running.next().is_none().then(|| only.identity())
 }

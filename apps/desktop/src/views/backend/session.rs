@@ -145,6 +145,7 @@ impl Backend {
     }
     pub(super) async fn maintain(&mut self) -> Result<()> {
         if self.host.poll_owned()? {
+            let _ = self.host.discover().await;
             self.publish_host().await;
         }
         if self.state.online {
