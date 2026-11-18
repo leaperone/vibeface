@@ -36,6 +36,7 @@ export default function JoinScreen() {
   // A recovery link the camera opened goes straight to finding devices again, with its computer filled in.
   useEffect(() => { if (url && recoveryTarget(url)) setLane('recovery') }, [url])
   const recovering = Boolean(device.recovery || device.ready && device.recovered)
+  const awaitingAcceptance = device.joining?.status === 'pending' && !device.joining.pinned
   // The request is out, so the Node has spent the link.
   useEffect(() => { if (session.phase === 'joining') spent = submitted }, [session.phase])
   const choosing = device.phase !== 'key_lost' && !device.review && !recovering && session.phase !== 'joining'
@@ -50,7 +51,15 @@ export default function JoinScreen() {
         : device.ready && device.recovered ? <RecoveredStep />
         : device.recovery ? <RecoveryWaiting />
         : device.review?.kind === 'recovery' ? <RecoveryReview />
-        : session.phase === 'joining' ? <Waiting code={session.code} admin={session.admin} reached={Boolean(device.info)} error={device.error} reconnecting={device.phase === 'reconnecting'} onCancel={workspace.actions.cancelJoin} />
+        : session.phase === 'joining' ? <Waiting
+          awaitingAcceptance={awaitingAcceptance}
+          code={session.code}
+          admin={session.admin}
+          reached={Boolean(device.info)}
+          error={device.error}
+          reconnecting={device.phase === 'reconnecting'}
+          onCancel={workspace.actions.cancelJoin}
+        />
         : lane === 'recovery' ? <Panel icon={ArchiveRestore} title="用恢复文件找回"><RecoveryRestore link={url} /></Panel>
         : <JoinForm />}
       {choosing ? <View className="gap-1 border-t border-border pt-4">
@@ -188,11 +197,22 @@ function Paste({ onText }: { onText: (text: string) => void }) {
   </Button>
 }
 
-function Waiting({ code, admin, reached, error, reconnecting, onCancel }: { code: string | null; admin?: string; reached: boolean; error: string; reconnecting: boolean; onCancel: () => void }) {
-  return <Panel icon={Hourglass} title={joinCopy.waiting}>
+function Waiting({ awaitingAcceptance, code, admin, reached, error, reconnecting, onCancel }: {
+  awaitingAcceptance: boolean
+  code: string | null
+  admin?: string
+  reached: boolean
+  error: string
+  reconnecting: boolean
+  onCancel: () => void
+}) {
+  const status = awaitingAcceptance
+    ? '在 Vibeface 的设备页找到这条加入申请，点「开始短码核对」或「显示安全码」。手机会自动显示安全码。'
+    : code ? joinCopy.compareCode(admin) : joinCopy.showCode
+  return <Panel icon={Hourglass} title={awaitingAcceptance ? '请在电脑上接受申请' : joinCopy.waiting}>
     {reached ? <View className="flex-row items-center gap-2"><Icon as={ShieldCheck} className="size-4 text-success" /><Text className="text-sm text-muted">{joinCopy.reached}</Text></View> : null}
-    <Text role="status" className="text-muted">{code ? joinCopy.compareCode(admin) : joinCopy.showCode}</Text>
-    {code ? <SafetyCode code={code} /> : <Skeleton className="h-8 w-40" />}
+    <Text role="status" accessibilityLiveRegion="polite" className="text-muted">{status}</Text>
+    {code ? <SafetyCode code={code} /> : !awaitingAcceptance ? <Skeleton className="h-8 w-40" /> : null}
     {reconnecting ? <Text className="text-sm text-muted">连接已断开，正在重连；批准后仍会继续完成加入。</Text> : null}
     <ErrorText error={error} />
     <Button variant="ghost" className="-ms-3 self-start" onPress={onCancel}><Text>取消</Text></Button>
