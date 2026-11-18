@@ -109,6 +109,46 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
+def discard_run_binaries(run, sources):
+    copies = [run / name for name in sources]
+
+    def identity(path):
+        entry = path.stat()
+        return entry.st_dev, entry.st_ino, entry.st_size, entry.st_mtime_ns, entry.st_ctime_ns
+
+    try:
+        # Persist the report and run directory entry before removing evidence.
+        with (run / "report.json").open("rb") as report_file:
+            os.fsync(report_file.fileno())
+        for directory in (run, run.parent):
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+        retained = {}
+        for name, (source, digest) in sources.items():
+            source = source.resolve(strict=True)
+            before = identity(source)
+            if (not source.is_file() or source.is_relative_to(run)
+                    or any((directory / "CACHEDIR.TAG").is_file() for directory in source.parents)
+                    or any(source.samefile(copy) for copy in copies) or file_sha256(source) != digest):
+                print(f"WARNING Run binaries kept because the retained {name} source could not be verified",
+                      file=sys.stderr)
+                return
+            retained[source] = before
+
+        if any(identity(source) != before for source, before in retained.items()):
+            print("WARNING Run binaries kept because a retained source changed during verification", file=sys.stderr)
+            return
+
+        for copy in copies:
+            copy.unlink()
+    except (OSError, RuntimeError) as error:
+        print(f"WARNING Could not discard all run binaries ({type(error).__name__})", file=sys.stderr)
+
+
 def maintenance(node, command):
     stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     stream.settimeout(5)
@@ -3588,7 +3628,7 @@ def phase1_acceptance(options):
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
     nodes = []
     fixture_roots = [run]
-    report = {"status": "running", "source_binary": str(source_binary),
+    report = {"status": "running", "source_binary": str(source_binary), "source_core_binary": str(options.core_binary),
               "binary_sha256": file_sha256(binary),
               "core_binary_sha256": file_sha256(run / "vibeface-core"), "provider_calls": 0,
               "coverage": "real Node processes, durable Scheduler and signed log; controlled Codex protocol",
@@ -4352,6 +4392,9 @@ def phase1_acceptance(options):
             stop_fixture_processes(fixture_root)
         private_json(run / "report.json", report)
         print("REPORT " + str(run / "report.json"), flush=True)
+    if options.discard_run_binaries_on_success:
+        discard_run_binaries(run, {"vibeface": (source_binary, report["binary_sha256"]),
+                                   "vibeface-core": (options.core_binary, report["core_binary_sha256"])})
 
 
 def memory_sync_acceptance(options):
@@ -4376,7 +4419,8 @@ def memory_sync_acceptance(options):
     helper.chmod(0o600)
     nodes, clients, roots = [], [], {}
     conversation, other_scope = "memory-sync-main", "memory-sync-other"
-    report = {"status": "running", "source_binary": str(source_binary), "frozen_sha256": frozen,
+    report = {"status": "running", "source_binary": str(source_binary), "source_core_binary": str(options.core_binary),
+              "frozen_sha256": frozen,
               "script_sha256": file_sha256(Path(__file__).resolve()), "provider_calls": 0, "cases": {},
               "coverage": "two real Node processes, WASM client signatures, controlled App Servers and iroh sync",
               "not_checked": ["real provider models", "rendered Web and Mobile UI", "public NAT paths"]}
@@ -4700,6 +4744,9 @@ def memory_sync_acceptance(options):
         print("REPORT " + str(run / "report.json"), flush=True)
         if cleanup_errors and "failure" not in report:
             raise RuntimeError("Memory fixture cleanup failed; see " + str(run / "report.json"))
+    if options.discard_run_binaries_on_success:
+        discard_run_binaries(run, {"vibeface": (source_binary, frozen["vibeface"]),
+                                   "vibeface-core": (options.core_binary, frozen["vibeface-core"])})
 
 
 def _npm_cli_candidate(registry, pages):
@@ -7742,6 +7789,9 @@ if __name__ == "__main__":
         parser.add_argument("--app-dir", type=Path,
                             help="development static output directory; packages discover sibling web/ automatically")
         parser.add_argument("--artifacts", type=Path, required=True)
+        parser.add_argument("--discard-run-binaries-on-success", action="store_true",
+                            help="remove run copies of the CLI and Core after successful --phase1 or --memory-sync "
+                                 "verification when their sources are retained separately")
         parser.add_argument("--crypto-module", type=Path, default=Path(__file__).resolve().parents[1] / "apps/app/dist/client/vibeface_secure.js")
         parser.add_argument("--npm-package", type=Path, help="the immutable CI npm artifact for --npm-service replacement")
         parser.add_argument("--npm-baseline", type=Path, help="the public baseline artifact pinned once for this candidate")
@@ -7774,6 +7824,8 @@ if __name__ == "__main__":
         parser.add_argument("--fixture-port", type=int, help=argparse.SUPPRESS)
         parser.add_argument("--fixture-profile", type=Path, default=Path(__file__).resolve().parents[1] / "crates/delivery/proof/profile.json", help=argparse.SUPPRESS)
         arguments = parser.parse_args()
+        if arguments.discard_run_binaries_on_success and not (arguments.phase1 or arguments.memory_sync):
+            parser.error("--discard-run-binaries-on-success requires --phase1 or --memory-sync")
         try:
             needs_process = not (arguments.native_provider_selfcheck
                                  or arguments.native_clipboard_selfcheck or arguments.npm_baseline_pin
