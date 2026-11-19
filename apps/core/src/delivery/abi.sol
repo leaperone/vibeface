@@ -75,6 +75,7 @@ function refundBudget(bytes32 id, WindowRef[] items) external;
 function settleBatch(bytes32 budgetId, bytes32[] ids, bytes seal) external;
 
 interface SessionEscrow {
+    function deployment() external view returns (bytes32);
     struct Terms {
         bytes32 delivery;
         bytes32 receiptContext;

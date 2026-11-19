@@ -329,6 +329,16 @@ impl Chain {
         &self.config
     }
 
+    pub async fn session_deployment(&self) -> Result<Word> {
+        Ok(self
+            .call(
+                address(&self.config.escrow)?,
+                abi::SessionEscrow::deploymentCall {},
+            )
+            .await?
+            .into())
+    }
+
     pub(super) async fn verify_hold(&self, statement: &Statement, seal: &[u8]) -> Result<()> {
         let input = abi::DeliveryStatement::abi_decode_validate(statement.abi_bytes())?;
         validate_statement(&self.config, &input)?;

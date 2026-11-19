@@ -102,6 +102,10 @@ impl Delivery {
         ensure!(!claims.is_empty(), "session payment claim queue is empty");
         let batch = vibeface_session_delivery::verify_session_settlement(&claims)
             .map_err(anyhow::Error::msg)?;
+        ensure!(
+            chain.session_deployment().await? == batch.deployment,
+            "session claims belong to another escrow deployment"
+        );
         let ids = claims
             .iter()
             .map(|claim| claim.order.order_id().map_err(anyhow::Error::msg))
@@ -142,6 +146,10 @@ impl Delivery {
         ensure!(!claims.is_empty(), "session payment claim queue is empty");
         let batch = vibeface_session_delivery::verify_session_settlement(&claims)
             .map_err(anyhow::Error::msg)?;
+        ensure!(
+            chain.session_deployment().await? == batch.deployment,
+            "session claims belong to another escrow deployment"
+        );
         let terms = claims
             .iter()
             .map(|claim| {
