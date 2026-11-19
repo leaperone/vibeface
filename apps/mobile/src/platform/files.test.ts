@@ -58,6 +58,7 @@ function fixture() {
       await gate.promise
       return new TextDecoder().decode(bytes.get(this.uri))
     }
+    textSync() { return new TextDecoder().decode(bytes.get(this.uri)) }
     async arrayBuffer(): Promise<ArrayBuffer> {
       const gate = deferred(); reads.push({ uri: this.uri, kind: 'arrayBuffer', ...gate })
       await gate.promise
@@ -73,6 +74,7 @@ function fixture() {
     crypto: { randomUUID: () => `owned-${++uuid}` }, AggregateError,
   }), specifier => {
     if (specifier === 'expo-file-system') return { File, Directory, Paths: { cache: new Directory('file:///cache'), document: new Directory('file:///documents') } }
+    if (specifier === './legacy-recovery') return load(fileURLToPath(new URL('./legacy-recovery.ts', import.meta.url)))
     if (specifier === 'react-native-mmkv') return { createMMKV: () => ({
       getString: (key: string) => index.get(key), getAllKeys: () => [...index.keys()],
       set: (key: string, value: string) => index.set(key, value), remove: (key: string) => index.delete(key),
@@ -177,6 +179,33 @@ test('erase fences pending copy delivery, rejects new work, and clears only afte
     `file:delete:${picker}`, 'directory:delete:file:///cache/vibeface-selections', 'index:clear', 'clear',
   ])
   await f.privateFiles.run(async current => { assert.equal(current(), true) })
+})
+
+test('erase removes only valid legacy root recovery copies', async () => {
+  const f = fixture()
+  const valid = 'file:///documents/vibeface-recovery-ABCDEF12-2026-11-08.json'
+  const invalidPayload = 'file:///documents/vibeface-recovery-ABCDEF13-2026-11-08.json'
+  const wrongName = 'file:///documents/vibeface-recovery-ABCDEF12-2026-11-08-notes.json'
+  const payload = {
+    version: 1,
+    network_id: 'a'.repeat(64),
+    envelope: {
+      header: {
+        format: 'vibeface-recovery', version: 1, kdf: 'argon2id', memory_kib: 19_456,
+        iterations: 2, parallelism: 1, cipher: 'xchacha20poly1305', salt: 'b'.repeat(32), nonce: 'c'.repeat(48),
+      },
+      ciphertext: 'd'.repeat(32),
+    },
+  }
+  f.bytes.set(valid, new TextEncoder().encode(JSON.stringify(payload)))
+  f.bytes.set(invalidPayload, new TextEncoder().encode(JSON.stringify({ ...payload, version: 2 })))
+  f.bytes.set(wrongName, new TextEncoder().encode(JSON.stringify(payload)))
+
+  await f.privateFiles.erase(async () => {})
+
+  assert.equal(f.bytes.has(valid), false)
+  assert.equal(f.bytes.has(invalidPayload), true)
+  assert.equal(f.bytes.has(wrongName), true)
 })
 
 
