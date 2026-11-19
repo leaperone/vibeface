@@ -551,7 +551,7 @@ def self_test():
     auto19_paths = [*(path for path in RELEASE_TOOL_PATHS if path != "scripts/sealed-runtime.mjs"), ".github/workflows/ci.yml", ".github/workflows/npm-publish.yml",
                     ".preflight.toml", "packages/docs/design/release-modules.md", "scripts/ci.py",
                     "scripts/hourly.py", "scripts/test_release_trains.py", "scripts/check-release-workflow.py"]
-    assert len(auto19_paths) == 16
+    assert len(auto19_paths) == 19
     selected = make_plan(auto19_paths)
     assert selected["full"] and not selected["docs_only"] and selected["required_jobs"] == required_full
     assert docs["local_process_modes"] == [] and www["local_process_modes"] == []
