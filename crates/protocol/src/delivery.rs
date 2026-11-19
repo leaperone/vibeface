@@ -189,4 +189,28 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn session_payment_configuration_round_trips_only_when_explicit() {
+        let action: DeliveryAction = DeliveryAction::ConfigureSessionRelay {
+            relay_enabled: false,
+            route: None,
+            payment: Some(SessionPaymentConfig {
+                deployment: "1".repeat(64),
+                budget: "2".repeat(64),
+                amount: "17".into(),
+                claim_until_ms: 99,
+            }),
+        };
+        let value = serde_json::to_value(&action).unwrap();
+        assert_eq!(value["payment"]["amount"], "17");
+        let decoded: DeliveryAction = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            decoded,
+            DeliveryAction::ConfigureSessionRelay {
+                payment: Some(_),
+                ..
+            }
+        ));
+    }
 }
