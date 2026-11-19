@@ -1690,6 +1690,20 @@
           "source": "#[cfg(any())]\npub const DATA_EPOCH: u32 = 1;\n#[cfg(not(any()))]\npub const DATA_EPOCH: u32 = 2;\npub const UPDATE_PROTOCOL: u32 = 1;\n",
           "accepted": false,
           "error": "source"
+        },
+        {
+          "id": "rust-decorated-declaration",
+          "kind": "source",
+          "source": "#[allow(dead_code)]\npub const UPDATE_PROTOCOL: u32 = 1;\npub const DATA_EPOCH: u32 = 1;\n",
+          "accepted": false,
+          "error": "source"
+        },
+        {
+          "id": "rust-multiline-cfg-declaration",
+          "kind": "source",
+          "source": "#[cfg(\n    any()\n)]\npub const DATA_EPOCH: u32 = 1;\npub const UPDATE_PROTOCOL: u32 = 1;\n",
+          "accepted": false,
+          "error": "source"
         }
       ]
     }
