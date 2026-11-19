@@ -5,6 +5,8 @@ import Network
 public class LanBrowserModule: Module {
   private let queue = DispatchQueue(label: "one.leaper.vibeface.lan-browser")
   private var browser: NWBrowser?
+  /// Identifies the observer lifetime so callbacks from a failed browser cannot publish into a restart.
+  private var session: UInt64 = 0
   /// Resolved services by instance name, as JS gets them.
   private var found: [String: [String: Any]] = [:]
   /// What the browser sees now, by instance name.
@@ -23,23 +25,40 @@ public class LanBrowserModule: Module {
   // ponytail: a browse that fails stays stopped until JS listens again, on the next return to the foreground.
   private func start() {
     guard browser == nil else { return }
+    session &+= 1
+    let session = session
     let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_vibeface._udp", domain: nil), using: NWParameters())
-    browser.browseResultsChangedHandler = { [weak self] results, _ in self?.update(results) }
+    browser.stateUpdateHandler = { [weak self, weak browser] state in
+      guard let self, let browser else { return }
+      switch state {
+      case .failed, .cancelled:
+        self.browserDidStop(browser, session: session)
+      default:
+        break
+      }
+    }
+    browser.browseResultsChangedHandler = { [weak self, weak browser] results, _ in
+      guard let self, let browser, self.browser === browser, self.session == session else { return }
+      self.update(results, browser: browser, session: session)
+    }
     self.browser = browser
     browser.start(queue: queue)
     let refresh = DispatchSource.makeTimerSource(queue: queue)
     refresh.schedule(deadline: .now() + 60, repeating: 60)
     refresh.setEventHandler { [weak self] in
-      guard let self else { return }
-      for (name, service) in self.seen where self.resolving[name] == nil { self.resolve(name, service.tag, service.endpoint) }
+      guard let self, self.browser === browser, self.session == session else { return }
+      for (name, service) in self.seen where self.resolving[name] == nil { self.resolve(name, service.tag, service.endpoint, browser: browser, session: session) }
     }
     refresh.resume()
     self.refresh = refresh
   }
 
   private func stop() {
-    browser?.cancel()
-    browser = nil
+    session &+= 1
+    if let browser {
+      self.browser = nil
+      browser.cancel()
+    }
     refresh?.cancel()
     refresh = nil
     seen = [:]
@@ -48,12 +67,29 @@ public class LanBrowserModule: Module {
     found = [:]
   }
 
-  private func update(_ results: Set<NWBrowser.Result>) {
+  /// A failed browser cannot be restarted while it remains stored in `browser`.
+  private func browserDidStop(_ browser: NWBrowser, session: UInt64) {
+    guard self.browser === browser, self.session == session else { return }
+    self.session &+= 1
+    self.browser = nil
+    browser.cancel()
+    refresh?.cancel()
+    refresh = nil
+    seen = [:]
+    resolving.values.forEach(drop)
+    resolving = [:]
+    let hadFound = !found.isEmpty
+    found = [:]
+    if hadFound { emit() }
+  }
+
+  private func update(_ results: Set<NWBrowser.Result>, browser: NWBrowser, session: UInt64) {
+    guard self.browser === browser, self.session == session else { return }
     var now: [String: (tag: String, endpoint: NWEndpoint)] = [:]
     for result in results {
       guard case let .service(name, _, _, _) = result.endpoint, case let .bonjour(txt) = result.metadata, let tag = txt["t"] else { continue }
       now[name] = (tag, result.endpoint)
-      if found[name]?["tag"] as? String != tag && resolving[name] == nil { resolve(name, tag, result.endpoint) }
+      if found[name]?["tag"] as? String != tag && resolving[name] == nil { resolve(name, tag, result.endpoint, browser: browser, session: session) }
     }
     seen = now
     for name in Array(resolving.keys) where now[name] == nil {
@@ -65,7 +101,7 @@ public class LanBrowserModule: Module {
   }
 
   /// Bonjour names the service, not its address: a UDP connection to it resolves one and sends nothing.
-  private func resolve(_ name: String, _ tag: String, _ endpoint: NWEndpoint) {
+  private func resolve(_ name: String, _ tag: String, _ endpoint: NWEndpoint, browser: NWBrowser, session: UInt64) {
     let parameters = NWParameters.udp
     // An IPv6 link-local address needs its interface, which an `ip:port` cannot carry.
     (parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options)?.version = .v4
@@ -73,6 +109,10 @@ public class LanBrowserModule: Module {
     resolving[name] = connection
     connection.stateUpdateHandler = { [weak self] state in
       guard let self else { return }
+      guard self.browser === browser, self.session == session else {
+        self.finish(name, connection)
+        return
+      }
       switch state {
       case .ready:
         if case let .hostPort(host, port) = connection.currentPath?.remoteEndpoint, case let .ipv4(address) = host {
