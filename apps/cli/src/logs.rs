@@ -16,7 +16,7 @@ const MAX_LOG_RECORD: usize = 8 * 1024;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum LogLevel {
+enum LogLevel {
     Trace,
     Debug,
     Info,
@@ -26,7 +26,7 @@ pub(crate) enum LogLevel {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum LogSource {
+enum LogSource {
     Node,
     Web,
     Agent,
@@ -36,7 +36,7 @@ pub(crate) enum LogSource {
 }
 
 #[derive(Args)]
-pub(crate) struct LogRecord {
+pub(super) struct LogRecord {
     /// Log severity.
     level: LogLevel,
     /// Log message.
@@ -61,7 +61,7 @@ pub(crate) struct LogRecord {
 }
 
 #[derive(Args)]
-pub(crate) struct Logs {
+pub(super) struct Logs {
     /// Node data directory.
     #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = data_dir, default_value_os_t = default_data_dir())]
     data_dir: PathBuf,
@@ -94,7 +94,7 @@ pub(crate) struct Logs {
     json: bool,
 }
 
-pub(crate) async fn log_record(options: LogRecord) -> Result<()> {
+pub(super) async fn log_record(options: LogRecord) -> Result<()> {
     let source = options
         .source
         .unwrap_or(if std::env::var_os("VIBEFACE_TRIAGE_URL").is_some() {
@@ -156,7 +156,7 @@ fn log_matches(record: &LogValue, options: &Logs, since: Option<i64>) -> bool {
         })
 }
 
-pub(crate) async fn logs(options: Logs) -> Result<()> {
+pub(super) async fn logs(options: Logs) -> Result<()> {
     let current = options.data_dir.join(LOG_FILE);
     ensure!(
         current.exists(),
