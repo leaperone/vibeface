@@ -49,13 +49,17 @@ class LanBrowserModule : Module() {
       val listener = object : NsdManager.DiscoveryListener {
         override fun onDiscoveryStarted(serviceType: String) {}
         override fun onDiscoveryStopped(serviceType: String) {}
-        override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {}
-        override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {}
+        override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) = failed(this)
+        override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) = failed(this)
         override fun onServiceFound(info: NsdServiceInfo) = resolve(session, info)
         override fun onServiceLost(info: NsdServiceInfo) = lost(session, info.serviceName)
       }
       discovery = listener
-      nsd.discoverServices("_vibeface._udp", NsdManager.PROTOCOL_DNS_SD, listener)
+      try {
+        nsd.discoverServices("_vibeface._udp", NsdManager.PROTOCOL_DNS_SD, listener)
+      } catch (failure: RuntimeException) {
+        failed(listener)
+      }
     }
   }
 
@@ -68,6 +72,24 @@ class LanBrowserModule : Module() {
       if (Build.VERSION.SDK_INT >= 34) callbacks.values.forEach { runCatching { nsd.unregisterServiceInfoCallback(it) } }
       callbacks.clear()
       waiting.clear()
+      resolving = null
+      found.clear()
+      multicast?.release()
+      multicast = null
+    }
+  }
+
+  /** Clears a discovery session after NSD reports (or throws) a lifecycle failure. */
+  private fun failed(listener: NsdManager.DiscoveryListener) {
+    synchronized(lock) {
+      if (discovery !== listener) return
+      discovery = null
+      lifetime.stop()
+      runCatching { nsd.stopServiceDiscovery(listener) }
+      if (Build.VERSION.SDK_INT >= 34) callbacks.values.forEach { runCatching { nsd.unregisterServiceInfoCallback(it) } }
+      callbacks.clear()
+      waiting.clear()
+      resolving = null
       found.clear()
       multicast?.release()
       multicast = null

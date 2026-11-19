@@ -24,6 +24,15 @@ public class LanBrowserModule: Module {
   private func start() {
     guard browser == nil else { return }
     let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_vibeface._udp", domain: nil), using: NWParameters())
+    browser.stateUpdateHandler = { [weak self, weak browser] state in
+      guard let self, let browser else { return }
+      switch state {
+      case .failed, .cancelled:
+        self.browserDidStop(browser)
+      default:
+        break
+      }
+    }
     browser.browseResultsChangedHandler = { [weak self] results, _ in self?.update(results) }
     self.browser = browser
     browser.start(queue: queue)
@@ -38,8 +47,23 @@ public class LanBrowserModule: Module {
   }
 
   private func stop() {
-    browser?.cancel()
-    browser = nil
+    if let browser {
+      self.browser = nil
+      browser.cancel()
+    }
+    refresh?.cancel()
+    refresh = nil
+    seen = [:]
+    resolving.values.forEach(drop)
+    resolving = [:]
+    found = [:]
+  }
+
+  /// A failed browser cannot be restarted while it remains stored in `browser`.
+  private func browserDidStop(_ browser: NWBrowser) {
+    guard self.browser === browser else { return }
+    self.browser = nil
+    browser.cancel()
     refresh?.cancel()
     refresh = nil
     seen = [:]
