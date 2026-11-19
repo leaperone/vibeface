@@ -107,7 +107,12 @@ jobs:
           node --check apps/cli/npm/bin/vibeface.mjs
           node --check scripts/release-contract.mjs
           node --check scripts/release-metadata.mjs
+          node --check scripts/runtime-contract.mjs
+          node --check scripts/test-runtime-contract.mjs
           node --check scripts/test-release-contract.mjs
+          node scripts/test-runtime-contract.mjs --json > /tmp/runtime-node.json
+          python3 scripts/runtime_contract.py --json > /tmp/runtime-python.json
+          diff -u /tmp/runtime-node.json /tmp/runtime-python.json
           node --check scripts/publish-npm.mjs
           node --check scripts/package-npm.mjs
           node --check scripts/build-desktop.mjs
