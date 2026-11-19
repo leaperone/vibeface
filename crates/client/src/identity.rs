@@ -977,10 +977,7 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn private_dir(path: &Path) -> Result<()> {
-    if !path.exists() {
-        std::fs::create_dir_all(path)?;
-    }
-    privatefs::restrict_dir(path)
+    privatefs::create_dir(path)
 }
 
 fn now_ms() -> i64 {
