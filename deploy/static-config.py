@@ -91,6 +91,8 @@ http {{
     fastcgi_temp_path /tmp/fastcgi;
     uwsgi_temp_path /tmp/uwsgi;
     scgi_temp_path /tmp/scgi;
+    absolute_redirect off;
+    port_in_redirect off;
     map $uri $vibeface_cache {{
 {chr(10).join(cache)}
     }}
@@ -144,6 +146,7 @@ def self_test():
         (component / 'COMPONENT-INFO.json').write_text(json.dumps(info))
         result = generate(component, 'app')
         assert 'try_files $uri /_shell.html;' in result and 'location ^~ /api/ { return 404; }' in result
+        assert 'absolute_redirect off;' in result and 'port_in_redirect off;' in result
         assert 'X-Vibeface-Source "' + 'a' * 40 + '"' in result
         assert 'Content-Security-Policy "default-src \'self\'" always;' in result
         (web / '_shell.html').write_text('changed')
