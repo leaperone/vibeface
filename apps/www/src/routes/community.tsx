@@ -5,7 +5,7 @@ import { SiteLayout } from '@/components/site-layout'
 export const Route = createFileRoute('/community')({
   head: () => ({
     meta: [{ title: '社区 · Vibeface' }],
-    links: [{ rel: 'canonical', href: 'https://www.vibeface.dev/community' }],
+    links: [{ rel: 'canonical', href: 'https://www.vibeface.dev/community/' }],
   }),
   component: CommunityPage,
 })

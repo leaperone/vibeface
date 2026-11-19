@@ -29,7 +29,7 @@ export const Route = createFileRoute('/docs/$')({
           { title: `${loaderData.title} · Vibeface 文档` },
           { name: 'description', content: loaderData.description },
         ],
-        links: [{ rel: 'canonical', href: `https://www.vibeface.dev${loaderData.url}` }],
+        links: [{ rel: 'canonical', href: `https://www.vibeface.dev${loaderData.url.endsWith('/') ? loaderData.url : `${loaderData.url}/`}` }],
       }
     : {},
 })

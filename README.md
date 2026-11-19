@@ -64,7 +64,7 @@ The default data directory is `~/.vibeface`. The first run initializes only a mi
 
 Add `~/.local/bin` to your shell configuration to use `vibeface` in new terminals. For an existing installation, use `vibeface update` for updates and `vibeface service` to manage the background service. Do not run the installer again. See [installation and updates](packages/docs/install.md) for update configuration and other installation options.
 
-With Node.js 22 or newer, you can also install the CLI from npm with `npm install -g @leaperone/vibeface@hourly`. npm manages updates for that installation.
+With Node.js 22 or newer, you can also install the CLI from npm with `npm install -g @leaperone/vibeface@hourly`. npm manages updates for that installation. Use `@hourly` for the public preview channel. `@latest` is reserved for Stable.
 
 ## Add another device
 

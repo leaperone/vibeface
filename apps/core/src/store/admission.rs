@@ -697,17 +697,28 @@ impl Store {
                 PeerCommand::Deliver {
                     conversation_id,
                     trigger,
-                } if let Ok(Trigger::Assignment(assignment_id)) = Trigger::decode(trigger) => {
-                    self.delivery_assignment(network, conversation_id, assignment_id)?
-                        .bot_owner_epoch
-                }
-                PeerCommand::Dispatch { spec }
-                    if let Ok(Trigger::Assignment(assignment_id)) =
-                        Trigger::decode(&spec.trigger) =>
-                {
-                    self.delivery_assignment(network, &spec.conversation, assignment_id)?
-                        .bot_owner_epoch
-                }
+                } => match Trigger::decode(trigger) {
+                    Ok(Trigger::Assignment(assignment_id)) => {
+                        self.delivery_assignment(network, conversation_id, assignment_id)?
+                            .bot_owner_epoch
+                    }
+                    _ => {
+                        self.conversation(network, payload.conversation())?
+                            .context("conversation not found")?
+                            .owner_epoch
+                    }
+                },
+                PeerCommand::Dispatch { spec } => match Trigger::decode(&spec.trigger) {
+                    Ok(Trigger::Assignment(assignment_id)) => {
+                        self.delivery_assignment(network, &spec.conversation, assignment_id)?
+                            .bot_owner_epoch
+                    }
+                    _ => {
+                        self.conversation(network, payload.conversation())?
+                            .context("conversation not found")?
+                            .owner_epoch
+                    }
+                },
                 _ => {
                     self.conversation(network, payload.conversation())?
                         .context("conversation not found")?

@@ -5,7 +5,7 @@ import { SiteLayout } from '@/components/site-layout'
 export const Route = createFileRoute('/download')({
   head: () => ({
     meta: [{ title: '下载 Vibeface Hourly' }],
-    links: [{ rel: 'canonical', href: 'https://www.vibeface.dev/download' }],
+    links: [{ rel: 'canonical', href: 'https://vibeface.dev/download/' }],
   }),
   component: DownloadPage,
 })
@@ -18,12 +18,12 @@ function DownloadPage() {
         title="从公开 Releases 获取安装包。"
         lede={
           <p>
-            当前公开渠道是 Hourly，每小时自动发布。同一个产品 Release 提供电脑版完整包和 Android APK；电脑版包含同版本的 CLI、Core 与网页 App。
+            Hourly 每小时发布。Desktop、CLI、Android、iOS 和 Web App 使用独立的发布线，下载页只展示当前可安装状态。
           </p>
         }
         actions={
           <>
-            <a className="button button-primary" href="https://github.com/leaperone/vibeface/releases">
+            <a className="button button-primary" href="https://github.com/leaperone/vibeface/releases" rel="noreferrer">
               打开 GitHub Releases
             </a>
             <a className="button button-quiet" href="/docs/quick-start">
@@ -36,9 +36,10 @@ function DownloadPage() {
         <div><dt>macOS</dt><dd>Apple Silicon</dd></div>
         <div><dt>Linux</dt><dd>x64</dd></div>
         <div><dt>Linux</dt><dd>ARM64</dd></div>
-        <div><dt>Android</dt><dd>APK</dd></div>
+        <div><dt>Android</dt><dd>Hourly APK，手动安装</dd></div>
+        <div><dt>iOS</dt><dd>尚未提供可安装包</dd></div>
       </dl>
-      <p className="section-copy">安装器只接受当前版本的完整包。旧开发版数据目录不受支持，首次运行请使用全新目录。需要当前源码时，查看<a href="/docs/quick-start#从源码准备当前版本">源码运行步骤</a>；已有安装请先读<a href="/docs/install">安装与更新说明</a>。要添加浏览器或手机，查看<a href="/docs/onboarding">首次配置与加入设备</a>。</p>
+      <p className="section-copy">Desktop 和 CLI 安装包由 GitHub Releases 提供。Desktop 会在后台检查并准备更新，受管 Node 安装后默认每小时更新。Android 当前仍需从对应的 Mobile Release 下载 APK；iOS 需要等待签名和 TestFlight 分发。网页 App 直接打开<a href="https://app.vibeface.dev/" rel="noreferrer">app.vibeface.dev</a>，重新打开或恢复联网时会检查新版本。已有安装请先读<a href="/docs/install">安装与更新说明</a>。</p>
     </SiteLayout>
   )
 }

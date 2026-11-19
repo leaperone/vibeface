@@ -64,7 +64,7 @@ Vibeface 负责协调工作。每台电脑上的 Agent、登录、模型服务�
 
 将 `~/.local/bin` 加入 shell 配置，便于在新终端使用 `vibeface`。已有安装通过 `vibeface update` 更新，通过 `vibeface service` 管理后台服务，不重复运行安装器。更新配置和其他安装方式见[安装与更新](packages/docs/install.md)。
 
-已有 Node.js 22 或更新版本时，也可用 `npm install -g @leaperone/vibeface@hourly` 安装 CLI；这种安装由 npm 管理更新。
+已有 Node.js 22 或更新版本时，也可用 `npm install -g @leaperone/vibeface@hourly` 安装 CLI；这种安装由 npm 管理更新。当前公开预览应显式使用 `@hourly`，`@latest` 仅用于正式 Stable。
 
 ## 添加另一台设备
 

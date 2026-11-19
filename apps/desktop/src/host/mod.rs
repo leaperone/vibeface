@@ -286,13 +286,14 @@ impl DesktopHost {
         self.apply_discovery(result, true)
     }
     fn can_use_owned_dir(&self) -> bool {
+        let own_data_dir = self.profile_dir.join("node");
         !self.attach_only
             && self.discovery_state == DiscoveryState::Ready
             && !self.discovery.user_service_registered
             && self
                 .selected
                 .as_ref()
-                .is_none_or(|node| node.data_dir == self.profile_dir.join("node"))
+                .is_none_or(|node| node.data_dir == own_data_dir)
             && !self.discovery.warnings.iter().any(|warning| {
                 matches!(
                     warning.as_str(),
@@ -308,7 +309,7 @@ impl DesktopHost {
                 .discovery
                 .nodes
                 .iter()
-                .all(|node| node.data_dir == self.profile_dir.join("node"))
+                .all(|node| node.data_dir == own_data_dir)
     }
     fn can_start_owned(&self) -> bool {
         self.can_use_owned_dir()

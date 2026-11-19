@@ -5,8 +5,7 @@ description: 构建 Vibeface iOS 设备归档和签名 IPA，先通过 TestFligh
 
 # iOS 构建与分发
 
-iOS 先通过 TestFlight 内测，验证后再上 App Store。当前工作流只构建和校验，
-不上传 App Store Connect，也不提交商店审核。
+iOS 先通过 TestFlight 内测，验证后再上 App Store。当前工作流只构建和校验，不上传 App Store Connect，也不提交商店审核。公开 Mobile Release 因此不代表已有可安装的 iOS 渠道。
 
 `release-ios.yml` 是可复用工作流，只由 `release-mobile.yml` 调用。
 它从同一份 React Native App 与 Rust secure-native XCFramework
@@ -42,3 +41,5 @@ Mobile 的 marketing version 仍保持 `0.0.1`。
 当前仓库尚未配置这些 iOS 签名材料。已有的 macOS Developer ID 证书与公证 API key
 不能替代 iOS 分发签名。缺少签名材料时不生成 IPA，上传 TestFlight 或提交
 App Store 审核须另行授权。
+
+正式分发还需要 Apple Distribution 证书、描述文件、App Store Connect 上传凭证和测试组配置。上传、Apple 处理和测试组分配完成后，才能把对应 Mobile Release 标记为可安装。
