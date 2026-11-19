@@ -71,9 +71,11 @@ systemd_escape() {
 }
 
 systemd_path_escape() {
-  # Path directives preserve shell quotes and backslashes literally.
+  # Path directives use systemd escapes; an unescaped space starts another field.
   local value="$1"
-  printf '%s' "${value//%/%%}"
+  value="$(systemd_escape "$value")"
+  value="${value// /\\s}"
+  printf '%s' "$value"
 }
 
 systemd_exec_escape() {
