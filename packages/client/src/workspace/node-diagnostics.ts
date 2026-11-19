@@ -13,7 +13,7 @@ export const nodeStatusLabels = {
 
 type NodeStatus = keyof typeof nodeStatusLabels
 
-export type ConnectionHop = {
+type ConnectionHop = {
   kind: "client" | "gateway" | "relay" | "node"
   name: string
   via?: string
