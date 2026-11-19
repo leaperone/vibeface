@@ -116,8 +116,11 @@ def strip_rust_comments(source):
 def check_rust_contracts(source, runtime):
     active = strip_rust_comments(source)
     for field, key in (('UPDATE_PROTOCOL', 'update_protocol'), ('DATA_EPOCH', 'data_epoch')):
-        matches = re.findall(rf'^\s*pub\s+const\s+{field}\s*:\s*u32\s*=\s*([0-9]+)\s*;', active, re.MULTILINE)
-        if len(matches) != 1 or int(matches[0]) != runtime['contracts'][key]: raise ContractError('source')
+        matches = []
+        for match in re.finditer(rf'^\s*pub\s+const\s+{field}\s*:\s*u32\s*=\s*([0-9]+)\s*;', active, re.MULTILINE):
+            previous = active[:match.start()].split('\n')[-2] if '\n' in active[:match.start()] else ''
+            if not re.match(r'^\s*#(?:!\s*)?\[cfg(?:_attr)?\b', previous): matches.append(match)
+        if len(matches) != 1 or int(matches[0].group(1)) != runtime['contracts'][key]: raise ContractError('source')
     return True
 
 def validate_runtime(runtime):

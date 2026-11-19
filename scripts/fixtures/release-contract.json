@@ -1683,6 +1683,13 @@
           "source": "// pub const UPDATE_PROTOCOL: u32 = 1;\n/* pub const DATA_EPOCH: u32 = 1; */\n",
           "accepted": false,
           "error": "source"
+        },
+        {
+          "id": "rust-cfg-bound-declarations",
+          "kind": "source",
+          "source": "#[cfg(any())]\npub const DATA_EPOCH: u32 = 1;\n#[cfg(not(any()))]\npub const DATA_EPOCH: u32 = 2;\npub const UPDATE_PROTOCOL: u32 = 1;\n",
+          "accepted": false,
+          "error": "source"
         }
       ]
     }
