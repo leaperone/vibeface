@@ -37,10 +37,10 @@ function generate(check) {
     [resolve(portalRoot, 'public/sitemap.xml'), `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url><loc>https://www.vibeface.dev/</loc></url>
-  <url><loc>https://www.vibeface.dev/download</loc></url>
-  <url><loc>https://www.vibeface.dev/community</loc></url>
-  <url><loc>https://www.vibeface.dev/security</loc></url>
-${docs.map(({ slug }) => `  <url><loc>https://www.vibeface.dev/docs/${slug}</loc></url>`).join('\n')}
+  <url><loc>https://vibeface.dev/download/</loc></url>
+  <url><loc>https://www.vibeface.dev/community/</loc></url>
+  <url><loc>https://www.vibeface.dev/security/</loc></url>
+${docs.map(({ slug }) => `  <url><loc>https://www.vibeface.dev/docs/${slug}/</loc></url>`).join('\n')}
 </urlset>
 `],
     [resolve(docsRoot, 'meta.json'), `${JSON.stringify({ pages: docs.map(({ slug }) => slug) }, null, 2)}\n`],

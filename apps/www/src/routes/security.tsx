@@ -8,7 +8,7 @@ export const Route = createFileRoute('/security')({
       { title: '安全边界 · Vibeface' },
       { name: 'description', content: '了解设备身份、加密连接与本机执行的信任边界。' },
     ],
-    links: [{ rel: 'canonical', href: 'https://www.vibeface.dev/security' }],
+    links: [{ rel: 'canonical', href: 'https://www.vibeface.dev/security/' }],
   }),
   component: SecurityPage,
 })

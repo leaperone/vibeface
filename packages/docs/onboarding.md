@@ -67,7 +67,7 @@ vibeface join '<从管理设备复制的完整加入链接>' --name '我的第�
 
 浏览器需要可信 HTTPS 或本机 localhost。手机不能通过自己浏览器的 `localhost` 连接电脑；只有局域网地址时，使用原生 App 的扫码入口，并让手机与电脑处于同一局域网。iOS 需要允许本地网络访问。外网浏览器打开官方页面 `https://app.vibeface.dev` 或自建的 HTTPS 公共节点，详见[手机 App 局域网直连](node.md#手机-app-局域网直连)与[从外网访问](node.md#从外网访问)。
 
-网页 App 与原生手机 App 是不同客户端，每个浏览器 profile、站点地址和手机安装都有独立的本地身份。不要把“在另一处打开页面”当成已经获得授权。移动端安装渠道以实际发布情况为准，[下载页](https://www.vibeface.dev/download)不代表已提供 App Store 正式版。
+网页 App 与原生手机 App 是不同客户端，每个浏览器 profile、站点地址和手机安装都有独立的本地身份。不要把“在另一处打开页面”当成已经获得授权。移动端安装渠道以实际发布情况为准，[下载页](https://vibeface.dev/download/)不代表已提供 App Store 正式版。
 
 ## 恢复管理身份
 
