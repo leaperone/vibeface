@@ -118,8 +118,15 @@ def check_rust_contracts(source, runtime):
     for field, key in (('UPDATE_PROTOCOL', 'update_protocol'), ('DATA_EPOCH', 'data_epoch')):
         matches = []
         for match in re.finditer(rf'^\s*pub\s+const\s+{field}\s*:\s*u32\s*=\s*([0-9]+)\s*;', active, re.MULTILINE):
-            previous = list(reversed(active[:match.start()].split('\n')[:-1]))[:32]
-            if not any(re.match(r'^\s*#', line) for line in previous): matches.append(match)
+            previous = reversed(active[:match.start()].split('\n')[:-1])
+            decorated = False
+            for line in previous:
+                trimmed = line.strip()
+                if re.match(r'^#', trimmed):
+                    decorated = True
+                    break
+                if trimmed and re.search(r'[;}]\s*$', trimmed): break
+            if not decorated: matches.append(match)
         if len(matches) != 1 or int(matches[0].group(1)) != runtime['contracts'][key]: raise ContractError('source')
     return True
 

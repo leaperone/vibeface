@@ -117,8 +117,13 @@ export function checkRustContracts(source, runtime) {
   for (const [field, key] of [['UPDATE_PROTOCOL', 'update_protocol'], ['DATA_EPOCH', 'data_epoch']]) {
     const matches = [...active.matchAll(new RegExp(`^\\s*pub\\s+const\\s+${field}\\s*:\\s*u32\\s*=\\s*([0-9]+)\\s*;`, 'gm'))]
       .filter(match => {
-        const previous = active.slice(0, match.index).split('\n').slice(0, -1).reverse().slice(0, 32);
-        return !previous.some(line => /^\s*#/.test(line));
+        const previous = active.slice(0, match.index).split('\n').slice(0, -1).reverse();
+        for (const line of previous) {
+          const trimmed = line.trim();
+          if (/^#/.test(trimmed)) return false;
+          if (trimmed && /[;}]$/.test(trimmed)) break;
+        }
+        return true;
       });
     if (matches.length !== 1 || Number(matches[0][1]) !== runtime.contracts[key]) fail('source');
   }
