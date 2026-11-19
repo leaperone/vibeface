@@ -25,6 +25,7 @@ const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub mod discovery;
+pub mod tool_preflight;
 
 /// A bounded request handled by a standalone core process.  The core owns all data access and
 /// turns these DTOs into its internal Config, identity and Store values.

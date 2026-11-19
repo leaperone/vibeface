@@ -1666,50 +1666,6 @@ async fn codex(socket: Option<PathBuf>, command: CodexCommand) -> Result<()> {
     }
 }
 
-fn prepare_tool_arguments(name: &str, arguments: &mut Value, call_ref: Option<&str>) -> Result<()> {
-    ensure!(!name.is_empty() && name.len() <= 128, "invalid tool name");
-    ensure!(
-        arguments.is_object(),
-        "tool arguments must be a JSON object"
-    );
-    let argument_ref = arguments["call_ref"].as_str();
-    ensure!(
-        call_ref
-            .zip(argument_ref)
-            .is_none_or(|(flag, argument)| flag == argument),
-        "--call-ref must match arguments.call_ref"
-    );
-    let call_ref = call_ref.or(argument_ref).map(str::to_owned);
-    if let Some(call_ref) = &call_ref {
-        arguments["call_ref"] = json!(call_ref);
-    }
-    if name != "dispatch_work" {
-        return Ok(());
-    }
-    let call_id = call_ref
-        .as_deref()
-        .context("dispatch_work requires --call-ref or arguments.call_ref")?;
-    vibeface_protocol::validate_id(call_id)
-        .map_err(|error| anyhow::anyhow!("arguments.call_ref is invalid: {error}"))?;
-    ensure!(
-        arguments["prompt"]
-            .as_str()
-            .is_some_and(|prompt| !prompt.is_empty()),
-        "dispatch_work requires a prompt"
-    );
-    ensure!(
-        arguments["thread"]
-            .as_str()
-            .is_some_and(|thread| !thread.is_empty())
-            || (arguments["title"]
-                .as_str()
-                .is_some_and(|title| !title.is_empty())
-                && arguments["cwd"].as_str().is_some_and(|cwd| !cwd.is_empty())),
-        "dispatch_work requires thread or title and cwd"
-    );
-    Ok(())
-}
-
 async fn call_tool(name: String, raw: String, call_ref: Option<String>) -> Result<()> {
     let mut arguments: Value = serde_json::from_str(&raw)
         .context("invalid tool arguments JSON")
@@ -1722,7 +1678,12 @@ async fn call_tool(name: String, raw: String, call_ref: Option<String>) -> Resul
                 &error,
             )
         })?;
-    prepare_tool_arguments(&name, &mut arguments, call_ref.as_deref()).map_err(|error| {
+    vibeface_control::tool_preflight::prepare_tool_arguments(
+        &name,
+        &mut arguments,
+        call_ref.as_deref(),
+    )
+    .map_err(|error| {
         let reference = call_ref.as_deref().map(|id| json!(id)).or_else(|| {
             vibeface_control::tool_receipt::ToolOutcome::reference(&arguments).cloned()
         });
