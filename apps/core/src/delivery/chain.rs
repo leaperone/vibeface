@@ -106,6 +106,10 @@ pub enum Call {
         order_ids: Vec<Word>,
         seal: Vec<u8>,
     },
+    SessionReserve {
+        budget: Word,
+        terms: Vec<(Word, Word, Amount, u64)>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1190,6 +1194,27 @@ fn encode_call(config: &ChainConfig, call: Call, wallet: Address) -> Result<(Add
             }
             .abi_encode()
         }
+        Call::SessionReserve { budget, terms } => {
+            ensure!(
+                !terms.is_empty() && terms.len() <= 16,
+                "invalid session reserve batch"
+            );
+            abi::SessionEscrow::reserveBatchCall {
+                budgetId: budget.into(),
+                terms: terms
+                    .into_iter()
+                    .map(
+                        |(delivery, context, amount, claim_until_ms)| abi::SessionEscrow::Terms {
+                            delivery: delivery.into(),
+                            receiptContext: context.into(),
+                            amount: U256::from_be_bytes(amount.to_be_bytes()),
+                            claimUntilMs: claim_until_ms,
+                        },
+                    )
+                    .collect(),
+            }
+            .abi_encode()
+        }
     };
     ensure!(
         calldata.len() <= MAX_CALLDATA_BYTES,
@@ -1370,6 +1395,24 @@ fn validate_calldata(
                 previous = id;
             }
             validate_seal(&call.seal)?;
+        }
+        value if value == abi::SessionEscrow::reserveBatchCall::SELECTOR => {
+            let call = abi::SessionEscrow::reserveBatchCall::abi_decode_validate(input)?;
+            ensure!(
+                call.budgetId != alloy_primitives::B256::ZERO
+                    && !call.terms.is_empty()
+                    && call.terms.len() <= 16,
+                "invalid session reserve batch"
+            );
+            for term in call.terms.iter() {
+                ensure!(
+                    term.delivery != alloy_primitives::B256::ZERO
+                        && term.receiptContext != alloy_primitives::B256::ZERO
+                        && term.amount != alloy_primitives::U256::ZERO
+                        && term.claimUntilMs > 0,
+                    "invalid session reserve terms"
+                );
+            }
         }
         _ => return super::budget::validate_calldata(config, input, wallet),
     }
@@ -1899,6 +1942,15 @@ pub(super) mod tests {
             wallet,
         )?;
         assert!(validate_calldata(&config, target, &reversed, wallet).is_err());
+        let (_, reserve) = encode_call(
+            &config,
+            Call::SessionReserve {
+                budget: [1; 32],
+                terms: vec![([2; 32], [3; 32], Amount::from_u64(4), 5)],
+            },
+            wallet,
+        )?;
+        validate_calldata(&config, target, &reserve, wallet)?;
         Ok(())
     }
 

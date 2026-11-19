@@ -73,3 +73,13 @@ function withdrawBudget(bytes32 id) external;
 function closeBudget(bytes32 id) external;
 function refundBudget(bytes32 id, WindowRef[] items) external;
 function settleBatch(bytes32 budgetId, bytes32[] ids, bytes seal) external;
+
+interface SessionEscrow {
+    struct Terms {
+        bytes32 delivery;
+        bytes32 receiptContext;
+        uint256 amount;
+        uint64 claimUntilMs;
+    }
+    function reserveBatch(bytes32 budgetId, Terms[] terms) external;
+}

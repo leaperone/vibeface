@@ -132,6 +132,44 @@ impl Delivery {
         Ok(observation)
     }
 
+    pub async fn reserve_paid_session_batch(
+        &self,
+        chain: &Chain,
+        route_id: &str,
+        gas_cap: &str,
+    ) -> Result<TxObservation> {
+        let claims = self.paid_session_claims(route_id)?;
+        ensure!(!claims.is_empty(), "session payment claim queue is empty");
+        let batch = vibeface_session_delivery::verify_session_settlement(&claims)
+            .map_err(anyhow::Error::msg)?;
+        let terms = claims
+            .iter()
+            .map(|claim| {
+                Ok((
+                    claim.order.delivery,
+                    claim.order.receipt_context(),
+                    claim.order.amount,
+                    claim.order.claim_until_ms,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let intent_id = format!(
+            "session-reserve/{route_id}/{}",
+            hex::encode(hash(&batch.journal()))
+        );
+        chain
+            .execute(
+                self,
+                &intent_id,
+                Call::SessionReserve {
+                    budget: batch.budget,
+                    terms,
+                },
+                gas_cap,
+            )
+            .await
+    }
+
     pub(super) fn attach_session_outbox(&self, runtime: std::sync::Weak<Runtime>) -> Result<()> {
         let Some(node) = runtime.upgrade() else {
             return Ok(());
