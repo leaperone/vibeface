@@ -12,7 +12,7 @@ import { linkTarget } from './switch-network.ts'
 import { hideRecovery, recoveryHidden } from './recovery-notice.ts'
 import { approvalMatches, joinMatches, parseApprovalPins, parsePendingJoin, parseWaitRecord, pendingJoinJson, readIdentityRecord, recoveryCheckpointHash, waitRecordJson } from './persistence.ts'
 import type { Joining, PendingJoin, WaitRecord } from './persistence.ts'
-import { spentInviteText } from '../lib/errors.ts'
+import { spentInvite, spentInviteText } from '../lib/errors.ts'
 import { parseChanged } from '../lib/progress.ts'
 import type { ChangedEvent } from '../lib/progress.ts'
 import { recoveryCode, recoveryFileName, secureKit } from '../lib/secure.ts'
@@ -44,7 +44,7 @@ const inviteState = (value: unknown): InviteState | null => {
   return state === 'open' || state === 'used' || state === 'expired' ? state : null
 }
 /** A fresh invitation; `link` is `vibeface://join/<ticket>`, which the desktop and phone apps open. */
-export type Invitation = { link: string; expiresAt: number }
+export type Invitation = { link: string; expiresAt: number; readonly inviteId: string }
 /** What tabs of this origin tell each other: the leader's new entrance, an outbox change, or local inbox state. */
 type TabMessage = { type: 'entrance'; networkId: string; entry: ConnectionEntry } | { type: 'outbox'; networkId: string } | { type: 'ignored-inbox'; networkId: string }
 export type Tabs = { leader(): boolean; post(message: TabMessage): void; listen(listener: (message: TabMessage) => void): () => void }
@@ -173,7 +173,9 @@ function deviceStore(storage: KeyValue, self: string) {
   return { load, store, savedEntries, loadAuthenticated, resumeTargets, loadJoining, loadApprovalPins, loadEntrances, loadGateways }
 }
 function publicIdentity({ deviceId }: { deviceId: string }): PublicIdentity { return { deviceId } }
-function isResponseError(error: unknown) { return error instanceof Error && 'responded' in error && error.responded === true }
+function isResponseError(error: unknown): error is Error & { responded: true } {
+  return error instanceof Error && 'responded' in error && error.responded === true
+}
 type Vector = Record<string, number>
 /** Whether `seen` holds an event the entry's `vector` does not, so the page shows 同步中. */
 function behind(seen: Vector, vector: unknown): boolean {
@@ -227,6 +229,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   const [, setDismissals] = useState(0)
   const [queued, setQueued] = useState<number | null>(null)
   const [joins, setJoins] = useState<JoinRequest[]>([])
+  const startingApprovals = useRef(new Set<string>())
   const [joining, setJoining] = useState<Joining | null>(null)
   const [review, setReview] = useState<Review | null>(null)
   const [initialInvitation, setInitialInvitation] = useState('')
@@ -738,9 +741,12 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const view = verifiedView(response.state, ready.principal.network_id, nodeNow(response))
     if (!same(response.view, view)) throw new Error('设备列表校验失败，已停止使用。')
     const me = own().deviceId
-    const pending = ready.principal.can_manage ? array(record(await request('join_status')).requests).map(parseJoinRequest).map(item => managerCode(item, ready.principal.network_id, me)) : []
+    const pending = ready.principal.can_manage ? await readJoinRequests(request, ready.principal.network_id, me) : []
     if (session.current !== active || active.generation !== generation.current) throw changed()
     setDirectory(view); setRecoverySince(sinceOf(response)); setNodeClockOffset((nodeNow(response) ?? Date.now()) - Date.now()); setJoins(pending)
+  }
+  async function readJoinRequests(request: ReturnType<typeof scoped>, networkId: string, managerId: string) {
+    return array(record(await request('join_status')).requests).map(parseJoinRequest).map(item => managerCode(item, networkId, managerId))
   }
   async function setLocalAutoAccess(enabled: boolean) {
     const active = current(), connection = ready
@@ -767,28 +773,49 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     // The ticket carries the entry's node link, so a new device reaches it at its addresses and relay.
     const ticket = ticketEncode(String(result.entry), bytesToHex(secret))
     secret.fill(0)
-    if (validTarget(JSON.parse(platform.secure.ticketDecode(ticket)).entry_id) !== connection.entry.device_id) throw new Error('加入链接指向的设备和当前连接的不一致。')
-    return { link: joinLink(ticket), expiresAt }
+    const decoded = record(JSON.parse(platform.secure.ticketDecode(ticket)))
+    if (validTarget(decoded.entry_id) !== connection.entry.device_id) throw new Error('加入链接指向的设备和当前连接的不一致。')
+    return { link: joinLink(ticket), expiresAt, inviteId: text(decoded.invite_id) }
   }
   async function startApproval(joinId: string) {
-    const connection = managing(), networkId = connection.principal.network_id, me = own().deviceId
+    const connection = managing(), request = scoped(), networkId = connection.principal.network_id, me = own().deviceId
+    const key = `${generation.current}:${joinId}`
+    if (startingApprovals.current.has(key)) throw new Error('正在为这条申请显示安全码。稍后再查看。')
+    const unavailable = () => new Error('这个加入请求已失效。重新生成加入链接。')
     const stored = loadApprovalPins()
     const seen = joins.find(item => item.join_id === joinId)
-    if (!seen || (seen.status !== 'pending' && seen.status !== 'confirming') || seen.join_id !== seen.invite_id || seen.network_id !== networkId) throw new Error('这个加入请求已失效。重新生成加入链接。')
-    let pin = stored.kind === 'valid' ? stored.value.pins.get(joinId) : undefined
-    if (pin) {
-      if (!approvalMatches(seen, networkId, pin) || (seen.status === 'confirming' && (seen.admin_id !== me || seen.admin_nonce !== pin.nonce))) throw approvalRecordError()
-    } else {
-      if (seen.status !== 'pending' || (stored.kind !== 'empty' && (stored.kind !== 'valid' || stored.value.damaged))) throw approvalRecordError()
-      pin = { nonce: randomHex(), device_id: seen.device_id, invite_id: seen.invite_id, commit: seen.commit }
-      // Persist before sending, and keep earlier nonces while their requests may still be unresolved.
-      const pins = stored.kind === 'valid' ? stored.value.pins : new Map()
-      pins.set(joinId, pin)
-      store('approval-pins', Object.fromEntries(pins))
+    if (!seen || (seen.status !== 'pending' && seen.status !== 'confirming') || seen.join_id !== seen.invite_id || seen.network_id !== networkId) throw unavailable()
+    startingApprovals.current.add(key)
+    try {
+      let pin = stored.kind === 'valid' ? stored.value.pins.get(joinId) : undefined
+      if (pin) {
+        if (!approvalMatches(seen, networkId, pin) || (seen.status === 'confirming' && (seen.admin_id !== me || seen.admin_nonce !== pin.nonce))) throw approvalRecordError()
+        const requests = await readJoinRequests(request, networkId, me)
+        if (!connection.isCurrent()) throw changed()
+        setJoins(requests)
+        const latest = requests.find(item => item.join_id === joinId)
+        if (!latest) throw unavailable()
+        const persisted = loadApprovalPins()
+        if (persisted.kind !== 'valid' || !same(persisted.value.pins.get(joinId), pin) || !approvalMatches(latest, networkId, pin)) throw approvalRecordError()
+        if (latest.status === 'confirming') {
+          if (latest.admin_id !== me || latest.admin_nonce !== pin.nonce) throw approvalRecordError()
+          return
+        }
+        if (latest.status !== 'pending') throw unavailable()
+      } else {
+        if (seen.status !== 'pending' || (stored.kind !== 'empty' && (stored.kind !== 'valid' || stored.value.damaged))) throw approvalRecordError()
+        pin = { nonce: randomHex(), device_id: seen.device_id, invite_id: seen.invite_id, commit: seen.commit }
+        // Persist before sending, and keep earlier nonces while their requests may still be unresolved.
+        const pins = stored.kind === 'valid' ? stored.value.pins : new Map()
+        pins.set(joinId, pin)
+        store('approval-pins', Object.fromEntries(pins))
+      }
+      const result = parseJoinRequest(await request('approve', { join_id: joinId, admin_nonce: pin.nonce }))
+      if (result.join_id !== joinId || result.status !== 'confirming' || result.admin_id !== me || result.admin_nonce !== pin.nonce || !approvalMatches(result, networkId, pin)) throw new Error('设备返回的审批和原请求不一致。请刷新后查看原来的加入请求。')
+      await refreshDirectory()
+    } finally {
+      startingApprovals.current.delete(key)
     }
-    const request = parseJoinRequest(await scoped()('approve', { join_id: joinId, admin_nonce: pin.nonce }))
-    if (request.join_id !== joinId || request.status !== 'confirming' || request.admin_id !== me || request.admin_nonce !== pin.nonce || !approvalMatches(request, networkId, pin)) throw new Error('设备返回的审批和原请求不一致。请刷新后查看原来的加入请求。')
-    await refreshDirectory()
   }
   async function approveJoin(joinId: string, manage: boolean) {
     const connection = managing(), send = scoped()
@@ -1077,13 +1104,19 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       if (loadJoining().kind !== 'empty') throw joinRecordError()
       const nonce = randomHex()
       const commit = joinCommit(me, nonce)
-      const pending: Joining = { ...parsePendingJoin({ entry: entryJson(active.entry), join_id: link.inviteId, invite_id: link.inviteId, nonce, name }), status: 'pending' }
+      const pending: Joining = { ...parsePendingJoin({ entry: entryJson(active.entry), join_id: link.inviteId, invite_id: link.inviteId, nonce, name }), status: 'checking' }
       setJoin(pending)
       joinSending.current = pending
       try {
         const submitted = scoped(active)('join', { secret: link.secret, public_key: me, kind: 'client', name, commit })
         spend(linkText)
-        const response = parseJoinRequest(await submitted)
+        const response = parseJoinRequest(await submitted.catch((cause: unknown) => {
+          if (!isResponseError(cause) || !spentInvite.test(cause.message)) throw cause
+          if (!owner.current() || session.current !== active || joiningRef.current !== pending) throw changed()
+          requirePendingJoin(pending)
+          setJoin(null)
+          throw new Error(spentInviteText)
+        }))
         if (!owner.current() || session.current !== active) throw changed()
         requirePendingJoin(pending)
         if (!joinMatches(response, pending, me, commit)) stopJoinCheck(new Error('加入结果和这条链接对不上。请查看原来的加入请求。'))
@@ -1108,7 +1141,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     throw new Error(message)
   }
   async function resumePendingJoin(pending: PendingJoin) {
-    const joining: Joining = { ...pending, status: 'pending' }
+    const joining: Joining = { ...pending, status: 'checking' }
     if (openingConnection.current || session.current) resetConnection(joining)
     else { joiningRef.current = joining; setJoining(joining) }
     const checking = checkJoin(), version = generation.current
@@ -1144,7 +1177,10 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     let mine = pending
     if (status.status === 'confirming' && !status.joiner_nonce && status.admin_id && status.admin_nonce) {
       // Fix the manager's nonce before revealing ours, so the entry cannot pick it after seeing our nonce.
-      if (!mine.pinned) { mine = { ...mine, pinned: { network_id: status.network_id, admin_id: status.admin_id, admin_nonce: status.admin_nonce } }; setJoin(mine) }
+      if (!mine.pinned) {
+        mine = { ...mine, status: 'confirming', pinned: { network_id: status.network_id, admin_id: status.admin_id, admin_nonce: status.admin_nonce } }
+        setJoin(mine)
+      }
       status = parseJoinRequest(await request('join_status', { join_id: pending.join_id, reveal: pending.nonce }))
     }
     if (joiningRef.current !== mine) return
@@ -1164,6 +1200,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const code = pin && status.joiner_nonce ? shortCode(pin.network_id, pending.invite_id, own().deviceId, pin.admin_id, pin.admin_nonce, pending.nonce) : undefined
     const next = { ...mine, status: status.status, code, admin: status.admin_name }
     joiningRef.current = next; setJoining(next)
+    setError('')
   }
   /**
    * Cancelling takes the request back at the entry so the manager's approval card goes away now, not at expiry.

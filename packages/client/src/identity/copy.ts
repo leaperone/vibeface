@@ -3,10 +3,18 @@ import type { Member, PendingRecovery } from '../lib/node.ts'
 /** Join, recovery and device copy the web and the phone show word for word. */
 export const joinCopy = {
   waiting: '等待批准',
+  checkingDelivery: '正在确认申请是否送达…',
+  acceptOnComputer: '请在电脑上接受申请',
+  acceptOnComputerHint: '在电脑端的「设备」页刷新加入请求，找到这条申请并开始比对安全码。网页版点「显示安全码」。',
+  acceptOnManager: '请在管理设备上接受申请',
+  acceptOnManagerHint: '在管理设备的「设备」页找到这条申请，开始比对安全码。网页版点「显示安全码」。',
   /** The join request reached one of the person's devices. */
   reached: '已连上你的设备',
   showCode: '正在生成安全码…',
-  compareCode: (admin?: string) => `两边的安全码一致，就在${admin ? `「${admin}」` : '那边'}上点允许`,
+  compareCode: (admin?: string) => `两边的安全码一致时，请在${admin ? `「${admin}」` : '管理设备'}上允许加入。`,
+  reconnecting: '正在重新连接。连上后会继续查这条申请。',
+  stopWaiting: '退出等待',
+  offlineExit: '退出后，如果管理设备上还有这条申请，请在那台设备上拒绝。',
   linkSource: (from = '已有设备') => `链接来自${from}上的“添加设备”`,
   byLink: '使用加入链接',
   scan: '扫码加入',
@@ -213,6 +221,8 @@ export const deviceCopy = {
   unmanage: '取消管理',
   /** Under a request's safety code, on the web and the phone alike. */
   compareCode: '和新设备上的比对，不一致就拒绝，可能不是你的设备',
+  startCode: '点「显示安全码」，新设备上也会出现同一组数字。',
+  waitForCode: '请在新设备上保持加入页面打开，等安全码出现。',
   rejected: (name: string) => `已拒绝「${name}」`,
   addedManager: (name: string) => `已添加「${name}」为管理设备`,
   /** 可用文件夹: what it is, and during setup that it can wait. */

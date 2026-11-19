@@ -1,7 +1,7 @@
 import * as Clipboard from 'expo-clipboard'
 import { openURL, useLinkingURL } from 'expo-linking'
-import { ArchiveRestore, Camera, ClipboardPaste, ExternalLink, Hourglass, Laptop, Link2, ShieldAlert, ShieldCheck, X } from 'lucide-react-native'
-import { humanError, spentInviteText } from '@vibeface/client/lib/errors.ts'
+import { ArchiveRestore, Camera, ClipboardPaste, ExternalLink, Hourglass, Laptop, Link2, ShieldAlert, X } from 'lucide-react-native'
+import { humanError, spentInvite, spentInviteText } from '@vibeface/client/lib/errors.ts'
 import { useEffect, useState } from 'react'
 import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
@@ -11,6 +11,7 @@ import Svg, { Path, Rect } from 'react-native-svg'
 import { useCSSVariable } from 'uniwind'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { joinCopy } from '@vibeface/client/identity/copy.ts'
+import type { Joining } from '@vibeface/client/identity/persistence.ts'
 import { recoveryTarget } from '@vibeface/client/identity/recovery-link.ts'
 import { ErrorText } from '@/components/action'
 import { Panel, SafetyCode, Skeleton } from '@/components/kit'
@@ -58,7 +59,14 @@ export default function JoinScreen() {
         : device.ready && device.recovered ? <RecoveredStep />
         : device.recovery ? <RecoveryWaiting />
         : device.review?.kind === 'recovery' ? <RecoveryReview />
-        : session.phase === 'joining' ? <Waiting code={session.code} admin={session.admin} reached={Boolean(device.info)} error={device.error || error} reconnecting={device.phase === 'reconnecting'} onCancel={cancelJoin} />
+        : session.phase === 'joining' ? <Waiting
+          joinStatus={device.joining?.status ?? 'checking'}
+          code={session.code}
+          admin={session.admin}
+          error={device.error || error}
+          reconnecting={device.phase === 'reconnecting' || device.phase === 'disconnected'}
+          onCancel={cancelJoin}
+        />
         : lane === 'recovery' ? <Panel icon={ArchiveRestore} title="用恢复文件找回"><RecoveryRestore link={url} /></Panel>
         : <JoinForm busy={busy === 'join'} actionError={error} clearActionError={clear} onSubmit={submit} />}
       {choosing ? <View className="gap-1 border-t border-border pt-4">
@@ -133,6 +141,10 @@ function JoinForm({ busy, actionError, clearActionError, onSubmit }: {
   const [name, setName] = useState(defaultName)
   const [scanning, setScanning] = useState(false)
   const [error, setError] = useState('')
+  const submitError = submitted === invitation.trim() ? actionError : ''
+  useEffect(() => {
+    if (spentInvite.test(submitError)) { setInvitation(''); setError(spentInviteText) }
+  }, [submitError])
   // Checked as it changes, as on the web, down to a ticket that decodes: only a real join link counts as filled, so typing
   // or any other text keeps the field.
   const ready = device.linkTarget(invitation) !== null
@@ -148,7 +160,7 @@ function JoinForm({ busy, actionError, clearActionError, onSubmit }: {
   }, [invitation, ready])
   if (scanning) return <Scanner title={joinCopy.scan} onCancel={() => setScanning(false)} onScanned={(link) => { edit(link); setScanning(false) }} />
   const invalid = !ready && invitation.trim() !== ''
-  const failure = error || (submitted === invitation.trim() ? actionError : '') || (edited ? '' : device.error)
+  const failure = error || submitError || (edited ? '' : device.error)
   // Scanning leads; once there is a link it shrinks to one line, and the name and 加入 take over.
   if (ready) return <View className="gap-4">
     <View className="min-h-11 flex-row items-center gap-2 rounded-control bg-surface-muted/60 ps-3">
@@ -173,28 +185,46 @@ function JoinForm({ busy, actionError, clearActionError, onSubmit }: {
       <Textarea accessibilityLabel="加入链接" placeholder={joinCopy.paste} autoCapitalize="none" autoCorrect={false} numberOfLines={4}
         className="min-h-20 font-mono text-sm" value={invitation} onChangeText={edit} />
       {invalid ? <ErrorText error={joinCopy.notLink} /> : null}
-      <Paste onText={(text) => edit(text.trim())} />
+      <Paste onText={edit} onError={setError} />
     </View>
   </View>
 }
 
 /** iOS's own paste control reads the clipboard without asking each time; elsewhere a button reads it. */
-function Paste({ onText }: { onText: (text: string) => void }) {
+function Paste({ onText, onError }: { onText: (text: string) => void; onError: (message: string) => void }) {
   const [fill, ink] = useCSSVariable(['--surface-muted', '--foreground']) as [string, string]
+  const paste = (value: string) => {
+    const text = value.trim()
+    if (text) onText(text)
+    else onError('剪贴板里没有文字。请先复制加入链接。')
+  }
   if (Clipboard.isPasteButtonAvailable) return <Clipboard.ClipboardPasteButton acceptedContentTypes={['plain-text', 'url']} backgroundColor={fill} foregroundColor={ink}
-    cornerStyle="medium" style={{ alignSelf: 'flex-start', height: 44, width: 104 }} onPress={(data) => { if (data.type === 'text') onText(data.text) }} />
-  return <Button variant="ghost" className="-ms-3 self-start" onPress={async () => onText(await Clipboard.getStringAsync())}>
+    cornerStyle="medium" style={{ alignSelf: 'flex-start', height: 44, width: 104 }} onPress={(data) => { if (data.type === 'text') paste(data.text) }} />
+  return <Button variant="ghost" className="-ms-3 self-start" onPress={() => void Clipboard.getStringAsync().then(paste, () => onError('没能读取剪贴板。可以长按输入框粘贴，或扫码加入。'))}>
     <Icon as={ClipboardPaste} /><Text>粘贴</Text>
   </Button>
 }
 
-function Waiting({ code, admin, reached, error, reconnecting, onCancel }: { code: string | null; admin?: string; reached: boolean; error: string; reconnecting: boolean; onCancel: () => void }) {
-  return <Panel icon={Hourglass} title={joinCopy.waiting}>
-    {reached ? <View className="flex-row items-center gap-2"><Icon as={ShieldCheck} className="size-4 text-success" /><Text className="text-sm text-muted">{joinCopy.reached}</Text></View> : null}
-    <Text role="status" className="text-muted">{code ? joinCopy.compareCode(admin) : joinCopy.showCode}</Text>
-    {code ? <SafetyCode code={code} /> : <Skeleton className="h-8 w-40" />}
-    {reconnecting ? <Text className="text-sm text-muted">连接已断开，正在重连；批准后仍会继续完成加入。</Text> : null}
+function Waiting({ joinStatus, code, admin, error, reconnecting, onCancel }: {
+  joinStatus: Joining['status']
+  code: string | null
+  admin?: string
+  error: string
+  reconnecting: boolean
+  onCancel: () => void
+}) {
+  const awaitingAcceptance = joinStatus === 'pending'
+  const checking = joinStatus === 'checking'
+  const title = awaitingAcceptance ? joinCopy.acceptOnComputer : checking ? joinCopy.joining : joinCopy.waiting
+  const status = awaitingAcceptance
+    ? joinCopy.acceptOnComputerHint
+    : code ? joinCopy.compareCode(admin) : checking ? joinCopy.checkingDelivery : joinCopy.showCode
+  return <Panel icon={Hourglass} title={title}>
+    <Text role="status" accessibilityLiveRegion="polite" className="text-muted">{status}</Text>
+    {code ? <SafetyCode code={code} /> : joinStatus === 'confirming' ? <Skeleton className="h-8 w-40" /> : null}
+    {reconnecting ? <Text className="text-sm text-muted">{joinCopy.reconnecting}</Text> : null}
     <ErrorText error={error} />
-    <Button variant="ghost" className="-ms-3 self-start" onPress={onCancel}><Text>取消</Text></Button>
+    {reconnecting ? <Text className="text-sm text-muted">{joinCopy.offlineExit}</Text> : null}
+    <Button variant="ghost" className="-ms-3 self-start" onPress={onCancel}><Text>{joinCopy.stopWaiting}</Text></Button>
   </Panel>
 }
