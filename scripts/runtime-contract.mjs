@@ -109,22 +109,31 @@ export function runRuntimeCorpus(runtime = loadRuntimeCorpus()) {
   return outcomes;
 }
 
-function stripRustComments(source) {
-  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\r\n]*/g, '');
+function sanitizeRust(source) {
+  const output = Array.from(source, char => char);
+  const blank = index => { if (output[index] !== '\n' && output[index] !== '\r') output[index] = ' '; };
+  let i = 0;
+  while (i < source.length) {
+    if (source.startsWith('//', i)) { blank(i); blank(i + 1); i += 2; while (i < source.length && source[i] !== '\n') { blank(i); i++; } continue; }
+    if (source.startsWith('/*', i)) { let depth = 1; blank(i); blank(i + 1); i += 2; while (i < source.length && depth) { if (source.startsWith('/*', i)) { depth++; blank(i); blank(i + 1); i += 2; } else if (source.startsWith('*/', i)) { depth--; blank(i); blank(i + 1); i += 2; } else { blank(i); i++; } } continue; }
+    const raw = /^(?:b)?r(#+)"/.exec(source.slice(i));
+    if (raw) { const close = `"${raw[1]}`; const end = source.indexOf(close, i + raw[0].length); const stop = end < 0 ? source.length : end + close.length; for (; i < stop; i++) blank(i); continue; }
+    if (source[i] === '"' || source[i] === "'") { const quote = source[i]; blank(i++); let escaped = false; while (i < source.length) { const char = source[i]; blank(i++); if (!escaped && char === quote) break; escaped = !escaped && char === '\\'; if (char !== '\\') escaped = false; } continue; }
+    i++;
+  }
+  return output.join('');
+}
+function rustBraceDepth(source, end) { let depth = 0; for (let i = 0; i < end; i++) { if (source[i] === '{') depth++; else if (source[i] === '}') depth--; } return depth; }
+function rustHasAttachedAttribute(source, index) {
+  const previous = source.slice(0, index).split('\n').slice(0, -1).reverse();
+  for (const line of previous) { const trimmed = line.trim(); if (/^#/.test(trimmed)) return true; if (trimmed && /[;}]$/.test(trimmed)) break; }
+  return false;
 }
 export function checkRustContracts(source, runtime) {
-  const active = stripRustComments(source);
+  const active = sanitizeRust(source);
   for (const [field, key] of [['UPDATE_PROTOCOL', 'update_protocol'], ['DATA_EPOCH', 'data_epoch']]) {
-    const matches = [...active.matchAll(new RegExp(`^\\s*pub\\s+const\\s+${field}\\s*:\\s*u32\\s*=\\s*([0-9]+)\\s*;`, 'gm'))]
-      .filter(match => {
-        const previous = active.slice(0, match.index).split('\n').slice(0, -1).reverse();
-        for (const line of previous) {
-          const trimmed = line.trim();
-          if (/^#/.test(trimmed)) return false;
-          if (trimmed && /[;}]$/.test(trimmed)) break;
-        }
-        return true;
-      });
+    const matches = [...active.matchAll(new RegExp(`\\bpub\\s+const\\s+${field}\\s*:\\s*u32\\s*=\\s*([0-9]+)\\s*;`, 'g'))]
+      .filter(match => rustBraceDepth(active, match.index) === 0 && !rustHasAttachedAttribute(active, match.index));
     if (matches.length !== 1 || Number(matches[0][1]) !== runtime.contracts[key]) fail('source');
   }
   return true;

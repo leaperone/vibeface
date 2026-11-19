@@ -1704,6 +1704,27 @@
           "source": "#[cfg(\n    any()\n)]\npub const DATA_EPOCH: u32 = 1;\npub const UPDATE_PROTOCOL: u32 = 1;\n",
           "accepted": false,
           "error": "source"
+        },
+        {
+          "id": "rust-nested-module-declaration",
+          "kind": "source",
+          "source": "mod fixture { pub const DATA_EPOCH: u32 = 1; }\npub const UPDATE_PROTOCOL: u32 = 1;\n",
+          "accepted": false,
+          "error": "source"
+        },
+        {
+          "id": "rust-raw-string-fake-declaration",
+          "kind": "source",
+          "source": "const TEXT: &str = r#\"pub const DATA_EPOCH: u32 = 99;\"#;\npub const UPDATE_PROTOCOL: u32 = 1;\npub const DATA_EPOCH: u32 = 1;\n",
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "rust-stacked-attributes",
+          "kind": "source",
+          "source": "#[allow(dead_code)]\n#[cfg(any())]\npub const DATA_EPOCH: u32 = 1;\npub const UPDATE_PROTOCOL: u32 = 1;\n",
+          "accepted": false,
+          "error": "source"
         }
       ]
     }

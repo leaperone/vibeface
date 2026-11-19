@@ -110,23 +110,55 @@ def run_runtime_corpus(runtime=None):
     for item in runtime['cases']['source']: run(item, lambda item=item: check_rust_contracts(item['source'], runtime))
     return outcomes
 
-def strip_rust_comments(source):
-    return re.sub(r'/\*[\s\S]*?\*/', '', re.sub(r'//[^\r\n]*', '', source))
+def sanitize_rust(source):
+    output = list(source)
+    def blank(index):
+        if output[index] not in '\r\n': output[index] = ' '
+    i = 0
+    while i < len(source):
+        if source.startswith('//', i):
+            blank(i); blank(i + 1); i += 2
+            while i < len(source) and source[i] != '\n': blank(i); i += 1
+            continue
+        if source.startswith('/*', i):
+            depth = 1; blank(i); blank(i + 1); i += 2
+            while i < len(source) and depth:
+                if source.startswith('/*', i): depth += 1; blank(i); blank(i + 1); i += 2
+                elif source.startswith('*/', i): depth -= 1; blank(i); blank(i + 1); i += 2
+                else: blank(i); i += 1
+            continue
+        raw = re.match(r'(?:b)?r(#+)"', source[i:])
+        if raw:
+            close = '"' + raw.group(1); end = source.find(close, i + len(raw.group(0)))
+            stop = len(source) if end < 0 else end + len(close)
+            while i < stop: blank(i); i += 1
+            continue
+        if source[i] in ('"', "'"):
+            quote = source[i]; blank(i); i += 1; escaped = False
+            while i < len(source):
+                char = source[i]; blank(i); i += 1
+                if not escaped and char == quote: break
+                escaped = (not escaped and char == '\\')
+                if char != '\\': escaped = False
+            continue
+        i += 1
+    return ''.join(output)
+
+def rust_brace_depth(source, end):
+    return source[:end].count('{') - source[:end].count('}')
+
+def rust_has_attached_attribute(source, index):
+    for line in reversed(source[:index].split('\n')[:-1]):
+        trimmed = line.strip()
+        if trimmed.startswith('#'): return True
+        if trimmed and re.search(r'[;}]\s*$', trimmed): break
+    return False
 
 def check_rust_contracts(source, runtime):
-    active = strip_rust_comments(source)
+    active = sanitize_rust(source)
     for field, key in (('UPDATE_PROTOCOL', 'update_protocol'), ('DATA_EPOCH', 'data_epoch')):
-        matches = []
-        for match in re.finditer(rf'^\s*pub\s+const\s+{field}\s*:\s*u32\s*=\s*([0-9]+)\s*;', active, re.MULTILINE):
-            previous = reversed(active[:match.start()].split('\n')[:-1])
-            decorated = False
-            for line in previous:
-                trimmed = line.strip()
-                if re.match(r'^#', trimmed):
-                    decorated = True
-                    break
-                if trimmed and re.search(r'[;}]\s*$', trimmed): break
-            if not decorated: matches.append(match)
+        matches = [match for match in re.finditer(rf'\bpub\s+const\s+{field}\s*:\s*u32\s*=\s*([0-9]+)\s*;', active)
+                   if rust_brace_depth(active, match.start()) == 0 and not rust_has_attached_attribute(active, match.start())]
         if len(matches) != 1 or int(matches[0].group(1)) != runtime['contracts'][key]: raise ContractError('source')
     return True
 
