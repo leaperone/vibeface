@@ -161,10 +161,16 @@ with socket.create_connection(('127.0.0.1', int(os.environ['CLIENT_FIXTURE_PORT'
         let server =
             WebSocketStream::from_raw_socket(MaybeTlsStream::Plain(server), Role::Server, None)
                 .await;
+        let transport = if cookie.is_some() {
+            SessionTransport::Local
+        } else {
+            SessionTransport::WebSocket
+        };
         let serving = tokio::spawn(serve_session_with_heartbeat(
             self.node.clone(),
             ClientSocket::Client(Box::new(server)),
             cookie,
+            transport,
             Duration::from_millis(100),
         ));
         let mut client = FrameClient::from_socket(
@@ -1059,6 +1065,7 @@ async fn a_completed_display_result_is_rechecked_even_before_membership_watch_is
     let mut fixture = Fixture::new().await?;
     let mut session = Snapshot {
         device_id: fixture.admin.device_id()?,
+        transport: None,
         cookie: None,
         operator: false,
     }
@@ -1117,6 +1124,7 @@ async fn a_completed_invite_does_not_release_its_result_after_the_manager_is_rev
     let mut fixture = Fixture::new().await?;
     let mut session = Snapshot {
         device_id: fixture.admin.device_id()?,
+        transport: None,
         cookie: None,
         operator: false,
     }
@@ -1183,6 +1191,7 @@ async fn rejected_names_keep_order_and_consume_ids_even_when_overloaded() -> Res
     let fixture = Fixture::new().await?;
     let mut session = Snapshot {
         device_id: fixture.admin.device_id()?,
+        transport: None,
         cookie: None,
         operator: false,
     }
@@ -1366,6 +1375,7 @@ async fn business_rejections_keep_agent_writer_and_scope_error_positions() -> Re
     );
     let mut stranger = Snapshot {
         device_id: LocalIdentity::generate().device_id()?,
+        transport: None,
         cookie: None,
         operator: false,
     }
@@ -1383,6 +1393,7 @@ async fn business_rejections_keep_agent_writer_and_scope_error_positions() -> Re
     );
     let mut session = Snapshot {
         device_id: fixture.admin.device_id()?,
+        transport: None,
         cookie: None,
         operator: false,
     }

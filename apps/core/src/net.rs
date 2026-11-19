@@ -118,6 +118,31 @@ pub enum PathKind {
     Relay,
 }
 
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum SelectedPath {
+    Direct,
+    Relay { url: String },
+}
+
+/// Snapshots the path currently selected for application data on this connection.
+pub(crate) fn selected_path(connection: &Connection) -> Option<SelectedPath> {
+    if connection.close_reason().is_some() {
+        return None;
+    }
+    let paths = connection.paths();
+    match paths.iter().find(|path| path.is_selected())?.remote_addr() {
+        TransportAddr::Ip(_) => Some(SelectedPath::Direct),
+        TransportAddr::Relay(url) if matches!(url.scheme(), "http" | "https") => {
+            // Iroh uses its fixed relay route at this origin. Do not publish URL credentials.
+            Some(SelectedPath::Relay {
+                url: url.origin().ascii_serialization(),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// A relay token file holds 64 hex characters.
 pub fn read_token_file(path: &std::path::Path) -> Result<String> {
     let token = std::fs::read_to_string(path).context("the relay token file is unreadable")?;
@@ -683,21 +708,12 @@ impl Net {
         let connections = self.connections.lock().expect("connection cache");
         connections
             .iter()
-            .filter(|((peer, _), connection)| *peer == id && connection.close_reason().is_none())
+            .filter(|((peer, _), _)| *peer == id)
             .find_map(|(_, connection)| {
-                connection
-                    .paths()
-                    .iter()
-                    .find(|path| path.is_selected())
-                    .and_then(|path| {
-                        if path.is_ip() {
-                            Some(PathKind::Direct)
-                        } else if path.is_relay() {
-                            Some(PathKind::Relay)
-                        } else {
-                            None
-                        }
-                    })
+                selected_path(connection).map(|path| match path {
+                    SelectedPath::Direct => PathKind::Direct,
+                    SelectedPath::Relay { .. } => PathKind::Relay,
+                })
             })
     }
 
@@ -721,6 +737,21 @@ impl Net {
         timeout: Duration,
         after_send: fn(anyhow::Error) -> anyhow::Error,
     ) -> Result<Value> {
+        let (answer, _) = self
+            .request_with_connection(device_id, alpn, request, timeout, after_send)
+            .await?;
+        Ok(answer)
+    }
+
+    /// Returns the connection used by this request together with the response.
+    pub(crate) async fn request_with_connection(
+        &self,
+        device_id: &str,
+        alpn: &'static [u8],
+        request: &Value,
+        timeout: Duration,
+        after_send: fn(anyhow::Error) -> anyhow::Error,
+    ) -> Result<(Value, Connection)> {
         let connection = self.connect(device_id, alpn).await?;
         let mut sending = false;
         let result = tokio::time::timeout(
@@ -741,11 +772,12 @@ impl Net {
                 connections.remove(&(id, alpn));
             }
         }
-        if sending {
-            result.map_err(after_send)
+        let answer = if sending {
+            result.map_err(after_send)?
         } else {
-            result
-        }
+            result?
+        };
+        Ok((answer, connection))
     }
 
     pub async fn close(&self) {

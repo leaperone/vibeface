@@ -6,6 +6,7 @@ import { Appearance, Platform, ScrollView, useWindowDimensions, View, type Scrol
 import { Uniwind, useUniwind } from 'uniwind'
 import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
 import { addOnManager, eraseSoleManagerText, exitCopy, onlyManagerText, recoveryCopy, securityCopy, soleManager, waitingCopy } from '@vibeface/client/identity/copy.ts'
+import { nodeStatusLabels, type NodeDiagnostics } from '@vibeface/client/workspace/node-diagnostics.ts'
 import { ChatStorage } from '@/features/settings/chat-storage'
 import { NotificationSettings } from '@/features/settings/notifications'
 import { ErrorText } from '@/components/action'
@@ -19,6 +20,7 @@ import { useWorkspace } from '@/data/context'
 import type { Member } from '@/data/types'
 import { deviceIcon } from '@/features/devices/device-icon'
 import { JoinRequests } from '@/features/devices/join-requests'
+import { useNodeScreen } from '@/features/devices/node-connection'
 import { self } from '@/platform'
 import { factoryReset } from '@/lib/factory-reset'
 import { useRun } from '@/lib/use-run'
@@ -38,6 +40,8 @@ export default function Settings() {
   const sole = soleManager(device.directory?.members ?? [], device.identity?.deviceId)
   const otherClient = device.directory?.members.some((member) => member.kind === 'client' && member.device_id !== device.identity?.deviceId)
   const manager = device.ready?.principal.can_manage === true
+  const nodeScreen = useNodeScreen(workspace.members.some(member => member.kind === 'node'))
+  const orderedMembers = [...workspace.members].sort((a, b) => Number(b.entry) - Number(a.entry) || Number(b.kind === 'node') - Number(a.kind === 'node'))
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(() => {}) }, [device.ready])
   const open = (which: 'leave' | 'reset') => { void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning); reveal.current = true; setConfirming(which) }
   const reset = () => factoryReset(device)
@@ -47,7 +51,7 @@ export default function Settings() {
     <OfflineBar />
     <JoinRequests />
     {workspace.members.length || manager ? <View onLayout={(event) => { devicesAt.current = event.nativeEvent.layout.y }}><SettingsGroup title="我的设备">
-      {workspace.members.map((member) => <MemberRow key={member.device_id} member={member} />)}
+      {orderedMembers.map((member) => <MemberRow key={member.device_id} member={member} diagnostics={member.kind === 'node' ? nodeScreen.describe(member) : undefined} />)}
       {manager ? <SettingsRow href="/add-device" icon={Plus} label="添加设备" />
         : device.ready ? <SettingsRow disabled icon={Crown} label={addOnManager(workspace.members.filter((member) => member.admin).map((member) => member.name))} /> : null}
     </SettingsGroup></View> : null}
@@ -138,7 +142,7 @@ function SecurityStatus({ toDevices }: { toDevices(): void }) {
   </SettingsGroup>
 }
 
-function MemberRow({ member }: { member: Member }) {
+function MemberRow({ member, diagnostics }: { member: Member; diagnostics?: NodeDiagnostics }) {
   // iOS sits inline views on the line box, not the glyph baseline, so they sink as the line height grows with Dynamic Type.
   // Measured: 1.5pt at the default size, about 11.5pt at the 2x cap. Android centres it on the line, about 1dp high at every size.
   const fontScale = useWindowDimensions().fontScale
@@ -147,7 +151,8 @@ function MemberRow({ member }: { member: Member }) {
   // The name wraps in full so the inline marks are never cut off with it. As in the web's device list, the bot mark leads to the computer whose detail holds Bot 与任务.
   return <SettingsRow href={`/device/${member.device_id}`} icon={deviceIcon(member)}
     label={<>{member.name}{member.admin ? mark(Crown, '管理设备') : null}{member.kind === 'node' && member.bot ? mark(Bot, '能运行 Bot') : null}</>}
-    description={[member.kind === 'node' ? '节点' : '客户端', member.current ? self : member.entry ? '当前连接' : null].filter(Boolean).join(' · ')}>
-    {member.online !== undefined ? <Online online={member.online} /> : null}
+    description={[member.kind === 'node' ? '节点' : '客户端', member.current ? self : member.entry ? '当前连接' : null,
+      diagnostics && nodeStatusLabels[diagnostics.status], diagnostics?.pathLabel].filter(Boolean).join(' · ')}>
+    {!diagnostics && member.online !== undefined ? <Online online={member.online} /> : null}
   </SettingsRow>
 }

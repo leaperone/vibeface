@@ -176,7 +176,7 @@ test("creation fields use the server UTF-8 byte limits and reject whitespace", (
 test("workspace preserves bot and message requests while routing native decisions to their exact work", async (t) => {
   const drainOutbox = async () => { await new Promise(resolve => setTimeout(resolve, 50)) }
   const settleComponent = drainOutbox
-  const hooks = hookHarness(), { react, values, effects, afterRender } = hooks
+  const hooks = hookHarness(), { react, afterRender } = hooks
   const stored = new Map<string, string>()
   const browser = {
     location: { href: "https://node.example/app?conversation=chat" },
@@ -337,8 +337,7 @@ test("workspace preserves bot and message requests while routing native decision
     return state
   }
   const reload = async () => {
-    for (const effect of effects.values()) effect.cleanup?.()
-    effects.clear(); values.length = 0; afterRender.length = 0
+    hooks.remount()
     render(); render().setView("chat"); render()
     // The outbox read that unlocks writing is asynchronous; the next render starts the first refresh.
     await drainOutbox(); render()
@@ -354,6 +353,30 @@ test("workspace preserves bot and message requests while routing native decision
     await state.refresh()
     state = render()
     assert.equal(state.selectedBot?.bot_id, "bot")
+    await t.test("manual node checks wait for a polling read and then run one live probe", async () => {
+      const rpc = connection.rpc
+      const polling = deferred()
+      const paramsSeen: unknown[] = []
+      connection.rpc = (method, params) => {
+        if (method !== "nodes") return rpc(method, params)
+        paramsSeen.push(params)
+        return paramsSeen.length === 1 ? polling.promise : Promise.resolve({ nodes: [] })
+      }
+      try {
+        const first = state.refreshNodes()
+        const manual = state.refreshNodes(true)
+        const repeated = state.refreshNodes(true)
+        assert.deepEqual(paramsSeen, [undefined])
+        polling.resolve({ nodes: [] })
+        await Promise.all([first, manual, repeated])
+        assert.equal(paramsSeen.length, 2)
+        assert.equal(workspaceModel.record(paramsSeen[1]).check_connections, true)
+      } finally {
+        connection.rpc = rpc
+        polling.resolve({ nodes: [] })
+        await state.refreshNodes()
+      }
+    })
     await t.test('malformed signed Unknown inputs survive reload and recovery attempts without rewriting or resubmission', async () => {
       const originalOutbox = platform.outbox
       const mutations: string[] = []
@@ -1898,7 +1921,7 @@ test("workspace preserves bot and message requests while routing native decision
       } finally { outboxItems.clear(); for (const [key, item] of snapshot) outboxItems.set(key, item); await reload(); await render().refresh() }
     })
   } finally {
-    for (const effect of effects.values()) effect.cleanup?.()
+    hooks.remount()
   }
 })
 

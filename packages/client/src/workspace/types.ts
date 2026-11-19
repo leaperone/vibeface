@@ -102,8 +102,16 @@ export type NodeInfo = {
   local: boolean
   online: boolean
   revoked: boolean
-  capabilities?: { manager: string | null; manager_state: BotReadiness | null; manager_readiness?: ProviderReadiness | null; relay: boolean; roots: string[]; codex_connected?: boolean }
+  capabilities?: { manager: string | null; manager_state: BotReadiness | null; manager_readiness?: ProviderReadiness | null; relay: boolean; roots: string[]; codex_connected?: boolean; version?: string; os?: string; arch?: string }
+  observation?: NodeObservation
 }
+export type SelectedNodePath = { kind: "direct" } | { kind: "relay"; url: string }
+export type NodeObservation = { checkedAt: number | null; lastSyncedAt: number | null; path: SelectedNodePath | null }
+export type NodeSessionPath = { checkedAt: number } & (
+  { kind: "local" } | { kind: "websocket" } | { kind: "quic"; upstreamDeviceId: string; returnPath: SelectedNodePath | null }
+)
+export type NodeReport = { nodes: NodeInfo[]; sessionPath: NodeSessionPath | null }
+export type NodeReportSnapshot = NodeReport & { receivedAt: number }
 /** `unverified` remains runnable while authentication or model availability has no evidence. */
 export type BotReadiness = "ready" | "starting" | "needs_setup" | "unverified"
 export type ConversationSummary = { conversation_id: string; title: string; owner: string | null; owner_epoch: number }

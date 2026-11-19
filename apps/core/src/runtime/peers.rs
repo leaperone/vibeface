@@ -643,9 +643,22 @@ impl Runtime {
         &self,
         network: &str,
         target: &str,
-        mut payload: Value,
+        payload: Value,
         after_send: fn(anyhow::Error) -> anyhow::Error,
     ) -> Result<Value> {
+        let (answer, _) = self
+            .peer_request_with_connection(network, target, payload, after_send)
+            .await?;
+        Ok(answer)
+    }
+
+    pub(super) async fn peer_request_with_connection(
+        &self,
+        network: &str,
+        target: &str,
+        mut payload: Value,
+        after_send: fn(anyhow::Error) -> anyhow::Error,
+    ) -> Result<(Value, Connection)> {
         let local = self.identity.device_id()?;
         ensure!(
             target != local,
@@ -666,7 +679,7 @@ impl Runtime {
         }
         payload["network_id"] = json!(network);
         self.net()?
-            .request_with_send_boundary(target, net::RPC, &payload, PEER_TIMEOUT, after_send)
+            .request_with_connection(target, net::RPC, &payload, PEER_TIMEOUT, after_send)
             .await
     }
 
@@ -1330,8 +1343,15 @@ impl Runtime {
 
     /// Whether the last sync with `peer` failed.
     pub(crate) fn sync_failing(&self, peer: &str) -> bool {
+        self.peer_sync_status(peer).0
+    }
+
+    /// Whether the last attempt failed and when the last successful sync finished.
+    pub(super) fn peer_sync_status(&self, peer: &str) -> (bool, Option<i64>) {
         let states = self.sync_peers.lock().expect("sync peers");
-        states.get(peer).is_some_and(|state| state.failures > 0)
+        states
+            .get(peer)
+            .map_or((false, None), |state| (state.failures > 0, state.synced_ms))
     }
 
     /// Writable once every other current member Node has confirmed this device's log since
@@ -2472,7 +2492,6 @@ pub(super) fn staging_room(dir: &Path, size: u64) -> Result<()> {
     );
     Ok(())
 }
-
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]

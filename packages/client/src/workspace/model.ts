@@ -1,6 +1,7 @@
 import { base64ToBytes } from "../lib/byte-codec.ts"
 import type { Attachment, MessageRequest, PendingMessage, TranscriptMessage } from "../chat/types.ts"
 import { array, boolean, isRecord, isSafeInteger, isText, parseProviderReadiness } from "../lib/node.ts"
+import { validTarget } from "../lib/transport.ts"
 import { isJobState, providerStages, steerOutcomes, type ProviderStage, type TurnRuntime } from "./types.ts"
 import type { ReplyStatus } from "../chat/types.ts"
 import type {
@@ -10,6 +11,7 @@ import type {
   WorkPhase, WorkDetail, OverviewBot, OverviewNode, OverviewConsistency, OverviewTaskState, OverviewTask, OverviewQuestion, OverviewJob, OverviewCoverage, WorkspaceOverview, OverviewDeliveryState, OverviewRelation, OverviewConversation, OverviewSession,
   AgentLane, QueueHoldReason, ContextProjection, ManagerJob, ScopeJob, SentCoverage, MemoryConflict,
   InputTarget, InputIntent, InputReceipt, InputNotSaved, InputControlAction, QueuedInput, ScopeContext, SessionScope, WorkspaceChannel, WorkspaceTask, WorkspaceAssignment, WorkspaceCommand, WorkspaceCommandResult, WorkspaceCommandNotSaved, WorkspaceDomainState, WorkspaceHistory, WorkspaceHistoryBody, WorkspaceInputBody, WorkspaceSpeaker, MessageSearchScope, MessageSearchPage,
+  NodeObservation, NodeReport, NodeSessionPath, SelectedNodePath,
 } from "./types.ts"
 import { parseMemoryEntry, parseMemorySyncConflict, parseMemorySyncConflicts } from "./memory.ts"
 import { answerId, questionOpen } from "./questions.ts"
@@ -47,13 +49,70 @@ export function parseNodes(value: unknown): NodeInfo[] {
   return list(record(value).nodes).map((item) => {
     const data = record(item)
     const capabilities = data.capabilities == null ? null : record(data.capabilities)
+    const observation = parseNodeObservation(data.observation)
     return {
       device_id: text(data.device_id),
       name: typeof data.name === "string" ? data.name : "",
       local: flag(data.local), online: flag(data.online), revoked: flag(data.revoked),
-      capabilities: capabilities ? { manager: capabilities.manager == null ? null : text(capabilities.manager), manager_state: capabilities.manager == null ? null : readiness(capabilities.manager_state), manager_readiness: capabilities.manager_readiness == null ? null : parseProviderReadiness(capabilities.manager_readiness), relay: capabilities.relay === true, roots: texts(capabilities.roots), codex_connected: capabilities.codex != null && record(capabilities.codex).connected === true } : undefined,
+      capabilities: capabilities ? {
+        manager: capabilities.manager == null ? null : text(capabilities.manager),
+        manager_state: capabilities.manager == null ? null : readiness(capabilities.manager_state),
+        manager_readiness: capabilities.manager_readiness == null ? null : parseProviderReadiness(capabilities.manager_readiness),
+        relay: capabilities.relay === true, roots: texts(capabilities.roots),
+        codex_connected: capabilities.codex != null && record(capabilities.codex).connected === true,
+        version: diagnosticText(capabilities.version), os: diagnosticText(capabilities.os), arch: diagnosticText(capabilities.arch),
+      } : undefined,
+      ...(observation ? { observation } : {}),
     }
   })
+}
+
+function diagnosticText(value: unknown): string | undefined {
+  return typeof value === "string" && value.length <= 128 ? value.trim() || undefined : undefined
+}
+
+function diagnosticTime(value: unknown): number | null {
+  return isSafeInteger(value) && value > 0 && value <= 8_640_000_000_000_000 ? value : null
+}
+
+function parseSelectedPath(value: unknown): SelectedNodePath | null {
+  if (!isRecord(value)) return null
+  if (value.kind === "direct") return { kind: "direct" }
+  if (value.kind !== "relay" || typeof value.url !== "string" || value.url.length > 2048) return null
+  try {
+    const url = new URL(value.url)
+    if ((url.protocol === "https:" || url.protocol === "http:") && !url.username && !url.password && !url.search && !url.hash) {
+      return { kind: "relay", url: url.origin }
+    }
+  } catch { /* Unknown paths leave the node status readable. */ }
+  return null
+}
+
+function parseNodeObservation(value: unknown): NodeObservation | null {
+  if (!isRecord(value)) return null
+  const checkedAt = diagnosticTime(value.checked_at_ms)
+  if (checkedAt === null && value.checked_at_ms !== null) return null
+  return {
+    checkedAt,
+    lastSyncedAt: diagnosticTime(value.last_synced_at_ms),
+    path: checkedAt === null ? null : parseSelectedPath(value.path),
+  }
+}
+
+function parseNodeSessionPath(value: unknown): NodeSessionPath | null {
+  if (!isRecord(value)) return null
+  const checkedAt = diagnosticTime(value.checked_at_ms)
+  if (checkedAt === null) return null
+  if (value.kind === "local" || value.kind === "websocket") return { kind: value.kind, checkedAt }
+  if (value.kind !== "quic") return null
+  try {
+    return { kind: "quic", checkedAt, upstreamDeviceId: validTarget(value.upstream_device_id), returnPath: parseSelectedPath(value.return_path) }
+  } catch { return null }
+}
+
+export function parseNodeReport(value: unknown): NodeReport {
+  const data = record(value)
+  return { nodes: parseNodes(data), sessionPath: parseNodeSessionPath(data.session_path) }
 }
 function readiness(value: unknown): BotReadiness {
   if (value === "ready" || value === "starting" || value === "unverified" || value === "needs_setup") return value

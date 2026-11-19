@@ -14,6 +14,7 @@ import { Switch } from '@/components/arc/switch'
 import { Text } from '@/components/arc/text'
 import { useWorkspace } from '@/data/context'
 import { deviceIcon } from '@/features/devices/device-icon'
+import { NodeConnection, NodeStatus, useNodeScreen } from '@/features/devices/node-connection'
 import { self } from '@/platform'
 import { useRun } from '@/lib/use-run'
 
@@ -25,10 +26,12 @@ export default function DeviceDetail() {
   const device = useDevice()
   const { members } = useWorkspace()
   const member = members.find((item) => item.device_id === deviceId)
+  const nodeScreen = useNodeScreen(member?.kind === 'node')
   const { busy, error, run, clear } = useRun()
   const switching = useRun()
   const [removing, setRemoving] = useState(false)
   if (!member) return <EmptyState icon={MonitorSmartphone} title="找不到这个设备" className="flex-1 justify-center" />
+  const diagnostics = member.kind === 'node' ? nodeScreen.describe(member) : null
   const manageable = device.ready?.principal.can_manage === true && member.kind === 'client' && !member.current
   const removable = device.ready?.principal.can_manage === true && !member.admin && !member.current && !member.entry
   const entryName = members.find((item) => item.entry)?.name
@@ -41,14 +44,16 @@ export default function DeviceDetail() {
         <DeviceTitle deviceId={member.device_id} name={member.name} editable={device.ready?.principal.can_manage === true} />
         <View className="flex-row flex-wrap items-center gap-2">
           <View className={tag}><Text className="text-sm text-muted">{member.kind === 'node' ? '节点' : '客户端'}</Text></View>
-          {member.online !== undefined ? <Online online={member.online} /> : null}
+          {diagnostics ? <NodeStatus status={diagnostics.status} /> : member.online !== undefined ? <Online online={member.online} /> : null}
           {member.current || member.entry ? <View className={tag}><Text className="text-sm text-muted">{member.current ? self : '当前连接'}</Text></View> : null}
           {member.current && entryName ? <View className={tag} accessibilityLabel={`连在「${entryName}」上`}><Icon as={Laptop} className="size-3.5 text-muted" /><Text className="text-sm text-muted">{entryName}</Text></View> : null}
           {member.admin ? <View className={tag}><Icon as={Crown} className="size-3.5 text-muted" /><Text className="text-sm text-muted">管理</Text></View> : null}
         </View>
-        {member.online === false ? <Text className="text-sm text-muted">{deviceCopy.offline}</Text> : null}
+        {member.kind === 'client' && member.online === false ? <Text className="text-sm text-muted">{deviceCopy.offline}</Text> : null}
       </View>
     </View>
+    {diagnostics ? <NodeConnection member={member} diagnostics={diagnostics} checks={nodeScreen.checks} connected={nodeScreen.connected}
+      reconnect={device.link.kind === 'offline' ? device.retryNow : undefined} /> : null}
     {/* The AI page sets up the computer this phone connects through; any other computer shows how its bot stands, as on the web. */}
     {member.kind === 'node' ? <SettingsGroup>
       {member.entry && device.ready?.principal.can_manage ? <SettingsRow href="/ai" icon={Sparkles} label="Bot 与任务" />
@@ -71,10 +76,10 @@ export default function DeviceDetail() {
         {error && busy === null && !removing ? <View className="basis-full ps-11"><ErrorText error={error} /></View> : null}
       </SettingsRow>
     </SettingsGroup> : null}
-    <Details>
+    {member.kind === 'client' ? <Details>
       <Text className="text-sm text-muted">设备编号</Text>
       <CopyableId value={member.device_id} label="设备编号" />
-    </Details>
+    </Details> : null}
     {removable ? <SettingsGroup>
       <SettingsRow icon={Trash2} tone="danger" label="移除设备" onPress={removing ? undefined : () => { clear(); setRemoving(true) }}>
         {removing ? <View className="basis-full gap-3 ps-11">

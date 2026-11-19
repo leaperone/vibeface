@@ -244,8 +244,33 @@ enum Connect {
     Connect { target: String },
 }
 
+#[derive(Clone)]
+enum SessionTransport {
+    Local,
+    WebSocket,
+    Quic(Connection),
+}
+
+impl SessionTransport {
+    fn sample_path(&self) -> Value {
+        let checked_at_ms = crate::clock::now_ms();
+        match self {
+            Self::Local => json!({"kind":"local","checked_at_ms":checked_at_ms}),
+            Self::WebSocket => json!({"kind":"websocket","checked_at_ms":checked_at_ms}),
+            Self::Quic(connection) => json!({
+                "kind":"quic",
+                "checked_at_ms":checked_at_ms,
+                "upstream_device_id":net::device_id(&connection.remote_id()),
+                // Iroh selects this endpoint's transmit path. The forwarder's selection can differ.
+                "return_path":net::selected_path(connection),
+            }),
+        }
+    }
+}
+
 struct Session {
     device_id: String,
+    transport: Option<SessionTransport>,
     /// Present only on `/api/local/ws`; it lets a non-member browser use this Node.
     cookie: Option<String>,
     /// Set by `subscribe` to the management permission the device had then.
@@ -368,7 +393,7 @@ pub async fn serve_gateway(node: Arc<Runtime>, mut socket: ClientSocket) -> Resu
     let Connect::Connect { target } =
         serde_json::from_str(&text).context("invalid connect frame")?;
     if target == node.identity.device_id()? {
-        return serve_session(node, socket, None).await;
+        return serve_session(node, socket, None, SessionTransport::WebSocket).await;
     }
     // A public node forwards to any device it can reach; other Nodes only to their own
     // network's Nodes, checked before the session would wait in line.
@@ -551,8 +576,10 @@ impl Pace {
 pub async fn serve_forwarded(node: Arc<Runtime>, connection: Connection) -> Result<()> {
     while let Ok((send, recv)) = connection.accept_bi().await {
         let node = node.clone();
+        let transport = SessionTransport::Quic(connection.clone());
         tokio::spawn(async move {
-            if let Err(error) = serve_session(node, ClientSocket::forwarded(send, recv), None).await
+            if let Err(error) =
+                serve_session(node, ClientSocket::forwarded(send, recv), None, transport).await
             {
                 tracing::debug!(%error, "forwarded client session closed");
             }
@@ -588,6 +615,7 @@ pub async fn serve_join(node: Arc<Runtime>, connection: Connection, remote: Stri
             let command = decode_join_request(request)?;
             let mut session = Session {
                 device_id: remote,
+                transport: None,
                 cookie: None,
                 subscribed: None,
                 observation: None,
@@ -602,21 +630,23 @@ pub async fn serve_join(node: Arc<Runtime>, connection: Connection, remote: Stri
 }
 
 pub async fn serve_local(node: Arc<Runtime>, socket: ClientSocket, cookie: String) -> Result<()> {
-    serve_session(node, socket, Some(cookie)).await
+    serve_session(node, socket, Some(cookie), SessionTransport::Local).await
 }
 
 async fn serve_session(
     node: Arc<Runtime>,
     socket: ClientSocket,
     cookie: Option<String>,
+    transport: SessionTransport,
 ) -> Result<()> {
-    serve_session_with_heartbeat(node, socket, cookie, HEARTBEAT).await
+    serve_session_with_heartbeat(node, socket, cookie, transport, HEARTBEAT).await
 }
 
 async fn serve_session_with_heartbeat(
     node: Arc<Runtime>,
     mut socket: ClientSocket,
     cookie: Option<String>,
+    transport: SessionTransport,
     heartbeat_period: Duration,
 ) -> Result<()> {
     let mut local_changes = node.local_access.subscribe();
@@ -638,6 +668,7 @@ async fn serve_session_with_heartbeat(
     .context("client handshake timed out")??;
     let mut session = Session {
         device_id,
+        transport: Some(transport),
         cookie,
         subscribed: None,
         observation: None,
@@ -1034,6 +1065,7 @@ async fn dispatch_inner(
             };
             let mut params = params;
             bind_client_identity(&mut params, &principal.device_id)?;
+            let include_session_path = matches!(&params, Ok(BusinessCommand::Nodes(_)));
             let watched_scope = matches!(&params, Ok(BusinessCommand::Conversation(_)))
                 .then(|| {
                     command::business_params(&params).value()["conversation_id"]
@@ -1046,6 +1078,12 @@ async fn dispatch_inner(
                 scope: crate::runtime::UserScope::Network,
             };
             let mut result = node.rpc(access.clone(), params).await?;
+            if include_session_path {
+                result["session_path"] = session
+                    .transport
+                    .as_ref()
+                    .map_or(Value::Null, SessionTransport::sample_path);
+            }
             if let Some(scope) = watched_scope {
                 // The old lease goes only after the new one holds, so a stream keeps its cursor.
                 let _previous = session.observation.take();
@@ -1760,6 +1798,7 @@ pub(crate) async fn operator_wire_call(
 async fn operator_call(node: &Arc<Runtime>, input: ClientInput) -> Result<Value> {
     let mut session = Session {
         device_id: node.identity.device_id()?,
+        transport: None,
         cookie: None,
         subscribed: None,
         observation: None,
@@ -2620,6 +2659,7 @@ mod tests {
     fn test_session(device_id: String) -> Session {
         Session {
             device_id,
+            transport: None,
             cookie: None,
             subscribed: None,
             observation: None,
@@ -2663,6 +2703,7 @@ mod tests {
                 node,
                 ClientSocket::Client(Box::new(server)),
                 None,
+                SessionTransport::WebSocket,
             ));
             Ok((
                 FrameClient::from_socket(ClientSocket::Client(Box::new(client)), admin, &target)
@@ -4746,6 +4787,9 @@ mod tests {
             assert_eq!(second_local.call("authenticate", json!({})).await?["principal"]["source"], "local_session");
             let mut local = connect_local(&launcher.origin, &launcher.node_id, &shared_cookies, &browser).await?;
             let auth = local.call("authenticate", json!({})).await?;
+            let nodes = local.call("rpc", json!({"method":"nodes"})).await?;
+            assert_eq!(nodes["session_path"]["kind"], "local");
+            assert!(nodes["session_path"]["checked_at_ms"].is_i64());
             assert_eq!(auth["principal"]["source"], "local_session");
             assert_eq!(auth["principal"]["can_manage"], false);
             assert!(!auth["view"]["members"].as_array().context("members missing")?.iter().any(|member| member["device_id"] == browser.device_id().unwrap()));
@@ -5521,6 +5565,94 @@ mod tests {
         drop(node);
         std::fs::remove_dir_all(&dir)?;
         result.with_context(|| format!("identity gateway scenario failed; gateway_finished_before_cleanup={server_finished}"))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn node_list_reports_the_authenticated_sessions_inbound_path() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("vibeface-route-{}", uuid::Uuid::new_v4()));
+        let gateway_id = LocalIdentity::generate();
+        let target_id = LocalIdentity::generate();
+        let gateway_device = gateway_id.device_id()?;
+        let target_device = target_id.device_id()?;
+        let membership = gateway_id
+            .sign_network_fixture(1, vec![gateway_device.clone(), target_device.clone()])?;
+        let admin = gateway_id.fixture_admin();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let local = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let mut config = crate::config::Config::local(listener.local_addr()?, vec![], false);
+        config.local_listen = local.local_addr()?;
+        config.network.bind = Some("127.0.0.1:0".parse()?);
+        config.providers.codex_app_server.socket = Some(dir.join("unavailable.sock"));
+        let open_node = |name: &str, identity: &LocalIdentity| {
+            let data_dir = dir.join(name);
+            initialize_node(&data_dir, &config, identity)?;
+            Ok::<_, anyhow::Error>(data_dir)
+        };
+        let gateway = Arc::new(Runtime::open(&open_node("gateway", &gateway_id)?).await?);
+        let target = Arc::new(Runtime::open(&open_node("target", &target_id)?).await?);
+        drop((listener, local));
+        let server = tokio::spawn(crate::api::serve(gateway.clone(), None));
+        let result: Result<()> = async {
+            for node in [&gateway, &target] {
+                node.install_membership(membership.clone()).await?;
+                node.start().await?;
+            }
+            gateway.net()?.learn(&target.net()?.addr()).await;
+            target.net()?.learn(&gateway.net()?.addr()).await;
+            let url = config.public_url.replace("http://", "ws://") + "/api/client";
+            let open = |device: String, identity: LocalIdentity| {
+                let url = url.clone();
+                async move {
+                    let (socket, _) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+                        loop {
+                            match tokio_tungstenite::connect_async(&url).await {
+                                Err(tokio_tungstenite::tungstenite::Error::Io(error))
+                                    if error.kind() == std::io::ErrorKind::ConnectionRefused =>
+                                {
+                                    tokio::time::sleep(Duration::from_millis(20)).await;
+                                }
+                                result => return result,
+                            }
+                        }
+                    })
+                    .await??;
+                    let mut socket = ClientSocket::Client(Box::new(socket));
+                    socket
+                        .send(Message::Text(
+                            json!({"type":"connect","target":device}).to_string().into(),
+                        ))
+                        .await?;
+                    FrameClient::from_socket(socket, &identity, &device).await
+                }
+            };
+
+            let read = json!({"method":"nodes"});
+            let mut direct = open(gateway_device.clone(), admin.clone()).await?;
+            let via_websocket = direct.call("rpc", read.clone()).await?;
+            assert_eq!(via_websocket["session_path"]["kind"], "websocket");
+            assert!(via_websocket["session_path"]["checked_at_ms"].is_i64());
+
+            let mut forwarded = open(target_device.clone(), admin).await?;
+            let via_gateway = forwarded.call("rpc", read.clone()).await?;
+            let observed = &via_gateway["session_path"];
+            assert_eq!(observed["kind"], "quic");
+            assert_eq!(observed["upstream_device_id"], gateway_device);
+            assert_eq!(observed["return_path"], json!({"kind":"direct"}));
+            assert!(observed["checked_at_ms"].is_i64());
+
+            let mut guest = open(target_device, LocalIdentity::generate()).await?;
+            assert!(guest.call("rpc", read).await.is_err());
+            Ok(())
+        }
+        .await;
+        server.abort();
+        let _ = server.await;
+        target.shutdown().await;
+        gateway.shutdown().await;
+        drop((target, gateway));
+        std::fs::remove_dir_all(dir)?;
+        result
     }
 
     #[tokio::test(flavor = "multi_thread")]

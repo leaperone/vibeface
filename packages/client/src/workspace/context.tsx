@@ -1,6 +1,6 @@
 import { decodeOutbox, verifyOutbox } from './outbox-codec.ts'
 import { writeBody, writeKeySuffix, ownerBody, type SignedOperation } from './write-request.ts'
-import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react"
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import type { ReadyConnection } from "../lib/node.ts"
 import { messageOf } from "../lib/node.ts"
 import { parseLogs, reportLog, type LogFilter } from "../lib/web-log.ts"
@@ -15,7 +15,7 @@ import { taskActive } from "./labels.ts"
 import { outcomeUnknown } from "../lib/errors.ts"
 import { byRank, unreadReply } from "../chat/timeline.ts"
 import {
-  inputText, parseConversation, parseNodes, parseNotifications,
+  inputText, parseConversation, parseNodeReport, parseNotifications,
   parseBot, parseBots, parseCreateBot, parsePrimary, parsePendingBot, record,
   parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseAnswer, parseOpenWorks, parseRecords, parseWorkspaceOverview, attachmentName, signedOrder, attachmentLimit,
   parseInputReceipt, parseInputNotSaved, parsePendingMessage, parseScopeContext, parseWorkDetail, parseWorkspaceCommand, parseWorkspaceCommandResult, parseWorkspaceCommandNotSaved, parseWorkspaceHistory, parseWorkspaceState,
@@ -32,7 +32,7 @@ import { answerId } from "./questions.ts"
 import { memoryController, memoryResultLabel, memorySaved } from "./memory.ts"
 import { networkKey, newId, storageOf } from "./storage.ts"
 import type {
-  HistorySection, AnswerResult, ConversationPayload, MemoryBase, MemoryControlResult, NodeInfo, NotificationRecord, PendingAnswer, Question,
+  HistorySection, AnswerResult, ConversationPayload, MemoryBase, MemoryControlResult, NodeInfo, NodeReportSnapshot, NotificationRecord, PendingAnswer, Question,
   PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, WriteState, WriteStatus, OpenWork, ScheduleAction, WorkspaceOverview,
   InputControlAction, InputOptions, InputReceipt, InputNotSaved, InputTarget, WorkDetailWork, WorkspaceCommand, WorkspaceCommandResult, WorkspaceCommandNotSaved, WorkspaceDomainState, WorkspaceFilter,
 } from "./types.ts"
@@ -52,6 +52,7 @@ type AttachmentFile = { name: string; arrayBuffer(): Promise<ArrayBuffer> }
 /** `label` is a full sentence for a lone button; `state` lets a settings row word it shorter. */
 type NotificationButton = { label: string; disabled: boolean; state: "off" | "on" | "unsupported" | "denied" }
 const soleTab: Tabs = { leader: () => true, post() {}, listen: () => () => {} }
+const emptyNodes: NodeInfo[] = []
 const faceSuperseded = "Bot 的长相刚在别处改过，之前没确认的那次修改没有再发送。"
 const inputMissingReason = '这条输入的送达结果仍未确认，原内容已保留。请连接原设备，再确认原设备并查询。'
 const responded = (caught: unknown) => caught instanceof Error && "responded" in caught && caught.responded === true
@@ -134,9 +135,10 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const [view, setView] = useState<WorkspaceView>("other")
   // Read synchronously: the chat route selects its conversation in the same commit that sets the view.
   const viewRef = useRef<WorkspaceView>("other")
-  const [nodes, setNodes] = useState<NodeInfo[]>([])
-  // A node snapshot is usable before conversation history finishes, including while writes align.
-  const nodesRead = useRef<{ connection: ReadyConnection; generation: number } | null>(null)
+  const [nodeState, setNodeState] = useState<{ connection: ReadyConnection; generation: number; report: NodeReportSnapshot } | null>(null)
+  const nodes = nodeState?.report.nodes ?? emptyNodes
+  const nodeReport = nodeState?.connection === connection && nodeState.generation === connectionGeneration ? nodeState.report : null
+  const nodeRequest = useRef<{ connection: ReadyConnection; generation: number; checkingConnections: boolean; read: Promise<void> } | null>(null)
   const nodesRef = useRef(nodes)
   nodesRef.current = nodes
   const [writeState, setWriteState] = useState<WriteStatus>({ state: "writable", conflicts: [] })
@@ -214,7 +216,26 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const refreshPromiseRef = useRef<Promise<void> | null>(null)
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const refreshRef = useRef<() => Promise<void>>(async () => {})
-  const current = () => alive.current && connection.isCurrent() && connection.generation === connectionGeneration && connection.principal.network_id === networkId && connection.principal.device_id === clientId && renderedConnection.current === connection && renderedGeneration.current === connectionGeneration
+  const current = useCallback(() => alive.current && connection.isCurrent() && connection.generation === connectionGeneration && connection.principal.network_id === networkId && connection.principal.device_id === clientId && renderedConnection.current === connection && renderedGeneration.current === connectionGeneration, [connection, connectionGeneration, networkId, clientId])
+  // Settings and workspace refreshes share one read for this connection. Never publish a prior connection's path.
+  const refreshNodes = useCallback(async (checkConnections = false) => {
+    if (!current()) throw new Error("连接换了。再查一次。")
+    const pending = nodeRequest.current
+    const previous = pending?.connection === connection && pending.generation === connectionGeneration ? pending : null
+    if (previous && (!checkConnections || previous.checkingConnections)) return previous.read
+    const read = (async () => {
+      if (previous) await previous.read.catch(() => {})
+      if (!current()) throw new Error("连接换了。再查一次。")
+      const raw = await connection.rpc("nodes", checkConnections ? { check_connections: true } : undefined)
+      if (!current()) throw new Error("连接换了。再查一次。")
+      const report = { ...parseNodeReport(raw), receivedAt: Date.now() }
+      setNodeState({ connection, generation: connectionGeneration, report })
+    })().finally(() => {
+      if (nodeRequest.current?.read === read) nodeRequest.current = null
+    })
+    nodeRequest.current = { connection, generation: connectionGeneration, checkingConnections: checkConnections, read }
+    return read
+  }, [connection, connectionGeneration, current])
   const readMethods = new Set(['message_search', 'conversation_history', 'conversation', 'bots', 'nodes', 'notifications', 'questions', 'open_works', 'write_status', 'workspace_state', 'workspace_history', 'work_detail', 'scope_context', 'read_artifact', 'logs', 'history', 'workspace_overview'])
   async function rpc(method: string, params?: Record<string, unknown>, sideEffectGuard?: () => void) {
     requireCurrent()
@@ -567,19 +588,18 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       const conversationRead = conversationCache && readingId ? readConversation(readingId) : null
       // The metadata read may take longer; retain the read error until this refresh awaits it.
       conversationRead?.catch(() => {})
-      const [rawNodes, rawNotifications, rawBots, rawWrite, rawQuestions, rawWorks, rawOverview] = await Promise.all([
-        rpc("nodes"), rpc("notifications"), rpc("bots"), connection.request("write_state"), rpc("questions"), rpc("open_works"),
+      const [, rawNotifications, rawBots, rawWrite, rawQuestions, rawWorks, rawOverview] = await Promise.all([
+        refreshNodes(), rpc("notifications"), rpc("bots"), connection.request("write_state"), rpc("questions"), rpc("open_works"),
         viewRef.current === "tasks" ? rpc("workspace_overview") : null,
       ])
       requireCurrent()
-      const nextNodes = parseNodes(rawNodes), parsedNotifications = parseNotifications(rawNotifications)
+      const parsedNotifications = parseNotifications(rawNotifications)
       const nextNotifications = platform.explicitMessageRead ? parsedNotifications : unreadSince(parsedNotifications, true)
       const nextBots = parseBots(rawBots), nextQuestions = parseQuestions(rawQuestions)
       openWorksRef.current = parseOpenWorks(rawWorks)
       if (rawOverview !== null) setOverview(parseWorkspaceOverview(rawOverview))
       botsRef.current = nextBots
-      nodesRead.current = { connection, generation: connectionGeneration }
-      setNodes(nextNodes); setNotifications(nextNotifications); setBots(nextBots); setPrimary(parsePrimary(rawBots)); setWriteState(parseWriteStatus(rawWrite)); setQuestions(nextQuestions); setOpenWorks(openWorksRef.current)
+      setNotifications(nextNotifications); setBots(nextBots); setPrimary(parsePrimary(rawBots)); setWriteState(parseWriteStatus(rawWrite)); setQuestions(nextQuestions); setOpenWorks(openWorksRef.current)
       if (botCreationRef.current && nextBots.some((item) => item.bot_id === botCreationRef.current?.bot_id)) clearPendingBot()
       notificationsRef.current = nextNotifications
       if (platform.explicitMessageRead && viewRef.current === 'chat' && platform.foreground()) {
@@ -804,12 +824,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const timer = setInterval(() => {
       ticks += 1
       if (ticks % 20 === 0) scheduleRefresh()
-      else if (openWorksRef.current.length || nodesRef.current.some((node) => !node.revoked && !node.online)) rpc("nodes").then((raw) => {
-        if (!current()) return
-        const nextNodes = parseNodes(raw)
-        nodesRead.current = { connection, generation: connectionGeneration }
-        setNodes(nextNodes)
-      }, () => {})
+      else if (openWorksRef.current.length || nodesRef.current.some((node) => !node.revoked && !node.online)) void refreshNodes().catch(() => {})
     }, 15000)
     const stopForeground = platform.onForeground(scheduleRefresh)
     return () => {
@@ -1448,7 +1463,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       viewRef.current = next; setView(next); clearMessages()
       if (next === "chat" || next === "tasks") scheduleRefresh()
       else { onScreen.current = null; setFresh(new Set<string>()) }
-    }, nodes, nodesRead: nodesRead.current?.connection === connection && nodesRead.current.generation === connectionGeneration, conversationId, data: visibleData, dataOrigin: visibleOrigin, conversationLoading, conversationError, refreshConversation, markMessagesRead, fresh, notifications, ignoredNotifications, questions, openWorks, overview, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
+    }, nodes, nodesRead: nodeReport !== null, nodeReport, refreshNodes, conversationId, data: visibleData, dataOrigin: visibleOrigin, conversationLoading, conversationError, refreshConversation, markMessagesRead, fresh, notifications, ignoredNotifications, questions, openWorks, overview, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
     historyLoading, loadHistory, cancelHistory, refreshing, incomplete, chatSlot, pendingMessages, messageBusy, canSaveMessages, liveProgress, interrupted,
     workspaceState, readWorkspaceState, readWorkspaceHistory, workspaceCommand, queryInput, confirmInputEntry, readScopeContext, readWork, stopInputTarget, retryPendingMessage, releaseMessagePending,
     controlInput: (input: { message_id: string; expected_event: string; action: InputControlAction }) => workspaceCommand({ kind: 'control_input', ...input }),
