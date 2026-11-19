@@ -680,6 +680,7 @@ impl Delivery {
             json!({"availability":self.availability(),"settings_path":self.data_dir.join("delivery-settings.json"),
             "enabled":config.enabled,"charity_enabled":config.charity_enabled,"paid_enabled":config.paid_enabled,
             "session_relay_enabled":config.session_relay_enabled,"session_route":config.session_route,
+            "session_payment":config.session_payment,
             "node_peer":self.identity.device_id()?,"wallet":wallet,
             "max_file_bytes":MAX_FILE_BYTES,"receiver_key":key}),
         )

@@ -15,6 +15,7 @@ export type SessionRelaySettings = { relay_enabled: boolean; route: SessionRelay
 export type DeliveryStatus = DeliverySettings & {
   session_relay_enabled: boolean
   session_route: SessionRelayRoute | null
+  session_payment?: SessionPaymentConfig | null
   node_peer: string
   wallet: { state: 'absent'; address: null } | { state: 'locked' | 'unlocked'; address: string } | { state: 'unavailable'; address: null; reason: string }
   max_file_bytes: number

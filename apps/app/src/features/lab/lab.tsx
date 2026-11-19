@@ -5,7 +5,7 @@ import { webPlatform } from '@/lib/platform'
 import { useClipboard } from '@/lib/use-clipboard'
 import { useDelivery } from '@vibeface/client/delivery/client.ts'
 import { receiverChoices } from '@vibeface/client/delivery/model.ts'
-import type { DeliveryStatus,SessionRelayRoute } from '@vibeface/client/delivery/types.ts'
+import type { DeliveryStatus,SessionPaymentConfig,SessionRelayRoute } from '@vibeface/client/delivery/types.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { Switch } from "@vibeface/uiarc/switch/switch.tsx"
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
@@ -53,6 +53,7 @@ function SessionRelaySettings({ status, delivery, showError, onAction }: {
   const { bots } = useWorkspace()
   const { directory } = useDevice()
   const [draft, setDraft] = useState<SessionRelayRoute | null>(null)
+  const [paymentDraft, setPaymentDraft] = useState<SessionPaymentConfig | null>(status.session_payment ?? null)
   const [notice, setNotice] = useState('')
   const [relayTouched, setRelayTouched] = useState(false)
   const editButton = useRef<HTMLButtonElement>(null), firstField = useRef<HTMLButtonElement>(null)
@@ -78,10 +79,12 @@ function SessionRelaySettings({ status, delivery, showError, onAction }: {
   const peers = receiverChoices(directory?.members ?? [], status.node_peer)
   const bot = bots.find(item => item.conversation_id === route?.conversation_id)
   const other = peers.find(item => item.device_id === route?.peer)
-  const submit = (next: SessionRelayRoute | null) => {
+  const submit = (next: SessionRelayRoute | null, payment?: SessionPaymentConfig | null) => {
     onAction()
     setNotice('')
-    void delivery.configureSessionRelay({ relay_enabled: status.session_relay_enabled, route: next }).then(saved => {
+    const paymentField = payment === undefined ? paymentDraft ?? undefined : payment === null && paymentDraft === null ? undefined : payment
+    const settings = { relay_enabled: status.session_relay_enabled, route: next, ...(paymentField === undefined ? {} : { payment: paymentField }) }
+    void delivery.configureSessionRelay(settings).then(saved => {
       if (saved) {
         setNotice(next ? '会话线路已保存在此电脑。' : '已关闭此电脑的会话线路。')
         closeEditor()
@@ -92,7 +95,9 @@ function SessionRelaySettings({ status, delivery, showError, onAction }: {
   const relayError = relay && (relay === draft?.peer || relay === status.node_peer)
     ? '转发电脑不能是本机或对端电脑。'
     : relayTouched && !validPeer.test(relay) ? '请输入 64 位小写连接 ID。' : undefined
-  const valid = !!draft && bots.some(item => item.conversation_id === draft.conversation_id)
+  const paymentValid = !paymentDraft || /^[a-f0-9]{64}$/.test(paymentDraft.deployment) && /^[a-f0-9]{64}$/.test(paymentDraft.budget)
+    && /^(0|[1-9][0-9]{0,77})$/.test(paymentDraft.amount) && paymentDraft.claim_until_ms > 0
+  const valid = !!draft && paymentValid && bots.some(item => item.conversation_id === draft.conversation_id)
     && peers.some(item => item.device_id === draft.peer)
     && validPeer.test(relay) && relay !== draft.peer && relay !== status.node_peer
 
@@ -103,7 +108,7 @@ function SessionRelaySettings({ status, delivery, showError, onAction }: {
         : '未开启。配置后，所选会话的新内容才会通过这条线路。'}>
         {route ? <span className="flex flex-wrap gap-2">
           <Button ref={editButton} type="button" size="sm" variant="secondary" aria-expanded={editing} aria-controls={editing ? 'session-relay-form' : undefined} disabled={!canChange || !available} onClick={edit}>编辑线路</Button>
-          <Button type="button" size="sm" variant="secondary" disabled={!canChange} onClick={() => submit(null)}>关闭线路</Button>
+          <Button type="button" size="sm" variant="secondary" disabled={!canChange} onClick={() => submit(null, null)}>关闭线路</Button>
         </span> : <Button ref={editButton} type="button" size="sm" variant="secondary" aria-expanded={editing} aria-controls={editing ? 'session-relay-form' : undefined} disabled={!canChange || !available} onClick={edit}>配置线路</Button>}
       </SettingsRow>
       <SettingsRow icon={RadioTower} label="在此电脑提供转发" description={status.session_relay_enabled
@@ -122,6 +127,17 @@ function SessionRelaySettings({ status, delivery, showError, onAction }: {
             })
           }}
         />
+      </SettingsRow>
+      <SettingsRow icon={LockKeyhole} label="付费结算实验" description={paymentDraft ? '已启用：验收回执会进入批量结算队列。' : '关闭。公益转发不会产生付款。'}>
+        <Switch aria-label="付费结算实验" checked={paymentDraft !== null} disabled={!canChange} onCheckedChange={enabled => {
+          if (enabled) {
+            setPaymentDraft(status.session_payment ?? { deployment: '', budget: '', amount: '0', claim_until_ms: Date.now() + 86_400_000 })
+            if (route) setDraft(route)
+          } else {
+            setPaymentDraft(null)
+            if (route) submit(route, null)
+          }
+        }} />
       </SettingsRow>
       {status.session_relay_enabled ? <SettingsRow icon={RadioTower} label="本机连接 ID" description="把 ID 分享给需要使用此转发的设备。">
         <Button type="button" size="sm" variant="secondary" onClick={() => { void copy(status.node_peer) }}>{copied ? '已复制' : '复制连接 ID'}</Button>
@@ -144,6 +160,18 @@ function SessionRelaySettings({ status, delivery, showError, onAction }: {
         />
         {!bots.length ? <FieldNote>当前没有可选的 Bot 会话。</FieldNote> : null}
       </FormField>
+      {paymentDraft ? <div className="grid gap-3 rounded-md border border-subtle p-3">
+        <p className="text-sm font-medium">付费结算参数</p>
+        <Input label="结算部署 ID" value={paymentDraft.deployment} maxLength={64} autoCapitalize="none" autoCorrect="off" spellCheck={false}
+          onChange={event => setPaymentDraft({ ...paymentDraft, deployment: event.target.value.trim() })} />
+        <Input label="预存预算 ID" value={paymentDraft.budget} maxLength={64} autoCapitalize="none" autoCorrect="off" spellCheck={false}
+          onChange={event => setPaymentDraft({ ...paymentDraft, budget: event.target.value.trim() })} />
+        <Input label="每条消息金额（最小单位）" inputMode="numeric" value={paymentDraft.amount}
+          onChange={event => setPaymentDraft({ ...paymentDraft, amount: event.target.value.trim() })} />
+        <Input label="claim 截止时间（毫秒时间戳）" inputMode="numeric" value={String(paymentDraft.claim_until_ms)}
+          onChange={event => setPaymentDraft({ ...paymentDraft, claim_until_ms: Number(event.target.value) })} />
+        {!paymentValid ? <FieldNote>请输入 64 位小写 ID、非负整数金额和有效截止时间。</FieldNote> : null}
+      </div> : null}
       <FormField>
         <Select id="session-relay-peer" label="对端电脑" placeholder="选择我的设备中的电脑" required disabled={!canChange}
           value={draft.peer ? 'arc:' + draft.peer : ''}

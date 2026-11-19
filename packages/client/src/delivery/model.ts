@@ -1,7 +1,7 @@
 import { base64ToBytes, bytesToBase64, sha256Hex } from '../lib/byte-codec.ts'
 import { formatByteSize as sizeLabel } from '../lib/byte-size.ts'
 import { array, boolean, record, text, type Member } from '../lib/node.ts'
-import type { DeliveryBudget, DeliveryDeadlines, DeliveryDraft, DeliveryEvidence, DeliveryMode, DeliveryOrder, DeliveryPayment, DeliveryPhase, DeliveryProvider, DeliveryStatus, PendingIntent, PaymentState, ReceivedFile, SessionRelayRoute } from './types.ts'
+import type { DeliveryBudget, DeliveryDeadlines, DeliveryDraft, DeliveryEvidence, DeliveryMode, DeliveryOrder, DeliveryPayment, DeliveryPhase, DeliveryProvider, DeliveryStatus, PendingIntent, PaymentState, ReceivedFile, SessionPaymentConfig, SessionRelayRoute } from './types.ts'
 
 const maxAmount = (1n << 256n) - 1n
 const protocolMaxBytes = 16 * 65_536
@@ -49,10 +49,15 @@ export function parseStatus(value: unknown): DeliveryStatus {
   const state = member(wallet.state, ['absent', 'locked', 'unlocked', 'unavailable'])
   const receiving = v.receiver_key === null ? null : record(v.receiver_key)
   if ((state === 'absent' || state === 'unavailable') && wallet.address !== null) throw new Error('未创建或不可用的钱包不能带地址。')
+  const sessionPayment = v.session_payment === null || v.session_payment === undefined ? null : (() => {
+    const payment = record(v.session_payment)
+    return { deployment: text(payment.deployment), budget: text(payment.budget), amount: amount(payment.amount), claim_until_ms: integer(payment.claim_until_ms) } satisfies SessionPaymentConfig
+  })()
   return {
     enabled: boolean(v.enabled), charity_enabled: boolean(v.charity_enabled), paid_enabled: boolean(v.paid_enabled),
     session_relay_enabled: boolean(v.session_relay_enabled),
     session_route: nullable(v.session_route, parseSessionRoute),
+    session_payment: sessionPayment,
     node_peer: peer(v.node_peer), wallet: state === 'absent' ? { state, address: null } : state === 'unavailable' ? { state, address: null, reason: text(wallet.reason) } : { state, address: address(wallet.address) },
     max_file_bytes: integer(v.max_file_bytes, protocolMaxBytes),
     receiver_key: receiving ? { key_id: peer(receiving.key_id), serial: integer(receiving.serial), public_key: peer(receiving.public_key) } : null,
