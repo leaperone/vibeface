@@ -1,6 +1,6 @@
 import { Directory, File, Paths } from 'expo-file-system'
 import { createMMKV } from 'react-native-mmkv'
-import { record } from '@vibeface/client/lib/node.ts'
+import { isLegacyRecoveryFile } from './legacy-recovery'
 
 const recovery = new Directory(Paths.document, 'recovery')
 const selections = new Directory(Paths.cache, 'vibeface-selections')
@@ -141,21 +141,6 @@ const recoveryStorage = {
   },
 }
 
-/** The earlier writer kept these sealed copies directly in this app's private Documents directory. */
-function rootRecoveryCopy(file: File) {
-  if (!/^vibeface-recovery-[A-F0-9]{8}-\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\.json$/.test(file.name) || file.size < 1 || file.size > 4 * 1024 * 1024) return false
-  try {
-    const bundle = record(JSON.parse(file.textSync()))
-    const envelope = record(bundle.envelope), header = record(envelope.header)
-    return bundle.version === 1 && typeof bundle.network_id === 'string' && /^[a-f0-9]{64}$/.test(bundle.network_id)
-      && header.format === 'vibeface-recovery' && header.version === 1 && header.kdf === 'argon2id'
-      && header.memory_kib === 19_456 && header.iterations === 2 && header.parallelism === 1 && header.cipher === 'xchacha20poly1305'
-      && typeof header.salt === 'string' && /^[a-f0-9]{32}$/.test(header.salt)
-      && typeof header.nonce === 'string' && /^[a-f0-9]{48}$/.test(header.nonce)
-      && typeof envelope.ciphertext === 'string' && envelope.ciphertext.length >= 32 && envelope.ciphertext.length % 2 === 0 && /^[a-f0-9]+$/.test(envelope.ciphertext)
-  } catch { return false }
-}
-
 async function erase(clear: () => Promise<void>) {
   available()
   erasing = true
@@ -166,7 +151,7 @@ async function erase(clear: () => Promise<void>) {
       const uri = index.getString(key)
       if (uri) releasePicker(uri)
     }
-    for (const item of Paths.document.list()) if (item instanceof File && rootRecoveryCopy(item)) item.delete()
+    for (const item of Paths.document.list()) if (item instanceof File && isLegacyRecoveryFile(item)) item.delete()
     for (const directory of [recovery, transfers, selections, drafts, attachments]) if (directory.exists) directory.delete()
     index.clearAll()
     await clear()
