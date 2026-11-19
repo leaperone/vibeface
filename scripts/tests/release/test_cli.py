@@ -205,7 +205,7 @@ class CliContracts(unittest.TestCase):
             self.assertEqual(len(list(output.iterdir())),9)
             sidecars(self,output)
             # Core downloads must select one exact native target from a complete release.
-            info = f.remote(output)
+            f.remote(output)
             marker_sha = hashlib.sha256((output / 'release.json').read_bytes()).hexdigest()
             write_json(f.root / 'releases/cli.json', {'core': pin('core', source='a'*40, sha=marker_sha), 'app': pin('app')})
             for target in TARGETS:
@@ -216,7 +216,6 @@ class CliContracts(unittest.TestCase):
             for extra in ([], ['--target', 'invalid']):
                 f.cli('dependency', '--app', 'cli', '--dependency', 'core', '--output', f.root / 'bad-target', *extra, code=1)
             f.cli('collect','--app','core','--input-root',input_root,'--output',output,code=1)
-            import shutil
             shutil.copytree(input_root/TARGETS[0],input_root/'duplicate')
             bad=f.root/'duplicate-out'
             f.cli('collect','--app','core','--input-root',input_root,'--output',bad,code=1)
@@ -233,7 +232,7 @@ class CliContracts(unittest.TestCase):
         for baseline in (True,False):
             with Fixture(baseline) as f:
                 f.change(head='c'*40,on_main=['a'*40,'c'*40])
-                out=f.component('app');info=f.remote(out)
+                out=f.component('app');f.remote(out)
                 marker=hashlib.sha256((out/'release.json').read_bytes()).hexdigest()
                 write_json(f.root/'releases/cli.json',{'core':pin('core'),'app':pin('app',sha=marker)})
                 f.change(head='a'*40)

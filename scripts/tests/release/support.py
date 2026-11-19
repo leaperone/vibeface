@@ -1,5 +1,6 @@
 """Isolated, credential-free subprocess fixtures for release contracts."""
 import base64
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -159,7 +160,6 @@ class Fixture:
         assets = []
         for i, path in enumerate(directory.iterdir(), 1):
             if path.is_file():
-                import hashlib
                 body = path.read_bytes()
                 assets.append({'id': i, 'name': path.name, 'size': len(body),
                     'digest': 'sha256:' + hashlib.sha256(body).hexdigest(),
