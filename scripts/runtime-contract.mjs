@@ -42,6 +42,10 @@ export function checkBuildInfo(value, contracts, runtime) {
   return true;
 }
 export function checkBuildInfoRaw(raw, runtime) {
+  for (const field of ['data_epoch', 'update_protocol']) {
+    const token = new RegExp(`\"${field}\"\\s*:\\s*([^,}\\s]+)`).exec(raw)?.[1];
+    if (!token || !/^(0|[1-9][0-9]*)$/.test(token)) fail('contract');
+  }
   try { return checkBuildInfo(duplicateSafeParse(raw), runtime.contracts, runtime); }
   catch (error) { if (error.message === 'duplicate JSON key') fail('json-duplicate'); throw error; }
 }
@@ -101,7 +105,20 @@ export function runRuntimeCorpus(runtime = loadRuntimeCorpus()) {
   for (const item of runtime.cases.roles) run(item, value => checkRole(item.files, item.target, item.role, runtime));
   for (const item of runtime.cases.seals) run(item, value => checkSeal(item));
   for (const item of runtime.cases.compatibility) run(item, value => { if (JSON.stringify(item.wire) !== JSON.stringify(runtime.wire)) fail('wire'); });
+  for (const item of runtime.cases.source) run(item, value => checkRustContracts(item.source, runtime));
   return outcomes;
+}
+
+function stripRustComments(source) {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\r\n]*/g, '');
+}
+export function checkRustContracts(source, runtime) {
+  const active = stripRustComments(source);
+  for (const [field, key] of [['UPDATE_PROTOCOL', 'update_protocol'], ['DATA_EPOCH', 'data_epoch']]) {
+    const matches = [...active.matchAll(new RegExp(`^\\s*pub\\s+const\\s+${field}\\s*:\\s*u32\\s*=\\s*([0-9]+)\\s*;`, 'gm'))];
+    if (matches.length !== 1 || Number(matches[0][1]) !== runtime.contracts[key]) fail('source');
+  }
+  return true;
 }
 
 export function validateRuntimeCorpus(runtime = loadRuntimeCorpus()) {
@@ -118,6 +135,6 @@ export function validateRuntimeCorpus(runtime = loadRuntimeCorpus()) {
     assert.deepEqual(row.roles['runtime-core'], [...row.programs, 'BUILD-INFO.json', 'FILES.sha256']);
   }
   const source = fs.readFileSync(path.join(ROOT, 'crates/control/src/lib.rs'), 'utf8');
-  for (const [field, key] of [['UPDATE_PROTOCOL', 'update_protocol'], ['DATA_EPOCH', 'data_epoch']]) assert.match(source, new RegExp(`pub const ${field}: u32 = ${runtime.contracts[key]};`));
+  checkRustContracts(source, runtime);
   return true;
 }

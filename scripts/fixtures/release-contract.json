@@ -1026,6 +1026,20 @@
           "raw": "{\"version\": \"1.2.3-hourly.2026101909\", \"version\": \"1.2.3\", \"target\": \"aarch64-apple-darwin\", \"source_commit\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"update_protocol\": 1, \"data_epoch\": 1, \"core_version\": \"2.3.4\", \"core_source_commit\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"app_version\": \"3.4.5-rc.2\", \"app_source_commit\": \"cccccccccccccccccccccccccccccccccccccccc\"}",
           "accepted": false,
           "error": "json-duplicate"
+        },
+        {
+          "id": "build-contract-float-data-epoch",
+          "kind": "build-info-raw",
+          "raw": "{\"version\":\"0.0.1\",\"target\":\"aarch64-apple-darwin\",\"source_commit\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"update_protocol\":1,\"data_epoch\":1.0,\"core_version\":\"2.3.4\",\"core_source_commit\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"app_version\":\"3.4.5-rc.2\",\"app_source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\"}",
+          "accepted": false,
+          "error": "contract"
+        },
+        {
+          "id": "build-contract-exponent-update-protocol",
+          "kind": "build-info-raw",
+          "raw": "{\"version\":\"0.0.1\",\"target\":\"aarch64-apple-darwin\",\"source_commit\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"update_protocol\":1e0,\"data_epoch\":1,\"core_version\":\"2.3.4\",\"core_source_commit\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"app_version\":\"3.4.5-rc.2\",\"app_source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\"}",
+          "accepted": false,
+          "error": "contract"
         }
       ],
       "files": [
@@ -1653,6 +1667,22 @@
           },
           "accepted": false,
           "error": "wire"
+        }
+      ],
+      "source": [
+        {
+          "id": "rust-active-declarations",
+          "kind": "source",
+          "source": "// stale comment: pub const UPDATE_PROTOCOL: u32 = 99;\npub const UPDATE_PROTOCOL: u32 = 1;\npub const DATA_EPOCH: u32 = 1;\n",
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "rust-comment-only-declarations",
+          "kind": "source",
+          "source": "// pub const UPDATE_PROTOCOL: u32 = 1;\n/* pub const DATA_EPOCH: u32 = 1; */\n",
+          "accepted": false,
+          "error": "source"
         }
       ]
     }

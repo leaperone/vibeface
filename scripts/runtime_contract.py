@@ -45,6 +45,9 @@ def check_build_info(value, runtime):
     return True
 
 def check_build_raw(raw, runtime):
+    for field in ('data_epoch', 'update_protocol'):
+        match = re.search(rf'"{field}"\s*:\s*([^,}}\s]+)', raw)
+        if not match or not re.fullmatch(r'(0|[1-9][0-9]*)', match.group(1)): raise ContractError('contract')
     try: value = json.loads(raw, object_pairs_hook=duplicate_pairs)
     except ContractError: raise
     except (TypeError, ValueError): raise ContractError('json')
@@ -104,7 +107,18 @@ def run_runtime_corpus(runtime=None):
     def check_wire(item):
         if item['wire'] != runtime['wire']: raise ContractError('wire')
     for item in runtime['cases']['compatibility']: run(item, lambda item=item: check_wire(item))
+    for item in runtime['cases']['source']: run(item, lambda item=item: check_rust_contracts(item['source'], runtime))
     return outcomes
+
+def strip_rust_comments(source):
+    return re.sub(r'/\*[\s\S]*?\*/', '', re.sub(r'//[^\r\n]*', '', source))
+
+def check_rust_contracts(source, runtime):
+    active = strip_rust_comments(source)
+    for field, key in (('UPDATE_PROTOCOL', 'update_protocol'), ('DATA_EPOCH', 'data_epoch')):
+        matches = re.findall(rf'^\s*pub\s+const\s+{field}\s*:\s*u32\s*=\s*([0-9]+)\s*;', active, re.MULTILINE)
+        if len(matches) != 1 or int(matches[0]) != runtime['contracts'][key]: raise ContractError('source')
+    return True
 
 def validate_runtime(runtime):
     expected_fields = ['version', 'target', 'source_commit', 'update_protocol', 'data_epoch', 'core_version', 'core_source_commit', 'app_version', 'app_source_commit']
@@ -112,14 +126,14 @@ def validate_runtime(runtime):
     web = json.loads((ROOT / 'scripts' / 'package-node-web.json').read_text())
     assert runtime['files']['web_required'] == web
     assert tuple(row['target'] for row in runtime['targets']) == release_format.TARGETS
+    assert {row['target']: row['installer'] for row in runtime['targets']} == release_format.DESKTOP_INSTALLERS
     for row in runtime['targets']:
         assert row['programs'] == list(release_format.program_names(row['target']))
         assert row['roles']['node-full'] == ['FILES.sha256'] + list(release_format.program_names(row['target'])) + ['BUILD-INFO.json', 'README.md', 'RUNTIME-REQUIREMENTS.md', f"scripts/install-node-service.{row['service_suffix']}", 'docs/node.md', 'docs/releasing.md'] + ['web/' + name for name in web]
         assert row['roles']['npm-vendor'] == row['roles']['node-full']
         assert row['roles']['runtime-core'] == list(release_format.program_names(row['target'])) + ['BUILD-INFO.json', 'FILES.sha256']
     source = (ROOT / 'crates' / 'control' / 'src' / 'lib.rs').read_text()
-    for name, key in (('UPDATE_PROTOCOL', 'update_protocol'), ('DATA_EPOCH', 'data_epoch')):
-        assert re.search(rf'pub const {name}: u32 = {runtime["contracts"][key]};', source)
+    check_rust_contracts(source, runtime)
     return True
 
 def main():
