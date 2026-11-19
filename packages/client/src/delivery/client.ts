@@ -68,7 +68,9 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
     async configureSessionRelay(settings: SessionRelaySettings) {
       manage()
       const route = settings.route === null ? null : parseSessionRoute(settings.route)
-      const result = parseStatus(await request('configure_session_relay', { relay_enabled: settings.relay_enabled, route }))
+      const payload: Record<string, unknown> = { relay_enabled: settings.relay_enabled, route }
+      if (settings.payment !== undefined) payload.payment = settings.payment
+      const result = parseStatus(await request('configure_session_relay', payload))
       if (result.node_peer !== connection.entry.device_id) throw new Error('会话转发设置不属于当前连接的设备。')
       return result
     },

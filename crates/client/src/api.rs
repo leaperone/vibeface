@@ -2385,10 +2385,12 @@ impl Client {
                     DeliveryAction::ConfigureSessionRelay {
                         relay_enabled,
                         route,
+                        payment,
                     } => json!({
                         "op":"configure_session_relay",
                         "relay_enabled":relay_enabled,
                         "route":route,
+                        "payment":payment,
                     }),
                     DeliveryAction::Prepare(prepare) => {
                         validate_new_delivery_prepare(&prepare)?;

@@ -70,6 +70,15 @@ pub struct SessionEndpointRoute {
     pub relay: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionPaymentConfig {
+    pub deployment: String,
+    pub budget: String,
+    pub amount: String,
+    pub claim_until_ms: u64,
+}
+
 impl SessionEndpointRoute {
     pub fn validate(&self) -> Result<(), String> {
         super::validate_id(&self.conversation_id)?;
@@ -119,6 +128,8 @@ pub enum DeliveryAction<Flush = DeliveryFlushIntent> {
     ConfigureSessionRelay {
         relay_enabled: bool,
         route: Option<SessionEndpointRoute>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payment: Option<SessionPaymentConfig>,
     },
     Prepare(DeliveryPrepare),
     Confirm {
@@ -154,6 +165,7 @@ mod tests {
         let action: DeliveryAction = DeliveryAction::ConfigureSessionRelay {
             relay_enabled: true,
             route: Some(route.clone()),
+            payment: None,
         };
         assert_eq!(
             serde_json::to_value(action).unwrap(),

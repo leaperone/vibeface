@@ -10,7 +10,8 @@ export type DeliveryOffer = { settlement: Settlement; price: string }
 /** A device outside this one that announces it relays deliveries; `offer` only with paid delivery on. */
 export type DeliveryProvider = { device_id: string; paid: boolean; offer: DeliveryOffer | null; last_seen_ms: number }
 export type SessionRelayRoute = { conversation_id: string; peer: string; relay: string }
-export type SessionRelaySettings = { relay_enabled: boolean; route: SessionRelayRoute | null }
+export type SessionPaymentConfig = { deployment: string; budget: string; amount: string; claim_until_ms: number }
+export type SessionRelaySettings = { relay_enabled: boolean; route: SessionRelayRoute | null; payment?: SessionPaymentConfig | null }
 export type DeliveryStatus = DeliverySettings & {
   session_relay_enabled: boolean
   session_route: SessionRelayRoute | null

@@ -919,6 +919,7 @@ impl Delivery {
             ClientRequest::Write(DeliveryWireAction::ConfigureSessionRelay {
                 relay_enabled,
                 route,
+                payment,
             }) => {
                 let mut config = self.config();
                 let route = route.map(|route| SessionEndpointRoute {
@@ -947,6 +948,12 @@ impl Delivery {
                 }
                 config.session_relay_enabled = relay_enabled;
                 config.session_route = route;
+                config.session_payment = payment.map(|payment| SessionPaymentConfig {
+                    deployment: payment.deployment,
+                    budget: payment.budget,
+                    amount: payment.amount,
+                    claim_until_ms: payment.claim_until_ms,
+                });
                 self.configure_local(config)?;
                 self.status()
             }
