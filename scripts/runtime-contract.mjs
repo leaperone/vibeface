@@ -116,8 +116,8 @@ function sanitizeRust(source) {
   while (i < source.length) {
     if (source.startsWith('//', i)) { blank(i); blank(i + 1); i += 2; while (i < source.length && source[i] !== '\n') { blank(i); i++; } continue; }
     if (source.startsWith('/*', i)) { let depth = 1; blank(i); blank(i + 1); i += 2; while (i < source.length && depth) { if (source.startsWith('/*', i)) { depth++; blank(i); blank(i + 1); i += 2; } else if (source.startsWith('*/', i)) { depth--; blank(i); blank(i + 1); i += 2; } else { blank(i); i++; } } continue; }
-    const raw = /^(?:b)?r(#+)"/.exec(source.slice(i));
-    if (raw) { const close = `"${raw[1]}`; const end = source.indexOf(close, i + raw[0].length); const stop = end < 0 ? source.length : end + close.length; for (; i < stop; i++) blank(i); continue; }
+    const raw = /^(?:b)?r(#+)?"/.exec(source.slice(i));
+    if (raw) { const close = `"${raw[1] ?? ''}`; const end = source.indexOf(close, i + raw[0].length); const stop = end < 0 ? source.length : end + close.length; for (; i < stop; i++) blank(i); continue; }
     if (source[i] === '"' || source[i] === "'") { const quote = source[i]; blank(i++); let escaped = false; while (i < source.length) { const char = source[i]; blank(i++); if (!escaped && char === quote) break; escaped = !escaped && char === '\\'; if (char !== '\\') escaped = false; } continue; }
     i++;
   }

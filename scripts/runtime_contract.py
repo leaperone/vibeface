@@ -127,7 +127,7 @@ def sanitize_rust(source):
                 elif source.startswith('*/', i): depth -= 1; blank(i); blank(i + 1); i += 2
                 else: blank(i); i += 1
             continue
-        raw = re.match(r'(?:b)?r(#+)"', source[i:])
+        raw = re.match(r'(?:b)?r(#+)?"', source[i:])
         if raw:
             close = '"' + raw.group(1); end = source.find(close, i + len(raw.group(0)))
             stop = len(source) if end < 0 else end + len(close)
