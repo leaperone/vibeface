@@ -129,7 +129,7 @@ def sanitize_rust(source):
             continue
         raw = re.match(r'(?:b)?r(#+)?"', source[i:])
         if raw:
-            close = '"' + raw.group(1); end = source.find(close, i + len(raw.group(0)))
+            close = '"' + (raw.group(1) or ''); end = source.find(close, i + len(raw.group(0)))
             stop = len(source) if end < 0 else end + len(close)
             while i < stop: blank(i); i += 1
             continue
@@ -148,6 +148,8 @@ def rust_brace_depth(source, end):
     return source[:end].count('{') - source[:end].count('}')
 
 def rust_has_attached_attribute(source, index):
+    same_line = source[source.rfind('\n', 0, index) + 1:index]
+    if '#' in same_line: return True
     for line in reversed(source[:index].split('\n')[:-1]):
         trimmed = line.strip()
         if trimmed.startswith('#'): return True
@@ -156,6 +158,7 @@ def rust_has_attached_attribute(source, index):
 
 def check_rust_contracts(source, runtime):
     active = sanitize_rust(source)
+    if re.search(r'#!\s*\[cfg(?:_attr)?\b', active): raise ContractError('source')
     for field, key in (('UPDATE_PROTOCOL', 'update_protocol'), ('DATA_EPOCH', 'data_epoch')):
         matches = [match for match in re.finditer(rf'\bpub\s+const\s+{field}\s*:\s*u32\s*=\s*([0-9]+)\s*;', active)
                    if rust_brace_depth(active, match.start()) == 0 and not rust_has_attached_attribute(active, match.start())]

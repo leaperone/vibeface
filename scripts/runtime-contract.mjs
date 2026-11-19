@@ -125,12 +125,15 @@ function sanitizeRust(source) {
 }
 function rustBraceDepth(source, end) { let depth = 0; for (let i = 0; i < end; i++) { if (source[i] === '{') depth++; else if (source[i] === '}') depth--; } return depth; }
 function rustHasAttachedAttribute(source, index) {
+  const sameLine = source.slice(source.lastIndexOf('\n', index - 1) + 1, index);
+  if (sameLine.includes('#')) return true;
   const previous = source.slice(0, index).split('\n').slice(0, -1).reverse();
   for (const line of previous) { const trimmed = line.trim(); if (/^#/.test(trimmed)) return true; if (trimmed && /[;}]$/.test(trimmed)) break; }
   return false;
 }
 export function checkRustContracts(source, runtime) {
   const active = sanitizeRust(source);
+  if (/#!\s*\[cfg(?:_attr)?\b/.test(active)) fail('source');
   for (const [field, key] of [['UPDATE_PROTOCOL', 'update_protocol'], ['DATA_EPOCH', 'data_epoch']]) {
     const matches = [...active.matchAll(new RegExp(`\\bpub\\s+const\\s+${field}\\s*:\\s*u32\\s*=\\s*([0-9]+)\\s*;`, 'g'))]
       .filter(match => rustBraceDepth(active, match.index) === 0 && !rustHasAttachedAttribute(active, match.index));
