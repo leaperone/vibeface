@@ -92,9 +92,11 @@ class LanBrowserModule : Module() {
       callbacks.clear()
       waiting.clear()
       resolving = null
+      val hadFound = found.isNotEmpty()
       found.clear()
       multicast?.release()
       multicast = null
+      if (hadFound) emit()
     }
   }
 
