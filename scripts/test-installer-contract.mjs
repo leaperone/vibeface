@@ -49,9 +49,10 @@ try {
   corpus.runtime.targets[0].host = 'unsafe$host';
   fs.writeFileSync(fixture, `${JSON.stringify(corpus, null, 2)}\n`);
   assert.equal(run('--check').status, 1, 'unsafe literal rejected');
-  corpus.runtime.targets[0].host = corpus.runtime.targets[1].host;
+  corpus.runtime.targets[0].target = corpus.runtime.targets[1].target;
   fs.writeFileSync(fixture, `${JSON.stringify(corpus, null, 2)}\n`);
-  assert.equal(run('--check').status, 1, 'duplicate host/target row rejected');
+  assert.equal(run('--check').status, 1, 'duplicate target row rejected');
+  corpus.runtime.targets[0].target = 'aarch64-apple-darwin';
   corpus.runtime.targets[0].host = 'darwin-arm64';
   corpus.runtime.targets[0].roles['node-full'].push('extra.txt');
   fs.writeFileSync(fixture, `${JSON.stringify(corpus, null, 2)}\n`);
