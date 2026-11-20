@@ -107,6 +107,7 @@ struct DeliveryPolicy {
 #[serde(rename_all = "snake_case")]
 enum DeliveryOperation {
     Configure,
+    ConfigureSessionRelay,
     Prepare,
     Confirm,
     Accept,

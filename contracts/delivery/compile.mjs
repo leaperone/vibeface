@@ -15,7 +15,7 @@ const solc = requireDependency('solc');
 export function compile({ writeTrust = false, checkTrust = false } = {}) {
   if (writeTrust && checkTrust) throw Error('--write-trust and --check-trust are mutually exclusive');
   const sources = { 'crates/delivery/abi/Statement.sol': { content: schema } };
-  for (const name of ['DeliveryEscrow.sol', 'TestAdapters.sol', 'RiscZeroAdapter.sol']) {
+  for (const name of ['DeliveryEscrow.sol', 'TestAdapters.sol', 'RiscZeroAdapter.sol', 'SessionEscrow.sol', 'TestSessionEscrow.sol']) {
     sources[`contracts/delivery/${name}`] = { content: fs.readFileSync(path.join(root, name), 'utf8') };
   }
   const pins = JSON.parse(fs.readFileSync(path.join(root, 'verifier-sources.json')));

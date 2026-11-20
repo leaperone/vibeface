@@ -107,7 +107,7 @@ test('file retrieval permits charity senders and accepted receivers but never pa
   assert.equal(canRead({ ...delivered, role: 'provider', name: null, sha256: null }), false)
 })
 
-const status: DeliveryStatus = { enabled: true, charity_enabled: true, paid_enabled: false, node_peer: source, wallet: { state: 'absent', address: null }, max_file_bytes: 130816, receiver_key: null }
+const status: DeliveryStatus = { enabled: true, charity_enabled: true, paid_enabled: false, node_peer: source, wallet: { state: 'absent', address: null }, max_file_bytes: 130816, receiver_key: null, session_relay_enabled: false, session_route: null }
 const draft: DeliveryDraft = { receiver_peer: receiver, provider_peer: provider, mode: 'charity', acceptance: 'recoverable', max_service_amount: '0', max_gas_amount: '0', budget_id: null }
 const file = { name: 'example.txt', size: content.length, arrayBuffer: async () => new Uint8Array(content).buffer }
 function connection(request: ReadyConnection['request']): ReadyConnection {
@@ -245,6 +245,24 @@ test('strict prepare and confirm wire responses remain rejected in both delivery
   }
 })
 
+test('session relay changes only its own settings and rejects mismatched node status', async () => {
+  const route = { conversation_id: 'bot-chat', peer: receiver, relay: provider }
+  const calls: Record<string, unknown>[] = []
+  let reportedPeer = source
+  const transport = connection(async (method, params = {}) => {
+    assert.equal(method, 'delivery')
+    calls.push(params)
+    return { ...status, node_peer: reportedPeer, session_route: route }
+  })
+  const client = createDeliveryClient(transport, { getItem: () => null, setItem() {} }, reserveDeliveryIntent)
+  assert.deepEqual((await client.configureSessionRelay({ relay_enabled: false, route })).session_route, route)
+  assert.deepEqual(calls, [{ op: 'configure_session_relay', relay_enabled: false, route }])
+  await assert.rejects(client.configureSessionRelay({ relay_enabled: false, route: { ...route, relay: receiver } }))
+  assert.equal(calls.length, 1)
+  reportedPeer = receiver
+  await assert.rejects(client.configureSessionRelay({ relay_enabled: false, route: null }), /当前连接/)
+})
+
 test('a local session cannot configure or confirm and storage failure prevents prepare submission', async () => {
   let calls = 0
   const transport = connection(async () => { calls += 1; return order() })
@@ -252,6 +270,7 @@ test('a local session cannot configure or confirm and storage failure prevents p
   const storage = { getItem: () => null, setItem: () => { throw new Error('disk unavailable') } }
   const local = createDeliveryClient(transport, storage, reserveDeliveryIntent)
   await assert.rejects(local.configure({ enabled: true, charity_enabled: true, paid_enabled: false }))
+  await assert.rejects(local.configureSessionRelay({ relay_enabled: true, route: null }))
   await assert.rejects(local.confirm(order()))
   transport.principal = { ...transport.principal, source: 'membership', can_manage: true }
   await assert.rejects(createDeliveryClient(transport, storage, reserveDeliveryIntent).prepare(draft, file, status))

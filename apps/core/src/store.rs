@@ -795,9 +795,7 @@ impl Store {
         self.verified_blob_path(network, conversation, attachment)
     }
 
-    /// Test fixture that stores a whole attachment at once; production writes go through
-    /// `partial_blob_file` and `blob_file`.
-    #[cfg(test)]
+    /// Verify a complete content-addressed attachment before its atomic publication.
     pub fn put_blob(&mut self, expected: &BlobRef, content: &[u8]) -> Result<()> {
         ensure!(
             content.len() <= MAX_BLOB_BYTES && content.len() as u64 == expected.size,
@@ -805,15 +803,14 @@ impl Store {
         );
         ensure!(digest(content) == expected.hash, "blob hash mismatch");
         let path = self.blob_path(&expected.hash)?;
-        if log::blob_file_matches(&path, expected) {
+        if log::blob_file_matches(&path, expected)
+            && std::fs::read(&path).is_ok_and(|bytes| digest(&bytes) == expected.hash)
+        {
             return Ok(());
         }
         let parent = path.parent().context("blob path")?;
         std::fs::create_dir_all(parent)?;
-        let temporary = parent.join(format!(".{}.{}", expected.hash, uuid::Uuid::new_v4()));
-        privatefs::create_durable(&temporary, content)?;
-        privatefs::durable_rename(&temporary, &path)?;
-        Ok(())
+        privatefs::write_atomic(&path, content)
     }
 
     /// Reads an attachment referenced by a stored event of this conversation.

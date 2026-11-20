@@ -20,7 +20,7 @@ const PEER_ORDERS: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CharityKey {
+pub(crate) struct CharityKey {
     receiver_peer: String,
     public_key: String,
     key_id: String,
@@ -31,6 +31,45 @@ struct CharityKey {
 }
 
 impl CharityKey {
+    pub(crate) fn issue(
+        identity: &crate::crypto::LocalIdentity,
+        secret: &Secret32,
+        serial: u64,
+        valid_from: u64,
+        valid_until: u64,
+    ) -> Result<Self> {
+        let mut key = Self {
+            receiver_peer: identity.device_id()?,
+            public_key: hex::encode(receiving_public(secret)?),
+            key_id: hex::encode(random_word()),
+            serial,
+            valid_from,
+            valid_until,
+            signature: String::new(),
+        };
+        key.signature = identity.sign_payload("delivery-charity-key", &key.payload()?)?;
+        Ok(key)
+    }
+
+    pub(super) fn session_material(
+        &self,
+        recipient: &Word,
+        expiry: std::ops::Range<u64>,
+    ) -> Result<(Word, Word)> {
+        self.verify()?;
+        ensure!(
+            parse_word(&self.receiver_peer)? == *recipient,
+            "receiving key belongs to another Node"
+        );
+        ensure!(
+            expiry.start < expiry.end
+                && self.valid_from <= expiry.start / 1000
+                && (expiry.end - 1) / 1000 < self.valid_until,
+            "session object exceeds the receiving key validity interval"
+        );
+        Ok((parse_word(&self.key_id)?, parse_word(&self.public_key)?))
+    }
+
     fn payload(&self) -> Result<Vec<u8>> {
         ensure!(
             self.serial > 0 && self.valid_from < self.valid_until,
@@ -383,7 +422,7 @@ pub(super) enum CharityRequest {
 }
 
 impl Delivery {
-    fn charity_key(&self) -> Result<CharityKey> {
+    pub(super) fn charity_key(&self) -> Result<CharityKey> {
         self.ensure_mode(Mode::Charity)?;
         self.with_store(|store| {
             let previous = store
@@ -406,25 +445,21 @@ impl Delivery {
                 }
             }
             let secret = Secret32::new(random_word())?;
-            let mut key = CharityKey {
-                receiver_peer: self.identity.device_id()?,
-                public_key: hex::encode(receiving_public(&secret)?),
-                key_id: hex::encode(random_word()),
-                serial: match previous {
-                    Some(material) => material
-                        .key
-                        .serial
-                        .checked_add(1)
-                        .context("charity receiving key serial exhausted")?,
-                    None => 1,
-                },
-                valid_from: now().saturating_sub(60),
-                valid_until: now().saturating_add(7 * RETAIN_SECONDS),
-                signature: String::new(),
+            let serial = match previous {
+                Some(material) => material
+                    .key
+                    .serial
+                    .checked_add(1)
+                    .context("charity receiving key serial exhausted")?,
+                None => 1,
             };
-            key.signature = self
-                .identity
-                .sign_payload("delivery-charity-key", &key.payload()?)?;
+            let key = CharityKey::issue(
+                &self.identity,
+                &secret,
+                serial,
+                now().saturating_sub(60),
+                now().saturating_add(7 * RETAIN_SECONDS),
+            )?;
             let material = ReceivingMaterial {
                 key: key.clone(),
                 secret,
@@ -442,19 +477,44 @@ impl Delivery {
             key.receiver_peer == self.identity.device_id()?,
             "charity receiving key belongs to another Node"
         );
-        let bytes = Zeroizing::new(
-            self.with_store(|store| store.value(&format!("charity-receiving:{}", key.key_id)))?
-                .context(
-                    "charity receiving key is unavailable; restore the independent delivery backup",
-                )?,
-        );
-        let material: ReceivingMaterial = serde_json::from_slice(&bytes)?;
+        let material = self.charity_receiving_material(&key.key_id)?;
         ensure!(
             material.key == *key
                 && receiving_public(&material.secret)? == parse_word(&key.public_key)?,
             "charity receiving key material does not match the order"
         );
         Ok(material.secret)
+    }
+
+    fn charity_receiving_material(&self, key_id: &str) -> Result<ReceivingMaterial> {
+        let bytes = Zeroizing::new(
+            self.with_store(|store| store.value(&format!("charity-receiving:{}", key_id)))?
+                .context(
+                    "charity receiving key is unavailable; restore the independent delivery backup",
+                )?,
+        );
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    pub(super) fn session_receiving_secret(
+        &self,
+        recipient: &Word,
+        key_id: &Word,
+        validity: std::ops::Range<u64>,
+    ) -> Result<Secret32> {
+        let material = self.charity_receiving_material(&hex::encode(key_id))?;
+        let (bound_id, public) = material.key.session_material(recipient, validity)?;
+        ensure!(
+            bound_id == *key_id && public == receiving_public(&material.secret)?,
+            "stored session key does not match its signed public key"
+        );
+        Ok(material.secret)
+    }
+
+    pub(super) async fn session_receiving_key(node: &Runtime, peer: &str) -> Result<CharityKey> {
+        Ok(serde_json::from_value(
+            charity_request(node, peer, CharityRequest::Key {}).await?,
+        )?)
     }
 
     pub(super) fn charity_key_status(&self) -> Result<Value> {

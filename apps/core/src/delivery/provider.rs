@@ -10,16 +10,24 @@ impl Delivery {
         request: ServiceRequest,
     ) -> Result<Value> {
         ensure!(self.config().enabled, "object delivery service is disabled");
+        let _maintenance = node.maintenance.enter()?;
+        let request = match request {
+            ServiceRequest::SessionRelay { request } => {
+                let _relay = self.session_relay_operations.lock().await;
+                return self.handle_session_relay(remote, request);
+            }
+            request => request,
+        };
         if !matches!(&request, ServiceRequest::Charity { .. }) {
             self.ensure_mode(Mode::Paid)?;
         }
-        let _maintenance = node.maintenance.enter()?;
         let _provider = if matches!(&request, ServiceRequest::Charity { .. }) {
             None
         } else {
             Some(self.provider_operations.lock().await)
         };
         match request {
+            ServiceRequest::SessionRelay { .. } => unreachable!("handled before paid delivery"),
             ServiceRequest::Charity { request } => {
                 self.charity_handle_service(node, remote, request).await
             }

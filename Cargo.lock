@@ -11927,6 +11927,7 @@ dependencies = [
  "vibeface-delivery",
  "vibeface-protocol",
  "vibeface-secure",
+ "vibeface-session-delivery",
  "zeroize",
 ]
 
@@ -12032,6 +12033,24 @@ dependencies = [
  "vibeface-native-transport",
  "vibeface-protocol",
  "vibeface-secure",
+]
+
+[[package]]
+name = "vibeface-session-delivery"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-sol-types",
+ "chacha20poly1305",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "hpke",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "vibeface-delivery",
+ "zeroize",
 ]
 
 [[package]]

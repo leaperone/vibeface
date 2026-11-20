@@ -3,6 +3,13 @@ pub mod chain;
 mod charity;
 mod keys;
 mod orders;
+pub mod session;
+mod session_attachment;
+mod session_outbox;
+mod session_outbox_store;
+pub use session_outbox::{SessionEndpointRoute, SessionPaymentConfig};
+mod session_relay;
+mod session_relay_store;
 pub use keys::KeyAction;
 pub mod proof;
 mod provider;
@@ -36,6 +43,9 @@ use zeroize::Zeroizing;
 pub struct DeliveryConfig {
     pub enabled: bool,
     pub charity_enabled: bool,
+    pub session_relay_enabled: bool,
+    pub session_route: Option<SessionEndpointRoute>,
+    pub session_payment: Option<SessionPaymentConfig>,
     pub paid_enabled: bool,
     pub storage_limit_bytes: u64,
     pub max_orders: u32,
@@ -52,6 +62,9 @@ impl Default for DeliveryConfig {
         Self {
             enabled: false,
             charity_enabled: true,
+            session_relay_enabled: false,
+            session_route: None,
+            session_payment: None,
             paid_enabled: false,
             storage_limit_bytes: 64 * 1024 * 1024,
             max_orders: 128,
@@ -79,6 +92,13 @@ impl DeliveryConfig {
             &self.provider_gas_cap,
         ] {
             Amount::from_decimal_str(value)?;
+        }
+        if let Some(route) = &self.session_route {
+            route.validate()?;
+        }
+        if let Some(payment) = &self.session_payment {
+            ensure!(self.paid_enabled, "session payment requires paid delivery");
+            payment.validate()?;
         }
         if let Some(chain) = &self.chain {
             chain.validate()?;
@@ -192,6 +212,7 @@ pub struct Delivery {
     peer_slots: Mutex<HashMap<String, Weak<tokio::sync::Semaphore>>>,
     operations: tokio::sync::Mutex<()>,
     provider_operations: tokio::sync::Mutex<()>,
+    session_relay_operations: tokio::sync::Mutex<()>,
     publication_operations: tokio::sync::Mutex<()>,
     runtime: std::sync::OnceLock<Weak<Runtime>>,
     wakeup: Arc<tokio::sync::Notify>,
@@ -226,6 +247,7 @@ impl Delivery {
             peer_slots: Mutex::new(HashMap::new()),
             operations: tokio::sync::Mutex::new(()),
             provider_operations: tokio::sync::Mutex::new(()),
+            session_relay_operations: tokio::sync::Mutex::new(()),
             publication_operations: tokio::sync::Mutex::new(()),
             runtime: std::sync::OnceLock::new(),
             wakeup: Arc::new(tokio::sync::Notify::new()),
@@ -261,9 +283,10 @@ impl Delivery {
     }
     pub(crate) fn attach(&self, runtime: Weak<Runtime>) -> Result<()> {
         ensure!(
-            self.runtime.set(runtime).is_ok(),
+            self.runtime.set(runtime.clone()).is_ok(),
             "delivery runtime already attached"
         );
+        self.attach_session_outbox(runtime)?;
         self.start_executor();
         Ok(())
     }
@@ -360,6 +383,7 @@ impl Delivery {
             return Ok(());
         };
         let _maintenance = node.maintenance.enter()?;
+        self.purge_session_relay().await?;
         if self.data_dir.join("delivery/service.sqlite3").exists() {
             let config = self.config();
             self.with_store(|store| {
@@ -655,6 +679,8 @@ impl Delivery {
         Ok(
             json!({"availability":self.availability(),"settings_path":self.data_dir.join("delivery-settings.json"),
             "enabled":config.enabled,"charity_enabled":config.charity_enabled,"paid_enabled":config.paid_enabled,
+            "session_relay_enabled":config.session_relay_enabled,"session_route":config.session_route,
+            "session_payment":config.session_payment,
             "node_peer":self.identity.device_id()?,"wallet":wallet,
             "max_file_bytes":MAX_FILE_BYTES,"receiver_key":key}),
         )
@@ -813,6 +839,34 @@ impl Delivery {
             "order": order.view,
         }))
     }
+
+    async fn authorize_session_route(
+        &self,
+        node: &Runtime,
+        network: &str,
+        route: &SessionEndpointRoute,
+    ) -> Result<()> {
+        route.validate()?;
+        let local = self.identity.device_id()?;
+        ensure!(
+            route.peer != local && route.relay != local,
+            "session route peers must be different from this Node"
+        );
+        let network = network.to_owned();
+        let peer = route.peer.clone();
+        let conversation = route.conversation_id.clone();
+        node.store
+            .call("delivery.session_route.authorize", move |store| {
+                store.authorize_node(&network, &peer)?;
+                ensure!(
+                    store.conversation(&network, &conversation)?.is_some(),
+                    "session route conversation does not exist in this personal network"
+                );
+                Ok(())
+            })
+            .await
+    }
+
     pub(crate) async fn client_request(
         &self,
         node: &Runtime,
@@ -860,6 +914,47 @@ impl Delivery {
                 config.enabled = enabled;
                 config.charity_enabled = charity_enabled;
                 config.paid_enabled = paid_enabled;
+                self.configure_local(config)?;
+                self.status()
+            }
+            ClientRequest::Write(DeliveryWireAction::ConfigureSessionRelay {
+                relay_enabled,
+                route,
+                payment,
+            }) => {
+                let mut config = self.config();
+                let route = route.map(|route| SessionEndpointRoute {
+                    conversation_id: route.conversation_id,
+                    peer: route.peer,
+                    relay: route.relay,
+                });
+                let route_changed =
+                    route.is_some() && config.session_route.as_ref() != route.as_ref();
+                ensure!(
+                    !(route_changed || relay_enabled && !config.session_relay_enabled)
+                        || (config.enabled && config.charity_enabled),
+                    "session relay requires delivery and charity to be enabled"
+                );
+                if route_changed {
+                    let route = route.as_ref().context("session route disappeared")?;
+                    self.authorize_session_route(node, network, route).await?;
+                    // Keep unrelated file settings from a concurrent delivery update.
+                    config = self.config();
+                    let route_changed = config.session_route.as_ref() != Some(route);
+                    ensure!(
+                        !(route_changed || relay_enabled && !config.session_relay_enabled)
+                            || (config.enabled && config.charity_enabled),
+                        "session relay requires delivery and charity to be enabled"
+                    );
+                }
+                config.session_relay_enabled = relay_enabled;
+                config.session_route = route;
+                config.session_payment = payment.map(|payment| SessionPaymentConfig {
+                    deployment: payment.deployment,
+                    budget: payment.budget,
+                    amount: payment.amount,
+                    claim_until_ms: payment.claim_until_ms,
+                });
                 self.configure_local(config)?;
                 self.status()
             }

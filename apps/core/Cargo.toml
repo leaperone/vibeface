@@ -49,6 +49,7 @@ vibeface-bridge.workspace = true
 vibeface-control.workspace = true
 vibeface-secure = { path = "../../crates/secure" }
 vibeface-delivery = { path = "../../crates/delivery" }
+vibeface-session-delivery = { path = "../../crates/delivery/session" }
 zeroize = { version = "1", features = ["derive"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
