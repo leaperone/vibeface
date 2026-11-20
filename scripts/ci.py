@@ -551,7 +551,7 @@ def self_test():
     auto19_paths = [*(path for path in RELEASE_TOOL_PATHS if path != "scripts/sealed-runtime.mjs"), ".github/workflows/ci.yml", ".github/workflows/npm-publish.yml",
                     ".preflight.toml", "packages/docs/design/release-modules.md", "scripts/ci.py",
                     "scripts/hourly.py", "scripts/test_release_trains.py", "scripts/check-release-workflow.py"]
-    assert len(auto19_paths) == 19
+    assert len(auto19_paths) == 21
     selected = make_plan(auto19_paths)
     assert selected["full"] and not selected["docs_only"] and selected["required_jobs"] == required_full
     assert docs["local_process_modes"] == [] and www["local_process_modes"] == []
@@ -818,7 +818,9 @@ def self_test():
     assert all(name in quick for name in ("scripts/verify-delivery-protected.py", "scripts/verify-delivery-restart-observer.py"))
     config = (root / "crates/control/src/lib.rs").read_text()
     protocol, epoch = (re.search(rf"^pub const {name}: u32 = (\d+);$", config, re.M)[1] for name in ("UPDATE_PROTOCOL", "DATA_EPOCH"))
-    assert f'info["update_protocol"]=="{protocol}" && info["data_epoch"]=="{epoch}"' in (root / "install.sh").read_text(), "install.sh accepts the build's update protocol and data epoch"
+    installer = (root / "install.sh").read_text()
+    assert f"AUTO16_UPDATE_PROTOCOL='{protocol}'" in installer and f"AUTO16_DATA_EPOCH='{epoch}'" in installer, "generated installer contract matches active Rust contracts"
+    assert (root / "scripts/generate-installer-contract.mjs").exists() and (root / "scripts/test-installer-contract.mjs").exists()
     release_privacy_test(root, scratch)
     gatekeeper_test(root, scratch)
     print("CI selector, event, test partition, check commands, rename/delete, gate and installer epoch self-tests passed")

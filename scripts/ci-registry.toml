@@ -19,7 +19,7 @@ patterns = ["apps/www/*"]
 [paths.docs]
 patterns = ["README.md", "README.zh-CN.md", "AGENTS.md", "CLAUDE.md", "packages/docs/*", "tests/e2e/*"]
 [paths.node]
-patterns = ["config/public-bootstrap.json", "packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts", "apps/core/*", "install.sh", "scripts/package-node.sh", "scripts/package-node-windows.py", "scripts/package-node-web.json", "scripts/install-node-service.sh", "scripts/install-node-service.ps1", "scripts/verify-node.py", "scripts/verify-windows-node.py", "scripts/verification_harness.py"]
+patterns = ["config/public-bootstrap.json", "packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts", "apps/core/*", "install.sh", "scripts/install.ps1", "scripts/package-node.sh", "scripts/package-node-windows.py", "scripts/package-node-web.json", "scripts/install-node-service.sh", "scripts/install-node-service.ps1", "scripts/verify-node.py", "scripts/verify-windows-node.py", "scripts/verification_harness.py"]
 [paths.desktop]
 patterns = ["apps/desktop/src/*", "apps/desktop/tests/*"]
 [paths.mobile]
@@ -44,7 +44,7 @@ patterns = ["crates/control/*"]
 [paths.cli]
 patterns = ["apps/cli/*"]
 [paths.release_tools]
-patterns = ["scripts/release-contract.mjs", "scripts/release-metadata.mjs", "scripts/runtime-contract.mjs", "scripts/runtime_contract.py", "scripts/test-runtime-contract.mjs", "scripts/test-release-contract.mjs", "scripts/fixtures/release-contract.json", "scripts/build-desktop.mjs", "scripts/verify-desktop.mjs", "scripts/package-npm.mjs", "scripts/publish-npm.mjs", "scripts/sealed-runtime.mjs"]
+patterns = ["scripts/generate-installer-contract.mjs", "scripts/test-installer-contract.mjs", "scripts/release-contract.mjs", "scripts/release-metadata.mjs", "scripts/runtime-contract.mjs", "scripts/runtime_contract.py", "scripts/test-runtime-contract.mjs", "scripts/test-release-contract.mjs", "scripts/fixtures/release-contract.json", "scripts/build-desktop.mjs", "scripts/verify-desktop.mjs", "scripts/package-npm.mjs", "scripts/publish-npm.mjs", "scripts/sealed-runtime.mjs"]
 [paths.www_overlay]
 exact = ["packages/uiarc/src/foundation.css"]
 include = ["www_local_inputs"]
@@ -319,8 +319,8 @@ ci_check = "Workflow and source checks"
 [[preflight]]
 id = "delivery-scripts"
 name = "Delivery scripts and workflow"
-paths = ["install.sh", "scripts/*.sh", "scripts/release.py", "scripts/release_*.py", "scripts/tests/release/**", "scripts/tests/__init__.py", "scripts/hourly.py", "scripts/release-dispatch.py", "scripts/check-release-workflow.py", ".github/workflows/**"]
-command = "bash -n install.sh && bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/check-web.sh && shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/check-web.sh && bash install.sh --self-test"
+paths = ["install.sh", "scripts/install.ps1", "scripts/generate-installer-contract.mjs", "scripts/test-installer-contract.mjs", "scripts/*.sh", "scripts/release.py", "scripts/release_*.py", "scripts/tests/release/**", "scripts/tests/__init__.py", "scripts/hourly.py", "scripts/release-dispatch.py", "scripts/check-release-workflow.py", ".github/workflows/**"]
+command = "node --check scripts/generate-installer-contract.mjs && node --check scripts/test-installer-contract.mjs && node scripts/test-installer-contract.mjs && node scripts/generate-installer-contract.mjs --check && bash -n install.sh && bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/check-web.sh && shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/check-web.sh && bash install.sh --self-test"
 ci_check = "Workflow and source checks"
 [[preflight]]
 id = "release-signing"
