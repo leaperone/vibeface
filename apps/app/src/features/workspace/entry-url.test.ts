@@ -2020,6 +2020,10 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       const override = dependencies[specifier]
       return { ...workspaceModel, ...(typeof override === 'object' && override !== null ? override : {}) }
     }
+    if (specifier === '@vibeface/client/workspace/overview-policy.ts' || specifier === '@vibeface/client/workspace/presentation.ts') {
+      const filename = fileURLToPath(new URL(`../../../../../packages/client/src/workspace/${specifier.endsWith('overview-policy.ts') ? 'overview-policy' : 'presentation'}.ts`, import.meta.url))
+      return loadComponentModule(filename)
+    }
     if (specifier === '@vibeface/client/workspace/history.ts') return workspaceHistory
     if (specifier === '@vibeface/client/chat/protocol.ts') return { promptIntent, ...dependencies[specifier] as object }
     if (specifier === '@/features/chat/memory-summary') {
