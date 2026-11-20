@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { PLATFORMS, NATIVE_UI, parseReleaseVersion, parseReleaseTag, npmDistTag, compareWithinChannel,
   platformFor, programNames, requiredRuntimeFiles, desktopPayloadNames, validateBuildInfoShape, loadRuntimeDefinitions } from './release-contract.mjs';
-import { readContracts, readOwnVersion, readNativeUi, readNpmTemplate, parseSourceJson } from './release-metadata.mjs';
+import { readContracts, readOwnVersion, readNativeUi, readNpmTemplate, readRuntimeDefinitions, parseSourceJson } from './release-metadata.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
 const corpus = JSON.parse(fs.readFileSync(new URL('./fixtures/release-contract.json', import.meta.url), 'utf8'));
@@ -207,6 +207,10 @@ function sourceTests(root) {
     assert.equal(readOwnVersion(root, app), expected, `own fixture version: ${app}`);
   }
   assert.deepEqual(readContracts(repo), contracts); assert.deepEqual(readNativeUi(repo), NATIVE_UI);
+  const runtime = readRuntimeDefinitions(repo);
+  assert.deepEqual(runtime.targets.map(row => [row.target, row.roles['node-full'], row.roles['desktop-minimum']]),
+    corpus.runtime.targets.map(row => [row.target, row.roles['node-full'], row.roles['desktop-minimum']]));
+  assert.deepEqual(runtime.web_required, corpus.runtime.files.web_required);
   const templateSource = fs.readFileSync(path.join(repo, 'apps/cli/npm/package.json'), 'utf8');
   write(root, 'apps/cli/npm/package.json', templateSource);
   assert.equal(readNpmTemplate(root).version, '0.0.0');
@@ -220,7 +224,7 @@ function sourceTests(root) {
 
 function cliFixtures(root) {
   const copy = ['scripts/release-contract.mjs', 'scripts/release-metadata.mjs', 'scripts/sealed-runtime.mjs', 'scripts/windows-signing.mjs', 'scripts/private-control.mjs',
-    'scripts/build-desktop.mjs', 'scripts/verify-desktop.mjs', 'scripts/package-npm.mjs', 'scripts/package-node-web.json', 'scripts/publish-npm.mjs',
+    'scripts/build-desktop.mjs', 'scripts/verify-desktop.mjs', 'scripts/package-npm.mjs', 'scripts/package-node-web.json', 'scripts/fixtures/release-contract.json', 'scripts/publish-npm.mjs',
     'apps/cli/npm/bin/vibeface.mjs', 'apps/cli/npm/package.json', 'apps/cli/npm/README.md'];
   for (const name of copy) write(root, name, fs.readFileSync(path.join(repo, name)));
   const cliManifest = value => `[package]\nname = "vibeface"\nversion = "${value}"\n`;

@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { NATIVE_UI, parseReleaseVersion, releaseApp } from './release-contract.mjs';
+import { NATIVE_UI, loadRuntimeDefinitions, parseReleaseVersion, releaseApp } from './release-contract.mjs';
 
 // JSON.parse alone accepts duplicate keys. Walk the original tokens first, including nested
 // objects and escaped keys, so source manifests cannot silently select the last declaration.
@@ -122,6 +122,13 @@ export function readContracts(root) {
     result[field] = number;
   }
   return Object.freeze(result);
+}
+
+export function readRuntimeDefinitions(root) {
+  const source = parseSourceJson(readFileSync(path.join(root, 'scripts/fixtures/release-contract.json'), 'utf8'));
+  assert(source.runtime && typeof source.runtime === 'object' && !Array.isArray(source.runtime),
+    'runtime contract must be an object');
+  return loadRuntimeDefinitions(source.runtime);
 }
 
 export function readOwnVersion(root, application) {

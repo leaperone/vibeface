@@ -11,6 +11,8 @@ import zipfile
 
 SOURCE = Path(__file__).resolve().parents[2]
 BASE = 'e2093b537da3ba0b6f3fed057d81ab60bc54dd51'
+RUNTIME = json.loads((SOURCE / 'fixtures/release-contract.json').read_text(encoding='utf-8'))['runtime']
+WEB_FILES = [name[4:] for name in RUNTIME['targets'][0]['roles']['node-full'] if name.startswith('web/')]
 MODULES = ('release_component_identity', 'release_format', 'release_context', 'release_source', 'release_archive',
            'release_inventory', 'release_github', 'release_publisher', 'release_assembly')
 TARGETS = ('aarch64-apple-darwin', 'aarch64-unknown-linux-gnu',
@@ -63,9 +65,14 @@ class Fixture:
                 shutil.copy2(SOURCE / (name + '.py'), self.scripts / (name + '.py'))
             shutil.copytree(SOURCE / 'tests', self.scripts / 'tests',
                             ignore=shutil.ignore_patterns('__pycache__'))
+        (self.scripts / 'fixtures').mkdir()
+        shutil.copy2(SOURCE / 'fixtures/release-contract.json', self.scripts / 'fixtures/release-contract.json')
         (self.scripts / 'offline-docs.py').write_text(
             'def assemble(directory):\n    (directory / "docs").mkdir()\n'
-            '    (directory / "docs/guide.md").write_text("public guide\\n")\n')
+            '    (directory / "docs/guide.md").write_text("public guide\\n")\n'
+            '    (directory / "docs/node.md").write_text("node guide\\n")\n'
+            '    (directory / "docs/releasing.md").write_text("release guide\\n")\n'
+            '    (directory / "README.md").write_text("runtime readme\\n")\n')
         for name in ('install-node-service.sh', 'install-node-service.ps1'):
             (self.scripts / name).write_text('# service fixture\n')
         for app, value in VERSIONS.items():
@@ -143,7 +150,10 @@ class Fixture:
     def static(self, app='app'):
         directory = self.root / ('static-' + app)
         directory.mkdir(exist_ok=True)
-        (directory / 'index.html').write_bytes(b'fixture app\n')
+        for name in WEB_FILES:
+            path = directory / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'fixture app\n')
         return directory
 
     def component(self, app='app', target=None, output=None):

@@ -54,7 +54,7 @@ class ReleaseTrains(unittest.TestCase):
             self.assert_changed_inputs('scripts/' + name, {'core', 'cli', 'desktop'})
         self.assert_changed_inputs('scripts/sealed-runtime.mjs', {'desktop'})
         self.assert_changed_inputs('scripts/test-release-contract.mjs', set())
-        self.assert_changed_inputs('scripts/fixtures/release-contract.json', set())
+        self.assert_changed_inputs('scripts/fixtures/release-contract.json', {'cli'})
 
     def test_portable_desktop_zip_accepts_epoch_runtime_files(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -369,7 +369,8 @@ class ReleaseTrains(unittest.TestCase):
                     core.chmod(0o755)
                 else:
                     (directory / 'web').mkdir()
-                    (directory / 'web/index.html').write_text('<html>App 3.4.5-rc.2</html>')
+                    for name in release_assembly.node_web_files():
+                        (directory / 'web' / name).write_text('<html>App 3.4.5-rc.2</html>')
                 component = {key: dependency[key] for key in ('tag', 'version', 'source_commit')}
                 component |= dict(app=app, schema=1, target=target if app == 'core' else None,
                                   channel=release_format.version(dependency['version']), files=release_archive.files(directory))
