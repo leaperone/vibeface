@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { PLATFORMS, NATIVE_UI, parseReleaseVersion, parseReleaseTag, npmDistTag, compareWithinChannel,
   platformFor, programNames, requiredRuntimeFiles, desktopPayloadNames, validateBuildInfoShape, loadRuntimeDefinitions } from './release-contract.mjs';
-import { readContracts, readOwnVersion, readNativeUi, readNpmTemplate, readRuntimeDefinitions, parseSourceJson } from './release-metadata.mjs';
+import { readContracts, readOwnVersion, readNativeUi, readNpmTemplate, readRuntimeDefinitions, readRuntimeRole, parseSourceJson } from './release-metadata.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
 const corpus = JSON.parse(fs.readFileSync(new URL('./fixtures/release-contract.json', import.meta.url), 'utf8'));
@@ -132,6 +132,7 @@ function desktopInitializationTests(root) {
   for (const name of ['release-contract', 'release-metadata', 'sealed-runtime', 'windows-signing', 'private-control', 'build-desktop', 'verify-desktop']) {
     write(isolated, `scripts/${name}.mjs`, fs.readFileSync(path.join(repo, `scripts/${name}.mjs`)));
   }
+  write(isolated, 'scripts/fixtures/release-contract.json', fs.readFileSync(path.join(repo, 'scripts/fixtures/release-contract.json')));
   for (const name of ['installer.nsi', 'entitlements.mac.plist']) {
     write(isolated, `apps/desktop/build/${name}`, fs.readFileSync(path.join(repo, `apps/desktop/build/${name}`)));
   }
@@ -211,6 +212,11 @@ function sourceTests(root) {
   assert.deepEqual(runtime.targets.map(row => [row.target, row.roles['node-full'], row.roles['desktop-minimum']]),
     corpus.runtime.targets.map(row => [row.target, row.roles['node-full'], row.roles['desktop-minimum']]));
   assert.deepEqual(runtime.web_required, corpus.runtime.files.web_required);
+  for (const row of corpus.runtime.targets) {
+    assert.deepEqual(readRuntimeRole(repo, row.target, 'desktop-minimum'), row.roles['desktop-minimum']);
+  }
+  assert.throws(() => readRuntimeRole(repo, 'unknown-target', 'desktop-minimum'), /unsupported runtime target/);
+  assert.throws(() => readRuntimeRole(repo, corpus.runtime.targets[0].target, 'unknown-role'), /unsupported runtime role/);
   const templateSource = fs.readFileSync(path.join(repo, 'apps/cli/npm/package.json'), 'utf8');
   write(root, 'apps/cli/npm/package.json', templateSource);
   assert.equal(readNpmTemplate(root).version, '0.0.0');
@@ -309,7 +315,10 @@ function desktopFixture(root, cli, seal, env) {
   json(source, 'native-dependencies.json', { target, libraries: ['libc.so.6'], minimum_glibc: '2.17' });
   json(source, 'resources/desktop-build.json', { version: desktopVersion, source_commit: commit });
   const runtime = path.join(source, 'resources/runtime');
-  for (const name of ['vibeface', 'vibeface-core', 'web/index.html', 'web/vibeface_secure.js', 'web/vibeface_secure_bg.wasm']) write(runtime, name, 'runtime');
+  for (const name of ['vibeface', 'vibeface-core', 'README.md', 'RUNTIME-REQUIREMENTS.md',
+    'scripts/install-node-service.sh', 'docs/node.md', 'docs/releasing.md', 'web/_shell.html',
+    'web/index.html', 'web/_redirects', 'web/_headers', 'web/.vibeface-build.json',
+    'web/vibeface_secure.js', 'web/vibeface_secure_bg.wasm']) write(runtime, name, 'runtime');
   json(runtime, 'BUILD-INFO.json', info(target)); seal(runtime);
   const input = path.join(root, 'desktop-input'); fs.mkdirSync(input);
   const portable = path.join(input, `${base}.zip`);

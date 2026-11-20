@@ -54,7 +54,7 @@ class ReleaseTrains(unittest.TestCase):
             self.assert_changed_inputs('scripts/' + name, {'core', 'cli', 'desktop'})
         self.assert_changed_inputs('scripts/sealed-runtime.mjs', {'desktop'})
         self.assert_changed_inputs('scripts/test-release-contract.mjs', set())
-        self.assert_changed_inputs('scripts/fixtures/release-contract.json', {'cli'})
+        self.assert_changed_inputs('scripts/fixtures/release-contract.json', {'cli', 'desktop'})
 
     def test_portable_desktop_zip_accepts_epoch_runtime_files(self):
         with tempfile.TemporaryDirectory() as temporary:
