@@ -11,7 +11,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { PLATFORMS, NATIVE_UI, parseReleaseVersion, parseReleaseTag, npmDistTag, compareWithinChannel,
-  platformFor, programNames, requiredRuntimeFiles, desktopPayloadNames, validateBuildInfoShape } from './release-contract.mjs';
+  platformFor, programNames, requiredRuntimeFiles, desktopPayloadNames, validateBuildInfoShape, loadRuntimeDefinitions } from './release-contract.mjs';
 import { readContracts, readOwnVersion, readNativeUi, readNpmTemplate, parseSourceJson } from './release-metadata.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
@@ -25,6 +25,19 @@ const info = target => ({ version, target, source_commit: commit, update_protoco
   core_version: '2.3.4', core_source_commit: 'b'.repeat(40), app_version: '3.4.5-rc.2', app_source_commit: 'c'.repeat(40) });
 
 function pureTests() {
+  const runtime = loadRuntimeDefinitions(corpus.runtime);
+  assert.deepEqual(runtime.fields, corpus.runtime.build_info.fields);
+  assert.deepEqual(runtime.web_required, corpus.runtime.files.web_required);
+  assert.deepEqual(runtime.targets.map(row => row.target), corpus.runtime.targets.map(row => row.target));
+  assert(Object.isFrozen(runtime) && Object.isFrozen(runtime.targets) && Object.isFrozen(runtime.targets[0].roles));
+  assert.throws(() => loadRuntimeDefinitions({ ...corpus.runtime, schema: 2 }));
+  assert.throws(() => loadRuntimeDefinitions({ ...corpus.runtime, targets: corpus.runtime.targets.slice(0, 1).concat(corpus.runtime.targets[0]) }));
+  const firstTarget = corpus.runtime.targets[0];
+  const withTarget = patch => ({ ...corpus.runtime, targets: corpus.runtime.targets.map((row, index) => index === 0 ? { ...row, ...patch } : row) });
+  assert.throws(() => loadRuntimeDefinitions({ ...corpus.runtime, build_info: { ...corpus.runtime.build_info, fields: [''] } }));
+  assert.throws(() => loadRuntimeDefinitions({ ...corpus.runtime, files: { ...corpus.runtime.files, web_required: [''] } }));
+  assert.throws(() => loadRuntimeDefinitions(withTarget({ programs: [''] })));
+  assert.throws(() => loadRuntimeDefinitions(withTarget({ roles: { ...firstTarget.roles, 'runtime-core': [''] } })));
   for (const expected of corpus.versions) {
     const parsed = parseReleaseVersion(expected.value);
     assert.deepEqual({ channel: parsed.channel, npm: npmDistTag(parsed.channel), parts: parsed.parts.map(String) },

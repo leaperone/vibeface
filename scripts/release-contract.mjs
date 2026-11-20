@@ -14,6 +14,54 @@ const BUILD_FIELDS = Object.freeze(['version', 'target', 'source_commit', 'updat
   'core_version', 'core_source_commit', 'app_version', 'app_source_commit']);
 const APPS = Object.freeze(['core', 'app', 'cli', 'desktop', 'mobile', 'www']);
 
+/**
+ * Load the release-facing portion of the parsed AUTO-16 runtime contract.
+ *
+ * This deliberately accepts data supplied by the caller.  The release-format
+ * library stays detached from repository paths and fixture files; source
+ * adapters may parse the versioned contract and pass it here.  The returned
+ * value is a defensive, deeply frozen projection containing only the fields,
+ * targets and role paths used by release consumers.
+ */
+export function loadRuntimeDefinitions(contract) {
+  assert(contract && typeof contract === 'object' && !Array.isArray(contract), 'invalid runtime contract');
+  assert(contract.schema === 1, 'unsupported runtime contract schema');
+  const fields = contract.build_info?.fields;
+  assert(Array.isArray(fields) && fields.length > 0 && fields.every(field => typeof field === 'string' && field),
+    'invalid runtime BUILD-INFO fields');
+  assert(new Set(fields).size === fields.length, 'duplicate runtime BUILD-INFO field');
+  const web = contract.files?.web_required;
+  assert(Array.isArray(web) && web.every(name => typeof name === 'string' && name), 'invalid runtime Web files');
+  assert(new Set(web).size === web.length, 'duplicate runtime Web file');
+  assert(Array.isArray(contract.targets) && contract.targets.length > 0, 'invalid runtime targets');
+  const targets = contract.targets.map(row => {
+    assert(row && typeof row === 'object' && !Array.isArray(row), 'invalid runtime target');
+    const expected = ['target', 'host', 'platform', 'flag', 'exe_suffix', 'service_suffix', 'installer', 'signing', 'arch', 'programs', 'roles'];
+    assert.deepEqual(Object.keys(row).sort(), [...expected].sort(), 'unsupported runtime target fields');
+    for (const field of ['target', 'host', 'platform', 'flag', 'service_suffix', 'installer', 'signing']) {
+      assert(typeof row[field] === 'string' && row[field], `invalid runtime target ${field}`);
+    }
+    assert(typeof row.exe_suffix === 'string', 'invalid runtime target exe_suffix');
+    assert(row.arch === null || typeof row.arch === 'string', 'invalid runtime target arch');
+    assert(Array.isArray(row.programs) && row.programs.every(name => typeof name === 'string' && name), 'invalid runtime programs');
+    assert(new Set(row.programs).size === row.programs.length, 'duplicate runtime program');
+    assert(row.roles && typeof row.roles === 'object' && !Array.isArray(row.roles), 'invalid runtime roles');
+    assert.deepEqual(Object.keys(row.roles).sort(), ['desktop-minimum', 'node-full', 'npm-vendor', 'runtime-core'], 'unsupported runtime roles');
+    const roles = Object.fromEntries(Object.entries(row.roles).map(([name, paths]) => {
+      assert(name && Array.isArray(paths) && paths.every(path => typeof path === 'string' && path), 'invalid runtime role paths');
+      assert(new Set(paths).size === paths.length, `duplicate runtime role path: ${name}`);
+      return [name, Object.freeze([...paths])];
+    }));
+    return Object.freeze({ ...row, programs: Object.freeze([...row.programs]), roles: Object.freeze(roles) });
+  });
+  assert(new Set(targets.map(row => row.target)).size === targets.length, 'duplicate runtime target');
+  return Object.freeze({ schema: contract.schema, fields: Object.freeze([...fields]),
+    web_required: Object.freeze([...web]), targets: Object.freeze(targets) });
+}
+
+// Descriptive alias for callers that prefer the contract's full name.
+export const loadRuntimeContract = loadRuntimeDefinitions;
+
 export function parseReleaseVersion(value) {
   assert(typeof value === 'string', 'invalid component release version');
   const match = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(hourly)\.([0-9]{10})|-(rc)\.([1-9][0-9]*))?$/.exec(value);

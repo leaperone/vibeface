@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseReleaseVersion, platformFor, programNames, requiredRuntimeFiles, validateBuildInfoShape, PLATFORMS } from './release-contract.mjs';
+import { loadRuntimeDefinitions, parseReleaseVersion, platformFor, programNames, requiredRuntimeFiles, validateBuildInfoShape, PLATFORMS } from './release-contract.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const FIXTURE = path.join(ROOT, 'scripts/fixtures/release-contract.json');
@@ -143,15 +143,16 @@ export function checkRustContracts(source, runtime) {
 }
 
 export function validateRuntimeCorpus(runtime = loadRuntimeCorpus()) {
-  assert.deepEqual(runtime.build_info.fields, ['version', 'target', 'source_commit', 'update_protocol', 'data_epoch', 'core_version', 'core_source_commit', 'app_version', 'app_source_commit']);
-  assert.deepEqual(runtime.files.web_required, JSON.parse(fs.readFileSync(path.join(ROOT, 'scripts/package-node-web.json'), 'utf8')));
-  assert.deepEqual(Object.keys(PLATFORMS), runtime.targets.map(row => row.target));
-  for (const row of runtime.targets) {
+  const definitions = loadRuntimeDefinitions(runtime);
+  assert.deepEqual(definitions.fields, ['version', 'target', 'source_commit', 'update_protocol', 'data_epoch', 'core_version', 'core_source_commit', 'app_version', 'app_source_commit']);
+  assert.deepEqual(definitions.web_required, JSON.parse(fs.readFileSync(path.join(ROOT, 'scripts/package-node-web.json'), 'utf8')));
+  assert.deepEqual(Object.keys(PLATFORMS), definitions.targets.map(row => row.target));
+  for (const row of definitions.targets) {
     const platform = platformFor(row.target);
     assert.equal(row.host, platform.host); assert.equal(row.platform, platform.platform); assert.equal(row.flag, platform.flag);
     assert.equal(row.exe_suffix, platform.exe); assert.equal(row.service_suffix, platform.service); assert.equal(row.installer, platform.installer); assert.equal(row.signing, platform.signing); assert.equal(row.arch ?? null, platform.arch ?? null);
     assert.deepEqual(row.programs, programNames(row.target));
-    assert.deepEqual(row.roles['node-full'], requiredRuntimeFiles(row.target, { web: runtime.files.web_required, checksum: true }));
+    assert.deepEqual(row.roles['node-full'], requiredRuntimeFiles(row.target, { web: definitions.web_required, checksum: true }));
     assert.deepEqual(row.roles['npm-vendor'], row.roles['node-full']);
     assert.deepEqual(row.roles['runtime-core'], [...row.programs, 'BUILD-INFO.json', 'FILES.sha256']);
   }

@@ -33,6 +33,53 @@ DEPENDENCIES = {'core': (), 'app': (), 'cli': ('core', 'app'), 'desktop': ('cli'
 WORKFLOWS = {app: f'release-{app}.yml' for app in APPS} | {'cli': 'release.yml', 'desktop': 'release-desktop-app.yml', 'mobile': 'release-mobile.yml'}
 
 
+def load_runtime_definitions(contract):
+    """Return a defensive projection of parsed AUTO-16 runtime definitions.
+
+    The loader is intentionally pure: callers own JSON/file parsing and pass
+    the parsed contract explicitly.  This keeps release-format detached from
+    checkout paths while giving Node/Python corpus adapters one shape to
+    validate for field, target, and role drift.
+    """
+    require(isinstance(contract, dict) and not isinstance(contract, list), 'invalid runtime contract')
+    require(contract.get('schema') == 1, 'unsupported runtime contract schema')
+    fields = contract.get('build_info', {}).get('fields') if isinstance(contract.get('build_info'), dict) else None
+    require(isinstance(fields, list) and fields and all(isinstance(field, str) and field for field in fields),
+            'invalid runtime BUILD-INFO fields')
+    require(len(set(fields)) == len(fields), 'duplicate runtime BUILD-INFO field')
+    web = contract.get('files', {}).get('web_required') if isinstance(contract.get('files'), dict) else None
+    require(isinstance(web, list) and all(isinstance(name, str) and name for name in web), 'invalid runtime Web files')
+    require(len(set(web)) == len(web), 'duplicate runtime Web file')
+    rows = contract.get('targets')
+    require(isinstance(rows, list) and rows, 'invalid runtime targets')
+    expected = {'target', 'host', 'platform', 'flag', 'exe_suffix', 'service_suffix', 'installer', 'signing', 'arch', 'programs', 'roles'}
+    targets = []
+    for row in rows:
+        require(isinstance(row, dict) and set(row) == expected, 'unsupported runtime target fields')
+        for field in ('target', 'host', 'platform', 'flag', 'service_suffix', 'installer', 'signing'):
+            require(isinstance(row[field], str) and row[field], f'invalid runtime target {field}')
+        require(isinstance(row['exe_suffix'], str), 'invalid runtime target exe_suffix')
+        require(row['arch'] is None or isinstance(row['arch'], str), 'invalid runtime target arch')
+        programs = row['programs']
+        require(isinstance(programs, list) and all(isinstance(name, str) and name for name in programs), 'invalid runtime programs')
+        require(len(set(programs)) == len(programs), 'duplicate runtime program')
+        roles = row['roles']
+        require(isinstance(roles, dict), 'invalid runtime roles')
+        require(set(roles) == {'runtime-core', 'node-full', 'npm-vendor', 'desktop-minimum'}, 'unsupported runtime roles')
+        normalized_roles = {}
+        for name, paths in roles.items():
+            require(isinstance(name, str) and name and isinstance(paths, list)
+                    and all(isinstance(path, str) and path for path in paths), 'invalid runtime role paths')
+            require(len(set(paths)) == len(paths), f'duplicate runtime role path: {name}')
+            normalized_roles[name] = tuple(paths)
+        targets.append({**row, 'programs': tuple(programs), 'roles': normalized_roles})
+    require(len({row['target'] for row in targets}) == len(targets), 'duplicate runtime target')
+    return {'schema': contract['schema'], 'fields': tuple(fields), 'web_required': tuple(web), 'targets': tuple(targets)}
+
+
+loadRuntimeDefinitions = load_runtime_definitions
+
+
 def program_suffix(target):
     return '.exe' if target in WINDOWS_TARGETS else ''
 

@@ -166,17 +166,25 @@ def check_rust_contracts(source, runtime):
     return True
 
 def validate_runtime(runtime):
+    definitions = release_format.load_runtime_definitions(runtime)
+    for invalid in ({**runtime, 'schema': 2}, {**runtime, 'targets': list(runtime['targets']) + [runtime['targets'][0]]}):
+        try:
+            release_format.load_runtime_definitions(invalid)
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError('runtime loader accepted an invalid contract')
     expected_fields = ['version', 'target', 'source_commit', 'update_protocol', 'data_epoch', 'core_version', 'core_source_commit', 'app_version', 'app_source_commit']
-    assert runtime['build_info']['fields'] == expected_fields
+    assert list(definitions['fields']) == expected_fields
     web = json.loads((ROOT / 'scripts' / 'package-node-web.json').read_text())
-    assert runtime['files']['web_required'] == web
-    assert tuple(row['target'] for row in runtime['targets']) == release_format.TARGETS
-    assert {row['target']: row['installer'] for row in runtime['targets']} == release_format.DESKTOP_INSTALLERS
-    for row in runtime['targets']:
-        assert row['programs'] == list(release_format.program_names(row['target']))
-        assert row['roles']['node-full'] == ['FILES.sha256'] + list(release_format.program_names(row['target'])) + ['BUILD-INFO.json', 'README.md', 'RUNTIME-REQUIREMENTS.md', f"scripts/install-node-service.{row['service_suffix']}", 'docs/node.md', 'docs/releasing.md'] + ['web/' + name for name in web]
+    assert list(definitions['web_required']) == web
+    assert tuple(row['target'] for row in definitions['targets']) == release_format.TARGETS
+    assert {row['target']: row['installer'] for row in definitions['targets']} == release_format.DESKTOP_INSTALLERS
+    for row in definitions['targets']:
+        assert list(row['programs']) == list(release_format.program_names(row['target']))
+        assert list(row['roles']['node-full']) == ['FILES.sha256'] + list(release_format.program_names(row['target'])) + ['BUILD-INFO.json', 'README.md', 'RUNTIME-REQUIREMENTS.md', f"scripts/install-node-service.{row['service_suffix']}", 'docs/node.md', 'docs/releasing.md'] + ['web/' + name for name in web]
         assert row['roles']['npm-vendor'] == row['roles']['node-full']
-        assert row['roles']['runtime-core'] == list(release_format.program_names(row['target'])) + ['BUILD-INFO.json', 'FILES.sha256']
+        assert list(row['roles']['runtime-core']) == list(release_format.program_names(row['target'])) + ['BUILD-INFO.json', 'FILES.sha256']
     source = (ROOT / 'crates' / 'control' / 'src' / 'lib.rs').read_text()
     check_rust_contracts(source, runtime)
     return True
