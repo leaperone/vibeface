@@ -8,8 +8,9 @@ import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { providerNames } from '@vibeface/client/lib/node.ts'
 import { workFailure } from '@vibeface/client/lib/errors.ts'
-import { cardState, needsLook, nodeName, overviewScope, schedulerStatus, staleTaskLabel, taskActive, taskAgent, taskGroups, taskLabel, taskProgress, taskStale, workspaceActivities, type TaskGroup } from '@vibeface/client/workspace/labels.ts'
-import { openWorksFromOverview, overviewFromWorkspace } from '@vibeface/client/workspace/model.ts'
+import { cardState, needsLook, nodeName, overviewScope, schedulerStatus, staleTaskLabel, taskActive, taskAgent, taskGroups, taskLabel, taskProgress, taskStale, type TaskGroup } from '@vibeface/client/workspace/labels.ts'
+import { prepareOverviewInputs } from '@vibeface/client/workspace/overview-policy.ts'
+import { workspaceTaskCounts, workspaceTaskGroup } from '@vibeface/client/workspace/presentation.ts'
 import type { BotRecord, NodeInfo, OpenWorkCard, OverviewTask, WorkspaceActivity } from '@vibeface/client/workspace/types.ts'
 import { BotFace } from '@/components/bot-face'
 import { providerIcons, Skeleton } from '@/components/kit'
@@ -37,16 +38,26 @@ export function TasksScreen() {
   useEffect(() => { if (!shared) return; shared.setView('tasks'); return () => shared.setView('other') }, [shared?.generation])
   const works = shared?.openWorks ?? []
   const read = Boolean(shared?.synced)
-  const lookup = { nodes: shared?.nodes ?? [], directory }
-  const localOverview = shared ? overviewFromWorkspace({ openWorks: works, bots: shared.bots, questions: shared.questions, nodes: lookup.nodes }) : null
-  const overview = shared?.overview ?? localOverview
-  const visibleWorks = overview ? openWorksFromOverview(overview, works) : works
   const openQuestions = inbox.filter((item): item is Extract<typeof inbox[number], { kind: 'question' }> => item.kind === 'question' && !item.done && Boolean(item.question)).map((item) => item.question)
   const pendingChecks = inbox.filter((item): item is Extract<typeof inbox[number], { kind: 'confirm' }> => item.kind === 'confirm').map((item) => item.check)
-  const activityView = workspaceActivities({ works: visibleWorks, questions: openQuestions, checks: pendingChecks, overview, answered: shared?.answered ?? {}, nodes: lookup.nodes, knownBots: read ? shared?.bots ?? [] : [], connected: Boolean(shared?.connectionOnline), read, jobs: (shared?.data?.scheduler?.jobs ?? []).map((job) => ({ conversation_id: shared?.conversationId ?? null, job })) })
-  const taskStates: Record<TaskGroup, string[]> = { attention: ['waiting_user', 'needs_reconciliation', 'update_pending', 'stop_pending'], working: ['running'], waiting: ['not_started', 'waiting_dependencies', 'deferred'] }
+  const lookup = { nodes: shared?.nodes ?? [], directory }
+  const prepared = prepareOverviewInputs({
+    openWorks: works,
+    bots: shared?.bots ?? [],
+    questions: openQuestions,
+    nodes: lookup.nodes,
+    checks: pendingChecks,
+    overview: shared?.overview,
+    answered: shared?.answered ?? {},
+    connected: Boolean(shared?.connectionOnline),
+    read,
+    terminalCheckPolicy: 'mobile-inclusive',
+    jobs: (shared?.data?.scheduler?.jobs ?? []).map((job) => ({ conversation_id: shared?.conversationId ?? null, job })),
+  })
+  const overview = shared ? prepared.overview : null
+  const activityView = prepared.activities
   const businessTasks = (shared?.workspaceState?.tasks ?? []).filter((task) => botFilter === 'all' || task.owner_bot === botFilter)
-  const taskCounts = { attention: businessTasks.filter((task) => taskStates.attention.includes(task.state)).length, working: businessTasks.filter((task) => taskStates.working.includes(task.state)).length, waiting: businessTasks.filter((task) => taskStates.waiting.includes(task.state)).length }
+  const taskCounts = workspaceTaskCounts(businessTasks)
   const assignedWorkIds = new Set((shared?.workspaceState?.assignments ?? []).flatMap((assignment) => assignment.work_id && shared?.workspaceState?.tasks.some((task) => task.task_id === assignment.task_id) ? [assignment.work_id] : []))
   const chosenConversation = shared?.bots.find((bot) => bot.bot_id === botFilter)?.conversation_id
   const counted = activityView.activities.filter((activity) => {
@@ -90,7 +101,7 @@ export function TasksScreen() {
     </View> : workActivities.length ? taskGroups.map(({ group, title }) => groups[group].length ? <View key={group} className="gap-2">
       <Text role="heading" className="px-1 text-lg font-medium">{title} <Text className="text-muted">{groups[group].length}</Text></Text>
       {groups[group].map((activity) => <TaskRow key={activity.id} work={activity.work!} projected={activity.projection} waiting={activity.facts.questions.length > 0} bot={shared?.bots.find((item) => item.conversation_id === activity.conversation_id)} lookup={lookup} connected={Boolean(shared?.connectionOnline && read)} progress={taskProgress(activity.work!, shared?.liveProgress ?? [])} />)}
-    </View> : null) : counted.some((item) => item.group === 'attention' && (filter === 'all' || filter === 'attention')) || otherChecks.length || turns.length || businessTasks.some((task) => filter === 'all' || taskStates[filter].includes(task.state)) ? null : filter !== 'all' || botFilter !== 'all' ? <Text className="text-sm text-muted">没有符合筛选的执行工作。</Text> : <MobileEmpty bot={bot} read={read} />}
+    </View> : null) : counted.some((item) => item.group === 'attention' && (filter === 'all' || filter === 'attention')) || otherChecks.length || turns.length || businessTasks.some((task) => filter === 'all' || workspaceTaskGroup(task) === filter) ? null : filter !== 'all' || botFilter !== 'all' ? <Text className="text-sm text-muted">没有符合筛选的执行工作。</Text> : <MobileEmpty bot={bot} read={read} />}
   </KeyboardAwareScrollView>
 }
 

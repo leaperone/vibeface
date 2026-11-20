@@ -2020,6 +2020,10 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       const override = dependencies[specifier]
       return { ...workspaceModel, ...(typeof override === 'object' && override !== null ? override : {}) }
     }
+    if (specifier === '@vibeface/client/workspace/overview-policy.ts' || specifier === '@vibeface/client/workspace/presentation.ts') {
+      const filename = fileURLToPath(new URL(`../../../../../packages/client/src/workspace/${specifier.endsWith('overview-policy.ts') ? 'overview-policy' : 'presentation'}.ts`, import.meta.url))
+      return loadComponentModule(filename)
+    }
     if (specifier === '@vibeface/client/workspace/history.ts') return workspaceHistory
     if (specifier === '@vibeface/client/chat/protocol.ts') return { promptIntent, ...dependencies[specifier] as object }
     if (specifier === '@/features/chat/memory-summary') {
@@ -3995,6 +3999,19 @@ test('both task overviews preserve known records, show their coverage and only n
       if (platform === 'web') assert.equal(empty, undefined, 'Web waits for WorkspaceTasks first read before claiming no tasks')
       else { assert.ok(empty && typeof empty.type === 'function'); assert.match(componentText(empty.type(empty.props)), /当前记录没有未完成的任务/) }
       assert.equal(elements.some(({ type }) => type === 'PendingSection'), true, `${platform} keeps 待处理 atop the task page`)
+      shared.openWorks = ['assigned', 'orphan'].map((work_id) => ({ ...parityWork({ work_id }), conversation_id: parityBot.conversation_id }))
+      const assignment = { started_revision: 1, bot_id: parityBot.bot_id, execution_node: parityNode.device_id, bot_owner_epoch: 1, basis: {}, resource_roots: [], automatic: false, state: 'accepted', event_hash: 'assignment-event', created_at_ms: 1 }
+      shared.workspaceState = workspaceModel.parseWorkspaceState({
+        channels: [], inputs: [], coverage: { limit: 128, truncated: false },
+        tasks: [{ task_id: 'task', root_task_id: 'task', owner_bot: parityBot.bot_id, title: '业务任务', request: '核对项目', expected_result: '结论', source_events: [], dependencies: [], reply_only: false, revision: 1, action: 'continue', request_event: 'request', event_hash: 'event', created_at_ms: 1, updated_at_ms: 2, state: 'running' }],
+        assignments: [
+          { ...assignment, assignment_id: 'assigned', work_id: 'assigned', task_id: 'task' },
+          { ...assignment, assignment_id: 'orphan', work_id: 'orphan', task_id: 'not-loaded' },
+        ],
+      })
+      elements = render()
+      assert.deepEqual(elements.filter(({ type }) => typeof type === 'function' && type.name === cardName).map(({ props }) => (props.work as WorkRecord).work_id), ['orphan'])
+      assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === mastheadName)?.props.working, 2, `${platform} counts the business task and independent work once each`)
     } finally { app.close() }
   }
 })
@@ -4577,6 +4594,7 @@ test("mobile task screen holds 待处理 and claims no emptiness while something
     const attention = () => elements.find(({ type }) => typeof type === "function" && type.name === "MobileMasthead")?.props.attention
     const empty = () => elements.some(({ type }) => typeof type === "function" && type.name === "MobileEmpty")
     assert.equal(attention(), null, "counts remain unknown without the live connection first read")
+    assert.match(componentText(elements), /尚未读取任务记录/)
     assert.equal(elements.some(({ type }) => type === "PendingSection"), true)
     assert.equal(empty(), false)
     inbox = []
