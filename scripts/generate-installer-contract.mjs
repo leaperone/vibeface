@@ -87,7 +87,7 @@ function renderSh(model) {
     `readonly AUTO16_TARGET_LINUX_ARM64=${q(by('aarch64-unknown-linux-gnu').target)}`,
     `readonly AUTO16_PROGRAM_CLI=${q(posix[0].programs[0])}`,
     `readonly AUTO16_PROGRAM_CORE=${q(posix[0].programs[1])}`,
-    `readonly AUTO16_GENERATOR_HASH=${q(hash)}`, END_SH];
+    `readonly AUTO16_GENERATOR_HASH=${q(hash)}`, ': "$AUTO16_GENERATOR_HASH"', END_SH];
   return lines.join('\n');
 }
 function renderPs(model) {

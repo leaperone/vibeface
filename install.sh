@@ -31,6 +31,7 @@ readonly AUTO16_TARGET_LINUX_ARM64='aarch64-unknown-linux-gnu'
 readonly AUTO16_PROGRAM_CLI='vibeface'
 readonly AUTO16_PROGRAM_CORE='vibeface-core'
 readonly AUTO16_GENERATOR_HASH='349d8c7477301121fed0333705eeaa9a9dd3d61344ef436766fff921a64479d5'
+: "$AUTO16_GENERATOR_HASH"
 # END AUTO-16 GENERATED INSTALLER CONTRACTS
 
 # Completion manifests have a closed shape, including their nested dependency pins.
@@ -363,11 +364,11 @@ verify_package() {
     { info[$2]=$3 }
     END { exit !(NR==expected_fields && info["version"]==version && info["target"]==target && info["source_commit"]==commit && info["update_protocol"]==expected_update_protocol && info["data_epoch"]==expected_data_epoch && info["core_version"]==dependency[6] && info["core_source_commit"]==dependency[7] && info["app_version"]==dependency[8] && info["app_source_commit"]==dependency[9]) }
   ' "$scratch/build-fields" || fail 'BUILD-INFO does not match the release, platform, source commit, or data epoch'
-  [[ -x "$package/vibeface" && -x "$package/vibeface-core" ]] || fail 'packaged CLI and Core binaries must be executable'
-  [[ $("$package/vibeface" --version) == "vibeface $version" ]] || fail 'packaged CLI version does not match the release'
+  [[ -x "$package/$AUTO16_PROGRAM_CLI" && -x "$package/$AUTO16_PROGRAM_CORE" ]] || fail 'packaged CLI and Core binaries must be executable'
+  [[ $("$package/$AUTO16_PROGRAM_CLI" --version) == "$AUTO16_PROGRAM_CLI $version" ]] || fail 'packaged CLI version does not match the release'
   local core_version
   core_version=$(awk -F '\t' '$2=="core_version" {print $3}' "$scratch/build-fields")
-  [[ $("$package/vibeface-core" --version) == "vibeface-core $core_version" ]] || fail 'packaged Core version does not match the release'
+  [[ $("$package/$AUTO16_PROGRAM_CORE" --version) == "$AUTO16_PROGRAM_CORE $core_version" ]] || fail 'packaged Core version does not match the release'
 }
 
 install_release() (
@@ -392,7 +393,7 @@ install_release() (
   [[ -n "$install_root" && -n "$bin_dir" ]] || fail 'Specify --install-root and --bin-dir explicitly.'
   [[ $install_root == /* && $bin_dir == /* && $install_root != *$'\n'* && $bin_dir != *$'\n'* ]] || fail 'installation directories must be absolute paths without newlines'
   [[ ! -e "$install_root/current" && ! -L "$install_root/current" ]] || fail 'current already exists; use vibeface update apply'
-  [[ ! -e "$bin_dir/vibeface" && ! -L "$bin_dir/vibeface" ]] || fail 'vibeface already exists in the bin directory; use update apply for a managed installation'
+  [[ ! -e "$bin_dir/$AUTO16_PROGRAM_CLI" && ! -L "$bin_dir/$AUTO16_PROGRAM_CLI" ]] || fail 'vibeface already exists in the bin directory; use update apply for a managed installation'
   case "$(uname -s)/$(uname -m)" in
     Darwin/arm64|Darwin/aarch64) target="$AUTO16_TARGET_DARWIN_ARM64" ;;
     Linux/x86_64|Linux/amd64) target="$AUTO16_TARGET_LINUX_X64" ;;
@@ -407,7 +408,7 @@ install_release() (
   scratch=$(mktemp -d "${TMPDIR:-/tmp}/vibeface-install.XXXXXX")
   trap '
     if ! "$complete"; then
-      if "$made_bin" && [[ -L "$bin_dir/vibeface" && $(readlink "$bin_dir/vibeface") == "$install_root/current/vibeface" ]]; then rm "$bin_dir/vibeface"; fi
+      if "$made_bin" && [[ -L "$bin_dir/$AUTO16_PROGRAM_CLI" && $(readlink "$bin_dir/$AUTO16_PROGRAM_CLI") == "$install_root/current/$AUTO16_PROGRAM_CLI" ]]; then rm "$bin_dir/$AUTO16_PROGRAM_CLI"; fi
       if "$made_current" && [[ -L "$install_root/current" && $(readlink "$install_root/current") == "releases/$version" ]]; then rm "$install_root/current"; fi
       if [[ -n $destination ]]; then rm -rf "$destination"; fi
     fi
@@ -479,18 +480,18 @@ install_release() (
   bin_dir=$(cd "$bin_dir" && pwd -P)
   mkdir "$install_root/.install-lock" || fail 'another installer is active; no changes made'
   lock="$install_root/.install-lock"
-  [[ ! -e "$install_root/current" && ! -L "$install_root/current" && ! -e "$bin_dir/vibeface" && ! -L "$bin_dir/vibeface" ]] || fail 'installation appeared during download; use update apply'
+  [[ ! -e "$install_root/current" && ! -L "$install_root/current" && ! -e "$bin_dir/$AUTO16_PROGRAM_CLI" && ! -L "$bin_dir/$AUTO16_PROGRAM_CLI" ]] || fail 'installation appeared during download; use update apply'
   [[ ! -e "$install_root/releases/$version" && ! -L "$install_root/releases/$version" ]] || fail 'release directory already exists; it was preserved'
   destination="$install_root/releases/$version"
   mv "$scratch/unpack/$package" "$destination" || fail 'cannot stage the verified release'
   ln -s "releases/$version" "$install_root/current" || fail 'cannot create the current release link'
   made_current=true
-  ln -s "$install_root/current/vibeface" "$bin_dir/vibeface" || fail 'cannot create the CLI link'
+  ln -s "$install_root/current/$AUTO16_PROGRAM_CLI" "$bin_dir/$AUTO16_PROGRAM_CLI" || fail 'cannot create the CLI link'
   made_bin=true
   complete=true
-  printf 'Installed %s at %s\n' "$tag" "$bin_dir/vibeface"
-  printf 'No node data or services were created. Start your local node:\n  %q\n' "$bin_dir/vibeface"
-  printf 'After initialization, stop the foreground Node and install the user service with automatic updates on the %s channel:\n  %q service install\n' "$channel" "$bin_dir/vibeface"
+  printf 'Installed %s at %s\n' "$tag" "$bin_dir/$AUTO16_PROGRAM_CLI"
+  printf 'No node data or services were created. Start your local node:\n  %q\n' "$bin_dir/$AUTO16_PROGRAM_CLI"
+  printf 'After initialization, stop the foreground Node and install the user service with automatic updates on the %s channel:\n  %q service install\n' "$channel" "$bin_dir/$AUTO16_PROGRAM_CLI"
   # shellcheck disable=SC2016 # Print the PATH expression for the user to evaluate.
   case ":$PATH:" in *":$bin_dir:"*) ;; *) printf 'Add your bin directory to PATH, or use the absolute CLI path above:\n  export PATH=%q:"$PATH"\n' "$bin_dir" ;; esac
 )
