@@ -2020,6 +2020,10 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       const override = dependencies[specifier]
       return { ...workspaceModel, ...(typeof override === 'object' && override !== null ? override : {}) }
     }
+    if (specifier === '@vibeface/client/workspace/overview-policy.ts' || specifier === '@vibeface/client/workspace/presentation.ts') {
+      const filename = fileURLToPath(new URL(`../../../../../packages/client/src/workspace/${specifier.endsWith('overview-policy.ts') ? 'overview-policy' : 'presentation'}.ts`, import.meta.url))
+      return loadComponentModule(filename)
+    }
     if (specifier === '@vibeface/client/workspace/history.ts') return workspaceHistory
     if (specifier === '@vibeface/client/chat/protocol.ts') return { promptIntent, ...dependencies[specifier] as object }
     if (specifier === '@/features/chat/memory-summary') {
@@ -3895,6 +3899,13 @@ test('task overview keeps filters for completed business history and empty filte
     shared.workspaceState = { ...state, tasks: [] }
     shared.openWorks = [{ ...parityWork({ state: 'finished', outcome: 'completed' }), conversation_id: 'chat' }]
     assert.ok(named('TaskFilters'), 'history retained outside the current Bot and state filters still prevents global emptiness')
+    assert.equal(named('WorkspaceEmpty')?.props.title, '没有符合筛选的任务')
+    shared.openWorks = []
+    shared.overview = workspaceModel.parseWorkspaceOverview({
+      bots: [parityBot, other],
+      tasks: [{ item_id: 'remote-work', kind: 'work', work_id: 'remote-work', conversation_id: parityBot.conversation_id, bot: parityBot, target_node: parityNode.device_id, state: 'running', title: '远端任务' }],
+    })
+    assert.ok(named('TaskFilters'), 'a remote-only task belonging to another Bot still prevents global emptiness')
     assert.equal(named('WorkspaceEmpty')?.props.title, '没有符合筛选的任务')
   } finally { app.close() }
 })
