@@ -434,9 +434,11 @@ test("overview preparation keeps partial and unknown remote observations visible
 
 test("overview preparation names assignment and Bot filters before projecting activities", () => {
   const assigned = work({ work_id: "assigned", conversation_id: "chat-2" })
+  const stale = work({ work_id: "stale", conversation_id: "chat-2" })
   const prepared = prepareOverviewInputs({
-    openWorks: [work(), assigned], bots: [bot("chat-1"), bot("chat-2")], questions: [], nodes: [node("worker")], checks: [],
-    assignedWorkIds: ["assigned"], botFilter: "bot-chat-1", terminalCheckPolicy: "shared", read: true, connected: true,
+    openWorks: [work(), assigned, stale], bots: [bot("chat-1"), bot("chat-2")], questions: [], nodes: [node("worker")], checks: [],
+    tasks: [{ task_id: "task-assigned" }], assignments: [{ task_id: "task-assigned", work_id: "assigned" }, { task_id: "orphan-task", work_id: "stale" }],
+    botFilter: "bot-chat-1", terminalCheckPolicy: "shared", read: true, connected: true,
   })
   assert.deepEqual(prepared.works.map((item) => item.work_id), ["work-1"])
   assert.deepEqual(prepared.activities.activities.filter((activity) => activity.kind === "work").map((activity) => activity.work_id), ["work-1"])
@@ -453,4 +455,21 @@ test("overview preparation makes Web terminal-check filtering explicit", () => {
   assert.deepEqual(web.excludedTerminalChecks, [{ check_id: "finished-check", work_id: "finished", reason: "terminal-work", policy: "web-filtered" }])
   assert.equal(mobile.checks.length, 1)
   assert.equal(shared.checks.length, 1)
+  const assignedWeb = prepareOverviewInputs({ ...base, tasks: [{ task_id: "task-finished" }], assignments: [{ task_id: "task-finished", work_id: "finished" }], terminalCheckPolicy: "web-filtered" })
+  assert.equal(assignedWeb.checks.length, 0, "an assigned terminal check is filtered before assignment rows disappear")
+  assert.deepEqual(assignedWeb.excludedTerminalChecks, web.excludedTerminalChecks)
+})
+
+test("overview preparation scopes remote Bot checks and no-work checks, including input checks", () => {
+  const remote = parseWorkspaceOverview({
+    bots: [{ bot_id: "remote-bot", conversation_id: "remote-chat", name: "远端 Bot" }],
+    checks: [{ check_id: "remote-check", conversation_id: "remote-chat", trigger: "message:one", created_at_ms: 1 }],
+  })
+  const crossBot: PendingCheck = { kind: "work", check_id: "other-bot-check", detail: "other", work_id: "other-work", target_node: "worker", conversation_id: "chat-1", title: "other", reason: "unverified" }
+  const base = { openWorks: [], bots: [bot("chat-1")], questions: [], nodes: [node("worker")], checks: [crossBot], overview: remote, terminalCheckPolicy: "shared" as const, read: true, connected: true }
+  const remoteBot = prepareOverviewInputs({ ...base, botFilter: "remote-bot" })
+  assert.equal(remoteBot.checks.length, 0, "a selected Bot never retains an input check from another Bot")
+  assert.deepEqual(remoteBot.overview.tasks.map((task) => task.item_id), ["remote-check"])
+  const localBot = prepareOverviewInputs({ ...base, botFilter: "bot-chat-1" })
+  assert.equal(localBot.overview.tasks.length, 0, "a no-work remote check is excluded when its Bot is not selected")
 })

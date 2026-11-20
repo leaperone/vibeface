@@ -5,6 +5,7 @@ import type {
   BotRecord,
   NodeInfo,
   OpenWorkCard,
+  OverviewBot,
   OverviewCoverage,
   PendingCheck,
   Question,
@@ -35,10 +36,8 @@ export type OverviewInputPolicy = {
   connected?: boolean
   terminalCheckPolicy: TerminalCheckPolicy
   botFilter?: string
-  /** Work IDs already represented by a workspace assignment. */
-  assignedWorkIds?: readonly string[]
-  assignmentWorkIds?: readonly string[]
-  assignments?: readonly Pick<WorkspaceAssignment, "work_id">[]
+  /** Assignment rows are admitted only when their task_id is present in the task snapshot. */
+  assignments?: readonly Pick<WorkspaceAssignment, "work_id" | "task_id">[]
   workspaceState?: Pick<WorkspaceDomainState, "tasks" | "assignments">
   tasks?: readonly Pick<WorkspaceTask, "task_id">[]
 }
@@ -72,37 +71,43 @@ const checkMatchesWork = (check: PendingCheck, work: OpenWorkCard) => check.kind
 const terminalStates = new Set(["completed", "failed", "interrupted", "rejected"])
 
 function assignedIds(input: OverviewInputPolicy): ReadonlySet<string> {
+  const knownTaskIds = new Set([
+    ...(input.tasks ?? []).map((task) => task.task_id),
+    ...(input.workspaceState?.tasks ?? []).map((task) => task.task_id),
+  ])
+  const validAssignmentWorkIds = (assignments: readonly Pick<WorkspaceAssignment, "work_id" | "task_id">[]) => assignments.flatMap((assignment) => {
+    if (!assignment.work_id || !knownTaskIds.has(assignment.task_id)) return []
+    return [assignment.work_id]
+  })
   const values = [
-    ...(input.assignedWorkIds ?? []),
-    ...(input.assignmentWorkIds ?? []),
-    ...(input.assignments ?? []).flatMap((assignment) => assignment.work_id ? [assignment.work_id] : []),
-    ...(input.workspaceState?.assignments ?? []).flatMap((assignment) => assignment.work_id ? [assignment.work_id] : []),
+    ...validAssignmentWorkIds(input.assignments ?? []),
+    ...validAssignmentWorkIds(input.workspaceState?.assignments ?? []),
   ]
   return new Set(values)
 }
 
-function scopeOverview(overview: WorkspaceOverview, input: OverviewInputPolicy, assigned: ReadonlySet<string>): WorkspaceOverview {
+function scopeOverview(overview: WorkspaceOverview, input: OverviewInputPolicy, assigned: ReadonlySet<string>, bots: readonly (BotRecord | OverviewBot)[]): WorkspaceOverview {
   if ((!input.botFilter || input.botFilter === "all") && assigned.size === 0) return overview
-  const taskVisible = (task: WorkspaceOverview["tasks"][number]) => !task.work_id || !assigned.has(task.work_id) && botMatches(input.botFilter, task.conversation_id, input.bots)
+  const taskVisible = (task: WorkspaceOverview["tasks"][number]) => !assigned.has(task.work_id ?? "") && botMatches(input.botFilter, task.conversation_id, bots, task.bot?.bot_id)
   return {
     ...overview,
     tasks: overview.tasks.filter(taskVisible),
-    questions: overview.questions.filter((question) => botMatches(input.botFilter, question.conversation_id, input.bots)),
-    jobs: overview.jobs.filter((job) => !job.conversation_id || botMatches(input.botFilter, job.conversation_id, input.bots)),
+    questions: overview.questions.filter((question) => botMatches(input.botFilter, question.conversation_id, bots, question.bot?.bot_id)),
+    jobs: overview.jobs.filter((job) => !job.conversation_id || botMatches(input.botFilter, job.conversation_id, bots)),
   }
 }
 
-function botMatches(botFilter: string | undefined, conversationId: string, bots: readonly BotRecord[]): boolean {
+function botMatches(botFilter: string | undefined, conversationId: string, bots: readonly (BotRecord | OverviewBot)[], explicitBotId?: string): boolean {
   if (!botFilter || botFilter === "all") return true
-  return bots.some((bot) => bot.bot_id === botFilter && bot.conversation_id === conversationId)
+  return explicitBotId === botFilter || bots.some((bot) => bot.bot_id === botFilter && bot.conversation_id === conversationId)
 }
 
-function filterWorks(works: readonly OpenWorkCard[], input: OverviewInputPolicy, assigned: ReadonlySet<string>): OpenWorkCard[] {
-  return works.filter((work) => !assigned.has(work.work_id) && botMatches(input.botFilter, work.conversation_id, input.bots))
+function filterWorks(works: readonly OpenWorkCard[], input: OverviewInputPolicy, assigned: ReadonlySet<string>, bots: readonly (BotRecord | OverviewBot)[]): OpenWorkCard[] {
+  return works.filter((work) => !assigned.has(work.work_id) && botMatches(input.botFilter, work.conversation_id, bots))
 }
 
-function filterQuestions(questions: readonly Question[], input: OverviewInputPolicy): Question[] {
-  return questions.filter((question) => questionOpen(question) && botMatches(input.botFilter, question.conversation_id, input.bots))
+function filterQuestions(questions: readonly Question[], input: OverviewInputPolicy, bots: readonly (BotRecord | OverviewBot)[]): Question[] {
+  return questions.filter((question) => questionOpen(question) && botMatches(input.botFilter, question.conversation_id, bots, question.bot?.bot_id))
 }
 
 function filterChecks(
@@ -110,22 +115,45 @@ function filterChecks(
   works: readonly OpenWorkCard[],
   overview: WorkspaceOverview,
   input: OverviewInputPolicy,
+  assigned: ReadonlySet<string>,
 ): { checks: PendingCheck[]; excluded: ExcludedTerminalCheck[] } {
   const excluded: ExcludedTerminalCheck[] = []
-  if (input.terminalCheckPolicy !== "web-filtered") return { checks: [...checks], excluded }
   const projectionByKey = new Map(overview.tasks.flatMap((task) => {
     if ((task.kind !== "work" && task.kind !== "dispatch") || !task.work_id) return []
     return [[JSON.stringify([task.conversation_id, task.work_id]), task] as const]
   }))
-  const kept = checks.filter((check) => {
-    if (check.kind !== "work") return true
-    const work = works.find((candidate) => checkMatchesWork(check, candidate))
-    if (!work) return true
+  const scopedBots: readonly (BotRecord | OverviewBot)[] = [...input.bots, ...overview.bots]
+  const checkIsTerminal = (work: OpenWorkCard) => {
+    if (input.terminalCheckPolicy !== "web-filtered") return false
     const projection = projectionByKey.get(JSON.stringify([work.conversation_id, work.work_id]))
-    const state = cardState(work, [...input.nodes], projection)
-    if (!terminalStates.has(state)) return true
-    excluded.push({ check_id: check.check_id, work_id: check.work_id, reason: "terminal-work", policy: "web-filtered" })
-    return false
+    return terminalStates.has(cardState(work, [...input.nodes], projection))
+  }
+  const kept = checks.flatMap((check): PendingCheck[] => {
+    if (check.kind === "process") return [check]
+    if (check.kind === "work") {
+      if (!botMatches(input.botFilter, check.conversation_id, scopedBots) || assigned.has(check.work_id)) {
+        const work = works.find((candidate) => checkMatchesWork(check, candidate))
+        if (work && checkIsTerminal(work)) excluded.push({ check_id: check.check_id, work_id: check.work_id, reason: "terminal-work", policy: "web-filtered" })
+        return []
+      }
+      const work = works.find((candidate) => checkMatchesWork(check, candidate))
+      if (work && checkIsTerminal(work)) {
+        excluded.push({ check_id: check.check_id, work_id: check.work_id, reason: "terminal-work", policy: "web-filtered" })
+        return []
+      }
+      return [check]
+    }
+    const scopedWorks = check.works.filter((item) => !assigned.has(item.work_id) && botMatches(input.botFilter, item.conversation_id, scopedBots))
+    const visibleWorks = input.terminalCheckPolicy === "web-filtered"
+      ? scopedWorks.filter((item) => {
+        const work = works.find((candidate) => candidate.conversation_id === item.conversation_id && candidate.work_id === item.work_id && candidate.target_node === item.target_node)
+        if (!work) return true
+        if (!checkIsTerminal(work)) return true
+        excluded.push({ check_id: check.check_id, work_id: item.work_id, reason: "terminal-work", policy: "web-filtered" })
+        return false
+      })
+      : scopedWorks
+    return visibleWorks.length ? [{ ...check, works: visibleWorks }] : []
   })
   return { checks: kept, excluded }
 }
@@ -137,14 +165,17 @@ function filterChecks(
  */
 export function prepareOverviewInputs(input: OverviewInputPolicy): PreparedOverviewInputs {
   const remoteOverview = input.overview ?? input.remoteOverview ?? null
+  const availableBots: readonly (BotRecord | OverviewBot)[] = [...input.bots, ...(remoteOverview?.bots ?? [])]
   const assigned = assignedIds(input)
-  const localWorks = filterWorks(input.openWorks, input, assigned)
-  const localQuestions = filterQuestions(input.questions, input)
+  const localWorks = filterWorks(input.openWorks, input, assigned, availableBots)
+  const localQuestions = filterQuestions(input.questions, input, availableBots)
   const localOverview = overviewFromWorkspace({ openWorks: localWorks, bots: input.bots, questions: localQuestions, nodes: input.nodes })
-  const overview = scopeOverview(remoteOverview ?? localOverview, input, assigned)
+  const rawOverview = remoteOverview ?? localOverview
+  const allProjectedWorks = openWorksFromOverview(rawOverview, filterWorks(input.openWorks, input, new Set(), availableBots))
+  const overview = scopeOverview(rawOverview, input, assigned, availableBots)
   const projectedWorks = openWorksFromOverview(overview, localWorks)
-  const works = filterWorks(projectedWorks, input, assigned)
-  const { checks, excluded } = filterChecks(input.checks, works, overview, input)
+  const works = filterWorks(projectedWorks, input, assigned, availableBots)
+  const { checks, excluded } = filterChecks(input.checks, filterWorks(allProjectedWorks, input, new Set(), availableBots), rawOverview, input, assigned)
   const jobs = [...(input.jobs ?? [])]
   const activities = workspaceActivities({
     works,
