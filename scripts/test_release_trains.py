@@ -369,7 +369,8 @@ class ReleaseTrains(unittest.TestCase):
                     core.chmod(0o755)
                 else:
                     (directory / 'web').mkdir()
-                    (directory / 'web/index.html').write_text('<html>App 3.4.5-rc.2</html>')
+                    for name in release_assembly.node_web_files():
+                        (directory / 'web' / name).write_text('<html>App 3.4.5-rc.2</html>')
                 component = {key: dependency[key] for key in ('tag', 'version', 'source_commit')}
                 component |= dict(app=app, schema=1, target=target if app == 'core' else None,
                                   channel=release_format.version(dependency['version']), files=release_archive.files(directory))

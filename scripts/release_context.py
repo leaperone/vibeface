@@ -40,6 +40,14 @@ def contracts():
     return {'data_epoch': control_constant('DATA_EPOCH'), 'update_protocol': control_constant('UPDATE_PROTOCOL')}
 
 
+def runtime_definitions(root=None):
+    root = root or ROOT
+    source = json.loads((root / 'scripts' / 'fixtures' / 'release-contract.json').read_text(encoding='utf-8'))
+    release_format.require(isinstance(source, dict) and isinstance(source.get('runtime'), dict),
+                           'runtime contract must be an object')
+    return release_format.load_runtime_definitions(source['runtime'])
+
+
 def dependencies(app, root=None, required=False):
     release_format.require(app in release_format.APPS, 'unknown application')
     path = (root or ROOT) / 'releases' / f'{app}.json'

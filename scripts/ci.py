@@ -1269,7 +1269,7 @@ def release_privacy_test(root, scratch):
 
     with tempfile.TemporaryDirectory(prefix="release-", dir=scratch) as directory:
         repo = Path(directory)
-        for name in ('scripts/release_component_identity.py', 'scripts/release_format.py', 'scripts/release_context.py', 'scripts/release_source.py', 'scripts/release_archive.py', 'scripts/release_inventory.py', 'scripts/release_github.py', 'scripts/release_publisher.py', 'scripts/release_assembly.py', "scripts/release.py", "scripts/offline-docs.py", "scripts/offline-docs.json", "README.zh-CN.md", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/app/package.json", "apps/mobile/app.json", "apps/desktop/Cargo.toml", "scripts/package-node.sh", "scripts/release-rustflags.py", "scripts/build-inputs.py", "scripts/install-node-service.sh", "Cargo.toml", "crates/control/src/lib.rs", "README.md"):
+        for name in ('scripts/release_component_identity.py', 'scripts/release_format.py', 'scripts/release_context.py', 'scripts/release_source.py', 'scripts/release_archive.py', 'scripts/release_inventory.py', 'scripts/release_github.py', 'scripts/release_publisher.py', 'scripts/release_assembly.py', "scripts/release.py", "scripts/offline-docs.py", "scripts/offline-docs.json", "scripts/fixtures/release-contract.json", "README.zh-CN.md", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/app/package.json", "apps/mobile/app.json", "apps/desktop/Cargo.toml", "scripts/package-node.sh", "scripts/release-rustflags.py", "scripts/build-inputs.py", "scripts/install-node-service.sh", "Cargo.toml", "crates/control/src/lib.rs", "README.md"):
             target = repo / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(root / name, target)
@@ -1294,6 +1294,9 @@ def release_privacy_test(root, scratch):
             assert subprocess.check_output([str(binary)], text=True).strip() == "/vibeface/private build.rs"
         (repo / "packages/docs").mkdir(parents=True)
         (repo / "packages/docs/guide.md").write_text("public guide")
+        (repo / "packages/docs/node.md").write_text("node guide")
+        (repo / "packages/docs/releasing.md").write_text("release guide")
+        (repo / "README.md").write_text("runtime readme")
         for app, value in (("cli", "1.2.3-hourly.2026111400"), ("core", "2.3.4")):
             manifest = repo / f"apps/{app}/Cargo.toml"
             manifest.write_text(re.sub(r'^version = "[^"]+"$', f'version = "{value}"', manifest.read_text(), count=1, flags=re.M))

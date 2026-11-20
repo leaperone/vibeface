@@ -1,6 +1,5 @@
 """Component staging and offline CLI composition before inventory creation."""
 import importlib.util
-import json
 import os
 from pathlib import Path
 import shutil
@@ -13,7 +12,32 @@ import release_inventory
 
 
 def node_web_files():
-    return json.loads((release_context.ROOT / 'scripts/package-node-web.json').read_text(encoding='utf-8'))
+    rows = release_context.runtime_definitions()['targets']
+    posix = [row for row in rows if row['exe_suffix'] == '']
+    release_format.require(len(posix) == 3, 'runtime contract must define three POSIX targets')
+    subsets = []
+    for row in posix:
+        names = tuple(path[4:] for path in row['roles']['node-full'] if path.startswith('web/'))
+        release_format.require(all(name and '/' not in name for name in names), 'runtime Web paths must be direct files')
+        subsets.append(names)
+    release_format.require(all(names == subsets[0] for names in subsets[1:]), 'POSIX runtime Web files differ')
+    return list(subsets[0])
+
+
+def node_full_files(target):
+    rows = [row for row in release_context.runtime_definitions()['targets'] if row['target'] == target]
+    release_format.require(len(rows) == 1, f'unsupported release target: {target}')
+    return rows[0]['roles']['node-full']
+
+
+def assert_node_full(directory, target, *, sealed=False):
+    expected = set(node_full_files(target))
+    expected -= {'FILES.sha256'}
+    if not sealed:
+        expected -= {'BUILD-INFO.json'}
+    for name in expected:
+        file = Path(directory) / name
+        release_format.require(file.is_file() and not file.is_symlink(), f'missing node-full file: {name}')
 
 
 def prepare_node_web():
@@ -53,12 +77,14 @@ def stage_node_assets(directory, target, web, *, license=None):
     if license is not None and license.is_file():
         shutil.copy2(license, directory / 'LICENSE')
     release_archive.write_runtime_requirements(directory, target)
+    assert_node_full(directory, target)
 
 
 def archive_local_node(directory, target, web, output):
     stage_node_assets(directory, target, web, license=release_context.ROOT / 'LICENSE')
     os.environ['PACKAGE_TARGET'] = target
     release_archive.seal_bundle(directory)
+    assert_node_full(directory, target, sealed=True)
     release_archive.public_archive(directory, output)
 
 
@@ -130,5 +156,6 @@ def compose_offline(target, native_dir, app_archive, output, core_archive):
         stage_node_assets(directory, target, app_root / 'web')
         os.environ['PACKAGE_TARGET'] = target
         release_archive.seal_bundle(directory, core_info, app_info)
+        assert_node_full(directory, target, sealed=True)
         release_archive.public_archive(directory, output / (name + '.tar.gz'))
     release_inventory.manifest('cli', output)

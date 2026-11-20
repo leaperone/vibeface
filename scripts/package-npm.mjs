@@ -8,14 +8,18 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync, gzipSync } from 'node:zlib';
 
-import { PLATFORMS, programNames, parseReleaseVersion, npmDistTag, requiredRuntimeFiles, validateBuildInfoShape } from './release-contract.mjs';
-import { readContracts, readOwnVersion, readNpmTemplate } from './release-metadata.mjs';
+import { PLATFORMS, programNames, parseReleaseVersion, npmDistTag, validateBuildInfoShape } from './release-contract.mjs';
+import { readContracts, readOwnVersion, readNpmTemplate, readRuntimeDefinitions } from './release-metadata.mjs';
 import { readSealedRuntime } from './sealed-runtime.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
 const targets = Object.keys(PLATFORMS);
-const webFiles = JSON.parse(fs.readFileSync(new URL('./package-node-web.json', import.meta.url), 'utf8'));
-const requiredFiles = target => requiredRuntimeFiles(target, { web: webFiles, checksum: true });
+const runtime = readRuntimeDefinitions(repo);
+const requiredFiles = target => {
+  const row = runtime.targets.find(candidate => candidate.target === target);
+  assert(row, `unsupported release target: ${target}`);
+  return row.roles['node-full'];
+};
 const run = (program, args, options = {}) => execFileSync(program, args, {
   encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, ...options,
 });
