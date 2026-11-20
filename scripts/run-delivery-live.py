@@ -24,6 +24,8 @@ import uuid
 
 from unittest import TestCase
 
+from verification.resource import oom_delta, resources
+
 
 ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = ROOT / ".artifacts/vdp"
@@ -120,37 +122,6 @@ def terminate_owned(process):
         process.wait(timeout=5)
 
 
-def resources():
-    membership = next(line[3:] for line in Path("/proc/self/cgroup").read_text().splitlines() if line.startswith("0::"))
-    cgroup = Path("/sys/fs/cgroup") / membership.lstrip("/")
-    fields = {name: (cgroup / name).read_text().strip() for name in (
-        "memory.max", "memory.swap.max", "memory.current", "memory.events", "pids.max", "pids.current")}
-    if fields["memory.max"] != str(11 * 1024 ** 3) or fields["memory.swap.max"] != "0" or fields["pids.max"] != "64":
-        raise ValueError("Live proof sandbox has incorrect kernel memory, swap or process limits")
-    for name in ("memory.peak", "pids.peak"):
-        if (cgroup / name).is_file():
-            fields[name] = (cgroup / name).read_text().strip()
-    return cgroup, fields
-
-
-def oom_delta(initial, final):
-    def counts(snapshot):
-        values = {}
-        for line in snapshot["memory.events"].splitlines():
-            name, value = line.split()
-            if name in values or not re.fullmatch(r"[0-9]+", value):
-                raise ValueError("Invalid cgroup memory event counter")
-            values[name] = int(value)
-        if not {"oom", "oom_kill"}.issubset(values):
-            raise ValueError("Required cgroup OOM counters are missing")
-        return {name: values.get(name, 0) for name in ("oom", "oom_kill", "oom_group_kill")}
-    before, after = counts(initial), counts(final)
-    delta = {name: after[name] - before[name] for name in before}
-    if any(value < 0 for value in delta.values()):
-        raise ValueError("Cgroup OOM counters decreased during live acceptance")
-    return delta
-
-
 def command(label, arguments, log, **kwargs):
     print("RUN delivery-live " + label, flush=True)
     with log.open("ab") as output:
@@ -189,6 +160,7 @@ def self_test_source_cli(directory):
     scripts.mkdir(parents=True)
     for name in ("run-delivery-live.py", "release_component_identity.py", "release_format.py", "release_context.py"):
         shutil.copy2(ROOT / "scripts" / name, scripts / name)
+    shutil.copytree(ROOT / "scripts/verification", scripts / "verification", ignore=shutil.ignore_patterns("__pycache__"))
 
     control = repo / "crates/control/src/lib.rs"
     control.parent.mkdir(parents=True)
