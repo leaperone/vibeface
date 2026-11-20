@@ -171,12 +171,12 @@ export function walletNotice(wallet: DeliveryStatus['wallet']): string {
   }
 }
 
-export const phaseLabels: Record<DeliveryPhase, string> = {
+const phaseLabels: Record<DeliveryPhase, string> = {
   prepared: '待确认', funding_pending: '正在分配预算', proving: '正在确认付款条件', funded: '预算已占用', transferring: '传输中', cipher_held: '文件已收到，等待批次解锁', key_published: '正在解锁',
   recoverable: '已送达', paid: '已完成', partial: '部分完成', refunded: '已退款', reconciling: '正在确认付款结果', key_unavailable: '暂时打不开', failed: '未完成',
 }
 export const evidenceLabels: Record<DeliveryEvidence, string> = { none: '还没送达', charity_receipt: '对方已收到', ciphertext_held: '对方已收到，还没解锁', recoverable: '对方可以打开', decryption_proven: '对方已打开' }
-export const paymentLabels: Record<PaymentState, string> = {
+const paymentLabels: Record<PaymentState, string> = {
   free: '免费', prepared: '预算待分配', confirmed: '预算已分配', earned: '服务费已赚取', withdrawn: '预算费用已提取', refunded: '款已退回', unknown: '付款结果未知', failed: '付款失败',
 }
 function settlementUncertain(order: DeliveryOrder): boolean {
