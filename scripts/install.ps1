@@ -276,7 +276,7 @@ function Confirm-BuildIdentity {
     param([object] $Build, [string] $Version, [string] $Commit, [object] $Completion)
     if ($Build -isnot [pscustomobject]) { Fail 'invalid BUILD-INFO object' }
     $fields = @($Build.PSObject.Properties.Name | Sort-Object)
-    if (($fields -join ',') -cne (($Auto16BuildFields | Sort-Object) -join ',')) {
+    if ($fields.Count -ne $Auto16BuildFieldCount -or ($fields -join ',') -cne (($Auto16BuildFields | Sort-Object) -join ',')) {
         Fail 'BUILD-INFO does not declare exactly this release format'
     }
     foreach ($field in @($Auto16BuildFields | Where-Object { $_ -notin @('data_epoch', 'update_protocol') })) {
