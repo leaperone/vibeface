@@ -58,7 +58,8 @@ function derive() {
   const targets = definitions.targets;
   if (targets.length !== 4) fail('unsupported target count');
   const posix = targets.filter(row => row.service_suffix === 'sh');
-  if (posix.length !== 3 || new Set(posix.map(row => JSON.stringify(row.roles['node-full']))).size !== 1) fail('divergent POSIX role sets');
+  if (posix.length !== 3 || new Set(posix.map(row => JSON.stringify(row.roles['node-full']))).size !== 1 ||
+      new Set(posix.map(row => JSON.stringify(row.programs))).size !== 1 || posix.some(row => row.programs.some(name => /\.exe$/.test(name)))) fail('divergent POSIX role sets or programs');
   const nodePaths = [...posix[0].roles['node-full']];
   if (nodePaths.shift() !== 'FILES.sha256') fail('node-full checksum entry must be first');
   for (const row of targets) {
