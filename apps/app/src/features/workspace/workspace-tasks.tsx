@@ -4,6 +4,7 @@ import { Link,useNavigate } from '@tanstack/react-router'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { newId } from '@vibeface/client/workspace/storage.ts'
 import type { WorkspaceCommand,WorkspaceTask } from '@vibeface/client/workspace/types.ts'
+import { workspaceTaskGroup, workspaceTaskStateDescriptor } from '@vibeface/client/workspace/presentation.ts'
 import { Button } from '@vibeface/uiarc/button/button.tsx'
 import { Drawer,DrawerContent,DrawerTrigger } from "@vibeface/uiarc/drawer/drawer.tsx"
 import { Input } from '@vibeface/uiarc/input/input.tsx'
@@ -12,14 +13,8 @@ import { Textarea } from '@vibeface/uiarc/textarea/textarea.tsx'
 import { ChevronRight,Plus } from 'lucide-react'
 import { useEffect,useRef,useState } from 'react'
 
-const workspaceTaskLabels: Record<WorkspaceTask['state'], string> = {
-  not_started: '未开始', running: '执行中', waiting_dependencies: '等待依赖', waiting_user: '等待你决定',
-  update_pending: '更新待承接', stop_pending: '停止待确认', needs_reconciliation: '结果待确认',
-  completed: '已完成', cancelled: '已取消', deferred: '稍后处理',
-}
-
 export function WorkspaceTaskPill({ task }: { task: WorkspaceTask }) {
-  return <StatusPill tone={task.state === 'completed' ? 'success' : task.state === 'running' ? 'info' : ['needs_reconciliation', 'waiting_user', 'stop_pending'].includes(task.state) ? 'warning' : 'neutral'}>{workspaceTaskLabels[task.state]}</StatusPill>
+  return <StatusPill tone={task.state === 'completed' ? 'success' : task.state === 'running' ? 'info' : ['needs_reconciliation', 'waiting_user', 'stop_pending'].includes(task.state) ? 'warning' : 'neutral'}>{workspaceTaskStateDescriptor[task.state].label}</StatusPill>
 }
 
 export function WorkspaceTasks({ botFilter = 'all', filter = 'all', onReadError, showEmpty = true }: { botFilter?: string; filter?: 'all' | 'attention' | 'working' | 'waiting'; onReadError?: (cause: unknown) => void; showEmpty?: boolean }) {
@@ -35,8 +30,7 @@ export function WorkspaceTasks({ botFilter = 'all', filter = 'all', onReadError,
     return () => { current = false }
   }, [workspace.generation])
   useEffect(() => { setError(null) }, [workspace.workspaceState])
-  const groups = { attention: ['waiting_user', 'needs_reconciliation', 'update_pending', 'stop_pending'], working: ['running'], waiting: ['not_started', 'waiting_dependencies', 'deferred'] }
-  const tasks = (workspace.workspaceState?.tasks ?? []).filter((task) => (botFilter === 'all' || task.owner_bot === botFilter) && (filter === 'all' || groups[filter].includes(task.state)))
+  const tasks = (workspace.workspaceState?.tasks ?? []).filter((task) => (botFilter === 'all' || task.owner_bot === botFilter) && (filter === 'all' || workspaceTaskGroup(task) === filter))
   return <Drawer open={open} onOpenChange={setOpen}><section className="grid gap-3" aria-labelledby="workspace-tasks-heading">
     <div className="flex items-center justify-between gap-3"><h2 id="workspace-tasks-heading" className="text-lg font-medium">任务对话</h2><DrawerTrigger asChild><Button type="button" variant="secondary" disabled={!workspace.writable || !workspace.bots.length}><Plus aria-hidden="true" />新任务</Button></DrawerTrigger></div>
     <p className="text-sm text-secondary">每个任务保留独立对话。补充内容会继续发给这个任务。</p>

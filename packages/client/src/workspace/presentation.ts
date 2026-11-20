@@ -1,5 +1,29 @@
 import type { PendingMessage } from "../chat/types.ts"
-import type { InputReceipt, WorkspaceTask, WorkspaceTaskAction } from "./types.ts"
+import type { ContextProjection, InputReceipt, WorkspaceTask, WorkspaceTaskAction } from "./types.ts"
+
+type ContextSourceKind = ContextProjection["sources"][number]["kind"]
+
+/** Shared labels for the bounded context projection. Keep this exhaustive as protocol kinds grow. */
+export const contextSourceLabels = {
+  trigger: "本轮交代",
+  message: "共享消息",
+  work: "工作结果",
+  dispatch: "工作指派",
+  checkpoint: "历史摘要",
+  handoff: "任务交接",
+  memory: "持久记忆",
+  question: "已知问题",
+  attachment: "附件",
+} satisfies Record<ContextSourceKind, string>
+
+export function contextSourceSummary(sources: ContextProjection["sources"]) {
+  const counts = new Map<string, number>()
+  for (const { kind } of sources) counts.set(kind, (counts.get(kind) ?? 0) + 1)
+  return Object.entries(contextSourceLabels).flatMap(([kind, label]) => {
+    const count = counts.get(kind)
+    return count ? [{ kind, label, count }] : []
+  })
+}
 
 /** The three task sections shared by the Web and Mobile workspace views. */
 export type WorkspaceTaskGroup = "attention" | "working" | "waiting"
@@ -16,7 +40,6 @@ export type WorkspaceTaskStateDescriptor = {
 const actionSets = {
   continue: ["continue", "defer", "cancel"] as const satisfies readonly WorkspaceTaskAction[],
   running: ["stop"] as const satisfies readonly WorkspaceTaskAction[],
-  waiting: ["continue", "defer", "cancel"] as const satisfies readonly WorkspaceTaskAction[],
   none: [] as const satisfies readonly WorkspaceTaskAction[],
 } as const
 
@@ -27,7 +50,7 @@ const actionSets = {
 export const workspaceTaskStateDescriptor = {
   not_started: { label: "未开始", attention: false, active: false, group: "waiting", allowedActions: actionSets.continue },
   running: { label: "执行中", attention: false, active: true, group: "working", allowedActions: actionSets.running },
-  waiting_dependencies: { label: "等待依赖", attention: false, active: false, group: "waiting", allowedActions: actionSets.waiting },
+  waiting_dependencies: { label: "等待依赖", attention: false, active: false, group: "waiting", allowedActions: actionSets.continue },
   waiting_user: { label: "等待你决定", attention: true, active: false, group: "attention", allowedActions: actionSets.continue },
   update_pending: { label: "更新待承接", attention: true, active: false, group: "attention", allowedActions: actionSets.continue },
   stop_pending: { label: "停止待确认", attention: true, active: true, group: "attention", allowedActions: actionSets.none },
@@ -53,7 +76,7 @@ export function workspaceTaskCounts(tasks: readonly Pick<WorkspaceTask, "state">
   return counts
 }
 
-export type InputDeliveryDescriptor = {
+type InputStatusDescriptor = {
   label: string
   attention: boolean
   active: boolean
@@ -65,13 +88,7 @@ export const inputDeliveryDescriptor = {
   submitting: { label: "正在发送给连接的设备", attention: false, active: true },
   accepted: { label: "连接的设备已接收", attention: false, active: false },
   unknown: { label: "是否送达尚未确认", attention: true, active: false },
-} satisfies Record<PendingMessage["delivery"], InputDeliveryDescriptor>
-
-export type InputReceiptDescriptor = {
-  label: string
-  attention: boolean
-  active: boolean
-}
+} satisfies Record<PendingMessage["delivery"], InputStatusDescriptor>
 
 export const inputReceiptDescriptor = {
   entry_accepted: { label: "连接的设备已接收", attention: false, active: false },
@@ -81,4 +98,12 @@ export const inputReceiptDescriptor = {
   associated: { label: "已确认回合归属", attention: false, active: false },
   refused: { label: "已拒绝", attention: true, active: false },
   unknown: { label: "补充是否进入当前工作尚未确认", attention: true, active: false },
-} satisfies Record<InputReceipt["stage"], InputReceiptDescriptor>
+} satisfies Record<InputReceipt["stage"], InputStatusDescriptor>
+
+export function pendingInputLabel(pending: Pick<PendingMessage, "delivery" | "rejection_code" | "rejected" | "receipt">): string {
+  const { delivery, receipt, rejected } = pending
+  if (pending.rejection_code === "input_missing") return "这条输入的送达结果仍未确认"
+  if (rejected) return `已拒绝 · ${rejected}`
+  if (delivery === "unknown" && receipt?.stage === "refused" && receipt.retry_safe) return "重试请求待确认"
+  return receipt ? inputReceiptDescriptor[receipt.stage].label : inputDeliveryDescriptor[delivery].label
+}
