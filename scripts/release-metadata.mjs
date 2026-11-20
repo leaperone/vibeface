@@ -131,6 +131,23 @@ export function readRuntimeDefinitions(root) {
   return loadRuntimeDefinitions(source.runtime);
 }
 
+/**
+ * Read one target role from the checked-in runtime contract.
+ *
+ * Release consumers use this narrow projection for role-specific minimums;
+ * the sealed-runtime reader remains responsible for proving the complete
+ * FILES.sha256 corpus.  Returning the already frozen role array keeps this
+ * adapter pure and prevents callers from carrying handwritten path lists.
+ */
+export function readRuntimeRole(root, target, role) {
+  assert(typeof target === 'string' && target, 'runtime target is required');
+  assert(typeof role === 'string' && role, 'runtime role is required');
+  const row = readRuntimeDefinitions(root).targets.find(item => item.target === target);
+  assert(row, `unsupported runtime target: ${target}`);
+  assert(Object.hasOwn(row.roles, role), `unsupported runtime role: ${role}`);
+  return row.roles[role];
+}
+
 export function readOwnVersion(root, application) {
   const app = releaseApp(application);
   let version;
