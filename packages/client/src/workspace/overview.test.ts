@@ -5,6 +5,7 @@ import { isReplyEnded, isTerminalJobState } from './types.ts'
 import test from "node:test"
 import { openWorksFromOverview, overviewFromWorkspace, parseConversation, parseOpenWorks, parseWorkspaceOverview } from "./model.ts"
 import { cardState, overviewScope, taskGroup, taskLabel, workspaceActivities } from "./labels.ts"
+import { prepareOverviewInputs } from "./overview-policy.ts"
 import type { BotRecord, NodeInfo, OpenWork, PendingCheck, Question, WorkspaceActivityJob } from "./types.ts"
 
 const mainScope: SessionScope = { kind: 'main' }
@@ -414,4 +415,42 @@ test("workspace activities dedupe overview and live scheduler jobs by trusted so
   const turns = view.activities.filter((activity): activity is Extract<typeof view.activities[number], { kind: "turn" }> => activity.kind === "turn")
   assert.deepEqual(turns.map((activity) => activity.id), ["turn:chat-1:local:message:queue"])
   assert.equal(turns[0]?.job.state, "running", "the live conversation snapshot wins over an older overview job")
+})
+
+test("overview preparation keeps partial and unknown remote observations visible", () => {
+  const remote = parseWorkspaceOverview({
+    consistency: "partial", truncated: true,
+    tasks: [{ work_id: "remote-unknown", conversation_id: "chat-1", kind: "work", state: "unknown", outcome: null, target_node: "worker" }],
+  })
+  const prepared = prepareOverviewInputs({
+    openWorks: [], bots: [bot("chat-1")], questions: [], nodes: [node("worker", false)], checks: [], overview: remote,
+    terminalCheckPolicy: "shared", read: true, connected: false,
+  })
+  assert.equal(prepared.coverage.consistency, "partial")
+  assert.equal(prepared.coverage.truncated, true)
+  assert.equal(prepared.works[0]?.state, "unverified")
+  assert.equal(prepared.activities.activities[0]?.state, "awaiting_confirmation")
+})
+
+test("overview preparation names assignment and Bot filters before projecting activities", () => {
+  const assigned = work({ work_id: "assigned", conversation_id: "chat-2" })
+  const prepared = prepareOverviewInputs({
+    openWorks: [work(), assigned], bots: [bot("chat-1"), bot("chat-2")], questions: [], nodes: [node("worker")], checks: [],
+    assignedWorkIds: ["assigned"], botFilter: "bot-chat-1", terminalCheckPolicy: "shared", read: true, connected: true,
+  })
+  assert.deepEqual(prepared.works.map((item) => item.work_id), ["work-1"])
+  assert.deepEqual(prepared.activities.activities.filter((activity) => activity.kind === "work").map((activity) => activity.work_id), ["work-1"])
+})
+
+test("overview preparation makes Web terminal-check filtering explicit", () => {
+  const finished = work({ work_id: "finished", state: "finished", outcome: "completed" })
+  const check: PendingCheck = { kind: "work", check_id: "finished-check", detail: "late check", work_id: finished.work_id, target_node: finished.target_node, conversation_id: finished.conversation_id, title: finished.title, reason: "unverified" }
+  const base = { openWorks: [finished], bots: [bot("chat-1")], questions: [], nodes: [node("worker")], checks: [check], read: true, connected: true }
+  const web = prepareOverviewInputs({ ...base, terminalCheckPolicy: "web-filtered" })
+  const mobile = prepareOverviewInputs({ ...base, terminalCheckPolicy: "mobile-inclusive" })
+  const shared = prepareOverviewInputs({ ...base, terminalCheckPolicy: "shared" })
+  assert.equal(web.checks.length, 0)
+  assert.deepEqual(web.excludedTerminalChecks, [{ check_id: "finished-check", work_id: "finished", reason: "terminal-work", policy: "web-filtered" }])
+  assert.equal(mobile.checks.length, 1)
+  assert.equal(shared.checks.length, 1)
 })
