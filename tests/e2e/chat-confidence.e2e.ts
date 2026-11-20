@@ -2,19 +2,15 @@ import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from './fixtures';
-import { expect, secrets } from 'e2e';
+import { expect } from 'e2e';
+import { createPersonalNetwork, continueRecoverySetup, finishRecoveryDownload } from '../support/web-onboarding';
 
 test('chat keeps decisions and task records readable on desktop and phone', async ({ app, node, screen, browser }) => {
   await browser.setViewport({ width: 1280, height: 900 });
   await app.open(node.entry);
-  await screen.getByRole('button', '新建我的网络').click();
-  await screen.getByLabel('这个节点叫什么？').fill('交互验收设备');
-  await screen.getByRole('button', '下一步').click();
-  await screen.getByLabel(/^恢复密码/).fill(secrets.get('recoveryPassword'));
-  await screen.getByRole('button', '下一步').click();
-  await browser.waitForDownload(() => screen.getByRole('button', '下载恢复文件').click());
-  await screen.getByRole('checkbox', '已把文件和密码分开保存').check();
-  await screen.getByRole('button', '完成创建').click();
+  await createPersonalNetwork({ screen, browser }, '交互验收设备');
+  await continueRecoverySetup({ screen, browser });
+  await finishRecoveryDownload({ screen, browser });
   await screen.getByRole('button', '稍后设置').click();
   await screen.getByLabel('名称', { exact: true }).fill('运营助手');
   await screen.getByRole('button', '完成', { exact: true }).click();
