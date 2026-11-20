@@ -3900,6 +3900,13 @@ test('task overview keeps filters for completed business history and empty filte
     shared.openWorks = [{ ...parityWork({ state: 'finished', outcome: 'completed' }), conversation_id: 'chat' }]
     assert.ok(named('TaskFilters'), 'history retained outside the current Bot and state filters still prevents global emptiness')
     assert.equal(named('WorkspaceEmpty')?.props.title, '没有符合筛选的任务')
+    shared.openWorks = []
+    shared.overview = workspaceModel.parseWorkspaceOverview({
+      bots: [parityBot, other],
+      tasks: [{ item_id: 'remote-work', kind: 'work', work_id: 'remote-work', conversation_id: parityBot.conversation_id, bot: parityBot, target_node: parityNode.device_id, state: 'running', title: '远端任务' }],
+    })
+    assert.ok(named('TaskFilters'), 'a remote-only task belonging to another Bot still prevents global emptiness')
+    assert.equal(named('WorkspaceEmpty')?.props.title, '没有符合筛选的任务')
   } finally { app.close() }
 })
 

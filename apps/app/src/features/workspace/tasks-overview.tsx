@@ -45,16 +45,13 @@ export function TasksOverview() {
   const lookup = { nodes: workspace.nodes, directory }
   // The task snapshot does not wait for conversation reads or write alignment.
   const read = Boolean(workspace.synced || workspace.nodesRead)
-  const attention = inbox.filter((item): item is Extract<InboxItem, { kind: "question" | "confirm" }> => item.kind === "confirm" || item.kind === "question" && !item.done).flatMap((item): Extract<InboxItem, { kind: "question" | "confirm" }>[] => {
-    return [item]
-  })
+  const attention = inbox.filter((item): item is Extract<InboxItem, { kind: "question" | "confirm" }> => item.kind === "confirm" || item.kind === "question" && !item.done)
   const openQuestions = attention.filter((item): item is Extract<InboxItem, { kind: "question" }> => item.kind === "question").map((item) => item.question)
   const pendingChecks = attention.filter((item): item is Extract<InboxItem, { kind: "confirm" }> => item.kind === "confirm").map((item) => item.check)
   const prepared = prepareOverviewInputs({
     openWorks: workspace.openWorks, bots: workspace.bots, questions: openQuestions, nodes: workspace.nodes, checks: pendingChecks,
     overview: workspace.overview, jobs: (workspace.data?.scheduler?.jobs ?? []).map((job) => ({ conversation_id: workspace.conversationId, job })),
-    answered: workspace.answered, read, connected: workspace.connectionOnline, terminalCheckPolicy: "web-filtered", botFilter,
-    assignments: workspace.workspaceState?.assignments, workspaceState: workspace.workspaceState ?? undefined,
+    answered: workspace.answered, read, connected: workspace.connectionOnline, terminalCheckPolicy: "web-filtered",
   })
   const overview = prepared.overview
   const activityView = prepared.activities
@@ -80,7 +77,7 @@ export function TasksOverview() {
   const hasContent = visibleCount > 0
   const tasksRead = read && Boolean(workspace.workspaceState)
   // Test all loaded records before filters, including history and work held in 待处理.
-  const hasTaskRecords = Boolean(workspace.workspaceState?.tasks.length || workspace.openWorks.length || overview.tasks.length || activityView.activities.length
+  const hasTaskRecords = Boolean(workspace.workspaceState?.tasks.length || prepared.works.length || overview.tasks.length || activityView.activities.length
     || inbox.some((item) => ["question", "confirm", "failed", "undelivered", "attention", "session"].includes(item.kind)))
   const globallyEmpty = tasksRead && !hasTaskRecords
   const localReadError = readFailure && readFailure.generation === workspace.generation && (readFailure.kind === "workspace" ? !read : !workspace.workspaceState) ? readFailure.cause : null
