@@ -14,7 +14,7 @@ function authorization(order: DeliveryOrder) {
     payment: { chain_id: p.chain_id, asset: p.asset, payer: p.payer, provider_wallet: p.provider_wallet, delivery_fee: p.delivery_fee, reservation_fee: p.reservation_fee, priority_fee: p.priority_fee, total: p.total, gas_cap: p.gas_cap, budget_id: p.budget_id } }
 }
 
-export function shouldPollDelivery(enabled: boolean, orders: readonly DeliveryOrder[]): boolean {
+function shouldPollDelivery(enabled: boolean, orders: readonly DeliveryOrder[]): boolean {
   return enabled || orders.some(needsRefresh)
 }
 

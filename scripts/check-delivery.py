@@ -318,7 +318,7 @@ def sandbox(small=None, resume_run=None):
                 public = None
                 raise ValueError("Proof and resume work items require authoritative Actions provenance")
             if producer is not None:
-                resume_dir = download_inputs(producer, resume_run, small)
+                resume_dir = download_inputs(producer, resume_run)
         with tempfile.TemporaryDirectory(prefix="sandbox-build-", dir=ARTIFACTS) as directory:
             context = Path(directory)
             for file in SANDBOX_FILES:
@@ -897,7 +897,7 @@ def extract_artifact(data, origin, destination):
     return summary
 
 
-def download_inputs(producer, resume_run, item):
+def download_inputs(producer, resume_run):
     checked_producer(producer)
     run_ids = [producer["runId"]]
     if resume_run is not None:
@@ -1767,7 +1767,7 @@ def continuation_self_test(manifest, compiled, profile, vectors, proofs):
                 return data
             raise AssertionError("Unexpected self-test Actions request")
         with patch(f"{__name__}.ARTIFACTS", base / "downloads"), patch(f"{__name__}.gh_api", side_effect=fake_api):
-            downloaded = download_inputs(producer, None, "relation-1")
+            downloaded = download_inputs(producer, None)
             assert len(read_json_bytes((downloaded / "index.json").read_bytes())["artifacts"]) == 1
             assert requests.count(f"artifacts/{origin['artifactId']}/zip") == 1
         with patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": producer["repository"], "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_RUN_ID": "101", "GITHUB_RUN_ATTEMPT": "2", "GITHUB_SHA": commit, "GITHUB_WORKFLOW_REF": producer["repository"] + "/" + WORKFLOW_PATH + "@refs/heads/test"}):
