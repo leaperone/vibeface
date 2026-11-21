@@ -7,27 +7,17 @@ Migration map: ``check-delivery.py:self_test`` → ``fixture_check`` and
 
 from __future__ import annotations
 
-import argparse
-import contextlib
-import errno
 import hashlib
 import importlib.util
-import io
-import json
 import os
 from pathlib import Path
-import platform
 import re
-import shutil
 import signal
-import stat
 import subprocess
 import sys
 import tempfile
 import time
 import types
-import uuid
-import zipfile
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -47,7 +37,6 @@ from tests.delivery.test_fixture_continuation import run_continuation
 
 def self_test_fixture(subject):
     from copy import deepcopy
-    from unittest.mock import patch
     manifest = {"schemaVersion": 1, "imageId": "11" * 32, "schemaHash": "22" * 32, "elfSha256": "33" * 32,
                 "proofs": [{"receipt": f"relation-{relation}.receipt", "public": f"relation-{relation}.json"} for relation in range(1, 5)]}
     compiled = {key: manifest[key] for key in ("imageId", "schemaHash", "elfSha256")}

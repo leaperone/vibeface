@@ -29,13 +29,13 @@ export type WriteRequests = {
 export type WriteMethod = keyof WriteRequests
 export type SignedOperation = { [M in WriteMethod]: { method: M; params: SignedRequest<M> } }[WriteMethod]
 export type SignedRequest<M extends WriteMethod> = WriteRequests[M] & { attestation: Attestation }
-export function parseAttestation(value: unknown): Attestation {
+function parseAttestation(value: unknown): Attestation {
   const data = record(value), signature = text(data.signature)
   if (!/^[a-f0-9]{128}$/.test(signature)) throw new Error('invalid signature')
   return { device_id: validTarget(data.device_id), signature }
 }
 /** Narrow request projections, shared by the writer and persistence decoder. */
-export function parseWriteRequest(method: WriteMethod, value: unknown): WriteRequests[WriteMethod] {
+function parseWriteRequest(method: WriteMethod, value: unknown): WriteRequests[WriteMethod] {
   const p = record(value)
   switch (method) {
     case 'message': return parseMessageRequest(p)

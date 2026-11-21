@@ -27,7 +27,7 @@ const label = (connection: Connection) => connection.state === 'online' && conne
 const describe = (connection: Connection) => [connection.entry, connection.state === 'online' ? '已加密' : null, label(connection)].filter(Boolean).join(' · ')
 
 /** As the web's connection capsule: the entry device by name, a shield once the encrypted link is up. */
-export function ConnectionPill({ connection }: { connection: Connection }) {
+function ConnectionPill({ connection }: { connection: Connection }) {
   const look = looks[connection.state]
   return <View accessible accessibilityLabel={describe(connection)} className="min-h-11 flex-row items-center gap-2 px-2 py-2">
     <Icon as={look.icon} className={cn('size-4', toneText[look.tone])} />

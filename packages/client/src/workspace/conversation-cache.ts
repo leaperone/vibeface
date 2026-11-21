@@ -6,7 +6,7 @@ export type ConversationCacheScope = { networkId: string; deviceId: string }
 export type ConversationCacheKey = ConversationCacheScope & { conversationId: string }
 export type CachedConversation = ConversationCacheKey & { savedAt: number; payload: ConversationPayload }
 export const conversationCacheStorageKey = 'vibeface.conversation-cache'
-export const conversationCacheLimits = { maxBytes: 12 * 1024 * 1024, maxConversations: 40 }
+const conversationCacheLimits = { maxBytes: 12 * 1024 * 1024, maxConversations: 40 }
 
 /** The parser consumes local jobs, whereas the presentation payload also contains merged owner jobs. */
 function parsePayload(value: unknown, conversationId: string): ConversationPayload {

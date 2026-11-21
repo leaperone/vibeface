@@ -65,7 +65,7 @@ export type ProviderChange = {
   /** opencode only. `null` removes the endpoint and its token; `api_key` omitted keeps the stored token, `null` deletes it. */
   opencode_endpoint?: { protocol: EndpointProtocol; base_url: string; models: string[]; api_key?: string | null } | null
 }
-export const endpointProtocols = ['openai_compatible', 'anthropic', 'openai'] as const
+const endpointProtocols = ['openai_compatible', 'anthropic', 'openai'] as const
 export type EndpointProtocol = typeof endpointProtocols[number]
 /** opencode's custom model service; its models run as `custom/<model>`. The token never comes back, only whether one is stored. */
 export type ProviderEndpoint = { protocol: EndpointProtocol; base_url: string; models: string[]; has_api_key: boolean }
@@ -322,14 +322,14 @@ function parseIssue(value: unknown): ProviderIssue {
     default: throw new Error('AI 状态格式不对。')
   }
 }
-export const probeCodes = ['not_installed', 'config_invalid', 'missing_credential', 'launch_unverified', 'launch_failed', 'sign_in_required', 'authentication_unverified', 'catalog_unavailable', 'model_unverified', 'model_unavailable'] as const
+const probeCodes = ['not_installed', 'config_invalid', 'missing_credential', 'launch_unverified', 'launch_failed', 'sign_in_required', 'authentication_unverified', 'catalog_unavailable', 'model_unverified', 'model_unavailable'] as const
 export type ProbeCode = typeof probeCodes[number]
 export type ProbeIssue = { stage: 'install' | 'launch' | 'authentication' | 'model_list'; code: ProbeCode; kind?: FailureKind; safe_error?: string }
 export type ProviderReadiness = { state: 'ready' | 'starting' } | { state: 'unverified' | 'needs_setup'; issue: ProbeIssue }
 export type ModelEffort = { state: 'unknown' | 'provider_controlled' } | { state: 'selectable'; options: string[]; default: string | null }
 export type ModelChoice = { id: string; name: string; default: boolean; effort: ModelEffort }
 export type ModelCatalog = { state: 'unavailable'; reason: ProbeCode } | { state: 'available'; models: ModelChoice[]; coverage: 'partial' | 'complete' | 'account_available' }
-export function parseProbeIssue(value: unknown): ProbeIssue {
+function parseProbeIssue(value: unknown): ProbeIssue {
   const v = record(value, '检查原因')
   return { stage: oneOf(v.stage, ['install', 'launch', 'authentication', 'model_list']), code: oneOf(v.code, probeCodes), ...(v.kind == null ? {} : { kind: oneOf(v.kind, failureKinds) }), ...(v.safe_error == null ? {} : { safe_error: text(v.safe_error) }) }
 }

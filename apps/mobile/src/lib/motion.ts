@@ -1,7 +1,6 @@
 import { arcTokens } from '@vibeface/theme/tokens'
 import { cubicBezier, Easing, FadeIn, FadeOut, LinearTransition, ReduceMotion } from 'react-native-reanimated'
 
-export const quick = arcTokens.duration.fast
 export const settle = arcTokens.duration.standard
 export const easeOut = Easing.bezier(...arcTokens.ease.standard)
 export const cssEaseOut = cubicBezier(...arcTokens.ease.standard)

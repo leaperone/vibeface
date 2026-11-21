@@ -22,7 +22,7 @@ function epoch(value: unknown): number {
   if (value !== DATA_EPOCH) throw new Error('记忆数据版本不一致，请更新设备后再试。')
   return value
 }
-export function parseMemoryBase(value: unknown): MemoryBase {
+function parseMemoryBase(value: unknown): MemoryBase {
   const data = record(value), version = data.version === null ? null : record(data.version)
   return { epoch: epoch(data.epoch), version: version && { revision: hash(version.revision), control_revision: counter(version.control_revision), source_event_hash: hash(version.source_event_hash) } }
 }
@@ -78,7 +78,7 @@ export const memorySyncConflictLabel = (reason: MemorySyncConflicts['items'][num
 export const memorySaved = (result: MemoryControlResult) => result.state === 'applied' || result.state === 'already_recorded'
 export const memoryResultLabel = (result: MemoryControlResult) => memorySaved(result) ? result.current?.text === null ? '记忆已删除。' : '记忆已保存。' : result.state === 'superseded' ? '这次修改已记录，但已被其他修改替代。草稿已保留。' : '当前版本与草稿基准不同，草稿已保留。未确认的原操作需等待设备同步确认。'
 
-export function afterText(value: unknown): string | null {
+function afterText(value: unknown): string | null {
   if (value === null) return null
   const after = text(value, '记忆内容')
   if (!after.trim() || [...after].length > 500) throw new Error('记忆须为 1 至 500 个字符。')

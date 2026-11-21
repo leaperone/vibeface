@@ -12,7 +12,7 @@ export type Pose = {
 }
 export type Colors = { top: string; base: string; bottom: string; ink: string; ring: string; thought: string }
 
-export const SAMPLES = 48
+const SAMPLES = 48
 /** Body radius in the 100 viewBox; the halo ring sits a 1.5 gap outside it. */
 export const BODY = 36
 export const HALO = { r: BODY + 1.5 + 1.2, width: 2.4 }
@@ -157,7 +157,7 @@ export function colors(face: Face, dark: boolean, saturation: number): Colors {
 }
 
 // OKLCH to sRGB hex; chroma shrinks until the colour fits the gamut so hue and lightness hold.
-export function oklch(l: number, c: number, h: number) {
+function oklch(l: number, c: number, h: number) {
   const a = h * Math.PI / 180
   for (let chroma = c; ; chroma = Math.max(0, chroma - 0.005)) {
     const rgb = oklabToSrgb(l, chroma * Math.cos(a), chroma * Math.sin(a))
