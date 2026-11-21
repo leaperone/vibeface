@@ -175,6 +175,8 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const usable = !!device.identity && !['blocked', 'key_lost', 'initializing', 'removed', 'restarting'].includes(device.phase)
   const thisComputer = device.localSetup?.kind === 'uninitialized'
   const linking = busy || ['connecting', 'reconnecting'].includes(device.phase)
+  // The official page waits for a link a Node sent; someone with no link, no saved address and no past membership may have no Node yet.
+  const newcomer = official && !removed && !device.initialInvitation && !device.entries.length && purpose !== 'link' && !scanning
   // A newly opened link replaces whatever is here, including a spent one, and the failure that came with it.
   useEffect(() => { if (device.initialInvitation) { setInvitation(device.initialInvitation); setError(''); setNotice('') } }, [device.initialInvitation])
   // A link is single-use: once its request ends without joining, offering 继续 again only leads to "已用过".
@@ -304,6 +306,10 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
           {purpose === 'link' ? <Button type="submit" className="w-fit justify-self-end" aria-busy={linking || undefined}>{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}{linking ? joinCopy.joining : joinCopy.join}</Button> : null}
         </fieldset>
       </form>}
+      {newcomer ? <div className="grid justify-items-start gap-0.5 text-sm text-secondary">
+        <p className="font-medium">{joinCopy.noComputer}</p>
+        <a href={joinCopy.installGuide} target="_blank" rel="noopener noreferrer" className="underline">{joinCopy.installFirst}</a>
+      </div> : null}
     </Panel>
   }
 
