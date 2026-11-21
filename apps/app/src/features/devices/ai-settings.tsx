@@ -172,13 +172,14 @@ function openProvider(provider: ProviderId) {
 }
 
 type Change = ProviderChange
-type Failure = { at: ProviderId | "roots" | null; cause: unknown }
+/** `connect`: from connecting local services, which onboarding starts without being asked. */
+type Failure = { at: ProviderId | "roots" | null; cause: unknown; connect?: true }
 
 /**
  * The AI on the device this browser is connected to: which provider runs the bot, whether
  * Codex executes tasks, each provider's program and variables, and the folders it may use. Every
  * change saves right away. Variable values are write-only; the device only says which are set.
- * `onboarding` keeps only the choice of the provider that runs the bot, with the step's own footer.
+ * `onboarding` keeps only the choice of the provider that runs the bot, with the step's own footer; its 下一步 saves the choice.
  */
 export function AiSettings({ onboarding = false, compact = false, targetName, onNext, onInitialRead }: { onboarding?: boolean; compact?: boolean; targetName?: string; onNext?(): void; onInitialRead?(): void }) {
   const { ready } = useDevice()
@@ -192,6 +193,8 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
   const pendingFocus = useRef<typeof ready>(null)
   const [localResult, setLocalResult] = useState("")
   const [needsRead, setNeedsRead] = useState(false)
+  // Onboarding's pick; until one is made it follows the provider the device already runs the bot on.
+  const [draft, setDraft] = useState<ProviderId | null>(null)
 
   async function call(key: string, at: Failure["at"], method: string, params?: Change | NodeSettings) {
     if (!ready?.isCurrent()) return false
@@ -295,23 +298,31 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
       if (owner !== sequence.current || !connection.isCurrent()) return
       setLocalResult(failures.length ? "部分服务未完成，检查下方结果后重试。" : "检测已完成，接入结果见下方。")
       setNeedsRead(!reconciled)
-      if (failures.length) setError({ at: null, cause: new Error(failures.join("\n")) })
+      if (failures.length) setError({ at: null, cause: new Error(failures.join("\n")), connect: true })
       if (workspace.isCurrent()) await workspace.refresh()
     } catch (cause) {
-      if (owner === sequence.current && connection.isCurrent()) setError({ at: null, cause })
+      if (owner === sequence.current && connection.isCurrent()) setError({ at: null, cause, connect: true })
     } finally {
       if (connecting.current === connection) connecting.current = null
       if (owner === sequence.current) setBusy("")
     }
   }
-  /** Onboarding's choice makes the same write as 运行 Bot; a failed one is read back before another choice can start. */
-  async function chooseBot(item: ProviderStatus) {
-    if (!response || needsRead || busy && busy !== "load" || item.roles.includes("agent")) return
-    if (await call(`${item.provider}:bot`, item.provider, "configure_provider", { provider: item.provider, ...botOnChange(response, item) }) || !ready?.isCurrent()) return
-    const owner = sequence.current
-    setBusy("reconcile")
-    const read = await reconcile()
-    if (owner === sequence.current) { setBusy(""); setNeedsRead(!read) }
+  /** Onboarding's 下一步 makes the same write as 运行 Bot for a pick the device does not run yet; a failed one is read back and keeps the step. */
+  async function saveBot(item: ProviderStatus) {
+    if (!response || needsRead || busy && busy !== "load") return
+    if (!item.roles.includes("agent")) {
+      if (!await call(`${item.provider}:bot`, item.provider, "configure_provider", { provider: item.provider, ...botOnChange(response, item) })) {
+        if (!ready?.isCurrent()) return
+        const owner = sequence.current
+        setBusy("reconcile")
+        const read = await reconcile()
+        if (owner === sequence.current) { setBusy(""); setNeedsRead(!read) }
+        return
+      }
+      // The next step reads bot readiness from `nodes`; this one is gone before the effect below would read them again.
+      if (workspace.isCurrent()) void workspace.refresh().catch(() => {})
+    }
+    onNext?.()
   }
   const starting = response?.providers.some((item) => item.state === "starting")
   // Nothing pushes a device's bot readiness or folders; the device list, the inbox, onboarding and the new bot form read them from `nodes`, so read them again when they move.
@@ -327,12 +338,18 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
   if (onboarding) {
     const options = response ? providerGroups(response.providers).shown.filter((item) => item.supports.includes("agent")) : null
     const chosen = response?.providers.find((item) => item.roles.includes("agent"))
-    const pending = response?.providers.find((item) => busy === `${item.provider}:bot`)
-    // Also why 下一步 is disabled, so it is never empty while the button is.
-    const why = !response && error ? "重试后才能选择" : needsRead ? "重新读取后才能选择"
+    const picked = options?.find((item) => item.provider === (draft ?? chosen?.provider))
+    const saving = response?.providers.find((item) => busy === `${item.provider}:bot`)
+    const writing = Boolean(saving) || busy === "reconcile"
+    // The Cursor check runs unasked, so its failure stays out of the way unless only 重新读取 can clear what it left unknown.
+    const shownError = error?.connect && !needsRead ? null : error
+    // Why 下一步 is disabled, so the line is never empty while the button is; otherwise what 下一步 saves.
+    const blocked = !response && error ? "重试后才能选择" : needsRead ? "重新读取后才能继续"
       : !response || busy === "connect_local" ? "正在检测这台电脑的 AI 服务"
-      : pending ? `正在让 ${providerNames[pending.provider]} 运行 Bot` : busy === "reconcile" ? "正在确认刚才的选择"
-      : chosen ? "" : "先选一项 AI 服务"
+      : saving ? `正在让 ${providerNames[saving.provider]} 运行 Bot` : busy === "reconcile" ? "正在确认刚才的设置"
+      : picked ? "" : "先选一项 AI 服务"
+    const status = blocked || !response || !picked ? blocked : picked.roles.includes("agent") ? `${providerNames[picked.provider]} 已设为运行 Bot`
+      : botOnChange(response, picked).execution ? "下一步会让所选服务运行 Bot，也打开它的「执行任务」" : "下一步会让所选服务运行 Bot"
     return <>
       {options?.length === 0 ? <div className="grid gap-3">
         <p className="text-sm text-secondary">这台电脑上还没找到 AI 服务。装好 Codex、Claude Code 或 Cursor 后，再检测一次。</p>
@@ -340,21 +357,23 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
           <Button type="button" variant="secondary" disabled={busy !== ""} aria-busy={busy !== "" || undefined} onClick={() => void load()}><BusyIcon busy={busy === "load" || busy === "connect_local"} icon={RotateCw} />再检测一次</Button>
           <a className="hit-area relative text-sm font-medium text-foreground underline underline-offset-4" href={docs + "node.md#配置管理-agent"} target="_blank" rel="noopener noreferrer">怎么安装</a>
         </div>
-        {error ? <InlineError error={error.cause} /> : null}
+        {shownError ? <InlineError error={shownError.cause} /> : null}
       </div> : <>
-        <p className="text-sm text-secondary">选一项 AI 服务，让 Bot 在这台电脑上回复消息。需要登录或设置的服务也能先选，之后在「设备」中完成。</p>
+        <p className="text-sm text-secondary">选一项 AI 服务，让 Bot 在这台电脑上回复消息。需要登录或设置的服务也能先选，之后在「设置 → 我的设备」中完成。</p>
         <div className="grid gap-3">
-          {options ? <RadioGroup label="这台电脑上的 AI 服务" value={pending?.provider ?? chosen?.provider ?? ""}
+          {/* Held while 下一步 saves, so the step never moves on with a pick other than the one saved. */}
+          {options ? <RadioGroup label="这台电脑上的 AI 服务" value={picked?.provider ?? ""}
             options={options.map((item) => ({ value: item.provider, label: providerNames[item.provider], description: choiceNote(item) }))}
-            onValueChange={(value) => { const item = options.find((option) => option.provider === value); if (item) void chooseBot(item) }} />
+            onValueChange={(value) => { const item = options.find((option) => option.provider === value); if (item && !writing) setDraft(item.provider) }} />
             : error ? null : <div className="grid gap-2"><Skeleton className="h-14" /><Skeleton className="h-14" /></div>}
-          {error ? <InlineError error={error.cause} action={!response ? { label: "重试", onClick: () => void load() } : needsRead ? { label: "重新读取", onClick: () => void load() } : undefined} /> : null}
-          <p id="bot-choice-status" role="status" className="min-h-5 text-sm text-secondary">{why}</p>
+          {shownError ? <InlineError error={shownError.cause} action={!response ? { label: "重试", onClick: () => void load() } : needsRead ? { label: "重新读取", onClick: () => void load() } : undefined} /> : null}
+          <p id="bot-choice-status" role="status" className="min-h-5 text-sm text-secondary">{status}</p>
         </div>
       </>}
       <div className="flex justify-end gap-2 border-t pt-4">
-        <Button type="button" variant="ghost" onClick={onNext}>稍后设置</Button>
-        {options?.length === 0 ? null : <Button type="button" disabled={Boolean(why)} aria-describedby={why ? "bot-choice-status" : undefined} onClick={onNext}>下一步</Button>}
+        <Button type="button" variant="ghost" disabled={writing} aria-describedby={writing ? "bot-choice-status" : undefined} onClick={onNext}>稍后设置</Button>
+        {options?.length === 0 ? null : <Button type="button" disabled={Boolean(blocked)} aria-busy={writing || undefined} aria-describedby={status ? "bot-choice-status" : undefined}
+          onClick={() => { if (picked) void saveBot(picked) }}><BusyIcon busy={writing} />下一步</Button>}
       </div>
     </>
   }
@@ -646,13 +665,14 @@ function KeyField({ name, working, busy, more, save }: { name: string; working: 
   </form>
 }
 
-/** An option's state in onboarding; one that still needs setup can be picked and says what is left for 设备. */
+/** An option's state in onboarding; one that still needs setup can be picked and says where what is left gets done. */
 function choiceNote(item: ProviderStatus): string {
   const usable = availability(item)
   if (usable !== "needs_setup") return states[usable].label
   const issue = item.state === "needs_setup" ? item.issues.find((issue) => issue.code !== "env_missing" || canSetProviderEnvironment(item.provider, issue.name)) : undefined
   const readiness = summaryReadiness(item)
-  return `${states.needs_setup.label} · ${issue ? `${issueText(item.provider, issue)}，之后在「设备」中处理` : 'issue' in readiness ? probeIssueText(item.provider, readiness.issue) : "之后在「设备」中处理"}`
+  const later = "之后在「设置 → 我的设备」中处理"
+  return `${states.needs_setup.label} · ${issue ? `${issueText(item.provider, issue)}，${later}` : 'issue' in readiness ? probeIssueText(item.provider, readiness.issue) : later}`
 }
 
 const botFields = ["model", "workspace"] as const

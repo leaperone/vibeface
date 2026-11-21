@@ -2582,8 +2582,8 @@ test("automatic connection checks the three local services without changing uses
   })
 })
 
-test('onboarding picks the bot provider with the 运行 Bot write and reads back an unknown result before another pick', async (t) => {
-  for (const outcome of ['chosen', 'unknown', 'unreadable']) await t.test(outcome, async () => {
+test('onboarding saves the picked bot provider only on 下一步 and reads back an unknown result before another try', async (t) => {
+  for (const outcome of ['chosen', 'applied', 'not-applied', 'unreadable']) await t.test(outcome, async () => {
     const unverified = { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } } as const
     const codex: ProviderStatus = {
       provider: 'codex', authentication_source: 'private_login', roles: [], supports: ['agent', 'execution'], bin: '/fixture/codex', app_server: null,
@@ -2612,44 +2612,104 @@ test('onboarding picks the bot provider with the 运行 Bot write and reads back
     const render = () => app.render('AiSettings', { onboarding: true, onNext: () => { next++ } })
     const settle = async () => { for (let turn = 0; turn < 3; turn++) { await settleComponent(); render() } }
     const choice = () => render().find(({ type }) => type === 'RadioGroup')
-    const nextButton = () => render().find(({ type, props }) => type === 'Button' && elementText(props.children) === '下一步')
+    const button = (label: string) => render().find(({ type, props }) => type === 'Button' && elementText(props.children) === label)
+    const status = () => elementText(render().find(({ props }) => props.id === 'bot-choice-status')?.props.children)
     const pick = () => (choice()?.props.onValueChange as (value: string) => void)('codex')
+    const press = () => (button('下一步')?.props.onClick as () => void)()
+    const writes = () => calls.filter((call) => call.method === 'configure_provider')
     try {
       render(); await settle()
       assert.deepEqual(JSON.parse(JSON.stringify(choice()?.props.options)).map((option: { value: string }) => option.value), ['codex'], 'only found services that can run the bot are offered')
       assert.equal(choice()?.props.value, '')
       assert.deepEqual(calls.map((call) => call.method), ['node_settings'], 'entering the step neither connects Codex or Claude Code nor picks a service')
-      assert.equal(nextButton()?.props.disabled, true)
-      assert.equal(nextButton()?.props['aria-describedby'], 'bot-choice-status')
-      assert.ok(render().some(({ props }) => props.id === 'bot-choice-status' && elementText(props.children) === '先选一项 AI 服务'), 'the disabled 下一步 says why')
-      pick(); pick()
-      const writes = () => calls.filter((call) => call.method === 'configure_provider')
-      assert.deepEqual(JSON.parse(JSON.stringify(writes())), [{ method: 'configure_provider', params: { provider: 'codex', bot: true, execution: true } }], 'one pick is the same write as 运行 Bot on a fresh device')
-      assert.equal(choice()?.props.value, 'codex', 'the pending pick stays shown')
-      if (outcome === 'chosen') write.resolve(chosen)
-      else write.reject(new Error('client response timed out; outcome may be unknown'))
-      await settle()
-      if (outcome !== 'chosen') {
-        assert.equal(calls.at(-1)?.method, 'node_settings', 'an unknown write is read back instead of resent')
-        pick()
-        assert.equal(writes().length, 1, 'no other pick starts before the read-back')
-        if (outcome === 'unknown') readback.resolve(chosen)
-        else readback.reject(new Error('device read failed'))
-        await settle()
-        assert.ok(render().some(({ type }) => type === 'InlineError'), 'the failed write stays shown')
+      assert.equal(button('下一步')?.props.disabled, true)
+      assert.equal(button('下一步')?.props['aria-describedby'], 'bot-choice-status')
+      assert.equal(status(), '先选一项 AI 服务', 'the disabled 下一步 says why')
+      pick()
+      assert.equal(choice()?.props.value, 'codex')
+      assert.equal(writes().length, 0, 'a pick, by arrow key too, only changes the draft')
+      assert.equal(button('下一步')?.props.disabled, false)
+      assert.equal(status(), '下一步会让所选服务运行 Bot，也打开它的「执行任务」', 'on a fresh device the bot write also executes tasks, said before it is made')
+      press(); press()
+      assert.deepEqual(JSON.parse(JSON.stringify(writes())), [{ method: 'configure_provider', params: { provider: 'codex', bot: true, execution: true } }], 'one 下一步 is the same write as 运行 Bot on a fresh device')
+      assert.equal(status(), '正在让 Codex 运行 Bot')
+      assert.equal(button('下一步')?.props.disabled, true)
+      assert.equal(button('稍后设置')?.props.disabled, true, 'the step cannot be left while its write is pending')
+      if (outcome === 'chosen') {
+        write.resolve(chosen); await settle()
+        assert.equal(next, 1, 'a saved pick moves on')
+        return
       }
+      write.reject(new Error('client response timed out; outcome may be unknown')); await settle()
+      assert.equal(calls.at(-1)?.method, 'node_settings', 'an unknown write is read back instead of resent')
+      press()
+      assert.equal(writes().length, 1, 'no other try starts before the read-back')
+      assert.equal(button('稍后设置')?.props.disabled, true)
+      if (outcome === 'unreadable') readback.reject(new Error('device read failed'))
+      else readback.resolve(outcome === 'applied' ? chosen : initial)
+      await settle()
+      assert.ok(render().some(({ type }) => type === 'InlineError'), 'the failed write stays shown')
+      assert.equal(choice()?.props.value, 'codex', 'the pick stays')
+      assert.equal(next, 0, 'a failed write keeps the step')
+      assert.equal(button('稍后设置')?.props.disabled, false)
       if (outcome === 'unreadable') {
-        pick()
-        assert.equal(writes().length, 1, 'an unreadable result blocks another pick until it is read again')
-        assert.equal(nextButton()?.props.disabled, true)
+        press()
+        assert.equal(writes().length, 1, 'an unreadable result blocks another try until it is read again')
+        assert.equal(button('下一步')?.props.disabled, true)
+        assert.equal(status(), '重新读取后才能继续')
         const action: unknown = render().find(({ type }) => type === 'InlineError')?.props.action
         assert.ok(action && typeof action === 'object' && 'label' in action && action.label === '重新读取')
         return
       }
-      assert.equal(choice()?.props.value, 'codex')
-      assert.equal(nextButton()?.props.disabled, false)
-      nextButton()?.props.onClick?.()
-      assert.equal(next, 1)
+      if (outcome === 'applied') assert.equal(status(), 'Codex 已设为运行 Bot')
+      press()
+      assert.equal(writes().length, outcome === 'applied' ? 1 : 2, 'a read-back showing the write applied moves on without sending it again')
+      assert.equal(next, outcome === 'applied' ? 1 : 0)
+    } finally { app.close() }
+  })
+})
+
+test('onboarding keeps the unasked Cursor check quiet unless only reading again can clear its result', async (t) => {
+  for (const outcome of ['read-back', 'unreadable']) await t.test(outcome, async () => {
+    const unverified = { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } } as const
+    const cursor: ProviderStatus = {
+      provider: 'cursor', authentication_source: 'local_cli_login', roles: [], supports: ['agent', 'execution'], bin: '/fixture/agent', app_server: null,
+      endpoint: null, execution_model: '', execution_readiness: unverified, setup: null, installed: true, home: null, sessions: null, env: [],
+      state: 'off', issues: [], readiness: unverified,
+      probe: { provider: 'cursor', config_id: 'fixture', checked_at_ms: null, launch: { state: 'unchecked' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null },
+      observed: { installed: { status: 'confirmed', evidence: 'binary_discovery' }, launchable: { status: 'unknown', evidence: 'launch_prerequisites' }, authenticated: { status: 'unknown', evidence: 'authentication_not_observed' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } },
+    }
+    const initial: NodeSettingsResponse = { settings: { roots: [], manager: null }, defaults: { workspace: '/project' }, readiness: { manager: null }, providers: [cursor], display_paths: {}, suggested_roots: [] }
+    const calls: string[] = []
+    const connection = { isCurrent: () => true, request: async (method: string) => {
+      calls.push(method)
+      if (method === 'configure_provider') throw new Error('client response timed out; outcome may be unknown')
+      if (calls.length > 1 && outcome === 'unreadable') throw new Error('device read failed')
+      return initial
+    } }
+    const app = componentHarness('../devices/ai-settings.tsx', {
+      '@vibeface/client/lib/node.ts': nodeSettings,
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: connection }) },
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({ isCurrent: () => true, refresh: async () => {} }) },
+      '@vibeface/client/identity/copy.ts': { deviceCopy },
+      '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') },
+      '@/lib/glossary': { terms: { bot: { icon: 'Bot' }, task: { icon: 'Tasks' } } },
+    }, { window: { addEventListener() {}, removeEventListener() {} } })
+    const render = () => app.render('AiSettings', { onboarding: true, onNext() {} })
+    try {
+      render(); for (let turn = 0; turn < 5; turn++) { await settleComponent(); render() }
+      assert.deepEqual(calls, ['node_settings', 'configure_provider', 'node_settings'], 'the failed check is read back, not sent again')
+      const elements = render()
+      const shown = elements.find(({ type }) => type === 'InlineError')
+      const status = elementText(elements.find(({ props }) => props.id === 'bot-choice-status')?.props.children)
+      if (outcome === 'read-back') {
+        assert.equal(shown, undefined, 'a check nobody asked for does not fail loudly')
+        assert.equal(status, '先选一项 AI 服务')
+        return
+      }
+      const action: unknown = shown?.props.action
+      assert.ok(action && typeof action === 'object' && 'label' in action && action.label === '重新读取', 'an unknown result comes with the one action that clears it')
+      assert.equal(status, '重新读取后才能继续')
     } finally { app.close() }
   })
 })
