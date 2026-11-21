@@ -24,8 +24,10 @@ import traceback
 import urllib.parse
 import urllib.request
 import uuid
+from functools import partial
 
 from verification.resource import oom_delta, resources
+from verification.io import atomic_write as _atomic_write, digest_bytes, digest_file, read_bounded, save_json as _save_json
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -44,6 +46,13 @@ NOT_CHECKED = ["old fee5 failure remains its original baseline", "same bytes or 
 
 class CheckFailure(RuntimeError):
     pass
+
+
+digest = digest_bytes
+file_digest = digest_file
+read_regular = partial(read_bounded, error=CheckFailure)
+durable = partial(_atomic_write, allowed_root=ARTIFACTS, error=CheckFailure)
+save_json = partial(_save_json, allowed_root=ARTIFACTS, error=CheckFailure)
 
 
 def need(value, code):
@@ -655,48 +664,6 @@ def wait_observer_ready():
 
 def exact(value, fields, code):
     need(isinstance(value, dict) and set(value) == set(fields), code)
-
-
-def digest(data):
-    return hashlib.sha256(data).hexdigest()
-
-
-def read_regular(path, limit, *, private=False):
-    info = path.lstat()
-    need(stat.S_ISREG(info.st_mode) and 0 < info.st_size <= limit, "bounded_regular_file_required")
-    if private:
-        need(info.st_uid == os.getuid() and not info.st_mode & 0o077, "owner_only_file_required")
-    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
-        data = stream.read(limit + 1)
-    need(0 < len(data) <= limit, "bounded_file_read_required")
-    return data
-
-
-def file_digest(path):
-    value = hashlib.sha256()
-    with path.open("rb") as stream:
-        for part in iter(lambda: stream.read(1024 * 1024), b""):
-            value.update(part)
-    return value.hexdigest()
-
-
-def durable(path, data):
-    need(path.parent.resolve().is_relative_to(ARTIFACTS.resolve()), "write_outside_task_artifacts")
-    temporary = path.with_name("." + path.name + "." + uuid.uuid4().hex)
-    with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb") as output:
-        output.write(data)
-        output.flush()
-        os.fsync(output.fileno())
-    os.replace(temporary, path)
-    descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def save_json(path, value):
-    durable(path, (json.dumps(value, indent=2, sort_keys=True) + "\n").encode())
 
 
 def validate_config(value):

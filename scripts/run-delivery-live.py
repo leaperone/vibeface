@@ -7,7 +7,6 @@ import release_context
 import release_format
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -25,33 +24,11 @@ import uuid
 from unittest import TestCase
 
 from verification.resource import oom_delta, resources
+from verification.io import digest_bytes, digest_file as digest, regular, replace_public, write_private
 
 
 ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = ROOT / ".artifacts/vdp"
-
-
-def digest(file):
-    value = hashlib.sha256()
-    with file.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            value.update(block)
-    return value.hexdigest()
-
-
-def regular(file, limit=1024 * 1024):
-    if file.is_symlink() or not file.is_file() or not 0 < file.stat().st_size <= limit:
-        raise ValueError("Expected a bounded regular input file")
-    return file.read_bytes()
-
-
-def write_private(file, value):
-    descriptor = os.open(file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "w") as output:
-        json.dump(value, output, indent=2)
-        output.write("\n")
-        output.flush()
-        os.fsync(output.fileno())
 
 
 def source_commit(expected):
@@ -145,13 +122,6 @@ def runtime(binary, module, destination, log, environment):
         if not glibc_failure(destination, log):
             raise
         return False
-
-
-def replace_public(file, value):
-    temporary = file.with_name("." + file.name + "." + uuid.uuid4().hex)
-    write_private(temporary, value)
-    temporary.chmod(0o644)
-    os.replace(temporary, file)
 
 
 def self_test_source_cli(directory):
@@ -322,8 +292,8 @@ def observer_bindings(run, expected):
     observer = runpy.run_path(str(ROOT / OBSERVER_SCRIPT))
     native = run / "native/public/native-result.json"
     return {"sourceCommit":expected,"runBindingSha256":observer["run_binding"](run, configuration, ROOT),
-        "configurationSha256":hashlib.sha256(configuration).hexdigest(),"scriptSha256":digest(ROOT / OBSERVER_SCRIPT),
-        "proverSha256":config["sha256"]["prover"],"nativeResultSha256":hashlib.sha256(regular(native,131072)).hexdigest() if native.is_file() and not native.is_symlink() else None}
+        "configurationSha256":digest_bytes(configuration),"scriptSha256":digest(ROOT / OBSERVER_SCRIPT),
+        "proverSha256":config["sha256"]["prover"],"nativeResultSha256":digest_bytes(regular(native,131072)) if native.is_file() and not native.is_symlink() else None}
 
 
 def project_observer_summary(value, bindings):
@@ -795,7 +765,7 @@ def protected_public(run, expected, returncode):
             receipt_bytes = regular(source / receipt_name,16384)
             metadata_bytes = regular(source / public_name,16384)
             metadata = json.loads(metadata_bytes)
-            if hashlib.sha256(receipt_bytes).hexdigest() != fact["receiptSha256"] or hashlib.sha256(metadata_bytes).hexdigest() != fact["publicSha256"] or metadata["journalHash"] != fact["journalHash"]:
+            if digest_bytes(receipt_bytes) != fact["receiptSha256"] or digest_bytes(metadata_bytes) != fact["publicSha256"] or metadata["journalHash"] != fact["journalHash"]:
                 raise ValueError("changed proof pair")
             certified = {key:fact[key] for key in ("relation","public","receipt","receiptSha256","publicSha256","journalHash")}
             certified.update(official_host_verified=True,wrong_journal_receipt_comparison_rejected=True)
@@ -820,12 +790,12 @@ def protected_public(run, expected, returncode):
         recognized.add(name)
         try:
             data = regular(source / name,65536 if name == "registration-diagnostics.json" else 131072)
-            if not isinstance(checksum,str) or not re.fullmatch(r"[0-9a-f]{64}",checksum) or hashlib.sha256(data).hexdigest() != checksum:
+            if not isinstance(checksum,str) or not re.fullmatch(r"[0-9a-f]{64}",checksum) or digest_bytes(data) != checksum:
                 raise ValueError("changed public report")
             if name == "registration-diagnostics.json":
                 driver = runpy.run_path(str(ROOT / "scripts/verify-delivery-protected.py"))
                 native_bytes = regular(source / "native-result.json",131072)
-                if hashlib.sha256(native_bytes).hexdigest() != certified_files.get("native-result.json"):
+                if digest_bytes(native_bytes) != certified_files.get("native-result.json"):
                     raise ValueError("Unauthenticated registration diagnostic source")
                 native = json.loads(native_bytes)
                 if native.get("source_commit") != expected:
@@ -842,7 +812,7 @@ def protected_public(run, expected, returncode):
                         native.get("profile_id"), native.get("principals", {}), native.get("orders", []), qualified)
                     if projected["profile_id"] is not None:
                         profile_bytes = regular(ROOT / "crates/delivery/proof/profile.json", 16384)
-                        if hashlib.sha256(profile_bytes).hexdigest() != projected["artifact_sha256"]["profile"] \
+                        if digest_bytes(profile_bytes) != projected["artifact_sha256"]["profile"] \
                                 or driver["profile_id"](driver["diagnostic_json"](profile_bytes)) != projected["profile_id"]:
                             raise ValueError("Proof diagnostic profile differs from the final source")
                     proof_diagnostic_binding = (native, projected)
@@ -907,7 +877,7 @@ def protected_public(run, expected, returncode):
         if set(manifest) != {"summary","sha256","nativeExitCode","observerExitCode"} or manifest["summary"] != "restart-observer-summary.json":
             raise ValueError("Invalid observer manifest")
         data = regular(run / "restart-observer-summary.json",16384)
-        if hashlib.sha256(data).hexdigest() != manifest["sha256"]:
+        if digest_bytes(data) != manifest["sha256"]:
             raise ValueError("Changed observer summary")
         candidate,observer_passed = project_observer_summary(json.loads(data),observer_bindings(run,expected))
         if any(candidate[name] != manifest[name] for name in ("nativeExitCode","observerExitCode")):
@@ -1416,7 +1386,7 @@ def self_test_proof_export(expected):
     profile = driver["profile_id"](driver["diagnostic_json"](profile_bytes))
     profile_value = json.loads(profile_bytes)
     artifacts = {name: "a" * 64 for name in ("binary", "core_binary", "crypto_module", "crypto_wasm", "prover", "r0vm", "profile")}
-    artifacts.update(prover="b" * 64, r0vm="c" * 64, profile=hashlib.sha256(profile_bytes).hexdigest())
+    artifacts.update(prover="b" * 64, r0vm="c" * 64, profile=digest_bytes(profile_bytes))
     guest = {"imageId": bytes(profile_value["guest_image_id"]).hex(), "schemaHash": bytes(profile_value["statement_schema_hash"]).hex(),
              "elfSha256": "e" * 64, "statementBytes": 1504}
     principals = {node: {"peer": value * 32} for node, value in (("S", "11"), ("R", "22"))}
@@ -1434,8 +1404,8 @@ def self_test_proof_export(expected):
         facts.append({"relation": relation, "orderId": "0x" + order, "windowIndex": 0, "public": name + ".json", "receipt": name + ".receipt",
                       "journalHash": records[0]["job"], "official_host_verified": True, "wrong_journal_receipt_comparison_rejected": True})
     for fact in facts:
-        fact["receiptSha256"] = hashlib.sha256(receipts[fact["receipt"]]).hexdigest()
-        fact["publicSha256"] = hashlib.sha256(json.dumps(metadata[fact["public"]]).encode()).hexdigest()
+        fact["receiptSha256"] = digest_bytes(receipts[fact["receipt"]])
+        fact["publicSha256"] = digest_bytes(json.dumps(metadata[fact["public"]]).encode())
     jobs = [driver["summarize_proof_job"](b"".join((json.dumps(record, separators=(",", ":")) + "\n").encode() for record in records),
         node, index, principals[node]["peer"], orders[index]["order_id"], profile, artifacts, [1, 2], records[0]["job"], facts)
         for (node, index), records in fixtures.items()]
@@ -1469,7 +1439,7 @@ def self_test_proof_export(expected):
             write_private(run / "resources.json", {"status": "PASS"})
             raw_bytes = (public / "native-result.json").read_bytes()
             write_private(public / "progress.json", {"source_commit": expected, "scope": "fresh-two-order-protected-native-only", "status": "PASS",
-                "genuine_receipts": facts, "public_files": {"native-result.json": hashlib.sha256(raw_bytes).hexdigest()}})
+                "genuine_receipts": facts, "public_files": {"native-result.json": digest_bytes(raw_bytes)}})
             output, passed = protected_public(run, expected, code)
             return output, passed, raw_bytes
         output, passed, raw_bytes = export(native)
