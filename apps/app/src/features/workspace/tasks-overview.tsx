@@ -14,7 +14,7 @@ import type { MembershipView } from "@vibeface/client/lib/node.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { cardState,needsLook,nodeName,overviewScope,schedulerStatus,staleTaskLabel,taskActive,taskGroups,taskLabel,taskProgress,taskStale,type TaskGroup } from "@vibeface/client/workspace/labels.ts"
 import { prepareOverviewInputs } from "@vibeface/client/workspace/overview-policy.ts"
-import { workspaceTaskCounts,workspaceTaskGroup } from "@vibeface/client/workspace/presentation.ts"
+import { selectTasksOverview,workspaceTaskGroup } from "@vibeface/client/workspace/presentation.ts"
 import { projectName } from "@vibeface/client/workspace/questions.ts"
 import type { NodeInfo,OpenWorkCard,OverviewTask,WorkspaceActivity } from "@vibeface/client/workspace/types.ts"
 import { Button } from "@vibeface/uiarc/button/button.tsx"
@@ -55,23 +55,23 @@ export function TasksOverview() {
   })
   const overview = prepared.overview
   const activityView = prepared.activities
-  const groups: Record<TaskGroup, WorkspaceActivity[]> = activityView.groups
   const botIds = new Map(workspace.bots.map((bot) => [bot.conversation_id, bot.bot_id]))
   const matchesBot = (conversationId: string, projectedBotId?: string | null) => botFilter === "all" || projectedBotId === botFilter || botIds.get(conversationId) === botFilter
   const activityBot = (activity: WorkspaceActivity) => activity.conversation_id ? workspace.bots.find((bot) => bot.conversation_id === activity.conversation_id) ?? overview.bots.find((bot) => bot.conversation_id === activity.conversation_id) : undefined
-  const businessTasks = (workspace.workspaceState?.tasks ?? []).filter((task) => botFilter === 'all' || task.owner_bot === botFilter)
-  const taskCounts = workspaceTaskCounts(businessTasks)
-  const assignedWorkIds = new Set((workspace.workspaceState?.assignments ?? []).flatMap((assignment) => assignment.work_id && workspace.workspaceState?.tasks.some((task) => task.task_id === assignment.task_id) ? [assignment.work_id] : []))
-  const visibleGroups: Record<TaskGroup, WorkspaceActivity[]> = { attention: [], working: [], waiting: [] }
-  const heldGroups: Record<TaskGroup, number> = { attention: 0, working: 0, waiting: 0 }
-  for (const group of taskGroups.map(({ group }) => group)) for (const activity of groups[group]) {
-    if (activity.kind === 'work' && activity.work && assignedWorkIds.has(activity.work.work_id)) continue
-    const deviceMatch = activity.kind === "attention" && "kind" in activity.attention && activity.attention.kind === "device" && activity.attention.works.some((work) => matchesBot(work.conversation_id))
-    if (!matchesBot(activity.conversation_id ?? "", activityBot(activity)?.bot_id) && !deviceMatch) continue
-    // A failed work, live question or check is acted on in 待处理 above: counted here, shown only there.
-    if (activity.kind === "work" && activity.work && failedIds.has(activity.work.work_id) || activity.kind === "attention" && !("kind" in activity.attention && (activity.attention.kind === "question" || activity.attention.kind === "check"))) heldGroups[group]++
-    else visibleGroups[group].push(activity)
-  }
+  const selection = selectTasksOverview({
+    workspace: workspace.workspaceState,
+    activities: activityView,
+    botId: botFilter,
+    failedWorkIds: failedIds,
+    includeActivity: (activity) => {
+      const deviceMatch = activity.kind === "attention" && "kind" in activity.attention && activity.attention.kind === "device" && activity.attention.works.some((work) => matchesBot(work.conversation_id))
+      return matchesBot(activity.conversation_id ?? "", activityBot(activity)?.bot_id) || deviceMatch
+    },
+  })
+  const businessTasks = selection.businessTasks
+  const taskCounts = selection.taskCounts
+  const visibleGroups = selection.groups
+  const heldGroups = selection.heldGroups
   const visible = (group: TaskGroup) => filter === "all" || filter === group
   const visibleCount = (visible("attention") ? visibleGroups.attention.length + heldGroups.attention : 0) + (visible("working") ? visibleGroups.working.length + heldGroups.working : 0) + (visible("waiting") ? visibleGroups.waiting.length + heldGroups.waiting : 0) + businessTasks.filter((task) => filter === "all" || workspaceTaskGroup(task) === filter).length
   const hasContent = visibleCount > 0

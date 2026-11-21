@@ -4,7 +4,8 @@ import type { SessionScope } from './types.ts'
 import { isReplyEnded, isTerminalJobState } from './types.ts'
 import test from "node:test"
 import { openWorksFromOverview, overviewFromWorkspace, parseConversation, parseOpenWorks, parseWorkspaceOverview } from "./model.ts"
-import { cardState, overviewScope, taskGroup, taskLabel, workspaceActivities } from "./labels.ts"
+import { cardState, overviewScope, taskGroup, taskLabel } from "./labels.ts"
+import { workspaceActivities } from "./activities.ts"
 import { prepareOverviewInputs } from "./overview-policy.ts"
 import type { BotRecord, NodeInfo, OpenWork, PendingCheck, Question, WorkspaceActivityJob } from "./types.ts"
 

@@ -1,5 +1,5 @@
 import type { PendingMessage } from "../chat/types.ts"
-import type { ContextProjection, InputReceipt, WorkspaceTask, WorkspaceTaskAction } from "./types.ts"
+import type { ContextProjection, InputReceipt, WorkspaceActivity, WorkspaceActivityGroup, WorkspaceActivityView, WorkspaceDomainState, WorkspaceTask, WorkspaceTaskAction } from "./types.ts"
 
 type ContextSourceKind = ContextProjection["sources"][number]["kind"]
 
@@ -106,4 +106,38 @@ export function pendingInputLabel(pending: Pick<PendingMessage, "delivery" | "re
   if (rejected) return `已拒绝 · ${rejected}`
   if (delivery === "unknown" && receipt?.stage === "refused" && receipt.retry_safe) return "重试请求待确认"
   return receipt ? inputReceiptDescriptor[receipt.stage].label : inputDeliveryDescriptor[delivery].label
+}
+
+type TaskOverviewSelection = {
+  businessTasks: readonly WorkspaceTask[]
+  taskCounts: Record<WorkspaceTaskGroup, number>
+  groups: Record<WorkspaceActivityGroup, WorkspaceActivity[]>
+  visibleActivities: readonly WorkspaceActivity[]
+  heldGroups: Record<WorkspaceActivityGroup, number>
+}
+
+/** Shared business-task and activity selection; platform adapters supply Bot attribution. */
+export function selectTasksOverview(input: {
+  workspace: WorkspaceDomainState | null | undefined
+  activities: WorkspaceActivityView
+  botId: string
+  failedWorkIds: ReadonlySet<string>
+  includeActivity: (activity: WorkspaceActivity) => boolean
+}): TaskOverviewSelection {
+  const businessTasks = (input.workspace?.tasks ?? []).filter((task) => input.botId === "all" || task.owner_bot === input.botId)
+  const taskCounts = workspaceTaskCounts(businessTasks)
+  const knownTaskIds = new Set((input.workspace?.tasks ?? []).map((task) => task.task_id))
+  const assignedWorkIds = new Set((input.workspace?.assignments ?? []).flatMap((assignment) => assignment.work_id && knownTaskIds.has(assignment.task_id) ? [assignment.work_id] : []))
+  const groups: Record<WorkspaceActivityGroup, WorkspaceActivity[]> = { attention: [], working: [], waiting: [] }
+  const heldGroups: Record<WorkspaceActivityGroup, number> = { attention: 0, working: 0, waiting: 0 }
+  const visibleActivities: WorkspaceActivity[] = []
+  for (const activity of input.activities.activities) {
+    if (activity.kind === "work" && activity.work && assignedWorkIds.has(activity.work.work_id)) continue
+    if (!input.includeActivity(activity)) continue
+    const held = (activity.kind === "work" && activity.work && input.failedWorkIds.has(activity.work.work_id))
+      || (activity.kind === "attention" && !("kind" in activity.attention && (activity.attention.kind === "question" || activity.attention.kind === "check")))
+    if (held) heldGroups[activity.group] += 1
+    else { visibleActivities.push(activity); groups[activity.group].push(activity) }
+  }
+  return { businessTasks, taskCounts, groups, visibleActivities, heldGroups }
 }
