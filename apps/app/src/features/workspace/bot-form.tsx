@@ -16,6 +16,9 @@ import { Textarea } from "@vibeface/uiarc/textarea/textarea.tsx"
 import { ChevronRight,Plus } from "lucide-react"
 import { useEffect,useRef,useState,type FormEvent } from "react"
 
+/** A creation whose answer was lost keeps its fields; retrying sends them unchanged under the same ids. */
+export const pendingBotCopy = { retry: "再试一次", unconfirmed: "上次没确认是否建好，内容保持不变。", rejected: "上次没建成，确认后可以修改。" }
+
 type BotFormProps = {
   open: boolean
   onOpenChange(open: boolean): void
@@ -98,9 +101,9 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
 
   return (
     <Drawer open={open} onOpenChange={onOpenChange}>
-      <DrawerContent title={pending ? "再试一次" : "新 Bot"} description={pending ? "上次没确认是否建好，内容保持不变。" : "给它起个名字，创建后再交代想完成的事。"} className="!w-full max-sm:!border-l-0 overflow-y-auto sm:!max-w-lg" onCloseAutoFocus={(event) => { event.preventDefault(); restoreFocus() }}>
+      <DrawerContent title={pending ? pendingBotCopy.retry : "新 Bot"} description={pending ? pendingBotCopy.unconfirmed : "给它起个名字，创建后再交代想完成的事。"} className="!w-full max-sm:!border-l-0 overflow-y-auto sm:!max-w-lg" onCloseAutoFocus={(event) => { event.preventDefault(); restoreFocus() }}>
         <form className="space-y-6 pb-[env(safe-area-inset-bottom)]" noValidate onSubmit={(event) => { void submit(event) }}>
-          {pending && rejected && !busy ? <p role="status" className="rounded-control bg-surface-muted p-3 text-sm">上次没建成，确认后可以修改。</p> : null}
+          {pending && rejected && !busy ? <p role="status" className="rounded-control bg-surface-muted p-3 text-sm">{pendingBotCopy.rejected}</p> : null}
           <FormField>
             <Input label="名称" id="bot-name" name="bot-name" ref={nameInput} error={nameError} autoComplete="off" required maxLength={512} value={name} readOnly={Boolean(pending)} disabled={busy} onChange={(event) => { setName(event.target.value); setNameError("") }} placeholder="例如：项目 Bot" />
           </FormField>
@@ -122,7 +125,7 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
           <div className="flex flex-wrap justify-end gap-2">
             <Button type="button" variant="ghost" onClick={() => { if (!pending) clearDraft(); onOpenChange(false) }}>取消</Button>
             <Button type="submit" disabled={busy || !workspace.writable} aria-busy={busy || undefined}>
-              <BusyIcon busy={busy} icon={Plus} />{pending ? "再试一次" : "创建"}
+              <BusyIcon busy={busy} icon={Plus} />{pending ? pendingBotCopy.retry : "创建"}
             </Button>
           </div>
           {!workspace.writable ? <p role="status" className="text-sm text-secondary">{workspace.writeNotice || "连上后就能创建。"}</p> : null}
