@@ -18,11 +18,14 @@ import sqlite3
 import stat
 import subprocess
 import sys
+sys.dont_write_bytecode = True
 import time
 import traceback
 import urllib.parse
 import urllib.request
 import uuid
+
+from verification.resource import oom_delta, resources
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -757,11 +760,6 @@ def wrong_journal(journal):
 def profile_id(profile):
     encoded = hashlib.sha256(b"vibeface-delivery-profile-v1").digest() + bytes(profile["guest_image_id"]) + bytes(profile["statement_schema_hash"])
     return digest(encoded + b"".join(profile[name].to_bytes(32, "big") for name in PROFILE_FIELDS))
-
-
-_live_helpers = runpy.run_path(str(REPOSITORY / "scripts/run-delivery-live.py"))
-resources = _live_helpers["resources"]
-oom_delta = _live_helpers["oom_delta"]
 
 
 def process_fact(pid):

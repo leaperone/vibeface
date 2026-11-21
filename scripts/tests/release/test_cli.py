@@ -409,6 +409,7 @@ class CliContracts(unittest.TestCase):
         names = ('hourly.py', 'deploy.py', 'deploy-run.py', 'release-entry.py', 'release-dispatch.py',
                  'ci.py', 'benchmark-free-network.py', 'verification_harness.py', 'verify-node.py', 'package-node-windows.py', 'run-delivery-live.py')
         with Fixture() as f:
+            shutil.copytree(SOURCE / 'verification', f.scripts / 'verification', ignore=shutil.ignore_patterns('__pycache__'))
             for name in names:
                 shutil.copy2(SOURCE / name, f.scripts / name)
             for name in names:
