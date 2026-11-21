@@ -13,7 +13,7 @@
 </div>
 
 > [!NOTE]
-> Vibeface distributes preview builds through the Hourly channel. Core is checked hourly. Client releases start daily at 18:00 Los Angeles time. Before the first stable release, protocol, data, and API changes do not preserve backward compatibility. Use the same version on all computers in your network.
+> Vibeface distributes preview builds through the Hourly channel. Core is checked hourly. Client releases start daily at 09:00 and 18:00 Los Angeles time. Before the first stable release, protocol, data, and API changes do not preserve backward compatibility. Use the same version on all computers in your network.
 
 ## Contents
 
