@@ -13,7 +13,6 @@ import os
 from pathlib import Path
 import platform
 import re
-import runpy
 import shutil
 import signal
 import stat
@@ -345,10 +344,20 @@ def run_continuation(subject, manifest, compiled, profile, vectors, proofs):
                 if isinstance(value, Exception):
                     raise value
                 return None, value
-            helper = {"resources": observe, "oom_delta": lambda first, last: {"oom": 1 if final_resources == "OOM" else 0, "oom_kill": 0, "oom_group_kill": 0}}
-            with patch.dict(os.environ, {**env, "VIBEFACE_DELIVERY_WORK_ID": run_id}), patch.object(subject, "CANONICAL", base / "canonical"), patch.object(subject, "source_commit", return_value=commit), \
-                patch.object(subject, "prepare_canonical", return_value=(compiled, profile, vectors, {})), patch.object(subject, "normalize_inputs", return_value=(context, selected, [])), \
-                patch.object(subject, "run", side_effect=execute), patch.object(subject.runpy, "run_path", return_value=helper), patch("subprocess.run", return_value=subprocess.CompletedProcess([], 1, stderr=b"Error: io error: unexpected end of file\n" if negative_fails else b"Error: receipt journal mismatch\n")), patch("builtins.print"):
+            negative_error = b"Error: io error: unexpected end of file\n" if negative_fails else b"Error: receipt journal mismatch\n"
+            counters = {"oom": int(final_resources == "OOM"), "oom_kill": 0, "oom_group_kill": 0}
+            with (
+                patch.dict(os.environ, {**env, "VIBEFACE_DELIVERY_WORK_ID": run_id}),
+                patch.object(subject, "CANONICAL", base / "canonical"),
+                patch.object(subject, "source_commit", return_value=commit),
+                patch.object(subject, "prepare_canonical", return_value=(compiled, profile, vectors, {})),
+                patch.object(subject, "normalize_inputs", return_value=(context, selected, [])),
+                patch.object(subject, "run", side_effect=execute),
+                patch.object(subject, "cgroup_resources", side_effect=observe),
+                patch.object(subject, "oom_delta", side_effect=lambda *_: dict(counters)),
+                patch("subprocess.run", return_value=subprocess.CompletedProcess([], 1, stderr=negative_error)),
+                patch("builtins.print"),
+            ):
                 if node_fails or bad_proves or final_resources != "PASS" or binary_fails or negative_fails:
                     must_reject(lambda: subject.prove_small("relation-1"))
                 else:
@@ -408,8 +417,16 @@ def run_continuation(subject, manifest, compiled, profile, vectors, proofs):
                 assert generated[0].parent.stat().st_mode & 0o777 == 0o555
                 generated[0].parent.chmod(0o755)
         calls = []
-        with patch.dict(os.environ, {**env, "VIBEFACE_DELIVERY_WORK_ID": uuid.uuid4().hex}), patch.object(subject, "CANONICAL", base / "canonical"), patch.object(subject, "source_commit", return_value=commit), \
-            patch.object(subject, "prepare_canonical", return_value=(compiled, profile, vectors, {})), patch.object(subject, "normalize_inputs", side_effect=ValueError("missing part")), \
-            patch.object(subject, "run", side_effect=lambda command, **kwargs: calls.append(command)), patch.object(subject.runpy, "run_path", return_value={"resources": lambda: (None, snapshot), "oom_delta": lambda *_: resources["oomDelta"]}), patch("builtins.print"):
+        with (
+            patch.dict(os.environ, {**env, "VIBEFACE_DELIVERY_WORK_ID": uuid.uuid4().hex}),
+            patch.object(subject, "CANONICAL", base / "canonical"),
+            patch.object(subject, "source_commit", return_value=commit),
+            patch.object(subject, "prepare_canonical", return_value=(compiled, profile, vectors, {})),
+            patch.object(subject, "normalize_inputs", side_effect=ValueError("missing part")),
+            patch.object(subject, "run", side_effect=lambda command, **kwargs: calls.append(command)),
+            patch.object(subject, "cgroup_resources", return_value=(None, snapshot)),
+            patch.object(subject, "oom_delta", return_value=resources["oomDelta"]),
+            patch("builtins.print"),
+        ):
             must_reject(lambda: subject.prove_small("accept"))
         assert not any(command[:2] == ["node", "contracts/delivery/experiment-delivery.mjs"] for command in calls)

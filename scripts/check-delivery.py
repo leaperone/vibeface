@@ -11,7 +11,6 @@ import os
 from pathlib import Path
 import platform
 import re
-import runpy
 import shutil
 import signal
 import stat
@@ -21,7 +20,8 @@ import tempfile
 import time
 import uuid
 import zipfile
-from unittest import TestCase
+
+from verification.resource import oom_delta, resources as cgroup_resources
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -577,7 +577,7 @@ def checked_resources(value, require_pass=False):
         checked_counters(value["final"], complete=True)
         if value["initial"] is None:
             raise ValueError("Resource report lacks its initial observation")
-        delta = runpy.run_path(str(ROOT / "scripts/run-delivery-live.py"))["oom_delta"](value["initial"], value["final"])
+        delta = oom_delta(value["initial"], value["final"])
         object_keys(value["oomDelta"], ("oom", "oom_kill", "oom_group_kill"))
         for count in value["oomDelta"].values():
             integer(count)
@@ -1224,7 +1224,6 @@ def prove_small(item, resume_dir=None):
             raise ValueError("Continuation producer source mismatch")
     elif item != "prepare" or resume_dir is not None:
         raise ValueError("Only local prepare controls may omit Actions provenance")
-    live = runpy.run_path(str(ROOT / "scripts/run-delivery-live.py"))
     work_id = os.environ.get("VIBEFACE_DELIVERY_WORK_ID", uuid.uuid4().hex)
     if not re.fullmatch(r"[0-9a-f]{32}", work_id):
         raise ValueError("Invalid fresh work-item identifier")
@@ -1237,7 +1236,7 @@ def prove_small(item, resume_dir=None):
     resources, context, compiled, selected = unknown_resources(), None, None, {}
     failure, deferred_node_failure, pair, bundle, part = None, None, None, None, None
     try:
-        _, initial = live["resources"]()
+        _, initial = cgroup_resources()
         compiled, _, vectors, _ = prepare_canonical()
         for script, args in (("install.mjs", []), ("compile.mjs", ["--check-trust"])):
             run(["node", "contracts/delivery/" + script, *args])
@@ -1310,8 +1309,8 @@ def prove_small(item, resume_dir=None):
             except Exception:
                 pass
         try:
-            _, final = live["resources"]()
-            delta = live["oom_delta"](initial, final)
+            _, final = cgroup_resources()
+            delta = oom_delta(initial, final)
             resources = {"schemaVersion": 1, "status": "FAIL" if any(delta.values()) else "PASS", "scope": RESOURCE_SCOPE, "initial": initial, "final": final, "oomDelta": delta}
             checked_resources(resources)
         except Exception:
