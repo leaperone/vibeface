@@ -10,13 +10,12 @@ import { Button } from "@vibeface/uiarc/button/button.tsx"
 import { Input } from "@vibeface/uiarc/input/input.tsx"
 import { Bot,FolderOpen,MessageSquarePlus } from "lucide-react"
 import { useEffect,useState } from "react"
-import { finishOnboarding,setOnboardingStep,useOnboarding } from "./onboarding-flag"
+import { finishOnboarding,setOnboardingStep } from "./onboarding-flag"
 
-/** Steps 4 and 5 after creating a network here. Skipping step 4 still offers step 5; 待处理 and the composer point back to the device page. */
-export function Onboarding() {
+/** Steps 4 and 5 after creating `networkId` here. Skipping step 4 still offers step 5; 待处理 and the composer point back to the device page. */
+export function Onboarding({ networkId, step }: { networkId: string; step: 4 | 5 }) {
   const workspace = useWorkspace()
   const navigate = useNavigate()
-  const step = useOnboarding() ?? 4
   const [name, setName] = useState("我的 Bot")
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<unknown>(null)
@@ -45,7 +44,7 @@ export function Onboarding() {
   }
   return <AuthPage header={<Steps step={step} />}>
     {step === 4 ? <Panel icon={Bot} title="让这台电脑运行 Bot">
-      <AiSettings onboarding onNext={() => setOnboardingStep(5)} />
+      <AiSettings onboarding onNext={() => setOnboardingStep(networkId, 5)} />
     </Panel> : <Panel key="bot" icon={MessageSquarePlus} title="创建第一个 Bot">
       <p className="text-sm text-secondary">先给它起个名字，再告诉它你想完成的第一件事。{canReply ? null : " 暂时没有设备能回复，也可以先创建，稍后在「设备」中连接或设置。"}</p>
       <form className="grid gap-4" noValidate onSubmit={(event) => { event.preventDefault(); if (name.trim()) void create(); else setError(new Error("还没填名称")) }}>
@@ -53,7 +52,7 @@ export function Onboarding() {
         {project && shown ? <p className="flex min-w-0 items-center gap-1.5 text-sm text-secondary"><FolderOpen aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{folderLabels.project}</span><FolderPath path={project.cwd} shown={shown[project.cwd]} /></p> : null}
         <InlineError error={error} />
         <div className="flex justify-between gap-2 border-t pt-4">
-          <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={() => setOnboardingStep(4)}>上一步</Button>
+          <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={() => setOnboardingStep(networkId, 4)}>上一步</Button>
           <div className="flex gap-2">
             <Button type="button" variant="ghost" disabled={busy} onClick={done}>稍后设置</Button>
             <Button type="submit" disabled={busy || !workspace.writable}><BusyIcon busy={busy} />{canReply ? "开始对话" : "完成"}</Button>

@@ -2654,6 +2654,24 @@ test('onboarding picks the bot provider with the 运行 Bot write and reads back
   })
 })
 
+test('the onboarding step counts only on the network it was started for', () => {
+  const stored = new Map<string, string>()
+  const app = componentHarness('../identity/onboarding-flag.ts', {}, { localStorage: { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => { stored.set(key, value) }, removeItem: (key: string) => { stored.delete(key) } } })
+  const step = (network?: string) => { app.render('useOnboarding', network); return app.output }
+  const flag = app.module as { startOnboarding(network: string): void; setOnboardingStep(network: string, step: 4 | 5): void; finishOnboarding(): void }
+  try {
+    stored.set('vibeface.onboarding', '4')
+    assert.equal(step('network-a'), null, 'a step saved without its network counts as none')
+    flag.startOnboarding('network-a')
+    assert.deepEqual([step('network-a'), step('network-b'), step(undefined)], [4, null, null])
+    flag.setOnboardingStep('network-a', 5)
+    assert.deepEqual([step('network-a'), step('network-b')], [5, null])
+    flag.finishOnboarding()
+    assert.equal(step('network-a'), null)
+    assert.equal(stored.size, 0)
+  } finally { app.close() }
+})
+
 test("compact system provider cards use external service evidence without local prerequisites", async (t) => {
   for (const mode of ['system', 'spawn'] satisfies NonNullable<ProviderStatus['app_server']>['mode'][]) for (const installed of [false, true]) for (const authentication of ['authenticated', 'unverified', 'sign_in_required'] satisfies ProviderStatus['probe']['authentication'][]) await t.test(`${mode} installed=${installed} ${authentication}`, () => {
     const item: ProviderStatus = {

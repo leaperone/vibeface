@@ -18,7 +18,7 @@ import { Textarea } from '@vibeface/uiarc/textarea/textarea.tsx'
 import { Archive,ArchiveRestore,Camera,CircleCheck,CirclePlus,FileKey,Hourglass,KeyRound,Laptop,LifeBuoy,Link2,LoaderCircle,LogIn,MessageSquareLock,MonitorSmartphone,MonitorX,QrCode,RotateCcw,Settings2,ShieldAlert,ShieldCheck,X } from 'lucide-react'
 import { useEffect,useRef,useState,type FormEvent,type ReactNode } from 'react'
 import { CopyDiagnostics,GatewayForm } from './device-controls'
-import { startOnboarding } from './onboarding-flag'
+import { finishOnboarding,startOnboarding } from './onboarding-flag'
 import { PasswordStrength,RecoveryControls,RecoveryReview,RecoveryWaiting,SaveRecoveryFile } from './recovery-controls'
 
 const NOT_JOINED = notJoined(webPlatform.self)
@@ -375,14 +375,16 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
   const device = useDevice()
   const [password, setPassword] = useState('')
   const [tried, setTried] = useState(false)
+  const [mismatch, setMismatch] = useState(false)
   const weak = passwordStrength(password).level === 'weak'
   return <Panel icon={KeyRound} title="设置恢复密码">
     <p className="-mt-2 flex items-center gap-2 text-sm text-secondary"><LifeBuoy aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.passwordWhy}</p>
     <form className="grid gap-4" noValidate onSubmit={(event) => {
       event.preventDefault()
       const form = event.currentTarget
-      const input = form.elements.namedItem('password') as HTMLInputElement
+      const input = form.elements.namedItem('password') as HTMLInputElement, again = form.elements.namedItem('again') as HTMLInputElement
       if (passwordStrength(input.value).level === 'weak') { setTried(true); input.focus(); return }
+      if (again.value !== input.value) { setMismatch(true); again.focus(); return }
       void run('create', async ({ rebind }) => {
         let work: Promise<void>
         try { work = device.createLocalNetwork(names.browser, passphrase(value(form, 'password')), names.computer, rebind) }
@@ -392,9 +394,10 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
     }}>
       <fieldset disabled={busy || disabled} className="grid gap-4">
         <div className="grid gap-1.5">
-          <div ><PasswordInput label="恢复密码" name="password" autoComplete="new-password" aria-invalid={tried && weak || undefined} aria-describedby="password-hint" onChange={(event) => { setPassword(event.target.value); setTried(false) }} /></div>
+          <div ><PasswordInput label="恢复密码" name="password" autoComplete="new-password" aria-invalid={tried && weak || undefined} aria-describedby="password-hint" onChange={(event) => { setPassword(event.target.value); setTried(false); setMismatch(false) }} /></div>
           <PasswordStrength id="password-hint" password={password} tried={tried} />
         </div>
+        <PasswordInput label="再输入一遍恢复密码" name="again" autoComplete="new-password" error={mismatch ? "和上面的恢复密码不一致，再输入一遍" : undefined} onChange={() => setMismatch(false)} />
         <div className="flex justify-between gap-2">
           <Button type="button" variant="ghost" className="-ms-3" onClick={onBack}>上一步</Button>
           <Button type="submit" aria-busy={busy || undefined}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}下一步</Button>
@@ -421,7 +424,11 @@ function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
     <SaveRecoveryFile code={code} saved={saved} onSaved={setSaved} busy={busy} download={{ done: downloaded, run: () => void run('download', async ({ current }) => { await device.downloadBackup(); if (current()) setDownloaded(true) }) }} />
     <div className="flex justify-between gap-2">
       <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={device.cancelSensitive}>上一步</Button>
-      <Button type="button" disabled={!saved || busy} aria-busy={busy || undefined} onClick={() => void run('bootstrap', async () => { startOnboarding(); await device.confirmBootstrap(true) })}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}完成创建</Button>
+      <Button type="button" disabled={!saved || busy} aria-busy={busy || undefined} onClick={() => void run('bootstrap', async () => {
+        // Saved before creating so the workspace opens on step 4 instead of flashing first; a creation that fails leaves no step behind.
+        if (networkId) startOnboarding(networkId)
+        try { await device.confirmBootstrap(true) } catch (cause) { finishOnboarding(); throw cause }
+      })}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}完成创建</Button>
     </div>
   </Panel>
 }
