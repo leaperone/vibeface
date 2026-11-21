@@ -23,6 +23,7 @@ fail() { printf 'Vibeface installer: %s\n' "$*" >&2; exit 1; }
 readonly AUTO16_DATA_EPOCH='1'
 readonly AUTO16_UPDATE_PROTOCOL='1'
 readonly AUTO16_BUILD_FIELDS='version target source_commit update_protocol data_epoch core_version core_source_commit app_version app_source_commit'
+readonly AUTO16_BUILD_NUMBER_FIELDS='update_protocol data_epoch'
 readonly AUTO16_BUILD_FIELD_COUNT='9'
 readonly AUTO16_NODE_REQUIRED_PATHS=('vibeface' 'vibeface-core' 'BUILD-INFO.json' 'README.md' 'RUNTIME-REQUIREMENTS.md' 'scripts/install-node-service.sh' 'docs/node.md' 'docs/releasing.md' 'web/_shell.html' 'web/index.html' 'web/_redirects' 'web/_headers' 'web/.vibeface-build.json' 'web/vibeface_secure.js' 'web/vibeface_secure_bg.wasm')
 readonly AUTO16_TARGET_DARWIN_ARM64='aarch64-apple-darwin'
@@ -34,11 +35,18 @@ readonly AUTO16_GENERATOR_HASH='349d8c7477301121fed0333705eeaa9a9dd3d61344ef4367
 : "$AUTO16_GENERATOR_HASH"
 # END AUTO-16 GENERATED INSTALLER CONTRACTS
 
-# Completion manifests have a closed shape, including their nested dependency pins.
-completion_fields() {
-  LC_ALL=C awk -v page="${2:-0}" '
+# Release and build manifests both have closed JSON shapes.
+read_manifest_fields() {
+  LC_ALL=C awk -v mode="$2" -v page="${3:-0}" -v build_fields="$AUTO16_BUILD_FIELDS" -v build_numbers="$AUTO16_BUILD_NUMBER_FIELDS" '
+    BEGIN {
+      build_count=split(build_fields, names, " ")
+      for (i=1; i<=build_count; i++) build_field[names[i]]=1
+      numbers=split(build_numbers, names, " ")
+      for (i=1; i<=numbers; i++) build_number[names[i]]=1
+    }
     function error() { invalid=1; exit 1 }
     function allowed(context, name) {
+      if (mode=="build") return context=="root" && (name in build_field)
       if (context=="root") return name ~ /^(app|version|tag|source_commit|channel|schema|assets|contracts|dependencies)$/
       if (context=="contracts") return name ~ /^(data_epoch|update_protocol)$/
       if (context=="dependencies") return name ~ /^(core|app)$/
@@ -50,7 +58,7 @@ completion_fields() {
       if (!depth || (token=="}" ? kind[depth]!="{" : kind[depth]!="[")) error()
       if (state[depth]!="after" && state[depth]!="first") error()
       context=scope[depth]; count=fields[id[depth]]
-      if ((context=="root" && count!=9) || (context=="contracts" && count!=2) ||
+      if ((context=="root" && count!=(mode=="build" ? build_count : 9)) || (context=="contracts" && count!=2) ||
           (context=="dependencies" && count!=2) || ((context=="core" || context=="app") && count!=4) ||
           (context=="asset" && count!=3) || (context=="assets" && !record)) error()
       depth--; if (!depth) closed=1
@@ -91,7 +99,7 @@ completion_fields() {
         if (token!="{") error()
         child="asset"
       } else {
-        numeric=(name ~ /^(schema|data_epoch|update_protocol|size)$/)
+        numeric=(mode=="build" ? (name in build_number) : (name ~ /^(schema|data_epoch|update_protocol|size)$/))
         if (numeric) {
           if (token !~ /^(0|[1-9][0-9]*)$/) error()
           string_value=token
@@ -135,12 +143,11 @@ completion_fields() {
 
 # Parse only named fields; remote JSON is never evaluated as shell code.
 json_fields() {
-  if [[ $2 == completion ]]; then completion_fields "$1" "${3:-0}"; return; fi
-  LC_ALL=C awk -v mode="$2" -v page="${3:-0}" -v build_fields="$AUTO16_BUILD_FIELDS" '
+  if [[ $2 == completion || $2 == build ]]; then read_manifest_fields "$@"; return; fi
+  LC_ALL=C awk -v mode="$2" -v page="${3:-0}" '
     function error() { invalid=1; exit 1 }
     function field(value, k) {
       k=key; key=""
-      if (mode=="build" && !(k in build_field)) error()
       if (mode=="refs") {
         if (k!="ref") return
         if (seen[record SUBSEP k]++) error()
@@ -160,7 +167,7 @@ json_fields() {
       }
       print page "." record_key "\t" k "\t" value
     }
-    BEGIN { depth=0; record=0; expected=(mode=="refs" ? "[" : "{"); n=split(build_fields, names, /[ ]+/); for (i=1;i<=n;i++) build_field[names[i]]=1 }
+    BEGIN { depth=0; record=0; expected=(mode=="refs" ? "[" : "{") }
     {
       json=$0
       position=1; size=length(json)
@@ -343,27 +350,53 @@ check_archive() {
   awk 'substr($0,1,1)!="-" && substr($0,1,1)!="d" {exit 1}' "$scratch/types" || fail 'archive contains links or special files'
 }
 
-verify_package() {
-  local package="$1" version="$2" target="$3" commit="$4" scratch="$5" pins="$6" entry
-  for entry in "${AUTO16_NODE_REQUIRED_PATHS[@]}"; do
-    [[ -f "$package/$entry" && -s "$package/$entry" ]] || fail "package is missing $entry"
-  done
-  [[ -f "$package/FILES.sha256" ]] || fail 'package is missing FILES.sha256'
-  awk '{ if (seen[$2]++) exit 1 }' "$package/FILES.sha256" || fail 'duplicate file checksums'
-  local hash name count=0
-  while IFS=' ' read -r hash name; do
-    [[ $hash =~ ^[a-f0-9]{64}$ && $name =~ ^[a-zA-Z0-9._/-]+$ && $name != /* && $name != FILES.sha256 ]] || fail 'invalid file checksum entry'
+parse_file_checksums() {
+  local line name previous='' entry_pattern='^([a-f0-9]{64})  ([a-zA-Z0-9._/-]+)$'
+  [[ -f "$1" ]] || fail 'package is missing FILES.sha256'
+  while IFS= read -r line; do
+    [[ $line =~ $entry_pattern ]] || fail 'invalid file checksum entry'
+    name=${BASH_REMATCH[2]}
+    [[ $name != FILES.sha256 ]] || fail 'invalid file checksum entry'
     case "/$name/" in *'/../'*|*'/./'*|*'//'*) fail 'unsafe file checksum path' ;; esac
-    [[ -f "$package/$name" && $(sha256 "$package/$name") == "$hash" ]] || fail 'package file checksum mismatch'
-    count=$((count + 1))
-  done < "$package/FILES.sha256"
-  [[ $count -gt 0 && $count -eq $(find "$package" -type f ! -name FILES.sha256 | wc -l) ]] || fail 'file checksum coverage mismatch'
-  json_fields "$package/BUILD-INFO.json" build > "$scratch/build-fields" || fail 'invalid BUILD-INFO.json'
+    [[ $name != "$previous" ]] || fail 'duplicate file checksums'
+    [[ $name > "$previous" ]] || fail 'file checksum entries are not in canonical order'
+    printf '%s\t%s\n' "${BASH_REMATCH[1]}" "$name"
+    previous=$name
+  done < "$1"
+  [[ -z $line && -n $previous ]] || fail 'invalid file checksum entry'
+}
+
+verify_build_info() {
+  local file="$1" version="$2" target="$3" commit="$4" scratch="$5" pins="$6"
+  json_fields "$file" build > "$scratch/build-fields" || fail 'invalid BUILD-INFO.json'
   awk -F '\t' -v version="$version" -v target="$target" -v commit="$commit" -v pins="$pins" -v expected_data_epoch="$AUTO16_DATA_EPOCH" -v expected_update_protocol="$AUTO16_UPDATE_PROTOCOL" -v expected_fields="$AUTO16_BUILD_FIELD_COUNT" '
     BEGIN { split(pins, dependency, "\t") }
     { info[$2]=$3 }
     END { exit !(NR==expected_fields && info["version"]==version && info["target"]==target && info["source_commit"]==commit && info["update_protocol"]==expected_update_protocol && info["data_epoch"]==expected_data_epoch && info["core_version"]==dependency[6] && info["core_source_commit"]==dependency[7] && info["app_version"]==dependency[8] && info["app_source_commit"]==dependency[9]) }
   ' "$scratch/build-fields" || fail 'BUILD-INFO does not match the release, platform, source commit, or data epoch'
+}
+
+verify_file_checksums() {
+  local package="$1" scratch="$2" special present
+  special=$(find "$package" ! -type f ! -type d -print) || fail 'cannot inspect package files'
+  [[ -z $special ]] || fail 'package contains links or special files'
+  parse_file_checksums "$package/FILES.sha256" > "$scratch/file-checksums"
+  local hash name count=0
+  while IFS=$'\t' read -r hash name; do
+    [[ -f "$package/$name" && $(sha256 "$package/$name") == "$hash" ]] || fail 'package file checksum mismatch'
+    count=$((count + 1))
+  done < "$scratch/file-checksums"
+  present=$(cd "$package" && find . -type f ! -path './FILES.sha256' | wc -l) || fail 'cannot inspect package files'
+  [[ $count -eq $present ]] || fail 'file checksum coverage mismatch'
+}
+
+verify_package() {
+  local package="$1" version="$2" target="$3" commit="$4" scratch="$5" pins="$6" entry
+  for entry in "${AUTO16_NODE_REQUIRED_PATHS[@]}"; do
+    [[ -f "$package/$entry" && -s "$package/$entry" ]] || fail "package is missing $entry"
+  done
+  verify_file_checksums "$package" "$scratch"
+  verify_build_info "$package/BUILD-INFO.json" "$version" "$target" "$commit" "$scratch" "$pins"
   [[ -x "$package/$AUTO16_PROGRAM_CLI" && -x "$package/$AUTO16_PROGRAM_CORE" ]] || fail 'packaged CLI and Core binaries must be executable'
   [[ $("$package/$AUTO16_PROGRAM_CLI" --version) == "$AUTO16_PROGRAM_CLI $version" ]] || fail 'packaged CLI version does not match the release'
   local core_version
@@ -1049,9 +1082,11 @@ CASES
   printf 'Public installer self-test passed: tag discovery, bounded lookups, independent CLI/Core/App pins, closed manifests, contracts, channels, SHA256, layout, paths, progressive completion and existing-install protection.\n'
 )
 
-if [[ ${1:-} == --self-test ]]; then
-  [[ $# == 1 ]] || fail '--self-test does not accept other arguments'
-  self_test
-else
-  install_release "$@"
+if [[ ${BASH_SOURCE[0]:-$0} == "$0" ]]; then
+  if [[ ${1:-} == --self-test ]]; then
+    [[ $# == 1 ]] || fail '--self-test does not accept other arguments'
+    self_test
+  else
+    install_release "$@"
+  fi
 fi
