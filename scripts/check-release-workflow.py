@@ -307,17 +307,17 @@ def check_hourly(source):
 
 
 def check_daily(source):
-    require(events(source) == {'schedule'}
+    require(events(source) == {'schedule', 'workflow_dispatch'}
             and re.findall(r"^    - cron: '([^']+)'\n      timezone: ([^\n]+)$", source, re.M)
             == [('0 18 * * *', 'America/Los_Angeles')]
             and source.count('cron:') == 1,
-            'client coordinator must run only at 18:00 America/Los_Angeles')
+            'client coordinator must run at 18:00 America/Los_Angeles or by manual dispatch')
     block = coordinator_job(source, 'clients', 'independent-daily-client-releases', 'python3 -B scripts/hourly.py --clients')
     for ref in ('refs/heads/main', 'refs/heads/other'):
         for event in ('schedule', 'workflow_run', 'workflow_dispatch'):
             context = {'github.ref': ref, 'github.event_name': event}
-            require(evaluate(guard(block), context=context) == (ref == 'refs/heads/main' and event == 'schedule'),
-                    'client coordinator must reject all but scheduled main runs')
+            require(evaluate(guard(block), context=context) == (ref == 'refs/heads/main' and event in ('schedule', 'workflow_dispatch')),
+                    'client coordinator must reject all but scheduled or manual main runs')
 
 
 def check_deployment(source, entries):
@@ -481,7 +481,7 @@ def self_test(entries, helpers, hourly, daily, deployment, deployment_entries):
     for before, after in (
         ("cron: '0 18 * * *'", "cron: '0 * * * *'"),
         ('America/Los_Angeles', 'UTC'),
-        ('on:\n', 'on:\n  workflow_dispatch:\n'),
+        ('  workflow_dispatch:\n', ''),
         ("github.event_name == 'schedule'", 'true'),
         ('scripts/hourly.py --clients', 'scripts/hourly.py'),
     ):
