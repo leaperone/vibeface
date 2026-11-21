@@ -1,18 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReadyConnection } from '../lib/node.ts'
-import { messageOf, record, same } from '../lib/node.ts'
+import { messageOf, record } from '../lib/node.ts'
 import type { KeyValue, Platform } from '../lib/platform.ts'
 import { bytesToBase64, sha256Hex } from '../lib/byte-codec.ts'
 import { createActionOwner } from '../lib/action-owner.ts'
-import { amount, canRead, canRestart, checkedFile, fileName, intentId, needsRefresh, orderActions, parseBudgets, parseOrder, parseOrders, parsePending, parseProviders, parseReceived, parseStatus, peer } from './model.ts'
+import { amount, bindIntentIdentity, canRead, canRestart, checkedFile, fileName, intentId, needsRefresh, orderActions, parseBudgets, parseExpectedOrder, parseExpectedOrderId, parseExpectedOrders, parseOrder, parseOrders, parsePending, parseProviders, parseReceived, parseStatus, peer } from './model.ts'
 import type { DeliveryBudget, DeliveryDraft, DeliveryOrder, DeliveryProvider, DeliverySettings, DeliveryStatus, PendingIntent, ReserveDeliveryIntent, TransferFile } from './types.ts'
-
-function authorization(order: DeliveryOrder) {
-  const p = order.payment
-  return { order_id: order.order_id, intent_id: order.intent_id, mode: order.mode, acceptance: order.acceptance, source_peer: order.source_peer, receiver_peer: order.receiver_peer, provider_peer: order.provider_peer,
-    name: order.name, bytes: order.bytes, sha256: order.sha256, deadlines: order.deadlines,
-    payment: { chain_id: p.chain_id, asset: p.asset, payer: p.payer, provider_wallet: p.provider_wallet, delivery_fee: p.delivery_fee, reservation_fee: p.reservation_fee, priority_fee: p.priority_fee, total: p.total, gas_cap: p.gas_cap, budget_id: p.budget_id } }
-}
 
 function shouldPollDelivery(enabled: boolean, orders: readonly DeliveryOrder[]): boolean {
   return enabled || orders.some(needsRefresh)
@@ -49,9 +42,7 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
   async function findIntent(id: string): Promise<DeliveryOrder | null> {
     const value = record(await request('find_intent', { intent_id: intentId(id) }))
     if (value.order === null) return null
-    const order = parseOrder(value.order)
-    if (order.intent_id !== id || order.role !== 'sender' || order.source_peer !== connection.entry.device_id) throw new Error('查询结果不属于原来那次发送。')
-    return order
+    return bindIntentIdentity(parseOrder(value.order), id, connection.entry.device_id)
   }
   const client = {
     current, pending, recent, findIntent,
@@ -111,31 +102,31 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
     async confirm(order: DeliveryOrder) {
       manage()
       if (order.role !== 'sender' || order.phase !== 'prepared') throw new Error('这笔订单需要先刷新或点“检查进度”，不能重新确认付款。')
-      const confirmed = parseOrder(await request('confirm', { intent_id: order.intent_id }))
-      if (!same(authorization(confirmed), authorization(order))) throw new Error('确认结果与原订单的条款不一致。先点“检查进度”，不会自动再次付款。')
-      return confirmed
+      return parseExpectedOrder(await request('confirm', { intent_id: order.intent_id }), order)
     },
     async confirmBatch(orders: DeliveryOrder[]) {
       manage()
       if (orders.length !== 2 || orders.some(order => order.role !== 'sender' || order.mode !== 'paid' || order.phase !== 'prepared')
         || orders[0].order_id === orders[1].order_id || !orders[0].payment.budget_id
         || orders[0].payment.budget_id !== orders[1].payment.budget_id || orders.reduce((total, order) => total + order.windows.length, 0) > 2) throw new Error('请选择同一预算内两笔待确认且各含一个文件片段的订单。')
-      const confirmed = parseOrders(await request('confirm_batch', { intent_ids: orders.map(order => order.intent_id) }))
-      if (confirmed.length !== orders.length || confirmed.some(order => !orders.some(original => same(authorization(order), authorization(original))))) throw new Error('批次返回的条款与原订单不同，请查询原订单。')
-      return confirmed
+      return parseExpectedOrders(await request('confirm_batch', { intent_ids: orders.map(order => order.intent_id) }), orders)
     },
-    async get(orderId: string) { return parseOrder(await request('get', { order_id: peer(orderId) })) },
-    async accept(order: DeliveryOrder) { manage(); return parseOrder(await request('accept', { order_id: order.order_id })) },
+    async get(orderId: string) {
+      const expectedOrderId = peer(orderId)
+      return parseExpectedOrderId(await request('get', { order_id: expectedOrderId }), expectedOrderId)
+    },
+    async accept(order: DeliveryOrder) {
+      manage()
+      return parseExpectedOrder(await request('accept', { order_id: order.order_id }), order, 'receiver_metadata')
+    },
     async acceptBatch(orders: DeliveryOrder[]) {
       manage()
       if (orders.length !== 2 || orders.some(order => order.role !== 'receiver' || order.mode !== 'paid' || !orderActions(order).accept)
         || orders[0].order_id === orders[1].order_id || !orders[0].payment.budget_id
         || orders[0].payment.budget_id !== orders[1].payment.budget_id || orders.reduce((total, order) => total + order.windows.length, 0) > 2) throw new Error('同时接收需要同一预算内两笔各含一个文件片段的订单。')
-      const accepted = parseOrders(await request('accept_batch', { order_ids: orders.map(order => order.order_id) }))
-      if (accepted.length !== orders.length || accepted.some(order => !orders.some(original => same(authorization(order), authorization(original))))) throw new Error('接收批次与原订单不一致，请先刷新。')
-      return accepted
+      return parseExpectedOrders(await request('accept_batch', { order_ids: orders.map(order => order.order_id) }), orders)
     },
-    async reconcile(order: DeliveryOrder) { manage(); return parseOrder(await request('reconcile', { order_id: order.order_id })) },
+    async reconcile(order: DeliveryOrder) { manage(); return parseExpectedOrder(await request('reconcile', { order_id: order.order_id }), order, 'receiver_metadata') },
     async save(order: DeliveryOrder, platform: Platform) {
       if (!platform.files) throw new Error('此客户端尚不支持保存文件。')
       if (!canRead(order)) throw new Error('这笔订单的文件尚不可取回。')

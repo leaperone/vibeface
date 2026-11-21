@@ -443,6 +443,64 @@ test('the receiver authorizes both original orders together and groups only two 
   assert.equal(requests, 1)
 })
 
+test('delivery responses bind identity and fixed terms while allowing documented phase and evidence changes', async () => {
+  const receiverOrder: DeliveryOrder = { ...paidOrder(), role: 'receiver', phase: 'funded', evidence: 'none', name: null, sha256: null }
+  const accepted: DeliveryOrder = { ...receiverOrder, name: 'example.txt', sha256: digest, phase: 'recoverable', evidence: 'recoverable', payment: { ...receiverOrder.payment, state: 'confirmed' }, windows: receiverOrder.windows.map(window => ({ ...window, state: 'key_published' })) }
+  const requests: string[] = []
+  const client = createDeliveryClient(connection(async (_method, params = {}) => {
+    requests.push(String(params.op))
+    if (params.op === 'get') return { ...order(), order_id: '55'.repeat(32) }
+    if (params.op === 'accept') return { ...accepted, role: 'sender' }
+    if (params.op === 'reconcile') return { ...accepted, source_peer: provider }
+    throw new Error('unexpected operation')
+  }), { getItem: () => null, setItem: () => {} }, reserveDeliveryIntent)
+  await assert.rejects(client.get(order().order_id), /请求的订单/)
+  await assert.rejects(client.accept(receiverOrder), /原订单|固定条款/)
+  await assert.rejects(client.reconcile(receiverOrder), /原订单|固定条款/)
+  assert.deepEqual(requests, ['get', 'accept', 'reconcile'])
+
+  const termsClient = createDeliveryClient(connection(async () => ({ ...accepted, receiver_peer: provider })), { getItem: () => null, setItem: () => {} }, reserveDeliveryIntent)
+  await assert.rejects(termsClient.reconcile(receiverOrder), /固定条款/)
+
+  const legalClient = createDeliveryClient(connection(async (_method, params = {}) => {
+    if (params.op === 'accept' || params.op === 'reconcile') return accepted
+    throw new Error('unexpected operation')
+  }), { getItem: () => null, setItem: () => {} }, reserveDeliveryIntent)
+  assert.equal((await legalClient.accept(receiverOrder)).phase, 'recoverable')
+  assert.equal((await legalClient.reconcile(receiverOrder)).evidence, 'recoverable')
+
+  // A later chain snapshot may lag the already recovered local metadata. The
+  // fixed terms still bind, while phase/evidence remain the observed mutable facts.
+  const regressed = { ...accepted, phase: 'funded', evidence: 'none', windows: accepted.windows.map(window => ({ ...window, state: 'pending' })) }
+  const regressedClient = createDeliveryClient(connection(async () => regressed), { getItem: () => null, setItem: () => {} }, reserveDeliveryIntent)
+  assert.equal((await regressedClient.reconcile(receiverOrder)).phase, 'funded')
+  const partialClient = createDeliveryClient(connection(async () => ({ ...accepted, sha256: null })), { getItem: () => null, setItem: () => {} }, reserveDeliveryIntent)
+  await assert.rejects(partialClient.reconcile(receiverOrder), /固定条款/)
+
+  const charityReceiver: DeliveryOrder = { ...order(), role: 'receiver', phase: 'transferring', evidence: 'none', name: null, sha256: null }
+  const charityRecovered: DeliveryOrder = { ...charityReceiver, name: 'example.txt', sha256: digest, phase: 'recoverable', evidence: 'charity_receipt', windows: charityReceiver.windows.map(window => ({ ...window, state: 'held' })) }
+  const charityClient = createDeliveryClient(connection(async () => charityRecovered), { getItem: () => null, setItem: () => {} }, reserveDeliveryIntent)
+  assert.equal((await charityClient.reconcile(charityReceiver)).evidence, 'charity_receipt')
+
+  const knownReceiver = { ...receiverOrder, name: 'example.txt', sha256: digest }
+  const changedClient = createDeliveryClient(connection(async () => ({ ...accepted, name: 'changed.txt' })), { getItem: () => null, setItem: () => {} }, reserveDeliveryIntent)
+  await assert.rejects(changedClient.reconcile(knownReceiver), /固定条款/)
+  const forgottenClient = createDeliveryClient(connection(async () => ({ ...accepted, name: null, sha256: null })), { getItem: () => null, setItem: () => {} }, reserveDeliveryIntent)
+  await assert.rejects(forgottenClient.reconcile(knownReceiver), /固定条款/)
+})
+
+test('delivery batch responses require each requested member exactly once and retain fixed authorization', async () => {
+  const a: DeliveryOrder = { ...paidOrder(), role: 'receiver', phase: 'funded' }
+  const b: DeliveryOrder = { ...a, order_id: '99'.repeat(32), intent_id: '00000000-0000-4000-8000-000000000002' }
+  let response: DeliveryOrder[] = [a, a]
+  const client = createDeliveryClient(connection(async () => ({ orders: response })), { getItem: () => null, setItem: () => {} }, reserveDeliveryIntent)
+  await assert.rejects(client.acceptBatch([a, b]), /重复|全部原订单/)
+  response = [a]
+  await assert.rejects(client.acceptBatch([a, b]), /全部原订单/)
+  response = [a, { ...b, receiver_peer: provider }]
+  await assert.rejects(client.acceptBatch([a, b]), /固定条款|原订单/)
+})
+
 test('the provider field offers announced devices: paid delivery those that quote a price, free delivery all', async () => {
   const offer = { settlement: { chain_id: 31337, escrow: `0x${'66'.repeat(20)}`, asset: `0x${'55'.repeat(20)}` }, price: '9007199254740993' }
   const asked: unknown[] = []
