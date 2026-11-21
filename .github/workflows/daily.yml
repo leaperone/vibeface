@@ -3,6 +3,7 @@ on:
   schedule:
     - cron: '0 18 * * *'
       timezone: America/Los_Angeles
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
@@ -10,7 +11,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   clients:
-    if: github.ref == 'refs/heads/main' && github.event_name == 'schedule'
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     permissions: {contents: write, actions: write}
