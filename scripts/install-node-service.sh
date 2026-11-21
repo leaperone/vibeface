@@ -75,6 +75,7 @@ systemd_path_escape() {
   local value="$1"
   value="$(systemd_escape "$value")"
   value="${value// /\\s}"
+  value="${value//$'\t'/\\t}"
   printf '%s' "$value"
 }
 
