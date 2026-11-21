@@ -25,6 +25,7 @@ from unittest import TestCase
 
 from verification.resource import oom_delta, resources
 from verification.io import digest_bytes, digest_file as digest, regular, replace_public, write_private
+from verification.process import stop_owned_process
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -83,20 +84,17 @@ def unpack_package(directory, destination):
 
 
 def terminate_owned(process):
+    """Stop the private delivery child process group and preserve escalation timing."""
     if process is None or process.poll() is not None:
         return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait(timeout=5)
+    stop_owned_process(
+        process,
+        terminate=lambda: os.killpg(process.pid, signal.SIGTERM),
+        kill=lambda: os.killpg(process.pid, signal.SIGKILL),
+        wait_timeout=10,
+        kill_wait_timeout=5,
+        return_on_terminate_error=True,
+    )
 
 
 def command(label, arguments, log, **kwargs):
