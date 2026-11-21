@@ -54,7 +54,7 @@ function sources(dir: string): string[] {
   return readdirSync(dir).flatMap((name) => {
     const path = join(dir, name)
     if (statSync(path).isDirectory()) return sources(path)
-    return /\.tsx?$/.test(name) && !name.endsWith(".test.ts") && !name.endsWith(".gen.ts") ? [path] : []
+    return /\.tsx?$/.test(name) && !name.endsWith(".test.ts") && !name.endsWith(".test-support.ts") && !name.endsWith(".gen.ts") ? [path] : []
   })
 }
 

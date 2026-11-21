@@ -14,7 +14,7 @@ if ! command -v pnpm >/dev/null; then
   exit 1
 fi
 # This build entry owns dependency installation for local and workflow callers.
-pnpm install --frozen-lockfile --filter "vibeface-web..." --filter "vibeface-mobile..."
+pnpm install --frozen-lockfile --filter "vibeface-web..."
 node "$repo/scripts/check-uiarc-build.mjs"
 node "$repo/scripts/check-uiarc-native.cjs"
 bash "$repo/scripts/check-web.sh"
