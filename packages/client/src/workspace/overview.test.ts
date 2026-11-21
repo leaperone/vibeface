@@ -424,52 +424,39 @@ test("overview preparation keeps partial and unknown remote observations visible
   })
   const prepared = prepareOverviewInputs({
     openWorks: [], bots: [bot("chat-1")], questions: [], nodes: [node("worker", false)], checks: [], overview: remote,
-    terminalCheckPolicy: "shared", read: true, connected: false,
+    terminalCheckPolicy: "mobile-inclusive", read: true, connected: false,
   })
-  assert.equal(prepared.coverage.consistency, "partial")
-  assert.equal(prepared.coverage.truncated, true)
+  assert.equal(prepared.overview.coverage.consistency, "partial")
+  assert.equal(prepared.overview.coverage.truncated, true)
   assert.equal(prepared.works[0]?.state, "unverified")
   assert.equal(prepared.activities.activities[0]?.state, "awaiting_confirmation")
 })
 
-test("overview preparation names assignment and Bot filters before projecting activities", () => {
-  const assigned = work({ work_id: "assigned", conversation_id: "chat-2" })
-  const stale = work({ work_id: "stale", conversation_id: "chat-2" })
-  const prepared = prepareOverviewInputs({
-    openWorks: [work(), assigned, stale], bots: [bot("chat-1"), bot("chat-2")], questions: [], nodes: [node("worker")], checks: [],
-    tasks: [{ task_id: "task-assigned" }], assignments: [{ task_id: "task-assigned", work_id: "assigned" }, { task_id: "orphan-task", work_id: "stale" }],
-    botFilter: "bot-chat-1", terminalCheckPolicy: "shared", read: true, connected: true,
-  })
-  assert.deepEqual(prepared.works.map((item) => item.work_id), ["work-1"])
-  assert.deepEqual(prepared.activities.activities.filter((activity) => activity.kind === "work").map((activity) => activity.work_id), ["work-1"])
-})
-
 test("overview preparation makes Web terminal-check filtering explicit", () => {
   const finished = work({ work_id: "finished", state: "finished", outcome: "completed" })
-  const check: PendingCheck = { kind: "work", check_id: "finished-check", detail: "late check", work_id: finished.work_id, target_node: finished.target_node, conversation_id: finished.conversation_id, title: finished.title, reason: "unverified" }
-  const base = { openWorks: [finished], bots: [bot("chat-1")], questions: [], nodes: [node("worker")], checks: [check], read: true, connected: true }
+  const check: Extract<PendingCheck, { kind: "work" }> = { kind: "work", check_id: "finished-check", detail: "late check", work_id: finished.work_id, target_node: finished.target_node, conversation_id: finished.conversation_id, title: finished.title, reason: "unverified" }
+  const other = { ...check, check_id: "different-conversation", conversation_id: "chat-2" }
+  const device: PendingCheck = { kind: "device", check_id: "device", detail: "device check", target_node: finished.target_node, reason: "offline", works: [check, other] }
+  const base = { openWorks: [finished], bots: [bot("chat-1")], questions: [], nodes: [node("worker")], checks: [check, device], read: true, connected: true }
   const web = prepareOverviewInputs({ ...base, terminalCheckPolicy: "web-filtered" })
   const mobile = prepareOverviewInputs({ ...base, terminalCheckPolicy: "mobile-inclusive" })
-  const shared = prepareOverviewInputs({ ...base, terminalCheckPolicy: "shared" })
-  assert.equal(web.checks.length, 0)
-  assert.deepEqual(web.excludedTerminalChecks, [{ check_id: "finished-check", work_id: "finished", reason: "terminal-work", policy: "web-filtered" }])
-  assert.equal(mobile.checks.length, 1)
-  assert.equal(shared.checks.length, 1)
-  const assignedWeb = prepareOverviewInputs({ ...base, tasks: [{ task_id: "task-finished" }], assignments: [{ task_id: "task-finished", work_id: "finished" }], terminalCheckPolicy: "web-filtered" })
-  assert.equal(assignedWeb.checks.length, 0, "an assigned terminal check is filtered before assignment rows disappear")
-  assert.deepEqual(assignedWeb.excludedTerminalChecks, web.excludedTerminalChecks)
+  assert.deepEqual(web.activities.activities.find((activity) => activity.kind === "work")?.facts.checks, [])
+  assert.deepEqual(web.activities.groups.attention.find((activity) => activity.kind === "attention")?.attention, { ...device, works: [other] })
+  assert.deepEqual(mobile.activities.activities.find((activity) => activity.kind === "work")?.facts.checks, [check, device])
 })
 
-test("overview preparation scopes remote Bot checks and no-work checks, including input checks", () => {
+test("overview preparation retains cross-Bot checks for the screen to select", () => {
   const remote = parseWorkspaceOverview({
     bots: [{ bot_id: "remote-bot", conversation_id: "remote-chat", name: "远端 Bot" }],
     checks: [{ check_id: "remote-check", conversation_id: "remote-chat", trigger: "message:one", created_at_ms: 1 }],
   })
   const crossBot: PendingCheck = { kind: "work", check_id: "other-bot-check", detail: "other", work_id: "other-work", target_node: "worker", conversation_id: "chat-1", title: "other", reason: "unverified" }
-  const base = { openWorks: [], bots: [bot("chat-1")], questions: [], nodes: [node("worker")], checks: [crossBot], overview: remote, terminalCheckPolicy: "shared" as const, read: true, connected: true }
-  const remoteBot = prepareOverviewInputs({ ...base, botFilter: "remote-bot" })
-  assert.equal(remoteBot.checks.length, 0, "a selected Bot never retains an input check from another Bot")
-  assert.deepEqual(remoteBot.overview.tasks.map((task) => task.item_id), ["remote-check"])
-  const localBot = prepareOverviewInputs({ ...base, botFilter: "bot-chat-1" })
-  assert.equal(localBot.overview.tasks.length, 0, "a no-work remote check is excluded when its Bot is not selected")
+  const prepared = prepareOverviewInputs({
+    openWorks: [], bots: [bot("chat-1")], questions: [], nodes: [node("worker")], checks: [crossBot], overview: remote,
+    terminalCheckPolicy: "web-filtered", read: true, connected: true,
+  })
+  assert.deepEqual(prepared.activities.groups.attention.map((activity) => [activity.id, activity.conversation_id]), [
+    ["attention:check:other-bot-check", "chat-1"],
+    ["attention:overview-check:remote-check", "remote-chat"],
+  ])
 })
