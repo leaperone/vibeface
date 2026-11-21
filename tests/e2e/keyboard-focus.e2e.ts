@@ -1,17 +1,13 @@
-import { expect, secrets } from 'e2e'
+import { expect } from 'e2e'
+import { createPersonalNetwork, continueRecoverySetup, finishRecoveryDownload } from '../support/web-onboarding'
 import { test } from './fixtures'
 
 test('returns keyboard focus to task and device openers while retaining the task draft', { timeout: 180000 }, async ({ app, node, screen, browser }) => {
   await browser.setViewport({ width: 390, height: 844 })
   await app.open(node.entry)
-  await screen.getByRole('button', '新建我的网络').click()
-  await screen.getByLabel('这个节点叫什么？').fill('键盘验收工作站')
-  await screen.getByRole('button', '下一步').click()
-  await screen.getByLabel(/^恢复密码/).fill(secrets.get('recoveryPassword'))
-  await screen.getByRole('button', '下一步').click()
-  await browser.waitForDownload(() => screen.getByRole('button', '下载恢复文件').click())
-  await screen.getByRole('checkbox', '已把文件和密码分开保存').check()
-  await screen.getByRole('button', '完成创建').click()
+  await createPersonalNetwork({ screen, browser }, '键盘验收工作站')
+  await continueRecoverySetup({ screen, browser })
+  await finishRecoveryDownload({ screen, browser })
   await screen.getByRole('button', '稍后设置').click()
   await screen.getByLabel('名称', { exact: true }).fill('键盘验收助手')
   await screen.getByRole('button', '完成', { exact: true }).click()

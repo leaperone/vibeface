@@ -11,7 +11,7 @@ exact = ["scripts/build-web.sh", "scripts/check-web.sh", "scripts/build-web-cryp
 [paths.rust_local_inputs]
 patterns = ["crates/delivery/**", "apps/core/src/**", "apps/cli/src/**", "crates/control/src/**", "crates/client/src/**", "crates/bridge/src/**", "crates/protocol/src/**", "crates/secure/src/**", "crates/secure-ffi/**", "crates/native-transport/**", "crates/*/tests/**", "apps/core/tests/**", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/core/build.rs", "apps/core/migrations/**", "apps/core/schema.hcl", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".cargo/**"]
 [paths.delivery]
-patterns = ["crates/delivery/*", "crates/delivery/proof/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "apps/core/src/delivery/*", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/net/mesh/record.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/verify-delivery-protected.py", "scripts/verify-delivery-restart-observer.py"]
+patterns = ["crates/delivery/*", "crates/delivery/proof/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "apps/core/src/delivery/*", "apps/core/src/client.rs", "apps/core/src/config.rs", "apps/core/src/main.rs", "apps/core/src/maintenance.rs", "apps/core/src/net.rs", "apps/core/src/net/mesh/record.rs", "apps/core/src/runtime.rs", "apps/core/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py", "scripts/verify-delivery-protected.py", "scripts/verify-delivery-restart-observer.py", "scripts/verification/*"]
 [paths.full]
 patterns = ["scripts/release_component_identity.py", "scripts/release_format.py", "scripts/release_context.py", "scripts/release_source.py", "scripts/release_archive.py", "scripts/release_inventory.py", "scripts/release_github.py", "scripts/release_publisher.py", "scripts/release_assembly.py", "scripts/tests/release/*", "scripts/tests/__init__.py", "Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "crates/control/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py", "scripts/ci-registry.toml", "scripts/ci_registry.py"]
 [paths.www]
@@ -19,7 +19,7 @@ patterns = ["apps/www/*"]
 [paths.docs]
 patterns = ["README.md", "README.zh-CN.md", "AGENTS.md", "CLAUDE.md", "packages/docs/*", "tests/e2e/*"]
 [paths.node]
-patterns = ["config/public-bootstrap.json", "packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts", "apps/core/*", "install.sh", "scripts/package-node.sh", "scripts/package-node-windows.py", "scripts/package-node-web.json", "scripts/install-node-service.sh", "scripts/install-node-service.ps1", "scripts/verify-node.py", "scripts/verify-windows-node.py", "scripts/verification_harness.py"]
+patterns = ["config/public-bootstrap.json", "packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts", "apps/core/*", "install.sh", "scripts/install.ps1", "scripts/package-node.sh", "scripts/package-node-windows.py", "scripts/package-node-web.json", "scripts/install-node-service.sh", "scripts/install-node-service.ps1", "scripts/verify-node.py", "scripts/verify-windows-node.py", "scripts/verification_harness.py"]
 [paths.desktop]
 patterns = ["apps/desktop/src/*", "apps/desktop/tests/*"]
 [paths.mobile]
@@ -44,7 +44,7 @@ patterns = ["crates/control/*"]
 [paths.cli]
 patterns = ["apps/cli/*"]
 [paths.release_tools]
-patterns = ["scripts/release-contract.mjs", "scripts/release-metadata.mjs", "scripts/test-release-contract.mjs", "scripts/fixtures/release-contract.json", "scripts/build-desktop.mjs", "scripts/verify-desktop.mjs", "scripts/package-npm.mjs", "scripts/publish-npm.mjs", "scripts/sealed-runtime.mjs"]
+patterns = ["scripts/generate-installer-contract.mjs", "scripts/test-installer-contract.mjs", "scripts/release-contract.mjs", "scripts/release-metadata.mjs", "scripts/runtime-contract.mjs", "scripts/runtime_contract.py", "scripts/test-runtime-contract.mjs", "scripts/test-release-contract.mjs", "scripts/fixtures/release-contract.json", "scripts/build-desktop.mjs", "scripts/verify-desktop.mjs", "scripts/package-npm.mjs", "scripts/publish-npm.mjs", "scripts/sealed-runtime.mjs"]
 [paths.www_overlay]
 exact = ["packages/uiarc/src/foundation.css"]
 include = ["www_local_inputs"]
@@ -313,14 +313,14 @@ command = "pnpm --filter vibeface-www run test"
 [[preflight]]
 id = "javascript"
 name = "JavaScript syntax"
-paths = ["scripts/crypto-client.mjs", "apps/cli/npm/**", "scripts/package-npm.mjs", "scripts/package-node-web.json", "scripts/publish-npm.mjs", "scripts/release-contract.mjs", "scripts/release-metadata.mjs", "scripts/test-release-contract.mjs", "scripts/fixtures/release-contract.json", "scripts/sealed-runtime.mjs", "scripts/windows-signing.mjs", "scripts/private-control.mjs", ".github/workflows/npm-publish.yml", ".github/workflows/release.yml", ".github/workflows/release-*.yml"]
-command = "node --check scripts/crypto-client.mjs && node --check apps/cli/npm/bin/vibeface.mjs && node --check scripts/release-contract.mjs && node --check scripts/release-metadata.mjs && node --check scripts/test-release-contract.mjs && node --check scripts/package-npm.mjs && node --check scripts/publish-npm.mjs && node scripts/test-release-contract.mjs --cli-fixtures && node scripts/package-npm.mjs --self-test && node scripts/publish-npm.mjs --self-test"
+paths = ["scripts/crypto-client.mjs", "apps/cli/npm/**", "scripts/package-npm.mjs", "scripts/package-node-web.json", "scripts/publish-npm.mjs", "scripts/release-contract.mjs", "scripts/release-metadata.mjs", "scripts/runtime-contract.mjs", "scripts/runtime_contract.py", "scripts/test-runtime-contract.mjs", "scripts/test-release-contract.mjs", "scripts/fixtures/release-contract.json", "scripts/sealed-runtime.mjs", "scripts/windows-signing.mjs", "scripts/private-control.mjs", ".github/workflows/npm-publish.yml", ".github/workflows/release.yml", ".github/workflows/release-*.yml"]
+command = "node --check scripts/crypto-client.mjs && node --check apps/cli/npm/bin/vibeface.mjs && node --check scripts/release-contract.mjs && node --check scripts/release-metadata.mjs && node --check scripts/runtime-contract.mjs && node --check scripts/test-runtime-contract.mjs && node scripts/test-runtime-contract.mjs --json > /tmp/runtime-node.json && python3 scripts/runtime_contract.py --json > /tmp/runtime-python.json && diff -u /tmp/runtime-node.json /tmp/runtime-python.json && node --check scripts/package-npm.mjs && node --check scripts/publish-npm.mjs && node scripts/test-release-contract.mjs --cli-fixtures && node scripts/package-npm.mjs --self-test && node scripts/publish-npm.mjs --self-test"
 ci_check = "Workflow and source checks"
 [[preflight]]
 id = "delivery-scripts"
 name = "Delivery scripts and workflow"
-paths = ["install.sh", "scripts/*.sh", "scripts/release.py", "scripts/release_*.py", "scripts/tests/release/**", "scripts/tests/__init__.py", "scripts/hourly.py", "scripts/release-dispatch.py", "scripts/check-release-workflow.py", ".github/workflows/**"]
-command = "bash -n install.sh && bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/check-web.sh && shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/check-web.sh && bash install.sh --self-test"
+paths = ["install.sh", "scripts/install.ps1", "scripts/generate-installer-contract.mjs", "scripts/test-installer-contract.mjs", "scripts/*.sh", "scripts/release.py", "scripts/release_*.py", "scripts/tests/release/**", "scripts/tests/__init__.py", "scripts/hourly.py", "scripts/release-dispatch.py", "scripts/check-release-workflow.py", ".github/workflows/**"]
+command = "node --check scripts/generate-installer-contract.mjs && node --check scripts/test-installer-contract.mjs && node scripts/test-installer-contract.mjs && node scripts/generate-installer-contract.mjs --check && bash -n install.sh && bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/check-web.sh && shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/check-web.sh && bash install.sh --self-test"
 ci_check = "Workflow and source checks"
 [[preflight]]
 id = "release-signing"

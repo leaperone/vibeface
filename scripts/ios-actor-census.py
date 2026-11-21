@@ -489,8 +489,6 @@ def self_test() -> None:
     with TestCase().assertRaises(subprocess.TimeoutExpired, msg='an exhausted probe budget started another process'):
         budget.run(["fixture"], timeout=4)
     assert probe_timeouts == [4, 0.5]
-    from tempfile import TemporaryDirectory
-
     table = """  41  1 S snapshot-bridge
   42  41 S /Applications/Vibeface.app/Vibeface
   43  41 R AgentDeviceRunner-Runner
@@ -532,7 +530,7 @@ def self_test() -> None:
     assert public["snapshot_bridge_cache"] == {"status": "present", "binary_count": 1}
     assert secret not in encoded and "version" not in encoded and "transport" not in encoded
 
-    with TemporaryDirectory(prefix="ios-actor-census-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="ios-actor-census-") as temporary:
         root = Path(temporary) / "repo"
         private = root / ".artifacts/native/private"
         private.mkdir(parents=True)

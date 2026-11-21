@@ -6,8 +6,8 @@ import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { PLATFORMS, platformFor, DESKTOP_SCHEMA as SCHEMA_VERSION, parseReleaseVersion, programNames, desktopPayloadNames, validateBuildInfoShape } from './release-contract.mjs';
-import { readContracts, readOwnVersion, readNativeUi } from './release-metadata.mjs';
+import { PLATFORMS, platformFor, DESKTOP_SCHEMA as SCHEMA_VERSION, parseReleaseVersion, desktopPayloadNames, validateBuildInfoShape } from './release-contract.mjs';
+import { readContracts, readOwnVersion, readNativeUi, readRuntimeRole } from './release-metadata.mjs';
 import { hash, relativeFiles, readSealedRuntime, verifySealedRuntime } from './sealed-runtime.mjs';
 import { requireAuthenticode, signNative } from './windows-signing.mjs';
 
@@ -27,9 +27,11 @@ function readRuntime(directory, target, contracts, version, sourceCommit) {
     [version ?? info.version, target, sourceCommit ?? info.source_commit],
     'the bundled runtime is not this platform, version and source');
   const sealed = readSealedRuntime(directory);
-  for (const name of [...programNames(target), 'web/index.html', 'web/vibeface_secure.js',
-    'web/vibeface_secure_bg.wasm', 'README.md', 'RUNTIME-REQUIREMENTS.md']) {
-    assert(sealed.has(name), `the runtime is missing ${name}`);
+  for (const name of readRuntimeRole(repo, target, 'desktop-minimum')) {
+    const present = name === 'FILES.sha256'
+      ? fs.lstatSync(path.join(directory, name)).isFile()
+      : sealed.has(name);
+    assert(present, `the runtime is missing ${name}`);
   }
   return { info, sealed };
 }
@@ -295,7 +297,14 @@ function selfTest() {
       'vibeface-core': '#!/bin/sh\necho "vibeface-core fixture"\n',
       'README.md': 'fixture\n',
       'RUNTIME-REQUIREMENTS.md': 'fixture\n',
+      'scripts/install-node-service.sh': '#!/bin/sh\n',
+      'docs/node.md': 'fixture\n',
+      'docs/releasing.md': 'fixture\n',
+      'web/_shell.html': '<!doctype html>shell',
       'web/index.html': '<!doctype html>fixture',
+      'web/_redirects': '/ /index.html 200\n',
+      'web/_headers': '/*\n',
+      'web/.vibeface-build.json': '{"fixture":true}\n',
       'web/vibeface_secure.js': 'export const fixture = true;\n',
       'web/vibeface_secure_bg.wasm': '\u0000asm',
     };

@@ -7,6 +7,9 @@ must reserve, and the signal/handle operation used to stop an owned process.
 
 from __future__ import annotations
 
+import sys
+sys.dont_write_bytecode = True
+
 import hashlib
 import contextlib
 import json
@@ -128,25 +131,7 @@ def reserve_loopback_port(
             candidate = (selected + 1) if selected is not None else candidate + 1
 
 
-def stop_owned_process(
-    process: subprocess.Popen | None,
-    *,
-    terminate: Callable[[], object] | None = None,
-    kill: Callable[[], object] | None = None,
-    wait_timeout: float = 5,
-) -> None:
-    """Stop one already-owned process, keeping group/handle policy in adapters."""
-    if process is None:
-        return
-    if process.poll() is None:
-        with contextlib.suppress(ProcessLookupError):
-            (terminate or process.terminate)()
-    try:
-        process.wait(timeout=wait_timeout)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(ProcessLookupError):
-            (kill or process.kill)()
-        process.wait(timeout=wait_timeout)
+from verification.process import stop_owned_process
 
 
 def self_test() -> dict[str, object]:

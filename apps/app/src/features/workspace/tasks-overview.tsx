@@ -12,8 +12,9 @@ import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { workFailure } from "@vibeface/client/lib/errors.ts"
 import type { MembershipView } from "@vibeface/client/lib/node.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
-import { cardState,needsLook,nodeName,overviewScope,schedulerStatus,staleTaskLabel,taskActive,taskGroups,taskLabel,taskProgress,taskStale,workspaceActivities,type TaskGroup } from "@vibeface/client/workspace/labels.ts"
-import { openWorksFromOverview,overviewFromWorkspace } from "@vibeface/client/workspace/model.ts"
+import { cardState,needsLook,nodeName,overviewScope,schedulerStatus,staleTaskLabel,taskActive,taskGroups,taskLabel,taskProgress,taskStale,type TaskGroup } from "@vibeface/client/workspace/labels.ts"
+import { prepareOverviewInputs } from "@vibeface/client/workspace/overview-policy.ts"
+import { selectTasksOverview,workspaceTaskGroup } from "@vibeface/client/workspace/presentation.ts"
 import { projectName } from "@vibeface/client/workspace/questions.ts"
 import type { NodeInfo,OpenWorkCard,OverviewTask,WorkspaceActivity } from "@vibeface/client/workspace/types.ts"
 import { Button } from "@vibeface/uiarc/button/button.tsx"
@@ -42,54 +43,41 @@ export function TasksOverview() {
   const failedIds = new Set(inbox.flatMap((item) => item.kind === "failed" ? [item.work.work_id] : []))
   type InboxItem = (typeof inbox)[number]
   const lookup = { nodes: workspace.nodes, directory }
-  const localOverview = overviewFromWorkspace({ openWorks: workspace.openWorks, bots: workspace.bots, questions: workspace.questions, nodes: workspace.nodes })
-  const overview = workspace.overview ?? localOverview
-  const overviewWorks = openWorksFromOverview(overview, workspace.openWorks)
   // The task snapshot does not wait for conversation reads or write alignment.
   const read = Boolean(workspace.synced || workspace.nodesRead)
-  const projected = new Map([...localOverview.tasks, ...overview.tasks].filter((task): task is ProjectedWork => (task.kind === "work" || task.kind === "dispatch") && Boolean(task.work_id)).map((task) => [JSON.stringify([task.conversation_id, task.work_id]), task]))
-  const projection = (work: OpenWorkCard) => projected.get(JSON.stringify([work.conversation_id, work.work_id]))
-  const needsConfirmation = (check: { conversation_id: string; work_id: string; target_node: string }) => {
-    const work = overviewWorks.find((work) => work.conversation_id === check.conversation_id && work.work_id === check.work_id && work.target_node === check.target_node)
-    return !work || !["completed", "failed", "interrupted", "rejected"].includes(cardState(work, workspace.nodes, projection(work)))
-  }
-  const attention = inbox.filter((item): item is Extract<InboxItem, { kind: "question" | "confirm" }> => item.kind === "confirm" || item.kind === "question" && !item.done).flatMap((item): Extract<InboxItem, { kind: "question" | "confirm" }>[] => {
-    if (item.kind !== "confirm" || item.check.kind === "process") return [item]
-    if (item.check.kind === "work") return needsConfirmation(item.check) ? [item] : []
-    const works = item.check.works.filter(needsConfirmation)
-    return works.length ? [{ ...item, check: { ...item.check, works } }] : []
-  })
+  const attention = inbox.filter((item): item is Extract<InboxItem, { kind: "question" | "confirm" }> => item.kind === "confirm" || item.kind === "question" && !item.done)
   const openQuestions = attention.filter((item): item is Extract<InboxItem, { kind: "question" }> => item.kind === "question").map((item) => item.question)
   const pendingChecks = attention.filter((item): item is Extract<InboxItem, { kind: "confirm" }> => item.kind === "confirm").map((item) => item.check)
-  const activityView = workspaceActivities({
-    works: overviewWorks, questions: openQuestions, checks: pendingChecks, overview,
-    jobs: (workspace.data?.scheduler?.jobs ?? []).map((job) => ({ conversation_id: workspace.conversationId, job })),
-    answered: workspace.answered, nodes: workspace.nodes, knownBots: read ? workspace.bots : [], connected: workspace.connectionOnline, read,
+  const prepared = prepareOverviewInputs({
+    openWorks: workspace.openWorks, bots: workspace.bots, questions: openQuestions, nodes: workspace.nodes, checks: pendingChecks,
+    overview: workspace.overview, jobs: (workspace.data?.scheduler?.jobs ?? []).map((job) => ({ conversation_id: workspace.conversationId, job })),
+    answered: workspace.answered, read, connected: workspace.connectionOnline, terminalCheckPolicy: "web-filtered",
   })
-  const groups: Record<TaskGroup, WorkspaceActivity[]> = activityView.groups
+  const overview = prepared.overview
+  const activityView = prepared.activities
   const botIds = new Map(workspace.bots.map((bot) => [bot.conversation_id, bot.bot_id]))
   const matchesBot = (conversationId: string, projectedBotId?: string | null) => botFilter === "all" || projectedBotId === botFilter || botIds.get(conversationId) === botFilter
   const activityBot = (activity: WorkspaceActivity) => activity.conversation_id ? workspace.bots.find((bot) => bot.conversation_id === activity.conversation_id) ?? overview.bots.find((bot) => bot.conversation_id === activity.conversation_id) : undefined
-  const taskStates: Record<TaskGroup, string[]> = { attention: ['waiting_user', 'needs_reconciliation', 'update_pending', 'stop_pending'], working: ['running'], waiting: ['not_started', 'waiting_dependencies', 'deferred'] }
-  const businessTasks = (workspace.workspaceState?.tasks ?? []).filter((task) => botFilter === 'all' || task.owner_bot === botFilter)
-  const taskCounts = { attention: businessTasks.filter((task) => taskStates.attention.includes(task.state)).length, working: businessTasks.filter((task) => taskStates.working.includes(task.state)).length, waiting: businessTasks.filter((task) => taskStates.waiting.includes(task.state)).length }
-  const assignedWorkIds = new Set((workspace.workspaceState?.assignments ?? []).flatMap((assignment) => assignment.work_id && workspace.workspaceState?.tasks.some((task) => task.task_id === assignment.task_id) ? [assignment.work_id] : []))
-  const visibleGroups: Record<TaskGroup, WorkspaceActivity[]> = { attention: [], working: [], waiting: [] }
-  const heldGroups: Record<TaskGroup, number> = { attention: 0, working: 0, waiting: 0 }
-  for (const group of taskGroups.map(({ group }) => group)) for (const activity of groups[group]) {
-    if (activity.kind === 'work' && activity.work && assignedWorkIds.has(activity.work.work_id)) continue
-    const deviceMatch = activity.kind === "attention" && "kind" in activity.attention && activity.attention.kind === "device" && activity.attention.works.some((work) => matchesBot(work.conversation_id))
-    if (!matchesBot(activity.conversation_id ?? "", activityBot(activity)?.bot_id) && !deviceMatch) continue
-    // A failed work, live question or check is acted on in 待处理 above: counted here, shown only there.
-    if (activity.kind === "work" && activity.work && failedIds.has(activity.work.work_id) || activity.kind === "attention" && !("kind" in activity.attention && (activity.attention.kind === "question" || activity.attention.kind === "check"))) heldGroups[group]++
-    else visibleGroups[group].push(activity)
-  }
+  const selection = selectTasksOverview({
+    workspace: workspace.workspaceState,
+    activities: activityView,
+    botId: botFilter,
+    failedWorkIds: failedIds,
+    includeActivity: (activity) => {
+      const deviceMatch = activity.kind === "attention" && "kind" in activity.attention && activity.attention.kind === "device" && activity.attention.works.some((work) => matchesBot(work.conversation_id))
+      return matchesBot(activity.conversation_id ?? "", activityBot(activity)?.bot_id) || deviceMatch
+    },
+  })
+  const businessTasks = selection.businessTasks
+  const taskCounts = selection.taskCounts
+  const visibleGroups = selection.groups
+  const heldGroups = selection.heldGroups
   const visible = (group: TaskGroup) => filter === "all" || filter === group
-  const visibleCount = (visible("attention") ? visibleGroups.attention.length + heldGroups.attention : 0) + (visible("working") ? visibleGroups.working.length + heldGroups.working : 0) + (visible("waiting") ? visibleGroups.waiting.length + heldGroups.waiting : 0) + businessTasks.filter((task) => filter === "all" || taskStates[filter].includes(task.state)).length
+  const visibleCount = (visible("attention") ? visibleGroups.attention.length + heldGroups.attention : 0) + (visible("working") ? visibleGroups.working.length + heldGroups.working : 0) + (visible("waiting") ? visibleGroups.waiting.length + heldGroups.waiting : 0) + businessTasks.filter((task) => filter === "all" || workspaceTaskGroup(task) === filter).length
   const hasContent = visibleCount > 0
   const tasksRead = read && Boolean(workspace.workspaceState)
   // Test all loaded records before filters, including history and work held in 待处理.
-  const hasTaskRecords = Boolean(workspace.workspaceState?.tasks.length || overviewWorks.length || overview.tasks.length || activityView.activities.length
+  const hasTaskRecords = Boolean(workspace.workspaceState?.tasks.length || prepared.works.length || overview.tasks.length || activityView.activities.length
     || inbox.some((item) => ["question", "confirm", "failed", "undelivered", "attention", "session"].includes(item.kind)))
   const globallyEmpty = tasksRead && !hasTaskRecords
   const localReadError = readFailure && readFailure.generation === workspace.generation && (readFailure.kind === "workspace" ? !read : !workspace.workspaceState) ? readFailure.cause : null

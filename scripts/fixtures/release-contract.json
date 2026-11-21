@@ -234,5 +234,1520 @@
     "desktop": "9.9.9-hourly.2026110712",
     "mobile": "7.8.9-rc.2",
     "www": "0.0.1"
+  },
+  "runtime": {
+    "schema": 1,
+    "wire": {
+      "build_info": 1,
+      "files": 1
+    },
+    "contracts": {
+      "data_epoch": 1,
+      "update_protocol": 1
+    },
+    "targets": [
+      {
+        "target": "aarch64-apple-darwin",
+        "host": "darwin-arm64",
+        "platform": "darwin",
+        "flag": "--mac",
+        "exe_suffix": "",
+        "service_suffix": "sh",
+        "installer": "dmg",
+        "signing": "developer-id-notarized",
+        "arch": null,
+        "programs": [
+          "vibeface",
+          "vibeface-core"
+        ],
+        "roles": {
+          "runtime-core": [
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "FILES.sha256"
+          ],
+          "node-full": [
+            "FILES.sha256",
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "scripts/install-node-service.sh",
+            "docs/node.md",
+            "docs/releasing.md",
+            "web/_shell.html",
+            "web/index.html",
+            "web/_redirects",
+            "web/_headers",
+            "web/.vibeface-build.json",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "npm-vendor": [
+            "FILES.sha256",
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "scripts/install-node-service.sh",
+            "docs/node.md",
+            "docs/releasing.md",
+            "web/_shell.html",
+            "web/index.html",
+            "web/_redirects",
+            "web/_headers",
+            "web/.vibeface-build.json",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "desktop-minimum": [
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "FILES.sha256",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "web/index.html",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ]
+        }
+      },
+      {
+        "target": "aarch64-unknown-linux-gnu",
+        "host": "linux-arm64",
+        "platform": "linux",
+        "flag": "--linux",
+        "exe_suffix": "",
+        "service_suffix": "sh",
+        "installer": "AppImage",
+        "signing": "platform-checksums",
+        "arch": "arm64",
+        "programs": [
+          "vibeface",
+          "vibeface-core"
+        ],
+        "roles": {
+          "runtime-core": [
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "FILES.sha256"
+          ],
+          "node-full": [
+            "FILES.sha256",
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "scripts/install-node-service.sh",
+            "docs/node.md",
+            "docs/releasing.md",
+            "web/_shell.html",
+            "web/index.html",
+            "web/_redirects",
+            "web/_headers",
+            "web/.vibeface-build.json",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "npm-vendor": [
+            "FILES.sha256",
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "scripts/install-node-service.sh",
+            "docs/node.md",
+            "docs/releasing.md",
+            "web/_shell.html",
+            "web/index.html",
+            "web/_redirects",
+            "web/_headers",
+            "web/.vibeface-build.json",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "desktop-minimum": [
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "FILES.sha256",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "web/index.html",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ]
+        }
+      },
+      {
+        "target": "x86_64-unknown-linux-gnu",
+        "host": "linux-x64",
+        "platform": "linux",
+        "flag": "--linux",
+        "exe_suffix": "",
+        "service_suffix": "sh",
+        "installer": "AppImage",
+        "signing": "platform-checksums",
+        "arch": "x64",
+        "programs": [
+          "vibeface",
+          "vibeface-core"
+        ],
+        "roles": {
+          "runtime-core": [
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "FILES.sha256"
+          ],
+          "node-full": [
+            "FILES.sha256",
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "scripts/install-node-service.sh",
+            "docs/node.md",
+            "docs/releasing.md",
+            "web/_shell.html",
+            "web/index.html",
+            "web/_redirects",
+            "web/_headers",
+            "web/.vibeface-build.json",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "npm-vendor": [
+            "FILES.sha256",
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "scripts/install-node-service.sh",
+            "docs/node.md",
+            "docs/releasing.md",
+            "web/_shell.html",
+            "web/index.html",
+            "web/_redirects",
+            "web/_headers",
+            "web/.vibeface-build.json",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "desktop-minimum": [
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "FILES.sha256",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "web/index.html",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ]
+        }
+      },
+      {
+        "target": "x86_64-pc-windows-msvc",
+        "host": "win32-x64",
+        "platform": "win32",
+        "flag": "--win",
+        "exe_suffix": ".exe",
+        "service_suffix": "ps1",
+        "installer": "exe",
+        "signing": "authenticode",
+        "arch": null,
+        "programs": [
+          "vibeface.exe",
+          "vibeface-core.exe"
+        ],
+        "roles": {
+          "runtime-core": [
+            "vibeface.exe",
+            "vibeface-core.exe",
+            "BUILD-INFO.json",
+            "FILES.sha256"
+          ],
+          "node-full": [
+            "FILES.sha256",
+            "vibeface.exe",
+            "vibeface-core.exe",
+            "BUILD-INFO.json",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "scripts/install-node-service.ps1",
+            "docs/node.md",
+            "docs/releasing.md",
+            "web/_shell.html",
+            "web/index.html",
+            "web/_redirects",
+            "web/_headers",
+            "web/.vibeface-build.json",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "npm-vendor": [
+            "FILES.sha256",
+            "vibeface.exe",
+            "vibeface-core.exe",
+            "BUILD-INFO.json",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "scripts/install-node-service.ps1",
+            "docs/node.md",
+            "docs/releasing.md",
+            "web/_shell.html",
+            "web/index.html",
+            "web/_redirects",
+            "web/_headers",
+            "web/.vibeface-build.json",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "desktop-minimum": [
+            "vibeface.exe",
+            "vibeface-core.exe",
+            "BUILD-INFO.json",
+            "FILES.sha256",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "web/index.html",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ]
+        }
+      }
+    ],
+    "build_info": {
+      "fields": [
+        "version",
+        "target",
+        "source_commit",
+        "update_protocol",
+        "data_epoch",
+        "core_version",
+        "core_source_commit",
+        "app_version",
+        "app_source_commit"
+      ],
+      "types": {
+        "version": "string",
+        "target": "target",
+        "source_commit": "sha1",
+        "update_protocol": "uint32",
+        "data_epoch": "uint32",
+        "core_version": "string",
+        "core_source_commit": "sha1",
+        "app_version": "string",
+        "app_source_commit": "sha1"
+      }
+    },
+    "files": {
+      "syntax": {
+        "encoding": "utf-8",
+        "bom": false,
+        "line": "<64 lowercase hex><two ASCII spaces><relative POSIX path>\\n",
+        "path": "[A-Za-z0-9._/-]+",
+        "sorted": "raw-byte",
+        "self_entry": false
+      },
+      "roles": {
+        "runtime-core": "programs + BUILD-INFO.json + FILES.sha256",
+        "node-full": "runtime-core + support docs/service + web_required",
+        "npm-vendor": "node-full",
+        "desktop-minimum": "runtime-core + README.md + RUNTIME-REQUIREMENTS.md + web/index.html + web/vibeface_secure.js + web/vibeface_secure_bg.wasm"
+      },
+      "web_required": [
+        "_shell.html",
+        "index.html",
+        "_redirects",
+        "_headers",
+        ".vibeface-build.json",
+        "vibeface_secure.js",
+        "vibeface_secure_bg.wasm"
+      ]
+    },
+    "cases": {
+      "build_info": [
+        {
+          "id": "build-valid-stable-aarch64-apple-darwin",
+          "kind": "build-info",
+          "input": {
+            "version": "0.0.1",
+            "target": "aarch64-apple-darwin",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "build-valid-rc-aarch64-apple-darwin",
+          "kind": "build-info",
+          "input": {
+            "version": "1.2.3-rc.1",
+            "target": "aarch64-apple-darwin",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "build-valid-hourly-aarch64-apple-darwin",
+          "kind": "build-info",
+          "input": {
+            "version": "1.2.3-hourly.2026101909",
+            "target": "aarch64-apple-darwin",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "build-valid-stable-aarch64-unknown-linux-gnu",
+          "kind": "build-info",
+          "input": {
+            "version": "0.0.1",
+            "target": "aarch64-unknown-linux-gnu",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "build-valid-rc-aarch64-unknown-linux-gnu",
+          "kind": "build-info",
+          "input": {
+            "version": "1.2.3-rc.1",
+            "target": "aarch64-unknown-linux-gnu",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "build-valid-hourly-aarch64-unknown-linux-gnu",
+          "kind": "build-info",
+          "input": {
+            "version": "1.2.3-hourly.2026101909",
+            "target": "aarch64-unknown-linux-gnu",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "build-valid-stable-x86_64-unknown-linux-gnu",
+          "kind": "build-info",
+          "input": {
+            "version": "0.0.1",
+            "target": "x86_64-unknown-linux-gnu",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "build-valid-rc-x86_64-unknown-linux-gnu",
+          "kind": "build-info",
+          "input": {
+            "version": "1.2.3-rc.1",
+            "target": "x86_64-unknown-linux-gnu",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "build-valid-hourly-x86_64-unknown-linux-gnu",
+          "kind": "build-info",
+          "input": {
+            "version": "1.2.3-hourly.2026101909",
+            "target": "x86_64-unknown-linux-gnu",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "build-valid-stable-x86_64-pc-windows-msvc",
+          "kind": "build-info",
+          "input": {
+            "version": "0.0.1",
+            "target": "x86_64-pc-windows-msvc",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "build-valid-rc-x86_64-pc-windows-msvc",
+          "kind": "build-info",
+          "input": {
+            "version": "1.2.3-rc.1",
+            "target": "x86_64-pc-windows-msvc",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "build-valid-hourly-x86_64-pc-windows-msvc",
+          "kind": "build-info",
+          "input": {
+            "version": "1.2.3-hourly.2026101909",
+            "target": "x86_64-pc-windows-msvc",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "build-valid-large-components",
+          "kind": "build-info",
+          "input": {
+            "version": "9007199254740993.2.3",
+            "target": "aarch64-apple-darwin",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": 1,
+            "core_version": "9007199254740993.2.3",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "1.2.3",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "build-unknown-key",
+          "kind": "build-info",
+          "input": {
+            "version": "1.2.3-hourly.2026101909",
+            "target": "aarch64-apple-darwin",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc",
+            "legacy": true
+          },
+          "accepted": false,
+          "error": "fields"
+        },
+        {
+          "id": "build-missing-key",
+          "kind": "build-info",
+          "input": {
+            "version": "1.2.3-hourly.2026101909",
+            "target": "aarch64-apple-darwin",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": false,
+          "error": "fields"
+        },
+        {
+          "id": "build-unsupported-target",
+          "kind": "build-info",
+          "input": {
+            "version": "1.2.3-hourly.2026101909",
+            "target": "unknown",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": false,
+          "error": "target"
+        },
+        {
+          "id": "build-contract-data_epoch-string",
+          "kind": "build-info",
+          "input": {
+            "version": "1.2.3-hourly.2026101909",
+            "target": "aarch64-apple-darwin",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": "1",
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": false,
+          "error": "contract"
+        },
+        {
+          "id": "build-contract-update_protocol-boolean",
+          "kind": "build-info",
+          "input": {
+            "version": "1.2.3-hourly.2026101909",
+            "target": "aarch64-apple-darwin",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": true,
+            "data_epoch": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": false,
+          "error": "contract"
+        },
+        {
+          "id": "build-contract-data_epoch-wrong",
+          "kind": "build-info",
+          "input": {
+            "version": "1.2.3-hourly.2026101909",
+            "target": "aarch64-apple-darwin",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": 2,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": false,
+          "error": "contract"
+        },
+        {
+          "id": "build-contract-update_protocol-wrong",
+          "kind": "build-info",
+          "input": {
+            "version": "1.2.3-hourly.2026101909",
+            "target": "aarch64-apple-darwin",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 0,
+            "data_epoch": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": false,
+          "error": "contract"
+        },
+        {
+          "id": "build-commit-source_commit",
+          "kind": "build-info",
+          "input": {
+            "version": "1.2.3-hourly.2026101909",
+            "target": "aarch64-apple-darwin",
+            "source_commit": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "update_protocol": 1,
+            "data_epoch": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": false,
+          "error": "commit"
+        },
+        {
+          "id": "build-commit-core_source_commit",
+          "kind": "build-info",
+          "input": {
+            "version": "1.2.3-hourly.2026101909",
+            "target": "aarch64-apple-darwin",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": false,
+          "error": "commit"
+        },
+        {
+          "id": "build-commit-app_source_commit",
+          "kind": "build-info",
+          "input": {
+            "version": "1.2.3-hourly.2026101909",
+            "target": "aarch64-apple-darwin",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "accepted": false,
+          "error": "commit"
+        },
+        {
+          "id": "build-version-version",
+          "kind": "build-info",
+          "input": {
+            "version": "1.2.3+build",
+            "target": "aarch64-apple-darwin",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": false,
+          "error": "version"
+        },
+        {
+          "id": "build-version-core_version",
+          "kind": "build-info",
+          "input": {
+            "version": "1.2.3-hourly.2026101909",
+            "target": "aarch64-apple-darwin",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": 1,
+            "core_version": "1.2.3-hourly.2026022912",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "3.4.5-rc.2",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": false,
+          "error": "version"
+        },
+        {
+          "id": "build-version-app_version",
+          "kind": "build-info",
+          "input": {
+            "version": "1.2.3-hourly.2026101909",
+            "target": "aarch64-apple-darwin",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "update_protocol": 1,
+            "data_epoch": 1,
+            "core_version": "2.3.4",
+            "core_source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "app_version": "01.2.3",
+            "app_source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "accepted": false,
+          "error": "version"
+        },
+        {
+          "id": "build-duplicate-json-key",
+          "kind": "build-info-raw",
+          "raw": "{\"version\": \"1.2.3-hourly.2026101909\", \"version\": \"1.2.3\", \"target\": \"aarch64-apple-darwin\", \"source_commit\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"update_protocol\": 1, \"data_epoch\": 1, \"core_version\": \"2.3.4\", \"core_source_commit\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"app_version\": \"3.4.5-rc.2\", \"app_source_commit\": \"cccccccccccccccccccccccccccccccccccccccc\"}",
+          "accepted": false,
+          "error": "json-duplicate"
+        },
+        {
+          "id": "build-contract-float-data-epoch",
+          "kind": "build-info-raw",
+          "raw": "{\"version\":\"0.0.1\",\"target\":\"aarch64-apple-darwin\",\"source_commit\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"update_protocol\":1,\"data_epoch\":1.0,\"core_version\":\"2.3.4\",\"core_source_commit\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"app_version\":\"3.4.5-rc.2\",\"app_source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\"}",
+          "accepted": false,
+          "error": "contract"
+        },
+        {
+          "id": "build-contract-exponent-update-protocol",
+          "kind": "build-info-raw",
+          "raw": "{\"version\":\"0.0.1\",\"target\":\"aarch64-apple-darwin\",\"source_commit\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"update_protocol\":1e0,\"data_epoch\":1,\"core_version\":\"2.3.4\",\"core_source_commit\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"app_version\":\"3.4.5-rc.2\",\"app_source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\"}",
+          "accepted": false,
+          "error": "contract"
+        }
+      ],
+      "files": [
+        {
+          "id": "files-valid-sorted",
+          "kind": "files",
+          "raw": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  BUILD-INFO.json\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  vibeface\n",
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "files-valid-multi",
+          "kind": "files",
+          "raw": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  BUILD-INFO.json\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  docs/node.md\ncccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  web/index.html\n",
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "files-uppercase-digest",
+          "kind": "files",
+          "raw": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  x\n",
+          "accepted": false,
+          "error": "syntax"
+        },
+        {
+          "id": "files-single-space",
+          "kind": "files",
+          "raw": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa x\n",
+          "accepted": false,
+          "error": "syntax"
+        },
+        {
+          "id": "files-trailing-space",
+          "kind": "files",
+          "raw": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  x \n",
+          "accepted": false,
+          "error": "syntax"
+        },
+        {
+          "id": "files-unsorted",
+          "kind": "files",
+          "raw": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  z\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  a\n",
+          "accepted": false,
+          "error": "order"
+        },
+        {
+          "id": "files-duplicate-path",
+          "kind": "files",
+          "raw": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  x\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  x\n",
+          "accepted": false,
+          "error": "duplicate"
+        },
+        {
+          "id": "files-traversal",
+          "kind": "files",
+          "raw": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  ../x\n",
+          "accepted": false,
+          "error": "path"
+        },
+        {
+          "id": "files-absolute",
+          "kind": "files",
+          "raw": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  /x\n",
+          "accepted": false,
+          "error": "path"
+        },
+        {
+          "id": "files-backslash",
+          "kind": "files",
+          "raw": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  a\\b\n",
+          "accepted": false,
+          "error": "path"
+        },
+        {
+          "id": "files-self-entry",
+          "kind": "files",
+          "raw": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  FILES.sha256\n",
+          "accepted": false,
+          "error": "self-entry"
+        },
+        {
+          "id": "files-empty-line",
+          "kind": "files",
+          "raw": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  x\n\n",
+          "accepted": false,
+          "error": "syntax"
+        },
+        {
+          "id": "files-bad-hash",
+          "kind": "files",
+          "raw": "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg  x\n",
+          "accepted": false,
+          "error": "syntax"
+        }
+      ],
+      "roles": [
+        {
+          "id": "role-core-aarch64-apple-darwin",
+          "kind": "role",
+          "target": "aarch64-apple-darwin",
+          "role": "runtime-core",
+          "files": [
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "FILES.sha256"
+          ],
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "role-desktop-minimum-aarch64-apple-darwin",
+          "kind": "role",
+          "target": "aarch64-apple-darwin",
+          "role": "desktop-minimum",
+          "files": [
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "FILES.sha256",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "web/index.html",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "role-node-full-aarch64-apple-darwin",
+          "kind": "role",
+          "target": "aarch64-apple-darwin",
+          "role": "node-full",
+          "files": [
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "FILES.sha256",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "scripts/install-node-service.sh",
+            "docs/node.md",
+            "docs/releasing.md",
+            "web/_shell.html",
+            "web/index.html",
+            "web/_redirects",
+            "web/_headers",
+            "web/.vibeface-build.json",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "role-node-missing-service-aarch64-apple-darwin",
+          "kind": "role",
+          "target": "aarch64-apple-darwin",
+          "role": "node-full",
+          "files": [
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "FILES.sha256",
+            "web/_shell.html",
+            "web/index.html",
+            "web/_redirects",
+            "web/_headers",
+            "web/.vibeface-build.json",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "accepted": false,
+          "error": "required"
+        },
+        {
+          "id": "role-core-aarch64-unknown-linux-gnu",
+          "kind": "role",
+          "target": "aarch64-unknown-linux-gnu",
+          "role": "runtime-core",
+          "files": [
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "FILES.sha256"
+          ],
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "role-desktop-minimum-aarch64-unknown-linux-gnu",
+          "kind": "role",
+          "target": "aarch64-unknown-linux-gnu",
+          "role": "desktop-minimum",
+          "files": [
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "FILES.sha256",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "web/index.html",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "role-node-full-aarch64-unknown-linux-gnu",
+          "kind": "role",
+          "target": "aarch64-unknown-linux-gnu",
+          "role": "node-full",
+          "files": [
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "FILES.sha256",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "scripts/install-node-service.sh",
+            "docs/node.md",
+            "docs/releasing.md",
+            "web/_shell.html",
+            "web/index.html",
+            "web/_redirects",
+            "web/_headers",
+            "web/.vibeface-build.json",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "role-node-missing-service-aarch64-unknown-linux-gnu",
+          "kind": "role",
+          "target": "aarch64-unknown-linux-gnu",
+          "role": "node-full",
+          "files": [
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "FILES.sha256",
+            "web/_shell.html",
+            "web/index.html",
+            "web/_redirects",
+            "web/_headers",
+            "web/.vibeface-build.json",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "accepted": false,
+          "error": "required"
+        },
+        {
+          "id": "role-core-x86_64-unknown-linux-gnu",
+          "kind": "role",
+          "target": "x86_64-unknown-linux-gnu",
+          "role": "runtime-core",
+          "files": [
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "FILES.sha256"
+          ],
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "role-desktop-minimum-x86_64-unknown-linux-gnu",
+          "kind": "role",
+          "target": "x86_64-unknown-linux-gnu",
+          "role": "desktop-minimum",
+          "files": [
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "FILES.sha256",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "web/index.html",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "role-node-full-x86_64-unknown-linux-gnu",
+          "kind": "role",
+          "target": "x86_64-unknown-linux-gnu",
+          "role": "node-full",
+          "files": [
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "FILES.sha256",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "scripts/install-node-service.sh",
+            "docs/node.md",
+            "docs/releasing.md",
+            "web/_shell.html",
+            "web/index.html",
+            "web/_redirects",
+            "web/_headers",
+            "web/.vibeface-build.json",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "role-node-missing-service-x86_64-unknown-linux-gnu",
+          "kind": "role",
+          "target": "x86_64-unknown-linux-gnu",
+          "role": "node-full",
+          "files": [
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "FILES.sha256",
+            "web/_shell.html",
+            "web/index.html",
+            "web/_redirects",
+            "web/_headers",
+            "web/.vibeface-build.json",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "accepted": false,
+          "error": "required"
+        },
+        {
+          "id": "role-core-x86_64-pc-windows-msvc",
+          "kind": "role",
+          "target": "x86_64-pc-windows-msvc",
+          "role": "runtime-core",
+          "files": [
+            "vibeface.exe",
+            "vibeface-core.exe",
+            "BUILD-INFO.json",
+            "FILES.sha256"
+          ],
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "role-desktop-minimum-x86_64-pc-windows-msvc",
+          "kind": "role",
+          "target": "x86_64-pc-windows-msvc",
+          "role": "desktop-minimum",
+          "files": [
+            "vibeface.exe",
+            "vibeface-core.exe",
+            "BUILD-INFO.json",
+            "FILES.sha256",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "web/index.html",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "role-node-full-x86_64-pc-windows-msvc",
+          "kind": "role",
+          "target": "x86_64-pc-windows-msvc",
+          "role": "node-full",
+          "files": [
+            "vibeface.exe",
+            "vibeface-core.exe",
+            "BUILD-INFO.json",
+            "FILES.sha256",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "scripts/install-node-service.ps1",
+            "docs/node.md",
+            "docs/releasing.md",
+            "web/_shell.html",
+            "web/index.html",
+            "web/_redirects",
+            "web/_headers",
+            "web/.vibeface-build.json",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "role-node-missing-service-x86_64-pc-windows-msvc",
+          "kind": "role",
+          "target": "x86_64-pc-windows-msvc",
+          "role": "node-full",
+          "files": [
+            "vibeface.exe",
+            "vibeface-core.exe",
+            "BUILD-INFO.json",
+            "FILES.sha256",
+            "web/_shell.html",
+            "web/index.html",
+            "web/_redirects",
+            "web/_headers",
+            "web/.vibeface-build.json",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "accepted": false,
+          "error": "required"
+        },
+        {
+          "id": "role-unknown",
+          "kind": "role",
+          "target": "aarch64-apple-darwin",
+          "role": "missing",
+          "files": [],
+          "accepted": false,
+          "error": "role"
+        },
+        {
+          "id": "role-node-missing-web-aarch64-apple-darwin",
+          "kind": "role",
+          "target": "aarch64-apple-darwin",
+          "role": "node-full",
+          "files": [
+            "FILES.sha256",
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "scripts/install-node-service.sh",
+            "docs/node.md",
+            "docs/releasing.md",
+            "web/_shell.html",
+            "web/_redirects",
+            "web/_headers",
+            "web/.vibeface-build.json",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "accepted": false,
+          "error": "required"
+        },
+        {
+          "id": "role-node-missing-web-aarch64-unknown-linux-gnu",
+          "kind": "role",
+          "target": "aarch64-unknown-linux-gnu",
+          "role": "node-full",
+          "files": [
+            "FILES.sha256",
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "scripts/install-node-service.sh",
+            "docs/node.md",
+            "docs/releasing.md",
+            "web/_shell.html",
+            "web/_redirects",
+            "web/_headers",
+            "web/.vibeface-build.json",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "accepted": false,
+          "error": "required"
+        },
+        {
+          "id": "role-node-missing-web-x86_64-unknown-linux-gnu",
+          "kind": "role",
+          "target": "x86_64-unknown-linux-gnu",
+          "role": "node-full",
+          "files": [
+            "FILES.sha256",
+            "vibeface",
+            "vibeface-core",
+            "BUILD-INFO.json",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "scripts/install-node-service.sh",
+            "docs/node.md",
+            "docs/releasing.md",
+            "web/_shell.html",
+            "web/_redirects",
+            "web/_headers",
+            "web/.vibeface-build.json",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "accepted": false,
+          "error": "required"
+        },
+        {
+          "id": "role-node-missing-web-x86_64-pc-windows-msvc",
+          "kind": "role",
+          "target": "x86_64-pc-windows-msvc",
+          "role": "node-full",
+          "files": [
+            "FILES.sha256",
+            "vibeface.exe",
+            "vibeface-core.exe",
+            "BUILD-INFO.json",
+            "README.md",
+            "RUNTIME-REQUIREMENTS.md",
+            "scripts/install-node-service.ps1",
+            "docs/node.md",
+            "docs/releasing.md",
+            "web/_shell.html",
+            "web/_redirects",
+            "web/_headers",
+            "web/.vibeface-build.json",
+            "web/vibeface_secure.js",
+            "web/vibeface_secure_bg.wasm"
+          ],
+          "accepted": false,
+          "error": "required"
+        }
+      ],
+      "seals": [
+        {
+          "id": "seal-extra-file",
+          "kind": "seal",
+          "listed": [
+            "BUILD-INFO.json",
+            "vibeface"
+          ],
+          "actual": [
+            "BUILD-INFO.json",
+            "vibeface",
+            "added"
+          ],
+          "accepted": false,
+          "error": "unlisted"
+        },
+        {
+          "id": "seal-missing-file",
+          "kind": "seal",
+          "listed": [
+            "BUILD-INFO.json",
+            "vibeface"
+          ],
+          "actual": [
+            "BUILD-INFO.json"
+          ],
+          "accepted": false,
+          "error": "missing"
+        },
+        {
+          "id": "seal-symlink",
+          "kind": "seal",
+          "listed": [
+            "BUILD-INFO.json",
+            "vibeface"
+          ],
+          "actual": [
+            "BUILD-INFO.json",
+            "vibeface"
+          ],
+          "symlink": [
+            "vibeface"
+          ],
+          "accepted": false,
+          "error": "symlink"
+        },
+        {
+          "id": "seal-changed-file",
+          "kind": "seal",
+          "listed": [
+            "BUILD-INFO.json",
+            "vibeface"
+          ],
+          "actual": [
+            "BUILD-INFO.json",
+            "vibeface"
+          ],
+          "changed": [
+            "vibeface"
+          ],
+          "accepted": false,
+          "error": "changed"
+        },
+        {
+          "id": "seal-special-file",
+          "kind": "seal",
+          "listed": [
+            "BUILD-INFO.json",
+            "vibeface"
+          ],
+          "actual": [
+            "BUILD-INFO.json",
+            "vibeface"
+          ],
+          "special": [
+            "vibeface"
+          ],
+          "accepted": false,
+          "error": "special"
+        }
+      ],
+      "compatibility": [
+        {
+          "id": "wire-v1-package",
+          "kind": "compatibility",
+          "wire": {
+            "build_info": 1,
+            "files": 1
+          },
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "wire-future-package",
+          "kind": "compatibility",
+          "wire": {
+            "build_info": 2,
+            "files": 1
+          },
+          "accepted": false,
+          "error": "wire"
+        }
+      ],
+      "source": [
+        {
+          "id": "rust-active-declarations",
+          "kind": "source",
+          "source": "// stale comment: pub const UPDATE_PROTOCOL: u32 = 99;\npub const UPDATE_PROTOCOL: u32 = 1;\npub const DATA_EPOCH: u32 = 1;\n",
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "rust-comment-only-declarations",
+          "kind": "source",
+          "source": "// pub const UPDATE_PROTOCOL: u32 = 1;\n/* pub const DATA_EPOCH: u32 = 1; */\n",
+          "accepted": false,
+          "error": "source"
+        },
+        {
+          "id": "rust-cfg-bound-declarations",
+          "kind": "source",
+          "source": "#[cfg(any())]\npub const DATA_EPOCH: u32 = 1;\n#[cfg(not(any()))]\npub const DATA_EPOCH: u32 = 2;\npub const UPDATE_PROTOCOL: u32 = 1;\n",
+          "accepted": false,
+          "error": "source"
+        },
+        {
+          "id": "rust-decorated-declaration",
+          "kind": "source",
+          "source": "#[allow(dead_code)]\npub const UPDATE_PROTOCOL: u32 = 1;\npub const DATA_EPOCH: u32 = 1;\n",
+          "accepted": false,
+          "error": "source"
+        },
+        {
+          "id": "rust-multiline-cfg-declaration",
+          "kind": "source",
+          "source": "#[cfg(\n    any()\n)]\npub const DATA_EPOCH: u32 = 1;\npub const UPDATE_PROTOCOL: u32 = 1;\n",
+          "accepted": false,
+          "error": "source"
+        },
+        {
+          "id": "rust-nested-module-declaration",
+          "kind": "source",
+          "source": "mod fixture { pub const DATA_EPOCH: u32 = 1; }\npub const UPDATE_PROTOCOL: u32 = 1;\n",
+          "accepted": false,
+          "error": "source"
+        },
+        {
+          "id": "rust-raw-string-fake-declaration",
+          "kind": "source",
+          "source": "const TEXT: &str = r#\"pub const DATA_EPOCH: u32 = 99;\"#;\npub const UPDATE_PROTOCOL: u32 = 1;\npub const DATA_EPOCH: u32 = 1;\n",
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "rust-stacked-attributes",
+          "kind": "source",
+          "source": "#[allow(dead_code)]\n#[cfg(any())]\npub const DATA_EPOCH: u32 = 1;\npub const UPDATE_PROTOCOL: u32 = 1;\n",
+          "accepted": false,
+          "error": "source"
+        },
+        {
+          "id": "rust-zero-hash-raw-string",
+          "kind": "source",
+          "source": "const TEXT: &str = r\"pub const DATA_EPOCH: u32 = 99;\";\npub const UPDATE_PROTOCOL: u32 = 1;\npub const DATA_EPOCH: u32 = 1;\n",
+          "accepted": true,
+          "error": "ok"
+        },
+        {
+          "id": "rust-same-line-attribute",
+          "kind": "source",
+          "source": "pub const UPDATE_PROTOCOL: u32 = 1; #[allow(dead_code)] pub const DATA_EPOCH: u32 = 1;\n",
+          "accepted": false,
+          "error": "source"
+        },
+        {
+          "id": "rust-crate-level-cfg-separated",
+          "kind": "source",
+          "source": "#![cfg(any())]\nuse std::fmt;\npub const UPDATE_PROTOCOL: u32 = 1;\npub const DATA_EPOCH: u32 = 1;\n",
+          "accepted": false,
+          "error": "source"
+        }
+      ]
+    }
   }
 }

@@ -2,13 +2,22 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { TestContext } from 'node:test'
 import { Worker } from 'node:worker_threads'
+import * as workerThreads from 'node:worker_threads'
 import { createDeliveryClient } from '@vibeface/client/delivery/client.ts'
 import { sha256Hex } from '@vibeface/client/lib/byte-codec.ts'
 import { nativeDeliveryReservations } from '../../../mobile/src/platform/delivery-reservations.ts'
+import { webDeliveryReservations } from './delivery-reservations.ts'
 import { completed, connection, content, draft, file, fingerprint, intentKey, oldId, responseLost, status, wireBytes } from './delivery-reservations.fixture.ts'
 
-// These workers exercise Node 24's real process-wide LockManager, not browser
-// localStorage scheduling, native MMKV across runtimes, Core orders or payment.
+function hasLockRequest(value: unknown): value is Pick<LockManager, 'request'> {
+  return typeof value === 'object' && value !== null && 'request' in value && typeof value.request === 'function'
+}
+
+const workerLocks: unknown = Reflect.get(workerThreads, 'locks')
+assert.ok(hasLockRequest(workerLocks), 'Node must provide a LockManager for the delivery reservation fixture')
+const locks = workerLocks
+
+// The parent holds Node's LockManager so all workers share one lock authority.
 type ActorOptions = { restart?: boolean; network?: string; name?: string }
 type Call = { actor: number; params: Record<string, unknown> }
 type Message =
@@ -16,22 +25,40 @@ type Message =
   | { op: 'get'; key: string }
   | { op: 'set'; key: string; value: string }
   | { op: 'rpc'; method: string; params: Record<string, unknown> }
+  | { op: 'lock-acquire'; id: string; name: string }
+  | { op: 'lock-release'; id: string }
   | { op: 'done'; error: string | null }
 
 async function actors(t: TestContext, records: Map<string, string>, options: ActorOptions[], holdReads = false) {
   const ready: { worker: Worker; key: string }[] = [], finds: Worker[] = [], reads: { key: string; value: string | null }[] = []
   const calls: Call[] = [], writes: { key: string; value: string }[] = [], errors: (string | null)[] = []
   const heldReads: (() => void)[] = [], heldPrepares: Worker[] = []
+  const lockStates = new Map<string, { worker: Worker; cancelled: boolean; release?: () => void }>()
   const original = completed(await sha256Hex(content))
   const workers: Worker[] = []
-  t.after(async () => { await Promise.all(workers.map(worker => worker.terminate())) })
+  const cancelLocks = (worker: Worker) => {
+    for (const [id, state] of lockStates) {
+      if (state.worker !== worker) continue
+      state.cancelled = true
+      state.release?.()
+      lockStates.delete(id)
+    }
+  }
+  t.after(async () => {
+    for (const worker of workers) cancelLocks(worker)
+    await Promise.all(workers.map(worker => worker.terminate()))
+  })
   await Promise.all(options.map((option, actor) => new Promise<void>((resolve, reject) => {
     const buffer = new SharedArrayBuffer(16384)
     const worker = new Worker(new URL('./delivery-reservations.worker.mjs', import.meta.url), { workerData: { buffer, ...option } })
     workers.push(worker)
     let done = false
     worker.on('error', reject)
-    worker.on('exit', code => code === 0 && done ? resolve() : reject(new Error(`worker ${actor} exited ${code} before completion`)))
+    worker.on('exit', code => {
+      cancelLocks(worker)
+      if (code === 0 && done) resolve()
+      else reject(new Error(`worker ${actor} exited ${code} before completion`))
+    })
     const reply = (value: string | null) => {
       const bytes = new TextEncoder().encode(JSON.stringify(value))
       new Uint8Array(buffer, 8).set(bytes)
@@ -74,6 +101,24 @@ async function actors(t: TestContext, records: Map<string, string>, options: Act
               if (option.restart || heldPrepares.length === options.length) for (const preparing of heldPrepares.splice(0)) preparing.postMessage({ op: 'rpc-result', error: responseLost })
             }
             break
+          case 'lock-acquire': {
+            assert.equal(typeof message.id, 'string')
+            const state: { worker: Worker; cancelled: boolean; release?: () => void } = { worker, cancelled: false }
+            lockStates.set(message.id, state)
+            void locks.request(message.name, { mode: 'exclusive' }, async () => {
+              if (state.cancelled) return
+              worker.postMessage({ op: 'lock-grant', id: message.id })
+              await new Promise<void>(resolve => { state.release = resolve })
+            }).catch((error: unknown) => {
+              if (!state.cancelled) worker.postMessage({ op: 'lock-error', id: message.id, error: error instanceof Error ? error.message : String(error) })
+            }).finally(() => lockStates.delete(message.id))
+            break
+          }
+          case 'lock-release': {
+            const state = lockStates.get(message.id)
+            if (state?.worker === worker) state.release?.()
+            break
+          }
           case 'done': done = true; errors[actor] = message.error; break
         }
       } catch (error) { reject(error) }
@@ -82,13 +127,28 @@ async function actors(t: TestContext, records: Map<string, string>, options: Act
   return { reads, writes, calls, errors, keys: ready.map(item => item.key) }
 }
 
-test('actual Web adapter rejects unsupported/acquisition failures and releases after a callback throws', { timeout: 10000 }, async t => {
-  const worker = new Worker(new URL('./delivery-reservations.worker.mjs', import.meta.url), { workerData: { adapter: true } })
-  t.after(async () => { await worker.terminate() })
-  await new Promise<void>((resolve, reject) => {
-    worker.on('error', reject)
-    worker.on('exit', code => code === 0 ? resolve() : reject(new Error(`adapter worker exited ${code}`)))
-  })
+test('actual Web adapter rejects unsupported/acquisition failures and releases after a callback throws', { timeout: 10000 }, async () => {
+  let invoked = false
+  const value = { intent_id: oldId, fingerprint: 'test-fingerprint' }
+  const callback = () => { invoked = true; return value }
+  await assert.rejects(webDeliveryReservations(undefined)('unsupported', callback), /更新浏览器或使用原生应用/)
+  assert.equal(invoked, false)
+  const failed = new Error('acquisition failed')
+  const rejectingLocks = {
+    request(name: string, options: LockOptions | LockGrantedCallback<unknown>) {
+      assert.equal(this, rejectingLocks)
+      assert.equal(name, 'vibeface-delivery-intent:full-key')
+      assert.deepEqual(options, { mode: 'exclusive' })
+      return Promise.reject(failed)
+    },
+  }
+  await assert.rejects(webDeliveryReservations(rejectingLocks)('full-key', callback), error => error === failed)
+  assert.equal(invoked, false)
+  const reserve = webDeliveryReservations(locks)
+  const key = 'callback-release-' + crypto.randomUUID()
+  await assert.rejects(reserve(key, () => { throw new Error('callback failed') }), /callback failed/)
+  assert.equal(await reserve(key, callback), value)
+  assert.equal(invoked, true)
 })
 
 test('two real Web workers reserve one immutable ID, reuse it after response loss and release before prepare returns', { timeout: 10000 }, async t => {

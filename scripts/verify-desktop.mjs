@@ -6,8 +6,8 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { PLATFORMS, platformFor, DESKTOP_SCHEMA as SCHEMA_VERSION, SIGNING_STATES, parseReleaseVersion, programNames, desktopPayloadNames, validateBuildInfoShape } from './release-contract.mjs';
-import { readContracts, readOwnVersion, readNativeUi } from './release-metadata.mjs';
+import { PLATFORMS, platformFor, DESKTOP_SCHEMA as SCHEMA_VERSION, SIGNING_STATES, parseReleaseVersion, desktopPayloadNames, validateBuildInfoShape } from './release-contract.mjs';
+import { readContracts, readOwnVersion, readNativeUi, readRuntimeRole } from './release-metadata.mjs';
 import { hash, relativeFiles, readSealedRuntime } from './sealed-runtime.mjs';
 import { inspectAuthenticode, requireAuthenticode } from './windows-signing.mjs';
 
@@ -110,9 +110,11 @@ function verifyApplication(root, target, receipt, contracts) {
     { version: receipt.version, source_commit: receipt.source_commit }, 'the packaged desktop payload identity differs from its receipt');
   const runtime = path.join(resources, 'runtime');
   const sealed = readSealedRuntime(runtime);
-  for (const name of [...programNames(target), 'web/index.html',
-    'web/vibeface_secure.js', 'web/vibeface_secure_bg.wasm']) {
-    assert(sealed.has(name), `the bundled runtime is missing ${name}`);
+  for (const name of readRuntimeRole(repo, target, 'desktop-minimum')) {
+    const present = name === 'FILES.sha256'
+      ? fs.lstatSync(path.join(runtime, name)).isFile()
+      : sealed.has(name);
+    assert(present, `the bundled runtime is missing ${name}`);
   }
   const info = readRuntimeInfo(runtime, contracts);
   assert.deepEqual([info.version, info.target, info.source_commit],
@@ -287,7 +289,16 @@ function selfTest() {
       const entries = {
         [`vibeface${platform.exe}`]: 'cli\n',
         [`vibeface-core${platform.exe}`]: 'core\n',
+        'README.md': 'runtime README fixture\n',
+        'RUNTIME-REQUIREMENTS.md': 'runtime requirements fixture\n',
+        [`scripts/install-node-service.${platform.service}`]: 'service fixture\n',
+        'docs/node.md': 'node docs fixture\n',
+        'docs/releasing.md': 'release docs fixture\n',
+        'web/_shell.html': '<!doctype html>shell',
         'web/index.html': '<!doctype html>fixture',
+        'web/_redirects': '/ /index.html 200\n',
+        'web/_headers': '/*\n',
+        'web/.vibeface-build.json': '{"fixture":true}\n',
         'web/vibeface_secure.js': 'export const fixture = true;\n',
         'web/vibeface_secure_bg.wasm': 'wasm',
       };
@@ -337,12 +348,14 @@ function selfTest() {
       JSON.stringify({ version, source_commit: runtimeCommit }));
     assert.throws(() => verifyApplication(foreignPayload.root, 'aarch64-apple-darwin', foreignPayload.receipt, contracts), /desktop payload identity/);
 
-    const missing = buildFixture('aarch64-apple-darwin');
-    fs.rmSync(path.join(missing.runtime, 'web/vibeface_secure.js'));
-    fs.writeFileSync(path.join(missing.runtime, 'FILES.sha256'), relativeFiles(missing.runtime)
-      .filter(name => name !== 'FILES.sha256').map(name => `${hash(path.join(missing.runtime, name))}  ${name}\n`).join(''));
-    assert.throws(() => verifyApplication(missing.root, 'aarch64-apple-darwin', missing.receipt, contracts),
-      /bundled runtime is missing web\/vibeface_secure.js/);
+    for (const name of readRuntimeRole(repo, 'aarch64-apple-darwin', 'desktop-minimum').filter(file => file.startsWith('web/'))) {
+      const missing = buildFixture('aarch64-apple-darwin');
+      fs.rmSync(path.join(missing.runtime, name));
+      fs.writeFileSync(path.join(missing.runtime, 'FILES.sha256'), relativeFiles(missing.runtime)
+        .filter(file => file !== 'FILES.sha256').map(file => `${hash(path.join(missing.runtime, file))}  ${file}\n`).join(''));
+      assert.throws(() => verifyApplication(missing.root, 'aarch64-apple-darwin', missing.receipt, contracts),
+        new RegExp(`bundled runtime is missing ${name.replaceAll('/', '\\/')}`), name);
+    }
 
     // Asset sets: exact names, honest checksums and a signing status nobody can overstate.
     const assetSet = (target, changes = {}, mutate = () => {}) => {

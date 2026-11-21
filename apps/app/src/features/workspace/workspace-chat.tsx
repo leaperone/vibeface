@@ -9,7 +9,8 @@ import { inputTargetKey,promptIntent } from '@vibeface/client/chat/protocol.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { networkKey,storageOf } from '@vibeface/client/workspace/storage.ts'
-import type { ContextProjection,InputControlAction,InputReceipt,InputTarget,PendingMessage,QueuedInput,ScopeContext,WorkspaceHistory,WorkspaceTask } from '@vibeface/client/workspace/types.ts'
+import { contextSourceLabels, contextSourceSummary, inputReceiptDescriptor, pendingInputLabel } from '@vibeface/client/workspace/presentation.ts'
+import type { ContextProjection,InputControlAction,InputTarget,PendingMessage,QueuedInput,ScopeContext,WorkspaceHistory,WorkspaceTask } from '@vibeface/client/workspace/types.ts'
 import { Button } from '@vibeface/uiarc/button/button.tsx'
 import { Drawer,DrawerContent,DrawerTrigger } from '@vibeface/uiarc/drawer/drawer.tsx'
 import { Checkbox } from "@vibeface/uiarc/checkbox/checkbox.tsx"
@@ -22,14 +23,6 @@ import { QuestionCard } from './question-card'
 import { WorkspaceTaskLink,WorkspaceTaskPill } from './workspace-tasks'
 import styles from './workspace-chat.module.css'
 
-const deliveryLabels: Record<PendingMessage['delivery'], string> = {
-  saved: '本地已保存', uploading: '本地已保存，附件准备中', submitting: '正在发送给连接的设备',
-  accepted: '连接的设备已接收', unknown: '是否送达尚未确认',
-}
-const receiptLabels: Record<InputReceipt['stage'], string> = {
-  entry_accepted: '连接的设备已接收', owner_accepted: '执行设备已接纳', submitting: '提交已登记，等待执行服务确认',
-  provider_accepted: '执行服务已接受输入', associated: '已确认回合归属', refused: '已拒绝', unknown: '补充是否进入当前工作尚未确认',
-}
 type ComposerDraft = { text: string; files: File[]; target: string; conversationId: string }
 
 const narrowContextQuery = '(width < 40rem)'
@@ -271,7 +264,7 @@ export function WorkspaceInputStatus({ pending, refresh }: { pending: PendingMes
     && receipt.message_id === pending.message_id && inputTargetKey(receipt.target) === inputTargetKey(pending.target))
   const confirmEntry = pending.entry_device_id === undefined && (pending.delivery === 'unknown' || pending.delivery === 'submitting') && !releasePending && workspace.connectionOnline ? workspace.info : null
   return <div role="status" className="grid gap-2 rounded-control bg-surface-muted/60 px-3 py-2 text-sm">
-    <p className={pending.rejected || pending.delivery === 'unknown' || receipt?.stage === 'unknown' ? 'text-warning' : 'text-secondary'}>{inputMissing ? '这条输入的送达结果仍未确认' : pending.rejected ? `已拒绝 · ${pending.rejected}` : pending.delivery === 'unknown' && receipt?.stage === 'refused' && receipt.retry_safe ? '重试请求待确认' : receipt ? receiptLabels[receipt.stage] : deliveryLabels[pending.delivery]}</p>
+    <p className={pending.rejected || pending.delivery === 'unknown' || receipt?.stage === 'unknown' ? 'text-warning' : 'text-secondary'}>{pendingInputLabel(pending)}</p>
     {receipt?.actual_turn_id ? <p className="break-all text-secondary">实际回合 · {receipt.actual_turn_id}</p> : null}
     {receipt?.reason ? <p className="text-secondary">{receipt.reason}</p> : null}
     {inputMissing ? <p className="text-secondary">原内容保存在此浏览器。请连接最初接收它的设备，再确认原设备并查询。不会自动重发。</p> : null}
@@ -311,14 +304,13 @@ function WorkspaceTaskContext({ task, reading = false }: { task: WorkspaceTask; 
 }
 
 export function ScopeContextDetails({ context }: { context: ContextProjection }) {
-  const kinds: Record<ContextProjection['sources'][number]['kind'], string> = { trigger: '本轮交代', message: '共享消息', work: '工作结果', dispatch: '工作指派', checkpoint: '历史摘要', handoff: '任务交接', memory: '持久记忆', question: '已知问题', attachment: '附件' }
   return <div role="region" className="grid gap-3 text-sm" aria-label="实际上下文来源与补充回执">
     <h3 className="font-medium">本轮上下文引用</h3>
     <p className="text-secondary">{context.stage === 'compiled' ? '上下文已整理，尚未确认执行服务收到。' : '以下来源来自这个执行范围的上下文编译记录。'}</p>
-    <ul className="flex flex-wrap gap-x-4 gap-y-1">{Object.entries(kinds).map(([kind, name]) => { const count = context.sources.filter((source) => source.kind === kind).length; return count ? <li key={kind}>{name} {count} 项</li> : null })}</ul>
+    <ul className="flex flex-wrap gap-x-4 gap-y-1">{contextSourceSummary(context.sources).map(({ kind, label, count }) => <li key={kind}>{label} {count} 项</li>)}</ul>
     <p>因预算省略 · 消息 {context.coverage.messages_omitted} 条 · 附件 {context.coverage.attachments_omitted} 个 · 记忆 {context.coverage.memory_omitted} 条</p>
     {context.sources_omitted ? <p className="text-secondary">另有 {context.sources_omitted} 个来源引用未在这份有界记录中展开。</p> : null}
-    <Details label="查看来源引用"><ul className="grid gap-2">{context.sources.map((source, index) => <li key={`${source.kind}:${index}`} className="break-all">{kinds[source.kind]} · {source.reference ?? source.event_id ?? (source.author ? `${source.author}:${source.seq ?? ''}` : '未提供引用编号')}</li>)}</ul></Details>
-    <div className="grid gap-2"><h3 className="font-medium">补充归属</h3>{context.inputs.length ? context.inputs.map((input, index) => <div key={input.message_id} className="grid gap-1 rounded-control bg-background/70 p-2"><p>第 {index + 1} 条补充 · {receiptLabels[input.stage]}</p><Details label="消息和回合编号"><p className="break-all">消息 · {input.message_id}</p><p className="break-all">目标回合 · {input.expected_turn_id}</p><p className="break-all">实际回合 · {input.actual_turn_id ?? '尚未确认'}</p></Details></div>) : <p className="text-secondary">这个范围的上下文记录没有补充回执。</p>}{context.inputs_omitted ? <p className="text-secondary">另有 {context.inputs_omitted} 条补充回执未展开。</p> : null}</div>
+    <Details label="查看来源引用"><ul className="grid gap-2">{context.sources.map((source, index) => <li key={`${source.kind}:${index}`} className="break-all">{contextSourceLabels[source.kind]} · {source.reference ?? source.event_id ?? (source.author ? `${source.author}:${source.seq ?? ''}` : '未提供引用编号')}</li>)}</ul></Details>
+    <div className="grid gap-2"><h3 className="font-medium">补充归属</h3>{context.inputs.length ? context.inputs.map((input, index) => <div key={input.message_id} className="grid gap-1 rounded-control bg-background/70 p-2"><p>第 {index + 1} 条补充 · {inputReceiptDescriptor[input.stage].label}</p><Details label="消息和回合编号"><p className="break-all">消息 · {input.message_id}</p><p className="break-all">目标回合 · {input.expected_turn_id}</p><p className="break-all">实际回合 · {input.actual_turn_id ?? '尚未确认'}</p></Details></div>) : <p className="text-secondary">这个范围的上下文记录没有补充回执。</p>}{context.inputs_omitted ? <p className="text-secondary">另有 {context.inputs_omitted} 条补充回执未展开。</p> : null}</div>
   </div>
 }

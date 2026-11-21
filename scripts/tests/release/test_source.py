@@ -203,7 +203,12 @@ class SourceContracts(unittest.TestCase):
                 build = dict(version='1.2.3', target='x86_64-unknown-linux-gnu', source_commit='a'*40,
                     core_version='2.3.4', core_source_commit='b'*40, app_version='3.4.5-rc.2', app_source_commit='c'*40,
                     data_epoch=1, update_protocol=1)
-                assert namespace['verify_build_info'](build, {'data_epoch':1,'update_protocol':1}) == build
+                runtime = {'fields': tuple(build), 'build_info_types': {
+                    'version': 'string', 'target': 'target', 'source_commit': 'sha1',
+                    'update_protocol': 'uint32', 'data_epoch': 'uint32', 'core_version': 'string',
+                    'core_source_commit': 'sha1', 'app_version': 'string', 'app_source_commit': 'sha1'},
+                    'targets': ({'target': build['target']},)}
+                assert namespace['verify_build_info'](build, {'data_epoch':1,'update_protocol':1}, runtime) == build
             print('detached format has no external access')
         """).replace('IDENTITY_SOURCE_TEXT', repr(identity_source)).replace('SOURCE_TEXT', repr(source))
         result = subprocess.run([sys.executable, '-B', '-c', code], cwd=self.root,

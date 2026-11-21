@@ -110,6 +110,7 @@ function nativeFixture() {
     if (specifier === '@vibeface/client/lib/node.ts') return { record() { throw new Error('No root recovery files exist in this fixture') } }
     if (specifier === '@vibeface/client/lib/selection.ts') return { selectionOwner }
     if (specifier === './chat-drafts') return { createChatDrafts }
+    if (specifier === './legacy-recovery') return load(fileURLToPath(new URL('./legacy-recovery.ts', import.meta.url)))
     if (specifier === './files' || specifier === '@/platform/files') return load(fileURLToPath(new URL('./files.ts', import.meta.url)))
     if (specifier === '@/platform/native-chat-drafts') return load(fileURLToPath(new URL('./native-chat-drafts.ts', import.meta.url)))
     throw new Error(`Unexpected dependency: ${specifier}`)

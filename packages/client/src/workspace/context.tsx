@@ -46,6 +46,8 @@ const writeNotices: Record<Exclude<WriteState, "writable">, string> = {
 
 type InterruptedReply = { trigger: string; conversation_id: string; after?: string; text: string }
 type LocalTask = { target: Extract<InputTarget, { kind: 'task' | 'channel_task' }>; conversation_id: string; command?: Extract<WorkspaceCommand, { kind: 'create_task' }>; saved: boolean }
+const isMessageOutbox = (item: OutboxItem): item is OutboxRecord<'message'> => item.method === 'message'
+const findMessageOutbox = (items: readonly OutboxItem[], key: string): OutboxRecord<'message'> | undefined => items.find((item): item is OutboxRecord<'message'> => isMessageOutbox(item) && item.key === key)
 
 /** A file the person attached: a browser `File` or a picked document on a phone. */
 type AttachmentFile = { name: string; arrayBuffer(): Promise<ArrayBuffer> }
@@ -325,7 +327,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       if (channelTasks.current.has(key)) continue
       const tasks = next.filter((input) => input.target.kind === 'channel_task' && input.target.channel_id === target.channel_id && input.target.bot_id === target.bot_id)
       if (new Set(tasks.map((input) => inputTargetKey(input.target))).size !== 1) continue
-      const stored = items.find((item) => item.method === 'message' && item.params.message_id === pending.message_id)?.prerequisite
+      const stored = items.find((item): item is OutboxRecord<'message'> => isMessageOutbox(item) && item.params.message_id === pending.message_id)?.prerequisite
       const command = stored ? parseWorkspaceCommand(stored.params.command) : undefined
       channelTasks.current.set(key, { target, conversation_id: pending.conversation_id, saved: true, ...(command?.kind === 'create_task' && command.task_id === target.task_id ? { command } : {}) })
     }
@@ -922,11 +924,11 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     requireCurrent()
     const admitted = (pending: PendingMessage) => next.events.some((event) => event.body.type === 'input_posted' && event.body.message_id === pending.message_id && event.scope_id === pending.conversation_id && inputTargetKey(event.body.target) === inputTargetKey(pending.target))
     let cleared = false
-    for (const item of (await outbox.all()).filter((item) => item.method === 'message')) {
+    for (const item of (await outbox.all()).filter(isMessageOutbox)) {
       const pending = parsePendingMessage(item)
       if (!admitted(pending)) continue
       await withInputDelivery(messageLane(pending), async () => {
-        const latest = (await outbox.all()).find((entry) => entry.key === item.key)
+        const latest = findMessageOutbox(await outbox.all(), item.key)
         requireCurrent()
         if (!latest) return
         const checked = parsePendingMessage(latest)
@@ -1009,7 +1011,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const hash = await sha256Hex(bytes)
     return { hash, size: bytes.length, name: attachmentName(file.name), data: bytesToBase64(bytes) }
   }
-  const uploadAttachment = async (id: string, file: NonNullable<OutboxItem['uploads']>[number], targetGuard?: () => void) => {
+  const uploadAttachment = async (id: string, file: NonNullable<OutboxRecord<'message'>['uploads']>[number], targetGuard?: () => void) => {
     const bytes = base64ToBytes(file.data)
     if (!bytes.length || bytes.length !== file.size || bytes.length > attachmentLimit) throw new Error('本地附件内容不完整，已保留原输入。')
     let offset = 0
@@ -1050,10 +1052,10 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     requireCurrent()
     if (connection.info.device_id !== entry || connection.entry.device_id !== entry) throw new Error('请连接这条输入的原设备后再操作。')
   }
-  const withPendingInput = async <T,>(messageId: string, action: (item: OutboxItem) => Promise<T>): Promise<T> => {
+  const withPendingInput = async <T,>(messageId: string, action: (item: OutboxRecord<'message'>) => Promise<T>): Promise<T> => {
     requireCurrent()
     const read = async () => {
-      const item = (await outbox.all()).find((item) => item.key === outboxKey('message', messageId))
+      const item = findMessageOutbox(await outbox.all(), outboxKey('message', messageId))
       if (!item) throw new Error('这条输入已不在本地待发送队列。')
       return item
     }
@@ -1065,7 +1067,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const readInputReceipt = async (input: { message_id: string; target: InputTarget; conversation_id?: string }): Promise<InputReceipt | InputNotSaved> => {
     requireCurrent()
     const id = targetConversation(input.target, input.conversation_id)
-    const original = (await outbox.all()).find((item) => item.key === outboxKey('message', input.message_id))
+    const original = findMessageOutbox(await outbox.all(), outboxKey('message', input.message_id))
     const pending = original ? parsePendingMessage(original) : null
     const reconcile = original && pending?.conversation_id === id && inputTargetKey(pending.target) === inputTargetKey(input.target) && original.entry_device_id === connection.info.device_id && original.entry_device_id === connection.entry.device_id && (pending.delivery === 'unknown' || pending.delivery === 'submitting') && original.release_expected_event === undefined && original.release_command_id === undefined
     requireCurrent()
@@ -1076,7 +1078,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (notSaved) {
       if (!reconcile || notSaved.entry_device_id !== original.entry_device_id || notSaved.network_id !== networkId || notSaved.client_id !== clientId || notSaved.conversation_id !== id || notSaved.message_id !== input.message_id || inputTargetKey(notSaved.target) !== inputTargetKey(input.target)) throw new Error('设备返回的输入状态与原内容不一致，原输入已保留。')
       requireInputEntry(notSaved.entry_device_id)
-      const latest = (await outbox.all()).find((item) => item.key === original.key)
+      const latest = findMessageOutbox(await outbox.all(), original.key)
       if (latest?.rejection_code === 'input_conflict') return notSaved
       if (latest?.receipt !== undefined) return latest.receipt
       if (latest && latest.entry_device_id === notSaved.entry_device_id && (latest.delivery === 'unknown' || latest.delivery === 'submitting') && latest.release_expected_event === undefined && latest.release_command_id === undefined) {
@@ -1087,7 +1089,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     }
     const receipt = parseInputReceipt(value)
     if (receipt.message_id !== input.message_id || inputTargetKey(receipt.target) !== inputTargetKey(input.target)) throw new Error('输入回执和查询目标不匹配，已保留原输入。')
-    const items = await outbox.all(), item = items.find((item) => item.key === outboxKey('message', input.message_id))
+    const items = await outbox.all(), item = findMessageOutbox(items, outboxKey('message', input.message_id))
     // A receipt identifies the remote input, but cannot resolve a payload conflict.
     if (item?.rejection_code === 'input_conflict') return receipt
     if (item) {
@@ -1134,7 +1136,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
         const pending = parsePendingMessage(item)
         if (item.delivery === 'unknown' || item.delivery === 'submitting') {
           await readInputReceipt(pending)
-          const checked = (await outbox.all()).find((entry) => entry.key === item.key)
+          const checked = findMessageOutbox(await outbox.all(), item.key)
           if (checked?.delivery !== 'accepted') return
           continue
         }
@@ -1244,7 +1246,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       let prerequisite: OutboxRecord<'workspace_command'> | undefined
       if (target.kind === 'task' || target.kind === 'channel_task') {
         const key = inputTargetKey(target)
-        prerequisite = (await outbox.all()).find((item) => item.method === 'message' && item.prerequisite && inputTargetKey(parsePendingMessage(item).target) === key)?.prerequisite
+        prerequisite = (await outbox.all()).find((item): item is OutboxRecord<'message'> => isMessageOutbox(item) && item.prerequisite !== undefined && inputTargetKey(parsePendingMessage(item).target) === key)?.prerequisite
       }
       if (!prerequisite && localTask?.command) {
         if (!localTask.saved) localTask.command = inputTaskCommand({ ...localTask.command, text })
@@ -1312,7 +1314,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
         return
       }
       const receipt = await readInputReceipt(pending)
-      const latest = (await outbox.all()).find((entry) => entry.key === item.key)
+      const latest = findMessageOutbox(await outbox.all(), item.key)
       if (!latest) { resume = true; return }
       resume = latest.delivery === 'accepted'
       if (pending.delivery !== 'accepted' || item.release_expected_event !== undefined || !('stage' in receipt) || receipt.stage !== 'refused' || !receipt.retry_safe || !receipt.control_event?.trim()) {
@@ -1333,7 +1335,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       catch (caught) { failure = caught }
       try { await readInputReceipt(pending) }
       catch (caught) { throw failure ?? caught }
-      const confirmed = (await outbox.all()).find((entry) => entry.key === item.key)
+      const confirmed = findMessageOutbox(await outbox.all(), item.key)
       resume = confirmed?.delivery === 'accepted'
       if (failure instanceof WorkspaceCommandNotSavedError) throw failure
       if (confirmed?.release_expected_event !== undefined) {

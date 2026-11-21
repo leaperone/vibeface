@@ -563,6 +563,10 @@ async fn read_connection(connection: &Connection, request: ReadRequest) -> Resul
     }
 }
 
+fn decode_workspace_state(value: Value) -> Result<vibeface_protocol::workspace::WorkspaceState> {
+    serde_json::from_value(value).context("invalid workspace_state response")
+}
+
 async fn subscribe_connection(
     connection: &Connection,
     network: &str,
@@ -1322,6 +1326,13 @@ impl Client {
             observed?;
         }
         value
+    }
+
+    /// Read the personal workspace snapshot through its public protocol DTO.
+    pub async fn read_workspace_state(
+        &self,
+    ) -> Result<vibeface_protocol::workspace::WorkspaceState> {
+        decode_workspace_state(self.read(ReadRequest::Workspace).await?)
     }
     pub async fn stage(&self, action: Action) -> Result<OperationSnapshot> {
         self.stage_after(action, vec![]).await

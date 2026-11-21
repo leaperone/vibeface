@@ -250,10 +250,11 @@ def seal_bundle(directory, core_info=None, app_info=None):
     source = release_context.run('git', 'rev-parse', 'HEAD')
     core_info = core_info or {'version': release_context.read_version('core'), 'source_commit': source}
     app_info = app_info or {'version': release_context.read_version('app'), 'source_commit': source}
+    contracts = release_context.contracts()
     build = dict(version=release_context.read_version('cli'), target=os.environ['PACKAGE_TARGET'], source_commit=source,
-                 **release_context.contracts(), core_version=core_info['version'], core_source_commit=core_info['source_commit'],
+                 **contracts, core_version=core_info['version'], core_source_commit=core_info['source_commit'],
                  app_version=app_info['version'], app_source_commit=app_info['source_commit'])
-    release_format.verify_build_info(build, release_context.contracts())
+    release_format.verify_build_info(build, contracts, release_context.runtime_definitions())
     write_json(directory / 'BUILD-INFO.json', build)
     (directory / 'FILES.sha256').write_text(''.join(f'{value}  {name}\n' for name, value in files(directory, ('FILES.sha256',)).items()),
                                            encoding='utf-8', newline='\n')
@@ -278,7 +279,7 @@ def verify_checksum_file(directory, name):
 
 
 def verify_bundle(directory, target, info):
-    build = release_format.verify_build_info(json.loads((directory / 'BUILD-INFO.json').read_text()), release_context.contracts())
+    build = release_format.verify_build_info(json.loads((directory / 'BUILD-INFO.json').read_text()), release_context.contracts(), release_context.runtime_definitions())
     release_format.require(build['target'] == target and build['version'] == info['version'] and build['source_commit'] == info['source_commit'], 'CLI bundle identity mismatch')
     for dependency, pin in info['dependencies'].items():
         release_format.require(build[dependency + '_version'] == pin['version'] and build[dependency + '_source_commit'] == pin['source_commit'], 'CLI bundle dependency differs from manifest')

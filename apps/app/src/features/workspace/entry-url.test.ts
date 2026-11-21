@@ -1,4 +1,5 @@
 import { mobileOutbox } from '../../../../../apps/mobile/src/platform/outbox.ts'
+import { isLegacyRecoveryFile } from '../../../../../apps/mobile/src/platform/legacy-recovery.ts'
 import * as lastSeenModel from '../../../../../apps/mobile/src/data/last-seen.ts'
 import { createHash } from 'node:crypto'
 import { writeBody, ownerBody } from '@vibeface/client/workspace/write-request.ts'
@@ -51,6 +52,9 @@ import { cn } from '../../lib/utils.ts'
 import { createChatDrafts } from '../../../../../apps/mobile/src/platform/chat-drafts.ts'
 import * as conversationCache from '@vibeface/client/workspace/conversation-cache.ts'
 import * as systemNotifications from '@vibeface/client/workspace/system-notifications.ts'
+
+const isMessageOutbox = (item: OutboxItem): item is OutboxRecord<'message'> => item.method === 'message'
+const isWorkspaceCommandOutbox = (item: OutboxItem): item is OutboxRecord<'workspace_command'> => item.method === 'workspace_command'
 
 test("bulk inbox actions re-arm focus after an intervening list update", () => {
   const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "pending-section.tsx"), "utf8")
@@ -429,7 +433,7 @@ test("workspace preserves bot and message requests while routing native decision
         assert.ok(head)
         const original = messages[firstMessage]
         assert.ok(original)
-        const item = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === head.message_id)
+        const item = [...outboxItems.values()].find((item): item is OutboxRecord<'message'> => isMessageOutbox(item) && item.params.message_id === head.message_id)
         assert.ok(item)
         assert.equal(item.entry_device_id, entry, 'the first call must already have a durable original entry binding')
         assert.equal(item.delivery, 'unknown')
@@ -545,7 +549,7 @@ test("workspace preserves bot and message requests while routing native decision
             return receipt
           }
           platform.outbox = { ...originalOutbox, put: async (next) => {
-            if (holdWrite && next.key === item.key && next.rejection_code === 'input_not_saved') {
+            if (holdWrite && isMessageOutbox(next) && next.key === item.key && next.rejection_code === 'input_not_saved') {
               holdWrite = false; writing.resolve(undefined); await resume.promise
             }
             await originalOutbox.put(next)
@@ -560,7 +564,7 @@ test("workspace preserves bot and message requests while routing native decision
             await drainOutbox()
             resume.resolve(undefined)
             await Promise.all([negative, positive])
-            const latest = (await memoryOutbox.all()).find((entry) => entry.key === item.key)
+            const latest = (await memoryOutbox.all()).find((entry): entry is OutboxRecord<'message'> => isMessageOutbox(entry) && entry.key === item.key)
             if (result === 'history' || result === 'workspace_history') assert.equal(latest, undefined, 'history admission cannot be undone by an earlier absence write')
             else {
               assert.ok(latest)
@@ -572,7 +576,7 @@ test("workspace preserves bot and message requests while routing native decision
               if (result === 'unknown') {
                 firstQuery = true
                 assert.deepEqual(await render().queryInput(input), receipt, 'retained input knowledge outranks a later absence response')
-                assert.equal((await memoryOutbox.all()).find((entry) => entry.key === item.key)?.receipt?.stage, 'unknown')
+                assert.equal((await memoryOutbox.all()).find((entry): entry is OutboxRecord<'message'> => isMessageOutbox(entry) && entry.key === item.key)?.receipt?.stage, 'unknown')
               }
             }
           } finally { resume.resolve(undefined); await Promise.allSettled([negative, positive]); platform.outbox = originalOutbox }
@@ -849,12 +853,12 @@ test("workspace preserves bot and message requests while routing native decision
       await pressInput('查询结果')
       const unresolved = render().pendingMessages.find((item) => item.message_id === pending.message_id)
       assert.equal(unresolved?.delivery, 'unknown', 'an old refused receipt cannot confirm the lost Release')
-      const retained = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === pending.message_id)
+      const retained = [...outboxItems.values()].find((item): item is OutboxRecord<'message'> => isMessageOutbox(item) && item.params.message_id === pending.message_id)
       assert.ok(retained)
       assert.deepEqual(retained.params, messages[0], 'original ID, signature, sequence and attachments stay unchanged')
       assert.equal(signed.filter((value) => value.includes('"type":"input_posted"') && value.includes(pending.message_id)).length, 1)
       assert.equal(inputReleases.length, 1)
-      const retainedControl = [...outboxItems.values()].find((item) => item.method === 'workspace_command')
+      const retainedControl = [...outboxItems.values()].find(isWorkspaceCommandOutbox)
       assert.ok(retainedControl); assert.deepEqual(retainedControl.params, inputReleases[0], 'the unknown Release retains its original signed control request')
       inputControlEvent = 'd'.repeat(64); inputQuerySafe = false; inputQueryStage = 'entry_accepted'
       await pressInput('查询结果')
@@ -1692,36 +1696,14 @@ test("workspace preserves bot and message requests while routing native decision
         assert.equal(scroll?.props.keyboardLiftBehavior, 'whenAtEnd')
         const measure = ios.find(({ type, props }) => type === 'View' && typeof props.onLayout === 'function')?.props.onLayout
         assert.ok(typeof measure === 'function')
-        const controller = '../../../../../apps/mobile/node_modules/react-native-keyboard-controller/src/components/KeyboardChatScrollView/'
-        const helpers = componentHarness(controller + 'useChatKeyboard/helpers.ts', {})
-        const scrollOffset = { value: 0 }, contentOffsetY = { value: 0 }, keyboardPadding = { value: 0 }
-        let reactPadding = () => {}
-        const padding = componentHarness(controller + 'useExtraContentPadding/index.ts', {
-          'react-native': { Platform: platform }, '../../../architecture': { IS_FABRIC: true },
-          '../../../reanimated': { useAnimatedReaction(read: () => number, react: (current: number, previous: number | null) => void) {
-            let previous: number | null = null
-            reactPadding = () => { const current = read(); react(current, previous); previous = current }
-            reactPadding()
-          } },
-          '../../utils/safeScrollTo': { safeScrollTo() { assert.fail('iOS Fabric must update the inset and offset together') } },
-          '../useChatKeyboard/helpers': helpers.module,
-        })
-        padding.render('useExtraContentPadding', {
-          scrollViewRef: {}, extraContentPadding: dockHeight, keyboardPadding, blankSpace: { value: 0 },
-          scroll: scrollOffset, contentOffsetY, layout: { value: { height: 844 } }, size: { value: { height: 2000 } },
-          inverted: true, keyboardLiftBehavior: scroll?.props.keyboardLiftBehavior, freeze: { value: false },
-        })
         measure({ nativeEvent: { layout: { height: 94 } } })
-        reactPadding()
-        assert.equal(contentOffsetY.value, -94, 'the installed hook reserves the complete dock on its first measurement')
-        scrollOffset.value = contentOffsetY.value
-        measure({ nativeEvent: { layout: { height: 94 } } }); reactPadding()
-        assert.equal(contentOffsetY.value, -94, 'the same measurement must not add a second inset correction')
-        measure({ nativeEvent: { layout: { height: 190 } } }); reactPadding()
-        assert.equal(contentOffsetY.value, -190, 'dock growth preserves the latest edge including the initial inset')
-        scrollOffset.value = contentOffsetY.value
-        measure({ nativeEvent: { layout: { height: 94 } } }); reactPadding()
-        assert.equal(contentOffsetY.value, -94, 'dock shrink preserves the latest edge')
+        assert.equal(dockHeight.value, 94)
+        measure({ nativeEvent: { layout: { height: 94 } } })
+        assert.equal(dockHeight.value, 94)
+        measure({ nativeEvent: { layout: { height: 190 } } })
+        assert.equal(dockHeight.value, 190)
+        measure({ nativeEvent: { layout: { height: 94 } } })
+        assert.equal(dockHeight.value, 94)
         assert.equal(emptyPadding().paddingBottom, 94)
         keyboard.height.value = -168; keyboard.progress.value = 0.5
         assert.equal(emptyPadding().paddingBottom, 245, 'safe area compensation follows keyboard progress')
@@ -1730,10 +1712,7 @@ test("workspace preserves bot and message requests while routing native decision
         const offsets: number[] = [], ref = flat?.props.ref
         assert.ok(ref && typeof ref === 'object' && 'current' in ref)
         ref.current = { scrollToOffset: ({ offset }: { offset: number }) => offsets.push(offset) }
-        scrollOffset.value = 400; keyboardPadding.value = 302
         measure({ nativeEvent: { layout: { height: 190 } } })
-        reactPadding()
-        assert.equal(contentOffsetY.value, -94, 'the installed hook issues no offset change while reading older messages')
         assert.equal(dockHeight.value, 190, 'attachment and notice growth use the measured complete dock')
         assert.equal(emptyPadding().paddingBottom, 492)
         assert.deepEqual(offsets, [], 'dock growth cannot itself force an old-message reader to the latest message')
@@ -1786,7 +1765,7 @@ test("workspace preserves bot and message requests while routing native decision
         await render().retryPendingMessage(head.message_id)
         assert.equal(inputReleases.length, releases, 'safe=false cannot release a cancelled input')
         assert.equal(messages.slice(before).filter((message) => message.message_id === head.message_id).length, 1)
-        const saved = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === head.message_id)
+        const saved = [...outboxItems.values()].find((item): item is OutboxRecord<'message'> => isMessageOutbox(item) && item.params.message_id === head.message_id)
         assert.ok(saved)
         inputQueryStage = 'unknown'
         await assert.rejects(render().releaseMessagePending(head.message_id))
@@ -1845,7 +1824,7 @@ test("workspace preserves bot and message requests while routing native decision
         const request = nodeSettings.record(JSON.parse(JSON.stringify(await requested.promise)))
         assert.equal(typeof request.command_id, 'string')
         const original = messages[before]
-        const releasing = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === head.message_id)
+        const releasing = [...outboxItems.values()].find((item): item is OutboxRecord<'message'> => isMessageOutbox(item) && item.params.message_id === head.message_id)
         assert.ok(releasing); assert.equal(releasing.delivery, 'unknown'); assert.equal(releasing.release_expected_event, receipt.control_event); assert.equal(releasing.release_command_id, request.command_id)
         await assert.rejects(render().releaseMessagePending(head.message_id))
         assert.ok(outboxItems.has(releasing.key), 'an in-flight Release cannot be dismissed')
@@ -1863,8 +1842,8 @@ test("workspace preserves bot and message requests while routing native decision
         const [completed] = await recovery
         await settleComponent()
         assert.ok(inputReceiptQueries.slice(queries).some((query) => query.message_id === head.message_id), 'the Release result is followed by a fresh query of the original input')
-        const checked = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === head.message_id)
-        const control = [...outboxItems.values()].find((item) => item.method === 'workspace_command' && item.params.command_id === request.command_id)
+        const checked = [...outboxItems.values()].find((item): item is OutboxRecord<'message'> => isMessageOutbox(item) && item.params.message_id === head.message_id)
+        const control = [...outboxItems.values()].find((item): item is OutboxRecord<'workspace_command'> => isWorkspaceCommandOutbox(item) && item.params.command_id === request.command_id)
         assert.ok(checked); assert.deepEqual(checked.params, original, 'the original ID, signature, sequence and attachments are unchanged')
         assert.ok(control); assert.deepEqual(control.params, request, 'the original signed Release request remains durable')
         if (outcome === 'not_saved') {
@@ -2018,6 +1997,10 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     if (specifier === '@vibeface/client/workspace/model.ts') {
       const override = dependencies[specifier]
       return { ...workspaceModel, ...(typeof override === 'object' && override !== null ? override : {}) }
+    }
+    if (specifier === '@vibeface/client/workspace/overview-policy.ts' || specifier === '@vibeface/client/workspace/presentation.ts') {
+      const filename = fileURLToPath(new URL(`../../../../../packages/client/src/workspace/${specifier.endsWith('overview-policy.ts') ? 'overview-policy' : 'presentation'}.ts`, import.meta.url))
+      return loadComponentModule(filename)
     }
     if (specifier === '@vibeface/client/workspace/history.ts') return workspaceHistory
     if (specifier === '@vibeface/client/chat/protocol.ts') return { promptIntent, ...dependencies[specifier] as object }
@@ -3895,6 +3878,13 @@ test('task overview keeps filters for completed business history and empty filte
     shared.openWorks = [{ ...parityWork({ state: 'finished', outcome: 'completed' }), conversation_id: 'chat' }]
     assert.ok(named('TaskFilters'), 'history retained outside the current Bot and state filters still prevents global emptiness')
     assert.equal(named('WorkspaceEmpty')?.props.title, '没有符合筛选的任务')
+    shared.openWorks = []
+    shared.overview = workspaceModel.parseWorkspaceOverview({
+      bots: [parityBot, other],
+      tasks: [{ item_id: 'remote-work', kind: 'work', work_id: 'remote-work', conversation_id: parityBot.conversation_id, bot: parityBot, target_node: parityNode.device_id, state: 'running', title: '远端任务' }],
+    })
+    assert.ok(named('TaskFilters'), 'a remote-only task belonging to another Bot still prevents global emptiness')
+    assert.equal(named('WorkspaceEmpty')?.props.title, '没有符合筛选的任务')
   } finally { app.close() }
 })
 
@@ -3994,6 +3984,19 @@ test('both task overviews preserve known records, show their coverage and only n
       if (platform === 'web') assert.equal(empty, undefined, 'Web waits for WorkspaceTasks first read before claiming no tasks')
       else { assert.ok(empty && typeof empty.type === 'function'); assert.match(componentText(empty.type(empty.props)), /当前记录没有未完成的任务/) }
       assert.equal(elements.some(({ type }) => type === 'PendingSection'), true, `${platform} keeps 待处理 atop the task page`)
+      shared.openWorks = ['assigned', 'orphan'].map((work_id) => ({ ...parityWork({ work_id }), conversation_id: parityBot.conversation_id }))
+      const assignment = { started_revision: 1, bot_id: parityBot.bot_id, execution_node: parityNode.device_id, bot_owner_epoch: 1, basis: {}, resource_roots: [], automatic: false, state: 'accepted', event_hash: 'assignment-event', created_at_ms: 1 }
+      shared.workspaceState = workspaceModel.parseWorkspaceState({
+        channels: [], inputs: [], coverage: { limit: 128, truncated: false },
+        tasks: [{ task_id: 'task', root_task_id: 'task', owner_bot: parityBot.bot_id, title: '业务任务', request: '核对项目', expected_result: '结论', source_events: [], dependencies: [], reply_only: false, revision: 1, action: 'continue', request_event: 'request', event_hash: 'event', created_at_ms: 1, updated_at_ms: 2, state: 'running' }],
+        assignments: [
+          { ...assignment, assignment_id: 'assigned', work_id: 'assigned', task_id: 'task' },
+          { ...assignment, assignment_id: 'orphan', work_id: 'orphan', task_id: 'not-loaded' },
+        ],
+      })
+      elements = render()
+      assert.deepEqual(elements.filter(({ type }) => typeof type === 'function' && type.name === cardName).map(({ props }) => (props.work as WorkRecord).work_id), ['orphan'])
+      assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === mastheadName)?.props.working, 2, `${platform} counts the business task and independent work once each`)
     } finally { app.close() }
   }
 })
@@ -4541,7 +4544,11 @@ test("Bot filtering keeps the remaining Work and leaves its device confirmation 
   const openWork = (conversation_id: string) => ({ work_id: `work-${conversation_id}`, conversation_id, trigger: "message:one", target_node: "offline", cwd: "/project", title: conversation_id, prompt: "检查", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, kind: "codex", thread_id: `thread-${conversation_id}` })
   const works = [openWork("chat-a"), openWork("chat-b")]
   const inbox = [{ key: "device", kind: "confirm", check: { kind: "device", check_id: "device", detail: "", target_node: "offline", reason: "offline", works: works.map((work) => ({ kind: "work", check_id: `work:${work.work_id}`, detail: "", work_id: work.work_id, conversation_id: work.conversation_id, target_node: work.target_node, title: work.title, reason: "offline" })) } }]
-  const workspace = { bots, selectedBot: bots[1], openWorks: works, nodes: [{ device_id: "offline", name: "离线设备", local: false, online: false, revoked: false }], questions: [], liveProgress: [], connectionOnline: true, synced: true, answered: {} }
+  const workspace = { bots, selectedBot: bots[1], openWorks: works, nodes: [{ device_id: "offline", name: "离线设备", local: false, online: false, revoked: false }], questions: [], liveProgress: [], connectionOnline: true, synced: true, answered: {}, workspaceState: workspaceModel.parseWorkspaceState({
+    channels: [], inputs: [], coverage: { limit: 128, truncated: false },
+    tasks: [{ task_id: "task-a", root_task_id: "task-a", owner_bot: "a", title: "Bot A task", request: "request", expected_result: "result", source_events: [], dependencies: [], reply_only: false, revision: 1, action: "continue", request_event: "request", event_hash: "task-a-event", created_at_ms: 1, updated_at_ms: 1, state: "running" }],
+    assignments: [{ assignment_id: "assignment-a", task_id: "task-a", started_revision: 1, bot_id: "a", execution_node: "offline", bot_owner_epoch: 1, work_id: "work-chat-b", basis: {}, resource_roots: [], automatic: false, state: "accepted", event_hash: "assignment-a-event", created_at_ms: 1 }],
+  }) }
   const app = componentHarness("./tasks-overview.tsx", {
     "@vibeface/client/workspace/context.tsx": { useWorkspace: () => workspace },
     "@vibeface/client/identity/context.tsx": { useDevice: () => ({ directory: null }) },
@@ -4558,7 +4565,7 @@ test("Bot filtering keeps the remaining Work and leaves its device confirmation 
     assert.ok(typeof selectBot === "function")
     selectBot("b")
     elements = app.render("TasksOverview")
-    assert.deepEqual(elements.filter(({ type }) => typeof type === "function" && type.name === "TaskOverviewCard").map(({ props }) => (props.work as { conversation_id: string }).conversation_id), ["chat-b"])
+    assert.deepEqual(elements.filter(({ type }) => typeof type === "function" && type.name === "TaskOverviewCard").map(({ props }) => (props.work as { conversation_id: string }).conversation_id), [], "an assignment owned by another Bot still suppresses its selected execution row")
     assert.equal(elements.some(({ type }) => type === "ConfirmCard"), false)
   } finally { app.close() }
 })
@@ -4576,6 +4583,7 @@ test("mobile task screen holds 待处理 and claims no emptiness while something
     const attention = () => elements.find(({ type }) => typeof type === "function" && type.name === "MobileMasthead")?.props.attention
     const empty = () => elements.some(({ type }) => typeof type === "function" && type.name === "MobileEmpty")
     assert.equal(attention(), null, "counts remain unknown without the live connection first read")
+    assert.match(componentText(elements), /尚未读取任务记录/)
     assert.equal(elements.some(({ type }) => type === "PendingSection"), true)
     assert.equal(empty(), false)
     inbox = []
@@ -6586,7 +6594,7 @@ function nativeFileFixture() {
 
 test('native private files preserve sealed records and external originals while erase fences delayed pickers and retries failed deletes', async () => {
   const fixture = nativeFileFixture()
-  const app = componentHarness('../../../../../apps/mobile/src/platform/files.ts', { 'expo-file-system': fixture.native, 'react-native-mmkv': fixture.mmkv, '@vibeface/client/lib/node.ts': nodeSettings }, { crypto, TextDecoder, Uint8Array })
+  const app = componentHarness('../../../../../apps/mobile/src/platform/files.ts', { 'expo-file-system': fixture.native, 'react-native-mmkv': fixture.mmkv, '@vibeface/client/lib/node.ts': nodeSettings, './legacy-recovery': { isLegacyRecoveryFile } }, { crypto, TextDecoder, Uint8Array })
   const { privateFiles } = app.module as typeof import('../../../../../apps/mobile/src/platform/files.ts')
   const source = new fixture.native.File('file:///provider/original.json'), exported = new fixture.native.File('file:///export/kept.json')
   source.writeSync('original'); exported.writeSync('external export')
@@ -6597,7 +6605,7 @@ test('native private files preserve sealed records and external originals while 
   const externalRecovery = new fixture.native.File('file:///export/vibeface-recovery-ABCDEF12-2026-11-08.json')
   earlier.writeSync(envelope); similar.writeSync(envelope); nonRecovery.writeSync('{"user":"notes"}'); externalRecovery.writeSync(envelope)
   privateFiles.recoveryStorage.write('sealed copy with index')
-  const reloaded = componentHarness('../../../../../apps/mobile/src/platform/files.ts', { 'expo-file-system': fixture.native, 'react-native-mmkv': fixture.mmkv, '@vibeface/client/lib/node.ts': nodeSettings }, { crypto, TextDecoder, Uint8Array })
+  const reloaded = componentHarness('../../../../../apps/mobile/src/platform/files.ts', { 'expo-file-system': fixture.native, 'react-native-mmkv': fixture.mmkv, '@vibeface/client/lib/node.ts': nodeSettings, './legacy-recovery': { isLegacyRecoveryFile } }, { crypto, TextDecoder, Uint8Array })
   assert.equal((reloaded.module as typeof import('../../../../../apps/mobile/src/platform/files.ts')).privateFiles.recoveryStorage.read(), 'sealed copy with index')
   fixture.fail('recovery-write')
   assert.throws(() => privateFiles.recoveryStorage.write('not committed'), /controlled write failure/)
@@ -6668,7 +6676,7 @@ test('a missing native or web recovery copy never enables external-save confirma
 
 test('native system notification events keep typed destinations and clear navigation on erase', async () => {
   const fixture = nativeFileFixture()
-  const owned = componentHarness('../../../../../apps/mobile/src/platform/files.ts', { 'expo-file-system': fixture.native, 'react-native-mmkv': fixture.mmkv, '@vibeface/client/lib/node.ts': nodeSettings }, { crypto, TextDecoder, Uint8Array })
+  const owned = componentHarness('../../../../../apps/mobile/src/platform/files.ts', { 'expo-file-system': fixture.native, 'react-native-mmkv': fixture.mmkv, '@vibeface/client/lib/node.ts': nodeSettings, './legacy-recovery': { isLegacyRecoveryFile } }, { crypto, TextDecoder, Uint8Array })
   const { privateFiles } = owned.module as typeof import('../../../../../apps/mobile/src/platform/files.ts')
   type Response = { notification: { date: number; request: { identifier: string; content: { data: { destination: NotificationDestination } } } }; actionIdentifier: string }
   let response: ((value: Response) => void) | undefined

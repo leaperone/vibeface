@@ -11,7 +11,6 @@ import os
 from pathlib import Path
 import platform
 import re
-import runpy
 import shutil
 import signal
 import stat
@@ -21,7 +20,8 @@ import tempfile
 import time
 import uuid
 import zipfile
-from unittest import TestCase
+
+from verification.resource import oom_delta, resources as cgroup_resources
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -318,7 +318,7 @@ def sandbox(small=None, resume_run=None):
                 public = None
                 raise ValueError("Proof and resume work items require authoritative Actions provenance")
             if producer is not None:
-                resume_dir = download_inputs(producer, resume_run, small)
+                resume_dir = download_inputs(producer, resume_run)
         with tempfile.TemporaryDirectory(prefix="sandbox-build-", dir=ARTIFACTS) as directory:
             context = Path(directory)
             for file in SANDBOX_FILES:
@@ -577,7 +577,7 @@ def checked_resources(value, require_pass=False):
         checked_counters(value["final"], complete=True)
         if value["initial"] is None:
             raise ValueError("Resource report lacks its initial observation")
-        delta = runpy.run_path(str(ROOT / "scripts/run-delivery-live.py"))["oom_delta"](value["initial"], value["final"])
+        delta = oom_delta(value["initial"], value["final"])
         object_keys(value["oomDelta"], ("oom", "oom_kill", "oom_group_kill"))
         for count in value["oomDelta"].values():
             integer(count)
@@ -897,7 +897,7 @@ def extract_artifact(data, origin, destination):
     return summary
 
 
-def download_inputs(producer, resume_run, item):
+def download_inputs(producer, resume_run):
     checked_producer(producer)
     run_ids = [producer["runId"]]
     if resume_run is not None:
@@ -1224,7 +1224,6 @@ def prove_small(item, resume_dir=None):
             raise ValueError("Continuation producer source mismatch")
     elif item != "prepare" or resume_dir is not None:
         raise ValueError("Only local prepare controls may omit Actions provenance")
-    live = runpy.run_path(str(ROOT / "scripts/run-delivery-live.py"))
     work_id = os.environ.get("VIBEFACE_DELIVERY_WORK_ID", uuid.uuid4().hex)
     if not re.fullmatch(r"[0-9a-f]{32}", work_id):
         raise ValueError("Invalid fresh work-item identifier")
@@ -1237,7 +1236,7 @@ def prove_small(item, resume_dir=None):
     resources, context, compiled, selected = unknown_resources(), None, None, {}
     failure, deferred_node_failure, pair, bundle, part = None, None, None, None, None
     try:
-        _, initial = live["resources"]()
+        _, initial = cgroup_resources()
         compiled, _, vectors, _ = prepare_canonical()
         for script, args in (("install.mjs", []), ("compile.mjs", ["--check-trust"])):
             run(["node", "contracts/delivery/" + script, *args])
@@ -1310,8 +1309,8 @@ def prove_small(item, resume_dir=None):
             except Exception:
                 pass
         try:
-            _, final = live["resources"]()
-            delta = live["oom_delta"](initial, final)
+            _, final = cgroup_resources()
+            delta = oom_delta(initial, final)
             resources = {"schemaVersion": 1, "status": "FAIL" if any(delta.values()) else "PASS", "scope": RESOURCE_SCOPE, "initial": initial, "final": final, "oomDelta": delta}
             checked_resources(resources)
         except Exception:
@@ -1338,608 +1337,10 @@ def prove_small(item, resume_dir=None):
         raise ValueError("Delivery work item failed; only independently verified public evidence was retained") from None
 
 
+
 def self_test():
-    from copy import deepcopy
-    from unittest.mock import patch
-    manifest = {"schemaVersion": 1, "imageId": "11" * 32, "schemaHash": "22" * 32, "elfSha256": "33" * 32,
-                "proofs": [{"receipt": f"relation-{relation}.receipt", "public": f"relation-{relation}.json"} for relation in range(1, 5)]}
-    compiled = {key: manifest[key] for key in ("imageId", "schemaHash", "elfSha256")}
-    compiled["statementBytes"] = STATEMENT_BYTES
-    proofs = []
-    for relation in range(1, 5):
-        journal = bytearray(STATEMENT_BYTES)
-        journal[32:64] = relation.to_bytes(32, "big")
-        journal[4 * 32:5 * 32] = b"\x44" * 32
-        journal[5 * 32:6 * 32] = b"\x11" * 32
-        proofs.append({"mode": "prove", "kind": "groth16", "relation": relation, "imageId": manifest["imageId"], "profileId": "44" * 32,
-                       "journal": journal.hex(), "journalHash": hashlib.sha256(journal).hexdigest(), "seal": "55" * 260})
-    checked_metadata(manifest, proofs, compiled)
-
-    def reject(value, data, image=compiled):
-        try:
-            checked_metadata(value, data, image)
-        except (ValueError, TypeError, KeyError):
-            return
-        raise AssertionError("Invalid fixture metadata must be rejected")
-
-    for field in ("imageId", "schemaHash", "elfSha256"):
-        changed = dict(compiled, **{field: "66" * 32})
-        reject(manifest, proofs, changed)
-    reject(dict(manifest, proofs=manifest["proofs"][:-1]), proofs)
-    changed = deepcopy(manifest)
-    changed["proofs"][0]["receipt"] = "../outside"
-    reject(changed, proofs)
-    for field, value in (("relation", 4), ("kind", "fake"), ("imageId", "66" * 32), ("profileId", "66" * 32), ("journalHash", "66" * 32), ("seal", "55"), ("secret", "must-not-be-public")):
-        changed = deepcopy(proofs)
-        changed[0][field] = value
-        reject(manifest, changed)
-    profile = {**PROFILE_CAPS, "guest_image_id": list(hex_bytes(compiled["imageId"])), "statement_schema_hash": list(hex_bytes(compiled["schemaHash"]))}
-    profile_abi = bytes(9 * 32)
-    expected_profile = hashlib.sha256(profile_abi).hexdigest()
-    vectors = {"profile": profile, "schemaHash": compiled["schemaHash"], "profileAbi": profile_abi.hex(), "profileId": expected_profile}
-    profile_proofs = deepcopy(proofs)
-    for proof in profile_proofs:
-        proof["profileId"] = expected_profile
-        journal = bytearray(hex_bytes(proof["journal"]))
-        journal[4 * 32:5 * 32] = hex_bytes(expected_profile)
-        proof["journal"], proof["journalHash"] = journal.hex(), hashlib.sha256(journal).hexdigest()
-    checked_metadata(manifest, profile_proofs, compiled)
-    checked_profile_vectors(vectors, profile, compiled, profile_proofs)
-    for field, value in (("max_windows", 16), ("max_total_bytes", 1_048_576), ("crypto_suite", True), ("guest_image_id", [102] * 32), ("statement_schema_hash", [102] * 32), ("extra", 1)):
-        changed = deepcopy(profile)
-        changed[field] = value
-        with TestCase().assertRaises(ValueError, msg='Unsupported product profiles must fail'):
-            checked_profile_vectors(vectors, changed, compiled, profile_proofs)
-    changed = deepcopy(profile_proofs)
-    for proof in changed:
-        proof["profileId"] = "66" * 32
-        journal = bytearray(hex_bytes(proof["journal"]))
-        journal[4 * 32:5 * 32] = b"\x66" * 32
-        proof["journal"], proof["journalHash"] = journal.hex(), hashlib.sha256(journal).hexdigest()
-    checked_metadata(manifest, changed, compiled)
-    with TestCase().assertRaises(ValueError, msg='Self-consistent receipt profiles outside the product trust root must fail'):
-        checked_profile_vectors(vectors, profile, compiled, changed)
-    verified = {"verified": True, "kind": "groth16", "seal": proofs[0]["seal"], "imageId": compiled["imageId"], "journalHash": proofs[0]["journalHash"]}
-    checked_verification(verified, compiled, proofs[0])
-    for field, value in (("kind", "succinct"), ("seal", "66" * 260), ("imageId", "66" * 32), ("journalHash", "66" * 32), ("verified", 1), ("extra", "unexpected")):
-        changed = dict(verified, **{field: value})
-        with TestCase().assertRaises(ValueError, msg='A mismatched receipt export must fail'):
-            checked_verification(changed, compiled, proofs[0])
-    build, container = sandbox_commands(Path("/context"))
-    assert build[:5] == ["docker", "build", "--platform", "linux/amd64", "--file"]
-    assert build[-1] == "/context" and build[5] == "/context/crates/delivery/proof/Sandbox.Dockerfile"
-    assert container[:5] == ["docker", "run", "--rm", "--platform", "linux/amd64"]
-    for flag, value in (("--memory", "11g"), ("--memory-swap", "11g"), ("--pids-limit", "64")):
-        assert container[container.index(flag) + 1] == value
-    mounts = [container[index + 1] for index, value in enumerate(container) if value == "--mount"]
-    assert mounts == [f"type=bind,source={source},target={destination}" for source, destination in (
-        (ROOT, "/work"), (ARTIFACTS / "cargo", "/cargo"), (ARTIFACTS / "cargo", "/home/runner/.cargo"), (ARTIFACTS / "risc0", "/risc0"), (ARTIFACTS / "canonical", "/artifacts"))]
-    assert build[-2] == container[-4]
-    _, shared = sandbox_commands(Path("/context"), cache=Path("/shared"))
-    assert [shared[index + 1] for index, value in enumerate(shared) if value == "--mount"][1:] == [f"type=bind,source=/shared/{source},target={destination}" for source, destination in (
-        ("cargo", "/cargo"), ("cargo", "/home/runner/.cargo"), ("risc0", "/risc0"))] + [f"type=bind,source={ARTIFACTS / 'canonical'},target=/artifacts",
-        "type=bind,source=/shared/risc0,target=/work/.artifacts/vdp/risc0"]
-    with tempfile.TemporaryDirectory(prefix="target-share-", dir=ARTIFACTS) as directory:
-        base = Path(directory)
-        built, shared_target, worktree = base / "built", base / "shared", base / "worktree"
-        (built / "release").mkdir(parents=True)
-        (built / "release/prover").write_text("first")
-        os.utime(built / "release/prover", (1_000_000, 1_000_000))
-        publish_target(built, shared_target)
-        seed_target(worktree, shared_target)
-        assert (worktree / "release/prover").read_text() == "first"
-        assert all(path.stat().st_mtime == 0 for path in (worktree, worktree / "release", worktree / "release/prover"))
-        assert (shared_target / "release/prover").stat().st_mtime == 1_000_000
-        (built / "release/prover").write_text("second")
-        publish_target(built, shared_target)
-        seed_target(worktree, shared_target)
-        assert (shared_target / "release/prover").read_text() == "second" and (worktree / "release/prover").read_text() == "first"
-        with patch(f"{__name__}.clone_tree", side_effect=subprocess.CalledProcessError(1, ["cp"])):
-            publish_target(worktree, shared_target)
-            seed_target(base / "cold", shared_target)
-        assert (shared_target / "release/prover").read_text() == "second" and not (base / "cold").exists()
-        real_clone = clone_tree
-
-        def clone_during_publish(source, destination):
-            real_clone(source, destination)
-            if source == shared_target:
-                publish_target(built, shared_target)
-
-        with patch(f"{__name__}.clone_tree", side_effect=clone_during_publish):
-            seed_target(base / "raced", shared_target)
-        assert not (base / "raced").exists()
-        with patch(f"{__name__}.clone_tree", side_effect=InterruptedError("Delivery sandbox interrupted")):
-            for share in (publish_target, lambda target, shared: seed_target(base / "cold", shared)):
-                with TestCase().assertRaises(InterruptedError, msg="Sharing must not swallow a SIGTERM interruption"):
-                    share(worktree, shared_target)
-        assert sorted(path.name for path in base.iterdir()) == ["built", "shared", "worktree"]
-    assert container[-3:] == ["bash", "-c", "python3 scripts/install-delivery-toolchain.py && python3 scripts/check-delivery.py"]
-    env_pairs = [container[index + 1] for index, value in enumerate(container) if value == "--env"]
-    assert env_pairs == ["HOME=/home/runner", "PYTHONDONTWRITEBYTECODE=1"]
-    assert not {"--env-file", "-e", "--privileged"}.intersection(container)
-    deadline = str(int(time.time() * 1000) + 100000)
-    with patch.dict(os.environ, {DEADLINE_ENV: deadline}), patch(f"{__name__}.source_commit", return_value="a" * 40):
-        _, small = sandbox_commands(Path("/context"), small="relation-2", work_id="b" * 32)
-    assert small[-1].endswith("scripts/check-delivery.py --prove-small relation-2")
-    assert DEADLINE_ENV + "=" + deadline in small
-    assert not any("TOKEN" in value or "SECRET" in value for value in small)
-    assert "--resume-run" not in small[-1]
-    assert small[small.index("--memory") + 1] == small[small.index("--memory-swap") + 1] == "11g"
-    assert "TOKIO_WORKER_THREADS=2" in small
-    assert "run-delivery-live.py --inside" not in small[-1]
-    with patch(f"{__name__}.FIXTURES", ROOT / ".artifacts/no-public-proof-fixture"), patch(f"{__name__}.load_fixtures") as loader:
-        assert optional_fixtures() is None
-        loader.assert_not_called()
-    with patch(f"{__name__}.FIXTURES", ROOT), patch(f"{__name__}.load_fixtures", side_effect=ValueError("missing fixture")), patch(f"{__name__}.run") as operation:
-        with TestCase().assertRaises(ValueError, msg='A broken fixture must stop sandbox dispatch'):
-            sandbox()
-        operation.assert_not_called()
-    with patch(f"{__name__}.optional_fixtures", return_value=None), patch(f"{__name__}.subprocess.check_output", return_value=b" M uncommitted-source"), patch(f"{__name__}.run") as operation:
-        try:
-            sandbox(small="prepare")
-        except ValueError as error:
-            assert "clean committed source" in str(error)
-        else:
-            raise AssertionError("Uncommitted sources must not be attributed to HEAD in a proof experiment")
-        operation.assert_not_called()
-    owned_id = "a" * 64
-    failed = ValueError("sandbox failed")
-    interrupted = KeyboardInterrupt()
-    lookup_failed = subprocess.TimeoutExpired(["docker", "ps"], 20)
-    stop_failed = subprocess.CalledProcessError(1, ["docker", "stop"])
-    previous_term = signal.getsignal(signal.SIGTERM)
-
-    def prior_term(*_):
-        raise AssertionError("The prior SIGTERM handler must remain inactive during sandbox dispatch")
-
-    signal.signal(signal.SIGTERM, prior_term)
-    try:
-        for failure, lookup, stop_error, expected in (
-            ("SIGTERM", owned_id, None, InterruptedError),
-            (interrupted, owned_id, None, interrupted),
-            (failed, owned_id, None, failed),
-            (failed, "", None, failed),
-            (None, "", None, None),
-            (None, owned_id, stop_failed, stop_failed),
-            ("SIGTERM", lookup_failed, None, lookup_failed),
-            (None, "invalid-owned-id", None, ValueError),
-        ):
-            def execute(command):
-                if command[:2] == ["docker", "run"]:
-                    if failure == "SIGTERM":
-                        handler = signal.getsignal(signal.SIGTERM)
-                        assert callable(handler) and handler is not prior_term
-                        handler(signal.SIGTERM, None)
-                    elif failure is not None:
-                        raise failure
-
-            result = lookup if isinstance(lookup, BaseException) else subprocess.CompletedProcess([], 0, stdout=lookup + "\n")
-            with patch.dict(os.environ, {"GITHUB_ACTIONS": "false"}), patch(f"{__name__}.optional_fixtures", return_value=None), patch(f"{__name__}.run", side_effect=execute) as operation, \
-                    patch(f"{__name__}.seed_target") as seeded, patch(f"{__name__}.publish_target") as published, \
-                    patch("subprocess.run", side_effect=[result, stop_error or subprocess.CompletedProcess([], 0)]) as cleanup:
-                caught = None
-                try:
-                    sandbox()
-                except BaseException as error:
-                    caught = error
-                if isinstance(expected, type):
-                    assert isinstance(caught, expected), "Sandbox interruption or cleanup must propagate the expected failure"
-                else:
-                    assert caught is expected
-                assert seeded.call_count == 2 and published.call_count == (2 if failure is None else 0)
-                assert signal.getsignal(signal.SIGTERM) is prior_term
-                assert operation.call_count == 2
-                owned = operation.call_args.args[0]
-                name = owned[owned.index("--name") + 1]
-                assert name.startswith("vdp-") and len(name.rsplit("-", 1)[1]) == 32
-                assert owned[owned.index("--label") + 1] == "vibeface.task-root=" + str(ROOT)
-                assert owned.count("--name") == 1 and "--rm" in owned
-                assert cleanup.call_args_list[0].args[0] == ["docker", "ps", "--all", "--no-trunc", "--filter", "name=^/" + re.escape(name) + "$",
-                    "--filter", "label=vibeface.task-root=" + str(ROOT), "--format", "{{.ID}}"]
-                assert cleanup.call_args_list[0].kwargs == {"capture_output": True, "text": True, "check": True, "timeout": 20}
-                if lookup == owned_id:
-                    assert cleanup.call_count == 2
-                    assert cleanup.call_args_list[1].args[0] == ["docker", "stop", "--time", "10", owned_id]
-                    assert cleanup.call_args_list[1].kwargs == {"capture_output": True, "check": True, "timeout": 30}
-                else:
-                    assert cleanup.call_count == 1
-        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), patch(f"{__name__}.optional_fixtures", return_value=None), patch(f"{__name__}.run"), \
-                patch(f"{__name__}.seed_target") as seeded, patch(f"{__name__}.publish_target") as published, \
-                patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, stdout="")):
-            sandbox()
-        assert seeded.call_count == published.call_count == 0, "CI runners have no sibling worktree to share targets with"
-    finally:
-        signal.signal(signal.SIGTERM, previous_term)
-    continuation_self_test(manifest, compiled, profile, vectors, profile_proofs)
-    print("Delivery fixture, profile, continuation provenance, public export, resources and sandbox self-tests passed; no network, Docker or cryptographic proof ran")
-
-
-
-def continuation_self_test(manifest, compiled, profile, vectors, proofs):
-    from copy import deepcopy
-    from unittest.mock import patch
-    commit = "a" * 40
-    producer = {"repository": "test/repository", "workflowPath": WORKFLOW_PATH, "event": "workflow_dispatch", "runId": 101, "runAttempt": 2, "headSha": commit}
-    snapshot = {"memory.max": str(11 * 1024 ** 3), "memory.swap.max": "0", "memory.current": "100", "memory.peak": "200", "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0", "pids.max": "64", "pids.current": "1"}
-    resources = {"schemaVersion": 1, "status": "PASS", "scope": RESOURCE_SCOPE, "initial": dict(snapshot), "final": dict(snapshot), "oomDelta": {"oom": 0, "oom_kill": 0, "oom_group_kill": 0}}
-    process = {"label": "prove-1", "exitCode": 0, "elapsedMs": 1.5, "sandboxCpuUsec": 1, "before": {"cpu.stat": "usage_usec 1"}, "after": {"cpu.stat": "usage_usec 2"}, "stderrSha256": "0" * 64, "diagnosticMarkers": [], "succinctCheckpointBytes": 1}
-    addresses = ["0x" + str(number) * 40 for number in range(1, 9)]
-    block = lambda number, timestamp: {"number": number, "hash": "0x" + "1" * 64, "timestamp": timestamp}
-    transaction = lambda number, nonce: {"hash": "0x" + "2" * 64, "blockNumber": number, "blockHash": "0x" + "1" * 64, "gasUsed": "1", "nonce": nonce}
-    context = {"schemaVersion": 1, "sourceCommit": commit, "recipe": "delivery-small-public-test-v1", "guest": compiled,
-        "profileId": vectors["profileId"], "profileSha256": hashlib.sha256(PROFILE.read_bytes()).hexdigest(),
-        "file": {"bytes": 4096, "sha256": hashlib.sha256(bytes((index * 37 + 19) % 251 for index in range(4096))).hexdigest()},
-        "deployment": {"chainId": 31337, "confirmations": 2, "accounts": addresses[:4], "escrow": addresses[4], "asset": addresses[5], "adapter": addresses[6], "verifier": addresses[7], "payer": addresses[0], "provider": addresses[1], "tokenDecimals": 6, "funderNonce": 2,
-            "mining": {"genesisTimestamp": 1700000000, "timestampIncrement": 1, "blockTime": 0, "gasPriceWei": "2000000000", "coinbase": "0x" + "0" * 40},
-            "genesisBlock": block(0, 1700000000), "runtimeCodeHashes": {field: "0x" + "3" * 64 for field in ("escrow", "asset", "adapter", "verifier")},
-            "baselineBlock": block(4, 1700000004), "baselineBalances": {"nativeWei": {"payer": "1", "provider": "1", "escrow": "0"}, "tokenAtoms": {"payer": "1000000000000", "provider": "0", "escrow": "0"}},
-            "deploymentTransactions": {"asset": transaction(1, 0), "escrow": transaction(3, 1)}},
-        "orderId": "4" * 64, "expectedJournals": [{field: proof[field] for field in ("relation", "journal", "journalHash")} for proof in proofs]}
-    context_data = json_bytes(context)
-    context_hash = hashlib.sha256(context_data).hexdigest()
-    wrongs = [{"relation": proof["relation"], "journal": ("00" if proof["journal"][:2] != "00" else "01") + proof["journal"][2:]} for proof in proofs]
-    controls = [{"relation": proof["relation"], "cycles": 10, "segments": 1, "journalHash": proof["journalHash"], "executed": True, "proved": False, "originalJournalDecoderEof": True, "wrongJournalDecoderEof": True} for proof in proofs]
-    node_summary = {"schemaVersion": 1, "sourceCommit": commit, "workItem": "prepare", "status": "PREPARED", "stage": "complete", "guest": compiled, "file": context["file"], "contextSha256": context_hash,
-        "executionControls": controls, "legacyImagePreTermsRejected": True, "wrongJournals": wrongs, "reused": False, "replayChecks": 2, "proofs": [], "branches": [], "transactions": [], "processes": [],
-        "limits": {"memoryBytes": 11 * 1024 ** 3, "swapBytes": 0, "pids": 64}, "resourceScope": "CPU deltas cover each entire sandbox interval; memory.peak is cumulative sandbox lifetime, not per-process RSS",
-        "coverage": "synthetic raw 4096-byte file, deterministic public test keys and controlled Ganache branches; no product Node or durable-publication-policy coverage; raw late/reorg controls intentionally exceed its gate; no UI, mobile, real asset, or public-chain finality", "deployment": None, "corruptERejectedWithoutOutput": False, "failure": None}
-
-    def must_reject(call):
-        try:
-            call()
-        except (ValueError, TypeError, KeyError, OSError, zipfile.BadZipFile):
-            return
-        raise AssertionError("Invalid continuation input must be rejected")
-
-    checked_context(context_data, compiled, vectors["profileId"], commit)
-    checked_node_summary(node_summary, "prepare", context, commit)
-    producer_coverage = re.search(r"^  coverage: '([^'\n]*)',$", (ROOT / "contracts/delivery/experiment-delivery.mjs").read_text(), re.M)[1]
-    checked_node_summary({**node_summary, "coverage": producer_coverage}, "prepare", context, commit)
-    checked_resources(resources, require_pass=True)
-    checked_counters({"cpu.stat": "usage_usec 1\ncore_sched.force_idle_usec 0"})
-    must_reject(lambda: checked_counters({"cpu.stat": "usage_usec 1\n.core_sched.force_idle_usec 0"}))
-    must_reject(lambda: checked_counters({"cpu.stat": "usage_usec 1\ncore_sched.force_idle_usec -1"}))
-    checked_transaction({"label": "fund", "hash": "0x" + "1" * 64, "blockHash": "0x" + "2" * 64, "blockNumber": 5, "status": 1,
-        "gasUsed": "1", "effectiveGasPrice": "2", "nativeCostWei": "2", "events": [{"name": "Funded", "args": ["0x" + "4" * 64, "0x" + "Ab" * 20, "17"]}]})
-    budget, order = "0x" + "5" * 64, "0x" + context["orderId"]
-    accepted_events = (("open-budget", [("BudgetOpened", [budget, addresses[0], addresses[1], "17"])]),
-        ("reserve-batch", [("Funded", [order, addresses[0], "17"]), ("BudgetReserved", [budget, order, "17"])]),
-        ("publish", [("WindowUpdated", [order, "0", "3"]), ("BudgetEarned", [budget, order, "0", "17"])]),
-        ("withdraw", [("BudgetWithdrawn", [budget, addresses[1], "17"])]),
-        ("close", [("BudgetClosed", [budget])]),
-        ("refund", [("Refunded", [order, addresses[0], "17"]), ("BudgetRefunded", [budget, addresses[0], "17"])]))
-    accepted = {**node_summary, "workItem": "accept", "status": "PASS-accept-candidate",
-        "transactions": [{"label": label, "hash": "0x" + "1" * 64, "blockHash": "0x" + "2" * 64, "blockNumber": 5, "status": 1, "gasUsed": "1", "effectiveGasPrice": "2", "nativeCostWei": "2",
-            "events": [{"name": name, "args": arguments} for name, arguments in events]} for label, events in accepted_events],
-        "deployment": {**{field: context["deployment"][field] for field in ("chainId", "escrow", "asset", "payer", "provider", "adapter", "verifier", "tokenDecimals", "runtimeCodeHashes")},
-            "profileId": "0x" + context["profileId"], "orderId": order, "budgetId": budget, "allocationTransaction": "0x" + "6" * 64}}
-    checked_node_summary(accepted, "accept", context, commit)
-    must_reject(lambda: checked_node_summary({**accepted, "deployment": {**{field: value for field, value in accepted["deployment"].items() if field not in ("budgetId", "allocationTransaction")}, "fundTransaction": "0x" + "6" * 64}}, "accept", context, commit))
-    must_reject(lambda: checked_node_summary({**accepted, "deployment": {**accepted["deployment"], "budgetId": "5" * 64}}, "accept", context, commit))
-    must_reject(lambda: checked_transaction({**accepted["transactions"][0], "events": [{"name": "Withdrawn", "args": [order, addresses[1], "17"]}]}))
-    must_reject(lambda: checked_transaction({**accepted["transactions"][0], "events": [{"name": "BudgetClosed", "args": [budget, "17"]}]}))
-    for field, value in (("sourceCommit", "b" * 40), ("profileId", "f" * 64), ("profileSha256", "f" * 64), ("orderId", "0x" + "4" * 64), ("secret", "private")):
-        changed = {**context, field: value}
-        must_reject(lambda: checked_context(json_bytes(changed), compiled, vectors["profileId"], commit))
-    for path, value in ((["deployment", "mining", "blockTime"], True), (["file", "bytes"], 4097), (["deployment", "payer"], addresses[1]), (["expectedJournals", 0, "journalHash"], "f" * 64)):
-        changed = deepcopy(context)
-        target = changed
-        for key in path[:-1]:
-            target = target[key]
-        target[path[-1]] = value
-        must_reject(lambda: checked_context(json_bytes(changed), compiled, vectors["profileId"], commit))
-    must_reject(lambda: read_json_bytes(b'{"a":1,"a":2}'))
-    must_reject(lambda: checked_resources(unknown_resources(), require_pass=True))
-    oom = deepcopy(resources)
-    oom["final"]["memory.events"] = oom["final"]["memory.events"].replace("oom 0", "oom 1")
-    must_reject(lambda: checked_resources(oom, require_pass=True))
-    oom["status"], oom["oomDelta"]["oom"] = "FAIL", 1
-    checked_resources(oom)
-    for field, value in (("extra", "secret"),
-                         ("coverage", "synthetic raw 4096-byte file, deterministic public test keys and controlled Ganache branches; no production confidentiality, product Node, UI, mobile, real asset, or public-chain finality"),
-                         ("coverage", "raw witness"), ("coverage", producer_coverage + " "), ("coverage", None),
-                         ("processes", [{**process, "privateLog": "secret"}])):
-        must_reject(lambda: checked_node_summary({**node_summary, field: value}, "prepare", context, commit))
-
-    def origin_for(item, artifact_id, attempt=2):
-        return {**producer, "runAttempt": attempt, "artifactId": artifact_id,
-            "artifactName": f"delivery-small-{item}-{commit}-101-{attempt}", "artifactDigest": "sha256:" + "0" * 64}
-
-    assert WORKFLOW_PATH == ".github/workflows/delivery-small.yml"
-    checked_producer(producer)
-    for path in (".github/workflows/ci.yml", ".github/workflows/delivery-live.yml", ".github/workflows/delivery-small.yml/extra"):
-        must_reject(lambda: checked_producer({**producer, "workflowPath": path}))
-    run_api = {"id": 101, "path": WORKFLOW_PATH, "event": "workflow_dispatch", "head_sha": commit, "repository": {"full_name": producer["repository"]}, "head_repository": {"full_name": producer["repository"]}, "run_attempt": 2, "run_started_at": "2026-10-30T00:00:00Z"}
-    checked_run_api(run_api, producer, 101, 2)
-    for field, value in (("path", "other.yml"), ("path", ".github/workflows/ci.yml"), ("path", ".github/workflows/delivery-live.yml"), ("event", "push"), ("head_sha", "b" * 40), ("run_attempt", 3)):
-        must_reject(lambda: checked_run_api({**run_api, field: value}, producer, 101, 2))
-    artifact_api = {"id": 1, "name": origin_for("prepare", 1)["artifactName"], "digest": "sha256:" + "0" * 64, "size_in_bytes": 100, "expired": False,
-        "expires_at": "2999-01-01T00:00:00Z", "created_at": "2026-10-30T00:01:00Z", "workflow_run": {"id": 101, "head_sha": commit}}
-    with patch(f"{__name__}.gh_api", return_value=run_api):
-        artifact_origin(artifact_api, producer, 101)
-        for field, value in (("expired", True), ("expires_at", "2000-01-01T00:00:00Z"), ("name", "delivery-small-latest"), ("created_at", "2000-01-01T00:00:00Z")):
-            must_reject(lambda: artifact_origin({**artifact_api, field: value}, producer, 101))
-    with tempfile.TemporaryDirectory(prefix="continuation-self-test-", dir=ARTIFACTS) as temporary:
-        base = Path(temporary)
-        pair = base / "private-pair"
-        pair.mkdir(mode=0o700)
-        for relation, proof in enumerate(proofs, 1):
-            (pair / f"relation-{relation}.json").write_bytes(json_bytes(proof))
-            (pair / f"relation-{relation}.receipt").write_bytes(b"self-test-only-not-a-genuine-receipt")
-        for file in pair.iterdir():
-            file.chmod(0o600)
-        def part_for(relation, original=None):
-            name = f"relation-{relation}"
-            return {"schemaVersion": 1, "status": "VERIFIED_PARTIAL", "sourceCommit": commit, "contextSha256": context_hash, "relation": relation, "journalHash": proofs[relation - 1]["journalHash"],
-                "publicSha256": hashlib.sha256((pair / (name + ".json")).read_bytes()).hexdigest(), "receiptSha256": hashlib.sha256((pair / (name + ".receipt")).read_bytes()).hexdigest(),
-                "wrongJournal": wrongs[relation - 1]["journal"], "producer": producer, "producerArtifact": original,
-                "provingResources": {"sandbox": resources, "process": {**process, "label": f"prove-{relation}"}}, "verificationResources": resources}
-        def verifier(command, **kwargs):
-            proof = next(proof for proof in proofs if proof["journal"] == command[-1])
-            return subprocess.CompletedProcess(command, 0, stdout=json_bytes({"verified": True, "kind": "groth16", "seal": proof["seal"], "imageId": compiled["imageId"], "journalHash": proof["journalHash"]}))
-        with patch(f"{__name__}.run", side_effect=verifier), patch("subprocess.run", return_value=subprocess.CompletedProcess([], 1, stderr=b"Error: receipt journal mismatch\n")):
-            verify_pair(pair, 1, context, compiled, wrongs[0]["journal"])
-            with patch("subprocess.run", return_value=subprocess.CompletedProcess([], 1, stderr=b"Error: io error: unexpected end of file\n")):
-                must_reject(lambda: verify_pair(pair, 1, context, compiled, wrongs[0]["journal"]))
-        bad_proof = deepcopy(proofs[0])
-        bad_proof["seal"] = "00"
-        (pair / "relation-1.json").write_bytes(json_bytes(bad_proof))
-        must_reject(lambda: verify_pair(pair, 1, context, compiled))
-        (pair / "relation-1.json").write_bytes(json_bytes(proofs[0]))
-        origin = origin_for("relation-1", 2)
-        part = part_for(1)
-        checked_part(part, pair, context, origin)
-        for field, value in (("receiptSha256", "f" * 64), ("contextSha256", "f" * 64), ("extra", 1), ("verificationResources", unknown_resources())):
-            must_reject(lambda: checked_part({**part, field: value}, pair, context, origin))
-        (pair / "linked.json").symlink_to(pair / "relation-1.json")
-        must_reject(lambda: read_fixture("linked.json", 32 * 1024, pair))
-        (pair / "linked.json").unlink()
-        os.link(pair / "relation-1.json", pair / "linked.json")
-        must_reject(lambda: read_fixture("relation-1.json", 32 * 1024, pair))
-        (pair / "linked.json").unlink()
-        must_reject(lambda: read_fixture("../private-pair/relation-1.json", 32 * 1024, pair))
-        must_reject(lambda: read_fixture("relation-1.receipt", 1, pair))
-        summary = base_summary("relation-1", commit, producer)
-        summary.update(status="VERIFIED_PARTIAL", publication="VERIFIED_PARTIAL", contextSha256=context_hash)
-        public = base / "run/public"
-        previous_mask = os.umask(0o077)
-        try:
-            publish_small_results(public, summary, resources, context_data, pair, part)
-        finally:
-            os.umask(previous_mask)
-        exact_tree(public, public_layout("relation-1", "VERIFIED_PARTIAL"))
-        assert all(file.stat().st_mode & 0o777 == 0o600 for file in pair.iterdir())
-        assert all(file.stat().st_mode & 0o777 == (0o755 if file.is_dir() else 0o644) for file in [public, *public.rglob("*")])
-        must_reject(lambda: publish_small_results(base / "bad/public", summary, unknown_resources(), context_data, pair, part))
-        diagnostic = {**summary, "status": "FAIL", "publication": "UNQUALIFIED"}
-        publish_small_results(public, diagnostic, unknown_resources(), context_data, pair)
-        assert not (public / "partials/relation-1/part.json").exists()
-        assert (public / "partials/relation-1/relation-1.receipt").read_bytes() == b"self-test-only-not-a-genuine-receipt"
-        must_reject(lambda: publish_small_results(base / "bad2/public", diagnostic, resources, context_data, pair, part))
-        publish_small_results(public, summary, resources, context_data, pair, part)
-        with patch(f"{__name__}.load_profile", return_value=profile):
-            revoked_public = finish_host_public(public, "relation-1", commit, ValueError("private cleanup error"))
-        revoked = read_json_bytes((revoked_public / "summary.json").read_bytes())
-        assert revoked["status"] == "FAIL" and revoked["publication"] == "UNQUALIFIED"
-        assert not (revoked_public / "partials/relation-1/part.json").exists()
-        assert b"private cleanup error" not in (revoked_public / "summary.json").read_bytes()
-        prepared = base_summary("prepare", commit, producer)
-        prepared.update(status="PREPARED", contextSha256=context_hash, node=node_summary)
-        prepared_public = base / "prepared/public"
-        publish_small_results(prepared_public, prepared, resources, context_data)
-        output = base / "github-output"
-        with patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}), patch(f"{__name__}.load_profile", return_value=profile):
-            finish_host_public(prepared_public, "prepare", commit, None)
-        assert 'matrix={"item":["relation-1","relation-2","relation-3","relation-4"]}' in output.read_text()
-
-        def archive_bytes(files, symlink=False):
-            buffer = io.BytesIO()
-            with zipfile.ZipFile(buffer, "w") as archive:
-                for name, data in files.items():
-                    if symlink:
-                        entry = zipfile.ZipInfo(name)
-                        entry.external_attr = (stat.S_IFLNK | 0o777) << 16
-                        archive.writestr(entry, data)
-                    else:
-                        archive.writestr(name, data)
-            return buffer.getvalue()
-        files = {file.relative_to(public).as_posix(): file.read_bytes() for file in public.rglob("*") if file.is_file()}
-        data = archive_bytes(files)
-        zip_origin = {**origin, "artifactDigest": "sha256:" + hashlib.sha256(data).hexdigest()}
-        extract_artifact(data, zip_origin, base / "downloaded")
-        for name in ("../outside", "/absolute", "private/witness.json"):
-            bad = archive_bytes({**files, name: b"private"})
-            must_reject(lambda: extract_artifact(bad, {**origin, "artifactDigest": "sha256:" + hashlib.sha256(bad).hexdigest()}, base / "invalid-zip"))
-        bad = archive_bytes(files, symlink=True)
-        must_reject(lambda: extract_artifact(bad, {**origin, "artifactDigest": "sha256:" + hashlib.sha256(bad).hexdigest()}, base / "invalid-link-zip"))
-        must_reject(lambda: extract_artifact(data + b"corrupt", zip_origin, base / "invalid-digest"))
-        download_api = {**artifact_api, "id": origin["artifactId"], "name": origin["artifactName"], "digest": zip_origin["artifactDigest"]}
-        requests = []
-        def fake_api(repository, suffix, binary=False):
-            assert repository == producer["repository"]
-            requests.append(suffix)
-            if suffix in ("runs/101", "runs/101/attempts/2"):
-                return run_api
-            if suffix == "runs/101/artifacts?per_page=100&page=1":
-                return {"artifacts": [download_api, download_api]}
-            if suffix == f"artifacts/{origin['artifactId']}/zip":
-                assert binary
-                return data
-            raise AssertionError("Unexpected self-test Actions request")
-        with patch(f"{__name__}.ARTIFACTS", base / "downloads"), patch(f"{__name__}.gh_api", side_effect=fake_api):
-            downloaded = download_inputs(producer, None, "relation-1")
-            assert len(read_json_bytes((downloaded / "index.json").read_bytes())["artifacts"]) == 1
-            assert requests.count(f"artifacts/{origin['artifactId']}/zip") == 1
-        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": producer["repository"], "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_RUN_ID": "101", "GITHUB_RUN_ATTEMPT": "2", "GITHUB_SHA": commit, "GITHUB_WORKFLOW_REF": producer["repository"] + "/" + WORKFLOW_PATH + "@refs/heads/test"}):
-            assert current_producer(commit) == producer
-            must_reject(lambda: current_producer("f" * 40))
-            for path in (".github/workflows/ci.yml", ".github/workflows/delivery-live.yml", ".github/workflows/delivery-small.yml/extra"):
-                with patch.dict(os.environ, {"GITHUB_WORKFLOW_REF": producer["repository"] + "/" + path + "@refs/heads/test"}):
-                    must_reject(lambda: current_producer(commit))
-
-        incoming = base / "incoming"
-        incoming.mkdir(mode=0o700)
-        origins = []
-        for relation in range(1, 5):
-            item = f"relation-{relation}"
-            item_origin = origin_for(item, 10 + relation, attempt=1 if relation % 2 else 2)
-            item_producer = {key: item_origin[key] for key in producer}
-            item_part = part_for(relation)
-            item_part["producer"] = item_producer
-            item_summary = base_summary(item, commit, item_producer)
-            item_summary.update(status="VERIFIED_PARTIAL", publication="VERIFIED_PARTIAL", contextSha256=context_hash)
-            publish_small_results(incoming / ("stage-" + str(relation)) / "public", item_summary, resources, context_data, pair, item_part)
-            (incoming / ("stage-" + str(relation)) / "public").rename(incoming / str(item_origin["artifactId"]))
-            shutil.rmtree(incoming / ("stage-" + str(relation)))
-            origins.append(item_origin)
-        index = {"schemaVersion": 1, "sourceCommit": commit, "repository": producer["repository"], "artifacts": origins}
-        (incoming / "index.json").write_bytes(json_bytes(index))
-        with patch(f"{__name__}.run", side_effect=verifier), patch("subprocess.run", return_value=subprocess.CompletedProcess([], 1, stderr=b"Error: receipt journal mismatch\n")), patch(f"{__name__}.load_fixtures", return_value=(manifest, proofs)):
-            _, selected, _ = normalize_inputs(incoming, base / "normalized", compiled, vectors, commit, "accept", producer["repository"])
-            assert set(selected) == {1, 2, 3, 4} and {value[0]["runAttempt"] for value in selected.values()} == {1, 2}
-            assert {file.name for file in (base / "normalized/proofs").iterdir()} == PROOF_NAMES
-            competitor = origin_for("relation-1", 50)
-            competitor_summary = base_summary("relation-1", commit, producer)
-            competitor_summary.update(status="VERIFIED_PARTIAL", publication="VERIFIED_PARTIAL", contextSha256=context_hash)
-            publish_small_results(incoming / "competitor/public", competitor_summary, resources, context_data, pair, part_for(1))
-            (incoming / "competitor/public").rename(incoming / "50")
-            shutil.rmtree(incoming / "competitor")
-            (incoming / "index.json").write_bytes(json_bytes({**index, "artifacts": origins + [competitor]}))
-            _, competing, _ = normalize_inputs(incoming, base / "competing", compiled, vectors, commit, "accept", producer["repository"])
-            assert competing[1][0]["artifactId"] == origins[0]["artifactId"]
-            receipt_file = incoming / "50/partials/relation-1/relation-1.receipt"
-            receipt_file.write_bytes(b"corrupt claimed-qualified receipt")
-            must_reject(lambda: normalize_inputs(incoming, base / "corrupt-competitor", compiled, vectors, commit, "accept", producer["repository"]))
-            shutil.rmtree(incoming / "50")
-            (incoming / "index.json").write_bytes(json_bytes({**index, "artifacts": origins + [origins[0]]}))
-            must_reject(lambda: normalize_inputs(incoming, base / "duplicate", compiled, vectors, commit, "accept", producer["repository"]))
-            (incoming / "index.json").write_bytes(json_bytes({**index, "artifacts": origins[:-1]}))
-            shutil.rmtree(incoming / str(origins[-1]["artifactId"]))
-            must_reject(lambda: normalize_inputs(incoming, base / "missing", compiled, vectors, commit, "accept", producer["repository"]))
-            diagnostic_origin = origin_for("relation-4", 60)
-            diagnostic_summary = base_summary("relation-4", commit, producer)
-            diagnostic_summary.update(publication="UNQUALIFIED", contextSha256=context_hash)
-            publish_small_results(incoming / "diagnostic/public", diagnostic_summary, unknown_resources(), context_data, pair)
-            (incoming / "diagnostic/public").rename(incoming / "60")
-            shutil.rmtree(incoming / "diagnostic")
-            (incoming / "index.json").write_bytes(json_bytes({**index, "artifacts": origins[:-1] + [diagnostic_origin]}))
-            must_reject(lambda: normalize_inputs(incoming, base / "unqualified-missing", compiled, vectors, commit, "accept", producer["repository"]))
-        full = base / "normalized/proofs"
-        final_summary = base_summary("accept", commit, producer)
-        final_summary.update(status="FAIL", publication="VERIFIED_BUNDLE", contextSha256=context_hash)
-        publish_small_results(base / "final/public", final_summary, unknown_resources(), context_data, verified_bundle=full)
-        assert {file.name for file in (base / "final/public/proofs").iterdir()} == PROOF_NAMES
-        (full / "extra.json").write_bytes(b"{}")
-        must_reject(lambda: publish_small_results(base / "extra/public", final_summary, resources, context_data, verified_bundle=full))
-        (full / "extra.json").unlink()
-
-        env = {DEADLINE_ENV: str(int(time.time() * 1000) + 100000), "VIBEFACE_DELIVERY_SOURCE_COMMIT": commit, "VIBEFACE_DELIVERY_PRODUCER": json.dumps(producer)}
-        def run_item(reuse=False, node_fails=False, bad_proves=False, final_resources="PASS", binary_fails=False, negative_fails=False):
-            run_id = uuid.uuid4().hex
-            old = part_for(1)
-            original_origin = origin_for("relation-1", 500, attempt=1)
-            if reuse:
-                old["producer"] = {**producer, "runAttempt": 1}
-                old["provingResources"]["process"]["elapsedMs"] = 999
-            selected = {1: (original_origin, pair, old)} if reuse else {}
-            calls = []
-            candidate = deepcopy(node_summary)
-            candidate.update(workItem="relation-1", status="FAIL" if node_fails else "PROOF_VERIFIED", replayChecks=0, reused=reuse,
-                processes=[] if reuse else [process], proofs=[] if node_fails else [{"relation": 1, "cycles": 10, "segments": 1, "receiptBytes": 39, "sealBytes": 260, "journalHash": proofs[0]["journalHash"], "independentlyVerified": True, "wrongJournalRejected": True, "reused": reuse}])
-            if bad_proves:
-                candidate["processes"] = [process, {**process, "label": "prove-2"}]
-            def execute(command, **kwargs):
-                calls.append(command)
-                if command[:2] == ["node", "contracts/delivery/experiment-delivery.mjs"]:
-                    dest = Path(command[3])
-                    (dest / "public").mkdir(mode=0o700, parents=True)
-                    (dest / "private/proofs").mkdir(mode=0o700, parents=True)
-                    (dest / "public/context.json").write_bytes(context_data)
-                    (dest / "public/summary.json").write_bytes(json_bytes(candidate))
-                    for suffix in ("json", "receipt"):
-                        shutil.copyfile(pair / ("relation-1." + suffix), dest / ("private/proofs/relation-1." + suffix))
-                    if node_fails:
-                        raise ValueError("private assertion text must not be exported")
-                    return subprocess.CompletedProcess(command, 0)
-                if command[0].endswith("vibeface-delivery-prover"):
-                    if binary_fails:
-                        raise ValueError("self-test binary corruption")
-                    return verifier(command, **kwargs)
-                return subprocess.CompletedProcess(command, 0)
-            observations = [snapshot, snapshot if final_resources == "PASS" else (oom["final"] if final_resources == "OOM" else ValueError("unknown"))]
-            def observe():
-                value = observations.pop(0)
-                if isinstance(value, Exception):
-                    raise value
-                return None, value
-            helper = {"resources": observe, "oom_delta": lambda first, last: {"oom": 1 if final_resources == "OOM" else 0, "oom_kill": 0, "oom_group_kill": 0}}
-            with patch.dict(os.environ, {**env, "VIBEFACE_DELIVERY_WORK_ID": run_id}), patch(f"{__name__}.CANONICAL", base / "canonical"), patch(f"{__name__}.source_commit", return_value=commit), \
-                patch(f"{__name__}.prepare_canonical", return_value=(compiled, profile, vectors, {})), patch(f"{__name__}.normalize_inputs", return_value=(context, selected, [])), \
-                patch(f"{__name__}.run", side_effect=execute), patch(f"{__name__}.runpy.run_path", return_value=helper), patch("subprocess.run", return_value=subprocess.CompletedProcess([], 1, stderr=b"Error: io error: unexpected end of file\n" if negative_fails else b"Error: receipt journal mismatch\n")), patch("builtins.print"):
-                if node_fails or bad_proves or final_resources != "PASS" or binary_fails or negative_fails:
-                    must_reject(lambda: prove_small("relation-1"))
-                else:
-                    prove_small("relation-1")
-            exported = base / "canonical/small" / run_id / "public"
-            result = read_json_bytes((exported / "summary.json").read_bytes())
-            certificate = exported / "partials/relation-1/part.json"
-            assert (exported / "partials/relation-1/relation-1.receipt").exists() is not binary_fails
-            assert sum(command[:2] == ["node", "contracts/delivery/experiment-delivery.mjs"] for command in calls) == 1
-            if node_fails or bad_proves or final_resources != "PASS" or binary_fails or negative_fails:
-                assert result["status"] == "FAIL" and result["publication"] == ("NO_PROOF" if binary_fails else "UNQUALIFIED") and not certificate.exists()
-            else:
-                saved = read_json_bytes(certificate.read_bytes())
-                assert result["status"] == "VERIFIED_PARTIAL"
-                if reuse:
-                    assert saved["producer"] == old["producer"] and saved["producerArtifact"] == original_origin and saved["provingResources"] == old["provingResources"]
-        run_item()
-        run_item(reuse=True)
-        run_item(node_fails=True)
-        run_item(bad_proves=True)
-        run_item(final_resources="UNKNOWN")
-        run_item(final_resources="OOM")
-        run_item(binary_fails=True)
-        run_item(negative_fails=True)
-        for has_published_pair in (False, True):
-            outer_output = base / ("outer-output-" + str(has_published_pair))
-            generated = []
-            stop_error = subprocess.CalledProcessError(1, ["docker", "stop"])
-            def outer_run(command, **kwargs):
-                if command[:2] != ["docker", "run"]:
-                    return subprocess.CompletedProcess(command, 0)
-                work_id = next(value.split("=", 1)[1] for value in command if value.startswith("VIBEFACE_DELIVERY_WORK_ID="))
-                original_public = base / "host-artifacts/canonical/small" / work_id / "public"
-                generated.append(original_public)
-                if has_published_pair:
-                    publish_small_results(original_public, summary, resources, context_data, pair, part)
-                    original_public.parent.chmod(0o555)
-                raise subprocess.CalledProcessError(1, ["docker", "run"])
-            previous = signal.getsignal(signal.SIGTERM)
-            with patch.dict(os.environ, {"GITHUB_OUTPUT": str(outer_output)}), patch(f"{__name__}.ARTIFACTS", base / "host-artifacts"),                 patch(f"{__name__}.optional_fixtures", return_value=None), patch(f"{__name__}.source_commit", return_value=commit), patch(f"{__name__}.current_producer", return_value=producer),                 patch(f"{__name__}.download_inputs", return_value=None), patch(f"{__name__}.load_profile", return_value=profile), patch(f"{__name__}.run", side_effect=outer_run),                 patch("subprocess.run", side_effect=[subprocess.CompletedProcess([], 0, stdout="a" * 64), stop_error]), patch("builtins.print"):
-                try:
-                    sandbox("relation-1")
-                except subprocess.CalledProcessError as error:
-                    assert error is stop_error
-                else:
-                    raise AssertionError("Failed CLI and owned cleanup must remain a failed work item")
-            assert signal.getsignal(signal.SIGTERM) is previous
-            output_path = outer_output.read_text().strip().split("=", 1)[1]
-            safe_public = ROOT / output_path
-            assert safe_public != generated[0] and "*" not in output_path
-            safe_summary = read_json_bytes((safe_public / "summary.json").read_bytes())
-            assert safe_summary["status"] == "FAIL" and safe_summary["publication"] == ("UNQUALIFIED" if has_published_pair else "NO_PROOF")
-            assert not (safe_public / "partials/relation-1/part.json").exists()
-            assert (safe_public / "partials/relation-1/relation-1.receipt").exists() is has_published_pair
-            if has_published_pair:
-                assert (generated[0] / "partials/relation-1/part.json").exists()
-                assert generated[0].parent.stat().st_mode & 0o777 == 0o555
-                generated[0].parent.chmod(0o755)
-        calls = []
-        with patch.dict(os.environ, {**env, "VIBEFACE_DELIVERY_WORK_ID": uuid.uuid4().hex}), patch(f"{__name__}.CANONICAL", base / "canonical"), patch(f"{__name__}.source_commit", return_value=commit), \
-            patch(f"{__name__}.prepare_canonical", return_value=(compiled, profile, vectors, {})), patch(f"{__name__}.normalize_inputs", side_effect=ValueError("missing part")), \
-            patch(f"{__name__}.run", side_effect=lambda command, **kwargs: calls.append(command)), patch(f"{__name__}.runpy.run_path", return_value={"resources": lambda: (None, snapshot), "oom_delta": lambda *_: resources["oomDelta"]}), patch("builtins.print"):
-            must_reject(lambda: prove_small("accept"))
-        assert not any(command[:2] == ["node", "contracts/delivery/experiment-delivery.mjs"] for command in calls)
+    from tests.delivery.test_fixture_check import run
+    return run(sys.modules.get(__name__))
 
 
 if __name__ == "__main__":

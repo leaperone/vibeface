@@ -11,8 +11,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { PLATFORMS, NATIVE_UI, parseReleaseVersion, parseReleaseTag, npmDistTag, compareWithinChannel,
-  platformFor, programNames, requiredRuntimeFiles, desktopPayloadNames, validateBuildInfoShape } from './release-contract.mjs';
-import { readContracts, readOwnVersion, readNativeUi, readNpmTemplate, parseSourceJson } from './release-metadata.mjs';
+  platformFor, programNames, requiredRuntimeFiles, desktopPayloadNames, validateBuildInfoShape, loadRuntimeDefinitions } from './release-contract.mjs';
+import { readContracts, readOwnVersion, readNativeUi, readNpmTemplate, readRuntimeDefinitions, readRuntimeRole, parseSourceJson } from './release-metadata.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
 const corpus = JSON.parse(fs.readFileSync(new URL('./fixtures/release-contract.json', import.meta.url), 'utf8'));
@@ -25,6 +25,19 @@ const info = target => ({ version, target, source_commit: commit, update_protoco
   core_version: '2.3.4', core_source_commit: 'b'.repeat(40), app_version: '3.4.5-rc.2', app_source_commit: 'c'.repeat(40) });
 
 function pureTests() {
+  const runtime = loadRuntimeDefinitions(corpus.runtime);
+  assert.deepEqual(runtime.fields, corpus.runtime.build_info.fields);
+  assert.deepEqual(runtime.web_required, corpus.runtime.files.web_required);
+  assert.deepEqual(runtime.targets.map(row => row.target), corpus.runtime.targets.map(row => row.target));
+  assert(Object.isFrozen(runtime) && Object.isFrozen(runtime.targets) && Object.isFrozen(runtime.targets[0].roles));
+  assert.throws(() => loadRuntimeDefinitions({ ...corpus.runtime, schema: 2 }));
+  assert.throws(() => loadRuntimeDefinitions({ ...corpus.runtime, targets: corpus.runtime.targets.slice(0, 1).concat(corpus.runtime.targets[0]) }));
+  const firstTarget = corpus.runtime.targets[0];
+  const withTarget = patch => ({ ...corpus.runtime, targets: corpus.runtime.targets.map((row, index) => index === 0 ? { ...row, ...patch } : row) });
+  assert.throws(() => loadRuntimeDefinitions({ ...corpus.runtime, build_info: { ...corpus.runtime.build_info, fields: [''] } }));
+  assert.throws(() => loadRuntimeDefinitions({ ...corpus.runtime, files: { ...corpus.runtime.files, web_required: [''] } }));
+  assert.throws(() => loadRuntimeDefinitions(withTarget({ programs: [''] })));
+  assert.throws(() => loadRuntimeDefinitions(withTarget({ roles: { ...firstTarget.roles, 'runtime-core': [''] } })));
   for (const expected of corpus.versions) {
     const parsed = parseReleaseVersion(expected.value);
     assert.deepEqual({ channel: parsed.channel, npm: npmDistTag(parsed.channel), parts: parsed.parts.map(String) },
@@ -119,6 +132,7 @@ function desktopInitializationTests(root) {
   for (const name of ['release-contract', 'release-metadata', 'sealed-runtime', 'windows-signing', 'private-control', 'build-desktop', 'verify-desktop']) {
     write(isolated, `scripts/${name}.mjs`, fs.readFileSync(path.join(repo, `scripts/${name}.mjs`)));
   }
+  write(isolated, 'scripts/fixtures/release-contract.json', fs.readFileSync(path.join(repo, 'scripts/fixtures/release-contract.json')));
   for (const name of ['installer.nsi', 'entitlements.mac.plist']) {
     write(isolated, `apps/desktop/build/${name}`, fs.readFileSync(path.join(repo, `apps/desktop/build/${name}`)));
   }
@@ -194,6 +208,15 @@ function sourceTests(root) {
     assert.equal(readOwnVersion(root, app), expected, `own fixture version: ${app}`);
   }
   assert.deepEqual(readContracts(repo), contracts); assert.deepEqual(readNativeUi(repo), NATIVE_UI);
+  const runtime = readRuntimeDefinitions(repo);
+  assert.deepEqual(runtime.targets.map(row => [row.target, row.roles['node-full'], row.roles['desktop-minimum']]),
+    corpus.runtime.targets.map(row => [row.target, row.roles['node-full'], row.roles['desktop-minimum']]));
+  assert.deepEqual(runtime.web_required, corpus.runtime.files.web_required);
+  for (const row of corpus.runtime.targets) {
+    assert.deepEqual(readRuntimeRole(repo, row.target, 'desktop-minimum'), row.roles['desktop-minimum']);
+  }
+  assert.throws(() => readRuntimeRole(repo, 'unknown-target', 'desktop-minimum'), /unsupported runtime target/);
+  assert.throws(() => readRuntimeRole(repo, corpus.runtime.targets[0].target, 'unknown-role'), /unsupported runtime role/);
   const templateSource = fs.readFileSync(path.join(repo, 'apps/cli/npm/package.json'), 'utf8');
   write(root, 'apps/cli/npm/package.json', templateSource);
   assert.equal(readNpmTemplate(root).version, '0.0.0');
@@ -207,7 +230,7 @@ function sourceTests(root) {
 
 function cliFixtures(root) {
   const copy = ['scripts/release-contract.mjs', 'scripts/release-metadata.mjs', 'scripts/sealed-runtime.mjs', 'scripts/windows-signing.mjs', 'scripts/private-control.mjs',
-    'scripts/build-desktop.mjs', 'scripts/verify-desktop.mjs', 'scripts/package-npm.mjs', 'scripts/package-node-web.json', 'scripts/publish-npm.mjs',
+    'scripts/build-desktop.mjs', 'scripts/verify-desktop.mjs', 'scripts/package-npm.mjs', 'scripts/package-node-web.json', 'scripts/fixtures/release-contract.json', 'scripts/publish-npm.mjs',
     'apps/cli/npm/bin/vibeface.mjs', 'apps/cli/npm/package.json', 'apps/cli/npm/README.md'];
   for (const name of copy) write(root, name, fs.readFileSync(path.join(repo, name)));
   const cliManifest = value => `[package]\nname = "vibeface"\nversion = "${value}"\n`;
@@ -292,7 +315,10 @@ function desktopFixture(root, cli, seal, env) {
   json(source, 'native-dependencies.json', { target, libraries: ['libc.so.6'], minimum_glibc: '2.17' });
   json(source, 'resources/desktop-build.json', { version: desktopVersion, source_commit: commit });
   const runtime = path.join(source, 'resources/runtime');
-  for (const name of ['vibeface', 'vibeface-core', 'web/index.html', 'web/vibeface_secure.js', 'web/vibeface_secure_bg.wasm']) write(runtime, name, 'runtime');
+  for (const name of ['vibeface', 'vibeface-core', 'README.md', 'RUNTIME-REQUIREMENTS.md',
+    'scripts/install-node-service.sh', 'docs/node.md', 'docs/releasing.md', 'web/_shell.html',
+    'web/index.html', 'web/_redirects', 'web/_headers', 'web/.vibeface-build.json',
+    'web/vibeface_secure.js', 'web/vibeface_secure_bg.wasm']) write(runtime, name, 'runtime');
   json(runtime, 'BUILD-INFO.json', info(target)); seal(runtime);
   const input = path.join(root, 'desktop-input'); fs.mkdirSync(input);
   const portable = path.join(input, `${base}.zip`);

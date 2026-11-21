@@ -4,7 +4,9 @@ import type { SessionScope } from './types.ts'
 import { isReplyEnded, isTerminalJobState } from './types.ts'
 import test from "node:test"
 import { openWorksFromOverview, overviewFromWorkspace, parseConversation, parseOpenWorks, parseWorkspaceOverview } from "./model.ts"
-import { cardState, overviewScope, taskGroup, taskLabel, workspaceActivities } from "./labels.ts"
+import { cardState, overviewScope, taskGroup, taskLabel } from "./labels.ts"
+import { workspaceActivities } from "./activities.ts"
+import { prepareOverviewInputs } from "./overview-policy.ts"
 import type { BotRecord, NodeInfo, OpenWork, PendingCheck, Question, WorkspaceActivityJob } from "./types.ts"
 
 const mainScope: SessionScope = { kind: 'main' }
@@ -414,4 +416,48 @@ test("workspace activities dedupe overview and live scheduler jobs by trusted so
   const turns = view.activities.filter((activity): activity is Extract<typeof view.activities[number], { kind: "turn" }> => activity.kind === "turn")
   assert.deepEqual(turns.map((activity) => activity.id), ["turn:chat-1:local:message:queue"])
   assert.equal(turns[0]?.job.state, "running", "the live conversation snapshot wins over an older overview job")
+})
+
+test("overview preparation keeps partial and unknown remote observations visible", () => {
+  const remote = parseWorkspaceOverview({
+    consistency: "partial", truncated: true,
+    tasks: [{ work_id: "remote-unknown", conversation_id: "chat-1", kind: "work", state: "unknown", outcome: null, target_node: "worker" }],
+  })
+  const prepared = prepareOverviewInputs({
+    openWorks: [], bots: [bot("chat-1")], questions: [], nodes: [node("worker", false)], checks: [], overview: remote,
+    terminalCheckPolicy: "mobile-inclusive", read: true, connected: false,
+  })
+  assert.equal(prepared.overview.coverage.consistency, "partial")
+  assert.equal(prepared.overview.coverage.truncated, true)
+  assert.equal(prepared.works[0]?.state, "unverified")
+  assert.equal(prepared.activities.activities[0]?.state, "awaiting_confirmation")
+})
+
+test("overview preparation makes Web terminal-check filtering explicit", () => {
+  const finished = work({ work_id: "finished", state: "finished", outcome: "completed" })
+  const check: Extract<PendingCheck, { kind: "work" }> = { kind: "work", check_id: "finished-check", detail: "late check", work_id: finished.work_id, target_node: finished.target_node, conversation_id: finished.conversation_id, title: finished.title, reason: "unverified" }
+  const other = { ...check, check_id: "different-conversation", conversation_id: "chat-2" }
+  const device: PendingCheck = { kind: "device", check_id: "device", detail: "device check", target_node: finished.target_node, reason: "offline", works: [check, other] }
+  const base = { openWorks: [finished], bots: [bot("chat-1")], questions: [], nodes: [node("worker")], checks: [check, device], read: true, connected: true }
+  const web = prepareOverviewInputs({ ...base, terminalCheckPolicy: "web-filtered" })
+  const mobile = prepareOverviewInputs({ ...base, terminalCheckPolicy: "mobile-inclusive" })
+  assert.deepEqual(web.activities.activities.find((activity) => activity.kind === "work")?.facts.checks, [])
+  assert.deepEqual(web.activities.groups.attention.find((activity) => activity.kind === "attention")?.attention, { ...device, works: [other] })
+  assert.deepEqual(mobile.activities.activities.find((activity) => activity.kind === "work")?.facts.checks, [check, device])
+})
+
+test("overview preparation retains cross-Bot checks for the screen to select", () => {
+  const remote = parseWorkspaceOverview({
+    bots: [{ bot_id: "remote-bot", conversation_id: "remote-chat", name: "远端 Bot" }],
+    checks: [{ check_id: "remote-check", conversation_id: "remote-chat", trigger: "message:one", created_at_ms: 1 }],
+  })
+  const crossBot: PendingCheck = { kind: "work", check_id: "other-bot-check", detail: "other", work_id: "other-work", target_node: "worker", conversation_id: "chat-1", title: "other", reason: "unverified" }
+  const prepared = prepareOverviewInputs({
+    openWorks: [], bots: [bot("chat-1")], questions: [], nodes: [node("worker")], checks: [crossBot], overview: remote,
+    terminalCheckPolicy: "web-filtered", read: true, connected: true,
+  })
+  assert.deepEqual(prepared.activities.groups.attention.map((activity) => [activity.id, activity.conversation_id]), [
+    ["attention:check:other-bot-check", "chat-1"],
+    ["attention:overview-check:remote-check", "remote-chat"],
+  ])
 })

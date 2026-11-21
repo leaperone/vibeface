@@ -33,6 +33,61 @@ DEPENDENCIES = {'core': (), 'app': (), 'cli': ('core', 'app'), 'desktop': ('cli'
 WORKFLOWS = {app: f'release-{app}.yml' for app in APPS} | {'cli': 'release.yml', 'desktop': 'release-desktop-app.yml', 'mobile': 'release-mobile.yml'}
 
 
+def load_runtime_definitions(contract):
+    """Return a defensive projection of parsed AUTO-16 runtime definitions.
+
+    The loader is intentionally pure: callers own JSON/file parsing and pass
+    the parsed contract explicitly.  This keeps release-format detached from
+    checkout paths while giving Node/Python corpus adapters one shape to
+    validate for field, target, and role drift.
+    """
+    require(isinstance(contract, dict) and not isinstance(contract, list), 'invalid runtime contract')
+    require(contract.get('schema') == 1, 'unsupported runtime contract schema')
+    build_info = contract.get('build_info')
+    require(isinstance(build_info, dict), 'invalid runtime BUILD-INFO fields')
+    fields = build_info.get('fields')
+    require(isinstance(fields, list) and fields and all(isinstance(field, str) and field for field in fields),
+            'invalid runtime BUILD-INFO fields')
+    require(len(set(fields)) == len(fields), 'duplicate runtime BUILD-INFO field')
+    types = build_info.get('types')
+    require(isinstance(types, dict) and set(types) == set(fields), 'invalid runtime BUILD-INFO types')
+    allowed_types = {'string', 'target', 'sha1', 'uint32'}
+    require(all(isinstance(kind, str) and kind in allowed_types for kind in types.values()),
+            'unsupported runtime BUILD-INFO type')
+    web = contract.get('files', {}).get('web_required') if isinstance(contract.get('files'), dict) else None
+    require(isinstance(web, list) and all(isinstance(name, str) and name for name in web), 'invalid runtime Web files')
+    require(len(set(web)) == len(web), 'duplicate runtime Web file')
+    rows = contract.get('targets')
+    require(isinstance(rows, list) and rows, 'invalid runtime targets')
+    expected = {'target', 'host', 'platform', 'flag', 'exe_suffix', 'service_suffix', 'installer', 'signing', 'arch', 'programs', 'roles'}
+    targets = []
+    for row in rows:
+        require(isinstance(row, dict) and set(row) == expected, 'unsupported runtime target fields')
+        for field in ('target', 'host', 'platform', 'flag', 'service_suffix', 'installer', 'signing'):
+            require(isinstance(row[field], str) and row[field], f'invalid runtime target {field}')
+        require(isinstance(row['exe_suffix'], str), 'invalid runtime target exe_suffix')
+        require(row['arch'] is None or isinstance(row['arch'], str), 'invalid runtime target arch')
+        programs = row['programs']
+        require(isinstance(programs, list) and all(isinstance(name, str) and name for name in programs), 'invalid runtime programs')
+        require(len(set(programs)) == len(programs), 'duplicate runtime program')
+        roles = row['roles']
+        require(isinstance(roles, dict), 'invalid runtime roles')
+        require(set(roles) == {'runtime-core', 'node-full', 'npm-vendor', 'desktop-minimum'}, 'unsupported runtime roles')
+        normalized_roles = {}
+        for name, paths in roles.items():
+            require(isinstance(name, str) and name and isinstance(paths, list)
+                    and all(isinstance(path, str) and path for path in paths), 'invalid runtime role paths')
+            require(len(set(paths)) == len(paths), f'duplicate runtime role path: {name}')
+            normalized_roles[name] = tuple(paths)
+        targets.append({**row, 'programs': tuple(programs), 'roles': normalized_roles})
+    require(len({row['target'] for row in targets}) == len(targets), 'duplicate runtime target')
+    return {'schema': contract['schema'], 'fields': tuple(fields), 'build_info_types': dict(types),
+            'web_required': tuple(web), 'targets': tuple(targets)}
+
+
+loadRuntimeDefinitions = load_runtime_definitions
+
+
 def program_suffix(target):
     return '.exe' if target in WINDOWS_TARGETS else ''
 
@@ -90,16 +145,32 @@ def ios_asset_names(version_value, signed=False):
     return {name + suffix for name in payloads for suffix in ('', '.sha256', '.provenance.json')}
 
 
-def verify_build_info(info, expected_contracts):
-    require(set(info) == {'version', 'target', 'source_commit', 'update_protocol', 'data_epoch',
-                          'core_version', 'core_source_commit', 'app_version', 'app_source_commit'}, 'unsupported build info fields')
-    require(info['target'] in TARGETS, 'unsupported build target')
+def verify_build_info(info, expected_contracts, runtime):
+    require(isinstance(runtime, dict) and isinstance(runtime.get('fields'), tuple)
+            and isinstance(runtime.get('build_info_types'), dict), 'runtime definitions are required')
+    fields = runtime['fields']
+    types = runtime['build_info_types']
+    require(isinstance(info, dict) and set(info) == set(fields), 'unsupported build info fields')
+    targets = {row['target'] for row in runtime.get('targets', ())}
+    for field in fields:
+        kind = types.get(field)
+        value = info[field]
+        if kind == 'string':
+            version(value)
+        elif kind == 'target':
+            require(isinstance(value, str) and value in targets, 'unsupported build target')
+        elif kind == 'sha1':
+            require(isinstance(value, str) and re.fullmatch(COMMIT, value), 'invalid build source')
+        elif kind == 'uint32':
+            if field in expected_contracts:
+                require(type(value) is int and 0 <= value <= 0xffffffff and value == expected_contracts[field],
+                        'unsupported build protocol or data epoch')
+            else:
+                require(type(value) is int and 0 <= value <= 0xffffffff, 'invalid build integer')
+        else:
+            require(False, 'unsupported build info type')
     for key, expected in expected_contracts.items():
-        require(type(info[key]) is int and info[key] == expected, 'unsupported build protocol or data epoch')
-    for key in ('source_commit', 'core_source_commit', 'app_source_commit'):
-        require(isinstance(info[key], str) and re.fullmatch(COMMIT, info[key]), 'invalid build source')
-    for key in ('version', 'core_version', 'app_version'):
-        version(info[key])
+        require(types.get(key) == 'uint32' and info[key] == expected, 'unsupported build protocol or data epoch')
     return info
 
 
