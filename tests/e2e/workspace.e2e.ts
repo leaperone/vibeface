@@ -1,22 +1,18 @@
 import assert from 'node:assert/strict';
 import { stat } from 'node:fs/promises';
-import { expect, secrets } from 'e2e';
+import { expect } from 'e2e';
 import { workspaceTest as test } from './fixtures';
+import { createPersonalNetwork, continueRecoverySetup, finishRecoveryDownload } from '../support/web-onboarding';
 
 test('keeps personal Tasks and directed Channel results in their own scopes', { tags: ['workspace'], timeout: 300000 }, async ({ app, workspace, screen, browser }) => {
   await browser.setViewport({ width: 1440, height: 1000 });
   await app.open(workspace.source.entry);
-  await screen.getByRole('button', '新建我的网络').click();
-  await screen.getByLabel('这个节点叫什么？').fill('Workspace E2E Node');
-  await screen.getByRole('button', '下一步').click();
+  await createPersonalNetwork({ screen, browser }, 'Workspace E2E Node');
   await expect(screen.getByRole('heading', '设置恢复密码')).toBeVisible();
-  await screen.getByLabel(/^恢复密码/).fill(secrets.get('recoveryPassword'));
-  await screen.getByRole('button', '下一步').click();
+  await continueRecoverySetup({ screen, browser });
   await expect(screen.getByRole('heading', '保存恢复文件')).toBeVisible();
-  const recovery = await browser.waitForDownload(() => screen.getByRole('button', '下载恢复文件').click());
+  const recovery = await finishRecoveryDownload({ screen, browser });
   expect((await stat(recovery.absolutePath)).size).toBeGreaterThan(0);
-  await screen.getByRole('checkbox', '已把文件和密码分开保存').check();
-  await screen.getByRole('button', '完成创建').click();
   await expect(screen.getByRole('heading', '让这台电脑运行 Bot')).toBeVisible();
   await screen.getByRole('button', '稍后设置').click();
   await screen.getByRole('button', '跳过', { exact: true }).click();
