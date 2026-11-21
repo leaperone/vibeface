@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { inputDeliveryDescriptor, inputReceiptDescriptor, workspaceTaskCounts, workspaceTaskGroup, workspaceTaskStateDescriptor } from "./presentation.ts"
+import { contextSourceSummary, inputDeliveryDescriptor, inputReceiptDescriptor, pendingInputLabel, workspaceTaskCounts, workspaceTaskGroup, workspaceTaskStateDescriptor } from "./presentation.ts"
 import type { PendingMessage } from "../chat/types.ts"
 import type { InputReceipt, WorkspaceTask } from "./types.ts"
 
@@ -26,4 +26,24 @@ test("input delivery and receipt descriptors are exhaustive, including unknown o
 
 test("an unknown state fails closed instead of being silently grouped", () => {
   assert.throws(() => Reflect.apply(workspaceTaskGroup, undefined, ["future_state"]), TypeError)
+})
+
+test("the input label keeps an unknown delivery distinct from a final refusal", () => {
+  const receipt: InputReceipt = {
+    message_id: "input", target: { kind: "bot_main", bot_id: "bot" }, stage: "refused",
+    actual_turn_id: null, reason: null, retry_safe: true, control_event: null,
+  }
+  assert.equal(pendingInputLabel({ delivery: "unknown", receipt }), "重试请求待确认")
+  assert.equal(pendingInputLabel({ delivery: "accepted", receipt }), "已拒绝")
+  assert.equal(pendingInputLabel({ delivery: "unknown", receipt, rejected: "对话已改变" }), "已拒绝 · 对话已改变")
+  assert.equal(pendingInputLabel({ delivery: "unknown", receipt, rejected: "对话已改变", rejection_code: "input_missing" }), "这条输入的送达结果仍未确认")
+})
+
+test("context source counts follow the shared label order and omit empty kinds", () => {
+  assert.deepEqual(contextSourceSummary([
+    { kind: "attachment" }, { kind: "trigger" }, { kind: "attachment" },
+  ]), [
+    { kind: "trigger", label: "本轮交代", count: 1 },
+    { kind: "attachment", label: "附件", count: 2 },
+  ])
 })

@@ -12,6 +12,7 @@ import { mainConversationAttention } from '@vibeface/client/workspace/home.ts'
 import { inboxItems, waitingItems, type InboxItem } from '@vibeface/client/workspace/inbox.ts'
 import { addressName, deviceOnline, entryLabel } from '@vibeface/client/workspace/labels.ts'
 import { botReadiness, parsePendingMessage } from '@vibeface/client/workspace/model.ts'
+import { workspaceTaskCounts } from '@vibeface/client/workspace/presentation.ts'
 import type { PendingMessage } from '@vibeface/client/chat/types.ts'
 import { notificationBadgeCount, notificationPreferences, notificationUnreadCounts, watchNotificationPreferences } from '@vibeface/client/workspace/system-notifications.ts'
 import { storageOf } from '@vibeface/client/workspace/storage.ts'
@@ -52,7 +53,7 @@ export function useInbox(): InboxItem[] {
 /** How many things wait on the person, as the home card and the 待处理 tab count them. */
 export function useWaiting(): number {
   const shared = useLive()
-  return waitingItems(useInbox()).length + (shared?.workspaceState?.tasks ?? []).filter((task) => ['waiting_user', 'needs_reconciliation', 'update_pending', 'stop_pending'].includes(task.state)).length
+  return waitingItems(useInbox()).length + workspaceTaskCounts(shared?.workspaceState?.tasks ?? []).attention
 }
 
 /** The real network behind the screens: the shared device and workspace providers, reshaped for `useWorkspace`. */

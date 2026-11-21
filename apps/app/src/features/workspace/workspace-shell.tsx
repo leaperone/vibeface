@@ -20,6 +20,7 @@ import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { backTo,tabs } from "@vibeface/client/workspace/home.ts"
 import { waitingItems } from "@vibeface/client/workspace/inbox.ts"
 import { addressName,entryLabel,hostOf,isLoopback } from "@vibeface/client/workspace/labels.ts"
+import { workspaceTaskCounts } from "@vibeface/client/workspace/presentation.ts"
 import { Button } from "@vibeface/uiarc/button/button.tsx"
 import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
 import { Popover,PopoverContent,PopoverTrigger } from "@vibeface/uiarc/popover/popover.tsx"
@@ -63,7 +64,7 @@ const titles: Record<string, string> = { "/": "消息", "/tasks": terms.task.lab
 function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: boolean }) {
   const workspace = useWorkspace()
   // A question answered here stays on screen, collapsed, until the next read; it no longer counts.
-  const waiting = waitingItems(useInbox()).length + (workspace.workspaceState?.tasks ?? []).filter((task) => ['waiting_user', 'needs_reconciliation', 'update_pending', 'stop_pending'].includes(task.state)).length
+  const waiting = waitingItems(useInbox()).length + workspaceTaskCounts(workspace.workspaceState?.tasks ?? []).attention
   // A recovery about to take over outranks every other waiting item, so 任务 shows a red shield instead of a count.
   const device = useDevice()
   const recovering = Boolean(device.pendingRecovery)
