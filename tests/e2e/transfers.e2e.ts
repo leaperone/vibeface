@@ -19,7 +19,7 @@ async function createNetwork({ screen, browser }: Page, { url, entry }: OwnerNod
   await expect(screen.getByRole('heading', '让这台电脑运行 Bot')).toBeVisible();
   await screen.getByRole('button', '稍后设置').click();
   await expect(screen.getByRole('heading', '创建第一个 Bot')).toBeVisible();
-  await screen.getByRole('button', '跳过', { exact: true }).click();
+  await screen.getByRole('button', '稍后设置', { exact: true }).click();
   await browser.goto(`${url}/settings`);
   expect(await screen.getByRole('link', '发送和接收文件', { exact: true }).count()).toBe(0);
   await screen.getByRole('link', /^实验室/).click();

@@ -15,7 +15,8 @@ test('keeps personal Tasks and directed Channel results in their own scopes', { 
   expect((await stat(recovery.absolutePath)).size).toBeGreaterThan(0);
   await expect(screen.getByRole('heading', '让这台电脑运行 Bot')).toBeVisible();
   await screen.getByRole('button', '稍后设置').click();
-  await screen.getByRole('button', '跳过', { exact: true }).click();
+  await expect(screen.getByRole('heading', '创建第一个 Bot')).toBeVisible();
+  await screen.getByRole('button', '稍后设置', { exact: true }).click();
 
   const createBot = async (name: string) => {
     await screen.getByRole('button', '新 Bot', { visible: true }).first().click();
