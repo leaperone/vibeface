@@ -88,7 +88,7 @@ impl ChainConfig {
 }
 
 pub enum Call {
-    Budget(Box<super::budget::BudgetAction>),
+    Budget(Box<super::budget_codec::BudgetAction>),
     Approve {
         amount: Amount,
     },
@@ -699,12 +699,15 @@ impl Chain {
         &self,
         id: String,
         wallet: Address,
-        action: super::budget::BudgetAction,
+        action: super::budget_codec::BudgetAction,
         gas_cap: String,
         policy: &super::budget::PublicationPolicy,
     ) -> Result<SpendIntent> {
         policy.validate()?;
-        let (target, calldata) = action.encode(&self.config, wallet)?;
+        let codec = super::budget_codec::CodecContext::from_config(&self.config, wallet)?;
+        let encoded = super::budget_codec::encode_action(&codec, action)?;
+        let target = encoded.target;
+        let calldata = encoded.calldata;
         ensure!(
             calldata.starts_with(&abi::revealBatchCall::SELECTOR),
             "offline publication only signs a bounded reveal batch"
@@ -1129,7 +1132,11 @@ fn encode_call(config: &ChainConfig, call: Call, wallet: Address) -> Result<(Add
     config.validate()?;
     let escrow = address(&config.escrow)?;
     let calldata = match call {
-        Call::Budget(action) => return action.encode(config, wallet),
+        Call::Budget(action) => {
+            let codec = super::budget_codec::CodecContext::from_config(config, wallet)?;
+            let encoded = super::budget_codec::encode_action(&codec, *action)?;
+            return Ok((encoded.target, encoded.calldata));
+        }
         Call::Approve { amount } => {
             return Ok((
                 address(&config.asset)?,
@@ -1331,7 +1338,10 @@ fn validate_calldata(
             validate_order_index(call.id.into(), call.index)?;
             validate_seal(&call.seal)?;
         }
-        _ => return super::budget::validate_calldata(config, input, wallet),
+        _ => {
+            let codec = super::budget_codec::CodecContext::from_config(config, wallet)?;
+            super::budget_codec::decode_call(&codec, target, input)?;
+        }
     }
     Ok(())
 }
@@ -2174,10 +2184,10 @@ pub(super) mod tests {
             max_fee_per_gas: "3000000000".into(),
             priority_fee_per_gas: "1000000000".into(),
         };
-        let reveal = || super::super::budget::BudgetAction::Reveal {
+        let reveal = || super::super::budget_codec::BudgetAction::Reveal {
             budget_id: [0x33; 32],
-            items: vec![super::super::budget::Reveal {
-                window: super::super::budget::WindowRef {
+            items: vec![super::super::budget_codec::Reveal {
+                window: super::super::budget_codec::WindowRef {
                     order_id: "44".repeat(32),
                     index: 0,
                 },
