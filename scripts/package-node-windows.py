@@ -100,7 +100,7 @@ def self_test():
         core = {'version': '2.3.4', 'source_commit': 'b' * 40}
         app = {'version': '3.4.5-rc.2', 'source_commit': 'c' * 40}
         info = release_archive.seal_bundle(package, core, app)
-        release_format.verify_build_info(info, release_context.contracts())
+        release_format.verify_build_info(info, release_context.contracts(), release_context.runtime_definitions())
         assert len(info) == 9 and info['target'] == TARGET and info['source_commit'] == source
         identity = {'version': version, 'source_commit': source, 'dependencies': {'core': core, 'app': app}}
         assert release_archive.verify_bundle(package, TARGET, identity) == info

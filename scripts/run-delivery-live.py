@@ -41,7 +41,7 @@ def source_commit(expected):
 
 def checked_package(package, expected):
     info = json.loads(regular(package / "BUILD-INFO.json"))
-    release_format.verify_build_info(info, release_context.contracts())
+    release_format.verify_build_info(info, release_context.contracts(), release_context.runtime_definitions())
     if any(info[field] != expected for field in ("source_commit", "core_source_commit", "app_source_commit")) or info["target"] != "x86_64-unknown-linux-gnu":
         raise ValueError("Package provenance differs from this Linux source commit")
     for binary in (package / "vibeface", package / "vibeface-core"):
@@ -375,7 +375,7 @@ def project_wrapper_summary(name, value):
         package = result["package"]
         result["package"] = {key:package[key] for key in ("buildInfo","binarySha256","coreSha256","cryptoSha256","wasmSha256") if key in package}
         if "buildInfo" in package:
-            release_format.verify_build_info(package["buildInfo"], release_context.contracts())
+            release_format.verify_build_info(package["buildInfo"], release_context.contracts(), release_context.runtime_definitions())
             result["package"]["buildInfo"] = {key:package["buildInfo"][key] for key in ("version","target","source_commit","update_protocol",
                 "data_epoch","core_version","core_source_commit","app_version","app_source_commit") if key in package["buildInfo"]}
         if any(not isinstance(item,str) or not re.fullmatch(r"[0-9a-f]{64}",item) for key,item in result["package"].items() if key != "buildInfo"):

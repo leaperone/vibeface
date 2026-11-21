@@ -4822,7 +4822,7 @@ def pin_npm_baseline(options):
         for target in release_format.TARGETS:
             vendor = unpacked / "vendor" / target
             build = json.loads((vendor / "BUILD-INFO.json").read_text())
-            release_format.verify_build_info(build, release_context.contracts())
+            release_format.verify_build_info(build, release_context.contracts(), release_context.runtime_definitions())
             require(build["source_commit"] == baseline_source and build["version"] == version and build["target"] == target,
                     "every baseline vendor belongs to the complete CLI source and current data epoch")
             name = f"vibeface-{version}-{target}.tar.gz"

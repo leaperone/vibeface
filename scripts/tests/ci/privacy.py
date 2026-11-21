@@ -189,7 +189,7 @@ def release_privacy_test(root, scratch):
             "update_protocol": 1, "data_epoch": 1, "core_version": "2.3.4", "core_source_commit": "b" * 40,
             "app_version": "3.4.5-rc.2", "app_source_commit": "c" * 40,
         }
-        release_format.verify_build_info(sealed, release_context.contracts())
+        release_format.verify_build_info(sealed, release_context.contracts(), release_context.runtime_definitions())
         (repo / "scripts/release-rustflags.py").write_text('raise RuntimeError("fixture failure")')
         generated()
         marker.unlink()
