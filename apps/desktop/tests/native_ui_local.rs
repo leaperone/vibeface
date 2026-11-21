@@ -204,7 +204,7 @@ impl LocalNode {
                         json!({"nodes":[{"device_id":self.entry.node_id,"name":"Controlled local Node","online":true,"revoked":false,"local":true}]})
                     }
                     Some("workspace_state") => {
-                        json!({"tasks":[],"channels":[],"assignments":[],"inputs":[],"coverage":{"limit":100,"truncated":false}})
+                        json!({"tasks":[],"channels":[],"assignments":[],"inputs":[],"coverage":{"limit":256,"truncated":false}})
                     }
                     Some("questions") => json!({"questions":[]}),
                     Some("notifications") => json!({"notifications":[]}),

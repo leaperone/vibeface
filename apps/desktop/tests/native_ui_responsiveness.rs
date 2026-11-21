@@ -133,7 +133,7 @@ async fn serve(
                         json!({"bots":[{"bot_id":"bot","conversation_id":"chat","name":format!("Batch {batch}"),"models":{}},{"bot_id":"other-bot","conversation_id":"other","name":"Other","models":{}}]})
                     },
                     "nodes"=>json!({"nodes":[{"device_id":node.device_id(),"name":"Fixture Node","online":true,"revoked":false,"local":false}]}),
-                    "workspace_state"=>json!({"tasks":[],"channels":[],"assignments":[],"inputs":[]}),
+                    "workspace_state"=>json!({"tasks":[],"channels":[],"assignments":[],"inputs":[],"coverage":{"limit":256,"truncated":false}}),
                     "questions"=>json!({"questions":[]}),
                     "notifications"=>json!({"notifications":[]}),
                     "conversation"=>probe.conversation_override.lock().unwrap().clone().unwrap_or_else(||conversation(request["params"]["conversation_id"].as_str().unwrap(),&node.device_id(),&probe.head.lock().unwrap())),

@@ -3,7 +3,9 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use vibeface_protocol::amount::Amount;
-use vibeface_protocol::workspace::{Attachment, InputIntent, InputTarget};
+use vibeface_protocol::workspace::{
+    Attachment, Channel as WorkspaceChannel, InputIntent, InputTarget, TaskState, WorkspaceTask,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Route {
@@ -180,6 +182,42 @@ pub struct Task {
     #[serde(default)]
     pub state: String,
 }
+impl From<WorkspaceTask> for Task {
+    fn from(task: WorkspaceTask) -> Self {
+        let state = match task.state {
+            TaskState::NotStarted => "not_started",
+            TaskState::Running => "running",
+            TaskState::WaitingDependencies => "waiting_dependencies",
+            TaskState::WaitingUser => "waiting_user",
+            TaskState::UpdatePending => "update_pending",
+            TaskState::StopPending => "stop_pending",
+            TaskState::NeedsReconciliation => "needs_reconciliation",
+            TaskState::Completed => "completed",
+            TaskState::Cancelled => "cancelled",
+            TaskState::Deferred => "deferred",
+        };
+        Self {
+            root_task_id: task.root_task_id,
+            parent_task_id: task.parent_task_id,
+            source_events: task
+                .source_events
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect(),
+            waiting_reason: task.waiting_reason,
+            current_assignment: task.current_assignment,
+            channel_id: task.channel_id,
+            task_id: task.task_id,
+            title: task.title,
+            owner_bot: task.owner_bot,
+            request: task.request,
+            expected_result: task.expected_result,
+            dependencies: task.dependencies,
+            revision: task.revision,
+            state: state.into(),
+        }
+    }
+}
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Channel {
     pub channel_id: String,
@@ -190,6 +228,20 @@ pub struct Channel {
     pub coordinator_node: String,
     pub revision: u64,
     pub owner_epoch: u64,
+}
+impl From<WorkspaceChannel> for Channel {
+    fn from(channel: WorkspaceChannel) -> Self {
+        Self {
+            channel_id: channel.channel_id,
+            title: channel.title,
+            purpose: channel.purpose,
+            members: channel.members,
+            coordinator_bot: channel.coordinator_bot,
+            coordinator_node: channel.coordinator_node.to_string(),
+            revision: channel.revision,
+            owner_epoch: channel.owner_epoch,
+        }
+    }
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Node {
