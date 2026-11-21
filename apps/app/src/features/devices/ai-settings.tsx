@@ -233,7 +233,7 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
   }
   useEffect(() => {
     let active = true
-    pendingFocus.current = null; setResponse(null); setLocalResult(""); setNeedsRead(false); setReread(null); setQueued(null)
+    pendingFocus.current = null; setResponse(null); setLocalResult(""); setNeedsRead(false); setReread(null); setQueued(null); setDraft(null)
     // Only the basic settings read gates the page. Errors must also reveal their retry action;
     // provider discovery and checks continue independently after this read.
     void load().finally(() => { if (active && ready?.isCurrent()) onInitialRead?.() })
@@ -329,8 +329,9 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
     }
     onNext?.()
   }
+  // A check started in this same commit (focus returned during the last one) is not in `busy` yet; wait for it too, so the save never runs beside it.
   useEffect(() => {
-    if (busy || !queued) return
+    if (busy || !queued || connecting.current === ready) return
     setQueued(null)
     const item = response?.providers.find((option) => option.provider === queued)
     if (item) void saveBot(item)
@@ -395,8 +396,8 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
       </>}
       <div className="flex flex-wrap justify-end gap-2 border-t pt-4">
         <Button type="button" variant="ghost" disabled={writing} aria-describedby={writing ? "bot-choice-status" : undefined} onClick={onNext}>稍后设置</Button>
-        {options?.length === 0 ? null : <Button type="button" disabled={Boolean(blocked)} aria-busy={writing || undefined} aria-describedby={status ? "bot-choice-status" : undefined}
-          onClick={() => { if (picked) void saveBot(picked) }}><BusyIcon busy={writing} />下一步</Button>}
+        {options?.length === 0 ? null : <Button type="button" loading={writing} disabled={Boolean(blocked) && !writing} aria-describedby={status ? "bot-choice-status" : undefined}
+          onClick={() => { if (picked) void saveBot(picked) }}>下一步</Button>}
       </div>
     </>
   }
@@ -695,7 +696,7 @@ function choiceNote(item: ProviderStatus): string {
   const issue = item.state === "needs_setup" ? item.issues.find((issue) => issue.code !== "env_missing" || canSetProviderEnvironment(item.provider, issue.name)) : undefined
   const readiness = summaryReadiness(item)
   const later = "之后在「设置 → 我的设备」中处理"
-  return `${states.needs_setup.label} · ${issue ? `${issueText(item.provider, issue)}，${later}` : 'issue' in readiness ? probeIssueText(item.provider, readiness.issue) : later}`
+  return `${states.needs_setup.label} · ${issue ? `${issueText(item.provider, issue)}，${later}` : 'issue' in readiness ? `${probeIssueText(item.provider, readiness.issue)}，${later}` : later}`
 }
 
 const botFields = ["model", "workspace"] as const

@@ -13,7 +13,7 @@ cursorTest('automatically connects Cursor using only the official CLI subscripti
   await finishRecoveryDownload({ screen, browser });
   await expect(screen.getByRole('heading', '让这台电脑运行 Bot')).toBeVisible();
   // Onboarding only offers the choice; the sign-in note sits in the option and nothing is picked for the owner.
-  const signIn = screen.getByRole('radio', /^Cursor.*Cursor 需要在运行设备上完成官方 CLI 订阅登录$/);
+  const signIn = screen.getByRole('radio', /^Cursor.*Cursor 需要在运行设备上完成官方 CLI 订阅登录，之后在「设置 → 我的设备」中处理$/);
   await expect(signIn).not.toBeChecked();
   await expect(screen.getByRole('textbox', /密钥|令牌/)).toHaveCount(0);
   await expect(screen.getByRole('link', /获取/)).toHaveCount(0);

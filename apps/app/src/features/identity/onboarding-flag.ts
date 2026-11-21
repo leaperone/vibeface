@@ -1,7 +1,8 @@
 import { useSyncExternalStore } from "react"
 
 // The displayed onboarding step (4 or 5) after a new network is created here, saved as `<network_id>:<step>` so only that network's
-// connection shows it; cleared once the bot step is done or skipped, or when creating the network fails.
+// connection shows it; cleared once the bot step is done or skipped. A creation that fails keeps it, since its result may be unknown;
+// creating again overwrites it.
 const key = "vibeface.onboarding"
 const listeners = new Set<() => void>()
 type Step = 4 | 5

@@ -18,7 +18,7 @@ import { Textarea } from '@vibeface/uiarc/textarea/textarea.tsx'
 import { Archive,ArchiveRestore,Camera,CircleCheck,CirclePlus,FileKey,Hourglass,KeyRound,Laptop,LifeBuoy,Link2,LoaderCircle,LogIn,MessageSquareLock,MonitorSmartphone,MonitorX,QrCode,RotateCcw,Settings2,ShieldAlert,ShieldCheck,X } from 'lucide-react'
 import { useEffect,useRef,useState,type FormEvent,type ReactNode } from 'react'
 import { CopyDiagnostics,GatewayForm } from './device-controls'
-import { finishOnboarding,startOnboarding } from './onboarding-flag'
+import { startOnboarding } from './onboarding-flag'
 import { PasswordStrength,RecoveryControls,RecoveryReview,RecoveryWaiting,SaveRecoveryFile } from './recovery-controls'
 
 const NOT_JOINED = notJoined(webPlatform.self)
@@ -433,9 +433,10 @@ function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
       <div className="flex justify-between gap-2">
         <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={device.cancelSensitive}>上一步</Button>
         <Button type="button" disabled={!saved || busy} aria-busy={busy || undefined} aria-describedby={saved ? undefined : 'bootstrap-hint'} onClick={() => void run('bootstrap', async () => {
-          // Saved before creating so the workspace opens on step 4 instead of flashing first; a creation that fails leaves no step behind.
+          // Saved before creating so the workspace opens on step 4 instead of flashing first. Kept when creating fails: the network may exist anyway,
+          // and the step is bound to this network_id, so it never shows on another one.
           if (networkId) startOnboarding(networkId)
-          try { await device.confirmBootstrap(true) } catch (cause) { finishOnboarding(); throw cause }
+          await device.confirmBootstrap(true)
         })}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}完成创建</Button>
       </div>
     </div>
