@@ -1,6 +1,6 @@
 import { base64ToBytes, bytesToBase64, sha256Hex } from '../lib/byte-codec.ts'
 import { formatByteSize as sizeLabel } from '../lib/byte-size.ts'
-import { array, boolean, record, text, type Member } from '../lib/node.ts'
+import { array, boolean, record, same, text, type Member } from '../lib/node.ts'
 import type { DeliveryBudget, DeliveryDeadlines, DeliveryDraft, DeliveryEvidence, DeliveryMode, DeliveryOrder, DeliveryPayment, DeliveryPhase, DeliveryProvider, DeliveryStatus, PendingIntent, PaymentState, ReceivedFile } from './types.ts'
 
 const maxAmount = (1n << 256n) - 1n
@@ -130,6 +130,104 @@ export function parseOrders(value: unknown): DeliveryOrder[] {
   const orders = rows.map(parseOrder)
   if (new Set(orders.map(order => order.order_id)).size !== orders.length) throw new Error('订单列表包含重复记录。')
   return orders
+}
+
+type DeliveryIdentity = Partial<Pick<DeliveryOrder, 'order_id' | 'intent_id' | 'role' | 'source_peer'>>
+
+/** The identity facts that a response must preserve for a request about one order. */
+export function bindOrderIdentity(order: DeliveryOrder, expected: DeliveryIdentity, message = '传输响应不属于原订单或当前来源设备。'): DeliveryOrder {
+  if (expected.order_id !== undefined && order.order_id !== expected.order_id
+    || expected.intent_id !== undefined && order.intent_id !== expected.intent_id
+    || expected.role !== undefined && order.role !== expected.role
+    || expected.source_peer !== undefined && order.source_peer !== expected.source_peer) throw new Error(message)
+  return order
+}
+
+/** Intent lookup has no order ID before the lookup, but still has its sender binding. */
+export function bindIntentIdentity(order: DeliveryOrder, expectedIntentId: string, sourcePeer: string): DeliveryOrder {
+  return bindOrderIdentity(order, { intent_id: expectedIntentId, role: 'sender', source_peer: sourcePeer }, '查询结果不属于原来那次发送。')
+}
+
+/**
+ * Fixed delivery terms shared by every response for one order. Phase, evidence,
+ * window state and payment accounting are deliberately excluded: those are the
+ * values an accept/confirm/reconcile response is allowed to advance.
+ */
+export function authorization(order: DeliveryOrder) {
+  const p = order.payment
+  return {
+    order_id: order.order_id,
+    intent_id: order.intent_id,
+    role: order.role,
+    mode: order.mode,
+    acceptance: order.acceptance,
+    source_peer: order.source_peer,
+    receiver_peer: order.receiver_peer,
+    provider_peer: order.provider_peer,
+    name: order.name,
+    bytes: order.bytes,
+    sha256: order.sha256,
+    deadlines: order.deadlines,
+    windows: order.windows.map(window => ({ index: window.index, bytes: window.bytes })),
+    payment: {
+      chain_id: p.chain_id,
+      asset: p.asset,
+      payer: p.payer,
+      provider_wallet: p.provider_wallet,
+      delivery_fee: p.delivery_fee,
+      reservation_fee: p.reservation_fee,
+      priority_fee: p.priority_fee,
+      total: p.total,
+      gas_cap: p.gas_cap,
+      budget_id: p.budget_id,
+    },
+  }
+}
+
+type AuthorizationPolicy = 'exact' | 'receiver_metadata'
+
+/** Parse and bind one mutating/reconciling response to its original request. */
+export function parseExpectedOrder(value: unknown, expected: DeliveryOrder, policy: AuthorizationPolicy = 'exact'): DeliveryOrder {
+  const order = bindOrderIdentity(parseOrder(value), expected)
+  assertAuthorization(order, expected, '传输响应修改了原订单的固定条款，请先查询原订单。', policy)
+  return order
+}
+
+/** A generic get has only the requested order ID available to bind. */
+export function parseExpectedOrderId(value: unknown, expectedOrderId: string): DeliveryOrder {
+  const order = parseOrder(value)
+  if (order.order_id !== expectedOrderId) throw new Error('查询结果不属于请求的订单。')
+  return order
+}
+
+/** Parse a batch response and require every requested order exactly once. */
+export function parseExpectedOrders(value: unknown, expected: readonly DeliveryOrder[]): DeliveryOrder[] {
+  const orders = parseOrders(value)
+  if (orders.length !== expected.length) throw new Error('传输批次没有返回全部原订单。')
+  const expectedById = new Map(expected.map(order => [order.order_id, order]))
+  if (expectedById.size !== expected.length) throw new Error('请求批次包含重复订单。')
+  for (const order of orders) {
+    const original = expectedById.get(order.order_id)
+    if (!original) throw new Error('传输批次返回了无关订单。')
+    bindOrderIdentity(order, original)
+    assertAuthorization(order, original, '传输批次修改了原订单的固定条款，请先查询原订单。')
+  }
+  return orders
+}
+
+function assertAuthorization(actual: DeliveryOrder, expected: DeliveryOrder, message: string, policy: AuthorizationPolicy = 'exact'): void {
+  const actualFixed = authorization(actual), expectedFixed = authorization(expected)
+  if (policy === 'receiver_metadata' && expected.role === 'receiver' && expected.name === null && expected.sha256 === null) {
+    const actualHasName = actual.name !== null, actualHasSha256 = actual.sha256 !== null
+    if (actualHasName !== actualHasSha256) throw new Error(message)
+    if (actualHasName) {
+      // The executor writes the recovered name and digest together. Compare all
+      // other fixed terms exactly while allowing this one documented enrichment.
+      actualFixed.name = null
+      actualFixed.sha256 = null
+    }
+  }
+  if (!same(actualFixed, expectedFixed)) throw new Error(message)
 }
 export function parseReceived(value: unknown, limit: number): ReceivedFile {
   const v = record(value)
