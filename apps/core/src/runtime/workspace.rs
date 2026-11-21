@@ -118,15 +118,13 @@ impl Runtime {
             .map(|_| id(input, "task_id"))
             .transpose()?;
         let limit = domain_limit(input)?;
-        Ok(serde_json::to_value({
-            let network_id = access.network_id().to_owned();
-            let channel = channel.clone();
-            let task = task.clone();
-            self.read_display(access, input, "workspace.workspace_state", move |store| {
+        let network_id = access.network_id().to_owned();
+        let state: vibeface_protocol::workspace::WorkspaceState = self
+            .read_display(access, input, "workspace.workspace_state", move |store| {
                 store.workspace_state(&network_id, channel.as_deref(), task.as_deref(), limit)
             })
-            .await
-        }?)?)
+            .await?;
+        Ok(serde_json::to_value(state)?)
     }
     pub(super) async fn workspace_history(&self, access: &Access, input: &Value) -> Result<Value> {
         ensure!(

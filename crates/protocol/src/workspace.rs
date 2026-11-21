@@ -314,13 +314,15 @@ pub enum WorkspaceSpeaker {
     Node { device_id: DeviceId },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceCoverage {
     pub limit: usize,
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceState {
     pub inputs: Vec<QueuedInput>,
     pub channels: Vec<Channel>,
@@ -403,6 +405,33 @@ impl Attachment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_state_is_a_strict_public_read_dto() {
+        let minimal = serde_json::json!({
+            "inputs": [],
+            "channels": [],
+            "tasks": [],
+            "assignments": [],
+            "coverage": {"limit": 256, "truncated": false}
+        });
+        let state: WorkspaceState = serde_json::from_value(minimal.clone()).unwrap();
+        assert_eq!(serde_json::to_value(state).unwrap(), minimal);
+
+        let mut unknown = minimal;
+        unknown["extra"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<WorkspaceState>(unknown).is_err());
+    }
+
+    #[test]
+    fn workspace_state_rejects_unknown_coverage_fields() {
+        let state = serde_json::json!({
+            "inputs": [], "channels": [], "tasks": [], "assignments": [],
+            "coverage": {"limit": 1, "truncated": false, "extra": true}
+        });
+        assert!(serde_json::from_value::<WorkspaceState>(state).is_err());
+    }
+
     #[test]
     fn input_requires_an_explicit_boolean_reporting_choice() {
         let mut input = serde_json::json!({"message_id":"input-1","target":{"kind":"bot_main","bot_id":"bot-1"},"intent":"defer","sequence":1,"text":"Keep this input deferred"});
