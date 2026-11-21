@@ -422,13 +422,16 @@ function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
   }, [networkId])
   return <Panel icon={FileKey} title="保存恢复文件">
     <SaveRecoveryFile code={code} saved={saved} onSaved={setSaved} busy={busy} download={{ done: downloaded, run: () => void run('download', async ({ current }) => { await device.downloadBackup(); if (current()) setDownloaded(true) }) }} />
-    <div className="flex justify-between gap-2">
-      <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={device.cancelSensitive}>上一步</Button>
-      <Button type="button" disabled={!saved || busy} aria-busy={busy || undefined} onClick={() => void run('bootstrap', async () => {
-        // Saved before creating so the workspace opens on step 4 instead of flashing first; a creation that fails leaves no step behind.
-        if (networkId) startOnboarding(networkId)
-        try { await device.confirmBootstrap(true) } catch (cause) { finishOnboarding(); throw cause }
-      })}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}完成创建</Button>
+    <div className="grid gap-2">
+      {saved ? null : <p id="bootstrap-hint" className="text-sm text-secondary">{downloaded ? `勾选「${recoveryCopy.keptApart}」后，才能完成创建` : `下载恢复文件并勾选「${recoveryCopy.keptApart}」后，才能完成创建`}</p>}
+      <div className="flex justify-between gap-2">
+        <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={device.cancelSensitive}>上一步</Button>
+        <Button type="button" disabled={!saved || busy} aria-busy={busy || undefined} aria-describedby={saved ? undefined : 'bootstrap-hint'} onClick={() => void run('bootstrap', async () => {
+          // Saved before creating so the workspace opens on step 4 instead of flashing first; a creation that fails leaves no step behind.
+          if (networkId) startOnboarding(networkId)
+          try { await device.confirmBootstrap(true) } catch (cause) { finishOnboarding(); throw cause }
+        })}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}完成创建</Button>
+      </div>
     </div>
   </Panel>
 }
