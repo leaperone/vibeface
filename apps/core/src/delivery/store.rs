@@ -2474,7 +2474,7 @@ pub(super) mod tests {
             store
                 .put_value(
                     &format!("protected-flush:{budget_id}"),
-                    &serde_json::to_vec(&vec![super::super::budget::WindowRef {
+                    &serde_json::to_vec(&vec![super::super::budget_codec::WindowRef {
                         order_id: order.view.order_id.clone(),
                         index: 0,
                     }])

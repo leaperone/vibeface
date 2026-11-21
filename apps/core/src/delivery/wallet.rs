@@ -519,17 +519,23 @@ mod tests {
         };
         let config = chain::tests::config();
         let mut intent = chain::tests::approval_intent(wallet.address()?)?;
-        let (target, calldata) = super::super::budget::BudgetAction::Reveal {
-            budget_id: [3; 32],
-            items: vec![super::super::budget::Reveal {
-                window: super::super::budget::WindowRef {
-                    order_id: "04".repeat(32),
-                    index: 0,
-                },
-                capsule: vec![5; 80],
-            }],
-        }
-        .encode(&config, wallet.address()?)?;
+        let codec =
+            super::super::budget_codec::CodecContext::from_config(&config, wallet.address()?)?;
+        let encoded = super::super::budget_codec::encode_action(
+            &codec,
+            super::super::budget_codec::BudgetAction::Reveal {
+                budget_id: [3; 32],
+                items: vec![super::super::budget_codec::Reveal {
+                    window: super::super::budget_codec::WindowRef {
+                        order_id: "04".repeat(32),
+                        index: 0,
+                    },
+                    capsule: vec![5; 80],
+                }],
+            },
+        )?;
+        let target = encoded.target;
+        let calldata = encoded.calldata;
         intent.id = format!("budget-{}/reveal-{}-0", "03".repeat(32), "06".repeat(8));
         intent.to = chain::address_hex(target);
         intent.calldata = format!("0x{}", hex::encode(calldata));

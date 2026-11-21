@@ -1,4 +1,5 @@
 pub mod budget;
+pub mod budget_codec;
 pub mod chain;
 mod charity;
 mod keys;
@@ -937,7 +938,7 @@ impl Delivery {
                         .iter()
                         .all(|o| o.view.payment.budget_id.as_deref() == Some(&budget_id))
                         && orders.iter().map(|o| o.view.windows.len()).sum::<usize>()
-                            <= budget::MAX_BATCH_WINDOWS,
+                            <= budget_codec::MAX_BATCH_WINDOWS,
                     "a confirmed batch uses one budget and at most two windows"
                 );
                 let ids: Vec<_> = orders.iter().map(|o| o.view.order_id.clone()).collect();
@@ -1034,7 +1035,7 @@ impl Delivery {
                         .map(|other| other.view.windows.len())
                         .sum();
                     ensure!(
-                        active + order.view.windows.len() <= budget::MAX_BATCH_WINDOWS,
+                        active + order.view.windows.len() <= budget_codec::MAX_BATCH_WINDOWS,
                         "protected sending permits at most two active windows"
                     );
                 }
@@ -1095,7 +1096,7 @@ impl Delivery {
                         .iter()
                         .all(|o| o.view.payment.budget_id.as_deref() == Some(&budget_id))
                         && orders.iter().map(|o| o.view.windows.len()).sum::<usize>()
-                            <= budget::MAX_BATCH_WINDOWS,
+                            <= budget_codec::MAX_BATCH_WINDOWS,
                     "receiving batch uses one budget and at most two windows"
                 );
                 let active: usize = self
@@ -1173,7 +1174,7 @@ impl Delivery {
                             .map(|other| other.view.windows.len())
                             .sum();
                         ensure!(
-                            active + order.view.windows.len() <= budget::MAX_BATCH_WINDOWS,
+                            active + order.view.windows.len() <= budget_codec::MAX_BATCH_WINDOWS,
                             "protected receiving permits at most two active windows"
                         );
                     }
