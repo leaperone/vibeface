@@ -1,4 +1,5 @@
-import { cardState, workspaceActivities } from "./labels.ts"
+import { cardState } from "./labels.ts"
+import { workspaceActivities } from "./activities.ts"
 import { openWorksFromOverview, overviewFromWorkspace } from "./model.ts"
 import type {
   BotRecord,

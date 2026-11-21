@@ -10,7 +10,7 @@ import { providerNames } from '@vibeface/client/lib/node.ts'
 import { workFailure } from '@vibeface/client/lib/errors.ts'
 import { cardState, needsLook, nodeName, overviewScope, schedulerStatus, staleTaskLabel, taskActive, taskAgent, taskGroups, taskLabel, taskProgress, taskStale, type TaskGroup } from '@vibeface/client/workspace/labels.ts'
 import { prepareOverviewInputs } from '@vibeface/client/workspace/overview-policy.ts'
-import { workspaceTaskCounts, workspaceTaskGroup } from '@vibeface/client/workspace/presentation.ts'
+import { selectTasksOverview, workspaceTaskGroup } from '@vibeface/client/workspace/presentation.ts'
 import type { BotRecord, NodeInfo, OpenWorkCard, OverviewTask, WorkspaceActivity } from '@vibeface/client/workspace/types.ts'
 import { BotFace } from '@/components/bot-face'
 import { providerIcons, Skeleton } from '@/components/kit'
@@ -56,18 +56,22 @@ export function TasksScreen() {
   })
   const overview = shared ? prepared.overview : null
   const activityView = prepared.activities
-  const businessTasks = (shared?.workspaceState?.tasks ?? []).filter((task) => botFilter === 'all' || task.owner_bot === botFilter)
-  const taskCounts = workspaceTaskCounts(businessTasks)
-  const assignedWorkIds = new Set((shared?.workspaceState?.assignments ?? []).flatMap((assignment) => assignment.work_id && shared?.workspaceState?.tasks.some((task) => task.task_id === assignment.task_id) ? [assignment.work_id] : []))
   const chosenConversation = shared?.bots.find((bot) => bot.bot_id === botFilter)?.conversation_id
-  const counted = activityView.activities.filter((activity) => {
-    if (activity.kind === 'work' && activity.work && assignedWorkIds.has(activity.work.work_id)) return false
-    if (botFilter === 'all' || activity.conversation_id === chosenConversation) return true
-    return activity.kind === 'attention' && 'kind' in activity.attention && activity.attention.kind === 'device' && activity.attention.works.some((work) => work.conversation_id === chosenConversation)
+  const selection = selectTasksOverview({
+    workspace: shared?.workspaceState,
+    activities: activityView,
+    botId: botFilter,
+    failedWorkIds: failedIds,
+    includeActivity: (activity) => {
+      if (botFilter === 'all' || activity.conversation_id === chosenConversation) return true
+      return activity.kind === 'attention' && 'kind' in activity.attention && activity.attention.kind === 'device' && activity.attention.works.some((work) => work.conversation_id === chosenConversation)
+    },
   })
-  // A failed work, live question or check is acted on in 待处理 above: counted here, shown only there.
-  const known = counted.filter((activity) => !(activity.kind === 'work' && activity.work && failedIds.has(activity.work.work_id) || activity.kind === 'attention' && !('kind' in activity.attention && (activity.attention.kind === 'question' || activity.attention.kind === 'check'))))
-  const visible = known.filter((activity) => filter === 'all' || activity.group === filter)
+  const businessTasks = selection.businessTasks
+  const taskCounts = selection.taskCounts
+  const heldGroups = selection.heldGroups
+  const selectedActivities = selection.visibleActivities
+  const visible = selectedActivities.filter((activity) => filter === 'all' || activity.group === filter)
   const workActivities = visible.filter((activity): activity is Extract<WorkspaceActivity, { kind: 'work' }> => activity.kind === 'work')
   const turns = visible.filter((activity): activity is Extract<WorkspaceActivity, { kind: 'turn' }> => activity.kind === 'turn')
   const questionActivities = visible.filter((activity): activity is Extract<WorkspaceActivity, { kind: 'attention' }> => activity.kind === 'attention' && 'question_id' in activity.attention)
@@ -83,7 +87,7 @@ export function TasksScreen() {
     return [activity.attention]
   })
 
-  const count = (group: TaskGroup) => read ? counted.filter((item) => item.group === group).length + taskCounts[group] : null
+  const count = (group: TaskGroup) => read ? selection.groups[group].length + heldGroups[group] + taskCounts[group] : null
   return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-6 pb-12">
     <PendingSection />
     <MobileMasthead attention={count('attention')} working={count('working')} waiting={count('waiting')} filter={filter} onFilter={setFilter} />
@@ -101,7 +105,7 @@ export function TasksScreen() {
     </View> : workActivities.length ? taskGroups.map(({ group, title }) => groups[group].length ? <View key={group} className="gap-2">
       <Text role="heading" className="px-1 text-lg font-medium">{title} <Text className="text-muted">{groups[group].length}</Text></Text>
       {groups[group].map((activity) => <TaskRow key={activity.id} work={activity.work!} projected={activity.projection} waiting={activity.facts.questions.length > 0} bot={shared?.bots.find((item) => item.conversation_id === activity.conversation_id)} lookup={lookup} connected={Boolean(shared?.connectionOnline && read)} progress={taskProgress(activity.work!, shared?.liveProgress ?? [])} />)}
-    </View> : null) : counted.some((item) => item.group === 'attention' && (filter === 'all' || filter === 'attention')) || otherChecks.length || turns.length || businessTasks.some((task) => filter === 'all' || workspaceTaskGroup(task) === filter) ? null : filter !== 'all' || botFilter !== 'all' ? <Text className="text-sm text-muted">没有符合筛选的执行工作。</Text> : <MobileEmpty bot={bot} read={read} />}
+    </View> : null) : selection.groups.attention.length + heldGroups.attention > 0 && (filter === 'all' || filter === 'attention') || otherChecks.length || turns.length || businessTasks.some((task) => filter === 'all' || workspaceTaskGroup(task) === filter) ? null : filter !== 'all' || botFilter !== 'all' ? <Text className="text-sm text-muted">没有符合筛选的执行工作。</Text> : <MobileEmpty bot={bot} read={read} />}
   </KeyboardAwareScrollView>
 }
 

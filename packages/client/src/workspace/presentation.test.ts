@@ -1,8 +1,8 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { contextSourceSummary, inputDeliveryDescriptor, inputReceiptDescriptor, pendingInputLabel, workspaceTaskCounts, workspaceTaskGroup, workspaceTaskStateDescriptor } from "./presentation.ts"
+import { contextSourceSummary, inputDeliveryDescriptor, inputReceiptDescriptor, pendingInputLabel, selectTasksOverview, workspaceTaskCounts, workspaceTaskGroup, workspaceTaskStateDescriptor } from "./presentation.ts"
 import type { PendingMessage } from "../chat/types.ts"
-import type { InputReceipt, WorkspaceTask } from "./types.ts"
+import type { InputReceipt, OpenWorkCard, WorkspaceActivity, WorkspaceTask } from "./types.ts"
 
 test("workspace task descriptors cover every state and preserve row/count grouping", () => {
   const states = Object.keys(workspaceTaskStateDescriptor) as WorkspaceTask["state"][]
@@ -46,4 +46,22 @@ test("context source counts follow the shared label order and omit empty kinds",
     { kind: "trigger", label: "本轮交代", count: 1 },
     { kind: "attachment", label: "附件", count: 2 },
   ])
+})
+
+test("task selection keeps source order across activity groups", () => {
+  const facts = { questions: [], checks: [], overviewQuestions: [], overviewChecks: [], jobs: [] }
+  const work = {
+    work_id: "work", conversation_id: "chat", target_node: "node", cwd: "/project", title: "Work",
+    state: "running", summary: "", outcome: null, failure_reason: null,
+    dispatcher: "dispatcher", call_ref: "call", continues: null, parent: null, thread: null, phase: null,
+  } satisfies OpenWorkCard
+  const turn = { id: "turn", kind: "turn", conversation_id: "chat", work_id: null, group: "waiting", state: "queued", job: { trigger: "schedule:one", state: "queued", scope: { kind: "main" } }, facts } satisfies WorkspaceActivity
+  const workActivity = { id: "work", kind: "work", conversation_id: "chat", work_id: "work", group: "working", state: "running", work, facts } satisfies WorkspaceActivity
+  const activities: WorkspaceActivity[] = [turn, workActivity]
+  const groups = { attention: [], working: [workActivity], waiting: [turn] }
+  const selected = selectTasksOverview({
+    workspace: { channels: [], tasks: [], assignments: [], inputs: [], coverage: { limit: 20, truncated: false } },
+    activities: { activities, groups }, botId: "all", failedWorkIds: new Set(), includeActivity: () => true,
+  })
+  assert.deepEqual(selected.visibleActivities.map(({ id }) => id), ["turn", "work"])
 })

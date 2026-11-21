@@ -4566,7 +4566,11 @@ test("Bot filtering keeps the remaining Work and leaves its device confirmation 
   const openWork = (conversation_id: string) => ({ work_id: `work-${conversation_id}`, conversation_id, trigger: "message:one", target_node: "offline", cwd: "/project", title: conversation_id, prompt: "检查", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, kind: "codex", thread_id: `thread-${conversation_id}` })
   const works = [openWork("chat-a"), openWork("chat-b")]
   const inbox = [{ key: "device", kind: "confirm", check: { kind: "device", check_id: "device", detail: "", target_node: "offline", reason: "offline", works: works.map((work) => ({ kind: "work", check_id: `work:${work.work_id}`, detail: "", work_id: work.work_id, conversation_id: work.conversation_id, target_node: work.target_node, title: work.title, reason: "offline" })) } }]
-  const workspace = { bots, selectedBot: bots[1], openWorks: works, nodes: [{ device_id: "offline", name: "离线设备", local: false, online: false, revoked: false }], questions: [], liveProgress: [], connectionOnline: true, synced: true, answered: {} }
+  const workspace = { bots, selectedBot: bots[1], openWorks: works, nodes: [{ device_id: "offline", name: "离线设备", local: false, online: false, revoked: false }], questions: [], liveProgress: [], connectionOnline: true, synced: true, answered: {}, workspaceState: workspaceModel.parseWorkspaceState({
+    channels: [], inputs: [], coverage: { limit: 128, truncated: false },
+    tasks: [{ task_id: "task-a", root_task_id: "task-a", owner_bot: "a", title: "Bot A task", request: "request", expected_result: "result", source_events: [], dependencies: [], reply_only: false, revision: 1, action: "continue", request_event: "request", event_hash: "task-a-event", created_at_ms: 1, updated_at_ms: 1, state: "running" }],
+    assignments: [{ assignment_id: "assignment-a", task_id: "task-a", started_revision: 1, bot_id: "a", execution_node: "offline", bot_owner_epoch: 1, work_id: "work-chat-b", basis: {}, resource_roots: [], automatic: false, state: "accepted", event_hash: "assignment-a-event", created_at_ms: 1 }],
+  }) }
   const app = componentHarness("./tasks-overview.tsx", {
     "@vibeface/client/workspace/context.tsx": { useWorkspace: () => workspace },
     "@vibeface/client/identity/context.tsx": { useDevice: () => ({ directory: null }) },
@@ -4583,7 +4587,7 @@ test("Bot filtering keeps the remaining Work and leaves its device confirmation 
     assert.ok(typeof selectBot === "function")
     selectBot("b")
     elements = app.render("TasksOverview")
-    assert.deepEqual(elements.filter(({ type }) => typeof type === "function" && type.name === "TaskOverviewCard").map(({ props }) => (props.work as { conversation_id: string }).conversation_id), ["chat-b"])
+    assert.deepEqual(elements.filter(({ type }) => typeof type === "function" && type.name === "TaskOverviewCard").map(({ props }) => (props.work as { conversation_id: string }).conversation_id), [], "an assignment owned by another Bot still suppresses its selected execution row")
     assert.equal(elements.some(({ type }) => type === "ConfirmCard"), false)
   } finally { app.close() }
 })
