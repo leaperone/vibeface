@@ -90,7 +90,7 @@ class Artifact:
         require(os.access(binary, os.X_OK) and wasm.read_bytes().startswith(b"\x00asm"),
                 "The release binary is executable and its matching WASM is present")
         info = read_json(checked_path(value["build_info"]))
-        release_format.verify_build_info(info, release_context.contracts())
+        release_format.verify_build_info(info, release_context.contracts(), release_context.runtime_definitions())
         require(info["source_commit"] == value["source_commit"],
                 "BUILD-INFO must identify the pinned release package source")
         return cls(side, value["source_commit"], binary, module, hashes, info)

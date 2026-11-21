@@ -4,6 +4,7 @@ sys.dont_write_bytecode = True
 from pathlib import Path
 import tempfile
 import release_archive
+import release_context
 import release_format
 import release_inventory
 
@@ -25,9 +26,17 @@ def self_test():
     build = dict(version='0.0.1-hourly.2026111409', target='x86_64-unknown-linux-gnu', source_commit='a' * 40,
                  core_version='0.0.1-hourly.2026111408', core_source_commit='b' * 40,
                  app_version='0.0.1-rc.2', app_source_commit='c' * 40, **{'data_epoch': 1, 'update_protocol': 1})
-    assert release_format.verify_build_info(build, {'data_epoch': 1, 'update_protocol': 1}) == build
-    rejects(lambda: release_format.verify_build_info(build | {'data_epoch': 2}, {'data_epoch': 1, 'update_protocol': 1}))
-    rejects(lambda: release_format.verify_build_info(build | {'core_source_commit': 'invalid'}, {'data_epoch': 1, 'update_protocol': 1}))
+    runtime = release_context.runtime_definitions()
+    contracts = {'data_epoch': 1, 'update_protocol': 1}
+    assert release_format.verify_build_info(build, contracts, runtime) == build
+    rejects(lambda: release_format.verify_build_info(build | {'data_epoch': 2}, contracts, runtime))
+    rejects(lambda: release_format.verify_build_info(build | {'core_source_commit': 'invalid'}, contracts, runtime))
+    try:
+        release_format.verify_build_info(build | {'target': []}, contracts, runtime)
+    except ValueError as error:
+        assert str(error) == 'unsupported build target'
+    else:
+        raise AssertionError('invalid build target was accepted')
     def pin(app, version_value, source):
         return {'tag': f'{app}-v{version_value}', 'version': version_value, 'source_commit': source, 'manifest_sha256': 'd' * 64}
     pins = {'core': pin('core', build['core_version'], 'b' * 40), 'app': pin('app', build['app_version'], 'c' * 40)}

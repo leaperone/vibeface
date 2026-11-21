@@ -1,6 +1,8 @@
 """AUTO-16 Wave 0 runtime contract adapter and fixture conformance self-test.
 
-This module is intentionally a test adapter. Release validators and installers remain unchanged.
+This module is intentionally a test adapter. It also drives the pure Python
+release verifier against the canonical BUILD-INFO corpus without loading files
+from the verifier itself.
 """
 import json
 import re
@@ -89,6 +91,7 @@ def check_seal(item):
 
 def run_runtime_corpus(runtime=None):
     runtime = runtime or load_runtime()
+    definitions = release_format.load_runtime_definitions(runtime)
     outcomes = []
     def run(item, operation):
         accepted, error = True, 'ok'
@@ -100,6 +103,18 @@ def run_runtime_corpus(runtime=None):
             raise AssertionError(f"{item['id']}: expected {item['accepted']}/{item['error']}, got {accepted}/{error}")
         outcomes.append(result)
     for item in runtime['cases']['build_info']:
+        # Keep the adapter's error taxonomy above, but also execute every
+        # canonical BUILD-INFO object through the production verifier.  This
+        # prevents the corpus from proving only a shadow parser.
+        try:
+            value = (json.loads(item['raw'], object_pairs_hook=duplicate_pairs)
+                     if item['kind'] == 'build-info-raw' else item['input'])
+            release_format.verify_build_info(value, runtime['contracts'], definitions)
+            actual = True
+        except Exception:
+            actual = False
+        if actual != item['accepted']:
+            raise AssertionError(f"{item['id']}: production BUILD-INFO verifier acceptance drift")
         run(item, lambda item=item: check_build_raw(item['raw'], runtime) if item['kind'] == 'build-info-raw' else check_build_info(item['input'], runtime))
     for item in runtime['cases']['files']: run(item, lambda item=item: check_files(item['raw']))
     for item in runtime['cases']['roles']: run(item, lambda item=item: check_role(item['files'], item['target'], item['role'], runtime))

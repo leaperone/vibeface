@@ -454,7 +454,7 @@ jobs:
           sys.path.insert(0, "scripts")
           import release_format
           import release_context
-          release_format.verify_build_info(info, release_context.contracts())
+          release_format.verify_build_info(info, release_context.contracts(), release_context.runtime_definitions())
           assert info["update_protocol"] == protocol and info["data_epoch"] == epoch
           assert info["source_commit"] == os.environ["GITHUB_SHA"]
           assert info["target"] == os.environ["PACKAGE_TARGET"]
