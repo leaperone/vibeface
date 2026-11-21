@@ -60,7 +60,6 @@ function decode(value: unknown, physicalKey: unknown, nested = false): OutboxIte
     if (result.params.project) validTarget(result.params.project.target_node)
   }
   if (result.method === 'workspace_command') {
-    if (nested && result.prerequisite !== undefined) fail()
     if (result.command_rejection !== undefined) {
       const rejection = parseWorkspaceCommandNotSaved(result.command_rejection, result.params.command_id)
       if (!rejection) fail()
@@ -68,6 +67,7 @@ function decode(value: unknown, physicalKey: unknown, nested = false): OutboxIte
     }
   }
   if (result.method === 'message') {
+    if (nested && result.prerequisite !== undefined) fail()
     if (!['saved', 'uploading', 'submitting', 'accepted', 'unknown'].includes(result.delivery)) fail()
     if (result.entry_device_id !== undefined) validTarget(result.entry_device_id)
     if ((result.delivery === 'unknown' || result.delivery === 'submitting') && result.entry_device_id === undefined) fail()

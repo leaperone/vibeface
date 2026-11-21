@@ -53,6 +53,9 @@ import { createChatDrafts } from '../../../../../apps/mobile/src/platform/chat-d
 import * as conversationCache from '@vibeface/client/workspace/conversation-cache.ts'
 import * as systemNotifications from '@vibeface/client/workspace/system-notifications.ts'
 
+const isMessageOutbox = (item: OutboxItem): item is OutboxRecord<'message'> => item.method === 'message'
+const isWorkspaceCommandOutbox = (item: OutboxItem): item is OutboxRecord<'workspace_command'> => item.method === 'workspace_command'
+
 test("bulk inbox actions re-arm focus after an intervening list update", () => {
   const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "pending-section.tsx"), "utf8")
   const start = source.indexOf("const action = async (kind")
@@ -430,7 +433,7 @@ test("workspace preserves bot and message requests while routing native decision
         assert.ok(head)
         const original = messages[firstMessage]
         assert.ok(original)
-        const item = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === head.message_id)
+        const item = [...outboxItems.values()].find((item): item is OutboxRecord<'message'> => isMessageOutbox(item) && item.params.message_id === head.message_id)
         assert.ok(item)
         assert.equal(item.entry_device_id, entry, 'the first call must already have a durable original entry binding')
         assert.equal(item.delivery, 'unknown')
@@ -546,7 +549,7 @@ test("workspace preserves bot and message requests while routing native decision
             return receipt
           }
           platform.outbox = { ...originalOutbox, put: async (next) => {
-            if (holdWrite && next.key === item.key && next.rejection_code === 'input_not_saved') {
+            if (holdWrite && isMessageOutbox(next) && next.key === item.key && next.rejection_code === 'input_not_saved') {
               holdWrite = false; writing.resolve(undefined); await resume.promise
             }
             await originalOutbox.put(next)
@@ -561,7 +564,7 @@ test("workspace preserves bot and message requests while routing native decision
             await drainOutbox()
             resume.resolve(undefined)
             await Promise.all([negative, positive])
-            const latest = (await memoryOutbox.all()).find((entry) => entry.key === item.key)
+            const latest = (await memoryOutbox.all()).find((entry): entry is OutboxRecord<'message'> => isMessageOutbox(entry) && entry.key === item.key)
             if (result === 'history' || result === 'workspace_history') assert.equal(latest, undefined, 'history admission cannot be undone by an earlier absence write')
             else {
               assert.ok(latest)
@@ -573,7 +576,7 @@ test("workspace preserves bot and message requests while routing native decision
               if (result === 'unknown') {
                 firstQuery = true
                 assert.deepEqual(await render().queryInput(input), receipt, 'retained input knowledge outranks a later absence response')
-                assert.equal((await memoryOutbox.all()).find((entry) => entry.key === item.key)?.receipt?.stage, 'unknown')
+                assert.equal((await memoryOutbox.all()).find((entry): entry is OutboxRecord<'message'> => isMessageOutbox(entry) && entry.key === item.key)?.receipt?.stage, 'unknown')
               }
             }
           } finally { resume.resolve(undefined); await Promise.allSettled([negative, positive]); platform.outbox = originalOutbox }
@@ -850,12 +853,12 @@ test("workspace preserves bot and message requests while routing native decision
       await pressInput('查询结果')
       const unresolved = render().pendingMessages.find((item) => item.message_id === pending.message_id)
       assert.equal(unresolved?.delivery, 'unknown', 'an old refused receipt cannot confirm the lost Release')
-      const retained = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === pending.message_id)
+      const retained = [...outboxItems.values()].find((item): item is OutboxRecord<'message'> => isMessageOutbox(item) && item.params.message_id === pending.message_id)
       assert.ok(retained)
       assert.deepEqual(retained.params, messages[0], 'original ID, signature, sequence and attachments stay unchanged')
       assert.equal(signed.filter((value) => value.includes('"type":"input_posted"') && value.includes(pending.message_id)).length, 1)
       assert.equal(inputReleases.length, 1)
-      const retainedControl = [...outboxItems.values()].find((item) => item.method === 'workspace_command')
+      const retainedControl = [...outboxItems.values()].find(isWorkspaceCommandOutbox)
       assert.ok(retainedControl); assert.deepEqual(retainedControl.params, inputReleases[0], 'the unknown Release retains its original signed control request')
       inputControlEvent = 'd'.repeat(64); inputQuerySafe = false; inputQueryStage = 'entry_accepted'
       await pressInput('查询结果')
@@ -1787,7 +1790,7 @@ test("workspace preserves bot and message requests while routing native decision
         await render().retryPendingMessage(head.message_id)
         assert.equal(inputReleases.length, releases, 'safe=false cannot release a cancelled input')
         assert.equal(messages.slice(before).filter((message) => message.message_id === head.message_id).length, 1)
-        const saved = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === head.message_id)
+        const saved = [...outboxItems.values()].find((item): item is OutboxRecord<'message'> => isMessageOutbox(item) && item.params.message_id === head.message_id)
         assert.ok(saved)
         inputQueryStage = 'unknown'
         await assert.rejects(render().releaseMessagePending(head.message_id))
@@ -1846,7 +1849,7 @@ test("workspace preserves bot and message requests while routing native decision
         const request = nodeSettings.record(JSON.parse(JSON.stringify(await requested.promise)))
         assert.equal(typeof request.command_id, 'string')
         const original = messages[before]
-        const releasing = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === head.message_id)
+        const releasing = [...outboxItems.values()].find((item): item is OutboxRecord<'message'> => isMessageOutbox(item) && item.params.message_id === head.message_id)
         assert.ok(releasing); assert.equal(releasing.delivery, 'unknown'); assert.equal(releasing.release_expected_event, receipt.control_event); assert.equal(releasing.release_command_id, request.command_id)
         await assert.rejects(render().releaseMessagePending(head.message_id))
         assert.ok(outboxItems.has(releasing.key), 'an in-flight Release cannot be dismissed')
@@ -1864,8 +1867,8 @@ test("workspace preserves bot and message requests while routing native decision
         const [completed] = await recovery
         await settleComponent()
         assert.ok(inputReceiptQueries.slice(queries).some((query) => query.message_id === head.message_id), 'the Release result is followed by a fresh query of the original input')
-        const checked = [...outboxItems.values()].find((item) => item.method === 'message' && item.params.message_id === head.message_id)
-        const control = [...outboxItems.values()].find((item) => item.method === 'workspace_command' && item.params.command_id === request.command_id)
+        const checked = [...outboxItems.values()].find((item): item is OutboxRecord<'message'> => isMessageOutbox(item) && item.params.message_id === head.message_id)
+        const control = [...outboxItems.values()].find((item): item is OutboxRecord<'workspace_command'> => isWorkspaceCommandOutbox(item) && item.params.command_id === request.command_id)
         assert.ok(checked); assert.deepEqual(checked.params, original, 'the original ID, signature, sequence and attachments are unchanged')
         assert.ok(control); assert.deepEqual(control.params, request, 'the original signed Release request remains durable')
         if (outcome === 'not_saved') {
