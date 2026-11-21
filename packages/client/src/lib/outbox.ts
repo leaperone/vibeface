@@ -5,25 +5,36 @@ import type { InputReceipt, WorkspaceCommandNotSaved } from '../workspace/types.
  * Signed writes the entry has not confirmed. A write is kept byte-for-byte until the network
  * shows it recorded; it is never re-signed or sent to a different conversation.
  */
-type OutboxMetadata = {
+type OutboxBase<M extends WriteMethod> = {
   key: string
   scope_id: string
   created_at_ms: number
+  method: M
+  params: SignedRequest<M>
   rejected?: string
+}
+
+type MessageOutbox = OutboxBase<'message'> & {
   rejection_code?: 'input_not_saved' | 'input_conflict' | 'input_missing'
   /** Local message bytes stay here until the Node has the signed input. */
   uploads?: { hash: string; size: number; name: string; data: string }[]
-  delivery?: 'saved' | 'uploading' | 'submitting' | 'accepted' | 'unknown'
+  delivery: 'saved' | 'uploading' | 'submitting' | 'accepted' | 'unknown'
   /** Bound before the first message call; an uncertain request never changes entry. */
   entry_device_id?: string
   receipt?: InputReceipt
   release_expected_event?: string
   release_command_id?: string
-  command_rejection?: WorkspaceCommandNotSaved
   prerequisite?: OutboxRecord<'workspace_command'>
 }
 
-export type OutboxRecord<M extends WriteMethod> = OutboxMetadata & { method: M; params: SignedRequest<M> } & (M extends 'message' ? { delivery: NonNullable<OutboxMetadata['delivery']> } : {})
+type WorkspaceCommandOutbox = OutboxBase<'workspace_command'> & { command_rejection?: WorkspaceCommandNotSaved }
+type ControlMemoryOutbox = OutboxBase<'control_memory'>
+type SignedMutationOutbox<M extends Exclude<WriteMethod, 'message' | 'workspace_command' | 'control_memory'>> = OutboxBase<M>
+
+export type OutboxRecord<M extends WriteMethod> = M extends 'message' ? MessageOutbox
+  : M extends 'workspace_command' ? WorkspaceCommandOutbox
+  : M extends 'control_memory' ? ControlMemoryOutbox
+  : SignedMutationOutbox<Exclude<M, 'message' | 'workspace_command' | 'control_memory'>>
 export type OutboxItem = { [M in WriteMethod]: OutboxRecord<M> }[WriteMethod]
 
 export const outboxCorruptNotice = '本地待确认记录损坏，已暂停发送。请保留应用数据以恢复原记录。'

@@ -88,6 +88,24 @@ test('wrong scope, physical key, signer, unsafe numbers and extra signed fields 
   f.store.reset(); f.native.getAllKeys = () => ['outbox:missing']; await assert.rejects(f.store.all(), OutboxCorruptError)
 })
 
+test('variant metadata cannot cross message, workspace command and ordinary mutation lanes', async () => {
+  const ordinary = await ack(), input = await message()
+  const command = await signed({ method: 'workspace_command', params: { command_id: '', command: { kind: 'control_input', message_id: 'm1', expected_event: 'd'.repeat(64), action: { kind: 'cancel' } } } })
+  const memory = await signed({ method: 'control_memory', params: { conversation_id: 'chat', memory_id: 'memo', base: { epoch: 1, version: null }, after: '记忆', operation_id: '' } })
+  const variants = [
+    { ...ordinary, receipt: {} },
+    { ...command, uploads: [] },
+    { ...memory, command_rejection: {} },
+    { ...input, command_rejection: {} },
+  ]
+  for (const value of variants) {
+    const f = fixture()
+    f.raw.set('outbox:' + value.key, JSON.stringify(value))
+    await assert.rejects(f.store.all(), OutboxCorruptError)
+    assert.deepEqual(f.mutations, [])
+  }
+})
+
 test('message receipt, mandatory delivery and uploaded bytes are checked before submit', async () => {
   const good = await message()
   const variants = [{ ...good, delivery: undefined }, { ...good, delivery: 'unknown' }, { ...good, uploads: [{ hash: 'd'.repeat(64), size: 1, name: 'x', data: '%%%' }] }, { ...good, receipt: { message_id: 'other', target: { kind: 'bot_main', bot_id: 'bot' }, stage: 'unknown', actual_turn_id: null, reason: null, retry_safe: false, control_event: null } }]

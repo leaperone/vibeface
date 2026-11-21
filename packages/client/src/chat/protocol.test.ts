@@ -3,7 +3,7 @@ import test from 'node:test'
 import { awaitsDevice, botReach, botCanSend, canRetryJob, inputEventBody, inputTargetKey, inputTaskCommand, runtimeLabel, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, promptIntent, replyStatusLabel, retryText, reachDevice } from './protocol.ts'
 import type { ManagerJob, TurnRuntime } from '../workspace/types.ts'
 import { parseInputReceipt, parseMessageRequest, parseNodes, parsePendingMessage, parseTurnRuntime, parseWorkspaceCommand, parseWorkspaceCommandNotSaved, parseWorkspaceHistory, parseWorkspaceState, record } from '../workspace/model.ts'
-import { enqueue, type OutboxItem } from '../lib/outbox.ts'
+import { enqueue, type OutboxItem, type OutboxRecord } from '../lib/outbox.ts'
 
 const prepareMainSend = (input: Omit<Parameters<typeof prepareSend>[0], 'target' | 'sequence'>) => prepareSend({ ...input, target: { kind: 'bot_main', bot_id: 'bot' }, sequence: 1 })
 
@@ -115,12 +115,14 @@ test('a persisted unknown input retains the original signature, attachment bytes
   await enqueue(store, item)
   assert.deepEqual(await enqueue(store, { ...item, delivery: 'saved', uploads: [] }), item)
   const restored = parsePendingMessage((await store.all())[0])
+  const restoredItem = (await store.all()).find((entry): entry is OutboxRecord<'message'> => entry.method === 'message')
+  assert.ok(restoredItem)
   assert.equal(restored.message_id, item.params.message_id)
   assert.equal(restored.delivery, 'unknown')
   assert.deepEqual(restored.target, { kind: 'task', task_id: 'task' })
   assert.deepEqual(restored.attachments, [attachment])
-  assert.deepEqual((await store.all())[0].params, item.params)
-  assert.deepEqual((await store.all())[0].uploads, item.uploads)
+  assert.deepEqual(restoredItem.params, item.params)
+  assert.deepEqual(restoredItem.uploads, item.uploads)
   const releasing = parsePendingMessage({ ...item, release_expected_event: 'a'.repeat(64), release_command_id: 'c'.repeat(64) })
   assert.equal(releasing.release_expected_event, 'a'.repeat(64))
   assert.equal(releasing.release_command_id, 'c'.repeat(64))
@@ -132,7 +134,7 @@ test('a persisted unknown input retains the original signature, attachment bytes
   assert.equal(parseInputReceipt({ ...safe, control_event: 'A'.repeat(64) }).control_event, 'A'.repeat(64))
   for (const control_event of [undefined, null, 1, '', 'a'.repeat(63), 'g'.repeat(64)]) assert.throws(() => parseInputReceipt({ ...safe, control_event }))
   assert.throws(() => parseInputReceipt({ ...receipt, control_event: undefined }))
-  for (const rejection_code of ['input_not_saved', 'input_conflict', 'input_missing'] satisfies NonNullable<OutboxItem['rejection_code']>[]) assert.equal(parsePendingMessage({ ...item, rejection_code }).rejection_code, rejection_code)
+  for (const rejection_code of ['input_not_saved', 'input_conflict', 'input_missing'] satisfies NonNullable<OutboxRecord<'message'>['rejection_code']>[]) assert.equal(parsePendingMessage({ ...item, rejection_code }).rejection_code, rejection_code)
   assert.throws(() => parseInputReceipt({ ...receipt, stage: 'read' }))
   for (const stage of ['unknown', 'submitting', 'provider_accepted', 'associated']) assert.throws(() => parseInputReceipt({ ...safe, stage }))
 })
