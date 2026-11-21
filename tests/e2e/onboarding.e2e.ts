@@ -31,6 +31,12 @@ cursorTest('automatically connects Cursor using only the official CLI subscripti
   await expect(signedIn).not.toBeChecked();
   assert.deepEqual(await cursor.inspect(), { selected_official: true, bot_enabled: false, execution: [], prompts: 0 });
   await app.screenshot('cursor-cli-authenticated-model-unverified');
+  // A pick is only a draft; 下一步 makes the write and moves on.
+  await signedIn.check();
+  assert.equal((await cursor.inspect()).bot_enabled, false);
+  await screen.getByRole('button', '下一步').click();
+  await expect(screen.getByRole('heading', '创建第一个 Bot')).toBeVisible();
+  assert.equal((await cursor.inspect()).bot_enabled, true);
 });
 
 test('creates a persistent Bot without a model and shows triage budget state', async ({ app, node, screen, browser }) => {
