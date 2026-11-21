@@ -1028,7 +1028,7 @@ test('native composer preserves local input and visible blockers with compact ch
 
 test('native private files preserve sealed records and external originals while erase fences delayed pickers and retries failed deletes', async () => {
   const fixture = nativeFileFixture()
-  const app = componentHarness('./files.ts', { 'expo-file-system': fixture.native, 'react-native-mmkv': fixture.mmkv, '@vibeface/client/lib/node.ts': nodeSettings, './legacy-recovery': { isLegacyRecoveryFile } }, { crypto, TextDecoder, Uint8Array })
+  const app = componentHarness(new URL('./files.ts', import.meta.url).href, { 'expo-file-system': fixture.native, 'react-native-mmkv': fixture.mmkv, '@vibeface/client/lib/node.ts': nodeSettings, './legacy-recovery': { isLegacyRecoveryFile } }, { crypto, TextDecoder, Uint8Array })
   const { privateFiles } = app.module as typeof import('./files.ts')
   const source = new fixture.native.File('file:///provider/original.json'), exported = new fixture.native.File('file:///export/kept.json')
   source.writeSync('original'); exported.writeSync('external export')
@@ -1039,7 +1039,7 @@ test('native private files preserve sealed records and external originals while 
   const externalRecovery = new fixture.native.File('file:///export/vibeface-recovery-ABCDEF12-2026-11-08.json')
   earlier.writeSync(envelope); similar.writeSync(envelope); nonRecovery.writeSync('{"user":"notes"}'); externalRecovery.writeSync(envelope)
   privateFiles.recoveryStorage.write('sealed copy with index')
-  const reloaded = componentHarness('./files.ts', { 'expo-file-system': fixture.native, 'react-native-mmkv': fixture.mmkv, '@vibeface/client/lib/node.ts': nodeSettings, './legacy-recovery': { isLegacyRecoveryFile } }, { crypto, TextDecoder, Uint8Array })
+  const reloaded = componentHarness(new URL('./files.ts', import.meta.url).href, { 'expo-file-system': fixture.native, 'react-native-mmkv': fixture.mmkv, '@vibeface/client/lib/node.ts': nodeSettings, './legacy-recovery': { isLegacyRecoveryFile } }, { crypto, TextDecoder, Uint8Array })
   assert.equal((reloaded.module as typeof import('./files.ts')).privateFiles.recoveryStorage.read(), 'sealed copy with index')
   fixture.fail('recovery-write')
   assert.throws(() => privateFiles.recoveryStorage.write('not committed'), /controlled write failure/)
@@ -1088,14 +1088,14 @@ test('native private files preserve sealed records and external originals while 
 
 test('native system notification events keep typed destinations and clear navigation on erase', async () => {
   const fixture = nativeFileFixture()
-  const owned = componentHarness('./files.ts', { 'expo-file-system': fixture.native, 'react-native-mmkv': fixture.mmkv, '@vibeface/client/lib/node.ts': nodeSettings, './legacy-recovery': { isLegacyRecoveryFile } }, { crypto, TextDecoder, Uint8Array })
+  const owned = componentHarness(new URL('./files.ts', import.meta.url).href, { 'expo-file-system': fixture.native, 'react-native-mmkv': fixture.mmkv, '@vibeface/client/lib/node.ts': nodeSettings, './legacy-recovery': { isLegacyRecoveryFile } }, { crypto, TextDecoder, Uint8Array })
   const { privateFiles } = owned.module as typeof import('./files.ts')
   type Response = { notification: { date: number; request: { identifier: string; content: { data: { destination: NotificationDestination } } } }; actionIdentifier: string }
   let response: ((value: Response) => void) | undefined
   let dismissed = 0, forgotten = 0
   const storage = new Map<string, string>()
   const scheduled: unknown[] = []
-  const app = componentHarness('./index.ts', {
+  const app = componentHarness(new URL('./index.ts', import.meta.url).href, {
     'react-native': { Platform: { OS: 'ios', isPad: false }, AppState: { currentState: 'active', addEventListener: () => ({ remove() {} }) } },
     'expo-file-system': fixture.native,
     'expo-notifications': {
