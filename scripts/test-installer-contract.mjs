@@ -1,9 +1,13 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
+import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-const root = path.resolve(new URL('..', import.meta.url).pathname);
+import { fileURLToPath } from 'node:url';
+import { loadRuntimeCorpus } from './runtime-contract.mjs';
+const root = fileURLToPath(new URL('..', import.meta.url));
 const generator = path.join(root, 'scripts/generate-installer-contract.mjs');
 const fixture = path.join(root, 'scripts/fixtures/release-contract.json');
 const run = (...args) => spawnSync(process.execPath, [generator, ...args], { cwd: root, encoding: 'utf8' });
@@ -20,6 +24,7 @@ for (const [name, text] of [['install.sh', bash], ['scripts/install.ps1', ps]]) 
 // Independent facts from the normative corpus, rather than the renderer output, pin the contract.
 assert.match(bash, /AUTO16_BUILD_FIELDS='version target source_commit update_protocol data_epoch core_version core_source_commit app_version app_source_commit'/);
 assert.match(bash, /AUTO16_BUILD_FIELD_COUNT='9'/);
+assert.match(bash, /AUTO16_BUILD_NUMBER_FIELDS='update_protocol data_epoch'/);
 assert.match(bash, /AUTO16_DATA_EPOCH='1'/);
 assert.match(bash, /AUTO16_UPDATE_PROTOCOL='1'/);
 assert.match(bash, /AUTO16_TARGET_DARWIN_ARM64='aarch64-apple-darwin'/);
@@ -60,3 +65,63 @@ try {
 } finally { fs.writeFileSync(fixture, originalCorpus); }
 assert.equal(run('--check').status, 0, 'fixtures restored after negative tests');
 console.log('Installer contract generator self-test passed');
+
+function checkInstallerResult(test, result) {
+  assert.ifError(result.error);
+  assert.equal(result.status, test.accepted ? 0 : 1, test.id + ': ' + result.stderr);
+}
+
+const runtime = loadRuntimeCorpus(fixture);
+const posixTargets = new Set(runtime.targets.filter(row => row.service_suffix === 'sh').map(row => row.target));
+const buildCases = runtime.cases.build_info.filter(test => !test.accepted || posixTargets.has(test.input.target));
+const baseline = buildCases.find(test => test.id === 'build-valid-hourly-aarch64-apple-darwin').input;
+const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'vibeface-installer-contract-'));
+const runInstaller = (...args) => spawnSync('bash', ['-c', 'source "$1"; shift; "$@"', 'installer-contract', bashFile, ...args], {
+  cwd: root, encoding: 'utf8',
+});
+try {
+  const buildFile = path.join(scratch, 'BUILD-INFO.json');
+  const malformed = { id: 'build-missing-comma', accepted: false, kind: 'build-info-raw',
+    raw: JSON.stringify(baseline).replace(',"target"', ' "target"') };
+  for (const test of [...buildCases, malformed]) {
+    const identity = test.accepted ? test.input : baseline;
+    const pins = ['', '', '', '', '', identity.core_version, identity.core_source_commit, identity.app_version, identity.app_source_commit].join('\t');
+    fs.writeFileSync(buildFile, test.kind === 'build-info-raw' ? test.raw : JSON.stringify(test.input));
+    checkInstallerResult(test, runInstaller('verify_build_info', buildFile, identity.version, identity.target, identity.source_commit, scratch, pins));
+  }
+
+  const filesManifest = path.join(scratch, 'FILES.sha256');
+  for (const test of runtime.cases.files) {
+    fs.writeFileSync(filesManifest, test.raw);
+    checkInstallerResult(test, runInstaller('parse_file_checksums', filesManifest));
+  }
+
+  const acceptedSeal = { id: 'seal-valid', accepted: true, listed: ['BUILD-INFO.json', 'vibeface'], actual: ['BUILD-INFO.json', 'vibeface'] };
+  for (const test of [acceptedSeal, ...runtime.cases.seals]) {
+    const bundle = path.join(scratch, test.id);
+    fs.mkdirSync(bundle);
+    for (const name of test.actual) {
+      const destination = path.join(bundle, name);
+      if (test.symlink?.includes(name)) { fs.symlinkSync('BUILD-INFO.json', destination); continue; }
+      if (test.special?.includes(name)) {
+        const fifo = spawnSync('mkfifo', [destination], { encoding: 'utf8' });
+        assert.ifError(fifo.error);
+        assert.equal(fifo.status, 0, fifo.stderr);
+        continue;
+      }
+      fs.writeFileSync(destination, test.changed?.includes(name) ? 'changed\n' : name + '\n');
+    }
+    const manifest = [...test.listed].sort().map(name =>
+      createHash('sha256').update(name + '\n').digest('hex') + '  ' + name + '\n',
+    ).join('');
+    fs.writeFileSync(path.join(bundle, 'FILES.sha256'), manifest);
+    checkInstallerResult(test, runInstaller('verify_file_checksums', bundle, scratch));
+  }
+} finally {
+  fs.rmSync(scratch, { recursive: true, force: true });
+}
+const streamedHelp = spawnSync('bash', ['-s', '--', '--help'], { input: bash, cwd: root, encoding: 'utf8' });
+assert.ifError(streamedHelp.error);
+assert.equal(streamedHelp.status, 0, streamedHelp.stderr);
+assert.match(streamedHelp.stdout, /^Usage: install\.sh/);
+console.log('POSIX installer accepted and rejected ' + buildCases.length + ' shared BUILD-INFO and ' + runtime.cases.files.length + ' FILES.sha256 vectors, plus ' + runtime.cases.seals.length + ' shared seal rejections.');

@@ -80,6 +80,7 @@ function renderSh(model) {
     `readonly AUTO16_DATA_EPOCH=${q(String(runtime.contracts.data_epoch))}`,
     `readonly AUTO16_UPDATE_PROTOCOL=${q(String(runtime.contracts.update_protocol))}`,
     `readonly AUTO16_BUILD_FIELDS=${q(fields.join(' '))}`,
+    `readonly AUTO16_BUILD_NUMBER_FIELDS=${q(fields.filter(field => runtime.build_info.types[field] === 'uint32').join(' '))}`,
     `readonly AUTO16_BUILD_FIELD_COUNT=${q(String(fields.length))}`,
     `readonly AUTO16_NODE_REQUIRED_PATHS=(${nodePaths.map(q).join(' ')})`,
     `readonly AUTO16_TARGET_DARWIN_ARM64=${q(by('aarch64-apple-darwin').target)}`,
