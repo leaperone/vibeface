@@ -39,7 +39,7 @@ export function EmptyState({ icon: Icon, title, description = "", action, classN
   return <ArcEmptyState icon={<Icon aria-hidden="true" />} title={title} description={description} action={action} className={className} />
 }
 export function Steps({ step }: { step: number }) {
-  return <Stepper current={step - 1} compact label={`第 ${step} 步，共 5 步`} steps={[1,2,3,4,5].map(value => ({ id: String(value), label: `第 ${value} 步` }))} />
+  return <Stepper current={step - 1} compact label={`第 ${step} 步，共 5 步`} steps={["节点名称","恢复密码","恢复文件","运行 Bot","第一个 Bot"].map((label,index) => ({ id: String(index + 1), label }))} />
 }
 export function AuthPage({ header, children }: { header?: ReactNode; children: ReactNode }) {
   return <main className={styles.auth}><div className={styles.authBody}><header><Wordmark large />{header}</header>{children}</div></main>

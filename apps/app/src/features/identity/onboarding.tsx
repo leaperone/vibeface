@@ -46,11 +46,11 @@ export function Onboarding() {
   }
   return <AuthPage header={<Steps step={step} />}>
     {step === 4 ? <Panel icon={Bot} title="让这台电脑运行 Bot">
-      <p className="text-sm text-secondary">选一项 AI 服务，让 Bot 在这台电脑上回复消息。也可以先跳过，稍后在「设备」中设置。</p>
+      <p className="text-sm text-secondary">选一项 AI 服务，让 Bot 在这台电脑上回复消息。也可以点「稍后设置」，之后在「设备」中完成。</p>
       <AiSettings onboarding onBot={setBotOn} />
-      <div className="flex justify-between gap-2 border-t pt-4">
-        <Button type="button" variant="ghost" className="-ms-3" onClick={() => setOnboardingStep(5)}>稍后设置</Button>
-        <Button type="button" className="ms-auto" disabled={!botOn} onClick={() => setOnboardingStep(5)}>下一步</Button>
+      <div className="flex justify-end gap-2 border-t pt-4">
+        <Button type="button" variant="ghost" onClick={() => setOnboardingStep(5)}>稍后设置</Button>
+        <Button type="button" disabled={!botOn} onClick={() => setOnboardingStep(5)}>下一步</Button>
       </div>
     </Panel> : <Panel key="bot" icon={MessageSquarePlus} title="创建第一个 Bot">
       <p className="text-sm text-secondary">先给它起个名字，再告诉它你想完成的第一件事。{canReply ? null : " 暂时没有设备能回复，也可以先创建，稍后在「设备」中连接或设置。"}</p>
@@ -61,7 +61,7 @@ export function Onboarding() {
         <div className="flex justify-between gap-2 border-t pt-4">
           <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={() => setOnboardingStep(4)}>上一步</Button>
           <div className="flex gap-2">
-            <Button type="button" variant="ghost" disabled={busy} onClick={done}>跳过</Button>
+            <Button type="button" variant="ghost" disabled={busy} onClick={done}>稍后设置</Button>
             <Button type="submit" disabled={busy || !workspace.writable}><BusyIcon busy={busy} />{canReply ? "开始对话" : "完成"}</Button>
           </div>
         </div>
