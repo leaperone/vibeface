@@ -163,7 +163,7 @@ def workflow_and_installer():
         assert "    needs: plan\n" in block and f"needs.plan.outputs.{output} == 'true'" in block
         assert job in ci_gate.split("    runs-on:", 1)[0]
     web_build = (root / "scripts/build-web.sh").read_text()
-    assert '--filter "vibeface-mobile..."' in web_build, "Web behavior tests read Mobile package helpers"
+    assert '--filter "vibeface-web..."' in web_build, "Web build installs the Web package closure"
     assert "pnpm --filter @vibeface/secure-native run typecheck" not in web_build
     assert "pnpm --filter vibeface-mobile run typecheck" not in web_build
     concurrency = workflow.split("concurrency:\n", 1)[1].split("\npermissions:", 1)[0]
