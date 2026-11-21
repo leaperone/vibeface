@@ -308,7 +308,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
       </form>}
       {newcomer ? <div className="grid justify-items-start gap-0.5 text-sm text-secondary">
         <p className="font-medium">{joinCopy.noComputer}</p>
-        <a href={joinCopy.installGuide} target="_blank" rel="noopener noreferrer" className="underline">{joinCopy.installFirst}</a>
+        <a href={joinCopy.installGuide} target="_blank" rel="noopener noreferrer" className="hit-area relative font-medium text-foreground underline underline-offset-4">{joinCopy.installFirst}</a>
       </div> : null}
     </Panel>
   }

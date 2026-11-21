@@ -57,22 +57,26 @@ export function Onboarding({ networkId, step }: { networkId: string; step: 4 | 5
     {step === 4 ? <Panel icon={Bot} title="让这台电脑运行 Bot">
       <AiSettings onboarding onNext={() => setOnboardingStep(networkId, 5)} />
     </Panel> : <Panel key="bot" icon={MessageSquarePlus} title="创建第一个 Bot">
-      {pending ? <p role="status" className="text-sm text-secondary">{pending.submission?.state === "rejected" ? pendingBotCopy.rejected : pendingBotCopy.unconfirmed}</p>
+      {pending ? <p id="bot-create-pending" role="status" className="text-sm text-secondary">{pending.submission?.state === "rejected" ? pendingBotCopy.rejected : pendingBotCopy.unconfirmed}</p>
         : <p className="text-sm text-secondary">{canReply ? "给它起个名字，创建后会打开和它的对话，在那里交代第一件事。" : "给它起个名字，创建后会打开和它的对话。暂时没有设备能回复，也可以先创建，之后在「设置 → 我的设备」中连接或设置。"}</p>}
       <form className="grid gap-4" noValidate onSubmit={(event) => { event.preventDefault(); if (pending || name.trim()) void create(); else { setNameError("还没填名称"); nameInput.current?.focus() } }}>
-        <div className="grid gap-1.5 text-sm font-medium"><Input label="名称" ref={nameInput} error={nameError} required maxLength={512} value={name} readOnly={Boolean(pending)} disabled={busy} onChange={(event) => { setName(event.target.value); setNameError("") }} /></div>
+        <div className="grid gap-1.5 text-sm font-medium"><Input label="名称" ref={nameInput} error={nameError} required maxLength={512} value={name} readOnly={Boolean(pending)} aria-describedby={pending ? "bot-create-pending" : undefined} disabled={busy} onChange={(event) => { setName(event.target.value); setNameError("") }} /></div>
         {project && shown ? <p className="grid gap-1 text-sm">
           <span className="font-medium">{folderLabels.project}</span>
           <span className="flex min-w-0 items-center gap-1.5"><FolderOpen aria-hidden="true" className="size-4 shrink-0 text-secondary" /><FolderPath path={project.cwd} shown={shown[project.cwd]} /></span>
           <span className="text-secondary">之后可在 Bot 的设置里改</span>
         </p> : null}
         <InlineError error={error} />
-        {readOnly ? <p id="bot-create-status" role="status" className="text-sm text-secondary">{readOnly}</p> : null}
-        <div className="flex justify-between gap-2 border-t pt-4">
-          <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={() => setOnboardingStep(networkId, 4)}>上一步</Button>
-          <div className="flex gap-2">
-            <Button type="button" variant="ghost" disabled={busy} onClick={done}>{pending ? "稍后再试" : "稍后创建"}</Button>
-            <Button type="submit" disabled={busy || !workspace.writable} aria-describedby={readOnly ? "bot-create-status" : undefined}><BusyIcon busy={busy} />{pending ? pendingBotCopy.retry : canReply ? "开始对话" : "完成"}</Button>
+        {/* Always mounted so a reason that appears is read out; empty, it takes no room above the footer. */}
+        <div>
+          <p id="bot-create-status" role="status" className="pb-4 text-sm text-secondary empty:pb-0">{readOnly}</p>
+          {/* Wraps on narrow screens, the primary action staying at the end of the last line. */}
+          <div className="flex flex-wrap justify-between gap-2 border-t pt-4">
+            <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={() => setOnboardingStep(networkId, 4)}>上一步</Button>
+            <div className="ms-auto flex flex-wrap justify-end gap-2">
+              <Button type="button" variant="ghost" disabled={busy} onClick={done}>{pending ? "稍后再试" : "稍后创建"}</Button>
+              <Button type="submit" disabled={busy || !workspace.writable} aria-busy={busy || undefined} aria-describedby={readOnly ? "bot-create-status" : undefined}><BusyIcon busy={busy} />{pending ? pendingBotCopy.retry : canReply ? "开始对话" : "完成"}</Button>
+            </div>
           </div>
         </div>
       </form>
