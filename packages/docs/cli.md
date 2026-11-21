@@ -81,7 +81,7 @@ vibeface chat --bot Assistant --text-file /absolute/path/request.txt --wait --js
 vibeface chat --bot Assistant --stdin --wait --json
 ```
 
-机器模式按行输出 JSON，包括持久操作与最终等待状态。提示与连接诊断写入标准错误。`accepted` 表示输入已接收，不能据此认为工作完成。遇到需要决定的问题、结果未知或等待超时时，命令保留原始消息 ID，并以非零状态结束。超时不重发输入。
+机器模式按行输出 JSON，包括持久操作与最终等待状态。提示与连接诊断写入标准错误。`accepted` 表示输入已接收，不能据此认为工作完成。遇到需要决定的问题、结果未知或等待超时时，命令保留原始消息 ID，并以非零状态结束。超时不重发输入。输入被 Node 明确拒绝时不会有回复，命令不等待，最终状态为 `failed`，拒绝原因在操作行的 `operation.result.reason` 里。
 
 重试同一输入时保留原 `--message-id`、内容、目标和附件。同 ID 改内容会被拒绝。未知结果先查询原操作：
 

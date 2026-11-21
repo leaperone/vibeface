@@ -2,7 +2,7 @@ use vibeface_control::inspection::{Inspection, NodeIdentity, NodeStatus};
 pub mod release;
 mod service;
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 use service::service_data_matches;
 use service::{Service, ServiceControl};
 #[cfg(windows)]
