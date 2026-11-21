@@ -12,28 +12,31 @@ cursorTest('automatically connects Cursor using only the official CLI subscripti
   await continueRecoverySetup({ screen, browser });
   await finishRecoveryDownload({ screen, browser });
   await expect(screen.getByRole('heading', '让这台电脑运行 Bot')).toBeVisible();
-  const card = screen.getByRole('listitem').filter({ has: screen.getByText('Cursor', { exact: true }) });
-  await expect(card.getByText('Cursor 需要在运行设备上完成官方 CLI 订阅登录', { exact: true })).toBeVisible();
-  await expect(card.getByRole('textbox', 'Cursor 登录命令')).toHaveValue(/\/agent' login$/);
-  await expect(card.getByRole('textbox', /密钥|令牌/)).toHaveCount(0);
-  await expect(card.getByRole('link', /获取/)).toHaveCount(0);
-  await expect(card.getByRole('button', 'Cursor 运行 Bot')).toHaveAttribute('aria-pressed', 'false');
-  await expect(card.getByRole('button', 'Cursor 执行任务')).toHaveAttribute('aria-pressed', 'false');
+  // Onboarding only offers the choice; the sign-in note sits in the option and nothing is picked for the owner.
+  const signIn = screen.getByRole('radio', /^Cursor.*Cursor 需要在运行设备上完成官方 CLI 订阅登录，之后在「设置 → 我的设备」中处理$/);
+  await expect(signIn).not.toBeChecked();
+  await expect(screen.getByRole('textbox', /密钥|令牌/)).toHaveCount(0);
+  await expect(screen.getByRole('link', /获取/)).toHaveCount(0);
+  await expect(screen.getByRole('button', '下一步')).toBeDisabled();
   assert.deepEqual(await cursor.inspect(), { selected_official: true, bot_enabled: false, execution: [], prompts: 0 });
   await app.screenshot('cursor-cli-sign-in-required');
   await cursor.login();
   await browser.evaluate(() => window.dispatchEvent(new Event('focus')));
-  await expect(card.getByText('未验证，可尝试', { exact: true })).toBeVisible();
-  await expect(card.getByText('Cursor 尚未确认这个模型，可发送消息或先检查可用性', { exact: true })).toBeVisible();
-  await expect(card.getByText('Cursor 需要在运行设备上完成官方 CLI 订阅登录', { exact: true })).toHaveCount(0);
-  await expect(card.getByRole('textbox', 'Cursor 登录命令')).toHaveCount(0);
+  const signedIn = screen.getByRole('radio', /^Cursor.*未验证，可尝试$/);
+  await expect(signedIn).toBeVisible();
+  await expect(signIn).toHaveCount(0);
   const requests = (await readFile(join(cursor.node.directory, '..', 'cursor-requests.jsonl'), 'utf8')).trim().split('\n').map((line): unknown => JSON.parse(line));
   assert(requests.includes('initialize') && requests.includes('session/new'), 'the signed-in CLI returned its controlled model catalog');
   assert(!requests.includes('session/prompt'), 'catalog observation sends no model prompt');
-  await expect(card.getByRole('button', 'Cursor 运行 Bot')).toHaveAttribute('aria-pressed', 'false');
-  await expect(card.getByRole('button', 'Cursor 执行任务')).toHaveAttribute('aria-pressed', 'false');
+  await expect(signedIn).not.toBeChecked();
   assert.deepEqual(await cursor.inspect(), { selected_official: true, bot_enabled: false, execution: [], prompts: 0 });
   await app.screenshot('cursor-cli-authenticated-model-unverified');
+  // A pick is only a draft; 下一步 makes the write and moves on.
+  await signedIn.check();
+  assert.equal((await cursor.inspect()).bot_enabled, false);
+  await screen.getByRole('button', '下一步').click();
+  await expect(screen.getByRole('heading', '创建第一个 Bot')).toBeVisible();
+  assert.equal((await cursor.inspect()).bot_enabled, true);
 });
 
 test('creates a persistent Bot without a model and shows triage budget state', async ({ app, node, screen, browser }) => {
