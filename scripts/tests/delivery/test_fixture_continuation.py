@@ -3,26 +3,20 @@
 
 from __future__ import annotations
 
-import argparse
-import contextlib
-import errno
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
-import platform
 import re
 import shutil
 import signal
 import stat
 import subprocess
-import sys
 import tempfile
 import time
 import uuid
 import zipfile
-from unittest import TestCase
 
 def run_continuation(subject, manifest, compiled, profile, vectors, proofs):
     if subject is None:

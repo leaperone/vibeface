@@ -15,7 +15,7 @@ function keys(data: Record<string, unknown>, required: string[], optional: strin
   if (required.some(key => !own(data, key) || data[key] === undefined) || Object.keys(data).some(key => !required.includes(key) && !optional.includes(key))) fail()
 }
 /** Compare a domain parser's projection without changing a single stored value or key order. */
-export function exactProjection(raw: unknown, parsed: unknown): void {
+function exactProjection(raw: unknown, parsed: unknown): void {
   if (raw === parsed) return
   if (Array.isArray(raw) && Array.isArray(parsed)) {
     if (raw.length !== parsed.length || Object.keys(raw).length !== raw.length || Object.keys(raw).some((key, index) => key !== String(index))) fail()

@@ -53,7 +53,7 @@ export function ScopeSources({ context }: { context: ContextProjection }) {
   </Card>
 }
 
-export function WorkspaceTaskRow({ task }: { task: WorkspaceTask }) {
+function WorkspaceTaskRow({ task }: { task: WorkspaceTask }) {
   const shared = useLive()
   return <Link href={`/task/${task.task_id}`} asChild><Pressable accessibilityRole="link" accessibilityLabel={`${task.title}，${workspaceTaskStateDescriptor[task.state].label}`} className="min-h-16 gap-2 rounded-panel border border-border bg-surface p-4 active:bg-surface-muted">
     <View className="flex-row items-start gap-2"><Text className="min-w-0 flex-1 font-medium">{task.title}</Text><Text className={cn('text-sm', task.state === 'running' ? 'text-info' : ['needs_reconciliation', 'waiting_user'].includes(task.state) ? 'text-warning' : 'text-muted')}>{workspaceTaskStateDescriptor[task.state].label}</Text><Icon as={ChevronRight} className="size-4 text-muted" /></View>

@@ -133,7 +133,7 @@ function message(value: unknown): TranscriptMessage {
   return { message_id: text(data.message_id), role: text(data.role), text: text(data.text), event_hash: text(data.event_hash), created_at_ms: number(data.created_at_ms), in_reply_to: optionalText(data.in_reply_to), status: data.status == null ? undefined : replyStatus(data.status), ...failure(data.failure), attachments: attachments(data.attachments), answers: optionalText(data.answers), rank: optionalText(data.rank), sender: data.sender == null ? undefined : sender(data.sender), ...(data.target == null ? {} : { target: parseInputTarget(data.target) }) }
 }
 export const mainMessage = (message: Pick<TranscriptMessage, 'target'>) => message.target === undefined || message.target.kind === 'bot_main'
-export const mainQuestion = (question: Pick<Question, 'target'>) => question.target?.kind === 'bot_main'
+const mainQuestion = (question: Pick<Question, 'target'>) => question.target?.kind === 'bot_main'
 function sender(value: unknown) {
   const data = record(value)
   return { conversation_id: text(data.conversation_id), name: text(data.name) }
@@ -157,7 +157,7 @@ function failure(value: unknown): { failure?: FailureKind } {
 function attachments(value: unknown) { return value == null ? undefined : list(value).map((item) => { const file = record(item); return { hash: text(file.hash), size: number(file.size), name: text(file.name) } }) }
 function optionalText(value: unknown): string | undefined { return value == null ? undefined : text(value) }
 function optionalNumber(value: unknown): number | undefined { return value == null ? undefined : number(value) }
-export function parseInputTarget(value: unknown): InputTarget {
+function parseInputTarget(value: unknown): InputTarget {
   const data = record(value)
   switch (data.kind) {
     case 'bot_main': return { kind: data.kind, bot_id: text(data.bot_id) }
@@ -169,7 +169,7 @@ export function parseInputTarget(value: unknown): InputTarget {
     default: throw new Error('输入目标无法识别。')
   }
 }
-export function parseInputIntent(value: unknown): InputIntent {
+function parseInputIntent(value: unknown): InputIntent {
   if (value === 'continue' || value === 'new_task' || value === 'defer') return value
   throw new Error('无法识别这条输入要如何处理。')
 }
@@ -503,7 +503,7 @@ function managerJob(value: unknown): ManagerJob {
     ...(job.context === undefined ? {} : { context: contextProjection(job.context) }),
   }
 }
-export function parseSessionScope(value: unknown): SessionScope {
+function parseSessionScope(value: unknown): SessionScope {
   const data = record(value)
   switch (data.kind) {
     case 'main': return { kind: data.kind }
@@ -1243,7 +1243,7 @@ export function parseTriageSettings(value: unknown): TriageSettings {
 }
 
 export const historySections: HistorySection[] = ['messages', 'works', 'changes', 'questions', 'sessions', 'jobs', 'scope_jobs', 'owner_jobs', 'owner_scope_jobs', 'owner_memory_conflicts', 'checks', 'deliveries', 'unanswered', 'skills', 'schedules', 'memory', 'memory_conflicts', 'memory_sync_conflicts', 'overwritten']
-export function parseHistoryCoverage(value: unknown): HistoryCoverage {
+function parseHistoryCoverage(value: unknown): HistoryCoverage {
   const data = record(value), next_cursor = data.next_cursor === null ? null : text(data.next_cursor), complete = flag(data.complete)
   if (complete !== (next_cursor === null) || next_cursor === '') throw new Error('历史记录的分页范围无效。')
   return { next_cursor, complete }
