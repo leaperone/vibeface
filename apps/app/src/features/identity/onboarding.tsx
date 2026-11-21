@@ -19,7 +19,6 @@ export function Onboarding() {
   const step = useOnboarding() ?? 4
   const [name, setName] = useState("我的 Bot")
   const [busy, setBusy] = useState(false)
-  const [botOn, setBotOn] = useState(false)
   const [error, setError] = useState<unknown>(null)
   const canReply = workspace.nodes.some((node) => botReadiness(node) === "ready" || botReadiness(node) === "unverified" || botReadiness(node) === "starting")
   // The first bot works in this computer's first folder; its panel changes it later.
@@ -46,12 +45,7 @@ export function Onboarding() {
   }
   return <AuthPage header={<Steps step={step} />}>
     {step === 4 ? <Panel icon={Bot} title="让这台电脑运行 Bot">
-      <p className="text-sm text-secondary">选一项 AI 服务，让 Bot 在这台电脑上回复消息。也可以点「稍后设置」，之后在「设备」中完成。</p>
-      <AiSettings onboarding onBot={setBotOn} />
-      <div className="flex justify-end gap-2 border-t pt-4">
-        <Button type="button" variant="ghost" onClick={() => setOnboardingStep(5)}>稍后设置</Button>
-        <Button type="button" disabled={!botOn} onClick={() => setOnboardingStep(5)}>下一步</Button>
-      </div>
+      <AiSettings onboarding onNext={() => setOnboardingStep(5)} />
     </Panel> : <Panel key="bot" icon={MessageSquarePlus} title="创建第一个 Bot">
       <p className="text-sm text-secondary">先给它起个名字，再告诉它你想完成的第一件事。{canReply ? null : " 暂时没有设备能回复，也可以先创建，稍后在「设备」中连接或设置。"}</p>
       <form className="grid gap-4" noValidate onSubmit={(event) => { event.preventDefault(); if (name.trim()) void create(); else setError(new Error("还没填名称")) }}>

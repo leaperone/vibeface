@@ -2582,6 +2582,78 @@ test("automatic connection checks the three local services without changing uses
   })
 })
 
+test('onboarding picks the bot provider with the 运行 Bot write and reads back an unknown result before another pick', async (t) => {
+  for (const outcome of ['chosen', 'unknown', 'unreadable']) await t.test(outcome, async () => {
+    const unverified = { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } } as const
+    const codex: ProviderStatus = {
+      provider: 'codex', authentication_source: 'private_login', roles: [], supports: ['agent', 'execution'], bin: '/fixture/codex', app_server: null,
+      endpoint: null, execution_model: '', execution_readiness: unverified, setup: null, installed: true, home: null, sessions: null, env: [],
+      state: 'off', issues: [], readiness: unverified,
+      probe: { provider: 'codex', config_id: 'fixture', checked_at_ms: null, launch: { state: 'unchecked' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null },
+      observed: { installed: { status: 'confirmed', evidence: 'binary_discovery' }, launchable: { status: 'unknown', evidence: 'launch_prerequisites' }, authenticated: { status: 'unknown', evidence: 'authentication_not_observed' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } },
+    }
+    const claude: ProviderStatus = { ...codex, provider: 'claude', installed: false, probe: { ...codex.probe, provider: 'claude' } }
+    const initial: NodeSettingsResponse = { settings: { roots: [], manager: null }, defaults: { workspace: '/project' }, readiness: { manager: null }, providers: [codex, claude], display_paths: {}, suggested_roots: [] }
+    const chosen: NodeSettingsResponse = { ...initial, providers: [{ ...codex, roles: ['agent', 'execution'] }, claude] }
+    const write = pendingResult(), readback = pendingResult(), calls: { method: string; params: unknown }[] = []
+    const connection = { isCurrent: () => true, request: async (method: string, params?: unknown) => {
+      calls.push({ method, params })
+      return method === 'configure_provider' ? write.promise : calls.length === 1 ? initial : readback.promise
+    } }
+    let next = 0
+    const app = componentHarness('../devices/ai-settings.tsx', {
+      '@vibeface/client/lib/node.ts': nodeSettings,
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: connection }) },
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({ isCurrent: () => true, refresh: async () => {} }) },
+      '@vibeface/client/identity/copy.ts': { deviceCopy },
+      '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') },
+      '@/lib/glossary': { terms: { bot: { icon: 'Bot' }, task: { icon: 'Tasks' } } },
+    }, { window: { addEventListener() {}, removeEventListener() {} } })
+    const render = () => app.render('AiSettings', { onboarding: true, onNext: () => { next++ } })
+    const settle = async () => { for (let turn = 0; turn < 3; turn++) { await settleComponent(); render() } }
+    const choice = () => render().find(({ type }) => type === 'RadioGroup')
+    const nextButton = () => render().find(({ type, props }) => type === 'Button' && elementText(props.children) === '下一步')
+    const pick = () => (choice()?.props.onValueChange as (value: string) => void)('codex')
+    try {
+      render(); await settle()
+      assert.deepEqual(JSON.parse(JSON.stringify(choice()?.props.options)).map((option: { value: string }) => option.value), ['codex'], 'only found services that can run the bot are offered')
+      assert.equal(choice()?.props.value, '')
+      assert.deepEqual(calls.map((call) => call.method), ['node_settings'], 'entering the step neither connects Codex or Claude Code nor picks a service')
+      assert.equal(nextButton()?.props.disabled, true)
+      assert.equal(nextButton()?.props['aria-describedby'], 'bot-choice-status')
+      assert.ok(render().some(({ props }) => props.id === 'bot-choice-status' && elementText(props.children) === '先选一项 AI 服务'), 'the disabled 下一步 says why')
+      pick(); pick()
+      const writes = () => calls.filter((call) => call.method === 'configure_provider')
+      assert.deepEqual(JSON.parse(JSON.stringify(writes())), [{ method: 'configure_provider', params: { provider: 'codex', bot: true, execution: true } }], 'one pick is the same write as 运行 Bot on a fresh device')
+      assert.equal(choice()?.props.value, 'codex', 'the pending pick stays shown')
+      if (outcome === 'chosen') write.resolve(chosen)
+      else write.reject(new Error('client response timed out; outcome may be unknown'))
+      await settle()
+      if (outcome !== 'chosen') {
+        assert.equal(calls.at(-1)?.method, 'node_settings', 'an unknown write is read back instead of resent')
+        pick()
+        assert.equal(writes().length, 1, 'no other pick starts before the read-back')
+        if (outcome === 'unknown') readback.resolve(chosen)
+        else readback.reject(new Error('device read failed'))
+        await settle()
+        assert.ok(render().some(({ type }) => type === 'InlineError'), 'the failed write stays shown')
+      }
+      if (outcome === 'unreadable') {
+        pick()
+        assert.equal(writes().length, 1, 'an unreadable result blocks another pick until it is read again')
+        assert.equal(nextButton()?.props.disabled, true)
+        const action: unknown = render().find(({ type }) => type === 'InlineError')?.props.action
+        assert.ok(action && typeof action === 'object' && 'label' in action && action.label === '重新读取')
+        return
+      }
+      assert.equal(choice()?.props.value, 'codex')
+      assert.equal(nextButton()?.props.disabled, false)
+      nextButton()?.props.onClick?.()
+      assert.equal(next, 1)
+    } finally { app.close() }
+  })
+})
+
 test("compact system provider cards use external service evidence without local prerequisites", async (t) => {
   for (const mode of ['system', 'spawn'] satisfies NonNullable<ProviderStatus['app_server']>['mode'][]) for (const installed of [false, true]) for (const authentication of ['authenticated', 'unverified', 'sign_in_required'] satisfies ProviderStatus['probe']['authentication'][]) await t.test(`${mode} installed=${installed} ${authentication}`, () => {
     const item: ProviderStatus = {
@@ -2600,7 +2672,7 @@ test("compact system provider cards use external service evidence without local 
       '@/lib/glossary': { terms: { bot: { icon: 'Bot' }, task: { icon: 'Tasks' }, secret: { icon: 'Key' } } },
     }, {}, 'ProviderCard')
     try {
-      const elements = app.render('ProviderCard', { item, response, onboarding: false, compact: true, busy: '', models: null, error: '' })
+      const elements = app.render('ProviderCard', { item, response, compact: true, busy: '', models: null, error: '' })
       const summary = elements.find(({ type, props }) => type === 'span' && props.className === 'truncate')
       assert.equal(elementText(summary), mode === 'system' || installed ? '可用' : '未安装', 'the main state follows readiness for system services')
       const diagnostics = elements.find(({ type, props }) => type === 'Details' && props.label === '程序、认证与模型详情')
@@ -2672,7 +2744,7 @@ test("provider cards keep summary readiness, setup and execution details in thei
       '@/components/arc/product-kit': kit,
       '@/components/kit': kit,
     }, {}, name)
-    const props = { item, response, onboarding: false, first: true, busy: '', models: null, error: '' }
+    const props = { item, response, first: true, busy: '', models: null, error: '' }
     try {
       let elements = app.render(name, props)
       if (platform === 'mobile') {
