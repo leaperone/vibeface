@@ -23,6 +23,11 @@ def exact_head_and_clean_tree(directory):
         shutil.copy2(ROOT / "scripts" / name, scripts / name)
     shutil.copytree(ROOT / "scripts/verification", scripts / "verification",
                     ignore=shutil.ignore_patterns("__pycache__"))
+    tests = scripts / "tests"
+    tests.mkdir()
+    shutil.copy2(ROOT / "scripts/tests/__init__.py", tests / "__init__.py")
+    shutil.copytree(ROOT / "scripts/tests/delivery", tests / "delivery",
+                    ignore=shutil.ignore_patterns("__pycache__"))
 
     control = repo / "crates/control/src/lib.rs"
     control.parent.mkdir(parents=True)
