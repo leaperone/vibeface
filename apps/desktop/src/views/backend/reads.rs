@@ -1,6 +1,7 @@
 //! Bounded read workers. Only this actor applies their results; writes keep their own outbox.
 use super::*;
 use crate::views::history::{ApplyResult, PageTicket, SnapshotTicket};
+use vibeface_protocol::workspace::WorkspaceState;
 
 #[derive(Clone, PartialEq, Eq)]
 struct ReadScope {
@@ -85,7 +86,7 @@ struct DeliveryReply {
 struct RefreshReply {
     home: Value,
     nodes: Value,
-    workspace: Value,
+    workspace: WorkspaceState,
     write_state: Value,
     questions: Value,
     notifications: Value,
@@ -306,7 +307,7 @@ impl Backend {
             let result = async {
                 let home = client.read(ReadRequest::Home).await?;
                 let nodes = client.read(ReadRequest::Nodes).await?;
-                let workspace = client.read(ReadRequest::Workspace).await?;
+                let workspace = client.read_workspace_state().await?;
                 let write_state = client.read(ReadRequest::WriteState).await?;
                 let questions = client.read(ReadRequest::Questions).await?;
                 let notifications = client.read(ReadRequest::Notifications).await?;
@@ -722,10 +723,15 @@ impl Backend {
         next.can_configure_owner = self.host.snapshot().selected.is_some();
         next.bots = decode_list(&reply.home, "bots")?;
         next.nodes = decode_list(&reply.nodes, "nodes")?;
-        next.tasks = decode_list(&reply.workspace, "tasks")?;
-        next.assignments = decode_list(&reply.workspace, "assignments")?;
-        next.channels = decode_list(&reply.workspace, "channels")?;
-        next.inputs = decode_list(&reply.workspace, "inputs")?;
+        next.tasks = reply.workspace.tasks.into_iter().map(Into::into).collect();
+        next.assignments = reply.workspace.assignments;
+        next.channels = reply
+            .workspace
+            .channels
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        next.inputs = reply.workspace.inputs;
         next.questions = decode_list(&reply.questions, "questions")?;
         next.notifications = decode_list(&reply.notifications, "notifications")?;
         let mut fresh = true;

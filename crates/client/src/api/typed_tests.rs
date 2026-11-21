@@ -35,6 +35,23 @@ fn strict_client_input_literals_use_the_public_sdk_boundary() {
 }
 
 #[test]
+fn workspace_state_uses_the_shared_public_read_dto() {
+    let minimal = json!({
+        "inputs": [],
+        "channels": [],
+        "tasks": [],
+        "assignments": [],
+        "coverage": {"limit": 256, "truncated": false}
+    });
+    let decoded = decode_workspace_state(minimal.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), minimal);
+
+    let mut unknown = minimal;
+    unknown["extra"] = json!(true);
+    assert!(decode_workspace_state(unknown).is_err());
+}
+
+#[test]
 fn typed_documents_preserve_domain_tags_and_reject_unknown_fields() -> Result<()> {
     let schedule =
         json!({"type":"schedule","conversation_id":"chat","schedule_id":"s1","action":"pause"});
