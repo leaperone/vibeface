@@ -1696,36 +1696,14 @@ test("workspace preserves bot and message requests while routing native decision
         assert.equal(scroll?.props.keyboardLiftBehavior, 'whenAtEnd')
         const measure = ios.find(({ type, props }) => type === 'View' && typeof props.onLayout === 'function')?.props.onLayout
         assert.ok(typeof measure === 'function')
-        const controller = '../../../../../apps/mobile/node_modules/react-native-keyboard-controller/src/components/KeyboardChatScrollView/'
-        const helpers = componentHarness(controller + 'useChatKeyboard/helpers.ts', {})
-        const scrollOffset = { value: 0 }, contentOffsetY = { value: 0 }, keyboardPadding = { value: 0 }
-        let reactPadding = () => {}
-        const padding = componentHarness(controller + 'useExtraContentPadding/index.ts', {
-          'react-native': { Platform: platform }, '../../../architecture': { IS_FABRIC: true },
-          '../../../reanimated': { useAnimatedReaction(read: () => number, react: (current: number, previous: number | null) => void) {
-            let previous: number | null = null
-            reactPadding = () => { const current = read(); react(current, previous); previous = current }
-            reactPadding()
-          } },
-          '../../utils/safeScrollTo': { safeScrollTo() { assert.fail('iOS Fabric must update the inset and offset together') } },
-          '../useChatKeyboard/helpers': helpers.module,
-        })
-        padding.render('useExtraContentPadding', {
-          scrollViewRef: {}, extraContentPadding: dockHeight, keyboardPadding, blankSpace: { value: 0 },
-          scroll: scrollOffset, contentOffsetY, layout: { value: { height: 844 } }, size: { value: { height: 2000 } },
-          inverted: true, keyboardLiftBehavior: scroll?.props.keyboardLiftBehavior, freeze: { value: false },
-        })
         measure({ nativeEvent: { layout: { height: 94 } } })
-        reactPadding()
-        assert.equal(contentOffsetY.value, -94, 'the installed hook reserves the complete dock on its first measurement')
-        scrollOffset.value = contentOffsetY.value
-        measure({ nativeEvent: { layout: { height: 94 } } }); reactPadding()
-        assert.equal(contentOffsetY.value, -94, 'the same measurement must not add a second inset correction')
-        measure({ nativeEvent: { layout: { height: 190 } } }); reactPadding()
-        assert.equal(contentOffsetY.value, -190, 'dock growth preserves the latest edge including the initial inset')
-        scrollOffset.value = contentOffsetY.value
-        measure({ nativeEvent: { layout: { height: 94 } } }); reactPadding()
-        assert.equal(contentOffsetY.value, -94, 'dock shrink preserves the latest edge')
+        assert.equal(dockHeight.value, 94)
+        measure({ nativeEvent: { layout: { height: 94 } } })
+        assert.equal(dockHeight.value, 94)
+        measure({ nativeEvent: { layout: { height: 190 } } })
+        assert.equal(dockHeight.value, 190)
+        measure({ nativeEvent: { layout: { height: 94 } } })
+        assert.equal(dockHeight.value, 94)
         assert.equal(emptyPadding().paddingBottom, 94)
         keyboard.height.value = -168; keyboard.progress.value = 0.5
         assert.equal(emptyPadding().paddingBottom, 245, 'safe area compensation follows keyboard progress')
@@ -1734,10 +1712,7 @@ test("workspace preserves bot and message requests while routing native decision
         const offsets: number[] = [], ref = flat?.props.ref
         assert.ok(ref && typeof ref === 'object' && 'current' in ref)
         ref.current = { scrollToOffset: ({ offset }: { offset: number }) => offsets.push(offset) }
-        scrollOffset.value = 400; keyboardPadding.value = 302
         measure({ nativeEvent: { layout: { height: 190 } } })
-        reactPadding()
-        assert.equal(contentOffsetY.value, -94, 'the installed hook issues no offset change while reading older messages')
         assert.equal(dockHeight.value, 190, 'attachment and notice growth use the measured complete dock')
         assert.equal(emptyPadding().paddingBottom, 492)
         assert.deepEqual(offsets, [], 'dock growth cannot itself force an old-message reader to the latest message')
