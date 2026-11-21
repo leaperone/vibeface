@@ -2648,7 +2648,7 @@ test('onboarding saves the picked bot provider only on 下一步 and reads back 
       if (outcome === 'unreadable') readback.reject(new Error('device read failed'))
       else readback.resolve(outcome === 'applied' ? chosen : initial)
       await settle()
-      assert.ok(render().some(({ type }) => type === 'InlineError'), 'the failed write stays shown')
+      assert.equal(render().some(({ type }) => type === 'InlineError'), outcome !== 'applied', 'the failed write stays shown unless the read-back shows it took effect')
       assert.equal(choice()?.props.value, 'codex', 'the pick stays')
       assert.equal(next, 0, 'a failed write keeps the step')
       assert.equal(button('稍后设置')?.props.disabled, false)
@@ -2657,8 +2657,13 @@ test('onboarding saves the picked bot provider only on 下一步 and reads back 
         assert.equal(writes().length, 1, 'an unreadable result blocks another try until it is read again')
         assert.equal(button('下一步')?.props.disabled, true)
         assert.equal(status(), '重新读取后才能继续')
-        const action: unknown = render().find(({ type }) => type === 'InlineError')?.props.action
-        assert.ok(action && typeof action === 'object' && 'label' in action && action.label === '重新读取')
+        ;(button('重新读取')?.props.onClick as () => void)()
+        assert.ok(!render().some(({ type }) => type === 'InlineError'), 'the read clears the error')
+        assert.equal(button('重新读取')?.props.loading, true, 'the pressed button stays, busy, so focus stays on it')
+        assert.equal(status(), '正在重新读取这台电脑的 AI 服务')
+        await settle()
+        assert.equal(button('重新读取')?.props.loading, false)
+        assert.equal(status(), '重新读取后才能继续', 'a read that fails again keeps the step blocked')
         return
       }
       if (outcome === 'applied') assert.equal(status(), 'Codex 已设为运行 Bot')
@@ -2707,8 +2712,8 @@ test('onboarding keeps the unasked Cursor check quiet unless only reading again 
         assert.equal(status, '先选一项 AI 服务')
         return
       }
-      const action: unknown = shown?.props.action
-      assert.ok(action && typeof action === 'object' && 'label' in action && action.label === '重新读取', 'an unknown result comes with the one action that clears it')
+      assert.ok(shown, 'the failed check is shown when only reading again clears it')
+      assert.ok(elements.some(({ type, props }) => type === 'Button' && elementText(props.children) === '重新读取'), 'an unknown result comes with the one action that clears it')
       assert.equal(status, '重新读取后才能继续')
     } finally { app.close() }
   })
