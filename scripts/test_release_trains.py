@@ -98,6 +98,93 @@ class ReleaseTrains(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'no scheduled release'):
             hourly.reconcile_app('www', 'a' * 40, '2026111802', {}, None)
 
+    def test_coordinator_requires_the_release_app_tag_token(self):
+        with patch.dict(os.environ, {'GH_TOKEN': 'offline', 'GITHUB_REPOSITORY': hourly.REPO,
+                                     'GITHUB_REF': 'refs/heads/main', 'RELEASE_TAG_TOKEN': ''}, clear=True):
+            with self.assertRaisesRegex(ValueError, 'coordinator requires the release App tag token'):
+                hourly.require_coordinator_context()
+
+    def test_new_tag_push_uses_a_credential_helper_without_exposing_the_token(self):
+        base = 'a' * 40
+        source = 's' * 40
+        batch = '2026111802'
+        captured = []
+
+        def git(*args, **kwargs):
+            captured.append(args)
+            if args[0] == 'commit-tree':
+                return source
+            if args[0] == '-c':
+                return ''
+            raise AssertionError(args)
+
+        run = {'html_url': 'https://example.invalid/core', 'status': 'queued', 'head_sha': source,
+               'head_branch': 'core-v0.0.1-hourly.' + batch, 'repository': {'full_name': hourly.REPO},
+               'display_title': 'core / publish'}
+        with (patch.dict(os.environ, {'RELEASE_TAG_TOKEN': 'secret-token'}, clear=False),
+              patch.object(release_source, 'hourly_version', return_value='0.0.1-hourly.' + batch),
+              patch.object(hourly, 'tag_commit', side_effect=[None, source]),
+              patch.object(hourly, 'pending_attempt', return_value=None),
+              patch.object(release_source, 'expected_tree', return_value='tree'),
+              patch.object(release_source, 'verify', return_value=(base, batch)),
+              patch.object(release_context, 'git', side_effect=git),
+              patch.object(hourly, 'release_run_after_tag', return_value=[run])):
+            result = hourly.reconcile_app('core', base, batch, {}, None)
+        push = next(call for call in captured if call[:2] == ('-c', 'credential.helper='))
+        self.assertIn('credential.helper=!f() { echo username=x-access-token; echo "password=$RELEASE_TAG_TOKEN"; }; f', push)
+        self.assertNotIn('secret-token', ' '.join(push))
+        self.assertEqual(result['runs'], [run['html_url']])
+
+    def test_tag_creation_reuses_a_triggered_run_and_dispatches_once_only_when_missing(self):
+        base = 'a' * 40
+        source = 's' * 40
+        batch = '2026111802'
+        run = {'html_url': 'https://example.invalid/core', 'status': 'queued', 'head_sha': source,
+               'head_branch': 'core-v0.0.1-hourly.' + batch, 'repository': {'full_name': hourly.REPO},
+               'display_title': 'core / publish'}
+
+        def run_reconcile(wait_result, ensure=None):
+            with (patch.object(release_source, 'hourly_version', return_value='0.0.1-hourly.' + batch),
+                  patch.object(hourly, 'tag_commit', side_effect=[None, source]),
+                  patch.object(hourly, 'pending_attempt', return_value=None),
+                  patch.object(release_source, 'expected_tree', return_value='tree'),
+                  patch.object(release_source, 'verify', return_value=(base, batch)),
+                  patch.object(release_context, 'git', side_effect=lambda *args, **kwargs: source if args[0] == 'commit-tree' else ''),
+                  patch.object(hourly, 'release_run_after_tag', return_value=wait_result),
+                  patch.object(hourly, 'ensure_release_run', side_effect=ensure) as dispatch):
+                result = hourly.reconcile_app('core', base, batch, {}, None)
+            return result, dispatch
+
+        result, dispatch = run_reconcile([run])
+        dispatch.assert_not_called()
+        self.assertEqual(result['runs'], [run['html_url']])
+
+        with (patch.object(hourly, 'release_runs', side_effect=[[], [run]]),
+              patch.object(hourly.time, 'sleep') as sleep):
+            self.assertEqual(hourly.release_run_after_tag('core', run['head_branch'], source), [run])
+        sleep.assert_called_once_with(5)
+
+        with (patch.object(hourly, 'release_runs', return_value=[]),
+              patch.object(hourly.time, 'sleep') as sleep):
+            self.assertEqual(hourly.release_run_after_tag('core', run['head_branch'], source), [])
+        self.assertEqual(sleep.call_count, 18)
+
+        with (patch.object(release_source, 'hourly_version', return_value='0.0.1-hourly.' + batch),
+              patch.object(hourly, 'tag_commit', side_effect=[None, source]),
+              patch.object(hourly, 'pending_attempt', return_value=None),
+              patch.object(release_source, 'expected_tree', return_value='tree'),
+              patch.object(release_source, 'verify', return_value=(base, batch)),
+              patch.object(release_context, 'git', side_effect=lambda *args, **kwargs: source if args[0] == 'commit-tree' else ''),
+              patch.object(hourly, 'release_run_after_tag', return_value=[]),
+              patch.object(hourly, 'release_runs', side_effect=[[], [run]]),
+              patch.object(hourly, 'api', return_value=None) as api,
+              patch.object(hourly.time, 'sleep')):
+            result = hourly.reconcile_app('core', base, batch, {}, None)
+        api.assert_called_once_with('actions/workflows/release-core.yml/dispatches', 'POST',
+                                    {'ref': 'core-v0.0.1-hourly.' + batch,
+                                     'inputs': {'tag': 'core-v0.0.1-hourly.' + batch, 'publish': 'true'}})
+        self.assertEqual(result['runs'], [run['html_url']])
+
     def test_client_cutoff_follows_los_angeles_and_uses_the_scheduled_hour(self):
         for created, expected in (
             ('2026-11-18T02:00:00Z', '2026-11-18T02:00:00+00:00'),
@@ -202,7 +289,7 @@ class ReleaseTrains(unittest.TestCase):
                     return {'status': 'dispatched', 'tag': f'{app}-v{version}'}
 
                 publications = {item['tag']: item for item in (core, app_pin, cli_pin)}
-                with (patch.dict(os.environ, {'GH_TOKEN': 'offline', 'GITHUB_REPOSITORY': hourly.REPO,
+                with (patch.dict(os.environ, {'GH_TOKEN': 'offline', 'RELEASE_TAG_TOKEN': 'offline', 'GITHUB_REPOSITORY': hourly.REPO,
                                              'GITHUB_REF': 'refs/heads/main', 'GITHUB_EVENT_NAME': 'schedule',
                                              'GITHUB_RUN_ID': '7'}),
                       patch.object(hourly, 'api', side_effect=api),

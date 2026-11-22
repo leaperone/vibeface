@@ -113,6 +113,16 @@ def ensure_release_run(app, tag, source):
     return runs
 
 
+def release_run_after_tag(app, tag, source):
+    for attempt in range(19):
+        runs = release_runs(app, tag, source)
+        if runs:
+            return runs
+        if attempt < 18:
+            time.sleep(5)
+    return []
+
+
 def reconcile(write, read, description):
     try:
         write()
@@ -171,6 +181,7 @@ def pending_attempt(app, base, batch, pins):
 def require_coordinator_context():
     release_format.require(os.environ.get('GH_TOKEN') and os.environ.get('GITHUB_REPOSITORY') == REPO
                     and os.environ.get('GITHUB_REF') == 'refs/heads/main', 'coordinator runs only from main in Actions')
+    release_format.require(os.environ.get('RELEASE_TAG_TOKEN'), 'coordinator requires the release App tag token')
 
 
 def complete_manifest(record):
@@ -216,6 +227,7 @@ def reconcile_app(app, base, batch, pins, previous_tag):
         if input_digest(app, old_base) == input_digest(app, base) and previous['dependencies'] == pins:
             return {'status': 'unchanged', 'tag': previous_tag}
     source = tag_commit(tag)
+    created = False
     if source is None:
         pending = pending_attempt(app, base, batch, pins)
         if pending:
@@ -225,9 +237,12 @@ def reconcile_app(app, base, batch, pins, previous_tag):
                    GIT_COMMITTER_NAME='github-actions[bot]', GIT_COMMITTER_EMAIL=release_source.BOT)
         source = release_context.git('commit-tree', tree, '-p', base, '-m', f'chore(release): {app} hourly {batch}', env=env)
         release_format.require(release_source.verify(source, app) == (base, batch), 'generated source failed verification')
-        actual = reconcile(lambda: release_context.git('push', 'origin', source + ':refs/tags/' + tag),
+        actual = reconcile(lambda: release_context.git('-c', 'credential.helper=',
+                                                       '-c', 'credential.helper=!f() { echo username=x-access-token; echo "password=$RELEASE_TAG_TOKEN"; }; f',
+                                                       'push', 'origin', source + ':refs/tags/' + tag),
                            lambda: tag_commit(tag), 'tag creation')
         release_format.require(actual == source, 'tag points to another source')
+        created = True
     else:
         try:
             identity = release_source.verify(source, app)
@@ -235,7 +250,9 @@ def reconcile_app(app, base, batch, pins, previous_tag):
             return {'status': 'hour_occupied', 'tag': tag}
         if identity != (base, batch) or (pins and json.loads(release_context.blob(source, f'releases/{app}.json')) != pins):
             return {'status': 'hour_occupied', 'tag': tag}
-    runs = ensure_release_run(app, tag, source)
+    runs = release_run_after_tag(app, tag, source) if created else ensure_release_run(app, tag, source)
+    if created and not runs:
+        runs = ensure_release_run(app, tag, source)
     return {'status': 'dispatched', 'tag': tag, 'runs': [r['html_url'] for r in runs]}
 
 

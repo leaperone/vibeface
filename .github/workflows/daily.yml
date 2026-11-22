@@ -3,7 +3,6 @@ on:
   schedule:
     - cron: '0 18 * * *'
       timezone: America/Los_Angeles
-  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
@@ -11,16 +10,24 @@ concurrency:
   cancel-in-progress: false
 jobs:
   clients:
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: github.ref == 'refs/heads/main' && github.event_name == 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     permissions: {contents: write, actions: write}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with: {ref: main, fetch-depth: 0, persist-credentials: false}
+      - id: release-app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.VIBEFACE_RELEASE_APP_ID }}
+          private-key: ${{ secrets.VIBEFACE_RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-workflows: write
       - name: Release client changes from green main
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG_TOKEN: ${{ steps.release-app.outputs.token }}
         run: |
           gh auth setup-git
           python3 -B scripts/hourly.py --clients

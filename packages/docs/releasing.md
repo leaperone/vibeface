@@ -38,7 +38,9 @@ CLI 包中的 `BUILD-INFO.json` 记录包的来源。发行包中，CLI 的身�
 
 ## 自动发布
 
-`hourly.yml` 在 UTC 每小时 17 分、main push CI 成功后或手动运行时对账 Core。`daily.yml` 在 `America/Los_Angeles` 每日 18:00 定时启动客户端发布并跟随夏令时，也可在 main 手动运行。构建和发布可能稍后完成。
+`hourly.yml` 在 UTC 每小时 17 分、main push CI 成功后或手动运行时对账 Core。`daily.yml` 仅在 `America/Los_Angeles` 每日 18:00 定时启动客户端发布，并跟随夏令时。构建和发布可能稍后完成。
+
+协调器用 `vibeface-release` GitHub App 的短期 token（仓库变量 `VIBEFACE_RELEASE_APP_ID`、secret `VIBEFACE_RELEASE_APP_PRIVATE_KEY`，仅 contents/workflows 写权限）推送生成的 tag，其余 API 与派发仍用 `GITHUB_TOKEN`；tag 推送触发的发布运行会被复用，不重复派发。
 
 每日客户端批次固定一个通过 main push CI 的源码和 UTC 小时版本后缀，继续使用 Hourly 分发渠道。Web App、CLI/npm、Desktop 和 Mobile（Android APK 与 iOS）按构建输入或依赖 pin 的变化发布，无变化时复用完整 Release。CLI 锁定批次截止时最新完整发布且验证通过的 Hourly Core，以及本批次选定的 Web App。Desktop 锁定选定的 CLI。协调器跟踪各个组件的发布运行，可跨小时继续依赖构建。官网仅手动发布。
 
