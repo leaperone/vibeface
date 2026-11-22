@@ -16,9 +16,9 @@ import { ActionButton } from "./present"
 
 /** Plain-language reason; the original text stays in the details. */
 function checkReason(check: Pick<PendingCheck, "detail">): string {
-  if (/restart/i.test(check.detail)) return "设备在 Bot 工作时重启了，系统不会自动重做。"
-  if (/stream closed|frame limit|disconnect|connection/i.test(check.detail)) return "和 Bot 的连接断了，系统不会自动重做。"
-  return "这次的结果没法自动确认，系统不会自动重做。"
+  if (/restart/i.test(check.detail)) return "设备在 Bot 工作时重启了。"
+  if (/stream closed|frame limit|disconnect|connection/i.test(check.detail)) return "和 Bot 的连接断了。"
+  return "这次的结果没法自动确认。"
 }
 
 export function confirmText(check: Pick<WorkCheck, "reason" | "detail">, device: string): string {
@@ -51,7 +51,7 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
     title="程序还在运行"
     trailing={<ActionButton variant="primary" disabled={disabled} action={() => workspace.confirmStopped(check)}><CircleStop aria-hidden="true" />确认已停止</ActionButton>}
   >
-    <p className="text-secondary">{checkReason(check)}程序退出后会自动处理。</p>
+    <p className="text-secondary">{checkReason(check)}</p>
     <Details>
       <DetailRow label="设备" value={nodeName(workspace.data?.local_node, lookup)} />
       {check.detail ? <span>{check.detail}</span> : null}
@@ -68,7 +68,6 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
   }
   const viewTask = (work: WorkCheck) => { const bot = botOf(work) ?? chatBot; return bot ? <RoutedAction variant="secondary" to="/b/$botId/work/$workId" params={{ botId: bot.bot_id, workId: work.work_id }} search={inbox ? { from: "tasks" } : {}}>查看任务</RoutedAction> : null }
   const settleActions = (work: WorkCheck, text = "") => <Details label="我已自行核对">
-    <p className="text-sm text-secondary">只记录你的核对结论，不会重新执行任务。</p>
     <div className="flex flex-wrap justify-end gap-2">
       <ActionButton variant="ghost" disabled={disabled} action={settle(work, "interrupted", text)}>没做完</ActionButton>
       <ActionButton disabled={disabled} action={settle(work, "completed", text)}>做完了</ActionButton>
@@ -79,8 +78,7 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
     title={`待确认 · ${check.works.length} 个任务`}
     meta={device}
   >
-    <p className="text-secondary">{check.reason === "offline" ? "设备离线了" : "Codex 断开了"}，暂时收不到这些任务的结果。可以先查看已有记录。</p>
-    {check.reason === "offline" ? <BackOnline device={device} /> : null}
+    <p className="text-secondary">{check.reason === "offline" ? "设备离线了" : "Codex 断开了"}，暂时收不到这些任务的结果。</p>
     <ul className="divide-y overflow-hidden rounded-control border bg-surface">
       {check.works.map((work) => {
         const bot = botOf(work)
@@ -106,8 +104,7 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
     meta={device}
     actions={viewTask(check)}
   >
-    <p>{reason}先查看已有记录，再决定怎么继续。</p>
-    {check.reason === "offline" ? <BackOnline device={device} /> : null}
+    <p>{reason}</p>
     {bot ? <Link to="/b/$botId" params={{ botId: bot.bot_id }} className="inline-flex w-fit max-w-full min-w-0 items-center gap-1.5 rounded-control text-sm font-medium underline-offset-4 hover:underline max-md:min-h-11">
       <BotFace bot={bot} mood="idle" size={16} /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-secondary" /></Link> : null}
     <Details label="补充说明（可选）"><Textarea label="补充说明" id={`${id}-note`} aria-label="补充说明" rows={2} maxLength={2000} value={note} disabled={disabled} onChange={(event) => setNote(event.target.value)} /></Details>

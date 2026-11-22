@@ -3710,7 +3710,7 @@ test('empty chat starters preserve an editable unsent draft', () => {
   } finally { harness.app.close() }
 })
 
-test('chat task groups stay at their originating message and orphan tasks remain available only in history', () => {
+test('chat tasks stay out of the message list and remain available in the activity drawer', () => {
   const messages = [
     { message_id: 'one', event_hash: 'one', role: 'user', text: '核对项目', created_at_ms: 1 },
     { message_id: 'reply', event_hash: 'reply', role: 'assistant', text: '已开始核对', created_at_ms: 2, in_reply_to: 'one' },
@@ -3721,17 +3721,8 @@ test('chat task groups stay at their originating message and orphan tasks remain
   shared.data = parseConversation({ ...context, messages, works: [complete('root'), complete('sibling'), parityWork({ work_id: 'child', trigger: 'task:root' }), complete('orphan', 'message:missing')] })
   const harness = conversationHarness(() => shared)
   try {
-    const entries = harness.chatEntries()
-    assert.deepEqual(entries.map((entry) => entry.key), ['one', 'task-group:message:one', 'task-group:task:root', 'reply', 'two'])
-    const group = entries.find((entry) => entry.key === 'task-group:message:one')?.node
-    assert.equal(group?.type, 'Details')
-    assert.equal(group?.props.label, '2 个任务 · 已完成')
+    assert.equal(harness.chatEntries().map((entry) => entry.key).join(), 'one,reply,two')
     const elements = harness.render()
-    const cards = elements.filter(({ type }) => typeof type === 'function' && type.name === 'TaskCard')
-    assert.equal(cards.length, 3, 'the orphan cannot create a chat row')
-    const finished = cards.find(({ props }) => (props.task as { id: string }).id === 'sibling')
-    assert.ok(finished)
-    assert.equal(componentText(nestedElements([finished], ['TaskCard']).find(({ type }) => type === 'div')), '已完成 · 查看任务')
     const history = elements.find(({ type }) => typeof type === 'function' && type.name === 'TaskHistory')
     assert.equal(history, undefined, 'an inactive chat never mounts a history portal')
     const active = harness.render({ active: true })
@@ -3739,10 +3730,8 @@ test('chat task groups stay at their originating message and orphan tasks remain
     const chatKey = active.find(({ type }) => type === 'Chat')?.key
     assert.ok(historyKey && chatKey)
     assert.notEqual(historyKey, chatKey, 'history and the retained chat are different siblings during reconciliation')
-    shared.data = parseConversation({ ...context, messages: messages.slice(0, 1), works: shared.data.works })
-    assert.equal(harness.chatEntries()[1].key, 'task-group:message:one', 'a reply arriving never moves the task group')
-    shared.data = parseConversation({ ...context, messages, works: [complete('root'), complete('sibling'), complete('child', 'task:root'), complete('orphan', 'message:missing')] })
-    assert.equal(harness.chatEntries()[2].key, 'task-group:task:root', 'progress changes retain the group key')
+    const drawer = active.find(({ type }) => typeof type === 'function' && type.name === 'TaskHistory')
+    assert.equal((drawer?.props.tasks as unknown[]).length, 4, 'every task, including the orphan, is listed in the drawer')
   } finally { harness.app.close() }
 })
 
@@ -3765,8 +3754,13 @@ test('chat task history keeps completed and unknown records while counting only 
     return app.render('TaskHistory', history.props)
   }
   const label = () => render().find(({ type }) => type === 'Button')?.props['aria-label']
+  const badge = () => render().some(({ type }) => type === 'Dot')
+  const status = () => componentText(harness.render({ active: true }).find(({ type }) => type === 'PromptInput')?.props.above)
   try {
-    assert.equal(label(), '执行记录 · 3 待处理')
+    assert.equal(label(), '动态')
+    assert.equal(badge(), true, 'the unverifiable work needs the person')
+    assert.match(status(), /^1 项要处理待处理$/, 'the open approval is the question pill, not a running task')
+
     assert.equal(render().filter(({ type, props }) => type === 'Link' && props.to === '/b/$botId/work/$workId').length, 4, 'history includes completed, missing-origin and uncertain execution records')
     assert.equal(render().filter(({ type, props }) => type === 'Link' && props.to === '/tasks').length, 1, 'task conversations have a separate navigation entry')
     assert.match(componentText(render()), /已完成/)
@@ -3775,7 +3769,7 @@ test('chat task history keeps completed and unknown records while counting only 
     assert.equal(app.render('TaskIcon', { state: 'completed', stale: false }).some(({ type }) => type === 'CircleCheck'), true)
     shared.answered = { approval: '继续' }
     shared.openWorks = shared.openWorks.filter((work) => work.work_id !== 'failed')
-    assert.equal(label(), '执行记录 · 1 进行中 · 1 待处理', 'answered approvals and closed historical failures stop counting')
+    assert.match(status(), /^1 项要处理 · 1 个任务进行中$/, 'answered approvals and closed historical failures stop counting')
     const trigger = render().find(({ type }) => type === 'Button')
     let restoredFocus = 0
     const triggerRef = trigger?.props.ref as { current: { focus(options?: { preventScroll?: boolean }): void } | null }
@@ -3796,7 +3790,7 @@ test('chat task history keeps completed and unknown records while counting only 
     assert.equal(prevented, true, 'ordinary dismissal explicitly handles the portalled opener')
     assert.equal(restoredFocus, 1, 'ordinary dismissal restores the actual opening button')
     shared.connectionOnline = false
-    assert.equal(label(), '执行记录 · 2 待处理', 'offline active tasks are uncertain instead of counted as running')
+    assert.match(status(), /1 项要处理$/, 'offline active tasks are uncertain instead of counted as running')
   } finally { app.close(); harness.app.close() }
 })
 
@@ -5335,7 +5329,7 @@ test("conversation keeps unknown and newly edited drafts across connection chang
     info: { device_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
   let currentWorkspace = workspace()
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/labels.ts': taskLabels, '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('keep original draft'); composer()?.onSubmit?.()
@@ -6031,7 +6025,7 @@ test("an owner's reply on its way keeps its streamed text until the reply lands"
   const ask = { message_id: "m1", event_hash: "m1", role: "user", text: "hi", created_at_ms: 1 }
   const progress = { kind: "manager", key: "live", conversation_id: "chat", trigger: "message:m1", source_node: "owner", sequence: 1, text: "partial answer", items: [], needsRefresh: false }
   let messages: object[] = [ask]
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/labels.ts': taskLabels, '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({
     ...historyActions, generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), data: { ...parseConversation(context, "chat"), messages, scheduler: { scope_jobs: [], jobs: [job], unanswered: [] } }, pendingMessages: [], canSaveMessages: true, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [], liveProgress: [progress], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     refresh: async () => {},
@@ -6050,7 +6044,7 @@ test("a closed question neither waits on the person nor hides 思考中", () => 
   const question = (question_id: string, closed: string | null) => ({ question_id, conversation_id: "chat", bot: null, severity: "attention", text: "允许吗？", choices: [],
     about: { node: "gateway", agent: "codex", session_id: "s", cwd: "/w", summary: "", request_id: "r" }, author: "gateway", created_at_ms: 2, answer: null, closed })
   let questions = [question("lost", "request_lost")]
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/labels.ts': taskLabels, '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({
     ...historyActions, generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), data: { ...parseConversation(context, "chat"), messages: [ask], questions, scheduler: { scope_jobs: [], jobs: [job], unanswered: [] } }, pendingMessages: [], canSaveMessages: true, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [], liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true, answered: {},
     refresh: async () => {},
@@ -6092,7 +6086,7 @@ test('offline chat keeps reconnect and stale waiting summary above the composer,
   } finally { harness.app.close() }
 })
 
-test('merged and in-flight user messages show honest status labels and refresh-only 再查一次', async () => {
+test('merged and in-flight user messages show honest status marks and a refresh-only 再查一次 in the activity drawer', async () => {
   let refreshed = 0, sent = 0
   let connectionOnline = true
   const baseAsk = { message_id: 'm0', event_hash: 'm0', role: 'user' as const, text: 'first', created_at_ms: 0 }
@@ -6105,27 +6099,30 @@ test('merged and in-flight user messages show honest status labels and refresh-o
   })
   let current = build([], [], { report_results: true, message_id: 'pending', text: 'sending', conversation_id: 'chat', target: { kind: 'bot_main', bot_id: parityBot.bot_id }, intent: 'continue', sequence: 1, created_at_ms: 1, delivery: 'submitting' })
   const harness = conversationHarness(() => current)
+  const mark = (messageId: string) => harness.messageTree(messageId).find(({ props }) => props.role === 'img')?.props['aria-label']
+  const requery = () => findActionProps(harness.render({ active: true }).find(({ type }) => typeof type === 'function' && type.name === 'TaskHistory')?.props.before, '再查一次')
   try {
-    assert.match(componentText(harness.messageTree('pending')), /正在确认送达/)
+    assert.equal(mark('pending'), '正在确认送达')
     current = build(
       [{ trigger: 'message:m0', state: 'running', message_id: 'm0' }, { trigger: 'message:m1', state: 'queued', message_id: 'm1' }],
       [baseAsk, { message_id: 'm1', event_hash: 'm1', role: 'user', text: 'queued', created_at_ms: 1 }],
     )
-    assert.match(componentText(harness.messageTree('m1')), /已排队/)
+    assert.equal(mark('m1'), '已排队')
     for (const [outcome, label] of [['answered', '关联回合已完成'], ['unfinished', '关联回合未完成'], ['unknown', '补充结果未知']] as const) {
       current = build([{ trigger: 'message:m2', state: 'steered', message_id: 'm2', outcome }], [{ message_id: 'm2', event_hash: 'm2', role: 'user', text: outcome, created_at_ms: 2 }])
-      const tree = harness.messageTree('m2')
-      assert.ok(componentText(tree).includes(label))
-      if (outcome === 'unknown') {
+      assert.equal(mark('m2'), label)
+      assert.equal(findActionProps(harness.messageTree('m2'), '再查一次'), undefined, 'the bubble carries no actions')
+      if (outcome !== 'unknown') assert.equal(requery(), undefined)
+      else {
         refreshed = 0; sent = 0
-        const action = findActionProps(tree, '再查一次')
+        const action = requery()
         assert.ok(action?.action)
         await (action.action as () => Promise<void>)()
         assert.equal(refreshed, 1)
         assert.equal(sent, 0)
         connectionOnline = false
         current = { ...current, connectionOnline }
-        assert.equal(findActionProps(harness.messageTree('m2'), '再查一次')?.disabled, true)
+        assert.equal(requery()?.disabled, true)
       }
     }
   } finally { harness.app.close() }
