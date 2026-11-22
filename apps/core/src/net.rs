@@ -118,6 +118,13 @@ pub enum PathKind {
     Relay,
 }
 
+/// What happened to the connections this Node dialed to one peer since it started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinkCounts {
+    pub path_changes: u32,
+    pub disconnects: u32,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum SelectedPath {
@@ -127,20 +134,28 @@ pub(crate) enum SelectedPath {
 
 /// Snapshots the path currently selected for application data on this connection.
 pub(crate) fn selected_path(connection: &Connection) -> Option<SelectedPath> {
+    selected_link(connection).map(|(path, _)| path)
+}
+
+/// The selected path of this connection and its round-trip time in milliseconds.
+pub(crate) fn selected_link(connection: &Connection) -> Option<(SelectedPath, u32)> {
     if connection.close_reason().is_some() {
         return None;
     }
     let paths = connection.paths();
-    match paths.iter().find(|path| path.is_selected())?.remote_addr() {
-        TransportAddr::Ip(_) => Some(SelectedPath::Direct),
+    let selected = paths.iter().find(|path| path.is_selected())?;
+    let path = match selected.remote_addr() {
+        TransportAddr::Ip(_) => SelectedPath::Direct,
         TransportAddr::Relay(url) if matches!(url.scheme(), "http" | "https") => {
             // Iroh uses its fixed relay route at this origin. Do not publish URL credentials.
-            Some(SelectedPath::Relay {
+            SelectedPath::Relay {
                 url: url.origin().ascii_serialization(),
-            })
+            }
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    let rtt = u32::try_from(selected.rtt().as_millis()).unwrap_or(u32::MAX);
+    Some((path, rtt))
 }
 
 /// A relay token file holds 64 hex characters.
@@ -351,6 +366,8 @@ pub struct Net {
     /// Open relays the mesh announces, adopted while they rank among the best.
     adopted: tokio::sync::Mutex<HashSet<RelayUrl>>,
     connections: Mutex<HashMap<(EndpointId, &'static [u8]), Connection>>,
+    /// Path switches and closed connections per peer since this process started.
+    links: Arc<Mutex<HashMap<EndpointId, LinkCounts>>>,
     /// `network.mesh.advertise`, listed first in the node link.
     advertise: Vec<SocketAddr>,
 }
@@ -453,6 +470,7 @@ impl Net {
             bootstrap: Default::default(),
             adopted: Default::default(),
             connections: Mutex::new(HashMap::new()),
+            links: Default::default(),
             advertise: config.mesh.advertise.clone(),
         })
     }
@@ -700,21 +718,88 @@ impl Net {
             .lock()
             .expect("connection cache")
             .insert((id, alpn), connection.clone());
+        if alpn == SYNC {
+            self.count_link(id, &connection);
+        }
         Ok(connection)
     }
 
+    /// Counts the times this dialed SYNC connection switches between direct and relay, and its
+    /// close unless this Node closed or dropped it. Only SYNC counts, so one outage counts once
+    /// per peer. The task holds no strong reference: the connection still closes when the last
+    /// user drops it.
+    fn count_link(&self, id: EndpointId, connection: &Connection) {
+        let links = self.links.clone();
+        let bump = move |change: fn(&mut LinkCounts)| {
+            change(links.lock().expect("link counts").entry(id).or_default());
+        };
+        let weak = connection.weak_handle();
+        // Subscribed while a strong reference exists, so neither misses the close.
+        let mut events = connection.path_events();
+        let closed = weak.closed();
+        let mut last = selected_path(connection).map(|path| matches!(path, SelectedPath::Direct));
+        tokio::spawn(async move {
+            while let Some(event) = events.next().await {
+                let direct = match event {
+                    iroh::endpoint::PathEvent::Selected { remote_addr, .. } => {
+                        Some(remote_addr.is_ip())
+                    }
+                    iroh::endpoint::PathEvent::Lagged { .. } => weak
+                        .upgrade()
+                        .and_then(|connection| selected_path(&connection))
+                        .map(|path| matches!(path, SelectedPath::Direct)),
+                    _ => None,
+                };
+                if direct.is_some() {
+                    if last.is_some() && direct != last {
+                        bump(|counts| counts.path_changes += 1);
+                    }
+                    last = direct;
+                }
+            }
+            if closed.await.is_some_and(|closed| {
+                !matches!(
+                    closed.reason,
+                    iroh::endpoint::ConnectionError::LocallyClosed
+                )
+            }) {
+                bump(|counts| counts.disconnects += 1);
+            }
+        });
+    }
+
     pub fn path_kind(&self, device_id: &str) -> Option<PathKind> {
-        let id = endpoint_id(device_id).ok()?;
+        self.link(device_id).0
+    }
+
+    /// The selected path to a peer over the dialed SYNC connection, else any dialed one, and its
+    /// round-trip time on that same connection.
+    pub fn link(&self, device_id: &str) -> (Option<PathKind>, Option<u32>) {
+        let Ok(id) = endpoint_id(device_id) else {
+            return (None, None);
+        };
         let connections = self.connections.lock().expect("connection cache");
-        connections
+        let sync = connections.get(&(id, SYNC)).into_iter();
+        let others = connections
             .iter()
-            .filter(|((peer, _), _)| *peer == id)
-            .find_map(|(_, connection)| {
-                selected_path(connection).map(|path| match path {
+            .filter(|((peer, alpn), _)| *peer == id && *alpn != SYNC)
+            .map(|(_, connection)| connection);
+        sync.chain(others)
+            .find_map(selected_link)
+            .map_or((None, None), |(path, rtt)| {
+                let kind = match path {
                     SelectedPath::Direct => PathKind::Direct,
                     SelectedPath::Relay { .. } => PathKind::Relay,
-                })
+                };
+                (Some(kind), Some(rtt))
             })
+    }
+
+    pub fn link_counts(&self, device_id: &str) -> LinkCounts {
+        endpoint_id(device_id)
+            .ok()
+            .and_then(|id| self.links.lock().expect("link counts").get(&id).copied())
+            .unwrap_or_default()
     }
 
     /// One request on its own stream; the response is the stream's only frame.

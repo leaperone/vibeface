@@ -2667,6 +2667,7 @@ mod tests {
             tool_token: Some("tool-token-fixture".into()),
             provider_env: launch.env,
             process_started: None,
+            restricted: false,
             turn_binding: Some(TurnBinding {
                 client_id: client.into(),
                 started: None,

@@ -248,6 +248,19 @@ async fn a_sync_policy_redial_preserves_active_streams_and_other_protocols() -> 
             net.connect(&peer, net::RPC).await?.stable_id(),
             rpc.stable_id()
         );
+        // Out of the cache and dropped by its last user, the old connection closes: counting
+        // its path changes and disconnects keeps no strong reference to it.
+        let closed = sync.weak_handle().closed();
+        drop((send, recv, sync));
+        let closed = tokio::time::timeout(PEER_TIMEOUT, closed)
+            .await
+            .context("the forgotten sync connection stayed open")?
+            .context("the forgotten sync connection was gone before its close")?;
+        assert!(matches!(
+            closed.reason,
+            iroh::endpoint::ConnectionError::LocallyClosed
+        ));
+        assert_eq!(net.link_counts(&peer).disconnects, 0);
         anyhow::Ok(())
     }
     .await;

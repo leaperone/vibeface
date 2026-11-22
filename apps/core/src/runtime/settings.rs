@@ -376,6 +376,7 @@ impl Runtime {
             tool_token: None,
             provider_env,
             process_started: None,
+            restricted: false,
             turn_binding: None,
         })
     }

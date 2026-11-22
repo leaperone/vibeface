@@ -109,3 +109,17 @@ test("offline and expired status never pass for a current path", () => {
   assert.equal(disconnected.capabilitiesStale, true)
   assert.deepEqual(disconnected.hops, [])
 })
+
+test("transport measurements show the round trip and only counts above zero", () => {
+  const observation = { checked_at_ms: checkedAt, last_synced_at_ms: lastSyncedAt, path: { kind: "direct" } }
+  const session_path = { kind: "websocket", checked_at_ms: checkedAt }
+  const measured = inspect({ response: { nodes: [{ ...peer, observation: { ...observation, rtt_ms: 42, path_changes: 0, disconnects: 3 } }], session_path } })
+  assert.deepEqual(measured.transport, { rttMs: 42, pathChanges: 0, disconnects: 3 })
+  const text = nodeDiagnosticText(target.name, measured)
+  assert.match(text, /往返延迟 42 ms/)
+  assert.match(text, /断线 3 次/)
+  assert.doesNotMatch(text, /路径切换/)
+  const unmeasured = inspect({ response: { nodes: [{ ...peer, observation: { ...observation, rtt_ms: null } }], session_path } })
+  assert.deepEqual(unmeasured.transport, { rttMs: null, pathChanges: 0, disconnects: 0 })
+  assert.doesNotMatch(nodeDiagnosticText(target.name, unmeasured), /往返延迟|断线/)
+})

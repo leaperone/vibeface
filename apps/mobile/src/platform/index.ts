@@ -10,6 +10,7 @@ import { mobileOutbox } from './outbox'
 import type { Lan, Notifier, Permission, Platform } from '@vibeface/client/lib/platform.ts'
 import { createTransport, type DeviceKeys } from '@vibeface/client/lib/transport.ts'
 import { sha256Hex } from '@vibeface/client/lib/byte-codec.ts'
+import { clearLogs } from '@vibeface/client/lib/web-log.ts'
 import { lostKeyText } from '@vibeface/client/identity/copy.ts'
 import { notificationPreferences } from '@vibeface/client/workspace/system-notifications.ts'
 import LanBrowser from '../../modules/lan-browser'
@@ -187,6 +188,7 @@ export const mobilePlatform: Platform = {
       await Notifications.clearLastNotificationResponseAsync()
       openings.clear()
       store.clearAll()
+      clearLogs()
     })
     outbox.reset()
   },

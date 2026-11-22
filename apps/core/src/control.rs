@@ -292,6 +292,7 @@ pub async fn inspect(data_dir: &Path) -> Result<Inspection> {
                     }),
                     reachable: peer.reachable,
                     synced_ms: peer.synced_ms,
+                    rtt_ms: peer.rtt_ms,
                 })
                 .collect()
         }),

@@ -167,7 +167,7 @@ impl Runtime {
                     "work changes require a live agent invocation"
                 ))
         );
-        let mut kind = if let Some(manager) = access.invocation() {
+        let job = if let Some(manager) = access.invocation() {
             Some(
                 {
                     let arg0 = (scope).to_owned();
@@ -178,18 +178,46 @@ impl Runtime {
                         })
                         .await
                 }?
-                .context("this turn is not running here")?
-                .tool_kind(),
+                .context("this turn is not running here")?,
             )
         } else {
             None
         };
+        let mut kind = job.as_ref().map(|job| job.tool_kind());
+        let health_turn = job
+            .as_ref()
+            .is_some_and(|job| super::health::health_turn(&job.trigger));
         if let Some(kind) = kind {
             ensure!(
                 tool.effect().offered(kind),
                 Execution::NotStarted
                     .with(Approval::Denied)
                     .failure(anyhow::anyhow!("{name} is not offered in a {kind:?} turn"))
+            );
+        }
+        ensure!(
+            !health_turn || super::health::health_turn_tool(tool),
+            Execution::NotStarted
+                .with(Approval::Denied)
+                .failure(anyhow::anyhow!(
+                    "a health reminder's turn does not dispatch, control or wake work"
+                ))
+        );
+        if matches!(tool, Tool::ReadLogs | Tool::ReadHealth) {
+            let allowed = match &job {
+                Some(job) => {
+                    self.diagnostics_turn(access.network_id(), &scope, &job.trigger)
+                        .await?
+                }
+                None => false,
+            };
+            ensure!(
+                allowed,
+                Execution::NotStarted
+                    .with(Approval::Denied)
+                    .failure(anyhow::anyhow!(
+                        "{name} is for the primary bot, in a turn a managing device's own message or this device's health reminder started"
+                    ))
             );
         }
         let _lease = match access.invocation() {
@@ -278,8 +306,8 @@ impl Runtime {
             Tool::WorkspaceState | Tool::WorkspaceHistory | Tool::WorkspaceCommand => {
                 return self.agent_workspace(&access, &scope, tool, &args).await;
             }
-            Tool::Search => Tool::search(args, kind),
-            Tool::Describe => Tool::describe(args, kind),
+            Tool::Search => Tool::search(args, kind, health_turn),
+            Tool::Describe => Tool::describe(args, kind, health_turn),
             Tool::Call => unreachable!("discovery calls are resolved before admission"),
             Tool::HistorySearch | Tool::HistoryRead => {
                 self.agent_history(&access, &scope, tool, &args).await
@@ -417,6 +445,11 @@ impl Runtime {
                     .await
             }
             Tool::FetchUrl => crate::fetch::fetch_url(field(&args, "url")?).await,
+            Tool::ReadLogs => {
+                let (dir, args) = (self.data_dir.clone(), args.clone());
+                tokio::task::spawn_blocking(move || super::health::read_logs(&dir, &args)).await?
+            }
+            Tool::ReadHealth => self.read_health().await,
             Tool::ListBots => {
                 let now = now_ms();
                 let network = network.to_owned();
@@ -1634,7 +1667,7 @@ fn tool_bot(bot: &crate::model::Bot) -> Value {
 }
 
 /// Bytes one tool result carries, and one event within it; the rest is read page by page.
-const PAGE_BYTES: usize = 32_000;
+pub(super) const PAGE_BYTES: usize = 32_000;
 const EVENT_BYTES: usize = 8_000;
 
 /// An `{author, seq}` position within the turn's history.
@@ -1849,7 +1882,9 @@ pub(crate) fn work_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::test_support::{bot, claim_reply, node, signed_main_input, start_reply};
+    use crate::runtime::test_support::{
+        bot, claim_reply, node, signed_main_input, start_reply, start_reply_in,
+    };
 
     async fn post(
         node: &Runtime,
@@ -2100,6 +2135,43 @@ mod tests {
                 })
                 .await
         }?);
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn only_the_primary_bots_managed_turn_reads_this_devices_diagnostics() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        bot(&node, &admin, "c", "Ops", &[]).await?;
+        bot(&node, &admin, "d", "Docs", &[]).await?;
+        let network = node.network_id().await?;
+        let idle = |scope: &str| crate::runtime::AgentAccess::ReadOnly {
+            network_id: network.clone(),
+            conversation_id: scope.into(),
+        };
+        let denied = |error: anyhow::Error| format!("{error:#}").contains("is for the primary bot");
+        assert!(denied(
+            node.tool(idle("c"), "read_logs", json!({}))
+                .await
+                .expect_err("no live turn")
+        ));
+        let (trigger, attempt) = start_reply(&node, &admin, "primary").await?;
+        let primary = node
+            .manager_access_fixture("diag-c", idle("c"), &attempt, &trigger, Provider::Codex)
+            .await?;
+        assert!(node.tool(primary.clone(), "read_logs", json!({})).await?["records"].is_array());
+        let health = node.tool(primary, "read_health", json!({})).await?;
+        assert!(health["peers"].is_array() && health["health"]["problems"].is_array());
+        let (trigger, attempt) = start_reply_in(&node, &admin, "d", "other").await?;
+        let other = node
+            .manager_access_fixture("diag-d", idle("d"), &attempt, &trigger, Provider::Codex)
+            .await?;
+        assert!(denied(
+            node.tool(other, "read_health", json!({}))
+                .await
+                .expect_err("not the primary bot")
+        ));
         drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())

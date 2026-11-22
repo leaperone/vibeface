@@ -37,6 +37,12 @@ const STATE_EVENTS: &[&str] = &[
     "mesh.neighbor_down",
     "sync.write_state",
     "work.state",
+    "work.stalled",
+    "work.recovered",
+    "app_server.unresponsive",
+    "app_server.recovered",
+    "sync.stalled",
+    "sync.recovered",
 ];
 static PRIVATE_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
@@ -94,7 +100,10 @@ pub enum Source {
     Agent,
     Cli,
     Codex,
-    Cursor,
+    /// The native desktop app, through `/api/log`.
+    Desktop,
+    /// The phone app, through the device channel's `log` command.
+    Mobile,
 }
 
 impl std::str::FromStr for Level {
@@ -109,7 +118,7 @@ impl std::str::FromStr for Source {
     type Err = anyhow::Error;
     fn from_str(text: &str) -> Result<Self> {
         serde_json::from_value(Value::String(text.to_ascii_lowercase()))
-            .context("source is one of node, web, agent, cli, codex, cursor")
+            .context("source is one of node, web, agent, cli, codex, desktop, mobile")
     }
 }
 
@@ -562,6 +571,37 @@ pub fn init(data_dir: Option<&Path>, quiet_libraries: bool) {
         .with(sink.map(|sink| Layer { sink }))
         .with(terminal.then(|| fmt::layer().with_writer(std::io::stderr)))
         .init();
+    if data_dir.is_some() {
+        record_panics();
+    }
+}
+
+/// Logs every panic as `node.panic` before the default report, so `node.log` names its place.
+/// A panic while logging one skips the log and goes straight to the default report.
+fn record_panics() {
+    thread_local! {
+        static RECORDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if RECORDING.replace(true) {
+            previous(info);
+            return;
+        }
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panic without a message".into());
+        let location = info
+            .location()
+            .map(|at| format!("{}:{}", at.file(), at.line()))
+            .unwrap_or_default();
+        tracing::error!(event = "node.panic", location, "{message}");
+        RECORDING.set(false);
+        previous(info);
+    }));
 }
 
 /// Turns `tracing` events into records. The ids and `source` come from the event's fields or
@@ -736,6 +776,7 @@ pub struct Filter {
     pub sources: Vec<Source>,
     pub conversation_id: Option<String>,
     pub work_id: Option<String>,
+    pub event: Option<String>,
     /// Case-insensitive, in the message, event, ids or fields.
     pub text: Option<String>,
     /// The newest this many; defaults to 1000, at most [`MAX_READ`].
@@ -755,6 +796,10 @@ impl Filter {
             && (self.sources.is_empty() || self.sources.contains(&record.source))
             && same(&self.conversation_id, &record.conversation_id)
             && same(&self.work_id, &record.work_id)
+            && self
+                .event
+                .as_ref()
+                .is_none_or(|event| *event == record.event)
             && self.text.as_deref().is_none_or(|text| {
                 let text = text.to_lowercase();
                 [
@@ -863,8 +908,18 @@ fn submitted(source: Source, sender: &str, value: &Value, now_ms: i64) -> Result
     for reserved in ["repeated", "first_ms", "last_ms"] {
         fields.remove(reserved);
     }
-    // A browser's records name the device that authenticated the channel, not one the page claims.
-    if source == Source::Web {
+    // The phone's order and creation time, kept beside the Node's own receipt time.
+    for (key, valid) in [
+        ("client_seq", fields.get("client_seq").map(Value::is_u64)),
+        (
+            "client_ts_ms",
+            fields.get("client_ts_ms").map(Value::is_i64),
+        ),
+    ] {
+        ensure!(valid != Some(false), "{key} must be an integer");
+    }
+    // A client's records name the device that authenticated the channel, not one the page claims.
+    if matches!(source, Source::Web | Source::Mobile) {
         fields.insert("device_id".to_owned(), Value::String(sender.to_owned()));
     }
     Ok(Record {
@@ -882,10 +937,14 @@ fn submitted(source: Source, sender: &str, value: &Value, now_ms: i64) -> Result
     })
 }
 
-/// Per-sender budget of submitted records in one-minute windows.
+/// Per-sender budget of submitted records in one-minute windows, and the highest `client_seq` each
+/// sender has had written.
 #[derive(Default)]
 pub struct RateLimit {
     windows: Mutex<HashMap<String, (i64, u32)>>,
+    // ponytail: in memory only; after a Node restart a batch that was in flight when it stopped
+    // can be written twice.
+    seqs: Mutex<HashMap<String, u64>>,
 }
 
 impl RateLimit {
@@ -901,31 +960,107 @@ impl RateLimit {
     }
 }
 
-/// Accepts a batch from `sender` whole or not at all, and returns how many records it wrote.
+/// Why the Node refused a batch of log records. `code` tells a client whether to drop the batch
+/// (`log_rejected`: sending it again cannot change that) or wait a minute (`log_rate_limited`).
+#[derive(Debug)]
+pub struct Refused {
+    pub code: &'static str,
+    message: String,
+}
+
+impl Refused {
+    pub const REJECTED: &str = "log_rejected";
+    pub const RATE_LIMITED: &str = "log_rate_limited";
+
+    pub fn rejected(error: impl std::fmt::Display) -> anyhow::Error {
+        Self {
+            code: Self::REJECTED,
+            message: error.to_string(),
+        }
+        .into()
+    }
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Accepts a batch from `sender` whole or not at all, and answers `{"accepted":n}`. A record whose
+/// `fields.client_seq` is not above the sender's last written one is a resend and is skipped
+/// without counting against the budget. When any record is skipped the answer also carries how
+/// many as `skipped` and the last number written after this batch as `max_seq`, so a sender whose
+/// numbering went back can tell and start above it. Records come in ascending `client_seq`, so the
+/// skipped ones are the first `skipped`.
 pub fn submit(
     limit: &RateLimit,
     sender: &str,
     source: Source,
     records: &Value,
     now_ms: i64,
-) -> Result<usize> {
-    let records = records.as_array().context("records must be a list")?;
-    ensure!(
-        !records.is_empty() && records.len() <= MAX_BATCH,
-        "send between 1 and {MAX_BATCH} log records at a time"
-    );
-    let records = records
-        .iter()
-        .map(|record| submitted(source, sender, record, now_ms))
-        .collect::<Result<Vec<_>>>()?;
-    ensure!(
-        limit.take(sender, records.len() as u32, now_ms),
-        "too many log records; try again in a minute"
-    );
+) -> Result<Value> {
+    let records = (|| {
+        let records = records.as_array().context("records must be a list")?;
+        ensure!(
+            !records.is_empty() && records.len() <= MAX_BATCH,
+            "send between 1 and {MAX_BATCH} log records at a time"
+        );
+        records
+            .iter()
+            .map(|record| submitted(source, sender, record, now_ms))
+            .collect::<Result<Vec<_>>>()
+    })()
+    .map_err(|error| Refused::rejected(format!("{error:#}")))?;
+    let mut seqs = limit.seqs.lock().expect("log sequence");
+    let mut last = seqs.get(sender).copied();
+    let submitted = records.len();
+    let records: Vec<_> = records
+        .into_iter()
+        .filter(
+            |record| match record.fields.get("client_seq").and_then(Value::as_u64) {
+                Some(seq) if last.is_some_and(|last| seq <= last) => false,
+                Some(seq) => {
+                    last = Some(seq);
+                    true
+                }
+                None => true,
+            },
+        )
+        .collect();
+    let skipped = submitted - records.len();
+    // Only a record numbered at or below `last` is skipped, so `last` is set.
+    let answer = |accepted: usize| match last {
+        Some(max_seq) if skipped > 0 => {
+            serde_json::json!({"accepted":accepted,"skipped":skipped,"max_seq":max_seq})
+        }
+        _ => serde_json::json!({"accepted":accepted}),
+    };
+    if records.is_empty() {
+        tracing::debug!(
+            sender,
+            max_seq = last,
+            "log batch skipped: every client_seq was already written"
+        );
+        return Ok(answer(0));
+    }
+    if !limit.take(sender, records.len() as u32, now_ms) {
+        return Err(Refused {
+            code: Refused::RATE_LIMITED,
+            message: "too many log records; try again in a minute".into(),
+        }
+        .into());
+    }
+    if let Some(last) = last {
+        seqs.insert(sender.to_owned(), last);
+    }
+    drop(seqs);
     for record in &records {
         write(record);
     }
-    Ok(records.len())
+    Ok(answer(records.len()))
 }
 
 /// Copies a child's stderr into the log line by line, through `emit`, until it closes. More than
@@ -961,7 +1096,6 @@ pub async fn forward_lines(
 pub fn child_line(source: Source, event: &str, line: &str, thread_id: Option<&str>) {
     let source = match source {
         Source::Codex => "codex",
-        Source::Cursor => "cursor",
         _ => "node",
     };
     let words = || line.split(|c: char| !c.is_ascii_alphabetic());
@@ -1412,8 +1546,10 @@ mod tests {
         let ok = json!({"level":"error","event":"web.uncaught","message":"boom","conversation_id":"c-1"});
         assert_eq!(
             submit(&limit, "a", Source::Web, &json!([ok]), 0).unwrap(),
-            1
+            json!({"accepted":1})
         );
+        let code =
+            |error: anyhow::Error| error.downcast_ref::<Refused>().map(|refused| refused.code);
         let big = json!({"level":"info","message":"x".repeat(MAX_RECORD_BYTES)});
         for rejected in [
             json!([big]),
@@ -1424,8 +1560,11 @@ mod tests {
             json!([{"level":"info","message":"x","conversation_id":"../etc"}]),
             json!([{"level":"info","message":"x","source":"node"}]),
         ] {
-            assert!(
-                submit(&limit, "a", Source::Web, &rejected, 0).is_err(),
+            assert_eq!(
+                submit(&limit, "a", Source::Web, &rejected, 0)
+                    .err()
+                    .and_then(code),
+                Some(Refused::REJECTED),
                 "{rejected}"
             );
         }
@@ -1437,6 +1576,12 @@ mod tests {
             1 + accepted * MAX_BATCH,
             1 + (RATE_PER_MINUTE as usize - 1) / MAX_BATCH * MAX_BATCH
         );
+        assert_eq!(
+            submit(&limit, "a", Source::Web, &batch, 1)
+                .err()
+                .and_then(code),
+            Some(Refused::RATE_LIMITED)
+        );
         assert!(
             submit(&limit, "b", Source::Web, &json!([ok]), 1).is_ok(),
             "per sender"
@@ -1445,6 +1590,45 @@ mod tests {
             submit(&limit, "a", Source::Web, &json!([ok]), 60_001).is_ok(),
             "a new minute"
         );
+    }
+
+    #[test]
+    fn phone_records_skip_resent_sequence_numbers() {
+        let limit = RateLimit::default();
+        let seq = |n: u64| json!({"level":"info","event":"mobile.connection","message":"m","fields":{"client_seq":n,"client_ts_ms":5}});
+        let record = submitted(Source::Mobile, "phone-1", &seq(1), 9).unwrap();
+        assert_eq!(record.source, Source::Mobile);
+        assert_eq!(record.fields["device_id"], "phone-1");
+        assert_eq!(
+            (record.ts_ms, record.fields["client_ts_ms"].clone()),
+            (9, json!(5))
+        );
+        let send =
+            |sender, batch: Value| submit(&limit, sender, Source::Mobile, &batch, 0).unwrap();
+        assert_eq!(
+            send("phone-1", json!([seq(1), seq(2)])),
+            json!({"accepted":2})
+        );
+        assert_eq!(
+            send("phone-1", json!([seq(1), seq(2), seq(3)])),
+            json!({"accepted":1,"skipped":2,"max_seq":3}),
+            "only the new one, and how many were skipped below which number"
+        );
+        assert_eq!(
+            send("phone-1", json!([seq(1), seq(3)])),
+            json!({"accepted":0,"skipped":2,"max_seq":3}),
+            "a wholly skipped batch names the last written number"
+        );
+        assert_eq!(send("phone-1", json!([seq(4)])), json!({"accepted":1}));
+        assert_eq!(
+            send("phone-2", json!([seq(1)])),
+            json!({"accepted":1}),
+            "per sender"
+        );
+        for bad in [json!(-1), json!("7"), json!(1.5)] {
+            let record = json!({"level":"info","message":"m","fields":{"client_seq":bad}});
+            assert!(submit(&limit, "phone-1", Source::Mobile, &json!([record]), 0).is_err());
+        }
     }
 
     #[test]

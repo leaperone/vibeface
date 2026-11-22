@@ -1699,7 +1699,9 @@ def fixture_codex(arguments):
         threading.Thread(target=connection, args=(stream,), daemon=True).start()
 
 
-READ_TOOLS = {"nodes", "context", "history_search", "history_read", "work_status", "call_lookup", "read_skill", "recall", "fetch_url", "list_bots", "read_bot", "list_sessions", "workspace_state", "workspace_history"}
+READ_TOOLS = {"nodes", "context", "history_search", "history_read", "work_status", "call_lookup", "read_skill", "recall", "fetch_url", "list_bots", "read_bot", "list_sessions", "workspace_state", "workspace_history", "read_logs", "read_health"}
+# ponytail: tools an older published npm baseline may lack; its turn accepts their absence only. Empty once every baseline has them.
+UNRELEASED_TOOLS = {"read_logs", "read_health"}
 WORK_TOOLS = {"dispatch_work", "interrupt_work", "hand_over_session", "propose_provider_config", "apply_provider_config", "workspace_command"}
 WAKE_TOOLS = {"remind", "message_bot"}
 SETTINGS_TOOLS = {"update_profile", "save_skill", "remove_skill", "save_schedule", "remove_schedule", "remember", "forget",
@@ -1829,7 +1831,7 @@ def fixture_manager(run, initial, bot):
             "every initially exposed tool has exactly one advertised schema")
     require(not (initial_tools & set(context["trigger"].get("unavailable_tools") or [])),
             "the initial entrypoints remain available in every trigger")
-    expected_tools = READ_TOOLS if reply_only else READ_TOOLS | WORK_TOOLS
+    expected_tools = set(READ_TOOLS) if reply_only else READ_TOOLS | WORK_TOOLS
     if tool_kind not in ("agent_task", "workspace_task") and not reply_only:
         expected_tools |= WAKE_TOOLS
     if main_human:
@@ -1894,6 +1896,8 @@ def fixture_manager(run, initial, bot):
         require(isinstance(page["next"], int) and page["next"] > offset,
                 "tool discovery has a forward-only bounded cursor")
         offset = page["next"]
+    if (run / "fixture-baseline-tools").exists():
+        expected_tools -= UNRELEASED_TOOLS - catalog
     require(catalog == expected_tools, "dynamic discovery exposes exactly this turn's authorized domain tools")
     for name in sorted(expected_tools):
         schema = tool("tool_describe", {"tool": name})
@@ -5124,7 +5128,11 @@ def npm_service_acceptance(options):
             require(release_archive.files(vendor, ("FILES.sha256",)) == expected_files,
                     "every installed baseline vendor byte matches the immutable published package")
             shutil.copy2(vendor / "scripts/install-node-service.sh", cleanup_script)
-            conversation, attachment, digest, messages, invocation_count = create_history("NPM")
+            (run / "fixture-baseline-tools").touch()
+            try:
+                conversation, attachment, digest, messages, invocation_count = create_history("NPM")
+            finally:
+                (run / "fixture-baseline-tools").unlink(missing_ok=True)
             require(invocation_count == 1, "one controlled fixture call creates the message history")
             update = json.loads(command([binary, "update", "status", "--data-dir", node.directory]).stdout)
             require(update["distribution"] == "npm" and update["automatic"] is False,
@@ -6635,7 +6643,7 @@ def phase5_acceptance(options):
         require(shown["write_state"] == "writable" and shown["peers"][0]["device_id"] == b.device_id
                 and shown["peers"][0]["reachable"] is True, "status reports writes and the reachable peer")
         text = subprocess.run([str(binary), "status", "--data-dir", str(a.directory)], capture_output=True, timeout=20).stdout.decode()
-        require("Writes: writable" in text and re.search(r"Peer: .* reachable, synced \d+s ago", text), "plain status names the peer and its last sync")
+        require("Writes: writable" in text and re.search(r"Peer: .* reachable, [^,]+, RTT (\d+ ms|unknown), synced \d+s ago", text), "plain status names the peer and its last sync")
         passed("status-shows-writes-and-peer-sync", peers=len(shown["peers"]))
 
         a.stop()

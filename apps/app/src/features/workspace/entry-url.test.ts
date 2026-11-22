@@ -6844,7 +6844,7 @@ test('native system notification events keep typed destinations and clear naviga
   const { privateFiles } = owned.module as typeof import('../../../../../apps/mobile/src/platform/files.ts')
   type Response = { notification: { date: number; request: { identifier: string; content: { data: { destination: NotificationDestination } } } }; actionIdentifier: string }
   let response: ((value: Response) => void) | undefined
-  let dismissed = 0, forgotten = 0
+  let dismissed = 0, forgotten = 0, logsCleared = 0
   const storage = new Map<string, string>()
   const scheduled: unknown[] = []
   const app = componentHarness('../../../../../apps/mobile/src/platform/index.ts', {
@@ -6859,6 +6859,7 @@ test('native system notification events keep typed destinations and clear naviga
     },
     'react-native-mmkv': { createMMKV: () => ({ getString: (key: string) => storage.get(key), set: (key: string, value: string) => storage.set(key, value), clearAll: () => storage.clear(), getAllKeys: () => [...storage.keys()] }) },
     '@vibeface/secure-native': { lan: {}, secure: {} },
+    '@vibeface/client/lib/web-log.ts': { clearLogs: () => { logsCleared++ } },
     '@vibeface/client/lib/transport.ts': { createTransport: () => ({ forgetClient: async () => { forgotten++ } }) },
     '@vibeface/client/identity/copy.ts': { lostKeyText: () => '' },
     './files': { privateFiles },
@@ -6881,6 +6882,7 @@ test('native system notification events keep typed destinations and clear naviga
   assert.deepEqual(opened, [destination], 'erase removes the navigation consumer')
   assert.equal(dismissed, 1)
   assert.equal(forgotten, 1)
+  assert.equal(logsCleared, 1, 'erase clears the phone log buffer')
   unwatch?.()
 })
 

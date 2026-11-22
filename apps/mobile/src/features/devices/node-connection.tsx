@@ -2,7 +2,7 @@ import { useIsFocused } from 'expo-router'
 import { Check, Copy, Globe, Laptop, RadioTower, RefreshCw, Signal, Smartphone, WifiOff } from 'lucide-react-native'
 import { View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { describeNode, nodeDiagnosticText, nodeDiagnosticTime, nodeStatusLabels, type NodeDiagnostics } from '@vibeface/client/workspace/node-diagnostics.ts'
+import { describeNode, nodeDiagnosticText, nodeDiagnosticTime, nodeStatusLabels, transportFacts, type NodeDiagnostics } from '@vibeface/client/workspace/node-diagnostics.ts'
 import { useNodeChecks } from '@vibeface/client/workspace/use-node-checks.ts'
 import { ErrorText } from '@/components/action'
 import { Button } from '@/components/arc/button'
@@ -86,6 +86,7 @@ export function NodeConnection({ member, diagnostics, checks, connected, reconne
           {returnPath.path.kind === 'relay' ? <Text selectable className="font-mono text-sm text-secondary">{returnPath.path.url}</Text> : null}
           {!member.entry ? <Text className="text-sm text-muted">回程检查 {nodeDiagnosticTime(returnPath.checkedAt)}</Text> : null}
         </View> : null}
+        {transportFacts(diagnostics.transport).map(([label, value]) => <Text key={label} className="text-sm text-muted" style={{ fontVariant: ['tabular-nums'] }}>{label} {value}</Text>)}
         {checkedAt !== null ? <Text className="text-sm text-muted">最近检查 {nodeDiagnosticTime(checkedAt)}</Text> : null}
         {!member.entry && (checkedAt !== null || lastSyncedAt !== null) ? <Text className="text-sm text-muted">
           {lastSyncedAt === null ? '暂无成功同步记录' : `最近成功同步 ${nodeDiagnosticTime(lastSyncedAt)}`}

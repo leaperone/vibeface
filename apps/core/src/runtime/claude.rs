@@ -2192,6 +2192,7 @@ pub(super) mod tests {
             tool_token: Some("tool-token-fixture".into()),
             provider_env: place.env(),
             process_started: None,
+            restricted: false,
             turn_binding: Some(TurnBinding {
                 client_id: "attempt-1".into(),
                 started: None,
