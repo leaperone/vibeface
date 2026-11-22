@@ -114,11 +114,11 @@ def ensure_release_run(app, tag, source):
 
 
 def release_run_after_tag(app, tag, source):
-    for attempt in range(18):
+    for attempt in range(19):
         runs = release_runs(app, tag, source)
         if runs:
             return runs
-        if attempt < 17:
+        if attempt < 18:
             time.sleep(5)
     return []
 
