@@ -4,8 +4,8 @@ import { AlarmClock, ArrowRight, ArrowRightLeft, BookOpen, Bot, ChevronRight, Ci
 import { useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { failureText, outcomeUnknown, taskError, workFailure, type FailureKind } from '@vibeface/client/lib/errors.ts'
-import { runtimeLabel } from '@vibeface/client/chat/protocol.ts'
+import { failureText, taskError, workFailure, type FailureKind } from '@vibeface/client/lib/errors.ts'
+import { replyUnsettled, runtimeLabel } from '@vibeface/client/chat/protocol.ts'
 import { providerNames, type ProviderId } from '@vibeface/client/lib/node.ts'
 import { changeTitle, firedAt, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleFrequency } from '@vibeface/client/workspace/bot-settings.ts'
 import { chatTaskState, interruptedCopy, nodeName, staleTaskLabel, taskActive, taskAgent, taskCopy, taskLabel, taskProgress, taskStale } from '@vibeface/client/workspace/labels.ts'
@@ -59,17 +59,18 @@ export function useChatExtras(conversationId: string, botId: string) {
   data.works.forEach((work, index) => {
     const state = chatTaskState(work, data.works, shared.nodes)
     const shownAs = state === 'running' && work.thread_id && asking.has(work.thread_id) ? 'waiting' : state
-    if (taskActive(shownAs)) tasks++
+    const stale = taskStale(shownAs, shared.connectionOnline), away = shownAs === 'dispatch_waiting' && shared.nodes.some((node) => node.device_id === work.target_node && !node.online)
+    if (shared.connectionOnline && !away && (taskActive(shownAs) || shownAs === 'awaiting_children')) tasks++
     const joined = work.turn_id ? data.works.slice(0, index).find((item) => item.thread_id === work.thread_id && item.turn_id === work.turn_id)?.title : undefined
-    activity.tasks.unshift(<TaskCard key={`task:${work.work_id}`} work={work} state={shownAs} stale={taskStale(shownAs, shared.connectionOnline)} away={shownAs === 'dispatch_waiting' && shared.nodes.some((node) => node.device_id === work.target_node && !node.online)} joined={joined} botId={botId} device={nodeName(work.target_node, lookup)} agent={taskAgent(work)} progress={taskProgress(work, shared.liveProgress)} />)
+    activity.tasks.unshift(<TaskCard key={`task:${work.work_id}`} work={work} state={shownAs} stale={stale} away={away} joined={joined} botId={botId} device={nodeName(work.target_node, lookup)} agent={taskAgent(work)} progress={taskProgress(work, shared.liveProgress)} />)
   })
   for (const job of jobs) {
     const at = job.reply_message_id && shown.has(job.reply_message_id) ? job.reply_message_id : job.message_id
     if (job.runtime) activity.runtime.unshift(<Text key={`runtime:${job.trigger}`} className="text-sm text-muted">{runtimeLabel(job.runtime)}</Text>)
     if (job.state === 'reconciling' || job.pending_check) activity.todo.push(<ActionCard key={`reconcile:${job.trigger}`} icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => shared.refresh()}>再查一次</ActionButton>} />)
-    if (job.state === 'queued' && hold === null && job.hold_reason) hold = job.hold_reason
     if ((job.state === 'failed' || job.state === 'rejected') && job.message_id && shown.has(job.message_id) && !shown.has(job.reply_message_id ?? '') && at) failures.set(at, [...failures.get(at) ?? [], { key: `job:${job.trigger}`, node: <JobLine job={job} /> }])
   }
+  hold = jobs.find((job) => job.state === 'queued')?.hold_reason ?? null
   const changes = placeChanges(data.messages, data.changes)
   const schedules = data.bot_settings.schedules
   for (const records of [...changes.first, ...[...changes.after.values()].flat()]) activity.changes.unshift(<ChangeCard key={`change:${records[0].change_id}`} records={records} schedules={schedules} overwritten={data.overwritten} />)
@@ -141,7 +142,7 @@ function JobLine({ job }: { job: ManagerJob }) {
   const shared = useLive()
   const reason = job.failure ? cause(job.failure.kind, job.failure.detail) : ''
   const newest = shared?.data?.messages.at(-1)
-  const retry = shared && newest?.role === 'user' && newest.message_id === job.message_id && !outcomeUnknown(job.failure?.kind, job.failure?.detail)
+  const retry = shared && newest?.role === 'user' && newest.message_id === job.message_id && !replyUnsettled(job)
     ? () => shared.retryReply(newest.message_id) : undefined
   return <View className="flex-row flex-wrap items-center gap-x-2 gap-y-1">
     <View className="flex-row items-center gap-1"><Icon as={CircleX} className="size-4 text-danger" /><Text className="text-sm text-danger">没能回复</Text></View>

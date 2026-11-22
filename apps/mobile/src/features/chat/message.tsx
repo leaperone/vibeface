@@ -31,7 +31,7 @@ function Hold({ choose, children }: { choose: (() => void) | null; children: Rea
 
 /** A screen-reader-only button after the message, since VoiceOver exposes actions only on elements it can focus. */
 function MessageActionsButton({ choose }: { choose: (() => void) | null }) {
-  return choose ? <Pressable accessibilityRole="button" accessibilityLabel="消息操作" accessibilityHint="复制、分享或引用" onPress={choose} className="absolute size-px overflow-hidden opacity-0" /> : null
+  return choose ? <Pressable accessibilityRole="button" accessibilityLabel="消息操作" accessibilityHint="复制、分享或引用" onPress={choose} className="absolute size-px overflow-hidden" /> : null
 }
 
 /**

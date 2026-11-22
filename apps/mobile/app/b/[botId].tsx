@@ -9,13 +9,12 @@ import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimat
 import Animated, { useAnimatedStyle, useSharedValue } from 'react-native-reanimated'
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useCSSVariable, withUniwind } from 'uniwind'
-import { awaitsDevice, botReach, botCanSend, composerHint, inputTargetKey, promptIntent, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice, botReach, botCanSend, composerHint, inputTargetKey, promptIntent, replyUnsettled, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
 import { messageTimes } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
 import { messageOf } from '@vibeface/client/lib/node.ts'
 import { ErrorText } from '@/components/action'
-import { outcomeUnknown } from '@vibeface/client/lib/errors.ts'
 import { botCopy, scheduleName } from '@vibeface/client/workspace/bot-settings.ts'
 import { unreachable } from '@vibeface/client/workspace/home.ts'
 import { chatStatusLine } from '@vibeface/client/workspace/labels.ts'
@@ -254,7 +253,7 @@ export default function ChatScreen() {
   // 重试 on the newest reply once it failed or was stopped, as on the web.
   const newest = chat?.messages.at(-1)
   const asked = newest && ['failed', 'stopped'].includes(newest.status ?? '') ? newest.in_reply_to : undefined
-  const unknown = live?.data?.scheduler?.jobs.some((job) => job.message_id === asked && outcomeUnknown(job.failure?.kind, job.failure?.detail))
+  const unknown = live?.data?.scheduler?.jobs.some((job) => job.message_id === asked && replyUnsettled(job))
   const retry = asked && live && !blocked && !unknown ? () => live.retryReply(asked) : undefined
   unreadIndex.current = rows.findIndex((row) => row.key === 'unread')
   const mood = offline ? 'asleep' : botMood(bot, workspace, live)

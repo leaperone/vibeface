@@ -11,11 +11,11 @@ import { ChatSkeleton,useCreateBot } from '@/features/workspace/workspace-shell'
 import { terms } from '@/lib/glossary'
 import { webPlatform } from '@/lib/platform'
 import { Link,useNavigate,useRouterState } from '@tanstack/react-router'
-import { awaitsDevice,botCanSend,botReach,canRetryJob,canSend,composerHint,promptIntent,reachDevice,runtimeLabel,starters } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice,botCanSend,botReach,canRetryJob,canSend,composerHint,promptIntent,reachDevice,replyUnsettled,runtimeLabel,starters } from '@vibeface/client/chat/protocol.ts'
 import { chatTimeline,firstUnread } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
-import { failureText,outcomeUnknown,taskError } from '@vibeface/client/lib/errors.ts'
+import { failureText,taskError } from '@vibeface/client/lib/errors.ts'
 import { botCopy,placeChanges,scheduleName,scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { chatStatusLine,chatTaskState,nodeName,staleTaskLabel,taskActive,taskCopy,taskLabel,taskStale } from '@vibeface/client/workspace/labels.ts'
@@ -62,7 +62,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const [files, setFiles] = useState<File[]>([])
   const [selectedTarget, setSelectedTarget] = useState(routeRoutine ? `routine:${routeRoutine}` : 'main')
   const [activityOpen, setActivityOpen] = useState(false)
-  // The control that opened the activity drawer gets focus back, unless a link in it navigated away.
+  // The control that opened the activity drawer gets focus back, or the header button once it is gone, unless a link in it navigated away.
   const activityFrom = useRef<HTMLElement | null>(null)
   const openActivity = (from: HTMLElement | null) => { activityFrom.current = from; setActivityOpen(true) }
   const { conversationId, data, chatSlot } = workspace
@@ -93,7 +93,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const works = data?.works ?? []
   // A running turn paused on an approval reads as waiting; a steered input names the task it joined.
   const currentWorks = new Set(workspace.openWorks?.filter((work) => work.conversation_id === conversationId).map((work) => work.work_id))
-  const confirming = new Set(checks.flatMap((check) => check.kind === 'work' ? [check.work_id] : []))
+  const confirming = new Set(checks.flatMap((check) => check.kind === 'work' ? [check.work_id] : check.kind === 'device' ? check.works.map((work) => work.work_id) : []))
   const tasks: TaskRow[] = works.map((work) => {
     const shown = chatTaskState(work, works, workspace.nodes)
     const asking = workApproval({ work, conversationId, questions: data?.questions ?? [], answered: workspace.answered })
@@ -117,8 +117,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   // 重试 sits on the newest reply when it failed or was stopped; it reads the conversation again first and words what it sends by what the reply may have done.
   const newest = data?.messages.at(-1)
   const endedAsk = newest && ['failed', 'stopped', 'interrupted'].includes(newest.status ?? '') ? newest.in_reply_to : undefined
-  // A reply whose outcome is unknown may have done its work: it is checked, never retried.
-  const retryOf = (messageId: string | undefined) => messageId && !sendDisabled && !jobs.some((job) => job.message_id === messageId && outcomeUnknown(job.failure?.kind, job.failure?.detail))
+  const retryOf = (messageId: string | undefined) => messageId && !sendDisabled && !jobs.some((job) => job.message_id === messageId && replyUnsettled(job))
     ? async () => { setSendError(null); await workspace.retryReply(messageId) } : undefined
   const retry = retryOf(endedAsk)
   const replied = new Set((data?.messages ?? []).map((message) => message.message_id))
@@ -128,7 +127,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const merging = new Set(jobs.filter((job) => job.state === 'steering').map((job) => job.message_id))
   const entries: ChatEntry[] = []
   const waiting: ChatEntry[] = []
-  // A failed reply that cannot be retried, or a supplement with an unknown outcome, can only be read again.
+  // The newest reply failed with no 重试, or the newest supplement's outcome is unknown: it can only be read again.
   let requery = false
   for (const message of timeline.messages) {
     const start = entries.length
@@ -140,7 +139,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
       entries.push({ key: message.message_id, message, schedule: scheduleName(schedule, data?.bot_settings, changes), detail })
     } else if (!folded.hidden.has(message.message_id)) entries.push({ ...pendingRow(merged.has(message.message_id) ? { ...message, state: 'merged', merged: merged.get(message.message_id) } : message, message.message_id === newest?.message_id ? retry : undefined), detail })
     const recordedJob = jobs.find((job) => job.reply_message_id === message.message_id || !job.reply_message_id && job.message_id === message.message_id)
-    if (message.status === 'failed' && !recordedJob?.pending_check && (!recordedJob || !canRetryJob(recordedJob)) || merged.has(message.message_id) && (merged.get(message.message_id) ?? 'unknown') === 'unknown') requery = true
+    if (message.message_id === newest?.message_id && !retry && (message.status === 'failed' && !recordedJob?.pending_check && (!recordedJob || !canRetryJob(recordedJob)) || merged.has(message.message_id) && (merged.get(message.message_id) ?? 'unknown') === 'unknown')) requery = true
     for (const job of jobs) {
       if (job.message_id !== message.message_id) continue
       if ((job.state !== 'failed' && job.state !== 'rejected') || replied.has(job.reply_message_id ?? '')) continue
@@ -176,6 +175,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const reconciling = jobs.filter((job) => job.state === 'reconciling' || job.pending_check)
   const undecided = (pending: PendingMessage) => pending.rejected || pending.delivery === 'unknown' || pending.receipt?.stage === 'unknown'
   const inputStatus = (pending: PendingMessage) => <div key={pending.message_id} className="grid gap-2"><p className="line-clamp-2 text-sm">{pending.text}</p><WorkspaceInputStatus pending={pending} /></div>
+  const ownerUnknown = Boolean(remote && !remote.reachable && !ownerAway && newest?.role === 'user')
   const cards = [
     ownerAway && owner && here ? <ActionCard key="owner" icon={WifiOff} title={`${nodeName(owner, lookup)} 离线，对话在等它`} actions={
       <ActionButton variant="primary" disabled={!workspace.writable} action={() => workspace.takeOver()}><ArrowRightLeft aria-hidden="true" />换到 {nodeName(here.device_id, lookup)}</ActionButton>
@@ -185,12 +185,12 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
       <ActionButton variant="primary" disabled={!workspace.writable || !agentReady} action={() => workspace.settleUnanswered(unanswered, 'reply')}>{here ? <><Laptop aria-hidden="true" />由 {nodeName(here.device_id, lookup)} 回复</> : '现在回复'}</ActionButton>
     </>}>{lastUnanswered ? <p className="line-clamp-2 text-secondary">{lastUnanswered.text}</p> : null}</ActionCard> : null,
     ...checks.map((check) => <ConfirmCard key={check.check_id} check={check} />),
-    remote && !remote.reachable && !ownerAway && newest?.role === 'user' ? <ActionCard key="owner-unknown" icon={Unplug} title={`${nodeName(remote.owner, lookup)} 连不上，回复情况未知`} /> : null,
+    remote && ownerUnknown ? <ActionCard key="owner-unknown" icon={Unplug} title={`${nodeName(remote.owner, lookup)} 连不上，回复情况未知`} /> : null,
     ...reconciling.map((job) => <ActionCard key={`reconcile:${job.trigger}`} icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => workspace.refresh()}>再查一次</ActionButton>} />),
     ...pendingMessages.filter(undecided).map(inputStatus),
   ].filter(Boolean)
-  // Waiting tasks surface as question cards and confirming ones as ConfirmCards; the rest are counted here.
-  const attention = cards.length + (requery && !reconciling.length ? 1 : 0) + tasks.filter((task) => task.attention && task.state !== 'waiting' && !confirming.has(task.id)).length
+  // Waiting tasks surface as question cards and confirming ones as ConfirmCards; the rest are counted here. The owner-unknown card has no action.
+  const attention = cards.length - (ownerUnknown ? 1 : 0) + (requery && !reconciling.length ? 1 : 0) + tasks.filter((task) => task.attention && task.state !== 'waiting' && !confirming.has(task.id)).length
   const sending = pendingMessages.filter((pending) => !undecided(pending))
   const changeGroups = [...placedChanges.first, ...[...placedChanges.after.values()].flat()]
   const runtime = jobs.filter((job) => job.runtime).at(-1)?.runtime
@@ -210,7 +210,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const setupTo = setupDevice ? '/devices/$deviceId' : '/devices'
   const canSetUp = ready?.principal.can_manage === true || ready?.principal.source === 'local_session'
 
-  // The drawer outlives navigation, so a link inside it that leaves this chat closes it.
+  // This screen stays mounted, hidden, on other routes, so leaving this chat or route closes the drawer and drops its focus return.
   useEffect(() => { setActivityOpen(false); activityFrom.current = null }, [conversationId, pathname])
   // Picked files belong to the bot they were picked for.
   useEffect(() => { setSendError(null); setFiles([]); setSelectedTarget(routeRoutine ? `routine:${routeRoutine}` : 'main') }, [conversationId, routeRoutine])
@@ -359,7 +359,7 @@ function TaskHistory({ tasks, botId, attention, open, onOpenChange, onOpen, from
   return <>
     <PageActions><Button ref={trigger} type="button" variant="ghost" size="sm" aria-label={attention ? `动态，${attention} 项要处理` : '动态'} title={attention ? `动态，${attention} 项要处理` : '动态'} className="relative" onClick={() => onOpen(trigger.current)}><ListChecks aria-hidden="true" />{attention ? <Dot tone="warning" className="absolute end-1 top-1" /> : null}</Button></PageActions>
     <Drawer open={open} onOpenChange={onOpenChange}>
-      <DrawerContent title="动态" className="!w-full min-w-0 gap-0 sm:!max-w-md" onCloseAutoFocus={(event) => { event.preventDefault(); from.current?.focus({ preventScroll: true }) }}>
+      <DrawerContent title="动态" className="!w-full min-w-0 gap-0 sm:!max-w-md" onCloseAutoFocus={(event) => { event.preventDefault(); if (from.current) (from.current.isConnected ? from.current : trigger.current)?.focus({ preventScroll: true }) }}>
         <div className="grid min-h-0 flex-1 content-start gap-6 overflow-y-auto px-4 pb-6">
           {workspace.connectionOnline && workspace.incomplete ? <p role="status" className="text-sm text-secondary">同步中</p> : null}
           {before}
