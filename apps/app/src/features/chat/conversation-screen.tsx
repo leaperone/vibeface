@@ -101,7 +101,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
     const attention = state === 'waiting' || confirming.has(work.work_id) || currentWorks.has(work.work_id) && (taskStale(state, workspace.connectionOnline) || ['failed', 'rejected', 'dispatch_rejected', 'dispatch_unverified', 'unknown', 'unverified', 'awaiting_confirmation'].includes(state))
     return { id: work.work_id, state, attention, device: work.target_node, work }
   })
-  const runningTasks = tasks.filter((task) => workspace.connectionOnline && !task.attention && (taskActive(task.state) || task.state === 'awaiting_children')).length
+  const runningTasks = tasks.filter((task) => workspace.connectionOnline && !task.attention && !(task.state === 'dispatch_waiting' && workspace.nodes.some((node) => node.device_id === task.device && !node.online)) && (taskActive(task.state) || task.state === 'awaiting_children')).length
 
   const changes = data?.changes ?? []
   const placedChanges = placeChanges(data?.messages ?? [], changes)
