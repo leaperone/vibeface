@@ -1,6 +1,6 @@
 import type { KeyValue } from '@vibeface/client/lib/platform.ts'
 
-export type ReadingPosition = { kind: 'latest' } | { kind: 'message'; messageId: string }
+type ReadingPosition = { kind: 'latest' } | { kind: 'message'; messageId: string }
 type SavedPosition = { conversationId: string; position: ReadingPosition }
 
 function position(value: unknown): ReadingPosition | null {

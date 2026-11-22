@@ -2,8 +2,8 @@ import type { KeyValue } from '../lib/platform.ts'
 import { parseConversation, record } from './model.ts'
 import type { ConversationPayload } from './types.ts'
 
-export type ConversationCacheScope = { networkId: string; deviceId: string }
-export type ConversationCacheKey = ConversationCacheScope & { conversationId: string }
+type ConversationCacheScope = { networkId: string; deviceId: string }
+type ConversationCacheKey = ConversationCacheScope & { conversationId: string }
 export type CachedConversation = ConversationCacheKey & { savedAt: number; payload: ConversationPayload }
 export const conversationCacheStorageKey = 'vibeface.conversation-cache'
 const conversationCacheLimits = { maxBytes: 12 * 1024 * 1024, maxConversations: 40 }
@@ -91,5 +91,3 @@ export function createConversationCache(options: { storage: KeyValue; maxBytes?:
     },
   }
 }
-
-export type ConversationCache = ReturnType<typeof createConversationCache>

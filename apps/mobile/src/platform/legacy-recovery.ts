@@ -2,7 +2,7 @@ import type { File } from 'expo-file-system'
 import { record } from '@vibeface/client/lib/node.ts'
 
 /** The sealed recovery copies written directly in the app's private Documents directory by earlier versions. */
-export type LegacyRecoveryFile = Pick<File, 'name' | 'size' | 'textSync'>
+type LegacyRecoveryFile = Pick<File, 'name' | 'size' | 'textSync'>
 
 export function isLegacyRecoveryFile(file: LegacyRecoveryFile): boolean {
   if (!/^vibeface-recovery-[A-F0-9]{8}-\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\.json$/.test(file.name) || file.size < 1 || file.size > 4 * 1024 * 1024) return false

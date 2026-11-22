@@ -24,7 +24,7 @@ export function canSend(input: SendGate): boolean {
   return Boolean(input.hasConversation && input.loaded && !input.busy)
 }
 /** Whether any device can run the bot now: `starting` while one comes up, `offline` when the only ones that could are away, `none` when none is set up to. */
-export type BotReach = 'ready' | 'unverified' | 'starting' | 'needs_setup' | 'offline' | 'none'
+type BotReach = 'ready' | 'unverified' | 'starting' | 'needs_setup' | 'offline' | 'none'
 /** A device that only needs setup is fixable now, so it comes before one that is offline. */
 export function botReach(nodes: NodeInfo[]): BotReach {
   if (nodes.some((node) => botReadiness(node) === 'ready')) return 'ready'

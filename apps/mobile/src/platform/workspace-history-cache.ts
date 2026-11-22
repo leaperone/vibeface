@@ -3,10 +3,10 @@ import { parseWorkspaceHistory } from '@vibeface/client/workspace/model.ts'
 import type { MessageSearchItem, WorkspaceHistory, WorkspaceHistoryItem } from '@vibeface/client/workspace/types.ts'
 
 export type WorkspaceHistoryCacheScope = { networkId: string; deviceId: string; target: { kind: 'task' | 'channel'; id: string } }
-export type CachedWorkspaceHistory = WorkspaceHistoryCacheScope & {
+type CachedWorkspaceHistory = WorkspaceHistoryCacheScope & {
   savedAt: number; title: string; botIds: string[]; events: WorkspaceHistoryItem[]; complete: boolean
 }
-export type CachedWorkspaceSearchItem = Pick<MessageSearchItem, 'event_hash' | 'message_id' | 'conversation_id' | 'text' | 'created_at_ms' | 'speaker'>
+type CachedWorkspaceSearchItem = Pick<MessageSearchItem, 'event_hash' | 'message_id' | 'conversation_id' | 'text' | 'created_at_ms' | 'speaker'>
 type StoredHistory = WorkspaceHistoryCacheScope & { savedAt: number; title: string; botIds: string[]; pages: WorkspaceHistory[]; retainedAll: boolean }
 const storageKey = 'workspace-history-cache'
 const bytes = (value: string) => new TextEncoder().encode(value).length

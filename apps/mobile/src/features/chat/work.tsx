@@ -38,7 +38,7 @@ function confirmText(check: Pick<WorkCheck, 'reason' | 'detail'>, device: string
   return '结果没法自动确认'
 }
 
-export type ChatActivity = { todo: ReactNode[]; sending: ReactNode[]; tasks: ReactNode[]; changes: ReactNode[]; runtime: ReactNode[] }
+type ChatActivity = { todo: ReactNode[]; sending: ReactNode[]; tasks: ReactNode[]; changes: ReactNode[]; runtime: ReactNode[] }
 
 /**
  * What the chat knows besides messages. The list keeps only `failures`, a one-line JobLine after the message that got no

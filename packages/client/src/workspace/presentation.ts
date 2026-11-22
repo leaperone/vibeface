@@ -26,10 +26,10 @@ export function contextSourceSummary(sources: ContextProjection["sources"]) {
 }
 
 /** The three task sections shared by the Web and Mobile workspace views. */
-export type WorkspaceTaskGroup = "attention" | "working" | "waiting"
+type WorkspaceTaskGroup = "attention" | "working" | "waiting"
 
 /** Pure semantic state for a workspace task. Renderers choose tone, icon and layout. */
-export type WorkspaceTaskStateDescriptor = {
+type WorkspaceTaskStateDescriptor = {
   label: string
   attention: boolean
   active: boolean

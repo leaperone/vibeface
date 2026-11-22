@@ -7,7 +7,7 @@ import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { execFile } from 'node:child_process';
 import { test as base } from '@e2e-dev/mobile';
-import { expect, secrets } from 'e2e';
+import { expect } from 'e2e';
 import { bundleManifest, nativeFixture, record, type NativeFixture } from './native-fixture';
 
 const root = resolve(import.meta.dirname, '../..');

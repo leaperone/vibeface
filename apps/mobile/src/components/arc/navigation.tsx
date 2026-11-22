@@ -6,7 +6,7 @@ import { Icon } from './icon'
 import { Text } from './text'
 import { cn } from '@/lib/utils'
 
-export type NavigationItem = { href: Href; label: string; icon: LucideIcon; selected: boolean; notice?: ReactNode; accessibilityLabel?: string }
+type NavigationItem = { href: Href; label: string; icon: LucideIcon; selected: boolean; notice?: ReactNode; accessibilityLabel?: string }
 /** Native route tabs port Arc tabs' quiet rail and selected accent treatment. */
 export function NavigationTabs({ items, bottom }: { items: NavigationItem[]; bottom: number }) {
   return <View accessibilityRole="tabbar" className="flex-row gap-1 border-t border-border bg-surface px-3 pt-2" style={{ paddingBottom: bottom }}>
