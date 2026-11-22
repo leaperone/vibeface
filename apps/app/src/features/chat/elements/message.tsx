@@ -20,7 +20,8 @@ function deliveryMark(message: ChatMessage) {
   const label = message.state === 'sending' ? '正在确认送达' : message.state === 'queued' ? '已排队' : message.state === 'merging' ? '已登记为回合补充' : message.state === 'merged' ? mergedLabels[message.merged ?? 'unknown'] : null
   if (!label) return null
   const Icon = message.state === 'merged' && (message.merged ?? 'unknown') === 'unknown' ? CircleQuestionMark : message.state === 'merging' || message.state === 'merged' ? Merge : Clock
-  return <span role="img" aria-label={label} title={label} className={Icon === CircleQuestionMark ? 'text-warning' : 'text-secondary'}><Icon aria-hidden="true" className="size-3.5" /></span>
+  const unknown = Icon === CircleQuestionMark
+  return <span className={`flex items-center gap-1 text-sm ${unknown ? 'text-warning' : 'text-secondary'}`}><span role="img" aria-label={label} title={label}><Icon aria-hidden="true" className="size-3.5" /></span>{unknown ? <span aria-hidden="true">未确认</span> : null}</span>
 }
 
 /** A long message shows its first lines until expanded. */
@@ -63,7 +64,8 @@ export function Message({ message, conversationId, schedule, time: shown, retry,
   if (user) return <div className="flex min-w-0 flex-col items-end gap-1" data-message-id={messageKey(message)}>
     {message.text ? <div title={full} className={styles.user} data-sending={message.state === 'sending' || message.state === 'queued' || message.state === 'merging' || undefined}><span className="sr-only">你：</span><FoldedText text={message.text} /></div> : null}
     {message.attachments?.map((file) => <div key={`${conversationId ?? ''}:${file.hash}`} className="w-full min-w-0 max-w-[85%] sm:max-w-[75%]"><Artifact file={file} conversationId={conversationId} /></div>)}
-    {mark || time ? <span className="flex items-center gap-1 px-1">{mark}{time}</span> : null}
+    {/* Always mounted so a delivery state that appears later is announced. */}
+    <span aria-live="polite" className="flex items-center gap-1 px-1">{mark}{time}</span>
   </div>
   if (message.role === 'bot') return <div className="flex min-w-0 flex-col items-start gap-1" data-message-id={messageKey(message)}>
     <span className="flex min-w-0 max-w-full items-center gap-1.5 text-sm text-secondary">

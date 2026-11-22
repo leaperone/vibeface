@@ -1,6 +1,6 @@
 import { Bot, CirclePause, CircleX, Clock, RotateCcw } from 'lucide-react-native'
 import { memo, type ReactNode } from 'react'
-import { Pressable, View } from 'react-native'
+import { Pressable, View, type AccessibilityActionEvent } from 'react-native'
 import Animated, { FadeInDown, ReduceMotion } from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
 import { failureText, replyFailure } from '@vibeface/client/lib/errors.ts'
@@ -22,17 +22,17 @@ const rise = FadeInDown.duration(settle).easing(easeOut).withInitialValues({ tra
 const ended: Record<string, string> = { stopped: '已中断', interrupted: '已中断', failed: '失败' }
 
 /**
- * Long-pressing the text opens the copy, share and quote sheet; VoiceOver and TalkBack reach it as a named action. Only
- * the text is wrapped, so attachments keep their own buttons.
+ * Long-pressing the text opens the copy, share and quote sheet. The press area is not an accessibility element, so links
+ * and code copy buttons inside stay focusable; assistive tech reaches the sheet through `holdActions` on the row instead.
  */
-function Hold({ text, choose, children }: { text: string; choose: (() => void) | null; children: ReactNode }) {
-  return <Pressable accessible accessibilityLabel={text} accessibilityHint={choose ? '长按可复制、分享或引用' : undefined}
-    accessibilityActions={choose ? [{ name: 'longpress', label: '复制、分享或引用' }] : undefined}
-    onAccessibilityAction={(event) => { if (event.nativeEvent.actionName === 'longpress') choose?.() }}
-    onLongPress={choose ?? undefined}>
-    {children}
-  </Pressable>
+function Hold({ choose, children }: { choose: (() => void) | null; children: ReactNode }) {
+  return <Pressable accessible={false} onLongPress={choose ?? undefined}>{children}</Pressable>
 }
+
+const holdActions = (choose: (() => void) | null) => choose ? {
+  accessibilityActions: [{ name: 'longpress', label: '复制、分享或引用' }],
+  onAccessibilityAction: (event: AccessibilityActionEvent) => { if (event.nativeEvent.actionName === 'longpress') choose() },
+} : {}
 
 /**
  * The person's message in a bubble on the right; a bot's reply as plain text across the full width; another bot's in a
@@ -49,28 +49,28 @@ export const Message = memo(function Message({ message, bot, time: shown, offlin
   const { choose, feedback } = useMessageActions({ message, onCopy, onShare, onQuote })
   const time = shown ? <Text className="text-sm text-muted" style={{ fontVariant: ['tabular-nums'] }}>{shown}</Text> : null
   const attachments = message.attachments?.length ? <MessageAttachments files={message.attachments} scope={attachmentScope} read={readAttachment} /> : null
-  if (user) return <Rise entering={entering} className="max-w-[85%] items-end gap-1 self-end">
+  if (user) return <Rise entering={entering} {...holdActions(message.text ? choose : null)} className="max-w-[85%] items-end gap-1 self-end">
     <MessageBubble>
-      {message.text ? <Hold text={message.text} choose={choose}><Text className="text-foreground">{message.text}</Text></Hold> : null}
+      {message.text ? <Hold choose={choose}><Text className="text-foreground">{message.text}</Text></Hold> : null}
       {attachments}
     </MessageBubble>
     {feedback}
     {message.state === 'sending' ? <Icon as={Clock} accessibilityLabel="发送中" className="text-muted" /> : time}
   </Rise>
-  if (message.role === 'bot') return <Rise entering={entering} className="max-w-[85%] items-start gap-1">
+  if (message.role === 'bot') return <Rise entering={entering} {...holdActions(choose)} className="max-w-[85%] items-start gap-1">
     <View className="flex-row items-center gap-1.5">
       <Icon as={Bot} className="text-muted" />
       <Text numberOfLines={1} className="shrink text-sm text-muted">{message.sender?.name ?? '另一个 Bot'}</Text>
     </View>
     <MessageBubble>
-      <Hold text={message.text} choose={choose}><Markdown text={message.text} /></Hold>
+      <Hold choose={choose}><Markdown text={message.text} /></Hold>
       {attachments}
     </MessageBubble>
     {feedback}
     {time}
   </Rise>
-  return <Rise entering={entering} className="gap-1">
-    {message.text ? <Hold text={message.text} choose={message.state !== 'streaming' ? choose : null}><Markdown text={message.text} /></Hold> : null}
+  return <Rise entering={entering} {...holdActions(message.text && message.state !== 'streaming' ? choose : null)} className="gap-1">
+    {message.text ? <Hold choose={message.state !== 'streaming' ? choose : null}><Markdown text={message.text} /></Hold> : null}
     {attachments}
     {feedback}
     {message.state === 'streaming' ? <View accessible accessibilityRole="image" accessibilityLabel="正在回复" className="h-6 justify-center">

@@ -22,10 +22,12 @@ function checkReason(check: Pick<PendingCheck, "detail">): string {
 }
 
 export function confirmText(check: Pick<WorkCheck, "reason" | "detail">, device: string): string {
-  return check.reason === "offline" ? `${device} 离线了，报不回这个任务的结果。`
-    : check.reason === "disconnected" ? `${device} 上的 Codex 断开了，报不回这个任务的结果。`
-    : check.detail.startsWith("设备已移除") ? `${device} 已移除，报不回这个任务的结果。`
-    : checkReason(check)
+  return check.reason === "offline" ? `${device} 离线`
+    : check.reason === "disconnected" ? `${device} 上的 Codex 断开`
+    : check.detail.startsWith("设备已移除") ? `${device} 已移除`
+    : /restart/i.test(check.detail) ? "设备重启了"
+    : /stream closed|frame limit|disconnect|connection/i.test(check.detail) ? "连接断了"
+    : "结果没法自动确认"
 }
 
 const confirmIcons = { offline: WifiOff, disconnected: Unplug, unverified: CircleQuestionMark }
@@ -78,7 +80,7 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
     title={`待确认 · ${check.works.length} 个任务`}
     meta={device}
   >
-    <p className="text-secondary">{check.reason === "offline" ? "设备离线了" : "Codex 断开了"}，暂时收不到这些任务的结果。</p>
+    <p className="text-secondary">{check.reason === "offline" ? `${device} 离线` : `${device} 上的 Codex 断开`} · 它们做完了吗？</p>
     <ul className="divide-y overflow-hidden rounded-control border bg-surface">
       {check.works.map((work) => {
         const bot = botOf(work)
@@ -104,7 +106,7 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
     meta={device}
     actions={viewTask(check)}
   >
-    <p>{reason}</p>
+    <p>{reason} · 它做完了吗？</p>
     {bot ? <Link to="/b/$botId" params={{ botId: bot.bot_id }} className="inline-flex w-fit max-w-full min-w-0 items-center gap-1.5 rounded-control text-sm font-medium underline-offset-4 hover:underline max-md:min-h-11">
       <BotFace bot={bot} mood="idle" size={16} /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-secondary" /></Link> : null}
     <Details label="补充说明（可选）"><Textarea label="补充说明" id={`${id}-note`} aria-label="补充说明" rows={2} maxLength={2000} value={note} disabled={disabled} onChange={(event) => setNote(event.target.value)} /></Details>

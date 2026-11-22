@@ -26,7 +26,7 @@ import type { InputTarget,ManagerJob,PendingMessage,SentBotMessage,WorkRecord } 
 import { Button } from '@vibeface/uiarc/button/button.tsx'
 import buttonStyles from '@vibeface/uiarc/button/button.module.css'
 import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
-import { ArrowDown,ArrowRightLeft,Bot,ChevronRight,CircleCheck,CircleQuestionMark,CircleStop,CircleX,Crown,Hourglass,Laptop,ListChecks,LoaderCircle,MessageSquareOff,MessageSquareReply,Plus,RotateCcw,RotateCw,Send,WifiOff } from 'lucide-react'
+import { ArrowDown,ArrowRightLeft,Bot,ChevronRight,CircleCheck,CircleQuestionMark,CircleStop,CircleX,Crown,Hourglass,Laptop,ListChecks,LoaderCircle,MessageSquareOff,MessageSquareReply,Plus,RotateCcw,RotateCw,Send,Unplug,WifiOff } from 'lucide-react'
 import { useEffect,useRef,useState,type ReactNode,type RefObject } from 'react'
 import { ChangeCard } from './change-card'
 import './chat.css'
@@ -52,6 +52,7 @@ function NoBot() {
 export function ConversationScreen({ missing = false, active }: { missing?: boolean; active: boolean }) {
   const workspace = useWorkspace()
   const navigate = useNavigate()
+  const pathname = useRouterState({ select: (state) => state.location.pathname })
   const routeRoutine = useRouterState({ select: (state) => 'routine' in state.location.search && typeof state.location.search.routine === 'string' ? state.location.search.routine : null })
   const { directory, ready, retryNow } = useDevice()
   const draftStorage = storageOf(webPlatform.storage)
@@ -164,7 +165,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const toAnswer = questions.filter((question) => awaitsAnswer(question, workspace.answered, folded.answers))
   const asked = toAnswer[0]
   const stopping = activeJobs.some((job) => job.state === 'cancelling')
-  if (botBusy && !live.length && !asked) entries.push({ key: 'activity', node: <p role="status" className="flex min-h-7 items-center gap-2 text-sm text-secondary">{bot ? <BotFace bot={bot} mood={workspace.connectionOnline && remote?.reachable !== false ? 'thinking' : 'asleep'} size={24} /> : null}{stopping ? '正在停止' : '思考中'}</p> })
+  if (botBusy && !live.length && !asked) entries.push({ key: 'activity', node: <p role="status" className="flex min-h-7 items-center gap-2 text-sm text-secondary">{bot ? <BotFace bot={bot} mood={workspace.connectionOnline && remote?.reachable !== false ? 'thinking' : 'asleep'} size={24} /> : null}{stopping ? '正在停止' : !workspace.connectionOnline || remote?.reachable === false ? '暂时收不到进展' : '思考中'}</p> })
   entries.push(...waiting)
   // The replies and questions this chat's badge counted when it came on screen start under 新消息.
   const unread = firstUnread(timeline, workspace.fresh, (aside) => 'waiting' in aside && aside.waiting === true && workspace.fresh.has(aside.key))
@@ -184,10 +185,12 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
       <ActionButton variant="primary" disabled={!workspace.writable || !agentReady} action={() => workspace.settleUnanswered(unanswered, 'reply')}>{here ? <><Laptop aria-hidden="true" />由 {nodeName(here.device_id, lookup)} 回复</> : '现在回复'}</ActionButton>
     </>}>{lastUnanswered ? <p className="line-clamp-2 text-secondary">{lastUnanswered.text}</p> : null}</ActionCard> : null,
     ...checks.map((check) => <ConfirmCard key={check.check_id} check={check} />),
+    remote && !remote.reachable && !ownerAway && newest?.role === 'user' ? <ActionCard key="owner-unknown" icon={Unplug} title={`${nodeName(remote.owner, lookup)} 连不上，回复情况未知`} /> : null,
     ...reconciling.map((job) => <ActionCard key={`reconcile:${job.trigger}`} icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => workspace.refresh()}>再查一次</ActionButton>} />),
     ...pendingMessages.filter(undecided).map(inputStatus),
   ].filter(Boolean)
-  const attention = cards.length + (requery && !reconciling.length ? 1 : 0)
+  // Waiting tasks surface as question cards and confirming ones as ConfirmCards; the rest are counted here.
+  const attention = cards.length + (requery && !reconciling.length ? 1 : 0) + tasks.filter((task) => task.attention && task.state !== 'waiting' && !confirming.has(task.id)).length
   const sending = pendingMessages.filter((pending) => !undecided(pending))
   const changeGroups = [...placedChanges.first, ...[...placedChanges.after.values()].flat()]
   const runtime = jobs.filter((job) => job.runtime).at(-1)?.runtime
@@ -207,6 +210,8 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const setupTo = setupDevice ? '/devices/$deviceId' : '/devices'
   const canSetUp = ready?.principal.can_manage === true || ready?.principal.source === 'local_session'
 
+  // The drawer outlives navigation, so a link inside it that leaves this chat closes it.
+  useEffect(() => { setActivityOpen(false); activityFrom.current = null }, [conversationId, pathname])
   // Picked files belong to the bot they were picked for.
   useEffect(() => { setSendError(null); setFiles([]); setSelectedTarget(routeRoutine ? `routine:${routeRoutine}` : 'main') }, [conversationId, routeRoutine])
   // Nothing pushes a device's bot readiness, so while a device that could reply to an open bot is not ready, read it again every 10s, or every 2s while it starts.
@@ -261,7 +266,6 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
             <h2 className="max-w-full text-lg font-medium [overflow-wrap:anywhere]">{bot.name}</h2>
             {workspace.primary === bot.conversation_id ? <PrimaryMark labeled /> : null}
           </div>
-          {!needsSetup ? <p className="text-sm leading-relaxed text-secondary">说说你想完成的第一件事，也可以随时补充要求。</p> : null}
           {starting ? <p role="status" className="flex items-center gap-1.5 text-secondary"><LoaderCircle aria-hidden="true" className={`size-4 shrink-0 ${workspace.connectionOnline ? 'animate-spin' : ''}`} />Bot 正在启动</p>
             : needsSetup ? <>
             <p className="flex items-center gap-1.5 text-secondary"><MessageSquareOff aria-hidden="true" className="size-4 shrink-0" />Bot 还不能回复</p>
@@ -353,7 +357,7 @@ function TaskHistory({ tasks, botId, attention, open, onOpenChange, onOpen, from
   useEffect(() => () => { from.current = null }, [])
   const leave = () => { from.current = null; onOpenChange(false) }
   return <>
-    <PageActions><Button ref={trigger} type="button" variant="ghost" size="sm" aria-label="动态" title="动态" className="relative" onClick={() => onOpen(trigger.current)}><ListChecks aria-hidden="true" />{attention ? <Dot tone="warning" className="absolute end-1 top-1" /> : null}</Button></PageActions>
+    <PageActions><Button ref={trigger} type="button" variant="ghost" size="sm" aria-label={attention ? `动态，${attention} 项要处理` : '动态'} title={attention ? `动态，${attention} 项要处理` : '动态'} className="relative" onClick={() => onOpen(trigger.current)}><ListChecks aria-hidden="true" />{attention ? <Dot tone="warning" className="absolute end-1 top-1" /> : null}</Button></PageActions>
     <Drawer open={open} onOpenChange={onOpenChange}>
       <DrawerContent title="动态" className="!w-full min-w-0 gap-0 sm:!max-w-md" onCloseAutoFocus={(event) => { event.preventDefault(); from.current?.focus({ preventScroll: true }) }}>
         <div className="grid min-h-0 flex-1 content-start gap-6 overflow-y-auto px-4 pb-6">

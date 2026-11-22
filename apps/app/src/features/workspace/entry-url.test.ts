@@ -3756,9 +3756,9 @@ test('chat task history keeps completed and unknown records while counting only 
   const badge = () => render().some(({ type }) => type === 'Dot')
   const status = () => componentText(harness.render({ active: true }).find(({ type }) => type === 'PromptInput')?.props.above)
   try {
-    assert.equal(label(), '动态')
+    assert.equal(label(), '动态，2 项要处理')
     assert.equal(badge(), true, 'the unverifiable work needs the person')
-    assert.match(status(), /^1 项要处理待处理$/, 'the open approval is the question pill, not a running task')
+    assert.match(status(), /^2 项要处理待处理$/, 'the failed and unverifiable works count; the open approval is the question pill, not a running task')
 
     assert.equal(render().filter(({ type, props }) => type === 'Link' && props.to === '/b/$botId/work/$workId').length, 4, 'history includes completed, missing-origin and uncertain execution records')
     assert.equal(render().filter(({ type, props }) => type === 'Link' && props.to === '/tasks').length, 1, 'task conversations have a separate navigation entry')
@@ -3789,7 +3789,7 @@ test('chat task history keeps completed and unknown records while counting only 
     assert.equal(prevented, true, 'ordinary dismissal explicitly handles the portalled opener')
     assert.equal(restoredFocus, 1, 'ordinary dismissal restores the actual opening button')
     shared.connectionOnline = false
-    assert.match(status(), /1 项要处理$/, 'offline active tasks are uncertain instead of counted as running')
+    assert.match(status(), /2 项要处理$/, 'offline active tasks are uncertain and need the person instead of counting as running')
   } finally { app.close(); harness.app.close() }
 })
 
