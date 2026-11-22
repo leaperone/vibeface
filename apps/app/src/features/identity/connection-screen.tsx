@@ -2,6 +2,7 @@ import { AuthPage,claimFocus,Details,EmptyState,InlineError,Panel,PasswordInput,
 import { localCopy } from '@/features/workspace/local-session'
 import { defaultBrowserName,defaultComputerName,lastBrowserName,rememberBrowserName } from '@/lib/device-name'
 import { webPlatform } from '@/lib/platform'
+import { cn } from '@/lib/utils'
 import { primaryLane } from '@vibeface/client/identity/connection-lane.ts'
 import { notJoined,removedText,useDevice } from '@vibeface/client/identity/context.tsx'
 import { joinCopy,manualCopy,passwordCopy,recoveryCopy,startCopy } from '@vibeface/client/identity/copy.ts'
@@ -429,7 +430,11 @@ function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
   return <Panel icon={FileKey} title="保存恢复文件">
     <SaveRecoveryFile code={code} saved={saved} onSaved={setSaved} busy={busy} download={{ done: downloaded, run: () => void run('download', async ({ current }) => { await device.downloadBackup(); if (current()) setDownloaded(true) }) }} />
     <div className="grid gap-2">
-      {saved ? null : <p id="bootstrap-hint" className="text-sm text-secondary">{downloaded ? `勾选「${recoveryCopy.keptApart}」后，才能完成创建` : `下载恢复文件并勾选「${recoveryCopy.keptApart}」后，才能完成创建`}</p>}
+      {/* Both lines share one cell and the line keeps the taller one's height, so checking the box never moves 完成创建 under the pointer. */}
+      <p id="bootstrap-hint" className="grid text-sm text-secondary">
+        <span className={cn('col-start-1 row-start-1', saved && 'invisible')}>{downloaded ? `勾选「${recoveryCopy.keptApart}」后，才能完成创建` : `下载恢复文件并勾选「${recoveryCopy.keptApart}」后，才能完成创建`}</span>
+        <span className={cn('col-start-1 row-start-1', !saved && 'invisible')}>可以完成创建了</span>
+      </p>
       <div className="flex justify-between gap-2">
         <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={device.cancelSensitive}>上一步</Button>
         <Button type="button" disabled={!saved || busy} aria-busy={busy || undefined} aria-describedby={saved ? undefined : 'bootstrap-hint'} onClick={() => void run('bootstrap', async () => {
