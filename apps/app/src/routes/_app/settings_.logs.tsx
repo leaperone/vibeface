@@ -11,7 +11,7 @@ import { nodeName } from '@vibeface/client/workspace/labels.ts'
 import { Button } from '@vibeface/uiarc/button/button.tsx'
 import { Input } from '@vibeface/uiarc/input/input.tsx'
 import { Select } from "@vibeface/uiarc/select/select.tsx"
-import { Bot,ChevronDown,CircleX,Code,Copy,Globe,Layers,ListChecks,MessagesSquare,RefreshCw,ScrollText,Search,Terminal,TriangleAlert,X,type LucideIcon } from 'lucide-react'
+import { Bot,ChevronDown,CircleX,Code,Copy,Globe,Layers,ListChecks,MessagesSquare,Monitor,RefreshCw,ScrollText,Search,Terminal,TriangleAlert,X,type LucideIcon } from 'lucide-react'
 import { useCallback,useEffect,useRef,useState } from 'react'
 
 export const Route = createFileRoute('/_app/settings_/logs')({ component: LogsPage })
@@ -21,7 +21,7 @@ const levelChoices: Array<{ value: LevelChoice; label: string; icon: LucideIcon 
   { value: 'all', label: '全部', icon: Layers }, { value: 'warn', label: '有问题', icon: TriangleAlert }, { value: 'error', label: '错误', icon: CircleX },
 ]
 const sourceChoices: Array<[LogSource, string, LucideIcon]> = [
-  ['node', terms.thisComputer.label, terms.thisComputer.icon], ['web', '网页', Globe], ['agent', 'Bot', Bot], ['cli', '命令行', Terminal], ['codex', 'Codex', Code],
+  ['node', terms.thisComputer.label, terms.thisComputer.icon], ['web', '网页', Globe], ['agent', 'Bot', Bot], ['cli', '命令行', Terminal], ['codex', 'Codex', Code], ['desktop', '桌面端', Monitor],
 ]
 const sourceLabel = Object.fromEntries(sourceChoices.map(([value, label]) => [value, label])) as Record<LogSource, string>
 const sourceIcon = Object.fromEntries(sourceChoices.map(([value, , icon]) => [value, icon])) as Record<LogSource, LucideIcon>
@@ -32,7 +32,7 @@ const alertLook: Partial<Record<LogLevel, { icon: LucideIcon; tone: string; labe
 }
 
 /** Codex and Cursor print their own output; its ERROR words are not this device's errors, so it stays grey and out of the error filter. */
-const external = (record: LogRecord) => record.source === 'codex' || record.source === 'cursor'
+const external = (record: LogRecord) => record.source === 'codex'
 
 type Fields = Record<string, unknown>
 const str = (value: unknown) => typeof value === 'string' && value ? value : undefined

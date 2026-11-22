@@ -1,6 +1,6 @@
 /** Browser records for the connected device's log: errors, failed requests and user actions. */
 export type LogLevel = "trace" | "debug" | "info" | "warn" | "error"
-export type LogSource = "node" | "web" | "agent" | "cli" | "codex" | "cursor"
+export type LogSource = "node" | "web" | "agent" | "cli" | "codex" | "desktop"
 
 export type LogRecord = {
   ts_ms: number
@@ -118,7 +118,7 @@ export type LogFilter = {
 }
 
 const levels: LogLevel[] = ["trace", "debug", "info", "warn", "error"]
-const sources: LogSource[] = ["node", "web", "agent", "cli", "codex", "cursor"]
+const sources: LogSource[] = ["node", "web", "agent", "cli", "codex", "desktop"]
 
 export function parseLogs(value: unknown): LogRecord[] {
   const records = (value as { records?: unknown } | null)?.records

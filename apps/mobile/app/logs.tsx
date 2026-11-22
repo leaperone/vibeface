@@ -13,9 +13,9 @@ import { useClipboardAction } from '@/lib/use-clipboard'
 import { useRun } from '@/lib/use-run'
 import { useLive } from '@/data/live'
 
-const sourceLabels: Record<LogSource, string> = { node: '设备', web: '网页', agent: 'Bot', cli: '命令行', codex: 'Codex', cursor: 'Cursor' }
+const sourceLabels: Record<LogSource, string> = { node: '设备', web: '网页', agent: 'Bot', cli: '命令行', codex: 'Codex', desktop: '桌面端' }
 const levelLabels: Record<LogLevel, string> = { trace: '跟踪', debug: '调试', info: '信息', warn: '有问题', error: '错误' }
-const external = (record: LogRecord) => record.source === 'codex' || record.source === 'cursor'
+const external = (record: LogRecord) => record.source === 'codex'
 const eventTitles: Record<string, string> = {
   'agent.turn.started': 'Bot 开始回复',
   'agent.turn.finished': 'Bot 回复结束',
