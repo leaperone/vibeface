@@ -10,9 +10,8 @@ import { requestKey } from "../lib/secure.ts"
 import { notificationForOpening, type Platform } from "../lib/platform.ts"
 import type { Tabs } from "../identity/context.tsx"
 import { mergeProgress, type LiveProgress } from "../lib/progress.ts"
-import { inputTargetKey, inputTaskCommand, isQueuedReceipt, prepareSend, retryText } from "../chat/protocol.ts"
+import { inputTargetKey, inputTaskCommand, isQueuedReceipt, prepareSend, replyUnsettled, retryText } from "../chat/protocol.ts"
 import { taskActive } from "./labels.ts"
-import { outcomeUnknown } from "../lib/errors.ts"
 import { byRank, unreadReply } from "../chat/timeline.ts"
 import {
   inputText, parseConversation, parseNodeReport, parseNotifications,
@@ -1445,7 +1444,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const asked = messages.find((message) => message.message_id === messageId && message.role === "user")
     const newest = messages.at(-1)
     const job = shown?.scheduler?.jobs.find((item) => item.message_id === messageId)
-    if (activeId.current !== id || !asked || (newest?.message_id !== messageId && newest?.in_reply_to !== messageId) || !job || !["failed", "rejected", "cancelled", "interrupted"].includes(job.state) || outcomeUnknown(job.failure?.kind, job.failure?.detail)) {
+    if (activeId.current !== id || !asked || (newest?.message_id !== messageId && newest?.in_reply_to !== messageId) || !job || !["failed", "rejected", "cancelled", "interrupted"].includes(job.state) || replyUnsettled(job)) {
       setNoticeText("这条已经有新进展了，没有重发。")
       return false
     }
