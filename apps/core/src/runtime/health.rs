@@ -383,60 +383,135 @@ fn log_counts(dir: &Path, since_ms: i64) -> Value {
 #[serde(deny_unknown_fields)]
 struct LogQuery {
     since_ms: Option<i64>,
+    until_ms: Option<i64>,
     level: Option<Level>,
     source: Option<Source>,
     event: Option<String>,
     conversation_id: Option<String>,
     grep: Option<String>,
-    until_ms: Option<i64>,
+    cursor: Option<String>,
     limit: Option<usize>,
+}
+
+/// Where a `read_logs` page stopped: the records at or before `until_ms`, less the newest `skip`
+/// of those at `until_ms`, which earlier pages returned. Opaque to the Agent.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogCursor {
+    until_ms: i64,
+    skip: usize,
+}
+
+impl LogCursor {
+    fn encode(&self) -> String {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(self).expect("cursor JSON"))
+    }
+
+    fn decode(text: &str) -> Result<Self> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let bytes = URL_SAFE_NO_PAD
+            .decode(text)
+            .ok()
+            .context("invalid read_logs cursor")?;
+        serde_json::from_slice(&bytes).context("invalid read_logs cursor")
+    }
 }
 
 /// Characters of one record's message, and bytes of its fields as JSON, a `read_logs` page keeps.
 const LOG_MESSAGE_CHARS: usize = 2_000;
 const LOG_FIELDS_BYTES: usize = 2_000;
 
-/// `read_logs`: the newest matching records of `node.log`, redacted, at most `MAX_LOG_READ` and
-/// `PAGE_BYTES` of JSON. When older records did not fit, the page says `truncated` and names the
-/// `until_ms` that reads on from where it stopped.
+/// `read_logs`: the newest matching records of `node.log` by `ts_ms`, redacted, at most
+/// `MAX_LOG_READ` and `PAGE_BYTES` of JSON. When older records did not fit, the page says
+/// `truncated` and gives the `cursor` that reads on from where it stopped.
 pub(crate) fn read_logs(dir: &Path, args: &Value) -> Result<Value> {
     let query: LogQuery =
         serde_json::from_value(args.clone()).context("invalid read_logs arguments")?;
     let limit = query.limit.unwrap_or(50).clamp(1, MAX_LOG_READ);
+    let cursor = query.cursor.as_deref().map(LogCursor::decode).transpose()?;
+    let (until_ms, skip) = match (cursor, query.until_ms) {
+        (Some(cursor), until) if until.is_none_or(|until| cursor.until_ms <= until) => {
+            (Some(cursor.until_ms), cursor.skip)
+        }
+        (_, until) => (until, 0),
+    };
     let filter = Filter {
         since_ms: query.since_ms,
-        until_ms: query.until_ms,
+        until_ms,
         level: query.level,
         sources: query.source.into_iter().collect(),
         event: query.event,
         conversation_id: query.conversation_id,
         text: query.grep,
-        limit: Some(limit),
+        limit: Some(limit.saturating_add(skip).min(crate::logging::MAX_READ)),
         ..Default::default()
     };
     let mut records = crate::logging::read(dir, &filter)?;
-    // Room for the envelope, `truncated` and `until_ms`.
-    let mut room = super::agent_tools::PAGE_BYTES - 64;
+    // A clock set back writes older times after newer ones; pages follow the times.
+    records.sort_by_key(|record| record.ts_ms);
+    if let Some(until) = until_ms {
+        let at_until = records
+            .iter()
+            .rev()
+            .take_while(|record| record.ts_ms == until)
+            .count();
+        records.truncate(records.len() - skip.min(at_until));
+    }
+    if records.len() > limit {
+        records.drain(..records.len() - limit);
+    }
+    // Room for the envelope, `truncated` and `cursor`.
+    let mut room = super::agent_tools::PAGE_BYTES - 200;
     let mut page: Vec<crate::logging::Record> = Vec::new();
     while let Some(record) = records.pop() {
-        let record = shortened(record);
-        let size = serde_json::to_string(&record)?.len() + 1;
-        if size > room {
-            let newest = page.first().map_or(i64::MAX, |kept| kept.ts_ms);
-            // Records sharing the cut's millisecond come again, unless the whole page shares it.
-            let until_ms = if record.ts_ms < newest {
-                record.ts_ms
-            } else {
-                record.ts_ms - 1
-            };
-            page.reverse();
-            return Ok(json!({"records":page,"truncated":true,"until_ms":until_ms}));
+        let mut record = shortened(record);
+        let mut size = serde_json::to_string(&record)?.len() + 1;
+        if size > room && page.is_empty() {
+            // Not even one record fits: cut it further, so every page moves on.
+            record = squeezed(record, room);
+            size = serde_json::to_string(&record)?.len() + 1;
         }
-        room -= size;
+        if size > room && !page.is_empty() {
+            records.push(record);
+            break;
+        }
+        room = room.saturating_sub(size);
         page.push(record);
     }
+    let next = page.last().filter(|_| !records.is_empty()).map(|oldest| {
+        let returned = page
+            .iter()
+            .rev()
+            .take_while(|record| record.ts_ms == oldest.ts_ms)
+            .count();
+        let earlier = if until_ms == Some(oldest.ts_ms) {
+            skip
+        } else {
+            0
+        };
+        LogCursor {
+            until_ms: oldest.ts_ms,
+            skip: earlier + returned,
+        }
+        .encode()
+    });
     page.reverse();
-    Ok(json!({"records":page}))
+    Ok(match next {
+        Some(cursor) => json!({"records":page,"truncated":true,"cursor":cursor}),
+        None => json!({"records":page}),
+    })
+}
+
+/// `record` cut until its JSON fits in `room` bytes: no fields, then ever shorter messages.
+fn squeezed(mut record: crate::logging::Record, room: usize) -> crate::logging::Record {
+    record.fields = serde_json::Map::from_iter([("truncated".to_owned(), json!(true))]);
+    let mut chars = record.message.chars().count();
+    while chars > 0 && serde_json::to_string(&record).map_or(0, |text| text.len()) + 1 > room {
+        chars /= 2;
+        record.message = record.message.chars().take(chars).collect::<String>() + "…";
+    }
+    record
 }
 
 /// `record` with its message and its fields cut to a fixed prefix.
@@ -904,55 +979,127 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn read_logs_pages_large_records_by_bytes() -> Result<()> {
+    /// A log directory holding `count` records, record `index` at `ts(index)` and built by `fill`.
+    fn log_dir(
+        name: &str,
+        count: i64,
+        ts: impl Fn(i64) -> i64,
+        fill: impl Fn(&mut crate::logging::Record),
+    ) -> Result<PathBuf> {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
-            .join(format!("health-log-pages-{}", uuid::Uuid::new_v4()));
+            .join(format!("{name}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let mut lines = String::new();
-        for index in 0..100 {
-            let record = crate::logging::Record {
-                ts_ms: index,
+        for index in 0..count {
+            let mut record = crate::logging::Record {
+                ts_ms: ts(index),
                 level: Level::Error,
                 source: Source::Mobile,
                 event: "mobile.uncaught".into(),
-                message: format!("{index} {}", "x".repeat(5_000)),
+                message: format!("{index} "),
                 conversation_id: None,
                 work_id: None,
                 thread_id: None,
-                fields: serde_json::Map::from_iter([(
-                    "stack".to_owned(),
-                    json!("y".repeat(5_000)),
-                )]),
+                fields: Default::default(),
             };
+            fill(&mut record);
             lines.push_str(&serde_json::to_string(&record)?);
             lines.push('\n');
         }
         std::fs::write(dir.join(crate::logging::FILE), lines)?;
-        let (mut seen, mut until_ms, mut pages) = (Vec::new(), None, 0);
+        Ok(dir)
+    }
+
+    /// Every page from the newest on, following `cursor`: the indexes the messages start with,
+    /// oldest first, and the number of pages.
+    fn read_every_page(dir: &Path) -> Result<(Vec<i64>, usize)> {
+        let (mut seen, mut cursor, mut pages) = (Vec::new(), None::<String>, 0);
         loop {
-            let page = read_logs(&dir, &json!({"limit":200,"until_ms":until_ms}))?;
+            let page = read_logs(dir, &json!({"limit":200,"cursor":cursor}))?;
             assert!(page.to_string().len() <= super::super::agent_tools::PAGE_BYTES);
             pages += 1;
+            assert!(pages <= 200, "the pages move on");
             let records = page["records"].as_array().unwrap();
-            assert!(records.iter().all(|record| {
-                record["message"].as_str().unwrap().chars().count() <= LOG_MESSAGE_CHARS + 1
-                    && record["fields"]["truncated"] == true
-            }));
-            let mut ts: Vec<i64> = records
+            assert!(!records.is_empty());
+            let mut indexes: Vec<i64> = records
                 .iter()
-                .map(|r| r["ts_ms"].as_i64().unwrap())
+                .map(|record| {
+                    let message = record["message"].as_str().unwrap();
+                    assert!(message.chars().count() <= LOG_MESSAGE_CHARS + 1);
+                    message.split(' ').next().unwrap().parse().unwrap()
+                })
                 .collect();
-            ts.append(&mut seen);
-            seen = ts;
+            indexes.append(&mut seen);
+            seen = indexes;
             if page["truncated"] != true {
+                assert!(page.get("cursor").is_none());
                 break;
             }
-            until_ms = Some(page["until_ms"].as_i64().unwrap());
+            cursor = Some(page["cursor"].as_str().unwrap().to_owned());
         }
+        Ok((seen, pages))
+    }
+
+    fn large(record: &mut crate::logging::Record) {
+        record.message.push_str(&"x".repeat(5_000));
+        record.fields =
+            serde_json::Map::from_iter([("stack".to_owned(), json!("y".repeat(5_000)))]);
+    }
+
+    #[test]
+    fn read_logs_pages_large_records_by_bytes() -> Result<()> {
+        let dir = log_dir("health-log-pages", 100, |index| index, large)?;
+        let (seen, pages) = read_every_page(&dir)?;
         assert!(pages > 1, "a page of 100 large records is split");
         assert_eq!(seen, (0..100).collect::<Vec<_>>());
+        let first = read_logs(&dir, &json!({"limit":200}))?;
+        assert!(first["records"][0]["fields"]["truncated"] == true);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn read_logs_pages_records_of_one_millisecond() -> Result<()> {
+        let dir = log_dir("health-log-same-ms", 100, |_| 5, large)?;
+        let (seen, pages) = read_every_page(&dir)?;
+        assert!(pages > 1);
+        assert_eq!(seen, (0..100).collect::<Vec<_>>());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn read_logs_follows_times_when_the_clock_went_back() -> Result<()> {
+        // Written 0..50 at 100.. and then 50..100 at 0.. after the clock went back.
+        let dir = log_dir(
+            "health-log-clock",
+            100,
+            |index| if index < 50 { 100 + index } else { index - 50 },
+            large,
+        )?;
+        let (seen, _) = read_every_page(&dir)?;
+        let mut expected: Vec<i64> = (50..100).collect();
+        expected.extend(0..50);
+        assert_eq!(seen, expected);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn read_logs_cuts_a_record_larger_than_a_page() -> Result<()> {
+        let dir = log_dir(
+            "health-log-huge",
+            3,
+            |index| index,
+            |record| {
+                record.message.push_str(&"\u{1}".repeat(5_000));
+                record.work_id = Some("w".repeat(31_000));
+            },
+        )?;
+        let (seen, pages) = read_every_page(&dir)?;
+        assert_eq!((seen, pages), (vec![0, 1, 2], 3));
+        assert!(read_logs(&dir, &json!({"cursor":"not a cursor"})).is_err());
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

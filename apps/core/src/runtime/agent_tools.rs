@@ -184,6 +184,9 @@ impl Runtime {
             None
         };
         let mut kind = job.as_ref().map(|job| job.tool_kind());
+        let health_turn = job
+            .as_ref()
+            .is_some_and(|job| super::health::health_turn(&job.trigger));
         if let Some(kind) = kind {
             ensure!(
                 tool.effect().offered(kind),
@@ -192,16 +195,14 @@ impl Runtime {
                     .failure(anyhow::anyhow!("{name} is not offered in a {kind:?} turn"))
             );
         }
-        if let Some(job) = &job {
-            ensure!(
-                !super::health::health_turn(&job.trigger) || super::health::health_turn_tool(tool),
-                Execution::NotStarted
-                    .with(Approval::Denied)
-                    .failure(anyhow::anyhow!(
-                        "a health reminder's turn does not dispatch, control or wake work"
-                    ))
-            );
-        }
+        ensure!(
+            !health_turn || super::health::health_turn_tool(tool),
+            Execution::NotStarted
+                .with(Approval::Denied)
+                .failure(anyhow::anyhow!(
+                    "a health reminder's turn does not dispatch, control or wake work"
+                ))
+        );
         if matches!(tool, Tool::ReadLogs | Tool::ReadHealth) {
             let allowed = match &job {
                 Some(job) => {
@@ -305,8 +306,8 @@ impl Runtime {
             Tool::WorkspaceState | Tool::WorkspaceHistory | Tool::WorkspaceCommand => {
                 return self.agent_workspace(&access, &scope, tool, &args).await;
             }
-            Tool::Search => Tool::search(args, kind),
-            Tool::Describe => Tool::describe(args, kind),
+            Tool::Search => Tool::search(args, kind, health_turn),
+            Tool::Describe => Tool::describe(args, kind, health_turn),
             Tool::Call => unreachable!("discovery calls are resolved before admission"),
             Tool::HistorySearch | Tool::HistoryRead => {
                 self.agent_history(&access, &scope, tool, &args).await

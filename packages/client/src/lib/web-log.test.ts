@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Worker } from 'node:worker_threads'
-import { MAX_BATCH, MAX_RECORD_BYTES, createBufferedReporter, createReporter, failureFields, fit, pageIds, type WebRecord } from './web-log.ts'
+import { MAX_BATCH, MAX_RECORD_BYTES, createBufferedReporter, createReporter, failureFields, fit, pageIds, wellFormed, type WebRecord } from './web-log.ts'
 
 const size = (record: WebRecord) => new TextEncoder().encode(JSON.stringify(record)).length
 
@@ -305,4 +305,52 @@ test('the phone keeps the newest 300 and stays within 120 records a minute', asy
   clock += 60_000
   assert.deepEqual(await reporter.send(), { sent: 120, left: 60, connected: true })
   assert.equal(count, 240)
+})
+
+const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
+
+test('a cut never splits an emoji and lone surrogates become U+FFFD', () => {
+  assert.equal(wellFormed('a\uD83Db\uDC00😀'), 'a�b�😀')
+  for (let pad = 0; pad < 8; pad++) {
+    const fitted = fit({ level: 'error', event: 'web.uncaught', message: 'x'.repeat(pad) + '😀'.repeat(4000),
+      fields: { stack: 'y'.repeat(pad) + '🙂'.repeat(3000) } })
+    assert.ok(size(fitted) <= MAX_RECORD_BYTES)
+    assert.doesNotMatch(fitted.message, lone)
+    assert.doesNotMatch(String(fitted.fields?.stack), lone)
+  }
+  const cleaned = fit({ level: 'info', event: 'web.action', message: 'a\uD83D', fields: { stack: '\uDC00', nested: { list: ['\uD800x'] } } })
+  assert.deepEqual(cleaned, { level: 'info', event: 'web.action', message: 'a�', fields: { stack: '�', nested: { list: ['�x'] } } })
+  const intact: WebRecord = { level: 'info', event: 'web.action', message: '😀' }
+  assert.equal(fit(intact), intact)
+})
+
+test('a batch the device refused leaves sent_max where it was; an unknown result raises it', async () => {
+  const storage = memory()
+  const timers: Array<() => void> = []
+  // Only the save delay runs; retries wait for an explicit send.
+  const options = { now: () => 10, later: (run: () => void, ms: number) => { if (ms === 500) timers.push(run) } }
+  const reporter = createBufferedReporter(storage, options)
+  reporter.report({ level: 'info', event: 'mobile.action', message: 'a' })
+  const sentMax = () => { timers.splice(0).forEach(run => run()); return JSON.parse(storage.getItem('vibeface.log-buffer')!).sent_max }
+  let answer: Error = Object.assign(new Error('the Node is updating; try again shortly'), { responded: true })
+  reporter.connect(async () => { throw answer })
+  assert.deepEqual(await reporter.send(), { sent: 0, left: 1, connected: true })
+  assert.equal(sentMax(), 0, 'maintenance wrote nothing')
+  answer = Object.assign(new Error('slow down'), { responded: true, code: 'log_rate_limited' })
+  await reporter.send()
+  assert.equal(sentMax(), 0, 'a rate limit wrote nothing')
+  const unknown = createBufferedReporter(storage, options)
+  unknown.connect(async () => { throw new Error('连接超时。') })
+  await unknown.send()
+  assert.equal(sentMax(), 10, 'the device may have written it')
+})
+
+test('records reported after clearing survive a restart', () => {
+  const storage = memory()
+  const reporter = createBufferedReporter(storage, { now: () => 5, later: () => {} })
+  reporter.report({ level: 'info', event: 'mobile.action', message: 'before' })
+  reporter.clear()
+  reporter.report({ level: 'info', event: 'mobile.action', message: 'after' })
+  reporter.save()
+  assert.equal(createBufferedReporter(storage, { now: () => 5, later: () => {} }).pending(), 1)
 })
