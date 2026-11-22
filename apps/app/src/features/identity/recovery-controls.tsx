@@ -272,6 +272,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
   const busy = Boolean(action)
   const [password, setPassword] = useState('')
   const [tried, setTried] = useState(false)
+  const [mismatch, setMismatch] = useState(false)
   const [open, setOpen] = useState(only ?? (typeof location !== 'undefined' && location.hash === `#${PASSWORD_HASH}` ? 'passphrase' : undefined))
   // Opened from the reminder: the form may sit below the fold on a phone.
   useEffect(() => { if (open === 'passphrase' && !only) document.getElementById(PASSWORD_HASH)?.scrollIntoView({ block: 'center' }) }, [])
@@ -316,8 +317,11 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
   const passphraseForm = open === 'passphrase' ? frame(KeyRound, '换恢复密码', <>
       <p className="text-sm text-secondary">{recoveryCopy.replaceHint}</p>
       {/* A failed try keeps what was typed; a change to any field takes the old error away. */}
-      <form className="grid gap-4" noValidate onChange={clear} onSubmit={(event) => {
+      <form className="grid gap-4" noValidate onChange={() => { clear(); setMismatch(false) }} onSubmit={(event) => {
         event.preventDefault(); const form = event.currentTarget
+        // As when creating: a weak one gets its own reason first, so only a usable one is held against its retyping.
+        const again = form.elements.namedItem('confirm_password') as HTMLInputElement
+        if (passwordStrength(field(form, 'password')).level !== 'weak' && again.value !== field(form, 'password')) { setMismatch(true); again.focus(); return }
         void run('replace', async ({ current }) => {
           const file = fileOf(form)
           if (!field(form, 'old_password')) throw new Error('还没输入旧密码。')
@@ -334,6 +338,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
           <div ><PasswordInput label="新密码" name="password" autoComplete="new-password" required aria-describedby="new-password-strength" onChange={(event) => setPassword(event.target.value)} /></div>
           <PasswordStrength id="new-password-strength" password={password} tried={tried} />
         </div>
+        <PasswordInput label={passwordCopy.again} name="confirm_password" autoComplete="new-password" required error={mismatch ? passwordCopy.mismatch : undefined} />
         <InlineError error={error || null} />
         <div className="flex flex-wrap justify-end gap-2">{!only ? <Button type="button" variant="ghost" onClick={close}>取消</Button> : null}<Button type="submit" aria-busy={busy || undefined}><BusyIcon busy={busy} icon={Download} />换密码并下载新文件</Button></div>
       </fieldset></form>

@@ -4,7 +4,7 @@
 
 ## 程序与设置
 
-启动为已有用途补缺，设备页的 `configure_provider {provider, connect_local:true}` 可以单独准备服务。Web 进入 AI 设置及返回页面时只自动接入并检查 Cursor，登录变化会重新观察，不复用旧检查结果。手动点**自动接入**时按 Codex、Claude Code、Cursor 顺序处理，一项失败仍继续其余服务；写入结果未知时先读完整设置对账。手机开启相应用途走同一接入路径。
+启动为已有用途补缺，设备页的 `configure_provider {provider, connect_local:true}` 可以单独准备服务。Web 打开设备页「Bot 与任务」里的「AI 服务」或首次引导选择服务的一步，以及返回页面时，只自动接入并检查 Cursor，登录变化会重新观察，不复用旧检查结果。手动点**自动接入**时按 Codex、Claude Code、Cursor 顺序处理，一项失败仍继续其余服务；写入结果未知时先读完整设置对账。手机开启相应用途走同一接入路径。
 
 程序先使用保存的选择和 PATH，再查进程 PATH、常见用户目录、Homebrew、npm/Volta/Bun/NVM 安装。Cursor 支持官方 `agent`、`cursor-agent` 入口；Windows 使用 PATHEXT。NVM 按有效 Node 版本降序选择。npm wrapper 启动时补齐 sibling Node 或其他已发现的 Node 目录；仅能从登录 shell 找到所需 Node 时，保存受限 PATH 快照。已选择的绝对程序路径即使失效也不覆盖，Cursor 的旧 SDK Bridge 选择除外，自动接入会重新发现并保存官方 CLI 的绝对路径。有效自定义 CLI 选择保持不变。
 

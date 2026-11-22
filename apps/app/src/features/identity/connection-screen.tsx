@@ -2,9 +2,10 @@ import { AuthPage,claimFocus,Details,EmptyState,InlineError,Panel,PasswordInput,
 import { localCopy } from '@/features/workspace/local-session'
 import { defaultBrowserName,defaultComputerName,lastBrowserName,rememberBrowserName } from '@/lib/device-name'
 import { webPlatform } from '@/lib/platform'
+import { cn } from '@/lib/utils'
 import { primaryLane } from '@vibeface/client/identity/connection-lane.ts'
 import { notJoined,removedText,useDevice } from '@vibeface/client/identity/context.tsx'
-import { joinCopy,manualCopy,recoveryCopy,startCopy } from '@vibeface/client/identity/copy.ts'
+import { joinCopy,manualCopy,passwordCopy,recoveryCopy,startCopy } from '@vibeface/client/identity/copy.ts'
 import { APP_ORIGIN,PUBLIC_GATEWAY } from '@vibeface/client/lib/entrances.ts'
 import { spentInvite,spentInviteText } from '@vibeface/client/lib/errors.ts'
 import { entryAddress,entryKey,messageOf,parseEntry } from '@vibeface/client/lib/node.ts'
@@ -175,6 +176,8 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const usable = !!device.identity && !['blocked', 'key_lost', 'initializing', 'removed', 'restarting'].includes(device.phase)
   const thisComputer = device.localSetup?.kind === 'uninitialized'
   const linking = busy || ['connecting', 'reconnecting'].includes(device.phase)
+  // The official page waits for a link a Node sent; someone with no link, no saved address and no past membership may have no Node yet.
+  const newcomer = official && !removed && !device.initialInvitation && !device.entries.length && purpose !== 'link' && !scanning
   // A newly opened link replaces whatever is here, including a spent one, and the failure that came with it.
   useEffect(() => { if (device.initialInvitation) { setInvitation(device.initialInvitation); setError(''); setNotice('') } }, [device.initialInvitation])
   // A link is single-use: once its request ends without joining, offering 继续 again only leads to "已用过".
@@ -304,6 +307,10 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
           {purpose === 'link' ? <Button type="submit" className="w-fit justify-self-end" aria-busy={linking || undefined}>{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}{linking ? joinCopy.joining : joinCopy.join}</Button> : null}
         </fieldset>
       </form>}
+      {newcomer ? <div className="grid justify-items-start gap-0.5 text-sm text-secondary">
+        <p className="font-medium">{joinCopy.noComputer}</p>
+        <a href={joinCopy.installGuide} target="_blank" rel="noopener noreferrer" className="hit-area relative font-medium text-foreground underline underline-offset-4">{joinCopy.installFirst}</a>
+      </div> : null}
     </Panel>
   }
 
@@ -375,14 +382,16 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
   const device = useDevice()
   const [password, setPassword] = useState('')
   const [tried, setTried] = useState(false)
+  const [mismatch, setMismatch] = useState(false)
   const weak = passwordStrength(password).level === 'weak'
   return <Panel icon={KeyRound} title="设置恢复密码">
     <p className="-mt-2 flex items-center gap-2 text-sm text-secondary"><LifeBuoy aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.passwordWhy}</p>
     <form className="grid gap-4" noValidate onSubmit={(event) => {
       event.preventDefault()
       const form = event.currentTarget
-      const input = form.elements.namedItem('password') as HTMLInputElement
+      const input = form.elements.namedItem('password') as HTMLInputElement, again = form.elements.namedItem('again') as HTMLInputElement
       if (passwordStrength(input.value).level === 'weak') { setTried(true); input.focus(); return }
+      if (again.value !== input.value) { setMismatch(true); again.focus(); return }
       void run('create', async ({ rebind }) => {
         let work: Promise<void>
         try { work = device.createLocalNetwork(names.browser, passphrase(value(form, 'password')), names.computer, rebind) }
@@ -392,9 +401,10 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
     }}>
       <fieldset disabled={busy || disabled} className="grid gap-4">
         <div className="grid gap-1.5">
-          <div ><PasswordInput label="恢复密码" name="password" autoComplete="new-password" aria-invalid={tried && weak || undefined} aria-describedby="password-hint" onChange={(event) => { setPassword(event.target.value); setTried(false) }} /></div>
+          <div ><PasswordInput label="恢复密码" name="password" autoComplete="new-password" aria-invalid={tried && weak || undefined} aria-describedby="password-hint" onChange={(event) => { setPassword(event.target.value); setTried(false); setMismatch(false) }} /></div>
           <PasswordStrength id="password-hint" password={password} tried={tried} />
         </div>
+        <PasswordInput label={passwordCopy.again} name="again" autoComplete="new-password" error={mismatch ? passwordCopy.mismatch : undefined} onChange={() => setMismatch(false)} />
         <div className="flex justify-between gap-2">
           <Button type="button" variant="ghost" className="-ms-3" onClick={onBack}>上一步</Button>
           <Button type="submit" aria-busy={busy || undefined}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}下一步</Button>
@@ -419,9 +429,21 @@ function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
   }, [networkId])
   return <Panel icon={FileKey} title="保存恢复文件">
     <SaveRecoveryFile code={code} saved={saved} onSaved={setSaved} busy={busy} download={{ done: downloaded, run: () => void run('download', async ({ current }) => { await device.downloadBackup(); if (current()) setDownloaded(true) }) }} />
-    <div className="flex justify-between gap-2">
-      <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={device.cancelSensitive}>上一步</Button>
-      <Button type="button" disabled={!saved || busy} aria-busy={busy || undefined} onClick={() => void run('bootstrap', async () => { startOnboarding(); await device.confirmBootstrap(true) })}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}完成创建</Button>
+    <div className="grid gap-2">
+      {/* Both lines share one cell and the line keeps the taller one's height, so checking the box never moves 完成创建 under the pointer. */}
+      <p id="bootstrap-hint" className="grid text-sm text-secondary">
+        <span className={cn('col-start-1 row-start-1', saved && 'invisible')}>{downloaded ? `勾选「${recoveryCopy.keptApart}」后，才能完成创建` : `下载恢复文件并勾选「${recoveryCopy.keptApart}」后，才能完成创建`}</span>
+        <span className={cn('col-start-1 row-start-1', !saved && 'invisible')}>可以完成创建了</span>
+      </p>
+      <div className="flex justify-between gap-2">
+        <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={device.cancelSensitive}>上一步</Button>
+        <Button type="button" disabled={!saved || busy} aria-busy={busy || undefined} aria-describedby={saved ? undefined : 'bootstrap-hint'} onClick={() => void run('bootstrap', async () => {
+          // Saved before creating so the workspace opens on step 4 instead of flashing first. Kept when creating fails: the network may exist anyway,
+          // and the step is bound to this network_id, so it never shows on another one.
+          if (networkId) startOnboarding(networkId)
+          await device.confirmBootstrap(true)
+        })}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}完成创建</Button>
+      </div>
     </div>
   </Panel>
 }

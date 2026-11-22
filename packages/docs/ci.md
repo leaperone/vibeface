@@ -232,7 +232,7 @@ python3 scripts/ci.py check --packages vibeface-core vibeface-control vibeface
 python3 scripts/ci.py check --packages vibeface-core vibeface-control vibeface --msrv 1.91
 ```
 
-MSRV 参数应使用当前 `Cargo.toml` 的 `rust-version`。进程专项需要 Python 3、Node.js、当前提交构建的 CLI/Core 程序和真实 JS/WASM 密码学资源。先按 [源码构建步骤](releasing.md#源码构建) 生成资源和制品，然后设置以下路径：
+MSRV 参数应使用当前 `Cargo.toml` 的 `rust-version`。进程专项需要 [源码构建工具](releasing.md#源码构建工具) 中的 Python 和 Node.js 版本（Python 至少 3.11，构建和 CI 脚本用到 `tomllib`），以及当前提交构建的 CLI/Core 程序和真实 JS/WASM 密码学资源。先按 [源码构建步骤](releasing.md#源码构建) 生成资源和制品，然后设置以下路径：
 
 ```sh
 binary=/absolute/path/to/package/vibeface
