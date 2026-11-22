@@ -18,7 +18,7 @@ export type LogRecord = {
 
 export type WebRecord = Pick<LogRecord, "level" | "event" | "message" | "conversation_id" | "work_id" | "fields">
 /** Where records come from, as the `log` command's `source`. */
-export type ClientSource = Extract<LogSource, "web" | "mobile">
+type ClientSource = Extract<LogSource, "web" | "mobile">
 type Sink = (records: WebRecord[], source: ClientSource) => Promise<unknown>
 /** One `sendLogs`: records the device accepted, records still kept, and whether a device was connected. */
 export type SendResult = { sent: number; left: number; connected: boolean }

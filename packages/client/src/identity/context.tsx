@@ -39,7 +39,7 @@ type RecoveryCompletion = { active: Session; clientId: string; wait: WaitRecord;
 /** This computer's own join, as the Node reports it while the manager approves. */
 type NodeJoining = { status: 'waiting' | 'confirming' | 'joined'; code?: string; admin?: string }
 /** `open`: 加入 may go ahead; `used` or `expired`: the link's computer would refuse it. */
-export type InviteState = 'open' | 'used' | 'expired'
+type InviteState = 'open' | 'used' | 'expired'
 const inviteState = (value: unknown): InviteState | null => {
   const state = record(value).invite
   return state === 'open' || state === 'used' || state === 'expired' ? state : null
@@ -106,7 +106,7 @@ type DeviceContextValue = {
   setGateway(address: string | null): void
 }
 const DeviceContext = createContext<DeviceContextValue | null>(null)
-export type UnsavedRecovery = { name: string; code: string; attempted: boolean }
+type UnsavedRecovery = { name: string; code: string; attempted: boolean }
 type KeptRecovery = UnsavedRecovery & { bytes: Uint8Array }
 const UNSAVED_KEY = 'vibeface.unsaved-recovery'
 /** This tab's session storage, where it exists: a reload keeps the sealed file, closing the tab drops it. */

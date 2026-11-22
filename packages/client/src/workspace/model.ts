@@ -645,7 +645,7 @@ export function parseWorkDetail(value: unknown): WorkDetail {
   return { work: { ...openWork(shared), target: shared.target === null ? null : parseInputTarget(shared.target), source_events: sourceEvents }, coverage: { source: 'shared_history', complete: false } }
 }
 
-export type WorkspaceOverviewInput = {
+type WorkspaceOverviewInput = {
   openWorks: readonly OpenWorkCard[]
   bots: readonly BotRecord[]
   questions: readonly Question[]

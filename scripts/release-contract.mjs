@@ -59,9 +59,6 @@ export function loadRuntimeDefinitions(contract) {
     web_required: Object.freeze([...web]), targets: Object.freeze(targets) });
 }
 
-// Descriptive alias for callers that prefer the contract's full name.
-export const loadRuntimeContract = loadRuntimeDefinitions;
-
 export function parseReleaseVersion(value) {
   assert(typeof value === 'string', 'invalid component release version');
   const match = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(hourly)\.([0-9]{10})|-(rc)\.([1-9][0-9]*))?$/.exec(value);

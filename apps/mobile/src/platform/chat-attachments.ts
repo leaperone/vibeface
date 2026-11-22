@@ -1,7 +1,7 @@
 import { sha256Hex } from '@vibeface/client/lib/byte-codec.ts'
 import type { Attachment } from '@vibeface/client/chat/types.ts'
 
-export type AttachmentPage = { bytes: Uint8Array; next_offset: number | null; size: number }
+type AttachmentPage = { bytes: Uint8Array; next_offset: number | null; size: number }
 export type ReadAttachment = (attachment: Attachment, offset: number) => Promise<AttachmentPage>
 const limit = 64 * 1024 * 1024
 

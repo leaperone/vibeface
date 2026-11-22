@@ -3,7 +3,7 @@ import { cardState, schedulerStatus, taskActive, taskGroup, taskStale } from "./
 import type { ManagerJob, NodeInfo, OpenWorkCard, OverviewBot, OverviewJob, OverviewTask, PendingCheck, Question, WorkspaceActivity, WorkspaceActivityAttention, WorkspaceActivityFacts, WorkspaceActivityGroup, WorkspaceActivityJob, WorkspaceActivityView, WorkspaceOverview } from "./types.ts"
 import { isJobState, isTerminalJobState, jobStates } from "./types.ts"
 
-export type WorkspaceActivityInput = {
+type WorkspaceActivityInput = {
   works: readonly OpenWorkCard[]
   questions: readonly Question[]
   checks: readonly PendingCheck[]

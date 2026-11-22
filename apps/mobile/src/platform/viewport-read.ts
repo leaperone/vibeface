@@ -2,7 +2,7 @@ import { unreadReply } from '@vibeface/client/chat/timeline.ts'
 import type { NotificationRecord, WorkspaceHistoryItem } from '@vibeface/client/workspace/types.ts'
 
 export type MessageRowLayout = { y: number; height: number }
-export type MessageViewport = { top: number; height: number }
+type MessageViewport = { top: number; height: number }
 
 /** Require half of the row, or half of the viewport for a message taller than the screen. */
 export function visibleWorkspaceNotifications(input: {

@@ -44,7 +44,7 @@ export type Conversation = {
 
 export type Attachment = { uri: string; name: string; size: number | null; mimeType: string | null }
 export type PickedAttachment = Attachment & Omit<OwnedPickedFile, 'size'>
-export type OutgoingAttachment = Pick<PickedAttachment, 'name' | 'arrayBuffer'>
+type OutgoingAttachment = Pick<PickedAttachment, 'name' | 'arrayBuffer'>
 
 /** `bot`: how the device's bot stands right now, `null` with none; removing it stops that bot. `online`: known for computers only. */
 export type Member = { device_id: string; name: string; kind: 'node' | 'client'; admin: boolean; online: boolean | undefined; current: boolean; entry: boolean; bot: BotReadiness | null }

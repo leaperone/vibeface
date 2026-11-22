@@ -5,7 +5,7 @@ import type { BotReadiness, BotRecord } from '@vibeface/client/workspace/types.t
 import type { DisplayScope } from '@vibeface/client/identity/context.tsx'
 import type { Member } from './types'
 
-export type LastSeenRecord = DisplayScope & {
+type LastSeenRecord = DisplayScope & {
   entry_label: string; bots: BotRecord[]; primary: string | null
   members: (MembershipMember & { bot: BotReadiness | null })[]
 }
