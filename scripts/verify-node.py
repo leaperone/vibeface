@@ -1700,6 +1700,8 @@ def fixture_codex(arguments):
 
 
 READ_TOOLS = {"nodes", "context", "history_search", "history_read", "work_status", "call_lookup", "read_skill", "recall", "fetch_url", "list_bots", "read_bot", "list_sessions", "workspace_state", "workspace_history", "read_logs", "read_health"}
+# ponytail: tools the published npm baseline does not have yet; empty this once a release carries them.
+UNRELEASED_TOOLS = {"read_logs", "read_health"}
 WORK_TOOLS = {"dispatch_work", "interrupt_work", "hand_over_session", "propose_provider_config", "apply_provider_config", "workspace_command"}
 WAKE_TOOLS = {"remind", "message_bot"}
 SETTINGS_TOOLS = {"update_profile", "save_skill", "remove_skill", "save_schedule", "remove_schedule", "remember", "forget",
@@ -1832,6 +1834,8 @@ def fixture_manager(run, initial, bot):
     expected_tools = READ_TOOLS if reply_only else READ_TOOLS | WORK_TOOLS
     if tool_kind not in ("agent_task", "workspace_task") and not reply_only:
         expected_tools |= WAKE_TOOLS
+    if (run / "fixture-baseline-tools").exists():
+        expected_tools -= UNRELEASED_TOOLS
     if main_human:
         expected_tools |= SETTINGS_TOOLS
     described = set()
@@ -5124,7 +5128,11 @@ def npm_service_acceptance(options):
             require(release_archive.files(vendor, ("FILES.sha256",)) == expected_files,
                     "every installed baseline vendor byte matches the immutable published package")
             shutil.copy2(vendor / "scripts/install-node-service.sh", cleanup_script)
-            conversation, attachment, digest, messages, invocation_count = create_history("NPM")
+            (run / "fixture-baseline-tools").touch()
+            try:
+                conversation, attachment, digest, messages, invocation_count = create_history("NPM")
+            finally:
+                (run / "fixture-baseline-tools").unlink(missing_ok=True)
             require(invocation_count == 1, "one controlled fixture call creates the message history")
             update = json.loads(command([binary, "update", "status", "--data-dir", node.directory]).stdout)
             require(update["distribution"] == "npm" and update["automatic"] is False,
