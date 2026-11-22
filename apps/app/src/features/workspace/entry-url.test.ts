@@ -5657,7 +5657,7 @@ test('changing the recovery password asks for it twice, keeps what was typed whe
     const again = fields.get('confirm_password'); assert.ok(again)
     again.value = 'another test-only-value'; submit(); await settleComponent()
     assert.equal(replaced, 0, 'a retyping that differs seals no file')
-    assert.equal(render().find(({ props }) => props.error)?.props.error, '和上面的恢复密码不一致，再输入一遍')
+    assert.equal(render().find(({ props }) => props.error)?.props.error, '两遍不一致，再输入一遍')
     assert.ok(again.focused, 'the retyping takes the focus back')
     form_()?.onChange?.({})
     assert.equal(render().some(({ props }) => props.error), false, 'a change takes the mismatch away')
