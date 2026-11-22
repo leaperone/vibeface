@@ -29,7 +29,7 @@ description: 分清新建网络、加入已有网络和恢复身份，配置 Age
 
 ## 配置 Agent 和项目目录
 
-进入这台设备的 **AI** 设置。Codex、Cursor、Claude Code、pi 和 OpenCode 分别配置，不要求全部安装。
+在 **设置 → 我的设备** 打开这台设备的 **详细设置**，进入 **Bot 与任务**。Codex、Cursor、Claude Code、pi 和 OpenCode 分别配置，不要求全部安装。
 
 1. 选择一个已安装的服务，按页面提示填写程序路径或认证配置。
 2. 如果页面提供登录命令，复制到运行 Node 的这台电脑执行。然后点 **检查可用性**。

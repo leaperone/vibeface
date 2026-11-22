@@ -440,7 +440,7 @@ export function AiSettings({ onboarding = false, compact = false, targetName, on
       </details></li> : null}
     </ul>
     </div>
-    {compact ? <Details label="项目文件夹"><Folders later={false} roots={roots} suggested={folderSuggestions(response)} display={response.display_paths} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} /></Details> : <Folders later={false} roots={roots} suggested={folderSuggestions(response)} display={response.display_paths} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />}
+    {compact ? <Details label="项目文件夹"><Folders roots={roots} suggested={folderSuggestions(response)} display={response.display_paths} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} /></Details> : <Folders roots={roots} suggested={folderSuggestions(response)} display={response.display_paths} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />}
     {error?.at === "roots" ? <InlineError error={error.cause} /> : null}
   </div>
 }
@@ -451,10 +451,8 @@ const roles = {
 }
 
 /**
- * A chip for one use of a provider: its glyph and label tell the two apart, and on, the chip is tinted so a phone without hover still reads it.
- * Only one provider runs the bot, so that chip draws a radio dot, picking it moves the bot here and picking it again turns it off; it stays a toggle
- * button for assistive tech for that reason. Executing tasks is a switch any provider can have on.
- * Never solid, so the page's own next step stays the only filled button.
+ * One use of a provider as a switch; its label names the use, and the accessible name adds the provider so a row of them stays apart.
+ * Only one provider runs the bot, so turning it on here moves the bot from another; executing tasks can be on for any number of them.
  */
 function RoleToggle({ role, name, pressed, busy, disabled, onClick }: { role: keyof typeof roles; name: string; pressed: boolean; busy: boolean; disabled: boolean; onClick(): void }) {
   const { label, hint } = roles[role]
@@ -784,13 +782,13 @@ function EndpointDetails({ endpoint, working, busy, save }: { endpoint: Provider
   </form>
 }
 
-function Folders({ later, roots, suggested, display, busy, save }: { later: boolean; roots: string[]; suggested: { path: string; label: string }[]; display: Display; busy: boolean; save(roots: string[]): void }) {
+function Folders({ roots, suggested, display, busy, save }: { roots: string[]; suggested: { path: string; label: string }[]; display: Display; busy: boolean; save(roots: string[]): void }) {
   const [folder, setFolder] = useState("")
   const add = () => { const path = folder.trim(); setFolder(""); if (path && !roots.includes(path)) save([...roots, path]) }
   return <section className="grid gap-2">
     <div className="grid gap-0.5 px-1">
       <h3 className="text-sm font-medium text-secondary">{terms.folders.label}</h3>
-      <p className="text-sm text-secondary">{deviceCopy.folders(later)}</p>
+      <p className="text-sm text-secondary">{deviceCopy.folders}</p>
     </div>
     <div className="grid gap-2 rounded-panel border bg-surface p-3 ">
     {roots.length ? <ul className="grid gap-1">{roots.map((root) => <li key={root} className="flex min-h-9 min-w-0 items-center gap-2 rounded-control bg-surface-muted/60 ps-3">

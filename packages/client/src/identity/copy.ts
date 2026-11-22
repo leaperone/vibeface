@@ -225,8 +225,8 @@ export const deviceCopy = {
   waitForCode: '请在新设备上保持加入页面打开，等安全码出现。',
   rejected: (name: string) => `已拒绝「${name}」`,
   addedManager: (name: string) => `已添加「${name}」为管理设备`,
-  /** 可用文件夹: what it is, and during setup that it can wait. */
-  folders: (later: boolean) => later ? 'Bot 能读写的项目文件夹，可稍后添加' : 'Bot 能读写的项目文件夹',
+  /** 可用文件夹: what it is. */
+  folders: 'Bot 能读写的项目文件夹',
   /** A computer's bot as `botReadiness` reports it; `null`: it has none set up. */
   botStatus: { ready: '能运行 Bot', unverified: 'Bot 未验证，可尝试', starting: 'Bot 启动中', needs_setup: 'Bot 需设置', none: '还没配置 Bot', unknown: '离线，状态未知' },
   /** An offline computer reports nothing, so no bot there is unknown rather than none. */
