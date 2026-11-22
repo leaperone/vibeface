@@ -8,7 +8,7 @@ import { botReadiness, confirmReason, overviewFromWorkspace, parseConversation, 
 import { answerBody } from './questions.ts'
 import { mergeConversation, mergeWorkspaceState } from "./records.ts"
 import { mergeConversationSnapshot } from "./history.ts"
-import { taskAgent } from "./labels.ts"
+import { chatStatusLine, taskAgent } from "./labels.ts"
 import type { NodeInfo } from "./types.ts"
 
 const mainScope: SessionScope = { kind: 'main' }
@@ -334,4 +334,9 @@ test("works one offline device holds wait on one card; an unverified one keeps i
 test("a change the Node cannot map reloads only its conversation", () => {
   assert.deepEqual(parseChanged({ type: "changed", conversation_id: "chat" }), { type: "invalidate", conversation_id: "chat" })
   assert.deepEqual(parseChanged(undefined), { type: "invalidate" })
+})
+
+test("chat status line joins what needs the person, running tasks and the queue reason", () => {
+  assert.equal(chatStatusLine({ attention: 0, tasks: 0 }), null)
+  assert.equal(chatStatusLine({ attention: 2, tasks: 1, hold: "provider_serial" }), "2 项要处理 · 1 个任务进行中 · 等待 AI 空闲")
 })

@@ -282,3 +282,9 @@ export function overviewScope(coverage: OverviewCoverage): string[] {
   if (coverage.unreachable_nodes.length) notes.push("部分设备不可达，状态可能滞后")
   return notes
 }
+
+/** The one line above a chat's composer: what needs the person, what runs and why a reply waits; null when nothing does. */
+export function chatStatusLine(status: { attention: number; tasks: number; hold?: QueueHoldReason | null }): string | null {
+  const parts = [status.attention ? `${status.attention} 项要处理` : '', status.tasks ? `${status.tasks} 个任务进行中` : '', status.hold ? queueHoldLabels[status.hold] : '']
+  return parts.filter(Boolean).join(' · ') || null
+}
