@@ -20,7 +20,7 @@ type Props<Selected extends Attachment> = {
   onFiles: (files: Selected[]) => void | Promise<void>
   onPickFiles: (files: PickedAttachment[]) => void | Promise<void>
   attachmentScope: string
-  /** Why sending is off, in place of the placeholder, or under the box while it holds a draft; null when it is allowed. */
+  /** Why sending is off, in place of the placeholder; null when it is allowed. */
   blocked: string | null
   sending: boolean
   onSend: () => void
@@ -139,9 +139,6 @@ export function Composer<Selected extends Attachment>({ value, onChange, files, 
   </ScrollView> : undefined
   return <View className="gap-2 bg-background px-4 pb-3">
     <View className="w-full max-w-3xl self-center"><ComposerPanel attachments={attachments} editor={input} actions={<><View className="flex-row items-center gap-1">{attach}{target}</View>{controls}</>} /></View>
-    {blocked && value || children ? <View className="w-full max-w-3xl gap-2 self-center px-2">
-      {blocked && value ? <Text className="text-sm text-muted">{blocked}</Text> : null}
-      {children}
-    </View> : null}
+    {children ? <View className="w-full max-w-3xl gap-2 self-center px-2">{children}</View> : null}
   </View>
 }

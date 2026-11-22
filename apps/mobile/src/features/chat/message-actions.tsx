@@ -12,7 +12,9 @@ export type MessageActionsProps = {
   onShare?: (message: ChatMessage) => void | Promise<unknown>
   onQuote?: (message: ChatMessage) => void | Promise<unknown>
 }
-export function MessageActions({ message, onCopy, onShare, onQuote }: MessageActionsProps & { message: ChatMessage }) {
+
+/** The copy, share and quote sheet for one message; `choose` opens it, null while there is nothing to act on. */
+export function useMessageActions({ message, onCopy, onShare, onQuote }: MessageActionsProps & { message: ChatMessage }) {
   const version = useRef(0), mounted = useRef(true)
   useEffect(() => { mounted.current = true; version.current++; return () => { mounted.current = false; version.current++ } }, [message])
   const copy = useClipboardAction(message)
@@ -31,8 +33,14 @@ export function MessageActions({ message, onCopy, onShare, onQuote }: MessageAct
     if (Platform.OS === 'ios') ActionSheetIOS.showActionSheetWithOptions({ options: [...options.map(item => item.text), '取消'], cancelButtonIndex: options.length }, index => { if (current()) void options[index]?.action() })
     else Alert.alert('消息操作', undefined, options.map(item => ({ text: item.text, onPress: () => { if (current()) void item.action() } })), { cancelable: true })
   }
-  return <View className="flex-row items-center gap-1"><Button variant="ghost" iconOnly size="sm" accessibilityLabel="消息操作：复制、分享或引用" disabled={copy.busy || !text} onPress={choose}><Icon as={MoreHorizontal} /></Button>
-    {copy.copied ? <Text accessibilityLiveRegion="polite" className="text-sm text-muted">已复制</Text> : null}
-    {copy.error ? <Text accessibilityLiveRegion="polite" className="shrink text-sm text-danger">{copy.error}</Text> : null}
+  const feedback = copy.copied ? <Text accessibilityLiveRegion="polite" className="text-sm text-muted">已复制</Text>
+    : copy.error ? <Text accessibilityLiveRegion="polite" className="shrink text-sm text-danger">{copy.error}</Text> : null
+  return { choose: copy.busy || !text ? null : choose, feedback }
+}
+
+export function MessageActions(props: MessageActionsProps & { message: ChatMessage }) {
+  const { choose, feedback } = useMessageActions(props)
+  return <View className="flex-row items-center gap-1"><Button variant="ghost" iconOnly size="sm" accessibilityLabel="消息操作：复制、分享或引用" disabled={!choose} onPress={choose ?? undefined}><Icon as={MoreHorizontal} /></Button>
+    {feedback}
   </View>
 }
