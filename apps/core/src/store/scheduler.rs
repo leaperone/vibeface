@@ -1225,6 +1225,11 @@ fn steer_target(
     let Some(trigger) = &session.active else {
         return Ok(None);
     };
+    // A message continuing a health reminder's routine waits for a full turn instead of being
+    // answered inside the read-only health turn.
+    if crate::runtime::health_turn(trigger) {
+        return Ok(None);
+    }
     let Some(job) = load_job(connection, &session.conversation_id, trigger)? else {
         return Ok(None);
     };

@@ -1831,7 +1831,7 @@ def fixture_manager(run, initial, bot):
             "every initially exposed tool has exactly one advertised schema")
     require(not (initial_tools & set(context["trigger"].get("unavailable_tools") or [])),
             "the initial entrypoints remain available in every trigger")
-    expected_tools = READ_TOOLS if reply_only else READ_TOOLS | WORK_TOOLS
+    expected_tools = set(READ_TOOLS) if reply_only else READ_TOOLS | WORK_TOOLS
     if tool_kind not in ("agent_task", "workspace_task") and not reply_only:
         expected_tools |= WAKE_TOOLS
     if main_human:
