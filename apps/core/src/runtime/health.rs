@@ -342,8 +342,8 @@ pub(crate) fn health_turn(trigger: &str) -> bool {
 
 /// The tools a health reminder's turn is offered: the tools that only read this network's
 /// sessions, nodes, logs and health, and the provider-config card, which changes nothing until
-/// the user allows it. No work, wake or settings tool, and no `fetch_url`: a turn a log line
-/// started does not reach outside the network.
+/// the user allows it. No work, wake or settings tool, and no `fetch_url`. This limits the
+/// coordination tools only; the provider's own shell keeps host access.
 pub(crate) fn health_turn_tool(tool: crate::tools::Tool) -> bool {
     use crate::tools::{Effect, Tool};
     (tool.effect() == Effect::Read && tool != Tool::FetchUrl) || tool == Tool::ProposeProviderConfig

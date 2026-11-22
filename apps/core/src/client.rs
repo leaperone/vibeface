@@ -735,7 +735,11 @@ async fn serve_session_with_heartbeat(
                                 .and_then(WireRequest::decode);
                             let response = match request {
                                 Ok(request) => calls.accept(&node, &session, &authority, request)?,
-                                Err(error) => Some(undecodable_request(&plaintext, &error).ok_or(error)?),
+                                Err(error) => {
+                                    let response = undecodable_request(&plaintext, &error).ok_or(error)?;
+                                    calls.reserve(&response.id)?;
+                                    Some(response)
+                                }
                             };
                             if let Some(response) = response {
                                 send_value(&mut socket, &mut channel, &response).await?;

@@ -63,11 +63,11 @@ Node 每分钟检查三件事。连续两轮都发现才算问题出现，只在
 
 输出当前问题（检查、对象、开始时间、详情）和最近 1 小时按事件统计的 warn、error 条数，`--json` 输出 `{checked_at_ms, problems: [{check, subject, since_ms, detail, conversation_id?}], last_hour: {warn: {事件: 条数}, error: {…}}}`。
 
-新问题出现时，调度主 Bot 的那台 Node 给主 Bot 设一个一分钟后到期的提醒，正文写明发现问题的设备，让它先用 `read_health`、`read_logs` 排查，能自己处理就处理，需要本人决定时发拍板卡片。这一轮只提供只读工具（读会话、节点、日志和健康状态等）和 `propose_provider_config`，`tool_search` 也只列出这些，不能派发或控制工作，不能用 `remind` 设提醒或用 `message_bot` 给其他 Bot 发消息，不能改设置，也不能用 `fetch_url` 读外部网页。这些限制针对协调工具；产品自带的 Shell 和联网只有 Codex 能按轮收紧：Codex Bot 的这一轮在只读沙箱里跑，不写宿主文件，关闭原生网页搜索，Shell 环境不带 `VIBEFACE_CODEX_SOCKET`，但 Shell 仍能联网（Node 工具经本机回环调用）；Claude Code、opencode、pi 和 Cursor 这一轮仍有完整的宿主权限。Bot 不能改动或删除这类提醒。同一设备的同一问题每小时最多一次，全部问题每小时最多 6 次、每天最多 24 次，只有写成的提醒计入。没有主 Bot、未开启 **运行 Bot** 或本机不可写时只记日志。
+新问题出现时，调度主 Bot 的那台 Node 给主 Bot 设一个一分钟后到期的提醒，正文写明发现问题的设备，让它先用 `read_health`、`read_logs` 排查，能自己处理就处理，需要本人决定时发拍板卡片。这一轮只提供只读工具（读会话、节点、日志和健康状态等）和 `propose_provider_config`，`tool_search` 也只列出这些，不能派发或控制工作，不能用 `remind` 设提醒或用 `message_bot` 给其他 Bot 发消息，不能改设置，也不能用 `fetch_url` 读外部网页。这些限制针对协调工具；产品自带的 Shell 和联网只有 Codex 能按轮收紧：Codex Bot 的这一轮在只读沙箱里跑，关闭原生网页搜索，Shell 环境不带 `VIBEFACE_CODEX_SOCKET`。只读沙箱只防误写，不是安全边界：Shell 仍能读本机文件、访问网络（Node 工具经本机回环调用），也能连本机的 Node 维护 socket 和 Codex App Server socket 间接写入，挡不住日志内容里的提示注入；Bot 线程已被其他订阅者加载时，网页搜索和 Shell 环境可能沿用线程原有设置，只有沙箱每轮下发；Claude Code、opencode、pi 和 Cursor 这一轮仍有完整的宿主权限。Bot 不能改动或删除这类提醒。同一设备的同一问题每小时最多一次，全部问题每小时最多 6 次、每天最多 24 次，只有写成的提醒计入。没有主 Bot、未开启 **运行 Bot** 或本机不可写时只记日志。
 
 其他设备的 Node 只能为主 Bot 写本人消息引出的设置改动，没有不冒充本人就能让主 Bot 开始一轮的路径，所以它们发现的问题只记 `health.not_owner`，不占上限名额。要处理这类问题，在那台设备上看 `vibeface health`，或连接它导出诊断包。
 
-`read_logs` 和 `read_health` 只提供给主 Bot，并且只在两种轮次可用：管理设备上本人发的消息开启的轮次，或本机 Node 写的健康提醒开启的轮次，且这条提醒最后一次变更仍是 Node 写的那次、仍是一次性提醒；其他轮次调用会被拒绝。它们读的都是执行这一轮的设备自己的日志和健康状态，不能读其他设备的：Node 之间没有读取对端日志的通道。`read_logs` 一次最多返回 32000 字节，每条的说明截到前 2000 个字符，过大的 `fields` 换成 `{truncated: true, prefix}`；更早的记录放不下时结果带 `truncated: true` 和不透明的 `cursor`，带同样的筛选条件把它作为下次调用的 `cursor` 接着往前读，同一毫秒的记录也不重不漏。`read_health` 里每台对端只给连通情况和最近同步时间，与 `nodes` 工具给 Agent 的口径一致，不含路径、往返时间和断线统计。
+`read_logs` 和 `read_health` 只提供给主 Bot，并且只在两种轮次可用：管理设备上本人发的消息开启的轮次，或本机 Node 写的健康提醒开启的轮次，且这条提醒最后一次变更仍是 Node 写的那次、仍是一次性提醒；其他轮次调用会被拒绝。它们读的都是执行这一轮的设备自己的日志和健康状态，不能读其他设备的：Node 之间没有读取对端日志的通道。`read_logs` 一次最多返回 32000 字节，每条的说明截到前 2000 个字符，过大的 `fields` 换成 `{truncated: true, prefix}`；更早的记录放不下时结果带 `truncated: true` 和不透明的 `cursor`，带同样的筛选条件把它作为下次调用的 `cursor` 接着往前读，同一毫秒的记录也不重不漏。时钟回拨后写入的记录多于一次读取的窗口时，回拨前那些时间更晚的记录可能读不到。`read_health` 里每台对端只给连通情况和最近同步时间，与 `nodes` 工具给 Agent 的口径一致，不含路径、往返时间和断线统计。
 
 Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原因。`status` 经数据目录里的私有维护 socket 查询，不需要网络，也不需要安装服务。
 
