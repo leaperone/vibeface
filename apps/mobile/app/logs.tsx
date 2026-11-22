@@ -1,4 +1,4 @@
-import { CircleAlert, CircleX, RefreshCw, ScrollText } from 'lucide-react-native'
+import { Check, CircleAlert, CircleX, Copy, RefreshCw, ScrollText } from 'lucide-react-native'
 import { useEffect, useRef, useState } from 'react'
 import { ScrollView, View } from 'react-native'
 import type { LogFilter, LogLevel, LogRecord, LogSource } from '@vibeface/client/lib/web-log.ts'
@@ -9,6 +9,7 @@ import { Details, EmptyState, Skeleton } from '@/components/kit'
 import { Button } from '@/components/arc/button'
 import { Icon } from '@/components/arc/icon'
 import { Text } from '@/components/arc/text'
+import { useClipboardAction } from '@/lib/use-clipboard'
 import { useRun } from '@/lib/use-run'
 import { useLive } from '@/data/live'
 
@@ -49,6 +50,8 @@ const eventTitles: Record<string, string> = {
   'update.failed': '更新失败',
   'web.action_failed': '操作失败',
   'web.rpc_failed': '网页请求失败',
+  'mobile.uncaught': '手机应用出错',
+  'mobile.unhandled_rejection': '手机应用出错',
   'work.start_failed': '任务没能开始',
   'work.state': '任务状态变化',
 }
@@ -109,21 +112,27 @@ function LogRow({ record, bot, work, computer }: { record: LogRecord; bot?: stri
   const quiet = external(record)
   const message = record.message !== title && /[一-鿿]/.test(record.message) ? record.message : undefined
   const fields = record.fields && Object.keys(record.fields).length ? JSON.stringify(record.fields, null, 2) : ''
+  const { busy, copied, copy } = useClipboardAction(record)
   return <View className="rounded-panel border border-border bg-surface  ">
-    <View accessible accessibilityLabel={`${title}，${sourceLabels[record.source]}`} className="min-h-16 flex-row items-start gap-3 px-4 py-3">
-      <Icon as={quiet ? ScrollText : record.level === 'error' ? CircleX : record.level === 'warn' ? CircleAlert : ScrollText} className={quiet ? 'mt-0.5 size-4 text-muted' : record.level === 'error' ? 'mt-0.5 size-4 text-danger' : record.level === 'warn' ? 'mt-0.5 size-4 text-warning' : 'mt-0.5 size-4 text-muted'} />
-      <View className="min-w-0 flex-1 gap-1">
-        <Text className="font-medium">{title}</Text>
-        {message ? <Text numberOfLines={2} className="text-sm text-muted">{message}</Text> : null}
-        <View className="flex-row flex-wrap gap-x-2 gap-y-0.5">
-          <Text className="text-sm text-muted">{timeOf(record.ts_ms)}</Text>
-          <Text className="text-sm text-muted">{sourceLabels[record.source]}</Text>
-          {typeof record.fields?.repeated === 'number' ? <Text className="text-sm text-muted">又出现 {record.fields.repeated} 次</Text> : null}
-          {bot ? <Text numberOfLines={1} className="max-w-[40%] text-sm text-muted">Bot · {bot}</Text> : null}
-          {work ? <Text numberOfLines={1} className="max-w-[40%] text-sm text-muted">任务 · {work}</Text> : null}
-          {computer ? <Text numberOfLines={1} className="max-w-[40%] text-sm text-muted">设备 · {computer}</Text> : null}
+    <View className="flex-row items-start">
+      <View accessible accessibilityLabel={`${title}，${sourceLabels[record.source]}`} className="min-h-16 min-w-0 flex-1 flex-row items-start gap-3 py-3 ps-4">
+        <Icon as={quiet ? ScrollText : record.level === 'error' ? CircleX : record.level === 'warn' ? CircleAlert : ScrollText} className={quiet ? 'mt-0.5 size-4 text-muted' : record.level === 'error' ? 'mt-0.5 size-4 text-danger' : record.level === 'warn' ? 'mt-0.5 size-4 text-warning' : 'mt-0.5 size-4 text-muted'} />
+        <View className="min-w-0 flex-1 gap-1">
+          <Text className="font-medium">{title}</Text>
+          {message ? <Text numberOfLines={2} className="text-sm text-muted">{message}</Text> : null}
+          <View className="flex-row flex-wrap gap-x-2 gap-y-0.5">
+            <Text className="text-sm text-muted">{timeOf(record.ts_ms)}</Text>
+            <Text className="text-sm text-muted">{sourceLabels[record.source]}</Text>
+            {typeof record.fields?.repeated === 'number' ? <Text className="text-sm text-muted">又出现 {record.fields.repeated} 次</Text> : null}
+            {bot ? <Text numberOfLines={1} className="max-w-[40%] text-sm text-muted">Bot · {bot}</Text> : null}
+            {work ? <Text numberOfLines={1} className="max-w-[40%] text-sm text-muted">任务 · {work}</Text> : null}
+            {computer ? <Text numberOfLines={1} className="max-w-[40%] text-sm text-muted">设备 · {computer}</Text> : null}
+          </View>
         </View>
       </View>
+      <Button variant="ghost" iconOnly className="m-1.5" accessibilityLabel="复制这条记录" disabled={busy} onPress={() => void copy(JSON.stringify(record))}>
+        <Icon as={copied ? Check : Copy} className={copied ? 'size-4 text-success' : 'size-4'} />
+      </Button>
     </View>
     <Details label="技术详情">
       <View className="gap-1 px-4 pb-4">

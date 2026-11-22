@@ -1,4 +1,4 @@
-import { ArrowRightLeft, Download, FlaskConical, LoaderCircle, ScrollText } from 'lucide-react-native'
+import { ArrowRightLeft, Download, FlaskConical, LoaderCircle, MessageSquareWarning, ScrollText } from 'lucide-react-native'
 import { ScrollView, View } from 'react-native'
 import { useExperiments, experimentsCopy } from '@vibeface/client/lib/experiments.ts'
 import { ErrorText } from '@/components/action'
@@ -32,15 +32,16 @@ export default function Lab() {
         <Switch accessibilityLabel={experimentsCopy.label} value={experiments} onValueChange={setExperiments} />
       </SettingsRow>
     </SettingsGroup>
-    {canInspect ? <SettingsGroup title="问题排查">
-      <SettingsRow href="/logs" icon={ScrollText} label="日志" />
+    {shared ? <SettingsGroup title="问题排查">
+      <SettingsRow href="/report" icon={MessageSquareWarning} label="报告问题" />
+      {canInspect ? <><SettingsRow href="/logs" icon={ScrollText} label="日志" />
       <SettingsRow icon={Download} label="诊断包" description="不含登录信息和加入链接">
         <Button variant="secondary" size="sm" disabled={busy !== null} onPress={exportDiagnostics}>
           <Icon as={busy === 'diagnostics' ? LoaderCircle : Download} /><Text>{busy === 'diagnostics' ? '导出中' : '导出'}</Text>
         </Button>
         {status ? <Text role="status" className="basis-full ps-11 text-sm text-success">{status}</Text> : null}
         {error ? <View className="basis-full ps-11"><ErrorText error={error} /></View> : null}
-      </SettingsRow>
+      </SettingsRow></> : null}
     </SettingsGroup> : null}
   </ScrollView>
 }

@@ -47,6 +47,13 @@ export function failureFields(cause: unknown, shown: string): { code?: string; c
   return { ...(typeof code === "string" ? { code } : {}), ...(raw && raw !== shown ? { cause: raw } : {}) }
 }
 
+/** A thrown value as a log message and its stack, for uncaught errors on every client. */
+export function describeError(cause: unknown): { message: string; stack?: string } {
+  if (cause instanceof Error) return { message: `${cause.name}: ${cause.message}`, stack: cause.stack }
+  if (typeof cause === "string") return { message: cause }
+  try { return { message: JSON.stringify(cause) ?? String(cause) } } catch { return { message: String(cause) } }
+}
+
 /** The conversation and task the page shows, from `?conversation=` and `/work/<id>`. */
 export function pageIds(location: { pathname: string; search: string }): Pick<WebRecord, "conversation_id" | "work_id"> {
   const conversation = new URLSearchParams(location.search).get("conversation")

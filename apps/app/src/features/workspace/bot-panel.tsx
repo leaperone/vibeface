@@ -57,7 +57,7 @@ export function BotPanelButton() {
   const ownerNode = workspace.nodes.find((node) => node.device_id === owner)
   // The pick on show belongs to one bot: switching bots drops it (useAvatarPick compares bot_id).
   const look = useAvatarPick(bot ?? { bot_id: "", avatar: null, avatar_version: null }, (version, avatar) => workspace.setBotAvatar(bot!.conversation_id, version, avatar),
-    (caught) => toast(messageOf(caught, "换长相"), { tone: "danger" }))
+    (caught) => toast(messageOf(caught, "换长相"), { tone: "danger", cause: caught }))
   if (!bot) return null
   const deleteHint = botCopy.deleteHint(workspace.primary === bot.conversation_id ? workspace.bots.find((item) => item.successor)?.name ?? null : null)
   const shown = { bot_id: bot.bot_id, avatar: look.avatar }
@@ -87,7 +87,7 @@ export function BotPanelButton() {
   const projectNow = bot.project ? projectKey(bot.project) : ""
   const projectLabel = bot.project ? projectPlace(bot.project, owner, (id) => nodeName(id, lookup)) : "不选"
   const moveProject = (key: string) => void workspace.setBotProject(bot.conversation_id, choices.find((item) => item.key === key)?.project ?? null)
-    .catch((caught: unknown) => toast(messageOf(caught, "换文件夹"), { tone: "danger" }))
+    .catch((caught: unknown) => toast(messageOf(caught, "换文件夹"), { tone: "danger", cause: caught }))
   return <>
     <Button variant="ghost" type="button" className="-ms-1.5 flex min-w-0 items-center gap-2" aria-haspopup="dialog" title={bot.name} disabled={!view} onClick={() => { order.current = []; setOpen(true) }}>
       <BotFace bot={shown} mood={mood} size={32} />

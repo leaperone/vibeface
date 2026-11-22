@@ -37,6 +37,8 @@ export type NodeDiagnostics = ConnectionTrace & {
   system: string | null
   relay: boolean | null
   capabilitiesStale: boolean
+  /** The transport to this node as the reporting Node measures it; counts stay at zero until something happened. */
+  transport: { rttMs: number | null; pathChanges: number; disconnects: number }
 }
 
 type NodeTarget = { deviceId: string; name: string; entry: boolean }
@@ -152,6 +154,7 @@ export function describeNode({ target, ready, connected, report, fresh, checking
     version,
     system: [systemNames.get(capabilities?.os ?? "") ?? capabilities?.os, capabilities?.arch].filter(Boolean).join(" · ") || null,
     relay: capabilities?.relay ?? null,
+    transport: { rttMs: observation?.rttMs ?? null, pathChanges: observation?.pathChanges ?? 0, disconnects: observation?.disconnects ?? 0 },
     capabilitiesStale: capabilities ? !connected || !fresh || node?.online !== true : version !== null && !connected,
   }
 }
@@ -160,7 +163,7 @@ const timeFormat = new Intl.DateTimeFormat("zh-CN", { dateStyle: "short", timeSt
 export const nodeDiagnosticTime = (timestamp: number) => timeFormat.format(timestamp)
 
 export function nodeDiagnosticText(name: string, diagnostics: NodeDiagnostics): string {
-  const { status, deviceId, pathLabel, hops, routeNotice, returnPath, checkedAt, lastSyncedAt, version, system, relay, capabilitiesStale } = diagnostics
+  const { status, deviceId, pathLabel, hops, routeNotice, returnPath, checkedAt, lastSyncedAt, version, system, relay, capabilitiesStale, transport } = diagnostics
   return [
     name,
     `节点编号 ${deviceId}`,
@@ -172,6 +175,7 @@ export function nodeDiagnosticText(name: string, diagnostics: NodeDiagnostics): 
     returnPath ? `回程 ${returnPath.from} → ${returnPath.path.kind === "relay" ? `${returnPath.path.url} → ` : ""}${returnPath.to}${returnPath.path.kind === "direct" ? "（直连）" : ""}` : null,
     returnPath ? `回程检查时间 ${nodeDiagnosticTime(returnPath.checkedAt)}` : null,
     routeNotice,
+    ...transportFacts(transport).map(([label, value]) => `${label} ${value}`),
     checkedAt !== null ? `检查时间 ${nodeDiagnosticTime(checkedAt)}` : null,
     lastSyncedAt !== null ? `最近成功同步 ${nodeDiagnosticTime(lastSyncedAt)}` : null,
     version ? `Core 版本 ${version}` : null,
@@ -179,4 +183,13 @@ export function nodeDiagnosticText(name: string, diagnostics: NodeDiagnostics): 
     relay === null ? null : `转发服务 ${relay ? "已启用" : "未启用"}`,
     capabilitiesStale ? "设备信息来自上次报告。" : null,
   ].filter(Boolean).join("\n")
+}
+
+/** Round trip, path switches and drops, each only when there is something to show. */
+export function transportFacts({ rttMs, pathChanges, disconnects }: NodeDiagnostics["transport"]): Array<[string, string]> {
+  return [
+    rttMs !== null ? ["往返延迟", `${rttMs} ms`] : null,
+    pathChanges > 0 ? ["路径切换", `${pathChanges} 次`] : null,
+    disconnects > 0 ? ["断线", `${disconnects} 次`] : null,
+  ].filter((fact): fact is [string, string] => fact !== null)
 }
