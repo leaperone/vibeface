@@ -903,10 +903,15 @@ async fn dispatch_inner(
         }
         ClientCommand::Log(params) => {
             let params = params.into_value();
+            let source = match params.get("source").map(|source| source.as_str()) {
+                None | Some(Some("web")) => crate::logging::Source::Web,
+                Some(Some("mobile")) => crate::logging::Source::Mobile,
+                _ => anyhow::bail!("log source is web or mobile"),
+            };
             let accepted = crate::logging::submit(
                 &node.log_intake,
                 &session.device_id,
-                crate::logging::Source::Web,
+                source,
                 &params["records"],
                 crate::clock::now_ms(),
             )?;
@@ -3496,6 +3501,30 @@ mod tests {
         assert_eq!(
             dispatch_wire_fixture(&node, &mut browser, "log", json!({"records":[record]})).await?,
             json!({"accepted":1})
+        );
+        let phone = json!({"level":"info","event":"mobile.connection","message":"ready","fields":{"client_seq":1}});
+        for source in [json!("node"), json!("desktop"), json!(1)] {
+            assert!(
+                dispatch_wire_fixture(
+                    &node,
+                    &mut browser,
+                    "log",
+                    json!({"records":[phone],"source":source})
+                )
+                .await
+                .is_err(),
+                "{source}"
+            );
+        }
+        let declared = json!({"records":[phone],"source":"mobile"});
+        assert_eq!(
+            dispatch_wire_fixture(&node, &mut browser, "log", declared.clone()).await?,
+            json!({"accepted":1})
+        );
+        assert_eq!(
+            dispatch_wire_fixture(&node, &mut browser, "log", declared).await?,
+            json!({"accepted":0}),
+            "a resent sequence number is skipped"
         );
         assert!(
             dispatch_wire_fixture(&node, &mut browser, "logs", json!({}))

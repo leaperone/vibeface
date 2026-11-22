@@ -102,6 +102,8 @@ pub enum Source {
     Codex,
     /// The native desktop app, through `/api/log`.
     Desktop,
+    /// The phone app, through the device channel's `log` command.
+    Mobile,
 }
 
 impl std::str::FromStr for Level {
@@ -116,7 +118,7 @@ impl std::str::FromStr for Source {
     type Err = anyhow::Error;
     fn from_str(text: &str) -> Result<Self> {
         serde_json::from_value(Value::String(text.to_ascii_lowercase()))
-            .context("source is one of node, web, agent, cli, codex, desktop")
+            .context("source is one of node, web, agent, cli, codex, desktop, mobile")
     }
 }
 
@@ -906,8 +908,18 @@ fn submitted(source: Source, sender: &str, value: &Value, now_ms: i64) -> Result
     for reserved in ["repeated", "first_ms", "last_ms"] {
         fields.remove(reserved);
     }
-    // A browser's records name the device that authenticated the channel, not one the page claims.
-    if source == Source::Web {
+    // The phone's order and creation time, kept beside the Node's own receipt time.
+    for (key, valid) in [
+        ("client_seq", fields.get("client_seq").map(Value::is_u64)),
+        (
+            "client_ts_ms",
+            fields.get("client_ts_ms").map(Value::is_i64),
+        ),
+    ] {
+        ensure!(valid != Some(false), "{key} must be an integer");
+    }
+    // A client's records name the device that authenticated the channel, not one the page claims.
+    if matches!(source, Source::Web | Source::Mobile) {
         fields.insert("device_id".to_owned(), Value::String(sender.to_owned()));
     }
     Ok(Record {
@@ -925,10 +937,14 @@ fn submitted(source: Source, sender: &str, value: &Value, now_ms: i64) -> Result
     })
 }
 
-/// Per-sender budget of submitted records in one-minute windows.
+/// Per-sender budget of submitted records in one-minute windows, and the highest `client_seq` each
+/// sender has had written.
 #[derive(Default)]
 pub struct RateLimit {
     windows: Mutex<HashMap<String, (i64, u32)>>,
+    // ponytail: in memory only; after a Node restart a batch that was in flight when it stopped
+    // can be written twice.
+    seqs: Mutex<HashMap<String, u64>>,
 }
 
 impl RateLimit {
@@ -944,7 +960,9 @@ impl RateLimit {
     }
 }
 
-/// Accepts a batch from `sender` whole or not at all, and returns how many records it wrote.
+/// Accepts a batch from `sender` whole or not at all, and returns how many records it wrote. A
+/// record whose `fields.client_seq` is not above the sender's last written one is a resend and is
+/// skipped without counting against the budget.
 pub fn submit(
     limit: &RateLimit,
     sender: &str,
@@ -961,10 +979,32 @@ pub fn submit(
         .iter()
         .map(|record| submitted(source, sender, record, now_ms))
         .collect::<Result<Vec<_>>>()?;
+    let mut seqs = limit.seqs.lock().expect("log sequence");
+    let mut last = seqs.get(sender).copied();
+    let records: Vec<_> = records
+        .into_iter()
+        .filter(
+            |record| match record.fields.get("client_seq").and_then(Value::as_u64) {
+                Some(seq) if last.is_some_and(|last| seq <= last) => false,
+                Some(seq) => {
+                    last = Some(seq);
+                    true
+                }
+                None => true,
+            },
+        )
+        .collect();
+    if records.is_empty() {
+        return Ok(0);
+    }
     ensure!(
         limit.take(sender, records.len() as u32, now_ms),
         "too many log records; try again in a minute"
     );
+    if let Some(last) = last {
+        seqs.insert(sender.to_owned(), last);
+    }
+    drop(seqs);
     for record in &records {
         write(record);
     }
@@ -1487,6 +1527,33 @@ mod tests {
             submit(&limit, "a", Source::Web, &json!([ok]), 60_001).is_ok(),
             "a new minute"
         );
+    }
+
+    #[test]
+    fn phone_records_skip_resent_sequence_numbers() {
+        let limit = RateLimit::default();
+        let seq = |n: u64| json!({"level":"info","event":"mobile.connection","message":"m","fields":{"client_seq":n,"client_ts_ms":5}});
+        let record = submitted(Source::Mobile, "phone-1", &seq(1), 9).unwrap();
+        assert_eq!(record.source, Source::Mobile);
+        assert_eq!(record.fields["device_id"], "phone-1");
+        assert_eq!(
+            (record.ts_ms, record.fields["client_ts_ms"].clone()),
+            (9, json!(5))
+        );
+        let send =
+            |sender, batch: Value| submit(&limit, sender, Source::Mobile, &batch, 0).unwrap();
+        assert_eq!(send("phone-1", json!([seq(1), seq(2)])), 2);
+        assert_eq!(
+            send("phone-1", json!([seq(1), seq(2), seq(3)])),
+            1,
+            "only the new one"
+        );
+        assert_eq!(send("phone-1", json!([seq(3)])), 0);
+        assert_eq!(send("phone-2", json!([seq(1)])), 1, "per sender");
+        for bad in [json!(-1), json!("7"), json!(1.5)] {
+            let record = json!({"level":"info","message":"m","fields":{"client_seq":bad}});
+            assert!(submit(&limit, "phone-1", Source::Mobile, &json!([record]), 0).is_err());
+        }
     }
 
     #[test]
