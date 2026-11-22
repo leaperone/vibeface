@@ -6635,7 +6635,7 @@ def phase5_acceptance(options):
         require(shown["write_state"] == "writable" and shown["peers"][0]["device_id"] == b.device_id
                 and shown["peers"][0]["reachable"] is True, "status reports writes and the reachable peer")
         text = subprocess.run([str(binary), "status", "--data-dir", str(a.directory)], capture_output=True, timeout=20).stdout.decode()
-        require("Writes: writable" in text and re.search(r"Peer: .* reachable, synced \d+s ago", text), "plain status names the peer and its last sync")
+        require("Writes: writable" in text and re.search(r"Peer: .* reachable, [^,]+, RTT (\d+ ms|unknown), synced \d+s ago", text), "plain status names the peer and its last sync")
         passed("status-shows-writes-and-peer-sync", peers=len(shown["peers"]))
 
         a.stop()
