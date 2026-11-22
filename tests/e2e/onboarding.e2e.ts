@@ -31,8 +31,9 @@ cursorTest('automatically connects Cursor using only the official CLI subscripti
   await expect(signedIn).not.toBeChecked();
   assert.deepEqual(await cursor.inspect(), { selected_official: true, bot_enabled: false, execution: [], prompts: 0 });
   await app.screenshot('cursor-cli-authenticated-model-unverified');
-  // A pick is only a draft; 下一步 makes the write and moves on.
-  await signedIn.check();
+  // A pick is only a draft; 下一步 makes the write and moves on. The row is what a person presses: Arc's mark covers the native radio.
+  await screen.getByRole('group', '这台电脑上的 AI 服务').getByText('Cursor', { exact: true }).click();
+  await expect(signedIn).toBeChecked();
   assert.equal((await cursor.inspect()).bot_enabled, false);
   await screen.getByRole('button', '下一步').click();
   await expect(screen.getByRole('heading', '创建第一个 Bot')).toBeVisible();
