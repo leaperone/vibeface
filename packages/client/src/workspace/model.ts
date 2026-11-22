@@ -96,8 +96,13 @@ function parseNodeObservation(value: unknown): NodeObservation | null {
     checkedAt,
     lastSyncedAt: diagnosticTime(value.last_synced_at_ms),
     path: checkedAt === null ? null : parseSelectedPath(value.path),
+    rttMs: typeof value.rtt_ms === "number" && Number.isFinite(value.rtt_ms) && value.rtt_ms >= 0 ? Math.round(value.rtt_ms) : null,
+    pathChanges: transportCount(value.path_changes),
+    disconnects: transportCount(value.disconnects),
   }
 }
+/** A count the reporting Node leaves out stays at zero, so the page shows nothing for it. */
+function transportCount(value: unknown): number { return isSafeInteger(value) && value > 0 ? value : 0 }
 
 function parseNodeSessionPath(value: unknown): NodeSessionPath | null {
   if (!isRecord(value)) return null

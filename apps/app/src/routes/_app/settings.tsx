@@ -2,6 +2,7 @@ import { BusyIcon,CountBadge,Segmented,SegmentedValue,SettingsGroup,SettingsRow 
 import { RoutedAction } from "@/components/arc/routed-action"
 import { useOpenJoins } from '@/features/devices/join'
 import { TriageSettings } from '@/features/devices/triage-settings'
+import { ReportProblem } from '@/features/workspace/report-problem'
 import { ConnectionSettings } from '@/features/identity/device-controls'
 import { CurrentRecoveryFile,PhoneRecovery,RecoveredStep,RecoveryControls,RecoveryReview } from '@/features/identity/recovery-controls'
 import { terms } from '@/lib/glossary'
@@ -81,8 +82,9 @@ function SettingsPage() {
         <SettingsRow icon={FlaskConical} label="实验室" description="开启或关闭文件传输等试用功能"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow>
       </Link>
     </SettingsGroup>
-    {operator ? <SettingsGroup title="问题排查" footer="诊断包不含登录信息和加入链接">
-      <Link to="/settings/logs" className="interactive-row block">
+    <SettingsGroup title="问题排查" footer={operator ? "诊断包不含登录信息和加入链接" : undefined}>
+      <ReportProblem />
+      {operator ? <><Link to="/settings/logs" className="interactive-row block">
         <SettingsRow icon={ScrollText} label="日志"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow>
       </Link>
       <SettingsRow icon={Download} label="诊断包">
@@ -94,8 +96,8 @@ function SettingsPage() {
               .finally(() => setExported((state) => state === 'busy' ? 'idle' : state))
           }}>{exported === 'done' ? <><Check aria-hidden="true" className="text-success" /><span role="status">已导出</span></> : <><BusyIcon busy={exported === 'busy'} />导出</>}</Button>
         </span>
-      </SettingsRow>
-    </SettingsGroup> : null}
+      </SettingsRow></> : null}
+    </SettingsGroup>
     <SettingsGroup>
       <SettingsRow ref={leaveTrigger} icon={LogOut} tone="danger" label="断开这个浏览器" onClick={() => setLeaving(true)} />
     </SettingsGroup>

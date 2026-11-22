@@ -2,7 +2,7 @@ import { SettingsDisclosure,SettingsGroup,toast } from "@/components/arc/product
 import { terms } from "@/lib/glossary"
 import { useClipboard } from "@/lib/use-clipboard"
 import { cn } from "@/lib/utils"
-import { nodeDiagnosticText,nodeDiagnosticTime,nodeStatusLabels,type NodeDiagnostics } from "@vibeface/client/workspace/node-diagnostics.ts"
+import { nodeDiagnosticText,nodeDiagnosticTime,nodeStatusLabels,transportFacts,type NodeDiagnostics } from "@vibeface/client/workspace/node-diagnostics.ts"
 import type { useNodeChecks } from "@vibeface/client/workspace/use-node-checks.ts"
 import { Button } from "@vibeface/uiarc/button/button.tsx"
 import { ArrowDown,Copy,Globe,RadioTower,RefreshCw,Route } from "lucide-react"
@@ -32,7 +32,8 @@ export function NodeConnection({ name, diagnostics, checks, canRefresh }: {
 }) {
   const { status, hops, pathLabel, routeNotice, returnPath, checkedAt, lastSyncedAt, version, system, relay, capabilitiesStale } = diagnostics
   const hasDeviceInfo = Boolean(version || system || relay !== null)
-  const canCopy = hops.length > 0 || checkedAt !== null || lastSyncedAt !== null || hasDeviceInfo
+  const transport = transportFacts(diagnostics.transport)
+  const canCopy = hops.length > 0 || checkedAt !== null || lastSyncedAt !== null || hasDeviceInfo || transport.length > 0
   const clipboard = useClipboard(diagnostics.deviceId, {
     onCopied: () => toast("已复制连接详情", { tone: "success" }),
     onFailed: () => toast("复制失败，请重试。", { tone: "warning" }),
@@ -82,8 +83,9 @@ export function NodeConnection({ name, diagnostics, checks, canRefresh }: {
       {returnPath.checkedAt !== checkedAt ? <p className="text-sm text-secondary">回程检查 <time dateTime={new Date(returnPath.checkedAt).toISOString()}>{nodeDiagnosticTime(returnPath.checkedAt)}</time></p> : null}
     </div> : null}
 
-    {checkedAt !== null || lastSyncedAt !== null || hasDeviceInfo ? <div className="grid gap-2 border-t border-subtle pt-3">
+    {checkedAt !== null || lastSyncedAt !== null || hasDeviceInfo || transport.length ? <div className="grid gap-2 border-t border-subtle pt-3">
       <dl className="grid min-w-0 gap-x-6 gap-y-2 sm:grid-cols-2">
+        {transport.map(([label, value]) => <div key={label}><dt className="text-sm text-secondary">{label}</dt><dd className="tabular-nums">{value}</dd></div>)}
         {checkedAt !== null ? <div><dt className="text-sm text-secondary">最近检查</dt><dd><time dateTime={new Date(checkedAt).toISOString()}>{nodeDiagnosticTime(checkedAt)}</time></dd></div> : null}
         {lastSyncedAt !== null ? <div><dt className="text-sm text-secondary">最近成功同步</dt><dd><time dateTime={new Date(lastSyncedAt).toISOString()}>{nodeDiagnosticTime(lastSyncedAt)}</time></dd></div> : null}
         {version ? <div><dt className="text-sm text-secondary">Core 版本</dt><dd className="[overflow-wrap:anywhere]">{version}</dd></div> : null}
