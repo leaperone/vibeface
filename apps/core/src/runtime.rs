@@ -35,6 +35,7 @@ mod cursor;
 mod execution_directory;
 mod executor;
 mod followup;
+mod health;
 mod input_receipts;
 mod manager_control;
 mod observation;
@@ -56,6 +57,7 @@ mod work;
 mod work_input;
 mod workspace;
 pub(crate) use cursor::record_reply as record_cursor_reply;
+pub(crate) use health::MAX_LOG_READ;
 pub use manager_control::RegisteredInvocation;
 pub(crate) use observation::{ObservationGuard, native_progress};
 pub use settings::NodeSettings;
@@ -71,6 +73,10 @@ struct NodeObservation {
     checked_at_ms: Option<i64>,
     last_synced_at_ms: Option<i64>,
     path: Option<crate::net::SelectedPath>,
+    /// The same link facts as `maintenance::PeerHealth`.
+    rtt_ms: Option<u32>,
+    path_changes: u32,
+    disconnects: u32,
 }
 
 fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {
@@ -380,6 +386,7 @@ pub struct Runtime {
     rejoin: tokio::sync::Notify,
     /// Budget of records browsers and local processes may add to the log.
     pub(crate) log_intake: crate::logging::RateLimit,
+    health: std::sync::Mutex<health::HealthState>,
 }
 fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
     let s = v[key]
@@ -652,6 +659,7 @@ impl Runtime {
             node_join: std::sync::Mutex::new(None),
             rejoin: tokio::sync::Notify::new(),
             log_intake: Default::default(),
+            health: std::sync::Mutex::new(health::HealthState::new(now_ms())),
         };
         node.start_authority_projection_timer()?;
         for token in node.relay_tokens() {
@@ -933,6 +941,7 @@ impl Runtime {
         self.start_schedule_delivery();
         self.start_observation_worker();
         self.start_triage();
+        self.start_health();
     }
     pub(crate) async fn maintenance_idle(&self) -> Result<()> {
         self.store
@@ -1293,6 +1302,9 @@ impl Runtime {
                                 checked_at_ms: Some(now_ms()),
                                 last_synced_at_ms: None,
                                 path: None,
+                                rtt_ms: None,
+                                path_changes: 0,
+                                disconnects: 0,
                             },
                         );
                     }
@@ -1324,10 +1336,20 @@ impl Runtime {
                         None
                     };
                     let (_, last_synced_at_ms) = self.peer_sync_status(&member.device_id);
+                    let net = self.net.get();
+                    let rtt_ms = net
+                        .filter(|_| include_observation)
+                        .and_then(|net| net.link(&member.device_id).1);
+                    let counts = net
+                        .map(|net| net.link_counts(&member.device_id))
+                        .unwrap_or_default();
                     let observation = NodeObservation {
                         checked_at_ms: attempted.then(now_ms),
                         last_synced_at_ms,
                         path,
+                        rtt_ms,
+                        path_changes: counts.path_changes,
+                        disconnects: counts.disconnects,
                     };
                     (
                         live,

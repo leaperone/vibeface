@@ -118,6 +118,13 @@ pub enum PathKind {
     Relay,
 }
 
+/// What happened to the connections this Node dialed to one peer since it started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinkCounts {
+    pub path_changes: u32,
+    pub disconnects: u32,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum SelectedPath {
@@ -351,6 +358,8 @@ pub struct Net {
     /// Open relays the mesh announces, adopted while they rank among the best.
     adopted: tokio::sync::Mutex<HashSet<RelayUrl>>,
     connections: Mutex<HashMap<(EndpointId, &'static [u8]), Connection>>,
+    /// Path switches and closed connections per peer since this process started.
+    links: Arc<Mutex<HashMap<EndpointId, LinkCounts>>>,
     /// `network.mesh.advertise`, listed first in the node link.
     advertise: Vec<SocketAddr>,
 }
@@ -453,6 +462,7 @@ impl Net {
             bootstrap: Default::default(),
             adopted: Default::default(),
             connections: Mutex::new(HashMap::new()),
+            links: Default::default(),
             advertise: config.mesh.advertise.clone(),
         })
     }
@@ -700,21 +710,73 @@ impl Net {
             .lock()
             .expect("connection cache")
             .insert((id, alpn), connection.clone());
+        self.count_link(id, connection.clone());
         Ok(connection)
     }
 
+    /// Counts the times this dialed connection switches between direct and relay, and its close
+    /// unless this Node closed it.
+    fn count_link(&self, id: EndpointId, connection: Connection) {
+        let links = self.links.clone();
+        let bump = move |change: fn(&mut LinkCounts)| {
+            change(links.lock().expect("link counts").entry(id).or_default());
+        };
+        tokio::spawn(async move {
+            let mut paths = connection.paths_stream();
+            let mut last = None;
+            while let Some(list) = paths.next().await {
+                let direct = list
+                    .iter()
+                    .find(|path| path.is_selected())
+                    .map(|path| path.is_ip());
+                if direct.is_some() {
+                    if last.is_some() && direct != last {
+                        bump(|counts| counts.path_changes += 1);
+                    }
+                    last = direct;
+                }
+            }
+            if !matches!(
+                connection.closed().await,
+                iroh::endpoint::ConnectionError::LocallyClosed
+            ) {
+                bump(|counts| counts.disconnects += 1);
+            }
+        });
+    }
+
     pub fn path_kind(&self, device_id: &str) -> Option<PathKind> {
-        let id = endpoint_id(device_id).ok()?;
+        self.link(device_id).0
+    }
+
+    /// The selected path to a peer over a dialed connection and its round-trip time.
+    pub fn link(&self, device_id: &str) -> (Option<PathKind>, Option<u32>) {
+        let Ok(id) = endpoint_id(device_id) else {
+            return (None, None);
+        };
         let connections = self.connections.lock().expect("connection cache");
         connections
             .iter()
-            .filter(|((peer, _), _)| *peer == id)
+            .filter(|((peer, _), connection)| *peer == id && connection.close_reason().is_none())
             .find_map(|(_, connection)| {
-                selected_path(connection).map(|path| match path {
-                    SelectedPath::Direct => PathKind::Direct,
-                    SelectedPath::Relay { .. } => PathKind::Relay,
-                })
+                let paths = connection.paths();
+                let path = paths.iter().find(|path| path.is_selected())?;
+                let kind = match path.remote_addr() {
+                    TransportAddr::Ip(_) => PathKind::Direct,
+                    TransportAddr::Relay(_) => PathKind::Relay,
+                    _ => return None,
+                };
+                let rtt = u32::try_from(path.rtt().as_millis()).unwrap_or(u32::MAX);
+                Some((Some(kind), Some(rtt)))
             })
+            .unwrap_or((None, None))
+    }
+
+    pub fn link_counts(&self, device_id: &str) -> LinkCounts {
+        endpoint_id(device_id)
+            .ok()
+            .and_then(|id| self.links.lock().expect("link counts").get(&id).copied())
+            .unwrap_or_default()
     }
 
     /// One request on its own stream; the response is the stream's only frame.

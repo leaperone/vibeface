@@ -1351,6 +1351,69 @@ impl Store {
         Ok((record, true))
     }
 
+    /// A one-time reminder the Node sets for the primary bot, as its own `remind` would, a minute
+    /// from `at`. `key` names it, so the same key writes it once. `None` without a primary bot.
+    pub fn remind_primary_bot(
+        &mut self,
+        identity: &crate::crypto::LocalIdentity,
+        network: &str,
+        key: &str,
+        note: &str,
+        at: i64,
+    ) -> Result<Option<(ChangeRecord, bool)>> {
+        vibeface_protocol::validate_id(key).map_err(anyhow::Error::msg)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(scope) = super::bots::primary_bot_from(&tx, network)? else {
+            return Ok(None);
+        };
+        let digest = change_digest(&scope, "node", key);
+        let change_id = format!("change-{digest}");
+        if let Some(existing) = change_from(&tx, network, &change_id)? {
+            return Ok(Some((existing, false)));
+        }
+        let name: String = note
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or_default()
+            .chars()
+            .take(MAX_SCHEDULE_NAME_CHARS)
+            .collect();
+        let after = Schedule {
+            name,
+            prompt: note.into(),
+            first_run_at_ms: at + ONCE_MIN_LEAD_MS,
+            every_minutes: None,
+            enabled: true,
+            depth: 1,
+        };
+        after.validate()?;
+        room_for_schedule(&tx, network, &scope, None, at)?;
+        log::append_from(
+            &tx,
+            &self.blob_dir,
+            identity,
+            network,
+            &scope,
+            EventBody::BotChanged {
+                change_id: change_id.clone(),
+                cause: None,
+                change: BotChange::Schedule {
+                    schedule_id: format!("schedule-{digest}"),
+                    before: None,
+                    after: Some(after),
+                },
+            },
+            vec![],
+            at,
+        )?;
+        let record = change_from(&tx, network, &change_id)?.context("change was not projected")?;
+        tx.commit()?;
+        Ok(Some((record, true)))
+    }
+
     pub fn bot_change(&self, network: &str, change_id: &str) -> Result<Option<ChangeRecord>> {
         change_from(&self.connection, network, change_id)
     }

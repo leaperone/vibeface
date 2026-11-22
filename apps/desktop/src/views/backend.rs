@@ -542,6 +542,9 @@ impl Backend {
     }
 
     async fn emit(&self, event: Event) -> Result<()> {
+        if let Event::Error(error) = &event {
+            crate::node_log::error("desktop.error", error);
+        }
         self.out
             .send(Event::Scoped {
                 generation: self.state.generation,

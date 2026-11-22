@@ -417,6 +417,11 @@ impl Runtime {
                     .await
             }
             Tool::FetchUrl => crate::fetch::fetch_url(field(&args, "url")?).await,
+            Tool::ReadLogs => {
+                let (dir, args) = (self.data_dir.clone(), args.clone());
+                tokio::task::spawn_blocking(move || super::health::read_logs(&dir, &args)).await?
+            }
+            Tool::ReadHealth => self.read_health().await,
             Tool::ListBots => {
                 let now = now_ms();
                 let network = network.to_owned();

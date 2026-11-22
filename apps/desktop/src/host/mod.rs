@@ -377,6 +377,7 @@ impl DesktopHost {
             credential.node_id == expected.device_id,
             "本机会话身份不一致。"
         );
+        crate::node_log::attach(expected.data_dir.clone());
         Ok(credential)
     }
     pub fn poll_owned(&mut self) -> Result<bool> {

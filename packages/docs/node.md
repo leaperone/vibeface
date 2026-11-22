@@ -626,7 +626,7 @@ GitHub 受管安装通过安装根目录下固定的 `current/vibeface` 启动�
 
 每个系统用户管理一个 Node 服务。各服务命令核对 `--data-dir` 与已安装服务一致，再操作该服务。省略参数时使用 `VIBEFACE_DATA_DIR`，未设置时使用 `~/.vibeface`。管理其他数据目录时显式传入绝对路径。
 
-`status` 通过私有维护 socket 检查运行中的 Node，并核对设备编号，不要求安装服务。它输出设备编号、监听地址、运行版本、写入状态（`Writes`），以及每台其他成员 Node 最近一次同步是否连上、多久之前完成（`Peer`）。`status --json` 输出同样内容，不输出接入授权材料。已停止或无法连接时返回非零退出码。`service status` 则展示 launchd 或 systemd 的 Node 和更新服务状态。各项含义见 [排障](troubleshooting.md)。
+`status` 通过私有维护 socket 检查运行中的 Node，并核对设备编号，不要求安装服务。它输出设备编号、监听地址、运行版本、写入状态（`Writes`），以及每台其他成员 Node 最近一次同步是否连上、直连还是经中继、往返时间和多久之前完成（`Peer`）。`status --json` 输出同样内容，不输出接入授权材料。已停止或无法连接时返回非零退出码。`vibeface health` 经同一 socket 读取 Node 健康检查发现的问题和最近 1 小时的 warn、error 统计，见 [排障](troubleshooting.md#看健康检查)。`service status` 则展示 launchd 或 systemd 的 Node 和更新服务状态。各项含义见 [排障](troubleshooting.md)。
 
 ```sh
 vibeface status --json

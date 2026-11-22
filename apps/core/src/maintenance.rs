@@ -203,6 +203,12 @@ pub struct PeerHealth {
     /// `None` until the first sync attempt with this peer finishes.
     pub reachable: Option<bool>,
     pub synced_ms: Option<i64>,
+    /// Round-trip time of the selected path while a dialed connection is open.
+    pub rtt_ms: Option<u32>,
+    /// Switches between direct and relay since this Node started.
+    pub path_changes: u32,
+    /// Dialed connections that closed without this Node closing them, since it started.
+    pub disconnects: u32,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -240,6 +246,8 @@ enum Command {
         method: String,
         params: serde_json::Value,
     },
+    /// The health checks' open problems and the last hour's warnings and errors.
+    Health,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -694,6 +702,10 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: Stream)
                     response.error = Some(crate::logging::scrub(&error.to_string()));
                 }
             }
+            write_response(&mut stream, &response).await?;
+        }
+        Command::Health => {
+            response.result = Some(runtime.health_status().await);
             write_response(&mut stream, &response).await?;
         }
         Command::LocalAccess(enabled) => {

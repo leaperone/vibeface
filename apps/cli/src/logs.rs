@@ -32,7 +32,7 @@ enum LogSource {
     Agent,
     Cli,
     Codex,
-    Cursor,
+    Desktop,
 }
 
 #[derive(Args)]

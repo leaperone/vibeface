@@ -55,6 +55,7 @@ impl Label for PeerPath {
 pub trait PeerDisplay {
     fn reachability(&self) -> &'static str;
     fn path_label(&self) -> &'static str;
+    fn rtt(&self) -> String;
     fn last_sync(&self, now_ms: i64) -> String;
 }
 impl PeerDisplay for PeerStatus {
@@ -68,6 +69,11 @@ impl PeerDisplay for PeerStatus {
 
     fn path_label(&self) -> &'static str {
         self.path.map_or("unknown path", PeerPath::label)
+    }
+
+    fn rtt(&self) -> String {
+        self.rtt_ms
+            .map_or_else(|| "RTT unknown".into(), |rtt| format!("RTT {rtt} ms"))
     }
 
     fn last_sync(&self, now_ms: i64) -> String {
@@ -277,8 +283,9 @@ pub fn print_status(node: &NodeStatus) -> io::Result<()> {
                 "    ",
                 "    ",
                 &format!(
-                    "{} · {}",
+                    "{} · {} · {}",
                     peer.path_label(),
+                    peer.rtt(),
                     peer.last_sync(crate::now_ms())
                 ),
                 width,
@@ -384,7 +391,7 @@ mod tests {
             invalid_value[key] = invalid;
             assert!(Inspection::from_value(invalid_value).is_err(), "{key}");
         }
-        let peer: PeerStatus = serde_json::from_value(json!({"device_id":"peer","name":"Build","path":null,"reachable":null,"synced_ms":null})).unwrap();
+        let peer: PeerStatus = serde_json::from_value(json!({"device_id":"peer","name":"Build","path":null,"reachable":null,"synced_ms":null,"rtt_ms":null})).unwrap();
         assert_eq!(peer.reachability(), "not tried yet");
         assert_eq!(peer.last_sync(1000), "never synced");
     }

@@ -186,6 +186,31 @@ fn a_takeover_grace_uses_the_receiver_seen_time_when_the_writer_clock_is_slow() 
 }
 
 #[test]
+fn the_node_reminds_the_primary_bot_once_per_key() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    let now = 10_000;
+    let (first, written) = origin
+        .remind_primary_bot(&net.a, &net.network, "health-k-1", "检查 Node", now)?
+        .context("primary bot")?;
+    assert!(written && first.cause.is_none());
+    let (again, written) = origin
+        .remind_primary_bot(&net.a, &net.network, "health-k-1", "检查 Node", now + 5)?
+        .context("primary bot")?;
+    assert!(!written);
+    assert_eq!(again.change_id, first.change_id);
+    let BotChange::Schedule { schedule_id, .. } = first.change else {
+        panic!("reminder")
+    };
+    let at = now + 60_000;
+    assert_eq!(
+        origin.admit_due_schedules(&net.a, &net.network, at + 5)?,
+        vec![(first.conversation_id, schedule_trigger(&schedule_id, at))]
+    );
+    Ok(())
+}
+
+#[test]
 fn a_reminder_runs_once_and_never_again_after_restart_or_sync() -> Result<()> {
     let net = net()?;
     let (mut origin, _) = bot_with_message(&net)?;
